@@ -1,0 +1,70 @@
+{
+  "info": {
+    "build_version": "2026.10.13-release+4119",
+    "complete_ledgers": "1-26541064",
+    "server_state": "full",
+    "server_state_duration_us": "62876595000",
+    "load_factor": 1,
+    "io_latency_ms": 1,
+    "jq_trans_overflow": "0",
+    "peer_disconnects": "0",
+    "peer_disconnects_resources": "0",
+    "uptime": 62876,
+    "network_id": 21337,
+    "validation_quorum": 0,
+    "published_ledger": 26541064,
+    "time": "2026-Oct-15 10:37:35.493000 UTC",
+    "initial_sync_duration_us": "1157000",
+    "load_factor_server": 1,
+    "state_accounting": {
+      "connected": {
+        "duration_us": "0",
+        "transitions": "0"
+      },
+      "disconnected": {
+        "duration_us": "0",
+        "transitions": "0"
+      },
+      "full": {
+        "duration_us": "62876595000",
+        "transitions": "1"
+      },
+      "syncing": {
+        "duration_us": "0",
+        "transitions": "0"
+      },
+      "tracking": {
+        "duration_us": "0",
+        "transitions": "0"
+      }
+    },
+    "last_close": {
+      "converge_time_s": 3.001,
+      "proposers": 19
+    },
+    "complete_ledgers_pinned": "empty",
+    "hostid": "ORMA",
+    "peers": 202,
+    "ports": [
+      {
+        "port": "4000",
+        "protocol": [
+          "ws",
+          "http"
+        ]
+      }
+    ],
+    "pubkey_node": "n9JYxms4BTRi8v2YmsUH4fiV4Zco9CqWcmdY1ddY3BBEocLcEkMD",
+    "validated_ledger": {
+      "seq": 26541064,
+      "hash": "B46E1C70ABA2FCE6C5CC4270A68913BC4156077B92F15FBFC9CD1350C06BFD51",
+      "age": 1,
+      "base_fee_xrp": 0.00001,
+      "reserve_base_xrp": 1,
+      "reserve_inc_xrp": 0.2,
+      "base_fee_native": 0.00001,
+      "reserve_base_native": 1,
+      "reserve_inc_native": 0.2
+    }
+  }
+}

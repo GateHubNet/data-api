@@ -1,0 +1,101 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-15T11:53:06.047Z",
+  "validated_head": 107671609,
+  "scan_limit": 3000,
+  "scanned": 3000,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {
+    "AccountDelete": {
+      "ledger": 107671593,
+      "hash": "8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D"
+    },
+    "AMMCreate": {
+      "ledger": 107671317,
+      "hash": "6F152B6ED9514109B5CA4DA5A1050A5C57237BA413A12E46A7CC6E1F8FBCE977"
+    },
+    "AMMDeposit": {
+      "ledger": 107671558,
+      "hash": "83F332E0141EF2AD30427A8476FFD8469D678321F58E649F30761A862D880A4B"
+    },
+    "AMMWithdraw": {
+      "ledger": 107671499,
+      "hash": "4F2B0756C721F7DAE0016F3B7481601377241BE63B8C5A1BD90F4ECA732D8CA8"
+    },
+    "CheckCash": {
+      "ledger": 107671568,
+      "hash": "A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE"
+    },
+    "EscrowFinish": {
+      "ledger": 107670360,
+      "hash": "92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046"
+    },
+    "NFTokenAcceptOffer": {
+      "ledger": 107671591,
+      "hash": "423839F3B288D53874DAECE9AE3ACCE2A23E20E2C16E5DA594F425907D9E2052"
+    },
+    "NFTokenMint": {
+      "ledger": 107671538,
+      "hash": "7D16D6C749CAB260C906BEC2D9CF9B37F7D1D36F26421873CF838C9BCDF056AD"
+    },
+    "TicketCreate": {
+      "ledger": 107671607,
+      "hash": "A6D2AB0623B1874F35E0884BC42A82A18389627317EE1A93E61A4CF0B43E915B"
+    }
+  },
+  "missing": [
+    "Clawback",
+    "PaymentChannelClaim"
+  ],
+  "ledgers": [
+    {
+      "ledger": 107670360,
+      "bytes": 283342,
+      "gzipBytes": 55709
+    },
+    {
+      "ledger": 107671317,
+      "bytes": 203614,
+      "gzipBytes": 45075
+    },
+    {
+      "ledger": 107671499,
+      "bytes": 195806,
+      "gzipBytes": 36859
+    },
+    {
+      "ledger": 107671538,
+      "bytes": 293399,
+      "gzipBytes": 48561
+    },
+    {
+      "ledger": 107671558,
+      "bytes": 213742,
+      "gzipBytes": 47857
+    },
+    {
+      "ledger": 107671568,
+      "bytes": 1360928,
+      "gzipBytes": 316237
+    },
+    {
+      "ledger": 107671591,
+      "bytes": 398288,
+      "gzipBytes": 64798
+    },
+    {
+      "ledger": 107671593,
+      "bytes": 486638,
+      "gzipBytes": 99292
+    },
+    {
+      "ledger": 107671607,
+      "bytes": 171987,
+      "gzipBytes": 33887
+    }
+  ]
+}

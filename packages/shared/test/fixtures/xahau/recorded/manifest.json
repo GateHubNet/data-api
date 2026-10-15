@@ -1,0 +1,74 @@
+{
+  "network": "xahau",
+  "endpoint": "wss://xahau.network",
+  "recorded_at": "2026-10-15T12:28:12.733Z",
+  "validated_head": 26541064,
+  "scan_limit": 5000,
+  "scanned": 5000,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {
+    "ClaimReward": {
+      "ledger": 26540187,
+      "hash": "3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C"
+    },
+    "GenesisMint": {
+      "ledger": 26540188,
+      "hash": "E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D"
+    },
+    "Invoke": {
+      "ledger": 26540711,
+      "hash": "DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D"
+    },
+    "Remit": {
+      "ledger": 26540613,
+      "hash": "8C50C44787A12B785AA62377D0AFA6C4711E8E07EF68BA6E83DC286F7EE79AAF"
+    },
+    "URITokenBuy": {
+      "ledger": 26541051,
+      "hash": "FDE327991B2702E7BF849A36487CEA0DE9BB307F5110F1621C9B8EEE6696AC5F"
+    },
+    "URITokenMint": {
+      "ledger": 26541060,
+      "hash": "2EC9B35DA9FABDA4E375EBB158F7454E864FF24DDE4BD597F1EF6C04BC4EF4C3"
+    }
+  },
+  "missing": [
+    "Import",
+    "SetHook"
+  ],
+  "ledgers": [
+    {
+      "ledger": 26540187,
+      "bytes": 85594,
+      "gzipBytes": 14878
+    },
+    {
+      "ledger": 26540188,
+      "bytes": 22618,
+      "gzipBytes": 5584
+    },
+    {
+      "ledger": 26540613,
+      "bytes": 1340753,
+      "gzipBytes": 238171
+    },
+    {
+      "ledger": 26540711,
+      "bytes": 798528,
+      "gzipBytes": 194029
+    },
+    {
+      "ledger": 26541051,
+      "bytes": 44012,
+      "gzipBytes": 8997
+    },
+    {
+      "ledger": 26541060,
+      "bytes": 93742,
+      "gzipBytes": 15543
+    }
+  ]
+}

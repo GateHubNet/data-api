@@ -95,6 +95,22 @@ describe('network profiles', () => {
     it('is undefined on xahau when the definitions file is missing', () => {
       expect(getNetworkProfile('xahau').definitionsFallback(join(dir, 'missing.json'))).toBeUndefined();
     });
+
+    it('returns the bundled xahau server_definitions from the default path', () => {
+      const definitions = getNetworkProfile('xahau').definitionsFallback();
+      expect(definitions).toBeDefined();
+      expect(definitions).toEqual(
+        expect.objectContaining({
+          TYPES: expect.any(Object),
+          FIELDS: expect.any(Array),
+          TRANSACTION_TYPES: expect.any(Object),
+        }),
+      );
+      // Xahau-only transaction types prove this is the Xahau file and not the XRPL definitions.
+      expect((definitions as { TRANSACTION_TYPES: Record<string, number> }).TRANSACTION_TYPES).toEqual(
+        expect.objectContaining({ Import: expect.any(Number), ClaimReward: expect.any(Number) }),
+      );
+    });
   });
 
   describe('loadMarketsConfig', () => {
