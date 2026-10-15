@@ -19,10 +19,12 @@ export * from './parsers/affected-accounts.parser';
 export * from './parsers/from-client.parser';
 export * from './parsers/issuers.parser';
 
-// Utils & constants
+// Network
+export * from './network';
+
+// Utils
 export * from './util/ctid';
 export * from './util/amount';
 export * from './util/quality';
 export * from './util/helpers';
 export * from './util/time';
-export * from './constants';

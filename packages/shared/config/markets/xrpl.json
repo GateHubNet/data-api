@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "tradeMarkets": [
+    {
+      "base": {
+        "currency": "USD",
+        "issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq"
+      },
+      "counter": {
+        "currency": "XRP"
+      }
+    },
+    {
+      "base": {
+        "currency": "EUR",
+        "issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq"
+      },
+      "counter": {
+        "currency": "XRP"
+      }
+    },
+    {
+      "base": {
+        "currency": "USD",
+        "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B"
+      },
+      "counter": {
+        "currency": "XRP"
+      }
+    },
+    {
+      "base": {
+        "currency": "BTC",
+        "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B"
+      },
+      "counter": {
+        "currency": "XRP"
+      }
+    },
+    {
+      "base": {
+        "currency": "524C555344000000000000000000000000000000",
+        "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
+      },
+      "counter": {
+        "currency": "XRP"
+      }
+    }
+  ],
+  "paymentCurrencies": [
+    {
+      "currency": "USD",
+      "issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq"
+    },
+    {
+      "currency": "EUR",
+      "issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq"
+    },
+    {
+      "currency": "USD",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B"
+    },
+    {
+      "currency": "BTC",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B"
+    },
+    {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
+    }
+  ]
+}
