@@ -1,11 +1,11 @@
 import { codec } from 'sjcl';
-import * as xrpl from 'xrpl';
-import { IParser, XrplTx } from './parser.interface';
+import { ParserTx } from './parser.interface';
 
 /** Extracts the "client" string from a transaction's `client`-typed memo, if present. */
-export class FromClientParser implements IParser<string | null> {
+export class FromClientParser {
   private readonly hexMatch = /^(0x)?[0-9A-Fa-f]+$/;
-  private readonly base64Match = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})([=]{1,2})?$/;
+  private readonly base64Match =
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})([=]{1,2})?$/;
 
   private decodeBase64(data: string): string {
     return codec.utf8String.fromBits(codec.base64.toBits(data));
@@ -15,8 +15,8 @@ export class FromClientParser implements IParser<string | null> {
     return codec.utf8String.fromBits(codec.hex.toBits(data));
   }
 
-  private getClientString(transaction: xrpl.Transaction): string | undefined {
-    const memos = (transaction as any).Memos as any[] | undefined;
+  private getClientString(tx: Readonly<Record<string, any>>): string | undefined {
+    const memos = tx.Memos as readonly any[] | undefined;
     if (!memos) return undefined;
 
     for (const wrapper of memos) {
@@ -41,9 +41,9 @@ export class FromClientParser implements IParser<string | null> {
     return undefined;
   }
 
-  public parse(transaction: XrplTx): string | null {
-    if (!(transaction as any).Memos) return null;
-    const client = this.getClientString(transaction);
+  public parse(t: ParserTx): string | null {
+    if (!t.tx.Memos) return null;
+    const client = this.getClientString(t.tx);
     return client ? client.substring(0, 100) : null;
   }
 }

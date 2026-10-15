@@ -1,42 +1,46 @@
-import { BigNumber } from 'bignumber.js';
-import * as xrpl from 'xrpl';
-import { IParser, XrplTx } from './parser.interface';
+import { dropsToNative } from '../util/amount';
+import { ParseContext, ParserTx } from './parser.interface';
 
 export interface ParsedAccountCreated {
   account: string;
+  /** The sender of the transaction that created it. */
   parent: string;
-  balance: string;
-  date: number;
-  ledger_index: number;
-  tx_index: number;
-  tx_hash: string;
-  client?: string | null;
+  /** The balance it was created with, in whole units of the native currency. */
+  initial_balance: string;
 }
 
-export class AccountsCreatedParser implements IParser<ParsedAccountCreated[]> {
-  parse(transaction: XrplTx): ParsedAccountCreated[] {
-    const metadata = transaction.meta;
-    const list: ParsedAccountCreated[] = [];
-    if (!metadata || metadata.TransactionResult !== 'tesSUCCESS') return [];
+type Json = Readonly<Record<string, any>>;
 
-    for (const affNode of metadata.AffectedNodes as any[]) {
-      if (!affNode.CreatedNode || affNode.CreatedNode.LedgerEntryType !== 'AccountRoot') continue;
-      const fields = affNode.CreatedNode.NewFields ?? {};
-      // Skip AMM pseudo-accounts (created by AMMCreate): they are not user account
-      // creations and may carry no XRP Balance field. The `?? 0` further guards any
-      // created AccountRoot without an explicit Balance so it can never produce NaN.
+export class AccountsCreatedParser {
+  /**
+   * The accounts a successful transaction created, in the order of `meta.AffectedNodes`. Matches
+   * `ledgerParser/accountsCreated.js` of the Ripple Data API: every `CreatedNode` of an `AccountRoot` in a `tesSUCCESS`
+   * transaction, with the transaction's sender as the parent. Differences from the reference:
+   * - the balance is an exact decimal string (the reference divided a Number), and an account created without a
+   *   `Balance` starts at `0`;
+   * - AMM pseudo-accounts (`AMMID`) are not accounts anybody opened, so they are not creations. The reference predates
+   *   AMMs.
+   *
+   * Native amounts are drops on every network, so `ctx` only keeps the signature the same as the other parsers.
+   *
+   * Pure: nothing in `t` is modified.
+   */
+  parse(t: ParserTx, _ctx: ParseContext): ParsedAccountCreated[] {
+    if (t.meta.TransactionResult !== 'tesSUCCESS') return [];
+
+    const accounts: ParsedAccountCreated[] = [];
+    for (const affected of (t.meta.AffectedNodes ?? []) as readonly Json[]) {
+      const node: Json | undefined = affected.CreatedNode;
+      if (!node || node.LedgerEntryType !== 'AccountRoot') continue;
+
+      const fields: Json = node.NewFields ?? {};
       if ('AMMID' in fields) continue;
-      list.push({
+      accounts.push({
         account: fields.Account,
-        parent: transaction.Account,
-        balance: xrpl.dropsToXrp(new BigNumber(fields.Balance ?? 0)).toString(),
-        date: transaction.date,
-        ledger_index: transaction.ledger_index,
-        tx_index: metadata.TransactionIndex,
-        tx_hash: transaction.hash,
-        client: transaction.client,
+        parent: t.tx.Account,
+        initial_balance: dropsToNative(fields.Balance ?? '0'),
       });
     }
-    return list;
+    return accounts;
   }
 }
