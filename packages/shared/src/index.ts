@@ -3,6 +3,7 @@ export * from './clickhouse/clickhouse.config';
 export * from './clickhouse/clickhouse.service';
 export * from './clickhouse/clickhouse.module';
 export * from './clickhouse/tables';
+export * from './clickhouse/rows';
 export { runMigrations } from './clickhouse/migrate';
 export type { MigrateOptions, MigrateResult } from './clickhouse/migrate';
 
