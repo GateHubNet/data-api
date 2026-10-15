@@ -29,6 +29,15 @@ const metrics = {
     help: 'Unix time of the last ledger commit.',
     registers: [registry],
   }),
+  lastCommitAgeSeconds: new Gauge({
+    name: 'syncer_last_commit_age_seconds',
+    help: 'Seconds since the last ledger commit, computed at scrape time; NaN before the first commit.',
+    registers: [registry],
+    async collect() {
+      const last = (await metrics.lastCommitTimestampSeconds.get()).values[0]?.value;
+      this.set(last ? Math.max(0, Date.now() / 1000 - last) : Number.NaN);
+    },
+  }),
   validationsFlushedTotal: new Counter({
     name: 'syncer_validations_flushed_total',
     help: 'Validation rows flushed to ClickHouse.',
@@ -61,6 +70,8 @@ export class PrometheusService implements OnModuleInit {
   readonly headLedger = metrics.headLedger;
   readonly lagLedgers = metrics.lagLedgers;
   readonly lastCommitTimestampSeconds = metrics.lastCommitTimestampSeconds;
+  /** Derived from `lastCommitTimestampSeconds` when scraped; nothing sets it. */
+  readonly lastCommitAgeSeconds = metrics.lastCommitAgeSeconds;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly feeStatsSamplesTotal = metrics.feeStatsSamplesTotal;
   readonly aggregatorRunsTotal = metrics.aggregatorRunsTotal;

@@ -1,5 +1,6 @@
 import { DynamicModule, Logger, Type } from '@nestjs/common';
 import { WORKER_NAMES, WorkerName } from './config/syncer.config';
+import { IngestModule } from './ingest/ingest.module';
 
 /** What a worker contributes to the app: its Nest module (static or dynamic). */
 export type WorkerModule = Type<unknown> | DynamicModule;
@@ -9,12 +10,14 @@ export type WorkerModuleRegistry = Partial<Record<WorkerName, WorkerModule>>;
 /**
  * The worker -> module registry. A worker module is only imported when its name is in `GH_WORKERS`.
  *
- * It is empty on purpose: each worker task adds its own line (`ingest: IngestModule`, `validations: ValidationsModule`,
- * `fee_stats: FeesModule`, `aggregator: AggregatorModule`) and nothing else in the app changes.
+ * Each worker adds its own line (`validations: ValidationsModule`, `fee_stats: FeesModule`,
+ * `aggregator: AggregatorModule`) and nothing else in the app changes.
  *
  * The module that provides `INGEST_STATUS` for the liveliness probe must be `@Global()` and export that token.
  */
-export const WORKER_MODULES: WorkerModuleRegistry = {};
+export const WORKER_MODULES: WorkerModuleRegistry = {
+  ingest: IngestModule,
+};
 
 /**
  * The modules of the enabled workers, in `WORKER_NAMES` order. An enabled worker with no registered module is

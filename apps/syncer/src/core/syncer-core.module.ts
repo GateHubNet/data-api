@@ -12,6 +12,7 @@ import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { WorkerModule } from '../worker-registry';
 import { migrateOnBoot } from './migrate-on-boot';
 import { createNodeClient } from './node-client.provider';
+import { ShutdownSignals } from './shutdown-signals';
 
 /**
  * Token of the async provider that applies the boot-time migrations. Nest awaits async providers before it calls any
@@ -38,7 +39,8 @@ export interface SyncerCoreOptions {
 
 /**
  * Everything the workers share, global so that a worker module needs no imports to use it:
- * `SyncerConfig`, `NETWORK_PROFILE`, `PARSE_CONTEXT`, `NODE_CLIENT`, `ClickHouseService` and `PrometheusService`.
+ * `SyncerConfig`, `NETWORK_PROFILE`, `PARSE_CONTEXT`, `NODE_CLIENT`, `ClickHouseService`, `PrometheusService` and
+ * `ShutdownSignals` (SIGTERM / SIGINT cleanups; the node client's stop is registered here, first, so it runs last).
  * It also imports the liveliness probe and the modules of the enabled workers.
  */
 @Global()
@@ -55,11 +57,20 @@ export class SyncerCoreModule {
         { provide: NETWORK_PROFILE, useValue: profile },
         { provide: PARSE_CONTEXT, useValue: parseContextFor(profile) },
         { provide: SCHEMA_READY, useFactory: () => migrateOnBoot(config, clickHouse, logger) },
-        { provide: NODE_CLIENT, useFactory: () => createNodeClient(config, profile) },
+        ShutdownSignals,
+        {
+          provide: NODE_CLIENT,
+          useFactory: async (signals: ShutdownSignals) => {
+            const client = await createNodeClient(config, profile);
+            signals.register('node-client', () => client.stop());
+            return client;
+          },
+          inject: [ShutdownSignals],
+        },
         NodeClientShutdown,
         PrometheusService,
       ],
-      exports: [SyncerConfig, NETWORK_PROFILE, PARSE_CONTEXT, NODE_CLIENT, PrometheusService],
+      exports: [SyncerConfig, NETWORK_PROFILE, PARSE_CONTEXT, NODE_CLIENT, PrometheusService, ShutdownSignals],
     };
   }
 }

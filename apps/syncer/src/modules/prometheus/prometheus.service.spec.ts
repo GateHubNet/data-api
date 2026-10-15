@@ -36,6 +36,29 @@ describe('PrometheusService', () => {
     expect(scraper.registry).toBe(worker.registry);
   });
 
+  describe('syncer_last_commit_age_seconds', () => {
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('is the time since the last commit, computed when scraped', async () => {
+      jest.useFakeTimers({ now: new Date('2026-10-15T12:00:00Z') });
+      const service = new PrometheusService();
+      service.lastCommitTimestampSeconds.set(Date.now() / 1000 - 30);
+      expect(await service.getMetrics()).toMatch(/^# TYPE syncer_last_commit_age_seconds gauge$/m);
+      expect(await service.getMetrics()).toMatch(/^syncer_last_commit_age_seconds 30$/m);
+      jest.advanceTimersByTime(15_000);
+      expect(await service.getMetrics()).toMatch(/^syncer_last_commit_age_seconds 45$/m);
+    });
+
+    it('is NaN (unknown) before the first commit', async () => {
+      const service = new PrometheusService();
+      service.lastCommitTimestampSeconds.reset();
+      // prom-client writes NaN as `Nan`; Prometheus parses it case-insensitively.
+      expect(await service.getMetrics()).toMatch(/^syncer_last_commit_age_seconds nan$/im);
+    });
+  });
+
   it('prefixes the default process metrics with syncer_', async () => {
     const service = new PrometheusService();
     service.onModuleInit();

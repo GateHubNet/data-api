@@ -1,9 +1,18 @@
 /** What the liveliness probe needs to know about the ingest worker. */
 export interface IngestStatus {
-  /** How many ledgers the committed checkpoint is behind the validated head; undefined until it is known. */
+  /**
+   * How many ledgers the committed checkpoint is behind the validated head; undefined until it is known. It stays defined
+   * (against the last known head) while the node is unreachable, so that the lag rule can fire.
+   */
   lag?: number;
   /** `'halted'` fails the probe at once (a chain break); other states are informational. */
   state?: string;
+  /** Unix seconds of the last commit; the probe reports its age as `last_commit_age`. */
+  lastCommitAt?: number;
+  /** A failed write or the boot cleanup is being recovered (and nothing is written meanwhile). Informational. */
+  recovering?: boolean;
+  /** What holds ingest up, or why it halted. Informational. */
+  error?: string;
 }
 
 export interface IngestStatusProvider {

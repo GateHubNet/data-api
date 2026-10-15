@@ -5,6 +5,7 @@ import { AddressInfo, createServer } from 'node:net';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
+import { syntheticChain, SyntheticLedger } from './synthetic-chain';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 const APP_ROOT = join(__dirname, '..');
@@ -19,16 +20,38 @@ afterAll(async () => {
   await clickhouse?.container.stop();
 });
 
-/** A websocket server that answers `server_info` like a rippled / xahaud with the given `network_id`. */
-async function startFakeNode(networkId: number | undefined): Promise<{ url: string; stop: () => Promise<void> }> {
+/**
+ * A websocket server that answers `server_info` like a rippled / xahaud with the given `network_id`. With a chain it also
+ * serves `ledger` requests: `validated` is the last ledger of the chain, and every ledger of the chain is validated.
+ */
+async function startFakeNode(
+  networkId: number | undefined,
+  chain: SyntheticLedger[] = [],
+): Promise<{ url: string; stop: () => Promise<void> }> {
   const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await once(server, 'listening');
+  const head = chain[chain.length - 1];
   server.on('connection', (socket) => {
     socket.on('message', (raw) => {
-      const request = JSON.parse(raw.toString()) as { id: number; command: string };
-      const info = { complete_ledgers: '1-100', validated_ledger: { seq: 100 }, network_id: networkId };
-      const result = request.command === 'server_info' ? { info } : {};
-      socket.send(JSON.stringify({ id: request.id, type: 'response', status: 'success', result }));
+      const request = JSON.parse(raw.toString()) as { id: number; command: string; ledger_index?: unknown };
+      const respond = (result: object) =>
+        socket.send(JSON.stringify({ id: request.id, type: 'response', status: 'success', result }));
+      if (request.command === 'server_info') {
+        respond({ info: { complete_ledgers: '1-100', validated_ledger: { seq: 100 }, network_id: networkId } });
+      } else if (request.command === 'ledger' && request.ledger_index === 'validated' && head) {
+        respond({ ledger_index: head.index, ledger_hash: head.raw.header.ledger_hash, validated: true });
+      } else if (request.command === 'ledger') {
+        const ledger = chain.find((l) => l.index === request.ledger_index);
+        if (ledger) {
+          respond({ ledger: ledger.json, ledger_index: ledger.index, validated: true });
+        } else {
+          socket.send(
+            JSON.stringify({ id: request.id, type: 'response', status: 'error', error: 'lgrNotFound', request }),
+          );
+        }
+      } else {
+        respond({});
+      }
     });
   });
   const { port } = server.address() as AddressInfo;
@@ -150,8 +173,8 @@ describe('main.ts under the toolbox bootstrap()', () => {
     node = undefined;
   });
 
-  async function start(networkId: number | undefined, env: Record<string, string> = {}) {
-    node = await startFakeNode(networkId);
+  async function start(networkId: number | undefined, env: Record<string, string> = {}, chain?: SyntheticLedger[]) {
+    node = await startFakeNode(networkId, chain);
     const httpPort = await freePort();
     const metriczPort = await freePort();
     output = '';
@@ -213,6 +236,57 @@ describe('main.ts under the toolbox bootstrap()', () => {
     const [code] = (await once(child as ChildProcess, 'exit')) as [number | null];
     expect(code).toBe(1);
     expect(output).toContain('Node network_id 21337 does not match GH_NETWORK=xrpl');
+  });
+
+  it('runs the ingest worker to the node head, and on SIGTERM stops, releases the lease and exits 0', async () => {
+    const chain = syntheticChain(81_000_001, 30);
+    const head = chain[chain.length - 1];
+    const db = 'syncer_app_e2e_ingest';
+    const { httpPort, metriczPort } = await start(
+      undefined,
+      {
+        GH_WORKERS: 'ingest',
+        GH_CLICKHOUSE_DATABASE: db,
+        GH_RUN_MIGRATIONS_ON_BOOT: 'true',
+        GH_SYNC_START_LEDGER: String(chain[0].index),
+      },
+      chain,
+    );
+
+    await waitFor(async () => {
+      const [committed] = await chRows(`SELECT count() FROM ${db}.ledgers`, {});
+      return committed === '30' ? true : undefined;
+    }, `30 committed ledgers\n${output}`);
+    expect(await chRows(`SELECT min(ledger_index), max(ledger_index) FROM ${db}.ledgers`, {})).toEqual([
+      `${chain[0].index}\t${head.index}`,
+    ]);
+
+    const health = await waitFor(async () => {
+      const body = (await (await fetch(`http://127.0.0.1:${httpPort}/liveliness/healthz`)).json()) as {
+        info?: { ingest?: { state?: string } };
+      };
+      return body.info?.ingest?.state === 'live' ? body : undefined;
+    }, `a live ingest status\n${output}`);
+    expect(health.info?.ingest).toMatchObject({ status: 'up', state: 'live', lag: 0 });
+    const metrics = await (await fetch(`http://127.0.0.1:${metriczPort}/metricz`)).text();
+    expect(metrics).toMatch(new RegExp(`^syncer_checkpoint_ledger ${head.index}$`, 'm'));
+    expect(metrics).toMatch(new RegExp(`^syncer_head_ledger ${head.index}$`, 'm'));
+    expect(metrics).toMatch(/^syncer_lag_ledgers 0$/m);
+    expect(metrics).toMatch(/^syncer_last_commit_age_seconds \d/m);
+    const lease = `SELECT argMax(holder, heartbeat) FROM ${db}.syncer_lease WHERE network = 'xrpl'`;
+    expect((await chRows(lease, {}))[0]).toMatch(/:\d+:[0-9a-f-]{36}$/);
+
+    const exited = once(child as ChildProcess, 'exit');
+    const signalledAt = Date.now();
+    child?.kill('SIGTERM');
+    const [code] = (await exited) as [number | null];
+    expect(code).toBe(0);
+    expect(Date.now() - signalledAt).toBeLessThan(10_000);
+    expect(output).toContain('SIGTERM');
+    // The lease is released: the latest row has no holder, so a new syncer may start at once.
+    expect(
+      await chRows(`SELECT argMax(holder, heartbeat) = '' FROM ${db}.syncer_lease WHERE network = 'xrpl'`, {}),
+    ).toEqual(['1']);
   });
 
   it('exits with an error on invalid configuration', async () => {

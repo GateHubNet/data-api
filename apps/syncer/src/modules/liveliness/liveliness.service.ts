@@ -13,6 +13,8 @@ export const LAG_GRACE_MS = 60_000;
  * - the ingest worker is running (a module provides `INGEST_STATUS`) and its state is `halted`, or its lag has been
  *   above `maxLagHealthy` ledgers on every probe for more than 60 s.
  *
+ * The ingest indicator also reports `last_commit_age` (seconds), and `recovering` / `error` while recovery is stuck.
+ *
  * The lag is judged across probes: a spike that is gone by the next probe resets the window, and a lag the runner has
  * not measured yet (undefined) counts as healthy.
  */
@@ -43,8 +45,11 @@ export class LivelinessService extends HealthIndicator {
   }
 
   private async ingestStatus(): Promise<HealthIndicatorResult> {
-    const { lag, state } = this.ingest!.status();
-    const details = { state, lag };
+    const { lag, state, lastCommitAt, recovering, error } = this.ingest!.status();
+    const details: Record<string, unknown> = { state, lag };
+    if (lastCommitAt !== undefined) details.last_commit_age = Math.round(Date.now() / 1000 - lastCommitAt);
+    if (recovering) details.recovering = true;
+    if (error !== undefined) details.error = error;
 
     if (state === 'halted') {
       throw new HealthCheckError('Ingest halted', this.getStatus('ingest', false, { ...details, message: 'halted' }));

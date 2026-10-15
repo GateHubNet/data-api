@@ -11,6 +11,9 @@ const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefi
 interface Booted {
   app: INestApplication;
   tokens: typeof import('./config/syncer.config');
+  INGEST_STATUS: symbol;
+  LiveRunner: typeof import('./ingest/live-runner').LiveRunner;
+  ShutdownSignals: typeof import('./core/shutdown-signals').ShutdownSignals;
   clickhouse: { ping: jest.Mock };
   node: { start: jest.Mock; stop: jest.Mock; serverInfo: jest.Mock };
   baseUrl: string;
@@ -22,9 +25,14 @@ interface Booted {
  */
 async function boot(
   env: Record<string, string>,
-  options: { pingOk?: boolean; ingestStatus?: { state?: string; lag?: number } } = {},
+  options: {
+    pingOk?: boolean;
+    ingestStatus?: { state?: string; lag?: number };
+    /** Replaces the LiveRunner of the real ingest module (which would otherwise start ingesting). */
+    liveRunner?: { status: () => object };
+  } = {},
 ): Promise<Booted> {
-  const { pingOk = true, ingestStatus } = options;
+  const { pingOk = true, ingestStatus, liveRunner } = options;
   const saved = { ...process.env };
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('GH_') && key !== 'GH_ENV') delete process.env[key];
@@ -50,6 +58,10 @@ async function boot(
         class FakeIngestModule {}
         WORKER_MODULES.ingest = FakeIngestModule;
       }
+      // Imported before app.module: once it is imported, its config load races `setLogger(QUIET)` below.
+      const { INGEST_STATUS } = await import('./modules/liveliness/ingest-status');
+      const { LiveRunner } = await import('./ingest/live-runner');
+      const { ShutdownSignals } = await import('./core/shutdown-signals');
       const { AppModule } = await import('./app.module');
       const clickhouse = { ping: jest.fn(async () => pingOk), onModuleDestroy: jest.fn() };
       const node = {
@@ -57,16 +69,26 @@ async function boot(
         stop: jest.fn(async () => undefined),
         serverInfo: jest.fn(async () => ({ complete_ledgers: '1-2' })),
       };
-      const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      let builder = Test.createTestingModule({ imports: [AppModule] })
         .setLogger(QUIET) // terminus logs every failed health check
         .overrideProvider(ClickHouseService)
         .useValue(clickhouse)
         .overrideProvider(tokens.NODE_CLIENT)
-        .useValue(node)
-        .compile();
+        .useValue(node);
+      if (liveRunner) builder = builder.overrideProvider(LiveRunner).useValue(liveRunner);
+      const moduleRef = await builder.compile();
       const app = moduleRef.createNestApplication();
       await app.listen(0, '127.0.0.1');
-      booted = { app, tokens, clickhouse, node, baseUrl: await app.getUrl() };
+      booted = {
+        app,
+        tokens,
+        INGEST_STATUS,
+        LiveRunner,
+        ShutdownSignals,
+        clickhouse,
+        node,
+        baseUrl: await app.getUrl(),
+      };
     });
     return booted as Booted;
   } finally {
@@ -94,6 +116,32 @@ describe('AppModule', () => {
       partialPaymentFixLedger: 4594094,
     });
     expect(app.get(tokens.NODE_CLIENT)).toBe(booted.node);
+    expect(app.get(booted.ShutdownSignals)).toBeInstanceOf(booted.ShutdownSignals);
+  });
+
+  it('has no ingest status (and no LiveRunner) when the ingest worker is not enabled', async () => {
+    booted = await boot(FAKE_ENV);
+    const { app, INGEST_STATUS, LiveRunner } = booted;
+    expect(() => app.get(INGEST_STATUS)).toThrow();
+    expect(() => app.get(LiveRunner)).toThrow();
+    const res = await fetch(`${booted.baseUrl}/liveliness/healthz`);
+    expect((await res.json()).info).not.toHaveProperty('ingest');
+  });
+
+  it('resolves INGEST_STATUS to the LiveRunner of the ingest module when the ingest worker is enabled', async () => {
+    const runner = {
+      status: () => ({ state: 'catching_up', checkpoint: 100, head: 107, lag: 7, lastCommitAt: Date.now() / 1000 - 3 }),
+    };
+    booted = await boot({ ...FAKE_ENV, GH_WORKERS: 'ingest' }, { liveRunner: runner });
+    const { app, INGEST_STATUS, LiveRunner } = booted;
+
+    expect(app.get(LiveRunner)).toBe(runner);
+    expect(app.get(INGEST_STATUS)).toBe(runner);
+    const res = await fetch(`${booted.baseUrl}/liveliness/healthz`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      info: { ingest: { status: 'up', state: 'catching_up', lag: 7, last_commit_age: 3 } },
+    });
   });
 
   it('builds the xahau profile and parse context for GH_NETWORK=xahau', async () => {

@@ -114,6 +114,27 @@ describe('LivelinessService', () => {
       await expect(service.livelinessCheck()).resolves.toMatchObject({ status: 'ok' });
     });
 
+    it('reports the age of the last commit in seconds', async () => {
+      const { service, ingest } = await setup({ withIngest: true });
+      ingest.status.mockReturnValue({ state: 'live', lag: 1, lastCommitAt: Date.now() / 1000 - 42.4 });
+      const result = await service.livelinessCheck();
+      expect(result.info?.ingest).toMatchObject({ status: 'up', state: 'live', lag: 1, last_commit_age: 42 });
+    });
+
+    it('leaves the last commit age out before the first commit', async () => {
+      const { service, ingest } = await setup({ withIngest: true });
+      ingest.status.mockReturnValue({ state: 'starting' });
+      const result = await service.livelinessCheck();
+      expect(result.info?.ingest).not.toHaveProperty('last_commit_age');
+    });
+
+    it('reports a recovery that is stuck, without failing on it alone', async () => {
+      const { service, ingest } = await setup({ withIngest: true });
+      ingest.status.mockReturnValue({ state: 'catching_up', lag: 2, recovering: true, error: 'not quiescent' });
+      const result = await service.livelinessCheck();
+      expect(result.info?.ingest).toMatchObject({ status: 'up', recovering: true, error: 'not quiescent' });
+    });
+
     it('is unhealthy (503) at once when the runner halted', async () => {
       const { service, ingest } = await setup({ withIngest: true });
       ingest.status.mockReturnValue({ state: 'halted', lag: 0 });
