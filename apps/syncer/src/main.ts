@@ -1,25 +1,22 @@
-import 'dotenv/config';
+import { bootstrap } from '@gatehub/toolbox/lib/bootstrap';
 import { Logger } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
-import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { loadSyncerConfig } from './config/syncer.config';
+import { PrometheusModule } from './modules/prometheus/prometheus.module';
 
-const log = new Logger('SyncerBootstrap');
-
-async function bootstrap(): Promise<void> {
-  // The syncer is a worker, but it still runs an HTTP server so orchestrators can
-  // probe /liveliness/healthz and scrape /metricz. The actual ingestion is kicked
-  // off in AppService.onApplicationBootstrap.
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: false });
-  app.disable('x-powered-by');
-  app.enableShutdownHooks();
-
-  const port = process.env.GH_HTTP_API_PORT ?? 3002;
-  await app.listen(port);
-  log.log(`syncer HTTP (health/metrics) listening on ${port}`);
+async function main(): Promise<void> {
+  const cfg = await loadSyncerConfig();
+  // The syncer is a worker, but it still serves HTTP: the liveliness probe on the main port and Prometheus metrics on
+  // a second app (metricz).
+  await bootstrap(AppModule, {
+    port: cfg.httpApiPort,
+    swaggerDocs: { disabled: true },
+    versioning: { disabled: true, defaultVersion: '1' },
+    metricz: { module: PrometheusModule, port: cfg.metriczPort },
+  });
 }
 
-bootstrap().catch((err) => {
-  log.error('Fatal bootstrap error', err);
+main().catch((err) => {
+  new Logger('SyncerBootstrap').error('Fatal bootstrap error', err instanceof Error ? err.stack : err);
   process.exit(1);
 });
