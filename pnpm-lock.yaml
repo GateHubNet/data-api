@@ -83,6 +83,9 @@ importers:
       ripple-address-codec:
         specifier: ^4.3.1
         version: 4.3.1
+      ripple-binary-codec:
+        specifier: ^1.11.0
+        version: 1.11.0
       rxjs:
         specifier: ^7.8.1
         version: 7.8.2

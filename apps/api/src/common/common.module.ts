@@ -10,7 +10,10 @@ import { DynamicModule, Global, Injectable, Module, OnApplicationBootstrap } fro
 import { HttpAdapterHost } from '@nestjs/core';
 import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { BinaryCodecService } from './binary-codec.service';
 import { CacheService } from './cache.service';
+import { LedgerRangeResolver } from './ledger-range.service';
+import { TxService } from './tx-object';
 
 /**
  * Wires the process's graceful shutdown. The toolbox `bootstrap()` never enables Nest's shutdown hooks (ruling R19),
@@ -18,7 +21,7 @@ import { CacheService } from './cache.service';
  * order of registration:
  *  1. the HTTP server stops accepting connections and lets the requests in flight finish (registered last, so first);
  *  2. the ClickHouse client closes (registered when it is built, so after every request is done).
- * The NodeClient stop of the live-node service (Task 18) registers next to the ClickHouse one.
+ * The `XrplService` registers the stop of its NodeClient the same way, when it is built.
  */
 @Injectable()
 class ShutdownRegistrations implements OnApplicationBootstrap {
@@ -46,7 +49,9 @@ export interface CommonOptions {
 
 /**
  * Everything the endpoint modules share, global so that they need no imports to use it: `ApiConfig`,
- * `NETWORK_PROFILE`, `ClickHouseService`, `CacheService`, `PrometheusService` and `ShutdownSignals`.
+ * `NETWORK_PROFILE`, `ClickHouseService`, `CacheService`, `PrometheusService`, `ShutdownSignals`, and the services of
+ * the API contract layer: `LedgerRangeResolver`, `TxService` and `BinaryCodecService`. (`BinaryCodecService` asks the
+ * node for its definitions through the global `XrplService` of the `XrplModule`.)
  */
 @Global()
 @Module({})
@@ -64,8 +69,20 @@ export class CommonModule {
         PrometheusService,
         ShutdownSignals,
         ShutdownRegistrations,
+        LedgerRangeResolver,
+        TxService,
+        BinaryCodecService,
       ],
-      exports: [ApiConfig, NETWORK_PROFILE, CacheService, PrometheusService, ShutdownSignals],
+      exports: [
+        ApiConfig,
+        NETWORK_PROFILE,
+        CacheService,
+        PrometheusService,
+        ShutdownSignals,
+        LedgerRangeResolver,
+        TxService,
+        BinaryCodecService,
+      ],
     };
   }
 }
