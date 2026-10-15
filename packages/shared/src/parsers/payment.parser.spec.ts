@@ -253,17 +253,31 @@ describe('PaymentParser', () => {
       expect(payment.invoice_id).toBe('ABCD'.repeat(16));
     });
 
-    it('omits absent tags and, like the reference, a tag of 0', () => {
-      const plain = parser.parse(parserTx(), XRPL)!;
-      const zero = parser.parse(parserTx({ SourceTag: 0, DestinationTag: 0, InvoiceID: '' }), XRPL)!;
+    it('omits absent tags, invoice id, max_amount and issuer', () => {
+      const payment = parser.parse(parserTx(), XRPL)!;
 
-      for (const payment of [plain, zero]) {
-        expect(payment).not.toHaveProperty('source_tag');
-        expect(payment).not.toHaveProperty('destination_tag');
-        expect(payment).not.toHaveProperty('invoice_id');
-        expect(payment).not.toHaveProperty('max_amount');
-        expect(payment).not.toHaveProperty('issuer');
-      }
+      expect(payment).not.toHaveProperty('source_tag');
+      expect(payment).not.toHaveProperty('destination_tag');
+      expect(payment).not.toHaveProperty('invoice_id');
+      expect(payment).not.toHaveProperty('max_amount');
+      expect(payment).not.toHaveProperty('issuer');
+    });
+
+    it('keeps a tag of 0 (ruling R10) but leaves out an empty invoice id', () => {
+      const payment = parser.parse(parserTx({ SourceTag: 0, DestinationTag: 0, InvoiceID: '' }), XRPL)!;
+
+      expect(payment.source_tag).toBe(0);
+      expect(payment.destination_tag).toBe(0);
+      expect(payment).toHaveProperty('source_tag', 0);
+      expect(payment).toHaveProperty('destination_tag', 0);
+      expect(payment).not.toHaveProperty('invoice_id');
+    });
+
+    it('treats a null tag as absent', () => {
+      const payment = parser.parse(parserTx({ SourceTag: null, DestinationTag: null }), XRPL)!;
+
+      expect(payment).not.toHaveProperty('source_tag');
+      expect(payment).not.toHaveProperty('destination_tag');
     });
 
     it('records max_amount and source_currency from an issued-currency SendMax', () => {
@@ -565,6 +579,16 @@ describe('PaymentParser golden', () => {
           currency: 'XRP',
           value: `-${payment.amount}`,
         });
+      }
+    });
+
+    it('carries a tag of 0 through as 0', () => {
+      const zeroTagged = parsed.filter(({ raw }) => raw.tx.SourceTag === 0 || raw.tx.DestinationTag === 0);
+
+      expect(zeroTagged).toHaveLength(2);
+      for (const { raw, payment } of zeroTagged) {
+        if (raw.tx.SourceTag === 0) expect(payment.source_tag).toBe(0);
+        if (raw.tx.DestinationTag === 0) expect(payment.destination_tag).toBe(0);
       }
     });
 

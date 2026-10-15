@@ -67,7 +67,8 @@ export class PaymentParser {
   /**
    * Turn a successful Payment into the row the API serves. Matches `ledgerParser/payment.js` of the Ripple Data API:
    * - only `tesSUCCESS` Payments between two different accounts are payments (a payment to self is a conversion);
-   * - destination tags, source tags and invoice ids that are falsy (0, '') are left out;
+   * - source and destination tags are kept when present, including 0 (the reference dropped 0, ruling R10); an empty
+   *   invoice id is left out;
    * - `delivered_amount` falls back to `Amount` for a partial payment whose delivered amount is `'unavailable'`.
    *
    * Pure: nothing in `t` is modified, and the result shares no objects with it.
@@ -117,8 +118,8 @@ export class PaymentParser {
       payment.max_amount = amountValue(tx.SendMax);
       payment.source_currency = typeof tx.SendMax === 'object' ? tx.SendMax.currency : ctx.nativeCurrency;
     }
-    if (tx.SourceTag) payment.source_tag = tx.SourceTag;
-    if (tx.DestinationTag) payment.destination_tag = tx.DestinationTag;
+    if (tx.SourceTag !== undefined && tx.SourceTag !== null) payment.source_tag = tx.SourceTag;
+    if (tx.DestinationTag !== undefined && tx.DestinationTag !== null) payment.destination_tag = tx.DestinationTag;
     if (tx.InvoiceID) payment.invoice_id = tx.InvoiceID;
 
     if (issued) {
