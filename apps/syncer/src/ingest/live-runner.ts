@@ -6,6 +6,7 @@ import {
   LedgerSource,
   LedgerWriter,
   RawLedger,
+  ShutdownSignals,
   storedLedgerHash,
   Table,
 } from '@gatehub/data-api-shared';
@@ -14,7 +15,6 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { hostname } from 'node:os';
 import { NODE_CLIENT, SyncerConfig } from '../config/syncer.config';
-import { ShutdownSignals } from '../core/shutdown-signals';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 
 /** The `LedgerSource` the live runner reads from (an `RpcLedgerSource` in the app). */

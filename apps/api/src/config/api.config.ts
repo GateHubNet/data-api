@@ -1,65 +1,142 @@
-import { Global, Logger, Module } from '@nestjs/common';
+import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
+import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
+import { IsIn } from 'class-validator';
+import { IntValue, MaybeEmptyText, splitList, Text, validator } from './env-decorators';
 
-export interface ApiConfig {
-  port: number;
-  corsOrigins: string[];
-  rateLimit: number;
-  rateLimitWindow: number;
-  xrplEndpoint: string;
-  /** Accepted API keys. Empty array = auth disabled (dev only). */
-  apiKeys: string[];
-  /** TTL (ms) for cached live-XRPL responses (balances/orders). 0 disables caching. */
-  liveCacheTtlMs: number;
-  /** Number of reverse-proxy hops to trust for X-Forwarded-For (Express `trust proxy`). */
-  trustProxyHops: number;
+/**
+ * API configuration, read from `GH_*` environment variables by the toolbox ConfigService (`@ConfigValue()` maps the
+ * property `fooBar` to `GH_FOO_BAR`; an invalid value prints the problem and exits the process). The decorators of
+ * `env-decorators.ts` supply what the ConfigService cannot: defaults (the initializers below), strict integers and
+ * messages that name the variable.
+ *
+ * The toolbox is imported through its `lib/*` modules: the package root also registers its database and queue
+ * configuration when it is imported, and exits the process when `GH_DATABASE_*` is missing.
+ *
+ * Without `GH_ENV` the ConfigService loads `.env.$NODE_ENV` (or `.env`) from the working directory and throws when
+ * that file is missing, so containers (NODE_ENV=production) must set `GH_ENV` to any value.
+ */
+
+/** Every entry of a comma list of node endpoints must be a `ws://` or `wss://` URL. */
+const IsEndpointList = validator(
+  'isEndpointList',
+  (value) =>
+    typeof value === 'string' && splitList(value).length > 0 && splitList(value).every((e) => /^wss?:\/\/\S+$/.test(e)),
+  (variable) => `${variable} must be a comma separated list of ws:// or wss:// URLs`,
+);
+
+/** `*`, or a comma list of `http(s)://` origins. */
+const IsOriginList = validator(
+  'isOriginList',
+  (value) => typeof value === 'string' && (value === '*' || splitList(value).every((o) => /^https?:\/\/\S+$/.test(o))),
+  (variable) => `${variable} must be * or a comma separated list of http:// or https:// origins`,
+);
+
+/** A header value: printable ASCII, so that setting it can never throw while a request is served. */
+const IsHeaderValue = validator(
+  'isHeaderValue',
+  (value) => typeof value === 'string' && /^[\x20-\x7e]*$/.test(value),
+  (variable) => `${variable} must be printable ASCII`,
+);
+
+export class ApiConfig {
+  /** `GH_NETWORK`: `xrpl` or `xahau`. */
+  @ConfigValue()
+  @Text()
+  @IsIn(['xrpl', 'xahau'], { message: 'GH_NETWORK must be xrpl or xahau' })
+  network: string = 'xrpl';
+
+  /** `GH_NODE_ENDPOINTS`: comma separated rippled / xahaud websocket URLs for the live-state endpoints, tried in order. */
+  @ConfigValue()
+  @Text()
+  @IsEndpointList()
+  nodeEndpoints: string = 'wss://xrplcluster.com';
+
+  /**
+   * `GH_API_KEYS`: comma separated API keys, sent as `X-API-Key` or `Authorization: Bearer`. Empty disables the
+   * authentication outside production; in production an empty list fails the boot (see `apiKeysOf`).
+   */
+  @ConfigValue()
+  @MaybeEmptyText()
+  apiKeys: string = '';
+
+  /** `GH_HTTP_API_PORT`: the REST API, the probe and the swagger docs. */
+  @ConfigValue()
+  @IntValue({ min: 1, max: 65535 })
+  httpApiPort: number = 3001;
+
+  /** `GH_METRICZ_PORT`: Prometheus scrape port (a second app on its own port). */
+  @ConfigValue()
+  @IntValue({ min: 1, max: 65535 })
+  metriczPort: number = 3000;
+
+  /** `GH_CORS_ORIGINS`: `*` or comma separated allowed origins; empty sends no CORS headers. */
+  @ConfigValue()
+  @MaybeEmptyText()
+  @IsOriginList()
+  corsOrigins: string = '';
+
+  /** `GH_RATE_LIMIT`: requests per client address and route within `rateLimitWindow`. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  rateLimit: number = 600;
+
+  /** `GH_RATE_LIMIT_WINDOW`: the rate limit window, in seconds. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  rateLimitWindow: number = 60;
+
+  /** `GH_LIVE_CACHE_TTL_MS`: how long a live-node response (balances, orders) is cached; 0 disables the cache. */
+  @ConfigValue()
+  @IntValue({ min: 0 })
+  liveCacheTtlMs: number = 10000;
+
+  /** `GH_TRUST_PROXY_HOPS`: reverse-proxy hops whose `X-Forwarded-For` is trusted for the client address. */
+  @ConfigValue()
+  @IntValue({ min: 0 })
+  trustProxyHops: number = 1;
+
+  /** `GH_CACHE_CONTROL`: the `Cache-Control` of successful `/v2/*` responses; empty sends none. */
+  @ConfigValue()
+  @MaybeEmptyText()
+  @IsHeaderValue()
+  cacheControl: string = 'public, max-age=60';
 }
 
-class ConfigError extends Error {}
+/** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */
+export const NETWORK_PROFILE = Symbol('NETWORK_PROFILE');
 
-function requirePositive(name: string, raw: string | undefined, fallback?: number): number {
-  const value = raw === undefined || raw === '' ? fallback : Number(raw);
-  if (value === undefined || Number.isNaN(value) || value < 0) {
-    throw new ConfigError(`Invalid or missing numeric config ${name}: ${String(raw)}`);
-  }
-  return value;
+/** The entries of a comma separated endpoint list, trimmed, without empty items. */
+export function endpointList(csv: string): string[] {
+  return splitList(csv);
+}
+
+/** The origin list in the shape the `cors` package takes: `*`, or the exact origins. */
+export function corsOriginOf(cfg: Pick<ApiConfig, 'corsOrigins'>): '*' | string[] {
+  return cfg.corsOrigins === '*' ? '*' : splitList(cfg.corsOrigins);
 }
 
 /**
- * Builds and validates the API config from the environment, failing fast on bad input.
- * In production these env vars are expected to be injected from a secrets manager
- * (Vault / AWS Secrets Manager / k8s secrets) — never committed. See README.
+ * The accepted API keys (`GH_API_KEYS`, comma separated). An empty list means the authentication is off, which is for
+ * development only: with `NODE_ENV=production` it throws, so that the boot fails instead of serving an open API.
  */
-export function apiConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ApiConfig {
-  const apiKeys = (env.GH_API_KEYS ?? '')
-    .split(',')
-    .map((k) => k.trim())
-    .filter(Boolean);
-
-  if (apiKeys.length === 0 && env.NODE_ENV === 'production') {
-    // Don't hard-fail (allows a deliberately public deployment) but make it loud.
-    new Logger('ApiConfig').warn('GH_API_KEYS is empty in production — the API is UNAUTHENTICATED.');
+export function apiKeysOf(cfg: Pick<ApiConfig, 'apiKeys'>, env: NodeJS.ProcessEnv = process.env): string[] {
+  const keys = splitList(cfg.apiKeys);
+  if (keys.length === 0 && env.NODE_ENV === 'production') {
+    throw new Error('GH_API_KEYS must be set in production');
   }
-
-  return {
-    port: requirePositive('GH_HTTP_API_PORT', env.GH_HTTP_API_PORT, 3001),
-    corsOrigins: (env.GH_CORS_ORIGINS ?? '')
-      .split(',')
-      .map((o) => o.trim())
-      .filter(Boolean),
-    rateLimit: requirePositive('GH_RATE_LIMIT', env.GH_RATE_LIMIT, 600),
-    rateLimitWindow: requirePositive('GH_RATE_LIMIT_WINDOW', env.GH_RATE_LIMIT_WINDOW, 60),
-    xrplEndpoint: env.GH_XRPL_NODE_ENDPOINT ?? 'wss://xrplcluster.com',
-    apiKeys,
-    liveCacheTtlMs: requirePositive('GH_LIVE_CACHE_TTL_MS', env.GH_LIVE_CACHE_TTL_MS, 10_000),
-    trustProxyHops: requirePositive('GH_TRUST_PROXY_HOPS', env.GH_TRUST_PROXY_HOPS, 1),
-  };
+  return keys;
 }
 
-export const API_CONFIG = Symbol('API_CONFIG');
+let loading: Promise<ApiConfig> | undefined;
 
-@Global()
-@Module({
-  providers: [{ provide: API_CONFIG, useFactory: () => apiConfigFromEnv() }],
-  exports: [API_CONFIG],
-})
-export class ConfigModule {}
+/**
+ * Registers and returns the API configuration. Safe to call any number of times: the toolbox ConfigService throws on
+ * a second registration of the same schema, so `main.ts` (which needs the ports) and the AppModule share this promise.
+ */
+export function loadApiConfig(): Promise<ApiConfig> {
+  loading ??= (async () => {
+    await GateHubConfigModule.forFeature(ApiConfig);
+    return new ConfigService().get(ApiConfig);
+  })();
+  return loading;
+}

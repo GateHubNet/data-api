@@ -14,7 +14,6 @@
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
     "format": "prettier --write \"{apps,packages}/**/src/**/*.ts\"",
-    "swagger": "pnpm --filter @gatehub/data-api-service swagger",
     "ch:migrate": "pnpm --filter @gatehub/data-api-shared ch:migrate",
     "start:api": "pnpm --filter @gatehub/data-api-service start:dev",
     "start:syncer": "pnpm --filter @gatehub/data-syncer start:dev",

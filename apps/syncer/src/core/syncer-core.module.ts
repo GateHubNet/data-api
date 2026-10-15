@@ -4,6 +4,7 @@ import {
   NetworkProfile,
   NodeClient,
   parseContextFor,
+  ShutdownSignals,
 } from '@gatehub/data-api-shared';
 import { DynamicModule, Global, Inject, Injectable, Logger, Module, OnApplicationShutdown } from '@nestjs/common';
 import { NETWORK_PROFILE, NODE_CLIENT, PARSE_CONTEXT, SyncerConfig } from '../config/syncer.config';
@@ -12,7 +13,6 @@ import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { WorkerModule } from '../worker-registry';
 import { migrateOnBoot } from './migrate-on-boot';
 import { createNodeClient } from './node-client.provider';
-import { ShutdownSignals } from './shutdown-signals';
 
 /**
  * Token of the async provider that applies the boot-time migrations. Nest awaits async providers before it calls any

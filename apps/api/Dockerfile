@@ -18,7 +18,6 @@ COPY . .
 RUN pnpm install \
   && pnpm --filter @gatehub/data-api-shared build \
   && pnpm --filter @gatehub/data-api-service build \
-  && pnpm --filter @gatehub/data-api-service swagger \
   && pnpm --filter @gatehub/data-api-service --legacy deploy --prod /app/out
 
 FROM node:20-bookworm-slim

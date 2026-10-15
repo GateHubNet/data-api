@@ -22,6 +22,9 @@ export * from './network';
 // Node connection
 export * from './xrpl/node-client';
 
+// Nest helpers
+export * from './nest/shutdown-signals';
+
 // Ingest
 export * from './ingest/raw-ledger';
 export * from './ingest/ledger-source';

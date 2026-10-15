@@ -1,6 +1,6 @@
-import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Client } from 'xrpl';
-import { API_CONFIG, ApiConfig } from '../config/api.config';
+import { ApiConfig, endpointList } from '../config/api.config';
 
 /**
  * Lazily-connected XRPL client for endpoints that need *live* ledger state
@@ -13,8 +13,9 @@ export class XrplService implements OnModuleDestroy {
   private readonly client: Client;
   private connecting?: Promise<void>;
 
-  constructor(@Inject(API_CONFIG) config: ApiConfig) {
-    this.client = new Client(config.xrplEndpoint, { connectionTimeout: 15_000 });
+  constructor(config: ApiConfig) {
+    // Task 18 rewrites this service on the NodeClient over every endpoint; until then the first one serves.
+    this.client = new Client(endpointList(config.nodeEndpoints)[0], { connectionTimeout: 15_000 });
   }
 
   private async ensureConnected(): Promise<void> {

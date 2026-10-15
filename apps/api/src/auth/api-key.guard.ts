@@ -1,37 +1,48 @@
-import { CanActivate, ExecutionContext, Inject, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
-import { timingSafeEqual } from 'node:crypto';
+import { CanActivate, ExecutionContext, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { Request } from 'express';
-import { API_CONFIG, ApiConfig } from '../config/api.config';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { UNAUTHORIZED_MESSAGE } from '../common/ripple-error.filter';
+import { ApiConfig, apiKeysOf } from '../config/api.config';
+
+const digest = (key: string): Buffer => createHash('sha256').update(key).digest();
 
 /**
  * API-key authentication.
  *
- * Clients send their key in a header — either `X-API-Key: <key>` or the standard
- * `Authorization: Bearer <key>`. (Header, not query string: query params leak into
- * access logs, browser history and referrers.) Keys are compared in constant time.
+ * Clients send their key in a header: either `X-API-Key: <key>` or the standard `Authorization: Bearer <key>`. (Header,
+ * not query string: query params leak into access logs, browser history and referrers.) Keys are compared in constant
+ * time.
  *
- * If no keys are configured (`GH_API_KEYS` empty) the guard is a no-op so local/dev
- * works out of the box; in production an empty key set logs a loud warning (see config).
+ * If no keys are configured (`GH_API_KEYS` empty) the guard lets everything through so local development works out
+ * of the box; `apiKeysOf` refuses an empty list in production, so a deployed API is never open by accident.
  *
- * Operational paths (`/liveliness/*`, `/metricz`, `/internal/docs*`) are always allowed
- * so probes and scrapers don't need a key.
+ * The liveliness probe (`/liveliness/*`) needs no key. The Prometheus scrape endpoint is a separate app on its own
+ * port, and the swagger docs are served by the toolbox outside the Nest routes, so neither reaches this guard.
+ * The guard throws the 401; `RippleErrorFilter` of the route's controller renders it.
  */
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
-  private readonly logger = new Logger(ApiKeyGuard.name);
-  private readonly openPaths = [/^\/liveliness\//, /^\/metricz/, /^\/internal\/docs/];
+  private readonly openPaths = [/^\/liveliness\//];
+  /** SHA-256 of each key: equal-length buffers, so the comparison takes the same time whatever the lengths. */
+  private readonly digests: Buffer[];
 
-  constructor(@Inject(API_CONFIG) private readonly config: ApiConfig) {}
+  constructor(config: ApiConfig) {
+    const keys = apiKeysOf(config);
+    this.digests = keys.map(digest);
+    if (keys.length === 0) {
+      new Logger(ApiKeyGuard.name).warn('GH_API_KEYS is empty: the API is UNAUTHENTICATED (development only).');
+    }
+  }
 
   canActivate(context: ExecutionContext): boolean {
-    if (this.config.apiKeys.length === 0) return true; // auth disabled
+    if (this.digests.length === 0) return true; // authentication disabled
 
     const req = context.switchToHttp().getRequest<Request>();
     if (this.openPaths.some((re) => re.test(req.path))) return true;
 
     const presented = this.extractKey(req);
     if (!presented || !this.isValid(presented)) {
-      throw new UnauthorizedException('Missing or invalid API key.');
+      throw new UnauthorizedException(UNAUTHORIZED_MESSAGE);
     }
     return true;
   }
@@ -46,13 +57,10 @@ export class ApiKeyGuard implements CanActivate {
 
   /** Constant-time comparison against every configured key. */
   private isValid(presented: string): boolean {
-    const presentedBuf = Buffer.from(presented);
+    const candidate = digest(presented);
     let matched = false;
-    for (const key of this.config.apiKeys) {
-      const keyBuf = Buffer.from(key);
-      // timingSafeEqual requires equal lengths; compare against a same-length buffer.
-      const a = keyBuf.length === presentedBuf.length ? presentedBuf : Buffer.alloc(keyBuf.length);
-      if (timingSafeEqual(keyBuf, a) && keyBuf.length === presentedBuf.length) matched = true;
+    for (const key of this.digests) {
+      if (timingSafeEqual(key, candidate)) matched = true;
     }
     return matched;
   }

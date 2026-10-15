@@ -13,7 +13,7 @@ interface Booted {
   tokens: typeof import('./config/syncer.config');
   INGEST_STATUS: symbol;
   LiveRunner: typeof import('./ingest/live-runner').LiveRunner;
-  ShutdownSignals: typeof import('./core/shutdown-signals').ShutdownSignals;
+  ShutdownSignals: typeof import('@gatehub/data-api-shared').ShutdownSignals;
   clickhouse: { ping: jest.Mock };
   node: { start: jest.Mock; stop: jest.Mock; serverInfo: jest.Mock };
   baseUrl: string;
@@ -61,7 +61,7 @@ async function boot(
       // Imported before app.module: once it is imported, its config load races `setLogger(QUIET)` below.
       const { INGEST_STATUS } = await import('./modules/liveliness/ingest-status');
       const { LiveRunner } = await import('./ingest/live-runner');
-      const { ShutdownSignals } = await import('./core/shutdown-signals');
+      const { ShutdownSignals } = await import('@gatehub/data-api-shared');
       const { AppModule } = await import('./app.module');
       const clickhouse = { ping: jest.fn(async () => pingOk), onModuleDestroy: jest.fn() };
       const node = {
