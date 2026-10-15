@@ -23,6 +23,7 @@ import { NotFoundModule } from './common/not-found.controller';
 import { ApiConfig, apiKeysOf, corsOriginOf, loadApiConfig, NETWORK_PROFILE } from './config/api.config';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
+import { TransactionsModule } from './transactions/transactions.module';
 import { XrplModule } from './xrpl/xrpl.module';
 
 /**
@@ -46,7 +47,7 @@ assembled.catch(() => undefined);
  * The Ripple endpoint modules. Each of the Phase 5-8 tasks adds its module here. They are listed BEFORE the
  * `NotFoundModule` below, the `/v2/*` catch-all, which has to be the last thing Nest registers.
  */
-const ENDPOINT_MODULES: Type<unknown>[] = [LedgersModule];
+const ENDPOINT_MODULES: Type<unknown>[] = [LedgersModule, TransactionsModule];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */
 function cacheControl(value: string) {
