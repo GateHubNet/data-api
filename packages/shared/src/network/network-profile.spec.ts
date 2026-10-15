@@ -65,13 +65,35 @@ describe('network profiles', () => {
   });
 
   describe('definitionsFallback', () => {
+    let dir: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-definitions-'));
+    });
+
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
     it('is undefined on xrpl (the codec ships its own definitions)', () => {
       expect(getNetworkProfile('xrpl').definitionsFallback()).toBeUndefined();
     });
 
-    it('does not throw on xahau, whether or not the bundled JSON exists yet', () => {
-      const definitions = getNetworkProfile('xahau').definitionsFallback();
-      expect(definitions === undefined || typeof definitions === 'object').toBe(true);
+    it('ignores a definitions path on xrpl', () => {
+      const file = join(dir, 'xrpl.json');
+      writeFileSync(file, JSON.stringify({ TRANSACTION_TYPES: { Payment: 0 } }));
+      expect(getNetworkProfile('xrpl').definitionsFallback(file)).toBeUndefined();
+    });
+
+    it('reads and parses the definitions file on xahau', () => {
+      const file = join(dir, 'xahau.json');
+      const definitions = { TRANSACTION_TYPES: { Payment: 0, Import: 97 }, FIELDS: [] };
+      writeFileSync(file, JSON.stringify(definitions));
+      expect(getNetworkProfile('xahau').definitionsFallback(file)).toEqual(definitions);
+    });
+
+    it('is undefined on xahau when the definitions file is missing', () => {
+      expect(getNetworkProfile('xahau').definitionsFallback(join(dir, 'missing.json'))).toBeUndefined();
     });
   });
 

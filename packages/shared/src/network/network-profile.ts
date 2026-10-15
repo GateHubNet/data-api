@@ -28,24 +28,20 @@ export interface NetworkProfile {
   partialPaymentFixLedger: number;
   /**
    * Binary-codec definitions (the `server_definitions` result shape) to use when the node cannot supply them.
-   * `undefined` means the codec's built-in definitions apply.
+   * `undefined` means the codec's built-in definitions apply, or, on xahau, that no definitions file has been
+   * bundled yet. The file defaults to `config/definitions/<network>.json`; `definitionsPath` overrides it (tests).
    */
-  definitionsFallback(): Record<string, unknown> | undefined;
+  definitionsFallback(definitionsPath?: string): Record<string, unknown> | undefined;
 }
 
-// `src/network` and `dist/network` are both two levels below the package root.
+// `src/network` and `dist/network` are both two levels below the package root, which ships `config/` in `files`.
 const PACKAGE_ROOT = join(__dirname, '..', '..');
 const DEFAULT_MARKETS_DIR = join(PACKAGE_ROOT, 'config', 'markets');
+const DEFAULT_DEFINITIONS_DIR = join(PACKAGE_ROOT, 'config', 'definitions');
 
-/** Candidate locations of the bundled Xahau definitions: next to this file (copied build), then the sources. */
-const XAHAU_DEFINITIONS_PATHS = [
-  join(__dirname, 'definitions', 'xahau.json'),
-  join(PACKAGE_ROOT, 'src', 'network', 'definitions', 'xahau.json'),
-];
-
-function readXahauDefinitions(): Record<string, unknown> | undefined {
-  const path = XAHAU_DEFINITIONS_PATHS.find((candidate) => existsSync(candidate));
-  return path ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>) : undefined;
+function readDefinitions(name: NetworkName, definitionsPath?: string): Record<string, unknown> | undefined {
+  const file = definitionsPath ?? join(DEFAULT_DEFINITIONS_DIR, `${name}.json`);
+  return existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>) : undefined;
 }
 
 const PROFILES: Record<NetworkName, NetworkProfile> = {
@@ -63,7 +59,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     nativeCurrency: 'XAH',
     defaultDatabase: 'xahau',
     partialPaymentFixLedger: 0,
-    definitionsFallback: readXahauDefinitions,
+    definitionsFallback: (definitionsPath) => readDefinitions('xahau', definitionsPath),
   },
 };
 
