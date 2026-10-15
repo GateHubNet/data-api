@@ -4,6 +4,7 @@ import {
   getNetworkProfile,
   NetworkName,
   parseContextFor,
+  PaymentsRow,
   RawLedger,
   RawTransaction,
   TransactionsRow,
@@ -60,6 +61,20 @@ export function fixtureTransactions(seed: SeedName): FixtureTx[] {
       const rows = buildLedgerRows(ledger, ctx).transactions;
       return ledger.transactions.map((tx, i) => ({ ledger, tx, row: rows[i] }));
     });
+}
+
+/** A payment of a fixture ledger, as the syncer stores it in `payments`, with the ledger it is in. */
+export interface FixturePayment {
+  ledger: RawLedger;
+  row: PaymentsRow;
+}
+
+/** Every payment of a fixture set, as `buildLedgerRows` stores it, in the order of the ledgers and of their transactions. */
+export function fixturePayments(seed: SeedName): FixturePayment[] {
+  const ctx = parseContextFor(getNetworkProfile(SEED_NETWORK[seed]));
+  return fixtureSource(seed)
+    .list()
+    .flatMap((ledger) => buildLedgerRows(ledger, ctx).payments.map((row) => ({ ledger, row })));
 }
 
 /** One transaction of a fixture set by its hash. */
