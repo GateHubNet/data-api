@@ -86,7 +86,12 @@ export type StoredExchange = Pick<
 // 1 / rate, with room for the rates the ledger allows: an amount runs from 1e-81 to 1e96, so a rate and its inverse
 // need up to some 180 decimal places to keep eight significant digits. The default of 20 would turn the inverse of a
 // rate above 1e12 into 0.
-const Inverse = BigNumber.clone({ DECIMAL_PLACES: 200 });
+const Wide = BigNumber.clone({ DECIMAL_PLACES: 200 });
+
+/** `a / b` with the room of an inverse rate (see above): a rate, its inverse or a vwap keep their eight digits. */
+export function ratio(a: BigNumber.Value, b: BigNumber.Value): BigNumber {
+  return new Wide(a).dividedBy(b);
+}
 
 /**
  * The Exchange of a stored row. `inverted` is a pair that was asked for the other way round than it is stored (see
@@ -107,7 +112,7 @@ export function toExchangeObject(row: StoredExchange, inverted = false): Exchang
     base_amount: base.amount,
     counter_amount: counter.amount,
     node_index: row.node_index,
-    rate: precision8(inverted ? new Inverse(1).dividedBy(row.rate) : row.rate),
+    rate: precision8(inverted ? ratio(1, row.rate) : row.rate),
     tx_index: row.tx_index,
     // `autobridged_issuer` is stored as null when the currency has none; '' is the same to a client
     ...(row.autobridged_currency !== null && { autobridged_currency: row.autobridged_currency }),

@@ -1,5 +1,6 @@
 import { Asset, ExchangesRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
+import { bucketExpr, bucketStart, EXCHANGE_INTERVALS } from '../src/exchanges/exchange-intervals';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { FixtureExchange, fixtureExchanges, fixtureSource } from './support/fixtures';
 
@@ -10,23 +11,25 @@ import { FixtureExchange, fixtureExchanges, fixtureSource } from './support/fixt
  * of them autobridged). The Xahau ledgers recorded from a public node hold no exchange, so the Xahau case seeds
  * synthetic rows.
  *
- * Ported from rippled-historical-database `test/test.exchanges.js`, the raw-trade `it`s (11 of 14, same titles):
+ * Ported from rippled-historical-database `test/test.exchanges.js`, all 14 `it`s, same titles:
  *  - 'should make sure exchanges handles pagination correctly' walks the pair with `limit=1` and compares each page with
  *    the unpaged list, as the original does; only the marker is this API's;
  *  - 'should include a link header when marker is present' expected the HBase row key as the marker
  *    (`USD|rMwj…|XRP||20150114182720|000011119603|00012|00004`, the first row of the next page); the marker of this API
  *    is `(ledger_index, tx_index, node_index)` of the last row of the page, so the test checks the Link around it and
- *    that the row the original named is the first of the next page.
- * Skipped, because the aggregated path (`interval`, `reduce`) is Task 23:
- *  - 'should should reduce exchanges to a single row'
- *  - 'should should get aggregate exchanges'
- *  - 'should return an error for an invalid interval'
+ *    that the row the original named is the first of the next page;
+ *  - the aggregated path (`interval`, `reduce`, Task 23): 'should should reduce exchanges to a single row', 'should
+ *    should get aggregate exchanges' (the original's comment says there will be no aggregate: there is one, of the 5
+ *    exchanges) and 'should return an error for an invalid interval'.
  * The three missing-issuer / issuer-with-XRP `it`s pass `interval=3weeks` in the original and are ported as they are:
- * the pair is checked before the interval (it will stay so when Task 23 adds the interval checks).
+ * the pair is checked before the interval.
  *
  * Added: the Exchange object (key order of the HBase row, types, what is left out), both orientations of every pair of
  * the mock ledgers, the order of the checks, limit, the markers, CSV, the SQL (full-key ORDER BY, plan read in order),
- * rows written twice, the all-pairs list and Xahau.
+ * rows written twice, the all-pairs list and Xahau. For the aggregated path: candles and reduce of every pair in both
+ * orientations against an oracle written from the original (`lib/aggregation/exchanges.js`, `getAlignedTime`,
+ * `hbase.getExchanges` reduce and `invertPair`), the native legs of 0.0005 or less, the buckets of the window, the
+ * bucket markers, CSV, the SQL and its plan, and the bucket boundaries of every interval on synthetic ledgers.
  */
 
 const byKey = (a: FixtureExchange, b: FixtureExchange): number =>
@@ -148,6 +151,235 @@ const CSV_COLUMNS = [
   'tx_hash',
 ];
 
+// -- the aggregated path: an oracle written from the original ---------------------------------------------------------
+
+/** BigNumber with room for the inverse of a rate far from 1. */
+const Wide = BigNumber.clone({ DECIMAL_PLACES: 120 });
+
+/**
+ * `utils.getAlignedTime(time, period, multiple)` of the original (moment, UTC), written out on Date: the start of the
+ * bucket of `interval` that holds the time. n minutes and n hours are clock-aligned, n days count from 2013-01-01 (in
+ * whole hours over 24, as moment's diff did), 7 days are the ISO week from Monday, months and years the calendar ones.
+ */
+function alignedTime(seconds: number, interval: string): number {
+  const m = /^(\d+)(minute|hour|day|month|year)$/.exec(interval === 'week' ? '7day' : interval);
+  if (!m) throw new Error(`not an interval: ${interval}`);
+  let multiple = Number(m[1]);
+  let period = m[2];
+  if (period === 'day' && multiple === 7) {
+    period = 'week';
+    multiple = 1;
+  }
+  const d = new Date(seconds * 1000);
+  switch (period) {
+    case 'minute':
+      d.setUTCSeconds(0, 0);
+      d.setUTCMinutes(d.getUTCMinutes() - (d.getUTCMinutes() % multiple));
+      break;
+    case 'hour':
+      d.setUTCMinutes(0, 0, 0);
+      d.setUTCHours(d.getUTCHours() - (d.getUTCHours() % multiple));
+      break;
+    case 'day': {
+      const diff = Math.trunc((seconds * 1000 - Date.UTC(2013, 0, 1)) / 3_600_000) / 24;
+      const days = multiple === 1 ? 0 : Math.floor(diff) % multiple;
+      d.setUTCHours(0, 0, 0, 0);
+      d.setUTCDate(d.getUTCDate() - days);
+      break;
+    }
+    case 'week':
+      d.setUTCHours(0, 0, 0, 0);
+      d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+      break;
+    case 'month':
+      d.setUTCHours(0, 0, 0, 0);
+      d.setUTCDate(1);
+      break;
+    default:
+      d.setUTCHours(0, 0, 0, 0);
+      d.setUTCMonth(0, 1);
+  }
+  return d.getTime() / 1000;
+}
+
+/**
+ * The exchanges the original aggregates: one whose native leg is 0.0005 or less ("tiny amounts that exist from rounding
+ * errors in XRP") is left out. The native side is the one without an issuer.
+ */
+const aggregated = (rows: ExchangesRow[]): ExchangesRow[] =>
+  rows.filter(
+    (r) =>
+      !(r.base_issuer === '' && Number(r.base_amount) <= 0.0005) &&
+      !(r.counter_issuer === '' && Number(r.counter_amount) <= 0.0005),
+  );
+
+const sumOf = (values: string[]): BigNumber => values.reduce((s, v) => s.plus(v), new Wide(0));
+const p8 = (x: BigNumber.Value): string => new Wide(x).toPrecision(8);
+
+/**
+ * What the original computed from a list of exchanges of one pair, as stored and in the order of the key: open and
+ * close are the first and last exchange, high and low the highest and lowest rate (the first of equal ones, as its
+ * strict comparisons kept), vwap the counter volume over the base volume, the buy volume the base of the exchanges the
+ * taker bought. Inverted (`invertPair`, and the per-row inversion of the reduce path): the rates are 1/rate, so high
+ * is 1/low and low 1/high, the volumes swap, and the buy volume is that of the inverted exchanges: the counter of those
+ * the taker sold. The volumes are the exact sums of the stored amounts (the original summed floats), written as a
+ * number is.
+ */
+function figuresOf(rows: ExchangesRow[], inverted: boolean) {
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  const rates = rows.map((r) => Number(r.rate));
+  const lowest = rows[rates.indexOf(Math.min(...rates))].rate;
+  const highest = rows[rates.indexOf(Math.max(...rates))].rate;
+  const base = sumOf(rows.map((r) => r.base_amount));
+  const counter = sumOf(rows.map((r) => r.counter_amount));
+  const inv = (rate: string): BigNumber => new Wide(1).dividedBy(rate);
+  const times = { open_time: executedTime(first.close_time), close_time: executedTime(last.close_time) };
+  return inverted
+    ? {
+        open: p8(inv(first.rate)),
+        high: p8(inv(lowest)),
+        low: p8(inv(highest)),
+        close: p8(inv(last.rate)),
+        vwap: p8(base.dividedBy(counter)),
+        base_volume: counter.toString(),
+        counter_volume: base.toString(),
+        buy_volume: sumOf(rows.filter((r) => r.seller === r.taker).map((r) => r.counter_amount)).toNumber(),
+        count: rows.length,
+        ...times,
+      }
+    : {
+        open: p8(first.rate),
+        high: p8(highest),
+        low: p8(lowest),
+        close: p8(last.rate),
+        vwap: p8(counter.dividedBy(base)),
+        base_volume: base.toString(),
+        counter_volume: counter.toString(),
+        buy_volume: sumOf(rows.filter((r) => r.buyer === r.taker).map((r) => r.base_amount)).toNumber(),
+        count: rows.length,
+        ...times,
+      };
+}
+
+/** The pair fields the route sets: the pair as it was asked for, the native currency without an issuer key. */
+function pairFields(m: Market, inverted: boolean): Record<string, string> {
+  const [base, counter] = inverted ? [m.counter, m.base] : [m.base, m.counter];
+  return {
+    base_currency: base.currency,
+    ...(base.issuer && { base_issuer: base.issuer }),
+    counter_currency: counter.currency,
+    ...(counter.issuer && { counter_issuer: counter.issuer }),
+  };
+}
+
+/**
+ * The candles of a pair (rows as stored, in key order): one per bucket that holds an exchange, oldest first, with the
+ * keys of the HBase row of `agg_exchanges` (the `d` family sorted by name) and then the pair.
+ */
+function candlesOf(m: Market, interval: string, inverted: boolean, rows = m.rows.map((e) => e.row)) {
+  const buckets = new Map<number, ExchangesRow[]>();
+  for (const r of aggregated(rows)) {
+    const start = alignedTime(r.close_time, interval);
+    buckets.set(start, [...(buckets.get(start) ?? []), r]);
+  }
+  return [...buckets.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([start, list]) => {
+      const f = figuresOf(list, inverted);
+      return {
+        base_volume: f.base_volume,
+        buy_volume: f.buy_volume,
+        close: f.close,
+        close_time: f.close_time,
+        count: f.count,
+        counter_volume: f.counter_volume,
+        high: f.high,
+        low: f.low,
+        open: f.open,
+        open_time: f.open_time,
+        start: executedTime(start),
+        vwap: f.vwap,
+        ...pairFields(m, inverted),
+      };
+    });
+}
+
+/**
+ * The reduced row of a pair: the keys of the literal of the original's `reduce`, then `start` and the pair. Without an
+ * exchange it is the original's row of zeros, without open and close time. `start` is the start of the window.
+ */
+function reducedOf(m: Market, inverted: boolean, start: string, rows = m.rows.map((e) => e.row)) {
+  const list = aggregated(rows);
+  if (list.length === 0) {
+    return {
+      open: '0.0000000',
+      high: '0.0000000',
+      low: '0.0000000',
+      close: '0.0000000',
+      base_volume: '0',
+      counter_volume: '0',
+      buy_volume: 0,
+      count: 0,
+      vwap: '0.0000000',
+      start,
+      ...pairFields(m, inverted),
+    };
+  }
+  const f = figuresOf(list, inverted);
+  return {
+    open: f.open,
+    high: f.high,
+    low: f.low,
+    close: f.close,
+    base_volume: f.base_volume,
+    counter_volume: f.counter_volume,
+    buy_volume: f.buy_volume,
+    count: f.count,
+    open_time: f.open_time,
+    close_time: f.close_time,
+    vwap: f.vwap,
+    start,
+    ...pairFields(m, inverted),
+  };
+}
+
+/**
+ * Served aggregates against the oracle: the keys in their order, then every field. The volumes too, exactly: they are
+ * the exact sums of the stored amounts.
+ */
+function expectAggregates(
+  label: unknown,
+  served: Record<string, unknown>[],
+  expected: Record<string, unknown>[],
+): void {
+  expect([label, served.map((o) => Object.keys(o))]).toEqual([label, expected.map((o) => Object.keys(o))]);
+  expect([label, served]).toEqual([label, expected]);
+}
+
+/** The columns of the CSV of candles and of the reduced row: the original's list, and the buy volume it left out. */
+const AGGREGATE_CSV_COLUMNS = [
+  'open',
+  'high',
+  'low',
+  'close',
+  'vwap',
+  'count',
+  'base_currency',
+  'base_issuer',
+  'base_volume',
+  'counter_currency',
+  'counter_issuer',
+  'counter_volume',
+  'open_time',
+  'close_time',
+  'start',
+  'buy_volume',
+];
+
+/** The marker of a candle: the unix seconds of the start of its bucket, as base64url JSON. */
+const bucketMarker = (iso: string): string => Buffer.from(JSON.stringify([unix(iso)]), 'utf8').toString('base64url');
+
 describe('exchanges API endpoint', () => {
   let h: Harness;
   let api: ApiClient;
@@ -259,6 +491,24 @@ describe('exchanges API endpoint', () => {
     });
   });
 
+  it('should should reduce exchanges to a single row', async () => {
+    const res = await get(`/v2/exchanges/${PAIR}?reduce=true`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body).toBe('object');
+    expect(res.body.result).toBe('success');
+    expect(res.body.exchanges[0].count).toBe(5);
+  });
+
+  // the original's comment: "there will not be any aggregates to be found"; there is one, the hour of the 5 exchanges
+  it('should should get aggregate exchanges', async () => {
+    const res = await get(`/v2/exchanges/${PAIR}?interval=1hour`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body).toBe('object');
+    expect(res.body.result).toBe('success');
+    expect(res.body.exchanges.length).toBe(1);
+    expect(res.body.exchanges[0].count).toBe(5);
+  });
+
   it('should return an error for an invalid start date', async () => {
     const res = await get(`/v2/exchanges/${PAIR}?start=2015x`);
     expect(res.status).toBe(400);
@@ -273,6 +523,14 @@ describe('exchanges API endpoint', () => {
     expect(typeof res.body).toBe('object');
     expect(res.body.result).toBe('error');
     expect(res.body.message).toBe('invalid end date format');
+  });
+
+  it('should return an error for an invalid interval', async () => {
+    const res = await get(`/v2/exchanges/${PAIR}?interval=3weeks`);
+    expect(res.status).toBe(400);
+    expect(typeof res.body).toBe('object');
+    expect(res.body.result).toBe('error');
+    expect(res.body.message).toBe('invalid interval: 3weeks');
   });
 
   it('should return an error for an missing base issuer', async () => {
@@ -377,6 +635,108 @@ describe('exchanges API endpoint', () => {
     }
     const reversed = await get(`/v2/exchanges/xrp/usd+${USD_ISSUER}`);
     expect(reversed.body.exchanges).toEqual(exchangesOf(USD_XRP.rows, true));
+  });
+
+  // -- the brief of the aggregated path (Task 23) ---------------------------------------------------------------------
+
+  it('3day buckets align to 2013-01-01', async () => {
+    // the bucket expression, run on the ClickHouse of the harness
+    const times = [
+      '2013-01-01T00:00:00',
+      '2013-01-03T23:59:59',
+      '2013-01-04T00:00:00',
+      '2014-12-31T00:00:00',
+      '2015-01-02T23:59:59',
+      '2015-01-03T00:00:00',
+      '2015-01-14T18:27:20',
+    ];
+    const rows = await h.ch.query<{ bucket: number }>(
+      `SELECT toUnixTimestamp(${bucketExpr('3day')}) AS bucket
+         FROM (SELECT arrayJoin({times:Array(UInt32)}) AS t, toDateTime(t, 'UTC') AS close_time) ORDER BY t`,
+      { times: times.map(unix) },
+    );
+    expect(rows.map((r) => executedTime(r.bucket))).toEqual([
+      '2013-01-01T00:00:00Z',
+      '2013-01-01T00:00:00Z',
+      '2013-01-04T00:00:00Z',
+      '2014-12-31T00:00:00Z',
+      '2014-12-31T00:00:00Z',
+      '2015-01-03T00:00:00Z',
+      '2015-01-12T00:00:00Z',
+    ]);
+    // every start is a whole number of 3 days after 2013-01-01
+    for (const r of rows) expect((r.bucket - unix('2013-01-01T00:00:00')) % (3 * 86400)).toBe(0);
+    // and the 3day candle of the mock exchanges starts on the 12th
+    const res = await get(`/v2/exchanges/${PAIR}?interval=3day`);
+    expect(res.body.exchanges.map((e: { start: string }) => e.start)).toEqual(['2015-01-12T00:00:00Z']);
+  });
+
+  it('bucketExpr in ClickHouse, bucketStart and the alignment of the original agree, for every interval', async () => {
+    // times spread over 2013-2030 at an odd step, and for each of them the start of its bucket and the second before;
+    // from 2013-01-01 on, when the first ledger closed (before it the n-day expression and the original's alignment
+    // both go wrong: integer division and moment's diff round towards zero)
+    const samples: number[] = [];
+    for (let t = unix('2013-01-01T00:00:00'); t < unix('2031-01-01T00:00:00'); t += 7_919 * 97 + 13) samples.push(t);
+    for (const interval of EXCHANGE_INTERVALS) {
+      const times = samples
+        .flatMap((t) => [t, alignedTime(t, interval), alignedTime(t, interval) - 1])
+        .filter((t) => t >= unix('2013-01-01T00:00:00'));
+      expect(times.length).toBeGreaterThan(2000);
+      const rows = await h.ch.query<{ t: number; bucket: number }>(
+        `SELECT t, toUnixTimestamp(${bucketExpr(interval)}) AS bucket
+           FROM (SELECT arrayJoin({times:Array(UInt32)}) AS t, toDateTime(t, 'UTC') AS close_time)`,
+        { times },
+      );
+      expect(rows.map((r) => r.t)).toEqual(times);
+      const original = times.map((t) => alignedTime(t, interval));
+      expect([interval, rows.map((r) => r.bucket)]).toEqual([interval, original]);
+      expect([interval, times.map((t) => bucketStart(t, interval))]).toEqual([interval, original]);
+    }
+  });
+
+  it('week alias equals 7day', async () => {
+    expect(bucketExpr('week')).toBe(bucketExpr('7day'));
+    for (const path of [
+      `/v2/exchanges/${PAIR}`,
+      `/v2/exchanges/xrp/${USD}`,
+      `/v2/exchanges/${pathOf(MARKETS[0].base)}/${pathOf(MARKETS[0].counter)}`,
+    ]) {
+      const week = await get(`${path}?interval=week`);
+      const seven = await get(`${path}?interval=7day`);
+      expect([path, week.status]).toEqual([path, 200]);
+      expect([path, week.body]).toEqual([path, seven.body]);
+      expect([path, (await get(`${path}?interval=WEEK`)).body]).toEqual([path, seven.body]);
+      // the ISO week: 2015-01-14 was a Wednesday, its week starts on Monday the 12th
+      expect(week.body.exchanges.map((e: { start: string }) => e.start)).toEqual(['2015-01-12T00:00:00Z']);
+      expect(new Date(week.body.exchanges[0].start).getUTCDay()).toBe(1);
+    }
+  });
+
+  it('reduce returns one row whose count equals raw count', async () => {
+    for (const m of MARKETS) {
+      for (const [base, counter] of [
+        [m.base, m.counter],
+        [m.counter, m.base],
+      ]) {
+        const path = `/v2/exchanges/${pathOf(base)}/${pathOf(counter)}`;
+        const raw = await get(`${path}?limit=400`);
+        const reduced = await get(`${path}?reduce=true`);
+        expect([path, reduced.status, reduced.body.count, reduced.body.exchanges.length]).toEqual([path, 200, 1, 1]);
+        // every exchange of the pair, but those whose native leg is 0.0005 or less
+        const tiny = raw.body.exchanges.length - aggregated(m.rows.map((e) => e.row)).length;
+        expect([path, reduced.body.exchanges[0].count]).toEqual([path, raw.body.count - tiny]);
+      }
+    }
+    // USD/XRP has no tiny leg: all 5
+    expect((await get(`/v2/exchanges/${PAIR}?reduce=true`)).body.exchanges[0].count).toBe(
+      (await get(`/v2/exchanges/${PAIR}`)).body.count,
+    );
+    // and over a window
+    const window = qs({ start: '2015-01-14T18:28:40Z', end: '2015-01-14T18:51:40Z' });
+    const raw = await get(`/v2/exchanges/${PAIR}${window}`);
+    const reduced = await get(`/v2/exchanges/${PAIR}${window}&reduce=true`);
+    expect(raw.body.count).toBe(2);
+    expect(reduced.body.exchanges[0].count).toBe(2);
   });
 
   // -- the Exchange -----------------------------------------------------------------------------------------------
@@ -1091,6 +1451,765 @@ describe('exchanges API endpoint', () => {
     });
   });
 
+  // -- the aggregated path: interval and reduce -----------------------------------------------------------------------
+
+  describe('interval and reduce', () => {
+    type Candle = Record<string, unknown>;
+    const marketOf = (base: string, counter: string): Market =>
+      MARKETS.find((m) => pathOf(m.base) === base && pathOf(m.counter) === counter) as Market;
+    /** CNY+rnuF…/XRP: two of its four exchanges have an XRP leg of 0.000001. */
+    const TINY = marketOf('CNY+rnuF96W4SZoCJmbHYBFoJZpR8eCaxNvekK', 'XRP');
+    const startsOf = (body: { exchanges: Candle[] }): unknown[] => body.exchanges.map((c) => c.start);
+    const b64 = (text: string): string => Buffer.from(text).toString('base64url');
+    const NO_PAIR = `/v2/exchanges/${USD}/EUR+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`;
+    const exchangesCalls = (spy: jest.SpyInstance): unknown[][] =>
+      spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
+
+    it("candles of every pair, in both orientations and every interval, are the original's aggregation", async () => {
+      let candles = 0;
+      for (const interval of EXCHANGE_INTERVALS) {
+        for (const m of MARKETS) {
+          for (const inverted of [false, true]) {
+            const [base, counter] = inverted ? [m.counter, m.base] : [m.base, m.counter];
+            const path = `/v2/exchanges/${pathOf(base)}/${pathOf(counter)}?interval=${interval}&limit=400`;
+            const res = await get(path);
+            expect([path, res.status, res.body.result, res.body.count]).toEqual([
+              path,
+              200,
+              'success',
+              res.body.exchanges.length,
+            ]);
+            expect([path, res.body.marker]).toEqual([path, undefined]);
+            expectAggregates(path, res.body.exchanges, candlesOf(m, interval, inverted));
+            candles += res.body.count;
+          }
+        }
+      }
+      // the mock exchanges lie within 25 minutes: one candle per pair for most intervals, more for the minutes
+      expect(candles).toBeGreaterThan(EXCHANGE_INTERVALS.length * MARKETS.length * 2);
+    });
+
+    it("reduce of every pair, in both orientations, is the original's reduction", async () => {
+      for (const m of MARKETS) {
+        for (const inverted of [false, true]) {
+          const [base, counter] = inverted ? [m.counter, m.base] : [m.base, m.counter];
+          const path = `/v2/exchanges/${pathOf(base)}/${pathOf(counter)}?reduce=true`;
+          const res = await get(path);
+          expect([path, res.status, res.body.result, res.body.count, res.body.marker]).toEqual([
+            path,
+            200,
+            'success',
+            1,
+            undefined,
+          ]);
+          expectAggregates(path, res.body.exchanges, [reducedOf(m, inverted, '2013-01-01T00:00:00Z')]);
+        }
+      }
+    });
+
+    it('a candle has the keys of the agg_exchanges row, then the pair; the reduced row those of the reduce literal', async () => {
+      const KEYS = [
+        'base_volume',
+        'buy_volume',
+        'close',
+        'close_time',
+        'count',
+        'counter_volume',
+        'high',
+        'low',
+        'open',
+        'open_time',
+        'start',
+        'vwap',
+      ];
+      const both = MARKETS.find((m) => m.base.issuer && m.counter.issuer) as Market;
+      const issued = await get(`/v2/exchanges/${pathOf(both.base)}/${pathOf(both.counter)}?interval=1day`);
+      expect(Object.keys(issued.body.exchanges[0])).toEqual([
+        ...KEYS,
+        'base_currency',
+        'base_issuer',
+        'counter_currency',
+        'counter_issuer',
+      ]);
+      // the native currency has no issuer key, on either side
+      const native = await get(`/v2/exchanges/${PAIR}?interval=1day`);
+      expect(Object.keys(native.body.exchanges[0])).toEqual([
+        ...KEYS,
+        'base_currency',
+        'base_issuer',
+        'counter_currency',
+      ]);
+      const inverted = await get(`/v2/exchanges/xrp/${USD}?interval=1day`);
+      expect(Object.keys(inverted.body.exchanges[0])).toEqual([
+        ...KEYS,
+        'base_currency',
+        'counter_currency',
+        'counter_issuer',
+      ]);
+      const reduced = await get(`/v2/exchanges/${PAIR}?reduce=true`);
+      expect(Object.keys(reduced.body.exchanges[0])).toEqual([
+        'open',
+        'high',
+        'low',
+        'close',
+        'base_volume',
+        'counter_volume',
+        'buy_volume',
+        'count',
+        'open_time',
+        'close_time',
+        'vwap',
+        'start',
+        'base_currency',
+        'base_issuer',
+        'counter_currency',
+      ]);
+      // the response is the list of the raw route
+      expect(Object.keys(native.body)).toEqual(['result', 'count', 'exchanges']);
+      expect(Object.keys(reduced.body)).toEqual(['result', 'count', 'exchanges']);
+    });
+
+    it('prices are 8 significant digits, volumes text, count and buy volume numbers, times YYYY-MM-DDTHH:mm:ssZ', async () => {
+      for (const query of ['interval=1minute', 'interval=1month', 'reduce=true']) {
+        for (const path of [`/v2/exchanges/${PAIR}`, `/v2/exchanges/xrp/${USD}`]) {
+          const res = await get(`${path}?${query}`);
+          expect(res.body.exchanges.length).toBeGreaterThan(0);
+          for (const c of res.body.exchanges as Candle[]) {
+            const where = [path, query];
+            for (const k of ['open', 'high', 'low', 'close', 'vwap']) {
+              expect([where, k, typeof c[k]]).toEqual([where, k, 'string']);
+              expect([where, k, new BigNumber(c[k] as string).toPrecision(8)]).toEqual([where, k, c[k]]);
+            }
+            expect([where, typeof c.base_volume, typeof c.counter_volume]).toEqual([where, 'string', 'string']);
+            expect([where, typeof c.count, typeof c.buy_volume]).toEqual([where, 'number', 'number']);
+            for (const k of ['open_time', 'close_time', 'start']) {
+              expect([where, k, c[k]]).toEqual([where, k, expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/)]);
+            }
+          }
+        }
+      }
+    });
+
+    it('USD/XRP by hand: the minutes, and the buy volume of either side', async () => {
+      const minutes = await get(`/v2/exchanges/${PAIR}?interval=1minute`);
+      expect((minutes.body.exchanges as Candle[]).map((c) => [c.start, c.count])).toEqual([
+        ['2015-01-14T18:27:00Z', 2],
+        ['2015-01-14T18:28:00Z', 1],
+        ['2015-01-14T18:51:00Z', 1],
+        ['2015-01-14T18:52:00Z', 1],
+      ]);
+      // 11119603/1/1 and 11119603/12/4, both at 68.16632582, both bought by the taker
+      const first = minutes.body.exchanges[0];
+      expect(first).toMatchObject({
+        open: '68.166326',
+        high: '68.166326',
+        low: '68.166326',
+        close: '68.166326',
+        vwap: '68.166326',
+        open_time: '2015-01-14T18:27:20Z',
+        close_time: '2015-01-14T18:27:20Z',
+      });
+      // 49.99600000000001 + 0.00399999999999: exactly 50 (the original's float sum said 50.00000000000001 or so)
+      expect([first.base_volume, first.counter_volume, first.buy_volume]).toEqual(['50', '3408.316291', 50]);
+
+      // three exchanges bought by the taker (base 72.136…), two sold (counter 9221.21…)
+      const forward = (await get(`/v2/exchanges/${PAIR}?reduce=true`)).body.exchanges[0];
+      expect(forward).toMatchObject({
+        count: 5,
+        open: '68.166326',
+        close: '68.493151',
+        high: '68.493151',
+        low: '68.166326',
+      });
+      expect([forward.base_volume, forward.counter_volume, forward.buy_volume]).toEqual([
+        '206.76632937372958',
+        '14144.991191',
+        72.13661005922958,
+      ]);
+      const inverted = (await get(`/v2/exchanges/xrp/${USD}?reduce=true`)).body.exchanges[0];
+      expect(inverted).toMatchObject({
+        count: 5,
+        open: p8(new Wide(1).dividedBy('68.16632582')),
+        close: p8(new Wide(1).dividedBy('68.49315073184462378893')),
+        // high is 1 / the lowest rate, low is 1 / the highest
+        high: p8(new Wide(1).dividedBy('68.16632582')),
+        low: p8(new Wide(1).dividedBy('68.49315073184462378893')),
+        base_currency: 'XRP',
+        counter_currency: 'USD',
+        counter_issuer: USD_ISSUER,
+      });
+      expect([inverted.base_volume, inverted.counter_volume, inverted.buy_volume]).toEqual([
+        '14144.991191',
+        '206.76632937372958',
+        9221.213658,
+      ]);
+      expect(inverted.vwap).toBe(p8(new Wide(1).dividedBy(forward.vwap)));
+    });
+
+    it('native legs of 0.0005 or less are left out, the pair asked for either way round', async () => {
+      expect(TINY.rows).toHaveLength(4);
+      expect(TINY.rows.filter((e) => Number(e.row.counter_amount) <= 0.0005)).toHaveLength(2);
+      for (const path of [`/v2/exchanges/${pathOf(TINY.base)}/XRP`, `/v2/exchanges/XRP/${pathOf(TINY.base)}`]) {
+        // the raw list keeps them
+        expect([path, (await get(path)).body.count]).toEqual([path, 4]);
+        expect([path, (await get(`${path}?reduce=true`)).body.exchanges[0].count]).toEqual([path, 2]);
+        const minutes = await get(`${path}?interval=1minute`);
+        expect([path, (minutes.body.exchanges as Candle[]).map((c) => [c.start, c.count])]).toEqual([
+          path,
+          [['2015-01-14T18:27:00Z', 2]],
+        ]);
+      }
+      // CNY+rKiC…/XRP: one of 13 has an XRP leg of 0.000001
+      const cny = marketOf('CNY+rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y', 'XRP');
+      expect(cny.rows).toHaveLength(13);
+      expect((await get(`/v2/exchanges/${pathOf(cny.base)}/XRP?reduce=true`)).body.exchanges[0].count).toBe(12);
+    });
+
+    it('reduce aggregates the whole window: neither limit nor marker cuts it, and it has no marker', async () => {
+      const busiest = MARKETS.reduce((a, b) => (b.rows.length > a.rows.length ? b : a));
+      expect(busiest.rows).toHaveLength(38);
+      const path = `/v2/exchanges/${pathOf(busiest.base)}/${pathOf(busiest.counter)}`;
+      for (const query of [
+        'reduce=true&limit=5',
+        'reduce=true&limit=1',
+        `reduce=true&limit=5&marker=${markerOf(busiest.rows[3].row)}`,
+        'reduce=true&limit=5&descending=true',
+      ]) {
+        const res = await get(`${path}?${query}`);
+        expect([query, res.status, res.body.count, res.body.marker, res.headers.link]).toEqual([
+          query,
+          200,
+          1,
+          undefined,
+          undefined,
+        ]);
+        expectAggregates(query, res.body.exchanges, [reducedOf(busiest, false, '2013-01-01T00:00:00Z')]);
+      }
+      // the original reduced the first page of the scan only (200 by default, 400 at most)
+      expect((await get(`${path}?reduce=true&limit=5`)).body.exchanges[0].count).toBe(38);
+    });
+
+    it('reduce of a window: the exchanges of the ledgers that closed in it; start is the start of the window', async () => {
+      const window = qs({ start: '2015-01-14T18:28:40Z', end: '2015-01-14T18:51:40Z' });
+      const rows = closedBetween(USD_XRP.rows, '2015-01-14T18:28:40', '2015-01-14T18:51:41').map((e) => e.row);
+      expect(rows).toHaveLength(2);
+      for (const inverted of [false, true]) {
+        const path = inverted ? `/v2/exchanges/xrp/${USD}` : `/v2/exchanges/${PAIR}`;
+        const res = await get(`${path}${window}&reduce=true`);
+        expectAggregates([path, window], res.body.exchanges, [
+          reducedOf(USD_XRP, inverted, '2015-01-14T18:28:40Z', rows),
+        ]);
+      }
+      // start as it was asked for, to the second
+      const day = await get(`/v2/exchanges/xrp/${USD}?reduce=true&start=2015-01-14`);
+      expectAggregates('day', day.body.exchanges, [reducedOf(USD_XRP, true, '2015-01-14T00:00:00Z')]);
+      const empty = await get(`/v2/exchanges/xrp/${USD}?reduce=true&start=`);
+      expect(empty.body.exchanges[0].start).toBe('2013-01-01T00:00:00Z');
+    });
+
+    it('reduce of an empty window is the row of zeros the original answered', async () => {
+      const res = await get(`/v2/exchanges/${PAIR}?reduce=true&start=2030-01-01&end=2030-12-31`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        result: 'success',
+        count: 1,
+        exchanges: [
+          {
+            open: '0.0000000',
+            high: '0.0000000',
+            low: '0.0000000',
+            close: '0.0000000',
+            base_volume: '0',
+            counter_volume: '0',
+            buy_volume: 0,
+            count: 0,
+            vwap: '0.0000000',
+            start: '2030-01-01T00:00:00Z',
+            base_currency: 'USD',
+            base_issuer: USD_ISSUER,
+            counter_currency: 'XRP',
+          },
+        ],
+      });
+      // ledgers, but no exchange of the pair in them; and a pair that never traded
+      for (const path of [`/v2/exchanges/${PAIR}?reduce=true&end=2015-01-14T18:27:10Z`, `${NO_PAIR}?reduce=true`]) {
+        const none = await get(path);
+        expect([path, none.status, none.body.count]).toEqual([path, 200, 1]);
+        expectAggregates(path, none.body.exchanges, [
+          reducedOf(
+            path.startsWith(NO_PAIR)
+              ? { ...USD_XRP, counter: { currency: 'EUR', issuer: 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B' } }
+              : USD_XRP,
+            false,
+            '2013-01-01T00:00:00Z',
+            [],
+          ),
+        ]);
+      }
+    });
+
+    it('an interval on an empty window → no rows', async () => {
+      for (const path of [
+        `/v2/exchanges/${PAIR}?interval=1hour&start=2030-01-01&end=2030-12-31`,
+        `/v2/exchanges/${PAIR}?interval=1minute&end=2015-01-14T18:26:59Z`,
+        `/v2/exchanges/${PAIR}?interval=1year&start=2015-01-14T18:00:00Z`,
+        `${NO_PAIR}?interval=1day`,
+      ]) {
+        const res = await get(path);
+        expect([path, res.status, res.body]).toEqual([path, 200, { result: 'success', count: 0, exchanges: [] }]);
+        expect([path, res.headers.link]).toEqual([path, undefined]);
+      }
+    });
+
+    it('the buckets are those that start in the window, each of them whole', async () => {
+      // [params, interval, the first bucket start (inclusive), the bucket starts before (exclusive)]
+      const cases: [Record<string, string>, string, string, string][] = [
+        // a start inside a bucket leaves that bucket out, though it holds exchanges after the start
+        [{ start: '2015-01-14T18:27:30Z' }, '5minute', '2015-01-14T18:27:30', '2100-01-01T00:00:00'],
+        [{ start: '2015-01-14T18:00:01Z' }, '1hour', '2015-01-14T18:00:01', '2100-01-01T00:00:00'],
+        // an end inside a bucket takes it whole, with the exchanges after the end
+        [{ end: '2015-01-14T18:30:00Z' }, '1hour', '2013-01-01T00:00:00', '2015-01-14T18:30:01'],
+        [{ end: '2015-01-14T18:27:10Z' }, '1minute', '2013-01-01T00:00:00', '2015-01-14T18:27:11'],
+        [
+          { start: '2015-01-14T18:28', end: '2015-01-14T18:51' },
+          '1minute',
+          '2015-01-14T18:28:00',
+          '2015-01-14T18:52:00',
+        ],
+        [{ start: '2015-01-14T18', end: '2015-01-14T18' }, '1hour', '2015-01-14T18:00:00', '2015-01-14T19:00:00'],
+        [
+          { start: '2015-01-14T00:00:00Z', end: '2015-01-14T00:00:00Z' },
+          '1day',
+          '2015-01-14T00:00:00',
+          '2015-01-14T00:00:01',
+        ],
+        [{ start: '2015-01-14T00:00:01Z' }, '1day', '2015-01-14T00:00:01', '2100-01-01T00:00:00'],
+        [
+          { start: '2015-01-14T18:25:00Z', end: '2015-01-14T18:50:00Z' },
+          '5minute',
+          '2015-01-14T18:25:00',
+          '2015-01-14T18:50:01',
+        ],
+        // the original read the start and the end to the second
+        [{ start: '2015-01-14T18:25:00.900Z' }, '5minute', '2015-01-14T18:25:00', '2100-01-01T00:00:00'],
+        [{ end: '2015-01-14T18:50:00.500Z' }, '5minute', '2013-01-01T00:00:00', '2015-01-14T18:50:00'],
+      ];
+      for (const [params, interval, from, before] of cases) {
+        for (const inverted of [false, true]) {
+          for (const descending of [false, true]) {
+            const expected = candlesOf(USD_XRP, interval, inverted).filter(
+              (c) => unix(c.start) >= unix(from) && unix(c.start) < unix(before),
+            );
+            if (descending) expected.reverse();
+            const path = `${inverted ? `/v2/exchanges/xrp/${USD}` : `/v2/exchanges/${PAIR}`}${qs({
+              ...params,
+              interval,
+              ...(descending && { descending: 'true' }),
+            })}`;
+            const res = await get(path);
+            expect([path, res.status]).toEqual([path, 200]);
+            expectAggregates(path, res.body.exchanges, expected);
+          }
+        }
+      }
+      // the cases are not trivial: by hand
+      const counts = async (query: string): Promise<unknown[]> =>
+        ((await get(`/v2/exchanges/${PAIR}?${query}`)).body.exchanges as Candle[]).map((c) => [c.start, c.count]);
+      expect(await counts('interval=5minute')).toEqual([
+        ['2015-01-14T18:25:00Z', 3],
+        ['2015-01-14T18:50:00Z', 2],
+      ]);
+      expect(await counts('interval=5minute&start=2015-01-14T18:27:30Z')).toEqual([['2015-01-14T18:50:00Z', 2]]);
+      expect(await counts('interval=1hour&end=2015-01-14T18:30:00Z')).toEqual([['2015-01-14T18:00:00Z', 5]]);
+      expect(await counts('interval=1minute&end=2015-01-14T18:27:10Z')).toEqual([['2015-01-14T18:27:00Z', 2]]);
+    });
+
+    it('candle pages: the marker is the start of the last bucket of the page; the pages make up the list', async () => {
+      for (const path of [`/v2/exchanges/${PAIR}`, `/v2/exchanges/xrp/${USD}`]) {
+        const unpaged = await get(`${path}?interval=1minute`);
+        expect(unpaged.body.count).toBe(4);
+        expect(unpaged.body.marker).toBeUndefined();
+        for (const limit of [1, 2, 3]) {
+          const paged = await pages(`${path}?interval=1minute`, limit);
+          expect([path, limit, paged.flatMap((p) => p.exchanges)]).toEqual([path, limit, unpaged.body.exchanges]);
+          expect(paged.slice(0, -1).every((p) => p.count === limit && p.marker !== undefined)).toBe(true);
+        }
+        // descending reverses, and its markers continue downwards
+        const desc = await get(`${path}?interval=1minute&descending=true`);
+        expect(desc.body.exchanges).toEqual([...unpaged.body.exchanges].reverse());
+        const pagedDesc = await pages(`${path}?interval=1minute&descending=true`, 3);
+        expect(pagedDesc.flatMap((p) => p.exchanges)).toEqual(desc.body.exchanges);
+      }
+      const first = await get(`/v2/exchanges/${PAIR}?interval=1minute&limit=1`);
+      expect(first.body.marker).toBe(bucketMarker('2015-01-14T18:27:00'));
+      const origin = new URL(first.request.url).origin;
+      expect(first.headers.link).toBe(
+        `<${origin}/v2/exchanges/${PAIR}?interval=1minute&limit=1&marker=${first.body.marker}>; rel="next"`,
+      );
+      // exactly as many as the limit: no marker
+      const exact = await get(`/v2/exchanges/${PAIR}?interval=1minute&limit=4`);
+      expect([exact.body.count, exact.body.marker, exact.headers.link]).toEqual([4, undefined, undefined]);
+    });
+
+    it('a candle marker continues strictly after its bucket, whatever time it holds', async () => {
+      const starts = async (query: string): Promise<unknown[]> =>
+        startsOf((await get(`/v2/exchanges/${PAIR}?interval=1minute&${query}`)).body);
+      expect(await starts(`marker=${bucketMarker('2015-01-14T18:28:00')}`)).toEqual([
+        '2015-01-14T18:51:00Z',
+        '2015-01-14T18:52:00Z',
+      ]);
+      expect(await starts(`marker=${bucketMarker('2015-01-14T18:28:00')}&descending=true`)).toEqual([
+        '2015-01-14T18:27:00Z',
+      ]);
+      // a time inside a bucket (the marker of another interval): the buckets that start after it, or before it
+      expect(await starts(`marker=${bucketMarker('2015-01-14T18:28:30')}`)).toEqual([
+        '2015-01-14T18:51:00Z',
+        '2015-01-14T18:52:00Z',
+      ]);
+      expect(await starts(`marker=${bucketMarker('2015-01-14T18:28:30')}&descending=true`)).toEqual([
+        '2015-01-14T18:28:00Z',
+        '2015-01-14T18:27:00Z',
+      ]);
+      // the window still bounds the list
+      expect(await starts(`end=2015-01-14T18:51:00Z&marker=${bucketMarker('2015-01-14T18:27:00')}`)).toEqual([
+        '2015-01-14T18:28:00Z',
+        '2015-01-14T18:51:00Z',
+      ]);
+      // a marker beyond the history is still a marker
+      const beyond = await get(`/v2/exchanges/${PAIR}?interval=1minute&marker=${bucketMarker('2030-01-01T00:00:00')}`);
+      expect(beyond.body).toEqual({ result: 'success', count: 0, exchanges: [] });
+    });
+
+    it('tampered candle marker → 400 invalid marker; the markers of the raw list and of candles do not mix', async () => {
+      const bad = [
+        '!!!',
+        b64('not json'),
+        b64('[]'),
+        b64('[1,2]'),
+        b64('[-1]'),
+        b64('[1.5]'),
+        b64('["2015-01-14T18:27:00Z"]'),
+        b64('[4294967296]'),
+        b64('{"a":1}'),
+        markerOf(USD_XRP.rows[1].row),
+      ];
+      for (const query of ['interval=1hour', 'interval=1minute&descending=true']) {
+        for (const marker of bad) {
+          const res = await get(`/v2/exchanges/${PAIR}?${query}&marker=${encodeURIComponent(marker)}`);
+          expect([query, marker, res.status, res.body]).toEqual([
+            query,
+            marker,
+            400,
+            { result: 'error', message: 'invalid marker' },
+          ]);
+        }
+      }
+      const raw = await get(`/v2/exchanges/${PAIR}?marker=${bucketMarker('2015-01-14T18:27:00')}`);
+      expect([raw.status, raw.body.message]).toEqual([400, 'invalid marker']);
+      // a marker does not matter when the window is empty (as in the raw list)
+      const empty = await get(
+        `/v2/exchanges/${PAIR}?interval=1hour&start=2030-01-01&marker=${bucketMarker('2015-01-14T18:00:00')}`,
+      );
+      expect(empty.body).toEqual({ result: 'success', count: 0, exchanges: [] });
+    });
+
+    it('limit: 200 candles by default, at most 400; below one is the default; NaN is an error', async () => {
+      const cases: [string, number][] = [
+        ['', 200],
+        ['limit=1', 1],
+        ['limit=400', 400],
+        ['limit=401', 400],
+        ['limit=100000', 400],
+        ['limit=0', 200],
+        ['limit=2.9', 2],
+      ];
+      for (const [query, rows] of cases) {
+        const spy = jest.spyOn(h.ch, 'query');
+        const res = await get(`/v2/exchanges/${PAIR}?interval=1minute&${query}`);
+        const calls = exchangesCalls(spy);
+        // the buckets of the page and the one after it, then their aggregation
+        expect([query, res.status, calls.length, calls[0][1]]).toEqual([
+          query,
+          200,
+          2,
+          expect.objectContaining({ fetch: rows + 1 }),
+        ]);
+        expect([query, res.body.count]).toEqual([query, Math.min(rows, 4)]);
+        jest.restoreAllMocks();
+      }
+      const nan = await get(`/v2/exchanges/${PAIR}?interval=1minute&limit=abc`);
+      expect([nan.status, nan.body]).toEqual([400, { result: 'error', message: 'invalid limit: NaN' }]);
+    });
+
+    it('the checks come in the order of the original: pair, start, end, limit, reduce with interval, interval, marker', async () => {
+      const bad = { interval: 'bogus', reduce: 'true', marker: '!' };
+      const cases: [string, string][] = [
+        [`/v2/exchanges/USD/XRP${qs({ start: 'x', end: 'y', limit: 'z', ...bad })}`, 'base issuer is required'],
+        [`/v2/exchanges/${PAIR}${qs({ start: 'x', end: 'y', limit: 'z', ...bad })}`, 'invalid start date format'],
+        [`/v2/exchanges/${PAIR}${qs({ end: 'y', limit: 'z', ...bad })}`, 'invalid end date format'],
+        [`/v2/exchanges/${PAIR}${qs({ limit: 'z', ...bad })}`, 'invalid limit: NaN'],
+        [`/v2/exchanges/${PAIR}${qs(bad)}`, 'cannot use reduce with interval'],
+        [`/v2/exchanges/${PAIR}${qs({ interval: 'bogus', marker: '!' })}`, 'invalid interval: bogus'],
+        [`/v2/exchanges/${PAIR}${qs({ interval: '1hour', marker: '!' })}`, 'invalid marker'],
+      ];
+      for (const [url, message] of cases) {
+        const res = await get(url);
+        expect([url, res.status, res.body]).toEqual([url, 400, { result: 'error', message }]);
+      }
+    });
+
+    it('reduce with an interval → 400 cannot use reduce with interval, whatever the interval', async () => {
+      for (const query of [
+        'reduce=true&interval=1hour',
+        'reduce=TRUE&interval=week',
+        'interval=1day&reduce=xtruex',
+        'reduce=true&interval=3weeks',
+      ]) {
+        const res = await get(`/v2/exchanges/${PAIR}?${query}`);
+        expect([query, res.status, res.body]).toEqual([
+          query,
+          400,
+          { result: 'error', message: 'cannot use reduce with interval' },
+        ]);
+      }
+      // an empty interval is no interval
+      const empty = await get(`/v2/exchanges/${PAIR}?reduce=true&interval=`);
+      expect([empty.status, empty.body.exchanges[0].count]).toEqual([200, 5]);
+    });
+
+    it('an invalid interval is 400 with any limit (the original skipped the check above 400 and failed with a 500)', async () => {
+      for (const limit of ['1000', '401', '400', '1', '']) {
+        const res = await get(`/v2/exchanges/${PAIR}?interval=bogus&limit=${limit}`);
+        expect([limit, res.status, res.body]).toEqual([
+          limit,
+          400,
+          { result: 'error', message: 'invalid interval: bogus' },
+        ]);
+      }
+    });
+
+    it('interval is read in any case, its message lowercased; an empty interval is the raw list; the first one wins', async () => {
+      const hour = await get(`/v2/exchanges/${PAIR}?interval=1hour`);
+      expect((await get(`/v2/exchanges/${PAIR}?interval=1HOUR`)).body).toEqual(hour.body);
+      expect((await get(`/v2/exchanges/${PAIR}?interval=1Hour`)).body).toEqual(hour.body);
+      for (const [interval, message] of [
+        ['3WEEKS', 'invalid interval: 3weeks'],
+        ['Week2', 'invalid interval: week2'],
+        ['1 hour', 'invalid interval: 1 hour'],
+        ['2day', 'invalid interval: 2day'],
+        ['3month', 'invalid interval: 3month'],
+        ['1week', 'invalid interval: 1week'],
+        ['hour', 'invalid interval: hour'],
+      ]) {
+        const res = await get(`/v2/exchanges/${PAIR}${qs({ interval })}`);
+        expect([interval, res.status, res.body]).toEqual([interval, 400, { result: 'error', message }]);
+      }
+      const raw = await get(`/v2/exchanges/${PAIR}`);
+      expect((await get(`/v2/exchanges/${PAIR}?interval=`)).body).toEqual(raw.body);
+      expect((await get(`/v2/exchanges/${PAIR}?interval=1hour&interval=bogus`)).body).toEqual(hour.body);
+    });
+
+    it('reduce is /true/i; anything else is the raw list', async () => {
+      const raw = await get(`/v2/exchanges/${PAIR}`);
+      for (const flag of ['false', '1', '0', '']) {
+        expect([flag, (await get(`/v2/exchanges/${PAIR}?reduce=${flag}`)).body]).toEqual([flag, raw.body]);
+      }
+      const reduced = await get(`/v2/exchanges/${PAIR}?reduce=true`);
+      for (const flag of ['TRUE', 'True', 'xtruex']) {
+        expect([flag, (await get(`/v2/exchanges/${PAIR}?reduce=${flag}`)).body]).toEqual([flag, reduced.body]);
+      }
+    });
+
+    it('candles: two queries on the key range of the pair, the buckets of the page, then their aggregation; values bound', async () => {
+      const key = 'base_currency, base_issuer, counter_currency, counter_issuer, ledger_index, tx_index, node_index';
+      const order = (direction: string): string =>
+        `ORDER BY ${key
+          .split(', ')
+          .map((c) => `${c} ${direction}`)
+          .join(', ')}`;
+      const queries = async (path: string): Promise<{ sql: string; params: Record<string, unknown> }[]> => {
+        const spy = jest.spyOn(h.ch, 'query');
+        const res = await get(path);
+        expect([path, res.status]).toEqual([path, 200]);
+        const calls = exchangesCalls(spy).map(([sql, params]) => ({
+          sql: String(sql),
+          params: params as Record<string, unknown>,
+        }));
+        jest.restoreAllMocks();
+        return calls;
+      };
+
+      // USD/XRP: 18:27 (ledger 11119603), 18:28 (11119619), 18:51 (11119932), 18:52 (11119940)
+      const asc = await queries(
+        `/v2/exchanges/xrp/${USD}?interval=1minute&limit=1&marker=${bucketMarker('2015-01-14T18:20:00')}`,
+      );
+      expect(asc).toHaveLength(2);
+      for (const { sql, params } of asc) {
+        // the pair is the stored one (USD before XRP), bound
+        expect(Object.values(params)).toEqual(expect.arrayContaining(['USD', USD_ISSUER, 'XRP', '']));
+        expect(sql).not.toContain(USD_ISSUER);
+        expect(sql).toMatch(/base_currency = \{\w+:String\}/);
+        expect(sql).toMatch(/counter_issuer = \{\w+:String\}/);
+        expect(sql).toMatch(/ledger_index BETWEEN \{min:UInt32\} AND \{max:UInt32\}/);
+        expect(sql).not.toMatch(/\bFINAL\b/);
+        expect(sql).toContain(bucketExpr('1minute'));
+        // XRP is the stored counter: its leg of 0.0005 or less is left out by the query
+        expect(sql).toContain('counter_amount_f > 0.0005');
+        expect(sql).not.toContain('base_amount_f > 0.0005');
+        expect(sql).toContain(order('ASC'));
+      }
+      const [probe, aggregation] = asc;
+      // the first exchange of each bucket, cut after the bucket that follows the page
+      expect(probe.sql).toMatch(/LIMIT 1 BY bucket\s+LIMIT \{fetch:UInt32\}/);
+      expect(probe.params).toMatchObject({ fetch: 2 });
+      // the ledgers before the first one of the next bucket, each exchange once
+      expect(aggregation.sql).toContain(`LIMIT 1 BY ${key}`);
+      expect(aggregation.sql).toMatch(/GROUP BY bucket\s+ORDER BY bucket ASC/);
+      expect(aggregation.params).toMatchObject({ max: 11119618 });
+
+      // descending: the probe reads the key backwards; the page starts after the last ledger of the next bucket
+      const desc = await queries(`/v2/exchanges/${PAIR}?interval=1minute&limit=1&descending=true`);
+      expect(desc).toHaveLength(2);
+      expect(desc[0].sql).toContain(order('DESC'));
+      expect(desc[1].sql).toContain(order('ASC'));
+      expect(desc[1].sql).toMatch(/ORDER BY bucket DESC/);
+      expect(desc[1].params).toMatchObject({ min: 11119933 });
+
+      // the last page aggregates what is left of the range; no bucket, no aggregation
+      const [{ latest }] = await h.ch.query<{ latest: number }>(
+        `SELECT max(ledger_index) AS latest FROM ${Table.Ledgers}`,
+      );
+      const last = await queries(
+        `/v2/exchanges/${PAIR}?interval=1minute&marker=${bucketMarker('2015-01-14T18:28:00')}`,
+      );
+      expect(last).toHaveLength(2);
+      expect(last[1].params).toMatchObject({ max: latest });
+      expect(
+        await queries(`/v2/exchanges/${PAIR}?interval=1minute&marker=${bucketMarker('2015-01-14T18:52:00')}`),
+      ).toHaveLength(1);
+
+      // reduce: one query, the whole window, no buckets
+      const reduce = await queries(`/v2/exchanges/${PAIR}?reduce=true`);
+      expect(reduce).toHaveLength(1);
+      expect(reduce[0].sql).not.toContain('GROUP BY');
+      expect(reduce[0].sql).toContain(`LIMIT 1 BY ${key}`);
+      expect(reduce[0].sql).toContain(order('ASC'));
+      expect(reduce[0].params).toMatchObject({ max: latest });
+    });
+
+    it('reads the exchanges of the pair in the order of the primary key, never sorting them', async () => {
+      for (const [i, m] of MARKETS.entries()) {
+        const queries =
+          i < 4
+            ? [
+                'interval=1minute',
+                'interval=1minute&limit=1',
+                'reduce=true',
+                'interval=1month&descending=true',
+                'interval=1minute&descending=true&limit=1',
+                `interval=5minute&marker=${bucketMarker('2015-01-14T18:25:00')}`,
+                'interval=1day&autobridged=true',
+              ]
+            : ['interval=1hour'];
+        for (const query of queries) {
+          for (const [base, counter] of [
+            [m.base, m.counter],
+            [m.counter, m.base],
+          ]) {
+            const spy = jest.spyOn(h.ch, 'query');
+            await get(`/v2/exchanges/${pathOf(base)}/${pathOf(counter)}?${query}`);
+            const calls = exchangesCalls(spy);
+            jest.restoreAllMocks();
+            // the probe (when there is a bucket, the aggregation after it), or the reduction
+            const kinds = query.startsWith('reduce') ? ['reduce'] : ['probe', 'aggregation'];
+            expect(calls.length).toBeGreaterThan(0);
+            expect(calls.length).toBeLessThanOrEqual(kinds.length);
+            for (const [j, [sql, params]] of calls.entries()) {
+              const plan = await h.ch.query<{ explain: string }>(
+                `EXPLAIN PIPELINE ${String(sql)}`,
+                params as Record<string, unknown>,
+              );
+              const pipeline = plan.map((r) => r.explain).join('\n');
+              const where = [pathOf(base), pathOf(counter), query, kinds[j]];
+              // below the LIMIT BY: the rows of the pair read in key order (backwards for the probe of a descending
+              // list), never sorted; only the buckets are sorted, above
+              const read = pipeline.slice(pipeline.lastIndexOf('(LimitBy)'));
+              const backwards = kinds[j] === 'probe' && query.includes('descending=true');
+              expect([where, read]).toEqual([where, expect.stringContaining('ReadPoolInOrder')]);
+              expect([where, read.includes(backwards ? 'algorithm: InReverseOrder' : 'algorithm: InOrder')]).toEqual([
+                where,
+                true,
+              ]);
+              expect([where, /SortingTransform/.test(read)]).toEqual([where, false]);
+              // and the probe never sorts at all: it stops after its buckets
+              if (kinds[j] === 'probe') expect([where, /SortingTransform/.test(pipeline)]).toEqual([where, false]);
+            }
+          }
+        }
+      }
+    });
+
+    it('format=csv: candles and the reduced row in the columns of the original, the buy volume last', async () => {
+      const res = await get(`/v2/exchanges/xrp/${USD}?interval=1minute&format=csv`);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toMatch(/^text\/csv/);
+      expect(res.headers['content-disposition']).toBe('attachment; filename=exchanges - XRP-USD.csv');
+      const rows = res.text.split('\n');
+      expect(rows).toHaveLength(1 + 4);
+      expect(rows[0]).toBe(AGGREGATE_CSV_COLUMNS.map((c) => `"${c}"`).join(','));
+      const json = (await get(`/v2/exchanges/xrp/${USD}?interval=1minute`)).body.exchanges as Candle[];
+      json.forEach((c, i) =>
+        expect(rows[1 + i]).toBe(
+          AGGREGATE_CSV_COLUMNS.map((k) => `"${(c[k] as string | number | undefined) ?? ''}"`).join(','),
+        ),
+      );
+      // the reduced row
+      const reduced = await get(`/v2/exchanges/${PAIR}?reduce=true&format=csv`);
+      expect(reduced.headers['content-disposition']).toBe('attachment; filename=exchanges - USD-XRP.csv');
+      const lines = reduced.text.split('\n');
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toBe(AGGREGATE_CSV_COLUMNS.map((c) => `"${c}"`).join(','));
+      const one = (await get(`/v2/exchanges/${PAIR}?reduce=true`)).body.exchanges[0] as Candle;
+      expect(lines[1]).toBe(
+        AGGREGATE_CSV_COLUMNS.map((k) => `"${(one[k] as string | number | undefined) ?? ''}"`).join(','),
+      );
+      // the Link of a page, and the empty list
+      const paged = await get(`/v2/exchanges/${PAIR}?interval=1minute&format=csv&limit=2`);
+      expect(paged.headers.link).toContain(`marker=${bucketMarker('2015-01-14T18:28:00')}`);
+      expect(paged.text.split('\n')).toHaveLength(1 + 2);
+      const empty = await get(`/v2/exchanges/${PAIR}?interval=1hour&format=csv&start=2030-01-01`);
+      expect([empty.status, empty.text]).toEqual([200, '']);
+      const error = await get(`/v2/exchanges/${PAIR}?interval=bogus&format=csv`);
+      expect([error.status, error.body]).toEqual([400, { result: 'error', message: 'invalid interval: bogus' }]);
+    });
+
+    it('is 500 unable to retrieve exchanges when the database fails', async () => {
+      for (const query of ['interval=1hour', 'reduce=true']) {
+        jest.spyOn(h.ch, 'query').mockRejectedValueOnce(new Error('boom'));
+        const first = await get(`/v2/exchanges/${PAIR}?${query}`);
+        expect([query, first.status, first.body]).toEqual([
+          query,
+          500,
+          { result: 'error', message: 'unable to retrieve exchanges' },
+        ]);
+        jest.restoreAllMocks();
+        // the aggregation fails after the range was found
+        const real = h.ch.query.bind(h.ch);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        jest.spyOn(h.ch, 'query').mockImplementation(((sql: string, ...rest: any[]) =>
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          sql.includes(Table.Exchanges) ? Promise.reject(new Error('boom')) : (real as any)(sql, ...rest)) as never);
+        const second = await get(`/v2/exchanges/${PAIR}?${query}`);
+        expect([query, second.status, second.body]).toEqual([
+          query,
+          500,
+          { result: 'error', message: 'unable to retrieve exchanges' },
+        ]);
+        jest.restoreAllMocks();
+      }
+    });
+  });
+
   // -- every pair --------------------------------------------------------------------------------------------------
 
   describe('/v2/exchanges (all pairs)', () => {
@@ -1295,6 +2414,22 @@ describe('exchanges API endpoint when a ledger was written twice', () => {
     expect(res.body.count).toBe(158);
     expect(hashesIn(res.body)).toEqual(hashesOf(ALL));
   });
+
+  it('aggregates every exchange once: candles and reduce', async () => {
+    for (const inverted of [false, true]) {
+      const [base, counter] = inverted ? [market.counter, market.base] : [market.base, market.counter];
+      const path = `/v2/exchanges/${pathOf(base)}/${pathOf(counter)}`;
+      for (const interval of ['1minute', '1day']) {
+        const res = await get(`${path}?interval=${interval}`);
+        expectAggregates([path, interval], res.body.exchanges, candlesOf(market, interval, inverted));
+      }
+      const reduced = await get(`${path}?reduce=true`);
+      expectAggregates([path, 'reduce'], reduced.body.exchanges, [reducedOf(market, inverted, '2013-01-01T00:00:00Z')]);
+      // and in pages of one candle
+      const paged = (await pages(`${path}?interval=1minute`, 1)).flatMap((p) => p.exchanges);
+      expect(paged).toEqual((await get(`${path}?interval=1minute`)).body.exchanges);
+    }
+  });
 });
 
 describe('exchanges API endpoint on the xrpl-recorded ledgers (autobridged exchanges)', () => {
@@ -1388,6 +2523,42 @@ describe('exchanges API endpoint on the xrpl-recorded ledgers (autobridged excha
     // an issued currency that is called XAH is an ordinary currency on the XRP ledger
     const xah = await get(`/v2/exchanges/XAH+rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv/XRP`);
     expect(xah.body.count).toBe(1);
+  });
+
+  it('candles and reduce of every recorded pair (hex currencies, tiny XRP legs), in both orientations', async () => {
+    // 4245415200…/XRP traded 0.0001 XRP: left out of the aggregates
+    const tiny = all.filter((e) => e.row.counter_issuer === '' && Number(e.row.counter_amount) <= 0.0005);
+    expect(tiny).toHaveLength(1);
+    for (const m of markets) {
+      for (const inverted of [false, true]) {
+        const [base, counter] = inverted ? [m.counter, m.base] : [m.base, m.counter];
+        const path = `/v2/exchanges/${pathOf(base)}/${pathOf(counter)}`;
+        for (const interval of ['1minute', '1hour', '1year']) {
+          const res = await get(`${path}?interval=${interval}`);
+          expectAggregates([path, interval], res.body.exchanges, candlesOf(m, interval, inverted));
+        }
+        const reduced = await get(`${path}?reduce=true`);
+        expectAggregates([path, 'reduce'], reduced.body.exchanges, [reducedOf(m, inverted, '2013-01-01T00:00:00Z')]);
+      }
+    }
+  });
+
+  it("autobridged=true aggregates the autobridged exchanges only (the original's candles came back empty)", async () => {
+    const path = `/v2/exchanges/${pathOf(mixed.base)}/${pathOf(mixed.counter)}`;
+    const bridged = mixed.rows.filter((e) => e.row.autobridged_currency !== null).map((e) => e.row);
+    expect(bridged).toHaveLength(1);
+    const reduced = await get(`${path}?reduce=true&autobridged=true`);
+    expectAggregates('reduce', reduced.body.exchanges, [reducedOf(mixed, false, '2013-01-01T00:00:00Z', bridged)]);
+    expect(reduced.body.exchanges[0].count).toBe(1);
+    const candles = await get(`${path}?interval=1hour&autobridged=true`);
+    expectAggregates('1hour', candles.body.exchanges, candlesOf(mixed, '1hour', false, bridged));
+    const inverted = await get(
+      `/v2/exchanges/${pathOf(mixed.counter)}/${pathOf(mixed.base)}?interval=1day&autobridged=TRUE`,
+    );
+    expectAggregates('inverted', inverted.body.exchanges, candlesOf(mixed, '1day', true, bridged));
+    // without the flag, all of them
+    const every = await get(`${path}?reduce=true&autobridged=false`);
+    expect(every.body.exchanges[0].count).toBe(aggregated(mixed.rows.map((e) => e.row)).length);
   });
 });
 
@@ -1502,10 +2673,332 @@ describe('exchanges API endpoint on Xahau (synthetic rows: the recorded ledgers 
     expect((await get('/v2/exchanges?start=2030-01-01')).body.count).toBe(0);
   });
 
+  it('aggregates with XAH as the native currency: no issuer key on it, either way round', async () => {
+    const reduced = await api.ok<ListBody>(`/v2/exchanges/USD+${ISSUER}/XAH?reduce=true`, 'exchanges');
+    expect(reduced.body.exchanges[0]).toMatchObject({
+      count: 3,
+      open: '2.5000000',
+      close: '0.50000000',
+      base_currency: 'USD',
+      base_issuer: ISSUER,
+      counter_currency: 'XAH',
+    });
+    expect(reduced.body.exchanges[0]).not.toHaveProperty('counter_issuer');
+    const day = await api.ok<ListBody>(`/v2/exchanges/xah/USD+${ISSUER}?interval=1day`, 'exchanges');
+    expect(day.body.count).toBe(1);
+    expect(day.body.exchanges[0]).toMatchObject({
+      count: 3,
+      open: '0.40000000',
+      close: '2.0000000',
+      base_currency: 'XAH',
+      counter_currency: 'USD',
+      counter_issuer: ISSUER,
+    });
+    expect(day.body.exchanges[0]).not.toHaveProperty('base_issuer');
+  });
+
   it('format=csv is named after the pair', async () => {
     const res = await get(`/v2/exchanges/xah/USD+${ISSUER}?format=csv`);
     expect(res.headers['content-type']).toMatch(/^text\/csv/);
     expect(res.headers['content-disposition']).toBe('attachment; filename=exchanges - XAH-USD.csv');
     expect(res.text.split('\n')).toHaveLength(1 + 3);
+  });
+});
+
+describe.each([
+  ['xrpl', 'XRP'],
+  ['xahau', 'XAH'],
+] as const)('exchanges API endpoint, interval and reduce on synthetic ledgers (%s)', (network, NATIVE) => {
+  const ISSUER = 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De';
+  const BUYER = 'rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD';
+  const SELLER = 'rnCEEqDnCuSjDsHiJrca4VYUqaMyi4vGF7';
+  /** One ledger at each time: the edges of the buckets of every interval. */
+  const TIMES = [
+    '2013-01-02T00:00:00', // a Wednesday: its ISO week began in 2012
+    '2014-12-31T23:59:59',
+    '2015-01-01T00:00:00',
+    '2015-01-02T23:59:59',
+    '2015-01-03T00:00:00', // 3 days after 2014-12-31, 732 days after 2013-01-01
+    '2015-01-04T23:59:59', // a Sunday
+    '2015-01-05T00:00:00', // a Monday
+    '2015-01-31T23:59:59',
+    '2015-02-01T00:00:00',
+    '2016-02-29T12:00:00', // a leap day, a Monday
+    '2016-03-01T03:59:59',
+    '2016-03-01T04:00:00',
+    '2016-03-01T10:04:59',
+    '2016-03-01T10:05:00',
+    '2016-03-01T10:29:59',
+    '2016-03-01T10:30:00',
+  ];
+  const LEDGERS = TIMES.map((iso, i) => ({
+    ledger_index: 1000 + i * 10,
+    ledger_hash: `${i}`.padStart(64, 'C'),
+    close_time: unix(iso),
+  }));
+  const USD_M: Market = { base: { currency: 'USD', issuer: ISSUER }, counter: { currency: NATIVE }, rows: [] };
+  // the native currency sorts before ZAR, so it is the stored base of this pair
+  const ZAR_M: Market = { base: { currency: NATIVE }, counter: { currency: 'ZAR', issuer: ISSUER }, rows: [] };
+
+  function exchange(
+    m: Market,
+    ledger: number,
+    txIndex: number,
+    nodeIndex: number,
+    baseAmount: string,
+    counterAmount: string,
+    takerBuys: boolean,
+  ): ExchangesRow {
+    const rate = new BigNumber(counterAmount).dividedBy(baseAmount).toString();
+    return {
+      base_currency: m.base.currency,
+      base_issuer: m.base.issuer ?? '',
+      counter_currency: m.counter.currency,
+      counter_issuer: m.counter.issuer ?? '',
+      ledger_index: LEDGERS[ledger].ledger_index,
+      tx_index: txIndex,
+      node_index: nodeIndex,
+      tx_hash: `${ledger * 100 + txIndex}`.padStart(64, 'D'),
+      close_time: LEDGERS[ledger].close_time,
+      base_amount: baseAmount,
+      counter_amount: counterAmount,
+      base_amount_f: Number(baseAmount),
+      counter_amount_f: Number(counterAmount),
+      rate,
+      rate_f: Number(rate),
+      buyer: BUYER,
+      seller: SELLER,
+      taker: takerBuys ? BUYER : SELLER,
+      provider: takerBuys ? SELLER : BUYER,
+      offer_sequence: 7,
+      autobridged_currency: null,
+      autobridged_issuer: null,
+      tx_type: 'OfferCreate',
+      client: null,
+    };
+  }
+  const inKeyOrder = (rows: ExchangesRow[]): ExchangesRow[] =>
+    [...rows].sort((a, b) => a.ledger_index - b.ledger_index || a.tx_index - b.tx_index || a.node_index - b.node_index);
+
+  // two exchanges in every ledger, the one with the lower key written second; rates differ all over
+  const USD_ROWS = TIMES.flatMap((_, i) => {
+    const big = new BigNumber(3 + i);
+    const small = new BigNumber('1.5');
+    return [
+      exchange(USD_M, i, 7, 1, big.toString(), big.times(2 + i / 4).toString(), i % 2 === 0),
+      exchange(USD_M, i, 2, 4, small.toString(), small.times(1.9 + i / 4).toString(), i % 3 === 0),
+    ];
+  });
+  // an amount of 1e36 or more cannot be summed exactly: the aggregations that hold one use the float sums
+  const BIG_M: Market = { base: { currency: 'BIG', issuer: ISSUER }, counter: { currency: NATIVE }, rows: [] };
+  const BIG_ROWS = [
+    exchange(BIG_M, 2, 1, 1, '2e+40', '5', true),
+    exchange(BIG_M, 3, 1, 1, '1e+40', '7', false),
+    exchange(BIG_M, 9, 1, 1, '0.1', '0.2', true),
+    exchange(BIG_M, 10, 1, 1, '0.2', '0.4', true),
+  ];
+  // native amounts around 0.0005: 0.0005, 0.0004 and 0.000001 are left out of the aggregates
+  const ZAR_ROWS = (
+    [
+      [2, '0.0005'],
+      [3, '0.0004'],
+      [4, '0.0005001'],
+      [9, '2'],
+      [10, '0.000001'],
+      [11, '3.5'],
+    ] as const
+  ).map(([ledger, amount], k) => exchange(ZAR_M, ledger, 3, 2, amount, `${k + 1}`, k % 2 === 0));
+
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (path: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(path, limit, 'exchanges');
+  beforeAll(async () => {
+    h = await startHarness({ network, seed: 'none', env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+    await h.ch.insert(Table.Ledgers, LEDGERS);
+    await h.ch.insert(Table.Exchanges, [...USD_ROWS, ...ZAR_ROWS, ...BIG_ROWS]);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  const USD_PATH = `/v2/exchanges/USD+${ISSUER}/${NATIVE}`;
+  const counts = async (query: string, path = USD_PATH): Promise<unknown[]> => {
+    const res = await api.ok<ListBody>(`${path}?${query}`, 'exchanges');
+    return (res.body.exchanges as Record<string, unknown>[]).map((c) => [String(c.start).slice(0, 19), c.count]);
+  };
+
+  it('every interval, both orientations: the buckets of the original', async () => {
+    expect(USD_ROWS).toHaveLength(32);
+    for (const interval of EXCHANGE_INTERVALS) {
+      for (const inverted of [false, true]) {
+        const path = `${inverted ? `/v2/exchanges/${NATIVE}/USD+${ISSUER}` : USD_PATH}?interval=${interval}&start=2012-01-01&limit=400`;
+        const res = await get(path);
+        expect([path, res.status]).toEqual([path, 200]);
+        expectAggregates(path, res.body.exchanges, candlesOf(USD_M, interval, inverted, inKeyOrder(USD_ROWS)));
+      }
+    }
+  });
+
+  it('3day buckets align to 2013-01-01', async () => {
+    expect(await counts('interval=3day')).toEqual([
+      ['2013-01-01T00:00:00', 2],
+      ['2014-12-31T00:00:00', 6],
+      ['2015-01-03T00:00:00', 6],
+      ['2015-01-30T00:00:00', 4],
+      ['2016-02-27T00:00:00', 2],
+      ['2016-03-01T00:00:00', 12],
+    ]);
+    // a start inside a bucket leaves it out: the first 3 days that start in 2015 begin on the 3rd
+    expect(await counts('interval=3day&start=2015-01-01')).toEqual([
+      ['2015-01-03T00:00:00', 6],
+      ['2015-01-30T00:00:00', 4],
+      ['2016-02-27T00:00:00', 2],
+      ['2016-03-01T00:00:00', 12],
+    ]);
+  });
+
+  it('week is 7day, the ISO week from Monday; the default start leaves out the week that began in 2012', async () => {
+    const weeks = [
+      ['2014-12-29T00:00:00', 10],
+      ['2015-01-05T00:00:00', 2],
+      ['2015-01-26T00:00:00', 4],
+      ['2016-02-29T00:00:00', 14],
+    ];
+    expect(await counts('interval=week')).toEqual(weeks);
+    expect(await counts('interval=7day')).toEqual(weeks);
+    expect(await counts('interval=week&start=2012-12-31')).toEqual([['2012-12-31T00:00:00', 2], ...weeks]);
+    for (const [start] of weeks) expect(new Date(`${start}Z`).getUTCDay()).toBe(1);
+    expect((await get(`${USD_PATH}?interval=week&start=2012-01-01`)).body).toEqual(
+      (await get(`${USD_PATH}?interval=7day&start=2012-01-01`)).body,
+    );
+  });
+
+  it('months and years are the calendar ones; a window takes the buckets that start in it, whole', async () => {
+    expect(await counts('interval=1month')).toEqual([
+      ['2013-01-01T00:00:00', 2],
+      ['2014-12-01T00:00:00', 2],
+      ['2015-01-01T00:00:00', 12],
+      ['2015-02-01T00:00:00', 2],
+      ['2016-02-01T00:00:00', 2],
+      ['2016-03-01T00:00:00', 12],
+    ]);
+    expect(await counts('interval=1year')).toEqual([
+      ['2013-01-01T00:00:00', 2],
+      ['2014-01-01T00:00:00', 2],
+      ['2015-01-01T00:00:00', 14],
+      ['2016-01-01T00:00:00', 14],
+    ]);
+    // January 2015 starts before the window, though its last exchange is after the start
+    expect(await counts('interval=1month&start=2015-01-15')).toEqual([
+      ['2015-02-01T00:00:00', 2],
+      ['2016-02-01T00:00:00', 2],
+      ['2016-03-01T00:00:00', 12],
+    ]);
+    // January 2015 starts in the window: all of it, the exchanges after the end too
+    expect(await counts('interval=1month&end=2015-01-15')).toEqual([
+      ['2013-01-01T00:00:00', 2],
+      ['2014-12-01T00:00:00', 2],
+      ['2015-01-01T00:00:00', 12],
+    ]);
+    expect(await counts('interval=1year&start=2015-06-01')).toEqual([['2016-01-01T00:00:00', 14]]);
+    expect(await counts('interval=1year&end=2015-06-01&descending=true')).toEqual([
+      ['2015-01-01T00:00:00', 14],
+      ['2014-01-01T00:00:00', 2],
+      ['2013-01-01T00:00:00', 2],
+    ]);
+    expect(await counts('interval=1day&start=2015-01-31&end=2015-02-01')).toEqual([
+      ['2015-01-31T00:00:00', 2],
+      ['2015-02-01T00:00:00', 2],
+    ]);
+  });
+
+  it('n minutes and n hours are clock-aligned', async () => {
+    expect(await counts('interval=4hour&start=2016-03-01')).toEqual([
+      ['2016-03-01T00:00:00', 2],
+      ['2016-03-01T04:00:00', 2],
+      ['2016-03-01T08:00:00', 8],
+    ]);
+    expect(await counts('interval=5minute&start=2016-03-01T10:00')).toEqual([
+      ['2016-03-01T10:00:00', 2],
+      ['2016-03-01T10:05:00', 2],
+      ['2016-03-01T10:25:00', 2],
+      ['2016-03-01T10:30:00', 2],
+    ]);
+    expect(await counts('interval=15minute&start=2016-03-01T10:00')).toEqual([
+      ['2016-03-01T10:00:00', 4],
+      ['2016-03-01T10:15:00', 2],
+      ['2016-03-01T10:30:00', 2],
+    ]);
+    expect(await counts('interval=30minute&start=2016-03-01T10:00')).toEqual([
+      ['2016-03-01T10:00:00', 6],
+      ['2016-03-01T10:30:00', 2],
+    ]);
+  });
+
+  it('open and close follow the key of the exchange, not the order it was written in', async () => {
+    const [day] = (await api.ok<ListBody>(`${USD_PATH}?interval=1day&start=2015-01-01&end=2015-01-01`, 'exchanges'))
+      .body.exchanges;
+    // ledger 2: tx 2 (rate 2.4) comes before tx 7 (rate 2.5)
+    expect(day).toMatchObject({ count: 2, open: '2.4000000', close: '2.5000000', high: '2.5000000', low: '2.4000000' });
+  });
+
+  it('candle pages over the years: the pages make up the list, both ways', async () => {
+    const unpaged = await get(`${USD_PATH}?interval=1month`);
+    expect(unpaged.body.count).toBe(6);
+    for (const limit of [1, 2, 4]) {
+      expect((await pages(`${USD_PATH}?interval=1month`, limit)).flatMap((p) => p.exchanges)).toEqual(
+        unpaged.body.exchanges,
+      );
+      expect((await pages(`${USD_PATH}?interval=1month&descending=true`, limit)).flatMap((p) => p.exchanges)).toEqual(
+        [...unpaged.body.exchanges].reverse(),
+      );
+    }
+    const first = await get(`${USD_PATH}?interval=1month&limit=2`);
+    expect(first.body.marker).toBe(bucketMarker('2014-12-01T00:00:00'));
+  });
+
+  it(`native legs of 0.0005 or less are left out when ${NATIVE} is the stored base too`, async () => {
+    for (const path of [`/v2/exchanges/${NATIVE}/ZAR+${ISSUER}`, `/v2/exchanges/ZAR+${ISSUER}/${NATIVE}`]) {
+      const inverted = path.includes(`ZAR+${ISSUER}/`);
+      // the raw list keeps them
+      expect([path, (await get(path)).body.count]).toEqual([path, 6]);
+      const reduced = await get(`${path}?reduce=true`);
+      expect([path, reduced.body.exchanges[0].count]).toEqual([path, 3]);
+      expectAggregates(path, reduced.body.exchanges, [
+        reducedOf(ZAR_M, inverted, '2013-01-01T00:00:00Z', inKeyOrder(ZAR_ROWS)),
+      ]);
+      expect(await counts('interval=1year', path)).toEqual([
+        ['2015-01-01T00:00:00', 1],
+        ['2016-01-01T00:00:00', 2],
+      ]);
+      const years = await get(`${path}?interval=1year`);
+      expectAggregates(path, years.body.exchanges, candlesOf(ZAR_M, '1year', inverted, inKeyOrder(ZAR_ROWS)));
+    }
+    // 0.0005 itself is left out, 0.0005001 is kept
+    const [y2015] = (
+      await api.ok<ListBody>(`/v2/exchanges/${NATIVE}/ZAR+${ISSUER}?interval=1year&end=2015`, 'exchanges')
+    ).body.exchanges;
+    expect(y2015).toMatchObject({ count: 1, base_volume: '0.0005001', counter_volume: '3' });
+  });
+
+  it('volumes are exact; a bucket with an amount of 1e36 or more has the float sums of the original instead', async () => {
+    const path = `/v2/exchanges/BIG+${ISSUER}/${NATIVE}`;
+    const years = await api.ok<ListBody>(`${path}?interval=1year`, 'exchanges');
+    expect(years.body.exchanges).toMatchObject([
+      // 2e40 + 1e40, 5 + 7: as floats
+      { start: '2015-01-01T00:00:00Z', count: 2, base_volume: '3e+40', counter_volume: '12', buy_volume: 2e40 },
+      // 0.1 + 0.2 is 0.3 (as floats it would be 0.30000000000000004)
+      { start: '2016-01-01T00:00:00Z', count: 2, base_volume: '0.3', counter_volume: '0.6', buy_volume: 0.3 },
+    ]);
+    const reduced = await api.ok<ListBody>(`${path}?reduce=true`, 'exchanges');
+    expect(reduced.body.exchanges[0]).toMatchObject({ count: 4, base_volume: String(2e40 + 1e40 + 0.1 + 0.2) });
+    const inverted = await api.ok<ListBody>(
+      `/v2/exchanges/${NATIVE}/BIG+${ISSUER}?interval=1year&start=2016`,
+      'exchanges',
+    );
+    expect(inverted.body.exchanges).toMatchObject([{ base_volume: '0.6', counter_volume: '0.3', buy_volume: 0 }]);
   });
 });
