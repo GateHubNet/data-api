@@ -60,7 +60,7 @@ are applied as per-query safety caps (defense-in-depth against runaway queries /
 | `GH_CLICKHOUSE_URL` | No | `http://localhost:8123` | ClickHouse HTTP endpoint URL. |
 | `GH_CLICKHOUSE_USER` | No | `default` | ClickHouse username (`username` in config). |
 | `GH_CLICKHOUSE_PASSWORD` | No | `` (empty) | ClickHouse password. **Sensitive** — inject from a secrets manager in production. |
-| `GH_CLICKHOUSE_DATABASE` | No | `xrpl` | Database name. |
+| `GH_CLICKHOUSE_DATABASE` | No | `xrpl` / `xahau` (the `GH_NETWORK` profile's default) | Database name. Must match `^[a-z_][a-z0-9_]*$`, otherwise startup fails. |
 | `GH_CLICKHOUSE_REQUEST_TIMEOUT` | No | `30000` | HTTP request timeout in **ms**. (`.env.example`: API uses `30000`, syncer uses `60000`.) |
 | `GH_CLICKHOUSE_MAX_CONNECTIONS` | No | `10` | Max concurrent HTTP connections in the client pool (`maxOpenConnections`). (`.env.example`: API `10`, syncer `20`.) |
 | `GH_CLICKHOUSE_MAX_EXECUTION_TIME` | No | `30` | Per-query wall-clock cap in **seconds**. `0` = unlimited / server default. Kills runaway queries. |

@@ -16,6 +16,7 @@
     "build": "tsc -p tsconfig.json",
     "lint": "eslint \"src/**/*.ts\" --fix",
     "test": "jest --config jest.config.js --passWithNoTests",
+    "test:e2e": "jest --config jest.e2e.config.js --runInBand",
     "ch:migrate": "ts-node src/clickhouse/migrate.ts"
   },
   "dependencies": {
@@ -32,6 +33,7 @@
     "@types/node": "^20.14.12",
     "@types/sjcl": "^1.0.34",
     "jest": "^29.7.0",
+    "testcontainers": "^10.13.0",
     "ts-jest": "^29.2.3",
     "ts-node": "^10.9.2",
     "typescript": "~5.9.2"

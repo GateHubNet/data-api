@@ -2,7 +2,7 @@ import { ClickHouseService, runMigrations, Table } from '@gatehub/data-api-share
 import { INestApplication, ValidationPipe, VersioningType } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
-import { startClickHouse, StartedClickHouse } from './clickhouse-container';
+import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 
 const API_KEY = 'test-key-123';
 
@@ -12,7 +12,7 @@ describe('Data API (e2e)', () => {
   let chService: ClickHouseService;
 
   beforeAll(async () => {
-    ch = await startClickHouse();
+    ch = await startClickHouse('xrpl');
     process.env.GH_API_KEYS = API_KEY;
     process.env.GH_RATE_LIMIT = '100000';
 

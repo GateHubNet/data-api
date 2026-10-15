@@ -1,14 +1,23 @@
 import { ClickHouseClient, ClickHouseSettings, createClient } from '@clickhouse/client';
 import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { CLICKHOUSE_CONFIG, ClickHouseConfig } from './clickhouse.config';
+import { Table } from './tables';
+
+export interface InsertOptions {
+  /**
+   * Sent as `insert_deduplication_token`: a replay of the same token is dropped by the server instead of being
+   * hashed by content. Only effective on a table with `non_replicated_deduplication_window` > 0.
+   */
+  dedupToken?: string;
+}
 
 /**
  * Thin, typed wrapper around the official ClickHouse client.
  *
  * - `query<T>()` runs a parameterised SELECT and returns typed rows. Always use
  *   `query_params` (never string interpolation) so user input cannot be injected.
- * - `insert()` bulk-inserts rows for the syncer.
- * - `command()` runs DDL (used by the migration runner).
+ * - `insert()` bulk-inserts rows for the syncer. Deduplication is opted into per insert (`dedupToken`), never globally.
+ * - `command()` runs DDL / DML (used by the migration runner and the ingest bookkeeping).
  */
 @Injectable()
 export class ClickHouseService implements OnModuleDestroy {
@@ -23,11 +32,6 @@ export class ClickHouseService implements OnModuleDestroy {
       database: config.database,
       request_timeout: config.requestTimeout,
       max_open_connections: config.maxOpenConnections,
-      clickhouse_settings: {
-        // Idempotent inserts: identical blocks (same ledger replayed) are de-duplicated server-side.
-        insert_deduplicate: 1,
-        async_insert: 0,
-      },
       application: 'gatehub-data-api',
     });
   }
@@ -40,36 +44,50 @@ export class ClickHouseService implements OnModuleDestroy {
     return guards;
   }
 
-  /** Parameterised SELECT. Pass values via `params` — they are bound, never interpolated. */
-  async query<T = Record<string, unknown>>(query: string, params: Record<string, unknown> = {}): Promise<T[]> {
+  /**
+   * Parameterised SELECT. Pass values via `params` — they are bound, never interpolated. `settings` are merged over
+   * the safety guards, so a caller can raise a limit for one known-heavy query.
+   */
+  async query<T = Record<string, unknown>>(
+    query: string,
+    params: Record<string, unknown> = {},
+    settings: ClickHouseSettings = {},
+  ): Promise<T[]> {
     const resultSet = await this.client.query({
       query,
       query_params: params,
       format: 'JSONEachRow',
-      clickhouse_settings: this.queryGuards,
+      clickhouse_settings: { ...this.queryGuards, ...settings },
     });
     return resultSet.json<T>();
   }
 
   /** SELECT returning a single row (or undefined). */
-  async queryOne<T = Record<string, unknown>>(query: string, params: Record<string, unknown> = {}): Promise<T | undefined> {
-    const rows = await this.query<T>(query, params);
+  async queryOne<T = Record<string, unknown>>(
+    query: string,
+    params: Record<string, unknown> = {},
+    settings: ClickHouseSettings = {},
+  ): Promise<T | undefined> {
+    const rows = await this.query<T>(query, params, settings);
     return rows[0];
   }
 
-  /** Bulk insert. `table` is a trusted enum value; `rows` are JSON objects. */
-  async insert<T extends Record<string, unknown>>(table: string, rows: T[]): Promise<void> {
+  /** Bulk insert. `table` is a trusted `Table` enum value (never user input); `rows` are JSON objects. */
+  async insert<T>(table: Table | string, rows: T[], opts: InsertOptions = {}): Promise<void> {
     if (rows.length === 0) return;
     await this.client.insert({
       table,
       values: rows,
       format: 'JSONEachRow',
+      ...(opts.dedupToken !== undefined && {
+        clickhouse_settings: { insert_deduplication_token: opts.dedupToken },
+      }),
     });
   }
 
-  /** Run a DDL / DML command (CREATE TABLE, ALTER, OPTIMIZE …). */
-  async command(query: string): Promise<void> {
-    await this.client.command({ query, clickhouse_settings: { wait_end_of_query: 1 } });
+  /** Run a DDL / DML command (CREATE TABLE, ALTER, lightweight DELETE …). Values go through `params`. */
+  async command(query: string, params: Record<string, unknown> = {}): Promise<void> {
+    await this.client.command({ query, query_params: params, clickhouse_settings: { wait_end_of_query: 1 } });
   }
 
   /** Liveness probe used by the health module. */

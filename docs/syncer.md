@@ -350,9 +350,10 @@ the skip-window (§6) safe.
   - `ledgers` → `ledger_index`
   So **re-processing a ledger collapses to identical rows** — replay is a no-op once merges
   run.
-- The ClickHouse client is configured with **`insert_deduplicate: 1`** and `async_insert:
-  0`, so identical INSERT blocks (the same ledger replayed) are also de-duplicated
-  **server-side at insert time**, before merges.
+- The ClickHouse client no longer sets global `insert_deduplicate` / `async_insert`
+  settings. Server-side insert-time de-duplication is opted into **per insert**:
+  `ClickHouseService.insert(table, rows, { dedupToken })` sends `insert_deduplication_token`,
+  which only takes effect on a table created with `non_replicated_deduplication_window > 0`.
 - **Mid-batch crash:** if the process dies after writing some child tables but before the
   `ledgers` markers, those ledgers are simply *not* recorded as inserted. The next run sees
   them missing in the skip-window and **re-ingests them** — which, thanks to the dedup keys
@@ -535,7 +536,7 @@ trade-offs).
 | Config knobs | `apps/syncer/src/config/syncer.config.ts` |
 | Parser suite | `packages/shared/src/parsers/*` |
 | CTID / time / retry | `packages/shared/src/util/{ctid,time,helpers}.ts` |
-| ClickHouse client (insert_deduplicate) | `packages/shared/src/clickhouse/clickhouse.service.ts` |
+| ClickHouse client (per-insert dedup token) | `packages/shared/src/clickhouse/clickhouse.service.ts` |
 | Table names / schema engines | `packages/shared/src/clickhouse/tables.ts`, `packages/shared/schema/001_tables.sql` |
 | Metrics / health | `apps/syncer/src/modules/{prometheus,liveliness}/*` |
 

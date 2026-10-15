@@ -268,25 +268,29 @@ These use **testcontainers** to boot a real, throwaway ClickHouse, apply the **r
 # Docker must be running.
 pnpm --filter @gatehub/data-api-service test:e2e
 pnpm --filter @gatehub/data-syncer test:e2e
+pnpm --filter @gatehub/data-api-shared test:e2e
 ```
 
-The shared helper — `apps/api/test/clickhouse-container.ts` (and the syncer's copy) — starts `clickhouse/clickhouse-server:24.8`, waits for `/ping` to return 200, and **exports the connection into `process.env`** (`GH_CLICKHOUSE_URL`, `GH_CLICKHOUSE_DATABASE`, etc.) so the shared config picks it up:
+The shared helper — `packages/shared/test/clickhouse-container.ts` (the apps import it by relative path) — starts the pinned `clickhouse/clickhouse-server` LTS (`26.8.14.3`, override with `CLICKHOUSE_IMAGE`), waits for `/ping` to return 200, and **exports the connection into `process.env`** (`GH_CLICKHOUSE_URL`, `GH_CLICKHOUSE_DATABASE`, etc.) so the shared config picks it up. With a `database` argument the image creates that database on startup; without one only `default` exists and `runMigrations()` creates the target database itself:
 
 ```ts
-export async function startClickHouse(database = 'xrpl'): Promise<StartedClickHouse> {
-  const container = await new GenericContainer('clickhouse/clickhouse-server:24.8')
+export async function startClickHouse(database?: string): Promise<StartedClickHouse> {
+  const container = await new GenericContainer(process.env.CLICKHOUSE_IMAGE || DEFAULT_CLICKHOUSE_IMAGE)
     .withExposedPorts(8123)
     .withWaitStrategy(Wait.forHttp('/ping', 8123).forStatusCode(200))
     .withStartupTimeout(120_000)
     .start();
   process.env.GH_CLICKHOUSE_URL = `http://${container.getHost()}:${container.getMappedPort(8123)}`;
   // ...
+  return { container, url, database, config }; // config: ClickHouseConfig for the started server
 }
 ```
 
+The shared package has its own e2e suite for the migration runner and the ClickHouse client (`pnpm --filter @gatehub/data-api-shared test:e2e`, config `packages/shared/jest.e2e.config.js`). Point `GH_SCHEMA_DIR` at a directory of `*.sql` files to migrate from somewhere other than `packages/shared/schema/`.
+
 Test shape (see `apps/api/test/api.e2e-spec.ts` and `apps/syncer/test/processor.e2e-spec.ts`):
 
-1. `beforeAll`: `startClickHouse()` → set env → `await runMigrations()` → seed rows.
+1. `beforeAll`: `startClickHouse('xrpl')` → set env → `await runMigrations()` → seed rows.
 2. **Import `AppModule` only AFTER the env is set** (config is read at module-init time) — use a dynamic `await import('../src/app.module')`.
 3. Run assertions (the API tests use `supertest`).
 4. `afterAll`: close the app, close the ClickHouse client, `container.stop()`.

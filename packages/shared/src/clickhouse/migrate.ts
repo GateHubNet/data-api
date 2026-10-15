@@ -1,27 +1,42 @@
 /**
  * Schema migration runner.
  *
- * Each `*.sql` file in `packages/shared/schema/` is one migration unit. The runner:
- *   1. ensures the target database and a `schema_migrations` bookkeeping table exist,
- *   2. reads which files have already been applied,
+ * Each `*.sql` file in `packages/shared/schema/` (or in `GH_SCHEMA_DIR`) is one migration unit. The runner:
+ *   1. creates the target database (through a client bound to `default`, which always exists) and a
+ *      `schema_migrations` bookkeeping table,
+ *   2. reads which files have already been applied and verifies their sha256 checksum — an applied file that changed
+ *      is a hard error, never silently re-run or skipped,
  *   3. applies only the new files (in lexical order), statement by statement,
- *   4. records each applied file.
+ *   4. records each applied file with its checksum.
  *
- * All DDL is also written `CREATE ... IF NOT EXISTS`, so even a re-applied file is a
- * no-op — the tracking table just avoids needless work and gives an audit trail.
+ * All DDL is also written `CREATE ... IF NOT EXISTS`, so a file that failed half way can simply be re-run.
  *
  * Run as a one-shot, controlled step (CI job / the `migrate` service in the production
  * compose) — not concurrently from every syncer replica.
  *
  *   pnpm --filter @gatehub/data-api-shared ch:migrate
  */
+import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { clickHouseConfigFromEnv } from './clickhouse.config';
+import { assertValidDatabaseName, ClickHouseConfig, clickHouseConfigFromEnv } from './clickhouse.config';
 import { ClickHouseService } from './clickhouse.service';
 
-const SCHEMA_DIR = join(__dirname, '..', '..', 'schema');
+/** `src/clickhouse` and `dist/clickhouse` are both two levels below the package root, which ships `schema/`. */
+const DEFAULT_SCHEMA_DIR = join(__dirname, '..', '..', 'schema');
 const MIGRATIONS_TABLE = 'schema_migrations';
+
+export interface MigrateOptions {
+  /** Connection to migrate. Defaults to `clickHouseConfigFromEnv()`. */
+  config?: ClickHouseConfig;
+  /** Progress sink. Defaults to `console.log`. */
+  log?: (message: string) => void;
+}
+
+export interface MigrateResult {
+  applied: string[];
+  skipped: string[];
+}
 
 function splitStatements(sql: string): string[] {
   return sql
@@ -36,46 +51,77 @@ function splitStatements(sql: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-export async function runMigrations(): Promise<{ applied: string[]; skipped: string[] }> {
-  const config = clickHouseConfigFromEnv();
-  const service = new ClickHouseService(config);
+function checksum(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
+}
 
-  await service.command(`CREATE DATABASE IF NOT EXISTS ${config.database}`);
-  await service.command(
-    `CREATE TABLE IF NOT EXISTS ${MIGRATIONS_TABLE} (filename String, applied_at DateTime DEFAULT now()) ` +
-      `ENGINE = MergeTree ORDER BY filename`,
-  );
+export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateResult> {
+  const config = opts.config ?? clickHouseConfigFromEnv();
+  // eslint-disable-next-line no-console
+  const log = opts.log ?? ((message: string) => console.log(message));
+  const database = assertValidDatabaseName(config.database);
+  const schemaDir = process.env.GH_SCHEMA_DIR || DEFAULT_SCHEMA_DIR;
 
-  const alreadyApplied = new Set(
-    (await service.query<{ filename: string }>(`SELECT filename FROM ${MIGRATIONS_TABLE}`)).map((r) => r.filename),
-  );
-
-  const files = readdirSync(SCHEMA_DIR)
-    .filter((f) => f.endsWith('.sql'))
-    .sort();
-
-  const applied: string[] = [];
-  const skipped: string[] = [];
-
-  for (const file of files) {
-    if (alreadyApplied.has(file)) {
-      skipped.push(file);
-      continue;
-    }
-    const statements = splitStatements(readFileSync(join(SCHEMA_DIR, file), 'utf8'));
-    for (const statement of statements) {
-      // eslint-disable-next-line no-console
-      console.log(`[migrate] ${file}: ${statement.slice(0, 80).replace(/\s+/g, ' ')}…`);
-      await service.command(statement);
-    }
-    await service.insert(MIGRATIONS_TABLE, [{ filename: file }]);
-    applied.push(file);
+  // The target database may not exist yet, so create it through a connection bound to `default`.
+  const bootstrap = new ClickHouseService({ ...config, database: 'default' });
+  try {
+    await bootstrap.command('CREATE DATABASE IF NOT EXISTS {database:Identifier}', { database });
+  } finally {
+    await bootstrap.onModuleDestroy();
   }
 
-  await service.onModuleDestroy();
-  // eslint-disable-next-line no-console
-  console.log(`[migrate] db="${config.database}" applied=${applied.length} skipped=${skipped.length}`);
-  return { applied, skipped };
+  const service = new ClickHouseService({ ...config, database });
+  try {
+    await service.command(
+      `CREATE TABLE IF NOT EXISTS ${MIGRATIONS_TABLE} ` +
+        `(filename String, checksum String, applied_at DateTime DEFAULT now()) ENGINE = MergeTree ORDER BY filename`,
+    );
+
+    const recorded = new Map(
+      (
+        await service.query<{ filename: string; checksum: string }>(
+          `SELECT filename, checksum FROM ${MIGRATIONS_TABLE}`,
+        )
+      ).map((r) => [r.filename, r.checksum]),
+    );
+
+    const files = readdirSync(schemaDir)
+      .filter((f) => f.endsWith('.sql'))
+      .sort()
+      .map((filename) => {
+        const content = readFileSync(join(schemaDir, filename), 'utf8');
+        return { filename, content, checksum: checksum(content) };
+      });
+
+    // Verify every applied file before applying anything new, so a modified history never half-migrates.
+    for (const file of files) {
+      const previous = recorded.get(file.filename);
+      if (previous !== undefined && previous !== file.checksum) {
+        throw new Error(`Migration ${file.filename} was modified after being applied`);
+      }
+    }
+
+    const applied: string[] = [];
+    const skipped: string[] = [];
+
+    for (const file of files) {
+      if (recorded.has(file.filename)) {
+        skipped.push(file.filename);
+        continue;
+      }
+      for (const statement of splitStatements(file.content)) {
+        log(`[migrate] ${file.filename}: ${statement.slice(0, 80).replace(/\s+/g, ' ')}…`);
+        await service.command(statement);
+      }
+      await service.insert(MIGRATIONS_TABLE, [{ filename: file.filename, checksum: file.checksum }]);
+      applied.push(file.filename);
+    }
+
+    log(`[migrate] db="${database}" applied=${applied.length} skipped=${skipped.length}`);
+    return { applied, skipped };
+  } finally {
+    await service.onModuleDestroy();
+  }
 }
 
 if (require.main === module) {

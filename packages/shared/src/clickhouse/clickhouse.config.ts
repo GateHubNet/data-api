@@ -1,3 +1,5 @@
+import { getNetworkProfile, NetworkProfile } from '../network';
+
 /**
  * ClickHouse connection settings, read from the environment.
  *
@@ -19,12 +21,31 @@ export interface ClickHouseConfig {
   maxQueryMemoryBytes: number;
 }
 
-export function clickHouseConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ClickHouseConfig {
+/** Database names are interpolated into DDL, so only plain lowercase identifiers are accepted. */
+const DATABASE_NAME = /^[a-z_][a-z0-9_]*$/;
+
+export function assertValidDatabaseName(database: string): string {
+  if (!DATABASE_NAME.test(database)) {
+    throw new Error(
+      `Invalid ClickHouse database name "${database}" (GH_CLICKHOUSE_DATABASE must match ${DATABASE_NAME})`,
+    );
+  }
+  return database;
+}
+
+/**
+ * Build the connection config from `env`. The database is `GH_CLICKHOUSE_DATABASE` when set, otherwise the network
+ * profile's default (`xrpl` / `xahau`); the profile defaults to the one selected by `GH_NETWORK` in `env`.
+ */
+export function clickHouseConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  profile: NetworkProfile = getNetworkProfile(env.GH_NETWORK || undefined),
+): ClickHouseConfig {
   return {
     url: env.GH_CLICKHOUSE_URL ?? 'http://localhost:8123',
     username: env.GH_CLICKHOUSE_USER ?? 'default',
     password: env.GH_CLICKHOUSE_PASSWORD ?? '',
-    database: env.GH_CLICKHOUSE_DATABASE ?? 'xrpl',
+    database: assertValidDatabaseName(env.GH_CLICKHOUSE_DATABASE ?? profile.defaultDatabase),
     requestTimeout: Number(env.GH_CLICKHOUSE_REQUEST_TIMEOUT ?? 30_000),
     maxOpenConnections: Number(env.GH_CLICKHOUSE_MAX_CONNECTIONS ?? 10),
     maxExecutionTime: Number(env.GH_CLICKHOUSE_MAX_EXECUTION_TIME ?? 30),

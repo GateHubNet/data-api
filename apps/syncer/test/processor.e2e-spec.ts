@@ -1,7 +1,7 @@
 import { ClickHouseService, ParsedTransaction, runMigrations, Table } from '@gatehub/data-api-shared';
 import { ClickHouseDataProcessorService } from '../src/processor/clickhouse-data-processor.service';
 import { SyncerConfig } from '../src/config/syncer.config';
-import { startClickHouse, StartedClickHouse } from './clickhouse-container';
+import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 
 function syntheticLedger(index: number): any {
   return {
@@ -61,7 +61,7 @@ describe('ClickHouseDataProcessor (e2e)', () => {
   const config = { networkId: 0 } as SyncerConfig;
 
   beforeAll(async () => {
-    ch = await startClickHouse();
+    ch = await startClickHouse('xrpl');
     await runMigrations();
     chService = new ClickHouseService({ url: ch.url, username: 'default', password: '', database: ch.database, requestTimeout: 30000, maxOpenConnections: 5, maxExecutionTime: 30, maxQueryMemoryBytes: 0 });
     processor = new ClickHouseDataProcessorService(chService, config);

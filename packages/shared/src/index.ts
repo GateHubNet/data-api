@@ -4,6 +4,7 @@ export * from './clickhouse/clickhouse.service';
 export * from './clickhouse/clickhouse.module';
 export * from './clickhouse/tables';
 export { runMigrations } from './clickhouse/migrate';
+export type { MigrateOptions, MigrateResult } from './clickhouse/migrate';
 
 // Parsers
 export * from './parsers/parser.interface';

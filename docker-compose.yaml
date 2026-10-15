@@ -1,6 +1,6 @@
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.8.14.3
     container_name: data-api-clickhouse
     # Auto-restart so ClickHouse survives Docker/OrbStack restarts and host reboots
     # (otherwise the syncer/API can't connect after a reboot).

@@ -7,7 +7,7 @@
 # --env-file (inject from your secrets manager in real deployments; never commit it).
 services:
   keeper:
-    image: clickhouse/clickhouse-keeper:24.8
+    image: clickhouse/clickhouse-keeper:26.8.14.3
     container_name: ch-keeper
     volumes:
       - ./deploy/keeper/keeper_config.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
@@ -20,7 +20,7 @@ services:
       retries: 6
 
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.8.14.3
     container_name: ch-server
     depends_on:
       keeper:
