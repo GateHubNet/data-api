@@ -182,10 +182,26 @@ describe('SyncerConfig (GH_* environment)', () => {
     expect(errors).toContain('GH_NETWORK');
   });
 
-  it('requires node endpoints', async () => {
-    const { exits, errors } = await loadConfig({});
-    expect(exits).toEqual([1]);
-    expect(errors).toContain('nodeEndpoints');
+  it('defaults the node endpoints to the public endpoint of the network, when unset or empty', async () => {
+    for (const env of [{} as Record<string, string>, { GH_NODE_ENDPOINTS: ' ' }]) {
+      const xrpl = await loadConfig(env);
+      expect(xrpl.exits).toEqual([]);
+      expect(xrpl.cfg).toMatchObject({
+        nodeEndpoints: 'wss://xrplcluster.com',
+        validationEndpoints: 'wss://xrplcluster.com',
+      });
+      const xahau = await loadConfig({ ...env, GH_NETWORK: 'xahau' });
+      expect(xahau.exits).toEqual([]);
+      expect(xahau.cfg).toMatchObject({
+        nodeEndpoints: 'wss://xahau.network',
+        validationEndpoints: 'wss://xahau.network',
+      });
+    }
+  });
+
+  it('keeps an explicit node endpoint list, and the validation endpoints follow it', async () => {
+    const { cfg } = await loadConfig({ GH_NETWORK: 'xahau', GH_NODE_ENDPOINTS: 'ws://10.0.0.5:6006' });
+    expect(cfg).toMatchObject({ nodeEndpoints: 'ws://10.0.0.5:6006', validationEndpoints: 'ws://10.0.0.5:6006' });
   });
 
   it('rejects endpoints that are not ws:// or wss:// URLs', async () => {

@@ -1,6 +1,6 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { Request, Response } from 'express';
-import { RippleHttpError } from './errors';
+import { RateLimitError, rateLimitMessage, RippleHttpError } from './errors';
 
 /** What every Ripple route says when it fails for a reason the caller did not cause and the route has no message for. */
 export const INTERNAL_ERROR_MESSAGE = 'internal error';
@@ -23,8 +23,8 @@ function messageOf(exception: HttpException): string {
  * - A `RippleHttpError` keeps its status and message, whatever the status (`@RippleRoute` raises the 500 ones).
  * - Any other HttpException below 500 keeps its status and message; a 401 (the API key guard) always says
  *   `Missing or invalid API key.`.
- * - A 429 (the throttler) is `{"error":"Rate limit exceeded, retry in <n>sec"}` with `n` from the `Retry-After` header
- *   the throttler has already set.
+ * - A 429 (the throttler) is `{"error":"Rate limit exceeded, retry in <n.nn>sec"}`, the original's wording: `n.nn` is the
+ *   time left in the window, to two decimals (`RateLimitError`; a bare 429 falls back to its `Retry-After`).
  * - Anything else (an Error, an HttpException of 500 and above) is a 500 `internal error`; the cause is logged, never
  *   sent. A route that wants its own message uses `@RippleRoute`.
  *
@@ -59,8 +59,10 @@ export class RippleErrorFilter implements ExceptionFilter {
     if (exception instanceof HttpException) {
       const status = exception.getStatus();
       if (status === HttpStatus.TOO_MANY_REQUESTS) {
-        const retry = Math.max(1, Math.ceil(Number(res.getHeader('Retry-After'))) || 1);
-        res.status(status).json({ error: `Rate limit exceeded, retry in ${retry}sec` });
+        // The throttler's own 429 carries no fraction: fall back to its whole-second Retry-After.
+        const seconds =
+          exception instanceof RateLimitError ? exception.retryAfterSeconds : Number(res.getHeader('Retry-After')) || 1;
+        res.status(status).json({ error: rateLimitMessage(seconds) });
         return;
       }
       if (status === HttpStatus.UNAUTHORIZED) {

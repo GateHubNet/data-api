@@ -140,6 +140,13 @@ describe('the Ripple error contract on the toolbox bootstrap', () => {
         expect(res.status).toBe(500);
         expect(res.body).toEqual({ result: 'error', message: 'internal error' });
       });
+
+      it('on a @RippleRoute route a 5xx HttpException renders the route failure message too', async () => {
+        const res = await get('/v2/test/unavailable-route');
+        expect(res.status).toBe(500);
+        expect(res.body).toEqual({ result: 'error', message: 'Could not retrieve the test data.' });
+        expect(res.text).not.toContain('database is down');
+      });
     });
 
     describe('response headers', () => {
@@ -186,17 +193,29 @@ describe('the Ripple error contract on the toolbox bootstrap', () => {
 
       const limited = await get();
       expect(limited.status).toBe(429);
-      expect(limited.body).toEqual({ error: expect.stringMatching(/^Rate limit exceeded, retry in \d+sec$/) });
+      // The original's wording (lib/rateLimit.js): the seconds left in the window, with two decimals.
+      expect(limited.body).toEqual({ error: expect.stringMatching(/^Rate limit exceeded, retry in \d+\.\d{2}sec$/) });
       expect(limited.body).not.toHaveProperty('result');
+      const seconds = Number(/in (\d+\.\d{2})sec$/.exec(limited.body.error)?.[1]);
+      expect(seconds).toBeGreaterThan(0);
+      expect(seconds).toBeLessThanOrEqual(60);
+      // Retry-After is the same time rounded up to whole seconds, never below 1.
       const retryAfter = Number(limited.headers['retry-after']);
       expect(Number.isInteger(retryAfter)).toBe(true);
       expect(retryAfter).toBeGreaterThanOrEqual(1);
       expect(retryAfter).toBeLessThanOrEqual(60);
-      expect(limited.body.error).toBe(`Rate limit exceeded, retry in ${retryAfter}sec`);
+      expect(Math.abs(retryAfter - seconds)).toBeLessThan(1.01);
       expect(limited.headers['x-ratelimit-limit']).toBe('2');
       expect(limited.headers['x-ratelimit-remaining']).toBe('0');
       expect(Number(limited.headers['x-ratelimit-reset'])).toBe(retryAfter);
       expect(limited.headers['cache-control']).toBe('no-store');
+
+      // It is the time really left, not a whole number of seconds: it shrinks within the window.
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      const later = await get();
+      expect(later.status).toBe(429);
+      const laterSeconds = Number(/in (\d+\.\d{2})sec$/.exec(later.body.error)?.[1]);
+      expect(laterSeconds).toBeLessThan(seconds);
     });
 
     it('counts per client address: X-Forwarded-For is trusted for one hop', async () => {

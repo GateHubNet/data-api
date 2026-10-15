@@ -1,5 +1,15 @@
-import { Get } from '@nestjs/common';
+import {
+  BadRequestException,
+  CallHandler,
+  ExecutionContext,
+  Get,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { PATH_METADATA } from '@nestjs/common/constants';
+import { Reflector } from '@nestjs/core';
+import { lastValueFrom, throwError } from 'rxjs';
+import { badRequest, RippleHttpError } from './errors';
 import { RippleController, RippleRoute, RippleRouteInterceptor } from './ripple-controller';
 import { RippleErrorFilter } from './ripple-error.filter';
 
@@ -45,5 +55,58 @@ describe('RippleRoute', () => {
     expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('thing');
     expect(Reflect.getMetadata(INTERCEPTORS_METADATA, handler)).toEqual([RippleRouteInterceptor]);
     expect(Reflect.getMetadata('ripple:failure-message', handler)).toBe('Could not retrieve thing.');
+  });
+});
+
+describe('RippleRouteInterceptor', () => {
+  class Controller {
+    @RippleRoute('Could not retrieve thing.')
+    thing(): void {}
+  }
+  const context = {
+    getHandler: () => Controller.prototype.thing,
+    switchToHttp: () => ({ getRequest: () => ({ method: 'GET', originalUrl: '/v2/thing' }) }),
+  } as unknown as ExecutionContext;
+  const interceptor = new RippleRouteInterceptor(new Reflector());
+
+  /** What the interceptor lets out when the route fails with `error`. */
+  async function failWith(error: unknown): Promise<unknown> {
+    const next: CallHandler = { handle: () => throwError(() => error) };
+    return lastValueFrom(interceptor.intercept(context, next)).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+  }
+
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('passes a RippleHttpError through, whatever its status', async () => {
+    const bad = badRequest('invalid thing');
+    expect(await failWith(bad)).toBe(bad);
+    const failed = new RippleHttpError(500, 'Another message.');
+    expect(await failWith(failed)).toBe(failed);
+  });
+
+  it('passes an HttpException below 500 through', async () => {
+    const bad = new BadRequestException('nope');
+    expect(await failWith(bad)).toBe(bad);
+  });
+
+  it.each([
+    ['an Error', new Error('secret')],
+    ['a rejected string', 'secret'],
+    ['a 5xx HttpException', new ServiceUnavailableException('secret')],
+  ])('turns %s into a 500 with the route failure message, and logs the cause', async (_name, error) => {
+    const result = await failWith(error);
+    expect(result).toBeInstanceOf(RippleHttpError);
+    expect((result as RippleHttpError).getStatus()).toBe(500);
+    expect((result as RippleHttpError).getResponse()).toEqual({
+      result: 'error',
+      message: 'Could not retrieve thing.',
+    });
+    expect((Logger.prototype.error as jest.Mock).mock.calls[0][0]).toContain('GET /v2/thing failed');
   });
 });

@@ -24,6 +24,8 @@ export interface NetworkProfile {
   nativeCurrency: 'XRP' | 'XAH';
   /** ClickHouse database used when `GH_CLICKHOUSE_DATABASE` is not set. */
   defaultDatabase: string;
+  /** Public websocket endpoints of the network, used when `GH_NODE_ENDPOINTS` is not set. */
+  defaultNodeEndpoints: string[];
   /** First ledger from which a partial payment's delivered amount is taken from `delivered_amount` metadata. */
   partialPaymentFixLedger: number;
   /**
@@ -50,6 +52,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     networkId: 0,
     nativeCurrency: 'XRP',
     defaultDatabase: 'xrpl',
+    defaultNodeEndpoints: ['wss://xrplcluster.com'],
     partialPaymentFixLedger: 4594094,
     definitionsFallback: () => undefined,
   },
@@ -58,6 +61,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     networkId: 21337,
     nativeCurrency: 'XAH',
     defaultDatabase: 'xahau',
+    defaultNodeEndpoints: ['wss://xahau.network'],
     partialPaymentFixLedger: 0,
     definitionsFallback: (definitionsPath) => readDefinitions('xahau', definitionsPath),
   },

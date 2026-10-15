@@ -25,8 +25,14 @@ describe('network profiles', () => {
         networkId: 21337,
         nativeCurrency: 'XAH',
         defaultDatabase: 'xahau',
+        defaultNodeEndpoints: ['wss://xahau.network'],
         partialPaymentFixLedger: 0,
       });
+    });
+
+    it('has the public node endpoints of each network as the default for GH_NODE_ENDPOINTS', () => {
+      expect(getNetworkProfile('xrpl').defaultNodeEndpoints).toEqual(['wss://xrplcluster.com']);
+      expect(getNetworkProfile('xahau').defaultNodeEndpoints).toEqual(['wss://xahau.network']);
     });
 
     it('defaults to xrpl when GH_NETWORK is unset', () => {
@@ -35,6 +41,7 @@ describe('network profiles', () => {
         networkId: 0,
         nativeCurrency: 'XRP',
         defaultDatabase: 'xrpl',
+        defaultNodeEndpoints: ['wss://xrplcluster.com'],
         partialPaymentFixLedger: 4594094,
       });
     });

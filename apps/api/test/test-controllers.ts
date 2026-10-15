@@ -51,6 +51,13 @@ export class TestController {
     throw notFound('test thing not found');
   }
 
+  /** A 5xx HttpException on a route with a failure message: the route's message, not the exception's. */
+  @Get('unavailable-route')
+  @RippleRoute('Could not retrieve the test data.')
+  unavailableRoute(): never {
+    throw new ServiceUnavailableException('database is down');
+  }
+
   @Get('forbidden')
   forbidden(): never {
     throw new ForbiddenException('not for you');

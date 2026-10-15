@@ -1,7 +1,10 @@
+// Only the network profile, not the package root: the config is loaded (and its tests reload it) before anything else.
+import { getNetworkProfile } from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
+import { Transform } from 'class-transformer';
 import { IsIn } from 'class-validator';
-import { IntValue, MaybeEmptyText, splitList, Text, validator } from './env-decorators';
+import { IntValue, MaybeEmptyText, rawValue, splitList, Text, validator } from './env-decorators';
 
 /**
  * API configuration, read from `GH_*` environment variables by the toolbox ConfigService (`@ConfigValue()` maps the
@@ -38,6 +41,24 @@ const IsHeaderValue = validator(
   (variable) => `${variable} must be printable ASCII`,
 );
 
+/**
+ * `GH_NODE_ENDPOINTS`, or when it is unset or empty the public endpoints of `GH_NETWORK` (a Xahau API must not fall back to
+ * an XRPL node). An unknown network takes the XRPL ones: `IsIn` on `network` reports it.
+ */
+function NodeEndpoints(): PropertyDecorator {
+  return Transform(({ obj }) => {
+    const explicit = rawValue(obj, 'nodeEndpoints');
+    if (explicit !== undefined) return explicit;
+    let profile;
+    try {
+      profile = getNetworkProfile(rawValue(obj, 'network') ?? 'xrpl');
+    } catch {
+      profile = getNetworkProfile('xrpl');
+    }
+    return profile.defaultNodeEndpoints.join(',');
+  });
+}
+
 export class ApiConfig {
   /** `GH_NETWORK`: `xrpl` or `xahau`. */
   @ConfigValue()
@@ -45,9 +66,12 @@ export class ApiConfig {
   @IsIn(['xrpl', 'xahau'], { message: 'GH_NETWORK must be xrpl or xahau' })
   network: string = 'xrpl';
 
-  /** `GH_NODE_ENDPOINTS`: comma separated rippled / xahaud websocket URLs for the live-state endpoints, tried in order. */
+  /**
+   * `GH_NODE_ENDPOINTS`: comma separated rippled / xahaud websocket URLs for the live-state endpoints, tried in order.
+   * Default: the public endpoint of `network` (`defaultNodeEndpoints` of its profile; the initializer is the XRPL one).
+   */
   @ConfigValue()
-  @Text()
+  @NodeEndpoints()
   @IsEndpointList()
   nodeEndpoints: string = 'wss://xrplcluster.com';
 

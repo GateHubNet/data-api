@@ -53,7 +53,9 @@ export class RippleRouteInterceptor implements NestInterceptor {
     const failureMessage = this.reflector.get<string>(RIPPLE_FAILURE_MESSAGE, context.getHandler());
     return next.handle().pipe(
       catchError((err: unknown) => {
-        if (err instanceof HttpException) return throwError(() => err);
+        if (err instanceof RippleHttpError || (err instanceof HttpException && err.getStatus() < 500)) {
+          return throwError(() => err);
+        }
         const req = context.switchToHttp().getRequest<Request>();
         this.logger.error(
           `${req.method} ${req.originalUrl} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -66,9 +68,11 @@ export class RippleRouteInterceptor implements NestInterceptor {
 }
 
 /**
- * The failure message of a Ripple route (`Could not retrieve ledger.`): an error of the route that is not an
- * HttpException becomes a 500 `{"result":"error","message":failureMessage}`, and its cause is logged, not sent.
- * HttpExceptions (`badRequest`, `notFound`, ...) pass through with their own status and message.
+ * The failure message of a Ripple route (`Could not retrieve ledger.`): any error of the route that is not a
+ * `RippleHttpError` or an HttpException below 500 becomes a 500 `{"result":"error","message":failureMessage}`, and
+ * its cause is logged, not sent. That includes a 5xx HttpException (a `ServiceUnavailableException` from a client
+ * library, say): the route has failed, and the caller gets the route's message. `badRequest`, `notFound` and the other
+ * 4xx pass through with their own status and message.
  */
 export function RippleRoute(failureMessage: string): MethodDecorator {
   return applyDecorators(

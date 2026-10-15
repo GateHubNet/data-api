@@ -110,6 +110,24 @@ describe('ApiConfig (GH_* environment)', () => {
     });
   });
 
+  it('defaults GH_NODE_ENDPOINTS to the public endpoint of the network, when unset or empty', async () => {
+    expect((await loadConfig({ GH_NETWORK: 'xahau' })).cfg.nodeEndpoints).toBe('wss://xahau.network');
+    expect((await loadConfig({ GH_NETWORK: 'xahau', GH_NODE_ENDPOINTS: ' ' })).cfg.nodeEndpoints).toBe(
+      'wss://xahau.network',
+    );
+    expect((await loadConfig({ GH_NETWORK: 'xrpl' })).cfg.nodeEndpoints).toBe('wss://xrplcluster.com');
+    expect((await loadConfig({ GH_NETWORK: 'xahau', GH_NODE_ENDPOINTS: 'ws://10.0.0.5:6006' })).cfg.nodeEndpoints).toBe(
+      'ws://10.0.0.5:6006',
+    );
+  });
+
+  it('reports an unknown network once, instead of failing on its endpoint default', async () => {
+    const { exits, errors } = await loadConfig({ GH_NETWORK: 'bitcoin' });
+    expect(exits).toEqual([1]);
+    expect(errors).toContain('GH_NETWORK must be xrpl or xahau');
+    expect(errors).not.toContain('GH_NODE_ENDPOINTS');
+  });
+
   it('allows * as the CORS origin', async () => {
     const { cfg, exits } = await loadConfig({ GH_CORS_ORIGINS: '*' });
     expect(exits).toEqual([]);

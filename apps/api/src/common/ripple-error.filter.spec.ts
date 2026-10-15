@@ -1,5 +1,5 @@
 import { ArgumentsHost, BadRequestException, HttpException, NotFoundException } from '@nestjs/common';
-import { badRequest, notFound, RippleHttpError } from './errors';
+import { badRequest, notFound, RateLimitError, RippleHttpError } from './errors';
 import { RippleErrorFilter } from './ripple-error.filter';
 
 interface Reply {
@@ -83,17 +83,29 @@ describe('RippleErrorFilter', () => {
     });
   });
 
-  it('turns a 429 into the rate limit message with the seconds of Retry-After', () => {
+  it('words a RateLimitError as the original rate limiter: the seconds left, with two decimals', () => {
+    expect(render(new RateLimitError(16.4321))).toMatchObject({
+      status: 429,
+      body: { error: 'Rate limit exceeded, retry in 16.43sec' },
+    });
+    expect(render(new RateLimitError(0.4)).body).toEqual({ error: 'Rate limit exceeded, retry in 0.40sec' });
+    expect(render(new RateLimitError(60)).body).toEqual({ error: 'Rate limit exceeded, retry in 60.00sec' });
+    expect(render(new RateLimitError(2.005)).body).toEqual({
+      error: `Rate limit exceeded, retry in ${(2.005).toFixed(2)}sec`,
+    });
+  });
+
+  it('words another 429 with the whole seconds of its Retry-After', () => {
     expect(
       render(new HttpException('ThrottlerException: Too Many Requests', 429), { 'Retry-After': 17 }),
     ).toMatchObject({
       status: 429,
-      body: { error: 'Rate limit exceeded, retry in 17sec' },
+      body: { error: 'Rate limit exceeded, retry in 17.00sec' },
     });
     expect(render(new HttpException('x', 429), { 'Retry-After': '2.2' }).body).toEqual({
-      error: 'Rate limit exceeded, retry in 3sec',
+      error: 'Rate limit exceeded, retry in 2.20sec',
     });
-    expect(render(new HttpException('x', 429)).body).toEqual({ error: 'Rate limit exceeded, retry in 1sec' });
+    expect(render(new HttpException('x', 429)).body).toEqual({ error: 'Rate limit exceeded, retry in 1.00sec' });
   });
 
   it.each([

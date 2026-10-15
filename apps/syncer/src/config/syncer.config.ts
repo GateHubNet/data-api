@@ -1,3 +1,5 @@
+// Only the network profile, not the package root: the config is loaded (and its tests reload it) before anything else.
+import { getNetworkProfile } from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { Transform } from 'class-transformer';
@@ -119,6 +121,20 @@ function IntValue(options: { min: number; max?: number; optional?: boolean }): P
   };
 }
 
+/**
+ * The public node endpoints of `GH_NETWORK` (a Xahau syncer must not fall back to an XRPL node). An unknown network takes
+ * the XRPL ones: `IsIn` on `network` reports it.
+ */
+function defaultNodeEndpoints(obj: Record<string, unknown>): string {
+  let profile;
+  try {
+    profile = getNetworkProfile(rawValue(obj, 'network') ?? 'xrpl');
+  } catch {
+    profile = getNetworkProfile('xrpl');
+  }
+  return profile.defaultNodeEndpoints.join(',');
+}
+
 export class SyncerConfig {
   /** `GH_NETWORK`: `xrpl` or `xahau`. */
   @ConfigValue()
@@ -126,15 +142,18 @@ export class SyncerConfig {
   @IsIn(['xrpl', 'xahau'], { message: 'GH_NETWORK must be xrpl or xahau' })
   network: string = 'xrpl';
 
-  /** `GH_NODE_ENDPOINTS`: comma separated rippled / xahaud websocket URLs, tried in order. Required. */
+  /**
+   * `GH_NODE_ENDPOINTS`: comma separated rippled / xahaud websocket URLs, tried in order. Default: the public endpoint of
+   * `network` (`defaultNodeEndpoints` of its profile).
+   */
   @ConfigValue()
-  @Transform(({ obj, key }) => rawValue(obj, key))
+  @Transform(({ obj, key }) => rawValue(obj, key) ?? defaultNodeEndpoints(obj))
   @IsEndpointList()
   nodeEndpoints!: string;
 
   /** `GH_VALIDATION_ENDPOINTS`: comma separated nodes the validations collector subscribes to. Default `nodeEndpoints`. */
   @ConfigValue()
-  @Transform(({ obj, key }) => rawValue(obj, key) ?? rawValue(obj, 'nodeEndpoints'))
+  @Transform(({ obj, key }) => rawValue(obj, key) ?? rawValue(obj, 'nodeEndpoints') ?? defaultNodeEndpoints(obj))
   @IsEndpointList()
   validationEndpoints!: string;
 
