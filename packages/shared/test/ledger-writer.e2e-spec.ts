@@ -5,6 +5,7 @@ import { Table } from '../src/clickhouse/tables';
 import { buildLedgerRows, CHILD_TABLES, LedgerRows } from '../src/ingest/build-rows';
 import { FixtureLedgerSource } from '../src/ingest/fixture-ledger-source';
 import {
+  awaitQuiescence,
   committedCheckpoint,
   deleteLedgerRange,
   deleteLedgersAbove,
@@ -70,6 +71,25 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
   const count = async (svc: ClickHouseService, table: Table | string, where = '1'): Promise<number> =>
     Number((await svc.queryOne<{ n: string | number }>(`SELECT count() AS n FROM ${table} WHERE ${where}`))?.n);
+
+  /** Ids of the running queries that belong to `prefix`. */
+  async function runningQueryIds(svc: ClickHouseService, prefix: string): Promise<string[]> {
+    const rows = await svc.query<{ query_id: string }>(
+      'SELECT query_id FROM system.processes WHERE startsWith(query_id, {prefix:String})',
+      { prefix },
+    );
+    return rows.map((r) => r.query_id);
+  }
+
+  /** Poll `check` until it is true; false when it never is within `timeoutMs`. */
+  async function eventually(check: () => Promise<boolean>, timeoutMs = 10_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await check()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return false;
+  }
 
   async function storedCounts(svc: ClickHouseService): Promise<Counts> {
     return Object.fromEntries(await Promise.all(ALL_TABLES.map(async (t) => [t, await count(svc, t)] as const)));
@@ -351,9 +371,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const commands: string[] = [];
       const real = svc.command.bind(svc);
-      jest.spyOn(svc, 'command').mockImplementation(async (sql, params) => {
+      jest.spyOn(svc, 'command').mockImplementation(async (sql, params, opts) => {
         commands.push(sql);
-        await real(sql, params);
+        await real(sql, params, opts);
       });
       await deleteLedgersAbove(svc, cp!);
 
@@ -382,9 +402,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const params: unknown[] = [];
       const real = svc.command.bind(svc);
-      jest.spyOn(svc, 'command').mockImplementation(async (sql, p) => {
+      jest.spyOn(svc, 'command').mockImplementation(async (sql, p, opts) => {
         if (/IN PARTITION/.test(sql)) params.push({ sql, ...p });
-        await real(sql, p);
+        await real(sql, p, opts);
       });
       await deleteLedgersAbove(svc, index(committed - 1));
 
@@ -454,6 +474,44 @@ describe('LedgerWriter and ingest state (e2e)', () => {
     });
   });
 
+  describe('withNewRunId', () => {
+    it('returns a writer with a fresh runId (or the given one) and the same limits', async () => {
+      const svc = await freshService();
+      const writer = new LedgerWriter(svc, ctx, { runId: 'first', maxRowsPerInsert: 100 });
+
+      const rotated = writer.withNewRunId();
+      expect(rotated).not.toBe(writer);
+      expect(rotated.runId).not.toBe('first');
+      expect(rotated.runId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(writer.withNewRunId('given').runId).toBe('given');
+      expect(writer.runId).toBe('first');
+
+      const spy = jest.spyOn(svc, 'insert');
+      await rotated.write(LEDGERS);
+      expect(spy.mock.calls.filter((c) => c[0] === Table.Transactions)).toHaveLength(Math.ceil(933 / 100));
+    });
+
+    it('lets a writer that failed rewrite after deleteLedgersAbove without losing its child rows', async () => {
+      const svc = await freshService();
+      const failedWriter = new LedgerWriter(svc, ctx, { runId: 'failed-run' });
+      const real = svc.insert.bind(svc);
+      const failing = jest.spyOn(svc, 'insert').mockImplementation(async (table, rows, opts) => {
+        if (table === Table.Ledgers) throw new Error('commit failed');
+        await real(table, rows, opts);
+      });
+      await expect(failedWriter.write(LEDGERS)).rejects.toThrow('commit failed');
+      failing.mockRestore();
+
+      await deleteLedgersAbove(svc, 0);
+      expect(await count(svc, Table.Payments)).toBe(0);
+
+      await failedWriter.withNewRunId().write(LEDGERS);
+
+      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      expect(await count(svc, Table.Payments)).toBe(182);
+    });
+  });
+
   describe('deleteLedgerRange', () => {
     it('deletes the ledgers in [from, to] from every ledger-keyed table, across partitions, and keeps the rest', async () => {
       const svc = await freshService();
@@ -494,13 +552,185 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const order: string[] = [];
       const real = svc.command.bind(svc);
-      jest.spyOn(svc, 'command').mockImplementation(async (sql, params) => {
+      jest.spyOn(svc, 'command').mockImplementation(async (sql, params, opts) => {
         order.push(/^\s*DELETE FROM (\w+)/.exec(sql)?.[1] ?? sql);
-        await real(sql, params);
+        await real(sql, params, opts);
       });
       await deleteLedgerRange(svc, index(0), index(53));
 
       expect(order[0]).toBe(Table.Ledgers);
+    });
+  });
+
+  describe('query ids', () => {
+    /** Finished queries with an id under `prefix`, from the query log. */
+    async function loggedQueries(svc: ClickHouseService, prefix: string): Promise<string[]> {
+      await svc.command('SYSTEM FLUSH LOGS');
+      const rows = await svc.query<{ query_id: string }>(
+        `SELECT query_id FROM system.query_log
+          WHERE type = 'QueryFinish' AND startsWith(query_id, {prefix:String}) ORDER BY query_id`,
+        { prefix },
+      );
+      return rows.map((r) => r.query_id);
+    }
+
+    it('LedgerWriter sends every insert with the dedup token as its query_id', async () => {
+      const svc = await freshService();
+      const seen: Array<{ table: string; queryId?: string; dedupToken?: string }> = [];
+      const real = svc.insert.bind(svc);
+      jest.spyOn(svc, 'insert').mockImplementation(async (table, rows, opts) => {
+        seen.push({ table, queryId: opts?.queryId, dedupToken: opts?.dedupToken });
+        await real(table, rows, opts);
+      });
+
+      await new LedgerWriter(svc, ctx, { runId: 'qid-run', maxRowsPerInsert: 100 }).write(LEDGERS);
+
+      expect(seen.length).toBeGreaterThan(CHILD_TABLES.length);
+      for (const call of seen) {
+        expect(call.queryId).toBe(call.dedupToken);
+        expect(call.queryId).toMatch(new RegExp(`^qid-run:${call.table}:${index(0)}-${index(53)}:\\d+$`));
+      }
+      // The server saw them: one finished INSERT per call, under the runId.
+      jest.restoreAllMocks();
+      const logged = (await loggedQueries(svc, 'qid-run:')).sort();
+      expect(logged).toEqual(seen.map((c) => c.queryId!).sort());
+    });
+
+    it('an insert with a query_id shows up in system.processes while it runs', async () => {
+      const svc = await freshService();
+      // A column whose default sleeps makes a real INSERT slow enough to catch.
+      await svc.command(
+        'CREATE TABLE slow_insert (a UInt8, b UInt8 DEFAULT toUInt8(sleepEachRow(0.4))) ENGINE = Memory',
+      );
+
+      const running = svc.insert('slow_insert', [{ a: 1 }, { a: 2 }, { a: 3 }], { queryId: 'live:insert:1' });
+      const seen = await eventually(async () => (await runningQueryIds(svc, 'live:')).length > 0);
+      await running;
+
+      expect(seen).toBe(true);
+      expect(await runningQueryIds(svc, 'live:')).toEqual([]);
+      expect(await count(svc, 'slow_insert')).toBe(3);
+    });
+
+    it('deleteLedgersAbove and deleteLedgerRange tag each statement and make the lightweight delete synchronous', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(LEDGERS);
+      const calls: Array<{ sql: string; queryId?: string; sync?: unknown }> = [];
+      const real = svc.command.bind(svc);
+      jest.spyOn(svc, 'command').mockImplementation(async (sql, params, opts) => {
+        calls.push({ sql, queryId: opts?.queryId, sync: opts?.settings?.lightweight_deletes_sync });
+        await real(sql, params, opts);
+      });
+
+      await deleteLedgersAbove(svc, index(39), { queryIdPrefix: 'tagged-above' });
+      await deleteLedgerRange(svc, index(0), index(10), { queryIdPrefix: 'tagged-range' });
+      await deleteLedgerRange(svc, index(11), index(12));
+
+      const deletes = calls.filter((c) => /^\s*DELETE FROM/.test(c.sql));
+      expect(deletes.every((c) => c.sync === '2')).toBe(true);
+
+      const ids = (prefix: string) => deletes.filter((c) => c.queryId?.startsWith(prefix)).map((c) => c.queryId!);
+      for (const id of [...ids('tagged-above'), ...ids('tagged-range')]) {
+        expect(id).toMatch(/^tagged-(above|range):delete:[a-z_]+:(\d+|all)$/);
+      }
+      expect(new Set(ids('tagged-above').map((id) => id.split(':')[2]))).toEqual(new Set(ALL_TABLES));
+      expect(ids('tagged-above').find((id) => id.startsWith('tagged-above:delete:accounts_created:'))).toBe(
+        'tagged-above:delete:accounts_created:all',
+      );
+      expect(ids('tagged-above')).toContain('tagged-above:delete:transactions:11');
+      expect(new Set(ids('tagged-above')).size).toBe(ids('tagged-above').length);
+      // Without a prefix there is no query_id.
+      expect(
+        deletes.slice(ids('tagged-above').length + ids('tagged-range').length).every((c) => c.queryId === undefined),
+      ).toBe(true);
+
+      // And the server ran exactly those statements under those ids.
+      expect(await loggedQueries(svc, 'tagged-above:delete:')).toEqual(ids('tagged-above').sort());
+    });
+  });
+
+  describe('awaitQuiescence', () => {
+    /** Start a query that sleeps for about `seconds`, under a query_id, without waiting for it. */
+    const sleeper = (svc: ClickHouseService, queryId: string, seconds: number): Promise<void> =>
+      svc.raw
+        .command({
+          query: `SELECT sleepEachRow(0.25) FROM numbers(${Math.round(seconds * 4)}) SETTINGS max_block_size = 1`,
+          query_id: queryId,
+        })
+        .then(() => undefined);
+
+    it('returns immediately when nothing matches', async () => {
+      const svc = await freshService();
+      const started = Date.now();
+      await awaitQuiescence(svc, 'nobody-runs-this', { pollMs: 5000, timeoutMs: 10_000 });
+      expect(Date.now() - started).toBeLessThan(2000);
+    });
+
+    it('waits for a long-running query with the prefix', async () => {
+      const svc = await freshService();
+      let done = false;
+      const slow = sleeper(svc, 'quiet-run:slow:1', 1.5).then(() => {
+        done = true;
+      });
+      expect(await eventually(async () => (await runningQueryIds(svc, 'quiet-run')).length > 0)).toBe(true);
+
+      await awaitQuiescence(svc, 'quiet-run', { pollMs: 50, timeoutMs: 20_000 });
+
+      expect(done).toBe(true);
+      await slow;
+    });
+
+    it('matches the prefix as a whole id part: a sibling runId is neither awaited nor killed', async () => {
+      const svc = await freshService();
+      const sibling = sleeper(svc, 'quiet-run2:slow:1', 1.5);
+      expect(await eventually(async () => (await runningQueryIds(svc, 'quiet-run2')).length > 0)).toBe(true);
+
+      const started = Date.now();
+      await awaitQuiescence(svc, 'quiet-run', { pollMs: 50, timeoutMs: 300 });
+
+      expect(Date.now() - started).toBeLessThan(1000);
+      await expect(sibling).resolves.toBeUndefined();
+    });
+
+    it('kills the queries that are still running after the timeout', async () => {
+      const svc = await freshService();
+      const stuck = sleeper(svc, 'quiet-kill:slow:1', 30);
+      const outcome = stuck.then(
+        () => 'finished',
+        () => 'killed',
+      );
+      expect(await eventually(async () => (await runningQueryIds(svc, 'quiet-kill')).length > 0)).toBe(true);
+
+      const started = Date.now();
+      await awaitQuiescence(svc, 'quiet-kill', { pollMs: 50, timeoutMs: 400 });
+
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(await runningQueryIds(svc, 'quiet-kill')).toEqual([]);
+      expect(await outcome).toBe('killed');
+    });
+
+    it('waits for pending mutations of the ledger tables, and throws when they cannot finish', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, 2));
+
+      // With merges (and so mutations) stopped, an ALTER DELETE stays pending.
+      await svc.command(`SYSTEM STOP MERGES ${Table.LedgerByHash}`);
+      try {
+        await svc.command(
+          `ALTER TABLE ${Table.LedgerByHash} DELETE WHERE ledger_index < 0 SETTINGS mutations_sync = 0`,
+        );
+        await expect(awaitQuiescence(svc, 'quiet-mut', { pollMs: 50, timeoutMs: 300 })).rejects.toThrow(
+          /not quiescent.*mutation/is,
+        );
+      } finally {
+        await svc.command(`SYSTEM START MERGES ${Table.LedgerByHash}`);
+      }
+      await awaitQuiescence(svc, 'quiet-mut', { pollMs: 50, timeoutMs: 20_000 });
+    });
+
+    it('rejects an empty prefix: it would match every query', async () => {
+      const svc = await freshService();
+      await expect(awaitQuiescence(svc, '')).rejects.toThrow(/prefix/i);
     });
   });
 

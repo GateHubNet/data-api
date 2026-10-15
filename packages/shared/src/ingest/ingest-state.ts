@@ -1,6 +1,6 @@
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { Table } from '../clickhouse/tables';
-import { allSettledOrThrow } from '../util/helpers';
+import { allSettledOrThrow, wait } from '../util/helpers';
 
 /** Ledgers per partition of the ledger-prefixed tables: `PARTITION BY intDiv(ledger_index, 1000000)`. */
 const P6 = 1_000_000;
@@ -41,6 +41,20 @@ export const LEDGER_KEYED_TABLES: ReadonlyArray<LedgerKeyedTable> = [
   { table: Table.AccountsCreated },
 ];
 
+export interface DeleteOptions {
+  /**
+   * Tags each DELETE with the query_id `${queryIdPrefix}:delete:${table}:${partition}` (`all` for an unpartitioned
+   * table), so that `awaitQuiescence(ch, queryIdPrefix)` can wait for it and, if need be, kill it.
+   */
+  queryIdPrefix?: string;
+}
+
+/**
+ * Passed on every lightweight DELETE so that no server profile can make it asynchronous: the statement then returns
+ * only once the mutation has been applied (`lightweight_deletes_sync` is the 26.8 name; 2 = wait for all replicas).
+ */
+const SYNC_DELETE = { lightweight_deletes_sync: '2' } as const;
+
 function requireLedgerIndex(value: number, name = 'ledger index'): void {
   if (!Number.isInteger(value) || value < 0 || value > MAX_LEDGER_INDEX) {
     throw new RangeError(`Invalid ${name} ${value}: expected an integer from 0 to ${MAX_LEDGER_INDEX} (UInt32)`);
@@ -73,24 +87,34 @@ export async function storedLedgerHash(ch: ClickHouseService, index: number): Pr
  * ReplacingMergeTree, so rewriting without deleting would only collapse the duplicates at some later merge; reads
  * (which never use FINAL) would see them in the meantime.
  *
- * The rewrite must then use a **new `LedgerWriter`**: the dedup log of the tables outlives the DELETE, and a writer
- * that keeps its `runId` would have its rows dropped as replays of the attempt that was just cleaned up.
+ * Recovery is a contract, see `LedgerWriter`: `awaitQuiescence` of the failed run first, this, `awaitQuiescence` of
+ * `opts.queryIdPrefix`, then a writer from `withNewRunId()`. The dedup log of the tables outlives the DELETE, so a writer
+ * that keeps its `runId` has its rows dropped as replays of the attempt that was just cleaned up.
  */
-export async function deleteLedgersAbove(ch: ClickHouseService, checkpoint: number): Promise<void> {
+export async function deleteLedgersAbove(
+  ch: ClickHouseService,
+  checkpoint: number,
+  opts: DeleteOptions = {},
+): Promise<void> {
   requireLedgerIndex(checkpoint, 'checkpoint');
   if (checkpoint === MAX_LEDGER_INDEX) return;
-  await deleteWhere(ch, 'ledger_index > {checkpoint:UInt32}', { checkpoint }, checkpoint + 1);
+  await deleteWhere(ch, 'ledger_index > {checkpoint:UInt32}', { checkpoint }, checkpoint + 1, undefined, opts);
 }
 
 /**
  * Delete every row of the ledgers `from` to `to` (both inclusive) from every ledger-keyed table, to rewrite them with a
- * new `LedgerWriter` (see `deleteLedgersAbove` for why it must be a new one).
+ * writer from `withNewRunId()` (see `deleteLedgersAbove` for the contract).
  */
-export async function deleteLedgerRange(ch: ClickHouseService, from: number, to: number): Promise<void> {
+export async function deleteLedgerRange(
+  ch: ClickHouseService,
+  from: number,
+  to: number,
+  opts: DeleteOptions = {},
+): Promise<void> {
   requireLedgerIndex(from, 'ledger range start');
   requireLedgerIndex(to, 'ledger range end');
   if (from > to) throw new RangeError(`Invalid ledger range ${from}-${to}: the start is after the end`);
-  await deleteWhere(ch, 'ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}', { from, to }, from, to);
+  await deleteWhere(ch, 'ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}', { from, to }, from, to, opts);
 }
 
 /**
@@ -129,11 +153,12 @@ async function deleteWhere(
   predicate: string,
   params: Record<string, unknown>,
   lowest: number,
-  highest?: number,
+  highest: number | undefined,
+  opts: DeleteOptions,
 ): Promise<void> {
   const [marker, ...others] = LEDGER_KEYED_TABLES;
-  await deleteFromTable(ch, marker, predicate, params, lowest, highest);
-  await allSettledOrThrow(others.map((t) => deleteFromTable(ch, t, predicate, params, lowest, highest)));
+  await deleteFromTable(ch, marker, predicate, params, lowest, highest, opts);
+  await allSettledOrThrow(others.map((t) => deleteFromTable(ch, t, predicate, params, lowest, highest, opts)));
 }
 
 async function deleteFromTable(
@@ -143,9 +168,15 @@ async function deleteFromTable(
   params: Record<string, unknown>,
   lowest: number,
   highest: number | undefined,
+  { queryIdPrefix }: DeleteOptions,
 ): Promise<void> {
+  const commandOptions = (partition: string) => ({
+    ...(queryIdPrefix !== undefined && { queryId: `${queryIdPrefix}:delete:${table}:${partition}` }),
+    settings: SYNC_DELETE,
+  });
+
   if (partitionSize === undefined) {
-    await ch.command(`DELETE FROM ${table} WHERE ${predicate}`, params);
+    await ch.command(`DELETE FROM ${table} WHERE ${predicate}`, params, commandOptions('all'));
     return;
   }
 
@@ -164,9 +195,88 @@ async function deleteFromTable(
       );
     }
     if (id < lowestPartition || id > highestPartition) continue;
-    await ch.command(`DELETE FROM ${table} IN PARTITION ID {partition:String} WHERE ${predicate}`, {
-      ...params,
-      partition,
-    });
+    await ch.command(
+      `DELETE FROM ${table} IN PARTITION ID {partition:String} WHERE ${predicate}`,
+      { ...params, partition },
+      commandOptions(partition),
+    );
+  }
+}
+
+export interface QuiescenceOptions {
+  /** How long to wait before killing what still runs, and again how long to wait after the kill. Default 60000. */
+  timeoutMs?: number;
+  /** Pause between two looks at the server. Default 250. */
+  pollMs?: number;
+}
+
+/**
+ * Wait until the server is no longer working on anything a failed attempt started: no running query whose `query_id`
+ * is `queryIdPrefix` or starts with `${queryIdPrefix}:` (the ids of a `LedgerWriter` run and of the deletes tagged with
+ * a `queryIdPrefix`), and no unfinished mutation on the ledger-keyed tables (an abandoned lightweight DELETE is one).
+ *
+ * A client-side timeout does not stop the statement on the server. Without this wait, an INSERT of the failed attempt
+ * can land after the recovery's DELETE, and a DELETE can still be running when the rewrite starts.
+ *
+ * After `timeoutMs` the queries that still match are killed (`KILL QUERY ... SYNC`) and the mutations get `timeoutMs`
+ * more. If they are not done by then, this throws; the caller retries. A mutation is not killed, because the delete it
+ * carries is wanted. Only the id part is matched, so a run `abc` does not wait for, or kill, a run `abcd`.
+ */
+export async function awaitQuiescence(
+  ch: ClickHouseService,
+  queryIdPrefix: string,
+  opts: QuiescenceOptions = {},
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 60_000;
+  const pollMs = opts.pollMs ?? 250;
+  if (typeof queryIdPrefix !== 'string' || queryIdPrefix === '') {
+    throw new Error('awaitQuiescence needs a non-empty query id prefix: an empty one would match every query');
+  }
+  if (!(timeoutMs >= 0) || !(pollMs > 0)) {
+    throw new RangeError(`Invalid awaitQuiescence options: timeoutMs ${timeoutMs}, pollMs ${pollMs}`);
+  }
+
+  const match = { exact: queryIdPrefix, nested: `${queryIdPrefix}:` };
+  const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
+  const idle = async (): Promise<boolean> => {
+    const row = await ch.queryOne<{ queries: number | string; mutations: number | string }>(
+      `SELECT
+         (SELECT count() FROM system.processes WHERE query_id = {exact:String} OR startsWith(query_id, {nested:String})) AS queries,
+         (SELECT count() FROM system.mutations
+           WHERE database = currentDatabase() AND table IN {tables:Array(String)} AND is_done = 0) AS mutations`,
+      { ...match, tables },
+    );
+    return Number(row?.queries) === 0 && Number(row?.mutations) === 0;
+  };
+
+  if (await pollUntil(idle, timeoutMs, pollMs)) return;
+
+  await ch.command(`KILL QUERY WHERE query_id = {exact:String} OR startsWith(query_id, {nested:String}) SYNC`, match);
+  if (await pollUntil(idle, timeoutMs, pollMs)) return;
+
+  const stuck = await ch.query<{ table: string; mutation_id: string; latest_fail_reason: string }>(
+    `SELECT table, mutation_id, latest_fail_reason FROM system.mutations
+      WHERE database = currentDatabase() AND table IN {tables:Array(String)} AND is_done = 0 LIMIT 5`,
+    { tables },
+  );
+  const running = await ch.queryOne<{ n: number | string }>(
+    'SELECT count() AS n FROM system.processes WHERE query_id = {exact:String} OR startsWith(query_id, {nested:String})',
+    match,
+  );
+  throw new Error(
+    `The ledger tables are not quiescent after ${timeoutMs}ms, a KILL QUERY and ${timeoutMs}ms more: ` +
+      `${Number(running?.n)} queries under "${queryIdPrefix}" still running, unfinished mutations ` +
+      `${JSON.stringify(stuck)}. Retry.`,
+  );
+}
+
+/** Poll `check` every `pollMs` until it is true (then true) or `timeoutMs` has passed (then false). */
+async function pollUntil(check: () => Promise<boolean>, timeoutMs: number, pollMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await check()) return true;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await wait(Math.min(pollMs, left));
   }
 }

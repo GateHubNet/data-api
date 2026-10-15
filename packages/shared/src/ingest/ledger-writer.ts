@@ -24,22 +24,26 @@ export interface LedgerWriterOptions {
  *  2. `ledger_by_hash`,
  *  3. `ledgers`.
  * The `ledgers` row is the commit marker: a ledger is committed exactly when it has one, and a failed `write()` leaves
- * at most child rows of ledgers that have none. Nothing reads those; recovery removes them with
- * `deleteLedgersAbove(committedCheckpoint())` (see `ingest-state.ts`).
+ * at most child rows of ledgers that have none. Nothing reads those; recovery removes them.
  *
- * Every insert carries a dedup token `${runId}:${table}:${firstLedger}-${lastLedger}:${chunkNo}`, so retrying the same
- * batch with the same writer after a failure re-sends only what did not go in; the server drops the rest as replays.
+ * Every insert carries a dedup token `${runId}:${table}:${firstLedger}-${lastLedger}:${chunkNo}` and the same string as
+ * its `query_id`, so retrying the same batch with the same writer after a failure re-sends only what did not go in
+ * (the server drops the rest as replays), and everything a run has in flight can be found, and killed, by `runId`.
  *
- * **Recovery needs a new writer.** The tables remember the tokens of their last 1000 inserts, and that memory survives
- * a DELETE. Once rows of a `runId` have been deleted, inserting them again under that `runId` is silently dropped, while
- * the commit marker (a token that was never used) goes in: the ledger would look committed with its rows gone. So after
- * a failure, delete what is above the checkpoint and carry on with `new LedgerWriter(...)`, which has a new `runId`. A
- * retry with the same writer is only safe without a delete in between, and only for the same batch of ledgers: other
+ * **Recovery contract.** When `write()` throws:
+ *  1. `await awaitQuiescence(ch, writer.runId)`: a request the client gave up on (a timeout) may still be running on the
+ *     server, and its rows would land behind the delete. `write()` itself never rejects while one of its own client
+ *     calls is pending, but that says nothing about what the server is still doing.
+ *  2. Re-read `committedCheckpoint(ch)`.
+ *  3. `await deleteLedgersAbove(ch, checkpoint, { queryIdPrefix })`, then `await awaitQuiescence(ch, queryIdPrefix)` for
+ *     the same reason (a DELETE the client timed out on is a mutation that may still be running).
+ *  4. Carry on with `writer.withNewRunId()`, never with `writer`. The tables remember the tokens of their last 1000
+ *     inserts and that memory survives a DELETE: once rows of a `runId` have been deleted, inserting them again under
+ *     that `runId` is silently dropped, while the commit marker (a token that was never used) goes in. The ledger would
+ *     look committed with its rows gone.
+ *
+ * A retry with the same writer is only safe without a delete in between, and only for the same batch of ledgers: other
  * batch bounds give other tokens, which do not deduplicate.
- *
- * `write()` does not reject while an insert of its own is still running, so by the time the caller sees the error no
- * insert of that attempt can still land behind a recovery. (A request the client gave up on may still be running
- * server-side; callers with a request timeout should let it pass before they delete.)
  */
 export class LedgerWriter {
   readonly runId: string;
@@ -58,8 +62,17 @@ export class LedgerWriter {
   }
 
   /**
+   * A writer for the same connection, parse context and limits under a new `runId` (random unless given): the one to
+   * carry on with after a failure and a delete, see the recovery contract above. Passing the current `runId` defeats
+   * the purpose.
+   */
+  withNewRunId(runId?: string): LedgerWriter {
+    return new LedgerWriter(this.ch, this.ctx, { runId, maxRowsPerInsert: this.maxRowsPerInsert });
+  }
+
+  /**
    * Write the ledgers as one batch: the rows of all of them are concatenated per table. Throws on the first failure
-   * (after every running insert has finished); the caller decides how to recover, see the class description.
+   * (after every insert of this call has settled on the client); the caller recovers as the class description says.
    */
   async write(ledgers: RawLedger[]): Promise<void> {
     if (ledgers.length === 0) return;
@@ -96,7 +109,8 @@ export class LedgerWriter {
   private async insertChunks(table: Table, span: string, rows: unknown[]): Promise<void> {
     const chunks = chunk(rows, this.maxRowsPerInsert);
     for (const [chunkNo, part] of chunks.entries()) {
-      await this.ch.insert(table, part, { dedupToken: `${this.runId}:${table}:${span}:${chunkNo}` });
+      const id = `${this.runId}:${table}:${span}:${chunkNo}`;
+      await this.ch.insert(table, part, { dedupToken: id, queryId: id });
     }
   }
 }

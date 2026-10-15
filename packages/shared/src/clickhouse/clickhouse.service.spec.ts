@@ -47,6 +47,20 @@ describe('ClickHouseService', () => {
       expect(client.insert.mock.calls[1][0].clickhouse_settings).toEqual({ async_insert: 0 });
     });
 
+    it('sends query_id only when a queryId is given', async () => {
+      await service.insert('t', [{ a: 1 }], { dedupToken: 'tok', queryId: 'run1:t:1-2:0' });
+      expect(client.insert).toHaveBeenLastCalledWith({
+        table: 't',
+        values: [{ a: 1 }],
+        format: 'JSONEachRow',
+        query_id: 'run1:t:1-2:0',
+        clickhouse_settings: { async_insert: 0, insert_deduplication_token: 'tok' },
+      });
+
+      await service.insert('t', [{ a: 1 }]);
+      expect(client.insert.mock.calls[1][0]).not.toHaveProperty('query_id');
+    });
+
     it('skips empty batches', async () => {
       await service.insert('t', [], { dedupToken: 'x' });
       expect(client.insert).not.toHaveBeenCalled();
@@ -87,6 +101,23 @@ describe('ClickHouseService', () => {
 
       client.query.mockResolvedValue({ json: async () => [] });
       await expect(service.queryOne('SELECT 1')).resolves.toBeUndefined();
+    });
+  });
+
+  it('command sends query_id and merges settings over wait_end_of_query when given', async () => {
+    await service.command(
+      'DELETE FROM t WHERE k > {k:UInt32}',
+      { k: 5 },
+      {
+        queryId: 'p:delete:t:1',
+        settings: { lightweight_deletes_sync: '2' },
+      },
+    );
+    expect(client.command).toHaveBeenLastCalledWith({
+      query: 'DELETE FROM t WHERE k > {k:UInt32}',
+      query_params: { k: 5 },
+      query_id: 'p:delete:t:1',
+      clickhouse_settings: { wait_end_of_query: 1, lightweight_deletes_sync: '2' },
     });
   });
 

@@ -9,6 +9,18 @@ export interface InsertOptions {
    * hashed by content. Only effective on a table with `non_replicated_deduplication_window` > 0.
    */
   dedupToken?: string;
+  /**
+   * Sent as the request's `query_id`, so the insert can be found in `system.processes` while it runs and in
+   * `system.query_log` afterwards, and killed by id. ClickHouse rejects a second query with the id of a running one.
+   */
+  queryId?: string;
+}
+
+export interface CommandOptions {
+  /** Sent as the request's `query_id` (see `InsertOptions.queryId`). */
+  queryId?: string;
+  /** Merged over the defaults of `command` (`wait_end_of_query: 1`). */
+  settings?: ClickHouseSettings;
 }
 
 /**
@@ -85,6 +97,7 @@ export class ClickHouseService implements OnModuleDestroy {
       table,
       values: rows,
       format: 'JSONEachRow',
+      ...(opts.queryId !== undefined && { query_id: opts.queryId }),
       clickhouse_settings: {
         async_insert: 0,
         ...(opts.dedupToken !== undefined && { insert_deduplication_token: opts.dedupToken }),
@@ -93,8 +106,13 @@ export class ClickHouseService implements OnModuleDestroy {
   }
 
   /** Run a DDL / DML command (CREATE TABLE, ALTER, lightweight DELETE …). Values go through `params`. */
-  async command(query: string, params: Record<string, unknown> = {}): Promise<void> {
-    await this.client.command({ query, query_params: params, clickhouse_settings: { wait_end_of_query: 1 } });
+  async command(query: string, params: Record<string, unknown> = {}, opts: CommandOptions = {}): Promise<void> {
+    await this.client.command({
+      query,
+      query_params: params,
+      ...(opts.queryId !== undefined && { query_id: opts.queryId }),
+      clickhouse_settings: { wait_end_of_query: 1, ...opts.settings },
+    });
   }
 
   /** Liveness probe used by the health module. */
