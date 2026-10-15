@@ -25,8 +25,19 @@ export const LIVE_RUNNER_OPTIONS = Symbol('LIVE_RUNNER_OPTIONS');
 /** Ledgers per partition of `ledgers` (`PARTITION BY intDiv(ledger_index, 1000000)`): a commit never spans two. */
 export const LEDGERS_PARTITION_SIZE = 1_000_000;
 
-/** `ingest_log.run_id` prefix of the live runner's first-write intents (the range ingest uses its own ids). */
+/**
+ * `ingest_log` rows of the live runner's first-write intents have a `run_id` with this prefix (`live:<bootId>`) and the
+ * key `(range_start = start, range_end = LIVE_INTENT_RANGE_END)`.
+ */
 export const LIVE_INTENT_PREFIX = 'live:';
+
+/**
+ * `range_end` of a live first-write intent: 0, a sentinel no range-ingest chunk can have (a chunk's `range_end` is at
+ * least its `range_start`), so that a live intent never shares the ReplacingMergeTree key `(range_start, range_end)` of
+ * `ingest_log` with a range chunk, and no merge collapses one into the other (ruling R26). Readers of range chunks must
+ * skip `run_id` `live:%` (and range_end 0).
+ */
+export const LIVE_INTENT_RANGE_END = 0;
 
 /**
  * A ledger whose `parent_hash` is not the hash of the ledger before it, or a stored checkpoint whose hash the node does
@@ -345,8 +356,10 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
    * lease (argMax, and the table is ReplacingMergeTree(heartbeat)), so a release must win over the last heartbeat.
    * Written by the server (`now64(3)`), the DateTime64(3) column never sees a client number.
    *
-   * With `onlyIfHeldBy` the row is written only while that holder has the newest row, in the same statement: a takeover
-   * that lands between a heartbeat's check and its write is never overwritten (the next check sees it and halts).
+   * With `onlyIfHeldBy` the row is written only if that holder has the newest row when the statement reads the table: a
+   * takeover that landed between a heartbeat's check and its write is not overwritten, and the next check sees it and
+   * halts. ClickHouse has no transactions, so a takeover that lands while this very statement runs can still end up
+   * older than the row it writes; then the other syncer's next check finds this one newest and that one halts.
    */
   private async writeLeaseRow(holder: string, onlyIfHeldBy?: string): Promise<void> {
     const newest = `SELECT argMax(holder, heartbeat) FROM ${Table.SyncerLease} WHERE network = {network:String}`;
@@ -459,13 +472,16 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     return row?.start == null ? undefined : Number(row.start);
   }
 
-  /** Record that this runner is about to write its first ledger at `start`, before any row of it goes in. */
+  /**
+   * Record that this runner is about to write its first ledger at `start`, before any row of it goes in. The key is
+   * `(start, LIVE_INTENT_RANGE_END)`, which no range-ingest chunk uses.
+   */
   private async recordLiveIntent(start: number): Promise<void> {
     // updated_at is DateTime64(3): a JSON number is read as seconds, so it is sent as fractional seconds.
     await this.ch.insert(Table.IngestLog, [
       {
         range_start: start,
-        range_end: start,
+        range_end: LIVE_INTENT_RANGE_END,
         run_id: `${LIVE_INTENT_PREFIX}${this.bootId}`,
         status: 'started',
         updated_at: Date.now() / 1000,
@@ -684,9 +700,14 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     return undefined;
   }
 
-  /** Move fetched ledgers into the batch in index order while each one chains to the one before. */
+  /**
+   * Move fetched ledgers into the batch in index order while each one chains to the one before. A batch that is due is
+   * never appended to: it is written as it is, even when its write has to wait (a lease that cannot be confirmed right
+   * now), so it cannot grow across a `ledgers` partition or past the flush thresholds.
+   */
   private accept(head: number): void {
     while (!this.pendingBreak) {
+      if (this.batch.length > 0 && this.shouldFlush(head)) return;
       const ledger = this.ready.get(this.nextToAccept);
       if (ledger === undefined) return;
       const { ledger_index: index, ledger_hash: hash, parent_hash: parentHash } = ledger.header;
@@ -704,7 +725,6 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       if (this.batch.length === 1) this.batchSince = Date.now();
       this.tipHash = hash;
       this.nextToAccept += 1;
-      if (this.shouldFlush(head)) return;
     }
   }
 
@@ -828,8 +848,10 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   }
 
   /**
-   * A boot or recovery step that stop() may cut short (it throws `StoppedError` then). The abandoned query keeps running
-   * on the server; the next boot waits for it (`awaitQuiescence`) before it deletes anything.
+   * A boot or recovery step that stop() may cut short (it throws `StoppedError` then). The abandoned statement may keep
+   * running on the server. Only a delete matters: it is a mutation, which touches only the parts that existed when it was
+   * created (never rows written later), and the next boot, after its own delete, waits for every unfinished mutation on
+   * the ledger tables (`awaitQuiescence`) before it writes. Abandoned reads are harmless.
    */
   private async step<T>(promise: Promise<T>): Promise<T> {
     const result = await abortable(promise, this.stopAbort.signal);

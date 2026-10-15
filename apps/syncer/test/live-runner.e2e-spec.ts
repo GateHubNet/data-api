@@ -440,6 +440,58 @@ describe('LiveRunner (e2e)', () => {
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
   });
 
+  it('does not append to a due batch while its write waits for the lease', async () => {
+    const svc = await freshService();
+    const txsPerLedger = CHAIN[0].raw.transactions.length;
+    let leaseChecksFailed = 0;
+    let armed = false;
+    // The lease check fails once (ClickHouse hiccup, not a takeover) when the first batch is due: its tip is L(14) =
+    // 9,999,999, and it is also at catchupFlushLedgers and catchupFlushTxs.
+    const runnerCh = Object.create(svc) as ClickHouseService;
+    runnerCh.insert = (async (table: string, rows: unknown[], opts?: Record<string, unknown>) => {
+      if (table === Table.IngestLog) armed = true; // the boot is done: the next lease check is the first flush's
+      return svc.insert(table, rows, opts);
+    }) as ClickHouseService['insert'];
+    runnerCh.queryOne = (async (sql: string, params?: Record<string, unknown>) => {
+      if (armed && sql.includes('dateDiff')) {
+        armed = false;
+        leaseChecksFailed += 1;
+        throw new Error('injected: ClickHouse hiccup during the lease check');
+      }
+      return svc.queryOne(sql, params);
+    }) as ClickHouseService['queryOne'];
+    // Every lease confirmation looks stale, so every write checks the lease first.
+    const realNow = performance.now.bind(performance);
+    let shift = 0;
+    jest.spyOn(performance, 'now').mockImplementation(() => realNow() + (shift += 3_600_000));
+    const batches = recordBatches();
+    const { runner, logger } = makeRunner(svc, new TestSource(L(30)), {
+      ch: runnerCh,
+      cfg: { catchupFlushLedgers: 14, catchupFlushTxs: 14 * txsPerLedger, catchupFlushMs: 600_000 },
+      options: { headSilenceMs: 600_000, backoffInitialMs: 50 },
+    });
+
+    await within(runner.runOnce(), 10_000, 'Catching up 30 ledgers');
+
+    expect(leaseChecksFailed).toBe(1);
+    expect(logger.lines).toContainEqual(
+      expect.objectContaining({ level: 'warn', message: expect.stringContaining('injected: ClickHouse hiccup') }),
+    );
+    // The due batch was written as it was once the lease was confirmed: no ledger was added while it waited.
+    expect(batches).toEqual([
+      [L(1), L(14)],
+      [L(15), L(28)],
+      [L(29), L(29)],
+      [L(30), L(30)],
+    ]);
+    const partition = (index: number) => Math.floor(index / LEDGERS_PARTITION_SIZE);
+    for (const [first, last] of batches) {
+      expect(partition(first)).toBe(partition(last));
+      expect(last - first + 1).toBeLessThanOrEqual(14);
+    }
+    expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
+  });
+
   it('fills a gap when hints jump 10 → 13', async () => {
     const svc = await freshService();
     // The polled head stays at 10: only the hint can tell the runner about 13.
@@ -630,9 +682,10 @@ describe('LiveRunner (e2e)', () => {
     await firstRun;
 
     const [intent] = await liveIntentRows(svc);
+    // Keyed (start, 0): range_end 0 is a sentinel no range-ingest chunk can have (ruling R26).
     expect(intent).toMatchObject({
       range_start: L(5),
-      range_end: L(5),
+      range_end: 0,
       run_id: `live:${first.bootId}`,
       status: 'started',
     });
@@ -641,6 +694,13 @@ describe('LiveRunner (e2e)', () => {
     expect(intent.updated_ms).toBeLessThanOrEqual(Date.now() + 1_000);
     // ...and its write got as far as the child rows of L(5) and L(6), not their commit marker.
     await insertUncommitted(svc, chainRaw(L(5), L(6)));
+    // A range-ingest chunk that starts at the same ledger, newer and done, merged with everything: it must not swallow the
+    // intent (with the key (start, start) the merge would keep only the chunk's row).
+    await svc.insert(Table.IngestLog, [
+      { range_start: L(5), range_end: L(5), run_id: 'range:chunk', status: 'done', updated_at: Date.now() / 1000 + 1 },
+    ]);
+    await svc.command(`OPTIMIZE TABLE ${Table.IngestLog} FINAL`);
+    expect(await unfinishedLiveIntents(svc)).toEqual([L(5)]);
 
     // The next boot starts at the head of its own moment, L(12): above those rows.
     const { runner: second } = makeRunner(svc, new TestSource(L(12)), { cfg: { syncStartLedger: undefined } });
