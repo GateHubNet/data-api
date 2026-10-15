@@ -29,9 +29,10 @@ export interface NetworkProfile {
   /** First ledger from which a partial payment's delivered amount is taken from `delivered_amount` metadata. */
   partialPaymentFixLedger: number;
   /**
-   * Binary-codec definitions (the `server_definitions` result shape) to use when the node cannot supply them.
-   * `undefined` means the codec's built-in definitions apply, or, on xahau, that no definitions file has been
-   * bundled yet. The file defaults to `config/definitions/<network>.json`; `definitionsPath` overrides it (tests).
+   * Binary-codec definitions (the `server_definitions` result shape) to use when the node cannot supply them: the
+   * file recorded from a public node of the network, bundled as `config/definitions/<network>.json`. `undefined`
+   * means that file is missing, and the codec's built-in definitions apply. `definitionsPath` overrides the file
+   * (tests).
    */
   definitionsFallback(definitionsPath?: string): Record<string, unknown> | undefined;
 }
@@ -54,7 +55,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultDatabase: 'xrpl',
     defaultNodeEndpoints: ['wss://xrplcluster.com'],
     partialPaymentFixLedger: 4594094,
-    definitionsFallback: () => undefined,
+    definitionsFallback: (definitionsPath) => readDefinitions('xrpl', definitionsPath),
   },
   xahau: {
     name: 'xahau',

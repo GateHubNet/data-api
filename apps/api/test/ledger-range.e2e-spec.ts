@@ -108,24 +108,42 @@ describe('LedgerRangeResolver on the ripple-mock ledgers', () => {
   });
 
   it('counts a ledger only when its commit marker (the ledgers row) is there', async () => {
-    // A ledger whose child rows were written but whose ledgers row was not does not exist for the API.
-    await h.ch.insert('transactions', [
-      {
-        ledger_index: 99999999,
-        tx_index: 0,
-        hash: 'AB',
-        tx_type: 'Payment',
-        result: 'tesSUCCESS',
-        account: 'rX',
-        sequence: 1,
-        fee: '10',
-        close_time: 4000000000,
-        tx_json: '{}',
-        meta_json: '{}',
-      },
-    ]);
+    // Ledgers that crashed half way: child rows and the hash lookup were written, the `ledgers` row was not. One lies
+    // below the first committed ledger and one above the last, so that the open ends of a range see them as well.
+    for (const [half, closed] of [
+      [5, Date.UTC(2013, 0, 1)],
+      [99_999_999, Date.UTC(2099, 0, 1)],
+    ]) {
+      const hash = half.toString(16).padStart(64, 'A');
+      await h.ch.insert('ledger_by_hash', [{ ledger_hash: hash, ledger_index: half }]);
+      await h.ch.insert('transactions', [
+        {
+          ledger_index: half,
+          tx_index: 0,
+          hash,
+          tx_type: 'Payment',
+          result: 'tesSUCCESS',
+          account: 'rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg',
+          sequence: 1,
+          fee: '10',
+          close_time: Math.floor(closed / 1000),
+          tx_json: '{}',
+          meta_json: '{}',
+        },
+      ]);
+      await h.ch.insert('tx_by_hash', [{ hash, ledger_index: half, tx_index: 0 }]);
+      expect((await h.ch.query('SELECT 1 FROM transactions WHERE ledger_index = {i:UInt32}', { i: half })).length).toBe(
+        1,
+      );
+    }
+
     expect(await resolver.latest()).toBe(29709909);
-    expect(await resolver.resolve(day('2100-01-01'))).toBeNull();
+    expect(await resolver.resolve()).toEqual({ min: 1021029, max: 29709909 });
+    expect(await resolver.resolve(undefined, day('2013-06-01'))).toBeNull();
+    expect(await resolver.resolve(day('2012-01-01'), day('2014-01-01'))).toEqual({ min: 1021029, max: 2964124 });
+    expect(await resolver.resolve(day('2099-01-01'))).toBeNull();
+    expect(await resolver.ledgerAtOrBefore(day('2100-01-01'))).toBe(29709909);
+    expect(await resolver.ledgerAtOrBefore(day('2013-02-01'))).toBeUndefined();
   });
 
   it('answers a repeated historical resolution from memory', async () => {
@@ -143,5 +161,70 @@ describe('LedgerRangeResolver on the ripple-mock ledgers', () => {
       expect(String(sql)).not.toMatch(/2015|14\d{8}/);
       expect(params).toEqual({ secs: expect.any(Number) });
     }
+  });
+});
+
+/** A `ledgers` row, with what the lookups do not read left at zero. */
+function ledgerRow(ledgerIndex: number, closeTime: Date) {
+  return {
+    ledger_index: ledgerIndex,
+    ledger_hash: ledgerIndex.toString(16).padStart(64, '0').toUpperCase(),
+    parent_hash: '0'.repeat(64),
+    account_hash: '0'.repeat(64),
+    transaction_hash: '0'.repeat(64),
+    total_coins: '99999999999000000',
+    close_time: Math.floor(closeTime.getTime() / 1000),
+    parent_close_time: 0,
+    close_time_resolution: 10,
+    close_flags: 0,
+    tx_count: 0,
+    type_counts: {},
+    result_counts: {},
+    payments_count: 0,
+    exchanges_count: 0,
+    accounts_created: 0,
+    fee_total: '0',
+    fee_min: '0',
+    fee_max: '0',
+    parser_version: 1,
+  };
+}
+
+describe('LedgerRangeResolver while the ingest has not reached the bound', () => {
+  let h: Harness;
+  let resolver: LedgerRangeResolver;
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock' }); // the newest mock ledger closed in May 2017
+    resolver = new LedgerRangeResolver(h.ch);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('does not freeze the newest ledger as the answer for a bound older than an hour but newer than the data', async () => {
+    const query = countQueries(h.ch);
+    const bound = day('2020-01-01'); // far in the past, yet after everything the ingest has committed
+    expect(await resolver.resolve(undefined, bound)).toEqual({ min: 1021029, max: 29709909 });
+    expect(await resolver.resolve(undefined, bound)).toEqual({ min: 1021029, max: 29709909 });
+    const before = (q: jest.SpyInstance) => q.mock.calls.filter(([sql]) => String(sql).includes('close_time <')).length;
+    expect(before(query)).toBe(2); // asked twice: not remembered
+
+    // The syncer commits a ledger that closed in 2019, still before the bound: the answer is the new ledger.
+    await h.ch.insert('ledgers', [ledgerRow(30_000_000, day('2019-06-01'))]);
+    expect(await resolver.resolve(undefined, bound)).toEqual({ min: 1021029, max: 30_000_000 });
+    expect(await resolver.ledgerAtOrBefore(bound)).toBe(30_000_000);
+    expect(before(query)).toBe(4);
+
+    // Once a ledger closes at or after the bound the answer is settled, and it is remembered.
+    await h.ch.insert('ledgers', [ledgerRow(30_000_001, day('2020-02-01'))]);
+    expect(await resolver.ledgerAtOrBefore(bound)).toBe(30_000_000);
+    expect(before(query)).toBe(5);
+    expect(await resolver.ledgerAtOrBefore(bound)).toBe(30_000_000);
+    expect(before(query)).toBe(5);
+    // (resolve asks "closed before 2020-01-01", ledgerAtOrBefore "closed at or before it": two bounds)
+    expect(await resolver.resolve(undefined, bound)).toEqual({ min: 1021029, max: 30_000_000 });
+    expect(await resolver.resolve(undefined, bound)).toEqual({ min: 1021029, max: 30_000_000 });
+    expect(before(query)).toBe(6);
   });
 });

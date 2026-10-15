@@ -2,6 +2,7 @@ import { getNetworkProfile, NetworkName, TransactionsRow } from '@gatehub/data-a
 import { Logger } from '@nestjs/common';
 import { BinaryCodecService } from '../src/common/binary-codec.service';
 import { TxService } from '../src/common/tx-object';
+import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
 import type { XrplService } from '../src/xrpl/xrpl.service';
 import { Harness, startHarness } from './harness';
 import { fixtureSource, fixtureTransactions, SeedName, transactionId, transactionTreeRoot } from './support/fixtures';
@@ -13,12 +14,16 @@ beforeAll(() => Logger.overrideLogger(false));
 
 const noNode = { request: jest.fn().mockRejectedValue(new Error('No node connection')) } as unknown as XrplService;
 
-async function servicesOf(h: Harness, network: NetworkName): Promise<TxService> {
+async function servicesOf(
+  h: Harness,
+  network: NetworkName,
+): Promise<{ service: TxService; codec: BinaryCodecService; prometheus: PrometheusService }> {
   const profile = getNetworkProfile(network);
   const codec = new BinaryCodecService(noNode, profile);
   await codec.onModuleInit();
   codec.onModuleDestroy();
-  return new TxService(h.ch, codec, profile);
+  const prometheus = new PrometheusService();
+  return { service: new TxService(h.ch, codec, profile, prometheus), codec, prometheus };
 }
 
 const keyOf = (row: Pick<TransactionsRow, 'ledger_index' | 'tx_index'>) => ({
@@ -28,15 +33,18 @@ const keyOf = (row: Pick<TransactionsRow, 'ledger_index' | 'tx_index'>) => ({
 
 describe.each<[SeedName, NetworkName]>([
   ['ripple-mock', 'xrpl'],
+  ['xrpl-recorded', 'xrpl'],
   ['xahau-recorded', 'xahau'],
 ])('TxService on the %s ledgers', (seed, network) => {
   let h: Harness;
   let service: TxService;
+  let codec: BinaryCodecService;
+  let prometheus: PrometheusService;
   const all = fixtureTransactions(seed);
 
   beforeAll(async () => {
     h = await startHarness({ seed });
-    service = await servicesOf(h, network);
+    ({ service, codec, prometheus } = await servicesOf(h, network));
   });
   afterAll(async () => {
     await h?.close();
@@ -127,6 +135,10 @@ describe.each<[SeedName, NetworkName]>([
   });
 
   describe('binary form of what is stored', () => {
+    it('is built with the bundled definitions of the network when the node does not answer', () => {
+      expect(codec.definitionsSource).toBe('profile');
+    });
+
     it('hashes to the stored hash for every transaction', async () => {
       const rows = await service.fetchByKeys(all.map((t) => keyOf(t.row)));
       expect(rows).toHaveLength(all.length);
@@ -155,6 +167,18 @@ describe.each<[SeedName, NetworkName]>([
     });
   });
 
+  it('serves every stored transaction in both modes without falling back to the stored JSON', async () => {
+    const rows = await service.fetchByKeys(all.map((t) => keyOf(t.row)));
+    const { values: before } = await prometheus.txEncodeFallback.get();
+    for (const row of rows) {
+      const json = service.toTxObject(row, { binary: false });
+      expect(json.tx).toEqual(codec.decode(codec.encode(JSON.parse(row.tx_json))));
+      expect(json.tx).not.toHaveProperty('DeliverMax');
+      expect(typeof service.toTxObject(row, { binary: true }).tx).toBe('string');
+    }
+    expect((await prometheus.txEncodeFallback.get()).values).toEqual(before);
+  });
+
   it('serves a fetched row as a TxObject with the ledger hash of its ledger', async () => {
     const { row } = all[0];
     const [fetched] = await service.fetchByKeys([keyOf(row)]);
@@ -174,7 +198,7 @@ describe('TxService.toTxObject on a fetched mainnet Payment', () => {
   let service: TxService;
   beforeAll(async () => {
     h = await startHarness({ seed: 'ripple-mock' });
-    service = await servicesOf(h, 'xrpl');
+    ({ service } = await servicesOf(h, 'xrpl'));
   });
   afterAll(async () => {
     await h?.close();

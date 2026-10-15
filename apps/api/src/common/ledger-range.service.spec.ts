@@ -16,17 +16,22 @@ interface Fake {
 }
 
 /**
- * A ClickHouse whose `ledgers` table is `ledgers` (ledger_index -> close time in unix seconds), answering the four
- * lookups of the resolver the way the SQL defines them.
+ * A ClickHouse whose `ledgers` table is `ledgers` (ledger_index -> close time in unix seconds; the test may push more
+ * of them later), answering the lookups of the resolver the way the SQL defines them.
  */
 function chWith(ledgers: [number, number][]): Fake {
   const query = jest.fn(async (sql: string, params: Record<string, unknown> = {}) => {
     const secs = params.secs as number | undefined;
-    let rows = [...ledgers].sort((a, b) => a[0] - b[0]);
+    const all = [...ledgers].sort((a, b) => a[0] - b[0]);
+    let rows = all;
     if (sql.includes('close_time >=')) rows = rows.filter(([, close]) => close >= (secs as number));
     else if (sql.includes('close_time <')) rows = rows.filter(([, close]) => close < (secs as number));
-    if (sql.includes('DESC')) rows.reverse();
-    return rows.slice(0, 1).map(([ledger_index]) => ({ ledger_index }));
+    if (sql.includes('DESC')) rows = [...rows].reverse();
+    return rows.slice(0, 1).map(([ledger_index]) => ({
+      ledger_index,
+      // the lookup of the last ledger before a bound also reports when the newest ledger closed
+      ...(sql.includes('head_close') && { head_close: all[all.length - 1][1] }),
+    }));
   });
   return { ch: { query } as unknown as ClickHouseService, query };
 }
@@ -223,6 +228,48 @@ describe('LedgerRangeResolver', () => {
       await resolver.resolve(older);
       await resolver.resolve(older);
       expect(asked(query, 'from')).toBe(3);
+    });
+
+    it('does not remember the last ledger before a bound that the ingest has not reached', async () => {
+      // The newest ledger closed at 12:00:30, the bound is 12:05:00: the answer is only "the newest so far".
+      const ledgers = [...LEDGERS];
+      const { ch, query } = chWith(ledgers);
+      const resolver = new LedgerRangeResolver(ch);
+      const bound = at('2015-01-14T12:05:00Z');
+      expect(await resolver.ledgerAtOrBefore(bound)).toBe(14);
+      expect(await resolver.ledgerAtOrBefore(bound)).toBe(14);
+      expect(asked(query, 'before')).toBe(2);
+
+      // The syncer commits a ledger before the bound: the answer moves, and nothing stale is served.
+      ledgers.push([15, secs('2015-01-14T12:04:50Z')]);
+      expect(await resolver.ledgerAtOrBefore(bound)).toBe(15);
+      expect(asked(query, 'before')).toBe(3);
+      expect(await resolver.resolve(undefined, new Date(bound.getTime() + 1000))).toEqual({ min: 10, max: 15 });
+      expect(asked(query, 'before')).toBe(4); // a different bound, not reached either
+
+      // Once a ledger closes at or after the bound nothing can change the answer any more.
+      ledgers.push([16, secs('2015-01-14T12:05:10Z')]);
+      expect(await resolver.ledgerAtOrBefore(bound)).toBe(15);
+      expect(asked(query, 'before')).toBe(5);
+      expect(await resolver.ledgerAtOrBefore(bound)).toBe(15);
+      expect(asked(query, 'before')).toBe(5);
+    });
+
+    it('remembers the last ledger before a bound that the newest ledger closed exactly at', async () => {
+      const { ch, query } = chWith(LEDGERS);
+      const resolver = new LedgerRangeResolver(ch);
+      // closed < 12:00:30 -> ledger 13; the head (14) closed at 12:00:30, which is not before the bound
+      await resolver.resolve(undefined, at('2015-01-14T12:00:30Z'));
+      await resolver.resolve(undefined, at('2015-01-14T12:00:30Z'));
+      expect(asked(query, 'before')).toBe(1);
+    });
+
+    it('does not remember an answer for a database whose ledgers are all before the bound', async () => {
+      const { ch, query } = chWith([[1, secs('2015-01-14T12:00:00Z')]]);
+      const resolver = new LedgerRangeResolver(ch);
+      await resolver.resolve(undefined, at('2020-01-01T00:00:00Z'));
+      await resolver.resolve(undefined, at('2020-01-01T00:00:00Z'));
+      expect(asked(query, 'before')).toBe(2);
     });
 
     it('does not remember a missing ledger or an open bound: history may still be filled in', async () => {

@@ -82,14 +82,44 @@ describe('network profiles', () => {
       rmSync(dir, { recursive: true, force: true });
     });
 
-    it('is undefined on xrpl (the codec ships its own definitions)', () => {
-      expect(getNetworkProfile('xrpl').definitionsFallback()).toBeUndefined();
+    it('reads and parses the definitions file on xrpl too', () => {
+      const file = join(dir, 'xrpl.json');
+      const definitions = { TRANSACTION_TYPES: { Payment: 0 }, FIELDS: [] };
+      writeFileSync(file, JSON.stringify(definitions));
+      expect(getNetworkProfile('xrpl').definitionsFallback(file)).toEqual(definitions);
     });
 
-    it('ignores a definitions path on xrpl', () => {
-      const file = join(dir, 'xrpl.json');
-      writeFileSync(file, JSON.stringify({ TRANSACTION_TYPES: { Payment: 0 } }));
-      expect(getNetworkProfile('xrpl').definitionsFallback(file)).toBeUndefined();
+    it('is undefined on xrpl when the definitions file is missing', () => {
+      expect(getNetworkProfile('xrpl').definitionsFallback(join(dir, 'missing.json'))).toBeUndefined();
+    });
+
+    it('returns the bundled xrpl server_definitions from the default path', () => {
+      const definitions = getNetworkProfile('xrpl').definitionsFallback() as {
+        TYPES: Record<string, number>;
+        TRANSACTION_TYPES: Record<string, number>;
+        FIELDS: unknown[];
+      };
+      expect(definitions).toEqual(
+        expect.objectContaining({
+          TYPES: expect.any(Object),
+          FIELDS: expect.any(Array),
+          TRANSACTION_TYPES: expect.any(Object),
+          TRANSACTION_RESULTS: expect.any(Object),
+          LEDGER_ENTRY_TYPES: expect.any(Object),
+        }),
+      );
+      // Types the codec of a few years ago did not know prove this is a current XRPL file, and not the Xahau one.
+      expect(definitions.TRANSACTION_TYPES).toEqual(
+        expect.objectContaining({
+          OracleSet: expect.any(Number),
+          Batch: expect.any(Number),
+          VaultCreate: expect.any(Number),
+        }),
+      );
+      expect(definitions.TRANSACTION_TYPES).not.toHaveProperty('ClaimReward');
+      expect(definitions.TYPES).toEqual(
+        expect.objectContaining({ Hash192: expect.any(Number), Number: expect.any(Number), Int32: expect.any(Number) }),
+      );
     });
 
     it('reads and parses the definitions file on xahau', () => {

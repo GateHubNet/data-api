@@ -1,4 +1,4 @@
-import { ClickHouseService } from '@gatehub/data-api-shared';
+import { ClickHouseService, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 
 /** A resolution is cached only when the bound it answers is older than this: that part of the history is settled. */
@@ -51,6 +51,11 @@ export class LruCache<V> {
   }
 }
 
+/** Whether the bound lies far enough in the past for its answer to be remembered (see `RANGE_CACHE_MIN_AGE_MS`). */
+function isSettled(secs: number): boolean {
+  return secs * 1000 < Date.now() - RANGE_CACHE_MIN_AGE_MS;
+}
+
 /** Dates and ledgers: `ledgers.close_time` is whole seconds, so the lookups work in whole seconds too. */
 function seconds(date: Date, round: (value: number) => number): number {
   const ms = date.getTime();
@@ -97,48 +102,55 @@ export class LedgerRangeResolver {
 
   /** The highest committed ledger, `undefined` on an empty database. Never cached: it moves with every ledger. */
   async latest(): Promise<number | undefined> {
-    return this.one('SELECT ledger_index FROM ledgers ORDER BY ledger_index DESC LIMIT 1');
+    return this.one(`SELECT ledger_index FROM ${Table.Ledgers} ORDER BY ledger_index DESC LIMIT 1`);
   }
 
   private firstLedger(): Promise<number | undefined> {
-    return this.one('SELECT ledger_index FROM ledgers ORDER BY ledger_index ASC LIMIT 1');
+    return this.one(`SELECT ledger_index FROM ${Table.Ledgers} ORDER BY ledger_index ASC LIMIT 1`);
   }
 
   /** The first ledger with `close_time >= secs`. */
-  private firstClosedFrom(secs: number): Promise<number | undefined> {
+  private async firstClosedFrom(secs: number): Promise<number | undefined> {
     if (secs <= 0) return this.firstLedger();
-    if (secs > MAX_UINT32) return Promise.resolve(undefined);
-    return this.cached(
-      `from:${secs}`,
-      secs,
-      "SELECT ledger_index FROM ledgers WHERE close_time >= toDateTime({secs:UInt32}, 'UTC') ORDER BY ledger_index ASC LIMIT 1",
-    );
-  }
-
-  /** The last ledger with `close_time < secs`. */
-  private lastClosedBefore(secs: number): Promise<number | undefined> {
-    if (secs <= 0) return Promise.resolve(undefined);
-    if (secs > MAX_UINT32) return this.latest();
-    return this.cached(
-      `before:${secs}`,
-      secs,
-      "SELECT ledger_index FROM ledgers WHERE close_time < toDateTime({secs:UInt32}, 'UTC') ORDER BY ledger_index DESC LIMIT 1",
-    );
-  }
-
-  /**
-   * The answer to a question about the bound `secs`, from memory when the bound is old enough to be settled history.
-   * A missing ledger is never remembered: history below the bound may be backfilled later.
-   */
-  private async cached(key: string, secs: number, sql: string): Promise<number | undefined> {
-    const settled = secs * 1000 < Date.now() - RANGE_CACHE_MIN_AGE_MS;
+    if (secs > MAX_UINT32) return undefined;
+    const key = `from:${secs}`;
+    const settled = isSettled(secs);
     if (settled) {
       const hit = this.cache.get(key);
       if (hit !== undefined) return hit;
     }
-    const found = await this.one(sql, { secs });
+    const found = await this.one(
+      `SELECT ledger_index FROM ${Table.Ledgers}
+        WHERE close_time >= toDateTime({secs:UInt32}, 'UTC') ORDER BY ledger_index ASC LIMIT 1`,
+      { secs },
+    );
+    // A ledger that exists stays the first one at or after the bound, unless a backfill fills the gap below it (TTL).
     if (settled && found !== undefined) this.cache.set(key, found);
     return found;
+  }
+
+  /** The last ledger with `close_time < secs`. */
+  private async lastClosedBefore(secs: number): Promise<number | undefined> {
+    if (secs <= 0) return undefined;
+    if (secs > MAX_UINT32) return this.latest();
+    const key = `before:${secs}`;
+    const settled = isSettled(secs);
+    if (settled) {
+      const hit = this.cache.get(key);
+      if (hit !== undefined) return hit;
+    }
+    const [row] = await this.ch.query<{ ledger_index: number; head_close: number }>(
+      `SELECT ledger_index,
+              (SELECT toUnixTimestamp(close_time) FROM ${Table.Ledgers} ORDER BY ledger_index DESC LIMIT 1) AS head_close
+         FROM ${Table.Ledgers}
+        WHERE close_time < toDateTime({secs:UInt32}, 'UTC') ORDER BY ledger_index DESC LIMIT 1`,
+      { secs },
+    );
+    // The answer is final only once the ledgers have reached the bound. While the ingest lags behind it (the syncer
+    // catching up, or stopped for more than the hour of `isSettled`), the last ledger before the bound is merely the
+    // newest one so far, and the next ledger the syncer commits changes it.
+    if (settled && row !== undefined && row.head_close >= secs) this.cache.set(key, row.ledger_index);
+    return row?.ledger_index;
   }
 
   private async one(sql: string, params: Record<string, unknown> = {}): Promise<number | undefined> {

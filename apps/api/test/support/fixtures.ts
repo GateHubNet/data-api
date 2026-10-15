@@ -14,11 +14,16 @@ import { join } from 'node:path';
 /** The ledger fixtures of the shared package, which the API tests seed ClickHouse with and check the codec against. */
 const FIXTURES = join(__dirname, '..', '..', '..', '..', 'packages', 'shared', 'test', 'fixtures');
 export const RIPPLE_MOCK_DIR = join(FIXTURES, 'xrpl', 'ripple-mock');
+export const XRPL_RECORDED_DIR = join(FIXTURES, 'xrpl', 'recorded');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
 
-export type SeedName = 'ripple-mock' | 'xahau-recorded';
+export type SeedName = 'ripple-mock' | 'xrpl-recorded' | 'xahau-recorded';
 
-const DIRS: Record<SeedName, string> = { 'ripple-mock': RIPPLE_MOCK_DIR, 'xahau-recorded': XAHAU_RECORDED_DIR };
+const DIRS: Record<SeedName, string> = {
+  'ripple-mock': RIPPLE_MOCK_DIR,
+  'xrpl-recorded': XRPL_RECORDED_DIR,
+  'xahau-recorded': XAHAU_RECORDED_DIR,
+};
 
 const sources = new Map<SeedName, FixtureLedgerSource>();
 
@@ -33,7 +38,11 @@ export function fixtureSource(seed: SeedName): FixtureLedgerSource {
 }
 
 /** The network a fixture set was recorded on. */
-export const SEED_NETWORK: Record<SeedName, NetworkName> = { 'ripple-mock': 'xrpl', 'xahau-recorded': 'xahau' };
+export const SEED_NETWORK: Record<SeedName, NetworkName> = {
+  'ripple-mock': 'xrpl',
+  'xrpl-recorded': 'xrpl',
+  'xahau-recorded': 'xahau',
+};
 
 /** A transaction of a fixture ledger, with the ledger it is in and the row the syncer stores for it. */
 export interface FixtureTx {

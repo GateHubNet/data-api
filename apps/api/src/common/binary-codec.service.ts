@@ -19,6 +19,25 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * rippled and xahaud add `DeliverMax`, a JSON alias of `Amount`, to the Payments they serve. It is not part of the
+ * serialization, and the codec rejects every field it does not know that starts with a capital: the serialized
+ * transaction is the one without it. (The lower case JSON-only fields, `hash`, `date`, `delivered_amount`, ..., the
+ * codec skips by itself.)
+ */
+function serializable(json: object): object {
+  if (!('DeliverMax' in json)) return json;
+  const { DeliverMax, ...rest } = json as Record<string, unknown>;
+  return 'Amount' in rest ? rest : { ...rest, Amount: DeliverMax };
+}
+
+/** The transaction without `DeliverMax` when `Amount` says the same; it is left as it is otherwise. */
+export function withoutDeliverMax<T extends object>(tx: T): T {
+  if (!('DeliverMax' in tx) || !('Amount' in tx)) return tx;
+  const { DeliverMax, ...rest } = tx as Record<string, unknown>;
+  return rest as T;
+}
+
 /** Definitions built from a `server_definitions` shaped JSON, or `undefined` when it is not usable. */
 function definitionsFrom(json: unknown): XrplDefinitions | undefined {
   if (!isPlainObject(json) || !Array.isArray(json.FIELDS) || !OBJECT_ENUMS.every((key) => isPlainObject(json[key]))) {
@@ -38,11 +57,15 @@ function definitionsFrom(json: unknown): XrplDefinitions | undefined {
  * definitions of the node:
  *
  *  1. `server_definitions` of the node (`XrplDefinitions`), asked once at boot;
- *  2. else the network profile's bundled definitions (`definitionsFallback()`: Xahau ships a recorded file, XRPL none);
- *  3. else the codec's built-in `DEFAULT_DEFINITIONS`.
+ *  2. else the network profile's bundled definitions (`definitionsFallback()`: the file recorded from a public node of
+ *     the network, `config/definitions/<network>.json`);
+ *  3. else the codec's built-in `DEFAULT_DEFINITIONS` (a file that is missing or corrupt is logged, not fatal).
  *
- * Only (1) is complete for a network that has moved on. While it is missing the node is asked again every
+ * Only (1) follows a network that has moved on. While it is missing the node is asked again every
  * `DEFINITIONS_RETRY_MS`, and the definitions are replaced as soon as it answers.
+ *
+ * The codec is `ripple-binary-codec` 2.x, which knows the types that 1.x lacked (Hash192, Number, Int32, MPT amounts),
+ * with a direct dependency of this app: `xrpl` stays on 2.14, whose own codec is 1.11.
  */
 @Injectable()
 export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
@@ -59,7 +82,7 @@ export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit(): Promise<void> {
     if (await this.fromNode()) return;
-    const fallback = definitionsFrom(this.profile.definitionsFallback());
+    const fallback = this.bundled();
     if (fallback) {
       this.use(fallback, 'profile');
       this.logger.warn(`The node gave no server_definitions: using the bundled ${this.profile.name} definitions`);
@@ -80,9 +103,9 @@ export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
     return this.source;
   }
 
-  /** The serialization of a transaction or of its metadata, as upper case hex. */
+  /** The serialization of a transaction or of its metadata, as upper case hex. Throws what the codec cannot serialize. */
   encode(json: object): string {
-    return encode(json, this.definitions);
+    return encode(serializable(json), this.definitions);
   }
 
   decode(hex: string): Record<string, unknown> {
@@ -103,6 +126,18 @@ export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
       return typeof name === 'string' ? [name] : [];
     });
     return [...new Set(names)];
+  }
+
+  /** The definitions the network profile bundles. A file that cannot be read or built is logged, never fatal. */
+  private bundled(): XrplDefinitions | undefined {
+    try {
+      return definitionsFrom(this.profile.definitionsFallback());
+    } catch (err) {
+      this.logger.warn(
+        `Cannot read the bundled ${this.profile.name} definitions (${err instanceof Error ? err.message : String(err)})`,
+      );
+      return undefined;
+    }
   }
 
   /** Ask the node; true when its definitions are now in use. */

@@ -7,9 +7,10 @@ import {
   Table,
   TransactionsRow,
 } from '@gatehub/data-api-shared';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { NETWORK_PROFILE } from '../config/api.config';
-import { BinaryCodecService } from './binary-codec.service';
+import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { BinaryCodecService, withoutDeliverMax } from './binary-codec.service';
 import { fmtTxDate } from './format';
 
 /**
@@ -53,12 +54,14 @@ const TRANSACTION_COLUMNS = [
  */
 @Injectable()
 export class TxService {
+  private readonly logger = new Logger(TxService.name);
   private readonly ctx: ParseContext;
 
   constructor(
     private readonly ch: ClickHouseService,
     private readonly codec: BinaryCodecService,
     @Inject(NETWORK_PROFILE) profile: NetworkProfile,
+    private readonly prometheus: PrometheusService,
   ) {
     this.ctx = parseContextFor(profile);
   }
@@ -94,29 +97,56 @@ export class TxService {
   /**
    * The API object of a stored transaction.
    *
-   *  - JSON mode: `tx` and `meta` are the stored JSON. A successful Payment gets `meta.delivered_amount`, which
-   *    rippled adds to API v1 metadata for recent ledgers and the Ripple API added for all: `DeliveredAmount`, else
-   *    `Amount` unless the payment is partial and from before the fix (`'unavailable'`). It goes on the parsed
-   *    copy that is served, never on a shared object: an issued-currency amount is cloned.
+   *  - JSON mode: `tx` and `meta` are what the Ripple API served, the binary form decoded again:
+   *    `decode(encode(stored))` with the definitions of the network. That drops what rippled adds to its JSON and
+   *    the binary does not carry (`DeliverMax`, `type` and `type_hex` in the steps of `Paths`, rippled's own
+   *    `meta.delivered_amount`), writes UInt64 fields as 16 upper case hex digits and lists the fields in the order of
+   *    the binary format. A successful Payment then gets `meta.delivered_amount`: `DeliveredAmount`, else `Amount`
+   *    unless the payment is partial and from before the fix (`'unavailable'`), as the Ripple API worked it out.
+   *    An issued-currency or MPT amount is cloned, so that no object is shared inside the answer.
    *  - Binary mode: `tx` and `meta` are the serialized original as upper case hex, without the injected field.
+   *
+   * A transaction that the codec cannot serialize (a type or field the definitions lack, a malformed value) must not
+   * fail the page it is on: it is served as its stored JSON in either mode (without `DeliverMax` when `Amount` says
+   * the same), with a warning in the log and `api_tx_encode_fallback_total{mode}` counted.
    */
   toTxObject(row: TransactionsRow, o: { binary: boolean; ledgerHash?: string }): TxObject {
-    const tx = JSON.parse(row.tx_json) as Record<string, unknown>;
-    let meta = JSON.parse(row.meta_json) as Record<string, unknown>;
-
+    const stored = {
+      tx: JSON.parse(row.tx_json) as Record<string, unknown>,
+      meta: JSON.parse(row.meta_json) as Record<string, unknown>,
+    };
     const head = {
       hash: row.hash,
       ledger_index: row.ledger_index,
       date: fmtTxDate(row.close_time),
       ...(o.ledgerHash !== undefined && { ledger_hash: o.ledgerHash }),
     };
-    if (o.binary) {
-      return { ...head, tx: this.codec.encode(tx), meta: this.codec.encode(meta) };
+
+    let { tx, meta } = stored;
+    try {
+      if (o.binary) return { ...head, tx: this.codec.encode(tx), meta: this.codec.encode(meta) };
+      // Both before either is used: a transaction is served canonical or as stored, never half of each.
+      const canonical = {
+        tx: this.codec.decode(this.codec.encode(tx)),
+        meta: this.codec.decode(this.codec.encode(meta)),
+      };
+      ({ tx, meta } = canonical);
+    } catch (err) {
+      this.fellBack(row, o.binary, err);
+      tx = withoutDeliverMax(tx);
     }
 
     if (tx.TransactionType === 'Payment' && meta.TransactionResult === 'tesSUCCESS') {
       meta = { ...meta, delivered_amount: copyOf(deliveredAmount(tx, meta, row.ledger_index, this.ctx)) };
     }
     return { ...head, tx, meta };
+  }
+
+  private fellBack(row: TransactionsRow, binary: boolean, err: unknown): void {
+    this.prometheus.txEncodeFallback.inc({ mode: binary ? 'binary' : 'json' });
+    this.logger.warn(
+      `Cannot serialize ${row.tx_type} ${row.hash} with the ${this.codec.definitionsSource} definitions ` +
+        `(${err instanceof Error ? err.message : String(err)}); serving its stored JSON`,
+    );
   }
 }

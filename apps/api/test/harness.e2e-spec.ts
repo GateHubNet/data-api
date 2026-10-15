@@ -84,9 +84,9 @@ describe('startHarness', () => {
       expect(stub).toHaveBeenCalledWith({ command: 'fee' });
     });
 
-    it('does not answer server_definitions: the codec falls back to the built-in definitions', async () => {
+    it('does not answer server_definitions: the codec falls back to the definitions bundled for the network', async () => {
       const res = await h.http().get('/v2/harness/network').set('X-API-Key', h.key);
-      expect(res.body.definitions).toBe('builtin');
+      expect(res.body.definitions).toBe('profile');
     });
 
     it('a RippledError-like error reaches the caller as a RippledError of the app, as the NodeClient rethrows it', async () => {
@@ -124,7 +124,7 @@ describe('startHarness', () => {
       const res = await h.http().get('/v2/harness/node?command=fee').set('X-API-Key', h.key);
       expect(res.body).toMatchObject({ result: 'failed', isRippledError: false });
       expect(res.body.message).toMatch(/xrplStub/);
-      expect((await h.http().get('/v2/harness/network').set('X-API-Key', h.key)).body.definitions).toBe('builtin');
+      expect((await h.http().get('/v2/harness/network').set('X-API-Key', h.key)).body.definitions).toBe('profile');
     });
   });
 
@@ -148,6 +148,23 @@ describe('startHarness', () => {
     it('stays on the xrpl network', async () => {
       const res = await h.http().get('/v2/harness/network').set('X-API-Key', h.key);
       expect(res.body).toMatchObject({ network: 'xrpl', native: 'XRP' });
+    });
+  });
+
+  describe('seed xrpl-recorded', () => {
+    let h: Harness;
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'xrpl-recorded', controllers });
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('writes the recorded mainnet ledgers on the xrpl network, with the definitions bundled for it', async () => {
+      const res = await h.http().get('/v2/harness/network').set('X-API-Key', h.key);
+      expect(res.body).toMatchObject({ network: 'xrpl', native: 'XRP', definitions: 'profile' });
+      expect(await count(h, 'ledgers')).toBe(fixtureSource('xrpl-recorded').list().length);
+      expect(await count(h, 'transactions')).toBe(fixtureTransactions('xrpl-recorded').length);
     });
   });
 

@@ -16,8 +16,8 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 `{ command: 'ledger', ledger_index, transactions: true, expand: true }` (so the ledger itself is under `ledger`, next to
 `ledger_hash`, `ledger_index` and `validated`). No `api_version` is sent. Every recorded directory also holds:
 
-- `server_definitions.json`: the node's `server_definitions` result (the Xahau one is bundled as
-  `config/definitions/xahau.json`).
+- `server_definitions.json`: the node's `server_definitions` result (bundled as `config/definitions/<network>.json`, the
+  binary-codec fallback of the network profile; copy it there again after re-recording).
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not.

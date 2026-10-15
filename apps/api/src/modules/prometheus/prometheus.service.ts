@@ -24,6 +24,13 @@ const httpDuration = new Histogram({
   registers: [registry],
 });
 
+const txEncodeFallback = new Counter({
+  name: 'api_tx_encode_fallback_total',
+  help: 'Transactions served as their stored JSON because the binary codec could not serialize them.',
+  labelNames: ['mode'] as const,
+  registers: [registry],
+});
+
 let defaultMetricsCollected = false;
 
 @Injectable()
@@ -31,6 +38,8 @@ export class PrometheusService implements OnModuleInit {
   readonly registry = registry;
   readonly httpRequests = httpRequests;
   readonly httpDuration = httpDuration;
+  /** `mode` is `json` or `binary`: the kind of response that fell back. */
+  readonly txEncodeFallback = txEncodeFallback;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

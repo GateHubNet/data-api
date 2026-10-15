@@ -8,6 +8,7 @@ import {
   fixtureTransactions,
   transactionId,
   XAHAU_RECORDED_DIR,
+  XRPL_RECORDED_DIR,
 } from '../../test/support/fixtures';
 import type { XrplService } from '../xrpl/xrpl.service';
 import { BinaryCodecService, DEFINITIONS_RETRY_MS } from './binary-codec.service';
@@ -15,6 +16,11 @@ import { BinaryCodecService, DEFINITIONS_RETRY_MS } from './binary-codec.service
 /** What a Xahau node answers to `server_definitions` (recorded from xahau.network). */
 const XAHAU_SERVER_DEFINITIONS = JSON.parse(
   readFileSync(join(XAHAU_RECORDED_DIR, 'server_definitions.json'), 'utf8'),
+) as Record<string, unknown>;
+
+/** What an XRPL node answers to `server_definitions` (recorded from s2.ripple.com; also bundled as the xrpl fallback). */
+const XRPL_SERVER_DEFINITIONS = JSON.parse(
+  readFileSync(join(XRPL_RECORDED_DIR, 'server_definitions.json'), 'utf8'),
 ) as Record<string, unknown>;
 
 /** The mainnet Payment that the Ripple tests use (`test.transactions.js`), and a recorded Xahau ClaimReward. */
@@ -43,6 +49,12 @@ async function started(
   return { codec, request: node.request };
 }
 
+/** A network profile that bundles no definitions at all. */
+const withoutBundledDefinitions = (network: NetworkName) => ({
+  ...getNetworkProfile(network),
+  definitionsFallback: () => undefined,
+});
+
 describe('BinaryCodecService', () => {
   let warn: jest.SpyInstance;
   let log: jest.SpyInstance;
@@ -54,7 +66,7 @@ describe('BinaryCodecService', () => {
 
   describe('definitions', () => {
     it("asks the node for server_definitions (no api_version) and uses its answer, whatever the network's own fallback is", async () => {
-      // The xrpl profile has no fallback and the built-in definitions know no ClaimReward: only the node's answer encodes it.
+      // Neither the bundled XRPL definitions nor the built-in ones know ClaimReward: only the node's answer encodes it.
       const { codec, request } = await started(
         'xrpl',
         nodeWith(() => XAHAU_SERVER_DEFINITIONS),
@@ -75,8 +87,19 @@ describe('BinaryCodecService', () => {
       expect(transactionId(codec.encode(tx.tx))).toBe(XAHAU_CLAIM_REWARD);
     });
 
-    it("falls back to the codec's built-in definitions when the node cannot answer and the profile has none", async () => {
+    it("falls back to the XRPL profile's bundled definitions too, which know the newest transaction types", async () => {
       const { codec } = await started('xrpl', nodeDown());
+      expect(codec.definitionsSource).toBe('profile');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('bundled xrpl definitions'));
+      for (const type of ['OracleSet', 'Batch']) {
+        const { tx, row } = fixtureTransactions('xrpl-recorded').find((t) => t.row.tx_type === type)!;
+        expect(transactionId(codec.encode(JSON.parse(row.tx_json)))).toBe(tx.hash);
+      }
+    });
+
+    it("falls back to the codec's built-in definitions when the node cannot answer and the profile has none", async () => {
+      const codec = new BinaryCodecService(nodeDown().xrpl, withoutBundledDefinitions('xrpl'));
+      await codec.onModuleInit();
       expect(codec.definitionsSource).toBe('builtin');
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('built-in definitions'));
       const { tx } = fixtureTransaction('ripple-mock', MOCK_PAYMENT);
@@ -98,14 +121,33 @@ describe('BinaryCodecService', () => {
       expect(codec.definitionsSource).toBe('profile');
     });
 
-    it('does not fail the boot when the fallback itself is unusable: the built-in definitions apply', async () => {
-      const profile = { ...getNetworkProfile('xahau'), definitionsFallback: () => ({ TYPES: 'nope' }) };
-      const codec = new BinaryCodecService(nodeDown().xrpl, profile);
-      await expect(codec.onModuleInit()).resolves.toBeUndefined();
-      expect(codec.definitionsSource).toBe('builtin');
+    it.each([
+      ['definitions the codec cannot build', () => ({ TYPES: 'nope' })],
+      ['a corrupt bundled file', () => JSON.parse('{"TYPES": {')],
+      ['a bundled file that is missing', () => undefined],
+    ])(
+      'does not fail the boot when the profile fallback is %s: the built-in definitions apply',
+      async (_name, fallback) => {
+        const profile = { ...getNetworkProfile('xahau'), definitionsFallback: fallback as () => never };
+        const codec = new BinaryCodecService(nodeDown().xrpl, profile);
+        await expect(codec.onModuleInit()).resolves.toBeUndefined();
+        expect(codec.definitionsSource).toBe('builtin');
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('built-in definitions'));
+      },
+    );
+
+    it('says why a bundled file could not be read', async () => {
+      const profile = {
+        ...getNetworkProfile('xahau'),
+        definitionsFallback: () => JSON.parse('{"TYPES": {'),
+      };
+      await new BinaryCodecService(nodeDown().xrpl, profile).onModuleInit();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(/bundled xahau definitions.*(JSON|Unexpected|position)/i),
+      );
     });
 
-    it('works before onModuleInit with the built-in definitions', () => {
+    it('works before onModuleInit with the built-in definitions of the codec', () => {
       const codec = new BinaryCodecService(nodeDown().xrpl, getNetworkProfile('xrpl'));
       const { tx } = fixtureTransaction('ripple-mock', MOCK_PAYMENT);
       expect(transactionId(codec.encode(tx.tx))).toBe(MOCK_PAYMENT);
@@ -119,7 +161,9 @@ describe('BinaryCodecService', () => {
       expect(xahau.codec.transactionResults()).toEqual(expect.arrayContaining(['tesSUCCESS', 'tecPATH_DRY']));
 
       const xrpl = await started('xrpl', nodeDown());
-      expect(xrpl.codec.transactionTypes()).toEqual(expect.arrayContaining(['Payment', 'AMMCreate']));
+      expect(xrpl.codec.transactionTypes()).toEqual(
+        expect.arrayContaining(['Payment', 'AMMCreate', 'OracleSet', 'Batch', 'MPTokenAuthorize', 'VaultCreate']),
+      );
       expect(xrpl.codec.transactionTypes()).not.toContain('ClaimReward');
       expect(xrpl.codec.transactionResults()).toEqual(expect.arrayContaining(['tesSUCCESS', 'tecUNFUNDED_PAYMENT']));
       // Names only: the lookup also holds the ordinals.
@@ -148,13 +192,17 @@ describe('BinaryCodecService', () => {
     });
 
     it('encodes the stored JSON of every fixture transaction to the blob that was signed (hash check)', async () => {
-      const mock = await started('xrpl', nodeDown());
-      for (const { row } of fixtureTransactions('ripple-mock')) {
-        expect(transactionId(mock.codec.encode(JSON.parse(row.tx_json)))).toBe(row.hash);
-      }
-      const xahau = await started('xahau', nodeDown());
-      for (const { row } of fixtureTransactions('xahau-recorded')) {
-        expect(transactionId(xahau.codec.encode(JSON.parse(row.tx_json)))).toBe(row.hash);
+      for (const [seed, network] of [
+        ['ripple-mock', 'xrpl'],
+        ['xrpl-recorded', 'xrpl'],
+        ['xahau-recorded', 'xahau'],
+      ] as const) {
+        const { codec } = await started(network, nodeDown());
+        const rows = fixtureTransactions(seed);
+        expect(rows.length).toBeGreaterThan(0);
+        for (const { row } of rows) {
+          expect(transactionId(codec.encode(JSON.parse(row.tx_json)))).toBe(row.hash);
+        }
       }
     });
 
@@ -170,6 +218,120 @@ describe('BinaryCodecService', () => {
     });
   });
 
+  describe('transactions the 1.x codec could not serialize (ripple-binary-codec 2.x)', () => {
+    const ACCOUNT = 'rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg';
+    const DESTINATION = 'rP2GYatF5ZNCnu4zvf2SSB3yEopBdyzirW';
+    const MPT_ID = '000000010E0AC5AB06C8A19E7FC1D0E7E7B0C0E5F1B7C6A4';
+    const common = { Account: ACCOUNT, Fee: '10', Sequence: 7, Flags: 0, SigningPubKey: '' };
+
+    const synthetic = {
+      'an MPTokenAuthorize (Hash192 MPTokenIssuanceID)': {
+        TransactionType: 'MPTokenAuthorize',
+        ...common,
+        MPTokenIssuanceID: MPT_ID,
+      },
+      'a Payment of an MPT amount': {
+        TransactionType: 'Payment',
+        ...common,
+        Destination: DESTINATION,
+        Amount: { mpt_issuance_id: MPT_ID, value: '100' },
+      },
+      'a VaultCreate (Number AssetsMaximum)': {
+        TransactionType: 'VaultCreate',
+        ...common,
+        Asset: { currency: 'USD', issuer: DESTINATION },
+        AssetsMaximum: '1000.5',
+      },
+      'a transaction with an Int32 field (LoanScale)': { TransactionType: 'LoanSet', ...common, LoanScale: -5 },
+    };
+
+    const sources: [string, () => Promise<BinaryCodecService>][] = [
+      [
+        'the XRPL definitions of the node',
+        async () =>
+          (
+            await started(
+              'xrpl',
+              nodeWith(() => XRPL_SERVER_DEFINITIONS),
+            )
+          ).codec,
+      ],
+      ['the bundled XRPL definitions', async () => (await started('xrpl', nodeDown())).codec],
+      [
+        "the codec's built-in definitions",
+        async () => {
+          const codec = new BinaryCodecService(nodeDown().xrpl, withoutBundledDefinitions('xrpl'));
+          await codec.onModuleInit();
+          return codec;
+        },
+      ],
+    ];
+
+    describe.each(sources)('with %s', (_name, build) => {
+      it.each(Object.entries(synthetic))('encodes %s and decodes it back', async (_what, tx) => {
+        const codec = await build();
+        const hex = codec.encode(tx);
+        expect(hex).toMatch(/^[0-9A-F]+$/);
+        expect(codec.decode(hex)).toEqual(tx);
+      });
+    });
+
+    it('keeps the MPT amount exactly as the node writes it', async () => {
+      const { codec } = await started('xrpl', nodeDown());
+      const payment = synthetic['a Payment of an MPT amount'];
+      expect((codec.decode(codec.encode(payment)).Amount as Record<string, unknown>).mpt_issuance_id).toBe(MPT_ID);
+    });
+  });
+
+  describe('DeliverMax', () => {
+    // rippled and xahaud add DeliverMax, a JSON alias of Amount, to the Payments they serve; it is not serialized.
+    const payment = {
+      TransactionType: 'Payment',
+      Account: 'rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg',
+      Destination: 'rP2GYatF5ZNCnu4zvf2SSB3yEopBdyzirW',
+      Fee: '10',
+      Sequence: 7,
+      Flags: 0,
+      SigningPubKey: '',
+    };
+
+    it('is left out of the serialization: the blob is the one of the transaction without it', async () => {
+      const { codec } = await started('xrpl', nodeDown());
+      const plain = codec.encode({ ...payment, Amount: '1000' });
+      expect(codec.encode({ ...payment, Amount: '1000', DeliverMax: '1000' })).toBe(plain);
+    });
+
+    it('stands in for a missing Amount', async () => {
+      const { codec } = await started('xrpl', nodeDown());
+      expect(codec.encode({ ...payment, DeliverMax: '1000' })).toBe(codec.encode({ ...payment, Amount: '1000' }));
+    });
+
+    it('does not change the object it is given', async () => {
+      const { codec } = await started('xrpl', nodeDown());
+      const input = Object.freeze({ ...payment, Amount: '1000', DeliverMax: '1000' });
+      expect(() => codec.encode(input)).not.toThrow();
+      expect(input.DeliverMax).toBe('1000');
+    });
+
+    it('is the only JSON-only field that is tolerated: lower case ones are skipped, an unknown field fails', async () => {
+      const { codec } = await started('xrpl', nodeDown());
+      const plain = codec.encode({ ...payment, Amount: '1000' });
+      expect(
+        codec.encode({ ...payment, Amount: '1000', hash: 'AB', date: 5, ctid: 'C', delivered_amount: '1000' }),
+      ).toBe(plain);
+      expect(() => codec.encode({ ...payment, Amount: '1000', Bogus: 1 })).toThrow(/Bogus/);
+    });
+
+    it('is no problem for the recorded Payments that carry it', async () => {
+      const { codec } = await started('xahau', nodeDown());
+      const withDeliverMax = fixtureTransactions('xahau-recorded').filter(
+        (t) => 'DeliverMax' in JSON.parse(t.row.tx_json),
+      );
+      expect(withDeliverMax.length).toBeGreaterThan(10);
+      for (const { row } of withDeliverMax) expect(transactionId(codec.encode(JSON.parse(row.tx_json)))).toBe(row.hash);
+    });
+  });
+
   describe('when the node was not reachable at boot', () => {
     beforeEach(() => jest.useFakeTimers());
     afterEach(() => jest.useRealTimers());
@@ -181,12 +343,12 @@ describe('BinaryCodecService', () => {
         return XAHAU_SERVER_DEFINITIONS;
       });
       const { codec } = await started('xrpl', node);
-      expect(codec.definitionsSource).toBe('builtin');
+      expect(codec.definitionsSource).toBe('profile');
       expect(node.request).toHaveBeenCalledTimes(1);
 
       await jest.advanceTimersByTimeAsync(DEFINITIONS_RETRY_MS);
       expect(node.request).toHaveBeenCalledTimes(2);
-      expect(codec.definitionsSource).toBe('builtin');
+      expect(codec.definitionsSource).toBe('profile');
 
       up = true;
       await jest.advanceTimersByTimeAsync(DEFINITIONS_RETRY_MS);
