@@ -20,6 +20,10 @@ export interface LedgerOptions {
  * Everything else is text, because the original read the header from HBase, where every column is a string and only
  * those three were converted (`getLedgerByHash` in `lib/hbase/hbase-thrift/data.js`): `total_coins` (drops),
  * `close_time_human`, `close_time_resolution` and `close_flags`, besides the hashes.
+ *
+ * The original stored the whole ledger it was given, so the row also had `hash`, `seqNum`, `totalCoins`, `accepted`
+ * and `closed`, and the response served them after the others. They carry no information of their own (a ledger of
+ * this API is a validated one), but clients of the original may read them.
  */
 export interface LedgerObject {
   ledger_hash: string;
@@ -35,6 +39,16 @@ export interface LedgerObject {
   parent_close_time?: number;
   account_hash: string;
   transaction_hash: string;
+  /** = `ledger_hash` */
+  hash: string;
+  /** = `ledger_index`, as text */
+  seqNum: string;
+  /** = `total_coins` */
+  totalCoins: string;
+  /** The text "true": HBase kept `JSON.stringify(true)` of the boolean of rippled. Every served ledger is validated. */
+  accepted: 'true';
+  /** The text "true", as `accepted`. */
+  closed: 'true';
   transactions?: string[] | TxObject[];
 }
 
@@ -123,6 +137,11 @@ export class LedgersService {
       ...(header.parent_close_time > 0 && { parent_close_time: header.parent_close_time }),
       account_hash: header.account_hash,
       transaction_hash: header.transaction_hash,
+      hash: header.ledger_hash,
+      seqNum: String(header.ledger_index),
+      totalCoins: header.total_coins,
+      accepted: 'true',
+      closed: 'true',
       ...(transactions !== undefined && { transactions }),
     };
   }

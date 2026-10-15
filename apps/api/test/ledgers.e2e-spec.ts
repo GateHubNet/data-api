@@ -17,17 +17,23 @@ const MOCK: RawLedger[] = [...fixtureSource('ripple-mock').list()].sort(
   (a, b) => a.header.ledger_index - b.header.ledger_index,
 );
 const BY_INDEX = new Map(MOCK.map((l) => [l.header.ledger_index, l]));
-/** The ledgers as rippled served them: `close_time_human` there is the format of the Ripple API (`2015-Jan-14 18:27:00`). */
+/**
+ * The ledgers as rippled served them. The original stored the whole ledger (`accepted`, `closed`, `hash`, `seqNum` and
+ * `totalCoins` too) and `close_time_human` there is the format of the Ripple API (`2015-Jan-14 18:27:00`).
+ */
+interface RawMockLedger {
+  ledger_index: string;
+  close_time_human: string;
+  accepted: boolean;
+  closed: boolean;
+  hash: string;
+  seqNum: string;
+  totalCoins: string;
+}
 const RAW = new Map(
   readdirSync(RIPPLE_MOCK_DIR)
     .filter((f) => f.endsWith('.json'))
-    .map(
-      (f) =>
-        JSON.parse(readFileSync(join(RIPPLE_MOCK_DIR, f), 'utf8')) as {
-          ledger_index: string;
-          close_time_human: string;
-        },
-    )
+    .map((f) => JSON.parse(readFileSync(join(RIPPLE_MOCK_DIR, f), 'utf8')) as RawMockLedger)
     .map((l) => [Number(l.ledger_index), l]),
 );
 const LATEST = MOCK[MOCK.length - 1].header;
@@ -40,21 +46,31 @@ function atOrBefore(iso: string): number | undefined {
   return closed.length === 0 ? undefined : Math.max(...closed);
 }
 
-/** The ledger object the Ripple API serves for a mock ledger (without `transactions`). */
+/**
+ * The ledger object the Ripple API serves for a mock ledger (without `transactions`). The five leftovers of the raw
+ * ledger are what HBase gave back for them: it stores `JSON.stringify(value)` and returns text, so the booleans
+ * `accepted` and `closed` are the strings "true".
+ */
 function expectedLedger(index: number): Record<string, unknown> {
   const { header } = BY_INDEX.get(index) as RawLedger;
+  const raw = RAW.get(index) as RawMockLedger;
   return {
     ledger_hash: header.ledger_hash,
     ledger_index: header.ledger_index,
     parent_hash: header.parent_hash,
     total_coins: header.total_coins,
     close_time: header.close_time,
-    close_time_human: (RAW.get(index) as { close_time_human: string }).close_time_human,
+    close_time_human: raw.close_time_human,
     close_time_resolution: String(header.close_time_resolution),
     close_flags: String(header.close_flags),
     ...(header.parent_close_time > 0 && { parent_close_time: header.parent_close_time }),
     account_hash: header.account_hash,
     transaction_hash: header.transaction_hash,
+    hash: raw.hash,
+    seqNum: raw.seqNum,
+    totalCoins: raw.totalCoins,
+    accepted: JSON.stringify(raw.accepted),
+    closed: JSON.stringify(raw.closed),
   };
 }
 
@@ -70,6 +86,11 @@ const KEY_ORDER = [
   'parent_close_time',
   'account_hash',
   'transaction_hash',
+  'hash',
+  'seqNum',
+  'totalCoins',
+  'accepted',
+  'closed',
   'transactions',
 ];
 
@@ -438,9 +459,52 @@ describe('ledgers API endpoint', () => {
       });
     });
 
+    it('the leftovers of the raw ledger are served as text: hash, seqNum, totalCoins, accepted, closed', async () => {
+      // The original stored the whole ledger in HBase, which keeps JSON.stringify(value) and returns text: the
+      // numbers stay digits and the booleans are "true". They follow transaction_hash and carry nothing new.
+      const { ledger } = (await get('/v2/ledgers/11119599')).body;
+      expect(ledger.hash).toBe(ledger.ledger_hash);
+      expect(ledger.seqNum).toBe('11119599');
+      expect(ledger.totalCoins).toBe(ledger.total_coins);
+      expect(ledger.accepted).toBe('true');
+      expect(ledger.closed).toBe('true');
+      for (const field of ['hash', 'seqNum', 'totalCoins', 'accepted', 'closed']) {
+        expect([field, typeof ledger[field]]).toEqual([field, 'string']);
+      }
+      expect(Object.keys(ledger).slice(-5)).toEqual(['hash', 'seqNum', 'totalCoins', 'accepted', 'closed']);
+    });
+
+    it('the leftovers are the same as the raw mock ledgers have, for every mock ledger', async () => {
+      for (const index of BY_INDEX.keys()) {
+        const raw = RAW.get(index) as RawMockLedger;
+        const { ledger } = (await get(`/v2/ledgers/${index}`)).body;
+        expect([index, ledger.hash, ledger.seqNum, ledger.totalCoins, ledger.accepted, ledger.closed]).toEqual([
+          index,
+          raw.hash,
+          raw.seqNum,
+          raw.totalCoins,
+          'true',
+          'true',
+        ]);
+      }
+    });
+
+    it('the leftovers sit between transaction_hash and transactions', async () => {
+      const { ledger } = (await get('/v2/ledgers/11119599?transactions=true')).body;
+      expect(Object.keys(ledger).slice(-6)).toEqual([
+        'hash',
+        'seqNum',
+        'totalCoins',
+        'accepted',
+        'closed',
+        'transactions',
+      ]);
+    });
+
     it('total_coins keeps every digit', async () => {
       const { ledger } = (await get('/v2/ledgers/29709909')).body;
       expect(ledger.total_coins).toBe('99994758814182467');
+      expect(ledger.totalCoins).toBe('99994758814182467');
       expect(typeof ledger.total_coins).toBe('string');
     });
 
@@ -652,49 +716,61 @@ describe('ledgers API endpoint on an empty database', () => {
   });
 });
 
+/** The ledger after the last mock ledger. */
+const NEXT = LATEST.ledger_index + 1;
+
+/** A `ledgers` row (the commit marker) for a ledger that is not in the fixtures: `NEXT`, without transactions. */
+const headerRow = (over: Partial<LedgersRow> = {}): LedgersRow => ({
+  ledger_index: NEXT,
+  ledger_hash: 'C'.repeat(64),
+  parent_hash: LATEST.ledger_hash,
+  account_hash: 'D'.repeat(64),
+  transaction_hash: 'E'.repeat(64),
+  total_coins: '99994758814182467',
+  close_time: LATEST.close_time + 4,
+  parent_close_time: LATEST.close_time,
+  close_time_resolution: 10,
+  close_flags: 0,
+  tx_count: 0,
+  type_counts: {},
+  result_counts: {},
+  payments_count: 0,
+  exchanges_count: 0,
+  accounts_created: 0,
+  fee_total: '0',
+  fee_min: '0',
+  fee_max: '0',
+  parser_version: 1,
+  ...over,
+});
+
+/** Commits a ledger the way the syncer does: the lookup row first, the `ledgers` row (the commit marker) last. */
+async function commit(h: Harness, row: LedgersRow): Promise<void> {
+  await h.ch.insert(Table.LedgerByHash, [{ ledger_hash: row.ledger_hash, ledger_index: row.ledger_index }]);
+  await h.ch.insert(Table.Ledgers, [row]);
+}
+
 describe('ledgers API endpoint on committed and uncommitted data', () => {
   let h: Harness;
   let get: ReturnType<typeof api>;
   beforeAll(async () => {
     h = await startHarness({ seed: 'ripple-mock' });
     get = api(h);
+    // The newest ledger of this describe: committed, 'C...' by hash, no transactions.
+    await commit(h, headerRow());
   });
   afterAll(async () => {
     await h?.close();
   });
 
-  /** A `ledgers` row (the commit marker) for a ledger that is not in the fixtures. */
-  const header = (over: Partial<LedgersRow>): LedgersRow => ({
-    ledger_index: 29709910,
-    ledger_hash: 'C'.repeat(64),
-    parent_hash: LATEST.ledger_hash,
-    account_hash: 'D'.repeat(64),
-    transaction_hash: 'E'.repeat(64),
-    total_coins: '99994758814182467',
-    close_time: LATEST.close_time + 4,
-    parent_close_time: LATEST.close_time,
-    close_time_resolution: 10,
-    close_flags: 0,
-    tx_count: 0,
-    type_counts: {},
-    result_counts: {},
-    payments_count: 0,
-    exchanges_count: 0,
-    accounts_created: 0,
-    fee_total: '0',
-    fee_min: '0',
-    fee_max: '0',
-    parser_version: 1,
-    ...over,
-  });
-
   it('a ledger_by_hash row without a ledgers row is no ledger yet', async () => {
     const hash = 'A1'.repeat(32);
-    await h.ch.insert(Table.LedgerByHash, [{ ledger_hash: hash, ledger_index: 29709910 }]);
-    const res = await get(`/v2/ledgers/${hash}`);
-    expect(res.status).toBe(404);
-    expect(res.body).toEqual({ result: 'error', message: 'ledger not found' });
-    expect((await get('/v2/ledgers')).body.ledger.ledger_index).toBe(LATEST.ledger_index);
+    await h.ch.insert(Table.LedgerByHash, [{ ledger_hash: hash, ledger_index: NEXT + 1 }]);
+    for (const id of [hash, String(NEXT + 1)]) {
+      const res = await get(`/v2/ledgers/${id}`);
+      expect([id, res.status, res.body]).toEqual([id, 404, { result: 'error', message: 'ledger not found' }]);
+    }
+    expect((await get('/v2/ledgers')).body.ledger.ledger_index).toBe(NEXT);
   });
 
   it('a ledger_by_hash row of another ledger does not give that ledger under this hash', async () => {
@@ -705,14 +781,10 @@ describe('ledgers API endpoint on committed and uncommitted data', () => {
   });
 
   it('the commit marker makes the ledger the latest, for /v2/ledgers and /v2/last_validated', async () => {
-    const row = header({});
-    await h.ch.insert(Table.LedgerByHash, [{ ledger_hash: row.ledger_hash, ledger_index: row.ledger_index }]);
-    await h.ch.insert(Table.Ledgers, [row]);
-
     const latest = await get('/v2/ledgers');
     expect(latest.body.ledger).toEqual({
       ledger_hash: 'C'.repeat(64),
-      ledger_index: 29709910,
+      ledger_index: NEXT,
       parent_hash: LATEST.ledger_hash,
       total_coins: '99994758814182467',
       close_time: LATEST.close_time + 4,
@@ -722,11 +794,16 @@ describe('ledgers API endpoint on committed and uncommitted data', () => {
       parent_close_time: LATEST.close_time,
       account_hash: 'D'.repeat(64),
       transaction_hash: 'E'.repeat(64),
+      hash: 'C'.repeat(64),
+      seqNum: String(NEXT),
+      totalCoins: '99994758814182467',
+      accepted: 'true',
+      closed: 'true',
     });
-    expect((await get(`/v2/ledgers/${'c'.repeat(64)}`)).body.ledger.ledger_index).toBe(29709910);
+    expect((await get(`/v2/ledgers/${'c'.repeat(64)}`)).body.ledger.ledger_index).toBe(NEXT);
     expect((await get('/v2/last_validated')).body).toEqual({
       result: 'success',
-      ledger_index: '29709910',
+      ledger_index: String(NEXT),
       ledger_hash: 'C'.repeat(64),
       parent_hash: LATEST.ledger_hash,
       close_time: '2017-05-12T14:48:56Z',
@@ -735,25 +812,37 @@ describe('ledgers API endpoint on committed and uncommitted data', () => {
 
   it('an empty ledger has no transactions key unless transactions=true (expand and binary find nothing to expand)', async () => {
     // getLedger.js: expand / binary only apply to a ledger that has transactions; transactions=true lists them
-    expect((await get('/v2/ledgers/29709910')).body.ledger).not.toHaveProperty('transactions');
+    expect((await get(`/v2/ledgers/${NEXT}`)).body.ledger).not.toHaveProperty('transactions');
     for (const flags of ['expand=true', 'binary=true', 'expand=true&binary=true']) {
-      const res = await get(`/v2/ledgers/29709910?${flags}`);
+      const res = await get(`/v2/ledgers/${NEXT}?${flags}`);
       expect([flags, res.status]).toEqual([flags, 200]);
       expect(res.body.ledger).not.toHaveProperty('transactions');
     }
     for (const flags of ['transactions=true', 'transactions=true&expand=true', 'transactions=true&binary=true']) {
-      const res = await get(`/v2/ledgers/29709910?${flags}`);
+      const res = await get(`/v2/ledgers/${NEXT}?${flags}`);
       expect([flags, res.status, res.body.ledger.transactions]).toEqual([flags, 200, []]);
     }
   });
+});
 
-  it('a ledger whose transactions are not all there is 500 unable to retrieve ledger', async () => {
+describe('ledgers API endpoint on a ledger with a hole in its transactions', () => {
+  let h: Harness;
+  let get: ReturnType<typeof api>;
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock' });
+    get = api(h);
     // The ledger says it has 19 transactions; take one away.
     await h.ch.command(
       `DELETE FROM ${Table.Transactions} WHERE ledger_index = {index:UInt32} AND tx_index = {tx:UInt32}`,
       { index: 11119599, tx: 5 },
       { settings: { lightweight_deletes_sync: '2' } },
     );
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('is 500 unable to retrieve ledger when the transactions are asked for', async () => {
     for (const flags of ['expand=true', 'binary=true', 'transactions=true']) {
       const res = await get(`/v2/ledgers/11119599?${flags}`);
       expect([flags, res.status, res.body]).toEqual([
@@ -762,11 +851,15 @@ describe('ledgers API endpoint on committed and uncommitted data', () => {
         { result: 'error', message: 'unable to retrieve ledger' },
       ]);
     }
-    // the header alone does not need the transactions
+  });
+
+  it('is served without the transactions: the header does not need them', async () => {
     const plain = await get('/v2/ledgers/11119599');
     expect(plain.status).toBe(200);
     expect(plain.body.ledger).toEqual(expectedLedger(11119599));
-    // other ledgers are not affected
+  });
+
+  it('does not touch the other ledgers', async () => {
     expect((await get('/v2/ledgers/11119600?expand=true')).status).toBe(200);
   });
 });
@@ -797,6 +890,12 @@ describe('ledgers API endpoint on the xahau-recorded ledgers', () => {
       close_time: hd.close_time,
       account_hash: hd.account_hash,
       transaction_hash: hd.transaction_hash,
+      // the leftovers of the raw ledger, which the original also served
+      hash: hd.ledger_hash,
+      seqNum: String(hd.ledger_index),
+      totalCoins: hd.total_coins,
+      accepted: 'true',
+      closed: 'true',
     });
     expect((await get(`/v2/ledgers/${hd.ledger_index}`)).body).toEqual(latest.body);
     expect((await get(`/v2/ledgers/${hd.ledger_hash.toLowerCase()}`)).body).toEqual(latest.body);
@@ -808,12 +907,20 @@ describe('ledgers API endpoint on the xahau-recorded ledgers', () => {
     for (const ledger of ledgers) {
       const index = ledger.header.ledger_index;
       const hashes = ledger.transactions.map((t) => t.hash);
-      expect((await get(`/v2/ledgers/${index}?transactions=true`)).body.ledger.transactions ?? []).toEqual(hashes);
-      const expanded = await get(`/v2/ledgers/${index}?expand=true`);
-      expect((expanded.body.ledger.transactions ?? []).map((t: { hash: string }) => t.hash)).toEqual(hashes);
+      // transactions=true always lists them, an empty ledger gives []
+      expect((await get(`/v2/ledgers/${index}?transactions=true`)).body.ledger.transactions).toEqual(hashes);
+      // expand only applies to a ledger that has transactions; an empty one has no transactions key
+      const expanded = (await get(`/v2/ledgers/${index}?expand=true`)).body.ledger;
+      if (hashes.length > 0) {
+        expect(expanded.transactions.map((t: { hash: string }) => t.hash)).toEqual(hashes);
+      } else {
+        expect(expanded).not.toHaveProperty('transactions');
+      }
       const binary = await get(`/v2/ledgers/${index}?binary=true`);
       if (hashes.length > 0) {
         expect(transactionTreeRoot(binary.body.ledger.transactions)).toBe(ledger.header.transaction_hash);
+      } else {
+        expect(binary.body.ledger).not.toHaveProperty('transactions');
       }
     }
   });
