@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  Wires ClickHouse to Keeper and defines a 1-shard cluster + macros. With this in
+  place you can switch the schema's MergeTree engines to ReplicatedMergeTree
+  (engine path '/clickhouse/tables/{shard}/{table}', replica '{replica}') and scale
+  to N replicas for HA. The shipped schema uses plain ReplacingMergeTree, which works
+  with or without this file.
+-->
+<clickhouse>
+  <!-- Listen on all interfaces. Required because mounting this config.d directory
+       shadows the image's docker_related_config.xml (which normally sets this), so
+       without it ClickHouse would bind to localhost only and reject peer containers. -->
+  <listen_host>0.0.0.0</listen_host>
+
+  <zookeeper>
+    <node>
+      <host>keeper</host>
+      <port>9181</port>
+    </node>
+  </zookeeper>
+
+  <macros>
+    <shard>01</shard>
+    <replica>replica-1</replica>
+  </macros>
+
+  <remote_servers>
+    <xrpl_cluster>
+      <shard>
+        <internal_replication>true</internal_replication>
+        <replica>
+          <host>clickhouse</host>
+          <port>9000</port>
+        </replica>
+      </shard>
+    </xrpl_cluster>
+  </remote_servers>
+</clickhouse>

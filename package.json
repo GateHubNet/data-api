@@ -1,0 +1,30 @@
+{
+  "name": "@gatehub/data-api",
+  "version": "0.0.1",
+  "description": "GateHub XRPL Data API — ClickHouse-backed indexing (syncer) and serving (api) platform.",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "GateHub",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.6.3",
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "format": "prettier --write \"{apps,packages}/**/src/**/*.ts\"",
+    "swagger": "pnpm --filter @gatehub/data-api-service swagger",
+    "ch:migrate": "pnpm --filter @gatehub/data-api-shared ch:migrate",
+    "start:api": "pnpm --filter @gatehub/data-api-service start:dev",
+    "start:syncer": "pnpm --filter @gatehub/data-syncer start:dev",
+    "docker:up": "docker compose up -d clickhouse",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "prettier": "^3.3.3",
+    "prettier-plugin-organize-imports": "^4.0.0",
+    "typescript": "~5.9.2"
+  }
+}

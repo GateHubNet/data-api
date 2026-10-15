@@ -1,0 +1,464 @@
+openapi: 3.0.3
+info:
+  title: GateHub XRPL Data API
+  version: 2.0.0
+  description: >
+    Historical XRP Ledger data — payments, exchanges, ledgers, accounts and network
+    analytics — served from ClickHouse. List endpoints use cursor (keyset) pagination:
+    pass the `marker` from a response as the `marker` query param to fetch the next page.
+    This document is also generated live by the running service at `/internal/docs/json`.
+servers:
+  - url: http://localhost:3001
+    description: Local
+  - url: https://api.gatehub.net/data-api
+    description: Production
+tags:
+  - name: payments
+  - name: transactions
+  - name: ledgers
+  - name: exchanges
+  - name: network
+  - name: stats
+  - name: accounts
+  - name: ops
+
+# All endpoints require an API key except the ops paths (health/metrics/docs).
+# Send it as `X-API-Key: <key>` or `Authorization: Bearer <key>`.
+security:
+  - apiKey: []
+  - bearer: []
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    bearer:
+      type: http
+      scheme: bearer
+  parameters:
+    start:
+      name: start
+      in: query
+      schema: { type: string, format: date-time }
+      description: Inclusive start time (ISO-8601).
+    end:
+      name: end
+      in: query
+      schema: { type: string, format: date-time }
+      description: Inclusive end time (ISO-8601).
+    limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+    descending:
+      name: descending
+      in: query
+      schema: { type: boolean, default: false }
+    marker:
+      name: marker
+      in: query
+      schema: { type: string }
+      description: Opaque pagination cursor from the previous response.
+  schemas:
+    ListEnvelope:
+      type: object
+      properties:
+        result: { type: string, enum: [success] }
+        marker: { type: string, nullable: true }
+        count: { type: integer }
+      required: [result, count]
+    Payment:
+      type: object
+      properties:
+        tx_hash: { type: string }
+        source: { type: string }
+        destination: { type: string }
+        currency: { type: string }
+        issuer: { type: string }
+        amount: { type: number }
+        delivered_amount: { type: number }
+        source_currency: { type: string }
+        fee: { type: number }
+        source_tag: { type: integer, nullable: true }
+        destination_tag: { type: integer, nullable: true }
+        date: { type: string, format: date-time }
+        ledger_index: { type: integer }
+    Candle:
+      type: object
+      properties:
+        start: { type: string, format: date-time }
+        open: { type: number }
+        close: { type: number }
+        high: { type: number }
+        low: { type: number }
+        base_volume: { type: number }
+        counter_volume: { type: number }
+        vwap: { type: number }
+        count: { type: integer }
+    Problem:
+      description: RFC 7807 problem document (returned as application/problem+json).
+      type: object
+      properties:
+        type: { type: string, example: 'https://docs.gatehub.net/data-api/errors/404' }
+        title: { type: string, example: 'Not Found' }
+        status: { type: integer, example: 404 }
+        detail: { type: string }
+        instance: { type: string, example: '/v2/transactions/ABC' }
+        errors:
+          type: array
+          items: { type: string }
+          description: Field validation messages, when applicable.
+      required: [type, title, status]
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+paths:
+  /v2/payments:
+    get:
+      tags: [payments]
+      summary: List payments
+      parameters:
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/descending'
+        - $ref: '#/components/parameters/marker'
+        - { name: currency, in: query, schema: { type: string } }
+        - { name: issuer, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: A page of payments
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      payments:
+                        type: array
+                        items: { $ref: '#/components/schemas/Payment' }
+  /v2/payments/{currency}:
+    get:
+      tags: [payments]
+      summary: List payments for a currency
+      parameters:
+        - { name: currency, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/marker'
+        - $ref: '#/components/parameters/descending'
+      responses:
+        '200': { description: A page of payments }
+
+  /v2/transactions:
+    get:
+      tags: [transactions]
+      summary: List transactions
+      parameters:
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/descending'
+        - $ref: '#/components/parameters/marker'
+        - { name: type, in: query, schema: { type: string }, description: 'XRPL tx type, e.g. Payment' }
+        - { name: result, in: query, schema: { type: string }, description: 'Engine result, e.g. tesSUCCESS' }
+      responses:
+        '200': { description: A page of transactions }
+  /v2/transactions/{hash}:
+    get:
+      tags: [transactions]
+      summary: Get a transaction by hash
+      parameters:
+        - { name: hash, in: path, required: true, schema: { type: string } }
+        - { name: binary, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200': { description: The transaction }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v2/ledgers:
+    get:
+      tags: [ledgers]
+      summary: List ledgers in a time range
+      parameters:
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/descending'
+        - $ref: '#/components/parameters/marker'
+      responses:
+        '200': { description: A page of ledgers }
+  /v2/ledgers/{identifier}:
+    get:
+      tags: [ledgers]
+      summary: Get a ledger by index, 64-char hash, or ISO date
+      parameters:
+        - { name: identifier, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: The ledger }
+        '400': { description: Invalid identifier }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v2/exchanges:
+    get:
+      tags: [exchanges]
+      summary: List all DEX trades
+      parameters:
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/descending'
+        - $ref: '#/components/parameters/marker'
+      responses:
+        '200': { description: A page of trades }
+  /v2/exchanges/{base}/{counter}:
+    get:
+      tags: [exchanges]
+      summary: Trades or OHLC/VWAP candles for a pair
+      description: 'Pass `interval` for candles; omit for raw trades. Asset = CURRENCY or CURRENCY+ISSUER.'
+      parameters:
+        - { name: base, in: path, required: true, schema: { type: string }, example: 'XRP' }
+        - { name: counter, in: path, required: true, schema: { type: string }, example: 'USD+rXXXXXXXX' }
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [1minute, 5minute, 15minute, 30minute, 1hour, 2hour, 4hour, 1day, 3day, 7day, 1month]
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/descending'
+        - $ref: '#/components/parameters/marker'
+      responses:
+        '200':
+          description: Candles or trades
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: { type: string }
+                  count: { type: integer }
+                  interval: { type: string }
+                  exchanges:
+                    type: array
+                    items: { $ref: '#/components/schemas/Candle' }
+  /v2/exchange_rates/{base}/{counter}:
+    get:
+      tags: [exchanges]
+      summary: Latest rate or period VWAP for a pair
+      parameters:
+        - { name: base, in: path, required: true, schema: { type: string } }
+        - { name: counter, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+      responses:
+        '200':
+          description: The rate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: { type: string }
+                  rate: { type: number }
+  /v2/normalize:
+    get:
+      tags: [exchanges]
+      summary: Convert an amount between two assets
+      parameters:
+        - { name: amount, in: query, schema: { type: string }, example: '100' }
+        - { name: base, in: query, schema: { type: string } }
+        - { name: counter, in: query, schema: { type: string } }
+        - { name: date, in: query, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Converted amount }
+
+  /v2/network/payment_volume:
+    get:
+      tags: [network]
+      summary: Total payment volume for a currency
+      parameters:
+        - { name: currency, in: query, schema: { type: string, default: XRP } }
+        - { name: issuer, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Volume }
+  /v2/network/exchange_volume:
+    get:
+      tags: [network]
+      summary: Total DEX exchange volume for a base currency
+      parameters:
+        - { name: currency, in: query, schema: { type: string, default: XRP } }
+        - { name: issuer, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Volume }
+  /v2/network/top_currencies:
+    get:
+      tags: [network]
+      summary: Top issued currencies by trustline count
+      parameters:
+        - { name: descending, in: query, schema: { type: boolean, default: true } }
+        - { name: limit, in: query, schema: { type: integer, default: 100 } }
+      responses:
+        '200': { description: Ranked currencies }
+
+  /v2/stats:
+    get:
+      tags: [stats]
+      summary: Daily network activity counts
+      parameters:
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/descending'
+      responses:
+        '200': { description: Per-day counts }
+
+  /v2/accounts:
+    get:
+      tags: [accounts]
+      summary: List created accounts
+      parameters:
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/marker'
+        - $ref: '#/components/parameters/descending'
+      responses:
+        '200': { description: A page of accounts }
+  /v2/accounts/{address}:
+    get:
+      tags: [accounts]
+      summary: Account creation info
+      parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Account }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v2/accounts/{address}/balance_changes:
+    get:
+      tags: [accounts]
+      summary: Account balance changes
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: currency, in: query, schema: { type: string } }
+        - { name: counterparty, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/marker'
+        - $ref: '#/components/parameters/descending'
+      responses:
+        '200': { description: A page of balance changes }
+  /v2/accounts/{address}/payments:
+    get:
+      tags: [accounts]
+      summary: Account payments (sent/received)
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string, enum: [sent, received, both], default: both } }
+        - { name: currency, in: query, schema: { type: string } }
+        - { name: issuer, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/marker'
+        - $ref: '#/components/parameters/descending'
+      responses:
+        '200': { description: A page of payments }
+  /v2/accounts/{address}/transactions:
+    get:
+      tags: [accounts]
+      summary: Account transaction history
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string } }
+        - { name: result, in: query, schema: { type: string } }
+        - { name: min_ledger, in: query, schema: { type: integer } }
+        - { name: max_ledger, in: query, schema: { type: integer } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/marker'
+        - $ref: '#/components/parameters/descending'
+      responses:
+        '200': { description: A page of transactions }
+  /v2/accounts/{address}/exchanges:
+    get:
+      tags: [accounts]
+      summary: Account DEX trades
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/marker'
+        - $ref: '#/components/parameters/descending'
+      responses:
+        '200': { description: A page of trades }
+  /v2/accounts/{address}/balances:
+    get:
+      tags: [accounts]
+      summary: Live balances (from the XRPL node)
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: ledger, in: query, schema: { type: string } }
+        - { name: currency, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Balances }
+  /v2/accounts/{address}/orders:
+    get:
+      tags: [accounts]
+      summary: Live open orders (from the XRPL node)
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - { name: ledger, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 200 } }
+      responses:
+        '200': { description: Open orders }
+  /v2/accounts/{address}/stats/transactions:
+    get:
+      tags: [accounts]
+      summary: Account transaction-type counts
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+      responses:
+        '200': { description: Counts by type }
+  /v2/accounts/{address}/reports:
+    get:
+      tags: [accounts]
+      summary: Per-day sent/received payment report
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+      responses:
+        '200': { description: Daily report }
+
+  /liveliness/healthz:
+    get:
+      tags: [ops]
+      summary: Liveness probe (ClickHouse ping)
+      responses:
+        '200': { description: ok }
+        '503': { description: unhealthy }
+  /metricz:
+    get:
+      tags: [ops]
+      summary: Prometheus metrics
+      responses:
+        '200': { description: metrics (text/plain) }

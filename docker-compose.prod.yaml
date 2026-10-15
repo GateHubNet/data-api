@@ -1,0 +1,120 @@
+# Production-shaped topology. Run with:
+#   NPM_TOKEN=... docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --build
+#   docker compose -f docker-compose.prod.yaml up -d --scale api=3   # scale the read tier
+#
+# Components: ClickHouse Keeper (coordination) -> ClickHouse -> one-shot migrate job
+# -> syncer (ingest) + api (read replicas) behind nginx. Secrets come from the
+# --env-file (inject from your secrets manager in real deployments; never commit it).
+services:
+  keeper:
+    image: clickhouse/clickhouse-keeper:24.8
+    container_name: ch-keeper
+    volumes:
+      - ./deploy/keeper/keeper_config.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+      - keeper-data:/var/lib/clickhouse-keeper
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', "echo ruok | nc -w1 127.0.0.1 9181 | grep -q imok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ch-server
+    depends_on:
+      keeper:
+        condition: service_healthy
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    environment:
+      CLICKHOUSE_DB: ${GH_CLICKHOUSE_DATABASE:-xrpl}
+      CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-data_api}
+      CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:?set a ClickHouse password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./deploy/clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      - clickhouse-data:/var/lib/clickhouse
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { memory: 8g }
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:8123/ping']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: apply schema migrations, then exit 0. Other services wait for it.
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/syncer/Dockerfile
+      args:
+        NPM_TOKEN: ${NPM_TOKEN}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      GH_CLICKHOUSE_URL: http://clickhouse:8123
+      GH_CLICKHOUSE_DATABASE: ${GH_CLICKHOUSE_DATABASE:-xrpl}
+      GH_CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-data_api}
+      GH_CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD}
+    command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
+    restart: 'no'
+
+  syncer:
+    build:
+      context: .
+      dockerfile: apps/syncer/Dockerfile
+      args:
+        NPM_TOKEN: ${NPM_TOKEN}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file: deploy/.env.prod
+    environment:
+      GH_CLICKHOUSE_URL: http://clickhouse:8123
+      GH_RUN_MIGRATIONS_ON_BOOT: 'false' # migrations are owned by the one-shot job
+    restart: unless-stopped
+    healthcheck:
+      # node:slim has no wget/curl — use Node's global fetch instead.
+      test: ['CMD', 'node', '-e', "fetch('http://localhost:3002/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      args:
+        NPM_TOKEN: ${NPM_TOKEN}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file: deploy/.env.prod
+    environment:
+      GH_CLICKHOUSE_URL: http://clickhouse:8123
+    restart: unless-stopped
+    # no host port + no container_name -> scalable with `--scale api=N`
+    expose: ['3001']
+    healthcheck:
+      # node:slim has no wget/curl — use Node's global fetch instead.
+      test: ['CMD', 'node', '-e', "fetch('http://localhost:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on: [api]
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - '8080:80'
+    restart: unless-stopped
+
+volumes:
+  keeper-data:
+  clickhouse-data:

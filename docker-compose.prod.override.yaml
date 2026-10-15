@@ -1,0 +1,10 @@
+# OPTIONAL — for load/perf testing only. Publishes ClickHouse to the host so the
+# host-side seeder (load/seed.js) can reach it. Do NOT use in real production
+# (ClickHouse should not be exposed to the host/network there).
+#
+#   docker compose -f docker-compose.prod.yaml -f docker-compose.prod.override.yaml \
+#     --env-file deploy/.env.prod up -d --build --scale api=8
+services:
+  clickhouse:
+    ports:
+      - '8123:8123'

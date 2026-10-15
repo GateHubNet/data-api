@@ -1,0 +1,40 @@
+# compiled output
+dist
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# dependencies
+node_modules
+.pnpm-store
+
+# logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# env
+.env
+.env.*
+!.env.example
+
+# tests
+coverage
+.nyc_output
+junit
+junit.xml
+
+# OS / editors
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# generated openapi
+apps/api/dist/swagger.json
+
+# keep env templates
+!.env.*.example
+
+# superpowers plan workspaces
+.superpowers/
