@@ -19,6 +19,9 @@ export * from './parsers/from-client.parser';
 // Network
 export * from './network';
 
+// Node connection
+export * from './xrpl/node-client';
+
 // Ingest
 export * from './ingest/raw-ledger';
 export * from './ingest/ledger-source';
