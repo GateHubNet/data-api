@@ -61,7 +61,7 @@ git clone --depth 1 -b develop https://github.com/ripple/rippled-historical-data
 packages/shared/
   config/markets/{xrpl,xahau}.json           volume components per network
   schema/001_baseline.sql                    replaces 001_tables.sql + 002_materialized_views.sql
-  src/network/{network-profile.ts, definitions/xahau.json, index.ts}
+  src/network/{network-profile.ts, index.ts}; config/definitions/xahau.json
   src/clickhouse/{clickhouse.config.ts, clickhouse.service.ts, migrate.ts, tables.ts, rows.ts}
   src/parsers/{parser.interface.ts, payment.parser.ts, exchanges.parser.ts, balance-changes.parser.ts,
                accounts-created.parser.ts, affected-accounts.parser.ts, from-client.parser.ts}
@@ -140,7 +140,7 @@ Deleted:
   - `loadMarketsConfig(xrpl).tradeMarkets.length === 5`.
   - The `GH_MARKETS_CONFIG` env path override is honoured.
 - [ ] **Step 2: Run** `pnpm --filter @gatehub/data-api-shared test -- network-profile`. Expected: FAIL (module not found).
-- [ ] **Step 3: Implement.** `xahau` `definitionsFallback()` reads `src/network/definitions/xahau.json` if it exists, else returns `undefined`. Copy `config/` into the package `files` / build output: add `"files": ["dist", "config", "schema"]` and resolve paths via `join(__dirname, '..', '..', 'config', ...)`.
+- [ ] **Step 3: Implement.** `xahau` `definitionsFallback()` reads `config/definitions/xahau.json` if it exists, else returns `undefined`. Copy `config/` into the package `files` / build output: add `"files": ["dist", "config", "schema"]` and resolve paths via `join(__dirname, '..', '..', 'config', ...)`.
 - [ ] **Step 4: Run** the same test command. Expected: PASS.
 - [ ] **Step 5: Checkpoint.**
 
@@ -251,7 +251,7 @@ Deleted:
   - `packages/shared/src/ingest/raw-ledger.ts`
   - `packages/shared/src/ingest/ledger-source.ts`
   - `packages/shared/src/ingest/fixture-ledger-source.ts`
-  - `packages/shared/src/network/definitions/xahau.json`
+  - `packages/shared/config/definitions/xahau.json`
 - Test: `packages/shared/src/ingest/raw-ledger.spec.ts`
 
 **Interfaces:**
@@ -284,7 +284,7 @@ Deleted:
 - [ ] **Step 5: Record live fixtures**
   - **XRPL:** `--endpoint wss://xrplcluster.com --want AMMCreate,AMMDeposit,AMMWithdraw,NFTokenMint,NFTokenAcceptOffer,AccountDelete,CheckCash,TicketCreate,Clawback,EscrowFinish,PaymentChannelClaim --scan 3000 --out test/fixtures/xrpl/recorded`.
   - **Xahau:** `--endpoint wss://xahau.network --want Import,ClaimReward,SetHook,Invoke,URITokenMint,URITokenBuy,Remit,GenesisMint --scan 5000 --out test/fixtures/xahau/recorded`.
-  - Copy `xahau/recorded/server_definitions.json` → `src/network/definitions/xahau.json`.
+  - Copy `xahau/recorded/server_definitions.json` → `config/definitions/xahau.json`.
   - List the types not found in `fixtures/README.md`. That is not a failure.
   - Expected: `.json.gz` files are present. If an endpoint is unreachable, report BLOCKED with the error.
 - [ ] **Step 6: Checkpoint.**
