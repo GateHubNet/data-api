@@ -85,7 +85,11 @@ export class OffersParser implements IParser<ParsedOffer[]> {
           : { currency: 'XRP', value: dropsToXrp(new BigNumber(fields.TakerGets as string)).toString() };
 
       try {
-        offer.rate = parseQuality(fields.BookDirectory as string, offer.taker_pays.currency, offer.taker_gets.currency).toString();
+        offer.rate = parseQuality(
+          fields.BookDirectory as string,
+          typeof fields.TakerPays !== 'object',
+          typeof fields.TakerGets !== 'object',
+        ).toString();
       } catch {
         /* rate stays undefined */
       }

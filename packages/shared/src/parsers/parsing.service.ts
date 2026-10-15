@@ -48,8 +48,8 @@ export class ParsingService {
   }
 
   /**
-   * Adapter for the payment parser, which takes {@link ParserTx}. The other parsers still take {@link XrplTx} and move
-   * over in later tasks, together with this service.
+   * Adapter for the payment and exchanges parsers, which take {@link ParserTx}. The other parsers still take
+   * {@link XrplTx} and move over in later tasks, together with this service.
    */
   private asParserTx(t: XrplTx): ParserTx {
     return {
@@ -67,7 +67,7 @@ export class ParsingService {
     return {
       rawTransaction: transaction,
       payment: this.paymentParser.parse(this.asParserTx(transaction), this.parseContext),
-      exchanges: this.exchangesParser.parse(transaction),
+      exchanges: this.exchangesParser.parse(this.asParserTx(transaction), this.parseContext),
       balanceChanges: this.balanceChangesParser.parse(transaction),
       accountsCreated: this.accountsCreatedParser.parse(transaction),
       affectedAccounts: this.affectedAccountsParser.parse(transaction),
