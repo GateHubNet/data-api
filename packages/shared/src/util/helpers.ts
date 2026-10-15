@@ -32,3 +32,15 @@ export function chunk<T>(items: T[], size: number): T[][] {
   }
   return out;
 }
+
+/**
+ * Wait for every promise to settle, then reject with the first failure (in list order) if there was one.
+ *
+ * Unlike `Promise.all` this never rejects while a sibling is still running. That matters for writes: a caller that
+ * recovers from a failure must know that no insert of the failed attempt can still land afterwards.
+ */
+export async function allSettledOrThrow(promises: Promise<unknown>[]): Promise<void> {
+  const results = await Promise.allSettled(promises);
+  const failure = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failure) throw failure.reason;
+}

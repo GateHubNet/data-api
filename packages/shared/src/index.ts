@@ -27,6 +27,8 @@ export * from './ingest/raw-ledger';
 export * from './ingest/ledger-source';
 export * from './ingest/fixture-ledger-source';
 export * from './ingest/build-rows';
+export * from './ingest/ledger-writer';
+export * from './ingest/ingest-state';
 
 // Utils
 export * from './util/ctid';

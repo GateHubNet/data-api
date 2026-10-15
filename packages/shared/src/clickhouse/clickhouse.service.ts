@@ -72,16 +72,23 @@ export class ClickHouseService implements OnModuleDestroy {
     return rows[0];
   }
 
-  /** Bulk insert. `table` is a trusted `Table` enum value (never user input); `rows` are JSON objects. */
+  /**
+   * Bulk insert. `table` is a trusted `Table` enum value (never user input); `rows` are JSON objects.
+   *
+   * Every insert is synchronous (`async_insert: 0`): ClickHouse 26.8 defaults to async inserts, whose deduplication is
+   * off unless asked for and which acknowledge a row before it is a part. The ledger writer's exactly-once ordering
+   * (child rows, then the commit marker) needs the rows to be on disk, in order, when the call returns.
+   */
   async insert<T>(table: Table | string, rows: T[], opts: InsertOptions = {}): Promise<void> {
     if (rows.length === 0) return;
     await this.client.insert({
       table,
       values: rows,
       format: 'JSONEachRow',
-      ...(opts.dedupToken !== undefined && {
-        clickhouse_settings: { insert_deduplication_token: opts.dedupToken },
-      }),
+      clickhouse_settings: {
+        async_insert: 0,
+        ...(opts.dedupToken !== undefined && { insert_deduplication_token: opts.dedupToken }),
+      },
     });
   }
 

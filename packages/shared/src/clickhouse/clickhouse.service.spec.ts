@@ -34,17 +34,17 @@ describe('ClickHouseService', () => {
   });
 
   describe('insert', () => {
-    it('sets insert_deduplication_token only when a dedupToken is given', async () => {
+    it('always sends async_insert: 0, and insert_deduplication_token only when a dedupToken is given', async () => {
       await service.insert('t', [{ a: 1 }], { dedupToken: 'run1:t:1-2' });
       expect(client.insert).toHaveBeenLastCalledWith({
         table: 't',
         values: [{ a: 1 }],
         format: 'JSONEachRow',
-        clickhouse_settings: { insert_deduplication_token: 'run1:t:1-2' },
+        clickhouse_settings: { async_insert: 0, insert_deduplication_token: 'run1:t:1-2' },
       });
 
       await service.insert('t', [{ a: 1 }]);
-      expect(client.insert.mock.calls[1][0].clickhouse_settings).toBeUndefined();
+      expect(client.insert.mock.calls[1][0].clickhouse_settings).toEqual({ async_insert: 0 });
     });
 
     it('skips empty batches', async () => {
