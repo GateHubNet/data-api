@@ -35,6 +35,11 @@ export function flattenJSON(data: unknown): Json {
   return result;
 }
 
+/** Whether the request asks for the CSV form: `format=csv`, in any case (the original lowercased the format). */
+export function wantsCsv(query: Record<string, unknown>): boolean {
+  return first(query, 'format')?.toLowerCase() === 'csv';
+}
+
 /** The name of the downloaded file, without `.csv`. A route that names it after the account or currency passes a function. */
 export type CsvFilename = string | ((req: Request, body: Json) => string);
 
@@ -57,8 +62,7 @@ export class CsvInterceptor implements NestInterceptor {
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
     const http = context.switchToHttp();
     const req = http.getRequest<Request>();
-    // the original lowercased the format, so CSV works too
-    if (first(req.query, 'format')?.toLowerCase() !== 'csv') return next.handle();
+    if (!wantsCsv(req.query)) return next.handle();
 
     const res = http.getResponse<Response>();
     return next.handle().pipe(

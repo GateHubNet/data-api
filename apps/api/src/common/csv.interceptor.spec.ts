@@ -3,7 +3,7 @@ import { Test } from '@nestjs/testing';
 import { Request, Response } from 'express';
 import { convert, expressDecorator } from 'nice-json2csv';
 import request from 'supertest';
-import { Csv, CsvInterceptor, flattenJSON } from './csv.interceptor';
+import { Csv, CsvInterceptor, flattenJSON, wantsCsv } from './csv.interceptor';
 import { badRequest } from './errors';
 import { RippleController } from './ripple-controller';
 
@@ -272,5 +272,19 @@ describe('flattenJSON', () => {
     expect(Object.keys(out)).toEqual(['__proto__', 'x', 'y.__proto__.polluted']);
     expect(Object.getPrototypeOf(out)).toBeNull();
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+});
+
+describe('wantsCsv', () => {
+  it('is format=csv in any case, by the first value', () => {
+    expect(wantsCsv({ format: 'csv' })).toBe(true);
+    expect(wantsCsv({ format: 'CSV' })).toBe(true);
+    expect(wantsCsv({ format: ['Csv', 'json'] })).toBe(true);
+  });
+
+  it('is false for anything else', () => {
+    for (const q of [{}, { format: 'json' }, { format: '' }, { format: ['json', 'csv'] }, { format: { csv: '1' } }]) {
+      expect(wantsCsv(q)).toBe(false);
+    }
   });
 });
