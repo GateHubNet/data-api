@@ -1,7 +1,6 @@
 import { PaymentsRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
-import request from 'supertest';
-import { Harness, startHarness } from './harness';
+import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { FixturePayment, fixturePayments } from './support/fixtures';
 
 /**
@@ -77,24 +76,8 @@ function paymentOf(row: PaymentsRow): Record<string, unknown> {
 }
 const paymentsOf = (payments: FixturePayment[]): Record<string, unknown>[] => payments.map((p) => paymentOf(p.row));
 
-/** The suites walk lists a page at a time, far more requests to one route than the default limit of 600 a minute. */
-const NO_RATE_LIMIT = { GH_RATE_LIMIT: '1000000' };
-
-/**
- * The app on a socket of its own for the whole suite. `h.http()` starts and closes a server for every request, and a
- * test that walks a list one page at a time makes hundreds of them: now and then one lands on a port whose connection
- * the client still holds, and fails with ECONNRESET.
- */
-async function api(h: Harness): Promise<(path: string) => request.Test> {
-  await h.app.listen(0, '127.0.0.1');
-  const url = await h.app.getUrl();
-  return (path) => request(url).get(path).set('X-API-Key', h.key);
-}
-
 interface ListBody {
   result: string;
-  currency?: string;
-  issuer?: string;
   count: number;
   marker?: string;
   payments: Record<string, unknown>[];
@@ -104,31 +87,18 @@ const hashesOf = (payments: FixturePayment[]): string[] => payments.map((p) => p
 
 describe('payments API endpoint', () => {
   let h: Harness;
-  let get: Awaited<ReturnType<typeof api>>;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (path: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(path, limit, 'payments');
   beforeAll(async () => {
     h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
-    get = await api(h);
+    api = await h.api();
+    get = api.get;
   });
   afterAll(async () => {
     await h?.close();
   });
   afterEach(() => jest.restoreAllMocks());
-
-  /** Every page of a list, following the markers; the pages are returned in order. */
-  async function pages(path: string, limit: number): Promise<ListBody[]> {
-    const out: ListBody[] = [];
-    let marker: string | undefined;
-    do {
-      const res = await get(
-        `${path}${path.includes('?') ? '&' : '?'}limit=${limit}${marker ? `&marker=${marker}` : ''}`,
-      );
-      expect(res.status).toBe(200);
-      out.push(res.body as ListBody);
-      marker = (res.body as ListBody).marker;
-      expect(out.length).toBeLessThan(1000);
-    } while (marker);
-    return out;
-  }
 
   // -- test.payments.js -----------------------------------------------------------------------------------------
 
@@ -404,32 +374,23 @@ describe('payments API endpoint', () => {
       expect(Object.keys(last.body)).toEqual(['result', 'count', 'payments']);
     });
 
-    it('has the currency and the issuer of the path at the top: result, currency, issuer, count, marker, payments', async () => {
-      const res = await get(`/v2/payments/${CNY}?limit=5`);
-      expect(Object.keys(res.body)).toEqual(['result', 'currency', 'issuer', 'count', 'marker', 'payments']);
-      expect(res.body.currency).toBe('CNY');
-      expect(res.body.issuer).toBe('rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y');
-
-      const native = await get('/v2/payments/XRP?limit=5');
-      expect(Object.keys(native.body)).toEqual(['result', 'currency', 'count', 'marker', 'payments']);
-      expect(native.body.currency).toBe('XRP');
+    it('has no currency or issuer at the top, whatever the path (the original never served them)', async () => {
+      const keys = ['result', 'count', 'marker', 'payments'];
+      for (const path of [
+        `/v2/payments/${CNY}`,
+        '/v2/payments/XRP',
+        '/v2/payments/cny+rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y',
+      ]) {
+        const res = await get(`${path}?limit=5`);
+        expect([path, Object.keys(res.body)]).toEqual([path, keys]);
+        expect(res.body).not.toHaveProperty('currency');
+        expect(res.body).not.toHaveProperty('issuer');
+      }
     });
 
-    it('names the currency in upper case, the issuer as written', async () => {
-      const res = await get('/v2/payments/cny+rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y?limit=1');
-      expect(res.body.currency).toBe('CNY');
-      expect((await get('/v2/payments/xrp?limit=1')).body.currency).toBe('XRP');
-    });
-
-    it('has them for a currency without payments too', async () => {
+    it('is only result, count and payments for a currency without payments', async () => {
       const res = await get('/v2/payments/USD+rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y');
-      expect(res.body).toEqual({
-        result: 'success',
-        currency: 'USD',
-        issuer: 'rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y',
-        count: 0,
-        payments: [],
-      });
+      expect(res.body).toEqual({ result: 'success', count: 0, payments: [] });
     });
   });
 
@@ -874,7 +835,7 @@ describe('payments API endpoint', () => {
       const res = await get('/v2/payments?format=csv&limit=1000');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=payments  .csv');
+      expect(res.headers['content-disposition']).toBe('attachment; filename=payments.csv');
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 182);
       // the columns are the keys of all rows in the order they first appear, nested ones joined with dots
@@ -893,16 +854,27 @@ describe('payments API endpoint', () => {
       expect(rows[1]).toContain('"2013-06-11T20:01:20Z"');
     });
 
-    it('is named after the currency like the original: payments - CUR ISSUER', async () => {
+    it('is named after the currency and the issuer of the path: payments - CUR ISSUER', async () => {
       const cny = await get(`/v2/payments/${CNY}?format=csv`);
       expect(cny.headers['content-type']).toMatch(/^text\/csv/);
-      // the original wrote the currency where the issuer was meant
-      expect(cny.headers['content-disposition']).toBe('attachment; filename=payments - CNY CNY.csv');
+      expect(cny.headers['content-disposition']).toBe(
+        'attachment; filename=payments - CNY rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y.csv',
+      );
       expect(lines(cny.text)).toHaveLength(1 + 37);
 
       const xrp = await get('/v2/payments/XRP?format=csv');
-      expect(xrp.headers['content-disposition']).toBe('attachment; filename=payments - XRP .csv');
+      expect(xrp.headers['content-disposition']).toBe('attachment; filename=payments - XRP.csv');
       expect(lines(xrp.text)).toHaveLength(1 + 99);
+
+      // the currency in upper case, the issuer as written, whatever the separator
+      const issuer = CNY.split('+')[1];
+      for (const path of [`cny.${issuer}`, `Cny%7C${issuer}`]) {
+        const res = await get(`/v2/payments/${path}?format=csv`);
+        expect([path, res.headers['content-disposition']]).toEqual([
+          path,
+          `attachment; filename=payments - CNY ${issuer}.csv`,
+        ]);
+      }
     });
 
     it('format is case-insensitive, and anything but csv is JSON', async () => {
@@ -955,10 +927,13 @@ describe('payments API endpoint when a ledger was written twice', () => {
   const sameCurrency = ALL.filter((p) => p.row.currency === sample.currency && p.row.issuer === sample.issuer);
 
   let h: Harness;
-  let get: Awaited<ReturnType<typeof api>>;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (path: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(path, limit, 'payments');
   beforeAll(async () => {
     h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
-    get = await api(h);
+    api = await h.api();
+    get = api.get;
     for (const table of [Table.Payments, Table.PaymentsByCurrency]) {
       await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${table}`);
       await h.ch.command(
@@ -976,22 +951,6 @@ describe('payments API endpoint when a ledger was written twice', () => {
   afterAll(async () => {
     await h?.close();
   });
-
-  /** Every page of a list, following the markers. */
-  async function pages(path: string, limit: number): Promise<ListBody[]> {
-    const out: ListBody[] = [];
-    let marker: string | undefined;
-    do {
-      const res = await get(
-        `${path}${path.includes('?') ? '&' : '?'}limit=${limit}${marker ? `&marker=${marker}` : ''}`,
-      );
-      expect(res.status).toBe(200);
-      out.push(res.body as ListBody);
-      marker = (res.body as ListBody).marker;
-      expect(out.length).toBeLessThan(100);
-    } while (marker);
-    return out;
-  }
 
   it('lists every payment once', async () => {
     expect(written.length).toBeGreaterThan(2);
@@ -1029,10 +988,13 @@ describe('payments API endpoint on the xahau-recorded ledgers', () => {
   const seed = 'xahau-recorded';
   const all = [...fixturePayments(seed)].sort(byKey);
   let h: Harness;
-  let get: Awaited<ReturnType<typeof api>>;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (path: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(path, limit, 'payments');
   beforeAll(async () => {
     h = await startHarness({ seed, env: NO_RATE_LIMIT });
-    get = await api(h);
+    api = await h.api();
+    get = api.get;
   });
   afterAll(async () => {
     await h?.close();
@@ -1040,14 +1002,7 @@ describe('payments API endpoint on the xahau-recorded ledgers', () => {
 
   it('lists the 172 payments of the recorded ledgers, with XAH as the native currency', async () => {
     expect(all).toHaveLength(172);
-    const seen: ListBody['payments'] = [];
-    let marker: string | undefined;
-    do {
-      const res = await get(`/v2/payments?limit=100${marker ? `&marker=${marker}` : ''}`);
-      expect(res.status).toBe(200);
-      seen.push(...(res.body as ListBody).payments);
-      marker = res.body.marker;
-    } while (marker);
+    const seen = (await pages('/v2/payments', 100)).flatMap((page) => page.payments);
     expect(seen).toEqual(paymentsOf(all));
     for (const p of seen) {
       expect(p.currency).toBe('XAH');
@@ -1068,24 +1023,12 @@ describe('payments API endpoint on the xahau-recorded ledgers', () => {
     }
   });
 
-  it('/v2/payments/XAH lists the native payments, with the currency at the top and no issuer', async () => {
-    const res = await get('/v2/payments/XAH?limit=1000');
-    expect(res.status).toBe(200);
-    expect(Object.keys(res.body)).toEqual(['result', 'currency', 'count', 'payments']);
-    expect(res.body.currency).toBe('XAH');
+  it('/v2/payments/XAH lists the native payments, with no currency or issuer at the top', async () => {
+    const res = await api.ok<ListBody>('/v2/payments/XAH?limit=1000', 'payments');
+    expect(Object.keys(res.body)).toEqual(['result', 'count', 'payments']);
     expect(res.body.count).toBe(172);
     expect(res.body.payments).toEqual(paymentsOf(all));
-    const paged = await (async () => {
-      const out: string[] = [];
-      let marker: string | undefined;
-      do {
-        const page = await get(`/v2/payments/xah?limit=50${marker ? `&marker=${marker}` : ''}`);
-        if (page.status !== 200) throw new Error(`${page.status} ${JSON.stringify(page.body)}`);
-        out.push(...hashesIn(page.body as ListBody).map(String));
-        marker = page.body.marker;
-      } while (marker);
-      return out;
-    })();
+    const paged = (await pages('/v2/payments/xah', 50)).flatMap(hashesIn);
     expect(paged).toEqual(hashesOf(all));
   });
 
@@ -1106,7 +1049,7 @@ describe('payments API endpoint on the xahau-recorded ledgers', () => {
   it('format=csv is named after XAH', async () => {
     const res = await get('/v2/payments/XAH?format=csv&limit=10');
     expect(res.headers['content-type']).toMatch(/^text\/csv/);
-    expect(res.headers['content-disposition']).toBe('attachment; filename=payments - XAH .csv');
+    expect(res.headers['content-disposition']).toBe('attachment; filename=payments - XAH.csv');
     expect(res.text.split('\n')).toHaveLength(1 + 10);
     expect(res.headers.link).toBeDefined();
   });

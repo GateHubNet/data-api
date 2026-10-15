@@ -65,10 +65,42 @@ export interface HarnessOptions {
   controllers?: () => Type<unknown>[] | Promise<Type<unknown>[]>;
 }
 
+/**
+ * `GH_RATE_LIMIT` for a suite that walks lists a page at a time: far more requests to one route than the default limit
+ * of 600 a minute. Pass it as `env` of `startHarness`.
+ */
+export const NO_RATE_LIMIT: Record<string, string> = { GH_RATE_LIMIT: '1000000' };
+
+/** A GET client on a harness app, with the API key. See `Harness.api()`. */
+export interface ApiClient {
+  /** GET with the key; any status. Await it (or `.expect`/`.set`) like a supertest request. */
+  get(path: string): request.Test;
+  /**
+   * GET that must answer 200 and, when `key` is given, a body with that key; otherwise it throws an Error that carries
+   * the path, the status and the body, so a page walk that goes wrong says what it was given.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ok<T = any>(path: string, key?: string): Promise<request.Response & { body: T }>;
+  /**
+   * Every page of a list, following the `marker` of each (`limit` and the marker are added to `path`), in order. Each
+   * page goes through `ok(…, key)`, and a list that does not end in 1000 pages throws.
+   */
+  pages<T extends { marker?: string }>(path: string, limit: number, key: string): Promise<T[]>;
+}
+
 export interface Harness {
   app: INestApplication;
-  /** A supertest agent on the app (no listening socket needed). */
+  /**
+   * A supertest agent on the app. It starts and closes a server for every request, which is fine for a few requests; a
+   * test that makes hundreds of them (a walk over a list) should use `api()`.
+   */
   http(): ReturnType<typeof request>;
+  /**
+   * A client on a socket of the app's own, opened by the first call and used by every call after it (closed by
+   * `close()`). The requests of `http()` each listen on a new port, and now and then one of hundreds lands on a port
+   * whose connection the client still holds and fails with ECONNRESET.
+   */
+  api(): Promise<ApiClient>;
   /** The app's own ClickHouse service, bound to this harness's database. */
   ch: ClickHouseService;
   /** The database this harness created (random, dropped by `close()`). */
@@ -159,9 +191,11 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   }
 
   const running = app as unknown as NestExpressApplication;
+  let client: Promise<ApiClient> | undefined;
   return {
     app: running,
     http: () => request(running.getHttpServer()),
+    api: () => (client ??= listeningClient(running, TEST_API_KEY)),
     ch: ch as unknown as ClickHouseService,
     database,
     key: TEST_API_KEY,
@@ -170,6 +204,43 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       await dropDatabase(database, env);
     },
   };
+}
+
+/** Opens the app on a port of its own and returns a client on it (`app.close()` closes the socket again). */
+async function listeningClient(app: NestExpressApplication, key: string): Promise<ApiClient> {
+  await app.listen(0, '127.0.0.1');
+  const url = await app.getUrl();
+  const get = (path: string): request.Test => request(url).get(path).set('X-API-Key', key);
+
+  const ok: ApiClient['ok'] = async (path, expectedKey) => {
+    const res = await get(path);
+    const body = res.body as Record<string, unknown> | null;
+    if (
+      res.status !== 200 ||
+      (expectedKey !== undefined && (body === null || typeof body !== 'object' || !(expectedKey in body)))
+    ) {
+      const why = res.status !== 200 ? `answered ${res.status}` : `has no "${expectedKey}"`;
+      throw new Error(`GET ${path} ${why}: ${JSON.stringify(res.body ?? res.text)}`);
+    }
+    return res;
+  };
+
+  const pages: ApiClient['pages'] = async <T extends { marker?: string }>(path: string, limit: number, key: string) => {
+    const out: T[] = [];
+    let marker: string | undefined;
+    do {
+      const res = await ok<T>(
+        `${path}${path.includes('?') ? '&' : '?'}limit=${limit}${marker ? `&marker=${marker}` : ''}`,
+        key,
+      );
+      out.push(res.body);
+      marker = res.body.marker;
+      if (out.length >= 1000) throw new Error(`GET ${path}: still a marker after ${out.length} pages of ${limit}`);
+    } while (marker);
+    return out;
+  };
+
+  return { get, ok, pages };
 }
 
 /** Writes the ledgers of a fixture set the way the syncer does, so every table the API reads is filled. */

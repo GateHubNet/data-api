@@ -1,6 +1,6 @@
 import { ClickHouseService, clickHouseConfigFromEnv } from '@gatehub/data-api-shared';
 import { clickHouseUrl } from './e2e-env';
-import { Harness, rippledError, startHarness } from './harness';
+import { Harness, NO_RATE_LIMIT, rippledError, startHarness } from './harness';
 import { fixtureSource, fixtureTransactions } from './support/fixtures';
 
 const controllers = async () => (await import('./harness-controllers')).HARNESS_CONTROLLERS;
@@ -224,6 +224,107 @@ describe('startHarness', () => {
       }
       expect(await databaseExists(a.database)).toBe(false);
       expect(await databaseExists(b.database)).toBe(false);
+    });
+  });
+
+  describe('api()', () => {
+    let h: Harness;
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    // 30 transactions closed on 2015-02-09
+    const DAY = '/v2/transactions?start=2015-02-09&end=2015-02-09';
+
+    it('opens one socket for the harness: every call gets the same client, and http() still works', async () => {
+      const [a, b] = await Promise.all([h.api(), h.api()]);
+      expect(b).toBe(a);
+      expect(await h.api()).toBe(a);
+      expect(a.get).toBe(b.get);
+      const listening = h.app.getHttpServer().address();
+      expect(listening).toMatchObject({ address: '127.0.0.1' });
+      expect((await a.get('/v2/transactions?limit=1')).status).toBe(200);
+      expect((await h.http().get('/v2/transactions?limit=1').set('X-API-Key', h.key)).status).toBe(200);
+    });
+
+    it('get sends the API key and answers whatever the status', async () => {
+      const api = await h.api();
+      expect((await api.get('/v2/transactions?limit=1')).status).toBe(200);
+      const missing = await api.get(
+        '/v2/transactions/22F26CE4E2270CE3CF4EB61C609E7ADEDCD41D4C1BA2D96D680A9B016C4F47DC',
+      );
+      expect([missing.status, missing.body.message]).toEqual([404, 'transaction not found']);
+      // without the key the request would be refused: the key is sent
+      const unauthorized = await h.http().get('/v2/transactions?limit=1');
+      expect(unauthorized.status).toBe(401);
+    });
+
+    it('ok returns the response of a 200, with the key when asked for', async () => {
+      const api = await h.api();
+      const res = await api.ok<{ count: number; transactions: unknown[] }>(`${DAY}&limit=5`, 'transactions');
+      expect(res.status).toBe(200);
+      expect(res.body.transactions).toHaveLength(5);
+      expect((await api.ok('/v2/transactions?limit=1')).body.count).toBe(1);
+    });
+
+    it('ok throws with the path, the status and the body when the answer is not 200', async () => {
+      const api = await h.api();
+      const error = await api.ok('/v2/transactions?marker=!').catch((e: Error) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        'GET /v2/transactions?marker=! answered 400: {"result":"error","message":"invalid marker"}',
+      );
+    });
+
+    it('ok throws when the body lacks the key it was asked for', async () => {
+      const api = await h.api();
+      const error = await api.ok('/v2/transactions?limit=1', 'payments').catch((e: Error) => e);
+      expect((error as Error).message).toMatch(
+        /^GET \/v2\/transactions\?limit=1 has no "payments": \{"result":"success","count":1,/,
+      );
+    });
+
+    it('pages follows the markers until there is none and adds the limit', async () => {
+      const api = await h.api();
+      const unpaged = await api.ok<{ transactions: { hash: string }[] }>(`${DAY}&limit=100`, 'transactions');
+      expect(unpaged.body.transactions).toHaveLength(30);
+      const pages = await api.pages<{ marker?: string; count: number; transactions: { hash: string }[] }>(
+        DAY,
+        7,
+        'transactions',
+      );
+      expect(pages.map((p) => p.count)).toEqual([7, 7, 7, 7, 2]);
+      expect(pages.slice(0, -1).every((p) => p.marker !== undefined)).toBe(true);
+      expect(pages[pages.length - 1].marker).toBeUndefined();
+      expect(pages.flatMap((p) => p.transactions)).toEqual(unpaged.body.transactions);
+      // a path without a query gets its `?`
+      expect(await api.pages('/v2/payments', 1000, 'payments')).toHaveLength(1);
+    });
+
+    it('pages throws with the diagnostics of the page that failed', async () => {
+      const api = await h.api();
+      await expect(api.pages(`${DAY}&marker=!`, 7, 'transactions')).rejects.toThrow(
+        /^GET \/v2\/transactions\?start=2015-02-09&end=2015-02-09&marker=!&limit=7 answered 400: .*invalid marker/,
+      );
+      await expect(api.pages(DAY, 7, 'payments')).rejects.toThrow(/has no "payments"/);
+    });
+
+    it('NO_RATE_LIMIT lifts the limit of 600 a minute', async () => {
+      const res = await (await h.api()).get('/v2/transactions?limit=1');
+      expect(NO_RATE_LIMIT).toEqual({ GH_RATE_LIMIT: '1000000' });
+      expect(res.headers['x-ratelimit-limit']).toBe('1000000');
+    });
+
+    it('close() closes the socket again', async () => {
+      const other = await startHarness();
+      await other.api();
+      const url = await other.app.getUrl();
+      expect((await fetch(`${url}/liveliness`)).status).toBeLessThan(500);
+      await other.close();
+      await expect(fetch(`${url}/liveliness`)).rejects.toThrow();
     });
   });
 });

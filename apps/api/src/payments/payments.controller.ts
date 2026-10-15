@@ -17,21 +17,19 @@ import { PaymentsService } from './payments.service';
 
 interface PaymentsBody {
   result: 'success';
-  currency?: string;
-  issuer?: string;
   count: number;
   marker?: string;
   payments: PaymentObject[];
 }
 
 /**
- * The name of the CSV file, as `getPayments.js` builds it: `payments`, then ` - <currency>` or a space, then
- * ` <currency>` (sic: the original repeats the currency where it meant the issuer) or a space. The `.csv` is added by
- * `@Csv`.
+ * The name of the CSV file, as `getPayments.js` meant it: `payments`, then ` - <currency>` and ` <issuer>` of the path
+ * (the original repeated the currency where the issuer was meant, and, as it never had them at hand, always named it
+ * `payments  `). `@Csv` adds the `.csv`. The path has been validated by the time the answer is built.
  */
-function csvFilename(_req: Request, body: Record<string, unknown>): string {
-  const { currency, issuer } = body as { currency?: string; issuer?: string };
-  return `payments${currency ? ` - ${currency}` : ' '}${issuer ? ` ${currency}` : ' '}`;
+function csvFilename(req: Request): string {
+  const { currency, issuer } = splitAsset(req.params.currency ?? '');
+  return `payments${currency ? ` - ${currency}` : ''}${issuer ? ` ${issuer}` : ''}`;
 }
 
 /** `GET /v2/payments[/:currency]` (`api/routes/getPayments.js`). */
@@ -92,8 +90,6 @@ export class PaymentsController {
     setLinkHeader(req, res, page.marker);
     return {
       result: 'success',
-      currency: asset?.currency,
-      issuer: asset?.issuer,
       count: page.payments.length,
       marker: page.marker,
       payments: page.payments,
