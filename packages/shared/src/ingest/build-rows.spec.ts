@@ -1,0 +1,1022 @@
+import BigNumber from 'bignumber.js';
+import { createHash } from 'crypto';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { PARSER_VERSION } from '../clickhouse/rows';
+import { Table } from '../clickhouse/tables';
+import { getNetworkProfile } from '../network';
+import { ParseContext, parseContextFor } from '../parsers/parser.interface';
+import { deepFreeze } from '../test-utils/deep-freeze';
+import { buildLedgerRows, CHILD_TABLES, LedgerRows } from './build-rows';
+import { FixtureLedgerSource } from './fixture-ledger-source';
+import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
+
+const PACKAGE_ROOT = join(__dirname, '..', '..');
+const FIXTURES = join(PACKAGE_ROOT, 'test', 'fixtures');
+const DDL = readFileSync(join(PACKAGE_ROOT, 'schema', '001_baseline.sql'), 'utf8');
+
+const XRPL: ParseContext = parseContextFor(getNetworkProfile('xrpl'));
+const XAHAU: ParseContext = parseContextFor(getNetworkProfile('xahau'));
+
+type Json = Record<string, any>;
+
+// -- Fixture sets -----------------------------------------------------------------------------------------------
+
+interface FixtureSet {
+  name: string;
+  ctx: ParseContext;
+  dir: string;
+  /**
+   * Guards for the conservation check (c): at least this many transactions must have had their native total checked
+   * and this many trustlines their two sides summed, so that exemptions or a parser regression cannot make it vacuous.
+   * Set below what the fixtures give today (930/542, 1302/192, 193/96) to survive a re-recording.
+   */
+  minNativeChecked: number;
+  minTrustlinesChecked: number;
+}
+
+const SETS: FixtureSet[] = [
+  {
+    name: 'ripple-mock (xrpl)',
+    ctx: XRPL,
+    dir: join(FIXTURES, 'xrpl', 'ripple-mock'),
+    minNativeChecked: 900,
+    minTrustlinesChecked: 500,
+  },
+  {
+    name: 'recorded (xrpl)',
+    ctx: XRPL,
+    dir: join(FIXTURES, 'xrpl', 'recorded'),
+    minNativeChecked: 1250,
+    minTrustlinesChecked: 150,
+  },
+  {
+    name: 'recorded (xahau)',
+    ctx: XAHAU,
+    dir: join(FIXTURES, 'xahau', 'recorded'),
+    minNativeChecked: 150,
+    minTrustlinesChecked: 50,
+  },
+];
+
+interface Built {
+  raw: RawLedger;
+  rows: LedgerRows;
+}
+
+const loaded = new Map<string, Built[]>();
+
+/** Every ledger of a fixture set with its rows. Built once per set. */
+function builtOf(set: FixtureSet): Built[] {
+  let built = loaded.get(set.dir);
+  if (!built) {
+    built = FixtureLedgerSource.fromDir(set.dir)
+      .list()
+      .map((raw) => ({ raw, rows: buildLedgerRows(raw, set.ctx) }));
+    loaded.set(set.dir, built);
+  }
+  return built;
+}
+
+function ledgerNamed(set: FixtureSet, index: number): Built {
+  const found = builtOf(set).find((b) => b.raw.header.ledger_index === index);
+  if (!found) throw new Error(`fixture ledger ${index} not found in ${set.dir}`);
+  return found;
+}
+
+function isDeepFrozen(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return true;
+  return Object.isFrozen(value) && Object.values(value as Record<string, unknown>).every(isDeepFrozen);
+}
+
+// -- The ORDER BY keys, read from the DDL -----------------------------------------------------------------------
+
+/** The LedgerRows property that holds the rows of each ledger-derived table. */
+const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.Ledgers, 'ledger'],
+  [Table.LedgerByHash, 'ledgerByHash'],
+  [Table.Transactions, 'transactions'],
+  [Table.TxByHash, 'txByHash'],
+  [Table.TxByType, 'txByType'],
+  [Table.AccountTransactions, 'accountTransactions'],
+  [Table.AccountTxBySequence, 'accountTxBySequence'],
+  [Table.Payments, 'payments'],
+  [Table.PaymentsByCurrency, 'paymentsByCurrency'],
+  [Table.AccountPayments, 'accountPayments'],
+  [Table.Exchanges, 'exchanges'],
+  [Table.AccountExchanges, 'accountExchanges'],
+  [Table.BalanceChanges, 'balanceChanges'],
+  [Table.AccountsCreated, 'accountsCreated'],
+];
+
+function orderByColumns(table: Table): string[] {
+  const match = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\n[\\s\\S]*?\\nORDER BY \\(?([^)\\n]+)\\)?`).exec(
+    DDL,
+  );
+  if (!match) throw new Error(`no ORDER BY found for ${table} in 001_baseline.sql`);
+  return match[1].split(',').map((c) => c.trim());
+}
+
+/** All the rows of one LedgerRows property across a list of ledgers. */
+function collect(built: Built[], key: keyof LedgerRows): Json[] {
+  return built.flatMap((b) => {
+    const value = b.rows[key] as Json | Json[];
+    return Array.isArray(value) ? value : [value];
+  });
+}
+
+// -- Hand-built ledgers -----------------------------------------------------------------------------------------
+
+const SENDER = 'rSenderSenderSenderSenderSenderxx';
+const RECEIVER = 'rReceiverReceiverReceiverReceivxx';
+const NEWBIE = 'rNewbieNewbieNewbieNewbieNewbiexx';
+const TAKER = 'rTakerTakerTakerTakerTakerTakerxx';
+const PROVIDER = 'rProviderProviderProviderProvidexxx';
+const ISSUER = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
+
+const usd = (value: string): Json => ({ currency: 'USD', issuer: ISSUER, value });
+
+/**
+ * A BookDirectory whose trailing 8 bytes encode `mantissa * 10^exponent` (units of TakerPays / TakerGets, native amounts
+ * counted in drops): `exponent + 100` then a 7 byte mantissa.
+ */
+function bookDirectory(mantissa: string, exponent: number): string {
+  const quality = (exponent + 100).toString(16).padStart(2, '0') + BigInt(mantissa).toString(16).padStart(14, '0');
+  return `${'AB'.repeat(24)}${quality}`.toUpperCase();
+}
+
+/** 1e-6 USD per drop: one USD per XRP, so the sample offers trade 1:1. */
+const QUALITY_ONE = bookDirectory('1000000000000000', -21);
+
+const hex = (text: string) => Buffer.from(text, 'utf8').toString('hex').toUpperCase();
+
+function account(address: string, previous: string, final: string): Json {
+  return {
+    ModifiedNode: {
+      LedgerEntryType: 'AccountRoot',
+      FinalFields: { Account: address, Balance: final },
+      PreviousFields: { Balance: previous },
+    },
+  };
+}
+
+/** An offer of `PROVIDER` (or `owner`) that a transaction consumed from 3 USD / 3 XRP to 1 USD / 1 XRP. */
+function consumedOffer(owner: string): Json {
+  return {
+    ModifiedNode: {
+      LedgerEntryType: 'Offer',
+      FinalFields: {
+        Account: owner,
+        BookDirectory: QUALITY_ONE,
+        Sequence: 77,
+        TakerPays: usd('1'),
+        TakerGets: '1000000',
+      },
+      PreviousFields: { TakerPays: usd('3'), TakerGets: '3000000' },
+    },
+  };
+}
+
+function rawTx(tx: Json, index: number, hash: string, nodes: Json[], result = 'tesSUCCESS', meta: Json = {}): Json {
+  return {
+    Fee: '10',
+    Sequence: 1,
+    ...tx,
+    hash,
+    metaData: { TransactionIndex: index, TransactionResult: result, AffectedNodes: nodes, ...meta },
+  };
+}
+
+function ledgerOf(transactions: Json[], overrides: Json = {}): RawLedger {
+  return normalizeLedgerResponse({
+    ledger_index: '5000000',
+    ledger_hash: 'L'.repeat(64),
+    parent_hash: 'P'.repeat(64),
+    account_hash: 'A'.repeat(64),
+    transaction_hash: 'T'.repeat(64),
+    total_coins: '99999999999000000',
+    close_time: 750_000_000,
+    parent_close_time: 749_999_990,
+    close_time_resolution: 10,
+    close_flags: 1,
+    transactions,
+    ...overrides,
+  });
+}
+
+/** Five transactions: two native payments (one creates an account), two offer crossings, a ticketed AccountSet. */
+function sampleLedger(): RawLedger {
+  return ledgerOf([
+    // 0: payment with a client memo, source tag 0 and destination tag 42.
+    rawTx(
+      {
+        TransactionType: 'Payment',
+        Account: SENDER,
+        Destination: RECEIVER,
+        Amount: '10000000',
+        Fee: '12',
+        Sequence: 7,
+        SourceTag: 0,
+        DestinationTag: 42,
+        Memos: [{ Memo: { MemoType: hex('client'), MemoData: hex('xumm') } }],
+      },
+      0,
+      '0'.repeat(63) + 'A',
+      [account(SENDER, '100000000', '89999988'), account(RECEIVER, '10000000', '20000000')],
+      'tesSUCCESS',
+      { delivered_amount: '10000000' },
+    ),
+    // 1: OfferCreate by TAKER crossing PROVIDER's offer.
+    rawTx(
+      { TransactionType: 'OfferCreate', Account: TAKER, Fee: '15', Sequence: 3, TakerPays: usd('1'), TakerGets: '1' },
+      1,
+      '0'.repeat(63) + 'B',
+      [consumedOffer(PROVIDER)],
+    ),
+    // 2: OfferCreate by TAKER crossing its own offer.
+    rawTx(
+      { TransactionType: 'OfferCreate', Account: TAKER, Fee: '20', Sequence: 4, TakerPays: usd('1'), TakerGets: '1' },
+      2,
+      '0'.repeat(63) + 'C',
+      [consumedOffer(TAKER)],
+    ),
+    // 3: ticketed AccountSet that failed with a tec code; only the fee moved.
+    rawTx(
+      { TransactionType: 'AccountSet', Account: SENDER, Fee: '12', Sequence: 0, TicketSequence: 9 },
+      3,
+      '0'.repeat(63) + 'D',
+      [account(SENDER, '89999988', '89999976')],
+      'tecNO_PERMISSION',
+    ),
+    // 4: payment that creates an account; destination tag 0, no source tag.
+    rawTx(
+      {
+        TransactionType: 'Payment',
+        Account: SENDER,
+        Destination: NEWBIE,
+        Amount: '25000000',
+        Fee: '10',
+        Sequence: 8,
+        DestinationTag: 0,
+      },
+      4,
+      '0'.repeat(63) + 'E',
+      [
+        account(SENDER, '89999976', '64999966'),
+        {
+          CreatedNode: {
+            LedgerEntryType: 'AccountRoot',
+            NewFields: { Account: NEWBIE, Balance: '25000000', Sequence: 1 },
+          },
+        },
+      ],
+      'tesSUCCESS',
+      { delivered_amount: '25000000' },
+    ),
+  ]);
+}
+
+// -- Snapshots --------------------------------------------------------------------------------------------------
+
+/** The two JSON blobs are huge and are covered by a round-trip test; the snapshot keeps their length and a digest. */
+function forSnapshot(rows: LedgerRows): unknown {
+  const digest = (json: string) => `<${json.length} chars, sha256 ${createHash('sha256').update(json).digest('hex')}>`;
+  return {
+    ...rows,
+    transactions: rows.transactions.map((row) => ({
+      ...row,
+      tx_json: digest(row.tx_json),
+      meta_json: digest(row.meta_json),
+    })),
+  };
+}
+
+describe('buildLedgerRows snapshots', () => {
+  it('ripple-mock ledger 11118827', () => {
+    const { rows } = ledgerNamed(SETS[0], 11118827);
+    expect(forSnapshot(rows)).toMatchSnapshot();
+  });
+
+  it('ripple-mock ledger 11119620 (payments, exchanges and issued currencies)', () => {
+    const { rows } = ledgerNamed(SETS[0], 11119620);
+    expect(forSnapshot(rows)).toMatchSnapshot();
+  });
+
+  it('ripple-mock ledger 11618225 (a payment that creates an account)', () => {
+    const { rows } = ledgerNamed(SETS[0], 11618225);
+    expect(forSnapshot(rows)).toMatchSnapshot();
+  });
+
+  it('recorded Xahau ledger 26540188 (GenesisMint, URITokenCreateSellOffer, Payment)', () => {
+    const { rows } = ledgerNamed(SETS[2], 26540188);
+    expect(forSnapshot(rows)).toMatchSnapshot();
+  });
+});
+
+// -- Mapping rules ----------------------------------------------------------------------------------------------
+
+describe('buildLedgerRows mapping', () => {
+  const raw = sampleLedger();
+  const rows = buildLedgerRows(raw, XRPL);
+
+  describe('ledger row', () => {
+    it('copies the header, with unix times and total_coins as an exact string', () => {
+      expect(rows.ledger).toMatchObject({
+        ledger_index: 5_000_000,
+        ledger_hash: 'L'.repeat(64),
+        parent_hash: 'P'.repeat(64),
+        account_hash: 'A'.repeat(64),
+        transaction_hash: 'T'.repeat(64),
+        total_coins: '99999999999000000',
+        close_time: 750_000_000 + 946_684_800,
+        parent_close_time: 749_999_990 + 946_684_800,
+        close_time_resolution: 10,
+        close_flags: 1,
+        parser_version: PARSER_VERSION,
+      });
+      expect(rows.ledger.total_coins).toBe(raw.header.total_coins);
+      expect(rows.ledgerByHash).toEqual({ ledger_hash: 'L'.repeat(64), ledger_index: 5_000_000 });
+    });
+
+    it('leaves ingested_at to the server default', () => {
+      expect(rows.ledger).not.toHaveProperty('ingested_at');
+    });
+
+    it('counts transactions, types and results over all transactions', () => {
+      expect(rows.ledger.tx_count).toBe(5);
+      expect(rows.ledger.type_counts).toEqual({ Payment: 2, OfferCreate: 2, AccountSet: 1 });
+      expect(rows.ledger.result_counts).toEqual({ tesSUCCESS: 4, tecNO_PERMISSION: 1 });
+    });
+
+    it('counts payments, exchanges (not transactions) and created accounts', () => {
+      expect(rows.ledger.payments_count).toBe(2);
+      expect(rows.ledger.exchanges_count).toBe(2);
+      expect(rows.ledger.accounts_created).toBe(1);
+      expect(rows.payments).toHaveLength(2);
+      expect(rows.exchanges).toHaveLength(2);
+      expect(rows.accountsCreated).toHaveLength(1);
+    });
+
+    it('sums, minimises and maximises the Fee of every transaction in drops, as strings', () => {
+      // 12 + 15 + 20 + 12 + 10
+      expect(rows.ledger.fee_total).toBe('69');
+      expect(rows.ledger.fee_min).toBe('10');
+      expect(rows.ledger.fee_max).toBe('20');
+    });
+
+    it('keeps fee sums exact above 2^53', () => {
+      const big = ledgerOf([
+        rawTx({ TransactionType: 'AccountSet', Account: SENDER, Fee: '9007199254740993' }, 0, 'F'.repeat(64), []),
+        rawTx({ TransactionType: 'AccountSet', Account: SENDER, Fee: '9007199254740993' }, 1, 'E'.repeat(64), []),
+      ]);
+      const built = buildLedgerRows(big, XRPL);
+      expect(built.ledger.fee_total).toBe('18014398509481986');
+      expect(built.ledger.fee_min).toBe('9007199254740993');
+      expect(built.ledger.fee_max).toBe('9007199254740993');
+    });
+
+    it('is all zero for a ledger without transactions, with fee_min 0 like the reference fees.js', () => {
+      const empty = buildLedgerRows(ledgerOf([]), XRPL);
+      expect(empty.ledger).toMatchObject({
+        tx_count: 0,
+        type_counts: {},
+        result_counts: {},
+        payments_count: 0,
+        exchanges_count: 0,
+        accounts_created: 0,
+        fee_total: '0',
+        fee_min: '0',
+        fee_max: '0',
+      });
+      for (const [, key] of CHILD_TABLES) expect(empty[key]).toEqual([]);
+    });
+
+    it('maps a missing parent_close_time (genesis) to 0', () => {
+      const genesis = buildLedgerRows(ledgerOf([], { parent_close_time: undefined, close_flags: undefined }), XRPL);
+      expect(genesis.ledger.parent_close_time).toBe(0);
+      expect(genesis.ledger.close_flags).toBe(0);
+    });
+  });
+
+  describe('transactions, tx_by_hash, tx_by_type', () => {
+    it('stores tx_json without hash or meta, and meta_json unaltered', () => {
+      rows.transactions.forEach((row, i) => {
+        const source = raw.transactions[i];
+        expect(row.tx_json).toBe(JSON.stringify(source.tx));
+        expect(row.meta_json).toBe(JSON.stringify(source.meta));
+        const tx = JSON.parse(row.tx_json);
+        expect(tx).not.toHaveProperty('hash');
+        expect(tx).not.toHaveProperty('meta');
+        expect(tx).not.toHaveProperty('metaData');
+        expect(tx.TransactionType).toBe(row.tx_type);
+        expect(JSON.parse(row.meta_json).TransactionResult).toBe(row.result);
+      });
+    });
+
+    it('maps the scalar columns', () => {
+      expect(rows.transactions[0]).toMatchObject({
+        ledger_index: 5_000_000,
+        tx_index: 0,
+        hash: '0'.repeat(63) + 'A',
+        tx_type: 'Payment',
+        result: 'tesSUCCESS',
+        account: SENDER,
+        sequence: 7,
+        fee: '12',
+        close_time: 750_000_000 + 946_684_800,
+      });
+      expect(rows.transactions.map((r) => r.fee)).toEqual(['12', '15', '20', '12', '10']);
+    });
+
+    it('fills the lookup tables from the same transactions', () => {
+      expect(rows.txByHash).toEqual(
+        rows.transactions.map((r) => ({ hash: r.hash, ledger_index: 5_000_000, tx_index: r.tx_index })),
+      );
+      expect(rows.txByType).toEqual(
+        rows.transactions.map((r) => ({
+          tx_type: r.tx_type,
+          ledger_index: 5_000_000,
+          tx_index: r.tx_index,
+          result: r.result,
+        })),
+      );
+      expect(rows.txByType[3]).toEqual({
+        tx_type: 'AccountSet',
+        ledger_index: 5_000_000,
+        tx_index: 3,
+        result: 'tecNO_PERMISSION',
+      });
+    });
+  });
+
+  describe('account_transactions and account_tx_by_sequence', () => {
+    it('has one row per affected account with is_initiator for the sender only', () => {
+      const first = rows.accountTransactions.filter((r) => r.tx_index === 0);
+      expect(first.map((r) => [r.account, r.is_initiator]).sort()).toEqual(
+        [
+          [RECEIVER, 0],
+          [SENDER, 1],
+        ].sort(),
+      );
+      for (const row of first) {
+        expect(row).toMatchObject({
+          ledger_index: 5_000_000,
+          tx_type: 'Payment',
+          result: 'tesSUCCESS',
+          close_time: 750_000_000 + 946_684_800,
+        });
+      }
+    });
+
+    it('lists a failed (tec) transaction under its sender too', () => {
+      expect(rows.accountTransactions.filter((r) => r.tx_index === 3)).toEqual([
+        {
+          account: SENDER,
+          ledger_index: 5_000_000,
+          tx_index: 3,
+          tx_type: 'AccountSet',
+          result: 'tecNO_PERMISSION',
+          is_initiator: 1,
+          close_time: 750_000_000 + 946_684_800,
+        },
+      ]);
+    });
+
+    it('has the sender only, with the transaction Sequence, and 0 for a ticketed transaction', () => {
+      expect(rows.accountTxBySequence).toEqual([
+        { account: SENDER, sequence: 7, ledger_index: 5_000_000, tx_index: 0 },
+        { account: TAKER, sequence: 3, ledger_index: 5_000_000, tx_index: 1 },
+        { account: TAKER, sequence: 4, ledger_index: 5_000_000, tx_index: 2 },
+        { account: SENDER, sequence: 0, ledger_index: 5_000_000, tx_index: 3 },
+        { account: SENDER, sequence: 8, ledger_index: 5_000_000, tx_index: 4 },
+      ]);
+    });
+  });
+
+  describe('payments, payments_by_currency, account_payments', () => {
+    it('maps a native payment with the fee in drops, issuer empty and tags (0 kept)', () => {
+      expect(rows.payments[0]).toEqual({
+        ledger_index: 5_000_000,
+        tx_index: 0,
+        tx_hash: '0'.repeat(63) + 'A',
+        close_time: 750_000_000 + 946_684_800,
+        source: SENDER,
+        destination: RECEIVER,
+        currency: 'XRP',
+        issuer: '',
+        amount: '10',
+        delivered_amount: '10',
+        delivered_amount_f: 10,
+        max_amount: null,
+        source_currency: 'XRP',
+        source_tag: 0,
+        destination_tag: 42,
+        invoice_id: null,
+        fee: '12',
+        source_balance_changes: JSON.stringify([{ counterparty: '', currency: 'XRP', value: '-10' }]),
+        destination_balance_changes: JSON.stringify([{ counterparty: '', currency: 'XRP', value: '10' }]),
+        client: 'xumm',
+      });
+    });
+
+    it('maps an absent tag to null and a tag of 0 to 0', () => {
+      expect(rows.payments[1]).toMatchObject({ tx_index: 4, source_tag: null, destination_tag: 0, client: null });
+    });
+
+    it('indexes the payment by the delivered currency and issuer, empty for native', () => {
+      expect(rows.paymentsByCurrency).toEqual([
+        { currency: 'XRP', issuer: '', ledger_index: 5_000_000, tx_index: 0 },
+        { currency: 'XRP', issuer: '', ledger_index: 5_000_000, tx_index: 4 },
+      ]);
+    });
+
+    it('has a sent row for the source and a received row for the destination', () => {
+      const base = {
+        ledger_index: 5_000_000,
+        tx_index: 0,
+        tx_hash: '0'.repeat(63) + 'A',
+        close_time: 750_000_000 + 946_684_800,
+        currency: 'XRP',
+        issuer: '',
+        delivered_amount: '10',
+        delivered_amount_f: 10,
+        source_tag: 0,
+        destination_tag: 42,
+      };
+      expect(rows.accountPayments.filter((r) => r.tx_index === 0)).toEqual([
+        { account: SENDER, direction: 'sent', counterparty: RECEIVER, ...base },
+        { account: RECEIVER, direction: 'received', counterparty: SENDER, ...base },
+      ]);
+      expect(rows.accountPayments).toHaveLength(4);
+    });
+  });
+
+  describe('exchanges and account_exchanges', () => {
+    it('maps an exchange with nullable columns as null, Float64 shadows and drop-free strings', () => {
+      expect(rows.exchanges[0]).toEqual({
+        base_currency: 'USD',
+        base_issuer: ISSUER,
+        counter_currency: 'XRP',
+        counter_issuer: '',
+        ledger_index: 5_000_000,
+        tx_index: 1,
+        node_index: 0,
+        tx_hash: '0'.repeat(63) + 'B',
+        close_time: 750_000_000 + 946_684_800,
+        base_amount: '2',
+        counter_amount: '2',
+        base_amount_f: 2,
+        counter_amount_f: 2,
+        rate: '1',
+        rate_f: 1,
+        buyer: PROVIDER,
+        seller: TAKER,
+        taker: TAKER,
+        provider: PROVIDER,
+        offer_sequence: 77,
+        autobridged_currency: null,
+        autobridged_issuer: null,
+        tx_type: 'OfferCreate',
+        client: null,
+      });
+    });
+
+    it('has a row for the buyer and one for the seller, each a full copy of the exchange', () => {
+      const [exchange] = rows.exchanges;
+      expect(rows.accountExchanges.filter((r) => r.tx_index === 1)).toEqual([
+        { account: PROVIDER, ...exchange },
+        { account: TAKER, ...exchange },
+      ]);
+    });
+
+    it('collapses a self-trade (buyer === seller) to one row for that account', () => {
+      const own = rows.exchanges[1];
+      expect(own.tx_index).toBe(2);
+      expect(own.buyer).toBe(TAKER);
+      expect(own.seller).toBe(TAKER);
+      expect(rows.accountExchanges.filter((r) => r.tx_index === 2)).toEqual([{ account: TAKER, ...own }]);
+      expect(rows.accountExchanges).toHaveLength(3);
+    });
+
+    it('keeps autobridged currency and issuer when the parser reports them', () => {
+      const bridged = ledgerOf([
+        rawTx(
+          {
+            TransactionType: 'OfferCreate',
+            Account: TAKER,
+            TakerPays: { currency: 'EUR', issuer: PROVIDER, value: '1' },
+            TakerGets: usd('1'),
+          },
+          0,
+          'B'.repeat(64),
+          [consumedOffer(PROVIDER)],
+        ),
+      ]);
+      const [exchange] = buildLedgerRows(bridged, XRPL).exchanges;
+      expect(exchange.autobridged_currency).toBe('EUR');
+      expect(exchange.autobridged_issuer).toBe(PROVIDER);
+    });
+  });
+
+  describe('balance_changes', () => {
+    const senderRows = rows.balanceChanges.filter((r) => r.tx_index === 0 && r.account === SENDER);
+
+    it('has the fee row at node_index -1 and the payment row at its node, with nullable columns null', () => {
+      expect(senderRows).toEqual([
+        {
+          account: SENDER,
+          ledger_index: 5_000_000,
+          tx_index: 0,
+          node_index: -1,
+          tx_hash: '0'.repeat(63) + 'A',
+          close_time: 750_000_000 + 946_684_800,
+          currency: 'XRP',
+          counterparty: '',
+          amount_change: '-0.000012',
+          // The balance once the fee is paid and before the payment moved 10 XRP.
+          final_balance: '99.999988',
+          final_balance_f: 99.999988,
+          change_type: 'transaction_cost',
+          escrow_counterparty: null,
+          escrow_balance_change: null,
+          paychannel_counterparty: null,
+          paychannel_fund_change: null,
+          paychannel_fund_final_balance: null,
+          paychannel_final_balance: null,
+          paychannel_balance_change: null,
+          client: 'xumm',
+        },
+        expect.objectContaining({
+          node_index: 0,
+          amount_change: '-10',
+          final_balance: '89.999988',
+          change_type: 'payment_source',
+          client: 'xumm',
+        }),
+      ]);
+    });
+
+    it('has only the fee row for a failed transaction', () => {
+      expect(rows.balanceChanges.filter((r) => r.tx_index === 3)).toEqual([
+        expect.objectContaining({
+          account: SENDER,
+          node_index: -1,
+          amount_change: '-0.000012',
+          change_type: 'transaction_cost',
+        }),
+      ]);
+    });
+  });
+
+  describe('accounts_created', () => {
+    it('inception is the ledger close time and the genesis columns are null', () => {
+      expect(rows.accountsCreated).toEqual([
+        {
+          account: NEWBIE,
+          parent: SENDER,
+          initial_balance: '25',
+          ledger_index: 5_000_000,
+          tx_index: 4,
+          tx_hash: '0'.repeat(63) + 'E',
+          inception: 750_000_000 + 946_684_800,
+          genesis_balance: null,
+          genesis_index: null,
+        },
+      ]);
+    });
+  });
+
+  describe('Xahau', () => {
+    it('uses XAH as the native currency and an empty issuer', () => {
+      const built = buildLedgerRows(sampleLedger(), XAHAU);
+      expect(built.payments.map((p) => [p.currency, p.issuer])).toEqual([
+        ['XAH', ''],
+        ['XAH', ''],
+      ]);
+      expect(built.balanceChanges.filter((r) => r.counterparty === '').every((r) => r.currency === 'XAH')).toBe(true);
+    });
+  });
+
+  describe('input handling', () => {
+    it('does not modify its deep-frozen input and is deterministic', () => {
+      const frozen = sampleLedger();
+      expect(isDeepFrozen(frozen)).toBe(true);
+      const before = JSON.stringify(frozen);
+
+      const first = buildLedgerRows(frozen, XRPL);
+      const second = buildLedgerRows(frozen, XRPL);
+
+      expect(JSON.stringify(frozen)).toBe(before);
+      expect(second).toEqual(first);
+    });
+
+    it('returns output that is not frozen and shares no object with the input', () => {
+      const frozen = deepFreeze(sampleLedger());
+      const built = buildLedgerRows(frozen, XRPL);
+      expect(Object.isFrozen(built.ledger)).toBe(false);
+      expect(Object.isFrozen(built.ledger.type_counts)).toBe(false);
+      expect(Object.isFrozen(built.transactions)).toBe(false);
+    });
+
+    it('rejects a transaction with no usable Fee instead of storing a bad fee', () => {
+      const bad = ledgerOf([
+        rawTx({ TransactionType: 'AccountSet', Account: SENDER, Fee: '1.5' }, 0, 'F'.repeat(64), []),
+      ]);
+      expect(() => buildLedgerRows(bad, XRPL)).toThrow(/Fee/);
+    });
+
+    it('treats a missing Fee as 0 (pseudo-transactions)', () => {
+      const pseudo = ledgerOf([
+        {
+          TransactionType: 'EnableAmendment',
+          Account: 'rrrrrrrrrrrrrrrrrrrrrhoLvTp',
+          Sequence: 0,
+          hash: 'F'.repeat(64),
+          metaData: { TransactionIndex: 0, TransactionResult: 'tesSUCCESS', AffectedNodes: [] },
+        },
+      ]);
+      const built = buildLedgerRows(pseudo, XRPL);
+      expect(built.transactions[0].fee).toBe('0');
+      expect(built.ledger.fee_total).toBe('0');
+      expect(built.ledger.fee_min).toBe('0');
+    });
+  });
+});
+
+describe('CHILD_TABLES', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once', () => {
+    const tables = CHILD_TABLES.map(([table]) => table);
+    expect(new Set(tables).size).toBe(tables.length);
+    expect([...tables].sort()).toEqual(
+      [
+        Table.Transactions,
+        Table.TxByHash,
+        Table.TxByType,
+        Table.AccountTransactions,
+        Table.AccountTxBySequence,
+        Table.Payments,
+        Table.PaymentsByCurrency,
+        Table.AccountPayments,
+        Table.Exchanges,
+        Table.AccountExchanges,
+        Table.BalanceChanges,
+        Table.AccountsCreated,
+      ].sort(),
+    );
+  });
+
+  it('points each table at the LedgerRows property that holds its rows', () => {
+    const expected = new Map(ROW_KEY);
+    for (const [table, key] of CHILD_TABLES) expect(expected.get(table)).toBe(key);
+    const covered = new Set(CHILD_TABLES.map(([, key]) => key as string));
+    expect(Object.keys(buildLedgerRows(sampleLedger(), XRPL)).sort()).toEqual(
+      [...covered, 'ledger', 'ledgerByHash'].sort(),
+    );
+  });
+
+  it('holds arrays of rows for every child property', () => {
+    const built = buildLedgerRows(sampleLedger(), XRPL);
+    for (const [, key] of CHILD_TABLES) expect(Array.isArray(built[key])).toBe(true);
+  });
+});
+
+// -- Invariants over all fixtures -------------------------------------------------------------------------------
+
+/** Row fields that hold an exact decimal amount (a String column). */
+const AMOUNT_FIELDS = new Set([
+  'amount',
+  'delivered_amount',
+  'max_amount',
+  'base_amount',
+  'counter_amount',
+  'rate',
+  'amount_change',
+  'final_balance',
+  'initial_balance',
+  'genesis_balance',
+  'escrow_balance_change',
+  'paychannel_fund_change',
+  'paychannel_fund_final_balance',
+  'paychannel_final_balance',
+  'paychannel_balance_change',
+]);
+
+/** Row fields that hold drops as an unsigned integer string. */
+const DROPS_FIELDS = new Set(['fee', 'fee_total', 'fee_min', 'fee_max', 'total_coins']);
+
+describe.each(SETS)('invariants over $name', (set) => {
+  const built = () => builtOf(set);
+
+  it('loads fixtures, and every input ledger is deep-frozen (e)', () => {
+    expect(built().length).toBeGreaterThan(0);
+    for (const { raw } of built()) expect(isDeepFrozen(raw)).toBe(true);
+  });
+
+  it('is deterministic and leaves the input unchanged (e)', () => {
+    for (const { raw, rows } of built().slice(0, 12)) {
+      const before = JSON.stringify(raw);
+      expect(buildLedgerRows(raw, set.ctx)).toEqual(rows);
+      expect(JSON.stringify(raw)).toBe(before);
+    }
+  });
+
+  describe('(a) the ORDER BY key of every table is unique', () => {
+    it.each(ROW_KEY)('%s', (table, key) => {
+      const columns = orderByColumns(table);
+      expect(columns.length).toBeGreaterThan(0);
+
+      const rows = collect(built(), key);
+      const seen = new Set<string>();
+      for (const row of rows) {
+        for (const column of columns) expect(row[column]).toBeDefined();
+        const id = JSON.stringify(columns.map((c) => row[c]));
+        if (seen.has(id)) throw new Error(`${table}: duplicate key ${id}`);
+        seen.add(id);
+      }
+      expect(seen.size).toBe(rows.length);
+    });
+  });
+
+  it('never produces an undefined value or a non-finite number (JSON would drop or null them)', () => {
+    const problems: string[] = [];
+    for (const [, key] of ROW_KEY) {
+      for (const row of collect(built(), key)) {
+        for (const [field, value] of Object.entries(row)) {
+          if (value === undefined) problems.push(`${key}.${field} is undefined`);
+          if (typeof value === 'number' && !Number.isFinite(value)) problems.push(`${key}.${field} is ${value}`);
+        }
+      }
+    }
+    expect(problems).toEqual([]);
+  });
+
+  it('(b) every amount field is an exact string that parses as a finite BigNumber', () => {
+    const problems: string[] = [];
+    let checked = 0;
+    for (const [, key] of ROW_KEY) {
+      for (const row of collect(built(), key)) {
+        for (const [field, value] of Object.entries(row)) {
+          if (value === null) continue;
+          if (AMOUNT_FIELDS.has(field)) {
+            if (typeof value !== 'string' || !new BigNumber(value).isFinite())
+              problems.push(`${key}.${field}=${value}`);
+            checked++;
+          } else if (DROPS_FIELDS.has(field)) {
+            if (typeof value !== 'string' || !/^\d+$/.test(value)) problems.push(`${key}.${field}=${value}`);
+            checked++;
+          } else if (field.endsWith('_f')) {
+            // The Float64 shadow is Number() of its string.
+            if (!Object.is(value, Number(row[field.slice(0, -2)]))) problems.push(`${key}.${field}=${value}`);
+            checked++;
+          }
+        }
+        if (key === 'payments') {
+          for (const side of [row.source_balance_changes, row.destination_balance_changes]) {
+            for (const change of JSON.parse(side) as Json[]) {
+              if (typeof change.value !== 'string' || !new BigNumber(change.value).isFinite()) {
+                problems.push(`payments balance change ${JSON.stringify(change)}`);
+              }
+              checked++;
+            }
+          }
+        }
+      }
+    }
+    expect(problems).toEqual([]);
+    expect(checked).toBeGreaterThan(1000);
+  });
+
+  it('(d) the ledger summary agrees with the rows', () => {
+    for (const { raw, rows } of built()) {
+      expect(rows.ledger.tx_count).toBe(rows.transactions.length);
+      expect(rows.transactions).toHaveLength(raw.transactions.length);
+      expect(rows.txByHash).toHaveLength(rows.transactions.length);
+      expect(rows.txByType).toHaveLength(rows.transactions.length);
+      expect(rows.accountTxBySequence).toHaveLength(rows.transactions.length);
+      expect(rows.ledger.payments_count).toBe(rows.payments.length);
+      expect(rows.paymentsByCurrency).toHaveLength(rows.payments.length);
+      expect(rows.accountPayments).toHaveLength(rows.payments.length * 2);
+      expect(rows.ledger.exchanges_count).toBe(rows.exchanges.length);
+      expect(rows.ledger.accounts_created).toBe(rows.accountsCreated.length);
+      expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
+
+      const sum = (counts: Record<string, number>) => Object.values(counts).reduce((a, b) => a + b, 0);
+      expect(sum(rows.ledger.type_counts)).toBe(rows.ledger.tx_count);
+      expect(sum(rows.ledger.result_counts)).toBe(rows.ledger.tx_count);
+
+      const fees = rows.transactions.map((r) => BigInt(r.fee));
+      expect(rows.ledger.fee_total).toBe(fees.reduce((a, b) => a + b, 0n).toString());
+      expect(rows.ledger.fee_max).toBe(fees.reduce((a, b) => (b > a ? b : a), 0n).toString());
+      expect(rows.ledger.fee_min).toBe(fees.length ? fees.reduce((a, b) => (b < a ? b : a)).toString() : '0');
+    }
+  });
+
+  it('every row of a transaction carries the ledger close time, index and the transaction hash', () => {
+    for (const { raw, rows } of built()) {
+      const hashes = new Map(rows.transactions.map((r) => [r.tx_index, r.hash]));
+      for (const [, key] of CHILD_TABLES) {
+        for (const row of rows[key] as Json[]) {
+          expect(row.ledger_index).toBe(raw.header.ledger_index);
+          if ('close_time' in row) expect(row.close_time).toBe(raw.header.close_time);
+          if ('inception' in row) expect(row.inception).toBe(raw.header.close_time);
+          if ('tx_hash' in row) expect(row.tx_hash).toBe(hashes.get(row.tx_index));
+        }
+      }
+    }
+  });
+
+  it('native rows have an empty issuer and counterparty, issued rows do not', () => {
+    for (const { rows } of built()) {
+      for (const row of [...rows.payments, ...rows.accountPayments]) {
+        if (row.currency === set.ctx.nativeCurrency) expect(row.issuer).toBe('');
+      }
+      for (const row of rows.balanceChanges) {
+        if (row.currency === set.ctx.nativeCurrency && row.counterparty === '') continue;
+        expect(row.counterparty).not.toBe('');
+      }
+      for (const row of rows.exchanges) {
+        if (row.base_issuer === '') expect(row.base_currency).toBe(set.ctx.nativeCurrency);
+        if (row.counter_issuer === '') expect(row.counter_currency).toBe(set.ctx.nativeCurrency);
+      }
+    }
+  });
+
+  describe('(c) conservation (rulings R4, R4b)', () => {
+    /** Escrow and PayChannel move native currency into objects that are not AccountRoots. */
+    const movesNativeIntoObjects = (type: string) => type.startsWith('Escrow') || type.startsWith('PaymentChannel');
+
+    /** Xahau: rewards, genesis mints and imports mint XAH, and hooks may emit and rebate. */
+    const xahauExempt = (tx: Json, meta: Json) =>
+      ['ClaimReward', 'GenesisMint', 'Import'].includes(tx.TransactionType) ||
+      tx.EmitDetails !== undefined ||
+      meta.EmitDetails !== undefined ||
+      meta.HookExecutions !== undefined;
+
+    const exempt = (tx: Json, meta: Json): boolean =>
+      movesNativeIntoObjects(tx.TransactionType) || (set.ctx.nativeCurrency === 'XAH' && xahauExempt(tx, meta));
+
+    it('sums to zero per issued currency and trustline, and to -Fee for the native currency', () => {
+      let nativeChecked = 0;
+      let nativeExempt = 0;
+      let lines = 0;
+      let txs = 0;
+
+      for (const { raw, rows } of built()) {
+        const byTx = new Map<number, typeof rows.balanceChanges>();
+        for (const row of rows.balanceChanges) byTx.set(row.tx_index, [...(byTx.get(row.tx_index) ?? []), row]);
+
+        for (const t of raw.transactions) {
+          txs++;
+          const index = t.meta.TransactionIndex as number;
+          const changes = byTx.get(index) ?? [];
+
+          // Issued currencies: both sides of every trustline cancel.
+          const sums = new Map<string, BigNumber>();
+          for (const row of changes) {
+            if (row.counterparty === '') continue;
+            const pair = [row.account, row.counterparty].sort().join('|');
+            const id = `${row.currency}|${pair}`;
+            sums.set(id, (sums.get(id) ?? new BigNumber(0)).plus(row.amount_change));
+          }
+          for (const [id, sum] of sums) expect([t.hash, id, sum.toString()]).toEqual([t.hash, id, '0']);
+          lines += sums.size;
+
+          // Native currency: the fee is burned, nothing else is created or destroyed.
+          if (exempt(t.tx, t.meta)) {
+            nativeExempt++;
+            continue;
+          }
+          const native = changes.filter((r) => r.counterparty === '' && r.currency === set.ctx.nativeCurrency);
+          const total = native.reduce((acc, r) => acc.plus(r.amount_change), new BigNumber(0));
+          const fee = new BigNumber(t.tx.Fee as string).dividedBy(1_000_000).negated();
+          expect([t.hash, t.tx.TransactionType, total.toString()]).toEqual([
+            t.hash,
+            t.tx.TransactionType,
+            fee.toString(),
+          ]);
+          nativeChecked++;
+        }
+      }
+
+      // The check must really have run: not skipped by exemptions, not vacuous.
+      expect(nativeChecked + nativeExempt).toBe(txs);
+      expect(nativeChecked).toBeGreaterThanOrEqual(set.minNativeChecked);
+      expect(lines).toBeGreaterThanOrEqual(set.minTrustlinesChecked);
+    });
+  });
+});
+
+describe('ripple-mock ground truth', () => {
+  it('finds 182 payments over the 54 mock ledgers', () => {
+    const built = builtOf(SETS[0]);
+    expect(built).toHaveLength(54);
+    expect(built.reduce((sum, b) => sum + b.rows.payments.length, 0)).toBe(182);
+    expect(built.reduce((sum, b) => sum + b.rows.ledger.payments_count, 0)).toBe(182);
+  });
+
+  it('counts exchanges, not transactions, in exchanges_count (158 consumed offers)', () => {
+    const built = builtOf(SETS[0]);
+    expect(built.reduce((sum, b) => sum + b.rows.ledger.exchanges_count, 0)).toBe(158);
+    expect(built.reduce((sum, b) => sum + b.rows.exchanges.length, 0)).toBe(158);
+  });
+});

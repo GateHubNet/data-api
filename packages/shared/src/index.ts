@@ -23,6 +23,7 @@ export * from './network';
 export * from './ingest/raw-ledger';
 export * from './ingest/ledger-source';
 export * from './ingest/fixture-ledger-source';
+export * from './ingest/build-rows';
 
 // Utils
 export * from './util/ctid';
