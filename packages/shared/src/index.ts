@@ -33,6 +33,9 @@ export * from './ingest/build-rows';
 export * from './ingest/ledger-writer';
 export * from './ingest/ingest-state';
 
+// Query
+export * from './query/asset';
+
 // Utils
 export * from './util/ctid';
 export * from './util/amount';
