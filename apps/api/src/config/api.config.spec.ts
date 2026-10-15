@@ -53,6 +53,7 @@ describe('ApiConfig (GH_* environment)', () => {
       rateLimit: 600,
       rateLimitWindow: 60,
       liveCacheTtlMs: 10000,
+      txCacheSize: 20000,
       trustProxyHops: 1,
       cacheControl: 'public, max-age=60',
     });
@@ -69,6 +70,7 @@ describe('ApiConfig (GH_* environment)', () => {
       GH_RATE_LIMIT: '50',
       GH_RATE_LIMIT_WINDOW: '10',
       GH_LIVE_CACHE_TTL_MS: '0',
+      GH_TX_CACHE_SIZE: '0',
       GH_TRUST_PROXY_HOPS: '0',
       GH_CACHE_CONTROL: 'public, max-age=5',
     });
@@ -83,6 +85,7 @@ describe('ApiConfig (GH_* environment)', () => {
       rateLimit: 50,
       rateLimitWindow: 10,
       liveCacheTtlMs: 0,
+      txCacheSize: 0,
       trustProxyHops: 0,
       cacheControl: 'public, max-age=5',
     });
@@ -164,6 +167,8 @@ describe('ApiConfig (GH_* environment)', () => {
     ['GH_RATE_LIMIT', '1e3', 'GH_RATE_LIMIT must be a positive integer'],
     ['GH_RATE_LIMIT_WINDOW', '-5', 'GH_RATE_LIMIT_WINDOW must be a positive integer'],
     ['GH_LIVE_CACHE_TTL_MS', '-1', 'GH_LIVE_CACHE_TTL_MS must be a non-negative integer'],
+    ['GH_TX_CACHE_SIZE', '-1', 'GH_TX_CACHE_SIZE must be a non-negative integer'],
+    ['GH_TX_CACHE_SIZE', 'lots', 'GH_TX_CACHE_SIZE must be a non-negative integer'],
     ['GH_TRUST_PROXY_HOPS', 'one', 'GH_TRUST_PROXY_HOPS must be a non-negative integer'],
     ['GH_CACHE_CONTROL', 'public\nmax-age=60', 'GH_CACHE_CONTROL must be printable ASCII'],
   ])('rejects %s=%j, naming the variable', async (name, value, message) => {

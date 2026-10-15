@@ -74,6 +74,7 @@ export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
   private source: DefinitionsSource = 'builtin';
   private retry?: NodeJS.Timeout;
   private destroyed = false;
+  private generationNo = 0;
 
   constructor(
     private readonly xrpl: XrplService,
@@ -96,6 +97,14 @@ export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
     this.destroyed = true;
     clearTimeout(this.retry);
     this.retry = undefined;
+  }
+
+  /**
+   * Changes each time other definitions are put to use. What was serialized under an earlier generation may differ
+   * (a field that is now known, a different order), so a cache of serializations is only good for one.
+   */
+  get generation(): number {
+    return this.generationNo;
   }
 
   /** Where the definitions in use came from. */
@@ -159,6 +168,7 @@ export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
   private use(definitions: XrplDefinitionsBase, source: DefinitionsSource): void {
     this.definitions = definitions;
     this.source = source;
+    this.generationNo += 1;
   }
 
   private scheduleRetry(): void {

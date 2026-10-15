@@ -1,5 +1,6 @@
 import { ClickHouseService, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
+import { LruCache } from './lru-cache';
 
 /** A resolution is cached only when the bound it answers is older than this: that part of the history is settled. */
 export const RANGE_CACHE_MIN_AGE_MS = 60 * 60 * 1000;
@@ -13,43 +14,6 @@ export const RANGE_CACHE_MAX_ENTRIES = 10_000;
 export const RANGE_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const MAX_UINT32 = 4_294_967_295;
-
-interface Entry<V> {
-  value: V;
-  storedAt: number;
-}
-
-/** Least recently used cache with a size cap and a time to live, on the insertion order of a `Map`. */
-export class LruCache<V> {
-  private readonly entries = new Map<string, Entry<V>>();
-
-  constructor(
-    private readonly maxEntries: number,
-    private readonly ttlMs: number,
-  ) {}
-
-  get size(): number {
-    return this.entries.size;
-  }
-
-  get(key: string): V | undefined {
-    const entry = this.entries.get(key);
-    if (!entry) return undefined;
-    this.entries.delete(key);
-    if (Date.now() - entry.storedAt > this.ttlMs) return undefined;
-    this.entries.set(key, entry); // most recently used again
-    return entry.value;
-  }
-
-  set(key: string, value: V): void {
-    this.entries.delete(key);
-    this.entries.set(key, { value, storedAt: Date.now() });
-    if (this.entries.size > this.maxEntries) {
-      const oldest = this.entries.keys().next().value;
-      if (oldest !== undefined) this.entries.delete(oldest);
-    }
-  }
-}
 
 /** Whether the bound lies far enough in the past for its answer to be remembered (see `RANGE_CACHE_MIN_AGE_MS`). */
 function isSettled(secs: number): boolean {

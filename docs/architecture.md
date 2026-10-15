@@ -132,5 +132,5 @@ never takes the API down. They share only the ClickHouse database and the shared
 ## Technology summary
 NestJS 10 (TypeScript, strict) · ClickHouse · `@clickhouse/client` · `xrpl` · pnpm workspace ·
 `@gatehub/toolbox` (config/logger/bootstrap) · Prometheus (`prom-client`) · `@nestjs/terminus`
-(health) · `@nestjs/swagger` (OpenAPI) · Docker (public `node:20-bookworm-slim`) · testcontainers
+(health) · `@nestjs/swagger` (OpenAPI) · Docker (public `node:22.23.2-bookworm-slim`, Node ≥ 20.19) · testcontainers
 (integration tests) · k6 (load tests).

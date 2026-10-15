@@ -114,6 +114,15 @@ export class ApiConfig {
   @IntValue({ min: 0 })
   liveCacheTtlMs: number = 10000;
 
+  /**
+   * `GH_TX_CACHE_SIZE`: how many transactions' serialized forms (the decoded JSON and the binary hex that the responses
+   * are made of) are kept in memory by transaction hash, to spare the codec on repeated requests. A transaction never
+   * changes, so nothing expires; each entry is a few KB. 0 disables the cache.
+   */
+  @ConfigValue()
+  @IntValue({ min: 0 })
+  txCacheSize: number = 20000;
+
   /** `GH_TRUST_PROXY_HOPS`: reverse-proxy hops whose `X-Forwarded-For` is trusted for the client address. */
   @ConfigValue()
   @IntValue({ min: 0 })

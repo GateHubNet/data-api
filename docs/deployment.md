@@ -39,7 +39,7 @@ Key points:
 ## Build
 
 Both images build from the **repo root** (the build context is the whole workspace) on the
-public `node:20-bookworm-slim` base and run as the non-root `node` user.
+public `node:22.23.2-bookworm-slim` base (Node ≥ 20.19 is required) and run as the non-root `node` user.
 
 ```bash
 # NPM_TOKEN is needed only at BUILD time, to install the private @gatehub/toolbox.

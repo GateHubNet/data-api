@@ -329,7 +329,7 @@ pnpm's workspace symlinks (the `workspace:*` link from each app to `@gatehub/dat
 The per-tx tables are `ReplacingMergeTree` and the analytics targets are `Summing`/`AggregatingMergeTree`. `... FINAL` forces a merge-on-read across all parts, which **OOMs under concurrency** on large tables. For lists and aggregates, rely on background merges plus **query-time de-dup/aggregation**: `argMax`/`argMaxMerge` for latest-wins (see `network.service.ts`), `sum() ... GROUP BY` for counters (see `stats.service.ts`). `FINAL` is acceptable only for **single-row point lookups** by primary key (e.g. one tx by `hash`, one ledger, one account — see `transactions`/`ledgers`/`accounts` services), where it touches a tiny range.
 
 **d. `node:*-slim` has no `wget`/`curl` — health checks use Node `fetch`.**
-The runtime image is `node:20-bookworm-slim`, which ships **no** `wget`/`curl`. Container health checks therefore use Node's global `fetch` against `/liveliness/healthz`, e.g.:
+The runtime image is `node:22.23.2-bookworm-slim`, which ships **no** `wget`/`curl`. Container health checks therefore use Node's global `fetch` against `/liveliness/healthz`, e.g.:
 
 ```yaml
 test: ['CMD', 'node', '-e', "fetch('http://localhost:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]

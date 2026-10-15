@@ -1,7 +1,6 @@
 import type { ClickHouseService } from '@gatehub/data-api-shared';
 import {
   LedgerRangeResolver,
-  LruCache,
   RANGE_CACHE_MAX_ENTRIES,
   RANGE_CACHE_MIN_AGE_MS,
   RANGE_CACHE_TTL_MS,
@@ -309,43 +308,12 @@ describe('LedgerRangeResolver', () => {
   });
 });
 
-describe('LruCache', () => {
+describe('LedgerRangeResolver cache size', () => {
   beforeEach(() => jest.spyOn(Date, 'now').mockReturnValue(NOW));
   afterEach(() => jest.restoreAllMocks());
 
   it('is capped at 10k entries', () => {
     expect(RANGE_CACHE_MAX_ENTRIES).toBe(10_000);
-  });
-
-  it('evicts the least recently used entry beyond its capacity', () => {
-    const cache = new LruCache<number>(3, 1000);
-    cache.set('a', 1);
-    cache.set('b', 2);
-    cache.set('c', 3);
-    expect(cache.get('a')).toBe(1); // a is now the most recent
-    cache.set('d', 4); // evicts b
-    expect(cache.get('b')).toBeUndefined();
-    expect([cache.get('a'), cache.get('c'), cache.get('d')]).toEqual([1, 3, 4]);
-    expect(cache.size).toBe(3);
-  });
-
-  it('replacing a key does not grow it', () => {
-    const cache = new LruCache<number>(2, 1000);
-    cache.set('a', 1);
-    cache.set('a', 2);
-    cache.set('b', 3);
-    expect(cache.size).toBe(2);
-    expect(cache.get('a')).toBe(2);
-  });
-
-  it('drops an entry once its time to live has passed', () => {
-    const cache = new LruCache<number>(2, 1000);
-    cache.set('a', 1);
-    jest.spyOn(Date, 'now').mockReturnValue(NOW + 1000);
-    expect(cache.get('a')).toBe(1);
-    jest.spyOn(Date, 'now').mockReturnValue(NOW + 1001);
-    expect(cache.get('a')).toBeUndefined();
-    expect(cache.size).toBe(0);
   });
 
   it('holds 10k resolutions and no more through the resolver', async () => {

@@ -362,6 +362,26 @@ describe('BinaryCodecService', () => {
       expect(jest.getTimerCount()).toBe(0);
     });
 
+    it('counts a generation of definitions: it changes each time other definitions are put to use', async () => {
+      let up = false;
+      const node = nodeWith(() => {
+        if (!up) throw new Error('No node connection');
+        return XAHAU_SERVER_DEFINITIONS;
+      });
+      const codec = new BinaryCodecService(node.xrpl, getNetworkProfile('xrpl'));
+      const initial = codec.generation;
+      await codec.onModuleInit(); // the bundled XRPL definitions
+      const bundled = codec.generation;
+      expect(bundled).not.toBe(initial);
+      await jest.advanceTimersByTimeAsync(DEFINITIONS_RETRY_MS); // still no node
+      expect(codec.generation).toBe(bundled);
+      up = true;
+      await jest.advanceTimersByTimeAsync(DEFINITIONS_RETRY_MS);
+      expect(codec.definitionsSource).toBe('node');
+      expect(codec.generation).not.toBe(bundled);
+      codec.onModuleDestroy();
+    });
+
     it('onModuleDestroy cancels the retry', async () => {
       const node = nodeDown();
       const { codec } = await started('xrpl', node);

@@ -86,6 +86,7 @@ vars from §2.
 | `GH_RATE_LIMIT_WINDOW` | No | `60` | Rate-limit window in **seconds**. Numeric, fail-fast. |
 | `GH_TRUST_PROXY_HOPS` | No | `1` | Number of reverse-proxy hops to trust for `X-Forwarded-For` (Express `trust proxy`). The service runs behind the GateHub proxy (TLS termination); `1` trusts that single hop. Numeric, fail-fast. |
 | `GH_LIVE_CACHE_TTL_MS` | No | `10000` | TTL (ms) for cached live-XRPL responses (account balances / open orders). `0` disables caching. Numeric, fail-fast. |
+| `GH_TX_CACHE_SIZE` | No | `20000` | Transactions whose serialized form (decoded JSON and binary hex) the API keeps in memory by hash, so repeated requests do not re-run the binary codec (0.7-1.5 ms per transaction). A transaction never changes, so entries do not expire; each is a few KB. `0` disables the cache. Non-negative integer, fail-fast. |
 | `GH_XRPL_NODE_ENDPOINT` | No | `wss://xrplcluster.com` | XRPL node used for live account state (balances, open orders). |
 
 ### Service / logger / runtime variables (used by `@gatehub/toolbox` + Nest)
@@ -225,6 +226,7 @@ GH_RATE_LIMIT=600
 GH_RATE_LIMIT_WINDOW=60
 GH_TRUST_PROXY_HOPS=1
 GH_LIVE_CACHE_TTL_MS=10000
+GH_TX_CACHE_SIZE=20000
 GH_XRPL_NODE_ENDPOINT=wss://xrplcluster.com
 
 # logging

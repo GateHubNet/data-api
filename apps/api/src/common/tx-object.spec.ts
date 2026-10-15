@@ -10,6 +10,7 @@ import {
   transactionId,
   XRPL_RECORDED_DIR,
 } from '../../test/support/fixtures';
+import { ApiConfig } from '../config/api.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import type { XrplService } from '../xrpl/xrpl.service';
 import { BinaryCodecService } from './binary-codec.service';
@@ -35,14 +36,19 @@ interface Services {
   prometheus: PrometheusService;
 }
 
-async function serviceFor(network: NetworkName, node: XrplService = noNode): Promise<Services> {
+/**
+ * A TxService on a codec that has the definitions of `network`. `txCacheSize` is `GH_TX_CACHE_SIZE`: 0 (off) unless a
+ * test is about the cache, because most tests change a row and keep its hash, which the cache would answer from.
+ */
+async function serviceFor(network: NetworkName, node: XrplService = noNode, txCacheSize = 0): Promise<Services> {
   const profile = getNetworkProfile(network);
   const codec = new BinaryCodecService(node, profile);
   await codec.onModuleInit();
   codec.onModuleDestroy(); // no retry timer in a unit test
   const prometheus = new PrometheusService();
   warn.mockClear(); // the codec's own warning about its fallback definitions is not what the tests look at
-  return { service: new TxService({} as ClickHouseService, codec, profile, prometheus), codec, prometheus };
+  const config = Object.assign(new ApiConfig(), { txCacheSize });
+  return { service: new TxService({} as ClickHouseService, codec, profile, prometheus, config), codec, prometheus };
 }
 
 /** How often a transaction was served as stored JSON because it could not be serialized, per mode, so far. */
@@ -560,6 +566,212 @@ describe('TxService.toTxObject', () => {
         binary: 0,
       });
       expect(typeof fine.tx).toBe('string');
+    });
+  });
+
+  describe('the cache of canonical forms (ruling R41)', () => {
+    const row = () => fixtureTransaction('ripple-mock', MOCK_PAYMENT).row;
+    const another = () => fixtureTransactions('ripple-mock')[3].row;
+    const spies = (codec: BinaryCodecService) => ({
+      encode: jest.spyOn(codec, 'encode'),
+      decode: jest.spyOn(codec, 'decode'),
+    });
+
+    it.each([false, true])(
+      'answers a second request for a transaction without the codec (binary: %s)',
+      async (binary) => {
+        const { service, codec } = await serviceFor('xrpl', noNode, 100);
+        const first = service.toTxObject(row(), { binary, ledgerHash: 'AB'.repeat(32) });
+        const { encode, decode } = spies(codec);
+        const second = service.toTxObject(row(), { binary, ledgerHash: 'AB'.repeat(32) });
+        expect(encode).not.toHaveBeenCalled();
+        expect(decode).not.toHaveBeenCalled();
+        expect(JSON.stringify(second)).toBe(JSON.stringify(first)); // same values, same field order
+        expect(second).toEqual(first);
+      },
+    );
+
+    it('serves the same output as without a cache', async () => {
+      const cached = await serviceFor('xahau', noNode, 100);
+      const plain = await serviceFor('xahau', noNode, 0);
+      for (const { row } of fixtureTransactions('xahau-recorded').slice(0, 40)) {
+        for (const binary of [false, true]) {
+          cached.service.toTxObject(row, { binary }); // fills the cache
+          const hit = cached.service.toTxObject(row, { binary });
+          expect(JSON.stringify(hit)).toBe(JSON.stringify(plain.service.toTxObject(row, { binary })));
+        }
+      }
+    });
+
+    it('keeps JSON and binary apart: a JSON request does not answer a binary one', async () => {
+      const { service } = await serviceFor('xrpl', noNode, 100);
+      expect(typeof service.toTxObject(row(), { binary: false }).tx).toBe('object');
+      expect(typeof service.toTxObject(row(), { binary: true }).tx).toBe('string');
+      expect(typeof service.toTxObject(row(), { binary: false }).tx).toBe('object');
+    });
+
+    it('hands out copies: changing a returned object changes nothing the next request gets', async () => {
+      const { service } = await serviceFor('xrpl', noNode, 100);
+      const pristine = JSON.stringify(service.toTxObject(row(), { binary: false }));
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        // the first pass vandalizes the object of a cache miss, the second one that of a hit
+        const obj = service.toTxObject(row(), { binary: false });
+        const tx = obj.tx as Record<string, any>;
+        const meta = obj.meta as Record<string, any>;
+        tx.Fee = 'vandalized';
+        tx.SigningPubKey = undefined;
+        delete tx.Account;
+        meta.AffectedNodes.length = 0;
+        meta.AffectedNodes.push({ vandal: true });
+        meta.TransactionResult = 'tecVANDAL';
+        meta.delivered_amount = 'vandalized';
+        (obj as unknown as Record<string, unknown>).hash = 'vandalized';
+        expect(JSON.stringify(service.toTxObject(row(), { binary: false }))).toBe(pristine);
+      }
+    });
+
+    it('injects delivered_amount onto a copy: the entry holds the canonical form without it', async () => {
+      const { service } = await serviceFor('xrpl', noNode, 100);
+      const first = service.toTxObject(row(), { binary: false });
+      expect((first.meta as Record<string, unknown>).delivered_amount).toBe('300000000');
+      // the same transaction in another ledger context (a partial payment before the fix) works out its own value
+      const partial = rowOf('ripple-mock', MOCK_PAYMENT);
+      const otherContext = service.toTxObject({ ...partial, ledger_index: 4594094 }, { binary: false });
+      expect((otherContext.meta as Record<string, unknown>).delivered_amount).toBe('300000000');
+      const again = service.toTxObject(row(), { binary: false });
+      expect(again.meta).not.toBe(first.meta);
+      expect((again.meta as Record<string, unknown>).delivered_amount).toBe('300000000');
+    });
+
+    it('does not cache at all when GH_TX_CACHE_SIZE is 0', async () => {
+      const { service, codec } = await serviceFor('xrpl', noNode, 0);
+      service.toTxObject(row(), { binary: false });
+      const { encode } = spies(codec);
+      service.toTxObject(row(), { binary: false });
+      expect(encode).toHaveBeenCalledTimes(2); // transaction and metadata, again
+    });
+
+    it('holds at most GH_TX_CACHE_SIZE entries and drops the least recently used first', async () => {
+      const { service, codec } = await serviceFor('xrpl', noNode, 2);
+      const [a, b, c] = fixtureTransactions('ripple-mock')
+        .slice(0, 3)
+        .map((t) => t.row);
+      for (const r of [a, b]) service.toTxObject(r, { binary: false });
+      service.toTxObject(a, { binary: false }); // a is the most recent again
+      service.toTxObject(c, { binary: false }); // evicts b
+      const { encode } = spies(codec);
+      service.toTxObject(a, { binary: false });
+      service.toTxObject(c, { binary: false });
+      expect(encode).not.toHaveBeenCalled();
+      service.toTxObject(b, { binary: false });
+      expect(encode).toHaveBeenCalledTimes(2);
+    });
+
+    it('is dropped when the codec switches to other definitions', async () => {
+      const { service, codec } = await serviceFor('xrpl', noNode, 100);
+      service.toTxObject(row(), { binary: false });
+      service.toTxObject(row(), { binary: true });
+      const { encode } = spies(codec);
+      service.toTxObject(row(), { binary: false });
+      expect(encode).not.toHaveBeenCalled();
+
+      jest.spyOn(codec, 'generation', 'get').mockReturnValue(codec.generation + 1); // the node answered at last
+      service.toTxObject(row(), { binary: false });
+      service.toTxObject(row(), { binary: true });
+      expect(encode).toHaveBeenCalledTimes(4);
+      service.toTxObject(row(), { binary: false });
+      expect(encode).toHaveBeenCalledTimes(4); // and fills again
+    });
+
+    it('does not cache a transaction that fell back: it is retried, counted and logged each time', async () => {
+      const { service, prometheus } = await serviceFor('xrpl', noNode, 100);
+      const stubborn = rowOf('ripple-mock', MOCK_PAYMENT, (tx) => {
+        tx.Mystery = 'AB';
+      });
+      const counted = await fallbacksDuring(prometheus, () => {
+        service.toTxObject(stubborn, { binary: false });
+        service.toTxObject(stubborn, { binary: false });
+      });
+      expect(counted.json).toBe(2);
+      expect(warn).toHaveBeenCalledTimes(2);
+    });
+
+    it('is keyed by the transaction hash alone: a transaction never changes', async () => {
+      const { service } = await serviceFor('xrpl', noNode, 100);
+      service.toTxObject(row(), { binary: false });
+      const stubborn = rowOf('ripple-mock', MOCK_PAYMENT, (tx) => {
+        tx.Mystery = 'AB';
+      });
+      // same hash, other content: the cache is keyed by hash, as a transaction never changes
+      expect(service.toTxObject(stubborn, { binary: false }).tx).not.toHaveProperty('Mystery');
+    });
+  });
+
+  describe('toTxObjects: a page, converted without holding up the event loop (ruling R41)', () => {
+    const page = (n: number) =>
+      fixtureTransactions('ripple-mock')
+        .slice(0, n)
+        .map((t) => t.row);
+    const yields = async (n: number) => {
+      const { service } = await serviceFor('xrpl');
+      const rows = page(n);
+      const spy = jest.spyOn(global, 'setImmediate');
+      await service.toTxObjects(rows, { binary: false });
+      const calls = spy.mock.calls.length;
+      spy.mockRestore();
+      return calls;
+    };
+
+    it('is the same as toTxObject of each row, in order, with the ledger hash of each row', async () => {
+      const { service } = await serviceFor('xrpl');
+      const rows = page(30);
+      const ledgerHashes = new Map(
+        rows.slice(0, 20).map((r) => [r.ledger_index, `${r.ledger_index}`.padStart(64, '0')]),
+      );
+      for (const binary of [false, true]) {
+        const objects = await service.toTxObjects(rows, { binary, ledgerHashes });
+        expect(objects).toEqual(
+          rows.map((r) => service.toTxObject(r, { binary, ledgerHash: ledgerHashes.get(r.ledger_index) })),
+        );
+        expect(objects.map((o) => o.hash)).toEqual(rows.map((r) => r.hash));
+      }
+      expect((await service.toTxObjects(rows, { binary: false, ledgerHashes }))[0]).toHaveProperty('ledger_hash');
+      expect(await service.toTxObjects([], { binary: false })).toEqual([]);
+    });
+
+    it('lets other work run: a callback queued before the call has run before the page is returned', async () => {
+      const { service } = await serviceFor('xrpl');
+      let ran = false;
+      setImmediate(() => {
+        ran = true;
+      });
+      await service.toTxObjects(page(200), { binary: false });
+      expect(ran).toBe(true);
+    });
+
+    it('does so every 50 transactions, not after the last one', async () => {
+      expect(await yields(1)).toBe(0);
+      expect(await yields(50)).toBe(0);
+      expect(await yields(51)).toBe(1);
+      expect(await yields(100)).toBe(1);
+      expect(await yields(101)).toBe(2);
+      expect(await yields(200)).toBe(3);
+    });
+
+    it('serves a stubborn transaction in the page like toTxObject does', async () => {
+      const { service, prometheus } = await serviceFor('xrpl');
+      const rows = page(60);
+      rows[55] = rowOf('ripple-mock', MOCK_PAYMENT, (tx) => {
+        tx.Mystery = 'AB';
+      });
+      let objects: Awaited<ReturnType<TxService['toTxObjects']>> = [];
+      const counted = await fallbacksDuring(prometheus, async () => {
+        objects = await service.toTxObjects(rows, { binary: true });
+      });
+      expect(objects).toHaveLength(60);
+      expect(typeof objects[55].tx).toBe('object');
+      expect(typeof objects[54].tx).toBe('string');
+      expect(counted).toEqual({ json: 0, binary: 1 });
     });
   });
 });

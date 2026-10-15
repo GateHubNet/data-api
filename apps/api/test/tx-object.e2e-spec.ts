@@ -2,6 +2,7 @@ import { getNetworkProfile, NetworkName, TransactionsRow } from '@gatehub/data-a
 import { Logger } from '@nestjs/common';
 import { BinaryCodecService } from '../src/common/binary-codec.service';
 import { TxService } from '../src/common/tx-object';
+import { ApiConfig } from '../src/config/api.config';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
 import type { XrplService } from '../src/xrpl/xrpl.service';
 import { Harness, startHarness } from './harness';
@@ -23,7 +24,8 @@ async function servicesOf(
   await codec.onModuleInit();
   codec.onModuleDestroy();
   const prometheus = new PrometheusService();
-  return { service: new TxService(h.ch, codec, profile, prometheus), codec, prometheus };
+  // the default configuration: a cache of 20000 transactions
+  return { service: new TxService(h.ch, codec, profile, prometheus, new ApiConfig()), codec, prometheus };
 }
 
 const keyOf = (row: Pick<TransactionsRow, 'ledger_index' | 'tx_index'>) => ({
@@ -177,6 +179,19 @@ describe.each<[SeedName, NetworkName]>([
       expect(typeof service.toTxObject(row, { binary: true }).tx).toBe('string');
     }
     expect((await prometheus.txEncodeFallback.get()).values).toEqual(before);
+  });
+
+  it('converts a fetched page with the ledger hashes of its ledgers, as the list endpoints do', async () => {
+    const keys = all.slice(0, 120).map((t) => keyOf(t.row));
+    const rows = await service.fetchByKeys(keys);
+    const ledgerHashes = await service.ledgerHashes(rows.map((r) => r.ledger_index));
+    for (const binary of [false, true, false]) {
+      // the second JSON pass is answered from the cache
+      const objects = await service.toTxObjects(rows, { binary, ledgerHashes });
+      expect(objects.map((o) => o.hash)).toEqual(rows.map((r) => r.hash));
+      expect(objects.map((o) => o.ledger_hash)).toEqual(rows.map((r) => ledgerHashes.get(r.ledger_index)));
+      expect(objects.every((o) => typeof o.tx === (binary ? 'string' : 'object'))).toBe(true);
+    }
   });
 
   it('serves a fetched row as a TxObject with the ledger hash of its ledger', async () => {
