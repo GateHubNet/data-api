@@ -1,5 +1,6 @@
 import {
   awaitQuiescence,
+  buildLedgerRows,
   clickHouseConfigFromEnv,
   ClickHouseService,
   committedCheckpoint,
@@ -99,6 +100,11 @@ interface Chunk {
 }
 
 /** An `ingest_log` chunk whose newest row says 'started'. */
+interface CloseWindow {
+  min: number;
+  max: number;
+}
+
 interface OpenIntent {
   start: number;
   end: number;
@@ -120,10 +126,15 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *
  * **Per chunk** (the key of a chunk in `ingest_log` is `(first ledger, last ledger)` of the chunk):
  *  1. The ledgers of the chunk that are already committed (they have a `ledgers` row) are skipped, unless `reprocess`
- *     is set or the chunk has an unfinished intent: then all of its ledgers are deleted and written again.
+ *     is set or the chunk has an unfinished intent: then all of its ledgers are replaced.
  *  2. `ingest_log` gets a 'started' row (with the `run_id` of the attempt) before anything is deleted or written.
- *  3. The ledgers to write are fetched (up to `concurrency` at once) and written with one `LedgerWriter.write()`.
- *  4. `ingest_log` gets a 'done' row. A chunk with nothing to write is complete without any log row.
+ *  3. The ledgers to write are fetched (up to `concurrency` at once). When they replace committed ones, each is also
+ *     parsed (nothing is kept of that), so that a ledger the source lacks, a node that keeps failing or a parser that
+ *     rejects a ledger leaves the committed chunk untouched.
+ *  4. The live-syncer check (below) is repeated, the old ledgers of a replaced chunk are deleted, and the new ones are
+ *     written with one `LedgerWriter.write()`.
+ *  5. `ingest_log` gets a 'done' row, and `agg_dirty` a row for the chunk. A chunk with nothing to write is complete
+ *     without any log row.
  *
  * **An unfinished intent** is a chunk whose newest `ingest_log` row says 'started': a run died, or gave up, in the middle
  * of it. Any chunk of this run that overlaps one counts as unfinished too, so a run with other bounds or another chunk
@@ -133,17 +144,22 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *
  * **A failed attempt** is recovered as `LedgerWriter` documents (ruling R16): wait until the failed run's queries are gone,
  * delete the ledgers of the chunk that this run was writing (never a ledger it had skipped), wait for that too, and try
- * again with `writer.withNewRunId()`. A fetch that failed needs none of this: nothing was written. A
- * `LedgerNotAvailableError` is never retried or swallowed: it stops the run, and the chunk stays an unfinished intent.
- * After `maxAttempts` the error is thrown the same way.
+ * again with `writer.withNewRunId()`. A fetch that failed needs none of this: nothing was written, and the fetched
+ * ledgers are kept for the next attempt. A `LedgerNotAvailableError`, a ledger the parser rejects and a live syncer
+ * that appeared are never retried: they stop the run, and the chunk stays an unfinished intent. After `maxAttempts` the
+ * error is thrown the same way.
  *
  * **A live syncer** owns everything above its checkpoint (ruling R27): a range that reaches above the committed
- * checkpoint is refused while a lease younger than 30 s (on the server's clock) is held, and is checked again before
- * every chunk in case a live syncer started in the meantime.
+ * checkpoint is refused while a lease younger than 30 s (on the server's clock) is held, and is checked again for every
+ * chunk after its ledgers were fetched, in case a live syncer started in the meantime.
  *
- * **When it ends**, whether or not it failed, one `agg_dirty` row covers the close times of the ledgers it wrote, from the
- * start of the hour of the earliest to the end of the hour of the latest, so that the aggregator recomputes them. (A rerun
- * would skip those ledgers, so the row cannot wait for a run that finishes.)
+ * **`agg_dirty`.** Every chunk that was written gets a row right after its 'done', from the close times of its ledgers,
+ * from the start of the hour of the earliest to the end of the hour of the latest, so that the aggregator recomputes
+ * them. A run that is killed therefore loses no mark of the chunks it finished. The committed ledgers a run skips get one
+ * row at the end (their close times are read from `ledgers`): it also covers chunks that an earlier run finished but
+ * could not mark.
+ *
+ * Two range ingests over overlapping ranges must not run at the same time.
  */
 export async function rangeIngest(
   source: LedgerSource,
@@ -177,13 +193,13 @@ class RangeRunner {
   /** Of `chunksDone`, the chunks that needed no write. */
   private chunksSkipped = 0;
   private ledgersWritten = 0;
-  /** Earliest and latest close time (unix seconds) of the ledgers this run wrote. */
-  private closeWindow?: { min: number; max: number };
+  /** Earliest and latest close time (unix seconds), read from `ledgers`, of the committed ledgers this run skipped. */
+  private skippedWindow?: CloseWindow;
 
   constructor(
     private readonly source: LedgerSource,
     private readonly ch: ClickHouseService,
-    ctx: ParseContext,
+    private readonly ctx: ParseContext,
     opts: RangeIngestOptions,
   ) {
     const { from, to } = opts;
@@ -256,10 +272,11 @@ class RangeRunner {
     }
 
     try {
-      await this.markAggregatesDirty();
+      // The committed ledgers this run skipped: an earlier run may have been killed before it marked them.
+      if (this.skippedWindow) await this.markAggregatesDirty(this.skippedWindow);
     } catch (err) {
       if (failure === undefined) failure = err;
-      else this.logger.error(`Could not mark the ingested hours in agg_dirty: ${describe(err)}`);
+      else this.logger.error(`Could not mark the skipped hours in agg_dirty: ${describe(err)}`);
     }
 
     if (failure !== undefined) throw failure;
@@ -301,10 +318,13 @@ class RangeRunner {
 
   private async ingestChunk(chunk: Chunk): Promise<void> {
     const startedAt = Date.now();
-    const committed = new Set(await this.committedIn(chunk.start, chunk.end));
+    const committed = await this.committedIn(chunk.start, chunk.end);
     const unfinished = this.open.some((intent) => intent.start <= chunk.end && intent.end >= chunk.start);
     const redo = this.reprocess || unfinished;
     const toWrite = redo ? chunk.targets : chunk.targets.filter((i) => !committed.has(i));
+    if (!redo) {
+      for (const index of chunk.targets) this.noteSkipped(committed.get(index));
+    }
     if (toWrite.length === 0) {
       this.chunksSkipped += 1;
       return;
@@ -313,27 +333,36 @@ class RangeRunner {
     const writing = new Set(toWrite);
     const spans = deleteSpans(
       toWrite,
-      [...committed].filter((i) => !writing.has(i)).sort((a, b) => a - b),
+      [...committed.keys()].filter((i) => !writing.has(i)).sort((a, b) => a - b),
     );
 
     const ledgers = await this.writeWithRecovery(chunk, toWrite, spans, redo);
     await this.logIntent(chunk, this.writer.runId, 'done');
+    // Marked now, not when the run ends: a run that is killed would leave these hours unmarked, and its rerun skips them.
+    await this.markAggregatesDirty(closeWindowOf(ledgers));
 
     this.ledgersWritten += ledgers.length;
-    for (const { header } of ledgers) {
-      const window = (this.closeWindow ??= { min: header.close_time, max: header.close_time });
-      window.min = Math.min(window.min, header.close_time);
-      window.max = Math.max(window.max, header.close_time);
-    }
     this.logger.log(
       `Chunk [${chunk.start},${chunk.end}] done in ${Date.now() - startedAt} ms: ${ledgers.length} ledgers written` +
         (redo ? ' (redone)' : `, ${chunk.targets.length - ledgers.length} already committed`),
     );
   }
 
+  private noteSkipped(closeTime: number | undefined): void {
+    if (closeTime === undefined) return;
+    const window = (this.skippedWindow ??= { min: closeTime, max: closeTime });
+    window.min = Math.min(window.min, closeTime);
+    window.max = Math.max(window.max, closeTime);
+  }
+
   /**
    * Fetch `toWrite` and write it, recovering from a failed attempt as the class description says (`maxAttempts` attempts
    * in all). Returns the ledgers written. With `deleteFirst` the `spans` are deleted before the first write.
+   *
+   * Nothing is deleted until the replacement is in hand: the ledgers are fetched, and (before a delete) every one of
+   * them is parsed, so that a missing ledger, a node that keeps failing or a parser that rejects a ledger leaves the
+   * committed rows of the chunk as they were. The live-syncer check is repeated right before the delete and the write,
+   * after the time the fetch took.
    */
   private async writeWithRecovery(
     chunk: Chunk,
@@ -342,16 +371,33 @@ class RangeRunner {
     deleteFirst: boolean,
   ): Promise<RawLedger[]> {
     let ledgers: RawLedger[] | undefined;
+    let parsed = false;
     let needsCleanup = deleteFirst;
     /** Runs whose inserts may still be running on the server: waited for before the delete. */
     const failedRuns: string[] = [];
     /** The run id the chunk's newest 'started' row carries. */
     let loggedRun: string | undefined;
+    /** The failure of this attempt would fail again: it is not retried. */
+    let permanent = false;
+    const unretryable = async <T>(work: () => Promise<T> | T): Promise<T> => {
+      try {
+        return await work();
+      } catch (err) {
+        permanent = true;
+        throw err;
+      }
+    };
     for (let attempt = 1; ; attempt++) {
       try {
         // The intent comes before anything is deleted or written ...
         if (loggedRun === undefined) await this.logIntent(chunk, this.writer.runId, 'started');
         loggedRun ??= this.writer.runId;
+        ledgers ??= await this.fetchAll(toWrite);
+        if (needsCleanup && !parsed) {
+          await unretryable(() => ledgers?.forEach((raw) => buildLedgerRows(raw, this.ctx)));
+          parsed = true;
+        }
+        await unretryable(() => this.assertNoLiveSyncer(chunk.end));
         if (needsCleanup) {
           await this.cleanup(failedRuns, spans);
           needsCleanup = false;
@@ -362,7 +408,6 @@ class RangeRunner {
           await this.logIntent(chunk, this.writer.runId, 'started');
           loggedRun = this.writer.runId;
         }
-        ledgers ??= await this.fetchAll(toWrite);
         try {
           await this.writer.write(ledgers);
         } catch (err) {
@@ -373,7 +418,7 @@ class RangeRunner {
         }
         return ledgers;
       } catch (err) {
-        if (err instanceof LedgerNotAvailableError || attempt >= this.maxAttempts) {
+        if (permanent || err instanceof LedgerNotAvailableError || attempt >= this.maxAttempts) {
           this.logger.error(
             `Chunk [${chunk.start},${chunk.end}] failed (attempt ${attempt} of ${this.maxAttempts}), ` +
               `its intent stays open: ${describe(err)}`,
@@ -391,13 +436,14 @@ class RangeRunner {
     }
   }
 
-  /** The ledgers in `[from, to]` that have a `ledgers` row. */
-  private async committedIn(from: number, to: number): Promise<number[]> {
-    const rows = await this.ch.query<{ ledger_index: number | string }>(
-      `SELECT ledger_index FROM ${Table.Ledgers} WHERE ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}`,
+  /** The ledgers in `[from, to]` that have a `ledgers` row, with their close times (unix seconds). */
+  private async committedIn(from: number, to: number): Promise<Map<number, number>> {
+    const rows = await this.ch.query<{ ledger_index: number | string; close: number | string }>(
+      `SELECT ledger_index, toUnixTimestamp(close_time) AS close FROM ${Table.Ledgers}
+        WHERE ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}`,
       { from, to },
     );
-    return rows.map((r) => Number(r.ledger_index));
+    return new Map(rows.map((r) => [Number(r.ledger_index), Number(r.close)]));
   }
 
   /**
@@ -560,15 +606,15 @@ class RangeRunner {
   }
 
   /**
-   * One `agg_dirty` row for the ledgers this run wrote: from the start of the hour of the earliest close time to the end of
-   * the hour of the latest (the hour after it, so that a ledger that closed on the hour is covered too). Retried like a
-   * chunk: no later run can make up for a missing row.
+   * One `agg_dirty` row for ledgers whose close times span `window`: from the start of the hour of the earliest to the end
+   * of the hour of the latest (the hour after it, so that a ledger that closed on the hour is covered too). Retried like
+   * a chunk. If it still fails, the chunk it belongs to is committed and `done`, and a rerun marks it as part of the
+   * ledgers it skips.
    */
-  private async markAggregatesDirty(): Promise<void> {
-    if (!this.closeWindow) return;
+  private async markAggregatesDirty(window: CloseWindow): Promise<void> {
     const row = {
-      from_hour: Math.floor(this.closeWindow.min / HOUR_SECONDS) * HOUR_SECONDS,
-      to_hour: (Math.floor(this.closeWindow.max / HOUR_SECONDS) + 1) * HOUR_SECONDS,
+      from_hour: Math.floor(window.min / HOUR_SECONDS) * HOUR_SECONDS,
+      to_hour: (Math.floor(window.max / HOUR_SECONDS) + 1) * HOUR_SECONDS,
       // DateTime64(3): a JSON number is read as seconds, so it is sent as fractional seconds.
       created_at: Date.now() / 1000,
     };
@@ -582,6 +628,16 @@ class RangeRunner {
       }
     }
   }
+}
+
+/** Earliest and latest close time of `ledgers` (not empty). */
+function closeWindowOf(ledgers: RawLedger[]): CloseWindow {
+  const window = { min: ledgers[0].header.close_time, max: ledgers[0].header.close_time };
+  for (const { header } of ledgers) {
+    window.min = Math.min(window.min, header.close_time);
+    window.max = Math.max(window.max, header.close_time);
+  }
+  return window;
 }
 
 /** The network whose CTID network id is `ctx.networkId`: the `network` column of its `syncer_lease` row. */
@@ -631,7 +687,7 @@ The network, ClickHouse and node come from the same GH_* environment as the sync
   --run-id <id>          name of this run in ingest_log and in query ids (a nonce is appended)
   --help                 print this text
 
-Exit status: 0 when the range is ingested, 1 when the run failed (rerun the same command: unfinished chunks are redone),
+Exit status: 0 when the range is ingested, 1 when the run failed (rerun the same command: finished chunks are skipped, unfinished ones redone),
 2 for a wrong command line.`;
 
 /** The command line is wrong. */

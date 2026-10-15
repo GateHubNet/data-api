@@ -146,7 +146,8 @@ describe('ingest:range CLI (e2e)', () => {
     expect(code).toBe(0);
     expect(output).toContain('0 ledgers written');
     expect(await chRows(`SELECT count() FROM ${DB}.ledgers`)).toEqual(['30']);
-    expect(await chRows(`SELECT count() FROM ${DB}.agg_dirty`)).toEqual(['1']);
+    // The skipped ledgers are marked again, with the same window (so the same key) as the first run's row.
+    expect(await chRows(`SELECT uniqExact(from_hour, to_hour) FROM ${DB}.agg_dirty`)).toEqual(['1']);
   });
 
   it('passes --chunk, --concurrency, --reprocess and --run-id on', async () => {

@@ -286,6 +286,14 @@ describe('rangeIngest (e2e)', () => {
 
   const hourFloor = (seconds: number): number => Math.floor(seconds / 3600) * 3600;
 
+  /** The distinct `agg_dirty` windows, as `from-to` unix seconds, ascending. */
+  async function dirtyWindows(svc: ClickHouseService): Promise<Array<[number, number]>> {
+    const rows = await svc.query<{ f: number; t: number }>(
+      `SELECT DISTINCT toUnixTimestamp(from_hour) AS f, toUnixTimestamp(to_hour) AS t FROM ${Table.AggDirty} ORDER BY f, t`,
+    );
+    return rows.map((r) => [Number(r.f), Number(r.t)]);
+  }
+
   describe('explicit index list', () => {
     it('ingests an explicit index list', async () => {
       const svc = await freshService();
@@ -428,10 +436,13 @@ describe('rangeIngest (e2e)', () => {
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 14), CHAIN_TABLES));
     });
 
-    it('does nothing for a range that is complete: no fetch, no write, no agg_dirty', async () => {
+    it('does nothing for a range that is complete, except to mark the hours of the ledgers it skipped', async () => {
       const svc = await freshService();
       await rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(1), to: L(30), ...FAST });
-      const dirtyBefore = await count(svc, Table.AggDirty);
+      const logBefore = await count(svc, Table.IngestLog);
+      const window = await dirtyWindows(svc);
+      expect(window).toHaveLength(1);
+      await svc.command(`TRUNCATE TABLE ${Table.AggDirty}`); // the marks an earlier, killed run never wrote
       const source = new TestSource(CHAIN_RAW);
 
       const result = await rangeIngest(source, svc, ctx, { from: L(1), to: L(30), ...FAST });
@@ -439,7 +450,10 @@ describe('rangeIngest (e2e)', () => {
       expect(result).toEqual({ chunksDone: 2, ledgers: 0 });
       expect(source.fetches).toEqual([]);
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW, CHAIN_TABLES));
-      expect(await count(svc, Table.AggDirty)).toBe(dirtyBefore);
+      expect(await count(svc, Table.IngestLog)).toBe(logBefore);
+      // One row, from the close times that `ledgers` holds.
+      expect(await count(svc, Table.AggDirty)).toBe(1);
+      expect(await dirtyWindows(svc)).toEqual(window);
     });
 
     it('never swallows LedgerNotAvailableError for a gap in a contiguous range', async () => {
@@ -657,6 +671,107 @@ describe('rangeIngest (e2e)', () => {
     });
   });
 
+  describe('replacing a committed chunk', () => {
+    /** The first 14 ledgers of the chain, committed. */
+    async function committedChunk(): Promise<ClickHouseService> {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST });
+      return svc;
+    }
+
+    async function expectChunkIntact(svc: ClickHouseService): Promise<void> {
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(14)));
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 14), CHAIN_TABLES));
+    }
+
+    it('reprocess with a ledger missing from the source fails with LedgerNotAvailableError and leaves the committed rows intact', async () => {
+      const svc = await committedChunk();
+      const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(7)));
+
+      await expect(
+        rangeIngest(source, svc, ctx, { from: L(1), to: L(14), reprocess: true, ...FAST }),
+      ).rejects.toBeInstanceOf(LedgerNotAvailableError);
+
+      expect(source.fetchCount(L(7))).toBe(1);
+      await expectChunkIntact(svc);
+    });
+
+    it('reprocess with a ledger the parser rejects fails and leaves the committed rows intact', async () => {
+      const svc = await committedChunk();
+      // L(7) now has a transaction with a Fee that is not a number: buildLedgerRows throws on it.
+      const malformed = CHAIN_RAW.map((raw) =>
+        raw.header.ledger_index === L(7)
+          ? {
+              ...raw,
+              transactions: raw.transactions.map((t, i) => (i === 0 ? { ...t, tx: { ...t.tx, Fee: 'abc' } } : t)),
+            }
+          : raw,
+      );
+      const source = new TestSource(malformed);
+
+      await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(14), reprocess: true, ...FAST })).rejects.toThrow(
+        /invalid Fee "abc"/,
+      );
+
+      // A parser error does not go away: no retry, and nothing was deleted or written.
+      expect(source.fetchCount(L(7))).toBe(1);
+      await expectChunkIntact(svc);
+    });
+
+    it('reprocess whose fetches keep failing gives up with the committed rows intact', async () => {
+      const svc = await committedChunk();
+      const source = new TestSource(CHAIN_RAW);
+      source.failures.set(L(7), 100);
+
+      await expect(
+        rangeIngest(source, svc, ctx, { from: L(1), to: L(14), reprocess: true, maxAttempts: 3, ...FAST }),
+      ).rejects.toThrow(`fetch of ${L(7)} failed`);
+
+      expect(source.fetchCount(L(7))).toBe(3);
+      await expectChunkIntact(svc);
+    });
+
+    it('redo of an unfinished intent whose ledger the source lacks leaves the committed rows intact, and the intent open', async () => {
+      const svc = await committedChunk();
+      await seedIntent(svc, L(1), 9_999_999, 'crashed-run');
+      const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(3)));
+
+      await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(14), ...FAST })).rejects.toBeInstanceOf(
+        LedgerNotAvailableError,
+      );
+
+      await expectChunkIntact(svc);
+      expect((await intents(svc)).map((i) => i.status)).toEqual(['started']);
+
+      // The node has the ledger again: the open intent is redone.
+      const result = await rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST });
+      expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
+      await expectChunkIntact(svc);
+      await expectNoDuplicateTransactions(svc);
+      expect((await intents(svc)).map((i) => i.status)).toEqual(['done']);
+    });
+
+    it('fetches and parses the replacement before it deletes anything', async () => {
+      const svc = await committedChunk();
+      const events = recordEvents(svc);
+      const source = new TestSource(CHAIN_RAW);
+      const fetch = source.fetch.bind(source);
+      jest.spyOn(source, 'fetch').mockImplementation(async (index) => {
+        events.push(`fetch:${index}`);
+        return fetch(index);
+      });
+
+      await rangeIngest(source, svc, ctx, { from: L(1), to: L(14), reprocess: true, ...FAST });
+
+      const lastFetch = events.map((e) => e.startsWith('fetch:')).lastIndexOf(true);
+      const firstDelete = events.findIndex((e) => e.startsWith('delete:'));
+      expect(firstDelete).toBeGreaterThan(-1);
+      expect(lastFetch).toBeGreaterThan(-1);
+      expect(lastFetch).toBeLessThan(firstDelete);
+      await expectChunkIntact(svc);
+    });
+  });
+
   describe('run id', () => {
     it('appends a per-invocation nonce to a user supplied run id, so that a reprocess under the same id loses nothing', async () => {
       const svc = await freshService();
@@ -784,11 +899,10 @@ describe('rangeIngest (e2e)', () => {
       expect(result.ledgers).toBe(14);
     });
 
-    it('stops when a live syncer takes the lease in the middle of the run', async () => {
+    it('checks again after the fetch: a live syncer that boots while the first chunk is fetched stops the run before it writes', async () => {
       const svc = await freshService();
       const source = new TestSource(CHAIN_RAW);
       const fetch = source.fetch.bind(source);
-      // The live syncer boots while the first chunk is fetched.
       jest.spyOn(source, 'fetch').mockImplementation(async (index) => {
         if (index === L(1)) await seedLease(svc, 'host:2:def', 0);
         return fetch(index);
@@ -798,8 +912,43 @@ describe('rangeIngest (e2e)', () => {
         /while a live syncer holds the lease \(host:2:def\)/,
       );
 
-      // The chunk that was running finished; the next one was refused.
+      expect(await count(svc, Table.Ledgers)).toBe(0);
+      expect((await intents(svc)).map((i) => i.status)).toEqual(['started']);
+    });
+
+    it('stops when a live syncer takes the lease in the middle of the run, after the chunks that were finished', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW);
+      const fetch = source.fetch.bind(source);
+      // The live syncer boots while the second chunk (from 10,000,000) is fetched.
+      jest.spyOn(source, 'fetch').mockImplementation(async (index) => {
+        if (index === L(15)) await seedLease(svc, 'host:2:def', 0);
+        return fetch(index);
+      });
+
+      await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(30), ...FAST })).rejects.toThrow(
+        /while a live syncer holds the lease \(host:2:def\)/,
+      );
+
       expect(await committedIndexes(svc)).toEqual(range(L(1), 9_999_999));
+    });
+
+    it('keeps the committed ledgers of a chunk it is about to replace when a live syncer appears while it fetches', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(CHAIN_RAW.slice(0, 10)); // checkpoint L(10)
+      await seedIntent(svc, L(1), 9_999_999, 'crashed-run'); // the chunk reaches above it: L(11)..L(14) are still to come
+      const source = new TestSource(CHAIN_RAW);
+      const fetch = source.fetch.bind(source);
+      jest.spyOn(source, 'fetch').mockImplementation(async (index) => {
+        if (index === L(1)) await seedLease(svc, 'host:2:def', 0);
+        return fetch(index);
+      });
+
+      await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(14), ...FAST })).rejects.toThrow(
+        /while a live syncer holds the lease \(host:2:def\)/,
+      );
+
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 10), CHAIN_TABLES));
     });
   });
 
@@ -814,26 +963,37 @@ describe('rangeIngest (e2e)', () => {
         ...FAST,
       });
 
-      const closes = FIXTURES.map((l) => l.header.close_time);
-      const min = Math.min(...closes);
-      const max = Math.max(...closes);
-      const rows = await svc.query<{ f: number; t: number; c: number }>(
-        `SELECT toUnixTimestamp(from_hour) AS f, toUnixTimestamp(to_hour) AS t, toUnixTimestamp(created_at) AS c FROM ${Table.AggDirty}`,
+      // One row per chunk, from the start of the hour of its earliest ledger to the end of the hour of its latest.
+      const buckets = new Map<number, number[]>();
+      for (const l of FIXTURES) {
+        const bucket = Math.floor(l.header.ledger_index / 1000);
+        buckets.set(bucket, [...(buckets.get(bucket) ?? []), l.header.close_time]);
+      }
+      const expected = [...buckets.values()].map((closes): [number, number] => [
+        hourFloor(Math.min(...closes)),
+        hourFloor(Math.max(...closes)) + 3600,
+      ]);
+      const distinct = [...new Map(expected.map((w) => [w.join('-'), w])).values()].sort(
+        (a, b) => a[0] - b[0] || a[1] - b[1],
       );
-      expect(rows).toHaveLength(1);
-      expect(Number(rows[0].f)).toBe(hourFloor(min));
-      expect(Number(rows[0].t)).toBe(hourFloor(max) + 3600);
-      expect(Number(rows[0].f) % 3600).toBe(0);
-      expect(Number(rows[0].t) % 3600).toBe(0);
+      expect(await dirtyWindows(svc)).toEqual(distinct);
+      for (const [from, to] of distinct) {
+        expect(from % 3600).toBe(0);
+        expect(to % 3600).toBe(0);
+      }
       // created_at is a DateTime64(3) written as fractional seconds: a ms integer would land in the year 50000+.
-      expect(Math.abs(Number(rows[0].c) - Date.now() / 1000)).toBeLessThan(120);
+      const created = await svc.queryOne<{ lo: number; hi: number }>(
+        `SELECT toUnixTimestamp(min(created_at)) AS lo, toUnixTimestamp(max(created_at)) AS hi FROM ${Table.AggDirty}`,
+      );
+      expect(Math.abs(Number(created?.lo) - Date.now() / 1000)).toBeLessThan(120);
+      expect(Math.abs(Number(created?.hi) - Date.now() / 1000)).toBeLessThan(120);
 
-      // The window is what the `ledgers` table says about the ingested ledgers.
+      // Together they cover what the `ledgers` table says about the ingested ledgers.
       const stored = await svc.queryOne<{ lo: number; hi: number }>(
         `SELECT toUnixTimestamp(min(close_time)) AS lo, toUnixTimestamp(max(close_time)) AS hi FROM ${Table.Ledgers}`,
       );
-      expect(Number(stored?.lo)).toBe(min);
-      expect(Number(stored?.hi)).toBe(max);
+      expect(distinct[0][0]).toBe(hourFloor(Number(stored?.lo)));
+      expect(distinct[distinct.length - 1][1]).toBe(hourFloor(Number(stored?.hi)) + 3600);
     });
 
     it('covers a range that ends exactly on an hour boundary', async () => {
@@ -856,15 +1016,51 @@ describe('rangeIngest (e2e)', () => {
       expect(Number(row?.t)).toBe(onTheHour + 3600);
     });
 
-    it('marks the ledgers of the chunks that finished, even when a later chunk fails', async () => {
+    /** The chain with every ledger in an hour of its own, so that each chunk has a window of its own. */
+    const T0 = hourFloor(CHAIN_RAW[0].header.close_time);
+    const HOURLY = CHAIN_RAW.map((raw, i) => ({ ...raw, header: { ...raw.header, close_time: T0 + i * 3600 + 5 } }));
+    const hours = (n: number): number => T0 + n * 3600;
+
+    it('marks a chunk right after it is done: a run aborted on chunk 3 has marked chunks 1 and 2, and a rerun that skips them marks them again', async () => {
       const svc = await freshService();
-      const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(20)));
+      // Chunks of 10: L(1)..L(4), L(5)..L(14), L(15)..L(24), L(25)..L(30). The node lacks a ledger of the third.
+      const lacking = new TestSource(HOURLY.filter((l) => l.header.ledger_index !== L(20)));
 
-      await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(30), ...FAST })).rejects.toBeInstanceOf(
-        LedgerNotAvailableError,
-      );
+      await expect(
+        rangeIngest(lacking, svc, ctx, { from: L(1), to: L(30), chunkSize: 10, ...FAST }),
+      ).rejects.toBeInstanceOf(LedgerNotAvailableError);
 
-      expect(await count(svc, Table.AggDirty)).toBe(1);
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(14)));
+      expect(await dirtyWindows(svc)).toEqual([
+        [hours(0), hours(4)],
+        [hours(4), hours(14)],
+      ]);
+
+      // A run killed before it marked anything (or before the fix): the marks are gone, the ledgers are committed.
+      await svc.command(`TRUNCATE TABLE ${Table.AggDirty}`);
+      const source = new TestSource(HOURLY);
+      const result = await rangeIngest(source, svc, ctx, { from: L(1), to: L(30), chunkSize: 10, ...FAST });
+
+      expect(result).toEqual({ chunksDone: 4, ledgers: 16 });
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(15), L(30)));
+      expect(await dirtyWindows(svc)).toEqual([
+        [hours(0), hours(14)], // the skipped chunks 1 and 2, read from `ledgers`
+        [hours(14), hours(24)],
+        [hours(24), hours(30)],
+      ]);
+    });
+
+    it('marks the skipped ledgers also when the run fails', async () => {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(HOURLY), svc, ctx, { from: L(1), to: L(14), chunkSize: 10, ...FAST });
+      await svc.command(`TRUNCATE TABLE ${Table.AggDirty}`);
+      const lacking = new TestSource(HOURLY.filter((l) => l.header.ledger_index !== L(20)));
+
+      await expect(
+        rangeIngest(lacking, svc, ctx, { from: L(1), to: L(30), chunkSize: 10, ...FAST }),
+      ).rejects.toBeInstanceOf(LedgerNotAvailableError);
+
+      expect(await dirtyWindows(svc)).toEqual([[hours(0), hours(14)]]);
     });
   });
 
