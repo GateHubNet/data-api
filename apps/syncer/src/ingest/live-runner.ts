@@ -22,6 +22,12 @@ export const LEDGER_SOURCE = Symbol('LEDGER_SOURCE');
 /** Optional `LiveRunnerOptions` (timings, logger); tests shorten the timings. */
 export const LIVE_RUNNER_OPTIONS = Symbol('LIVE_RUNNER_OPTIONS');
 
+/** Ledgers per partition of `ledgers` (`PARTITION BY intDiv(ledger_index, 1000000)`): a commit never spans two. */
+export const LEDGERS_PARTITION_SIZE = 1_000_000;
+
+/** `ingest_log.run_id` prefix of the live runner's first-write intents (the range ingest uses its own ids). */
+export const LIVE_INTENT_PREFIX = 'live:';
+
 /**
  * A ledger whose `parent_hash` is not the hash of the ledger before it, or a stored checkpoint whose hash the node does
  * not confirm. The runner halts (status `halted`, liveliness 503): the data and the node disagree about history, and only
@@ -34,6 +40,14 @@ export class ChainBreakError extends Error {
   ) {
     super(message);
     this.name = 'ChainBreakError';
+  }
+}
+
+/** Another syncer holds the lease now (it took over after this one stalled): this one halts and writes nothing more. */
+export class LeaseLostError extends Error {
+  constructor(readonly holder: string) {
+    super(holder === '' ? 'lease lost: it was released by another syncer' : `lease lost to ${holder}`);
+    this.name = 'LeaseLostError';
   }
 }
 
@@ -56,9 +70,9 @@ export interface RunnerStatus {
 }
 
 export interface LiveRunnerOptions {
-  /** A lease whose last heartbeat is younger than this belongs to its holder. Default 30000. */
+  /** A lease whose last heartbeat is younger than this (on the ClickHouse server's clock) belongs to its holder. Default 30000. */
   leaseTtlMs?: number;
-  /** Heartbeat interval of the lease. Default 10000. */
+  /** Heartbeat interval of the lease; each heartbeat first checks that the lease is still this runner's. Default 10000. */
   heartbeatMs?: number;
   /** Poll `validatedHead()` when no `ledgerClosed` hint has arrived for this long. Default 15000. */
   headSilenceMs?: number;
@@ -91,22 +105,37 @@ const DEFAULTS = {
 /** Shortest wait of the loop, so that a deadline that has just passed cannot make it spin. */
 const MIN_WAIT_MS = 5;
 
+/** A lease confirmation older than this many heartbeat intervals is re-checked before anything is written. */
+const LEASE_RECHECK_INTERVALS = 1.5;
+
+/** What `abortable` resolves to when its signal aborts first. */
+const ABORTED = Symbol('aborted');
+
+/** Thrown by a boot or recovery step that the stop signal cut short (it is not an error). */
+class StoppedError extends Error {}
+
 /**
  * The live ingest loop: the single writer of a network's ledger tables.
  *
  * **Boot** (`onApplicationBootstrap`): take the `syncer_lease` (refused while another holder's heartbeat is younger than
- * 30 s), then, in the background: verify that the node confirms the hash stored for the committed checkpoint (else
- * halt), delete the uncommitted tail above it, and continue at checkpoint + 1. With no checkpoint the start is
- * `GH_SYNC_START_LEDGER` (default: the validated head), and the rows above start - 1 are deleted first (what a crashed
- * first write left).
+ * 30 s on the ClickHouse server's clock), then, in the background: verify that the node confirms the hash stored for the
+ * committed checkpoint (else halt), delete the uncommitted tail above it, and continue at checkpoint + 1. With no
+ * checkpoint the start is `GH_SYNC_START_LEDGER` (default: the validated head); the rows above
+ * min(start, earliest unfinished first-write intent) - 1 are deleted first (what a crashed first write left), and the
+ * start is recorded as an intent in `ingest_log` until the first commit.
+ *
+ * **Lease.** Every heartbeat first checks that the newest lease row is still this runner's; if another syncer took over,
+ * the runner halts (`lease lost to <holder>`) and writes nothing more. A confirmation older than 1.5 heartbeats (after a
+ * stall) is re-checked before any write or delete.
  *
  * **Loop.** The head is the highest `ledgerClosed` hint of the node client, or a poll of `validatedHead()` when no hint
  * has arrived for 15 s; it never goes down, so the lag stays defined while the node is away. Up to `catchupConcurrency`
  * ledgers are fetched at once, by index, each retried forever with a capped backoff (a ledger is never skipped). Fetched
  * ledgers are reordered and accepted in index order, each only if its `parent_hash` is the hash of the one before (else
  * the verified prefix is committed and the runner halts). Accepted ledgers are written as one batch when it holds
- * `catchupFlushLedgers` ledgers or `catchupFlushTxs` transactions, is `catchupFlushMs` old, or reaches to within one
- * ledger of the head: live, every ledger is its own commit.
+ * `catchupFlushLedgers` ledgers or `catchupFlushTxs` transactions, is `catchupFlushMs` old, reaches to within one ledger
+ * of the head (live, every ledger is its own commit), or the next ledger starts a new `ledgers` partition (a commit never
+ * spans two, so a half-applied commit cannot leave a marker above a gap).
  *
  * **A failed write** is recovered as `LedgerWriter` documents (ruling R16): wait until the failed run's queries are gone,
  * re-read the checkpoint, delete everything above it and wait for that too, carry on with a writer under a new runId and
@@ -114,12 +143,15 @@ const MIN_WAIT_MS = 5;
  * the status, and retried with backoff; nothing is written until it succeeds.
  *
  * **Shutdown** (`onModuleDestroy`, or SIGTERM through `ShutdownSignals`): stop the loop (a write in progress finishes, a
- * partial batch is dropped and refetched next time) and release the lease.
+ * partial batch is dropped and refetched next time; a boot or recovery step is abandoned, the next boot redoes it) and
+ * release the lease.
  */
 @Injectable()
 export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
+  /** Identifies this process's runner: in the lease holder and in its `ingest_log` intent. */
+  readonly bootId = randomUUID();
   /** `hostname:pid:bootId`, written to `syncer_lease`. */
-  readonly holder = `${hostname()}:${process.pid}:${randomUUID()}`;
+  readonly holder = `${hostname()}:${process.pid}:${this.bootId}`;
 
   private readonly opts: typeof DEFAULTS;
   private readonly logger: RunnerLogger;
@@ -127,7 +159,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   private state: RunnerState = 'starting';
   private recovering = false;
   private lastError?: string;
-  private haltError?: ChainBreakError;
+  private haltError?: Error;
   private lag?: number;
   private lastCommitAt?: number;
 
@@ -144,6 +176,8 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   private committed?: number;
   /** Consecutive failed writes; slows down a write that fails again and again (a ledger the parser rejects). */
   private writeFailures = 0;
+  /** The first-write intent of an empty-database boot is still to be marked done (after the first commit). */
+  private liveIntentPending = false;
 
   // --- pipeline (rebuilt by `reset`) ---------------------------------------------------------------------------------
   /** Bumped by every reset: fetches of an older generation are ignored. */
@@ -173,9 +207,11 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   // --- lease ---------------------------------------------------------------------------------------------------------
   private lease?: Promise<void>;
   private leaseHeld = false;
+  /** `performance.now()` of the last check that found the lease ours (and renewed it). */
+  private leaseConfirmedAt = 0;
+  private leaseCheckFailures = 0;
   private heartbeatTimer?: NodeJS.Timeout;
-  private beating?: Promise<void>;
-  private lastBeatMs = 0;
+  private beating?: Promise<boolean>;
 
   constructor(
     @Inject(LEDGER_SOURCE) private readonly source: LedgerSource,
@@ -225,8 +261,8 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
 
   /**
    * Test hook: take the lease, prepare (first call only), catch up to the validated head as polled now (or a higher hint)
-   * and resolve. Rejects with `ChainBreakError` when the chain breaks (the runner is then halted). Not for use while the
-   * background loop runs.
+   * and resolve. Rejects with `ChainBreakError` / `LeaseLostError` when the runner halts. Not for use while the background
+   * loop runs.
    */
   async runOnce(): Promise<void> {
     this.assertUsable();
@@ -240,12 +276,12 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         const polled = await this.untilDone('poll the validated head', 'warn', () => this.source.validatedHead());
         if (polled !== undefined) this.observeHead(polled);
         const target = this.head;
-        if (target === undefined) return;
-        await this.pipeline(() => (this.committedTip() ?? 0) >= target);
+        if (target !== undefined) await this.pipeline(() => (this.committedTip() ?? 0) >= target);
       } catch (err) {
         if (err instanceof ChainBreakError) this.halt(err);
         throw err;
       }
+      if (this.haltError) throw this.haltError;
     })();
     this.running = run.catch(() => undefined);
     try {
@@ -277,49 +313,109 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   private async takeLease(): Promise<void> {
     const current = await this.currentLease();
     if (current.holder !== '' && current.holder !== this.holder) {
-      const age = Date.now() - current.heartbeatMs;
-      if (age < this.opts.leaseTtlMs) throw new Error(`Another syncer holds the lease (${current.holder})`);
+      if (current.ageMs < this.opts.leaseTtlMs) throw new Error(`Another syncer holds the lease (${current.holder})`);
       this.logger.warn(
-        `Taking over the lease of ${current.holder}, whose last heartbeat is ${Math.round(age / 1000)} s old`,
+        `Taking over the lease of ${current.holder}, whose last heartbeat is ${Math.round(current.ageMs / 1000)} s old`,
       );
     }
-    await this.writeHeartbeat();
+    await this.writeLeaseRow(this.holder);
     this.leaseHeld = true;
+    this.leaseConfirmedAt = performance.now();
     this.logger.log(`Holding the ${this.cfg.network} syncer lease as ${this.holder}`);
     if (this.stopping) return; // stop() releases it as soon as this returns
-    this.heartbeatTimer = setInterval(() => {
-      this.beating ??= this.writeHeartbeat()
-        .catch((err) => this.logger.warn(`Lease heartbeat failed: ${describe(err)}`))
-        .finally(() => (this.beating = undefined));
-    }, this.opts.heartbeatMs);
+    this.heartbeatTimer = setInterval(() => void this.heartbeat(), this.opts.heartbeatMs);
     this.heartbeatTimer.unref();
   }
 
-  /** The newest lease row of this network; `holder` is '' when there is none or it was released. */
-  private async currentLease(): Promise<{ holder: string; heartbeatMs: number }> {
-    const row = await this.ch.queryOne<{ holder: string; heartbeat_ms: string | number }>(
-      `SELECT argMax(holder, heartbeat) AS holder, toUnixTimestamp64Milli(max(heartbeat)) AS heartbeat_ms
+  /**
+   * The newest lease row of this network, and its age on the ClickHouse server's clock (heartbeats are written with the
+   * server's clock too, so no two hosts' clocks are ever compared). `holder` is '' when there is none or it was released.
+   */
+  private async currentLease(): Promise<{ holder: string; ageMs: number }> {
+    const row = await this.ch.queryOne<{ holder: string; age_ms: string | number }>(
+      `SELECT argMax(holder, heartbeat) AS holder, dateDiff('millisecond', max(heartbeat), now64(3)) AS age_ms
          FROM ${Table.SyncerLease} WHERE network = {network:String}`,
       { network: this.cfg.network },
     );
-    return { holder: row?.holder ?? '', heartbeatMs: Number(row?.heartbeat_ms ?? 0) };
+    return { holder: row?.holder ?? '', ageMs: Number(row?.age_ms ?? Number.POSITIVE_INFINITY) };
   }
 
   /**
-   * One lease row for this holder. `heartbeat` is a DateTime64(3), which reads a JSON number as (fractional) seconds:
-   * a millisecond integer would land thousands of years in the future.
+   * One lease row with the server's current time, strictly newer than every row of this network: the newest row is the
+   * lease (argMax, and the table is ReplacingMergeTree(heartbeat)), so a release must win over the last heartbeat.
+   * Written by the server (`now64(3)`), the DateTime64(3) column never sees a client number.
+   *
+   * With `onlyIfHeldBy` the row is written only while that holder has the newest row, in the same statement: a takeover
+   * that lands between a heartbeat's check and its write is never overwritten (the next check sees it and halts).
    */
-  private async writeHeartbeat(holder = this.holder): Promise<void> {
-    // Strictly increasing, so that the release row is always the newest (argMax / ReplacingMergeTree(heartbeat)).
-    const ms = Math.max(Date.now(), this.lastBeatMs + 1);
-    this.lastBeatMs = ms;
-    await this.ch.insert(Table.SyncerLease, [{ network: this.cfg.network, holder, heartbeat: ms / 1000 }]);
+  private async writeLeaseRow(holder: string, onlyIfHeldBy?: string): Promise<void> {
+    const newest = `SELECT argMax(holder, heartbeat) FROM ${Table.SyncerLease} WHERE network = {network:String}`;
+    await this.ch.command(
+      `INSERT INTO ${Table.SyncerLease} (network, holder, heartbeat)
+       SELECT {network:String}, {holder:String},
+              greatest(now64(3), (SELECT max(heartbeat) FROM ${Table.SyncerLease} WHERE network = {network:String})
+                                 + toIntervalMillisecond(1))
+       ${onlyIfHeldBy === undefined ? '' : `WHERE (${newest}) = {owner:String}`}`,
+      { network: this.cfg.network, holder, ...(onlyIfHeldBy !== undefined && { owner: onlyIfHeldBy }) },
+    );
   }
 
   /**
-   * Hand the lease back so that the next syncer can start at once instead of waiting out the TTL. The table keeps the row
-   * with the highest heartbeat (ReplacingMergeTree(heartbeat), read with argMax), so a release is a newer row with an
-   * empty holder; a row with heartbeat 0 would never be the one read. Skipped when someone else holds the lease by now.
+   * Check that the lease is still ours and renew it; resolves true when it is. Another holder halts the runner. A failed
+   * check (ClickHouse unreachable) resolves false and is retried by the next heartbeat. Only one runs at a time.
+   */
+  private heartbeat(): Promise<boolean> {
+    this.beating ??= this.checkAndRenewLease()
+      .then(
+        (ours) => {
+          if (ours) this.leaseCheckFailures = 0;
+          return ours;
+        },
+        (err: unknown) => {
+          this.leaseCheckFailures += 1;
+          this.logger.warn(`Lease heartbeat failed: ${describe(err)}`);
+          return false;
+        },
+      )
+      .finally(() => {
+        this.beating = undefined;
+      });
+    return this.beating;
+  }
+
+  private async checkAndRenewLease(): Promise<boolean> {
+    if (!this.leaseHeld) return false;
+    const current = await this.currentLease();
+    if (!this.leaseHeld) return false;
+    if (current.holder !== this.holder) {
+      this.loseLease(current.holder);
+      return false;
+    }
+    await this.writeLeaseRow(this.holder, this.holder);
+    this.leaseConfirmedAt = performance.now();
+    return true;
+  }
+
+  /**
+   * Whether this runner may write now: true while the last lease confirmation is recent; otherwise (after a stall, or
+   * failed heartbeats) the lease is checked again first. False when it was lost (the runner is halted then) or cannot be
+   * confirmed right now.
+   */
+  private async leaseIsFresh(): Promise<boolean> {
+    if (!this.leaseHeld) return false;
+    if (performance.now() - this.leaseConfirmedAt <= this.opts.heartbeatMs * LEASE_RECHECK_INTERVALS) return true;
+    return this.heartbeat();
+  }
+
+  private loseLease(holder: string): void {
+    this.leaseHeld = false;
+    clearInterval(this.heartbeatTimer);
+    this.halt(new LeaseLostError(holder));
+  }
+
+  /**
+   * Hand the lease back so that the next syncer can start at once instead of waiting out the TTL: a newer row with an
+   * empty holder (a row with heartbeat 0 would never be the newest, so never read). Skipped when the lease is not ours.
    */
   private async releaseLease(): Promise<void> {
     if (!this.leaseHeld) return;
@@ -332,11 +428,62 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         this.logger.warn(`Not releasing the lease: it is held by ${current.holder || 'nobody'} now`);
         return;
       }
-      await this.writeHeartbeat('');
+      await this.writeLeaseRow('', this.holder);
       this.logger.log('Released the syncer lease');
     } catch (err) {
       this.logger.warn(`Could not release the lease (it expires on its own): ${describe(err)}`);
     }
+  }
+
+  /** Throws unless the lease is confirmed ours: a step that would write or delete must not run without it. */
+  private async assertLease(): Promise<void> {
+    if (await this.leaseIsFresh()) return;
+    if (this.haltError) throw this.haltError;
+    throw new Error('The syncer lease cannot be confirmed right now');
+  }
+
+  // =================================================================================================================
+  // First-write intent (ingest_log)
+  // =================================================================================================================
+
+  /** The lowest start of a live first-write intent that never got its first commit, if any. */
+  private async earliestUnfinishedLiveIntent(): Promise<number | undefined> {
+    const row = await this.ch.queryOne<{ start: number | string | null }>(
+      `SELECT minOrNull(range_start) AS start FROM (
+         SELECT range_start, argMax(status, updated_at) AS last_status FROM ${Table.IngestLog}
+          WHERE startsWith(run_id, {prefix:String})
+          GROUP BY range_start, range_end
+       ) WHERE last_status = 'started'`,
+      { prefix: LIVE_INTENT_PREFIX },
+    );
+    return row?.start == null ? undefined : Number(row.start);
+  }
+
+  /** Record that this runner is about to write its first ledger at `start`, before any row of it goes in. */
+  private async recordLiveIntent(start: number): Promise<void> {
+    // updated_at is DateTime64(3): a JSON number is read as seconds, so it is sent as fractional seconds.
+    await this.ch.insert(Table.IngestLog, [
+      {
+        range_start: start,
+        range_end: start,
+        run_id: `${LIVE_INTENT_PREFIX}${this.bootId}`,
+        status: 'started',
+        updated_at: Date.now() / 1000,
+      },
+    ]);
+  }
+
+  /** After the first commit: mark every unfinished live intent done (the older ones were cleaned up at boot). */
+  private async markLiveIntentsDone(): Promise<void> {
+    await this.ch.command(
+      `INSERT INTO ${Table.IngestLog} (range_start, range_end, run_id, status, updated_at)
+       SELECT range_start, range_end, {runId:String}, 'done', greatest(now64(3), max(updated_at) + toIntervalMillisecond(1))
+         FROM ${Table.IngestLog}
+        WHERE startsWith(run_id, {prefix:String})
+        GROUP BY range_start, range_end
+       HAVING argMax(status, updated_at) = 'started'`,
+      { runId: `${LIVE_INTENT_PREFIX}${this.bootId}`, prefix: LIVE_INTENT_PREFIX },
+    );
   }
 
   // =================================================================================================================
@@ -397,7 +544,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   // =================================================================================================================
 
   private async runForever(): Promise<void> {
-    while (!this.stopping) {
+    while (!this.stopping && !this.haltError) {
       try {
         await this.prepare();
         await this.pipeline(() => false);
@@ -407,7 +554,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
           this.halt(err);
           return;
         }
-        if (this.stopping) return;
+        if (this.stopping || this.haltError) return;
         // Not a write error (those are recovered in `flush`): a bug or something unexpected. Start over from the
         // committed checkpoint, the same way as after a failed write.
         this.logger.error(`The ingest loop failed: ${describe(err)}`, err instanceof Error ? err.stack : undefined);
@@ -420,25 +567,36 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
 
   /**
    * Find where to continue, once: verify the checkpoint against the node and delete the uncommitted tail above it, or,
-   * with nothing committed, delete above start - 1. Transient failures are retried; throws `ChainBreakError`.
+   * with nothing committed, clean up after any crashed first write and record this one's intent. Transient failures are
+   * retried; throws `ChainBreakError`.
    */
   private async prepare(): Promise<void> {
     if (this.prepared) return;
     await this.untilDone('prepare the ingest checkpoint', 'error', async () => {
-      const checkpoint = await committedCheckpoint(this.ch);
+      const checkpoint = await this.step(committedCheckpoint(this.ch));
       this.committed = checkpoint;
       this.updateStatus();
       if (checkpoint === undefined) {
-        const start = this.cfg.syncStartLedger ?? (await this.source.validatedHead());
-        await this.deleteAbove(start - 1, 'boot');
+        const start = this.cfg.syncStartLedger ?? (await this.step(this.source.validatedHead()));
+        // A first write that crashed left rows above its own start, which (with the start defaulting to the head) may be
+        // lower than this one: its unfinished intent says where.
+        const earlier = await this.step(this.earliestUnfinishedLiveIntent());
+        const cleanFrom = Math.min(start, earlier ?? start);
+        await this.assertLease();
+        await this.deleteAbove(cleanFrom - 1, 'boot');
+        await this.step(this.recordLiveIntent(start));
+        this.liveIntentPending = true;
         this.floor = start - 1;
         this.reset(undefined, undefined);
-        this.logger.log(`Nothing is committed yet: starting at ledger ${start}`);
+        this.logger.log(
+          `Nothing is committed yet: starting at ledger ${start}` +
+            (cleanFrom < start ? ` (cleaned up after an unfinished first write from ${cleanFrom})` : ''),
+        );
       } else {
-        const stored = await storedLedgerHash(this.ch, checkpoint);
+        const stored = await this.step(storedLedgerHash(this.ch, checkpoint));
         if (stored === undefined) throw new Error(`The checkpoint ${checkpoint} has no stored hash`);
         const ledger = await this.fetchLedger(checkpoint, this.stopAbort.signal);
-        if (ledger === undefined) return; // stopping
+        if (ledger === undefined) throw new StoppedError();
         if (ledger.header.ledger_hash !== stored) {
           throw new ChainBreakError(
             `The node's ledger ${checkpoint} has hash ${ledger.header.ledger_hash}, ` +
@@ -446,6 +604,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
             checkpoint,
           );
         }
+        await this.assertLease();
         await this.deleteAbove(checkpoint, 'boot');
         this.floor = checkpoint;
         this.reset(checkpoint, stored);
@@ -458,9 +617,9 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     });
   }
 
-  /** Fetch, accept and write ledgers until `done()` (checked between steps) or stop. Throws `ChainBreakError`. */
+  /** Fetch, accept and write ledgers until `done()` (checked between steps), a halt or stop. Throws `ChainBreakError`. */
   private async pipeline(done: () => boolean): Promise<void> {
-    while (!this.stopping && this.prepared && !done()) {
+    while (!this.stopping && !this.haltError && this.prepared && !done()) {
       this.dirty = false;
       this.pollHeadIfSilent();
       const head = this.head;
@@ -496,12 +655,19 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     });
   }
 
-  /** `source.fetch(index)`, retried forever with a capped backoff; undefined once `signal` aborts. Never rejects. */
+  /**
+   * `source.fetch(index)`, retried forever with a capped backoff; undefined as soon as `signal` aborts, even while a
+   * request is still out (it is abandoned). Never rejects.
+   */
   private async fetchLedger(index: number, signal: AbortSignal): Promise<RawLedger | undefined> {
     let delay = this.opts.backoffInitialMs;
     for (let attempt = 1; !signal.aborted; attempt++) {
       try {
-        const ledger = await this.source.fetch(index);
+        const ledger = await abortable(
+          Promise.resolve().then(() => this.source.fetch(index)),
+          signal,
+        );
+        if (ledger === ABORTED) break;
         if (ledger.header.ledger_index !== index) {
           throw new Error(`Ledger ${index} was requested but ledger ${ledger.header.ledger_index} came back`);
         }
@@ -548,6 +714,8 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     const tip = this.nextToAccept - 1;
     return (
       head - tip <= 1 ||
+      // The next ledger opens a new partition of `ledgers`: one commit INSERT must not span two (ruling R24).
+      (tip + 1) % LEDGERS_PARTITION_SIZE === 0 ||
       this.batch.length >= this.cfg.catchupFlushLedgers ||
       this.batchTxs >= this.cfg.catchupFlushTxs ||
       Date.now() - this.batchSince >= this.cfg.catchupFlushMs
@@ -558,6 +726,11 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   private async flush(): Promise<void> {
     const batch = this.batch;
     if (batch.length > 0) {
+      if (!(await this.leaseIsFresh())) {
+        // Lost: halted, the loop ends. Unconfirmed (ClickHouse trouble): write nothing, and try again shortly.
+        if (!this.haltError) await this.sleep(this.backoff(this.leaseCheckFailures));
+        return;
+      }
       const first = batch[0].header.ledger_index;
       const last = batch[batch.length - 1].header.ledger_index;
       try {
@@ -585,14 +758,20 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       } else {
         this.logger.debug?.(`Committed ledger${first === last ? ` ${last}` : `s ${first}-${last}`}`);
       }
+      if (this.liveIntentPending) {
+        await this.markLiveIntentsDone().then(
+          () => (this.liveIntentPending = false),
+          (err: unknown) => this.logger.warn(`Could not mark the first-write intent done (retried): ${describe(err)}`),
+        );
+      }
     }
     if (this.pendingBreak) throw this.pendingBreak;
   }
 
   /**
-   * The recovery contract of `LedgerWriter` (ruling R16), retried until it succeeds or the runner stops:
+   * The recovery contract of `LedgerWriter` (ruling R16), retried until it succeeds, the runner stops or halts:
    *  1. wait until nothing of the failed run is running on the server,
-   *  2. re-read the committed checkpoint,
+   *  2. re-read the committed checkpoint (and its stored hash, which must exist),
    *  3. delete everything above it under a new query id prefix, and wait for that too,
    *  4. carry on with a writer under a new runId, from a pipeline rebuilt at checkpoint + 1.
    * Nothing is written before all of it succeeded.
@@ -607,12 +786,17 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       await this.sleep(this.backoff(this.writeFailures - 1));
     }
     let delay = this.opts.backoffInitialMs;
-    while (!this.stopping) {
+    while (!this.stopping && !this.haltError) {
       try {
-        await awaitQuiescence(this.ch, failed.runId, { timeoutMs: this.opts.quiescenceTimeoutMs });
-        const checkpoint = await committedCheckpoint(this.ch);
+        await this.step(awaitQuiescence(this.ch, failed.runId, { timeoutMs: this.opts.quiescenceTimeoutMs }));
+        const checkpoint = await this.step(committedCheckpoint(this.ch));
+        const hash = checkpoint === undefined ? undefined : await this.step(storedLedgerHash(this.ch, checkpoint));
+        if (checkpoint !== undefined && hash === undefined) {
+          // Without it the next ledger's parent_hash would go unchecked (ruling R25).
+          throw new Error(`The checkpoint ${checkpoint} has no stored hash`);
+        }
+        await this.assertLease();
         await this.deleteAbove(checkpoint ?? (this.floor as number), 'recovery');
-        const hash = checkpoint === undefined ? undefined : await storedLedgerHash(this.ch, checkpoint);
         this.writer = failed.withNewRunId();
         this.reset(checkpoint, hash);
         this.recovering = false;
@@ -624,6 +808,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         );
         return;
       } catch (err) {
+        if (this.stopping || this.haltError) return;
         this.lastError = describe(err);
         this.logger.error(
           `Recovery is stuck, so nothing is written until it succeeds (retry in ${delay} ms): ${describe(err)}`,
@@ -638,8 +823,18 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   /** `deleteLedgersAbove` under a fresh query id prefix, then wait until the deletes (mutations) are done. */
   private async deleteAbove(checkpoint: number, purpose: string): Promise<void> {
     const queryIdPrefix = `${purpose}-${randomUUID()}`;
-    await deleteLedgersAbove(this.ch, checkpoint, { queryIdPrefix });
-    await awaitQuiescence(this.ch, queryIdPrefix, { timeoutMs: this.opts.quiescenceTimeoutMs });
+    await this.step(deleteLedgersAbove(this.ch, checkpoint, { queryIdPrefix }));
+    await this.step(awaitQuiescence(this.ch, queryIdPrefix, { timeoutMs: this.opts.quiescenceTimeoutMs }));
+  }
+
+  /**
+   * A boot or recovery step that stop() may cut short (it throws `StoppedError` then). The abandoned query keeps running
+   * on the server; the next boot waits for it (`awaitQuiescence`) before it deletes anything.
+   */
+  private async step<T>(promise: Promise<T>): Promise<T> {
+    const result = await abortable(promise, this.stopAbort.signal);
+    if (result === ABORTED) throw new StoppedError();
+    return result;
   }
 
   /** Rebuild the pipeline after `checkpoint` (undefined: after the floor). Fetches of the old pipeline are dropped. */
@@ -662,11 +857,14 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     this.ready.clear();
   }
 
-  private halt(err: ChainBreakError): void {
+  /** Halt for good (chain break, lost lease): nothing is fetched or written any more; liveliness fails. */
+  private halt(err: Error): void {
+    if (this.haltError) return;
     this.haltError = err;
     this.state = 'halted';
     this.cancelFetches();
-    this.logger.error(`Chain break, ingest halted until an operator intervenes: ${err.message}`);
+    this.notify();
+    this.logger.error(`Ingest halted until an operator intervenes: ${err.message}`);
   }
 
   // =================================================================================================================
@@ -704,7 +902,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     this.wake?.();
   }
 
-  /** Sleep up to `ms`, or until `notify()` (a fetch landed, the head moved, stop). */
+  /** Sleep up to `ms`, or until `notify()` (a fetch landed, the head moved, a halt, stop). */
   private idle(ms: number): Promise<void> {
     if (this.dirty || this.stopping) return Promise.resolve();
     return new Promise((resolve) => {
@@ -736,14 +934,14 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     return Math.min(this.opts.backoffInitialMs * 2 ** Math.max(0, attempt - 1), this.opts.backoffMaxMs);
   }
 
-  /** `fn()` until it succeeds; a failure is logged and retried with backoff. Undefined when stopped first. */
+  /** `fn()` until it succeeds; a failure is logged and retried with backoff. Undefined when stopped or halted first. */
   private async untilDone<T>(what: string, level: 'warn' | 'error', fn: () => Promise<T>): Promise<T | undefined> {
-    for (let attempt = 1; !this.stopping; attempt++) {
+    for (let attempt = 1; !this.stopping && !this.haltError; attempt++) {
       try {
         return await fn();
       } catch (err) {
         if (err instanceof ChainBreakError) throw err;
-        if (this.stopping) break;
+        if (this.stopping || this.haltError) break;
         const delay = this.backoff(attempt);
         if (level === 'error') {
           this.recovering = true;
@@ -777,6 +975,25 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     await this.running;
     await this.releaseLease();
   }
+}
+
+/** `promise`, or `ABORTED` as soon as `signal` aborts (the promise is abandoned, its rejection swallowed). */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | typeof ABORTED> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(ABORTED);
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 /** A ledger index from a stream message (a number, or a decimal string on some servers). */

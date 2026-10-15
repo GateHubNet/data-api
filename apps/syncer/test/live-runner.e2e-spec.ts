@@ -16,7 +16,13 @@ import { EventEmitter } from 'node:events';
 import { hostname } from 'node:os';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { SyncerConfig } from '../src/config/syncer.config';
-import { ChainBreakError, LiveRunner, LiveRunnerOptions } from '../src/ingest/live-runner';
+import {
+  ChainBreakError,
+  LeaseLostError,
+  LEDGERS_PARTITION_SIZE,
+  LiveRunner,
+  LiveRunnerOptions,
+} from '../src/ingest/live-runner';
 import { LedgerNotValidatedError } from '../src/ingest/rpc-ledger-source';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
 import { range, syntheticChain, SyntheticLedger } from './synthetic-chain';
@@ -132,6 +138,8 @@ async function within<T>(promise: Promise<T>, ms: number, what: string): Promise
   }
 }
 
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function waitFor(check: () => boolean | Promise<boolean>, what: string, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!(await check())) {
@@ -161,12 +169,22 @@ describe('LiveRunner (e2e)', () => {
   });
 
   /** A migrated database of its own: no test sees another test's rows, lease or dedup log. */
+  const databases = new Map<ClickHouseService, string>();
+
   async function freshService(): Promise<ClickHouseService> {
     const cfg = { ...clickhouse.config, database: `live_runner_${++dbCounter}` };
     await runMigrations({ config: cfg, log: () => undefined });
     const svc = new ClickHouseService(cfg);
     services.push(svc);
+    databases.set(svc, cfg.database);
     return svc;
+  }
+
+  /** Another client (own sockets) for the database of `svc`. */
+  function secondClient(svc: ClickHouseService): ClickHouseService {
+    const other = new ClickHouseService({ ...clickhouse.config, database: databases.get(svc) as string });
+    services.push(other);
+    return other;
   }
 
   interface RunnerParts {
@@ -224,6 +242,68 @@ describe('LiveRunner (e2e)', () => {
         ),
       ),
     );
+  }
+
+  /** Rows of every ledger-keyed table below `index`. */
+  async function rowsBelow(svc: ClickHouseService, index: number): Promise<Counts> {
+    return Object.fromEntries(
+      await Promise.all(
+        LEDGER_KEYED_TABLES.map(
+          async ({ table }) => [table, await count(svc, table, `ledger_index < ${index}`)] as const,
+        ),
+      ),
+    );
+  }
+
+  /** The newest lease row of `xrpl` (what a runner reads). */
+  async function currentLease(svc: ClickHouseService): Promise<{ holder: string; heartbeatMs: number }> {
+    const row = await svc.queryOne<{ holder: string; ms: string }>(
+      `SELECT argMax(holder, heartbeat) AS holder, toUnixTimestamp64Milli(max(heartbeat)) AS ms
+         FROM ${Table.SyncerLease} WHERE network = 'xrpl'`,
+    );
+    return { holder: row?.holder ?? '', heartbeatMs: Number(row?.ms) };
+  }
+
+  /** Another syncer takes the lease: a lease row newer than every other, with its holder. */
+  async function takeOverLease(svc: ClickHouseService, holder: string): Promise<void> {
+    await svc.command(
+      `INSERT INTO ${Table.SyncerLease} (network, holder, heartbeat)
+       SELECT 'xrpl', {holder:String}, now64(3) + toIntervalSecond(1)`,
+      { holder },
+    );
+  }
+
+  interface LiveIntent {
+    range_start: number;
+    range_end: number;
+    run_id: string;
+    status: string;
+    updated_ms: number;
+  }
+
+  /** Every live first-write intent row of `ingest_log`, oldest first. */
+  async function liveIntentRows(svc: ClickHouseService): Promise<LiveIntent[]> {
+    const rows = await svc.query<LiveIntent>(
+      `SELECT range_start, range_end, run_id, toString(status) AS status, toUnixTimestamp64Milli(updated_at) AS updated_ms
+         FROM ${Table.IngestLog} WHERE startsWith(run_id, 'live:') ORDER BY updated_at`,
+    );
+    return rows.map((r) => ({
+      ...r,
+      range_start: Number(r.range_start),
+      range_end: Number(r.range_end),
+      updated_ms: Number(r.updated_ms),
+    }));
+  }
+
+  /** Starts of the live intents whose latest status is still 'started'. */
+  async function unfinishedLiveIntents(svc: ClickHouseService): Promise<number[]> {
+    const rows = await svc.query<{ start: number }>(
+      `SELECT range_start AS start FROM (
+         SELECT range_start, argMax(status, updated_at) AS last_status FROM ${Table.IngestLog}
+          WHERE startsWith(run_id, 'live:') GROUP BY range_start, range_end
+       ) WHERE last_status = 'started' ORDER BY start`,
+    );
+    return rows.map((r) => Number(r.start));
   }
 
   const noRows = (): Counts => Object.fromEntries(LEDGER_KEYED_TABLES.map(({ table }) => [table, 0]));
@@ -335,6 +415,29 @@ describe('LiveRunner (e2e)', () => {
     // 1 and 2 are written once the batch is 100 ms old, long before 3 arrives.
     expect(ageBatches[0]).toEqual([L(1), L(2)]);
     expect(await committedIndexes(byAge)).toEqual(range(L(1), L(10)));
+  });
+
+  it('never lets one commit span two ledgers partitions', async () => {
+    const svc = await freshService();
+    const batches = recordBatches();
+    // L(14) = 9,999,999 and L(15) = 10,000,000: batches of 10 would put both into one commit.
+    const { runner } = makeRunner(svc, new TestSource(L(30)), {
+      cfg: { catchupFlushLedgers: 10, catchupFlushMs: 600_000 },
+      options: { headSilenceMs: 600_000 },
+    });
+
+    await within(runner.runOnce(), 10_000, 'Catching up 30 ledgers');
+
+    expect(batches).toEqual([
+      [L(1), L(10)],
+      [L(11), L(14)],
+      [L(15), L(24)],
+      [L(25), L(29)],
+      [L(30), L(30)],
+    ]);
+    const partition = (index: number) => Math.floor(index / LEDGERS_PARTITION_SIZE);
+    for (const [first, last] of batches) expect(partition(first)).toBe(partition(last));
+    expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
   });
 
   it('fills a gap when hints jump 10 → 13', async () => {
@@ -514,6 +617,42 @@ describe('LiveRunner (e2e)', () => {
     expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
   });
 
+  it('cleans up after a crashed first write that started below the current head (no GH_SYNC_START_LEDGER)', async () => {
+    const svc = await freshService();
+    const before = Date.now();
+    // A first boot starts at the head of its moment, L(5), records that intent, and dies with its first write in flight.
+    const stuck = new TestSource(L(5));
+    stuck.fetch = () => new Promise<RawLedger>(() => undefined);
+    const { runner: first } = makeRunner(svc, stuck, { cfg: { syncStartLedger: undefined } });
+    const firstRun = first.runOnce();
+    await waitFor(async () => (await liveIntentRows(svc)).length === 1, 'the first-write intent');
+    await first.stop();
+    await firstRun;
+
+    const [intent] = await liveIntentRows(svc);
+    expect(intent).toMatchObject({
+      range_start: L(5),
+      range_end: L(5),
+      run_id: `live:${first.bootId}`,
+      status: 'started',
+    });
+    // updated_at went in as fractional seconds: a millisecond integer would read as a date thousands of years away.
+    expect(intent.updated_ms).toBeGreaterThanOrEqual(before - 1_000);
+    expect(intent.updated_ms).toBeLessThanOrEqual(Date.now() + 1_000);
+    // ...and its write got as far as the child rows of L(5) and L(6), not their commit marker.
+    await insertUncommitted(svc, chainRaw(L(5), L(6)));
+
+    // The next boot starts at the head of its own moment, L(12): above those rows.
+    const { runner: second } = makeRunner(svc, new TestSource(L(12)), { cfg: { syncStartLedger: undefined } });
+    await second.runOnce();
+
+    expect(await rowsBelow(svc, L(12))).toEqual(noRows()); // no orphans left below the new start
+    expect(await committedIndexes(svc)).toEqual([L(12)]);
+    await expectNoDuplicateTransactions(svc);
+    // After the first commit no intent is left unfinished, the crashed one included.
+    expect(await unfinishedLiveIntents(svc)).toEqual([]);
+  });
+
   it('parent_hash mismatch halts', async () => {
     const svc = await freshService();
     const forked = syntheticChain(L(1), 30, { breakAt: L(12) });
@@ -583,14 +722,6 @@ describe('LiveRunner (e2e)', () => {
   describe('lease', () => {
     const otherHolder = 'other-host:42:0b6d1c2e';
 
-    async function currentLease(svc: ClickHouseService): Promise<{ holder: string; heartbeatMs: number }> {
-      const row = await svc.queryOne<{ holder: string; ms: string }>(
-        `SELECT argMax(holder, heartbeat) AS holder, toUnixTimestamp64Milli(max(heartbeat)) AS ms
-           FROM ${Table.SyncerLease} WHERE network = 'xrpl'`,
-      );
-      return { holder: row?.holder ?? '', heartbeatMs: Number(row?.ms) };
-    }
-
     it("refuses to start while another holder's lease is fresh", async () => {
       const svc = await freshService();
       await svc.insert(Table.SyncerLease, [{ network: 'xrpl', holder: otherHolder, heartbeat: Date.now() / 1000 }]);
@@ -625,7 +756,119 @@ describe('LiveRunner (e2e)', () => {
       expect((await currentLease(svc)).holder).toBe(runner.holder);
     });
 
-    it('heartbeats in fractional seconds and releases the lease on stop, so that the next syncer starts at once', async () => {
+    it('judges the age of a lease on the ClickHouse server clock, not the local one', async () => {
+      const svc = await freshService();
+      await svc.command(
+        `INSERT INTO ${Table.SyncerLease} (network, holder, heartbeat) SELECT 'xrpl', {holder:String}, now64(3)`,
+        { holder: otherHolder },
+      );
+      // This host's clock runs an hour ahead: on it, the lease would look an hour old.
+      const realNow = Date.now.bind(Date);
+      const clock = jest.spyOn(Date, 'now').mockImplementation(() => realNow() + 3_600_000);
+      // The ClickHouse client ages its keep-alive sockets with Date.now(): the runner gets a client whose sockets are all
+      // made on the shifted clock, and the shared one is not used until the clock is back.
+      const { runner } = makeRunner(svc, new TestSource(L(3)), { ch: secondClient(svc) });
+
+      await expect(runner.runOnce()).rejects.toThrow(`Another syncer holds the lease (${otherHolder})`);
+      clock.mockRestore();
+      expect((await currentLease(svc)).holder).toBe(otherHolder);
+    });
+
+    it('halts when another syncer takes the lease over, and writes nothing more', async () => {
+      const svc = await freshService();
+      const source = new TestSource(L(5));
+      const hints = new EventEmitter();
+      const { runner } = makeRunner(svc, source, { hints, options: { heartbeatMs: 50 } });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().checkpoint === L(5), 'the checkpoint to reach L(5)');
+
+      await takeOverLease(svc, otherHolder);
+      await waitFor(() => runner.status().state === 'halted', 'the runner to halt');
+      expect(runner.status()).toMatchObject({
+        state: 'halted',
+        checkpoint: L(5),
+        error: `lease lost to ${otherHolder}`,
+      });
+      await expect(runner.runOnce()).rejects.toBeInstanceOf(LeaseLostError);
+
+      const writes = recordBatches();
+      source.available = L(9);
+      hints.emit('ledgerClosed', { ledger_index: L(9) });
+      await pause(300);
+      expect(writes).toEqual([]);
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(5)));
+
+      await runner.stop();
+      expect((await currentLease(svc)).holder).toBe(otherHolder); // not released over the new holder
+    });
+
+    it("does not overwrite a takeover that lands between a heartbeat's check and its renewal", async () => {
+      const svc = await freshService();
+      let armed = false;
+      // Right after the heartbeat has read the lease (still ours), another syncer writes its own row.
+      const runnerCh = Object.create(svc) as ClickHouseService;
+      runnerCh.queryOne = (async (sql: string, params?: Record<string, unknown>) => {
+        const row = await svc.queryOne(sql, params);
+        if (armed && sql.includes('dateDiff')) {
+          armed = false;
+          await svc.command(
+            `INSERT INTO ${Table.SyncerLease} (network, holder, heartbeat) SELECT 'xrpl', {holder:String}, now64(3)`,
+            { holder: otherHolder },
+          );
+        }
+        return row;
+      }) as ClickHouseService['queryOne'];
+      const { runner } = makeRunner(svc, new TestSource(L(5)), { ch: runnerCh, options: { heartbeatMs: 50 } });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().checkpoint === L(5), 'the checkpoint to reach L(5)');
+
+      armed = true;
+      await waitFor(() => runner.status().state === 'halted', 'the runner to halt');
+      expect(runner.status().error).toBe(`lease lost to ${otherHolder}`);
+      expect((await currentLease(svc)).holder).toBe(otherHolder);
+    });
+
+    it('re-checks a stale lease before writing, and halts instead of writing when it was taken over', async () => {
+      const svc = await freshService();
+      const source = new TestSource(L(5));
+      const hints = new EventEmitter();
+      // No heartbeat fires during the test: only the check before a write can notice the takeover.
+      const { runner } = makeRunner(svc, source, { hints, options: { heartbeatMs: 600_000 } });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().checkpoint === L(5), 'the checkpoint to reach L(5)');
+
+      // The process stalled for an hour (its last lease confirmation is that old), and meanwhile another syncer took over.
+      await takeOverLease(svc, otherHolder);
+      const realNow = performance.now.bind(performance);
+      jest.spyOn(performance, 'now').mockImplementation(() => realNow() + 3_600_000);
+      const writes = recordBatches();
+      source.available = L(8);
+      hints.emit('ledgerClosed', { ledger_index: L(8) });
+
+      await waitFor(() => runner.status().state === 'halted', 'the runner to halt');
+      expect(runner.status().error).toBe(`lease lost to ${otherHolder}`);
+      expect(writes).toEqual([]);
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(5)));
+    });
+
+    it('releases the lease within moments of stop() even while a boot fetch never answers', async () => {
+      const svc = await freshService();
+      const { runner: first } = makeRunner(svc, new TestSource(L(3)));
+      await first.runOnce();
+      await first.stop();
+
+      const silent = new TestSource(L(10));
+      silent.fetch = () => new Promise<RawLedger>(() => undefined);
+      const { runner } = makeRunner(svc, silent);
+      await runner.onApplicationBootstrap(); // the boot check fetches the checkpoint L(3): no answer, ever
+      await pause(100);
+      expect((await currentLease(svc)).holder).toBe(runner.holder);
+
+      await within(runner.stop(), 3_000, 'stop()');
+      expect((await currentLease(svc)).holder).toBe('');
+    });
+
+    it('heartbeats on the server clock and releases the lease on stop, so that the next syncer starts at once', async () => {
       const svc = await freshService();
       const before = Date.now();
       const { runner: first } = makeRunner(svc, new TestSource(L(3)), { options: { heartbeatMs: 50 } });
@@ -634,7 +877,7 @@ describe('LiveRunner (e2e)', () => {
       expect(first.holder).toMatch(new RegExp(`^${hostname()}:${process.pid}:[0-9a-f-]{36}$`));
       const lease = await currentLease(svc);
       expect(lease.holder).toBe(first.holder);
-      // Stored in seconds with a fraction: a millisecond integer would read as a date thousands of years away.
+      // A sane time (written by the server with now64(3)), not a date thousands of years away.
       expect(lease.heartbeatMs).toBeGreaterThanOrEqual(before - 1_000);
       expect(lease.heartbeatMs).toBeLessThanOrEqual(Date.now() + 1_000);
       await waitFor(async () => (await currentLease(svc)).heartbeatMs > lease.heartbeatMs, 'a later heartbeat');
