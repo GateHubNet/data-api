@@ -7,6 +7,6 @@ declare module 'ripple-lib-transactionparser' {
     value: string;
   }
 
-  export function parseBalanceChanges(metadata: TransactionMetadata): Record<string, BalanceChange[]>;
+  export function parseBalanceChanges(metadata: Readonly<Record<string, any>>): Record<string, BalanceChange[]>;
   export function getAffectedAccounts(metadata: TransactionMetadata): string[];
 }

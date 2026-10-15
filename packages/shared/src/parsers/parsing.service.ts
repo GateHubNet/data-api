@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { getNetworkProfile } from '../network/network-profile';
 import { AccountsCreatedParser, ParsedAccountCreated } from './accounts-created.parser';
 import { AffectedAccountsParser, ParsedAffectedAccount } from './affected-accounts.parser';
 import { BalanceChangesParser, ParsedBalanceChange } from './balance-changes.parser';
@@ -7,7 +8,7 @@ import { ExchangeParser, ParsedExchange } from './exchanges.parser';
 import { FromClientParser } from './from-client.parser';
 import { IssuersParser, ParsedIssuerTrustline } from './issuers.parser';
 import { OffersParser, ParsedOffer } from './offers.parser';
-import { LedgerTransaction, XrplTx } from './parser.interface';
+import { LedgerTransaction, ParseContext, parseContextFor, ParserTx, XrplTx } from './parser.interface';
 import { ParsedPayChannel, PaychanParser } from './paychan.parser';
 import { ParsedPayment, PaymentParser } from './payment.parser';
 
@@ -32,6 +33,7 @@ export interface ParsedTransaction {
 export class ParsingService {
   private readonly offersParser = new OffersParser();
   private readonly paymentParser = new PaymentParser();
+  private readonly parseContext: ParseContext = parseContextFor(getNetworkProfile());
   private readonly paychanParser = new PaychanParser();
   private readonly escrowParser = new EscrowParser();
   private readonly clientParser = new FromClientParser();
@@ -45,10 +47,26 @@ export class ParsingService {
     return this.clientParser.parse(transaction as unknown as XrplTx);
   }
 
+  /**
+   * Adapter for the payment parser, which takes {@link ParserTx}. The other parsers still take {@link XrplTx} and move
+   * over in later tasks, together with this service.
+   */
+  private asParserTx(t: XrplTx): ParserTx {
+    return {
+      hash: t.hash,
+      ledger_index: t.ledger_index,
+      close_time: t.date,
+      tx_index: t.meta?.TransactionIndex ?? 0,
+      tx: t,
+      meta: t.meta ?? {},
+      client: t.client ?? null,
+    };
+  }
+
   parseTransaction(transaction: XrplTx): ParsedTransaction {
     return {
       rawTransaction: transaction,
-      payment: this.paymentParser.parse(transaction),
+      payment: this.paymentParser.parse(this.asParserTx(transaction), this.parseContext),
       exchanges: this.exchangesParser.parse(transaction),
       balanceChanges: this.balanceChangesParser.parse(transaction),
       accountsCreated: this.accountsCreatedParser.parse(transaction),
