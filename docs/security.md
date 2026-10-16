@@ -125,7 +125,10 @@ render another shape).
 - **5xx causes are never sent.** Any unexpected error, and any 5xx, becomes the route's fixed failure message (`unable to retrieve
   payments`, ...) or `internal error`; the exception and stack are logged server-side only.
 - **4xx messages are intentional** so that callers can fix their request.
-- Errors are `Cache-Control: no-store`; `x-powered-by` is disabled.
+- Errors are `Cache-Control: no-store`; `x-powered-by` is disabled. Successful `/v2` answers are `Cache-Control: private,
+  max-age=60` by default (`GH_CACHE_CONTROL`): they are for the holder of an API key, and a shared cache that does not key on it
+  would hand them to anybody (Ruling R109). The live `/balances` and `/orders` are private for the live cache's TTL only (R108).
+- A malformed percent-escape in a `/v2` path answers the Ripple 400 shape before any route runs (R55).
 - A route that does not exist answers `Cannot GET /v2/nope`, not a framework page.
 
 ## 8. Secrets management
