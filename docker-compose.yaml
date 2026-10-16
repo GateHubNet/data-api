@@ -1,3 +1,54 @@
+# Local development stack. One ClickHouse server, one database per network (the database is named after the network:
+# `xrpl`, `xahau`), and per network a one-shot migrate job, a syncer and an api - the same images as production.
+#
+#   docker compose up -d clickhouse                      only ClickHouse; run the apps from source (pnpm start:syncer / start:api)
+#   docker compose --profile full up -d --build          + the XRPL stack: migrate-xrpl, syncer-xrpl, api-xrpl
+#   docker compose --profile xahau up -d --build         + the Xahau stack: migrate-xahau, syncer-xahau, api-xahau
+#   docker compose --profile full --profile xahau up -d --build    both networks
+#   docker compose run --rm migrate-xahau                apply the schema of one network on its own
+#
+# Building the images needs NPM_TOKEN (the private @gatehub/toolbox); it is passed as a BuildKit secret, not baked in:
+#   NPM_TOKEN=... docker compose --profile full build
+#
+# Everything is published on 127.0.0.1 only. The stack is configured from the environment of this shell
+# (GH_CLICKHOUSE_USER, GH_CLICKHOUSE_PASSWORD, GH_API_KEYS, XRPL_NODE_ENDPOINTS, ...); the defaults below are for
+# development. Nothing reads apps/*/.env: those files are for running the apps from source.
+#
+# Migrations are owned by the migrate-* jobs (the apps wait for them to complete), so the syncers run with
+# GH_RUN_MIGRATIONS_ON_BOOT=false.
+
+x-syncer-build: &syncer-build
+  context: .
+  dockerfile: apps/syncer/Dockerfile
+  secrets: [npm_token]
+
+x-api-build: &api-build
+  context: .
+  dockerfile: apps/api/Dockerfile
+  secrets: [npm_token]
+
+x-clickhouse-client: &clickhouse-client
+  GH_CLICKHOUSE_URL: http://clickhouse:8123
+  GH_CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-default}
+  GH_CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:-}
+
+# node:slim has no wget/curl, so the probes use Node's global fetch.
+x-api-healthcheck: &api-healthcheck
+  test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+# The syncer opens its HTTP port only once its node connection is up, and answers 503 while it is more than
+# GH_MAX_LAG_HEALTHY ledgers behind for over a minute (catching up): `unhealthy` there is informational, nothing restarts on it.
+x-syncer-healthcheck: &syncer-healthcheck
+  test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3002/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 60s
+
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.8.14.3
@@ -10,13 +61,13 @@ services:
         soft: 262144
         hard: 262144
     environment:
-      CLICKHOUSE_DB: xrpl
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ''
+      # No CLICKHOUSE_DB: the migrate-* jobs create the database of their network.
+      CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:-}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - '8123:8123' # HTTP interface (used by @clickhouse/client)
-      - '9000:9000' # native protocol
+      - '127.0.0.1:8123:8123' # HTTP interface (used by @clickhouse/client)
+      - '127.0.0.1:9000:9000' # native protocol
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     healthcheck:
@@ -25,38 +76,127 @@ services:
       timeout: 3s
       retries: 10
 
-  # Optional: build & run the services locally. Requires NPM_TOKEN for @gatehub/toolbox.
-  syncer:
-    profiles: ['full']
-    build:
-      context: .
-      dockerfile: apps/syncer/Dockerfile
-      args:
-        NPM_TOKEN: ${NPM_TOKEN}
-    env_file: apps/syncer/.env
-    environment:
-      GH_CLICKHOUSE_URL: http://clickhouse:8123
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-    ports:
-      - '3002:3002'
+  # ---------------------------------------------------------------- XRPL (profile: full)
 
-  api:
+  # One-shot: create the `xrpl` database and apply the schema, then exit 0.
+  migrate-xrpl:
     profiles: ['full']
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
-      args:
-        NPM_TOKEN: ${NPM_TOKEN}
-    env_file: apps/api/.env
+    build: *syncer-build
+    image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
     environment:
-      GH_CLICKHOUSE_URL: http://clickhouse:8123
+      <<: *clickhouse-client
+      GH_NETWORK: xrpl
     depends_on:
       clickhouse:
         condition: service_healthy
+    restart: 'no'
+
+  syncer-xrpl:
+    profiles: ['full']
+    build: *syncer-build
+    image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xrpl
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
+      GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
+      GH_RUN_MIGRATIONS_ON_BOOT: 'false'
+      GH_HTTP_API_PORT: 3002
+      GH_METRICZ_PORT: 3000
+    depends_on:
+      migrate-xrpl:
+        condition: service_completed_successfully
+    healthcheck: *syncer-healthcheck
+    stop_grace_period: 30s
     ports:
-      - '3001:3001'
+      - '127.0.0.1:3002:3002' # /liveliness/healthz
+      - '127.0.0.1:3004:3000' # /metricz
+
+  api-xrpl:
+    profiles: ['full']
+    build: *api-build
+    image: gatehub/data-api:${IMAGE_TAG:-dev}
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xrpl
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      # Development key: the API refuses to start in production mode without keys. Set GH_API_KEYS to use your own.
+      GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
+      GH_HTTP_API_PORT: 3001
+      GH_METRICZ_PORT: 3000
+    depends_on:
+      migrate-xrpl:
+        condition: service_completed_successfully
+    healthcheck: *api-healthcheck
+    stop_grace_period: 30s
+    ports:
+      - '127.0.0.1:3001:3001' # /v2/*, /liveliness/healthz, /internal/docs
+      - '127.0.0.1:3003:3000' # /metricz
+
+  # ---------------------------------------------------------------- Xahau (profile: xahau)
+
+  # One-shot: create the `xahau` database and apply the schema, then exit 0.
+  migrate-xahau:
+    profiles: ['xahau']
+    build: *syncer-build
+    image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xahau
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: 'no'
+
+  syncer-xahau:
+    profiles: ['xahau']
+    build: *syncer-build
+    image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xahau
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
+      GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
+      GH_RUN_MIGRATIONS_ON_BOOT: 'false'
+      GH_HTTP_API_PORT: 3002
+      GH_METRICZ_PORT: 3000
+    depends_on:
+      migrate-xahau:
+        condition: service_completed_successfully
+    healthcheck: *syncer-healthcheck
+    stop_grace_period: 30s
+    ports:
+      - '127.0.0.1:3012:3002' # /liveliness/healthz
+      - '127.0.0.1:3014:3000' # /metricz
+
+  api-xahau:
+    profiles: ['xahau']
+    build: *api-build
+    image: gatehub/data-api:${IMAGE_TAG:-dev}
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xahau
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
+      GH_HTTP_API_PORT: 3001
+      GH_METRICZ_PORT: 3000
+    depends_on:
+      migrate-xahau:
+        condition: service_completed_successfully
+    healthcheck: *api-healthcheck
+    stop_grace_period: 30s
+    ports:
+      - '127.0.0.1:3011:3001' # /v2/*, /liveliness/healthz, /internal/docs
+      - '127.0.0.1:3013:3000' # /metricz
+
+# The npm token for the private @gatehub/toolbox, read from the NPM_TOKEN environment variable at build time only.
+secrets:
+  npm_token:
+    environment: NPM_TOKEN
 
 volumes:
   clickhouse-data:

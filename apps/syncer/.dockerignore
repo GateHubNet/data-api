@@ -1,7 +1,0 @@
-node_modules
-dist
-coverage
-junit
-.env
-.env.*
-!.env.example

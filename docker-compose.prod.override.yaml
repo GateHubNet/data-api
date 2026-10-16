@@ -3,7 +3,7 @@
 # (ClickHouse should not be exposed to the host/network there).
 #
 #   docker compose -f docker-compose.prod.yaml -f docker-compose.prod.override.yaml \
-#     --env-file deploy/.env.prod up -d --build --scale api=8
+#     --env-file deploy/.env.prod up -d --build --scale api-xrpl=8 --scale api-xahau=2
 services:
   clickhouse:
     ports:

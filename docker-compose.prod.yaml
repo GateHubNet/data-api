@@ -1,10 +1,104 @@
-# Production-shaped topology. Run with:
-#   NPM_TOKEN=... docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --build
-#   docker compose -f docker-compose.prod.yaml up -d --scale api=3   # scale the read tier
+# Production-shaped topology: one deployment per network (XRPL and Xahau) on one ClickHouse server.
 #
-# Components: ClickHouse Keeper (coordination) -> ClickHouse -> one-shot migrate job
-# -> syncer (ingest) + api (read replicas) behind nginx. Secrets come from the
-# --env-file (inject from your secrets manager in real deployments; never commit it).
+#   ClickHouse Keeper -> ClickHouse -> migrate-<network> (one-shot, creates the database of the network and applies the schema)
+#                                   -> syncer-<network> (ingest, exactly one) + api-<network> (read replicas)
+#   nginx routes by host to the apis: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau (deploy/nginx/nginx.conf)
+#
+# Run (secrets come from deploy/.env.prod - inject it from your secrets manager, never commit it; the building needs the npm
+# token of the private @gatehub/toolbox, passed as a BuildKit secret from the NPM_TOKEN environment variable):
+#   NPM_TOKEN=... docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --build
+#
+# Scale the read tier of a network (compose has no rolling update; `up` recreates the changed services):
+#   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --scale api-xrpl=3 --scale api-xahau=2
+#
+# The syncers are singletons: replicas 1 and a fixed container_name (compose then refuses to scale them). A single writer
+# per network and database is a rule of the application (it holds a lease in ClickHouse), and `up` recreates a changed syncer
+# by stopping the old container before starting the new one - compose has no rolling update, so the two never overlap.
+#
+# Backfill or repair a ledger range of one network. The live syncer keeps running; the CLI checks the syncer lease itself.
+# The image holds the CLI as `dist/cli/range-ingest.js` (--help lists the options):
+#   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+#     node dist/cli/range-ingest.js --from 90000000 --to 90100000
+#   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xahau \
+#     node dist/cli/range-ingest.js --from 1 --to 100000 --concurrency 4
+#
+# Apply the migrations by hand (they also run on every `up`, as part of the start order; all DDL is idempotent):
+#   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl
+#
+# Metrics: every api and syncer serves Prometheus metrics on port 3000 (GET /metricz) of the compose network. They are
+# exposed to that network only and not published; scrape them from a Prometheus container on the same network
+# (targets api-xrpl:3000, syncer-xrpl:3000, ... - with scaled replicas use Docker DNS service discovery).
+#
+# Migrations are owned by the migrate-* jobs (the apps wait for them to complete), so the syncers run with
+# GH_RUN_MIGRATIONS_ON_BOOT=false. Do not set GH_CLICKHOUSE_DATABASE, GH_NETWORK, GH_NODE_ENDPOINTS, GH_VALIDATION_ENDPOINTS,
+# GH_SYNC_START_LEDGER or the ports in deploy/.env.prod: they are per network and fixed below (see XRPL_* / XAHAU_*).
+
+x-syncer-build: &syncer-build
+  context: .
+  dockerfile: apps/syncer/Dockerfile
+  secrets: [npm_token]
+
+x-api-build: &api-build
+  context: .
+  dockerfile: apps/api/Dockerfile
+  secrets: [npm_token]
+
+# node:slim has no wget/curl, so the probes use Node's global fetch.
+x-api-healthcheck: &api-healthcheck
+  test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+# The syncer opens its HTTP port only once its node connection is up, and answers 503 while it is more than
+# GH_MAX_LAG_HEALTHY ledgers behind for over a minute (catching up): `unhealthy` there is informational, nothing restarts on it.
+x-syncer-healthcheck: &syncer-healthcheck
+  test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3002/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 60s
+
+# The ClickHouse login is deploy/.env.prod's GH_CLICKHOUSE_USER / GH_CLICKHOUSE_PASSWORD for every client.
+x-clickhouse-client: &clickhouse-client
+  GH_CLICKHOUSE_URL: http://clickhouse:8123
+  GH_CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-data_api}
+  GH_CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:?set a ClickHouse password}
+
+x-migrate: &migrate
+  build: *syncer-build
+  image: gatehub/data-syncer:${IMAGE_TAG:-latest}
+  # The schema lives in the shared package of the image: schema/ next to dist/.
+  command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
+  depends_on:
+    clickhouse:
+      condition: service_healthy
+  restart: 'no'
+
+x-syncer: &syncer
+  build: *syncer-build
+  image: gatehub/data-syncer:${IMAGE_TAG:-latest}
+  env_file: deploy/.env.prod
+  restart: unless-stopped
+  deploy:
+    replicas: 1
+  # The apps finish their cleanups within 10 s of SIGTERM.
+  stop_grace_period: 30s
+  healthcheck: *syncer-healthcheck
+  # metricz (3000) and the probe (3002) are reachable inside the compose network only.
+  expose: ['3000', '3002']
+
+x-api: &api
+  build: *api-build
+  image: gatehub/data-api:${IMAGE_TAG:-latest}
+  env_file: deploy/.env.prod
+  restart: unless-stopped
+  stop_grace_period: 30s
+  healthcheck: *api-healthcheck
+  # no host port + no container_name -> scalable with `--scale api-<network>=N`; nginx is the only way in
+  expose: ['3001', '3000']
+
 services:
   keeper:
     image: clickhouse/clickhouse-keeper:26.8.14.3
@@ -28,7 +122,7 @@ services:
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     environment:
-      CLICKHOUSE_DB: ${GH_CLICKHOUSE_DATABASE:-xrpl}
+      # No CLICKHOUSE_DB: the migrate-* jobs create the database of each network (xrpl, xahau).
       CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-data_api}
       CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:?set a ClickHouse password}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
@@ -45,75 +139,116 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot: apply schema migrations, then exit 0. Other services wait for it.
-  migrate:
-    build:
-      context: .
-      dockerfile: apps/syncer/Dockerfile
-      args:
-        NPM_TOKEN: ${NPM_TOKEN}
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-    environment:
-      GH_CLICKHOUSE_URL: http://clickhouse:8123
-      GH_CLICKHOUSE_DATABASE: ${GH_CLICKHOUSE_DATABASE:-xrpl}
-      GH_CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-data_api}
-      GH_CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD}
-    command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
-    restart: 'no'
+  # ------------------------------------------------------------------------------------------------ XRPL
 
-  syncer:
-    build:
-      context: .
-      dockerfile: apps/syncer/Dockerfile
-      args:
-        NPM_TOKEN: ${NPM_TOKEN}
+  # One-shot: create the `xrpl` database and apply the schema, then exit 0. The xrpl services wait for it.
+  migrate-xrpl:
+    <<: *migrate
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xrpl
+
+  syncer-xrpl:
+    <<: *syncer
+    container_name: data-syncer-xrpl
     depends_on:
-      migrate:
+      migrate-xrpl:
         condition: service_completed_successfully
-    env_file: deploy/.env.prod
     environment:
-      GH_CLICKHOUSE_URL: http://clickhouse:8123
-      GH_RUN_MIGRATIONS_ON_BOOT: 'false' # migrations are owned by the one-shot job
-    restart: unless-stopped
-    healthcheck:
-      # node:slim has no wget/curl — use Node's global fetch instead.
-      test: ['CMD', 'node', '-e', "fetch('http://localhost:3002/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+      <<: *clickhouse-client
+      GH_NETWORK: xrpl
+      GH_CLICKHOUSE_DATABASE: xrpl
+      # Point a full-history syncer at your own node or at Ripple's full history server (wss://s2.ripple.com).
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      # Empty = the node endpoints.
+      GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
+      # Empty = the validated head at the first boot; ignored once ledgers exist.
+      GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
+      GH_RUN_MIGRATIONS_ON_BOOT: 'false' # owned by migrate-xrpl
+      GH_HTTP_API_PORT: 3002
+      GH_METRICZ_PORT: 3000
 
-  api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
-      args:
-        NPM_TOKEN: ${NPM_TOKEN}
+  api-xrpl:
+    <<: *api
     depends_on:
-      migrate:
+      migrate-xrpl:
         condition: service_completed_successfully
-    env_file: deploy/.env.prod
     environment:
-      GH_CLICKHOUSE_URL: http://clickhouse:8123
-    restart: unless-stopped
-    # no host port + no container_name -> scalable with `--scale api=N`
-    expose: ['3001']
-    healthcheck:
-      # node:slim has no wget/curl — use Node's global fetch instead.
-      test: ['CMD', 'node', '-e', "fetch('http://localhost:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+      <<: *clickhouse-client
+      GH_NETWORK: xrpl
+      GH_CLICKHOUSE_DATABASE: xrpl
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
+      GH_HTTP_API_PORT: 3001
+      GH_METRICZ_PORT: 3000
 
+  # ------------------------------------------------------------------------------------------------ Xahau
+
+  # One-shot: create the `xahau` database and apply the schema, then exit 0. The xahau services wait for it.
+  migrate-xahau:
+    <<: *migrate
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xahau
+
+  syncer-xahau:
+    <<: *syncer
+    container_name: data-syncer-xahau
+    depends_on:
+      migrate-xahau:
+        condition: service_completed_successfully
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xahau
+      GH_CLICKHOUSE_DATABASE: xahau
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      # Empty = the node endpoints.
+      GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
+      # Empty = the validated head at the first boot; ignored once ledgers exist.
+      GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
+      GH_RUN_MIGRATIONS_ON_BOOT: 'false' # owned by migrate-xahau
+      GH_HTTP_API_PORT: 3002
+      GH_METRICZ_PORT: 3000
+
+  api-xahau:
+    <<: *api
+    depends_on:
+      migrate-xahau:
+        condition: service_completed_successfully
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xahau
+      GH_CLICKHOUSE_DATABASE: xahau
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
+      GH_HTTP_API_PORT: 3001
+      GH_METRICZ_PORT: 3000
+
+  # ------------------------------------------------------------------------------------------------ edge
+
+  # Routes by host name: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau. TLS terminates in front of it (see nginx.conf).
   nginx:
     image: nginx:1.27-alpine
-    depends_on: [api]
+    depends_on:
+      api-xrpl:
+        condition: service_healthy
+      api-xahau:
+        condition: service_healthy
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - '8080:80'
     restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/healthz']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+# The npm token for the private @gatehub/toolbox, read from the NPM_TOKEN environment variable at build time only.
+secrets:
+  npm_token:
+    environment: NPM_TOKEN
 
 volumes:
   keeper-data:
