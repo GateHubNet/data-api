@@ -4,6 +4,8 @@ import { runMigrations } from '../src/clickhouse/migrate';
 import { Table } from '../src/clickhouse/tables';
 import { buildLedgerRows, CHILD_TABLES, LedgerRows } from '../src/ingest/build-rows';
 import { FixtureLedgerSource } from '../src/ingest/fixture-ledger-source';
+import { committedCheckpoint } from '../src/ingest/ingest-state';
+import { LedgerWriter } from '../src/ingest/ledger-writer';
 import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
@@ -64,6 +66,8 @@ const SCENARIOS: Scenario[] = [
   { name: 'ripple-mock', database: 'rows_mock', network: 'xrpl', dir: 'xrpl/ripple-mock', ledgers: 54, payments: 182 },
   { name: 'recorded xrpl', database: 'rows_xrpl', network: 'xrpl', dir: 'xrpl/recorded', ledgers: 9 },
   { name: 'recorded xahau', database: 'rows_xahau', network: 'xahau', dir: 'xahau/recorded', ledgers: 6 },
+  // A flag ledger: 22 UNLReport pseudo-transactions with Account "" (ruling R95).
+  { name: 'xahau flag ledger', database: 'rows_xahau_flag', network: 'xahau', dir: 'xahau/flag', ledgers: 1 },
 ];
 
 describe('buildLedgerRows into ClickHouse (e2e)', () => {
@@ -196,6 +200,41 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
       });
       // The numbers are what the reference sums.
       expect(String(ledger.total_coins)).toMatch(/^\d{15,17}$/);
+    });
+  });
+
+  describe('a Xahau flag ledger through the LedgerWriter (ruling R95)', () => {
+    let svc: ClickHouseService;
+
+    beforeAll(async () => {
+      const config = { ...ch.config, database: 'rows_xahau_flag_writer' };
+      await runMigrations({ config, log: () => undefined });
+      svc = new ClickHouseService(config);
+    });
+
+    afterAll(async () => {
+      await svc?.onModuleDestroy();
+    });
+
+    it('commits the ledger, with the UNLReport sender as the zero account and its tx_json as the node sent it', async () => {
+      const ctx = parseContextFor(getNetworkProfile('xahau'));
+      const ledgers = FixtureLedgerSource.fromDir(join(FIXTURES, 'xahau', 'flag')).list();
+      await new LedgerWriter(svc, ctx).write(ledgers);
+
+      expect(await committedCheckpoint(svc)).toBe(26570752);
+      const reports = await svc.query<{ account: string; sequence: number; account_in_json: string; n: number }>(
+        `SELECT account, sequence, JSONExtractString(tx_json, 'Account') AS account_in_json, count() AS n
+           FROM ${Table.Transactions} WHERE tx_type = 'UNLReport' GROUP BY account, sequence, account_in_json`,
+      );
+      expect(reports).toEqual([{ account: 'rrrrrrrrrrrrrrrrrrrrrhoLvTp', sequence: 0, account_in_json: '', n: 22 }]);
+      const bySequence = await svc.queryOne<{ n: string }>(
+        `SELECT count() AS n FROM ${Table.AccountTxBySequence} WHERE account = 'rrrrrrrrrrrrrrrrrrrrrhoLvTp'`,
+      );
+      expect(Number(bySequence?.n)).toBe(22);
+      const ledger = await svc.queryOne<{ tx_count: number; payments_count: number }>(
+        `SELECT tx_count, payments_count FROM ${Table.Ledgers} WHERE ledger_index = 26570752`,
+      );
+      expect(ledger).toEqual({ tx_count: 37, payments_count: 15 });
     });
   });
 });

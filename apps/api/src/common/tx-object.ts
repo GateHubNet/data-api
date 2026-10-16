@@ -140,13 +140,15 @@ export class TxService {
    * The API object of a stored transaction.
    *
    *  - JSON mode: `tx` and `meta` are what the Ripple API served, the binary form decoded again:
-   *    `decode(encode(stored))` with the definitions of the network. That drops what rippled adds to its JSON and
+   *    `decode(encode(stored))` with the definitions of the network (an empty AccountID stays `""`, see
+   *    `BinaryCodecService.roundTrip`). That drops what rippled adds to its JSON and
    *    the binary does not carry (`DeliverMax`, `type` and `type_hex` in the steps of `Paths`, rippled's own
    *    `meta.delivered_amount`), writes UInt64 fields as 16 upper case hex digits and lists the fields in the order of
    *    the binary format. A successful Payment then gets `meta.delivered_amount`: `DeliveredAmount`, else `Amount`
    *    unless the payment is partial and from before the fix (`'unavailable'`), as the Ripple API worked it out.
    *    An issued-currency or MPT amount is cloned, so that no object is shared inside the answer.
-   *  - Binary mode: `tx` and `meta` are the serialized original as upper case hex, without the injected field.
+   *  - Binary mode: `tx` and `meta` are the serialized original as upper case hex, without the injected field: the
+   *    node's bytes, which re-hash to the transaction hash (an empty AccountID is a zero-length field, ruling R97).
    *
    * Every call returns objects of its own (nothing is shared with the cache or with other calls).
    *
@@ -179,15 +181,19 @@ export class TxService {
     return { ...head, tx, meta };
   }
 
-  /** `decode(encode(stored))` of the transaction and of its metadata. Throws what the codec cannot serialize. */
+  /**
+   * `decode(encode(stored))` of the transaction and of its metadata (`roundTrip`). Throws what the codec cannot
+   * serialize.
+   */
   private canonical(row: TransactionsRow): CanonicalForm {
     const key = `json:${row.hash}`;
     const hit = this.cacheGet(key);
     if (hit !== undefined) return JSON.parse(hit) as CanonicalForm;
 
-    // Both before either is used: a transaction is served canonical or as stored, never half of each.
-    const tx = this.codec.decode(this.codec.encode(JSON.parse(row.tx_json)));
-    const meta = this.codec.decode(this.codec.encode(JSON.parse(row.meta_json)));
+    // Both before either is used: a transaction is served canonical or as stored, never half of each. `roundTrip` is
+    // decode(encode()) that keeps an empty AccountID ("", Xahau's UNLReport) as the node shows it.
+    const tx = this.codec.roundTrip(JSON.parse(row.tx_json));
+    const meta = this.codec.roundTrip(JSON.parse(row.meta_json));
     this.cacheSet(key, JSON.stringify({ tx, meta }));
     return { tx, meta };
   }

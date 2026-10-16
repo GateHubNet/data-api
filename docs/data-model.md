@@ -89,6 +89,12 @@ Header and summary of a ledger; **the commit marker**. Columns: `ledger_index UI
 ZSTD(3)` (the transaction **without** metadata), `meta_json String ZSTD(3)` (the metadata, unaltered). Every transaction object of the
 API is made from here. This is the largest table.
 
+`account` is the sender (`Account`). Pseudo-transactions carry the zero account `rrrrrrrrrrrrrrrrrrrrrhoLvTp` there; Xahau's
+`UNLReport` (one per active validator in every flag ledger, the ledgers whose index is divisible by 256) leaves its `Account` empty
+(`""`, a zero-length AccountID), and is indexed under the zero account too (`account`, `account_tx_by_sequence`, the `parent` of
+`accounts_created`), while `tx_json` keeps the node's `""`. The API shows `""` like the node, and its `binary=true` form is the
+node's zero-length field (`81 00`).
+
 ### `tx_by_hash` (P7, `ORDER BY hash`), `tx_by_type` (P7, `ORDER BY (tx_type, ledger_index, tx_index)`)
 Narrow lookups into `transactions`: `hash` -> `(ledger_index, tx_index)`; `tx_by_type` also carries `result`. Read by
 `/transactions/{hash}` and `/transactions?type=`.

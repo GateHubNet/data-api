@@ -17,20 +17,26 @@ import {
   TransactionsRow,
 } from '@gatehub/data-api-shared';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 
 /** The ledger fixtures of the shared package, which the API tests seed ClickHouse with and check the codec against. */
 const FIXTURES = join(__dirname, '..', '..', '..', '..', 'packages', 'shared', 'test', 'fixtures');
 export const RIPPLE_MOCK_DIR = join(FIXTURES, 'xrpl', 'ripple-mock');
 export const XRPL_RECORDED_DIR = join(FIXTURES, 'xrpl', 'recorded');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
+/** Xahau flag ledger 26570752: 22 UNLReport pseudo-transactions with `Account: ""`, and 15 Payments. */
+export const XAHAU_FLAG_DIR = join(FIXTURES, 'xahau', 'flag');
+export const XAHAU_FLAG_LEDGER = 26570752;
 
-export type SeedName = 'ripple-mock' | 'xrpl-recorded' | 'xahau-recorded';
+export type SeedName = 'ripple-mock' | 'xrpl-recorded' | 'xahau-recorded' | 'xahau-flag';
 
 const DIRS: Record<SeedName, string> = {
   'ripple-mock': RIPPLE_MOCK_DIR,
   'xrpl-recorded': XRPL_RECORDED_DIR,
   'xahau-recorded': XAHAU_RECORDED_DIR,
+  'xahau-flag': XAHAU_FLAG_DIR,
 };
 
 const sources = new Map<SeedName, FixtureLedgerSource>();
@@ -50,7 +56,22 @@ export const SEED_NETWORK: Record<SeedName, NetworkName> = {
   'ripple-mock': 'xrpl',
   'xrpl-recorded': 'xrpl',
   'xahau-recorded': 'xahau',
+  'xahau-flag': 'xahau',
 };
+
+/**
+ * The flag ledger as the node serialized it (`ledger` with `binary: true`): the `tx_blob` and `meta` hex of every
+ * transaction, by transaction hash (the hash is computed from the blob, so it does not depend on the codec under test).
+ */
+export function xahauFlagNodeBlobs(): Map<string, { tx: string; meta: string }> {
+  const file = join(XAHAU_FLAG_DIR, `node-binary-${XAHAU_FLAG_LEDGER}.json.gz`);
+  const result = JSON.parse(gunzipSync(readFileSync(file)).toString('utf8')) as {
+    ledger: { transactions: { tx_blob: string; meta: string }[] };
+  };
+  return new Map(
+    result.ledger.transactions.map((t) => [transactionId(t.tx_blob), { tx: t.tx_blob, meta: t.meta.toUpperCase() }]),
+  );
+}
 
 /** A transaction of a fixture ledger, with the ledger it is in and the row the syncer stores for it. */
 export interface FixtureTx {

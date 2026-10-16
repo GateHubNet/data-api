@@ -38,6 +38,28 @@ export interface ParserTx {
   client: string | null;
 }
 
+/**
+ * The zero AccountID (`rrrrrrrrrrrrrrrrrrrrrhoLvTp`): the `Account` of XRPL's pseudo-transactions (EnableAmendment,
+ * SetFee, UNLModify), which rippled sets explicitly.
+ */
+export const ACCOUNT_ZERO = 'rrrrrrrrrrrrrrrrrrrrrhoLvTp';
+
+/**
+ * The sender of a transaction as the index columns store it: its `Account`, with the empty string read as
+ * `ACCOUNT_ZERO`.
+ *
+ * Xahau's `UNLReport` pseudo-transactions (one per active validator in every flag ledger, whose index is divisible by
+ * 256) never set `Account`: a default AccountID, which xahaud serializes as a zero-length field (`81 00`) and shows in
+ * JSON as `""`. They are the same kind of transaction as XRPL's pseudo-transactions, so they are indexed under the same
+ * account; the stored `tx_json` keeps the node's `""` (ruling R95). Any other transaction type that turns up with an
+ * empty Account is treated alike. Undefined when `Account` is missing or not a string.
+ */
+export function senderAccount(tx: Readonly<Record<string, unknown>>): string | undefined {
+  const account = tx.Account;
+  if (typeof account !== 'string') return undefined;
+  return account === '' ? ACCOUNT_ZERO : account;
+}
+
 export function toParserTx(raw: RawTransaction, header: LedgerHeader, client: string | null): ParserTx {
   return {
     hash: raw.hash,

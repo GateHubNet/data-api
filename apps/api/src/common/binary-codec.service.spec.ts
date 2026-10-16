@@ -7,7 +7,10 @@ import {
   fixtureTransaction,
   fixtureTransactions,
   transactionId,
+  transactionTreeRoot,
+  XAHAU_FLAG_LEDGER,
   XAHAU_RECORDED_DIR,
+  xahauFlagNodeBlobs,
   XRPL_RECORDED_DIR,
 } from '../../test/support/fixtures';
 import type { XrplService } from '../xrpl/xrpl.service';
@@ -48,6 +51,9 @@ async function started(
   await codec.onModuleInit();
   return { codec, request: node.request };
 }
+
+/** A copy of the transaction with another `Account`. */
+const withAccount = (tx: Record<string, unknown>, account: string) => ({ ...tx, Account: account });
 
 /** A network profile that bundles no definitions at all. */
 const withoutBundledDefinitions = (network: NetworkName) => ({
@@ -215,6 +221,118 @@ describe('BinaryCodecService', () => {
         TransactionResult: 'tesSUCCESS',
         TransactionIndex: tx.meta.TransactionIndex,
       });
+    });
+  });
+
+  describe('an empty AccountID (Xahau UNLReport, Account ""; ruling R97)', () => {
+    const ZERO = 'rrrrrrrrrrrrrrrrrrrrrhoLvTp';
+    const flag = () => fixtureTransactions('xahau-flag');
+    const reports = () => flag().filter((t) => t.row.tx_type === 'UNLReport');
+
+    it('serializes Account "" as a zero-length field (81 00): every blob of the flag ledger is the node\'s own', async () => {
+      const { codec } = await started('xahau', nodeDown());
+      const node = xahauFlagNodeBlobs();
+      expect(reports()).toHaveLength(22);
+      for (const { row } of flag()) {
+        const tx = codec.encode(JSON.parse(row.tx_json));
+        expect(tx).toBe(node.get(row.hash)?.tx);
+        expect(transactionId(tx)).toBe(row.hash);
+        expect(codec.encode(JSON.parse(row.meta_json))).toBe(node.get(row.hash)?.meta);
+      }
+      expect(codec.encode(JSON.parse(reports()[0].row.tx_json))).toContain('73008100');
+    });
+
+    it('re-hashes the transaction tree of the flag ledger to its transaction_hash', async () => {
+      const { codec } = await started('xahau', nodeDown());
+      const items = flag().map(({ row }) => ({
+        hash: row.hash,
+        tx: codec.encode(JSON.parse(row.tx_json)),
+        meta: codec.encode(JSON.parse(row.meta_json)),
+      }));
+      const { ledger } = flag()[0];
+      expect(ledger.header.ledger_index).toBe(XAHAU_FLAG_LEDGER);
+      expect(transactionTreeRoot(items)).toBe(ledger.header.transaction_hash);
+    });
+
+    it('round trips Account "" as "" (not the zero account): roundTrip is decode(encode()) that keeps it', async () => {
+      const { codec } = await started('xahau', nodeDown());
+      for (const { tx } of reports()) {
+        const json = codec.roundTrip(tx.tx);
+        expect(json.Account).toBe('');
+        // The canonical JSON of the same transaction with the zero account, but with the node's "" in it.
+        expect(json).toEqual({ ...codec.decode(codec.encode(withAccount(tx.tx, ZERO))), Account: '' });
+        expect(transactionId(codec.encode(json))).toBe(tx.hash);
+      }
+    });
+
+    it('is decode(encode()) for every other transaction', async () => {
+      const { codec } = await started('xahau', nodeDown());
+      for (const { row } of [...fixtureTransactions('xahau-recorded'), ...flag()].filter(
+        (t) => t.row.tx_type !== 'UNLReport',
+      )) {
+        const stored = JSON.parse(row.tx_json);
+        expect(codec.roundTrip(stored)).toEqual(codec.decode(codec.encode(stored)));
+      }
+    });
+
+    it('keeps an explicit zero account (XRPL pseudo-transactions) as 20 zero bytes', async () => {
+      const { codec } = await started('xrpl', nodeDown());
+      const pseudo = {
+        TransactionType: 'EnableAmendment',
+        Account: ZERO,
+        Fee: '0',
+        Sequence: 0,
+        SigningPubKey: '',
+        Amendment: 'AB'.repeat(32),
+        LedgerSequence: 1,
+      };
+      expect(codec.encode(pseudo)).toContain(`8114${'00'.repeat(20)}`);
+      expect(codec.roundTrip(pseudo).Account).toBe(ZERO);
+    });
+
+    it('serializes every empty AccountID field, nested ones too, as zero length, and gives each back as ""', async () => {
+      const { codec } = await started('xahau', nodeDown());
+      const meta = {
+        TransactionIndex: 3,
+        TransactionResult: 'tesSUCCESS',
+        AffectedNodes: [
+          {
+            ModifiedNode: {
+              LedgerEntryType: 'AccountRoot',
+              LedgerIndex: 'CD'.repeat(32),
+              FinalFields: { Account: '', Balance: '10', Flags: 0, OwnerCount: 0, Sequence: 1 },
+              PreviousFields: { Balance: '20' },
+            },
+          },
+        ],
+      };
+      const hex = codec.encode(meta);
+      // The Account of FinalFields (field 1 of type 8): its header and a zero length, nothing after it.
+      expect(hex).toContain('8100');
+      expect(hex).not.toContain('8114');
+      expect(codec.roundTrip(meta)).toEqual(meta);
+
+      const payment = {
+        TransactionType: 'Payment',
+        Account: '',
+        Destination: '',
+        Amount: '1',
+        Fee: '0',
+        Sequence: 0,
+        SigningPubKey: '',
+      };
+      const blob = codec.encode(payment);
+      expect(blob).toContain('81008300');
+      expect(codec.roundTrip(payment)).toMatchObject({ Account: '', Destination: '' });
+    });
+
+    it('does not change the object it is given', async () => {
+      const { codec } = await started('xahau', nodeDown());
+      const tx = structuredClone(reports()[0].tx.tx);
+      const before = JSON.stringify(tx);
+      codec.encode(tx);
+      codec.roundTrip(tx);
+      expect(JSON.stringify(tx)).toBe(before);
     });
   });
 

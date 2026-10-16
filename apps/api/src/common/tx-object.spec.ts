@@ -8,6 +8,7 @@ import {
   fixtureTransactions,
   SeedName,
   transactionId,
+  xahauFlagNodeBlobs,
   XRPL_RECORDED_DIR,
 } from '../../test/support/fixtures';
 import { ApiConfig } from '../config/api.config';
@@ -369,6 +370,48 @@ describe('TxService.toTxObject', () => {
     });
   });
 
+  describe('a UNLReport, whose Account is "" (Xahau flag ledgers; rulings R95, R97)', () => {
+    const reports = () => fixtureTransactions('xahau-flag').filter((t) => t.row.tx_type === 'UNLReport');
+
+    it('shows Account "" in JSON mode, as the node does (not the zero account the row is indexed under)', async () => {
+      const { service, prometheus } = await serviceFor('xahau');
+      expect(reports()).toHaveLength(22);
+      const counted = await fallbacksDuring(prometheus, () => {
+        for (const { row } of reports()) {
+          expect(row.account).toBe('rrrrrrrrrrrrrrrrrrrrrhoLvTp');
+          const obj = service.toTxObject(row, { binary: false });
+          expect((obj.tx as Record<string, unknown>).Account).toBe('');
+          expect((obj.tx as Record<string, unknown>).TransactionType).toBe('UNLReport');
+        }
+      });
+      expect(counted).toEqual({ json: 0, binary: 0 });
+    });
+
+    it("serves the node's own bytes in binary mode, which re-hash to the transaction hash", async () => {
+      const { service, prometheus } = await serviceFor('xahau');
+      const node = xahauFlagNodeBlobs();
+      const counted = await fallbacksDuring(prometheus, () => {
+        for (const { row } of fixtureTransactions('xahau-flag')) {
+          const obj = service.toTxObject(row, { binary: true });
+          expect(obj.tx).toBe(node.get(row.hash)?.tx);
+          expect(obj.meta).toBe(node.get(row.hash)?.meta);
+          expect(transactionId(obj.tx as string)).toBe(row.hash);
+        }
+      });
+      expect(counted).toEqual({ json: 0, binary: 0 });
+    });
+
+    it('serves the same from the cache', async () => {
+      const { service } = await serviceFor('xahau', noNode, 100);
+      const { row } = reports()[0];
+      for (const binary of [false, true]) {
+        const first = JSON.stringify(service.toTxObject(row, { binary }));
+        expect(JSON.stringify(service.toTxObject(row, { binary }))).toBe(first);
+      }
+      expect((service.toTxObject(row, { binary: false }).tx as Record<string, unknown>).Account).toBe('');
+    });
+  });
+
   describe('transactions the XRPL tools of a few years ago could not serialize (ruling R39)', () => {
     it.each([
       [
@@ -575,6 +618,7 @@ describe('TxService.toTxObject', () => {
     const spies = (codec: BinaryCodecService) => ({
       encode: jest.spyOn(codec, 'encode'),
       decode: jest.spyOn(codec, 'decode'),
+      roundTrip: jest.spyOn(codec, 'roundTrip'),
     });
 
     it.each([false, true])(
@@ -582,10 +626,11 @@ describe('TxService.toTxObject', () => {
       async (binary) => {
         const { service, codec } = await serviceFor('xrpl', noNode, 100);
         const first = service.toTxObject(row(), { binary, ledgerHash: 'AB'.repeat(32) });
-        const { encode, decode } = spies(codec);
+        const { encode, decode, roundTrip } = spies(codec);
         const second = service.toTxObject(row(), { binary, ledgerHash: 'AB'.repeat(32) });
         expect(encode).not.toHaveBeenCalled();
         expect(decode).not.toHaveBeenCalled();
+        expect(roundTrip).not.toHaveBeenCalled();
         expect(JSON.stringify(second)).toBe(JSON.stringify(first)); // same values, same field order
         expect(second).toEqual(first);
       },

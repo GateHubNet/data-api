@@ -1020,3 +1020,93 @@ describe('ripple-mock ground truth', () => {
     expect(built.reduce((sum, b) => sum + b.rows.exchanges.length, 0)).toBe(158);
   });
 });
+
+// -- An empty Account (ruling R95) ------------------------------------------------------------------------------
+
+/** The zero AccountID, which XRPL pseudo-transactions carry as their Account. */
+const ZERO_ACCOUNT = 'rrrrrrrrrrrrrrrrrrrrrhoLvTp';
+
+describe('a transaction whose Account is "" (Xahau UNLReport; ruling R95)', () => {
+  /** Xahau flag ledger 26570752: 22 UNLReport pseudo-transactions (Account "") and 15 Payments. */
+  const flag = (): RawLedger => {
+    const [ledger] = FixtureLedgerSource.fromDir(join(FIXTURES, 'xahau', 'flag')).list();
+    return ledger;
+  };
+
+  it('builds the rows of a recorded flag ledger: 22 UNLReport and 15 Payment', () => {
+    const raw = flag();
+    expect(raw.header.ledger_index).toBe(26570752);
+    expect(raw.header.ledger_index % 256).toBe(0);
+    const rows = buildLedgerRows(raw, XAHAU);
+    expect(rows.ledger.tx_count).toBe(37);
+    expect(rows.ledger.type_counts).toEqual({ UNLReport: 22, Payment: 15 });
+    expect(rows.payments).toHaveLength(15);
+  });
+
+  it('stores the zero account in the sender columns and the node JSON (Account "") in tx_json', () => {
+    const raw = flag();
+    const rows = buildLedgerRows(raw, XAHAU);
+    const reports = rows.transactions.filter((r) => r.tx_type === 'UNLReport');
+    expect(reports).toHaveLength(22);
+    for (const row of reports) {
+      expect(row.account).toBe(ZERO_ACCOUNT);
+      expect(row.sequence).toBe(0);
+      expect(row.fee).toBe('0');
+      expect(JSON.parse(row.tx_json).Account).toBe('');
+    }
+    const report = reports[0];
+    const original = raw.transactions.find((t) => t.hash === report.hash);
+    expect(report.tx_json).toBe(JSON.stringify(original?.tx));
+    expect(rows.accountTxBySequence.filter((r) => r.account === ZERO_ACCOUNT)).toHaveLength(22);
+    // The validators the report names in its metadata are not the sender: nothing is listed under ''.
+    expect([...rows.accountTransactions, ...rows.accountTxBySequence].some((r) => r.account === '')).toBe(false);
+  });
+
+  it('matches the golden rows of the flag ledger', () => {
+    expect(forSnapshot(buildLedgerRows(flag(), XAHAU))).toMatchSnapshot();
+  });
+
+  it('treats an empty Account the same way whatever the transaction type (a pseudo-transaction of any kind)', () => {
+    const ledger = ledgerOf([
+      {
+        TransactionType: 'EmitFailure',
+        Account: '',
+        Fee: '0',
+        Sequence: 0,
+        SigningPubKey: '',
+        hash: 'E'.repeat(64),
+        metaData: { TransactionIndex: 0, TransactionResult: 'tesSUCCESS', AffectedNodes: [] },
+      },
+    ]);
+    const rows = buildLedgerRows(ledger, XAHAU);
+    expect(rows.transactions[0].account).toBe(ZERO_ACCOUNT);
+    expect(JSON.parse(rows.transactions[0].tx_json).Account).toBe('');
+    expect(rows.accountTxBySequence).toEqual([
+      { account: ZERO_ACCOUNT, sequence: 0, ledger_index: 5000000, tx_index: 0 },
+    ]);
+  });
+
+  it('still rejects a transaction that has no Account at all, or one that is not a string', () => {
+    const missing = ledgerOf([
+      {
+        TransactionType: 'AccountSet',
+        Fee: '10',
+        Sequence: 1,
+        hash: 'A'.repeat(64),
+        metaData: { TransactionIndex: 0, TransactionResult: 'tesSUCCESS', AffectedNodes: [] },
+      },
+    ]);
+    expect(() => buildLedgerRows(missing, XAHAU)).toThrow(/has no Account/);
+    const numeric = ledgerOf([
+      {
+        TransactionType: 'AccountSet',
+        Account: 7,
+        Fee: '10',
+        Sequence: 1,
+        hash: 'B'.repeat(64),
+        metaData: { TransactionIndex: 0, TransactionResult: 'tesSUCCESS', AffectedNodes: [] },
+      },
+    ]);
+    expect(() => buildLedgerRows(numeric, XAHAU)).toThrow(/has no Account/);
+  });
+});

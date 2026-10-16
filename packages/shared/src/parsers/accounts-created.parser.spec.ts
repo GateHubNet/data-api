@@ -103,6 +103,15 @@ describe('AccountsCreatedParser', () => {
     expect(parser.parse(t, XRPL)).toEqual([]);
   });
 
+  it('names the zero account as the parent of a transaction whose Account is "" (a pseudo-transaction, ruling R95)', () => {
+    const t = parserTx({ TransactionType: 'UNLReport', Account: '', Fee: '0' }, [
+      created({ Account: 'rChild', Balance: '1', Sequence: 1 }),
+    ]);
+    expect(parser.parse(t, XAHAU)).toStrictEqual([
+      { account: 'rChild', parent: 'rrrrrrrrrrrrrrrrrrrrrhoLvTp', initial_balance: '0.000001' },
+    ]);
+  });
+
   it('handles a transaction without nodes', () => {
     expect(parser.parse(parserTx({}, []), XRPL)).toEqual([]);
     expect(parser.parse(parserTx({}, undefined as unknown as Json[]), XRPL)).toEqual([]);

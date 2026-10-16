@@ -1,5 +1,5 @@
 import { dropsToNative } from '../util/amount';
-import { ParseContext, ParserTx } from './parser.interface';
+import { ParseContext, ParserTx, senderAccount } from './parser.interface';
 
 export interface ParsedAccountCreated {
   account: string;
@@ -37,7 +37,7 @@ export class AccountsCreatedParser {
       if ('AMMID' in fields) continue;
       accounts.push({
         account: fields.Account,
-        parent: t.tx.Account,
+        parent: senderAccount(t.tx) ?? t.tx.Account,
         initial_balance: dropsToNative(fields.Balance ?? '0'),
       });
     }

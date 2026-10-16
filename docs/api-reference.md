@@ -329,7 +329,8 @@ Errors: 400 `invalid start date format`, `invalid end date format`, `invalid tra
   the network's definitions, as the original (which stored binary) did. So `DeliverMax` and the `type`/`type_hex` of `Paths`
   steps are not in the JSON, UInt64 fields are 16 upper-case hex digits, and the fields come in binary-format order. The
   `binary=true` hex is the serialization itself and re-hashes to the transaction hash (the transactions of a ledger re-hash to
-  its `transaction_hash`). A transaction that the codec cannot serialize (a type missing from the definitions) is served as its
+  its `transaction_hash`). An AccountID that the node shows as `""` (the `Account` of Xahau's `UNLReport`) is `""` in the JSON
+  and a zero-length field (`81 00`) in the binary form, as the node serializes it. A transaction that the codec cannot serialize (a type missing from the definitions) is served as its
   stored JSON instead of failing the page, and `api_tx_encode_fallback_total` counts it.
 - A hash with a `0x` prefix is `invalid hash` (as in the original, where the check could never match it).
 - A missing `end` is open-ended (the newest ledger); the original used the time of the request.

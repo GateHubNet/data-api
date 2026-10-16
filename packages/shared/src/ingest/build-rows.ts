@@ -22,7 +22,7 @@ import { AffectedAccountsParser } from '../parsers/affected-accounts.parser';
 import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
-import { ParseContext, ParserTx, toParserTx } from '../parsers/parser.interface';
+import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
 import { PaymentParser } from '../parsers/payment.parser';
 import { RawLedger } from './raw-ledger';
 
@@ -90,10 +90,15 @@ function feeDrops(t: ParserTx): string {
   return fee;
 }
 
-/** The `Account` of a transaction. Every transaction, pseudo-transactions included, has one. */
+/**
+ * The sender of a transaction for the index columns (`transactions.account`, `account_tx_by_sequence`,
+ * `is_initiator`). Every transaction has an `Account` field; pseudo-transactions carry the zero account there, which
+ * Xahau's `UNLReport` leaves empty (`""`): that is stored as the zero account too, while `tx_json` keeps the node's
+ * `""` (`senderAccount`, ruling R95). A transaction without an `Account` string is malformed and rejected.
+ */
 function senderOf(t: ParserTx): string {
-  const sender = t.tx.Account;
-  if (typeof sender !== 'string' || sender === '') {
+  const sender = senderAccount(t.tx);
+  if (sender === undefined) {
     throw new Error(`Ledger ${t.ledger_index}: transaction ${t.hash} has no Account`);
   }
   return sender;

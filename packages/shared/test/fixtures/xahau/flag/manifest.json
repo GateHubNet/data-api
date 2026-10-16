@@ -1,0 +1,25 @@
+{
+  "network": "xahau",
+  "endpoint": "wss://xahau.network",
+  "recorded_at": "2026-10-16T18:12:00.548Z",
+  "validated_head": 26573063,
+  "note": "A flag ledger (index divisible by 256): one UNLReport pseudo-transaction per active validator, each with Account \"\" (an empty AccountID, serialized as 81 00). 26570752.json.gz is the ledger as record-fixtures writes it (transactions:true, expand:true); node-binary-26570752.json.gz is the same ledger requested with binary:true (tx_blob and meta hex of every transaction, as the node serialized them). Kept apart from ../recorded so that the counts of the suites that seed those ledgers do not change.",
+  "transactions": {
+    "UNLReport": 22,
+    "Payment": 15
+  },
+  "transaction_hash": "C39A304D59AC9B1F3479E49EE3AD2CD87A569817E7803AF8E15D73C2ED854646",
+  "ledgers": [
+    {
+      "ledger": 26570752,
+      "bytes": 165493,
+      "gzipBytes": 20097
+    }
+  ],
+  "binary": [
+    {
+      "ledger": 26570752,
+      "file": "node-binary-26570752.json.gz"
+    }
+  ]
+}
