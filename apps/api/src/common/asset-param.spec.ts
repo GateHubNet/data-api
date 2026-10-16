@@ -1,5 +1,5 @@
 import { Asset } from '@gatehub/data-api-shared';
-import { assetFromParts, parseAsset, parseAssetPair, splitAsset } from './asset-param';
+import { assetFromParts, parseAsset, parseAssetFilter, parseAssetPair, splitAsset } from './asset-param';
 import { RippleHttpError } from './errors';
 
 const BITSTAMP = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
@@ -133,6 +133,39 @@ describe('parseAssetPair', () => {
   it('uses the native currency of the network', () => {
     expect(badRequestMessage(() => parseAssetPair('XRP', `XAH+${BITSTAMP}`, 'XAH'))).toBe('XAH cannot have an issuer');
     expect(badRequestMessage(() => parseAssetPair('XRP', 'XAH', 'XAH'))).toBe('base issuer is required');
+  });
+});
+
+describe('parseAssetFilter', () => {
+  it.each<[string, { currency?: string; issuer?: string }]>([
+    ['usd', { currency: 'USD', issuer: undefined }],
+    [`usd+${BITSTAMP}`, { currency: 'USD', issuer: BITSTAMP }],
+    [`Usd.${BITSTAMP}`, { currency: 'USD', issuer: BITSTAMP }],
+    [`usd|${BITSTAMP}`, { currency: 'USD', issuer: BITSTAMP }],
+    ['xrp', { currency: 'XRP', issuer: undefined }],
+    // nothing is required of a filter: no issuer for an issued currency, and an issuer alone
+    [`+${BITSTAMP}`, { currency: undefined, issuer: BITSTAMP }],
+    // and nothing is checked of the currency
+    ['usdollar', { currency: 'USDOLLAR', issuer: undefined }],
+  ])('accepts %j', (raw, expected) => {
+    expect(parseAssetFilter(raw, 'base')).toEqual(expected);
+  });
+
+  it('is no filter for nothing, or for a segment that names neither a currency nor an issuer', () => {
+    expect(parseAssetFilter(undefined, 'base')).toBeUndefined();
+    expect(parseAssetFilter('', 'base')).toBeUndefined();
+    expect(parseAssetFilter('+', 'counter')).toBeUndefined();
+  });
+
+  it('rejects an issuer that is not a classic address, naming the side (R33)', () => {
+    expect(badRequestMessage(() => parseAssetFilter('usd+nonsense', 'base'))).toBe('invalid base issuer address');
+    expect(badRequestMessage(() => parseAssetFilter('usd+nonsense', 'counter'))).toBe('invalid counter issuer address');
+    expect(badRequestMessage(() => parseAssetFilter(`usd+${X_ADDRESS}`, 'base'))).toBe('invalid base issuer address');
+    expect(badRequestMessage(() => parseAssetFilter('+nonsense', 'base'))).toBe('invalid base issuer address');
+  });
+
+  it('does not reject the native currency with an issuer: such a filter matches nothing, as in the original', () => {
+    expect(parseAssetFilter(`xrp+${GATEHUB}`, 'base')).toEqual({ currency: 'XRP', issuer: GATEHUB });
   });
 });
 

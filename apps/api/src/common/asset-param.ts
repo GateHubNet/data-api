@@ -79,6 +79,19 @@ export function parseAssetPair(baseRaw: string, counterRaw: string, native: stri
 }
 
 /**
+ * An asset to filter a list by, from a path segment: `CUR`, `CUR+issuer` or just `+issuer`, split as the Ripple routes do
+ * (`splitAsset`). Nothing is required of it, and a part that is missing matches anything, so `USD` is the dollars of
+ * every issuer; only an issuer that is given has to be a classic address (400 `invalid base issuer address`, ruling
+ * R33). `undefined` when the segment names neither a currency nor an issuer.
+ */
+export function parseAssetFilter(raw: string | undefined, role: AssetRole): AssetParts | undefined {
+  if (raw === undefined) return undefined;
+  const parts = splitAsset(raw);
+  requireValidIssuer(parts, role);
+  return parts.currency === undefined && parts.issuer === undefined ? undefined : parts;
+}
+
+/**
  * One asset from separate `currency` and `issuer` parameters. A missing currency is the native one, as in
  * `/v2/normalize` (`currency || 'XRP'`); with `defaultNative` off, a missing currency answers 400
  * `currency is required`.

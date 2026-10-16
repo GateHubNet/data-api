@@ -1,7 +1,10 @@
 import {
+  AccountExchangesRow,
+  AccountPaymentsRow,
   AccountsCreatedRow,
   AccountTransactionsRow,
   AccountTxBySequenceRow,
+  BalanceChangesRow,
   buildLedgerRows,
   ExchangesRow,
   FixtureLedgerSource,
@@ -123,6 +126,30 @@ export function fixtureAccountTxBySequence(seed: SeedName): AccountTxBySequenceR
   return fixtureSource(seed)
     .list()
     .flatMap((ledger) => buildLedgerRows(ledger, ctx).accountTxBySequence);
+}
+
+/** Every row of `account_payments` a fixture set is stored as: a `sent` and a `received` row per payment. */
+export function fixtureAccountPayments(seed: SeedName): AccountPaymentsRow[] {
+  const ctx = parseContextFor(getNetworkProfile(SEED_NETWORK[seed]));
+  return fixtureSource(seed)
+    .list()
+    .flatMap((ledger) => buildLedgerRows(ledger, ctx).accountPayments);
+}
+
+/** Every row of `account_exchanges` a fixture set is stored as: a copy of the exchange per participating account. */
+export function fixtureAccountExchanges(seed: SeedName): AccountExchangesRow[] {
+  const ctx = parseContextFor(getNetworkProfile(SEED_NETWORK[seed]));
+  return fixtureSource(seed)
+    .list()
+    .flatMap((ledger) => buildLedgerRows(ledger, ctx).accountExchanges);
+}
+
+/** Every row of `balance_changes` a fixture set is stored as. */
+export function fixtureBalanceChanges(seed: SeedName): BalanceChangesRow[] {
+  const ctx = parseContextFor(getNetworkProfile(SEED_NETWORK[seed]));
+  return fixtureSource(seed)
+    .list()
+    .flatMap((ledger) => buildLedgerRows(ledger, ctx).balanceChanges);
 }
 
 /** One transaction of a fixture set by its hash. */
