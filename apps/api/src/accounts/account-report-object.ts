@@ -120,7 +120,7 @@ export function ratedAssets(groups: StoredReportGroup[], native: string): Asset[
 }
 
 /** The significant digits of a quotient: what the double the original printed could tell apart. */
-const QUOTIENT_DIGITS = 17;
+export const QUOTIENT_DIGITS = 17;
 
 /**
  * What the payments of a group are worth in the native currency: the sum of their amounts and the largest of them. The

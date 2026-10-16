@@ -12,6 +12,8 @@ import { AccountPaymentsController } from './account-payments.controller';
 import { AccountPaymentsService } from './account-payments.service';
 import { AccountReportsController } from './account-reports.controller';
 import { AccountReportsService } from './account-reports.service';
+import { AccountStatsController } from './account-stats.controller';
+import { AccountStatsService } from './account-stats.service';
 import { AccountTransactionsController } from './account-transactions.controller';
 import { AccountTransactionsService } from './account-transactions.service';
 import { AccountsController } from './accounts.controller';
@@ -21,9 +23,9 @@ import { LiveLedgerService } from './live-ledger.service';
 /**
  * `GET /v2/accounts` and `GET /v2/accounts/:address`, `GET /v2/accounts/:address/transactions[/:sequence]`,
  * `GET /v2/accounts/:address/{payments,exchanges[/:base[/:counter]],balance_changes}`,
- * `GET /v2/accounts/:address/reports[/:date]` (its values are in the native currency, converted with the `RatesService`
- * of `RatesModule`), and the two routes that ask the live node instead of the database,
- * `GET /v2/accounts/:address/{balances,orders}`.
+ * `GET /v2/accounts/:address/reports[/:date]` and `GET /v2/accounts/:address/stats/:family` (their values are in the
+ * native currency, converted with the `RatesService` of `RatesModule`), and the two routes that ask the live node
+ * instead of the database, `GET /v2/accounts/:address/{balances,orders}`.
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
@@ -40,6 +42,7 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountBalancesController,
     AccountOrdersController,
     AccountReportsController,
+    AccountStatsController,
   ],
   providers: [
     AccountsService,
@@ -51,6 +54,7 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountBalancesService,
     AccountOrdersService,
     AccountReportsService,
+    AccountStatsService,
   ],
 })
 export class AccountsModule {}
