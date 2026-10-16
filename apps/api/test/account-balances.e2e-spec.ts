@@ -733,7 +733,11 @@ describe('GET /v2/accounts/:address/balances', () => {
       'rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg',
     ];
     let used = 0;
-    const freshAccount = (): string => ACCOUNTS[used++];
+    const freshAccount = (): string => {
+      // a test that ran out of accounts would share another test's cache entry (M4)
+      if (used >= ACCOUNTS.length) throw new Error('add an account to ACCOUNTS: every test needs one of its own');
+      return ACCOUNTS[used++];
+    };
 
     it('a live answer is private and no older than the live cache: max-age of the TTL in seconds, JSON and CSV (R108)', async () => {
       const a = freshAccount();
