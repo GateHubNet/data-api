@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { CacheService } from '../common/cache.service';
 import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
 import { XrplService } from '../xrpl/xrpl.service';
-import { LedgerSelector, LedgerSpec, liveCacheKey, liveNodeError } from './account-ledger';
+import { LedgerSelector, LedgerSpec, liveCacheKey, LiveDeadline, liveNodeError, pagedLedger } from './account-ledger';
 import { LiveLedgerService } from './live-ledger.service';
 import { NodeOffer, OrderObject, toOrderObject } from './order-object';
 
@@ -38,10 +38,12 @@ interface AccountOffersResult {
  * The open orders of an account on the live node (`rippled.getOrders` of the original): `account_offers`, paged until
  * the limit is filled (`limit=all`: until the node has no more).
  *
- * The first request names the ledger the caller chose (or `validated`); once the node has said which ledger that was,
- * the following pages are asked of that ledger by its index, because a marker is only good for the ledger it came from
- * and a validated ledger moves on every few seconds. A page asks for no more offers than the limit still lacks
- * (at most 400); the original asked for 100 each time.
+ * The first request names the ledger the caller chose (or `validated`). A marker is only good for the ledger it came
+ * from and a validated ledger moves on every few seconds, so once the node has said which ledger a word (`validated`,
+ * `closed`, `current`) was, the following pages are asked of that ledger by its index; a hash or a number the caller gave
+ * names one ledger already and is asked again as it is (M3). A page asks for no more offers than the limit still lacks
+ * (at most 400); the original asked for 100 each time. `limit=all` pages within an overall deadline of 30 s (R108: past
+ * it the route answers its 500).
  *
  * Cached like the balances: `ApiConfig.liveCacheTtlMs`, under the whole resolved request.
  */
@@ -73,15 +75,19 @@ export class AccountOrdersService {
     let ledger = chosen;
     let ledgerIndex: number | undefined;
     let marker: unknown;
+    const deadline = LiveDeadline.for(q.limit);
     try {
       for (;;) {
-        const page: AccountOffersResult = await this.xrpl.request<AccountOffersResult>({
-          command: 'account_offers',
-          account: q.address,
-          ...ledger,
-          limit: Math.min(OFFERS_PAGE_SIZE, wanted - orders.length),
-          ...(marker !== undefined && { marker }),
-        });
+        deadline.check();
+        const page: AccountOffersResult = await deadline.race(
+          this.xrpl.request<AccountOffersResult>({
+            command: 'account_offers',
+            account: q.address,
+            ...ledger,
+            limit: Math.min(OFFERS_PAGE_SIZE, wanted - orders.length),
+            ...(marker !== undefined && { marker }),
+          }),
+        );
         ledgerIndex ??= page.ledger_index ?? page.ledger_current_index;
         for (const offer of page.offers) {
           if (orders.length >= wanted) break;
@@ -94,8 +100,8 @@ export class AccountOrdersService {
           throw new Error('account_offers answered with the marker it was given');
         }
         marker = page.marker;
-        // the marker belongs to the ledger of this page: the next page asks for that ledger by its index
-        if (ledgerIndex !== undefined) ledger = { ledger_index: ledgerIndex };
+        // the marker belongs to the ledger of this page: the next page asks for that ledger
+        ledger = pagedLedger(chosen, ledgerIndex);
       }
     } catch (err) {
       return liveNodeError(err);

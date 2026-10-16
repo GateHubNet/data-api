@@ -163,7 +163,9 @@ other conventions of its CSV writer (`nice-json2csv`: union-of-keys header, ever
 
 ### Caching and transport
 
-Successful `/v2` answers carry `Cache-Control: public, max-age=60` (the `GH_CACHE_CONTROL` setting; empty sends no header).
+Successful `/v2` answers carry `Cache-Control: private, max-age=60` (the `GH_CACHE_CONTROL` setting; empty sends no header):
+`private`, because an answer is for the holder of an API key and a shared cache that ignores the key would serve it to anybody. The
+live routes `/balances` and `/orders` send their own (see there).
 Responses are gzip-compressed when the client asks for it. CORS headers are sent only for the origins in `GH_CORS_ORIGINS`.
 Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it (see [deployment](deployment.md)).
 
@@ -734,18 +736,24 @@ ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, 
 ledger that early, or the node no longer has the ledger), 404 `account not found`; 500 `unable to retrieve balances`.
 
 Responses are cached in memory for `GH_LIVE_CACHE_TTL_MS` (default 10 s) per resolved request, so a `validated` answer is at
-most that old; the body says which ledger it was read at. Like every `/v2` answer it also carries the global `Cache-Control`
-(default `public, max-age=60`): set `GH_CACHE_CONTROL` accordingly if downstream caches must not hold balances that long.
+most that old; the body says which ledger it was read at. The answer says the same downstream: `Cache-Control: private,
+max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`private, max-age=10` by default), or `no-store` when the live cache is off
+(`GH_LIVE_CACHE_TTL_MS=0`), in place of the global `GH_CACHE_CONTROL`. `limit=all` pages the node for at most 30 s in all; an
+account that needs longer gets 500 `unable to retrieve balances`. The pages of trust lines after `account_info` are read from the
+ledger named by `ledger_hash` or a numeric `ledger_index` as given, and from the index the node answered with for
+`validated` / `closed` / `current` (a marker belongs to one ledger).
 
 **Differences from data.ripple.com**: the default ledger is the newest **validated** one (the original asked for the open
 ledger); `ledger_hash` is honored (it was ignored); trust lines are paged until the limit is filled with lines that pass the
 filters (the original cut the first page and filtered afterwards, so a `currency` could miss lines); `limit=all` pages to
-completion; a date older than the first stored ledger is 400 (the original answered 500); balances are exact decimal strings.
+completion (within 30 s); a date older than the first stored ledger is 400 (the original answered 500); balances are exact decimal
+strings.
 
 ### `GET /v2/accounts/{address}/orders`
 
 The open offers of the account on a ledger of the live node, with the same ledger selectors, `limit` (200, max 400, or `all`),
-error order and caching as `/balances` (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened).
+error order, caching (the in-memory live cache and its `Cache-Control`), 30 s limit of `limit=all` and ledger of the pages after
+the first as `/balances` (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened).
 
 ```json
 { "result": "success", "ledger_index": 107695660, "limit": 200,

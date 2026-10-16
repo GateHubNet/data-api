@@ -62,8 +62,8 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_RATE_LIMIT` | `600` | Requests per client address and route per window. |
 | `GH_RATE_LIMIT_WINDOW` | `60` | The window, seconds. |
 | `GH_TRUST_PROXY_HOPS` | `1` | Reverse-proxy hops whose `X-Forwarded-For` is believed for the client address (the key of the rate limit and the `Link` header's scheme). With the shipped nginx in front, leave it at `1`: nginx hands the API exactly one address. Too high a value lets clients spoof their address. |
-| `GH_CACHE_CONTROL` | `public, max-age=60` | `Cache-Control` of successful `/v2/*` responses (printable ASCII); empty sends none. Errors are always `no-store`. |
-| `GH_LIVE_CACHE_TTL_MS` | `10000` | How long the live-node answers (balances, orders) are cached in memory; 0 disables the cache. |
+| `GH_CACHE_CONTROL` | `private, max-age=60` | `Cache-Control` of successful `/v2/*` responses (printable ASCII); empty sends none. Errors are always `no-store`. `private` because the answers are key-gated: a shared cache that ignores the API key would serve them to anybody (Ruling R109); behind a CDN that keys on the API key, `public` is an option. The live routes `/balances` and `/orders` send `private, max-age=<GH_LIVE_CACHE_TTL_MS in seconds>` (`no-store` when it is 0) instead (R108). |
+| `GH_LIVE_CACHE_TTL_MS` | `10000` | How long the live-node answers (balances, orders) are cached in memory; 0 disables the cache. Their `Cache-Control` follows it: `private, max-age=<it in whole seconds>`, `no-store` at 0. |
 | `GH_TX_CACHE_SIZE` | `20000` | Serialized transactions (decoded JSON and binary hex) kept in memory by hash, to spare the codec on repeated requests; a transaction never changes so nothing expires; each entry is a few KB. 0 disables. |
 | `GH_SERVICE_NAME`, `GH_SERVICE_DESCRIPTION`, `GH_SERVICE_VERSION` | `data-api`, `Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.`, the package version | The title of the Swagger document (read by the toolbox bootstrap; the API fills in the defaults). Optional. The syncer has no Swagger and ignores them. |
 

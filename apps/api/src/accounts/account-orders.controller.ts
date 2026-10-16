@@ -1,12 +1,16 @@
-import { Get, Param, Query } from '@nestjs/common';
+import { Get, Param, Query, Res } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
+// `import type`: the decorated parameter below would otherwise make Nest's metadata `require('express')`, which is not
+// a dependency of this app (only its types are)
+import type { Response } from 'express';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { Csv } from '../common/csv.interceptor';
 import { badRequest } from '../common/errors';
 import { fmtTime } from '../common/format';
 import { Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
-import { ledgerSelector, liveLimit } from './account-ledger';
+import { ApiConfig } from '../config/api.config';
+import { ledgerSelector, liveCacheControl, liveLimit } from './account-ledger';
 import { AccountOrdersService } from './account-orders.service';
 import { OrderObject } from './order-object';
 
@@ -28,7 +32,10 @@ interface AccountOrdersBody {
  */
 @RippleController('v2/accounts')
 export class AccountOrdersController {
-  constructor(private readonly orders: AccountOrdersService) {}
+  constructor(
+    private readonly orders: AccountOrdersService,
+    private readonly config: ApiConfig,
+  ) {}
 
   @Get(':address/orders')
   @RippleRoute('unable to retrieve orders')
@@ -52,13 +59,19 @@ export class AccountOrdersController {
   })
   @ApiQuery({ name: 'limit', required: false, description: 'Default 200, at most 400, or `all`.' })
   @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
-  async list(@Param('address') address: string, @Query() query: QueryParams): Promise<AccountOrdersBody> {
+  async list(
+    @Param('address') address: string,
+    @Query() query: QueryParams,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<AccountOrdersBody> {
     if (!isValidClassicAddress(address)) throw badRequest('invalid ripple address');
     const selector = ledgerSelector(query);
     const limit = liveLimit(query);
 
     const found = await this.orders.orders({ address, selector, limit });
 
+    // private and no older than the live cache, in place of the global header of /v2 (R108)
+    res.setHeader('Cache-Control', liveCacheControl(this.config.liveCacheTtlMs));
     return {
       result: 'success',
       ledger_index: found.ledgerIndex,

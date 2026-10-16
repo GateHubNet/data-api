@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { CacheService } from '../common/cache.service';
 import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
 import { XrplService } from '../xrpl/xrpl.service';
-import { LedgerSelector, LedgerSpec, liveCacheKey, liveNodeError } from './account-ledger';
+import { LedgerSelector, LedgerSpec, liveCacheKey, LiveDeadline, liveNodeError, pagedLedger } from './account-ledger';
 import { LiveLedgerService } from './live-ledger.service';
 
 /** A balance of the account: the native one has no `counterparty`. Keys in the order of the original. */
@@ -59,7 +59,9 @@ interface AccountLinesResult {
  *  - the lines are paged until the limit is filled with lines that pass the filters. The original cut the first page
  *    to the limit and filtered afterwards, so a `currency` could miss its lines on later pages (and, by subtracting
  *    the page size twice, never read a second page at all);
- *  - `limit=all` reads every page (R32).
+ *  - `limit=all` reads every page (R32), within an overall deadline of 30 s (R108: past it the route answers its 500);
+ *  - the trust lines are read from the ledger the client named when it named one (a hash or a number, M3), else from
+ *    the index `account_info` answered with.
  *
  * A response is cached (`ApiConfig.liveCacheTtlMs`) under the whole resolved request: address, the ledger spec (a
  * date is already its ledger), filters and limit. A `validated` entry shows the ledger it was read at in `ledger_index`,
@@ -88,19 +90,18 @@ export class AccountBalancesService {
   }
 
   private async read(q: BalancesQuery, spec: LedgerSpec): Promise<BalancesResult> {
+    const deadline = LiveDeadline.for(q.limit);
     try {
-      const info = await this.xrpl.request<AccountInfoResult>({ command: 'account_info', account: q.address, ...spec });
+      const info = await deadline.race(
+        this.xrpl.request<AccountInfoResult>({ command: 'account_info', account: q.address, ...spec }),
+      );
       const ledgerIndex = info.ledger_index ?? info.ledger_current_index;
       const native: Balance = { currency: this.native, value: dropsToNative(info.account_data.Balance) };
       // `currency=<native>` is the native balance and nothing else, whatever the other filters say
       if (q.currency === this.native) return { ledgerIndex, balances: [native] };
 
       const balances = q.currency === undefined ? [native] : [];
-      const lines = await this.lines(
-        q,
-        ledgerIndex === undefined ? spec : { ledger_index: ledgerIndex },
-        balances.length,
-      );
+      const lines = await this.lines(q, pagedLedger(spec, ledgerIndex), balances.length, deadline);
       return { ledgerIndex, balances: [...balances, ...lines] };
     } catch (err) {
       return liveNodeError(err);
@@ -108,19 +109,22 @@ export class AccountBalancesService {
   }
 
   /** The trust lines that pass the filters, as balances, as many as the limit leaves room for after `taken` balances. */
-  private async lines(q: BalancesQuery, ledger: LedgerSpec, taken: number): Promise<Balance[]> {
+  private async lines(q: BalancesQuery, ledger: LedgerSpec, taken: number, deadline: LiveDeadline): Promise<Balance[]> {
     const wanted = q.limit === undefined ? Infinity : q.limit - taken;
     const out: Balance[] = [];
     let marker: unknown;
     while (out.length < wanted) {
-      const page: AccountLinesResult = await this.xrpl.request<AccountLinesResult>({
-        command: 'account_lines',
-        account: q.address,
-        ...ledger,
-        limit: LINES_PAGE_SIZE,
-        ...(q.counterparty !== undefined && { peer: q.counterparty }),
-        ...(marker !== undefined && { marker }),
-      });
+      deadline.check();
+      const page: AccountLinesResult = await deadline.race(
+        this.xrpl.request<AccountLinesResult>({
+          command: 'account_lines',
+          account: q.address,
+          ...ledger,
+          limit: LINES_PAGE_SIZE,
+          ...(q.counterparty !== undefined && { peer: q.counterparty }),
+          ...(marker !== undefined && { marker }),
+        }),
+      );
       for (const line of page.lines) {
         if (q.currency !== undefined && line.currency !== q.currency) continue;
         out.push({ currency: line.currency, counterparty: line.account, value: line.balance });

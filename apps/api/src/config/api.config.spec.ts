@@ -55,7 +55,8 @@ describe('ApiConfig (GH_* environment)', () => {
       liveCacheTtlMs: 10000,
       txCacheSize: 20000,
       trustProxyHops: 1,
-      cacheControl: 'public, max-age=60',
+      // key-gated answers: private, so a shared cache does not serve one client's answer to another (R109)
+      cacheControl: 'private, max-age=60',
     });
   });
 
@@ -118,7 +119,9 @@ describe('ApiConfig (GH_* environment)', () => {
     expect((await loadConfig({ GH_NETWORK: 'xahau', GH_NODE_ENDPOINTS: ' ' })).cfg.nodeEndpoints).toBe(
       'wss://xahau.network',
     );
-    expect((await loadConfig({ GH_NETWORK: 'xrpl' })).cfg.nodeEndpoints).toBe('wss://s2.ripple.com,wss://xrplcluster.com');
+    expect((await loadConfig({ GH_NETWORK: 'xrpl' })).cfg.nodeEndpoints).toBe(
+      'wss://s2.ripple.com,wss://xrplcluster.com',
+    );
     expect((await loadConfig({ GH_NETWORK: 'xahau', GH_NODE_ENDPOINTS: 'ws://10.0.0.5:6006' })).cfg.nodeEndpoints).toBe(
       'ws://10.0.0.5:6006',
     );

@@ -498,7 +498,7 @@ describe('GET /v2/accounts/:address/orders', () => {
         ]);
       });
 
-      it('a hash is read once: the pages after the first are of the ledger it turned out to be', async () => {
+      it('a hash names one ledger already: every page is asked of it (M3)', async () => {
         node.serve(
           offersNode({
             '': { offers: offers(1), marker: 'm1' },
@@ -508,8 +508,35 @@ describe('GET /v2/accounts/:address/orders', () => {
         await api.get(`${path()}?ledger_hash=${HASH}&limit=all`);
         expect(node.requests()).toEqual([
           { command: 'account_offers', account: ACCOUNT, ledger_hash: HASH, limit: 400 },
-          { command: 'account_offers', account: ACCOUNT, ledger_index: VALIDATED, limit: 400, marker: 'm1' },
+          { command: 'account_offers', account: ACCOUNT, ledger_hash: HASH, limit: 400, marker: 'm1' },
         ]);
+      });
+
+      it('limit=all stops paging after 30 s in all and answers the route failure (R108)', async () => {
+        let now = Date.now();
+        const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+          node.serve((req) => {
+            // every page takes 11 s of the clock, and there are ten of them
+            now += 11_000;
+            const marker = Number(req.marker ?? 0) + 1;
+            if (marker >= 10)
+              return { account: req.account, ledger_index: VALIDATED, validated: true, offers: offers(marker) };
+            return {
+              account: req.account,
+              ledger_index: VALIDATED,
+              validated: true,
+              offers: offers(marker),
+              marker: String(marker),
+            };
+          });
+          const res = await api.get(`${path()}?limit=all`);
+          expect([res.status, res.body]).toEqual([500, { result: 'error', message: 'unable to retrieve orders' }]);
+          expect(node.requests()).toHaveLength(3);
+          expect(res.headers['cache-control']).toBe('no-store');
+        } finally {
+          clock.mockRestore();
+        }
       });
 
       it('limit=all with a marker that is an object passes it on unchanged', async () => {
@@ -735,9 +762,24 @@ describe('GET /v2/accounts/:address/orders', () => {
       'rGcSxmn1ibh5ZfCMAEu2iy7mnrb5nE6fbY',
       'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj',
       'rUeXUxaMTH1pELvD2EkiHTRcM9FsH3v4d7',
+      'rK5j9n8baXfL4gzUoZsfxBvvsv97P5swaV',
+      'rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg',
     ];
     let used = 0;
-    const freshAccount = (): string => ACCOUNTS[used++];
+    const freshAccount = (): string => {
+      // a test that ran out of accounts would share another test's cache entry (M4)
+      if (used >= ACCOUNTS.length) throw new Error('add an account to ACCOUNTS: every test needs one of its own');
+      return ACCOUNTS[used++];
+    };
+
+    it('a live answer is private and no older than the live cache: max-age of the TTL in seconds, JSON and CSV (R108)', async () => {
+      const a = freshAccount();
+      for (const query of ['', '?format=csv']) {
+        const res = await api.get(`${path(a)}${query}`);
+        expect([query, res.status, res.headers['cache-control']]).toEqual([query, 200, 'private, max-age=10']);
+      }
+      expect((await api.get(`${path(a)}?limit=abc`)).headers['cache-control']).toBe('no-store');
+    });
 
     it('an identical request is answered from the cache: the node is asked once', async () => {
       const a = freshAccount();
@@ -816,8 +858,10 @@ describe('GET /v2/accounts/:address/orders', () => {
       node.serve(standardNode);
       const api = await h.api();
       await api.get(path());
-      await api.get(path());
+      const res = await api.get(path());
       expect(node.requests()).toHaveLength(2);
+      // nothing is cached here, so nobody downstream may cache it either (R108)
+      expect(res.headers['cache-control']).toBe('no-store');
     });
   });
 });

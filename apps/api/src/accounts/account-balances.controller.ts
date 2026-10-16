@@ -1,13 +1,17 @@
-import { Get, Param, Query } from '@nestjs/common';
+import { Get, Param, Query, Res } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
+// `import type`: the decorated parameter below would otherwise make Nest's metadata `require('express')`, which is not
+// a dependency of this app (only its types are)
+import type { Response } from 'express';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { Csv } from '../common/csv.interceptor';
 import { badRequest } from '../common/errors';
 import { fmtTime } from '../common/format';
 import { first, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
+import { ApiConfig } from '../config/api.config';
 import { AccountBalancesService, Balance } from './account-balances.service';
-import { ledgerSelector, liveLimit } from './account-ledger';
+import { ledgerSelector, liveCacheControl, liveLimit } from './account-ledger';
 
 interface AccountBalancesBody {
   result: 'success';
@@ -26,7 +30,10 @@ interface AccountBalancesBody {
  */
 @RippleController('v2/accounts')
 export class AccountBalancesController {
-  constructor(private readonly balances: AccountBalancesService) {}
+  constructor(
+    private readonly balances: AccountBalancesService,
+    private readonly config: ApiConfig,
+  ) {}
 
   @Get(':address/balances')
   @RippleRoute('unable to retrieve balances')
@@ -56,7 +63,11 @@ export class AccountBalancesController {
   })
   @ApiQuery({ name: 'limit', required: false, description: 'Default 200, at most 400, or `all`.' })
   @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
-  async list(@Param('address') address: string, @Query() query: QueryParams): Promise<AccountBalancesBody> {
+  async list(
+    @Param('address') address: string,
+    @Query() query: QueryParams,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<AccountBalancesBody> {
     if (!isValidClassicAddress(address)) throw badRequest('invalid ripple address');
     const selector = ledgerSelector(query);
     const limit = liveLimit(query);
@@ -69,6 +80,8 @@ export class AccountBalancesController {
       limit,
     });
 
+    // private and no older than the live cache, in place of the global header of /v2 (R108)
+    res.setHeader('Cache-Control', liveCacheControl(this.config.liveCacheTtlMs));
     return {
       result: 'success',
       ledger_index: found.ledgerIndex,

@@ -128,11 +128,15 @@ export class ApiConfig {
   @IntValue({ min: 0 })
   trustProxyHops: number = 1;
 
-  /** `GH_CACHE_CONTROL`: the `Cache-Control` of successful `/v2/*` responses; empty sends none. */
+  /**
+   * `GH_CACHE_CONTROL`: the `Cache-Control` of successful `/v2/*` responses; empty sends none. `private` by default: the
+   * answers are for the holder of an API key, and a shared cache that ignores the key would hand them to anybody
+   * (Ruling R109). The live routes (`/balances`, `/orders`) send their own, bound to `liveCacheTtlMs` (R108).
+   */
   @ConfigValue()
   @MaybeEmptyText()
   @IsHeaderValue()
-  cacheControl: string = 'public, max-age=60';
+  cacheControl: string = 'private, max-age=60';
 }
 
 /** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */

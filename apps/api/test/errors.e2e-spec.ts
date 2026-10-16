@@ -152,14 +152,15 @@ describe('the Ripple error contract on the toolbox bootstrap', () => {
     describe('response headers', () => {
       it('successes carry the Cache-Control of /v2, errors are never cached, other routes are untouched', async () => {
         const ok = await h.http().get('/v2/test/ok').set('X-API-Key', h.key);
-        expect(ok.headers['cache-control']).toBe('public, max-age=60');
+        // private: the answers are for the holder of a key, a shared cache must not keep them (R109)
+        expect(ok.headers['cache-control']).toBe('private, max-age=60');
         for (const path of ['/v2/test/boom', '/v2/test/bad-request', '/v2/nope']) {
           const res = await h.http().get(path).set('X-API-Key', h.key);
           expect(res.headers['cache-control']).toBe('no-store');
         }
         expect((await h.http().get('/v2/test/ok')).headers['cache-control']).toBe('no-store');
         // The probe is not a /v2 route: terminus answers it with its own header, not the one of the middleware.
-        expect((await h.http().get('/liveliness/healthz')).headers['cache-control']).not.toBe('public, max-age=60');
+        expect((await h.http().get('/liveliness/healthz')).headers['cache-control']).not.toBe('private, max-age=60');
       });
 
       it('compresses large bodies when the client accepts gzip', async () => {

@@ -2,9 +2,13 @@ import { RippleHttpError } from '../common/errors';
 import {
   DATE_TOO_OLD,
   ledgerSelector,
+  LIMIT_ALL_DEADLINE_MS,
+  liveCacheControl,
   liveCacheKey,
+  LiveDeadline,
   liveLimit,
   liveNodeError,
+  pagedLedger,
   rippledErrorCode,
 } from './account-ledger';
 
@@ -178,5 +182,67 @@ describe('liveCacheKey', () => {
     expect(liveCacheKey('orders', 'rA', { ledger_index: 7 }, 5)).toBe(
       liveCacheKey('orders', 'rA', { ledger_index: 7 }, 5),
     );
+  });
+});
+
+describe('liveCacheControl (R108)', () => {
+  it('private, as long as the live cache keeps an answer, in whole seconds', () => {
+    expect(liveCacheControl(10_000)).toBe('private, max-age=10');
+    expect(liveCacheControl(1_500)).toBe('private, max-age=1');
+    expect(liveCacheControl(999)).toBe('private, max-age=0');
+  });
+
+  it('no-store when the live cache is off', () => {
+    expect(liveCacheControl(0)).toBe('no-store');
+  });
+});
+
+describe('pagedLedger (M3)', () => {
+  it('keeps a hash and a number: each names one ledger already', () => {
+    expect(pagedLedger({ ledger_hash: 'AB' }, 70)).toEqual({ ledger_hash: 'AB' });
+    expect(pagedLedger({ ledger_index: 12 }, 70)).toEqual({ ledger_index: 12 });
+  });
+
+  it('turns a word into the ledger the node answered with, which a marker belongs to', () => {
+    for (const word of ['validated', 'closed', 'current'] as const) {
+      expect(pagedLedger({ ledger_index: word }, 70)).toEqual({ ledger_index: 70 });
+    }
+    // without an answer, the word stays
+    expect(pagedLedger({ ledger_index: 'validated' }, undefined)).toEqual({ ledger_index: 'validated' });
+  });
+});
+
+describe('LiveDeadline (R108)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('no limit: limit=all may page the node for 30 s in all, then it throws', () => {
+    let now = 1_000_000;
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const deadline = LiveDeadline.for(undefined);
+    expect(() => deadline.check()).not.toThrow();
+    now += LIMIT_ALL_DEADLINE_MS - 1;
+    expect(() => deadline.check()).not.toThrow();
+    now += 1;
+    expect(() => deadline.check()).toThrow(/limit=all .* 30 s/);
+  });
+
+  it('a request that is still out when the deadline passes is given up on', async () => {
+    jest.useFakeTimers();
+    try {
+      const deadline = LiveDeadline.for(undefined);
+      const never = new Promise<never>(() => undefined);
+      const race = deadline.race(never);
+      jest.advanceTimersByTime(LIMIT_ALL_DEADLINE_MS);
+      await expect(race).rejects.toThrow(/limit=all .* 30 s/);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a numeric limit has none', async () => {
+    const deadline = LiveDeadline.for(200);
+    jest.spyOn(Date, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER);
+    expect(() => deadline.check()).not.toThrow();
+    await expect(deadline.race(Promise.resolve(5))).resolves.toBe(5);
   });
 });

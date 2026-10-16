@@ -230,13 +230,12 @@ describe('GET /v2/accounts/:address/balances', () => {
         }
       });
 
-      it('ledger_hash is forwarded', async () => {
+      it('ledger_hash is forwarded, to the trust lines too: a hash names one ledger already', async () => {
         const res = await api.get(`${path()}?ledger_hash=${HASH}`);
         expect(res.status).toBe(200);
         expect(node.requests()).toEqual([
           { command: 'account_info', account: ACCOUNT, ledger_hash: HASH },
-          // the lines are read from the ledger the hash turned out to be: the validated ledger can move on between calls
-          { command: 'account_lines', account: ACCOUNT, ledger_index: VALIDATED, limit: 400 },
+          { command: 'account_lines', account: ACCOUNT, ledger_hash: HASH, limit: 400 },
         ]);
         expect(res.body.ledger_index).toBe(VALIDATED);
       });
@@ -474,6 +473,47 @@ describe('GET /v2/accounts/:address/balances', () => {
         expect(node.requests('account_lines')).toEqual([lines, { ...lines, marker: 'm1' }, { ...lines, marker: 'm2' }]);
       });
 
+      it('limit=all with a ledger_hash pages every trust line on that hash (M3)', async () => {
+        node.serve(pagedNode);
+        const res = await api.get(`${path()}?ledger_hash=${HASH}&limit=all`);
+        expect(res.status).toBe(200);
+        const lines = { command: 'account_lines', account: ACCOUNT, ledger_hash: HASH, limit: 400 };
+        expect(node.requests('account_lines')).toEqual([lines, { ...lines, marker: 'm1' }, { ...lines, marker: 'm2' }]);
+      });
+
+      it('limit=all stops paging after 30 s in all and answers the route failure (R108)', async () => {
+        const started = Date.now();
+        let now = started;
+        const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+          node.serve((req) => {
+            if (req.command === 'account_info') return accountInfo(req);
+            // every page takes 11 s of the clock, and there are ten of them
+            now += 11_000;
+            const marker = Number(req.marker ?? 0) + 1;
+            return {
+              account: req.account,
+              ledger_index: req.ledger_index,
+              lines: [USD],
+              ...(marker < 10 && { marker: String(marker) }),
+            };
+          });
+          const res = await api.get(`${path()}?limit=all`);
+          expect([res.status, res.body]).toEqual([500, { result: 'error', message: 'unable to retrieve balances' }]);
+          // three pages are 33 s: the fourth is never asked for
+          expect(node.requests('account_lines')).toHaveLength(3);
+          expect(res.headers['cache-control']).toBe('no-store');
+        } finally {
+          clock.mockRestore();
+        }
+      });
+
+      it('a numeric limit has no deadline of its own: it ends with the limit', async () => {
+        node.serve(standardNode);
+        const res = await api.get(`${path()}?limit=400`);
+        expect(res.status).toBe(200);
+      });
+
       it('limit=all with a marker that is an object passes it on unchanged', async () => {
         const marker = { ledger: 5, seq: 9 };
         node.serve((req) =>
@@ -689,9 +729,20 @@ describe('GET /v2/accounts/:address/balances', () => {
       'rBeToNo4AwHaNbRX2n4BNCYKtpTyFLQwkj',
       'rUeXUxaMTH1pELvD2EkiHTRcM9FsH3v4d7',
       'rK5j9n8baXfL4gzUoZsfxBvvsv97P5swaV',
+      'rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg',
     ];
     let used = 0;
     const freshAccount = (): string => ACCOUNTS[used++];
+
+    it('a live answer is private and no older than the live cache: max-age of the TTL in seconds, JSON and CSV (R108)', async () => {
+      const a = freshAccount();
+      for (const query of ['', '?format=csv']) {
+        const res = await api.get(`${path(a)}${query}`);
+        expect([query, res.status, res.headers['cache-control']]).toEqual([query, 200, 'private, max-age=10']);
+      }
+      // an error stays no-store
+      expect((await api.get(`${path(a)}?limit=abc`)).headers['cache-control']).toBe('no-store');
+    });
 
     it('an identical request is answered from the cache: the node is asked once', async () => {
       const a = freshAccount();
@@ -778,8 +829,10 @@ describe('GET /v2/accounts/:address/balances', () => {
       node.serve(standardNode);
       const api = await h.api();
       await api.get(path());
-      await api.get(path());
+      const res = await api.get(path());
       expect(node.requests('account_info')).toHaveLength(2);
+      // nothing is cached here, so nobody downstream may cache it either (R108)
+      expect(res.headers['cache-control']).toBe('no-store');
     });
   });
 });

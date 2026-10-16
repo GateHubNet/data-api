@@ -108,3 +108,61 @@ export function liveNodeError(err: unknown): never {
 export function liveCacheKey(kind: string, ...parts: unknown[]): string {
   return `${kind}:${JSON.stringify(parts)}`;
 }
+
+/**
+ * The ledger the pages after the first ask the node for. A marker is only good for the ledger it came from: a hash or a
+ * number the client gave names one ledger already and stays as it is (M3: the hash was replaced by the index); a word
+ * (`validated`, `closed`, `current`) becomes the index the node answered the first request with, so that a later page
+ * cannot land on a newer ledger.
+ */
+export function pagedLedger(spec: LedgerSpec, answered: number | undefined): LedgerSpec {
+  if ('ledger_hash' in spec || typeof spec.ledger_index === 'number' || answered === undefined) return spec;
+  return { ledger_index: answered };
+}
+
+/**
+ * The `Cache-Control` of a live answer (`/balances`, `/orders`; Ruling R108): private (it is for the holder of an API key),
+ * and no older than the live cache keeps it, in whole seconds; `no-store` when the live cache is off. It replaces the
+ * global header of `/v2` (`GH_CACHE_CONTROL`), whose 60 s would let a downstream cache serve stale balances.
+ */
+export function liveCacheControl(liveCacheTtlMs: number): string {
+  return liveCacheTtlMs <= 0 ? 'no-store' : `private, max-age=${Math.floor(liveCacheTtlMs / 1000)}`;
+}
+
+/** How long a `limit=all` read may page the live node in all (Ruling R108). */
+export const LIMIT_ALL_DEADLINE_MS = 30_000;
+
+/**
+ * The overall deadline of a `limit=all` read (Ruling R108): an account with a huge number of trust lines or offers would
+ * otherwise page the node for as long as it has pages. Past the deadline the read throws, which the route answers with its
+ * own 500 message. A numeric limit ends with the limit and has no deadline of its own (each node request has its timeout).
+ */
+export class LiveDeadline {
+  private constructor(private readonly at: number | undefined) {}
+
+  /** The deadline of a read with this limit: 30 s from now for `limit=all` (`undefined`), none otherwise. */
+  static for(limit: number | undefined): LiveDeadline {
+    return new LiveDeadline(limit === undefined ? Date.now() + LIMIT_ALL_DEADLINE_MS : undefined);
+  }
+
+  /** Throws when the deadline has passed. */
+  check(): void {
+    if (this.at !== undefined && Date.now() >= this.at) throw this.error();
+  }
+
+  /** `request`, or the deadline's error when the deadline passes first. */
+  race<T>(request: Promise<T>): Promise<T> {
+    if (this.at === undefined) return request;
+    const left = this.at - Date.now();
+    if (left <= 0) return Promise.reject(this.error());
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(this.error()), left);
+    });
+    return Promise.race([request, late]).finally(() => clearTimeout(timer));
+  }
+
+  private error(): Error {
+    return new Error(`limit=all paged the node for longer than ${LIMIT_ALL_DEADLINE_MS / 1000} s`);
+  }
+}
