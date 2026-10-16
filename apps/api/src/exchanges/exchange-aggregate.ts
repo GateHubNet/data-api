@@ -1,7 +1,6 @@
-import { Asset } from '@gatehub/data-api-shared';
+import { Asset, exactAmount, ratio } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { fmtTime, precision8 } from '../common/format';
-import { ratio } from './exchange-object';
 
 /**
  * The aggregates of the exchanges of a pair: candles (`interval`) and the reduced row (`reduce`) of `getExchanges.js`.
@@ -24,29 +23,8 @@ import { ratio } from './exchange-object';
  * that holds an amount outside that window falls back to the Float64 sums of the shadows, as the original's were.
  */
 
-/** Amounts at or above this are not summed as decimals: up to 1e10 of them stay below the 1e46 a `Decimal256(30)` holds. */
-export const EXACT_LIMIT = '1e36';
-
 /** A price of nothing: `0.0000000`. */
 const ZERO_PRICE = precision8(0);
-
-/** The decimal places a `Decimal256` of the exact sums keeps. */
-export const EXACT_SCALE = 30;
-
-/**
- * The exact decimal of an amount column (`base_amount`, `counter_amount`: code, never input), or `NULL` when the
- * decimal cannot hold it whole. The decimal places are counted on the text, as BigNumber writes it: `123.456`, or a
- * mantissa and an exponent, `1.234567890123456e-25` (15 places, less the exponent: 40), `1e+21` (-21).
- */
-function exactAmount(column: 'base_amount' | 'counter_amount'): string {
-  const places =
-    `toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.')))` +
-    ` - toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', ''))`;
-  return (
-    `if(${places} <= ${EXACT_SCALE} AND ${column}_f < ${EXACT_LIMIT}, ` +
-    `toDecimal256OrNull(${column}, ${EXACT_SCALE}), NULL)`
-  );
-}
 
 /** One aggregation of exchanges as the query reads it (`AGGREGATE_COLUMNS`), in the stored orientation. */
 export interface AggregateRow {

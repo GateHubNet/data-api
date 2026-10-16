@@ -1,5 +1,4 @@
-import { ExchangesRow } from '@gatehub/data-api-shared';
-import BigNumber from 'bignumber.js';
+import { ExchangesRow, ratio } from '@gatehub/data-api-shared';
 import { fmtTime, precision8 } from '../common/format';
 
 /**
@@ -82,16 +81,6 @@ export type StoredExchange = Pick<
   | 'autobridged_issuer'
   | 'tx_type'
 >;
-
-// 1 / rate, with room for the rates the ledger allows: an amount runs from 1e-81 to 1e96, so a rate and its inverse
-// need up to some 180 decimal places to keep eight significant digits. The default of 20 would turn the inverse of a
-// rate above 1e12 into 0.
-const Wide = BigNumber.clone({ DECIMAL_PLACES: 200 });
-
-/** `a / b` with the room of an inverse rate (see above): a rate, its inverse or a vwap keep their eight digits. */
-export function ratio(a: BigNumber.Value, b: BigNumber.Value): BigNumber {
-  return new Wide(a).dividedBy(b);
-}
 
 /**
  * The Exchange of a stored row. `inverted` is a pair that was asked for the other way round than it is stored (see

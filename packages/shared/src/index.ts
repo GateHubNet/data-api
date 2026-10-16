@@ -35,6 +35,8 @@ export * from './ingest/ingest-state';
 
 // Query
 export * from './query/asset';
+export * from './query/decimal';
+export * from './query/rates.service';
 
 // Utils
 export * from './util/ctid';

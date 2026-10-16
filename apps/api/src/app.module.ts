@@ -23,6 +23,7 @@ import { MetricsInterceptor } from './common/metrics.interceptor';
 import { NotFoundModule } from './common/not-found.controller';
 import { ApiConfig, apiKeysOf, corsOriginOf, loadApiConfig, NETWORK_PROFILE } from './config/api.config';
 import { ExchangesModule } from './exchanges/exchanges.module';
+import { RatesModule } from './exchanges/rates.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { PaymentsModule } from './payments/payments.module';
@@ -55,6 +56,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   TransactionsModule,
   PaymentsModule,
   ExchangesModule,
+  RatesModule,
   AccountsModule,
 ];
 
