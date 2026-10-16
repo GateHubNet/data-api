@@ -43,6 +43,18 @@ const metrics = {
     help: 'Validation rows flushed to ClickHouse.',
     registers: [registry],
   }),
+  validationsErrorsTotal: new Counter({
+    name: 'syncer_validations_errors_total',
+    help: 'Failures of the validations collector, by stage (flush, reporter, manifest_rpc, ...).',
+    labelNames: ['stage'],
+    registers: [registry],
+  }),
+  validationsDroppedTotal: new Counter({
+    name: 'syncer_validations_dropped_total',
+    help: 'Validations (or buffered rows) the collector did not keep, by reason (buffer_full, no_reporter, invalid).',
+    labelNames: ['reason'],
+    registers: [registry],
+  }),
   feeStatsSamplesTotal: new Counter({
     name: 'syncer_fee_stats_samples_total',
     help: 'Fee stats samples written to ClickHouse.',
@@ -78,6 +90,8 @@ export class PrometheusService implements OnModuleInit {
   /** Derived from `lastCommitTimestampSeconds` when scraped; nothing sets it. */
   readonly lastCommitAgeSeconds = metrics.lastCommitAgeSeconds;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
+  readonly validationsErrorsTotal = metrics.validationsErrorsTotal;
+  readonly validationsDroppedTotal = metrics.validationsDroppedTotal;
   readonly feeStatsSamplesTotal = metrics.feeStatsSamplesTotal;
   readonly feeStatsErrorsTotal = metrics.feeStatsErrorsTotal;
   readonly aggregatorRunsTotal = metrics.aggregatorRunsTotal;

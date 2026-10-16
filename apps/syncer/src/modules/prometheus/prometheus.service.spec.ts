@@ -9,6 +9,9 @@ describe('PrometheusService', () => {
     service.lagLedgers.set(5);
     service.lastCommitTimestampSeconds.set(1_760_000_000);
     service.validationsFlushedTotal.inc(20);
+    service.validationsErrorsTotal.inc({ stage: 'flush' });
+    service.validationsErrorsTotal.inc({ stage: 'reporter' }, 2);
+    service.validationsDroppedTotal.inc({ reason: 'buffer_full' }, 3);
     service.feeStatsSamplesTotal.inc();
     service.feeStatsErrorsTotal.inc(3);
     service.aggregatorRunsTotal.inc({ job: 'stats' });
@@ -21,6 +24,9 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_lag_ledgers 5$/m);
     expect(text).toMatch(/^syncer_last_commit_timestamp_seconds 1760000000$/m);
     expect(text).toMatch(/^syncer_validations_flushed_total 20$/m);
+    expect(text).toMatch(/^syncer_validations_errors_total\{stage="flush"\} 1$/m);
+    expect(text).toMatch(/^syncer_validations_errors_total\{stage="reporter"\} 2$/m);
+    expect(text).toMatch(/^syncer_validations_dropped_total\{reason="buffer_full"\} 3$/m);
     expect(text).toMatch(/^syncer_fee_stats_samples_total 1$/m);
     expect(text).toMatch(/^syncer_fee_stats_errors_total 3$/m);
     expect(text).toMatch(/^syncer_aggregator_runs_total\{job="stats"\} 1$/m);

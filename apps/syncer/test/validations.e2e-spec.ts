@@ -1,0 +1,546 @@
+import { ClickHouseService, getNetworkProfile, NodeClient, runMigrations, Table } from '@gatehub/data-api-shared';
+import { EventEmitter, once } from 'node:events';
+import { AddressInfo } from 'node:net';
+import { WebSocket, WebSocketServer } from 'ws';
+import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
+import { SyncerConfig } from '../src/config/syncer.config';
+import { ValidationsCollector } from '../src/validations/validations-collector';
+
+/**
+ * The validations collector against a real ClickHouse (testcontainers):
+ *  - what the unit specs cannot show: how `validations` (an AggregatingMergeTree of SimpleAggregateFunction columns) reads
+ *    the rows the collector writes. Partial sightings of one validation are separate rows until a merge; summed with
+ *    `GROUP BY` they are one, and after `OPTIMIZE ... FINAL` the table itself says the same;
+ *  - the whole path, with real `NodeClient`s against websocket servers that talk like rippled: subscribe, `server_info`,
+ *    the stream messages, the `manifest` RPC.
+ */
+
+const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
+/** The node clients of the collector, as the collector makes them, without their log lines. */
+const quietClient = (endpoint: string): NodeClient => new NodeClient({ endpoints: [endpoint], logger: QUIET });
+const NO_FLUSH_TIMER = 3_600_000;
+const REPORTER = 'n9KJb7NMxGySRcjCqh69xEPMUhwJx22qntYYXsnUqYgjsJhNoW7g';
+const SIGNING = 'n9MzwWa4dwdZkRzj6XmihBG4ymGtMPd12cLjfhKwx5Hoqeu6WEgy';
+const MASTER = 'nHUkp7WhouVMobBUKGrV5FNqjsdD9zKP5jpGnnLLnYxUQSGAwrZ6';
+const SIGNING_2 = 'n9LbDLg9F7ExZCeMw1QZqsd1Ejs9uYpwd8bPUStF5hBJdd6B5aWj';
+const MASTER_2 = 'nHUnhRJK3csknycNK5SXRFi8jvDp3sKoWvS9wKWLq1ATBBGgPBjp';
+
+/**
+ * Yesterday (UTC), the day the sightings of these tests are seen on: `validations` expires its rows 90 days after their
+ * last datetime (TTL) and ClickHouse drops an expired row as it is written, so a fixed date would stop working one day.
+ */
+const YESTERDAY = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+
+/** A hash that no other test uses: `n` as 64 hex digits. */
+const hash = (n: number): string => n.toString(16).toUpperCase().padStart(64, '0');
+
+function validation(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    type: 'validationReceived',
+    amendments: ['42426C4D4F1009EE67080A9B7965B44656D7714D104A72F9B4369F97ABF044EE'],
+    base_fee: 10,
+    flags: 2147483649,
+    full: true,
+    ledger_hash: hash(1),
+    ledger_index: '46087342',
+    load_fee: 256000,
+    master_key: MASTER,
+    reserve_base: 10000000,
+    reserve_inc: 2000000,
+    signature: '304402207D80F93D',
+    signing_time: 606933920,
+    validation_public_key: SIGNING,
+    ...overrides,
+  };
+}
+
+interface Grouped {
+  validation_public_key: string;
+  count: number;
+  first: string;
+  last: string;
+  reporter: string;
+  ephemeral: string;
+}
+
+describe('ValidationsCollector (e2e)', () => {
+  let clickhouse: StartedClickHouse;
+  let ch: ClickHouseService;
+
+  beforeAll(async () => {
+    clickhouse = await startClickHouse();
+    const config = { ...clickhouse.config, database: 'validations_e2e' };
+    await runMigrations({ config, log: () => undefined });
+    ch = new ClickHouseService(config);
+  });
+
+  afterAll(async () => {
+    await ch?.onModuleDestroy();
+    await clickhouse?.container.stop();
+  });
+
+  const config = (endpoints: string) => ({ validationEndpoints: endpoints }) as SyncerConfig;
+  const collectorFor = (endpoints = 'ws://127.0.0.1:1', network: 'xrpl' | 'xahau' = 'xrpl') =>
+    new ValidationsCollector(config(endpoints), getNetworkProfile(network), ch, undefined, undefined, {
+      logger: QUIET,
+      flushIntervalMs: NO_FLUSH_TIMER,
+      makeClient: quietClient,
+    });
+
+  /** What the API reads: the partial rows of one ledger summed per validator. */
+  const grouped = (ledgerHash: string): Promise<Grouped[]> =>
+    ch.query<Grouped>(
+      `SELECT validation_public_key, sum(count) AS count,
+              toString(min(first_datetime)) AS first, toString(max(last_datetime)) AS last,
+              argMin(reporter_public_key, first_datetime) AS reporter,
+              argMin(ephemeral_public_key, first_datetime) AS ephemeral
+         FROM ${Table.Validations}
+        WHERE ledger_hash = {h:String}
+        GROUP BY ledger_hash, validation_public_key
+        ORDER BY validation_public_key`,
+      { h: ledgerHash },
+    );
+  const rawRows = (ledgerHash: string): Promise<{ count: number; part: string }[]> =>
+    ch.query(
+      `SELECT count, _part AS part FROM ${Table.Validations} WHERE ledger_hash = {h:String} ORDER BY first_datetime`,
+      {
+        h: ledgerHash,
+      },
+    );
+
+  describe('rows in the table', () => {
+    it('flush is idempotent across two flushes: the counts of the partial rows add up', async () => {
+      const h = hash(100);
+      const collector = collectorFor();
+      const at = (ms: number) => new Date(Date.parse(`${YESTERDAY}T12:00:00.000Z`) + ms);
+
+      for (const ms of [123, 456, 789]) collector.handleValidation(validation({ ledger_hash: h }), REPORTER, at(ms));
+      expect(await collector.flush()).toBe(1);
+      expect(await collector.flush()).toBe(0); // nothing new: not written again
+      for (const ms of [20_100, 20_200]) {
+        collector.handleValidation(validation({ ledger_hash: h }), REPORTER, at(ms));
+      }
+      expect(await collector.flush()).toBe(1);
+
+      // two parts: the sightings of two flushes are two rows until the table merges them ...
+      const raw = await rawRows(h);
+      expect(raw.map((r) => Number(r.count))).toEqual([3, 2]);
+      // ... and one validation, with the sum of their counts, when read the way the API reads
+      expect(await grouped(h)).toEqual([
+        {
+          validation_public_key: MASTER,
+          count: 5,
+          first: `${YESTERDAY} 12:00:00.123`,
+          last: `${YESTERDAY} 12:00:20.200`,
+          reporter: REPORTER,
+          ephemeral: SIGNING,
+        },
+      ]);
+
+      // a merge gives the same answer: sum of counts, earliest first, latest last
+      await ch.command(`OPTIMIZE TABLE ${Table.Validations} FINAL`);
+      const merged = await ch.query<{ count: number; first: string; last: string; n: number }>(
+        `SELECT count, toString(first_datetime) AS first, toString(last_datetime) AS last, count() OVER () AS n
+           FROM ${Table.Validations} WHERE ledger_hash = {h:String}`,
+        { h },
+      );
+      expect(merged).toEqual([
+        { count: 5, first: `${YESTERDAY} 12:00:00.123`, last: `${YESTERDAY} 12:00:20.200`, n: 1 },
+      ]);
+      await collector.stop();
+    });
+
+    it('keeps the fractional seconds exactly, in a day partition of its own', async () => {
+      const h = hash(101);
+      const collector = collectorFor();
+      collector.handleValidation(validation({ ledger_hash: h }), REPORTER, new Date('2031-05-06T23:59:59.999Z'));
+      collector.handleValidation(
+        validation({ ledger_hash: h, master_key: MASTER_2, validation_public_key: SIGNING_2 }),
+        REPORTER,
+        new Date('2031-05-07T00:00:00.001Z'),
+      );
+      await collector.flush();
+      const rows = await ch.query<{ key: string; first: string; partition: string }>(
+        `SELECT validation_public_key AS key, toString(first_datetime) AS first, _partition_id AS partition
+           FROM ${Table.Validations} WHERE ledger_hash = {h:String} ORDER BY validation_public_key`,
+        { h },
+      );
+      expect(rows).toEqual([
+        { key: MASTER, first: '2031-05-06 23:59:59.999', partition: '20310506' },
+        { key: MASTER_2, first: '2031-05-07 00:00:00.001', partition: '20310507' },
+      ]);
+      await collector.stop();
+    });
+
+    it('stores every field of a message, and reads the fee fields back as exact digits and NULLs', async () => {
+      const h = hash(102);
+      const collector = collectorFor();
+      collector.handleValidation(
+        validation({ ledger_hash: h, base_fee: '9007199254740993', load_fee: undefined, reserve_inc: 0, full: false }),
+        REPORTER,
+        new Date(`${YESTERDAY}T12:00:00.000Z`),
+      );
+      await collector.flush();
+      const [row] = await ch.query<Record<string, unknown>>(
+        `SELECT ledger_index, reporter_public_key, ephemeral_public_key, signature, signing_time, flags, full, amendments,
+                toString(base_fee) AS base_fee, load_fee, toString(reserve_base) AS reserve_base, toString(reserve_inc) AS reserve_inc
+           FROM ${Table.Validations} WHERE ledger_hash = {h:String}`,
+        { h },
+      );
+      expect(row).toEqual({
+        ledger_index: 46087342,
+        reporter_public_key: REPORTER,
+        ephemeral_public_key: SIGNING,
+        signature: '304402207D80F93D',
+        signing_time: 606933920,
+        flags: 2147483649,
+        full: 0,
+        amendments: JSON.stringify(['42426C4D4F1009EE67080A9B7965B44656D7714D104A72F9B4369F97ABF044EE']),
+        base_fee: '9007199254740993',
+        load_fee: null,
+        reserve_base: '10000000',
+        reserve_inc: '0',
+      });
+      await collector.stop();
+    });
+
+    it('writes a batch of rows ClickHouse would take from nothing else: odd fields are defaults, not errors', async () => {
+      const h = hash(103);
+      const collector = collectorFor();
+      collector.handleValidation(
+        validation({ ledger_hash: h, ledger_index: 'x', flags: -1, signing_time: 2 ** 40, signature: undefined }),
+        REPORTER,
+        new Date(`${YESTERDAY}T12:00:00.000Z`),
+      );
+      expect(await collector.flush()).toBe(1);
+      const [row] = await ch.query<Record<string, unknown>>(
+        `SELECT ledger_index, flags, signing_time, signature FROM ${Table.Validations} WHERE ledger_hash = {h:String}`,
+        { h },
+      );
+      expect(row).toEqual({ ledger_index: 0, flags: 0, signing_time: 0, signature: '' });
+      await collector.stop();
+    });
+
+    it('is read in the order of the validators, whatever the order the sightings came in', async () => {
+      const h = hash(104);
+      const collector = collectorFor();
+      const keys = [MASTER_2, MASTER, 'nHUon2tpyJEHHYGmxqeGu37cvPYHzrMtUNQFVdCgGNvEkjmCpTqK'];
+      keys.forEach((key, i) =>
+        collector.handleValidation(
+          validation({ ledger_hash: h, master_key: key, validation_public_key: `n9${i}` }),
+          REPORTER,
+          new Date(Date.parse(`${YESTERDAY}T12:00:00Z`) + i),
+        ),
+      );
+      await collector.flush();
+      expect((await grouped(h)).map((r) => r.validation_public_key)).toEqual([...keys].sort());
+      await collector.stop();
+    });
+  });
+
+  describe('validator_manifests', () => {
+    it('keeps the highest seq per ephemeral key, and a restarted collector maps through them', async () => {
+      const collector = collectorFor();
+      const a = 'n9ManifestKeyA11111111111111111111111111111111111111';
+      const b = 'n9ManifestKeyB11111111111111111111111111111111111111';
+      collector.handleManifest({ master_key: MASTER, signing_key: a, seq: 3 });
+      collector.handleManifest({ master_key: MASTER_2, signing_key: b, seq: 1 });
+      await collector.flush();
+      collector.handleManifest({ master_key: MASTER, signing_key: a, seq: 2 }); // older: ignored
+      collector.handleManifest({ master_key: 'nHUsomeoneElse', signing_key: a, seq: 9 });
+      await collector.flush();
+
+      await ch.command(`OPTIMIZE TABLE ${Table.ValidatorManifests} FINAL`);
+      const stored = await ch.query<{ ephemeral_key: string; master_key: string; seq: number }>(
+        `SELECT ephemeral_key, master_key, seq FROM ${Table.ValidatorManifests}
+          WHERE ephemeral_key IN ({a:String}, {b:String}) ORDER BY ephemeral_key`,
+        { a, b },
+      );
+      expect(stored).toEqual([
+        { ephemeral_key: a, master_key: 'nHUsomeoneElse', seq: 9 },
+        { ephemeral_key: b, master_key: MASTER_2, seq: 1 },
+      ]);
+      await collector.stop();
+
+      // the next process reads them at start and needs no RPC to know the master key
+      const h = hash(110);
+      const idle = Object.assign(new EventEmitter(), {
+        subscribe: async () => undefined,
+        start: async () => new Promise<void>(() => undefined), // never connects: only the manifests are read here
+        stop: async () => undefined,
+      });
+      const restarted = new ValidationsCollector(
+        config('ws://127.0.0.1:1'),
+        getNetworkProfile('xrpl'),
+        ch,
+        undefined,
+        undefined,
+        { logger: QUIET, flushIntervalMs: NO_FLUSH_TIMER, makeClient: () => idle as unknown as NodeClient },
+      );
+      restarted.onApplicationBootstrap();
+      await new Promise((resolve) => setTimeout(resolve, 300)); // the load of validator_manifests
+      restarted.handleValidation(
+        validation({ ledger_hash: h, master_key: undefined, validation_public_key: b }),
+        REPORTER,
+        new Date(`${YESTERDAY}T12:00:00Z`),
+      );
+      await restarted.flush();
+      expect((await grouped(h)).map((r) => r.validation_public_key)).toEqual([MASTER_2]);
+      await restarted.stop();
+    });
+  });
+
+  describe('with real node clients', () => {
+    interface FakeNode {
+      url: string;
+      pubkey: string;
+      server: WebSocketServer;
+      subscribed: string[][];
+      requests: Record<string, unknown>[];
+      /** The `manifest` answers by public key. */
+      manifests: Record<string, { master_key: string; seq: number }>;
+      sockets: Set<WebSocket>;
+      push(message: Record<string, unknown>): void;
+      stop(): Promise<void>;
+    }
+
+    /** A websocket server that answers like a rippled: `server_info`, `subscribe`, `manifest`; it can push stream messages. */
+    async function startNode(pubkey: string, networkId?: number): Promise<FakeNode> {
+      const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+      await once(server, 'listening');
+      const node: FakeNode = {
+        url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}`,
+        pubkey,
+        server,
+        subscribed: [],
+        requests: [],
+        manifests: {},
+        sockets: new Set(),
+        push: (message) => {
+          for (const socket of node.sockets) socket.send(JSON.stringify(message));
+        },
+        stop: () =>
+          new Promise((resolve) => {
+            for (const socket of server.clients) socket.terminate();
+            server.close(() => resolve());
+          }),
+      };
+      server.on('connection', (socket) => {
+        node.sockets.add(socket);
+        socket.on('close', () => node.sockets.delete(socket));
+        socket.on('message', (raw) => {
+          const request = JSON.parse(raw.toString()) as { id: number; command: string; [k: string]: unknown };
+          node.requests.push(request);
+          const respond = (result: object) =>
+            socket.send(JSON.stringify({ id: request.id, type: 'response', status: 'success', result }));
+          if (request.command === 'server_info') {
+            respond({ info: { complete_ledgers: '1-100', pubkey_node: pubkey, network_id: networkId } });
+          } else if (request.command === 'subscribe') {
+            node.subscribed.push(request.streams as string[]);
+            respond({});
+          } else if (request.command === 'manifest') {
+            const known = node.manifests[request.public_key as string];
+            respond({
+              requested: request.public_key,
+              ...(known && {
+                details: { ephemeral_key: request.public_key, master_key: known.master_key, seq: known.seq },
+              }),
+            });
+          } else {
+            respond({});
+          }
+        });
+      });
+      return node;
+    }
+
+    async function waitFor(what: string, probe: () => boolean, timeoutMs = 15_000): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (!probe()) {
+        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+
+    async function waitForAsync(what: string, probe: () => Promise<boolean>, timeoutMs = 15_000): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (!(await probe())) {
+        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+
+    it('subscribes to validations and manifests on every endpoint, and stamps each report with its node', async () => {
+      const a = await startNode('n9NodeAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+      const b = await startNode('n9NodeBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB');
+      const collector = collectorFor(`${a.url},${b.url}`);
+      try {
+        collector.onApplicationBootstrap();
+        await waitFor('both nodes to be subscribed', () => a.subscribed.length > 0 && b.subscribed.length > 0);
+        expect(a.subscribed).toEqual([['validations', 'manifests']]);
+        expect(b.subscribed).toEqual([['validations', 'manifests']]);
+        // the reporter is asked of server_info before anything is recorded
+        await waitFor('server_info of both nodes', () =>
+          [a, b].every((n) => n.requests.some((r) => r.command === 'server_info')),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        const h = hash(200);
+        /** Flushes until the table holds `n` reports of the given ledgers. */
+        const reportsIn = (n: number, ...hashes: string[]) =>
+          waitForAsync(`${n} reports`, async () => {
+            await collector.flush();
+            const [total] = await ch.query<{ n: number }>(
+              `SELECT sum(count) AS n FROM ${Table.Validations} WHERE ledger_hash IN ({hashes:Array(String)})`,
+              { hashes },
+            );
+            return Number(total.n) === n;
+          });
+        a.push(validation({ ledger_hash: h }));
+        a.push(validation({ ledger_hash: h }));
+        await reportsIn(2, h);
+        b.push(validation({ ledger_hash: h })); // the same validation, reported by the other node
+        b.push(validation({ ledger_hash: hash(201), master_key: MASTER_2, validation_public_key: SIGNING_2 }));
+        await reportsIn(4, h, hash(201));
+
+        const [row] = await grouped(h);
+        expect(row).toMatchObject({ validation_public_key: MASTER, ephemeral: SIGNING, reporter: a.pubkey });
+        expect(row.count).toBe(3);
+        const [other] = await grouped(hash(201));
+        expect(other).toMatchObject({ validation_public_key: MASTER_2, count: 1, reporter: b.pubkey });
+      } finally {
+        await collector.stop();
+        await Promise.all([a.stop(), b.stop()]);
+      }
+    });
+
+    it('maps an ephemeral key by a manifest of the stream, and by the manifest RPC when no manifest came', async () => {
+      const node = await startNode(REPORTER);
+      node.manifests[SIGNING_2] = { master_key: MASTER_2, seq: 12 };
+      const collector = collectorFor(node.url);
+      try {
+        collector.onApplicationBootstrap();
+        await waitFor('the subscription', () => node.subscribed.length > 0);
+        await waitFor('server_info', () => node.requests.some((r) => r.command === 'server_info'));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        const h = hash(210);
+        node.push({ type: 'manifestReceived', master_key: MASTER, seq: 5, signature: 'AA', signing_key: SIGNING });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        node.push(validation({ ledger_hash: h, master_key: undefined })); // mapped by the manifest of the stream
+        node.push(validation({ ledger_hash: h, master_key: undefined, validation_public_key: SIGNING_2 })); // by the RPC
+        node.push(validation({ ledger_hash: h, master_key: undefined, validation_public_key: 'n9Unknown' })); // by neither
+        await waitFor('three validators', () => collector.bufferedRows === 3);
+        await collector.flush();
+
+        expect((await grouped(h)).map((r) => [r.validation_public_key, r.ephemeral, r.count])).toEqual(
+          [
+            [MASTER, SIGNING, 1],
+            [MASTER_2, SIGNING_2, 1],
+            ['n9Unknown', 'n9Unknown', 1],
+          ].sort((x, y) => String(x[0]).localeCompare(String(y[0]))),
+        );
+        expect(node.requests.filter((r) => r.command === 'manifest').map((r) => r.public_key)).toEqual([
+          SIGNING_2,
+          'n9Unknown',
+        ]);
+        expect(node.requests.find((r) => r.command === 'manifest')).not.toHaveProperty('api_version');
+
+        // both manifests are in the table: the one of the stream and the one the RPC found
+        const stored = await ch.query<{ ephemeral_key: string; master: string; highest: number }>(
+          `SELECT ephemeral_key, argMax(master_key, seq) AS master, max(seq) AS highest
+             FROM ${Table.ValidatorManifests} WHERE ephemeral_key IN ({a:String}, {b:String})
+            GROUP BY ephemeral_key ORDER BY ephemeral_key`,
+          { a: SIGNING, b: SIGNING_2 },
+        );
+        expect(stored.sort((x, y) => x.ephemeral_key.localeCompare(y.ephemeral_key))).toEqual(
+          [
+            { ephemeral_key: SIGNING, master: MASTER, highest: 5 },
+            { ephemeral_key: SIGNING_2, master: MASTER_2, highest: 12 },
+          ].sort((x, y) => x.ephemeral_key.localeCompare(y.ephemeral_key)),
+        );
+      } finally {
+        await collector.stop();
+        await node.stop();
+      }
+    });
+
+    it('sends the subscription again on a new connection, and asks for the reporter again', async () => {
+      const node = await startNode('n9NodeBeforeReconnect');
+      const collector = collectorFor(node.url);
+      try {
+        collector.onApplicationBootstrap();
+        await waitFor('the subscription', () => node.subscribed.length === 1);
+        await waitFor('server_info', () => node.requests.filter((r) => r.command === 'server_info').length === 1);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        node.pubkey = 'n9NodeAfterReconnect';
+        for (const socket of node.server.clients) socket.terminate(); // the connection drops
+        await waitFor('the second subscription', () => node.subscribed.length === 2, 30_000);
+        await waitFor(
+          'the second server_info',
+          () => node.requests.filter((r) => r.command === 'server_info').length === 2,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(node.subscribed[1]).toEqual(['validations', 'manifests']);
+      } finally {
+        await collector.stop();
+        await node.stop();
+      }
+    });
+
+    it('refuses a node of the other network: nothing it reports is written', async () => {
+      const xahau = await startNode('n9XahauNode', 21337);
+      const collector = collectorFor(xahau.url, 'xrpl');
+      try {
+        collector.onApplicationBootstrap();
+        await waitFor('the subscription', () => xahau.subscribed.length > 0);
+        await waitFor('server_info', () => xahau.requests.some((r) => r.command === 'server_info'));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        xahau.push(validation({ ledger_hash: hash(220) }));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(collector.bufferedRows).toBe(0);
+      } finally {
+        await collector.stop();
+        await xahau.stop();
+      }
+    });
+
+    it('works on Xahau unchanged', async () => {
+      const xahau = await startNode('n9XahauNode', 21337);
+      const collector = collectorFor(xahau.url, 'xahau');
+      try {
+        collector.onApplicationBootstrap();
+        await waitFor('the subscription', () => xahau.subscribed.length > 0);
+        await waitFor('server_info', () => xahau.requests.some((r) => r.command === 'server_info'));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        xahau.push(validation({ ledger_hash: hash(221) }));
+        await waitFor('the validation', () => collector.bufferedRows === 1);
+        await collector.flush();
+        expect((await grouped(hash(221))).map((r) => [r.validation_public_key, r.count, r.reporter])).toEqual([
+          [MASTER, 1, 'n9XahauNode'],
+        ]);
+      } finally {
+        await collector.stop();
+        await xahau.stop();
+      }
+    });
+
+    it('flushes what it has when it is stopped', async () => {
+      const node = await startNode(REPORTER);
+      const collector = collectorFor(node.url);
+      try {
+        collector.onApplicationBootstrap();
+        await waitFor('the subscription', () => node.subscribed.length > 0);
+        await waitFor('server_info', () => node.requests.some((r) => r.command === 'server_info'));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        node.push(validation({ ledger_hash: hash(230) }));
+        await waitFor('the validation', () => collector.bufferedRows === 1);
+      } finally {
+        await collector.stop(); // the final flush
+        await node.stop();
+      }
+      expect((await grouped(hash(230))).map((r) => r.count)).toEqual([1]);
+    });
+  });
+});

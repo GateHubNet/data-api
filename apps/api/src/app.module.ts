@@ -30,6 +30,7 @@ import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
 import { PaymentsModule } from './payments/payments.module';
 import { TransactionsModule } from './transactions/transactions.module';
+import { ValidationsModule } from './validations/validations.module';
 import { XrplModule } from './xrpl/xrpl.module';
 
 /**
@@ -62,6 +63,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   AccountsModule,
   ActiveAccountsModule,
   NetworkModule,
+  ValidationsModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */
