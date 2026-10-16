@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
 import { Table } from '../src/clickhouse/tables';
-import { buildLedgerRows, CHILD_TABLES, LedgerRows } from '../src/ingest/build-rows';
+import { buildLedgerRows, CHILD_TABLES, LedgerParseError, LedgerRows } from '../src/ingest/build-rows';
 import { FixtureLedgerSource } from '../src/ingest/fixture-ledger-source';
 import {
   awaitQuiescence,
@@ -224,6 +224,28 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       expect(spy.mock.calls.map((c) => c[0])).toEqual([Table.LedgerByHash, Table.Ledgers]);
       expect(await count(svc, Table.Ledgers)).toBe(1);
+    });
+
+    it('fails with a LedgerParseError naming the ledger before it inserts anything (ruling R96)', async () => {
+      const svc = await freshService();
+      const spy = jest.spyOn(svc, 'insert');
+      const bad = index(5);
+      const ledgers = LEDGERS.slice(0, 10).map((raw) =>
+        raw.header.ledger_index === bad
+          ? {
+              ...raw,
+              transactions: raw.transactions.map((t, i) => (i === 0 ? { ...t, tx: { ...t.tx, Fee: 'x' } } : t)),
+            }
+          : raw,
+      );
+      expect(LEDGERS[5].transactions.length).toBeGreaterThan(0);
+
+      await expect(new LedgerWriter(svc, ctx).write(ledgers)).rejects.toMatchObject({
+        name: 'LedgerParseError',
+        ledgerIndex: bad,
+      });
+      await expect(new LedgerWriter(svc, ctx).write(ledgers)).rejects.toBeInstanceOf(LedgerParseError);
+      expect(spy).not.toHaveBeenCalled();
     });
 
     it('writing no ledgers does nothing', async () => {

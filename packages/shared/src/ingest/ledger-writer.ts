@@ -73,6 +73,9 @@ export class LedgerWriter {
   /**
    * Write the ledgers as one batch: the rows of all of them are concatenated per table. Throws on the first failure
    * (after every insert of this call has settled on the client); the caller recovers as the class description says.
+   *
+   * Every ledger is parsed before the first insert: a ledger the parser rejects throws a `LedgerParseError` (naming the
+   * ledger) with nothing of the batch written, so the caller may write the ledgers before it with this same writer.
    */
   async write(ledgers: RawLedger[]): Promise<void> {
     if (ledgers.length === 0) return;

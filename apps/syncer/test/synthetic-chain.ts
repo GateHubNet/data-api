@@ -26,6 +26,8 @@ export interface SyntheticChainOptions {
   breakAt?: number;
   /** Salt of every hash: two chains with different salts share no hash. */
   salt?: string;
+  /** This ledger's first transaction has a `Fee` the parser rejects (`buildLedgerRows` throws on it). */
+  malformedAt?: number;
 }
 
 /**
@@ -47,6 +49,10 @@ export function syntheticChain(first: number, count: number, opts: SyntheticChai
       hash,
       parent_hash: parentHash,
     };
+    if (index === opts.malformedAt) {
+      const [first, ...rest] = json.transactions as Record<string, unknown>[];
+      json.transactions = [{ ...first, Fee: 'not a number' }, ...rest];
+    }
     ledgers.push({ index, json, raw: normalizeLedgerResponse(json) });
   }
   return ledgers;

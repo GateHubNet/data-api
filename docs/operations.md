@@ -127,7 +127,7 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | --- | --- | --- |
 | `syncer_lag_ledgers` | 0-2 live; large and falling during catch-up | Does not fall, or is above 10 for more than a minute (the probe fails at `GH_MAX_LAG_HEALTHY`) |
 | `syncer_last_commit_age_seconds` | under ~10 s live (a ledger closes every 3-4 s on XRPL) | Above 60 s with a lag of 0 means the chain is not closing ledgers or the head hint is stuck |
-| syncer probe `state` | `live` (`catching_up` while behind) | `halted` (chain break or lost lease) |
+| syncer probe `state` | `live` (`catching_up` while behind) | `halted` (chain break, a ledger the parser rejects, or lost lease) |
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
 | `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines |
 | `rate(syncer_fee_stats_samples_total[5m])` | about 0.2/s | 0 (node unreachable) |
@@ -203,6 +203,10 @@ them with `range-ingest` (see [Backfill and repair](#backfill-and-repair)).
   out which is wrong (ask a second node: `ledger` at the stored index, compare `ledger_hash`). If the **node** is on another
   chain (wrong network, a reset test net) fix `GH_NODE_ENDPOINTS`. If the **stored** ledgers are wrong, re-ingest from the last
   good ledger: `range-ingest --reprocess --from <last good> --to <checkpoint>` from a stopped live syncer, then start it.
+- `Cannot parse ledger <index>: <reason>`: the parser rejects that ledger (a transaction type or field it does not handle). It
+  fails the same way every time, so the runner committed the ledgers before it and stopped instead of retrying. Look at the
+  ledger (`ledger` with `transactions` and `expand` on the node), fix the parser, deploy, restart: the runner carries on at that
+  ledger. `range-ingest` fails the chunk with the same message and leaves its intent open; rerun it after the fix.
 - `lease lost to <holder>`: another syncer took the lease. Find and stop it; restart this one.
 
 ### Syncer falling behind

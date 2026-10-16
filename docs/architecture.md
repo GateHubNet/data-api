@@ -135,7 +135,7 @@ views. See [clickhouse](clickhouse.md).
 | Tier | Scales | Resilience |
 | --- | --- | --- |
 | API | Horizontally (stateless; small per-replica caches and rate-limit state) | A replica loss is invisible behind nginx; `GET /liveliness/healthz` gates readiness |
-| Syncer | **Does not scale out**: one writer per network (fixed container name + ClickHouse lease). Speed up history with `range-ingest --concurrency` | Crash-safe: the checkpoint is `max(ledgers.ledger_index)`, the uncommitted tail is deleted on boot, the node client reconnects with failover; halts (probe 503) on a chain break or a lost lease |
+| Syncer | **Does not scale out**: one writer per network (fixed container name + ClickHouse lease). Speed up history with `range-ingest --concurrency` | Crash-safe: the checkpoint is `max(ledgers.ledger_index)`, the uncommitted tail is deleted on boot, the node client reconnects with failover; halts (probe 503) on a chain break, a ledger the parser rejects, or a lost lease |
 | ClickHouse | Vertically first; replication needs Keeper-backed engines | Backups; the data is re-derivable from the ledger |
 
 ## Why two services

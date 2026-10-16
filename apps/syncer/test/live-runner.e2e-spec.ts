@@ -5,6 +5,7 @@ import {
   getNetworkProfile,
   LEDGER_KEYED_TABLES,
   LedgerNotAvailableError,
+  LedgerParseError,
   LedgerSource,
   LedgerWriter,
   parseContextFor,
@@ -729,6 +730,66 @@ describe('LiveRunner (e2e)', () => {
     );
     // A halted runner stays halted.
     await expect(runner.runOnce()).rejects.toBeInstanceOf(ChainBreakError);
+  });
+
+  /** How often the runner halted for `reason`, so far (the counter is process-wide). */
+  async function halts(metrics: PrometheusService, reason: string): Promise<number> {
+    const { values } = await metrics.ingestHaltsTotal.get();
+    return values.find((v) => v.labels.reason === reason)?.value ?? 0;
+  }
+
+  it('halts on a ledger the parser rejects: commits the ledgers before it and does not retry (ruling R96)', async () => {
+    const svc = await freshService();
+    const chain = syntheticChain(L(1), 30, { malformedAt: L(12) });
+    const source = new TestSource(L(30), chain);
+    const metrics = new PrometheusService();
+    const before = await halts(metrics, 'parse_error');
+    // Batches of 7: L(1)..L(7) commit, then L(8)..L(14) holds the bad ledger: its prefix L(8)..L(11) commits too.
+    const { runner, logger } = makeRunner(svc, source, { metrics });
+
+    await expect(runner.runOnce()).rejects.toBeInstanceOf(LedgerParseError);
+
+    expect(runner.status()).toMatchObject({
+      state: 'halted',
+      checkpoint: L(11),
+      error: expect.stringContaining(`Cannot parse ledger ${L(12)}`),
+    });
+    expect(await committedIndexes(svc)).toEqual(range(L(1), L(11)));
+    expect(await rowsAbove(svc, L(11))).toEqual(noRows());
+    expect(source.fetchCount(L(12))).toBe(1); // not "recovered" and fetched again
+    expect(await halts(metrics, 'parse_error')).toBe(before + 1);
+    expect(logger.lines).toContainEqual(
+      expect.objectContaining({
+        level: 'error',
+        message: expect.stringContaining(`Ingest halted until an operator intervenes: Cannot parse ledger ${L(12)}`),
+      }),
+    );
+    expect(logger.lines.some((l) => l.message.includes('Recovered'))).toBe(false);
+    // A halted runner stays halted.
+    await expect(runner.runOnce()).rejects.toBeInstanceOf(LedgerParseError);
+  });
+
+  it('halts at once when the first ledger of a batch is the one the parser rejects', async () => {
+    const svc = await freshService();
+    const chain = syntheticChain(L(1), 30, { malformedAt: L(8) });
+    const { runner } = makeRunner(svc, new TestSource(L(30), chain));
+
+    await expect(runner.runOnce()).rejects.toMatchObject({ name: 'LedgerParseError', ledgerIndex: L(8) });
+
+    expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(7) });
+    expect(await committedIndexes(svc)).toEqual(range(L(1), L(7)));
+    expect(await rowsAbove(svc, L(7))).toEqual(noRows());
+  });
+
+  it('counts a chain break as a halt too', async () => {
+    const svc = await freshService();
+    const metrics = new PrometheusService();
+    const before = await halts(metrics, 'chain_break');
+    const { runner } = makeRunner(svc, new TestSource(L(30), syntheticChain(L(1), 30, { breakAt: L(12) })), {
+      metrics,
+    });
+    await expect(runner.runOnce()).rejects.toBeInstanceOf(ChainBreakError);
+    expect(await halts(metrics, 'chain_break')).toBe(before + 1);
   });
 
   it('halts at boot when the stored checkpoint hash differs from the node', async () => {

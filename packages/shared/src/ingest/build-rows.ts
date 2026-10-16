@@ -109,14 +109,45 @@ function tally(counts: Map<string, number>, key: string): void {
 }
 
 /**
+ * A ledger that cannot be turned into rows (a malformed transaction, a field a parser rejects). Parsing is pure, so it
+ * fails the same way every time: retrying it, or fetching the ledger again, does not help (ruling R96). The live runner
+ * halts on it and range-ingest fails the chunk at once; an operator has to look at the ledger.
+ */
+export class LedgerParseError extends Error {
+  constructor(
+    readonly ledgerIndex: number,
+    readonly reason: string,
+  ) {
+    super(`Cannot parse ledger ${ledgerIndex}: ${reason}`);
+    this.name = 'LedgerParseError';
+  }
+}
+
+/** Whether `err` is a `LedgerParseError` (by name too, so that it holds across copies of this package). */
+export function isLedgerParseError(err: unknown): err is LedgerParseError {
+  return err instanceof LedgerParseError || (err instanceof Error && err.name === 'LedgerParseError');
+}
+
+/**
  * Parse one ledger into the rows of every ledger-derived table, plus the `ledgers` summary row.
  *
  * Pure: the same ledger always gives the same rows, nothing in `raw` is modified, and the result shares no objects with
  * it. Rows carry no `undefined`: an absent optional value is `null`, and the empty string stands for the native
  * currency's issuer and counterparty. Native amounts in `fee` columns are drops, every other amount is an exact decimal
  * string in whole units.
+ *
+ * Throws a `LedgerParseError` (with the ledger index and the reason) for anything it cannot parse.
  */
 export function buildLedgerRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
+  try {
+    return buildRows(raw, ctx);
+  } catch (err) {
+    if (isLedgerParseError(err)) throw err;
+    throw new LedgerParseError(raw.header.ledger_index, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
   const { header } = raw;
   const closeTime = header.close_time;
 

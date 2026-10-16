@@ -7,7 +7,7 @@ import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
 import { ParseContext, parseContextFor } from '../parsers/parser.interface';
 import { deepFreeze } from '../test-utils/deep-freeze';
-import { buildLedgerRows, CHILD_TABLES, LedgerRows } from './build-rows';
+import { buildLedgerRows, CHILD_TABLES, LedgerParseError, LedgerRows } from './build-rows';
 import { FixtureLedgerSource } from './fixture-ledger-source';
 import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
 
@@ -723,6 +723,23 @@ describe('buildLedgerRows mapping', () => {
         rawTx({ TransactionType: 'AccountSet', Account: SENDER, Fee: '1.5' }, 0, 'F'.repeat(64), []),
       ]);
       expect(() => buildLedgerRows(bad, XRPL)).toThrow(/Fee/);
+    });
+
+    it('throws a LedgerParseError that names the ledger for anything it cannot parse (ruling R96)', () => {
+      const bad = ledgerOf([
+        rawTx({ TransactionType: 'AccountSet', Account: SENDER, Fee: 'abc' }, 0, 'F'.repeat(64), []),
+      ]);
+      let thrown: unknown;
+      try {
+        buildLedgerRows(bad, XRPL);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(LedgerParseError);
+      expect(thrown).toMatchObject({ name: 'LedgerParseError', ledgerIndex: 5000000 });
+      expect((thrown as Error).message).toBe(
+        `Cannot parse ledger 5000000: Ledger 5000000: transaction ${'F'.repeat(64)} has an invalid Fee "abc"`,
+      );
     });
 
     it('treats a missing Fee as 0 (pseudo-transactions)', () => {

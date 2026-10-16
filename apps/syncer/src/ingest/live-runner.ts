@@ -3,6 +3,8 @@ import {
   ClickHouseService,
   committedCheckpoint,
   deleteLedgersAbove,
+  isLedgerParseError,
+  LedgerParseError,
   LedgerSource,
   LedgerWriter,
   RawLedger,
@@ -153,6 +155,12 @@ class StoppedError extends Error {}
  * a pipeline rebuilt from checkpoint + 1. A recovery step that fails (a stuck mutation) is logged as an error, shown in
  * the status, and retried with backoff; nothing is written until it succeeds.
  *
+ * **A ledger the parser rejects** (`LedgerParseError`) is not a failed write: parsing is pure, so it would fail the same
+ * way after any recovery (ruling R96). The ledgers of the batch before it are committed (the writer parses the whole
+ * batch before it inserts anything, so the same writer may write that prefix), then the runner halts like on a chain
+ * break: status `halted` with the error, liveliness 503, `syncer_ingest_halts_total{reason="parse_error"}`. An operator
+ * has to look at the ledger (a parser fix, then a restart, which carries on after the checkpoint).
+ *
  * **Shutdown** (`onModuleDestroy`, or SIGTERM through `ShutdownSignals`): stop the loop (a write in progress finishes, a
  * partial batch is dropped and refetched next time; a boot or recovery step is abandoned, the next boot redoes it) and
  * release the lease.
@@ -185,7 +193,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   /** The ledger below the first one this runner writes when nothing is committed (`start - 1`, or the boot checkpoint). */
   private floor?: number;
   private committed?: number;
-  /** Consecutive failed writes; slows down a write that fails again and again (a ledger the parser rejects). */
+  /** Consecutive failed writes; slows down a write that fails again and again (ClickHouse refusing a batch). */
   private writeFailures = 0;
   /** The first-write intent of an empty-database boot is still to be marked done (after the first commit). */
   private liveIntentPending = false;
@@ -272,8 +280,8 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
 
   /**
    * Test hook: take the lease, prepare (first call only), catch up to the validated head as polled now (or a higher hint)
-   * and resolve. Rejects with `ChainBreakError` / `LeaseLostError` when the runner halts. Not for use while the background
-   * loop runs.
+   * and resolve. Rejects with `ChainBreakError` / `LedgerParseError` / `LeaseLostError` when the runner halts. Not for use
+   * while the background loop runs.
    */
   async runOnce(): Promise<void> {
     this.assertUsable();
@@ -289,7 +297,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         const target = this.head;
         if (target !== undefined) await this.pipeline(() => (this.committedTip() ?? 0) >= target);
       } catch (err) {
-        if (err instanceof ChainBreakError) this.halt(err);
+        if (err instanceof ChainBreakError || isLedgerParseError(err)) this.halt(err);
         throw err;
       }
       if (this.haltError) throw this.haltError;
@@ -566,7 +574,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         await this.pipeline(() => false);
         return;
       } catch (err) {
-        if (err instanceof ChainBreakError) {
+        if (err instanceof ChainBreakError || isLedgerParseError(err)) {
           this.halt(err);
           return;
         }
@@ -756,6 +764,10 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       try {
         await this.writer.write(batch);
       } catch (err) {
+        if (isLedgerParseError(err)) {
+          await this.haltOnUnparsable(batch, err);
+          return;
+        }
         this.writeFailures += 1;
         this.logger.error(
           `Writing ledgers ${first}-${last} failed (run ${this.writer.runId}); recovering from the committed checkpoint: ` +
@@ -765,27 +777,62 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         await this.recover(err);
         return;
       }
-      this.writeFailures = 0;
       this.batch = [];
       this.batchTxs = 0;
       this.batchSince = 0;
-      this.committed = last;
-      this.lastCommitAt = Date.now() / 1000;
-      this.metrics?.lastCommitTimestampSeconds.set(this.lastCommitAt);
-      this.updateStatus();
-      if (this.state === 'catching_up') {
-        this.logger.log(`Committed ledgers ${first}-${last}; head ${this.head}, lag ${this.lag}`);
-      } else {
-        this.logger.debug?.(`Committed ledger${first === last ? ` ${last}` : `s ${first}-${last}`}`);
-      }
-      if (this.liveIntentPending) {
-        await this.markLiveIntentsDone().then(
-          () => (this.liveIntentPending = false),
-          (err: unknown) => this.logger.warn(`Could not mark the first-write intent done (retried): ${describe(err)}`),
-        );
-      }
+      await this.committedBatch(first, last);
     }
     if (this.pendingBreak) throw this.pendingBreak;
+  }
+
+  /** The bookkeeping after the ledgers `first`..`last` were committed. */
+  private async committedBatch(first: number, last: number): Promise<void> {
+    this.writeFailures = 0;
+    this.committed = last;
+    this.lastCommitAt = Date.now() / 1000;
+    this.metrics?.lastCommitTimestampSeconds.set(this.lastCommitAt);
+    this.updateStatus();
+    if (this.state === 'catching_up') {
+      this.logger.log(`Committed ledgers ${first}-${last}; head ${this.head}, lag ${this.lag}`);
+    } else {
+      this.logger.debug?.(`Committed ledger${first === last ? ` ${last}` : `s ${first}-${last}`}`);
+    }
+    if (this.liveIntentPending) {
+      await this.markLiveIntentsDone().then(
+        () => (this.liveIntentPending = false),
+        (err: unknown) => this.logger.warn(`Could not mark the first-write intent done (retried): ${describe(err)}`),
+      );
+    }
+  }
+
+  /**
+   * Ruling R96: a ledger of `batch` cannot be parsed. Nothing of the batch was written (the writer parses all of it
+   * first), so the ledgers before the bad one are written with the same writer, then the runner halts. If writing that
+   * prefix fails, it is a failed write like any other: recovery, and the next attempt ends here again.
+   */
+  private async haltOnUnparsable(batch: RawLedger[], err: LedgerParseError): Promise<void> {
+    const prefix = batch.filter((ledger) => ledger.header.ledger_index < err.ledgerIndex);
+    if (prefix.length > 0) {
+      const first = prefix[0].header.ledger_index;
+      const last = prefix[prefix.length - 1].header.ledger_index;
+      try {
+        await this.writer.write(prefix);
+      } catch (prefixErr) {
+        this.writeFailures += 1;
+        this.logger.error(
+          `Writing ledgers ${first}-${last}, before the ledger ${err.ledgerIndex} that cannot be parsed, failed ` +
+            `(run ${this.writer.runId}); recovering from the committed checkpoint: ${describe(prefixErr)}`,
+          prefixErr instanceof Error ? prefixErr.stack : undefined,
+        );
+        await this.recover(prefixErr);
+        return;
+      }
+      await this.committedBatch(first, last);
+    }
+    this.batch = [];
+    this.batchTxs = 0;
+    this.batchSince = 0;
+    this.halt(err);
   }
 
   /**
@@ -802,7 +849,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     this.lastError = describe(cause);
     this.cancelFetches();
     if (this.writeFailures > 1) {
-      // The same write keeps failing (e.g. a ledger the parser rejects): do not hammer the node and ClickHouse.
+      // The same write keeps failing (e.g. ClickHouse refuses the batch): do not hammer the node and ClickHouse.
       await this.sleep(this.backoff(this.writeFailures - 1));
     }
     let delay = this.opts.backoffInitialMs;
@@ -879,11 +926,15 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     this.ready.clear();
   }
 
-  /** Halt for good (chain break, lost lease): nothing is fetched or written any more; liveliness fails. */
+  /**
+   * Halt for good (chain break, a ledger that cannot be parsed, lost lease): nothing is fetched or written any more;
+   * liveliness fails, and `syncer_ingest_halts_total{reason}` counts it.
+   */
   private halt(err: Error): void {
     if (this.haltError) return;
     this.haltError = err;
     this.state = 'halted';
+    this.metrics?.ingestHaltsTotal.inc({ reason: haltReason(err) });
     this.cancelFetches();
     this.notify();
     this.logger.error(`Ingest halted until an operator intervenes: ${err.message}`);
@@ -1022,6 +1073,14 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | typ
 function toLedgerIndex(value: unknown): number | undefined {
   const parsed = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
   return typeof parsed === 'number' && Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** The `reason` label of `syncer_ingest_halts_total` for the error the runner halted on. */
+function haltReason(err: Error): string {
+  if (err instanceof ChainBreakError) return 'chain_break';
+  if (err instanceof LeaseLostError) return 'lease_lost';
+  if (isLedgerParseError(err)) return 'parse_error';
+  return 'other';
 }
 
 /** `name: message`, plus the ClickHouse error code when there is one. */

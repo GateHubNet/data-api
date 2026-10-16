@@ -162,7 +162,8 @@ The endpoint belongs to another network (an XRPL node for a Xahau syncer, or the
 
 ### Syncer: lag does not fall / halted
 See [operations](operations.md#after-an-outage): a node without the history (`complete_ledgers`), ClickHouse refusing writes (`system.mutations`,
-the probe's `recovering`/`error`), a chain break or a lost lease (`state=halted`).
+the probe's `recovering`/`error`), a chain break, a ledger the parser rejects (`error: Cannot parse ledger <index>: ...`) or a lost lease
+(`state=halted`, see [operations](operations.md#syncer-halted)).
 
 ### `api_tx_encode_fallback_total` rises
 A transaction type or field is missing from the binary-codec definitions in use, so those transactions are served as their stored JSON. The

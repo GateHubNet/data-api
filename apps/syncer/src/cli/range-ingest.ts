@@ -6,6 +6,7 @@ import {
   committedCheckpoint,
   deleteLedgerRange,
   getNetworkProfile,
+  isLedgerParseError,
   LedgerNotAvailableError,
   LedgerSource,
   LedgerWriter,
@@ -145,7 +146,8 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  * **A failed attempt** is recovered as `LedgerWriter` documents (ruling R16): wait until the failed run's queries are gone,
  * delete the ledgers of the chunk that this run was writing (never a ledger it had skipped), wait for that too, and try
  * again with `writer.withNewRunId()`. A fetch that failed needs none of this: nothing was written, and the fetched
- * ledgers are kept for the next attempt. A `LedgerNotAvailableError`, a ledger the parser rejects and a live syncer
+ * ledgers are kept for the next attempt. A `LedgerNotAvailableError`, a ledger the parser rejects (a `LedgerParseError`
+ * with the ledger index and the reason: parsing is pure, a retry fails the same way, ruling R96) and a live syncer
  * that appeared are never retried: they stop the run, and the chunk stays an unfinished intent. After `maxAttempts` the
  * error is thrown the same way.
  *
@@ -418,7 +420,13 @@ class RangeRunner {
         }
         return ledgers;
       } catch (err) {
-        if (permanent || err instanceof LedgerNotAvailableError || attempt >= this.maxAttempts) {
+        // A ledger the parser rejects (`LedgerParseError`, which names it) fails the same way every time (ruling R96).
+        if (
+          permanent ||
+          isLedgerParseError(err) ||
+          err instanceof LedgerNotAvailableError ||
+          attempt >= this.maxAttempts
+        ) {
           this.logger.error(
             `Chunk [${chunk.start},${chunk.end}] failed (attempt ${attempt} of ${this.maxAttempts}), ` +
               `its intent stays open: ${describe(err)}`,

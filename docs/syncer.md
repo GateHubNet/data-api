@@ -107,6 +107,10 @@ half-written ledger is invisible; recovery removes it.
   (0.5 s doubling to 30 s): a ledger is never skipped. A fetched ledger is accepted only if the node says it is `validated`.
   Accepted ledgers are reordered and chained in index order: each `parent_hash` must be the hash of the ledger before it. A break
   commits the verified prefix and **halts** the runner (probe 503).
+- **A ledger the parser rejects** (`Cannot parse ledger <index>: <reason>`) is not retried: parsing is pure and would fail the
+  same way after any recovery. The ledgers of the batch before it are committed, then the runner **halts** like on a chain break
+  (probe 503 with the error, `syncer_ingest_halts_total{reason="parse_error"}`). It needs a parser fix; after the restart the
+  runner carries on after the checkpoint, at the ledger that failed.
 - **Flush.** An accepted batch is written when it holds `GH_CATCHUP_FLUSH_LEDGERS` (300) ledgers or `GH_CATCHUP_FLUSH_TXS`
   (100,000) transactions, is `GH_CATCHUP_FLUSH_MS` (5 s) old, reaches the head (live: every ledger is its own commit), or the
   next ledger starts a new `ledgers` partition: a commit never spans two partitions of a million ledgers, so a half-applied
@@ -241,6 +245,7 @@ Properties that matter operationally:
 | Symptom | Cause | What happens |
 | --- | --- | --- |
 | Probe 503, `state=halted`, `error: ...parent_hash...` | Chain break: the node's history differs from what is stored | The verified prefix is committed, then nothing. Operator decision: see [operations](operations.md#syncer-halted). |
+| Probe 503, `state=halted`, `error: Cannot parse ledger <index>: ...` | The parser rejects a ledger (a transaction shape it does not know) | The ledgers before it are committed, then nothing; not retried. Needs a parser fix and a restart, see [operations](operations.md#syncer-halted). |
 | Probe 503, `lease lost to ...` | Another syncer took the lease | This one stopped writing. Find and stop the other one. |
 | Boot refuses: lease held | A previous syncer (or an old-stack container) is still running or died less than 30 s ago | Stop it; wait 30 s. |
 | Lag grows, `last_commit_age` grows | Node unreachable or slow; ClickHouse refusing writes; recovery stuck (`recovering`) | Retries forever; see [operations](operations.md#syncer-falling-behind). |

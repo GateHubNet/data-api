@@ -38,6 +38,12 @@ const metrics = {
       this.set(last ? Math.max(0, Date.now() / 1000 - last) : Number.NaN);
     },
   }),
+  ingestHaltsTotal: new Counter({
+    name: 'syncer_ingest_halts_total',
+    help: 'Times the live ingest halted until an operator intervenes, by reason (chain_break, parse_error, lease_lost).',
+    labelNames: ['reason'],
+    registers: [registry],
+  }),
   validationsFlushedTotal: new Counter({
     name: 'syncer_validations_flushed_total',
     help: 'Validation rows flushed to ClickHouse.',
@@ -100,6 +106,7 @@ export class PrometheusService implements OnModuleInit {
   readonly lastCommitTimestampSeconds = metrics.lastCommitTimestampSeconds;
   /** Derived from `lastCommitTimestampSeconds` when scraped; nothing sets it. */
   readonly lastCommitAgeSeconds = metrics.lastCommitAgeSeconds;
+  readonly ingestHaltsTotal = metrics.ingestHaltsTotal;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly validationsErrorsTotal = metrics.validationsErrorsTotal;
   readonly validationsDroppedTotal = metrics.validationsDroppedTotal;

@@ -718,6 +718,32 @@ describe('rangeIngest (e2e)', () => {
       await expectChunkIntact(svc);
     });
 
+    it('a ledger the parser rejects fails a new chunk at once, naming the ledger, and leaves its intent open (ruling R96)', async () => {
+      const svc = await freshService();
+      const malformed = syntheticChain(L(1), 30, { malformedAt: L(7) }).map((l) => l.raw);
+      const source = new TestSource(malformed);
+      const write = jest.spyOn(LedgerWriter.prototype, 'write');
+      const logger = captureLogger();
+
+      await expect(rangeIngest(source, svc, ctx, { ...FAST, from: L(1), to: L(14), logger })).rejects.toMatchObject({
+        name: 'LedgerParseError',
+        ledgerIndex: L(7),
+        message: expect.stringContaining(`Cannot parse ledger ${L(7)}`),
+      });
+
+      // One attempt: a parser error does not go away on a retry.
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(source.fetchCount(L(7))).toBe(1);
+      expect(await count(svc, Table.Ledgers)).toBe(0);
+      expect((await intents(svc)).map((i) => i.status)).toEqual(['started']);
+      expect(logger.lines).toContainEqual(
+        expect.objectContaining({
+          level: 'error',
+          message: expect.stringMatching(new RegExp(`failed \\(attempt 1 of 3\\).*Cannot parse ledger ${L(7)}`)),
+        }),
+      );
+    });
+
     it('reprocess whose fetches keep failing gives up with the committed rows intact', async () => {
       const svc = await committedChunk();
       const source = new TestSource(CHAIN_RAW);

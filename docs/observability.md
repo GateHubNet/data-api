@@ -44,7 +44,7 @@ The same ClickHouse check, plus an **`ingest`** indicator when the `ingest` work
             "ingest": { "status": "up", "state": "live", "lag": 0, "last_commit_age": 3 } } }
 ```
 
-It answers **503** when ClickHouse is down, when the ingest `state` is `halted` (a chain break or a lost lease), or when `lag` (validated
+It answers **503** when ClickHouse is down, when the ingest `state` is `halted` (a chain break, a ledger the parser rejects, or a lost lease), or when `lag` (validated
 head minus committed checkpoint, in ledgers) has stayed above `GH_MAX_LAG_HEALTHY` (default 10) on every probe for more than **60 s**.
 `state` is `starting`, `catching_up`, `live` or `halted`; `last_commit_age` is seconds since the last commit; `recovering: true` and
 `error` appear while a failed write or the boot cleanup is being recovered. A lag the runner has not measured yet counts as healthy,
@@ -101,6 +101,7 @@ Prefix `syncer_`.
 | **`syncer_lag_ledgers`** | Gauge | | Validated head minus the committed checkpoint, in ledgers |
 | `syncer_last_commit_timestamp_seconds` | Gauge | | Unix time of the last commit |
 | **`syncer_last_commit_age_seconds`** | Gauge | | Seconds since the last commit, computed at scrape time; `NaN` before the first commit |
+| `syncer_ingest_halts_total` | Counter | `reason` | Times the live ingest halted until an operator intervenes (`chain_break`, `parse_error`, `lease_lost`) |
 | `syncer_validations_flushed_total` | Counter | | Validation rows flushed to ClickHouse |
 | `syncer_validations_errors_total` | Counter | `stage` | Collector failures (`flush`, `reporter`, `manifest_rpc`, ...) |
 | `syncer_validations_dropped_total` | Counter | `reason` | Validations not kept (`buffer_full`, `no_reporter`, `manifest_no_reporter`, `invalid`, `shutdown`) |
@@ -157,7 +158,7 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | API down | probe failing or `up{job="api"} == 0` | |
 | **Syncer behind** | `syncer_lag_ledgers > 10` for 5m (outside a planned catch-up) | Live sync lagging; the probe fails at the same threshold after 60 s |
 | **Syncer not committing** | `syncer_last_commit_age_seconds > 120` | Ingest wedged, node silent, or ClickHouse refusing writes |
-| **Syncer halted / down** | probe 503 with `state=halted`, or `up{job="syncer"} == 0` | Chain break, lost lease, or process down |
+| **Syncer halted / down** | probe 503 with `state=halted`, `increase(syncer_ingest_halts_total[5m]) > 0`, or `up{job="syncer"} == 0` | Chain break, a ledger the parser rejects, lost lease, or process down |
 | Aggregator failing | `rate(syncer_aggregator_errors_total[15m]) > 0` for 30m | Stats or volumes not refreshing |
 | Aggregator far behind | `syncer_aggregator_stats_lag_seconds > 3600` for 1h | Sweep slower than the data |
 | Validations flowing | `rate(syncer_validations_flushed_total[10m]) == 0` for 10m on XRPL | Collector or its nodes down |
