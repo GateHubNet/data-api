@@ -87,6 +87,33 @@ describe('the Ripple error contract on the toolbox bootstrap', () => {
         expect(res.body).toEqual({ result: 'success' });
       });
 
+      it('a malformed percent-escape in a path parameter is a Ripple 400, not the framework shape (R55)', async () => {
+        // Express fails to decode the parameter while it matches the route, before any controller runs
+        for (const [path, raw] of [
+          ['/v2/accounts/%zz/payments', '%zz'],
+          ['/v2/transactions/%E0%A4%A', '%E0%A4%A'],
+          ['/V2/ledgers/%/validations', '%'],
+        ]) {
+          const res = await h.http().get(path).set('X-API-Key', h.key);
+          expect([path, res.status, res.body]).toEqual([
+            path,
+            400,
+            { result: 'error', message: `Failed to decode param '${raw}'` },
+          ]);
+          expect(res.headers['cache-control']).toBe('no-store');
+          expect(res.headers['content-type']).toMatch(/^application\/json/);
+        }
+      });
+
+      it('a well-formed escape in a path parameter is decoded as usual', async () => {
+        // %41%42 is AB: an even number of hex digits, so a hash the route looks up (and does not find), not 'invalid hash'
+        const found = await h.http().get('/v2/transactions/%41%42').set('X-API-Key', h.key);
+        expect([found.status, found.body]).toEqual([404, { result: 'error', message: 'transaction not found' }]);
+        // %4 is not an escape: still the decode error, whatever follows
+        const bad = await h.http().get('/v2/transactions/%4G').set('X-API-Key', h.key);
+        expect([bad.status, bad.body]).toEqual([400, { result: 'error', message: "Failed to decode param '%4G'" }]);
+      });
+
       it('outside /v2 the toolbox global filter still answers (a controller filter beats it only on its own routes)', async () => {
         const res = await h.http().get('/nope').set('X-API-Key', h.key);
         expect(res.status).toBe(404);

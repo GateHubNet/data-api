@@ -76,9 +76,9 @@ time left with two decimals. Requests that pass carry `X-RateLimit-Limit`, `-Rem
 
 ### Errors
 
-Every error of a `/v2` route is JSON in the shape of the original (one known exception: a malformed percent-escape in a path parameter,
-such as `/v2/accounts/%zz/payments`, is rendered in the framework's own `{"error":{...}}` shape, see
-[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#5-known-gaps-at-the-time-of-writing-served-as-described-in-the-api-reference)):
+Every error of a `/v2` route is JSON in the shape of the original. That includes a malformed percent-escape in a path parameter, such as
+`/v2/accounts/%zz/payments`, which Express fails to decode before any route runs: `400 {"result":"error","message":"Failed to decode param
+'%zz'"}` (the text Express gives the error, naming the segment; see [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#5-closed-in-the-final-review-were-known-gaps)):
 
 ```json
 { "result": "error", "message": "invalid start date format" }
@@ -115,8 +115,9 @@ YYYY-MM-DDTHH:mm:ssZ   YYYY-MM-DDTHH:mm:ss.SSSZ   (a zone is Z or +hh, +hhmm, +h
 YYYYMMDDHHmmss   YYYYMMDDHHmmssSSS   1234567890 (ten digits: unix seconds)
 ```
 
-`start` is inclusive. `end` is inclusive at the precision it is written with: `end=2015-08-31` is the whole of that day,
-`end=2015-08-31T10` the whole hour. (`stats/{family}` of an account is the exception, its `end` is an instant and exclusive.) A
+`start` is inclusive, to the second: a `start` with milliseconds is the second it falls in (`start=…T18:27:10.750Z` takes the
+ledgers that closed at 18:27:10), as the original's row keys were. `end` is inclusive at the precision it is written with:
+`end=2015-08-31` is the whole of that day, `end=2015-08-31T10` the whole hour. (`stats/{family}` of an account is the exception, its `end` is an instant and exclusive.) A
 text that is not a date answers 400 with the message of the parameter (`invalid start date format`, `invalid end date format`,
 `invalid date format`). Lists are ordered by **ledger**, which is how the time axis works here: `start` and `end` select the
 ledgers that closed in the window, and within a ledger the order is the order of the transactions in it.

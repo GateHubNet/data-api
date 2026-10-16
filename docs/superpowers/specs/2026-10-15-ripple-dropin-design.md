@@ -29,8 +29,11 @@
 >   `TRUSTED_PROXIES` and the secret `NPM_TOKEN` is a BuildKit secret (no build argument).
 > - **ClickHouse** is pinned to 26.8.14.3; inserts are synchronous (`async_insert=0`) because the dedup tokens and the child-rows-then-commit order depend on it; each insert is tagged with a `query_id`
 >   so a failed run's in-flight queries can be awaited or killed before its tail is deleted (the recovery contract in [syncer](../../syncer.md)).
-> - **Known gaps at the time of writing** (see ADR-0010, section 5): a sub-second `start` is rounded up (the original truncated); a malformed percent escape in a path parameter is rendered in the
->   toolbox error shape; the live routes carry the global `Cache-Control` and `limit=all` has no overall deadline.
+> - **Closed in the final review** (ADR-0010, section 5; they were listed here as known gaps): a sub-second `start` is truncated to its second, as the original did (R54); a malformed
+>   percent escape in a path parameter answers the Ripple 400 shape (R55); the live routes send `Cache-Control: private, max-age=<live TTL>` and `limit=all` pages within 30 s (R108); the
+>   global `Cache-Control` defaults to `private, max-age=60` (R109).
+> - **Paged reads** (final review C1, R106/R107): every list reads its page with a plain inner `LIMIT` and dedupes outside it, and the keyset bounds the first key column; `/v2/exchanges`
+>   of every pair reads windows of ledgers. See [clickhouse](../../clickhouse.md#reading-a-page-what-stops-the-read).
 
 ## Context
 

@@ -77,6 +77,12 @@ describe('main.ts under the toolbox bootstrap()', () => {
     expect(unknown.status).toBe(404);
     expect(await unknown.json()).toEqual({ result: 'error', message: 'Cannot GET /v2/nope' });
     expect(unknown.headers.get('x-powered-by')).toBeNull();
+    // a malformed percent-escape in a /v2 path is a Ripple 400 on the real bootstrap too (R55)
+    const undecodable = await fetch(`${base}/v2/accounts/%zz/payments`, { headers: { 'X-API-Key': 'main-key' } });
+    expect([undecodable.status, await undecodable.json()]).toEqual([
+      400,
+      { result: 'error', message: "Failed to decode param '%zz'" },
+    ]);
     const outside = await fetch(`${base}/nope`);
     expect(outside.status).toBe(404);
     expect(await outside.json()).toMatchObject({ error: { message: expect.stringContaining('/nope') } });

@@ -133,13 +133,14 @@ below. Where a ruling made during implementation changed served behaviour it is 
 36. The partial-payment `delivered_amount` rule falls back to `Amount` for the parser's payment row exactly as the original's parser did, while `meta.delivered_amount`
     of a transaction object still says `unavailable` for a pre-fix partial payment.
 
-### 5. Known gaps at the time of writing (served as described in the API reference)
-37. A sub-second `start` is rounded up to the next second when resolved to a ledger (the original truncated it); the date-window edge can differ by one second.
-38. A malformed percent escape in a path parameter (`/v2/accounts/%zz/payments`) is rendered by the toolbox error shape, not the Ripple one.
-39. The live routes `/balances` and `/orders` carry the global `Cache-Control` (default `public, max-age=60`), not one capped by `GH_LIVE_CACHE_TTL_MS`, and `limit=all` paging
-    has no overall deadline.
-
-These three are tracked for the final review; check the code before relying on the text.
+### 5. Closed in the final review (were known gaps)
+The three gaps this section listed were fixed in the final fix round; they are kept here with what is served now.
+37. A sub-second `start` is truncated to its second when resolved to a ledger, as the original's row keys were (Ruling R54); it was rounded up before.
+38. A malformed percent escape in a path parameter (`/v2/accounts/%zz/payments`) answers the Ripple shape, `400 {"result":"error","message":"Failed to decode param '%zz'"}`
+    (the text Express gives the error, naming the segment; Ruling R55); it was the toolbox's `{"error":{...}}` shape before.
+39. The live routes `/balances` and `/orders` send `Cache-Control: private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`no-store` when the live cache is off), and
+    `limit=all` pages the node within an overall deadline of 30 s, past which the route answers its 500 (Ruling R108). Every other `/v2` answer carries the global
+    `GH_CACHE_CONTROL`, now `private, max-age=60` by default (Ruling R109).
 
 ## Consequences
 **Positive**
