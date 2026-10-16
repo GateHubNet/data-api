@@ -727,18 +727,96 @@ describe('rangeIngest (e2e)', () => {
       expect(logger.lines.filter((l) => l.level === 'warn' && l.message.includes(`Ledger ${L(7)}`))).toHaveLength(2);
     });
 
-    it('fails the chunk once its transient waits would pass the budget, and leaves its intent open', async () => {
+    it('fails the chunk once no ledger was fetched for --max-wait, says so, and leaves its intent open', async () => {
       const svc = await freshService();
       const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(7)));
+      const logger = captureLogger();
 
       await expect(
-        rangeIngest(source, svc, ctx, { ...FAST, from: L(1), to: L(14), retryBackoffMs: 20, maxTransientWaitMs: 100 }),
+        rangeIngest(source, svc, ctx, {
+          ...FAST,
+          from: L(1),
+          to: L(14),
+          retryBackoffMs: 20,
+          maxTransientWaitMs: 100,
+          logger,
+        }),
       ).rejects.toMatchObject({ name: 'LedgerNotAvailableError', ledgerIndex: L(7) });
 
-      // 20 + 40 ms fit in the budget, 80 more would not: three fetches, then the chunk fails, without a chunk retry.
+      // The other ledgers came at once; then 20 + 40 ms fit in 100 ms without progress, 80 more would not: three fetches,
+      // then the chunk fails, without a chunk retry.
       expect(source.fetchCount(L(7))).toBe(3);
       expect(await count(svc, Table.Ledgers)).toBe(0);
       expect((await intents(svc)).map((i) => i.status)).toEqual(['started']);
+      expect(logger.lines).toContainEqual(
+        expect.objectContaining({
+          level: 'error',
+          message: expect.stringMatching(/failed .*no ledger fetched for --max-wait \(0\.1 s\)/),
+        }),
+      );
+    });
+
+    it('counts the budget from the last ledger fetched: slow fetches that take longer than it in all, then a rate limit, and the chunk completes (R105)', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW);
+      source.delayMs = 40; // 14 ledgers one at a time: about 560 ms of successful fetches
+      source.errors.set(L(12), [new NodeThrottledError(['wss://node.example'], 200, 'rate limit: retry in ~150ms')]);
+      const write = jest.spyOn(LedgerWriter.prototype, 'write');
+
+      const result = await rangeIngest(source, svc, ctx, {
+        ...FAST,
+        from: L(1),
+        to: L(14),
+        concurrency: 1,
+        maxTransientWaitMs: 300,
+      });
+
+      expect(result.ledgers).toBe(14);
+      expect(write).toHaveBeenCalledTimes(1);
+      const [first, second] = source.fetchedAt.get(L(12)) ?? [];
+      expect(second - first).toBeGreaterThanOrEqual(190);
+    });
+
+    it('still fails within a bounded time for a ledger the node really lacks while the others keep arriving (R105)', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(3)));
+      source.delayMs = 30;
+      const started = Date.now();
+
+      await expect(
+        rangeIngest(source, svc, ctx, {
+          ...FAST,
+          from: L(1),
+          to: L(14),
+          concurrency: 2,
+          retryBackoffMs: 20,
+          maxTransientWaitMs: 200,
+        }),
+      ).rejects.toMatchObject({ name: 'LedgerNotAvailableError', ledgerIndex: L(3) });
+
+      // About 200 ms of other ledgers, then at most 200 ms without progress and one backoff step.
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(source.fetchCount(L(14))).toBe(1);
+    });
+
+    it('wakes the fetches that wait for a rate-limited node as soon as another fetch of the chunk failed (R105)', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW);
+      source.errors.set(L(3), [new NodeThrottledError(['wss://node.example'], 10_000, 'rate limit: retry in ~9750ms')]);
+      source.failures.set(L(5), 1); // a plain failure: the attempt fails, the chunk is retried
+      const started = Date.now();
+
+      const result = await rangeIngest(source, svc, ctx, {
+        ...FAST,
+        from: L(1),
+        to: L(14),
+        concurrency: 2,
+        maxTransientWaitMs: 60_000,
+      });
+
+      expect(result.ledgers).toBe(14);
+      expect(Date.now() - started).toBeLessThan(3_000); // not the 10 s pause of L(3)
+      expect(source.fetchCount(L(3))).toBe(2);
     });
 
     it('fails the chunk at once when a rate limit asks for longer than the budget', async () => {

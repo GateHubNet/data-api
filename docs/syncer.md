@@ -169,7 +169,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 | `--from <n>`, `--to <n>` | required | Both inclusive. |
 | `--chunk <n>` | 1000 | Ledgers per chunk; must divide 1,000,000. A chunk is fetched and written as a whole, so it is also the memory the run needs. |
 | `--concurrency <n>` | 8 | Ledgers of a chunk fetched at once. On a public node 2 (see [backfill](backfill.md#public-nodes-and-rate-limits)). |
-| `--max-wait <s>` | 1200 | Seconds the fetches of one chunk may wait in all for a rate-limited node (as long as it asks) and for a ledger the node lacks right now (`lgrNotFound`, retried after 0.5 s doubling to 30 s); past it the chunk fails. |
+| `--max-wait <s>` | 1200 | Seconds a chunk may go without a ledger arriving while its fetches wait for a rate-limited node (as long as it asks) or retry a ledger the node lacks right now (`lgrNotFound`, after 0.5 s doubling to 30 s). Every ledger fetched starts it again; past it the chunk fails (the log names `--max-wait`). |
 | `--reprocess` | off | Delete and rewrite ledgers that are already committed (after a parser change); default: skip them. |
 | `--run-id <id>` | random | Name of the run in `ingest_log` and in query ids (a per-invocation nonce is appended). Must not start with `live:`. |
 | `--help` | | Prints the usage. |
@@ -193,8 +193,9 @@ How it works (aligned chunks, `ingest_log` intents):
    ledgers a run skipped get one row at the end.
 5. A failed attempt is recovered like a failed live write (wait for the queries, delete the chunk, new `runId`); a chunk gets 3
    attempts. A rate-limited fetch is retried when the node's pause is over, and a ledger the node does not have right now
-   (`lgrNotFound`, e.g. one member of a cluster without it) after a backoff, both within `--max-wait` per chunk; past it the chunk
-   fails and the run stops. A ledger the parser rejects (`Cannot parse ledger <n>: ...`) and a live syncer that appeared are not
+   (`lgrNotFound`, e.g. one member of a cluster without it) after a backoff. The chunk fails, and the run stops, only when
+   `--max-wait` passes with no ledger of the chunk arriving (every ledger fetched starts it again); when another fetch of the
+   chunk fails, the fetches that wait are woken and the attempt ends at once. A ledger the parser rejects (`Cannot parse ledger <n>: ...`) and a live syncer that appeared are not
    retried: they stop the run.
 6. **The live syncer owns everything above its checkpoint.** A range that reaches above the committed checkpoint is refused while
    the syncer's lease is fresh (< 30 s), and this is re-checked per chunk. Backfill is history: below the checkpoint.

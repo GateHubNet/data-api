@@ -63,9 +63,11 @@ export interface RangeIngestOptions {
   /** Wait before the second attempt of a chunk; it doubles per attempt (at most 30 s). Default 500. */
   retryBackoffMs?: number;
   /**
-   * How long the fetches of one chunk may wait in all for transient failures (ruling R100): a rate-limited node (as long
-   * as it asks) and a ledger the node does not have right now (`lgrNotFound`, retried after `retryBackoffMs`, doubling
-   * to 30 s). A wait that would pass it fails the chunk. Default 1200000 (20 min, the longest pause a node may ask for).
+   * How long the fetches of one chunk may go without a ledger arriving while they wait out transient failures (rulings
+   * R100, R105): a rate-limited node (as long as it asks) and a ledger the node does not have right now (`lgrNotFound`,
+   * retried after `retryBackoffMs`, doubling to 30 s). Every ledger fetched starts it again; a chunk fails only when this
+   * long passes with no ledger fetched (or a wait would end after that and nothing else can arrive before it). Default
+   * 1200000 (20 min, the longest pause the node client honours).
    */
   maxTransientWaitMs?: number;
   /** A live syncer's lease younger than this (server clock) is fresh. Default 30000, the live runner's TTL. */
@@ -101,6 +103,80 @@ const DEFAULT_THROTTLE_WAIT_MS = 10_000;
 const DEFAULT_QUIESCENCE_TIMEOUT_MS = 60_000;
 const MAX_LEDGER_INDEX = 2 ** 32 - 1;
 const HOUR_SECONDS = 3600;
+
+/**
+ * The fetch phase of one chunk (rulings R100, R105): when the last ledger arrived, what each worker is doing (fetching,
+ * or waiting until a time to fetch again), and whether the chunk has failed. A waiting worker sleeps until its time, but
+ * wakes on every change (a ledger arrived, a worker finished, the chunk failed) to look again.
+ */
+class FetchPhase {
+  /** When the last ledger of the chunk arrived (the start of the phase before the first). */
+  private lastProgress = Date.now();
+  /** Per worker: 0 while it fetches, else the time it fetches again. Finished workers are not in it. */
+  private readonly next = new Map<number, number>();
+  private readonly sleepers = new Set<() => void>();
+  failed = false;
+
+  constructor(readonly maxWaitMs: number) {}
+
+  /** The time after which the chunk has gone `maxWaitMs` without a ledger. */
+  get deadline(): number {
+    return this.lastProgress + this.maxWaitMs;
+  }
+
+  fetching(worker: number): void {
+    this.next.set(worker, 0);
+  }
+
+  waiting(worker: number, until: number): void {
+    this.next.set(worker, until);
+  }
+
+  progress(): void {
+    this.lastProgress = Date.now();
+    this.wakeAll();
+  }
+
+  finished(worker: number): void {
+    this.next.delete(worker);
+    this.wakeAll();
+  }
+
+  fail(): void {
+    this.failed = true;
+    this.wakeAll();
+  }
+
+  /**
+   * No ledger can arrive before the deadline: every worker waits until it or later (a fetching one counts as arriving
+   * now). With a budget of 0 that is always so: nothing is waited for.
+   */
+  hopeless(now: number): boolean {
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const at of this.next.values()) earliest = Math.min(earliest, at === 0 ? now : at);
+    return earliest >= this.deadline;
+  }
+
+  /** Sleep until `until`, or until the next change of the phase, whichever comes first. */
+  sleep(until: number): Promise<void> {
+    return new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        this.sleepers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, Math.max(0, until - Date.now()));
+      this.sleepers.add(wake);
+    });
+  }
+
+  private wakeAll(): void {
+    for (const wake of [...this.sleepers]) wake();
+  }
+}
+
+/** Thrown by a fetch that gave up because another fetch of its chunk failed: not a failure of its own. */
+class FetchAbandoned extends Error {}
 
 /** A run of ledgers that is ingested and logged as one: it lies inside one aligned `chunkSize` bucket. */
 interface Chunk {
@@ -154,9 +230,10 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  * ones as one range), and closed ('done') right after (ruling R100, see `redoOpenIntents`). `ingest_log` rows with a
  * `live:` run id belong to the live runner (key `(start, 0)`): they are never read as chunks, redone or marked.
  *
- * **Transient fetch failures** (ruling R100): a rate-limited node is asked again when the pause it named is over, a
- * ledger the node does not have right now (`lgrNotFound` from one member of a cluster) after a backoff, both within a
- * wait budget per chunk (`maxTransientWaitMs`, 20 min); past it the chunk fails, like a missing ledger.
+ * **Transient fetch failures** (rulings R100, R105): a rate-limited node is asked again when the pause it named is over,
+ * a ledger the node does not have right now (`lgrNotFound` from one member of a cluster) after a backoff. A chunk fails
+ * only when `maxTransientWaitMs` (20 min) passes without a ledger of it arriving: every ledger fetched starts that time
+ * again, so a slow but moving chunk never runs out of it, and a ledger the node really lacks still fails in bounded time.
  *
  * **A failed attempt** is recovered as `LedgerWriter` documents (ruling R16): wait until the failed run's queries are gone,
  * delete the ledgers of the chunk that this run was writing (never a ledger it had skipped), wait for that too, and try
@@ -206,6 +283,8 @@ class RangeRunner {
 
   private writer: LedgerWriter;
   private open: OpenIntent[] = [];
+  /** The errors a fetch gave up on because the chunk went `maxTransientWaitMs` without a ledger (for the log). */
+  private readonly outOfTime = new WeakSet<object>();
   /** The ledgers the redo of the unfinished intents wrote in this run (and marked in agg_dirty). */
   private readonly redone = new Set<number>();
 
@@ -448,8 +527,12 @@ class RangeRunner {
         const spent =
           err instanceof LedgerNotAvailableError || retryAfterMsOf(err) > 0 || throttleHint(err) !== undefined;
         if (permanent || isLedgerParseError(err) || spent || attempt >= this.maxAttempts) {
+          const outOfTime =
+            typeof err === 'object' && err !== null && this.outOfTime.has(err)
+              ? `: no ledger fetched for --max-wait (${this.maxTransientWaitMs / 1000} s)`
+              : '';
           this.logger.error(
-            `Chunk [${chunk.start},${chunk.end}] failed (attempt ${attempt} of ${this.maxAttempts}), ` +
+            `Chunk [${chunk.start},${chunk.end}] failed (attempt ${attempt} of ${this.maxAttempts})${outOfTime}, ` +
               `its intent stays open: ${describe(err)}`,
           );
           throw err;
@@ -498,19 +581,25 @@ class RangeRunner {
     const results = new Array<RawLedger>(indexes.length);
     const failures: Array<{ position: number; error: unknown }> = [];
     let next = 0;
-    // The transient waits of this chunk's fetches: they must all end by this time (ruling R100).
-    const deadline = Date.now() + this.maxTransientWaitMs;
-    const worker = async (): Promise<void> => {
-      while (failures.length === 0 && next < indexes.length) {
-        const position = next++;
-        try {
-          results[position] = await this.fetchOne(indexes[position], deadline, () => failures.length > 0);
-        } catch (error) {
-          failures.push({ position, error });
+    const phase = new FetchPhase(this.maxTransientWaitMs);
+    const worker = async (id: number): Promise<void> => {
+      try {
+        while (!phase.failed && next < indexes.length) {
+          const position = next++;
+          try {
+            results[position] = await this.fetchOne(indexes[position], phase, id);
+            phase.progress();
+          } catch (error) {
+            if (error instanceof FetchAbandoned) break;
+            failures.push({ position, error });
+            phase.fail();
+          }
         }
+      } finally {
+        phase.finished(id);
       }
     };
-    await Promise.all(Array.from({ length: Math.min(this.concurrency, indexes.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(this.concurrency, indexes.length) }, (_, id) => worker(id)));
     if (failures.length > 0) {
       failures.sort((a, b) => a.position - b.position);
       throw (failures.find((f) => f.error instanceof LedgerNotAvailableError) ?? failures[0]).error;
@@ -519,13 +608,15 @@ class RangeRunner {
   }
 
   /**
-   * `source.fetch(index)`, retried while the failure is transient and its wait ends by `deadline` (ruling R100): a
-   * rate-limited node is asked again when the pause it named is over (the node client logged it), a ledger the node does
-   * not have right now (`LedgerNotAvailableError`: a cluster member without it) after a backoff. Anything else, or a wait
-   * past the deadline, is thrown; so is the last transient error once another fetch of the chunk failed (`abandon`).
+   * `source.fetch(index)`, retried while the failure is transient (rulings R100, R105): a rate-limited node is asked again
+   * when the pause it named is over (the node client logged it), a ledger the node does not have right now
+   * (`LedgerNotAvailableError`: a cluster member without it) after a backoff. The chunk may go `maxTransientWaitMs`
+   * without a ledger arriving; a wait that cannot see one arrive in that time gives up (the error is thrown). Anything
+   * else is thrown at once. When another fetch of the chunk failed, a waiting fetch wakes and stops (`FetchAbandoned`).
    */
-  private async fetchOne(index: number, deadline: number, abandon: () => boolean): Promise<RawLedger> {
+  private async fetchOne(index: number, phase: FetchPhase, worker: number): Promise<RawLedger> {
     for (let missing = 0; ; ) {
+      phase.fetching(worker);
       try {
         const ledger = await this.source.fetch(index);
         if (ledger.header.ledger_index !== index) {
@@ -533,6 +624,7 @@ class RangeRunner {
         }
         return ledger;
       } catch (err) {
+        if (phase.failed) throw new FetchAbandoned();
         let delay: number;
         const throttle = throttleHint(err);
         if (retryAfterMsOf(err) > 0 || throttle !== undefined) {
@@ -543,11 +635,23 @@ class RangeRunner {
         } else {
           throw err;
         }
-        if (abandon() || Date.now() + delay > deadline) throw err;
-        if (err instanceof LedgerNotAvailableError) {
-          this.logger.warn(`Ledger ${index} is not available on the node right now; asking again in ${delay} ms`);
+        const resumeAt = Date.now() + delay;
+        phase.waiting(worker, resumeAt);
+        let logged = false;
+        for (;;) {
+          if (phase.failed) throw new FetchAbandoned();
+          const now = Date.now();
+          if (now >= resumeAt) break;
+          if (phase.hopeless(now)) {
+            if (typeof err === 'object' && err !== null) this.outOfTime.add(err);
+            throw err;
+          }
+          if (!logged && err instanceof LedgerNotAvailableError) {
+            this.logger.warn(`Ledger ${index} is not available on the node right now; asking again in ${delay} ms`);
+          }
+          logged = true;
+          await phase.sleep(Math.min(resumeAt, phase.deadline));
         }
-        await wait(delay);
       }
     }
   }
@@ -777,8 +881,8 @@ The network, ClickHouse and node come from the same GH_* environment as the sync
   --to <ledger>          last ledger (required)
   --chunk <n>            ledgers per chunk, must divide 1000000 (default ${DEFAULT_CHUNK_SIZE}); a chunk is held in memory
   --concurrency <n>      ledgers of a chunk fetched at once (default ${DEFAULT_CONCURRENCY})
-  --max-wait <s>         seconds the fetches of one chunk may wait in all for a rate-limited node or a ledger the node
-                         lacks right now, before the chunk fails (default ${DEFAULT_MAX_TRANSIENT_WAIT_MS / 1000})
+  --max-wait <s>         seconds a chunk may go without a ledger arriving while it waits for a rate-limited node or a
+                         ledger the node lacks right now, before it fails (default ${DEFAULT_MAX_TRANSIENT_WAIT_MS / 1000})
   --reprocess            delete and rewrite ledgers that are committed already (default: skip them)
   --run-id <id>          name of this run in ingest_log and in query ids (a nonce is appended)
   --help                 print this text

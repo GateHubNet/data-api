@@ -31,7 +31,8 @@ pnpm build && GH_ENV=local pnpm --filter @gatehub/data-syncer ingest:range --fro
 ```
 
 Options: `--from`, `--to` (both inclusive, required), `--chunk` (default 1000, must divide 1,000,000), `--concurrency` (default 8),
-`--max-wait` (seconds a chunk may wait for a rate-limited node or a ledger it lacks right now, default 1200), `--reprocess`,
+`--max-wait` (seconds a chunk may go without a ledger arriving while it waits for a rate-limited node or a ledger the node lacks
+right now, default 1200), `--reprocess`,
 `--run-id`, `--help`. Exit status: `0` done, `1` failed (rerun the same command), `2` wrong command line. The
 mechanics (aligned chunks, `ingest_log` intents, recovery of a failed attempt, the lease rule, `agg_dirty`) are in
 [syncer](syncer.md#4-range-ingest-cli).
@@ -83,14 +84,17 @@ A range that runs into ledgers already committed simply skips them (unless `--re
 Public nodes limit what one client may ask, and say how long to wait: `rate limit: units quota (50000 per 10s) exhausted, retry in
 ~12376ms` (`wss://xahau.network`, `wss://xrplcluster.com`), and a second, hourly quota (`10000000 per 3600s`) that pauses a client
 for up to about 15 minutes. The node client honours the answer (nothing is sent to that node until the pause is over; another
-endpoint of `GH_NODE_ENDPOINTS` is used meanwhile), and range-ingest waits for it within `--max-wait` per chunk, so a throttled
-backfill slows down instead of failing. What keeps it moving:
+endpoint of `GH_NODE_ENDPOINTS` is used meanwhile), and range-ingest waits for it, so a throttled backfill slows down instead of
+failing. A chunk fails only when `--max-wait` seconds pass without any of its ledgers arriving: every ledger fetched starts that time
+again, however long the chunk takes in all. What keeps it moving:
 
 - `--concurrency 2` (Xahau ledgers are about 260 KB; one 10-second window of 50,000 units lets through roughly 100 to 370 of them).
-- `--chunk 100`: a chunk that cannot be fetched within its wait budget fails and is redone by the next run; a small chunk keeps
-  that redo cheap. A chunk is written only once all of its ledgers are in, so a chunk much larger than what one quota window
-  lets through mostly waits.
-- `--max-wait` at least the longest pause the node asks for: 1200 (20 minutes, the default) also rides out the hourly quota.
+- `--chunk 100`: a chunk is written only once all of its ledgers are in, and a chunk that fails (a ledger the node lacks, or a
+  pause longer than `--max-wait`) is redone by the next run; a small chunk keeps both the memory and that redo cheap.
+- `--max-wait` longer than the pauses the node asks for. The 10-second quota asks for seconds. The hourly quota asked for about
+  930 s in the verification run: the default 1200 rides that out when it starts within about 4.5 minutes of the last ledger
+  fetched, which is the usual case (the answer comes on the next fetch); raise `--max-wait` for margin. A pause the node client
+  caps at 20 minutes never fits in 1200 s: that chunk fails and the rerun picks it up.
 - Expect tens of ledgers per minute, not hundreds: a backfill of more than a few thousand ledgers wants a node of your own.
 - Run one backfill per node at a time, and not while the live syncer catches up from the same node: they share its quota.
 
