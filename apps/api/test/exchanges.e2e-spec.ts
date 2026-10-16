@@ -2368,52 +2368,99 @@ describe('exchanges API endpoint', () => {
       expect((await get('/v2/exchanges?limit=5&foo=bar')).body).toEqual(plain.body);
     });
 
-    it('reads exchanges in windows of ledgers from the marker on, ordered by the ledger key, deduped in code, without FINAL (R107)', async () => {
+    /** The exchanges of each ledger of the mock ledgers, ascending: what `ledgers.exchanges_count` holds. */
+    const perLedger = (): [number, number][] => {
+      const counts = new Map<number, number>();
+      for (const e of ALL) counts.set(e.row.ledger_index, (counts.get(e.row.ledger_index) ?? 0) + 1);
+      return [...counts.entries()].sort((a, b) => a[0] - b[0]);
+    };
+    /** The first ledger from `from` on (back from it, descending) by which the ledgers hold `count` exchanges. */
+    const edgeOf = (from: number, count: number, descending: boolean): number => {
+      const ledgers = perLedger().filter(([l]) => (descending ? l <= from : l >= from));
+      if (descending) ledgers.reverse();
+      let total = 0;
+      for (const [ledger, n] of ledgers) {
+        total += n;
+        if (total >= count) return ledger;
+      }
+      throw new Error('fewer exchanges than asked for');
+    };
+    const exchangesCalls = (spy: jest.SpyInstance) =>
+      spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
+    const edgeCalls = (spy: jest.SpyInstance) =>
+      spy.mock.calls.filter(([q]) =>
+        new RegExp(`FROM ${Table.Ledgers}\\b[\\s\\S]*exchanges_count > 0`).test(String(q)),
+      );
+
+    it('reads one window of ledgers from the marker on, as long as their exchanges_count says the page needs (R107)', async () => {
       const query = jest.spyOn(h.ch, 'query');
       const res = await get(`/v2/exchanges?limit=3&marker=${markerOf(ALL[10].row)}`);
       expect(hashesIn(res.body)).toEqual(hashesOf(ALL.slice(11, 14)));
-      const paging = query.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
-      expect(paging.length).toBeGreaterThan(0);
-      for (const [q, params] of paging) {
-        const sql = String(q);
-        expect(sql).toMatch(/ledger_index BETWEEN \{lo:UInt32\} AND \{hi:UInt32\}/);
-        expect(sql).toContain('ledger_index >= {k0:UInt32} AND (ledger_index, tx_index, node_index) > (');
-        expect(sql).toMatch(/ORDER BY ledger_index ASC, tx_index ASC, node_index ASC\s+LIMIT \{cap:UInt32\}/);
-        // no LIMIT BY: a row written twice is dropped in code, so the sort of a window stops at the cap
-        expect(sql).not.toContain('LIMIT 1 BY');
-        expect(sql).not.toMatch(/\bFINAL\b/);
-        expect(sql).not.toMatch(/base_currency =/);
-        expect(params).toMatchObject({ k0: ALL[10].row.ledger_index });
-      }
-      // the first window starts at the ledger of the marker and is 256 ledgers long; each next one twice as long
-      const windows = paging.map(([, p]) => p as { lo: number; hi: number });
-      expect(windows[0]).toMatchObject({ lo: ALL[10].row.ledger_index, hi: ALL[10].row.ledger_index + 255 });
-      windows.slice(1).forEach((w, i) => {
-        expect(w.lo).toBe(windows[i].hi + 1);
-        expect(w.hi - w.lo + 1).toBe(Math.min(2 * (windows[i].hi - windows[i].lo + 1), 1_048_576));
-      });
+      // where the window ends: the ledgers of the marker on, until they hold the page and one more (4)
+      const [[edgeSql, edgeParams]] = edgeCalls(query);
+      expect(String(edgeSql)).toMatch(/ORDER BY ledger_index ASC\s+LIMIT \{count:UInt32\}/);
+      expect(edgeParams).toMatchObject({ lo: ALL[10].row.ledger_index, count: 4 });
+      const paging = exchangesCalls(query);
+      const edge = edgeOf(ALL[10].row.ledger_index, 4, false);
+      expect(paging.map(([, p]) => p)).toEqual([expect.objectContaining({ lo: ALL[10].row.ledger_index, hi: edge })]);
+      const [q, params] = paging[0];
+      const sql = String(q);
+      expect(sql).toMatch(/ledger_index BETWEEN \{lo:UInt32\} AND \{hi:UInt32\}/);
+      expect(sql).toContain('ledger_index >= {k0:UInt32} AND (ledger_index, tx_index, node_index) > (');
+      expect(sql).toMatch(/ORDER BY ledger_index ASC, tx_index ASC, node_index ASC\s+LIMIT \{cap:UInt32\}/);
+      // no LIMIT BY: a row written twice is dropped in code, so the sort of a window stops at the cap
+      expect(sql).not.toContain('LIMIT 1 BY');
+      expect(sql).not.toMatch(/\bFINAL\b/);
+      expect(sql).not.toMatch(/base_currency =/);
+      expect(params).toMatchObject({ k0: ALL[10].row.ledger_index });
     });
 
-    it('descending walks the windows back from the marker (R107)', async () => {
+    it('descending: the window runs back from the marker (R107)', async () => {
       const query = jest.spyOn(h.ch, 'query');
       const res = await get(`/v2/exchanges?limit=3&descending=true&marker=${markerOf(ALL[100].row)}`);
       expect(hashesIn(res.body)).toEqual(hashesOf(ALL.slice(97, 100).reverse()));
-      const windows = query.mock.calls
-        .filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)))
-        .map(([, p]) => p as { lo: number; hi: number });
-      expect(windows[0]).toMatchObject({ hi: ALL[100].row.ledger_index, lo: ALL[100].row.ledger_index - 255 });
+      expect(String(edgeCalls(query)[0][0])).toMatch(/ORDER BY ledger_index DESC\s+LIMIT \{count:UInt32\}/);
+      const windows = exchangesCalls(query).map(([, p]) => p as { lo: number; hi: number });
+      expect(windows[0]).toMatchObject({
+        hi: ALL[100].row.ledger_index,
+        lo: edgeOf(ALL[100].row.ledger_index, 4, true),
+      });
       windows.slice(1).forEach((w, i) => expect(w.hi).toBe(windows[i].lo - 1));
     });
 
-    it('a window that holds more than the page is one read, sorted to the page and its room only (R107)', async () => {
-      // the ledger of ALL[30] and the 255 after it hold more exchanges than a page of 3
-      const after = ALL.filter(
-        (e) => e.row.ledger_index >= ALL[30].row.ledger_index && e.row.ledger_index <= ALL[30].row.ledger_index + 255,
-      );
-      expect(after.length).toBeGreaterThan(4 + 16);
+    it('the first page of the default window: one read of the ledgers and one of the exchanges, wherever they start (R107)', async () => {
+      const query = jest.spyOn(h.ch, 'query');
+      const res = await get('/v2/exchanges?limit=3');
+      expect(hashesIn(res.body)).toEqual(hashesOf(ALL.slice(0, 3)));
+      expect(edgeCalls(query)).toHaveLength(1);
+      const [[, params]] = exchangesCalls(query);
+      expect(exchangesCalls(query)).toHaveLength(1);
+      // from the first ledger of the range (2013-01-01 on) to the ledger by which the page is in
+      expect(params).toMatchObject({ hi: edgeOf(0, 4, false) });
+      expect((params as { lo: number }).lo).toBeLessThanOrEqual(ALL[0].row.ledger_index);
+    });
+
+    it('a window that holds fewer than its ledgers count is followed by one sized for twice as many (R107)', async () => {
+      // the marker is the last exchange of the busiest ledger: its exchanges_count covers the page, but the marker
+      // leaves none of them, so the next window is sized for twice the page
+      const [busiest] = [...perLedger()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+      expect(busiest[1]).toBeGreaterThanOrEqual(4);
+      const last = ALL.filter((e) => e.row.ledger_index === busiest[0]).pop() as FixtureExchange;
+      const after = ALL.slice(ALL.indexOf(last) + 1, ALL.indexOf(last) + 4);
+      const query = jest.spyOn(h.ch, 'query');
+      const res = await get(`/v2/exchanges?limit=3&marker=${markerOf(last.row)}`);
+      expect(hashesIn(res.body)).toEqual(hashesOf(after));
+      const counts = edgeCalls(query).map(([, p]) => (p as { count: number }).count);
+      expect(counts.slice(0, 2)).toEqual([4, 8]);
+      const windows = exchangesCalls(query).map(([, p]) => p as { lo: number; hi: number });
+      expect(windows[0]).toMatchObject({ lo: busiest[0], hi: busiest[0] });
+      expect(windows[1].lo).toBe(busiest[0] + 1);
+    });
+
+    it('a window sorts to the page and its room only, however many exchanges it holds (R107)', async () => {
       const query = jest.spyOn(h.ch, 'query');
       await get(`/v2/exchanges?limit=3&marker=${markerOf(ALL[30].row)}`);
-      const paging = query.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
+      const paging = exchangesCalls(query);
       expect(paging).toHaveLength(1);
       expect(paging[0][1]).toMatchObject({ cap: 4 + 16 });
     });
@@ -2586,6 +2633,15 @@ describe('exchanges API endpoint on the xrpl-recorded ledgers (autobridged excha
     expect(none.body).toEqual({ result: 'success', count: 0, exchanges: [] });
   });
 
+  it('/v2/exchanges?autobridged=true walks every autobridged exchange, page by page, however its windows are sized (R107)', async () => {
+    for (const limit of [1, 2]) {
+      const walked = (await pages('/v2/exchanges?autobridged=true', limit)).flatMap((p) =>
+        p.exchanges.map((e) => e.tx_hash),
+      );
+      expect([limit, walked]).toEqual([limit, autobridged.map((e) => e.row.tx_hash)]);
+    }
+  });
+
   it('autobridged=true pages: the marker continues inside the filtered rows', async () => {
     const both = (await pages('/v2/exchanges?autobridged=true', 1)).flatMap(hashesIn);
     expect(both).toEqual(hashesOf(autobridged));
@@ -2704,6 +2760,18 @@ describe('exchanges API endpoint on Xahau (synthetic rows: the recorded ledgers 
       row(3, 1, { rate: '0.5', counter_amount: '5' }),
     );
     await h.ch.insert(Table.Exchanges, rows);
+    // what the LedgerWriter would have written with them: the exchanges of each ledger in its `ledgers` row, which the
+    // list of every pair sizes its windows by
+    for (const [ledger, n] of rows.reduce(
+      (m, r) => m.set(r.ledger_index, (m.get(r.ledger_index) ?? 0) + 1),
+      new Map<number, number>(),
+    )) {
+      await h.ch.command(
+        `ALTER TABLE ${Table.Ledgers} UPDATE exchanges_count = {n:UInt32} WHERE ledger_index = {ledger:UInt32}`,
+        { n, ledger },
+        { settings: { mutations_sync: '2' } },
+      );
+    }
   });
   afterAll(async () => {
     await h?.close();

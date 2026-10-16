@@ -496,10 +496,9 @@ issuer` (`XAH` on Xahau), `base issuer is required`, `counter issuer is required
 ### `GET /v2/exchanges`
 
 An extra that `data.ripple.com` did not have: the trades of **all** pairs, each with the pair it is stored under (the canonical
-Ripple order: the pair is sorted by the lower-cased `currency+issuer` text), oldest first. A page reads the window in windows of
-ledgers from the marker on (256 ledgers, doubling while they hold too few trades for the page, up to about a million), each sorted
-to the page on its own, so a page costs the trades near it, not the window (Ruling R107); across a long stretch without trades it
-takes a handful of reads. Parameters: `start` (`2013-01-01`), `end`, `autobridged`, `descending`, `limit` (200, max 400), `marker`,
+Ripple order: the pair is sorted by the lower-cased `currency+issuer` text), oldest first. A page reads one window of ledgers from
+the marker on, as long as the ledgers' own count of trades says the page needs, sorted to the page on its own, so a page costs the
+trades near it, not the whole window, however long the gap before them (Ruling R107). Parameters: `start` (`2013-01-01`), `end`, `autobridged`, `descending`, `limit` (200, max 400), `marker`,
 `format` (file `exchanges.csv`). Rows are the raw trades above. 500 `unable to retrieve exchanges`.
 
 **Differences from data.ripple.com**: the route does not exist in the original (it is an extra, [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md)); everything said for

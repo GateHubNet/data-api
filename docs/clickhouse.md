@@ -64,8 +64,12 @@ ClickHouse stops reading a key-ordered range after a page only when the `LIMIT` 
   `ledger_index >= x AND (ledger_index, tx_index) > (x, y)`.
 
 What a page then reads is about one granule (8,192 rows; 1,024 for `transactions`) of each part the rest of the range spans, whatever
-the length of the range. `/v2/exchanges` of every pair is not a key order of `exchanges` (it is ordered by the pair first), so it reads
-windows of ledgers, starting at 256 ledgers and doubling up to about a million, each sorted on its own to the page (Ruling R107).
+the length of the range. `/v2/exchanges` of every pair is not a key order of `exchanges` (it is ordered by the pair first, and the
+primary key can skip only the granules of pairs large enough to have some to themselves), so it reads one window of ledgers per page,
+sized by `ledgers.exchanges_count` (a read of `ledgers` in key order finds the ledger by which the exchanges from the marker on reach
+the page) and sorted on its own to the page (a top-N); a window that holds fewer than counted (a marker inside its first ledger,
+`autobridged`) is followed by one sized for twice as many (Ruling R107). Its cost is the granules of that window, which for the long
+tail of small pairs can be most of the partition (10 million ledgers) it lies in, never the whole history.
 
 ## Writes: parts, insert modes, deduplication
 

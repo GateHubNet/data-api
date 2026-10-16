@@ -46,8 +46,8 @@ first ClickHouse design keyed every row on a CTID and ordered lists by a `date` 
   - the marker's tuple comparison `(a, b) > (x, y)` does not narrow the granules ClickHouse reads, so `keysetClause` also bounds
     the first column on its own (`a >= x AND (a, b) > (x, y)`); without it a deep page read the range from its start up to the
     marker.
-  `/v2/exchanges` of every pair has no key to read in order (the table is ordered by the pair first): it reads the window in
-  windows of ledgers, each sorted on its own to the page (Ruling R107).
+  `/v2/exchanges` of every pair has no key to read in order (the table is ordered by the pair first): it reads one window of
+  ledgers per page, sized by `ledgers.exchanges_count` and sorted on its own to the page (Ruling R107).
 - Markers are stable under concurrent inserts and unique; a page walk concatenated equals the unpaged list.
 - Replays, restarts and overlaps are exact without `FINAL` or eventual-consistency tricks; a crash leaves only invisible, deletable rows.
 

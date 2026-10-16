@@ -63,12 +63,8 @@ export const PAIR_ORDER: KeysetKey[] = [...PAIR_KEYS, ...EXCHANGE_KEYS];
  */
 const EDGE_MIN_ROOM = 2048;
 
-/**
- * The ledgers of the first window `all()` reads, and the most a window grows to: about a quarter of an hour of XRPL
- * ledgers, doubling up to about six weeks.
- */
-const FIRST_ALL_WINDOW = 256;
-const MAX_ALL_WINDOW = 1_048_576;
+/** The most exchanges one window of `all()` is sized for: its ledgers hold about this many, sorted to the page. */
+const MAX_WINDOW_EXCHANGES = 1_000_000;
 
 /** Whether two stored exchanges are the same one (the same key), as a row written twice is. */
 function sameExchange(a: StoredExchange, b: StoredExchange): boolean {
@@ -182,12 +178,15 @@ export class ExchangesService {
    * One page of the exchanges of every pair, as they are stored, in the order of the ledgers.
    *
    * `exchanges` is ordered by the pair first, so the order of the ledgers is not an order the table can be read in: a
-   * query over the whole window would sort all of it (by default every exchange since 2013) for one page. So the window
-   * is read in windows of ledgers, from the marker on (back, descending): each is sorted on its own, a top-N of the
-   * page, and ClickHouse skips the granules of the pairs that have no exchange in it through the primary key. The first
-   * window is `FIRST_ALL_WINDOW` ledgers; a window that holds too few exchanges for the page is followed by one twice as
-   * long (up to `MAX_ALL_WINDOW`), so a gap of years is a handful of reads and a busy stretch is one small one. The rows
-   * of a window are read with a plain `LIMIT` and deduped here: a row written twice (no FINAL) sorts next to its copy.
+   * query over the whole window would sort all of it (by default every exchange since 2013) for one page, and through
+   * the primary key ClickHouse can skip only the granules of pairs that are large enough to have some to themselves.
+   * So the page is read in windows of ledgers, from the marker on (back, descending), each just long enough: the
+   * `exchanges_count` of `ledgers` (the rows each ledger wrote to `exchanges`) says where the ledgers from the marker on
+   * hold the exchanges the page still needs (`windowEdge`, one read in the order of the key of `ledgers`), and the
+   * exchanges of that window are read and sorted to the page (a top-N with room for duplicates, deduped here: a row
+   * written twice, no FINAL, sorts next to its copy). Usually that is one read of each table, however long the gap
+   * before the next exchange; when a window holds fewer than counted (the marker cut its first ledger, a filter such as
+   * `autobridged`, a ledger row written twice) the next one is sized for twice as many (Ruling R107).
    */
   async all(q: ExchangesWindow): Promise<ExchangesPage> {
     const after = decodeMarker(q.marker, EXCHANGE_KEYS);
@@ -206,17 +205,42 @@ export class ExchangesService {
     // one row more than the page: it only tells whether there is a next page
     const fetch = q.limit + 1;
     const rows: StoredExchange[] = [];
-    let span = FIRST_ALL_WINDOW;
-    while (lo <= hi && rows.length < fetch) {
-      const window = q.descending
-        ? { min: Math.max(lo, hi - span + 1), max: hi }
-        : { min: lo, max: Math.min(hi, lo + span - 1) };
-      rows.push(...(await this.allIn(window, cursor, q.autobridged, q.descending, fetch - rows.length)));
-      if (q.descending) hi = window.min - 1;
-      else lo = window.max + 1;
-      span = Math.min(span * 2, MAX_ALL_WINDOW);
+    for (let round = 0; lo <= hi && rows.length < fetch; round++) {
+      const want = fetch - rows.length;
+      const edge = await this.windowEdge(lo, hi, Math.min(want * 2 ** round, MAX_WINDOW_EXCHANGES), q.descending);
+      if (edge === undefined) break;
+      const window = q.descending ? { min: edge, max: hi } : { min: lo, max: edge };
+      rows.push(...(await this.allIn(window, cursor, q.autobridged, q.descending, want)));
+      if (q.descending) hi = edge - 1;
+      else lo = edge + 1;
     }
     return this.page(rows, q.limit, false);
+  }
+
+  /**
+   * Where a window of `all()` ends: the first ledger from `lo` on (back from `hi`, descending) by which the ledgers of
+   * `[lo, hi]` hold `count` exchanges, by their `exchanges_count`; the other end of the range when they hold fewer; none
+   * when no ledger of the range has an exchange. One read of `ledgers` in the order of its key, with a plain `LIMIT` (a
+   * ledger with an exchange holds at least one, so `count` of them are enough), and a running sum over those rows.
+   * `exchanges_count` is written by the `LedgerWriter` with the exchanges of the ledger (`buildLedgerRows`), and the
+   * lists serve committed ledgers only, whose `ledgers` row is that count.
+   */
+  private async windowEdge(lo: number, hi: number, count: number, descending: boolean): Promise<number | undefined> {
+    const direction = descending ? 'DESC' : 'ASC';
+    const [row] = await this.ch.query<{ found: number | string; edge: number | string }>(
+      `SELECT count() AS found, ${descending ? 'maxIf' : 'minIf'}(ledger_index, total >= {count:UInt32}) AS edge
+         FROM (SELECT ledger_index,
+                      sum(n) OVER (ORDER BY ledger_index ${direction} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS total
+                 FROM (SELECT ledger_index, exchanges_count AS n FROM ${Table.Ledgers}
+                        WHERE ledger_index BETWEEN {lo:UInt32} AND {hi:UInt32} AND exchanges_count > 0
+                        ORDER BY ledger_index ${direction}
+                        LIMIT {count:UInt32}))`,
+      { lo, hi, count },
+    );
+    if (!row || Number(row.found) === 0) return undefined;
+    // no ledger reached the count (an edge of 0: ledger indexes start at 1): the rest of the range is the window
+    const edge = Number(row.edge);
+    return edge === 0 ? (descending ? lo : hi) : edge;
   }
 
   /**
