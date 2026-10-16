@@ -242,13 +242,53 @@ describe('main.ts under the toolbox bootstrap()', () => {
     expect((await fetch(`http://127.0.0.1:${httpPort}/metricz`)).status).toBe(404);
   });
 
-  it('reports 503 when ClickHouse is unreachable', async () => {
+  it('reports 503 when ClickHouse is unreachable, with the detail body of a 200 (ruling R101)', async () => {
     const { httpPort } = await start(undefined, { GH_CLICKHOUSE_URL: `http://127.0.0.1:${await freePort()}` });
     const res = await waitFor(async () => {
       const response = await fetch(`http://127.0.0.1:${httpPort}/liveliness/healthz`);
       return response.status === 503 ? response : undefined;
     }, `a 503 from the probe on ${httpPort}\n${output}`);
     expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({
+      status: 'error',
+      info: {},
+      error: { clickhouse: { status: 'down' } },
+      details: { clickhouse: { status: 'down' } },
+    });
+  });
+
+  it('reports 503 with state, lag and the error when the ingest halted (rulings R96, R101)', async () => {
+    const chain = syntheticChain(83_000_001, 20, { breakAt: 83_000_011 });
+    const db = 'syncer_app_e2e_halted';
+    const { httpPort } = await start(
+      undefined,
+      {
+        GH_WORKERS: 'ingest',
+        GH_CLICKHOUSE_DATABASE: db,
+        GH_RUN_MIGRATIONS_ON_BOOT: 'true',
+        GH_SYNC_START_LEDGER: String(chain[0].index),
+      },
+      chain,
+    );
+    const body = await waitFor(async () => {
+      const response = await fetch(`http://127.0.0.1:${httpPort}/liveliness/healthz`);
+      return response.status === 503 ? ((await response.json()) as Record<string, any>) : undefined;
+    }, `a 503 from the halted runner\n${output}`);
+    expect(body).toMatchObject({
+      status: 'error',
+      info: { clickhouse: { status: 'up' } },
+      error: {
+        ingest: {
+          status: 'down',
+          state: 'halted',
+          lag: 10,
+          message: 'halted',
+          error: expect.stringContaining('parent_hash'),
+          last_commit_age: expect.any(Number),
+        },
+      },
+    });
+    expect(body.details.ingest).toEqual(body.error.ingest);
   });
 
   it('exits with an error when the node belongs to another network', async () => {

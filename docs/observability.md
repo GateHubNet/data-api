@@ -32,7 +32,11 @@ this replica reach ClickHouse?
 { "status": "ok", "info": { "clickhouse": { "status": "up" } }, "error": {}, "details": { "clickhouse": { "status": "up" } } }
 ```
 
-ClickHouse unreachable: **503** with `"status": "error"` and `"error": { "clickhouse": { "status": "down" } }`.
+ClickHouse unreachable: **503** with the same body shape, `"status": "error"` and the failed indicator under `error`:
+
+```json
+{ "status": "error", "info": {}, "error": { "clickhouse": { "status": "down" } }, "details": { "clickhouse": { "status": "down" } } }
+```
 
 ### Syncer
 
@@ -50,6 +54,16 @@ head minus committed checkpoint, in ledgers) has stayed above `GH_MAX_LAG_HEALTH
 `error` appear while a failed write or the boot cleanup is being recovered. A lag the runner has not measured yet counts as healthy,
 and a spike that is gone by the next probe resets the window. During a large catch-up or a backfill the probe therefore turns 503: that
 is informational and nothing restarts on it.
+
+A 503 carries the same detail as a 200, so the body says why: the failed indicator moves from `info` to `error` with
+`"status": "down"`, a `message`, and the same `state`, `lag`, `last_commit_age` and `error` fields, e.g. for a halted runner:
+
+```json
+{ "status": "error",
+  "info": { "clickhouse": { "status": "up" } },
+  "error": { "ingest": { "status": "down", "state": "halted", "lag": 10, "last_commit_age": 41, "message": "halted",
+                         "error": "Ledger 83000011 has parent_hash ..., but ledger 83000010 has hash ..." } } }
+```
 
 A syncer whose workers read from the node (`ingest`, `fee_stats`) opens its probe port only after its node connection is up and
 the boot network check has passed (it is retried until it does), so an unreachable node shows as a failing healthcheck

@@ -95,6 +95,23 @@ describe('main.ts under the toolbox bootstrap()', () => {
     expect(metrics).toContain('# TYPE api_process_cpu_user_seconds_total counter');
   });
 
+  it('the probe answers 503 with the detail body of a 200 when ClickHouse is unreachable (ruling R101)', async () => {
+    const { base } = await start({ GH_CLICKHOUSE_URL: `http://127.0.0.1:${await freePort()}` });
+    const res = await waitFor(
+      async () => {
+        const response = await fetch(`${base}/liveliness/healthz`);
+        return response.status === 503 ? response : undefined;
+      },
+      () => `a 503 from the probe on ${base}`,
+    );
+    expect(await res.json()).toEqual({
+      status: 'error',
+      info: {},
+      error: { clickhouse: { status: 'down' } },
+      details: { clickhouse: { status: 'down' } },
+    });
+  });
+
   it('on SIGTERM drains the server, closes ClickHouse and exits 0', async () => {
     const { base } = await start();
     await waitFor(
