@@ -4,10 +4,11 @@ Day-2 operations of the GateHub Data API: routine tasks, what to watch, what to 
 and incident playbooks. How it is deployed: [deployment](deployment.md). Metrics and health in detail:
 [observability](observability.md). How the syncer works: [syncer](syncer.md).
 
-Commands use the production compose file. Set these once per shell (the env file holds secrets; do not paste it into tickets):
+Commands use the production compose file through a small shell function (works in bash and zsh; the env file holds secrets, do not paste
+it into tickets). Define it once per shell, in the repo root:
 
 ```bash
-export DC="docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod"
+dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$@"; }
 ```
 
 ## At a glance
@@ -18,7 +19,7 @@ export DC="docker compose -f docker-compose.prod.yaml --env-file deploy/.env.pro
 | Syncer health | `GET /liveliness/healthz` on the syncer (3002): 503 when ClickHouse is down, the ingest is `halted`, or the lag stays above `GH_MAX_LAG_HEALTHY` for more than 60 s. The body shows `state`, `lag`, `last_commit_age`. |
 | Metrics | `GET /metricz` on port 3000 of every api and syncer, inside the compose network only |
 | Swagger | `GET /internal/docs` (not exposed by nginx; reach the api container directly) |
-| Apply the schema | `$DC run --rm migrate-xrpl` / `migrate-xahau` (idempotent) |
+| Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` (idempotent) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total` |
 
@@ -33,35 +34,52 @@ The apis (`api-xrpl`, `api-xahau`) scale freely.
 ```bash
 git pull                                              # or check out the release tag
 export NPM_TOKEN=...                                  # the private @gatehub/toolbox; BuildKit secret, never baked in
-$DC build                                             # builds gatehub/data-api and gatehub/data-syncer from this checkout
-$DC up -d                                             # migrate jobs run first (idempotent), then recreates what changed
+dc build                                              # builds gatehub/data-api and gatehub/data-syncer from this checkout
+dc up -d --scale api-xrpl=<n> --scale api-xahau=<m>   # migrate jobs run first (idempotent), then recreates what changed
 ```
 
-`up -d` recreates a changed container; compose has no rolling update, so for a few seconds a recreated api does not answer
-(nginx answers 502 for that network's host) — scale the api to 2 or more replicas first if that matters. A changed **syncer** is
-stopped (SIGTERM, 30 s grace: it finishes its write and releases the lease) before the new one starts, so the two never overlap;
-the new one catches up from its checkpoint. Order does not matter for the schema: the migrate jobs run before the apps start.
+**Repeat your `--scale` flags on every `up`**: a plain `dc up -d` converges every service to its configured count and scales the apis back to 1.
+
+**There is no rolling update and no zero-downtime deploy with compose.** `up -d` recreates every container of a changed service **together**: while the new
+api containers start (a few seconds to the end of their healthcheck `start_period`) that network's host answers 502 from nginx, and the other network is not
+affected. A changed **syncer** is stopped (SIGTERM, 30 s grace: it finishes its write and releases the lease) before the new one starts, so the two never
+overlap; the new one catches up from its checkpoint, and the api keeps serving what is committed meanwhile. Order does not matter for the schema: the migrate
+jobs run before the apps start. If a brief outage per release is not acceptable, put an orchestrator with rolling updates (Kubernetes, see
+[deployment](deployment.md#option-3-kubernetes)) in front of the same images, or run a second compose project next to the first and switch the nginx
+upstream between them; neither is shipped or tested here.
 
 ### Apply a schema migration
 
 Migrations are the `*.sql` files in `packages/shared/schema/`, applied in file-name order, each once, and recorded with a SHA-256
 checksum in `<database>.schema_migrations`. To change the schema add a new `NNN_*.sql` and run the migrate job
-(`$DC run --rm migrate-xrpl && $DC run --rm migrate-xahau`, or just `$DC up -d`). **Never edit an applied file**: its changed
+(`dc run --rm migrate-xrpl && dc run --rm migrate-xahau`, or just `dc up -d`). **Never edit an applied file**: its changed
 checksum is a hard error (`Migration ... was modified after being applied`). All DDL is `CREATE ... IF NOT EXISTS`, so a file that
 failed halfway can simply be run again. Run migrations as a one-shot step, not from every replica. Details:
 [data-model](data-model.md#5-migrations).
 
 ### Rotate an API key
 
-`GH_API_KEYS` is comma separated and read at boot. Zero downtime: add the new key beside the old one in `deploy/.env.prod`
-(`old,new`), `$DC up -d` (recreates the apis; with two replicas nothing is dropped), move the clients, then remove the old key and
-`up -d` again. The API refuses to start with an empty list, or a key that is `dev-api-key` or starts with `change-me`.
+`GH_API_KEYS` is comma separated and read at boot, so a change needs a restart of the apis. Rotate in two steps so that no client has to switch at the
+same instant: add the new key beside the old one in `deploy/.env.prod` (`old,new`) and `dc up -d` (repeat your `--scale` flags), move the clients,
+then remove the old key and `dc up -d` again. Each `up` recreates the apis of both networks together, i.e. a brief 502 from nginx (see
+[Deploy a new version](#deploy-a-new-version)). The API refuses to start with an empty list, or a key that is `dev-api-key` or starts with `change-me`.
 
 ### Rotate the ClickHouse password
 
-The `CLICKHOUSE_PASSWORD` of the server container applies only when the data volume is first initialised. To rotate on a running
-server: `ALTER USER data_api IDENTIFIED BY '<new>'` (from `clickhouse-client` as an admin), then update `GH_CLICKHOUSE_PASSWORD` in
-`deploy/.env.prod` and `$DC up -d` so every client picks it up (the syncer restarts and catches up).
+`data_api` is not a SQL-created user: the clickhouse-server entrypoint writes `users.d/default-user.xml` (a user defined in XML, with `default` removed) from
+`CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` on **every container start**, and ClickHouse refuses to change an XML-defined user (`ALTER USER data_api ...` fails with
+`ACCESS_STORAGE_READONLY`; checked on 26.8.14.3). In `docker-compose.prod.yaml` the server's `CLICKHOUSE_PASSWORD` and the `GH_CLICKHOUSE_PASSWORD` of the
+migrate jobs, syncers and apis are all the same `GH_CLICKHOUSE_PASSWORD` of `deploy/.env.prod`. So:
+
+```bash
+# 1. set the new GH_CLICKHOUSE_PASSWORD in deploy/.env.prod (from your secrets manager)
+dc up -d --scale api-xrpl=<n> --scale api-xahau=<m>
+```
+
+Compose sees the changed environment and **recreates the clickhouse container and every client** (migrate jobs, syncers, apis; nginx is unchanged). The data volume is
+kept, the new container regenerates the XML user with the new password, and the clients start with it; the syncers catch up from their checkpoints. Expect a short
+outage of the whole stack (ClickHouse restarts). Any other client of the database (backups, a Prometheus exporter, your own `clickhouse-client` sessions) needs the new
+password too.
 
 ### Reclaim space after a big load
 
@@ -74,14 +92,34 @@ OPTIMIZE TABLE xrpl.transactions FINAL;   -- per table, off-peak; expensive on b
 
 ### Retention
 
-Only `validations` expires on its own (90-day TTL). To drop old raw data, drop whole partitions: the ledger-prefixed tables
-(`ledgers`, `transactions`, `payments`) have one partition per million ledgers, the secondary tables one per ten million:
+Only `validations` expires on its own (90-day TTL). Raw ledger data is deleted by dropping whole partitions, **but a ledger exists only if all its tables agree**:
 
-```sql
-ALTER TABLE xrpl.transactions DROP PARTITION 80;          -- ledgers 80,000,000 - 80,999,999
+- `ledgers` is the commit marker; `range-ingest` **skips every ledger that has a `ledgers` row** (it believes it is complete), and the live syncer never looks
+  behind its checkpoint.
+- A ledger that has a `ledgers` row but fewer stored transactions than its `tx_count` is answered with **500** by `/v2/ledgers/{id}` (and its hash list); lists of
+  payments, exchanges and balance changes silently lose the rows whose tables were dropped.
+
+So never drop the partitions of one table alone. Drop **the same ledger range from all 14 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
+partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
+is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledgers vanish from every list at once), then the children. For the block 80,000,000-89,999,999
+(P7 partition 8, P6 partitions 80-89) of the XRPL database:
+
+```bash
+# run from the repo root; clickhouse-client authenticates with the container's own environment (the secret never touches the host command line)
+ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -q "$0"' "$1"; }
+for p in 80 81 82 83 84 85 86 87 88 89; do ch "ALTER TABLE xrpl.ledgers DROP PARTITION $p"; done      # the commit marker first
+for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
+for t in ledger_by_hash tx_by_hash tx_by_type account_transactions account_tx_by_sequence payments_by_currency account_payments exchanges account_exchanges balance_changes; do
+  ch "ALTER TABLE xrpl.$t DROP PARTITION 8"
+done
+ch "DELETE FROM xrpl.accounts_created WHERE ledger_index BETWEEN 80000000 AND 89999999"
 ```
 
-Dropping history makes the API answer from what is left (empty windows); re-ingest with `range-ingest` to bring it back.
+The rollups (`stats_hourly`, `volume_*`) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats` and `validations` are independent.
+
+To **bring a dropped block back**, run `range-ingest` over the same range: with no `ledgers` rows left it ingests everything. To repair a **partial** loss (some tables
+dropped, or a ledger answering 500) without caring about partition alignment, use `--reprocess` over exactly the damaged range
+(`range-ingest --from A --to B --reprocess`: it fetches and parses first, then deletes and rewrites those ledgers in every table, from any sub-range).
 
 ## What to watch
 
@@ -100,7 +138,14 @@ Dropping history makes the API answer from what is left (empty windows); re-inge
 
 ### SQL health checks
 
-Run with `clickhouse-client` (`$DC exec clickhouse clickhouse-client --user data_api --password "$GH_CLICKHOUSE_PASSWORD"`):
+Run them in `clickhouse-client` inside the container, which authenticates with the container's own environment (the password stays off the host command
+line; `data_api` is the only user, `default` is removed):
+
+```bash
+dc exec clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD"'
+```
+
+and paste:
 
 ```sql
 -- no gaps and no duplicate ledgers (span = count = distinct)
@@ -134,7 +179,7 @@ visible to the API.
 **Nothing needs to be repaired by hand in the usual case.** The syncer is crash-safe by construction (see
 [syncer](syncer.md#checkpoint-boot-and-recovery)):
 
-1. Start the syncer (`$DC up -d syncer-xrpl`, or let `restart: unless-stopped` do it). If it refuses to boot because the lease is
+1. Start the syncer (`dc up -d syncer-xrpl`, or let `restart: unless-stopped` do it). If it refuses to boot because the lease is
    held, a previous syncer is still running or died less than 30 s ago: stop it (`docker ps` for stray `syncer`/`data-syncer-*`
    containers of an older stack) and wait 30 s.
 2. It reads the checkpoint, confirms the checkpoint's hash with the node, deletes the uncommitted tail, and catches up from
@@ -143,7 +188,7 @@ visible to the API.
    remaining work. The stats of the current hour are stale until the sweep is over.
 4. **If the node no longer has the missing ledgers** (a non-full-history node: `complete_ledgers` of `server_info`), the syncer retries
    forever and the lag never falls. Point `GH_NODE_ENDPOINTS` at a full-history node (your own, or `wss://s2.ripple.com` for
-   XRPL), `$DC up -d`, and it carries on.
+   XRPL), `dc up -d`, and it carries on.
 5. A ClickHouse outage is handled the same way: writes fail, the runner recovers (waits for the failed queries, deletes the
    tail, writes again) and no ledger is lost or duplicated.
 
@@ -175,11 +220,11 @@ syncer in the same image. Full guidance on sizing and nodes: [backfill](backfill
 
 ```bash
 # a range of one network (the syncer keeps running; the CLI checks its lease itself)
-$DC run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 --to 90100000
-$DC run --rm --no-deps syncer-xahau node dist/cli/range-ingest.js --from 1 --to 100000 --concurrency 4
+dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 --to 90100000
+dc run --rm --no-deps syncer-xahau node dist/cli/range-ingest.js --from 1 --to 100000 --concurrency 4
 
 # after a parser change: rewrite committed ledgers (below the live checkpoint)
-$DC run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 --to 90100000 --reprocess
+dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 --to 90100000 --reprocess
 ```
 
 - **Resume:** rerun the same command. Finished chunks are skipped, an unfinished one is redone. Exit status 1 means failed, 2 a
@@ -195,7 +240,7 @@ $DC run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000
 
 | Tier | How |
 | --- | --- |
-| API (read) | `$DC up -d --scale api-xrpl=4 --scale api-xahau=2` (compose has no rolling update; nginx resolves the replicas per request through Docker DNS and uses all of them). The api is stateless apart from small in-memory caches. The rate limit is per replica (in memory), so the effective limit grows with the replica count. |
+| API (read) | `dc up -d --scale api-xrpl=4 --scale api-xahau=2` (repeat the flags on every `up`; compose has no rolling update; nginx resolves the replicas per request through Docker DNS and uses all of them). The api is stateless apart from small in-memory caches. The rate limit is per replica (in memory), so the effective limit grows with the replica count. |
 | Syncer | **Never.** One per network. It is network- and ClickHouse-bound, not CPU-bound. |
 | ClickHouse | One server with one database per network. Scale it up first (RAM, disk); replication needs Keeper-backed `Replicated*` engines, see [clickhouse](clickhouse.md#high-availability-and-replication). |
 
@@ -206,7 +251,7 @@ compressed, mostly `transactions`).
 
 ### Probe returns 503 on the api
 
-ClickHouse does not answer a ping. Is it up and reachable from the api's network (`$DC exec api-xrpl node -e "fetch('http://clickhouse:8123/ping').then(r=>console.log(r.status))"`)? Memory or disk? The api itself is fine; it is the dependency.
+ClickHouse does not answer a ping. Is it up and reachable from the api's network (`dc exec api-xrpl node -e "fetch('http://clickhouse:8123/ping').then(r=>console.log(r.status))"`)? Memory or disk? The api itself is fine; it is the dependency.
 
 ### API 5xx spike
 
@@ -224,7 +269,7 @@ kills. Typical causes: an unbounded window on `/v2/exchanges` (all pairs), a ver
 ### Many 401s after a deploy
 
 `GH_API_KEYS` changed or the env file did not reach the container. The api refuses to boot without keys in production, so a running
-api has keys; compare the key clients send with `$DC exec api-xrpl printenv GH_API_KEYS` only on a trusted terminal.
+api has keys; compare the key clients send with `dc exec api-xrpl printenv GH_API_KEYS` only on a trusted terminal.
 
 ### Every client gets 429
 

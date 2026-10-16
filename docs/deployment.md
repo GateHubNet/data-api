@@ -115,7 +115,7 @@ nginx. The syncer opens its probe port only once its node connection is up, and 
 `GH_MAX_LAG_HEALTHY` ledgers behind for over a minute (catching up): `unhealthy` there is informational, compose restarts nothing
 on it.
 
-Scale the read tier of a network (compose has no rolling update):
+Scale the read tier of a network (compose has no rolling update; **repeat the `--scale` flags on every `up`**: a plain `up -d` scales the apis back to 1):
 
 ```bash
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --scale api-xrpl=3 --scale api-xahau=2
@@ -221,6 +221,9 @@ Manifests are not shipped; the shape is:
 ## Rollout and health
 
 - Run migrations before the code that needs them (compose does it for you in start order).
-- Roll apis one at a time (scale to >= 2 first); the probe gates traffic until ClickHouse answers.
+- **Compose has no rolling update and no zero-downtime deploy.** `up -d` recreates all containers of a changed service together, so a release means a brief outage
+  of that service (nginx answers 502 for that network's host while the new api containers start; the other network is unaffected). Options without promises: an
+  orchestrator with rolling updates for the same images (Kubernetes, above), or a second compose project next to the first with the nginx upstream switched
+  between them. The healthcheck (`start_period` 30 s) tells you when an api is up.
 - The syncer is safe to restart at any time: it re-derives its position from ClickHouse, cleans its uncommitted tail and resumes
   with no double counting ([syncer](syncer.md#checkpoint-boot-and-recovery)). It gets a 30 s grace period to finish its write.

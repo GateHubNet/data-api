@@ -16,7 +16,7 @@ first ClickHouse design keyed every row on a CTID and ordered lists by a `date` 
 ## Decision
 1. **`ledger_index` is the time axis.** Close times grow monotonically with it. A request's `start`/`end` is resolved **once** to a
    `[L1, L2]` ledger range (a `minmax` index on `ledgers.close_time`, with an LRU cache in the API), and every list is a range of a primary
-   key. Markers encode `(ledger_index, tx_index[, node_index])`, a unique key, and **never a DateTime**. A marker is the base64url of the
+   key. Markers of lists of ledger rows encode `(ledger_index, tx_index[, node_index])`, a unique key, and **never a DateTime** (lists of aggregated buckets are the exception, see the consequences). A marker is the base64url of the
    JSON key of the last row; the next page is a tuple comparison `(cols) > (values)` (or `<` descending); a malformed marker is 400.
 2. **Wide base tables are ordered by ledger** (`ledgers`, `transactions`, `payments`, ...). **Narrow secondary tables** the syncer writes
    explicitly serve the other access paths: `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`,
@@ -44,6 +44,8 @@ first ClickHouse design keyed every row on a CTID and ordered lists by a `date` 
 - The invariant "a ledger is whole or absent" relies on the write order and on recovery; rows of an uncommitted ledger are visible to a query that
   reads a child table directly until recovery has removed them.
 - Markers are not interchangeable with `data.ripple.com`'s HBase row keys, and work only for the endpoint and direction they came from.
-- Candle pages use the bucket start as their marker (the aggregated list's own key), the one place where the marker is a time.
+- Lists of aggregated buckets use the bucket as their key and so carry a time in the marker: the bucket start (unix seconds) for candles, hourly/daily fees and fee
+  samples, stats and historical volumes, the day (`YYYY-MM-DD`) for the account stats, and the snapshot time in milliseconds for raw `fee_stats`. Only lists of ledger rows are
+  markered by ledger keys.
 
 See [data-model](../data-model.md) and [syncer](../syncer.md).

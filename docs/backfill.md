@@ -25,8 +25,9 @@ Works the same for the XRP Ledger and for Xahau; every command below takes the n
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
   node dist/cli/range-ingest.js --from 90000000 --to 90100000
 
-# the same from source (GH_* environment as the syncer; GH_NODE_ENDPOINTS = the node to read from)
-pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000 --concurrency 16
+# the same from source: `ingest:range` runs the compiled dist/cli/range-ingest.js, so `pnpm build` first; it needs the syncer's GH_* environment
+# (apps/syncer/.env, or GH_ENV=local with the variables exported; GH_NODE_ENDPOINTS = the node to read from)
+pnpm build && GH_ENV=local pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000 --concurrency 16
 ```
 
 Options: `--from`, `--to` (both inclusive, required), `--chunk` (default 1000, must divide 1,000,000), `--concurrency` (default 8),

@@ -57,8 +57,10 @@ The syncer is network-bound on the node, then ClickHouse-bound on writes. Measur
 synthetic tool:
 
 ```bash
-# point at your node (GH_NODE_ENDPOINTS), pick a fixed range of a scratch database, and time it
-export GH_NETWORK=xrpl GH_CLICKHOUSE_DATABASE=ingesttest GH_NODE_ENDPOINTS=ws://your-node:6006
+# point at your node (GH_NODE_ENDPOINTS), pick a fixed range of a scratch database, and time it. ingest:range runs the compiled
+# dist/cli/range-ingest.js (pnpm build first); GH_ENV=local makes it read the exported variables instead of an .env file, like start:syncer below
+export GH_ENV=local GH_NETWORK=xrpl GH_CLICKHOUSE_DATABASE=ingesttest GH_NODE_ENDPOINTS=ws://your-node:6006
+pnpm build
 pnpm ch:migrate
 time pnpm --filter @gatehub/data-syncer ingest:range --from 80000000 --to 80010000 --concurrency 16
 

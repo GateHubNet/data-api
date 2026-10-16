@@ -75,7 +75,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_WORKERS` | `ingest,validations,fee_stats,aggregator` | Comma separated subset of the four workers; empty runs none. An unknown name fails the boot (`Unknown worker "x"`). Run **exactly one syncer per network and database**; see [syncer](syncer.md). |
 | `GH_SYNC_START_LEDGER` | unset: the validated head at the first boot | Where the very first run starts. **Ignored once the database has a committed ledger.** |
 | `GH_LEDGER_FETCH_TIMEOUT_MS` | `120000` | Timeout of one expanded `ledger` request (a busy ledger is big). |
-| `GH_CATCHUP_CONCURRENCY` | `8` | Ledgers fetched in parallel while catching up (and by `range-ingest`). Raise it with your own node; public clusters need less. |
+| `GH_CATCHUP_CONCURRENCY` | `8` | Ledgers the **live runner** fetches in parallel while catching up. It is not read by `range-ingest`, which has its own `--concurrency` flag (default 8). Raise either with your own node; public clusters need less. |
 | `GH_CATCHUP_FLUSH_LEDGERS` | `300` | A catch-up batch is written when it holds this many ledgers ... |
 | `GH_CATCHUP_FLUSH_TXS` | `100000` | ... or this many transactions ... |
 | `GH_CATCHUP_FLUSH_MS` | `5000` | ... or when its first ledger is this old, whichever comes first. In live mode every ledger is its own commit. |
@@ -171,7 +171,7 @@ NGINX_BIND=<interface only the front proxy reaches>
 | --- | --- |
 | Query cost and memory | `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `GH_CLICKHOUSE_MAX_QUERY_MEMORY`, `GH_CLICKHOUSE_MAX_CONNECTIONS` |
 | API CPU and latency | `GH_TX_CACHE_SIZE`, `GH_LIVE_CACHE_TTL_MS`, `GH_CACHE_CONTROL` |
-| Ingest speed | `GH_CATCHUP_CONCURRENCY`, `GH_CATCHUP_FLUSH_LEDGERS`, `GH_CATCHUP_FLUSH_TXS`, `GH_CATCHUP_FLUSH_MS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, the node you point at |
+| Ingest speed | `GH_CATCHUP_CONCURRENCY` (live runner; `range-ingest --concurrency` for the CLI), `GH_CATCHUP_FLUSH_LEDGERS`, `GH_CATCHUP_FLUSH_TXS`, `GH_CATCHUP_FLUSH_MS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, the node you point at |
 | Abuse and exposure | `GH_API_KEYS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_TRUST_PROXY_HOPS`, `GH_CORS_ORIGINS`, `TRUSTED_PROXIES`, `NGINX_BIND` |
 | Health | `GH_MAX_LAG_HEALTHY` |
 

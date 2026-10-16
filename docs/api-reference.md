@@ -76,7 +76,9 @@ time left with two decimals. Requests that pass carry `X-RateLimit-Limit`, `-Rem
 
 ### Errors
 
-Every error of a `/v2` route is JSON in the shape of the original:
+Every error of a `/v2` route is JSON in the shape of the original (one known exception: a malformed percent-escape in a path parameter,
+such as `/v2/accounts/%zz/payments`, is rendered in the framework's own `{"error":{...}}` shape, see
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#5-known-gaps-at-the-time-of-writing-served-as-described-in-the-api-reference)):
 
 ```json
 { "result": "error", "message": "invalid start date format" }
@@ -155,6 +157,10 @@ Routes that list rows answer `format=csv` with `Content-Type: text/csv` and `Con
 filename=<name>.csv`. Nested objects are flattened to `a.b` and `c[0].d` columns, the columns are the union of the keys in the
 order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name.
 
+**Differences from data.ripple.com**: flattening is applied on **every** route that has a CSV form. The original flattened nested objects with
+its `flattenJSON` helper on only some routes (9 of 29) and printed `[Object]` in the cells of the others, which made those CSVs unusable. The
+other conventions of its CSV writer (`nice-json2csv`: union-of-keys header, every cell quoted, `\"` escaping) are kept.
+
 ### Caching and transport
 
 Successful `/v2` answers carry `Cache-Control: public, max-age=60` (the `GH_CACHE_CONTROL` setting; empty sends no header).
@@ -172,10 +178,25 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 | Markers | HBase row keys | opaque tokens, same mechanism (`marker` + `Link`) |
 | Bugs of the original | | fixed where they were outright bugs; listed per endpoint and in [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) |
 
-Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs). Endpoints of the original
-that this API does not serve: `/v2/network/top\_currencies` and the old GateHub `/v2/ledgers` time-range list (the path is the
-Ripple "latest ledger" now). The singular `/v2/ledger/{hash}/validations` of the original is kept as an alias. Anything else
-under `/v2` is a 404.
+Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs).
+
+**Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
+(`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
+
+| Group | Routes of the original |
+| --- | --- |
+| Health, gateways, currencies | `/v2/health[/{aspect}]`, `/v2/gateways[/{gateway}]`, `/v2/gateways/{gateway}/assets[/{filename}]`, `/v2/currencies[/{currencyAsset}]` |
+| Network | `/v2/network/external_markets`, `/v2/network/xrp_distribution`, `/v2/network/top_markets[/{date}]`, `/v2/network/top\_currencies[/{date}]`, `/v2/network/topology`, `/v2/network/topology/nodes[/{pubkey}]`, `/v2/network/topology/links`, `/v2/network/validators[/{pubkey}]`, `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`, `/v2/network/validator_reports`, `/v2/network/rippled_versions` |
+| Accounts | `/v2/accounts/{address}/escrows`, `/v2/accounts/{address}/payment_channels` |
+| Reports and tools | `/v2/reports[/{date}]`, `/v2/maintenance/{domain}`, `/v2/estimate` |
+| API map | `GET /` and `GET /v2` (the index of all routes) |
+
+The original's 404 body also carried an `api-map` key (the same index); here it is `{"result":"error","message":"Cannot GET <url>"}`
+only. The old GateHub `/v2/ledgers` time-range list is gone too: `/v2/ledgers` without an identifier is the latest ledger, as in Ripple.
+
+The singular `/v2/ledger/{hash}/validations[/{pubkey}]` is served as an alias of `/v2/ledgers/{hash}/validations[/{pubkey}]`. It appeared
+only in the original's **README**, not in the route table of either branch's `server.js`; it is provided because that README documented it
+and it was asked for. Anything else under `/v2` is a 404.
 
 Each endpoint below ends with **Differences from data.ripple.com** where this API serves something else than the original did.
 
@@ -437,8 +458,9 @@ of the window. With no trade the row is all zeros (`"0.0000000"` prices, `"0"` v
 
 CSV: the raw rows use the 20 columns of the original, in this order: `base_currency, base_issuer, base_amount, counter_amount,
 counter_currency, counter_issuer, rate, executed_time, ledger_index, buyer, seller, taker, provider, autobridged_currency,
-autobridged_issuer, offer_sequence, tx_type, tx_index, node_index, tx_hash`. Candle and reduce rows are CSV rows of their own
-keys (`buy_volume` last).
+autobridged_issuer, offer_sequence, tx_type, tx_index, node_index, tx_hash`. Candle and reduce rows use a fixed list of 16 columns, in this
+order: `open, high, low, close, vwap, count, base_currency, base_issuer, base_volume, counter_currency, counter_issuer, counter_volume,
+open_time, close_time, start, buy_volume` (an empty cell where a row has no value, e.g. `open_time` of an empty reduce row).
 
 Errors, in the order they are checked: 400 `base currency is required`, `counter currency is required`, `XRP cannot have an
 issuer` (`XAH` on Xahau), `base issuer is required`, `counter issuer is required`, `invalid base issuer address`,
@@ -483,13 +505,15 @@ How many `counter` one `base` buys.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `date` | now | The moment the rate is as of. Not in the future (10 ms of clock skew are tolerated). |
+| `date` | now | The moment the rate is as of; it names a period (`2015-01-14` is a day, `2015-01-14T18` an hour) and the daily and latest windows read up to the end of it. Not in the future (10 ms of clock skew are tolerated). |
 | `strict` | true | The latest-trades price counts only when there are at least 10 trades; `strict=false` counts however many there are. |
 | `period` | none | `hour`, `day`, `3day`, `7day` or `30day`: the volume weighted price of the rolling window of that length that ends a second before `date`, instead of the default rate. |
 | `live` | false | Leave out the daily part: only the latest trades. |
 
-The default rate combines two numbers: the volume weighted price of the day of `date` (from 00:00 UTC to `date`; none with
-`live=true`) and the volume weighted price of the **last 50 trades** in the 14 days before `date`. The rate is their average when
+The default rate combines two numbers: the volume weighted price of the day of `date` (from 00:00 UTC up to the **end of the period
+`date` names**: the whole day for `date=2015-01-14`, up to the end of the hour for `date=2015-01-14T18`, up to that second for a full time,
+never past the end of that day; without `date`, up to now; none with `live=true`) and the volume weighted price of the **last 50 trades** in the
+14 days before `date` (up to the same end). The rate is their average when
 both are above zero, otherwise the latest-trades price. With `strict` (the default) the latest-trades price counts only when
 there are at least 10 trades in that window, otherwise it is 0, and so is the rate. Trades whose native leg is `<= 0.0005` do not
 count. The same asset on both sides is `1`; a rate that cannot be told is `0` (`"0.0000000"`).
@@ -505,8 +529,8 @@ future date`; 500 `unable to retrieve exchanges`. No CSV.
 - An unparseable `date` (or an empty `date=`) is 400 `invalid date format`; the original failed with a 500.
 - The same asset on both sides with a `period` is `1` (the original answered `0`).
 - `period` is a direct rolling window ending at `date`; the original summed pre-aggregated buckets, so its edges were aligned
-  to the bucket size. The daily part is the volume weighted price from 00:00 of the day to `date`, not the stored whole-day
-  bucket.
+  to the bucket size. The daily part is the volume weighted price from 00:00 of the day of `date` to the end of the period `date`
+  names, not the stored whole-day bucket (so a past `date` with a time of day reads to the end of that hour/minute/second, not the whole day).
 - A `date` naming a month or year reads the first calendar day of that period for the daily part (the original read the first
   day that had trades).
 
@@ -783,6 +807,8 @@ row), from `start` up to but **not including** `end`.
 | `descending`, `limit` (200, max 1000), `marker` | | The marker is the day of the last row. |
 | `format` | json | `csv`: file `<address> - stats.<family>.csv`. |
 
+The answer is `{ "result": "success", "count": n, "marker": "…", "rows": [ ... ] }`: the list key is **`rows`** (not `stats`).
+
 `family=transactions` rows: `{ "date": "2015-01-14T00:00:00Z", "transaction_count": 3, "result": {"tesSUCCESS": 3}, "type":
 {"Payment": 2, "OfferCreate": 1} }` (the transactions the account **sent** that day). `family=value` rows: `{ "date": …,
 "account_value": "1034.5", "balance_change_count": 7 }` (what the account held at the end of the day in the native currency:
@@ -834,7 +860,7 @@ Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 
 
 ## Network
 
-All four `/v2/network/*` list routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`.
+`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the two volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`. `marker` is present only when there is a next page.
 
 ### `GET /v2/network/fees`
 
@@ -853,7 +879,7 @@ The fees paid by the transactions of a ledger, an hour or a day, in whole units 
 An hour or a day is a row when it **starts** within `start` and `end`, and it counts all its ledgers.
 
 ```json
-{ "result": "success", "count": 1, "marker": "…",
+{ "result": "success", "marker": "…", "count": 1,
   "rows": [{ "avg": 0.010615, "max": 0.011, "min": 0.00001, "total": 0.138, "tx_count": 13,
              "date": "2015-01-14T18:27:20Z", "ledger_index": 11118827 }] }
 ```
@@ -883,7 +909,7 @@ Snapshots of the node's fee state (the `fee` command), taken every 5 seconds by 
 | `format` | json | `csv`: file `network fee stats.csv`. |
 
 ```json
-{ "result": "success", "count": 1, "marker": "…",
+{ "result": "success", "marker": "…", "count": 1,
   "rows": [{ "current_ledger_size": 54, "current_queue_size": 0, "date": "2016-08-24T00:15:55Z",
              "expected_ledger_size": 53, "median_fee": 0.000005, "minimum_fee": 0.00001, "open_ledger_fee": 0.00001,
              "pct_max_queue_size": 0 }] }
@@ -959,8 +985,8 @@ only once the ingest has passed it by an hour, so volumes follow the ingest rath
 
 ### `GET /v2/ledgers/{ledger_hash}/validations` and `GET /v2/ledger/{ledger_hash}/validations`
 
-The validations the network made of one ledger, one per validator, sorted by validator key. The singular `/v2/ledger/...` is the
-alias that the original also had. The data are collected by the syncer from the `validations` stream of `GH_VALIDATION_ENDPOINTS`
+The validations the network made of one ledger, one per validator, sorted by validator key. The singular `/v2/ledger/...` is an
+alias: the original's README documented that spelling (its route table did not), and it is provided on request. The data are collected by the syncer from the `validations` stream of `GH_VALIDATION_ENDPOINTS`
 and kept for 90 days.
 
 | Parameter | Default | Meaning |

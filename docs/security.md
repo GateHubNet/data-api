@@ -54,9 +54,9 @@ rate limit so a request with a bad key spends nobody's budget.
   `NODE_ENV=production` an empty list throws `GH_API_KEYS must be set in production`, and so does a placeholder key (`dev-api-key`, or
   anything starting with `change-me`, case-insensitive): `GH_API_KEYS contains a placeholder key ... set real keys in production`
   (the message never echoes the keys). The dev compose runs its API with `NODE_ENV=development` for that reason.
-- **Provisioning and rotation:** `GH_API_KEYS` is a comma separated list; several keys are accepted at once, so rotation is zero-downtime
-  (add the new key, roll the clients, remove the old one, [operations](operations.md#rotate-an-api-key)). Keys come from a secrets manager,
-  never from git.
+- **Provisioning and rotation:** `GH_API_KEYS` is a comma separated list; several keys are accepted at once, so rotation needs no client flag day (add the new
+  key, roll the clients, remove the old one, [operations](operations.md#rotate-an-api-key)); restarting the apis for each step is still a brief outage per
+  service. Keys come from a secrets manager, never from git.
 
 Caveats: keys are compared by digest in memory but live in the environment as plaintext; validation is per replica, so revoking a key
 needs a roll-out of every replica.

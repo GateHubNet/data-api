@@ -82,7 +82,8 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123 / 9000
 
 cp apps/api/.env.example    apps/api/.env  # the .env files are git-ignored; the .env.example files are committed
 cp apps/syncer/.env.example apps/syncer/.env
-#   defaults: GH_NETWORK=xrpl, public node wss://xrplcluster.com, GH_API_KEYS empty (no authentication)
+#   defaults: GH_NETWORK=xrpl; the syncer example reads from Ripple's full-history server wss://s2.ripple.com (the API example keeps the
+#   default node wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
 
 pnpm ch:migrate                            # creates the database of GH_NETWORK (xrpl) and applies the schema
 
@@ -122,7 +123,7 @@ From the repo root; `pnpm -r <script>` fans out in dependency order.
 | `pnpm --filter @gatehub/data-api-shared test:e2e` | Shared e2e tests (migrations, writer, build-rows, rates, aggregation). **Needs Docker.** |
 | `pnpm format` | Prettier write over `{apps,packages}/**/src/**/*.ts`. (`pnpm lint` runs `eslint --fix`, but the repo has no ESLint configuration yet, so it does not work.) |
 | `pnpm ch:migrate` | applies the schema to the database of `GH_NETWORK` (`ts-node` on `migrate.ts`) |
-| `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source ([backfill](backfill.md)) |
+| `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source: it runs `dist/`, so `pnpm build` first, and it needs the syncer's `GH_*` environment (`.env` or `GH_ENV=local`) ([backfill](backfill.md)) |
 | `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures |
 | `pnpm start:api` / `pnpm start:syncer` | `nest start --watch` |
 | `pnpm docker:up` / `pnpm docker:down` | start/stop the dev ClickHouse container |

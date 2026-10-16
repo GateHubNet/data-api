@@ -36,11 +36,21 @@ below. Where a ruling made during implementation changed served behaviour it is 
    header keeps reserved characters percent-encoded (the original decoded everything and produced unfollowable links); a malformed marker is 400.
 5. **`GH_*` configuration, `/internal/docs`, `/liveliness/healthz`, `/metricz`** are ours.
 
+4a. **CSV flattening is applied on every route that has a CSV form.** The original flattened nested objects (its `flattenJSON` helper) on only 9 of its 29
+    routes and printed `[Object]` in the cells of the others, which made those files unusable. The other conventions of its CSV writer (`nice-json2csv`:
+    union-of-keys header in order of first appearance, every cell quoted, `\"` escaping) are kept. See [api-reference](../api-reference.md#csv).
+
 ### 2. Endpoints kept, added, dropped
 6. **Kept as extras:** `GET /v2/exchanges` (the exchanges of all pairs) and `GET /v2/last_validated` (the original had it, its README did not list it).
-7. **Dropped:** `GET /v2/network/top\_currencies` and the old GateHub `/v2/ledgers` time-range list (it collided with Ripple's "latest ledger"; `/v2/ledgers`
-   without an identifier is the latest ledger).
-8. **`/v2/ledger/{hash}/validations[/{pubkey}]`** (singular) is registered as an alias of `/v2/ledgers/{hash}/validations[/{pubkey}]`.
+7. **Not served (out of scope).** The original's `api/server.js` served more than the endpoint set this API was asked to implement. These routes are **not part of this
+   API and answer 404**: `/v2/health[/{aspect}]`; `/v2/gateways[/{gateway}]` and `/v2/gateways/{gateway}/assets[/{filename}]`; `/v2/currencies[/{currencyAsset}]`;
+   `/v2/network/{external_markets, xrp_distribution, top_markets[/{date}], top\_currencies[/{date}], topology, topology/nodes[/{pubkey}], topology/links,
+   validators[/{pubkey}[/manifests|/reports]], validator_reports, rippled_versions}`; `/v2/accounts/{address}/{escrows, payment_channels}`; `/v2/reports[/{date}]`;
+   `/v2/maintenance/{domain}`; `/v2/estimate`; and the API map at `/` and `/v2`, whose index also appeared as the `api-map` key of the original's 404 body (here the
+   404 body is `{result, message}` only). The old GateHub `/v2/ledgers` time-range list is dropped as well (it collided with Ripple's "latest ledger": `/v2/ledgers`
+   without an identifier is the latest ledger). Dropping the escrows and payment-channels *routes* goes with dropping their tables (item 10).
+8. **`/v2/ledger/{hash}/validations[/{pubkey}]`** (singular) is registered as an alias of `/v2/ledgers/{hash}/validations[/{pubkey}]`. It appears only in the
+   original's README, not in the route table of either branch's `server.js`; it is provided because the README documented it and it was asked for.
 9. **`minute` live period of the volume routes is not supported** (the original's develop branch had it); `hour, day` (payments) and `hour, day,
    3day, 7day, 30day` (trades) are. The historical mode (`start`/`end`/`interval=day|week|month`) of the develop branch is implemented.
 10. **Data dropped:** the offers, issuers, escrows and paychannels tables and parsers. Escrow and payment-channel *typing* stays in `balance_changes`.
@@ -67,7 +77,7 @@ below. Where a ruling made during implementation changed served behaviour it is 
     answered an empty 200).
 20. `/v2/accounts/{a}` answers with the **latest** creation of an address (the original with the earliest); a transaction that creates several accounts
     lists them all.
-21. `max_sequence` is inclusive (the HBase stop row dropped it); a reversed `min_sequence`/`max_sequence` is swapped (the original's behaviour, kept);
+21. `max_sequence` is inclusive (the HBase stop row dropped it), and so is `min_sequence` when the list is descending (the reversed scan dropped that one); a reversed `min_sequence`/`max_sequence` is swapped (the original's behaviour, kept);
     sequences beyond what a sequence can be never become database errors.
 22. Account payments honour `issuer`; account exchanges `/{base}[/{counter}]` work in either orientation (the original compared with the stored order
     literally), inverting what was stored the other way round; the account-exchanges CSV carries all 20 columns of every row (the original rewrote only the first).
@@ -78,7 +88,8 @@ below. Where a ruling made during implementation changed served behaviour it is 
     `direction` is `sell` when the offer has the sell flag (the original hard-coded `buy`); account_lines are paged until the limit is filled with lines
     that pass the filters (the original sliced then filtered, and subtracted the page size twice); `limit=all` pages to completion on both routes; orders
     validate the address (the original let the node fail with a 500); a date older than the first stored ledger is 400 `the date provided is too old`
-    (was 500); a repeated node marker is an error instead of an endless loop. The original's `currency` on orders was never used and is ignored.
+    (was 500); a `ledger_hash` that is not 64 hex digits is 400 `invalid ledger hash` (the original had no such message: it ignored the hash); a repeated node
+    marker is an error instead of an endless loop. The original's `currency` on orders was never used and is ignored.
 
 **Exchanges / rates / volumes**
 25. Aggregates (candles, `reduce`, active accounts) are **exact sums** of the stored decimal text, and amounts are served as exact text (the original summed
@@ -104,7 +115,8 @@ below. Where a ruling made during implementation changed served behaviour it is 
     expected_ledger_size, median_fee, minimum_fee, open_ledger_fee, pct_max_queue_size` (**not** the order of the design spec); the interval error is the short
     `invalid interval` (the long `use: ...` text belongs to the volume routes); `avg` is `toPrecision(6)` of total/tx_count rounded to a drop per ledger and total/tx_count
     rounded to a drop for buckets; a bucket's `min` does not depend on an empty first ledger; an empty bucket has `avg` 0 (was `NaN`); `fee_stats` with an interval serves
-    the first snapshot at or after each boundary (the original needed a row stored at that exact second); `interval=raw` returns raw rows.
+    the first snapshot at or after each boundary (the original needed a row stored at that exact second); `interval=raw` returns raw rows; ascending and descending lists
+    sample the same boundaries (the original's two directions picked different ones).
 32. **Validations are kept per (ledger, validator), not per reporting node.** A validation two collector nodes saw is one row whose `count` adds up; the original's data
     mixed both shapes. Values are the original's HBase text (flags, `ledger_index`, `signing_time`, fees, `full: "true"`; `count` is a number; empty columns absent),
     keys sorted alphabetically; a `0x` ledger hash works (was upper-cased to `0X...`); `limit` at or below 0 is the default; 404 `validation not found`.

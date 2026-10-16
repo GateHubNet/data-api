@@ -189,7 +189,7 @@ local volumes).
 
 - `transactions.tx_json` and `meta_json` dominate (full XRPL history is roughly 1-1.5 TB compressed). Everything else together is a
   fraction of it.
-- Retention is by partition: `ALTER TABLE ... DROP PARTITION n` ([clickhouse](clickhouse.md#retention-and-ttl)). `validations`
+- Retention is by partition, but always the same ledger block from all 14 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
   expires by TTL after 90 days.
 - Rollups (`stats_hourly`, `volume_*`) and `fee_stats` are small; keep them.
 

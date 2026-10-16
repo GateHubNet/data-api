@@ -124,15 +124,22 @@ Do not run production without a tested restore:
 
 ## Retention and TTL
 
-`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap:
+`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap, but **a ledger lives in 14
+tables that must agree**, so retention is never per table:
 
-```sql
-ALTER TABLE xrpl.transactions DROP PARTITION 80;       -- ledgers 80,000,000-80,999,999 (P6 tables: per million ledgers)
-ALTER TABLE xrpl.account_transactions DROP PARTITION 8; -- P7 tables: per ten million ledgers
-```
+- The `ledgers` row is the commit marker. `range-ingest` **skips every ledger that has one** (it believes the ledger is complete), and the live syncer does not look
+  behind its checkpoint, so a half-dropped ledger is not repaired by re-ingesting its range.
+- A ledger with a `ledgers` row but fewer stored transactions than its `tx_count` answers **500** on `/v2/ledgers/{id}`; payments, exchanges and balance changes
+  whose tables were dropped just vanish from lists.
+- Partition sizes differ: `ledgers`, `transactions` and `payments` are partitioned per **1,000,000** ledgers (P6), the other ten ledger-keyed tables per **10,000,000** (P7),
+  and `accounts_created` is not partitioned.
 
-`validations` has a 90-day TTL (`toDateTime(last_datetime) + INTERVAL 90 DAY`); `fee_stats` and the rollups are small, keep them.
-Dropping history makes lists in that window empty; `range-ingest` brings it back.
+The safe procedure drops **one 10,000,000-ledger block from all 14 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`
+(`ledgers` first, the commit marker), partition `k` of the ten P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`; the exact commands are in
+[operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair
+a partial loss use `range-ingest --reprocess` over exactly the damaged range. Dropping a block makes lists in that window empty.
+
+`validations` has a 90-day TTL (`toDateTime(last_datetime) + INTERVAL 90 DAY`); `fee_stats` and the rollups (`stats_hourly`, `volume_*`) are small, keep them.
 
 ## Useful operational queries
 

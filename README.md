@@ -63,7 +63,8 @@ History before the syncer's start ledger is filled with the range-ingest CLI; re
 sizing):
 
 ```bash
-pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000
+pnpm build                                  # ingest:range runs the compiled dist/cli/range-ingest.js
+pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000     # reads apps/syncer/.env like the syncer (or set GH_ENV=local and the variables)
 ```
 
 ## Build and test
@@ -103,7 +104,7 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Payments | `/v2/payments[/{currency}]` |
 | Exchanges | `/v2/exchanges/{base}/{counter}` (raw, `interval` candles, `reduce`), `/v2/exchanges` (all pairs, extra) |
 | Rates | `/v2/exchange_rates/{base}/{counter}`, `/v2/normalize` |
-| Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]`, `.../stats/{transactions|value}` |
+| Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]`, `.../stats/{transactions\|value}` |
 | Markets | `/v2/active_accounts/{base}/{counter}` |
 | Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
@@ -123,7 +124,7 @@ it needs. The images need your npm token at build time as a BuildKit secret.
 cp deploy/.env.prod.example deploy/.env.prod                 # fill in the secrets, TRUSTED_PROXIES, NGINX_BIND
 export NPM_TOKEN=...                                         # BuildKit secret, never baked into an image
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --build
-docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --scale api-xrpl=3 --scale api-xahau=2   # scale the read tier; never a syncer
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --scale api-xrpl=3 --scale api-xahau=2   # scale the read tier (repeat the flags on every up); never a syncer
 ```
 
 Moving an existing host from the previous single-network stack: add `--remove-orphans` (the old `migrate` / `syncer` / `api` containers are orphans,

@@ -73,7 +73,8 @@ Integers are plain digits (`1.5`, `1e3` are rejected).
 **Root cause 1:** an old healthcheck used `wget`, which the slim image does not have; the current ones use Node's `fetch`.
 **Root cause 2 (syncer):** the syncer opens its probe port only once its node connection is up, and answers 503 while it is more than
 `GH_MAX_LAG_HEALTHY` ledgers behind for over a minute (catch-up, backfill). `unhealthy` is informational; compose restarts nothing on it.
-**Fix:** check the probe body (`curl localhost:3002/liveliness/healthz` inside the network): `state`, `lag`, `last_commit_age`.
+**Fix:** read the probe body, with Node (the slim images have no `curl`):
+`docker compose exec syncer-xrpl node -e "fetch('http://127.0.0.1:3002/liveliness/healthz').then(r=>r.text()).then(console.log)"` and look at `state`, `lag`, `last_commit_age`.
 
 ### ClickHouse Keeper stuck "unhealthy" -> ClickHouse will not start
 **Root cause:** the healthcheck `echo ruok | nc localhost 9181` hung; this image's `nc` has no `-q`. **Fix:**

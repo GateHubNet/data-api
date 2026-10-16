@@ -127,8 +127,9 @@ visible as lag that does not shrink. Point `GH_NODE_ENDPOINTS` at a full-history
 For history, gaps and parser changes. It runs next to the live syncer, in the same image:
 
 ```bash
-# from source (needs the same GH_* environment as the syncer)
-pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000
+# from source: `ingest:range` runs the compiled dist/cli/range-ingest.js, so run `pnpm build` first; it needs the syncer's GH_* environment
+# (apps/syncer/.env, or GH_ENV=local with the variables exported)
+pnpm build && GH_ENV=local pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000
 
 # in the container stack
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
