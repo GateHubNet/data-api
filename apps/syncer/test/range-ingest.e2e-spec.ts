@@ -512,7 +512,7 @@ describe('rangeIngest (e2e)', () => {
   });
 
   describe('recovery', () => {
-    it("redo of a 'started' intent deletes and rewrites the chunk", async () => {
+    it("closes a 'started' intent whose ledgers are all committed, without fetching or rewriting them", async () => {
       const svc = await freshService();
       // A run that crashed after the commit and before it marked the chunk done: all 14 ledgers are in, the intent is open.
       await new LedgerWriter(svc, ctx, { runId: 'crashed-run' }).write(CHAIN_RAW.slice(0, 14));
@@ -521,9 +521,9 @@ describe('rangeIngest (e2e)', () => {
 
       const result = await rangeIngest(source, svc, ctx, { from: L(1), to: L(30), ...FAST });
 
-      // The first chunk was redone although its ledgers were committed; the second was new.
-      expect(result).toEqual({ chunksDone: 2, ledgers: 30 });
-      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(1), L(30)));
+      // A committed ledger is complete (its commit marker went in after all of its rows): only the second chunk is new.
+      expect(result).toEqual({ chunksDone: 2, ledgers: 16 });
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(15), L(30)));
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW, CHAIN_TABLES));
       await expectNoDuplicateTransactions(svc);
       expect((await intents(svc)).map((i) => i.status)).toEqual(['done', 'done']);
@@ -551,9 +551,9 @@ describe('rangeIngest (e2e)', () => {
 
       const result = await rangeIngest(source, svc, ctx, { from: L(1), to: L(14), ...FAST });
 
-      // Only the intent is redone: the other ledgers are committed, and a committed ledger is complete.
-      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(6), L(10)));
-      expect(result).toEqual({ chunksDone: 1, ledgers: 5 });
+      // Every ledger of the intent is committed, and a committed ledger is complete: nothing to fetch, the intent is closed.
+      expect(source.fetches).toEqual([]);
+      expect(result).toEqual({ chunksDone: 1, ledgers: 0 });
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 14), CHAIN_TABLES));
       await expectNoDuplicateTransactions(svc);
       expect((await intents(svc)).map((i) => [i.start, i.end, i.status])).toEqual([[L(6), L(10), 'done']]);
@@ -561,8 +561,10 @@ describe('rangeIngest (e2e)', () => {
 
     it('closes an unfinished intent wider than the chunks of this run as soon as it is redone, so a failing run cannot redo it forever (F5)', async () => {
       const svc = await freshService();
-      // A run with chunks of 1000 died while writing L(1)..L(14): child rows without a commit, the intent open.
-      await insertUncommitted(svc, CHAIN_RAW.slice(0, 5));
+      // A run with chunks of 1000 died while writing L(1)..L(14): L(1)..L(3) committed, child rows of L(4)..L(8) without a
+      // commit, the intent open.
+      await new LedgerWriter(svc, ctx, { runId: 'crashed-run' }).write(CHAIN_RAW.slice(0, 3));
+      await insertUncommitted(svc, CHAIN_RAW.slice(3, 8));
       await seedIntent(svc, L(1), 9_999_999, 'crashed-run');
       // This run uses chunks of 5, and the node lacks L(28) for now: the run fails on a later chunk.
       const lacking = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(28)));
@@ -570,7 +572,9 @@ describe('rangeIngest (e2e)', () => {
 
       await expect(rangeIngest(lacking, svc, ctx, options)).rejects.toBeInstanceOf(LedgerNotAvailableError);
 
-      // The intent was redone over its whole range (14 ledgers, more than a chunk of this run) and closed.
+      // The committed ledgers of the intent were not fetched again.
+      expect(lacking.fetches.filter((i) => i <= L(3))).toEqual([]);
+      // The intent was redone over its whole range (11 ledgers to write, more than a chunk of this run) and closed.
       const old = (await intents(svc)).find((i) => i.start === L(1) && i.end === 9_999_999);
       expect(old?.status).toBe('done');
       expect((await committedIndexes(svc)).filter((i) => i <= 9_999_999)).toEqual(range(L(1), 9_999_999));
@@ -594,10 +598,11 @@ describe('rangeIngest (e2e)', () => {
       await seedIntent(svc, L(5), L(8), 'crashed-b');
       const source = new TestSource(CHAIN_RAW);
 
-      // The run asks for L(1)..L(6) only: L(7) and L(8) are not written, but their orphan rows go.
+      // The run asks for L(1)..L(6) only: L(5) and L(6) are written, L(7) and L(8) are not, but their orphan rows go; the
+      // committed L(1)..L(4) are kept as they are.
       await rangeIngest(source, svc, ctx, { from: L(1), to: L(6), ...FAST });
 
-      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(1), L(6)));
+      expect(source.fetches.sort((a, b) => a - b)).toEqual([L(5), L(6)]);
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(6)));
       expect(await rowsAbove(svc, L(6))).toEqual(noRows());
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 6), CHAIN_TABLES));
@@ -976,20 +981,25 @@ describe('rangeIngest (e2e)', () => {
     });
 
     it('redo of an unfinished intent whose ledger the source lacks leaves the committed rows intact, and the intent open', async () => {
-      const svc = await committedChunk();
+      const svc = await freshService();
+      // A crashed run committed L(1)..L(10) and left child rows of L(11) and L(12) behind.
+      await new LedgerWriter(svc, ctx, { runId: 'crashed-run' }).write(CHAIN_RAW.slice(0, 10));
+      await insertUncommitted(svc, CHAIN_RAW.slice(10, 12));
       await seedIntent(svc, L(1), 9_999_999, 'crashed-run');
-      const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(3)));
+      const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(12)));
 
       await expect(rangeIngest(source, svc, ctx, { from: L(1), to: L(14), ...FAST })).rejects.toBeInstanceOf(
         LedgerNotAvailableError,
       );
 
-      await expectChunkIntact(svc);
+      // Nothing was deleted: the replacement could not be fetched.
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(source.fetches.filter((i) => i <= L(10))).toEqual([]);
       expect((await intents(svc)).map((i) => i.status)).toEqual(['started']);
 
-      // The node has the ledger again: the open intent is redone.
+      // The node has the ledger again: the open intent is redone (the uncommitted part of it) and closed.
       const result = await rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST });
-      expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
+      expect(result).toEqual({ chunksDone: 1, ledgers: 4 });
       await expectChunkIntact(svc);
       await expectNoDuplicateTransactions(svc);
       expect((await intents(svc)).map((i) => i.status)).toEqual(['done']);
@@ -1184,7 +1194,8 @@ describe('rangeIngest (e2e)', () => {
       const source = new TestSource(CHAIN_RAW);
       const fetch = source.fetch.bind(source);
       jest.spyOn(source, 'fetch').mockImplementation(async (index) => {
-        if (index === L(1)) await seedLease(svc, 'host:2:def', 0);
+        // The redo fetches only what is not committed: the live syncer starts while L(11) is fetched.
+        if (index === L(11)) await seedLease(svc, 'host:2:def', 0);
         return fetch(index);
       });
 

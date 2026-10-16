@@ -69,8 +69,8 @@ A range that runs into ledgers already committed simply skips them (unless `--re
 ### Resuming, gap repair, reprocessing
 
 - **Resume:** rerun the same command, or one with another `--chunk`: finished chunks (`ingest_log` `done`) are skipped, and an
-  unfinished one (an intent a failed or killed run left `started`) is redone over its whole recorded range first and closed, so
-  it is redone once whatever the chunk size of the rerun.
+  unfinished one (an intent a failed or killed run left `started`) is redone over its whole recorded range first and closed (its
+  committed ledgers are kept, the rest is cleaned and written), so it is redone once whatever the chunk size of the rerun.
 - **Gaps:** find them with the SQL in [operations](operations.md#sql-health-checks) and ingest exactly those ranges.
 - **Reprocess:** after a parser change (the `parser_version` of `ledgers` records which parser wrote a ledger),
   `--reprocess --from A --to B` fetches and dry-parses first, then deletes and rewrites the committed ledgers of the range.

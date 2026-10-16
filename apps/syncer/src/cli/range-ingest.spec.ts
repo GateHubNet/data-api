@@ -1,4 +1,4 @@
-import { deleteSpans, main, parseRangeIngestArgs, USAGE, UsageError } from './range-ingest';
+import { deleteSpans, main, parseRangeIngestArgs, uncommittedSpans, USAGE, UsageError } from './range-ingest';
 
 describe('parseRangeIngestArgs', () => {
   it('reads the flags of the CLI', () => {
@@ -108,5 +108,23 @@ describe('deleteSpans', () => {
   it('ignores kept ledgers outside the targets', () => {
     expect(deleteSpans([10, 11, 12], [1, 2, 3, 20, 21])).toEqual([[10, 12]]);
     expect(deleteSpans([10, 15], [1, 9, 16, 17])).toEqual([[10, 15]]);
+  });
+});
+
+describe('uncommittedSpans', () => {
+  it('is the whole range when nothing is committed, and nothing when everything is', () => {
+    expect(uncommittedSpans(10, 20, [])).toEqual([[10, 20]]);
+    expect(uncommittedSpans(10, 12, [10, 11, 12])).toEqual([]);
+  });
+
+  it('is the gaps between, before and after the committed ledgers', () => {
+    expect(uncommittedSpans(10, 20, [10, 11, 14, 20])).toEqual([
+      [12, 13],
+      [15, 19],
+    ]);
+    expect(uncommittedSpans(10, 20, [12])).toEqual([
+      [10, 11],
+      [13, 20],
+    ]);
   });
 });

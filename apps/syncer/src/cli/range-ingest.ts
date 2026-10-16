@@ -717,10 +717,12 @@ class RangeRunner {
   /**
    * Ruling R100: redo every unfinished intent over its own recorded range, whatever the chunk size of this run is, and
    * close it. Overlapping intents are merged and redone as one. For each such range, before any chunk of this run:
-   *  - the ledgers to write are the ones committed in it now (a committed ledger is complete, but the intent may have been
-   *    a reprocess that deleted others) and the ones this run would ingest in it;
-   *  - they are fetched and parsed, then the whole range is deleted (which also takes the child rows that a crashed write
-   *    left for ledgers that are not written now), then they are written, as one chunk with its own intent row;
+   *  - a ledger that is committed in it is complete (its commit marker went in after all of its rows) and is kept as it
+   *    is: neither fetched nor rewritten;
+   *  - the ledgers to write are the uncommitted ones this run would ingest in it; they are fetched and parsed, then every
+   *    uncommitted span of the range is deleted (which also takes the child rows that a crashed write left for ledgers
+   *    that are not written now), then they are written, as one chunk with its own intent row (nothing of this when the
+   *    whole range is committed);
    *  - every intent of the range gets a 'done' row.
    * A redo that fails leaves the intents open, and the next run redoes them again; one that succeeds closes them, so no
    * intent is redone by every run after it (F5: a run with a smaller `--chunk` than the one that died kept rewriting the
@@ -742,16 +744,23 @@ class RangeRunner {
       const startedAt = Date.now();
       await this.assertNoLiveSyncer(group.end);
       const committed = await this.committedIn(group.start, group.end);
-      const toWrite = [...new Set([...committed.keys(), ...this.targetsIn(group.start, group.end)])].sort(
-        (a, b) => a - b,
+      const toWrite = this.targetsIn(group.start, group.end).filter((i) => !committed.has(i));
+      const gaps = uncommittedSpans(
+        group.start,
+        group.end,
+        [...committed.keys()].sort((a, b) => a - b),
       );
-      const chunk: Chunk = { start: group.start, end: group.end, targets: toWrite };
-      const ledgers = await this.writeWithRecovery(chunk, toWrite, [[group.start, group.end]], true);
-      await this.logIntent(chunk, this.writer.runId, 'done');
+      let ledgers: RawLedger[] = [];
+      let groupClosed = false;
+      if (gaps.length > 0) {
+        const chunk: Chunk = { start: group.start, end: group.end, targets: toWrite };
+        ledgers = await this.writeWithRecovery(chunk, toWrite, gaps, true);
+        await this.logIntent(chunk, this.writer.runId, 'done');
+        groupClosed = true;
+      }
       for (const intent of group.members) {
-        if (intent.start !== group.start || intent.end !== group.end) {
-          await this.writeIntent(intent.start, intent.end, this.writer.runId, 'done');
-        }
+        if (groupClosed && intent.start === group.start && intent.end === group.end) continue;
+        await this.writeIntent(intent.start, intent.end, this.writer.runId, 'done');
       }
       if (ledgers.length > 0) await this.markAggregatesDirty(closeWindowOf(ledgers));
       for (const ledger of ledgers) this.redone.add(ledger.header.ledger_index);
@@ -844,6 +853,18 @@ function networkOf(ctx: ParseContext): string {
     if (getNetworkProfile(name).networkId === ctx.networkId) return name;
   }
   throw new Error(`No network has the CTID network id ${ctx.networkId}: pass the network option`);
+}
+
+/** The spans of `[start, end]` that hold no ledger of `committed` (ascending, all inside the range). */
+export function uncommittedSpans(start: number, end: number, committed: number[]): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  let from = start;
+  for (const index of committed) {
+    if (index > from) spans.push([from, index - 1]);
+    from = Math.max(from, index + 1);
+  }
+  if (from <= end) spans.push([from, end]);
+  return spans;
 }
 
 /**

@@ -185,10 +185,10 @@ How it works (aligned chunks, `ingest_log` intents):
    untouched), the chunk is written with one `LedgerWriter.write()`, then `ingest_log` gets `done`.
 3. A chunk whose newest log row is `started` is an **unfinished intent**: a run died (or gave up) in the middle of it. The next run
    whose range overlaps it waits for that run's queries to be gone, then, **before its own chunks**, redoes the intent over its
-   whole recorded range, whatever `--chunk` is now (overlapping intents as one range): it fetches the ledgers committed in the
-   range and the ones it would ingest there, dry-parses them, deletes the whole range (with the child rows a crashed write left)
-   and writes them; then the intent gets `done`. So an intent is redone once, not by every run after it, and changing `--chunk`
-   between runs is safe.
+   whole recorded range, whatever `--chunk` is now (overlapping intents as one range): a ledger committed in the range is complete
+   and stays as it is; the uncommitted ledgers it would ingest there are fetched and dry-parsed, then every uncommitted span of
+   the range is deleted (with the child rows a crashed write left) and they are written; then the intent gets `done`. So an
+   intent is redone once, not by every run after it, and changing `--chunk` between runs is safe.
 4. Every written chunk marks its hour range in **`agg_dirty`** so the aggregator recomputes the stats and daily volumes. Committed
    ledgers a run skipped get one row at the end.
 5. A failed attempt is recovered like a failed live write (wait for the queries, delete the chunk, new `runId`); a chunk gets 3
