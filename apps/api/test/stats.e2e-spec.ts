@@ -8,6 +8,7 @@ import {
   Table,
 } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureSource, SeedName } from './support/fixtures';
 
 /**
@@ -817,7 +818,7 @@ describe('GET /v2/stats against the mock ledgers', () => {
       const res = await get('/v2/stats?format=csv');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=stats.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('stats'));
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 7);
       const header = rows[0].split(',').map((c) => c.replace(/"/g, ''));
@@ -834,7 +835,7 @@ describe('GET /v2/stats against the mock ledgers', () => {
 
     it('a family is a flat list: its columns and the date last, in a file named after the family', async () => {
       const res = await get('/v2/stats/metric?format=csv');
-      expect(res.headers['content-disposition']).toBe('attachment; filename=stats metric.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('stats metric'));
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 7);
       // one column per name found in any row, in the order of first appearance (a row has no key for what is zero)
@@ -848,15 +849,15 @@ describe('GET /v2/stats against the mock ledgers', () => {
       const name = async (path: string): Promise<string | undefined> =>
         (await get(path)).headers['content-disposition'];
       expect(await name('/v2/stats/metric/ledger_count?format=csv')).toBe(
-        'attachment; filename=stats metric-metric:ledger_count.csv',
+        csvDisposition('stats metric-metric:ledger_count'),
       );
       expect(await name('/v2/stats/metric?format=csv&metrics=ledger_count,tx_per_ledger')).toBe(
-        'attachment; filename=stats metric-metric:ledger_count-metric:tx_per_ledger.csv',
+        csvDisposition('stats metric-metric:ledger_count-metric:tx_per_ledger'),
       );
       expect(await name('/v2/stats?format=csv&family=Type&metrics=Payment')).toBe(
-        'attachment; filename=stats type-type:Payment.csv',
+        csvDisposition('stats type-type:Payment'),
       );
-      expect(await name('/v2/stats/result?format=csv')).toBe('attachment; filename=stats result.csv');
+      expect(await name('/v2/stats/result?format=csv')).toBe(csvDisposition('stats result'));
     });
 
     it('a metric file has the metric and the date', async () => {

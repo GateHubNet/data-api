@@ -3,7 +3,7 @@ import { Test } from '@nestjs/testing';
 import { Request, Response } from 'express';
 import { convert, expressDecorator } from 'nice-json2csv';
 import request from 'supertest';
-import { Csv, CsvInterceptor, flattenJSON, wantsCsv } from './csv.interceptor';
+import { Csv, csvContentDisposition, CsvInterceptor, flattenJSON, wantsCsv } from './csv.interceptor';
 import { badRequest } from './errors';
 import { RippleController } from './ripple-controller';
 
@@ -69,6 +69,12 @@ class RowsController {
     return { result: 'success', count: 1, rows: [{ x: req.query.account }] };
   }
 
+  @Get('named-by-query')
+  @Csv((req) => String(req.query.name), 'rows')
+  namedByQuery() {
+    return { result: 'success', rows: [{ x: 1 }] };
+  }
+
   @Get('hostile-name')
   @Csv(() => 'line\nbreak € "quoted"', 'rows')
   hostileName() {
@@ -102,6 +108,10 @@ describe('Csv', () => {
 
   const get = (url: string) => request(app.getHttpServer()).get(url);
 
+  /** The file name a client reads from a Content-Disposition: the UTF-8 `filename*` (RFC 6266 prefers it). */
+  const fileNameOf = (header: string): string =>
+    decodeURIComponent(/filename\*=UTF-8''([^;]*)/.exec(header)?.[1] ?? 'no filename* in the header');
+
   it('adds one CsvInterceptor to the route', () => {
     const metadata = Reflect.getMetadata(INTERCEPTORS_METADATA, RowsController.prototype.nested);
     expect(metadata).toHaveLength(1);
@@ -128,7 +138,7 @@ describe('Csv', () => {
       const res = await get('/v2/rows/nested?format=csv');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toBe('text/csv; charset=utf-8');
-      expect(res.headers['content-disposition']).toBe('attachment; filename=nested.csv');
+      expect(res.headers['content-disposition']).toBe(`attachment; filename="nested.csv"; filename*=UTF-8''nested.csv`);
       expect(res.text).toBe(String.raw`"a.b","c[0].d"` + '\n' + `"1","2"`);
     });
 
@@ -136,10 +146,12 @@ describe('Csv', () => {
       const original = await get('/v2/rows/original');
       const ours = await get('/v2/rows/nested?format=csv');
       expect(original.headers['content-disposition']).toBe('attachment; filename=nested.csv');
-      for (const header of ['content-type', 'content-disposition', 'content-length', 'etag']) {
+      for (const header of ['content-type', 'content-length', 'etag']) {
         expect(ours.headers[header]).toBeDefined();
         expect(ours.headers[header]).toBe(original.headers[header]);
       }
+      // the same file name, quoted and also given as UTF-8 (M12): the original's was unquoted
+      expect(fileNameOf(ours.headers['content-disposition'])).toBe('nested.csv');
       expect(ours.text).toBe(original.text);
       expect(ours.status).toBe(original.status);
     });
@@ -197,7 +209,9 @@ describe('Csv', () => {
         const res = await get(`/v2/rows/${route}?format=csv`);
         expect(res.status).toBe(200);
         expect(res.headers['content-type']).toMatch(/^text\/csv/);
-        expect(res.headers['content-disposition']).toBe(`attachment; filename=${route}.csv`);
+        expect(res.headers['content-disposition']).toBe(
+          `attachment; filename="${route}.csv"; filename*=UTF-8''${route}.csv`,
+        );
         expect(res.text).toBe('');
       }
     });
@@ -210,16 +224,50 @@ describe('Csv', () => {
     it('lets the route name the file from the request and the body', async () => {
       const res = await get('/v2/rows/named?format=csv&account=rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh');
       expect(res.headers['content-disposition']).toBe(
-        'attachment; filename=rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh - 1 rows.csv',
+        `attachment; filename="rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh - 1 rows.csv"; ` +
+          `filename*=UTF-8''rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh%20-%201%20rows.csv`,
       );
+      expect(fileNameOf(res.headers['content-disposition'])).toBe('rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh - 1 rows.csv');
       expect(res.text).toBe('"x"\n"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"');
     });
 
-    it('replaces what a header cannot carry in a file name instead of failing the route', async () => {
+    it('replaces a control character of a file name, quotes the name and gives it in UTF-8 too (M12)', async () => {
       const res = await get('/v2/rows/hostile-name?format=csv');
       expect(res.status).toBe(200);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=line_break _ "quoted".csv');
+      expect(res.headers['content-disposition']).toBe(
+        String.raw`attachment; filename="line_break _ \"quoted\".csv"; ` +
+          `filename*=UTF-8''line_break%20%E2%82%AC%20%22quoted%22.csv`,
+      );
+      expect(fileNameOf(res.headers['content-disposition'])).toBe('line_break € "quoted".csv');
     });
+
+    it('a lone surrogate in a name is replaced instead of failing the route', () => {
+      expect(csvContentDisposition('a\uD800b')).toBe(`attachment; filename="a_b.csv"; filename*=UTF-8''a_b.csv`);
+    });
+
+    it.each([
+      ['a semicolon', 'USD; x=1', `filename="USD; x=1.csv"; filename*=UTF-8''USD%3B%20x%3D1.csv`],
+      ['a quote and a backslash', 'a"b\\c', String.raw`filename="a\"b\\c.csv"; filename*=UTF-8''a%22b%5Cc.csv`],
+      [
+        'spaces',
+        'payments - USD rIssuer',
+        `filename="payments - USD rIssuer.csv"; filename*=UTF-8''payments%20-%20USD%20rIssuer.csv`,
+      ],
+      ['non-ASCII text', 'Zürich €', `filename="Z_rich _.csv"; filename*=UTF-8''Z%C3%BCrich%20%E2%82%AC.csv`],
+      [
+        "what RFC 5987 does not allow raw: ' ( ) *",
+        "o'k (1)*",
+        `filename="o'k (1)*.csv"; filename*=UTF-8''o%27k%20%281%29%2A.csv`,
+      ],
+    ])(
+      'a name with %s is one parameter, and the UTF-8 form is the name itself (M12)',
+      async (_what, name, expected) => {
+        const res = await get(`/v2/rows/named-by-query?format=csv&name=${encodeURIComponent(name)}`);
+        expect(res.status).toBe(200);
+        expect(res.headers['content-disposition']).toBe(`attachment; ${expected}`);
+        expect(fileNameOf(res.headers['content-disposition'])).toBe(`${name}.csv`);
+      },
+    );
 
     it('leaves an error of the route alone: the Ripple error body and status, no CSV', async () => {
       const res = await get('/v2/rows/fails?format=csv');

@@ -2,6 +2,7 @@ import { Table, ValidationsRow } from '@gatehub/data-api-shared';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 
 /**
  * `GET /v2/ledgers/:ledger_hash/validations[/:pubkey]` (and the singular `/v2/ledger/...`) on a real ClickHouse, seeded
@@ -277,7 +278,7 @@ describe('ledger validations (the original test.validations.js)', () => {
   it('should get ledger validations in CSV format', async () => {
     const res = await get(`/v2/ledgers/${H}/validations?format=csv`);
     expect(res.status).toBe(200);
-    expect(res.headers['content-disposition']).toBe(`attachment; filename=${H} - validations.csv`);
+    expect(res.headers['content-disposition']).toBe(csvDisposition(`${H} - validations`));
   });
 
   it('should get a specific ledger validation', async () => {
@@ -592,7 +593,7 @@ describe('GET /v2/ledgers/:ledger_hash/validations', () => {
       );
 
       const csv = await get(`/v2/ledger/${H}/validations?format=csv`);
-      expect(csv.headers['content-disposition']).toBe(`attachment; filename=${H} - validations.csv`);
+      expect(csv.headers['content-disposition']).toBe(csvDisposition(`${H} - validations`));
       expect(csv.text).toBe((await get(`/v2/ledgers/${H}/validations?format=csv`)).text);
     });
 
@@ -671,7 +672,7 @@ describe('GET /v2/ledgers/:ledger_hash/validations', () => {
       const res = await get(`/v2/ledgers/${H.toLowerCase()}/validations?format=csv`);
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe(`attachment; filename=${H} - validations.csv`);
+      expect(res.headers['content-disposition']).toBe(csvDisposition(`${H} - validations`));
       expect(lines(res.text)).toHaveLength(1 + 4);
     });
 
@@ -1145,7 +1146,7 @@ describe('GET /v2/ledgers/:ledger_hash/validations on Xahau', () => {
     expect((await get(`/v2/ledgers/${XAHAU_HASH}/validations?limit=1`)).body.marker).toBe(markerOf(V1));
     expect((await get(`/v2/ledger/${XAHAU_HASH}/validations/${V2}`)).body).toEqual({ ...full, result: 'success' });
     expect((await get(`/v2/ledgers/${XAHAU_HASH}/validations?format=csv`)).headers['content-disposition']).toBe(
-      `attachment; filename=${XAHAU_HASH} - validations.csv`,
+      csvDisposition(`${XAHAU_HASH} - validations`),
     );
     expect((await get(`/v2/ledgers/${'AB'.repeat(32)}/validations/${V1}`)).status).toBe(404);
   });

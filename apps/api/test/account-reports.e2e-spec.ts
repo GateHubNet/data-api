@@ -1,6 +1,7 @@
 import { AccountPaymentsRow, ExchangesRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureAccountPayments, fixtureExchanges, fixtureSource } from './support/fixtures';
 
 /**
@@ -805,7 +806,7 @@ describe('account reports API endpoint', () => {
       const res = await get(`${path(SINGLE)}${qs({ start: '2015-01-13', end: '2015-01-15', format: 'csv' })}`);
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe(`attachment; filename=${SINGLE} - reports.csv`);
+      expect(res.headers['content-disposition']).toBe(csvDisposition(`${SINGLE} - reports`));
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 3);
       expect(rows[0].split(',')).toEqual([

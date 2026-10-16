@@ -1,6 +1,7 @@
 import { AccountTransactionsRow, BalanceChangesRow, ExchangesRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureAccountTransactions, fixtureBalanceChanges, fixtureExchanges } from './support/fixtures';
 
 /**
@@ -926,7 +927,7 @@ describe('account stats API endpoint', () => {
     it('is named <address> - stats.<family>', async () => {
       for (const family of ['transactions', 'value']) {
         const res = await get(`${path(TRADER, family)}?format=csv`);
-        expect(res.headers['content-disposition']).toBe(`attachment; filename=${TRADER} - stats.${family}.csv`);
+        expect(res.headers['content-disposition']).toBe(csvDisposition(`${TRADER} - stats.${family}`));
       }
     });
 
@@ -1779,7 +1780,7 @@ describe('account stats on Xahau (XAH is the native currency)', () => {
     );
     expect((await get(`${path(SENDER)}?start=2026-10-16`)).body.rows).toEqual([]);
     const csv = await get(`${path(BUSY, 'value')}?format=csv`);
-    expect(csv.headers['content-disposition']).toBe(`attachment; filename=${BUSY} - stats.value.csv`);
+    expect(csv.headers['content-disposition']).toBe(csvDisposition(`${BUSY} - stats.value`));
     expect(csv.text.split('\n')).toHaveLength(2);
     expect(csv.text).not.toContain('XRP');
   });

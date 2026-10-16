@@ -1,5 +1,6 @@
 import { Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, rippledError, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { Ledger, ledgerClock, liveNode, NodeRequest, trustLine } from './support/live-node';
 
 /**
@@ -637,7 +638,7 @@ describe('GET /v2/accounts/:address/balances', () => {
         const res = await api.get(`${path()}?format=csv`);
         expect(res.status).toBe(200);
         expect(res.headers['content-type']).toMatch(/^text\/csv/);
-        expect(res.headers['content-disposition']).toBe(`attachment; filename=${ACCOUNT} - balances.csv`);
+        expect(res.headers['content-disposition']).toBe(csvDisposition(`${ACCOUNT} - balances`));
         expect(res.text.split('\n')).toEqual([
           '"currency","value","counterparty"',
           '"XRP","100",""',

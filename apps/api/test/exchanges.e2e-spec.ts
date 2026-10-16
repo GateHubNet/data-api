@@ -2,6 +2,7 @@ import { Asset, ExchangesRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { bucketExpr, bucketStart, EXCHANGE_INTERVALS } from '../src/exchanges/exchange-intervals';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { FixtureExchange, fixtureExchanges, fixtureSource } from './support/fixtures';
 import { expectBoundedInOrderRead, explain, tableReads } from './support/plans';
 
@@ -1368,7 +1369,7 @@ describe('exchanges API endpoint', () => {
       const res = await get(`/v2/exchanges/${PAIR}?format=csv`);
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=exchanges - USD-XRP.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('exchanges - USD-XRP'));
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 5);
       expect(rows[0]).toBe(CSV_COLUMNS.map((c) => `"${c}"`).join(','));
@@ -1401,7 +1402,7 @@ describe('exchanges API endpoint', () => {
 
     it('is named after the pair as it was asked for: exchanges - BASE-COUNTER', async () => {
       const reversed = await get(`/v2/exchanges/xrp/${USD}?format=csv`);
-      expect(reversed.headers['content-disposition']).toBe('attachment; filename=exchanges - XRP-USD.csv');
+      expect(reversed.headers['content-disposition']).toBe(csvDisposition('exchanges - XRP-USD'));
       // the first row is the same exchange, the other way round
       const header = lines(reversed.text)[0].split(',');
       expect(header).toEqual(CSV_COLUMNS.map((c) => `"${c}"`));
@@ -2201,7 +2202,7 @@ describe('exchanges API endpoint', () => {
       const res = await get(`/v2/exchanges/xrp/${USD}?interval=1minute&format=csv`);
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=exchanges - XRP-USD.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('exchanges - XRP-USD'));
       const rows = res.text.split('\n');
       expect(rows).toHaveLength(1 + 4);
       expect(rows[0]).toBe(AGGREGATE_CSV_COLUMNS.map((c) => `"${c}"`).join(','));
@@ -2213,7 +2214,7 @@ describe('exchanges API endpoint', () => {
       );
       // the reduced row
       const reduced = await get(`/v2/exchanges/${PAIR}?reduce=true&format=csv`);
-      expect(reduced.headers['content-disposition']).toBe('attachment; filename=exchanges - USD-XRP.csv');
+      expect(reduced.headers['content-disposition']).toBe(csvDisposition('exchanges - USD-XRP'));
       const lines = reduced.text.split('\n');
       expect(lines).toHaveLength(2);
       expect(lines[0]).toBe(AGGREGATE_CSV_COLUMNS.map((c) => `"${c}"`).join(','));
@@ -2420,7 +2421,7 @@ describe('exchanges API endpoint', () => {
     it('format=csv gives the same columns, named exchanges.csv', async () => {
       const res = await get('/v2/exchanges?format=csv&limit=400');
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=exchanges.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('exchanges'));
       const rows = res.text.split('\n');
       expect(rows).toHaveLength(1 + 158);
       expect(rows[0]).toBe(CSV_COLUMNS.map((c) => `"${c}"`).join(','));
@@ -2791,7 +2792,7 @@ describe('exchanges API endpoint on Xahau (synthetic rows: the recorded ledgers 
   it('format=csv is named after the pair', async () => {
     const res = await get(`/v2/exchanges/xah/USD+${ISSUER}?format=csv`);
     expect(res.headers['content-type']).toMatch(/^text\/csv/);
-    expect(res.headers['content-disposition']).toBe('attachment; filename=exchanges - XAH-USD.csv');
+    expect(res.headers['content-disposition']).toBe(csvDisposition('exchanges - XAH-USD'));
     expect(res.text.split('\n')).toHaveLength(1 + 3);
   });
 });

@@ -1,5 +1,6 @@
 import { BalanceChangesRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureBalanceChanges } from './support/fixtures';
 import { expectBoundedInOrderRead } from './support/plans';
 
@@ -1051,13 +1052,13 @@ describe('account balance changes API endpoint', () => {
 
     it('is named after the account, then the currency in upper case: <address> - balance changes XRP', async () => {
       const plain = await get(`${path(SENDER)}?format=csv`);
-      expect(plain.headers['content-disposition']).toBe(`attachment; filename=${SENDER} - balance changes.csv`);
+      expect(plain.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - balance changes`));
       const currency = await get(`${path(SENDER)}?format=csv&currency=xrp`);
-      expect(currency.headers['content-disposition']).toBe(`attachment; filename=${SENDER} - balance changes XRP.csv`);
+      expect(currency.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - balance changes XRP`));
       expect(lines(currency.text)).toHaveLength(1 + 4);
       // the counterparty and the type do not name the file
       const other = await get(`${path(TRADER)}?format=csv&type=exchange&issuer=${GATEWAY}&limit=2`);
-      expect(other.headers['content-disposition']).toBe(`attachment; filename=${TRADER} - balance changes.csv`);
+      expect(other.headers['content-disposition']).toBe(csvDisposition(`${TRADER} - balance changes`));
     });
 
     it('format is case-insensitive, and anything but csv is JSON', async () => {
@@ -1218,7 +1219,7 @@ describe('account balance changes API endpoint on the xahau-recorded ledgers', (
     expect(res.body.balance_changes).toEqual(changesOf(list.filter((r) => r.close_time >= mid)));
     expect((await get(`${path(EVERNODE)}?start=2030-01-01`)).body.count).toBe(0);
     const csv = await get(`${path(EVERNODE)}?format=csv&currency=evr&limit=5`);
-    expect(csv.headers['content-disposition']).toBe(`attachment; filename=${EVERNODE} - balance changes EVR.csv`);
+    expect(csv.headers['content-disposition']).toBe(csvDisposition(`${EVERNODE} - balance changes EVR`));
     expect(csv.text.split('\n')).toHaveLength(1 + 5);
   });
 });

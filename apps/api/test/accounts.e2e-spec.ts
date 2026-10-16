@@ -1,5 +1,6 @@
 import { AccountsCreatedRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { FixtureAccount, fixtureAccountsCreated } from './support/fixtures';
 import { expectBoundedInOrderRead } from './support/plans';
 
@@ -750,7 +751,7 @@ describe('accounts API endpoint', () => {
       const res = await get('/v2/accounts?format=csv');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=accounts.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('accounts'));
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 13);
       expect(rows[0].split(',')).toEqual([
@@ -1238,7 +1239,7 @@ describe('accounts API endpoint on Xahau', () => {
     it('format=csv is accounts.csv', async () => {
       const res = await get('/v2/accounts?format=csv');
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=accounts.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('accounts'));
       expect(res.text.split('\n')).toHaveLength(1 + 4);
     });
   });

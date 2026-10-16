@@ -1,5 +1,6 @@
 import { AccountExchangesRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureAccountExchanges, fixtureExchanges, fixtureSource } from './support/fixtures';
 import { expectBoundedInOrderRead } from './support/plans';
 
@@ -950,7 +951,7 @@ describe('account exchanges API endpoint', () => {
       for (const [filter, name] of cases) {
         const res = await get(`${path(MULTI, filter)}?format=csv`);
         expect([filter, res.headers['content-type']]).toEqual([filter, expect.stringMatching(/^text\/csv/)]);
-        expect([filter, res.headers['content-disposition']]).toEqual([filter, `attachment; filename=${name}.csv`]);
+        expect([filter, res.headers['content-disposition']]).toEqual([filter, csvDisposition(`${name}`)]);
       }
     });
 
@@ -1124,7 +1125,7 @@ describe('account exchanges API endpoint on the xahau-recorded ledgers', () => {
 
   it('the file name and the markers of a filtered list use XAH', async () => {
     const csv = await get(`${path(TRADER_X, '/xah/evr')}?format=csv`);
-    expect(csv.headers['content-disposition']).toBe(`attachment; filename=${TRADER_X} - exchanges - XAH-EVR.csv`);
+    expect(csv.headers['content-disposition']).toBe(csvDisposition(`${TRADER_X} - exchanges - XAH-EVR`));
     expect(csv.text.split('\n')).toHaveLength(2);
     expect((await get(`${path(TRADER_X)}?start=2030-01-01`)).body.count).toBe(0);
     const before = await get(`${path(TRADER_X)}?marker=${markerOf(row)}`);

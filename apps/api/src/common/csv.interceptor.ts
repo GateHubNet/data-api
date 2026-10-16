@@ -43,15 +43,33 @@ export function wantsCsv(query: Record<string, unknown>): boolean {
 /** The name of the downloaded file, without `.csv`. A route that names it after the account or currency passes a function. */
 export type CsvFilename = string | ((req: Request, body: Json) => string);
 
-// What Node refuses in a header value (it would throw and fail the route); a file name is the one place a request can
-// put such a character in.
-const NOT_FOR_A_HEADER = /[^\t\x20-\x7e\x80-\xff]/g;
+// Control characters: no file name needs one, and Node refuses some of them in a header value (it would throw and fail
+// the route). A file name is the one place a request can put such a character in.
+const CONTROL = /[\x00-\x1f\x7f]/g;
+// A lone surrogate is no character at all, and `encodeURIComponent` throws on it.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+// What the quoted `filename` cannot carry: anything but printable ASCII.
+const NOT_ASCII = /[^\x20-\x7e]/g;
+
+/**
+ * `Content-Disposition` of a CSV download (RFC 6266), for the name the original gave the file (`<name>.csv`): a quoted
+ * `filename` (printable ASCII, `"` and `\` escaped, anything else `_`) for old clients, and `filename*` with the name
+ * itself in UTF-8 (RFC 5987 percent-encoding), which clients prefer. The original wrote the name unquoted
+ * (`filename=payments - USD rIssuer.csv`), so a name with a `;`, a quote or a space from the request (a currency, an
+ * address, a query value) broke the header (M12); the name a client shows is still the original's.
+ */
+export function csvContentDisposition(name: string): string {
+  const file = `${name}.csv`.replace(CONTROL, '_').replace(LONE_SURROGATE, '_');
+  const ascii = file.replace(NOT_ASCII, '_').replace(/["\\]/g, '\\$&');
+  const utf8 = encodeURIComponent(file).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`;
+}
 
 /**
  * Answers `format=csv` with the rows of the body as a CSV file, the way the routes of the original did with
- * `res.csv(rows, filename)` of nice-json2csv: `Content-Type: text/csv` (UTF-8), `Content-Disposition: attachment;
- * filename=<name>`, rows flattened, one column per key found in any row, in the order of first appearance, every cell a
- * quoted string. Any other `format` leaves the JSON body as it is. An error of the route is not touched.
+ * `res.csv(rows, filename)` of nice-json2csv: `Content-Type: text/csv` (UTF-8), `Content-Disposition: attachment` with
+ * the original's file name (quoted, and in UTF-8 too: `csvContentDisposition`), rows flattened, one column per key
+ * found in any row, in the order of first appearance, every cell a quoted string. Any other `format` leaves the JSON body as it is. An error of the route is not touched.
  */
 export class CsvInterceptor implements NestInterceptor {
   constructor(
@@ -72,7 +90,7 @@ export class CsvInterceptor implements NestInterceptor {
         const name = typeof this.filename === 'function' ? this.filename(req, body ?? {}) : this.filename;
 
         res.set('Content-Type', 'text/csv');
-        res.set('Content-Disposition', `attachment; filename=${name.replace(NOT_FOR_A_HEADER, '_')}.csv`);
+        res.set('Content-Disposition', csvContentDisposition(name));
         return convert(list.map((row) => (typeof row === 'object' && row !== null ? flattenJSON(row) : row)));
       }),
     );

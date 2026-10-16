@@ -2,6 +2,7 @@ import { FeeStatsRow, LedgersRow, RawLedger, Table } from '@gatehub/data-api-sha
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureSource } from './support/fixtures';
 import { expectBoundedInOrderRead } from './support/plans';
 
@@ -972,7 +973,7 @@ describe('GET /v2/network/fees', () => {
       const res = await get('/v2/network/fees?format=csv');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=network fees.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('network fees'));
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 54);
       expect(rows[0].split(',')).toEqual([
@@ -1641,7 +1642,7 @@ describe('GET /v2/network/fee_stats', () => {
       const res = await get('/v2/network/fee_stats?format=csv&limit=1000');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=network fee stats.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('network fee stats'));
       const rows = res.text.split('\n');
       expect(rows).toHaveLength(1 + ROWS.length);
       expect(rows[0].split(',')).toEqual(STAT_KEYS.map((key) => `"${key}"`));
@@ -1786,7 +1787,7 @@ describe('GET /v2/network/fees and /fee_stats on Xahau', () => {
     );
     expect((await get('/v2/network/fees?start=2030-01-01')).body.count).toBe(0);
     expect((await get('/v2/network/fees?format=csv')).headers['content-disposition']).toBe(
-      'attachment; filename=network fees.csv',
+      csvDisposition('network fees'),
     );
   });
 

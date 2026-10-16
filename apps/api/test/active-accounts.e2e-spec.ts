@@ -1,6 +1,7 @@
 import { Asset, ExchangesRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { FixtureExchange, fixtureExchanges } from './support/fixtures';
 
 /**
@@ -696,7 +697,7 @@ describe('active accounts API endpoint', () => {
       const res = await get(`${PAIR}?${WINDOW}&format=csv`);
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=active_accounts.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('active_accounts'));
       const rows = lines(res.text);
       const accounts = oracle(USD_XRP.rows, false);
       expect(rows).toHaveLength(1 + 7);
@@ -1363,7 +1364,7 @@ describe.each([
     it('format=csv is named active_accounts', async () => {
       const res = await get(`${pair('TIE')}?date=${D}&format=csv`);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=active_accounts.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('active_accounts'));
       expect(res.text.split('\n')).toHaveLength(1 + 5);
     });
   });

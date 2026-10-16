@@ -1,5 +1,6 @@
 import { AccountPaymentsRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureAccountPayments, fixturePayments } from './support/fixtures';
 import { expectBoundedInOrderRead, innerRead } from './support/plans';
 
@@ -772,18 +773,18 @@ describe('account payments API endpoint', () => {
 
     it('is named after the account, then the type and the currency: <address> - payments sent XRP', async () => {
       const plain = await get(`${path(SENDER)}?format=csv`);
-      expect(plain.headers['content-disposition']).toBe(`attachment; filename=${SENDER} - payments.csv`);
+      expect(plain.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - payments`));
       expect(lines(plain.text)).toHaveLength(1 + 2);
 
       const both = await get(`${path(SENDER)}?format=csv&type=Sent&currency=xrp`);
-      expect(both.headers['content-disposition']).toBe(`attachment; filename=${SENDER} - payments sent XRP.csv`);
+      expect(both.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - payments sent XRP`));
       const typeOnly = await get(`${path(SENDER)}?format=csv&type=received`);
-      expect(typeOnly.headers['content-disposition']).toBe(`attachment; filename=${SENDER} - payments received.csv`);
+      expect(typeOnly.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - payments received`));
       const currencyOnly = await get(`${path(SENDER)}?format=csv&currency=cny`);
-      expect(currencyOnly.headers['content-disposition']).toBe(`attachment; filename=${SENDER} - payments CNY.csv`);
+      expect(currencyOnly.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - payments CNY`));
       // the issuer and the tags do not name the file
       const issuer = await get(`${path(SENDER)}?format=csv&issuer=rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y&source_tag=1`);
-      expect(issuer.headers['content-disposition']).toBe(`attachment; filename=${SENDER} - payments.csv`);
+      expect(issuer.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - payments`));
     });
 
     it('format is case-insensitive, and anything but csv is JSON', async () => {
@@ -905,7 +906,7 @@ describe('account payments API endpoint on the xahau-recorded ledgers', () => {
     // on Xahau an issued currency can be called XRP; the native one is not
     expect((await get(`${path(PAYEE)}?currency=XRP`)).body.count).toBe(0);
     const csv = await get(`${path(PAYEE)}?format=csv&currency=xah&type=received&limit=10`);
-    expect(csv.headers['content-disposition']).toBe(`attachment; filename=${PAYEE} - payments received XAH.csv`);
+    expect(csv.headers['content-disposition']).toBe(csvDisposition(`${PAYEE} - payments received XAH`));
     expect(csv.text.split('\n')).toHaveLength(1 + Math.min(10, received.length));
   });
 

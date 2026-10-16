@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { SAMPLE_ROWS } from '../../../packages/shared/test/sample-rows';
 import { ExpectedComponent, paymentOracle, tradeOracle } from '../../../packages/shared/test/volume-oracle';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { fixtureExchanges, fixturePayments } from './support/fixtures';
 
 /**
@@ -1277,7 +1278,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
       const res = await get('/v2/network/exchange_volume?start=2026-02-23&end=2026-02-23&format=csv');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=trade_volume.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('trade_volume'));
       const lines = res.text.trim().split('\n');
       expect(lines).toHaveLength(2);
       expect(lines[0]).toBe(
@@ -1334,7 +1335,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
       );
 
       const pay = await get('/v2/network/payment_volume?live=day&format=CSV');
-      expect(pay.headers['content-disposition']).toBe('attachment; filename=payment_volume.csv');
+      expect(pay.headers['content-disposition']).toBe(csvDisposition('payment_volume'));
       expect(pay.text.split('\n')[0]).toMatch(/^"components\[0\]\.currency"/);
     });
 

@@ -1,6 +1,7 @@
 import { PaymentsRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { FixturePayment, fixturePayments } from './support/fixtures';
 import { expectBoundedInOrderRead, innerRead, isPageRead } from './support/plans';
 
@@ -836,7 +837,7 @@ describe('payments API endpoint', () => {
       const res = await get('/v2/payments?format=csv&limit=1000');
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/csv/);
-      expect(res.headers['content-disposition']).toBe('attachment; filename=payments.csv');
+      expect(res.headers['content-disposition']).toBe(csvDisposition('payments'));
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 182);
       // the columns are the keys of all rows in the order they first appear, nested ones joined with dots
@@ -859,22 +860,19 @@ describe('payments API endpoint', () => {
       const cny = await get(`/v2/payments/${CNY}?format=csv`);
       expect(cny.headers['content-type']).toMatch(/^text\/csv/);
       expect(cny.headers['content-disposition']).toBe(
-        'attachment; filename=payments - CNY rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y.csv',
+        csvDisposition('payments - CNY rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y'),
       );
       expect(lines(cny.text)).toHaveLength(1 + 37);
 
       const xrp = await get('/v2/payments/XRP?format=csv');
-      expect(xrp.headers['content-disposition']).toBe('attachment; filename=payments - XRP.csv');
+      expect(xrp.headers['content-disposition']).toBe(csvDisposition('payments - XRP'));
       expect(lines(xrp.text)).toHaveLength(1 + 99);
 
       // the currency in upper case, the issuer as written, whatever the separator
       const issuer = CNY.split('+')[1];
       for (const path of [`cny.${issuer}`, `Cny%7C${issuer}`]) {
         const res = await get(`/v2/payments/${path}?format=csv`);
-        expect([path, res.headers['content-disposition']]).toEqual([
-          path,
-          `attachment; filename=payments - CNY ${issuer}.csv`,
-        ]);
+        expect([path, res.headers['content-disposition']]).toEqual([path, csvDisposition(`payments - CNY ${issuer}`)]);
       }
     });
 
@@ -1050,7 +1048,7 @@ describe('payments API endpoint on the xahau-recorded ledgers', () => {
   it('format=csv is named after XAH', async () => {
     const res = await get('/v2/payments/XAH?format=csv&limit=10');
     expect(res.headers['content-type']).toMatch(/^text\/csv/);
-    expect(res.headers['content-disposition']).toBe('attachment; filename=payments - XAH.csv');
+    expect(res.headers['content-disposition']).toBe(csvDisposition('payments - XAH'));
     expect(res.text.split('\n')).toHaveLength(1 + 10);
     expect(res.headers.link).toBeDefined();
   });
