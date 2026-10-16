@@ -1,4 +1,5 @@
 import BigNumber from 'bignumber.js';
+import { isValidClassicAddress } from 'xrpl';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { VolumeDailyRow, VolumeLiveRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
@@ -85,22 +86,31 @@ function invalid(where: string, why: string): never {
   throw new Error(`Invalid markets config: ${where}: ${why}`);
 }
 
+/** A currency code as the ledger takes it: three characters of the standard set, or 40 hex digits. */
+const STANDARD_CODE = /^[A-Za-z0-9?!@#$%^&*<>(){}[\]|]{3}$/;
+const HEX_CODE = /^[0-9A-Fa-f]{40}$/;
+
 function checkAsset(where: string, a: unknown, nativeCurrency: string): void {
   if (typeof a !== 'object' || a === null) return invalid(where, 'must be an object with a currency (and an issuer)');
   const { currency, issuer } = a as MarketAsset;
   if (typeof currency !== 'string' || currency === '') return invalid(where, 'needs a currency');
+  if (currency !== nativeCurrency && !STANDARD_CODE.test(currency) && !HEX_CODE.test(currency)) {
+    return invalid(where, `"${currency}" is not a currency code (three characters, or 40 hexadecimal digits)`);
+  }
   if (issuer !== undefined && issuer !== null && typeof issuer !== 'string')
     return invalid(where, 'the issuer must be text');
   if (currency === nativeCurrency && !issuer) return;
   if (currency === nativeCurrency) return invalid(where, `the native currency ${nativeCurrency} has no issuer`);
   if (!issuer)
     return invalid(where, `${currency} needs an issuer (only the native currency ${nativeCurrency} has none)`);
+  if (!isValidClassicAddress(issuer)) return invalid(where, `the issuer "${issuer}" is not a classic address`);
 }
 
 /**
  * Throws an `Error` that says what is wrong with a markets config (`version` a whole number that fits a `UInt32`; every
- * market two different assets; every asset a currency with an issuer, or the native currency without), so that a typo of
- * the operator stops the boot instead of failing every tick. The loader only checks the shape of the file.
+ * market two different assets; every asset a currency code with the classic address of its issuer, or the native currency
+ * without one), so that a typo of the operator stops the boot instead of failing every tick. The loader only checks the
+ * shape of the file.
  */
 export function assertValidMarketsConfig(config: MarketsConfig, nativeCurrency: string): void {
   if (!Number.isInteger(config.version) || config.version < 0 || config.version > MAX_UINT32) {
@@ -371,12 +381,16 @@ async function paymentComponents(
 
 type SetRow = Omit<VolumeDailyRow, 'day'>;
 
-/** The rows of a set: the sentinel first, then the components. */
+/**
+ * The rows of a set: the sentinel first, then the components. The `rate_f` of a daily sentinel is 1 when the set is the final
+ * one of its day (`final`, see `computeDailyVolumeSet`), else 0; a live set's is 0.
+ */
 function setRows(
   metric: VolumeMetric,
   components: VolumeComponent[],
   configVersion: number,
   version: number,
+  final = false,
 ): SetRow[] {
   const row = (c: VolumeComponent | undefined): SetRow => ({
     metric,
@@ -388,7 +402,7 @@ function setRows(
     amount: c ? c.amount.toString() : '0',
     amount_f: c ? c.amount.toNumber() : 0,
     count: c?.count ?? 0,
-    rate_f: c ? c.rate.toNumber() : 0,
+    rate_f: c ? c.rate.toNumber() : final ? 1 : 0,
     converted_f: c ? c.converted.toNumber() : 0,
     config_version: configVersion,
     version,
@@ -424,9 +438,29 @@ const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString
 const at = (seconds: number): Date => new Date(seconds * 1000);
 
 /**
+ * A daily set is the FINAL one of its day when the ledgers had been ingested past the day when it was written: the newest
+ * ledger closed at least this long after the day's end (ledger time, not wall clock: after an outage, or with an ingest that
+ * started at an old ledger, the wall clock says nothing about which ledgers are in). The ledgers are ingested in order, so
+ * then every ledger of the day is in `ledgers`.
+ */
+export const VOLUME_DAY_SETTLE_MS = 3_600_000;
+
+/** The close time of the newest ingested ledger (the highest index: a read of the end of the primary key), unix seconds. */
+async function newestLedgerClose(ch: ClickHouseService): Promise<number | undefined> {
+  const row = await ch.queryOne<{ closed: number | string }>(
+    `SELECT toUnixTimestamp(close_time) AS closed FROM ${Table.Ledgers} ORDER BY ledger_index DESC LIMIT 1`,
+  );
+  return row === undefined ? undefined : Number(row.closed);
+}
+
+/**
  * Recomputes the daily set of a metric for the UTC day of `day`, and writes it: the sentinel and the components, one version,
  * one insert. Returns how many components it wrote. Trades and payments that closed in `[00:00, 24:00)` count, and a
  * payment is converted at the rate of the start of the day.
+ *
+ * The `rate_f` of the sentinel says whether the set is the final one of its day: 1 when the newest ledger had closed
+ * `VOLUME_DAY_SETTLE_MS` after the end of the day when the set was read (read BEFORE the trades and payments, so that all
+ * ledgers up to it are in what the set counted), else 0. `volumeDaysDone` counts a day as done only for a final set.
  */
 export async function computeDailyVolumeSet(
   ch: ClickHouseService,
@@ -440,6 +474,8 @@ export async function computeDailyVolumeSet(
   throwIfAborted(signal);
   const start = dayStartSeconds(day);
   const [from, to] = [at(start), at(start + DAY_SECONDS)];
+  const newest = await newestLedgerClose(ch);
+  const final = newest !== undefined && newest >= start + DAY_SECONDS + VOLUME_DAY_SETTLE_MS / 1000;
   const components =
     metric === 'trade_volume'
       ? await tradeComponents(rates, markets, from, to)
@@ -449,7 +485,7 @@ export async function computeDailyVolumeSet(
     day: dayKey(start),
   });
   throwIfAborted(signal);
-  const rows = setRows(metric, components, markets.version, version).map(
+  const rows = setRows(metric, components, markets.version, version, final).map(
     (r): VolumeDailyRow => ({ ...r, day: dayKey(start) }),
   );
   await ch.insert(Table.VolumeDaily, rows);
@@ -523,18 +559,12 @@ export async function computeDailyVolumes(
 }
 
 /**
- * A daily set is the final one of its day when it was written this long after the day ended: the ledgers of the day have
- * been ingested by then (the ingest is seconds behind the network). A set made while the day was still going, or just as it
- * ended, is a snapshot, and `volumeDaysDone` does not count the day as done on its account.
- */
-export const VOLUME_DAY_SETTLE_MS = 3_600_000;
-
-/**
  * The days of `[from, toExclusive)` (UTC days: both are cut to their midnight) that are done for `metric`: the newest daily
- * set of the day was made with `configVersion` AND after the day was over (`VOLUME_DAY_SETTLE_MS` after its end). A day whose
- * set has another version is not in it, so it is computed again after a config change; neither is a day whose newest set
- * was made while the day was going (the aggregator was down when the day ended). A day with only a sentinel (no volume) is. Each
- * day counts by its newest sentinel, and a set that was stored twice counts once. Returns the days as `YYYY-MM-DD`.
+ * set of the day was made with `configVersion` AND is a final set (its sentinel says the ingest had passed the day, see
+ * `computeDailyVolumeSet`). A day whose set has another version is not in it, so it is computed again after a config change;
+ * neither is a day whose newest set was made while its ledgers were not all in (the aggregator ran during the day, the
+ * ingest was behind after an outage, the ingest started at an old ledger). A day with only a sentinel (no volume) is. Each day
+ * counts by its newest sentinel, and a set that was stored twice counts once. Returns the days as `YYYY-MM-DD`.
  */
 export async function volumeDaysDone(
   ch: ClickHouseService,
@@ -548,14 +578,42 @@ export async function volumeDaysDone(
   if (first >= until) return new Set();
   const rows = await ch.query<{ day: string }>(
     `SELECT toString(day) AS day
-       FROM (SELECT day, config_version, version
+       FROM (SELECT day, config_version, rate_f
                FROM ${Table.VolumeDaily}
               WHERE metric = {metric:String} AND component = '' AND day >= {from:Date} AND day < {until:Date}
               ORDER BY day ASC, version DESC
               LIMIT 1 BY day)
-      WHERE config_version = {configVersion:UInt32}
-        AND version >= (toUnixTimestamp(toDateTime(day, 'UTC')) + ${DAY_SECONDS}) * 1000 + {settle:UInt64}`,
-    { metric, from: dayKey(first), until: dayKey(until), configVersion, settle: VOLUME_DAY_SETTLE_MS },
+      WHERE config_version = {configVersion:UInt32} AND rate_f = 1`,
+    { metric, from: dayKey(first), until: dayKey(until), configVersion },
   );
   return new Set(rows.map((r) => r.day));
+}
+
+/**
+ * The newest version of every live set there is, keyed `<metric>/<period>` (`trade_volume/hour`): when each was last written.
+ * A set that has never been written is not in it. The aggregator starts with the stalest set, so that none starves.
+ */
+export async function liveSetVersions(ch: ClickHouseService): Promise<Map<string, number>> {
+  const rows = await ch.query<{ metric: string; period: string; version: number | string }>(
+    `SELECT metric, period, toUInt64(max(version)) AS version FROM ${Table.VolumeLive} GROUP BY metric, period`,
+  );
+  return new Map(rows.map((r) => [`${r.metric}/${r.period}`, Number(r.version)]));
+}
+
+/**
+ * The newest version of the daily sets of the days of `[from, to]` (UTC days), keyed `<metric>/<YYYY-MM-DD>`; a set that
+ * does not exist is not in it.
+ */
+export async function dailySetVersions(ch: ClickHouseService, from: Date, to: Date): Promise<Map<string, number>> {
+  const first = dayStartSeconds(from);
+  const last = dayStartSeconds(to);
+  if (first > last) return new Map();
+  const rows = await ch.query<{ metric: string; day_text: string; version: number | string }>(
+    `SELECT metric, toString(day) AS day_text, toUInt64(max(version)) AS version
+       FROM ${Table.VolumeDaily}
+      WHERE day >= {from:Date} AND day <= {to:Date}
+      GROUP BY metric, day`,
+    { from: dayKey(first), to: dayKey(last) },
+  );
+  return new Map(rows.map((r) => [`${r.metric}/${r.day_text}`, Number(r.version)]));
 }

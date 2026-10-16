@@ -19,8 +19,9 @@ import { AggregatorOptions, AggregatorService } from '../src/aggregator/aggregat
 
 /**
  * The volume jobs of the `AggregatorService` against a real ClickHouse: the 41 mock ledgers of 2015-01-14 (17:29 - 19:10 UTC),
- * written by the real `LedgerWriter`, preceded by a ledger of 2015-01-08, so that there are closed days to back-fill. The
- * sets themselves are checked against an oracle in `packages/shared/test/volume-job.e2e-spec.ts`; here it is the job that
+ * written by the real `LedgerWriter`, preceded by a ledger of 2015-01-08, so that there are closed days to back-fill, and
+ * followed by a ledger of 2015-01-15 at 03:00, so that the ingest has passed the 14th (a day is closed, and its set final,
+ * when the newest ledger closed an hour after its end). The sets themselves are checked against an oracle in `packages/shared/test/volume-job.e2e-spec.ts`; here it is the job that
  * is on trial: what a tick writes, the back-fill (once per config version, newest first, under a budget), and the hook of
  * `agg_dirty`.
  */
@@ -59,22 +60,46 @@ describe('AggregatorService volume jobs (e2e)', () => {
     await container?.container.stop();
   });
 
-  /** A migrated database with the ledgers of 2015-01-14 and a first ledger on 2015-01-08. */
-  async function fresh(): Promise<ClickHouseService> {
+  /** A migrated database, empty. */
+  async function empty(): Promise<ClickHouseService> {
     const config = { ...container.config, database: `aggregator_volumes_${++dbCounter}` };
     await runMigrations({ config, log: () => undefined });
     const svc = new ClickHouseService(config);
     services.push(svc);
-    await svc.insert(Table.Ledgers, [
-      {
-        ...SAMPLE_ROWS[Table.Ledgers],
-        ledger_index: 11_000_000,
-        ledger_hash: '11'.repeat(32),
-        close_time: unix('2015-01-08T09:00:00Z'),
-      },
-    ]);
-    await new LedgerWriter(svc, ctx).write(day14);
     return svc;
+  }
+
+  /** A ledger row that closed at `close`; the indexes of the tests are above the mock ledgers' for the later ones. */
+  const ledgerRow = (index: number, close: string) => ({
+    ...SAMPLE_ROWS[Table.Ledgers],
+    ledger_index: index,
+    ledger_hash: String(index).padStart(64, 'E'),
+    close_time: unix(close),
+  });
+  const FIRST_LEDGER = ledgerRow(11_000_000, '2015-01-08T09:00:00Z');
+  /** The ledger that has the ingest pass the 14th. */
+  const LAST_LEDGER = ledgerRow(11_200_000, '2015-01-15T03:00:00Z');
+
+  /** A migrated database with the ledgers of 2015-01-14, a first ledger on 2015-01-08 and a last one on the 15th. */
+  async function fresh(): Promise<ClickHouseService> {
+    const svc = await empty();
+    await svc.insert(Table.Ledgers, [FIRST_LEDGER]);
+    await new LedgerWriter(svc, ctx).write(day14);
+    await svc.insert(Table.Ledgers, [LAST_LEDGER]);
+    return svc;
+  }
+
+  /** The days whose newest daily set of `metric` is final (the flag of its sentinel), as `YYYY-MM-DD`. */
+  async function finalDays(ch: ClickHouseService, metric: string): Promise<string[]> {
+    const rows = await ch.query<{ day: string }>(
+      `SELECT toString(day) AS day
+         FROM (SELECT day, rate_f FROM ${Table.VolumeDaily} WHERE metric = {metric:String} AND component = ''
+                ORDER BY day, version DESC LIMIT 1 BY day)
+        WHERE rate_f = 1
+        ORDER BY day`,
+      { metric },
+    );
+    return rows.map((r) => r.day);
   }
 
   function aggregator(
@@ -278,5 +303,134 @@ describe('AggregatorService volume jobs (e2e)', () => {
     expect((await daily(ch, 'payment_volume')).find((s) => s.day === '2015-01-14')?.components).toBe(1);
     const live = await ch.query<{ n: string }>(`SELECT countIf(component = '') AS n FROM ${Table.VolumeLive}`);
     expect(Number(live[0].n)).toBe(7);
+  });
+
+  describe('the ingest decides which days are closed and final, not the clock', () => {
+    /** The components of the newest set of a day: [component, amount, count], by component. */
+    async function setOf(ch: ClickHouseService, metric: string, day: string): Promise<[string, string, number][]> {
+      const rows = await ch.query<{ component: string; amount: string; count: string }>(
+        `SELECT component, amount, toUInt64(count) AS count
+           FROM ${Table.VolumeDaily}
+          WHERE metric = {metric:String} AND day = {day:Date} AND component != ''
+            AND version = (SELECT max(version) FROM ${Table.VolumeDaily} WHERE metric = {metric:String} AND day = {day:Date})
+          ORDER BY component`,
+        { metric, day },
+      );
+      return rows.map((r) => [r.component, r.amount, Number(r.count)]);
+    }
+
+    it('outage resume: a day whose last hour has not been ingested is not back-filled, and a set made meanwhile is recomputed once the ledgers arrive', async () => {
+      const ch = await empty();
+      const cutoff = unix('2015-01-14T18:30:00Z');
+      const early = day14.filter((l) => l.header.close_time <= cutoff);
+      const late = day14.filter((l) => l.header.close_time > cutoff);
+      expect(early.length).toBeGreaterThan(5);
+      expect(late.length).toBeGreaterThan(5);
+      await ch.insert(Table.Ledgers, [FIRST_LEDGER]);
+      await new LedgerWriter(ch, ctx).write(early);
+      const svc = aggregator(ch);
+
+      // the aggregator runs while the day goes on: the set of today is a snapshot of what is in
+      await svc.tick(new Date('2015-01-14T18:31:00Z'));
+      const snapshot = await setOf(ch, 'trade_volume', '2015-01-14');
+      expect(snapshot.length).toBeGreaterThan(0);
+      expect(await finalDays(ch, 'trade_volume')).not.toContain('2015-01-14');
+
+      // three days later the wall clock says that the 14th is over, the ledgers say that the ingest is still in the middle of it
+      await svc.tick(new Date('2015-01-17T12:00:00Z'));
+      expect(await setOf(ch, 'trade_volume', '2015-01-14')).toEqual(snapshot);
+      expect(await finalDays(ch, 'trade_volume')).toEqual([
+        '2015-01-08',
+        '2015-01-09',
+        '2015-01-10',
+        '2015-01-11',
+        '2015-01-12',
+        '2015-01-13',
+      ]);
+      expect(await finalDays(ch, 'payment_volume')).not.toContain('2015-01-14');
+
+      // the rest of the day and the next hours are ingested
+      await new LedgerWriter(ch, ctx).write(late);
+      await ch.insert(Table.Ledgers, [LAST_LEDGER]);
+      await svc.tick(new Date('2015-01-17T12:01:00Z'));
+      expect(await finalDays(ch, 'trade_volume')).toContain('2015-01-14');
+      expect(await finalDays(ch, 'payment_volume')).toContain('2015-01-14');
+
+      // the set is the one of a database that was never behind
+      const control = await fresh();
+      await aggregator(control).tick(new Date('2015-01-17T12:01:00Z'));
+      for (const metric of ['trade_volume', 'payment_volume']) {
+        expect(await setOf(ch, metric, '2015-01-14')).toEqual(await setOf(control, metric, '2015-01-14'));
+      }
+      expect(await setOf(ch, 'trade_volume', '2015-01-14')).not.toEqual(snapshot);
+    });
+
+    it('an ingest that started at an old ledger leaves no final set, sentinel-only or not, for the days it has not reached', async () => {
+      const ch = await empty();
+      await ch.insert(Table.Ledgers, [FIRST_LEDGER]);
+      await aggregator(ch).tick(new Date('2015-01-17T12:00:00Z'));
+      for (const metric of ['trade_volume', 'payment_volume']) {
+        // only today and yesterday have a set (the stalest first, whatever the day), and neither is final
+        expect((await daily(ch, metric)).map((d) => d.day)).toEqual(['2015-01-16', '2015-01-17']);
+        expect(await finalDays(ch, metric)).toEqual([]);
+        expect(
+          (
+            await volumeDaysDone(
+              ch,
+              metric as 'trade_volume',
+              new Date('2015-01-01T00:00:00Z'),
+              new Date('2015-02-01T00:00:00Z'),
+              MARKETS.version,
+            )
+          ).size,
+        ).toBe(0);
+      }
+    });
+
+    it('a day is closed an hour after its end in LEDGER time, whatever the real clock says (ledgers placed relative to the real today)', async () => {
+      const DAY = 86_400;
+      const base = Math.floor(Date.now() / 1000 / DAY) * DAY;
+      const text = (offset: number): string => new Date((base + offset) * 1000).toISOString().slice(0, 10);
+      const ledgerAt = (index: number, offset: number) => ({
+        ...SAMPLE_ROWS[Table.Ledgers],
+        ledger_index: index,
+        ledger_hash: String(index).padStart(64, 'D'),
+        close_time: base + offset,
+      });
+      const ch = await empty();
+      // the ingest started 6 days ago and is two days behind the clock: the newest ledger closed 30 minutes into the day that
+      // began two days ago, so the day before it (three days ago) is over by less than the hour
+      await ch.insert(Table.Ledgers, [
+        ledgerAt(100, -6 * DAY + 10 * 3600),
+        ledgerAt(101, -3 * DAY + 12 * 3600),
+        ledgerAt(102, -2 * DAY + 1800),
+      ]);
+      const svc = aggregator(ch);
+      await svc.tick();
+      expect(await finalDays(ch, 'trade_volume')).toEqual([text(-6 * DAY), text(-5 * DAY), text(-4 * DAY)]);
+      expect((await daily(ch, 'trade_volume')).map((d) => d.day)).toEqual([
+        text(-6 * DAY),
+        text(-5 * DAY),
+        text(-4 * DAY),
+        text(-DAY),
+        text(0),
+      ]);
+
+      // the ingest gets an hour into that day: the day three days ago is closed now, and the one two days ago is not
+      await ch.insert(Table.Ledgers, [ledgerAt(103, -2 * DAY + 3600)]);
+      await svc.tick();
+      expect(await finalDays(ch, 'trade_volume')).toEqual([
+        text(-6 * DAY),
+        text(-5 * DAY),
+        text(-4 * DAY),
+        text(-3 * DAY),
+      ]);
+      expect(await finalDays(ch, 'payment_volume')).toEqual([
+        text(-6 * DAY),
+        text(-5 * DAY),
+        text(-4 * DAY),
+        text(-3 * DAY),
+      ]);
+    });
   });
 });

@@ -47,7 +47,7 @@ describe('toVolumeRow', () => {
       expect(Object.keys(row)).toEqual(['components', 'count', 'exchange', 'total', 'exchange_rate', 'start_time']);
     });
 
-    it('a live row adds end_time after start_time', () => {
+    it('a row with an end (live or historical) adds end_time after start_time', () => {
       const row = toVolumeRow('trade_volume', bucket([trade()], { end: T0 + 86_400 }), 'XRP');
       expect(Object.keys(row)).toEqual([
         'components',
@@ -325,6 +325,52 @@ describe('sumParts', () => {
     expect(part.base).toEqual({ currency: 'XRP' });
     expect(part.counter).toBeUndefined();
     expect(Object.keys(part.base)).toEqual(['currency']);
+  });
+
+  it('rows without a converted amount are not added to the component: 9 unrated units and 4 at rate 2 are 4 units at rate 2, and the payments of both are in the count', () => {
+    const unrated = stored({
+      component: `USD.${I1}`,
+      base_currency: 'USD',
+      base_issuer: I1,
+      counter_currency: '',
+      counter_issuer: '',
+      amount: '9',
+      count: 3,
+      converted_f: 0,
+    });
+    const rated = { ...unrated, amount: '4', count: 2, converted_f: 2 };
+    for (const rows of [
+      [unrated, rated],
+      [rated, unrated],
+    ]) {
+      const parts = sumParts(rows);
+      expect(parts).toHaveLength(2);
+      const row = toVolumeRow('payment_volume', bucket(parts), 'XRP');
+      expect(row.components).toEqual([
+        { currency: 'USD', issuer: I1, amount: '4', count: 2, rate: '2.0000000', converted_amount: '2' },
+      ]);
+      expect(row.count).toBe(5);
+      expect(row.total).toBe('2');
+    }
+  });
+
+  it('several unrated days stay one part that is never listed; their payments add up in the count', () => {
+    const unrated = (count: number) =>
+      stored({
+        component: `ZZZ.${I1}`,
+        base_currency: 'ZZZ',
+        base_issuer: I1,
+        counter_currency: '',
+        counter_issuer: '',
+        amount: '5',
+        count,
+        converted_f: 0,
+      });
+    const parts = sumParts([unrated(2), unrated(4)]);
+    expect(parts).toHaveLength(1);
+    const row = toVolumeRow('payment_volume', bucket(parts), 'XRP');
+    expect(row.components).toEqual([]);
+    expect(row.count).toBe(6);
   });
 
   it('a row of zero converted amount (a currency without a rate) stays a part, to be counted', () => {

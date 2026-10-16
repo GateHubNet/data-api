@@ -68,9 +68,10 @@ export interface VolumePart {
   converted: number;
 }
 
-/** A row to be: the parts of an hour, a day, a week, ... starting at `start` (unix seconds), and for a live set its `end`. */
+/** A row to be: the parts of a bucket (a live period, a day, a week, a month) from `start` to `end`, exclusive (unix seconds). */
 export interface VolumeBucket {
   start: number;
+  /** Where the bucket ends, exclusive: the end of a live period, the start of the next day, week or month. */
   end?: number;
   parts: VolumePart[];
 }
@@ -88,10 +89,15 @@ const volumeAsset = (a: Asset): VolumeAsset =>
   a.issuer ? { currency: a.currency, issuer: a.issuer } : { currency: a.currency };
 
 /**
- * Adds the stored rows of the days of one bucket (a day, a week, a month), part by part: the amounts exactly, the counts and the
- * converted amounts. The sentinel row of a set (component empty) is no part. A component whose sides were swapped on another
- * day (the trade volume converts through the counter leg when the base has no rate, and then its amount is of the other
- * currency) is two parts, because the amounts are of different currencies.
+ * Adds the stored rows of the days of one bucket (a day, a week, a month), part by part: the amounts exactly, the counts and
+ * the converted amounts. The sentinel row of a set (component empty) is no part. A component whose sides were swapped on
+ * another day (the trade volume converts through the counter leg when the base has no rate, and then its amount is of the
+ * other currency) is two parts, because the amounts are of different currencies.
+ *
+ * A row with no converted amount (a currency that had payments but no rate that day) is not added to the component: it would
+ * put an amount in the sum that nothing was converted for, and `amount / converted_amount` would no longer be a rate. Such
+ * rows are parts of their own (never listed, see `toVolumeRow`), which keeps their payments in the `count` of the row only,
+ * as a daily set, which does not list them either, has them.
  */
 export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
   const parts = new Map<string, VolumePart>();
@@ -99,9 +105,15 @@ export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
     if (row.component === '') continue;
     const base = assetOf(row.base_currency, row.base_issuer);
     const counter = row.counter_currency === '' ? undefined : assetOf(row.counter_currency, row.counter_issuer);
-    const id = [row.component, row.base_currency, row.base_issuer, row.counter_currency, row.counter_issuer].join(
-      '\u0000',
-    );
+    // rows with a converted amount and rows without one are summed apart
+    const id = [
+      row.component,
+      row.base_currency,
+      row.base_issuer,
+      row.counter_currency,
+      row.counter_issuer,
+      Number(row.converted_f) > 0 ? 'converted' : 'unconverted',
+    ].join('\u0000');
     const found = parts.get(id);
     if (found) {
       found.amount = found.amount.plus(row.amount);

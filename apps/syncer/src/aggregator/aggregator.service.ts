@@ -2,14 +2,17 @@ import {
   ClickHouseService,
   computeDailyVolumeSet,
   computeLiveVolumeSet,
+  dailySetVersions,
   HOUR_SECONDS,
   livePeriodsOf,
+  liveSetVersions,
   MarketsConfig,
   RatesService,
   recomputeStatsHourly,
   ShutdownSignals,
   StatsRecomputeAborted,
   Table,
+  VOLUME_DAY_SETTLE_MS,
   VOLUME_METRICS,
   volumeDaysDone,
   VolumeMetric,
@@ -62,6 +65,15 @@ export const AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS = 10_000;
 
 /** A volume job gives up after this many sets failed in a tick, so that an outage does not log a line per set. */
 export const MAX_FAILED_VOLUME_SETS_PER_TICK = 3;
+
+/**
+ * A closed day whose set failed is left alone for this long before the back-fill tries it again, and for twice as long after
+ * each further failure, up to `VOLUME_BACKFILL_MAX_RETRY_MS`: a day that fails every time (bad data, a query over the memory
+ * limit) must not stop the back-fill of the older days, which the cap of failures per tick would otherwise do from the newest
+ * end for ever. Kept in memory: a restart tries them all again.
+ */
+export const VOLUME_BACKFILL_RETRY_MS = 5 * 60_000;
+export const VOLUME_BACKFILL_MAX_RETRY_MS = 60 * 60_000;
 
 /**
  * How long a shutdown waits for the tick in flight. The cleanups of `ShutdownSignals` share one budget of 10 s and the
@@ -133,6 +145,10 @@ export interface VolumeFunctions {
   computeLiveSet: typeof computeLiveVolumeSet;
   computeDailySet: typeof computeDailyVolumeSet;
   daysDone: typeof volumeDaysDone;
+  /** When each live set was last written, keyed `<metric>/<period>`: the stalest is started first. */
+  liveVersions: typeof liveSetVersions;
+  /** The same for the daily sets of today and of yesterday, keyed `<metric>/<day>`. */
+  dailyVersions: typeof dailySetVersions;
 }
 
 export interface AggregatorOptions {
@@ -173,6 +189,17 @@ const DAY_SECONDS = 86_400;
 const utcDayStart = (seconds: number): number => Math.floor(seconds / DAY_SECONDS) * DAY_SECONDS;
 /** `YYYY-MM-DD` of the UTC day that starts at `seconds`. */
 const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
+
+/**
+ * The sets in the order they are started: the one whose newest version is the oldest first, a set with no version (never
+ * written) before all of them, equals in the order they are listed in.
+ */
+function staleFirst<T extends { key: string }>(sets: T[], versions: ReadonlyMap<string, number>): T[] {
+  return sets
+    .map((set, i) => ({ set, i, version: versions.get(set.key) ?? 0 }))
+    .sort((a, b) => a.version - b.version || a.i - b.i)
+    .map(({ set }) => set);
+}
 const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
 const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
@@ -182,8 +209,10 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  * with a budget of its own),
  *
  *  1. **volume_live** (with the `volumes` option): the seven live volume sets (trade volume for hour, day, 3day, 7day and 30day,
- *     payment volume for hour and day), each recomputed whole under one version.
- *  2. **volume_daily**: the daily volume sets of today and of yesterday (UTC), both metrics.
+ *     payment volume for hour and day), each recomputed whole under one version, the stalest first: when the budget is too
+ *     short for all of them every set is refreshed in turn.
+ *  2. **volume_daily**: the daily volume sets of today and of yesterday (UTC), both metrics, the stalest first (yesterday's are
+ *     the ones that are finalised after the midnight).
  *  3. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
  *     first, in slices of at most a day:
  *      - the **catch-up**, from the watermark (the newest hour with ledgers) up to two hours ago, or to the hour of the newest
@@ -201,9 +230,11 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *  4. **stats_dirty**: drains `agg_dirty`, the ranges that ingest rewrote behind the aggregator, oldest first, each in slices
  *     of at most a day, for at most `AGGREGATOR_DIRTY_BUDGET_MS`. The days a slice covers have their daily volume sets
  *     recomputed too (with the `volumes` option), once per tick unless the ingest marked the day again after that.
- *  5. **volume_backfill**: the closed days (before yesterday, back to the day of the first ledger) whose daily sets do not exist
- *     for the current `version` of the markets config, newest first, under its own budget. A day is computed once; a new
- *     config version computes them all again.
+ *  5. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config,
+ *     newest first, under its own budget. A day is closed when it is before yesterday AND the ingest has passed it (the newest
+ *     ledger closed an hour after its end): the wall clock alone would call a day final while its ledgers are still to come.
+ *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
+ *     doubling) and the older days go on.
  *
  * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set is a complete set under a new version), which is
  * what lets this retry, resume and crash anywhere:
@@ -233,6 +264,11 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly volumeFns: VolumeFunctions;
   /** Whether the back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
   private backfilling = false;
+  /** The sets (`<metric>/<day>`) of the back-fill that failed: when to try each again, and the wait after the next failure. */
+  private readonly backfillBackoff = new Map<string, { until: number; delayMs: number }>();
+  /** The volume jobs that hit their budget in the run in progress, and the ones with a warning out (until a run in time). */
+  private readonly budgetHit = new Set<string>();
+  private readonly budgetWarned = new Set<string>();
   private readonly logger: Pick<Logger, 'log' | 'warn' | 'error' | 'debug'>;
   private readonly clock: () => number;
   private readonly recompute: typeof recomputeStatsHourly;
@@ -266,6 +302,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       computeLiveSet: computeLiveVolumeSet,
       computeDailySet: computeDailyVolumeSet,
       daysDone: volumeDaysDone,
+      liveVersions: liveSetVersions,
+      dailyVersions: dailySetVersions,
       ...options.volumeFunctions,
     };
     this.logger = options.logger ?? new Logger(AggregatorService.name);
@@ -358,6 +396,9 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         this.metrics?.aggregatorRunsTotal.inc({ job: job.name });
       } catch (err) {
         this.failed(job.name, err);
+      } finally {
+        // a run that did not hit its budget ends the streak the warning was said for
+        if (!this.budgetHit.delete(job.name)) this.budgetWarned.delete(job.name);
       }
     }
   }
@@ -595,105 +636,85 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     }
   }
 
-  /** Whether a volume job may start another set: not after the shutdown began, and not past its budget (it says so). */
+  /**
+   * Whether a volume job may start another set: not after the shutdown began, and not past its budget. Running out of the budget
+   * is how a long back-fill works, tick after tick, so it is said once (a warning) for as long as the runs of the job keep
+   * hitting it, and at debug level after that; a run that finishes in time ends the streak.
+   */
   private mayStartSet(tick: AggregatorTick, job: string): boolean {
     if (this.closing) return false;
     if (this.clock() < tick.deadline) return true;
-    this.logger.warn(`Aggregator job ${job} reached its budget; the sets left go on next tick`);
+    this.budgetHit.add(job);
+    const text = `Aggregator job ${job} reached its budget; the sets left go on next tick`;
+    if (this.budgetWarned.has(job)) {
+      this.logger.debug(text);
+    } else {
+      this.budgetWarned.add(job);
+      this.logger.warn(`${text} (said once until a tick finishes in time)`);
+    }
     return false;
+  }
+
+  /**
+   * The newest version of each set, for `staleFirst`; when the read fails the order is the default one (the failure is
+   * logged and counted), so that a problem with this read cannot keep the sets from being written.
+   */
+  private async versionsOf(job: string, read: () => Promise<Map<string, number>>): Promise<Map<string, number>> {
+    try {
+      return await read();
+    } catch (err) {
+      this.failed(job, err, ' reading the versions of the sets');
+      return new Map();
+    }
   }
 
   // -------------------------------------------------------------------------------------------------------------------
   // volume_live, volume_daily, volume_backfill
   // -------------------------------------------------------------------------------------------------------------------
 
-  /** The live sets of both metrics, every period, with the time of the tick. A failed set does not stop the other ones. */
+  /**
+   * The live sets of both metrics, every period, with the time of the tick, the STALEST first (the one written longest ago;
+   * a set with no row at all is the stalest of all), so that with a budget that is too short for them all every set is
+   * refreshed in turn, none always last. A failed set does not stop the other ones, and stays the stalest for the next tick.
+   */
   private async volumeLive(tick: AggregatorTick): Promise<void> {
     const volumes = this.volumes;
     if (!volumes) return;
+    const sets = VOLUME_METRICS.flatMap((metric) =>
+      livePeriodsOf(metric).map((period) => ({ metric, period, key: `${metric}/${period}` })),
+    );
+    const versions = await this.versionsOf('volume_live', () => this.volumeFns.liveVersions(this.ch));
     let failed = 0;
-    for (const metric of VOLUME_METRICS) {
-      for (const period of livePeriodsOf(metric)) {
-        if (!this.mayStartSet(tick, 'volume_live')) return;
-        try {
-          await this.volumeFns.computeLiveSet(this.ch, volumes.rates, volumes.markets, metric, period, tick.now, {
-            signal: tick.signal,
-          });
-        } catch (err) {
-          this.failed('volume_live', err, ` in ${metric} ${period}`);
-          if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
-        }
-      }
-    }
-  }
-
-  /** The daily sets of today and of yesterday (UTC), both metrics: the day is not over, or only just, so they change. */
-  private async volumeDaily(tick: AggregatorTick): Promise<void> {
-    const volumes = this.volumes;
-    if (!volumes) return;
-    const today = utcDayStart(Math.floor(tick.now.getTime() / 1000));
-    let failed = 0;
-    for (const dayStart of [today, today - DAY_SECONDS]) {
-      for (const metric of VOLUME_METRICS) {
-        if (!this.mayStartSet(tick, 'volume_daily')) return;
-        try {
-          await this.volumeFns.computeDailySet(
-            this.ch,
-            volumes.rates,
-            volumes.markets,
-            metric,
-            new Date(dayStart * 1000),
-            {
-              signal: tick.signal,
-            },
-          );
-        } catch (err) {
-          this.failed('volume_daily', err, ` in ${metric} ${dayKey(dayStart)}`);
-          if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
-        }
+    for (const { metric, period } of staleFirst(sets, versions)) {
+      if (!this.mayStartSet(tick, 'volume_live')) return;
+      try {
+        await this.volumeFns.computeLiveSet(this.ch, volumes.rates, volumes.markets, metric, period, tick.now, {
+          signal: tick.signal,
+        });
+      } catch (err) {
+        this.failed('volume_live', err, ` in ${metric} ${period}`);
+        if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
       }
     }
   }
 
   /**
-   * The closed days (before yesterday, back to the day of the first ledger) that have no daily set of the current config
-   * version, newest first, both metrics, for as long as the budget of the job and of the tick last. The sets that exist are
-   * found by one read per metric (`volumeDaysDone`), so a day is computed once, and a new version of the config computes them
-   * all again; whatever is left is found again next tick. It says when it starts and when it is done.
+   * The daily sets of today and of yesterday (UTC), both metrics, the stalest first (as `volumeLive`): the day is not over,
+   * or only just, so they change; and yesterday's are the ones that must be finalised after the midnight.
    */
-  private async volumeBackfill(tick: AggregatorTick): Promise<void> {
+  private async volumeDaily(tick: AggregatorTick): Promise<void> {
     const volumes = this.volumes;
     if (!volumes) return;
-    // the stats and the dirty queue before it may have used the tick up: do not even read what cannot be worked on
-    if (this.closing || this.clock() >= tick.deadline) return;
-    const firstClose = await this.firstCloseTime();
-    const closedUntil = utcDayStart(Math.floor(tick.now.getTime() / 1000)) - DAY_SECONDS;
-    if (firstClose === undefined || utcDayStart(firstClose) >= closedUntil) return;
-    const first = utcDayStart(firstClose);
-    const version = volumes.markets.version;
-
-    const done = new Map<VolumeMetric, Set<string>>();
-    for (const metric of VOLUME_METRICS) {
-      done.set(
-        metric,
-        await this.volumeFns.daysDone(this.ch, metric, new Date(first * 1000), new Date(closedUntil * 1000), version),
-      );
-    }
-    const missing: Array<{ metric: VolumeMetric; dayStart: number }> = [];
-    for (let dayStart = closedUntil - DAY_SECONDS; dayStart >= first; dayStart -= DAY_SECONDS) {
-      for (const metric of VOLUME_METRICS) {
-        if (!done.get(metric)?.has(dayKey(dayStart))) missing.push({ metric, dayStart });
-      }
-    }
-    if (missing.length === 0) {
-      this.announceBackfill(false, 0);
-      return;
-    }
-    this.announceBackfill(true, missing.length);
-
+    const today = utcDayStart(Math.floor(tick.now.getTime() / 1000));
+    const sets = [today, today - DAY_SECONDS].flatMap((dayStart) =>
+      VOLUME_METRICS.map((metric) => ({ metric, dayStart, key: `${metric}/${dayKey(dayStart)}` })),
+    );
+    const versions = await this.versionsOf('volume_daily', () =>
+      this.volumeFns.dailyVersions(this.ch, new Date((today - DAY_SECONDS) * 1000), new Date(today * 1000)),
+    );
     let failed = 0;
-    for (const { metric, dayStart } of missing) {
-      if (!this.mayStartSet(tick, 'volume_backfill')) return;
+    for (const { metric, dayStart } of staleFirst(sets, versions)) {
+      if (!this.mayStartSet(tick, 'volume_daily')) return;
       try {
         await this.volumeFns.computeDailySet(
           this.ch,
@@ -706,11 +727,95 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
           },
         );
       } catch (err) {
-        this.failed('volume_backfill', err, ` in ${metric} ${dayKey(dayStart)}`);
+        this.failed('volume_daily', err, ` in ${metric} ${dayKey(dayStart)}`);
         if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
       }
     }
-    if (failed === 0 && !this.closing) this.announceBackfill(false, 0);
+  }
+
+  /**
+   * The closed days that have no final daily set of the current config version, newest first, both metrics, for as long as
+   * the budget of the job and of the tick last. A day is closed (a day to back-fill) when it is before yesterday AND the ingest
+   * has passed it: the newest ingested ledger closed at least `VOLUME_DAY_SETTLE_MS` after the end of the day. By wall clock
+   * alone a day would be taken for final while its ledgers are still to come (after an outage, or when the ingest started at an
+   * old ledger), and the set made then would stay wrong; a set carries the same test (`computeDailyVolumeSet`), so a day
+   * that was computed too early is computed again once the ingest has passed it. The sets that exist are found by one read
+   * per metric (`volumeDaysDone`), so a day is computed once, and a new version of the config computes them all again;
+   * whatever is left is found again next tick. A set that fails is left alone for a while (`VOLUME_BACKFILL_RETRY_MS`,
+   * doubling), so that the days before it go on. It says when it starts and when it is done.
+   */
+  private async volumeBackfill(tick: AggregatorTick): Promise<void> {
+    const volumes = this.volumes;
+    if (!volumes) return;
+    // the stats and the dirty queue before it may have used the tick up: do not even read what cannot be worked on
+    if (this.closing || this.clock() >= tick.deadline) return;
+    const [firstClose, newestClose] = await Promise.all([this.firstCloseTime(), this.latestCloseTime()]);
+    if (firstClose === undefined || newestClose === undefined) return;
+    const closedUntil = Math.min(
+      utcDayStart(Math.floor(tick.now.getTime() / 1000)) - DAY_SECONDS,
+      utcDayStart(newestClose - VOLUME_DAY_SETTLE_MS / 1000),
+    );
+    if (utcDayStart(firstClose) >= closedUntil) return;
+    const first = utcDayStart(firstClose);
+    const version = volumes.markets.version;
+
+    const done = new Map<VolumeMetric, Set<string>>();
+    for (const metric of VOLUME_METRICS) {
+      done.set(
+        metric,
+        await this.volumeFns.daysDone(this.ch, metric, new Date(first * 1000), new Date(closedUntil * 1000), version),
+      );
+    }
+    const missing: Array<{ metric: VolumeMetric; dayStart: number; key: string }> = [];
+    for (let dayStart = closedUntil - DAY_SECONDS; dayStart >= first; dayStart -= DAY_SECONDS) {
+      for (const metric of VOLUME_METRICS) {
+        if (!done.get(metric)?.has(dayKey(dayStart)))
+          missing.push({ metric, dayStart, key: `${metric}/${dayKey(dayStart)}` });
+      }
+    }
+    // a set that is done (or is no longer wanted) has no failure to remember
+    const wanted = new Set(missing.map((set) => set.key));
+    for (const key of this.backfillBackoff.keys()) if (!wanted.has(key)) this.backfillBackoff.delete(key);
+    if (missing.length === 0) {
+      this.announceBackfill(false, 0);
+      return;
+    }
+    this.announceBackfill(true, missing.length);
+
+    let failed = 0;
+    let waiting = 0;
+    for (const { metric, dayStart, key } of missing) {
+      const backoff = this.backfillBackoff.get(key);
+      if (backoff !== undefined && backoff.until > this.clock()) {
+        waiting++;
+        continue;
+      }
+      if (!this.mayStartSet(tick, 'volume_backfill')) return;
+      try {
+        await this.volumeFns.computeDailySet(
+          this.ch,
+          volumes.rates,
+          volumes.markets,
+          metric,
+          new Date(dayStart * 1000),
+          {
+            signal: tick.signal,
+          },
+        );
+        this.backfillBackoff.delete(key);
+      } catch (err) {
+        this.failed('volume_backfill', err, ` in ${metric} ${dayKey(dayStart)}`);
+        if (!this.closing) {
+          const delayMs =
+            backoff === undefined
+              ? VOLUME_BACKFILL_RETRY_MS
+              : Math.min(backoff.delayMs * 2, VOLUME_BACKFILL_MAX_RETRY_MS);
+          this.backfillBackoff.set(key, { until: this.clock() + delayMs, delayMs });
+        }
+        if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
+      }
+    }
+    if (failed === 0 && waiting === 0 && !this.closing) this.announceBackfill(false, 0);
   }
 
   /** Says once that the back-fill is under way (and how much there is), and once that it is done. */

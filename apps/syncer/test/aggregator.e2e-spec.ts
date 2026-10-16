@@ -382,9 +382,20 @@ describe('AggregatorService (e2e)', () => {
     let queryCounter = 0;
 
     /** Runs a statement as the service ran it and says how many rows ClickHouse read for it (`system.query_log`). */
-    async function readRows(ch: ClickHouseService, sql: string, params: Record<string, unknown>): Promise<number> {
+    async function readRows(
+      ch: ClickHouseService,
+      sql: string,
+      params: Record<string, unknown>,
+      settings: Record<string, string | number> = {},
+    ): Promise<number> {
       const id = `aggregator-read-rows-${container.config.database}-${++queryCounter}`;
-      const result = await ch.raw.query({ query: sql, query_params: params, format: 'JSONEachRow', query_id: id });
+      const result = await ch.raw.query({
+        query: sql,
+        query_params: params,
+        format: 'JSONEachRow',
+        query_id: id,
+        clickhouse_settings: settings,
+      });
       await result.text();
       await ch.command('SYSTEM FLUSH LOGS');
       const rows = await ch.query<{ read_rows: string }>(
@@ -411,9 +422,20 @@ describe('AggregatorService (e2e)', () => {
       }
     }
 
-    it('the watermark: a hundred hours from the newest, not the whole history of stats_hourly', async () => {
+    /**
+     * A database with 200,000 hours (23 years) of stats history before the current hour, and the watermark read of a tick on
+     * it: the statement and its parameters. The table holds three parts: the live hour of `fresh`, the history, the rows the
+     * tick wrote.
+     */
+    async function withHistory(
+      stopMerges: boolean,
+    ): Promise<{ ch: ClickHouseService; sql: string; params: Record<string, unknown> }> {
       const ch = await fresh(true, false);
-      // 200,000 hours (23 years) of history before the current hour
+      if (stopMerges) {
+        // the layout of production, where the merges lag behind the inserts, held still
+        const db = (await ch.query<{ db: string }>('SELECT currentDatabase() AS db'))[0].db;
+        await ch.command(`SYSTEM STOP MERGES ${db}.${Table.StatsHourly}`);
+      }
       await ch.command(
         `INSERT INTO ${Table.StatsHourly}
            (hour, transaction_count, payments_count, exchanges_count, accounts_created, ledger_count,
@@ -426,18 +448,59 @@ describe('AggregatorService (e2e)', () => {
         /LIMIT \{n:UInt32\}/.test(sql),
       );
       expect(reads).toHaveLength(1); // the newest hour has ledgers: one chunk
-      const [sql, params] = reads[0];
-      // One part, as the table is once the background merge has joined the three parts it has now (the history, the live
-      // hour, the tick's rows): each part is read for a block, so the number of rows read depends on when that merge ran.
+      return { ch, sql: reads[0][0], params: reads[0][1] };
+    }
+
+    /** The read the watermark query replaces: the whole table, deduped, then the newest. */
+    const WHOLE = `SELECT toUnixTimestamp(maxOrNull(hour)) AS hour
+                     FROM (SELECT hour, ledger_count FROM ${Table.StatsHourly} ORDER BY hour ASC, version DESC LIMIT 1 BY hour)
+                    WHERE ledger_count > 0`;
+
+    it('the watermark: a hundred hours from the newest, not the whole history of stats_hourly (one part)', async () => {
+      const { ch, sql, params } = await withHistory(false);
+      // One part, as the table is once the background merge has joined the three parts it has now: each part is read for a
+      // block, so with several the number of rows read depends on the layout (see the next test), and on when the merge ran.
       await ch.command(`OPTIMIZE TABLE ${Table.StatsHourly} FINAL`);
       // one block of the table read in reverse order (65,000 rows at most), whatever the history
       expect(await readRows(ch, sql, params)).toBeLessThanOrEqual(70_000);
 
       // the read it replaces (the whole table, deduped, then the newest) reads all of it
-      const whole = `SELECT toUnixTimestamp(maxOrNull(hour)) AS hour
-                       FROM (SELECT hour, ledger_count FROM ${Table.StatsHourly} ORDER BY hour ASC, version DESC LIMIT 1 BY hour)
-                      WHERE ledger_count > 0`;
-      expect(await readRows(ch, whole, {})).toBeGreaterThanOrEqual(200_000);
+      expect(await readRows(ch, WHOLE, {})).toBeGreaterThanOrEqual(200_000);
+    });
+
+    it('the watermark in the layout of production, several parts (the merges behind the inserts): every part read in reverse key order, merged without a sort of the table', async () => {
+      const { ch, sql, params } = await withHistory(true);
+      const parts = await ch.query<{ rows: string }>(
+        `SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = {table:String} AND active`,
+        { table: Table.StatsHourly },
+      );
+      expect(parts.length).toBeGreaterThanOrEqual(3); // the live hour, the history, the rows of the tick: not merged
+      const total = parts.reduce((sum, p) => sum + Number(p.rows), 0);
+      expect(total).toBeGreaterThanOrEqual(200_000);
+
+      // The rows this reads in such a layout are NOT bounded by the parts and their blocks: how many of them it reads before
+      // the LIMIT stops the streams depends on the scheduling of the threads (measured with 1 to 16 threads on this table: from
+      // 52,548 rows to all 200,004, run after run, and always all of them with one thread). So what is pinned is the shape of
+      // the read, which does not depend on it: each part is read from the end of its primary key, the parts are merged in order,
+      // the order within an hour is finished on the rows of that hour only and the LIMIT BY works on sorted input. A read of
+      // the whole table (the statement it replaces) sorts all of it.
+      const plan = (await ch.query<{ explain: string }>(`EXPLAIN PIPELINE ${sql}`, params))
+        .map((r) => r.explain)
+        .join('\n');
+      expect(plan.match(/algorithm: InReverseOrder/g)).toHaveLength(parts.length);
+      expect(plan).toMatch(/MergingSortedTransform 3 → 1/);
+      expect(plan).toMatch(/FinishSortingTransform/);
+      expect(plan).toMatch(/LimitBySortedStreamTransform/);
+      expect(plan).not.toMatch(/MergeSortingTransform/);
+      const whole = (await ch.query<{ explain: string }>(`EXPLAIN PIPELINE ${WHOLE}`)).map((r) => r.explain).join('\n');
+      expect(whole).toMatch(/MergeSortingTransform|FinishSortingTransform/);
+      expect(whole).not.toMatch(/algorithm: InReverseOrder/);
+
+      // and it finds the watermark, the newest hour that has ledgers, whatever the layout and the number of rows it reads
+      const [newest] = await ch.query<{ hour_start: string; ledger_count: string }>(sql, params);
+      expect(Number(newest.hour_start)).toBe(unix('2026-10-16T12:00:00Z'));
+      expect(Number(newest.ledger_count)).toBeGreaterThan(0);
+      expect(await readRows(ch, sql, params)).toBeLessThanOrEqual(total);
     });
 
     it('the first, the next and the newest ledger: a read of the primary key that stops at the first row, in a table of a million', async () => {

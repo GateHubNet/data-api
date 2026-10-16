@@ -71,8 +71,7 @@ interface Body {
 }
 
 /** The keys of a row, a trade component and a payment component, in the order the original served them. */
-const ROW_KEYS = ['components', 'count', 'exchange', 'total', 'exchange_rate', 'start_time'];
-const LIVE_ROW_KEYS = [...ROW_KEYS, 'end_time'];
+const ROW_KEYS = ['components', 'count', 'exchange', 'total', 'exchange_rate', 'start_time', 'end_time'];
 const TRADE_KEYS = ['count', 'rate', 'amount', 'base', 'counter', 'converted_amount'];
 const PAYMENT_KEYS = ['currency', 'issuer', 'amount', 'count', 'rate', 'converted_amount'];
 
@@ -217,7 +216,8 @@ const PAYMENT_DAYS: Record<string, Part[]> = {
     part(`USD.${I1}`, USD1, undefined, '10', 3, 20),
     part(`ZZZ.${I1}`, ZZZ1, undefined, '9', 2, 0),
   ],
-  '2026-02-26': [part('XRP', XRP, undefined, '1', 1, 1)],
+  // USD had no rate this day: its 2 payments are in the count of the row, and nowhere in the amount of its component
+  '2026-02-26': [part('XRP', XRP, undefined, '1', 1, 1), part(`USD.${I1}`, USD1, undefined, '9', 2, 0)],
   '2026-03-03': [part('XRP', XRP, undefined, '2', 2, 2), part(`USD.${I1}`, USD1, undefined, '4', 1, 8)],
 };
 
@@ -235,51 +235,74 @@ const eur = { currency: 'EUR', issuer: I1 };
 const foo = { currency: 'FOO', issuer: I2 };
 const xrp = { currency: 'XRP' };
 
-const base = (extra: Json): Json => ({ exchange: xrp, exchange_rate: '1.0000000', ...extra });
+/** A historical row of the hand-made sets: the bucket ends where the next one starts (a day, a week from Monday, a month). */
+const base = (extra: Json, unit: 'day' | 'week' | 'month' = 'day'): Json => {
+  const start = new Date(extra.start_time);
+  const end =
+    unit === 'month'
+      ? Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1)
+      : start.getTime() + (unit === 'week' ? 7 : 1) * DAY * SEC;
+  return { exchange: xrp, exchange_rate: '1.0000000', ...extra, end_time: iso(end / SEC) };
+};
 // the rows of the hand-made trade sets, written out, per interval
-const W1 = base({
-  components: [
-    tc(4, p8(16.5 / 48), '16.5', usd, xrp, '48'),
-    tc(1, p8(6 / 30), '6', eur, usd, '30'),
-    tc(2, p8(4 / 20), '4', eur, xrp, '20'),
-  ],
-  count: 7,
-  total: '98',
-  start_time: '2026-02-23T00:00:00Z',
-});
-const W2 = base({
-  components: [
-    tc(1, p8(10 / 30), '10', usd, foo, '30'),
-    tc(2, p8(100 / 25), '100', foo, usd, '25'),
-    tc(3, p8(2 / 6), '2', usd, xrp, '6'),
-  ],
-  count: 6,
-  total: '61',
-  start_time: '2026-03-02T00:00:00Z',
-});
-const W3 = base({
-  components: [tc(4, p8(7 / 21), '7', usd, xrp, '21')],
-  count: 4,
-  total: '21',
-  start_time: '2026-03-09T00:00:00Z',
-});
-const FEB = base({
-  components: [tc(3, p8(15.5 / 45), '15.5', usd, xrp, '45'), tc(2, p8(4 / 20), '4', eur, xrp, '20')],
-  count: 5,
-  total: '65',
-  start_time: '2026-02-01T00:00:00Z',
-});
-const MAR = base({
-  components: [
-    tc(1, p8(6 / 30), '6', eur, usd, '30'),
-    tc(1, p8(10 / 30), '10', usd, foo, '30'),
-    tc(8, p8(10 / 30), '10', usd, xrp, '30'),
-    tc(2, p8(100 / 25), '100', foo, usd, '25'),
-  ],
-  count: 12,
-  total: '115',
-  start_time: '2026-03-01T00:00:00Z',
-});
+const W1 = base(
+  {
+    components: [
+      tc(4, p8(16.5 / 48), '16.5', usd, xrp, '48'),
+      tc(1, p8(6 / 30), '6', eur, usd, '30'),
+      tc(2, p8(4 / 20), '4', eur, xrp, '20'),
+    ],
+    count: 7,
+    total: '98',
+    start_time: '2026-02-23T00:00:00Z',
+  },
+  'week',
+);
+const W2 = base(
+  {
+    components: [
+      tc(1, p8(10 / 30), '10', usd, foo, '30'),
+      tc(2, p8(100 / 25), '100', foo, usd, '25'),
+      tc(3, p8(2 / 6), '2', usd, xrp, '6'),
+    ],
+    count: 6,
+    total: '61',
+    start_time: '2026-03-02T00:00:00Z',
+  },
+  'week',
+);
+const W3 = base(
+  {
+    components: [tc(4, p8(7 / 21), '7', usd, xrp, '21')],
+    count: 4,
+    total: '21',
+    start_time: '2026-03-09T00:00:00Z',
+  },
+  'week',
+);
+const FEB = base(
+  {
+    components: [tc(3, p8(15.5 / 45), '15.5', usd, xrp, '45'), tc(2, p8(4 / 20), '4', eur, xrp, '20')],
+    count: 5,
+    total: '65',
+    start_time: '2026-02-01T00:00:00Z',
+  },
+  'month',
+);
+const MAR = base(
+  {
+    components: [
+      tc(1, p8(6 / 30), '6', eur, usd, '30'),
+      tc(1, p8(10 / 30), '10', usd, foo, '30'),
+      tc(8, p8(10 / 30), '10', usd, xrp, '30'),
+      tc(2, p8(100 / 25), '100', foo, usd, '25'),
+    ],
+    count: 12,
+    total: '115',
+    start_time: '2026-03-01T00:00:00Z',
+  },
+  'month',
+);
 
 describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () => {
   let h: Harness;
@@ -556,7 +579,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
         expect(Object.keys(res)).toEqual(['result', 'count', 'rows']);
         expect(res.count).toBe(1);
         expectSameShape(res.rows[0], tradeRow(tradesIn(END - SECONDS[period], END), END - SECONDS[period], END));
-        expect(Object.keys(res.rows[0])).toEqual(LIVE_ROW_KEYS);
+        expect(Object.keys(res.rows[0])).toEqual(ROW_KEYS);
       },
     );
 
@@ -680,7 +703,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
 
   // ===============================================================================================================
   describe('historical mode', () => {
-    it('day rows are the sets of the days, in order: the keys of the original, no end_time', async () => {
+    it('day rows are the sets of the days, in order: the keys of the original, end_time the next midnight', async () => {
       const res = await ok('/v2/network/exchange_volume?start=2026-02-23&end=2026-03-09');
       expect(res.count).toBe(7);
       expect(res.rows.map((r) => r.start_time)).toEqual([
@@ -717,6 +740,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
         total: '0',
         exchange_rate: '1.0000000',
         start_time: '2026-03-02T00:00:00Z',
+        end_time: '2026-03-03T00:00:00Z',
       });
     });
 
@@ -744,7 +768,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
       for (const row of res.rows) expect(Object.keys(row)).toEqual(ROW_KEYS);
     });
 
-    it('payment_volume: weeks and months add up the days; a currency with no converted amount is counted but not listed', async () => {
+    it('payment_volume: weeks and months add up the days; a currency with no converted amount is counted but not listed, and its amount is not in the rate of the days that had one', async () => {
       const days = await ok('/v2/network/payment_volume?start=2026-02-24&end=2026-03-03');
       expect(days.rows).toEqual([
         base({
@@ -758,7 +782,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
         }),
         base({
           components: [{ currency: 'XRP', amount: '1', count: 1, rate: p8(1), converted_amount: '1' }],
-          count: 1,
+          count: 3,
           total: '1',
           start_time: '2026-02-26T00:00:00Z',
         }),
@@ -774,28 +798,34 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
       ]);
       const weeks = await ok('/v2/network/payment_volume?start=2026-02-23&end=2026-03-02&interval=week');
       expect(weeks.rows).toEqual([
-        base({
-          components: [
-            { currency: 'USD', issuer: I1, amount: '10', count: 3, rate: p8(10 / 20), converted_amount: '20' },
-            { currency: 'XRP', amount: '11.5', count: 5, rate: p8(1), converted_amount: '11.5' },
-          ],
-          count: 10,
-          total: '31.5',
-          start_time: '2026-02-23T00:00:00Z',
-        }),
-        base({
-          components: [
-            { currency: 'USD', issuer: I1, amount: '4', count: 1, rate: p8(4 / 8), converted_amount: '8' },
-            { currency: 'XRP', amount: '2', count: 2, rate: p8(1), converted_amount: '2' },
-          ],
-          count: 3,
-          total: '10',
-          start_time: '2026-03-02T00:00:00Z',
-        }),
+        base(
+          {
+            components: [
+              { currency: 'USD', issuer: I1, amount: '10', count: 3, rate: p8(10 / 20), converted_amount: '20' },
+              { currency: 'XRP', amount: '11.5', count: 5, rate: p8(1), converted_amount: '11.5' },
+            ],
+            count: 12,
+            total: '31.5',
+            start_time: '2026-02-23T00:00:00Z',
+          },
+          'week',
+        ),
+        base(
+          {
+            components: [
+              { currency: 'USD', issuer: I1, amount: '4', count: 1, rate: p8(4 / 8), converted_amount: '8' },
+              { currency: 'XRP', amount: '2', count: 2, rate: p8(1), converted_amount: '2' },
+            ],
+            count: 3,
+            total: '10',
+            start_time: '2026-03-02T00:00:00Z',
+          },
+          'week',
+        ),
       ]);
       const months = await ok('/v2/network/payment_volume?start=2026-02&end=2026-03&interval=month');
       expect(months.rows.map((r) => [r.start_time, r.count, r.total])).toEqual([
-        ['2026-02-01T00:00:00Z', 10, '31.5'],
+        ['2026-02-01T00:00:00Z', 12, '31.5'],
         ['2026-03-01T00:00:00Z', 3, '10'],
       ]);
     });
@@ -846,9 +876,8 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
         // the week of the 9th ends after `end`: still all of it
         const w3 = await ok('/v2/network/exchange_volume?start=2026-03-09&end=2026-03-09&interval=week');
         expect(w3.rows).toEqual([W3]);
-        expect(await starts('start=2026-02-02&end=2026-02-28&interval=month')).toEqual(
-          ['2026-02-01T00:00:00Z'].slice(1),
-        );
+        // February began before the 2nd, and March begins after the 28th: no month starts in the window
+        expect(await starts('start=2026-02-02&end=2026-02-28&interval=month')).toEqual([]);
         expect(await starts('start=2026-02-01&end=2026-02-01&interval=month')).toEqual(['2026-02-01T00:00:00Z']);
       });
 
@@ -1006,7 +1035,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
       const plain = (await ok('/v2/network/exchange_volume?live=day')).rows[0];
       const res = await ok(`/v2/network/exchange_volume?live=day&${display}`);
       const row = res.rows[0];
-      expect(Object.keys(row)).toEqual(LIVE_ROW_KEYS);
+      expect(Object.keys(row)).toEqual(ROW_KEYS);
       expect(row.exchange).toEqual({ currency: 'XYZ', issuer: I2 });
       expect(row.exchange_rate).toBe('0.50000000');
       expect(row.total).toBe(String(Number(plain.total) * 0.5));
@@ -1272,6 +1301,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
           'total',
           'exchange_rate',
           'start_time',
+          'end_time',
         ]
           .map((h) => `"${h}"`)
           .join(','),
@@ -1297,6 +1327,7 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
           '50',
           '1.0000000',
           '2026-02-23T00:00:00Z',
+          '2026-02-24T00:00:00Z',
         ]
           .map((v) => `"${v}"`)
           .join(','),
@@ -1307,9 +1338,13 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
       expect(pay.text.split('\n')[0]).toMatch(/^"components\[0\]\.currency"/);
     });
 
-    it('a live row has end_time in the header, and the Link header is set for a page with a next one', async () => {
+    it('every row has end_time in the header, live or not, and the Link header is set for a page with a next one', async () => {
       const live = await get('/v2/network/exchange_volume?format=csv');
       expect(live.text.split('\n')[0]).toMatch(/"start_time","end_time"$/);
+      const week = await get('/v2/network/payment_volume?start=2026-02-23&end=2026-02-23&interval=week&format=csv');
+      const [header, row] = week.text.trim().split('\n');
+      expect(header).toMatch(/"exchange_rate","start_time","end_time"$/);
+      expect(row).toMatch(/"2026-02-23T00:00:00Z","2026-03-02T00:00:00Z"$/);
       const paged = await get('/v2/network/exchange_volume?start=2026-02-01&end=2026-03-31&limit=2&format=csv');
       expect(paged.headers.link).toMatch(/rel="next"/);
       expect(paged.text.trim().split('\n')).toHaveLength(3);
@@ -1407,6 +1442,65 @@ describe('GET /v2/network/exchange_volume and /v2/network/payment_volume', () =>
       expect(params.fetch).toBe(4);
     });
 
+    it('an end past the last day a Date holds, with a start in range, is not an error: the days are read up to 2149-06-06', async () => {
+      // a start in range and an end of the year 2200: the reads must not bind a date past what ClickHouse's Date holds
+      const spy = jest.spyOn(h.ch, 'query');
+      const res = await ok('/v2/network/exchange_volume?start=2026-03-01&end=2200-01-01');
+      const bound = volumeQueries(spy).flatMap(([, params]) =>
+        Object.values(params).filter((v) => /^\d{4}-\d\d-\d\d$/.test(String(v))),
+      );
+      spy.mockRestore();
+      expect(res.rows.map((r) => r.start_time.slice(0, 10))).toEqual([
+        '2026-03-01',
+        '2026-03-02',
+        '2026-03-03',
+        '2026-03-04',
+        '2026-03-09',
+      ]);
+      expect(bound.length).toBeGreaterThan(0);
+      expect([...bound].sort().pop()).toBe('2149-06-06');
+      expect((await ok('/v2/network/payment_volume?start=2026-03-01&end=2999-12-31')).count).toBe(1);
+      for (const interval of ['week', 'month']) {
+        expect(
+          (await ok(`/v2/network/exchange_volume?start=2026-03-01&end=2300-01-01&interval=${interval}`)).count,
+        ).toBeGreaterThan(0);
+      }
+      // and with a display currency: the window of the rates is not bound as a Date
+      expect(
+        (
+          await ok(
+            `/v2/network/exchange_volume?start=2026-03-01&end=2200-01-01&exchange_currency=XYZ&exchange_issuer=${I2}`,
+          )
+        ).count,
+      ).toBe(5);
+    });
+
+    it('the last day a Date holds is read, whatever the interval (a set of 2149-06-06; its week and month end past the Date range)', async () => {
+      // (it stays: the merges are stopped, and a lightweight DELETE would wait for ever; the tests after this one end before 2149)
+      await h.ch.insert(Table.VolumeDaily, setRows('trade_volume', '2149-06-06', V, [part(A, USD1, XRP, '3', 1, 9)]));
+      const day = await ok('/v2/network/exchange_volume?start=2149-06-06&end=2200-01-01');
+      expect(day.rows).toEqual([
+        base({
+          components: [tc(1, p8(3 / 9), '3', usd, xrp, '9')],
+          count: 1,
+          total: '9',
+          start_time: '2149-06-06T00:00:00Z',
+        }),
+      ]);
+      expect(day.rows[0].end_time).toBe('2149-06-07T00:00:00Z');
+      // 2149-06-06 is a Friday: its week began on the 2nd and ends on the 9th, its month began on the 1st and ends on July 1st
+      const week = await ok('/v2/network/exchange_volume?start=2149-06-02&end=2300-01-01&interval=week');
+      expect(week.rows.map((r) => [r.start_time, r.end_time, r.count])).toEqual([
+        ['2149-06-02T00:00:00Z', '2149-06-09T00:00:00Z', 1],
+      ]);
+      const month = await ok('/v2/network/exchange_volume?start=2149-06&end=2300-01-01&interval=month');
+      expect(month.rows.map((r) => [r.start_time, r.end_time, r.count])).toEqual([
+        ['2149-06-01T00:00:00Z', '2149-07-01T00:00:00Z', 1],
+      ]);
+      expect((await ok('/v2/network/exchange_volume?start=2149-06-07&end=2300-01-01')).rows).toEqual([]);
+      expect((await ok('/v2/network/exchange_volume?start=2149-06-06&end=2149-06-06')).count).toBe(1);
+    });
+
     it('a window past the last day a Date holds is empty without a query', async () => {
       const spy = jest.spyOn(h.ch, 'query');
       const res = await ok('/v2/network/exchange_volume?start=2200-01-01&end=2300-01-01');
@@ -1469,7 +1563,7 @@ describe('GET /v2/network/*_volume on Xahau with an empty markets config', () =>
         },
       ],
     });
-    expect(Object.keys(res.rows[0])).toEqual(LIVE_ROW_KEYS);
+    expect(Object.keys(res.rows[0])).toEqual(ROW_KEYS);
   });
 
   it('every period of both routes has its row', async () => {
@@ -1500,6 +1594,7 @@ describe('GET /v2/network/*_volume on Xahau with an empty markets config', () =>
         total: String(sum.toNumber()),
         exchange_rate: '1.0000000',
         start_time: `${day}T00:00:00Z`,
+        end_time: iso(dayStart + DAY),
       },
     ]);
   });
@@ -1514,6 +1609,7 @@ describe('GET /v2/network/*_volume on Xahau with an empty markets config', () =>
         total: '0',
         exchange_rate: '1.0000000',
         start_time: `${day}T00:00:00Z`,
+        end_time: iso(dayStart + DAY),
       },
     ]);
     const week = (await api.ok<Body>(`/v2/network/exchange_volume?start=${day}&end=${day}&interval=week`, 'rows')).body;

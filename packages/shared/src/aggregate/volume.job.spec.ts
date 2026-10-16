@@ -64,6 +64,34 @@ describe('assertValidMarketsConfig', () => {
     expect(() => assertValidMarketsConfig(config(), 'XRP')).not.toThrow();
   });
 
+  it('accepts the codes of the ledger: three characters of the standard set, or 40 hexadecimal digits', () => {
+    const codes = [
+      'USD',
+      'usd',
+      'U5D',
+      'BTC',
+      '$$$',
+      'A!B',
+      '524C555344000000000000000000000000000000',
+      '524c555344000000000000000000000000000000',
+    ];
+    expect(() =>
+      assertValidMarketsConfig(
+        config({ paymentCurrencies: codes.map((currency) => ({ currency, issuer: ISSUER })) }),
+        'XRP',
+      ),
+    ).not.toThrow();
+  });
+
+  it('says what is wrong with the address and with the code', () => {
+    expect(() =>
+      assertValidMarketsConfig(config({ paymentCurrencies: [{ currency: 'USD', issuer: 'rNope' }] }), 'XRP'),
+    ).toThrow('Invalid markets config: paymentCurrencies[0]: the issuer "rNope" is not a classic address');
+    expect(() =>
+      assertValidMarketsConfig(config({ paymentCurrencies: [{ currency: 'DOLLAR', issuer: ISSUER }] }), 'XRP'),
+    ).toThrow('paymentCurrencies[0]: "DOLLAR" is not a currency code (three characters, or 40 hexadecimal digits)');
+  });
+
   it('accepts a market with the native currency on either side', () => {
     expect(() =>
       assertValidMarketsConfig(
@@ -129,6 +157,53 @@ describe('assertValidMarketsConfig', () => {
     [
       'a payment currency that is not an object',
       config({ paymentCurrencies: [null as never] }),
+      'paymentCurrencies[0]',
+    ],
+    [
+      'an issuer that is not a classic address',
+      config({ tradeMarkets: [{ base: { currency: 'USD', issuer: 'notanaddress' }, counter: XRP }] }),
+      'tradeMarkets[0].base',
+    ],
+    [
+      'an issuer whose checksum is wrong',
+      config({
+        tradeMarkets: [{ base: { currency: 'USD', issuer: 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2X' }, counter: XRP }],
+      }),
+      'tradeMarkets[0].base',
+    ],
+    [
+      'the counter issuer being no address',
+      config({ tradeMarkets: [{ base: USD, counter: { currency: 'EUR', issuer: 'r' } }] }),
+      'tradeMarkets[0].counter',
+    ],
+    [
+      'a payment issuer that is no address',
+      config({ paymentCurrencies: [{ currency: 'USD', issuer: 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59X' }] }),
+      'paymentCurrencies[0]',
+    ],
+    [
+      'a currency code of two characters',
+      config({ tradeMarkets: [{ base: { currency: 'US', issuer: ISSUER }, counter: XRP }] }),
+      'tradeMarkets[0].base',
+    ],
+    [
+      'a currency code of four characters',
+      config({ tradeMarkets: [{ base: { currency: 'USDT', issuer: ISSUER }, counter: XRP }] }),
+      'tradeMarkets[0].base',
+    ],
+    [
+      'a currency code with a space',
+      config({ tradeMarkets: [{ base: { currency: 'U D', issuer: ISSUER }, counter: XRP }] }),
+      'tradeMarkets[0].base',
+    ],
+    [
+      'a hexadecimal currency code of 39 digits',
+      config({ paymentCurrencies: [{ currency: '524C55534400000000000000000000000000000', issuer: ISSUER }] }),
+      'paymentCurrencies[0]',
+    ],
+    [
+      'a currency code of 40 characters that are not all hexadecimal',
+      config({ paymentCurrencies: [{ currency: '524C5553440000000000000000000000000000ZZ', issuer: ISSUER }] }),
       'paymentCurrencies[0]',
     ],
     ['a version that is not a whole number', config({ version: 1.5 }), 'version'],

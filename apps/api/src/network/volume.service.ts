@@ -103,40 +103,43 @@ export class VolumeService {
     const after = decodeMarker(q.marker, BUCKET_KEYS);
 
     let from = Math.max(ceilBucket(q.start.getTime(), q.interval), 0);
-    // the days before this belong to buckets that start before `endExclusive`
-    const until = Math.min(ceilBucket(q.endExclusive.getTime(), q.interval), MAX_DAY_MS + DAY_MS);
+    // the days up to the one before this belong to buckets that start before `endExclusive`; the last day a `Date` of ClickHouse
+    // holds is the end, so that no date past it is ever bound
+    const until = ceilBucket(q.endExclusive.getTime(), q.interval);
     // strictly after the bucket the marker names, whatever interval it was made for
     if (after !== undefined) from = Math.max(from, nextBucket(Number(after[0]) * 1000, q.interval));
-    if (from >= until) return { rows: [] };
+    const lastDay = Math.min(until - DAY_MS, MAX_DAY_MS);
+    if (from > lastDay) return { rows: [] };
 
     const found = await this.ch.query<{ bucket: string }>(
       `SELECT toString(${BUCKET_OF_DAY[q.interval]}) AS bucket
          FROM ${Table.VolumeDaily}
-        WHERE metric = {metric:String} AND day >= {from:Date} AND day < {until:Date}
+        WHERE metric = {metric:String} AND day >= {from:Date} AND day <= {last:Date}
         GROUP BY bucket
         ORDER BY bucket ASC
         LIMIT {fetch:UInt32}`,
       // one row more than the page: it only tells whether there is a next page
-      { metric: q.metric, from: dayText(from), until: dayText(until), fetch: q.limit + 1 },
+      { metric: q.metric, from: dayText(from), last: dayText(lastDay), fetch: q.limit + 1 },
     );
     const page = paginate(found, q.limit, (row) => [Date.parse(`${row.bucket}T00:00:00Z`) / 1000]);
     if (page.rows.length === 0) return { rows: [] };
 
     const starts = page.rows.map((row) => Date.parse(`${row.bucket}T00:00:00Z`));
     const first = starts[0];
+    // where the last bucket ends, exclusive; the days it holds are read up to the last day a `Date` holds
     const last = nextBucket(starts[starts.length - 1], q.interval);
     const days = await this.ch.query<DayRow>(
       `SELECT toString(day) AS day_text, component, base_currency, base_issuer, counter_currency, counter_issuer, amount,
               toUInt64(count) AS count, converted_f
          FROM ${Table.VolumeDaily}
-        WHERE metric = {metric:String} AND day >= {a:Date} AND day < {b:Date}
+        WHERE metric = {metric:String} AND day >= {a:Date} AND day <= {z:Date}
           AND (day, version) IN (
               SELECT day, max(version) FROM ${Table.VolumeDaily}
-               WHERE metric = {metric:String} AND day >= {a:Date} AND day < {b:Date}
+               WHERE metric = {metric:String} AND day >= {a:Date} AND day <= {z:Date}
                GROUP BY day)
         ORDER BY metric, day, component
         LIMIT 1 BY day, component`,
-      { metric: q.metric, a: dayText(first), b: dayText(last) },
+      { metric: q.metric, a: dayText(first), z: dayText(Math.min(last - DAY_MS, MAX_DAY_MS)) },
     );
 
     const byBucket = new Map<number, DayRow[]>(starts.map((start) => [start, []]));
@@ -151,7 +154,9 @@ export class VolumeService {
       const parts: VolumePart[] = sumParts(byBucket.get(start) ?? []);
       const display =
         q.display && vwaps ? { asset: q.display, rate: vwaps.get(start / 1000) ?? new BigNumber(0) } : undefined;
-      return toVolumeRow(q.metric, { start: start / 1000, parts }, this.native, display);
+      // the row ends where the next bucket starts (exclusive), as a live row ends at its `end`
+      const bucket = { start: start / 1000, end: nextBucket(start, q.interval) / 1000, parts };
+      return toVolumeRow(q.metric, bucket, this.native, display);
     });
     return { rows, ...(page.marker !== undefined && { marker: page.marker }) };
   }

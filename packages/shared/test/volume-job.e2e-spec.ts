@@ -6,7 +6,9 @@ import {
   computeDailyVolumeSet,
   computeLiveVolumes,
   computeLiveVolumeSet,
+  dailySetVersions,
   LivePeriod,
+  liveSetVersions,
   PAYMENT_LIVE_PERIODS,
   TRADE_LIVE_PERIODS,
   VOLUME_DAY_SETTLE_MS,
@@ -130,8 +132,11 @@ const parts = (rows: StoredRow[]): StoredRow[] =>
     .filter((r) => r.component !== '')
     .sort((a, b) => b.converted_f - a.converted_f || (a.component < b.component ? -1 : 1));
 
-/** The sentinel row of a set of a day, as the job writes it, with the version and the config version of the test. */
-const setOfSentinel = (metric: string, day: string, version: number, configVersion: number) => ({
+/**
+ * The sentinel row of a set of a day, as the job writes it, with the version and the config version of the test; `final`
+ * is the flag of the set (`rate_f` 1: the ingest had passed the day when it was written).
+ */
+const setOfSentinel = (metric: string, day: string, version: number, configVersion: number, final = true) => ({
   ...SAMPLE_ROWS[Table.VolumeDaily],
   metric,
   day,
@@ -143,7 +148,7 @@ const setOfSentinel = (metric: string, day: string, version: number, configVersi
   amount: '0',
   amount_f: 0,
   count: 0,
-  rate_f: 0,
+  rate_f: final ? 1 : 0,
   converted_f: 0,
   config_version: configVersion,
   version,
@@ -283,7 +288,7 @@ describe('volume jobs (e2e)', () => {
         expectTrades(set, want);
       });
 
-      it('a day with ledgers but no trade, and a day with no ledger at all, hold the sentinel only', async () => {
+      it('a day with ledgers but no trade, and a day with no ledger at all, hold the sentinel only: final, the ingest is past them', async () => {
         for (const day of ['2013-06-11', '2014-06-01']) {
           await computeDailyVolumes(ch, rates, MARKETS, new Date(`${day}T00:00:00Z`));
           const set = await dailySet(ch, 'trade_volume', day);
@@ -293,9 +298,17 @@ describe('volume jobs (e2e)', () => {
             count: 0,
             amount: '0',
             converted_f: 0,
-            rate_f: 0,
+            rate_f: 1,
             config_version: 7,
           });
+        }
+      });
+
+      it('the last day of the ledgers is not final: the ingest has not passed it', async () => {
+        // the newest mock ledger closed on 2017-05-12
+        await computeDailyVolumes(ch, rates, MARKETS, new Date('2017-05-12T00:00:00Z'));
+        for (const metric of VOLUME_METRICS) {
+          expect((await dailySet(ch, metric, '2017-05-12'))[0]).toMatchObject({ component: '', rate_f: 0 });
         }
       });
 
@@ -950,35 +963,26 @@ describe('volume jobs (e2e)', () => {
         expect([...done]).toEqual([DAY_KEY]);
       });
 
-      it('a set made while the day was going, or within the hour after it, is a snapshot: the day is not done on its account', async () => {
-        const row = (day: string, version: number, configVersion = 5) =>
-          setOfSentinel('trade_volume', day, version, configVersion);
-        const endOf = (day: string): number => Date.parse(`${day}T00:00:00Z`) + 86_400_000;
+      it('only a final set makes a day done: the same config version with the flag off is not enough', async () => {
+        const window: [Date, Date] = [new Date('2015-01-01T00:00:00Z'), new Date('2015-02-01T00:00:00Z')];
         await ch.insert(Table.VolumeDaily, [
-          row('2015-01-10', endOf('2015-01-10') - 3_600_000), // an hour before the day ended
-          row('2015-01-11', endOf('2015-01-11') - 1), // a millisecond before
-          row('2015-01-12', endOf('2015-01-12') + 1_800_000), // half an hour after: the ingest may still be catching up
-          row('2015-01-13', endOf('2015-01-13') + 3_599_999), // one millisecond short of the hour
-          row('2015-01-14', endOf('2015-01-14') + 3_600_000), // the hour, to the millisecond
-          row('2015-01-15', endOf('2015-01-15') + 7_200_000), // two hours after
+          setOfSentinel('trade_volume', '2015-01-10', 1000, 5, true),
+          setOfSentinel('trade_volume', '2015-01-11', 1000, 5, false),
+          setOfSentinel('payment_volume', '2015-01-11', 1000, 5, true),
         ]);
-        const done = await volumeDaysDone(
-          ch,
-          'trade_volume',
-          new Date('2015-01-01T00:00:00Z'),
-          new Date('2015-02-01T00:00:00Z'),
-          5,
-        );
-        expect([...done].sort()).toEqual(['2015-01-14', '2015-01-15']);
-        expect(VOLUME_DAY_SETTLE_MS).toBe(3_600_000);
+        expect([...(await volumeDaysDone(ch, 'trade_volume', ...window, 5))]).toEqual(['2015-01-10']);
+        expect([...(await volumeDaysDone(ch, 'payment_volume', ...window, 5))]).toEqual(['2015-01-11']);
       });
 
-      it('goes by the newest set of the day: a newer final set of another config version un-does the day for the old one', async () => {
-        const endOf = Date.parse('2015-01-10T00:00:00Z') + 86_400_000;
+      it('goes by the newest set of the day: a newer set that is not final, or of another config version, un-does the day', async () => {
         const window: [Date, Date] = [new Date('2015-01-10T00:00:00Z'), new Date('2015-01-11T00:00:00Z')];
-        await ch.insert(Table.VolumeDaily, [setOfSentinel('trade_volume', '2015-01-10', endOf + 7_200_000, 5)]);
+        await ch.insert(Table.VolumeDaily, [setOfSentinel('trade_volume', '2015-01-10', 1000, 5, true)]);
         expect((await volumeDaysDone(ch, 'trade_volume', ...window, 5)).size).toBe(1);
-        await ch.insert(Table.VolumeDaily, [setOfSentinel('trade_volume', '2015-01-10', endOf + 10_800_000, 6)]);
+        // a newer set made before the ingest had passed the day (a rewind of the ingest, a restore): the day is not done
+        await ch.insert(Table.VolumeDaily, [setOfSentinel('trade_volume', '2015-01-10', 2000, 5, false)]);
+        expect((await volumeDaysDone(ch, 'trade_volume', ...window, 5)).size).toBe(0);
+        // a newer final set of another config version: not done for 5, done for 6
+        await ch.insert(Table.VolumeDaily, [setOfSentinel('trade_volume', '2015-01-10', 3000, 6, true)]);
         expect((await volumeDaysDone(ch, 'trade_volume', ...window, 5)).size).toBe(0);
         expect((await volumeDaysDone(ch, 'trade_volume', ...window, 6)).size).toBe(1);
       });
@@ -989,6 +993,72 @@ describe('volume jobs (e2e)', () => {
         expect((await volumeDaysDone(ch, 'trade_volume', new Date('2016-01-01T00:00:00Z'), THE_DAY, 5)).size).toBe(0);
         expect(spy).not.toHaveBeenCalled();
         spy.mockRestore();
+      });
+    });
+
+    describe('the versions of the sets (the aggregator starts with the stalest)', () => {
+      it('liveSetVersions: the newest version of every live set that exists, keyed metric/period', async () => {
+        expect((await liveSetVersions(ch)).size).toBe(0);
+        const before = Date.now();
+        await computeLiveVolumes(ch, rates, config(5, nativeMarkets), new Date('2015-01-14T19:30:00Z'));
+        const versions = await liveSetVersions(ch);
+        expect([...versions.keys()].sort()).toEqual([
+          'payment_volume/day',
+          'payment_volume/hour',
+          'trade_volume/30day',
+          'trade_volume/3day',
+          'trade_volume/7day',
+          'trade_volume/day',
+          'trade_volume/hour',
+        ]);
+        for (const version of versions.values()) expect(version).toBeGreaterThanOrEqual(before - 5000);
+        // a set written again has a newer version; one that was not is as it was
+        const hour = versions.get('trade_volume/hour') as number;
+        const day = versions.get('trade_volume/day') as number;
+        await computeLiveVolumeSet(
+          ch,
+          rates,
+          config(5, nativeMarkets),
+          'trade_volume',
+          'hour',
+          new Date('2015-01-14T19:31:00Z'),
+        );
+        const after = await liveSetVersions(ch);
+        expect(after.get('trade_volume/hour')).toBeGreaterThan(hour);
+        expect(after.get('trade_volume/day')).toBe(day);
+      });
+
+      it('dailySetVersions: the sets of the days of the window only, keyed metric/day', async () => {
+        const cfg = config(5, nativeMarkets);
+        await computeDailyVolumeSet(ch, rates, cfg, 'trade_volume', new Date('2015-01-14T00:00:00Z'));
+        await computeDailyVolumeSet(ch, rates, cfg, 'payment_volume', new Date('2015-01-14T00:00:00Z'));
+        await computeDailyVolumeSet(ch, rates, cfg, 'trade_volume', new Date('2015-01-13T00:00:00Z'));
+        await computeDailyVolumeSet(ch, rates, cfg, 'trade_volume', new Date('2015-01-10T00:00:00Z'));
+        const versions = await dailySetVersions(ch, new Date('2015-01-13T05:00:00Z'), new Date('2015-01-14T23:00:00Z'));
+        expect([...versions.keys()].sort()).toEqual([
+          'payment_volume/2015-01-14',
+          'trade_volume/2015-01-13',
+          'trade_volume/2015-01-14',
+        ]);
+        expect(
+          (await dailySetVersions(ch, new Date('2015-01-15T00:00:00Z'), new Date('2015-01-20T00:00:00Z'))).size,
+        ).toBe(0);
+        expect(
+          (await dailySetVersions(ch, new Date('2015-01-20T00:00:00Z'), new Date('2015-01-15T00:00:00Z'))).size,
+        ).toBe(0);
+      });
+
+      it('take the newest of the versions a set has, and bind their values', async () => {
+        await ch.insert(Table.VolumeLive, [
+          { ...SAMPLE_ROWS[Table.VolumeLive], metric: 'trade_volume', period: 'hour', component: '', version: 5 },
+          { ...SAMPLE_ROWS[Table.VolumeLive], metric: 'trade_volume', period: 'hour', component: 'x', version: 9 },
+        ]);
+        const spy = jest.spyOn(ch, 'query');
+        expect((await liveSetVersions(ch)).get('trade_volume/hour')).toBe(9);
+        await dailySetVersions(ch, new Date('2015-01-13T00:00:00Z'), new Date('2015-01-14T00:00:00Z'));
+        const texts = spy.mock.calls.map(([sql]) => String(sql));
+        spy.mockRestore();
+        for (const text of texts) expect(text).not.toMatch(/\bFINAL\b|2015/);
       });
     });
 
@@ -1125,6 +1195,111 @@ describe('volume jobs (e2e)', () => {
         expect(await liveSet(xahau, 'trade_volume', 'day')).toHaveLength(1);
         expect(parts(await liveSet(xahau, 'payment_volume', 'day')).map((r) => r.component)).toEqual(['XAH']);
       });
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('the final flag of a daily set: the ledger time of the ingest against the end of the day (times relative to the real clock)', () => {
+    // The set of a day is the final one when the newest ledger closed VOLUME_DAY_SETTLE_MS after the end of the day. The
+    // wall clock has nothing to do with it, so these tests run with the days ten days before the real today and ledgers
+    // placed around the end of that day: a rule that went by the version (the time of the write, which is now, long after
+    // the day) would call every set final.
+    const SETTLE = VOLUME_DAY_SETTLE_MS / SEC;
+    const today = Math.floor(Date.now() / SEC / DAY) * DAY;
+    const D = today - 10 * DAY;
+    const END = D + DAY;
+    const dayText = new Date(D * SEC).toISOString().slice(0, 10);
+    const window: [Date, Date] = [at(D - DAY), at(END + DAY)];
+    let ch: ClickHouseService;
+    let rates: RatesService;
+    let nextLedger: number;
+
+    beforeEach(async () => {
+      ch = await freshService();
+      rates = new RatesService(ch, 'XRP');
+      nextLedger = 5000;
+    });
+
+    /** A ledger that closed at `close` (a later one than every ledger before it). */
+    const ledger = async (close: number): Promise<void> => {
+      const index = nextLedger++;
+      await ch.insert(Table.Ledgers, [
+        {
+          ...SAMPLE_ROWS[Table.Ledgers],
+          ledger_index: index,
+          ledger_hash: String(index).padStart(64, 'A'),
+          close_time: close,
+        },
+      ]);
+    };
+    const flagOf = async (metric: VolumeMetric = 'trade_volume'): Promise<number> => {
+      await computeDailyVolumeSet(ch, rates, MARKETS, metric, at(D));
+      return (await dailySet(ch, metric, dayText))[0].rate_f;
+    };
+
+    it('is on from the settle time after the end of the day, to the second, in ledger time', async () => {
+      expect(await flagOf()).toBe(0); // no ledger at all
+      const seen: [number, number][] = [];
+      for (const close of [END - 1, END, END + SETTLE - 1, END + SETTLE, END + 2 * DAY]) {
+        await ledger(close);
+        seen.push([close - END, await flagOf()]);
+      }
+      expect(seen).toEqual([
+        [-1, 0],
+        [0, 0],
+        [SETTLE - 1, 0],
+        [SETTLE, 1],
+        [2 * DAY, 1],
+      ]);
+    });
+
+    it('both metrics carry the flag, and the days that are not over carry none', async () => {
+      await ledger(END + SETTLE);
+      for (const metric of VOLUME_METRICS) expect(await flagOf(metric)).toBe(1);
+      // the day of the newest ledger itself, and the day after it
+      await computeDailyVolumeSet(ch, rates, MARKETS, 'trade_volume', at(END));
+      await computeDailyVolumeSet(ch, rates, MARKETS, 'trade_volume', at(END + DAY));
+      expect((await dailySet(ch, 'trade_volume', new Date(END * SEC).toISOString().slice(0, 10)))[0].rate_f).toBe(0);
+      expect(
+        (await dailySet(ch, 'trade_volume', new Date((END + DAY) * SEC).toISOString().slice(0, 10)))[0].rate_f,
+      ).toBe(0);
+    });
+
+    it('a day the ingest has not reached is not done (the ingest started at an old ledger), and is once it has', async () => {
+      await ledger(D - 100 * DAY); // the ingest is 100 days behind that day
+      expect(await flagOf()).toBe(0);
+      expect((await volumeDaysDone(ch, 'trade_volume', ...window, MARKETS.version)).size).toBe(0);
+      // the set is there: a sentinel with nothing in it, which is NOT a final one
+      expect((await dailySet(ch, 'trade_volume', dayText)).map((r) => r.component)).toEqual(['']);
+
+      await ledger(D + 3 * 3600); // it reaches the day, but not its end
+      expect(await flagOf()).toBe(0);
+      await ledger(END + SETTLE); // and passes it
+      expect(await flagOf()).toBe(1);
+      expect([...(await volumeDaysDone(ch, 'trade_volume', ...window, MARKETS.version))]).toEqual([dayText]);
+    });
+
+    it('a day computed while its last hour was missing (an outage) is not done, and is recomputed once the ledgers are in', async () => {
+      // 20 hours of the day are in: the newest ledger closed at 20:00
+      await ledger(D + 20 * 3600);
+      expect(await flagOf('payment_volume')).toBe(0);
+      expect((await volumeDaysDone(ch, 'payment_volume', ...window, MARKETS.version)).size).toBe(0);
+      // the rest of the day and an hour of the next arrive
+      await ledger(D + 23 * 3600 + 1800);
+      await ledger(END + 3600);
+      expect(await flagOf('payment_volume')).toBe(1);
+      expect([...(await volumeDaysDone(ch, 'payment_volume', ...window, MARKETS.version))]).toEqual([dayText]);
+    });
+
+    it('reads the newest ledger BEFORE the trades and the payments, so that what it counted is at least what the flag says', async () => {
+      await ledger(END + SETTLE);
+      const spy = jest.spyOn(ch, 'query');
+      await computeDailyVolumeSet(ch, rates, MARKETS, 'payment_volume', at(D));
+      const texts = spy.mock.calls.map(([sql]) => String(sql));
+      spy.mockRestore();
+      const newest = texts.findIndex((t) => /FROM ledgers\s+ORDER BY ledger_index DESC\s+LIMIT 1/.test(t));
+      expect(newest).toBe(0);
+      expect(texts.findIndex((t) => /close_time >=/.test(t))).toBeGreaterThan(newest);
     });
   });
 });
