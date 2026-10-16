@@ -51,7 +51,7 @@ const metrics = {
   }),
   validationsDroppedTotal: new Counter({
     name: 'syncer_validations_dropped_total',
-    help: 'Validations (or buffered rows) the collector did not keep, by reason (buffer_full, no_reporter, invalid).',
+    help: 'Validations (or buffered rows) the collector did not keep, by reason (buffer_full, no_reporter, manifest_no_reporter, invalid, shutdown).',
     labelNames: ['reason'],
     registers: [registry],
   }),

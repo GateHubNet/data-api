@@ -92,7 +92,7 @@ describe('toValidation()', () => {
     expect(v.flags).toBe('2147483649');
   });
 
-  it('leaves out what HBase did not store: empty text, NULL fees, a partial validation (full 0)', () => {
+  it('leaves out what HBase did not store: empty text (R76: the signature too), NULL fees, a partial validation (full 0)', () => {
     const v = toValidation(
       stored({
         amendments: '',
@@ -103,6 +103,7 @@ describe('toValidation()', () => {
         full: 0,
         ephemeral_public_key: '',
         reporter_public_key: '',
+        signature: '',
       }),
     );
     expect(Object.keys(v)).toEqual([
@@ -112,7 +113,6 @@ describe('toValidation()', () => {
       'last_datetime',
       'ledger_hash',
       'ledger_index',
-      'signature',
       'signing_time',
       'validation_public_key',
     ]);

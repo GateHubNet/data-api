@@ -32,7 +32,7 @@ export interface StoredValidation {
  * family and name by name (`rowkey` removed), where the route made `count` a number and nothing else. So: the keys are
  * sorted by name, the values are text (`flags: "2147483649"`, `ledger_index: "46087342"`, `full: "true"`), and a column
  * that was empty is not there at all (the writer did not store an empty value: no `amendments`, no fee fields when the
- * validation carried none, no `full` on a partial validation). Datetimes are `YYYY-MM-DDTHH:mm:ss.SSSZ`.
+ * validation carried none, no `signature` when there was none to store, no `full` on a partial validation). Datetimes are `YYYY-MM-DDTHH:mm:ss.SSSZ`.
  *
  * `ephemeral_public_key` is the signing key the validation was made with. The original wrote it for the rows of its first
  * collector (they are in its mock data) and not any more; here it is stored again, so it is served when there is one.
@@ -52,7 +52,7 @@ export interface Validation {
   reporter_public_key?: string;
   reserve_base?: string;
   reserve_inc?: string;
-  signature: string;
+  signature?: string;
   signing_time: string;
   validation_public_key: string;
 }
@@ -76,7 +76,7 @@ export function toValidation(row: StoredValidation): Validation {
     reporter_public_key: orNothing(row.reporter_public_key),
     reserve_base: orNothing(row.reserve_base),
     reserve_inc: orNothing(row.reserve_inc),
-    signature: row.signature,
+    signature: orNothing(row.signature),
     signing_time: String(row.signing_time),
     validation_public_key: row.validation_public_key,
   });

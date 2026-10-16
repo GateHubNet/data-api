@@ -25,6 +25,13 @@ export const VALIDATIONS_FLUSH_INTERVAL_MS = 20_000;
 export const VALIDATIONS_SHUTDOWN_WAIT_MS = 3_000;
 
 /**
+ * Of the shutdown's budget, how long the validations that wait for a `manifest` answer get. A node that hangs must not
+ * starve the final flush of every other row in the buffer; what still waits after this is dropped and counted
+ * (`reason="shutdown"`), not recorded under its signing key: that would list the validator a second time for the ledger.
+ */
+export const VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS = 1_000;
+
+/**
  * The most rows the buffer holds. A mainnet node reports about 10 validations a second, so a flush (every 20 s) writes
  * a few hundred rows; 50 000 is a hundred times that, an outage of ClickHouse of more than an hour at about 25 MB.
  * Past it the oldest rows are dropped, counted (`syncer_validations_dropped_total{reason="buffer_full"}`) and logged.
@@ -207,8 +214,10 @@ interface ManifestAnswer {
  * - **Messages in the replay window of a reconnect** (between the connection dropping and the subscription being sent
  *   again) are lost; so are the ones a node never sent. That is the node client's contract.
  * - **Stops** on module destroy and on SIGTERM / SIGINT (`ShutdownSignals`): the timers stop, the messages are no longer
- *   listened to, pending manifest lookups are awaited, the buffer is flushed once more, and the clients are stopped, all
- *   within `VALIDATIONS_SHUTDOWN_WAIT_MS`.
+ *   listened to, the validations that wait for a manifest answer get `VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS` (what still
+ *   waits after that is dropped and counted, `reason="shutdown"`), the buffer is flushed once more, and the clients are
+ *   stopped, all within `VALIDATIONS_SHUTDOWN_WAIT_MS`. A flush not done by then is abandoned, and from that moment no
+ *   insert is started by anything (a flush chained behind one that hangs, a lookup that settles late).
  * - **Never crashes.** Every failure (flush, `server_info`, manifest RPC or load, a message that breaks the handler) is
  *   logged and counted in `syncer_validations_errors_total{stage}`; none escapes into the stream.
  */
@@ -241,6 +250,11 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
   /** Validations waiting for a master key, as the promises that record them. */
   private readonly waiting = new Set<Promise<void>>();
 
+  /** Set when the final flush is given up on: from then on no insert is started, whoever asks for it. */
+  private abandoned = false;
+  /** Set when the shutdown stops waiting for the manifest lookups: what they answer later is not recorded. */
+  private lookupsCutOff = false;
+
   private lastFlush?: Promise<void>;
   private flushesInFlight = 0;
   /** The rows of the flush under way, which a shutdown that gives up on it reports as at stake. */
@@ -270,6 +284,11 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
   /** The rows waiting for the next flush. */
   get bufferedRows(): number {
     return this.buffer.size;
+  }
+
+  /** The reporter of each feed, in the order of the endpoints: `undefined` while it is not known, and for a refused node. */
+  get reporters(): (string | undefined)[] {
+    return this.feeds.map((feed) => feed.reporter);
   }
 
   /** Starts the flush timer and the feeds. The feeds are not awaited: a node that is down does not hold up the boot. */
@@ -323,7 +342,11 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
 
     // not known: ask the node, and record the validation under what it answers
     const recorded: Promise<void> = this.lookupMaster(signing, reporter)
-      .then((master) => this.record(msg, reporter, at, master ?? signing, signing))
+      .then((master) => {
+        if (this.lookupsCutOff) return; // the shutdown gave up on this one (and counted it)
+        // a manifest of the stream may have come in while the node was being asked
+        this.record(msg, reporter, at, master ?? this.masters.get(signing) ?? signing, signing);
+      })
       .catch((err: unknown) => this.failed('handle', 'Recording a validation failed', err))
       .then(() => {
         this.waiting.delete(recorded);
@@ -402,7 +425,7 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
       attempt: 0,
       rejected: false,
       onValidation: (msg) => this.onStreamValidation(feed, msg),
-      onManifest: (msg) => this.onStreamManifest(msg),
+      onManifest: (msg) => this.onStreamManifest(feed, msg),
       onConnected: () => this.onConnected(feed),
     };
     this.feeds.push(feed);
@@ -429,8 +452,10 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
     }
   }
 
-  private onStreamManifest(msg: unknown): void {
-    if (this.closing) return;
+  /** Gated like the validations: a node of another network, or one whose reporter is not known yet, is not believed. */
+  private onStreamManifest(feed: Feed, msg: unknown): void {
+    if (this.closing || feed.rejected) return;
+    if (feed.reporter === undefined) return this.drop('manifest_no_reporter');
     try {
       this.handleManifest(msg as Record<string, unknown>);
     } catch (err) {
@@ -568,6 +593,8 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
         }
         return master;
       } catch (err) {
+        // the app is going down and the clients with it: neither a fault of the node nor of the key
+        if (this.closing) return undefined;
         if (isRippledError(err)) {
           // the node's own answer (it does not know the key): the same as no manifest
           this.remember(signing, this.missTtlMs);
@@ -647,7 +674,11 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
   }
 
   private async doFlush(): Promise<number> {
+    // a flush that was chained behind one that hangs, or that was waiting for the manifests, starts after the shutdown
+    // has given up on the final flush: it must not write anything then
+    if (this.abandoned) return 0;
     await this.flushManifests();
+    if (this.abandoned) return 0;
     const rows = [...this.buffer.values()];
     if (rows.length === 0) return 0;
     this.buffer = new Map();
@@ -695,11 +726,26 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
       feed.client.off('connected', feed.onConnected);
     }
 
-    const final = (async () => {
-      await this.whenIdle();
-      await this.flush().catch(() => undefined); // counted and logged by doFlush
-    })();
-    if (await this.within(final, VALIDATIONS_SHUTDOWN_WAIT_MS)) {
+    // The validations that wait for a manifest answer get a part of the budget, so that a node that hangs cannot keep
+    // the rows that are already in the buffer from being written.
+    if (await this.within(this.whenIdle(), VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS)) {
+      this.lookupsCutOff = true;
+      const left = this.waiting.size;
+      this.metrics?.validationsDroppedTotal.inc({ reason: 'shutdown' }, left);
+      this.logger.warn(
+        `Giving up on ${left} validations still waiting for a manifest answer ` +
+          `after ${VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS} ms of the shutdown: they are dropped`,
+      );
+    }
+
+    const final = this.flush().catch(() => undefined); // counted and logged by doFlush
+    const remaining = Math.max(0, VALIDATIONS_SHUTDOWN_WAIT_MS - (Date.now() - started));
+    // `abandoned` is set by the timer itself: nothing can start an insert between the cap and the warning
+    if (
+      await this.within(final, remaining, () => {
+        this.abandoned = true;
+      })
+    ) {
       this.logger.warn(
         `Abandoning the final flush: no answer within ${VALIDATIONS_SHUTDOWN_WAIT_MS} ms of the shutdown; ` +
           `${this.rowsInFlight + this.buffer.size} rows may not have been written`,
@@ -711,11 +757,14 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
     await this.within(stops, Math.max(0, VALIDATIONS_SHUTDOWN_WAIT_MS - (Date.now() - started)));
   }
 
-  /** Whether `work` did NOT finish within `ms` (it is left running). Leaves no timer behind. */
-  private async within(work: Promise<unknown>, ms: number): Promise<boolean> {
+  /** Whether `work` did NOT finish within `ms` (it is left running; `onTimeout` runs the moment it is given up on). Leaves no timer behind. */
+  private async within(work: Promise<unknown>, ms: number, onTimeout?: () => void): Promise<boolean> {
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<boolean>((resolve) => {
-      timer = setTimeout(() => resolve(true), ms);
+      timer = setTimeout(() => {
+        onTimeout?.();
+        resolve(true);
+      }, ms);
     });
     try {
       return await Promise.race([work.then(() => false), timedOut]);
@@ -726,7 +775,7 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
 
   // -- bookkeeping -------------------------------------------------------------------------------------------------
 
-  private drop(reason: 'invalid' | 'no_reporter'): void {
+  private drop(reason: 'invalid' | 'no_reporter' | 'manifest_no_reporter'): void {
     this.metrics?.validationsDroppedTotal.inc({ reason });
   }
 

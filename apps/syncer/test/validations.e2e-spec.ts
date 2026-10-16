@@ -34,6 +34,30 @@ const YESTERDAY = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 /** A hash that no other test uses: `n` as 64 hex digits. */
 const hash = (n: number): string => n.toString(16).toUpperCase().padStart(64, '0');
 
+/** Polls `probe` until it holds; a test waits for what it is waiting for, not for a time. */
+async function waitFor(what: string, probe: () => boolean, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!probe()) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function waitForAsync(what: string, probe: () => Promise<boolean>, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await probe())) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/** Every feed of the collector has asked its node who it is (`server_info`) and has the answer. */
+const reportersKnown = (collector: ValidationsCollector, feeds: number): Promise<void> =>
+  waitFor(
+    `the reporters of ${feeds} feed(s)`,
+    () => collector.reporters.length === feeds && collector.reporters.every((reporter) => reporter !== undefined),
+  );
+
 function validation(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     type: 'validationReceived',
@@ -278,7 +302,8 @@ describe('ValidationsCollector (e2e)', () => {
         { logger: QUIET, flushIntervalMs: NO_FLUSH_TIMER, makeClient: () => idle as unknown as NodeClient },
       );
       restarted.onApplicationBootstrap();
-      await new Promise((resolve) => setTimeout(resolve, 300)); // the load of validator_manifests
+      // the manifests are read before the feeds start: the feed is the sign that they are loaded
+      await waitFor('the feed to start', () => idle.listenerCount('validationReceived') === 1);
       restarted.handleValidation(
         validation({ ledger_hash: h, master_key: undefined, validation_public_key: b }),
         REPORTER,
@@ -334,7 +359,7 @@ describe('ValidationsCollector (e2e)', () => {
           const respond = (result: object) =>
             socket.send(JSON.stringify({ id: request.id, type: 'response', status: 'success', result }));
           if (request.command === 'server_info') {
-            respond({ info: { complete_ledgers: '1-100', pubkey_node: pubkey, network_id: networkId } });
+            respond({ info: { complete_ledgers: '1-100', pubkey_node: node.pubkey, network_id: networkId } });
           } else if (request.command === 'subscribe') {
             node.subscribed.push(request.streams as string[]);
             respond({});
@@ -354,22 +379,6 @@ describe('ValidationsCollector (e2e)', () => {
       return node;
     }
 
-    async function waitFor(what: string, probe: () => boolean, timeoutMs = 15_000): Promise<void> {
-      const deadline = Date.now() + timeoutMs;
-      while (!probe()) {
-        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-    }
-
-    async function waitForAsync(what: string, probe: () => Promise<boolean>, timeoutMs = 15_000): Promise<void> {
-      const deadline = Date.now() + timeoutMs;
-      while (!(await probe())) {
-        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-
     it('subscribes to validations and manifests on every endpoint, and stamps each report with its node', async () => {
       const a = await startNode('n9NodeAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
       const b = await startNode('n9NodeBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB');
@@ -380,10 +389,7 @@ describe('ValidationsCollector (e2e)', () => {
         expect(a.subscribed).toEqual([['validations', 'manifests']]);
         expect(b.subscribed).toEqual([['validations', 'manifests']]);
         // the reporter is asked of server_info before anything is recorded
-        await waitFor('server_info of both nodes', () =>
-          [a, b].every((n) => n.requests.some((r) => r.command === 'server_info')),
-        );
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await reportersKnown(collector, 2);
 
         const h = hash(200);
         /** Flushes until the table holds `n` reports of the given ledgers. */
@@ -421,12 +427,11 @@ describe('ValidationsCollector (e2e)', () => {
       try {
         collector.onApplicationBootstrap();
         await waitFor('the subscription', () => node.subscribed.length > 0);
-        await waitFor('server_info', () => node.requests.some((r) => r.command === 'server_info'));
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await reportersKnown(collector, 1);
 
         const h = hash(210);
+        // the messages of one connection arrive in order: the manifest is known when the validation behind it is handled
         node.push({ type: 'manifestReceived', master_key: MASTER, seq: 5, signature: 'AA', signing_key: SIGNING });
-        await new Promise((resolve) => setTimeout(resolve, 100));
         node.push(validation({ ledger_hash: h, master_key: undefined })); // mapped by the manifest of the stream
         node.push(validation({ ledger_hash: h, master_key: undefined, validation_public_key: SIGNING_2 })); // by the RPC
         node.push(validation({ ledger_hash: h, master_key: undefined, validation_public_key: 'n9Unknown' })); // by neither
@@ -465,28 +470,110 @@ describe('ValidationsCollector (e2e)', () => {
       }
     });
 
-    it('sends the subscription again on a new connection, and asks for the reporter again', async () => {
+    it('sends the subscription again on a new connection, and takes the reporter the node answers then', async () => {
       const node = await startNode('n9NodeBeforeReconnect');
       const collector = collectorFor(node.url);
       try {
         collector.onApplicationBootstrap();
         await waitFor('the subscription', () => node.subscribed.length === 1);
-        await waitFor('server_info', () => node.requests.filter((r) => r.command === 'server_info').length === 1);
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await reportersKnown(collector, 1);
+        expect(collector.reporters).toEqual(['n9NodeBeforeReconnect']);
+        node.push(validation({ ledger_hash: hash(240) }));
+        await waitFor('the validation', () => collector.bufferedRows === 1);
+        await collector.flush();
 
+        // the connection drops; the endpoint now answers as another server of the cluster
         node.pubkey = 'n9NodeAfterReconnect';
-        for (const socket of node.server.clients) socket.terminate(); // the connection drops
-        await waitFor('the second subscription', () => node.subscribed.length === 2, 30_000);
-        await waitFor(
-          'the second server_info',
-          () => node.requests.filter((r) => r.command === 'server_info').length === 2,
-        );
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        expect(node.subscribed[1]).toEqual(['validations', 'manifests']);
+        for (const socket of node.server.clients) socket.terminate();
+        await waitFor('the new reporter', () => collector.reporters[0] === 'n9NodeAfterReconnect', 30_000);
+        expect(node.subscribed).toEqual([
+          ['validations', 'manifests'],
+          ['validations', 'manifests'],
+        ]);
+        expect(node.requests.filter((r) => r.command === 'server_info')).toHaveLength(2);
+
+        node.push(validation({ ledger_hash: hash(241) }));
+        await waitFor('the validation', () => collector.bufferedRows === 1);
+        await collector.flush();
+        expect((await grouped(hash(240))).map((r) => r.reporter)).toEqual(['n9NodeBeforeReconnect']);
+        expect((await grouped(hash(241))).map((r) => r.reporter)).toEqual(['n9NodeAfterReconnect']);
       } finally {
         await collector.stop();
         await node.stop();
       }
+    });
+
+    it('follows a key rotation: the same master with a new signing key and a higher seq, both keys map to it', async () => {
+      const node = await startNode(REPORTER);
+      const old = 'n9RotationOldSigningKey1111111111111111111111111111';
+      const next = 'n9RotationNewSigningKey2222222222222222222222222222';
+      const collector = collectorFor(node.url);
+      try {
+        collector.onApplicationBootstrap();
+        await waitFor('the subscription', () => node.subscribed.length > 0);
+        await reportersKnown(collector, 1);
+
+        node.push({ type: 'manifestReceived', master_key: MASTER, seq: 1, signature: 'AA', signing_key: old });
+        node.push(validation({ ledger_hash: hash(250), master_key: undefined, validation_public_key: old }));
+        node.push({ type: 'manifestReceived', master_key: MASTER, seq: 2, signature: 'AA', signing_key: next });
+        node.push(validation({ ledger_hash: hash(251), master_key: undefined, validation_public_key: next }));
+        // a straggler signed with the key that was rotated out is still the same validator
+        node.push(validation({ ledger_hash: hash(252), master_key: undefined, validation_public_key: old }));
+        await waitFor('three validations', () => collector.bufferedRows === 3);
+        await collector.flush();
+
+        expect((await grouped(hash(250))).map((r) => [r.validation_public_key, r.ephemeral])).toEqual([[MASTER, old]]);
+        expect((await grouped(hash(251))).map((r) => [r.validation_public_key, r.ephemeral])).toEqual([[MASTER, next]]);
+        expect((await grouped(hash(252))).map((r) => [r.validation_public_key, r.ephemeral])).toEqual([[MASTER, old]]);
+        // the stream said all of it: the node was never asked
+        expect(node.requests.filter((r) => r.command === 'manifest')).toEqual([]);
+
+        // both manifests are in the table, each with its own seq
+        const stored = await ch.query<{ ephemeral_key: string; master: string; highest: number }>(
+          `SELECT ephemeral_key, argMax(master_key, seq) AS master, max(seq) AS highest
+             FROM ${Table.ValidatorManifests} WHERE ephemeral_key IN ({old:String}, {next:String})
+            GROUP BY ephemeral_key ORDER BY highest`,
+          { old, next },
+        );
+        expect(stored).toEqual([
+          { ephemeral_key: old, master: MASTER, highest: 1 },
+          { ephemeral_key: next, master: MASTER, highest: 2 },
+        ]);
+      } finally {
+        await collector.stop();
+        await node.stop();
+      }
+
+      // a process that starts later reads both rows and maps both keys without asking anybody
+      const idle = Object.assign(new EventEmitter(), {
+        subscribe: async () => undefined,
+        start: async () => new Promise<void>(() => undefined),
+        stop: async () => undefined,
+      });
+      const restarted = new ValidationsCollector(
+        config('ws://127.0.0.1:1'),
+        getNetworkProfile('xrpl'),
+        ch,
+        undefined,
+        undefined,
+        { logger: QUIET, flushIntervalMs: NO_FLUSH_TIMER, makeClient: () => idle as unknown as NodeClient },
+      );
+      restarted.onApplicationBootstrap();
+      await waitFor('the feed to start', () => idle.listenerCount('validationReceived') === 1);
+      for (const [n, key] of [
+        [260, old],
+        [261, next],
+      ] as const) {
+        restarted.handleValidation(
+          validation({ ledger_hash: hash(n), master_key: undefined, validation_public_key: key }),
+          REPORTER,
+          new Date(`${YESTERDAY}T12:00:00Z`),
+        );
+      }
+      await restarted.flush();
+      expect((await grouped(hash(260))).map((r) => r.validation_public_key)).toEqual([MASTER]);
+      expect((await grouped(hash(261))).map((r) => r.validation_public_key)).toEqual([MASTER]);
+      await restarted.stop();
     });
 
     it('refuses a node of the other network: nothing it reports is written', async () => {
@@ -496,10 +583,14 @@ describe('ValidationsCollector (e2e)', () => {
         collector.onApplicationBootstrap();
         await waitFor('the subscription', () => xahau.subscribed.length > 0);
         await waitFor('server_info', () => xahau.requests.some((r) => r.command === 'server_info'));
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        // refused: the collector stops the client, which closes the connection
+        await waitFor('the connection to be closed', () => xahau.sockets.size === 0);
+        expect(collector.reporters).toEqual([undefined]);
         xahau.push(validation({ ledger_hash: hash(220) }));
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        xahau.push({ type: 'manifestReceived', master_key: MASTER, seq: 1, signature: 'AA', signing_key: SIGNING });
         expect(collector.bufferedRows).toBe(0);
+        await collector.flush();
+        expect(await grouped(hash(220))).toEqual([]);
       } finally {
         await collector.stop();
         await xahau.stop();
@@ -512,8 +603,7 @@ describe('ValidationsCollector (e2e)', () => {
       try {
         collector.onApplicationBootstrap();
         await waitFor('the subscription', () => xahau.subscribed.length > 0);
-        await waitFor('server_info', () => xahau.requests.some((r) => r.command === 'server_info'));
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await reportersKnown(collector, 1);
         xahau.push(validation({ ledger_hash: hash(221) }));
         await waitFor('the validation', () => collector.bufferedRows === 1);
         await collector.flush();
@@ -532,8 +622,7 @@ describe('ValidationsCollector (e2e)', () => {
       try {
         collector.onApplicationBootstrap();
         await waitFor('the subscription', () => node.subscribed.length > 0);
-        await waitFor('server_info', () => node.requests.some((r) => r.command === 'server_info'));
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await reportersKnown(collector, 1);
         node.push(validation({ ledger_hash: hash(230) }));
         await waitFor('the validation', () => collector.bufferedRows === 1);
       } finally {

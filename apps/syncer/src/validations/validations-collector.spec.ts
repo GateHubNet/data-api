@@ -19,6 +19,7 @@ import {
   REPORTER_RETRY_MS,
   validationRowFrom,
   VALIDATIONS_FLUSH_INTERVAL_MS,
+  VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS,
   VALIDATIONS_SHUTDOWN_WAIT_MS,
   ValidationsCollector,
   ValidationsCollectorOptions,
@@ -530,6 +531,32 @@ describe('ValidationsCollector', () => {
       await s.collector.stop();
     });
 
+    it('honours a manifest of the stream that came in while the node was being asked, when the node knows nothing', async () => {
+      const s = setup();
+      await boot(s);
+      const answer = deferred<unknown>();
+      s.nodes[0].request.mockReturnValueOnce(answer.promise);
+      s.nodes[0].emit('validationReceived', bare());
+      s.nodes[0].emit('manifestReceived', manifest({ seq: 3 })); // SIGNING belongs to MASTER, says the stream
+      answer.resolve({ requested: SIGNING }); // and the node, asked a moment ago, has nothing
+      await jest.advanceTimersByTimeAsync(0);
+      await s.collector.flush();
+      expect(written(s).map((r) => [r.validation_public_key, r.count])).toEqual([[MASTER, 1]]);
+
+      // the same when the request failed
+      const failing = deferred<unknown>();
+      s.nodes[0].request.mockReturnValueOnce(failing.promise);
+      s.nodes[0].emit('validationReceived', bare({ validation_public_key: SIGNING_2, ledger_hash: OTHER_HASH }));
+      s.nodes[0].emit('manifestReceived', manifest({ signing_key: SIGNING_2, master_key: MASTER_2, seq: 1 }));
+      failing.reject(new Error('No node connection within 2000 ms'));
+      await jest.advanceTimersByTimeAsync(0);
+      await s.collector.flush();
+      expect(lastInsert(s).map((r) => [r.validation_public_key, r.ephemeral_public_key])).toEqual([
+        [MASTER_2, SIGNING_2],
+      ]);
+      await s.collector.stop();
+    });
+
     it('treats a master key that is the signing key itself as no manifest', async () => {
       const s = setup();
       await boot(s);
@@ -653,6 +680,38 @@ describe('ValidationsCollector', () => {
       await jest.advanceTimersByTimeAsync(0);
       expect(s.nodes[0].request).toHaveBeenCalledTimes(1); // the map learned nothing from them
       await s.collector.stop();
+    });
+
+    it('is not believed from a node whose reporter is not known yet, or which was refused', async () => {
+      const s = setup();
+      s.collector.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(0);
+      // a new connection: who the node is has not been asked yet
+      const slow = deferred<{ pubkey_node: string; complete_ledgers: string }>();
+      s.nodes[0].serverInfo.mockReturnValueOnce(slow.promise as never);
+      s.nodes[0].emit('connected', 'ws://node-a:6006');
+      s.nodes[0].emit('manifestReceived', manifest({ seq: 4 }));
+      expect(s.metrics.validationsDroppedTotal.inc).toHaveBeenCalledWith({ reason: 'manifest_no_reporter' });
+      await s.collector.flush();
+      expect(writtenManifests(s)).toEqual([]);
+
+      slow.resolve({ pubkey_node: REPORTER, complete_ledgers: '1-2' });
+      await jest.advanceTimersByTimeAsync(0);
+      s.nodes[0].emit('manifestReceived', manifest({ seq: 4 })); // the same manifest, now from a node that is known
+      await s.collector.flush();
+      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 4 }]);
+      await s.collector.stop();
+
+      // a node of another network is not believed at all
+      const refused = setup({ network: 'xrpl', networkId: 21337 });
+      await boot(refused);
+      refused.nodes[0].emit('manifestReceived', manifest({ seq: 9 }));
+      await refused.collector.flush();
+      expect(writtenManifests(refused)).toEqual([]);
+      refused.nodes[0].emit('validationReceived', bare());
+      expect(refused.collector.bufferedRows).toBe(0);
+      expect(refused.nodes[0].request).not.toHaveBeenCalled(); // nothing it said was learned: no lookup either
+      await refused.collector.stop();
     });
 
     it('puts a manifest back when its insert fails, and counts the error without failing the validations', async () => {
@@ -1190,6 +1249,107 @@ describe('ValidationsCollector', () => {
       expect(s.metrics.validationsErrorsTotal.inc).toHaveBeenCalledWith({ stage: 'flush' });
       expect(s.logger.error).toHaveBeenCalledWith(expect.stringContaining('ClickHouse is down'));
       expect(s.nodes[0].stop).toHaveBeenCalled();
+    });
+
+    it('a manifest request that never answers does not keep the other rows from being written', async () => {
+      expect(VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS).toBe(1_000);
+      const s = setup();
+      await boot(s);
+      s.nodes[0].emit('validationReceived', validation()); // a row in the buffer
+      s.nodes[0].request.mockReturnValueOnce(new Promise(() => undefined)); // the node never answers this one
+      s.nodes[0].emit('validationReceived', bare({ validation_public_key: SIGNING_2, ledger_hash: OTHER_HASH }));
+
+      let done = false;
+      const stopping = s.collector.stop().then(() => (done = true));
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS - 1);
+      expect(s.insert).not.toHaveBeenCalled(); // the lookups still have their share
+      await jest.advanceTimersByTimeAsync(1);
+      await stopping;
+
+      // the row that was there is written inside the cap, and the validation that waited is dropped, counted and said
+      expect(done).toBe(true);
+      expect(written(s).map((r) => [r.ledger_hash, r.validation_public_key])).toEqual([[HASH, MASTER]]);
+      expect(s.metrics.validationsDroppedTotal.inc).toHaveBeenCalledWith({ reason: 'shutdown' }, 1);
+      expect(s.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Giving up on 1 validations.*1000 ms/));
+      expect(s.logger.warn).not.toHaveBeenCalledWith(expect.stringMatching(/Abandoning the final flush/));
+      expect(s.nodes[0].stop).toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('a lookup that gives its answer after the shutdown gave up on it records nothing, and inserts nothing', async () => {
+      const s = setup();
+      await boot(s);
+      const late = deferred<unknown>();
+      s.nodes[0].request.mockReturnValueOnce(late.promise);
+      s.nodes[0].emit('validationReceived', bare());
+      const stopping = s.collector.stop();
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS);
+      await stopping;
+      expect(s.insert).not.toHaveBeenCalled();
+
+      late.resolve({ details: { master_key: MASTER, ephemeral_key: SIGNING, seq: 1 } });
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS * 2);
+      expect(s.collector.bufferedRows).toBe(0);
+      expect(s.insert).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('a lookup that fails after the stop (the client is stopped, the request rejects) is no error', async () => {
+      const s = setup();
+      await boot(s);
+      const hung = deferred<unknown>();
+      s.nodes[0].request.mockReturnValueOnce(hung.promise);
+      s.nodes[0].emit('validationReceived', bare());
+      const stopping = s.collector.stop();
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS);
+      await stopping;
+
+      hung.reject(new Error('The websocket was closed before the response was received'));
+      await jest.advanceTimersByTimeAsync(0);
+      expect(s.metrics.validationsErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(s.logger.error).not.toHaveBeenCalled();
+      expect(s.insert).not.toHaveBeenCalled();
+    });
+
+    it('no insert is started once the final flush is abandoned, even when the hung insert settles and a flush was waiting behind it', async () => {
+      const s = setup();
+      await boot(s);
+      const hungInsert = deferred<void>();
+      s.insert.mockReturnValueOnce(hungInsert.promise);
+      s.nodes[0].emit('validationReceived', validation());
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS); // the periodic flush: its insert hangs
+      expect(s.insert).toHaveBeenCalledTimes(1);
+
+      s.nodes[0].emit('validationReceived', validation({ ledger_hash: OTHER_HASH })); // waiting in the buffer
+      s.nodes[0].emit('manifestReceived', manifest({ seq: 2 })); // and a manifest waiting to be written
+      const stopping = s.collector.stop(); // its final flush is chained behind the hung one
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_SHUTDOWN_WAIT_MS);
+      await stopping;
+      expect(s.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Abandoning the final flush.*2 rows/));
+
+      // the hung insert finishes at last: the flush behind it must not start
+      hungInsert.resolve();
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS * 3);
+      expect(s.insert).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('does not start the insert of the buffer either when the hung one is the manifests insert', async () => {
+      const s = setup();
+      await boot(s);
+      const hungManifests = deferred<void>();
+      s.insert.mockReturnValueOnce(hungManifests.promise);
+      s.nodes[0].emit('manifestReceived', manifest({ seq: 2 }));
+      s.nodes[0].emit('validationReceived', validation());
+      const stopping = s.collector.stop(); // the final flush hangs writing the manifests ...
+      await jest.advanceTimersByTimeAsync(VALIDATIONS_SHUTDOWN_WAIT_MS);
+      await stopping;
+      expect(s.insert).toHaveBeenCalledTimes(1);
+
+      hungManifests.resolve(); // ... and gets on with the rows when they are written: it must not
+      await jest.advanceTimersByTimeAsync(0);
+      expect(s.insert).toHaveBeenCalledTimes(1);
+      expect(written(s)).toEqual([]);
     });
 
     it('does not wait for a client that does not stop', async () => {

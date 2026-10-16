@@ -387,6 +387,20 @@ describe('GET /v2/ledgers/:ledger_hash/validations', () => {
       expect(repeated.headers.link).toContain('limit=1&marker=');
     });
 
+    it('R76: an empty signature is absent like every other empty column, in the list, the single validation and the CSV', async () => {
+      const E = 'EE'.repeat(32);
+      await h.ch.insert(Table.Validations, [row({ ledger_hash: E, validation_public_key: K1, signature: '' })]);
+      const list = await get(`/v2/ledgers/${E}/validations`);
+      expect(list.body.count).toBe(1);
+      expect(Object.keys(list.body.validations[0])).not.toContain('signature');
+      expect(Object.keys(list.body.validations[0])).toContain('signing_time');
+      const one = await get(`/v2/ledgers/${E}/validations/${K1}`);
+      expect(Object.keys(one.body)).not.toContain('signature');
+      expect(one.body.result).toBe('success');
+      const csv = await get(`/v2/ledgers/${E}/validations?format=csv`);
+      expect(csv.text.split('\n')[0]).not.toContain('signature');
+    });
+
     it('has a ledger without validations: count 0, an empty list, 200', async () => {
       const res = await get(`/v2/ledgers/${'AB'.repeat(32)}/validations`);
       expect(res.status).toBe(200);
@@ -460,7 +474,7 @@ describe('GET /v2/ledgers/:ledger_hash/validations', () => {
       expect((await get(`/v2/ledgers/${H}/validations?limit=2`)).body.count).toBe(2);
     });
 
-    it('pages by validator key: the pages concatenate to the unpaged list, for any page size', async () => {
+    it('pagination by pubkey: the pages concatenate to the unpaged list, for any page size', async () => {
       const unpaged = (await get(`/v2/ledgers/${H}/validations`)).body as ListBody;
       for (const limit of [1, 2, 3, 4, 5]) {
         const pages = await api.pages<ListBody>(`/v2/ledgers/${H}/validations`, limit, 'validations');
