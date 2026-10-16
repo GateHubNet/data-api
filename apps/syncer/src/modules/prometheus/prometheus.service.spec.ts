@@ -17,6 +17,7 @@ describe('PrometheusService', () => {
     service.aggregatorRunsTotal.inc({ job: 'stats' });
     service.aggregatorRunsTotal.inc({ job: 'volume' }, 2);
     service.aggregatorErrorsTotal.inc({ job: 'stats_dirty' }, 4);
+    service.aggregatorStatsLagSeconds.set(86_400);
 
     const text = await service.getMetrics();
     expect(text).toMatch(/^# TYPE syncer_checkpoint_ledger gauge$/m);
@@ -33,6 +34,8 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_aggregator_runs_total\{job="stats"\} 1$/m);
     expect(text).toMatch(/^syncer_aggregator_runs_total\{job="volume"\} 2$/m);
     expect(text).toMatch(/^syncer_aggregator_errors_total\{job="stats_dirty"\} 4$/m);
+    expect(text).toMatch(/^# TYPE syncer_aggregator_stats_lag_seconds gauge$/m);
+    expect(text).toMatch(/^syncer_aggregator_stats_lag_seconds 86400$/m);
   });
 
   it('shares one registry between instances, as the main app and the metricz app each create one', async () => {

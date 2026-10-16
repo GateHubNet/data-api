@@ -1,6 +1,7 @@
 import { ClickHouseService, StatsRecomputeAborted, Table } from '@gatehub/data-api-shared';
 import {
   AGGREGATOR_INTERVAL_MS,
+  AGGREGATOR_LIVE_BUDGET_MS,
   AGGREGATOR_SHUTDOWN_WAIT_MS,
   AGGREGATOR_TICK_BUDGET_MS,
   AggregatorJob,
@@ -33,21 +34,44 @@ interface DirtyRow {
 }
 
 /**
- * A ClickHouse with the three things the service asks it: the newest stats hour with ledgers, the close time of the newest
- * ledger, and the `agg_dirty` queue (with the semantics of the real table: reads give the newest row of a key, oldest first;
- * the DELETE takes a key and `created_at <= created`; the INSERT adds a row).
+ * A ClickHouse with the things the service asks it: the hours of `stats_hourly` (newest first), the close times of the
+ * ledgers (ascending, as their indexes are), and the `agg_dirty` queue (with the semantics of the real table: reads give the
+ * newest row of a key, oldest first; the DELETE takes a key and `created_at <= created`; the INSERT adds a row).
  */
 class FakeClickHouse {
+  /** The newest hour of `stats_hourly` that has ledgers; shorthand for one row of `statsRows`. */
   watermark?: number;
-  latestClose?: number;
+  /** Rows of `stats_hourly`, newest hour first; replaces `watermark` when set. */
+  statsRows?: Array<{ hour: number; ledger_count: number }>;
+  /** The close times of the ledgers, ascending. */
+  closes: number[] = [];
   dirty: DirtyRow[] = [];
   readonly sql: string[] = [];
+  readonly params: Array<Record<string, unknown>> = [];
+
+  /** The close time of the newest ledger; shorthand for `closes = [it]`. */
+  set latestClose(closed: number | undefined) {
+    this.closes = closed === undefined ? [] : [closed];
+  }
 
   query = jest.fn(async (sql: string, params: Record<string, unknown> = {}): Promise<unknown[]> => {
     this.sql.push(sql);
-    if (sql.includes(`FROM ${Table.StatsHourly}`)) return [{ hour: this.watermark ?? null }];
-    if (sql.includes(`FROM ${Table.Ledgers}`))
-      return this.latestClose === undefined ? [] : [{ closed: this.latestClose }];
+    this.params.push(params);
+    if (sql.includes(`FROM ${Table.StatsHourly}`)) {
+      const rows = this.statsRows ?? (this.watermark === undefined ? [] : [{ hour: this.watermark, ledger_count: 1 }]);
+      return rows
+        .filter((r) => r.hour < Number(params.before))
+        .sort((a, b) => b.hour - a.hour)
+        .slice(0, Number(params.n))
+        .map((r) => ({ hour_start: r.hour, ledger_count: r.ledger_count }));
+    }
+    if (sql.includes(`FROM ${Table.Ledgers}`)) {
+      if (sql.includes('DESC')) {
+        return this.closes.length === 0 ? [] : [{ closed: this.closes[this.closes.length - 1] }];
+      }
+      const found = sql.includes('close_time >=') ? this.closes.find((c) => c >= Number(params.from)) : this.closes[0];
+      return found === undefined ? [] : [{ closed: found }];
+    }
     if (sql.includes(`FROM ${Table.AggDirty}`)) {
       const newest = new Map<string, DirtyRow>();
       for (const row of this.dirty) {
@@ -120,6 +144,7 @@ describe('AggregatorService', () => {
   let metrics: {
     aggregatorRunsTotal: { inc: jest.Mock };
     aggregatorErrorsTotal: { inc: jest.Mock };
+    aggregatorStatsLagSeconds: { set: jest.Mock };
   };
   let shutdown: { register: jest.Mock };
   const created: AggregatorService[] = [];
@@ -136,6 +161,26 @@ describe('AggregatorService', () => {
 
   const ranges = (): [string, string][] => recomputed.map((r) => [iso(r.from), iso(r.to)]);
 
+  /**
+   * A recompute that behaves like the job: it writes a row for every hour of the slice that has a ledger (so it returns how
+   * many there are, and the watermark moves to the newest of them), and it takes `sliceMs` of the fake clock.
+   */
+  /** One close time a day at the same time of day, `days` + 1 of them, from `first`. */
+  const dailyCloses = (first: string, days: number): number[] =>
+    Array.from({ length: days + 1 }, (_, i) => unix(first) + i * DAY);
+
+  function jobLike(sliceMs = 0): void {
+    recompute.mockImplementation(async (_ch: unknown, from: Date, to: Date, options?: { signal?: AbortSignal }) => {
+      const f = from.getTime() / 1000;
+      const t = to.getTime() / 1000;
+      recomputed.push({ from: f, to: t, signal: options?.signal });
+      const hours = [...new Set(ch.closes.filter((c) => c >= f && c < t).map((c) => Math.floor(c / HOUR) * HOUR))];
+      if (hours.length > 0) ch.watermark = Math.max(ch.watermark ?? 0, ...hours);
+      if (sliceMs > 0) jest.setSystemTime(Date.now() + sliceMs);
+      return hours.length;
+    });
+  }
+
   beforeEach(() => {
     jest.useFakeTimers({ now: NOW });
     ch = new FakeClickHouse();
@@ -145,7 +190,11 @@ describe('AggregatorService', () => {
       return 1;
     });
     logger = QUIET();
-    metrics = { aggregatorRunsTotal: { inc: jest.fn() }, aggregatorErrorsTotal: { inc: jest.fn() } };
+    metrics = {
+      aggregatorRunsTotal: { inc: jest.fn() },
+      aggregatorErrorsTotal: { inc: jest.fn() },
+      aggregatorStatsLagSeconds: { set: jest.fn() },
+    };
     shutdown = { register: jest.fn() };
   });
 
@@ -168,14 +217,46 @@ describe('AggregatorService', () => {
     });
 
     it('takes now from the argument of tick', async () => {
-      ch.latestClose = unix('2026-01-01T00:00:00Z');
+      ch.watermark = unix('2026-01-01T03:00:00Z');
+      ch.latestClose = unix('2026-01-01T04:00:00Z');
       await service().tick(new Date('2026-01-01T05:30:00Z'));
       expect(ranges()).toEqual([['2026-01-01T03:00:00Z', '2026-01-01T06:00:00Z']]);
     });
 
-    it('starts at now - 2h when no hour has ledgers yet', async () => {
+    it('starts at now - 2h when there is no ledger at all', async () => {
       await service().tick();
       expect(ranges()).toEqual([['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z']]);
+    });
+
+    it('starts at the hour of the first ledger when no hour has stats yet (a fresh database, an aggregator enabled late)', async () => {
+      ch.closes = [unix('2026-10-14T09:20:00Z'), unix('2026-10-15T00:00:00Z'), NOW_SECONDS - 3];
+      await service().tick();
+      expect(ranges()).toEqual([
+        ['2026-10-14T09:00:00Z', '2026-10-15T09:00:00Z'],
+        ['2026-10-15T09:00:00Z', '2026-10-16T09:00:00Z'],
+        ['2026-10-16T09:00:00Z', '2026-10-16T10:00:00Z'],
+        ['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z'],
+      ]);
+    });
+
+    it('a first ledger inside the last two hours leaves the window as it was', async () => {
+      ch.closes = [unix('2026-10-16T11:20:00Z'), NOW_SECONDS - 3];
+      await service().tick();
+      expect(ranges()).toEqual([['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z']]);
+    });
+
+    it('reads the first ledger only when there is no watermark, and by the primary key', async () => {
+      ch.closes = [unix('2026-10-14T09:20:00Z'), NOW_SECONDS - 3];
+      await service().tick();
+      const first = ch.sql.filter((q) => q.includes(`FROM ${Table.Ledgers}`) && /ORDER BY ledger_index ASC/.test(q));
+      expect(first).toHaveLength(1);
+      expect(first[0]).toMatch(/ORDER BY ledger_index ASC\s+LIMIT 1/);
+      expect(first[0]).not.toMatch(/\bmin\(|FINAL/);
+
+      ch.sql.length = 0;
+      ch.watermark = unix('2026-10-16T12:00:00Z');
+      await service().tick();
+      expect(ch.sql.filter((q) => /ORDER BY ledger_index ASC/.test(q))).toEqual([]);
     });
 
     it('ends one hour after the newest ledger when it closed after now', async () => {
@@ -246,10 +327,194 @@ describe('AggregatorService', () => {
         return 1;
       });
       await service().tick();
-      // 12 s, 24 s, and the third slice starts at 24 s < 30 s; the fourth would start at 36 s
-      expect(recomputed).toHaveLength(3);
+      // stats_live has 20 s of the tick: a slice at 0 s and one at 12 s; the third would start at 24 s
+      expect(recomputed).toHaveLength(2);
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('budget'));
       expect(AGGREGATOR_TICK_BUDGET_MS).toBe(30_000);
+      expect(AGGREGATOR_LIVE_BUDGET_MS).toBe(20_000);
+    });
+
+    it('gives stats_live at most 20 s of the tick, so that stats_dirty is always served', async () => {
+      ch.watermark = unix('2026-10-10T08:00:00Z');
+      ch.closes = [...dailyCloses('2026-10-10T08:30:00Z', 6), NOW_SECONDS - 3];
+      ch.dirty = [{ from: unix('2026-05-01T00:00:00Z'), to: unix('2026-05-02T00:00:00Z'), created: 1000 }];
+      jobLike(12_000);
+      await service().tick();
+      // the live window is far from done (a week of slices), but it stopped at 24 s and the dirty range got its slice
+      const live = recomputed.filter((r) => r.from > unix('2026-06-01T00:00:00Z'));
+      expect(live).toHaveLength(2);
+      expect(ranges()).toContainEqual(['2026-05-01T00:00:00Z', '2026-05-02T00:00:00Z']);
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('the tail of the window runs only after the catch-up has finished, never before it', async () => {
+      ch.watermark = unix('2026-10-10T08:00:00Z');
+      ch.closes = [...dailyCloses('2026-10-10T08:30:00Z', 6), NOW_SECONDS - 3];
+      jobLike(12_000);
+      await service().tick();
+      // 2 of the 7 catch-up slices fit in the budget: the tail [10:00, 13:00) was not touched, and the watermark, which
+      // is where the next tick starts, is the hour of the last slice that had a ledger
+      expect(recomputed.map((r) => r.to)).not.toContain(AFTER_NOW);
+      expect(ch.watermark).toBe(unix('2026-10-11T08:00:00Z'));
+    });
+
+    describe('a gap in the ledgers', () => {
+      const W = unix('2025-09-01T05:00:00Z');
+      const gapped = (): void => {
+        ch.watermark = W;
+        ch.closes = [W + 600, unix('2026-10-10T08:20:00Z'), unix('2026-10-12T00:00:00Z'), NOW_SECONDS - 3];
+      };
+
+      it('is jumped over: a slice that writes nothing continues at the hour of the next ledger', async () => {
+        gapped();
+        jobLike(1000); // a gap of 400 days would take 400 s of slices of a second: far more than the budget
+        await service().tick();
+        expect(ranges()).toEqual([
+          ['2025-09-01T05:00:00Z', '2025-09-02T05:00:00Z'], // the watermark hour: written
+          ['2025-09-02T05:00:00Z', '2025-09-03T05:00:00Z'], // nothing: jump to the hour of the next ledger
+          ['2026-10-10T08:00:00Z', '2026-10-11T08:00:00Z'],
+          ['2026-10-11T08:00:00Z', '2026-10-12T08:00:00Z'],
+          ['2026-10-12T08:00:00Z', '2026-10-13T08:00:00Z'], // nothing: the next ledger is after the catch-up
+          ['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z'], // so the tail runs, in the same tick
+        ]);
+        const next = ch.sql.filter((q) => q.includes('close_time >='));
+        expect(next).toHaveLength(2);
+        expect(next[0]).toMatch(
+          /WHERE close_time >= toDateTime\(\{from:UInt32\}, 'UTC'\)\s+ORDER BY ledger_index ASC\s+LIMIT 1/,
+        );
+        expect(next[0]).not.toMatch(/\bmin\(|FINAL/);
+        expect(ch.params.filter((_, i) => ch.sql[i].includes('close_time >=')).map((p) => iso(Number(p.from)))).toEqual(
+          ['2025-09-03T05:00:00Z', '2026-10-13T08:00:00Z'],
+        );
+      });
+
+      it('does not keep a catch-up from the tail, or the tick from stats_dirty, however long it is', async () => {
+        gapped();
+        ch.dirty = [{ from: unix('2026-05-01T00:00:00Z'), to: unix('2026-05-01T05:00:00Z'), created: 1000 }];
+        jobLike(1000);
+        const svc = service();
+        await svc.tick();
+        expect(ranges()).toContainEqual(['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z']);
+        expect(ranges()).toContainEqual(['2026-05-01T00:00:00Z', '2026-05-01T05:00:00Z']);
+        expect(ch.dirty).toEqual([]);
+        // 8 slices of the whole tick, not one per day of the gap
+        expect(recomputed.length).toBeLessThanOrEqual(8);
+      });
+
+      it('is crossed over several ticks when the slices are slow: every tick ends further on than the one before', async () => {
+        gapped();
+        jobLike(8000); // the budget of stats_live (20 s) holds three slices
+        const svc = service();
+        const marks: number[] = [];
+        let ticks = 0;
+        do {
+          recomputed.length = 0;
+          await svc.tick();
+          marks.push(ch.watermark as number);
+        } while (!ranges().some(([, to]) => to === '2026-10-16T13:00:00Z') && ++ticks < 6);
+        // the first tick got past the gap (the watermark is no longer the hour it started from) ...
+        expect(marks[0]).toBeGreaterThan(unix('2026-10-01T00:00:00Z'));
+        // ... every one after it moved on, and the one that finished the catch-up ran the tail
+        expect(marks.length).toBeLessThanOrEqual(3);
+        for (let i = 1; i < marks.length; i++) expect(marks[i]).toBeGreaterThan(marks[i - 1]);
+        expect(ranges()[ranges().length - 1]).toEqual(['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z']);
+      });
+
+      it('a failing look for the next ledger fails the job, which starts again from the same watermark', async () => {
+        gapped();
+        jobLike();
+        const real = ch.query.getMockImplementation() as (
+          sql: string,
+          params?: Record<string, unknown>,
+        ) => Promise<unknown[]>;
+        ch.query.mockImplementation(async (sql, params) => {
+          if (sql.includes('close_time >=')) throw new Error('timeout');
+          return real(sql, params);
+        });
+        const svc = service();
+        await svc.tick();
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'stats_live' });
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('timeout'));
+        expect(ranges()).not.toContainEqual(['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z']);
+        ch.query.mockImplementation(real);
+        recomputed.length = 0;
+        await svc.tick();
+        expect(ranges()).toContainEqual(['2026-10-16T10:00:00Z', '2026-10-16T13:00:00Z']);
+      });
+    });
+
+    it('reports how far behind the sweep is, and 0 once it has caught up', async () => {
+      ch.watermark = unix('2026-10-13T08:00:00Z');
+      ch.closes = [...dailyCloses('2026-10-13T08:30:00Z', 3), NOW_SECONDS - 3];
+      jobLike(12_000);
+      const svc = service();
+      await svc.tick();
+      const lags = (): number[] => metrics.aggregatorStatsLagSeconds.set.mock.calls.map(([v]) => v as number);
+      // 74 hours from the watermark to the start of the last two hours; two slices of a day were done in the tick
+      expect(lags()[0]).toBe(74 * HOUR);
+      expect(lags()[lags().length - 1]).toBe(26 * HOUR);
+
+      let last = lags()[lags().length - 1];
+      for (let i = 0; i < 4 && last > 0; i++) {
+        await svc.tick();
+        expect(lags()[lags().length - 1]).toBeLessThan(last); // never further behind than before
+        last = lags()[lags().length - 1];
+      }
+      expect(last).toBe(0);
+    });
+
+    it('is 0 when the aggregator is where it should be', async () => {
+      ch.watermark = unix('2026-10-16T12:00:00Z');
+      ch.latestClose = NOW_SECONDS - 3;
+      await service().tick();
+      expect(metrics.aggregatorStatsLagSeconds.set.mock.calls.every(([v]) => v === 0)).toBe(true);
+      expect(metrics.aggregatorStatsLagSeconds.set).toHaveBeenCalled();
+    });
+
+    describe('the watermark', () => {
+      it('is looked for from the newest hour backwards in chunks of 100 hours, past the zero rows of vanished hours', async () => {
+        const top = unix('2026-10-12T00:00:00Z');
+        const zeros = Array.from({ length: 250 }, (_, i) => ({ hour: top - i * HOUR, ledger_count: 0 }));
+        const found = { hour: top - 250 * HOUR, ledger_count: 4 };
+        const older = Array.from({ length: 300 }, (_, i) => ({ hour: found.hour - (i + 1) * HOUR, ledger_count: 2 }));
+        ch.statsRows = [...zeros, found, ...older];
+        ch.closes = [NOW_SECONDS - 3];
+        await service().tick();
+
+        expect(ranges()[0][0]).toBe(iso(found.hour)); // the catch-up starts at the newest hour that has ledgers
+        const reads = ch.sql
+          .map((q, i) => [q, ch.params[i]] as const)
+          .filter(([q]) => q.includes(`FROM ${Table.StatsHourly}`));
+        expect(reads).toHaveLength(3);
+        expect(reads.map(([, p]) => p.n)).toEqual([100, 100, 100]);
+        // each chunk starts under the oldest hour of the one before
+        expect(Number(reads[1][1].before)).toBe(top - 99 * HOUR);
+        expect(Number(reads[2][1].before)).toBe(top - 199 * HOUR);
+        expect(reads[0][0]).toMatch(/ORDER BY hour DESC, version DESC\s+LIMIT 1 BY hour\s+LIMIT \{n:UInt32\}/);
+        expect(reads[0][0]).not.toMatch(/\bmax\(|maxOrNull|FINAL/);
+      });
+
+      it('is one read of 100 hours at most when the newest hour has ledgers, however much history there is', async () => {
+        ch.statsRows = Array.from({ length: 50_000 }, (_, i) => ({
+          hour: unix('2026-10-16T12:00:00Z') - i * HOUR,
+          ledger_count: 1,
+        }));
+        ch.latestClose = NOW_SECONDS - 3;
+        await service().tick();
+        expect(ch.sql.filter((q) => q.includes(`FROM ${Table.StatsHourly}`))).toHaveLength(1);
+      });
+
+      it('is none when no chunk has an hour with ledgers: all zero rows, or no rows', async () => {
+        ch.statsRows = Array.from({ length: 150 }, (_, i) => ({
+          hour: unix('2026-10-12T00:00:00Z') - i * HOUR,
+          ledger_count: 0,
+        }));
+        ch.closes = [unix('2026-10-14T09:20:00Z'), NOW_SECONDS - 3];
+        await service().tick();
+        // no watermark: the sweep starts at the first ledger
+        expect(ranges()[0][0]).toBe('2026-10-14T09:00:00Z');
+        expect(ch.sql.filter((q) => q.includes(`FROM ${Table.StatsHourly}`))).toHaveLength(2);
+      });
     });
   });
 
@@ -342,6 +607,27 @@ describe('AggregatorService', () => {
       const insert = ch.command.mock.calls[0];
       expect(insert[0]).toMatch(/fromUnixTimestamp64Milli\(\{created:Int64\}\)/);
       expect(insert[1]).toMatchObject({ created: 42 });
+    });
+
+    it('completes the narrowing it began: a shutdown between its INSERT and its DELETE does not leave the old row behind', async () => {
+      live();
+      ch.dirty = [{ from: unix('2021-01-01T00:00:00Z'), to: unix('2026-01-01T00:00:00Z'), created: 42 }];
+      const svc = service();
+      recompute.mockImplementation(async () => {
+        jest.setSystemTime(Date.now() + 20_000);
+        return 1;
+      });
+      const real = ch.command.getMockImplementation() as (
+        sql: string,
+        params?: Record<string, unknown>,
+      ) => Promise<void>;
+      ch.command.mockImplementation(async (sql, params) => {
+        await real(sql, params);
+        if (sql.startsWith('INSERT')) void svc.stop(); // the shutdown begins right after the narrowed row went in
+      });
+      await svc.tick();
+      expect(ch.command.mock.calls.map(([sql]) => String(sql).split(' ')[0])).toEqual(['INSERT', 'DELETE']);
+      expect(ch.dirty).toEqual([{ from: unix('2021-01-02T00:00:00Z'), to: unix('2026-01-01T00:00:00Z'), created: 42 }]);
     });
 
     it('does not delete a row that was marked again after it was read', async () => {

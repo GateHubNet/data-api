@@ -67,8 +67,9 @@ export async function deleteDirtyRange(ch: ClickHouseService, range: DirtyRange)
 /**
  * Replaces a range by the part of it that is left, `[progress, to)`: the narrowed row is inserted first, then the old one
  * is deleted (as `deleteDirtyRange` does it), so that a crash between the two leaves both, and the work in between is
- * done twice, which is harmless. The narrowed row keeps the `created_at` of the original: it stays where it was in the
- * queue and is finished before younger ranges are started.
+ * done twice, which is harmless. A shutdown does not interrupt the pair: once the narrowed row is in, the old one goes. The
+ * narrowed row keeps the `created_at` of the original: it stays where it was in the queue and is finished before younger
+ * ranges are started.
  */
 export async function narrowDirtyRange(ch: ClickHouseService, range: DirtyRange, progress: number): Promise<void> {
   if (progress <= range.from) return;

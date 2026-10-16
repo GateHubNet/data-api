@@ -71,6 +71,11 @@ const metrics = {
     labelNames: ['job'],
     registers: [registry],
   }),
+  aggregatorStatsLagSeconds: new Gauge({
+    name: 'syncer_aggregator_stats_lag_seconds',
+    help: 'Seconds of ledger history the stats catch-up still has to cover (0 when the stats are up to the last two hours). Positive for as long as a sweep of an old database or after an outage is under way.',
+    registers: [registry],
+  }),
   aggregatorErrorsTotal: new Counter({
     name: 'syncer_aggregator_errors_total',
     help: 'Aggregator jobs (or slices of one) that failed, by job; each is retried on the next tick.',
@@ -102,6 +107,7 @@ export class PrometheusService implements OnModuleInit {
   readonly feeStatsErrorsTotal = metrics.feeStatsErrorsTotal;
   readonly aggregatorRunsTotal = metrics.aggregatorRunsTotal;
   readonly aggregatorErrorsTotal = metrics.aggregatorErrorsTotal;
+  readonly aggregatorStatsLagSeconds = metrics.aggregatorStatsLagSeconds;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

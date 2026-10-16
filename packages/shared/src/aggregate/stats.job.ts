@@ -41,10 +41,12 @@ interface AggregatedHour {
   version: number | string;
 }
 
-/** The hour of a `stats_hourly` row that is the latest version of its hour and has ledgers. */
-interface LiveHour {
+/** The newest row of an hour of the range as `stats_hourly` has it now, and the time of the ClickHouse clock. */
+interface StoredHour {
   hour: number | string;
-  version: number | string;
+  ledger_count: number | string;
+  newest_version: number | string;
+  now_ms: number | string;
 }
 
 const counts = (map: Record<string, number | string>): CountMap =>
@@ -78,9 +80,11 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
  * - **Without FINAL.** `ledgers` is a ReplacingMergeTree and a ledger that was written twice is there twice until a merge,
  *   so the ledgers are deduped by `LIMIT 1 BY ledger_index` (the newest write wins) in a subquery that filters on
  *   `close_time`, which its minmax index prunes, before anything is added up.
- * - **Idempotent.** The row of an hour is a function of the ledgers in it; the `version` is the time of the write in
- *   milliseconds on the ClickHouse clock, and readers take the newest version of an hour. Running it twice leaves the same
- *   latest values; the older versions go away when ClickHouse merges.
+ * - **Idempotent.** The row of an hour is a function of the ledgers in it; readers take the newest version of an hour.
+ *   Running it twice leaves the same latest values; the older versions go away when ClickHouse merges.
+ * - **The version only goes up.** It is the time of the write in milliseconds on the ClickHouse clock, but never lower than
+ *   one more than the newest version the hour has now (read by the query that finds the hours to zero): a clock that stepped
+ *   back, or a writer that wrote the same millisecond, cannot make the new row lose to an older one.
  * - **No stale counts.** An hour of the range that has no ledgers any more but whose newest row has some (the ledgers were
  *   deleted to be rewritten) gets a zero row, `ledger_count` 0 and empty maps, as a newer version. Readers skip hours with
  *   `ledger_count` 0. An hour that never had ledgers gets no row.
@@ -131,22 +135,27 @@ export async function recomputeStatsHourly(
         ORDER BY hour ASC`,
       params,
     ),
-    // The newest version of every hour of the range, of those that have ledgers: the hours that may have to be zeroed.
-    ch.query<LiveHour>(
-      `SELECT toUnixTimestamp(hour) AS hour, toUnixTimestamp64Milli(now64(3)) AS version
+    // The newest row of every hour of the range: its version, which the new one has to beat, and whether it has ledgers,
+    // which decides whether the hour may have to be zeroed.
+    ch.query<StoredHour>(
+      `SELECT toUnixTimestamp(hour) AS hour, ledger_count, version AS newest_version,
+              toUnixTimestamp64Milli(now64(3)) AS now_ms
          FROM (
-              SELECT hour, ledger_count
+              SELECT hour, ledger_count, version
                 FROM ${Table.StatsHourly}
                WHERE hour >= toDateTime({from:UInt32}, 'UTC')
                  AND hour < toDateTime({to:UInt32}, 'UTC')
                ORDER BY hour ASC, version DESC
                LIMIT 1 BY hour
               )
-        WHERE ledger_count > 0
         ORDER BY hour ASC`,
       params,
     ),
   ]);
+
+  const newest = new Map<number, number>(existing.map((e) => [Number(e.hour), Number(e.newest_version)]));
+  /** The clock, but one past the version the hour has now. */
+  const versionOf = (hour: number, now: number): number => Math.max(now, (newest.get(hour) ?? -1) + 1);
 
   const rows: StatsHourlyRow[] = aggregated.map((h) => ({
     hour: Number(h.hour),
@@ -159,14 +168,14 @@ export async function recomputeStatsHourly(
     last_close_time: Number(h.last_close_time),
     type_counts: counts(h.types),
     result_counts: counts(h.results),
-    version: Number(h.version),
+    version: versionOf(Number(h.hour), Number(h.version)),
   }));
 
   // An hour that has a row with ledgers and none in the aggregation lost its ledgers: it is zeroed.
   const computed = new Set(rows.map((r) => r.hour));
   for (const old of existing) {
     const hour = Number(old.hour);
-    if (computed.has(hour)) continue;
+    if (computed.has(hour) || Number(old.ledger_count) === 0) continue;
     rows.push({
       hour,
       transaction_count: 0,
@@ -179,7 +188,7 @@ export async function recomputeStatsHourly(
       last_close_time: hour,
       type_counts: {},
       result_counts: {},
-      version: Number(old.version),
+      version: versionOf(hour, Number(old.now_ms)),
     });
   }
   if (rows.length === 0) return 0;

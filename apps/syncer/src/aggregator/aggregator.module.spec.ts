@@ -25,7 +25,11 @@ describe('AggregatorModule', () => {
     });
     const insert = jest.fn(async () => undefined);
     const shutdown = { register: jest.fn() };
-    const metrics = { aggregatorRunsTotal: { inc: jest.fn() }, aggregatorErrorsTotal: { inc: jest.fn() } };
+    const metrics = {
+      aggregatorRunsTotal: { inc: jest.fn() },
+      aggregatorErrorsTotal: { inc: jest.fn() },
+      aggregatorStatsLagSeconds: { set: jest.fn() },
+    };
     // what the global core module and the ClickHouse module provide to every worker
     @Global()
     @Module({

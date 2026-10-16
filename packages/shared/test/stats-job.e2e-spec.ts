@@ -42,6 +42,7 @@ interface Expected {
   result_counts: Record<string, number>;
 }
 
+const unix = (text: string): number => Date.parse(text) / 1000;
 const hourOf = (seconds: number): number => Math.floor(seconds / HOUR) * HOUR;
 
 /** The stats of every hour the ledgers close in, added up the plain way. */
@@ -213,6 +214,79 @@ describe('recomputeStatsHourly (e2e)', () => {
       }
     });
 
+    it('never lets a version go down: an hour whose newest row is from the future (a clock that stepped back) is beaten', async () => {
+      const ch = await fresh();
+      await recomputeStatsHourly(ch, ...ALL_HOURS);
+      const target = expected[4];
+      const future = Date.now() + 3_600_000;
+      // a row with other values and a version an hour ahead of the clock
+      await ch.insert(Table.StatsHourly, [
+        {
+          hour: target.hour,
+          transaction_count: 999,
+          payments_count: 0,
+          exchanges_count: 0,
+          accounts_created: 0,
+          ledger_count: 99,
+          first_close_time: target.hour,
+          last_close_time: target.hour,
+          type_counts: { Payment: 999 },
+          result_counts: { tesSUCCESS: 999 },
+          version: future,
+        },
+      ]);
+      expect((await latest(ch)).find((r) => r.hour === target.hour)?.ledger_count).toBe(99);
+
+      await recomputeStatsHourly(ch, at(target.hour), at(target.hour + HOUR));
+      const row = (await latest(ch)).find((r) => r.hour === target.hour) as Stored;
+      expect(withoutVersion([row])).toEqual([target]);
+      expect(row.version).toBe(future + 1);
+
+      // and again: still one more
+      await recomputeStatsHourly(ch, at(target.hour), at(target.hour + HOUR));
+      expect(((await latest(ch)).find((r) => r.hour === target.hour) as Stored).version).toBe(future + 2);
+    });
+
+    it('never lets a version go down for a zero row either', async () => {
+      const ch = await fresh();
+      await recomputeStatsHourly(ch, ...ALL_HOURS);
+      const gone = expected[3];
+      const future = Date.now() + 3_600_000;
+      await ch.insert(Table.StatsHourly, [
+        {
+          hour: gone.hour,
+          transaction_count: gone.transaction_count,
+          payments_count: 0,
+          exchanges_count: 0,
+          accounts_created: 0,
+          ledger_count: gone.ledger_count,
+          first_close_time: gone.first_close_time,
+          last_close_time: gone.last_close_time,
+          type_counts: gone.type_counts,
+          result_counts: gone.result_counts,
+          version: future,
+        },
+      ]);
+      await ch.command(
+        `DELETE FROM ${Table.Ledgers} WHERE close_time >= toDateTime({from:UInt32}, 'UTC') AND close_time < toDateTime({to:UInt32}, 'UTC')`,
+        { from: gone.hour, to: gone.hour + HOUR },
+        { settings: SQL_DELETE },
+      );
+      await recomputeStatsHourly(ch, ...ALL_HOURS);
+      const row = (await latest(ch)).find((r) => r.hour === gone.hour) as Stored;
+      expect(row.ledger_count).toBe(0);
+      expect(row.version).toBe(future + 1);
+    });
+
+    it('gives every hour of one run a version above its own newest, and the others the clock', async () => {
+      const ch = await fresh();
+      await recomputeStatsHourly(ch, ...ALL_HOURS);
+      const first = await latest(ch);
+      await recomputeStatsHourly(ch, ...ALL_HOURS);
+      const second = await latest(ch);
+      for (const [i, row] of second.entries()) expect(row.version).toBeGreaterThan(first[i].version);
+    });
+
     it('recomputes only the hours of the range, and widens a range that cuts an hour to the whole hour', async () => {
       const ch = await fresh();
       const target = expected[4];
@@ -231,7 +305,29 @@ describe('recomputeStatsHourly (e2e)', () => {
       expect(withoutVersion(await latest(ch))).toEqual([target]);
     });
 
-    it('slices of one day add up to the same rows as one big run', async () => {
+    it('slices of one day, as the syncer cuts them, add up to the same rows as one big run', async () => {
+      const ch = await fresh();
+      // the month round the two busy days: 33 slices of a day, 5 of the hours of the mock ledgers fall in them
+      const from = unix('2015-01-10T00:00:00Z');
+      const until = unix('2015-02-12T00:00:00Z');
+      let total = 0;
+      let slices = 0;
+      for (let start = from; start < until; start += DAY) {
+        total += await recomputeStatsHourly(ch, at(start), at(Math.min(start + DAY, until)));
+        slices++;
+      }
+      expect(slices).toBe(33);
+      const inWindow = expected.filter((e) => e.hour >= from && e.hour < until);
+      expect(inWindow).toHaveLength(5);
+      expect(total).toBe(5);
+      expect(withoutVersion(await latest(ch))).toEqual(inWindow);
+
+      const whole = await fresh();
+      await recomputeStatsHourly(whole, at(from), at(until));
+      expect(withoutVersion(await latest(whole))).toEqual(withoutVersion(await latest(ch)));
+    });
+
+    it('slices of 400 days over the whole span of the mock ledgers add up to the same rows too', async () => {
       const ch = await fresh();
       const first = expected[0].hour;
       const last = expected[expected.length - 1].hour + HOUR;
