@@ -32,6 +32,7 @@ import { FixtureExchange, fixtureExchanges } from './support/fixtures';
 
 const MWJ = 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q';
 const BITSTAMP = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
+const KIC = 'rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y';
 const USD_MWJ = `USD+${MWJ}`;
 
 const pathOf = (a: Asset): string => (a.issuer ? `${a.currency}+${a.issuer}` : a.currency);
@@ -71,8 +72,10 @@ interface ActiveBody {
 /**
  * The exchange the way `hbase.getExchanges` left it for `activeAccounts.js`: the keys of the HBase row in order (the `d`
  * family, then the `f` family, each sorted by name), without the four fields of the pair (`formatExchanges` deletes them
- * and this route does not set them again), with `executed_time` as `toISOString()` writes it. `inverted` is a pair
- * asked for the other way round: the amounts, the buyer and the seller swap and the rate is inverted.
+ * and this route does not set them again), with the `client` when the transaction had one (this route deletes only the
+ * row key and the time, `getExchanges.js` the client too), with `executed_time` as `toISOString()` writes it.
+ * `inverted` is a pair asked for the other way round: the amounts, the buyer and the seller swap and the rate is
+ * inverted; the client is of the transaction and stays.
  */
 function exchangeOf(row: ExchangesRow, inverted: boolean): Record<string, unknown> {
   const rate = new BigNumber(row.rate);
@@ -85,6 +88,7 @@ function exchangeOf(row: ExchangesRow, inverted: boolean): Record<string, unknow
     autobridged_currency: row.autobridged_currency ?? undefined,
     autobridged_issuer: row.autobridged_issuer || undefined,
     buyer: inverted ? row.seller : row.buyer,
+    client: row.client || undefined,
     executed_time: new Date(row.close_time * 1000).toISOString(),
     ledger_index: row.ledger_index,
     offer_sequence: row.offer_sequence,
@@ -489,6 +493,82 @@ describe('active accounts API endpoint', () => {
       });
     });
 
+    it('include_exchanges: the client of the transaction is kept (getExchanges.js deletes it, this route does not)', async () => {
+      // the three exchanges of the mock ledgers with a client
+      const withClient = MARKETS.flatMap((m) => m.rows.filter((r) => r.client !== null));
+      expect(withClient.map((r) => [r.base_currency, r.ledger_index, r.client])).toEqual([
+        ['CNY', 11119618, 'rt1.2.1'],
+        ['BTC', 11120176, 'rt1.2.1'],
+        ['USD', 20005122, 'rt1.5.6-12-g1b8c0ed'],
+      ]);
+      const keys = [
+        'base_amount',
+        'counter_amount',
+        'node_index',
+        'rate',
+        'tx_index',
+        'buyer',
+        'client',
+        'executed_time',
+        'ledger_index',
+        'offer_sequence',
+        'provider',
+        'seller',
+        'taker',
+        'tx_hash',
+        'tx_type',
+      ];
+      const found: unknown[] = [];
+      for (const row of withClient) {
+        const window = WINDOWS.find(
+          (w) => closedBetween([row], w.from, w.before).length > 0,
+        ) as (typeof WINDOWS)[number];
+        for (const inverted of [false, true]) {
+          const [b, c] = inverted
+            ? [assetOf(row.counter_currency, row.counter_issuer), assetOf(row.base_currency, row.base_issuer)]
+            : [assetOf(row.base_currency, row.base_issuer), assetOf(row.counter_currency, row.counter_issuer)];
+          const path = `${active(pathOf(b), pathOf(c))}${qs({ ...window.query, include_exchanges: true })}`;
+          const res = await accountsOf(api, path);
+          const all = res.body.accounts.flatMap((a) => a.exchanges ?? []);
+          const mine = all.filter((e) => e.tx_hash === row.tx_hash);
+          // in the list of its seller and of its buyer, the same either way round
+          expect([path, mine.length]).toEqual([path, 2]);
+          for (const e of mine) {
+            expect(Object.keys(e)).toEqual(keys);
+            expect(e.client).toBe(row.client);
+          }
+          expect(mine[0]).toEqual(exchangeOf(row, inverted));
+          // the others of the window have none, and no key for it
+          expect(all.filter((e) => e.tx_hash !== row.tx_hash).some((e) => 'client' in e)).toBe(false);
+          found.push([row.ledger_index, inverted, mine[0].client]);
+        }
+      }
+      expect(found).toEqual([
+        [11119618, false, 'rt1.2.1'],
+        [11119618, true, 'rt1.2.1'],
+        [11120176, false, 'rt1.2.1'],
+        [11120176, true, 'rt1.2.1'],
+        [20005122, false, 'rt1.5.6-12-g1b8c0ed'],
+        [20005122, true, 'rt1.5.6-12-g1b8c0ed'],
+      ]);
+    });
+
+    it('USD+rvYAf…/XRP on 2016-03-28: the exchange of ledger 20005122 has its client', async () => {
+      for (const [base, counter] of [
+        [`USD+${BITSTAMP}`, 'xrp'],
+        ['xrp', `USD+${BITSTAMP}`],
+      ]) {
+        const res = await accountsOf(
+          api,
+          `${active(base, counter)}?date=2016-03-28&period=1day&include_exchanges=true`,
+        );
+        const exchanges = res.body.accounts
+          .flatMap((a) => a.exchanges ?? [])
+          .filter((e) => e.ledger_index === 20005122);
+        expect([base, exchanges.map((e) => e.client)]).toEqual([base, ['rt1.5.6-12-g1b8c0ed', 'rt1.5.6-12-g1b8c0ed']]);
+      }
+    });
+
     it('include_exchanges is any text that is not empty, even false or 0', async () => {
       for (const value of ['true', 'false', '0', 'x']) {
         const res = await accountsOf(api, `${PAIR}${WINDOW}&include_exchanges=${value}`);
@@ -523,7 +603,10 @@ describe('active accounts API endpoint', () => {
 
     it('unknown parameters are ignored, a repeated one is read by its first value', async () => {
       const want = text((await accountsOf(api, `${PAIR}${WINDOW}`)).body);
-      expect(text((await api.ok(`${PAIR}${WINDOW}&foo=bar&limit=1&marker=x`, 'accounts')).body)).toBe(want);
+      // the route has no pages: limit, marker and descending are unknown to it
+      expect(text((await api.ok(`${PAIR}${WINDOW}&foo=bar&limit=1&marker=x&descending=true`, 'accounts')).body)).toBe(
+        want,
+      );
       expect(text((await api.ok(`${PAIR}${WINDOW}&period=7day&period=bogus`, 'accounts')).body)).toBe(want);
       expect(text((await api.ok(`${PAIR}?date=2015-01-14&date=bogus&period=7day`, 'accounts')).body)).toBe(want);
     });
@@ -674,6 +757,29 @@ describe('active accounts API endpoint', () => {
       expect(header).toContain('"exchanges[1].tx_hash"');
       expect(header).not.toContain('"exchanges[0].base_currency"');
       expect(lines(res.text)).toHaveLength(1 + 7);
+    });
+
+    it('with include_exchanges the client of an exchange is a column too: exchanges[i].client', async () => {
+      // CNY+rKiCet…/XRP has one exchange with a client (ledger 11119618)
+      const pair = active(`CNY+${KIC}`, 'xrp');
+      const json = (await accountsOf(api, `${pair}?${WINDOW}&include_exchanges=true`)).body;
+      const csv = lines((await get(`${pair}?${WINDOW}&include_exchanges=true&format=csv`)).text);
+      const header = csv[0].split(',');
+      // a CSV has a column for every key found in any row, in the order of first appearance: the column of the client
+      // of an exchange comes where the first row that has one puts it, and is empty in the rows that have none
+      let withClient = 0;
+      json.accounts.forEach((account, row) => {
+        const cells = csv[1 + row].split(',');
+        (account.exchanges ?? []).forEach((e, i) => {
+          const column = header.indexOf(`"exchanges[${i}].client"`);
+          const cell = column < 0 ? '""' : cells[column];
+          expect([account.account, i, cell]).toEqual([account.account, i, `"${e.client ?? ''}"`]);
+          if (e.client !== undefined) withClient++;
+        });
+      });
+      // the exchange is in the list of its seller and of its buyer
+      expect(withClient).toBe(2);
+      expect(header.filter((c) => /^"exchanges\[\d+\]\.client"$/.test(c)).length).toBeGreaterThan(0);
     });
 
     it('format is case-insensitive, and anything but csv is JSON', async () => {

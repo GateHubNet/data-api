@@ -1,7 +1,7 @@
-import { sumOf, VolumeSums } from '@gatehub/data-api-shared';
+import { ExchangesRow, sumOf, VolumeSums } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { fmtMillis } from '../common/format';
-import { ExchangeObject, StoredExchange, toExchangeObject } from '../exchanges/exchange-object';
+import { EXCHANGE_COLUMNS, StoredExchange, toExchangeObject } from '../exchanges/exchange-object';
 
 /** The role of an account in the exchanges of a group, as the exchange is stored. */
 export const BUYER = 0;
@@ -25,11 +25,41 @@ export interface ActiveSide {
   count: number;
 }
 
-/** The exchange of an account as `activeAccounts.js` served it: the exchange of the API without its pair fields. */
-export type ActiveExchange = Omit<
-  ExchangeObject,
-  'base_currency' | 'base_issuer' | 'counter_currency' | 'counter_issuer'
->;
+/**
+ * The exchange of an account as `activeAccounts.js` served it: the HBase row after `formatExchanges`, as `GET
+ * /v2/exchanges` serves it but with the four fields of the pair missing (`formatExchanges` deletes them and this route
+ * does not set them again) and with the `client` (that route deletes it, this one deletes only the row key and the
+ * time). The keys come in the order of the row: the columns of the `d` family, then those of the `f` family, each sorted
+ * by name. A field the exchange does not have is left out.
+ */
+export interface ActiveExchange {
+  base_amount: string;
+  counter_amount: string;
+  node_index: number;
+  /** Counter per base, eight significant digits. */
+  rate: string;
+  tx_index: number;
+  autobridged_currency?: string;
+  autobridged_issuer?: string;
+  buyer: string;
+  /** What the importer recorded as the client of the transaction, when it knew it. */
+  client?: string;
+  /** `YYYY-MM-DDTHH:mm:ss.SSSZ`, the close time of the ledger. */
+  executed_time: string;
+  ledger_index: number;
+  offer_sequence: number;
+  provider: string;
+  seller: string;
+  taker: string;
+  tx_hash: string;
+  tx_type: string;
+}
+
+/** The columns of `exchanges` this route reads for the exchanges of the accounts: those of the API, and the client. */
+export const ACTIVE_EXCHANGE_COLUMNS = `${EXCHANGE_COLUMNS}, client`;
+
+/** A row of `exchanges` as `ACTIVE_EXCHANGE_COLUMNS` reads it. */
+export type StoredActiveExchange = StoredExchange & Pick<ExchangesRow, 'client'>;
 
 /** An account of the answer, with the keys in the order of `organizeData` of the original. */
 export interface ActiveAccount {
@@ -150,20 +180,33 @@ export function toActiveAccounts(
   };
 }
 
-const PAIR_FIELDS = new Set(['base_currency', 'base_issuer', 'counter_currency', 'counter_issuer']);
-
 /**
- * The exchange as `activeAccounts.js` attached it to an account: the exchange of the API (`toExchangeObject`, the keys of
- * the HBase row of the original) without the four fields of the pair, which `hbase.getExchanges` deleted from its rows
- * and this route did not set again, and with `executed_time` as `toISOString()` writes it, to the millisecond. The
- * pair asked for the other way round is inverted.
+ * The exchange as `activeAccounts.js` attached it to an account (see `ActiveExchange`): the exchange of the API
+ * (`toExchangeObject`) without the pair, with the client and with `executed_time` as `toISOString()` writes it, to the
+ * millisecond. The pair asked for the other way round is inverted (amounts, buyer, seller, rate); the client is of the
+ * transaction and is the same from both sides.
  */
-export function toActiveExchange(row: StoredExchange, inverted: boolean): ActiveExchange {
-  return Object.fromEntries(
-    Object.entries(toExchangeObject(row, inverted))
-      .filter(([key]) => !PAIR_FIELDS.has(key))
-      .map(([key, value]) => [key, key === 'executed_time' ? fmtMillis(row.close_time) : value]),
-  ) as unknown as ActiveExchange;
+export function toActiveExchange(row: StoredActiveExchange, inverted: boolean): ActiveExchange {
+  const e = toExchangeObject(row, inverted);
+  return {
+    base_amount: e.base_amount,
+    counter_amount: e.counter_amount,
+    node_index: e.node_index,
+    rate: e.rate,
+    tx_index: e.tx_index,
+    ...(e.autobridged_currency !== undefined && { autobridged_currency: e.autobridged_currency }),
+    ...(e.autobridged_issuer !== undefined && { autobridged_issuer: e.autobridged_issuer }),
+    buyer: e.buyer,
+    ...(row.client !== null && { client: row.client }),
+    executed_time: fmtMillis(row.close_time),
+    ledger_index: e.ledger_index,
+    offer_sequence: e.offer_sequence,
+    provider: e.provider,
+    seller: e.seller,
+    taker: e.taker,
+    tx_hash: e.tx_hash,
+    tx_type: e.tx_type,
+  };
 }
 
 /**
@@ -171,7 +214,7 @@ export function toActiveExchange(row: StoredExchange, inverted: boolean): Active
  * list of its buyer, the same object in both (a trade of an account with itself is twice in its list, as in the
  * original). Seller and buyer are those of the pair as asked for.
  */
-export function attachExchanges(accounts: ActiveAccount[], rows: StoredExchange[], inverted: boolean): void {
+export function attachExchanges(accounts: ActiveAccount[], rows: StoredActiveExchange[], inverted: boolean): void {
   const byName = new Map(accounts.map((a) => [a.account, a]));
   for (const a of accounts) a.exchanges = [];
   for (const row of rows) {

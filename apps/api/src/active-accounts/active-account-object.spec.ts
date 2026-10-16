@@ -1,9 +1,9 @@
-import { StoredExchange } from '../exchanges/exchange-object';
 import {
   AccountGroup,
   attachExchanges,
   BUYER,
   SELLER,
+  StoredActiveExchange,
   toActiveAccounts,
   toActiveExchange,
 } from './active-account-object';
@@ -120,7 +120,7 @@ describe('toActiveAccounts', () => {
 });
 
 describe('toActiveExchange and attachExchanges', () => {
-  const row = (over: Partial<StoredExchange> = {}): StoredExchange => ({
+  const row = (over: Partial<StoredActiveExchange> = {}): StoredActiveExchange => ({
     base_currency: 'USD',
     base_issuer: 'rIssuer',
     counter_currency: 'XRP',
@@ -141,6 +141,7 @@ describe('toActiveExchange and attachExchanges', () => {
     autobridged_currency: null,
     autobridged_issuer: null,
     tx_type: 'OfferCreate',
+    client: null,
     ...over,
   });
 
@@ -163,6 +164,38 @@ describe('toActiveExchange and attachExchanges', () => {
       'tx_type',
     ]);
     expect(e).toMatchObject({ executed_time: '2015-01-14T18:27:20.000Z', rate: '2.0000000', base_amount: '10' });
+  });
+
+  it('keeps the client of the transaction, between the buyer and the time, as the row of HBase had it', () => {
+    for (const inverted of [false, true]) {
+      const e = toActiveExchange(
+        row({ client: 'rt1.2.1', autobridged_currency: 'EUR', autobridged_issuer: 'rEur' }),
+        inverted,
+      );
+      expect(Object.keys(e)).toEqual([
+        'base_amount',
+        'counter_amount',
+        'node_index',
+        'rate',
+        'tx_index',
+        'autobridged_currency',
+        'autobridged_issuer',
+        'buyer',
+        'client',
+        'executed_time',
+        'ledger_index',
+        'offer_sequence',
+        'provider',
+        'seller',
+        'taker',
+        'tx_hash',
+        'tx_type',
+      ]);
+      // the client is of the transaction: the same from both sides
+      expect(e.client).toBe('rt1.2.1');
+    }
+    // an exchange without a client has no key
+    expect(toActiveExchange(row(), false)).not.toHaveProperty('client');
   });
 
   it('asked the other way round: the amounts, the parties and the rate are inverted', () => {

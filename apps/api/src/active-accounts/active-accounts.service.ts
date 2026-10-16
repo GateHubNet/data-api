@@ -9,9 +9,15 @@ import {
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { orderByClause } from '../common/pagination';
-import { EXCHANGE_COLUMNS, StoredExchange } from '../exchanges/exchange-object';
 import { PAIR_KEYS, PAIR_ORDER } from '../exchanges/exchanges.service';
-import { AccountGroup, ActiveAccount, attachExchanges, toActiveAccounts } from './active-account-object';
+import {
+  AccountGroup,
+  ACTIVE_EXCHANGE_COLUMNS,
+  ActiveAccount,
+  attachExchanges,
+  StoredActiveExchange,
+  toActiveAccounts,
+} from './active-account-object';
 
 /** What the accounts of a pair are asked for; the values are already validated. */
 export interface ActiveAccountsQuery {
@@ -90,7 +96,7 @@ export class ActiveAccountsService {
     const result = toActiveAccounts(groups, stored.inverted);
 
     if (q.includeExchanges && result.accounts.length > 0) {
-      const rows = await this.ch.query<StoredExchange>(exchanges(EXCHANGE_COLUMNS), params);
+      const rows = await this.ch.query<StoredActiveExchange>(exchanges(ACTIVE_EXCHANGE_COLUMNS), params);
       attachExchanges(result.accounts, rows, stored.inverted);
     }
     return result;
