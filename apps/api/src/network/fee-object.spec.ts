@@ -77,18 +77,18 @@ describe('toLedgerFees', () => {
     fee_max: 11000,
   };
 
-  it('is {avg, min, max, total, tx_count, date, ledger_index}, in that order, fees in native units', () => {
+  it('is {avg, max, min, total, tx_count, date, ledger_index}, in the order HBase served the columns, fees in native units', () => {
     const row = toLedgerFees(stored);
     expect(row).toEqual({
       avg: 0.010615,
-      min: 0.01,
       max: 0.011,
+      min: 0.01,
       total: 0.138,
       tx_count: 13,
       date: '2015-01-14T17:29:10Z',
       ledger_index: 11118827,
     });
-    expect(Object.keys(row)).toEqual(['avg', 'min', 'max', 'total', 'tx_count', 'date', 'ledger_index']);
+    expect(Object.keys(row)).toEqual(['avg', 'max', 'min', 'total', 'tx_count', 'date', 'ledger_index']);
   });
 
   it('is all numbers (and the date text), whatever shape the client hands the 64-bit columns over in', () => {
@@ -127,17 +127,17 @@ describe('toBucketFees', () => {
     fee_max: 10_000,
   };
 
-  it('is {avg, min, max, total, tx_count, date} with the start of the bucket as date and no ledger_index', () => {
+  it('is {avg, max, min, total, tx_count, date} with the start of the bucket as date and no ledger_index', () => {
     const row = toBucketFees(stored);
     expect(row).toEqual({
       avg: 0.01,
-      min: 0.01,
       max: 0.01,
+      min: 0.01,
       total: 0.03,
       tx_count: 3,
       date: '2015-01-14T16:00:00Z',
     });
-    expect(Object.keys(row)).toEqual(['avg', 'min', 'max', 'total', 'tx_count', 'date']);
+    expect(Object.keys(row)).toEqual(['avg', 'max', 'min', 'total', 'tx_count', 'date']);
   });
 
   it('a bucket of one ledger has the avg of that ledger (to six digits, then to a drop), a bucket of two is worked out again', () => {
@@ -181,27 +181,27 @@ describe('toFeeStat', () => {
     open_ledger_fee: 12,
   };
 
-  it('is the snapshot with fees in native units, the date to the second, and the fields in the order of the API', () => {
+  it('is the snapshot with fees in native units, the date to the second, and the fields sorted by name as HBase served them', () => {
     const row = toFeeStat(stored);
     expect(row).toEqual({
-      date: '2016-08-24T00:15:00Z',
       current_ledger_size: 46,
-      expected_ledger_size: 52,
       current_queue_size: 3,
-      pct_max_queue_size: 0.29,
+      date: '2016-08-24T00:15:00Z',
+      expected_ledger_size: 52,
       median_fee: 0.005,
       minimum_fee: 0.00001,
       open_ledger_fee: 0.000012,
+      pct_max_queue_size: 0.29,
     });
     expect(Object.keys(row)).toEqual([
-      'date',
       'current_ledger_size',
-      'expected_ledger_size',
       'current_queue_size',
-      'pct_max_queue_size',
+      'date',
+      'expected_ledger_size',
       'median_fee',
       'minimum_fee',
       'open_ledger_fee',
+      'pct_max_queue_size',
     ]);
   });
 

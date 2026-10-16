@@ -65,11 +65,14 @@ export interface StoredBucketFees {
   fee_max: number;
 }
 
-/** A row of `/v2/network/fees`: fees in native units, the keys in the order of the API. */
+/**
+ * A row of `/v2/network/fees`: fees in native units. The keys are in the order the original served them: HBase (Thrift)
+ * gave a row's columns sorted by name, the family `d` (the numbers) before the family `f` (`date`, `ledger_index`).
+ */
 export interface FeeSummary {
   avg: number;
-  min: number;
   max: number;
+  min: number;
   total: number;
   tx_count: number;
   /** `YYYY-MM-DDTHH:mm:ssZ`: the close time of the ledger, or the start of the hour or day. */
@@ -86,8 +89,8 @@ export function toLedgerFees(row: StoredLedgerFees): FeeSummary {
   const txCount = Number(row.tx_count);
   return {
     avg: ledgerAvg(row.fee_total, txCount),
-    min: toNative(row.fee_min),
     max: toNative(row.fee_max),
+    min: toNative(row.fee_min),
     total: toNative(row.fee_total),
     tx_count: txCount,
     date: fmtTime(Number(row.closed)),
@@ -108,8 +111,8 @@ export function toBucketFees(row: StoredBucketFees): FeeSummary {
   const txCount = Number(row.tx_count);
   return {
     avg: Number(row.ledgers) === 1 ? ledgerAvg(row.fee_total, txCount) : bucketAvg(row.fee_total, txCount),
-    min: toNative(row.fee_min),
     max: toNative(row.fee_max),
+    min: toNative(row.fee_min),
     total: toNative(row.fee_total),
     tx_count: txCount,
     date: fmtTime(Number(row.bucket)),
@@ -128,28 +131,31 @@ export interface StoredFeeStat {
   open_ledger_fee: number;
 }
 
-/** A row of `/v2/network/fee_stats`: fees in native units, the keys in the order of the API. */
+/**
+ * A row of `/v2/network/fee_stats`: fees in native units. The keys are in the order the original served them: the
+ * columns of the HBase row, sorted by name (as `test/mock/fee-stats.json` has them).
+ */
 export interface FeeStat {
+  current_ledger_size: number;
+  current_queue_size: number;
   /** `YYYY-MM-DDTHH:mm:ssZ`: when the snapshot was taken, to the second. */
   date: string;
-  current_ledger_size: number;
   expected_ledger_size: number;
-  current_queue_size: number;
-  pct_max_queue_size: number;
   median_fee: number;
   minimum_fee: number;
   open_ledger_fee: number;
+  pct_max_queue_size: number;
 }
 
 export function toFeeStat(row: StoredFeeStat): FeeStat {
   return {
-    date: fmtTime(new Date(Number(row.ms))),
     current_ledger_size: Number(row.current_ledger_size),
-    expected_ledger_size: Number(row.expected_ledger_size),
     current_queue_size: Number(row.current_queue_size),
-    pct_max_queue_size: Number(row.pct_max_queue_size),
+    date: fmtTime(new Date(Number(row.ms))),
+    expected_ledger_size: Number(row.expected_ledger_size),
     median_fee: toNative(row.median_fee),
     minimum_fee: toNative(row.minimum_fee),
     open_ledger_fee: toNative(row.open_ledger_fee),
+    pct_max_queue_size: Number(row.pct_max_queue_size),
   };
 }

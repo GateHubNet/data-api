@@ -68,15 +68,26 @@ interface FeeBody {
   rows: FeeRow[];
 }
 interface StatRow {
-  date: string;
   current_ledger_size: number;
-  expected_ledger_size: number;
   current_queue_size: number;
-  pct_max_queue_size: number;
+  date: string;
+  expected_ledger_size: number;
   median_fee: number;
   minimum_fee: number;
   open_ledger_fee: number;
+  pct_max_queue_size: number;
 }
+/** The keys of a `/fee_stats` row, in the order the original served them: sorted by name, as the HBase row had them. */
+const STAT_KEYS = [
+  'current_ledger_size',
+  'current_queue_size',
+  'date',
+  'expected_ledger_size',
+  'median_fee',
+  'minimum_fee',
+  'open_ledger_fee',
+  'pct_max_queue_size',
+];
 interface StatBody {
   result: string;
   count: number;
@@ -132,8 +143,8 @@ function summarizeFees(ledger: RawLedger): Summary {
 /** What `addFeeSummary` wrote (and the API served) for a summary: `avg` and `total` through `round(x, 6)`. */
 const written = (d: Summary, ledgerIndex?: number): FeeRow => ({
   avg: round(d.avg, 6),
-  min: d.min,
   max: d.max,
+  min: d.min,
   total: round(d.total, 6),
   tx_count: d.tx_count,
   date: d.date,
@@ -207,14 +218,14 @@ function mockRow(r: MockFeeStat): FeeStatsRow {
 }
 /** The row of the API for a mock snapshot: the numbers of the mock, fees in XRP. */
 const mockStat = (r: MockFeeStat): StatRow => ({
-  date: r.date,
   current_ledger_size: Number(r.current_ledger_size),
-  expected_ledger_size: Number(r.expected_ledger_size),
   current_queue_size: Number(r.current_queue_size),
-  pct_max_queue_size: Number(r.pct_max_queue_size),
+  date: r.date,
+  expected_ledger_size: Number(r.expected_ledger_size),
   median_fee: Number(r.median_fee),
   minimum_fee: Number(r.minimum_fee),
   open_ledger_fee: Number(r.open_ledger_fee),
+  pct_max_queue_size: Number(r.pct_max_queue_size),
 });
 const MOCK_STATS: StatRow[] = FEE_STATS_MOCK.map(mockStat);
 const MOCK_ROWS: FeeStatsRow[] = FEE_STATS_MOCK.map(mockRow);
@@ -236,14 +247,14 @@ function snapshot(at: string, size: number, over: Partial<FeeStatsRow> = {}): Fe
 }
 /** The row of the API for a `snapshot()`. */
 const statOf = (row: FeeStatsRow, date: string): StatRow => ({
-  date,
   current_ledger_size: row.current_ledger_size,
-  expected_ledger_size: row.expected_ledger_size,
   current_queue_size: row.current_queue_size,
-  pct_max_queue_size: row.pct_max_queue_size,
+  date,
+  expected_ledger_size: row.expected_ledger_size,
   median_fee: Number(row.median_fee) / 1e6,
   minimum_fee: Number(row.minimum_fee) / 1e6,
   open_ledger_fee: Number(row.open_ledger_fee) / 1e6,
+  pct_max_queue_size: row.pct_max_queue_size,
 });
 
 /** A `ledgers` row for the synthetic ledgers: the fee columns are the point, the rest is a plausible ledger. */
@@ -572,7 +583,7 @@ describe('GET /v2/network/fees', () => {
       }
     });
 
-    it('a ledger row is {avg, min, max, total, tx_count, date, ledger_index} in that order, fees in XRP as JSON numbers', async () => {
+    it('a ledger row is {avg, max, min, total, tx_count, date, ledger_index} in that order, fees in XRP as JSON numbers', async () => {
       const res = await get('/v2/network/fees?limit=3');
       expect(res.body).toEqual({
         result: 'success',
@@ -582,8 +593,8 @@ describe('GET /v2/network/fees', () => {
           // 12 transactions that paid 10 drops each
           {
             avg: 0.00001,
-            min: 0.00001,
             max: 0.00001,
+            min: 0.00001,
             total: 0.00012,
             tx_count: 12,
             date: '2013-06-11T20:01:20Z',
@@ -592,8 +603,8 @@ describe('GET /v2/network/fees', () => {
           // 775 drops over 5 transactions
           {
             avg: 0.000155,
-            min: 0.00001,
             max: 0.00025,
+            min: 0.00001,
             total: 0.000775,
             tx_count: 5,
             date: '2013-10-25T10:27:10Z',
@@ -602,8 +613,8 @@ describe('GET /v2/network/fees', () => {
           // 138000 drops over 13 transactions: 0.0106153846 to six digits is 0.0106154, and to a drop 0.010615
           {
             avg: 0.010615,
-            min: 0.01,
             max: 0.011,
+            min: 0.01,
             total: 0.138,
             tx_count: 13,
             date: '2015-01-14T17:29:10Z',
@@ -611,7 +622,22 @@ describe('GET /v2/network/fees', () => {
           },
         ],
       });
-      expect(Object.keys(res.body.rows[0])).toEqual(['avg', 'min', 'max', 'total', 'tx_count', 'date', 'ledger_index']);
+      expect(Object.keys(res.body.rows[0])).toEqual(['avg', 'max', 'min', 'total', 'tx_count', 'date', 'ledger_index']);
+    });
+
+    it('R71: the keys of a row, in JSON and in the CSV header, are in the order HBase served the columns: sorted by name, the numbers before date and ledger_index', async () => {
+      const ledger = ['avg', 'max', 'min', 'total', 'tx_count', 'date', 'ledger_index'];
+      const bucket = ['avg', 'max', 'min', 'total', 'tx_count', 'date'];
+      for (const [interval, keys] of [
+        ['ledger', ledger],
+        ['hour', bucket],
+        ['day', bucket],
+      ] as const) {
+        const json = await get(`/v2/network/fees?interval=${interval}&limit=1000`);
+        for (const row of json.body.rows as FeeRow[]) expect([interval, Object.keys(row)]).toEqual([interval, keys]);
+        const csv = await get(`/v2/network/fees?interval=${interval}&format=csv&limit=2`);
+        expect([interval, csv.text.split('\n')[0]]).toEqual([interval, keys.map((k) => `"${k}"`).join(',')]);
+      }
     });
 
     it('an hour or a day has no ledger_index, and its date is the start of the bucket', async () => {
@@ -619,7 +645,7 @@ describe('GET /v2/network/fees', () => {
         const res = await get(`/v2/network/fees?interval=${interval}&limit=1000`);
         for (const r of res.body.rows as FeeRow[]) {
           expect(r).not.toHaveProperty('ledger_index');
-          expect(Object.keys(r)).toEqual(['avg', 'min', 'max', 'total', 'tx_count', 'date']);
+          expect(Object.keys(r)).toEqual(['avg', 'max', 'min', 'total', 'tx_count', 'date']);
           expect(unix(r.date) % SIZES[interval]).toBe(0);
         }
       }
@@ -948,8 +974,8 @@ describe('GET /v2/network/fees', () => {
       expect(rows).toHaveLength(1 + 54);
       expect(rows[0].split(',')).toEqual([
         '"avg"',
-        '"min"',
         '"max"',
+        '"min"',
         '"total"',
         '"tx_count"',
         '"date"',
@@ -962,7 +988,7 @@ describe('GET /v2/network/fees', () => {
       const res = await get('/v2/network/fees?format=csv&interval=hour');
       const rows = lines(res.text);
       expect(rows).toHaveLength(1 + 10);
-      expect(rows[0].split(',')).toEqual(['"avg"', '"min"', '"max"', '"total"', '"tx_count"', '"date"']);
+      expect(rows[0].split(',')).toEqual(['"avg"', '"max"', '"min"', '"total"', '"tx_count"', '"date"']);
     });
 
     it('format is case-insensitive, and anything but csv is JSON', async () => {
@@ -1111,18 +1137,18 @@ describe('GET /v2/network/fees on ledgers without fees', () => {
   it('an empty ledger: min 0, max 0, total 0, avg 0, tx_count 0 (numbers, not NaN or null)', async () => {
     const res = await get(window('ledger', '2018-03-05', '2018-03-05'));
     expect(res.body.rows).toEqual([
-      { avg: 0, min: 0, max: 0, total: 0, tx_count: 0, date: '2018-03-05T10:00:10Z', ledger_index: 40000001 },
+      { avg: 0, max: 0, min: 0, total: 0, tx_count: 0, date: '2018-03-05T10:00:10Z', ledger_index: 40000001 },
       {
         avg: 0.00002,
-        min: 0.00001,
         max: 0.00003,
+        min: 0.00001,
         total: 0.00008,
         tx_count: 4,
         date: '2018-03-05T10:20:00Z',
         ledger_index: 40000002,
       },
-      { avg: 0, min: 0, max: 0, total: 0, tx_count: 0, date: '2018-03-05T11:00:00Z', ledger_index: 40000003 },
-      { avg: 0, min: 0, max: 0, total: 0, tx_count: 2, date: '2018-03-05T11:30:00Z', ledger_index: 40000004 },
+      { avg: 0, max: 0, min: 0, total: 0, tx_count: 0, date: '2018-03-05T11:00:00Z', ledger_index: 40000003 },
+      { avg: 0, max: 0, min: 0, total: 0, tx_count: 2, date: '2018-03-05T11:30:00Z', ledger_index: 40000004 },
     ]);
   });
 
@@ -1130,9 +1156,9 @@ describe('GET /v2/network/fees on ledgers without fees', () => {
     const res = await get(window('hour', '2018-03-05', '2018-03-05'));
     expect(res.body.rows).toEqual([
       // 4 transactions over 80 drops; the empty ledger neither holds min at 0 nor counts
-      { avg: 0.00002, min: 0.00001, max: 0.00003, total: 0.00008, tx_count: 4, date: '2018-03-05T10:00:00Z' },
+      { avg: 0.00002, max: 0.00003, min: 0.00001, total: 0.00008, tx_count: 4, date: '2018-03-05T10:00:00Z' },
       // an empty ledger and a ledger of free transactions: nothing paid
-      { avg: 0, min: 0, max: 0, total: 0, tx_count: 2, date: '2018-03-05T11:00:00Z' },
+      { avg: 0, max: 0, min: 0, total: 0, tx_count: 2, date: '2018-03-05T11:00:00Z' },
     ]);
   });
 
@@ -1140,9 +1166,9 @@ describe('GET /v2/network/fees on ledgers without fees', () => {
     const res = await get(window('day', '2018-03-05', '2018-03-06'));
     expect(res.body.rows).toEqual([
       // 80 drops over 6 transactions: 13.33 drops, 13 to a drop
-      { avg: 0.000013, min: 0.00001, max: 0.00003, total: 0.00008, tx_count: 6, date: '2018-03-05T00:00:00Z' },
+      { avg: 0.000013, max: 0.00003, min: 0.00001, total: 0.00008, tx_count: 6, date: '2018-03-05T00:00:00Z' },
       // one ledger with one 12 drop transaction: its own row, avg 0.000012
-      { avg: 0.000012, min: 0.000012, max: 0.000012, total: 0.000012, tx_count: 1, date: '2018-03-06T00:00:00Z' },
+      { avg: 0.000012, max: 0.000012, min: 0.000012, total: 0.000012, tx_count: 1, date: '2018-03-06T00:00:00Z' },
     ]);
   });
 
@@ -1152,9 +1178,9 @@ describe('GET /v2/network/fees on ledgers without fees', () => {
     const hours = await get(window('hour', '2019-05-05', '2019-05-05'));
     expect(hours.body.rows).toEqual([
       // the original set a bucket from the first ledger it saw and worked avg out again only from the second
-      { avg: 0.010501, min: 0.01, max: 0.011, total: 1.050046, tx_count: 100, date: '2019-05-05T05:00:00Z' },
+      { avg: 0.010501, max: 0.011, min: 0.01, total: 1.050046, tx_count: 100, date: '2019-05-05T05:00:00Z' },
       // 2100092 drops over 200 transactions: 10500.46 drops
-      { avg: 0.0105, min: 0.01, max: 0.011, total: 2.100092, tx_count: 200, date: '2019-05-05T07:00:00Z' },
+      { avg: 0.0105, max: 0.011, min: 0.01, total: 2.100092, tx_count: 200, date: '2019-05-05T07:00:00Z' },
     ]);
   });
 
@@ -1288,30 +1314,32 @@ describe('GET /v2/network/fee_stats', () => {
   afterEach(() => jest.restoreAllMocks());
 
   describe('the rows', () => {
-    it('a snapshot is {date, current_ledger_size, expected_ledger_size, current_queue_size, pct_max_queue_size, median_fee, minimum_fee, open_ledger_fee}', async () => {
+    it('a snapshot is {current_ledger_size, current_queue_size, date, expected_ledger_size, median_fee, minimum_fee, open_ledger_fee, pct_max_queue_size}', async () => {
       const res = await get('/v2/network/fee_stats?start=2020-01-01T12:00:07&limit=1');
       expect(res.body.rows).toEqual([
         {
-          date: '2020-01-01T12:00:07Z',
           current_ledger_size: 10,
-          expected_ledger_size: 50,
           current_queue_size: 10,
-          pct_max_queue_size: 1,
+          date: '2020-01-01T12:00:07Z',
+          expected_ledger_size: 50,
           median_fee: 0.005,
           minimum_fee: 0.00001,
           open_ledger_fee: 0.00002,
+          pct_max_queue_size: 1,
         },
       ]);
-      expect(Object.keys(res.body.rows[0])).toEqual([
-        'date',
-        'current_ledger_size',
-        'expected_ledger_size',
-        'current_queue_size',
-        'pct_max_queue_size',
-        'median_fee',
-        'minimum_fee',
-        'open_ledger_fee',
-      ]);
+      expect(Object.keys(res.body.rows[0])).toEqual(STAT_KEYS);
+    });
+
+    it('R71: the keys of a row, in JSON and in the CSV header, are the columns of the HBase row sorted by name, raw and sampled', async () => {
+      for (const interval of ['', 'minute', 'hour', 'day']) {
+        const json = await get(`/v2/network/fee_stats?interval=${interval}&limit=1000`);
+        expect(json.body.rows.length).toBeGreaterThan(0);
+        for (const row of json.body.rows as StatRow[])
+          expect([interval, Object.keys(row)]).toEqual([interval, STAT_KEYS]);
+        const csv = await get(`/v2/network/fee_stats?interval=${interval}&format=csv&limit=2`);
+        expect([interval, csv.text.split('\n')[0]]).toEqual([interval, STAT_KEYS.map((k) => `"${k}"`).join(',')]);
+      }
     });
 
     it('is all numbers (fees in the native unit) but the date, which is the second the snapshot was taken in', async () => {
@@ -1615,17 +1643,8 @@ describe('GET /v2/network/fee_stats', () => {
       expect(res.headers['content-disposition']).toBe('attachment; filename=network fee stats.csv');
       const rows = res.text.split('\n');
       expect(rows).toHaveLength(1 + ROWS.length);
-      expect(rows[0].split(',')).toEqual([
-        '"date"',
-        '"current_ledger_size"',
-        '"expected_ledger_size"',
-        '"current_queue_size"',
-        '"pct_max_queue_size"',
-        '"median_fee"',
-        '"minimum_fee"',
-        '"open_ledger_fee"',
-      ]);
-      expect(rows[1]).toBe('"2019-07-01T09:10:11Z","5","50","5","0.5","0.005","0.00001","0.000015"');
+      expect(rows[0].split(',')).toEqual(STAT_KEYS.map((key) => `"${key}"`));
+      expect(rows[1]).toBe('"5","5","2019-07-01T09:10:11Z","50","0.005","0.00001","0.000015","0.5"');
     });
 
     it('goes with the interval, has the Link header on a next page, and an empty range is an empty CSV', async () => {
@@ -1779,14 +1798,14 @@ describe('GET /v2/network/fees and /fee_stats on Xahau', () => {
     const res = await get('/v2/network/fee_stats?start=2026-01-01');
     expect(res.body.rows).toEqual([
       {
-        date: '2026-10-15T12:25:00Z',
         current_ledger_size: 12,
-        expected_ledger_size: 50,
         current_queue_size: 12,
-        pct_max_queue_size: 1.2,
+        date: '2026-10-15T12:25:00Z',
+        expected_ledger_size: 50,
         median_fee: 0.00001,
         minimum_fee: 0.00001,
         open_ledger_fee: 0.007056,
+        pct_max_queue_size: 1.2,
       },
       expect.objectContaining({ current_ledger_size: 13, open_ledger_fee: 0.018088 }),
     ]);

@@ -7,10 +7,19 @@ import { PrometheusService } from '../modules/prometheus/prometheus.service';
 export const FEE_STATS_INTERVAL_MS = 5000;
 
 /**
- * Longest a `fee` request may take (to connect, and again to answer): under the interval, so that a node that hangs holds
- * up one tick, not six (the default of the node client is 30 s). It is not retried: the next tick is the retry.
+ * The timeout passed to `NodeClient.request`. The client applies it to waiting for a connection AND again to waiting for
+ * the answer, so a node that hangs costs up to twice as much: about 8 s, which is a little more than one tick (the
+ * default of the node client is 30 s, and 3 retries on top; the poller does not retry, the next tick is the retry). The
+ * ticks never overlap, so a hung node costs two ticks, not more.
  */
 export const FEE_STATS_REQUEST_TIMEOUT_MS = 4000;
+
+/**
+ * How long a shutdown waits for the sample in flight (for its insert, when the node has answered already). The cleanups
+ * of `ShutdownSignals` share one budget of 10 s and the ingest runner, which releases the syncer lease, can stop after
+ * this one, so a node that hangs must not use it up: the sample is abandoned (it is dropped when its answer arrives).
+ */
+export const FEE_STATS_SHUTDOWN_WAIT_MS = 2000;
 
 /** Optional `FeeStatsPollerOptions` (interval, logger); tests shorten the interval and capture the log. */
 export const FEE_STATS_POLLER_OPTIONS = Symbol('FEE_STATS_POLLER_OPTIONS');
@@ -85,6 +94,13 @@ export function feeStatsRowFrom(result: unknown, ts: number): FeeStatsRow {
   };
 }
 
+/** A sample whose answer came after the poller was stopped: dropped, not written. */
+class SampleDropped extends Error {
+  constructor() {
+    super('the poller was stopped before the node answered');
+  }
+}
+
 /** The text of whatever a promise rejected with. */
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -99,8 +115,10 @@ function describe(err: unknown): string {
  * - **Never crashes.** A failed sample (node unreachable, odd answer, ClickHouse refusing the insert) is logged and
  *   counted in `syncer_fee_stats_errors_total`; the next tick tries again. A written sample counts in
  *   `syncer_fee_stats_samples_total`.
- * - **Stops on shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it, and the sample
- *   in flight is allowed to finish and be written.
+ * - **Stops on shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it, and a sample
+ *   whose node answer arrives after it is dropped, not written. The stop waits for the sample in flight for at most
+ *   `FEE_STATS_SHUTDOWN_WAIT_MS` (an insert that is under way gets that long to finish), then abandons it and says so, so
+ *   that the stop of the ingest runner (the lease), which can run after this one, keeps most of the 10 s of the shutdown.
  *
  * The ticks are not aligned to the wall clock (the original's cron job ran at second 0, 5, 10, ...): the API serves
  * a minute / hour / day as the first snapshot at or after each boundary, whatever second that falls on.
@@ -112,6 +130,8 @@ export class FeeStatsPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly now: () => number;
   private timer?: NodeJS.Timeout;
   private inFlight?: Promise<void>;
+  /** Set when a stop begins: nothing starts, and nothing that was asked before it is written, after it. */
+  private closing = false;
   private stopped?: Promise<void>;
 
   constructor(
@@ -128,7 +148,7 @@ export class FeeStatsPoller implements OnApplicationBootstrap, OnModuleDestroy {
 
   /** Takes the first sample at once (not awaited: a slow node does not hold up the boot), then one every interval. */
   onApplicationBootstrap(): void {
-    if (this.stopped || this.timer) return;
+    if (this.closing || this.timer) return;
     this.shutdownSignals?.register('fee-stats', () => this.stop());
     this.timer = setInterval(() => void this.tick(), this.intervalMs);
     void this.tick();
@@ -138,28 +158,34 @@ export class FeeStatsPoller implements OnApplicationBootstrap, OnModuleDestroy {
     await this.stop();
   }
 
-  /** Stops the ticks and waits for the sample in flight. Idempotent; a stopped poller does not start again. */
+  /**
+   * Stops the ticks and waits for the sample in flight, at most `FEE_STATS_SHUTDOWN_WAIT_MS`. A sample whose node answer
+   * comes after this call is dropped. Idempotent; a stopped poller does not start again.
+   */
   stop(): Promise<void> {
+    this.closing = true;
     this.stopped ??= this.shutDown();
     return this.stopped;
   }
 
   /**
    * Asks the node for its fees, writes the row and returns it. Rejects when the node or ClickHouse does (the loop
-   * catches that). Exported for tests; the loop calls it once per tick.
+   * catches that), and when the poller was stopped before the node answered (nothing is written then). Exported for
+   * tests; the loop calls it once per tick.
    */
   async sample(): Promise<FeeStatsRow> {
     // the time the snapshot was asked for, as the original stamped it (it took the date before the request)
     const ts = this.now() / 1000;
     const result = await this.node.request({ command: 'fee' }, { timeoutMs: FEE_STATS_REQUEST_TIMEOUT_MS, retries: 0 });
     const row = feeStatsRowFrom(result, ts);
+    if (this.closing) throw new SampleDropped();
     await this.ch.insert(Table.FeeStats, [row]);
     this.metrics?.feeStatsSamplesTotal.inc();
     return row;
   }
 
   private tick(): Promise<void> {
-    if (this.stopped) return Promise.resolve();
+    if (this.closing) return Promise.resolve();
     if (this.inFlight) {
       this.logger.warn('Skipping a fee stats sample: the previous sample is still running');
       return this.inFlight;
@@ -168,8 +194,13 @@ export class FeeStatsPoller implements OnApplicationBootstrap, OnModuleDestroy {
       try {
         await this.sample();
       } catch (err) {
-        this.metrics?.feeStatsErrorsTotal.inc();
-        this.logger.error(`Fee stats sample failed: ${describe(err)}`);
+        if (this.closing) {
+          // the node answered late, or failed, while the app was going down: neither is a fault of the node or of the table
+          this.logger.log(`Dropped the fee stats sample in flight at shutdown: ${describe(err)}`);
+        } else {
+          this.metrics?.feeStatsErrorsTotal.inc();
+          this.logger.error(`Fee stats sample failed: ${describe(err)}`);
+        }
       } finally {
         this.inFlight = undefined;
       }
@@ -181,6 +212,18 @@ export class FeeStatsPoller implements OnApplicationBootstrap, OnModuleDestroy {
   private async shutDown(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
-    await this.inFlight;
+    const running = this.inFlight;
+    if (running === undefined) return;
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), FEE_STATS_SHUTDOWN_WAIT_MS);
+    });
+    const abandoned = await Promise.race([running.then(() => false), timedOut]);
+    clearTimeout(timer);
+    if (abandoned) {
+      this.logger.warn(
+        `Abandoning the fee stats sample in flight: no answer within ${FEE_STATS_SHUTDOWN_WAIT_MS} ms of the shutdown`,
+      );
+    }
   }
 }

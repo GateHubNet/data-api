@@ -3,6 +3,7 @@ import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import {
   FEE_STATS_INTERVAL_MS,
   FEE_STATS_REQUEST_TIMEOUT_MS,
+  FEE_STATS_SHUTDOWN_WAIT_MS,
   FeeStatsPoller,
   feeStatsRowFrom,
   roundPct,
@@ -68,8 +69,10 @@ describe('FeeStatsPoller', () => {
       await poller.sample();
       expect(request).toHaveBeenCalledTimes(1);
       expect(request.mock.calls[0][0]).toEqual({ command: 'fee' });
-      // a hung node must not hold a tick for the default 30 s
+      // The node client applies the timeout to the connection AND to the answer, so a hung node costs up to twice as much:
+      // 8 s, not the 30 s (and 3 retries) of the client's defaults. The poller does not retry; the next tick does.
       expect(request.mock.calls[0][1]).toEqual({ timeoutMs: FEE_STATS_REQUEST_TIMEOUT_MS, retries: 0 });
+      expect(FEE_STATS_REQUEST_TIMEOUT_MS * 2).toBeLessThan(30_000);
       expect(FEE_STATS_REQUEST_TIMEOUT_MS).toBeLessThan(FEE_STATS_INTERVAL_MS);
     });
 
@@ -375,8 +378,8 @@ describe('FeeStatsPoller', () => {
       }
     });
 
-    it('lets the sample in flight finish before it resolves, and writes it', async () => {
-      const { poller, request, insert } = setup();
+    it('drops a sample whose node answer arrives after the stop: nothing is written, nothing is counted as an error', async () => {
+      const { poller, request, insert, logger, metrics } = setup();
       const slow = deferred<unknown>();
       request.mockReturnValueOnce(slow.promise);
       await poller.onApplicationBootstrap();
@@ -384,12 +387,83 @@ describe('FeeStatsPoller', () => {
       let stopped = false;
       const stopping = poller.onModuleDestroy().then(() => (stopped = true));
       await jest.advanceTimersByTimeAsync(1_000);
-      expect(stopped).toBe(false);
-      expect(insert).not.toHaveBeenCalled();
+      expect(stopped).toBe(false); // it waits for the sample in flight, for a while
 
-      slow.resolve(fee());
+      slow.resolve(fee()); // the answer comes after the stop began
       await stopping;
+      expect(insert).not.toHaveBeenCalled();
+      expect(metrics.feeStatsSamplesTotal.inc).not.toHaveBeenCalled();
+      expect(metrics.feeStatsErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.log).toHaveBeenCalledWith(expect.stringMatching(/dropped the fee stats sample in flight/i));
+    });
+
+    it('does not count a node that fails while the app goes down as an error either', async () => {
+      const { poller, request, logger, metrics } = setup();
+      const slow = deferred<unknown>();
+      request.mockReturnValueOnce(slow.promise);
+      await poller.onApplicationBootstrap();
+      const stopping = poller.onModuleDestroy();
+      slow.reject(new Error('NodeClient is stopped'));
+      await stopping;
+      expect(metrics.feeStatsErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('NodeClient is stopped'));
+    });
+
+    it('lets an insert that is under way finish before the stop resolves', async () => {
+      const { poller, insert, metrics } = setup();
+      const writing = deferred<void>();
+      insert.mockReturnValueOnce(writing.promise);
+      await poller.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(0); // the node answered, the insert is on its way
       expect(insert).toHaveBeenCalledTimes(1);
+
+      let stopped = false;
+      const stopping = poller.onModuleDestroy().then(() => (stopped = true));
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(stopped).toBe(false);
+
+      writing.resolve();
+      await stopping;
+      expect(metrics.feeStatsSamplesTotal.inc).toHaveBeenCalledTimes(1);
+      expect(insert).toHaveBeenCalledTimes(1);
+    });
+
+    it('abandons the sample in flight after FEE_STATS_SHUTDOWN_WAIT_MS, so the stop of the ingest runner keeps the rest of the 10 s', async () => {
+      expect(FEE_STATS_SHUTDOWN_WAIT_MS).toBeLessThanOrEqual(2_000);
+      const { poller, request, insert, logger } = setup();
+      const hung = deferred<unknown>();
+      request.mockReturnValueOnce(hung.promise);
+      await poller.onApplicationBootstrap();
+
+      let stopped = false;
+      const stopping = poller.onModuleDestroy().then(() => (stopped = true));
+      await jest.advanceTimersByTimeAsync(FEE_STATS_SHUTDOWN_WAIT_MS - 1);
+      expect(stopped).toBe(false);
+      expect(logger.warn).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1);
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/abandoning the fee stats sample in flight/i));
+      expect(jest.getTimerCount()).toBe(0); // the wait left no timer behind
+
+      // the node answers at last: the sample is dropped, not written
+      hung.resolve(fee());
+      await jest.advanceTimersByTimeAsync(0);
+      expect(insert).not.toHaveBeenCalled();
+      expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it('the SIGTERM cleanup is capped the same way', async () => {
+      const { poller, request, signals } = setup();
+      request.mockReturnValueOnce(deferred<unknown>().promise); // never answers
+      await poller.onApplicationBootstrap();
+      let done = false;
+      const cleanup = (signals.register.mock.calls[0][1] as () => Promise<void>)().then(() => (done = true));
+      await jest.advanceTimersByTimeAsync(FEE_STATS_SHUTDOWN_WAIT_MS);
+      await cleanup;
+      expect(done).toBe(true);
     });
 
     it('is idempotent, and a stopped poller cannot be started again', async () => {
