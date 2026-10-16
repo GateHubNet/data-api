@@ -176,15 +176,17 @@ describe('ingest:range CLI (e2e)', () => {
     ]);
   });
 
-  it('exits 1 and names the ledger when the node does not have it, leaving the chunk to be redone', async () => {
+  it('exits 1 and names the ledger when the node does not have it within --max-wait, leaving the chunk to be redone', async () => {
     const database = `${DB}_gap`;
     const gap = syntheticChain(82_000_001, 30).filter((l) => l.index !== 82_000_020);
 
-    const { code, output } = await runCli(['--from', '82000001', '--to', '82000030'], gap, {
+    // lgrNotFound is retried (0.5 s, then 1 s) while the chunk's wait budget lasts (ruling R100).
+    const { code, output } = await runCli(['--from', '82000001', '--to', '82000030', '--max-wait', '2'], gap, {
       GH_CLICKHOUSE_DATABASE: database,
     });
 
     expect(code).toBe(1);
+    expect(output).toContain('Ledger 82000020 is not available on the node right now; asking again in 500 ms');
     expect(output).toContain('Ledger 82000020 is not available');
     expect(await chRows(`SELECT count() FROM ${database}.ledgers`)).toEqual(['0']);
     expect(

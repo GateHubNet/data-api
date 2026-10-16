@@ -19,6 +19,16 @@ describe('parseRangeIngestArgs', () => {
     ).toEqual({ from: 1000, to: 5999, chunkSize: 500, concurrency: 4, reprocess: true, runId: 'backfill-1' });
   });
 
+  it('reads --max-wait in seconds as the wait budget of a chunk (ruling R100)', () => {
+    expect(parseRangeIngestArgs(['--from', '1', '--to', '2', '--max-wait', '90'])).toEqual({
+      from: 1,
+      to: 2,
+      maxTransientWaitMs: 90_000,
+    });
+    expect(() => parseRangeIngestArgs(['--from', '1', '--to', '2', '--max-wait', '1.5'])).toThrow(UsageError);
+    expect(USAGE).toContain('--max-wait');
+  });
+
   it('leaves the optional flags out when they are not given, so that the defaults of rangeIngest apply', () => {
     expect(parseRangeIngestArgs(['--from', '1', '--to', '2'])).toEqual({ from: 1, to: 2 });
   });

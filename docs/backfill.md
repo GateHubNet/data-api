@@ -31,7 +31,8 @@ pnpm build && GH_ENV=local pnpm --filter @gatehub/data-syncer ingest:range --fro
 ```
 
 Options: `--from`, `--to` (both inclusive, required), `--chunk` (default 1000, must divide 1,000,000), `--concurrency` (default 8),
-`--reprocess`, `--run-id`, `--help`. Exit status: `0` done, `1` failed (rerun the same command), `2` wrong command line. The
+`--max-wait` (seconds a chunk may wait for a rate-limited node or a ledger it lacks right now, default 1200), `--reprocess`,
+`--run-id`, `--help`. Exit status: `0` done, `1` failed (rerun the same command), `2` wrong command line. The
 mechanics (aligned chunks, `ingest_log` intents, recovery of a failed attempt, the lease rule, `agg_dirty`) are in
 [syncer](syncer.md#4-range-ingest-cli).
 
@@ -66,7 +67,9 @@ A range that runs into ledgers already committed simply skips them (unless `--re
 
 ### Resuming, gap repair, reprocessing
 
-- **Resume:** rerun the same command. Finished chunks (`ingest_log` `done`) are skipped, an unfinished one is redone from scratch.
+- **Resume:** rerun the same command, or one with another `--chunk`: finished chunks (`ingest_log` `done`) are skipped, and an
+  unfinished one (an intent a failed or killed run left `started`) is redone over its whole recorded range first and closed, so
+  it is redone once whatever the chunk size of the rerun.
 - **Gaps:** find them with the SQL in [operations](operations.md#sql-health-checks) and ingest exactly those ranges.
 - **Reprocess:** after a parser change (the `parser_version` of `ledgers` records which parser wrote a ledger),
   `--reprocess --from A --to B` fetches and dry-parses first, then deletes and rewrites the committed ledgers of the range.
@@ -74,6 +77,29 @@ A range that runs into ledgers already committed simply skips them (unless `--re
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
+
+### Public nodes and rate limits
+
+Public nodes limit what one client may ask, and say how long to wait: `rate limit: units quota (50000 per 10s) exhausted, retry in
+~12376ms` (`wss://xahau.network`, `wss://xrplcluster.com`), and a second, hourly quota (`10000000 per 3600s`) that pauses a client
+for up to about 15 minutes. The node client honours the answer (nothing is sent to that node until the pause is over; another
+endpoint of `GH_NODE_ENDPOINTS` is used meanwhile), and range-ingest waits for it within `--max-wait` per chunk, so a throttled
+backfill slows down instead of failing. What keeps it moving:
+
+- `--concurrency 2` (Xahau ledgers are about 260 KB; one 10-second window of 50,000 units lets through roughly 100 to 370 of them).
+- `--chunk 100`: a chunk that cannot be fetched within its wait budget fails and is redone by the next run; a small chunk keeps
+  that redo cheap. A chunk is written only once all of its ledgers are in, so a chunk much larger than what one quota window
+  lets through mostly waits.
+- `--max-wait` at least the longest pause the node asks for: 1200 (20 minutes, the default) also rides out the hourly quota.
+- Expect tens of ledgers per minute, not hundreds: a backfill of more than a few thousand ledgers wants a node of your own.
+- Run one backfill per node at a time, and not while the live syncer catches up from the same node: they share its quota.
+
+Example for a few days of Xahau history from the public node:
+
+```bash
+GH_ENV=local GH_NETWORK=xahau pnpm --filter @gatehub/data-syncer ingest:range \
+  --from 26505727 --to 26570726 --concurrency 2 --chunk 100 --max-wait 1200
+```
 
 ## 2. Which node?
 
@@ -84,8 +110,8 @@ of the range:
 | --- | --- | --- | --- |
 | **Your own full-history rippled / Clio** | Complete if configured | None | Backfill and live |
 | A full-history provider | Complete | Per plan | Backfill without running infrastructure |
-| Public cluster (`xrplcluster.com`, `s2.ripple.com`) | Often deep | Yes, throttled under sweep load | Live syncing, light backfill |
-| Xahau (`wss://xahau.network`) | Check `complete_ledgers`: full history is not guaranteed | | Live; backfill as far as it goes |
+| Public cluster (`xrplcluster.com`, `s2.ripple.com`) | Often deep (`s2` is Ripple's full-history server) | Yes, throttled under sweep load | Live syncing, light backfill |
+| Xahau (`wss://xahau.network`) | Check `complete_ledgers` (full history from ledger 1 at the time of writing) | Yes: 50,000 units per 10 s, 10,000,000 per hour | Live; light backfill (see above) |
 
 - **One-time deep backfill:** your own full-history node (or a rented full-history API for the duration). A sweep of tens of millions
   of ledgers against a public endpoint is rate-limited, fails intermittently (retries mask but slow it) and is impolite to a shared

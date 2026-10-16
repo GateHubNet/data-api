@@ -12,6 +12,7 @@ import {
   LedgerNotAvailableError,
   LedgerSource,
   LedgerWriter,
+  NodeThrottledError,
   parseContextFor,
   RawLedger,
   runMigrations,
@@ -69,6 +70,10 @@ class TestSource implements LedgerSource {
   readonly fetches: number[] = [];
   /** Index -> how many more fetches of it fail with a plain error. */
   readonly failures = new Map<number, number>();
+  /** Index -> errors that the next fetches of it throw, in order (a rate limit, a ledger the node lacks for now). */
+  readonly errors = new Map<number, Error[]>();
+  /** Index -> the time of every fetch of it. */
+  readonly fetchedAt = new Map<number, number[]>();
   delayMs = 0;
   inFlight = 0;
   maxInFlight = 0;
@@ -84,10 +89,13 @@ class TestSource implements LedgerSource {
 
   async fetch(index: number): Promise<RawLedger> {
     this.fetches.push(index);
+    this.fetchedAt.set(index, [...(this.fetchedAt.get(index) ?? []), Date.now()]);
     this.inFlight += 1;
     this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
     try {
       if (this.delayMs > 0) await pause(this.delayMs);
+      const queued = this.errors.get(index)?.shift();
+      if (queued) throw queued;
       const failing = this.failures.get(index) ?? 0;
       if (failing > 0) {
         this.failures.set(index, failing - 1);
@@ -123,8 +131,16 @@ function captureLogger() {
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 
-/** Options that keep the failure paths fast and the output of the suite clean. */
-const FAST: Partial<RangeIngestOptions> = { retryBackoffMs: 1, quiescenceTimeoutMs: 5_000, logger: QUIET };
+/**
+ * Options that keep the failure paths fast and the output of the suite clean. No wait for a transient fetch failure (a
+ * rate limit, a ledger the node lacks): the tests of that budget set their own.
+ */
+const FAST: Partial<RangeIngestOptions> = {
+  retryBackoffMs: 1,
+  quiescenceTimeoutMs: 5_000,
+  maxTransientWaitMs: 0,
+  logger: QUIET,
+};
 
 describe('rangeIngest (e2e)', () => {
   let clickhouse: StartedClickHouse;
@@ -155,6 +171,15 @@ describe('rangeIngest (e2e)', () => {
 
   const count = async (svc: ClickHouseService, table: Table | string, where = '1'): Promise<number> =>
     Number((await svc.queryOne<{ n: string | number }>(`SELECT count() AS n FROM ${table} WHERE ${where}`))?.n);
+
+  /** Rows of every ledger-keyed table above `index`. */
+  async function rowsAbove(svc: ClickHouseService, index: number): Promise<Counts> {
+    return Object.fromEntries(
+      await Promise.all(ALL_TABLES.map(async (t) => [t, await count(svc, t, `ledger_index > ${index}`)] as const)),
+    );
+  }
+
+  const noRows = (): Counts => Object.fromEntries(ALL_TABLES.map((t) => [t, 0]));
 
   async function tableCounts(svc: ClickHouseService, tables: Table[]): Promise<Counts> {
     return Object.fromEntries(await Promise.all(tables.map(async (t) => [t, await count(svc, t)] as const)));
@@ -517,22 +542,66 @@ describe('rangeIngest (e2e)', () => {
       await expectNoDuplicateTransactions(svc);
     });
 
-    it('treats an unfinished intent of different bounds that overlaps a chunk as that chunk being unfinished', async () => {
+    it('redoes an unfinished intent over its own recorded range, whatever the chunk size is now, and closes it (R100)', async () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx, { runId: 'crashed-run' }).write(CHAIN_RAW.slice(0, 14));
       // The crashed run worked in chunks of 5: its open chunk is L(6)..L(10).
       await seedIntent(svc, L(6), L(10), 'crashed-run');
       const source = new TestSource(CHAIN_RAW);
 
-      await rangeIngest(source, svc, ctx, { from: L(1), to: L(14), ...FAST });
+      const result = await rangeIngest(source, svc, ctx, { from: L(1), to: L(14), ...FAST });
 
-      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(1), L(14)));
+      // Only the intent is redone: the other ledgers are committed, and a committed ledger is complete.
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(6), L(10)));
+      expect(result).toEqual({ chunksDone: 1, ledgers: 5 });
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 14), CHAIN_TABLES));
-      // The chunk is done, and so is the older intent it covered.
-      expect((await intents(svc)).map((i) => [i.start, i.end, i.status])).toEqual([
-        [L(1), 9_999_999, 'done'],
-        [L(6), L(10), 'done'],
-      ]);
+      await expectNoDuplicateTransactions(svc);
+      expect((await intents(svc)).map((i) => [i.start, i.end, i.status])).toEqual([[L(6), L(10), 'done']]);
+    });
+
+    it('closes an unfinished intent wider than the chunks of this run as soon as it is redone, so a failing run cannot redo it forever (F5)', async () => {
+      const svc = await freshService();
+      // A run with chunks of 1000 died while writing L(1)..L(14): child rows without a commit, the intent open.
+      await insertUncommitted(svc, CHAIN_RAW.slice(0, 5));
+      await seedIntent(svc, L(1), 9_999_999, 'crashed-run');
+      // This run uses chunks of 5, and the node lacks L(28) for now: the run fails on a later chunk.
+      const lacking = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(28)));
+      const options = { from: L(1), to: L(30), chunkSize: 5, ...FAST };
+
+      await expect(rangeIngest(lacking, svc, ctx, options)).rejects.toBeInstanceOf(LedgerNotAvailableError);
+
+      // The intent was redone over its whole range (14 ledgers, more than a chunk of this run) and closed.
+      const old = (await intents(svc)).find((i) => i.start === L(1) && i.end === 9_999_999);
+      expect(old?.status).toBe('done');
+      expect((await committedIndexes(svc)).filter((i) => i <= 9_999_999)).toEqual(range(L(1), 9_999_999));
+      await expectNoDuplicateTransactions(svc);
+
+      // The rerun does not touch it again: it fetches only what is still missing.
+      const source = new TestSource(CHAIN_RAW);
+      await rangeIngest(source, svc, ctx, options);
+      expect(source.fetches.every((i) => i > 9_999_999)).toBe(true);
+      expect(source.fetches).toContain(L(28));
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW, CHAIN_TABLES));
+      expect((await intents(svc)).filter((i) => i.status !== 'done')).toEqual([]);
+    });
+
+    it('merges overlapping unfinished intents and redoes them as one, removing the orphans of ledgers it does not write', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx, { runId: 'crashed-a' }).write(CHAIN_RAW.slice(0, 4)); // L(1)..L(4) committed
+      await insertUncommitted(svc, CHAIN_RAW.slice(4, 8)); // L(5)..L(8): child rows only
+      await seedIntent(svc, L(1), L(6), 'crashed-a');
+      await seedIntent(svc, L(5), L(8), 'crashed-b');
+      const source = new TestSource(CHAIN_RAW);
+
+      // The run asks for L(1)..L(6) only: L(7) and L(8) are not written, but their orphan rows go.
+      await rangeIngest(source, svc, ctx, { from: L(1), to: L(6), ...FAST });
+
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(1), L(6)));
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(6)));
+      expect(await rowsAbove(svc, L(6))).toEqual(noRows());
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 6), CHAIN_TABLES));
+      expect((await intents(svc)).filter((i) => i.status !== 'done')).toEqual([]);
     });
 
     it('waits for the run of an unfinished intent before it deletes', async () => {
@@ -619,6 +688,77 @@ describe('rangeIngest (e2e)', () => {
       expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 14), CHAIN_TABLES));
       await expectNoDuplicateTransactions(svc);
+    });
+  });
+
+  describe('transient fetch failures (ruling R100)', () => {
+    it('waits as long as a rate-limited node asks and goes on, in the same attempt', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW);
+      source.errors.set(L(5), [new NodeThrottledError(['wss://node.example'], 300, 'rate limit: retry in ~50ms')]);
+      const write = jest.spyOn(LedgerWriter.prototype, 'write');
+
+      const result = await rangeIngest(source, svc, ctx, { ...FAST, from: L(1), to: L(14), maxTransientWaitMs: 5_000 });
+
+      expect(result.ledgers).toBe(14);
+      const [first, second] = source.fetchedAt.get(L(5)) ?? [];
+      expect(second - first).toBeGreaterThanOrEqual(290);
+      expect(write).toHaveBeenCalledTimes(1); // not a failed attempt: the chunk was not redone
+      expect((await intents(svc)).map((i) => i.status)).toEqual(['done']);
+    });
+
+    it('retries a ledger the node does not have right now (lgrNotFound) with a backoff', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW);
+      source.errors.set(L(7), [new LedgerNotAvailableError(L(7)), new LedgerNotAvailableError(L(7))]);
+      const logger = captureLogger();
+
+      const result = await rangeIngest(source, svc, ctx, {
+        ...FAST,
+        from: L(1),
+        to: L(14),
+        retryBackoffMs: 20,
+        maxTransientWaitMs: 5_000,
+        logger,
+      });
+
+      expect(result.ledgers).toBe(14);
+      expect(source.fetchCount(L(7))).toBe(3);
+      expect(logger.lines.filter((l) => l.level === 'warn' && l.message.includes(`Ledger ${L(7)}`))).toHaveLength(2);
+    });
+
+    it('fails the chunk once its transient waits would pass the budget, and leaves its intent open', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW.filter((l) => l.header.ledger_index !== L(7)));
+
+      await expect(
+        rangeIngest(source, svc, ctx, { ...FAST, from: L(1), to: L(14), retryBackoffMs: 20, maxTransientWaitMs: 100 }),
+      ).rejects.toMatchObject({ name: 'LedgerNotAvailableError', ledgerIndex: L(7) });
+
+      // 20 + 40 ms fit in the budget, 80 more would not: three fetches, then the chunk fails, without a chunk retry.
+      expect(source.fetchCount(L(7))).toBe(3);
+      expect(await count(svc, Table.Ledgers)).toBe(0);
+      expect((await intents(svc)).map((i) => i.status)).toEqual(['started']);
+    });
+
+    it('fails the chunk at once when a rate limit asks for longer than the budget', async () => {
+      const svc = await freshService();
+      const source = new TestSource(CHAIN_RAW);
+      source.errors.set(L(3), [
+        new NodeThrottledError(['wss://node.example'], 929_624, 'rate limit: retry in ~929374ms'),
+      ]);
+
+      await expect(
+        rangeIngest(source, svc, ctx, { ...FAST, from: L(1), to: L(14), maxTransientWaitMs: 60_000 }),
+      ).rejects.toBeInstanceOf(NodeThrottledError);
+      expect(source.fetchCount(L(3))).toBe(1);
+    });
+
+    it('refuses a negative budget', async () => {
+      const svc = await freshService();
+      await expect(
+        rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(1), to: L(3), maxTransientWaitMs: -1 }),
+      ).rejects.toThrow(/maxTransientWaitMs/);
     });
   });
 

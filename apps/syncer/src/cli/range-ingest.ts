@@ -14,7 +14,9 @@ import {
   ParseContext,
   parseContextFor,
   RawLedger,
+  retryAfterMsOf,
   Table,
+  throttleHint,
   wait,
 } from '@gatehub/data-api-shared';
 import { Logger } from '@nestjs/common';
@@ -60,6 +62,12 @@ export interface RangeIngestOptions {
   maxAttempts?: number;
   /** Wait before the second attempt of a chunk; it doubles per attempt (at most 30 s). Default 500. */
   retryBackoffMs?: number;
+  /**
+   * How long the fetches of one chunk may wait in all for transient failures (ruling R100): a rate-limited node (as long
+   * as it asks) and a ledger the node does not have right now (`lgrNotFound`, retried after `retryBackoffMs`, doubling
+   * to 30 s). A wait that would pass it fails the chunk. Default 1200000 (20 min, the longest pause a node may ask for).
+   */
+  maxTransientWaitMs?: number;
   /** A live syncer's lease younger than this (server clock) is fresh. Default 30000, the live runner's TTL. */
   leaseFreshMs?: number;
   /** `awaitQuiescence` timeout (before the kill, and again after it). Default 60000. */
@@ -87,6 +95,9 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_BACKOFF_MS = 500;
 const MAX_RETRY_BACKOFF_MS = 30_000;
 const DEFAULT_LEASE_FRESH_MS = 30_000;
+const DEFAULT_MAX_TRANSIENT_WAIT_MS = 20 * 60_000;
+/** The pause after a rate-limit answer that names no wait, as the node client takes it. */
+const DEFAULT_THROTTLE_WAIT_MS = 10_000;
 const DEFAULT_QUIESCENCE_TIMEOUT_MS = 60_000;
 const MAX_LEDGER_INDEX = 2 ** 32 - 1;
 const HOUR_SECONDS = 3600;
@@ -127,7 +138,7 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *
  * **Per chunk** (the key of a chunk in `ingest_log` is `(first ledger, last ledger)` of the chunk):
  *  1. The ledgers of the chunk that are already committed (they have a `ledgers` row) are skipped, unless `reprocess`
- *     is set or the chunk has an unfinished intent: then all of its ledgers are replaced.
+ *     is set: then all of its ledgers are replaced.
  *  2. `ingest_log` gets a 'started' row (with the `run_id` of the attempt) before anything is deleted or written.
  *  3. The ledgers to write are fetched (up to `concurrency` at once). When they replace committed ones, each is also
  *     parsed (nothing is kept of that), so that a ledger the source lacks, a node that keeps failing or a parser that
@@ -138,10 +149,14 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     without any log row.
  *
  * **An unfinished intent** is a chunk whose newest `ingest_log` row says 'started': a run died, or gave up, in the middle
- * of it. Any chunk of this run that overlaps one counts as unfinished too, so a run with other bounds or another chunk
- * size cleans up after it as well. At the start the runs of those intents are waited for (`awaitQuiescence`), and at the
- * end the intents lying inside a range that was ingested whole are marked 'done'. `ingest_log` rows with a `live:` run id
- * belong to the live runner (key `(start, 0)`): they are never read as chunks, redone or marked.
+ * of it. At the start the runs of the intents that overlap `[from, to]` are waited for (`awaitQuiescence`); then, before
+ * the first chunk, each of them is redone over its own recorded range, whatever the chunk size of this run (overlapping
+ * ones as one range), and closed ('done') right after (ruling R100, see `redoOpenIntents`). `ingest_log` rows with a
+ * `live:` run id belong to the live runner (key `(start, 0)`): they are never read as chunks, redone or marked.
+ *
+ * **Transient fetch failures** (ruling R100): a rate-limited node is asked again when the pause it named is over, a
+ * ledger the node does not have right now (`lgrNotFound` from one member of a cluster) after a backoff, both within a
+ * wait budget per chunk (`maxTransientWaitMs`, 20 min); past it the chunk fails, like a missing ledger.
  *
  * **A failed attempt** is recovered as `LedgerWriter` documents (ruling R16): wait until the failed run's queries are gone,
  * delete the ledgers of the chunk that this run was writing (never a ledger it had skipped), wait for that too, and try
@@ -181,6 +196,7 @@ class RangeRunner {
   private readonly reprocess: boolean;
   private readonly maxAttempts: number;
   private readonly retryBackoffMs: number;
+  private readonly maxTransientWaitMs: number;
   private readonly leaseFreshMs: number;
   private readonly quiescenceTimeoutMs: number;
   private readonly network: string;
@@ -190,6 +206,8 @@ class RangeRunner {
 
   private writer: LedgerWriter;
   private open: OpenIntent[] = [];
+  /** The ledgers the redo of the unfinished intents wrote in this run (and marked in agg_dirty). */
+  private readonly redone = new Set<number>();
 
   private chunksDone = 0;
   /** Of `chunksDone`, the chunks that needed no write. */
@@ -229,6 +247,10 @@ class RangeRunner {
       throw new RangeError(`maxAttempts must be a positive integer, got ${this.maxAttempts}`);
     }
     this.retryBackoffMs = opts.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
+    this.maxTransientWaitMs = opts.maxTransientWaitMs ?? DEFAULT_MAX_TRANSIENT_WAIT_MS;
+    if (typeof this.maxTransientWaitMs !== 'number' || !(this.maxTransientWaitMs >= 0)) {
+      throw new RangeError(`maxTransientWaitMs must be a non-negative number, got ${this.maxTransientWaitMs}`);
+    }
     this.leaseFreshMs = opts.leaseFreshMs ?? DEFAULT_LEASE_FRESH_MS;
     this.quiescenceTimeoutMs = opts.quiescenceTimeoutMs ?? DEFAULT_QUIESCENCE_TIMEOUT_MS;
     this.reprocess = opts.reprocess ?? false;
@@ -263,12 +285,12 @@ class RangeRunner {
     try {
       await this.assertNoLiveSyncer(this.to);
       await this.waitForOpenIntents();
+      await this.redoOpenIntents();
       for (const chunk of this.chunks()) {
         await this.assertNoLiveSyncer(chunk.end);
         await this.ingestChunk(chunk);
         this.chunksDone += 1;
       }
-      await this.closeCoveredIntents();
     } catch (err) {
       failure = err;
     }
@@ -321,11 +343,12 @@ class RangeRunner {
   private async ingestChunk(chunk: Chunk): Promise<void> {
     const startedAt = Date.now();
     const committed = await this.committedIn(chunk.start, chunk.end);
-    const unfinished = this.open.some((intent) => intent.start <= chunk.end && intent.end >= chunk.start);
-    const redo = this.reprocess || unfinished;
+    // The unfinished intents were redone and closed before the first chunk (`redoOpenIntents`).
+    const redo = this.reprocess;
     const toWrite = redo ? chunk.targets : chunk.targets.filter((i) => !committed.has(i));
     if (!redo) {
-      for (const index of chunk.targets) this.noteSkipped(committed.get(index));
+      // A ledger the redo of an intent wrote in this run is marked in agg_dirty already.
+      for (const index of chunk.targets) if (!this.redone.has(index)) this.noteSkipped(committed.get(index));
     }
     if (toWrite.length === 0) {
       this.chunksSkipped += 1;
@@ -420,13 +443,11 @@ class RangeRunner {
         }
         return ledgers;
       } catch (err) {
-        // A ledger the parser rejects (`LedgerParseError`, which names it) fails the same way every time (ruling R96).
-        if (
-          permanent ||
-          isLedgerParseError(err) ||
-          err instanceof LedgerNotAvailableError ||
-          attempt >= this.maxAttempts
-        ) {
+        // A ledger the parser rejects (`LedgerParseError`, which names it) fails the same way every time (ruling R96). A
+        // missing ledger and a rate limit were retried by the fetch until the chunk's wait budget ran out (ruling R100).
+        const spent =
+          err instanceof LedgerNotAvailableError || retryAfterMsOf(err) > 0 || throttleHint(err) !== undefined;
+        if (permanent || isLedgerParseError(err) || spent || attempt >= this.maxAttempts) {
           this.logger.error(
             `Chunk [${chunk.start},${chunk.end}] failed (attempt ${attempt} of ${this.maxAttempts}), ` +
               `its intent stays open: ${describe(err)}`,
@@ -477,11 +498,13 @@ class RangeRunner {
     const results = new Array<RawLedger>(indexes.length);
     const failures: Array<{ position: number; error: unknown }> = [];
     let next = 0;
+    // The transient waits of this chunk's fetches: they must all end by this time (ruling R100).
+    const deadline = Date.now() + this.maxTransientWaitMs;
     const worker = async (): Promise<void> => {
       while (failures.length === 0 && next < indexes.length) {
         const position = next++;
         try {
-          results[position] = await this.fetchOne(indexes[position]);
+          results[position] = await this.fetchOne(indexes[position], deadline, () => failures.length > 0);
         } catch (error) {
           failures.push({ position, error });
         }
@@ -495,12 +518,38 @@ class RangeRunner {
     return results;
   }
 
-  private async fetchOne(index: number): Promise<RawLedger> {
-    const ledger = await this.source.fetch(index);
-    if (ledger.header.ledger_index !== index) {
-      throw new Error(`Ledger ${index} was requested but the source returned ledger ${ledger.header.ledger_index}`);
+  /**
+   * `source.fetch(index)`, retried while the failure is transient and its wait ends by `deadline` (ruling R100): a
+   * rate-limited node is asked again when the pause it named is over (the node client logged it), a ledger the node does
+   * not have right now (`LedgerNotAvailableError`: a cluster member without it) after a backoff. Anything else, or a wait
+   * past the deadline, is thrown; so is the last transient error once another fetch of the chunk failed (`abandon`).
+   */
+  private async fetchOne(index: number, deadline: number, abandon: () => boolean): Promise<RawLedger> {
+    for (let missing = 0; ; ) {
+      try {
+        const ledger = await this.source.fetch(index);
+        if (ledger.header.ledger_index !== index) {
+          throw new Error(`Ledger ${index} was requested but the source returned ledger ${ledger.header.ledger_index}`);
+        }
+        return ledger;
+      } catch (err) {
+        let delay: number;
+        const throttle = throttleHint(err);
+        if (retryAfterMsOf(err) > 0 || throttle !== undefined) {
+          delay = retryAfterMsOf(err) || throttle?.retryInMs || DEFAULT_THROTTLE_WAIT_MS;
+        } else if (err instanceof LedgerNotAvailableError) {
+          missing += 1;
+          delay = Math.min(MAX_RETRY_BACKOFF_MS, this.retryBackoffMs * 2 ** (missing - 1));
+        } else {
+          throw err;
+        }
+        if (abandon() || Date.now() + delay > deadline) throw err;
+        if (err instanceof LedgerNotAvailableError) {
+          this.logger.warn(`Ledger ${index} is not available on the node right now; asking again in ${delay} ms`);
+        }
+        await wait(delay);
+      }
     }
-    return ledger;
   }
 
   // =================================================================================================================
@@ -562,26 +611,63 @@ class RangeRunner {
   }
 
   /**
-   * After a whole range was ingested, the unfinished intents inside it were all redone (every chunk that overlapped
-   * one was). Mark the ones that no chunk of this run has a row for. Not for an index list: it need not have touched
-   * every ledger of the intent.
+   * Ruling R100: redo every unfinished intent over its own recorded range, whatever the chunk size of this run is, and
+   * close it. Overlapping intents are merged and redone as one. For each such range, before any chunk of this run:
+   *  - the ledgers to write are the ones committed in it now (a committed ledger is complete, but the intent may have been
+   *    a reprocess that deleted others) and the ones this run would ingest in it;
+   *  - they are fetched and parsed, then the whole range is deleted (which also takes the child rows that a crashed write
+   *    left for ledgers that are not written now), then they are written, as one chunk with its own intent row;
+   *  - every intent of the range gets a 'done' row.
+   * A redo that fails leaves the intents open, and the next run redoes them again; one that succeeds closes them, so no
+   * intent is redone by every run after it (F5: a run with a smaller `--chunk` than the one that died kept rewriting the
+   * first chunk of a wider intent and never closed it).
    */
-  private async closeCoveredIntents(): Promise<void> {
-    if (this.indexes) return;
-    const covered = this.open.filter(
-      (i) => i.start >= this.from && i.end <= this.to && !this.isChunkKey(i.start, i.end),
-    );
-    for (const intent of covered) await this.writeIntent(intent.start, intent.end, this.writer.runId, 'done');
+  private async redoOpenIntents(): Promise<void> {
+    const sorted = [...this.open].sort((a, b) => a.start - b.start || a.end - b.end);
+    const groups: Array<{ start: number; end: number; members: OpenIntent[] }> = [];
+    for (const intent of sorted) {
+      const last = groups[groups.length - 1];
+      if (last && intent.start <= last.end) {
+        last.end = Math.max(last.end, intent.end);
+        last.members.push(intent);
+      } else {
+        groups.push({ start: intent.start, end: intent.end, members: [intent] });
+      }
+    }
+    for (const group of groups) {
+      const startedAt = Date.now();
+      await this.assertNoLiveSyncer(group.end);
+      const committed = await this.committedIn(group.start, group.end);
+      const toWrite = [...new Set([...committed.keys(), ...this.targetsIn(group.start, group.end)])].sort(
+        (a, b) => a - b,
+      );
+      const chunk: Chunk = { start: group.start, end: group.end, targets: toWrite };
+      const ledgers = await this.writeWithRecovery(chunk, toWrite, [[group.start, group.end]], true);
+      await this.logIntent(chunk, this.writer.runId, 'done');
+      for (const intent of group.members) {
+        if (intent.start !== group.start || intent.end !== group.end) {
+          await this.writeIntent(intent.start, intent.end, this.writer.runId, 'done');
+        }
+      }
+      if (ledgers.length > 0) await this.markAggregatesDirty(closeWindowOf(ledgers));
+      for (const ledger of ledgers) this.redone.add(ledger.header.ledger_index);
+      this.ledgersWritten += ledgers.length;
+      this.logger.log(
+        `Unfinished intent${group.members.length > 1 ? 's' : ''} ` +
+          `${group.members.map((i) => `[${i.start},${i.end}]`).join(', ')} redone in ${Date.now() - startedAt} ms: ` +
+          `${ledgers.length} ledgers written, closed`,
+      );
+    }
+    this.open = [];
   }
 
-  /** Whether `(start, end)` is the key of a chunk of this run. */
-  private isChunkKey(start: number, end: number): boolean {
-    const bucket = Math.floor(start / this.chunkSize);
-    return (
-      Math.floor(end / this.chunkSize) === bucket &&
-      start === Math.max(this.from, bucket * this.chunkSize) &&
-      end === Math.min(this.to, (bucket + 1) * this.chunkSize - 1)
-    );
+  /** The ledgers in `[start, end]` that this run ingests: its range there, or its listed indexes there. */
+  private targetsIn(start: number, end: number): number[] {
+    const from = Math.max(this.from, start);
+    const to = Math.min(this.to, end);
+    if (from > to) return [];
+    if (this.indexes) return this.indexes.filter((i) => i >= from && i <= to);
+    return Array.from({ length: to - from + 1 }, (_, k) => from + k);
   }
 
   // =================================================================================================================
@@ -691,6 +777,8 @@ The network, ClickHouse and node come from the same GH_* environment as the sync
   --to <ledger>          last ledger (required)
   --chunk <n>            ledgers per chunk, must divide 1000000 (default ${DEFAULT_CHUNK_SIZE}); a chunk is held in memory
   --concurrency <n>      ledgers of a chunk fetched at once (default ${DEFAULT_CONCURRENCY})
+  --max-wait <s>         seconds the fetches of one chunk may wait in all for a rate-limited node or a ledger the node
+                         lacks right now, before the chunk fails (default ${DEFAULT_MAX_TRANSIENT_WAIT_MS / 1000})
   --reprocess            delete and rewrite ledgers that are committed already (default: skip them)
   --run-id <id>          name of this run in ingest_log and in query ids (a nonce is appended)
   --help                 print this text
@@ -729,6 +817,7 @@ export function parseRangeIngestArgs(argv: string[]): RangeIngestOptions | 'help
         to: { type: 'string' },
         chunk: { type: 'string' },
         concurrency: { type: 'string' },
+        'max-wait': { type: 'string' },
         reprocess: { type: 'boolean' },
         'run-id': { type: 'string' },
         help: { type: 'boolean', short: 'h' },
@@ -747,6 +836,9 @@ export function parseRangeIngestArgs(argv: string[]): RangeIngestOptions | 'help
   };
   if (values.chunk !== undefined) opts.chunkSize = integerFlag('chunk', values.chunk as string);
   if (values.concurrency !== undefined) opts.concurrency = integerFlag('concurrency', values.concurrency as string);
+  if (values['max-wait'] !== undefined) {
+    opts.maxTransientWaitMs = integerFlag('max-wait', values['max-wait'] as string) * 1000;
+  }
   if (values.reprocess) opts.reprocess = true;
   if (values['run-id'] !== undefined) opts.runId = values['run-id'] as string;
   return opts;

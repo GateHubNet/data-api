@@ -168,7 +168,8 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 | --- | --- | --- |
 | `--from <n>`, `--to <n>` | required | Both inclusive. |
 | `--chunk <n>` | 1000 | Ledgers per chunk; must divide 1,000,000. A chunk is fetched and written as a whole, so it is also the memory the run needs. |
-| `--concurrency <n>` | 8 | Ledgers of a chunk fetched at once. |
+| `--concurrency <n>` | 8 | Ledgers of a chunk fetched at once. On a public node 2 (see [backfill](backfill.md#public-nodes-and-rate-limits)). |
+| `--max-wait <s>` | 1200 | Seconds the fetches of one chunk may wait in all for a rate-limited node (as long as it asks) and for a ledger the node lacks right now (`lgrNotFound`, retried after 0.5 s doubling to 30 s); past it the chunk fails. |
 | `--reprocess` | off | Delete and rewrite ledgers that are already committed (after a parser change); default: skip them. |
 | `--run-id <id>` | random | Name of the run in `ingest_log` and in query ids (a per-invocation nonce is appended). Must not start with `live:`. |
 | `--help` | | Prints the usage. |
@@ -182,13 +183,19 @@ How it works (aligned chunks, `ingest_log` intents):
 2. An `ingest_log` row `started` is written **before** anything is deleted or written, the ledgers are fetched (and, when they
    replace committed ones, dry-parsed, so that a missing ledger, a failing node or a parser error leaves the committed chunk
    untouched), the chunk is written with one `LedgerWriter.write()`, then `ingest_log` gets `done`.
-3. A chunk whose newest log row is `started` is an **unfinished intent**: a run died in the middle of it. The next run waits for
-   that run's queries to be gone, deletes the chunk's ledgers and redoes it.
+3. A chunk whose newest log row is `started` is an **unfinished intent**: a run died (or gave up) in the middle of it. The next run
+   whose range overlaps it waits for that run's queries to be gone, then, **before its own chunks**, redoes the intent over its
+   whole recorded range, whatever `--chunk` is now (overlapping intents as one range): it fetches the ledgers committed in the
+   range and the ones it would ingest there, dry-parses them, deletes the whole range (with the child rows a crashed write left)
+   and writes them; then the intent gets `done`. So an intent is redone once, not by every run after it, and changing `--chunk`
+   between runs is safe.
 4. Every written chunk marks its hour range in **`agg_dirty`** so the aggregator recomputes the stats and daily volumes. Committed
    ledgers a run skipped get one row at the end.
 5. A failed attempt is recovered like a failed live write (wait for the queries, delete the chunk, new `runId`); a chunk gets 3
-   attempts. A ledger the node does not have, a ledger the parser rejects and a live syncer that appeared are not retried: they
-   stop the run.
+   attempts. A rate-limited fetch is retried when the node's pause is over, and a ledger the node does not have right now
+   (`lgrNotFound`, e.g. one member of a cluster without it) after a backoff, both within `--max-wait` per chunk; past it the chunk
+   fails and the run stops. A ledger the parser rejects (`Cannot parse ledger <n>: ...`) and a live syncer that appeared are not
+   retried: they stop the run.
 6. **The live syncer owns everything above its checkpoint.** A range that reaches above the committed checkpoint is refused while
    the syncer's lease is fresh (< 30 s), and this is re-checked per chunk. Backfill is history: below the checkpoint.
 7. `--reprocess` rewrites the whole requested range; it fetches and dry-parses before it deletes anything.
