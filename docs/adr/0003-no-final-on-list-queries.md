@@ -1,6 +1,6 @@
 # ADR-0003: Do not use `FINAL` on list/scan queries
 
-**Status:** Accepted
+**Status:** Accepted. Amended (see the end): the rule stands, its mechanics changed with the new schema.
 
 ## Context
 `ReplacingMergeTree` deduplicates rows only after a background merge. `... FINAL` forces that
@@ -30,6 +30,17 @@ idle (blocked on ClickHouse) with p95 ≈ 30 s and ~30 % errors. The identical q
   newest few rows). Point lookups and rollups remain exact.
 - A new list endpoint that naively adds `FINAL` reintroduces the OOM. This is documented in
   [clickhouse.md](../clickhouse.md#the-final-rule), [development.md](../development.md), and
-  [data-model.md](../data-model.md#read-side-implication-the-api-does-not-use-final-on-list-endpoints).
+  [data-model.md](../data-model.md#read-side-rule-no-final-on-lists).
 - Optional defense-in-depth: per-query `max_memory_usage` / `max_execution_time` guards so any
   future regression is killed rather than taking the node down.
+
+## Amendment: how the rule is applied now
+With the ledger-keyed schema ([ADR-0007](0007-ledger-index-axis-and-secondary-tables.md)) and no materialized views
+([ADR-0008](0008-no-aggregate-materialized-views.md)) the list of exceptions above shrank:
+
+- **List, range and aggregate queries never use `FINAL`.** Lists read a key-ordered range, dedupe with `LIMIT 1 BY <key>` and stop after `limit + 1` rows;
+  aggregates read the same deduplicated rows and sum exact decimals.
+- **Single-row lookups do not need `FINAL` either**: a lookup table (`tx_by_hash`, `ledger_by_hash`) gives the key, and the `ledgers` row is the commit marker.
+- **Versioned rollups** (`stats_hourly`, `volume_*`) are read by their newest `version` (`argMax` / `max(version)`), never with `FINAL`.
+- `validations` (AggregatingMergeTree) is read with `GROUP BY (ledger_hash, validation_public_key)`.
+- Duplicates are also prevented on write (deduplication tokens, delete-before-rewrite recovery), so `ReplacingMergeTree` is a safety net and not what correctness rests on.

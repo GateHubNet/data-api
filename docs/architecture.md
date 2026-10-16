@@ -1,136 +1,158 @@
 # Architecture
 
-The GateHub Data API indexes the XRP Ledger and serves it over REST. It is two services
-sharing one library, backed by ClickHouse.
-
-- **syncer** (`@gatehub/data-syncer`) — ingests ledgers from an XRPL node, parses them, and
-  writes idempotent batches to ClickHouse.
-- **api** (`@gatehub/data-api-service`) — a stateless, horizontally-scalable REST service
-  reading ClickHouse, behind the GateHub reverse proxy.
-- **shared** (`@gatehub/data-api-shared`) — parsers, ClickHouse client + schema, utilities.
+The GateHub Data API is a **drop-in replacement for the Ripple Data API v2** (`data.ripple.com`, the
+`rippled-historical-database` project) for the **XRP Ledger and Xahau**, built as a ClickHouse-backed system with two services and a
+shared library. This page explains the moving parts; the reasons for the big choices are the [ADRs](adr/README.md).
 
 ## System diagram
 
 ```
-                              ┌──────────────────────────────┐
-   Internet ──────HTTPS──────▶│   GateHub reverse proxy       │  TLS termination, edge routing
-                              └───────────────┬──────────────┘
-                                              │ HTTP (+ X-Forwarded-For)
-                                ┌─────────────┴─────────────┐
-                                ▼                           ▼
-                      ┌───────────────────┐      ┌────────────────────┐
-                      │  api (N replicas) │─SQL─▶│     ClickHouse     │   tables + materialized views
-                      │  stateless        │◀─────│  (+ Keeper for HA) │   (internal only)
-                      └─────────┬─────────┘      └─────────▲──────────┘
-                                │ live state                │ idempotent batch INSERTs
-                                ▼ (balances/orders)         │
-                          ┌───────────┐            ┌────────┴────────┐    fetch ledgers (WS)
-                          │ XRPL node │◀───────────│  syncer (1..N)  │◀───────────────────────┐
-                          └───────────┘            │  internal only  │                        │
-                                                   └─────────────────┘                  ┌───────────┐
-                                                          fetch → parse → batch ───────▶│ XRPL node │
-                                                                                        └───────────┘
+                       rippled / xahaud (websocket)  ─ ledger, fee, validations, manifests, server_info
+                                     │
+                                     ▼
+ ┌───────────────────────────────────────────────────────────────────┐
+ │ syncer (apps/syncer) — ONE per network                            │
+ │   ingest ─ LiveRunner (live + catch-up)   range-ingest CLI        │
+ │   validations ─ collector      fee_stats ─ poller                 │
+ │   aggregator ─ stats_hourly, volume_live, volume_daily            │
+ └──────────────────────────────┬────────────────────────────────────┘
+                                │ bulk inserts (ledger tables: children first, `ledgers` row = commit)
+                                ▼
+                     ClickHouse  (one server, one database per network: xrpl, xahau)
+                                ▲
+                                │ parameterised SELECTs
+ ┌──────────────────────────────┴────────────────────────────────────┐
+ │ api (apps/api) — N replicas per network, stateless                │   balances / orders:
+ │   /v2/*  Ripple-compatible, API key, rate limit, CSV, markers     │──▶ live node (account_info/lines/offers)
+ └──────────────────────────────▲────────────────────────────────────┘
+                                │ HTTP
+              nginx (host routing: xrpl.data.* / xahau.data.*)  ◀── front proxy (TLS)  ◀── clients
 ```
 
-Both services also expose `GET /liveliness/healthz` (ClickHouse ping) and `GET /metricz`
-(Prometheus). The api serves Swagger UI at `/internal/docs`.
+Both services run `GH_NETWORK=xrpl` or `xahau` (the same images). One deployment serves one network; the network profile selects
+the node URLs, the native currency (`XRP` / `XAH`), the CTID network id (0 / 21337), the markets config and the default database.
+See [ADR-0009](adr/0009-one-deployment-per-network.md).
 
 ## Components
 
-### Shared library — `packages/shared`
-The domain core, consumed by both services so logic exists once
-([ADR-0005](adr/0005-pnpm-monorepo.md)):
-- **Parsers** (`src/parsers/`): pure functions turning an XRPL transaction + metadata into
-  domain rows — payments, exchanges (DEX trades), balance changes, offers, issuer trustlines,
-  escrows, paychannels, accounts-created, affected-accounts, and the "client" memo. No I/O.
-- **ClickHouse layer** (`src/clickhouse/`): a thin typed client (`ClickHouseService`), a Nest
-  module, the table/view name enums, and the migration runner. All queries are parameterised.
-- **Schema** (`schema/*.sql`): all DDL — 11 tables + 4 analytics views — applied by
-  `ch:migrate`.
-- **Utils**: CTID (deterministic id), order-book quality decoding, time conversion, retry.
+### Shared library: `packages/shared` (`@gatehub/data-api-shared`)
 
-### Syncer — `apps/syncer`
-A NestJS worker. On boot it (optionally) runs migrations, probes the node's ledger range, and
-starts backfill and/or live subscription. The core loop: **fetch a ledger (expanded) → parse
-every transaction → buffer → flush one batched INSERT per table**. It runs an HTTP server only
-for health/metrics. Deep dive: [syncer.md](syncer.md).
+Everything both services need, written once:
 
-### API — `apps/api`
-A NestJS REST service, one module per domain (payments, transactions, ledgers, exchanges,
-network, stats, accounts). Each service builds **parameterised** ClickHouse SQL. Cross-cutting:
-API-key auth, RFC-7807 errors, keyset pagination, per-client rate limiting, a short-TTL cache
-for live-XRPL endpoints, request metrics, and OpenAPI generation. Reference:
-[api-reference.md](api-reference.md).
+- **`network/`**: `NetworkProfile` per network, the bundled binary-codec definitions (`config/definitions/<network>.json`, a fallback
+  for when the node cannot supply `server_definitions`) and the markets config (`config/markets/<network>.json`).
+- **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
+  tokens), `Table` enum, row types, the tracked migration runner.
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts) and
+  `buildLedgerRows` (a raw ledger -> rows of the 14 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
+  `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
+  partition-scoped deletes, quiescence).
+- **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
+- **`query/`**: `RatesService` (exchange rates, vwap, used by the API *and* the aggregator) and amount/decimal helpers.
+- **`aggregate/`**: the `stats_hourly` and volume jobs the aggregator runs.
+
+### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
+
+A NestJS process with four optional **workers** (`GH_WORKERS`) and a probe/metrics HTTP surface: `ingest` (the single writer of the
+ledger tables, atomic per ledger), `validations`, `fee_stats` and `aggregator`, plus the `range-ingest` CLI in the same image.
+Exactly one per network. Details: [syncer](syncer.md).
+
+### API: `apps/api` (`@gatehub/data-api-service`)
+
+A NestJS REST service that reads ClickHouse with parameterised SQL and serves the Ripple Data API contract under `/v2`.
+
+- **Contract layer** (`src/common`): `@RippleController` + `RippleErrorFilter` (every error is `{result:"error", message}` with the
+  route's Ripple message; the toolbox's global filter is overridden per controller), `@RippleRoute('<failure message>')` (a 5xx
+  becomes the route's message, the cause is logged), hand-written parameter parsers (`params.ts`: booleans, dates, limits;
+  `asset-param.ts`: `CUR+issuer`), `pagination.ts` (markers, `Link`), `csv.interceptor.ts`, `format.ts`, and a catch-all `/v2/*` 404
+  controller registered last.
+- **Cross-cutting services:** `LedgerRangeResolver` (a date -> a ledger range, cached), `TxService` (a stored transaction ->
+  the Ripple object, binary codec with the node's definitions, an LRU of serialized forms), `XrplService` (the shared `NodeClient` with
+  short API timeouts, for balances and orders), `CacheService`.
+- **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route); `MetricsInterceptor`.
+- **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts`, `active-accounts`, `network`, `validations`,
+  `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+- Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
+  unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
 ### ClickHouse
-The analytical store ([ADR-0001](adr/0001-use-clickhouse.md)). Append-only ledger data in
-`ReplacingMergeTree` tables keyed on the XRPL CTID for idempotency, plus materialized views
-that maintain pre-aggregated analytics (candles, daily volumes, network stats). Details:
-[data-model.md](data-model.md), [clickhouse.md](clickhouse.md).
+
+One server, one database per network, 23 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
+views. See [clickhouse](clickhouse.md).
 
 ## Data flow
 
-### Write path (ingestion)
-```
-XRPL `ledger` request (expand, transactions)
-  → normalize close_time (ripple → unix seconds)
-  → parse each tx through the parser suite  → domain rows + CTID
-  → buffer rows across N ledgers
-  → flush: one INSERT per child table, then the `ledgers` commit-marker row
-  → ClickHouse merges collapse any duplicate keys (idempotent)
-  → materialized views update incrementally (candles, volumes, stats)
-```
-Idempotent by construction ([ADR-0002](adr/0002-ctid-idempotent-ingest.md)); batched to keep
-ClickHouse part counts sane.
+### Write path (ingest)
+
+1. `NodeClient` follows the `ledgerClosed` stream as a **head hint**; the `LiveRunner` always fetches ledgers **by index** (expanded),
+   accepts only `validated` ones and checks that each `parent_hash` chains to the previous ledger.
+2. `buildLedgerRows(raw, ctx)` (pure) produces the rows of all tables plus the ledger summary row.
+3. `LedgerWriter` inserts every child table in parallel, then `ledger_by_hash`, then `ledgers` (the atomic commit), synchronously, with
+   dedup tokens.
+4. Workers on the side: validations stream -> `validations`/`validator_manifests`; `fee` every 5 s -> `fee_stats`; the aggregator
+   rolls `ledgers` into `stats_hourly` and computes `volume_*` from `exchanges`/`payments` and rates.
+5. Crashes recover from the database alone: re-read the checkpoint, delete the uncommitted tail, carry on
+   ([syncer](syncer.md#checkpoint-boot-and-recovery)).
 
 ### Read path (serving)
-```
-HTTPS → GateHub proxy (TLS) → api replica
-  → ApiKeyGuard (X-API-Key / Bearer)  → ThrottlerGuard (per real client IP)
-  → ValidationPipe (typed DTO, whitelist)
-  → service builds parameterised SQL → ClickHouse (no FINAL on scans)
-  → map rows → { result, marker, count, items } envelope
-  → MetricsInterceptor records count + duration
-```
-Errors render as `application/problem+json`. Live account state (balances, open orders) is
-fetched from the XRPL node and short-TTL cached.
+
+1. nginx maps the host to the network's api; the guards check the API key and the rate limit.
+2. The controller parses and validates the parameters with the original's messages, resolves `start`/`end` to a ledger range,
+   queries a key-ordered range (secondary table -> keys -> full rows) with `limit + 1`, builds the Ripple-shaped objects, emits
+   `marker` and `Link`, and the CSV interceptor reformats on `format=csv`.
+3. Balances and orders are the exception: they read the **live node** (`account_info`, `account_lines`, `account_offers`) and cache the
+   answer briefly.
 
 ## Key design decisions
 
-| Decision | Why | ADR |
-| --- | --- | --- |
-| ClickHouse over Elasticsearch | Workload is columnar-OLAP; ES's full-text strength unused | [0001](adr/0001-use-clickhouse.md) |
-| CTID-keyed `ReplacingMergeTree` + batched writes | Idempotent, replay-safe ingest; sane part counts | [0002](adr/0002-ctid-idempotent-ingest.md) |
-| No `FINAL` on list queries | `FINAL` on scans OOMs ClickHouse under load | [0003](adr/0003-no-final-on-list-queries.md) |
-| Keyset (cursor) pagination | O(1) deep pagination, stable under inserts | [0004](adr/0004-keyset-pagination.md) |
-| pnpm monorepo + shared lib | Parser/storage logic written once | [0005](adr/0005-pnpm-monorepo.md) |
-| TLS at the GateHub proxy + trust X-Forwarded-For | One owner for TLS; correct per-client rate limiting | [0006](adr/0006-reverse-proxy-tls.md) |
+| Decision | ADR |
+| --- | --- |
+| ClickHouse as the analytical store | [0001](adr/0001-use-clickhouse.md) |
+| No `FINAL` on list queries | [0003](adr/0003-no-final-on-list-queries.md) |
+| Opaque marker, ledger-key pagination (supersedes the date keyset) | [0004](adr/0004-keyset-pagination.md) |
+| pnpm monorepo with a shared library | [0005](adr/0005-pnpm-monorepo.md) |
+| TLS at the front proxy; the client address from `X-Forwarded-For` | [0006](adr/0006-reverse-proxy-tls.md) |
+| `ledger_index` axis and narrow secondary tables | [0007](adr/0007-ledger-index-axis-and-secondary-tables.md) |
+| No aggregate materialized views | [0008](adr/0008-no-aggregate-materialized-views.md) |
+| One deployment per network | [0009](adr/0009-one-deployment-per-network.md) |
+| Ripple v2 wire compatibility and every deliberate deviation | [0010](adr/0010-ripple-v2-wire-compatibility.md) |
+| CTID dedup (superseded by the commit marker and dedup tokens) | [0002](adr/0002-ctid-idempotent-ingest.md) |
 
 ## Cross-cutting concerns
-- **Security** — API keys, parameterised SQL (no injection), rate limiting, internal-only
-  ClickHouse: [security.md](security.md).
-- **Observability** — `/metricz`, `/liveliness/healthz`, structured logs:
-  [observability.md](observability.md).
-- **Configuration** — all via env, validated/fail-fast: [configuration.md](configuration.md).
 
-## Scaling & resilience model
-- **api**: stateless → scale horizontally; the proxy/orchestrator load-balances. ClickHouse is
-  the shared dependency — scale it first.
-- **syncer**: one instance for live; shard across instances+nodes for a fast backfill. Safe to
-  restart anytime (re-derives progress, no double counting).
-- **ClickHouse**: single-node correct; HA via Keeper + `Replicated*MergeTree` or a managed
-  service ([clickhouse.md](clickhouse.md#high-availability--replication)).
-- **Failure handling**: bounded retries on XRPL fetch and ClickHouse writes; failed ledgers
-  logged and re-runnable; crash-safe idempotent batches. Honest list of what's *not* yet
-  handled (reorgs, validated-ledger gating, dead-letter) in [syncer.md](syncer.md).
+- **Configuration:** `GH_*` environment variables through the toolbox `ConfigService`, validated at boot
+  ([configuration](configuration.md)).
+- **Errors:** one shape, Ripple's messages ([api-reference](api-reference.md#errors)); causes of 5xx only in the log.
+- **Auth and abuse:** API key on `/v2/*`, in-memory rate limit per client and route, input validation, parameterised SQL
+  ([security](security.md)).
+- **Observability:** `/liveliness/healthz` and `/metricz` on both services ([observability](observability.md)).
+- **Testing:** unit tests, parser golden tests, and Docker-based e2e suites (real ClickHouse via testcontainers, seeded through the real
+  `LedgerWriter`) for every endpoint and for the syncer's recovery ([development](development.md#7-testing)).
+
+## Scaling and resilience model
+
+| Tier | Scales | Resilience |
+| --- | --- | --- |
+| API | Horizontally (stateless; small per-replica caches and rate-limit state) | A replica loss is invisible behind nginx; `GET /liveliness/healthz` gates readiness |
+| Syncer | **Does not scale out**: one writer per network (fixed container name + ClickHouse lease). Speed up history with `range-ingest --concurrency` | Crash-safe: the checkpoint is `max(ledgers.ledger_index)`, the uncommitted tail is deleted on boot, the node client reconnects with failover; halts (probe 503) on a chain break or a lost lease |
+| ClickHouse | Vertically first; replication needs Keeper-backed engines | Backups; the data is re-derivable from the ledger |
 
 ## Why two services
-Ingestion is write-heavy and long-running (a multi-year backfill); serving is read-heavy and
-latency-sensitive. Splitting them lets each scale and deploy independently, and a syncer crash
-never takes the API down. They share only the ClickHouse database and the shared library.
+
+Ingest is a long-lived stateful worker with one writer and backpressure from the node; serving is stateless and elastic. Splitting
+them lets the read tier scale and deploy independently, keeps node connections and write load off the request path, and lets a
+parser fix be re-run without touching the API.
 
 ## Technology summary
-NestJS 10 (TypeScript, strict) · ClickHouse · `@clickhouse/client` · `xrpl` · pnpm workspace ·
-`@gatehub/toolbox` (config/logger/bootstrap) · Prometheus (`prom-client`) · `@nestjs/terminus`
-(health) · `@nestjs/swagger` (OpenAPI) · Docker (public `node:22.23.2-bookworm-slim`, Node ≥ 20.19) · testcontainers
-(integration tests) · k6 (load tests).
+
+| Concern | Choice |
+| --- | --- |
+| Runtime | Node.js >= 20.19 (images: `node:22.23.2-bookworm-slim`), TypeScript |
+| Framework | NestJS 10 with the private `@gatehub/toolbox` (config, bootstrap, logger) |
+| Store | ClickHouse 26.8 (`@clickhouse/client`, HTTP) |
+| XRPL access | `xrpl` 2.14 (API v1 shape; both rippled and xahaud default to it) behind the shared `NodeClient`; `ripple-binary-codec` 2.x in the API for `binary=true` and canonical JSON |
+| Parsing | `ripple-lib-transactionparser` for balance changes, own pure parsers for the rest |
+| Packaging | pnpm workspace, Docker (BuildKit secret for the npm token), docker compose |
+| Edge | nginx (host routing, trusted-proxy client address), TLS at the front proxy |
+| Metrics | `prom-client` -> Prometheus |

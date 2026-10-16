@@ -1,382 +1,187 @@
 # Observability
 
-How to monitor the GateHub XRPL Data API in production: metrics, health checks, and
-logs. This document describes exactly what the code exposes today, plus recommended
-PromQL, dashboards, and alerts built on top of it.
+How to monitor the Data API in production: metrics, health checks and logs. This page describes what the code exposes today, plus
+recommended PromQL and alerts built on it. Day-2 procedures are in [operations](operations.md).
 
----
+## 1. Overview
 
-## 1. Overview — the three pillars
+Two long-running services per network, the **API** (`apps/api`) and the **syncer** (`apps/syncer`), backed by ClickHouse. Both run
+two HTTP listeners:
 
-The platform ships two long-running services — the **API** (`apps/api`, the read tier)
-and the **Syncer** (`apps/syncer`, the ingestion worker) — backed by **ClickHouse**.
-Three of the observability pillars are wired up:
-
-| Pillar | Surface | Where |
+| Surface | API | Syncer |
 | --- | --- | --- |
-| **Metrics** | Prometheus text exposition on `GET /metricz` | both services |
-| **Health** | Terminus health check on `GET /liveliness/healthz` | both services |
-| **Logs** | Structured/pretty stdout via env (`GH_LOGGER_FORMAT` / `GH_LOGGER_LEVEL`) | both services |
+| Health: `GET /liveliness/healthz` (main port, `GH_HTTP_API_PORT`) | `3001` | `3002` |
+| Metrics: `GET /metricz` (second app, `GH_METRICZ_PORT`) | `3000` | `3000` |
+| Logs | stdout | stdout |
 
-> **No distributed tracing yet.** There is no OpenTelemetry / trace-context propagation
-> in the codebase today, and no request-scoped correlation IDs. Both are tracked as
-> backlog (see [§8](#8-gaps--backlog)).
-
-Both services run an HTTP server even though the syncer is "just" a worker — it boots an
-HTTP listener purely so orchestrators can probe `/liveliness/healthz` and scrape
-`/metricz` (`apps/syncer/src/main.ts`).
-
----
+The metrics ports are reachable **inside the compose network only** (never publish them; the dev compose maps them to 127.0.0.1:
+api-xrpl 3003, syncer-xrpl 3004, api-xahau 3013, syncer-xahau 3014). In production scrape `api-xrpl:3000`, `syncer-xrpl:3000`, ... from a
+Prometheus on the same network (use Docker DNS service discovery for scaled api replicas). There is no distributed tracing or
+request correlation id yet ([gaps](#8-gaps-and-backlog)).
 
 ## 2. Health checks
 
-Both services expose an identical health endpoint, implemented with `@nestjs/terminus`:
+Implemented with `@nestjs/terminus`; no API key and no rate limit.
 
-- **Endpoint:** `GET /liveliness/healthz`
-- **API:** served on the main HTTP port — `GH_HTTP_API_PORT`, default **3001**
-  (`apps/api/src/config/api.config.ts`).
-- **Syncer:** served on `GH_HTTP_API_PORT`, default **3002** (`apps/syncer/src/main.ts`).
+### API
 
-### What it checks
-
-A single health indicator that **pings ClickHouse**
-(`apps/{api,syncer}/src/modules/liveliness/liveliness.service.ts`). It calls
-`ClickHouseService.ping()` (`packages/shared/src/clickhouse/clickhouse.service.ts`); any
-thrown error is swallowed and treated as "not ok". So the endpoint answers one question:
-**can this service reach ClickHouse?**
-
-### Response shape
-
-Terminus returns its standard envelope. Healthy → **HTTP 200**:
+`GET /liveliness/healthz` pings ClickHouse (`ClickHouseService.ping()`; any error counts as "not ok"). It answers one question: can
+this replica reach ClickHouse?
 
 ```json
-{
-  "status": "ok",
-  "info":  { "clickhouse": { "status": "up" } },
-  "error": {},
-  "details": { "clickhouse": { "status": "up" } }
-}
+{ "status": "ok", "info": { "clickhouse": { "status": "up" } }, "error": {}, "details": { "clickhouse": { "status": "up" } } }
 ```
 
-ClickHouse unreachable → **HTTP 503**:
+ClickHouse unreachable: **503** with `"status": "error"` and `"error": { "clickhouse": { "status": "down" } }`.
+
+### Syncer
+
+The same ClickHouse check, plus an **`ingest`** indicator when the `ingest` worker is enabled:
 
 ```json
-{
-  "status": "error",
-  "info":  {},
-  "error": { "clickhouse": { "status": "down" } },
-  "details": { "clickhouse": { "status": "down" } }
-}
+{ "status": "ok",
+  "info": { "clickhouse": { "status": "up" },
+            "ingest": { "status": "up", "state": "live", "lag": 0, "last_commit_age": 3 } } }
 ```
 
-### How container healthchecks use it
+It answers **503** when ClickHouse is down, when the ingest `state` is `halted` (a chain break or a lost lease), or when `lag` (validated
+head minus committed checkpoint, in ledgers) has stayed above `GH_MAX_LAG_HEALTHY` (default 10) on every probe for more than **60 s**.
+`state` is `starting`, `catching_up`, `live` or `halted`; `last_commit_age` is seconds since the last commit; `recovering: true` and
+`error` appear while a failed write or the boot cleanup is being recovered. A lag the runner has not measured yet counts as healthy,
+and a spike that is gone by the next probe resets the window. During a large catch-up or a backfill the probe therefore turns 503: that
+is informational and nothing restarts on it.
 
-`docker-compose.prod.yaml` defines a healthcheck on both the `api` and `syncer` services.
-The base image (`node:slim`) ships without `wget`/`curl`, so the check uses Node's global
-`fetch` and exits non-zero unless the response is `ok` (2xx):
+The syncer opens its probe port only after its node connection is up, so an unreachable node shows as a failing healthcheck
+(`start_period` 60 s in compose).
+
+### Container healthchecks and orchestrators
+
+The base image has no `wget`/`curl`, so the compose healthchecks use Node's `fetch` against `127.0.0.1` (every 15 s, 5 s timeout, 5
+retries):
 
 ```yaml
-# syncer
-test: ['CMD', 'node', '-e', "fetch('http://localhost:3002/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-# api
-test: ['CMD', 'node', '-e', "fetch('http://localhost:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-# interval: 15s, timeout: 5s, retries: 5
+test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]   # api; 3002 for the syncer
 ```
 
-### How k8s / orchestrators should use it
+The check is cheap, so it suits both liveness (be lenient: a ClickHouse blip must not cause a restart loop) and readiness (a replica
+that cannot reach ClickHouse serves nothing useful; it should leave rotation). For the syncer, prefer to alert on the metrics below
+rather than to restart on the probe. The shipped nginx lets `/liveliness/` through to trusted proxies only.
 
-Because the check is shallow (a ClickHouse ping) and cheap, it is suitable for both
-probe types:
+## 3. Metrics: API
 
-- **Liveness probe** — restart the pod if the process is wedged. Be slightly lenient
-  (a few retries) so a transient ClickHouse blip doesn't trigger a restart loop.
-- **Readiness probe** — pull the pod out of the load-balancer rotation while it can't
-  reach ClickHouse. For the API this is the important one: a replica that can't reach
-  ClickHouse can serve nothing useful, so it should leave rotation until the DB is back.
+Prefix `api_`; one `prom-client` registry per process.
 
-```yaml
-livenessProbe:
-  httpGet: { path: /liveliness/healthz, port: 3001 }   # 3002 for the syncer
-  periodSeconds: 15
-  timeoutSeconds: 5
-  failureThreshold: 5
-readinessProbe:
-  httpGet: { path: /liveliness/healthz, port: 3001 }
-  periodSeconds: 10
-  timeoutSeconds: 5
-  failureThreshold: 3
-```
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `api_http_requests_total` | Counter | `method, route, status` | Requests handled |
+| `api_http_request_duration_seconds` | Histogram | `method, route, status` | Duration; buckets 0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5, 5 s |
+| `api_tx_encode_fallback_total` | Counter | `mode` (`json` / `binary`) | Transactions served as their stored JSON because the binary codec could not serialize them (a type or field missing from the definitions). Should be 0 |
+| `api_process_*`, `api_nodejs_*` | | | Default process metrics (CPU, memory, event-loop lag, GC, handles) |
 
-> The syncer has no separate "ingestion is healthy" probe — `/liveliness/healthz` only
-> reports ClickHouse reachability, not ingest progress. Use the syncer **metrics**
-> ([§4](#4-metrics--syncer)) and alerts ([§6](#6-suggested-dashboards--alerts)) to detect
-> a stalled or lagging syncer.
-
----
-
-## 3. Metrics — API
-
-- **Endpoint:** `GET /metricz` on the API's HTTP port (default **3001**).
-- **Content type:** `text/plain; version=0.0.4; charset=utf-8` (Prometheus exposition).
-- Backed by a single `prom-client` `Registry`
-  (`apps/api/src/modules/prometheus/prometheus.service.ts`), exposed via the controller
-  (`prometheus.controller.ts`) and a `@Global()` module (`prometheus.module.ts`).
-
-### Metrics exposed
-
-**1. Default process metrics**, registered with the prefix `api_`
-(`collectDefaultMetrics({ prefix: 'api_' })`). These are the standard `prom-client`
-Node.js process metrics, e.g. CPU, resident/heap memory, the Node event-loop lag,
-GC stats, open file descriptors, and active handles/requests:
-
-```
-api_process_cpu_user_seconds_total
-api_process_resident_memory_bytes
-api_nodejs_eventloop_lag_seconds
-api_nodejs_gc_duration_seconds
-api_nodejs_active_handles
-...  (full set provided by prom-client)
-```
-
-**2. `api_http_requests_total`** — a **Counter** of HTTP requests handled, labelled
-`{method, route, status}`.
-
-**3. `api_http_request_duration_seconds`** — a **Histogram** of request duration in
-seconds, labelled `{method, route, status}`, with buckets:
-
-```
-0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5, 5
-```
-
-Both are populated by a **global interceptor**, `MetricsInterceptor`
-(`apps/api/src/common/metrics.interceptor.ts`), wired in `app.module.ts` as an
-`APP_INTERCEPTOR`. On every HTTP request it times the handler with
-`process.hrtime.bigint()` and, on completion, increments the counter and observes the
-histogram.
-
-### Labels use the route *pattern*, not the raw URL
-
-The `route` label is `req.route?.path` — the Express route **pattern**
-(e.g. `/v1/accounts/:address/transactions`), **not** the concrete URL. This is a
-deliberate cardinality-safety choice: labelling by raw path would explode the metric
-series count (one per account address, ledger index, etc.). If no route pattern is
-available it falls back to `req.path`, then `'unknown'`. `status` is the numeric HTTP
-status code as a string.
-
-### Example PromQL
-
-Request rate per route:
+The `route` label is the Express route **pattern** (`/v2/accounts/:address/transactions`), never the concrete URL, so the series count
+stays bounded; without a pattern it falls back to the path, then `unknown`. The request counter and histogram are recorded by a global
+interceptor, i.e. for requests that reach a handler: a 401 or 429 raised by a guard never reaches it and is not counted in these
+series.
 
 ```promql
-sum by (route) (rate(api_http_requests_total[5m]))
+sum by (route) (rate(api_http_requests_total[5m]))                                       # request rate per route
+sum(rate(api_http_requests_total{status=~"5.."}[5m])) / sum(rate(api_http_requests_total[5m]))   # error ratio
+histogram_quantile(0.95, sum by (le, route) (rate(api_http_request_duration_seconds_bucket[5m])))   # p95 per route
+rate(api_tx_encode_fallback_total[15m]) > 0                                              # codec definitions need attention
 ```
 
-Error rate (server errors as a fraction of all requests):
+## 4. Metrics: Syncer
+
+Prefix `syncer_`.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `syncer_checkpoint_ledger` | Gauge | | Highest ledger index committed to ClickHouse |
+| `syncer_head_ledger` | Gauge | | Latest validated ledger index known from the node |
+| **`syncer_lag_ledgers`** | Gauge | | Validated head minus the committed checkpoint, in ledgers |
+| `syncer_last_commit_timestamp_seconds` | Gauge | | Unix time of the last commit |
+| **`syncer_last_commit_age_seconds`** | Gauge | | Seconds since the last commit, computed at scrape time; `NaN` before the first commit |
+| `syncer_validations_flushed_total` | Counter | | Validation rows flushed to ClickHouse |
+| `syncer_validations_errors_total` | Counter | `stage` | Collector failures (`flush`, `reporter`, `manifest_rpc`, ...) |
+| `syncer_validations_dropped_total` | Counter | `reason` | Validations not kept (`buffer_full`, `no_reporter`, `manifest_no_reporter`, `invalid`, `shutdown`) |
+| `syncer_fee_stats_samples_total` | Counter | | Fee snapshots written |
+| `syncer_fee_stats_errors_total` | Counter | | Snapshots that failed (node silent, ClickHouse refused) |
+| `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `stats_live`, `stats_dirty`, `volume_backfill`) |
+| `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices) that failed; each is retried on the next tick |
+| **`syncer_aggregator_stats_lag_seconds`** | Gauge | | Seconds of ledger history the stats catch-up still has to cover; 0 when the stats are up to the last two hours |
+| `syncer_process_*`, `syncer_nodejs_*` | | | Default process metrics |
 
 ```promql
-sum(rate(api_http_requests_total{status=~"5.."}[5m]))
-  /
-sum(rate(api_http_requests_total[5m]))
+syncer_lag_ledgers                                                  # the number to alert on
+syncer_last_commit_age_seconds > 120 and syncer_lag_ledgers < 2     # a live chain commits every few seconds
+rate(syncer_head_ledger[5m])                                        # ledgers/s closing; compare with the checkpoint's rate
+rate(syncer_checkpoint_ledger[5m])                                  # ingest throughput while catching up
+rate(syncer_aggregator_errors_total[15m]) > 0
+syncer_aggregator_stats_lag_seconds > 3600
+rate(syncer_validations_flushed_total[5m]) == 0                     # XRPL: validators validate every ledger
 ```
 
-p95 request latency (across all routes) from the histogram:
-
-```promql
-histogram_quantile(
-  0.95,
-  sum by (le) (rate(api_http_request_duration_seconds_bucket[5m]))
-)
-```
-
-p95 latency **per route** (add `route` to the grouping):
-
-```promql
-histogram_quantile(
-  0.95,
-  sum by (le, route) (rate(api_http_request_duration_seconds_bucket[5m]))
-)
-```
-
-Rate-limit (HTTP 429) rate:
-
-```promql
-sum(rate(api_http_requests_total{status="429"}[5m]))
-```
-
----
-
-## 4. Metrics — Syncer
-
-- **Endpoint:** `GET /metricz` on the syncer's HTTP port (`GH_HTTP_API_PORT`, default
-  **3002**).
-- **Content type:** `text/plain; version=0.0.4; charset=utf-8`.
-- Backed by its own `prom-client` `Registry`
-  (`apps/syncer/src/modules/prometheus/prometheus.service.ts`).
-
-### Metrics exposed
-
-**1. Default process metrics**, prefix `syncer_`
-(`collectDefaultMetrics({ prefix: 'syncer_' })`) — same Node.js process metrics as the
-API but under the `syncer_` namespace (`syncer_process_resident_memory_bytes`,
-`syncer_nodejs_eventloop_lag_seconds`, etc.).
-
-**2. `syncer_latest_synced_ledger`** — a **Gauge**: the highest ledger index written to
-ClickHouse.
-
-**3. `syncer_ledgers_processed_total`** — a **Counter**: total ledgers processed since
-process start (the `_total` suffix follows the Prometheus counter convention).
-
-### Where these are updated
-
-In `apps/syncer/src/sync/sync-processor.service.ts`:
-
-- **Backfill** (`backfill()`): after each ledger is enqueued/flushed, the counter is
-  incremented (`ledgersProcessed.inc()`) and, when a ledger index exceeds the running
-  max, the gauge is set (`latestSyncedLedger.set(index)`). Because backfill runs a worker
-  pool over a `[from, to]` range, the gauge tracks the **max index seen this run**, not
-  necessarily live head.
-- **Live sync** (`subscribeLive()`): for every ledger consumed off the `ledger$` stream,
-  the gauge is set to that ledger index and the counter is incremented.
-
-> Note: the gauge reflects what *this process* has advanced to since boot. With sharded
-> or multiple syncer instances, scrape each instance separately (per-`instance` series)
-> rather than assuming one global value.
-
-### Example PromQL
-
-Ingest rate (ledgers/sec):
-
-```promql
-rate(syncer_ledgers_processed_total[5m])
-```
-
-How far behind XRPL head the syncer is — requires an externally-scraped "current XRPL
-ledger" series (e.g. exported from your rippled / a sidecar). Given a metric
-`xrpl_validated_ledger_index`:
-
-```promql
-xrpl_validated_ledger_index - syncer_latest_synced_ledger
-```
-
-Detect a stalled syncer (no progress for 10 minutes):
-
-```promql
-rate(syncer_ledgers_processed_total[10m]) == 0
-```
-
----
+The gauges describe what *this process* has done since boot: scrape each network's syncer separately.
 
 ## 5. Logging
 
-Both services log through the NestJS `Logger` (`@nestjs/common`) — see the `Logger`
-instances in `apps/{api,syncer}/src/main.ts` and throughout the services. Output is
-plain stdout/stderr; in production capture it with your container/log pipeline.
+Both services log through the NestJS `Logger` via the toolbox logger (stdout/stderr; capture it with your container log pipeline).
+There are **no `GH_LOGGER_*` variables**: the toolbox logger decides the format (colour is switched off outside dev/test). Contexts to
+grep for: `Syncer` (boot line with network, workers and node hosts), `NodeClient` (connects, reconnects, silence), `LiveRunner`
+(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService`, `Api` (boot line with
+network and native currency), `RippleRoute` / `RippleError` (the cause of every 5xx, with the stack; the response body never carries
+it), `ApiKeyGuard`.
 
-Two environment variables (toolbox conventions, documented in
-[docs/configuration.md](./configuration.md)) control output:
+Node endpoints may carry credentials: logs show only `scheme://host:port`. API keys are never logged.
 
-| Variable | Values | Dev default | Prod default | Purpose |
-| --- | --- | --- | --- | --- |
-| `GH_LOGGER_FORMAT` | `pretty` \| `structured` | `pretty` | `structured` | Output format. |
-| `GH_LOGGER_LEVEL` | `debug` \| `info` \| `warn` \| `error` … | `debug` | `info` | Minimum level. |
+There are no request correlation ids yet.
 
-**Recommendation for production:** `GH_LOGGER_FORMAT=structured` and
-`GH_LOGGER_LEVEL=info`. Structured (JSON) logs are parseable by Loki/Elasticsearch/etc.;
-`info` keeps volume sane while preserving operational events (backfill progress, live
-ledger failures, health/metric errors).
+## 6. Suggested dashboards and alerts
 
-What you get in the logs today, by way of example:
-
-- API bootstrap line (`Data API listening on …`).
-- Syncer backfill progress (`Backfilled N ledgers (X/s), cursor …`), completion summary,
-  and any permanently-failed ledger indices.
-- Live-sync per-ledger failures (`Live ledger N failed: …`).
-- `/metricz` failures (logged before returning 500).
-
-> **No correlation IDs yet.** Logs are not stamped with a per-request trace/correlation
-> ID, so you cannot currently stitch a single client request across log lines (or across
-> services). This is backlog (see [§8](#8-gaps--backlog)).
-
----
-
-## 6. Suggested dashboards & alerts
-
-Build an API **RED** dashboard (Rate / Errors / Duration) from
-`api_http_requests_total` and `api_http_request_duration_seconds`, a syncer **ingest**
-dashboard from `syncer_ledgers_processed_total` / `syncer_latest_synced_ledger`, and a
-**USE**-style resource dashboard from the `*_process_*` / `*_nodejs_*` default metrics.
+Build an API **RED** dashboard (rate, errors, duration) from the `api_http_*` series, a syncer **ingest** dashboard from
+`syncer_checkpoint_ledger`, `syncer_head_ledger`, `syncer_lag_ledgers`, `syncer_last_commit_age_seconds`, and a **USE** resource dashboard
+from the default process metrics.
 
 ### Monitoring ClickHouse itself
 
-The `/liveliness/healthz` check only tells you the app can *reach* ClickHouse — it says
-nothing about the DB's internal health (memory, disk, merges, replication). Scrape
-ClickHouse directly via either:
-
-- ClickHouse's **built-in Prometheus endpoint** (configure `<prometheus>` in
-  `config.d`, exposed on its own port), or
-- a **`clickhouse-exporter`** sidecar that queries `system.*` tables.
-
-Either way you get series like memory usage, disk free, parts counts, merge activity,
-and (for the replicated setup with Keeper) replication queue depth. Wiring this is
-backlog ([§8](#8-gaps--backlog)).
+The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse directly (its built-in Prometheus endpoint via
+`<prometheus>` in `config.d`, or a `clickhouse-exporter` over `system.*`): memory, disk free, parts per partition, merges, mutations
+(stuck lightweight deletes), replication queue. Wiring this is backlog.
 
 ### Recommended alerts
 
 | Alert | Condition (sketch) | Why |
 | --- | --- | --- |
-| **API 5xx rate high** | `sum(rate(api_http_requests_total{status=~"5.."}[5m])) / sum(rate(api_http_requests_total[5m])) > 0.05` for 5m | Read tier failing requests. |
-| **API p95 latency high** | `histogram_quantile(0.95, sum by (le)(rate(api_http_request_duration_seconds_bucket[5m]))) > 1` for 10m | Slow queries / DB pressure. |
-| **API 429 spike** | `sum(rate(api_http_requests_total{status="429"}[5m]))` above baseline | Rate-limit storms / abusive client / misconfigured limits. |
-| **Liveliness down (API)** | `/liveliness/healthz` probe failing or `up{job="api"} == 0` | API can't reach ClickHouse / is down. |
-| **Liveliness down (syncer)** | syncer probe failing or `up{job="syncer"} == 0` | Syncer down. |
-| **Syncer ingest stalled** | `rate(syncer_ledgers_processed_total[10m]) == 0` for N min (while not idle/finished) | Ingestion wedged. |
-| **Syncer falling behind head** | `xrpl_validated_ledger_index - syncer_latest_synced_ledger > 50` for 10m | Live sync lagging XRPL. |
-| **ClickHouse memory high** | from CH exporter, e.g. memory tracked / limit > 0.9 | OOM risk (compose limits CH to 8g). |
-| **ClickHouse disk low** | from CH exporter, free bytes below threshold | Ingestion will fail when disk fills. |
-| **ClickHouse too many parts** | from CH exporter, parts-per-partition above threshold | Merges falling behind (see §7). |
+| API 5xx rate high | `sum(rate(api_http_requests_total{status=~"5.."}[5m])) / sum(rate(api_http_requests_total[5m])) > 0.05` for 5m | The read tier is failing requests |
+| API p95 high | `histogram_quantile(0.95, sum by (le)(rate(api_http_request_duration_seconds_bucket[5m]))) > 1` for 10m | Slow queries or DB pressure |
+| API down | probe failing or `up{job="api"} == 0` | |
+| **Syncer behind** | `syncer_lag_ledgers > 10` for 5m (outside a planned catch-up) | Live sync lagging; the probe fails at the same threshold after 60 s |
+| **Syncer not committing** | `syncer_last_commit_age_seconds > 120` | Ingest wedged, node silent, or ClickHouse refusing writes |
+| **Syncer halted / down** | probe 503 with `state=halted`, or `up{job="syncer"} == 0` | Chain break, lost lease, or process down |
+| Aggregator failing | `rate(syncer_aggregator_errors_total[15m]) > 0` for 30m | Stats or volumes not refreshing |
+| Aggregator far behind | `syncer_aggregator_stats_lag_seconds > 3600` for 1h | Sweep slower than the data |
+| Validations flowing | `rate(syncer_validations_flushed_total[10m]) == 0` for 10m on XRPL | Collector or its nodes down |
+| Fee stats flowing | `rate(syncer_fee_stats_samples_total[10m]) == 0` | Node unreachable |
+| Codec fallback | `increase(api_tx_encode_fallback_total[1h]) > 0` | Definitions out of date for a new transaction type |
+| ClickHouse memory / disk / parts | from the exporter | OOM (compose limits CH to 8g), disk full stops ingest, merges behind |
 
-(Threshold numbers above are starting points — tune to your traffic and SLOs.)
-
----
+Threshold numbers are starting points: tune to your traffic and SLOs.
 
 ## 7. What to watch during a backfill
 
-A backfill replays a large `[from, to]` ledger range through a worker pool and bulk-loads
-ClickHouse hard (see [docs/backfill.md](./backfill.md)). Watch both sides:
+A range ingest bulk-loads ClickHouse hard ([backfill](backfill.md)). Watch both sides:
 
-**Syncer side (from `/metricz`):**
+- **CLI:** its log (`Range [...] ingested: N chunks complete ... M ledgers written`), and in SQL `SELECT count(), max(ledger_index) FROM
+  <db>.ledgers`. The CLI is a separate process and has no metrics endpoint; the live syncer's gauges describe the live runner only.
+- **Aggregator:** `SELECT count() FROM <db>.agg_dirty` shrinks as the aggregator digests the new hours;
+  `syncer_aggregator_stats_lag_seconds`.
+- **ClickHouse:** parts per partition and merge activity (`system.merges`): if parts pile up faster than merges drain them you risk
+  `too many parts`; lower `--concurrency`. Memory and disk: bulk loads are the likeliest time to hit the memory limit or fill the volume.
 
-- **`rate(syncer_ledgers_processed_total[5m])`** — the live ingest throughput. Compare
-  against the `Backfilled N ledgers (X/s)` log lines. A sustained drop signals XRPL-node
-  rate-limiting, ClickHouse back-pressure, or retries.
-- **`syncer_latest_synced_ledger`** — should climb monotonically toward `to`. During
-  backfill it tracks the max index seen this run.
-- **`syncer_process_*` / `syncer_nodejs_eventloop_lag_seconds`** — memory growth and
-  event-loop lag indicate the worker pool / batch size is too aggressive.
+## 8. Gaps and backlog
 
-**ClickHouse side (from CH's own metrics / `system` tables):**
-
-- **Parts & merges** — heavy inserts create many parts; watch the active **parts count**
-  per partition and **background merge** activity (`system.merges`,
-  `system.metrics`/`system.asynchronous_metrics`). If parts pile up faster than merges
-  drain them you risk a "too many parts" error and stalled inserts — throttle the
-  backfill (workers / batch size) if so.
-- **Memory & disk** — bulk loads are the most likely time to hit the 8 GB container
-  memory limit or fill the data volume. Alert on both before they hard-fail.
-
----
-
-## 8. Gaps / backlog
-
-Known observability gaps, roughly in priority order:
-
-1. **Distributed tracing** — no OpenTelemetry / trace-context propagation. Adding OTel
-   (HTTP + ClickHouse client spans) would give per-request, cross-service traces.
-2. **Log correlation IDs** — requests are not stamped with a request/trace ID, so log
-   lines can't be tied to a single request or followed across services. Add a
-   request-scoped ID (ideally the same trace ID once OTel lands).
-3. **Dashboards as code** — ship the RED (API) / USE (resource) / ingest (syncer)
-   dashboards as versioned Grafana JSON / provisioning rather than hand-built.
-4. **ClickHouse exporter wiring** — the DB is not yet scraped. Wire ClickHouse's built-in
-   Prometheus endpoint or a `clickhouse-exporter` so memory/disk/parts/merges/replication
-   feed the alerts in [§6](#6-suggested-dashboards--alerts).
+1. **Distributed tracing:** no OpenTelemetry or trace-context propagation.
+2. **Log correlation ids:** requests are not stamped with an id.
+3. **Dashboards as code:** ship Grafana JSON instead of hand-built boards.
+4. **ClickHouse exporter wiring:** the database is not scraped yet.
+5. **A metric for the volume back-fill and for guard rejections** (401/429 are not in `api_http_requests_total`).

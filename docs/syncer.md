@@ -1,544 +1,259 @@
-# The XRPL Syncer (ingestion service)
+# The syncer (ingestion service)
 
-A deep-dive into `apps/syncer` — the service that pulls ledgers from an XRPL node,
-parses every transaction into analytics rows, and bulk-writes them into ClickHouse.
-
-This document describes exactly what the code does. For the *operational* question of
-**how to backfill ~2 years of history and whether to run your own rippled**, see
-[docs/backfill.md](./backfill.md) — that discussion (history sizing, node choice, rate
-limits) is not repeated here.
-
----
-
-## 1. Purpose & high-level flow
-
-The syncer is a NestJS worker. Its job is to keep ClickHouse in sync with the XRPL,
-in two complementary modes:
-
-- **backfill** — sweep a `[from, to]` ledger range as fast as the node allows.
-- **live-subscribe** — follow the `ledgerClosed` stream and ingest each new ledger.
-
-Both modes share one pipeline: *fetch a ledger (with expanded transactions) → run the
-parser suite over each transaction → buffer the resulting rows → bulk-INSERT per table
-into ClickHouse*.
+`apps/syncer` (`@gatehub/data-syncer`) fills the ClickHouse database of **one network** with everything the
+[API](api-reference.md) serves. It is a NestJS process that runs up to four **workers** and exposes a liveliness probe
+(`GET /liveliness/healthz`, port 3002) and Prometheus metrics (`GET /metricz`, port 3000). Run **exactly one syncer per network
+and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer); metrics: [observability](observability.md).
 
 ```
-                                    apps/syncer
- ┌──────────────┐   ws/wss    ┌───────────────────────────────────────────────┐
- │  XRPL node   │◄───────────►│ XrplConnectionService                         │
- │  (rippled /  │             │  - owns the xrpl.js Client                    │
- │   cluster)   │  ledger     │  - ledger$ Subject (ledgerClosed events)      │
- └──────────────┘  request    │  - re-subscribes on reconnect                 │
-        ▲                     └───────────────┬───────────────────────────────┘
-        │ command:'ledger'                    │
-        │ transactions+expand                 ▼
-        │                     ┌───────────────────────────────────────────────┐
-        │                     │ LedgerIngestor.fetchAndParse(index)           │
-        └─────────────────────│  - retry(fetch ledger)                        │
-                              │  - rippleTime → unix seconds                   │
-                              │  - enrich each tx, ParsingService.parse        │
-                              └───────────────┬───────────────────────────────┘
-                                              │ FetchedLedger { ledger, parsed[] }
-                  ┌───────────────────────────┴───────────────────────┐
-                  ▼ (backfill: pool)                                   ▼ (live: serial chain)
- ┌────────────────────────────────────┐           ┌──────────────────────────────────────┐
- │ SyncProcessorService.backfill      │           │ SyncProcessorService.subscribeLive   │
- │  - worker pool over [from,to]      │           │  - promise-chain, one ledger at a time│
- │  - skip already-inserted (window)  │           │  - insertLedger() (flush immediately) │
- │  - enqueueLedger + maybeFlush(N)   │           └──────────────────┬───────────────────┘
- └────────────────┬───────────────────┘                              │
-                  ▼                                                   ▼
- ┌──────────────────────────────────────────────────────────────────────────────────────┐
- │ ClickHouseDataProcessorService                                                         │
- │  - buffers N ledgers' rows in per-table maps                                           │
- │  - flush(): all CHILD_TABLES (parallel) → then the `ledgers` commit marker             │
- │  - getInsertedLedgers(from,to): the skip-window lookup                                  │
- └──────────────────────────────────────────────┬───────────────────────────────────────┘
-                                                 ▼  JSONEachRow, insert_deduplicate=1
-                                  ┌────────────────────────────────┐
-                                  │ ClickHouse (ReplacingMergeTree) │
-                                  └────────────────────────────────┘
+                      GH_NODE_ENDPOINTS (rippled / xahaud, websocket)
+                                  │  NodeClient: failover, watchdog, re-subscribe
+   ┌──────────────┬───────────────┼────────────────┬─────────────────┐
+   │ ingest       │ validations   │ fee_stats      │ aggregator      │   <- GH_WORKERS
+   │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats + volumes │
+   └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┘
+          ▼               ▼               ▼                 ▼
+   14 ledger tables   validations    fee_stats        stats_hourly, volume_live,
+   (ledgers = commit  validator_     (every 5 s)      volume_daily   (reads the ledger tables)
+    marker)           manifests
+                          ClickHouse, database = the network name
 ```
 
-A separate HTTP server runs the whole time for `/liveliness/healthz` and `/metricz`.
+## 1. Boot
 
----
+`main.ts` loads and validates the configuration (the process exits with a message naming the bad variable), builds the app from
+the **enabled workers** only (`GH_WORKERS`, default all four), and starts the toolbox bootstrap (probe + metrics ports).
+Then, in order:
 
-## 2. Boot & modes
+1. If `GH_RUN_MIGRATIONS_ON_BOOT=true`, the schema is applied (the compose stacks leave this off: the `migrate-<network>` job
+   owns it).
+2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
+   (`server_info.network_id`: XRPL reports 0 or nothing, Xahau 21337/21338). A node of another network refuses the boot.
+3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
+   the node client stops) within 10 s; the compose `stop_grace_period` is 30 s.
 
-### Boot sequence
+The probe port opens only after the node connection is up.
 
-`apps/syncer/src/main.ts`:
+## 2. NodeClient
 
-1. Loads `dotenv/config`, creates the Nest app (`NestExpressApplication`).
-2. Disables `x-powered-by`, enables shutdown hooks.
-3. Listens on `GH_HTTP_API_PORT` (default `3002`). **The HTTP server exists purely so an
-   orchestrator can probe health and scrape metrics** while ingestion runs — the actual
-   work is kicked off in a lifecycle hook, not by an HTTP request.
+One resilient websocket connection (`packages/shared/src/xrpl/node-client.ts`), shared by everything in a process that talks
+to a node, and by the API (which uses it for balances and orders). It owns one `xrpl.js` client at a time and never relies on
+`xrpl.js` reconnecting (xrpl.js 2.14 gives up after a failed reconnect):
 
-`apps/syncer/src/app.module.ts` wires up: `ConfigModule`, `ClickHouseModule.forRoot()`,
-`PrometheusModule`, `LivelinessModule`, `SyncModule`, plus the `AppService`.
+- **Failover:** endpoints are tried round-robin, with a capped exponential backoff (1 s doubling to 30 s) after a failed round.
+- **Watchdog (every 5 s):** a dead connection, or one whose subscribed streams have been silent for 30 s, is retired and
+  replaced.
+- **Re-subscribe:** subscribed streams are remembered and sent again on every new connection.
+- **Requests:** timeout (default 30 s, waiting for a connection and again for the answer), up to 3 retries on a fresh
+  connection after a disconnect or timeout. A timeout recycles the shared connection (a timed-out socket is the usual stuck
+  socket). `tooBusy` / `noCurrent` style errors come back as `RippledError` and are the caller's to retry.
+- **Network check:** `server_info.network_id` must match the profile.
 
-### `AppService.onApplicationBootstrap` (`app.service.ts`)
+Do not send `api_version` to the node: both rippled and xahaud default to API v1, which is the shape the parsers expect.
 
-This is the orchestrator that runs once the Nest container is ready:
+## 3. The ingest worker (`LiveRunner`)
 
-1. **Migrations on boot** — if `runMigrationsOnBoot` (`GH_RUN_MIGRATIONS_ON_BOOT`, default
-   `true` — only `"false"` disables it) it calls `runMigrations()` from the shared package.
-   The runner is idempotent (`schema_migrations` bookkeeping table + `CREATE … IF NOT
-   EXISTS`). Note: the migrate module's own header recommends running migrations as a
-   single controlled step, **not** concurrently from every replica — if you scale the
-   syncer horizontally, set `GH_RUN_MIGRATIONS_ON_BOOT=false` on all but one and run a
-   dedicated migrate step.
-2. **Node range probe** — issues `server_info`, reads `info.complete_ledgers` (e.g.
-   `"32570-86000000"`), and splits it into `serverFrom`/`serverTo`.
-3. **Mode selection** (the two are independent and may both run):
-   - If `subscribeLive` (`GH_SUBSCRIBE_LIVE=true`): `sync.subscribeLive()`.
-   - If `backfillEnabled` (`GH_BACKFILL_ENABLED=true`): computes `from`/`to`, defaulting to
-     the node's range and **clamping** the requested `GH_BACKFILL_START_LEDGER` /
-     `GH_BACKFILL_END_LEDGER` to what the node actually holds (logs a warning, points to
-     `docs/backfill.md`). Backfill is started with `void this.sync.backfill(from, to)` —
-     fire-and-forget in the background so liveliness/metrics stay responsive; a crash is
-     caught and logged.
-   - If **neither** is enabled: logs `syncer is idle`.
+The single writer of the ledger tables. It follows the validated chain, one ledger at a time in order, and makes every ledger
+**atomic**: a ledger exists for readers exactly when its `ledgers` row does.
 
-### Running both modes together
+### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-This is the recommended fresh-deployment setup: live keeps the head current while the pool
-fills history behind it. The overlap is harmless because writes are idempotent (CTID +
-`ReplacingMergeTree`; see §5).
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 14
+**ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
+`account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
+`balance_changes`, `accounts_created`; see [data-model](data-model.md)). The parsers never mutate their input and take the
+network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
+`LedgerWriter.write()` then inserts, in this order:
 
-### Health & metrics endpoints
+1. all child tables, in parallel (each insert is chunked at 50,000 rows),
+2. `ledger_by_hash`,
+3. `ledgers` — **the commit marker**, in ascending order, so the checkpoint never skips an uncommitted ledger.
 
-- `GET /liveliness/healthz` (`LivelinessController`) — Terminus health check; the single
-  indicator pings ClickHouse (`LivelinessService.clickhouse()`), throwing
-  `HealthCheckError` if the ping fails.
-- `GET /metricz` (`PrometheusController`) — returns the Prometheus registry text. The
-  registry has default process metrics (prefixed `syncer_`) plus the two domain gauges
-  described in §10.
+Every insert is synchronous (`async_insert=0`) and carries an `insert_deduplication_token`
+`<runId>:<table>:<first>-<last>:<chunk>` (the tables keep the tokens of their last 1000 inserts, `non_replicated_deduplication_window`)
+and the same string as its `query_id`. So a retried batch re-sends only what did not go in, and everything a run has in flight
+can be found, waited for and killed by its `runId` prefix. Nothing reads rows of a ledger that has no `ledgers` row, so a
+half-written ledger is invisible; recovery removes it.
 
----
+### Checkpoint, boot and recovery
 
-## 3. The ingestion unit: `LedgerIngestor.fetchAndParse`
+- **Checkpoint** = `max(ledger_index)` of `ledgers`. There is no separate cursor to lose.
+- **Lease.** Before anything else the runner takes the `syncer_lease` row of the network. A lease whose heartbeat (server clock)
+  is younger than **30 s** belongs to its holder and refuses the boot (an old syncer that is still running holds it: stop it
+  first, see [deployment](deployment.md#cutover-on-an-existing-host)). The holder heartbeats every 10 s, and every heartbeat
+  first checks that the newest lease row is still its own: if another syncer took over after a stall, the runner **halts**
+  (`lease lost to <holder>`), writes nothing more and the probe goes 503. Releasing the lease inserts a newer row with an empty
+  holder.
+- **Verify.** The node must confirm the hash stored for the checkpoint, else the runner halts (data and node disagree about
+  history; only an operator can tell which is wrong).
+- **Clean the tail.** Rows above the checkpoint are rows of ledgers that never committed. They are deleted with partition-scoped
+  lightweight `DELETE`s (the `ledgers` row first) and the runner waits for the deletes (`lightweight_deletes_sync=2`).
+- **First boot** (no checkpoint): the start is `GH_SYNC_START_LEDGER` (default: the validated head). The start is recorded as a
+  *live intent* in `ingest_log` (`run_id live:<bootId>`, key `(start, 0)`) until the first commit, so that a crash during the
+  first write is cleaned up at the next boot even though the head has moved. `GH_SYNC_START_LEDGER` is ignored once a ledger
+  exists.
+- **Failed write.** Wait until the failed run's queries are really gone (`awaitQuiescence`: a request the client gave up on may
+  still run on the server and land behind a delete), re-read the checkpoint, delete everything above it and wait for that too,
+  then carry on with a **new `runId`** (the tables remember the tokens of deleted rows; reusing a `runId` would silently drop the
+  rewrite) and a pipeline rebuilt from checkpoint + 1. A recovery step that fails (a stuck mutation) is logged, shown in the
+  probe (`recovering`, `error`) and retried with backoff; nothing is written meanwhile.
 
-`apps/syncer/src/sync/ledger-ingestor.ts`. This is the **parallelizable, network-bound unit
-of work**: it only *fetches and parses* — it never writes. Writing is the data processor's
-job, so many ingestors can run concurrently.
+### The loop
 
-`fetchAndParse(ledgerIndex)`:
+- **The head.** The `ledgerClosed` stream is only a hint; ledgers are always **fetched by index** (`ledger` with
+  `transactions` and `expand`). When no hint has arrived for 15 s the runner polls `validatedHead()` instead. The head never
+  goes down, so the lag stays defined while the node is away.
+- **Catch-up.** Up to `GH_CATCHUP_CONCURRENCY` (8) ledgers are fetched at once, each retried **forever** with a capped backoff
+  (0.5 s doubling to 30 s): a ledger is never skipped. A fetched ledger is accepted only if the node says it is `validated`.
+  Accepted ledgers are reordered and chained in index order: each `parent_hash` must be the hash of the ledger before it. A break
+  commits the verified prefix and **halts** the runner (probe 503).
+- **Flush.** An accepted batch is written when it holds `GH_CATCHUP_FLUSH_LEDGERS` (300) ledgers or `GH_CATCHUP_FLUSH_TXS`
+  (100,000) transactions, is `GH_CATCHUP_FLUSH_MS` (5 s) old, reaches the head (live: every ledger is its own commit), or the
+  next ledger starts a new `ledgers` partition: a commit never spans two partitions of a million ledgers, so a half-applied
+  commit cannot leave a marker above a gap.
+- **Shutdown.** A write in progress finishes, a partial batch is dropped and refetched next time, the lease is released.
 
-1. **Fetch (retried).** `fetchLedger` issues:
-   ```
-   command: 'ledger', ledger_index, transactions: true, expand: true, binary: false
-   ```
-   i.e. the full ledger header plus every transaction with its metadata expanded inline.
-   The fetch is wrapped in `retry(…, { attempts: 5 })` so a transient node error does not
-   create a permanent gap. If the response has no `ledger`, it throws `Ledger N not found`.
+States (probe and `syncer_*` metrics): `starting`, `catching_up`, `live`, `halted`. Lag = validated head − committed checkpoint.
 
-2. **Time normalization (ripple time → unix seconds).** On the wire, `close_time` and
-   `parent_close_time` are **ripple time** (seconds since the ripple epoch, 2000-01-01).
-   The ingestor converts them **once**, here, via
-   `xrpl.rippleTimeToUnixTime(...) / 1000` (that helper returns ms, hence the `/1000`),
-   so every downstream parser and the processor see a consistent unix-seconds `date`.
-   `ledger_index` is coerced to a `Number`. The normalized object is what gets enqueued.
+### Catch-up after an outage
 
-3. **Per-transaction enrichment.** Each transaction is reshaped into an `XrplTx` carrying
-   the ledger-level context the parsers need:
-   - `meta` ← the tx's `metaData`,
-   - `hash`,
-   - `date` ← the ledger's unix `close_time` (every tx in a ledger shares the close time),
-   - `ledger_index`,
-   - `client` ← `parseClient(tx)` (the memo-derived client string, see §4).
+Nothing special is needed: restart (or let `restart: unless-stopped` restart) the syncer. It reads the checkpoint, cleans the
+tail, and catches up from checkpoint + 1 at the speed the node allows. Needs a node that still **has** those ledgers
+(`complete_ledgers` of `server_info`); a ledger the node no longer has fails the fetch forever and the runner keeps retrying,
+visible as lag that does not shrink. Point `GH_NODE_ENDPOINTS` at a full-history node (see [backfill](backfill.md)).
 
-   Then `ParsingService.parseTransaction(enriched)` runs the full parser suite, producing
-   a `ParsedTransaction`.
+## 4. Range ingest (CLI)
 
-4. Returns `{ ledger: normalizedLedger, parsed: ParsedTransaction[] }`.
+For history, gaps and parser changes. It runs next to the live syncer, in the same image:
 
----
+```bash
+# from source (needs the same GH_* environment as the syncer)
+pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000
 
-## 4. The parser suite
-
-`packages/shared/src/parsers/`. `ParsingService.parseTransaction` (`parsing.service.ts`)
-runs every parser over one transaction and returns a `ParsedTransaction`:
-
-```
-{ rawTransaction, payment?, exchanges[], balanceChanges[], accountsCreated[],
-  affectedAccounts[], offers[], issuers[], escrow?, paychannel? }
-```
-
-The suite is **pure and synchronous — no network calls**. Each parser reads the transaction
-fields and its metadata `AffectedNodes`. The shared gate `txSucceededOrClaimed(meta)`
-(`parser.interface.ts`) treats `tesSUCCESS` or any `tec*` result as "had ledger effects",
-though most parsers apply their own stricter `tesSUCCESS` check.
-
-### `parseClient` — `from-client.parser.ts`
-**Input:** a transaction's `Memos`. **Output:** a string (≤100 chars) or `null`.
-Scans memos for one whose `MemoType` decodes (hex or base64) to `"client"`, then decodes
-its `MemoData`/`MemoFormat` payload. Wrapped in try/catch per memo so malformed memos are
-ignored. This is the attribution tag (which app submitted the tx) propagated onto every
-child row as `client`.
-
-### `payment.parser.ts` — `payment?`
-**Input:** `Payment` transactions with `tesSUCCESS`. **Output:** one `ParsedPayment` or
-`undefined`.
-- Returns `undefined` for non-Payments, failures, or **self-payments**
-  (`Account === Destination` is an exchange/no-op, not a real payment).
-- Uses `parseBalanceChanges(meta)` from `ripple-lib-transactionparser` to compute
-  source/destination changes; subtracts the fee from the source's XRP change.
-- **Correctness fix (review C4/H4):** `destination_balance_changes` and the source changes
-  are guarded with `?? []` — a missing entry no longer throws (the old code assumed it
-  existed).
-- **Issuer resolution** (`setIssuer`): XRP has none. Otherwise, if the amount's issuer is
-  neither source nor destination, that issuer is used directly. Failing that, it inspects
-  the `RippleState` `AffectedNodes`: matching the destination on `HighLimit`/`LowLimit`, a
-  **negative (or previously-negative) balance means the low-limit account is the issuer**
-  (XRPL signs RippleState balances from the low account's perspective).
-- Emits `currency`, `amount`, `delivered_amount` (prefers `DeliveredAmount`), `max_amount`
-  / `source_currency` (from `SendMax`), tags, `invoice_id`, `fee` (in XRP).
-
-### `exchanges.parser.ts` — `exchanges[]`
-**Input:** `Payment` and `OfferCreate` with `tesSUCCESS`. **Output:** one `ParsedExchange`
-per exercised offer.
-- Walks `AffectedNodes`, picking `ModifiedNode`/`DeletedNode` of type `Offer` that have
-  `PreviousFields.TakerPays` **and** `TakerGets` (i.e. the offer actually moved).
-- Computes the traded `base`/`counter` sides from `Previous − Final`, converting XRP drops.
-- Rate from `parseQuality(BookDirectory, …)`, falling back to the amount ratio.
-- **Autobridging detection:** for `OfferCreate` with two IOU legs bridged through XRP, sets
-  `autobridged`.
-- `orderPair` canonicalizes side order (lexicographic on `currency+issuer`) so the same
-  pair always sorts consistently, inverting the rate accordingly.
-- Carries `node_index` (its index in `AffectedNodes`) — part of the natural key.
-
-### `balance-changes.parser.ts` — `balanceChanges[]`
-**Input:** any tx whose result is `tesSUCCESS` or `tec*`. **Output:** one row per affected
-`AccountRoot`/`RippleState` node.
-- `parseAccountRoot`: XRP balance deltas. For the sending account it emits a separate
-  `type: 'fee'` row and nets the fee out of the real change.
-- `parseRippleState`: emits **two mirror rows** (low party and high party) for an IOU
-  trustline, with `final_balance` negated for the high side.
-- `findType` classifies each change: `fee`, `payment_source`, `payment_destination`,
-  `exchange`, `intermediary`.
-  **Correctness fix (review C3):** one branch was `data.account = transaction.Account`
-  (an **assignment** that always truthy-evaluated and corrupted `data.account`); it is now
-  the intended `===` **comparison**. This is a load-bearing fix — without it, payment-source
-  classification and the account it was attributed to were both wrong.
-- After the main pass, escrow/paychannel `AffectedNodes` are matched onto the relevant
-  account rows to annotate `escrow_*` / `paychannel_*` fields and refine `type`.
-
-### `accounts-created.parser.ts` — `accountsCreated[]`
-**Input:** `tesSUCCESS` txs. **Output:** one row per `CreatedNode` of type `AccountRoot`.
-Records the new `account`, its funding `parent` (the tx `Account`), and starting `balance`
-(XRP).
-
-### `affected-accounts.parser.ts` — `affectedAccounts[]`
-**Input:** any tx with metadata. **Output:** one row per affected account address.
-Uses `getAffectedAccounts(meta)`; filters to addresses starting with `r`. This is the
-"which accounts did this tx touch" index, carrying `tx_result` and `tx_type`.
-
-### `offers.parser.ts` — `offers[]`
-**Input:** `Payment`/`OfferCancel`/`OfferCreate` with `tesSUCCESS`. **Output:** one row per
-Offer node (Created/Modified/Deleted).
-Captures `account`, `offer_sequence`, `book_directory`, `taker_pays`/`taker_gets`
-(normalizing XRP drops), `rate` (`parseQuality`), and `pays_change`/`gets_change` deltas.
-`change_type` is classified: `create`, `partial_fill`, `cancel`, `replace`, `fill`,
-`unfunded_cancel`, `unfunded_partial_fill`. Carries `node_index`.
-
-### `issuers.parser.ts` — `issuers[]` (the historically-correct trustline snapshot)
-**Input:** any tx with metadata. **Output:** one `ParsedIssuerTrustline` per affected
-`RippleState` node with a non-zero balance.
-- For each RippleState node it reads `Balance.value`, `HighLimit.issuer`, `LowLimit.issuer`.
-  **Sign convention:** the balance is signed from the low account's perspective — positive
-  ⇒ `issuer = high`, `counterparty = low`; negative ⇒ the reverse. The stored `balance` is
-  the absolute value.
-- **Why this matters (review H6):** the old pipeline derived issuer trustlines from a
-  **per-transaction `account_lines` RPC**. That was (a) a throughput bottleneck — one
-  network round-trip *per transaction* — and (b) **historically wrong**, because it always
-  queried `ledger_index: 'validated'` ("now") rather than the ledger being processed.
-  Deriving the snapshot from the affected RippleState nodes gives the balance **as of this
-  ledger** and needs **no network call** — so it is both correct for backfilled history and
-  fast. Rows dedup downstream in a `ReplacingMergeTree` keyed on
-  `(issuer, currency, counterparty)` with `ledger_index` as the version, so the latest
-  snapshot wins.
-
-### `escrow.parser.ts` — `escrow?`
-**Input:** `EscrowCreate`/`Cancel`/`Finish` with `tesSUCCESS`. **Output:** one
-`ParsedEscrow` or `undefined`.
-Finds the escrow node (Deleted or Created) in the metadata.
-**Guard (review H4):** `EscrowCancel`/`Finish` carry no top-level `Amount`, so amount falls
-back to the node fields and is only converted when present (`rawAmount != null`). Converts
-`CancelAfter`/`FinishAfter` from ripple time to unix seconds.
-
-### `paychan.parser.ts` — `paychannel?`
-**Input:** `PaymentChannelCreate`/`Fund`/`Claim` with `tesSUCCESS`. **Output:** one
-`ParsedPayChannel` or `undefined`.
-Finds the `PayChannel` node and reads `f.Account`/`Destination`/`Amount`/`Balance` from its
-`NewFields`/`FinalFields`. **Guard:** if no PayChannel node is present it defaults to
-`{ fields: {} }` so field access never throws, and amount/balance conversions are only done
-when the field exists.
-
-### CTID — `packages/shared/src/util/ctid.ts`
-The **Concise Transaction Identifier** (XLS-37d): a deterministic id from
-`(ledger_index, tx_index, network_id)`, e.g. `getTxCtid` produces
-`C` + 7-hex ledger + 4-hex tx-index + 4-hex network. It is computed in the processor (not
-the parsers) and used as the ClickHouse sort/dedup key for per-tx rows, making replay
-idempotent. `getNodeCtid` appends a 4-digit node index for per-node rows. `parseCtid`
-inverts it. This replaces Elasticsearch's auto-generated `_id`, which produced duplicate
-documents on any replay.
-
-### Time helpers — `packages/shared/src/util/time.ts`
-`RIPPLE_EPOCH_MS`, ISO↔ripple/unix converters, and `toClickHouseDateTime(seconds)` which
-formats unix seconds as a UTC `'YYYY-MM-DD HH:MM:SS'` string (ClickHouse `DateTime`). The
-processor uses the latter for every `date`/`close_time` column.
-
-### Retry helper — `packages/shared/src/util/helpers.ts`
-`retry(fn, { attempts=5, baseDelayMs=250, maxDelayMs=10_000, onRetry })` — bounded retries
-with **exponential backoff** (`base * 2^(attempt-1)`, capped), re-throwing the last error
-on exhaustion. Used for ledger fetch (§3) and the ClickHouse flush (§5). Also exports
-`wait(ms)` (used for the per-worker throttle) and `chunk`.
-
----
-
-## 5. Batched writing & idempotency: `ClickHouseDataProcessorService`
-
-`apps/syncer/src/processor/clickhouse-data-processor.service.ts`.
-
-### Buffering & flush
-
-- `enqueueLedger(ledger, parsed)` is **synchronous** — safe to call from concurrent
-  backfill workers. For each parsed tx it computes the `ctid` and appends rows to per-table
-  buffers (a `Map<table, rows[]>`) plus one `ledgers` "commit marker" row. It increments
-  `bufferedLedgers`.
-- `maybeFlush(threshold)` flushes once `bufferedLedgers >= threshold` (the threshold is
-  `GH_BACKFILL_BATCH_LEDGERS`, default 500).
-- `flush()`:
-  1. Snapshots and **clears the buffers up-front** (`resetBuffers`) so concurrent workers
-     can keep enqueuing during the network I/O.
-  2. Inserts **all `CHILD_TABLES` in parallel** (skipping empty ones), then inserts the
-     `ledgers` markers **last**.
-  3. The whole batch is wrapped in `retry(…, { attempts: 5 })`.
-- `insertLedger(ledger, parsed)` = `enqueueLedger` + immediate `flush()` — used by live sync
-  (ledgers arrive ~1 per 3–4 s, so there's nothing to batch).
-
-### Why batch matters
-
-**ClickHouse creates one storage "part" per INSERT.** A ledger produces ~11 inserts; over a
-multi-million-ledger backfill, per-ledger inserts would create an unsustainable number of
-tiny parts ("too many parts" errors) and waste round-trips. Buffering N ledgers and issuing
-**one INSERT per table per flush** cuts round-trips roughly 100× and keeps part counts sane.
-Inserts use `JSONEachRow` (`ClickHouseService.insert`).
-
-### Children-then-marker ordering
-
-`CHILD_TABLES` (transactions, payments, exchanges, balance_changes, affected_accounts,
-accounts_created, offers, issuers, escrows, paychannels) are always written **before** the
-`ledgers` row for that batch. The `ledgers` row acts as a **commit marker**: a ledger
-present in `ledgers` is taken to mean its children were written. This ordering is what makes
-the skip-window (§6) safe.
-
-### Idempotency & crash-safety
-
-- Every table is a **`ReplacingMergeTree(ledger_index)`** (the `ledger_index` is the
-  version column — latest wins on merge). Each table dedups on its `ORDER BY` natural key:
-  - `transactions`, `payments` → `ctid`
-  - `exchanges` → `(base_currency, base_issuer, counter_currency, counter_issuer, date, tx_hash, node_index)`
-  - `balance_changes` → `(account, currency, date, tx_hash, node_index)`
-  - `offers` → `(account, date, tx_hash, node_index)`
-  - `affected_accounts` → `(account, date, tx_hash)`
-  - `accounts_created` → `account`; `escrows`/`paychannels` → `tx_hash`
-  - `issuers` → `(issuer, currency, counterparty)`
-  - `ledgers` → `ledger_index`
-  So **re-processing a ledger collapses to identical rows** — replay is a no-op once merges
-  run.
-- The ClickHouse client no longer sets global `insert_deduplicate` / `async_insert`
-  settings. Server-side insert-time de-duplication is opted into **per insert**:
-  `ClickHouseService.insert(table, rows, { dedupToken })` sends `insert_deduplication_token`,
-  which only takes effect on a table created with `non_replicated_deduplication_window > 0`.
-- **Mid-batch crash:** if the process dies after writing some child tables but before the
-  `ledgers` markers, those ledgers are simply *not* recorded as inserted. The next run sees
-  them missing in the skip-window and **re-ingests them** — which, thanks to the dedup keys
-  + `insert_deduplicate`, is harmless. The only "cost" is re-writing a few already-present
-  child rows that merges will collapse.
-
-### `getInsertedLedgers(from, to)`
-
-A parameterised query — `SELECT ledger_index FROM ledgers WHERE ledger_index BETWEEN
-{from} AND {to}` — returning a `Set<number>`. This is the source of truth for "what's
-already done" and drives the skip-window.
-
----
-
-## 6. Backfill mechanics
-
-`SyncProcessorService.backfill` (`sync-processor.service.ts`).
-
-- **Worker pool.** `workers = max(1, GH_BACKFILL_WORKERS)` worker coroutines run
-  concurrently via `Promise.all`. Each worker loops, claiming the next ledger.
-- **Cursor.** `claimNext()` hands out `cursor++` (a shared integer) until `cursor > to`.
-  This is a simple atomic-ish claim (single-threaded JS event loop), so each ledger is
-  processed by exactly one worker.
-- **Windowed skip of already-inserted ledgers (single-flight).** A `SKIP_WINDOW = 10_000`
-  block of "already inserted" indices is cached in a `Set`. `refreshWindowIfNeeded(index)`
-  reloads the window when `index` falls outside it. **Only one worker loads the window at a
-  time** — others `await` the same in-flight `windowLoad` promise (this fixes a shared-state
-  race in the old version). If `inserted.has(index)`, the worker counts it done and skips
-  the fetch entirely. This is what makes restarts cheap: a re-run skips everything already
-  present instead of re-fetching it.
-- **Per-ledger work:** `fetchAndParse(index)` → `enqueueLedger` → `maybeFlush(batch)`. On
-  success it bumps `done`, updates `maxSynced` + the `latestSyncedLedger` gauge, increments
-  `ledgersProcessed`, and every 1000 ledgers logs the rate (`N ledgers (R/s)`).
-- **Retries & failed-ledger handling.** The fetch itself is retried inside `fetchAndParse`
-  (5 attempts, backoff). If a ledger still throws (exhausted retries), the worker logs
-  `Ledger N permanently failed after retries` and pushes `N` onto a `failed[]` list —
-  it does **not** abort the whole backfill. At the end, `failed.length` and (up to 50 of)
-  the indices are logged.
-- **Throttle.** After each ledger, if `GH_FETCH_THROTTLE_MS > 0`, the worker `wait`s that
-  long — a per-worker pause to stay under a node's rate limit.
-- **Tail drain.** After all workers finish, `processor.flush()` writes whatever is left in
-  the buffer (the last partial batch).
-
-### Re-running gaps
-
-Restarting resumes cleanly (skip-window). To repair the ledgers reported in the
-`… failed and were not indexed: …` line, re-run with `GH_BACKFILL_START_LEDGER` /
-`GH_BACKFILL_END_LEDGER` narrowed to those ranges. See
-[docs/backfill.md](./backfill.md#resuming--gap-repair).
-
----
-
-## 7. Horizontal scaling (sharding)
-
-`shardRange(from, to)` splits `[from, to]` into `shardTotal` **contiguous** slices and
-returns the slice for `shardIndex`:
-
-```
-size      = ceil((to - from + 1) / shardTotal)
-shardFrom = from + shardIndex * size
-shardTo   = min(to, shardFrom + size - 1)
+# in the container stack
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+  node dist/cli/range-ingest.js --from 90000000 --to 90100000
 ```
 
-(`shardTotal <= 1` ⇒ the whole range.) If a shard's `from > to` it logs "empty" and
-returns. So you can run **N syncer instances** with the same `GH_BACKFILL_START_LEDGER` /
-`END_LEDGER` but different `GH_BACKFILL_SHARD_INDEX` (`0..N-1`) and `GH_BACKFILL_SHARD_TOTAL
-= N`, and each handles a disjoint contiguous slice. Point each instance at its **own XRPL
-node** (`GH_XRPL_NODE_ENDPOINT`) to multiply fetch throughput — fetch latency, not
-ClickHouse, is the bottleneck. Because writes are idempotent, even overlapping shards are
-safe. Remember to run migrations from only one place (§2).
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--from <n>`, `--to <n>` | required | Both inclusive. |
+| `--chunk <n>` | 1000 | Ledgers per chunk; must divide 1,000,000. A chunk is fetched and written as a whole, so it is also the memory the run needs. |
+| `--concurrency <n>` | 8 | Ledgers of a chunk fetched at once. |
+| `--reprocess` | off | Delete and rewrite ledgers that are already committed (after a parser change); default: skip them. |
+| `--run-id <id>` | random | Name of the run in `ingest_log` and in query ids (a per-invocation nonce is appended). Must not start with `live:`. |
+| `--help` | | Prints the usage. |
 
----
+Exit status: `0` ingested, `1` the run failed (**rerun the same command**: finished chunks are skipped, unfinished ones redone),
+`2` wrong command line.
 
-## 8. Live sync
+How it works (aligned chunks, `ingest_log` intents):
 
-`SyncProcessorService.subscribeLive`:
+1. Per chunk, the ledgers already committed are skipped (unless `--reprocess`).
+2. An `ingest_log` row `started` is written **before** anything is deleted or written, the ledgers are fetched (and, when they
+   replace committed ones, dry-parsed, so that a missing ledger, a failing node or a parser error leaves the committed chunk
+   untouched), the chunk is written with one `LedgerWriter.write()`, then `ingest_log` gets `done`.
+3. A chunk whose newest log row is `started` is an **unfinished intent**: a run died in the middle of it. The next run waits for
+   that run's queries to be gone, deletes the chunk's ledgers and redoes it.
+4. Every written chunk marks its hour range in **`agg_dirty`** so the aggregator recomputes the stats and daily volumes. Committed
+   ledgers a run skipped get one row at the end.
+5. A failed attempt is recovered like a failed live write (wait for the queries, delete the chunk, new `runId`); a chunk gets 3
+   attempts. A ledger the node does not have, a ledger the parser rejects and a live syncer that appeared are not retried: they
+   stop the run.
+6. **The live syncer owns everything above its checkpoint.** A range that reaches above the committed checkpoint is refused while
+   the syncer's lease is fresh (< 30 s), and this is re-checked per chunk. Backfill is history: below the checkpoint.
+7. `--reprocess` rewrites the whole requested range; it fetches and dry-parses before it deletes anything.
 
-- Subscribes to `XrplConnectionService.ledger$` (the `ledgerClosed` event Subject).
-- **Promise-chain serialization.** Each incoming ledger appends to a `chain` promise:
-  `chain = chain.then(process(index)).catch(log)`. This processes ledgers **strictly one at
-  a time, in order**, with **no shared mutable `isWorking` flag** — the old design used such
-  a flag and could *drop* a ledger that arrived while idle (review M7). With the chain, a
-  ledger arriving during processing simply queues behind the current one.
-- Each step does `fetchAndParse(index)` → `insertLedger` (immediate flush, since live
-  ledgers are infrequent) → updates the `latestSyncedLedger` and `ledgersProcessed` gauges.
-- Finally calls `xrpl.subscribeToLedgers()` to start the stream.
+Do not run two range ingests over overlapping ranges at the same time. Throughput is bound first by the node, then by
+ClickHouse; raise `--concurrency` with your own node.
 
-### XRPL connection (`xrpl-connection.service.ts`)
+## 5. The validations worker
 
-- Owns the `xrpl.js` `Client` (20 s connection timeout). On `onModuleInit` it connects and
-  registers handlers; `ledgerClosed` events are pushed into `ledger$`.
-- **Reconnect & re-subscribe.** `xrpl.js` auto-reconnects internally. On every `connected`
-  event, if a live subscription was ever established (`liveSubscribed`), it
-  **re-subscribes** to the `ledger` stream — so the live feed is not silently lost after a
-  reconnect. `subscribeToLedgers` throws if the subscribe response is empty and sets
-  `liveSubscribed = true`.
-- The class header notes it fixed prior review findings: no more `assert` from `console`
-  (which never throws in prod), guarded/awaited reconnects, and the re-subscribe.
+`ValidationsCollector` listens to the `validations` and `manifests` streams of every node of `GH_VALIDATION_ENDPOINTS` (one
+`NodeClient` per endpoint, so each reporter is distinct; a node that is down does not hold up the others) and writes
+`validations` / `validator_manifests`:
 
----
+- **`reporter_public_key`** is the `pubkey_node` of the node the message came from (asked of `server_info` on each (re)connect).
+  A message that arrives while it is unknown is dropped and counted (`reason="no_reporter"`).
+- **`validation_public_key`** (the validator's master key) is the `master_key` of the message, else the manifest map (loaded from
+  `validator_manifests`, kept current from the `manifests` stream), else the `manifest` RPC (waits at most 4 s; a miss is
+  remembered for 10 minutes, a failure for 30 s), else the signing key. `ephemeral_public_key` is the signing key.
+- **Merging:** one row per (`ledger_hash`, `validator`); `count` goes up, first/last time of receipt are kept; the table adds
+  partial sightings up on merge (AggregatingMergeTree) and the API on read.
+- **Flush every 20 s.** A failed flush puts its rows back into the buffer (at-least-once; an insert that times out after
+  ClickHouse took the rows is written twice and that validation's `count` is too high — rare, accepted). The buffer is bounded
+  (50,000 rows); past it the oldest rows are dropped and counted.
+- Messages in the replay window of a reconnect are lost; a node of another network is refused. Rows expire after 90 days (TTL).
+- Shutdown: lookups get 1 s, the final flush at most 3 s in total; nothing starts after that.
 
-## 9. Resilience & failure modes (honest)
+## 6. The fee_stats worker
 
-**Handled:**
-- *XRPL transient errors / "ledger not found":* retried 5× with backoff per ledger; a
-  permanent failure is recorded and reported, not fatal.
-- *XRPL disconnect:* `xrpl.js` auto-reconnects; live re-subscribes automatically.
-- *ClickHouse transient errors:* the whole flush batch is retried 5× with backoff.
-- *Replay / restart / overlap / mid-batch crash:* idempotent via CTID-keyed
-  `ReplacingMergeTree` + `insert_deduplicate=1` + children-before-marker ordering. Re-runs
-  skip already-inserted ledgers via the window.
-- *Process probeability:* HTTP health/metrics stay up independently of ingestion.
+`FeeStatsPoller` asks the node for `fee` every **5 s** and writes one `fee_stats` row (`pct_max_queue_size =
+current_queue_size / (expected_ledger_size × 20) × 100`). Ticks never overlap (a slow one is skipped and logged); a failed sample
+is logged and counted (`syncer_fee_stats_errors_total`) and the next tick is the retry. Request timeout 4 s; shutdown waits at
+most 2 s for the sample in flight.
 
-**Not handled yet (be aware):**
-- **Reorgs / non-validated ledgers.** The backfill fetches by `ledger_index` without an
-  explicit *validated* gate, and live ingests on `ledgerClosed`. There is no reorg detection
-  or rollback — the design assumes the node serves validated, final ledgers (true for
-  historical backfill; a theoretical edge for the very head in live mode).
-- **Dead-letter / durable failed-ledger queue.** Permanently-failed ledgers are only
-  *logged* (in-memory `failed[]`, list truncated to 50 in the message). There is no
-  persistent dead-letter store; gap repair is manual (re-run a narrowed range, §6).
-- **Validated-ledger gating / completeness verification.** No post-hoc check that the
-  `[from, to]` range is fully contiguous in ClickHouse beyond the skip-window lookup.
-- **Mid-batch atomicity across tables.** Children and the ledger marker are separate
-  inserts; a crash between them is *recovered by re-ingest*, not by a transaction (ClickHouse
-  has none). This is safe but not atomic.
-- **Backpressure between fetch and write.** Buffers grow in memory until the flush
-  threshold; an extended ClickHouse outage (beyond the 5 retries) would surface as an error,
-  not graceful backpressure.
+## 7. The aggregator
 
----
+Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs five jobs **in priority order**; a job
+gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work:
 
-## 10. Operational tips
-
-### Throughput knobs (`syncer.config.ts` ← env)
-
-| Env var | Config | Default | Effect |
+| # | Job | Budget | What |
 | --- | --- | --- | --- |
-| `GH_XRPL_NODE_ENDPOINT` | `xrplEndpoint` | *(required)* | ws/wss node URL. Own full-history node for backfill (see backfill.md). |
-| `GH_XRPL_NETWORK_ID` | `networkId` | 0 | Goes into the CTID. |
-| `GH_RUN_MIGRATIONS_ON_BOOT` | `runMigrationsOnBoot` | true | Set `false` on extra replicas. |
-| `GH_BACKFILL_ENABLED` | `backfillEnabled` | (`true` only if `="true"`) | Enable the sweep. |
-| `GH_BACKFILL_START_LEDGER` / `_END_LEDGER` | `backfill{Start,End}Ledger` | node range | Clamped to node `complete_ledgers`. |
-| `GH_BACKFILL_WORKERS` | `backfillWorkers` | 8 (example: 12) | Concurrency of the fetch pool — the main throughput lever; raise toward your node's rate limit. |
-| `GH_BACKFILL_BATCH_LEDGERS` | `backfillBatchLedgers` | 500 | Ledgers buffered per flush. Bigger = fewer/larger inserts, more memory & more re-work on crash. |
-| `GH_FETCH_THROTTLE_MS` | `fetchThrottleMs` | 100 | Per-worker pause; raise if you see rate-limit errors, lower (0) for a dedicated local node. |
-| `GH_BACKFILL_SHARD_INDEX` / `_TOTAL` | `shardIndex` / `shardTotal` | 0 / 1 | Horizontal sharding (§7). |
-| `GH_SUBSCRIBE_LIVE` | `subscribeLive` | (`true` only if `="true"`) | Follow the head. |
-| `GH_HTTP_API_PORT` | — | 3002 | Health/metrics port. |
+| 1 | `volume_live` | 5 s | The seven live volume sets (trade volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version. **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
+| 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), both metrics, stalest first. |
+| 3 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
+| 4 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes the daily volume sets of the days a slice covers. |
+| 5 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config, **newest first**. |
 
-Practical tuning: for a fast local full-history node, push `GH_BACKFILL_WORKERS` up
-(12–16+) and drop `GH_FETCH_THROTTLE_MS` toward 0. Against a public cluster, keep workers
-modest and the throttle ≥100 ms (see backfill.md for the rationale and node-choice
-trade-offs).
+Properties that matter operationally:
 
-### Metrics to watch (`/metricz`)
+- **Idempotent and resumable.** A stats slice is `recomputeStatsHourly` (deduplicated by `LIMIT 1 BY ledger_index`, written with a
+  new version); a volume set is a complete set of rows under one version and readers keep only the highest version of a set. A
+  failed slice or set is retried on the next tick; errors are logged and counted (`syncer_aggregator_errors_total{job}`) and never
+  stop the loop.
+- **A mark is never lost.** An `agg_dirty` range is deleted only after all its slices succeeded, and only if it was not marked
+  again meanwhile; an unfinished range is replaced by one that starts where the work stopped.
+- **During a long catch-up the tail does not run**, so the current hour's stats are stale until the catch-up is over (a database with years of history,
+  or after a long outage). `syncer_aggregator_stats_lag_seconds` says how many seconds of history are still to do; it is 0 when
+  the stats are current.
+- **A closed day is final only once the ingest has passed it**: back-fill covers days that ended at least an hour before the
+  *newest ingested ledger's* close time (the sentinel row of a set records whether the newest ledger had passed the day end
+  when the set was written), not by the wall clock. After an ingest lag of more than a day the days are not computed until their
+  ledgers are in.
+- A set that keeps failing waits 5 minutes, doubling up to an hour, and older days go on; the memory of this is lost on restart.
+- **No overlap, graceful stop** (a tick still running is skipped; shutdown aborts the slice in flight and waits at most 2 s).
+- Volume jobs need the **markets config** (`config/markets/<network>.json` or `GH_MARKETS_CONFIG`): without markets there is
+  nothing to compute (the shipped Xahau list is empty). A new `version` in the file recomputes the closed days.
 
-- **`syncer_ledgers_processed_total`** — gauge incremented per successfully processed ledger
-  (since process start). Watch its *rate* for throughput.
-- **`syncer_latest_synced_ledger`** — highest ledger index written. In live mode it should
-  track the network head (advance every ~3–4 s); in backfill it climbs through the range.
-- Plus default process metrics (prefixed `syncer_`).
-- Useful log lines: `Backfilled N ledgers (R/s), cursor X` (every 1000), the final
-  `Backfill complete` / `… ledgers failed and were not indexed: …`, and the XRPL
-  connect/disconnect/re-subscribe logs.
+## 8. What the syncer does not do
 
----
+- It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
+- It does not write `agg_dirty` for live ingest (the aggregator's catch-up watermark covers that); only range ingest does.
+- It never deletes a committed ledger except through `--reprocess` or its own recovery of an uncommitted tail.
+- It has no SQLite history importer (the `LedgerSource` interface is there for one; `genesis_*` of `accounts_created` stays empty
+  until such an import loads ledger 32570).
 
-## File map
+## 9. Failure modes
 
-| Concern | File |
+| Symptom | Cause | What happens |
+| --- | --- | --- |
+| Probe 503, `state=halted`, `error: ...parent_hash...` | Chain break: the node's history differs from what is stored | The verified prefix is committed, then nothing. Operator decision: see [operations](operations.md#syncer-halted). |
+| Probe 503, `lease lost to ...` | Another syncer took the lease | This one stopped writing. Find and stop the other one. |
+| Boot refuses: lease held | A previous syncer (or an old-stack container) is still running or died less than 30 s ago | Stop it; wait 30 s. |
+| Lag grows, `last_commit_age` grows | Node unreachable or slow; ClickHouse refusing writes; recovery stuck (`recovering`) | Retries forever; see [operations](operations.md#syncer-falling-behind). |
+| `Node network_id ... does not match GH_NETWORK` | Wrong node for the network | Boot refused. |
+
+## 10. Source map
+
+| Where | What |
 | --- | --- |
-| Boot / HTTP server | `apps/syncer/src/main.ts` |
-| Module wiring | `apps/syncer/src/app.module.ts`, `sync/sync.module.ts` |
-| Mode selection / migrations on boot | `apps/syncer/src/app.service.ts` |
-| XRPL websocket / reconnect | `apps/syncer/src/xrpl/xrpl-connection.service.ts` |
-| Fetch + parse one ledger | `apps/syncer/src/sync/ledger-ingestor.ts` |
-| Backfill pool + live chain | `apps/syncer/src/sync/sync-processor.service.ts` |
-| Buffering / batched writes / idempotency | `apps/syncer/src/processor/clickhouse-data-processor.service.ts` |
-| Config knobs | `apps/syncer/src/config/syncer.config.ts` |
-| Parser suite | `packages/shared/src/parsers/*` |
-| CTID / time / retry | `packages/shared/src/util/{ctid,time,helpers}.ts` |
-| ClickHouse client (per-insert dedup token) | `packages/shared/src/clickhouse/clickhouse.service.ts` |
-| Table names / schema engines | `packages/shared/src/clickhouse/tables.ts`, `packages/shared/schema/001_tables.sql` |
-| Metrics / health | `apps/syncer/src/modules/{prometheus,liveliness}/*` |
-
-See also: [docs/backfill.md](./backfill.md) (history sizing & running rippled),
-[docs/architecture.md](./architecture.md), [docs/data-model.md](./data-model.md).
+| `apps/syncer/src/main.ts`, `app.module.ts`, `worker-registry.ts`, `core/*` | Bootstrap, worker selection, node client provider, migrate-on-boot |
+| `apps/syncer/src/ingest/{live-runner,rpc-ledger-source}.ts` | The ingest worker and its ledger source |
+| `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
+| `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | The other three workers |
+| `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
+| `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
+| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |
+| `packages/shared/src/aggregate/{stats,volume}.job.ts`, `query/rates.service.ts` | Aggregation and rates |
+| `packages/shared/src/xrpl/node-client.ts` | The node client |

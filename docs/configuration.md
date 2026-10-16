@@ -1,300 +1,199 @@
-# Configuration Reference
+# Configuration reference
 
-This document is the authoritative reference for every environment variable read by the
-GateHub XRPL Data API monorepo. It covers the two runnable services — **`apps/api`** (the
-public REST API) and **`apps/syncer`** (the XRPL ingestion worker) — plus the **shared
-ClickHouse** configuration that both services consume.
-
-Every variable below is documented exactly as the code reads it. The source of truth is:
-
-- `apps/api/src/config/api.config.ts` — `apiConfigFromEnv()`
-- `apps/syncer/src/config/syncer.config.ts` — `syncerConfigFromEnv()`
-- `packages/shared/src/clickhouse/clickhouse.config.ts` — `clickHouseConfigFromEnv()`
-- `packages/shared/src/constants.ts` — `networkIdFromEnv()` / `NetworkId`
-
----
+Every environment variable of the two services, with its default, the service that reads it and what it does. The tables are
+checked against the configuration classes by [the check at the end of this page](#keeping-this-page-true). The sources of
+truth are
+[`apps/api/src/config/api.config.ts`](../apps/api/src/config/api.config.ts),
+[`apps/syncer/src/config/syncer.config.ts`](../apps/syncer/src/config/syncer.config.ts),
+[`packages/shared/src/clickhouse/clickhouse.config.ts`](../packages/shared/src/clickhouse/clickhouse.config.ts) and
+[`packages/shared/src/network/network-profile.ts`](../packages/shared/src/network/network-profile.ts).
 
 ## 1. How configuration is loaded
 
-1. **dotenv.** Each service's `src/main.ts` begins with `import 'dotenv/config'`, which loads
-   a `.env` file from the **service's working directory** into `process.env` at startup.
-   `apps/api` reads `apps/api/.env`; `apps/syncer` reads `apps/syncer/.env`.
-2. **Read from `process.env`.** All config factory functions take
-   `env: NodeJS.ProcessEnv = process.env` and read named keys (all prefixed `GH_`). The
-   config is read **once** at boot and frozen into a strongly-typed object
-   (`ApiConfig` / `SyncerConfig` / `ClickHouseConfig`).
-3. **Validation / fail-fast.**
-   - The **API** validates numerics through `requirePositive(name, raw, fallback)`: an empty or
-     unset value falls back to the default; a value that is `NaN` or `< 0` throws a
-     `ConfigError` (`Invalid or missing numeric config <NAME>: <raw>`), aborting boot. This
-     applies to `GH_HTTP_API_PORT`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`,
-     `GH_LIVE_CACHE_TTL_MS`, and `GH_TRUST_PROXY_HOPS`.
-   - The **syncer** requires `GH_XRPL_NODE_ENDPOINT`; if it is missing/empty it throws
-     `GH_XRPL_NODE_ENDPOINT is required.` Its numeric helper `num()` is more lenient — an
-     empty or `NaN` value becomes `undefined` and falls back to the coded default (it does
-     **not** fail-fast on bad numerics, it silently uses the default).
-   - The **ClickHouse** config does not fail-fast: it wraps raw values in `Number(...)`, so a
-     non-numeric value yields `NaN` (no default substitution beyond the `??` fallback for
-     unset/empty).
-4. **Production secrets injection.** In production these variables are injected by a secrets
-   manager (Vault / AWS Secrets Manager / Kubernetes secrets) — **never committed**. The
-   Docker images set `ENV NODE_ENV=production`.
-5. **Git hygiene.** `.env` and `.env.*` are git-ignored, **except** `!.env.example`. The
-   `.env.example` files (and `deploy/.env.prod.example`) are the committed templates; copy
-   them to `.env` / `.env.prod` and fill in real values locally or via your secrets manager.
+- Every variable is prefixed `GH_`. A class property `fooBar` is read from `GH_FOO_BAR` by the `@gatehub/toolbox`
+  `ConfigService` (`@ConfigValue()`); the ClickHouse variables are read by `clickHouseConfigFromEnv`.
+- The values are validated at boot. An invalid value (a port that is not a number, an unknown worker name, a node URL that is not
+  `ws://` / `wss://`, `GH_NETWORK` other than `xrpl` / `xahau`) prints a message that **names the variable** and stops the
+  process with a non-zero exit status. Integers are plain decimal digits: `1.5`, `1e3` and `abc` are rejected.
+- An unset or blank variable takes the default of the table. A variable that may be empty (`GH_API_KEYS`, `GH_CORS_ORIGINS`,
+  `GH_CACHE_CONTROL`, `GH_WORKERS`) is empty when it is set to the empty string.
+- **Env files.** Without `GH_ENV` the toolbox loads `.env` (or `.env.$NODE_ENV` when `NODE_ENV` is set) from the working
+  directory and **refuses to start when that file is missing**. That is what you want when running from source
+  (`cp apps/api/.env.example apps/api/.env`). In containers the variables come from the environment: the images set
+  `NODE_ENV=production` and `GH_ENV=container`, and any non-empty `GH_ENV` skips the file. The `.env` files are git-ignored;
+  only the `.env.example` files are committed.
+- **One network per process.** `GH_NETWORK` selects the node URLs, the native currency (`XRP` / `XAH`), the CTID network id (0 /
+  21337), the markets config and the default ClickHouse database (all in the *network profile*). Run one API and one syncer per
+  network; a node whose `network_id` does not match refuses the boot.
 
-> Note on `NODE_ENV`: when `NODE_ENV=production` and `GH_API_KEYS` is empty, the API logs a
-> loud warning (`GH_API_KEYS is empty in production — the API is UNAUTHENTICATED.`) but does
-> **not** hard-fail, so a deliberately public deployment is still possible.
+## 2. Variables of both services
 
----
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GH_ENV` | unset | Any non-empty value: do not load an env file, the environment is the configuration. Set by both images. |
+| `GH_NETWORK` | `xrpl` | `xrpl` or `xahau`. Also read by `migrate` and `range-ingest`. |
+| `GH_NODE_ENDPOINTS` | the public endpoint of the network (`wss://xrplcluster.com`, `wss://xahau.network`) | Comma separated `ws://` / `wss://` URLs of rippled / xahaud, tried in order with failover. **API:** the live-state endpoints (balances, orders). **Syncer:** the ingest source (and the fee poller). A Xahau process never falls back to an XRPL node. For full-history ingest point it at your own node or at a full-history server such as `wss://s2.ripple.com`. Credentials in a URL are never logged: logs show only `scheme://host:port`. |
+| `GH_HTTP_API_PORT` | API `3001`, syncer `3002` | The main HTTP port: the REST API and the probe (API), the probe (syncer). 1-65535. |
+| `GH_METRICZ_PORT` | `3000` | Prometheus `GET /metricz` on a second HTTP app. 1-65535. |
 
-## 2. Shared ClickHouse configuration (`GH_CLICKHOUSE_*`)
+## 3. ClickHouse client (API, syncer, `migrate`, `range-ingest`)
 
-Read by `clickHouseConfigFromEnv()` in `packages/shared`. **Used by BOTH services.** All
-values are passed to the ClickHouse HTTP client; `maxExecutionTime` and `maxQueryMemoryBytes`
-are applied as per-query safety caps (defense-in-depth against runaway queries / OOM).
+Read by `clickHouseConfigFromEnv`. One ClickHouse server holds one database per network.
 
-| Variable | Required? | Default | Description |
-|---|---|---|---|
-| `GH_CLICKHOUSE_URL` | No | `http://localhost:8123` | ClickHouse HTTP endpoint URL. |
-| `GH_CLICKHOUSE_USER` | No | `default` | ClickHouse username (`username` in config). |
-| `GH_CLICKHOUSE_PASSWORD` | No | `` (empty) | ClickHouse password. **Sensitive** — inject from a secrets manager in production. |
-| `GH_CLICKHOUSE_DATABASE` | No | `xrpl` / `xahau` (the `GH_NETWORK` profile's default) | Database name. Must match `^[a-z_][a-z0-9_]*$`, otherwise startup fails. |
-| `GH_CLICKHOUSE_REQUEST_TIMEOUT` | No | `30000` | HTTP request timeout in **ms**. (`.env.example`: API uses `30000`, syncer uses `60000`.) |
-| `GH_CLICKHOUSE_MAX_CONNECTIONS` | No | `10` | Max concurrent HTTP connections in the client pool (`maxOpenConnections`). (`.env.example`: API `10`, syncer `20`.) |
-| `GH_CLICKHOUSE_MAX_EXECUTION_TIME` | No | `30` | Per-query wall-clock cap in **seconds**. `0` = unlimited / server default. Kills runaway queries. |
-| `GH_CLICKHOUSE_MAX_QUERY_MEMORY` | No | `0` | Per-query memory cap in **bytes** (`maxQueryMemoryBytes`). `0` = use server default. Defends against OOM. |
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GH_CLICKHOUSE_URL` | `http://localhost:8123` | HTTP interface of the server. |
+| `GH_CLICKHOUSE_USER` | `default` | |
+| `GH_CLICKHOUSE_PASSWORD` | empty | A secret. |
+| `GH_CLICKHOUSE_DATABASE` | the network's name (`xrpl` / `xahau`) | Plain lowercase identifier (`^[a-z_][a-z0-9_]*$`): it is written into DDL. |
+| `GH_CLICKHOUSE_REQUEST_TIMEOUT` | `30000` | Client request timeout, ms. |
+| `GH_CLICKHOUSE_MAX_CONNECTIONS` | `10` | Connections in the client pool. |
+| `GH_CLICKHOUSE_MAX_EXECUTION_TIME` | `30` | `max_execution_time` of every SELECT, seconds; 0 = unlimited. Kills runaway queries. |
+| `GH_CLICKHOUSE_MAX_QUERY_MEMORY` | `0` | `max_memory_usage` of every SELECT, bytes; 0 = the server's default. |
 
-> These are read via `??` (unset/empty → default) and then `Number(...)`. A non-numeric
-> value for the numeric fields produces `NaN` (no fail-fast), so keep them numeric.
+The numeric ones are parsed with `Number()` and are not range-checked: a typo gives `NaN` and a client that does not work.
 
----
+## 4. API (`apps/api`)
 
-## 3. API service (`apps/api`)
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GH_API_KEYS` | empty | Comma separated API keys, sent as `X-API-Key` or `Authorization: Bearer`. Empty turns authentication **off**, which is for development only: with `NODE_ENV=production` an empty list fails the boot, and so does a placeholder key (`dev-api-key`, or anything starting with `change-me`, case-insensitive). A secret. |
+| `GH_CORS_ORIGINS` | empty | `*` or comma separated `http(s)://` origins. Empty sends no CORS headers. |
+| `GH_RATE_LIMIT` | `600` | Requests per client address and route per window. |
+| `GH_RATE_LIMIT_WINDOW` | `60` | The window, seconds. |
+| `GH_TRUST_PROXY_HOPS` | `1` | Reverse-proxy hops whose `X-Forwarded-For` is believed for the client address (the key of the rate limit and the `Link` header's scheme). With the shipped nginx in front, leave it at `1`: nginx hands the API exactly one address. Too high a value lets clients spoof their address. |
+| `GH_CACHE_CONTROL` | `public, max-age=60` | `Cache-Control` of successful `/v2/*` responses (printable ASCII); empty sends none. Errors are always `no-store`. |
+| `GH_LIVE_CACHE_TTL_MS` | `10000` | How long the live-node answers (balances, orders) are cached in memory; 0 disables the cache. |
+| `GH_TX_CACHE_SIZE` | `20000` | Serialized transactions (decoded JSON and binary hex) kept in memory by hash, to spare the codec on repeated requests; a transaction never changes so nothing expires; each entry is a few KB. 0 disables. |
+| `GH_SERVICE_NAME`, `GH_SERVICE_DESCRIPTION`, `GH_SERVICE_VERSION` | `data-api`, `Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.`, the package version | The title of the Swagger document (read by the toolbox bootstrap; the API fills in the defaults). Optional. The syncer has no Swagger and ignores them. |
 
-Read by `apiConfigFromEnv()` in `apps/api/src/config/api.config.ts`. All numeric fields are
-validated by `requirePositive` (fail-fast on `NaN` or negative). Plus the shared ClickHouse
-vars from §2.
+## 5. Syncer (`apps/syncer`)
 
-| Variable | Required? | Default | Description |
-|---|---|---|---|
-| `GH_HTTP_API_PORT` | No | `3001` | HTTP port for the REST API, Swagger docs (`/internal/docs`), and metrics (`/metricz`). Numeric, fail-fast. |
-| `GH_CORS_ORIGINS` | No | `` (empty → CORS disabled) | Comma-separated list of allowed CORS origins. Trimmed; empties filtered. If empty, `enableCors` is **not** called (no CORS headers). |
-| `GH_API_KEYS` | No (but see note) | `` (empty → auth disabled) | Comma-separated accepted API keys. Clients send one as `X-API-Key:` or `Authorization: Bearer`. Empty array = authentication disabled (dev only). Empty in `production` logs a warning. **Sensitive.** |
-| `GH_RATE_LIMIT` | No | `120` (code) / `600` (`.env.example`) | Per-client request budget per window. Numeric, fail-fast. |
-| `GH_RATE_LIMIT_WINDOW` | No | `60` | Rate-limit window in **seconds**. Numeric, fail-fast. |
-| `GH_TRUST_PROXY_HOPS` | No | `1` | Number of reverse-proxy hops to trust for `X-Forwarded-For` (Express `trust proxy`). The service runs behind the GateHub proxy (TLS termination); `1` trusts that single hop. Numeric, fail-fast. |
-| `GH_LIVE_CACHE_TTL_MS` | No | `10000` | TTL (ms) for cached live-XRPL responses (account balances / open orders). `0` disables caching. Numeric, fail-fast. |
-| `GH_TX_CACHE_SIZE` | No | `20000` | Transactions whose serialized form (decoded JSON and binary hex) the API keeps in memory by hash, so repeated requests do not re-run the binary codec (0.7-1.5 ms per transaction). A transaction never changes, so entries do not expire; each is a few KB. `0` disables the cache. Non-negative integer, fail-fast. |
-| `GH_XRPL_NODE_ENDPOINT` | No | `wss://xrplcluster.com` | XRPL node used for live account state (balances, open orders). |
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GH_VALIDATION_ENDPOINTS` | the value of `GH_NODE_ENDPOINTS` | Nodes the validations collector subscribes to, one client per endpoint (each is a distinct reporter). Use several independent nodes for a good validations picture. |
+| `GH_WORKERS` | `ingest,validations,fee_stats,aggregator` | Comma separated subset of the four workers; empty runs none. An unknown name fails the boot (`Unknown worker "x"`). Run **exactly one syncer per network and database**; see [syncer](syncer.md). |
+| `GH_SYNC_START_LEDGER` | unset: the validated head at the first boot | Where the very first run starts. **Ignored once the database has a committed ledger.** |
+| `GH_LEDGER_FETCH_TIMEOUT_MS` | `120000` | Timeout of one expanded `ledger` request (a busy ledger is big). |
+| `GH_CATCHUP_CONCURRENCY` | `8` | Ledgers fetched in parallel while catching up (and by `range-ingest`). Raise it with your own node; public clusters need less. |
+| `GH_CATCHUP_FLUSH_LEDGERS` | `300` | A catch-up batch is written when it holds this many ledgers ... |
+| `GH_CATCHUP_FLUSH_TXS` | `100000` | ... or this many transactions ... |
+| `GH_CATCHUP_FLUSH_MS` | `5000` | ... or when its first ledger is this old, whichever comes first. In live mode every ledger is its own commit. |
+| `GH_RUN_MIGRATIONS_ON_BOOT` | `false` | Apply the schema before the workers start (`true`/`1`/`false`/`0`). Convenient for a single dev process; the compose files leave it `false` because the `migrate-<network>` job owns the schema. |
+| `GH_MAX_LAG_HEALTHY` | `10` | `/liveliness/healthz` answers 503 when the ingest lag (validated head minus committed checkpoint, in ledgers) stays above this for more than 60 s. |
+| `GH_MARKETS_CONFIG` | the file shipped as `config/markets/<network>.json` | Path of the markets config (versioned list of trade markets and payment currencies) of the aggregator's volume jobs. Per network: with two syncers use two files. Empty counts as unset. |
 
-### Service / logger / runtime variables (used by `@gatehub/toolbox` + Nest)
+## 6. Other variables
 
-These appear in `apps/api/.env.example` and are consumed by the GateHub toolbox
-logger/bootstrap layer and Nest's standard runtime (they are **not** read by
-`apiConfigFromEnv()` directly, so no in-repo default is coded for them):
+| Variable | Read by | Default | Meaning |
+| --- | --- | --- | --- |
+| `GH_SCHEMA_DIR` | `migrate` (and `GH_RUN_MIGRATIONS_ON_BOOT`) | the `schema/` folder of the shared package | Directory of the `*.sql` migrations. Only for tests and experiments. |
+| `NODE_ENV` | both | `production` in the images | `production` also switches on the keyless-boot guard of the API and makes the toolbox look for `.env.production` unless `GH_ENV` is set. The dev compose runs the API with `NODE_ENV=development` so that its `dev-api-key` is allowed. |
+| `NPM_TOKEN` | **build only** | | The npm token of the private `@gatehub/toolbox`. Needed to `pnpm install` and to build the images; it is handed to the build as a BuildKit **secret** (compose `build.secrets`), never as a build argument or environment variable of the image, and is in no layer. See [development](development.md#npm-access). |
 
-| Variable | Required? | Default (template) | Description |
-|---|---|---|---|
-| `GH_SERVICE_NAME` | No | `data-api` | Service name used in logs / metrics / OpenAPI metadata. |
-| `GH_SERVICE_VERSION` | No | `0.0.1` | Service version label. |
-| `GH_SERVICE_DESCRIPTION` | No | `GateHub XRPL Data API` | Human-readable service description. |
-| `GH_LOGGER_FORMAT` | No | `pretty` (dev) / `structured` (prod) | Log output format. |
-| `GH_LOGGER_LEVEL` | No | `debug` (dev) / `info` (prod) | Minimum log level. |
-| `NODE_ENV` | No | `production` (set by Dockerfile) | Standard Node env. Drives the empty-`GH_API_KEYS` production warning and Nest behavior. |
+## 7. Compose-level variables
 
-> **Open (unauthenticated) paths:** regardless of `GH_API_KEYS`, the API key guard always
-> allows `/liveliness/*`, `/metricz`, and `/internal/docs*`.
+These are read by `docker compose` for interpolation, not by the applications. The production compose turns them into the
+variables above, per network.
 
----
+| Variable | Used in | Default | Becomes |
+| --- | --- | --- | --- |
+| `XRPL_NODE_ENDPOINTS`, `XAHAU_NODE_ENDPOINTS` | prod, dev | `wss://xrplcluster.com`, `wss://xahau.network` | `GH_NODE_ENDPOINTS` of the network's syncer **and** api |
+| `XRPL_VALIDATION_ENDPOINTS`, `XAHAU_VALIDATION_ENDPOINTS` | prod, dev | empty (= the node endpoints) | `GH_VALIDATION_ENDPOINTS` of the syncer |
+| `XRPL_SYNC_START_LEDGER`, `XAHAU_SYNC_START_LEDGER` | prod, dev | empty (= the validated head) | `GH_SYNC_START_LEDGER` of the syncer |
+| `XRPL_MARKETS_CONFIG`, `XAHAU_MARKETS_CONFIG` | prod | empty (= the shipped file) | `GH_MARKETS_CONFIG` of the syncer; the file must be mounted into the container (a commented `volumes:` line shows how) |
+| `GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD` | prod, dev | prod: `data_api` and **required**; dev: `default` and empty | The ClickHouse server's user (`CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`) and the login of every client |
+| `GH_API_KEYS` | prod, dev | prod: **required**; dev: `dev-api-key` | `GH_API_KEYS` of the apis |
+| `IMAGE_TAG` | prod, dev | prod `latest`, dev `dev` | tag of the locally built `gatehub/data-api` and `gatehub/data-syncer` images |
+| `TRUSTED_PROXIES` | prod (nginx) | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Comma separated addresses / CIDRs of the front proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` nginx believes. `0.0.0.0/0` and any zero prefix length are refused. **Set it to your front proxy** (see [security](security.md)). |
+| `NGINX_BIND`, `NGINX_PORT` | prod (nginx) | `0.0.0.0`, `8080` | Where nginx is published on the host. Bind it to an interface only the front proxy can reach. |
 
-## 4. Syncer service (`apps/syncer`)
+### Which service gets which variables (production compose)
 
-Read by `syncerConfigFromEnv()` in `apps/syncer/src/config/syncer.config.ts`. Numeric fields
-use the lenient `num()` helper (unset/empty/`NaN` → coded default). Plus the shared ClickHouse
-vars from §2.
+`docker-compose.prod.yaml` does not hand the whole `deploy/.env.prod` to any container: the file is only the `--env-file` for
+interpolation, and each service lists the variables it needs, so a secret reaches only the services that use it. A listed
+variable that is unset in the file is not passed on and the application's own default applies.
 
-| Variable | Required? | Default | Description |
-|---|---|---|---|
-| `GH_XRPL_NODE_ENDPOINT` | **Yes** | — (throws if missing/empty) | XRPL node WebSocket endpoint to fetch ledgers from. A mainnet full-history node is recommended for a long backfill. |
-| `GH_XRPL_NETWORK_ID` | No | `0` (Mainnet) | XRPL network ID used when computing CTIDs. `NetworkId`: `0`=Mainnet, `1`=Testnet, `2`=Devnet. Also read independently by `networkIdFromEnv()` (defaults to `NetworkId.Mainnet`). |
-| `GH_RUN_MIGRATIONS_ON_BOOT` | No | `true` | Run schema migrations on boot. **Disabled only by the literal string `false`** (`!== 'false'`); any other value (including unset) = `true`. All DDL is `IF NOT EXISTS`, so it is safe. |
-| `GH_BACKFILL_ENABLED` | No | `false` (code) / `true` (`.env.example`) | Enable historical backfill. **Enabled only by the literal string `true`** (`=== 'true'`). |
-| `GH_BACKFILL_START_LEDGER` | No | `undefined` | First ledger of the backfill range (inclusive). Numeric; empty → `undefined`. |
-| `GH_BACKFILL_END_LEDGER` | No | `undefined` | Last ledger of the backfill range (inclusive). Numeric; empty → `undefined`. |
-| `GH_BACKFILL_WORKERS` | No | `8` (code) / `12` (`.env.example`) | Concurrent ledger fetchers. Raise with your own node; public clusters need fewer. |
-| `GH_BACKFILL_BATCH_LEDGERS` | No | `500` (code) / `1000` (prod example) | Buffer this many ledgers before one batched INSERT per table. Fewer, bigger writes reduce ClickHouse load and avoid "too many parts". 500–2000 is a good range. |
-| `GH_BACKFILL_SHARD_INDEX` | No | `0` | This instance's slice index when sharding the range across N instances (`shardIndex`). Instance *i* sets `SHARD_INDEX=i`. |
-| `GH_BACKFILL_SHARD_TOTAL` | No | `1` | Total number of shards/instances (`shardTotal`); the `[start,end]` range is split into N contiguous slices. |
-| `GH_SUBSCRIBE_LIVE` | No | `false` (code) / `true` (`.env.example`) | Subscribe to live ledgers as they close. **Enabled only by the literal string `true`** (`=== 'true'`). Can run alongside or instead of backfill. |
-| `GH_FETCH_THROTTLE_MS` | No | `100` | Throttle (ms) between ledger fetches per worker, to respect node rate limits. Set to `0` when pointing at your own full-history node. |
-| `GH_HTTP_API_PORT` | No | `3002` | HTTP port for the liveliness probe (`/liveliness/healthz`) and Prometheus metrics (`/metricz`). Read directly in `main.ts` as `process.env.GH_HTTP_API_PORT ?? 3002`. |
+| Service | Variables it gets |
+| --- | --- |
+| `migrate-xrpl`, `migrate-xahau` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_NETWORK` |
+| `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
+| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning, `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`; `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
+| `clickhouse` | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` (from `GH_CLICKHOUSE_USER` / `_PASSWORD`) |
+| `nginx` | `TRUSTED_PROXIES`, and the fixed `NGINX_ENVSUBST_*` of the template |
 
-The syncer also reads the same `GH_SERVICE_*` / `GH_LOGGER_*` / `NODE_ENV` toolbox variables
-described in §3 (template values: `GH_SERVICE_NAME=data-syncer`,
-`GH_SERVICE_DESCRIPTION="GateHub XRPL syncer"`).
+The dev compose ([development](development.md)) takes `GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD`, `GH_API_KEYS` and the
+`XRPL_*` / `XAHAU_*` variables from the environment of your shell, with the development defaults above; it does not read
+`apps/*/.env` (those files are for running the apps from source).
 
-> **Boolean parsing gotcha:** `GH_BACKFILL_ENABLED` and `GH_SUBSCRIBE_LIVE` are `true` only
-> when set to the exact string `true`. `GH_RUN_MIGRATIONS_ON_BOOT` is the inverse — `false`
-> only when set to the exact string `false`.
+## 8. Sensitive values
 
----
+Treat these as secrets and inject them from a secrets manager (or the environment of the deployment tool), never commit them:
+`GH_API_KEYS`, `GH_CLICKHOUSE_PASSWORD`, node endpoints that carry credentials, and `NPM_TOKEN`. The `.env.example` and
+`deploy/.env.prod.example` files hold placeholders only (`change-me-...`); the API refuses to start in production with a
+placeholder key, but there is no such guard for `GH_CLICKHOUSE_PASSWORD`. Rotation steps are in
+[operations](operations.md#routine-tasks).
 
-## 5. Sensitive values & secrets-manager guidance
+## 9. Examples
 
-The following must be treated as secrets and **never committed**:
+**Local development, from source** (`apps/api/.env` and `apps/syncer/.env`, see the `.env.example` next to each):
 
-| Secret | Where | Notes |
-|---|---|---|
-| `GH_API_KEYS` | API runtime | Comma-separated live API keys (e.g. `key_live_aaa,key_live_bbb`). Inject from a secrets manager; rotate periodically. Empty in production = unauthenticated API (logs a warning). |
-| `GH_CLICKHOUSE_PASSWORD` | Both services (runtime) | ClickHouse password. Inject from a secrets manager. |
-| `NPM_TOKEN` | **Build time only** | npm auth token for the private `@gatehub/toolbox` dependency. Used in `.npmrc` (`//registry.npmjs.org/:_authToken=${NPM_TOKEN}`) and passed to the Docker build as `ARG NPM_TOKEN` / `ENV npm_read_token=$NPM_TOKEN`. It is **not** needed at runtime and must not be baked into the final image layer. |
-
-Guidance:
-
-- `.env` / `.env.*` are git-ignored; only `*.env.example` templates are committed.
-- In production, inject all runtime variables (especially the secrets above) from Vault / AWS
-  Secrets Manager / Kubernetes secrets. `deploy/.env.prod.example` is a template only — copy
-  to `deploy/.env.prod` and fill in, or feed equivalent values from your secrets manager.
-- TLS is terminated by the GateHub reverse proxy in front of the API; the API speaks plain
-  HTTP and trusts the proxy's `X-Forwarded-For` (see `GH_TRUST_PROXY_HOPS`).
-
----
-
-## 6. Example environment blocks
-
-### 6.1 Minimal local dev
-
-**`apps/api/.env`**
-
-```dotenv
-GH_HTTP_API_PORT=3001
-# Auth + CORS disabled for local dev:
-GH_API_KEYS=
-GH_CORS_ORIGINS=
-GH_XRPL_NODE_ENDPOINT=wss://xrplcluster.com
-
+```bash
+# apps/api/.env
+GH_NETWORK=xrpl
+GH_API_KEYS=            # empty = no authentication (development only)
 GH_CLICKHOUSE_URL=http://localhost:8123
-GH_CLICKHOUSE_USER=default
-GH_CLICKHOUSE_PASSWORD=
-GH_CLICKHOUSE_DATABASE=xrpl
-```
 
-**`apps/syncer/.env`**
-
-```dotenv
-GH_HTTP_API_PORT=3002
-GH_XRPL_NODE_ENDPOINT=wss://xrplcluster.com   # required
-GH_XRPL_NETWORK_ID=0
-
-GH_RUN_MIGRATIONS_ON_BOOT=true
-GH_SUBSCRIBE_LIVE=true
-GH_BACKFILL_ENABLED=false
-GH_FETCH_THROTTLE_MS=100
-
+# apps/syncer/.env
+GH_NETWORK=xrpl
+GH_SYNC_START_LEDGER=   # empty = start at the validated head
 GH_CLICKHOUSE_URL=http://localhost:8123
-GH_CLICKHOUSE_USER=default
-GH_CLICKHOUSE_PASSWORD=
-GH_CLICKHOUSE_DATABASE=xrpl
-```
-
-### 6.2 Production
-
-Inject these from a secrets manager (placeholder secrets shown). Based on
-`deploy/.env.prod.example`.
-
-**API (production)**
-
-```dotenv
-NODE_ENV=production
-
-# shared ClickHouse
-GH_CLICKHOUSE_URL=http://clickhouse:8123
-GH_CLICKHOUSE_DATABASE=xrpl
-GH_CLICKHOUSE_USER=data_api
-GH_CLICKHOUSE_PASSWORD=<from-secrets-manager>
-GH_CLICKHOUSE_MAX_CONNECTIONS=10
-GH_CLICKHOUSE_MAX_EXECUTION_TIME=30
-GH_CLICKHOUSE_MAX_QUERY_MEMORY=0
-
-# API
-GH_HTTP_API_PORT=3001
-GH_API_KEYS=<from-secrets-manager>          # e.g. key_live_aaa,key_live_bbb
-GH_CORS_ORIGINS=https://app.gatehub.net
-GH_RATE_LIMIT=600
-GH_RATE_LIMIT_WINDOW=60
-GH_TRUST_PROXY_HOPS=1
-GH_LIVE_CACHE_TTL_MS=10000
-GH_TX_CACHE_SIZE=20000
-GH_XRPL_NODE_ENDPOINT=wss://xrplcluster.com
-
-# logging
-GH_LOGGER_FORMAT=structured
-GH_LOGGER_LEVEL=info
-```
-
-**Syncer (production)**
-
-```dotenv
-NODE_ENV=production
-
-# shared ClickHouse
-GH_CLICKHOUSE_URL=http://clickhouse:8123
-GH_CLICKHOUSE_DATABASE=xrpl
-GH_CLICKHOUSE_USER=data_api
-GH_CLICKHOUSE_PASSWORD=<from-secrets-manager>
-GH_CLICKHOUSE_MAX_CONNECTIONS=20
-GH_CLICKHOUSE_REQUEST_TIMEOUT=60000
-GH_CLICKHOUSE_MAX_EXECUTION_TIME=30
-GH_CLICKHOUSE_MAX_QUERY_MEMORY=0
-
-# syncer
-GH_HTTP_API_PORT=3002
-GH_XRPL_NODE_ENDPOINT=wss://xrplcluster.com   # required
-GH_XRPL_NETWORK_ID=0
 GH_RUN_MIGRATIONS_ON_BOOT=true
-GH_BACKFILL_ENABLED=true
-GH_BACKFILL_START_LEDGER=
-GH_BACKFILL_END_LEDGER=
-GH_BACKFILL_WORKERS=12
-GH_BACKFILL_BATCH_LEDGERS=1000
-GH_BACKFILL_SHARD_INDEX=0
-GH_BACKFILL_SHARD_TOTAL=1
-GH_SUBSCRIBE_LIVE=true
-GH_FETCH_THROTTLE_MS=0                          # 0 when using your own full-history node
-
-# logging
-GH_LOGGER_FORMAT=structured
-GH_LOGGER_LEVEL=info
 ```
 
----
+**Production**, per network, through `deploy/.env.prod` (copy `deploy/.env.prod.example`; the example lists every variable
+with a comment):
 
-## 7. Cross-reference: performance & security knobs
+```bash
+GH_CLICKHOUSE_USER=data_api
+GH_CLICKHOUSE_PASSWORD=<secret>
+GH_API_KEYS=<key1>,<key2>
+XRPL_NODE_ENDPOINTS=wss://your-own-node:6006,wss://s2.ripple.com
+XRPL_VALIDATION_ENDPOINTS=wss://s1.ripple.com,wss://s2.ripple.com
+XAHAU_NODE_ENDPOINTS=wss://xahau.network
+TRUSTED_PROXIES=<address of your front proxy>
+NGINX_BIND=<interface only the front proxy reaches>
+```
 
-### Performance-affecting variables
+## 10. Performance and security knobs
 
-| Variable | Service | Effect |
-|---|---|---|
-| `GH_BACKFILL_WORKERS` | syncer | Concurrent ledger fetchers — more = faster backfill, but more node/CH pressure. |
-| `GH_BACKFILL_BATCH_LEDGERS` | syncer | Ledgers buffered per batched INSERT — bigger batches = fewer, larger writes, less CH load. |
-| `GH_BACKFILL_SHARD_INDEX` / `GH_BACKFILL_SHARD_TOTAL` | syncer | Horizontal scaling across N instances over contiguous range slices. |
-| `GH_FETCH_THROTTLE_MS` | syncer | Per-worker delay between fetches; `0` for your own node, higher for rate-limited public clusters. |
-| `GH_CLICKHOUSE_MAX_CONNECTIONS` | both | Client connection pool size. |
-| `GH_CLICKHOUSE_REQUEST_TIMEOUT` | both | HTTP request timeout (ms). |
-| `GH_CLICKHOUSE_MAX_EXECUTION_TIME` | both | Per-query wall-clock cap (s) — kills runaway queries. |
-| `GH_CLICKHOUSE_MAX_QUERY_MEMORY` | both | Per-query memory cap (bytes) — OOM defense. |
-| `GH_LIVE_CACHE_TTL_MS` | API | Caches live-XRPL responses; higher = fewer XRPL round-trips. |
+| Concern | Variables |
+| --- | --- |
+| Query cost and memory | `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `GH_CLICKHOUSE_MAX_QUERY_MEMORY`, `GH_CLICKHOUSE_MAX_CONNECTIONS` |
+| API CPU and latency | `GH_TX_CACHE_SIZE`, `GH_LIVE_CACHE_TTL_MS`, `GH_CACHE_CONTROL` |
+| Ingest speed | `GH_CATCHUP_CONCURRENCY`, `GH_CATCHUP_FLUSH_LEDGERS`, `GH_CATCHUP_FLUSH_TXS`, `GH_CATCHUP_FLUSH_MS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, the node you point at |
+| Abuse and exposure | `GH_API_KEYS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_TRUST_PROXY_HOPS`, `GH_CORS_ORIGINS`, `TRUSTED_PROXIES`, `NGINX_BIND` |
+| Health | `GH_MAX_LAG_HEALTHY` |
 
-### Security-affecting variables
+## Keeping this page true
 
-| Variable | Service | Effect |
-|---|---|---|
-| `GH_API_KEYS` | API | Authentication. Empty = unauthenticated API (warned in production). |
-| `GH_CORS_ORIGINS` | API | CORS allowlist; empty disables CORS entirely. |
-| `GH_RATE_LIMIT` / `GH_RATE_LIMIT_WINDOW` | API | Per-client rate limiting (client identified via trusted `X-Forwarded-For`). |
-| `GH_TRUST_PROXY_HOPS` | API | How many proxy hops to trust for client IP — must match the real proxy depth or rate limiting / logging will use the wrong IP. |
-| `GH_CLICKHOUSE_PASSWORD` | both | Database credential (secret). |
-| `NPM_TOKEN` | build | Private registry credential (build-time secret). |
-| `GH_CLICKHOUSE_MAX_EXECUTION_TIME` / `GH_CLICKHOUSE_MAX_QUERY_MEMORY` | both | Defense-in-depth resource caps limiting the blast radius of abusive/expensive queries. |
+The variables of sections 2 to 6 are the properties of `ApiConfig` and `SyncerConfig`, the `env.GH_*` reads of
+`clickhouse.config.ts` and the few reads in `network-profile.ts`, `migrate.ts` and `service-info.ts`. After changing a config
+class, list what the built code reads and compare:
+
+```bash
+pnpm build
+node -e "
+require('reflect-metadata');
+const names = (Cls) => (Reflect.getMetadata('opts', Cls) || []).map((k) => {
+  const e = (k.options && k.options.path) || k.propertyName.replace(/([A-Z])/g, '_\$1').toUpperCase();
+  return e.startsWith('GH_') ? e : 'GH_' + e;
+});
+console.log('api   ', names(require('./apps/api/dist/config/api.config.js').ApiConfig).join(' '));
+console.log('syncer', names(require('./apps/syncer/dist/config/syncer.config.js').SyncerConfig).join(' '));
+"
+grep -o 'env\.GH_[A-Z_]*' packages/shared/src/clickhouse/clickhouse.config.ts | sort -u
+```
+
+Every name printed must have a row in this page (and in the matching `.env.example`), and every `GH_*` name in a row must be
+printed or be one of `GH_ENV`, `GH_MARKETS_CONFIG`, `GH_SCHEMA_DIR`, `GH_SERVICE_*`.

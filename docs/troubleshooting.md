@@ -1,159 +1,192 @@
 # Troubleshooting
 
-Concrete failures encountered building and running this system, each with the symptom, the
-root cause, and the fix. These are real — not hypothetical — and several are now guarded
-against in code/config.
+Concrete failures encountered building and running this system, each with the symptom, the root cause and the fix. Operational
+playbooks are in [operations](operations.md); this page is the lookup table for error messages.
 
-## Build & packaging
+## Build and packaging
 
 ### `tsc` emits nothing / `Cannot find module '@gatehub/data-api-shared'`
-**Symptom:** a clean Docker build fails the API typecheck with 26 `Cannot find module`
-errors, even though `pnpm build` works locally. Or locally, a rebuild produces a near-empty
-`dist/`.
+**Symptom:** a clean Docker build fails the API type check with many `Cannot find module` errors although `pnpm build` works locally, or
+a local rebuild produces a near-empty `dist/`.
 
-**Root cause:** TypeScript `incremental`/`composite` writes a `*.tsbuildinfo`. If a stale one
-is present (it was being copied into the Docker context) while `dist` is absent/wiped, `tsc`
-thinks outputs are current and **emits nothing**. The shared lib's `dist/index.d.ts` is then
-missing, so the API can't resolve its types.
+**Root cause:** TypeScript writes a `*.tsbuildinfo`; a stale one next to a missing `dist` makes `tsc` believe the output is current and
+emit nothing (nest's `deleteOutDir` is the trap). The shared package's `dist/index.d.ts` is then missing.
 
-**Fix:** `**/*.tsbuildinfo` is in [`.dockerignore`](../.dockerignore); `incremental` was
-removed from the base tsconfig. Locally, if you hit it: delete `*.tsbuildinfo` and `dist`,
-rebuild. (nest's `deleteOutDir` + incremental is the underlying trap.)
+**Fix:** `**/*.tsbuildinfo` is in [`.dockerignore`](../.dockerignore) and git-ignored. Locally delete `*.tsbuildinfo` and `dist` and rebuild.
 
 ### Docker build: workspace package not found after `pnpm install`
-**Symptom:** `pnpm install` in one `RUN` layer, build in the next → the shared package's
-symlink isn't resolvable.
-
-**Root cause:** pnpm's workspace symlinks don't survive across separate BuildKit layers.
-
-**Fix:** the Dockerfiles do `pnpm install && … build && … deploy` in **one `RUN`**.
+**Root cause:** pnpm workspace symlinks do not survive across BuildKit layers. **Fix:** the Dockerfiles do install, build and deploy in one `RUN`.
 
 ### `ERR_PNPM_DEPLOY_NONINJECTED_WORKSPACE`
-**Symptom:** `pnpm deploy` fails at the end of the build.
+**Root cause:** pnpm 10 refuses `deploy` without injected workspaces. **Fix:** `pnpm ... --legacy deploy --prod /app/out` (the Dockerfiles do).
 
-**Root cause:** pnpm v10 refuses `deploy` without injected workspaces by default.
+### Docker build: `secret npm_token: not found` / `the npm_token secret is empty`
+**Symptom:** `docker compose build` (or `docker build`) stops at the install `RUN`.
 
-**Fix:** the Dockerfiles use `pnpm … --legacy deploy --prod /app/out`.
+**Root cause:** the npm token of the private `@gatehub/toolbox` is a **BuildKit secret**, read from the `NPM_TOKEN` environment variable
+(compose: `secrets.npm_token.environment: NPM_TOKEN`). It is not a build argument, and not read from `~/.npmrc`.
 
-### `.env` not loaded → service uses default config
-**Symptom:** the service connects to `localhost` ClickHouse / has no API keys despite a
-populated `.env`.
+**Fix:** `export NPM_TOKEN=...` in the shell that runs the build (`NPM_TOKEN=... docker compose build`), or
+`docker build --secret id=npm_token,env=NPM_TOKEN ...`. Do not copy the token out of `~/.npmrc` or pass it as a build argument: the
+secret is in no layer and `docker history` shows nothing. A `404`/`401` for `@gatehub/toolbox` during install means the token cannot read it.
 
-**Root cause:** nothing loaded the `.env` file.
+### `pnpm install` fails with 404/401 for `@gatehub/toolbox`
+**Root cause:** the package is private and pnpm has no token. **Fix:** [development](development.md#npm-access) (log in to npm, or reference
+`${NPM_TOKEN}` from your user-level `~/.npmrc`). The committed `.npmrc` does not carry the token.
 
-**Fix:** both `main.ts` import `dotenv/config` as the first import. `node dist/main.js` must
-run from the service dir (or use `pnpm --filter … start:prod`) so `dotenv` finds `.env`.
+### `Env file not found: .env.production` (or `.env`)
+**Symptom:** the service dies right at boot, before any log line of its own.
 
-### Query params rejected / `limit must be an integer`
-**Symptom:** `?limit=200` → 400 "must be an integer / not greater than 1000".
+**Root cause:** the toolbox config loader reads `.env` (or `.env.$NODE_ENV`) from the working directory and refuses to start without it,
+unless `GH_ENV` is set to any value. The images set `GH_ENV=container`; running `node dist/main.js` by hand with `NODE_ENV=production` and
+no `GH_ENV` hits this.
 
-**Root cause:** query strings are strings; class-transformer didn't coerce.
+**Fix:** from source copy `apps/<app>/.env.example` to `.env` and run from the package folder; in a container or CI set `GH_ENV=container`
+and put the variables in the environment.
 
-**Fix:** numeric DTO fields use `@Type(() => Number)`.
+### `process exits: GH_DATABASE_...` when importing the toolbox
+**Root cause:** the package root of `@gatehub/toolbox` registers its own database and queue configuration. **Fix:** import
+`@gatehub/toolbox/lib/<module>` (as `api.config.ts` does), never the package root.
 
-## Containers & compose
+### `ERR_REQUIRE_ESM` / `require() of ES Module` at boot
+**Root cause:** Node older than 20.19 (22.12 on the 22 line): `ripple-binary-codec` 2.x pulls ES-module-only dependencies with `require(esm)`.
+**Fix:** Node >= 20.19 (the images pin `node:22.23.2-bookworm-slim`; do not go back to a floating `node:20` tag).
 
-### `docker compose` "variable is not set" / interpolation error
-**Symptom:** `required variable GH_CLICKHOUSE_PASSWORD is missing a value`.
+### A GH_* value rejected at boot
+**Symptom:** `GH_CATCHUP_CONCURRENCY must be a positive integer`, `GH_NODE_ENDPOINTS must be a comma separated list of ws:// or wss:// URLs`,
+`GH_NETWORK must be xrpl or xahau`, `Unknown worker "x"`. **Fix:** the message names the variable; see [configuration](configuration.md).
+Integers are plain digits (`1.5`, `1e3` are rejected).
 
-**Root cause:** service-level `env_file:` populates the *container's* env, but `${…}`
-**interpolation in the compose file** is resolved only from your shell or `--env-file`.
+## Containers and compose
 
-**Fix:** pass `--env-file deploy/.env.prod` to the compose command, and `export NPM_TOKEN`.
-All compose subcommands (`ps`, `stop`, `logs`, `down`) need `--env-file` too.
+### `docker compose`: "variable is not set" / `required variable ... is missing a value`
+**Root cause:** `${...}` interpolation in a compose file is resolved from your shell or `--env-file`, not from a service's environment.
+`GH_CLICKHOUSE_PASSWORD` and `GH_API_KEYS` are required in the production compose.
+
+**Fix:** pass `--env-file deploy/.env.prod` to **every** compose subcommand (`up`, `ps`, `logs`, `down`, `run`), and `export NPM_TOKEN` for builds.
+
+### The API container exits: `GH_API_KEYS must be set in production` / `contains a placeholder key`
+**Root cause:** the images run with `NODE_ENV=production`, where an empty key list, `dev-api-key`, or a key starting with `change-me` is refused.
+**Fix:** real keys in `deploy/.env.prod`. The dev compose runs its API with `NODE_ENV=development` so `dev-api-key` works there.
 
 ### Containers show `(unhealthy)` but the service works
-**Symptom:** every api/syncer container is "unhealthy"; the app serves fine.
+**Root cause 1:** an old healthcheck used `wget`, which the slim image does not have; the current ones use Node's `fetch`.
+**Root cause 2 (syncer):** the syncer opens its probe port only once its node connection is up, and answers 503 while it is more than
+`GH_MAX_LAG_HEALTHY` ledgers behind for over a minute (catch-up, backfill). `unhealthy` is informational; compose restarts nothing on it.
+**Fix:** check the probe body (`curl localhost:3002/liveliness/healthz` inside the network): `state`, `lag`, `last_commit_age`.
 
-**Root cause:** the healthcheck used `wget`, which **isn't in `node:20-bookworm-slim`**.
-
-**Fix:** the compose healthchecks use Node's global fetch:
-`node -e "fetch('http://localhost:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`.
-
-### ClickHouse Keeper stuck "unhealthy" → ClickHouse won't start
-**Symptom:** `Container ch-keeper Error dependency ... failed to start`; Keeper logs show it's
-actually "Ready for connections".
-
-**Root cause:** the healthcheck `echo ruok | nc localhost 9181` **hung** — this image's `nc`
-has no `-q` flag and no timeout, so it waited forever and timed out.
-
-**Fix:** `echo ruok | nc -w1 127.0.0.1 9181 | grep -q imok`.
+### ClickHouse Keeper stuck "unhealthy" -> ClickHouse will not start
+**Root cause:** the healthcheck `echo ruok | nc localhost 9181` hung; this image's `nc` has no `-q`. **Fix:**
+`echo ruok | nc -w1 127.0.0.1 9181 | grep -q imok` (the compose file has it).
 
 ### ClickHouse healthy but peers get `ECONNREFUSED` on :8123
-**Symptom:** ClickHouse passes its own `/ping` healthcheck (localhost) but the migrate/api
-containers can't connect to `clickhouse:8123`.
-
-**Root cause:** mounting our `config.d` directory **shadowed the image's
-`docker_related_config.xml`**, which is what makes ClickHouse `listen_host = 0.0.0.0`. Without
-it, ClickHouse binds to localhost only and rejects peer containers.
-
+**Root cause:** mounting our `config.d` shadowed the image's `docker_related_config.xml`, which sets `listen_host = 0.0.0.0`.
 **Fix:** `deploy/clickhouse/config.d/cluster.xml` sets `<listen_host>0.0.0.0</listen_host>`.
 
-### Host seeder can't reach ClickHouse in the prod compose
-**Symptom:** `load/seed.js` gets connection refused against `localhost:8123`.
+### The migrate job fails on an old ClickHouse volume
+**Symptom:** `Missing columns: 'checksum'`, `Unknown identifier`/`no such column` in later queries, or the schema looks wrong.
 
-**Root cause:** the prod compose deliberately does **not** publish ClickHouse to the host.
+**Root cause:** the volume was created by the previous stack (`001_tables.sql` / `002_materialized_views.sql`). The baseline replaced them;
+`CREATE TABLE IF NOT EXISTS` skips old tables of the same name, and the old `schema_migrations` has no `checksum` column.
 
-**Fix:** for load testing only, add `-f docker-compose.prod.override.yaml` (publishes 8123).
-Never in production.
+**Fix (local, throw-away data):** `docker compose down -v`, then `up` again so the migrate job creates a clean database. There is no
+in-place migration; re-ingest with the syncer and `range-ingest` ([deployment](deployment.md#cutover-on-an-existing-host)).
 
-## Runtime & performance
+### The new syncer refuses to boot (lease) or two syncers write
+**Symptom:** the syncer exits with a message that the lease is held; or an old container is still ingesting.
 
-### ClickHouse `Memory limit (total) exceeded`; API slow with idle replicas
-**Symptom:** under concurrency, p95 balloons to tens of seconds and ~30% of requests fail,
-while the API replicas sit near 0% CPU. ClickHouse logs `Memory limit (total) exceeded`.
+**Root cause:** after moving to the per-network stack the old `migrate` / `syncer` / `api` containers are **orphans** that keep running; a
+syncer's lease (30 s) is held by a live or recently dead holder.
 
-**Root cause:** list endpoints used `... FROM table FINAL`. `FINAL` merge-sorts the whole
-table **per query**; under concurrency it exhausts ClickHouse memory. The API replicas were
-idle because they were *blocked waiting* on ClickHouse.
+**Fix:** `docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --remove-orphans`, or `docker rm -f` the old containers; wait 30 s.
 
-**Fix:** **removed `FINAL` from all list/scan queries** (kept only on selective single-row
-lookups; top-currencies uses `argMax`). Verified: ~30% errors / p95 30s → **0% errors / 178
-req/s / p95 2.9s** at the same load. Plus per-query guards
-(`GH_CLICKHOUSE_MAX_QUERY_MEMORY`, `_MAX_EXECUTION_TIME`). See
-[clickhouse.md](clickhouse.md#the-final-rule).
+### Dev compose: port or container name already in use
+**Root cause:** the dev stack names its ClickHouse `data-api-clickhouse` and publishes 8123/9000, 3001-3004, 3011-3014 on 127.0.0.1; an older
+stack or another service holds them. **Fix:** stop it, or change the port mappings in a compose override.
 
-### Rate limiter throttles everyone as one bucket
-**Symptom:** behind the proxy, all clients share one rate-limit bucket; or a single-IP load
-test gets 429s almost immediately.
+### nginx exits at start / `unknown directive "${TRUSTED_PROXY_DIRECTIVES}"`
+**Root cause:** `16-trusted-proxies.envsh` lost its executable bit (it must stay `chmod +x`; the image sources it before rendering the
+template), or `TRUSTED_PROXIES` has an invalid entry or a zero prefix (`0.0.0.0/0`), which is refused on purpose. **Fix:** restore the mode;
+use plain addresses/CIDRs of your front proxy.
 
-**Root cause:** the throttler keyed on the connecting IP, which behind a proxy is the
-**proxy's** IP for every request.
+### Host seeder cannot reach ClickHouse in the prod compose
+**Root cause:** the prod compose does not publish ClickHouse. **Fix:** for load testing only add `-f docker-compose.prod.override.yaml`
+(publishes 8123). Never in production. The dev compose already publishes it on 127.0.0.1.
 
-**Fix:** `app.set('trust proxy', GH_TRUST_PROXY_HOPS)` so `req.ip` resolves to the real
-client from `X-Forwarded-For`. Note the limit is still **per-replica in-memory** — for a true
-global limit use a shared store (Redis); see [security.md](security.md).
+## Runtime and performance
 
-### `network` volume endpoints reject `start`/`end` with 400
-**Symptom:** `?start=…&end=…` on `/v2/network/payment_volume` → 400.
+### ClickHouse `Memory limit (total) exceeded`; the API is slow with idle replicas
+**Symptom:** under concurrency p95 balloons and requests fail while the API replicas sit at ~0 % CPU; ClickHouse logs `Memory limit (total)
+exceeded`. **Root cause:** a list query with `FINAL` merge-sorts the whole table per request and the replicas wait on ClickHouse.
+**Fix:** no `FINAL` on lists ([ADR-0003](adr/0003-no-final-on-list-queries.md), [clickhouse](clickhouse.md#the-final-rule)); the per-query guards
+`GH_CLICKHOUSE_MAX_QUERY_MEMORY` / `_MAX_EXECUTION_TIME` bound a regression. Also check for unbounded windows (`/v2/exchanges` over all pairs).
 
-**Root cause:** the global `forbidNonWhitelisted` validator rejects params not declared on the
-DTO; `VolumeQueryDto` was missing `start`/`end`.
+### Every client shares one rate-limit bucket
+**Symptom:** all clients get 429 together; a single-IP load test hits 429 almost at once; the logs show the proxy's address for everybody.
 
-**Fix:** added `start`/`end` (`@IsDateString`) to `VolumeQueryDto`.
+**Root cause:** the throttler keys on `req.ip`. If nginx does not recover the real client, or the API trusts the wrong number of hops, `req.ip`
+is the proxy.
 
-### `npm config get` returns empty for the auth token
-**Symptom:** can't read the registry token to pass as `NPM_TOKEN`.
+**Fix:** set `TRUSTED_PROXIES` (deploy/.env.prod) to the address(es) of your **front proxy**, so nginx believes its `X-Forwarded-For`; keep
+`GH_TRUST_PROXY_HOPS=1` (nginx hands the API exactly one address). If clients can reach nginx from a *trusted* address they can pick their own
+address instead: bind nginx (`NGINX_BIND`) to the front proxy's interface. See [deployment](deployment.md#the-edge-nginx). The limit is per replica
+and in memory.
 
-**Root cause:** npm 9+ **redacts** auth tokens from `npm config get`.
+### 401 `Missing or invalid API key.`
+The key goes in a header (`X-API-Key: <key>` or `Authorization: Bearer <key>`), never the query string; it must be one of `GH_API_KEYS`; an empty
+`X-API-Key` falls through to `Authorization`.
 
-**Fix:** read it from the file:
-`export NPM_TOKEN="$(grep '//registry.npmjs.org/:_authToken=' ~/.npmrc | tail -1 | sed 's/.*_authToken=//' | tr -d '"[:space:]')"`.
+### 404 `Cannot GET /v2/...`
+The route does not exist on this API: `/v2/network/top\_currencies` and the old GateHub `/v2/ledgers` list are gone; check the path in
+[api-reference](api-reference.md). Paths ignore case but not spelling (`/v2/exchange_rates`, `/v2/active_accounts`).
+
+### `/v2/ledgers/...` or lists are empty on a fresh database
+Nothing is committed yet, or the window is before the syncer's start ledger (`GH_SYNC_START_LEDGER`, default the validated head at the first
+boot). Check `SELECT min(ledger_index), max(ledger_index) FROM xrpl.ledgers` and backfill history with `range-ingest` ([backfill](backfill.md)).
+`/v2/last_validated` is `500 unavailable` on an empty database.
+
+### Volumes are empty / stats are stale
+`/v2/network/exchange_volume` and `payment_volume` need markets in the markets config (`GH_MARKETS_CONFIG` or `config/markets/<network>.json`); the Xahau
+file ships empty. `/v2/stats` and the volumes are written by the aggregator once a minute; after an outage or on a database with years of
+history the current hour lags until it has caught up (`syncer_aggregator_stats_lag_seconds`).
+
+### `/balances` or `/orders` answer 400 `the date provided is too old`, 404 `account not found` or 500
+They read the live node (`GH_NODE_ENDPOINTS` of the **api**): a date before the first stored ledger or a ledger the node no longer has is the
+400; an address the node does not know is the 404; an unreachable node is the 500 `unable to retrieve balances|orders`. Check the node and the
+api log (`XrplService`).
+
+### Syncer: `Node network_id N does not match GH_NETWORK=...`
+The endpoint belongs to another network (an XRPL node for a Xahau syncer, or the reverse). Fix `GH_NODE_ENDPOINTS` / `XRPL_NODE_ENDPOINTS` /
+`XAHAU_NODE_ENDPOINTS`.
+
+### Syncer: lag does not fall / halted
+See [operations](operations.md#after-an-outage): a node without the history (`complete_ledgers`), ClickHouse refusing writes (`system.mutations`,
+the probe's `recovering`/`error`), a chain break or a lost lease (`state=halted`).
+
+### `api_tx_encode_fallback_total` rises
+A transaction type or field is missing from the binary-codec definitions in use, so those transactions are served as their stored JSON. The
+definitions come from the node's `server_definitions` (at api boot) with the bundled `config/definitions/<network>.json` as fallback: restart
+the api against an up-to-date node, or refresh the bundled file with `record:fixtures`.
+
+### Validations are missing for recent ledgers
+The collector subscribes to the `validations` stream of every node in `GH_VALIDATION_ENDPOINTS` and only sees what those nodes publish; use
+several independent nodes. Check `syncer_validations_flushed_total`, `syncer_validations_dropped_total{reason}` and the `ValidationsCollector` log.
 
 ## Load testing reality check
-A single laptop running the whole stack **plus** the load generator is CPU-bound by the box,
-not the architecture (we saw 56 containers on 16 cores degrade everything). For meaningful
-numbers: run the load generator on a separate machine against a real deployment, raise the
-rate limit, and isolate reads from the syncer. See [operations.md](operations.md#load--capacity-testing).
+
+A laptop running the whole stack plus the load generator is CPU-bound by the box, not the architecture. For meaningful numbers run the generator on
+another machine against a real deployment, raise `GH_RATE_LIMIT`, and keep the syncer from competing. See [load/README.md](../load/README.md).
 
 ## Quick diagnostics
+
 ```bash
 # is ClickHouse reachable from the app network?
-docker run --rm --network <compose-net> curlimages/curl -s -o /dev/null -w '%{http_code}\n' http://clickhouse:8123/ping
+docker compose exec api-xrpl node -e "fetch('http://clickhouse:8123/ping').then(r=>console.log(r.status))"
 
-# what's slow in ClickHouse right now?
-clickhouse-client -q "SELECT query_id, formatReadableSize(memory_usage), elapsed, substring(query,1,80) FROM system.processes ORDER BY memory_usage DESC"
+# what is slow in ClickHouse right now?
+docker compose exec clickhouse clickhouse-client -q "SELECT query_id, formatReadableSize(memory_usage), elapsed, substring(query,1,80) FROM system.processes ORDER BY memory_usage DESC"
 
-# api/syncer health & metrics
-curl -s localhost:3001/liveliness/healthz; curl -s localhost:3001/metricz | grep api_http_requests_total
+# health and metrics (inside the compose network)
+docker compose exec api-xrpl node -e "fetch('http://127.0.0.1:3001/liveliness/healthz').then(r=>r.text()).then(console.log)"
+docker compose exec syncer-xrpl node -e "fetch('http://127.0.0.1:3000/metricz').then(r=>r.text()).then(t=>console.log(t.split('\n').filter(l=>l.startsWith('syncer_')&&!l.startsWith('#')).join('\n')))"
 ```

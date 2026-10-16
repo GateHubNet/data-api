@@ -1,6 +1,6 @@
 # ADR-0001: Use ClickHouse as the analytical store
 
-**Status:** Accepted
+**Status:** Accepted. Amended: the materialized views proposed below were replaced by query-time aggregates and aggregator-written tables ([ADR-0008](0008-no-aggregate-materialized-views.md)); one database per network ([ADR-0009](0009-one-deployment-per-network.md)).
 
 ## Context
 The Data API serves an append-only, time-ordered ledger through two query shapes:
@@ -16,17 +16,17 @@ implementation used Elasticsearch, which:
 That is a columnar-OLAP workload, which Elasticsearch is weakest at.
 
 ## Decision
-Use **ClickHouse** as the analytical store. Model the data as `MergeTree`-family tables with
-**materialized views** maintaining pre-aggregated analytics. Express the API's reads as
+Use **ClickHouse** as the analytical store. Model the data as `MergeTree`-family tables (originally with
+**materialized views** maintaining pre-aggregated analytics; see the amendment above). Express the API's reads as
 parameterised SQL.
 
 ## Consequences
 **Positive**
-- Vectorized columnar scans + materialized views replace per-request scripts → far faster,
+- Vectorized columnar scans and precomputed rollups replace per-request scripts → far faster,
   cheaper analytics.
 - ~5–10× better compression on this numeric/time data.
 - SQL is testable and analyst-friendly; integrates with BI tools.
-- Native idempotency via `ReplacingMergeTree` (see [ADR-0002](0002-ctid-idempotent-ingest.md)).
+- Idempotent, crash-safe ingest through the commit-marker design (see [ADR-0007](0007-ledger-index-axis-and-secondary-tables.md); the earlier CTID design of [ADR-0002](0002-ctid-idempotent-ingest.md) is superseded).
 - Simpler ops than a JVM/shard cluster; mature managed option (ClickHouse Cloud).
 
 **Negative / trade-offs**
@@ -37,5 +37,4 @@ parameterised SQL.
   (see [ADR-0003](0003-no-final-on-list-queries.md)).
 - HA/replication is a deliberate deployment step (Keeper + `Replicated*MergeTree`), not free.
 
-See [elasticsearch-to-clickhouse.md](../elasticsearch-to-clickhouse.md) for the full
-rationale and query-translation mapping.
+The Elasticsearch-era design this replaced is obsolete and its migration notes were removed; this ADR keeps the reasoning.

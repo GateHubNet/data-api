@@ -1,72 +1,85 @@
-# Load & capacity testing
+# Load and capacity testing
 
-Two dimensions matter for this system: **API read throughput/latency** and **syncer
-ingest throughput**. They're tested separately.
+Two dimensions matter: **API read throughput/latency** and **syncer ingest throughput**. They are tested separately.
 
 ## 1. API read load (k6)
 
+`seed.js` writes SYNTHETIC ledgers straight into the tables of the current schema (ledgers, transactions and their lookup tables, payments,
+exchanges, balance changes, hourly stats, fee snapshots), so no node is needed. Use a **throwaway database**: never one that a live syncer
+writes to.
+
 ```bash
-# a) build the workspace (the seeder uses the compiled shared client)
+# a) build the workspace (the seeder and the migration use the compiled shared package)
 pnpm build
 
-# b) start ClickHouse + apply schema
+# b) ClickHouse + a scratch database with the real schema (the database name is the one you choose)
 docker compose up -d clickhouse
+export GH_NETWORK=xrpl GH_CLICKHOUSE_DATABASE=loadtest GH_CLICKHOUSE_URL=http://localhost:8123
 pnpm ch:migrate
 
-# c) seed realistic data (2M payments here; takes a few minutes)
-GH_CLICKHOUSE_URL=http://localhost:8123 node load/seed.js 2000000
+# c) seed: 20,000 ledgers x 10 transactions (about 2.5 million rows, a few seconds)
+node load/seed.js 20000 10            # usage: [ledgers=20000] [txPerLedger=10] [firstLedger=90000000]
+#    it prints the account and ledger range to pass to k6
 
-# d) run the API with a known key
-GH_API_KEYS=test-key-123 pnpm start:api
+# d) run the API against that database, with a known key and a rate limit the test cannot hit
+#    (a single client address makes all the requests)
+GH_ENV=local GH_API_KEYS=test-key-123 GH_RATE_LIMIT=1000000 pnpm start:api     # GH_ENV skips the .env file; GH_CLICKHOUSE_* are exported from b)
 
 # e) run the load test (install k6 first: `brew install k6`)
-BASE_URL=http://localhost:3001 API_KEY=test-key-123 k6 run load/api-load.js
+BASE_URL=http://localhost:3001 API_KEY=test-key-123 \
+ACCOUNT=<printed by the seeder> FIRST_LEDGER=90000000 LEDGERS=20000 k6 run load/api-load.js
 ```
 
-`api-load.js` ramps 0→500 virtual users across the list, stats, volume and candle
-endpoints. Thresholds (the test **fails** if breached):
+The synthetic window ends "now" (one ledger every 4 s), every fifth transaction is an `OfferCreate` with one USD/XRP or EUR/XRP exchange, the others
+are payments in XRP, USD, EUR or BTC. Not seeded: `validations` and the volume rollups (the aggregator writes those), so the volume endpoints
+answer an empty 200. The seeder refuses a database that already has ledgers (`SEED_ALLOW_NONEMPTY=1` overrides it).
 
-- `http_req_duration p95 < 500ms`, `p99 < 1500ms`
-- error rate `< 1%`
+`api-load.js` ramps 0 -> 500 virtual users across the read endpoints that exist in `apps/api`: payments (all and per currency), transactions,
+ledgers (latest and by index with transactions), stats, network fees, exchange and payment volume, candles, exchange rates, active accounts and
+the account lists. Thresholds (the test **fails** if breached):
 
-Tune the `stages` and `thresholds` to your SLO. Watch the API's `/metricz`
-(`api_http_request_duration_seconds`) and ClickHouse's own metrics during the run.
+- `http_req_duration` p95 < 500 ms, p99 < 1500 ms
+- error rate < 1 %
+
+Tune `stages` and `thresholds` to your SLO. Watch the API's `/metricz` (`api_http_request_duration_seconds`) and ClickHouse's own metrics
+(`system.query_log`, `system.processes`) during the run.
 
 ### What to look for
-- **p95/p99 latency** vs concurrency — where does it knee?
-- **ClickHouse CPU / memory** — candle and volume queries hit materialized views and
-  should stay cheap; raw `payments`/`transactions` scans grow with the time window.
-- If latency degrades: add ClickHouse replicas (scale reads), raise `GH_RATE_LIMIT`
-  only after confirming the backend keeps up, and ensure hot endpoints are cached.
+- **p95/p99 latency** against concurrency: where is the knee?
+- **ClickHouse CPU and memory**: list pages are key-ordered range reads and should stay cheap; candles, rates and active accounts aggregate their
+  window, so they grow with it.
+- If latency degrades: scale ClickHouse (RAM, CPU), add api replicas, and check `system.query_log` for the heavy query. Raise `GH_RATE_LIMIT`
+  only after confirming the backend keeps up.
 
 ## 2. Syncer ingest throughput
 
-The syncer is network-bound on the XRPL node, then ClickHouse-bound on writes. Measure
-with the built-in Prometheus gauges rather than a synthetic tool:
+The syncer is network-bound on the node, then ClickHouse-bound on writes. Measure with the Prometheus gauges and the range-ingest CLI rather than a
+synthetic tool:
 
 ```bash
-# point at your node, pick a fixed range, then watch the rate
-GH_BACKFILL_START_LEDGER=80000000 GH_BACKFILL_END_LEDGER=80100000 \
-GH_BACKFILL_WORKERS=16 GH_BACKFILL_BATCH_LEDGERS=1000 GH_FETCH_THROTTLE_MS=0 \
-pnpm start:syncer
+# point at your node (GH_NODE_ENDPOINTS), pick a fixed range of a scratch database, and time it
+export GH_NETWORK=xrpl GH_CLICKHOUSE_DATABASE=ingesttest GH_NODE_ENDPOINTS=ws://your-node:6006
+pnpm ch:migrate
+time pnpm --filter @gatehub/data-syncer ingest:range --from 80000000 --to 80010000 --concurrency 16
 
-# in another shell, scrape progress:
-watch -n5 'curl -s localhost:3002/metricz | grep syncer_'
+# live catch-up speed: start the syncer at an old ledger of a scratch database and watch the gauges
+GH_ENV=local GH_SYNC_START_LEDGER=80000000 GH_CATCHUP_CONCURRENCY=16 pnpm start:syncer
+watch -n5 'curl -s localhost:3000/metricz | grep -E "^syncer_(checkpoint_ledger|head_ledger|lag_ledgers)"'
 ```
 
-`syncer_ledgers_processed_total` over time gives ledgers/sec. To find the ceiling:
-- raise `GH_BACKFILL_WORKERS` until ledgers/sec stops improving (node-bound), then
-- shard across instances (`GH_BACKFILL_SHARD_TOTAL`) and/or add XRPL nodes.
+`rate(syncer_checkpoint_ledger[5m])` is ledgers per second while catching up; the CLI prints the number of ledgers written. To find the ceiling,
+raise `--concurrency` / `GH_CATCHUP_CONCURRENCY` until ledgers per second stops improving (node-bound), then look at ClickHouse (parts, merges,
+`system.mutations`). A single syncer per network cannot be sharded; for a big backfill run range ingests over *disjoint* ranges in parallel.
 
-Capacity-plan the backfill from the measured rate: `~57,000,000 / (ledgers_per_sec)`
-seconds for two years (see ../docs/backfill.md).
+Capacity-plan a backfill from the measured rate: `ledgers / (ledgers per second)` seconds (about 22,000 XRPL ledgers close per day; two years is
+roughly 46-57 million; see [../docs/backfill.md](../docs/backfill.md)).
 
 ## 3. ClickHouse query micro-benchmarks (optional)
 
-For pure DB capacity, `clickhouse-benchmark` against the seeded data isolates the
-storage layer from the API:
+For pure database capacity, `clickhouse-benchmark` against the seeded data isolates the storage layer from the API. For example the page read behind
+`/v2/payments`:
 
 ```bash
-echo "SELECT currency, sum(total_amount) FROM payment_volume_daily GROUP BY currency" \
+echo "SELECT ledger_index, tx_index FROM loadtest.payments ORDER BY ledger_index, tx_index LIMIT 201" \
   | clickhouse-benchmark --host localhost --port 9000 -i 1000 -c 16
 ```

@@ -1,6 +1,10 @@
 # ADR-0002: Idempotent ingest via CTID-keyed ReplacingMergeTree + batched writes
 
-**Status:** Accepted
+**Status:** **Superseded** by [ADR-0007](0007-ledger-index-axis-and-secondary-tables.md).
+
+> Kept for history. The CTID-keyed tables and `ReplacingMergeTree(ledger_index)` dedup described here were replaced by a ledger-keyed schema where the
+> `ledgers` row is the commit marker, inserts are synchronous with deduplication tokens, and recovery deletes the uncommitted tail with partition-scoped
+> lightweight `DELETE`s. The batched writes (one `INSERT` per table per flush, children first and the marker last) survive.
 
 ## Context
 Ingestion must survive crashes, restarts, overlapping live+backfill windows, and manual
@@ -33,4 +37,4 @@ insert and quickly hits "too many parts".
 - The backfill cursor is derived from the `ledgers` table (a windowed query), not a separate
   durable cursor — simple and correct, but it relies on the ledger marker being written last.
 
-See [syncer.md](../syncer.md) and [data-model.md](../data-model.md#2-the-ctid-idempotency-model).
+See [syncer.md](../syncer.md) and [data-model.md](../data-model.md#idempotency-and-the-commit-marker) for the current design.

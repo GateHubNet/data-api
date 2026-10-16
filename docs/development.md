@@ -1,338 +1,290 @@
-# Developer Guide
+# Developer guide
 
-This guide covers everything you need to develop on the **GateHub XRPL Data API** monorepo: a ClickHouse-backed platform that **indexes** the XRP Ledger (the *syncer*) and **serves** that data over a REST API (the *api*), with shared XRPL parsing and ClickHouse plumbing in a common library.
+Everything you need to develop on the Data API monorepo: a ClickHouse-backed, Ripple Data API v2 compatible platform for the XRP
+Ledger and Xahau, with an **api** that serves it, a **syncer** that fills it, and a **shared** library.
 
-> Looking for runtime/operational docs? See `docs/architecture.md`, `docs/data-model.md`, `docs/configuration.md`, `docs/syncer.md`, `docs/backfill.md`, and `docs/api-reference.md`.
-
----
+> Runtime and operations docs: [architecture](architecture.md), [data-model](data-model.md), [configuration](configuration.md),
+> [syncer](syncer.md), [backfill](backfill.md), [api-reference](api-reference.md), [deployment](deployment.md).
 
 ## 1. Prerequisites
 
 | Tool | Version | Why |
 | --- | --- | --- |
-| Node.js | `>=20` | Enforced by `engines.node` in the root `package.json`. |
-| pnpm | `10.x` (repo pins `10.6.3` via `packageManager`) | Workspace package manager. Use `corepack enable` to get the pinned version. |
-| Docker | recent | Runs local ClickHouse and powers the testcontainers-based integration tests. |
-| `NPM_TOKEN` | a token with read access to the private `@gatehub/toolbox` | Both apps depend on `@gatehub/toolbox@^0.2.6`, which is published to the public npm registry but is **private**. |
-
-Enable the pinned pnpm:
+| Node.js | `>=20.19` (`engines` in the root and api `package.json`; the images use 22) | `ripple-binary-codec` 2.x loads ES-module-only dependencies with `require(esm)`, which Node enables by default from 20.19 / 22.12 |
+| pnpm | `10.x` (the repo pins `10.6.3` via `packageManager`) | Workspace package manager (`corepack enable`) |
+| Docker | recent, with BuildKit | Local ClickHouse, the compose stacks and the testcontainers-based e2e suites |
+| npm access | a token that can read the private `@gatehub/toolbox` | Both apps depend on `@gatehub/toolbox`, which is on the npm registry but private |
 
 ```bash
 corepack enable
 corepack prepare pnpm@10.6.3 --activate
 ```
 
-### NPM_TOKEN
+### NPM access
 
-`@gatehub/toolbox` is private. The root `.npmrc` reads the token from the `NPM_TOKEN` env var:
+`@gatehub/toolbox` is private, so `pnpm install` needs an npm token that can read it. The committed `.npmrc` keeps its auth line
+commented out (so installs without a token do not lose the project settings in it) and does not read the token. Two ways to give pnpm
+the token, neither of which writes it into the repo:
 
-```
-//registry.npmjs.org/:_authToken=${NPM_TOKEN}
-```
+- you are already logged in to npm on this machine (`npm login`): your user-level `~/.npmrc` holds the token and pnpm uses it; or
+- export the token and reference it from your **user-level** `~/.npmrc`:
 
-You likely already have the token saved in your user `~/.npmrc` (from a previous `npm login`). Because `npm config get //registry.npmjs.org/:_authToken` **redacts** the value, extract it directly from the file and export it:
+  ```bash
+  export NPM_TOKEN=...                                                    # in your shell profile or a secrets manager
+  echo '//registry.npmjs.org/:_authToken=${NPM_TOKEN}' >> ~/.npmrc        # literally ${NPM_TOKEN}: pnpm expands it
+  ```
 
-```bash
-export NPM_TOKEN="$(grep '//registry.npmjs.org/:_authToken=' ~/.npmrc | tail -1 | sed 's/.*_authToken=//' | tr -d '"[:space:]')"
-```
-
-Add that line to your shell profile (`~/.zshrc` / `~/.bashrc`) so installs and Docker builds always pick it up. The same `NPM_TOKEN` is passed into the Docker images as a build `ARG` (see the Gotchas section).
-
----
+Do not copy the token out of `~/.npmrc` into other files, build arguments or the repo. **Docker builds** take the token from the
+`NPM_TOKEN` environment variable as a BuildKit **secret** (`docker compose build`, or `docker build --secret id=npm_token,env=NPM_TOKEN`),
+never as a build argument; see [deployment](deployment.md#build).
 
 ## 2. Repository layout
 
-This is a **pnpm workspace**. Members are declared in `pnpm-workspace.yaml`:
+A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 
-```yaml
-packages:
-  - 'apps/*'
-  - 'packages/*'
-```
-
-| Path | Package name | Role |
+| Path | Package | Role |
 | --- | --- | --- |
-| `apps/api` | `@gatehub/data-api-service` | NestJS REST API. Serves ledger data from ClickHouse, plus a few live-XRPL passthrough endpoints. |
-| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker. Ingests ledgers from the XRP Ledger, parses them, batches and writes them to ClickHouse. |
-| `packages/shared` | `@gatehub/data-api-shared` | Shared library: the ClickHouse client/module/config, the migration runner, all XRPL parsers, the `Table`/`View` enums, and util/constants. Consumed by both apps via `workspace:*`. |
+| `apps/api` | `@gatehub/data-api-service` | NestJS REST API: the `/v2` Ripple-compatible endpoints over ClickHouse, plus live-node lookups (balances, orders) |
+| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the `ingest`, `validations`, `fee_stats` and `aggregator` workers, and the `range-ingest` CLI |
+| `packages/shared` | `@gatehub/data-api-shared` | ClickHouse client and migration runner, the `Table` enum and row types, parsers, `buildLedgerRows` / `LedgerWriter`, the `NodeClient`, `RatesService`, the aggregation jobs, the network profiles |
 
-What lives in `packages/shared/src`:
+`packages/shared` in more detail:
 
-- `clickhouse/` — `clickhouse.service.ts` (typed wrapper around `@clickhouse/client`), `clickhouse.module.ts`, `clickhouse.config.ts`, `migrate.ts` (the migration runner), `tables.ts` (the `Table` and `View` enums).
-- `parsers/` — one file per XRPL concern (`payment`, `exchanges`, `balance-changes`, `offers`, `escrow`, `paychan`, `accounts-created`, `affected-accounts`, `from-client`, `issuers`), the `IParser` interface (`parser.interface.ts`), and the `ParsingService` that runs the whole suite.
-- `util/` — `ctid.ts`, `quality.ts`, `time.ts`, `helpers.ts` (e.g. `retry`, `isoTimeToUnixSeconds`, `toClickHouseDateTime`).
-- `types/` — ambient type declarations.
-- `constants.ts` — shared constants.
+- `src/network/`: `NetworkProfile` for `xrpl` and `xahau`; `config/definitions/<network>.json` (binary-codec definitions, a fallback for when
+  the node cannot supply `server_definitions`) and `config/markets/<network>.json` (volume markets) ship next to `dist/`.
+- `src/clickhouse/`: `clickhouse.service.ts` (typed wrapper: bound parameters, per-query guards, synchronous inserts with dedup tokens),
+  `clickhouse.config.ts`, `migrate.ts`, `tables.ts` (the `Table` enum), `rows.ts` (row types).
+- `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
+  `FixtureLedgerSource`, `raw-ledger.ts`.
+- `src/xrpl/node-client.ts`, `src/query/` (rates, decimals), `src/aggregate/` (stats and volume jobs), `src/util/`.
+- `schema/001_baseline.sql`: the schema (a migration unit; **not** under `src/`).
+- `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
-The SQL schema lives in **`packages/shared/schema/`** (NOT under `src/`):
+Everything the apps use is re-exported from `packages/shared/src/index.ts`: **export what you add there.**
 
-- `001_tables.sql` — base `ReplacingMergeTree` tables.
-- `002_materialized_views.sql` — target tables + materialized views for pre-aggregated analytics.
+### Build order
 
-Everything the library exposes to the apps is re-exported from `packages/shared/src/index.ts`. **If you add something the apps need, export it there.**
-
-### Build order matters
-
-The shared library must be **built before** the apps, because the apps import its compiled `dist/` (`"main": "dist/index.js"`). The root `pnpm build` runs `pnpm -r build`, which respects the workspace dependency graph and builds `@gatehub/data-api-shared` first (topological order). If you build an app in isolation, build shared first:
+The apps import the compiled `dist/` of the shared package, so build it first. The root `pnpm build` (`pnpm -r build`) respects the graph.
+Alone:
 
 ```bash
 pnpm --filter @gatehub/data-api-shared build
 pnpm --filter @gatehub/data-api-service build
 ```
 
----
-
 ## 3. First-time setup
 
 ```bash
-# 0. Make sure NPM_TOKEN is exported (see section 1).
-
-# 1. Install all workspace deps.
+export NPM_TOKEN=...                       # or be logged in to npm, see 1
 pnpm install
 
-# 2. Start a local ClickHouse (HTTP on :8123, native on :9000).
-docker compose up -d clickhouse      # or: pnpm docker:up
+docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123 / 9000 (or: pnpm docker:up)
 
-# 3. Create env files for each service from the committed examples.
-cp apps/api/.env.example apps/api/.env
+cp apps/api/.env.example    apps/api/.env  # the .env files are git-ignored; the .env.example files are committed
 cp apps/syncer/.env.example apps/syncer/.env
-#   The .env files are gitignored; .env.example files are committed.
-#   The syncer requires GH_XRPL_NODE_ENDPOINT (it throws on boot without it).
+#   defaults: GH_NETWORK=xrpl, public node wss://xrplcluster.com, GH_API_KEYS empty (no authentication)
 
-# 4. Apply the ClickHouse schema (tables + materialized views).
-pnpm ch:migrate
+pnpm ch:migrate                            # creates the database of GH_NETWORK (xrpl) and applies the schema
 
-# 5. Run the services in watch mode (separate terminals).
-pnpm start:api       # http://localhost:3001  (docs at /internal/docs)
-pnpm start:syncer    # http://localhost:3002
+pnpm start:syncer                          # http://localhost:3002 (probe), starts at the validated head
+pnpm start:api                             # http://localhost:3001, Swagger at /internal/docs
 ```
 
-ClickHouse connection defaults (overridable via `GH_CLICKHOUSE_*`, see `clickhouse.config.ts`): URL `http://localhost:8123`, user `default`, empty password, database `xrpl`.
+Without `GH_ENV` the toolbox loads `.env` from the working directory (`pnpm --filter` runs from the package folder, where the `.env`
+files above live) and refuses to start without it. Try it:
 
-To tear down ClickHouse: `pnpm docker:down`.
+```bash
+curl -s localhost:3001/v2/last_validated            # empty database: 500 {"result":"error","message":"unavailable"}; fine until the syncer commits a ledger
+curl -s localhost:3001/liveliness/healthz
+```
 
----
+**A second network (Xahau).** Use a second pair of env files (or the compose stack), with `GH_NETWORK=xahau`: the database defaults to
+`xahau`, the node to `wss://xahau.network`, the native currency to `XAH`. Run `GH_NETWORK=xahau pnpm ch:migrate` once, and give the second
+API and syncer different ports (`GH_HTTP_API_PORT`, `GH_METRICZ_PORT`).
+
+**Everything in containers.** `NPM_TOKEN=... docker compose --profile full up -d --build` brings up ClickHouse, the XRPL migrate job,
+syncer and api (add `--profile xahau` for Xahau); see [deployment](deployment.md#option-2-local-development-stack). The ports are
+published on 127.0.0.1, the API key is `dev-api-key`, and **an old ClickHouse volume from the previous stack must be recreated**
+(`docker compose down -v`: the schema baseline was replaced).
+
+Tear down: `pnpm docker:down`.
 
 ## 4. Common commands
 
-All commands run from the repo root unless noted. `pnpm -r <script>` fans out across every workspace package in dependency order.
+From the repo root; `pnpm -r <script>` fans out in dependency order.
 
 | Command | What it does |
 | --- | --- |
-| `pnpm build` | `pnpm -r build` — builds shared (tsc) then both apps (`nest build`), in topological order. |
-| `pnpm test` | `pnpm -r test` — runs **unit** tests (`*.spec.ts`) in every package. |
-| `pnpm --filter @gatehub/data-api-service test:e2e` | API integration/e2e tests. **Needs Docker** (spins a real ClickHouse). |
-| `pnpm --filter @gatehub/data-syncer test:e2e` | Syncer integration/e2e tests. **Needs Docker**. |
-| `pnpm lint` | `pnpm -r lint` — ESLint with `--fix` across packages. |
-| `pnpm format` | Prettier write across `{apps,packages}/**/src/**/*.ts`. |
-| `pnpm swagger` | Builds the OpenAPI document to `apps/api/dist/swagger.json` (no server needed). |
-| `pnpm ch:migrate` | Runs the ClickHouse schema migrations (`packages/shared/src/clickhouse/migrate.ts`). |
-| `pnpm start:api` / `pnpm start:syncer` | `nest start --watch` for the respective app. |
-| `pnpm docker:up` / `pnpm docker:down` | Start/stop the local ClickHouse container. |
+| `pnpm build` | builds shared (`tsc`), then both apps (`nest build`) |
+| `pnpm test` | **unit** tests (`*.spec.ts`) of every package |
+| `pnpm --filter @gatehub/data-api-service test:e2e` | API contract e2e tests. **Needs Docker.** |
+| `pnpm --filter @gatehub/data-syncer test:e2e` | Syncer recovery/worker e2e tests. **Needs Docker.** |
+| `pnpm --filter @gatehub/data-api-shared test:e2e` | Shared e2e tests (migrations, writer, build-rows, rates, aggregation). **Needs Docker.** |
+| `pnpm format` | Prettier write over `{apps,packages}/**/src/**/*.ts`. (`pnpm lint` runs `eslint --fix`, but the repo has no ESLint configuration yet, so it does not work.) |
+| `pnpm ch:migrate` | applies the schema to the database of `GH_NETWORK` (`ts-node` on `migrate.ts`) |
+| `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source ([backfill](backfill.md)) |
+| `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures |
+| `pnpm start:api` / `pnpm start:syncer` | `nest start --watch` |
+| `pnpm docker:up` / `pnpm docker:down` | start/stop the dev ClickHouse container |
 
-> Note: there is **no root `test:e2e` script** — e2e is per app, by design (each spins its own throwaway ClickHouse and they should not race over `--runInBand`).
-
----
+There is no root `test:e2e`: each package spins its own throwaway ClickHouse and runs `--runInBand`.
 
 ## 5. Conventions
 
-- **TypeScript strict mode.** `tsconfig.base.json` sets `strict: true` (plus `noImplicitAny`, `strictNullChecks`, etc.). Each package extends it.
-- **ESLint + Prettier.** Prettier config (`.prettierrc`): `printWidth: 120`, `singleQuote: true`, `trailingComma: 'all'`, 2-space indent, plus `prettier-plugin-organize-imports`. Run `pnpm format` / `pnpm lint` before committing.
-- **NestJS module-per-domain.** Each API domain is a self-contained folder under `apps/api/src/<domain>/` with `<domain>.module.ts`, `.controller.ts`, `.service.ts`, and `.dto.ts`. Register the module in `apps/api/src/app.module.ts`.
-- **Parameterised ClickHouse queries only.** Always pass user-derived values through `query_params` (`{name:Type}` placeholders + a `params` object). **Never interpolate user input into SQL.** `ClickHouseService.query()` enforces this pattern; only trusted enum/constant values (e.g. `Table.Payments`, column names from `SortKey`) are ever string-built into queries.
-- **Keyset (cursor) pagination.** Use the helpers in `apps/api/src/common/pagination.ts` (`keysetClause`, `orderByClause`, `nextMarker`, `encodeMarker`/`decodeMarker`). The marker is an opaque base64url token of the last row's sort-key tuple — O(1) deep paging, no `OFFSET`.
-- **Standard list envelope.** List endpoints return `listResponse(itemsKey, items, marker)` from `apps/api/src/common/response.ts`: `{ result: 'success', marker?, count, [itemsKey]: items }`. Normalise ClickHouse `DateTime` to ISO with `toIso()`.
-- **Config via `*.config.ts` + env.** `apps/api/src/config/api.config.ts`, `apps/syncer/src/config/syncer.config.ts`, and shared `clickhouse.config.ts` each build a typed config object from `GH_*` env vars and fail fast on bad input. Don't read `process.env` ad-hoc in services.
-
----
+- **TypeScript strict** (`tsconfig.base.json`); each package extends it. **Prettier** (`.prettierrc`): 120 columns, single quotes, trailing
+  commas, organize-imports plugin. Run `pnpm format` before committing.
+- **Module per domain.** `apps/api/src/<domain>/` has `<domain>.module.ts`, `.controller.ts`, `.service.ts` and, where the shape is non-trivial,
+  `<thing>-object.ts` (+ spec) for the response object. Modules are listed in `ENDPOINT_MODULES` of `app.module.ts`; **the catch-all
+  `NotFoundModule` must stay last** (`app.module.spec.ts` guards the order).
+- **Ripple contract.** Controllers use `@RippleController('v2/...')` (the `/v2` is part of the route; the app has no global prefix) and
+  `@RippleRoute('<failure message>')`; errors are `badRequest('exact ripple message')` / `notFound(...)` from `common/errors.ts`, never a
+  generic exception. Parameters are read with the helpers of `common/params.ts` (`first`, `bool`, `limitParam`, `dateParam`, `uintParam`),
+  assets with `asset-param.ts`. **Match the original** (`rippled-historical-database`): its messages, defaults, field order. Success bodies
+  omit fields that have no value (`compact`); `fmt*` functions take unix **seconds**.
+- **Parameterised queries only.** Pass every user-derived value through `query_params` (`{name:Type}` + a params object). Only table names
+  (from the `Table` enum, checked by `sql-tables.spec.ts`), fixed column lists and whitelisted expressions are written into SQL.
+- **Lists: key-ordered, no `FINAL`.** `ORDER BY` the full table key, `LIMIT limit + 1`, dedupe with `LIMIT 1 BY <key>`, page with
+  `keysetClause` / `paginate` / `setLinkHeader`; the marker is the base64url of the key of the last row and never a DateTime. Resolve
+  `start`/`end` to a ledger range with `LedgerRangeResolver`. See [clickhouse](clickhouse.md#the-final-rule).
+- **Amounts** are exact decimal strings; sum with the shared decimal helpers, never with floats.
+- **Config** lives in `api.config.ts`, `syncer.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `env-decorators.ts`);
+  do not read `process.env` ad hoc in services. Import the toolbox through `@gatehub/toolbox/lib/<module>`, never the package root (the
+  root loads database/queue config and exits without `GH_DATABASE_*`).
 
 ## 6. How-to guides
 
-### 6a. Add a new API endpoint
+### 6a. Add an API endpoint
 
-Mirror an existing domain such as `apps/api/src/payments/`. Suppose we add an endpoint to a new `widgets` domain.
+Mirror a small domain such as `apps/api/src/active-accounts/`.
 
-1. **DTO** — `apps/api/src/widgets/widgets.dto.ts`. Extend `CommonQueryDto` (gives you `start`/`end`/`limit`/`descending`/`marker`/`format` with validation) and add domain filters with `class-validator` + `@ApiPropertyOptional`:
-
-   ```ts
-   export class WidgetsQueryDto extends CommonQueryDto {
-     @ApiPropertyOptional({ description: 'Filter by owner address.' })
-     @IsOptional()
-     @IsString()
-     owner?: string;
-   }
-   ```
-
-2. **Service** — `widgets.service.ts`. Inject `ClickHouseService`, build the `WHERE` with **bound params**, add the keyset clause, and order by your sort keys. Follow `payments.service.ts`:
+1. **Service** (`widgets.service.ts`): inject `ClickHouseService` and, for time windows, `LedgerRangeResolver`. Build the `WHERE` with bound
+   parameters, add `keysetClause`, order by the full key, fetch `limit + 1`, and `paginate` the rows:
 
    ```ts
-   const SORT_KEYS: SortKey[] = [
-     { column: 'date', type: 'DateTime' },
-     { column: 'ledger_index', type: 'UInt32' },
-     { column: 'tx_index', type: 'UInt16' },
-   ];
-
-   const where: string[] = [];
-   const params: Record<string, unknown> = { limit: options.limit };
-   if (options.owner) {
-     where.push('owner = {owner:String}');   // bound, never interpolated
-     params.owner = options.owner;
-   }
-   const keyset = keysetClause(SORT_KEYS, options.descending, options.marker);
-   if (keyset.clause) { where.push(keyset.clause); Object.assign(params, keyset.params); }
-
-   const sql = `SELECT ... FROM ${Table.Widgets}
-                ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-                ORDER BY ${orderByClause(SORT_KEYS, options.descending)}
-                LIMIT {limit:UInt32}`;
-
-   const rows = await this.ch.query<Record<string, unknown>>(sql, params);
-   const marker = nextMarker(rows, SORT_KEYS, options.limit);
-   return listResponse('widgets', rows, marker);
+   const KEYS: KeysetKey[] = [{ column: 'ledger_index', type: 'UInt32' }, { column: 'tx_index', type: 'UInt32' }];
+   const after = decodeMarker(q.marker, KEYS);                       // 400 `invalid marker` before any query
+   const range = await this.ranges.resolve(q.start, q.endExclusive);
+   const cursor = keysetClause(KEYS, q.descending, after);
+   const rows = await this.ch.query<Row>(
+     `SELECT ... FROM ${Table.Widgets}
+       WHERE owner = {owner:String} AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32} ${cursor.clause && `AND ${cursor.clause}`}
+       ORDER BY ${orderByClause(KEYS, q.descending)} LIMIT 1 BY ledger_index, tx_index LIMIT {limit:UInt32}`,
+     { owner: q.owner, min: range.min, max: range.max, limit: q.limit + 1, ...cursor.params });
+   const { rows: page, marker } = paginate(rows, q.limit, (r) => [r.ledger_index, r.tx_index]);
    ```
 
-3. **Controller** — `widgets.controller.ts`. Version it and tag it for OpenAPI; add `@ApiOperation` to every route:
+2. **Object** (`widget-object.ts`): the response shape with the keys **in the order of the original**; leave out what is missing.
+3. **Controller**: `@RippleController('v2/widgets')`, `@RippleRoute('unable to retrieve widgets')`, optional `@Csv('widgets', 'widgets')`,
+   `@ApiOperation` / `@ApiQuery` for Swagger, parse with the `common/params.ts` helpers in the order of the original's checks,
+   `setLinkHeader(req, res, page.marker)`, return `{ result: 'success', count, marker, widgets }`.
+4. **Module**: declare it and add it to `ENDPOINT_MODULES` (before `NotFoundModule`).
+5. **Tests**: unit spec for the object and the parameter parsing, an e2e spec against a seeded database (6c), including the limit clamp,
+   descending order, concatenated marker pages equalling the unpaged list, unknown params ignored, the exact error messages, 401 without a key.
+6. **Docs**: [api-reference](api-reference.md) (including a "Differences" note if you deviate from the original) and regenerate
+   [openapi.yaml](openapi.yaml) (section 8).
 
-   ```ts
-   @ApiTags('widgets')
-   @Controller({ version: '2', path: 'widgets' })
-   export class WidgetsController {
-     constructor(private readonly service: WidgetsService) {}
+### 6b. Add a ClickHouse table or column
 
-     @Get()
-     @ApiOperation({ summary: 'List widgets' })
-     getWidgets(@Query() query: WidgetsQueryDto) {
-       return this.service.getWidgets(query);
-     }
-   }
-   ```
+1. Add a **new** migration file `packages/shared/schema/002_*.sql` (never edit an applied one; `CREATE ... IF NOT EXISTS`, and the
+   semicolon of a statement must end its last line, no comment line may end with `;`).
+2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.
+3. For a ledger-derived table: have `buildLedgerRows` produce the rows and add the table to `CHILD_TABLES` (`build-rows.ts`), to
+   `LEDGER_KEYED_TABLES` (`ingest-state.ts`, so recovery deletes it; keep its partitioning identical to the DDL) and give it
+   `non_replicated_deduplication_window`. Bump `PARSER_VERSION` when the parsers' output changes, and re-ingest with `--reprocess`.
+4. Read it from an API service with `${Table.X}`. Apply: `pnpm ch:migrate` locally; the migrate job in compose; the e2e suites apply
+   `runMigrations()` themselves.
 
-4. **Module** — `widgets.module.ts` declaring the controller + service, then **register it** in `apps/api/src/app.module.ts`'s `imports` array.
+### 6c. Add or change a parser
 
-5. Regenerate OpenAPI (`pnpm swagger`) and add an e2e assertion (section 7).
+1. Parsers are **pure and synchronous**: derive everything from the transaction and its metadata, no I/O, never mutate the input (the
+   tests deep-freeze it), take the network from `ParseContext` (native currency, `partialPaymentFixLedger`), never hard-code `XRP`.
+2. Feed the result into `buildLedgerRows` and add the golden tests: the snapshot of `build-rows`, key uniqueness per table, every amount
+   parses with BigNumber, per-currency balance changes sum to zero except for the fee burn and XAH mint, and the parity tests ported from
+   the original's mocha suite.
+3. Fixtures: `packages/shared/test/fixtures/{xrpl,xahau}` (`ripple-mock` ledgers from the original, `recorded` ledgers from public nodes;
+   `record:fixtures` records more). Tests that need a transaction type skip per type using `recorded/manifest.json`.
 
-### 6b. Add a new ClickHouse table or column
+### 6d. Add an aggregate
 
-1. **DDL** — add a new migration file in `packages/shared/schema/`, named with the next number, e.g. `003_widgets.sql`. The runner applies files in lexical order and records them in `schema_migrations`, so **never edit an already-applied file** — add a new one. Write all DDL as `CREATE ... IF NOT EXISTS` (and use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for new columns). Follow the existing conventions in `001_tables.sql`: `ReplacingMergeTree(ledger_index)` keyed on the natural XRPL identity, `PARTITION BY toYYYYMM(date)`, time columns as `DateTime` (UTC).
-
-2. **Table enum** — add the table to the `Table` enum in `packages/shared/src/clickhouse/tables.ts` so services reference `Table.Widgets`, never a string literal.
-
-3. **Populate it** — in the relevant parser's output type and in the syncer's mapping in `apps/syncer/src/processor/clickhouse-data-processor.service.ts`: add a row-array, push mapped rows inside the per-tx loop, append to its buffer, and add the table to the `CHILD_TABLES` list so it's flushed. (For a new column on an existing table, just add the field to that table's row object.)
-
-4. **Expose it** — read the new table/column from an API service.
-
-5. **Apply** — `pnpm ch:migrate` locally. In production a one-shot `migrate` job runs it (see `docker-compose.prod.yaml`); the integration tests apply it automatically via `runMigrations()`.
-
-### 6c. Add a new XRPL parser
-
-1. **Implement `IParser`** in `packages/shared/src/parsers/<thing>.parser.ts`. Define a `Parsed<Thing>` output type and a class implementing `IParser<Parsed<Thing>[]>` (or a single object). Parsers must be **pure and synchronous** — derive everything from `transaction.meta` (the affected nodes), no network calls. `issuers.parser.ts` is a good model: it reads `RippleState` nodes from metadata rather than making an `account_lines` RPC.
-
-2. **Export** it from `packages/shared/src/index.ts`.
-
-3. **Wire it into the suite** — in `packages/shared/src/parsers/parsing.service.ts`: add a private instance and call it in `parseTransaction()`, adding the result to the `ParsedTransaction` interface.
-
-4. **Map its output** in `apps/syncer/src/processor/clickhouse-data-processor.service.ts` (see 6b step 3) and **add a table** for it (see 6b).
-
-5. **Add fixture-based unit tests** (section 7).
-
-### 6d. Add a materialized view
-
-1. **DDL** — append to `packages/shared/schema/002_materialized_views.sql` only if it has **not** been applied anywhere yet; otherwise add a **new** numbered migration (the runner skips already-recorded files). Use the established pattern: a target `*MergeTree` table (`AggregatingMergeTree` for OHLC/argMax-argMin, `SummingMergeTree` for additive counters) **plus** a `CREATE MATERIALIZED VIEW ... TO target AS SELECT ...`. See `exchange_candles_1m` and `payment_volume_daily`.
-
-2. **View enum** — add it to the `View` enum in `tables.ts`.
-
-3. **Query it from an API service.** Because `SummingMergeTree`/`AggregatingMergeTree` may hold un-merged parts, **re-aggregate in the query** (`sum(...) ... GROUP BY`, or `argMaxMerge`/`argMinMerge` for `AggregateFunction` columns) — do **not** rely on `FINAL` for list/analytics queries. `apps/api/src/stats/stats.service.ts` is the reference: it `sum()`s and `GROUP BY day` over `View.StatsDaily`.
-
-> Materialized views only populate on **new** inserts after they're created. To populate historical data, backfill the target table once with an `INSERT INTO target SELECT ...` over the source table.
-
----
+There are no materialized views ([ADR-0008](adr/0008-no-aggregate-materialized-views.md)). Query-time aggregates are plain `GROUP BY`
+queries over a bounded, key-ordered range (guard them with a window). A precomputed aggregate is a table the **aggregator** writes: a
+`ReplacingMergeTree(version)`, recomputed idempotently (a complete set under one new version; readers keep the highest version), added as a
+job in `aggregator.service.ts` with its own budget, and marked via `agg_dirty` when ingest rewrites its inputs.
 
 ## 7. Testing
 
-Two layers, both Jest with `ts-jest`.
+Jest with `ts-jest`, in three layers.
 
-### Unit tests (`*.spec.ts`)
-
-Fast, no Docker. Run with `pnpm test` (root) or `pnpm --filter <pkg> test`.
-
-- Shared: `packages/shared/src/util/ctid.spec.ts`, `packages/shared/src/parsers/balance-changes.parser.spec.ts`.
-- API: `apps/api/src/common/pagination.spec.ts`.
-
-Each app's unit config (`jest-config.json`) deliberately **excludes** e2e files (`"testRegex": "^(?!.*e2e-).*\\.spec\\.ts$"`).
-
-### Integration / e2e tests (`*.e2e-spec.ts`) — needs Docker
-
-These use **testcontainers** to boot a real, throwaway ClickHouse, apply the **real schema** via `runMigrations()`, then exercise the actual code against it.
+- **Unit tests** (`*.spec.ts`, no Docker): `pnpm test`. Parsers (golden and parity), `build-rows` snapshots, params/pagination/format/CSV,
+  response objects, the config classes, the guards, the node client with a fake socket.
+- **Contract e2e tests** (`apps/api/test/*.e2e-spec.ts`): one per endpoint. A **real ClickHouse** in Docker (testcontainers) is migrated
+  with the real schema and seeded through the real `LedgerWriter` from a `FixtureLedgerSource` (the 54 mock ledgers of the original, or
+  the recorded Xahau ledgers); the app runs in-process behind `supertest` (`test/harness.ts`; `TEST_API_KEY` is accepted, the live node
+  can be stubbed). Many suites port the assertions of the original's mocha tests as the parity oracle, and the Xahau network is
+  exercised too.
+- **Recovery e2e tests** (`apps/syncer/test`): fault injection between the child inserts and the commit, an ambiguous timeout after a
+  commit, a gap that is filled, `validated:false` retried, a `parent_hash` mismatch that halts, a WS close with a refused reconnect, a
+  range-ingest intent that is redone, the aggregator run twice. They use a synthetic contiguous chain built from a mock ledger.
+- **Shared e2e tests** (`packages/shared/test`): migrations, the writer, `buildLedgerRows` against real data, rates, the stats and
+  volume jobs.
 
 ```bash
-# Docker must be running.
+# Docker must be running
+pnpm --filter @gatehub/data-api-shared test:e2e
 pnpm --filter @gatehub/data-api-service test:e2e
 pnpm --filter @gatehub/data-syncer test:e2e
-pnpm --filter @gatehub/data-api-shared test:e2e
 ```
 
-The shared helper — `packages/shared/test/clickhouse-container.ts` (the apps import it by relative path) — starts the pinned `clickhouse/clickhouse-server` LTS (`26.8.14.3`, override with `CLICKHOUSE_IMAGE`), waits for `/ping` to return 200, and **exports the connection into `process.env`** (`GH_CLICKHOUSE_URL`, `GH_CLICKHOUSE_DATABASE`, etc.) so the shared config picks it up. With a `database` argument the image creates that database on startup; without one only `default` exists and `runMigrations()` creates the target database itself:
+`packages/shared/test/clickhouse-container.ts` starts the pinned `clickhouse/clickhouse-server:26.8.14.3` (override with
+`CLICKHOUSE_IMAGE`), waits for `/ping`, and exports the connection into `process.env`. Import `AppModule` only **after** the environment is
+set (config is read at module load). Suites run `--runInBand` with a long `testTimeout`. A suite that hangs once in a while on the
+container start is an infrastructure flake; a failure that reproduces alone is a bug.
 
-```ts
-export async function startClickHouse(database?: string): Promise<StartedClickHouse> {
-  const container = await new GenericContainer(process.env.CLICKHOUSE_IMAGE || DEFAULT_CLICKHOUSE_IMAGE)
-    .withExposedPorts(8123)
-    .withWaitStrategy(Wait.forHttp('/ping', 8123).forStatusCode(200))
-    .withStartupTimeout(120_000)
-    .start();
-  process.env.GH_CLICKHOUSE_URL = `http://${container.getHost()}:${container.getMappedPort(8123)}`;
-  // ...
-  return { container, url, database, config }; // config: ClickHouseConfig for the started server
-}
-```
+**When you add an endpoint add an e2e suite; when you add a parser add golden/parity tests.** A bug fix starts with a failing test.
 
-The shared package has its own e2e suite for the migration runner and the ClickHouse client (`pnpm --filter @gatehub/data-api-shared test:e2e`, config `packages/shared/jest.e2e.config.js`). Point `GH_SCHEMA_DIR` at a directory of `*.sql` files to migrate from somewhere other than `packages/shared/schema/`.
-
-Test shape (see `apps/api/test/api.e2e-spec.ts` and `apps/syncer/test/processor.e2e-spec.ts`):
-
-1. `beforeAll`: `startClickHouse('xrpl')` → set env → `await runMigrations()` → seed rows.
-2. **Import `AppModule` only AFTER the env is set** (config is read at module-init time) — use a dynamic `await import('../src/app.module')`.
-3. Run assertions (the API tests use `supertest`).
-4. `afterAll`: close the app, close the ClickHouse client, `container.stop()`.
-
-The e2e Jest config (`test/jest-e2e.json`) uses a long `testTimeout` (180000 ms) because container startup is slow, and runs `--runInBand`.
-
-**When you add a parser, add fixture-based unit tests** (feed a representative `XrplTx`/metadata object, assert the parsed output). **When you add an endpoint, add an e2e assertion** that seeds a row and hits the route.
-
----
-
-## 8. Building & OpenAPI
+## 8. Building, OpenAPI and the images
 
 ```bash
-pnpm build      # shared (tsc) -> api (nest build) -> syncer (nest build), topological
-pnpm swagger    # writes apps/api/dist/swagger.json
+pnpm build
 ```
 
-`pnpm swagger` runs `apps/api/src/swagger.ts`, which boots `AppModule` in-memory (no HTTP listener), builds the document via `buildOpenApiDocument()`, and writes `dist/swagger.json`. That file is **gitignored** (`apps/api/dist/swagger.json`) — it's a build artifact, regenerated in CI / the Docker build.
+`docs/openapi.yaml` is generated from the running app (the Swagger decorators of the controllers). There is no `swagger` script:
 
-At runtime the API serves interactive docs from **`/internal/docs`** (and the raw JSON at `/internal/docs/json`), wired up in `apps/api/src/main.ts`. Endpoints are URI-versioned (`@Controller({ version: '2', ... })` → `/v2/...`).
-
----
-
-## 9. Gotchas (learned the hard way on this project)
-
-**a. TS incremental builds vs `nest build --deleteOutDir`.**
-`apps/*/nest-cli.json` sets `"deleteOutDir": true`. Combined with TypeScript incremental builds / `.tsbuildinfo`, the compiler can think outputs are already up to date and **skip emit** after the dir was wiped — leaving an empty/partial `dist`. `*.tsbuildinfo` is gitignored; don't commit it and don't rely on it for the apps' Nest builds. If a build looks stale, delete `dist` and any `*.tsbuildinfo` and rebuild.
-
-**b. Docker: install + build must share one `RUN` layer.**
-pnpm's workspace symlinks (the `workspace:*` link from each app to `@gatehub/data-api-shared`) **do not survive across separate `RUN` layers** in BuildKit. So `apps/api/Dockerfile` and `apps/syncer/Dockerfile` run `pnpm install && pnpm --filter shared build && pnpm --filter <app> build && ... deploy` in a **single `RUN`**. Also:
-   - `**/*.tsbuildinfo` is in `.dockerignore` (so a stale local incremental cache can't poison the image — see gotcha a).
-   - `pnpm deploy` on pnpm v10 needs the `--legacy` flag: `pnpm --filter <app> --legacy deploy --prod /app/out`.
-   - `NPM_TOKEN` is passed as a build `ARG` and written to npm config so the private `@gatehub/toolbox` installs.
-
-**c. Don't use `FINAL` on ClickHouse list/analytics queries.**
-The per-tx tables are `ReplacingMergeTree` and the analytics targets are `Summing`/`AggregatingMergeTree`. `... FINAL` forces a merge-on-read across all parts, which **OOMs under concurrency** on large tables. For lists and aggregates, rely on background merges plus **query-time de-dup/aggregation**: `argMax`/`argMaxMerge` for latest-wins (see `network.service.ts`), `sum() ... GROUP BY` for counters (see `stats.service.ts`). `FINAL` is acceptable only for **single-row point lookups** by primary key (e.g. one tx by `hash`, one ledger, one account — see `transactions`/`ledgers`/`accounts` services), where it touches a tiny range.
-
-**d. `node:*-slim` has no `wget`/`curl` — health checks use Node `fetch`.**
-The runtime image is `node:22.23.2-bookworm-slim`, which ships **no** `wget`/`curl`. Container health checks therefore use Node's global `fetch` against `/liveliness/healthz`, e.g.:
-
-```yaml
-test: ['CMD', 'node', '-e', "fetch('http://localhost:3001/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+```bash
+pnpm --filter @gatehub/data-api-shared build && pnpm --filter @gatehub/data-api-service build
+env -i PATH="$PATH" NODE_ENV=development GH_ENV=container GH_API_KEYS=any GH_CLICKHOUSE_URL=http://127.0.0.1:1 \
+  GH_HTTP_API_PORT=23001 GH_METRICZ_PORT=23000 node apps/api/dist/main.js &        # boots without a reachable ClickHouse
+curl -s http://127.0.0.1:23001/internal/docs-json | ruby -ryaml -rjson -e 'puts JSON.parse(STDIN.read).to_yaml' > /tmp/openapi.yaml
+kill %1                                                                           # then keep the header comment of docs/openapi.yaml on top of /tmp/openapi.yaml
 ```
 
-(The local `docker-compose.yaml` ClickHouse health check uses `wget` because the *ClickHouse* image has it — this only bites the **app** images.)
+At runtime the API serves Swagger UI at `/internal/docs` and the JSON at `/internal/docs-json` (the shipped nginx does not expose them).
+
+Images: [deployment](deployment.md#build). The npm token is a BuildKit secret (`NPM_TOKEN` in the environment), not a build argument.
+
+## 9. Gotchas
+
+**a. TypeScript incremental builds vs `nest build --deleteOutDir`.** `apps/*/nest-cli.json` sets `deleteOutDir`. With incremental builds / a stale
+`*.tsbuildinfo` the compiler can believe the output is up to date after the folder was wiped and skip emit, leaving an empty `dist`.
+`*.tsbuildinfo` is git- and docker-ignored; if a build looks stale delete `dist` and any `*.tsbuildinfo`.
+
+**b. Docker: install + build + deploy in one `RUN`.** pnpm workspace symlinks do not survive across BuildKit layers, so the Dockerfiles run
+`pnpm install && build && pnpm deploy` in a single `RUN`. `pnpm deploy` on pnpm 10 needs `--legacy`. Inside the image the shared package
+is `node_modules/@gatehub/data-api-shared` (so the migrate command is `node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js`).
+
+**c. No `FINAL` on list or aggregate queries.** See [clickhouse](clickhouse.md#the-final-rule). Dedupe with `LIMIT 1 BY <key>` and read versioned
+aggregates by their newest version.
+
+**d. `DateTime64(3)` takes seconds.** A JSON insert of a `DateTime64(3)` reads integers as seconds: insert `1700000000.123`, never `Date.now()`.
+
+**e. Slim images have no `wget` / `curl`.** Container healthchecks use Node's `fetch`. (The ClickHouse image has `wget`.)
+
+**f. The toolbox pipe and filter.** The toolbox `bootstrap()` installs a validation pipe that rejects unknown query parameters (disabled here)
+and a global filter that renders `{error:{...}}` (overridden per controller by `RippleErrorFilter`). A new controller must use
+`@RippleController`, or its errors come out in the wrong shape.
+
+**g. Node >= 20.19.** A lower Node fails at runtime requiring the ESM-only dependencies of `ripple-binary-codec` 2.x. The Dockerfiles pin one patch
+version of `node:22` for both images; `apps/api/src/node-version.spec.ts` checks it.
+
+**h. Flaky e2e under load.** Parallel load on a laptop has caused rare ClickHouse timeouts in the recovery suites; rerun a failing suite
+once in isolation before looking for a bug.

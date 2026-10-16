@@ -1,5 +1,37 @@
 # GateHub Data API: finish it as a drop-in Ripple Data API v2 replacement (XRPL + Xahau)
 
+## As built (errata)
+
+> This spec is the **intent**; the body below is left as written. During implementation a number of decisions ("rulings") refined or overrode it. Where the
+> spec and the built system disagree, **the code and these notes win**. Every deliberate deviation from `data.ripple.com` is listed in
+> [ADR-0010](../../adr/0010-ripple-v2-wire-compatibility.md), the per-endpoint contract is [api-reference](../../api-reference.md), and the design as built is described in
+> [architecture](../../architecture.md), [data-model](../../data-model.md), [syncer](../../syncer.md) and [configuration](../../configuration.md).
+>
+> Changes that make the text below misleading:
+>
+> - **Fee objects (endpoint table, `/v2/network/fees` and `fee_stats`):** the brace lists are sets, not orders. The served order is the original's HBase order:
+>   `avg, max, min, total, tx_count, date, ledger_index?` and `current_ledger_size, current_queue_size, date, expected_ledger_size, median_fee, minimum_fee, open_ledger_fee,
+>   pct_max_queue_size`; validation objects likewise have their keys sorted (the same rule applies to every Ripple object; see the api-reference).
+> - **Interval errors:** `/v2/network/fees` and `fee_stats` answer `invalid interval` (the long `invalid interval - use: ...` text belongs to the volume routes, `use: day, week, month`).
+>   `/v2/stats` answers `invalid interval` too.
+> - **Validations are kept per (ledger, validator), not per reporting node**: the collector's rows are keyed by `(ledger_hash, validation_public_key)` and a validation seen by
+>   several nodes is one row with a summed `count`. Values are served as the original's text (`flags`, `ledger_index`, `full: "true"`), `count` as a number.
+> - **Worker selection** is `GH_WORKERS` (not `GH_SYNCER_WORKERS`); the other variables are in [configuration](../../configuration.md). The variables of the earlier single-network stack (the XRPL network id,
+>   the `GH_BACKFILL` group, the live-subscription switch, the fetch throttle) are gone.
+> - **Codec and runtime:** the API uses `ripple-binary-codec` 2.x (not 1.11), which needs Node >= 20.19; the XRPL and Xahau definitions are bundled
+>   (`packages/shared/config/definitions/<network>.json`) as the fallback for `server_definitions`. `tx`/`meta` are served in the canonical `decode(encode(stored))` form, with a
+>   per-transaction fallback to the stored JSON.
+> - **Volumes:** a trade or payment component's `rate` is units of the component's currency per native coin (so `converted_amount = amount / rate`); historical rows carry `end_time`;
+>   the `minute` live period is not supported; a closed day is final only after the ingest has passed it. `volume_daily` is ordered by `(metric, day, component)`.
+> - **Account semantics not specified by the original:** account stats count transactions *sent* and exclude fee rows; reports use the UTC-day rate; `/accounts/{a}` returns the latest creation.
+> - **Rate limit** 429 text is `Rate limit exceeded, retry in N.NNsec` (two decimals) with a whole-second `Retry-After`; `X-RateLimit-Reset` is a delta.
+> - **Production safety:** the API refuses to boot without keys, and with the placeholder keys `dev-api-key` / `change-me...`. The compose stack's nginx recovers the client address from
+>   `TRUSTED_PROXIES` and the secret `NPM_TOKEN` is a BuildKit secret (no build argument).
+> - **ClickHouse** is pinned to 26.8.14.3; inserts are synchronous (`async_insert=0`) because the dedup tokens and the child-rows-then-commit order depend on it; each insert is tagged with a `query_id`
+>   so a failed run's in-flight queries can be awaited or killed before its tail is deleted (the recovery contract in [syncer](../../syncer.md)).
+> - **Known gaps at the time of writing** (see ADR-0010, section 5): a sub-second `start` is rounded up (the original truncated); a malformed percent escape in a path parameter is rendered in the
+>   toolbox error shape; the live routes carry the global `Cache-Control` and `limit=all` has no overall deadline.
+
 ## Context
 
 `data-api-new` is a pnpm monorepo: NestJS + ClickHouse, with `apps/api`, `apps/syncer` and

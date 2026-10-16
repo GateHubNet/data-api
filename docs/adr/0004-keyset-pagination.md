@@ -1,6 +1,10 @@
 # ADR-0004: Keyset (cursor) pagination instead of offset
 
-**Status:** Accepted
+**Status:** **Superseded** by [ADR-0007](0007-ledger-index-axis-and-secondary-tables.md) for the key of the marker; the keyset mechanism itself stands.
+
+> The marker described here encoded a date-led tuple `(date, ledger_index, tx_index)`. Markers now encode the ledger-ordered key of the list
+> (`ledger_index, tx_index[, node_index]`, or the key of the secondary table) and **never a DateTime**; `start`/`end` are resolved to a ledger range
+> once per request. Everything else below (opaque base64url token, tuple comparison, `limit + 1` to decide whether there is a next page, a `Link` header) holds.
 
 ## Context
 List endpoints return large, time-ordered result sets that clients page through. The old ES

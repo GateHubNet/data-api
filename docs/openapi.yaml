@@ -1,464 +1,2357 @@
-openapi: 3.0.3
+# OpenAPI 3.0 document of the GateHub Data API (Ripple Data API v2 compatible).
+#
+# GENERATED from the running app, do not edit by hand: the descriptions come from the Swagger decorators of the controllers in
+# apps/api/src. Regenerate it after changing a controller (see docs/development.md, "OpenAPI"):
+#
+#   1. pnpm --filter @gatehub/data-api-shared build && pnpm --filter @gatehub/data-api-service build
+#   2. start the API (it does not need a reachable ClickHouse to boot and serve its docs), for example
+#        env -i PATH="$PATH" NODE_ENV=development GH_ENV=container GH_API_KEYS=any GH_CLICKHOUSE_URL=http://127.0.0.1:1 \
+#          GH_HTTP_API_PORT=23001 GH_METRICZ_PORT=23000 node apps/api/dist/main.js
+#   3. curl -s http://127.0.0.1:23001/internal/docs-json | ruby -ryaml -rjson -e 'puts JSON.parse(STDIN.read).to_yaml' > docs/openapi.yaml
+#      (and put this comment back on top)
+#
+# Read this together with docs/api-reference.md:
+#  - Every /v2/* path needs an API key: `X-API-Key: <key>` or `Authorization: Bearer <key>`. The `securitySchemes` at the end
+#    of this file are the defaults of the @gatehub/toolbox bootstrap (a JWT bearer and a cookie); they do not describe this
+#    API's key and no path references them.
+#  - Errors are `{"result":"error","message":"..."}` (429: `{"error":"Rate limit exceeded, retry in N.NNsec"}`), see api-reference.md.
+#  - The generated document lists parameters and descriptions, not response schemas: the bodies are documented in
+#    api-reference.md.
+#  - One deployment serves one network (XRPL or Xahau); the paths are the same on both.
+---
+openapi: 3.0.0
+paths:
+  "/liveliness/healthz":
+    get:
+      operationId: LivelinessController_check
+      parameters: []
+      responses:
+        '200':
+          description: The Health Check is successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  info:
+                    type: object
+                    example:
+                      database:
+                        status: up
+                    additionalProperties:
+                      type: object
+                      required:
+                      - status
+                      properties:
+                        status:
+                          type: string
+                      additionalProperties: true
+                    nullable: true
+                  error:
+                    type: object
+                    example: {}
+                    additionalProperties:
+                      type: object
+                      required:
+                      - status
+                      properties:
+                        status:
+                          type: string
+                      additionalProperties: true
+                    nullable: true
+                  details:
+                    type: object
+                    example:
+                      database:
+                        status: up
+                    additionalProperties:
+                      type: object
+                      required:
+                      - status
+                      properties:
+                        status:
+                          type: string
+                      additionalProperties: true
+        '503':
+          description: The Health Check is not successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: error
+                  info:
+                    type: object
+                    example:
+                      database:
+                        status: up
+                    additionalProperties:
+                      type: object
+                      required:
+                      - status
+                      properties:
+                        status:
+                          type: string
+                      additionalProperties: true
+                    nullable: true
+                  error:
+                    type: object
+                    example:
+                      redis:
+                        status: down
+                        message: Could not connect
+                    additionalProperties:
+                      type: object
+                      required:
+                      - status
+                      properties:
+                        status:
+                          type: string
+                      additionalProperties: true
+                    nullable: true
+                  details:
+                    type: object
+                    example:
+                      database:
+                        status: up
+                      redis:
+                        status: down
+                        message: Could not connect
+                    additionalProperties:
+                      type: object
+                      required:
+                      - status
+                      properties:
+                        status:
+                          type: string
+                      additionalProperties: true
+  "/v2/ledgers":
+    get:
+      operationId: LedgersController_getLedger
+      summary: Get a ledger
+      description: A ledger by index, hash or date (the ledger that closed at or before
+        it), or the latest validated ledger. `binary` wins over `expand`, and both
+        win over `transactions`.
+      parameters:
+      - name: binary
+        required: false
+        in: query
+        description: Include the transactions as hex.
+        schema:
+          type: boolean
+      - name: expand
+        required: false
+        in: query
+        description: Include the transactions as JSON.
+        schema:
+          type: boolean
+      - name: transactions
+        required: false
+        in: query
+        description: Include the transaction hashes.
+        schema:
+          type: boolean
+      - name: date
+        required: false
+        in: query
+        description: Used when there is no identifier in the path.
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: Used when there is no identifier in the path.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: Used when there is no identifier in the path.
+        schema: {}
+      - name: ledger_param
+        required: false
+        in: path
+        description: 'Ledger index (digits), date (`YYYY-MM-DD[THH:mm:ss]`) or ledger
+          hash (even-length hex). Omitted: the latest ledger.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - ledgers
+  "/v2/ledgers/{ledger_param}":
+    get:
+      operationId: LedgersController_getLedger
+      summary: Get a ledger
+      description: A ledger by index, hash or date (the ledger that closed at or before
+        it), or the latest validated ledger. `binary` wins over `expand`, and both
+        win over `transactions`.
+      parameters:
+      - name: binary
+        required: false
+        in: query
+        description: Include the transactions as hex.
+        schema:
+          type: boolean
+      - name: expand
+        required: false
+        in: query
+        description: Include the transactions as JSON.
+        schema:
+          type: boolean
+      - name: transactions
+        required: false
+        in: query
+        description: Include the transaction hashes.
+        schema:
+          type: boolean
+      - name: date
+        required: false
+        in: query
+        description: Used when there is no identifier in the path.
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: Used when there is no identifier in the path.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: Used when there is no identifier in the path.
+        schema: {}
+      - name: ledger_param
+        required: false
+        in: path
+        description: 'Ledger index (digits), date (`YYYY-MM-DD[THH:mm:ss]`) or ledger
+          hash (even-length hex). Omitted: the latest ledger.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - ledgers
+  "/v2/last_validated":
+    get:
+      operationId: LastValidatedController_getLastValidated
+      summary: Get the last validated ledger
+      parameters: []
+      responses:
+        '200':
+          description: ''
+      tags:
+      - last_validated
+  "/v2/transactions/{tx_hash}":
+    get:
+      operationId: TransactionsController_getTransaction
+      summary: Get a transaction
+      description: A transaction by its hash (any case). `binary=true` gives `tx`
+        and `meta` as hex.
+      parameters:
+      - name: tx_hash
+        required: true
+        in: path
+        description: 'The transaction hash: an even number of hex digits.'
+        schema:
+          type: string
+      - name: binary
+        required: false
+        in: query
+        description: Serve `tx` and `meta` as hex.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - transactions
+  "/v2/transactions":
+    get:
+      operationId: TransactionsController_list
+      summary: Get transactions
+      description: The transactions of the ledgers that closed between `start` and
+        `end`, oldest first, each with the hash of its ledger. `type` and `result`
+        are the names of the network (`Payment`, `tesSUCCESS`).
+      parameters:
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 20, at most 100.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: binary
+        required: false
+        in: query
+        description: Serve `tx` and `meta` as hex.
+        schema:
+          type: boolean
+      - name: result
+        required: false
+        in: query
+        description: Only this transaction result code.
+        schema: {}
+      - name: type
+        required: false
+        in: query
+        description: Only this transaction type.
+        schema: {}
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - transactions
+  "/v2/payments":
+    get:
+      operationId: PaymentsController_list
+      summary: Get payments
+      description: The `Payment` transactions between two different accounts of the
+        ledgers that closed between `start` and `end`, oldest first; with a currency
+        in the path, only the payments of that currency. `format=csv` gives the payments
+        as a flat CSV file.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      - name: currency
+        required: false
+        in: path
+        description: 'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          or the native currency alone. Omitted: all currencies.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - payments
+  "/v2/payments/{currency}":
+    get:
+      operationId: PaymentsController_list
+      summary: Get payments
+      description: The `Payment` transactions between two different accounts of the
+        ledgers that closed between `start` and `end`, oldest first; with a currency
+        in the path, only the payments of that currency. `format=csv` gives the payments
+        as a flat CSV file.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      - name: currency
+        required: false
+        in: path
+        description: 'A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          or the native currency alone. Omitted: all currencies.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - payments
+  "/v2/exchanges/{base}/{counter}":
+    get:
+      operationId: ExchangesController_pair
+      summary: Get the exchanges of a pair
+      description: 'The trades between `base` and `counter` of the ledgers that closed
+        between `start` and `end`, oldest first. A pair asked for in the reverse order
+        of the stored one is inverted: base and counter, buyer and seller swap and
+        the rate is 1/rate. With `interval`, the candles of the buckets that start
+        between `start` and `end` (open, high, low, close, vwap, volumes, count);
+        with `reduce=true`, one such row of the whole window. An exchange whose native
+        leg is 0.0005 or less is left out of both. `format=csv` gives the rows as
+        a CSV file.'
+      parameters:
+      - name: base
+        required: true
+        in: path
+        description: A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          or the native currency alone.
+        schema:
+          type: string
+      - name: counter
+        required: true
+        in: path
+        description: The other side of the pair, written like `base`.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 400.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: autobridged
+        required: false
+        in: query
+        description: Only the autobridged exchanges.
+        schema:
+          type: boolean
+      - name: reduce
+        required: false
+        in: query
+        description: One row of all the exchanges of the window. Not with `interval`.
+        schema:
+          type: boolean
+      - name: interval
+        required: false
+        in: query
+        description: Candles of this interval (`week` is `7day`, the ISO week) instead
+          of the exchanges.
+        schema:
+          enum:
+          - 1minute
+          - 5minute
+          - 15minute
+          - 30minute
+          - 1hour
+          - 2hour
+          - 4hour
+          - 1day
+          - 3day
+          - 7day
+          - 1month
+          - 1year
+          - week
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - exchanges
+  "/v2/exchanges":
+    get:
+      operationId: ExchangesController_all
+      summary: Get the exchanges of every pair
+      description: 'The trades of all pairs of the ledgers that closed between `start`
+        and `end`, oldest first, each with the pair it is stored under. Reads every
+        exchange of the range: ask for a window.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 400.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: autobridged
+        required: false
+        in: query
+        description: Only the autobridged exchanges.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - exchanges
+  "/v2/exchange_rates/{base}/{counter}":
+    get:
+      operationId: ExchangeRatesController_rate
+      summary: Get the exchange rate of a pair
+      description: 'How many `counter` one `base` buys at `date`: the average of the
+        volume weighted price of the day of `date` up to it and of the last 50 trades
+        in the 14 days before it, or the latter alone when the day has none. The last
+        trades count only when there are at least 10 of them, unless `strict=false`.
+        With `period`, the volume weighted price of the window of that length that
+        ends a second before `date`. The same asset on both sides is 1; a rate that
+        cannot be told is 0. Trades whose native leg is 0.0005 or less are left out.'
+      parameters:
+      - name: base
+        required: true
+        in: path
+        description: A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          or the native currency alone.
+        schema:
+          type: string
+      - name: counter
+        required: true
+        in: path
+        description: The other side of the pair, written like `base`.
+        schema:
+          type: string
+      - name: live
+        required: false
+        in: query
+        description: 'Leave out the daily rate: only the latest trades.'
+        schema:
+          type: boolean
+      - name: period
+        required: false
+        in: query
+        description: The rate over a rolling window that ends a second before `date`,
+          instead of the daily and the latest rate.
+        schema:
+          enum:
+          - hour
+          - day
+          - 3day
+          - 7day
+          - 30day
+          type: string
+      - name: strict
+        required: false
+        in: query
+        description: 'Default true: the last trades count only when there are at least
+          10. `false` counts however many there are.'
+        schema:
+          type: boolean
+      - name: date
+        required: false
+        in: query
+        description: 'The moment the rate is as of, not in the future. Default: now.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - exchange_rates
+  "/v2/normalize":
+    get:
+      operationId: NormalizeController_normalize
+      summary: Convert an amount between currencies
+      description: 'Converts `amount` of `currency` into `exchange_currency` at the
+        rate of `date`: `rate(currency -> native) / rate(exchange_currency -> native)`,
+        each the rate of `/v2/exchange_rates`. The same currency and issuer on both
+        sides is rate 1; a currency without a rate gives 0.'
+      parameters:
+      - name: strict
+        required: false
+        in: query
+        description: As for `/v2/exchange_rates`. Default true.
+        schema:
+          type: boolean
+      - name: date
+        required: false
+        in: query
+        description: 'The moment the rates are as of, not in the future. Default:
+          now.'
+        schema: {}
+      - name: exchange_issuer
+        required: false
+        in: query
+        description: Required for every currency but the native one.
+        schema: {}
+      - name: exchange_currency
+        required: false
+        in: query
+        description: 'The currency to convert to. Default: the native currency.'
+        schema: {}
+      - name: issuer
+        required: false
+        in: query
+        description: Required for every currency but the native one.
+        schema: {}
+      - name: currency
+        required: false
+        in: query
+        description: 'Default: the native currency.'
+        schema: {}
+      - name: amount
+        required: true
+        in: query
+        description: The amount to convert, a number.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - normalize
+  "/v2/accounts":
+    get:
+      operationId: AccountsController_list
+      summary: Get the accounts created
+      description: The accounts created in the ledgers that closed between `start`
+        and `end`, oldest first, each with the account that created it (`parent`),
+        the balance it was created with and when. With `parent`, only the accounts
+        that address created. `format=csv` gives the accounts as a CSV file.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: parent
+        required: false
+        in: query
+        description: Only the accounts this address created.
+        schema: {}
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}":
+    get:
+      operationId: AccountsController_lookup
+      summary: Get an account
+      description: When and by whom an account was created. An address that was created
+        more than once (deleted and funded again) answers with its latest creation.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/transactions/{sequence}":
+    get:
+      operationId: AccountTransactionsController_getBySequence
+      summary: Get an account transaction by sequence
+      description: The transaction the account sent with this `Sequence`. Transactions
+        that use a ticket have Sequence 0; there the latest of them is returned. `binary=true`
+        gives `tx` and `meta` as hex.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: sequence
+        required: true
+        in: path
+        description: The sequence number of the transaction (digits).
+        schema:
+          type: string
+      - name: binary
+        required: false
+        in: query
+        description: Serve `tx` and `meta` as hex.
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/transactions":
+    get:
+      operationId: AccountTransactionsController_list
+      summary: Get the transactions of an account
+      description: Every transaction that affects the account (sent, received, or
+        touching one of its offers or trust lines) in the ledgers that closed between
+        `start` and `end`, oldest first. With `min_sequence` or `max_sequence` the
+        list is instead the transactions the account sent, by their sequence number,
+        and `start` and `end` are ignored. `type` and `result` are the names of the
+        network (`Payment`, `tesSUCCESS`).
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 20, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: binary
+        required: false
+        in: query
+        description: Serve `tx` and `meta` as hex.
+        schema:
+          type: boolean
+      - name: result
+        required: false
+        in: query
+        description: Only this transaction result code.
+        schema: {}
+      - name: type
+        required: false
+        in: query
+        description: Only this transaction type.
+        schema: {}
+      - name: max_sequence
+        required: false
+        in: query
+        description: Highest sequence number, included.
+        schema:
+          type: number
+      - name: min_sequence
+        required: false
+        in: query
+        description: Lowest sequence number, included.
+        schema:
+          type: number
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the first ledger.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/payments":
+    get:
+      operationId: AccountPaymentsController_list
+      summary: Get the payments of an account
+      description: The `Payment` transactions the account sent or received in the
+        ledgers that closed between `start` and `end`, oldest first, as `GET /v2/payments`
+        serves them. `type` keeps the ones it `sent` or `received`, `currency`, `issuer`,
+        `source_tag` and `destination_tag` the ones with that currency, issuer or
+        tag. `format=csv` gives the payments as a flat CSV file.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: destination_tag
+        required: false
+        in: query
+        description: Only payments with this destination tag.
+        schema:
+          type: number
+      - name: source_tag
+        required: false
+        in: query
+        description: Only payments with this source tag.
+        schema:
+          type: number
+      - name: issuer
+        required: false
+        in: query
+        description: Only payments of this issuer.
+        schema: {}
+      - name: currency
+        required: false
+        in: query
+        description: Only payments of this currency.
+        schema: {}
+      - name: type
+        required: false
+        in: query
+        description: Only payments sent or received.
+        schema:
+          enum:
+          - sent
+          - received
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/exchanges":
+    get:
+      operationId: AccountExchangesController_list
+      summary: Get the exchanges of an account
+      description: 'The trades the account took part in, as buyer or as seller, in
+        the ledgers that closed between `start` and `end`, oldest first. Each is the
+        exchange `GET /v2/exchanges` serves, plus the `client` when there is one.
+        With `base`, only the trades of that asset, and with `counter` only against
+        that asset, in whichever order the pair is stored: a trade stored the other
+        way round is inverted (base and counter, buyer and seller swap, the rate is
+        1/rate). `format=csv` gives the trades as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      - name: counter
+        required: false
+        in: path
+        description: The other side of the pair, written like `base`.
+        schema: {}
+      - name: base
+        required: false
+        in: path
+        description: 'A currency, with its issuer or without: `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          `USD`, or the native currency.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/exchanges/{base}":
+    get:
+      operationId: AccountExchangesController_list
+      summary: Get the exchanges of an account
+      description: 'The trades the account took part in, as buyer or as seller, in
+        the ledgers that closed between `start` and `end`, oldest first. Each is the
+        exchange `GET /v2/exchanges` serves, plus the `client` when there is one.
+        With `base`, only the trades of that asset, and with `counter` only against
+        that asset, in whichever order the pair is stored: a trade stored the other
+        way round is inverted (base and counter, buyer and seller swap, the rate is
+        1/rate). `format=csv` gives the trades as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      - name: counter
+        required: false
+        in: path
+        description: The other side of the pair, written like `base`.
+        schema: {}
+      - name: base
+        required: false
+        in: path
+        description: 'A currency, with its issuer or without: `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          `USD`, or the native currency.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/exchanges/{base}/{counter}":
+    get:
+      operationId: AccountExchangesController_list
+      summary: Get the exchanges of an account
+      description: 'The trades the account took part in, as buyer or as seller, in
+        the ledgers that closed between `start` and `end`, oldest first. Each is the
+        exchange `GET /v2/exchanges` serves, plus the `client` when there is one.
+        With `base`, only the trades of that asset, and with `counter` only against
+        that asset, in whichever order the pair is stored: a trade stored the other
+        way round is inverted (base and counter, buyer and seller swap, the rate is
+        1/rate). `format=csv` gives the trades as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      - name: counter
+        required: false
+        in: path
+        description: The other side of the pair, written like `base`.
+        schema: {}
+      - name: base
+        required: false
+        in: path
+        description: 'A currency, with its issuer or without: `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          `USD`, or the native currency.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/balance_changes":
+    get:
+      operationId: AccountBalanceChangesController_list
+      summary: Get the balance changes of an account
+      description: Every change of a balance of the account (the native currency and
+        its trust lines) made by the transactions of the ledgers that closed between
+        `start` and `end`, oldest first; the fee of a transaction comes first, as
+        a `transaction_cost` without a `node_index`. `currency`, `counterparty` (alias
+        `issuer`) and `change_type` (alias `type`) keep the changes of that currency,
+        against that counterparty, of that kind. `format=csv` gives the changes as
+        a CSV file.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: change_type
+        required: false
+        in: query
+        description: 'Only changes of this kind. Alias: type.'
+        schema:
+          enum:
+          - transaction_cost
+          - exchange
+          - intermediary
+          - payment_source
+          - payment_destination
+          - escrow_create
+          - escrow_cancel
+          - escrow_finish
+          - paychannel_fund
+          - paychannel_payout
+          type: string
+      - name: counterparty
+        required: false
+        in: query
+        description: 'Only changes against this counterparty; not with the native
+          currency. Alias: issuer.'
+        schema: {}
+      - name: currency
+        required: false
+        in: query
+        description: Only changes of this currency.
+        schema: {}
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/balances":
+    get:
+      operationId: AccountBalancesController_list
+      summary: Get the balances of an account
+      description: The balances of the account on a ledger of the live node, the native
+        one first (it has no `counterparty`), then the trust lines in the order of
+        the node. The ledger is chosen by `ledger_index`, `ledger_hash` or `date`
+        (the last ledger closed at or before it, answered with its `close_time`);
+        without any of them it is the newest validated one. `currency` keeps the balances
+        of one currency, `counterparty` the trust lines with one account. `limit=all`
+        reads every trust line. `format=csv` gives the balances as a CSV file.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 400, or `all`.
+        schema: {}
+      - name: counterparty
+        required: false
+        in: query
+        description: 'Only trust lines with this account. Alias: `issuer`.'
+        schema: {}
+      - name: currency
+        required: false
+        in: query
+        description: Only balances in this currency.
+        schema: {}
+      - name: date
+        required: false
+        in: query
+        description: 'The last ledger closed at or before this time. Alias: `close_time`.'
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of the ledger.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: 'A ledger number. Alias: `ledger`.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/orders":
+    get:
+      operationId: AccountOrdersController_list
+      summary: Get the open orders of an account
+      description: The offers the account has on the book, on a ledger of the live
+        node, in the order of the node. A buy has the quantity it pays for and the
+        total price it gets; a sell (the offer has the sell flag) the other way round.
+        `makerExchangeRate` is the quality of the offer in whole units. The ledger
+        is chosen by `ledger_index`, `ledger_hash` or `date` (the last ledger closed
+        at or before it, answered with its `close_time`); without any of them it is
+        the newest validated one. `limit=all` reads every offer. `format=csv` gives
+        the orders as a flat CSV file.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 400, or `all`.
+        schema: {}
+      - name: date
+        required: false
+        in: query
+        description: 'The last ledger closed at or before this time. Alias: `close_time`.'
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of the ledger.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: 'A ledger number. Alias: `ledger`.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/reports":
+    get:
+      operationId: AccountReportsController_report
+      summary: Get the daily reports of an account
+      description: 'A report for each UTC day from `start` to `end` (at most 200 days;
+        `/{date}` is the one day), with zeros for a day without payments. It has the
+        number of `Payment`s the account sent and received, the largest of each and
+        their total value (`total_value` is the two totals together), and the accounts
+        it paid (`receiving_counterparties`) and was paid by (`sending_counterparties`):
+        their number, or the accounts with `accounts`. The values are in the native
+        currency: an issued currency counts at the rate of the day (`/v2/exchange_rates`,
+        in strict mode), and as 0 where it has none. `payments` lists each payment
+        with its delivered amount. `format=csv` gives the reports as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: descending
+        required: false
+        in: query
+        description: Newest day first.
+        schema:
+          type: boolean
+      - name: payments
+        required: false
+        in: query
+        description: List the payments of each day.
+        schema:
+          type: boolean
+      - name: accounts
+        required: false
+        in: query
+        description: 'The counterparties themselves instead of their number. Alias:
+          `counterparties`.'
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'The last day, whole. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The first day. Default: now.'
+        schema: {}
+      - name: date
+        required: false
+        in: path
+        description: 'One day: the report of the day of this date.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/reports/{date}":
+    get:
+      operationId: AccountReportsController_report
+      summary: Get the daily reports of an account
+      description: 'A report for each UTC day from `start` to `end` (at most 200 days;
+        `/{date}` is the one day), with zeros for a day without payments. It has the
+        number of `Payment`s the account sent and received, the largest of each and
+        their total value (`total_value` is the two totals together), and the accounts
+        it paid (`receiving_counterparties`) and was paid by (`sending_counterparties`):
+        their number, or the accounts with `accounts`. The values are in the native
+        currency: an issued currency counts at the rate of the day (`/v2/exchange_rates`,
+        in strict mode), and as 0 where it has none. `payments` lists each payment
+        with its delivered amount. `format=csv` gives the reports as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: descending
+        required: false
+        in: query
+        description: Newest day first.
+        schema:
+          type: boolean
+      - name: payments
+        required: false
+        in: query
+        description: List the payments of each day.
+        schema:
+          type: boolean
+      - name: accounts
+        required: false
+        in: query
+        description: 'The counterparties themselves instead of their number. Alias:
+          `counterparties`.'
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'The last day, whole. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The first day. Default: now.'
+        schema: {}
+      - name: date
+        required: false
+        in: path
+        description: 'One day: the report of the day of this date.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/stats/{family}":
+    get:
+      operationId: AccountStatsController_list
+      summary: Get the daily stats of an account
+      description: 'A row for each UTC day from `start` up to, but not including,
+        `end`, in which the account was active; a day without activity has no row.
+        `family=transactions`: `{date, transaction_count, result, type}`, the transactions
+        the account sent that day, with how many had each result code and each transaction
+        type. `family=value`: `{date, account_value, balance_change_count}`, what
+        the account held at the end of the day in the native currency (the native
+        balance, plus each issued currency it holds at the rate of the day, as a string;
+        what the account owes is not counted) and how many times its balances changed
+        that day, not counting the fee. `format=csv` gives the rows as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: family
+        required: true
+        in: path
+        description: 'What to count: `transactions` or `value`.'
+        schema:
+          enum:
+          - transactions
+          - value
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest day first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'Where the days stop, exclusive: `end=2015-01-16` is the days
+          before it. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The first day, from its midnight on. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/active_accounts/{base}/{counter}":
+    get:
+      operationId: ActiveAccountsController_activeAccounts
+      summary: Get the active accounts of a pair
+      description: 'The accounts that took part in an exchange of the pair in the
+        window, with what each bought (`buy`) and sold (`sell`) in volume and count
+        and the totals, sorted by base volume, the largest first. An account is in
+        the list of the seller and of the buyer of every exchange (one that trades
+        with itself counts on both sides). With `date` the window runs from it to
+        `period` after it, and to the end of the day, hour, ... the date names; without,
+        it is the `period` before now. A pair asked for in the reverse order of the
+        stored one is inverted: base and counter, buy and sell swap. `include_exchanges`
+        adds the exchanges of each account. `format=csv` gives the accounts as a CSV
+        file.'
+      parameters:
+      - name: base
+        required: true
+        in: path
+        description: A currency and its issuer, `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
+          or the native currency alone.
+        schema:
+          type: string
+      - name: counter
+        required: true
+        in: path
+        description: The other side of the pair, written like `base`.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: include_exchanges
+        required: false
+        in: query
+        description: 'Any text that is not empty: add the exchanges of each account.'
+        schema: {}
+      - name: date
+        required: false
+        in: query
+        description: 'The start of the window. Default: the window ends now.'
+        schema: {}
+      - name: period
+        required: false
+        in: query
+        description: 'Default: 1day.'
+        schema:
+          enum:
+          - 1day
+          - 3day
+          - 7day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - active_accounts
+  "/v2/network/fees":
+    get:
+      operationId: FeesController_networkFees
+      summary: Get the fees paid on the network
+      description: 'The fees of the transactions in each ledger, hour or day, in the
+        native currency: the mean, the smallest and the largest fee, the total and
+        the number of transactions. An hour or a day is listed when it starts within
+        `start` and `end`, and counts all its ledgers. `format=csv` gives the rows
+        as a CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: ledger.'
+        schema:
+          enum:
+          - ledger
+          - hour
+          - day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/fee_stats":
+    get:
+      operationId: FeesController_networkFeeStats
+      summary: Get the fee state of the network over time
+      description: 'Snapshots of the node''s fee state, taken every few seconds: the
+        size of the open ledger and of the queue, the percentage of the queue in use,
+        and the median, the minimum and the open ledger fee in the native currency.
+        With `interval`, the first snapshot at or after each minute, hour or day.
+        `format=csv` gives the rows as a CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2016-07-01.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: raw.'
+        schema:
+          enum:
+          - raw
+          - minute
+          - hour
+          - day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/exchange_volume":
+    get:
+      operationId: VolumeController_exchangeVolume
+      summary: Get the volume of the trades on the network
+      description: 'The trades of the markets of the markets config, in the native
+        currency: per market the base volume, the number of trades and the rate, and
+        the volume converted to the native currency (through the native market of
+        the base or the counter currency; a market without a rate is left out). Without
+        `start` and `end`, the live row of the rolling period `live` (hour, day, 3day,
+        7day, 30day; default day). With them, a row per `interval` (day, week from
+        Monday, month, UTC) for the days that were computed: a bucket is a row when
+        it starts within `start` and `end`, whole. `exchange_currency` / `exchange_issuer`
+        show the amounts in another currency, at the rate of the live trades (live)
+        or the volume weighted price of the bucket (historical).'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: exchange_issuer
+        required: false
+        in: query
+        description: Required for every currency but the native one.
+        schema: {}
+      - name: exchange_currency
+        required: false
+        in: query
+        description: 'Default: the native currency.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'End time of the historical rows. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time of the historical rows. Default: the epoch.'
+        schema: {}
+      - name: live
+        required: false
+        in: query
+        description: 'Default: day. Ignored with start or end.'
+        schema:
+          enum:
+          - hour
+          - day
+          - 3day
+          - 7day
+          - 30day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/payment_volume":
+    get:
+      operationId: VolumeController_paymentVolume
+      summary: Get the volume of the payments on the network
+      description: The payments in the native currency and in the currencies of the
+        markets config, with the amount, the number of payments and the rate each
+        currency was converted to the native currency with (at the start of the period).
+        A currency without a rate is counted but not listed. Without `start` and `end`,
+        the live row of the rolling period `live` (hour, day; default day). With them,
+        a row per `interval`. `exchange_currency` / `exchange_issuer` as for the exchange
+        volume.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: exchange_issuer
+        required: false
+        in: query
+        description: Required for every currency but the native one.
+        schema: {}
+      - name: exchange_currency
+        required: false
+        in: query
+        description: 'Default: the native currency.'
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'End time of the historical rows. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time of the historical rows. Default: the epoch.'
+        schema: {}
+      - name: live
+        required: false
+        in: query
+        description: 'Default: day. Ignored with start or end.'
+        schema:
+          enum:
+          - hour
+          - day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/ledgers/{ledger_hash}/validations":
+    get:
+      operationId: ValidationsController_list
+      summary: Get the validations of a ledger
+      description: The validations the network made of the ledger with this hash,
+        one per validator, sorted by validator key. `format=csv` gives them as a CSV
+        file.
+      parameters:
+      - name: ledger_hash
+        required: true
+        in: path
+        description: 'The hash of the ledger: hex, of even length.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      responses:
+        '200':
+          description: ''
+      tags:
+      - ledgers
+  "/v2/ledger/{ledger_hash}/validations":
+    get:
+      operationId: ValidationsController_list
+      summary: Get the validations of a ledger
+      description: The validations the network made of the ledger with this hash,
+        one per validator, sorted by validator key. `format=csv` gives them as a CSV
+        file.
+      parameters:
+      - name: ledger_hash
+        required: true
+        in: path
+        description: 'The hash of the ledger: hex, of even length.'
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      responses:
+        '200':
+          description: ''
+      tags:
+      - ledgers
+  "/v2/ledgers/{ledger_hash}/validations/{pubkey}":
+    get:
+      operationId: ValidationsController_get
+      summary: Get the validation of a ledger by one validator
+      description: 'The validation object itself, with `result: "success"`.'
+      parameters:
+      - name: ledger_hash
+        required: true
+        in: path
+        description: 'The hash of the ledger: hex, of even length.'
+        schema:
+          type: string
+      - name: pubkey
+        required: true
+        in: path
+        description: The public key of the validator.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - ledgers
+  "/v2/ledger/{ledger_hash}/validations/{pubkey}":
+    get:
+      operationId: ValidationsController_get
+      summary: Get the validation of a ledger by one validator
+      description: 'The validation object itself, with `result: "success"`.'
+      parameters:
+      - name: ledger_hash
+        required: true
+        in: path
+        description: 'The hash of the ledger: hex, of even length.'
+        schema:
+          type: string
+      - name: pubkey
+        required: true
+        in: path
+        description: The public key of the validator.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - ledgers
+  "/v2/stats":
+    get:
+      operationId: StatsController_list
+      summary: Get statistics of the network
+      description: Transactions (by type and by result), payments, exchanges, created
+        accounts and ledgers per hour, day or week (Monday to Sunday, UTC), with the
+        average number of transactions per ledger and the average time between ledgers.
+        Without a family a row is `{date, type, result, metric}`; with `type`, `result`
+        or `metric` (in the path or in `family`) it holds the values of that family
+        and `date`, and `metrics` (a list) or the last part of the path picks some
+        of them. What is zero is left out. A bucket is listed when it starts within
+        `start` and `end`. `format=csv` gives the rows as a CSV file.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      - name: metrics
+        required: false
+        in: query
+        description: Comma separated names in the family; needs a family.
+        schema: {}
+      - name: family
+        required: false
+        in: query
+        description: As in the path.
+        schema:
+          enum:
+          - type
+          - result
+          - metric
+          type: string
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - hour
+          - day
+          - week
+          type: string
+      - name: metric
+        required: false
+        in: path
+        description: A transaction type, a result code or a metric of the family.
+        schema: {}
+      - name: family
+        required: false
+        in: path
+        schema:
+          enum:
+          - type
+          - result
+          - metric
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - stats
+  "/v2/stats/{family}":
+    get:
+      operationId: StatsController_list
+      summary: Get statistics of the network
+      description: Transactions (by type and by result), payments, exchanges, created
+        accounts and ledgers per hour, day or week (Monday to Sunday, UTC), with the
+        average number of transactions per ledger and the average time between ledgers.
+        Without a family a row is `{date, type, result, metric}`; with `type`, `result`
+        or `metric` (in the path or in `family`) it holds the values of that family
+        and `date`, and `metrics` (a list) or the last part of the path picks some
+        of them. What is zero is left out. A bucket is listed when it starts within
+        `start` and `end`. `format=csv` gives the rows as a CSV file.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      - name: metrics
+        required: false
+        in: query
+        description: Comma separated names in the family; needs a family.
+        schema: {}
+      - name: family
+        required: false
+        in: query
+        description: As in the path.
+        schema:
+          enum:
+          - type
+          - result
+          - metric
+          type: string
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - hour
+          - day
+          - week
+          type: string
+      - name: metric
+        required: false
+        in: path
+        description: A transaction type, a result code or a metric of the family.
+        schema: {}
+      - name: family
+        required: false
+        in: path
+        schema:
+          enum:
+          - type
+          - result
+          - metric
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - stats
+  "/v2/stats/{family}/{metric}":
+    get:
+      operationId: StatsController_list
+      summary: Get statistics of the network
+      description: Transactions (by type and by result), payments, exchanges, created
+        accounts and ledgers per hour, day or week (Monday to Sunday, UTC), with the
+        average number of transactions per ledger and the average time between ledgers.
+        Without a family a row is `{date, type, result, metric}`; with `type`, `result`
+        or `metric` (in the path or in `family`) it holds the values of that family
+        and `date`, and `metrics` (a list) or the last part of the path picks some
+        of them. What is zero is left out. A bucket is listed when it starts within
+        `start` and `end`. `format=csv` gives the rows as a CSV file.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: 2013-01-01.'
+        schema: {}
+      - name: metrics
+        required: false
+        in: query
+        description: Comma separated names in the family; needs a family.
+        schema: {}
+      - name: family
+        required: false
+        in: query
+        description: As in the path.
+        schema:
+          enum:
+          - type
+          - result
+          - metric
+          type: string
+      - name: interval
+        required: false
+        in: query
+        description: 'Default: day.'
+        schema:
+          enum:
+          - hour
+          - day
+          - week
+          type: string
+      - name: metric
+        required: false
+        in: path
+        description: A transaction type, a result code or a metric of the family.
+        schema: {}
+      - name: family
+        required: false
+        in: path
+        schema:
+          enum:
+          - type
+          - result
+          - metric
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - stats
 info:
-  title: GateHub XRPL Data API
-  version: 2.0.0
-  description: >
-    Historical XRP Ledger data — payments, exchanges, ledgers, accounts and network
-    analytics — served from ClickHouse. List endpoints use cursor (keyset) pagination:
-    pass the `marker` from a response as the `marker` query param to fetch the next page.
-    This document is also generated live by the running service at `/internal/docs/json`.
-servers:
-  - url: http://localhost:3001
-    description: Local
-  - url: https://api.gatehub.net/data-api
-    description: Production
-tags:
-  - name: payments
-  - name: transactions
-  - name: ledgers
-  - name: exchanges
-  - name: network
-  - name: stats
-  - name: accounts
-  - name: ops
-
-# All endpoints require an API key except the ops paths (health/metrics/docs).
-# Send it as `X-API-Key: <key>` or `Authorization: Bearer <key>`.
-security:
-  - apiKey: []
-  - bearer: []
-
+  title: data-api
+  description: Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.
+  version: 0.0.1
+  contact: {}
+tags: []
+servers: []
 components:
   securitySchemes:
-    apiKey:
-      type: apiKey
-      in: header
-      name: X-API-Key
     bearer:
-      type: http
       scheme: bearer
-  parameters:
-    start:
-      name: start
-      in: query
-      schema: { type: string, format: date-time }
-      description: Inclusive start time (ISO-8601).
-    end:
-      name: end
-      in: query
-      schema: { type: string, format: date-time }
-      description: Inclusive end time (ISO-8601).
-    limit:
-      name: limit
-      in: query
-      schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
-    descending:
-      name: descending
-      in: query
-      schema: { type: boolean, default: false }
-    marker:
-      name: marker
-      in: query
-      schema: { type: string }
-      description: Opaque pagination cursor from the previous response.
-  schemas:
-    ListEnvelope:
-      type: object
-      properties:
-        result: { type: string, enum: [success] }
-        marker: { type: string, nullable: true }
-        count: { type: integer }
-      required: [result, count]
-    Payment:
-      type: object
-      properties:
-        tx_hash: { type: string }
-        source: { type: string }
-        destination: { type: string }
-        currency: { type: string }
-        issuer: { type: string }
-        amount: { type: number }
-        delivered_amount: { type: number }
-        source_currency: { type: string }
-        fee: { type: number }
-        source_tag: { type: integer, nullable: true }
-        destination_tag: { type: integer, nullable: true }
-        date: { type: string, format: date-time }
-        ledger_index: { type: integer }
-    Candle:
-      type: object
-      properties:
-        start: { type: string, format: date-time }
-        open: { type: number }
-        close: { type: number }
-        high: { type: number }
-        low: { type: number }
-        base_volume: { type: number }
-        counter_volume: { type: number }
-        vwap: { type: number }
-        count: { type: integer }
-    Problem:
-      description: RFC 7807 problem document (returned as application/problem+json).
-      type: object
-      properties:
-        type: { type: string, example: 'https://docs.gatehub.net/data-api/errors/404' }
-        title: { type: string, example: 'Not Found' }
-        status: { type: integer, example: 404 }
-        detail: { type: string }
-        instance: { type: string, example: '/v2/transactions/ABC' }
-        errors:
-          type: array
-          items: { type: string }
-          description: Field validation messages, when applicable.
-      required: [type, title, status]
-  responses:
-    NotFound:
-      description: Resource not found
-      content:
-        application/problem+json:
-          schema: { $ref: '#/components/schemas/Problem' }
-    Unauthorized:
-      description: Missing or invalid API key
-      content:
-        application/problem+json:
-          schema: { $ref: '#/components/schemas/Problem' }
-    BadRequest:
-      description: Invalid request parameters
-      content:
-        application/problem+json:
-          schema: { $ref: '#/components/schemas/Problem' }
-    TooManyRequests:
-      description: Rate limit exceeded
-      content:
-        application/problem+json:
-          schema: { $ref: '#/components/schemas/Problem' }
-
-paths:
-  /v2/payments:
-    get:
-      tags: [payments]
-      summary: List payments
-      parameters:
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/descending'
-        - $ref: '#/components/parameters/marker'
-        - { name: currency, in: query, schema: { type: string } }
-        - { name: issuer, in: query, schema: { type: string } }
-      responses:
-        '200':
-          description: A page of payments
-          content:
-            application/json:
-              schema:
-                allOf:
-                  - $ref: '#/components/schemas/ListEnvelope'
-                  - type: object
-                    properties:
-                      payments:
-                        type: array
-                        items: { $ref: '#/components/schemas/Payment' }
-  /v2/payments/{currency}:
-    get:
-      tags: [payments]
-      summary: List payments for a currency
-      parameters:
-        - { name: currency, in: path, required: true, schema: { type: string } }
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/marker'
-        - $ref: '#/components/parameters/descending'
-      responses:
-        '200': { description: A page of payments }
-
-  /v2/transactions:
-    get:
-      tags: [transactions]
-      summary: List transactions
-      parameters:
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/descending'
-        - $ref: '#/components/parameters/marker'
-        - { name: type, in: query, schema: { type: string }, description: 'XRPL tx type, e.g. Payment' }
-        - { name: result, in: query, schema: { type: string }, description: 'Engine result, e.g. tesSUCCESS' }
-      responses:
-        '200': { description: A page of transactions }
-  /v2/transactions/{hash}:
-    get:
-      tags: [transactions]
-      summary: Get a transaction by hash
-      parameters:
-        - { name: hash, in: path, required: true, schema: { type: string } }
-        - { name: binary, in: query, schema: { type: boolean, default: false } }
-      responses:
-        '200': { description: The transaction }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v2/ledgers:
-    get:
-      tags: [ledgers]
-      summary: List ledgers in a time range
-      parameters:
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/descending'
-        - $ref: '#/components/parameters/marker'
-      responses:
-        '200': { description: A page of ledgers }
-  /v2/ledgers/{identifier}:
-    get:
-      tags: [ledgers]
-      summary: Get a ledger by index, 64-char hash, or ISO date
-      parameters:
-        - { name: identifier, in: path, required: true, schema: { type: string } }
-      responses:
-        '200': { description: The ledger }
-        '400': { description: Invalid identifier }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v2/exchanges:
-    get:
-      tags: [exchanges]
-      summary: List all DEX trades
-      parameters:
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/descending'
-        - $ref: '#/components/parameters/marker'
-      responses:
-        '200': { description: A page of trades }
-  /v2/exchanges/{base}/{counter}:
-    get:
-      tags: [exchanges]
-      summary: Trades or OHLC/VWAP candles for a pair
-      description: 'Pass `interval` for candles; omit for raw trades. Asset = CURRENCY or CURRENCY+ISSUER.'
-      parameters:
-        - { name: base, in: path, required: true, schema: { type: string }, example: 'XRP' }
-        - { name: counter, in: path, required: true, schema: { type: string }, example: 'USD+rXXXXXXXX' }
-        - name: interval
-          in: query
-          schema:
-            type: string
-            enum: [1minute, 5minute, 15minute, 30minute, 1hour, 2hour, 4hour, 1day, 3day, 7day, 1month]
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/descending'
-        - $ref: '#/components/parameters/marker'
-      responses:
-        '200':
-          description: Candles or trades
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  result: { type: string }
-                  count: { type: integer }
-                  interval: { type: string }
-                  exchanges:
-                    type: array
-                    items: { $ref: '#/components/schemas/Candle' }
-  /v2/exchange_rates/{base}/{counter}:
-    get:
-      tags: [exchanges]
-      summary: Latest rate or period VWAP for a pair
-      parameters:
-        - { name: base, in: path, required: true, schema: { type: string } }
-        - { name: counter, in: path, required: true, schema: { type: string } }
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-      responses:
-        '200':
-          description: The rate
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  result: { type: string }
-                  rate: { type: number }
-  /v2/normalize:
-    get:
-      tags: [exchanges]
-      summary: Convert an amount between two assets
-      parameters:
-        - { name: amount, in: query, schema: { type: string }, example: '100' }
-        - { name: base, in: query, schema: { type: string } }
-        - { name: counter, in: query, schema: { type: string } }
-        - { name: date, in: query, schema: { type: string, format: date-time } }
-      responses:
-        '200': { description: Converted amount }
-
-  /v2/network/payment_volume:
-    get:
-      tags: [network]
-      summary: Total payment volume for a currency
-      parameters:
-        - { name: currency, in: query, schema: { type: string, default: XRP } }
-        - { name: issuer, in: query, schema: { type: string } }
-      responses:
-        '200': { description: Volume }
-  /v2/network/exchange_volume:
-    get:
-      tags: [network]
-      summary: Total DEX exchange volume for a base currency
-      parameters:
-        - { name: currency, in: query, schema: { type: string, default: XRP } }
-        - { name: issuer, in: query, schema: { type: string } }
-      responses:
-        '200': { description: Volume }
-  /v2/network/top_currencies:
-    get:
-      tags: [network]
-      summary: Top issued currencies by trustline count
-      parameters:
-        - { name: descending, in: query, schema: { type: boolean, default: true } }
-        - { name: limit, in: query, schema: { type: integer, default: 100 } }
-      responses:
-        '200': { description: Ranked currencies }
-
-  /v2/stats:
-    get:
-      tags: [stats]
-      summary: Daily network activity counts
-      parameters:
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/descending'
-      responses:
-        '200': { description: Per-day counts }
-
-  /v2/accounts:
-    get:
-      tags: [accounts]
-      summary: List created accounts
-      parameters:
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/marker'
-        - $ref: '#/components/parameters/descending'
-      responses:
-        '200': { description: A page of accounts }
-  /v2/accounts/{address}:
-    get:
-      tags: [accounts]
-      summary: Account creation info
-      parameters: [{ name: address, in: path, required: true, schema: { type: string } }]
-      responses:
-        '200': { description: Account }
-        '404': { $ref: '#/components/responses/NotFound' }
-  /v2/accounts/{address}/balance_changes:
-    get:
-      tags: [accounts]
-      summary: Account balance changes
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - { name: currency, in: query, schema: { type: string } }
-        - { name: counterparty, in: query, schema: { type: string } }
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/marker'
-        - $ref: '#/components/parameters/descending'
-      responses:
-        '200': { description: A page of balance changes }
-  /v2/accounts/{address}/payments:
-    get:
-      tags: [accounts]
-      summary: Account payments (sent/received)
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - { name: type, in: query, schema: { type: string, enum: [sent, received, both], default: both } }
-        - { name: currency, in: query, schema: { type: string } }
-        - { name: issuer, in: query, schema: { type: string } }
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/marker'
-        - $ref: '#/components/parameters/descending'
-      responses:
-        '200': { description: A page of payments }
-  /v2/accounts/{address}/transactions:
-    get:
-      tags: [accounts]
-      summary: Account transaction history
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - { name: type, in: query, schema: { type: string } }
-        - { name: result, in: query, schema: { type: string } }
-        - { name: min_ledger, in: query, schema: { type: integer } }
-        - { name: max_ledger, in: query, schema: { type: integer } }
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/marker'
-        - $ref: '#/components/parameters/descending'
-      responses:
-        '200': { description: A page of transactions }
-  /v2/accounts/{address}/exchanges:
-    get:
-      tags: [accounts]
-      summary: Account DEX trades
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - $ref: '#/components/parameters/limit'
-        - $ref: '#/components/parameters/marker'
-        - $ref: '#/components/parameters/descending'
-      responses:
-        '200': { description: A page of trades }
-  /v2/accounts/{address}/balances:
-    get:
-      tags: [accounts]
-      summary: Live balances (from the XRPL node)
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - { name: ledger, in: query, schema: { type: string } }
-        - { name: currency, in: query, schema: { type: string } }
-      responses:
-        '200': { description: Balances }
-  /v2/accounts/{address}/orders:
-    get:
-      tags: [accounts]
-      summary: Live open orders (from the XRPL node)
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - { name: ledger, in: query, schema: { type: string } }
-        - { name: limit, in: query, schema: { type: integer, default: 200 } }
-      responses:
-        '200': { description: Open orders }
-  /v2/accounts/{address}/stats/transactions:
-    get:
-      tags: [accounts]
-      summary: Account transaction-type counts
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-      responses:
-        '200': { description: Counts by type }
-  /v2/accounts/{address}/reports:
-    get:
-      tags: [accounts]
-      summary: Per-day sent/received payment report
-      parameters:
-        - { name: address, in: path, required: true, schema: { type: string } }
-        - $ref: '#/components/parameters/start'
-        - $ref: '#/components/parameters/end'
-      responses:
-        '200': { description: Daily report }
-
-  /liveliness/healthz:
-    get:
-      tags: [ops]
-      summary: Liveness probe (ClickHouse ping)
-      responses:
-        '200': { description: ok }
-        '503': { description: unhealthy }
-  /metricz:
-    get:
-      tags: [ops]
-      summary: Prometheus metrics
-      responses:
-        '200': { description: metrics (text/plain) }
+      bearerFormat: JWT
+      type: http
+    cookie:
+      type: apiKey
+      in: cookie
+      name: x-gatehub-uuid
+  schemas: {}

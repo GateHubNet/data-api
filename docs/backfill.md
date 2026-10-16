@@ -1,118 +1,114 @@
-# Backfilling 2 years of history
+# Backfilling history
 
 This guide answers two questions:
 
-1. **How do I backfill ~2 years of XRPL data?**
-2. **Should I run my own rippled to get that history?**
+1. **How do I fill history before the point where the live syncer started** (and repair gaps, and reprocess after a parser
+   change)?
+2. **Which node should I read the history from?**
+
+Works the same for the XRP Ledger and for Xahau; every command below takes the network's compose service
+(`syncer-xrpl` or `syncer-xahau`) or the `GH_NETWORK` of your environment.
 
 ## TL;DR
 
-- ~2 years ≈ **~57 million ledgers** (XRPL closes a ledger every ~3–4 s ⇒ ~21–23k/day ⇒
-  ~7.7M every 3 months ⇒ ~46–57M in 2 years).
-- You need a data source that **has those ledgers as full-history transaction data**.
-- **Recommended: run your own full-history rippled** (or use a paid full-history provider)
-  for the backfill. Public clusters work but will rate-limit / throttle a 50M-ledger sweep
-  and make it slow and unreliable. For ongoing **live** sync, a public/cluster node is fine.
+- The **live syncer** (`ingest` worker) only moves forward from its start ledger. Everything before it comes from the
+  **range-ingest CLI**, which runs next to the live syncer, is resumable and writes the same tables through the same writer.
+- Roughly 20-23 thousand XRPL ledgers close per day; two years is about 46-57 million. Xahau has a shorter history.
+- You need a node that **holds the full history of the range** you ask for. Public clusters work for live syncing but throttle a
+  large sweep; for a big backfill use your own full-history node (or a full-history provider).
+- Backfill is **history**: the CLI refuses a range that reaches above the live syncer's checkpoint while the syncer is running.
 
-## 1. How the backfill works
-
-The syncer (`apps/syncer`) has two modes, toggled by env (see `apps/syncer/.env.example`):
-
-- `GH_BACKFILL_ENABLED=true` with `GH_BACKFILL_START_LEDGER` / `GH_BACKFILL_END_LEDGER`
-  — a worker pool (`GH_BACKFILL_WORKERS`) fetches each ledger with expanded transactions,
-  parses it, and bulk-inserts into ClickHouse. Already-indexed ledgers are skipped
-  (windowed lookup against the `ledgers` table), so it resumes cleanly after a restart.
-- `GH_SUBSCRIBE_LIVE=true` — subscribes to the `ledger` stream and ingests new ledgers as
-  they close.
-
-You can (and for a fresh deployment, should) run both at once: live keeps the head current
-while the pool fills history behind it. Because writes are idempotent (CTID +
-`ReplacingMergeTree`), the overlap is harmless.
-
-### Picking the ledger range for "2 years"
+## 1. How a backfill works
 
 ```bash
-# Ask any node for its available range:
-#   { "command": "server_info" } -> result.info.complete_ledgers  e.g. "32570-86000000"
-# Current validated ledger index ≈ <LEDGER_NOW>. Two years back ≈ <LEDGER_NOW> - 57_000_000.
-GH_BACKFILL_START_LEDGER=<LEDGER_NOW_MINUS_~57M>
-GH_BACKFILL_END_LEDGER=<LEDGER_NOW>
-GH_BACKFILL_WORKERS=12        # tune to your node's rate limit
-GH_FETCH_THROTTLE_MS=100      # per-worker pause; raise if you see rate-limit errors
+# production compose (the live syncer keeps running; the CLI checks its lease itself)
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+  node dist/cli/range-ingest.js --from 90000000 --to 90100000
+
+# the same from source (GH_* environment as the syncer; GH_NODE_ENDPOINTS = the node to read from)
+pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000 --concurrency 16
 ```
 
-The syncer clamps the range to the node's `complete_ledgers` and logs a warning if your
-start is older than the node has.
+Options: `--from`, `--to` (both inclusive, required), `--chunk` (default 1000, must divide 1,000,000), `--concurrency` (default 8),
+`--reprocess`, `--run-id`, `--help`. Exit status: `0` done, `1` failed (rerun the same command), `2` wrong command line. The
+mechanics (aligned chunks, `ingest_log` intents, recovery of a failed attempt, the lease rule, `agg_dirty`) are in
+[syncer](syncer.md#4-range-ingest-cli).
 
-### Throughput & expectations
+### Picking the range
 
-- Each ledger = one `ledger` request (expanded). Realistic sustained rates against a
-  healthy local full-history node are roughly **hundreds of ledgers/second** with 8–16
-  workers — i.e. a full 2-year backfill is on the order of **a couple of days**, dominated
-  by node fetch latency, not ClickHouse (which ingests this volume easily).
-- ClickHouse write amplification is low: bulk JSONEachRow inserts, monthly partitions,
-  background merges. Budget disk for the raw `transactions.tx_json` (the largest table).
-- Watch `/metricz` (`syncer_ledgers_processed_total`, `syncer_latest_synced_ledger`) and the
-  log line `Backfilled N ledgers (R/s)`.
+```text
+# Ask a node what it has:   { "command": "server_info" }  ->  result.info.complete_ledgers   e.g. "32570-90100000"
+# Current validated ledger  ~ LEDGER_NOW.   N days back ~ LEDGER_NOW - N * 22000   (XRPL)
+```
 
-### Resuming / gap repair
+For a fresh deployment, start the live syncer first (`GH_SYNC_START_LEDGER` empty = the validated head, or a recent ledger of your
+choice) so the head stays current, then backfill the history **below** the ledger it started at:
 
-- Restarting the syncer re-derives what's already indexed and continues — no duplicates.
-- Ledgers that exhaust their retries are logged at the end (`… ledgers failed and were not
-  indexed: …`). Re-run the syncer with `GH_BACKFILL_START_LEDGER`/`END` narrowed to those
-  ranges to fill the gaps.
+```bash
+# live syncer started at 107600000;  fill the previous year
+... node dist/cli/range-ingest.js --from 85000000 --to 107599999 --concurrency 16
+```
 
-## 2. Should you run your own rippled?
+A range that runs into ledgers already committed simply skips them (unless `--reprocess`).
 
-### What the data source must provide
+### Throughput
 
-The backfill calls `ledger` with `transactions:true, expand:true`. That requires the node to
-**hold full transaction history for the range you want**. Three options:
+- Each ledger is one expanded `ledger` request, so throughput is bound by the node's latency and rate limits, not by ClickHouse
+  (bulk synchronous inserts, partitions of a million ledgers, background merges). Raise `--concurrency` until the node is the
+  bottleneck; with your own node, hundreds of ledgers per second are realistic.
+- A chunk is held in memory (1000 ledgers by default); busy ledgers can have hundreds of transactions, so lower `--chunk` (it must
+  divide 1,000,000: 500, 250, 100, ...) if memory is tight.
+- Budget disk for `transactions` (`tx_json` and `meta_json` are ZSTD-compressed text and by far the largest columns): roughly
+  1-1.5 TB compressed for full XRPL history.
+- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written`) and, in ClickHouse,
+  `SELECT count(), max(ledger_index) FROM xrpl.ledgers`. The aggregator follows by itself (see below).
 
-| Source | History | Rate limits | Cost | Good for |
-| --- | --- | --- | --- | --- |
-| **Your own full-history rippled** | Complete (if configured) | None (it's yours) | High disk (multi-TB), ops effort | **Backfill** + live |
-| Paid full-history API (e.g. providers offering full-history XRPL) | Complete | Per plan | $$ | Backfill without running infra |
-| Public cluster (`xrplcluster.com`, `s2.ripple.com`) | Often full or deep | Yes — throttled/blocked under sweep load | Free | **Live** sync, light backfill |
+### Resuming, gap repair, reprocessing
 
-### Recommendation
+- **Resume:** rerun the same command. Finished chunks (`ingest_log` `done`) are skipped, an unfinished one is redone from scratch.
+- **Gaps:** find them with the SQL in [operations](operations.md#sql-health-checks) and ingest exactly those ranges.
+- **Reprocess:** after a parser change (the `parser_version` of `ledgers` records which parser wrote a ledger),
+  `--reprocess --from A --to B` fetches and dry-parses first, then deletes and rewrites the committed ledgers of the range.
+  It rewrites the whole requested range, not only ledgers of an older parser version.
+- **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
+  those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
+  aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
 
-- **For a one-time 2-year backfill: run your own full-history `rippled`** (or rent a
-  full-history API for the duration). A 50M+ ledger sweep against a public endpoint will be
-  rate-limited, will intermittently fail (your retries will mask but slow it), and is
-  impolite to a shared resource. A local node removes the network bottleneck and the limits,
-  and lets you push `GH_BACKFILL_WORKERS` higher.
-- **For ongoing live sync afterwards: a public cluster endpoint is fine** — the live stream
-  is ~1 ledger every 3–4 s, nowhere near any limit. You can decommission the local node once
-  history is loaded, or keep it for resilience.
+## 2. Which node?
+
+The backfill calls `ledger` with `transactions: true, expand: true`, which needs a node that holds the **full transaction history**
+of the range:
+
+| Source | History | Rate limits | Good for |
+| --- | --- | --- | --- |
+| **Your own full-history rippled / Clio** | Complete if configured | None | Backfill and live |
+| A full-history provider | Complete | Per plan | Backfill without running infrastructure |
+| Public cluster (`xrplcluster.com`, `s2.ripple.com`) | Often deep | Yes, throttled under sweep load | Live syncing, light backfill |
+| Xahau (`wss://xahau.network`) | Check `complete_ledgers`: full history is not guaranteed | | Live; backfill as far as it goes |
+
+- **One-time deep backfill:** your own full-history node (or a rented full-history API for the duration). A sweep of tens of millions
+  of ledgers against a public endpoint is rate-limited, fails intermittently (retries mask but slow it) and is impolite to a shared
+  resource.
+- **Live syncing afterwards:** a public cluster is fine (one ledger every 3-4 s). Keep your own node for resilience if you can.
+- Point the process at it with `GH_NODE_ENDPOINTS` (a comma separated list; credentials in the URL are never logged). For the
+  compose stack set `XRPL_NODE_ENDPOINTS` / `XAHAU_NODE_ENDPOINTS` in `deploy/.env.prod`; note that it also becomes the api's
+  live-state node.
 
 ### Running your own rippled (outline)
 
-1. Provision a host with **fast NVMe SSD and lots of it** — full transaction history is
-   multi-terabyte and grows continuously. Plan headroom.
-2. Install `rippled` and configure it for history:
-   - In `rippled.cfg`, set `[ledger_history] full` (or a large number to cap to ~2 years,
-     e.g. enough ledgers to cover 57M back from the head) and enable online delete / advisory
-     settings appropriate to your disk.
-   - Use the `NuDB`/`RocksDB` node store per the current rippled guidance for full history.
-3. Let it acquire history (this itself takes time and bandwidth), or start from a
-   full-history database shard/snapshot if available.
-4. Point the syncer at it:
-   ```bash
-   GH_XRPL_NODE_ENDPOINT=ws://your-rippled-host:6006
-   ```
-5. Run the backfill. Once complete, optionally switch `GH_XRPL_NODE_ENDPOINT` to a public
-   cluster for live-only operation.
+1. Provision fast NVMe storage, lots of it: full history is multi-terabyte and grows.
+2. Install `rippled`, configure it for full history (`[ledger_history]`, `[node_db]` NuDB per the current guidance), let it acquire
+   history or start from a snapshot.
+3. Point the syncer at it (`XRPL_NODE_ENDPOINTS=ws://your-host:6006`) and run the backfill; afterwards you may switch back to a
+   public endpoint for live-only operation.
 
-> Sizing/operational specifics for rippled (exact config keys, disk, sync time) change over
-> releases — follow the current XRPL.org "Capacity Planning" and "Run rippled in full
-> history mode" docs when you provision. The point for this project is only that the syncer
-> needs a node (yours or a provider's) that actually holds the 2-year range.
+Exact configuration keys, disk and sync time change between releases: follow the current XRPL.org capacity-planning and full-history
+documents when you provision.
 
-### Alternative: don't backfill transaction-by-transaction
+## 3. Things a backfill does not do
 
-If you ever need *only* aggregates and not full per-transaction history, XRPL full-history
-data dumps / third-party datasets can be loaded straight into ClickHouse, skipping the
-node-fetch bottleneck. The schema in this repo is plain SQL, so a bulk `INSERT ... FROM`
-loader is straightforward to add. For the current product (which serves per-transaction
-endpoints) the node-driven backfill above is the right path.
+- No genesis import: `accounts_created.genesis_*` stays empty until a history import loads ledger 32570. The `LedgerSource`
+  interface is the seam for an importer of older data (e.g. from SQLite dumps).
+- No ingest of pre-2013 data that the node does not hold.
+- It does not touch `fee_stats` or `validations` (they exist only from when their workers ran: they are collected live, not derived
+  from ledgers).

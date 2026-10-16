@@ -5,14 +5,19 @@ consequences. They explain *why* the system is the way it is.
 
 | # | Decision | Status |
 | --- | --- | --- |
-| [0001](0001-use-clickhouse.md) | Use ClickHouse as the analytical store (replacing Elasticsearch) | Accepted |
-| [0002](0002-ctid-idempotent-ingest.md) | Idempotent ingest via CTID-keyed ReplacingMergeTree + batched writes | Accepted |
-| [0003](0003-no-final-on-list-queries.md) | Do not use `FINAL` on list/scan queries | Accepted |
-| [0004](0004-keyset-pagination.md) | Keyset (cursor) pagination instead of offset | Accepted |
+| [0001](0001-use-clickhouse.md) | Use ClickHouse as the analytical store (replacing Elasticsearch) | Accepted (amended: no materialized views, see 0008) |
+| [0002](0002-ctid-idempotent-ingest.md) | Idempotent ingest via CTID-keyed ReplacingMergeTree + batched writes | **Superseded** by 0007 |
+| [0003](0003-no-final-on-list-queries.md) | Do not use `FINAL` on list/scan queries | Accepted (amended) |
+| [0004](0004-keyset-pagination.md) | Keyset (cursor) pagination instead of offset | **Superseded** by 0007 for the marker key |
 | [0005](0005-pnpm-monorepo.md) | pnpm workspace monorepo with a shared library | Accepted |
-| [0006](0006-reverse-proxy-tls.md) | TLS terminated by the GateHub reverse proxy; app trusts X-Forwarded-For | Accepted |
+| [0006](0006-reverse-proxy-tls.md) | TLS terminated by the front proxy; trusted-proxy client address | Accepted (amended) |
+| [0007](0007-ledger-index-axis-and-secondary-tables.md) | `ledger_index` is the time axis; narrow secondary tables; commit-marker writes | Accepted |
+| [0008](0008-no-aggregate-materialized-views.md) | No aggregate materialized views | Accepted |
+| [0009](0009-one-deployment-per-network.md) | One deployment per network (XRPL, Xahau) | Accepted |
+| [0010](0010-ripple-v2-wire-compatibility.md) | Ripple Data API v2 wire compatibility, and every deliberate deviation | Accepted |
 
 ## Format
 Each ADR: **Context** (the forces), **Decision** (what we chose), **Consequences**
 (positive and negative, including what we give up). Keep them short. New decisions get a new
-file; superseding decisions reference the one they replace rather than editing history.
+file; superseding decisions reference the one they replace rather than editing history. An
+amendment is appended to the ADR it amends and says so in its status line.

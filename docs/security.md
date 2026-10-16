@@ -1,354 +1,191 @@
 # Security
 
-This document describes the security posture of the GateHub XRPL Data API: what is
-implemented today, how it is deployed, and what remains on the hardening backlog. It is
-written to be **honest about gaps** — where a control is recommended but not yet
-implemented, that is called out explicitly.
+The security posture of the Data API: what is implemented, how it is deployed, and what remains on the hardening backlog. It is
+honest about gaps: where a control is recommended but not implemented, that is said.
 
-The system has two runtime components plus a data store:
+Components: the **api** (a read-only HTTP service; it also forwards a few live lookups to a node), the **syncer** (an internal ingest
+worker), **ClickHouse** (+ Keeper), and **nginx** as the edge of the stack. The data itself is public ledger data, so the
+confidentiality of responses is not the main concern; availability, the integrity of the store and the secrets are.
 
-- **`api`** — a read-only HTTP service (NestJS) that serves XRPL data from ClickHouse and
-  proxies a small number of live lookups to an XRPL node.
-- **`syncer`** — an internal ingest worker that subscribes to / backfills the XRPL ledger
-  and writes into ClickHouse.
-- **ClickHouse** (+ ClickHouse Keeper) — the analytical data store.
+## 1. Threat model and trust boundaries
 
----
-
-## 1. Threat model & trust boundaries
-
-The service is **not** internet-facing on its own. It is designed to run **behind the
-GateHub reverse proxy**, which performs TLS termination and edge routing. ClickHouse, the
-ClickHouse Keeper, and the syncer are **internal-only** and are never published to the
-public network.
+The service is not internet-facing on its own. It runs behind a **front proxy** (the GateHub reverse proxy / a load balancer) that
+terminates TLS, then through the stack's **nginx**, which routes by host name. ClickHouse, Keeper and the syncers are internal only.
 
 ```
-                          ┌──────────────────────── public internet ────────────────────────┐
-                          │                                                                  │
-                          │   client ──HTTPS──► GateHub reverse proxy (TLS termination, edge)│
-                          └──────────────────────────────┬───────────────────────────────────┘
-                                                         │ HTTP + X-Forwarded-For
-   ════════════════════════ trust boundary ═════════════│══════════════════════════════════════
-                                                         │ (internal network)
-                          ┌──────────────────────────────▼───────────────────────────────────┐
-                          │  api  (read replicas, :3001, behind in-cluster nginx/proxy)        │
-                          │    │                                  │                            │
-                          │    │ HTTP                             │ WSS (outbound)             │
-                          │    ▼                                  ▼                            │
-                          │  ClickHouse (:8123/:9000) ◄── syncer (:3002, ingest)   XRPL node   │
-                          │      ▲                                                              │
-                          │      └── ClickHouse Keeper (:9181, coordination)                    │
-                          └────────────────────────────────────────────────────────────────────┘
+   client ──HTTPS──▶ front proxy (TLS, edge) ──HTTP, X-Forwarded-For──▶ nginx ──▶ api-xrpl / api-xahau ──▶ ClickHouse
+   ═══════════ untrusted ═════════════════════ │ ═══════════════ internal network ═════════════════════════════
+                                                ClickHouse ◀── syncer-xrpl / syncer-xahau ──▶ XRPL / Xahau node (WSS, outbound)
 ```
 
-**Trust boundary.** The boundary sits at the GateHub reverse proxy. Everything to the
-left (the public client and the proxy) is untrusted; everything to the right (the API
-replicas, ClickHouse, Keeper, the syncer) is on the internal network and treated as a
-trusted zone. The API authenticates clients (API keys) and rate-limits them, but it
-trusts the reverse proxy to:
-
-- terminate TLS, and
-- set a correct `X-Forwarded-For` so the API can identify the real client IP.
-
-**Assets to protect.** Availability of the read API (the data itself is public XRPL
-ledger data, so confidentiality of *responses* is not the primary concern); ClickHouse
-integrity and availability; the secrets (API keys, ClickHouse password, NPM token).
-
-**Primary threats considered.**
+The API authenticates clients (API keys) and rate-limits them, but relies on the proxy chain to terminate TLS and to hand it a
+correct client address (§4).
 
 | Threat | Control |
 | --- | --- |
-| Unauthenticated access | API-key auth (§2) |
+| Unauthenticated access | API key on every `/v2/*` route (§2) |
 | SQL injection | Fully parameterised queries (§6) |
-| Resource exhaustion / abuse | Rate limiting (§5) + per-query CH guards (§6) |
-| Info disclosure via errors | RFC 7807 filter, 5xx detail suppressed (§7) |
-| Secret leakage | `.env` git-ignored, secrets-manager injection (§8) |
-| Direct ClickHouse access | CH not published to the network (§9) |
+| Resource exhaustion and abuse | Rate limit (§5), per-query ClickHouse guards (§6), bounded windows and limits per endpoint |
+| Information disclosure through errors | Ripple-shaped errors, 5xx causes only in the log (§7) |
+| Client-address spoofing (rate-limit evasion) | nginx trusts `X-Forwarded-For` only from `TRUSTED_PROXIES` and sets exactly one address (§4) |
+| Secret leakage | Env-only secrets, git/docker-ignored env files, BuildKit secret for the npm token, per-service env (§8) |
+| Direct ClickHouse access | Not published (§9) |
+| Exposure of internals | `/internal/` and `/liveliness/` blocked at the edge for the public (§9) |
 
-**Known residual risks** (not yet mitigated): single trust level / no per-key scopes
-(§3), API keys stored in plaintext at rest (§2), rate limiting is per-replica not global
-(§5), and the `NPM_TOKEN` build-arg is baked into an image layer (§8). These are tracked
-in §10.
-
----
+**Known residual risks:** a single trust level (no per-key scopes), API keys in the environment in plaintext, a per-replica in-memory
+rate limit, the same full-access ClickHouse user for every client, and the nginx trust default (private ranges) that the operator must
+narrow. They are tracked in §10.
 
 ## 2. Authentication
 
-Authentication is by **static API key**, enforced globally by `ApiKeyGuard`
-(`apps/api/src/auth/api-key.guard.ts`), registered as an `APP_GUARD` in
-`apps/api/src/app.module.ts`.
+Static **API keys**, enforced globally by `ApiKeyGuard` (`apps/api/src/auth/api-key.guard.ts`, an `APP_GUARD`), checked **before** the
+rate limit so a request with a bad key spends nobody's budget.
 
-**Header forms.** Clients present their key in one of two request headers:
+- **Header forms:** `X-API-Key: <key>` or `Authorization: Bearer <key>`. The key is deliberately not accepted in the query string
+  (query strings leak into logs, history and `Referer`).
+- **Constant-time comparison:** the SHA-256 digest of the presented key is compared with the digest of every configured key using
+  `crypto.timingSafeEqual` (equal-length buffers whatever the key lengths, no early exit), so response time leaks neither length nor
+  content.
+- **401 body:** `{"result":"error","message":"Missing or invalid API key."}` ([api-reference](api-reference.md#authentication)).
+- **Open paths:** `^/liveliness/` only (the probe). `/metricz` is a separate app on its own port, and the Swagger docs are served by the
+  toolbox outside the Nest routes, so neither reaches the guard; keep both off the public network (§9).
+- **No keys = no authentication, development only.** If `GH_API_KEYS` is empty the guard lets everything through and logs
+  `GH_API_KEYS is empty: the API is UNAUTHENTICATED (development only).` In production this is a **boot failure**: with
+  `NODE_ENV=production` an empty list throws `GH_API_KEYS must be set in production`, and so does a placeholder key (`dev-api-key`, or
+  anything starting with `change-me`, case-insensitive): `GH_API_KEYS contains a placeholder key ... set real keys in production`
+  (the message never echoes the keys). The dev compose runs its API with `NODE_ENV=development` for that reason.
+- **Provisioning and rotation:** `GH_API_KEYS` is a comma separated list; several keys are accepted at once, so rotation is zero-downtime
+  (add the new key, roll the clients, remove the old one, [operations](operations.md#rotate-an-api-key)). Keys come from a secrets manager,
+  never from git.
 
-- `X-API-Key: <key>`, or
-- `Authorization: Bearer <key>`.
-
-The key is deliberately **not** accepted as a query-string parameter — query params leak
-into access logs, browser history, and `Referer` headers.
-
-**Constant-time comparison.** The presented key is compared against every configured key
-using `crypto.timingSafeEqual`, with a same-length buffer substituted when lengths differ
-(since `timingSafeEqual` requires equal-length inputs). This avoids leaking key length or
-content through response timing. A simple `===` comparison is *not* used.
-
-**Open operational paths.** A small allow-list of paths is always reachable without a key,
-so health probes and metrics scrapers don't need credentials:
-
-- `^/liveliness/` (health/liveness probes)
-- `^/metricz` (Prometheus metrics)
-- `^/internal/docs` (Swagger UI / OpenAPI JSON)
-
-**"Auth disabled when no keys" (dev convenience).** If `GH_API_KEYS` is empty, the guard
-is a **no-op** and the API is fully open. This makes local/dev work out of the box. To
-prevent this from silently shipping to production, `apiConfigFromEnv`
-(`apps/api/src/config/api.config.ts`) logs a **loud warning** when keys are empty *and*
-`NODE_ENV=production`:
-
-> `GH_API_KEYS is empty in production — the API is UNAUTHENTICATED.`
-
-It does **not** hard-fail, so a deliberately public deployment is still possible — but the
-operator is warned.
-
-**Provisioning & rotation.** Keys are supplied via the `GH_API_KEYS` environment variable
-as a comma-separated list (e.g. `key_live_aaa,key_live_bbb`). In production these come
-from a secrets manager (Vault / AWS Secrets Manager / k8s secrets), never committed (see
-§8). Because multiple keys are accepted simultaneously, **rotation is zero-downtime**:
-add the new key alongside the old, roll it out to clients, then remove the old key on the
-next deploy.
-
-**Honest caveats (current state):**
-
-- **Plaintext at rest.** Keys are read from the environment and compared in plaintext.
-  They are not hashed. *Recommended future hardening:* store only a hash (e.g.
-  SHA-256/HMAC) and compare hashes, so a leaked env/config does not directly expose usable
-  keys. (Backlog item, §10.)
-- **No shared key store.** Key validation is in-process per replica; there is no shared
-  auth state. All replicas must receive the same `GH_API_KEYS`. This is fine for static
-  keys but means revocation requires a config roll-out, not an instant central toggle.
-
----
+Caveats: keys are compared by digest in memory but live in the environment as plaintext; validation is per replica, so revoking a key
+needs a roll-out of every replica.
 
 ## 3. Authorization
 
-There is currently a **single trust level**: any valid API key grants **full read
-access** to the entire API surface. The service is read-only, so there is no write/admin
-distinction to enforce — but there is also **no per-key scoping** (no notion of "this key
-may only read payments", rate-tier per key, or per-key data restrictions).
+One trust level: any valid key grants full read access to the whole `/v2` surface. The service is read-only, so there is no
+write/admin distinction, but also no per-key scopes or rate tiers. Treat every issued key as equivalent. Per-key scopes are future work.
 
-Per-key scopes/roles are **future work** (§10). Until then, treat every issued key as
-equivalent to every other key in terms of access.
+## 4. Transport and the client address
 
----
+**TLS ends at the front proxy.** The api and nginx speak plain HTTP inside the network. To key the rate limit on the real client the API
+trusts `GH_TRUST_PROXY_HOPS` proxy hops of `X-Forwarded-For` (default 1).
 
-## 4. Transport security
+The address chain in the shipped stack ([deployment](deployment.md#the-edge-nginx)):
 
-**TLS is terminated at the GateHub reverse proxy.** The API process itself speaks plain
-**HTTP** on its internal port (default `3001`); it does not manage certificates. This is
-intentional for a service that always runs behind the edge proxy.
+1. The front proxy appends the client to `X-Forwarded-For`.
+2. nginx believes that header **only from a `TRUSTED_PROXIES` peer** (comma separated addresses/CIDRs; default the private ranges; zero
+   prefix lengths such as `0.0.0.0/0` are refused at start). It takes the last non-trusted address as the client, and then **sets**
+   (never appends) `X-Forwarded-For` to that single address and passes `X-Forwarded-Proto` through from a trusted peer only
+   (`http`/`https`; anything else becomes the scheme of the connection).
+3. The API, with `GH_TRUST_PROXY_HOPS=1`, takes that one address as `req.ip`.
 
-Because the app sits behind a proxy, Express `trust proxy` is configured in
-`apps/api/src/main.ts` from `GH_TRUST_PROXY_HOPS` (default `1` — the GateHub proxy). This
-makes `req.ip` resolve to the real client IP from `X-Forwarded-For`, which is required for
-correct per-client rate limiting (§5) and logging.
+So a client cannot choose its address by sending its own `X-Forwarded-For`, unless it reaches nginx **from a trusted address**.
+**Operator duties:** set `TRUSTED_PROXIES` to your front proxy's address(es), and publish nginx (`NGINX_BIND`) only on an interface that
+proxy can reach. With the placeholder defaults (the private ranges, published on 0.0.0.0) a client that reaches the port from a
+private address, on Docker Desktop every connection, can pick any address and get a rate-limit bucket of its own per request.
+`GH_TRUST_PROXY_HOPS` must equal the number of proxies you actually control in front of the API; too high lets clients spoof their
+address.
 
-**Operational note:** `trustProxyHops` must match the actual number of trusted proxy hops.
-If it is set too high, a client could spoof `X-Forwarded-For` and impersonate another
-client IP (defeating rate limiting and poisoning logs). Keep it equal to the count of
-proxies you actually control in front of the service.
+## 5. Rate limiting
 
----
+`@nestjs/throttler` with a custom guard (`ApiThrottlerGuard`):
 
-## 5. Rate limiting & abuse protection
+- **Default:** 600 requests per 60 s per client address **and route** (`GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`). Everything except
+  `/liveliness/*` is limited (the check is case-insensitive: Express routes ignore case, so `/V2/...` is limited too).
+- **Response:** 429 `{"error":"Rate limit exceeded, retry in N.NNsec"}` with `Retry-After` and `X-RateLimit-*` headers, the wording of
+  the original service.
+- **Honest caveat:** the store is in memory, per replica, so with N replicas behind the proxy the effective limit is up to N x the
+  setting. A true global limit needs a shared store (Redis-backed throttler storage), which is backlog; the front proxy may also rate
+  limit at the edge.
 
-Rate limiting uses `@nestjs/throttler` (`ThrottlerModule` in
-`apps/api/src/app.module.ts`, `ThrottlerGuard` registered as an `APP_GUARD`).
+## 6. Input validation and injection
 
-- **Default limit:** `600` requests per `60` second window per client
-  (`GH_RATE_LIMIT` / `GH_RATE_LIMIT_WINDOW`).
-- **Keying:** because `trust proxy` is configured, the throttler keys on the **real client
-  IP** from `X-Forwarded-For`, not the proxy's IP.
-- **Response:** over-limit requests receive HTTP **429** (rendered as RFC 7807
-  problem+json by the global filter, §7).
+- **Parameters** are parsed by hand-written, strict parsers (`apps/api/src/common/params.ts`, `asset-param.ts`, `pagination.ts`) with the
+  exact error messages of the original; issuer addresses are checked with `ripple-address-codec`, dates against the supported formats,
+  hashes against hex, markers against the shape and types of their key. The toolbox `ValidationPipe` is **disabled** (it would reject
+  unknown query parameters; the Ripple API ignores them). Unknown parameters are ignored, never trusted.
+- **No SQL injection.** Every query goes through `ClickHouseService.query()`, which passes user values as ClickHouse server-side bound
+  `query_params` with typed placeholders (`{currency:String}`, `{limit:UInt32}`), never by string interpolation. Pagination and
+  `IN (...)` clauses emit placeholders too. The only interpolated parts are table names (from the `Table` enum, enforced by a unit test),
+  column lists and sort keys, all hard-coded; interval expressions come from a fixed whitelist.
+- **Resource guards:** every SELECT carries `max_execution_time` and `max_memory_usage` (`GH_CLICKHOUSE_MAX_EXECUTION_TIME`,
+  `GH_CLICKHOUSE_MAX_QUERY_MEMORY`), and endpoints bound their own work (`limit` maxima, the 200-day report window, capped candle pages,
+  node timeouts for live lookups).
+- **Output hygiene:** the CSV file name is built from the request and stripped of characters a header cannot carry. A known nit: the
+  payments CSV file name echoes an unvalidated currency text (the header is made safe, the name is not restricted further).
+- **The live-node proxy** only forwards fixed commands (`account_info`, `account_lines`, `account_offers`, plus `server_info` / `server_definitions` at boot) with validated
+  addresses and ledger selectors; node errors are mapped to Ripple messages, never passed through.
 
-**Honest caveats:**
+## 7. Error handling and information disclosure
 
-- **Per-replica, in-memory.** The default throttler store is in-memory, so each API
-  replica counts independently. With *N* replicas behind the proxy the effective global
-  limit is up to *N × 600/min* (depending on how the proxy load-balances). This is **not a
-  true global limit.**
-- **Shared store option.** For a true global limit, the throttler supports a **Redis-backed
-  shared store** (`@nest-lab/throttler-storage-redis` or similar). Adopting this is on the
-  backlog (§10).
-- **Edge proxy.** The GateHub reverse proxy may *also* apply its own rate limiting at the
-  edge; the in-app throttler is a defence-in-depth layer, not the only one.
+Errors are `{"result":"error","message":...}` rendered by `RippleErrorFilter` at controller level (the toolbox's global filter would
+render another shape).
 
----
-
-## 6. Input validation & injection
-
-**Request validation.** A global `ValidationPipe` is configured in
-`apps/api/src/main.ts` with:
-
-- `whitelist: true` — strips properties not declared on the DTO,
-- `forbidNonWhitelisted: true` — *rejects* requests carrying unknown properties (does not
-  silently drop them),
-- `transform: true` + `enableImplicitConversion` — coerces query/path params into typed
-  DTO fields,
-- `validationError: { target: false }` — keeps the raw input object out of error output.
-
-All endpoints use typed DTOs, so inputs are constrained by type/shape before reaching any
-service.
-
-**No SQL injection.** Every ClickHouse query goes through `ClickHouseService.query()` /
-`queryOne()` (`packages/shared/src/clickhouse/clickhouse.service.ts`), which **always**
-passes user values via `query_params` (ClickHouse server-side bound parameters). User
-input is **never** string-interpolated into SQL.
-
-This was verified across the query services. For example, in
-`apps/api/src/payments/payments.service.ts` and
-`apps/api/src/accounts/accounts.service.ts`, every user-supplied filter is bound with a
-typed placeholder:
-
-```sql
-WHERE currency = {currency:String}
-  AND issuer   = {issuer:String}
-  AND date    >= {start:DateTime}
-LIMIT {limit:UInt32}
-```
-
-with the actual values supplied in the `params` object — never concatenated into the
-query string. Pagination keyset clauses likewise emit placeholders and contribute their
-values to `params`.
-
-**Table/column names are trusted-source only.** The only parts of a query that are
-interpolated are table names (from the `Table` enum) and column lists / sort keys, all of
-which are **hard-coded in application code** — they never derive from request input. So
-even the non-parameterisable identifiers cannot be influenced by a client.
-
-**Per-query resource guards.** `ClickHouseService` applies `max_execution_time` and
-`max_memory_usage` (from `GH_CLICKHOUSE_MAX_EXECUTION_TIME` / `GH_CLICKHOUSE_MAX_QUERY_MEMORY`)
-to every SELECT, so a single expensive query is bounded in wall-clock time and memory —
-limiting the blast radius of an abusive or pathological request.
-
----
-
-## 7. Error handling & information disclosure
-
-All errors are rendered as **RFC 7807 `application/problem+json`** by the global
-`ProblemDetailsFilter` (`apps/api/src/common/problem-details.filter.ts`), giving a
-consistent error shape instead of Nest's ad-hoc default JSON.
-
-- **5xx detail is not leaked.** For any error that is not an `HttpException` (i.e.
-  unexpected server errors), the client receives a generic `500` problem document with
-  `detail: "An unexpected error occurred."`. The real exception (including stack trace) is
-  **logged server-side only**.
-- **4xx detail is intentional.** Client errors (400/401/404/429, etc.) return their
-  message/validation errors so callers can correct their request.
-- **`x-powered-by` is disabled** in `main.ts` (`app.disable('x-powered-by')`), so the
-  response does not advertise the framework.
-
----
+- **5xx causes are never sent.** Any unexpected error, and any 5xx, becomes the route's fixed failure message (`unable to retrieve
+  payments`, ...) or `internal error`; the exception and stack are logged server-side only.
+- **4xx messages are intentional** so that callers can fix their request.
+- Errors are `Cache-Control: no-store`; `x-powered-by` is disabled.
+- A route that does not exist answers `Cannot GET /v2/nope`, not a framework page.
 
 ## 8. Secrets management
 
-Secrets handled by the system: **API keys** (`GH_API_KEYS`), the **ClickHouse password**
-(`GH_CLICKHOUSE_PASSWORD`), the **XRPL node endpoint** (`GH_XRPL_NODE_ENDPOINT`), and the
-build-time **`NPM_TOKEN`** for the private `@gatehub` registry.
+Secrets: `GH_API_KEYS`, `GH_CLICKHOUSE_PASSWORD`, node URLs with credentials, and the build-time `NPM_TOKEN`.
 
-**Source of truth.** All runtime secrets are provided via environment variables.
-
-- `.env` and `.env.*` are **git-ignored** (`.gitignore`), with only `.env.example` /
-  `deploy/.env.prod.example` checked in as templates. `deploy/.env.prod` itself is
-  git-ignored and must never be committed.
-- `.dockerignore` excludes `**/.env` and `**/.env.*` (except `*.env.example`) so secrets
-  are not copied into image build contexts.
-- In production, env vars are expected to be **injected from a secrets manager** (Vault /
-  AWS Secrets Manager / k8s secrets). The config layer and the env templates both call
-  this out. The `prod` compose file consumes them via `--env-file deploy/.env.prod`, which
-  in a real deployment should itself be rendered from the secrets manager rather than
-  stored on disk.
-- Config is **fail-fast**: `apiConfigFromEnv` validates numeric settings and throws on bad
-  input at boot, and the compose file requires `GH_CLICKHOUSE_PASSWORD`
-  (`${GH_CLICKHOUSE_PASSWORD:?set a ClickHouse password}`) so the stack won't start without
-  one.
-
-**`NPM_TOKEN` build-arg caveat (honest gap).** Both `apps/api/Dockerfile` and
-`apps/syncer/Dockerfile` take `NPM_TOKEN` as an `ARG` and use it to authenticate `pnpm
-install` against the private registry:
-
-```dockerfile
-ARG NPM_TOKEN
-ENV npm_read_token=$NPM_TOKEN
-RUN npm config set "//registry.npmjs.org/:_authToken" "${npm_read_token}"
-```
-
-This bakes the token into the **builder layer's history**. The final runtime image is a
-fresh `node:20-bookworm-slim` stage that copies only `/app/out` (a multi-stage build, so
-the token does not land in the *runtime* image filesystem) — but the token can still be
-recovered from the **builder image layers** if that intermediate image is retained or
-pushed. *Recommended hardening:* use **BuildKit secrets**
-(`RUN --mount=type=secret,id=npm_token ...`) so the token is never written to any layer.
-This matters especially for images pushed to a registry. (Backlog, §10.)
-
-**Containers run as non-root.** Both Dockerfiles drop to the unprivileged `node` user
-(`USER node`) and `--chown=node:node` the copied app, so the process does not run as root.
-
----
+- All runtime secrets are environment variables. `.env` and `.env.*` are git-ignored (only `*.env.example` and `deploy/.env.prod.example`
+  are committed) and excluded from the Docker build context (`.dockerignore` excludes all `**/.env*`). In production inject them from a
+  secrets manager; `deploy/.env.prod` should be rendered from it, not stored.
+- **Least privilege per service.** The production compose does not hand `deploy/.env.prod` to containers; each service lists the
+  variables it needs, so the syncers never see `GH_API_KEYS` or the CORS and rate-limit settings
+  ([which service gets what](configuration.md#which-service-gets-which-variables-production-compose)).
+- **Config is fail-fast:** invalid values stop the boot with a message naming the variable (values of secrets are not echoed), and the
+  compose file refuses to start without `GH_CLICKHOUSE_PASSWORD` and `GH_API_KEYS`. There is no boot guard against a placeholder
+  ClickHouse password.
+- **`NPM_TOKEN` is a BuildKit secret.** Both Dockerfiles mount it with `RUN --mount=type=secret,id=npm_token,required=true`: it is written
+  to `~/.npmrc` inside that one `RUN` and removed by a `trap` before the layer is committed. It is not an `ARG` or `ENV`, so it is in no
+  image layer, config or `docker history` (verified with a leak probe for both images). Do not copy the token out of `~/.npmrc` into
+  files or build arguments; pass `NPM_TOKEN` in the environment of the build command.
+- **Containers run as non-root** (`USER node`, `--chown=node:node`).
+- Logs show node endpoints as `scheme://host:port` only.
 
 ## 9. Network exposure
 
-In the production topology (`docker-compose.prod.yaml`):
+Production compose (`docker-compose.prod.yaml`):
 
-- **ClickHouse is deliberately not published.** The `clickhouse` service exposes no host
-  ports — `8123` (HTTP) and `9000` (native) are reachable only on the internal compose
-  network. ClickHouse Keeper (`9181`) is likewise internal.
-- **The syncer is internal.** It has no published host port; its `3002` health endpoint is
-  used only by the in-container healthcheck.
-- **The API is not directly published either.** API replicas use `expose: ['3001']` (no
-  host port binding, no fixed `container_name`) so they can be scaled with
-  `--scale api=N`. Traffic reaches them through the in-cluster `nginx`/proxy, which in turn
-  sits behind the GateHub edge proxy. Only that ingress path is reachable.
-- **Load-testing override.** `docker-compose.prod.override.yaml` *does* publish ClickHouse
-  (`8123:8123`) so a host-side seeder can reach it. This file is **explicitly marked for
-  load/perf testing only** and must **not** be used in real production. Using it widens the
-  trust boundary to include the host.
+- **Only nginx has a host port** (`NGINX_BIND:NGINX_PORT`, default `0.0.0.0:8080`, bind it to the front proxy's interface).
+  ClickHouse (8123/9000), Keeper (9181), the apis (3001) and the syncers (3002), and every metrics port (3000) are `expose`d inside the
+  compose network only.
+- **Edge rules** (nginx, case-insensitive after URI normalisation): `/internal/` (Swagger) is 404 for everyone; `/liveliness/healthz` is
+  answered only for trusted proxies; unknown hosts get a 404 JSON and `/healthz`.
+- **Load-test override.** `docker-compose.prod.override.yaml` publishes ClickHouse on the host for seeding; never use it in production.
+- **Dev compose:** everything is published on `127.0.0.1` only, and the dev API key is `dev-api-key`.
+- **ClickHouse users:** a dedicated `data_api` user (access management enabled), not `default`. The api and the syncers share it
+  (full access); a read-only user for the api would be better.
 
-**ClickHouse access management** is enabled in the prod compose
-(`CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1`) with a dedicated `data_api` user rather than
-`default`. Tightening that user to least-privilege is on the backlog (§10).
+## 10. Security checklist
 
----
+### Implemented
 
-## 10. Security checklist / hardening backlog
+- [x] API-key authentication (two header forms), global, before the rate limit; constant-time comparison.
+- [x] Production boot refuses an empty key list and the placeholder keys.
+- [x] Zero-downtime key rotation (several keys accepted).
+- [x] TLS at the front proxy; the client address recovered by nginx from trusted proxies only and handed on as one address.
+- [x] Per-client-and-route rate limit (429), case-insensitive path handling.
+- [x] Strict hand-written parameter parsers with the original's messages; fully parameterised ClickHouse queries.
+- [x] Per-query ClickHouse time and memory guards; bounded windows and limits.
+- [x] Ripple-shaped errors; 5xx causes only in logs; `x-powered-by` disabled.
+- [x] Secrets via environment; env files git- and docker-ignored; per-service env in compose.
+- [x] The npm token is a BuildKit secret, in no layer.
+- [x] Containers run as non-root; ClickHouse, Keeper, syncers and metrics are not published; `/internal/` and `/liveliness/` blocked at the edge.
 
-### Implemented today
+### Backlog
 
-- [x] API-key authentication (two header forms), enforced globally.
-- [x] Constant-time key comparison (`timingSafeEqual`).
-- [x] Loud production warning when auth is disabled (no keys configured).
-- [x] Zero-downtime key rotation (multiple keys accepted).
-- [x] TLS terminated at the GateHub reverse proxy; `trust proxy` configured.
-- [x] Per-client rate limiting (429), keyed on real client IP.
-- [x] Global `ValidationPipe` with `whitelist` + `forbidNonWhitelisted` + typed DTOs.
-- [x] Fully parameterised ClickHouse queries (no SQL injection); identifiers from
-      trusted code/enums only.
-- [x] Per-query ClickHouse time & memory guards.
-- [x] RFC 7807 errors; 5xx detail suppressed; `x-powered-by` disabled.
-- [x] Secrets via env / secrets manager; `.env` git-ignored & docker-ignored; fail-fast
-      config validation.
-- [x] Containers run as non-root (`node` user).
-- [x] ClickHouse and Keeper not published to the network in prod.
-
-### Backlog / recommended hardening (not yet implemented)
-
-- [ ] **Hash API keys at rest** — compare hashes instead of plaintext env values.
-- [ ] **Per-key scopes / trust levels** — currently any valid key = full read access.
-- [ ] **Shared (Redis-backed) rate-limit store** — for a true global limit across replicas.
-- [ ] **BuildKit secrets for `NPM_TOKEN`** — stop baking the token into image layers.
-- [ ] **Secret-scanning in CI** — catch committed credentials before merge.
-- [ ] **Dependency / vulnerability scanning** — automated SCA on the dependency tree and
-      base images.
-- [ ] **Audit logging** — structured record of authenticated requests (which key, what
-      endpoint) for traceability.
-- [ ] **ClickHouse user least-privilege** — restrict the `data_api` user to the minimum
-      grants (read on the `xrpl` DB for the API; scoped writes for the syncer/migrator).
+- [ ] **Hash API keys at rest** (store digests, not plaintext env values).
+- [ ] **Per-key scopes / rate tiers.**
+- [ ] **Shared (Redis-backed) rate-limit store** for a true global limit across replicas.
+- [ ] **Read-only ClickHouse user for the api** and scoped grants for the syncer and migrator.
+- [ ] **Guard for a placeholder `GH_CLICKHOUSE_PASSWORD`.**
+- [ ] **Count 401/429 in the metrics** (guard rejections are not in `api_http_requests_total`).
+- [ ] **Secret scanning and dependency/base-image vulnerability scanning in CI.**
+- [ ] **Audit logging** (which key called which endpoint).
+- [ ] **Narrow the nginx trust defaults** by shipping no default for `TRUSTED_PROXIES` (today: private ranges).
