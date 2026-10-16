@@ -29,6 +29,15 @@ describe('parseRangeIngestArgs', () => {
     expect(USAGE).toContain('--max-wait');
   });
 
+  it('reads --allow-gap: a range may start above the live checkpoint + 1 (ruling R110)', () => {
+    expect(parseRangeIngestArgs(['--from', '1', '--to', '2', '--allow-gap'])).toEqual({
+      from: 1,
+      to: 2,
+      allowGap: true,
+    });
+    expect(USAGE).toContain('--allow-gap');
+  });
+
   it('leaves the optional flags out when they are not given, so that the defaults of rangeIngest apply', () => {
     expect(parseRangeIngestArgs(['--from', '1', '--to', '2'])).toEqual({ from: 1, to: 2 });
   });

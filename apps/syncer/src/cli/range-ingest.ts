@@ -48,6 +48,12 @@ export interface RangeIngestOptions {
   /** Delete and rewrite the ledgers in the range even if they are committed. Default false: those are skipped. */
   reprocess?: boolean;
   /**
+   * Allow a range that starts above the live checkpoint + 1 on a database a live syncer has run on (ruling R110). The
+   * live syncer resumes after the highest committed ledger, so the ledgers between the checkpoint and `from` would be
+   * skipped for good unless something else fills them. Default false: such a range is refused.
+   */
+  allowGap?: boolean;
+  /**
    * Names this invocation in `ingest_log.run_id`, in the dedup tokens and in the query ids of its inserts. A per-invocation
    * nonce is appended (`${runId}:${nonce}`): the dedup log of the tables survives a DELETE, so reusing a `runId` after
    * a delete would silently drop the rows of the rewrite. Must not start with `live:` (the live runner's intents).
@@ -226,8 +232,9 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *
  * **An unfinished intent** is a chunk whose newest `ingest_log` row says 'started': a run died, or gave up, in the middle
  * of it. At the start the runs of the intents that overlap `[from, to]` are waited for (`awaitQuiescence`); then, before
- * the first chunk, each of them is redone over its own recorded range, whatever the chunk size of this run (overlapping
- * ones as one range), and closed ('done') right after (ruling R100, see `redoOpenIntents`). `ingest_log` rows with a
+ * the first chunk, each of them is redone over its own recorded range, whatever the chunk size and the range of this run
+ * (overlapping ones as one range), marked in `agg_dirty` and closed ('done') right after (rulings R100, R110, see
+ * `redoOpenIntents`). `ingest_log` rows with a
  * `live:` run id belong to the live runner (key `(start, 0)`): they are never read as chunks, redone or marked.
  *
  * **Transient fetch failures** (rulings R100, R105): a rate-limited node is asked again when the pause it named is over,
@@ -245,7 +252,9 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *
  * **A live syncer** owns everything above its checkpoint (ruling R27): a range that reaches above the committed
  * checkpoint is refused while a lease younger than 30 s (on the server's clock) is held, and is checked again for every
- * chunk after its ledgers were fetched, in case a live syncer started in the meantime.
+ * chunk after its ledgers were fetched, in case a live syncer started in the meantime. On a database a live syncer has
+ * run on, a range that starts above the checkpoint + 1 is refused unless `allowGap` (ruling R110): the live syncer
+ * resumes after the highest committed ledger and would skip the ledgers in between.
  *
  * **`agg_dirty`.** Every chunk that was written gets a row right after its 'done', from the close times of its ledgers,
  * from the start of the hour of the earliest to the end of the hour of the latest, so that the aggregator recomputes
@@ -271,6 +280,7 @@ class RangeRunner {
   private readonly chunkSize: number;
   private readonly concurrency: number;
   private readonly reprocess: boolean;
+  private readonly allowGap: boolean;
   private readonly maxAttempts: number;
   private readonly retryBackoffMs: number;
   private readonly maxTransientWaitMs: number;
@@ -283,8 +293,11 @@ class RangeRunner {
 
   private writer: LedgerWriter;
   private open: OpenIntent[] = [];
-  /** The errors a fetch gave up on because the chunk went `maxTransientWaitMs` without a ledger (for the log). */
-  private readonly outOfTime = new WeakSet<object>();
+  /**
+   * Why a fetch gave up on a transient failure (for the log): the chunk went `maxTransientWaitMs` without a ledger, or the
+   * node asked for a pause longer than that, which fails at once.
+   */
+  private readonly outOfTime = new WeakMap<object, string>();
   /** The ledgers the redo of the unfinished intents wrote in this run (and marked in agg_dirty). */
   private readonly redone = new Set<number>();
 
@@ -333,6 +346,7 @@ class RangeRunner {
     this.leaseFreshMs = opts.leaseFreshMs ?? DEFAULT_LEASE_FRESH_MS;
     this.quiescenceTimeoutMs = opts.quiescenceTimeoutMs ?? DEFAULT_QUIESCENCE_TIMEOUT_MS;
     this.reprocess = opts.reprocess ?? false;
+    this.allowGap = opts.allowGap ?? false;
 
     if (opts.indexes !== undefined) {
       for (const index of opts.indexes) {
@@ -363,6 +377,7 @@ class RangeRunner {
     let failure: unknown;
     try {
       await this.assertNoLiveSyncer(this.to);
+      await this.assertNoGap();
       await this.waitForOpenIntents();
       await this.redoOpenIntents();
       for (const chunk of this.chunks()) {
@@ -527,10 +542,8 @@ class RangeRunner {
         const spent =
           err instanceof LedgerNotAvailableError || retryAfterMsOf(err) > 0 || throttleHint(err) !== undefined;
         if (permanent || isLedgerParseError(err) || spent || attempt >= this.maxAttempts) {
-          const outOfTime =
-            typeof err === 'object' && err !== null && this.outOfTime.has(err)
-              ? `: no ledger fetched for --max-wait (${this.maxTransientWaitMs / 1000} s)`
-              : '';
+          const why = typeof err === 'object' && err !== null ? this.outOfTime.get(err) : undefined;
+          const outOfTime = why === undefined ? '' : `: ${why}`;
           this.logger.error(
             `Chunk [${chunk.start},${chunk.end}] failed (attempt ${attempt} of ${this.maxAttempts})${outOfTime}, ` +
               `its intent stays open: ${describe(err)}`,
@@ -574,8 +587,9 @@ class RangeRunner {
 
   /**
    * Fetch the ledgers, `concurrency` at a time, and return them in the order of `indexes`. After the first failure no new
-   * fetch starts and the ones in flight are waited for; then a `LedgerNotAvailableError` (permanent) is thrown in
-   * preference to any other error, and otherwise the error of the lowest index.
+   * fetch starts: a fetch that waits out a transient failure wakes and gives up at once (`FetchAbandoned`, ruling R105),
+   * and the requests still on the wire are waited for. Then a `LedgerNotAvailableError` is thrown in preference to any
+   * other error, and otherwise the error of the lowest index.
    */
   private async fetchAll(indexes: number[]): Promise<RawLedger[]> {
     const results = new Array<RawLedger>(indexes.length);
@@ -627,7 +641,8 @@ class RangeRunner {
         if (phase.failed) throw new FetchAbandoned();
         let delay: number;
         const throttle = throttleHint(err);
-        if (retryAfterMsOf(err) > 0 || throttle !== undefined) {
+        const paused = retryAfterMsOf(err) > 0 || throttle !== undefined;
+        if (paused) {
           delay = retryAfterMsOf(err) || throttle?.retryInMs || DEFAULT_THROTTLE_WAIT_MS;
         } else if (err instanceof LedgerNotAvailableError) {
           missing += 1;
@@ -643,7 +658,17 @@ class RangeRunner {
           const now = Date.now();
           if (now >= resumeAt) break;
           if (phase.hopeless(now)) {
-            if (typeof err === 'object' && err !== null) this.outOfTime.add(err);
+            if (typeof err === 'object' && err !== null) {
+              this.outOfTime.set(
+                err,
+                // a pause of the node's that would end after the budget fails at once, without waiting for it;
+                // anything else means the budget ran out (or would, before the next try)
+                paused && now < phase.deadline && resumeAt >= phase.deadline
+                  ? `the node asked for a pause of ${(delay / 1000).toFixed(1)} s, longer than --max-wait ` +
+                      `(${this.maxTransientWaitMs / 1000} s) without a ledger allows: failed at once`
+                  : `no ledger fetched for --max-wait (${this.maxTransientWaitMs / 1000} s)`,
+              );
+            }
             throw err;
           }
           if (!logged && err instanceof LedgerNotAvailableError) {
@@ -715,15 +740,19 @@ class RangeRunner {
   }
 
   /**
-   * Ruling R100: redo every unfinished intent over its own recorded range, whatever the chunk size of this run is, and
-   * close it. Overlapping intents are merged and redone as one. For each such range, before any chunk of this run:
+   * Rulings R100, R110: redo every unfinished intent over its own recorded range, whatever the chunk size and the range of
+   * this run are, and close it. Overlapping intents are merged and redone as one. For each such range, before any chunk
+   * of this run:
    *  - a ledger that is committed in it is complete (its commit marker went in after all of its rows) and is kept as it
    *    is: neither fetched nor rewritten;
-   *  - the ledgers to write are the uncommitted ones this run would ingest in it; they are fetched and parsed, then every
-   *    uncommitted span of the range is deleted (which also takes the child rows that a crashed write left for ledgers
-   *    that are not written now), then they are written, as one chunk with its own intent row (nothing of this when the
-   *    whole range is committed);
-   *  - every intent of the range gets a 'done' row.
+   *  - the ledgers to write are all the uncommitted ones of the recorded range, also those outside `[from, to]` (a
+   *    narrower rerun must not close an intent over ledgers it never wrote); inside `[from, to]` an index-list run writes
+   *    its listed ones only. They are fetched and parsed, then every uncommitted span of the range is deleted (which also
+   *    takes the child rows a crashed write left for ledgers that are not written now), then they are written, as one
+   *    chunk with its own intent row (nothing of this when the whole range is committed);
+   *  - every intent of the range gets a 'done' row;
+   *  - `agg_dirty` gets the close-time window of every committed ledger of the range, the ones that were committed before
+   *    as well: the run that died may have committed them and never marked them.
    * A redo that fails leaves the intents open, and the next run redoes them again; one that succeeds closes them, so no
    * intent is redone by every run after it (F5: a run with a smaller `--chunk` than the one that died kept rewriting the
    * first chunk of a wider intent and never closed it).
@@ -744,7 +773,7 @@ class RangeRunner {
       const startedAt = Date.now();
       await this.assertNoLiveSyncer(group.end);
       const committed = await this.committedIn(group.start, group.end);
-      const toWrite = this.targetsIn(group.start, group.end).filter((i) => !committed.has(i));
+      const toWrite = this.redoTargets(group.start, group.end).filter((i) => !committed.has(i));
       const gaps = uncommittedSpans(
         group.start,
         group.end,
@@ -762,7 +791,15 @@ class RangeRunner {
         if (groupClosed && intent.start === group.start && intent.end === group.end) continue;
         await this.writeIntent(intent.start, intent.end, this.writer.runId, 'done');
       }
-      if (ledgers.length > 0) await this.markAggregatesDirty(closeWindowOf(ledgers));
+      // the window of everything committed in the range now: what was there, and what was written
+      let window: CloseWindow | undefined;
+      for (const close of [...committed.values(), ...ledgers.map((l) => l.header.close_time)]) {
+        window = window
+          ? { min: Math.min(window.min, close), max: Math.max(window.max, close) }
+          : { min: close, max: close };
+      }
+      if (window) await this.markAggregatesDirty(window);
+      for (const index of committed.keys()) this.redone.add(index);
       for (const ledger of ledgers) this.redone.add(ledger.header.ledger_index);
       this.ledgersWritten += ledgers.length;
       this.logger.log(
@@ -774,13 +811,15 @@ class RangeRunner {
     this.open = [];
   }
 
-  /** The ledgers in `[start, end]` that this run ingests: its range there, or its listed indexes there. */
-  private targetsIn(start: number, end: number): number[] {
-    const from = Math.max(this.from, start);
-    const to = Math.min(this.to, end);
-    if (from > to) return [];
-    if (this.indexes) return this.indexes.filter((i) => i >= from && i <= to);
-    return Array.from({ length: to - from + 1 }, (_, k) => from + k);
+  /**
+   * The ledgers of the recorded range `[start, end]` of an unfinished intent that its redo writes (when they are not
+   * committed): every one of them, except that inside `[from, to]` an index-list run keeps to its listed indexes.
+   */
+  private redoTargets(start: number, end: number): number[] {
+    const all = Array.from({ length: end - start + 1 }, (_, k) => start + k);
+    if (!this.indexes) return all;
+    const listed = new Set(this.indexes);
+    return all.filter((i) => i < this.from || i > this.to || listed.has(i));
   }
 
   // =================================================================================================================
@@ -810,6 +849,29 @@ class RangeRunner {
           `while a live syncer holds the lease (${holder})`,
       );
     }
+  }
+
+  /**
+   * Ruling R110: on a database a live syncer has run on (it has a `syncer_lease` row, fresh or not), a range must not
+   * start above the committed checkpoint + 1 unless `allowGap`. The live syncer resumes after the highest committed
+   * ledger, so the ledgers between its checkpoint and `from` would be skipped for good; and a live syncer that boots
+   * while the range is written deletes the ledgers above its checkpoint. A database filled by range ingests alone (no
+   * lease row) is not checked: there the gaps are the operator's to fill.
+   */
+  private async assertNoGap(): Promise<void> {
+    if (this.allowGap) return;
+    const checkpoint = await committedCheckpoint(this.ch);
+    if (checkpoint === undefined || this.from <= checkpoint + 1) return;
+    const lease = await this.ch.queryOne<{ n: string | number }>(
+      `SELECT count() AS n FROM ${Table.SyncerLease} WHERE network = {network:String}`,
+      { network: this.network },
+    );
+    if (Number(lease?.n ?? 0) === 0) return;
+    throw new Error(
+      `Range [${this.from},${this.to}] starts above the live checkpoint ${checkpoint} + 1: the live syncer resumes after ` +
+        `the highest committed ledger and would skip ${checkpoint + 1}..${this.from - 1}. Start at ${checkpoint + 1}, ` +
+        'or pass --allow-gap (allowGap) when the gap is deliberate and will be filled by another range ingest',
+    );
   }
 
   /**
@@ -905,6 +967,8 @@ The network, ClickHouse and node come from the same GH_* environment as the sync
   --max-wait <s>         seconds a chunk may go without a ledger arriving while it waits for a rate-limited node or a
                          ledger the node lacks right now, before it fails (default ${DEFAULT_MAX_TRANSIENT_WAIT_MS / 1000})
   --reprocess            delete and rewrite ledgers that are committed already (default: skip them)
+  --allow-gap            allow a range that starts above the highest committed ledger + 1 on a database a live syncer
+                         has run on (refused by default: the live syncer would never fetch the ledgers in between)
   --run-id <id>          name of this run in ingest_log and in query ids (a nonce is appended)
   --help                 print this text
 
@@ -944,6 +1008,7 @@ export function parseRangeIngestArgs(argv: string[]): RangeIngestOptions | 'help
         concurrency: { type: 'string' },
         'max-wait': { type: 'string' },
         reprocess: { type: 'boolean' },
+        'allow-gap': { type: 'boolean' },
         'run-id': { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
@@ -965,6 +1030,7 @@ export function parseRangeIngestArgs(argv: string[]): RangeIngestOptions | 'help
     opts.maxTransientWaitMs = integerFlag('max-wait', values['max-wait'] as string) * 1000;
   }
   if (values.reprocess) opts.reprocess = true;
+  if (values['allow-gap']) opts.allowGap = true;
   if (values['run-id'] !== undefined) opts.runId = values['run-id'] as string;
   return opts;
 }

@@ -590,7 +590,7 @@ describe('rangeIngest (e2e)', () => {
       expect((await intents(svc)).filter((i) => i.status !== 'done')).toEqual([]);
     });
 
-    it('merges overlapping unfinished intents and redoes them as one, removing the orphans of ledgers it does not write', async () => {
+    it('merges overlapping unfinished intents and redoes them as one over their whole recorded range, also beyond the range of the run (R110)', async () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx, { runId: 'crashed-a' }).write(CHAIN_RAW.slice(0, 4)); // L(1)..L(4) committed
       await insertUncommitted(svc, CHAIN_RAW.slice(4, 8)); // L(5)..L(8): child rows only
@@ -598,14 +598,37 @@ describe('rangeIngest (e2e)', () => {
       await seedIntent(svc, L(5), L(8), 'crashed-b');
       const source = new TestSource(CHAIN_RAW);
 
-      // The run asks for L(1)..L(6) only: L(5) and L(6) are written, L(7) and L(8) are not, but their orphan rows go; the
-      // committed L(1)..L(4) are kept as they are.
+      // The run asks for L(1)..L(6) only, but the intents it closes recorded L(1)..L(8): L(5)..L(8) are written (their
+      // orphan rows replaced), so closing the intents leaves no uncommitted ledger behind; the committed L(1)..L(4) are
+      // kept as they are.
       await rangeIngest(source, svc, ctx, { from: L(1), to: L(6), ...FAST });
 
-      expect(source.fetches.sort((a, b) => a - b)).toEqual([L(5), L(6)]);
-      expect(await committedIndexes(svc)).toEqual(range(L(1), L(6)));
-      expect(await rowsAbove(svc, L(6))).toEqual(noRows());
-      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 6), CHAIN_TABLES));
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(5), L(8)));
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(8)));
+      expect(await rowsAbove(svc, L(8))).toEqual(noRows());
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 8), CHAIN_TABLES));
+      await expectNoDuplicateTransactions(svc);
+      expect((await intents(svc)).filter((i) => i.status !== 'done')).toEqual([]);
+    });
+
+    it('a narrower rerun redoes the whole intent and marks agg_dirty for all of its committed ledgers (R110)', async () => {
+      const svc = await freshService();
+      const T0 = hourFloor(CHAIN_RAW[0].header.close_time);
+      const hourly = CHAIN_RAW.map((raw, i) => ({ ...raw, header: { ...raw.header, close_time: T0 + i * 3600 + 5 } }));
+      // A run over L(1)..L(14) died after it committed L(1)..L(3) and before it marked anything: its intent is open.
+      await new LedgerWriter(svc, ctx, { runId: 'crashed-run' }).write(hourly.slice(0, 3));
+      await insertUncommitted(svc, hourly.slice(3, 6));
+      await seedIntent(svc, L(1), L(14), 'crashed-run');
+      const source = new TestSource(hourly);
+
+      // The rerun asks for the last ledgers only.
+      await rangeIngest(source, svc, ctx, { from: L(12), to: L(14), ...FAST });
+
+      expect(source.fetches.sort((a, b) => a - b)).toEqual(range(L(4), L(14)));
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(14)));
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(hourly.slice(0, 14), CHAIN_TABLES));
+      // the hours of L(1)..L(3), which the crashed run committed but never marked, are marked with the rest
+      expect(await dirtyWindows(svc)).toEqual([[T0, T0 + 14 * 3600]]);
       expect((await intents(svc)).filter((i) => i.status !== 'done')).toEqual([]);
     });
 
@@ -768,12 +791,14 @@ describe('rangeIngest (e2e)', () => {
       source.errors.set(L(12), [new NodeThrottledError(['wss://node.example'], 200, 'rate limit: retry in ~150ms')]);
       const write = jest.spyOn(LedgerWriter.prototype, 'write');
 
+      // 400 ms without a ledger: the 40 ms fetch and the 200 ms pause of L(12) fit with 160 ms to spare (the whole run
+      // takes longer than the budget)
       const result = await rangeIngest(source, svc, ctx, {
         ...FAST,
         from: L(1),
         to: L(14),
         concurrency: 1,
-        maxTransientWaitMs: 300,
+        maxTransientWaitMs: 400,
       });
 
       expect(result.ledgers).toBe(14);
@@ -831,10 +856,18 @@ describe('rangeIngest (e2e)', () => {
         new NodeThrottledError(['wss://node.example'], 929_624, 'rate limit: retry in ~929374ms'),
       ]);
 
+      const logger = captureLogger();
+
       await expect(
-        rangeIngest(source, svc, ctx, { ...FAST, from: L(1), to: L(14), maxTransientWaitMs: 60_000 }),
+        rangeIngest(source, svc, ctx, { ...FAST, from: L(1), to: L(14), maxTransientWaitMs: 60_000, logger }),
       ).rejects.toBeInstanceOf(NodeThrottledError);
       expect(source.fetchCount(L(3))).toBe(1);
+      // the log says why it failed at once, not that the budget ran out
+      const failed = logger.lines.filter((l) => l.level === 'error').map((l) => l.message);
+      expect(failed).toEqual([
+        expect.stringMatching(/failed .*: the node asked for a pause of 929\.6 s, longer than --max-wait \(60 s\)/),
+      ]);
+      expect(failed[0]).not.toContain('no ledger fetched');
     });
 
     it('refuses a negative budget', async () => {
@@ -1113,6 +1146,43 @@ describe('rangeIngest (e2e)', () => {
         rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST }),
       ).rejects.toThrow(/reaches above the live checkpoint .* while a live syncer holds the lease \(host:1:abc\)/);
       expect(await count(svc, Table.Ledgers)).toBe(0);
+    });
+
+    it('refuses a range that starts above the live checkpoint + 1 once a live syncer has run, even with its lease released (R110)', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(CHAIN_RAW.slice(0, 10)); // checkpoint L(10)
+      await seedLease(svc, '', 3600); // a live syncer ran here and released its lease an hour ago
+      const source = new TestSource(CHAIN_RAW);
+
+      await expect(rangeIngest(source, svc, ctx, { from: L(15), to: L(20), ...FAST })).rejects.toThrow(
+        `Range [${L(15)},${L(20)}] starts above the live checkpoint ${L(10)} + 1: the live syncer resumes after the ` +
+          `highest committed ledger and would skip ${L(11)}..${L(14)}. Start at ${L(11)}, or pass --allow-gap`,
+      );
+      expect(source.fetches).toEqual([]);
+      expect(await count(svc, Table.IngestLog)).toBe(0);
+    });
+
+    it('allows a gap above the live checkpoint with allowGap, and a range that starts right after it (R110)', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(CHAIN_RAW.slice(0, 10));
+      await seedLease(svc, '', 3600);
+
+      await rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(15), to: L(20), allowGap: true, ...FAST });
+      expect(await committedIndexes(svc)).toEqual([...range(L(1), L(10)), ...range(L(15), L(20))]);
+
+      const svc2 = await freshService();
+      await new LedgerWriter(svc2, ctx).write(CHAIN_RAW.slice(0, 10));
+      await seedLease(svc2, '', 3600);
+      await rangeIngest(new TestSource(CHAIN_RAW), svc2, ctx, { from: L(11), to: L(20), ...FAST });
+      expect(await committedIndexes(svc2)).toEqual(range(L(1), L(20)));
+    });
+
+    it('does not refuse a gap where no live syncer ever ran: a database filled by range ingests only (R110)', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(CHAIN_RAW.slice(0, 10));
+
+      await rangeIngest(new TestSource(CHAIN_RAW), svc, ctx, { from: L(15), to: L(20), ...FAST });
+      expect(await committedIndexes(svc)).toEqual([...range(L(1), L(10)), ...range(L(15), L(20))]);
     });
 
     it('allows a range at or below the live checkpoint', async () => {
