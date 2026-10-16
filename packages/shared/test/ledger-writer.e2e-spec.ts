@@ -716,6 +716,12 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
     it('kills the queries that are still running after the timeout', async () => {
       const svc = await freshService();
+      // The client warns when the socket of the query it is waiting for is closed by the kill (sometimes, depending on
+      // timing): expected here, so it is kept out of the output; any other warning still goes through.
+      const warn = console.warn.bind(console);
+      jest.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        if (!String(args[0]).includes('socket was closed or ended before the response was fully read')) warn(...args);
+      });
       const stuck = sleeper(svc, 'quiet-kill:slow:1', 30);
       const outcome = stuck.then(
         () => 'finished',

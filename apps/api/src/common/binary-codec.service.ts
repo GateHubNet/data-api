@@ -95,6 +95,17 @@ function substituteEmptyAccounts(
   return count === 0 ? { value: json, count } : { value: Object.fromEntries(entries), count };
 }
 
+/** Whether `json` holds an AccountID field whose value is `""` anywhere, without building anything (the common case: no). */
+function hasEmptyAccount(json: unknown, isAccountField: (name: string) => boolean): boolean {
+  if (Array.isArray(json)) return json.some((item) => hasEmptyAccount(item, isAccountField));
+  if (!isPlainObject(json)) return false;
+  for (const key in json) {
+    const value = json[key];
+    if (value === '' ? isAccountField(key) : hasEmptyAccount(value, isAccountField)) return true;
+  }
+  return false;
+}
+
 /** `json` (decoded) with every string that is `address` put back as `""`. */
 function restoreEmptyAccounts(json: unknown, address: string): unknown {
   if (Array.isArray(json)) return json.map((item) => restoreEmptyAccounts(item, address));
@@ -258,8 +269,7 @@ export class BinaryCodecService implements OnModuleInit, OnModuleDestroy {
       const field = Object.prototype.hasOwnProperty.call(fields, name) ? fields[name] : undefined;
       return field?.type?.name === 'AccountID' && field.isVariableLengthEncoded === true;
     };
-    const probe = substituteEmptyAccounts(json, isAccountField, EMPTY_ACCOUNT_SENTINELS[0].address);
-    if (probe.count === 0) return undefined;
+    if (!hasEmptyAccount(json, isAccountField)) return undefined;
     const text = JSON.stringify(json);
     const sentinel = EMPTY_ACCOUNT_SENTINELS.find(
       (s) => !text.includes(s.address) && !text.toUpperCase().includes(s.hex),
