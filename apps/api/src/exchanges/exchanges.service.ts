@@ -26,7 +26,7 @@ export const EXCHANGE_KEYS: KeysetKey[] = [
 export const BUCKET_KEYS: KeysetKey[] = [{ column: 'bucket', type: 'UInt32' }];
 
 /** The start of the ORDER BY of `exchanges`: the pair, in the order it is stored. */
-const PAIR_KEYS: KeysetKey[] = [
+export const PAIR_KEYS: KeysetKey[] = [
   { column: 'base_currency', type: 'String' },
   { column: 'base_issuer', type: 'String' },
   { column: 'counter_currency', type: 'String' },
@@ -39,7 +39,7 @@ const PAIR_KEYS: KeysetKey[] = [
  * cannot read the table in the order of its primary key, and sorts every row of the pair in the range first (found in
  * Task 21 for `payments_by_currency`). Spelled out, it reads in order and stops after the page.
  */
-const PAIR_ORDER: KeysetKey[] = [...PAIR_KEYS, ...EXCHANGE_KEYS];
+export const PAIR_ORDER: KeysetKey[] = [...PAIR_KEYS, ...EXCHANGE_KEYS];
 
 /** What both lists of exchanges are asked for; the values are already validated. */
 export interface ExchangesWindow {
