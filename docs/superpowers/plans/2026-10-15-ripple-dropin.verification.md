@@ -4,7 +4,7 @@ Run of 2026-10-16 (16:08 to 18:10 UTC) on branch `feat/ripple-dropin`, base comm
 Everything below was observed, not assumed; the files behind each number are under the scratch folder
 `/private/tmp/claude-501/-Users-golobitch-github-com-GateHubNet-data-api-new/096aa099-861f-4246-9d06-6b477dcfe4c1/scratchpad/verify/`
 (logs in `logs/`, every API response in `smoke/<network>/`) and the harness scripts are kept in
-`.superpowers/sdd/2026-10-15-ripple-dropin/task-38-harness/` (git-ignored). The API key of the run is a random throwaway and is written `$KEY`.
+`docs/superpowers/plans/2026-10-15-ripple-dropin.verification/harness/`. The API key of the run is a random throwaway and is written `$KEY`.
 
 ## 0. Verdict
 
@@ -411,7 +411,7 @@ The unit test of F12 reads this file: update `packages/shared/src/network/networ
 
 - `packages/shared/config/markets/xahau.json` (version 2, section 8).
 - Doc corrections made false by that file: `docs/syncer.md` §7 (last bullet), `docs/api-reference.md` (network volumes intro), `docs/adr/0009-one-deployment-per-network.md` ("ships empty"). No other doc was changed; F6 to F9 are listed, not fixed, because the right side to fix (docs or product) is the controller's call.
-- This report, and `.superpowers/sdd/2026-10-15-ripple-dropin/task-38-report.md` (git-ignored) with the harness copy.
+- This report, and the harness copy in `docs/superpowers/plans/2026-10-15-ripple-dropin.verification/harness/`.
 
 No product code, test or env file was edited; no key, token or env file is in the report or the commit.
 
@@ -420,7 +420,7 @@ No product code, test or env file was edited; no key, token or env file is in th
 - Processes: both syncers stopped with SIGTERM (lease released, `Released the syncer lease` logged; the `kill -9` ones were the crash tests), both apis stopped, every range-ingest / sample / crash script finished or stopped; `pgrep` for `dist/main.js`, `range-ingest`, `sample-range`, `crash-loop`, `smoke.js`, `step5.js`, `semantic.js` finds nothing, ports 13000 to 13013 are free.
 - Docker: `docker compose -p dropin-verify -f docker-compose.yaml -f compose.override.yaml down -v` removed the container `dropin-verify-clickhouse`, the network `dropin-verify_default` and the volume `dropin-verify_clickhouse-data`; no container, volume, network or image with `dropin` in its name remains. The testcontainers of Step 1 removed themselves (no `ryuk` or ClickHouse test container left).
   The user's containers and volumes (`data-api-clickhouse`, `ch-keeper`, the `ghv2_*`, `supabase_*`, `rhyza-*` ones) were not stopped, started, removed or modified; the running ones were running before and after. The two failed `docker build` attempts produced no image; BuildKit may keep unnamed cache layers of the base image steps.
-- Files: nothing was deleted except my own scratch files inside the verify folder (`range.stop`, two `*.tmp`, one 260 KB ledger sample). The verify folder itself is left in place as the evidence; nothing was written outside it and the repo except the harness copy in the git-ignored `.superpowers/sdd/.../task-38-harness/`. No stray file from a mistyped path.
+- Files: nothing was deleted except my own scratch files inside the verify folder (`range.stop`, two `*.tmp`, one 260 KB ledger sample). The verify folder itself is left in place as the evidence; nothing was written outside it and the repo except the harness copy (now in `docs/superpowers/plans/2026-10-15-ripple-dropin.verification/harness/`). No stray file from a mistyped path.
 - The user's `apps/api/.env`, `apps/syncer/.env`, `deploy/.env.prod` and the npm credentials were not read, printed, copied or edited.
 
 ## Appendix: harness and commands
@@ -447,7 +447,7 @@ docker compose -p dropin-verify -f docker-compose.yaml -f compose.override.yaml 
 ## Fixes after verification
 
 Fix round of 2026-10-16 on `feat/ripple-dropin` (base `04c0f0e`), under the controller rulings R95 to R104. Every code change was
-written test first (RED, then GREEN); the RED/GREEN evidence per change is in `.superpowers/sdd/2026-10-15-ripple-dropin/task-38-fix-report.md`.
+written test first (RED, then GREEN); the RED/GREEN evidence per change is in `docs/superpowers/plans/2026-10-15-ripple-dropin.verification/fixes-report.md` (and `final-fix-report.md` for the final review round).
 
 | Finding | Ruling | Commit | What changed | Evidence |
 | --- | --- | --- | --- | --- |

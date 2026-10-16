@@ -1,0 +1,9 @@
+# scratch override for the verification run: the dev compose pins container_name: data-api-clickhouse and host ports 8123/9000,
+# which collide with the user's own (stopped) container of that name.
+services:
+  clickhouse:
+    container_name: dropin-verify-clickhouse
+    restart: 'no'
+    ports: !override
+      - '127.0.0.1:18123:8123'
+      - '127.0.0.1:19000:9000'

@@ -1,0 +1,1 @@
+{ "version": 3, "tradeMarkets": [ { "base": { "currency": "EVR", "issuer": "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8" }, "counter": { "currency": "XAH", "issuer": "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8" } } ], "paymentCurrencies": [ { "currency": "XAH", "issuer": "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8" } ] }
