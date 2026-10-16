@@ -115,9 +115,23 @@ One row per successful `Payment` between two different accounts: `tx_hash`, `clo
 Nullable(String)`. Read by `/payments` and the payment volume aggregation.
 
 ### `payments_by_currency` (P7, `ORDER BY (currency, issuer, ledger_index, tx_index)`)
-Narrow index for `/payments/{currency}`. `account_payments` (P7, `ORDER BY (account, ledger_index, tx_index)`): one row per account
-and payment with `direction Enum8('sent'=1,'received'=2)`, `counterparty`, `currency`, `issuer`, `delivered_amount[_f]`, the tags and
-`tx_hash`, `close_time`. Read by `/accounts/{a}/payments` and `/accounts/{a}/reports`.
+Narrow index for `/payments/{currency}`.
+
+### `account_payments` (P7, `ORDER BY (account, ledger_index, tx_index, direction)`)
+One row per account and payment with `direction Enum8('sent'=1,'received'=2)`, `counterparty`, `currency`, `issuer`,
+`delivered_amount[_f]`, the tags and `tx_hash`, `close_time`: a `sent` row for the source and a `received` row for the destination.
+Read by `/accounts/{a}/payments` and `/accounts/{a}/reports`.
+
+`direction` closes the key (Ruling R112): a ReplacingMergeTree keeps one row per key, and a payment from an account to itself has
+both rows for the same account and `(ledger_index, tx_index)`, so with the key `(account, ledger_index, tx_index)` a merge kept
+one of them, whichever, and `type=sent` (or `received`) lost the payment at random. The ingest drops a payment to oneself today (a
+conversion, not a payment, as in the original), so this is the table not depending on that rule. The readers keep the original's
+behaviour for such a payment: `/accounts/{a}/payments` lists it **once** (the page dedupes on `(ledger_index, tx_index)`, markers
+unchanged) and it matches **both** `type=sent` and `type=received` (a filter on `direction`; the original filtered on
+`source == account` / `destination == account`); `/accounts/{a}/reports` counts it **once, as sent** (the original tested
+`payment.account === payment.data.source` first, so the receiver's side was never reached), with the account among its own
+`receiving_counterparties`. The baseline was changed in place (it had not been deployed); a development database created from the old
+baseline keeps the old key (`CREATE TABLE IF NOT EXISTS`) and fails the checksum of `001_baseline.sql`: recreate it.
 
 ### `exchanges` (P7, `ORDER BY (base_currency, base_issuer, counter_currency, counter_issuer, ledger_index, tx_index, node_index)`)
 One row per trade. **The pair is stored in Ripple's canonical order** (lexicographic on the lower-cased `currency+issuer`), so a pair

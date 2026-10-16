@@ -30,23 +30,27 @@ export interface AccountReportsQuery {
 const DAY = "toString(toDate(close_time, 'UTC'))";
 
 /**
- * The side of a payment for the account. A payment to oneself has a row of each side under the same key
- * `(account, ledger_index, tx_index)`, so only one of them survives a merge (and which one does not matter here); the
- * original saw it as the sender's (`payment.account === payment.data.source`), and so it is here.
+ * The side of a payment for the account. A payment to oneself has a row of each side (`sent` and `received`, two keys
+ * of `account_payments` since R112, so a merge keeps both), and the original counted it once, as the sender's: it
+ * tested `payment.account === payment.data.source` first, and only the rest was the receiver's side
+ * (`lib/aggregation/accountPayments.js`). So both rows are the sender's here (the counterparty is the account itself),
+ * whichever of them `LIMIT 1 BY` reads, and a payment to oneself is never in `payments_received` nor in
+ * `sending_counterparties`.
  */
 const SIDE = "if(counterparty = account, 'sent', toString(direction))";
 
 /**
  * The rows of the account in the ledgers `[min, max]`, each payment once. The tables are not collapsed before a merge
- * and no FINAL is used, so a row that was written twice would be read twice: `LIMIT 1 BY` the rest of the key keeps
- * one. The ORDER BY is the whole key of `account_payments` (`account, ledger_index, tx_index`), account included
- * though it is fixed: ClickHouse then reads the table in the order of its primary key and does not sort, as a suffix
- * alone could make it read the whole history of the account and sort it.
+ * and no FINAL is used, so a row that was written twice would be read twice, and a payment to oneself has two rows even
+ * after a merge: `LIMIT 1 BY` the payment (`ledger_index, tx_index`) keeps one. The ORDER BY is the whole key of
+ * `account_payments` (`account, ledger_index, tx_index, direction`), account included though it is fixed: ClickHouse then
+ * reads the table in the order of its primary key and does not sort, as a suffix alone could make it read the whole
+ * history of the account and sort it.
  */
 function read(columns: string): string {
   return `SELECT ${columns} FROM ${Table.AccountPayments}
            WHERE account = {account:String} AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
-           ORDER BY account, ledger_index, tx_index
+           ORDER BY account, ledger_index, tx_index, direction
            LIMIT 1 BY ledger_index, tx_index`;
 }
 
@@ -55,7 +59,7 @@ function read(columns: string): string {
  * accountPayments.js` filled as the payments came in; here they are made when they are asked for).
  *
  * The days become one range of ledgers (`LedgerRangeResolver`), and everything is read from the narrow
- * `account_payments`, in the order of its key (`ORDER BY account, ledger_index, tx_index`, a row for each side of a
+ * `account_payments`, in the order of its key (`ORDER BY account, ledger_index, tx_index, direction`, a row for each side of a
  * payment, with the currency, issuer and delivered amount). ClickHouse adds the payments up per day, direction and
  * currency (exact decimal sums, with the Float64 fallback of `decimal.ts`) and counts or lists the counterparties; only
  * those groups come back, not the payments, which are read only for `payments=true`.

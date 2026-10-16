@@ -1,17 +1,19 @@
 import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, paginate } from '../common/pagination';
 import { PaymentObject, toPaymentObject } from '../payments/payment-object';
 import { PAYMENT_KEYS, PaymentKey, paymentsByKeys } from '../payments/payments.service';
 import { AccountWindow } from './account-window';
 
 /**
- * The ORDER BY of `account_payments`. `account` is fixed by the query, but it stays in the ORDER BY: ClickHouse reads a
- * table in the order of its key only when the ORDER BY starts with a prefix of that key, and a suffix-only ORDER BY can
- * make it read the whole history of the account and sort it (found in Task 21 for `payments_by_currency`).
+ * The ORDER BY of `account_payments`: its whole sorting key. `account` is fixed by the query, but it stays in the ORDER
+ * BY: ClickHouse reads a table in the order of its key only when the ORDER BY starts with a prefix of that key, and a
+ * suffix-only ORDER BY can make it read the whole history of the account and sort it (found in Task 21 for
+ * `payments_by_currency`). `direction` closes the key (R112): a payment to oneself has a `sent` and a `received` row
+ * for the same account and the same `(ledger_index, tx_index)`, and a merge keeps one row per key.
  */
-const ACCOUNT_PAYMENT_ORDER: KeysetKey[] = [{ column: 'account', type: 'String' }, ...PAYMENT_KEYS];
+const ACCOUNT_PAYMENT_ORDER = ['account', ...columnsOf(PAYMENT_KEYS), 'direction'];
 
 /** The direction of a payment for the account (`type=sent|received`). */
 export type PaymentDirection = 'sent' | 'received';
@@ -33,10 +35,13 @@ export interface AccountPaymentsQuery extends AccountWindow {
 /**
  * The payments of an account (`getAccountPayments` of the original).
  *
- * The keys of a page come from the narrow `account_payments` (`ORDER BY account, ledger_index, tx_index`, a `sent` and
- * a `received` row per payment, with the currency, issuer, tags and direction the list filters on), read with
+ * The keys of a page come from the narrow `account_payments` (`ORDER BY account, ledger_index, tx_index, direction`, a
+ * `sent` and a `received` row per payment, with the currency, issuer, tags and direction the list filters on), read with
  * `readDistinctPage`, and the wide rows of the page from `payments` (`paymentsByKeys`): the payment is the one
  * `GET /v2/payments` serves. The dates become a range of ledgers once.
+ *
+ * Like the original (one row per account and payment; `type=sent` is `source == account`, `type=received` is
+ * `destination == account`), a payment to oneself is listed once, and is both a payment sent and a payment received.
  */
 @Injectable()
 export class AccountPaymentsService {
@@ -69,13 +74,14 @@ export class AccountPaymentsService {
     ];
 
     // In the order of the whole key, each payment once: a row written twice is there twice until a merge (no FINAL is
-    // used), and so are the `sent` and `received` rows of a payment to oneself, which share the key. One more than the
-    // page: it tells whether there is a next page.
+    // used), and so are the `sent` and `received` rows of a payment to oneself (two keys, told apart by `direction`,
+    // but one `(ledger_index, tx_index)`). Without a `type` both are read and counted once; with one, `direction`
+    // picks the row. One more than the page: it tells whether there is a next page.
     const keys = await readDistinctPage<PaymentKey>(this.ch, {
       columns: 'ledger_index, tx_index',
       table: Table.AccountPayments,
       where: conditions,
-      orderBy: columnsOf(ACCOUNT_PAYMENT_ORDER),
+      orderBy: ACCOUNT_PAYMENT_ORDER,
       unique: columnsOf(PAYMENT_KEYS),
       descending: q.descending,
       params: {

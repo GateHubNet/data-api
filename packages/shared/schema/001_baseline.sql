@@ -182,6 +182,9 @@ PARTITION BY intDiv(ledger_index, 10000000)
 ORDER BY (currency, issuer, ledger_index, tx_index)
 SETTINGS non_replicated_deduplication_window = 1000;
 
+-- One row per account and payment, a `sent` row for the source and a `received` row for the destination. `direction`
+-- is the last column of the key: a payment to oneself has both rows for the same account, and a ReplacingMergeTree
+-- keeps one row per key, so without it a merge would drop one of them (R112).
 CREATE TABLE IF NOT EXISTS account_payments
 (
   account            String,
@@ -200,7 +203,7 @@ CREATE TABLE IF NOT EXISTS account_payments
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY intDiv(ledger_index, 10000000)
-ORDER BY (account, ledger_index, tx_index)
+ORDER BY (account, ledger_index, tx_index, direction)
 SETTINGS non_replicated_deduplication_window = 1000;
 
 -- ---------------------------------------------------------------------------

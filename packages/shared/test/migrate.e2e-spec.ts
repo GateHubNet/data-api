@@ -46,7 +46,8 @@ const SHAPES: Record<Table, Shape> = {
   [Table.AccountPayments]: {
     engine: 'ReplacingMergeTree',
     partition: P7,
-    order: 'account, ledger_index, tx_index',
+    // `direction` tells the `sent` and the `received` row of a payment to oneself apart (R112)
+    order: 'account, ledger_index, tx_index, direction',
   },
   [Table.Exchanges]: {
     engine: 'ReplacingMergeTree',

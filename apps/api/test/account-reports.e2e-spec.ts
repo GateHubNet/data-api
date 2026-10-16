@@ -1382,6 +1382,36 @@ describe('account reports computed from synthetic ledgers', () => {
     );
     expect(b).toMatchObject({ payments_sent: 1, payments_received: 0, total_value_sent: '3' });
   });
+
+  it('counts a payment to oneself the same, once and as sent, after a merge: both of its rows are kept (R112)', async () => {
+    // the original counted it as the sender's only (`payment.account === payment.data.source` is tested first, and the
+    // receiver's side is what is left): so does the report, whichever of the two rows it reads
+    const before = await dayReport('2020-03-04', '?accounts=true&payments=true');
+    await h.ch.command(`OPTIMIZE TABLE ${Table.AccountPayments} FINAL`);
+    const tx = PAYS.findIndex((p) => p.from === p.to) + 1;
+    const stored = await h.ch.query<{ direction: string }>(
+      `SELECT direction FROM ${Table.AccountPayments} WHERE account = {account:String} AND tx_index = {tx:UInt32}
+        ORDER BY direction`,
+      { account: A, tx },
+    );
+    expect(stored.map((r) => r.direction)).toEqual(['sent', 'received']);
+
+    const after = await dayReport('2020-03-04', '?accounts=true&payments=true');
+    expect(after).toEqual(before);
+    expect(after).toMatchObject({
+      payments_sent: 3,
+      payments_received: 0,
+      receiving_counterparties: [A, B, E],
+      sending_counterparties: [],
+    });
+    expect(after.payments?.map((p) => [p.type, p.currency, p.amount])).toEqual([
+      ['sent', 'XRP', '5'],
+      ['sent', 'USD', '100'],
+      ['sent', 'XRP', '1'],
+    ]);
+    // the side of the other days did not move either
+    expect(await dayReport('2020-03-05')).toMatchObject({ payments_received: 1, payments_sent: 0 });
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------------

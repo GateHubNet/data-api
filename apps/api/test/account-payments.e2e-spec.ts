@@ -630,9 +630,12 @@ describe('account payments API endpoint', () => {
       expect(sql).toMatch(/direction = \{direction:String\}/);
       expect(sql).toMatch(/currency = \{currency:String\}/);
       expect(sql).toMatch(/destination_tag = \{destination_tag:UInt32\}/);
-      // read with a plain LIMIT, which stops the read after the page (Ruling R106); outside it a row that was written
-      // twice counts once
-      expect(sql).toMatch(/tx_index ASC\s+LIMIT \{distinct_page_cap:UInt32\}\)/);
+      // read with a plain LIMIT, which stops the read after the page (Ruling R106), in the order of the whole key of the
+      // table, `direction` last (R112); outside it a row that was written twice counts once, and so does a payment to
+      // oneself (its `sent` and `received` rows have one `(ledger_index, tx_index)`)
+      expect(sql).toMatch(
+        /ORDER BY account ASC, ledger_index ASC, tx_index ASC, direction ASC\s+LIMIT \{distinct_page_cap:UInt32\}\)/,
+      );
       expect(sql.match(/LIMIT 1 BY ledger_index, tx_index/g)).toHaveLength(1);
       expect(params).toMatchObject({
         account: BUSIEST,
@@ -860,6 +863,117 @@ describe('account payments API endpoint when a ledger was written twice', () => 
     const desc = await pages(`${path(BUSIEST)}?descending=true`, 2);
     expect(desc.flatMap(hashesIn)).toEqual(hashesOfRows(rows).reverse());
     expect(unpaged.body.count).toBe(rows.length);
+  });
+});
+
+describe('account payments API endpoint for a payment to oneself, after a merge (R112)', () => {
+  // `account_payments` is a ReplacingMergeTree: of the rows that share an ORDER BY key a merge keeps one. A payment to
+  // oneself has a `sent` and a `received` row for the same account, so `direction` is part of the key (the ingest
+  // drops such a payment today, being a conversion, but the table must not depend on that). The original stored one
+  // row per account and payment and filtered `type=sent` by `source == account` and `type=received` by
+  // `destination == account`: a payment to oneself was listed once, and matched both types.
+  const SELF = 'rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD';
+  const OTHER = 'rnCEEqDnCuSjDsHiJrca4VYUqaMyi4vGF7';
+  const [template] = PAYMENTS;
+  const LEDGER = template.row.ledger_index;
+  // the account's own payments, in the order of the list: to oneself, to the other, from the other
+  const PAYS = [
+    { tx_index: 900, source: SELF, destination: SELF },
+    { tx_index: 901, source: SELF, destination: OTHER },
+    { tx_index: 902, source: OTHER, destination: SELF },
+  ].map((p) => ({ ...template.row, ...p, tx_hash: `${p.tx_index}`.padStart(64, 'D') }));
+  const [TO_SELF, TO_OTHER, FROM_OTHER] = PAYS.map((p) => p.tx_hash);
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (p: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(p, limit, 'payments');
+  const directions = async (): Promise<string[]> =>
+    (
+      await h.ch.query<{ tx_index: number; direction: string }>(
+        `SELECT tx_index, direction FROM ${Table.AccountPayments} WHERE account = {account:String} AND ledger_index = {index:UInt32}
+          ORDER BY tx_index, direction`,
+        { account: SELF, index: LEDGER },
+      )
+    ).map((r) => `${r.tx_index}:${r.direction}`);
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+    await h.ch.insert(Table.Payments, PAYS);
+    // the rows `buildLedgerRows` makes of a payment: one for the source and one for the destination. ClickHouse
+    // already merges the rows of ONE insert that share a key (`optimize_on_insert`), so to see what a later merge
+    // does the two sides come in two inserts, and are two parts until the merge
+    const sideRows = (side: 'sent' | 'received'): AccountPaymentsRow[] =>
+      PAYS.map((p) => ({
+        account: side === 'sent' ? p.source : p.destination,
+        direction: side,
+        counterparty: side === 'sent' ? p.destination : p.source,
+        ledger_index: p.ledger_index,
+        tx_index: p.tx_index,
+        tx_hash: p.tx_hash,
+        close_time: p.close_time,
+        currency: p.currency,
+        issuer: p.issuer,
+        delivered_amount: p.delivered_amount,
+        delivered_amount_f: p.delivered_amount_f,
+        source_tag: p.source_tag,
+        destination_tag: p.destination_tag,
+      }));
+    await h.ch.insert(Table.AccountPayments, sideRows('sent'));
+    await h.ch.insert(Table.AccountPayments, sideRows('received'));
+    // the rows are in the table, two for the payment to oneself ...
+    expect(await directions()).toEqual(['900:sent', '900:received', '901:sent', '902:received']);
+    // ... and a merge is made of them all
+    for (const table of [Table.Payments, Table.AccountPayments]) {
+      await h.ch.command(`OPTIMIZE TABLE ${table} FINAL`);
+    }
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('keeps both of its rows through a merge: the key tells them apart', async () => {
+    expect(await directions()).toEqual(['900:sent', '900:received', '901:sent', '902:received']);
+  });
+
+  it('lists it once', async () => {
+    const res = await get(`${path(SELF)}?limit=1000`);
+    expect(res.status).toBe(200);
+    expect(hashesIn(res.body)).toEqual([TO_SELF, TO_OTHER, FROM_OTHER]);
+    expect(res.body.count).toBe(3);
+    expect(res.body.marker).toBeUndefined();
+    expect(hashesIn((await get(`${path(SELF)}?limit=1000&descending=true`)).body)).toEqual([
+      FROM_OTHER,
+      TO_OTHER,
+      TO_SELF,
+    ]);
+  });
+
+  it('is both a payment sent and a payment received', async () => {
+    expect(hashesIn((await get(`${path(SELF)}?type=sent`)).body)).toEqual([TO_SELF, TO_OTHER]);
+    expect(hashesIn((await get(`${path(SELF)}?type=received`)).body)).toEqual([TO_SELF, FROM_OTHER]);
+    expect(hashesIn((await get(`${path(SELF)}?type=sent&descending=true`)).body)).toEqual([TO_OTHER, TO_SELF]);
+    expect(hashesIn((await get(`${path(SELF)}?type=received&descending=true`)).body)).toEqual([FROM_OTHER, TO_SELF]);
+    // the other account has the two payments it took part in, one sent and one received
+    expect(hashesIn((await get(`${path(OTHER)}?type=sent`)).body)).toEqual([FROM_OTHER]);
+    expect(hashesIn((await get(`${path(OTHER)}?type=received`)).body)).toEqual([TO_OTHER]);
+  });
+
+  it('is neither repeated nor skipped by the pages, one payment at a time', async () => {
+    const cases: [string, string[]][] = [
+      ['', [TO_SELF, TO_OTHER, FROM_OTHER]],
+      ['?type=sent', [TO_SELF, TO_OTHER]],
+      ['?type=received', [TO_SELF, FROM_OTHER]],
+      ['?descending=true', [FROM_OTHER, TO_OTHER, TO_SELF]],
+      ['?type=received&descending=true', [FROM_OTHER, TO_SELF]],
+    ];
+    for (const [query, hashes] of cases) {
+      for (const limit of [1, 2]) {
+        const walked = (await pages(`${path(SELF)}${query}`, limit)).flatMap(hashesIn);
+        expect([query, limit, walked]).toEqual([query, limit, hashes]);
+      }
+    }
   });
 });
 

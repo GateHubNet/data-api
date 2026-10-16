@@ -647,7 +647,7 @@ The payments (as `/v2/payments`) the account sent or received.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `type` | both | `sent` or `received` (lower-cased). |
+| `type` | both | `sent` or `received` (lower-cased). A payment from the account to itself (the ingest stores none, a conversion is not a payment) would be listed once, and match both types, as in the original. |
 | `currency`, `issuer` | all | Only payments of that currency (upper-cased) / issuer. |
 | `source_tag`, `destination_tag` | all | Only payments with that tag; text that is not a tag matches nothing. |
 | `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | |
@@ -801,7 +801,8 @@ The window may span at most 200 days (counted as the whole days between `start` 
 A day without payments is a report of zeros, so there is one report per day of the window. Values are in the native currency:
 an issued currency counts at the rate of the day (the `/v2/exchange_rates` rate in strict mode) and as 0 where it has none.
 Quotients are cut to 17 significant digits, sums are exact. `payments` adds a list `[{tx_hash, amount (the delivered amount),
-currency, issuer?, type}]` as the last key of each report.
+currency, issuer?, type}]` as the last key of each report. A payment from the account to itself would count once, as sent (the
+original tested the sender's side first), and the account would be among its own `receiving_counterparties`.
 
 Errors, in order: 400 `invalid date format` (`start`, or the path date), `invalid end date format`, `choose a date range less
 than 200 days`; 500 `unable to retrieve payments` (the message the original has: it copied the payments route).

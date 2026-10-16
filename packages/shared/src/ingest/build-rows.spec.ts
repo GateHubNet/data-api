@@ -6,6 +6,7 @@ import { PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
 import { ParseContext, parseContextFor } from '../parsers/parser.interface';
+import { PaymentParser } from '../parsers/payment.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
 import { buildLedgerRows, CHILD_TABLES, LedgerParseError, LedgerRows } from './build-rows';
 import { FixtureLedgerSource } from './fixture-ledger-source';
@@ -548,6 +549,59 @@ describe('buildLedgerRows mapping', () => {
         { account: RECEIVER, direction: 'received', counterparty: SENDER, ...base },
       ]);
       expect(rows.accountPayments).toHaveLength(4);
+    });
+
+    // R112: a ReplacingMergeTree keeps one row per ORDER BY key, so the `sent` and the `received` row of one payment
+    // must never share one. They differ in `account` unless a payment is to oneself, and then in `direction`.
+    it('keys a row of account_payments by its direction too: (account, ledger_index, tx_index, direction)', () => {
+      expect(orderByColumns(Table.AccountPayments)).toEqual(['account', 'ledger_index', 'tx_index', 'direction']);
+    });
+
+    describe('a payment to oneself', () => {
+      const ledger = (): RawLedger =>
+        ledgerOf([
+          rawTx(
+            { TransactionType: 'Payment', Account: SENDER, Destination: SENDER, Amount: '10000000', Fee: '12' },
+            0,
+            '0'.repeat(63) + 'F',
+            [account(SENDER, '100000000', '99999988')],
+            'tesSUCCESS',
+            { delivered_amount: '10000000' },
+          ),
+        ]);
+
+      it('is a conversion, not a payment: no row of payments or account_payments (the parser drops it)', () => {
+        const built = buildLedgerRows(ledger(), XRPL);
+        expect(built.payments).toEqual([]);
+        expect(built.paymentsByCurrency).toEqual([]);
+        expect(built.accountPayments).toEqual([]);
+      });
+
+      it('would still get its two rows, told apart by the key, if a parser did return it', () => {
+        const parsed = jest.spyOn(PaymentParser.prototype, 'parse').mockReturnValue({
+          source: SENDER,
+          destination: SENDER,
+          currency: 'XRP',
+          amount: '10',
+          delivered_amount: '10',
+          source_currency: 'XRP',
+          fee_drops: '12',
+          source_balance_changes: [],
+          destination_balance_changes: [],
+        });
+        try {
+          const { accountPayments } = buildLedgerRows(ledger(), XRPL);
+          expect(accountPayments.map((r) => [r.account, r.direction, r.counterparty])).toEqual([
+            [SENDER, 'sent', SENDER],
+            [SENDER, 'received', SENDER],
+          ]);
+          const key = (r: (typeof accountPayments)[number]): string =>
+            JSON.stringify(orderByColumns(Table.AccountPayments).map((c) => (r as unknown as Json)[c]));
+          expect(new Set(accountPayments.map(key)).size).toBe(2);
+        } finally {
+          parsed.mockRestore();
+        }
+      });
     });
   });
 
