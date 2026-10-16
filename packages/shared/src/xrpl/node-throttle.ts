@@ -53,6 +53,19 @@ export function endpointHostOf(endpoint: string): string {
 }
 
 /**
+ * `wss://user:key@host:443/path?token=...` -> `wss://host:443`: what a log may say about an endpoint (its credentials,
+ * path and query never go into a log).
+ */
+export function redactEndpoint(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return '(invalid url)';
+  }
+}
+
+/**
  * A request that was not sent, or a rate-limit answer: every endpoint it could go to is paused because the node asked
  * this client to slow down. `retryAfterMs` is the wait until the first of them may be used again.
  */

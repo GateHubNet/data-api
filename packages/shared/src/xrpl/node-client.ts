@@ -2,7 +2,7 @@ import { Logger } from '@nestjs/common';
 import { EventEmitter } from 'events';
 import { Client, DisconnectedError, NotConnectedError, Request, RippledError, TimeoutError } from 'xrpl';
 import { NetworkName, NetworkProfile } from '../network';
-import { EndpointThrottle, nodeThrottle, NodeThrottledError, throttleHint } from './node-throttle';
+import { EndpointThrottle, nodeThrottle, NodeThrottledError, redactEndpoint, throttleHint } from './node-throttle';
 
 export interface NodeClientLogger {
   log(message: string): void;
@@ -87,7 +87,7 @@ const ACCEPTED_NETWORK_IDS: Record<NetworkName, ReadonlyArray<number | undefined
  * configured endpoint that is not paused (the connection is moved there); when every endpoint is paused a request fails
  * at once with `NodeThrottledError` (its `retryAfterMs` says how long to wait), and the connect loop waits for the first
  * pause to end. A connection to a paused endpoint is kept while there is no other one, so its streams keep flowing. Each
- * pause is logged once, with its length.
+ * pause is logged once, with its length. Logs name an endpoint by `scheme://host:port` only (`redactEndpoint`).
  *
  * Events: `connected`(endpoint), `disconnected`(endpoint), and the stream messages `ledgerClosed`,
  * `validationReceived`, `manifestReceived` (plus `transaction`, `peerStatusChange`, `consensusPhase`) with the raw
@@ -131,7 +131,7 @@ export class NodeClient extends EventEmitter {
     }
     for (const endpoint of opts.endpoints) {
       if (!/^wss?:\/\//.test(endpoint)) {
-        throw new Error(`Invalid node endpoint "${endpoint}": expected a ws:// or wss:// URL`);
+        throw new Error(`Invalid node endpoint "${redactEndpoint(endpoint)}": expected a ws:// or wss:// URL`);
       }
     }
     this.endpoints = [...opts.endpoints];
@@ -189,7 +189,7 @@ export class NodeClient extends EventEmitter {
       this.client = undefined;
       this.endpoint = undefined;
       closing.push(this.retire(client));
-      this.logger.log(`Disconnected from ${endpoint}`);
+      this.logger.log(`Disconnected from ${redactEndpoint(endpoint as string)}`);
       this.safeEmit('disconnected', endpoint);
     }
     await settleWithin(Promise.all(closing), STOP_GRACE_MS);
@@ -250,9 +250,11 @@ export class NodeClient extends EventEmitter {
           this.paused(endpoint, err, `Request ${String(req.command)}`);
           throttled = err;
           const wait = this.throttledForMs();
-          if (this.state !== 'running' || wait > 0 || attempt >= retries) throw this.throttledError(wait, err);
-          // Another endpoint may be used: move the connection there and send the request again.
+          if (wait > 0) throw this.throttledError(wait, err);
+          // Another endpoint may be used: move the connection there, and send the request again if it has an attempt left.
           if (client) this.replace(client, 'is rate limiting this client');
+          // Without one, the node's own answer: there is nothing to wait for, the next request goes to the other endpoint.
+          if (this.state !== 'running' || attempt >= retries) throw err;
           continue;
         }
         if (this.state !== 'running' || !isFailoverError(err) || attempt >= retries) throw err;
@@ -281,7 +283,7 @@ export class NodeClient extends EventEmitter {
     const { ms, started } = this.throttle.pause(endpoint, err);
     if (!started) return;
     this.logger.warn(
-      `${what} was refused by ${endpoint}: ${errorMessage(err)}. It rate limits this client: nothing is sent to it ` +
+      `${what} was refused by ${redactEndpoint(endpoint)}: ${errorMessage(err)}. It rate limits this client: nothing is sent to it ` +
         `for ${(ms / 1000).toFixed(1)} s`,
     );
   }
@@ -348,11 +350,11 @@ export class NodeClient extends EventEmitter {
         if (throttleHint(err) !== undefined) {
           // Refused because this client sends too much: pause the endpoint (and try another) instead of backing off.
           this.paused(endpoint, err, 'Connecting');
-          this.logger.warn(`Cannot connect to ${endpoint}: ${errorMessage(err)}`);
+          this.logger.warn(`Cannot connect to ${redactEndpoint(endpoint)}: ${errorMessage(err)}`);
           continue;
         }
         failures += 1;
-        this.logger.warn(`Cannot connect to ${endpoint}: ${errorMessage(err)}`);
+        this.logger.warn(`Cannot connect to ${redactEndpoint(endpoint)}: ${errorMessage(err)}`);
         if (failures % this.endpoints.length === 0) await this.backoff();
         continue;
       }
@@ -362,7 +364,7 @@ export class NodeClient extends EventEmitter {
       this.healthy = false;
       this.lastStreamAt = Date.now();
       const subscribed = this.streams.size > 0 ? ` (streams: ${[...this.streams].join(', ')})` : '';
-      this.logger.log(`Connected to ${endpoint}${subscribed}`);
+      this.logger.log(`Connected to ${redactEndpoint(endpoint)}${subscribed}`);
       this.safeEmit('connected', endpoint);
       return client;
     }
@@ -426,7 +428,7 @@ export class NodeClient extends EventEmitter {
     this.endpoint = undefined;
     this.backoffBeforeReconnect = !this.healthy;
     void this.retire(client);
-    this.logger.warn(`Node ${endpoint} ${reason}; reconnecting`);
+    this.logger.warn(`Node ${redactEndpoint(endpoint as string)} ${reason}; reconnecting`);
     this.safeEmit('disconnected', endpoint);
     if (this.state === 'running') void this.startConnecting().catch(() => undefined);
   }
@@ -440,7 +442,7 @@ export class NodeClient extends EventEmitter {
     disableAutoReconnect(client);
     // Listeners are attached once, here, for the lifetime of this instance; `retire()` removes them.
     client.on('error', (code: unknown, message: unknown) =>
-      this.logger.warn(`Node ${endpoint} error: ${code} ${message}`),
+      this.logger.warn(`Node ${redactEndpoint(endpoint)} error: ${code} ${message}`),
     );
     client.on('disconnected', (code: number) => this.replace(client, `disconnected (code ${code})`));
     const emitter: EventEmitter = client;

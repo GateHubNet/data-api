@@ -452,6 +452,55 @@ describe('NodeClient', () => {
       expect(node.commands('ledger')).toHaveLength(1);
     });
 
+    it("rethrows the node's own answer when the request has no attempt left but another endpoint is usable", async () => {
+      const a = await mockNode();
+      const b = await mockNode();
+      a.handlers.ledger = () => limited(5_000);
+      b.handlers.ledger = () => ({ ledger_index: 9 });
+      const { t } = throttle();
+      const client = nodeClient([a.url, b.url], { throttle: t });
+      await client.start();
+
+      const err = (await client.request({ command: 'ledger' }, { retries: 0 }).catch((e: unknown) => e)) as Error;
+      // Not "nothing is sent to it for 0.0 s": nothing needs waiting for, the next request goes to b.
+      expect(err).not.toBeInstanceOf(NodeThrottledError);
+      expect(err).toMatchObject({ name: 'RippledError', message: expect.stringContaining('rate limit') });
+      await expect(client.request({ command: 'ledger' })).resolves.toEqual({ ledger_index: 9 });
+      expect(a.commands('ledger')).toHaveLength(1);
+    });
+
+    it('never logs the credentials, path or query of an endpoint, only scheme://host:port', async () => {
+      const node = await mockNode();
+      node.handlers.ledger = () => limited(300);
+      const lines: string[] = [];
+      const capture = {
+        log: (m: string) => void lines.push(m),
+        warn: (m: string) => void lines.push(m),
+        error: (m: string) => void lines.push(m),
+      };
+      const endpoint = `ws://user:secret@127.0.0.1:${node.port}/ws?token=hush`;
+      const { t } = throttle();
+      const client = nodeClient([endpoint], { throttle: t, logger: capture });
+      await client.start();
+      await client.request({ command: 'ledger' }).catch(() => undefined); // the pause warning
+      const reconnected = once(client, 'connected');
+      node.dropAll(); // "Node ... disconnected; reconnecting", "Connected to ..."
+      await reconnected;
+      await client.stop(); // "Disconnected from ..."
+
+      expect(lines.length).toBeGreaterThanOrEqual(4);
+      for (const line of lines) {
+        expect(line).not.toMatch(/secret|user:|hush|token|\/ws/);
+      }
+      expect(lines.filter((line) => line.includes(`ws://127.0.0.1:${node.port}`)).length).toBeGreaterThanOrEqual(4);
+    });
+
+    it('names a rejected endpoint without its credentials', () => {
+      expect(() => new NodeClient({ endpoints: ['https://user:secret@node.example/x?token=hush'] })).toThrow(
+        'Invalid node endpoint "https://node.example": expected a ws:// or wss:// URL',
+      );
+    });
+
     it('reads the hint of the answer texts the public nodes send', () => {
       expect(throttleHint(new Error('rate limit: units quota (10000 per 60s) exhausted, retry in ~109117ms'))).toEqual({
         retryInMs: 109_117,
