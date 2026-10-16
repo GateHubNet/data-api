@@ -483,3 +483,19 @@ root `C39A304D...54646` = `transaction_hash`; the JSON form shows the 22 UNLRepo
 `server_definitions`, `ledger`), 1 for its binary form, 1 for the head, and the syncer's own (`server_info`, `subscribe`, the validated
 head, and one ledger at a time: 6 committed, 2 refused with the rate limit); never more than one in flight. Everything started was torn down
 (`docker compose -p t38fix down -v`: container, network, volume); the user's containers were not touched.
+
+**Fix round 1 (after review).** The review confirmed R95–R99 and R101–R104. It found that the R100 wait budget was a deadline on the
+whole fetch phase, so a throttled chunk could use it up with successful fetches and never finish. That is fixed under ruling R105,
+together with seven minor points; no public node was contacted:
+
+| Point | Commit | Change |
+| --- | --- | --- |
+| R105: the `--max-wait` budget | `d114173` | No-progress timeout: every ledger fetched restarts it. The chunk-failure log names `--max-wait`. A ledger the node lacks still fails in bounded time. e2e: slow fetches longer than the budget plus a rate limit, and the chunk completes |
+| Abandon | `d114173` | When one fetch of the chunk fails, the fetches sleeping on a pause are woken at once |
+| Intent redo | `bc7c227` | Committed ledgers of the intent are kept (not fetched or rewritten); only uncommitted spans are cleaned and written |
+| NodeClient | `77498a3` | Out of attempts with another endpoint usable: the node's own answer, not `NodeThrottledError(0)`. Endpoints in logs are `scheme://host:port` only |
+| Wording | `550c218` | Concurrency docs state what was observed (s2 not throttled at 2; xahau.network throttles at 1, waited out) |
+| API logs | `6d87348` | A request failing on a paused node is logged once per pause, at warn, without a stack |
+| Tests, docs | `151317b`, `31d51f4` | The flag e2e uses the persistent client; the halted-503 example is the real body, with `details` |
+
+Suites after the round: `pnpm test` 1919 / 1919, `pnpm -r test:e2e` 2096 / 2096, output clean.
