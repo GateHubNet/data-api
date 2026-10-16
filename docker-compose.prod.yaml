@@ -205,6 +205,10 @@ services:
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
+      # Empty = the config/markets/xrpl.json that ships in the image. Another file must be mounted (volumes below).
+      GH_MARKETS_CONFIG: ${XRPL_MARKETS_CONFIG:-}
+    # volumes:
+    #   - ./deploy/markets-xrpl.json:/etc/gatehub/markets.json:ro # and XRPL_MARKETS_CONFIG=/etc/gatehub/markets.json
 
   api-xrpl:
     <<: *api
@@ -241,6 +245,10 @@ services:
       GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
+      # Empty = the config/markets/xahau.json that ships in the image. Another file must be mounted (volumes below).
+      GH_MARKETS_CONFIG: ${XAHAU_MARKETS_CONFIG:-}
+    # volumes:
+    #   - ./deploy/markets-xahau.json:/etc/gatehub/markets.json:ro # and XAHAU_MARKETS_CONFIG=/etc/gatehub/markets.json
 
   api-xahau:
     <<: *api
@@ -260,6 +268,12 @@ services:
   # api that is down answers 502 for its own host only. The official image renders the template at start: TRUSTED_PROXIES (the
   # front proxies, default the private ranges) -> 16-trusted-proxies.envsh -> /etc/nginx/templates/nginx.conf.template.
   # /internal/ (swagger) is blocked; /liveliness/ answers trusted proxies only.
+  #
+  # SECURITY - who may choose the client address: nginx believes the X-Forwarded-For / X-Forwarded-Proto of a connection that
+  # comes from a TRUSTED_PROXIES address, and the rate limit keys on the address it derives. The default (all private ranges)
+  # is a placeholder: set TRUSTED_PROXIES to the address(es) of your front proxy, and bind nginx (NGINX_BIND) to an interface only
+  # that proxy can reach. Published on 0.0.0.0, a client that reaches the port from a private address - on Docker Desktop every
+  # connection arrives from the gateway's private address - can spoof both headers and get a bucket of its own on every request.
   nginx:
     image: nginx:1.30.5-alpine
     depends_on:
@@ -275,7 +289,7 @@ services:
       - ./deploy/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       - ./deploy/nginx/16-trusted-proxies.envsh:/docker-entrypoint.d/16-trusted-proxies.envsh:ro # must stay executable
     ports:
-      - '8080:80'
+      - '${NGINX_BIND:-0.0.0.0}:${NGINX_PORT:-8080}:80'
     restart: unless-stopped
     healthcheck:
       test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/healthz']

@@ -4,7 +4,8 @@
 # TRUSTED_PROXIES: comma separated addresses / CIDRs of the proxies in front of this nginx whose X-Forwarded-For is believed
 # (the GateHub reverse proxy, a load balancer). Default: the private ranges, so that only a client that reaches nginx from
 # inside the private network can pick its address. To trust nothing, set a loopback address (127.0.0.1): then X-Forwarded-For
-# is never read and the client is whoever connects. 0.0.0.0/0 and ::/0 are refused (they would trust everybody).
+# is never read and the client is whoever connects. An entry whose prefix length is zero (0.0.0.0/0, ::/0, also /00) is refused:
+# it would trust everybody.
 #
 # Exports, for the template:
 #   TRUSTED_PROXY_DIRECTIVES  one `set_real_ip_from <entry>;` per entry
@@ -12,15 +13,29 @@
 
 TRUSTED_PROXY_DIRECTIVES=""
 TRUSTED_PROXY_GEO=""
+set -f # no globbing: an entry such as * must not expand to file names in the loop below
 for entry in $(printf '%s' "${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}" | tr ',' ' '); do
   case "$entry" in
     *[!0-9a-fA-F:./]*)
       echo "16-trusted-proxies.envsh: invalid TRUSTED_PROXIES entry \"$entry\" (an address or CIDR expected)" >&2
       exit 1
       ;;
-    0.0.0.0/0 | ::/0 | */0)
-      echo "16-trusted-proxies.envsh: TRUSTED_PROXIES entry \"$entry\" would trust every client" >&2
-      exit 1
+  esac
+  case "$entry" in
+    */*)
+      prefix="${entry##*/}"
+      case "$prefix" in
+        '' | *[!0-9]*)
+          echo "16-trusted-proxies.envsh: invalid TRUSTED_PROXIES entry \"$entry\" (the prefix length must be a number)" >&2
+          exit 1
+          ;;
+        *[!0]*) ;; # a prefix with a digit other than 0 is fine
+        *)
+          # /0, /00, /000 ...: nginx reads all of them as /0, which trusts every client
+          echo "16-trusted-proxies.envsh: TRUSTED_PROXIES entry \"$entry\" would trust every client" >&2
+          exit 1
+          ;;
+      esac
       ;;
   esac
   TRUSTED_PROXY_DIRECTIVES="${TRUSTED_PROXY_DIRECTIVES}set_real_ip_from ${entry};
@@ -28,4 +43,5 @@ for entry in $(printf '%s' "${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.
   TRUSTED_PROXY_GEO="${TRUSTED_PROXY_GEO}${entry} 1;
     "
 done
+set +f
 export TRUSTED_PROXY_DIRECTIVES TRUSTED_PROXY_GEO

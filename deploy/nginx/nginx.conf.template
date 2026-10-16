@@ -68,13 +68,16 @@ http {
       return 404 '{"result":"error","message":"not found"}';
     }
 
-    # Not for the public: the swagger UI and its JSON (/internal/docs, /internal/docs-json).
-    location ^~ /internal/ { return 404; }
-    location = /internal   { return 404; }
+    # Not for the public: the swagger UI and its JSON (/internal/docs, /internal/docs-json). The API routes ignore case
+    # (/INTERNAL/Docs works), so these are case-insensitive regex locations (`~*`) - a prefix location would only catch the
+    # lower-case spelling. nginx matches them against the normalised URI: percent-encoding is decoded and `//` and `/./`
+    # collapsed first, so /%69nternal/docs, //internal/docs and /./internal/docs are caught too.
+    location ~* ^/internal(/|$) { return 404; }
 
     # The probe asks ClickHouse on every call, so it is not for the public either. The front proxy / load balancer (a trusted
-    # proxy address) may use it: GET /liveliness/healthz. Container healthchecks go to the apps directly.
-    location ^~ /liveliness/ {
+    # proxy address) may use it: GET /liveliness/healthz (any letter case, as above). Container healthchecks go to the apps
+    # directly.
+    location ~* ^/liveliness(/|$) {
       if ($from_trusted_proxy = 0) { return 404; }
       set $upstream $api_upstream;
       proxy_pass $upstream;
