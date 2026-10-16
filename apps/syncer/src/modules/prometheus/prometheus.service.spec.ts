@@ -10,6 +10,7 @@ describe('PrometheusService', () => {
     service.lastCommitTimestampSeconds.set(1_760_000_000);
     service.validationsFlushedTotal.inc(20);
     service.feeStatsSamplesTotal.inc();
+    service.feeStatsErrorsTotal.inc(3);
     service.aggregatorRunsTotal.inc({ job: 'stats' });
     service.aggregatorRunsTotal.inc({ job: 'volume' }, 2);
 
@@ -21,6 +22,7 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_last_commit_timestamp_seconds 1760000000$/m);
     expect(text).toMatch(/^syncer_validations_flushed_total 20$/m);
     expect(text).toMatch(/^syncer_fee_stats_samples_total 1$/m);
+    expect(text).toMatch(/^syncer_fee_stats_errors_total 3$/m);
     expect(text).toMatch(/^syncer_aggregator_runs_total\{job="stats"\} 1$/m);
     expect(text).toMatch(/^syncer_aggregator_runs_total\{job="volume"\} 2$/m);
   });

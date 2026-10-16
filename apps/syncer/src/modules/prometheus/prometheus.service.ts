@@ -48,6 +48,11 @@ const metrics = {
     help: 'Fee stats samples written to ClickHouse.',
     registers: [registry],
   }),
+  feeStatsErrorsTotal: new Counter({
+    name: 'syncer_fee_stats_errors_total',
+    help: 'Fee stats samples that failed (the node did not answer, or ClickHouse refused the row).',
+    registers: [registry],
+  }),
   aggregatorRunsTotal: new Counter({
     name: 'syncer_aggregator_runs_total',
     help: 'Aggregator job runs, by job.',
@@ -74,6 +79,7 @@ export class PrometheusService implements OnModuleInit {
   readonly lastCommitAgeSeconds = metrics.lastCommitAgeSeconds;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly feeStatsSamplesTotal = metrics.feeStatsSamplesTotal;
+  readonly feeStatsErrorsTotal = metrics.feeStatsErrorsTotal;
   readonly aggregatorRunsTotal = metrics.aggregatorRunsTotal;
 
   onModuleInit(): void {
