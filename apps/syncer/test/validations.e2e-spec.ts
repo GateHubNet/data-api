@@ -576,21 +576,25 @@ describe('ValidationsCollector (e2e)', () => {
       await restarted.stop();
     });
 
-    it('refuses a node of the other network: nothing it reports is written', async () => {
+    it('refuses a node of the other network: it asks server_info, keeps no reporter for it and closes the connection', async () => {
+      // What a refused node streams is kept out by the gate of its feed (`rejected`), which the unit tests drive
+      // (validations-collector.spec.ts: 'refuses a node of another network: it is stopped and none of its messages is
+      // recorded', 'is not believed from a node whose reporter is not known yet, or which was refused'). Here, against a
+      // real connection, a message can only reach that gate in the moment between the refusal and the close, which no
+      // test can hit reliably: pushing after the close (as this test did) asserted nothing (final review I3).
       const xahau = await startNode('n9XahauNode', 21337);
       const collector = collectorFor(xahau.url, 'xrpl');
       try {
         collector.onApplicationBootstrap();
         await waitFor('the subscription', () => xahau.subscribed.length > 0);
         await waitFor('server_info', () => xahau.requests.some((r) => r.command === 'server_info'));
-        // refused: the collector stops the client, which closes the connection
+        // refused: the collector stops the client, which closes the connection, and never knows a reporter for it
         await waitFor('the connection to be closed', () => xahau.sockets.size === 0);
         expect(collector.reporters).toEqual([undefined]);
-        xahau.push(validation({ ledger_hash: hash(220) }));
-        xahau.push({ type: 'manifestReceived', master_key: MASTER, seq: 1, signature: 'AA', signing_key: SIGNING });
-        expect(collector.bufferedRows).toBe(0);
-        await collector.flush();
-        expect(await grouped(hash(220))).toEqual([]);
+        // and it does not come back: no reconnect within the time a reconnect would take
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        expect(xahau.sockets.size).toBe(0);
+        expect(xahau.requests.filter((r) => r.command === 'server_info')).toHaveLength(1);
       } finally {
         await collector.stop();
         await xahau.stop();
