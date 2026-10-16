@@ -107,3 +107,5 @@ Every decision the controller made while executing `2026-10-15-ripple-dropin.md`
 - Ruling R112: load-bearing residual — fix it in a small targeted dispatch (deviation from "one fix dispatch": a nondeterministic data loss on a common XRPL case found by the last re-review; mechanical baseline change, not a guess): direction joins the account_payments key, unfiltered lists dedupe on (ledger_index, tx_index), type filters find self-payments in both (original semantics), reports/stats follow the original's rule; plus .env.example private Cache-Control and balances freshAccount guard — cost if wrong: one more short review cycle.
 
 Note on R112: the premise was narrower than stated. `PaymentParser` drops `Account === Destination` (as the original did: a conversion, not a payment), so ingest never writes a self-payment row today; the key change is defense in depth.
+
+Status of the "FIX IN FINAL REVIEW" rulings: R54, R55 and R63 were implemented in the final fix round (R108 for R63) and ADR-0010 section 5 and the spec errata were updated with them.
