@@ -5,7 +5,7 @@ import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '
 import { TxObject, TxService } from '../common/tx-object';
 
 /** The highest `Sequence` a transaction can have: the column is a UInt32. */
-export const MAX_SEQUENCE = 4_294_967_295;
+const MAX_SEQUENCE = 4_294_967_295;
 
 /**
  * The ORDER BY of `account_transactions`. `account` is fixed by the query, but it stays in the ORDER BY: ClickHouse
@@ -18,7 +18,7 @@ const TIME_ORDER: KeysetKey[] = [
   { column: 'tx_index', type: 'UInt32' },
 ];
 /** What a marker of the time list holds: the ORDER BY without the account. */
-export const TIME_KEYS: KeysetKey[] = TIME_ORDER.slice(1);
+const TIME_KEYS: KeysetKey[] = TIME_ORDER.slice(1);
 
 /** The ORDER BY of `account_tx_by_sequence`, with the account for the same reason. */
 const SEQUENCE_ORDER: KeysetKey[] = [
@@ -28,7 +28,7 @@ const SEQUENCE_ORDER: KeysetKey[] = [
   { column: 'tx_index', type: 'UInt32' },
 ];
 /** What a marker of the sequence list holds: the ORDER BY without the account. */
-export const SEQUENCE_KEYS: KeysetKey[] = SEQUENCE_ORDER.slice(1);
+const SEQUENCE_KEYS: KeysetKey[] = SEQUENCE_ORDER.slice(1);
 
 /** What both lists are asked for; the values are already validated. */
 interface ListQuery {
@@ -52,11 +52,15 @@ export interface TimeQuery extends ListQuery {
   endExclusive?: Date;
 }
 
-/** The list by sequence: the transactions the account sent with a `Sequence` in the range, both ends included. */
+/**
+ * The list by sequence: the transactions the account sent with a `Sequence` between the two bounds, both ends included.
+ * With both bounds given, their order does not matter: the original's HBase scan swapped them (ruling R57), so
+ * `min_sequence=9&max_sequence=5` is the range 5 to 9.
+ */
 export interface SequenceQuery extends ListQuery {
-  /** Without it, 0. May be above what a sequence can be (the list is then empty). */
+  /** Without it, 0. Alone, above what a sequence can be, it leaves nothing to list. */
   minSequence?: number;
-  /** Without it, no upper bound. May be above what a sequence can be (the bound is then the highest sequence). */
+  /** Without it, no upper bound. Above what a sequence can be, the bound is the highest sequence. */
   maxSequence?: number;
 }
 
@@ -139,19 +143,28 @@ export class AccountTransactionsService {
   async listBySequence(q: SequenceQuery): Promise<TransactionsPage> {
     const after = decodeMarker(q.marker, SEQUENCE_KEYS);
 
-    const min = q.minSequence ?? 0;
-    const max = Math.min(q.maxSequence ?? MAX_SEQUENCE, MAX_SEQUENCE);
-    // nothing has a sequence above the highest, and a range upside down holds nothing (the HBase scan of the original
-    // swapped its ends instead, and served the rows between them)
-    if (min > MAX_SEQUENCE || min > max) return { transactions: [] };
+    // Both bounds given upside down are swapped, as the HBase scan of the original did (R57). Only when both are given,
+    // and on the numbers as sent: a missing `max_sequence` is not the highest sequence yet, or `min_sequence=4294967296`
+    // alone would swap to the highest rows where the original finds nothing.
+    const { minSequence, maxSequence } = q;
+    const both = minSequence !== undefined && maxSequence !== undefined;
+    const low = both ? Math.min(minSequence, maxSequence) : (minSequence ?? 0);
+    const high = both ? Math.max(minSequence, maxSequence) : (maxSequence ?? MAX_SEQUENCE);
+    // nothing has a sequence above the highest; a bound beyond it only means "up to the highest"
+    if (low > MAX_SEQUENCE) return { transactions: [] };
+    const min = low;
+    const max = Math.min(high, MAX_SEQUENCE);
 
     const cursor = keysetClause(SEQUENCE_KEYS, q.descending, after);
     const filtered = q.type !== undefined || q.result !== undefined;
     const conditions = [
       'account = {account:String}',
       'sequence BETWEEN {min_sequence:UInt32} AND {max_sequence:UInt32}',
-      // the table has no type and no result: those are in the row of the sender in `account_transactions`, which the
-      // account prefix of its key finds without reading any other account
+      // The table has no type and no result: those are in the row of the sender in `account_transactions`, which the
+      // account prefix of its key finds without reading any other account. The subquery is not bounded by the sequence
+      // range or the marker (it cannot be, that table has no sequence), so it reads the matching rows of the whole
+      // account on every page; that is the cost of a filtered sequence list, like a filtered time list scanning the
+      // account until it has a page.
       ...(filtered
         ? [
             `(ledger_index, tx_index) IN (

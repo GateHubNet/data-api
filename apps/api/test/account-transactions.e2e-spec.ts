@@ -881,17 +881,63 @@ describe('account transactions API endpoint', () => {
       expect((await get(`${listPath(SEQUENCED)}?min_sequence=0&result=tecPATH_DRY`)).body.count).toBe(0);
     });
 
-    it('an empty range, a reversed range and a range beyond the sequences → count 0', async () => {
+    it('an empty range and a range beyond the sequences → count 0', async () => {
       for (const query of [
         'min_sequence=1&max_sequence=11368000',
-        'min_sequence=11370364&max_sequence=11370357',
         'min_sequence=13299879',
+        // alone, a bound above the highest sequence leaves nothing: it is not swapped with a missing other bound
         'min_sequence=4294967296',
         'min_sequence=99999999999999999999999',
+        // both beyond, in either order
+        'min_sequence=4294967296&max_sequence=4294967297',
+        'min_sequence=99999999999999999999999&max_sequence=4294967296',
+        'min_sequence=13299879&max_sequence=13299880',
       ]) {
         const res = await get(`${listPath(SEQUENCED)}?${query}`);
         expect([query, res.status, res.body]).toEqual([query, 200, { result: 'success', count: 0, transactions: [] }]);
       }
+    });
+
+    it('a reversed range (min_sequence > max_sequence) is the range between them, both ends in (R57)', async () => {
+      // the HBase scan of the original swapped its ends when they came upside down and served what lies between
+      const ordinary = await get(`${listPath(SEQUENCED)}?min_sequence=11370357&max_sequence=11370364`);
+      const expected = [11370357, 11370358, 11370359, 11370360, 11370361, 11370362, 11370363, 11370364];
+      expect(sequencesIn(ordinary.body)).toEqual(expected);
+
+      const reversed = await get(`${listPath(SEQUENCED)}?min_sequence=11370364&max_sequence=11370357`);
+      expect(reversed.status).toBe(200);
+      expect(reversed.body).toEqual(ordinary.body);
+      const descending = await get(
+        `${listPath(SEQUENCED)}?min_sequence=11370364&max_sequence=11370357&descending=true`,
+      );
+      expect(sequencesIn(descending.body)).toEqual([...expected].reverse());
+
+      // with pages, in both directions, and with a filter
+      for (const dir of ['', '&descending=true']) {
+        const base = `${listPath(SEQUENCED)}?min_sequence=11370364&max_sequence=11370357${dir}`;
+        const walked = (await pages(base, 3)).flatMap(sequencesIn);
+        expect([dir, walked]).toEqual([dir, dir ? [...expected].reverse() : expected]);
+      }
+      const typed = await get(`${listPath(SEQUENCED)}?min_sequence=11370364&max_sequence=11370357&type=OfferCreate`);
+      expect(sequencesIn(typed.body)).toEqual(expected);
+      // equal bounds are one sequence
+      const one = await get(`${listPath(SEQUENCED)}?min_sequence=11370360&max_sequence=11370360`);
+      expect(sequencesIn(one.body)).toEqual([11370360]);
+    });
+
+    it('a reversed range with one bound beyond what a sequence can be: from the other bound up (R57)', async () => {
+      // 1e23 is clamped to the highest sequence after the swap
+      for (const query of [
+        'min_sequence=99999999999999999999999&max_sequence=13299872',
+        'min_sequence=13299872&max_sequence=99999999999999999999999',
+        'min_sequence=4294967296&max_sequence=13299872',
+      ]) {
+        const res = await get(`${listPath(SEQUENCED)}?${query}`);
+        expect([query, sequencesIn(res.body)]).toEqual([query, [13299872, 13299878]]);
+      }
+      // swapped down to zero: sequences 0 to 11368933
+      const low = await get(`${listPath(SEQUENCED)}?min_sequence=11368933&max_sequence=0`);
+      expect(sequencesIn(low.body)).toEqual([11368825, 11368933]);
     });
 
     it('a max_sequence beyond what a sequence can be is the highest sequence', async () => {
@@ -1087,8 +1133,10 @@ describe('account transactions API endpoint', () => {
     });
 
     it('reads the tables in the order of their primary key, so that a page never sorts the whole history', async () => {
-      // the equality prefix of the key (`account`) has to be in the ORDER BY too: a suffix-only ORDER BY can make
-      // ClickHouse read the whole history of the account and sort it
+      // The plan shows the key is read in order and never sorted. It does not prove the ORDER BY spells `account`:
+      // ClickHouse reads in order here with or without it, because `account = const` fixes that prefix. The
+      // 'time mode pages ...' and 'sequence mode pages ...' tests assert the ORDER BY text for that rule (a
+      // suffix-only ORDER BY can force a full sort on other layouts).
       const middle = historyOf(BUSY)[100];
       const sentMiddle = sentBy(SEQUENCED)[40];
       const variants: [string, string, string][] = [
