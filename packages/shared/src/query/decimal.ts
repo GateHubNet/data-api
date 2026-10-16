@@ -18,7 +18,8 @@ export const EXACT_SCALE = 30;
 export const EXACT_LIMIT = '1e36';
 
 /**
- * The exact decimal of an amount column (`base_amount`, `counter_amount`: code, never input), or `NULL` when the
+ * The exact decimal of an amount column (`base_amount`, `counter_amount` of `exchanges`, `delivered_amount` of
+ * `account_payments`: code, never input; each has an `_f` shadow next to it), or `NULL` when the
  * decimal cannot hold it whole. An amount is summed exactly only when it has at most 30 decimal places (a
  * `Decimal256(30)` silently drops the digits after them, so 1e-35 would count as 0) and is below 1e36 (so that up to
  * 1e10 of them stay below the 1e46 it holds; a sum past it wraps without an error). Issued amounts run from 1e-81 to
@@ -26,7 +27,7 @@ export const EXACT_LIMIT = '1e36';
  * decimal places are counted on the text, as BigNumber writes it: `123.456`, or a mantissa and an exponent,
  * `1.234567890123456e-25` (15 places, less the exponent: 40), `1e+21` (-21).
  */
-export function exactAmount(column: 'base_amount' | 'counter_amount'): string {
+export function exactAmount(column: 'base_amount' | 'counter_amount' | 'delivered_amount'): string {
   const places =
     `toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.')))` +
     ` - toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', ''))`;

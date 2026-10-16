@@ -44,6 +44,13 @@ describe('exactAmount', () => {
     expect(exactAmount('counter_amount')).toContain('counter_amount_f < ');
     expect(exactAmount('counter_amount')).not.toContain('base_amount');
   });
+
+  it('reads the delivered amount of a payment the same way', () => {
+    const sql = exactAmount('delivered_amount');
+    expect(sql).toContain(`toDecimal256OrNull(delivered_amount, ${EXACT_SCALE})`);
+    expect(sql).toContain(`delivered_amount_f < ${EXACT_LIMIT}`);
+    expect(sql).not.toContain('base_amount');
+  });
 });
 
 describe('volumeColumns', () => {
