@@ -8,6 +8,7 @@ import { badRequest, notFound } from '../common/errors';
 import { setLinkHeader } from '../common/pagination';
 import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
+import { transactionFilters } from '../common/tx-filters';
 import { TxObject } from '../common/tx-object';
 import { TransactionsService } from './transactions.service';
 
@@ -74,14 +75,7 @@ export class TransactionsController {
     // the checks come in the order of the original
     const start = dateParam(query, 'start', 'invalid start date format', '2013-01-01');
     const end = dateParam(query, 'end', 'invalid end date format');
-    const type = first(query, 'type') || undefined;
-    if (type !== undefined && !this.codec.transactionTypes().includes(type)) {
-      throw badRequest('invalid transaction type');
-    }
-    const result = first(query, 'result') || undefined;
-    if (result !== undefined && !this.codec.transactionResults().includes(result)) {
-      throw badRequest('invalid transaction result');
-    }
+    const { type, result } = transactionFilters(query, this.codec);
 
     const page = await this.transactions.list({
       start: start.date,
