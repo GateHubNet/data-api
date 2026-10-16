@@ -320,6 +320,20 @@ describe('toReports', () => {
       const reports = build({ days: ['2015-01-14', '2015-01-15'], list: [] });
       expect([reports[1].receiving_counterparties, reports[1].sending_counterparties]).toEqual([[], []]);
     });
+
+    it('a long list is gathered in linear time (an account that paid 100,000 accounts in a day; M5)', () => {
+      const list = Array.from({ length: 100_000 }, (_, i) => ({
+        day: '2015-01-14',
+        dir: 'sent' as const,
+        counterparty: `r${i}`,
+      }));
+      const started = Date.now();
+      const [r] = build({ list });
+      // copying the list for every account added took about 8 s here
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect((r.receiving_counterparties as string[]).length).toBe(100_000);
+      expect((r.receiving_counterparties as string[])[99_999]).toBe('r99999');
+    });
   });
 
   describe('the payments', () => {

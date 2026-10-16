@@ -168,7 +168,10 @@ export function toReports(input: ReportInput): Report[] {
   const lists = new Map<string, string[]>();
   for (const c of input.counterparties.list ?? []) {
     const key = sideKey(c.day, c.dir);
-    lists.set(key, [...(lists.get(key) ?? []), c.counterparty]);
+    const list = lists.get(key);
+    // appended in place: a copy for every account would make a day of many accounts quadratic (M5)
+    if (list) list.push(c.counterparty);
+    else lists.set(key, [c.counterparty]);
   }
   const withAccounts = input.counterparties.list !== undefined;
   const counterparties = (day: string, dir: ReportSide): number | string[] =>
