@@ -133,8 +133,9 @@ once (`... It rate limits this client: nothing is sent to it for 12.6 s`) and co
 `syncer_node_rate_limited_total{endpoint}`.
 
 The XRPL default is `wss://s2.ripple.com,wss://xrplcluster.com` (Ripple's full-history server first; it did not throttle a
-first sync at concurrency 2 to 4) and `GH_CATCHUP_CONCURRENCY` defaults to 4. A Xahau ledger is about 260 KB: on
-`wss://xahau.network` a catch-up at concurrency 1 or 2 is what stays under its 50,000 units per 10 s.
+first sync at concurrency 2 in the verification run) and `GH_CATCHUP_CONCURRENCY` defaults to 4. A Xahau ledger is about 260 KB:
+`wss://xahau.network` throttles a catch-up even at concurrency 1 (its 50,000 units per 10 s let 2 to 3 such ledgers through), and
+the syncer waits each pause out: the catch-up is slow, it does not fail.
 
 ### Boot without a node
 

@@ -176,8 +176,9 @@ export class SyncerConfig {
   ledgerFetchTimeoutMs: number = 120000;
 
   /**
-   * `GH_CATCHUP_CONCURRENCY`: ledgers fetched in parallel while catching up. 4 keeps a first sync on the public nodes
-   * under their rate limits (ruling R98); raise it with a node of your own.
+   * `GH_CATCHUP_CONCURRENCY`: ledgers fetched in parallel while catching up (default 4, ruling R98). Observed on the public
+   * nodes: `wss://s2.ripple.com` did not throttle a first sync at 2; `wss://xahau.network` throttles even at 1, which the
+   * runner waits out. Raise it with a node of your own.
    */
   @ConfigValue()
   @IntValue({ min: 1 })
