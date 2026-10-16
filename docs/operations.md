@@ -274,9 +274,10 @@ Inspect `system.query_log` for slow and failed queries and `system.processes` fo
 ### API slow while the replicas are idle
 
 The replicas wait for ClickHouse. Look at `system.processes`, `system.query_log` (`read_rows`, `memory_usage`), and `max_execution_time`
-kills. Typical causes: an unbounded window on `/v2/exchanges` (all pairs), a very active account on `/reports` or `/stats/value`, a
-`/v2/stats` over the full history before the rollup caught up, or `FINAL` added to a list query by a code change
-([ADR-0003](adr/0003-no-final-on-list-queries.md)).
+kills. Typical causes: a very active account on `/reports` or `/stats/value`, a `/v2/stats` over the full history before the rollup
+caught up, `FINAL` added to a list query by a code change ([ADR-0003](adr/0003-no-final-on-list-queries.md)), or a list query that
+reads its page with `LIMIT 1 BY` in the same SELECT as the table, which reads most of the range
+([clickhouse](clickhouse.md#reading-a-page-what-stops-the-read)): one page should read about a granule per part.
 
 ### Many 401s after a deploy
 
