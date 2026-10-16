@@ -155,12 +155,15 @@ the unpaged list.
 ### CSV
 
 Routes that list rows answer `format=csv` with `Content-Type: text/csv` and `Content-Disposition: attachment;
-filename=<name>.csv`. Nested objects are flattened to `a.b` and `c[0].d` columns, the columns are the union of the keys in the
+filename="<name>.csv"; filename*=UTF-8''<name>.csv` (RFC 6266: the name quoted, `"` and `\` escaped and anything but printable
+ASCII as `_`, and the name itself in UTF-8, percent-encoded; clients show the latter). Nested objects are flattened to `a.b` and `c[0].d` columns, the columns are the union of the keys in the
 order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name.
 
 **Differences from data.ripple.com**: flattening is applied on **every** route that has a CSV form. The original flattened nested objects with
 its `flattenJSON` helper on only some routes (9 of 29) and printed `[Object]` in the cells of the others, which made those CSVs unusable. The
-other conventions of its CSV writer (`nice-json2csv`: union-of-keys header, every cell quoted, `\"` escaping) are kept.
+other conventions of its CSV writer (`nice-json2csv`: union-of-keys header, every cell quoted, `\"` escaping) are kept. The original wrote the file
+name unquoted (`filename=payments - USD r….csv`), so a name with a `;`, a quote or a space from the request split the header; the
+name is the same, quoted (M12).
 
 ### Caching and transport
 
