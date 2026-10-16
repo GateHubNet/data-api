@@ -121,6 +121,17 @@ describe('main.ts under the toolbox bootstrap()', () => {
     expect(output).toContain('GH_API_KEYS must be set in production');
   });
 
+  it.each(['dev-api-key', 'change-me-key-1'])(
+    'refuses to boot in production with the placeholder key %s',
+    async (key) => {
+      await start({ NODE_ENV: 'production', GH_API_KEYS: `real-key,${key}` });
+      const [code] = (await once(child as ChildProcess, 'exit')) as [number | null];
+      expect(code).toBe(1);
+      expect(output).toContain('GH_API_KEYS contains a placeholder key');
+      expect(output).not.toContain('real-key');
+    },
+  );
+
   it('boots in production with a key', async () => {
     const { base } = await start({ NODE_ENV: 'production' });
     await waitFor(

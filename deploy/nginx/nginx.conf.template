@@ -1,0 +1,105 @@
+# Rendered by the official nginx image's entrypoint (envsubst on /etc/nginx/templates/*.template -> /etc/nginx/nginx.conf, see
+# the nginx service in docker-compose.prod.yaml). Exactly two variables are substituted (NGINX_ENVSUBST_FILTER): the lists of
+# trusted front proxies that 16-trusted-proxies.envsh builds from TRUSTED_PROXIES. Every other `$name` below is an nginx variable.
+
+worker_processes auto;
+events { worker_connections 1024; }
+
+http {
+  # Docker's embedded DNS - lets nginx re-resolve the api services to all their replicas. The upstreams below are
+  # variables (`set $upstream ...`), so nginx resolves them per request and starts even while an api is still down.
+  resolver 127.0.0.11 valid=10s ipv6=off;
+  server_tokens off;
+  access_log /dev/stdout;
+  error_log  /dev/stderr;
+
+  # ---- Client address -------------------------------------------------------------------------------------------------
+  # nginx sits behind a front proxy (the GateHub reverse proxy / a load balancer), which terminates TLS and appends the
+  # client address to X-Forwarded-For. The addresses in TRUSTED_PROXIES are the front proxies: from such a peer nginx takes
+  # the real client from X-Forwarded-For (the last address that is not itself a trusted proxy); from any other peer the header is
+  # ignored, so a client cannot choose its own address. Either way $remote_addr is then the client, and X-Forwarded-For is
+  # SET to it below (never appended to), so the API sees exactly one address: with GH_TRUST_PROXY_HOPS=1 (this nginx is the
+  # one hop it trusts) `req.ip` - the key of the rate limit - is the real client.
+  ${TRUSTED_PROXY_DIRECTIVES}
+  real_ip_header X-Forwarded-For;
+  real_ip_recursive on;
+
+  # Is the connecting peer (not the recovered client) one of the trusted proxies?
+  geo $realip_remote_addr $from_trusted_proxy {
+    default 0;
+    ${TRUSTED_PROXY_GEO}
+  }
+
+  # X-Forwarded-Proto: the front proxy's value (http or https) when a trusted proxy sends one - TLS ends there, so $scheme
+  # here is always http - else the scheme of this connection.
+  map "$from_trusted_proxy:$http_x_forwarded_proto" $forwarded_proto {
+    default            $scheme;
+    "~^1:(https?)$"    $1;
+  }
+
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header X-Forwarded-Proto $forwarded_proto;
+  proxy_read_timeout 60s;
+
+  # TLS terminates in front of this proxy (or here in production: add `listen 443 ssl;` + certs - mount certs, or run
+  # behind a cloud load balancer / cert-manager). HTTP shown for brevity.
+
+  # ---- Routing by host --------------------------------------------------------------------------------------------------
+  # One deployment per network, one host name per network: the API answers the same /v2/... paths on every host.
+  #   xrpl.data.<domain>  -> the XRPL deployment (database `xrpl`)
+  #   xahau.data.<domain> -> the Xahau deployment (database `xahau`)
+  map $host $api_upstream {
+    default           "";
+    ~^xrpl\.data\.    http://api-xrpl:3001;
+    ~^xahau\.data\.   http://api-xahau:3001;
+  }
+
+  server {
+    listen 80;
+    server_name xrpl.data.* xahau.data.*;
+
+    # nginx's own 404s (the blocked paths below) carry the API's error body.
+    error_page 404 @not_found;
+    location @not_found {
+      default_type application/json;
+      return 404 '{"result":"error","message":"not found"}';
+    }
+
+    # Not for the public: the swagger UI and its JSON (/internal/docs, /internal/docs-json).
+    location ^~ /internal/ { return 404; }
+    location = /internal   { return 404; }
+
+    # The probe asks ClickHouse on every call, so it is not for the public either. The front proxy / load balancer (a trusted
+    # proxy address) may use it: GET /liveliness/healthz. Container healthchecks go to the apps directly.
+    location ^~ /liveliness/ {
+      if ($from_trusted_proxy = 0) { return 404; }
+      set $upstream $api_upstream;
+      proxy_pass $upstream;
+    }
+
+    location / {
+      set $upstream $api_upstream;
+      proxy_pass $upstream;
+    }
+  }
+
+  # Any other host name: nothing to serve. /healthz is the liveness of nginx itself.
+  server {
+    listen 80 default_server;
+    server_name _;
+
+    location = /healthz {
+      access_log off;
+      default_type text/plain;
+      return 200 "ok\n";
+    }
+
+    location / {
+      default_type application/json;
+      return 404 '{"result":"error","message":"unknown host: use xrpl.data.<domain> or xahau.data.<domain>"}';
+    }
+  }
+}

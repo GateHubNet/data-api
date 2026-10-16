@@ -2,11 +2,18 @@
 #
 #   ClickHouse Keeper -> ClickHouse -> migrate-<network> (one-shot, creates the database of the network and applies the schema)
 #                                   -> syncer-<network> (ingest, exactly one) + api-<network> (read replicas)
-#   nginx routes by host to the apis: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau (deploy/nginx/nginx.conf)
+#   nginx routes by host to the apis: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau (deploy/nginx/nginx.conf.template)
 #
-# Run (secrets come from deploy/.env.prod - inject it from your secrets manager, never commit it; the building needs the npm
+# Run (secrets and settings come from deploy/.env.prod - inject it from your secrets manager, never commit it; building needs the npm
 # token of the private @gatehub/toolbox, passed as a BuildKit secret from the NPM_TOKEN environment variable):
 #   NPM_TOKEN=... docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --build
+#
+# deploy/.env.prod is only read as the compose interpolation file (`--env-file`); no container gets it as a whole. Each service
+# below lists the variables it needs, so a secret reaches only the services that use it (GH_API_KEYS: the apis; the ClickHouse
+# password: everything that talks to ClickHouse). A listed variable that is not set in the file is not passed on, and the app's
+# own default applies.
+#
+# The images are always built from this checkout (`pull_policy: build`): the image names are not looked up in any registry.
 #
 # Scale the read tier of a network (compose has no rolling update; `up` recreates the changed services):
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --scale api-xrpl=3 --scale api-xahau=2
@@ -30,8 +37,8 @@
 # (targets api-xrpl:3000, syncer-xrpl:3000, ... - with scaled replicas use Docker DNS service discovery).
 #
 # Migrations are owned by the migrate-* jobs (the apps wait for them to complete), so the syncers run with
-# GH_RUN_MIGRATIONS_ON_BOOT=false. Do not set GH_CLICKHOUSE_DATABASE, GH_NETWORK, GH_NODE_ENDPOINTS, GH_VALIDATION_ENDPOINTS,
-# GH_SYNC_START_LEDGER or the ports in deploy/.env.prod: they are per network and fixed below (see XRPL_* / XAHAU_*).
+# GH_RUN_MIGRATIONS_ON_BOOT=false. Per network, the compose file sets GH_NETWORK, GH_CLICKHOUSE_DATABASE, the node endpoints
+# (XRPL_* / XAHAU_* in the env file), the start ledger and the ports.
 
 x-syncer-build: &syncer-build
   context: .
@@ -66,9 +73,43 @@ x-clickhouse-client: &clickhouse-client
   GH_CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-data_api}
   GH_CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:?set a ClickHouse password}
 
+# Optional client settings (api and syncer): passed on from deploy/.env.prod when set there (a key without a value).
+x-clickhouse-tuning: &clickhouse-tuning
+  GH_CLICKHOUSE_MAX_EXECUTION_TIME:
+  GH_CLICKHOUSE_MAX_QUERY_MEMORY:
+  GH_CLICKHOUSE_REQUEST_TIMEOUT:
+  GH_CLICKHOUSE_MAX_CONNECTIONS:
+
+x-api-env: &api-env
+  <<: [*clickhouse-client, *clickhouse-tuning]
+  GH_CORS_ORIGINS:
+  GH_RATE_LIMIT:
+  GH_RATE_LIMIT_WINDOW:
+  GH_TRUST_PROXY_HOPS:
+  GH_LIVE_CACHE_TTL_MS:
+  GH_TX_CACHE_SIZE:
+  GH_CACHE_CONTROL:
+  GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
+  GH_HTTP_API_PORT: 3001
+  GH_METRICZ_PORT: 3000
+
+x-syncer-env: &syncer-env
+  <<: [*clickhouse-client, *clickhouse-tuning]
+  GH_WORKERS:
+  GH_LEDGER_FETCH_TIMEOUT_MS:
+  GH_CATCHUP_CONCURRENCY:
+  GH_CATCHUP_FLUSH_LEDGERS:
+  GH_CATCHUP_FLUSH_TXS:
+  GH_CATCHUP_FLUSH_MS:
+  GH_MAX_LAG_HEALTHY:
+  GH_RUN_MIGRATIONS_ON_BOOT: 'false' # owned by the migrate-<network> job
+  GH_HTTP_API_PORT: 3002
+  GH_METRICZ_PORT: 3000
+
 x-migrate: &migrate
   build: *syncer-build
   image: gatehub/data-syncer:${IMAGE_TAG:-latest}
+  pull_policy: build
   # The schema lives in the shared package of the image: schema/ next to dist/.
   command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
   depends_on:
@@ -79,7 +120,7 @@ x-migrate: &migrate
 x-syncer: &syncer
   build: *syncer-build
   image: gatehub/data-syncer:${IMAGE_TAG:-latest}
-  env_file: deploy/.env.prod
+  pull_policy: build
   restart: unless-stopped
   deploy:
     replicas: 1
@@ -92,7 +133,7 @@ x-syncer: &syncer
 x-api: &api
   build: *api-build
   image: gatehub/data-api:${IMAGE_TAG:-latest}
-  env_file: deploy/.env.prod
+  pull_policy: build
   restart: unless-stopped
   stop_grace_period: 30s
   healthcheck: *api-healthcheck
@@ -155,7 +196,7 @@ services:
       migrate-xrpl:
         condition: service_completed_successfully
     environment:
-      <<: *clickhouse-client
+      <<: *syncer-env
       GH_NETWORK: xrpl
       GH_CLICKHOUSE_DATABASE: xrpl
       # Point a full-history syncer at your own node or at Ripple's full history server (wss://s2.ripple.com).
@@ -164,9 +205,6 @@ services:
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
-      GH_RUN_MIGRATIONS_ON_BOOT: 'false' # owned by migrate-xrpl
-      GH_HTTP_API_PORT: 3002
-      GH_METRICZ_PORT: 3000
 
   api-xrpl:
     <<: *api
@@ -174,13 +212,10 @@ services:
       migrate-xrpl:
         condition: service_completed_successfully
     environment:
-      <<: *clickhouse-client
+      <<: *api-env
       GH_NETWORK: xrpl
       GH_CLICKHOUSE_DATABASE: xrpl
       GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
-      GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
-      GH_HTTP_API_PORT: 3001
-      GH_METRICZ_PORT: 3000
 
   # ------------------------------------------------------------------------------------------------ Xahau
 
@@ -198,7 +233,7 @@ services:
       migrate-xahau:
         condition: service_completed_successfully
     environment:
-      <<: *clickhouse-client
+      <<: *syncer-env
       GH_NETWORK: xahau
       GH_CLICKHOUSE_DATABASE: xahau
       GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
@@ -206,9 +241,6 @@ services:
       GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
-      GH_RUN_MIGRATIONS_ON_BOOT: 'false' # owned by migrate-xahau
-      GH_HTTP_API_PORT: 3002
-      GH_METRICZ_PORT: 3000
 
   api-xahau:
     <<: *api
@@ -216,26 +248,32 @@ services:
       migrate-xahau:
         condition: service_completed_successfully
     environment:
-      <<: *clickhouse-client
+      <<: *api-env
       GH_NETWORK: xahau
       GH_CLICKHOUSE_DATABASE: xahau
       GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
-      GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
-      GH_HTTP_API_PORT: 3001
-      GH_METRICZ_PORT: 3000
 
   # ------------------------------------------------------------------------------------------------ edge
 
-  # Routes by host name: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau. TLS terminates in front of it (see nginx.conf).
+  # Routes by host name: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau, and recovers the client address behind the front
+  # proxy. TLS terminates in front of it (see the template). nginx resolves the apis per request and does not wait for them: an
+  # api that is down answers 502 for its own host only. The official image renders the template at start: TRUSTED_PROXIES (the
+  # front proxies, default the private ranges) -> 16-trusted-proxies.envsh -> /etc/nginx/templates/nginx.conf.template.
+  # /internal/ (swagger) is blocked; /liveliness/ answers trusted proxies only.
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:1.30.5-alpine
     depends_on:
       api-xrpl:
-        condition: service_healthy
+        condition: service_started
       api-xahau:
-        condition: service_healthy
+        condition: service_started
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      NGINX_ENVSUBST_FILTER: '^TRUSTED_PROXY_(DIRECTIVES|GEO)$'
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     volumes:
-      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      - ./deploy/nginx/16-trusted-proxies.envsh:/docker-entrypoint.d/16-trusted-proxies.envsh:ro # must stay executable
     ports:
       - '8080:80'
     restart: unless-stopped

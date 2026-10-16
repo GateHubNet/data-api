@@ -9,6 +9,8 @@
 #
 # Building the images needs NPM_TOKEN (the private @gatehub/toolbox); it is passed as a BuildKit secret, not baked in:
 #   NPM_TOKEN=... docker compose --profile full build
+# The images are always built from this checkout (`pull_policy: build`; layers are cached): the image names are not looked up
+# in any registry.
 #
 # Everything is published on 127.0.0.1 only. The stack is configured from the environment of this shell
 # (GH_CLICKHOUSE_USER, GH_CLICKHOUSE_PASSWORD, GH_API_KEYS, XRPL_NODE_ENDPOINTS, ...); the defaults below are for
@@ -83,6 +85,7 @@ services:
     profiles: ['full']
     build: *syncer-build
     image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    pull_policy: build
     command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
     environment:
       <<: *clickhouse-client
@@ -96,6 +99,7 @@ services:
     profiles: ['full']
     build: *syncer-build
     image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    pull_policy: build
     environment:
       <<: *clickhouse-client
       GH_NETWORK: xrpl
@@ -118,11 +122,14 @@ services:
     profiles: ['full']
     build: *api-build
     image: gatehub/data-api:${IMAGE_TAG:-dev}
+    pull_policy: build
     environment:
       <<: *clickhouse-client
       GH_NETWORK: xrpl
       GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
-      # Development key: the API refuses to start in production mode without keys. Set GH_API_KEYS to use your own.
+      # Development mode, not the image's production one: the API refuses to start in production without real keys, and the
+      # key below is a development default. Set GH_API_KEYS to use your own.
+      NODE_ENV: development
       GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
       GH_HTTP_API_PORT: 3001
       GH_METRICZ_PORT: 3000
@@ -142,6 +149,7 @@ services:
     profiles: ['xahau']
     build: *syncer-build
     image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    pull_policy: build
     command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
     environment:
       <<: *clickhouse-client
@@ -155,6 +163,7 @@ services:
     profiles: ['xahau']
     build: *syncer-build
     image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    pull_policy: build
     environment:
       <<: *clickhouse-client
       GH_NETWORK: xahau
@@ -177,10 +186,12 @@ services:
     profiles: ['xahau']
     build: *api-build
     image: gatehub/data-api:${IMAGE_TAG:-dev}
+    pull_policy: build
     environment:
       <<: *clickhouse-client
       GH_NETWORK: xahau
       GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      NODE_ENV: development # see api-xrpl
       GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
       GH_HTTP_API_PORT: 3001
       GH_METRICZ_PORT: 3000

@@ -149,13 +149,28 @@ export function corsOriginOf(cfg: Pick<ApiConfig, 'corsOrigins'>): '*' | string[
 }
 
 /**
+ * The placeholder keys of the dev compose file (`dev-api-key`) and of the env examples (`change-me-...`): public
+ * knowledge, so a production API that accepts one is open. Matched case-insensitively.
+ */
+function isPlaceholderKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return lower === 'dev-api-key' || lower.startsWith('change-me');
+}
+
+/**
  * The accepted API keys (`GH_API_KEYS`, comma separated). An empty list means the authentication is off, which is for
- * development only: with `NODE_ENV=production` it throws, so that the boot fails instead of serving an open API.
+ * development only: with `NODE_ENV=production` it throws, so that the boot fails instead of serving an open API. In
+ * production a placeholder key (`dev-api-key`, or anything starting with `change-me`) throws as well.
  */
 export function apiKeysOf(cfg: Pick<ApiConfig, 'apiKeys'>, env: NodeJS.ProcessEnv = process.env): string[] {
   const keys = splitList(cfg.apiKeys);
-  if (keys.length === 0 && env.NODE_ENV === 'production') {
-    throw new Error('GH_API_KEYS must be set in production');
+  if (env.NODE_ENV === 'production') {
+    if (keys.length === 0) throw new Error('GH_API_KEYS must be set in production');
+    if (keys.some(isPlaceholderKey)) {
+      throw new Error(
+        'GH_API_KEYS contains a placeholder key (dev-api-key or change-me...): set real keys in production',
+      );
+    }
   }
   return keys;
 }

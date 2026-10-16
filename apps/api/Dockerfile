@@ -20,15 +20,17 @@ RUN corepack enable && corepack prepare pnpm@10.6.3 --activate
 # RUN. (pnpm's workspace symlinks don't survive across separate RUN layers in BuildKit, so the install and the build
 # that depends on them must share one layer.)
 #
-# The token goes into ~/.npmrc for the duration of this RUN only; the file is deleted before the layer is committed.
-# Without the secret the install runs unauthenticated and fails on the private package.
+# The secret is required: without it the build stops here with a clear error instead of failing later on the private
+# package. The token goes into ~/.npmrc for the duration of this RUN only; the file is deleted before the layer is
+# committed. (The repo's .npmrc keeps its auth line commented out, so that installs without a token do not lose the
+# project settings in it; it is read as usual here. NPM_TOKEN is exported as well, for the day that line is enabled.)
 COPY . .
-RUN --mount=type=secret,id=npm_token \
+RUN --mount=type=secret,id=npm_token,required=true \
   set -eu; \
+  test -s /run/secrets/npm_token || { echo "the npm_token secret is empty: pass the npm token of the private @gatehub/toolbox"; exit 1; }; \
   trap 'rm -f "$HOME/.npmrc"' EXIT; \
-  if [ -s /run/secrets/npm_token ]; then \
-    printf '//registry.npmjs.org/:_authToken=%s\n' "$(cat /run/secrets/npm_token)" > "$HOME/.npmrc"; \
-  fi; \
+  NPM_TOKEN="$(cat /run/secrets/npm_token)"; export NPM_TOKEN; \
+  printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$HOME/.npmrc"; \
   pnpm install --frozen-lockfile \
   && pnpm --filter @gatehub/data-api-shared build \
   && pnpm --filter @gatehub/data-api-service build \
@@ -41,8 +43,8 @@ RUN --mount=type=secret,id=npm_token \
 FROM node:22.23.2-bookworm-slim
 WORKDIR /app
 # NODE_ENV=production makes the toolbox config loader look for a `.env.production` file and refuse to start without it,
-# unless GH_ENV is set to anything: then the configuration comes from the environment only (compose `environment` /
-# `env_file`). The API refuses to start in production without GH_API_KEYS.
+# unless GH_ENV is set to anything: then the configuration comes from the environment only (compose `environment`).
+# The API refuses to start in production without GH_API_KEYS, or with a placeholder key (dev-api-key, change-me...).
 ENV NODE_ENV=production \
   GH_ENV=container
 COPY --from=builder --chown=node:node /app/out/package.json ./package.json

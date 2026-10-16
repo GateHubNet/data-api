@@ -198,6 +198,41 @@ describe('apiKeysOf', () => {
     );
   });
 
+  const PLACEHOLDER =
+    'GH_API_KEYS contains a placeholder key (dev-api-key or change-me...): set real keys in production';
+
+  it.each([
+    'dev-api-key',
+    'change-me',
+    'change-me-key-1',
+    'Change-Me-Key-2',
+    'abc,dev-api-key',
+    'real-key-1, change-me-key-2 ,real-key-3',
+  ])('throws in production when %s contains a placeholder key', (apiKeys) => {
+    expect(() => apiKeysOf({ apiKeys }, { NODE_ENV: 'production' })).toThrow(PLACEHOLDER);
+  });
+
+  it('does not echo the keys in the error', () => {
+    expect(() => apiKeysOf({ apiKeys: 'real-secret-key,change-me-x' }, { NODE_ENV: 'production' })).toThrow(
+      expect.objectContaining({ message: expect.not.stringContaining('real-secret-key') }),
+    );
+  });
+
+  it('accepts keys that merely contain or resemble a placeholder in production', () => {
+    expect(
+      apiKeysOf({ apiKeys: 'my-dev-api-key,xchange-me,change_me,dev-api-keys' }, { NODE_ENV: 'production' }),
+    ).toEqual(['my-dev-api-key', 'xchange-me', 'change_me', 'dev-api-keys']);
+  });
+
+  it('allows the placeholder keys outside production', () => {
+    for (const NODE_ENV of ['development', 'test', undefined]) {
+      expect(apiKeysOf({ apiKeys: 'dev-api-key,change-me-key-1' }, { NODE_ENV })).toEqual([
+        'dev-api-key',
+        'change-me-key-1',
+      ]);
+    }
+  });
+
   it('reads NODE_ENV from the process by default', () => {
     const saved = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
