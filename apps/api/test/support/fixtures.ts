@@ -1,4 +1,5 @@
 import {
+  AccountsCreatedRow,
   buildLedgerRows,
   ExchangesRow,
   FixtureLedgerSource,
@@ -90,6 +91,20 @@ export function fixtureExchanges(seed: SeedName): FixtureExchange[] {
   return fixtureSource(seed)
     .list()
     .flatMap((ledger) => buildLedgerRows(ledger, ctx).exchanges.map((row) => ({ ledger, row })));
+}
+
+/** An account creation of a fixture ledger, as the syncer stores it in `accounts_created`, with the ledger it is in. */
+export interface FixtureAccount {
+  ledger: RawLedger;
+  row: AccountsCreatedRow;
+}
+
+/** Every account creation of a fixture set, as `buildLedgerRows` stores it, in the order of the ledgers and of their transactions. */
+export function fixtureAccountsCreated(seed: SeedName): FixtureAccount[] {
+  const ctx = parseContextFor(getNetworkProfile(SEED_NETWORK[seed]));
+  return fixtureSource(seed)
+    .list()
+    .flatMap((ledger) => buildLedgerRows(ledger, ctx).accountsCreated.map((row) => ({ ledger, row })));
 }
 
 /** One transaction of a fixture set by its hash. */

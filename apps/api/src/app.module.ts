@@ -15,6 +15,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import compression from 'compression';
 import cors from 'cors';
 import { NextFunction, Request, Response } from 'express';
+import { AccountsModule } from './accounts/accounts.module';
 import { ApiKeyGuard } from './auth/api-key.guard';
 import { ApiThrottlerGuard } from './common/api-throttler.guard';
 import { CommonModule } from './common/common.module';
@@ -49,7 +50,13 @@ assembled.catch(() => undefined);
  * The Ripple endpoint modules. Each of the Phase 5-8 tasks adds its module here. They are listed BEFORE the
  * `NotFoundModule` below, the `/v2/*` catch-all, which has to be the last thing Nest registers.
  */
-const ENDPOINT_MODULES: Type<unknown>[] = [LedgersModule, TransactionsModule, PaymentsModule, ExchangesModule];
+const ENDPOINT_MODULES: Type<unknown>[] = [
+  LedgersModule,
+  TransactionsModule,
+  PaymentsModule,
+  ExchangesModule,
+  AccountsModule,
+];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */
 function cacheControl(value: string) {
