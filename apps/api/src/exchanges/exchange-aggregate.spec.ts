@@ -153,6 +153,17 @@ describe('toCandleObject', () => {
     });
   });
 
+  it('a base volume of 0 has a vwap of 0, never Infinity or NaN', () => {
+    expect(toCandleObject({ ...BUCKET, base_sum: '0' }, USD_XRP, false).vwap).toBe('0.0000000');
+    expect(toCandleObject({ ...BUCKET, base_sum: '0', counter_sum: '0' }, USD_XRP, false).vwap).toBe('0.0000000');
+    // inverted, the stored counter is the base
+    expect(toCandleObject({ ...BUCKET, counter_sum: '0' }, XRP_USD, true).vwap).toBe('0.0000000');
+    expect(toCandleObject({ ...BUCKET, base_sum: '0' }, XRP_USD, true).vwap).toBe('0.0000000');
+    // the float sums too
+    expect(toCandleObject({ ...BUCKET, unfit: 1, base_sum_f: 0 }, USD_XRP, false).vwap).toBe('0.0000000');
+    expect(toReducedObject({ ...ROW, base_sum: '0' }, USD_XRP, false, new Date(0)).vwap).toBe('0.0000000');
+  });
+
   it('does not change its input', () => {
     const row = deepFreeze({ ...BUCKET });
     const pair = deepFreeze({ base: { ...USD_XRP.base }, counter: { ...USD_XRP.counter } });

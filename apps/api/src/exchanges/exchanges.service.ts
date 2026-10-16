@@ -186,6 +186,9 @@ export class ExchangesService {
    *   at `limit + 1` buckets, which stops the reading there. The first ledger of the bucket after the page (its last
    *   one, descending) bounds the page: one ledger closes at one time, so it lies in one bucket;
    * - the aggregation of the exchanges of those ledgers, by bucket.
+   * Both rest on the close time never decreasing with the ledger index (`exchanges.close_time` is that of the ledger,
+   * and a ledger closes after its parent): read in the order of the key, the buckets come in order too, so the first
+   * `limit + 1` distinct ones are the page and the bucket after it, and a ledger bound is a bucket bound.
    * A page so costs what its own exchanges cost, wherever it lies in the window: the newest 30 days of a pair with years
    * of history (`descending=true&limit=30`) read 31 days of exchanges, not all of them.
    */
@@ -250,10 +253,18 @@ export class ExchangesService {
    * All the exchanges of a pair in the window as one row (`reduce`). The whole window is aggregated, in ClickHouse: the
    * original reduced the first page of its scan only (`limit`, 200 by default and 400 at most), and from the `marker`
    * on; here there is neither limit nor marker. No exchange gives the original's row of zeros.
+   *
+   * The window is read to the second, as the candles' is and as the original's row keys were (`YYYYMMDDHHmmss`):
+   * `start=…:40.500Z` takes the ledgers that closed at :40, and an `end` of `…:40.500Z` (the period up to :40.501)
+   * stops before them.
    */
   async reduce(q: ReduceQuery): Promise<ReducedObject> {
     const stored = canonicalPair(q.base, q.counter);
-    const range = await this.ranges.resolve(q.start, q.endExclusive);
+    const toSecond = (d: Date): Date => new Date(Math.floor(d.getTime() / 1000) * 1000);
+    const range = await this.ranges.resolve(
+      toSecond(q.start),
+      q.endExclusive === undefined ? undefined : toSecond(q.endExclusive),
+    );
     if (!range) return toReducedObject(undefined, q, stored.inverted, q.start);
 
     const source = this.aggregationSource(stored, range, q.autobridged);

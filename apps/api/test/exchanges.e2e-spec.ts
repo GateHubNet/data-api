@@ -1748,6 +1748,34 @@ describe('exchanges API endpoint', () => {
       }
     });
 
+    it('reduce reads the window to the second, as the candles and the original do', async () => {
+      // USD/XRP: 18:27:20 (2), 18:28:40 (11119619), 18:51:40 (11119932), 18:52:10 (11119940)
+      const reduced = async (params: Record<string, string>): Promise<Candle> =>
+        (await get(`/v2/exchanges/${PAIR}${qs({ ...params, reduce: 'true' })}`)).body.exchanges[0];
+      // a start inside the second of a ledger takes that ledger
+      expect((await reduced({ start: '2015-01-14T18:28:40.500Z' })).count).toBe(3);
+      expect((await reduced({ start: '2015-01-14T18:28:40Z' })).count).toBe(3);
+      expect((await reduced({ start: '2015-01-14T18:28:41Z' })).count).toBe(2);
+      // an end of …:40.500 is the period up to :40.501, which the original's row keys read as up to :40
+      expect((await reduced({ start: '2015-01-14T18:28:40.500Z', end: '2015-01-14T18:51:40.500Z' })).count).toBe(1);
+      expect((await reduced({ start: '2015-01-14T18:28:40Z', end: '2015-01-14T18:51:40Z' })).count).toBe(2);
+      // start as it was asked for, to the second
+      expect((await reduced({ start: '2015-01-14T18:28:40.500Z' })).start).toBe('2015-01-14T18:28:40Z');
+      // the candles read the window the same way
+      const minutes = await get(
+        `/v2/exchanges/${PAIR}${qs({ interval: '1minute', start: '2015-01-14T18:28:00.500Z', end: '2015-01-14T18:51:00.500Z' })}`,
+      );
+      expect(startsOf(minutes.body)).toEqual(['2015-01-14T18:28:00Z']);
+    });
+
+    it('unknown params ignored, with an interval and with reduce', async () => {
+      for (const query of ['interval=1minute&limit=2', 'interval=week&descending=true', 'reduce=true']) {
+        const plain = await get(`/v2/exchanges/${PAIR}?${query}`);
+        const res = await get(`/v2/exchanges/${PAIR}?${query}&foo=bar&intervals=1day&reduced=false`);
+        expect([query, res.status, res.body]).toEqual([query, 200, plain.body]);
+      }
+    });
+
     it('an interval on an empty window → no rows', async () => {
       for (const path of [
         `/v2/exchanges/${PAIR}?interval=1hour&start=2030-01-01&end=2030-12-31`,
@@ -2797,6 +2825,29 @@ describe.each([
     exchange(BIG_M, 9, 1, 1, '0.1', '0.2', true),
     exchange(BIG_M, 10, 1, 1, '0.2', '0.4', true),
   ];
+  // amounts a 30-place decimal cannot hold whole: dust far below 1e-30, digits past 30 places (a stored amount is the
+  // difference of two ledger amounts), on a native pair and between two issued currencies
+  const DUST_M: Market = { base: { currency: 'DST', issuer: ISSUER }, counter: { currency: NATIVE }, rows: [] };
+  const IOU_M: Market = {
+    base: { currency: 'AAA', issuer: ISSUER },
+    counter: { currency: 'ZZZ', issuer: BUYER },
+    rows: [],
+  };
+  const LONG = '0.99999999999999999998765432109876544'; // about 1, with 35 decimal places
+  const DUST_ROWS = [
+    exchange(DUST_M, 2, 1, 1, LONG, '3', true),
+    exchange(DUST_M, 9, 1, 1, '0.1', '0.2', true),
+    exchange(DUST_M, 9, 2, 1, '0.2', '0.4', false),
+    exchange(DUST_M, 12, 1, 1, '1e-35', '2', true),
+    exchange(DUST_M, 13, 1, 1, '1.234567890123456e-25', '3', false),
+  ];
+  const IOU_ROWS = [
+    exchange(IOU_M, 12, 1, 1, '1e-35', '1e-34', true),
+    exchange(IOU_M, 13, 1, 1, '1.234567890123456e-25', '5e-25', true),
+  ];
+  // a zero side: the parser keeps an exchange whose rate is in the book directory
+  const NIL_M: Market = { base: { currency: 'NIL', issuer: ISSUER }, counter: { currency: NATIVE }, rows: [] };
+  const NIL_ROWS = [{ ...exchange(NIL_M, 2, 1, 1, '1', '1', true), base_amount: '0', base_amount_f: 0 }];
   // native amounts around 0.0005: 0.0005, 0.0004 and 0.000001 are left out of the aggregates
   const ZAR_ROWS = (
     [
@@ -2818,7 +2869,7 @@ describe.each([
     api = await h.api();
     get = api.get;
     await h.ch.insert(Table.Ledgers, LEDGERS);
-    await h.ch.insert(Table.Exchanges, [...USD_ROWS, ...ZAR_ROWS, ...BIG_ROWS]);
+    await h.ch.insert(Table.Exchanges, [...USD_ROWS, ...ZAR_ROWS, ...BIG_ROWS, ...DUST_ROWS, ...IOU_ROWS, ...NIL_ROWS]);
   });
   afterAll(async () => {
     await h?.close();
@@ -3000,5 +3051,63 @@ describe.each([
       'exchanges',
     );
     expect(inverted.body.exchanges).toMatchObject([{ base_volume: '0.6', counter_volume: '0.3', buy_volume: 0 }]);
+  });
+
+  it('amounts a 30-place decimal cannot hold whole are summed as floats, never as 0; the vwap stays finite', async () => {
+    const months = await api.ok<ListBody>(`/v2/exchanges/DST+${ISSUER}/${NATIVE}?interval=1month`, 'exchanges');
+    const base = 1e-35 + 1.234567890123456e-25;
+    expect(months.body.exchanges).toMatchObject([
+      // 35 decimal places: the float of the amount (1)
+      { start: '2015-01-01T00:00:00Z', count: 1, base_volume: String(Number(LONG)), counter_volume: '3' },
+      // a month of amounts that fit is exact: 0.1 + 0.2 is 0.3
+      { start: '2016-02-01T00:00:00Z', count: 2, base_volume: '0.3', counter_volume: '0.6', vwap: '2.0000000' },
+      // 1e-35 (35 places) and 1.234567890123456e-25 (40): not 0 and 0.000000000000000000000000123456
+      { start: '2016-03-01T00:00:00Z', count: 2, base_volume: String(base), counter_volume: '5' },
+    ]);
+    const dust = months.body.exchanges[2];
+    expect(dust.vwap).toBe(p8(new Wide(5).dividedBy(String(base))));
+    expect(Number(dust.vwap)).toBeGreaterThan(4e25);
+    expect(Number.isFinite(Number(dust.vwap))).toBe(true);
+    // the other way round: 1 / 4.05e25
+    const inverted = await api.ok<ListBody>(
+      `/v2/exchanges/${NATIVE}/DST+${ISSUER}?interval=1month&start=2016-03-01`,
+      'exchanges',
+    );
+    expect(inverted.body.exchanges).toMatchObject([
+      { count: 2, base_volume: '5', counter_volume: String(base), vwap: p8(new Wide(String(base)).dividedBy(5)) },
+    ]);
+
+    // two issued currencies, dust on both sides
+    const counter = 1e-34 + 5e-25;
+    for (const [path, inv] of [
+      [`/v2/exchanges/AAA+${ISSUER}/ZZZ+${BUYER}`, false],
+      [`/v2/exchanges/ZZZ+${BUYER}/AAA+${ISSUER}`, true],
+    ] as const) {
+      const [reduced] = (await api.ok<ListBody>(`${path}?reduce=true`, 'exchanges')).body.exchanges;
+      const [b, c] = inv ? [counter, base] : [base, counter];
+      expect([path, reduced.count, reduced.base_volume, reduced.counter_volume]).toEqual([
+        path,
+        2,
+        String(b),
+        String(c),
+      ]);
+      expect([path, reduced.vwap]).toEqual([path, p8(new Wide(String(c)).dividedBy(String(b)))]);
+      expect([path, Number.isFinite(Number(reduced.vwap)) && Number(reduced.vwap) > 0]).toEqual([path, true]);
+    }
+  });
+
+  it('a base volume of 0 (an exchange with a zero side) has a vwap of 0, not Infinity', async () => {
+    const forward = await api.ok<ListBody>(`/v2/exchanges/NIL+${ISSUER}/${NATIVE}?reduce=true`, 'exchanges');
+    expect(forward.body.exchanges[0]).toMatchObject({
+      count: 1,
+      open: '1.0000000',
+      base_volume: '0',
+      counter_volume: '1',
+      vwap: '0.0000000',
+    });
+    const inverted = await api.ok<ListBody>(`/v2/exchanges/${NATIVE}/NIL+${ISSUER}?interval=1year`, 'exchanges');
+    expect(inverted.body.exchanges).toMatchObject([
+      { count: 1, base_volume: '1', counter_volume: '0', vwap: '0.0000000' },
+    ]);
   });
 });

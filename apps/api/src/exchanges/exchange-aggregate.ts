@@ -11,17 +11,42 @@ import { ratio } from './exchange-object';
  * The prices are the exact stored rates of the exchanges they name (open and close by the key of the exchange, high
  * and low by the rate), so they are eight significant digits of the exact text, as the raw `rate` is.
  *
- * The volumes are exact: the stored amounts (exact decimal text) are summed as `Decimal256(30)`, which keeps 30 decimal
- * places and, for amounts below 1e36 (`EXACT_LIMIT`), cannot overflow. The original summed `parseFloat`s and served
- * the float's text (`50.00000000000001`, where the amounts add up to 50); a float sum also depends on the order of its
- * terms, which in ClickHouse depends on how the rows come in blocks, so the same request could differ in its last digit
- * from one answer to the next. The exact sum is the same every time and written as a number's text was (exponent from
- * 1e21 and below 1e-6). An aggregation that holds an amount of 1e36 or more (no real market has one) cannot be summed
- * exactly and falls back to the Float64 sums of the shadows, as the original's.
+ * The volumes are exact: the stored amounts (exact decimal text) are summed as `Decimal256(30)`. The original summed
+ * `parseFloat`s and served the float's text (`50.00000000000001`, where the amounts add up to 50); a float sum also
+ * depends on the order of its terms, which in ClickHouse depends on how the rows come in blocks, so the same request
+ * could differ in its last digit from one answer to the next. The exact sum is the same every time and written as a
+ * number's text was (exponent from 1e21 and below 1e-6).
+ *
+ * An amount is summed exactly only when the decimal holds it whole (`exactAmount`): at most 30 decimal places (a
+ * `Decimal256(30)` silently drops the digits after them, so 1e-35 would count as 0) and below 1e36 (so that up to 1e10
+ * of them stay below the 1e46 it holds; a sum past it wraps without an error). Issued amounts run from 1e-81 to 1e96,
+ * and a stored amount is the difference of two ledger amounts, which can have more digits than either. An aggregation
+ * that holds an amount outside that window falls back to the Float64 sums of the shadows, as the original's were.
  */
 
 /** Amounts at or above this are not summed as decimals: up to 1e10 of them stay below the 1e46 a `Decimal256(30)` holds. */
 export const EXACT_LIMIT = '1e36';
+
+/** A price of nothing: `0.0000000`. */
+const ZERO_PRICE = precision8(0);
+
+/** The decimal places a `Decimal256` of the exact sums keeps. */
+export const EXACT_SCALE = 30;
+
+/**
+ * The exact decimal of an amount column (`base_amount`, `counter_amount`: code, never input), or `NULL` when the
+ * decimal cannot hold it whole. The decimal places are counted on the text, as BigNumber writes it: `123.456`, or a
+ * mantissa and an exponent, `1.234567890123456e-25` (15 places, less the exponent: 40), `1e+21` (-21).
+ */
+function exactAmount(column: 'base_amount' | 'counter_amount'): string {
+  const places =
+    `toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.')))` +
+    ` - toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', ''))`;
+  return (
+    `if(${places} <= ${EXACT_SCALE} AND ${column}_f < ${EXACT_LIMIT}, ` +
+    `toDecimal256OrNull(${column}, ${EXACT_SCALE}), NULL)`
+  );
+}
 
 /** One aggregation of exchanges as the query reads it (`AGGREGATE_COLUMNS`), in the stored orientation. */
 export interface AggregateRow {
@@ -40,7 +65,7 @@ export interface AggregateRow {
   base_bought: string | null;
   /** Σ counter amount of those the taker sold (`seller = taker`): the buy volume of the inverted pair. */
   counter_bought: string | null;
-  /** How many exchanges have an amount the exact sums cannot hold; if any, the Float64 sums below are used. */
+  /** How many exchanges have an amount the exact sums cannot hold whole; if any, the Float64 sums below are used. */
   unfit: number;
   base_sum_f: number;
   counter_sum_f: number;
@@ -73,8 +98,8 @@ export const AGGREGATE_SOURCE_COLUMNS = [
   'close_time',
   'rate',
   'rate_f',
-  `if(base_amount_f < ${EXACT_LIMIT}, toDecimal256OrNull(base_amount, 30), NULL) AS base_exact`,
-  `if(counter_amount_f < ${EXACT_LIMIT}, toDecimal256OrNull(counter_amount, 30), NULL) AS counter_exact`,
+  `${exactAmount('base_amount')} AS base_exact`,
+  `${exactAmount('counter_amount')} AS counter_exact`,
   'base_amount_f',
   'counter_amount_f',
   'buyer',
@@ -183,6 +208,15 @@ function volumes(row: AggregateRow): { base: string; counter: string; baseBought
 }
 
 /**
+ * The vwap: counter volume over base volume, eight significant digits. A base volume of 0 (only an exchange with a zero
+ * side can give one: the parser takes the rate from the book directory, which a zero amount does not change) has no
+ * vwap: it is 0, the vwap of the original's reduce without volume, never the `Infinity` or `NaN` of a division by 0.
+ */
+function vwap(counter: string, base: string): string {
+  return new BigNumber(base).isZero() ? ZERO_PRICE : precision8(ratio(counter, base));
+}
+
+/**
  * The prices and volumes of an aggregation, for the pair as it was asked for. Inverted (`invertPair` of the original):
  * the rates are 1/rate, so high is 1/low and low is 1/high; the volumes swap; the vwap is still counter over base. The
  * buy volume is that of the inverted exchanges (base where the buyer is the taker), which is the counter of the stored
@@ -197,7 +231,7 @@ function figures(row: AggregateRow, inverted: boolean): Figures {
       high: precision8(row.high_rate),
       low: precision8(row.low_rate),
       close: precision8(row.close_rate),
-      vwap: precision8(ratio(v.counter, v.base)),
+      vwap: vwap(v.counter, v.base),
       base_volume: v.base,
       counter_volume: v.counter,
       buy_volume: Number(v.baseBought),
@@ -208,7 +242,7 @@ function figures(row: AggregateRow, inverted: boolean): Figures {
     high: precision8(ratio(1, row.low_rate)),
     low: precision8(ratio(1, row.high_rate)),
     close: precision8(ratio(1, row.close_rate)),
-    vwap: precision8(ratio(v.base, v.counter)),
+    vwap: vwap(v.base, v.counter),
     base_volume: v.counter,
     counter_volume: v.base,
     buy_volume: Number(v.counterBought),
@@ -246,8 +280,6 @@ export function toCandleObject(row: BucketRow, pair: RequestedPair, inverted: bo
     ...pairFields(pair),
   };
 }
-
-const ZERO_PRICE = precision8(0);
 
 /**
  * The reduced row of a window. `start` is the start of the window: the original wrote the time of the request there
