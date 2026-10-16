@@ -488,7 +488,7 @@ describe('AggregatorService (e2e)', () => {
         .map((r) => r.explain)
         .join('\n');
       expect(plan.match(/algorithm: InReverseOrder/g)).toHaveLength(parts.length);
-      expect(plan).toMatch(/MergingSortedTransform 3 → 1/);
+      expect(plan).toMatch(new RegExp(`MergingSortedTransform ${parts.length} → 1`));
       expect(plan).toMatch(/FinishSortingTransform/);
       expect(plan).toMatch(/LimitBySortedStreamTransform/);
       expect(plan).not.toMatch(/MergeSortingTransform/);

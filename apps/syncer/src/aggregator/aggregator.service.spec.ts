@@ -1074,6 +1074,8 @@ describe('AggregatorService volume jobs', () => {
   let computed: Set<string>;
   /** How long (fake milliseconds) each kind of work takes. */
   let liveMs: number;
+  /** How long a live set that fails takes to fail (a slow failure, such as a timeout). */
+  let failMs: number;
   let closedDayMs: number;
   /** How long a daily set of today or of yesterday takes. */
   let currentDayMs: number;
@@ -1116,6 +1118,7 @@ describe('AggregatorService volume jobs', () => {
     writeSeq = 0;
     failing = new Set();
     liveMs = 0;
+    failMs = 0;
     closedDayMs = 0;
     currentDayMs = 0;
     statsMs = 0;
@@ -1140,7 +1143,10 @@ describe('AggregatorService volume jobs', () => {
       ) => {
         events.push(`live ${metric} ${period}`);
         liveCalls.push({ metric, period, now, signal: options?.signal, at: Date.now() });
-        if (failing.has(`${metric}/${period}`)) throw new Error(`DB::Exception: ${metric} ${period}`);
+        if (failing.has(`${metric}/${period}`)) {
+          if (failMs > 0) jest.setSystemTime(Date.now() + failMs);
+          throw new Error(`DB::Exception: ${metric} ${period}`);
+        }
         if (liveMs > 0) jest.setSystemTime(Date.now() + liveMs);
         liveWrites.set(`${metric}/${period}`, ++writeSeq);
         return 0;
@@ -1771,27 +1777,113 @@ describe('AggregatorService volume jobs', () => {
       }
     });
 
-    it('live: a set that failed has the old version still, so it is the first to be tried again', async () => {
+    it('live: a set that failed keeps its old version, but is tried behind the sets that did not fail (R87)', async () => {
       caughtUp();
       liveMs = 3000;
       failing.add('trade_volume/hour');
       const svc = service();
       await svc.tick();
       expect(seq(liveCalls)).toEqual(['trade hour', 'trade day', 'trade 3day']);
+      expect(liveWrites.has('trade_volume/hour')).toBe(false);
       liveCalls.length = 0;
       jest.setSystemTime(NOW_MS + 60_000);
       await svc.tick();
-      expect(seq(liveCalls)[0]).toBe('trade hour');
-      // and once it works it goes to the back of the line
-      failing.clear();
-      liveCalls.length = 0;
-      jest.setSystemTime(NOW_MS + 120_000);
-      await svc.tick();
-      expect(seq(liveCalls)[0]).toBe('trade hour');
-      liveCalls.length = 0;
-      jest.setSystemTime(NOW_MS + 180_000);
-      await svc.tick();
-      expect(seq(liveCalls)).not.toContain('trade hour');
+      // the sets never written come first, the one that failed is behind them: with a budget for two it waits its turn
+      expect(seq(liveCalls)).toEqual(['trade 7day', 'trade 30day']);
+    });
+
+    describe('a set that keeps failing does not keep the healthy ones from running (R87)', () => {
+      const HEALTHY = ['trade day', 'trade 3day', 'trade 7day', 'trade 30day', 'payment hour', 'payment day'];
+      const tickLive = async (svc: AggregatorService, i: number): Promise<string[]> => {
+        jest.setSystemTime(NOW_MS + i * 60_000);
+        liveCalls.length = 0;
+        await svc.tick();
+        return seq(liveCalls);
+      };
+
+      it('a set that always fails slowly (longer than the budget) is tried last: the other six are refreshed at every tick', async () => {
+        caughtUp();
+        failing.add('trade_volume/hour');
+        failMs = AGGREGATOR_VOLUME_LIVE_BUDGET_MS + 1000; // the failure alone is over the 5 s of the budget
+        const svc = service();
+        // the first tick cannot know: the set that was never written is the stalest, so it starts first and uses the budget
+        expect(await tickLive(svc, 0)).toEqual(['trade hour']);
+        for (let i = 1; i < 6; i++) {
+          const calls = await tickLive(svc, i);
+          // after that it is behind the sets that did not fail, which are all started (and take no time here) before it
+          expect(calls.slice(0, 6).sort()).toEqual([...HEALTHY].sort());
+          expect(calls[6]).toBe('trade hour');
+          expect(calls).toHaveLength(7);
+        }
+        // the healthy sets are written again at every tick; the one that fails never is
+        expect(liveWrites.has('trade_volume/hour')).toBe(false);
+        expect(
+          Math.min(...HEALTHY.map((name) => liveWrites.get(`${name.split(' ')[0]}_volume/${name.split(' ')[1]}`) ?? 0)),
+        ).toBeGreaterThan(0);
+      });
+
+      it('three sets that fail fast do not use up the failures of the tick before the healthy ones are refreshed', async () => {
+        caughtUp();
+        for (const key of ['trade_volume/hour', 'trade_volume/day', 'trade_volume/3day']) failing.add(key);
+        const svc = service();
+        await tickLive(svc, 0); // the first tick: they come first, fail three times, and the tick gives up
+        expect(liveCalls).toHaveLength(3);
+        for (let i = 1; i < 5; i++) {
+          const calls = await tickLive(svc, i);
+          // the four healthy sets first, then the three that failed (each fails again; the tick gives up at the third)
+          expect(calls.slice(0, 4).sort()).toEqual(['payment day', 'payment hour', 'trade 30day', 'trade 7day']);
+          expect(calls.slice(4).sort()).toEqual(['trade 3day', 'trade day', 'trade hour']);
+        }
+        expect(liveWrites.size).toBe(4);
+      });
+
+      it('within each group the stalest is first; a set that recovers is back in the order of its version', async () => {
+        caughtUp();
+        failing.add('trade_volume/hour');
+        const svc = service();
+        await tickLive(svc, 0);
+        expect((await tickLive(svc, 1)).slice(-1)).toEqual(['trade hour']);
+        // it works again: it is still behind the others for the attempt in which it succeeds ...
+        failing.clear();
+        expect((await tickLive(svc, 2)).slice(-1)).toEqual(['trade hour']);
+        expect(liveWrites.has('trade_volume/hour')).toBe(true);
+        // ... and then it is just a set with a version: make it the stalest and it goes first
+        liveWrites.delete('trade_volume/hour');
+        expect((await tickLive(svc, 3))[0]).toBe('trade hour');
+        // and a healthy set that is the stalest goes before a fresher one, as before
+        liveWrites.set('payment_volume/hour', 0.5);
+        expect((await tickLive(svc, 4))[0]).toBe('payment hour');
+      });
+
+      it('the daily sets: a day that fails is tried behind the others, and the memory goes with the day', async () => {
+        caughtUp();
+        ch.closes = [unix('2026-10-15T08:00:00Z'), NOW_SECONDS - 3]; // nothing to back-fill
+        failing.add('trade_volume:2026-10-16');
+        const svc = service();
+        const dailyAt = async (at: string): Promise<string[]> => {
+          jest.setSystemTime(new Date(at));
+          events.length = 0;
+          await svc.tick();
+          return volumeEvents('daily').map((e) => e.slice(6));
+        };
+        expect((await dailyAt('2026-10-16T12:00:00Z'))[0]).toBe('trade_volume 2026-10-16');
+        const next = await dailyAt('2026-10-16T12:01:00Z');
+        expect(next.slice(0, 3)).toEqual([
+          'payment_volume 2026-10-16',
+          'trade_volume 2026-10-15',
+          'payment_volume 2026-10-15',
+        ]);
+        expect(next[3]).toBe('trade_volume 2026-10-16');
+        // the day moves on: the sets of the new day are not behind anything (the old one still fails, as yesterday's set)
+        const tomorrow = await dailyAt('2026-10-17T00:00:30Z');
+        expect(tomorrow[0]).toBe('trade_volume 2026-10-17');
+        expect(tomorrow.slice(-1)).toEqual(['trade_volume 2026-10-16']);
+        // two days after the failure the day is not among the sets of the job any more
+        await dailyAt('2026-10-18T12:00:00Z');
+        // and the memory of the failure is gone with the day (it does not grow by a key a day)
+        const memory = (svc as unknown as { failedLast: { volume_daily: Set<string> } }).failedLast.volume_daily;
+        expect([...memory]).toEqual([]);
+      });
     });
 
     it('daily: yesterday is finalised after the midnight although the budget fits two of the four sets', async () => {
@@ -1956,6 +2048,36 @@ describe('AggregatorService volume jobs', () => {
       expect(logger.log).toHaveBeenCalledWith(expect.stringMatching(/back-fill is done/i));
       // nothing is remembered: a later failure of another set starts at the first wait again
       expect(await tickAt(svc, VOLUME_BACKFILL_RETRY_MS + 60_000)).toEqual([]);
+    });
+
+    it('the wait is for the config version it failed under: a new version retries the set at once', async () => {
+      caughtUp();
+      failing.add('2026-10-14');
+      const markets = { ...MARKETS };
+      const svc = service({}, markets);
+      expect(await tickAt(svc, 0)).toEqual(
+        [
+          'trade_volume 2026-10-14',
+          'payment_volume 2026-10-14',
+          'trade_volume 2026-10-13',
+          'payment_volume 2026-10-13',
+          'trade_volume 2026-10-12',
+          'payment_volume 2026-10-12',
+          'trade_volume 2026-10-11',
+          'payment_volume 2026-10-11',
+          'trade_volume 2026-10-10',
+          'payment_volume 2026-10-10',
+        ].slice(0, 10),
+      );
+      // the two sets of the 14th wait: a minute later they are skipped
+      expect((await tickAt(svc, 60_000)).filter((e) => e.endsWith('2026-10-14'))).toEqual([]);
+      // the operator changes the config, and the reason of the failure with it: the version is new, the wait does not apply
+      failing.clear();
+      markets.version = 5;
+      const retried = await tickAt(svc, 120_000);
+      expect(retried.slice(0, 2)).toEqual(['trade_volume 2026-10-14', 'payment_volume 2026-10-14']);
+      expect(computed.has('trade_volume:2026-10-14:5')).toBe(true);
+      expect(computed.has('payment_volume:2026-10-14:5')).toBe(true);
     });
 
     it('does not wait on a set that failed because of the shutdown', async () => {

@@ -191,13 +191,20 @@ const utcDayStart = (seconds: number): number => Math.floor(seconds / DAY_SECOND
 const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
 
 /**
- * The sets in the order they are started: the one whose newest version is the oldest first, a set with no version (never
- * written) before all of them, equals in the order they are listed in.
+ * The sets in the order they are started: first the ones whose last attempt did not fail, then the ones whose did, and within
+ * each group the one whose newest version is the oldest first, a set with no version (never written) before all of them, equals
+ * in the order they are listed in. A set that keeps failing is always the stalest, so without the second rule it would start
+ * first at every tick, and a failure that is slow (a timeout longer than the budget), or three fast ones, would keep every
+ * healthy set from being refreshed; it is tried last instead, with the budget that is left.
  */
-function staleFirst<T extends { key: string }>(sets: T[], versions: ReadonlyMap<string, number>): T[] {
+function staleFirst<T extends { key: string }>(
+  sets: T[],
+  versions: ReadonlyMap<string, number>,
+  failedLast: ReadonlySet<string> = new Set(),
+): T[] {
   return sets
-    .map((set, i) => ({ set, i, version: versions.get(set.key) ?? 0 }))
-    .sort((a, b) => a.version - b.version || a.i - b.i)
+    .map((set, i) => ({ set, i, version: versions.get(set.key) ?? 0, failed: failedLast.has(set.key) ? 1 : 0 }))
+    .sort((a, b) => a.failed - b.failed || a.version - b.version || a.i - b.i)
     .map(({ set }) => set);
 }
 const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
@@ -234,7 +241,7 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     newest first, under its own budget. A day is closed when it is before yesterday AND the ingest has passed it (the newest
  *     ledger closed an hour after its end): the wall clock alone would call a day final while its ledgers are still to come.
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
- *     doubling) and the older days go on.
+ *     doubling, until the config version changes) and the older days go on.
  *
  * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set is a complete set under a new version), which is
  * what lets this retry, resume and crash anywhere:
@@ -264,7 +271,9 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly volumeFns: VolumeFunctions;
   /** Whether the back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
   private backfilling = false;
-  /** The sets (`<metric>/<day>`) of the back-fill that failed: when to try each again, and the wait after the next failure. */
+  /** The sets of `volume_live` and `volume_daily` (by job, then `<metric>/<period or day>`) whose last attempt failed. */
+  private readonly failedLast = { volume_live: new Set<string>(), volume_daily: new Set<string>() };
+  /** The sets (`<metric>/<day>@<config version>`) of the back-fill that failed: when to try each again, and the wait after the next failure. */
   private readonly backfillBackoff = new Map<string, { until: number; delayMs: number }>();
   /** The volume jobs that hit their budget in the run in progress, and the ones with a warning out (until a run in time). */
   private readonly budgetHit = new Set<string>();
@@ -675,7 +684,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   /**
    * The live sets of both metrics, every period, with the time of the tick, the STALEST first (the one written longest ago;
    * a set with no row at all is the stalest of all), so that with a budget that is too short for them all every set is
-   * refreshed in turn, none always last. A failed set does not stop the other ones, and stays the stalest for the next tick.
+   * refreshed in turn, none always last. A set whose last attempt failed is started after the ones that did not fail (R87): it is the
+   * stalest for as long as it fails, and would otherwise start first at every tick and keep the healthy ones from running.
    */
   private async volumeLive(tick: AggregatorTick): Promise<void> {
     const volumes = this.volumes;
@@ -684,15 +694,18 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       livePeriodsOf(metric).map((period) => ({ metric, period, key: `${metric}/${period}` })),
     );
     const versions = await this.versionsOf('volume_live', () => this.volumeFns.liveVersions(this.ch));
+    const failedLast = this.failedLast.volume_live;
     let failed = 0;
-    for (const { metric, period } of staleFirst(sets, versions)) {
+    for (const { metric, period, key } of staleFirst(sets, versions, failedLast)) {
       if (!this.mayStartSet(tick, 'volume_live')) return;
       try {
         await this.volumeFns.computeLiveSet(this.ch, volumes.rates, volumes.markets, metric, period, tick.now, {
           signal: tick.signal,
         });
+        failedLast.delete(key);
       } catch (err) {
         this.failed('volume_live', err, ` in ${metric} ${period}`);
+        if (!this.closing) failedLast.add(key);
         if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
       }
     }
@@ -712,8 +725,11 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     const versions = await this.versionsOf('volume_daily', () =>
       this.volumeFns.dailyVersions(this.ch, new Date((today - DAY_SECONDS) * 1000), new Date(today * 1000)),
     );
+    // the memory of a failure does not outlive the day it was about
+    const failedLast = this.failedLast.volume_daily;
+    for (const key of failedLast) if (!sets.some((set) => set.key === key)) failedLast.delete(key);
     let failed = 0;
-    for (const { metric, dayStart } of staleFirst(sets, versions)) {
+    for (const { metric, dayStart, key } of staleFirst(sets, versions, failedLast)) {
       if (!this.mayStartSet(tick, 'volume_daily')) return;
       try {
         await this.volumeFns.computeDailySet(
@@ -726,8 +742,10 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
             signal: tick.signal,
           },
         );
+        failedLast.delete(key);
       } catch (err) {
         this.failed('volume_daily', err, ` in ${metric} ${dayKey(dayStart)}`);
+        if (!this.closing) failedLast.add(key);
         if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
       }
     }
@@ -742,7 +760,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
    * that was computed too early is computed again once the ingest has passed it. The sets that exist are found by one read
    * per metric (`volumeDaysDone`), so a day is computed once, and a new version of the config computes them all again;
    * whatever is left is found again next tick. A set that fails is left alone for a while (`VOLUME_BACKFILL_RETRY_MS`,
-   * doubling), so that the days before it go on. It says when it starts and when it is done.
+   * doubling; remembered per config version, so that a config change that may have fixed it retries it at once), so that the days
+   * before it go on. It says when it starts and when it is done.
    */
   private async volumeBackfill(tick: AggregatorTick): Promise<void> {
     const volumes = this.volumes;
@@ -770,7 +789,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     for (let dayStart = closedUntil - DAY_SECONDS; dayStart >= first; dayStart -= DAY_SECONDS) {
       for (const metric of VOLUME_METRICS) {
         if (!done.get(metric)?.has(dayKey(dayStart)))
-          missing.push({ metric, dayStart, key: `${metric}/${dayKey(dayStart)}` });
+          missing.push({ metric, dayStart, key: `${metric}/${dayKey(dayStart)}@${version}` });
       }
     }
     // a set that is done (or is no longer wanted) has no failure to remember
