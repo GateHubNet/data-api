@@ -3,7 +3,10 @@ import {
   EXACT_LIMIT,
   EXACT_SCALE,
   exactAmount,
+  exactSum,
+  floatSum,
   ratio,
+  sumOf,
   VOLUME_SOURCE_COLUMNS,
   volumeColumns,
   volumesOf,
@@ -111,5 +114,32 @@ describe('volumesOf', () => {
       counter_sum_f: null,
     });
     expect([noneF.base.toFixed(), noneF.counter.toFixed()]).toEqual(['0', '0']);
+  });
+});
+
+describe('exactSum and floatSum', () => {
+  it('sum a column, or the rows that meet a condition', () => {
+    expect(exactSum('base_exact')).toBe('toString(sum(base_exact))');
+    expect(exactSum('base_exact', 'buyer = taker')).toBe('toString(sumIf(base_exact, buyer = taker))');
+    expect(floatSum('base_amount_f')).toBe('sumKahan(base_amount_f)');
+    expect(floatSum('base_amount_f', 'buyer = taker')).toBe('sumKahanIf(base_amount_f, buyer = taker)');
+  });
+
+  it('are the ones volumeColumns is made of', () => {
+    expect(volumeColumns()).toContain(`${exactSum('counter_exact')} AS counter_sum`);
+    expect(volumeColumns('x > 1')).toContain(`${floatSum('counter_amount_f', 'x > 1')} AS counter_sum_f`);
+  });
+});
+
+describe('sumOf', () => {
+  it('is the exact sum, or the float one as soon as one amount did not fit', () => {
+    expect(sumOf(0, '12.50', 99).toString()).toBe('12.5');
+    expect(sumOf(1, '12.50', 99).toString()).toBe('99');
+    expect(sumOf(3, null, 1.5e-35).toString()).toBe('1.5e-35');
+  });
+
+  it('nothing to sum is 0 either way', () => {
+    expect(sumOf(0, null, null).toFixed()).toBe('0');
+    expect(sumOf(1, null, null).toFixed()).toBe('0');
   });
 });

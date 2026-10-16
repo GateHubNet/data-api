@@ -91,14 +91,48 @@ function floatVwap(pair: Pair, inverted: boolean, before: number): { vwap: numbe
 
 const EPOCH_2015_01_15 = Date.parse('2015-01-15T00:00:00Z') / 1000;
 
+/** The 32 pairs of the mock ledgers, with their exchanges as the syncer stores them. */
+const pairs = pairsOf(fixtureExchanges('ripple-mock'));
+
+/**
+ * Asks the rate of every pair of the mock ledgers, both ways round, on 2015-01-14, in strict mode and with
+ * `strict=false`, and compares it with the float oracle: the vwap of its trades with 10 or more, none with fewer (strict),
+ * the vwap with `strict=false`. Returns how many of the rates were above 0, so that a caller can tell it was not a
+ * comparison of zeros.
+ */
+async function expectEveryPairRate(api: ApiClient): Promise<{ strictRates: number; laxRates: number }> {
+  const eight = (v: number): string => new BigNumber(v).toPrecision(8);
+  const rate = async (b: Asset, c: Asset, params: Record<string, string | number | boolean>): Promise<string> =>
+    (await api.ok<RateBody>(`${RATE_PATH(pathOf(b), pathOf(c))}${qs(params)}`, 'rate')).body.rate;
+  let strictRates = 0;
+  let laxRates = 0;
+  for (const pair of pairs) {
+    for (const inverted of [false, true]) {
+      const [b, c] = inverted ? [pair.counter, pair.base] : [pair.base, pair.counter];
+      const want = floatVwap(pair, inverted, EPOCH_2015_01_15);
+      const path = RATE_PATH(pathOf(b), pathOf(c));
+      const strict = await rate(b, c, { date: '2015-01-14' });
+      const lax = await rate(b, c, { date: '2015-01-14', strict: false });
+      expect([path, inverted, 'strict', strict]).toEqual([
+        path,
+        inverted,
+        'strict',
+        eight(want.count >= 10 ? want.vwap : 0),
+      ]);
+      expect([path, inverted, 'lax', lax]).toEqual([path, inverted, 'lax', eight(want.vwap)]);
+      if (want.count >= 10 && want.vwap > 0) strictRates++;
+      if (want.vwap > 0) laxRates++;
+    }
+  }
+  return { strictRates, laxRates };
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 
 describe('exchange rates and normalize API endpoints', () => {
   let h: Harness;
   let api: ApiClient;
   let get: ApiClient['get'];
-
-  const pairs = pairsOf(fixtureExchanges('ripple-mock'));
 
   beforeAll(async () => {
     h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
@@ -240,28 +274,7 @@ describe('exchange rates and normalize API endpoints', () => {
     });
 
     it('every pair, both ways round: the vwap of its trades with 10 or more, none with fewer (strict), strict=false has it', async () => {
-      let strictRates = 0;
-      let laxRates = 0;
-      for (const pair of pairs) {
-        for (const inverted of [false, true]) {
-          const [b, c] = inverted ? [pair.counter, pair.base] : [pair.base, pair.counter];
-          const want = floatVwap(pair, inverted, EPOCH_2015_01_15);
-          const path = `${RATE_PATH(pathOf(b), pathOf(c))}`;
-          const strict = await rateOf(pathOf(b), pathOf(c), { date: '2015-01-14' });
-          const lax = await rateOf(pathOf(b), pathOf(c), { date: '2015-01-14', strict: false });
-          // eight significant digits of the float vwap
-          const eight = (v: number): string => new BigNumber(v).toPrecision(8);
-          expect([path, inverted, 'strict', strict]).toEqual([
-            path,
-            inverted,
-            'strict',
-            eight(want.count >= 10 ? want.vwap : 0),
-          ]);
-          expect([path, inverted, 'lax', lax]).toEqual([path, inverted, 'lax', eight(want.vwap)]);
-          if (want.count >= 10 && want.vwap > 0) strictRates++;
-          if (want.vwap > 0) laxRates++;
-        }
-      }
+      const { strictRates, laxRates } = await expectEveryPairRate(api);
       // not a vacuous comparison of zeros
       expect(strictRates).toBeGreaterThanOrEqual(6);
       expect(laxRates).toBeGreaterThanOrEqual(60);
@@ -369,36 +382,59 @@ describe('exchange rates and normalize API endpoints', () => {
     });
 
     it('the formats of a date and the period it names: a day reads to its end, a second to that second', async () => {
-      const path = RATE_PATH(`CNY+${KIC}`, `JPY+${MAZ}`);
-      // CNY+rKiC against JPY+rMAz has 38 trades between 18:27:20 and 18:29:20; the date is when the rate is as of
-      const pair = pairs.find((p) => pathOf(p.base) === `CNY+${KIC}` && pathOf(p.counter) === `JPY+${MAZ}`) as Pair;
-      expect(pair.rows).toHaveLength(38);
+      const path = RATE_PATH(`USD+${MWJ}`, 'XRP');
+      // USD+rMwj against XRP has 5 trades, at 18:27:20 (2), 18:28:40, 18:51:40 and 18:52:10, and each time moves the vwap
+      const pair = pairs.find((p) => pathOf(p.base) === `USD+${MWJ}` && p.counter.currency === 'XRP') as Pair;
+      expect(pair.rows.map((r) => new Date(r.close_time * 1000).toISOString().slice(11, 19))).toEqual([
+        '18:27:20',
+        '18:27:20',
+        '18:28:40',
+        '18:51:40',
+        '18:52:10',
+      ]);
       const at = (iso: string): number => Date.parse(iso) / 1000;
       const eight = (v: number): string => new BigNumber(v).toPrecision(8);
-      // a few trades by 18:27:30: fewer than 10 would be 0 in strict mode, so use strict=false everywhere in the middle
+      // each case: the date, and where the period it names ends (exclusive); the trades up to there are the rate's.
+      // 18:28:40 is a second with trades, so a date there tells reading to the second (they are in) from reading
+      // before it (they are out)
       const cases: [string, string][] = [
-        ['2015-01-14T18:28:00', '2015-01-14T18:28:01Z'], // seconds: up to and including 18:28:00
-        ['2015-01-14T18:28:00Z', '2015-01-14T18:28:01Z'],
-        ['2015-01-14T18:28:00.000Z', '2015-01-14T18:28:01Z'],
+        ['2015-01-14T18:28:40', '2015-01-14T18:28:41Z'], // seconds: up to and including 18:28:40
+        ['2015-01-14T18:28:40Z', '2015-01-14T18:28:41Z'],
+        // milliseconds: the period is the millisecond (date + 1 ms) and the original's row keys stop at the second, so a
+        // .SSS date excludes the trades of its own second, unless the next millisecond is the next second (.999)
+        ['2015-01-14T18:28:40.000Z', '2015-01-14T18:28:40Z'],
+        ['2015-01-14T18:28:40.500Z', '2015-01-14T18:28:40Z'],
+        ['2015-01-14T18:28:40.999Z', '2015-01-14T18:28:41Z'],
         ['2015-01-14T18:28', '2015-01-14T18:29:00Z'], // a minute: to the end of it
         ['2015-01-14T18', '2015-01-14T19:00:00Z'], // an hour
         ['2015-01-14', '2015-01-15T00:00:00Z'], // a day
         ['2015-01', '2015-02-01T00:00:00Z'], // a month: to the end of it
         ['2015', '2016-01-01T00:00:00Z'], // a year
-        ['20150114182800', '2015-01-14T18:28:01Z'], // the compact form
-        [String(at('2015-01-14T18:28:00Z')), '2015-01-14T18:28:01Z'], // unix seconds
-        ['2015-01-14T20:28:00+02:00', '2015-01-14T18:28:01Z'], // a zone
+        ['20150114182840', '2015-01-14T18:28:41Z'], // the compact form
+        ['20150114182840000', '2015-01-14T18:28:40Z'], // the compact form with milliseconds
+        [String(at('2015-01-14T18:28:40Z')), '2015-01-14T18:28:41Z'], // unix seconds
+        ['2015-01-14T20:28:40+02:00', '2015-01-14T18:28:41Z'], // a zone
       ];
+      const rates = new Map<string, string>();
       for (const [date, until] of cases) {
-        const got = await rateOf(`CNY+${KIC}`, `JPY+${MAZ}`, { date, strict: false, live: true });
+        const got = await rateOf(`USD+${MWJ}`, 'XRP', { date, strict: false, live: true });
         // live: only the last 50 trades in the 14 days before the date, to the end of the period it names
         const kept = pair.rows.filter((r) => r.close_time < at(until));
         const base = kept.reduce((t, r) => t + r.base_amount_f, 0);
         const counter = kept.reduce((t, r) => t + r.counter_amount_f, 0);
         const want = eight(base ? counter / base : 0);
         expect([path, date, got]).toEqual([path, date, want]);
+        rates.set(date, got);
       }
-      void path;
+      // the cases tell the periods apart: 2 trades (before :40), 3 (to :40), 5 (the hour on)
+      expect(new Set(rates.values()).size).toBe(3);
+      expect(rates.get('2015-01-14T18:28:40')).not.toBe(rates.get('2015-01-14T18:28:40.000Z'));
+      expect(rates.get('2015-01-14T18:28:40')).not.toBe(rates.get('2015-01-14T18'));
+      expect(rates.get('2015-01-14T18:28:40')).toBe(rates.get('2015-01-14T18:28'));
+      expect(rates.get('2015-01-14T18:28:40.000Z')).toBe(rates.get('2015-01-14T18:28:40.500Z'));
+      expect(rates.get('2015-01-14T18:28:40.999Z')).toBe(rates.get('2015-01-14T18:28:40'));
+      expect(rates.get('2015-01-14T18:28:40')).toBe(rates.get('20150114182840'));
+      expect(rates.get('2015-01-14T18:28:40.000Z')).toBe(rates.get('20150114182840000'));
     });
 
     it('period: a rolling window that ends a second before the date', async () => {
@@ -649,6 +685,51 @@ describe('exchange rates and normalize API endpoints', () => {
       expect(res.rate).toBe('1.0000000');
       expect((await h.http().get(`/v2/normalize?amount=1`)).status).toBe(401);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('exchange rates when every exchange was written twice', () => {
+  // `exchanges` is a ReplacingMergeTree and the rates never use FINAL, so until a merge a row can be there twice (the
+  // syncer re-writes a ledger it is not sure about). One insert of a row twice would be collapsed by ClickHouse on the
+  // way in (`optimize_on_insert`), so the copy is a second insert, without deduplication, with the merges stopped.
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    const count = async (): Promise<number> =>
+      Number((await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${Table.Exchanges}`))[0].n);
+    const once = await count();
+    expect(once).toBe(158);
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.Exchanges}`);
+    await h.ch.command(
+      `INSERT INTO ${Table.Exchanges} SELECT * FROM ${Table.Exchanges}`,
+      {},
+      { settings: { insert_deduplicate: 0 } },
+    );
+    // the table really holds every exchange twice
+    expect(await count()).toBe(2 * once);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('every pair, both ways round, has the rate of its exchanges counted once: 5 trades are not 10', async () => {
+    const { strictRates, laxRates } = await expectEveryPairRate(api);
+    expect(strictRates).toBeGreaterThanOrEqual(6);
+    expect(laxRates).toBeGreaterThanOrEqual(60);
+  });
+
+  it('normalize counts them once too', async () => {
+    // USD+rMwj has 5 exchanges: no rate in strict mode (twice written, it would have 10)
+    const strict = await api.ok<NormalizeBody>(
+      `/v2/normalize${qs({ amount: 10, date: '2015-01-14', currency: 'USD', issuer: MWJ })}`,
+      'converted',
+    );
+    expect([strict.body.converted, strict.body.rate]).toEqual(['0', '0.0000000']);
   });
 });
 

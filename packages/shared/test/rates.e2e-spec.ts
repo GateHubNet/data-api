@@ -23,9 +23,11 @@ import { startClickHouse, StartedClickHouse } from './clickhouse-container';
  *
  * Part 2 writes synthetic trades straight into `ledgers` and `exchanges` (one ledger per second that has a trade) so
  * that the edges of every window sit on a second: the oldest second of the 14 days, the start of the day, the date
- * itself, the second after it; more than 50 trades in the window; noise in the newest 50; rows written twice; amounts
- * a 30-place decimal cannot hold; and Xahau's native currency. The expected values of the small market are worked out
- * by hand.
+ * itself, the second after it; more than 50 trades in the window; noise in the newest 50; amounts a
+ * 30-place decimal cannot hold; and Xahau's native currency. The expected values of the small market are worked out
+ * by hand. Half of the trades of a second database are written twice (a second insert without deduplication, with the
+ * merges stopped: ClickHouse collapses a row inserted twice in one insert, so that would test nothing) and every read
+ * has to count them once.
  *
  * Part 3 is `dailyNativeRates` (against `exchangeRate` of each day) and `normalize`; part 4 is the SQL (bound values,
  * the newest 50 read in reverse key order without a sort).
@@ -363,8 +365,6 @@ describe('RatesService (e2e)', () => {
       asset: Asset;
       nativeCurrency: string;
       specs: Spec[];
-      /** Written twice (the table is not collapsed before a merge). */
-      twice?: boolean;
     }
 
     /** The row of a trade of a stored pair, at a ledger. */
@@ -430,7 +430,6 @@ describe('RatesService (e2e)', () => {
           const close = D + spec[0];
           const row = exchangeRow(stored, ledgerOf.get(close) as number, close, spec, k++);
           written.push(row);
-          if (p.twice) written.push(row);
           market.trades.push({
             ledger: row.ledger_index,
             tx: row.tx_index,
@@ -494,16 +493,6 @@ describe('RatesService (e2e)', () => {
         { asset: ZZZ, nativeCurrency: 'XRP', specs: zzzSpecs },
         // the same trades under Xahau's native currency: the service of XAH must see XAH as the native side
         { asset: USD, nativeCurrency: 'XAH', specs: usdSpecs.slice(-14) },
-        // rows written twice count once
-        {
-          asset: { currency: 'DUP', issuer: ISSUER },
-          nativeCurrency: 'XRP',
-          twice: true,
-          specs: [
-            [-3 * HOUR, '2', '5'],
-            [-2 * HOUR, '4', '6'],
-          ],
-        },
         // amounts a 30-place decimal cannot hold whole
         {
           asset: { currency: 'DST', issuer: ISSUER },
@@ -541,6 +530,29 @@ describe('RatesService (e2e)', () => {
       expect(zzz.base.currency).toBe('XRP');
       expect(zzz.counter.currency).toBe('ZZZ');
     });
+
+    /** Seconds from D: the edges of the windows, one second each side. */
+    const OFFSETS = [
+      -20 * DAY,
+      -14 * DAY - 1,
+      -14 * DAY,
+      -14 * DAY + 1,
+      -13 * DAY,
+      -DAY,
+      -12 * HOUR - 1,
+      -12 * HOUR,
+      -12 * HOUR + 1,
+      -3 * HOUR,
+      -1,
+      0,
+      1,
+      8 * HOUR,
+      DAY - 1,
+      DAY,
+      2 * DAY,
+      15 * DAY,
+      40 * DAY,
+    ];
 
     describe('the hand-worked market: XRP against ZZZ', () => {
       // the day of D: 10 XRP for 40 ZZZ and 30 XRP for 60: 100 ZZZ for 40 XRP, 2.5. Last trades: those two and the 10 of
@@ -596,28 +608,6 @@ describe('RatesService (e2e)', () => {
     });
 
     describe('the windows, against the oracle', () => {
-      const OFFSETS = [
-        -20 * DAY,
-        -14 * DAY - 1,
-        -14 * DAY,
-        -14 * DAY + 1,
-        -13 * DAY,
-        -DAY,
-        -12 * HOUR - 1,
-        -12 * HOUR,
-        -12 * HOUR + 1,
-        -3 * HOUR,
-        -1,
-        0,
-        1,
-        8 * HOUR,
-        DAY - 1,
-        DAY,
-        2 * DAY,
-        15 * DAY,
-        40 * DAY,
-      ];
-
       it.each([
         ['strict', {}],
         ['strict=false', { strict: false }],
@@ -707,16 +697,8 @@ describe('RatesService (e2e)', () => {
     });
 
     describe('amounts and rows', () => {
-      const DUP: Asset = { currency: 'DUP', issuer: ISSUER };
       const DST: Asset = { currency: 'DST', issuer: ISSUER };
       const BIG: Asset = { currency: 'BIG', issuer: ISSUER };
-
-      it('a row written twice counts once', async () => {
-        const w = await rates.vwap(DUP, XRP, at(-4 * HOUR), at(0));
-        expect([w.count, w.baseVolume.toFixed(), w.counterVolume.toFixed()]).toEqual([2, '6', '11']);
-        const rate = await rates.exchangeRate(DUP, XRP, { date: at(0), strict: false });
-        expect(rate.toFixed()).toBe(new Wide(11).dividedBy(6).toFixed());
-      });
 
       it('amounts below 1e-30 or past 30 places are not 0: the sums fall back to floats', async () => {
         const w = await rates.vwap(DST, XRP, at(-4 * HOUR), at(0));
@@ -745,6 +727,127 @@ describe('RatesService (e2e)', () => {
         expect(w.baseVolume.toNumber()).toBe(3e40);
         expect(w.counterVolume.toNumber()).toBe(12);
         expect(w.vwap.toNumber()).toBeCloseTo(12 / 3e40, 50);
+      });
+    });
+
+    describe('rows written twice (a second insert without deduplication, the merges stopped)', () => {
+      // `exchanges` is a ReplacingMergeTree and the rates never use FINAL, so until a merge a row can be there twice (the
+      // syncer re-writes a ledger it is not sure about). Two copies in one insert would be collapsed by ClickHouse on the
+      // way in (`optimize_on_insert`), so the copies are a second insert. Half of the ledgers are copied, so the copies
+      // change the sums (not only their count) wherever a read does not count each exchange once.
+      let twice: ClickHouseService;
+      let twiceRates: RatesService;
+      let distinct: Map<string, Market>;
+      let once: number;
+
+      const countRows = async (): Promise<number> =>
+        Number((await twice.query<{ n: string }>(`SELECT count() AS n FROM ${Table.Exchanges}`))[0].n);
+
+      beforeAll(async () => {
+        twice = await freshService();
+        distinct = await seed(twice, [
+          { asset: USD, nativeCurrency: 'XRP', specs: usdSpecs },
+          { asset: ZZZ, nativeCurrency: 'XRP', specs: zzzSpecs },
+        ]);
+        once = await countRows();
+        await twice.command(`SYSTEM STOP MERGES ${Table.Exchanges}`);
+        await twice.command(
+          `INSERT INTO ${Table.Exchanges} SELECT * FROM ${Table.Exchanges} WHERE ledger_index % 2 = 0`,
+          {},
+          { settings: { insert_deduplicate: 0 } },
+        );
+        twiceRates = new RatesService(twice, 'XRP');
+      });
+
+      it('the table really holds some exchanges twice', async () => {
+        const copies = (await countRows()) - once;
+        expect(copies).toBeGreaterThan(20);
+        expect(copies).toBeLessThan(once);
+        const [{ n }] = await twice.query<{ n: string }>(
+          `SELECT count() AS n FROM (SELECT 1 FROM ${Table.Exchanges}
+            GROUP BY base_currency, base_issuer, counter_currency, counter_issuer, ledger_index, tx_index, node_index)`,
+        );
+        expect(Number(n)).toBe(once);
+      });
+
+      it('vwap() counts each exchange once: count and volumes', async () => {
+        const m = distinct.get(`XRP:${assetKey(USD)}`) as Market;
+        const window = closedIn(m.trades, D - 20 * DAY, D + 2 * DAY);
+        const want = oracleVwap(m, 'XRP', window, false);
+        const got = await twiceRates.vwap(USD, XRP, at(-20 * DAY), at(2 * DAY));
+        expect([got.count, got.baseVolume.toFixed(), got.counterVolume.toFixed()]).toEqual([
+          want.count,
+          want.baseVolume.toFixed(),
+          want.counterVolume.toFixed(),
+        ]);
+        expectSame('vwap', got.vwap, want.vwap);
+      });
+
+      it.each([
+        ['strict', {}],
+        ['strict=false', { strict: false }],
+        ['live', { live: true }],
+      ])(
+        'exchangeRate() at every edge counts each exchange once, %s: the newest 50 are 50 distinct ones',
+        async (_name, extra) => {
+          const m = distinct.get(`XRP:${assetKey(USD)}`) as Market;
+          const cases = OFFSETS.flatMap((offset) => [false, true].map((inverted) => ({ offset, inverted })));
+          await inBatches(cases, async ({ offset, inverted }) => {
+            const o = { date: at(offset), ...extra };
+            const [b, c] = inverted ? [XRP, USD] : [USD, XRP];
+            expectSame([offset, inverted], await twiceRates.exchangeRate(b, c, o), oracleRate(m, 'XRP', inverted, o));
+          });
+        },
+      );
+
+      it('exchangeRate() counts the trades of strict mode once: 9 trades, some of them stored twice, are 9', async () => {
+        const m = distinct.get(`XRP:${assetKey(ZZZ)}`) as Market;
+        const date = at(-10 * DAY + 8 * HOUR);
+        expect(closedIn(m.trades, 0, D)).toHaveLength(12);
+        // 9 trades closed by then, and the table holds more than 9 rows of them: 10 would be enough in strict mode
+        const [{ n }] = await twice.query<{ n: string }>(
+          `SELECT count() AS n FROM ${Table.Exchanges}
+            WHERE base_currency = 'XRP' AND counter_currency = 'ZZZ' AND close_time <= toDateTime({at:UInt32}, 'UTC')`,
+          { at: Math.floor(date.getTime() / SEC) },
+        );
+        expect(closedIn(m.trades, 0, Math.floor(date.getTime() / SEC) + 1)).toHaveLength(9);
+        expect(Number(n)).toBeGreaterThanOrEqual(10);
+        expectSame('strict', await twiceRates.exchangeRate(XRP, ZZZ, { date }), new BigNumber(0));
+        expectSame(
+          'lax',
+          await twiceRates.exchangeRate(XRP, ZZZ, { date, strict: false }),
+          oracleRate(m, 'XRP', false, { date, strict: false }),
+        );
+      });
+
+      it('dailyNativeRates() counts each exchange once: the same rates as the database written once, and as exchangeRate()', async () => {
+        const from = at(-20 * DAY);
+        const to = at(2 * DAY);
+        const got = await twiceRates.dailyNativeRates([USD, ZZZ], from, to);
+        // `rates` reads the other database, which holds the same trades once
+        const reference = await rates.dailyNativeRates([USD, ZZZ], from, to);
+        let nonZero = 0;
+        for (const asset of [USD, ZZZ]) {
+          const mine = got.get(assetKey(asset)) as Map<string, BigNumber>;
+          const theirs = reference.get(assetKey(asset)) as Map<string, BigNumber>;
+          expect([...mine.keys()]).toEqual([...theirs.keys()]);
+          for (const [day, rate] of mine) {
+            expectSame([assetKey(asset), day], rate, theirs.get(day) as BigNumber);
+            if (rate.gt(0)) nonZero++;
+          }
+        }
+        // a comparison of zeros would prove nothing
+        expect(nonZero).toBeGreaterThan(10);
+        const day = new Date('2016-06-15T00:00:00Z');
+        const exact = await twiceRates.exchangeRate(XRP, USD, {
+          date: day,
+          endExclusive: new Date(day.getTime() + DAY * SEC),
+        });
+        expectSame(
+          '2016-06-15',
+          (got.get(assetKey(USD)) as Map<string, BigNumber>).get('2016-06-15') as BigNumber,
+          exact,
+        );
       });
     });
   });

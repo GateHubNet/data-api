@@ -92,7 +92,9 @@ export function periodWindow(date: Date, period: RatePeriod): RateWindow {
 
 /**
  * The window of the daily rate: from the start of the day of `date` up to `endExclusive` (the second after `date`
- * unless the client wrote a coarser date), but not past that day.
+ * unless the client wrote a coarser date), but not past that day. A date that names a month or a year therefore reads
+ * the first day of it only; the original's `limit: 1` scan of the daily rows took the first day WITH trades (another
+ * day when the first has none), a deviation that was left as it is.
  */
 export function dailyWindow(date: Date, endExclusive?: Date): RateWindow {
   const at = floorSecond(timeOf(date));

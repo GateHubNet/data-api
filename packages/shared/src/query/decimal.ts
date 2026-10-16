@@ -61,21 +61,35 @@ export const VOLUME_SOURCE_COLUMNS = [
   'counter_amount_f',
 ].join(', ');
 
+const sumExpr = (fn: string, column: string, cond?: string): string =>
+  cond === undefined ? `${fn}(${column})` : `${fn}If(${column}, ${cond})`;
+
+/**
+ * The exact sum of a column of exact decimals (`base_exact`, ...) as text, optionally of the rows that meet `cond` (a
+ * condition on the columns of the source, code and never input). `sumOf` reads it back.
+ */
+export function exactSum(column: string, cond?: string): string {
+  return `toString(${sumExpr('sum', column, cond)})`;
+}
+
+/** The Float64 sum of a shadow column (`base_amount_f`, ...), optionally of the rows that meet `cond`. `sumOf` reads it back. */
+export function floatSum(column: string, cond?: string): string {
+  return sumExpr('sumKahan', column, cond);
+}
+
 /**
  * The sums of `VOLUME_SOURCE_COLUMNS`, optionally only of the rows that meet `cond` (a condition on the columns of the
  * source, code and never input). Read the result with `volumesOf`.
  */
 export function volumeColumns(cond?: string): string {
-  const on = (agg: string, ...args: string[]): string =>
-    cond === undefined ? `${agg}(${args.join(', ')})` : `${agg}If(${[...args, cond].join(', ')})`;
   const misfit = 'base_exact IS NULL OR counter_exact IS NULL';
   return [
-    `toUInt32(${on('count')}) AS n`,
-    `toString(${on('sum', 'base_exact')}) AS base_sum`,
-    `toString(${on('sum', 'counter_exact')}) AS counter_sum`,
+    `toUInt32(${cond === undefined ? 'count()' : `countIf(${cond})`}) AS n`,
+    `${exactSum('base_exact', cond)} AS base_sum`,
+    `${exactSum('counter_exact', cond)} AS counter_sum`,
     `toUInt32(${cond === undefined ? `countIf(${misfit})` : `countIf((${cond}) AND (${misfit}))`}) AS unfit`,
-    `${on('sumKahan', 'base_amount_f')} AS base_sum_f`,
-    `${on('sumKahan', 'counter_amount_f')} AS counter_sum_f`,
+    `${floatSum('base_amount_f', cond)} AS base_sum_f`,
+    `${floatSum('counter_amount_f', cond)} AS counter_sum_f`,
   ].join(', ');
 }
 
@@ -93,12 +107,18 @@ export interface VolumeSums {
 }
 
 /**
- * The two volumes of an aggregation: the exact sums, or the Float64 ones when an amount did not fit. BigNumber writes
- * a number as JavaScript does, so a volume prints as the original's float did.
+ * A sum read back: the exact one, or the Float64 one when an amount did not fit a decimal (`unfit` > 0: the exact sums
+ * left that amount out or cut it). This is the one place of that rule. BigNumber writes a number as JavaScript does, so
+ * a volume prints as the original's float did.
  */
+export function sumOf(unfit: number, exact: string | null, float: number | null): BigNumber {
+  return unfit > 0 ? new BigNumber(float ?? 0) : new BigNumber(exact ?? 0);
+}
+
+/** The two volumes of an aggregation (`volumeColumns`), each by `sumOf`. */
 export function volumesOf(row: VolumeSums): { base: BigNumber; counter: BigNumber } {
-  if (row.unfit > 0) {
-    return { base: new BigNumber(row.base_sum_f ?? 0), counter: new BigNumber(row.counter_sum_f ?? 0) };
-  }
-  return { base: new BigNumber(row.base_sum ?? 0), counter: new BigNumber(row.counter_sum ?? 0) };
+  return {
+    base: sumOf(row.unfit, row.base_sum, row.base_sum_f),
+    counter: sumOf(row.unfit, row.counter_sum, row.counter_sum_f),
+  };
 }

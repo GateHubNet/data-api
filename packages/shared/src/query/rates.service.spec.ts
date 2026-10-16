@@ -56,7 +56,8 @@ describe('the windows of a rate', () => {
       toExclusive: ms('2015-01-15T00:00:00Z'),
     });
     expect(dailyWindow(date, new Date('2015-01-14T19:00:00Z')).toExclusive).toBe(ms('2015-01-14T19:00:00Z'));
-    // a month or a year is the first day (the original read the first aggregated day of it)
+    // a month or a year: only its first day (the original's `limit: 1` read the first day WITH trades of it, which is
+    // another day when the first has none: a known deviation)
     expect(dailyWindow(date, new Date('2015-02-01T00:00:00Z')).toExclusive).toBe(ms('2015-01-15T00:00:00Z'));
   });
 

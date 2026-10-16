@@ -1,4 +1,14 @@
-import { Asset, exactAmount, ratio } from '@gatehub/data-api-shared';
+import {
+  Asset,
+  exactAmount,
+  exactSum,
+  floatSum,
+  ratio,
+  sumOf,
+  volumeColumns,
+  volumesOf,
+  VolumeSums,
+} from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { fmtTime, precision8 } from '../common/format';
 
@@ -26,27 +36,22 @@ import { fmtTime, precision8 } from '../common/format';
 /** A price of nothing: `0.0000000`. */
 const ZERO_PRICE = precision8(0);
 
-/** One aggregation of exchanges as the query reads it (`AGGREGATE_COLUMNS`), in the stored orientation. */
-export interface AggregateRow {
-  /** How many exchanges. */
-  n: number;
+/**
+ * One aggregation of exchanges as the query reads it (`AGGREGATE_COLUMNS`), in the stored orientation. `n`, the two
+ * sums (exact, `null` for no amount to sum, and Float64) and `unfit` (how many exchanges have an amount the exact sums
+ * cannot hold whole; if any, the Float64 sums are used) are those of `volumeColumns`.
+ */
+export interface AggregateRow extends VolumeSums {
   /** The rate of the first exchange by `(ledger_index, tx_index, node_index)`, and of the last. */
   open_rate: string;
   close_rate: string;
   /** The rate of the exchange with the highest `rate_f`, and with the lowest (the first by key of equal ones). */
   high_rate: string;
   low_rate: string;
-  /** Σ base amount and Σ counter amount, exact decimal text (`null`: no amount to sum). */
-  base_sum: string | null;
-  counter_sum: string | null;
   /** Σ base amount of the exchanges the taker bought (`buyer = taker`): the buy volume of the stored pair. */
   base_bought: string | null;
   /** Σ counter amount of those the taker sold (`seller = taker`): the buy volume of the inverted pair. */
   counter_bought: string | null;
-  /** How many exchanges have an amount the exact sums cannot hold whole; if any, the Float64 sums below are used. */
-  unfit: number;
-  base_sum_f: number;
-  counter_sum_f: number;
   base_bought_f: number;
   counter_bought_f: number;
   /** Unix seconds of the close time of the first ledger and of the last. */
@@ -91,20 +96,16 @@ export const AGGREGATE_SOURCE_COLUMNS = [
  * equal rates are told apart by the key of the exchange, and decimal sums do not depend on the order of the rows.
  */
 export const AGGREGATE_COLUMNS = [
-  'toUInt32(count()) AS n',
   'argMin(rate, (ledger_index, tx_index, node_index)) AS open_rate',
   'argMax(rate, (ledger_index, tx_index, node_index)) AS close_rate',
   'argMax(rate, (rate_f, -toInt64(ledger_index), -toInt64(tx_index), -toInt32(node_index))) AS high_rate',
   'argMin(rate, (rate_f, ledger_index, tx_index, node_index)) AS low_rate',
-  'toString(sum(base_exact)) AS base_sum',
-  'toString(sum(counter_exact)) AS counter_sum',
-  'toString(sumIf(base_exact, buyer = taker)) AS base_bought',
-  'toString(sumIf(counter_exact, seller = taker)) AS counter_bought',
-  'toUInt32(countIf(base_exact IS NULL OR counter_exact IS NULL)) AS unfit',
-  'sumKahan(base_amount_f) AS base_sum_f',
-  'sumKahan(counter_amount_f) AS counter_sum_f',
-  'sumKahanIf(base_amount_f, buyer = taker) AS base_bought_f',
-  'sumKahanIf(counter_amount_f, seller = taker) AS counter_bought_f',
+  // the count, the two volumes (exact and Float64) and the exchanges the exact sums cannot hold: the shared ones
+  volumeColumns(),
+  `${exactSum('base_exact', 'buyer = taker')} AS base_bought`,
+  `${exactSum('counter_exact', 'seller = taker')} AS counter_bought`,
+  `${floatSum('base_amount_f', 'buyer = taker')} AS base_bought_f`,
+  `${floatSum('counter_amount_f', 'seller = taker')} AS counter_bought_f`,
   'toUnixTimestamp(min(close_time)) AS open_ts',
   'toUnixTimestamp(max(close_time)) AS close_ts',
 ].join(',\n         ');
@@ -165,23 +166,18 @@ interface Figures {
   buy_volume: number;
 }
 
-/** The four volumes of an aggregation as text: the exact sums, or the Float64 ones when an amount did not fit. */
+/**
+ * The four volumes of an aggregation as text: the exact sums, or the Float64 ones when an amount did not fit (the rule
+ * is `sumOf`, shared with the rates). BigNumber writes a number as JavaScript does (exponent from 1e21 and below 1e-6),
+ * as the original's floats were.
+ */
 function volumes(row: AggregateRow): { base: string; counter: string; baseBought: string; counterBought: string } {
-  if (row.unfit > 0) {
-    return {
-      base: String(row.base_sum_f),
-      counter: String(row.counter_sum_f),
-      baseBought: String(row.base_bought_f),
-      counterBought: String(row.counter_bought_f),
-    };
-  }
-  // BigNumber writes a number as JavaScript does (exponent from 1e21 and below 1e-6), as the original's floats were
-  const text = (sum: string | null): string => new BigNumber(sum ?? 0).toString();
+  const v = volumesOf(row);
   return {
-    base: text(row.base_sum),
-    counter: text(row.counter_sum),
-    baseBought: text(row.base_bought),
-    counterBought: text(row.counter_bought),
+    base: v.base.toString(),
+    counter: v.counter.toString(),
+    baseBought: sumOf(row.unfit, row.base_bought, row.base_bought_f).toString(),
+    counterBought: sumOf(row.unfit, row.counter_bought, row.counter_bought_f).toString(),
   };
 }
 
