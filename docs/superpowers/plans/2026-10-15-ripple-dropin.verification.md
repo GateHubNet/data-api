@@ -443,3 +443,43 @@ node smoke.js {xrpl,xahau}; node step5.js {xrpl,xahau}; node semantic.js {xrpl,x
 GH_ENV=local pnpm --filter @gatehub/data-syncer ingest:range --from <a> --to <b> --concurrency 3 --chunk 100 --run-id verify-sample
 docker compose -p dropin-verify -f docker-compose.yaml -f compose.override.yaml down -v
 ```
+
+## Fixes after verification
+
+Fix round of 2026-10-16 on `feat/ripple-dropin` (base `04c0f0e`), under the controller rulings R95 to R104. Every code change was
+written test first (RED, then GREEN); the RED/GREEN evidence per change is in `.superpowers/sdd/2026-10-15-ripple-dropin/task-38-fix-report.md`.
+
+| Finding | Ruling | Commit | What changed | Evidence |
+| --- | --- | --- | --- | --- |
+| F1 UNLReport (`Account: ""`) blocks ingest | R95 | `6006133` | `senderAccount()`: an empty `Account` is the zero account `rrrrrrrrrrrrrrrrrrrrrhoLvTp` in the index columns (`transactions.account`, `account_tx_by_sequence`, `is_initiator`, `accounts_created.parent`); `tx_json` keeps the node's `""`; a missing / non-string `Account` is still rejected | Flag ledger 26570752 recorded from `wss://xahau.network` (`record-fixtures`, plus its `binary: true` form) in `packages/shared/test/fixtures/xahau/flag/`; golden snapshot of its rows; shared e2e: inserts and reads back in every table, commits through `LedgerWriter` (22 UNLReport under the zero account, `tx_json` Account `""`) |
+| F1 aggravating: deterministic parse error loops | R96 | `74db13f` | `buildLedgerRows` throws `LedgerParseError` (ledger index + reason). The live runner commits the batch prefix before the bad ledger with the same writer (nothing of the batch was inserted) and halts (`state: halted`, `error: Cannot parse ledger <n>: ...`, probe 503, `syncer_ingest_halts_total{reason="parse_error"}`); range-ingest fails the chunk at once, intent open | live-runner e2e: before the fix the runner never stopped (both tests hit the 180 s timeout); after: checkpoint = ledger before the bad one, no rows above it, the bad ledger fetched once; range-ingest e2e: one attempt, `Cannot parse ledger <n>` |
+| F2 `binary=true` of UNLReport does not re-hash | R97 | `6006133`, `9f2703a` | `BinaryCodecService.encode` writes an AccountID whose JSON value is `""` as a zero-length field (`81 00`: encoded with a sentinel address whose `14 <20 bytes>` is cut to `00`); `roundTrip()` keeps `""` in JSON mode | codec unit: all 37 blobs and metas of the flag ledger are byte-equal to the node's `binary: true` answer and re-hash; tx tree root = `transaction_hash`; api e2e `xahau-flag`: `/v2/transactions/{hash}` shows `Account: ""`, `?binary=true` and `/v2/ledgers/26570752?binary=true[&expand=true]` re-hash (7 of 8 tests failed before the fix) |
+| F3 rate limits ignored; default endpoints throttle | R98 | `add88cb` | Process-wide `EndpointThrottle`: a rate-limit answer (`retry in ~<N>ms`, `slowDown`, `tooBusy`, HTTP 429) pauses that endpoint (hint + 250 ms, 10 s without a hint, max 20 min) for every NodeClient of the process: no request, no connection attempt; failover to another endpoint; `NodeThrottledError` (`retryAfterMs`) when all are paused; logged once per pause; `syncer_node_rate_limited_total` / `api_node_rate_limited_total{endpoint}`. Defaults: XRPL `wss://s2.ripple.com,wss://xrplcluster.com`, `GH_CATCHUP_CONCURRENCY=4` | NodeClient unit tests against a mock rippled (pause, no request during it, failover, connect refusal, shared throttle, cap); live runner waits the hint (e2e); live re-check below |
+| F4 boot dies on a rate-limited `server_info`; aggregator needs a node | R99 | `add88cb` | The boot network check retries (1 s doubling to 30 s, or the hint); only a node of another network ends the boot. The shared NodeClient is made only for `ingest` / `fee_stats` | syncer app e2e (real `main.ts`): boots through two rate-limited `server_info` answers; `GH_WORKERS=aggregator` boots and serves 200 with no node listening (both timed out before) |
+| F5 range-ingest stuck on throttled nodes; `--chunk` change redoes intents forever | R100 | `3a2b831` | Rate-limited and `lgrNotFound` fetches are retried within a per-chunk wait budget (`--max-wait`, default 1200 s); unfinished intents are redone first over their own recorded range (overlapping ones merged) and closed | range-ingest e2e: 8 new tests failed on the old code; the F5 scenario (wide intent, smaller chunk, later failure) closes the intent and the rerun fetches only what is missing |
+| F11 `lgrNotFound` intermittent | R100 | `3a2b831` | as F5 (retried as transient in range-ingest; the live runner already retried) | as F5 |
+| F6 probe 503 body | R101 | `3cd4530` | The probe controller of both apps answers 503 with the terminus result (`status: error`, `info`, `error`, `details`) | syncer app e2e (ClickHouse down; halted runner: `state`, `lag`, `last_commit_age`, `error`), api `main.e2e-spec` (ClickHouse down), all under the real toolbox `bootstrap()` |
+| F7 `GET /` body | R102 | `c4b4f8e` | api-reference "Out of scope": paths outside `/v2`, `GET /` included, answer the platform's `{"error":{...}}` 404 | doc only |
+| F8 config self-check snippet | R102 | `c4b4f8e` | The snippet works from any directory of the checkout (`git rev-parse`, `reflect-metadata` resolved from `apps/api`) | run from the repo root and from `docs/`: prints the 12 api and 14 syncer names |
+| F9 dev compose next to another stack | R103 | `c4b4f8e` | `docker-compose.yaml`: no `container_name`, every host port from a variable with the old default; prod compose keeps the syncer / ClickHouse names (documented as the refuse-to-scale mechanism, one prod stack per host) | `docker compose -p t38fix up -d clickhouse` with `CLICKHOUSE_HTTP_PORT=18124 CLICKHOUSE_NATIVE_PORT=19001` started next to the user's stopped `data-api-clickhouse` without a conflict (live re-check) |
+| F10 `ledger_interval` of a partial first hour | R102 | `c4b4f8e` | Documented as computed from the bucket start | doc only |
+| F12 / markets | R104 | `c4b4f8e` | `xahau.json` version 3 without `XXX` / `rxxxx9gmp1DSJ8bE4Gya48VtRdPPz7mHF`; `network-profile.spec.ts` expects it; provenance note kept | shared unit suite 578 / 578 |
+
+Suites at the end of the round (code commit `9f2703a`): `pnpm build` exit 0; `pnpm test` 1911 pass / 0 fail (shared 578, syncer 351,
+api 982); `pnpm -r test:e2e` 2093 pass / 0 fail (shared 350, syncer 160, api 1583, including `apps/api/test/main.e2e-spec.ts`). One
+of three full api e2e runs had a single intermittent failure (`errors.e2e-spec.ts`, `/v2` answered a 404 whose body was not the JSON
+one); it did not recur in 9 isolated reruns of that suite nor in the other two full runs, and nothing on that path changed in this round.
+
+**Live re-check** (built `dist`, own compose project `t38fix`, scratch database `xahau_t38fix`, `GH_WORKERS=ingest`, concurrency 1,
+`wss://xahau.network`; validated head 26574278, flag ledger 26574080, start 26574060): the syncer committed 26574060-26574063, then the node
+answered `rate limit: units quota (50000 per 10s) exhausted, retry in ~6280ms`. The node client logged it once (`... nothing is sent to it
+for 6.5 s`), the runner waited exactly that long and committed 26574064-26574065, and a second answer (`retry in ~8148ms`) was honoured the
+same way, before the syncer was stopped (SIGTERM, lease released) **as the rule requires on a rate-limit answer: the flag ledger 26574080 was
+not reached live**. Instead, the flag ledger recorded from the same node earlier that day (26570752, 22 UNLReport) was ingested offline into
+the same database through the built `range-ingest` (`FixtureLedgerSource`, no node), and the built API (node endpoint unreachable on
+purpose, bundled Xahau definitions) served `/v2/ledgers/26570752?binary=true&expand=true`: 37 of 37 blobs re-hash, 22 carry `81 00`, tree
+root `C39A304D...54646` = `transaction_hash`; the JSON form shows the 22 UNLReports with `Account: ""`. The six ledgers ingested live
+(161 to 176 transactions each) re-hash the same way. Requests to the public node in this round: 3 for the fixture (`server_info`,
+`server_definitions`, `ledger`), 1 for its binary form, 1 for the head, and the syncer's own (`server_info`, `subscribe`, the validated
+head, and one ledger at a time: 6 committed, 2 refused with the rate limit); never more than one in flight. Everything started was torn down
+(`docker compose -p t38fix down -v`: container, network, volume); the user's containers were not touched.
