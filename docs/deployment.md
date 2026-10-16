@@ -25,7 +25,9 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
 
 - **api-xrpl / api-xahau** are stateless and scale horizontally.
 - **syncer-xrpl / syncer-xahau** are singletons: exactly one per network, enforced by a fixed `container_name` (compose refuses
-  to scale it) and by a lease in ClickHouse (a second syncer refuses to boot). They expose only the probe and metrics.
+  to scale it; keep the names, they are that mechanism) and by a lease in ClickHouse (a second syncer refuses to boot). The fixed
+  names (`data-syncer-*`, `ch-keeper`, `ch-server`) also mean one prod stack per Docker host; the dev `docker-compose.yaml` fixes
+  none and takes its host ports from variables, so it can run next to another stack. They expose only the probe and metrics.
 - **ClickHouse** and **Keeper** are internal: never publish them. **nginx** is the only service with a host port.
 - The API answers the same `/v2/...` paths on both hosts; the **host name** selects the network
   ([api-reference](api-reference.md#hosts-one-per-network)). Native currency per network: `XRP` / `XAH`.

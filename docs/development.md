@@ -79,6 +79,7 @@ export NPM_TOKEN=...                       # or be logged in to npm, see 1
 pnpm install
 
 docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123 / 9000 (or: pnpm docker:up)
+#   next to another stack: docker compose -p <name> up -d clickhouse, ports via CLICKHOUSE_HTTP_PORT / CLICKHOUSE_NATIVE_PORT
 
 cp apps/api/.env.example    apps/api/.env  # the .env files are git-ignored; the .env.example files are committed
 cp apps/syncer/.env.example apps/syncer/.env

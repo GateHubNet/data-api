@@ -101,9 +101,13 @@ syncer's lease (30 s) is held by a live or recently dead holder.
 
 **Fix:** `docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --remove-orphans`, or `docker rm -f` the old containers; wait 30 s.
 
-### Dev compose: port or container name already in use
-**Root cause:** the dev stack names its ClickHouse `data-api-clickhouse` and publishes 8123/9000, 3001-3004, 3011-3014 on 127.0.0.1; an older
-stack or another service holds them. **Fix:** stop it, or change the port mappings in a compose override.
+### Dev compose: port already in use, or a second stack next to the first
+**Root cause:** the dev stack publishes 8123/9000, 3001-3004, 3011-3014 on 127.0.0.1, and another stack or service holds one of them.
+The dev compose fixes no container name (an older version named its ClickHouse `data-api-clickhouse`), so a project name is enough to
+keep two stacks apart. **Fix:** run under your own project and move the ports with their variables, e.g.
+`CLICKHOUSE_HTTP_PORT=18123 CLICKHOUSE_NATIVE_PORT=19000 docker compose -p my-check up -d clickhouse` (the list of variables is at the top
+of `docker-compose.yaml`; point `GH_CLICKHOUSE_URL` at the new port). The prod compose keeps fixed names for the syncers and ClickHouse:
+it is one stack per host.
 
 ### nginx exits at start / `unknown directive "${TRUSTED_PROXY_DIRECTIVES}"`
 **Root cause:** `16-trusted-proxies.envsh` lost its executable bit (it must stay `chmod +x`; the image sources it before rendering the

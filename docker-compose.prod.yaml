@@ -18,9 +18,12 @@
 # Scale the read tier of a network (compose has no rolling update; `up` recreates the changed services):
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --scale api-xrpl=3 --scale api-xahau=2
 #
-# The syncers are singletons: replicas 1 and a fixed container_name (compose then refuses to scale them). A single writer
-# per network and database is a rule of the application (it holds a lease in ClickHouse), and `up` recreates a changed syncer
-# by stopping the old container before starting the new one - compose has no rolling update, so the two never overlap.
+# The syncers are singletons: replicas 1 and a fixed container_name (compose then refuses to scale them). Keep those names:
+# they are the "refuse to scale" mechanism (unlike the dev compose, which has none so it can run next to another stack). A
+# single writer per network and database is a rule of the application (it holds a lease in ClickHouse), and `up` recreates a
+# changed syncer by stopping the old container before starting the new one - compose has no rolling update, so the two never
+# overlap. Two prod stacks on one Docker host therefore conflict on these names (and on ch-keeper / ch-server): use one host
+# per stack.
 #
 # Backfill or repair a ledger range of one network. The live syncer keeps running; the CLI checks the syncer lease itself.
 # The image holds the CLI as `dist/cli/range-ingest.js` (--help lists the options):

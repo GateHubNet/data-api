@@ -192,7 +192,8 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 | API map | `GET /` and `GET /v2` (the index of all routes) |
 
 The original's 404 body also carried an `api-map` key (the same index); here it is `{"result":"error","message":"Cannot GET <url>"}`
-only. The old GateHub `/v2/ledgers` time-range list is gone too: `/v2/ledgers` without an identifier is the latest ledger, as in Ripple.
+only. That Ripple-shaped 404 covers every path under `/v2`. A path outside `/v2`, `GET /` included, is not part of the Ripple
+contract: it answers the platform's own 404, `{"error":{"key":"NOTFOUNDEXCEPTION","message":"Cannot GET /"}}`. The old GateHub `/v2/ledgers` time-range list is gone too: `/v2/ledgers` without an identifier is the latest ledger, as in Ripple.
 
 The singular `/v2/ledger/{hash}/validations[/{pubkey}]` is served as an alias of `/v2/ledgers/{hash}/validations[/{pubkey}]`. It appeared
 only in the original's **README**, not in the route table of either branch's `server.js`; it is provided because that README documented it
@@ -932,8 +933,9 @@ is accepted and means the same as none.
 The trade volume and the payment volume of the network, converted to the native currency (or to a display currency). The
 components come from the **markets config** of the network (`packages/shared/config/markets/{xrpl,xahau}.json`, or the file in
 `GH_MARKETS_CONFIG`), a versioned list of trade markets and payment currencies that the syncer's aggregator works through; the
-list shipped for Xahau (version 2) was derived from a sample of the last three days of Xahau history (two trade markets, four payment
-currencies): it is provisional and should be re-derived from a full-history node (override with `GH_MARKETS_CONFIG`).
+list shipped for Xahau (version 3) was derived from a small sample of three days of Xahau history (one trade market, `EVR`/`XAH`, and
+three payment currencies; the `XXX` test token is left out): it is provisional and should be re-derived from a full-history node
+(override with `GH_MARKETS_CONFIG`).
 
 Two modes, chosen by the parameters:
 
@@ -1049,6 +1051,12 @@ picture, with a family it is a flat row of that family.
 The `metric` family has: `accounts_created, exchanges_count, ledger_count, ledger_interval, payments_count, transaction_count,
 tx_per_ledger` (`ledger_interval` is the average seconds between ledgers, `tx_per_ledger` the average transactions per ledger,
 both to 5 significant digits). A bucket is listed when it starts within `start` and `end`.
+
+`ledger_interval` is computed from the **start of the bucket**: (close time of its last ledger − bucket start) / its ledgers. That is
+the average interval for a complete bucket and for the bucket in progress, but not for the first bucket of a database whose first
+ledger closed after the bucket started (the live syncer began, or a backfill begins, part-way through that hour or day): there the
+time before the first stored ledger counts too and the value is too high (for example 17.6 instead of about 3.9 for an XRPL hour
+whose first 47 minutes are not stored).
 
 ```json
 { "result": "success", "count": 1, "marker": "…",

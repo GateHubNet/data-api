@@ -18,6 +18,13 @@
 #
 # Migrations are owned by the migrate-* jobs (the apps wait for them to complete), so the syncers run with
 # GH_RUN_MIGRATIONS_ON_BOOT=false.
+#
+# Next to another stack: no container has a fixed name (compose names them after the project), and every host port can be
+# moved with a variable (defaults in brackets): CLICKHOUSE_HTTP_PORT (8123), CLICKHOUSE_NATIVE_PORT (9000),
+# XRPL_API_PORT (3001), XRPL_API_METRICZ_PORT (3003), XRPL_SYNCER_PORT (3002), XRPL_SYNCER_METRICZ_PORT (3004),
+# XAHAU_API_PORT (3011), XAHAU_API_METRICZ_PORT (3013), XAHAU_SYNCER_PORT (3012), XAHAU_SYNCER_METRICZ_PORT (3014). E.g.
+#   docker compose -p my-check up -d clickhouse                                        a second stack, default ports
+#   CLICKHOUSE_HTTP_PORT=18123 CLICKHOUSE_NATIVE_PORT=19000 docker compose -p my-check up -d clickhouse
 
 x-syncer-build: &syncer-build
   context: .
@@ -54,7 +61,6 @@ x-syncer-healthcheck: &syncer-healthcheck
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.8.14.3
-    container_name: data-api-clickhouse
     # Auto-restart so ClickHouse survives Docker/OrbStack restarts and host reboots
     # (otherwise the syncer/API can't connect after a reboot).
     restart: unless-stopped
@@ -68,8 +74,8 @@ services:
       CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:-}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - '127.0.0.1:8123:8123' # HTTP interface (used by @clickhouse/client)
-      - '127.0.0.1:9000:9000' # native protocol
+      - '127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123' # HTTP interface (used by @clickhouse/client)
+      - '127.0.0.1:${CLICKHOUSE_NATIVE_PORT:-9000}:9000' # native protocol
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     healthcheck:
@@ -115,8 +121,8 @@ services:
     healthcheck: *syncer-healthcheck
     stop_grace_period: 30s
     ports:
-      - '127.0.0.1:3002:3002' # /liveliness/healthz
-      - '127.0.0.1:3004:3000' # /metricz
+      - '127.0.0.1:${XRPL_SYNCER_PORT:-3002}:3002' # /liveliness/healthz
+      - '127.0.0.1:${XRPL_SYNCER_METRICZ_PORT:-3004}:3000' # /metricz
 
   api-xrpl:
     profiles: ['full']
@@ -139,8 +145,8 @@ services:
     healthcheck: *api-healthcheck
     stop_grace_period: 30s
     ports:
-      - '127.0.0.1:3001:3001' # /v2/*, /liveliness/healthz, /internal/docs
-      - '127.0.0.1:3003:3000' # /metricz
+      - '127.0.0.1:${XRPL_API_PORT:-3001}:3001' # /v2/*, /liveliness/healthz, /internal/docs
+      - '127.0.0.1:${XRPL_API_METRICZ_PORT:-3003}:3000' # /metricz
 
   # ---------------------------------------------------------------- Xahau (profile: xahau)
 
@@ -179,8 +185,8 @@ services:
     healthcheck: *syncer-healthcheck
     stop_grace_period: 30s
     ports:
-      - '127.0.0.1:3012:3002' # /liveliness/healthz
-      - '127.0.0.1:3014:3000' # /metricz
+      - '127.0.0.1:${XAHAU_SYNCER_PORT:-3012}:3002' # /liveliness/healthz
+      - '127.0.0.1:${XAHAU_SYNCER_METRICZ_PORT:-3014}:3000' # /metricz
 
   api-xahau:
     profiles: ['xahau']
@@ -201,8 +207,8 @@ services:
     healthcheck: *api-healthcheck
     stop_grace_period: 30s
     ports:
-      - '127.0.0.1:3011:3001' # /v2/*, /liveliness/healthz, /internal/docs
-      - '127.0.0.1:3013:3000' # /metricz
+      - '127.0.0.1:${XAHAU_API_PORT:-3011}:3001' # /v2/*, /liveliness/healthz, /internal/docs
+      - '127.0.0.1:${XAHAU_API_METRICZ_PORT:-3013}:3000' # /metricz
 
 # The npm token for the private @gatehub/toolbox, read from the NPM_TOKEN environment variable at build time only.
 secrets:

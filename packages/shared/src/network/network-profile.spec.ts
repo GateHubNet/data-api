@@ -174,11 +174,16 @@ describe('network profiles', () => {
       expect(markets.tradeMarkets.map((m) => m.base)).toEqual(markets.paymentCurrencies);
     });
 
-    it('loads the bundled xahau markets (empty until populated)', () => {
+    it('loads the bundled xahau markets: version 3, derived from a sample, without the XXX test token (ruling R104)', () => {
+      const evr = { currency: 'EVR', issuer: 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8' };
       expect(loadMarketsConfig(getNetworkProfile('xahau'))).toEqual({
-        version: 1,
-        tradeMarkets: [],
-        paymentCurrencies: [],
+        version: 3,
+        tradeMarkets: [{ base: evr, counter: { currency: 'XAH' } }],
+        paymentCurrencies: [
+          evr,
+          { currency: '4555525100000000000000000000000000000000', issuer: 'rDk1xiArDMjDqnrR2yWypwQAKg4mKnQYvs' },
+          { currency: 'RVN', issuer: 'rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb' },
+        ],
       });
     });
 

@@ -182,17 +182,21 @@ The variables of sections 2 to 6 are the properties of `ApiConfig` and `SyncerCo
 class, list what the built code reads and compare:
 
 ```bash
-pnpm build
+# works from any directory of the checkout (the root's node_modules has no reflect-metadata: it is resolved from apps/api)
+ROOT="$(git rev-parse --show-toplevel)"
+(cd "$ROOT" && pnpm build)
 node -e "
-require('reflect-metadata');
+const path = require('path');
+const root = process.argv[1];
+require(require.resolve('reflect-metadata', { paths: [path.join(root, 'apps/api')] }));
 const names = (Cls) => (Reflect.getMetadata('opts', Cls) || []).map((k) => {
   const e = (k.options && k.options.path) || k.propertyName.replace(/([A-Z])/g, '_\$1').toUpperCase();
   return e.startsWith('GH_') ? e : 'GH_' + e;
 });
-console.log('api   ', names(require('./apps/api/dist/config/api.config.js').ApiConfig).join(' '));
-console.log('syncer', names(require('./apps/syncer/dist/config/syncer.config.js').SyncerConfig).join(' '));
-"
-grep -o 'env\.GH_[A-Z_]*' packages/shared/src/clickhouse/clickhouse.config.ts | sort -u
+console.log('api   ', names(require(path.join(root, 'apps/api/dist/config/api.config.js')).ApiConfig).join(' '));
+console.log('syncer', names(require(path.join(root, 'apps/syncer/dist/config/syncer.config.js')).SyncerConfig).join(' '));
+" "$ROOT"
+grep -o 'env\.GH_[A-Z_]*' "$ROOT/packages/shared/src/clickhouse/clickhouse.config.ts" | sort -u
 ```
 
 Every name printed must have a row in this page (and in the matching `.env.example`), and every `GH_*` name in a row must be

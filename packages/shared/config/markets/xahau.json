@@ -1,19 +1,10 @@
 {
-  "version": 2,
+  "version": 3,
   "tradeMarkets": [
     {
       "base": {
         "currency": "EVR",
         "issuer": "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8"
-      },
-      "counter": {
-        "currency": "XAH"
-      }
-    },
-    {
-      "base": {
-        "currency": "XXX",
-        "issuer": "rxxxx9gmp1DSJ8bE4Gya48VtRdPPz7mHF"
       },
       "counter": {
         "currency": "XAH"
@@ -32,10 +23,6 @@
     {
       "currency": "RVN",
       "issuer": "rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb"
-    },
-    {
-      "currency": "XXX",
-      "issuer": "rxxxx9gmp1DSJ8bE4Gya48VtRdPPz7mHF"
     }
   ]
 }

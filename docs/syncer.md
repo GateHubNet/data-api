@@ -260,8 +260,11 @@ Properties that matter operationally:
 - A set that keeps failing waits 5 minutes, doubling up to an hour, and older days go on; the memory of this is lost on restart.
 - **No overlap, graceful stop** (a tick still running is skipped; shutdown aborts the slice in flight and waits at most 2 s).
 - Volume jobs need the **markets config** (`config/markets/<network>.json` or `GH_MARKETS_CONFIG`): without markets there is
-  nothing to compute. (The shipped Xahau list, version 2, was derived from a sample of the last three days and is short: two trade
-  markets and four payment currencies; re-derive it from a full-history node.) A new `version` in the file recomputes the closed days.
+  nothing to compute. (The shipped Xahau list, version 3, was derived from a small sample, about 3,800 ledgers spread over three days,
+  and is short: one trade market (`EVR`/`XAH`) and three payment currencies; `XXX`, a test token whose ISO code means "no
+  currency", was left out. Re-derive it from a full-history node with the queries of the
+  [verification report](superpowers/plans/2026-10-15-ripple-dropin.verification.md#8-step-6-packagessharedconfigmarketsxahaujson),
+  then bump `version`.) A new `version` in the file recomputes the closed days.
 
 ## 8. What the syncer does not do
 
