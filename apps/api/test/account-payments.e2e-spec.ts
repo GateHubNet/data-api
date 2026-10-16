@@ -7,11 +7,14 @@ import { fixtureAccountPayments, fixturePayments } from './support/fixtures';
  * suite (`ripple-mock`: 182 payments, 364 rows of `account_payments`) and with the Xahau ledgers recorded from a
  * public node (172 payments, all XAH).
  *
- * Ported from rippled-historical-database `test/test.account.payments.js` (all 10 `it`s, same titles, none skipped).
- * Three of them lean on HBase and are ported to what this API holds instead:
+ * Ported from rippled-historical-database `test/test.account.payments.js` (all 10 `it`s, none skipped). Eight keep
+ * the original's title word for word; the two that share one title there ('should make sure
+ * /accounts/:account/payments handles type correctly', once for `sent` and once for `received`) are told apart here
+ * with a suffix, '(sent)' and '(received)'. Three of them lean on HBase and are ported to what this API holds instead:
  *  - the two 'handles pagination correctly' walk the payments of the account one by one with `limit=1` and compare
  *    each page with the unpaged list, as `utils.checkPagination` does; only the marker is this API's (the original
- *    ran the same walk twice, "the descending false version" being the same request);
+ *    ran the same walk twice, "the descending false version" being the same request: this port sends
+ *    `descending=false` explicitly in the second);
  *  - 'should include a link header when marker is present' expected the HBase row key as the marker
  *    (`rpjZ…|20150114185210|000011119940|00001`); the marker of this API is the `(ledger_index, tx_index)` of the last
  *    row of the page.

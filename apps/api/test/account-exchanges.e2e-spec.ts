@@ -1,17 +1,20 @@
 import { AccountExchangesRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
-import { fixtureAccountExchanges, fixtureExchanges } from './support/fixtures';
+import { fixtureAccountExchanges, fixtureExchanges, fixtureSource } from './support/fixtures';
 
 /**
  * `GET /v2/accounts/:address/exchanges[/:base[/:counter]]` on a real ClickHouse, seeded with the 54 ledgers of the
  * original Ripple test suite (`ripple-mock`: 158 exchanges, 316 rows of `account_exchanges` for 53 accounts, 6 of them
  * with a `client`) and with the Xahau ledgers recorded from a public node (no exchanges at all).
  *
- * Ported from rippled-historical-database `test/test.account.exchanges.js` (all 10 `it`s, same titles, none skipped).
- * Three of them lean on HBase and are ported to what this API holds instead:
+ * Ported from rippled-historical-database `test/test.account.exchanges.js` (all 10 `it`s, none skipped). Eight keep
+ * the original's title word for word; the two that share one title there ('should make sure
+ * /accounts/:account/exhanges/:curr handles currency correctly', once for `jpy` and once for `BTC`) are told apart
+ * here with a suffix, '(jpy)' and '(BTC)'. Three of them lean on HBase and are ported to what this API holds instead:
  *  - the two 'handles pagination correctly' walk the exchanges of the account one by one with `limit=1` and compare
- *    each with the unpaged list, as `utils.checkPagination` does; only the marker is this API's (the original ran the
- *    same walk twice, the second being "descending" in the title only);
+ *    each with the unpaged list, as `utils.checkPagination` does; only the marker is this API's. The original ran the
+ *    same walk twice, the second being "descending" in the title only (its URL never sent `descending=true`); this
+ *    port's '(descending)' walk does send it, and also checks that it is the ascending list the other way round;
  *  - 'should include a link header when marker is present' expected the HBase row key as the marker
  *    (`rHsZ…|20150114185210|000011119940|00009|00001`); the marker of this API is the `(ledger_index, tx_index,
  *    node_index)` of the last row of the page.
@@ -471,7 +474,16 @@ describe('account exchanges API endpoint', () => {
     });
 
     it('a pair that the account has not traded, or never existed, is an empty list', async () => {
-      for (const filter of [`/XRP/BTC+${NUF}`, '/XRP/XRP', `/USD+${KICE}/XRP`, '/NOPE/XRP', '/XRP/NOPE']) {
+      for (const filter of [
+        `/XRP/BTC+${NUF}`,
+        '/XRP/XRP',
+        `/USD+${KICE}/XRP`,
+        '/NOPE/XRP',
+        '/XRP/NOPE',
+        // the native currency has no issuer: with one it matches nothing, and it is no 400 (a filter, not a pair)
+        `/XRP+${KICE}`,
+        `/USD+${MWJ}/XRP+${KICE}`,
+      ]) {
         const res = await get(path(MULTI, filter));
         expect([filter, res.status, res.body]).toEqual([filter, 200, { result: 'success', count: 0, exchanges: [] }]);
       }
@@ -1021,11 +1033,43 @@ describe('account exchanges API endpoint when a ledger was written twice', () =>
 });
 
 describe('account exchanges API endpoint on the xahau-recorded ledgers', () => {
+  const EVERNODE = 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8';
+  const TRADER_X = 'rDripFkNyrKz7XUEWKCa18aTeGQ9mi7afj';
+  const header = fixtureSource('xahau-recorded').list()[0].header;
+  /** The recorded ledgers have no exchange: this one is an EVR/XAH trade written into the first of them, for TRADER_X. */
+  const row: AccountExchangesRow = {
+    account: TRADER_X,
+    base_currency: 'EVR',
+    base_issuer: EVERNODE,
+    counter_currency: 'XAH',
+    counter_issuer: '',
+    ledger_index: header.ledger_index,
+    tx_index: 0,
+    node_index: 0,
+    tx_hash: 'E'.repeat(64),
+    close_time: header.close_time,
+    base_amount: '10',
+    counter_amount: '5',
+    base_amount_f: 10,
+    counter_amount_f: 5,
+    rate: '0.5',
+    rate_f: 0.5,
+    buyer: TRADER_X,
+    seller: EVERNODE,
+    taker: TRADER_X,
+    provider: EVERNODE,
+    offer_sequence: 7,
+    autobridged_currency: null,
+    autobridged_issuer: null,
+    tx_type: 'OfferCreate',
+    client: null,
+  };
   let h: Harness;
   let get: ApiClient['get'];
   beforeAll(async () => {
     h = await startHarness({ seed: 'xahau-recorded', env: NO_RATE_LIMIT });
     get = (await h.api()).get;
+    await h.ch.insert(Table.AccountExchanges, [row]);
   });
   afterAll(async () => {
     await h?.close();
@@ -1033,19 +1077,58 @@ describe('account exchanges API endpoint on the xahau-recorded ledgers', () => {
 
   it('the recorded ledgers have no exchanges: every list is empty', async () => {
     expect(fixtureAccountExchanges('xahau-recorded')).toHaveLength(0);
-    const account = 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8';
-    for (const filter of ['', '/XAH', `/EVR+${account}/XAH`]) {
-      const res = await get(path(account, filter));
+    for (const filter of ['', '/XAH', `/EVR+${EVERNODE}/XAH`]) {
+      const res = await get(path(EVERNODE, filter));
       expect([filter, res.status, res.body]).toEqual([filter, 200, { result: 'success', count: 0, exchanges: [] }]);
     }
   });
 
-  it('XAH is the native currency of the filters: it takes no issuer; XRP is an ordinary currency', async () => {
-    const account = 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8';
-    expect((await get(path(account, '/XRP'))).status).toBe(200);
-    expect((await get(path(account, '/XAH/XRP'))).status).toBe(200);
-    const csv = await get(`${path(account, '/xah/evr')}?format=csv`);
-    expect(csv.headers['content-disposition']).toBe(`attachment; filename=${account} - exchanges - XAH-EVR.csv`);
-    expect((await get(`${path(account)}?start=2030-01-01`)).body.count).toBe(0);
+  it('XAH is the native currency of the filters: alone it matches the native side, with an issuer it matches nothing', async () => {
+    const asStored = await get(`${path(TRADER_X)}?limit=1000`);
+    expect(asStored.body.exchanges).toEqual([
+      expect.objectContaining({
+        base_currency: 'EVR',
+        base_issuer: EVERNODE,
+        counter_currency: 'XAH',
+        tx_hash: row.tx_hash,
+      }),
+    ]);
+    expect(asStored.body.exchanges[0]).not.toHaveProperty('counter_issuer');
+
+    // XAH alone is the native currency, on either side: here the counter, so the trade is inverted
+    const xah = await get(path(TRADER_X, '/xah'));
+    expect(xah.body.count).toBe(1);
+    expect(xah.body.exchanges[0]).toMatchObject({
+      base_currency: 'XAH',
+      counter_currency: 'EVR',
+      counter_issuer: EVERNODE,
+      base_amount: '5',
+      counter_amount: '10',
+      buyer: EVERNODE,
+      seller: TRADER_X,
+      rate: '2.0000000',
+    });
+    expect(xah.body.exchanges[0]).not.toHaveProperty('base_issuer');
+    expect((await get(path(TRADER_X, `/XAH/EVR+${EVERNODE}`))).body.exchanges).toEqual(xah.body.exchanges);
+    expect((await get(path(TRADER_X, `/EVR+${EVERNODE}/XAH`))).body.exchanges).toEqual(asStored.body.exchanges);
+
+    // the native currency has no issuer, so XAH with one matches nothing; it is a filter, not a pair, so no 400
+    for (const filter of [`/XAH+${EVERNODE}`, `/XAH+${EVERNODE}/EVR`, `/EVR/XAH+${EVERNODE}`]) {
+      const res = await get(path(TRADER_X, filter));
+      expect([filter, res.status, res.body]).toEqual([filter, 200, { result: 'success', count: 0, exchanges: [] }]);
+    }
+    // XRP is an ordinary currency on Xahau: this account never traded it
+    for (const filter of ['/XRP', '/XRP/XAH', `/XAH/XRP`]) {
+      expect([filter, (await get(path(TRADER_X, filter))).body.count]).toEqual([filter, 0]);
+    }
+  });
+
+  it('the file name and the markers of a filtered list use XAH', async () => {
+    const csv = await get(`${path(TRADER_X, '/xah/evr')}?format=csv`);
+    expect(csv.headers['content-disposition']).toBe(`attachment; filename=${TRADER_X} - exchanges - XAH-EVR.csv`);
+    expect(csv.text.split('\n')).toHaveLength(2);
+    expect((await get(`${path(TRADER_X)}?start=2030-01-01`)).body.count).toBe(0);
+    const before = await get(`${path(TRADER_X)}?marker=${markerOf(row)}`);
+    expect(before.body.count).toBe(0);
   });
 });

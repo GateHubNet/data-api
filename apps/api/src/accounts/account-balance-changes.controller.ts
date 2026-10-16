@@ -15,10 +15,24 @@ import { accountWindow } from './account-window';
 import { BalanceChangeObject } from './balance-change-object';
 
 /**
- * The `change_type`s the original accepts (`types` of `accountBalanceChanges.js`). Its list leaves out the types of
- * escrows and payment channels, which the rows do carry, so those cannot be asked for (and are rejected, as there).
+ * The `change_type`s that can be asked for (R59). `types` of `accountBalanceChanges.js` lists the first five, but the
+ * rows carry five more (the parser writes `escrow_*` and `paychannel_*` exactly as the original's did) and the original
+ * answered `invalid change_type` for them, so no client could ever filter on a type it was served. All ten are accepted;
+ * the message lists them, and `fee` / `network fee` (what the original stored for the fee, which the filter never
+ * found) and other spellings are still rejected.
  */
-const CHANGE_TYPES = ['transaction_cost', 'exchange', 'intermediary', 'payment_source', 'payment_destination'];
+const CHANGE_TYPES = [
+  'transaction_cost',
+  'exchange',
+  'intermediary',
+  'payment_source',
+  'payment_destination',
+  'escrow_create',
+  'escrow_cancel',
+  'escrow_finish',
+  'paychannel_fund',
+  'paychannel_payout',
+];
 
 /**
  * The name of the CSV file, as `accountBalanceChanges.js` has it: `<address> - balance changes`, then ` <currency>`

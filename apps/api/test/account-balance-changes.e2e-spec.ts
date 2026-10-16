@@ -8,8 +8,8 @@ import { fixtureBalanceChanges } from './support/fixtures';
  * Xahau ledgers recorded from a public node (909: XAH, the EVR token, and the changes of GenesisMint, Cron, Remit
  * and URITokenBuy that have no change type).
  *
- * Ported from rippled-historical-database `test/test.account.balanceChanges.js` (all 13 `it`s, same titles, none
- * skipped). Four of them lean on HBase and are ported to what this API holds instead:
+ * Ported from rippled-historical-database `test/test.account.balanceChanges.js` (all 13 `it`s, none skipped; every title
+ * is the original's, word for word). Four of them lean on HBase and are ported to what this API holds instead:
  *  - the two 'should handle pagination correctly' walk the changes of the account one by one with `limit=1` and compare
  *    each with the unpaged list, as `utils.checkPagination` does; only the marker is this API's. The original compared
  *    `.change`, a field no row has (the field is `amount_change`), so it compared undefined with undefined; here
@@ -19,8 +19,9 @@ import { fixtureBalanceChanges } from './support/fixtures';
  *    node_index)` of the last row of the page;
  *  - 'should handle empty response correctly' passes a start of year 1015 and an end of 1970: nothing is stored there.
  *
- * Added: the shape of an item (field names, key order, what is left out when absent), `issuer` and `type` as aliases,
- * the values of `change_type`, the checks and their order, the shared list behaviour (empty range, marker pages,
+ * Added: the shape of an item (field names, key order, what is left out when absent; `paychannel_balance_change` is
+ * stored but never served, R61), `issuer` and `type` as aliases, every `change_type` the rows carry as a filter (R59:
+ * the original's list left out the escrow and payment channel types), the checks and their order, the shared list behaviour (empty range, marker pages,
  * descending, unknown params, limits), CSV and its file name, the query and its plan, rows that were written twice, the
  * failure paths and Xahau.
  */
@@ -32,6 +33,11 @@ const ESCROWER = 'rGhDCgik9CwiNpcNnYHkEHcMgw2dkLgtNB'; // 2 changes: the fee and
 const PAYEE = 'rnNzy3iPc7gPEAJbAdXwxY1UTBamBqTYhR'; // 4 changes: two PaymentChannelClaims paid out to it
 const BITSTAMP = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 const NOBODY = 'rrrrUBy92h6worVCYERZcVCzgzgmHb17Dx';
+
+/** The 400 of a `change_type` that is none of the types a row can have (R59: the five of the original and the five of escrows and payment channels). */
+const INVALID_CHANGE_TYPE =
+  'invalid change_type - use: transaction_cost, exchange, intermediary, payment_source, payment_destination, ' +
+  'escrow_create, escrow_cancel, escrow_finish, paychannel_fund, paychannel_payout';
 
 interface Key {
   ledger_index: number;
@@ -74,7 +80,6 @@ function changeOf(r: BalanceChangesRow): Record<string, unknown> {
     escrow_balance_change: r.escrow_balance_change ?? undefined,
     final_balance: r.final_balance,
     node_index: r.node_index === -1 ? undefined : r.node_index,
-    paychannel_balance_change: r.paychannel_balance_change ?? undefined,
     paychannel_final_balance: r.paychannel_final_balance ?? undefined,
     paychannel_fund_change: r.paychannel_fund_change ?? undefined,
     paychannel_fund_final_balance: r.paychannel_fund_final_balance ?? undefined,
@@ -259,8 +264,7 @@ describe('account balance changes API endpoint', () => {
     expect(res.status).toBe(400);
     expect(res.body).toEqual({
       result: 'error',
-      message:
-        'invalid change_type - use: transaction_cost, exchange, intermediary, payment_source, payment_destination',
+      message: INVALID_CHANGE_TYPE,
     });
   });
 
@@ -337,7 +341,6 @@ describe('account balance changes API endpoint', () => {
         'amount_change',
         'final_balance',
         'node_index',
-        'paychannel_balance_change',
         'paychannel_final_balance',
         'paychannel_fund_final_balance',
         'tx_index',
@@ -451,11 +454,13 @@ describe('account balance changes API endpoint', () => {
         .forEach((c, i) => {
           expect(c).toMatchObject({
             paychannel_counterparty: payout[i].paychannel_counterparty,
-            paychannel_balance_change: payout[i].paychannel_balance_change,
             paychannel_final_balance: payout[i].paychannel_final_balance,
             paychannel_fund_final_balance: payout[i].paychannel_fund_final_balance,
           });
           expect(c).not.toHaveProperty('paychannel_fund_change');
+          // stored (the payout was -0.223509) but never served: the original never wrote it to HBase (R61)
+          expect(payout[i].paychannel_balance_change).not.toBeNull();
+          expect(c).not.toHaveProperty('paychannel_balance_change');
           expect(c).not.toHaveProperty('escrow_counterparty');
         });
     });
@@ -551,18 +556,76 @@ describe('account balance changes API endpoint', () => {
       );
     });
 
-    it('the types the original does not list are rejected, even ones the data has (escrow, payment channel)', async () => {
-      for (const type of ['escrow_create', 'paychannel_payout', 'fee', 'network fee', 'Exchange', 'EXCHANGE']) {
+    it('the escrow and payment channel types can be asked for too (R59): the rows carry them, the original forgot them', async () => {
+      const escrow = await get(`${path(ESCROWER)}?change_type=escrow_create`);
+      expect(escrow.status).toBe(200);
+      expect(escrow.body.count).toBe(1);
+      expect(escrow.body.balance_changes).toEqual(
+        changesOf(rowsOf(ESCROWER).filter((r) => r.change_type === 'escrow_create')),
+      );
+      expect(escrow.body.balance_changes[0]).toMatchObject({
+        change_type: 'escrow_create',
+        escrow_balance_change: '100',
+      });
+
+      const payout = await get(`${path(PAYEE)}?change_type=paychannel_payout`);
+      expect(payout.status).toBe(200);
+      expect(payout.body.count).toBe(2);
+      expect(payout.body.balance_changes).toEqual(
+        changesOf(rowsOf(PAYEE).filter((r) => r.change_type === 'paychannel_payout')),
+      );
+
+      // the alias, and the other filters with it
+      const alias = await get(`${path(PAYEE)}?type=paychannel_payout&currency=xrp`);
+      expect(alias.body.balance_changes).toEqual(payout.body.balance_changes);
+      // the types the parser emits that the mock ledgers have no row of: valid, and empty
+      for (const type of ['escrow_cancel', 'escrow_finish', 'paychannel_fund']) {
+        expect(ROWS.some((r) => r.change_type === type)).toBe(false);
         const res = await get(`${path(ESCROWER)}${qs({ change_type: type })}`);
-        expect([type, res.status, res.body]).toEqual([
+        expect([type, res.status, res.body]).toEqual([type, 200, { result: 'success', count: 0, balance_changes: [] }]);
+      }
+      // an account without the type has none
+      expect((await get(`${path(ESCROWER)}?change_type=paychannel_payout`)).body.count).toBe(0);
+    });
+
+    it('every change type a row carries can be asked for', async () => {
+      const types = new Set(ROWS.map((r) => r.change_type).filter((t) => t !== ''));
+      expect([...types].sort()).toEqual(
+        [
+          'escrow_create',
+          'exchange',
+          'intermediary',
+          'paychannel_payout',
+          'payment_destination',
+          'payment_source',
+          'transaction_cost',
+        ].sort(),
+      );
+      for (const type of types) {
+        const account = (ROWS.find((r) => r.change_type === type) as BalanceChangesRow).account;
+        const res = await get(`${path(account)}${qs({ change_type: type, limit: 1000 })}`);
+        expect([type, res.status]).toEqual([type, 200]);
+        expect([type, res.body.balance_changes]).toEqual([
           type,
-          400,
-          {
-            result: 'error',
-            message:
-              'invalid change_type - use: transaction_cost, exchange, intermediary, payment_source, payment_destination',
-          },
+          changesOf(rowsOf(account).filter((r) => r.change_type === type)),
         ]);
+        expect(res.body.count).toBeGreaterThan(0);
+      }
+    });
+
+    it('anything else is rejected: the stored names of the old fee (fee, network fee), other cases, other words', async () => {
+      for (const type of [
+        'fee',
+        'network fee',
+        'Exchange',
+        'EXCHANGE',
+        'Escrow_Create',
+        'paychannel',
+        'escrow',
+        'payment',
+      ]) {
+        const res = await get(`${path(ESCROWER)}${qs({ change_type: type })}`);
+        expect([type, res.status, res.body]).toEqual([type, 400, { result: 'error', message: INVALID_CHANGE_TYPE }]);
       }
     });
 
@@ -613,10 +676,7 @@ describe('account balance changes API endpoint', () => {
         [`start=x&end=y&${bad}`, 'invalid start date format'],
         [`end=y&${bad}`, 'invalid end date format'],
         [bad, 'counterparty cannot be specified for XRP'],
-        [
-          'change_type=zzz&marker=!!!',
-          'invalid change_type - use: transaction_cost, exchange, intermediary, payment_source, payment_destination',
-        ],
+        ['change_type=zzz&marker=!!!', INVALID_CHANGE_TYPE],
         ['marker=!!!', 'invalid marker'],
       ];
       for (const [query, message] of cases) {

@@ -7,6 +7,10 @@ import { fmtTime } from '../common/format';
  * each sorted by name. A field the change does not have is left out: the fee has no node, the native currency no
  * counterparty, a change of most transaction types no change type, and only the change of a party to an escrow or a
  * payment channel has the `escrow_*` and `paychannel_*` fields. The account and the client are stripped.
+ *
+ * `paychannel_balance_change` is not served (R61): the parser computes it and the table keeps it, but the original's
+ * `prepareParsedData` never wrote it to HBase, so data.ripple.com never returned it. The other three
+ * `paychannel_*` amounts and `paychannel_counterparty` it did write.
  */
 export interface BalanceChangeObject {
   /** Whole units of the currency, exact. */
@@ -16,7 +20,6 @@ export interface BalanceChangeObject {
   final_balance: string;
   /** The node of the transaction's metadata the change comes from; the fee (a `transaction_cost`) has none. */
   node_index?: number;
-  paychannel_balance_change?: string;
   paychannel_final_balance?: string;
   paychannel_fund_change?: string;
   paychannel_fund_final_balance?: string;
@@ -34,7 +37,10 @@ export interface BalanceChangeObject {
   tx_hash: string;
 }
 
-/** The columns of `balance_changes` the API reads: what `StoredBalanceChange` holds, with the close time as unix seconds. */
+/**
+ * The columns of `balance_changes` the API reads: what `StoredBalanceChange` holds, with the close time as unix seconds.
+ * Not `paychannel_balance_change`, which is not served.
+ */
 export const BALANCE_CHANGE_COLUMNS = [
   'ledger_index',
   'tx_index',
@@ -52,7 +58,6 @@ export const BALANCE_CHANGE_COLUMNS = [
   'paychannel_fund_change',
   'paychannel_fund_final_balance',
   'paychannel_final_balance',
-  'paychannel_balance_change',
 ].join(', ');
 
 /** A row of `balance_changes` as `BALANCE_CHANGE_COLUMNS` reads it. The account, the Float64 shadow and the client are not read. */
@@ -74,7 +79,6 @@ export type StoredBalanceChange = Pick<
   | 'paychannel_fund_change'
   | 'paychannel_fund_final_balance'
   | 'paychannel_final_balance'
-  | 'paychannel_balance_change'
 >;
 
 /** The API object of a stored balance change. */
@@ -85,7 +89,6 @@ export function toBalanceChangeObject(row: StoredBalanceChange): BalanceChangeOb
     final_balance: row.final_balance,
     // the fee of a transaction is stored at node -1 and served with none (`delete row.node_index` of the original)
     ...(row.node_index !== -1 && { node_index: row.node_index }),
-    ...(row.paychannel_balance_change !== null && { paychannel_balance_change: row.paychannel_balance_change }),
     ...(row.paychannel_final_balance !== null && { paychannel_final_balance: row.paychannel_final_balance }),
     ...(row.paychannel_fund_change !== null && { paychannel_fund_change: row.paychannel_fund_change }),
     ...(row.paychannel_fund_final_balance !== null && {

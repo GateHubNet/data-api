@@ -20,14 +20,16 @@ const FEE: StoredBalanceChange = Object.freeze({
   paychannel_fund_change: null,
   paychannel_fund_final_balance: null,
   paychannel_final_balance: null,
-  paychannel_balance_change: null,
 });
 
 describe('BALANCE_CHANGE_COLUMNS', () => {
   it('reads the columns of a change, the close time as unix seconds, and neither the account nor the client', () => {
     const columns = BALANCE_CHANGE_COLUMNS.split(', ');
     expect(columns).toContain('toUnixTimestamp(close_time) AS close_time');
-    for (const column of ['account', 'client', 'final_balance_f']) expect(columns).not.toContain(column);
+    // `paychannel_balance_change` is stored but never served (see toBalanceChangeObject)
+    for (const column of ['account', 'client', 'final_balance_f', 'paychannel_balance_change']) {
+      expect(columns).not.toContain(column);
+    }
     expect(columns).toHaveLength(Object.keys(FEE).length);
   });
 });
@@ -44,14 +46,12 @@ describe('toBalanceChangeObject', () => {
       paychannel_fund_change: '-5',
       paychannel_fund_final_balance: '30',
       paychannel_final_balance: '8.5',
-      paychannel_balance_change: '-0.5',
     };
     expect(Object.keys(toBalanceChangeObject(full))).toEqual([
       'amount_change',
       'escrow_balance_change',
       'final_balance',
       'node_index',
-      'paychannel_balance_change',
       'paychannel_final_balance',
       'paychannel_fund_change',
       'paychannel_fund_final_balance',
@@ -111,14 +111,16 @@ describe('toBalanceChangeObject', () => {
       escrow_balance_change: '0',
       paychannel_fund_change: '0',
     });
-    for (const key of [
-      'paychannel_counterparty',
-      'paychannel_fund_final_balance',
-      'paychannel_final_balance',
-      'paychannel_balance_change',
-    ]) {
+    for (const key of ['paychannel_counterparty', 'paychannel_fund_final_balance', 'paychannel_final_balance']) {
       expect(served).not.toHaveProperty(key);
     }
+  });
+
+  it('never serves paychannel_balance_change, even when the row has it: the original never wrote it to HBase (R61)', () => {
+    const wide = { ...FEE, paychannel_balance_change: '-0.5' };
+    const served = toBalanceChangeObject(wide);
+    expect(served).not.toHaveProperty('paychannel_balance_change');
+    expect(Object.values(served)).not.toContain('-0.5');
   });
 
   it('does not serve the account, the client or the shadow, even when the row has them', () => {
