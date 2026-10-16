@@ -52,7 +52,8 @@ upstream between them; neither is shipped or tested here.
 
 Migrations are the `*.sql` files in `packages/shared/schema/`, applied in file-name order, each once, and recorded with a SHA-256
 checksum in `<database>.schema_migrations`. To change the schema add a new `NNN_*.sql` and run the migrate job
-(`dc run --rm migrate-xrpl && dc run --rm migrate-xahau`, or just `dc up -d`). **Never edit an applied file**: its changed
+(`dc run --rm migrate-xrpl && dc run --rm migrate-xahau`, or `dc up -d --scale api-xrpl=N --scale api-xahau=M` with your own scale
+flags: a plain `dc up -d` scales the apis back to 1). **Never edit an applied file**: its changed
 checksum is a hard error (`Migration ... was modified after being applied`). All DDL is `CREATE ... IF NOT EXISTS`, so a file that
 failed halfway can simply be run again. Run migrations as a one-shot step, not from every replica. Details:
 [data-model](data-model.md#5-migrations).
@@ -61,7 +62,7 @@ failed halfway can simply be run again. Run migrations as a one-shot step, not f
 
 `GH_API_KEYS` is comma separated and read at boot, so a change needs a restart of the apis. Rotate in two steps so that no client has to switch at the
 same instant: add the new key beside the old one in `deploy/.env.prod` (`old,new`) and `dc up -d` (repeat your `--scale` flags), move the clients,
-then remove the old key and `dc up -d` again. Each `up` recreates the apis of both networks together, i.e. a brief 502 from nginx (see
+then remove the old key and `dc up -d` again (with the same `--scale` flags). Each `up` recreates the apis of both networks together, i.e. a brief 502 from nginx (see
 [Deploy a new version](#deploy-a-new-version)). The API refuses to start with an empty list, or a key that is `dev-api-key` or starts with `change-me`.
 
 ### Rotate the ClickHouse password
@@ -188,7 +189,8 @@ visible to the API.
    remaining work. The stats of the current hour are stale until the sweep is over.
 4. **If the node no longer has the missing ledgers** (a non-full-history node: `complete_ledgers` of `server_info`), the syncer retries
    forever and the lag never falls. Point `GH_NODE_ENDPOINTS` at a full-history node (your own, or `wss://s2.ripple.com` for
-   XRPL), `dc up -d`, and it carries on.
+   XRPL), `dc up -d syncer-xrpl` (only that service: a plain `dc up -d` would also scale the apis back to 1; repeat your `--scale`
+   flags if you run a whole-stack `up`), and it carries on.
 5. A ClickHouse outage is handled the same way: writes fail, the runner recovers (waits for the failed queries, deletes the
    tail, writes again) and no ledger is lost or duplicated.
 
@@ -225,7 +227,8 @@ syncer in the same image. Full guidance on sizing and nodes: [backfill](backfill
 ```bash
 # a range of one network (the syncer keeps running; the CLI checks its lease itself)
 dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 --to 90100000
-dc run --rm --no-deps syncer-xahau node dist/cli/range-ingest.js --from 1 --to 100000 --concurrency 4
+# Xahau's public node throttles even one fetch at a time: 1 in flight (more only meets its pauses sooner; see backfill)
+dc run --rm --no-deps syncer-xahau node dist/cli/range-ingest.js --from 1 --to 100000 --concurrency 1 --chunk 100
 
 # after a parser change: rewrite committed ledgers (below the live checkpoint)
 dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 --to 90100000 --reprocess
@@ -235,7 +238,12 @@ dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 
   wrong command line.
 - **Speed:** `--concurrency` (ledgers of a chunk fetched at once) is bound by the node; `--chunk` (default 1000, must divide
   1,000,000) is the memory a run needs.
-- **Above the checkpoint:** refused while the live syncer's lease is fresh. Backfill is history.
+- **Above the checkpoint:** refused while the live syncer's lease is fresh. Backfill is history. A range that **starts** above the
+  checkpoint + 1 is refused on a database a live syncer has run on, fresh lease or not, unless `--allow-gap` (Ruling R110): the live
+  syncer resumes after the highest committed ledger, so the ledgers in between would never be fetched (and a live syncer that boots
+  while the range is written deletes everything above its checkpoint). Pass `--allow-gap` only for a gap you fill yourself next.
+- **Unfinished intents:** a rerun redoes the unfinished chunk of a run that died over its whole recorded range (also beyond the range
+  of the rerun), and marks the hours of all its committed ledgers in `agg_dirty` (Ruling R110).
 - **Aggregates follow by themselves:** every chunk marks `agg_dirty`, the aggregator recomputes the affected hours and days within
   its per-tick budgets. Watch `SELECT count() FROM xrpl.agg_dirty`.
 - **Do not** run two range ingests over overlapping ranges at once.

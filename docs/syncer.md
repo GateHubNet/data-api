@@ -169,9 +169,10 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 | --- | --- | --- |
 | `--from <n>`, `--to <n>` | required | Both inclusive. |
 | `--chunk <n>` | 1000 | Ledgers per chunk; must divide 1,000,000. A chunk is fetched and written as a whole, so it is also the memory the run needs. |
-| `--concurrency <n>` | 8 | Ledgers of a chunk fetched at once. On a public node 2 (see [backfill](backfill.md#public-nodes-and-rate-limits)). |
-| `--max-wait <s>` | 1200 | Seconds a chunk may go without a ledger arriving while its fetches wait for a rate-limited node (as long as it asks) or retry a ledger the node lacks right now (`lgrNotFound`, after 0.5 s doubling to 30 s). Every ledger fetched starts it again; past it the chunk fails (the log names `--max-wait`). |
+| `--concurrency <n>` | 8 | Ledgers of a chunk fetched at once. On XRPL's public nodes 2, on `wss://xahau.network` 1 (see [backfill](backfill.md#public-nodes-and-rate-limits)). |
+| `--max-wait <s>` | 1200 | Seconds a chunk may go without a ledger arriving while its fetches wait for a rate-limited node (as long as it asks) or retry a ledger the node lacks right now (`lgrNotFound`, after 0.5 s doubling to 30 s). Every ledger fetched starts it again; past it the chunk fails (the log names `--max-wait`). A pause the node asks for that is longer than it fails the chunk at once, and the log says so. |
 | `--reprocess` | off | Delete and rewrite ledgers that are already committed (after a parser change); default: skip them. |
+| `--allow-gap` | off | Allow a range that starts above the highest committed ledger + 1 on a database a live syncer has run on; refused by default because the live syncer would skip the ledgers in between (Ruling R110). |
 | `--run-id <id>` | random | Name of the run in `ingest_log` and in query ids (a per-invocation nonce is appended). Must not start with `live:`. |
 | `--help` | | Prints the usage. |
 
@@ -186,10 +187,13 @@ How it works (aligned chunks, `ingest_log` intents):
    untouched), the chunk is written with one `LedgerWriter.write()`, then `ingest_log` gets `done`.
 3. A chunk whose newest log row is `started` is an **unfinished intent**: a run died (or gave up) in the middle of it. The next run
    whose range overlaps it waits for that run's queries to be gone, then, **before its own chunks**, redoes the intent over its
-   whole recorded range, whatever `--chunk` is now (overlapping intents as one range): a ledger committed in the range is complete
-   and stays as it is; the uncommitted ledgers it would ingest there are fetched and dry-parsed, then every uncommitted span of
-   the range is deleted (with the child rows a crashed write left) and they are written; then the intent gets `done`. So an
-   intent is redone once, not by every run after it, and changing `--chunk` between runs is safe.
+   whole recorded range, whatever `--chunk` and the range of this run are (overlapping intents as one range): a ledger committed in
+   the range is complete and stays as it is; every other ledger of the recorded range is fetched and dry-parsed, also those
+   outside `--from`..`--to` (an index-list run of the API keeps to its listed ledgers inside its own range), then every uncommitted
+   span of the range is deleted (with the child rows a crashed write left) and they are written; the intent gets `done`, and the
+   hours of all the committed ledgers of the range are marked in `agg_dirty` (Ruling R110: the run that died may have committed
+   some and never marked them). So an intent is redone once, not by every run after it, and changing `--chunk` or narrowing the
+   range between runs is safe.
 4. Every written chunk marks its hour range in **`agg_dirty`** so the aggregator recomputes the stats and daily volumes. Committed
    ledgers a run skipped get one row at the end.
 5. A failed attempt is recovered like a failed live write (wait for the queries, delete the chunk, new `runId`); a chunk gets 3
@@ -199,7 +203,10 @@ How it works (aligned chunks, `ingest_log` intents):
    chunk fails, the fetches that wait are woken and the attempt ends at once. A ledger the parser rejects (`Cannot parse ledger <n>: ...`) and a live syncer that appeared are not
    retried: they stop the run.
 6. **The live syncer owns everything above its checkpoint.** A range that reaches above the committed checkpoint is refused while
-   the syncer's lease is fresh (< 30 s), and this is re-checked per chunk. Backfill is history: below the checkpoint.
+   the syncer's lease is fresh (< 30 s), and this is re-checked per chunk. Backfill is history: below the checkpoint. On a database
+   a live syncer has run on (a `syncer_lease` row), a range that starts above the checkpoint + 1 is refused even with the lease
+   released, unless `--allow-gap`: the live syncer resumes after the highest committed ledger and would never fetch the ledgers in
+   between (Ruling R110).
 7. `--reprocess` rewrites the whole requested range; it fetches and dry-parses before it deletes anything.
 
 Do not run two range ingests over overlapping ranges at the same time. Throughput is bound first by the node, then by

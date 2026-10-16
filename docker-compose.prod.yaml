@@ -30,7 +30,8 @@
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
 #     node dist/cli/range-ingest.js --from 90000000 --to 90100000
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xahau \
-#     node dist/cli/range-ingest.js --from 1 --to 100000 --concurrency 4
+#     node dist/cli/range-ingest.js --from 1 --to 100000 --concurrency 1 --chunk 100
+# (wss://xahau.network throttles even one fetch at a time: one in flight; more only meets its pauses sooner. docs/backfill.md)
 #
 # Apply the migrations by hand (they also run on every `up`, as part of the start order; all DDL is idempotent):
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl

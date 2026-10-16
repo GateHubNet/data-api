@@ -54,6 +54,12 @@ choice) so the head stays current, then backfill the history **below** the ledge
 
 A range that runs into ledgers already committed simply skips them (unless `--reprocess`).
 
+A range must not **start** above the highest committed ledger + 1 on a database a live syncer has run on (it has a `syncer_lease`
+row): the live syncer resumes after the highest committed ledger, so the ledgers between its checkpoint and `--from` would never be
+fetched, and a live syncer that boots while the range is written deletes the ledgers above its checkpoint. Such a range is refused
+(`Range [a,b] starts above the live checkpoint c + 1 ...`) unless `--allow-gap` is given, for a gap you then fill with another range
+ingest (Ruling R110). A database filled by range ingests only (no lease row) is not checked.
+
 ### Throughput
 
 - Each ledger is one expanded `ledger` request, so throughput is bound by the node's latency and rate limits, not by ClickHouse
@@ -68,9 +74,12 @@ A range that runs into ledgers already committed simply skips them (unless `--re
 
 ### Resuming, gap repair, reprocessing
 
-- **Resume:** rerun the same command, or one with another `--chunk`: finished chunks (`ingest_log` `done`) are skipped, and an
-  unfinished one (an intent a failed or killed run left `started`) is redone over its whole recorded range first and closed (its
-  committed ledgers are kept, the rest is cleaned and written), so it is redone once whatever the chunk size of the rerun.
+- **Resume:** rerun the same command, or one with another `--chunk` or a narrower range: finished chunks (`ingest_log` `done`) are
+  skipped, and an unfinished one (an intent a failed or killed run left `started`) is redone over its whole recorded range first and
+  closed: its committed ledgers are kept, every other ledger of the recorded range is cleaned and written, also those outside the
+  range of the rerun, and the hours of all its committed ledgers are marked in `agg_dirty` (the run that died may have committed
+  some and never marked them). It is redone once, whatever the chunk size or range of the rerun (Rulings R100, R110). The redo
+  fetches the ledgers of the recorded range from the same node as the rest, so a rerun can fetch more than it names.
 - **Gaps:** find them with the SQL in [operations](operations.md#sql-health-checks) and ingest exactly those ranges.
 - **Reprocess:** after a parser change (the `parser_version` of `ledgers` records which parser wrote a ledger),
   `--reprocess --from A --to B` fetches and dry-parses first, then deletes and rewrites the committed ledgers of the range.
@@ -88,8 +97,10 @@ endpoint of `GH_NODE_ENDPOINTS` is used meanwhile), and range-ingest waits for i
 failing. A chunk fails only when `--max-wait` seconds pass without any of its ledgers arriving: every ledger fetched starts that time
 again, however long the chunk takes in all. What keeps it moving:
 
-- `--concurrency 2`: Xahau ledgers are about 260 KB, and `wss://xahau.network` throttles even one fetch at a time (the live
-  re-check of Task 38 saw 2 to 3 ledgers per 10-second window at concurrency 1); more in flight only meets the pauses sooner.
+- `--concurrency 1`: Xahau ledgers are about 260 KB, and `wss://xahau.network` throttles even one fetch at a time (the live
+  re-check of Task 38 saw 2 to 3 ledgers per 10-second window at concurrency 1); more in flight only meets the pauses sooner and
+  spends the quota on fetches that are refused. On XRPL's public nodes 2 is fine (`wss://s2.ripple.com` did not throttle a first
+  sync at 2).
 - `--chunk 100`: a chunk is written only once all of its ledgers are in, and a chunk that fails (a ledger the node lacks, or a
   pause longer than `--max-wait`) is redone by the next run; a small chunk keeps both the memory and that redo cheap.
 - `--max-wait` longer than the pauses the node asks for. The 10-second quota asks for seconds. The hourly quota asked for about
@@ -103,7 +114,7 @@ Example for a few days of Xahau history from the public node:
 
 ```bash
 GH_ENV=local GH_NETWORK=xahau pnpm --filter @gatehub/data-syncer ingest:range \
-  --from 26505727 --to 26570726 --concurrency 2 --chunk 100 --max-wait 1200
+  --from 26505727 --to 26570726 --concurrency 1 --chunk 100 --max-wait 1200
 ```
 
 ## 2. Which node?

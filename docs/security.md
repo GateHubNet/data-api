@@ -168,7 +168,9 @@ Production compose (`docker-compose.prod.yaml`):
 
 - [x] API-key authentication (two header forms), global, before the rate limit; constant-time comparison.
 - [x] Production boot refuses an empty key list and the placeholder keys.
-- [x] Zero-downtime key rotation (several keys accepted).
+- [x] Key rotation without a flag day: several keys are accepted at once, so clients move to the new key at their own pace. Each
+  change of `GH_API_KEYS` restarts the apis, which compose recreates together: a brief 502 per network, not zero downtime (see
+  [operations](operations.md#rotate-an-api-key)).
 - [x] TLS at the front proxy; the client address recovered by nginx from trusted proxies only and handed on as one address.
 - [x] Per-client-and-route rate limit (429), case-insensitive path handling.
 - [x] Strict hand-written parameter parsers with the original's messages; fully parameterised ClickHouse queries.
