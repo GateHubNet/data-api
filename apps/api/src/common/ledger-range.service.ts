@@ -47,8 +47,10 @@ export class LedgerRangeResolver {
    * and a window that holds no ledger (never an error: the endpoints answer `count: 0`).
    */
   async resolve(start?: Date, endExclusive?: Date): Promise<{ min: number; max: number } | null> {
-    // Both dates are checked before any query is sent.
-    const from = start === undefined ? undefined : seconds(start, Math.ceil);
+    // Both dates are checked before any query is sent. A start with milliseconds is the second it falls in, as the
+    // row keys of the original were (`hbaseFormatStartRow` cut the date to the second; R54): the ledgers that closed in
+    // that second are in the window. The end is exclusive: closed < 12:00:20.5 is closed < 12:00:21.
+    const from = start === undefined ? undefined : seconds(start, Math.floor);
     const before = endExclusive === undefined ? undefined : seconds(endExclusive, Math.ceil);
     const [min, max] = await Promise.all([
       from === undefined ? this.firstLedger() : this.firstClosedFrom(from),

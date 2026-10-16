@@ -428,6 +428,15 @@ describe('transactions API endpoint', () => {
       }
     });
 
+    it('a start with milliseconds is the second it falls in, as the row keys of the original were (R54)', async () => {
+      const second = closedBetween('2015-01-14T18:27:10', '2015-01-14T18:27:11');
+      expect(second.length).toBeGreaterThan(0);
+      const listed = (
+        await pages(`/v2/transactions${qs({ start: '2015-01-14T18:27:10.750Z', end: '2015-01-14T18:27:20Z' })}`, 100)
+      ).flatMap(hashesIn);
+      expect(listed).toEqual(hashesOf(closedBetween('2015-01-14T18:27:10', '2015-01-14T18:27:21')));
+    });
+
     it('start defaults to 2013-01-01', async () => {
       expect(hashesIn((await get('/v2/transactions?limit=5')).body)).toEqual(hashesOf(ALL.slice(0, 5)));
       expect(hashesIn((await get('/v2/transactions?limit=5&start=')).body)).toEqual(hashesOf(ALL.slice(0, 5)));

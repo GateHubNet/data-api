@@ -95,13 +95,14 @@ describe('LedgerRangeResolver', () => {
       expect(await resolver.resolve(at('2015-01-14T12:00:20Z'), at('2015-01-14T12:00:10Z'))).toBeNull(); // start after end
     });
 
-    it('treats a fractional bound as the whole-second close times see it', async () => {
+    it('truncates a start with milliseconds to its second, as the row keys of the original did (R54)', async () => {
       const resolver = new LedgerRangeResolver(chWith(LEDGERS).ch);
-      // closed >= 12:00:10.001 is closed >= 12:00:11; closed < 12:00:20.5 is closed < 12:00:21
+      // start 12:00:10.001 is the second 12:00:10, which ledger 11 closed in; closed < 12:00:20.5 is closed < 12:00:21
       expect(await resolver.resolve(at('2015-01-14T12:00:10.001Z'), at('2015-01-14T12:00:20.500Z'))).toEqual({
-        min: 12,
+        min: 11,
         max: 13,
       });
+      expect(await resolver.resolve(at('2015-01-14T12:00:10.999Z'))).toEqual({ min: 11, max: 14 });
     });
 
     it('binds the bounds as seconds parameters and never writes them into the SQL', async () => {
