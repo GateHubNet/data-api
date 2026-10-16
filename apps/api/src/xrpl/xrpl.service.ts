@@ -5,6 +5,8 @@ import {
   NodeClientOptions,
   NodeRequestOptions,
   NodeServerInfo,
+  nodeThrottle,
+  NodeThrottledError,
   ShutdownSignals,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, OnModuleDestroy, Optional } from '@nestjs/common';
@@ -37,6 +39,10 @@ export const NODE_CLIENT_FACTORY = Symbol('NODE_CLIENT_FACTORY');
  *
  * Errors of the node itself (`RippledError`: `actNotFound`, `lgrNotFound`, ...) are rethrown unchanged, as the
  * `NodeClient` does. No `api_version` is sent: both servers default to v1.
+ *
+ * While every endpoint is paused because the node asked this process to slow down (ruling R98, the process-wide
+ * `nodeThrottle`), a request fails at once with `NodeThrottledError`: it neither waits out the request timeout nor makes
+ * a new client that would knock at the node again.
  */
 @Injectable()
 export class XrplService implements OnModuleDestroy {
@@ -66,6 +72,10 @@ export class XrplService implements OnModuleDestroy {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async request<T = any>(req: Record<string, unknown>, opts: NodeRequestOptions = {}): Promise<T> {
     if (this.stopped) throw new Error('XrplService is stopped');
+    const paused = nodeThrottle.waitMs(this.endpoints);
+    if (paused > 0) {
+      throw new NodeThrottledError(this.endpoints, paused, 'the node asked this process to slow down');
+    }
     const timeoutMs = opts.timeoutMs ?? NODE_REQUEST_TIMEOUT_MS;
     const client = await this.connected(timeoutMs);
     return client.request<T>(req, { timeoutMs, retries: opts.retries ?? NODE_REQUEST_RETRIES });

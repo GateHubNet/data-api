@@ -1,3 +1,4 @@
+import { nodeThrottle } from '@gatehub/data-api-shared';
 import { PrometheusService } from './prometheus.service';
 
 describe('PrometheusService', () => {
@@ -21,5 +22,21 @@ describe('PrometheusService', () => {
     expect(metrics).toContain('# TYPE api_tx_encode_fallback_total counter');
     expect(metrics).toContain('api_tx_encode_fallback_total{mode="json"} 1');
     expect(metrics).toContain('api_tx_encode_fallback_total{mode="binary"} 2');
+  });
+
+  it('counts every pause a rate-limited node asked for, by endpoint host (no credentials, no default port; ruling R98)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    const endpoint = 'wss://user:secret@api-node.example:443/ws';
+    try {
+      nodeThrottle.pause(endpoint, new Error('rate limit: units quota (50000 per 10s) exhausted, retry in ~5000ms'));
+      nodeThrottle.pause(endpoint, new Error('rate limit: retry in ~6000ms')); // the same pause, extended: not counted
+      const text = await service.getMetrics();
+      expect(text).toMatch(/^# TYPE api_node_rate_limited_total counter$/m);
+      expect(text).toMatch(/^api_node_rate_limited_total\{endpoint="api-node.example"\} 1$/m);
+      expect(text).not.toContain('secret');
+    } finally {
+      nodeThrottle.clear();
+    }
   });
 });

@@ -32,7 +32,7 @@ truth are
 | --- | --- | --- |
 | `GH_ENV` | unset | Any non-empty value: do not load an env file, the environment is the configuration. Set by both images. |
 | `GH_NETWORK` | `xrpl` | `xrpl` or `xahau`. Also read by `migrate` and `range-ingest`. |
-| `GH_NODE_ENDPOINTS` | the public endpoint of the network (`wss://xrplcluster.com`, `wss://xahau.network`) | Comma separated `ws://` / `wss://` URLs of rippled / xahaud, tried in order with failover. **API:** the live-state endpoints (balances, orders). **Syncer:** the ingest source (and the fee poller). A Xahau process never falls back to an XRPL node. For full-history ingest point it at your own node or at a full-history server such as `wss://s2.ripple.com`. Credentials in a URL are never logged: logs show only `scheme://host:port`. |
+| `GH_NODE_ENDPOINTS` | the public endpoints of the network (XRPL `wss://s2.ripple.com,wss://xrplcluster.com`, Xahau `wss://xahau.network`) | Comma separated `ws://` / `wss://` URLs of rippled / xahaud, tried in order with failover. A node that answers with a rate limit (`retry in ~<N>ms`, `slowDown`, `tooBusy`) gets nothing from the process, no request and no connection attempt, for as long as it asked (at most 20 min; 10 s without a hint); another endpoint of the list is used meanwhile. **API:** the live-state endpoints (balances, orders). **Syncer:** the ingest source (and the fee poller). A Xahau process never falls back to an XRPL node. For full-history ingest point it at your own node or at a full-history server such as `wss://s2.ripple.com`. Credentials in a URL are never logged: logs show only `scheme://host:port`. |
 | `GH_HTTP_API_PORT` | API `3001`, syncer `3002` | The main HTTP port: the REST API and the probe (API), the probe (syncer). 1-65535. |
 | `GH_METRICZ_PORT` | `3000` | Prometheus `GET /metricz` on a second HTTP app. 1-65535. |
 
@@ -75,7 +75,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_WORKERS` | `ingest,validations,fee_stats,aggregator` | Comma separated subset of the four workers; empty runs none. An unknown name fails the boot (`Unknown worker "x"`). Run **exactly one syncer per network and database**; see [syncer](syncer.md). |
 | `GH_SYNC_START_LEDGER` | unset: the validated head at the first boot | Where the very first run starts. **Ignored once the database has a committed ledger.** |
 | `GH_LEDGER_FETCH_TIMEOUT_MS` | `120000` | Timeout of one expanded `ledger` request (a busy ledger is big). |
-| `GH_CATCHUP_CONCURRENCY` | `8` | Ledgers the **live runner** fetches in parallel while catching up. It is not read by `range-ingest`, which has its own `--concurrency` flag (default 8). Raise either with your own node; public clusters need less. |
+| `GH_CATCHUP_CONCURRENCY` | `4` | Ledgers the **live runner** fetches in parallel while catching up. 4 stays under the rate limits of the public nodes for a first sync; raise it with your own node. It is not read by `range-ingest`, which has its own `--concurrency` flag (default 8; see [backfill](backfill.md#public-nodes-and-rate-limits) for public nodes). |
 | `GH_CATCHUP_FLUSH_LEDGERS` | `300` | A catch-up batch is written when it holds this many ledgers ... |
 | `GH_CATCHUP_FLUSH_TXS` | `100000` | ... or this many transactions ... |
 | `GH_CATCHUP_FLUSH_MS` | `5000` | ... or when its first ledger is this old, whichever comes first. In live mode every ledger is its own commit. |
@@ -98,7 +98,7 @@ variables above, per network.
 
 | Variable | Used in | Default | Becomes |
 | --- | --- | --- | --- |
-| `XRPL_NODE_ENDPOINTS`, `XAHAU_NODE_ENDPOINTS` | prod, dev | `wss://xrplcluster.com`, `wss://xahau.network` | `GH_NODE_ENDPOINTS` of the network's syncer **and** api |
+| `XRPL_NODE_ENDPOINTS`, `XAHAU_NODE_ENDPOINTS` | prod, dev | `wss://s2.ripple.com,wss://xrplcluster.com`, `wss://xahau.network` | `GH_NODE_ENDPOINTS` of the network's syncer **and** api |
 | `XRPL_VALIDATION_ENDPOINTS`, `XAHAU_VALIDATION_ENDPOINTS` | prod, dev | empty (= the node endpoints) | `GH_VALIDATION_ENDPOINTS` of the syncer |
 | `XRPL_SYNC_START_LEDGER`, `XAHAU_SYNC_START_LEDGER` | prod, dev | empty (= the validated head) | `GH_SYNC_START_LEDGER` of the syncer |
 | `XRPL_MARKETS_CONFIG`, `XAHAU_MARKETS_CONFIG` | prod | empty (= the shipped file) | `GH_MARKETS_CONFIG` of the syncer; the file must be mounted into the container (a commented `volumes:` line shows how) |

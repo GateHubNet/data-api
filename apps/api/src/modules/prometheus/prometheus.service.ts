@@ -1,3 +1,4 @@
+import { nodeThrottle, ThrottlePause } from '@gatehub/data-api-shared';
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { collectDefaultMetrics, Counter, Histogram, Registry } from 'prom-client';
 
@@ -31,6 +32,16 @@ const txEncodeFallback = new Counter({
   registers: [registry],
 });
 
+const nodeRateLimited = new Counter({
+  name: 'api_node_rate_limited_total',
+  help: 'Pauses a node asked for with a rate-limit answer (nothing is sent to it while one lasts), by endpoint host.',
+  labelNames: ['endpoint'] as const,
+  registers: [registry],
+});
+
+// Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
+nodeThrottle.on('pause', (pause: ThrottlePause) => nodeRateLimited.inc({ endpoint: pause.host }));
+
 let defaultMetricsCollected = false;
 
 @Injectable()
@@ -40,6 +51,8 @@ export class PrometheusService implements OnModuleInit {
   readonly httpDuration = httpDuration;
   /** `mode` is `json` or `binary`: the kind of response that fell back. */
   readonly txEncodeFallback = txEncodeFallback;
+  /** Pauses that rate-limited nodes asked for, by endpoint host. */
+  readonly nodeRateLimited = nodeRateLimited;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

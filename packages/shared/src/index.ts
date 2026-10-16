@@ -21,6 +21,7 @@ export * from './network';
 
 // Node connection
 export * from './xrpl/node-client';
+export * from './xrpl/node-throttle';
 
 // Nest helpers
 export * from './nest/shutdown-signals';

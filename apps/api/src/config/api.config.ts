@@ -73,7 +73,7 @@ export class ApiConfig {
   @ConfigValue()
   @NodeEndpoints()
   @IsEndpointList()
-  nodeEndpoints: string = 'wss://xrplcluster.com';
+  nodeEndpoints: string = 'wss://s2.ripple.com,wss://xrplcluster.com';
 
   /**
    * `GH_API_KEYS`: comma separated API keys, sent as `X-API-Key` or `Authorization: Bearer`. Empty disables the

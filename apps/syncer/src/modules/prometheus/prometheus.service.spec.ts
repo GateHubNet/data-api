@@ -1,3 +1,4 @@
+import { nodeThrottle } from '@gatehub/data-api-shared';
 import { PrometheusService } from './prometheus.service';
 
 describe('PrometheusService', () => {
@@ -76,5 +77,21 @@ describe('PrometheusService', () => {
     const service = new PrometheusService();
     service.onModuleInit();
     expect(await service.getMetrics()).toMatch(/^syncer_process_cpu_user_seconds_total /m);
+  });
+
+  it('counts every pause a rate-limited node asked for, by endpoint host (no credentials, no default port; ruling R98)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    const endpoint = 'wss://user:secret@syncer-node.example:443/ws';
+    try {
+      nodeThrottle.pause(endpoint, new Error('rate limit: units quota (50000 per 10s) exhausted, retry in ~5000ms'));
+      nodeThrottle.pause(endpoint, new Error('rate limit: retry in ~6000ms')); // the same pause, extended: not counted
+      const text = await service.getMetrics();
+      expect(text).toMatch(/^# TYPE syncer_node_rate_limited_total counter$/m);
+      expect(text).toMatch(/^syncer_node_rate_limited_total\{endpoint="syncer-node.example"\} 1$/m);
+      expect(text).not.toContain('secret');
+    } finally {
+      nodeThrottle.clear();
+    }
   });
 });

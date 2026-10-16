@@ -1,4 +1,11 @@
-import { ClickHouseService, FeeStatsRow, NodeClient, ShutdownSignals, Table } from '@gatehub/data-api-shared';
+import {
+  ClickHouseService,
+  FeeStatsRow,
+  NodeClient,
+  retryAfterMsOf,
+  ShutdownSignals,
+  Table,
+} from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { NODE_CLIENT } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
@@ -113,7 +120,8 @@ function describe(err: unknown): string {
  * - **Overlap-safe.** A tick that finds the previous sample still in flight (a slow node, a slow insert) is skipped and
  *   logged; samples never run side by side, so they never reach ClickHouse out of order.
  * - **Never crashes.** A failed sample (node unreachable, odd answer, ClickHouse refusing the insert) is logged and
- *   counted in `syncer_fee_stats_errors_total`; the next tick tries again. A written sample counts in
+ *   counted in `syncer_fee_stats_errors_total`; the next tick tries again. A sample a rate-limited node held back
+ *   (`NodeThrottledError`) is counted but not logged: the node client logs each pause once. A written sample counts in
  *   `syncer_fee_stats_samples_total`.
  * - **Stops on shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it, and a sample
  *   whose node answer arrives after it is dropped, not written. The stop waits for the sample in flight for at most
@@ -199,7 +207,9 @@ export class FeeStatsPoller implements OnApplicationBootstrap, OnModuleDestroy {
           this.logger.log(`Dropped the fee stats sample in flight at shutdown: ${describe(err)}`);
         } else {
           this.metrics?.feeStatsErrorsTotal.inc();
-          this.logger.error(`Fee stats sample failed: ${describe(err)}`);
+          // A rate-limited node (ruling R98): the node client logged the pause once; the samples it holds back are
+          // only counted.
+          if (retryAfterMsOf(err) === 0) this.logger.error(`Fee stats sample failed: ${describe(err)}`);
         }
       } finally {
         this.inFlight = undefined;

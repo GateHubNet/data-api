@@ -3,6 +3,7 @@ import { AddressInfo } from 'net';
 import { WebSocket, WebSocketServer } from 'ws';
 import { getNetworkProfile } from '../network';
 import { assertNetwork, NodeClient, NodeClientOptions } from './node-client';
+import { EndpointThrottle, NodeThrottledError, throttleHint } from './node-throttle';
 
 type Json = Record<string, any>;
 /** A handler returns the `result`, or `{ error, error_message? }` for a rippled error response. */
@@ -323,5 +324,142 @@ describe('NodeClient', () => {
     expect(() => assertNetwork({ network_id: 0 }, getNetworkProfile('xrpl'))).not.toThrow();
     expect(() => assertNetwork(info, getNetworkProfile('xahau'))).not.toThrow();
     expect(() => assertNetwork({ network_id: 21338 }, getNetworkProfile('xahau'))).not.toThrow();
+  });
+
+  describe("a node's rate-limit answers (ruling R98)", () => {
+    const limited = (ms: number) => ({
+      error: 'slowDown',
+      error_message: `rate limit: units quota (50000 per 10s) exhausted, retry in ~${ms}ms`,
+    });
+
+    /** A throttle of its own, so that no test sees another test's pauses; `pauses` records each pause it starts. */
+    function throttle(opts: ConstructorParameters<typeof EndpointThrottle>[0] = {}) {
+      const t = new EndpointThrottle(opts);
+      const pauses: Array<{ endpoint: string; ms: number }> = [];
+      t.on('pause', (event: { endpoint: string; ms: number }) => pauses.push(event));
+      return { t, pauses };
+    }
+
+    it('pauses the endpoint until the hint expires: no request reaches it meanwhile, then it is used again', async () => {
+      const node = await mockNode();
+      let answers = 0;
+      node.handlers.ledger = () => (answers++ === 0 ? limited(400) : { ledger_index: 7 });
+      const { t, pauses } = throttle();
+      const client = nodeClient([node.url], { throttle: t });
+      await client.start();
+
+      const first = await client.request({ command: 'ledger' }).catch((err: unknown) => err);
+      expect(first).toBeInstanceOf(NodeThrottledError);
+      expect((first as NodeThrottledError).retryAfterMs).toBeGreaterThanOrEqual(400);
+      expect((first as NodeThrottledError).retryAfterMs).toBeLessThanOrEqual(1_000);
+      expect((first as Error).message).toContain('retry in ~400ms');
+
+      // While paused: refused at once, nothing is sent.
+      await expect(client.request({ command: 'ledger' })).rejects.toBeInstanceOf(NodeThrottledError);
+      await expect(client.request({ command: 'server_info' })).rejects.toBeInstanceOf(NodeThrottledError);
+      expect(node.commands('ledger')).toHaveLength(1);
+      expect(node.commands('server_info')).toHaveLength(0);
+
+      await delay(800);
+      await expect(client.request({ command: 'ledger' })).resolves.toEqual({ ledger_index: 7 });
+      expect(node.commands('ledger')).toHaveLength(2);
+      // One pause, logged once with the remaining time.
+      expect(pauses).toEqual([
+        { endpoint: node.url, host: expect.any(String), ms: expect.any(Number), reason: expect.any(String) },
+      ]);
+      expect(warnings.filter((w) => /rate limit/i.test(w))).toHaveLength(1);
+      expect(warnings.find((w) => /rate limit/i.test(w))).toMatch(/for \d+(\.\d+)? s/);
+      expect(node.connections).toBe(1); // the connection itself is kept
+    });
+
+    it('treats slowDown and tooBusy without a hint as a pause of the default length', async () => {
+      for (const error of ['slowDown', 'tooBusy']) {
+        const node = await mockNode();
+        node.handlers.fee = () => ({ error });
+        const { t } = throttle({ defaultPauseMs: 300 });
+        const client = nodeClient([node.url], { throttle: t });
+        await client.start();
+        const err = (await client.request({ command: 'fee' }).catch((e: unknown) => e)) as NodeThrottledError;
+        expect(err).toBeInstanceOf(NodeThrottledError);
+        expect(err.retryAfterMs).toBeGreaterThan(200);
+        expect(err.retryAfterMs).toBeLessThanOrEqual(300);
+        await expect(client.request({ command: 'fee' })).rejects.toBeInstanceOf(NodeThrottledError);
+        expect(node.commands('fee')).toHaveLength(1);
+      }
+    });
+
+    it('caps a pause at maxPauseMs', async () => {
+      const node = await mockNode();
+      node.handlers.ledger = () => limited(929_624);
+      const { t } = throttle({ maxPauseMs: 500 });
+      const client = nodeClient([node.url], { throttle: t });
+      await client.start();
+      const err = (await client.request({ command: 'ledger' }).catch((e: unknown) => e)) as NodeThrottledError;
+      expect(err.retryAfterMs).toBeLessThanOrEqual(500);
+      await delay(600);
+      expect(t.waitMs([node.url])).toBe(0);
+    });
+
+    it('fails over to another endpoint while one is paused, and does not go back to it before the pause ends', async () => {
+      const a = await mockNode();
+      const b = await mockNode();
+      a.handlers.ledger = () => limited(5_000);
+      b.handlers.ledger = () => ({ ledger_index: 8 });
+      const { t } = throttle();
+      const client = nodeClient([a.url, b.url], { throttle: t });
+      await client.start();
+      expect(client.currentEndpoint).toBe(a.url);
+
+      await expect(client.request({ command: 'ledger' })).resolves.toEqual({ ledger_index: 8 });
+      expect(client.currentEndpoint).toBe(b.url);
+      for (let i = 0; i < 3; i++) await client.request({ command: 'ledger' });
+      expect(a.commands('ledger')).toHaveLength(1);
+      expect(b.commands('ledger')).toHaveLength(4);
+
+      // b drops: the client must not reconnect to a while a is paused.
+      b.handlers.ledger = () => limited(5_000);
+      await expect(client.request({ command: 'ledger' })).rejects.toBeInstanceOf(NodeThrottledError);
+      await delay(200);
+      expect(a.connections).toBe(1);
+    });
+
+    it('does not even connect to a paused endpoint: a connection refused with the rate-limit text pauses it', async () => {
+      const node = await mockNode();
+      let refusals = 1;
+      node.handlers.subscribe = () => (refusals-- > 0 ? limited(400) : {});
+      const { t, pauses } = throttle();
+      const client = nodeClient([node.url], { throttle: t });
+      await client.subscribe(['ledger']); // recorded: sent with the connect
+      const started = Date.now();
+      await client.start();
+      // The first attempt was refused; the next one waited for the hint instead of the 50 ms backoff.
+      expect(Date.now() - started).toBeGreaterThanOrEqual(350);
+      expect(node.connections).toBe(2);
+      expect(pauses).toHaveLength(1);
+      expect(warnings.some((w) => /Cannot connect/.test(w) && /rate limit/.test(w))).toBe(true);
+    });
+
+    it('shares a pause between the clients of one throttle (the process): a second client sends nothing either', async () => {
+      const node = await mockNode();
+      node.handlers.ledger = () => limited(5_000);
+      const { t } = throttle();
+      const one = nodeClient([node.url], { throttle: t });
+      const two = nodeClient([node.url], { throttle: t });
+      await one.start();
+      await two.start();
+      await expect(one.request({ command: 'ledger' })).rejects.toBeInstanceOf(NodeThrottledError);
+      await expect(two.request({ command: 'ledger' })).rejects.toBeInstanceOf(NodeThrottledError);
+      expect(node.commands('ledger')).toHaveLength(1);
+    });
+
+    it('reads the hint of the answer texts the public nodes send', () => {
+      expect(throttleHint(new Error('rate limit: units quota (10000 per 60s) exhausted, retry in ~109117ms'))).toEqual({
+        retryInMs: 109_117,
+      });
+      expect(throttleHint({ data: { error: 'slowDown' } })).toEqual({});
+      expect(throttleHint(new Error('Unexpected server response: 429'))).toEqual({});
+      expect(throttleHint(new Error('timeout'))).toBeUndefined();
+      expect(throttleHint({ data: { error: 'lgrNotFound' } })).toBeUndefined();
+    });
   });
 });

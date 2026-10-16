@@ -1,4 +1,11 @@
-import { ClickHouseService, FeeStatsRow, NodeClient, ShutdownSignals, Table } from '@gatehub/data-api-shared';
+import {
+  ClickHouseService,
+  FeeStatsRow,
+  NodeClient,
+  NodeThrottledError,
+  ShutdownSignals,
+  Table,
+} from '@gatehub/data-api-shared';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import {
   FEE_STATS_INTERVAL_MS,
@@ -315,6 +322,21 @@ describe('FeeStatsPoller', () => {
       expect(insert).toHaveBeenCalledTimes(1);
       expect(metrics.feeStatsSamplesTotal.inc).toHaveBeenCalledTimes(1);
       expect(metrics.feeStatsErrorsTotal.inc).toHaveBeenCalledTimes(1);
+      await poller.onModuleDestroy();
+    });
+
+    it('counts a sample a rate-limited node held back, without an error line per tick (ruling R98)', async () => {
+      const { poller, request, logger, metrics } = setup();
+      request.mockRejectedValue(
+        new NodeThrottledError(['wss://node.example'], 60_000, 'rate limit: retry in ~60000ms'),
+      );
+      await poller.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(request).toHaveBeenCalledTimes(3);
+      expect(metrics.feeStatsErrorsTotal.inc).toHaveBeenCalledTimes(3);
+      // The node client logs the pause once; the poller adds nothing for every sample it skips.
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
       await poller.onModuleDestroy();
     });
 

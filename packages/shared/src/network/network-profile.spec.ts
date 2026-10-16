@@ -31,7 +31,8 @@ describe('network profiles', () => {
     });
 
     it('has the public node endpoints of each network as the default for GH_NODE_ENDPOINTS', () => {
-      expect(getNetworkProfile('xrpl').defaultNodeEndpoints).toEqual(['wss://xrplcluster.com']);
+      // Ruling R98: Ripple's full-history server first (it did not throttle the verification run), the cluster second.
+      expect(getNetworkProfile('xrpl').defaultNodeEndpoints).toEqual(['wss://s2.ripple.com', 'wss://xrplcluster.com']);
       expect(getNetworkProfile('xahau').defaultNodeEndpoints).toEqual(['wss://xahau.network']);
     });
 
@@ -41,7 +42,7 @@ describe('network profiles', () => {
         networkId: 0,
         nativeCurrency: 'XRP',
         defaultDatabase: 'xrpl',
-        defaultNodeEndpoints: ['wss://xrplcluster.com'],
+        defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
         partialPaymentFixLedger: 4594094,
       });
     });

@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { EventEmitter } from 'events';
 import { Client, DisconnectedError, NotConnectedError, Request, RippledError, TimeoutError } from 'xrpl';
 import { NetworkName, NetworkProfile } from '../network';
+import { EndpointThrottle, nodeThrottle, NodeThrottledError, throttleHint } from './node-throttle';
 
 export interface NodeClientLogger {
   log(message: string): void;
@@ -26,6 +27,8 @@ export interface NodeClientOptions {
   backoffMaxMs?: number;
   /** Defaults to a Nest `Logger` with context `NodeClient`. */
   logger?: NodeClientLogger;
+  /** Where the pauses that rate-limiting nodes asked for are kept. Default: `nodeThrottle`, shared by the process. */
+  throttle?: EndpointThrottle;
 }
 
 export interface NodeRequestOptions {
@@ -77,6 +80,15 @@ const ACCEPTED_NETWORK_IDS: Record<NetworkName, ReadonlyArray<number | undefined
  * answering or goes silent is retired and a new one is connected, trying the endpoints round-robin with a capped
  * exponential backoff. Subscribed streams are remembered and sent again on every new connection.
  *
+ * **Rate limits (ruling R98).** A node that answers a request, or refuses a connection, with a rate-limit answer
+ * (`rate limit: ... retry in ~<N>ms`, `slowDown`, `tooBusy`, HTTP 429) is paused for the wait it names (plus a margin; a
+ * default 10 s without a hint; at most 20 min), in a throttle the whole process shares: nothing is sent to it and no
+ * connection to it is attempted until the pause ends, by this client or any other. Meanwhile requests go to another
+ * configured endpoint that is not paused (the connection is moved there); when every endpoint is paused a request fails
+ * at once with `NodeThrottledError` (its `retryAfterMs` says how long to wait), and the connect loop waits for the first
+ * pause to end. A connection to a paused endpoint is kept while there is no other one, so its streams keep flowing. Each
+ * pause is logged once, with its length.
+ *
  * Events: `connected`(endpoint), `disconnected`(endpoint), and the stream messages `ledgerClosed`,
  * `validationReceived`, `manifestReceived` (plus `transaction`, `peerStatusChange`, `consensusPhase`) with the raw
  * message. It never emits `error`.
@@ -90,6 +102,7 @@ export class NodeClient extends EventEmitter {
   private readonly backoffInitialMs: number;
   private readonly backoffMaxMs: number;
   private readonly logger: NodeClientLogger;
+  private readonly throttle: EndpointThrottle;
 
   private state: 'idle' | 'running' | 'stopped' = 'idle';
   private readonly streams = new Set<string>();
@@ -108,6 +121,8 @@ export class NodeClient extends EventEmitter {
   private lastStreamAt = 0;
   private watchdog?: NodeJS.Timeout;
   private sleeping?: { timer: NodeJS.Timeout; wake: () => void };
+  /** The endpoint of each instance this client made. */
+  private readonly endpointOf = new WeakMap<Client, string>();
 
   constructor(opts: NodeClientOptions) {
     super();
@@ -128,6 +143,12 @@ export class NodeClient extends EventEmitter {
     this.backoffMaxMs = opts.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS;
     this.backoffMs = this.backoffInitialMs;
     this.logger = opts.logger ?? nestLogger();
+    this.throttle = opts.throttle ?? nodeThrottle;
+  }
+
+  /** 0 when an endpoint of this client may be used now, else how long until the first of them may. */
+  throttledForMs(): number {
+    return this.throttle.waitMs(this.endpoints);
   }
 
   /** Endpoint of the live connection; undefined while (re)connecting or stopped. */
@@ -201,6 +222,10 @@ export class NodeClient extends EventEmitter {
    * Send one request and return its `result`. A disconnect or timeout retires the connection and the request is
    * retried on a fresh one (`retries` times). Rippled errors (`RippledError`, e.g. `actNotFound`, `lgrNotFound`) are
    * rethrown at once. The request is sent as given: no `api_version` is added.
+   *
+   * A rate-limit answer pauses its endpoint (see the class description); the request is retried on another endpoint
+   * that is not paused, and fails with `NodeThrottledError` when there is none. While every endpoint is paused it fails
+   * with `NodeThrottledError` without sending anything.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async request<T = any>(req: Record<string, unknown>, opts: NodeRequestOptions = {}): Promise<T> {
@@ -208,13 +233,28 @@ export class NodeClient extends EventEmitter {
     const retries = opts.retries ?? DEFAULT_RETRIES;
     const payload = { ...req };
     delete payload.id; // xrpl.js assigns ids; a caller's id could collide with a pending one.
+    let throttled: unknown;
     for (let attempt = 0; ; attempt += 1) {
+      if (this.state === 'running') {
+        const wait = this.throttledForMs();
+        if (wait > 0) throw this.throttledError(wait, throttled);
+      }
       let client: Client | undefined;
       try {
         client = await this.connection(timeoutMs);
         const response = (await client.connection.request(payload as unknown as Request, timeoutMs)) as { result: T };
         return response.result;
       } catch (err) {
+        const endpoint = client ? this.endpointOf.get(client) : undefined;
+        if (endpoint !== undefined && throttleHint(err) !== undefined) {
+          this.paused(endpoint, err, `Request ${String(req.command)}`);
+          throttled = err;
+          const wait = this.throttledForMs();
+          if (this.state !== 'running' || wait > 0 || attempt >= retries) throw this.throttledError(wait, err);
+          // Another endpoint may be used: move the connection there and send the request again.
+          if (client) this.replace(client, 'is rate limiting this client');
+          continue;
+        }
         if (this.state !== 'running' || !isFailoverError(err) || attempt >= retries) throw err;
         this.logger.warn(
           `Request ${String(req.command)} failed (${errorMessage(err)}); retrying on a fresh connection (${attempt + 1}/${retries})`,
@@ -230,14 +270,33 @@ export class NodeClient extends EventEmitter {
     return result.info;
   }
 
+  /** A `NodeThrottledError` for a wait of `ms` (every endpoint paused), with the answer that started it if known. */
+  private throttledError(ms: number, cause?: unknown): NodeThrottledError {
+    const reason = cause instanceof Error ? cause.message : 'the node asked this client to slow down';
+    return new NodeThrottledError([...this.endpoints], ms, reason);
+  }
+
+  /** Pause `endpoint` for the rate-limit answer `err` (`what` failed); logged once per pause. */
+  private paused(endpoint: string, err: unknown, what: string): void {
+    const { ms, started } = this.throttle.pause(endpoint, err);
+    if (!started) return;
+    this.logger.warn(
+      `${what} was refused by ${endpoint}: ${errorMessage(err)}. It rate limits this client: nothing is sent to it ` +
+        `for ${(ms / 1000).toFixed(1)} s`,
+    );
+  }
+
   /** The live instance, waiting for the connect loop when there is none (at most `timeoutMs`, when given). */
   private connection(timeoutMs?: number): Promise<Client> {
     if (this.state !== 'running') {
       return Promise.reject(new Error(this.state === 'idle' ? 'NodeClient is not started' : 'NodeClient is stopped'));
     }
     if (this.client) {
-      if (this.client.isConnected()) return Promise.resolve(this.client);
-      this.replace(this.client, 'is not connected');
+      const live = this.client;
+      const endpoint = this.endpoint as string;
+      const movable = this.throttle.remainingMs(endpoint) > 0 && this.throttledForMs() === 0;
+      if (live.isConnected() && !movable) return Promise.resolve(live);
+      this.replace(live, live.isConnected() ? 'is rate limiting this client' : 'is not connected');
     }
     const connecting = this.startConnecting();
     if (timeoutMs === undefined) return connecting;
@@ -265,8 +324,13 @@ export class NodeClient extends EventEmitter {
     let failures = 0;
     for (;;) {
       this.assertRunning();
-      const endpoint = this.endpoints[this.nextEndpoint];
-      this.nextEndpoint = (this.nextEndpoint + 1) % this.endpoints.length;
+      const wait = this.throttledForMs();
+      if (wait > 0) {
+        // Every endpoint is paused: no connection attempt until the first pause ends.
+        await this.sleep(wait);
+        continue;
+      }
+      const endpoint = this.nextUsableEndpoint();
       const client = this.createClient(endpoint);
       this.pending = client;
       try {
@@ -281,6 +345,12 @@ export class NodeClient extends EventEmitter {
         if (this.pending === client) this.pending = undefined;
         void this.retire(client);
         this.assertRunning();
+        if (throttleHint(err) !== undefined) {
+          // Refused because this client sends too much: pause the endpoint (and try another) instead of backing off.
+          this.paused(endpoint, err, 'Connecting');
+          this.logger.warn(`Cannot connect to ${endpoint}: ${errorMessage(err)}`);
+          continue;
+        }
         failures += 1;
         this.logger.warn(`Cannot connect to ${endpoint}: ${errorMessage(err)}`);
         if (failures % this.endpoints.length === 0) await this.backoff();
@@ -298,11 +368,26 @@ export class NodeClient extends EventEmitter {
     }
   }
 
+  /** The next endpoint, round-robin, that is not paused (the caller made sure there is one). */
+  private nextUsableEndpoint(): string {
+    for (let tried = 0; tried < this.endpoints.length; tried++) {
+      const endpoint = this.endpoints[this.nextEndpoint];
+      this.nextEndpoint = (this.nextEndpoint + 1) % this.endpoints.length;
+      if (this.throttle.remainingMs(endpoint) === 0) return endpoint;
+    }
+    return this.endpoints[this.nextEndpoint];
+  }
+
   /** Sleep for the current backoff, then double it (capped). `stop()` cuts the sleep short. */
   private async backoff(): Promise<void> {
     const ms = this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 2, this.backoffMaxMs);
     this.logger.warn(`Reconnecting in ${ms} ms`);
+    await this.sleep(ms);
+  }
+
+  /** Sleep `ms`; `stop()` cuts it short (and then this throws). */
+  private async sleep(ms: number): Promise<void> {
     await new Promise<void>((resolve) => {
       this.sleeping = { timer: setTimeout(resolve, ms), wake: resolve };
     });
@@ -351,6 +436,7 @@ export class NodeClient extends EventEmitter {
       connectionTimeout: this.connectionTimeoutMs,
       timeout: this.requestTimeoutMs,
     });
+    this.endpointOf.set(client, endpoint);
     disableAutoReconnect(client);
     // Listeners are attached once, here, for the lifetime of this instance; `retire()` removes them.
     client.on('error', (code: unknown, message: unknown) =>

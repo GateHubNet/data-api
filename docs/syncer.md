@@ -103,8 +103,9 @@ half-written ledger is invisible; recovery removes it.
 - **The head.** The `ledgerClosed` stream is only a hint; ledgers are always **fetched by index** (`ledger` with
   `transactions` and `expand`). When no hint has arrived for 15 s the runner polls `validatedHead()` instead. The head never
   goes down, so the lag stays defined while the node is away.
-- **Catch-up.** Up to `GH_CATCHUP_CONCURRENCY` (8) ledgers are fetched at once, each retried **forever** with a capped backoff
-  (0.5 s doubling to 30 s): a ledger is never skipped. A fetched ledger is accepted only if the node says it is `validated`.
+- **Catch-up.** Up to `GH_CATCHUP_CONCURRENCY` (4) ledgers are fetched at once, each retried **forever** with a capped backoff
+  (0.5 s doubling to 30 s): a ledger is never skipped. A node that rate limits the syncer is waited out instead, for as long as
+  it asks (see [Rate limits](#rate-limits)). A fetched ledger is accepted only if the node says it is `validated`.
   Accepted ledgers are reordered and chained in index order: each `parent_hash` must be the hash of the ledger before it. A break
   commits the verified prefix and **halts** the runner (probe 503).
 - **A ledger the parser rejects** (`Cannot parse ledger <index>: <reason>`) is not retried: parsing is pure and would fail the
@@ -118,6 +119,29 @@ half-written ledger is invisible; recovery removes it.
 - **Shutdown.** A write in progress finishes, a partial batch is dropped and refetched next time, the lease is released.
 
 States (probe and `syncer_*` metrics): `starting`, `catching_up`, `live`, `halted`. Lag = validated head − committed checkpoint.
+
+### Rate limits
+
+Public nodes limit what one client may ask (`rate limit: units quota (50000 per 10s) exhausted, retry in ~12376ms` on
+`xahau.network` and `xrplcluster.com`, rippled's own `slowDown` / `tooBusy`). The node client of the process honours that
+answer, for requests and for refused connections alike: the endpoint gets **nothing** (no request, no connection attempt, from
+any client of the process: ingest, fee poller, validations collector) until the wait it named is over (plus 250 ms; 10 s when
+it names none; at most 20 minutes). Meanwhile another endpoint of `GH_NODE_ENDPOINTS` takes the requests; when every endpoint
+is paused a request fails at once and its caller waits: the live runner fetches the ledger again when the pause ends, the fee
+poller skips its samples (counted in `syncer_fee_stats_errors_total`), the boot network check retries. Each pause is logged
+once (`... It rate limits this client: nothing is sent to it for 12.6 s`) and counted in
+`syncer_node_rate_limited_total{endpoint}`.
+
+The XRPL default is `wss://s2.ripple.com,wss://xrplcluster.com` (Ripple's full-history server first; it did not throttle a
+first sync at concurrency 2 to 4) and `GH_CATCHUP_CONCURRENCY` defaults to 4. A Xahau ledger is about 260 KB: on
+`wss://xahau.network` a catch-up at concurrency 1 or 2 is what stays under its 50,000 units per 10 s.
+
+### Boot without a node
+
+The shared node client is made only when a worker reads from it (`ingest`, `fee_stats`); the validations collector opens its own
+client per node. A syncer with `GH_WORKERS=aggregator` boots and serves its probe while every node is down. The boot network check
+(`server_info`, which must report the network of `GH_NETWORK`) is retried with a backoff (1 s doubling to 30 s, or the wait a
+rate-limiting node asks for) instead of ending the boot; only a node of another network ends it.
 
 ### Catch-up after an outage
 
@@ -250,6 +274,8 @@ Properties that matter operationally:
 | Boot refuses: lease held | A previous syncer (or an old-stack container) is still running or died less than 30 s ago | Stop it; wait 30 s. |
 | Lag grows, `last_commit_age` grows | Node unreachable or slow; ClickHouse refusing writes; recovery stuck (`recovering`) | Retries forever; see [operations](operations.md#syncer-falling-behind). |
 | `Node network_id ... does not match GH_NETWORK` | Wrong node for the network | Boot refused. |
+| `... It rate limits this client: nothing is sent to it for N s` | A public node throttles the process | That endpoint is left alone for N s, the next one is used; with none left the syncer waits. See [Rate limits](#rate-limits). |
+| `The boot network check (server_info) failed: ...; retry in N s` | The node is unreachable, busy or rate limiting at boot | Retried until it answers; only a node of another network ends the boot. |
 
 ## 10. Source map
 

@@ -175,10 +175,13 @@ export class SyncerConfig {
   @IntValue({ min: 1 })
   ledgerFetchTimeoutMs: number = 120000;
 
-  /** `GH_CATCHUP_CONCURRENCY`: ledgers fetched in parallel while catching up. */
+  /**
+   * `GH_CATCHUP_CONCURRENCY`: ledgers fetched in parallel while catching up. 4 keeps a first sync on the public nodes
+   * under their rate limits (ruling R98); raise it with a node of your own.
+   */
   @ConfigValue()
   @IntValue({ min: 1 })
-  catchupConcurrency: number = 8;
+  catchupConcurrency: number = 4;
 
   /** `GH_CATCHUP_FLUSH_LEDGERS`: flush a catch-up batch at this many ledgers ... */
   @ConfigValue()

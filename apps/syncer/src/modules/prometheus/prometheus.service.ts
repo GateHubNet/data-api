@@ -1,3 +1,4 @@
+import { nodeThrottle, ThrottlePause } from '@gatehub/data-api-shared';
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { collectDefaultMetrics, Counter, Gauge, Registry } from 'prom-client';
 
@@ -37,6 +38,12 @@ const metrics = {
       const last = (await metrics.lastCommitTimestampSeconds.get()).values[0]?.value;
       this.set(last ? Math.max(0, Date.now() / 1000 - last) : Number.NaN);
     },
+  }),
+  nodeRateLimitedTotal: new Counter({
+    name: 'syncer_node_rate_limited_total',
+    help: 'Pauses a node asked for with a rate-limit answer (nothing is sent to it while one lasts), by endpoint host.',
+    labelNames: ['endpoint'],
+    registers: [registry],
   }),
   ingestHaltsTotal: new Counter({
     name: 'syncer_ingest_halts_total',
@@ -90,6 +97,9 @@ const metrics = {
   }),
 };
 
+// Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
+nodeThrottle.on('pause', (pause: ThrottlePause) => metrics.nodeRateLimitedTotal.inc({ endpoint: pause.host }));
+
 let defaultMetricsCollected = false;
 
 /**
@@ -107,6 +117,7 @@ export class PrometheusService implements OnModuleInit {
   /** Derived from `lastCommitTimestampSeconds` when scraped; nothing sets it. */
   readonly lastCommitAgeSeconds = metrics.lastCommitAgeSeconds;
   readonly ingestHaltsTotal = metrics.ingestHaltsTotal;
+  readonly nodeRateLimitedTotal = metrics.nodeRateLimitedTotal;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly validationsErrorsTotal = metrics.validationsErrorsTotal;
   readonly validationsDroppedTotal = metrics.validationsDroppedTotal;

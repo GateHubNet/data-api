@@ -103,7 +103,7 @@ services:
     environment:
       <<: *clickhouse-client
       GH_NETWORK: xrpl
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
       GH_RUN_MIGRATIONS_ON_BOOT: 'false'
@@ -126,7 +126,7 @@ services:
     environment:
       <<: *clickhouse-client
       GH_NETWORK: xrpl
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
       # Development mode, not the image's production one: the API refuses to start in production without real keys, and the
       # key below is a development default. Set GH_API_KEYS to use your own.
       NODE_ENV: development

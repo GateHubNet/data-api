@@ -200,7 +200,7 @@ services:
       GH_NETWORK: xrpl
       GH_CLICKHOUSE_DATABASE: xrpl
       # Point a full-history syncer at your own node or at Ripple's full history server (wss://s2.ripple.com).
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
       # Empty = the node endpoints.
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
@@ -219,7 +219,7 @@ services:
       <<: *api-env
       GH_NETWORK: xrpl
       GH_CLICKHOUSE_DATABASE: xrpl
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://xrplcluster.com}
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
 
   # ------------------------------------------------------------------------------------------------ Xahau
 

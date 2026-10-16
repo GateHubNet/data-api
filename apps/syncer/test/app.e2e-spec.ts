@@ -27,16 +27,30 @@ afterAll(async () => {
 async function startFakeNode(
   networkId: number | undefined,
   chain: SyntheticLedger[] = [],
-): Promise<{ url: string; stop: () => Promise<void> }> {
+  opts: { rateLimitedServerInfo?: number } = {},
+): Promise<{ url: string; stop: () => Promise<void>; serverInfos: () => number }> {
   const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await once(server, 'listening');
   const head = chain[chain.length - 1];
+  let serverInfos = 0;
   server.on('connection', (socket) => {
     socket.on('message', (raw) => {
       const request = JSON.parse(raw.toString()) as { id: number; command: string; ledger_index?: unknown };
       const respond = (result: object) =>
         socket.send(JSON.stringify({ id: request.id, type: 'response', status: 'success', result }));
-      if (request.command === 'server_info') {
+      if (request.command === 'server_info' && ++serverInfos <= (opts.rateLimitedServerInfo ?? 0)) {
+        // What the public nodes answer to a client that sends too much.
+        socket.send(
+          JSON.stringify({
+            id: request.id,
+            type: 'response',
+            status: 'error',
+            error: 'slowDown',
+            error_message: 'rate limit: units quota (50000 per 10s) exhausted, retry in ~700ms',
+            request,
+          }),
+        );
+      } else if (request.command === 'server_info') {
         respond({ info: { complete_ledgers: '1-100', validated_ledger: { seq: 100 }, network_id: networkId } });
       } else if (request.command === 'ledger' && request.ledger_index === 'validated' && head) {
         respond({ ledger_index: head.index, ledger_hash: head.raw.header.ledger_hash, validated: true });
@@ -57,6 +71,7 @@ async function startFakeNode(
   const { port } = server.address() as AddressInfo;
   return {
     url: `ws://127.0.0.1:${port}`,
+    serverInfos: () => serverInfos,
     stop: () =>
       new Promise((resolve) => {
         for (const client of server.clients) client.terminate();
@@ -160,7 +175,7 @@ describe('AppModule on a real ClickHouse', () => {
 
 describe('main.ts under the toolbox bootstrap()', () => {
   let child: ChildProcess | undefined;
-  let node: { url: string; stop: () => Promise<void> } | undefined;
+  let node: Awaited<ReturnType<typeof startFakeNode>> | undefined;
   let output = '';
 
   afterEach(async () => {
@@ -173,8 +188,13 @@ describe('main.ts under the toolbox bootstrap()', () => {
     node = undefined;
   });
 
-  async function start(networkId: number | undefined, env: Record<string, string> = {}, chain?: SyntheticLedger[]) {
-    node = await startFakeNode(networkId, chain);
+  async function start(
+    networkId: number | undefined,
+    env: Record<string, string> = {},
+    chain?: SyntheticLedger[],
+    nodeOpts: Parameters<typeof startFakeNode>[2] = {},
+  ) {
+    node = await startFakeNode(networkId, chain, nodeOpts);
     const httpPort = await freePort();
     const metriczPort = await freePort();
     output = '';
@@ -232,7 +252,7 @@ describe('main.ts under the toolbox bootstrap()', () => {
   });
 
   it('exits with an error when the node belongs to another network', async () => {
-    await start(21337); // an xahau node, GH_NETWORK=xrpl
+    await start(21337, { GH_WORKERS: 'fee_stats' }); // an xahau node, GH_NETWORK=xrpl
     const [code] = (await once(child as ChildProcess, 'exit')) as [number | null];
     expect(code).toBe(1);
     expect(output).toContain('Node network_id 21337 does not match GH_NETWORK=xrpl');
@@ -287,6 +307,44 @@ describe('main.ts under the toolbox bootstrap()', () => {
     expect(
       await chRows(`SELECT argMax(holder, heartbeat) = '' FROM ${db}.syncer_lease WHERE network = 'xrpl'`, {}),
     ).toEqual(['1']);
+  });
+
+  it('boots without a node when no worker reads from it (GH_WORKERS=aggregator; ruling R99)', async () => {
+    const { httpPort } = await start(undefined, {
+      GH_WORKERS: 'aggregator',
+      GH_NODE_ENDPOINTS: `ws://127.0.0.1:${await freePort()}`, // nothing listens there
+      GH_CLICKHOUSE_DATABASE: 'syncer_app_e2e_aggregator_only',
+      GH_RUN_MIGRATIONS_ON_BOOT: 'true',
+    });
+    const res = await waitFor(async () => {
+      const response = await fetch(`http://127.0.0.1:${httpPort}/liveliness/healthz`);
+      return response.status === 200 ? response : undefined;
+    }, `the probe of an aggregator-only syncer\n${output}`);
+    expect(res.status).toBe(200);
+    expect(output).toContain('no worker reads from the node');
+    expect(output).not.toContain('Cannot connect');
+  });
+
+  it('retries the boot network check while the node rate-limits it, instead of exiting (ruling R99)', async () => {
+    const { httpPort } = await start(
+      undefined,
+      {
+        GH_WORKERS: 'fee_stats',
+        GH_CLICKHOUSE_DATABASE: 'syncer_app_e2e_boot_retry',
+        GH_RUN_MIGRATIONS_ON_BOOT: 'true',
+      },
+      [],
+      { rateLimitedServerInfo: 2 },
+    );
+    await waitFor(async () => {
+      const response = await fetch(`http://127.0.0.1:${httpPort}/liveliness/healthz`);
+      return response.status === 200 ? true : undefined;
+    }, `the probe after the rate-limited boot check\n${output}`);
+    expect(child?.exitCode).toBeNull();
+    expect(node?.serverInfos()).toBe(3);
+    expect(output).toMatch(/boot network check \(server_info\) failed: .*rate limit/);
+    // One pause per rate-limit answer, logged once each by the node client.
+    expect(output.match(/It rate limits this client/g)).toHaveLength(2);
   });
 
   it('exits with an error on invalid configuration', async () => {

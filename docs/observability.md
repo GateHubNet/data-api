@@ -51,8 +51,9 @@ head minus committed checkpoint, in ledgers) has stayed above `GH_MAX_LAG_HEALTH
 and a spike that is gone by the next probe resets the window. During a large catch-up or a backfill the probe therefore turns 503: that
 is informational and nothing restarts on it.
 
-The syncer opens its probe port only after its node connection is up, so an unreachable node shows as a failing healthcheck
-(`start_period` 60 s in compose).
+A syncer whose workers read from the node (`ingest`, `fee_stats`) opens its probe port only after its node connection is up and
+the boot network check has passed (it is retried until it does), so an unreachable node shows as a failing healthcheck
+(`start_period` 60 s in compose). A syncer without such a worker (`GH_WORKERS=aggregator`) makes no node connection at all.
 
 ### Container healthchecks and orchestrators
 
@@ -75,6 +76,7 @@ Prefix `api_`; one `prom-client` registry per process.
 | --- | --- | --- | --- |
 | `api_http_requests_total` | Counter | `method, route, status` | Requests handled |
 | `api_http_request_duration_seconds` | Histogram | `method, route, status` | Duration; buckets 0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5, 5 s |
+| `api_node_rate_limited_total` | Counter | `endpoint` | Pauses a node asked for with a rate-limit answer; while every endpoint is paused `/balances` and `/orders` fail at once (500) |
 | `api_tx_encode_fallback_total` | Counter | `mode` (`json` / `binary`) | Transactions served as their stored JSON because the binary codec could not serialize them (a type or field missing from the definitions). Should be 0 |
 | `api_process_*`, `api_nodejs_*` | | | Default process metrics (CPU, memory, event-loop lag, GC, handles) |
 
@@ -101,6 +103,7 @@ Prefix `syncer_`.
 | **`syncer_lag_ledgers`** | Gauge | | Validated head minus the committed checkpoint, in ledgers |
 | `syncer_last_commit_timestamp_seconds` | Gauge | | Unix time of the last commit |
 | **`syncer_last_commit_age_seconds`** | Gauge | | Seconds since the last commit, computed at scrape time; `NaN` before the first commit |
+| `syncer_node_rate_limited_total` | Counter | `endpoint` | Pauses a node asked for with a rate-limit answer (host only, no credentials); nothing goes to that node while one lasts |
 | `syncer_ingest_halts_total` | Counter | `reason` | Times the live ingest halted until an operator intervenes (`chain_break`, `parse_error`, `lease_lost`) |
 | `syncer_validations_flushed_total` | Counter | | Validation rows flushed to ClickHouse |
 | `syncer_validations_errors_total` | Counter | `stage` | Collector failures (`flush`, `reporter`, `manifest_rpc`, ...) |

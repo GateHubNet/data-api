@@ -69,7 +69,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       validationEndpoints: 'wss://s2.ripple.com',
       workers: 'ingest,validations,fee_stats,aggregator',
       ledgerFetchTimeoutMs: 120000,
-      catchupConcurrency: 8,
+      catchupConcurrency: 4,
       catchupFlushLedgers: 300,
       catchupFlushTxs: 100000,
       catchupFlushMs: 5000,
@@ -134,7 +134,7 @@ describe('SyncerConfig (GH_* environment)', () => {
     expect(exits).toEqual([]);
     expect(cfg.syncStartLedger).toBeUndefined();
     expect(cfg.validationEndpoints).toBe('wss://s2.ripple.com');
-    expect(cfg.catchupConcurrency).toBe(8);
+    expect(cfg.catchupConcurrency).toBe(4);
     expect(cfg.runMigrationsOnBoot).toBe(false);
   });
 
@@ -187,8 +187,8 @@ describe('SyncerConfig (GH_* environment)', () => {
       const xrpl = await loadConfig(env);
       expect(xrpl.exits).toEqual([]);
       expect(xrpl.cfg).toMatchObject({
-        nodeEndpoints: 'wss://xrplcluster.com',
-        validationEndpoints: 'wss://xrplcluster.com',
+        nodeEndpoints: 'wss://s2.ripple.com,wss://xrplcluster.com',
+        validationEndpoints: 'wss://s2.ripple.com,wss://xrplcluster.com',
       });
       const xahau = await loadConfig({ ...env, GH_NETWORK: 'xahau' });
       expect(xahau.exits).toEqual([]);

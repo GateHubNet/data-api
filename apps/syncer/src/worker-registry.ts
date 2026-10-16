@@ -24,6 +24,14 @@ export const WORKER_MODULES: WorkerModuleRegistry = {
   aggregator: AggregatorModule,
 };
 
+/** The workers that read from the shared node client (`NODE_CLIENT`). The validations collector makes its own. */
+export const NODE_CLIENT_WORKERS: ReadonlySet<WorkerName> = new Set<WorkerName>(['ingest', 'fee_stats']);
+
+/** Whether one of the enabled workers reads from the shared node client: only then does the app make one (ruling R99). */
+export function needsNodeClient(enabled: ReadonlySet<WorkerName>): boolean {
+  return [...enabled].some((name) => NODE_CLIENT_WORKERS.has(name));
+}
+
 /**
  * The modules of the enabled workers, in `WORKER_NAMES` order. An enabled worker with no registered module is
  * reported with a warning and skipped: the app still starts with the workers that exist.

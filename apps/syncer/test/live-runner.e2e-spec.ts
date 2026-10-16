@@ -8,6 +8,7 @@ import {
   LedgerParseError,
   LedgerSource,
   LedgerWriter,
+  NodeThrottledError,
   parseContextFor,
   RawLedger,
   runMigrations,
@@ -806,6 +807,30 @@ describe('LiveRunner (e2e)', () => {
     expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(10) });
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
     expect(source.fetches).toEqual([L(10)]);
+  });
+
+  it('waits as long as a rate-limited node asks before it fetches again, without a warning per fetch (ruling R98)', async () => {
+    const svc = await freshService();
+    const source = new TestSource(L(10));
+    const fetchedAt = new Map<number, number[]>();
+    const fetch = source.fetch.bind(source);
+    let throttled = 0;
+    jest.spyOn(source, 'fetch').mockImplementation(async (index: number) => {
+      fetchedAt.set(index, [...(fetchedAt.get(index) ?? []), Date.now()]);
+      if (index === L(3) && throttled++ === 0) {
+        throw new NodeThrottledError(['wss://node.example'], 600, 'rate limit: retry in ~350ms');
+      }
+      return fetch(index);
+    });
+    const { runner, logger } = makeRunner(svc, source, { options: { backoffInitialMs: 20, backoffMaxMs: 50 } });
+
+    await runner.runOnce();
+
+    expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+    const [first, second] = fetchedAt.get(L(3)) ?? [];
+    expect(second - first).toBeGreaterThanOrEqual(580); // the hint, not the 20 ms backoff
+    // The node client logs the pause once; the runner does not add a warning for every fetch it holds back.
+    expect(logger.lines.filter((l) => l.level === 'warn' && l.message.includes('rate limit'))).toEqual([]);
   });
 
   it('polls the validated head when no hint arrives', async () => {

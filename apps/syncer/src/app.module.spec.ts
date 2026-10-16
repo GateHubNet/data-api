@@ -30,9 +30,13 @@ async function boot(
     ingestStatus?: { state?: string; lag?: number };
     /** Replaces the LiveRunner of the real ingest module (which would otherwise start ingesting). */
     liveRunner?: { status: () => object };
+    /** Replaces the FeeStatsPoller of the real fee_stats module (which would otherwise poll the fake node). */
+    feeStatsPoller?: boolean;
+    /** Override NODE_CLIENT with the fake node (default). Off: the app has to boot without one. */
+    stubNode?: boolean;
   } = {},
 ): Promise<Booted> {
-  const { pingOk = true, ingestStatus, liveRunner } = options;
+  const { pingOk = true, ingestStatus, liveRunner, feeStatsPoller = false, stubNode = true } = options;
   const saved = { ...process.env };
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('GH_') && key !== 'GH_ENV') delete process.env[key];
@@ -61,6 +65,7 @@ async function boot(
       // Imported before app.module: once it is imported, its config load races `setLogger(QUIET)` below.
       const { INGEST_STATUS } = await import('./modules/liveliness/ingest-status');
       const { LiveRunner } = await import('./ingest/live-runner');
+      const { FeeStatsPoller } = await import('./fees/fee-stats-poller');
       const { ShutdownSignals } = await import('@gatehub/data-api-shared');
       const { AppModule } = await import('./app.module');
       const clickhouse = { ping: jest.fn(async () => pingOk), onModuleDestroy: jest.fn() };
@@ -72,10 +77,10 @@ async function boot(
       let builder = Test.createTestingModule({ imports: [AppModule] })
         .setLogger(QUIET) // terminus logs every failed health check
         .overrideProvider(ClickHouseService)
-        .useValue(clickhouse)
-        .overrideProvider(tokens.NODE_CLIENT)
-        .useValue(node);
+        .useValue(clickhouse);
+      if (stubNode) builder = builder.overrideProvider(tokens.NODE_CLIENT).useValue(node);
       if (liveRunner) builder = builder.overrideProvider(LiveRunner).useValue(liveRunner);
+      if (feeStatsPoller) builder = builder.overrideProvider(FeeStatsPoller).useValue({});
       const moduleRef = await builder.compile();
       const app = moduleRef.createNestApplication();
       await app.listen(0, '127.0.0.1');
@@ -115,8 +120,25 @@ describe('AppModule', () => {
       networkId: 0,
       partialPaymentFixLedger: 4594094,
     });
-    expect(app.get(tokens.NODE_CLIENT)).toBe(booted.node);
     expect(app.get(booted.ShutdownSignals)).toBeInstanceOf(booted.ShutdownSignals);
+  });
+
+  describe('the node client is only made for the workers that use it (ruling R99)', () => {
+    it.each(['', 'aggregator', 'validations', 'aggregator,validations'])(
+      'has none with GH_WORKERS=%j: the app boots without a node',
+      async (workers) => {
+        booted = await boot({ ...FAKE_ENV, GH_WORKERS: workers }, { stubNode: false });
+        expect(() => booted?.app.get(booted.tokens.NODE_CLIENT)).toThrow();
+        const res = await fetch(`${booted.baseUrl}/liveliness/healthz`);
+        expect(res.status).toBe(200);
+      },
+    );
+
+    it.each(['ingest', 'fee_stats'])('has one with GH_WORKERS=%s', async (workers) => {
+      const runner = { status: () => ({ state: 'live', lag: 0 }) };
+      booted = await boot({ ...FAKE_ENV, GH_WORKERS: workers }, { liveRunner: runner, feeStatsPoller: true });
+      expect(booted.app.get(booted.tokens.NODE_CLIENT)).toBe(booted.node);
+    });
   });
 
   it('has no ingest status (and no LiveRunner) when the ingest worker is not enabled', async () => {
@@ -180,7 +202,7 @@ describe('AppModule', () => {
   });
 
   it('stops the node client when the app closes', async () => {
-    booted = await boot(FAKE_ENV);
+    booted = await boot({ ...FAKE_ENV, GH_WORKERS: 'ingest' }, { liveRunner: { status: () => ({ state: 'live' }) } });
     const { app, node } = booted;
     expect(node.stop).not.toHaveBeenCalled();
     await app.close();

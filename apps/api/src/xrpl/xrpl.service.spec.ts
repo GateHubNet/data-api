@@ -1,4 +1,11 @@
-import { getNetworkProfile, NetworkName, NodeClientOptions, ShutdownSignals } from '@gatehub/data-api-shared';
+import {
+  getNetworkProfile,
+  NetworkName,
+  NodeClientOptions,
+  nodeThrottle,
+  NodeThrottledError,
+  ShutdownSignals,
+} from '@gatehub/data-api-shared';
 import { NotConnectedError, RippledError } from 'xrpl';
 import { ApiConfig } from '../config/api.config';
 import { NODE_REQUEST_RETRIES, NODE_REQUEST_TIMEOUT_MS, NodeClientLike, XrplService } from './xrpl.service';
@@ -173,6 +180,27 @@ describe('XrplService', () => {
       expect(broken.stop).toHaveBeenCalledTimes(1);
       await expect(service.request({ command: 'x' })).resolves.toBeDefined();
       expect(factory).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('a rate-limited node (ruling R98)', () => {
+    afterEach(() => nodeThrottle.clear());
+
+    it('fails at once while every endpoint is paused, and makes no client for it', async () => {
+      const { service, factory } = setup();
+      nodeThrottle.pause('wss://a.example', new Error('rate limit: retry in ~60000ms'));
+      nodeThrottle.pause('wss://b.example', new Error('rate limit: retry in ~30000ms'));
+      const err = await service.request({ command: 'account_info' }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(NodeThrottledError);
+      expect((err as NodeThrottledError).retryAfterMs).toBeGreaterThan(29_000);
+      expect((err as NodeThrottledError).retryAfterMs).toBeLessThanOrEqual(30_250);
+      expect(factory).not.toHaveBeenCalled();
+    });
+
+    it('serves while one endpoint is still usable', async () => {
+      const { service } = setup();
+      nodeThrottle.pause('wss://a.example', new Error('rate limit: retry in ~60000ms'));
+      await expect(service.request({ command: 'x' })).resolves.toEqual({ echoed: { command: 'x' } });
     });
   });
 

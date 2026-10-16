@@ -35,6 +35,11 @@ export interface SyncerCoreOptions {
   profile: NetworkProfile;
   clickHouse: ClickHouseConfig;
   workerModules: WorkerModule[];
+  /**
+   * Whether a worker that reads from the shared node client is enabled (`needsNodeClient`). Without one the app makes no
+   * client: no connection, no boot network check, and `NODE_CLIENT` is not provided (ruling R99).
+   */
+  nodeClient: boolean;
 }
 
 /**
@@ -42,13 +47,30 @@ export interface SyncerCoreOptions {
  * `SyncerConfig`, `NETWORK_PROFILE`, `PARSE_CONTEXT`, `NODE_CLIENT`, `ClickHouseService`, `PrometheusService` and
  * `ShutdownSignals` (SIGTERM / SIGINT cleanups; the node client's stop is registered here, first, so it runs last).
  * It also imports the liveliness probe and the modules of the enabled workers.
+ *
+ * `NODE_CLIENT` is only there when `options.nodeClient` says a worker reads from it (ingest, fee_stats): an aggregator
+ * or validations-only syncer boots without a node (the validations collector makes its own clients, one per node).
  */
 @Global()
 @Module({})
 export class SyncerCoreModule {
   static register(options: SyncerCoreOptions): DynamicModule {
-    const { config, profile, clickHouse, workerModules } = options;
+    const { config, profile, clickHouse, workerModules, nodeClient } = options;
     const logger = new Logger('Syncer');
+    const node = nodeClient
+      ? [
+          {
+            provide: NODE_CLIENT,
+            useFactory: async (signals: ShutdownSignals) => {
+              const client = await createNodeClient(config, profile);
+              signals.register('node-client', () => client.stop());
+              return client;
+            },
+            inject: [ShutdownSignals],
+          },
+          NodeClientShutdown,
+        ]
+      : [];
     return {
       module: SyncerCoreModule,
       imports: [ClickHouseModule.forRoot(clickHouse), LivelinessModule, ...workerModules],
@@ -58,19 +80,17 @@ export class SyncerCoreModule {
         { provide: PARSE_CONTEXT, useValue: parseContextFor(profile) },
         { provide: SCHEMA_READY, useFactory: () => migrateOnBoot(config, clickHouse, logger) },
         ShutdownSignals,
-        {
-          provide: NODE_CLIENT,
-          useFactory: async (signals: ShutdownSignals) => {
-            const client = await createNodeClient(config, profile);
-            signals.register('node-client', () => client.stop());
-            return client;
-          },
-          inject: [ShutdownSignals],
-        },
-        NodeClientShutdown,
+        ...node,
         PrometheusService,
       ],
-      exports: [SyncerConfig, NETWORK_PROFILE, PARSE_CONTEXT, NODE_CLIENT, PrometheusService, ShutdownSignals],
+      exports: [
+        SyncerConfig,
+        NETWORK_PROFILE,
+        PARSE_CONTEXT,
+        ...(nodeClient ? [NODE_CLIENT] : []),
+        PrometheusService,
+        ShutdownSignals,
+      ],
     };
   }
 }

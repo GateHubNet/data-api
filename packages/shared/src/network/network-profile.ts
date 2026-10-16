@@ -24,7 +24,11 @@ export interface NetworkProfile {
   nativeCurrency: 'XRP' | 'XAH';
   /** ClickHouse database used when `GH_CLICKHOUSE_DATABASE` is not set. */
   defaultDatabase: string;
-  /** Public websocket endpoints of the network, used when `GH_NODE_ENDPOINTS` is not set. */
+  /**
+   * Public websocket endpoints of the network, used when `GH_NODE_ENDPOINTS` is not set, in the order they are tried.
+   * XRPL: Ripple's full-history server first (it did not throttle a first sync), the community cluster as the
+   * failover (ruling R98).
+   */
   defaultNodeEndpoints: string[];
   /** First ledger from which a partial payment's delivered amount is taken from `delivered_amount` metadata. */
   partialPaymentFixLedger: number;
@@ -53,7 +57,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     networkId: 0,
     nativeCurrency: 'XRP',
     defaultDatabase: 'xrpl',
-    defaultNodeEndpoints: ['wss://xrplcluster.com'],
+    defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
     partialPaymentFixLedger: 4594094,
     definitionsFallback: (definitionsPath) => readDefinitions('xrpl', definitionsPath),
   },

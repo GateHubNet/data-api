@@ -45,7 +45,7 @@ describe('ApiConfig (GH_* environment)', () => {
     expect(exits).toEqual([]);
     expect(cfg).toMatchObject({
       network: 'xrpl',
-      nodeEndpoints: 'wss://xrplcluster.com',
+      nodeEndpoints: 'wss://s2.ripple.com,wss://xrplcluster.com',
       apiKeys: '',
       httpApiPort: 3001,
       metriczPort: 3000,
@@ -104,7 +104,7 @@ describe('ApiConfig (GH_* environment)', () => {
     expect(exits).toEqual([]);
     expect(cfg).toMatchObject({
       network: 'xrpl',
-      nodeEndpoints: 'wss://xrplcluster.com',
+      nodeEndpoints: 'wss://s2.ripple.com,wss://xrplcluster.com',
       httpApiPort: 3001,
       rateLimit: 600,
       apiKeys: '',
@@ -118,7 +118,7 @@ describe('ApiConfig (GH_* environment)', () => {
     expect((await loadConfig({ GH_NETWORK: 'xahau', GH_NODE_ENDPOINTS: ' ' })).cfg.nodeEndpoints).toBe(
       'wss://xahau.network',
     );
-    expect((await loadConfig({ GH_NETWORK: 'xrpl' })).cfg.nodeEndpoints).toBe('wss://xrplcluster.com');
+    expect((await loadConfig({ GH_NETWORK: 'xrpl' })).cfg.nodeEndpoints).toBe('wss://s2.ripple.com,wss://xrplcluster.com');
     expect((await loadConfig({ GH_NETWORK: 'xahau', GH_NODE_ENDPOINTS: 'ws://10.0.0.5:6006' })).cfg.nodeEndpoints).toBe(
       'ws://10.0.0.5:6006',
     );

@@ -160,6 +160,12 @@ api log (`XrplService`).
 The endpoint belongs to another network (an XRPL node for a Xahau syncer, or the reverse). Fix `GH_NODE_ENDPOINTS` / `XRPL_NODE_ENDPOINTS` /
 `XAHAU_NODE_ENDPOINTS`.
 
+### `rate limit: units quota ... exhausted, retry in ~<N>ms` / `It rate limits this client`
+A public node throttles this process. The node client pauses that endpoint for the time it named (logged once, counted in
+`syncer_node_rate_limited_total` / `api_node_rate_limited_total`) and uses the next endpoint of `GH_NODE_ENDPOINTS` meanwhile;
+nothing is lost, the syncer waits. If it happens all the time: lower `GH_CATCHUP_CONCURRENCY` (2 for `wss://xahau.network`), list
+a second endpoint, or use a node of your own. For `range-ingest` see [backfill](backfill.md#public-nodes-and-rate-limits).
+
 ### Syncer: lag does not fall / halted
 See [operations](operations.md#after-an-outage): a node without the history (`complete_ledgers`), ClickHouse refusing writes (`system.mutations`,
 the probe's `recovering`/`error`), a chain break, a ledger the parser rejects (`error: Cannot parse ledger <index>: ...`) or a lost lease

@@ -8,6 +8,7 @@ import {
   LedgerSource,
   LedgerWriter,
   RawLedger,
+  retryAfterMsOf,
   ShutdownSignals,
   storedLedgerHash,
   Table,
@@ -143,7 +144,8 @@ class StoppedError extends Error {}
  *
  * **Loop.** The head is the highest `ledgerClosed` hint of the node client, or a poll of `validatedHead()` when no hint
  * has arrived for 15 s; it never goes down, so the lag stays defined while the node is away. Up to `catchupConcurrency`
- * ledgers are fetched at once, by index, each retried forever with a capped backoff (a ledger is never skipped). Fetched
+ * ledgers are fetched at once, by index, each retried forever with a capped backoff (a ledger is never skipped); a
+ * rate-limited node (`NodeThrottledError`) is waited out for as long as it asked instead (ruling R98). Fetched
  * ledgers are reordered and accepted in index order, each only if its `parent_hash` is the hash of the one before (else
  * the verified prefix is committed and the runner halts). Accepted ledgers are written as one batch when it holds
  * `catchupFlushLedgers` ledgers or `catchupFlushTxs` transactions, is `catchupFlushMs` old, reaches to within one ledger
@@ -555,7 +557,11 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       .then(() => this.source.validatedHead())
       .then(
         (index) => this.observeHead(index),
-        (err: unknown) => this.logger.warn(`Polling the validated head failed: ${describe(err)}`),
+        (err: unknown) => {
+          // A rate-limited node: the node client logged the pause; the head is polled again after headSilenceMs.
+          if (retryAfterMsOf(err) > 0) this.lastPollAt = Date.now() + retryAfterMsOf(err) - this.opts.headSilenceMs;
+          else this.logger.warn(`Polling the validated head failed: ${describe(err)}`);
+        },
       )
       .finally(() => {
         this.polling = false;
@@ -698,6 +704,13 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         return ledger;
       } catch (err) {
         if (signal.aborted) break;
+        const throttled = retryAfterMsOf(err);
+        if (throttled > 0) {
+          // The node asked this process to slow down: the node client logged the pause once; wait it out (R98).
+          this.logger.debug?.(`Fetching ledger ${index} waits ${throttled} ms for a rate-limited node`);
+          await this.sleep(throttled, signal);
+          continue;
+        }
         this.logger.warn(
           `Fetching ledger ${index} failed (attempt ${attempt}, retry in ${delay} ms): ${describe(err)}`,
         );
@@ -1015,7 +1028,8 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       } catch (err) {
         if (err instanceof ChainBreakError) throw err;
         if (this.stopping || this.haltError) break;
-        const delay = this.backoff(attempt);
+        // A rate-limited node asks for a wait of its own (ruling R98).
+        const delay = Math.max(this.backoff(attempt), retryAfterMsOf(err));
         if (level === 'error') {
           this.recovering = true;
           this.lastError = describe(err);

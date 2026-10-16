@@ -2,7 +2,7 @@ import { clickHouseConfigFromEnv, getNetworkProfile } from '@gatehub/data-api-sh
 import { DynamicModule, Logger, MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { enabledWorkers, endpointHost, endpointList, loadSyncerConfig } from './config/syncer.config';
 import { SyncerCoreModule } from './core/syncer-core.module';
-import { selectWorkerModules } from './worker-registry';
+import { needsNodeClient, selectWorkerModules } from './worker-registry';
 
 /**
  * Reads the configuration (GH_* variables, see `SyncerConfig`) and assembles the app: the shared infrastructure plus the
@@ -13,15 +13,17 @@ async function assemble(): Promise<DynamicModule> {
   const profile = getNetworkProfile(config.network);
   const logger = new Logger('Syncer');
   const workers = enabledWorkers(config);
+  const nodeClient = needsNodeClient(workers);
   logger.log(
     `network=${profile.name} workers=${workers.size === 0 ? '(none)' : [...workers].join(',')} ` +
-      `nodes=${endpointList(config.nodeEndpoints).map(endpointHost).join(',')}`,
+      `nodes=${nodeClient ? endpointList(config.nodeEndpoints).map(endpointHost).join(',') : '(none: no worker reads from the node)'}`,
   );
   return SyncerCoreModule.register({
     config,
     profile,
     clickHouse: clickHouseConfigFromEnv(process.env, profile),
     workerModules: selectWorkerModules(workers),
+    nodeClient,
   });
 }
 
