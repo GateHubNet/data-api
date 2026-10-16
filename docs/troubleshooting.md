@@ -124,7 +124,10 @@ use plain addresses/CIDRs of your front proxy.
 **Symptom:** under concurrency p95 balloons and requests fail while the API replicas sit at ~0 % CPU; ClickHouse logs `Memory limit (total)
 exceeded`. **Root cause:** a list query with `FINAL` merge-sorts the whole table per request and the replicas wait on ClickHouse.
 **Fix:** no `FINAL` on lists ([ADR-0003](adr/0003-no-final-on-list-queries.md), [clickhouse](clickhouse.md#the-final-rule)); the per-query guards
-`GH_CLICKHOUSE_MAX_QUERY_MEMORY` / `_MAX_EXECUTION_TIME` bound a regression. Also check for unbounded windows (`/v2/exchanges` over all pairs).
+`GH_CLICKHOUSE_MAX_QUERY_MEMORY` (`API_CLICKHOUSE_MAX_QUERY_MEMORY` for the apis in production) / `_MAX_EXECUTION_TIME` bound a
+regression. A list query must read its page with `readDistinctPage`: a `LIMIT 1 BY` in the SELECT that reads the table makes ClickHouse
+read most of the range ([clickhouse](clickhouse.md#reading-a-page-what-stops-the-read)); `system.query_log.read_rows` of one page should
+be about a granule per part, not the range.
 
 ### Every client shares one rate-limit bucket
 **Symptom:** all clients get 429 together; a single-IP load test hits 429 almost at once; the logs show the proxy's address for everybody.

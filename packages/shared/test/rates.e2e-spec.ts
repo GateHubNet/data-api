@@ -1337,7 +1337,11 @@ describe('RatesService (e2e)', () => {
         expect(sql).toContain('{pair0:String}');
         expect(sql).toContain('ledger_index BETWEEN {min:UInt32} AND {max:UInt32}');
         expect(params).toMatchObject({ pair0: 'USD', pair1: ISSUER, pair2: 'XRP', pair3: '' });
-        expect(sql).toContain('LIMIT 1 BY base_currency, base_issuer, counter_currency, counter_issuer, ledger_index');
+        // each trade once: by the whole key (the daily read), or by the key after the pair, which the read fixes (the
+        // last 50, deduped outside the read that stops after them)
+        expect(sql).toMatch(
+          /LIMIT 1 BY (base_currency, base_issuer, counter_currency, counter_issuer, )?ledger_index, tx_index, node_index/,
+        );
       }
     });
 
@@ -1345,22 +1349,34 @@ describe('RatesService (e2e)', () => {
       const queries = await exchangeQueries(() => rates.exchangeRate(USD, XRP, { date, live: true }));
       expect(queries).toHaveLength(1);
       const [latest] = queries;
-      expect(latest.params.newest).toBe(50);
-      expect(latest.sql).toContain('LIMIT {newest:UInt32}');
-      // the whole key, descending, so that ClickHouse can read the primary key backwards
-      expect(latest.sql).toContain(
-        'ORDER BY base_currency DESC, base_issuer DESC, counter_currency DESC, counter_issuer DESC, ledger_index DESC, tx_index DESC, node_index DESC',
+      expect(latest.params.distinct_page_limit).toBe(50);
+      // the whole key, descending, so that ClickHouse can read the primary key backwards, with a plain LIMIT on the
+      // read (the dedupe is outside it: a LIMIT BY in the same SELECT made ClickHouse read most of the window, R106)
+      const order =
+        'ORDER BY base_currency DESC, base_issuer DESC, counter_currency DESC, counter_issuer DESC, ledger_index DESC, tx_index DESC, node_index DESC';
+      expect(latest.sql).toContain(`${order}\n         LIMIT {distinct_page_cap:UInt32})`);
+      expect(latest.sql).toMatch(
+        /LIMIT 1 BY ledger_index, tx_index, node_index\s+LIMIT \{distinct_page_limit:UInt32\}/,
       );
-      const pipeline = await pipelineOf(latest);
-      const read = pipeline.slice(pipeline.lastIndexOf('(LimitBy)'));
+      const inner = /FROM \((SELECT (?:(?!FROM \()[\s\S])*?LIMIT \{distinct_page_cap:UInt32\})\)/.exec(
+        latest.sql,
+      )?.[1] as string;
+      const read = await pipelineOf({ sql: inner, params: latest.params });
       expect(read).toContain('ReadPoolInOrder');
       expect(read).toContain('algorithm: InReverseOrder');
-      expect(/SortingTransform/.test(pipeline)).toBe(false);
+      expect(/SortingTransform/.test(read)).toBe(false);
+      // and the read stops at its cap: the LIMIT sits on the merge of the parts, right above the read
+      const actions = (await ch.query<{ explain: string }>(`EXPLAIN actions = 1 ${latest.sql}`, latest.params))
+        .map((r) => r.explain)
+        .join('\n');
+      expect(actions).toMatch(
+        /Sorting \(Sorting for ORDER BY\)\n[│ ]*Prefix sort description: base_currency DESC[^\n]*\n(?:[│ ]*Result sort description:[^\n]*\n)?[│ ]*Limit \d+\n/,
+      );
     });
 
     it('the daily rate is read in key order too (the key range of the day), and the noise filter sits inside', async () => {
       const queries = await exchangeQueries(() => rates.exchangeRate(USD, XRP, { date }));
-      const daily = queries.find((q) => q.params.newest === undefined) as {
+      const daily = queries.find((q) => q.params.distinct_page_limit === undefined) as {
         sql: string;
         params: Record<string, unknown>;
       };

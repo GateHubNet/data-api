@@ -6,6 +6,7 @@ import {
   fixtureAccountTxBySequence,
   fixtureTransactions,
 } from './support/fixtures';
+import { expectBoundedInOrderRead, isPageRead } from './support/plans';
 
 /**
  * `GET /v2/accounts/:address/transactions` and `GET /v2/accounts/:address/transactions/:sequence` on a real ClickHouse,
@@ -1074,7 +1075,7 @@ describe('account transactions API endpoint', () => {
   describe('the tables and the plan of the queries', () => {
     const paging = (spy: jest.SpyInstance, table: string): [string, Record<string, unknown>][] =>
       spy.mock.calls
-        .filter(([q]) => new RegExp(`FROM ${table}\\b`).test(String(q)) && /LIMIT \{fetch/.test(String(q)))
+        .filter(([q]) => new RegExp(`FROM ${table}\\b`).test(String(q)) && isPageRead(String(q)))
         .map(([q, params]) => [String(q), params as Record<string, unknown>]);
 
     it('time mode pages account_transactions for the keys and reads the rows from transactions', async () => {
@@ -1090,9 +1091,16 @@ describe('account transactions API endpoint', () => {
       expect(sql).toMatch(/result = \{result:String\}/);
       expect(sql).toMatch(/ledger_index BETWEEN \{min:UInt32\} AND \{max:UInt32\}/);
       // the whole key, equality prefix included, and a row that was written twice counts once
-      expect(sql).toMatch(/ORDER BY account ASC, ledger_index ASC, tx_index ASC/);
-      expect(sql).toMatch(/LIMIT 1 BY ledger_index, tx_index/);
-      expect(params).toMatchObject({ account: BUSY, type: 'OfferCreate', result: 'tesSUCCESS', fetch: 11 });
+      // read with a plain LIMIT, which stops the read after the page (Ruling R106) ...
+      expect(sql).toMatch(/ORDER BY account ASC, ledger_index ASC, tx_index ASC\s+LIMIT \{distinct_page_cap:UInt32\}/);
+      // ... and outside it a row that was written twice counts once
+      expect(sql).toMatch(/LIMIT 1 BY ledger_index, tx_index\s+LIMIT \{distinct_page_limit:UInt32\}/);
+      expect(params).toMatchObject({
+        account: BUSY,
+        type: 'OfferCreate',
+        result: 'tesSUCCESS',
+        distinct_page_limit: 11,
+      });
       // values are bound, never written into the SQL
       expect(sql).not.toContain(BUSY);
       // the wide rows: transactions, by key, without FINAL
@@ -1112,9 +1120,14 @@ describe('account transactions API endpoint', () => {
       expect(sql).toMatch(/account = \{account:String\}/);
       expect(sql).toMatch(/sequence BETWEEN \{min_sequence:UInt32\} AND \{max_sequence:UInt32\}/);
       expect(sql).toMatch(/ORDER BY account ASC, sequence ASC, ledger_index ASC, tx_index ASC/);
-      expect(sql).toMatch(/LIMIT 1 BY sequence, ledger_index, tx_index/);
+      expect(sql).toMatch(/LIMIT 1 BY sequence, ledger_index, tx_index\s+LIMIT \{distinct_page_limit:UInt32\}/);
       expect(sql).not.toContain(SEQUENCED);
-      expect(params).toMatchObject({ account: SEQUENCED, min_sequence: 11370357, max_sequence: 11370364, fetch: 5 });
+      expect(params).toMatchObject({
+        account: SEQUENCED,
+        min_sequence: 11370357,
+        max_sequence: 11370364,
+        distinct_page_limit: 5,
+      });
       // and no ledger range: the dates are not read in this mode
       expect(query.mock.calls.map(([q]) => String(q)).some((q) => /FROM ledgers\b/.test(q))).toBe(false);
     });
@@ -1159,15 +1172,8 @@ describe('account transactions API endpoint', () => {
           expect(calls).toHaveLength(1);
 
           const [sql, params] = calls[0];
-          const plan = await h.ch.query<{ explain: string }>(`EXPLAIN PIPELINE ${sql}`, params);
-          const pipeline = plan.map((r) => r.explain).join('\n');
-          expect([descending, variant, pipeline]).toEqual([
-            descending,
-            variant,
-            expect.stringContaining('ReadPoolInOrder'),
-          ]);
-          expect(pipeline).toContain(descending ? 'InReverseOrder' : 'algorithm: InOrder');
-          expect(pipeline).not.toContain('PartialSortingTransform');
+          // in the order of the key, no sort, and a LIMIT on the read itself: it stops after the page
+          await expectBoundedInOrderRead(h, sql, params, descending, [descending, variant]);
         }
       }
     });
@@ -1180,7 +1186,7 @@ describe('account transactions API endpoint', () => {
       const indexes = await h.ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${sql}`, params);
       const text = indexes.map((r) => r.explain).join('\n');
       expect(text).toContain('PrimaryKey');
-      expect(text).toMatch(/Keys:\s+account/);
+      expect(text).toMatch(/Keys:[\s│]+account/);
     });
   });
 

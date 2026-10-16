@@ -1,7 +1,7 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { TxObject, TxService } from '../common/tx-object';
 
 /** The key of the list, which is the ORDER BY suffix of both tables it reads and so what a marker holds. */
@@ -9,6 +9,12 @@ export const TRANSACTION_KEYS: KeysetKey[] = [
   { column: 'ledger_index', type: 'UInt32' },
   { column: 'tx_index', type: 'UInt32' },
 ];
+
+/**
+ * The whole ORDER BY of `tx_by_type`. The type is fixed by the query, but it stays in the ORDER BY: ClickHouse reads a
+ * table in the order of its key only when the ORDER BY starts with a prefix of that key (Task 21).
+ */
+const TX_BY_TYPE_ORDER: KeysetKey[] = [{ column: 'tx_type', type: 'String' }, ...TRANSACTION_KEYS];
 
 /** What `GET /v2/transactions` is asked for; the values are already validated. */
 export interface TransactionsQuery {
@@ -70,31 +76,32 @@ export class TransactionsService {
     const range = await this.ranges.resolve(q.start, q.endExclusive);
     if (!range) return { transactions: [] };
 
-    const cursor = keysetClause(TRANSACTION_KEYS, q.descending, after);
     const byType = q.type !== undefined;
+    const cursor = keysetClause(TRANSACTION_KEYS, q.descending, after);
     const conditions = [
       ...(byType ? ['tx_type = {type:String}'] : []),
       'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
       ...(q.result !== undefined ? ['result = {result:String}'] : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
-    // `LIMIT 1 BY`: a row that was written twice (the tables are not collapsed before a merge, and no FINAL is used)
-    // counts once; the extra row tells whether there is a next page
-    const found = await this.ch.query<Key>(
-      `SELECT ledger_index, tx_index FROM ${byType ? Table.TxByType : Table.Transactions}
-        WHERE ${conditions.join(' AND ')}
-        ORDER BY ${orderByClause(TRANSACTION_KEYS, q.descending)}
-        LIMIT 1 BY ledger_index, tx_index
-        LIMIT {fetch:UInt32}`,
-      {
+    // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
+    // used), with one more than the page: it tells whether there is a next page
+    const found = await readDistinctPage<Key>(this.ch, {
+      columns: 'ledger_index, tx_index',
+      table: byType ? Table.TxByType : Table.Transactions,
+      where: conditions,
+      orderBy: columnsOf(byType ? TX_BY_TYPE_ORDER : TRANSACTION_KEYS),
+      unique: columnsOf(TRANSACTION_KEYS),
+      descending: q.descending,
+      params: {
         ...(byType && { type: q.type }),
         ...(q.result !== undefined && { result: q.result }),
         min: range.min,
         max: range.max,
         ...cursor.params,
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
 
     const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
     const [rows, ledgerHashes] = await Promise.all([

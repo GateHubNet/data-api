@@ -139,20 +139,27 @@ describe('keysetClause', () => {
 
   it('compares the key tuple, with bound params, after the marker in ascending order', () => {
     expect(keysetClause(KEYS, false, [4_000_000, 7])).toEqual({
-      clause: '(ledger_index, tx_index) > ({k0:UInt32}, {k1:UInt16})',
+      clause: 'ledger_index >= {k0:UInt32} AND (ledger_index, tx_index) > ({k0:UInt32}, {k1:UInt16})',
       params: { k0: 4_000_000, k1: 7 },
     });
   });
 
+  it('bounds the first column on its own as well: ClickHouse cannot read a tuple comparison on the primary key', () => {
+    // without the bound, a page deep into a list read every row from the start of the range up to the marker and threw
+    // them away (CH 26.8: `(a, b) > (x, y)` does not narrow the granules; `a >= x` does)
+    const { clause } = keysetClause(KEYS, false, [4_000_000, 7]);
+    expect(clause.startsWith('ledger_index >= {k0:UInt32} AND ')).toBe(true);
+  });
+
   it('compares the other way when descending', () => {
     expect(keysetClause(KEYS, true, [4_000_000, 7]).clause).toBe(
-      '(ledger_index, tx_index) < ({k0:UInt32}, {k1:UInt16})',
+      'ledger_index <= {k0:UInt32} AND (ledger_index, tx_index) < ({k0:UInt32}, {k1:UInt16})',
     );
   });
 
   it('prefixes the param names so that a query can hold two clauses', () => {
     expect(keysetClause(KEYS, false, [1, 2], 'after_')).toEqual({
-      clause: '(ledger_index, tx_index) > ({after_0:UInt32}, {after_1:UInt16})',
+      clause: 'ledger_index >= {after_0:UInt32} AND (ledger_index, tx_index) > ({after_0:UInt32}, {after_1:UInt16})',
       params: { after_0: 1, after_1: 2 },
     });
   });
@@ -163,7 +170,9 @@ describe('keysetClause', () => {
       { column: 'ledger_index', type: 'UInt32' },
     ];
     const { clause, params } = keysetClause(keys, false, ["n9'; DROP TABLE x; --", 3]);
-    expect(clause).toBe('(validation_public_key, ledger_index) > ({k0:String}, {k1:UInt32})');
+    expect(clause).toBe(
+      'validation_public_key >= {k0:String} AND (validation_public_key, ledger_index) > ({k0:String}, {k1:UInt32})',
+    );
     expect(clause).not.toContain('DROP');
     expect(params).toEqual({ k0: "n9'; DROP TABLE x; --", k1: 3 });
   });

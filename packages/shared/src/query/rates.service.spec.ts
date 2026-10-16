@@ -104,7 +104,12 @@ function fakeClickHouse(
   ledgers: (sql: string, params: Record<string, unknown>) => { ledger_index: number } | undefined = (sql) =>
     sql.includes('ORDER BY ledger_index ASC') ? { ledger_index: 100 } : { ledger_index: 200 },
 ) {
-  const query = jest.fn(async (_sql: string, params: Record<string, unknown> = {}) => rows(params));
+  const query = jest.fn(async (_sql: string, params: Record<string, unknown> = {}) =>
+    // the read of the last trades also says how many it took and how many its inner read had (see `latest`)
+    params.distinct_page_limit === undefined
+      ? rows(params)
+      : rows(params).map((row) => ({ taken: row.n, inner_read: row.n, ...row })),
+  );
   const queryOne = jest.fn(async (sql: string, params: Record<string, unknown> = {}) => ledgers(sql, params));
   return { ch: { query, queryOne } as unknown as ClickHouseService, query, queryOne };
 }
@@ -117,6 +122,12 @@ const sums = (n: number, base: string, counter: string) => ({
   base_sum_f: Number(base),
   counter_sum_f: Number(counter),
 });
+
+/**
+ * The row of the read of the last trades (`distinct_page_limit` is the 50 it takes): the sums, how many it took (all
+ * `n`, no noise left out) and how many its inner read had (fewer than its cap: the window ended).
+ */
+const latest = (n: number, base: string, counter: string) => ({ ...sums(n, base, counter), taken: n, inner_read: n });
 
 describe('RatesService.exchangeRate', () => {
   const date = new Date('2016-06-15T12:00:00Z');
@@ -150,13 +161,13 @@ describe('RatesService.exchangeRate', () => {
 
   it('is the average of the daily and the latest vwap; the latest is the query that has a limit', async () => {
     const { ch, query } = fakeClickHouse((params) =>
-      params.newest === undefined ? [sums(3, '10', '20')] : [sums(12, '10', '40')],
+      params.distinct_page_limit === undefined ? [sums(3, '10', '20')] : [latest(12, '10', '40')],
     );
     const rate = await new RatesService(ch, 'XRP').exchangeRate(USD, XRP, { date });
     // daily 20/10 = 2, latest 40/10 = 4
     expect(rate.toFixed()).toBe('3');
     expect(query).toHaveBeenCalledTimes(2);
-    expect(query.mock.calls.map(([, params]) => params?.newest).sort()).toEqual([50, undefined]);
+    expect(query.mock.calls.map(([, params]) => params?.distinct_page_limit).sort()).toEqual([50, undefined]);
   });
 
   it('the pair asked the other way round swaps the stored volumes: counter over base of that side', async () => {
@@ -179,27 +190,45 @@ describe('RatesService.exchangeRate', () => {
 
   it('strict: fewer than 10 trades make the latest rate 0, and with it the rate', async () => {
     const nine = fakeClickHouse((params) =>
-      params.newest === undefined ? [sums(5, '10', '20')] : [sums(9, '10', '40')],
+      params.distinct_page_limit === undefined ? [sums(5, '10', '20')] : [latest(9, '10', '40')],
     );
     const rates = new RatesService(nine.ch, 'XRP');
     expect((await rates.exchangeRate(USD, XRP, { date })).toFixed()).toBe('0');
     expect((await rates.exchangeRate(USD, XRP, { date, strict: false })).toFixed()).toBe('3');
     const ten = fakeClickHouse((params) =>
-      params.newest === undefined ? [sums(5, '10', '20')] : [sums(10, '10', '40')],
+      params.distinct_page_limit === undefined ? [sums(5, '10', '20')] : [latest(10, '10', '40')],
     );
     expect((await new RatesService(ten.ch, 'XRP').exchangeRate(USD, XRP, { date })).toFixed()).toBe('3');
   });
 
   it('no daily trade: the latest alone; live: the daily is not even read', async () => {
     const { ch, query } = fakeClickHouse((params) =>
-      params.newest === undefined ? [sums(0, '0', '0')] : [sums(12, '10', '40')],
+      params.distinct_page_limit === undefined ? [sums(0, '0', '0')] : [latest(12, '10', '40')],
     );
     const rates = new RatesService(ch, 'XRP');
     expect((await rates.exchangeRate(USD, XRP, { date })).toFixed()).toBe('4');
     query.mockClear();
     await rates.exchangeRate(USD, XRP, { date, live: true });
     expect(query).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[0][1]).toMatchObject({ newest: 50 });
+    expect(query.mock.calls[0][1]).toMatchObject({ distinct_page_limit: 50 });
+  });
+
+  it('the last trades: a plain LIMIT on the read, the dedupe outside it, read again when duplicates filled it (R106)', async () => {
+    const reads: { sql: string; cap: unknown }[] = [];
+    const { ch, query } = fakeClickHouse((params) => {
+      if (params.distinct_page_limit === undefined) return [sums(0, '0', '0')];
+      // the first read stopped at its cap of 100 rows with 30 trades: duplicates took the rest
+      return params.distinct_page_cap === 100
+        ? [{ ...sums(30, '10', '40'), taken: 30, inner_read: 100 }]
+        : [latest(50, '10', '40')];
+    });
+    expect((await new RatesService(ch, 'XRP').exchangeRate(USD, XRP, { date, live: true })).toFixed()).toBe('4');
+    for (const [sql, params] of query.mock.calls) reads.push({ sql: String(sql), cap: params?.distinct_page_cap });
+    expect(reads.map((r) => r.cap)).toEqual([100, 250]);
+    for (const { sql } of reads) {
+      expect(sql).toMatch(/node_index DESC\s+LIMIT \{distinct_page_cap:UInt32\}\)/);
+      expect(sql).toMatch(/LIMIT 1 BY ledger_index, tx_index, node_index\s+LIMIT \{distinct_page_limit:UInt32\}/);
+    }
   });
 
   it('a base volume of 0 is a vwap of 0, never a division by 0', async () => {
@@ -217,7 +246,7 @@ describe('RatesService.exchangeRate', () => {
     });
     expect(rate.toFixed()).toBe('2.5');
     expect(query).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[0][1]?.newest).toBeUndefined();
+    expect(query.mock.calls[0][1]?.distinct_page_limit).toBeUndefined();
     // [11:00:00 - 1s - 1h... = 10:59:59, 12:00:00)
     const bounds = queryOne.mock.calls.map(([sql, params]) => [String(sql).includes('>='), params?.secs]);
     expect(bounds.sort()).toEqual([
@@ -391,10 +420,10 @@ describe('RatesService.dailyNativeRates', () => {
 
   it('a day the pair has a trade on, with the daily and latest rates read from the rows', async () => {
     const { ch, query } = fakeClickHouse((params) =>
-      // the grouped read has `first_ledger`, the last-50 read has `newest`
-      params.newest === undefined
+      // the grouped read has `first_ledger`, the last-50 read has `distinct_page_limit`
+      params.distinct_page_limit === undefined
         ? [{ ...sums(3, '10', '20'), day: '2016-06-02', first_ledger: 150, last_ledger: 160 }]
-        : [sums(12, '10', '40')],
+        : [latest(12, '10', '40')],
     );
     const out = await new RatesService(ch, 'XRP').dailyNativeRates(
       [USD],

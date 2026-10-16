@@ -1,6 +1,7 @@
 import { AccountPaymentsRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { fixtureAccountPayments, fixturePayments } from './support/fixtures';
+import { expectBoundedInOrderRead, innerRead } from './support/plans';
 
 /**
  * `GET /v2/accounts/:address/payments` on a real ClickHouse, seeded with the 54 ledgers of the original Ripple test
@@ -559,7 +560,11 @@ describe('account payments API endpoint', () => {
         const res = await get(`${path(BUSIEST)}?${query}`);
         // one more than the page is asked for: the extra row tells whether there is a next page
         const paging = spy.mock.calls.filter(([q]) => String(q).includes(Table.AccountPayments));
-        expect([query, res.status, paging[0][1]]).toEqual([query, 200, expect.objectContaining({ fetch: rows + 1 })]);
+        expect([query, res.status, paging[0][1]]).toEqual([
+          query,
+          200,
+          expect.objectContaining({ distinct_page_limit: rows + 1 }),
+        ]);
         expect([query, res.body.count]).toEqual([query, Math.min(rows, rowsOf(BUSIEST).length)]);
         jest.restoreAllMocks();
       }
@@ -611,7 +616,7 @@ describe('account payments API endpoint', () => {
         .filter(([q]) => String(q).includes(Table.AccountPayments))
         .map(([q, p]) => [String(q), p as Record<string, unknown>]);
 
-    it('pages account_payments for the keys, and reads the rows from payments with an IN subquery', async () => {
+    it('pages account_payments for the keys, then reads the rows of the page from payments by their keys', async () => {
       const spy = jest.spyOn(h.ch, 'query');
       const res = await get(`${path(BUSIEST)}?limit=4&type=received&currency=XRP&issuer=&destination_tag=223051`);
       expect(res.status).toBe(200);
@@ -619,27 +624,38 @@ describe('account payments API endpoint', () => {
       const calls = paging(spy);
       expect(calls).toHaveLength(1);
       const [sql, params] = calls[0];
-      expect(sql).toMatch(
-        new RegExp(
-          `FROM ${Table.Payments}\\b[\\s\\S]*\\(ledger_index, tx_index\\) IN \\(\\s*SELECT ledger_index, tx_index FROM ${Table.AccountPayments}`,
-        ),
-      );
+      expect(sql).toMatch(new RegExp(`FROM ${Table.AccountPayments}\\b`));
       expect(sql).toMatch(/account = \{account:String\}/);
       expect(sql).toMatch(/direction = \{direction:String\}/);
       expect(sql).toMatch(/currency = \{currency:String\}/);
       expect(sql).toMatch(/destination_tag = \{destination_tag:UInt32\}/);
-      // a row that was written twice counts once, in the index and in the table
-      expect(sql.match(/LIMIT 1 BY ledger_index, tx_index/g)).toHaveLength(2);
+      // read with a plain LIMIT, which stops the read after the page (Ruling R106); outside it a row that was written
+      // twice counts once
+      expect(sql).toMatch(/tx_index ASC\s+LIMIT \{distinct_page_cap:UInt32\}\)/);
+      expect(sql.match(/LIMIT 1 BY ledger_index, tx_index/g)).toHaveLength(1);
       expect(params).toMatchObject({
         account: BUSIEST,
         direction: 'received',
         currency: 'XRP',
         destination_tag: 223051,
-        fetch: 5,
+        distinct_page_limit: 5,
       });
       // values are bound, never written into the SQL
       expect(sql).not.toContain(BUSIEST);
       expect(sql).not.toContain('223051');
+
+      // the wide rows of a page, by their keys, from the ledgers of the page only
+      spy.mockClear();
+      const page = await get(`${path(BUSIEST)}?limit=4`);
+      expect(page.body.count).toBe(4);
+      const wide = spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Payments}\\b`).test(String(q)));
+      expect(wide).toHaveLength(1);
+      expect(String(wide[0][0])).toMatch(/ledger_index BETWEEN \{lo:UInt32\} AND \{hi:UInt32\}/);
+      expect(String(wide[0][0])).toMatch(/\(ledger_index, tx_index\) IN \(/);
+      const keys = wide[0][1] as { ledgers: number[]; indexes: number[]; lo: number; hi: number };
+      expect(keys.ledgers).toHaveLength(4);
+      expect(keys.lo).toBe(Math.min(...keys.ledgers));
+      expect(keys.hi).toBe(Math.max(...keys.ledgers));
     });
 
     it('applies only the filters that were asked for', async () => {
@@ -679,18 +695,9 @@ describe('account payments API endpoint', () => {
           const [[sql, params]] = paging(spy);
           jest.restoreAllMocks();
 
-          // the keys of the account: the subquery on the narrow table
-          const keys = /IN \(\s*(SELECT[\s\S]*?LIMIT \{fetch:UInt32\})\)/.exec(sql)?.[1] as string;
-          expect(keys).toContain(Table.AccountPayments);
-          const plan = await h.ch.query<{ explain: string }>(`EXPLAIN PIPELINE ${keys}`, params);
-          const pipeline = plan.map((r) => r.explain).join('\n');
-          expect([descending, variant, pipeline]).toEqual([
-            descending,
-            variant,
-            expect.stringContaining('ReadPoolInOrder'),
-          ]);
-          expect(pipeline).toContain(descending ? 'InReverseOrder' : 'algorithm: InOrder');
-          expect(pipeline).not.toContain('PartialSortingTransform');
+          // the keys of the account, from the narrow table: in the order of the key, no sort, and a LIMIT on the read
+          // itself, which stops it after the page
+          await expectBoundedInOrderRead(h, sql, params, descending, [descending, variant]);
         }
       }
     });
@@ -700,11 +707,10 @@ describe('account payments API endpoint', () => {
       await get(`${path(BUSIEST)}?limit=5`);
       const [[sql, params]] = paging(spy);
       jest.restoreAllMocks();
-      const keys = /IN \(\s*(SELECT[\s\S]*?LIMIT \{fetch:UInt32\})\)/.exec(sql)?.[1] as string;
-      const indexes = await h.ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${keys}`, params);
+      const indexes = await h.ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${innerRead(sql)}`, params);
       const text = indexes.map((r) => r.explain).join('\n');
       expect(text).toContain('PrimaryKey');
-      expect(text).toMatch(/Keys:\s+account/);
+      expect(text).toMatch(/Keys:[\s│]+account/);
     });
 
     it('a request the client got wrong, or that cannot match, reads nothing', async () => {

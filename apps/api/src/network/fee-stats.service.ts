@@ -1,4 +1,4 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { decodeMarker, KeysetKey, paginate } from '../common/pagination';
 import { ceilTo, collectBuckets, floorTo } from './bucket-windows';
@@ -48,8 +48,9 @@ const clampSeconds = (seconds: number): number => Math.min(Math.max(seconds, 0),
  * The fee stats of the API (`getFeeStats` of the original): the snapshots the syncer's poller takes of the node's `fee`
  * every five seconds, from `fee_stats` (MergeTree, ORDER BY `ts`, partitioned by month).
  *
- * Raw: the snapshots in the order of `ts` (the whole key in the ORDER BY: read in order, no sort, stops after the page).
- * `LIMIT 1 BY ts` keeps a snapshot that was written twice (a retried insert; the table is not collapsed on merge) once.
+ * Raw: the snapshots in the order of `ts` (the whole key in the ORDER BY: read in order, no sort), with `readDistinctPage`,
+ * which stops the read after the page and keeps a snapshot that was written twice (a retried insert; the table is not
+ * collapsed on merge) once.
  *
  * Sampled (`minute`, `hour`, `day`): the original read, for each boundary, the snapshot stored under exactly that second.
  * Its cron job ran at second 0, 5, 10, ..., so one was there for every minute, hour and day. The poller here ticks
@@ -69,7 +70,6 @@ export class FeeStatsService {
   private async raw(q: FeeStatsQuery): Promise<{ rows: FeeStat[]; marker?: string }> {
     // before any query: a marker that is none of ours is the client's mistake, whatever the range holds
     const after = decodeMarker(q.marker, RAW_STAT_KEYS);
-    const direction = q.descending ? 'DESC' : 'ASC';
     const where = [
       `ts >= ${SQL_TS('from')}`,
       ...(q.endExclusive !== undefined ? [`ts < ${SQL_TS('until')}`] : []),
@@ -77,22 +77,23 @@ export class FeeStatsService {
         ? [`ts ${q.descending ? '<' : '>'} fromUnixTimestamp64Milli(toInt64({k0:UInt64}), 'UTC')`]
         : []),
     ];
-    const rows = await this.ch.query<StoredFeeStat>(
-      `SELECT toUnixTimestamp64Milli(ts) AS ms, current_ledger_size, expected_ledger_size, current_queue_size,
-              pct_max_queue_size, median_fee, minimum_fee, open_ledger_fee
-         FROM ${Table.FeeStats}
-        WHERE ${where.join(' AND ')}
-        ORDER BY ts ${direction}
-        LIMIT 1 BY ts
-        LIMIT {fetch:UInt32}`,
-      {
+    // each snapshot once, with one more than the page: it only tells whether there is a next page
+    const rows = await readDistinctPage<StoredFeeStat>(this.ch, {
+      columns: `toUnixTimestamp64Milli(ts) AS ms, current_ledger_size, expected_ledger_size, current_queue_size,
+              pct_max_queue_size, median_fee, minimum_fee, open_ledger_fee`,
+      table: Table.FeeStats,
+      where,
+      orderBy: ['ts'],
+      // the milliseconds of `ts`: the same order, and the same value for a snapshot written twice
+      unique: ['ms'],
+      descending: q.descending,
+      params: {
         from: clampMs(q.start.getTime()),
         ...(q.endExclusive !== undefined && { until: clampMs(q.endExclusive.getTime()) }),
         ...(after !== undefined && { k0: Math.min(Number(after[0]), MAX_MS) }),
-        // one row more than the page: it only tells whether there is a next page
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
     const page = paginate(rows, q.limit, (row) => [Number(row.ms)]);
     return { rows: page.rows.map(toFeeStat), ...(page.marker !== undefined && { marker: page.marker }) };
   }

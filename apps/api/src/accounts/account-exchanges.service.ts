@@ -1,8 +1,8 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { AssetParts } from '../common/asset-param';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import {
   ACCOUNT_EXCHANGE_COLUMNS,
   AccountExchangeObject,
@@ -89,9 +89,9 @@ export class AccountExchangesService {
     const range = await this.ranges.resolve(q.start, q.endExclusive);
     if (!range) return { exchanges: [] };
 
-    // the tuple of the whole key: the account is equal, so only the ledger part decides, and ClickHouse can use it on the
-    // primary key
-    const cursor = keysetClause(ACCOUNT_EXCHANGE_ORDER, q.descending, after && [q.account, ...after]);
+    // the columns after the account, which the query fixes: `keysetClause` bounds the first of them on its own, which
+    // ClickHouse narrows the read with
+    const cursor = keysetClause(ACCOUNT_EXCHANGE_KEYS, q.descending, after);
     const asStored = [...sideConditions('base', 'base', q.base), ...sideConditions('counter', 'counter', q.counter)];
     const reversed = [...sideConditions('counter', 'base', q.base), ...sideConditions('base', 'counter', q.counter)];
     const where = [
@@ -101,15 +101,16 @@ export class AccountExchangesService {
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
 
-    // `LIMIT 1 BY` the key: a row that was written twice (the table is not collapsed before a merge, and no FINAL is used)
-    // counts once; the extra row of the page only tells whether there is a next page
-    const rows = await this.ch.query<StoredAccountExchange>(
-      `SELECT ${ACCOUNT_EXCHANGE_COLUMNS} FROM ${Table.AccountExchanges}
-        WHERE ${where.join(' AND ')}
-        ORDER BY ${orderByClause(ACCOUNT_EXCHANGE_ORDER, q.descending)}
-        LIMIT 1 BY ${ACCOUNT_EXCHANGE_KEYS.map((k) => k.column).join(', ')}
-        LIMIT {fetch:UInt32}`,
-      {
+    // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
+    // used), with one more than the page: it only tells whether there is a next page
+    const rows = await readDistinctPage<StoredAccountExchange>(this.ch, {
+      columns: ACCOUNT_EXCHANGE_COLUMNS,
+      table: Table.AccountExchanges,
+      where,
+      orderBy: columnsOf(ACCOUNT_EXCHANGE_ORDER),
+      unique: columnsOf(ACCOUNT_EXCHANGE_KEYS),
+      descending: q.descending,
+      params: {
         account: q.account,
         min: range.min,
         max: range.max,
@@ -118,9 +119,9 @@ export class AccountExchangesService {
         ...(q.counter?.currency !== undefined && { counter_currency: q.counter.currency }),
         ...(q.counter?.issuer !== undefined && { counter_issuer: q.counter.issuer }),
         ...cursor.params,
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
 
     const page = paginate(rows, q.limit, (row) => [row.ledger_index, row.tx_index, row.node_index]);
     // a row is inverted when it is not the pair as asked for, so it is the reverse of it

@@ -1,7 +1,7 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { AccountWindow } from './account-window';
 import {
   BALANCE_CHANGE_COLUMNS,
@@ -65,9 +65,9 @@ export class AccountBalanceChangesService {
     const range = await this.ranges.resolve(q.start, q.endExclusive);
     if (!range) return { balance_changes: [] };
 
-    // the tuple of the whole key: the account is equal, so only the ledger part decides, and ClickHouse can use it on the
-    // primary key
-    const cursor = keysetClause(BALANCE_CHANGE_ORDER, q.descending, after && [q.account, ...after]);
+    // the columns after the account, which the query fixes: `keysetClause` bounds the first of them on its own, which
+    // ClickHouse narrows the read with
+    const cursor = keysetClause(BALANCE_CHANGE_KEYS, q.descending, after);
     const where = [
       'account = {account:String}',
       'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
@@ -77,15 +77,16 @@ export class AccountBalanceChangesService {
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
 
-    // `LIMIT 1 BY` the key: a row that was written twice (the table is not collapsed before a merge, and no FINAL is used)
-    // counts once; the extra row of the page only tells whether there is a next page
-    const rows = await this.ch.query<StoredBalanceChange>(
-      `SELECT ${BALANCE_CHANGE_COLUMNS} FROM ${Table.BalanceChanges}
-        WHERE ${where.join(' AND ')}
-        ORDER BY ${orderByClause(BALANCE_CHANGE_ORDER, q.descending)}
-        LIMIT 1 BY ${BALANCE_CHANGE_KEYS.map((k) => k.column).join(', ')}
-        LIMIT {fetch:UInt32}`,
-      {
+    // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
+    // used), with one more than the page: it only tells whether there is a next page
+    const rows = await readDistinctPage<StoredBalanceChange>(this.ch, {
+      columns: BALANCE_CHANGE_COLUMNS,
+      table: Table.BalanceChanges,
+      where,
+      orderBy: columnsOf(BALANCE_CHANGE_ORDER),
+      unique: columnsOf(BALANCE_CHANGE_KEYS),
+      descending: q.descending,
+      params: {
         account: q.account,
         min: range.min,
         max: range.max,
@@ -93,9 +94,9 @@ export class AccountBalanceChangesService {
         ...(q.counterparty !== undefined && { counterparty: q.counterparty }),
         ...(q.changeType !== undefined && { change_type: q.changeType }),
         ...cursor.params,
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
 
     const page = paginate(rows, q.limit, (row) => [row.ledger_index, row.tx_index, row.node_index]);
     return {

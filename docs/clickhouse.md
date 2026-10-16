@@ -36,15 +36,36 @@ errors), while the same query without `FINAL` ran at 127 QPS with zero errors.
 
 | Query shape | `FINAL`? | How duplicates are handled instead |
 | --- | --- | --- |
-| Lists and range scans (`transactions`, `payments`, `exchanges`, `account_*`, `ledgers`, fees) | **No** | `LIMIT 1 BY <key>` on the already-ordered scan, so a row written twice counts once |
+| Lists and range scans (`transactions`, `payments`, `exchanges`, `account_*`, `ledgers`, fees) | **No** | `LIMIT 1 BY <key>` OUTSIDE the ordered read: `readDistinctPage` reads `ORDER BY <whole key> LIMIT <page + room>` in a subquery and dedupes that (see below) |
 | Single-row lookups (`tx_by_hash`, `ledger_by_hash`, ...) | not needed | the lookup table gives the key; the `ledgers` row is the commit marker |
 | Aggregates (candles, rates, active accounts, reports) | **No** | the aggregation reads `LIMIT 1 BY` deduplicated rows, and sums are exact decimals so a row counted once is counted once |
 | Rollups the aggregator writes (`stats_hourly`, `volume_*`) | **No** | readers keep the newest `version` of a row/set (`argMax` / `max(version)`), so a half-written newer version is never mixed with an older one |
 | `validations` (AggregatingMergeTree) | **No** | readers `GROUP BY (ledger_hash, validation_public_key)` and add the partial rows up |
 
 > A new list endpoint must not use `FINAL` on its scan ([ADR-0003](adr/0003-no-final-on-list-queries.md)); the unit test
-> `sql-tables.spec.ts` also keeps table names to the `Table` enum, and the e2e suites check query plans (`EXPLAIN indexes = 1`) so a
-> list reads in key order and stops after its page.
+> `sql-tables.spec.ts` also keeps table names to the `Table` enum, and the e2e suites check query plans (`EXPLAIN PIPELINE` for the read
+> in key order, `EXPLAIN actions = 1` for the `Limit` on that read) and what a page reads (`system.query_log.read_rows`,
+> `apps/api/test/paged-reads.e2e-spec.ts`).
+
+### Reading a page: what stops the read
+
+ClickHouse stops reading a key-ordered range after a page only when the `LIMIT` reaches the read. Two things in the SQL break that
+(both found in the final review, Ruling R106; ClickHouse 26.8.14.3):
+
+- **`LIMIT 1 BY` in the same SELECT as the read.** `ORDER BY <key> LIMIT 1 BY <key> LIMIT n` reads in order, but the `LIMIT BY`
+  between the read and the `LIMIT` keeps the limit out of the read: over a range of more than one part it read, and buffered, most of
+  the range (one 201-row page of a 256M-row table: 143M rows and 1.16 GiB; with `max_memory_usage` = 100 MB it failed). With a plain
+  inner `LIMIT` the same page read 590k rows and 20 MiB. So every list reads with `readDistinctPage` (`packages/shared/src/query/
+  distinct-page.ts`): an inner `ORDER BY <whole key> LIMIT <page + room>` (room = as many rows as the page, at least 16) and, outside it,
+  `LIMIT 1 BY <key> LIMIT <page>`. If duplicates fill the room (the inner read hit its cap and the page came out short), it reads again
+  with four times the room. The pages of candles (`LIMIT 1 BY bucket`) and the last 50 trades of a rate use the same shape.
+- **A tuple comparison for the marker.** `(ledger_index, tx_index) > (x, y)` does not narrow the granules ClickHouse reads, so a page far
+  into a list read the range from its start up to the marker. `keysetClause` also bounds the first column on its own:
+  `ledger_index >= x AND (ledger_index, tx_index) > (x, y)`.
+
+What a page then reads is about one granule (8,192 rows; 1,024 for `transactions`) of each part the rest of the range spans, whatever
+the length of the range. `/v2/exchanges` of every pair is not a key order of `exchanges` (it is ordered by the pair first), so it reads
+windows of ledgers, starting at 256 ledgers and doubling up to about a million, each sorted on its own to the page (Ruling R107).
 
 ## Writes: parts, insert modes, deduplication
 
@@ -81,10 +102,13 @@ A single heavy query must never take the node down. Two layers:
    default 30 s) and, if set, `max_memory_usage` (`GH_CLICKHOUSE_MAX_QUERY_MEMORY`, bytes). A runaway query is killed.
 2. **Server limits** (ClickHouse config/profile): `max_server_memory_usage` (or the RAM ratio) and `max_concurrent_queries`.
 
-The production compose caps the container at 8 GiB; size it to the box and set the per-query caps below it. The expensive query
-families are the ones that read a lot by design: `/v2/exchanges` over all pairs, `/v2/stats` over years before the rollup caught
-up, `/reports` and `/stats/value` of very active accounts, and filtered `balance_changes`. They are bounded by the guards above
-and by their own window parameters.
+The production compose caps the container at 8 GiB; size it to the box and set the per-query caps below it. The apis get their own
+cap, `API_CLICKHOUSE_MAX_QUERY_MEMORY` (2 GiB in `deploy/.env.prod.example`; Ruling R107): a page reads a few MiB, so only a
+regression or an extreme aggregation window gets near it, and it then fails with the route's 500 instead of starving the syncers.
+The expensive query families are the ones that read a lot by design: `/v2/stats` over years before the rollup caught up,
+`/reports` and `/stats/value` of very active accounts (an account-stats page groups the account's whole window), long candle and
+reduce windows, and filtered `balance_changes`. They are bounded by the guards above and by their own window parameters.
+`/v2/exchanges` over all pairs reads windows of ledgers since Ruling R107 (see [reading a page](#reading-a-page-what-stops-the-read)).
 
 The API and the syncer use the **same ClickHouse user** (`data_api`, a full-access user that the compose creates); a read-only
 user for the API would be better and is a known hardening gap ([security](security.md#10-security-checklist)).

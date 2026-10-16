@@ -1,7 +1,7 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { ceilTo, collectBuckets, floorTo } from './bucket-windows';
 import { FeeSummary, StoredBucketFees, StoredLedgerFees, toBucketFees, toLedgerFees } from './fee-object';
 
@@ -66,23 +66,19 @@ export class FeesService {
       'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
-    // The whole key in the ORDER BY, so that ClickHouse reads the table in the order of its primary key and stops after
-    // the page. `LIMIT 1 BY`: a ledger that was written twice counts once.
-    const rows = await this.ch.query<StoredLedgerFees>(
-      `SELECT ledger_index, toUnixTimestamp(close_time) AS closed, tx_count, fee_total, fee_min, fee_max
-         FROM ${Table.Ledgers}
-        WHERE ${where.join(' AND ')}
-        ORDER BY ${orderByClause(LEDGER_KEYS, q.descending)}
-        LIMIT 1 BY ledger_index
-        LIMIT {fetch:UInt32}`,
-      {
-        min: range.min,
-        max: range.max,
-        ...cursor.params,
-        // one row more than the page: it only tells whether there is a next page
-        fetch: q.limit + 1,
-      },
-    );
+    // In the order of the key, each ledger once (a ledger written twice is there twice until a merge, and no FINAL is
+    // used), with one more than the page: it only tells whether there is a next page. `readDistinctPage` reads with a
+    // plain LIMIT and dedupes outside it, so ClickHouse stops after the page (Ruling R106).
+    const rows = await readDistinctPage<StoredLedgerFees>(this.ch, {
+      columns: 'ledger_index, toUnixTimestamp(close_time) AS closed, tx_count, fee_total, fee_min, fee_max',
+      table: Table.Ledgers,
+      where,
+      orderBy: columnsOf(LEDGER_KEYS),
+      unique: columnsOf(LEDGER_KEYS),
+      descending: q.descending,
+      params: { min: range.min, max: range.max, ...cursor.params },
+      limit: q.limit + 1,
+    });
     const page = paginate(rows, q.limit, (row) => [Number(row.ledger_index)]);
     return { rows: page.rows.map(toLedgerFees), ...(page.marker !== undefined && { marker: page.marker }) };
   }

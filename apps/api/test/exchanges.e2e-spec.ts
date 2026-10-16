@@ -3,6 +3,7 @@ import BigNumber from 'bignumber.js';
 import { bucketExpr, bucketStart, EXCHANGE_INTERVALS } from '../src/exchanges/exchange-intervals';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { FixtureExchange, fixtureExchanges, fixtureSource } from './support/fixtures';
+import { expectBoundedInOrderRead, explain, tableReads } from './support/plans';
 
 /**
  * `GET /v2/exchanges/:base/:counter` (raw exchanges) and `GET /v2/exchanges` (every pair, a GateHub extra) on a real
@@ -609,7 +610,7 @@ describe('exchanges API endpoint', () => {
     const paging = query.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
     // one more than the page is asked for: the extra row tells whether there is a next page
     expect(paging).toHaveLength(1);
-    expect(paging[0][1]).toMatchObject({ fetch: 401 });
+    expect(paging[0][1]).toMatchObject({ distinct_page_limit: 401 });
     // 400 itself and below are kept
     jest.restoreAllMocks();
     const spy = jest.spyOn(h.ch, 'query');
@@ -618,7 +619,7 @@ describe('exchanges API endpoint', () => {
     await get(`/v2/exchanges/${PAIR}?limit=401`);
     const fetches = spy.mock.calls
       .filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)))
-      .map(([, params]) => (params as { fetch: number }).fetch);
+      .map(([, params]) => (params as { distinct_page_limit: number }).distinct_page_limit);
     expect(fetches).toEqual([401, 400, 401]);
   });
 
@@ -965,7 +966,7 @@ describe('exchanges API endpoint', () => {
       const sql = String(paging[0][0]);
       const params = paging[0][1] as Record<string, unknown>;
       // the pair is the stored one (USD before XRP), however it was asked for
-      expect(params).toMatchObject({ fetch: 4 });
+      expect(params).toMatchObject({ distinct_page_limit: 4 });
       expect(Object.values(params)).toEqual(expect.arrayContaining(['USD', USD_ISSUER, 'XRP', '']));
       // values are bound, never written into the SQL
       expect(sql).not.toContain(USD_ISSUER);
@@ -981,13 +982,17 @@ describe('exchanges API endpoint', () => {
           .map((c) => `${c} ASC`)
           .join(', ')}`,
       );
-      expect(sql).toContain(`LIMIT 1 BY ${key}`);
-      // a resumed page compares the whole key too
+      // read with a plain LIMIT, which stops the read after the page; outside it a row that was written twice counts once
+      expect(sql).toMatch(/node_index ASC\s+LIMIT \{distinct_page_cap:UInt32\}\)/);
+      expect(sql).toMatch(/LIMIT 1 BY ledger_index, tx_index, node_index\s+LIMIT \{distinct_page_limit:UInt32\}/);
+      // a resumed page compares the key after the pair, with its first column on its own for the primary key
       jest.restoreAllMocks();
       const resumed = jest.spyOn(h.ch, 'query');
       await get(`/v2/exchanges/${PAIR}?limit=3&marker=${markerOf(USD_XRP.rows[1].row)}&descending=true`);
       const second = resumed.mock.calls.find(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
-      expect(String(second?.[0])).toContain(`(${key}) < (`);
+      expect(String(second?.[0])).toContain(
+        'ledger_index <= {k0:UInt32} AND (ledger_index, tx_index, node_index) < ({k0:UInt32}, {k1:UInt32}, {k2:UInt16})',
+      );
       expect(String(second?.[0])).toContain(
         `ORDER BY ${key
           .split(', ')
@@ -1014,18 +1019,9 @@ describe('exchanges API endpoint', () => {
             jest.restoreAllMocks();
 
             const [sql, params] = calls[0];
-            const plan = await h.ch.query<{ explain: string }>(
-              `EXPLAIN PIPELINE ${String(sql)}`,
-              params as Record<string, unknown>,
-            );
-            const pipeline = plan.map((r) => r.explain).join('\n');
             const where = [pathOf(m.base), pathOf(m.counter), descending, extra];
-            expect([where, pipeline]).toEqual([where, expect.stringContaining('ReadPoolInOrder')]);
-            expect([where, pipeline.includes(descending ? 'InReverseOrder' : 'algorithm: InOrder')]).toEqual([
-              where,
-              true,
-            ]);
-            expect([where, pipeline.includes('PartialSortingTransform')]).toEqual([where, false]);
+            // in the order of the key, no sort, and a LIMIT on the read itself: it stops after the page
+            await expectBoundedInOrderRead(h, String(sql), params as Record<string, unknown>, descending, where);
           }
         }
       }
@@ -1243,7 +1239,11 @@ describe('exchanges API endpoint', () => {
         const res = await get(`/v2/exchanges/${PAIR}?${query}`);
         // one more than the page is asked for: the extra row tells whether there is a next page
         const paging = spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
-        expect([query, res.status, paging[0][1]]).toEqual([query, 200, expect.objectContaining({ fetch: rows + 1 })]);
+        expect([query, res.status, paging[0][1]]).toEqual([
+          query,
+          200,
+          expect.objectContaining({ distinct_page_limit: rows + 1 }),
+        ]);
         expect([query, res.body.count]).toEqual([query, Math.min(rows, 5)]);
         jest.restoreAllMocks();
       }
@@ -2087,9 +2087,14 @@ describe('exchanges API endpoint', () => {
         expect(sql).toContain(order('ASC'));
       }
       const [probe, aggregation] = asc;
-      // the first exchange of each bucket, cut after the bucket that follows the page
-      expect(probe.sql).toMatch(/LIMIT 1 BY bucket\s+LIMIT \{fetch:UInt32\}/);
-      expect(probe.params).toMatchObject({ fetch: 2 });
+      // the exchanges in the order of the key, a plain LIMIT on the read; grouped by bucket outside it (the first
+      // ledger of each), cut after the bucket that follows the page
+      expect(probe.sql).toMatch(
+        /LIMIT \{cap:UInt32\}\)\s+GROUP BY bucket\s+ORDER BY bucket ASC\s+LIMIT \{fetch:UInt32\}/,
+      );
+      expect(probe.sql).toContain('min(ledger_index) AS ledger_index');
+      expect(probe.sql).not.toContain('LIMIT 1 BY');
+      expect(probe.params).toMatchObject({ fetch: 2, cap: 2 + 2048 });
       // the ledgers before the first one of the next bucket, each exchange once
       expect(aggregation.sql).toContain(`LIMIT 1 BY ${key}`);
       expect(aggregation.sql).toMatch(/GROUP BY bucket\s+ORDER BY bucket ASC/);
@@ -2099,6 +2104,7 @@ describe('exchanges API endpoint', () => {
       const desc = await queries(`/v2/exchanges/${PAIR}?interval=1minute&limit=1&descending=true`);
       expect(desc).toHaveLength(2);
       expect(desc[0].sql).toContain(order('DESC'));
+      expect(desc[0].sql).toContain('max(ledger_index) AS ledger_index');
       expect(desc[1].sql).toContain(order('ASC'));
       expect(desc[1].sql).toMatch(/ORDER BY bucket DESC/);
       expect(desc[1].params).toMatchObject({ min: 11119933 });
@@ -2153,24 +2159,38 @@ describe('exchanges API endpoint', () => {
             expect(calls.length).toBeGreaterThan(0);
             expect(calls.length).toBeLessThanOrEqual(kinds.length);
             for (const [j, [sql, params]] of calls.entries()) {
-              const plan = await h.ch.query<{ explain: string }>(
-                `EXPLAIN PIPELINE ${String(sql)}`,
+              const where = [pathOf(base), pathOf(counter), query, kinds[j]];
+              const backwards = kinds[j] === 'probe' && query.includes('descending=true');
+              // the read of the probe is its inner SELECT: the exchanges of the pair with a plain LIMIT (the buckets are
+              // grouped and sorted above it, a few rows); the aggregation and the reduction read below their LIMIT BY
+              const probeRead = /FROM \((SELECT [\s\S]*?LIMIT \{cap:UInt32\})\)/.exec(String(sql))?.[1];
+              const pipeline = await explain(
+                h,
+                'PIPELINE',
+                kinds[j] === 'probe' ? (probeRead as string) : String(sql),
                 params as Record<string, unknown>,
               );
-              const pipeline = plan.map((r) => r.explain).join('\n');
-              const where = [pathOf(base), pathOf(counter), query, kinds[j]];
-              // below the LIMIT BY: the rows of the pair read in key order (backwards for the probe of a descending
-              // list), never sorted; only the buckets are sorted, above
-              const read = pipeline.slice(pipeline.lastIndexOf('(LimitBy)'));
-              const backwards = kinds[j] === 'probe' && query.includes('descending=true');
+              const read = kinds[j] === 'probe' ? pipeline : pipeline.slice(pipeline.lastIndexOf('(LimitBy)'));
+              // the rows of the pair read in key order (backwards for the probe of a descending list), never sorted
               expect([where, read]).toEqual([where, expect.stringContaining('ReadPoolInOrder')]);
               expect([where, read.includes(backwards ? 'algorithm: InReverseOrder' : 'algorithm: InOrder')]).toEqual([
                 where,
                 true,
               ]);
               expect([where, /SortingTransform/.test(read)]).toEqual([where, false]);
-              // and the probe never sorts at all: it stops after its buckets
-              if (kinds[j] === 'probe') expect([where, /SortingTransform/.test(pipeline)]).toEqual([where, false]);
+              if (kinds[j] === 'probe') {
+                // and it stops after its cap: the LIMIT is on the read itself (Ruling R106)
+                expect([where, await tableReads(h, String(sql), params as Record<string, unknown>)]).toEqual([
+                  where,
+                  [
+                    {
+                      readType: backwards ? 'InReverseOrder' : 'InOrder',
+                      prefixSorted: true,
+                      limit: (params as { cap: number }).cap,
+                    },
+                  ],
+                ]);
+              }
             }
           }
         }
@@ -2287,7 +2307,15 @@ describe('exchanges API endpoint', () => {
         const spy = jest.spyOn(h.ch, 'query');
         const res = await get(`/v2/exchanges?${query}`);
         const paging = spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
-        expect([query, res.status, paging[0][1]]).toEqual([query, 200, expect.objectContaining({ fetch: rows + 1 })]);
+        // the first window has room for one more than the page (it tells whether there is a next page), and as many
+        // duplicates, at least 16
+        const want = rows + 1;
+        expect([query, res.status, paging[0][1]]).toEqual([
+          query,
+          200,
+          expect.objectContaining({ cap: want + Math.max(want, 16) }),
+        ]);
+        expect([query, res.body.count]).toEqual([query, Math.min(rows, ALL.length)]);
         jest.restoreAllMocks();
       }
       const bad = await get('/v2/exchanges?limit=abc');
@@ -2339,19 +2367,54 @@ describe('exchanges API endpoint', () => {
       expect((await get('/v2/exchanges?limit=5&foo=bar')).body).toEqual(plain.body);
     });
 
-    it('reads exchanges in one query on the ledger range, ordered by the ledger key, without FINAL', async () => {
+    it('reads exchanges in windows of ledgers from the marker on, ordered by the ledger key, deduped in code, without FINAL (R107)', async () => {
       const query = jest.spyOn(h.ch, 'query');
-      await get(`/v2/exchanges?limit=3&marker=${markerOf(ALL[10].row)}`);
+      const res = await get(`/v2/exchanges?limit=3&marker=${markerOf(ALL[10].row)}`);
+      expect(hashesIn(res.body)).toEqual(hashesOf(ALL.slice(11, 14)));
+      const paging = query.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
+      expect(paging.length).toBeGreaterThan(0);
+      for (const [q, params] of paging) {
+        const sql = String(q);
+        expect(sql).toMatch(/ledger_index BETWEEN \{lo:UInt32\} AND \{hi:UInt32\}/);
+        expect(sql).toContain('ledger_index >= {k0:UInt32} AND (ledger_index, tx_index, node_index) > (');
+        expect(sql).toMatch(/ORDER BY ledger_index ASC, tx_index ASC, node_index ASC\s+LIMIT \{cap:UInt32\}/);
+        // no LIMIT BY: a row written twice is dropped in code, so the sort of a window stops at the cap
+        expect(sql).not.toContain('LIMIT 1 BY');
+        expect(sql).not.toMatch(/\bFINAL\b/);
+        expect(sql).not.toMatch(/base_currency =/);
+        expect(params).toMatchObject({ k0: ALL[10].row.ledger_index });
+      }
+      // the first window starts at the ledger of the marker and is 256 ledgers long; each next one twice as long
+      const windows = paging.map(([, p]) => p as { lo: number; hi: number });
+      expect(windows[0]).toMatchObject({ lo: ALL[10].row.ledger_index, hi: ALL[10].row.ledger_index + 255 });
+      windows.slice(1).forEach((w, i) => {
+        expect(w.lo).toBe(windows[i].hi + 1);
+        expect(w.hi - w.lo + 1).toBe(Math.min(2 * (windows[i].hi - windows[i].lo + 1), 1_048_576));
+      });
+    });
+
+    it('descending walks the windows back from the marker (R107)', async () => {
+      const query = jest.spyOn(h.ch, 'query');
+      const res = await get(`/v2/exchanges?limit=3&descending=true&marker=${markerOf(ALL[100].row)}`);
+      expect(hashesIn(res.body)).toEqual(hashesOf(ALL.slice(97, 100).reverse()));
+      const windows = query.mock.calls
+        .filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)))
+        .map(([, p]) => p as { lo: number; hi: number });
+      expect(windows[0]).toMatchObject({ hi: ALL[100].row.ledger_index, lo: ALL[100].row.ledger_index - 255 });
+      windows.slice(1).forEach((w, i) => expect(w.hi).toBe(windows[i].lo - 1));
+    });
+
+    it('a window that holds more than the page is one read, sorted to the page and its room only (R107)', async () => {
+      // the ledger of ALL[30] and the 255 after it hold more exchanges than a page of 3
+      const after = ALL.filter(
+        (e) => e.row.ledger_index >= ALL[30].row.ledger_index && e.row.ledger_index <= ALL[30].row.ledger_index + 255,
+      );
+      expect(after.length).toBeGreaterThan(4 + 16);
+      const query = jest.spyOn(h.ch, 'query');
+      await get(`/v2/exchanges?limit=3&marker=${markerOf(ALL[30].row)}`);
       const paging = query.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
       expect(paging).toHaveLength(1);
-      const sql = String(paging[0][0]);
-      expect(sql).toMatch(/ledger_index BETWEEN \{min:UInt32\} AND \{max:UInt32\}/);
-      expect(sql).toContain('(ledger_index, tx_index, node_index) > (');
-      expect(sql).toContain('ORDER BY ledger_index ASC, tx_index ASC, node_index ASC');
-      expect(sql).toContain('LIMIT 1 BY ledger_index, tx_index, node_index');
-      expect(sql).not.toMatch(/\bFINAL\b/);
-      expect(sql).not.toMatch(/base_currency =/);
-      expect(paging[0][1]).toMatchObject({ fetch: 4 });
+      expect(paging[0][1]).toMatchObject({ cap: 4 + 16 });
     });
 
     it('format=csv gives the same columns, named exchanges.csv', async () => {

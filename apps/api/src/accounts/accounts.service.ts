@@ -1,7 +1,7 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { ACCOUNT_COLUMNS, AccountObject, StoredAccount, toAccountObject } from './account-object';
 
 /**
@@ -57,24 +57,23 @@ export class AccountsService {
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
 
-    // The whole key in the ORDER BY, so that ClickHouse reads the table in the order of its primary key and stops after
-    // the page. `LIMIT 1 BY`: a row that was written twice (the table is not collapsed before a merge, and no FINAL is
-    // used) counts once.
-    const rows = await this.ch.query<StoredAccount>(
-      `SELECT ${ACCOUNT_COLUMNS} FROM ${Table.AccountsCreated}
-        WHERE ${where.join(' AND ')}
-        ORDER BY ${orderByClause(ACCOUNT_KEYS, q.descending)}
-        LIMIT 1 BY ledger_index, tx_index, account
-        LIMIT {fetch:UInt32}`,
-      {
+    // In the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
+    // used), with one more than the page: it only tells whether there is a next page.
+    const rows = await readDistinctPage<StoredAccount>(this.ch, {
+      columns: ACCOUNT_COLUMNS,
+      table: Table.AccountsCreated,
+      where,
+      orderBy: columnsOf(ACCOUNT_KEYS),
+      unique: columnsOf(ACCOUNT_KEYS),
+      descending: q.descending,
+      params: {
         min: range.min,
         max: range.max,
         ...(q.parent && { parent: q.parent }),
         ...cursor.params,
-        // one row more than the page: it only tells whether there is a next page
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
 
     const page = paginate(rows, q.limit, (row) => [row.ledger_index, row.tx_index, row.account]);
     return {

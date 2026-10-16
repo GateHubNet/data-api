@@ -38,8 +38,9 @@ idle (blocked on ClickHouse) with p95 ≈ 30 s and ~30 % errors. The identical q
 With the ledger-keyed schema ([ADR-0007](0007-ledger-index-axis-and-secondary-tables.md)) and no materialized views
 ([ADR-0008](0008-no-aggregate-materialized-views.md)) the list of exceptions above shrank:
 
-- **List, range and aggregate queries never use `FINAL`.** Lists read a key-ordered range, dedupe with `LIMIT 1 BY <key>` and stop after `limit + 1` rows;
-  aggregates read the same deduplicated rows and sum exact decimals.
+- **List, range and aggregate queries never use `FINAL`.** Lists read a key-ordered range with a plain `LIMIT` of the page plus room for
+  duplicates and dedupe outside that read with `LIMIT 1 BY <key>` (`readDistinctPage`; in the same SELECT the `LIMIT BY` keeps ClickHouse
+  from stopping the read after the page, Ruling R106); aggregates read the same deduplicated rows and sum exact decimals.
 - **Single-row lookups do not need `FINAL` either**: a lookup table (`tx_by_hash`, `ledger_by_hash`) gives the key, and the `ledgers` row is the commit marker.
 - **Versioned rollups** (`stats_hourly`, `volume_*`) are read by their newest `version` (`argMax` / `max(version)`), never with `FINAL`.
 - `validations` (AggregatingMergeTree) is read with `GROUP BY (ledger_hash, validation_public_key)`.

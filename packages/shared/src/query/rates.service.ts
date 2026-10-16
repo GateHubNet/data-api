@@ -3,6 +3,7 @@ import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { Table } from '../clickhouse/tables';
 import { Asset, assetKey, canonicalPair } from './asset';
 import { ratio, VOLUME_SOURCE_COLUMNS, volumeColumns, volumesOf, VolumeSums } from './decimal';
+import { DISTINCT_PAGE_READ, distinctPageSql, readGrowingCap } from './distinct-page';
 
 /** The rolling windows of `period`, as the Ripple `/v2/exchange_rates` takes them. */
 export type RatePeriod = 'hour' | 'day' | '3day' | '7day' | '30day';
@@ -419,29 +420,49 @@ export class RatesService {
    *
    * Without `newest`, the trades of a native leg of 0.0005 or less are left out first. With it, the newest are taken
    * first and then the noise is left out of them, as the original did (its reduce filtered the 50 rows it had scanned):
-   * the newest 50 are read in reverse key order and the read stops after 50.
+   * the newest 50 are read in reverse key order with a plain inner `LIMIT` and deduped outside it (`distinctPageSql`),
+   * so ClickHouse stops after them; a `LIMIT BY` in the same SELECT as the read made it read most of the window
+   * (Ruling R106). When duplicates fill the room of the inner read, it is read again with more (`readGrowingCap`).
    */
   private async sums(stored: StoredPair, range: LedgerRange, newest?: number): Promise<VolumeSums> {
     const keep = keepConditions(stored);
     const where = [...PAIR_WHERE, 'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}'];
-    const source = (conditions: string[], descending: boolean, limit: string): string =>
-      `SELECT ${VOLUME_SOURCE_COLUMNS}
-         FROM ${Table.Exchanges}
-        WHERE ${conditions.join(' AND ')}
-        ORDER BY ${orderBy(descending)}
-        LIMIT 1 BY ${KEY_COLUMNS.join(', ')}${limit}`;
     const params: Record<string, unknown> = { ...pairParams(stored), min: range.min, max: range.max };
-    let sql: string;
     if (newest === undefined) {
-      sql = `SELECT ${volumeColumns()} FROM (${source([...where, ...keep], false, '')})`;
-    } else {
-      params.newest = newest;
-      sql =
-        `SELECT ${volumeColumns()} FROM (${source(where, true, '\n        LIMIT {newest:UInt32}')})` +
-        (keep.length > 0 ? ` WHERE ${keep.join(' AND ')}` : '');
+      const [row] = await this.ch.query<VolumeSums>(
+        `SELECT ${volumeColumns()}
+           FROM (SELECT ${VOLUME_SOURCE_COLUMNS}
+                   FROM ${Table.Exchanges}
+                  WHERE ${[...where, ...keep].join(' AND ')}
+                  ORDER BY ${orderBy(false)}
+                  LIMIT 1 BY ${KEY_COLUMNS.join(', ')})`,
+        params,
+      );
+      return row ?? NO_TRADES;
     }
-    const [row] = await this.ch.query<VolumeSums>(sql, params);
-    return row ?? NO_TRADES;
+
+    const page = distinctPageSql({
+      columns: `ledger_index, tx_index, node_index, ${VOLUME_SOURCE_COLUMNS}`,
+      table: Table.Exchanges,
+      where,
+      orderBy: KEY_COLUMNS,
+      unique: ['ledger_index', 'tx_index', 'node_index'],
+      descending: true,
+    });
+    // the noise is left out of the newest by the conditions of the sums, so `taken` counts all of them
+    const sql = `SELECT ${volumeColumns(keep.length > 0 ? keep.join(' AND ') : undefined)},
+                        count() AS taken, max(${DISTINCT_PAGE_READ}) AS inner_read
+                   FROM (${page})`;
+    return readGrowingCap(newest, async (cap) => {
+      const [row] = await this.ch.query<VolumeSums & { taken: number | string; inner_read: number | string }>(sql, {
+        ...params,
+        distinct_page_limit: newest,
+        distinct_page_cap: cap,
+      });
+      if (!row) return { result: NO_TRADES, found: 0, read: 0 };
+      const { taken, inner_read, ...sums } = row;
+      return { result: sums, found: Number(taken), read: Number(inner_read) };
+    });
   }
 
   /**

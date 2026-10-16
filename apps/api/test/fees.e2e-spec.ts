@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { fixtureSource } from './support/fixtures';
+import { expectBoundedInOrderRead } from './support/plans';
 
 /**
  * `GET /v2/network/fees` and `GET /v2/network/fee_stats` on a real ClickHouse, seeded with the 54 mock ledgers of the
@@ -856,8 +857,10 @@ describe('GET /v2/network/fees', () => {
       const fetched = async (limit: string): Promise<unknown> => {
         spy.mockClear();
         await get(`/v2/network/fees?interval=ledger${limit}`);
-        const call = spy.mock.calls.find(([q]) => /FROM ledgers\b/.test(String(q)) && /fetch/.test(String(q)));
-        return (call?.[1] as { fetch?: number } | undefined)?.fetch;
+        const call = spy.mock.calls.find(
+          ([q]) => /FROM ledgers\b/.test(String(q)) && /distinct_page_limit/.test(String(q)),
+        );
+        return (call?.[1] as { distinct_page_limit?: number } | undefined)?.distinct_page_limit;
       };
       expect(await fetched('')).toBe(201);
       expect(await fetched('&limit=abc')).toBe(201);
@@ -1023,7 +1026,10 @@ describe('GET /v2/network/fees', () => {
   describe('the query', () => {
     const ledgersSql = (spy: jest.SpyInstance): [string, Record<string, unknown>][] =>
       spy.mock.calls
-        .filter(([q]) => new RegExp(`FROM ${Table.Ledgers}\\b`).test(String(q)) && /fetch/.test(String(q)))
+        .filter(
+          ([q]) =>
+            new RegExp(`FROM ${Table.Ledgers}\\b`).test(String(q)) && /fetch|distinct_page_limit/.test(String(q)),
+        )
         .map(([q, p]) => [String(q), p as Record<string, unknown>]);
     const planOf = async (sql: string, params: Record<string, unknown>, kind = 'PIPELINE'): Promise<string> =>
       (await h.ch.query<{ explain: string }>(`EXPLAIN ${kind} ${sql}`, params)).map((r) => r.explain).join('\n');
@@ -1035,12 +1041,13 @@ describe('GET /v2/network/fees', () => {
       const [[sql, params]] = ledgersSql(spy);
       expect(sql).toMatch(/ledger_index BETWEEN \{min:UInt32\} AND \{max:UInt32\}/);
       expect(sql).toMatch(/\(ledger_index\) > \(\{k0:UInt32\}\)/);
-      expect(sql).toMatch(/ORDER BY ledger_index ASC/);
-      // a ledger that was written twice counts once
-      expect(sql).toMatch(/LIMIT 1 BY ledger_index\s+LIMIT \{fetch:UInt32\}/);
+      // read in the order of the key with a plain LIMIT, which stops the read after the page (Ruling R106) ...
+      expect(sql).toMatch(/ORDER BY ledger_index ASC\s+LIMIT \{distinct_page_cap:UInt32\}/);
+      // ... and a ledger that was written twice counts once, outside it
+      expect(sql).toMatch(/LIMIT 1 BY ledger_index\s+LIMIT \{distinct_page_limit:UInt32\}/);
       expect(sql).not.toMatch(/\bFINAL\b/);
-      expect(params).toMatchObject({ min: 1021029, max: 29709909, k0: 11118861, fetch: 5 });
-      expect(Object.keys(params).sort()).toEqual(['fetch', 'k0', 'max', 'min']);
+      expect(params).toMatchObject({ min: 1021029, max: 29709909, k0: 11118861, distinct_page_limit: 5 });
+      expect(Object.keys(params).sort()).toEqual(['distinct_page_cap', 'distinct_page_limit', 'k0', 'max', 'min']);
     });
 
     it('reads the ledgers in the order of their primary key, so that a page never sorts the whole range', async () => {
@@ -1054,14 +1061,8 @@ describe('GET /v2/network/fees', () => {
           await get(`/v2/network/fees?${variant}&descending=${descending}`);
           const [[sql, params]] = ledgersSql(spy);
           jest.restoreAllMocks();
-          const pipeline = await planOf(sql, params);
-          expect([descending, variant, pipeline]).toEqual([
-            descending,
-            variant,
-            expect.stringContaining('ReadPoolInOrder'),
-          ]);
-          expect(pipeline).toContain(descending ? 'InReverseOrder' : 'algorithm: InOrder');
-          expect(pipeline).not.toContain('PartialSortingTransform');
+          // in the order of the key, no sort, and a LIMIT on the read itself: it stops after the page
+          await expectBoundedInOrderRead(h, sql, params, descending, [descending, variant]);
         }
       }
     });
@@ -1590,7 +1591,7 @@ describe('GET /v2/network/fee_stats', () => {
         spy.mockClear();
         await get(`/v2/network/fee_stats?${limit}`);
         const call = spy.mock.calls.find(([q]) => new RegExp(`FROM ${Table.FeeStats}\\b`).test(String(q)));
-        return (call?.[1] as { fetch?: number } | undefined)?.fetch;
+        return (call?.[1] as { distinct_page_limit?: number } | undefined)?.distinct_page_limit;
       };
       expect(await fetched('')).toBe(201);
       expect(await fetched('limit=abc')).toBe(201);
@@ -1678,14 +1679,15 @@ describe('GET /v2/network/fee_stats', () => {
       expect(sql).toMatch(/ts >= fromUnixTimestamp64Milli\(\{from:Int64\}, 'UTC'\)/);
       expect(sql).toMatch(/ts < fromUnixTimestamp64Milli\(\{until:Int64\}, 'UTC'\)/);
       expect(sql).toMatch(/ts > fromUnixTimestamp64Milli\(toInt64\(\{k0:UInt64\}\), 'UTC'\)/);
-      expect(sql).toMatch(/ORDER BY ts ASC/);
-      // a snapshot that was written twice counts once
-      expect(sql).toMatch(/LIMIT 1 BY ts\s+LIMIT \{fetch:UInt32\}/);
+      // read in the order of the key with a plain LIMIT, which stops the read after the page (Ruling R106) ...
+      expect(sql).toMatch(/ORDER BY ts ASC\s+LIMIT \{distinct_page_cap:UInt32\}/);
+      // ... and a snapshot that was written twice counts once, outside it
+      expect(sql).toMatch(/LIMIT 1 BY ms\s+LIMIT \{distinct_page_limit:UInt32\}/);
       expect(sql).not.toMatch(/\bFINAL\b/);
       expect(params).toMatchObject({
         from: Date.parse('2020-01-01T00:00:00Z'),
         k0: Date.parse('2020-01-01T12:00:12.250Z'),
-        fetch: 4,
+        distinct_page_limit: 4,
       });
     });
 
@@ -1697,14 +1699,8 @@ describe('GET /v2/network/fee_stats', () => {
           await get(`/v2/network/fee_stats?${variant}&descending=${descending}`);
           const [[sql, params]] = feeSql(spy);
           jest.restoreAllMocks();
-          const pipeline = await planOf(sql, params);
-          expect([descending, variant, pipeline]).toEqual([
-            descending,
-            variant,
-            expect.stringContaining('ReadPoolInOrder'),
-          ]);
-          expect(pipeline).toContain(descending ? 'InReverseOrder' : 'algorithm: InOrder');
-          expect(pipeline).not.toContain('PartialSortingTransform');
+          // in the order of the key, no sort, and a LIMIT on the read itself: it stops after the page
+          await expectBoundedInOrderRead(h, sql, params, descending, [descending, variant]);
         }
       }
     });

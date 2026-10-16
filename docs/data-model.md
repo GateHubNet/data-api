@@ -65,7 +65,8 @@ and a ledger rewritten with `--reprocess` is briefly absent.
 
 ### Read-side rule: no `FINAL` on lists
 
-Lists read in key order with `LIMIT 1 BY <key>` and stop after `limit + 1` rows; aggregates read the same deduplicated rows;
+Lists read in key order with a plain `LIMIT` (the page and room for duplicates) and dedupe outside that read with `LIMIT 1 BY <key>`,
+so ClickHouse stops after the page ([clickhouse](clickhouse.md#reading-a-page-what-stops-the-read)); aggregates read the same deduplicated rows;
 rollups are read by newest `version`; `validations` is read with `GROUP BY` and added up. See [clickhouse](clickhouse.md#the-final-rule)
 and [ADR-0003](adr/0003-no-final-on-list-queries.md).
 

@@ -8,6 +8,10 @@ import { badRequest } from './errors';
  * A list is ordered by its unique key, and a marker is that key for the last row of a page: the next page is every row
  * after it, found with one tuple comparison `(k1, k2) > ({k0:T}, {k1:T})`. No OFFSET and no FINAL, so a page far into
  * the list costs the same as the first. A marker never holds a DateTime: the time axis of the tables is `ledger_index`.
+ *
+ * The page itself is read with `readDistinctPage` (`@gatehub/data-api-shared`): a plain `ORDER BY <whole key> LIMIT`
+ * inside, which ClickHouse stops after the page, and the dedupe of rows written twice (`LIMIT 1 BY`) outside it. Both in
+ * one SELECT made ClickHouse read most of the range (Ruling R106).
  */
 
 /** The ClickHouse types a marker can hold. The key of a list is made of these. */
@@ -70,6 +74,11 @@ export function decodeMarker(marker: string | undefined, keys: KeysetKey[]): Key
  * The tuple comparison that selects the rows after a marker, and its bound params (`k0`, `k1`, ... or `<prefix>0`, ...).
  * Ascending lists continue with `>`, descending ones with `<`. No `values` (the first page) gives an empty clause.
  * `values` come from `decodeMarker`, which has checked them against the same keys.
+ *
+ * With more than one column the first one is also bounded on its own (`a >= x AND (a, b) > (x, y)`): ClickHouse (26.8)
+ * does not narrow the granules it reads by a tuple comparison, only by the plain one, so without it a page deep into a
+ * list read every row from the start of the range up to the marker and threw them away. Pass the keys that follow the
+ * columns the query fixes with `=` (the account, the pair): the bound has to be on the first column that varies.
  */
 export function keysetClause(
   keys: KeysetKey[],
@@ -86,7 +95,14 @@ export function keysetClause(
   const placeholders = keys.map((k, i) => `{${prefix}${i}:${k.type}}`).join(', ');
   const params: Record<string, unknown> = {};
   values.forEach((v, i) => (params[`${prefix}${i}`] = v));
-  return { clause: `(${columns}) ${descending ? '<' : '>'} (${placeholders})`, params };
+  const tuple = `(${columns}) ${descending ? '<' : '>'} (${placeholders})`;
+  const bound = `${keys[0].column} ${descending ? '<=' : '>='} {${prefix}0:${keys[0].type}}`;
+  return { clause: keys.length > 1 ? `${bound} AND ${tuple}` : tuple, params };
+}
+
+/** The column names of a key, in its order (what `readDistinctPage` takes as `orderBy` and `unique`). */
+export function columnsOf(keys: KeysetKey[]): string[] {
+  return keys.map((k) => k.column);
 }
 
 /** `a ASC, b ASC` (or DESC): every column of the key in the same direction. */

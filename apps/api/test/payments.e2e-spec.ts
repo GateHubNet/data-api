@@ -2,6 +2,7 @@ import { PaymentsRow, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { FixturePayment, fixturePayments } from './support/fixtures';
+import { expectBoundedInOrderRead, innerRead, isPageRead } from './support/plans';
 
 /**
  * `GET /v2/payments` and `GET /v2/payments/:currency` on a real ClickHouse, seeded with the 54 ledgers of the original
@@ -444,7 +445,7 @@ describe('payments API endpoint', () => {
       expect((await get('/v2/payments/CNY+rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q')).body.count).toBe(0);
     });
 
-    it('pages payments_by_currency for the keys, and reads the rows from payments with an IN subquery', async () => {
+    it('pages payments_by_currency for the keys, then reads the rows of the page from payments by their keys', async () => {
       const query = jest.spyOn(h.ch, 'query');
       const res = await get(`/v2/payments/${CNY}?limit=10`);
       expect(res.status).toBe(200);
@@ -454,19 +455,21 @@ describe('payments API endpoint', () => {
       expect(paging).toHaveLength(1);
       const sql = String(paging[0][0]);
       const params = paging[0][1];
-      // the wide rows come from payments, selected by the keys of the narrow table
-      expect(sql).toMatch(
-        new RegExp(
-          `FROM ${Table.Payments}\\b[\\s\\S]*\\(ledger_index, tx_index\\) IN \\(\\s*SELECT ledger_index, tx_index FROM ${Table.PaymentsByCurrency}`,
-        ),
-      );
       expect(sql).toMatch(/currency = \{currency:String\}/);
       expect(sql).toMatch(/issuer = \{issuer:String\}/);
-      // a row that was written twice counts once
-      expect(sql.match(/LIMIT 1 BY ledger_index, tx_index/g)).toHaveLength(2);
-      expect(params).toMatchObject({ currency: 'CNY', issuer: CNY.split('+')[1], fetch: 11 });
+      // read with a plain LIMIT, which stops the read after the page (Ruling R106); outside it a row that was written
+      // twice counts once
+      expect(sql).toMatch(/tx_index ASC\s+LIMIT \{distinct_page_cap:UInt32\}\)/);
+      expect(sql.match(/LIMIT 1 BY ledger_index, tx_index/g)).toHaveLength(1);
+      expect(params).toMatchObject({ currency: 'CNY', issuer: CNY.split('+')[1], distinct_page_limit: 11 });
       // values are bound, never written into the SQL
       expect(sql).not.toContain(CNY.split('+')[1]);
+
+      // the wide rows of the page (not the extra key), by their keys, from the ledgers of the page only
+      const wide = query.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Payments}\\b`).test(String(q)));
+      expect(wide).toHaveLength(1);
+      expect(String(wide[0][0])).toMatch(/ledger_index BETWEEN \{lo:UInt32\} AND \{hi:UInt32\}/);
+      expect((wide[0][1] as { ledgers: number[] }).ledgers).toHaveLength(10);
     });
 
     it('reads the tables in the order of their primary key, so that a page never sorts the whole range', async () => {
@@ -478,24 +481,18 @@ describe('payments API endpoint', () => {
         const query = jest.spyOn(h.ch, 'query');
         await get(`/v2/payments/XRP?limit=5&descending=${descending}&marker=${markerOf(ALL[10].row)}`);
         await get(`/v2/payments?limit=5&descending=${descending}&marker=${markerOf(ALL[10].row)}`);
-        const calls = query.mock.calls.filter(([q]) => /FROM payments\b/.test(String(q)));
-        expect(calls).toHaveLength(2);
+        // the keys of the currency from payments_by_currency, and the page of all currencies from payments
+        const reads = query.mock.calls
+          .filter(([q]) => isPageRead(String(q)))
+          .map(([q, p]): [string, Record<string, unknown>] => [String(q), p as Record<string, unknown>]);
         jest.restoreAllMocks();
-
-        const [currencyCall, allCall] = calls;
-        // the keys of the currency: the subquery on payments_by_currency
-        const keys = /IN \(\s*(SELECT[\s\S]*?LIMIT \{fetch:UInt32\})\)/.exec(String(currencyCall[0]))?.[1] as string;
-        expect(keys).toContain(Table.PaymentsByCurrency);
-        const reads: [string, Record<string, unknown>][] = [
-          [keys, currencyCall[1] as Record<string, unknown>],
-          [String(allCall[0]), allCall[1] as Record<string, unknown>],
-        ];
+        expect(reads.map(([sql]) => /FROM (\w+)/.exec(innerRead(sql))?.[1])).toEqual([
+          Table.PaymentsByCurrency,
+          Table.Payments,
+        ]);
         for (const [sql, params] of reads) {
-          const plan = await h.ch.query<{ explain: string }>(`EXPLAIN PIPELINE ${sql}`, params);
-          const pipeline = plan.map((r) => r.explain).join('\n');
-          expect([descending, pipeline]).toEqual([descending, expect.stringContaining('ReadPoolInOrder')]);
-          expect(pipeline).toContain(descending ? 'InReverseOrder' : 'algorithm: InOrder');
-          expect(pipeline).not.toContain('PartialSortingTransform');
+          // in the order of the key, no sort, and a LIMIT on the read itself: it stops after the page
+          await expectBoundedInOrderRead(h, sql, params, descending, descending);
         }
       }
     });
@@ -704,7 +701,11 @@ describe('payments API endpoint', () => {
         const res = await get(`/v2/payments?${query}`);
         // one more than the page is asked for: the extra row tells whether there is a next page
         const paging = query$.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Payments}\\b`).test(String(q)));
-        expect([query, res.status, paging[0][1]]).toEqual([query, 200, expect.objectContaining({ fetch: rows + 1 })]);
+        expect([query, res.status, paging[0][1]]).toEqual([
+          query,
+          200,
+          expect.objectContaining({ distinct_page_limit: rows + 1 }),
+        ]);
         expect([query, res.body.count]).toEqual([query, Math.min(rows, 182)]);
         jest.restoreAllMocks();
       }

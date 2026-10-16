@@ -1,7 +1,7 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { TxObject, TxService } from '../common/tx-object';
 
 /** The highest `Sequence` a transaction can have: the column is a UInt32. */
@@ -116,24 +116,25 @@ export class AccountTransactionsService {
       ...(q.result !== undefined ? ['result = {result:String}'] : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
-    // `LIMIT 1 BY`: a row that was written twice (the table is not collapsed before a merge, and no FINAL is used)
-    // counts once; the extra row tells whether there is a next page
-    const found = await this.ch.query<TimeKey>(
-      `SELECT ledger_index, tx_index FROM ${Table.AccountTransactions}
-        WHERE ${conditions.join(' AND ')}
-        ORDER BY ${orderByClause(TIME_ORDER, q.descending)}
-        LIMIT 1 BY ledger_index, tx_index
-        LIMIT {fetch:UInt32}`,
-      {
+    // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
+    // used), with one more than the page: it tells whether there is a next page
+    const found = await readDistinctPage<TimeKey>(this.ch, {
+      columns: 'ledger_index, tx_index',
+      table: Table.AccountTransactions,
+      where: conditions,
+      orderBy: columnsOf(TIME_ORDER),
+      unique: columnsOf(TIME_KEYS),
+      descending: q.descending,
+      params: {
         account: q.account,
         ...(q.type !== undefined && { type: q.type }),
         ...(q.result !== undefined && { result: q.result }),
         min: range.min,
         max: range.max,
         ...cursor.params,
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
 
     const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
     return this.page(page.rows, page.marker, q.binary);
@@ -176,22 +177,23 @@ export class AccountTransactionsService {
         : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
-    const found = await this.ch.query<SequenceKey>(
-      `SELECT sequence, ledger_index, tx_index FROM ${Table.AccountTxBySequence}
-        WHERE ${conditions.join(' AND ')}
-        ORDER BY ${orderByClause(SEQUENCE_ORDER, q.descending)}
-        LIMIT 1 BY sequence, ledger_index, tx_index
-        LIMIT {fetch:UInt32}`,
-      {
+    const found = await readDistinctPage<SequenceKey>(this.ch, {
+      columns: 'sequence, ledger_index, tx_index',
+      table: Table.AccountTxBySequence,
+      where: conditions,
+      orderBy: columnsOf(SEQUENCE_ORDER),
+      unique: columnsOf(SEQUENCE_KEYS),
+      descending: q.descending,
+      params: {
         account: q.account,
         ...(q.type !== undefined && { type: q.type }),
         ...(q.result !== undefined && { result: q.result }),
         min_sequence: min,
         max_sequence: max,
         ...cursor.params,
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
 
     const page = paginate(found, q.limit, (key) => [key.sequence, key.ledger_index, key.tx_index]);
     return this.page(page.rows, page.marker, q.binary);

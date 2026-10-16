@@ -35,7 +35,19 @@ first ClickHouse design keyed every row on a CTID and ordered lists by a `date` 
 
 ## Consequences
 **Positive**
-- Every list is a bounded, key-ordered range read that stops after `limit + 1` rows; deep pages cost the same as the first.
+- Every list is a key-ordered range read that ClickHouse stops after the page: about a granule (8,192 rows) of each part the
+  rest of the range spans, however long the range is, and deep pages cost the same as the first. Two details carry that, both
+  found in the final review (Ruling R106) and checked by read_rows tests (`apps/api/test/paged-reads.e2e-spec.ts`):
+  - the dedupe of rows written twice (`LIMIT 1 BY <key>`) must not be in the SELECT that reads the table: between the read in
+    order and the `LIMIT` it keeps ClickHouse 26.8 from pushing the limit into the read, and a page over a range of more than one
+    part read and buffered most of the range (143M rows / 1.16 GiB for one 201-row page of a 256M-row table). `readDistinctPage`
+    (shared) reads with a plain inner `ORDER BY <whole key> LIMIT <page + room for duplicates>` and dedupes outside it, reading
+    again with more room in the rare case duplicates fill it;
+  - the marker's tuple comparison `(a, b) > (x, y)` does not narrow the granules ClickHouse reads, so `keysetClause` also bounds
+    the first column on its own (`a >= x AND (a, b) > (x, y)`); without it a deep page read the range from its start up to the
+    marker.
+  `/v2/exchanges` of every pair has no key to read in order (the table is ordered by the pair first): it reads the window in
+  windows of ledgers, each sorted on its own to the page (Ruling R107).
 - Markers are stable under concurrent inserts and unique; a page walk concatenated equals the unpaged list.
 - Replays, restarts and overlaps are exact without `FINAL` or eventual-consistency tricks; a crash leaves only invisible, deletable rows.
 

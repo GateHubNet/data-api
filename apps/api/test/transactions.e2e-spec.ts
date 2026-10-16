@@ -1,6 +1,7 @@
 import { Table } from '@gatehub/data-api-shared';
 import { Harness, startHarness } from './harness';
 import { FixtureTx, fixtureTransaction, fixtureTransactions, transactionId } from './support/fixtures';
+import { expectBoundedInOrderRead, isPageRead } from './support/plans';
 
 /**
  * `GET /v2/transactions/:tx_hash` and `GET /v2/transactions` on a real ClickHouse, seeded with the 54 ledgers of the
@@ -649,6 +650,29 @@ describe('transactions API endpoint', () => {
       expect(all).toHaveLength(188);
       expect(all.every((t) => t.tx.TransactionType === 'Payment')).toBe(true);
       expect(all.map((t) => t.hash)).toEqual(hashesOf(ALL.filter((t) => t.row.tx_type === 'Payment')));
+    });
+
+    it('reads both tables in the order of their whole key, and stops after the page (R106)', async () => {
+      // tx_by_type is ORDER BY (tx_type, ledger_index, tx_index): the type is fixed, but the ORDER BY spells it out, or
+      // ClickHouse sorts the whole range of the type (final review M11)
+      const marker = markerOf(ALL[100]);
+      for (const descending of [false, true]) {
+        for (const variant of ['', '&type=Payment', '&type=OfferCreate&result=tesSUCCESS', `&marker=${marker}`]) {
+          const query = jest.spyOn(h.ch, 'query');
+          await get(`/v2/transactions?limit=5&descending=${descending}${variant}`);
+          const calls = query.mock.calls.filter(([q]) => isPageRead(String(q)));
+          jest.restoreAllMocks();
+          expect(calls).toHaveLength(1);
+          const [sql, params] = calls[0] as [string, Record<string, unknown>];
+          const d = descending ? 'DESC' : 'ASC';
+          expect(sql).toContain(
+            variant.includes('type=')
+              ? `ORDER BY tx_type ${d}, ledger_index ${d}, tx_index ${d}`
+              : `ORDER BY ledger_index ${d}, tx_index ${d}`,
+          );
+          await expectBoundedInOrderRead(h, sql, params, descending, [descending, variant]);
+        }
+      }
     });
 
     it('no type pages the transactions table and never reads tx_by_type', async () => {

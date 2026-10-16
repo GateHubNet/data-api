@@ -1,6 +1,7 @@
 import { AccountsCreatedRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { FixtureAccount, fixtureAccountsCreated } from './support/fixtures';
+import { expectBoundedInOrderRead } from './support/plans';
 
 /**
  * `GET /v2/accounts` and `GET /v2/accounts/:address` on a real ClickHouse, seeded with the 54 ledgers of the original
@@ -647,7 +648,11 @@ describe('accounts API endpoint', () => {
         const res = await get(`/v2/accounts?${query}`);
         // one more than the page is asked for: the extra row tells whether there is a next page
         const paging = spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.AccountsCreated}\\b`).test(String(q)));
-        expect([query, res.status, paging[0][1]]).toEqual([query, 200, expect.objectContaining({ fetch: rows + 1 })]);
+        expect([query, res.status, paging[0][1]]).toEqual([
+          query,
+          200,
+          expect.objectContaining({ distinct_page_limit: rows + 1 }),
+        ]);
         expect([query, res.body.count]).toEqual([query, Math.min(rows, 13)]);
         jest.restoreAllMocks();
       }
@@ -815,13 +820,30 @@ describe('accounts API endpoint', () => {
       expect(res.body.count).toBe(4);
       const [[sql, params]] = accountsSql(spy);
       expect(sql).toMatch(/ledger_index BETWEEN \{min:UInt32\} AND \{max:UInt32\}/);
-      expect(sql).toMatch(/\(ledger_index, tx_index, account\) > \(\{k0:UInt32\}, \{k1:UInt32\}, \{k2:String\}\)/);
-      expect(sql).toMatch(/ORDER BY ledger_index ASC, tx_index ASC, account ASC/);
-      // a row that was written twice counts once
-      expect(sql).toMatch(/LIMIT 1 BY ledger_index, tx_index, account\s+LIMIT \{fetch:UInt32\}/);
+      expect(sql).toContain(
+        'ledger_index >= {k0:UInt32} AND (ledger_index, tx_index, account) > ({k0:UInt32}, {k1:UInt32}, {k2:String})',
+      );
+      // read with a plain LIMIT, which stops the read after the page (Ruling R106) ...
+      expect(sql).toMatch(/ORDER BY ledger_index ASC, tx_index ASC, account ASC\s+LIMIT \{distinct_page_cap:UInt32\}/);
+      // ... and a row that was written twice counts once, outside it
+      expect(sql).toMatch(/LIMIT 1 BY ledger_index, tx_index, account\s+LIMIT \{distinct_page_limit:UInt32\}/);
       expect(sql).not.toMatch(/\bFINAL\b/);
-      expect(params).toMatchObject({ min: 1021029, k0: 1021029, k1: 2, k2: ALL[2].row.account, fetch: 5 });
-      expect(Object.keys(params).sort()).toEqual(['fetch', 'k0', 'k1', 'k2', 'max', 'min']);
+      expect(params).toMatchObject({
+        min: 1021029,
+        k0: 1021029,
+        k1: 2,
+        k2: ALL[2].row.account,
+        distinct_page_limit: 5,
+      });
+      expect(Object.keys(params).sort()).toEqual([
+        'distinct_page_cap',
+        'distinct_page_limit',
+        'k0',
+        'k1',
+        'k2',
+        'max',
+        'min',
+      ]);
     });
 
     it('descending reads the same key backwards', async () => {
@@ -851,15 +873,8 @@ describe('accounts API endpoint', () => {
           const [[sql, params]] = accountsSql(spy);
           jest.restoreAllMocks();
 
-          const plan = await h.ch.query<{ explain: string }>(`EXPLAIN PIPELINE ${sql}`, params);
-          const pipeline = plan.map((r) => r.explain).join('\n');
-          expect([descending, variant, pipeline]).toEqual([
-            descending,
-            variant,
-            expect.stringContaining('ReadPoolInOrder'),
-          ]);
-          expect(pipeline).toContain(descending ? 'InReverseOrder' : 'algorithm: InOrder');
-          expect(pipeline).not.toContain('PartialSortingTransform');
+          // in the order of the key, no sort, and a LIMIT on the read itself: it stops after the page
+          await expectBoundedInOrderRead(h, sql, params, descending, [descending, variant]);
         }
       }
     });
@@ -886,7 +901,7 @@ describe('accounts API endpoint', () => {
       const calls = accountsSql(spy);
       expect(calls).toHaveLength(2);
       expect(calls[0][0]).toMatch(/LIMIT 1\b/);
-      expect(calls[1][1]).toMatchObject({ fetch: 3 });
+      expect(calls[1][1]).toMatchObject({ distinct_page_limit: 3 });
     });
   });
 });

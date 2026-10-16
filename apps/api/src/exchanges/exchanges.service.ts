@@ -1,7 +1,22 @@
-import { Asset, canonicalPair, ClickHouseService, Table } from '@gatehub/data-api-shared';
+import {
+  Asset,
+  canonicalPair,
+  ClickHouseService,
+  readDistinctPage,
+  readGrowingCap,
+  Table,
+} from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, encodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
+import {
+  columnsOf,
+  decodeMarker,
+  encodeMarker,
+  keysetClause,
+  KeysetKey,
+  orderByClause,
+  paginate,
+} from '../common/pagination';
 import {
   AGGREGATE_COLUMNS,
   AGGREGATE_SOURCE_COLUMNS,
@@ -37,9 +52,28 @@ export const PAIR_KEYS: KeysetKey[] = [
  * The whole ORDER BY of `exchanges`. A list of one pair fixes the first four columns, so its order is that of
  * `EXCHANGE_KEYS`, but it has to ask for the whole key: with only `ledger_index, tx_index, node_index` ClickHouse
  * cannot read the table in the order of its primary key, and sorts every row of the pair in the range first (found in
- * Task 21 for `payments_by_currency`). Spelled out, it reads in order and stops after the page.
+ * Task 21 for `payments_by_currency`). Spelled out, it reads in order, and `readDistinctPage` stops it after the page.
  */
 export const PAIR_ORDER: KeysetKey[] = [...PAIR_KEYS, ...EXCHANGE_KEYS];
+
+/**
+ * The least room of the read that finds the buckets of a page of candles: a quarter of a granule. ClickHouse reads whole
+ * granules (8192 rows) of every part the read reaches, and a cap above a granule makes that two of each; below it, a page
+ * of buckets of a few exchanges each is one read.
+ */
+const EDGE_MIN_ROOM = 2048;
+
+/**
+ * The ledgers of the first window `all()` reads, and the most a window grows to: about a quarter of an hour of XRPL
+ * ledgers, doubling up to about six weeks.
+ */
+const FIRST_ALL_WINDOW = 256;
+const MAX_ALL_WINDOW = 1_048_576;
+
+/** Whether two stored exchanges are the same one (the same key), as a row written twice is. */
+function sameExchange(a: StoredExchange, b: StoredExchange): boolean {
+  return a.ledger_index === b.ledger_index && a.tx_index === b.tx_index && a.node_index === b.node_index;
+}
 
 /** What both lists of exchanges are asked for; the values are already validated. */
 export interface ExchangesWindow {
@@ -92,7 +126,8 @@ export interface ReduceQuery extends PairExchangesQuery {
  * reduced row are aggregated in ClickHouse from the same range of the key (the original read them from `agg_exchanges`,
  * which its importer kept up to date, and reduced raw rows in the API).
  *
- * The list of all pairs has no pair to fix, so it is a scan of the ledger range, sorted by the key of the ledger.
+ * The list of all pairs has no pair to fix, so it reads the ledger range in windows of ledgers, each sorted by the key
+ * of the ledger (see `all()`).
  */
 @Injectable()
 export class ExchangesService {
@@ -116,59 +151,99 @@ export class ExchangesService {
       stored.counter.currency,
       stored.counter.issuer ?? '',
     ];
-    // the tuple of the whole key: the pair is equal, so only the ledger part decides, and ClickHouse can use it
-    // on the primary key
-    const cursor = keysetClause(PAIR_ORDER, q.descending, after && [...pairValues, ...after]);
+    const cursor = keysetClause(EXCHANGE_KEYS, q.descending, after);
     const where = [
       ...PAIR_KEYS.map((k, i) => `${k.column} = {pair${i}:${k.type}}`),
       'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
       ...(q.autobridged ? ['autobridged_currency IS NOT NULL'] : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
-    const params: Record<string, unknown> = {
-      ...Object.fromEntries(pairValues.map((v, i) => [`pair${i}`, v])),
-      min: range.min,
-      max: range.max,
-      ...cursor.params,
-      // one row more than the page: it only tells whether there is a next page
-      fetch: q.limit + 1,
-    };
-
-    // `LIMIT 1 BY` the whole key: a row that was written twice (the tables are not collapsed before a merge, and no FINAL
-    // is used) counts once
-    const rows = await this.ch.query<StoredExchange>(
-      `SELECT ${EXCHANGE_COLUMNS} FROM ${Table.Exchanges}
-        WHERE ${where.join(' AND ')}
-        ORDER BY ${orderByClause(PAIR_ORDER, q.descending)}
-        LIMIT 1 BY ${PAIR_ORDER.map((k) => k.column).join(', ')}
-        LIMIT {fetch:UInt32}`,
-      params,
-    );
+    // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
+    // used), with one more than the page: it only tells whether there is a next page
+    const rows = await readDistinctPage<StoredExchange>(this.ch, {
+      columns: EXCHANGE_COLUMNS,
+      table: Table.Exchanges,
+      where,
+      orderBy: columnsOf(PAIR_ORDER),
+      unique: columnsOf(EXCHANGE_KEYS),
+      descending: q.descending,
+      params: {
+        ...Object.fromEntries(pairValues.map((v, i) => [`pair${i}`, v])),
+        min: range.min,
+        max: range.max,
+        ...cursor.params,
+      },
+      limit: q.limit + 1,
+    });
     return this.page(rows, q.limit, stored.inverted);
   }
 
-  /** One page of the exchanges of every pair, as they are stored, in the order of the ledgers. */
+  /**
+   * One page of the exchanges of every pair, as they are stored, in the order of the ledgers.
+   *
+   * `exchanges` is ordered by the pair first, so the order of the ledgers is not an order the table can be read in: a
+   * query over the whole window would sort all of it (by default every exchange since 2013) for one page. So the window
+   * is read in windows of ledgers, from the marker on (back, descending): each is sorted on its own, a top-N of the
+   * page, and ClickHouse skips the granules of the pairs that have no exchange in it through the primary key. The first
+   * window is `FIRST_ALL_WINDOW` ledgers; a window that holds too few exchanges for the page is followed by one twice as
+   * long (up to `MAX_ALL_WINDOW`), so a gap of years is a handful of reads and a busy stretch is one small one. The rows
+   * of a window are read with a plain `LIMIT` and deduped here: a row written twice (no FINAL) sorts next to its copy.
+   */
   async all(q: ExchangesWindow): Promise<ExchangesPage> {
     const after = decodeMarker(q.marker, EXCHANGE_KEYS);
 
     const range = await this.ranges.resolve(q.start, q.endExclusive);
     if (!range) return { exchanges: [] };
 
+    // the ledgers still to read, [lo, hi]: from the ledger of the marker on (back to it, descending)
+    let lo = range.min;
+    let hi = range.max;
+    if (after !== undefined) {
+      if (q.descending) hi = Math.min(hi, Number(after[0]));
+      else lo = Math.max(lo, Number(after[0]));
+    }
     const cursor = keysetClause(EXCHANGE_KEYS, q.descending, after);
+    // one row more than the page: it only tells whether there is a next page
+    const fetch = q.limit + 1;
+    const rows: StoredExchange[] = [];
+    let span = FIRST_ALL_WINDOW;
+    while (lo <= hi && rows.length < fetch) {
+      const window = q.descending
+        ? { min: Math.max(lo, hi - span + 1), max: hi }
+        : { min: lo, max: Math.min(hi, lo + span - 1) };
+      rows.push(...(await this.allIn(window, cursor, q.autobridged, q.descending, fetch - rows.length)));
+      if (q.descending) hi = window.min - 1;
+      else lo = window.max + 1;
+      span = Math.min(span * 2, MAX_ALL_WINDOW);
+    }
+    return this.page(rows, q.limit, false);
+  }
+
+  /**
+   * The first `want` exchanges of every pair in a window of ledgers, in the order of the page, each once. The read has
+   * room for as many duplicates as rows wanted; if they fill it, it is read again with more (`readGrowingCap`).
+   */
+  private allIn(
+    window: { min: number; max: number },
+    cursor: { clause: string; params: Record<string, unknown> },
+    autobridged: boolean,
+    descending: boolean,
+    want: number,
+  ): Promise<StoredExchange[]> {
     const where = [
-      'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
-      ...(q.autobridged ? ['autobridged_currency IS NOT NULL'] : []),
+      'ledger_index BETWEEN {lo:UInt32} AND {hi:UInt32}',
+      ...(autobridged ? ['autobridged_currency IS NOT NULL'] : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
-    const rows = await this.ch.query<StoredExchange>(
-      `SELECT ${EXCHANGE_COLUMNS} FROM ${Table.Exchanges}
+    const sql = `SELECT ${EXCHANGE_COLUMNS} FROM ${Table.Exchanges}
         WHERE ${where.join(' AND ')}
-        ORDER BY ${orderByClause(EXCHANGE_KEYS, q.descending)}
-        LIMIT 1 BY ${EXCHANGE_KEYS.map((k) => k.column).join(', ')}
-        LIMIT {fetch:UInt32}`,
-      { min: range.min, max: range.max, ...cursor.params, fetch: q.limit + 1 },
-    );
-    return this.page(rows, q.limit, false);
+        ORDER BY ${orderByClause(EXCHANGE_KEYS, descending)}
+        LIMIT {cap:UInt32}`;
+    return readGrowingCap(want, async (cap) => {
+      const read = await this.ch.query<StoredExchange>(sql, { lo: window.min, hi: window.max, ...cursor.params, cap });
+      const distinct = read.filter((row, i) => i === 0 || !sameExchange(row, read[i - 1]));
+      return { result: distinct.slice(0, want), found: distinct.length, read: read.length };
+    });
   }
 
   /**
@@ -182,9 +257,13 @@ export class ExchangesService {
    * the buckets after it (before it, descending), which narrows the ledgers to read.
    *
    * Two queries, both on the range of the primary key of the pair, read in its order:
-   * - the buckets of the page and the one after it: the first exchange of each bucket, in the order of the page, cut
-   *   at `limit + 1` buckets, which stops the reading there. The first ledger of the bucket after the page (its last
-   *   one, descending) bounds the page: one ledger closes at one time, so it lies in one bucket;
+   * - the buckets of the page and the one after it: the exchanges of the pair in the order of the page, with a plain
+   *   inner `LIMIT` that ClickHouse stops at, grouped by bucket outside it: every bucket the read reached has its first
+   *   exchange among the rows read (the read starts at the start of the range), so its first ledger is exact. When the
+   *   read stopped at its cap with fewer than `limit + 1` buckets, it is read again with four times the room
+   *   (`readGrowingCap`, from `EDGE_MIN_ROOM` on). A `LIMIT 1 BY bucket` in the same SELECT as the read made
+   *   ClickHouse read the rest of the pair's range (Ruling R106). The first ledger of the bucket after the page (its
+   *   last one, descending) bounds the page: one ledger closes at one time, so it lies in one bucket;
    * - the aggregation of the exchanges of those ledgers, by bucket.
    * Both rest on the close time never decreasing with the ledger index (`exchanges.close_time` is that of the ledger,
    * and a ledger closes after its parent): read in the order of the key, the buckets come in order too, so the first
@@ -216,14 +295,26 @@ export class ExchangesService {
     const direction = q.descending ? 'DESC' : 'ASC';
 
     const pair = this.pairFilter(stored, q.autobridged);
-    const edges = await this.ch.query<{ bucket: number; ledger_index: number }>(
-      `SELECT ${bucket} AS bucket, ledger_index
-       FROM ${Table.Exchanges}
-       WHERE ${[...pair.where, 'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}'].join(' AND ')}
-       ORDER BY ${orderByClause(PAIR_ORDER, q.descending)}
-       LIMIT 1 BY bucket
-       LIMIT {fetch:UInt32}`,
-      { ...pair.params, min: range.min, max: range.max, fetch: q.limit + 1 },
+    const fetch = q.limit + 1;
+    const edges = await readGrowingCap(
+      fetch,
+      async (cap) => {
+        const rows = await this.ch.query<{ bucket: number; ledger_index: number; inner_read: number | string }>(
+          `SELECT bucket, ${q.descending ? 'max' : 'min'}(ledger_index) AS ledger_index,
+                  sum(count()) OVER () AS inner_read
+             FROM (SELECT ${bucket} AS bucket, ledger_index
+                     FROM ${Table.Exchanges}
+                    WHERE ${[...pair.where, 'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}'].join(' AND ')}
+                    ORDER BY ${orderByClause(PAIR_ORDER, q.descending)}
+                    LIMIT {cap:UInt32})
+            GROUP BY bucket
+            ORDER BY bucket ${direction}
+            LIMIT {fetch:UInt32}`,
+          { ...pair.params, min: range.min, max: range.max, cap, fetch },
+        );
+        return { result: rows, found: rows.length, read: rows.length === 0 ? 0 : Number(rows[0].inner_read) };
+      },
+      EDGE_MIN_ROOM,
     );
     if (edges.length === 0) return { candles: [] };
     const more = edges.length > q.limit;

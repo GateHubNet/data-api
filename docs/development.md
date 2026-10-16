@@ -145,9 +145,12 @@ There is no root `test:e2e`: each package spins its own throwaway ClickHouse and
   omit fields that have no value (`compact`); `fmt*` functions take unix **seconds**.
 - **Parameterised queries only.** Pass every user-derived value through `query_params` (`{name:Type}` + a params object). Only table names
   (from the `Table` enum, checked by `sql-tables.spec.ts`), fixed column lists and whitelisted expressions are written into SQL.
-- **Lists: key-ordered, no `FINAL`.** `ORDER BY` the full table key, `LIMIT limit + 1`, dedupe with `LIMIT 1 BY <key>`, page with
-  `keysetClause` / `paginate` / `setLinkHeader`; the marker is the base64url of the key of the last row and never a DateTime. Resolve
-  `start`/`end` to a ledger range with `LedgerRangeResolver`. See [clickhouse](clickhouse.md#the-final-rule).
+- **Lists: key-ordered, no `FINAL`.** Read a page with `readDistinctPage` (shared): `ORDER BY` the full table key with a plain
+  `LIMIT` in a subquery and the dedupe (`LIMIT 1 BY <key>`) outside it, `limit + 1` rows; never `LIMIT 1 BY` in the SELECT that reads
+  the table, which makes ClickHouse read most of the range (Ruling R106). Page with `keysetClause` (it also bounds the first key column,
+  which the primary key needs) / `paginate` / `setLinkHeader`; the marker is the base64url of the key of the last row and never a
+  DateTime. Resolve `start`/`end` to a ledger range with `LedgerRangeResolver`. See
+  [clickhouse](clickhouse.md#reading-a-page-what-stops-the-read).
 - **Amounts** are exact decimal strings; sum with the shared decimal helpers, never with floats.
 - **Config** lives in `api.config.ts`, `syncer.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `env-decorators.ts`);
   do not read `process.env` ad hoc in services. Import the toolbox through `@gatehub/toolbox/lib/<module>`, never the package root (the
@@ -160,20 +163,29 @@ There is no root `test:e2e`: each package spins its own throwaway ClickHouse and
 Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 1. **Service** (`widgets.service.ts`): inject `ClickHouseService` and, for time windows, `LedgerRangeResolver`. Build the `WHERE` with bound
-   parameters, add `keysetClause`, order by the full key, fetch `limit + 1`, and `paginate` the rows:
+   parameters, add `keysetClause`, read `limit + 1` rows with `readDistinctPage` in the order of the whole key, and `paginate` them:
 
    ```ts
    const KEYS: KeysetKey[] = [{ column: 'ledger_index', type: 'UInt32' }, { column: 'tx_index', type: 'UInt32' }];
+   const ORDER: KeysetKey[] = [{ column: 'owner', type: 'String' }, ...KEYS]; // the table's whole ORDER BY
    const after = decodeMarker(q.marker, KEYS);                       // 400 `invalid marker` before any query
    const range = await this.ranges.resolve(q.start, q.endExclusive);
-   const cursor = keysetClause(KEYS, q.descending, after);
-   const rows = await this.ch.query<Row>(
-     `SELECT ... FROM ${Table.Widgets}
-       WHERE owner = {owner:String} AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32} ${cursor.clause && `AND ${cursor.clause}`}
-       ORDER BY ${orderByClause(KEYS, q.descending)} LIMIT 1 BY ledger_index, tx_index LIMIT {limit:UInt32}`,
-     { owner: q.owner, min: range.min, max: range.max, limit: q.limit + 1, ...cursor.params });
+   const cursor = keysetClause(KEYS, q.descending, after);           // the keys after the columns fixed with `=`
+   const rows = await readDistinctPage<Row>(this.ch, {
+     columns: 'ledger_index, tx_index, ...',
+     table: Table.Widgets,
+     where: ['owner = {owner:String}', 'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}', ...(cursor.clause ? [cursor.clause] : [])],
+     orderBy: columnsOf(ORDER),   // inner: ORDER BY owner, ledger_index, tx_index LIMIT <page + room>
+     unique: columnsOf(KEYS),     // outer: LIMIT 1 BY ledger_index, tx_index LIMIT <page>
+     descending: q.descending,
+     params: { owner: q.owner, min: range.min, max: range.max, ...cursor.params },
+     limit: q.limit + 1,
+   });
    const { rows: page, marker } = paginate(rows, q.limit, (r) => [r.ledger_index, r.tx_index]);
    ```
+
+   Add the page to `apps/api/test/paged-reads.e2e-spec.ts` (what it reads over a bulk of four parts) and a plan test
+   (`expectBoundedInOrderRead` of `test/support/plans.ts`).
 
 2. **Object** (`widget-object.ts`): the response shape with the keys **in the order of the original**; leave out what is missing.
 3. **Controller**: `@RippleController('v2/widgets')`, `@RippleRoute('unable to retrieve widgets')`, optional `@Csv('widgets', 'widgets')`,
@@ -274,8 +286,8 @@ Images: [deployment](deployment.md#build). The npm token is a BuildKit secret (`
 `pnpm install && build && pnpm deploy` in a single `RUN`. `pnpm deploy` on pnpm 10 needs `--legacy`. Inside the image the shared package
 is `node_modules/@gatehub/data-api-shared` (so the migrate command is `node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js`).
 
-**c. No `FINAL` on list or aggregate queries.** See [clickhouse](clickhouse.md#the-final-rule). Dedupe with `LIMIT 1 BY <key>` and read versioned
-aggregates by their newest version.
+**c. No `FINAL` on list or aggregate queries.** See [clickhouse](clickhouse.md#the-final-rule). Dedupe with `LIMIT 1 BY <key>` (outside the
+read of a page: `readDistinctPage`) and read versioned aggregates by their newest version.
 
 **d. `DateTime64(3)` takes seconds.** A JSON insert of a `DateTime64(3)` reads integers as seconds: insert `1700000000.123`, never `Date.now()`.
 

@@ -1,9 +1,9 @@
-import { ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { decodeMarker, keysetClause, KeysetKey, orderByClause, paginate } from '../common/pagination';
-import { PAYMENT_COLUMNS, PaymentObject, StoredPayment, toPaymentObject } from '../payments/payment-object';
-import { PAYMENT_KEYS } from '../payments/payments.service';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
+import { PaymentObject, toPaymentObject } from '../payments/payment-object';
+import { PAYMENT_KEYS, PaymentKey, paymentsByKeys } from '../payments/payments.service';
 import { AccountWindow } from './account-window';
 
 /**
@@ -34,9 +34,9 @@ export interface AccountPaymentsQuery extends AccountWindow {
  * The payments of an account (`getAccountPayments` of the original).
  *
  * The keys of a page come from the narrow `account_payments` (`ORDER BY account, ledger_index, tx_index`, a `sent` and
- * a `received` row per payment, with the currency, issuer, tags and direction the list filters on), and the wide rows
- * from `payments` through an `IN` subquery on them: the payment is the one `GET /v2/payments` serves. The dates become
- * a range of ledgers once.
+ * a `received` row per payment, with the currency, issuer, tags and direction the list filters on), read with
+ * `readDistinctPage`, and the wide rows of the page from `payments` (`paymentsByKeys`): the payment is the one
+ * `GET /v2/payments` serves. The dates become a range of ledgers once.
  */
 @Injectable()
 export class AccountPaymentsService {
@@ -68,20 +68,17 @@ export class AccountPaymentsService {
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
 
-    // `LIMIT 1 BY`: a row that was written twice (the tables are not collapsed before a merge, and no FINAL is used)
-    // counts once, in the index and in the table; the extra row of the page only tells whether there is a next page
-    const rows = await this.ch.query<StoredPayment>(
-      `SELECT ${PAYMENT_COLUMNS} FROM ${Table.Payments}
-        WHERE ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
-          AND (ledger_index, tx_index) IN (
-              SELECT ledger_index, tx_index FROM ${Table.AccountPayments}
-               WHERE ${conditions.join(' AND ')}
-               ORDER BY ${orderByClause(ACCOUNT_PAYMENT_ORDER, q.descending)}
-               LIMIT 1 BY ledger_index, tx_index
-               LIMIT {fetch:UInt32})
-        ORDER BY ${orderByClause(PAYMENT_KEYS, q.descending)}
-        LIMIT 1 BY ledger_index, tx_index`,
-      {
+    // In the order of the whole key, each payment once: a row written twice is there twice until a merge (no FINAL is
+    // used), and so are the `sent` and `received` rows of a payment to oneself, which share the key. One more than the
+    // page: it tells whether there is a next page.
+    const keys = await readDistinctPage<PaymentKey>(this.ch, {
+      columns: 'ledger_index, tx_index',
+      table: Table.AccountPayments,
+      where: conditions,
+      orderBy: columnsOf(ACCOUNT_PAYMENT_ORDER),
+      unique: columnsOf(PAYMENT_KEYS),
+      descending: q.descending,
+      params: {
         account: q.account,
         min: range.min,
         max: range.max,
@@ -91,13 +88,15 @@ export class AccountPaymentsService {
         ...(q.sourceTag !== undefined && { source_tag: q.sourceTag }),
         ...(q.destinationTag !== undefined && { destination_tag: q.destinationTag }),
         ...cursor.params,
-        fetch: q.limit + 1,
       },
-    );
+      limit: q.limit + 1,
+    });
 
-    const page = paginate(rows, q.limit, (row) => [row.ledger_index, row.tx_index]);
+    // the page is cut from the keys, so a key whose wide row is missing cannot end the list early
+    const page = paginate(keys, q.limit, (key) => [key.ledger_index, key.tx_index]);
+    const rows = await paymentsByKeys(this.ch, page.rows);
     return {
-      payments: page.rows.map(toPaymentObject),
+      payments: rows.map(toPaymentObject),
       ...(page.marker !== undefined && { marker: page.marker }),
     };
   }

@@ -1,6 +1,7 @@
 import { AccountExchangesRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { fixtureAccountExchanges, fixtureExchanges, fixtureSource } from './support/fixtures';
+import { expectBoundedInOrderRead } from './support/plans';
 
 /**
  * `GET /v2/accounts/:address/exchanges[/:base[/:counter]]` on a real ClickHouse, seeded with the 54 ledgers of the
@@ -691,7 +692,11 @@ describe('account exchanges API endpoint', () => {
         const res = await get(`${path(MULTI)}?${query}`);
         // one more than the page is asked for: the extra row tells whether there is a next page
         const paging = spy.mock.calls.filter(([q]) => String(q).includes(Table.AccountExchanges));
-        expect([query, res.status, paging[0][1]]).toEqual([query, 200, expect.objectContaining({ fetch: rows + 1 })]);
+        expect([query, res.status, paging[0][1]]).toEqual([
+          query,
+          200,
+          expect.objectContaining({ distinct_page_limit: rows + 1 }),
+        ]);
         expect([query, res.body.count]).toEqual([query, Math.min(rows, rowsOf(MULTI).length)]);
         jest.restoreAllMocks();
       }
@@ -778,10 +783,12 @@ describe('account exchanges API endpoint', () => {
       expect(sql).not.toMatch(new RegExp(`FROM ${Table.Exchanges}\\b`));
       expect(sql).toMatch(/account = \{account:String\}/);
       expect(sql).toMatch(/ledger_index BETWEEN \{min:UInt32\} AND \{max:UInt32\}/);
-      // a row that was written twice counts once
-      expect(sql).toContain('LIMIT 1 BY ledger_index, tx_index, node_index');
+      // read with a plain LIMIT, which stops the read after the page (Ruling R106); outside it a row that was written
+      // twice counts once
+      expect(sql).toMatch(/node_index ASC\s+LIMIT \{distinct_page_cap:UInt32\}\)/);
+      expect(sql).toMatch(/LIMIT 1 BY ledger_index, tx_index, node_index\s+LIMIT \{distinct_page_limit:UInt32\}/);
       expect(sql).not.toMatch(/\bFINAL\b/);
-      expect(params).toMatchObject({ account: MULTI, fetch: 5 });
+      expect(params).toMatchObject({ account: MULTI, distinct_page_limit: 5 });
       // values are bound, never written into the SQL
       expect(sql).not.toContain(MULTI);
       expect(sql).not.toContain(MWJ);
@@ -823,16 +830,8 @@ describe('account exchanges API endpoint', () => {
             const [[sql, params]] = paging(spy);
             jest.restoreAllMocks();
 
-            const plan = await h.ch.query<{ explain: string }>(`EXPLAIN PIPELINE ${sql}`, params);
-            const pipeline = plan.map((r) => r.explain).join('\n');
-            expect([descending, filter, query, pipeline]).toEqual([
-              descending,
-              filter,
-              query,
-              expect.stringContaining('ReadPoolInOrder'),
-            ]);
-            expect(pipeline).toContain(descending ? 'InReverseOrder' : 'algorithm: InOrder');
-            expect(pipeline).not.toContain('PartialSortingTransform');
+            // in the order of the key, no sort, and a LIMIT on the read itself: it stops after the page
+            await expectBoundedInOrderRead(h, sql, params, descending, [descending, filter, query]);
           }
         }
       }
@@ -846,7 +845,7 @@ describe('account exchanges API endpoint', () => {
       const indexes = await h.ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${sql}`, params);
       const text = indexes.map((r) => r.explain).join('\n');
       expect(text).toContain('PrimaryKey');
-      expect(text).toMatch(/Keys:\s+account/);
+      expect(text).toMatch(/Keys:[\s│]+account/);
     });
 
     it('a request the client got wrong reads nothing', async () => {
