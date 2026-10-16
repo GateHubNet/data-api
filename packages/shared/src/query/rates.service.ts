@@ -152,10 +152,38 @@ function keepConditions(stored: StoredPair): string[] {
 const orderBy = (descending: boolean): string =>
   KEY_COLUMNS.map((c) => `${c} ${descending ? 'DESC' : 'ASC'}`).join(', ');
 
-interface LedgerRange {
+/** The ledgers of a window of time: the first index to the last, both inclusive. */
+export interface LedgerRange {
   min: number;
   max: number;
 }
+
+/** The buckets `bucketVwaps` groups by: a UTC day, a week from Monday, a calendar month. */
+export type VwapBucket = 'day' | 'week' | 'month';
+
+/** The expression of `close_time` (a `DateTime('UTC')`) that is the unix time of its bucket's start. */
+const BUCKET_START: Record<VwapBucket, string> = {
+  day: 'toUnixTimestamp(toStartOfDay(close_time))',
+  week: "toUnixTimestamp(toDateTime(toMonday(close_time), 'UTC'))",
+  month: "toUnixTimestamp(toDateTime(toStartOfMonth(close_time), 'UTC'))",
+};
+
+/**
+ * Both native legs above the dust, spelled for any pair (a side is native when it has no issuer, as `keepConditions`
+ * has it): what the grouped reads (`vwaps`, `bucketVwaps`) keep, one condition for all the pairs of the group.
+ */
+const KEEP_ANY_PAIR = `(base_issuer != '' OR base_amount_f > ${NATIVE_DUST}) AND (counter_issuer != '' OR counter_amount_f > ${NATIVE_DUST})`;
+
+/** The pair columns and the sums of one group of `vwaps`. */
+interface PairSumsRow extends VolumeSums {
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+}
+
+const storedKey = (s: StoredPair): string =>
+  [s.base.currency, s.base.issuer ?? '', s.counter.currency, s.counter.issuer ?? ''].join('\u0000');
 
 /** One group of `dayRows`: the sums of a day of trades and the first and last ledger of all its trades. */
 interface DayRow extends VolumeSums {
@@ -220,7 +248,7 @@ export class RatesService {
   constructor(
     private readonly ch: ClickHouseService,
     /** `XRP` or `XAH`: the currency every rate is converted through. It has no issuer. */
-    private readonly nativeCurrency: string,
+    readonly nativeCurrency: string,
   ) {}
 
   /**
@@ -262,6 +290,66 @@ export class RatesService {
       from: floorSecond(timeOf(from)),
       toExclusive: floorSecond(timeOf(toExclusive)),
     });
+  }
+
+  /**
+   * The same as `vwap` for many pairs of one window, in one read of the exchanges (the volume jobs ask for a window of
+   * every market they list): the window is turned into ledgers once, and the pairs are grouped by the database. The
+   * answers come in the order of `pairs`; a pair may be there twice, or the other way round as well.
+   */
+  async vwaps(pairs: { base: Asset; counter: Asset }[], from: Date, toExclusive: Date): Promise<Vwap[]> {
+    const w = { from: floorSecond(timeOf(from)), toExclusive: floorSecond(timeOf(toExclusive)) };
+    if (pairs.length === 0) return [];
+    const stored = pairs.map((p) => canonicalPair(p.base, p.counter));
+    const range = await this.ledgerRange(w.from, w.toExclusive);
+    const sums = range ? await this.pairSums(stored, range) : new Map<string, VolumeSums>();
+    return stored.map((s) => orient(sums.get(storedKey(s)) ?? NO_TRADES, s.inverted));
+  }
+
+  /**
+   * The vwap of a pair in each `bucket` (a UTC day, a week from Monday, a calendar month) of the window, in one read: a
+   * map from the unix time of the start of a bucket to its vwap, the pair as asked for, in the order of the buckets.
+   * A bucket without a trade (or whose trades are all native dust) is not in it. Pass whole buckets: the trades that
+   * closed in `[from, toExclusive)` count, to the second, and a bucket is the sum of those that fall in it.
+   */
+  async bucketVwaps(
+    base: Asset,
+    counter: Asset,
+    from: Date,
+    toExclusive: Date,
+    bucket: VwapBucket,
+  ): Promise<Map<number, BigNumber>> {
+    const w = { from: floorSecond(timeOf(from)), toExclusive: floorSecond(timeOf(toExclusive)) };
+    const stored = canonicalPair(base, counter);
+    const out = new Map<number, BigNumber>();
+    const range = await this.ledgerRange(w.from, w.toExclusive);
+    if (!range) return out;
+    const keep = keepConditions(stored);
+    const rows = await this.ch.query<VolumeSums & { bucket: number | string }>(
+      `SELECT ${BUCKET_START[bucket]} AS bucket,
+              ${volumeColumns(keep.length > 0 ? keep.join(' AND ') : undefined)}
+         FROM (SELECT close_time, ${VOLUME_SOURCE_COLUMNS}
+                 FROM ${Table.Exchanges}
+                WHERE ${[...PAIR_WHERE, 'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}'].join(' AND ')}
+                ORDER BY ${orderBy(false)}
+                LIMIT 1 BY ${KEY_COLUMNS.join(', ')})
+        GROUP BY bucket
+        ORDER BY bucket`,
+      { ...pairParams(stored), min: range.min, max: range.max },
+    );
+    for (const row of rows) {
+      const v = orient(row, stored.inverted);
+      if (v.count > 0) out.set(Number(row.bucket), v.vwap);
+    }
+    return out;
+  }
+
+  /**
+   * The ledgers that closed in `[from, toExclusive)`, to the second (the first index to the last), `null` when none did.
+   * The volume jobs resolve a window once and read the payments with it.
+   */
+  ledgersClosedIn(from: Date, toExclusive: Date): Promise<LedgerRange | null> {
+    return this.ledgerRange(floorSecond(timeOf(from)), floorSecond(timeOf(toExclusive)));
   }
 
   /**
@@ -354,6 +442,39 @@ export class RatesService {
     }
     const [row] = await this.ch.query<VolumeSums>(sql, params);
     return row ?? NO_TRADES;
+  }
+
+  /**
+   * The sums of the trades of some stored pairs in a range of ledgers, one group per pair: one read, each trade once
+   * (`LIMIT 1 BY` the key), the native legs of 0.0005 or less left out. The pairs are matched as the start of the primary
+   * key, so the read is bounded by their own trades.
+   */
+  private async pairSums(pairs: StoredPair[], range: LedgerRange): Promise<Map<string, VolumeSums>> {
+    const unique = [...new Map(pairs.map((p) => [storedKey(p), p])).values()];
+    // The pairs go in as four arrays of text and are zipped back into tuples by the server: a tuple parameter is a class of
+    // the client, which a second copy of the client (two module registries in one process) does not recognise.
+    const rows = await this.ch.query<PairSumsRow>(
+      `SELECT ${PAIR_COLUMNS.join(', ')}, ${volumeColumns(KEEP_ANY_PAIR)}
+         FROM (SELECT ${PAIR_COLUMNS.join(', ')}, ${VOLUME_SOURCE_COLUMNS}
+                 FROM ${Table.Exchanges}
+                WHERE (${PAIR_COLUMNS.join(', ')}) IN (
+                      SELECT arrayJoin(arrayZip({pair0:Array(String)}, {pair1:Array(String)}, {pair2:Array(String)}, {pair3:Array(String)})))
+                  AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
+                ORDER BY ${orderBy(false)}
+                LIMIT 1 BY ${KEY_COLUMNS.join(', ')})
+        GROUP BY ${PAIR_COLUMNS.join(', ')}`,
+      {
+        pair0: unique.map((p) => p.base.currency),
+        pair1: unique.map((p) => p.base.issuer ?? ''),
+        pair2: unique.map((p) => p.counter.currency),
+        pair3: unique.map((p) => p.counter.issuer ?? ''),
+        min: range.min,
+        max: range.max,
+      },
+    );
+    return new Map(
+      rows.map((r) => [[r.base_currency, r.base_issuer, r.counter_currency, r.counter_issuer].join('\u0000'), r]),
+    );
   }
 
   /**

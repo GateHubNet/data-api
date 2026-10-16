@@ -1,10 +1,19 @@
 import {
   ClickHouseService,
+  computeDailyVolumeSet,
+  computeLiveVolumeSet,
   HOUR_SECONDS,
+  livePeriodsOf,
+  MarketsConfig,
+  RatesService,
   recomputeStatsHourly,
   ShutdownSignals,
   StatsRecomputeAborted,
   Table,
+  VOLUME_METRICS,
+  volumeDaysDone,
+  VolumeMetric,
+  VolumeRecomputeAborted,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
@@ -26,6 +35,33 @@ export const AGGREGATOR_TICK_BUDGET_MS = 30_000;
  * was over.
  */
 export const AGGREGATOR_LIVE_BUDGET_MS = 20_000;
+
+/**
+ * How much of the tick `stats_dirty` may use. A backlog of ranges (a range-ingest of years marks thousands) would otherwise
+ * take what `stats_live` left of the tick, and the jobs after it would get nothing.
+ */
+export const AGGREGATOR_DIRTY_BUDGET_MS = 10_000;
+
+/**
+ * How much of the tick `volume_live` (the seven live sets) may use. It runs first, so that the live volumes are refreshed at
+ * every tick whatever the sweeps after it are doing; its sets are a handful of queries each, so this is a bound for a
+ * database that has gone slow, not a share it needs.
+ */
+export const AGGREGATOR_VOLUME_LIVE_BUDGET_MS = 5000;
+
+/** How much of the tick `volume_daily` (the sets of today and of yesterday: four) may use; it runs second, for the same reason. */
+export const AGGREGATOR_VOLUME_DAILY_BUDGET_MS = 4000;
+
+/**
+ * How much of the tick `volume_backfill` may use. The closed days (a fresh deployment over years of history, or a new config
+ * version) are computed newest first, a set at a time, until this is spent or the tick budget is, whichever comes first:
+ * the job runs last, so the live work of the tick is done by then, and a tick that ends within its budget leaves the next
+ * one to start on time.
+ */
+export const AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS = 10_000;
+
+/** A volume job gives up after this many sets failed in a tick, so that an outage does not log a line per set. */
+export const MAX_FAILED_VOLUME_SETS_PER_TICK = 3;
 
 /**
  * How long a shutdown waits for the tick in flight. The cleanups of `ShutdownSignals` share one budget of 10 s and the
@@ -73,12 +109,30 @@ export interface AggregatorJob {
   /** The `job` label of its metrics and the name in its log lines. */
   readonly name: string;
   /**
-   * The most of the tick this job may use, from the moment it starts (and never more than what is left of the tick budget).
-   * Without it the job may use what the jobs before it left. A job that runs after jobs that can use up the tick (the volume
-   * jobs come after `stats_dirty`) gives itself a budget, so that it is served too.
+   * The most of the tick this job may use, counted from the moment it starts, and never more than what is left of the tick
+   * budget. It caps the job's OWN use and nothing else: it reserves no time for the jobs after it, and a job that runs later
+   * only gets what the jobs before it left. So a job that has to run at every tick goes early in the list, and every job
+   * that can run long (a sweep, a backlog, a back-fill) has a budget, which is what keeps it from taking the whole tick
+   * from the ones after it. Without a budget the job may use all that is left.
    */
   readonly budgetMs?: number;
   run(tick: AggregatorTick): Promise<void>;
+}
+
+/** The jobs the aggregator has of its own, in the order of a tick. */
+export type AggregatorJobName = 'volume_live' | 'volume_daily' | 'stats_live' | 'stats_dirty' | 'volume_backfill';
+
+/** What the volume jobs work with: the rates of the network and its versioned markets config. */
+export interface AggregatorVolumes {
+  rates: RatesService;
+  markets: MarketsConfig;
+}
+
+/** The functions of the shared package the volume jobs call; tests replace them. */
+export interface VolumeFunctions {
+  computeLiveSet: typeof computeLiveVolumeSet;
+  computeDailySet: typeof computeDailyVolumeSet;
+  daysDone: typeof volumeDaysDone;
 }
 
 export interface AggregatorOptions {
@@ -86,8 +140,14 @@ export interface AggregatorOptions {
   intervalMs?: number;
   /** Default: `AGGREGATOR_TICK_BUDGET_MS`. */
   tickBudgetMs?: number;
-  /** Default: `AGGREGATOR_LIVE_BUDGET_MS`. */
+  /** Default: `AGGREGATOR_LIVE_BUDGET_MS`. Short for `budgetsMs.stats_live`. */
   liveBudgetMs?: number;
+  /** The budget of each job of the aggregator (see `AggregatorJob.budgetMs`); the defaults are the `AGGREGATOR_*_BUDGET_MS` constants. */
+  budgetsMs?: Partial<Record<AggregatorJobName, number>>;
+  /** With it the volume jobs run (live sets, today and yesterday, the back-fill and the days of `agg_dirty`); without it they do not. */
+  volumes?: AggregatorVolumes;
+  /** Replaces the volume functions of the shared package; for tests. */
+  volumeFunctions?: Partial<VolumeFunctions>;
   /** Default: a Nest `Logger` with the context `AggregatorService`. */
   logger?: Pick<Logger, 'log' | 'warn' | 'error' | 'debug'>;
   /** The clock, in unix milliseconds. Default: `Date.now`. */
@@ -108,13 +168,23 @@ export function sliceRange(from: number, to: number): Array<[number, number]> {
 }
 
 const hourStart = (seconds: number): number => Math.floor(seconds / HOUR_SECONDS) * HOUR_SECONDS;
+const DAY_SECONDS = 86_400;
+/** The start of the UTC day of a time, unix seconds. */
+const utcDayStart = (seconds: number): number => Math.floor(seconds / DAY_SECONDS) * DAY_SECONDS;
+/** `YYYY-MM-DD` of the UTC day that starts at `seconds`. */
+const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
 const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
 const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /**
- * The `aggregator` worker: once a minute it runs its jobs, in this order,
+ * The `aggregator` worker: once a minute it runs its jobs, in this order (the order is the priority: a job only gets what the
+ * jobs before it left of the tick, so what has to be fresh at every tick goes first and what can run long goes last, each
+ * with a budget of its own),
  *
- *  1. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
+ *  1. **volume_live** (with the `volumes` option): the seven live volume sets (trade volume for hour, day, 3day, 7day and 30day,
+ *     payment volume for hour and day), each recomputed whole under one version.
+ *  2. **volume_daily**: the daily volume sets of today and of yesterday (UTC), both metrics.
+ *  3. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
  *     first, in slices of at most a day:
  *      - the **catch-up**, from the watermark (the newest hour with ledgers) up to two hours ago, or to the hour of the newest
  *        ledger if that is earlier. The live runner writes no `agg_dirty` row, so after an outage, for a database whose
@@ -125,27 +195,32 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *        hour it closed in), only once the catch-up is over: the watermark is the cursor of the catch-up and lives in the
  *        database, so it must not move past hours that have not been done. A restart takes the catch-up up where it was.
  *
- *     It gets at most `AGGREGATOR_LIVE_BUDGET_MS` of the tick, so that `stats_dirty` is served in every tick. **During a long
- *     catch-up (weeks of ledgers after an outage, the first sweep of a database with years of history) the tail is not
- *     run, so the stats of the current hour are stale**; `syncer_aggregator_stats_lag_seconds` says how much is left.
- *  2. **stats_dirty**: drains `agg_dirty`, the ranges that ingest rewrote behind the aggregator, oldest first, each in slices
- *     of at most a day.
+ *     It gets at most `AGGREGATOR_LIVE_BUDGET_MS` of the tick. **During a long catch-up (weeks of ledgers after an outage, the
+ *     first sweep of a database with years of history) the tail is not run, so the stats of the current hour are stale**;
+ *     `syncer_aggregator_stats_lag_seconds` says how much is left.
+ *  4. **stats_dirty**: drains `agg_dirty`, the ranges that ingest rewrote behind the aggregator, oldest first, each in slices
+ *     of at most a day, for at most `AGGREGATOR_DIRTY_BUDGET_MS`. The days a slice covers have their daily volume sets
+ *     recomputed too (with the `volumes` option), once per tick unless the ingest marked the day again after that.
+ *  5. **volume_backfill**: the closed days (before yesterday, back to the day of the first ledger) whose daily sets do not exist
+ *     for the current `version` of the markets config, newest first, under its own budget. A day is computed once; a new
+ *     config version computes them all again.
  *
- * and a later task adds its volume jobs to the list. Every slice is idempotent (`recomputeStatsHourly`), which is what lets
- * this retry, resume and crash anywhere:
+ * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set is a complete set under a new version), which is
+ * what lets this retry, resume and crash anywhere:
  *
- *  - **A failed slice is retried next tick.** The live job stops at the first failure (its slices are in order, and a later one
- *    would move the watermark past it); the dirty job leaves the range in the queue, keeps the progress it made, and goes on
- *    with the next range, until three ranges have failed in a tick. Errors are logged and counted, and never stop the loop.
- *  - **A range of years does not stall a tick.** Slices are started until the budget of the job (`AGGREGATOR_LIVE_BUDGET_MS`
- *    for the live job) or of the tick (`AGGREGATOR_TICK_BUDGET_MS`) is spent. The unfinished
- *    `agg_dirty` range is replaced by one that starts where the work stopped (inserted first, then the old one deleted), with
- *    the `created_at` it had; the live window picks up from the watermark.
+ *  - **A failed slice or set is retried next tick.** The live job stops at the first failure (its slices are in order, and a
+ *    later one would move the watermark past it); the dirty job leaves the range in the queue, keeps the progress it made, and
+ *    goes on with the next range, until three ranges have failed in a tick; the volume jobs go on with the next set until three
+ *    have failed. Errors are logged and counted, and never stop the loop.
+ *  - **A range of years does not stall a tick.** Slices and sets are started until the budget of the job or of the tick
+ *    (`AGGREGATOR_TICK_BUDGET_MS`) is spent. The unfinished `agg_dirty` range is replaced by one that starts where the work
+ *    stopped (inserted first, then the old one deleted), with the `created_at` it had; the live window picks up from the
+ *    watermark; the back-fill finds the days that are still missing.
  *  - **A mark is never lost.** A range is deleted only after all its slices succeeded, and only the marks made at or before
  *    the one that was read; a range that the ingest marked again meanwhile stays and is done again.
  *  - **No overlap.** A tick that finds the previous one still running is skipped and logged.
- *  - **Shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it; the signal of the slice in
- *    flight is aborted, so that its rows are not written; no change to `agg_dirty` is started after it (a narrowing that
+ *  - **Shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it; the signal of the slice or set
+ *    in flight is aborted, so that its rows are not written; no change to `agg_dirty` is started after it (a narrowing that
  *    has inserted its row finishes its delete, so as not to leave the old row beside the new one). The stop waits for the
  *    tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`, then abandons it and says so.
  */
@@ -153,7 +228,11 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
 export class AggregatorService implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly intervalMs: number;
   private readonly tickBudgetMs: number;
-  private readonly liveBudgetMs: number;
+  private readonly budgets: Record<AggregatorJobName, number>;
+  private readonly volumes?: AggregatorVolumes;
+  private readonly volumeFns: VolumeFunctions;
+  /** Whether the back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
+  private backfilling = false;
   private readonly logger: Pick<Logger, 'log' | 'warn' | 'error' | 'debug'>;
   private readonly clock: () => number;
   private readonly recompute: typeof recomputeStatsHourly;
@@ -174,13 +253,52 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   ) {
     this.intervalMs = options.intervalMs ?? AGGREGATOR_INTERVAL_MS;
     this.tickBudgetMs = options.tickBudgetMs ?? AGGREGATOR_TICK_BUDGET_MS;
-    this.liveBudgetMs = options.liveBudgetMs ?? AGGREGATOR_LIVE_BUDGET_MS;
+    this.budgets = {
+      volume_live: AGGREGATOR_VOLUME_LIVE_BUDGET_MS,
+      volume_daily: AGGREGATOR_VOLUME_DAILY_BUDGET_MS,
+      stats_live: options.liveBudgetMs ?? AGGREGATOR_LIVE_BUDGET_MS,
+      stats_dirty: AGGREGATOR_DIRTY_BUDGET_MS,
+      volume_backfill: AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS,
+      ...options.budgetsMs,
+    };
+    this.volumes = options.volumes;
+    this.volumeFns = {
+      computeLiveSet: computeLiveVolumeSet,
+      computeDailySet: computeDailyVolumeSet,
+      daysDone: volumeDaysDone,
+      ...options.volumeFunctions,
+    };
     this.logger = options.logger ?? new Logger(AggregatorService.name);
     this.clock = options.now ?? Date.now;
     this.recompute = options.recompute ?? recomputeStatsHourly;
+    // The order is the priority (see `AggregatorJob.budgetMs`): what must be fresh at every tick, the live volumes, goes first;
+    // the sweeps and the back-fill, which can run long, come after it and have budgets of their own.
     this.jobs = [
-      { name: 'stats_live', budgetMs: this.liveBudgetMs, run: (tick) => this.statsLive(tick) },
-      { name: 'stats_dirty', run: (tick) => this.statsDirty(tick) },
+      ...(this.volumes
+        ? [
+            {
+              name: 'volume_live',
+              budgetMs: this.budgets.volume_live,
+              run: (tick: AggregatorTick) => this.volumeLive(tick),
+            },
+            {
+              name: 'volume_daily',
+              budgetMs: this.budgets.volume_daily,
+              run: (tick: AggregatorTick) => this.volumeDaily(tick),
+            },
+          ]
+        : []),
+      { name: 'stats_live', budgetMs: this.budgets.stats_live, run: (tick) => this.statsLive(tick) },
+      { name: 'stats_dirty', budgetMs: this.budgets.stats_dirty, run: (tick) => this.statsDirty(tick) },
+      ...(this.volumes
+        ? [
+            {
+              name: 'volume_backfill',
+              budgetMs: this.budgets.volume_backfill,
+              run: (tick: AggregatorTick) => this.volumeBackfill(tick),
+            },
+          ]
+        : []),
       ...(options.extraJobs ?? []),
     ];
   }
@@ -246,7 +364,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   /** Logs and counts a failure of a job (or of one slice of it); one that comes of the shutdown is neither. */
   private failed(job: string, err: unknown, where = ''): void {
-    if (this.closing && err instanceof StatsRecomputeAborted) {
+    if (this.closing && (err instanceof StatsRecomputeAborted || err instanceof VolumeRecomputeAborted)) {
       this.logger.log(`Dropped the ${job} slice in flight at shutdown`);
       return;
     }
@@ -378,6 +496,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   private async statsDirty(tick: AggregatorTick): Promise<void> {
     const ranges = await readDirtyRanges(this.ch, DIRTY_RANGES_PER_TICK);
+    // the days whose volumes this tick has recomputed, and the clock reading when it began (see `volumesOfSlice`)
+    const volumeDays = new Map<string, number>();
     let failedRanges = 0;
     for (const range of ranges) {
       if (this.closing) return;
@@ -385,7 +505,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         this.logger.warn('Aggregator job stats_dirty reached the tick budget; the ranges left go on next tick');
         return;
       }
-      const outcome = await this.recomputeDirty(range, tick);
+      const outcome = await this.recomputeDirty(range, tick, volumeDays);
       if (this.closing) return;
       if (outcome === 'budget') {
         this.logger.warn(
@@ -401,7 +521,11 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
    * Recomputes a range slice by slice. When all slices are done the range is deleted; otherwise (the budget, a failed slice)
    * it is replaced by the part that is left, so that the progress is kept.
    */
-  private async recomputeDirty(range: DirtyRange, tick: AggregatorTick): Promise<'done' | 'budget' | 'failed'> {
+  private async recomputeDirty(
+    range: DirtyRange,
+    tick: AggregatorTick,
+    volumeDays: Map<string, number>,
+  ): Promise<'done' | 'budget' | 'failed'> {
     let done = range.from;
     let outcome: 'done' | 'budget' | 'failed' = 'done';
     for (const [start, end] of sliceRange(range.from, range.to)) {
@@ -417,6 +541,13 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         outcome = 'failed';
         break;
       }
+      try {
+        await this.volumesOfSlice(start, end, range.created, volumeDays, tick);
+      } catch (err) {
+        this.failed('volume_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
+        outcome = 'failed';
+        break;
+      }
       done = end;
     }
     // no change to agg_dirty is started once the shutdown has begun; one that is under way (narrowDirtyRange's INSERT and
@@ -425,6 +556,172 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     if (done >= range.to) await deleteDirtyRange(this.ch, range);
     else await narrowDirtyRange(this.ch, range, done);
     return outcome;
+  }
+
+  /**
+   * The daily volume sets of the days a slice `[start, end)` covers, both metrics, after its stats. A day is done once per
+   * tick (`done` maps a day to the clock reading at which its recompute began), unless the range was marked after that: the
+   * ingest wrote more ledgers into the day meanwhile, which that recompute may not have seen. A failure fails the slice, so
+   * that the range stays in the queue and the day is done again next tick.
+   */
+  private async volumesOfSlice(
+    start: number,
+    end: number,
+    marked: number,
+    done: Map<string, number>,
+    tick: AggregatorTick,
+  ): Promise<void> {
+    const volumes = this.volumes;
+    if (!volumes) return;
+    for (let dayStart = utcDayStart(start); dayStart < end; dayStart += DAY_SECONDS) {
+      const key = dayKey(dayStart);
+      const began = done.get(key);
+      if (began !== undefined && began >= marked) continue;
+      const startedAt = this.clock();
+      for (const metric of VOLUME_METRICS) {
+        if (this.closing) return;
+        await this.volumeFns.computeDailySet(
+          this.ch,
+          volumes.rates,
+          volumes.markets,
+          metric,
+          new Date(dayStart * 1000),
+          {
+            signal: tick.signal,
+          },
+        );
+      }
+      done.set(key, startedAt);
+    }
+  }
+
+  /** Whether a volume job may start another set: not after the shutdown began, and not past its budget (it says so). */
+  private mayStartSet(tick: AggregatorTick, job: string): boolean {
+    if (this.closing) return false;
+    if (this.clock() < tick.deadline) return true;
+    this.logger.warn(`Aggregator job ${job} reached its budget; the sets left go on next tick`);
+    return false;
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // volume_live, volume_daily, volume_backfill
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /** The live sets of both metrics, every period, with the time of the tick. A failed set does not stop the other ones. */
+  private async volumeLive(tick: AggregatorTick): Promise<void> {
+    const volumes = this.volumes;
+    if (!volumes) return;
+    let failed = 0;
+    for (const metric of VOLUME_METRICS) {
+      for (const period of livePeriodsOf(metric)) {
+        if (!this.mayStartSet(tick, 'volume_live')) return;
+        try {
+          await this.volumeFns.computeLiveSet(this.ch, volumes.rates, volumes.markets, metric, period, tick.now, {
+            signal: tick.signal,
+          });
+        } catch (err) {
+          this.failed('volume_live', err, ` in ${metric} ${period}`);
+          if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
+        }
+      }
+    }
+  }
+
+  /** The daily sets of today and of yesterday (UTC), both metrics: the day is not over, or only just, so they change. */
+  private async volumeDaily(tick: AggregatorTick): Promise<void> {
+    const volumes = this.volumes;
+    if (!volumes) return;
+    const today = utcDayStart(Math.floor(tick.now.getTime() / 1000));
+    let failed = 0;
+    for (const dayStart of [today, today - DAY_SECONDS]) {
+      for (const metric of VOLUME_METRICS) {
+        if (!this.mayStartSet(tick, 'volume_daily')) return;
+        try {
+          await this.volumeFns.computeDailySet(
+            this.ch,
+            volumes.rates,
+            volumes.markets,
+            metric,
+            new Date(dayStart * 1000),
+            {
+              signal: tick.signal,
+            },
+          );
+        } catch (err) {
+          this.failed('volume_daily', err, ` in ${metric} ${dayKey(dayStart)}`);
+          if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
+        }
+      }
+    }
+  }
+
+  /**
+   * The closed days (before yesterday, back to the day of the first ledger) that have no daily set of the current config
+   * version, newest first, both metrics, for as long as the budget of the job and of the tick last. The sets that exist are
+   * found by one read per metric (`volumeDaysDone`), so a day is computed once, and a new version of the config computes them
+   * all again; whatever is left is found again next tick. It says when it starts and when it is done.
+   */
+  private async volumeBackfill(tick: AggregatorTick): Promise<void> {
+    const volumes = this.volumes;
+    if (!volumes) return;
+    // the stats and the dirty queue before it may have used the tick up: do not even read what cannot be worked on
+    if (this.closing || this.clock() >= tick.deadline) return;
+    const firstClose = await this.firstCloseTime();
+    const closedUntil = utcDayStart(Math.floor(tick.now.getTime() / 1000)) - DAY_SECONDS;
+    if (firstClose === undefined || utcDayStart(firstClose) >= closedUntil) return;
+    const first = utcDayStart(firstClose);
+    const version = volumes.markets.version;
+
+    const done = new Map<VolumeMetric, Set<string>>();
+    for (const metric of VOLUME_METRICS) {
+      done.set(
+        metric,
+        await this.volumeFns.daysDone(this.ch, metric, new Date(first * 1000), new Date(closedUntil * 1000), version),
+      );
+    }
+    const missing: Array<{ metric: VolumeMetric; dayStart: number }> = [];
+    for (let dayStart = closedUntil - DAY_SECONDS; dayStart >= first; dayStart -= DAY_SECONDS) {
+      for (const metric of VOLUME_METRICS) {
+        if (!done.get(metric)?.has(dayKey(dayStart))) missing.push({ metric, dayStart });
+      }
+    }
+    if (missing.length === 0) {
+      this.announceBackfill(false, 0);
+      return;
+    }
+    this.announceBackfill(true, missing.length);
+
+    let failed = 0;
+    for (const { metric, dayStart } of missing) {
+      if (!this.mayStartSet(tick, 'volume_backfill')) return;
+      try {
+        await this.volumeFns.computeDailySet(
+          this.ch,
+          volumes.rates,
+          volumes.markets,
+          metric,
+          new Date(dayStart * 1000),
+          {
+            signal: tick.signal,
+          },
+        );
+      } catch (err) {
+        this.failed('volume_backfill', err, ` in ${metric} ${dayKey(dayStart)}`);
+        if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
+      }
+    }
+    if (failed === 0 && !this.closing) this.announceBackfill(false, 0);
+  }
+
+  /** Says once that the back-fill is under way (and how much there is), and once that it is done. */
+  private announceBackfill(under: boolean, sets: number): void {
+    if (under && !this.backfilling) {
+      this.backfilling = true;
+      this.logger.log(`Volume back-fill: ${sets} daily sets to compute, newest day first`);
+    } else if (!under && this.backfilling) {
+      this.backfilling = false;
+      this.logger.log('Volume back-fill is done: every closed day has its daily sets');
+    }
   }
 
   // -------------------------------------------------------------------------------------------------------------------

@@ -187,17 +187,24 @@ describe('AggregatorService (e2e)', () => {
     };
     const service = aggregator(ch, { now: () => clock, recompute });
 
+    // live (10 s), then a day of the range: stats_dirty has a budget of its own, 10 s from its start (it used to take the
+    // rest of the 30 s of the tick), and a slice is only started inside it
+    const days = ['2013-06-11', '2013-06-12', '2013-06-13'];
     await service.tick();
-    // live (10 s), then two days of the range (20 s) fit in the budget of 30 s
     expect(await dirty(ch)).toEqual([
-      { from: unix('2013-06-12T00:00:00Z'), to: unix('2013-06-14T00:00:00Z'), created: 1_760_000_000_777 },
+      { from: unix(`${days[0]}T00:00:00Z`), to: unix('2013-06-14T00:00:00Z'), created: 1_760_000_000_777 },
     ]);
-    expect(await oldStats(ch)).toEqual(await truth(ch, '2013-06-10T00:00:00Z', '2013-06-12T00:00:00Z'));
+    expect(await oldStats(ch)).toEqual(await truth(ch, '2013-06-10T00:00:00Z', '2013-06-11T00:00:00Z'));
 
-    clock = Date.parse('2026-10-16T12:35:56Z');
-    await service.tick();
-    expect(await dirty(ch)).toEqual([]);
-    expect(await oldStats(ch)).toEqual(await truth(ch, '2013-06-10T00:00:00Z', '2013-06-14T00:00:00Z'));
+    for (const [i] of days.entries()) {
+      clock = Date.parse('2026-10-16T12:35:56Z') + i * 60_000;
+      await service.tick();
+      const next = days[i + 1];
+      expect(await dirty(ch)).toEqual(
+        next ? [{ from: unix(`${next}T00:00:00Z`), to: unix('2013-06-14T00:00:00Z'), created: 1_760_000_000_777 }] : [],
+      );
+      expect(await oldStats(ch)).toEqual(await truth(ch, '2013-06-10T00:00:00Z', `${next ?? '2013-06-14'}T00:00:00Z`));
+    }
   });
 
   it('turns an hour whose ledgers were rewritten away into a zero row, which readers skip', async () => {
@@ -420,6 +427,9 @@ describe('AggregatorService (e2e)', () => {
       );
       expect(reads).toHaveLength(1); // the newest hour has ledgers: one chunk
       const [sql, params] = reads[0];
+      // One part, as the table is once the background merge has joined the three parts it has now (the history, the live
+      // hour, the tick's rows): each part is read for a block, so the number of rows read depends on when that merge ran.
+      await ch.command(`OPTIMIZE TABLE ${Table.StatsHourly} FINAL`);
       // one block of the table read in reverse order (65,000 rows at most), whatever the history
       expect(await readRows(ch, sql, params)).toBeLessThanOrEqual(70_000);
 

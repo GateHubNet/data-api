@@ -1,0 +1,188 @@
+import type { Asset, VolumeMetric } from '@gatehub/data-api-shared';
+import BigNumber from 'bignumber.js';
+import { fmtTime, precision8 } from '../common/format';
+
+/**
+ * The rows of `/v2/network/exchange_volume` and `/v2/network/payment_volume`, as the original served them
+ * (`api/routes/network/getMetric.js` and `lib/hbase/hbase-thrift/data.js getMetric`).
+ *
+ * The key order of the objects is the one of the original, which came of how the object was built: the columns of an
+ * HBase row come sorted (`components, count, endTime, exchange, exchangeRate, startTime, total`), the reassignments of
+ * `handleResponse` and `formatRows` keep their place, and what `formatRows` adds comes after, in the order it adds it: the row
+ * is `components, count, exchange, total, exchange_rate, start_time, end_time`; a trade component is the object the
+ * aggregation script built, `count, rate, amount, base, counter, converted_amount`, and a payment component
+ * `currency, issuer, amount, count, rate, converted_amount` (`issuer` is absent for the native currency, which has none).
+ */
+
+export type VolumeAsset = { currency: string; issuer?: string };
+
+export interface TradeComponent {
+  count: number;
+  rate: string;
+  amount: string;
+  base: VolumeAsset;
+  counter: VolumeAsset;
+  converted_amount: string;
+}
+
+export interface PaymentComponent {
+  currency: string;
+  issuer?: string;
+  amount: string;
+  count: number;
+  rate: string;
+  converted_amount: string;
+}
+
+export interface VolumeRow {
+  components: (TradeComponent | PaymentComponent)[];
+  count: number;
+  exchange: VolumeAsset;
+  total: string;
+  exchange_rate: string;
+  start_time: string;
+  end_time?: string;
+}
+
+/** The columns of a stored set that the API reads (see `volume_daily`, `volume_live`). */
+export interface StoredVolumeRow {
+  component: string;
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  amount: string;
+  /** A 64-bit column may come back as text. */
+  count: number | string;
+  converted_f: number | string;
+}
+
+/** One component of a bucket, the days of it added up. `converted` is in the native currency. */
+export interface VolumePart {
+  component: string;
+  base: Asset;
+  /** The other side of a trade market; a payment component is a currency alone. */
+  counter?: Asset;
+  amount: BigNumber;
+  count: number;
+  converted: number;
+}
+
+/** A row to be: the parts of an hour, a day, a week, ... starting at `start` (unix seconds), and for a live set its `end`. */
+export interface VolumeBucket {
+  start: number;
+  end?: number;
+  parts: VolumePart[];
+}
+
+/** The currency the amounts are shown in, and how many of it one native coin buys (0 when that cannot be told). */
+export interface DisplayCurrency {
+  asset: Asset;
+  rate: BigNumber;
+}
+
+const assetOf = (currency: string, issuer: string): Asset => (issuer ? { currency, issuer } : { currency });
+
+/** `{currency}` or `{currency, issuer}`: the key `issuer` is absent for the native currency. */
+const volumeAsset = (a: Asset): VolumeAsset =>
+  a.issuer ? { currency: a.currency, issuer: a.issuer } : { currency: a.currency };
+
+/**
+ * Adds the stored rows of the days of one bucket (a day, a week, a month), part by part: the amounts exactly, the counts and the
+ * converted amounts. The sentinel row of a set (component empty) is no part. A component whose sides were swapped on another
+ * day (the trade volume converts through the counter leg when the base has no rate, and then its amount is of the other
+ * currency) is two parts, because the amounts are of different currencies.
+ */
+export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
+  const parts = new Map<string, VolumePart>();
+  for (const row of rows) {
+    if (row.component === '') continue;
+    const base = assetOf(row.base_currency, row.base_issuer);
+    const counter = row.counter_currency === '' ? undefined : assetOf(row.counter_currency, row.counter_issuer);
+    const id = [row.component, row.base_currency, row.base_issuer, row.counter_currency, row.counter_issuer].join(
+      '\u0000',
+    );
+    const found = parts.get(id);
+    if (found) {
+      found.amount = found.amount.plus(row.amount);
+      found.count += Number(row.count);
+      found.converted += Number(row.converted_f);
+    } else {
+      parts.set(id, {
+        component: row.component,
+        base,
+        ...(counter && { counter }),
+        amount: new BigNumber(row.amount),
+        count: Number(row.count),
+        converted: Number(row.converted_f),
+      });
+    }
+  }
+  return [...parts.values()];
+}
+
+/** The largest converted amount first; the same amount in the order of the component ids, so that the order is the same every time. */
+function byConverted(a: VolumePart, b: VolumePart): number {
+  return b.converted - a.converted || (a.component < b.component ? -1 : a.component > b.component ? 1 : 0);
+}
+
+/** `c.rate ? Number(c.rate).toPrecision(8) : '0'` of the original. */
+function rateText(rate: number): string {
+  return rate !== 0 && Number.isFinite(rate) ? precision8(rate) : '0';
+}
+
+/**
+ * The row of a bucket. `native` is the currency of the network (the exchange of the row unless a display currency is
+ * given). With a `display` currency the row is converted as the original did: `total *= X`, `exchange_rate = X`,
+ * `rate /= X` (0 when X is 0), `converted_amount *= X`, where X is `display.rate`.
+ *
+ * A part with a converted amount of 0 (a currency with payments but no rate) is not a component, but its payments are in the
+ * `count`, as in the original. A component's rate is how many units of its currency one native coin buys:
+ * `amount / converted_amount`.
+ */
+export function toVolumeRow(
+  metric: VolumeMetric,
+  bucket: VolumeBucket,
+  native: string,
+  display?: DisplayCurrency,
+): VolumeRow {
+  const x = display ? display.rate.toNumber() : 1;
+  const listed = bucket.parts.filter((p) => p.converted > 0).sort(byConverted);
+
+  const components = listed.map((p): TradeComponent | PaymentComponent => {
+    const rate = p.converted > 0 ? p.amount.toNumber() / p.converted : 0;
+    const shownRate = display ? (x ? rate / x : 0) : rate;
+    const rateOut = rateText(shownRate);
+    const amount = p.amount.toString();
+    const converted = String(p.converted * x);
+    if (metric === 'trade_volume') {
+      return {
+        count: p.count,
+        rate: rateOut,
+        amount,
+        base: volumeAsset(p.base),
+        counter: volumeAsset(p.counter as Asset),
+        converted_amount: converted,
+      };
+    }
+    return {
+      currency: p.base.currency,
+      ...(p.base.issuer && { issuer: p.base.issuer }),
+      amount,
+      count: p.count,
+      rate: rateOut,
+      converted_amount: converted,
+    };
+  });
+
+  const total = listed.reduce((sum, p) => sum + p.converted, 0);
+  return {
+    components,
+    count: bucket.parts.reduce((sum, p) => sum + p.count, 0),
+    exchange: display ? volumeAsset(display.asset) : { currency: native },
+    total: String(total * x),
+    exchange_rate: precision8(display ? display.rate : 1),
+    start_time: fmtTime(bucket.start),
+    ...(bucket.end !== undefined && { end_time: fmtTime(bucket.end) }),
+  };
+}

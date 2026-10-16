@@ -1,0 +1,37 @@
+{
+  "version": 7,
+  "tradeMarkets": [
+    { "base": { "currency": "CNY", "issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y" }, "counter": { "currency": "XRP" } },
+    { "base": { "currency": "KRW", "issuer": "rUkMKjQitpgAM5WTGk79xpjT38DEJY283d" }, "counter": { "currency": "XRP" } },
+    { "base": { "currency": "USD", "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q" }, "counter": { "currency": "XRP" } },
+    { "base": { "currency": "CNY", "issuer": "rnuF96W4SZoCJmbHYBFoJZpR8eCaxNvekK" }, "counter": { "currency": "XRP" } },
+    { "base": { "currency": "JPY", "issuer": "rMAz5ZnK73nyNUL4foAvaxdreczCkG3vA6" }, "counter": { "currency": "XRP" } },
+    { "base": { "currency": "STR", "issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y" }, "counter": { "currency": "XRP" } },
+    { "base": { "currency": "XRP" }, "counter": { "currency": "BTC", "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q" } },
+    { "base": { "currency": "EUR", "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q" }, "counter": { "currency": "XRP" } },
+    { "base": { "currency": "USD", "issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq" }, "counter": { "currency": "XRP" } },
+    {
+      "base": { "currency": "CNY", "issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y" },
+      "counter": { "currency": "JPY", "issuer": "rMAz5ZnK73nyNUL4foAvaxdreczCkG3vA6" }
+    },
+    {
+      "base": { "currency": "CNY", "issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y" },
+      "counter": { "currency": "EUR", "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q" }
+    },
+    {
+      "base": { "currency": "FMM", "issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y" },
+      "counter": { "currency": "STR", "issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y" }
+    },
+    {
+      "base": { "currency": "JPY", "issuer": "r94s8px6kSw1uZ1MV98dhSRTvc6VMPoPcN" },
+      "counter": { "currency": "JPY", "issuer": "r9ZFPSb1TFdnJwbTMYHvVwFK1bQPUCVNfJ" }
+    }
+  ],
+  "paymentCurrencies": [
+    { "currency": "CNY", "issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y" },
+    { "currency": "EUR", "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q" },
+    { "currency": "CCK", "issuer": "rp2PaYDxVwDvaZVLEQv7bHhoFQEyX1mEx7" },
+    { "currency": "USD", "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B" },
+    { "currency": "EUR", "issuer": "rhxULAn1xW9T4V2u67FX9pQjSz4Tay2zjZ" }
+  ]
+}

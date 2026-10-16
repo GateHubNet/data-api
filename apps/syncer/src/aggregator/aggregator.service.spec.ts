@@ -1,9 +1,20 @@
-import { ClickHouseService, StatsRecomputeAborted, Table } from '@gatehub/data-api-shared';
 import {
+  ClickHouseService,
+  MarketsConfig,
+  RatesService,
+  StatsRecomputeAborted,
+  Table,
+  VolumeRecomputeAborted,
+} from '@gatehub/data-api-shared';
+import {
+  AGGREGATOR_DIRTY_BUDGET_MS,
   AGGREGATOR_INTERVAL_MS,
   AGGREGATOR_LIVE_BUDGET_MS,
   AGGREGATOR_SHUTDOWN_WAIT_MS,
   AGGREGATOR_TICK_BUDGET_MS,
+  AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS,
+  AGGREGATOR_VOLUME_DAILY_BUDGET_MS,
+  AGGREGATOR_VOLUME_LIVE_BUDGET_MS,
   AggregatorJob,
   AggregatorOptions,
   AggregatorService,
@@ -1019,6 +1030,700 @@ describe('AggregatorService', () => {
       const b = svc.stop();
       expect(b).toBe(a);
       await svc.onModuleDestroy();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The volume jobs of the aggregator: volume_live, volume_daily (today and yesterday), the dirty hook and volume_backfill.
+// The volume functions of the shared package are replaced by fakes that record what they were asked and take fake time;
+// what they write is tested against a real ClickHouse (packages/shared/test/volume-job.e2e-spec.ts and
+// apps/syncer/test/aggregator.e2e-spec.ts).
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('AggregatorService volume jobs', () => {
+  const MARKETS: MarketsConfig = { version: 4, tradeMarkets: [], paymentCurrencies: [] };
+  const RATES = { nativeCurrency: 'XRP' } as RatesService;
+  const NOW_MS = NOW.getTime();
+  /** The first day that is closed at NOW: the day before yesterday (2026-10-14). */
+  const NEWEST_CLOSED = '2026-10-14';
+
+  let ch: FakeClickHouse;
+  let logger: ReturnType<typeof QUIET>;
+  let metrics: {
+    aggregatorRunsTotal: { inc: jest.Mock };
+    aggregatorErrorsTotal: { inc: jest.Mock };
+    aggregatorStatsLagSeconds: { set: jest.Mock };
+  };
+  const created: AggregatorService[] = [];
+
+  /** What happened, in order: `live <metric> <period>`, `daily <metric> <day>`, `stats <from>`. */
+  let events: string[];
+  interface LiveCall {
+    metric: string;
+    period: string;
+    now: Date;
+    signal?: AbortSignal;
+    at: number;
+  }
+  let liveCalls: LiveCall[];
+  /** `<metric>:<day>:<config version>` of every daily set the fake wrote. */
+  let computed: Set<string>;
+  /** How long (fake milliseconds) each kind of work takes. */
+  let liveMs: number;
+  let closedDayMs: number;
+  let statsMs: number;
+  let recompute: jest.Mock;
+  let liveSet: jest.Mock;
+  let dailySet: jest.Mock;
+  let daysDone: jest.Mock;
+  /** A day (or `metric:day`) the daily fake fails on, while it is in the set. */
+  let failing: Set<string>;
+
+  const day = (d: Date): string => d.toISOString().slice(0, 10);
+  const mark = (from: string, to: string, createdMs = 1000) => ({
+    from: unix(from),
+    to: unix(to),
+    created: createdMs,
+  });
+  const isClosed = (d: string): boolean => d < '2026-10-15';
+
+  beforeEach(() => {
+    jest.useFakeTimers({ now: NOW });
+    ch = new FakeClickHouse();
+    logger = QUIET();
+    metrics = {
+      aggregatorRunsTotal: { inc: jest.fn() },
+      aggregatorErrorsTotal: { inc: jest.fn() },
+      aggregatorStatsLagSeconds: { set: jest.fn() },
+    };
+    events = [];
+    liveCalls = [];
+    computed = new Set();
+    failing = new Set();
+    liveMs = 0;
+    closedDayMs = 0;
+    statsMs = 0;
+    recompute = jest.fn(async (_ch: unknown, from: Date, to: Date) => {
+      events.push(`stats ${iso(from.getTime() / 1000)}`);
+      if (statsMs > 0) jest.setSystemTime(Date.now() + statsMs);
+      const f = from.getTime() / 1000;
+      const t = to.getTime() / 1000;
+      const hours = [...new Set(ch.closes.filter((c) => c >= f && c < t).map((c) => Math.floor(c / HOUR) * HOUR))];
+      if (hours.length > 0) ch.watermark = Math.max(ch.watermark ?? 0, ...hours);
+      return hours.length;
+    });
+    liveSet = jest.fn(
+      async (
+        _ch: unknown,
+        _rates: unknown,
+        _markets: unknown,
+        metric: string,
+        period: string,
+        now: Date,
+        options?: { signal?: AbortSignal },
+      ) => {
+        events.push(`live ${metric} ${period}`);
+        liveCalls.push({ metric, period, now, signal: options?.signal, at: Date.now() });
+        if (liveMs > 0) jest.setSystemTime(Date.now() + liveMs);
+        return 0;
+      },
+    );
+    dailySet = jest.fn(async (_ch: unknown, _rates: unknown, markets: MarketsConfig, metric: string, d: Date) => {
+      const key = day(d);
+      events.push(`daily ${metric} ${key}`);
+      if (isClosed(key) && closedDayMs > 0) jest.setSystemTime(Date.now() + closedDayMs);
+      if (failing.has(key) || failing.has(`${metric}:${key}`)) throw new Error(`DB::Exception: ${metric} ${key}`);
+      computed.add(`${metric}:${key}:${markets.version}`);
+      return 0;
+    });
+    daysDone = jest.fn(async (_ch: unknown, metric: string, from: Date, until: Date, version: number) => {
+      const out = new Set<string>();
+      for (let t = from.getTime(); t < until.getTime(); t += DAY * 1000) {
+        const key = day(new Date(t));
+        if (computed.has(`${metric}:${key}:${version}`)) out.add(key);
+      }
+      return out;
+    });
+  });
+
+  afterEach(async () => {
+    const stops = created.splice(0).map((svc) => svc.stop());
+    await jest.advanceTimersByTimeAsync(AGGREGATOR_SHUTDOWN_WAIT_MS);
+    await Promise.all(stops);
+    jest.useRealTimers();
+  });
+
+  function service(options: AggregatorOptions = {}, markets: MarketsConfig = MARKETS): AggregatorService {
+    const svc = new AggregatorService(ch.asService(), metrics as never, { register: jest.fn() } as never, {
+      logger,
+      recompute,
+      volumes: { rates: RATES, markets },
+      volumeFunctions: { computeLiveSet: liveSet, computeDailySet: dailySet, daysDone },
+      ...options,
+    });
+    created.push(svc);
+    return svc;
+  }
+
+  /** The stats are up to date: the live window is the last slice only. */
+  const caughtUp = (): void => {
+    ch.watermark = unix('2026-10-16T12:00:00Z');
+    ch.closes = [unix('2026-10-10T08:00:00Z'), NOW_SECONDS - 3];
+  };
+  const volumeEvents = (kind: 'live' | 'daily'): string[] => events.filter((e) => e.startsWith(kind));
+  const dailyOf = (list: string[]): string[] => list.filter((e) => e.startsWith('daily')).map((e) => e.slice(6));
+
+  describe('the jobs of a tick', () => {
+    it('are, with volumes, volume_live, volume_daily, stats_live, stats_dirty, volume_backfill, in this order', async () => {
+      caughtUp();
+      ch.dirty = [{ from: unix('2026-05-01T00:00:00Z'), to: unix('2026-05-01T03:00:00Z'), created: 1000 }];
+      await service().tick();
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'volume_live',
+        'volume_daily',
+        'stats_live',
+        'stats_dirty',
+        'volume_backfill',
+      ]);
+      const firstStats = events.findIndex((e) => e.startsWith('stats'));
+      const lastLive = events.lastIndexOf('live payment_volume day');
+      const lastCurrent = events.lastIndexOf(`daily payment_volume 2026-10-15`);
+      expect(lastLive).toBeLessThan(lastCurrent);
+      expect(lastCurrent).toBeLessThan(firstStats);
+      // the back-fill is the last thing the tick does
+      expect(events[events.length - 1]).toBe('daily payment_volume 2026-10-10');
+    });
+
+    it('are without volumes the two jobs of the stats, and nothing is asked of the volume functions', async () => {
+      caughtUp();
+      await service({ volumes: undefined }).tick();
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'stats_live',
+        'stats_dirty',
+      ]);
+      expect(liveSet).not.toHaveBeenCalled();
+      expect(dailySet).not.toHaveBeenCalled();
+      expect(daysDone).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('volume_live', () => {
+    it('refreshes the live sets of both metrics at every tick, with the time of the tick: trade hour..30day, payment hour, day', async () => {
+      caughtUp();
+      const svc = service();
+      await svc.tick();
+      expect(volumeEvents('live')).toEqual([
+        'live trade_volume hour',
+        'live trade_volume day',
+        'live trade_volume 3day',
+        'live trade_volume 7day',
+        'live trade_volume 30day',
+        'live payment_volume hour',
+        'live payment_volume day',
+      ]);
+      expect(liveCalls.every((c) => c.now.getTime() === NOW_MS)).toBe(true);
+      const call = liveSet.mock.calls[0];
+      expect(call[0]).toBe(ch);
+      expect(call[1]).toBe(RATES);
+      expect(call[2]).toBe(MARKETS);
+
+      liveCalls.length = 0;
+      jest.setSystemTime(NOW_MS + 60_000);
+      await svc.tick();
+      expect(liveCalls).toHaveLength(7);
+      expect(liveCalls.every((c) => c.now.getTime() === NOW_MS + 60_000)).toBe(true);
+    });
+
+    it('hands the shutdown signal to every set', async () => {
+      caughtUp();
+      await service().tick();
+      expect(liveCalls.every((c) => c.signal instanceof AbortSignal && !c.signal.aborted)).toBe(true);
+    });
+
+    it('a set that fails is logged and counted, the other sets still run, and it is tried again next tick', async () => {
+      caughtUp();
+      liveSet.mockRejectedValueOnce(new Error('DB::Exception: rates unavailable'));
+      const svc = service();
+      await svc.tick();
+      expect(volumeEvents('live')).toHaveLength(6);
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('volume_live'));
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('trade_volume hour'));
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('rates unavailable'));
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'volume_live' });
+      // the stats and the other volume jobs ran
+      expect(recompute).toHaveBeenCalled();
+      expect(dailySet).toHaveBeenCalled();
+
+      liveCalls.length = 0;
+      await svc.tick();
+      expect(liveCalls).toHaveLength(7);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up after three sets failed in a tick, so that an outage does not log a line per set', async () => {
+      caughtUp();
+      liveSet.mockRejectedValue(new Error('down'));
+      await service().tick();
+      expect(liveSet).toHaveBeenCalledTimes(3);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
+    });
+
+    it('stops starting sets when its own budget is spent, says so, and does not take the tick from the stats', async () => {
+      caughtUp();
+      liveMs = 3000;
+      await service().tick();
+      // 3 s a set: sets start at 0 s and 3 s; at 6 s the 5 s budget is spent
+      expect(liveCalls).toHaveLength(2);
+      expect(AGGREGATOR_VOLUME_LIVE_BUDGET_MS).toBe(5000);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('volume_live'));
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('budget'));
+      // the stats still ran in the same tick
+      expect(recompute).toHaveBeenCalled();
+    });
+
+    it('starts nothing after the shutdown began, and a set cut short by it is neither an error nor counted', async () => {
+      caughtUp();
+      const svc = service();
+      liveSet.mockImplementationOnce(async () => {
+        void svc.stop();
+        throw new VolumeRecomputeAborted();
+      });
+      await svc.tick();
+      expect(liveSet).toHaveBeenCalledTimes(1);
+      expect(dailySet).not.toHaveBeenCalled();
+      expect(recompute).not.toHaveBeenCalled();
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('shutdown'));
+    });
+
+    it('a real failure while the shutdown is under way is still an error', async () => {
+      caughtUp();
+      const svc = service();
+      liveSet.mockImplementationOnce(async () => {
+        void svc.stop();
+        throw new Error('DB::Exception: table is read-only');
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'volume_live' });
+    });
+  });
+
+  describe('volume_daily: today and yesterday, at every tick', () => {
+    it('recomputes the daily sets of both metrics for today and for yesterday (UTC)', async () => {
+      caughtUp();
+      await service().tick();
+      expect(dailyOf(volumeEvents('daily').slice(0, 4))).toEqual([
+        'trade_volume 2026-10-16',
+        'payment_volume 2026-10-16',
+        'trade_volume 2026-10-15',
+        'payment_volume 2026-10-15',
+      ]);
+      const [, , markets, , d, options] = dailySet.mock.calls[0];
+      expect(markets).toBe(MARKETS);
+      expect(d).toEqual(new Date('2026-10-16T00:00:00Z'));
+      expect(options.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it('moves on with the UTC midnight', async () => {
+      caughtUp();
+      ch.closes = [unix('2026-10-10T08:00:00Z'), unix('2026-10-17T00:00:10Z')];
+      ch.watermark = unix('2026-10-17T00:00:00Z');
+      jest.setSystemTime(new Date('2026-10-17T00:00:30Z'));
+      await service().tick();
+      expect(dailyOf(volumeEvents('daily').slice(0, 4))).toEqual([
+        'trade_volume 2026-10-17',
+        'payment_volume 2026-10-17',
+        'trade_volume 2026-10-16',
+        'payment_volume 2026-10-16',
+      ]);
+    });
+
+    it('a set that fails is logged and counted, the others go on, and it is tried again next tick', async () => {
+      caughtUp();
+      failing.add('payment_volume:2026-10-16');
+      const svc = service();
+      await svc.tick();
+      expect(computed.has('trade_volume:2026-10-15:4')).toBe(true);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'volume_daily' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('payment_volume 2026-10-16'));
+      failing.clear();
+      await svc.tick();
+      expect(computed.has('payment_volume:2026-10-16:4')).toBe(true);
+    });
+
+    it('has a budget of its own, so that the sets of today cannot take the tick from the stats', async () => {
+      caughtUp();
+      closedDayMs = 0;
+      dailySet.mockImplementation(async (_c: unknown, _r: unknown, _m: unknown, metric: string, d: Date) => {
+        events.push(`daily ${metric} ${day(d)}`);
+        jest.setSystemTime(Date.now() + 3000);
+        return 0;
+      });
+      await service().tick();
+      // sets at 0 s and 3 s (the budget is 4 s), the third would start at 6 s
+      expect(AGGREGATOR_VOLUME_DAILY_BUDGET_MS).toBe(4000);
+      expect(volumeEvents('daily').slice(0, 2)).toHaveLength(2);
+      expect(events.filter((e) => e.startsWith('daily') && !isClosed(e.slice(-10)))).toHaveLength(2);
+      expect(recompute).toHaveBeenCalled();
+    });
+  });
+
+  describe('volume_backfill: the closed days, once per config version, newest first', () => {
+    it('computes the closed days from the first ledger up to the day before yesterday, newest first, both metrics', async () => {
+      caughtUp();
+      await service().tick();
+      const closed = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
+      expect(closed).toEqual([
+        'trade_volume 2026-10-14',
+        'payment_volume 2026-10-14',
+        'trade_volume 2026-10-13',
+        'payment_volume 2026-10-13',
+        'trade_volume 2026-10-12',
+        'payment_volume 2026-10-12',
+        'trade_volume 2026-10-11',
+        'payment_volume 2026-10-11',
+        'trade_volume 2026-10-10',
+        'payment_volume 2026-10-10',
+      ]);
+      // asked which days of that window are done, for the config version of the markets
+      expect(daysDone).toHaveBeenCalledWith(
+        ch,
+        'trade_volume',
+        new Date('2026-10-10T00:00:00Z'),
+        new Date('2026-10-15T00:00:00Z'),
+        4,
+      );
+      expect(daysDone).toHaveBeenCalledWith(
+        ch,
+        'payment_volume',
+        new Date('2026-10-10T00:00:00Z'),
+        new Date('2026-10-15T00:00:00Z'),
+        4,
+      );
+      expect(NEWEST_CLOSED).toBe('2026-10-14');
+    });
+
+    it('computes a closed day once: the next tick has nothing to do but today and yesterday', async () => {
+      caughtUp();
+      const svc = service();
+      await svc.tick();
+      dailySet.mockClear();
+      await svc.tick();
+      expect(dailySet).toHaveBeenCalledTimes(4);
+      expect(dailyOf(volumeEvents('daily').slice(-4)).every((e) => !isClosed(e.split(' ')[1]))).toBe(true);
+    });
+
+    it('computes the days again for a new config version, and only for it', async () => {
+      caughtUp();
+      await service().tick();
+      dailySet.mockClear();
+      await service({}, { ...MARKETS, version: 5 }).tick();
+      const closed = dailySet.mock.calls.filter((c) => isClosed(day(c[4])));
+      expect(closed).toHaveLength(10);
+      expect(closed.every((c) => c[2].version === 5)).toBe(true);
+      expect(daysDone).toHaveBeenLastCalledWith(ch, 'payment_volume', expect.any(Date), expect.any(Date), 5);
+    });
+
+    it('skips the days that are done, one metric apart from the other', async () => {
+      caughtUp();
+      computed.add('trade_volume:2026-10-14:4');
+      computed.add('trade_volume:2026-10-13:4');
+      computed.add('payment_volume:2026-10-12:4');
+      await service().tick();
+      const closed = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
+      expect(closed).toEqual([
+        'payment_volume 2026-10-14',
+        'payment_volume 2026-10-13',
+        'trade_volume 2026-10-12',
+        'trade_volume 2026-10-11',
+        'payment_volume 2026-10-11',
+        'trade_volume 2026-10-10',
+        'payment_volume 2026-10-10',
+      ]);
+    });
+
+    it('does nothing without a ledger, and when the first ledger is younger than the closed days', async () => {
+      ch.watermark = unix('2026-10-16T12:00:00Z');
+      await service().tick();
+      expect(daysDone).not.toHaveBeenCalled();
+      ch.closes = [unix('2026-10-15T08:00:00Z'), NOW_SECONDS - 3];
+      await service().tick();
+      expect(daysDone).not.toHaveBeenCalled();
+      expect(dailySet).toHaveBeenCalledTimes(8); // today and yesterday, twice
+    });
+
+    it('works under its own budget, a per-tick one, and goes on where it stopped next tick', async () => {
+      caughtUp();
+      ch.closes = [unix('2026-09-01T08:00:00Z'), NOW_SECONDS - 3];
+      closedDayMs = 3000;
+      const svc = service();
+      await svc.tick();
+      // 3 s a set: sets start at 0, 3, 6 and 9 s; at 12 s the 10 s budget is spent
+      expect(AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS).toBe(10_000);
+      const first = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
+      expect(first).toEqual([
+        'trade_volume 2026-10-14',
+        'payment_volume 2026-10-14',
+        'trade_volume 2026-10-13',
+        'payment_volume 2026-10-13',
+      ]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('volume_backfill'));
+
+      events.length = 0;
+      jest.setSystemTime(NOW_MS + 60_000);
+      await svc.tick();
+      const second = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
+      expect(second).toEqual([
+        'trade_volume 2026-10-12',
+        'payment_volume 2026-10-12',
+        'trade_volume 2026-10-11',
+        'payment_volume 2026-10-11',
+      ]);
+    });
+
+    it('never takes the tick from the live work: whatever it has left to do, the tick ends within its budget', async () => {
+      caughtUp();
+      ch.closes = [unix('2024-01-01T08:00:00Z'), NOW_SECONDS - 3];
+      closedDayMs = 2500;
+      await service().tick();
+      expect(Date.now() - NOW_MS).toBeLessThanOrEqual(AGGREGATOR_TICK_BUDGET_MS + 2500);
+    });
+
+    it('a set that fails is logged and counted, the others go on, and it is tried again next tick', async () => {
+      caughtUp();
+      failing.add('payment_volume:2026-10-13');
+      const svc = service();
+      await svc.tick();
+      expect(computed.has('trade_volume:2026-10-13:4')).toBe(true);
+      expect(computed.has('payment_volume:2026-10-13:4')).toBe(false);
+      expect(computed.has('trade_volume:2026-10-10:4')).toBe(true);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'volume_backfill' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('payment_volume 2026-10-13'));
+
+      failing.clear();
+      events.length = 0;
+      await svc.tick();
+      expect(dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]))).toEqual([
+        'payment_volume 2026-10-13',
+      ]);
+    });
+
+    it('gives up after three sets failed in a tick', async () => {
+      caughtUp();
+      for (let d = 10; d <= 14; d++) failing.add(`2026-10-${d}`);
+      await service().tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
+    });
+
+    it('says when it starts, and when it is done', async () => {
+      caughtUp();
+      ch.closes = [unix('2026-10-01T08:00:00Z'), NOW_SECONDS - 3];
+      closedDayMs = 3000;
+      const svc = service();
+      await svc.tick();
+      expect(logger.log).toHaveBeenCalledWith(expect.stringMatching(/back-fill: \d+ daily sets/i));
+      logger.log.mockClear();
+      for (let i = 0; i < 20 && !logger.log.mock.calls.some(([m]) => /back-fill is done/i.test(String(m))); i++) {
+        jest.setSystemTime(NOW_MS + (i + 1) * 60_000);
+        await svc.tick();
+      }
+      expect(logger.log).toHaveBeenCalledWith(expect.stringMatching(/back-fill is done/i));
+    });
+
+    it('starts no set after the shutdown began', async () => {
+      caughtUp();
+      const svc = service();
+      dailySet.mockImplementation(async (_c: unknown, _r: unknown, _m: unknown, metric: string, d: Date) => {
+        events.push(`daily ${metric} ${day(d)}`);
+        if (day(d) === '2026-10-13' && metric === 'payment_volume') void svc.stop();
+        return 0;
+      });
+      await svc.tick();
+      const closed = dailyOf(volumeEvents('daily')).filter((e) => isClosed(e.split(' ')[1]));
+      expect(closed[closed.length - 1]).toBe('payment_volume 2026-10-13');
+    });
+  });
+
+  describe('the days of agg_dirty ranges (the hook of stats_dirty)', () => {
+    it('recomputes the daily volumes of the days a slice covers, after its stats, and removes the range', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
+      await service().tick();
+      const at = events.indexOf('stats 2026-05-01T22:00:00Z');
+      expect(events.slice(at, at + 5)).toEqual([
+        'stats 2026-05-01T22:00:00Z',
+        'daily trade_volume 2026-05-01',
+        'daily payment_volume 2026-05-01',
+        'daily trade_volume 2026-05-02',
+        'daily payment_volume 2026-05-02',
+      ]);
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('a range of several days: each slice recomputes its own days, a day cut by two slices once more than needed is fine', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-03T06:00:00Z')];
+      await service().tick();
+      const days = dailyOf(volumeEvents('daily')).filter((e) => e.split(' ')[1] < '2026-06-01');
+      expect([...new Set(days.map((e) => e.split(' ')[1]))]).toEqual(['2026-05-01', '2026-05-02', '2026-05-03']);
+    });
+
+    it('computes a day once for the ranges of one tick, unless the ingest marked it again after that', async () => {
+      caughtUp();
+      ch.dirty = [
+        mark('2026-05-01T01:00:00Z', '2026-05-01T02:00:00Z', 1000),
+        mark('2026-05-01T05:00:00Z', '2026-05-01T06:00:00Z', 2000),
+      ];
+      await service().tick();
+      expect(dailyOf(volumeEvents('daily')).filter((e) => e.endsWith('2026-05-01'))).toEqual([
+        'trade_volume 2026-05-01',
+        'payment_volume 2026-05-01',
+      ]);
+
+      // the second range was marked after the day began (the ingest wrote more ledgers meanwhile): the day is done again
+      events.length = 0;
+      ch.dirty = [
+        mark('2026-05-01T01:00:00Z', '2026-05-01T02:00:00Z', 1000),
+        mark('2026-05-01T05:00:00Z', '2026-05-01T06:00:00Z', NOW_MS + 5000),
+      ];
+      await service().tick();
+      expect(dailyOf(volumeEvents('daily')).filter((e) => e.endsWith('2026-05-01'))).toHaveLength(4);
+    });
+
+    it('a day that fails keeps the range, counts the failure, and the next tick does it again', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
+      failing.add('payment_volume:2026-05-02');
+      const svc = service();
+      await svc.tick();
+      expect(ch.dirty).toHaveLength(1);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'volume_dirty' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('volume_dirty'));
+
+      failing.clear();
+      await svc.tick();
+      expect(ch.dirty).toEqual([]);
+      expect(computed.has('payment_volume:2026-05-02:4')).toBe(true);
+    });
+
+    it('does not touch the volumes without the option', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
+      await service({ volumes: undefined }).tick();
+      expect(dailySet).not.toHaveBeenCalled();
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('a day cut short by the shutdown is neither an error nor counted, and the range stays', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
+      const svc = service();
+      dailySet.mockImplementation(async (_c: unknown, _r: unknown, _m: unknown, metric: string, d: Date) => {
+        if (day(d) === '2026-05-01') {
+          void svc.stop();
+          throw new VolumeRecomputeAborted();
+        }
+        return 0;
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(ch.dirty).toHaveLength(1);
+    });
+  });
+
+  describe('the budgets of the tick', () => {
+    it('the jobs that may run long have a budget: stats_live 20 s, stats_dirty 10 s, the volume jobs 5, 4 and 10 s', () => {
+      expect(AGGREGATOR_LIVE_BUDGET_MS).toBe(20_000);
+      expect(AGGREGATOR_DIRTY_BUDGET_MS).toBe(10_000);
+      expect(AGGREGATOR_VOLUME_LIVE_BUDGET_MS + AGGREGATOR_VOLUME_DAILY_BUDGET_MS).toBeLessThan(
+        AGGREGATOR_TICK_BUDGET_MS - AGGREGATOR_LIVE_BUDGET_MS,
+      );
+    });
+
+    it('stats_dirty has a budget: a backlog of ranges does not take the rest of the tick', async () => {
+      caughtUp();
+      statsMs = 4000;
+      ch.dirty = Array.from({ length: 20 }, (_, i) =>
+        mark(
+          `2026-04-${String(i + 1).padStart(2, '0')}T00:00:00Z`,
+          `2026-04-${String(i + 1).padStart(2, '0')}T05:00:00Z`,
+          1000 + i,
+        ),
+      );
+      await service({ volumes: undefined }).tick();
+      // the live slice takes 4 s; dirty slices start while the 10 s since the start of the job are not spent: at 4, 8 and 12 s
+      const dirtySlices = events.filter((e) => e.startsWith('stats 2026-04'));
+      expect(dirtySlices).toHaveLength(3);
+      expect(ch.dirty).toHaveLength(17);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('stats_dirty'));
+    });
+
+    it('a long stats sweep and a dirty backlog cannot starve the live volumes: they are refreshed first, at every tick', async () => {
+      // 60 days of stats to catch up, 4 s a slice; 30 dirty ranges of a day, 4 s a slice; 300 closed days of volumes to
+      // back-fill, 3 s a set
+      ch.watermark = unix('2026-08-17T00:00:00Z');
+      ch.closes = Array.from({ length: 61 }, (_, i) => unix('2026-08-17T00:30:00Z') + i * DAY);
+      ch.closes.push(NOW_SECONDS - 3);
+      ch.dirty = Array.from({ length: 30 }, (_, i) => ({
+        from: unix('2026-01-01T00:00:00Z') + i * DAY,
+        to: unix('2026-01-02T00:00:00Z') + i * DAY,
+        created: 1000 + i,
+      }));
+      statsMs = 4000;
+      closedDayMs = 3000;
+      const svc = service();
+
+      const startedAt: number[] = [];
+      for (let tickNo = 0; tickNo < 3; tickNo++) {
+        const tickStart = NOW_MS + tickNo * 60_000;
+        jest.setSystemTime(tickStart);
+        startedAt.push(tickStart);
+        events.length = 0;
+        liveCalls.length = 0;
+        await svc.tick();
+        // the seven live sets ran at the very start of the tick, before any stats slice, whatever followed
+        expect(liveCalls).toHaveLength(7);
+        expect(liveCalls.every((c) => c.at === tickStart)).toBe(true);
+        expect(events.slice(0, 7).every((e) => e.startsWith('live'))).toBe(true);
+        // and the four daily sets of today and yesterday, so the first stats slice comes after eleven volume sets
+        expect(events.findIndex((e) => e.startsWith('stats'))).toBeGreaterThanOrEqual(11);
+        // and the tick is over within its budget plus the slice in flight
+        expect(Date.now() - tickStart).toBeLessThanOrEqual(AGGREGATOR_TICK_BUDGET_MS + 4000);
+        // the stats sweep is far from done: the sweep and the backlog are what ran long
+        expect(ch.dirty.length).toBeGreaterThan(0);
+      }
+    });
+
+    it('the volume jobs before the stats cannot take more than their budgets even when their sets are slow', async () => {
+      caughtUp();
+      liveMs = 10_000;
+      closedDayMs = 0;
+      dailySet.mockImplementation(async (_c: unknown, _r: unknown, _m: unknown, metric: string, d: Date) => {
+        events.push(`daily ${metric} ${day(d)}`);
+        jest.setSystemTime(Date.now() + 10_000);
+        return 0;
+      });
+      ch.dirty = [{ from: unix('2026-05-01T00:00:00Z'), to: unix('2026-05-01T05:00:00Z'), created: 1000 }];
+      await service().tick();
+      // one live set (10 s, over its 5 s budget), one daily set (10 s, over its 4 s): the tick is at 20 s, the stats still run
+      expect(volumeEvents('live')).toHaveLength(1);
+      expect(events.filter((e) => e.startsWith('daily') && !e.includes('2026-05')).length).toBe(1);
+      expect(events.some((e) => e.startsWith('stats'))).toBe(true);
+    });
+
+    it('can be changed per job, and the live budget option still works', async () => {
+      caughtUp();
+      liveMs = 1000;
+      await service({ budgetsMs: { volume_live: 2500 } }).tick();
+      expect(liveCalls).toHaveLength(3);
+      liveCalls.length = 0;
+      jest.setSystemTime(NOW);
+      await service({ liveBudgetMs: 1, budgetsMs: { volume_live: 100_000 } }).tick();
+      expect(liveCalls).toHaveLength(7);
     });
   });
 });

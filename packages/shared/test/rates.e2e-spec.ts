@@ -10,7 +10,7 @@ import { LedgerWriter } from '../src/ingest/ledger-writer';
 import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
 import { Asset, assetKey, canonicalPair } from '../src/query/asset';
-import { RATE_PERIODS, RatePeriod, RatesService } from '../src/query/rates.service';
+import { RATE_PERIODS, RatePeriod, RatesService, Vwap } from '../src/query/rates.service';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 
 /**
@@ -344,6 +344,207 @@ describe('RatesService (e2e)', () => {
         '0',
         '0',
       ]);
+    });
+
+    describe('vwaps(): many pairs of one window in one read (the volume jobs)', () => {
+      const DAY_FROM = new Date('2015-01-14T00:00:00Z');
+      const DAY_TO = new Date('2015-01-15T00:00:00Z');
+      const sameAs = (got: Vwap, want: Vwap, label: string): void => {
+        expect([label, got.count, got.baseVolume.toFixed(), got.counterVolume.toFixed(), got.vwap.toFixed()]).toEqual([
+          label,
+          want.count,
+          want.baseVolume.toFixed(),
+          want.counterVolume.toFixed(),
+          want.vwap.toFixed(),
+        ]);
+      };
+
+      it('is, for every pair in both orientations, what the oracle and vwap() give', async () => {
+        const got = await rates.vwaps(
+          orientations.map(({ base, counter }) => ({ base, counter })),
+          DAY_FROM,
+          DAY_TO,
+        );
+        expect(got).toHaveLength(orientations.length);
+        for (const [i, { m, inverted, base, counter }] of orientations.entries()) {
+          const want = oracleVwap(
+            m,
+            'XRP',
+            closedIn(m.trades, DAY_FROM.getTime() / SEC, DAY_TO.getTime() / SEC),
+            inverted,
+          );
+          expectSame(label(base, counter), got[i].vwap, want.vwap);
+          expect([got[i].count, got[i].baseVolume.toFixed(), got[i].counterVolume.toFixed()]).toEqual([
+            want.count,
+            want.baseVolume.toFixed(),
+            want.counterVolume.toFixed(),
+          ]);
+        }
+        // and not a window of zeros: most of the pairs traded that day
+        expect(got.filter((v) => v.count > 0).length).toBeGreaterThan(40);
+        await inBatches(orientations.slice(0, 16), async ({ base, counter }) => {
+          const i = orientations.findIndex((o) => o.base === base && o.counter === counter);
+          sameAs(got[i], await rates.vwap(base, counter, DAY_FROM, DAY_TO), label(base, counter));
+        });
+      });
+
+      it('answers in the order asked, a pair asked twice or both ways round included', async () => {
+        const [a, b] = [markets[0], markets[3]];
+        const got = await rates.vwaps(
+          [
+            { base: b.base, counter: b.counter },
+            { base: a.counter, counter: a.base },
+            { base: b.base, counter: b.counter },
+            { base: a.base, counter: a.counter },
+          ],
+          DAY_FROM,
+          DAY_TO,
+        );
+        const one = (m: Market, inverted: boolean): Vwap =>
+          oracleVwap(m, 'XRP', closedIn(m.trades, DAY_FROM.getTime() / SEC, DAY_TO.getTime() / SEC), inverted);
+        sameAs(got[0], one(b, false), 'b');
+        sameAs(got[1], one(a, true), 'a reversed');
+        sameAs(got[2], one(b, false), 'b again');
+        sameAs(got[3], one(a, false), 'a');
+        expect(got[1].baseVolume.toFixed()).toBe(got[3].counterVolume.toFixed());
+      });
+
+      it('is one read of the exchanges whatever the number of pairs, with a window without ledgers read not at all', async () => {
+        const pairs = orientations.map(({ base, counter }) => ({ base, counter }));
+        const spy = jest.spyOn(ch, 'query');
+        await rates.vwaps(pairs, DAY_FROM, DAY_TO);
+        const exchangeReads = spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.Exchanges}`));
+        expect(exchangeReads).toHaveLength(1);
+        spy.mockClear();
+        const none = await rates.vwaps(
+          pairs.slice(0, 3),
+          new Date('2020-01-01T00:00:00Z'),
+          new Date('2020-01-02T00:00:00Z'),
+        );
+        expect(spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.Exchanges}`))).toHaveLength(0);
+        expect(none.map((v) => [v.count, v.vwap.toFixed()])).toEqual([
+          [0, '0'],
+          [0, '0'],
+          [0, '0'],
+        ]);
+        spy.mockClear();
+        expect(await rates.vwaps([], DAY_FROM, DAY_TO)).toEqual([]);
+        expect(spy).not.toHaveBeenCalled();
+        spy.mockRestore();
+      });
+
+      it('leaves out the native legs of 0.0005 or less, as vwap() does', async () => {
+        const cny = markets.find((x) => x.counter.currency === 'XRP' && x.trades.length === 13) as Market;
+        const [got] = await rates.vwaps([{ base: cny.base, counter: cny.counter }], DAY_FROM, DAY_TO);
+        const all = oracleVwap(cny, 'XRP', cny.trades, false);
+        expect(got.count).toBe(all.count);
+        expect(got.count).toBeLessThan(13);
+      });
+
+      it('rejects a date that is none', async () => {
+        await expect(
+          rates.vwaps([{ base: markets[0].base, counter: markets[0].counter }], new Date(NaN), DAY_TO),
+        ).rejects.toThrow(RangeError);
+      });
+    });
+
+    describe('bucketVwaps(): the vwap of every day, week (Monday) or month of a window (the display currency of the volumes)', () => {
+      const usd = markets.find(
+        (x) => assetKey(x.base) === 'USD.rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B' && x.counter.currency === 'XRP',
+      ) as Market;
+      const xrp: Asset = { currency: 'XRP' };
+      const unix = (text: string): number => Date.parse(text) / SEC;
+      const FROM = new Date('2015-01-01T00:00:00Z');
+      const TO = new Date('2017-01-01T00:00:00Z');
+
+      /** The vwap of the trades of the pair that closed in each bucket, XRP in USD (the pair asked for the other way round). */
+      function expected(starts: string[], size: (start: number) => number): [number, string][] {
+        return starts.map((start) => {
+          const from = unix(start);
+          const v = oracleVwap(usd, 'XRP', closedIn(usd.trades, from, from + size(from)), true);
+          return [from, v.vwap.toFixed()];
+        });
+      }
+      const asList = (map: Map<number, BigNumber>): [number, string][] => [...map].map(([k, v]) => [k, v.toFixed()]);
+
+      it('day: the days that have trades', async () => {
+        const got = await rates.bucketVwaps(xrp, usd.base, FROM, TO, 'day');
+        expect(asList(got)).toEqual(expected(['2015-01-14T00:00:00Z', '2016-03-28T00:00:00Z'], () => 86_400));
+        expect([...got.values()].every((v) => v.gt(0))).toBe(true);
+      });
+
+      it('week: Monday to Monday', async () => {
+        const got = await rates.bucketVwaps(xrp, usd.base, FROM, TO, 'week');
+        // 2015-01-14 is a Wednesday
+        expect(asList(got)).toEqual(expected(['2015-01-12T00:00:00Z', '2016-03-28T00:00:00Z'], () => 7 * 86_400));
+      });
+
+      it('month: the calendar month', async () => {
+        const got = await rates.bucketVwaps(xrp, usd.base, FROM, TO, 'month');
+        expect(asList(got)).toEqual(
+          expected(
+            ['2015-01-01T00:00:00Z', '2016-03-01T00:00:00Z'],
+            (start) =>
+              (Date.UTC(new Date(start * SEC).getUTCFullYear(), new Date(start * SEC).getUTCMonth() + 1, 1) -
+                start * SEC) /
+              SEC,
+          ),
+        );
+      });
+
+      it('is the vwap of the same pair in the direction asked', async () => {
+        const forward = await rates.bucketVwaps(usd.base, xrp, FROM, TO, 'day');
+        const backward = await rates.bucketVwaps(xrp, usd.base, FROM, TO, 'day');
+        for (const [bucket, v] of forward) {
+          const want = await rates.vwap(usd.base, xrp, new Date(bucket * SEC), new Date((bucket + 86_400) * SEC));
+          expectSame('forward', v, want.vwap);
+          expect(backward.get(bucket)?.gt(0)).toBe(true);
+        }
+        expect(forward.size).toBe(2);
+      });
+
+      it('the window decides which trades count: a window of one day gives that day', async () => {
+        const got = await rates.bucketVwaps(
+          xrp,
+          usd.base,
+          new Date('2016-03-28T00:00:00Z'),
+          new Date('2016-03-29T00:00:00Z'),
+          'day',
+        );
+        expect([...got.keys()]).toEqual([unix('2016-03-28T00:00:00Z')]);
+      });
+
+      it('is empty for a window without ledgers or trades, and for the same asset on both sides', async () => {
+        expect(
+          (
+            await rates.bucketVwaps(
+              xrp,
+              usd.base,
+              new Date('2020-01-01T00:00:00Z'),
+              new Date('2020-02-01T00:00:00Z'),
+              'day',
+            )
+          ).size,
+        ).toBe(0);
+        const other = { currency: 'EUR', issuer: 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B' };
+        expect((await rates.bucketVwaps(xrp, other, FROM, TO, 'day')).size).toBe(0);
+        expect((await rates.bucketVwaps(xrp, xrp, FROM, TO, 'day')).size).toBe(0);
+      });
+
+      it('leaves out the native legs of 0.0005 or less, as vwap() does', async () => {
+        const cny = markets.find((x) => x.counter.currency === 'XRP' && x.trades.length === 13) as Market;
+        const got = await rates.bucketVwaps(xrp, cny.base, FROM, TO, 'day');
+        const want = oracleVwap(cny, 'XRP', cny.trades, true);
+        expect(got.size).toBe(1);
+        expectSame('cny', [...got.values()][0], want.vwap);
+      });
+
+      it('is one read of the exchanges', async () => {
+        const spy = jest.spyOn(ch, 'query');
+        await rates.bucketVwaps(xrp, usd.base, FROM, TO, 'week');
+        expect(spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.Exchanges}`))).toHaveLength(1);
+        spy.mockRestore();
+      });
     });
   });
 
@@ -1168,6 +1369,41 @@ describe('RatesService (e2e)', () => {
       const pipeline = await pipelineOf(daily);
       expect(pipeline).toContain('ReadPoolInOrder');
       expect(/SortingTransform/.test(pipeline)).toBe(false);
+    });
+
+    it('vwaps() and bucketVwaps() bind the pairs and the ledgers, and read by the primary key (the pairs, then the ledgers)', async () => {
+      const eur: Asset = { currency: 'EUR', issuer: ISSUER };
+      const from = new Date(FIRST * SEC);
+      const queries = await exchangeQueries(async () => {
+        await rates.vwaps(
+          [
+            { base: USD, counter: XRP },
+            { base: eur, counter: XRP },
+          ],
+          from,
+          date,
+        );
+        await rates.bucketVwaps(XRP, USD, from, date, 'day');
+      });
+      expect(queries).toHaveLength(2);
+      for (const { sql, params } of queries) {
+        expect(sql).not.toContain(ISSUER);
+        expect(sql).toContain('LIMIT 1 BY base_currency, base_issuer, counter_currency, counter_issuer, ledger_index');
+        expect(sql).toContain('ledger_index BETWEEN {min:UInt32} AND {max:UInt32}');
+        expect(params).toHaveProperty('min');
+      }
+      expect(queries[0].sql).toContain('{pair0:Array(String)}');
+      expect(queries[0].params).toMatchObject({
+        pair0: ['USD', 'EUR'],
+        pair1: [ISSUER, ISSUER],
+        pair2: ['XRP', 'XRP'],
+        pair3: ['', ''],
+      });
+      const plan = (await ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${queries[0].sql}`, queries[0].params))
+        .map((r) => r.explain)
+        .join('\n');
+      // the pairs narrow the primary key (an `in 2-element set` condition on the four pair columns)
+      expect(plan).toMatch(/PrimaryKey[\s\S]*base_currency[\s\S]*counter_issuer[\s\S]*in 2-element set/);
     });
 
     it('a window with no ledger sends no query on the exchanges', async () => {
