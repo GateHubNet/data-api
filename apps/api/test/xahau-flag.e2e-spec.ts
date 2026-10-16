@@ -1,4 +1,4 @@
-import { Harness, startHarness } from './harness';
+import { ApiClient, Harness, startHarness } from './harness';
 import {
   fixtureSource,
   fixtureTransactions,
@@ -19,10 +19,12 @@ describe('a Xahau flag ledger with UNLReport pseudo-transactions (Account "")', 
   const all = fixtureTransactions(seed);
   const reports = all.filter((t) => t.row.tx_type === 'UNLReport');
   let h: Harness;
-  const get = (path: string) => h.http().get(path).set('X-API-Key', h.key);
+  // One listening socket for all the requests (the per-request server of `h.http()` is for a few requests only).
+  let get: ApiClient['get'];
 
   beforeAll(async () => {
     h = await startHarness({ seed });
+    get = (await h.api()).get;
   });
   afterAll(async () => {
     await h?.close();
