@@ -56,13 +56,19 @@ and a spike that is gone by the next probe resets the window. During a large cat
 is informational and nothing restarts on it.
 
 A 503 carries the same detail as a 200, so the body says why: the failed indicator moves from `info` to `error` with
-`"status": "down"`, a `message`, and the same `state`, `lag`, `last_commit_age` and `error` fields, e.g. for a halted runner:
+`"status": "down"`, a `message`, and the same `state`, `lag`, `last_commit_age` and `error` fields; `details` holds every
+indicator, up or down. For example a runner halted on a chain break (the body of the syncer e2e test, hashes shortened):
 
 ```json
 { "status": "error",
   "info": { "clickhouse": { "status": "up" } },
-  "error": { "ingest": { "status": "down", "state": "halted", "lag": 10, "last_commit_age": 41, "message": "halted",
-                         "error": "Ledger 83000011 has parent_hash ..., but ledger 83000010 has hash ..." } } }
+  "error": { "ingest": { "status": "down", "state": "halted", "lag": 10, "last_commit_age": 0,
+                         "error": "Ledger 83000011 has parent_hash 32DD4CF3...2C24, but ledger 83000010 has hash 3AE10F12...C0E",
+                         "message": "halted" } },
+  "details": { "clickhouse": { "status": "up" },
+               "ingest": { "status": "down", "state": "halted", "lag": 10, "last_commit_age": 0,
+                           "error": "Ledger 83000011 has parent_hash 32DD4CF3...2C24, but ledger 83000010 has hash 3AE10F12...C0E",
+                           "message": "halted" } } }
 ```
 
 A syncer whose workers read from the node (`ingest`, `fee_stats`) opens its probe port only after its node connection is up and
