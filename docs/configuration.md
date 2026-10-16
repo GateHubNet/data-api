@@ -107,6 +107,7 @@ variables above, per network.
 | `IMAGE_TAG` | prod, dev | prod `latest`, dev `dev` | tag of the locally built `gatehub/data-api` and `gatehub/data-syncer` images |
 | `TRUSTED_PROXIES` | prod (nginx) | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Comma separated addresses / CIDRs of the front proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` nginx believes. `0.0.0.0/0` and any zero prefix length are refused. **Set it to your front proxy** (see [security](security.md)). |
 | `NGINX_BIND`, `NGINX_PORT` | prod (nginx) | `0.0.0.0`, `8080` | Where nginx is published on the host. Bind it to an interface only the front proxy can reach. |
+| `API_CLICKHOUSE_MAX_QUERY_MEMORY` | prod | `2147483648` in `deploy/.env.prod.example`; unset or empty = `GH_CLICKHOUSE_MAX_QUERY_MEMORY` | `GH_CLICKHOUSE_MAX_QUERY_MEMORY` of the **apis** only: a per-query memory cap (bytes) for the API, so a request that needs more fails with its route's 500 instead of taking the server's memory (Ruling R107). The syncers keep `GH_CLICKHOUSE_MAX_QUERY_MEMORY`. |
 
 ### Which service gets which variables (production compose)
 
@@ -118,7 +119,7 @@ variable that is unset in the file is not passed on and the application's own de
 | --- | --- |
 | `migrate-xrpl`, `migrate-xahau` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_NETWORK` |
 | `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
-| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning, `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`; `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
+| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`; `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
 | `clickhouse` | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` (from `GH_CLICKHOUSE_USER` / `_PASSWORD`) |
 | `nginx` | `TRUSTED_PROXIES`, and the fixed `NGINX_ENVSUBST_*` of the template |
 

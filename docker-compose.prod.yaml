@@ -85,6 +85,8 @@ x-clickhouse-tuning: &clickhouse-tuning
 
 x-api-env: &api-env
   <<: [*clickhouse-client, *clickhouse-tuning]
+  # The apis' memory cap per query: API_CLICKHOUSE_MAX_QUERY_MEMORY (deploy/.env.prod.example sets 2 GiB), else the shared one.
+  GH_CLICKHOUSE_MAX_QUERY_MEMORY: ${API_CLICKHOUSE_MAX_QUERY_MEMORY:-${GH_CLICKHOUSE_MAX_QUERY_MEMORY:-0}}
   GH_CORS_ORIGINS:
   GH_RATE_LIMIT:
   GH_RATE_LIMIT_WINDOW:
