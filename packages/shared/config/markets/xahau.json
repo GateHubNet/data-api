@@ -1,5 +1,41 @@
 {
-  "version": 1,
-  "tradeMarkets": [],
-  "paymentCurrencies": []
+  "version": 2,
+  "tradeMarkets": [
+    {
+      "base": {
+        "currency": "EVR",
+        "issuer": "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8"
+      },
+      "counter": {
+        "currency": "XAH"
+      }
+    },
+    {
+      "base": {
+        "currency": "XXX",
+        "issuer": "rxxxx9gmp1DSJ8bE4Gya48VtRdPPz7mHF"
+      },
+      "counter": {
+        "currency": "XAH"
+      }
+    }
+  ],
+  "paymentCurrencies": [
+    {
+      "currency": "EVR",
+      "issuer": "rEvernodee8dJLaFsujS6q1EiXvZYmHXr8"
+    },
+    {
+      "currency": "4555525100000000000000000000000000000000",
+      "issuer": "rDk1xiArDMjDqnrR2yWypwQAKg4mKnQYvs"
+    },
+    {
+      "currency": "RVN",
+      "issuer": "rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb"
+    },
+    {
+      "currency": "XXX",
+      "issuer": "rxxxx9gmp1DSJ8bE4Gya48VtRdPPz7mHF"
+    }
+  ]
 }

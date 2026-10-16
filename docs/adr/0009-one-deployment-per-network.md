@@ -29,7 +29,7 @@ wrong network would silently poison the data.
 ## Consequences
 **Positive**
 - No network discriminator anywhere: keys, queries and caches are per network by construction; a mistake affects one network.
-- Networks scale, fail, upgrade and are backed up independently; Xahau can be absent or provisional (its markets list ships empty).
+- Networks scale, fail, upgrade and are backed up independently; Xahau can be absent or provisional (its markets list is provisional: derived from a short sample of history).
 - The code paths are the same; the profile is the only switch, and every endpoint is tested with both networks.
 
 **Negative / trade-offs**

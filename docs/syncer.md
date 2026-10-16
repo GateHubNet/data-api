@@ -225,7 +225,8 @@ Properties that matter operationally:
 - A set that keeps failing waits 5 minutes, doubling up to an hour, and older days go on; the memory of this is lost on restart.
 - **No overlap, graceful stop** (a tick still running is skipped; shutdown aborts the slice in flight and waits at most 2 s).
 - Volume jobs need the **markets config** (`config/markets/<network>.json` or `GH_MARKETS_CONFIG`): without markets there is
-  nothing to compute (the shipped Xahau list is empty). A new `version` in the file recomputes the closed days.
+  nothing to compute. (The shipped Xahau list, version 2, was derived from a sample of the last three days and is short: two trade
+  markets and four payment currencies; re-derive it from a full-history node.) A new `version` in the file recomputes the closed days.
 
 ## 8. What the syncer does not do
 

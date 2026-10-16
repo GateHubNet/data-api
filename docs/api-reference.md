@@ -931,7 +931,8 @@ is accepted and means the same as none.
 The trade volume and the payment volume of the network, converted to the native currency (or to a display currency). The
 components come from the **markets config** of the network (`packages/shared/config/markets/{xrpl,xahau}.json`, or the file in
 `GH_MARKETS_CONFIG`), a versioned list of trade markets and payment currencies that the syncer's aggregator works through; the
-list as shipped for Xahau is empty, so its volumes are empty until a list is curated for it (override with `GH_MARKETS_CONFIG`).
+list shipped for Xahau (version 2) was derived from a sample of the last three days of Xahau history (two trade markets, four payment
+currencies): it is provisional and should be re-derived from a full-history node (override with `GH_MARKETS_CONFIG`).
 
 Two modes, chosen by the parameters:
 
