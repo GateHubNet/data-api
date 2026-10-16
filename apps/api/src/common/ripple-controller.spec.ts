@@ -1,3 +1,4 @@
+import { NodeThrottledError } from '@gatehub/data-api-shared';
 import {
   BadRequestException,
   CallHandler,
@@ -10,6 +11,7 @@ import { PATH_METADATA } from '@nestjs/common/constants';
 import { Reflector } from '@nestjs/core';
 import { lastValueFrom, throwError } from 'rxjs';
 import { badRequest, RippleHttpError } from './errors';
+import { resetFailureLog } from './failure-log';
 import { RippleController, RippleRoute, RippleRouteInterceptor } from './ripple-controller';
 import { RippleErrorFilter } from './ripple-error.filter';
 
@@ -108,5 +110,45 @@ describe('RippleRouteInterceptor', () => {
       message: 'Could not retrieve thing.',
     });
     expect((Logger.prototype.error as jest.Mock).mock.calls[0][0]).toContain('GET /v2/thing failed');
+  });
+
+  describe('a request that failed because the node rate limits this process (ruling R98)', () => {
+    let warn: jest.SpyInstance;
+    beforeEach(() => {
+      resetFailureLog();
+      warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    });
+
+    it('is still the 500 of the route, but logged once per pause, at warn and without a stack', async () => {
+      const throttled = () =>
+        new NodeThrottledError(['wss://node.example'], 60_000, 'rate limit: units quota exhausted, retry in ~59750ms');
+      for (let i = 0; i < 3; i++) {
+        const result = await failWith(throttled());
+        expect(result).toBeInstanceOf(RippleHttpError);
+        expect((result as RippleHttpError).getResponse()).toEqual({
+          result: 'error',
+          message: 'Could not retrieve thing.',
+        });
+      }
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]).toHaveLength(1); // no stack
+      expect(warn.mock.calls[0][0]).toContain('GET /v2/thing failed');
+      expect(warn.mock.calls[0][0]).toContain('rate limit');
+      expect(Logger.prototype.error).not.toHaveBeenCalled();
+      // Any other failure is still an error with its stack.
+      await failWith(new Error('boom'));
+      expect(Logger.prototype.error).toHaveBeenCalledWith(expect.stringContaining('boom'), expect.any(String));
+    });
+
+    it('is logged again once the pause it reported is over', async () => {
+      const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      await failWith(new NodeThrottledError(['wss://node.example'], 5_000, 'rate limit'));
+      now.mockReturnValue(1_004_000);
+      await failWith(new NodeThrottledError(['wss://node.example'], 5_000, 'rate limit'));
+      expect(warn).toHaveBeenCalledTimes(1);
+      now.mockReturnValue(1_005_001);
+      await failWith(new NodeThrottledError(['wss://node.example'], 5_000, 'rate limit'));
+      expect(warn).toHaveBeenCalledTimes(2);
+    });
   });
 });

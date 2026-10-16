@@ -1,5 +1,7 @@
+import { NodeThrottledError } from '@gatehub/data-api-shared';
 import { ArgumentsHost, BadRequestException, HttpException, NotFoundException } from '@nestjs/common';
 import { badRequest, notFound, RateLimitError, RippleHttpError } from './errors';
+import { resetFailureLog } from './failure-log';
 import { RippleErrorFilter } from './ripple-error.filter';
 
 interface Reply {
@@ -10,7 +12,15 @@ interface Reply {
 }
 
 /** Runs the filter against a fake Express response and returns what it sent. */
-function render(exception: unknown, headers: Record<string, unknown> = {}, headersSent = false): Reply {
+function render(
+  exception: unknown,
+  headers: Record<string, unknown> = {},
+  headersSent = false,
+  logger: { error: (...args: unknown[]) => void; warn: (...args: unknown[]) => void } = {
+    error: () => undefined,
+    warn: () => undefined,
+  },
+): Reply {
   const reply: Reply = { headers: { ...headers } };
   const res = {
     headersSent,
@@ -29,7 +39,7 @@ function render(exception: unknown, headers: Record<string, unknown> = {}, heade
     switchToHttp: () => ({ getResponse: () => res, getRequest: () => ({ method: 'GET', originalUrl: '/v2/x' }) }),
   } as unknown as ArgumentsHost;
   const filter = new RippleErrorFilter();
-  (filter as unknown as { logger: { error: () => void } }).logger = { error: () => undefined };
+  (filter as unknown as { logger: typeof logger }).logger = logger;
   filter.catch(exception, host);
   return reply;
 }
@@ -130,5 +140,17 @@ describe('RippleErrorFilter', () => {
   it('never lets a shared cache keep an error', () => {
     expect(render(badRequest('x')).headers['Cache-Control']).toBe('no-store');
     expect(render(new Error('x')).headers['Cache-Control']).toBe('no-store');
+  });
+
+  it('logs a failure caused by a rate-limited node once per pause, at warn and without a stack, and still answers 500', () => {
+    resetFailureLog();
+    const logger = { error: jest.fn(), warn: jest.fn() };
+    for (let i = 0; i < 3; i++) {
+      const reply = render(new NodeThrottledError(['wss://node.example'], 60_000, 'rate limit'), {}, false, logger);
+      expect(reply).toMatchObject({ status: 500, body: { result: 'error', message: 'internal error' } });
+    }
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0]).toHaveLength(1);
+    expect(logger.error).not.toHaveBeenCalled();
   });
 });

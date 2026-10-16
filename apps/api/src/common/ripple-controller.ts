@@ -16,6 +16,7 @@ import { ApiTags } from '@nestjs/swagger';
 import { Request } from 'express';
 import { catchError, Observable, throwError } from 'rxjs';
 import { RippleHttpError } from './errors';
+import { logFailure } from './failure-log';
 import { RippleErrorFilter } from './ripple-error.filter';
 
 /** Swagger tag of a controller: the first segment after `v2/` of its first path (`v2/accounts/:id` -> `accounts`). */
@@ -57,10 +58,7 @@ export class RippleRouteInterceptor implements NestInterceptor {
           return throwError(() => err);
         }
         const req = context.switchToHttp().getRequest<Request>();
-        this.logger.error(
-          `${req.method} ${req.originalUrl} failed: ${err instanceof Error ? err.message : String(err)}`,
-          err instanceof Error ? err.stack : undefined,
-        );
+        logFailure(this.logger, `${req.method} ${req.originalUrl} failed`, err);
         return throwError(() => new RippleHttpError(500, failureMessage));
       }),
     );
@@ -70,7 +68,7 @@ export class RippleRouteInterceptor implements NestInterceptor {
 /**
  * The failure message of a Ripple route (`Could not retrieve ledger.`): any error of the route that is not a
  * `RippleHttpError` or an HttpException below 500 becomes a 500 `{"result":"error","message":failureMessage}`, and
- * its cause is logged, not sent. That includes a 5xx HttpException (a `ServiceUnavailableException` from a client
+ * its cause is logged, not sent (a rate-limited node once per pause, see `logFailure`). That includes a 5xx HttpException (a `ServiceUnavailableException` from a client
  * library, say): the route has failed, and the caller gets the route's message. `badRequest`, `notFound` and the other
  * 4xx pass through with their own status and message.
  */

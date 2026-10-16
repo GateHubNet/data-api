@@ -1,6 +1,7 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { RateLimitError, rateLimitMessage, RippleHttpError } from './errors';
+import { logFailure } from './failure-log';
 
 /** What every Ripple route says when it fails for a reason the caller did not cause and the route has no message for. */
 export const INTERNAL_ERROR_MESSAGE = 'internal error';
@@ -26,7 +27,8 @@ function messageOf(exception: HttpException): string {
  * - A 429 (the throttler) is `{"error":"Rate limit exceeded, retry in <n.nn>sec"}`, the original's wording: `n.nn` is the
  *   time left in the window, to two decimals (`RateLimitError`; a bare 429 falls back to its `Retry-After`).
  * - Anything else (an Error, an HttpException of 500 and above) is a 500 `internal error`; the cause is logged, never
- *   sent. A route that wants its own message uses `@RippleRoute`.
+ *   sent (a failure because the node rate limits the process once per pause, at warn: `logFailure`). A route that
+ *   wants its own message uses `@RippleRoute`.
  *
  * It is applied per controller by `@RippleController`: the toolbox `bootstrap()` installs its own global filter
  * (`{"error":{"key","message"}}`), and a controller-level filter takes precedence over a global one. Guard
@@ -76,10 +78,7 @@ export class RippleErrorFilter implements ExceptionFilter {
     }
 
     const req = http.getRequest<Request>();
-    this.logger.error(
-      `${req.method} ${req.originalUrl} failed: ${exception instanceof Error ? exception.message : String(exception)}`,
-      exception instanceof Error ? exception.stack : undefined,
-    );
+    logFailure(this.logger, `${req.method} ${req.originalUrl} failed`, exception);
     res.status(HttpStatus.INTERNAL_SERVER_ERROR).json({ result: 'error', message: INTERNAL_ERROR_MESSAGE });
   }
 }
