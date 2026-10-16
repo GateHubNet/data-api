@@ -1,4 +1,5 @@
 import { DynamicModule, Logger, Type } from '@nestjs/common';
+import { AggregatorModule } from './aggregator/aggregator.module';
 import { WORKER_NAMES, WorkerName } from './config/syncer.config';
 import { FeesModule } from './fees/fees.module';
 import { IngestModule } from './ingest/ingest.module';
@@ -12,8 +13,7 @@ export type WorkerModuleRegistry = Partial<Record<WorkerName, WorkerModule>>;
 /**
  * The worker -> module registry. A worker module is only imported when its name is in `GH_WORKERS`.
  *
- * Each worker adds its own line (`aggregator: AggregatorModule` is the one still to come) and nothing else in
- * the app changes.
+ * Each worker adds its own line and nothing else in the app changes.
  *
  * The module that provides `INGEST_STATUS` for the liveliness probe must be `@Global()` and export that token.
  */
@@ -21,6 +21,7 @@ export const WORKER_MODULES: WorkerModuleRegistry = {
   ingest: IngestModule,
   fee_stats: FeesModule,
   validations: ValidationsModule,
+  aggregator: AggregatorModule,
 };
 
 /**

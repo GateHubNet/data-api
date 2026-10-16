@@ -5,7 +5,9 @@ import {
   LedgerWriter,
   NetworkName,
   parseContextFor,
+  recomputeStatsHourly,
   runMigrations,
+  Table,
 } from '@gatehub/data-api-shared';
 import type { INestApplication, Type } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -243,10 +245,18 @@ async function listeningClient(app: NestExpressApplication, key: string): Promis
   return { get, ok, pages };
 }
 
-/** Writes the ledgers of a fixture set the way the syncer does, so every table the API reads is filled. */
+/**
+ * Writes the ledgers of a fixture set the way the syncer does, so every table the API reads is filled, and rolls them up
+ * into `stats_hourly` the way the syncer's aggregator does (`recomputeStatsHourly` over the hours they closed in).
+ */
 async function seedLedgers(ch: ClickHouseService, seed: SeedName, network: NetworkName): Promise<void> {
   const writer = new LedgerWriter(ch, parseContextFor(getNetworkProfile(network)));
   await writer.write(fixtureSource(seed).list());
+  const closed = await ch.queryOne<{ first: number | string; last: number | string }>(
+    `SELECT toUnixTimestamp(min(close_time)) AS first, toUnixTimestamp(max(close_time)) AS last FROM ${Table.Ledgers}`,
+  );
+  if (closed)
+    await recomputeStatsHourly(ch, new Date(Number(closed.first) * 1000), new Date((Number(closed.last) + 1) * 1000));
 }
 
 /** What the harness puts in place of the `XrplService`. */

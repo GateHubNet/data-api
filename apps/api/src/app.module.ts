@@ -29,6 +29,7 @@ import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
 import { PaymentsModule } from './payments/payments.module';
+import { StatsModule } from './stats/stats.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { ValidationsModule } from './validations/validations.module';
 import { XrplModule } from './xrpl/xrpl.module';
@@ -64,6 +65,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ActiveAccountsModule,
   NetworkModule,
   ValidationsModule,
+  StatsModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

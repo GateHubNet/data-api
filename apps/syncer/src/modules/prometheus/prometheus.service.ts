@@ -71,6 +71,12 @@ const metrics = {
     labelNames: ['job'],
     registers: [registry],
   }),
+  aggregatorErrorsTotal: new Counter({
+    name: 'syncer_aggregator_errors_total',
+    help: 'Aggregator jobs (or slices of one) that failed, by job; each is retried on the next tick.',
+    labelNames: ['job'],
+    registers: [registry],
+  }),
 };
 
 let defaultMetricsCollected = false;
@@ -95,6 +101,7 @@ export class PrometheusService implements OnModuleInit {
   readonly feeStatsSamplesTotal = metrics.feeStatsSamplesTotal;
   readonly feeStatsErrorsTotal = metrics.feeStatsErrorsTotal;
   readonly aggregatorRunsTotal = metrics.aggregatorRunsTotal;
+  readonly aggregatorErrorsTotal = metrics.aggregatorErrorsTotal;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

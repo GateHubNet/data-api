@@ -33,6 +33,9 @@ export * from './ingest/build-rows';
 export * from './ingest/ledger-writer';
 export * from './ingest/ingest-state';
 
+// Aggregates
+export * from './aggregate/stats.job';
+
 // Query
 export * from './query/asset';
 export * from './query/decimal';
