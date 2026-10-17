@@ -21,7 +21,10 @@ import {
   AggregatorJob,
   AggregatorOptions,
   AggregatorService,
+  AMM_POOL_MAX_RETRY_MS,
+  AMM_POOL_RETRY_MS,
   AMM_POOLS_BATCH,
+  MAX_ISOLATED_POOLS_PER_BATCH,
   MAX_SLICE_SECONDS,
   sliceRange,
   VOLUME_BACKFILL_MAX_RETRY_MS,
@@ -2274,6 +2277,10 @@ describe('AggregatorService amm_pools job', () => {
   let slicePools: Map<string, string[]>;
   /** How long (fake milliseconds) the recompute of a batch of pools takes. */
   let poolMs: number;
+  /** The pools the fake recompute fails on, whatever batch they are in. */
+  let failing: Set<string>;
+  /** The pools of the batches that the fake recompute did write, in order. */
+  let done: string[];
 
   const mark = (from: string, to: string, createdMs = 1000) => ({ from: unix(from), to: unix(to), created: createdMs });
   const jobsRun = (): string[] => metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job);
@@ -2292,6 +2299,8 @@ describe('AggregatorService amm_pools job', () => {
     pages = new Map();
     slicePools = new Map();
     poolMs = 0;
+    failing = new Set();
+    done = [];
     statsRecompute = jest.fn(async (_ch: unknown, from: Date) => {
       events.push(`stats ${iso(from.getTime() / 1000)}`);
       return 1;
@@ -2307,6 +2316,9 @@ describe('AggregatorService amm_pools job', () => {
     recomputePools = jest.fn(async (_ch: unknown, _rates: unknown, accounts: string[]) => {
       events.push(`pools ${accounts.join(',')}`);
       if (poolMs > 0) jest.setSystemTime(Date.now() + poolMs);
+      const bad = accounts.filter((a) => failing.has(a));
+      if (bad.length > 0) throw new Error(`DB::Exception: memory limit on pool ${bad[0]}`);
+      done.push(...accounts);
       return accounts.length;
     });
     // the stats are up to date: the live window is the last slice only
@@ -2443,26 +2455,31 @@ describe('AggregatorService amm_pools job', () => {
   });
 
   describe('failures', () => {
-    it('are logged and counted, the cursor stays behind the batch that failed, and the next tick does it again', async () => {
-      pages.set(500, { accounts: ['rA', 'rB'], upTo: 700 });
-      pages.set(700, { accounts: ['rC'], upTo: 900 });
-      recomputePools
-        .mockImplementationOnce(async () => 2)
-        .mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+    const POOLS5 = ['rA', 'rB', 'rC', 'rD', 'rE'];
+
+    it('a batch that fails as a whole is the failure of the job: the cursor stays behind it, nothing is set aside, and the next tick does it again', async () => {
+      pages.set(500, { accounts: POOLS5, upTo: 700 });
+      pages.set(700, { accounts: ['rF'], upTo: 900 });
+      // more pools than the isolation takes for a cause of its own
+      for (const pool of POOLS5) failing.add(pool);
+      expect(POOLS5.length).toBeGreaterThan(MAX_ISOLATED_POOLS_PER_BATCH);
       const svc = service();
       await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('amm_pools'));
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('memory limit'));
       // the jobs after it still ran
       expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
-      expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 700]);
+      expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500]);
+      expect(done).toEqual([]);
 
+      failing.clear();
       jest.setSystemTime(NOW_SECONDS * 1000 + 60_000);
       await svc.tick();
-      // the batch of 700 is the one retried: the cursor was at 700, not at 900
-      expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 700, 700, 900]);
-      expect(batches()).toEqual([['rA', 'rB'], ['rC'], ['rC']]);
+      // the batch of 500 is the one done again: the cursor was at 500, and nothing was set aside to wait
+      expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 500, 700, 900]);
+      expect(done).toEqual([...POOLS5, 'rF']);
       expect(jobsRun()).toContain('amm_pools');
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
     });
@@ -2472,6 +2489,160 @@ describe('AggregatorService amm_pools job', () => {
       await service().tick();
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('no such table'));
+    });
+
+    describe('one pool that fails every time (Ruling R-A15)', () => {
+      it('is found by halving the batch and set aside; the other pools of its batch and the later batches are done', async () => {
+        pages.set(500, { accounts: POOLS5, upTo: 700 });
+        pages.set(700, { accounts: ['rF'], upTo: 900 });
+        failing.add('rC');
+        await service().tick();
+        // the batch, its first half (three), that half's first half, the pool alone, and the other half of the batch
+        expect(batches()).toEqual([POOLS5, ['rA', 'rB', 'rC'], ['rA', 'rB'], ['rC'], ['rD', 'rE'], ['rF']]);
+        expect(done).toEqual(['rA', 'rB', 'rD', 'rE', 'rF']);
+        // the cursor passed the batch, and the job ran to the end
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 700, 900]);
+        expect(jobsRun()).toEqual(['amm_pools', 'stats_live', 'stats_dirty']);
+        // one error, for the pool, and not one for the batch
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool rC'));
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('memory limit'));
+      });
+
+      it('up to three pools of a batch are set aside, a fourth makes it the failure of the job', async () => {
+        pages.set(500, { accounts: POOLS5, upTo: 700 });
+        for (const pool of ['rA', 'rC', 'rE']) failing.add(pool);
+        expect(MAX_ISOLATED_POOLS_PER_BATCH).toBe(3);
+        const svc = service();
+        await svc.tick();
+        expect(done).toEqual(['rB', 'rD']);
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 700]);
+
+        // four in a batch: the cursor stays
+        pages.set(700, { accounts: ['rF', 'rG', 'rH', 'rI'], upTo: 900 });
+        for (const pool of ['rF', 'rG', 'rH', 'rI']) failing.add(pool);
+        jest.setSystemTime(NOW_SECONDS * 1000 + 60_000);
+        changedSince.mockClear();
+        await svc.tick();
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([700]);
+        expect(done).toEqual(['rB', 'rD']);
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(4);
+      });
+
+      it('is tried again after five minutes, then after twice as long each time up to an hour, and forgotten once it works', async () => {
+        pages.set(500, { accounts: ['rC'], upTo: 700 });
+        failing.add('rC');
+        const svc = service();
+        const retries = (): number => batches().filter((b) => b.length === 1 && b[0] === 'rC').length;
+        const T0 = NOW_SECONDS * 1000;
+        await svc.tick();
+        expect(retries()).toBe(1);
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+        expect([AMM_POOL_RETRY_MS, AMM_POOL_MAX_RETRY_MS]).toEqual([5 * 60_000, 60 * 60_000]);
+
+        let at = T0;
+        let errors = 1;
+        for (const waitMinutes of [5, 10, 20, 40, 60, 60]) {
+          // a tick a second before the wait is over leaves it alone ...
+          jest.setSystemTime(at + waitMinutes * 60_000 - 1000);
+          await svc.tick();
+          expect(retries()).toBe(errors);
+          // ... and one at the end of it tries again, and fails again: each failure is an error
+          jest.setSystemTime(at + waitMinutes * 60_000);
+          await svc.tick();
+          errors++;
+          expect(retries()).toBe(errors);
+          expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(errors);
+          at += waitMinutes * 60_000;
+        }
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool rC'));
+
+        // it works at last: rebuilt, and not asked for again
+        failing.clear();
+        jest.setSystemTime(at + AMM_POOL_MAX_RETRY_MS);
+        await svc.tick();
+        expect(done).toEqual(['rC']);
+        const before = recomputePools.mock.calls.length;
+        jest.setSystemTime(at + 10 * AMM_POOL_MAX_RETRY_MS);
+        await svc.tick();
+        expect(recomputePools.mock.calls.length).toBe(before);
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(errors);
+      });
+
+      it('is left out of the batches that come while it waits, and rebuilt by its retry with everything it has by then', async () => {
+        pages.set(500, { accounts: ['rC'], upTo: 700 });
+        pages.set(700, { accounts: ['rC', 'rD'], upTo: 900 }); // it changed again
+        failing.add('rC');
+        const svc = service();
+        await svc.tick();
+        expect(batches()).toEqual([['rC'], ['rD']]);
+        expect(done).toEqual(['rD']);
+
+        failing.clear();
+        jest.setSystemTime(NOW_SECONDS * 1000 + AMM_POOL_RETRY_MS);
+        await svc.tick();
+        expect(batches().slice(2)).toEqual([['rC']]);
+        expect(done).toEqual(['rD', 'rC']);
+      });
+
+      it('has its retry after the new work of the tick', async () => {
+        pages.set(500, { accounts: ['rC'], upTo: 700 });
+        failing.add('rC');
+        const svc = service();
+        await svc.tick();
+
+        failing.clear();
+        pages.set(700, { accounts: ['rD'], upTo: 900 });
+        jest.setSystemTime(NOW_SECONDS * 1000 + AMM_POOL_RETRY_MS);
+        await svc.tick();
+        expect(batches().slice(1)).toEqual([['rD'], ['rC']]);
+      });
+
+      it('the retries are under the budget of the job: a slow one uses it up, and the next waits for the next tick', async () => {
+        pages.set(500, { accounts: ['rC', 'rE'], upTo: 700 });
+        failing.add('rC');
+        failing.add('rE');
+        const svc = service({ budgetsMs: { amm_pools: 1000 } });
+        await svc.tick();
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(2);
+
+        failing.clear();
+        poolMs = 1100;
+        jest.setSystemTime(NOW_SECONDS * 1000 + AMM_POOL_RETRY_MS);
+        await svc.tick();
+        expect(done).toEqual(['rC']);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('amm_pools reached its budget'));
+
+        jest.setSystemTime(NOW_SECONDS * 1000 + AMM_POOL_RETRY_MS + 60_000);
+        await svc.tick();
+        expect(done).toEqual(['rC', 'rE']);
+      });
+
+      it('the halving stops when the budget of the job is spent: nothing is set aside, and the job fails', async () => {
+        pages.set(500, { accounts: POOLS5, upTo: 700 });
+        failing.add('rC');
+        poolMs = 600;
+        await service({ budgetsMs: { amm_pools: 1000 } }).tick();
+        // the batch (600 ms), its first half (1200 ms) and no more
+        expect(batches()).toEqual([POOLS5, ['rA', 'rB', 'rC']]);
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500]);
+      });
+
+      it('is not set aside by the shutdown: an aborted batch is neither an error nor a pool to retry', async () => {
+        pages.set(500, { accounts: POOLS5, upTo: 700 });
+        const svc = service();
+        recomputePools.mockImplementation(async () => {
+          void svc.stop();
+          throw new AmmPoolsRecomputeAborted();
+        });
+        await svc.tick();
+        expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+        expect(logger.error).not.toHaveBeenCalled();
+        expect(recomputePools).toHaveBeenCalledTimes(1); // no halving
+      });
     });
   });
 
@@ -2558,29 +2729,48 @@ describe('AggregatorService amm_pools job', () => {
       expect(ch.dirty).toEqual([]);
     });
 
-    it('a failure keeps the range, is counted as amm_pools_dirty, and the next tick does the slice again', async () => {
+    it('a pool that fails is set aside, not the slice: the others are done, the range is removed, and its retry comes later', async () => {
       ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
-      slicePools.set('2026-05-01T22:00:00Z', ['rA']);
-      recomputePools.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      slicePools.set('2026-05-01T22:00:00Z', ['rA', 'rB', 'rC']);
+      failing.add('rB');
+      const svc = service();
+      await svc.tick();
+      expect(done.sort()).toEqual(['rA', 'rC']);
+      expect(ch.dirty).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools_dirty' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('amm_pools_dirty'));
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool rB'));
+
+      // the job of the live pools tries the pool again when its wait is over
+      failing.clear();
+      jest.setSystemTime(NOW_SECONDS * 1000 + AMM_POOL_RETRY_MS);
+      await svc.tick();
+      expect(done).toContain('rB');
+    });
+
+    it('a slice most of whose pools fail keeps the range, counts the failure, and the next tick does it again', async () => {
+      ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
+      slicePools.set('2026-05-01T22:00:00Z', ['rA', 'rB', 'rC', 'rD', 'rE']);
+      for (const pool of ['rA', 'rB', 'rC', 'rD', 'rE']) failing.add(pool);
       const svc = service();
       await svc.tick();
       expect(ch.dirty).toHaveLength(1);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools_dirty' });
-      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('amm_pools_dirty'));
 
+      failing.clear();
       await svc.tick();
       expect(ch.dirty).toEqual([]);
-      expect(batches().at(-1)).toEqual(['rA']);
+      expect(done).toEqual(['rA', 'rB', 'rC', 'rD', 'rE']);
     });
 
     it('a failure in the middle of a range keeps the progress: the range is narrowed to the slice that failed', async () => {
       ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-03T00:00:00Z')];
       slicePools.set('2026-05-01T00:00:00Z', ['rA']);
-      slicePools.set('2026-05-02T00:00:00Z', ['rB']);
-      recomputePools.mockImplementation(async (_c: unknown, _r: unknown, accounts: string[]) => {
-        if (accounts[0] === 'rB') throw new Error('DB::Exception: boom');
-        return 1;
-      });
+      const second = ['rB1', 'rB2', 'rB3', 'rB4', 'rB5'];
+      slicePools.set('2026-05-02T00:00:00Z', second);
+      for (const pool of second) failing.add(pool);
       await service().tick();
       expect(ch.dirty).toEqual([mark('2026-05-02T00:00:00Z', '2026-05-03T00:00:00Z')]);
     });

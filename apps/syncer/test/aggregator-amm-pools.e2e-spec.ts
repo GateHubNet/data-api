@@ -7,6 +7,7 @@ import {
   LedgerWriter,
   parseContextFor,
   RatesService,
+  recomputeAmmPools,
   runMigrations,
   Table,
 } from '@gatehub/data-api-shared';
@@ -95,6 +96,15 @@ describe('AggregatorService amm_pools job (e2e)', () => {
   const rowCount = async (ch: ClickHouseService): Promise<number> =>
     Number((await ch.queryOne<{ n: string | number }>(`SELECT count() AS n FROM ${Table.AmmPools}`))?.n);
 
+  /** State rows made by hand, and their touches: the ledger writer writes both. */
+  async function insertStates(ch: ClickHouseService, rows: AmmPoolStatesRow[]): Promise<void> {
+    await ch.insert(Table.AmmPoolStates, rows);
+    await ch.insert(
+      Table.AmmPoolTouches,
+      rows.map(({ ledger_index, tx_index, amm_account }) => ({ ledger_index, tx_index, amm_account })),
+    );
+  }
+
   /** A state row of a pool, made by hand, at the ledger of one of its real rows. */
   function extraState(pool: string, ledger: number, over: Partial<AmmPoolStatesRow>): AmmPoolStatesRow {
     const real = STATES.find((s) => s.amm_account === pool && s.ledger_index === ledger) as AmmPoolStatesRow;
@@ -151,13 +161,40 @@ describe('AggregatorService amm_pools job (e2e)', () => {
     expect(await rowCount(ch)).toBe(written);
   });
 
+  it('a pool that fails every time is set aside: the others of the batch are written, and a restart finds it again', async () => {
+    const ch = await fresh();
+    const rates = new RatesService(ch, 'XRP');
+    const failing = new AggregatorService(ch, undefined, undefined, {
+      logger: QUIET,
+      ammPools: { rates },
+      // the real recompute, except for one pool, as a pool the database cannot rebuild would be
+      ammPoolsFunctions: {
+        recompute: async (db, r, accounts, options) => {
+          if (accounts.includes(RLUSD_POOL)) throw new Error('DB::Exception: Memory limit exceeded');
+          return recomputeAmmPools(db, r, accounts, options);
+        },
+      },
+      recompute: async () => 0,
+    });
+    aggregators.push(failing);
+    await failing.tick(NOW);
+    const written = await pools(ch);
+    expect([...written.keys()].sort()).toEqual(POOLS.filter((p) => p !== RLUSD_POOL));
+
+    // the process starts again (the set of pools to retry was in memory): the pool is stale in the tables, so it is found
+    await aggregator(ch).tick(NOW);
+    const all = await pools(ch);
+    expect([...all.keys()].sort()).toEqual(POOLS);
+    expect(all.get(RLUSD_POOL)).toMatchObject({ last_ledger: NEWEST_LEDGER, reserve_base: '2417282.053464318' });
+  });
+
   it('a state row that arrives rebuilds its pool only, under a newer version', async () => {
     const ch = await fresh();
     const svc = aggregator(ch);
     await svc.tick(NOW);
     const before = await pools(ch);
 
-    await ch.insert(Table.AmmPoolStates, [
+    await insertStates(ch, [
       extraState(RLUSD_POOL, NEWEST_LEDGER, {
         ledger_index: NEWEST_LEDGER + 1,
         tx_type: 'Payment',
@@ -183,7 +220,7 @@ describe('AggregatorService amm_pools job (e2e)', () => {
     await aggregator(ch).tick(NOW);
     const before = await pools(ch);
 
-    await ch.insert(Table.AmmPoolStates, [
+    await insertStates(ch, [
       extraState(RLUSD_POOL, NEWEST_LEDGER, { ledger_index: NEWEST_LEDGER + 5, tx_type: 'AMMVote', trading_fee: 333 }),
     ]);
     await aggregator(ch).tick(NOW);
@@ -203,7 +240,7 @@ describe('AggregatorService amm_pools job (e2e)', () => {
       STATES.filter((s) => s.amm_account === p).every((s) => s.trading_fee === null),
     ) as string;
     const old = STATES.find((s) => s.amm_account === noFee) as AmmPoolStatesRow;
-    await ch.insert(Table.AmmPoolStates, [extraState(noFee, old.ledger_index, { trading_fee: 777 })]);
+    await insertStates(ch, [extraState(noFee, old.ledger_index, { trading_fee: 777 })]);
     const before = await pools(ch);
     await svc.tick(NOW);
     // the job looks forward from its cursor: the row is behind it

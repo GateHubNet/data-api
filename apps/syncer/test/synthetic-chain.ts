@@ -11,7 +11,7 @@ const TEMPLATE = JSON.parse(readFileSync(TEMPLATE_FILE, 'utf8')) as Record<strin
 
 /**
  * Recorded mainnet AMM ledgers: 107612573 (an AMMCreate and 7 swaps against pools) and 107644916 (an AMMVote and 3
- * swaps), so that a ledger made of both has rows for all four AMM tables.
+ * swaps), so that a ledger made of both has rows for all five AMM tables.
  */
 export const AMM_TEMPLATE_FILES = ['107612573', '107644916'].map((index) =>
   join(__dirname, `../../../packages/shared/test/fixtures/xrpl/amm/${index}.json.gz`),

@@ -146,6 +146,15 @@ function state(
   };
 }
 
+/** State rows and the touches that go with them, as the ledger writer writes both. */
+async function insertStates(ch: ClickHouseService, rows: AmmPoolStatesRow[]): Promise<void> {
+  await ch.insert(Table.AmmPoolStates, rows);
+  await ch.insert(
+    Table.AmmPoolTouches,
+    rows.map(({ ledger_index, tx_index, amm_account }) => ({ ledger_index, tx_index, amm_account })),
+  );
+}
+
 /** A `ledgers` row: just enough for `ledgersClosedIn`. */
 const ledgerRow = (ledger_index: number, close_time: number) => ({
   ledger_index,
@@ -330,7 +339,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('fills every field forward from the newest row that has it, whatever the order the rows were written in', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         // written newest first, to show that the order of the rows in the table is nothing
         state({ amm_account: POOL, ledger_index: 500, tx_index: 2, reserve_counter: '90.5', tx_type: 'AMMWithdraw' }),
         state({
@@ -401,7 +410,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('takes deleted from the newest row, and keeps the amounts of the rows before it when the newest has none', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({ amm_account: POOL, ledger_index: 10, reserve_base: '5', reserve_counter: '6', lp_supply: '5.4' }),
         state({ amm_account: POOL, ledger_index: 20, tx_type: 'AMMDelete', deleted: 1 }),
         // a pool that was flagged and then, for a reason of the data, has a newer row that is not
@@ -424,7 +433,7 @@ describe('the amm_pools job (e2e)', () => {
       const ch = await fresh();
       const nativeBase = 'rNativeBase0000000000000000000000';
       const neverSeen = 'rNeverSeen00000000000000000000000';
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({
           amm_account: nativeBase,
           ledger_index: 10,
@@ -448,7 +457,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('keeps the exact strings of the amounts: only value_native is a float', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({
           amm_account: POOL,
           ledger_index: 10,
@@ -470,9 +479,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('stores the row with its keys in the pinned order', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
-        state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' }),
-      ]);
+      await insertStates(ch, [state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' })]);
       await recomputeAmmPools(ch, noRates(), [POOL]);
       const [row] = await ch.query(`SELECT * FROM ${Table.AmmPools}`);
       expect(Object.keys(row as object)).toEqual(POOL_KEYS);
@@ -482,8 +489,8 @@ describe('the amm_pools job (e2e)', () => {
       const ch = await fresh();
       const n = AMM_POOLS_CHUNK * 2 + 37;
       const accounts = Array.from({ length: n }, (_, i) => `rBulk${String(i).padStart(5, '0')}`);
-      await ch.insert(
-        Table.AmmPoolStates,
+      await insertStates(
+        ch,
         accounts.map((a, i) =>
           state({ amm_account: a, ledger_index: 10 + i, reserve_base: '1', reserve_counter: String(i) }),
         ),
@@ -506,9 +513,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('writes nothing once the signal is aborted: before the read, and just before the write', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
-        state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' }),
-      ]);
+      await insertStates(ch, [state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' })]);
       const early = new AbortController();
       early.abort();
       await expect(recomputeAmmPools(ch, noRates(), [POOL], { signal: early.signal })).rejects.toBeInstanceOf(
@@ -516,7 +521,7 @@ describe('the amm_pools job (e2e)', () => {
       );
 
       // aborted while the rates are being looked up (an IOU/IOU pool): the write is dropped
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({
           amm_account: OTHER,
           ledger_index: 11,
@@ -541,9 +546,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('writes nothing when the signal is aborted between the read and the write of a native pool, which needs no rates', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
-        state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' }),
-      ]);
+      await insertStates(ch, [state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' })]);
       const controller = new AbortController();
       const query = ch.query.bind(ch) as (sql: string, params?: Record<string, unknown>) => Promise<unknown[]>;
       jest.spyOn(ch, 'query').mockImplementation((async (sql: string, params?: Record<string, unknown>) => {
@@ -580,7 +583,7 @@ describe('the amm_pools job (e2e)', () => {
 
       it('is the ledger and the sender of the AMMCreate, not of a deposit, and the first should there be two', async () => {
         const ch = await fresh();
-        await ch.insert(Table.AmmPoolStates, [
+        await insertStates(ch, [
           state({ amm_account: POOL, ledger_index: 10, reserve_base: '10', reserve_counter: '20' }),
           state({ amm_account: POOL, ledger_index: 30, reserve_base: '12', reserve_counter: '22' }),
           state({ amm_account: OTHER, ledger_index: 40, reserve_base: '1', reserve_counter: '2' }),
@@ -635,7 +638,7 @@ describe('the amm_pools job (e2e)', () => {
 
       it('is never below one more than the newest version the pool has, even when the clock is behind it', async () => {
         const ch = await fresh();
-        await ch.insert(Table.AmmPoolStates, [
+        await insertStates(ch, [
           state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' }),
         ]);
         await recomputeAmmPools(ch, noRates(), [POOL]);
@@ -651,7 +654,7 @@ describe('the amm_pools job (e2e)', () => {
 
       it('the pools of one call get their own versions: a pool with a high one does not hold the others up', async () => {
         const ch = await fresh();
-        await ch.insert(Table.AmmPoolStates, [
+        await insertStates(ch, [
           state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' }),
           state({ amm_account: OTHER, ledger_index: 11, reserve_base: '1', reserve_counter: '2' }),
         ]);
@@ -687,8 +690,9 @@ describe('the amm_pools job (e2e)', () => {
         }),
       ];
       await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolStates}`);
+      await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolTouches}`);
       try {
-        await ch.insert(Table.AmmPoolStates, rows);
+        await insertStates(ch, rows);
         await recomputeAmmPools(ch, noRates(), [POOL]);
         const before = await latest(ch);
         // a SEPARATE insert of the same rows, not collapsed: the table holds every row twice
@@ -698,6 +702,12 @@ describe('the amm_pools job (e2e)', () => {
           { settings: { insert_deduplicate: 0 } },
         );
         expect(await ch.query(`SELECT count() AS n FROM ${Table.AmmPoolStates}`)).toEqual([{ n: 4 }]);
+        await ch.command(
+          `INSERT INTO ${Table.AmmPoolTouches} SELECT * FROM ${Table.AmmPoolTouches}`,
+          {},
+          { settings: { insert_deduplicate: 0 } },
+        );
+        expect(await ch.query(`SELECT count() AS n FROM ${Table.AmmPoolTouches}`)).toEqual([{ n: 4 }]);
 
         await recomputeAmmPools(ch, noRates(), [POOL]);
         const after = await latest(ch);
@@ -713,9 +723,10 @@ describe('the amm_pools job (e2e)', () => {
           value_native: 50,
         });
         // and the pools that changed: the duplicate rows name the pool once
-        expect((await poolsChangedSince(ch, 0, 10)).accounts).toEqual([POOL]);
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [POOL], upTo: 200 });
       } finally {
         await ch.command(`SYSTEM START MERGES ${Table.AmmPoolStates}`);
+        await ch.command(`SYSTEM START MERGES ${Table.AmmPoolTouches}`);
       }
     });
 
@@ -807,7 +818,7 @@ describe('the amm_pools job (e2e)', () => {
             reserve_base: rb,
             reserve_counter: rc,
           });
-        await ch.insert(Table.AmmPoolStates, [
+        await insertStates(ch, [
           iou(P1, AAA, BBB, 100, TRADE_DAY, '100', '40'),
           iou(P2, CCC, BBB, 100, TRADE_DAY, '500', '40'),
           iou(P3, CCC, DDD, 100, TRADE_DAY, '500', '40'),
@@ -877,7 +888,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('lists the pools with a state row after the ledger, with the newest ledger of those rows', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({ amm_account: acct(1), ledger_index: 10 }),
         state({ amm_account: acct(1), ledger_index: 30 }),
         state({ amm_account: acct(2), ledger_index: 20 }),
@@ -893,14 +904,14 @@ describe('the amm_pools job (e2e)', () => {
     it('answers nothing, and stays where it is, when nothing changed (or there are no rows at all)', async () => {
       const ch = await fresh();
       expect(await poolsChangedSince(ch, 7, 100)).toEqual({ accounts: [], upTo: 7 });
-      await ch.insert(Table.AmmPoolStates, [state({ amm_account: acct(1), ledger_index: 10 })]);
+      await insertStates(ch, [state({ amm_account: acct(1), ledger_index: 10 })]);
       expect(await poolsChangedSince(ch, 10, 100)).toEqual({ accounts: [], upTo: 10 });
       expect(await poolsChangedSince(ch, 4_000_000_000, 100)).toEqual({ accounts: [], upTo: 4_000_000_000 });
     });
 
     it('cuts at the limit on a ledger boundary: the pools before the first one left out, up to the ledger before it', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({ amm_account: acct(1), ledger_index: 10 }),
         state({ amm_account: acct(2), ledger_index: 20 }),
         state({ amm_account: acct(3), ledger_index: 30 }),
@@ -913,7 +924,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('returns every pool of a ledger that holds more of them than the limit, so that it always moves on', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         ...[1, 2, 3, 4, 5].map((n) => state({ amm_account: acct(n), ledger_index: 100 })),
         state({ amm_account: acct(6), ledger_index: 200 }),
       ]);
@@ -931,7 +942,7 @@ describe('the amm_pools job (e2e)', () => {
           rows.push(state({ amm_account: acct(p), ledger_index: ledger, tx_index: p }));
         }
       }
-      await ch.insert(Table.AmmPoolStates, rows);
+      await insertStates(ch, rows);
       for (const limit of [1, 3, 7, 100]) {
         const seen = new Set<string>();
         let ledger = 0;
@@ -956,53 +967,56 @@ describe('the amm_pools job (e2e)', () => {
       }
     });
 
-    describe('reads through the ledger index, not the table (Ruling R-A2)', () => {
+    describe('reads the touches by primary-key range, not the partition (Rulings R-A2 and R-A14)', () => {
       /**
-       * Six parts, merges stopped, in one partition: the template row (ledger 1); four spread parts of 100,000 rows each in a
-       * ledger range of its own (100 pools x 1000 ledgers: every granule of a part spans the whole range of the part); and one
-       * clustered part of 100,000 rows in which the pools are in the order of their ledgers (pool k lives in the ledgers
-       * `CLUSTER + 10k ...`, 1000 rows each), so that a granule holds a narrow range of ledgers.
+       * `amm_pool_touches`: 400,000 rows in four inserts of 100,000 (25,000 ledgers of four transactions each), all in the
+       * partition of the ledgers 1,000,000 to 1,999,999, with merges stopped (four parts) and then merged into one.
+       * `amm_pool_states` gets the same count in four ledger ranges of 100 pools each, merged: the control.
        */
-      const BASES = [1_000_000, 2_000_000, 3_000_000, 4_000_000];
-      const CLUSTER = 5_000_000;
-      const PER_PART = 100_000;
-      const POOLS = 100;
+      const FIRST = 1_000_000;
+      const LEDGERS_PER_PART = 25_000;
+      const PARTS = 4;
+      const PER_PART = LEDGERS_PER_PART * 4;
       const GRANULE = 8192;
-      /** Above the ledgers of pools 0..89 of the clustered part: pools 90..99, 10,000 rows, are left. */
-      const ABOVE_CLUSTER = CLUSTER + 89 * 10 + 9;
+      /** The last ledger of the third part: the range above it is the fourth part, a quarter of the table. */
+      const ABOVE_THREE_PARTS = FIRST + 3 * LEDGERS_PER_PART - 1;
+      const STATES_BASES = [1_000_000, 2_000_000, 3_000_000, 4_000_000];
       let ch: ClickHouseService;
       let db: string;
 
       beforeAll(async () => {
         ch = await fresh();
         db = ((await ch.queryOne<{ db: string }>('SELECT currentDatabase() AS db')) as { db: string }).db;
+        await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolTouches}`);
         await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolStates}`);
+        for (let part = 0; part < PARTS; part++) {
+          await ch.command(
+            `INSERT INTO ${Table.AmmPoolTouches}
+             SELECT toUInt32({base:UInt32} + intDiv(n.number, 4)) AS ledger_index,
+                    toUInt32(n.number % 4) AS tx_index,
+                    concat('rBulk', leftPad(toString((intDiv(n.number, 4) + n.number) % 100), 3, '0')) AS amm_account
+               FROM numbers({rows:UInt32}) AS n`,
+            { base: FIRST + part * LEDGERS_PER_PART, rows: PER_PART },
+            { settings: { insert_deduplicate: 0 } },
+          );
+        }
+        // the control: pools in the order of their account, each with rows in every ledger range
         await ch.insert(Table.AmmPoolStates, [
           state({ amm_account: 'rTemplate', ledger_index: 1, reserve_base: '1', reserve_counter: '2' }),
         ]);
-        const copies = (replace: string, params: Record<string, unknown>) =>
-          ch.command(
+        for (const base of STATES_BASES) {
+          await ch.command(
             `INSERT INTO ${Table.AmmPoolStates}
-             SELECT tpl.* REPLACE (${replace})
+             SELECT tpl.* REPLACE (
+                      concat('rBulk', leftPad(toString(n.number % 100), 3, '0')) AS amm_account,
+                      toUInt32({base:UInt32} + intDiv(n.number, 100)) AS ledger_index
+                    )
                FROM (SELECT * FROM ${Table.AmmPoolStates} WHERE amm_account = 'rTemplate') AS tpl
               CROSS JOIN numbers({rows:UInt32}) AS n`,
-            { rows: PER_PART, pools: POOLS, ...params },
+            { base, rows: PER_PART },
             { settings: { insert_deduplicate: 0 } },
           );
-        for (const base of BASES) {
-          await copies(
-            `concat('rBulk', toString(n.number % {pools:UInt32})) AS amm_account,
-             toUInt32({base:UInt32} + intDiv(n.number, {pools:UInt32})) AS ledger_index`,
-            { base },
-          );
         }
-        const per = PER_PART / POOLS;
-        await copies(
-          `concat('rClus', leftPad(toString(intDiv(n.number, {per:UInt32})), 3, '0')) AS amm_account,
-           toUInt32({base:UInt32} + intDiv(n.number, {per:UInt32}) * 10 + n.number % 10) AS ledger_index,
-           toUInt32(n.number % {per:UInt32}) AS tx_index`,
-          { base: CLUSTER, per },
-        );
       });
 
       interface Stage {
@@ -1010,102 +1024,154 @@ describe('the amm_pools job (e2e)', () => {
         granules: [number, number];
       }
 
-      /** The `Parts: a/b` and `Granules: a/b` of a stage of an EXPLAIN indexes = 1 (`Min-Max`, or the skip index by its name). */
-      async function stages(ledger: number): Promise<{ minMax: Stage; skip: Stage; names: string[] }> {
-        const lines = (
-          await ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${POOLS_CHANGED_SINCE_SQL}`, { ledger, n: 101 })
-        ).map((r) => r.explain.trim());
-        const stage = (at: number): Stage => {
-          const pair = (prefix: string): [number, number] => {
-            const line = lines.slice(at).find((l) => l.startsWith(prefix)) as string;
-            const [a, b] = line.slice(prefix.length).trim().split('/');
-            return [Number(a), Number(b)];
-          };
-          return { parts: pair('Parts:'), granules: pair('Granules:') };
+      /** The `Parts: a/b` and `Granules: a/b` of the stage of an EXPLAIN indexes = 1 that starts at the line `at`. */
+      function stageAt(lines: string[], at: number): Stage {
+        const pair = (prefix: string): [number, number] => {
+          const line = lines.slice(at).find((l) => l.startsWith(prefix)) as string;
+          const [a, b] = line.slice(prefix.length).trim().split('/');
+          return [Number(a), Number(b)];
         };
-        const minMax = lines.indexOf('Min-Max');
-        const skip = lines.indexOf('Name: ledger_mm');
-        expect([minMax, skip]).not.toContain(-1);
-        return {
-          minMax: stage(minMax),
-          skip: stage(skip),
-          names: lines.filter((l) => l.startsWith('Name: ')),
-        };
+        return { parts: pair('Parts:'), granules: pair('Granules:') };
       }
 
-      /** The rows `system.query_log` says the watermark query read in one run of `run`. */
+      const explain = async (sql: string, params: Record<string, unknown>): Promise<string[]> =>
+        (await ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${sql}`, params)).map((r) => r.explain.trim());
+
+      /** The stages of the watermark query for a ledger: the min-max of the parts (partition key), then the primary key. */
+      async function stages(ledger: number): Promise<{ minMax: Stage; primaryKey: Stage }> {
+        const lines = await explain(POOLS_CHANGED_SINCE_SQL, { ledger, n: 101 });
+        const at = lines.indexOf('PrimaryKey');
+        expect(at).toBeGreaterThan(-1);
+        // the key it searches is the ledger, the first column of the primary key
+        expect(lines.slice(at).find((l) => l.startsWith('Condition:'))).toContain('ledger_index');
+        return { minMax: stageAt(lines, lines.indexOf('Min-Max')), primaryKey: stageAt(lines, at) };
+      }
+      const primaryKey = async (ledger: number): Promise<Stage> => (await stages(ledger)).primaryKey;
+
+      /** The rows `system.query_log` says the watermark query read in one run of `run`, and the tables it read. */
       async function rowsRead(run: () => Promise<unknown>): Promise<number> {
         const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
         await run();
         await ch.command('SYSTEM FLUSH LOGS');
-        const rows = await ch.query<{ read_rows: string }>(
-          `SELECT read_rows FROM system.query_log
+        const rows = await ch.query<{ read_rows: string; tables: string[] }>(
+          `SELECT read_rows, tables FROM system.query_log
             WHERE current_database = {db:String} AND type = 'QueryFinish' AND query_kind = 'Select'
-              AND query_start_time_microseconds >= {t:DateTime64(6)} AND has(tables, {table:String})
+              AND query_start_time_microseconds >= {t:DateTime64(6)}
               AND startsWith(query, 'SELECT amm_account, min(ledger_index)')
             ORDER BY query_start_time_microseconds`,
-          { db, t, table: `${db}.${Table.AmmPoolStates}` },
+          { db, t },
         );
         expect(rows).toHaveLength(1);
+        // the touches and nothing else: the wide state table is not read by the watermark scans
+        expect(rows[0].tables).toEqual([`${db}.${Table.AmmPoolTouches}`]);
         return Number(rows[0].read_rows);
       }
-      const sinceLedger =
-        (ledger: number, settings: Record<string, number> = {}) =>
-        () =>
-          ch.query(POOLS_CHANGED_SINCE_SQL, { ledger, n: 1001 }, settings);
+      const sinceLedger = (ledger: number) => () => ch.query(POOLS_CHANGED_SINCE_SQL, { ledger, n: 1001 });
 
-      it('the table is six parts: four spread, one clustered, one row', async () => {
-        const parts = await ch.query<{ rows: string }>(
-          `SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = {t:String} AND active ORDER BY rows DESC`,
-          { t: Table.AmmPoolStates },
-        );
-        expect(parts.map((p) => Number(p.rows))).toEqual([...Array(5).fill(PER_PART), 1]);
+      const activeParts = async (table: Table): Promise<number[]> =>
+        (
+          await ch.query<{ rows: string }>(
+            `SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = {t:String} AND active ORDER BY rows DESC`,
+            { t: table },
+          )
+        ).map((p) => Number(p.rows));
+
+      it('the touches are four parts of 100,000 rows in one partition (merges stopped)', async () => {
+        expect(await activeParts(Table.AmmPoolTouches)).toEqual(Array(PARTS).fill(PER_PART));
       });
 
-      it('EXPLAIN: the ledger_mm skip index is there and usable; a ledger above old parts leaves one part of six', async () => {
+      it('unmerged: the parts below the ledger are out, the key search narrows the fourth to its range', async () => {
         const all = await stages(0);
-        expect(all.names).toEqual(['Name: ledger_mm']);
-        expect(all.minMax.parts).toEqual([6, 6]);
-        const newest = await stages(BASES[3] + PER_PART / POOLS);
-        // the parts whose ledgers are all below are out before a granule is looked at: one part, 13 of the 66 granules
-        expect(newest.minMax.parts).toEqual([1, 6]);
-        expect(newest.minMax.granules).toEqual([Math.ceil(PER_PART / GRANULE), all.minMax.granules[1]]);
-        expect(newest.skip.parts[1]).toBe(1);
+        expect(all.minMax.parts).toEqual([PARTS, PARTS]);
+        const last = await stages(ABOVE_THREE_PARTS);
+        expect(last.minMax.parts).toEqual([1, PARTS]); // the parts of older ledgers are out before the key is searched
+        expect(last.primaryKey.parts).toEqual([1, 1]);
+        expect(last.primaryKey.granules[0]).toBeLessThanOrEqual(Math.ceil(PER_PART / GRANULE) + 1);
+        expect(last.primaryKey.granules[0] * 3).toBeLessThan(all.primaryKey.granules[1]);
+
+        const read = await rowsRead(sinceLedger(ABOVE_THREE_PARTS));
+        expect(read).toBeGreaterThanOrEqual(PER_PART);
+        expect(read).toBeLessThanOrEqual(PER_PART + 2 * GRANULE);
+        expect(await rowsRead(sinceLedger(0))).toBe(PARTS * PER_PART);
       });
 
-      it('EXPLAIN: within a part whose granules are narrow in ledgers the skip index drops the granules below the ledger', async () => {
-        const stage = (await stages(ABOVE_CLUSTER)).skip;
-        expect(stage.parts).toEqual([1, 1]);
-        // 100,000 rows are 13 granules; pools 90..99 are the last 10,000 rows: the last three granules
-        expect(stage.granules[1]).toBe(Math.ceil(PER_PART / GRANULE));
-        expect(stage.granules[0]).toBeLessThanOrEqual(3);
+      describe('merged into one part', () => {
+        beforeAll(async () => {
+          await ch.command(`SYSTEM START MERGES ${Table.AmmPoolTouches}`);
+          await ch.command(`OPTIMIZE TABLE ${Table.AmmPoolTouches} FINAL`);
+        });
+
+        it('the touches are one part of 400,000 rows', async () => {
+          expect(await activeParts(Table.AmmPoolTouches)).toEqual([PARTS * PER_PART]);
+        });
+
+        it('EXPLAIN: the primary key selects the granules of the range, a quarter of the partition', async () => {
+          const all = await primaryKey(0);
+          expect(all.granules[0]).toBe(all.granules[1]);
+          const last = await primaryKey(ABOVE_THREE_PARTS);
+          expect(last.parts).toEqual([1, 1]);
+          expect(last.granules[1]).toBe(all.granules[1]);
+          expect(last.granules[0]).toBeLessThanOrEqual(Math.ceil(PER_PART / GRANULE) + 1);
+          expect(last.granules[0] * 3).toBeLessThan(last.granules[1]);
+          // a range of a few ledgers is a granule or two
+          const tip = await primaryKey(FIRST + PARTS * LEDGERS_PER_PART - 100);
+          expect(tip.granules[0]).toBeLessThanOrEqual(2);
+        });
+
+        it('read_rows: about the range (a quarter of the table), not the partition; the whole table only from the start', async () => {
+          const range = await rowsRead(sinceLedger(ABOVE_THREE_PARTS));
+          expect(range).toBeGreaterThanOrEqual(PER_PART);
+          expect(range).toBeLessThanOrEqual(PER_PART + 2 * GRANULE);
+          const tip = await rowsRead(sinceLedger(FIRST + PARTS * LEDGERS_PER_PART - 100));
+          expect(tip).toBeLessThanOrEqual(400 + 2 * GRANULE);
+          expect(await rowsRead(sinceLedger(FIRST + PARTS * LEDGERS_PER_PART))).toBeLessThanOrEqual(GRANULE);
+          expect(await rowsRead(sinceLedger(0))).toBe(PARTS * PER_PART);
+        });
+
+        it('poolsClosedIn reads the same range: the pools of a few ledgers cost a granule or two', async () => {
+          const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
+          const rates = { ledgersClosedIn: async () => ({ min: FIRST + 40_000, max: FIRST + 40_010 }) } as never;
+          const accounts = await poolsClosedIn(ch, rates, new Date(0), new Date(1000));
+          expect(accounts.length).toBeGreaterThan(0);
+          expect(accounts.length).toBeLessThanOrEqual(100);
+          await ch.command('SYSTEM FLUSH LOGS');
+          const [read] = await ch.query<{ read_rows: string; tables: string[] }>(
+            `SELECT read_rows, tables FROM system.query_log
+              WHERE current_database = {db:String} AND type = 'QueryFinish' AND query_kind = 'Select'
+                AND query_start_time_microseconds >= {t:DateTime64(6)} AND startsWith(query, 'SELECT DISTINCT amm_account')`,
+            { db, t },
+          );
+          expect(read.tables).toEqual([`${db}.${Table.AmmPoolTouches}`]);
+          expect(Number(read.read_rows)).toBeLessThanOrEqual(2 * GRANULE);
+        });
+
+        it('and finds the pools that changed, with the ledger it is complete up to', async () => {
+          const { accounts, upTo } = await poolsChangedSince(ch, ABOVE_THREE_PARTS, 1000);
+          const [{ pools }] = await ch.query<{ pools: string }>(
+            `SELECT uniqExact(amm_account) AS pools FROM ${Table.AmmPoolTouches} WHERE ledger_index > {ledger:UInt32}`,
+            { ledger: ABOVE_THREE_PARTS },
+          );
+          expect(accounts).toHaveLength(Number(pools));
+          expect(accounts.length).toBeGreaterThan(50);
+          expect(upTo).toBe(FIRST + PARTS * LEDGERS_PER_PART - 1);
+        });
       });
 
-      it('read_rows: the parts and granules below the ledger are not read', async () => {
-        const total = 5 * PER_PART + 1;
-        expect(await rowsRead(sinceLedger(0))).toBeGreaterThanOrEqual(total);
-        // two parts of the five (the newest spread one and the clustered one), and the others are not read
-        const twoParts = await rowsRead(sinceLedger(BASES[3] - 1));
-        expect(twoParts).toBeGreaterThanOrEqual(2 * PER_PART);
-        expect(twoParts).toBeLessThanOrEqual(2 * PER_PART + 2 * GRANULE);
-        // one part, whole: its granules all span the ledgers of the part
-        const onePart = await rowsRead(sinceLedger(CLUSTER - 1));
-        expect(onePart).toBeGreaterThanOrEqual(PER_PART);
-        expect(onePart).toBeLessThanOrEqual(PER_PART + 2 * GRANULE);
-        // nothing above the newest ledger
-        expect(await rowsRead(sinceLedger(CLUSTER + 1000))).toBeLessThanOrEqual(GRANULE);
-        // the last granules of the clustered part, where a scan of the part would read all of it
-        const clustered = await rowsRead(sinceLedger(ABOVE_CLUSTER));
-        expect(clustered).toBeLessThanOrEqual(3 * GRANULE);
-        const noSkipIndex = await rowsRead(sinceLedger(ABOVE_CLUSTER, { use_skip_indexes: 0 }));
-        expect(noSkipIndex).toBeGreaterThanOrEqual(PER_PART);
-      });
-
-      it('and finds the pools that changed, all of them, with the ledger it is complete up to', async () => {
-        const { accounts, upTo } = await poolsChangedSince(ch, ABOVE_CLUSTER, 1000);
-        expect(accounts).toEqual(Array.from({ length: 10 }, (_, k) => `rClus${String(90 + k).padStart(3, '0')}`));
-        expect(upTo).toBe(CLUSTER + 99 * 10 + 9);
-        expect((await poolsChangedSince(ch, BASES[3] - 1, 1000)).accounts).toHaveLength(POOLS + POOLS);
+      describe('the control: the wide state table, merged', () => {
+        it('ledger_mm prunes nothing once the parts are merged: every pool has rows in every ledger range', async () => {
+          await ch.command(`SYSTEM START MERGES ${Table.AmmPoolStates}`);
+          await ch.command(`OPTIMIZE TABLE ${Table.AmmPoolStates} FINAL`);
+          expect(await activeParts(Table.AmmPoolStates)).toEqual([STATES_BASES.length * PER_PART + 1]);
+          const lines = await explain(
+            `SELECT amm_account, min(ledger_index) FROM ${Table.AmmPoolStates}
+              WHERE ledger_index > {ledger:UInt32} GROUP BY amm_account`,
+            { ledger: STATES_BASES[3] - 1 },
+          );
+          const skip = stageAt(lines, lines.indexOf('Name: ledger_mm'));
+          // the rows above are a quarter of the table, but all but a granule or two hold some of them
+          expect(skip.granules[1]).toBeGreaterThan(40);
+          expect(skip.granules[0] * 10).toBeGreaterThanOrEqual(skip.granules[1] * 9);
+        });
       });
     });
   });
@@ -1118,7 +1184,7 @@ describe('the amm_pools job (e2e)', () => {
     it('is 0 for an empty table, and the ledger before the first row when no pool has been rebuilt', async () => {
       const ch = await fresh();
       expect(await ammPoolsWatermark(ch)).toBe(0);
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({ amm_account: A, ledger_index: 100 }),
         state({ amm_account: B, ledger_index: 250 }),
         state({ amm_account: A, ledger_index: 300 }),
@@ -1128,7 +1194,7 @@ describe('the amm_pools job (e2e)', () => {
 
     it('is the newest ledger when every pool has seen all its rows, and moves back to the first row a pool has not seen', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({ amm_account: A, ledger_index: 100, reserve_base: '1', reserve_counter: '1' }),
         state({ amm_account: B, ledger_index: 250, reserve_base: '1', reserve_counter: '1' }),
       ]);
@@ -1136,7 +1202,7 @@ describe('the amm_pools job (e2e)', () => {
       expect(await ammPoolsWatermark(ch)).toBe(250);
 
       // the live job's pools changed: B at 400 and A at 300; B is rebuilt, A is not
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({ amm_account: B, ledger_index: 400, reserve_base: '2', reserve_counter: '2' }),
         state({ amm_account: A, ledger_index: 300, reserve_base: '2', reserve_counter: '2' }),
       ]);
@@ -1150,14 +1216,14 @@ describe('the amm_pools job (e2e)', () => {
 
     it('reads the newest version of a pool, so a rebuild that saw less is not mistaken for one that saw more', async () => {
       const ch = await fresh();
-      await ch.insert(Table.AmmPoolStates, [
+      await insertStates(ch, [
         state({ amm_account: A, ledger_index: 100 }),
         state({ amm_account: A, ledger_index: 200 }),
       ]);
       await recomputeAmmPools(ch, noRates(), [A]);
       expect(await ammPoolsWatermark(ch)).toBe(200);
       // rows past the newest version's last_ledger are unseen even though an older version may have seen them
-      await ch.insert(Table.AmmPoolStates, [state({ amm_account: A, ledger_index: 250 })]);
+      await insertStates(ch, [state({ amm_account: A, ledger_index: 250 })]);
       expect(await ammPoolsWatermark(ch)).toBe(249);
     });
   });

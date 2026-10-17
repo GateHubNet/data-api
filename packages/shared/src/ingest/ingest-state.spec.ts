@@ -3,9 +3,16 @@ import { Table } from '../clickhouse/tables';
 import { CHILD_TABLES } from './build-rows';
 import { deleteLedgerRange, deleteLedgersAbove, LEDGER_KEYED_TABLES } from './ingest-state';
 
+const P6 = 1_000_000;
 const P7 = 10_000_000;
 
-const AMM_LEDGER_TABLES = [Table.AmmPoolStates, Table.AmmLiquidity, Table.AccountAmmLiquidity, Table.AmmGovernance];
+const AMM_LEDGER_TABLES = [
+  Table.AmmPoolStates,
+  Table.AmmPoolTouches,
+  Table.AmmLiquidity,
+  Table.AccountAmmLiquidity,
+  Table.AmmGovernance,
+];
 
 interface Delete {
   sql: string;
@@ -35,9 +42,10 @@ const deletedFrom = (deletes: Delete[], table: Table): Delete[] =>
   deletes.filter((d) => new RegExp(`^\\s*DELETE FROM ${table}\\b`).test(d.sql));
 
 describe('LEDGER_KEYED_TABLES', () => {
-  it('lists the four AMM ledger tables, partitioned by intDiv(ledger_index, 10000000)', () => {
+  it('lists the five AMM ledger tables, partitioned by intDiv(ledger_index, 10000000) but amm_pool_touches by a million', () => {
     for (const table of AMM_LEDGER_TABLES) {
-      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P7 }]);
+      const partitionSize = table === Table.AmmPoolTouches ? P6 : P7;
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize }]);
     }
   });
 
@@ -63,28 +71,33 @@ describe('LEDGER_KEYED_TABLES', () => {
 });
 
 describe('deleteLedgerRange covers the AMM ledger tables', () => {
-  it('deletes the range from each of them, in the P7 partitions that can hold it', async () => {
+  it('deletes the range from each of them, in the partitions that can hold it (P7; P6 for the touches)', async () => {
     const { ch, deletes } = recordingClickHouse(allPartitions);
 
-    // Ledgers 25,000,000 to 26,000,000 lie in P7 partition 2 only.
+    // Ledgers 25,000,000 to 26,000,000 lie in P7 partition 2 only, and in P6 partitions 25 and 26.
     await deleteLedgerRange(ch, 25_000_000, 26_000_000);
 
     for (const table of AMM_LEDGER_TABLES) {
       const mine = deletedFrom(deletes, table);
-      expect(mine).toHaveLength(1);
-      expect(mine[0].sql).toContain('IN PARTITION ID {partition:String}');
-      expect(mine[0].sql).toContain('ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}');
-      expect(mine[0].params).toEqual({ from: 25_000_000, to: 26_000_000, partition: '2' });
+      const partitions = table === Table.AmmPoolTouches ? ['25', '26'] : ['2'];
+      expect(mine.map((d) => d.params.partition)).toEqual(partitions);
+      for (const d of mine) {
+        expect(d.sql).toContain('IN PARTITION ID {partition:String}');
+        expect(d.sql).toContain('ledger_index >= {from:UInt32} AND ledger_index <= {to:UInt32}');
+        expect(d.params).toEqual({ from: 25_000_000, to: 26_000_000, partition: d.params.partition });
+      }
     }
   });
 
-  it('visits every P7 partition a range spans, and none beyond', async () => {
+  it('visits every partition a range spans, and none beyond', async () => {
     const { ch, deletes } = recordingClickHouse(allPartitions);
 
     await deleteLedgerRange(ch, 9_999_999, 20_000_000);
 
     for (const table of AMM_LEDGER_TABLES) {
-      expect(deletedFrom(deletes, table).map((d) => d.params.partition)).toEqual(['0', '1', '2']);
+      const partitions =
+        table === Table.AmmPoolTouches ? Array.from({ length: 12 }, (_, i) => String(i + 9)) : ['0', '1', '2'];
+      expect(deletedFrom(deletes, table).map((d) => d.params.partition)).toEqual(partitions);
     }
   });
 
@@ -121,7 +134,10 @@ describe('deleteLedgersAbove covers the AMM ledger tables', () => {
 
     for (const table of AMM_LEDGER_TABLES) {
       const mine = deletedFrom(deletes, table);
-      expect(mine.map((d) => d.params.partition)).toEqual(allPartitions().slice(1));
+      // from the partition of the checkpoint: P7 partition 1, P6 partition 12
+      expect(mine.map((d) => d.params.partition)).toEqual(
+        allPartitions().slice(table === Table.AmmPoolTouches ? 12 : 1),
+      );
       for (const d of mine) {
         expect(d.sql).toContain('ledger_index > {checkpoint:UInt32}');
         expect(d.params.checkpoint).toBe(12_345_678);

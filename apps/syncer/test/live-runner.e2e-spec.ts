@@ -608,10 +608,16 @@ describe('LiveRunner (e2e)', () => {
     const unclassified = async (metrics: PrometheusService): Promise<number> =>
       (await metrics.ammUnclassifiedTotal.get()).values[0]?.value ?? 0;
 
-    it('the chain has rows for all four AMM tables and two unclassified pools per ledger', () => {
+    it('the chain has rows for all five AMM tables and two unclassified pools per ledger', () => {
       expect(unclassifiedUpTo(L(12))).toBe(12 * UNCLASSIFIED_PER_LEDGER);
       const counts = expectedCounts(L(12), AMM_CHAIN);
-      for (const table of [Table.AmmPoolStates, Table.AmmLiquidity, Table.AccountAmmLiquidity, Table.AmmGovernance]) {
+      for (const table of [
+        Table.AmmPoolStates,
+        Table.AmmPoolTouches,
+        Table.AmmLiquidity,
+        Table.AccountAmmLiquidity,
+        Table.AmmGovernance,
+      ]) {
         expect([table, counts[table] > 0]).toEqual([table, true]);
       }
     });

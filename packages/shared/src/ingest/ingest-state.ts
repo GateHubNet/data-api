@@ -16,8 +16,8 @@ export interface LedgerKeyedTable {
 }
 
 /**
- * Every table whose rows belong to one ledger: the 18 ledger-derived tables of the baseline schema (the 14 of the
- * Ripple v2 data and the 4 AMM ledger tables), the ones that carry a `ledger_index` column and a dedup window. Fee
+ * Every table whose rows belong to one ledger: the 19 ledger-derived tables of the baseline schema (the 14 of the
+ * Ripple v2 data and the 5 AMM ledger tables), the ones that carry a `ledger_index` column and a dedup window. Fee
  * stats, validations, manifests, aggregates (`amm_pools` and `amm_daily` among them) and the bookkeeping tables are not
  * in the list, because a ledger's rewrite must not touch them.
  *
@@ -41,6 +41,7 @@ export const LEDGER_KEYED_TABLES: ReadonlyArray<LedgerKeyedTable> = [
   { table: Table.BalanceChanges, partitionSize: P7 },
   { table: Table.AccountsCreated },
   { table: Table.AmmPoolStates, partitionSize: P7 },
+  { table: Table.AmmPoolTouches, partitionSize: P6 },
   { table: Table.AmmLiquidity, partitionSize: P7 },
   { table: Table.AccountAmmLiquidity, partitionSize: P7 },
   { table: Table.AmmGovernance, partitionSize: P7 },

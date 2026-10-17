@@ -36,6 +36,7 @@ const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 /** The ledger tables of the AMM data: child tables like the others, with rows from the AMM parser. */
 const AMM_LEDGER_TABLES: Table[] = [
   Table.AmmPoolStates,
+  Table.AmmPoolTouches,
   Table.AmmLiquidity,
   Table.AccountAmmLiquidity,
   Table.AmmGovernance,
@@ -157,7 +158,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         rows.map((r) => ({
           ...SAMPLE_ROWS[table],
           ledger_index: r.ledger.ledger_index,
-          close_time: r.ledger.close_time,
+          // the touches of a pool are the three columns of its key, with no time
+          ...(table === Table.AmmPoolTouches ? {} : { close_time: r.ledger.close_time }),
         })),
       );
   }
@@ -245,7 +247,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const tokens = calls.map((c) => c.token);
       expect(new Set(tokens).size).toBe(tokens.length);
 
-      // The child tables that have rows (the 12 of the Ripple data: these ledgers have no AMM activity, so the 4 AMM
+      // The child tables that have rows (the 12 of the Ripple data: these ledgers have no AMM activity, so the 5 AMM
       // tables get no insert) start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
@@ -500,8 +502,11 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // Ledger 20,005,122 has transactions but no payment, so payments has no partition 20.
       expect(partitionsOf(Table.Payments)).toEqual([11, 29]);
       expect(partitionsOf(Table.TxByHash)).toEqual([1, 2]);
-      // The AMM ledger tables are P7 like tx_by_hash.
-      for (const table of AMM_LEDGER_TABLES) expect([table, partitionsOf(table)]).toEqual([table, [1, 2]]);
+      // The AMM ledger tables are P7 like tx_by_hash, but the touches of a pool, which are P6 like transactions.
+      for (const table of AMM_LEDGER_TABLES) {
+        const partitions = table === Table.AmmPoolTouches ? [11, 20, 29] : [1, 2];
+        expect([table, partitionsOf(table)]).toEqual([table, partitions]);
+      }
     });
 
     it('is a no-op on committed data when nothing is above the checkpoint', async () => {
@@ -654,6 +659,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   describe('AMM ledgers (whole mainnet ledgers around the recorded AMM cases)', () => {
     /** The rows of an AMM table as ClickHouse returns them, close_time as unix seconds, in the order of `orderBy`. */
     async function readBack(svc: ClickHouseService, table: Table, orderBy: string): Promise<Array<Json>> {
+      // the touches of a pool have no time
+      if (table === Table.AmmPoolTouches) return svc.query<Json>(`SELECT * FROM ${table} ORDER BY ${orderBy}`);
       return svc.query<Json>(
         `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${table} ORDER BY ${orderBy}`,
       );
@@ -663,6 +670,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
     const AMM_KEYS: Array<[Table, ChildRowsKey, string]> = [
       [Table.AmmPoolStates, 'ammPoolStates', 'amm_account, ledger_index, tx_index'],
+      [Table.AmmPoolTouches, 'ammPoolTouches', 'ledger_index, tx_index, amm_account'],
       [Table.AmmLiquidity, 'ammLiquidity', 'amm_account, ledger_index, tx_index'],
       [Table.AccountAmmLiquidity, 'accountAmmLiquidity', 'account, ledger_index, tx_index, amm_account'],
       [Table.AmmGovernance, 'ammGovernance', 'amm_account, ledger_index, tx_index'],
@@ -677,14 +685,14 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         return 0;
       });
 
-    it('the fixtures put rows into all four AMM tables, and AMM swaps into exchanges', () => {
+    it('the fixtures put rows into all five AMM tables, and AMM swaps into exchanges', () => {
       const expected = expectedAmmCounts();
       for (const table of AMM_LEDGER_TABLES) expect([table, expected[table] > 0]).toEqual([table, true]);
       const swaps = AMM_BUILT.flatMap((r) => r.exchanges).filter((e) => e.amm_account !== '');
       expect(swaps.length).toBeGreaterThan(10);
     });
 
-    it('an AMM ledger lands in all four tables: counts and every row as built, and the unclassified count is reported', async () => {
+    it('an AMM ledger lands in all five tables: counts and every row as built, and the unclassified count is reported', async () => {
       const svc = await freshService();
       const result = await new LedgerWriter(svc, ctx).write(AMM_LEDGERS);
 

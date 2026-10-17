@@ -354,12 +354,13 @@ export async function recomputeAmmPools(
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * The pools with a state row after `ledger`, with the first and newest ledger of those rows. `amm_pool_states` is ordered by
- * pool and not by ledger, so what finds the rows is its `ledger_mm` skip index (a minmax of `ledger_index` per granule): the
- * parts and granules that hold only older ledgers are not read (Ruling R-A2).
+ * The pools with a state row after `ledger`, with the first and newest ledger of those rows. It reads `amm_pool_touches`, the
+ * narrow index of the state rows ordered by ledger, so `ledger_index > {ledger}` is a range of its primary key: the granules
+ * of older ledgers are not read, whatever the state table's parts look like (Rulings R-A2 and R-A14: `amm_pool_states` is
+ * ordered by pool, and once its parts have merged the minmax index on its ledgers skips no granule).
  */
 export const POOLS_CHANGED_SINCE_SQL = `SELECT amm_account, min(ledger_index) AS first_ledger, max(ledger_index) AS newest_ledger
-  FROM ${Table.AmmPoolStates}
+  FROM ${Table.AmmPoolTouches}
  WHERE ledger_index > {ledger:UInt32}
  GROUP BY amm_account
  ORDER BY first_ledger ASC, amm_account ASC
@@ -367,7 +368,7 @@ export const POOLS_CHANGED_SINCE_SQL = `SELECT amm_account, min(ledger_index) AS
 
 /** The pools with a state row at one ledger. */
 const POOLS_AT_LEDGER_SQL = `SELECT DISTINCT amm_account
-  FROM ${Table.AmmPoolStates}
+  FROM ${Table.AmmPoolTouches}
  WHERE ledger_index = {ledger:UInt32}
  ORDER BY amm_account`;
 
@@ -417,7 +418,7 @@ export async function poolsChangedSince(ch: ClickHouseService, ledger: number, l
 /**
  * The pools with a state row in a ledger that closed in `[from, toExclusive)`: the pools of an `agg_dirty` slice, whose ledgers
  * were rewritten behind the aggregator. The time window becomes a range of ledgers first (`RatesService.ledgersClosedIn`, the
- * way the volume jobs find theirs), and the rows are found by the `ledger_mm` skip index.
+ * way the volume jobs find theirs), and the pools are read from `amm_pool_touches` by a range of its primary key.
  */
 export async function poolsClosedIn(
   ch: ClickHouseService,
@@ -429,7 +430,7 @@ export async function poolsClosedIn(
   if (!range) return [];
   const rows = await ch.query<{ amm_account: string }>(
     `SELECT DISTINCT amm_account
-       FROM ${Table.AmmPoolStates}
+       FROM ${Table.AmmPoolTouches}
       WHERE ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
       ORDER BY amm_account`,
     { min: range.min, max: range.max },
@@ -441,8 +442,9 @@ export async function poolsClosedIn(
  * Where the live job of `amm_pools` goes on from: the highest ledger such that every pool with a state row up to it is
  * reflected in `amm_pools` (its newest version has seen the row: `last_ledger` is at least the row's ledger). It is the
  * persistent cursor of the job, worked out from the tables themselves, so that a restart resumes where the last run
- * stopped instead of rebuilding every pool: one read of the ledger and pool columns of the state table, at the start of the
- * process.
+ * stopped instead of rebuilding every pool: one scan of `amm_pool_touches` (the ledger and pool of every state row; narrow, and
+ * not the state table), at the start of the process. The scan cannot be cut to a range of the key: a pool that was never
+ * rebuilt, or not since long ago, may have a stale row anywhere.
  *
  * It is the ledger before the oldest state row that its pool has not seen, or the newest ledger of the table when there is
  * none (0 for an empty table). It is not `max(last_ledger)` of `amm_pools`: a pool that a dirty slice recomputed up to the
@@ -453,7 +455,7 @@ export async function ammPoolsWatermark(ch: ClickHouseService): Promise<number> 
     `SELECT minIf(s.ledger_index, s.ledger_index > ifNull(p.reflected, 0)) AS first_stale,
             countIf(s.ledger_index > ifNull(p.reflected, 0)) AS stale,
             max(s.ledger_index) AS newest
-       FROM ${Table.AmmPoolStates} AS s
+       FROM ${Table.AmmPoolTouches} AS s
        LEFT JOIN (
             SELECT amm_account, argMax(last_ledger, version) AS reflected
               FROM ${Table.AmmPools}

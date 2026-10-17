@@ -70,6 +70,12 @@ const SHAPES: Record<Table, Shape> = {
     partition: P7,
     order: 'amm_account, ledger_index, tx_index',
   },
+  // the narrow ledger-ordered index of amm_pool_states (R-A14): the watermark and day scans read it by primary-key range
+  [Table.AmmPoolTouches]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, amm_account',
+  },
   [Table.AmmLiquidity]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
   [Table.AccountAmmLiquidity]: {
     engine: 'ReplacingMergeTree',
@@ -141,6 +147,7 @@ const DEDUP_TABLES: Table[] = [
   Table.BalanceChanges,
   Table.AccountsCreated,
   Table.AmmPoolStates,
+  Table.AmmPoolTouches,
   Table.AmmLiquidity,
   Table.AccountAmmLiquidity,
   Table.AmmGovernance,
@@ -353,9 +360,11 @@ describe('migrations (e2e)', () => {
           rows.map((t) => [t.name, { sorting: t.sorting_key, partition: t.partition_key }]),
         );
         const ledgerP7 = 'intDiv(ledger_index, 10000000)';
+        const ledgerP6 = 'intDiv(ledger_index, 1000000)';
 
         expect({
           [Table.AmmPoolStates]: keys[Table.AmmPoolStates],
+          [Table.AmmPoolTouches]: keys[Table.AmmPoolTouches],
           [Table.AmmLiquidity]: keys[Table.AmmLiquidity],
           [Table.AccountAmmLiquidity]: keys[Table.AccountAmmLiquidity],
           [Table.AmmGovernance]: keys[Table.AmmGovernance],
@@ -363,6 +372,7 @@ describe('migrations (e2e)', () => {
           [Table.AmmDaily]: keys[Table.AmmDaily],
         }).toEqual({
           amm_pool_states: { sorting: 'amm_account, ledger_index, tx_index', partition: ledgerP7 },
+          amm_pool_touches: { sorting: 'ledger_index, tx_index, amm_account', partition: ledgerP6 },
           amm_liquidity: { sorting: 'amm_account, ledger_index, tx_index', partition: ledgerP7 },
           account_amm_liquidity: { sorting: 'account, ledger_index, tx_index, amm_account', partition: ledgerP7 },
           amm_governance: { sorting: 'amm_account, ledger_index, tx_index', partition: ledgerP7 },
@@ -373,7 +383,13 @@ describe('migrations (e2e)', () => {
         const engines = Object.fromEntries(rows.map((t) => [t.name, t.engine_full.split(' ')[0]]));
         expect(engines[Table.AmmPools]).toBe('ReplacingMergeTree(version)');
         expect(engines[Table.AmmDaily]).toBe('ReplacingMergeTree(version)');
-        for (const table of [Table.AmmPoolStates, Table.AmmLiquidity, Table.AccountAmmLiquidity, Table.AmmGovernance]) {
+        for (const table of [
+          Table.AmmPoolStates,
+          Table.AmmPoolTouches,
+          Table.AmmLiquidity,
+          Table.AccountAmmLiquidity,
+          Table.AmmGovernance,
+        ]) {
           expect({ table, engine: engines[table] }).toEqual({ table, engine: 'ReplacingMergeTree' });
         }
       });
@@ -423,6 +439,18 @@ describe('migrations (e2e)', () => {
           auction_expiration: 'Nullable(UInt32)',
           deleted: 'UInt8',
         });
+      });
+
+      it('keeps amm_pool_touches narrow: the ledger, the transaction and the pool, in the order of its key', async () => {
+        const cols = await svc.query<{ name: string; type: string }>(
+          `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,
+          { db: 'xahau', t: Table.AmmPoolTouches },
+        );
+        expect(cols).toEqual([
+          { name: 'ledger_index', type: 'UInt32' },
+          { name: 'tx_index', type: 'UInt32' },
+          { name: 'amm_account', type: 'String' },
+        ]);
       });
 
       it('types the liquidity and governance columns', async () => {

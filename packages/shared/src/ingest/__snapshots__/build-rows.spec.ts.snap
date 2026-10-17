@@ -956,6 +956,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
   "ammGovernance": [],
   "ammLiquidity": [],
   "ammPoolStates": [],
+  "ammPoolTouches": [],
   "balanceChanges": [
     {
       "account": "rHktfGUbjqzU4GsYCMc1pDjdHXb5CJamto",
@@ -3528,6 +3529,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
   "ammGovernance": [],
   "ammLiquidity": [],
   "ammPoolStates": [],
+  "ammPoolTouches": [],
   "balanceChanges": [
     {
       "account": "rDitc4S7Y1GF2yzM4S2dayA4jYuK6YewSz",
@@ -4377,6 +4379,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
   "ammGovernance": [],
   "ammLiquidity": [],
   "ammPoolStates": [],
+  "ammPoolTouches": [],
   "balanceChanges": [
     {
       "account": "rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg",
@@ -5632,6 +5635,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
   "ammGovernance": [],
   "ammLiquidity": [],
   "ammPoolStates": [],
+  "ammPoolTouches": [],
   "balanceChanges": [
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
@@ -7044,6 +7048,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
   "ammGovernance": [],
   "ammLiquidity": [],
   "ammPoolStates": [],
+  "ammPoolTouches": [],
   "balanceChanges": [
     {
       "account": "rBSZe33F5oxHTbxSF1nZJooVDpcrrqNFp3",

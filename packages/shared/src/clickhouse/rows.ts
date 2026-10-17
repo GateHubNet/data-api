@@ -265,6 +265,18 @@ export interface AmmPoolStatesRow {
 }
 
 /**
+ * A pool touched by a transaction: the narrow, ledger-ordered index of `amm_pool_states` (Ruling R-A14), one row per state
+ * row with the three columns of its identity. The aggregator's scans ("which pools changed after this ledger", "which pools
+ * have a state in these ledgers") read it by a range of the primary key, which the wide state table (ordered by pool) cannot
+ * serve once its parts have merged.
+ */
+export interface AmmPoolTouchesRow {
+  ledger_index: number;
+  tx_index: number;
+  amm_account: string;
+}
+
+/**
  * One liquidity event of a pool: create, deposit, withdraw, clawback or delete. Amounts are signed from the pool's
  * perspective: positive in, negative out; `lp_tokens` is positive when minted and negative when burned. `mode` is `''`
  * for events without one (create, delete).

@@ -11,6 +11,7 @@ import {
   AmmLiquidityRow,
   AmmPoolsRow,
   AmmPoolStatesRow,
+  AmmPoolTouchesRow,
   BalanceChangesRow,
   ExchangesRow,
   FeeStatsRow,
@@ -49,6 +50,7 @@ export interface TableRows {
   [Table.BalanceChanges]: BalanceChangesRow;
   [Table.AccountsCreated]: AccountsCreatedRow;
   [Table.AmmPoolStates]: AmmPoolStatesRow;
+  [Table.AmmPoolTouches]: AmmPoolTouchesRow;
   [Table.AmmLiquidity]: AmmLiquidityRow;
   [Table.AccountAmmLiquidity]: AccountAmmLiquidityRow;
   [Table.AmmGovernance]: AmmGovernanceRow;
@@ -280,6 +282,8 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     auction_expiration: 750_086_400,
     deleted: 0,
   },
+  // the touch of the pool state above: the same ledger, transaction and pool
+  [Table.AmmPoolTouches]: { ledger_index: LEDGER, tx_index: 2, amm_account: POOL },
   [Table.AmmLiquidity]: ammLiquidity,
   [Table.AccountAmmLiquidity]: ammLiquidity,
   [Table.AmmGovernance]: {

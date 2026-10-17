@@ -18,6 +18,7 @@ export enum Table {
   AccountsCreated = 'accounts_created',
   // AMM ledger tables (written by ingest, one row per pool and transaction).
   AmmPoolStates = 'amm_pool_states',
+  AmmPoolTouches = 'amm_pool_touches',
   AmmLiquidity = 'amm_liquidity',
   AccountAmmLiquidity = 'account_amm_liquidity',
   AmmGovernance = 'amm_governance',

@@ -8,6 +8,7 @@ import {
   AmmGovernanceRow,
   AmmLiquidityRow,
   AmmPoolStatesRow,
+  AmmPoolTouchesRow,
   BalanceChangesRow,
   CountMap,
   ExchangesRow,
@@ -48,6 +49,8 @@ export interface LedgerRows {
   balanceChanges: BalanceChangesRow[];
   accountsCreated: AccountsCreatedRow[];
   ammPoolStates: AmmPoolStatesRow[];
+  /** One per pool state: the ledger-ordered index the aggregator scans (Ruling R-A14). */
+  ammPoolTouches: AmmPoolTouchesRow[];
   ammLiquidity: AmmLiquidityRow[];
   accountAmmLiquidity: AccountAmmLiquidityRow[];
   ammGovernance: AmmGovernanceRow[];
@@ -73,7 +76,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
 /**
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
- * They are the 12 tables of the Ripple v2 data and the 4 AMM ledger tables.
+ * They are the 12 tables of the Ripple v2 data and the 5 AMM ledger tables.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -89,6 +92,7 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.BalanceChanges, 'balanceChanges'],
   [Table.AccountsCreated, 'accountsCreated'],
   [Table.AmmPoolStates, 'ammPoolStates'],
+  [Table.AmmPoolTouches, 'ammPoolTouches'],
   [Table.AmmLiquidity, 'ammLiquidity'],
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
@@ -200,6 +204,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     balanceChanges: [],
     accountsCreated: [],
     ammPoolStates: [],
+    ammPoolTouches: [],
     ammLiquidity: [],
     accountAmmLiquidity: [],
     ammGovernance: [],
@@ -416,6 +421,11 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         auction_discounted_fee: state.auction_discounted_fee ?? null,
         auction_expiration: state.auction_expiration ?? null,
         deleted: state.deleted ? 1 : 0,
+      });
+      rows.ammPoolTouches.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        amm_account: state.amm_account,
       });
     }
 

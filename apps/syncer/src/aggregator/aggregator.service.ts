@@ -78,6 +78,21 @@ export const AGGREGATOR_AMM_POOLS_BUDGET_MS = 3000;
 /** How many pools one batch of `amm_pools` recomputes (and so how far the cursor of the job moves at a time). */
 export const AMM_POOLS_BATCH = 200;
 
+/**
+ * A batch of `amm_pools` that fails is halved until the pools that fail on their own are found (Ruling R-A15). When more than
+ * this many of one batch fail, the cause is not the pools (the database, a limit) and the batch is the failure of the job: the
+ * cursor stays behind it and the next tick does it again.
+ */
+export const MAX_ISOLATED_POOLS_PER_BATCH = 3;
+
+/**
+ * A pool that fails on its own is set aside, in memory, and tried again after this long, and after twice as long after each
+ * further failure, up to `AMM_POOL_MAX_RETRY_MS`, while the cursor and the other pools go on. A restart forgets the set: the
+ * pool is stale in the tables (`ammPoolsWatermark`), so the new process finds it again.
+ */
+export const AMM_POOL_RETRY_MS = 5 * 60_000;
+export const AMM_POOL_MAX_RETRY_MS = 60 * 60_000;
+
 /** A volume job gives up after this many sets failed in a tick, so that an outage does not log a line per set. */
 export const MAX_FAILED_VOLUME_SETS_PER_TICK = 3;
 
@@ -266,6 +281,9 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     process starts (`ammPoolsWatermark`: the ledger before the oldest state row that its pool's newest `amm_pools` row has not
  *     seen), so a restart takes the work up where it was; it moves past a batch only once the batch is written. A pool is a
  *     whole recompute from its state rows, so a batch is idempotent and a failed one is simply done again at the next tick.
+ *     A batch that fails is halved to find the pools that fail on their own (at most `MAX_ISOLATED_POOLS_PER_BATCH`): those
+ *     are set aside in memory, each counted as an error, and tried again after `AMM_POOL_RETRY_MS`, doubling up to an hour,
+ *     while the cursor and the other pools go on; a batch that fails as a whole (the database) is the failure of the job.
  *  4. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
  *     first, in slices of at most a day:
  *      - the **catch-up**, from the watermark (the newest hour with ledgers) up to two hours ago, or to the hour of the newest
@@ -324,6 +342,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
    * reads it from the tables (`ammPoolsWatermark`); it only moves past a batch that was written.
    */
   private ammWatermark?: number;
+  /** The pools of `amm_pools` that failed on their own: when to try each again, and the wait after the next failure. */
+  private readonly ammRetry = new Map<string, { until: number; delayMs: number }>();
   /** Whether the back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
   private backfilling = false;
   /** The sets of `volume_live` and `volume_daily` (by job, then `<metric>/<period or day>`) whose last attempt failed. */
@@ -506,19 +526,27 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   /**
    * Rebuilds the pools whose state rows changed since the cursor, a batch at a time, until nothing is left, the budget of the job
-   * is spent, or the shutdown begins. A batch that throws leaves the cursor where it was (the error is the tick's: logged,
-   * counted as `amm_pools`, and the jobs after this one still run), so the next tick asks for the same pools again.
+   * is spent, or the shutdown begins; then tries again the pools that were set aside (`ammPoolsRetries`). A pool that fails on
+   * its own does not stop the others (`recomputeAmmPools`); a batch that fails as a whole is the error of the job, which is
+   * logged and counted as `amm_pools`, and the jobs after this one still run. It leaves the cursor where it was, so the next
+   * tick asks for the same pools again.
    */
   private async ammPoolsJob(tick: AggregatorTick): Promise<void> {
     const amm = this.ammPools;
     if (!amm) return;
     this.ammWatermark ??= await this.ammFns.watermark(this.ch);
+    await this.ammPoolsLive(tick);
+    await this.ammPoolsRetries(tick);
+  }
+
+  /** The pools that changed since the cursor, a batch at a time. */
+  private async ammPoolsLive(tick: AggregatorTick): Promise<void> {
     for (;;) {
       if (!this.mayStartSet(tick, 'amm_pools')) return;
-      const ledger = this.ammWatermark;
+      const ledger = this.ammWatermark as number;
       const { accounts, upTo } = await this.ammFns.changedSince(this.ch, ledger, AMM_POOLS_BATCH);
       if (this.closing || accounts.length === 0) return;
-      await this.ammFns.recompute(this.ch, amm.rates, accounts, { signal: tick.signal });
+      await this.recomputeAmmBatch(accounts, tick, 'amm_pools');
       this.logger.debug(`amm_pools: ${accounts.length} pool(s) up to ledger ${upTo}`);
       // a cursor that does not move would ask for the same pools for ever
       if (upTo <= ledger) return;
@@ -527,8 +555,71 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   }
 
   /**
+   * Rebuilds a batch of pools. When it fails, it is halved to find the pools that fail on their own (at most
+   * `MAX_ISOLATED_POOLS_PER_BATCH`; a recompute of the others goes on), and those are set aside for a retry
+   * (`AMM_POOL_RETRY_MS`), each counted as an error of `job`. When more fail, or the budget of the job is spent first, the
+   * error of the batch is thrown and nothing is set aside. The pools that wait for a retry are left out: the retry rebuilds
+   * them with everything they have by then.
+   */
+  private async recomputeAmmBatch(accounts: string[], tick: AggregatorTick, job: string): Promise<void> {
+    const amm = this.ammPools as AggregatorAmmPools;
+    const batch = accounts.filter((account) => !this.ammRetry.has(account));
+    if (batch.length === 0) return;
+    const recompute = (list: string[]) => this.ammFns.recompute(this.ch, amm.rates, list, { signal: tick.signal });
+    try {
+      await recompute(batch);
+      return;
+    } catch (err) {
+      if (this.closing) throw err;
+      const isolated: Array<{ account: string; err: unknown }> = [];
+      const isolate = async (list: string[], failure: unknown): Promise<void> => {
+        if (list.length === 1) {
+          isolated.push({ account: list[0], err: failure });
+          if (isolated.length > MAX_ISOLATED_POOLS_PER_BATCH) throw err;
+          return;
+        }
+        const middle = Math.ceil(list.length / 2);
+        for (const half of [list.slice(0, middle), list.slice(middle)]) {
+          if (this.closing || this.clock() >= tick.deadline) throw err;
+          try {
+            await recompute(half);
+          } catch (halfErr) {
+            if (this.closing) throw halfErr;
+            await isolate(half, halfErr);
+          }
+        }
+      };
+      await isolate(batch, err);
+      for (const { account, err: failure } of isolated) {
+        this.ammRetry.set(account, { until: this.clock() + AMM_POOL_RETRY_MS, delayMs: AMM_POOL_RETRY_MS });
+        this.failed(job, failure, ` for pool ${account}, set aside to be tried again`);
+      }
+    }
+  }
+
+  /** The pools that were set aside and whose wait is over, one at a time, under the budget of the job. */
+  private async ammPoolsRetries(tick: AggregatorTick): Promise<void> {
+    const amm = this.ammPools as AggregatorAmmPools;
+    const due = [...this.ammRetry].filter(([, retry]) => retry.until <= this.clock()).map(([account]) => account);
+    for (const account of due) {
+      if (!this.mayStartSet(tick, 'amm_pools')) return;
+      try {
+        await this.ammFns.recompute(this.ch, amm.rates, [account], { signal: tick.signal });
+        this.ammRetry.delete(account);
+        this.logger.log(`amm_pools: pool ${account} is rebuilt again`);
+      } catch (err) {
+        if (this.closing) throw err;
+        const delayMs = Math.min((this.ammRetry.get(account)?.delayMs ?? AMM_POOL_RETRY_MS) * 2, AMM_POOL_MAX_RETRY_MS);
+        this.ammRetry.set(account, { until: this.clock() + delayMs, delayMs });
+        this.failed('amm_pools', err, ` for pool ${account}, tried again in ${Math.round(delayMs / 60_000)} min`);
+      }
+    }
+  }
+
+  /**
    * The pools with a state row in the ledgers that closed in the slice `[start, end)` of an `agg_dirty` range, rebuilt a batch at
-   * a time. The slice is started whole (the budget is checked before a slice, as for its stats and volumes); only the shutdown
+   * a time (a pool that fails on its own is set aside like those of the live job; a slice most of whose pools fail fails the
+   * slice). The slice is started whole (the budget is checked before a slice, as for its stats and volumes); only the shutdown
    * stops it between batches, and then the range is left as it is (`recomputeDirty` writes nothing to `agg_dirty` after it).
    */
   private async ammPoolsOfSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
@@ -537,9 +628,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     const accounts = await this.ammFns.poolsClosedIn(this.ch, amm.rates, new Date(start * 1000), new Date(end * 1000));
     for (let i = 0; i < accounts.length; i += AMM_POOLS_BATCH) {
       if (this.closing) return;
-      await this.ammFns.recompute(this.ch, amm.rates, accounts.slice(i, i + AMM_POOLS_BATCH), {
-        signal: tick.signal,
-      });
+      await this.recomputeAmmBatch(accounts.slice(i, i + AMM_POOLS_BATCH), tick, 'amm_pools_dirty');
     }
   }
 

@@ -334,8 +334,9 @@ SETTINGS non_replicated_deduplication_window = 1000;
 
 -- ---------------------------------------------------------------------------
 -- AMM ledger tables. One row per pool (or account) and transaction, written with the other ledger tables. The minmax
--- index on ledger_index lets the "changed since ledger" watermark scans and the day scans of the aggregator skip parts,
--- because the tables are ordered by pool or account and not by ledger.
+-- index on ledger_index lets scans by ledger skip whole parts, because the tables are ordered by pool or account and not by
+-- ledger; it does not skip granules once the parts have merged, which is why the aggregator's watermark and day scans read
+-- the narrow ledger-ordered amm_pool_touches instead.
 -- ---------------------------------------------------------------------------
 
 -- The state of a pool after each transaction that touched it. The pair is in Ripple's canonical (base, counter) order.
@@ -372,6 +373,21 @@ CREATE TABLE IF NOT EXISTS amm_pool_states
 ENGINE = ReplacingMergeTree
 PARTITION BY intDiv(ledger_index, 10000000)
 ORDER BY (amm_account, ledger_index, tx_index)
+SETTINGS non_replicated_deduplication_window = 1000;
+
+-- The pools touched by each transaction: one row per amm_pool_states row, with the three columns of its identity, in the
+-- order of the ledgers. amm_pool_states is ordered by pool, so once its parts have merged a "which pools changed after this
+-- ledger" scan reads every granule (the minmax index cannot skip granules that hold a bit of every pool's history). This
+-- table answers it by a range of the primary key: the aggregator's watermark and day scans read it, never the wide table.
+CREATE TABLE IF NOT EXISTS amm_pool_touches
+(
+  ledger_index UInt32,
+  tx_index     UInt32,
+  amm_account  String
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY intDiv(ledger_index, 1000000)
+ORDER BY (ledger_index, tx_index, amm_account)
 SETTINGS non_replicated_deduplication_window = 1000;
 
 -- One row per create, deposit, withdraw, clawback or delete. Amounts are signed from the pool's perspective (positive

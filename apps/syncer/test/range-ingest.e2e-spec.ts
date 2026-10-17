@@ -44,7 +44,7 @@ const CHAIN_RAW = CHAIN.map((l) => l.raw);
 const UNCLASSIFIED_PER_LEDGER = 2;
 /**
  * The same 30 ledgers with AMM activity: each holds an AMMCreate, an AMMVote and 10 swaps against pools of two recorded
- * mainnet ledgers (rows in all four AMM tables), and `UNCLASSIFIED_PER_LEDGER` pools that give no row.
+ * mainnet ledgers (rows in all five AMM tables), and `UNCLASSIFIED_PER_LEDGER` pools that give no row.
  */
 const AMM_RAW = syntheticChain(L(1), 30, { template: ammTemplate(UNCLASSIFIED_PER_LEDGER) }).map((l) => l.raw);
 
@@ -733,7 +733,13 @@ describe('rangeIngest (e2e)', () => {
     const unclassified = async (metrics: PrometheusService): Promise<number> =>
       (await metrics.ammUnclassifiedTotal.get()).values[0]?.value ?? 0;
 
-    const AMM_TABLES = [Table.AmmPoolStates, Table.AmmLiquidity, Table.AccountAmmLiquidity, Table.AmmGovernance];
+    const AMM_TABLES = [
+      Table.AmmPoolStates,
+      Table.AmmPoolTouches,
+      Table.AmmLiquidity,
+      Table.AccountAmmLiquidity,
+      Table.AmmGovernance,
+    ];
 
     /** `count() == uniqExact(<sorting key>)` in each AMM table: no row is there twice, and there are rows. */
     async function expectNoDuplicateAmmRows(svc: ClickHouseService): Promise<void> {
@@ -751,7 +757,7 @@ describe('rangeIngest (e2e)', () => {
       }
     }
 
-    it('the ledgers have rows for all four AMM tables, and two pools per ledger the parser cannot classify', () => {
+    it('the ledgers have rows for all five AMM tables, and two pools per ledger the parser cannot classify', () => {
       const counts = expectedCounts(AMM_RAW, CHAIN_TABLES);
       for (const table of AMM_TABLES) expect([table, counts[table] > 0]).toEqual([table, true]);
       const total = AMM_RAW.reduce((sum, raw) => sum + buildLedgerRows(raw, ctx).diagnostics.ammUnclassified, 0);

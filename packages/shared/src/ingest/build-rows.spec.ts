@@ -121,6 +121,7 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.BalanceChanges, 'balanceChanges'],
   [Table.AccountsCreated, 'accountsCreated'],
   [Table.AmmPoolStates, 'ammPoolStates'],
+  [Table.AmmPoolTouches, 'ammPoolTouches'],
   [Table.AmmLiquidity, 'ammLiquidity'],
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
@@ -1117,6 +1118,43 @@ describe('AMM rows (parser version 2)', () => {
     });
   });
 
+  describe('amm_pool_touches', () => {
+    it('is one row per state row, the same ledger, transaction and pool, in the same order', () => {
+      let total = 0;
+      for (const { rows } of builtOf(AMM_SET)) {
+        expect(rows.ammPoolTouches).toEqual(
+          rows.ammPoolStates.map(({ ledger_index, tx_index, amm_account }) => ({
+            ledger_index,
+            tx_index,
+            amm_account,
+          })),
+        );
+        total += rows.ammPoolTouches.length;
+      }
+      // the recorded ledgers hold a hundred pools' states: the index is not vacuously empty
+      expect(total).toBeGreaterThan(100);
+    });
+
+    it('payment_two_pools: one touch for each of the two pools of the transaction', () => {
+      const { rows, mine, at } = ammCase('payment_two_pools');
+      expect(mine(rows.ammPoolTouches)).toEqual([
+        { ledger_index: at.ledger_index, tx_index: at.tx_index, amm_account: 'rEaErQ5vEbHXThFedUrjz9YFotG5HHcxoW' },
+        { ledger_index: at.ledger_index, tx_index: at.tx_index, amm_account: 'rs9ineLqrCzeAGS1bxsrW8x2n3bRJYAh3Q' },
+      ]);
+    });
+
+    it('a pool deleted by the transaction is touched like any other', () => {
+      const { rows, mine, at } = ammCase('withdraw_all_deletes_pool');
+      expect(mine(rows.ammPoolTouches)).toEqual([
+        { ledger_index: at.ledger_index, tx_index: at.tx_index, amm_account: XRP_SNK },
+      ]);
+    });
+
+    it('a ledger without AMM activity has none', () => {
+      for (const { rows } of builtOf(RIPPLE_MOCK)) expect(rows.ammPoolTouches).toEqual([]);
+    });
+  });
+
   describe('amm_liquidity and account_amm_liquidity', () => {
     it('deposit_two_asset: the signed pool amounts, the LP tokens and the mode, with shadows', () => {
       const { rows, mine, at } = ammCase('deposit_two_asset');
@@ -1232,6 +1270,7 @@ describe('AMM rows (parser version 2)', () => {
       [Table.Exchanges, 'exchanges'],
       [Table.AccountExchanges, 'accountExchanges'],
       [Table.AmmPoolStates, 'ammPoolStates'],
+      [Table.AmmPoolTouches, 'ammPoolTouches'],
       [Table.AmmLiquidity, 'ammLiquidity'],
       [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
       [Table.AmmGovernance, 'ammGovernance'],
@@ -1255,6 +1294,7 @@ describe('AMM rows (parser version 2)', () => {
     it('has empty AMM arrays, no unclassified pool and amm_account empty on every exchange row', () => {
       for (const { rows } of builtOf(RIPPLE_MOCK)) {
         expect(rows.ammPoolStates).toEqual([]);
+        expect(rows.ammPoolTouches).toEqual([]);
         expect(rows.ammLiquidity).toEqual([]);
         expect(rows.accountAmmLiquidity).toEqual([]);
         expect(rows.ammGovernance).toEqual([]);
@@ -1320,7 +1360,7 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
 }
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data and the 4 AMM ones', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data and the 5 AMM ones', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -1338,6 +1378,7 @@ describe('CHILD_TABLES', () => {
         Table.BalanceChanges,
         Table.AccountsCreated,
         Table.AmmPoolStates,
+        Table.AmmPoolTouches,
         Table.AmmLiquidity,
         Table.AccountAmmLiquidity,
         Table.AmmGovernance,
