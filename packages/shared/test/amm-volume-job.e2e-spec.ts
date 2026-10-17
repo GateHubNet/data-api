@@ -893,6 +893,15 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
         calls.filter(([q]) => q === sql).map(([, p]) => ((p as { accounts: string[] }).accounts ?? []).length);
       expect(calls.filter(([q]) => q === AMM_TOUCHED_POOLS_SQL)).toHaveLength(1);
       expect(lengths(AMM_POOL_PAIRS_SQL)).toEqual([200, 200, 50]);
+      // the pairs are read at the first ledger the pool was touched in, one ledger for each pool of the chunk
+      for (const [q, p] of calls) {
+        if (q !== AMM_POOL_PAIRS_SQL) continue;
+        const { accounts, firsts } = p as { accounts: string[]; firsts: number[] };
+        expect(firsts).toHaveLength(accounts.length);
+        accounts.forEach((account, i) =>
+          expect(firsts[i]).toBe(1000 + (Number(account.slice('rChunkPool'.length, 14)) % 4)),
+        );
+      }
       expect(lengths(AMM_POOL_SUMS_SQL)).toEqual([200, 200, 50]);
       expect(volumes).toHaveLength(POOLS);
       expect(volumes.every((v) => v.count === 1 && v.baseVolume.eq(2) && v.counterVolume.eq(1))).toBe(true);
@@ -916,6 +925,163 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
       const set = await dailySet(ch, D1_KEY);
       expect(set).toHaveLength(POOLS + 1);
       expect(parts(set).every((r) => r.count === 1 && r.converted_f === 1 && r.rate_f === 2)).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('the markets of the config are read only for the assets a pool needs a rate of', () => {
+    const DDD: Asset = { currency: 'DDD', issuer: ISSUER_D };
+    const CNY: Asset = { currency: 'CNY', issuer: ISSUER_C };
+    const JPY: Asset = { currency: 'JPY', issuer: ISSUER_B };
+    const MMM: Asset = { currency: 'MMM', issuer: ISSUER_D };
+    const asMarket = (base: Asset, counter: Asset) => ({ base, counter });
+    // USD and EUR against XRP are needed by the pool EUR/USD below; DDD against XRP, CNY against JPY, and EUR against USD (a
+    // market that is not against the native currency gives no rate) are not read
+    const MARKETS: MarketsConfig = {
+      version: 2,
+      tradeMarkets: [
+        asMarket(USD, XRP),
+        asMarket(DDD, XRP),
+        asMarket(EUR, XRP),
+        asMarket(CNY, JPY),
+        asMarket(EUR, USD),
+      ],
+      paymentCurrencies: [],
+    };
+    const N1 = pool('rPoolNativeOne', USD, XRP);
+    const N2 = pool('rPoolNativeTwo', EUR, XRP);
+    const B1 = pool('rPoolBridge', EUR, USD);
+    const B2 = pool('rPoolNoMarket', AAA, BBB);
+    const ids = (pairs: Array<{ base: Asset; counter: Asset }>): string[] =>
+      pairs.map((p) => `${assetKey(p.base)}/${assetKey(p.counter)}`);
+
+    /** Swaps of pools and trades of the order book, all in the ledger 1000 of day 1, with their states and touches. */
+    async function seed(
+      swaps: Array<[PoolDef, string, string]>,
+      book: Array<[Asset, string, string]>,
+    ): Promise<{ ch: ClickHouseService; rows: ExchangesRow[] }> {
+      const ch = await fresh();
+      await ch.insert(Table.Ledgers, [...CLOSES.keys()].map(ledgerRow));
+      const rows = [
+        ...swaps.map(([p, base, counter], i) => exchangeRow(p, 1000, i, base, counter, p.account)),
+        ...book.map(([base, b, c], i) => exchangeRow({ base, counter: XRP }, 1000, swaps.length + i, b, c, '')),
+      ];
+      await ch.insert(Table.Exchanges, rows);
+      await ch.insert(
+        Table.AmmPoolStates,
+        swaps.map(([p], i) => stateRow(p, 1000, i)),
+      );
+      await ch.insert(
+        Table.AmmPoolTouches,
+        swaps.map(([p], i) => ({ ledger_index: 1000, tx_index: i, amm_account: p.account })),
+      );
+      return { ch, rows };
+    }
+
+    it('a pool that needs a rate reads the markets against the native currency of its assets and no other, and the rates are the same', async () => {
+      const { ch, rows } = await seed(
+        [
+          [N1, '10', '5'],
+          [N2, '4', '2'],
+          [B1, '6', '3'],
+        ],
+        [
+          [EUR, '8', '2'], // the market EUR/XRP: 12 EUR for 4 XRP with the swap of the pool, 3 a coin (the pools say 2)
+          [USD, '30', '10'],
+          [DDD, '7', '7'],
+        ],
+      );
+      const r = rates(ch);
+      const spy = jest.spyOn(r, 'vwaps');
+      await computeDailyVolumeSet(ch, r, MARKETS, 'amm_volume', at(D1));
+      const read = spy.mock.calls.map(([pairs]) => ids(pairs));
+      spy.mockRestore();
+      expect(read).toEqual([[`USD.${ISSUER_A}/XRP`, `EUR.${ISSUER_B}/XRP`]]);
+      // the pool EUR/USD is converted through the market rate of EUR (3), as the oracle that reads every market says
+      const set = await dailySet(ch, D1_KEY);
+      expectAmm(set, ammVolumeOracle(MARKETS, rows, D1, D2));
+      expect(parts(set).find((c) => c.component === B1.account)).toMatchObject({ amount: '6', count: 1 });
+      expect((parts(set).find((c) => c.component === B1.account) as StoredRow).rate_f).toBe(3);
+    });
+
+    it('no market is read when every pool has a native leg', async () => {
+      const { ch, rows } = await seed(
+        [
+          [N1, '10', '5'],
+          [N2, '4', '2'],
+        ],
+        [[USD, '30', '10']],
+      );
+      const r = rates(ch);
+      const spy = jest.spyOn(r, 'vwaps');
+      await computeDailyVolumeSet(ch, r, MARKETS, 'amm_volume', at(D1));
+      const calls = spy.mock.calls.length;
+      spy.mockRestore();
+      expect(calls).toBe(0);
+      const set = await dailySet(ch, D1_KEY);
+      expect(parts(set)).toHaveLength(2);
+      expectAmm(set, ammVolumeOracle(MARKETS, rows, D1, D2));
+    });
+
+    it('no market is read when no configured market is against the native currency for an asset a pool needs a rate of', async () => {
+      const { ch, rows } = await seed(
+        [
+          [N1, '10', '5'],
+          [B2, '5', '5'],
+        ],
+        [[USD, '30', '10']],
+      );
+      const r = rates(ch);
+      const spy = jest.spyOn(r, 'vwaps');
+      await computeDailyVolumeSet(ch, r, MARKETS, 'amm_volume', at(D1));
+      const calls = spy.mock.calls.length;
+      spy.mockRestore();
+      expect(calls).toBe(0);
+      const set = await dailySet(ch, D1_KEY);
+      expectAmm(set, ammVolumeOracle(MARKETS, rows, D1, D2));
+      expect(parts(set).map((c) => c.component)).toEqual([N1.account]);
+    });
+
+    it('a configured market rate of exactly 0 does not block the rate of the pools', async () => {
+      // MMM against XRP: the market read says 0 MMM for 1 XRP (a rate of 0); the pool MMM/XRP swapped 10 MMM for 5 XRP, a rate of
+      // 2, and the pool AAA/MMM has no rate of AAA: it is converted through the rate of MMM that the pools give
+      const Q1 = pool('rPoolQuoteOne', MMM, XRP);
+      const Q2 = pool('rPoolQuoteTwo', AAA, MMM);
+      const { ch } = await seed(
+        [
+          [Q1, '10', '5'],
+          [Q2, '6', '4'],
+        ],
+        [],
+      );
+      const r = rates(ch);
+      const spy = jest.spyOn(r, 'vwaps').mockImplementation(async (pairs) =>
+        pairs.map(() => ({
+          vwap: new BigNumber(0),
+          count: 1,
+          baseVolume: new BigNumber(0),
+          counterVolume: new BigNumber(1),
+        })),
+      );
+      await computeDailyVolumeSet(
+        ch,
+        r,
+        { version: 4, tradeMarkets: [asMarket(MMM, XRP)], paymentCurrencies: [] },
+        'amm_volume',
+        at(D1),
+      );
+      expect(spy).toHaveBeenCalledTimes(1);
+      spy.mockRestore();
+      const set = parts(await dailySet(ch, D1_KEY));
+      expect(set.map((c) => c.component)).toEqual([Q1.account, Q2.account]);
+      expect(set[0]).toMatchObject({ amount: '10', count: 1, converted_f: 5, rate_f: 2 });
+      expect(set[1]).toMatchObject({
+        base_currency: 'MMM',
+        counter_currency: 'AAA',
+        amount: '4',
+        converted_f: 2,
+        rate_f: 2,
+      });
     });
   });
 
@@ -987,6 +1153,7 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
     const PAIRS = 5;
     const PER_PAIR = 60_000;
     const OTHER_POOLS = 200_000;
+    const BUSY_ROWS = 150_000;
     const GRANULE = 8192;
     let ch: ClickHouseService;
 
@@ -1075,6 +1242,18 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
         { pool: P1.account, rows: OTHER_POOLS },
         { settings: { insert_deduplicate: 0 } },
       );
+      // a busy pool: 150,000 state rows of P1 after the ledger it was first touched in (1000), in the window
+      await ch.command(
+        `INSERT INTO ${Table.AmmPoolStates}
+         SELECT tpl.* REPLACE (
+                  toUInt32(1001 + n.number % 4) AS ledger_index,
+                  toUInt32(1000 + intDiv(n.number, 4)) AS tx_index
+                )
+           FROM (SELECT * FROM ${Table.AmmPoolStates} WHERE amm_account = {pool:String} LIMIT 1) AS tpl
+          CROSS JOIN numbers({rows:UInt32}) AS n`,
+        { pool: P1.account, rows: BUSY_ROWS },
+        { settings: { insert_deduplicate: 0 } },
+      );
       await ch.command(
         `INSERT INTO ${Table.AmmPoolTouches}
          SELECT toUInt32(2000 + intDiv(n.number, 100)) AS ledger_index, toUInt32(n.number % 100) AS tx_index,
@@ -1116,8 +1295,8 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
       expect(selected).toBeLessThanOrEqual(2);
     });
 
-    it('EXPLAIN: the pair of a pool is read by the pool key (a prefix of the primary key of the states) and the ledger range', async () => {
-      const lines = await explain(AMM_POOL_PAIRS_SQL, { accounts: [P1.account, P4.account], first: 1000, last: 1004 });
+    it('EXPLAIN: the pair of a pool is read by the pool key and the first ledger it was touched in (a prefix of the primary key of the states)', async () => {
+      const lines = await explain(AMM_POOL_PAIRS_SQL, { accounts: [P1.account, P4.account], firsts: [1000, 1001] });
       const cond = condition(lines);
       expect(cond).toContain('amm_account');
       expect(cond).toContain('ledger_index');
@@ -1158,12 +1337,26 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
       expect(reads[0].read_rows).toBeLessThanOrEqual(2 * GRANULE);
     });
 
-    it('read_rows: the pairs of the pools are their own state rows, not the 200,000 rows of other pools', async () => {
+    it('read_rows: the pairs of the pools cost a granule each, not the 200,000 rows of other pools nor the 150,000 of a busy pool in the window', async () => {
+      expect(await totalRows(Table.AmmPoolStates)).toBeGreaterThan(OTHER_POOLS + BUSY_ROWS);
       const reads = await readsOf(Table.AmmPoolStates, () =>
         computeDailyVolumeSet(ch, rates(ch), HAND_MARKETS, 'amm_volume', at(D1)),
       );
       expect(reads).toHaveLength(1);
       expect(reads[0].read_rows).toBeLessThanOrEqual(2 * GRANULE);
+      // the control: the pairs read by the pool key and the range of the window (what the read was) reads every state row the
+      // busy pool has in the window
+      const windowWide = await readsOf(Table.AmmPoolStates, () =>
+        ch.query(
+          `SELECT amm_account, base_currency, base_issuer, counter_currency, counter_issuer
+             FROM ${Table.AmmPoolStates}
+            WHERE amm_account IN {accounts:Array(String)} AND ledger_index BETWEEN {first:UInt32} AND {last:UInt32}
+            ORDER BY amm_account, ledger_index, tx_index
+            LIMIT 1 BY amm_account`,
+          { accounts: [P1.account, P4.account], first: 1000, last: 1004 },
+        ),
+      );
+      expect(windowWide[0].read_rows).toBeGreaterThan(BUSY_ROWS);
     });
 
     it('still gives the right pools: the other pairs and pools add nothing to the day', async () => {

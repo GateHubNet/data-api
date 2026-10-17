@@ -73,7 +73,7 @@ import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTL
 /** The version of the computation: bump it when the rows would come out differently, so that `ammDaysDone` redoes the days. */
 export const AMM_DAILY_CONFIG_VERSION = 1;
 
-/** How many pools one read of the job covers (the accounts travel as an array parameter of the queries). */
+/** How many pools one read of the job covers: `AMM_CHUNK`. */
 export const AMM_DAILY_CHUNK = AMM_CHUNK;
 
 const RIPPLE_EPOCH_S = RIPPLE_EPOCH_MS / 1000;
@@ -272,10 +272,7 @@ export function liquidityTotals(events: readonly DayLiquidity[]): LiquidityTotal
 // The reads
 // ---------------------------------------------------------------------------------------------------------------------
 
-/**
- * The pools a transaction touched in the ledgers of the day, from the narrow ledger-ordered `amm_pool_touches`: a range of its
- * primary key (Ruling R-A14), never the state table (ordered by pool) or the exchanges.
- */
+/** The pools of the day: `AMM_TOUCHED_POOLS_SQL` over the ledgers of the day (this job ignores its `first_ledger`). */
 export const AMM_DAILY_TOUCHES_SQL = AMM_TOUCHED_POOLS_SQL;
 
 /**

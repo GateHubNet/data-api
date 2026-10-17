@@ -180,7 +180,8 @@ function paymentAssetsOf(config: MarketsConfig, nativeCurrency: string): Asset[]
 /**
  * One row of a set, before it is stored. `converted` is in the native currency and `rate` is how many units of the
  * component's `base` one native coin buys, so that `converted = amount / rate` for every component, whatever way it was
- * converted. A trade component has a `counter` (the other side of the market); a pool component too (the other asset of the
+ * converted (the one exception is a native-leg component with no base volume, a rate of 0: `amount` 0, `rate` 0, `converted` its
+ * native volume). A trade component has a `counter` (the other side of the market); a pool component too (the other asset of the
  * pool, its `component` the pool account); a payment component is a currency alone.
  */
 interface VolumeComponent {
@@ -283,9 +284,23 @@ function convertLegs(
   return out;
 }
 
-/** The configured markets with what traded in them in a window (`getVolumes` of `scripts/tradeVolume.js`). */
-async function tradeLegs(rates: RatesService, config: MarketsConfig, from: Date, toExclusive: Date): Promise<Leg[]> {
-  const markets = marketsOf(config, rates.nativeCurrency);
+/**
+ * The configured markets with what traded in them in a window (`getVolumes` of `scripts/tradeVolume.js`). With `bases`, only
+ * the markets against the native currency whose base is one of those assets (the markets a rate of those assets comes from),
+ * and nothing is read when there are none.
+ */
+async function tradeLegs(
+  rates: RatesService,
+  config: MarketsConfig,
+  from: Date,
+  toExclusive: Date,
+  bases?: ReadonlySet<string>,
+): Promise<Leg[]> {
+  const native = rates.nativeCurrency;
+  const markets = marketsOf(config, native).filter(
+    (m) => bases === undefined || (isNative(m.counter, native) && bases.has(assetKey(m.base))),
+  );
+  if (markets.length === 0) return [];
   const vwaps = await rates.vwaps(markets, from, toExclusive);
   return markets.map((market, i) => ({ ...market, ...vwaps[i] }));
 }
@@ -348,7 +363,8 @@ function poolLeg(p: AmmPoolVolume, native: string): Leg {
  *  2. for an asset they have none for, the pools against the native currency in the window: the base volume over the native
  *     volume of all of them together.
  * A pool against the native currency is converted to its own native volume; the others through the rate of their base, else
- * of their counter; a pool with no rate for either asset is dropped.
+ * of their counter; a pool with no rate for either asset is dropped. Only the pools that are not against the native currency
+ * use a rate, so only the markets of their two assets are read, and none when there is no such pool.
  */
 async function ammComponents(
   ch: ClickHouseService,
@@ -363,14 +379,22 @@ async function ammComponents(
   const pools = (await ammPoolVolumes(ch, range)).map((p) => poolLeg(p, native));
   if (pools.length === 0) return [];
 
-  const nativeRate = nativeRatesOf(await tradeLegs(rates, config, from, toExclusive), native);
+  const needed = new Set<string>();
+  for (const p of pools) {
+    if (!isNative(p.counter, native)) {
+      needed.add(assetKey(p.base));
+      needed.add(assetKey(p.counter));
+    }
+  }
+  const nativeRate = nativeRatesOf(await tradeLegs(rates, config, from, toExclusive, needed), native);
   const fromPools = new Map<string, { base: BigNumber; native: BigNumber }>();
   for (const p of pools) {
     if (!isNative(p.counter, native) || !p.counterVolume.gt(0)) continue;
     const sums = fromPools.get(assetKey(p.base)) ?? { base: ZERO, native: ZERO };
     fromPools.set(assetKey(p.base), { base: sums.base.plus(p.baseVolume), native: sums.native.plus(p.counterVolume) });
   }
-  for (const [key, sums] of fromPools) if (!nativeRate.has(key)) nativeRate.set(key, ratio(sums.base, sums.native));
+  for (const [key, sums] of fromPools)
+    if (!nativeRate.get(key)?.gt(0)) nativeRate.set(key, ratio(sums.base, sums.native));
 
   return convertLegs(pools, nativeRate, native)
     .filter((c) => c.converted.gt(0))
@@ -652,7 +676,10 @@ export async function computeLiveVolumeSet(
   return components.length;
 }
 
-/** The live sets of every metric, every period (trade and AMM: hour, day, 3day, 7day, 30day; payment: hour, day), one after the other. */
+/**
+ * The live sets of every metric, every period (trade and AMM: hour, day, 3day, 7day, 30day; payment: hour, day), one after the
+ * other.
+ */
 export async function computeLiveVolumes(
   ch: ClickHouseService,
   rates: RatesService,
