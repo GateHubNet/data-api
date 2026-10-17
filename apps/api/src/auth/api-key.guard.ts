@@ -3,6 +3,7 @@ import { Request } from 'express';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { UNAUTHORIZED_MESSAGE } from '../common/ripple-error.filter';
 import { ApiConfig, apiKeysOf } from '../config/api.config';
+import { presentedApiKey } from './presented-key';
 
 const digest = (key: string): Buffer => createHash('sha256').update(key).digest();
 
@@ -40,19 +41,11 @@ export class ApiKeyGuard implements CanActivate {
     const req = context.switchToHttp().getRequest<Request>();
     if (this.openPaths.some((re) => re.test(req.path))) return true;
 
-    const presented = this.extractKey(req);
+    const presented = presentedApiKey(req);
     if (!presented || !this.isValid(presented)) {
       throw new UnauthorizedException(UNAUTHORIZED_MESSAGE);
     }
     return true;
-  }
-
-  private extractKey(req: Request): string | undefined {
-    const header = req.header('x-api-key');
-    if (header) return header.trim();
-    const auth = req.header('authorization');
-    if (auth?.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
-    return undefined;
   }
 
   /** Constant-time comparison against every configured key. */

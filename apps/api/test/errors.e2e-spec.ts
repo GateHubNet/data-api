@@ -1,5 +1,5 @@
 import { apiKeysOf } from '../src/config/api.config';
-import { Harness, startHarness } from './harness';
+import { Harness, startHarness, TEST_API_KEY } from './harness';
 
 const controllers = async () => (await import('./test-controllers')).TEST_CONTROLLERS;
 
@@ -282,6 +282,83 @@ describe('the Ripple error contract on the toolbox bootstrap', () => {
       for (let i = 0; i < 5; i++) {
         expect((await h.http().get('/liveliness/healthz').set('X-Forwarded-For', '203.0.113.50')).status).toBe(200);
       }
+    });
+  });
+
+  describe('with per-key limits (GH_RATE_LIMIT_KEYS)', () => {
+    // A key's budget is shared by every request that carries it, so each test gets an app (and budget) of its own.
+    const LISTED = 'explorer-key';
+    const ENV = {
+      GH_API_KEYS: `test-key,${LISTED}`,
+      GH_RATE_LIMIT_KEYS: `${LISTED}=3`,
+      GH_RATE_LIMIT: '2',
+      GH_RATE_LIMIT_WINDOW: '60',
+    };
+    let h: Harness;
+    const start = async (env: Record<string, string> = ENV) => {
+      h = await startHarness({ controllers, env });
+    };
+    afterEach(async () => {
+      await h?.close();
+    });
+
+    /** GET /v2/test/ok with `X-API-Key` from the client address `ip`. */
+    const as = (key: string, ip: string) =>
+      h.http().get('/v2/test/ok').set('X-API-Key', key).set('X-Forwarded-For', ip);
+
+    it('a listed key shares one budget across client addresses', async () => {
+      await start();
+      for (const ip of ['203.0.113.30', '203.0.113.31', '203.0.113.32']) {
+        expect((await as(LISTED, ip)).status).toBe(200);
+      }
+      const limited = await as(LISTED, '203.0.113.33');
+      expect(limited.status).toBe(429);
+      expect(limited.headers['x-ratelimit-limit']).toBe('3');
+      expect(limited.body).toEqual({ error: expect.stringMatching(/^Rate limit exceeded, retry in \d+\.\d{2}sec$/) });
+    });
+
+    it('X-API-Key and Authorization: Bearer are the same budget', async () => {
+      await start();
+      const withHeader = () => h.http().get('/v2/test/ok').set('X-API-Key', LISTED);
+      const withBearer = () => h.http().get('/v2/test/ok').set('Authorization', `Bearer ${LISTED}`);
+      expect((await withHeader()).status).toBe(200);
+      expect((await withHeader()).status).toBe(200);
+      expect((await withBearer()).status).toBe(200);
+      expect((await withBearer()).status).toBe(429);
+      expect((await withHeader()).status).toBe(429);
+    });
+
+    it('an unlisted key keeps per-address budgets', async () => {
+      await start();
+      expect((await as(TEST_API_KEY, '203.0.113.40')).status).toBe(200);
+      expect((await as(TEST_API_KEY, '203.0.113.40')).status).toBe(200);
+      const limited = await as(TEST_API_KEY, '203.0.113.40');
+      expect(limited.status).toBe(429);
+      expect(limited.headers['x-ratelimit-limit']).toBe('2');
+      expect((await as(TEST_API_KEY, '203.0.113.41')).status).toBe(200);
+    });
+
+    it('the liveliness probe is not throttled for a listed key', async () => {
+      await start();
+      for (let i = 0; i < 5; i++) {
+        expect((await h.http().get('/liveliness/healthz').set('X-API-Key', LISTED)).status).toBe(200);
+      }
+    });
+
+    it('a key limit below GH_RATE_LIMIT wins', async () => {
+      await start({ ...ENV, GH_RATE_LIMIT_KEYS: `${LISTED}=1`, GH_RATE_LIMIT: '600' });
+      expect((await as(LISTED, '203.0.113.50')).status).toBe(200);
+      const limited = await as(LISTED, '203.0.113.50');
+      expect(limited.status).toBe(429);
+      expect(limited.headers['x-ratelimit-limit']).toBe('1');
+    });
+  });
+
+  describe('with an invalid GH_RATE_LIMIT_KEYS', () => {
+    it('the app does not boot when it lists a key that is not in GH_API_KEYS', async () => {
+      await expect(
+        startHarness({ controllers, env: { GH_API_KEYS: 'test-key,explorer-key', GH_RATE_LIMIT_KEYS: 'zz=3' } }),
+      ).rejects.toThrow('GH_RATE_LIMIT_KEYS entry 1 names a key that is not in GH_API_KEYS');
     });
   });
 
