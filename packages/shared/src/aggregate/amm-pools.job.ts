@@ -153,7 +153,7 @@ const POOL_VERSIONS_SQL = `SELECT amm_account, toUInt64(max(version)) AS newest
 const isNative = (currency: string, issuer: string, nativeCurrency: string): boolean =>
   currency === nativeCurrency && issuer === '';
 
-const decimalOf = (reserve: string | null): BigNumber | undefined => {
+export const decimalOf = (reserve: string | null): BigNumber | undefined => {
   if (reserve === null) return undefined;
   const value = new BigNumber(reserve);
   return value.isFinite() ? value : undefined;
@@ -164,10 +164,23 @@ const finiteOrNull = (value: BigNumber): number | null => {
   return Number.isFinite(number) ? number : null;
 };
 
+/**
+ * What a pool's value is written to: a row of `amm_pools`, or a day of `amm_daily` (which has no `deleted` column of its own, so
+ * its caller says whether the pool was deleted at the end of the day).
+ */
+export interface ValueTarget {
+  deleted: number;
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  value_native: number | null;
+}
+
 /** The pool a value is worked out for. */
-interface Valued {
-  row: AmmPoolsRow;
-  /** The UTC day, in unix seconds, of the pool's newest state: the day of the rate. */
+export interface Valued {
+  row: ValueTarget;
+  /** The UTC day, in unix seconds, of the rate: that of the pool's newest state (`amm_pools`), or the day itself (`amm_daily`). */
   dayStart: number;
   base: { asset: Asset; reserve?: BigNumber };
   counter: { asset: Asset; reserve?: BigNumber };
@@ -212,9 +225,14 @@ async function ratesOn(
  * Sets `value_native` of the pools (spec section 3): 2 × the native reserve when the pool has the native currency, else the
  * rate-based value of the first asset, base then counter, that has a reserve and a rate. The counter's rate is only asked for
  * the pools whose base has none.
- * A deleted pool keeps `null`.
+ * A deleted pool keeps `null`. Shared by `amm_pools` (the rate of the day of the newest state) and `amm_daily` (the rate of the
+ * day, the reserves those of its close).
  */
-async function valueNative(rates: RatesService, pools: Valued[], signal: AbortSignal | undefined): Promise<void> {
+export async function valueNative(
+  rates: RatesService,
+  pools: Valued[],
+  signal: AbortSignal | undefined,
+): Promise<void> {
   const rated = (pool: Valued, side: Valued['base'], rate: BigNumber | undefined): boolean => {
     if (!side.reserve || !rate || !rate.gt(0)) return false;
     pool.row.value_native = finiteOrNull(ratio(side.reserve.times(2), rate));

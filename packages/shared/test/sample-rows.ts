@@ -427,6 +427,7 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     lp_supply: '22881.5',
     trading_fee: 500,
     value_native: 2000,
+    final: 1,
     config_version: 3,
     version: 1,
   },

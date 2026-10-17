@@ -28,12 +28,15 @@ export function aggregatorOptions(
   // one service for both: the volume jobs and the value of a pool read the same trades
   const rates = new RatesService(ch, profile.nativeCurrency);
   logger.log('AMM pools job on: the current state of every pool, from amm_pool_states');
-  return { volumes: { rates, markets }, ammPools: { rates } };
+  logger.log(
+    'AMM daily job on: the per-day stats of every pool, from the exchanges, the liquidity and the pool states',
+  );
+  return { volumes: { rates, markets }, ammPools: { rates }, ammDaily: { rates } };
 }
 
 /**
  * The `aggregator` worker: the `AggregatorService`, which keeps `stats_hourly`, the volume tables (`volume_live`,
- * `volume_daily`) and `amm_pools` up to date once a minute. It needs what the global core module provides (`ClickHouseService`,
+ * `volume_daily`), `amm_pools` and `amm_daily` up to date (the last one every fifth tick of a minute). It needs what the global core module provides (`ClickHouseService`,
  * `PrometheusService`, `ShutdownSignals`, `NETWORK_PROFILE`), so it imports nothing.
  */
 @Module({

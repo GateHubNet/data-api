@@ -74,11 +74,17 @@ describe('AggregatorModule', () => {
     }
     // and so is the AMM pools job, which has nothing to rebuild over an empty database
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+    // and the AMM daily job, which runs at the first tick: today and yesterday, each a sentinel without any pool
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_daily' });
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     const written = insert.mock.calls.map(([table]) => table);
     expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(7);
     expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(4);
     expect(written).not.toContain(Table.AmmPools);
+    const days = insert.mock.calls.filter(([table]) => table === Table.AmmDaily);
+    expect(
+      days.map(([, rows]) => (rows as Array<{ day: string; amm_account: string }>).map((r) => [r.day, r.amm_account])),
+    ).toEqual([[['2026-10-16', '']], [['2026-10-15', '']]]);
 
     await app.close();
     await jest.advanceTimersByTimeAsync(5 * 60_000);

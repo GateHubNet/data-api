@@ -440,7 +440,13 @@ export interface AmmPoolsRow {
   version: UInt64Value;
 }
 
-/** One UTC day of a pool with activity, plus its closing state. The fee amounts are estimates. */
+/**
+ * One UTC day of a pool with activity, plus its closing state. The fee amounts are estimates.
+ *
+ * A day is a version set: its pool rows and its sentinel row (`amm_account` `''`, empty assets, `'0'` amounts and 0 counts, null
+ * state) carry the same `version`. A reader takes the version of the day from the sentinel and keeps the pool rows with it
+ * (never the sentinel, and never a row of an older set: a pool that had no activity in the newer set has no row in it).
+ */
 export interface AmmDailyRow {
   amm_account: string;
   /** `'YYYY-MM-DD'` */
@@ -466,6 +472,8 @@ export interface AmmDailyRow {
   lp_supply: string | null;
   trading_fee: number | null;
   value_native: number | null;
+  /** 1 on the sentinel of a set made once the ingest had passed the day (a final set), 0 on every other row. */
+  final: number;
   config_version: number;
   version: UInt64Value;
 }

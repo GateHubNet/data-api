@@ -407,6 +407,40 @@ describe('migrations (e2e)', () => {
         ]);
       });
 
+      it('gives amm_daily the columns of a day, in order: the finality flag of the sentinel is a UInt8 before the versions', async () => {
+        const cols = await svc.query<{ name: string; type: string }>(
+          `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,
+          { db: 'xahau', t: Table.AmmDaily },
+        );
+        expect(cols.map((c) => [c.name, c.type])).toEqual([
+          ['amm_account', 'String'],
+          ['day', 'Date'],
+          ['base_currency', 'LowCardinality(String)'],
+          ['base_issuer', 'String'],
+          ['counter_currency', 'LowCardinality(String)'],
+          ['counter_issuer', 'String'],
+          ['swap_count', 'UInt64'],
+          ['volume_base', 'String'],
+          ['volume_counter', 'String'],
+          ['fees_base_est', 'String'],
+          ['fees_counter_est', 'String'],
+          ['deposit_count', 'UInt64'],
+          ['withdraw_count', 'UInt64'],
+          ['liquidity_in_base', 'String'],
+          ['liquidity_in_counter', 'String'],
+          ['liquidity_out_base', 'String'],
+          ['liquidity_out_counter', 'String'],
+          ['reserve_base', 'Nullable(String)'],
+          ['reserve_counter', 'Nullable(String)'],
+          ['lp_supply', 'Nullable(String)'],
+          ['trading_fee', 'Nullable(UInt16)'],
+          ['value_native', 'Nullable(Float64)'],
+          ['final', 'UInt8'],
+          ['config_version', 'UInt32'],
+          ['version', 'UInt64'],
+        ]);
+      });
+
       it('types the values of a pool state as Nullable, so a reader can tell "unchanged" from a value', async () => {
         const cols = await svc.query<{ name: string; type: string }>(
           `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,

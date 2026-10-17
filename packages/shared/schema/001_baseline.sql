@@ -619,6 +619,10 @@ ORDER BY amm_account;
 
 -- One row per pool and UTC day with activity, with the closing state of the pool. volume_* are the amounts that went
 -- into the pool by side, fees_*_est are estimates, liquidity_in_* and liquidity_out_* the deposited and withdrawn amounts.
+-- A day is one version set: the pool rows and a sentinel row (amm_account '', empty assets, zero amounts, NULL state) carry
+-- the same version, and a reader takes the version of the day from the sentinel (a primary key prefix read) and keeps the pool
+-- rows with that version, never the sentinel itself. final is 1 on the sentinel of a set that was made once the ingest had
+-- passed the day (0 on every other row); config_version is the version of the computation that made the set.
 CREATE TABLE IF NOT EXISTS amm_daily
 (
   amm_account           String,
@@ -643,6 +647,7 @@ CREATE TABLE IF NOT EXISTS amm_daily
   lp_supply             Nullable(String),
   trading_fee           Nullable(UInt16),
   value_native          Nullable(Float64),
+  final                 UInt8,
   config_version        UInt32,
   version               UInt64
 )

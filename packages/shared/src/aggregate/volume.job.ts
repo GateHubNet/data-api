@@ -412,11 +412,11 @@ function setRows(
 
 /**
  * The version of the next set of a (metric, day|period): the ClickHouse clock in milliseconds, but one past the newest
- * version the set has now.
+ * version the set has now. (`amm_daily` takes its versions the same way, from the sentinel row of the day.)
  */
-async function nextVersion(
+export async function nextVersion(
   ch: ClickHouseService,
-  table: Table.VolumeDaily | Table.VolumeLive,
+  table: Table.VolumeDaily | Table.VolumeLive | Table.AmmDaily,
   where: string,
   params: Record<string, unknown>,
 ): Promise<number> {
@@ -428,7 +428,7 @@ async function nextVersion(
 }
 
 /** The start of the UTC day of a date, unix seconds; an invalid date is a `RangeError`. */
-function dayStartSeconds(date: Date): number {
+export function dayStartSeconds(date: Date): number {
   const ms = date.getTime();
   if (Number.isNaN(ms)) throw new RangeError('Invalid date');
   return Math.floor(ms / 1000 / DAY_SECONDS) * DAY_SECONDS;
