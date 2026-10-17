@@ -55,6 +55,8 @@ interface Node {
 }
 
 const LSF_AMM_NODE = 0x01000000;
+const LSF_LOW_RESERVE = 0x00010000;
+const LSF_HIGH_RESERVE = 0x00020000;
 
 const manifest = JSON.parse(readFileSync(join(DIR, 'manifest.json'), 'utf8')) as Manifest;
 const source = FixtureLedgerSource.fromDir(DIR);
@@ -81,6 +83,13 @@ function nodesOf(t: RawTransaction): Node[] {
 
 const poolRoots = (nodes: Node[]) => nodes.filter((n) => n.type === 'AccountRoot' && n.fields.AMMID);
 const ammNodes = (nodes: Node[]) => nodes.filter((n) => n.type === 'AMM');
+/** The pool side of an `lsfAMMNode` line: the side whose reserve bit is set. Undefined when neither bit is set. */
+const poolSide = (line: Node): string | undefined => {
+  const flags = line.fields.Flags as number;
+  if (flags & LSF_LOW_RESERVE) return line.fields.LowLimit.issuer;
+  if (flags & LSF_HIGH_RESERVE) return line.fields.HighLimit.issuer;
+  return undefined;
+};
 const poolLines = (nodes: Node[]) =>
   nodes.filter((n) => n.type === 'RippleState' && ((n.fields.Flags as number) & LSF_AMM_NODE) !== 0);
 
@@ -131,8 +140,7 @@ describe('xrpl/amm fixtures', () => {
       expect(ammNodes(nodes)).toHaveLength(0);
       const lines = poolLines(nodes);
       expect(lines).toHaveLength(2);
-      const pools = lines.map((l) => [l.fields.LowLimit.issuer, l.fields.HighLimit.issuer]);
-      expect(pools[0].filter((a) => pools[1].includes(a))).toEqual(['rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb']);
+      expect(lines.map(poolSide)).toEqual(['rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb', 'rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb']);
       for (const line of lines) expect(line.op).toBe('ModifiedNode');
     });
 
@@ -185,6 +193,30 @@ describe('xrpl/amm fixtures', () => {
       expect(ammNodes(nodes).map((n) => n.op)).toEqual(['DeletedNode']);
       expect(poolRoots(nodes).map((n) => n.op)).toEqual(['DeletedNode']);
       expect(poolLines(nodes).map((n) => n.op)).toEqual(['DeletedNode']);
+    });
+
+    it.each([
+      'swap_payment_xrp_iou',
+      'swap_offercreate_xrp_iou',
+      'payment_two_pools',
+      'payment_pool_and_book',
+      'offercreate_autobridged_pool_leg',
+      'deposit_two_asset',
+      'swap_issuer_transfer_rate',
+      'create',
+    ])('%s: the reserve bit of every lsfAMMNode line points at a pool named by an AccountRoot', async (name) => {
+      const nodes = nodesOf(await transactionOf(name));
+      const roots = poolRoots(nodes).map((n) => n.fields.Account);
+      const lines = poolLines(nodes);
+      expect(lines.length).toBeGreaterThan(0);
+      for (const line of lines) expect(roots).toContain(poolSide(line));
+    });
+
+    it('a deleted lsfAMMNode line has no reserve bit left, so the pool side cannot be read from it', async () => {
+      const [line] = poolLines(nodesOf(await transactionOf('withdraw_all_deletes_pool')));
+      expect(line.op).toBe('DeletedNode');
+      expect(line.fields.Flags).toBe(LSF_AMM_NODE);
+      expect(poolSide(line)).toBeUndefined();
     });
 
     it('create: the AMM node, the pool AccountRoot and the pool trust line are created', async () => {

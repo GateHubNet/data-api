@@ -21,7 +21,8 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
   binary-codec fallback of the network profile; copy it there again after re-recording).
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
-  transaction hash) and which were not.
+  transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
+  `{ledger, type, result}`). `xrpl/amm/` also has a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -41,8 +42,10 @@ checked. Requests are sequential, with a pause between ledgers, and throttling b
 `--txs` looks up each transaction with `tx`, takes its `ledger_index` and records that whole ledger like `--ledgers`
 does. A ledger that holds several of the hashes, or that `--ledgers` already recorded, is fetched once. The run stops
 naming the hash when the node answers `txnNotFound`, when the transaction is not in a validated ledger yet, or when the
-recorded ledger does not contain it. The manifest gets a `txs` map (hash to `{ledger, type, result}`), and a `cases`
-object that is already in the manifest of `--out` is carried over, so hand-written case names survive re-recording.
+recorded ledger does not contain it. The manifest gets a `txs` map (hash to `{ledger, type, result}`). What an earlier run
+left in the manifest of `--out` is merged in, so adding one hash to a directory keeps the rest: its `cases` (hand-written
+case names), its `txs` and its `ledgers` (the last two only while the `<index>.json.gz` files are still there). The other
+keys describe the current run.
 
 ### XRPL (`xrpl/recorded/`)
 
@@ -117,14 +120,22 @@ pools the `AccountRoot` is in every swap that crosses the pool (1,982 of 1,982 X
 1,992 XRP/USD GateHub). Pool detection by `AccountRoot`-with-`AMMID` or `AMM` node (spec section 2.1) therefore finds no
 pool in an IOU/IOU swap; the `lsfAMMNode` flag on a `RippleState` does.
 
+**Which side of an `lsfAMMNode` line is the pool:** the side whose reserve bit is set. `lsfLowReserve` (0x10000) means
+`LowLimit.issuer`, `lsfHighReserve` (0x20000) means `HighLimit.issuer`. In the fixtures the bit always points at the pool
+(`swap_iou_iou` has 0x01010000 with the pool low; `payment_two_pools` and `create` have 0x01020000 with the pool high).
+This stays unambiguous for an IOU/IOU pool whose two assets share one issuer, where the two lines name the same issuer
+besides the pool and intersecting the accounts of the two lines could not tell them apart. A `DeletedNode` line has no
+reserve bit left (`withdraw_all_deletes_pool` has Flags 0x01000000), so for a deleted line the pool has to come from the
+`AMM` node or the `AccountRoot` of the same transaction.
+
 Other facts the fixtures show:
 
 - Single-asset XRP deposits and withdrawals (`deposit_single_asset`, `withdraw_single_asset`) have the `AMM` node, the pool
   `AccountRoot` and the LP's LP-token line, but no `lsfAMMNode` line. `vote` has only the `AMM` node and the voter's
   `AccountRoot`; `bid` the `AMM` node, the bidder's `AccountRoot` and LP-token line. The `bid` transaction lists `Asset` USD
   and `Asset2` XRP, so the transaction's asset order is not the canonical pair order.
-- `withdraw_all_deletes_pool`: the `AMM` node, the pool `AccountRoot` and the pool's trust line (Flags 0x01000000) are
-  `DeletedNode`. `create`: the same three are `CreatedNode`.
+- `withdraw_all_deletes_pool`: the `AMM` node, the pool `AccountRoot` and the pool's trust line (Flags 0x01000000, no
+  reserve bit) are `DeletedNode`. `create`: the same three are `CreatedNode`.
 - `lp_token_transfer` has no `AMM` node, no pool `AccountRoot` and no `lsfAMMNode` line, only two LP-token `RippleState`
   nodes with the pool as issuer. The pool detection above sees no pool here; the movement shows in `balance_changes` only.
 - `swap_issuer_transfer_rate`: the GateHub USD issuer has `TransferRate` 1002000000. The pool's USD line moves by 83.28354047857

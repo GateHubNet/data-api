@@ -110,7 +110,7 @@
       "ledger": 102186243,
       "hash": "B9C56D941C726140DCDE385A5045EDF976745F434153EA49908AAE92969B1469",
       "type": "Payment",
-      "note": "Payment through the IOU/IOU pool RLUSD/USDC rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb: pool -22.2147 USDC, +22.1965 RLUSD. The pool AccountRoot is NOT in the metadata and there is no AMM node; the pool is named only by two lsfAMMNode RippleState nodes (one per asset). See FINDINGS.md."
+      "note": "Payment through the IOU/IOU pool RLUSD/USDC rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb: pool -22.2147 USDC, +22.1965 RLUSD. The pool AccountRoot is NOT in the metadata and there is no AMM node; the pool is named only by two lsfAMMNode RippleState nodes (one per asset). See test/fixtures/README.md, section \"XRPL AMM cases (xrpl/amm/)\"."
     },
     "payment_two_pools": {
       "ledger": 107636673,

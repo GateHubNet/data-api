@@ -28,6 +28,7 @@ function rippledError(error: string, message: string): Error {
  */
 function stubNode(txs: StubTx[], head = 1000) {
   const calls: Record<string, unknown>[] = [];
+  const times: number[] = [];
   const ledgerOf = (index: number) => ({
     ledger: {
       ledger_index: String(index),
@@ -47,6 +48,7 @@ function stubNode(txs: StubTx[], head = 1000) {
     disconnect: async () => undefined,
     request: async (command) => {
       calls.push(command);
+      times.push(Date.now());
       switch (command.command) {
         case 'server_info':
           return { info: { validated_ledger: { seq: head } } };
@@ -70,7 +72,7 @@ function stubNode(txs: StubTx[], head = 1000) {
       }
     },
   };
-  return { node, calls, commands: (name: string) => calls.filter((c) => c.command === name) };
+  return { node, calls, times, commands: (name: string) => calls.filter((c) => c.command === name) };
 }
 
 describe('record-fixtures', () => {
@@ -225,6 +227,85 @@ describe('record-fixtures', () => {
       const manifest = readJson('manifest.json');
       expect(manifest.cases).toEqual(cases);
       expect(manifest.found).toEqual({});
+    });
+
+    it('adds to the manifest of an earlier run: the txs, ledgers and cases of both runs are kept', async () => {
+      const { node } = stubNode([
+        { hash: HASH_A, ledger: 500, type: 'AMMDeposit' },
+        { hash: HASH_B, ledger: 600, type: 'Payment' },
+      ]);
+      await recordFixtures(options({ txs: [HASH_A] }), node, silent);
+      const cases = { deposit_two_asset: { ledger: 500, hash: HASH_A, type: 'AMMDeposit', note: 'hand-written' } };
+      writeFileSync(join(out, 'manifest.json'), JSON.stringify({ ...readJson('manifest.json'), cases }));
+
+      const run = await recordFixtures(options({ txs: [HASH_B] }), node, silent);
+
+      expect(run.failure).toBeUndefined();
+      const manifest = readJson('manifest.json');
+      expect(manifest.txs).toEqual({
+        [HASH_A]: { ledger: 500, type: 'AMMDeposit', result: 'tesSUCCESS' },
+        [HASH_B]: { ledger: 600, type: 'Payment', result: 'tesSUCCESS' },
+      });
+      expect(manifest.ledgers.map((l: { ledger: number }) => l.ledger)).toEqual([500, 600]);
+      expect(manifest.cases).toEqual(cases);
+      expect(readdirSync(out).filter((f) => f.endsWith('.json.gz'))).toEqual(['500.json.gz', '600.json.gz']);
+    });
+
+    it('records a ledger of an earlier run again without listing it twice', async () => {
+      const { node } = stubNode([{ hash: HASH_A, ledger: 500 }]);
+      await recordFixtures(options({ txs: [HASH_A] }), node, silent);
+
+      await recordFixtures(options({ ledgers: [500], txs: [HASH_A] }), node, silent);
+
+      const manifest = readJson('manifest.json');
+      expect(manifest.ledgers.map((l: { ledger: number }) => l.ledger)).toEqual([500]);
+      expect(Object.keys(manifest.txs)).toEqual([HASH_A]);
+    });
+
+    it('drops an earlier ledger whose file is gone, with its txs, and says so', async () => {
+      const { node } = stubNode([
+        { hash: HASH_A, ledger: 500 },
+        { hash: HASH_B, ledger: 600 },
+        { hash: HASH_C, ledger: 700 },
+      ]);
+      await recordFixtures(options({ txs: [HASH_A, HASH_B] }), node, silent);
+      rmSync(join(out, '500.json.gz'));
+      const warnings: string[] = [];
+
+      await recordFixtures(options({ txs: [HASH_C] }), node, { ...silent, warn: (m) => warnings.push(m) });
+
+      const manifest = readJson('manifest.json');
+      expect(manifest.ledgers.map((l: { ledger: number }) => l.ledger)).toEqual([600, 700]);
+      expect(Object.keys(manifest.txs).sort()).toEqual([HASH_B, HASH_C].sort());
+      expect(warnings.join('\n')).toContain('500');
+    });
+
+    it('starts a fresh manifest, with a warning, when the earlier one is not valid JSON', async () => {
+      writeFileSync(join(out, 'manifest.json'), '{ not json');
+      const { node } = stubNode([{ hash: HASH_A, ledger: 500 }]);
+      const warnings: string[] = [];
+
+      const run = await recordFixtures(options({ txs: [HASH_A] }), node, { ...silent, warn: (m) => warnings.push(m) });
+
+      expect(run.failure).toBeUndefined();
+      expect(warnings.join('\n')).toMatch(/not valid JSON/);
+      expect(Object.keys(readJson('manifest.json').txs)).toEqual([HASH_A]);
+    });
+
+    it('pauses --delay-ms after every tx lookup and every ledger fetch', async () => {
+      const { node, calls, times } = stubNode([
+        { hash: HASH_A, ledger: 500 },
+        { hash: HASH_B, ledger: 500 },
+        { hash: HASH_C, ledger: 600 },
+      ]);
+
+      await recordFixtures(options({ txs: [HASH_A, HASH_B, HASH_C], delayMs: 40 }), node, silent);
+
+      const spaced = calls
+        .map((c, i) => ({ command: c.command, at: times[i] }))
+        .filter((c) => c.command === 'tx' || c.command === 'ledger');
+      expect(spaced.map((c) => c.command)).toEqual(['tx', 'ledger', 'tx', 'tx', 'ledger']);
+      for (let i = 1; i < spaced.length; i++) expect(spaced[i].at - spaced[i - 1].at).toBeGreaterThanOrEqual(35);
     });
   });
 

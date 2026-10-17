@@ -14,15 +14,16 @@
  * `--txs` looks each transaction up with `tx`, takes its `ledger_index` and records that whole ledger, the same way
  * `--ledgers` does (a ledger holding several of the transactions, or also listed in `--ledgers`, is fetched once). The
  * lookup must be validated and the recorded ledger must contain the hash, else the run stops naming it. The manifest gets
- * a `txs` map: hash -> { ledger, type, result }. A `cases` object already in the manifest of `--out` is carried over, so
- * hand-written case names survive a re-recording.
+ * a `txs` map: hash -> { ledger, type, result }. What an earlier run left in the manifest of `--out` is merged in, so a run
+ * that adds to the directory keeps the rest: its `cases` (hand-written case names), its `txs` and its `ledgers` (the
+ * latter two only while the `<index>.json.gz` files are still there). Everything else describes the current run.
  *
  * `--want` walks back from the validated head, one ledger at a time, and keeps a ledger only when it holds a wanted
  * TransactionType that has not been found yet. It stops when every wanted type is found or `--scan` ledgers have been
  * checked. A type counts as found on its first `tesSUCCESS` transaction unless `--any-result` is given.
  * Requests are sequential with a small delay so public servers are not hammered. Missing types are not an error.
  */
-import { mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { Client } from 'xrpl';
 import { gzipSync } from 'zlib';
@@ -181,20 +182,51 @@ function errorText(err: unknown): string {
   }
 }
 
-/** The hand-written `cases` of a manifest from an earlier run, so a re-recording does not wipe them. */
-function readCases(manifestPath: string, env: Pick<RecorderEnv, 'warn'>): unknown {
+interface EarlierManifest {
+  cases: unknown;
+  txs: Record<string, unknown>;
+  ledgers: { ledger: number }[];
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * What an earlier run left in `manifest.json` of `--out`, so a run that adds to the directory does not forget what is
+ * already there: the hand-written `cases`, the `txs` and the recorded `ledgers`. A ledger counts only while its
+ * `<index>.json.gz` is still in the directory, and a transaction only while its ledger does.
+ */
+function readEarlierManifest(dir: string, env: Pick<RecorderEnv, 'warn'>): EarlierManifest {
+  const none: EarlierManifest = { cases: undefined, txs: {}, ledgers: [] };
+  const manifestPath = join(dir, 'manifest.json');
   let text: string;
   try {
     text = readFileSync(manifestPath, 'utf8');
   } catch {
-    return undefined; // no earlier manifest
+    return none; // no earlier manifest
   }
+  let earlier: unknown;
   try {
-    return (JSON.parse(text) as { cases?: unknown }).cases;
+    earlier = JSON.parse(text);
   } catch (err) {
     env.warn(`WARNING: ${manifestPath} is not valid JSON (${errorText(err)}); not carrying anything over`);
-    return undefined;
+    return none;
   }
+  if (!isRecord(earlier)) return none;
+
+  const ledgers: { ledger: number }[] = [];
+  for (const entry of Array.isArray(earlier.ledgers) ? earlier.ledgers : []) {
+    if (!isRecord(entry) || !Number.isInteger(entry.ledger)) continue;
+    const index = entry.ledger as number;
+    if (existsSync(join(dir, `${index}.json.gz`))) ledgers.push({ ...entry, ledger: index });
+    else env.warn(`WARNING: ledger ${index} of the earlier manifest has no ${index}.json.gz; dropping it`);
+  }
+  const kept = new Set(ledgers.map((l) => l.ledger));
+  const txs: Record<string, unknown> = {};
+  for (const [hash, info] of Object.entries(isRecord(earlier.txs) ? earlier.txs : {})) {
+    if (isRecord(info) && kept.has(info.ledger as number)) txs[hash] = info;
+  }
+  return { cases: earlier.cases, txs, ledgers };
 }
 
 /** What the recorder needs from a node. `main` backs it with an `xrpl.Client`; tests pass a stub. */
@@ -349,6 +381,7 @@ export async function recordFixtures(
         },
         env,
       );
+      await sleep(options.delayMs);
       if (!lookup) {
         throw new Error(
           `transaction ${hash} not found on ${options.endpoint} (txnNotFound: unknown hash, or the node does not hold its ledger)`,
@@ -406,7 +439,9 @@ export async function recordFixtures(
   }
 
   const missing = options.want.filter((type) => !found.has(type));
-  const cases = readCases(join(options.out, 'manifest.json'), env);
+  const earlier = readEarlierManifest(options.out, env);
+  const ledgers = new Map<number, { ledger: number }>(earlier.ledgers.map((l) => [l.ledger, l]));
+  for (const entry of recorded) ledgers.set(entry.ledger, entry);
   const manifest = {
     network: options.network,
     endpoint: options.endpoint,
@@ -420,9 +455,9 @@ export async function recordFixtures(
     server_definitions: hasDefinitions,
     found: Object.fromEntries([...found.entries()].sort(([a], [b]) => a.localeCompare(b))),
     missing,
-    txs: txInfo,
-    ...(cases === undefined ? {} : { cases }),
-    ledgers: recorded.sort((a, b) => a.ledger - b.ledger),
+    txs: { ...earlier.txs, ...txInfo },
+    ...(earlier.cases === undefined ? {} : { cases: earlier.cases }),
+    ledgers: [...ledgers.values()].sort((a, b) => a.ledger - b.ledger),
   };
   // A run that died before recording anything must not overwrite the manifest of an earlier good run.
   const writeManifest = failure === undefined || recorded.length > 0;
