@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AMM pools</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.xp{--bg:#F5F6F8;--surface:#FFFFFF;--sunken:#EEF0F3;--border:#E1E4E9;--border-strong:#CDD2D9;--fg:#0F1217;--muted:#4F5864;--faint:#646D7A;--link:var(--accent);--grid:#EEF0F3;--axis:#CDD2D9;--s1:#2a78d6;font-family:'Geist',ui-sans-serif,system-ui,sans-serif;color:var(--fg);background:var(--bg);min-height:100vh;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+.xp.dark{--bg:#0B0E12;--surface:#12161C;--sunken:#181D24;--border:#232A33;--border-strong:#323B46;--fg:#E7EBF0;--muted:#A3ACB9;--faint:#8D97A5;--link:color-mix(in srgb,var(--accent) 55%,#ffffff);--grid:#1D232B;--axis:#323B46;--s1:#3987e5}
+.xp a{color:var(--link);text-decoration:none}
+.xp a:hover{text-decoration:underline}
+.xp button,.xp input{font:inherit;color:inherit}
+.xp :focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.mono{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.seg{border:0;background:transparent;padding:6px 12px;border-radius:7px;display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:500;color:var(--muted);min-height:32px;white-space:nowrap}
+.seg.on{background:var(--surface);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--border)}
+.segs{display:flex;padding:3px;background:var(--sunken);border:1px solid var(--border);border-radius:9px}
+.nav{padding:8px 10px;border-radius:7px;color:var(--muted)!important;font-weight:500;display:inline-flex;align-items:center}
+.nav:hover{background:var(--sunken);text-decoration:none!important;color:var(--fg)!important}
+.nav.cur{color:var(--fg)!important;background:var(--sunken)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px}
+.src{font-family:'Geist Mono',ui-monospace,monospace;font-size:11px;color:var(--faint)}
+.amt{font-family:'Geist Mono',ui-monospace,monospace;font-weight:500;font-variant-numeric:tabular-nums}
+.gl{position:absolute;left:0;right:0;border-top:1px solid var(--grid)}
+.gl.base{border-top-color:var(--axis)}
+.yl{position:absolute;right:10px;transform:translateY(50%);font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
+.xl{position:absolute;top:6px;transform:translateX(-50%);font-size:11px;color:var(--faint);white-space:nowrap}
+.col{flex:1 1 0;height:100%;display:flex;align-items:flex-end;justify-content:center;border:0;background:transparent;padding:0;min-width:0;cursor:default}
+.col:focus-visible{outline:2px solid var(--link);outline-offset:-2px;border-radius:4px}
+.bar{width:min(24px,64%);border-radius:4px 4px 0 0;background:var(--s1)}
+.col.dim .bar{opacity:.45}
+.tip{position:absolute;z-index:3;top:6px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:0 10px 28px -14px rgba(0,0,0,.4);padding:10px 12px;font-size:12px;min-width:150px;pointer-events:none;display:flex;flex-direction:column;gap:4px}
+.tip .k{display:inline-block;width:12px;height:2px;border-radius:1px;margin-right:8px;vertical-align:middle;background:var(--s1)}
+.tr{display:grid;grid-template-columns:var(--cols);align-items:center;column-gap:16px;padding:0 16px;min-height:58px;border-top:1px solid var(--border)}
+.th{min-height:40px;font-size:12px;font-weight:500;color:var(--faint);border-top:0}
+.tb .tr:hover{background:var(--sunken)}
+.r{text-align:right;justify-self:end}
+.sort{border:0;background:transparent;padding:6px 0;cursor:pointer;font-size:12px;font-weight:500;color:var(--faint);display:inline-flex;align-items:center;gap:4px;min-height:32px}
+.sort.on{color:var(--fg)}
+.pair{display:flex;align-items:center;gap:10px;min-width:0}
+.coins{display:flex;flex:none}
+.coin{width:26px;height:26px;border-radius:50%;background:var(--sunken);border:2px solid var(--surface);display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;font-family:'Geist Mono',ui-monospace,monospace;box-shadow:0 0 0 1px var(--border)}
+.coin + .coin{margin-left:-8px}
+.tag{font-size:11px;font-weight:500;padding:1px 6px;border-radius:5px;background:var(--sunken);border:1px solid var(--border);white-space:nowrap}
+.chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);cursor:pointer;min-height:40px}
+.chk input{width:16px;height:16px;accent-color:var(--accent)}
+</style>
+</helmet>
+<div class="xp {{themeClass}}" style="--accent: {{accentNow}};">
+
+<header style="background: var(--surface); border-bottom: 1px solid var(--border);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;">
+    <a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; color: var(--fg);" aria-label="Explorer home">
+      <svg aria-hidden="true" width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="8" style="fill: var(--accent)"></rect><path d="M8 10h7M8 14h12M8 18h9" stroke="#fff" stroke-width="2.2" stroke-linecap="round"></path></svg>
+      <span style="font-weight: 650; font-size: 17px; letter-spacing: -0.01em;">explorer</span>
+    </a>
+    <div role="group" aria-label="Network" class="segs">
+      <button type="button" class="seg {{xrplCls}}" aria-pressed="{{isXrpl}}" onClick="{{pickXrpl}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xrplDot}};"></span>XRPL</button>
+      <button type="button" class="seg {{xahauCls}}" aria-pressed="{{isXahau}}" onClick="{{pickXahau}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xahauDot}};"></span>Xahau</button>
+    </div>
+    <nav aria-label="Main" style="display: flex; flex-wrap: wrap; gap: 2px;">
+      <a class="nav" href="Ledger.dc.html">Ledgers</a>
+      <a class="nav" href="Transaction.dc.html">Transactions</a>
+      <a class="nav" href="Account.dc.html">Accounts</a>
+      <a class="nav" href="Network.dc.html">Network</a>
+      <a class="nav" href="Markets.dc.html">Markets</a>
+      <a class="nav cur" href="Amm.dc.html" aria-current="page">AMM</a>
+    </nav>
+    <form role="search" style="flex: 1 1 240px; display: flex; align-items: center; gap: 8px; background: var(--sunken); border: 1px solid var(--border); border-radius: 9px; padding: 0 12px; min-height: 40px;">
+      <label for="hdr-q" class="sr">Search</label>
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint); flex: none;"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+      <input id="hdr-q" type="search" placeholder="Address, hash, ledger or CTID" style="flex: 1 1 auto; min-width: 0; border: 0; outline: none; background: transparent; font-size: 13px;">
+    </form>
+  </div>
+</header>
+
+<main style="max-width: 1240px; margin: 0 auto; padding: 24px 20px 64px; display: flex; flex-direction: column; gap: 18px;">
+
+  <div style="display: flex; flex-direction: column; gap: 4px;">
+    <h1 style="margin: 0; font-size: 30px; letter-spacing: -0.02em; font-weight: 650;">AMM pools</h1>
+    <p style="margin: 0; color: var(--muted);">{{intro}}</p>
+  </div>
+
+  <sc-if value="{{isXahau}}" hint-placeholder-val="{{false}}">
+    <section class="card" style="padding: 40px 28px; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; max-width: 640px;">
+      <svg aria-hidden="true" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint);"><circle cx="8" cy="12" r="5"></circle><circle cx="16" cy="12" r="5"></circle></svg>
+      <h2 style="margin: 0; font-size: 18px; font-weight: 600;">Xahau has no AMM</h2>
+      <p style="margin: 0; color: var(--muted);">The AMM amendment is not part of Xahau, so there are no pools to show. Trades on Xahau are order-book crossings.</p>
+      <div style="display: flex; gap: 14px; flex-wrap: wrap;"><a href="Markets.dc.html" style="font-weight: 500;">See Xahau markets →</a><button type="button" onClick="{{pickXrpl}}" style="border: 0; background: transparent; color: var(--link); font-weight: 500; cursor: pointer; padding: 0; min-height: 32px;">Switch to XRPL pools</button></div>
+    </section>
+  </sc-if>
+
+  <sc-if value="{{isXrpl}}" hint-placeholder-val="{{true}}">
+    <div style="display: flex; flex-direction: column; gap: 18px;">
+
+      <div role="group" aria-label="Filters" style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;">
+        <div style="flex: 0 1 360px; display: flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0 12px; min-height: 40px;">
+          <label for="pool-q" class="sr">Pools containing</label>
+          <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint); flex: none;"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+          <input id="pool-q" type="search" value="{{q}}" onChange="{{onQ}}" placeholder="Pools containing a currency or issuer" style="flex: 1 1 auto; min-width: 0; border: 0; outline: none; background: transparent; font-size: 13px;">
+        </div>
+        <label class="chk"><input type="checkbox" checked="{{showDeleted}}" onChange="{{toggleDeleted}}">Include deleted pools</label>
+      </div>
+
+      <section aria-label="Totals" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+        <sc-for list="{{tiles}}" as="t" hint-placeholder-count="4">
+          <div class="card" style="padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;">
+            <span style="font-size: 12px; color: var(--faint); font-weight: 500;">{{t.label}}</span>
+            <span style="font-size: 24px; font-weight: 600; letter-spacing: -0.015em;">{{t.value}}</span>
+            <span style="font-size: 12px; color: var(--muted);">{{t.sub}}</span>
+          </div>
+        </sc-for>
+      </section>
+
+      <section class="card" aria-labelledby="av-title" style="padding: 16px 18px 12px; display: flex; flex-direction: column; gap: 12px;">
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <h2 id="av-title" style="margin: 0; font-size: 15px; font-weight: 600;">AMM swap volume per day, in XRP, last 30 days</h2>
+          <span class="src">/v2/network/amm_volume?interval=day</span>
+        </div>
+        <div style="display: flex;">
+          <div style="position: relative; width: 52px; flex: none;" aria-hidden="true"><div style="position: relative; height: 180px;"><sc-for list="{{axis}}" as="a" hint-placeholder-count="5"><span class="yl" style="bottom: {{a.pos}};">{{a.label}}</span></sc-for></div></div>
+          <div style="flex: 1 1 auto; min-width: 0;">
+            <div style="position: relative; height: 180px;" onMouseLeave="{{leave}}">
+              <sc-for list="{{axis}}" as="a" hint-placeholder-count="5"><span class="gl {{a.cls}}" style="bottom: {{a.pos}};"></span></sc-for>
+              <div style="position: absolute; inset: 0; display: flex; align-items: flex-end;">
+                <sc-for list="{{cols}}" as="c" hint-placeholder-count="30">
+                  <button type="button" class="col {{c.cls}}" aria-label="{{c.aria}}" onMouseEnter="{{c.enter}}" onFocus="{{c.enter}}" onBlur="{{leave}}"><span class="bar" style="height: {{c.h}};"></span></button>
+                </sc-for>
+              </div>
+              <sc-if value="{{tip.show}}" hint-placeholder-val="{{false}}">
+                <div class="tip" style="left: {{tip.left}}; transform: {{tip.tf}};"><span style="color: var(--faint);">{{tip.date}}</span><span><span class="k"></span><b class="amt">{{tip.v}} XRP</b></span><span style="color: var(--muted);">{{tip.n}} swaps</span></div>
+              </sc-if>
+            </div>
+            <div style="position: relative; height: 24px;" aria-hidden="true"><sc-for list="{{xls}}" as="x" hint-placeholder-count="5"><span class="xl" style="left: {{x.pos}};">{{x.label}}</span></sc-for></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="pl-title" style="overflow: hidden;">
+        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--border);">
+          <h2 id="pl-title" style="margin: 0; font-size: 15px; font-weight: 600;">Pools</h2>
+          <span class="src">/v2/amm/pools · ordered by value</span>
+        </div>
+        <div style="overflow-x: auto;">
+          <div role="table" aria-label="Pools" style="min-width: 1080px; --cols: minmax(200px, 1.4fr) 120px minmax(190px, 1.2fr) 80px 120px 120px 130px 96px;">
+            <div role="row" class="tr th">
+              <span role="columnheader">Pool</span>
+              <span role="columnheader" class="r" aria-sort="{{ariaVal}}"><button type="button" class="sort {{sortVal}}" onClick="{{byVal}}">Value (XRP){{arVal}}</button></span>
+              <span role="columnheader" class="r">Reserves</span>
+              <span role="columnheader" class="r" aria-sort="{{ariaFee}}"><button type="button" class="sort {{sortFee}}" onClick="{{byFee}}">Fee{{arFee}}</button></span>
+              <span role="columnheader" class="r" aria-sort="{{ariaVol}}"><button type="button" class="sort {{sortVol}}" onClick="{{byVol}}">Volume 24 h{{arVol}}</button></span>
+              <span role="columnheader" class="r">Fees 24 h, est.</span>
+              <span role="columnheader">Auction slot</span>
+              <span role="columnheader">Created</span>
+            </div>
+            <div class="tb">
+              <sc-for list="{{pools}}" as="p" hint-placeholder-count="9">
+                <div role="row" class="tr">
+                  <span role="cell" class="pair">
+                    <span class="coins" aria-hidden="true"><span class="coin">{{p.a1}}</span><span class="coin">{{p.a2}}</span></span>
+                    <span style="display: flex; flex-direction: column; min-width: 0;">
+                      <a href="AmmPool.dc.html" style="font-weight: 600; color: var(--fg);">{{p.pair}}</a>
+                      <span class="mono" style="font-size: 11.5px; color: var(--faint);">{{p.acct}}</span>
+                    </span>
+                    <sc-if value="{{p.deleted}}" hint-placeholder-val="{{false}}"><span class="tag">deleted</span></sc-if>
+                  </span>
+                  <span role="cell" class="r amt">{{p.value}}</span>
+                  <span role="cell" class="r amt" style="font-weight: 400; font-size: 13px; color: var(--muted); display: flex; flex-direction: column; align-items: flex-end;"><span>{{p.r1}}</span><span>{{p.r2}}</span></span>
+                  <span role="cell" class="r amt" style="font-weight: 400;">{{p.fee}}</span>
+                  <span role="cell" class="r amt">{{p.vol}}</span>
+                  <span role="cell" class="r amt" style="font-weight: 400; color: var(--muted);">{{p.fees}}</span>
+                  <span role="cell" class="mono" style="font-size: 12.5px; color: var(--muted);">{{p.slot}}</span>
+                  <span role="cell" class="num" style="font-size: 13px; color: var(--muted);">{{p.created}}</span>
+                </div>
+              </sc-for>
+              <sc-if value="{{empty}}" hint-placeholder-val="{{false}}"><div style="padding: 28px 16px; color: var(--faint); border-top: 1px solid var(--border);">No pools contain “{{q}}”.</div></sc-if>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; padding: 12px 16px; border-top: 1px solid var(--border); font-size: 12.5px; color: var(--faint);">
+          <span>Value is twice the XRP reserve, or twice a reserve at its daily XRP rate. Fees are estimates from each swap and the fee in force.</span>
+          <button type="button" style="border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 0 12px; min-height: 34px; cursor: pointer; font-weight: 500;">More pools →</button>
+        </div>
+      </section>
+    </div>
+  </sc-if>
+</main>
+
+<footer style="border-top: 1px solid var(--border); background: var(--surface);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 22px 20px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; font-size: 13px; color: var(--faint);">
+    <span>explorer · by GateHub</span>
+    <span>History from validated ledgers. Balances and account state read live from the network.</span>
+    <span style="display: flex; gap: 16px;"><a href="#">API</a><a href="#">Status</a><a href="#">Privacy</a></span>
+  </div>
+</footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["light","dark"],"default":"light"},"accent":{"editor":"color","options":["#2F5BEA","#0F766E","#6D28D9","#111827"],"default":"#2F5BEA","section":"Network colors"},"xahauAccent":{"editor":"color","options":["#B45309","#C2410C","#A16207"],"default":"#B45309","section":"Network colors"},"$preview":{"width":1440,"height":1650}}'>
+class Component extends DCLogic {
+  state = { net: 'xrpl', q: '', deleted: false, sort: 'val', dir: -1, hov: -1 };
+
+  renderVals() {
+    const dark = (this.props.theme ?? 'light') === 'dark';
+    const accent = this.props.accent ?? '#2F5BEA';
+    const xahauAccent = this.props.xahauAccent ?? '#B45309';
+    const x = this.state.net === 'xrpl';
+    const st = this.state;
+    const compact = (n) => { const a = Math.abs(n); if (a >= 1e9) return (n / 1e9).toFixed(2) + 'B'; if (a >= 1e6) return (n / 1e6).toFixed(2) + 'M'; if (a >= 1e3) return (n / 1e3).toFixed(1) + 'K'; return n.toFixed(a < 10 ? 3 : 0); };
+    const seedRng = (s) => () => { s = (s + 0x6D2B79F5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+
+    const I1 = 'rA7wzf…g95', I2 = 'rmMVsQ…Cwp', I3 = 'rYYUaK…TMy';
+    const P = [
+      ['XRP', 'USD', I1, 'rAtRwr…2rXT', 1804220, 4401122, 300, 14.0e6, 'rwisR4…nkW', '22 Mar 2024', false],
+      ['XRP', 'EUR', I1, 'rHk3Lw…9QeT', 1120400, 2297900, 250, 5.2e6, 'rCQfy3…WWL', '25 Mar 2024', false],
+      ['XRP', 'USD', I3, 'rPq8Zn…u7Lm', 905100, 2208400, 500, 4.6e6, 'open', '2 Apr 2024', false],
+      ['XRP', 'BTC', I2, 'rGx2Tb…cW4a', 610000, 9.748, 300, 2.1e6, 'rfpH3e…dX3f', '23 Mar 2024', false],
+      ['XRP', 'ETH', I2, 'rLm5Yd…Rk8s', 402300, 230.4, 400, 0.9e6, 'open', '10 May 2024', false],
+      ['USD', 'EUR', I1, 'rUv7Ec…Mn2p', 0, 0, 100, 0.3e6, 'open', '1 Jun 2024', false],
+      ['XRP', 'GBP', I1, 'rBz4Ha…Tg6y', 211000, 382300, 300, 0.7e6, 'open', '15 Jul 2024', false],
+      ['XRP', 'JPY', I3, 'rKs9Wq…Pf3e', 160500, 58450000, 1000, 0.5e6, 'rsW8Gc…vYgY', '2 Sep 2024', false],
+      ['XRP', 'AUD', I3, 'rDn6Jv…Xc1o', 0, 0, 300, 0, 'open', '9 Apr 2024', true]
+    ];
+    let pools = P.map((p) => {
+      const isNative = p[0] === 'XRP';
+      const value = p[10] ? 0 : isNative ? 2 * p[4] : 2 * 610000 / 2.4395;
+      const r1 = p[10] ? '—' : isNative ? compact(p[4]) + ' XRP' : '610.0K USD';
+      const r2 = p[10] ? '' : isNative ? compact(p[5]) + ' ' + p[1] : '512.8K EUR';
+      return {
+        a1: p[0].slice(0, 3), a2: p[1].slice(0, 3),
+        pair: p[0] + ' / ' + p[1], issuer: p[2], acct: p[3] + ' · ' + p[1] + ' ' + p[2],
+        valueN: value, value: p[10] ? '0' : compact(value),
+        r1, r2, feeN: p[6], fee: (p[6] / 1000).toFixed(3) + '%',
+        volN: p[7], vol: p[7] ? compact(p[7]) : '0', fees: p[7] ? compact(p[7] * p[6] / 100000) : '0',
+        slot: p[8], created: p[9], deleted: p[10]
+      };
+    });
+    if (!st.deleted) pools = pools.filter((p) => !p.deleted);
+    const q = (st.q || '').trim().toLowerCase();
+    if (q) pools = pools.filter((p) => (p.pair + ' ' + p.acct).toLowerCase().indexOf(q) >= 0);
+    const key = { val: 'valueN', fee: 'feeN', vol: 'volN' }[st.sort];
+    pools.sort((a, b) => (a[key] - b[key]) * st.dir);
+
+    const R = seedRng(2026);
+    const n = 30, endMs = Date.UTC(2026, 9, 16);
+    const vals = [];
+    for (let i = 0; i < n; i++) vals.push(31e6 * (1 + 0.25 * Math.sin(i / 6 + 1) + (R() - 0.5) * 0.3));
+    const mx = Math.max.apply(null, vals);
+    const rough = mx / 4, mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= rough);
+    const top = Math.ceil(mx / step) * step;
+    const axis = [];
+    for (let v = 0; v <= top + 1; v += step) axis.push({ pos: (v / top * 100).toFixed(2) + '%', label: compact(v).replace('.00', ''), cls: v === 0 ? 'base' : '' });
+    const dateOf = (i) => new Date(endMs - (n - 1 - i) * 86400000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    const hov = st.hov;
+    const cols = vals.map((v, i) => ({ h: (v / top * 100).toFixed(2) + '%', cls: hov < 0 ? '' : hov === i ? '' : 'dim', aria: dateOf(i) + ': ' + compact(v) + ' XRP', enter: () => this.setState({ hov: i }) }));
+    const left = hov >= 0 ? (hov + 0.5) / n * 100 : 0;
+    const tip = hov >= 0
+      ? { show: true, left: left.toFixed(2) + '%', tf: left < 22 ? 'translateX(8px)' : left > 78 ? 'translateX(calc(-100% - 8px))' : 'translateX(-50%)', date: dateOf(hov), v: compact(vals[hov]), n: Math.round(vals[hov] / 2400).toLocaleString('en-US') }
+      : { show: false, left: '0%', tf: '', date: '', v: '', n: '' };
+    const xls = vals.map((v, i) => ({ i, label: dateOf(i), pos: ((i + 0.5) / n * 100).toFixed(2) + '%' })).filter((p) => (n - 1 - p.i) % 5 === 0);
+
+    const tiles = [
+      { label: 'Pools', value: '14,906', sub: '312 deleted · 1,212 worth over 10K XRP' },
+      { label: 'Value locked', value: '96.4M XRP', sub: 'all pools, at daily XRP rates' },
+      { label: 'Swap volume, 24 h', value: compact(vals[n - 1]) + ' XRP', sub: '13,020 swaps' },
+      { label: 'Fees earned, 24 h', value: '102.6K XRP', sub: 'estimate, paid to liquidity providers' }
+    ];
+    const sortBtn = (k) => () => this.setState(st.sort === k ? { dir: -st.dir } : { sort: k, dir: -1 });
+    const ar = (k) => st.sort === k ? (st.dir < 0 ? ' ↓' : ' ↑') : '';
+    const aria = (k) => st.sort === k ? (st.dir < 0 ? 'descending' : 'ascending') : 'none';
+
+    return {
+      themeClass: dark ? 'dark' : '',
+      accentNow: x ? accent : xahauAccent,
+      xrplDot: accent, xahauDot: xahauAccent,
+      isXrpl: x, isXahau: !x,
+      xrplCls: x ? 'on' : '', xahauCls: x ? '' : 'on',
+      pickXrpl: () => this.setState({ net: 'xrpl' }),
+      pickXahau: () => this.setState({ net: 'xahau', hov: -1 }),
+      intro: x ? 'Automated market maker pools on the XRP Ledger. Swaps against them also count as DEX trades.' : 'Automated market maker pools.',
+      q: st.q, onQ: (e) => this.setState({ q: e.target.value }),
+      showDeleted: st.deleted, toggleDeleted: () => this.setState({ deleted: !st.deleted }),
+      tiles, axis, cols, tip, xls, leave: () => this.setState({ hov: -1 }),
+      pools, empty: pools.length === 0,
+      byVal: sortBtn('val'), byFee: sortBtn('fee'), byVol: sortBtn('vol'),
+      sortVal: st.sort === 'val' ? 'on' : '', sortFee: st.sort === 'fee' ? 'on' : '', sortVol: st.sort === 'vol' ? 'on' : '',
+      arVal: ar('val'), arFee: ar('fee'), arVol: ar('vol'),
+      ariaVal: aria('val'), ariaFee: aria('fee'), ariaVol: aria('vol')
+    };
+  }
+}
+</script>
+</body>
+</html>

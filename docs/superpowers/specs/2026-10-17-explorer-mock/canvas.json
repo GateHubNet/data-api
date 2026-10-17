@@ -1,0 +1,39 @@
+{
+  "v": 3,
+  "createdOnFiles": { "v": 1, "at": "2026-10-17T15:30:00Z" },
+  "title": "Explorer Design Mock",
+  "launch": { "view": "canvas" },
+  "pages": [],
+  "boards": {
+    "Main.dc.html": { "x": 0, "y": 0, "w": 1440, "h": 1560, "title": "Home and search", "expand": "fill", "is_interactive": true },
+    "Ledger.dc.html": { "x": 1520, "y": 0, "w": 1440, "h": 1900, "title": "Ledger", "expand": "fill", "is_interactive": true },
+    "Transaction.dc.html": { "x": 3040, "y": 0, "w": 1440, "h": 2300, "title": "Transaction", "expand": "fill", "is_interactive": true },
+    "Account.dc.html": { "x": 4560, "y": 0, "w": 1440, "h": 1800, "title": "Account", "expand": "fill", "is_interactive": true },
+    "TransactionMobile.dc.html": { "x": 0, "y": 2700, "w": 390, "h": 1700, "title": "Transaction on a phone", "is_interactive": true },
+    "LinkPreview.dc.html": { "x": 470, "y": 2700, "w": 1200, "h": 630, "title": "Link preview image (Open Graph)" },
+    "Network.dc.html": { "x": 0, "y": 4800, "w": 1440, "h": 2150, "title": "Network dashboard", "expand": "fill", "is_interactive": true },
+    "Markets.dc.html": { "x": 1520, "y": 4800, "w": 1440, "h": 1500, "title": "Markets", "expand": "fill", "is_interactive": true },
+    "MarketPair.dc.html": { "x": 3040, "y": 4800, "w": 1440, "h": 2150, "title": "Market pair", "expand": "fill", "is_interactive": true },
+    "Amm.dc.html": { "x": 4560, "y": 4800, "w": 1440, "h": 1650, "title": "AMM pools", "expand": "fill", "is_interactive": true },
+    "AmmPool.dc.html": { "x": 6080, "y": 4800, "w": 1440, "h": 2300, "title": "AMM pool", "expand": "fill", "is_interactive": true }
+  },
+  "order": [
+    "Main.dc.html",
+    "Ledger.dc.html",
+    "Transaction.dc.html",
+    "Account.dc.html",
+    "TransactionMobile.dc.html",
+    "LinkPreview.dc.html",
+    "Network.dc.html",
+    "Markets.dc.html",
+    "MarketPair.dc.html",
+    "Amm.dc.html",
+    "AmmPool.dc.html"
+  ],
+  "notes": {
+    "row1": { "x": 0, "y": -300, "text": "Explorer v1 · core lookup pages", "kind": "title1", "maxW": 6000 },
+    "row2": { "x": 0, "y": 2420, "text": "Phone and link preview", "kind": "title1", "maxW": 1670 },
+    "row3": { "x": 0, "y": 4500, "text": "Later sub-projects · network, markets, AMM", "kind": "title1", "maxW": 7520 }
+  },
+  "designSystems": []
+}

@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Market pair</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.xp{--bg:#F5F6F8;--surface:#FFFFFF;--sunken:#EEF0F3;--border:#E1E4E9;--border-strong:#CDD2D9;--fg:#0F1217;--muted:#4F5864;--faint:#646D7A;--link:var(--accent);--grid:#EEF0F3;--axis:#CDD2D9;--up:#2a78d6;--down:#e34948;--up-wash:rgba(42,120,214,.13);--down-wash:rgba(227,73,72,.12);--s1:#2a78d6;--s-other:#B4BAC3;font-family:'Geist',ui-sans-serif,system-ui,sans-serif;color:var(--fg);background:var(--bg);min-height:100vh;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+.xp.dark{--bg:#0B0E12;--surface:#12161C;--sunken:#181D24;--border:#232A33;--border-strong:#323B46;--fg:#E7EBF0;--muted:#A3ACB9;--faint:#8D97A5;--link:color-mix(in srgb,var(--accent) 55%,#ffffff);--grid:#1D232B;--axis:#323B46;--up:#3987e5;--down:#e66767;--up-wash:rgba(57,135,229,.18);--down-wash:rgba(230,103,103,.16);--s1:#3987e5;--s-other:#4A525D}
+.xp a{color:var(--link);text-decoration:none}
+.xp a:hover{text-decoration:underline}
+.xp button,.xp input{font:inherit;color:inherit}
+.xp :focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.mono{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.seg{border:0;background:transparent;padding:6px 12px;border-radius:7px;display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:500;color:var(--muted);min-height:32px;white-space:nowrap}
+.seg.on{background:var(--surface);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--border)}
+.segs{display:flex;padding:3px;background:var(--sunken);border:1px solid var(--border);border-radius:9px}
+.nav{padding:8px 10px;border-radius:7px;color:var(--muted)!important;font-weight:500;display:inline-flex;align-items:center}
+.nav:hover{background:var(--sunken);text-decoration:none!important;color:var(--fg)!important}
+.nav.cur{color:var(--fg)!important;background:var(--sunken)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px}
+.src{font-family:'Geist Mono',ui-monospace,monospace;font-size:11px;color:var(--faint)}
+.btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:var(--surface);border-radius:8px;padding:0 12px;min-height:36px;color:var(--fg)!important;font-weight:500;font-size:13px;cursor:pointer}
+.btn:hover{border-color:var(--border-strong);text-decoration:none!important}
+.amt{font-family:'Geist Mono',ui-monospace,monospace;font-weight:500;font-variant-numeric:tabular-nums}
+.gl{position:absolute;left:0;right:0;border-top:1px solid var(--grid)}
+.yl{position:absolute;left:10px;transform:translateY(50%);font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap}
+.xl{position:absolute;top:6px;transform:translateX(-50%);font-size:11px;color:var(--faint);white-space:nowrap}
+.cnd{flex:1 1 0;height:100%;position:relative;border:0;background:transparent;padding:0;min-width:0;cursor:crosshair}
+.cnd.hov{background:var(--sunken)}
+.cnd:focus-visible{outline:2px solid var(--link);outline-offset:-2px}
+.wick{position:absolute;left:50%;width:1px;transform:translateX(-50%)}
+.body{position:absolute;left:50%;transform:translateX(-50%);width:min(9px,62%);border-radius:1px;min-height:1px}
+.vb{position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:min(9px,62%);border-radius:2px 2px 0 0}
+.tr{display:grid;grid-template-columns:var(--cols);align-items:center;column-gap:14px;padding:0 16px;min-height:42px;border-top:1px solid var(--border);font-size:13px}
+.th{min-height:36px;font-size:12px;font-weight:500;color:var(--faint);border-top:0}
+.r{text-align:right;justify-self:end}
+.tag{font-size:11px;font-weight:500;padding:1px 6px;border-radius:5px;background:var(--sunken);border:1px solid var(--border);white-space:nowrap}
+.lvl{position:relative;display:grid;grid-template-columns:1fr 1fr 1fr;column-gap:10px;padding:0 14px;min-height:28px;align-items:center;font-size:12.5px;font-variant-numeric:tabular-nums}
+.lvl span{position:relative;z-index:1;text-align:right}
+.lvl span:first-child{text-align:left}
+.depth{position:absolute;top:2px;bottom:2px;right:0;z-index:0;border-radius:3px 0 0 3px}
+.stat{display:flex;flex-direction:column;gap:2px;min-width:110px}
+.stat span:first-child{font-size:12px;color:var(--faint)}
+</style>
+</helmet>
+<div class="xp {{themeClass}}" style="--accent: {{accentNow}};">
+
+<header style="background: var(--surface); border-bottom: 1px solid var(--border);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;">
+    <a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; color: var(--fg);" aria-label="Explorer home">
+      <svg aria-hidden="true" width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="8" style="fill: var(--accent)"></rect><path d="M8 10h7M8 14h12M8 18h9" stroke="#fff" stroke-width="2.2" stroke-linecap="round"></path></svg>
+      <span style="font-weight: 650; font-size: 17px; letter-spacing: -0.01em;">explorer</span>
+    </a>
+    <div role="group" aria-label="Network" class="segs">
+      <button type="button" class="seg {{xrplCls}}" aria-pressed="{{isXrpl}}" onClick="{{pickXrpl}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xrplDot}};"></span>XRPL</button>
+      <button type="button" class="seg {{xahauCls}}" aria-pressed="{{isXahau}}" onClick="{{pickXahau}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xahauDot}};"></span>Xahau</button>
+    </div>
+    <nav aria-label="Main" style="display: flex; flex-wrap: wrap; gap: 2px;">
+      <a class="nav" href="Ledger.dc.html">Ledgers</a>
+      <a class="nav" href="Transaction.dc.html">Transactions</a>
+      <a class="nav" href="Account.dc.html">Accounts</a>
+      <a class="nav" href="Network.dc.html">Network</a>
+      <a class="nav cur" href="Markets.dc.html" aria-current="page">Markets</a>
+      <a class="nav" href="Amm.dc.html">AMM</a>
+    </nav>
+    <form role="search" style="flex: 1 1 240px; display: flex; align-items: center; gap: 8px; background: var(--sunken); border: 1px solid var(--border); border-radius: 9px; padding: 0 12px; min-height: 40px;">
+      <label for="hdr-q" class="sr">Search</label>
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint); flex: none;"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+      <input id="hdr-q" type="search" placeholder="Address, hash, ledger or CTID" style="flex: 1 1 auto; min-width: 0; border: 0; outline: none; background: transparent; font-size: 13px;">
+    </form>
+  </div>
+</header>
+
+<main style="max-width: 1240px; margin: 0 auto; padding: 24px 20px 64px; display: flex; flex-direction: column; gap: 18px;">
+
+  <nav aria-label="Breadcrumb" style="font-size: 13px; color: var(--faint); display: flex; gap: 8px; flex-wrap: wrap;">
+    <a href="Main.dc.html">{{netName}}</a><span aria-hidden="true">/</span><a href="Markets.dc.html">Markets</a><span aria-hidden="true">/</span><span aria-current="page" style="color: var(--muted);">{{baseC}}/{{counterC}}</span>
+  </nav>
+
+  <section class="card" aria-label="Pair summary" style="padding: 20px 22px; display: flex; flex-wrap: wrap; gap: 18px 36px; align-items: flex-end; justify-content: space-between;">
+    <div style="display: flex; flex-direction: column; gap: 6px;">
+      <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+        <h1 style="margin: 0; font-size: 26px; letter-spacing: -0.02em; font-weight: 650;">{{baseC}} <span style="color: var(--faint); font-weight: 400;">/</span> {{counterC}}</h1>
+        <button type="button" class="btn" onClick="{{invert}}" style="min-height: 32px;"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h13l-4-4M17 17H4l4 4"></path></svg>Show {{counterC}}/{{baseC}}</button>
+      </div>
+      <span class="mono" style="font-size: 12px; color: var(--faint);">{{issuerLine}}</span>
+      <div style="display: flex; align-items: baseline; gap: 14px; margin-top: 6px; flex-wrap: wrap;">
+        <span style="font-size: 52px; font-weight: 600; letter-spacing: -0.03em; line-height: 1;">{{last}}</span>
+        <span style="font-size: 16px; color: var(--muted);">{{counterC}} per {{baseC}}</span>
+        <span style="display: inline-flex; align-items: center; gap: 5px; font-size: 15px;">
+          <sc-if value="{{dayUp}}" hint-placeholder-val="{{true}}"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 10 10"><path d="M5 1.5 9 8H1z" style="fill: var(--up);"></path></svg></sc-if>
+          <sc-if value="{{dayDown}}" hint-placeholder-val="{{false}}"><svg aria-hidden="true" width="11" height="11" viewBox="0 0 10 10"><path d="M5 8.5 1 2h8z" style="fill: var(--down);"></path></svg></sc-if>
+          {{dayChg}} <span style="color: var(--faint);">24 h</span>
+        </span>
+      </div>
+    </div>
+    <div style="display: flex; flex-wrap: wrap; gap: 14px 28px;">
+      <sc-for list="{{stats}}" as="s" hint-placeholder-count="6"><div class="stat"><span>{{s.label}}</span><span class="amt">{{s.value}}</span></div></sc-for>
+    </div>
+  </section>
+
+  <sc-if value="{{isXrpl}}" hint-placeholder-val="{{true}}">
+    <div role="group" aria-label="Filters" style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;">
+      <div style="display: flex; align-items: center; gap: 8px;"><span style="font-size: 13px; color: var(--faint);">Trades</span>
+        <div class="segs"><sc-for list="{{sources}}" as="p" hint-placeholder-count="3"><button type="button" class="seg {{p.cls}}" aria-pressed="{{p.on}}" onClick="{{p.pick}}">{{p.label}}</button></sc-for></div>
+      </div>
+      <span style="font-size: 12px; color: var(--faint);">Applies to the chart and the trade list (amm={{ammParam}}).</span>
+    </div>
+  </sc-if>
+
+  <section class="card" aria-labelledby="ch-title" style="padding: 16px 18px 12px; display: flex; flex-direction: column; gap: 10px;">
+    <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px;">
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <h2 id="ch-title" style="margin: 0; font-size: 15px; font-weight: 600;">Price</h2>
+        <span class="src">/v2/exchanges/{{baseC}}/{{counterC}}?interval={{ivParam}}</span>
+      </div>
+      <div class="segs" role="group" aria-label="Candle interval"><sc-for list="{{intervals}}" as="p" hint-placeholder-count="5"><button type="button" class="seg {{p.cls}}" aria-pressed="{{p.on}}" onClick="{{p.pick}}">{{p.label}}</button></sc-for></div>
+    </div>
+    <div aria-live="polite" style="display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12.5px; color: var(--muted); min-height: 20px; font-variant-numeric: tabular-nums;">
+      <span style="color: var(--fg); font-weight: 500;">{{ro.time}}</span>
+      <span>O <b class="amt">{{ro.o}}</b></span><span>H <b class="amt">{{ro.h}}</b></span><span>L <b class="amt">{{ro.l}}</b></span><span>C <b class="amt">{{ro.c}}</b></span>
+      <span>Volume <b class="amt">{{ro.v}}</b> {{baseC}}</span><span><b class="amt">{{ro.n}}</b> trades</span>
+    </div>
+    <div style="display: flex;">
+      <div style="flex: 1 1 auto; min-width: 0;">
+        <div style="position: relative; height: 280px;" onMouseLeave="{{leave}}">
+          <sc-for list="{{pAxis}}" as="a" hint-placeholder-count="5"><span class="gl" style="bottom: {{a.pos}};"></span></sc-for>
+          <div style="position: absolute; inset: 0; display: flex;">
+            <sc-for list="{{candles}}" as="c" hint-placeholder-count="60">
+              <button type="button" class="cnd {{c.cls}}" aria-label="{{c.aria}}" onMouseEnter="{{c.enter}}" onFocus="{{c.enter}}">
+                <span class="wick" style="bottom: {{c.wb}}; height: {{c.wh}}; background: {{c.color}};"></span>
+                <span class="body" style="bottom: {{c.bb}}; height: {{c.bh}}; background: {{c.color}};"></span>
+              </button>
+            </sc-for>
+          </div>
+        </div>
+        <div style="position: relative; height: 64px; border-top: 1px solid var(--axis); margin-top: 6px;" aria-hidden="true">
+          <div style="position: absolute; inset: 0; display: flex;">
+            <sc-for list="{{candles}}" as="c" hint-placeholder-count="60"><span style="flex: 1 1 0; position: relative; min-width: 0;"><span class="vb" style="height: {{c.vh}}; background: {{c.vcolor}};"></span></span></sc-for>
+          </div>
+        </div>
+        <div style="position: relative; height: 24px;" aria-hidden="true"><sc-for list="{{xls}}" as="x" hint-placeholder-count="6"><span class="xl" style="left: {{x.pos}};">{{x.label}}</span></sc-for></div>
+      </div>
+      <div style="position: relative; width: 72px; flex: none;" aria-hidden="true">
+        <div style="position: relative; height: 280px;"><sc-for list="{{pAxis}}" as="a" hint-placeholder-count="5"><span class="yl" style="bottom: {{a.pos}};">{{a.label}}</span></sc-for></div>
+        <div style="position: relative; height: 64px; margin-top: 6px;"><span class="yl" style="bottom: 100%;">{{volTop}}</span><span class="yl" style="bottom: 0;">0</span></div>
+      </div>
+    </div>
+    <div style="display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12px; color: var(--muted);">
+      <span><span style="display: inline-block; width: 9px; height: 12px; border-radius: 1px; background: var(--up); vertical-align: -2px; margin-right: 6px;"></span>Closed higher</span>
+      <span><span style="display: inline-block; width: 9px; height: 12px; border-radius: 1px; background: var(--down); vertical-align: -2px; margin-right: 6px;"></span>Closed lower</span>
+      <span><span style="display: inline-block; width: 9px; height: 8px; border-radius: 1px; background: var(--s-other); vertical-align: 0; margin-right: 6px;"></span>Volume ({{baseC}})</span>
+    </div>
+  </section>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start;">
+    <section class="card" aria-labelledby="rt-title" style="flex: 999 1 600px; min-width: 0; overflow: hidden;">
+      <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--border);">
+        <h2 id="rt-title" style="margin: 0; font-size: 15px; font-weight: 600;">Recent trades</h2>
+        <span class="src">/v2/exchanges/{{baseC}}/{{counterC}}?descending=true</span>
+      </div>
+      <div style="overflow-x: auto;">
+        <div role="table" aria-label="Recent trades" style="min-width: 640px; --cols: 74px 54px minmax(90px, 1fr) minmax(100px, 1fr) minmax(100px, 1fr) minmax(110px, 1fr) 62px;">
+          <div role="row" class="tr th"><span role="columnheader">Time</span><span role="columnheader">Side</span><span role="columnheader" class="r">Price</span><span role="columnheader" class="r">{{baseC}}</span><span role="columnheader" class="r">{{counterC}}</span><span role="columnheader">Taker</span><span role="columnheader">Via</span></div>
+          <sc-for list="{{trades}}" as="t" hint-placeholder-count="12">
+            <div role="row" class="tr">
+              <span role="cell" class="num"><a href="Transaction.dc.html">{{t.time}}</a></span>
+              <span role="cell" style="display: flex; align-items: center; gap: 5px;"><span style="width: 6px; height: 6px; border-radius: 50%; background: {{t.color}};"></span>{{t.side}}</span>
+              <span role="cell" class="r amt">{{t.price}}</span>
+              <span role="cell" class="r amt" style="font-weight: 400;">{{t.base}}</span>
+              <span role="cell" class="r amt" style="font-weight: 400;">{{t.counter}}</span>
+              <span role="cell"><a class="mono" href="Account.dc.html">{{t.taker}}</a></span>
+              <span role="cell"><span class="tag">{{t.via}}</span></span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border);"><button type="button" class="btn">Older →</button></div>
+    </section>
+
+    <div style="flex: 1 1 340px; min-width: 0; display: flex; flex-direction: column; gap: 18px;">
+      <section class="card" aria-labelledby="ob-title" style="overflow: hidden;">
+        <div style="padding: 14px 14px 10px; display: flex; flex-direction: column; gap: 2px;">
+          <h2 id="ob-title" style="margin: 0; font-size: 15px; font-weight: 600;">Order book</h2>
+          <span class="src">live from the node · book_offers</span>
+        </div>
+        <div class="lvl" style="color: var(--faint); font-size: 11.5px;"><span>Price</span><span>{{baseC}}</span><span>Total</span></div>
+        <sc-for list="{{asks}}" as="l" hint-placeholder-count="6"><div class="lvl"><span class="depth" style="width: {{l.w}}; background: var(--down-wash);"></span><span class="amt" style="font-weight: 500;">{{l.p}}</span><span>{{l.q}}</span><span style="color: var(--muted);">{{l.t}}</span></div></sc-for>
+        <div style="padding: 8px 14px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; font-size: 12.5px;"><span class="amt">{{last}}</span><span style="color: var(--faint);">spread {{spread}}</span></div>
+        <sc-for list="{{bids}}" as="l" hint-placeholder-count="6"><div class="lvl"><span class="depth" style="width: {{l.w}}; background: var(--up-wash);"></span><span class="amt" style="font-weight: 500;">{{l.p}}</span><span>{{l.q}}</span><span style="color: var(--muted);">{{l.t}}</span></div></sc-for>
+        <div style="padding: 10px 14px; font-size: 12px; color: var(--faint); border-top: 1px solid var(--border);">Asks on top, bids below; the bar is the size on the book up to that price.{{bookNote}}</div>
+      </section>
+
+      <sc-if value="{{isXrpl}}" hint-placeholder-val="{{true}}">
+        <a href="AmmPool.dc.html" class="card" style="padding: 16px; display: flex; flex-direction: column; gap: 8px; color: var(--fg); text-decoration: none;">
+          <span style="display: flex; justify-content: space-between; align-items: baseline;"><span style="font-weight: 600;">XRP/USD AMM pool</span><span style="font-size: 13px; color: var(--link);">Pool page →</span></span>
+          <span style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; font-size: 12.5px;">
+            <span style="display: flex; flex-direction: column;"><span style="color: var(--faint);">Reserves</span><span class="amt">1.80M XRP · 4.40M USD</span></span>
+            <span style="display: flex; flex-direction: column;"><span style="color: var(--faint);">Pool price</span><span class="amt">2.4393 USD</span></span>
+            <span style="display: flex; flex-direction: column;"><span style="color: var(--faint);">Trading fee</span><span class="amt">0.300%</span></span>
+            <span style="display: flex; flex-direction: column;"><span style="color: var(--faint);">Share of pair volume</span><span class="amt">34%</span></span>
+          </span>
+        </a>
+      </sc-if>
+
+      <section class="card" aria-labelledby="ta-title" style="padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;">
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <h2 id="ta-title" style="margin: 0; font-size: 15px; font-weight: 600;">Most active traders, 24 h</h2>
+          <span class="src">/v2/active_accounts/{{baseC}}/{{counterC}}</span>
+        </div>
+        <sc-for list="{{traders}}" as="a" hint-placeholder-count="5">
+          <div style="display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 10px; align-items: center; font-size: 12.5px;">
+            <a class="mono" href="Account.dc.html">{{a.acct}}</a>
+            <span style="display: flex; align-items: center; gap: 8px; min-width: 0;"><span style="height: 12px; width: {{a.w}}; background: var(--s1); border-radius: 0 3px 3px 0; flex: none;"></span><span style="white-space: nowrap; color: var(--muted);"><b class="amt" style="color: var(--fg);">{{a.v}}</b> · {{a.n}} trades</span></span>
+          </div>
+        </sc-for>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer style="border-top: 1px solid var(--border); background: var(--surface);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 22px 20px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; font-size: 13px; color: var(--faint);">
+    <span>explorer · by GateHub</span>
+    <span>History from validated ledgers. Balances and account state read live from the network.</span>
+    <span style="display: flex; gap: 16px;"><a href="#">API</a><a href="#">Status</a><a href="#">Privacy</a></span>
+  </div>
+</footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["light","dark"],"default":"light"},"accent":{"editor":"color","options":["#2F5BEA","#0F766E","#6D28D9","#111827"],"default":"#2F5BEA","section":"Network colors"},"xahauAccent":{"editor":"color","options":["#B45309","#C2410C","#A16207"],"default":"#B45309","section":"Network colors"},"$preview":{"width":1440,"height":2150}}'>
+class Component extends DCLogic {
+  state = { net: 'xrpl', iv: '1h', source: 'include', inv: false, hov: -1 };
+
+  renderVals() {
+    const dark = (this.props.theme ?? 'light') === 'dark';
+    const accent = this.props.accent ?? '#2F5BEA';
+    const xahauAccent = this.props.xahauAccent ?? '#B45309';
+    const x = this.state.net === 'xrpl';
+    const st = this.state;
+    const inv = st.inv;
+    const native = x ? 'XRP' : 'XAH';
+    const b0 = native, c0 = 'USD';
+    const baseC = inv ? c0 : b0, counterC = inv ? b0 : c0;
+    const p0 = x ? 2.4395 : 0.03104;
+    const priceNow = inv ? 1 / p0 : p0;
+    const seedRng = (s) => () => { s = (s + 0x6D2B79F5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    const fp = (v) => v >= 100 ? v.toFixed(2) : v >= 1 ? v.toFixed(4) : v.toPrecision(5);
+    const compact = (n) => { const a = Math.abs(n); if (a >= 1e9) return (n / 1e9).toFixed(2) + 'B'; if (a >= 1e6) return (n / 1e6).toFixed(2) + 'M'; if (a >= 1e3) return (n / 1e3).toFixed(1) + 'K'; return n.toFixed(a < 10 ? 2 : 0); };
+
+    const ivs = { '15m': [15, 0.004], '1h': [60, 0.007], '4h': [240, 0.012], '1d': [1440, 0.03], '1w': [10080, 0.07] };
+    const ivApi = { '15m': '15minute', '1h': '1hour', '4h': '4hour', '1d': '1day', '1w': '7day' };
+    const mins = ivs[st.iv][0], vol = ivs[st.iv][1];
+    const srcMul = !x ? 1 : st.source === 'only' ? 0.34 : st.source === 'exclude' ? 0.66 : 1;
+    const R = seedRng((x ? 5 : 9) * 1000 + mins + (st.source === 'only' ? 7 : st.source === 'exclude' ? 3 : 0));
+    const N = 60;
+    let p = 1;
+    const raw = [];
+    for (let k = 0; k < N; k++) {
+      const o = p;
+      const c = o * (1 + (R() - 0.49) * vol);
+      const h = Math.max(o, c) * (1 + R() * vol * 0.6);
+      const l = Math.min(o, c) * (1 - R() * vol * 0.6);
+      const v = (x ? 1.6e6 : 0.02e6) * (mins / 60) * (0.4 + R() * 1.3) * srcMul;
+      raw.push({ o, h, l, c, v, n: Math.max(1, Math.round(v / (x ? 2300 : 330))) });
+      p = c;
+    }
+    const f = p0 / raw[N - 1].c;
+    const C = raw.map((r) => inv
+      ? { o: 1 / (r.o * f), c: 1 / (r.c * f), h: 1 / (r.l * f), l: 1 / (r.h * f), v: r.v * r.c * f, n: r.n }
+      : { o: r.o * f, c: r.c * f, h: r.h * f, l: r.l * f, v: r.v, n: r.n });
+
+    const lo = Math.min.apply(null, C.map((c) => c.l)), hi = Math.max.apply(null, C.map((c) => c.h));
+    const rough = (hi - lo) / 4;
+    const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= rough);
+    const a0 = Math.floor(lo / step) * step, a1 = Math.ceil(hi / step) * step, span = a1 - a0;
+    const pAxis = [];
+    for (let v = a0; v <= a1 + step / 2; v += step) pAxis.push({ pos: ((v - a0) / span * 100).toFixed(2) + '%', label: fp(v) });
+    const pct = (v) => ((v - a0) / span * 100).toFixed(2) + '%';
+    const vMax = Math.max.apply(null, C.map((c) => c.v));
+
+    const endMs = Date.UTC(2026, 9, 17, 15, 0);
+    const tOf = (k) => new Date(endMs - (N - 1 - k) * mins * 60000);
+    const lab = (d) => mins >= 1440
+      ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+      : d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' });
+    const full = (d) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }) + (mins < 1440 ? ', ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC' : '');
+
+    const hov = st.hov;
+    const candles = C.map((c, k) => {
+      const up = c.c >= c.o;
+      return {
+        wb: pct(c.l), wh: ((c.h - c.l) / span * 100).toFixed(2) + '%',
+        bb: pct(Math.min(c.o, c.c)), bh: Math.max(Math.abs(c.c - c.o) / span * 100, 0.4).toFixed(2) + '%',
+        color: up ? 'var(--up)' : 'var(--down)',
+        vh: (c.v / vMax * 100).toFixed(1) + '%', vcolor: hov === k ? 'var(--s1)' : 'var(--s-other)',
+        cls: hov === k ? 'hov' : '',
+        aria: full(tOf(k)) + ': open ' + fp(c.o) + ', high ' + fp(c.h) + ', low ' + fp(c.l) + ', close ' + fp(c.c),
+        enter: () => this.setState({ hov: k })
+      };
+    });
+    const ri = hov >= 0 ? hov : N - 1;
+    const rc = C[ri];
+    const ro = { time: full(tOf(ri)) + (hov < 0 ? ' · latest' : ''), o: fp(rc.o), h: fp(rc.h), l: fp(rc.l), c: fp(rc.c), v: compact(rc.v), n: rc.n.toLocaleString('en-US') };
+    const every = 10;
+    const xls = C.map((c, k) => ({ k, label: lab(tOf(k)), pos: ((k + 0.5) / N * 100).toFixed(2) + '%' })).filter((q) => (N - 1 - q.k) % every === 0);
+
+    const Rd = seedRng(x ? 42 : 43);
+    const dayChgN = (Rd() - 0.4) * 5 * (inv ? -1 : 1);
+    const baseVol24 = x ? 41.2e6 * srcMul : 0.41e6;
+    const stats = [
+      { label: '24 h high', value: fp(priceNow * 1.018) },
+      { label: '24 h low', value: fp(priceNow * 0.974) },
+      { label: 'VWAP 24 h', value: fp(priceNow * 0.9978) },
+      { label: 'Volume ' + baseC, value: compact(inv ? baseVol24 * p0 : baseVol24) },
+      { label: 'Volume ' + counterC, value: compact(inv ? baseVol24 : baseVol24 * p0) },
+      { label: 'Trades 24 h', value: Math.round((x ? 18420 : 620) * srcMul).toLocaleString('en-US') }
+    ];
+
+    const Rt = seedRng(x ? 77 : 78);
+    const takers = ['rJF2Xa…FQvg', 'rNYbL8…Kq5', 'rwisR4…nkW', 'rCQfy3…WWL', 'rfpH3e…dX3f', 'rsW8Gc…vYgY', 'rmMVsQ…Cwp'];
+    const trades = [];
+    let tm = Date.UTC(2026, 9, 17, 15, 42, 51);
+    for (let k = 0; k < 12; k++) {
+      const amm = x && (st.source === 'only' || (st.source === 'include' && Rt() < 0.34));
+      const buy = Rt() > 0.5;
+      const pr = p0 * (1 + (Rt() - 0.5) * 0.002);
+      const amtB = 50 + Rt() * (x ? 4000 : 9000);
+      const pp = inv ? 1 / pr : pr;
+      const bAmt = inv ? amtB * pr : amtB, cAmt = inv ? amtB : amtB * pr;
+      trades.push({
+        time: new Date(tm).toLocaleTimeString('en-GB', { timeZone: 'UTC' }),
+        side: (buy !== inv) ? 'Buy' : 'Sell', color: (buy !== inv) ? 'var(--up)' : 'var(--down)',
+        price: fp(pp), base: compact(bAmt), counter: compact(cAmt), taker: takers[k % takers.length], via: amm ? 'AMM' : 'Book'
+      });
+      tm -= Math.round(4000 + Rt() * 40000);
+    }
+
+    const Rb = seedRng(x ? 91 : 92);
+    const mk = (side) => {
+      const out = []; let cum = 0;
+      for (let k = 0; k < 6; k++) {
+        const pr = p0 * (1 + (side === 'ask' ? 1 : -1) * (0.0004 + k * 0.0009 + Rb() * 0.0003));
+        const q = (x ? 3000 : 20000) + Rb() * (x ? 40000 : 200000);
+        cum += q;
+        out.push({ pr, q, cum });
+      }
+      const max = out[out.length - 1].cum;
+      return out.map((o) => ({ p: fp(inv ? 1 / o.pr : o.pr), q: compact(inv ? o.q * o.pr : o.q), t: compact(inv ? o.cum * o.pr : o.cum), w: (o.cum / max * 100).toFixed(1) + '%' }));
+    };
+    const asks0 = mk('ask'), bids0 = mk('bid');
+    const asks = (inv ? bids0 : asks0).slice().reverse();
+    const bids = inv ? asks0 : bids0;
+
+    const Ra = seedRng(x ? 61 : 62);
+    const tv = [1, 0.62, 0.41, 0.33, 0.21].map((s) => s * (x ? 6.1e6 : 0.08e6));
+    const traders = tv.map((v, k) => ({ acct: takers[(k + 2) % takers.length], v: compact(inv ? v * p0 : v) + ' ' + baseC, n: Math.round(40 + Ra() * 400), w: (v / tv[0] * 64).toFixed(1) + '%' }));
+
+    const seg = (key, list) => list.map((q) => ({ label: q[1], on: st[key] === q[0], cls: st[key] === q[0] ? 'on' : '', pick: () => this.setState({ [key]: q[0], hov: -1 }) }));
+
+    return {
+      themeClass: dark ? 'dark' : '',
+      accentNow: x ? accent : xahauAccent,
+      xrplDot: accent, xahauDot: xahauAccent,
+      isXrpl: x, isXahau: !x,
+      xrplCls: x ? 'on' : '', xahauCls: x ? '' : 'on',
+      pickXrpl: () => this.setState({ net: 'xrpl', hov: -1 }),
+      pickXahau: () => this.setState({ net: 'xahau', hov: -1, source: 'include' }),
+      netName: x ? 'XRPL' : 'Xahau',
+      baseC, counterC,
+      issuerLine: 'USD issued by rA7wzfRjziBcrbFwErG1t2sdVofKQmg95 · ' + native + ' is native',
+      invert: () => this.setState({ inv: !inv, hov: -1 }),
+      last: fp(priceNow), dayChg: (dayChgN >= 0 ? '+' : '−') + Math.abs(dayChgN).toFixed(2) + '%', dayUp: dayChgN >= 0, dayDown: dayChgN < 0,
+      stats,
+      sources: seg('source', [['include', 'All'], ['exclude', 'Order book'], ['only', 'AMM']]),
+      ammParam: st.source,
+      intervals: seg('iv', [['15m', '15 m'], ['1h', '1 h'], ['4h', '4 h'], ['1d', '1 d'], ['1w', '1 w']]),
+      ivParam: ivApi[st.iv],
+      pAxis, candles, xls, ro, volTop: compact(vMax),
+      leave: () => this.setState({ hov: -1 }),
+      trades, asks, bids, spread: fp(Math.abs((inv ? 1 / (p0 * 1.0004) : p0 * 1.0004) - (inv ? 1 / (p0 * 0.9996) : p0 * 0.9996))),
+      bookNote: x ? ' AMM pool liquidity is not in this book; see the pool.' : '',
+      traders
+    };
+  }
+}
+</script>
+</body>
+</html>

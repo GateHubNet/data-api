@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ledger page</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.xp{--bg:#F5F6F8;--surface:#FFFFFF;--sunken:#EEF0F3;--border:#E1E4E9;--border-strong:#CDD2D9;--fg:#0F1217;--muted:#4F5864;--faint:#646D7A;--link:var(--accent);--ok:#17733F;--ok-bg:#E3F3E9;--bad:#B42318;--bad-bg:#FCEBE9;font-family:'Geist',ui-sans-serif,system-ui,sans-serif;color:var(--fg);background:var(--bg);min-height:100vh;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+.xp.dark{--bg:#0B0E12;--surface:#12161C;--sunken:#181D24;--border:#232A33;--border-strong:#323B46;--fg:#E7EBF0;--muted:#A3ACB9;--faint:#8D97A5;--link:color-mix(in srgb,var(--accent) 55%,#ffffff);--ok:#5BD08F;--ok-bg:#10281B;--bad:#F28B80;--bad-bg:#30161A}
+.xp a{color:var(--link);text-decoration:none}
+.xp a:hover{text-decoration:underline}
+.xp button,.xp input{font:inherit;color:inherit}
+.xp :focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.mono{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.seg{border:0;background:transparent;padding:6px 12px;border-radius:7px;display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:500;color:var(--muted);min-height:32px}
+.seg.on{background:var(--surface);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--border)}
+.nav{padding:8px 10px;border-radius:7px;color:var(--muted)!important;font-weight:500;display:inline-flex;align-items:center}
+.nav:hover{background:var(--sunken);text-decoration:none!important;color:var(--fg)!important}
+.nav.cur{color:var(--fg)!important;background:var(--sunken)}
+.soon{font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);border:1px solid var(--border);border-radius:4px;padding:0 4px;margin-left:6px}
+.tr{display:grid;grid-template-columns:var(--cols);align-items:center;column-gap:16px;padding:0 16px;min-height:46px;border-top:1px solid var(--border)}
+.th{min-height:36px;font-size:12px;font-weight:500;color:var(--faint);border-top:0}
+.tb .tr:hover{background:var(--sunken)}
+.r{text-align:right;justify-self:end}
+.ell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:500;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.ok{color:var(--ok);background:var(--ok-bg)}
+.bad{color:var(--bad);background:var(--bad-bg)}
+.type{font-size:12px;font-weight:500;padding:2px 7px;border-radius:5px;background:var(--sunken);border:1px solid var(--border);color:var(--fg);white-space:nowrap}
+.btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:var(--surface);border-radius:8px;padding:0 12px;min-height:36px;color:var(--fg)!important;font-weight:500;font-size:13px;cursor:pointer}
+.btn:hover{border-color:var(--border-strong);text-decoration:none!important}
+.fchip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--surface);border-radius:8px;padding:0 10px;min-height:34px;cursor:pointer;font-size:13px;color:var(--muted)}
+.fchip:hover{border-color:var(--border-strong);color:var(--fg)}
+.fchip.on{border-color:var(--accent);color:var(--fg);box-shadow:inset 0 0 0 1px var(--accent)}
+.fchip b{font-weight:500;color:var(--faint);font-variant-numeric:tabular-nums}
+.kv{display:grid;grid-template-columns:180px minmax(0,1fr);gap:4px 16px;padding:12px 0;border-top:1px solid var(--border);align-items:baseline}
+.kv dt{color:var(--faint);font-size:13px}
+.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.copy{border:0;background:transparent;color:var(--faint);cursor:pointer;padding:4px;border-radius:5px;vertical-align:middle;min-width:28px;min-height:28px}
+.copy:hover{color:var(--fg);background:var(--sunken)}
+details summary{cursor:pointer;font-weight:500;padding:14px 16px;list-style:none}
+details summary::-webkit-details-marker{display:none}
+pre{margin:0;padding:16px;overflow:auto;font-size:12.5px;line-height:1.6;background:var(--sunken);border-top:1px solid var(--border)}
+@media (max-width:640px){.kv{grid-template-columns:1fr}}
+</style>
+</helmet>
+<div class="xp {{themeClass}}" style="--accent: {{accentNow}};">
+
+<header style="background: var(--surface); border-bottom: 1px solid var(--border);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;">
+    <a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; color: var(--fg);" aria-label="Explorer home">
+      <svg aria-hidden="true" width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="8" style="fill: var(--accent)"></rect><path d="M8 10h7M8 14h12M8 18h9" stroke="#fff" stroke-width="2.2" stroke-linecap="round"></path></svg>
+      <span style="font-weight: 650; font-size: 17px; letter-spacing: -0.01em;">explorer</span>
+    </a>
+    <div role="group" aria-label="Network" style="display: flex; padding: 3px; background: var(--sunken); border: 1px solid var(--border); border-radius: 9px;">
+      <button type="button" class="seg {{xrplCls}}" aria-pressed="{{isXrpl}}" onClick="{{pickXrpl}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xrplDot}};"></span>XRPL</button>
+      <button type="button" class="seg {{xahauCls}}" aria-pressed="{{isXahau}}" onClick="{{pickXahau}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xahauDot}};"></span>Xahau</button>
+    </div>
+    <nav aria-label="Main" style="display: flex; flex-wrap: wrap; gap: 2px;">
+      <a class="nav cur" href="Ledger.dc.html" aria-current="page">Ledgers</a>
+      <a class="nav" href="Transaction.dc.html">Transactions</a>
+      <a class="nav" href="Account.dc.html">Accounts</a>
+      <a class="nav" href="Network.dc.html">Network</a>
+      <a class="nav" href="Markets.dc.html">Markets</a>
+      <a class="nav" href="Amm.dc.html">AMM</a>
+    </nav>
+    <form role="search" style="flex: 1 1 260px; display: flex; align-items: center; gap: 8px; background: var(--sunken); border: 1px solid var(--border); border-radius: 9px; padding: 0 12px; min-height: 40px;">
+      <label for="hdr-q" class="sr">Search</label>
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint); flex: none;"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+      <input id="hdr-q" type="search" placeholder="Address, hash, ledger or CTID" style="flex: 1 1 auto; min-width: 0; border: 0; outline: none; background: transparent; font-size: 13px;">
+      <span class="mono" style="font-size: 11px; color: var(--faint); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;">/</span>
+    </form>
+  </div>
+</header>
+
+<main style="max-width: 1240px; margin: 0 auto; padding: 24px 20px 64px; display: flex; flex-direction: column; gap: 20px;">
+
+  <nav aria-label="Breadcrumb" style="font-size: 13px; color: var(--faint); display: flex; gap: 8px; flex-wrap: wrap;">
+    <a href="Main.dc.html">{{netName}}</a><span aria-hidden="true">/</span><span>Ledgers</span><span aria-hidden="true">/</span><span class="mono num" aria-current="page" style="color: var(--muted);">{{idx}}</span>
+  </nav>
+
+  <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px;">
+    <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px;">
+      <h1 style="margin: 0; font-size: 30px; letter-spacing: -0.02em; font-weight: 650;">Ledger <span class="mono num" style="font-weight: 500;">#{{idx}}</span></h1>
+      <span class="pill ok"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>Validated</span>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <a class="btn" href="Ledger.dc.html" aria-label="Previous ledger"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"></path></svg><span class="mono num">{{prevIdx}}</span></a>
+      <a class="btn" href="Ledger.dc.html" aria-label="Next ledger"><span class="mono num">{{nextIdx}}</span><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"></path></svg></a>
+    </div>
+  </div>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start;">
+    <section aria-label="Ledger header" style="flex: 999 1 560px; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 4px 20px;">
+      <dl style="margin: 0;">
+        <div class="kv" style="border-top: 0;"><dt>Closed</dt><dd><span class="mono num">2026-10-17 15:42:51 UTC</span> <span style="color: var(--faint);">· 3 s ago</span></dd></div>
+        <div class="kv"><dt>Ledger hash</dt><dd><span class="mono" style="font-size: 13px;">F1B8DCD834F3B5D39C7F0C3F67D9D128B55231ADDC3B94CE1624FD9B6CBACBF2</span><button type="button" class="copy" aria-label="Copy ledger hash"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V6a2 2 0 0 1 2-2h8"></path></svg></button></dd></div>
+        <div class="kv"><dt>Parent hash</dt><dd><a class="mono" href="Ledger.dc.html" style="font-size: 13px;">3A89843AACF945FE5F6564F771CA83861E320D1C59E0C4CE72A05BDBCD6D33E0</a></dd></div>
+        <div class="kv"><dt>Total supply</dt><dd class="mono num">{{supply}}</dd></div>
+        <div class="kv"><dt>Fees burned</dt><dd><span class="mono num">{{fees}}</span> <span style="color: var(--faint);">· min {{feeMin}} · max {{feeMax}}</span></dd></div>
+        <div class="kv"><dt>Close time resolution</dt><dd class="num">10 s</dd></div>
+        <div class="kv"><dt>Transaction tree hash</dt><dd class="mono" style="font-size: 13px; color: var(--muted);">F0B98D5A7B478FA4184880FB5539D4D0922C172E4ACE17F376B27C565BFFC1A7</dd></div>
+        <div class="kv"><dt>Account state hash</dt><dd class="mono" style="font-size: 13px; color: var(--muted);">8ED0360115ECB3F183FDE7906326A9168E01485044AB8FCE2E53404A0BFB92EB</dd></div>
+      </dl>
+    </section>
+
+    <aside aria-label="Results" style="flex: 1 1 300px; min-width: 0; display: flex; flex-direction: column; gap: 12px;">
+      <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px;">
+        <span style="font-size: 12px; color: var(--faint); font-weight: 500;">Transactions</span>
+        <span class="mono num" style="font-size: 30px; font-weight: 500;">84</span>
+        <div aria-hidden="true" style="display: flex; height: 8px; border-radius: 99px; overflow: hidden; background: var(--sunken);">
+          <span style="width: 97.6%; background: var(--ok);"></span><span style="width: 2.4%; background: var(--bad);"></span>
+        </div>
+        <span style="font-size: 13px; color: var(--muted);">82 succeeded · 2 failed (<span class="mono" style="font-size: 12px;">tecPATH_DRY</span>, <span class="mono" style="font-size: 12px;">tecUNFUNDED_OFFER</span>)</span>
+      </div>
+      <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 6px;">
+        <span style="font-size: 12px; color: var(--faint); font-weight: 500;">Accounts created</span>
+        <span class="mono num" style="font-size: 22px; font-weight: 500;">3</span>
+        <span style="font-size: 13px; color: var(--muted);">Payments: 38 · DEX trades: 51</span>
+      </div>
+    </aside>
+  </div>
+
+  <section aria-labelledby="txs-title" style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;">
+    <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--border);">
+      <h2 id="txs-title" style="margin: 0; font-size: 15px; font-weight: 600;">Transactions in this ledger</h2>
+      <div role="group" aria-label="Filter by type" style="display: flex; flex-wrap: wrap; gap: 6px;">
+        <sc-for list="{{chips}}" as="c" hint-placeholder-count="8">
+          <button type="button" class="fchip {{c.cls}}" aria-pressed="{{c.on}}" onClick="{{c.pick}}">{{c.label}} <b>{{c.n}}</b></button>
+        </sc-for>
+      </div>
+    </div>
+    <div style="overflow-x: auto;">
+      <div role="table" aria-label="Transactions" style="min-width: 900px; --cols: 36px 124px 110px minmax(130px, 1fr) minmax(220px, 2fr) 150px 84px;">
+        <div role="row" class="tr th"><span role="columnheader" class="r">#</span><span role="columnheader">Type</span><span role="columnheader">Hash</span><span role="columnheader">Account</span><span role="columnheader">What happened</span><span role="columnheader">Result</span><span role="columnheader" class="r">Fee ({{cur}})</span></div>
+        <div class="tb">
+          <sc-for list="{{rows}}" as="t" hint-placeholder-count="10">
+            <div role="row" class="tr">
+              <span role="cell" class="r mono num" style="color: var(--faint);">{{t.i}}</span>
+              <span role="cell"><span class="type">{{t.type}}</span></span>
+              <span role="cell"><a class="mono" href="Transaction.dc.html">{{t.hash}}</a></span>
+              <span role="cell" class="ell"><a class="mono" href="Account.dc.html">{{t.acct}}</a></span>
+              <span role="cell" class="ell" style="color: var(--muted);">{{t.what}}</span>
+              <span role="cell">
+                <sc-if value="{{t.ok}}" hint-placeholder-val="{{true}}"><span class="pill ok"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>Success</span></sc-if>
+                <sc-if value="{{t.bad}}" hint-placeholder-val="{{false}}"><span class="pill bad mono" style="font-size: 11px;"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg>{{t.result}}</span></sc-if>
+              </span>
+              <span role="cell" class="r mono num" style="color: var(--muted);">{{t.fee}}</span>
+            </div>
+          </sc-for>
+          <sc-if value="{{empty}}" hint-placeholder-val="{{false}}">
+            <div style="padding: 24px 16px; color: var(--faint); border-top: 1px solid var(--border);">No {{filterName}} transactions among the rows shown.</div>
+          </sc-if>
+        </div>
+      </div>
+    </div>
+    <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--border); font-size: 13px; color: var(--faint);">
+      <span>Showing {{shown}} of 84, in ledger order</span>
+      <button type="button" class="btn">Show all 84</button>
+    </div>
+  </section>
+
+  <details style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;">
+    <summary>Raw ledger header <span style="color: var(--faint); font-weight: 400;">· JSON from /v2/ledgers/{{idxPlain}}</span></summary>
+<pre class="mono">{
+  "ledger_hash": "F1B8DCD834F3B5D39C7F0C3F67D9D128B55231ADDC3B94CE1624FD9B6CBACBF2",
+  "ledger_index": {{idxPlain}},
+  "parent_hash": "3A89843AACF945FE5F6564F771CA83861E320D1C59E0C4CE72A05BDBCD6D33E0",
+  "total_coins": "{{coinsDrops}}",
+  "close_time": 1792251771,
+  "close_time_human": "2026-Oct-17 15:42:51",
+  "close_time_resolution": "10",
+  "close_flags": "0",
+  "account_hash": "8ED0360115ECB3F183FDE7906326A9168E01485044AB8FCE2E53404A0BFB92EB",
+  "transaction_hash": "F0B98D5A7B478FA4184880FB5539D4D0922C172E4ACE17F376B27C565BFFC1A7"
+}</pre>
+  </details>
+</main>
+
+<footer style="border-top: 1px solid var(--border); background: var(--surface);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 22px 20px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; font-size: 13px; color: var(--faint);">
+    <span>explorer · by GateHub</span>
+    <span>History from validated ledgers. Balances and account state read live from the network.</span>
+    <span style="display: flex; gap: 16px;"><a href="#">API</a><a href="#">Status</a><a href="#">Privacy</a></span>
+  </div>
+</footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["light","dark"],"default":"light"},"accent":{"editor":"color","options":["#2F5BEA","#0F766E","#6D28D9","#111827"],"default":"#2F5BEA","section":"Network colors"},"xahauAccent":{"editor":"color","options":["#B45309","#C2410C","#A16207"],"default":"#B45309","section":"Network colors"},"$preview":{"width":1440,"height":1900}}'>
+class Component extends DCLogic {
+  state = { net: 'xrpl', type: 'All' };
+
+  renderVals() {
+    const dark = (this.props.theme ?? 'light') === 'dark';
+    const accent = this.props.accent ?? '#2F5BEA';
+    const xahauAccent = this.props.xahauAccent ?? '#B45309';
+    const x = this.state.net === 'xrpl';
+    const cur = x ? 'XRP' : 'XAH';
+    const fmt = (n) => n.toLocaleString('en-US');
+    const base = x ? 107695660 : 17482913;
+    const sh = (h) => h.slice(0, 6) + '…' + h.slice(-4);
+    const sa = (a) => a.slice(0, 7) + '…' + a.slice(-4);
+    const swap = x ? {} : { AMMDeposit: 'Invoke', AMMWithdraw: 'ClaimReward', NFTokenMint: 'URITokenMint' };
+    const T = (t) => swap[t] || t;
+
+    const A = ['rJF2XanJQGFLS5ZUdcqEzwJcTJ7aFfQvg', 'rNYbL8WZKKNNni5rb2MzcxnAEgkQC5Kq5', 'rYogZ7DwjEpJRbgSJ8b3dxZ36sChdfGaWm', 'r6vquFEFVbUo4MjDCbLGjPWhJJjP3aaRB', 'rwisR4ZSrwz6vzysSnH8BCKuLuSohnnkW', 'roi9qyY1VuFnxPbvTQAmz7VKdyexUeH1g6', 'rfpH3eL5ygepvDHD3e8MAWKM4covQzdX3f', 'rsW8GcM3uP3jQU5D8jHXAwzDeEiznvYgY', 'rCQfy3KYLbRWPwhMwJSXyy63kqdT3biWWL', 'rmMVsQDUPfwi3BpqmZRWHWDWeaxHqtQCwp', 'rAtRwrVakWQaGpzxtqgJZDb3Tg7t32rXT', 'rYYUaKeSBhKpqu4ZHtR6dzer3PPytaTMy', 'rA7wzfRjziBcrbFwErG1t2sdVofKQmg95', 'ropjwRLHMWtcvhLrX6uF1wPD6s6Yj1QgEP'];
+    const H = ['67F91E110D4E3E6C2E6DA3D42EDFB36D9860D024406F58A12CDDF09B65057C31', 'CB56CF15676C43E094B201D19AD2CDA2254594CC586437E177B70263F6748AD5', 'FC1CF65511DFB9262EF3B7ECC8D95885BA356EA78806BC5D678831F323721ED4', 'E205A66506ECE4ECCB3E87CD8A224379271F4D616D40A272032CE337180C1E33', 'ED94BD3929D59DD55D03452E4A3B500786FDA0C43ACC98B05F9C01F32F177D15', 'EBDD05F21EC1966E01B37B026BB1F8431E036A8EE4236CF5833543E9538D1D93', '2907D3365841C438AEA576BA82AA2623133FF50E765DA85878E3ABF3A141C77C', '77FDE05B3585525EEA7E1B648A6CCD5EB41BB8654537063B977CDCE95FC05BFA', 'F30137318C939DA60A1F635C9099D729B657987B5D07748D195792743ED687A2', '17FB13C110A02565B9A9E7EF80AB164CC4352B58641879B8A1EAB5E49CE3C2C5', 'D8CFD81B5CDEF652EA69517E3CECB4E1DF8D9925DF96F45AC2EDFE24023CCC2C', '49B504EC600F5C5A81859A6960819DC5A37377ACBCF532270F42EB269402A5D0', '686170EBAB86DE3789CC7A0B8B4A9FC841CA989B344D8DE4F6D9301A4516433D', '2854CE7B05906D6FAA7F58C54B94765B98C6BDF1357D733CF9F5061381C55E7F'];
+    const raw = [
+      ['Payment', 'Sent 1,250.00 USD to ' + sa(A[1]), '', '0.000012'],
+      ['OfferCreate', 'Sell 5,000 ' + cur + ' for 12,410.00 USD', '', '0.000012'],
+      ['Payment', 'Sent 42.5 ' + cur + ' to ' + sa(A[3]), '', '0.00001'],
+      ['AMMDeposit', x ? 'Added 1,800 XRP + 4,410.00 USD to the XRP/USD pool' : 'Invoked hook on ' + sa(A[5]), '', '0.000012'],
+      ['OfferCancel', 'Cancelled offer #8,812', '', '0.00001'],
+      ['TrustSet', 'Trust line for BTC, limit 10', '', '0.000012'],
+      ['Payment', 'Tried to send 320 ' + cur + ' to ' + sa(A[8]), 'tecPATH_DRY', '0.000012'],
+      ['OfferCreate', 'Buy 0.0125 BTC for 7,820 ' + cur, '', '0.000015'],
+      ['NFTokenMint', x ? 'Minted an NFT, taxon 7, transfer fee 5%' : 'Minted a URIToken', '', '0.000012'],
+      ['Payment', 'Sent 18.00 EUR to ' + sa(A[2]), '', '0.000012'],
+      ['OfferCreate', 'Sell 920.00 USD for 371 ' + cur, 'tecUNFUNDED_OFFER', '0.000012'],
+      ['AMMWithdraw', x ? 'Withdrew 2.1% of the XRP/EUR pool' : 'Claimed 2.31 XAH of rewards', '', '0.000012'],
+      ['Payment', 'Sent 5 ' + cur + ' to ' + sa(A[9]), '', '0.00001'],
+      ['EscrowFinish', 'Released 1,000 ' + cur + ' from escrow', '', '0.000012']
+    ];
+    const main = ['Payment', 'OfferCreate', 'OfferCancel', 'TrustSet', 'AMMDeposit', 'NFTokenMint', 'AMMWithdraw'];
+    const all = raw.map((r, i) => ({
+      i: i, baseType: r[0], type: T(r[0]), what: r[1], result: r[2], ok: !r[2], bad: !!r[2], fee: r[3],
+      hash: sh(H[i]), acct: sa(A[i])
+    }));
+    const f = this.state.type;
+    const rows = f === 'All' ? all
+      : f === 'Other' ? all.filter((r) => main.indexOf(r.baseType) < 0)
+      : all.filter((r) => r.baseType === f);
+
+    const chipDefs = [['All', 84], ['Payment', 38], ['OfferCreate', 24], ['OfferCancel', 9], ['TrustSet', 5], ['AMMDeposit', 3], ['NFTokenMint', 2], ['AMMWithdraw', 1], ['Other', 2]];
+    const chips = chipDefs.map((c) => ({
+      label: c[0] === 'All' || c[0] === 'Other' ? c[0] : T(c[0]), n: c[1],
+      on: f === c[0], cls: f === c[0] ? 'on' : '',
+      pick: () => this.setState({ type: c[0] })
+    }));
+
+    return {
+      themeClass: dark ? 'dark' : '',
+      accentNow: x ? accent : xahauAccent,
+      xrplDot: accent, xahauDot: xahauAccent,
+      isXrpl: x, isXahau: !x,
+      xrplCls: x ? 'on' : '', xahauCls: x ? '' : 'on',
+      pickXrpl: () => this.setState({ net: 'xrpl' }),
+      pickXahau: () => this.setState({ net: 'xahau' }),
+      netName: x ? 'XRPL' : 'Xahau', cur,
+      idx: fmt(base), idxPlain: String(base), prevIdx: fmt(base - 1), nextIdx: fmt(base + 1),
+      supply: x ? '99,985,312,446.118204 XRP' : '613,402,118.440291 XAH',
+      coinsDrops: x ? '99985312446118204' : '613402118440291',
+      fees: '0.001284 ' + cur, feeMin: '0.00001', feeMax: '0.00012',
+      chips, rows, shown: rows.length, empty: rows.length === 0,
+      filterName: f
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Link preview image</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.mono{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+</style>
+</helmet>
+<div style="width: 1200px; height: 630px; box-sizing: border-box; background: #FFFFFF; color: #0F1217; font-family: 'Geist', ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; position: relative; overflow: hidden;">
+  <div style="height: 10px; background: {{accent}}; flex: none;"></div>
+  <div style="flex: 1 1 auto; padding: 56px 72px 52px; display: flex; flex-direction: column; justify-content: space-between;">
+
+    <div style="display: flex; align-items: center; justify-content: space-between;">
+      <div style="display: flex; align-items: center; gap: 16px;">
+        <svg aria-hidden="true" width="48" height="48" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="8" fill="{{accent}}"></rect><path d="M8 10h7M8 14h12M8 18h9" stroke="#fff" stroke-width="2.2" stroke-linecap="round"></path></svg>
+        <span style="font-size: 30px; font-weight: 650; letter-spacing: -0.01em;">explorer</span>
+      </div>
+      <span style="display: flex; align-items: center; gap: 12px; font-size: 26px; font-weight: 500; color: #3B434E; border: 2px solid #E1E4E9; border-radius: 999px; padding: 8px 22px;"><span style="width: 14px; height: 14px; border-radius: 50%; background: {{accent}};"></span>XRPL mainnet</span>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 18px;">
+      <div style="display: flex; align-items: center; gap: 18px;">
+        <span style="font-size: 34px; font-weight: 600; color: #3B434E;">Payment</span>
+        <span style="display: inline-flex; align-items: center; gap: 10px; font-size: 26px; font-weight: 600; color: #17733F; background: #E3F3E9; border-radius: 999px; padding: 6px 18px;"><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>Success</span>
+      </div>
+      <span class="mono" style="font-size: 92px; font-weight: 500; letter-spacing: -0.035em; line-height: 1;">1,250.00 USD</span>
+      <span class="mono" style="font-size: 34px; color: #3B434E; display: flex; align-items: center; gap: 18px;">rJF2Xa…FQvg <svg aria-hidden="true" width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#7A8390" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg> rNYbL8…Kq5</span>
+    </div>
+
+    <div style="display: flex; align-items: flex-end; justify-content: space-between; border-top: 2px solid #EEF0F3; padding-top: 24px; font-size: 24px; color: #4F5864;">
+      <span>Ledger <span class="mono">#107,695,660</span> · 17 Oct 2026, 15:42 UTC</span>
+      <span class="mono">67F91E…7C31</span>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","options":["#2F5BEA","#B45309","#0F766E","#111827"],"default":"#2F5BEA"},"$preview":{"width":1200,"height":630}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { accent: this.props.accent ?? '#2F5BEA' };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Explorer home</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.xp{--bg:#F5F6F8;--surface:#FFFFFF;--sunken:#EEF0F3;--border:#E1E4E9;--border-strong:#CDD2D9;--fg:#0F1217;--muted:#4F5864;--faint:#646D7A;--link:var(--accent);--ok:#17733F;--ok-bg:#E3F3E9;--bad:#B42318;--bad-bg:#FCEBE9;font-family:'Geist',ui-sans-serif,system-ui,sans-serif;color:var(--fg);background:var(--bg);min-height:100vh;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+.xp.dark{--bg:#0B0E12;--surface:#12161C;--sunken:#181D24;--border:#232A33;--border-strong:#323B46;--fg:#E7EBF0;--muted:#A3ACB9;--faint:#8D97A5;--link:color-mix(in srgb,var(--accent) 55%,#ffffff);--ok:#5BD08F;--ok-bg:#10281B;--bad:#F28B80;--bad-bg:#30161A}
+.xp a{color:var(--link);text-decoration:none}
+.xp a:hover{text-decoration:underline}
+.xp button,.xp input{font:inherit;color:inherit}
+.xp :focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.mono{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.seg{border:0;background:transparent;padding:6px 12px;border-radius:7px;display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:500;color:var(--muted);min-height:32px}
+.seg.on{background:var(--surface);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--border)}
+.nav{padding:8px 10px;border-radius:7px;color:var(--muted)!important;font-weight:500;display:inline-flex;align-items:center}
+.nav:hover{background:var(--sunken);text-decoration:none!important;color:var(--fg)!important}
+.soon{font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);border:1px solid var(--border);border-radius:4px;padding:0 4px;margin-left:6px}
+.tr{display:grid;grid-template-columns:var(--cols);align-items:center;column-gap:16px;padding:0 16px;min-height:46px;border-top:1px solid var(--border)}
+.th{min-height:36px;font-size:12px;font-weight:500;color:var(--faint);border-top:0}
+.tb .tr:hover{background:var(--sunken)}
+.r{text-align:right;justify-self:end}
+.ell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:500;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.ok{color:var(--ok);background:var(--ok-bg)}
+.bad{color:var(--bad);background:var(--bad-bg)}
+.type{font-size:12px;font-weight:500;padding:2px 7px;border-radius:5px;background:var(--sunken);border:1px solid var(--border);color:var(--fg);white-space:nowrap}
+.chip{border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:5px 11px;cursor:pointer;color:var(--muted);font-size:13px;min-height:32px}
+.chip:hover{border-color:var(--border-strong);color:var(--fg)}
+.hit{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:9px;color:var(--fg)!important}
+.hit:hover{background:var(--sunken);text-decoration:none!important}
+</style>
+</helmet>
+<div class="xp {{themeClass}}" style="--accent: {{accentNow}};">
+
+<header style="background: var(--surface); border-bottom: 1px solid var(--border);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;">
+    <a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; color: var(--fg);" aria-label="Explorer home">
+      <svg aria-hidden="true" width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="8" style="fill: var(--accent)"></rect><path d="M8 10h7M8 14h12M8 18h9" stroke="#fff" stroke-width="2.2" stroke-linecap="round"></path></svg>
+      <span style="font-weight: 650; font-size: 17px; letter-spacing: -0.01em;">explorer</span>
+    </a>
+    <div role="group" aria-label="Network" style="display: flex; padding: 3px; background: var(--sunken); border: 1px solid var(--border); border-radius: 9px;">
+      <button type="button" class="seg {{xrplCls}}" aria-pressed="{{isXrpl}}" onClick="{{pickXrpl}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xrplDot}};"></span>XRPL</button>
+      <button type="button" class="seg {{xahauCls}}" aria-pressed="{{isXahau}}" onClick="{{pickXahau}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xahauDot}};"></span>Xahau</button>
+    </div>
+    <nav aria-label="Main" style="display: flex; flex-wrap: wrap; gap: 2px; flex: 1 1 auto;">
+      <a class="nav" href="Ledger.dc.html">Ledgers</a>
+      <a class="nav" href="Transaction.dc.html">Transactions</a>
+      <a class="nav" href="Account.dc.html">Accounts</a>
+      <a class="nav" href="Network.dc.html">Network</a>
+      <a class="nav" href="Markets.dc.html">Markets</a>
+      <a class="nav" href="Amm.dc.html">AMM</a>
+    </nav>
+  </div>
+</header>
+
+<main style="max-width: 1240px; margin: 0 auto; padding: 0 20px 64px;">
+
+  <section aria-labelledby="hero-title" style="padding: 56px 0 36px; display: flex; flex-direction: column; gap: 18px; max-width: 760px;">
+    <div style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted);">
+      <span style="width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 4px var(--ok-bg);"></span>
+      <span>{{netName}} mainnet · ledger <a class="mono num" href="Ledger.dc.html">#{{latestIdx}}</a> validated 3 s ago</span>
+    </div>
+    <h1 id="hero-title" style="margin: 0; font-size: 40px; line-height: 1.1; letter-spacing: -0.025em; font-weight: 650;">{{heroTitle}}</h1>
+    <p style="margin: 0; font-size: 16px; color: var(--muted); max-width: 620px;">Look up any ledger, transaction or account from validated history. Balances and account settings are read live from the network.</p>
+
+    <form role="search" onSubmit="{{submit}}" style="display: flex; flex-direction: column; gap: 10px; margin-top: 6px;">
+      <label for="home-q" class="sr">Search {{netName}}</label>
+      <div style="display: flex; align-items: center; gap: 10px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px; padding: 6px 6px 6px 16px; box-shadow: 0 1px 2px rgba(15,18,23,.04), 0 6px 20px -12px rgba(15,18,23,.25);">
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint); flex: none;"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+        <input id="home-q" type="search" class="mono" value="{{q}}" onChange="{{onQ}}" placeholder="Address, transaction hash, ledger index or CTID" autocomplete="off" style="flex: 1 1 auto; min-width: 0; border: 0; outline: none; background: transparent; font-size: 15px; padding: 10px 0;">
+        <button type="submit" style="border: 0; border-radius: 8px; background: var(--accent); color: #fff; font-weight: 600; padding: 0 18px; min-height: 44px; cursor: pointer;">Search</button>
+      </div>
+
+      <sc-if value="{{showExamples}}" hint-placeholder-val="{{true}}">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; color: var(--faint);">
+          <span>Try</span>
+          <sc-for list="{{examples}}" as="ex" hint-placeholder-count="4">
+            <button type="button" class="chip" onClick="{{ex.pick}}">{{ex.label}}</button>
+          </sc-for>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{hasHits}}" hint-placeholder-val="{{false}}">
+        <div role="listbox" aria-label="Matches" style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 6px; display: flex; flex-direction: column;">
+          <sc-for list="{{hits}}" as="h" hint-placeholder-count="1">
+            <a class="hit" href="{{h.href}}">
+              <span class="type">{{h.kind}}</span>
+              <span class="mono ell" style="flex: 1 1 auto; color: var(--muted);">{{h.detail}}</span>
+              <span style="font-size: 12px; color: var(--faint); white-space: nowrap;">on {{netName}}</span>
+              <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint);"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+            </a>
+          </sc-for>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{noHits}}" hint-placeholder-val="{{false}}">
+        <div style="background: var(--surface); border: 1px dashed var(--border-strong); border-radius: 12px; padding: 14px 16px; color: var(--muted); font-size: 13px;">
+          Nothing on {{netName}} looks like that. Enter an address (r…), a 64-character transaction or ledger hash, a ledger index, or a CTID (C followed by 15 hex digits).
+        </div>
+      </sc-if>
+    </form>
+  </section>
+
+  <section aria-label="Network at a glance" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 28px;">
+    <sc-for list="{{stats}}" as="s" hint-placeholder-count="4">
+      <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 6px;">
+        <span style="font-size: 12px; color: var(--faint); font-weight: 500;">{{s.label}}</span>
+        <span class="mono num" style="font-size: 22px; font-weight: 500; letter-spacing: -0.01em;">{{s.value}}</span>
+        <span style="font-size: 12px; color: var(--muted);">{{s.sub}}</span>
+      </div>
+    </sc-for>
+  </section>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start;">
+
+    <section aria-labelledby="ll-title" style="flex: 1 1 400px; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;">
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border);">
+        <h2 id="ll-title" style="margin: 0; font-size: 15px; font-weight: 600;">Latest ledgers</h2>
+        <a href="Ledger.dc.html" style="font-size: 13px; font-weight: 500;">Latest ledger →</a>
+      </div>
+      <div style="overflow-x: auto;">
+        <div role="table" aria-label="Latest ledgers" style="min-width: 380px; --cols: minmax(120px, 1.4fr) 70px 90px 70px;">
+          <div role="row" class="tr th"><span role="columnheader">Ledger</span><span role="columnheader" class="r">Txs</span><span role="columnheader" class="r">Closed (UTC)</span><span role="columnheader" class="r">Age</span></div>
+          <div class="tb">
+            <sc-for list="{{ledgers}}" as="l" hint-placeholder-count="8">
+              <div role="row" class="tr">
+                <span role="cell"><a class="mono num" href="Ledger.dc.html">{{l.idx}}</a></span>
+                <span role="cell" class="r mono num">{{l.txs}}</span>
+                <span role="cell" class="r mono num" style="color: var(--muted);">{{l.closed}}</span>
+                <span role="cell" class="r num" style="color: var(--faint); font-size: 13px;">{{l.age}}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="lt-title" style="flex: 999 1 560px; min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;">
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border);">
+        <h2 id="lt-title" style="margin: 0; font-size: 15px; font-weight: 600;">Latest transactions</h2>
+        <a href="Ledger.dc.html" style="font-size: 13px; font-weight: 500;">All in ledger #{{latestIdx}} →</a>
+      </div>
+      <div style="overflow-x: auto;">
+        <div role="table" aria-label="Latest transactions" style="min-width: 640px; --cols: 118px 104px minmax(120px, 1fr) minmax(110px, 1fr) 118px 48px;">
+          <div role="row" class="tr th"><span role="columnheader">Type</span><span role="columnheader">Hash</span><span role="columnheader">Account</span><span role="columnheader" class="r">Amount</span><span role="columnheader">Result</span><span role="columnheader" class="r">Age</span></div>
+          <div class="tb">
+            <sc-for list="{{txs}}" as="t" hint-placeholder-count="8">
+              <div role="row" class="tr">
+                <span role="cell"><span class="type">{{t.type}}</span></span>
+                <span role="cell"><a class="mono" href="Transaction.dc.html">{{t.hash}}</a></span>
+                <span role="cell" class="ell"><a class="mono" href="Account.dc.html">{{t.acct}}</a></span>
+                <span role="cell" class="r mono num ell">{{t.amount}}</span>
+                <span role="cell">
+                  <sc-if value="{{t.ok}}" hint-placeholder-val="{{true}}"><span class="pill ok"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>Success</span></sc-if>
+                  <sc-if value="{{t.bad}}" hint-placeholder-val="{{false}}"><span class="pill bad mono" style="font-size: 11px;"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg>{{t.result}}</span></sc-if>
+                </span>
+                <span role="cell" class="r num" style="color: var(--faint); font-size: 13px;">{{t.age}}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<footer style="border-top: 1px solid var(--border); background: var(--surface);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 22px 20px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; font-size: 13px; color: var(--faint);">
+    <span>explorer · by GateHub</span>
+    <span>History from validated ledgers. Balances and account state read live from the network.</span>
+    <span style="display: flex; gap: 16px;"><a href="#">API</a><a href="#">Status</a><a href="#">Privacy</a></span>
+  </div>
+</footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["light","dark"],"default":"light"},"accent":{"editor":"color","options":["#2F5BEA","#0F766E","#6D28D9","#111827"],"default":"#2F5BEA","section":"Network colors"},"xahauAccent":{"editor":"color","options":["#B45309","#C2410C","#A16207"],"default":"#B45309","section":"Network colors"},"$preview":{"width":1440,"height":1560}}'>
+class Component extends DCLogic {
+  state = { net: 'xrpl', q: '' };
+
+  renderVals() {
+    const dark = (this.props.theme ?? 'light') === 'dark';
+    const accent = this.props.accent ?? '#2F5BEA';
+    const xahauAccent = this.props.xahauAccent ?? '#B45309';
+    const x = this.state.net === 'xrpl';
+    const cur = x ? 'XRP' : 'XAH';
+    const netName = x ? 'XRPL' : 'Xahau';
+    const fmt = (n) => n.toLocaleString('en-US');
+    const base = x ? 107695660 : 17482913;
+    const sh = (h) => h.slice(0, 6) + '…' + h.slice(-4);
+    const sa = (a) => a.slice(0, 7) + '…' + a.slice(-4);
+
+    const counts = x ? [84, 61, 97, 73, 58, 112, 66, 79] : [12, 9, 15, 7, 11, 8, 14, 10];
+    const closed = ['15:42:51', '15:42:47', '15:42:43', '15:42:39', '15:42:36', '15:42:32', '15:42:28', '15:42:24'];
+    const ages = ['3 s', '7 s', '11 s', '15 s', '18 s', '22 s', '26 s', '30 s'];
+    const ledgers = counts.map((c, i) => ({ idx: fmt(base - i), txs: c, closed: closed[i], age: ages[i] }));
+    const avg = Math.round(counts.reduce((a, b) => a + b, 0) / counts.length);
+
+    const A = ['rJF2XanJQGFLS5ZUdcqEzwJcTJ7aFfQvg', 'rNYbL8WZKKNNni5rb2MzcxnAEgkQC5Kq5', 'rYogZ7DwjEpJRbgSJ8b3dxZ36sChdfGaWm', 'r6vquFEFVbUo4MjDCbLGjPWhJJjP3aaRB', 'rwisR4ZSrwz6vzysSnH8BCKuLuSohnnkW', 'roi9qyY1VuFnxPbvTQAmz7VKdyexUeH1g6', 'rfpH3eL5ygepvDHD3e8MAWKM4covQzdX3f', 'rsW8GcM3uP3jQU5D8jHXAwzDeEiznvYgY'];
+    const H = ['67F91E110D4E3E6C2E6DA3D42EDFB36D9860D024406F58A12CDDF09B65057C31', 'CB56CF15676C43E094B201D19AD2CDA2254594CC586437E177B70263F6748AD5', 'FC1CF65511DFB9262EF3B7ECC8D95885BA356EA78806BC5D678831F323721ED4', 'E205A66506ECE4ECCB3E87CD8A224379271F4D616D40A272032CE337180C1E33', 'ED94BD3929D59DD55D03452E4A3B500786FDA0C43ACC98B05F9C01F32F177D15', 'EBDD05F21EC1966E01B37B026BB1F8431E036A8EE4236CF5833543E9538D1D93', '2907D3365841C438AEA576BA82AA2623133FF50E765DA85878E3ABF3A141C77C', '77FDE05B3585525EEA7E1B648A6CCD5EB41BB8654537063B977CDCE95FC05BFA'];
+    const rowsX = [
+      ['Payment', '1,250.00 USD', ''], ['OfferCreate', '5,000 XRP', ''], ['AMMDeposit', '1,800 XRP + 4,410 USD', ''], ['TrustSet', '—', ''],
+      ['Payment', '320 XRP', 'tecPATH_DRY'], ['OfferCancel', '—', ''], ['NFTokenMint', '—', ''], ['Payment', '42.5 XRP', '']
+    ];
+    const rowsH = [
+      ['Payment', '150 XAH', ''], ['URITokenMint', '—', ''], ['Invoke', '—', ''], ['ClaimReward', '2.31 XAH', ''],
+      ['Payment', '75 XAH', 'tecUNFUNDED_PAYMENT'], ['SetHook', '—', ''], ['Remit', '10 XAH', ''], ['TrustSet', '—', '']
+    ];
+    const txs = (x ? rowsX : rowsH).map((r, i) => ({
+      type: r[0], amount: r[1], result: r[2], ok: !r[2], bad: !!r[2],
+      hash: sh(H[i]), acct: sa(A[i]), age: i < 3 ? '3 s' : i < 6 ? '7 s' : '11 s'
+    }));
+
+    const stats = x ? [
+      { label: 'Latest validated ledger', value: '#' + fmt(base), sub: 'closed 3 s ago' },
+      { label: 'Transactions per ledger', value: String(counts[0]), sub: 'average ' + avg + ' over the last 8' },
+      { label: 'Fees burned, last ledger', value: '0.001284 XRP', sub: 'base fee 0.00001 XRP' },
+      { label: 'Total supply', value: '99,985,312,446 XRP', sub: 'from the latest ledger header' }
+    ] : [
+      { label: 'Latest validated ledger', value: '#' + fmt(base), sub: 'closed 3 s ago' },
+      { label: 'Transactions per ledger', value: String(counts[0]), sub: 'average ' + avg + ' over the last 8' },
+      { label: 'Fees burned, last ledger', value: '0.000196 XAH', sub: 'base fee 0.00001 XAH' },
+      { label: 'Total supply', value: '613,402,118 XAH', sub: 'from the latest ledger header' }
+    ];
+
+    const exampleVals = x
+      ? [String(base), A[0], H[0], 'C66B4E4C00450000']
+      : [String(base), A[3], H[3], 'C10AC3A100075399'];
+    const examples = exampleVals.map((v) => ({
+      label: v.length > 20 ? v.slice(0, 10) + '…' : v,
+      pick: () => this.setState({ q: v })
+    }));
+
+    const q = (this.state.q || '').trim();
+    let hits = [];
+    if (/^\d{1,10}$/.test(q)) hits = [{ kind: 'Ledger', detail: '#' + fmt(Number(q)), href: 'Ledger.dc.html' }];
+    else if (/^[0-9a-fA-F]{64}$/.test(q)) hits = [
+      { kind: 'Transaction', detail: q.toUpperCase(), href: 'Transaction.dc.html' },
+      { kind: 'Ledger', detail: q.toUpperCase(), href: 'Ledger.dc.html' }
+    ];
+    else if (/^[cC][0-9a-fA-F]{15}$/.test(q)) hits = [{ kind: 'Transaction', detail: 'CTID ' + q.toUpperCase(), href: 'Transaction.dc.html' }];
+    else if (/^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(q)) hits = [{ kind: 'Account', detail: q, href: 'Account.dc.html' }];
+
+    return {
+      themeClass: dark ? 'dark' : '',
+      accentNow: x ? accent : xahauAccent,
+      xrplDot: accent, xahauDot: xahauAccent,
+      isXrpl: x, isXahau: !x,
+      xrplCls: x ? 'on' : '', xahauCls: x ? '' : 'on',
+      pickXrpl: () => this.setState({ net: 'xrpl' }),
+      pickXahau: () => this.setState({ net: 'xahau' }),
+      netName, cur,
+      heroTitle: x ? 'Explore the XRP Ledger' : 'Explore Xahau',
+      latestIdx: fmt(base),
+      q: this.state.q,
+      onQ: (e) => this.setState({ q: e.target.value }),
+      submit: (e) => { e.preventDefault(); },
+      showExamples: !q, examples,
+      hits, hasHits: hits.length > 0, noHits: !!q && hits.length === 0,
+      stats, ledgers, txs
+    };
+  }
+}
+</script>
+</body>
+</html>

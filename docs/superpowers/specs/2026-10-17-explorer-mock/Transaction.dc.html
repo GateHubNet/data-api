@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Transaction page</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.xp{--bg:#F5F6F8;--surface:#FFFFFF;--sunken:#EEF0F3;--border:#E1E4E9;--border-strong:#CDD2D9;--fg:#0F1217;--muted:#4F5864;--faint:#646D7A;--link:var(--accent);--ok:#17733F;--ok-bg:#E3F3E9;--bad:#B42318;--bad-bg:#FCEBE9;font-family:'Geist',ui-sans-serif,system-ui,sans-serif;color:var(--fg);background:var(--bg);min-height:100vh;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+.xp.dark{--bg:#0B0E12;--surface:#12161C;--sunken:#181D24;--border:#232A33;--border-strong:#323B46;--fg:#E7EBF0;--muted:#A3ACB9;--faint:#8D97A5;--link:color-mix(in srgb,var(--accent) 55%,#ffffff);--ok:#5BD08F;--ok-bg:#10281B;--bad:#F28B80;--bad-bg:#30161A}
+.xp a{color:var(--link);text-decoration:none}
+.xp a:hover{text-decoration:underline}
+.xp button,.xp input{font:inherit;color:inherit}
+.xp :focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.mono{font-family:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.seg{border:0;background:transparent;padding:6px 12px;border-radius:7px;display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:500;color:var(--muted);min-height:32px}
+.seg.on{background:var(--surface);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--border)}
+.nav{padding:8px 10px;border-radius:7px;color:var(--muted)!important;font-weight:500;display:inline-flex;align-items:center}
+.nav:hover{background:var(--sunken);text-decoration:none!important;color:var(--fg)!important}
+.nav.cur{color:var(--fg)!important;background:var(--sunken)}
+.soon{font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);border:1px solid var(--border);border-radius:4px;padding:0 4px;margin-left:6px}
+.tr{display:grid;grid-template-columns:var(--cols);align-items:center;column-gap:16px;padding:0 16px;min-height:46px;border-top:1px solid var(--border)}
+.th{min-height:36px;font-size:12px;font-weight:500;color:var(--faint);border-top:0}
+.r{text-align:right;justify-self:end}
+.ell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:500;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.ok{color:var(--ok);background:var(--ok-bg)}
+.bad{color:var(--bad);background:var(--bad-bg)}
+.type{font-size:12px;font-weight:500;padding:2px 7px;border-radius:5px;background:var(--sunken);border:1px solid var(--border);color:var(--fg);white-space:nowrap}
+.btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:var(--surface);border-radius:8px;padding:0 12px;min-height:36px;color:var(--fg)!important;font-weight:500;font-size:13px;cursor:pointer}
+.btn:hover{border-color:var(--border-strong);text-decoration:none!important}
+.kv{display:grid;grid-template-columns:160px minmax(0,1fr);gap:4px 16px;padding:11px 0;border-top:1px solid var(--border);align-items:baseline}
+.kv dt{color:var(--faint);font-size:13px}
+.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.copy{border:0;background:transparent;color:var(--faint);cursor:pointer;padding:4px;border-radius:5px;vertical-align:middle;min-width:28px;min-height:28px}
+.copy:hover{color:var(--fg);background:var(--sunken)}
+.ent{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:7px;background:var(--sunken);border:1px solid var(--border);font-family:'Geist Mono',ui-monospace,monospace;font-size:14px;color:var(--fg)!important}
+a.ent:hover{border-color:var(--border-strong);text-decoration:none!important}
+.amt{font-family:'Geist Mono',ui-monospace,monospace;font-weight:500;font-variant-numeric:tabular-nums}
+.pos{color:var(--ok)}
+.tab{border:0;background:transparent;padding:10px 4px;margin-right:18px;cursor:pointer;color:var(--muted);font-weight:500;border-bottom:2px solid transparent;min-height:44px}
+.tab.on{color:var(--fg);border-bottom-color:var(--accent)}
+.node{flex:1 1 200px;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:4px}
+.arrow{flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:var(--faint);padding:0 2px}
+pre{margin:0;padding:16px;overflow:auto;font-size:12.5px;line-height:1.6;background:var(--sunken);max-height:420px;white-space:pre}
+@media (max-width:640px){.kv{grid-template-columns:1fr}.arrow{transform:rotate(90deg);width:100%}}
+</style>
+</helmet>
+<div class="xp {{themeClass}}" style="--accent: {{accentNow}};">
+
+<header style="background: var(--surface); border-bottom: 1px solid var(--border);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;">
+    <a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; color: var(--fg);" aria-label="Explorer home">
+      <svg aria-hidden="true" width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="8" style="fill: var(--accent)"></rect><path d="M8 10h7M8 14h12M8 18h9" stroke="#fff" stroke-width="2.2" stroke-linecap="round"></path></svg>
+      <span style="font-weight: 650; font-size: 17px; letter-spacing: -0.01em;">explorer</span>
+    </a>
+    <div role="group" aria-label="Network" style="display: flex; padding: 3px; background: var(--sunken); border: 1px solid var(--border); border-radius: 9px;">
+      <button type="button" class="seg {{xrplCls}}" aria-pressed="{{isXrpl}}" onClick="{{pickXrpl}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xrplDot}};"></span>XRPL</button>
+      <button type="button" class="seg {{xahauCls}}" aria-pressed="{{isXahau}}" onClick="{{pickXahau}}"><span style="width: 8px; height: 8px; border-radius: 50%; background: {{xahauDot}};"></span>Xahau</button>
+    </div>
+    <nav aria-label="Main" style="display: flex; flex-wrap: wrap; gap: 2px;">
+      <a class="nav" href="Ledger.dc.html">Ledgers</a>
+      <a class="nav cur" href="Transaction.dc.html" aria-current="page">Transactions</a>
+      <a class="nav" href="Account.dc.html">Accounts</a>
+      <a class="nav" href="Network.dc.html">Network</a>
+      <a class="nav" href="Markets.dc.html">Markets</a>
+      <a class="nav" href="Amm.dc.html">AMM</a>
+    </nav>
+    <form role="search" style="flex: 1 1 260px; display: flex; align-items: center; gap: 8px; background: var(--sunken); border: 1px solid var(--border); border-radius: 9px; padding: 0 12px; min-height: 40px;">
+      <label for="hdr-q" class="sr">Search</label>
+      <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--faint); flex: none;"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+      <input id="hdr-q" type="search" placeholder="Address, hash, ledger or CTID" style="flex: 1 1 auto; min-width: 0; border: 0; outline: none; background: transparent; font-size: 13px;">
+      <span class="mono" style="font-size: 11px; color: var(--faint); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;">/</span>
+    </form>
+  </div>
+</header>
+
+<main style="max-width: 1240px; margin: 0 auto; padding: 24px 20px 64px; display: flex; flex-direction: column; gap: 20px;">
+
+  <nav aria-label="Breadcrumb" style="font-size: 13px; color: var(--faint); display: flex; gap: 8px; flex-wrap: wrap;">
+    <a href="Main.dc.html">{{netName}}</a><span aria-hidden="true">/</span><a href="Ledger.dc.html">Ledger {{idx}}</a><span aria-hidden="true">/</span><span class="mono" aria-current="page" style="color: var(--muted);">67F91E…7C31</span>
+  </nav>
+
+  <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px;">
+    <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px;">
+      <h1 style="margin: 0; font-size: 30px; letter-spacing: -0.02em; font-weight: 650;">Payment</h1>
+      <span class="pill ok"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>Success <span class="mono" style="font-size: 11px; opacity: .85;">tesSUCCESS</span></span>
+      <span style="font-size: 13px; color: var(--faint);">2026-10-17 15:42:51 UTC · 3 s ago</span>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <button type="button" class="btn"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"></path><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"></path></svg>Copy link</button>
+      <a class="btn" href="#raw">Raw JSON</a>
+    </div>
+  </div>
+
+  <section aria-label="Summary" style="background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px 22px 20px; display: flex; flex-direction: column; gap: 18px;">
+    <p style="margin: 0; font-size: 19px; line-height: 1.9; letter-spacing: -0.005em;">
+      <a class="ent" href="Account.dc.html">rJF2Xa…FQvg</a> paid <span class="amt">1,250.00 USD</span> to <a class="ent" href="Account.dc.html">rNYbL8…Kq5</a>, spending <span class="amt">512.402115 {{cur}}</span> {{via}}.
+    </p>
+    <div style="display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px;">
+      <div class="node">
+        <span style="font-size: 12px; color: var(--faint);">Sender</span>
+        <a class="mono" href="Account.dc.html">rJF2Xa…FQvg</a>
+        <span class="amt" style="font-size: 16px;">−512.402115 {{cur}}</span>
+      </div>
+      <div class="arrow" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></div>
+      <div class="node" style="background: var(--sunken);">
+        <span style="font-size: 12px; color: var(--faint);">{{hopLabel}}</span>
+        <a class="mono" href="Account.dc.html">rAtRwr…2rXT</a>
+        <span style="font-size: 13px; color: var(--muted);">{{hopDetail}}</span>
+      </div>
+      <div class="arrow" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></div>
+      <div class="node">
+        <span style="font-size: 12px; color: var(--faint);">Destination · tag 104882</span>
+        <a class="mono" href="Account.dc.html">rNYbL8…Kq5</a>
+        <span class="amt pos" style="font-size: 16px;">+1,250.00 USD</span>
+      </div>
+    </div>
+  </section>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start;">
+
+    <div style="flex: 999 1 640px; min-width: 0; display: flex; flex-direction: column; gap: 20px;">
+      <section aria-labelledby="det-title" style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 20px 4px;">
+        <h2 id="det-title" style="margin: 0 0 6px; font-size: 15px; font-weight: 600;">Details</h2>
+        <dl style="margin: 0;">
+          <div class="kv"><dt>Hash</dt><dd><span class="mono" style="font-size: 13px;">67F91E110D4E3E6C2E6DA3D42EDFB36D9860D024406F58A12CDDF09B65057C31</span><button type="button" class="copy" aria-label="Copy hash"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V6a2 2 0 0 1 2-2h8"></path></svg></button></dd></div>
+          <div class="kv"><dt>CTID</dt><dd><span class="mono" style="font-size: 13px;">{{ctid}}</span><button type="button" class="copy" aria-label="Copy CTID"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V6a2 2 0 0 1 2-2h8"></path></svg></button></dd></div>
+          <div class="kv"><dt>Ledger</dt><dd><a class="mono num" href="Ledger.dc.html">#{{idx}}</a> <span style="color: var(--faint);">· transaction 12 of 84</span></dd></div>
+          <div class="kv"><dt>Account</dt><dd><a class="mono" href="Account.dc.html" style="font-size: 13px;">rJF2XanJQGFLS5ZUdcqEzwJcTJ7aFfQvg</a></dd></div>
+          <div class="kv"><dt>Destination</dt><dd><a class="mono" href="Account.dc.html" style="font-size: 13px;">rNYbL8WZKKNNni5rb2MzcxnAEgkQC5Kq5</a> <span style="color: var(--faint);">· tag</span> <span class="mono num">104882</span></dd></div>
+          <div class="kv"><dt>Amount</dt><dd><span class="amt">1,250.00 USD</span> <span style="color: var(--faint);">· issuer</span> <a class="mono" href="Account.dc.html" style="font-size: 13px;">rA7wzf…g95</a></dd></div>
+          <div class="kv"><dt>Delivered</dt><dd><span class="amt">1,250.00 USD</span></dd></div>
+          <div class="kv"><dt>Send max</dt><dd><span class="amt">520 {{cur}}</span></dd></div>
+          <div class="kv"><dt>Fee</dt><dd><span class="amt">0.000012 {{cur}}</span> <span style="color: var(--faint);">· burned</span></dd></div>
+          <div class="kv"><dt>Sequence</dt><dd class="mono num">46,118,302</dd></div>
+          <div class="kv"><dt>Memo</dt><dd><span style="background: var(--sunken); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px;">Invoice 2291</span> <span style="color: var(--faint); font-size: 12px;">· text/plain</span></dd></div>
+        </dl>
+      </section>
+
+      <section aria-labelledby="bc-title" style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;">
+        <div style="padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap;">
+          <h2 id="bc-title" style="margin: 0; font-size: 15px; font-weight: 600;">Balance changes</h2>
+          <span style="font-size: 12px; color: var(--faint);">from the transaction metadata</span>
+        </div>
+        <div style="overflow-x: auto;">
+          <div role="table" aria-label="Balance changes" style="min-width: 620px; --cols: minmax(200px, 1.6fr) 90px minmax(130px, 1fr) minmax(140px, 1fr);">
+            <div role="row" class="tr th"><span role="columnheader">Account</span><span role="columnheader">Currency</span><span role="columnheader" class="r">Change</span><span role="columnheader" class="r">Balance after</span></div>
+            <sc-for list="{{changes}}" as="c" hint-placeholder-count="4">
+              <div role="row" class="tr">
+                <span role="cell" style="display: flex; align-items: center; gap: 8px; min-width: 0;"><a class="mono ell" href="Account.dc.html">{{c.acct}}</a><sc-if value="{{c.hasTag}}" hint-placeholder-val="{{false}}"><span class="type" style="font-size: 11px;">{{c.tag}}</span></sc-if></span>
+                <span role="cell" class="mono">{{c.cur}}</span>
+                <span role="cell" class="r amt {{c.cls}}">{{c.delta}}</span>
+                <span role="cell" class="r amt" style="color: var(--muted); font-weight: 400;">{{c.after}}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </section>
+
+      <section id="raw" aria-labelledby="raw-title" style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;">
+        <div style="padding: 6px 16px 0; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px;">
+          <div style="display: flex; align-items: center; gap: 16px;">
+            <h2 id="raw-title" class="sr">Raw data</h2>
+            <div role="tablist" aria-label="Raw data" style="display: flex;">
+              <sc-for list="{{rawTabs}}" as="t" hint-placeholder-count="3">
+                <button type="button" role="tab" class="tab {{t.cls}}" aria-selected="{{t.on}}" onClick="{{t.pick}}">{{t.label}}</button>
+              </sc-for>
+            </div>
+          </div>
+          <button type="button" class="btn" style="min-height: 30px; margin-bottom: 6px;">Copy</button>
+        </div>
+        <pre class="mono" role="tabpanel">{{rawText}}</pre>
+      </section>
+    </div>
+
+    <aside aria-label="Context" style="flex: 1 1 300px; min-width: 0; display: flex; flex-direction: column; gap: 12px;">
+      <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 8px;">
+        <span style="font-size: 12px; color: var(--faint); font-weight: 500;">Result</span>
+        <span class="mono" style="font-weight: 500;">tesSUCCESS</span>
+        <span style="font-size: 13px; color: var(--muted);">The transaction was applied and is final. It is part of a validated ledger and can't be reversed.</span>
+      </div>
+      <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px;">
+        <span style="font-size: 12px; color: var(--faint); font-weight: 500;">In ledger <a class="mono num" href="Ledger.dc.html">#{{idx}}</a></span>
+        <div style="display: flex; flex-direction: column; gap: 6px; font-size: 13px;">
+          <a href="Transaction.dc.html" style="display: flex; justify-content: space-between; gap: 8px;"><span>← Previous · #11</span><span class="mono" style="color: var(--faint);">AMMDeposit</span></a>
+          <a href="Transaction.dc.html" style="display: flex; justify-content: space-between; gap: 8px;"><span>Next · #13 →</span><span class="mono" style="color: var(--faint);">OfferCreate</span></a>
+        </div>
+      </div>
+      <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px;">
+        <span style="font-size: 12px; color: var(--faint); font-weight: 500;">Ledger objects touched</span>
+        <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px;">
+          <sc-for list="{{objects}}" as="o" hint-placeholder-count="4">
+            <div style="display: flex; align-items: center; gap: 8px; min-width: 0;"><span class="type" style="font-size: 11px;">{{o.kind}}</span><span class="mono">{{o.type}}</span><span class="ell" style="color: var(--faint);">{{o.who}}</span></div>
+          </sc-for>
+        </div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<footer style="border-top: 1px solid var(--border); background: var(--surface);">
+  <div style="max-width: 1240px; margin: 0 auto; padding: 22px 20px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; font-size: 13px; color: var(--faint);">
+    <span>explorer · by GateHub</span>
+    <span>History from validated ledgers. Balances and account state read live from the network.</span>
+    <span style="display: flex; gap: 16px;"><a href="#">API</a><a href="#">Status</a><a href="#">Privacy</a></span>
+  </div>
+</footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["light","dark"],"default":"light"},"accent":{"editor":"color","options":["#2F5BEA","#0F766E","#6D28D9","#111827"],"default":"#2F5BEA","section":"Network colors"},"xahauAccent":{"editor":"color","options":["#B45309","#C2410C","#A16207"],"default":"#B45309","section":"Network colors"},"$preview":{"width":1440,"height":2300}}'>
+class Component extends DCLogic {
+  state = { net: 'xrpl', raw: 'tx' };
+
+  renderVals() {
+    const dark = (this.props.theme ?? 'light') === 'dark';
+    const accent = this.props.accent ?? '#2F5BEA';
+    const xahauAccent = this.props.xahauAccent ?? '#B45309';
+    const x = this.state.net === 'xrpl';
+    const cur = x ? 'XRP' : 'XAH';
+    const fmt = (n) => n.toLocaleString('en-US');
+    const base = x ? 107695660 : 17482913;
+    const issuer = 'rA7wzfRjziBcrbFwErG1t2sdVofKQmg95';
+
+    const changes = [
+      { acct: 'rJF2Xa…FQvg', tag: 'sender', hasTag: true, cur: cur, delta: '−512.402127', cls: '', after: '12,480.256114' },
+      { acct: 'rAtRwr…2rXT', tag: x ? 'AMM pool' : 'offer owner', hasTag: true, cur: cur, delta: '+512.402115', cls: 'pos', after: x ? '1,804,220.553901' : '88,412.120000' },
+      { acct: 'rAtRwr…2rXT', tag: x ? 'AMM pool' : 'offer owner', hasTag: true, cur: 'USD', delta: '−1,250.00', cls: '', after: x ? '4,401,122.18' : '19,870.40' },
+      { acct: 'rNYbL8…Kq5', tag: 'destination', hasTag: true, cur: 'USD', delta: '+1,250.00', cls: 'pos', after: '3,860.25' }
+    ];
+
+    const objects = x ? [
+      { kind: 'Modified', type: 'AccountRoot', who: 'rJF2Xa…FQvg' },
+      { kind: 'Modified', type: 'AccountRoot', who: 'rAtRwr…2rXT · AMM' },
+      { kind: 'Modified', type: 'RippleState', who: 'USD · pool' },
+      { kind: 'Modified', type: 'RippleState', who: 'USD · rNYbL8…Kq5' }
+    ] : [
+      { kind: 'Modified', type: 'AccountRoot', who: 'rJF2Xa…FQvg' },
+      { kind: 'Modified', type: 'Offer', who: 'rAtRwr…2rXT' },
+      { kind: 'Modified', type: 'RippleState', who: 'USD · rAtRwr…2rXT' },
+      { kind: 'Modified', type: 'RippleState', who: 'USD · rNYbL8…Kq5' }
+    ];
+
+    const txJson = '{\n' +
+      '  "TransactionType": "Payment",\n' +
+      '  "Flags": 0,\n' +
+      '  "Sequence": 46118302,\n' +
+      '  "LastLedgerSequence": ' + (base + 8) + ',\n' +
+      '  "DestinationTag": 104882,\n' +
+      '  "Amount": {\n' +
+      '    "currency": "USD",\n' +
+      '    "issuer": "' + issuer + '",\n' +
+      '    "value": "1250"\n' +
+      '  },\n' +
+      '  "Fee": "12",\n' +
+      '  "SendMax": "520000000",\n' +
+      '  "SigningPubKey": "02A4F3B5A0D1C2E7F9081B6E33D49C0A7FE21C5B8D4E66F0A12B9C3D7E5F80A1C4",\n' +
+      '  "TxnSignature": "3044022071C8D0E2B5F61A93…",\n' +
+      '  "Account": "rJF2XanJQGFLS5ZUdcqEzwJcTJ7aFfQvg",\n' +
+      '  "Destination": "rNYbL8WZKKNNni5rb2MzcxnAEgkQC5Kq5",\n' +
+      '  "Memos": [\n' +
+      '    { "Memo": { "MemoData": "496E766F6963652032323931", "MemoType": "746578742F706C61696E" } }\n' +
+      '  ]' + (x ? '' : ',\n  "NetworkID": 21337') + '\n' +
+      '}';
+    const metaJson = '{\n' +
+      '  "TransactionIndex": 12,\n' +
+      '  "TransactionResult": "tesSUCCESS",\n' +
+      '  "delivered_amount": { "currency": "USD", "issuer": "' + issuer + '", "value": "1250" },\n' +
+      '  "AffectedNodes": [\n' +
+      '    { "ModifiedNode": { "LedgerEntryType": "AccountRoot", "FinalFields": { "Account": "rJF2XanJQGFLS5ZUdcqEzwJcTJ7aFfQvg", "Balance": "12480256114", "Sequence": 46118303 }, "PreviousFields": { "Balance": "12992658241", "Sequence": 46118302 } } },\n' +
+      '    { "ModifiedNode": { "LedgerEntryType": "' + (x ? 'AccountRoot' : 'Offer') + '", "FinalFields": { "Account": "rAtRwrVakWQaGpzxtqgJZDb3Tg7t32rXT", … } } },\n' +
+      '    { "ModifiedNode": { "LedgerEntryType": "RippleState", … } },\n' +
+      '    { "ModifiedNode": { "LedgerEntryType": "RippleState", … } }\n' +
+      '  ]\n' +
+      '}';
+    const binHex = '12000022000000002402BFB59E2E0001999A201B' + (base + 8).toString(16).toUpperCase().padStart(8, '0') +
+      '61D5447A4E8E7C4F0000000000000000000000000055534400000000\n00F2B1C49D5E0A7C3B6E91D24A0F8C7E2B5D1A9346840000000000000C69400000001EFE6200\n7321' +
+      '02A4F3B5A0D1C2E7F9081B6E33D49C0A7FE21C5B8D4E66F0A12B9C3D7E5F80A1C474463044022071C8D0E2B5F61A93…';
+    const rawMap = { tx: txJson, meta: metaJson, bin: binHex };
+    const rawTabs = [['tx', 'Transaction'], ['meta', 'Metadata'], ['bin', 'Binary']].map((t) => ({
+      label: t[1], on: this.state.raw === t[0], cls: this.state.raw === t[0] ? 'on' : '',
+      pick: () => this.setState({ raw: t[0] })
+    }));
+
+    return {
+      themeClass: dark ? 'dark' : '',
+      accentNow: x ? accent : xahauAccent,
+      xrplDot: accent, xahauDot: xahauAccent,
+      isXrpl: x, isXahau: !x,
+      xrplCls: x ? 'on' : '', xahauCls: x ? '' : 'on',
+      pickXrpl: () => this.setState({ net: 'xrpl' }),
+      pickXahau: () => this.setState({ net: 'xahau' }),
+      netName: x ? 'XRPL' : 'Xahau', cur,
+      idx: fmt(base),
+      ctid: x ? 'C66B4E2C000C0000' : 'C10AC4A1000C5359',
+      via: x ? 'through the XRP/USD AMM pool' : 'through an offer on the DEX',
+      hopLabel: x ? 'Through AMM pool · XRP/USD' : 'Through DEX offer · XAH/USD',
+      hopDetail: x ? 'swapped at 2.4395 USD per XRP, pool fee 0.3%' : 'filled at 2.4395 USD per XAH',
+      changes, objects, rawTabs,
+      rawText: rawMap[this.state.raw]
+    };
+  }
+}
+</script>
+</body>
+</html>
