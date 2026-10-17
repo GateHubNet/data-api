@@ -1,0 +1,276 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-17T12:50:24.319Z",
+  "validated_head": 107717584,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "52E2AD5B382D4588BECF6A743E7AE5C84D49A5C06968EC7700E8333BF41E1C60": {
+      "ledger": 107694747,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "5081561D02260B321E16B9C3EF2840D6C5D32E6D62C74DADD7428F40C73D2793": {
+      "ledger": 107699656,
+      "type": "OfferCreate",
+      "result": "tesSUCCESS"
+    },
+    "B9C56D941C726140DCDE385A5045EDF976745F434153EA49908AAE92969B1469": {
+      "ledger": 102186243,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "2C9538843C61FE4120577EDCD885C9B4E6AC6694C9DF3603528B81A2D9FC084A": {
+      "ledger": 107636673,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "8014250A4FB1AC8859C4743090B7A905F2738253C010B968E272368A3FE59900": {
+      "ledger": 107713744,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "F9F304F7B20FA2B1A340C1AB5DD0D6F410A50E80444EE698A47D556BA78E34FC": {
+      "ledger": 107698980,
+      "type": "OfferCreate",
+      "result": "tesSUCCESS"
+    },
+    "20254F31198DE60948CB0488464D9D9E55B262486D5C366FD6046374254ADF25": {
+      "ledger": 107703707,
+      "type": "AMMDeposit",
+      "result": "tesSUCCESS"
+    },
+    "94E38B2BCCA96997BCEC32925AEB289D35EC9FD67977995102D91A7E3DD71FEF": {
+      "ledger": 107698848,
+      "type": "AMMDeposit",
+      "result": "tesSUCCESS"
+    },
+    "781C5A2707D3A3E9BB00B483A8719345A6ECF0E5532E0CB5FA4016E1D5D6A832": {
+      "ledger": 105257303,
+      "type": "AMMWithdraw",
+      "result": "tesSUCCESS"
+    },
+    "2D6FF646176D364EAD12395D67CCA6D459E1875F537D035D9B10B7754ACA07A3": {
+      "ledger": 107711512,
+      "type": "AMMWithdraw",
+      "result": "tesSUCCESS"
+    },
+    "B44F14E085567F8C25DD20456FCAD9B0A289BA2EA2AB3469D6F29E582059F63F": {
+      "ledger": 100132150,
+      "type": "AMMWithdraw",
+      "result": "tesSUCCESS"
+    },
+    "EF35220095FC32B7036D130A460CFB31B80BAF973C0C7F7A9812B0665E33701B": {
+      "ledger": 107644916,
+      "type": "AMMVote",
+      "result": "tesSUCCESS"
+    },
+    "2D66C6FD02977F96126FB352AAD691CA556790DBF71E0CDF3B701E18A49B9427": {
+      "ledger": 106084525,
+      "type": "AMMBid",
+      "result": "tesSUCCESS"
+    },
+    "B9A146300E7755D109BF92B6B51725B8C45BA1CCFB6683C0E01DA679B2FB0675": {
+      "ledger": 107612573,
+      "type": "AMMCreate",
+      "result": "tesSUCCESS"
+    },
+    "6C6B9070EF68F9BC7777C018DC85596B40C531DBB29FA0E9C49B5964DF75B96B": {
+      "ledger": 93663334,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "CB1B7721CCC2C842B86A178A26BF50160F57CEC9E95291A9C5349071B89C3822": {
+      "ledger": 107506489,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "swap_payment_xrp_iou": {
+      "ledger": 107694747,
+      "hash": "52E2AD5B382D4588BECF6A743E7AE5C84D49A5C06968EC7700E8333BF41E1C60",
+      "type": "Payment",
+      "note": "Partial Payment (DeliverMin) sending XRP for RLUSD through the XRP/RLUSD pool rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3 only: pool +134 XRP, -179.4482 RLUSD. Metadata names the pool by its AccountRoot (AMMID) and one lsfAMMNode trust line; no AMM node, no order-book offer."
+    },
+    "swap_offercreate_xrp_iou": {
+      "ledger": 107699656,
+      "hash": "5081561D02260B321E16B9C3EF2840D6C5D32E6D62C74DADD7428F40C73D2793",
+      "type": "OfferCreate",
+      "note": "OfferCreate crossing only the XRP/RLUSD pool rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3: pool -417.277515 XRP, +543.8709 RLUSD. Pool AccountRoot and one lsfAMMNode trust line; no order-book offer."
+    },
+    "swap_iou_iou": {
+      "ledger": 102186243,
+      "hash": "B9C56D941C726140DCDE385A5045EDF976745F434153EA49908AAE92969B1469",
+      "type": "Payment",
+      "note": "Payment through the IOU/IOU pool RLUSD/USDC rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb: pool -22.2147 USDC, +22.1965 RLUSD. The pool AccountRoot is NOT in the metadata and there is no AMM node; the pool is named only by two lsfAMMNode RippleState nodes (one per asset). See FINDINGS.md."
+    },
+    "payment_two_pools": {
+      "ledger": 107636673,
+      "hash": "2C9538843C61FE4120577EDCD885C9B4E6AC6694C9DF3603528B81A2D9FC084A",
+      "type": "Payment",
+      "note": "Payment USD(GateHub) -> XRP -> SGB across two pools in series: XRP/USD pool rs9ineLqrCzeAGS1bxsrW8x2n3bRJYAh3Q (-1.455815 XRP, +2.0464 USD) and XRP/SGB pool rEaErQ5vEbHXThFedUrjz9YFotG5HHcxoW (+1.455815 XRP). Both pool AccountRoots are present, each with its own trust line."
+    },
+    "payment_pool_and_book": {
+      "ledger": 107713744,
+      "hash": "8014250A4FB1AC8859C4743090B7A905F2738253C010B968E272368A3FE59900",
+      "type": "Payment",
+      "note": "Payment XRP -> RLUSD (Account differs from Destination) filled by the XRP/RLUSD pool rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3 (+1.015604 XRP, -1.3260 RLUSD) and one order-book Offer owned by rKrVTQChbm1761udZt18u9Aq9onJwEyvZw (deleted, 1.664 RLUSD for 1.27451 XRP)."
+    },
+    "offercreate_autobridged_pool_leg": {
+      "ledger": 107698980,
+      "hash": "F9F304F7B20FA2B1A340C1AB5DD0D6F410A50E80444EE698A47D556BA78E34FC",
+      "type": "OfferCreate",
+      "note": "OfferCreate selling 1000 XAH for 1 RLUSD (neither side XRP), autobridged through XRP: the XAH/XRP leg is an order-book Offer (rUfp2CFb3nP1zEqTzXhCkMXrHVnf4ciuwe), the XRP/RLUSD leg is the pool rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3 (+0.766153 XRP, -1 RLUSD)."
+    },
+    "deposit_two_asset": {
+      "ledger": 107703707,
+      "hash": "20254F31198DE60948CB0488464D9D9E55B262486D5C366FD6046374254ADF25",
+      "type": "AMMDeposit",
+      "note": "AMMDeposit tfTwoAsset into the XRP/RLUSD pool rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3: +82.769304 XRP and +108.06155 RLUSD, about 80142.9 LP tokens minted. AMM node, pool AccountRoot and one lsfAMMNode trust line."
+    },
+    "deposit_single_asset": {
+      "ledger": 107698848,
+      "hash": "94E38B2BCCA96997BCEC32925AEB289D35EC9FD67977995102D91A7E3DD71FEF",
+      "type": "AMMDeposit",
+      "note": "AMMDeposit tfSingleAsset of 1010 XRP into the XRP/RLUSD pool rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3, about 489502 LP tokens minted. XRP only: AMM node and pool AccountRoot, no pool trust line in the metadata."
+    },
+    "withdraw_two_asset": {
+      "ledger": 105257303,
+      "hash": "781C5A2707D3A3E9BB00B483A8719345A6ECF0E5532E0CB5FA4016E1D5D6A832",
+      "type": "AMMWithdraw",
+      "note": "AMMWithdraw tfTwoAsset from the IOU/IOU pool RLUSD/USDC rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb: 4.1798184 USDC and 4.180497 RLUSD out, 4.16713 LP tokens burned. AMM node plus two lsfAMMNode trust lines; no pool AccountRoot."
+    },
+    "withdraw_single_asset": {
+      "ledger": 107711512,
+      "hash": "2D6FF646176D364EAD12395D67CCA6D459E1875F537D035D9B10B7754ACA07A3",
+      "type": "AMMWithdraw",
+      "note": "AMMWithdraw tfSingleAsset of 50 XRP from the XRP/RLUSD pool rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3, about 24262.1 LP tokens burned. XRP only: AMM node and pool AccountRoot, no pool trust line."
+    },
+    "withdraw_all_deletes_pool": {
+      "ledger": 100132150,
+      "hash": "B44F14E085567F8C25DD20456FCAD9B0A289BA2EA2AB3469D6F29E582059F63F",
+      "type": "AMMWithdraw",
+      "note": "AMMWithdraw tfWithdrawAll by the last LP of the XRP/SNK pool rGLnUKdptCVobJKEkrwxtdyGZ98Evdmqdz: the AMM node, the pool AccountRoot and the pool trust line are all DeletedNode. The pool no longer exists on the ledger."
+    },
+    "vote": {
+      "ledger": 107644916,
+      "hash": "EF35220095FC32B7036D130A460CFB31B80BAF973C0C7F7A9812B0665E33701B",
+      "type": "AMMVote",
+      "note": "AMMVote on the XRP/VOX pool rhEypxvxNXMdMTd3GXpb6gTN1jvb4h3nef. Metadata is the AMM node (ModifiedNode) and the voter AccountRoot only."
+    },
+    "bid": {
+      "ledger": 106084525,
+      "hash": "2D66C6FD02977F96126FB352AAD691CA556790DBF71E0CDF3B701E18A49B9427",
+      "type": "AMMBid",
+      "note": "AMMBid by r4S6hRiKREKkmMeqs8dpgyYAotGyck9g3h on the XRP/USD(Bitstamp) pool rHUpaqUPbwzKZdzQ8ZQCme18FrgW9pB4am, BidMin = BidMax = 294.354152174 LP tokens. The tx lists Asset USD / Asset2 XRP. Pool named by the AMM node only."
+    },
+    "create": {
+      "ledger": 107612573,
+      "hash": "B9A146300E7755D109BF92B6B51725B8C45BA1CCFB6683C0E01DA679B2FB0675",
+      "type": "AMMCreate",
+      "note": "AMMCreate of the XRP/DVR pool rUAEvY1XNvnkurE9RunV7u3yjh3jQsQPsG by rEh4WnsrdmE7V1XeTsWi5dM7FHH8hYuea3: pool AccountRoot, AMM node and the pool trust line are all CreatedNode."
+    },
+    "lp_token_transfer": {
+      "ledger": 93663334,
+      "hash": "6C6B9070EF68F9BC7777C018DC85596B40C531DBB29FA0E9C49B5964DF75B96B",
+      "type": "Payment",
+      "note": "Payment of 141421356.2373095 LP tokens (currency 03F5BC4D66B44AEAD668A84F094E08C8C13F5EE2, issuer = XRP/TUJ pool rGuYK1v7kyrKEa86wPN2M9CHpT9LiWFr5m) from rXPMxDRxMM6JLk8AMVh569iap3TtnjaF3 to rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV. Metadata has no AMM node and no pool AccountRoot, only the two LP-token RippleState nodes (pool as issuer, no lsfAMMNode flag)."
+    },
+    "swap_issuer_transfer_rate": {
+      "ledger": 107506489,
+      "hash": "CB1B7721CCC2C842B86A178A26BF50160F57CEC9E95291A9C5349071B89C3822",
+      "type": "Payment",
+      "note": "Payment through the XRP/USD(GateHub) pool rs9ineLqrCzeAGS1bxsrW8x2n3bRJYAh3Q; the issuer rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq has TransferRate 1002000000 (0.2%). Pool pays out 83.28354 USD and takes in 54.514846 XRP, the receiver is credited 83.11731 USD (ratio 1.002)."
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 93663334,
+      "bytes": 305706,
+      "gzipBytes": 71626
+    },
+    {
+      "ledger": 100132150,
+      "bytes": 221331,
+      "gzipBytes": 45419
+    },
+    {
+      "ledger": 102186243,
+      "bytes": 277544,
+      "gzipBytes": 55271
+    },
+    {
+      "ledger": 105257303,
+      "bytes": 228694,
+      "gzipBytes": 42808
+    },
+    {
+      "ledger": 106084525,
+      "bytes": 417717,
+      "gzipBytes": 86434
+    },
+    {
+      "ledger": 107506489,
+      "bytes": 279146,
+      "gzipBytes": 54780
+    },
+    {
+      "ledger": 107612573,
+      "bytes": 182774,
+      "gzipBytes": 34787
+    },
+    {
+      "ledger": 107636673,
+      "bytes": 563930,
+      "gzipBytes": 124792
+    },
+    {
+      "ledger": 107644916,
+      "bytes": 228491,
+      "gzipBytes": 42164
+    },
+    {
+      "ledger": 107694747,
+      "bytes": 196320,
+      "gzipBytes": 37858
+    },
+    {
+      "ledger": 107698848,
+      "bytes": 182186,
+      "gzipBytes": 36028
+    },
+    {
+      "ledger": 107698980,
+      "bytes": 166744,
+      "gzipBytes": 36761
+    },
+    {
+      "ledger": 107699656,
+      "bytes": 345407,
+      "gzipBytes": 77477
+    },
+    {
+      "ledger": 107703707,
+      "bytes": 180706,
+      "gzipBytes": 31714
+    },
+    {
+      "ledger": 107711512,
+      "bytes": 214106,
+      "gzipBytes": 39504
+    },
+    {
+      "ledger": 107713744,
+      "bytes": 233778,
+      "gzipBytes": 44158
+    }
+  ]
+}
