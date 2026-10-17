@@ -15,8 +15,8 @@ truth are
 - The values are validated at boot. An invalid value (a port that is not a number, an unknown worker name, a node URL that is not
   `ws://` / `wss://`, `GH_NETWORK` other than `xrpl` / `xahau`) prints a message that **names the variable** and stops the
   process with a non-zero exit status. Integers are plain decimal digits: `1.5`, `1e3` and `abc` are rejected.
-- An unset or blank variable takes the default of the table. A variable that may be empty (`GH_API_KEYS`, `GH_CORS_ORIGINS`,
-  `GH_CACHE_CONTROL`, `GH_WORKERS`) is empty when it is set to the empty string.
+- An unset or blank variable takes the default of the table. A variable that may be empty (`GH_API_KEYS`,
+  `GH_RATE_LIMIT_KEYS`, `GH_CORS_ORIGINS`, `GH_CACHE_CONTROL`, `GH_WORKERS`) is empty when it is set to the empty string.
 - **Env files.** Without `GH_ENV` the toolbox loads `.env` (or `.env.$NODE_ENV` when `NODE_ENV` is set) from the working
   directory and **refuses to start when that file is missing**. That is what you want when running from source
   (`cp apps/api/.env.example apps/api/.env`). In containers the variables come from the environment: the images set
@@ -61,7 +61,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_CORS_ORIGINS` | empty | `*` or comma separated `http(s)://` origins. Empty sends no CORS headers. |
 | `GH_RATE_LIMIT` | `600` | Requests per client address and route per window. |
 | `GH_RATE_LIMIT_WINDOW` | `60` | The window, seconds. |
-| `GH_RATE_LIMIT_KEYS` | empty | Comma separated key=limit pairs. A request made with a listed key is counted per key and route, with that limit per window, instead of per client address: for a trusted server-side client whose requests share addresses (the explorer behind Cloudflare). Every listed key must also be in GH_API_KEYS. Like GH_RATE_LIMIT, the limit is per API replica. A secret. |
+| `GH_RATE_LIMIT_KEYS` | empty | Comma separated `key=limit` pairs (a pair splits at its last `=`, so a key may end in `=`). A request made with a listed key is counted per key and route, with that limit per window, instead of per client address: for a trusted server-side client whose requests share addresses (the explorer behind Cloudflare). Every listed key must also be in `GH_API_KEYS`, and the limit is a positive whole number. An invalid setting fails the boot with a message that names the entry by position, never the key. The limit is per API replica (the counts are in memory), so with N replicas the effective limit is up to N times it. A secret. |
 | `GH_TRUST_PROXY_HOPS` | `1` | Reverse-proxy hops whose `X-Forwarded-For` is believed for the client address (the key of the rate limit and the `Link` header's scheme). With the shipped nginx in front, leave it at `1`: nginx hands the API exactly one address. Too high a value lets clients spoof their address. |
 | `GH_CACHE_CONTROL` | `private, max-age=60` | `Cache-Control` of successful `/v2/*` responses (printable ASCII); empty sends none. Errors are always `no-store`. `private` because the answers are key-gated: a shared cache that ignores the API key would serve them to anybody (Ruling R109); behind a CDN that keys on the API key, `public` is an option. The live routes `/balances` and `/orders` send `private, max-age=<GH_LIVE_CACHE_TTL_MS in seconds>` (`no-store` when it is 0) instead (R108). |
 | `GH_LIVE_CACHE_TTL_MS` | `10000` | How long the live-node answers (balances, orders) are cached in memory; 0 disables the cache. Their `Cache-Control` follows it: `private, max-age=<it in whole seconds>`, `no-store` at 0. |

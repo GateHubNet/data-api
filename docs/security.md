@@ -34,7 +34,8 @@ correct client address (§4).
 
 **Known residual risks:** a single trust level (no per-key scopes), API keys in the environment in plaintext, a per-replica in-memory
 rate limit, the same full-access ClickHouse user for every client, and the nginx trust default (private ranges) that the operator must
-narrow. They are tracked in §10.
+narrow. A key listed in `GH_RATE_LIMIT_KEYS` is also exempt from the per-address limit: whoever holds it gets its own budget (60000
+per 60 s at rollout, against 600 per address) per route and replica from any address, so it must stay server-side (§3). They are tracked in §10.
 
 ## 2. Authentication
 
@@ -65,7 +66,10 @@ needs a roll-out of every replica.
 ## 3. Authorization
 
 One trust level: any valid key grants full read access to the whole `/v2` surface. The service is read-only, so there is no
-write/admin distinction, but also no per-key scopes or rate tiers. Treat every issued key as equivalent. Per-key scopes are future work.
+write/admin distinction, and no per-key scopes: access is the same for every key. What differs is the rate budget: a key listed in
+`GH_RATE_LIMIT_KEYS` (§5) has its own limit whatever the client address, not the per-address one. Such a key must stay server-side
+(never in a browser or an app) and be rotated at once if it leaks ([operations](operations.md#rotate-an-api-key)), because from any
+address it gets that budget per route and replica. Per-key scopes are future work.
 
 ## 4. Transport and the client address
 
@@ -183,7 +187,7 @@ Production compose (`docker-compose.prod.yaml`):
   change of `GH_API_KEYS` restarts the apis, which compose recreates together: a brief 502 per network, not zero downtime (see
   [operations](operations.md#rotate-an-api-key)).
 - [x] TLS at the front proxy; the client address recovered by nginx from trusted proxies only and handed on as one address.
-- [x] Per-client-and-route rate limit (429), case-insensitive path handling.
+- [x] Per-client-and-route rate limit (429), or per listed key (`GH_RATE_LIMIT_KEYS`) and route; case-insensitive path handling.
 - [x] Strict hand-written parameter parsers with the original's messages; fully parameterised ClickHouse queries.
 - [x] Per-query ClickHouse time and memory guards; bounded windows and limits.
 - [x] Ripple-shaped errors; 5xx causes only in logs; `x-powered-by` disabled.
@@ -194,7 +198,7 @@ Production compose (`docker-compose.prod.yaml`):
 ### Backlog
 
 - [ ] **Hash API keys at rest** (store digests, not plaintext env values).
-- [ ] **Per-key scopes / rate tiers.**
+- [ ] **Per-key scopes** (rate tiers are covered by `GH_RATE_LIMIT_KEYS`).
 - [ ] **Shared (Redis-backed) rate-limit store** for a true global limit across replicas.
 - [ ] **Read-only ClickHouse user for the api** and scoped grants for the syncer and migrator.
 - [ ] **Guard for a placeholder `GH_CLICKHOUSE_PASSWORD`.**

@@ -9,9 +9,9 @@
 #   NPM_TOKEN=... docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --build
 #
 # deploy/.env.prod is only read as the compose interpolation file (`--env-file`); no container gets it as a whole. Each service
-# below lists the variables it needs, so a secret reaches only the services that use it (GH_API_KEYS: the apis; the ClickHouse
-# password: everything that talks to ClickHouse). A listed variable that is not set in the file is not passed on, and the app's
-# own default applies.
+# below lists the variables it needs, so a secret reaches only the services that use it (GH_API_KEYS and GH_RATE_LIMIT_KEYS: the
+# apis only; the ClickHouse password: everything that talks to ClickHouse). A listed variable that is not set in the file is not
+# passed on, and the app's own default applies.
 #
 # The images are always built from this checkout (`pull_policy: build`): the image names are not looked up in any registry.
 #

@@ -65,9 +65,13 @@ Integers are plain digits (`1.5`, `1e3` are rejected).
 
 **Fix:** pass `--env-file deploy/.env.prod` to **every** compose subcommand (`up`, `ps`, `logs`, `down`, `run`), and `export NPM_TOKEN` for builds.
 
-### The API container exits: `GH_API_KEYS must be set in production` / `contains a placeholder key`
+### The API container exits: `GH_API_KEYS must be set in production` / `contains a placeholder key` / `GH_RATE_LIMIT_KEYS entry N ...`
 **Root cause:** the images run with `NODE_ENV=production`, where an empty key list, `dev-api-key`, or a key starting with `change-me` is refused.
-**Fix:** real keys in `deploy/.env.prod`. The dev compose runs its API with `NODE_ENV=development` so `dev-api-key` works there.
+An invalid `GH_RATE_LIMIT_KEYS` also stops the boot; the message names the entry by its position (1-based), never the key: `entry N must be key=limit`
+(a malformed pair), `must have a positive whole limit`, `names a key that is not in GH_API_KEYS`, `repeats a key`; `GH_RATE_LIMIT_KEYS needs GH_API_KEYS` when
+the setting is set and the key list is empty.
+**Fix:** real keys in `deploy/.env.prod`; correct the named entry of `GH_RATE_LIMIT_KEYS`. A key removed from `GH_API_KEYS` (a rotation) leaves its entry
+behind: remove it there too ([operations](operations.md#rotate-an-api-key)). The dev compose runs its API with `NODE_ENV=development` so `dev-api-key` works there.
 
 ### Containers show `(unhealthy)` but the service works
 **Root cause 1:** an old healthcheck used `wget`, which the slim image does not have; the current ones use Node's `fetch`.

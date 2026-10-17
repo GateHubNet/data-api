@@ -74,8 +74,8 @@ X-RateLimit-Reset: 4
 `Retry-After` and `X-RateLimit-Reset` are whole seconds until the window ends (a delta, not a clock time); the body has the
 time left with two decimals. Requests that pass carry `X-RateLimit-Limit`, `-Remaining` and `-Reset` as well.
 
-A key listed in `GH_RATE_LIMIT_KEYS` is counted per key, with its own limit, instead of per client address; the 429 answer and
-headers are the same.
+A key listed in `GH_RATE_LIMIT_KEYS` is counted per key and route, with its own limit, instead of per client address:
+`X-RateLimit-Limit` (and `-Remaining`) carry that limit. The 429 body and `Retry-After` are unchanged.
 
 ### Errors
 

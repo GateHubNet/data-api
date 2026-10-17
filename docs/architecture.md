@@ -69,7 +69,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
 - **Cross-cutting services:** `LedgerRangeResolver` (a date -> a ledger range, cached), `TxService` (a stored transaction ->
   the Ripple object, binary codec with the node's definitions, an LRU of serialized forms), `XrplService` (the shared `NodeClient` with
   short API timeouts, for balances and orders), `CacheService`.
-- **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route); `MetricsInterceptor`.
+- **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts`, `active-accounts`, `network`, `validations`,
   `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
