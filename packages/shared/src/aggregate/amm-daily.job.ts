@@ -4,8 +4,19 @@ import { AmmDailyRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { RatesService } from '../query/rates.service';
 import { RIPPLE_EPOCH_MS } from '../util/time';
-import { committedHead, decimalOf, Valued, valueNative } from './amm-pools.job';
-import { dayStartSeconds, nextVersion, VOLUME_DAY_SETTLE_MS } from './volume.job';
+import {
+  AMM_FILL_WINDOW_LEDGERS,
+  committedHead,
+  decimalOf,
+  fillForward,
+  FillForwardQuery,
+  FillForwardRow,
+  fillForwardSql,
+  nullable,
+  Valued,
+  valueNative,
+} from './amm-pools.job';
+import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTLE_MS } from './volume.job';
 
 /**
  * The `amm_daily` job: one row per AMM pool and UTC day on which a transaction touched the pool, with the swap volume and the
@@ -42,14 +53,16 @@ import { dayStartSeconds, nextVersion, VOLUME_DAY_SETTLE_MS } from './volume.job
  *  - **Liquidity.** A create counts as a deposit and a clawback as a withdrawal; a delete counts as neither. The amounts are
  *    the pool's signed changes, the positive part of each side is "in" and the negative part "out".
  *  - **Closing state.** Each field is its newest non-null value over the pool's state rows up to the last ledger of the day,
- *    like `amm_pools` (`argMaxIf`). A pool deleted during the day has its activity, the deleted state as its closing state
+ *    like `amm_pools` (`argMaxIf`, from a window of the history, then the whole of it if need be: see Cost below). A pool deleted during the day has its activity, the deleted state as its closing state
  *    (empty reserves) and no value. `value_native` is that of `amm_pools` (2 x the native reserve, else 2 x a reserve over the
  *    daily rate of the asset) at the closing reserves, and the rate of the day itself.
  *  - **Duplicates change nothing.** The tables are ReplacingMergeTrees that may not have merged: every read dedupes by the key
  *    of the table (`LIMIT 1 BY`), and the aggregates give the same answer for a row and for two copies of it.
  *
- * Cost: the closing state reads every state row of the day's pools up to the day (like the rebuild of `amm_pools`): a
- * back-fill of many days costs the history of the pools once per day.
+ * Cost: the closing state and the fee state at the start of the day are read from the last `AMM_FILL_WINDOW_LEDGERS` ledgers
+ * of the state rows of each pool (`fillForward`, Ruling R-A21), and from the first ledger of the pool only when the window does
+ * not give every value; so a day costs about a week of the history of its pools, however old they are, and a back-fill of many
+ * days costs that for each day.
  */
 
 /** The version of the computation: bump it when the rows would come out differently, so that `ammDaysDone` redoes the days. */
@@ -58,7 +71,6 @@ export const AMM_DAILY_CONFIG_VERSION = 1;
 /** How many pools one read of the job covers (the accounts travel as an array parameter of the queries). */
 export const AMM_DAILY_CHUNK = 200;
 
-const DAY_SECONDS = 86_400;
 const RIPPLE_EPOCH_S = RIPPLE_EPOCH_MS / 1000;
 /** The fee is in units of 1/100000. */
 const FEE_SCALE = 5;
@@ -77,6 +89,8 @@ export interface AmmDailyOptions {
    * `AmmDailyRecomputeAborted` and writes nothing. The syncer aborts it when it shuts down.
    */
   signal?: AbortSignal;
+  /** How many ledgers before the first ledger of the day the fill-forward looks first; default `AMM_FILL_WINDOW_LEDGERS`. */
+  fillWindow?: number;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -85,8 +99,6 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 type Counted = number | string;
 
-const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
-const at = (seconds: number): Date => new Date(seconds * 1000);
 const ZERO = new BigNumber(0);
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -265,33 +277,32 @@ export const AMM_DAILY_TOUCHES_SQL = `SELECT DISTINCT amm_account
  ORDER BY amm_account`;
 
 /**
- * The closing state of some pools, a fill-forward of their state rows up to the last ledger of the day, and the fee state they
- * were carried into the day with (the same fill-forward up to the ledger before it). One row per pool; the `WHERE amm_account
- * IN` is a range of the primary key `(amm_account, ledger_index, tx_index)`.
+ * The closing state of some pools, a fill-forward of their state rows up to the last ledger of the day (`fillForward`: a window
+ * first, then the whole history of the pools the window does not answer for), and the fee state they were carried into the
+ * day with: the same fill-forward up to the ledger before it, of the fee and of the auction slot. A value of the carry that
+ * is null in the window is read from the history, and so is a reserve or the LP supply: the answer is that of the whole
+ * history (Ruling R-A21). The slot values are in `required` as well: a slot that was bid before the window may still be in
+ * force at the start of the day when the window is shorter than a day of ledgers, and a pool whose slot values are null in the
+ * window and that has swaps has its fees depend on them.
  */
-export const AMM_DAILY_STATES_SQL = `SELECT amm_account,
-       argMax(base_currency, row_key) AS asset_base_currency,
-       argMax(base_issuer, row_key) AS asset_base_issuer,
-       argMax(counter_currency, row_key) AS asset_counter_currency,
-       argMax(counter_issuer, row_key) AS asset_counter_issuer,
-       argMax(deleted, row_key) AS newest_deleted,
-       argMaxIf(reserve_base, row_key, isNotNull(reserve_base)) AS filled_reserve_base,
-       argMaxIf(reserve_counter, row_key, isNotNull(reserve_counter)) AS filled_reserve_counter,
-       argMaxIf(lp_supply, row_key, isNotNull(lp_supply)) AS filled_lp_supply,
-       argMaxIf(trading_fee, row_key, isNotNull(trading_fee)) AS filled_trading_fee,
-       argMaxIf(trading_fee, row_key, isNotNull(trading_fee) AND ledger_index < {first:UInt32}) AS carry_trading_fee,
-       argMaxIf(auction_holder, row_key, isNotNull(auction_holder) AND ledger_index < {first:UInt32}) AS carry_auction_holder,
-       argMaxIf(auction_discounted_fee, row_key, isNotNull(auction_discounted_fee) AND ledger_index < {first:UInt32}) AS carry_auction_discounted_fee,
-       argMaxIf(auction_expiration, row_key, isNotNull(auction_expiration) AND ledger_index < {first:UInt32}) AS carry_auction_expiration
-  FROM (
-       SELECT amm_account, ledger_index, (ledger_index, tx_index) AS row_key,
-              base_currency, base_issuer, counter_currency, counter_issuer, deleted,
-              reserve_base, reserve_counter, lp_supply, trading_fee, auction_holder, auction_discounted_fee, auction_expiration
-         FROM ${Table.AmmPoolStates}
-        WHERE amm_account IN {accounts:Array(String)} AND ledger_index <= {last:UInt32}
-       )
- GROUP BY amm_account
- ORDER BY amm_account`;
+const DAILY_CARRIED = ['trading_fee', 'auction_holder', 'auction_discounted_fee', 'auction_expiration'] as const;
+const dailyQuery = (first: number): FillForwardQuery => ({
+  fields: ['reserve_base', 'reserve_counter', 'lp_supply', 'trading_fee'],
+  required: [
+    'filled_reserve_base',
+    'filled_reserve_counter',
+    'filled_lp_supply',
+    ...DAILY_CARRIED.map((c) => `carry_${c}`),
+  ],
+  extra: {
+    columns: DAILY_CARRIED,
+    select: DAILY_CARRIED.map(
+      (c) => `argMaxIf(${c}, row_key, isNotNull(${c}) AND ledger_index < {first:UInt32}) AS carry_${c}`,
+    ).join(',\n       '),
+    params: { first },
+  },
+});
+export const AMM_DAILY_STATES_SQL = fillForwardSql(dailyQuery(0));
 
 /**
  * The swaps of pools in the ledgers of the day, through the pair key of each pool (the four asset columns, then the ledgers,
@@ -338,13 +349,7 @@ const BIDS_SQL = `SELECT amm_account, ledger_index, tx_index, slot_holder, auth_
  ORDER BY amm_account, ledger_index, tx_index
  LIMIT 1 BY amm_account, ledger_index, tx_index`;
 
-interface ClosingRow {
-  amm_account: string;
-  asset_base_currency: string;
-  asset_base_issuer: string;
-  asset_counter_currency: string;
-  asset_counter_issuer: string;
-  newest_deleted: Counted;
+interface ClosingRow extends FillForwardRow {
   filled_reserve_base: string | null;
   filled_reserve_counter: string | null;
   filled_lp_supply: string | null;
@@ -393,9 +398,6 @@ interface BidCarryRow {
   slot_holder: string | null;
   auth_accounts: string[];
 }
-
-const nullable = (value: Counted | null | undefined): number | null =>
-  value === null || value === undefined ? null : Number(value);
 
 /** Rows grouped by pool. */
 function byPool<T extends { amm_account: string }, R>(rows: T[], convert: (row: T) => R): Map<string, R[]> {
@@ -494,12 +496,13 @@ async function poolDays(
   accounts: string[],
   ledgers: DayLedgers,
   start: number,
+  window: number,
 ): Promise<Array<Omit<AmmDailyRow, 'version'>>> {
   const day = dayKey(start);
-  const params = { accounts, ...ledgers };
   const [closing, liquidity] = await Promise.all([
-    ch.query<ClosingRow>(AMM_DAILY_STATES_SQL, params),
-    ch.query<LiquidityRow>(LIQUIDITY_SQL, params),
+    // the state up to the last ledger of the day, and the fee state at the start of it, from a window before the day
+    fillForward<ClosingRow>(ch, accounts, ledgers.last, ledgers.first - window, dailyQuery(ledgers.first)),
+    ch.query<LiquidityRow>(LIQUIDITY_SQL, { accounts, ...ledgers }),
   ]);
   const swaps = await swapsOf(ch, closing, ledgers);
   const withSwaps = closing.map((c) => c.amm_account).filter((account) => swaps.has(account));
@@ -668,7 +671,7 @@ export async function computeAmmDaily(
   if (ledgers) {
     for (const chunk of chunksOf(pools, AMM_DAILY_CHUNK)) {
       throwIfAborted(signal);
-      rows.push(...(await poolDays(ch, rates, chunk, ledgers, start)));
+      rows.push(...(await poolDays(ch, rates, chunk, ledgers, start, options.fillWindow ?? AMM_FILL_WINDOW_LEDGERS)));
     }
   }
 

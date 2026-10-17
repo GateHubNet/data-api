@@ -52,7 +52,7 @@ export const LIVE_PERIOD_SECONDS: Readonly<Record<LivePeriod, number>> = {
   '30day': 30 * 86_400,
 };
 
-const DAY_SECONDS = 86_400;
+export const DAY_SECONDS = 86_400;
 const MAX_UINT32 = 4_294_967_295;
 /** At most this many rate lookups of a payment set are in flight at once. */
 const RATE_CONCURRENCY = 4;
@@ -434,8 +434,10 @@ export function dayStartSeconds(date: Date): number {
   return Math.floor(ms / 1000 / DAY_SECONDS) * DAY_SECONDS;
 }
 
-const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
-const at = (seconds: number): Date => new Date(seconds * 1000);
+/** `YYYY-MM-DD` of the UTC day that starts at, or contains, a time in unix seconds. */
+export const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
+/** The date of a time in unix seconds. */
+export const at = (seconds: number): Date => new Date(seconds * 1000);
 
 /**
  * A daily set is the FINAL one of its day when the ledgers had been ingested past the day when it was written: the newest

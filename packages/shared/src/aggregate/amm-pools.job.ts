@@ -16,6 +16,10 @@ import { RatesService } from '../query/rates.service';
  *    exceptions are `deleted` and `last_ledger`, which are those of the newest row, and the assets, which never change for
  *    one pool account. `created_ledger` and `created_by` are those of the pool's `AMMCreate` (`amm_liquidity`, event
  *    `create`) and are null for a pool whose creation was not ingested (a pool first seen in the middle of its life).
+ *  - **A window, then the whole history if need be (Ruling R-A21).** The fill-forward reads the state rows of the last
+ *    `AMM_FILL_WINDOW_LEDGERS` ledgers of the head first, a range of the primary key of each pool (`fillForward`, shared with
+ *    `amm_daily`), and only the pools for which that does not give every column a value (or give no row at all) are read from
+ *    their first ledger: the answer is the one the whole history gives, and a pool with years of rows costs about a week of them.
  *  - **Exact amounts.** The reserves, the LP supply and the auction price are the exact strings of the state rows; only
  *    `value_native` is a Float64.
  *  - **`value_native`** (spec section 3): 2 × the native reserve when one of the assets is the native currency; otherwise
@@ -42,6 +46,9 @@ const DAY_SECONDS = 86_400;
 /** How many pools one read and one write of a recompute cover (the accounts travel as an array parameter of the query). */
 export const AMM_POOLS_CHUNK = 200;
 
+/** How many ledgers back from the ledger a fill-forward looks first (about seven days): see `fillForward`. */
+export const AMM_FILL_WINDOW_LEDGERS = 160_000;
+
 /** Thrown by a recompute whose `signal` was aborted: nothing was written after the abort. */
 export class AmmPoolsRecomputeAborted extends Error {
   constructor() {
@@ -56,6 +63,8 @@ export interface RecomputeAmmPoolsOptions {
    * writes nothing more. The syncer aborts it when it shuts down, so that no row is written once the shutdown has begun.
    */
   signal?: AbortSignal;
+  /** How many ledgers back from the head the fill-forward looks first; default `AMM_FILL_WINDOW_LEDGERS`. */
+  fillWindow?: number;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -64,17 +73,8 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 type Counted = number | string;
 
-/** The fill-forward of the state rows of one pool, as the aggregation returns it. */
-interface PoolAggregate {
-  amm_account: string;
-  asset_base_currency: string;
-  asset_base_issuer: string;
-  asset_counter_currency: string;
-  asset_counter_issuer: string;
-  newest_ledger: Counted;
-  newest_close: Counted;
-  newest_deleted: Counted;
-  now_ms: Counted;
+/** The fill-forward of the state rows of one pool, as the aggregation returns it (`fillForward`). */
+interface PoolAggregate extends FillForwardRow {
   filled_reserve_base: string | null;
   filled_reserve_counter: string | null;
   filled_lp_supply: string | null;
@@ -97,16 +97,67 @@ interface PoolVersion {
   newest: Counted;
 }
 
-const nullable = (value: Counted | null | undefined): number | null =>
+/** A nullable counter as a number: `null` stays `null`. */
+export const nullable = (value: Counted | null | undefined): number | null =>
   value === null || value === undefined ? null : Number(value);
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The fill-forward of the state rows of some pools
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** The columns of a state row that are filled forward: the newest non-null value over the rows up to a ledger. */
+export type FilledColumn =
+  | 'reserve_base'
+  | 'reserve_counter'
+  | 'lp_supply'
+  | 'lp_currency'
+  | 'trading_fee'
+  | 'auction_holder'
+  | 'auction_price'
+  | 'auction_discounted_fee'
+  | 'auction_expiration';
+
+/** What every fill-forward row says besides the filled values: the pool's pair and its newest row (the assets never change for one pool account). */
+export interface FillForwardRow {
+  amm_account: string;
+  asset_base_currency: string;
+  asset_base_issuer: string;
+  asset_counter_currency: string;
+  asset_counter_issuer: string;
+  /** The ledger of the newest row, its close time (unix seconds) and whether it deleted the pool. */
+  newest_ledger: Counted;
+  newest_close: Counted;
+  newest_deleted: Counted;
+  now_ms: Counted;
+}
+
+export interface FillForwardQuery {
+  /** The columns to fill forward: the output column of `x` is `filled_x`. */
+  fields: readonly FilledColumn[];
+  /**
+   * The output columns (`filled_x`, or an alias of `extra`) that must be non-null for a window to be taken for the whole
+   * history: a pool whose row has one of them null in the window is read again from its first ledger. Name only what the
+   * answer depends on; a column that is null in the whole history of a pool makes the pool be read whole every time.
+   */
+  required: readonly string[];
+  /**
+   * More select items over the same rows (aggregates over `row_key`, `ledger_index` and the state columns they name in
+   * `columns`), and the parameters they use.
+   */
+  extra?: { select: string; columns: readonly FilledColumn[]; params: Record<string, unknown> };
+}
+
 /**
- * The fill-forward aggregation of the state rows of some pools: one row per pool that has state rows. The newest row of a
- * pool is the one with the highest `(ledger_index, tx_index)`. The aliases differ from the columns they aggregate so that no
- * aggregate reads its own alias. The `WHERE amm_account IN` is a range of the primary key `(amm_account, ledger_index,
- * tx_index)`.
+ * The select of a fill-forward: one row per pool that has state rows in `[fill_from, fill_up_to]`. The newest row of a pool is
+ * the one with the highest `(ledger_index, tx_index)`; the assets, the newest ledger, its close time and `deleted` are those of
+ * that row, and each filled column is the newest non-null value (`argMaxIf`). The aliases differ from the columns they aggregate
+ * so that no aggregate reads its own alias. The `WHERE amm_account IN` and the range of ledgers are a range of the primary key
+ * `(amm_account, ledger_index, tx_index)`. This is the one text of the fill-forward of `amm_pools` and `amm_daily`.
  */
-const POOL_STATES_SQL = `SELECT amm_account,
+export function fillForwardSql(query: Pick<FillForwardQuery, 'fields' | 'extra'>): string {
+  const filled = query.fields.map((f) => `argMaxIf(${f}, row_key, isNotNull(${f})) AS filled_${f}`);
+  const columns = [...new Set<string>(['deleted', 'close_time', ...query.fields, ...(query.extra?.columns ?? [])])];
+  return `SELECT amm_account,
        argMax(base_currency, row_key) AS asset_base_currency,
        argMax(base_issuer, row_key) AS asset_base_issuer,
        argMax(counter_currency, row_key) AS asset_counter_currency,
@@ -114,23 +165,71 @@ const POOL_STATES_SQL = `SELECT amm_account,
        max(ledger_index) AS newest_ledger,
        toUnixTimestamp(argMax(close_time, row_key)) AS newest_close,
        argMax(deleted, row_key) AS newest_deleted,
-       argMaxIf(reserve_base, row_key, isNotNull(reserve_base)) AS filled_reserve_base,
-       argMaxIf(reserve_counter, row_key, isNotNull(reserve_counter)) AS filled_reserve_counter,
-       argMaxIf(lp_supply, row_key, isNotNull(lp_supply)) AS filled_lp_supply,
-       argMaxIf(lp_currency, row_key, isNotNull(lp_currency)) AS filled_lp_currency,
-       argMaxIf(trading_fee, row_key, isNotNull(trading_fee)) AS filled_trading_fee,
-       argMaxIf(auction_holder, row_key, isNotNull(auction_holder)) AS filled_auction_holder,
-       argMaxIf(auction_price, row_key, isNotNull(auction_price)) AS filled_auction_price,
-       argMaxIf(auction_discounted_fee, row_key, isNotNull(auction_discounted_fee)) AS filled_auction_discounted_fee,
-       argMaxIf(auction_expiration, row_key, isNotNull(auction_expiration)) AS filled_auction_expiration,
+       ${[...filled, ...(query.extra ? [query.extra.select] : [])].join(',\n       ')},
        toUnixTimestamp64Milli(now64(3)) AS now_ms
   FROM (
-       SELECT *, (ledger_index, tx_index) AS row_key
+       SELECT amm_account, ledger_index, (ledger_index, tx_index) AS row_key,
+              base_currency, base_issuer, counter_currency, counter_issuer, ${columns.join(', ')}
          FROM ${Table.AmmPoolStates}
-        WHERE amm_account IN {accounts:Array(String)} AND ledger_index <= {head:UInt32}
+        WHERE amm_account IN {accounts:Array(String)} AND ledger_index BETWEEN {fill_from:UInt32} AND {fill_up_to:UInt32}
        )
  GROUP BY amm_account
  ORDER BY amm_account`;
+}
+
+/**
+ * The fill-forward state of some pools at a ledger (Ruling R-A21), read from a window: the state rows of the ledgers
+ * `[from, upTo]` first (a range of the primary key of each pool, so a busy pool with years of history costs the window and not
+ * the years), and then, from the pool's first ledger, only the pools for which the window does not give the whole answer: those
+ * with no row in the window and those with one of the `required` columns null in it. The answer is exactly the one the whole
+ * history gives: a column that has a value in the window has the same newest value in the history, and `deleted`, the assets
+ * and the newest ledger are those of the newest row, which is in the window whenever the pool has a row in it. With `from` 0
+ * the window is the history and there is no second read. One row per pool that has state rows up to `upTo`, in the order of
+ * `accounts` (the callers pass them sorted, which is the order of the select).
+ */
+export async function fillForward<R extends object = Record<string, never>>(
+  ch: ClickHouseService,
+  accounts: string[],
+  upTo: number,
+  from: number,
+  query: FillForwardQuery,
+): Promise<Array<FillForwardRow & R>> {
+  type Row = FillForwardRow & R;
+  const sql = fillForwardSql(query);
+  const read = (of: string[], start: number): Promise<Row[]> =>
+    ch.query<Row>(sql, { accounts: of, fill_from: start, fill_up_to: upTo, ...query.extra?.params });
+  const first = Math.max(0, Math.floor(from));
+  const window = await read(accounts, first);
+  if (first === 0) return window;
+
+  const complete = (row: Row): boolean =>
+    query.required.every((column) => (row as Record<string, unknown>)[column] !== null);
+  const found = new Map(window.map((row) => [row.amm_account, row]));
+  const incomplete = accounts.filter((account) => {
+    const row = found.get(account);
+    return row === undefined || !complete(row);
+  });
+  if (incomplete.length === 0) return window;
+  for (const row of await read(incomplete, 0)) found.set(row.amm_account, row);
+  return accounts.flatMap((account) => found.get(account) ?? []); // the order of the caller, who passes them sorted
+}
+
+/** The columns of the pool row that come from the fill-forward, and so decide when a window is enough. */
+const POOL_FIELDS: readonly FilledColumn[] = [
+  'reserve_base',
+  'reserve_counter',
+  'lp_supply',
+  'lp_currency',
+  'trading_fee',
+  'auction_holder',
+  'auction_price',
+  'auction_discounted_fee',
+  'auction_expiration',
+];
+const POOL_QUERY: FillForwardQuery = {
+  fields: POOL_FIELDS,
+  required: POOL_FIELDS.map((f) => `filled_${f}`),
+};
 
 /** The ledger and the sender of the `AMMCreate` of each pool whose creation was ingested (the first, should there be two). */
 const POOL_CREATED_SQL = `SELECT amm_account,
@@ -289,13 +388,13 @@ async function recomputeChunk(
   rates: RatesService,
   accounts: string[],
   head: number,
+  window: number,
   signal: AbortSignal | undefined,
 ): Promise<number> {
   throwIfAborted(signal);
-  const params = { accounts, head };
   const [states, created, versions] = await Promise.all([
-    ch.query<PoolAggregate>(POOL_STATES_SQL, params),
-    ch.query<CreatedPool>(POOL_CREATED_SQL, params),
+    fillForward<PoolAggregate>(ch, accounts, head, head - window, POOL_QUERY),
+    ch.query<CreatedPool>(POOL_CREATED_SQL, { accounts, head }),
     ch.query<PoolVersion>(POOL_VERSIONS_SQL, { accounts }),
   ]);
   if (states.length === 0) return 0;
@@ -376,8 +475,9 @@ export async function recomputeAmmPools(
   // read once, before any state row: a ledger at or below it is committed, so all its rows are there to read
   const head = await committedHead(ch);
   let written = 0;
+  const window = options.fillWindow ?? AMM_FILL_WINDOW_LEDGERS;
   for (const chunk of chunksOf([...new Set(accounts)].sort(), AMM_POOLS_CHUNK)) {
-    written += await recomputeChunk(ch, rates, chunk, head, signal);
+    written += await recomputeChunk(ch, rates, chunk, head, window, signal);
   }
   return written;
 }

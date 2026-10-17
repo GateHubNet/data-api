@@ -128,6 +128,23 @@ describe('AggregatorService amm_daily job (e2e)', () => {
   const rowCount = async (ch: ClickHouseService): Promise<number> =>
     Number((await ch.queryOne<{ n: string | number }>(`SELECT count() AS n FROM ${Table.AmmDaily}`))?.n);
 
+  /** A sentinel of a day that is the newest set of it: the newest one with another finality, config version and a later version. */
+  async function forgeSentinel(
+    ch: ClickHouseService,
+    day: string,
+    over: { final: number; configDelta: number; versionDelta: number },
+  ): Promise<void> {
+    await ch.command(
+      `INSERT INTO ${Table.AmmDaily} (amm_account, day, base_currency, base_issuer, counter_currency, counter_issuer, swap_count,
+         volume_base, volume_counter, fees_base_est, fees_counter_est, deposit_count, withdraw_count, liquidity_in_base,
+         liquidity_in_counter, liquidity_out_base, liquidity_out_counter, final, config_version, version)
+       SELECT '', day, '', '', '', '', 0, '0', '0', '0', '0', 0, 0, '0', '0', '0', '0',
+              {final:UInt8}, config_version + {configDelta:UInt32}, version + {versionDelta:UInt64}
+         FROM ${Table.AmmDaily} WHERE amm_account = '' AND day = {day:Date} ORDER BY version DESC LIMIT 1`,
+      { day, ...over },
+    );
+  }
+
   const daysBetween = (first: string, last: string): string[] => {
     const out: string[] = [];
     for (let t = Date.parse(first); t <= Date.parse(last); t += 86_400_000)
@@ -170,16 +187,14 @@ describe('AggregatorService amm_daily job (e2e)', () => {
 
     await svc.tick(NOW); // the sixth tick
     const second = await sentinels(ch);
-    // today and yesterday are written again under a newer version ...
-    for (const day of [TODAY, YESTERDAY]) {
-      expect(second.get(day)?.version).toBeGreaterThan(first.get(day)?.version as number);
-    }
-    // ... and a closed day, which is final, is not
-    for (const [day, sentinel] of first) if (day < YESTERDAY) expect(second.get(day)?.version).toBe(sentinel.version);
-    expect(await rowCount(ch)).toBeGreaterThan(written);
+    // today is written again under a newer version ...
+    expect(second.get(TODAY)?.version).toBeGreaterThan(first.get(TODAY)?.version as number);
+    // ... and a day that is final, yesterday and the closed days, is not (Ruling R-A21)
+    expect(first.get(YESTERDAY)?.final).toBe(1);
+    for (const [day, sentinel] of first) if (day < TODAY) expect(second.get(day)?.version).toBe(sentinel.version);
   });
 
-  it('a restarted aggregator finds the closed days done in the tables, and writes today and yesterday only', async () => {
+  it('a restarted aggregator finds the closed days and yesterday done in the tables, and writes today only', async () => {
     const ch = await fresh();
     await aggregator(ch).tick(NOW);
     const before = await sentinels(ch);
@@ -188,7 +203,7 @@ describe('AggregatorService amm_daily job (e2e)', () => {
     const after = await sentinels(ch);
     expect([...after.keys()]).toEqual([...before.keys()]);
     for (const [day, sentinel] of before) {
-      if (day < YESTERDAY) expect(after.get(day)).toEqual(sentinel);
+      if (day < TODAY) expect(after.get(day)).toEqual(sentinel);
       else expect(after.get(day)?.version).toBeGreaterThan(sentinel.version);
     }
     expect(
@@ -217,20 +232,37 @@ describe('AggregatorService amm_daily job (e2e)', () => {
     expect((await pools(ch, YESTERDAY)).size).toBe(11);
   });
 
+  it('yesterday is computed again when its set is not final, or was made by another config version', async () => {
+    const ch = await fresh();
+    const svc = aggregator(ch, 1);
+    await svc.tick(NOW);
+    const first = (await sentinels(ch)).get(YESTERDAY) as StoredDay;
+    await svc.tick(NOW);
+    expect((await sentinels(ch)).get(YESTERDAY)?.version).toBe(first.version); // final: left alone
+
+    // its set was made by an older computation
+    await forgeSentinel(ch, YESTERDAY, { final: 1, configDelta: 7, versionDelta: 1000 });
+    await svc.tick(NOW);
+    const redone = (await sentinels(ch)).get(YESTERDAY) as StoredDay;
+    expect(redone.config_version).toBe(AMM_DAILY_CONFIG_VERSION);
+    expect(redone.version).toBeGreaterThan(first.version + 1000);
+    expect((await pools(ch, YESTERDAY)).size).toBe(11);
+
+    // and a set that is not final (the ingest was behind the day when it was made) is made again
+    await forgeSentinel(ch, YESTERDAY, { final: 0, configDelta: 0, versionDelta: 1 });
+    await svc.tick(NOW);
+    const final = (await sentinels(ch)).get(YESTERDAY) as StoredDay;
+    expect(final.final).toBe(1);
+    expect(final.version).toBeGreaterThan(redone.version + 1);
+  });
+
   it('a closed day with a changed config version is computed again', async () => {
     const ch = await fresh();
     const svc = aggregator(ch, 1);
     await svc.tick(NOW);
     const before = (await sentinels(ch)).get('2026-10-13') as StoredDay;
     // the sets of the day were made by an older computation
-    await ch.command(
-      `INSERT INTO ${Table.AmmDaily} (amm_account, day, base_currency, base_issuer, counter_currency, counter_issuer, swap_count,
-         volume_base, volume_counter, fees_base_est, fees_counter_est, deposit_count, withdraw_count, liquidity_in_base,
-         liquidity_in_counter, liquidity_out_base, liquidity_out_counter, final, config_version, version)
-       SELECT '', day, '', '', '', '', 0, '0', '0', '0', '0', 0, 0, '0', '0', '0', '0', 1, config_version + 7, version + 1000
-         FROM ${Table.AmmDaily} WHERE amm_account = '' AND day = {day:Date} LIMIT 1`,
-      { day: '2026-10-13' },
-    );
+    await forgeSentinel(ch, '2026-10-13', { final: 1, configDelta: 7, versionDelta: 1000 });
     expect((await sentinels(ch)).get('2026-10-13')?.config_version).toBe(AMM_DAILY_CONFIG_VERSION + 7);
     await svc.tick(NOW);
     const after = (await sentinels(ch)).get('2026-10-13') as StoredDay;

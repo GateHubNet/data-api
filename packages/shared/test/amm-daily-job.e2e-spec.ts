@@ -11,6 +11,7 @@ import {
   ammFirstDay,
   computeAmmDaily,
 } from '../src/aggregate/amm-daily.job';
+import { AMM_FILL_WINDOW_LEDGERS, committedHead } from '../src/aggregate/amm-pools.job';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
 import {
@@ -1240,25 +1241,41 @@ describe('the amm_daily job (e2e)', () => {
 
   // -------------------------------------------------------------------------------------------------------------------
   describe('committed ledgers only (the ledger writer writes the ledgers row last)', () => {
-    it('ignores the rows of a ledger above the newest ledgers row, and counts them once it is committed', async () => {
+    it('ignores the rows of a ledger above the head (its ledgers row is not there yet), and counts them once it is committed', async () => {
       const ch = await fresh();
-      await seedHandMade(ch);
-      // a ledger of day 1 that is being written: its rows are there, its ledgers row is not; it is above the newest
-      // committed ledger? No: ledgers 1100 and 1101 are committed, so it is the closing ledger 1050 that must be left out
-      CLOSES.set(1050, D1 + 20 * HOUR);
-      await insertStates(ch, [state(P, 1050, 1, { reserve_base: '5', reserve_counter: '6', trading_fee: 900 })]);
-      await ch.insert(Table.Exchanges, [swap(P, 1050, 1, { taker: TAKER_1, in: 'base', base: '12345', counter: '1' })]);
-      await ch.insert(Table.AmmLiquidity, [liquidity(P, 1050, 2, 'deposit', '1', '1', '1')]);
+      const rows = handMadeRows();
+      await insertStates(ch, rows.states);
+      await ch.insert(Table.Exchanges, rows.swaps);
+      await ch.insert(Table.AmmLiquidity, rows.liquidityRows);
+      await ch.insert(Table.AmmGovernance, rows.bids);
+      await commit(ch, [900, 1000, 1001, 1002, 1003]); // the head is ledger 1003 ...
+      // ... and ledger 1004, a quarter of an hour later in the same day, is being written: its rows are there, its ledgers row is not
+      CLOSES.set(1004, D1 + 23 * HOUR + 2700);
+      await insertStates(ch, [state(P, 1004, 1, { reserve_base: '5', reserve_counter: '6', trading_fee: 900 })]);
+      await ch.insert(Table.Exchanges, [swap(P, 1004, 1, { taker: TAKER_1, in: 'base', base: '12345', counter: '1' })]);
+      await ch.insert(Table.AmmLiquidity, [liquidity(P, 1004, 2, 'deposit', '1', '1', '1')]);
+      expect(await committedHead(ch)).toBe(1003);
       const r = rates(ch);
-      // the day is capped at the newest committed ledger of it, and 1050 has no ledgers row: it is not a ledger of the day yet
       await computeAmmDaily(ch, r, at(D1));
       const without = (await dayOf(ch, D1_KEY)).pools.get(P.account) as StoredDaily;
-      expect(without).toMatchObject({ swap_count: 6, volume_base: '1120', deposit_count: 1, reserve_base: '970.6' });
+      expect(without).toMatchObject({
+        swap_count: 6,
+        volume_base: '1120',
+        deposit_count: 1,
+        reserve_base: '970.6',
+        trading_fee: 500,
+      });
 
-      await commit(ch, [1050]);
+      await commit(ch, [1004]);
       await computeAmmDaily(ch, r, at(D1));
       const withIt = (await dayOf(ch, D1_KEY)).pools.get(P.account) as StoredDaily;
-      expect(withIt).toMatchObject({ swap_count: 7, volume_base: '13465', deposit_count: 2 });
+      expect(withIt).toMatchObject({
+        swap_count: 7,
+        volume_base: '13465',
+        deposit_count: 2,
+        reserve_base: '5',
+        trading_fee: 900,
+      });
     });
 
     it('caps the day at the head: a ledger of the day above the head read is not counted, and does not make the day final', async () => {
@@ -1524,6 +1541,292 @@ describe('the amm_daily job (e2e)', () => {
   });
 
   // -------------------------------------------------------------------------------------------------------------------
+  describe('the fill-forward window (Ruling R-A21): the state of a pool is read from a window of its history, then whole if need be', () => {
+    const WINDOW = 40; // ledgers: the day starts at ledger 1000, so the window starts at 960
+    const FULL = Number.MAX_SAFE_INTEGER;
+    const ripple = (unixSeconds: number): number => unixSeconds - RIPPLE_EPOCH_S;
+    const FUTURE = ripple(D1 + 20 * HOUR);
+    const PAST = ripple(D1 - HOUR);
+    const SLOT_HOLDER = 'rWindowSlotHolder0000000000000000';
+    const OTHER_HOLDER = 'rWindowOtherHolder000000000000000';
+    const STRANGER = 'rWindowStranger00000000000000000';
+
+    type Values = Partial<AmmPoolStatesRow>;
+    /** The values of the old rows (ledger 900, long before the window), and of the rows in the window (ledger 970). */
+    const OLD: Values = {
+      reserve_base: '1',
+      reserve_counter: '2',
+      lp_supply: '3',
+      trading_fee: 111,
+      auction_holder: SLOT_HOLDER,
+      auction_discounted_fee: 40,
+      auction_expiration: FUTURE,
+    };
+    const NEW: Values = {
+      reserve_base: '10',
+      reserve_counter: '20',
+      lp_supply: '30',
+      trading_fee: 222,
+      auction_holder: OTHER_HOLDER,
+      auction_discounted_fee: 60,
+      auction_expiration: FUTURE,
+    };
+    const minus = (values: Values, column: keyof Values): Values => {
+      const { [column]: _dropped, ...rest } = values;
+      return rest;
+    };
+
+    interface Case {
+      name: string;
+      before: Values;
+      inWindow: Values;
+      /** Who swaps 100000 of base into the pool at the first ledger of the day. */
+      taker: string;
+      /** What the day has to say, whole-history or windowed alike. */
+      expected: Partial<StoredDaily>;
+    }
+    const CASES: Case[] = [
+      {
+        name: 'reserve_base',
+        before: OLD,
+        inWindow: minus(NEW, 'reserve_base'),
+        taker: STRANGER,
+        expected: { reserve_base: '1', reserve_counter: '20', fees_base_est: '222' },
+      },
+      {
+        name: 'reserve_counter',
+        before: OLD,
+        inWindow: minus(NEW, 'reserve_counter'),
+        taker: STRANGER,
+        expected: { reserve_base: '10', reserve_counter: '2', fees_base_est: '222' },
+      },
+      {
+        name: 'lp_supply',
+        before: OLD,
+        inWindow: minus(NEW, 'lp_supply'),
+        taker: STRANGER,
+        expected: { lp_supply: '3', trading_fee: 222, fees_base_est: '222' },
+      },
+      {
+        name: 'trading_fee',
+        before: OLD,
+        inWindow: minus(NEW, 'trading_fee'),
+        taker: STRANGER,
+        expected: { trading_fee: 111, fees_base_est: '111' },
+      },
+      // the slot values only matter to a swap of the holder: the holder of the old slot swaps
+      {
+        name: 'auction_holder',
+        before: OLD,
+        inWindow: { ...minus(NEW, 'auction_holder'), auction_discounted_fee: 40 },
+        taker: SLOT_HOLDER,
+        expected: { fees_base_est: '40' },
+      },
+      {
+        name: 'auction_discounted_fee',
+        before: OLD,
+        inWindow: { ...minus(NEW, 'auction_discounted_fee'), auction_holder: SLOT_HOLDER },
+        taker: SLOT_HOLDER,
+        expected: { fees_base_est: '40' },
+      },
+      // a slot that ran out before the day: the rows of the window do not say so, the old row does
+      {
+        name: 'auction_expiration',
+        before: { ...OLD, auction_expiration: PAST },
+        inWindow: { ...minus(NEW, 'auction_expiration'), auction_holder: SLOT_HOLDER, auction_discounted_fee: 40 },
+        taker: SLOT_HOLDER,
+        expected: { fees_base_est: '222' },
+      },
+    ];
+    const FRESH = pool('rWindowFresh', USD, XRP); // every value in the window
+    const CREATED = pool('rWindowCreatedToday', USD, XRP); // no row before the day
+
+    let ch: ClickHouseService;
+    const pools = CASES.map((c) => pool(`rWindow_${c.name}`, USD, XRP));
+    let windowed: Map<string, StoredDaily>;
+    let whole: Map<string, StoredDaily>;
+    let reads: Array<{ accounts: string[]; fill_from: number; fill_up_to: number }>;
+    let written: string[];
+
+    beforeAll(async () => {
+      ch = await fresh();
+      const states: AmmPoolStatesRow[] = [];
+      const swaps: ExchangesRow[] = [];
+      const add = (p: PoolDef, node: number, before: Values | undefined, inWindow: Values, taker: string): void => {
+        if (before) states.push(state(p, 900, node, before));
+        if (Object.keys(inWindow).length > 0) states.push(state(p, 970, node, inWindow));
+        states.push(state(p, 1000, node, {})); // the swap touches the pool, and says nothing about its state
+        swaps.push(swap(p, 1000, node, { taker, in: 'base', base: '100000', counter: '1', node }));
+      };
+      CASES.forEach((c, i) => add(pools[i], i + 1, c.before, c.inWindow, c.taker));
+      add(FRESH, 20, OLD, NEW, STRANGER);
+      add(CREATED, 21, undefined, {}, STRANGER);
+      await insertStates(ch, states);
+      await ch.insert(Table.Exchanges, swaps);
+      await commit(
+        ch,
+        LEDGER_CLOSES.map(([l]) => l),
+      );
+
+      const query = jest.spyOn(ch, 'query');
+      const insert = jest.spyOn(ch, 'insert');
+      await computeAmmDaily(ch, rates(ch), at(D1), { fillWindow: WINDOW });
+      written = (insert.mock.calls[0][1] as Array<{ amm_account: string }>).map((r) => r.amm_account);
+      reads = query.mock.calls
+        .filter(([sql]) => String(sql) === AMM_DAILY_STATES_SQL)
+        .map(([, params]) => params as (typeof reads)[number]);
+      windowed = (await dayOf(ch, D1_KEY)).pools;
+      await computeAmmDaily(ch, rates(ch), at(D1), { fillWindow: FULL });
+      whole = (await dayOf(ch, D1_KEY)).pools;
+    });
+
+    it('is about seven days of ledgers, as for amm_pools', () => {
+      expect(AMM_FILL_WINDOW_LEDGERS).toBe(160_000);
+    });
+
+    it('reads the window first for all the pools and then the whole history of those the window does not give completely', () => {
+      const incomplete = [...pools, CREATED].map((p) => p.account).sort();
+      expect(reads.map((r) => [r.accounts, r.fill_from, r.fill_up_to])).toEqual([
+        [[...pools, FRESH, CREATED].map((p) => p.account).sort(), 1000 - WINDOW, 1003],
+        [incomplete, 0, 1003],
+      ]);
+    });
+
+    it('writes the pools in the order of their account, those read whole among them', () => {
+      expect(written).toEqual(['', ...[...pools, FRESH, CREATED].map((p) => p.account).sort()]);
+    });
+
+    it('gives the day it gives when it reads the whole history, pool by pool, all fields but the version', () => {
+      expect([...windowed.keys()]).toEqual([...whole.keys()]);
+      for (const [account, row] of windowed)
+        expect([account, withoutVersion(row)]).toEqual([account, withoutVersion(whole.get(account) as StoredDaily)]);
+      expect(windowed.size).toBe(CASES.length + 2);
+    });
+
+    it.each(CASES.map((c, i) => [c.name, i] as const))(
+      'a pool whose %s was last set before the window has that value (and the fee it made)',
+      (_name, i) => {
+        expect(windowed.get(pools[i].account)).toMatchObject({
+          swap_count: 1,
+          volume_base: '100000',
+          ...CASES[i].expected,
+        });
+      },
+    );
+
+    it('a pool with everything in the window has the values of the window', () => {
+      expect(windowed.get(FRESH.account)).toMatchObject({
+        reserve_base: '10',
+        lp_supply: '30',
+        trading_fee: 222,
+        fees_base_est: '222',
+      });
+    });
+
+    it('a pool created today has the values of the day only', () => {
+      expect(windowed.get(CREATED.account)).toMatchObject({
+        swap_count: 1,
+        reserve_base: null,
+        trading_fee: null,
+        fees_base_est: '0',
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('a pool with a long history (900,000 state rows in three parts) is read from its window (Ruling R-A21)', () => {
+    const BASE = 1_000_000;
+    const PART = 300_000;
+    const BUSY = pool('rBusyHistory', USD, XRP);
+    const DAY_FIRST = BASE + 3 * PART; // the first ledger of the day, just after the history
+    const GRANULE = 8192;
+    let ch: ClickHouseService;
+    let db: string;
+
+    beforeAll(async () => {
+      ch = await fresh();
+      db = ((await ch.queryOne<{ db: string }>('SELECT currentDatabase() AS db')) as { db: string }).db;
+      await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolStates}`);
+      CLOSES.set(1, D0);
+      await ch.insert(Table.AmmPoolStates, [state(BUSY, 1, 0, { reserve_base: '1' })]);
+      for (let part = 0; part < 3; part++) {
+        // a row in every ledger with the reserves; one in a thousand is a transaction on the AMM node: the fee, the LP supply and the slot
+        await ch.command(
+          `INSERT INTO ${Table.AmmPoolStates}
+           SELECT tpl.* REPLACE (
+                    toUInt32({base:UInt32} + n.number) AS ledger_index,
+                    toUInt32(0) AS tx_index,
+                    toNullable('10') AS reserve_base,
+                    toNullable('20') AS reserve_counter,
+                    if(n.number % 1000 = 0, toNullable('30'), NULL) AS lp_supply,
+                    if(n.number % 1000 = 0, toNullable(toUInt16(222)), NULL) AS trading_fee,
+                    if(n.number % 1000 = 0, toNullable('rSomeHolder'), NULL) AS auction_holder,
+                    if(n.number % 1000 = 0, toNullable(toUInt16(22)), NULL) AS auction_discounted_fee,
+                    if(n.number % 1000 = 0, toNullable(toUInt32(1)), NULL) AS auction_expiration
+                  )
+             FROM (SELECT * FROM ${Table.AmmPoolStates} WHERE amm_account = {pool:String} AND ledger_index = 1) AS tpl
+            CROSS JOIN numbers({rows:UInt32}) AS n`,
+          { base: BASE + part * PART, pool: BUSY.account, rows: PART },
+          { settings: { insert_deduplicate: 0 } },
+        );
+      }
+      // the day: two ledgers, the pool touched in the first, and a ledger a day later that makes it final
+      await ch.insert(Table.Ledgers, [
+        ledgerRow(DAY_FIRST, D1 + HOUR),
+        ledgerRow(DAY_FIRST + 1, D1 + 5 * HOUR),
+        ledgerRow(DAY_FIRST + 100, D2 + 2 * HOUR),
+      ]);
+      CLOSES.set(DAY_FIRST, D1 + HOUR);
+      await insertStates(ch, [state(BUSY, DAY_FIRST, 0, { reserve_base: '11' })]);
+    });
+
+    async function stateReads(run: () => Promise<unknown>): Promise<number[]> {
+      const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
+      await run();
+      await ch.command('SYSTEM FLUSH LOGS');
+      const rows = await ch.query<{ read_rows: string }>(
+        `SELECT read_rows FROM system.query_log
+          WHERE current_database = {db:String} AND type = 'QueryFinish' AND query_kind = 'Select'
+            AND query_start_time_microseconds >= {t:DateTime64(6)} AND has(tables, {table:String})
+            AND position(query, 'argMaxIf(reserve_base') > 0
+          ORDER BY query_start_time_microseconds`,
+        { db, t, table: `${db}.${Table.AmmPoolStates}` },
+      );
+      return rows.map((r) => Number(r.read_rows));
+    }
+
+    it('is three parts of 300,000 rows', async () => {
+      const parts = await ch.query<{ rows: string }>(
+        `SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = {t:String} AND active ORDER BY rows DESC`,
+        { t: Table.AmmPoolStates },
+      );
+      expect(parts.map((p) => Number(p.rows)).slice(0, 3)).toEqual([PART, PART, PART]);
+    });
+
+    it('reads about the window (160,000 rows) for the closing state and the carry-in, not the 900,000 rows of the pool', async () => {
+      const windowed = await stateReads(() => computeAmmDaily(ch, rates(ch), at(D1)));
+      expect(windowed).toHaveLength(1); // every value is in the window: no read of the whole history
+      expect(windowed[0]).toBeGreaterThanOrEqual(AMM_FILL_WINDOW_LEDGERS);
+      expect(windowed[0]).toBeLessThanOrEqual(AMM_FILL_WINDOW_LEDGERS + 4 * GRANULE);
+      // the control: the read of the whole history, which is what the job did
+      const whole = await stateReads(() =>
+        computeAmmDaily(ch, rates(ch), at(D1), { fillWindow: Number.MAX_SAFE_INTEGER }),
+      );
+      expect(whole[0]).toBeGreaterThanOrEqual(3 * PART);
+      expect(whole[0]).toBeGreaterThan(4 * windowed[0]);
+    });
+
+    it('and the day is the same as the day from the whole history', async () => {
+      await computeAmmDaily(ch, rates(ch), at(D1));
+      const windowed = (await dayOf(ch, D1_KEY)).pools.get(BUSY.account) as StoredDaily;
+      await computeAmmDaily(ch, rates(ch), at(D1), { fillWindow: Number.MAX_SAFE_INTEGER });
+      const whole = (await dayOf(ch, D1_KEY)).pools.get(BUSY.account) as StoredDaily;
+      expect(withoutVersion(windowed)).toEqual(withoutVersion(whole));
+      expect(windowed).toMatchObject({ reserve_base: '11', reserve_counter: '20', lp_supply: '30', trading_fee: 222 });
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
   describe('days without anything', () => {
     it('a database without ledgers: a sentinel of the day, not final, and no pool', async () => {
       const ch = await fresh();
@@ -1688,6 +1991,26 @@ describe('the amm_daily job (e2e)', () => {
       read_rows: number;
     }
 
+    /** Bids and votes of other pools in amm_governance (two parts, merges stopped): the reads of the bids of a pool must not read them. */
+    const BULK_GOVERNANCE = 200_000;
+    beforeAll(async () => {
+      await ch.command(`SYSTEM STOP MERGES ${Table.AmmGovernance}`);
+      for (let part = 0; part < 2; part++) {
+        await ch.command(
+          `INSERT INTO ${Table.AmmGovernance}
+           SELECT tpl.* REPLACE (
+                    concat('rOtherPool', leftPad(toString(n.number % 100), 3, '0')) AS amm_account,
+                    toUInt32(2000 + {part:UInt32} * 5000 + intDiv(n.number, 100)) AS ledger_index,
+                    toUInt32(n.number % 100) AS tx_index
+                  )
+             FROM (SELECT * FROM ${Table.AmmGovernance} WHERE amm_account = {pool:String} LIMIT 1) AS tpl
+            CROSS JOIN numbers({rows:UInt32}) AS n`,
+          { part, pool: P2.account, rows: BULK_GOVERNANCE / 2 },
+          { settings: { insert_deduplicate: 0 } },
+        );
+      }
+    });
+
     /** A month of other pools' days in amm_daily (two parts, merges stopped): the reads of the sentinels must not read them. */
     const BULK_DAILY = 120_000;
     beforeAll(async () => {
@@ -1825,6 +2148,14 @@ describe('the amm_daily job (e2e)', () => {
       const reads = await readsOf(Table.AmmLiquidity, () => computeAmmDaily(ch, rates(ch), at(D1)));
       expect(reads).toHaveLength(1);
       expect(reads[0].read_rows).toBeLessThanOrEqual(2 * GRANULE);
+    });
+
+    it('read_rows: the bids before the day and in it are read through the key of the pools with swaps, not the 200,000 bids of others', async () => {
+      expect(await totalRows(Table.AmmGovernance)).toBeGreaterThanOrEqual(BULK_GOVERNANCE);
+      const reads = await readsOf(Table.AmmGovernance, () => computeAmmDaily(ch, rates(ch), at(D1)));
+      // the bid before the day (BID_CARRY_SQL) and the bids of the day (BIDS_SQL): P, P2 and DEL have swaps
+      expect(reads).toHaveLength(2);
+      for (const read of reads) expect(read.read_rows).toBeLessThanOrEqual(2 * GRANULE);
     });
 
     it('read_rows: the version of the day, and the days that are done, are read from the sentinels (a prefix of the key), not the month', async () => {
