@@ -414,7 +414,7 @@ describe('volume jobs (e2e)', () => {
         expect(await liveSet(ch, 'payment_volume', '3day')).toEqual([]);
       });
 
-      it('writes the sets of both metrics and nothing else: 5 + 2 sets', async () => {
+      it('writes the sets of the three metrics and nothing else: 5 + 2 + 5 sets', async () => {
         const ch2 = await freshService();
         await new LedgerWriter(ch2, ctx).write(ledgers);
         await computeLiveVolumes(ch2, new RatesService(ch2, 'XRP'), MARKETS, NOW);
@@ -422,6 +422,11 @@ describe('volume jobs (e2e)', () => {
           `SELECT metric, period FROM ${Table.VolumeLive} GROUP BY metric, period ORDER BY metric, period`,
         );
         expect(sets).toEqual([
+          { metric: 'amm_volume', period: '30day' },
+          { metric: 'amm_volume', period: '3day' },
+          { metric: 'amm_volume', period: '7day' },
+          { metric: 'amm_volume', period: 'day' },
+          { metric: 'amm_volume', period: 'hour' },
           { metric: 'payment_volume', period: 'day' },
           { metric: 'payment_volume', period: 'hour' },
           { metric: 'trade_volume', period: '30day' },
@@ -1003,6 +1008,11 @@ describe('volume jobs (e2e)', () => {
         await computeLiveVolumes(ch, rates, config(5, nativeMarkets), new Date('2015-01-14T19:30:00Z'));
         const versions = await liveSetVersions(ch);
         expect([...versions.keys()].sort()).toEqual([
+          'amm_volume/30day',
+          'amm_volume/3day',
+          'amm_volume/7day',
+          'amm_volume/day',
+          'amm_volume/hour',
           'payment_volume/day',
           'payment_volume/hour',
           'trade_volume/30day',

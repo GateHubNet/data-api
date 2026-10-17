@@ -17,6 +17,7 @@ import {
   Valued,
   valueNative,
 } from './amm-pools.job';
+import { AMM_CHUNK, AMM_SWAPS_WHERE, AMM_TOUCHED_POOLS_SQL, ammChunks, ammSwapParams } from './amm-reads';
 import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTLE_MS } from './volume.job';
 
 /**
@@ -73,7 +74,7 @@ import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTL
 export const AMM_DAILY_CONFIG_VERSION = 1;
 
 /** How many pools one read of the job covers (the accounts travel as an array parameter of the queries). */
-export const AMM_DAILY_CHUNK = 200;
+export const AMM_DAILY_CHUNK = AMM_CHUNK;
 
 const RIPPLE_EPOCH_S = RIPPLE_EPOCH_MS / 1000;
 /** The fee is in units of 1/100000. */
@@ -275,10 +276,7 @@ export function liquidityTotals(events: readonly DayLiquidity[]): LiquidityTotal
  * The pools a transaction touched in the ledgers of the day, from the narrow ledger-ordered `amm_pool_touches`: a range of its
  * primary key (Ruling R-A14), never the state table (ordered by pool) or the exchanges.
  */
-export const AMM_DAILY_TOUCHES_SQL = `SELECT DISTINCT amm_account
-  FROM ${Table.AmmPoolTouches}
- WHERE ledger_index BETWEEN {first:UInt32} AND {last:UInt32}
- ORDER BY amm_account`;
+export const AMM_DAILY_TOUCHES_SQL = AMM_TOUCHED_POOLS_SQL;
 
 /**
  * The closing state of some pools, a fill-forward of their state rows up to the last ledger of the day (`fillForward`: a window
@@ -316,11 +314,7 @@ export const AMM_DAILY_STATES_SQL = fillForwardSql(dailyQuery(0, CLOSING_REQUIRE
  */
 export const AMM_DAILY_SWAPS_SQL = `SELECT amm_account, ledger_index, tx_index, toUnixTimestamp(close_time) AS closed, taker, buyer, base_amount, counter_amount
   FROM ${Table.Exchanges}
- WHERE (base_currency, base_issuer, counter_currency, counter_issuer) IN (
-       SELECT arrayJoin(arrayZip({base_currencies:Array(String)}, {base_issuers:Array(String)}, {counter_currencies:Array(String)}, {counter_issuers:Array(String)}))
-       )
-   AND amm_account IN {accounts:Array(String)}
-   AND ledger_index BETWEEN {first:UInt32} AND {last:UInt32}
+ WHERE ${AMM_SWAPS_WHERE}
  ORDER BY base_currency, base_issuer, counter_currency, counter_issuer, ledger_index, tx_index, node_index
  LIMIT 1 BY base_currency, base_issuer, counter_currency, counter_issuer, ledger_index, tx_index, node_index`;
 
@@ -428,22 +422,16 @@ async function swapsOf(
   closing: ClosingRow[],
   ledgers: DayLedgers,
 ): Promise<Map<string, DaySwap[]>> {
-  const pairs = new Map<string, ClosingRow>();
-  for (const c of closing) {
-    pairs.set(
-      [c.asset_base_currency, c.asset_base_issuer, c.asset_counter_currency, c.asset_counter_issuer].join('\0'),
-      c,
-    );
-  }
-  const distinct = [...pairs.values()];
-  const rows = await ch.query<SwapRow>(AMM_DAILY_SWAPS_SQL, {
-    accounts: closing.map((c) => c.amm_account),
-    base_currencies: distinct.map((c) => c.asset_base_currency),
-    base_issuers: distinct.map((c) => c.asset_base_issuer),
-    counter_currencies: distinct.map((c) => c.asset_counter_currency),
-    counter_issuers: distinct.map((c) => c.asset_counter_issuer),
-    ...ledgers,
-  });
+  const rows = await ch.query<SwapRow>(
+    AMM_DAILY_SWAPS_SQL,
+    ammSwapParams(
+      closing.map((c) => ({
+        account: c.amm_account,
+        pair: [c.asset_base_currency, c.asset_base_issuer, c.asset_counter_currency, c.asset_counter_issuer] as const,
+      })),
+      ledgers,
+    ),
+  );
   return byPool(
     rows,
     (r): DaySwap => ({
@@ -607,12 +595,6 @@ async function poolDays(
 // The day
 // ---------------------------------------------------------------------------------------------------------------------
 
-function chunksOf<T>(items: T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
-  return chunks;
-}
-
 /** The sentinel of a set: the row of `amm_account` `''` that stands for the day. */
 function sentinelRow(day: string, final: boolean, version: number): AmmDailyRow {
   return {
@@ -686,7 +668,7 @@ export async function computeAmmDaily(
   const pools = ledgers ? await activePools(ch, ledgers) : [];
   const rows: Array<Omit<AmmDailyRow, 'version'>> = [];
   if (ledgers) {
-    for (const chunk of chunksOf(pools, AMM_DAILY_CHUNK)) {
+    for (const chunk of ammChunks(pools, AMM_DAILY_CHUNK)) {
       throwIfAborted(signal);
       rows.push(...(await poolDays(ch, rates, chunk, ledgers, start, options.fillWindow ?? AMM_FILL_WINDOW_LEDGERS)));
     }

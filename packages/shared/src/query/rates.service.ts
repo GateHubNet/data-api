@@ -175,6 +175,24 @@ const BUCKET_START: Record<VwapBucket, string> = {
  */
 const KEEP_ANY_PAIR = `(base_issuer != '' OR base_amount_f > ${NATIVE_DUST}) AND (counter_issuer != '' OR counter_amount_f > ${NATIVE_DUST})`;
 
+/**
+ * The grouped read of the exchanges that `pairSums` (the volume of each pair) and the AMM volume (the volume of each pool)
+ * share: the rows `where` selects (a range of the primary key, the conditions are the caller's, code and never input), each
+ * trade once (`LIMIT 1 BY` its key, read in key order: the table is not collapsed before a merge, and no FINAL is used), the
+ * native legs of 0.0005 or less left out, summed per `groupBy` (columns of the exchanges). Read the groups with `volumesOf`;
+ * `n` is how many trades counted.
+ */
+export function exchangeSumsSql(where: string, groupBy: readonly string[]): string {
+  const columns = [...new Set([...groupBy, ...PAIR_COLUMNS])].join(', ');
+  return `SELECT ${groupBy.join(', ')}, ${volumeColumns(KEEP_ANY_PAIR)}
+         FROM (SELECT ${columns}, ${VOLUME_SOURCE_COLUMNS}
+                 FROM ${Table.Exchanges}
+                WHERE ${where}
+                ORDER BY ${orderBy(false)}
+                LIMIT 1 BY ${KEY_COLUMNS.join(', ')})
+        GROUP BY ${groupBy.join(', ')}`;
+}
+
 /** The pair columns and the sums of one group of `vwaps`. */
 interface PairSumsRow extends VolumeSums {
   base_currency: string;
@@ -475,15 +493,12 @@ export class RatesService {
     // The pairs go in as four arrays of text and are zipped back into tuples by the server: a tuple parameter is a class of
     // the client, which a second copy of the client (two module registries in one process) does not recognise.
     const rows = await this.ch.query<PairSumsRow>(
-      `SELECT ${PAIR_COLUMNS.join(', ')}, ${volumeColumns(KEEP_ANY_PAIR)}
-         FROM (SELECT ${PAIR_COLUMNS.join(', ')}, ${VOLUME_SOURCE_COLUMNS}
-                 FROM ${Table.Exchanges}
-                WHERE (${PAIR_COLUMNS.join(', ')}) IN (
+      exchangeSumsSql(
+        `(${PAIR_COLUMNS.join(', ')}) IN (
                       SELECT arrayJoin(arrayZip({pair0:Array(String)}, {pair1:Array(String)}, {pair2:Array(String)}, {pair3:Array(String)})))
-                  AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
-                ORDER BY ${orderBy(false)}
-                LIMIT 1 BY ${KEY_COLUMNS.join(', ')})
-        GROUP BY ${PAIR_COLUMNS.join(', ')}`,
+                  AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}`,
+        PAIR_COLUMNS,
+      ),
       {
         pair0: unique.map((p) => p.base.currency),
         pair1: unique.map((p) => p.base.issuer ?? ''),

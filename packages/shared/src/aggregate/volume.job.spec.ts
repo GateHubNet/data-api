@@ -32,7 +32,12 @@ describe('the periods and the metrics', () => {
     expect(PAYMENT_LIVE_PERIODS).toEqual(['hour', 'day']);
     expect(livePeriodsOf('trade_volume')).toBe(TRADE_LIVE_PERIODS);
     expect(livePeriodsOf('payment_volume')).toBe(PAYMENT_LIVE_PERIODS);
-    expect(VOLUME_METRICS).toEqual(['trade_volume', 'payment_volume']);
+  });
+
+  it('the AMM volume is the third metric, after the trade and the payment volume, and has the live periods of the trade volume', () => {
+    expect(VOLUME_METRICS).toEqual(['trade_volume', 'payment_volume', 'amm_volume']);
+    expect(livePeriodsOf('amm_volume')).toBe(TRADE_LIVE_PERIODS);
+    expect(livePeriodsOf('amm_volume')).toEqual(['hour', 'day', '3day', '7day', '30day']);
   });
 
   it('each period is as long as its name says, in seconds', () => {

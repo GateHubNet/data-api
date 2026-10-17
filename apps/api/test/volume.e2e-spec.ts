@@ -14,7 +14,13 @@ import {
 import BigNumber from 'bignumber.js';
 import { join } from 'node:path';
 import { SAMPLE_ROWS } from '../../../packages/shared/test/sample-rows';
-import { ExpectedComponent, paymentOracle, tradeOracle } from '../../../packages/shared/test/volume-oracle';
+import {
+  ammVolumeOracle,
+  ExpectedAmm,
+  ExpectedComponent,
+  paymentOracle,
+  tradeOracle,
+} from '../../../packages/shared/test/volume-oracle';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
 import { fixtureExchanges, fixturePayments } from './support/fixtures';
@@ -1618,6 +1624,47 @@ describe('GET /v2/network/*_volume on Xahau with an empty markets config', () =>
     expect(week.rows).toHaveLength(0 + (new Date(dayStart * SEC).getUTCDay() === 1 ? 1 : 0));
   });
 
+  it('amm_volume: Xahau has no AMM, so its sets are the sentinel only and the route answers rows of zero totals and no component', async () => {
+    const zero = (start: string, end: string, extra: Json = {}): Json => ({
+      components: [],
+      count: 0,
+      exchange: { currency: 'XAH' },
+      total: '0',
+      exchange_rate: '1.0000000',
+      start_time: start,
+      end_time: end,
+      ...extra,
+    });
+    const live = (await api.ok<Body>('/v2/network/amm_volume?live=day', 'rows')).body;
+    expect(live).toEqual({
+      result: 'success',
+      count: 1,
+      rows: [zero(iso(NOW.getTime() / SEC - DAY), iso(NOW.getTime() / SEC))],
+    });
+    expect(Object.keys(live.rows[0])).toEqual(ROW_KEYS);
+    for (const period of ['hour', '3day', '7day', '30day']) {
+      expect((await api.ok<Body>(`/v2/network/amm_volume?live=${period}`, 'rows')).body.rows[0]).toMatchObject({
+        components: [],
+        count: 0,
+        total: '0',
+      });
+    }
+    const historical = (await api.ok<Body>(`/v2/network/amm_volume?start=${day}&end=${day}`, 'rows')).body;
+    expect(historical.rows).toEqual([zero(`${day}T00:00:00Z`, iso(dayStart + DAY))]);
+
+    // the sets are there, a sentinel each, and nothing else
+    const sets = await h.ch.query<{ n: string; components: string }>(
+      `SELECT count() AS n, countIf(component != '') AS components FROM ${Table.VolumeDaily} WHERE metric = 'amm_volume'`,
+    );
+    expect(Number(sets[0].n)).toBeGreaterThan(0);
+    expect(Number(sets[0].components)).toBe(0);
+    const liveSets = await h.ch.query<{ n: string; components: string }>(
+      `SELECT count() AS n, countIf(component != '') AS components FROM ${Table.VolumeLive} WHERE metric = 'amm_volume'`,
+    );
+    expect(Number(liveSets[0].n)).toBe(5);
+    expect(Number(liveSets[0].components)).toBe(0);
+  });
+
   it('the native currency of the network is XAH: XRP is an issued currency here, and the messages say XAH', async () => {
     const issuer = await api.get(
       '/v2/network/exchange_volume?exchange_currency=XAH&exchange_issuer=rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B',
@@ -1730,3 +1777,621 @@ describe('GET /v2/network/exchange_volume counts the swaps against AMM pools', (
     expect(res.rows[0].count).toBeGreaterThan(book.reduce((n, c) => n + c.count, 0));
   });
 });
+
+// =====================================================================================================================
+describe('GET /v2/network/amm_volume', () => {
+  // The swaps against the pools of the recorded AMM ledgers (138 swaps against 97 pools on 11 UTC days, 39 order-book
+  // trades beside them), summed per pool and converted to the native currency like the trade components. Three configured
+  // markets give a rate of their own (RLUSD, GateHub USD and 666 against XRP); every other pool is converted with the rate of
+  // the pools themselves, or dropped when no rate can be told. The expected rows come from `ammVolumeOracle`, plain JavaScript
+  // over the stored exchange rows; the route is the one of `exchange_volume`, so what it shares with it is tested there and
+  // here only for this metric: periods, intervals, pages, display currencies, CSV, errors.
+  const rows = fixtureExchanges('xrpl-amm').map((e) => e.row);
+  const ISSUER_RLUSD = 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De';
+  const markets: MarketsConfig = {
+    version: 3,
+    tradeMarkets: [
+      { base: { currency: '524C555344000000000000000000000000000000', issuer: ISSUER_RLUSD }, counter: XRP },
+      { base: { currency: 'USD', issuer: 'rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq' }, counter: XRP },
+      { base: { currency: '666', issuer: 'rhvf9fe6PP3GC8Bku2Ug7iQPjPDxYZfrxN' }, counter: XRP },
+    ],
+    paymentCurrencies: [],
+  };
+  const AMM_KEYS = ['amm_account', 'base', 'counter', 'count', 'amount', 'rate', 'converted_amount'];
+  const DAYS = [
+    ...new Set(
+      rows.filter((r) => r.amm_account !== '').map((r) => new Date(r.close_time * SEC).toISOString().slice(0, 10)),
+    ),
+  ].sort();
+  const NOW = new Date('2026-10-17T09:00:00Z');
+  const END = NOW.getTime() / SEC;
+  const SECONDS: Record<string, number> = { hour: 3600, day: DAY, '3day': 3 * DAY, '7day': 7 * DAY, '30day': 30 * DAY };
+  const RANGE = `start=${DAYS[0]}&end=${DAYS[DAYS.length - 1]}`;
+
+  let h: Harness;
+  let api: ApiClient;
+  const get = (path: string) => api.get(path);
+  const ok = async (path: string): Promise<Body> => (await api.ok<Body>(path, 'rows')).body;
+
+  /** The part of a bucket, before it is a row: the days of a week or a month added up as the reader adds them. */
+  interface Part {
+    component: string;
+    base: Asset;
+    counter: Asset;
+    amount: BigNumber;
+    count: number;
+    converted: number;
+  }
+  const sideOf = (a: Asset): Json => (a.issuer ? { currency: a.currency, issuer: a.issuer } : { currency: a.currency });
+  const partOf = (w: ExpectedAmm): Part => ({
+    component: w.component,
+    base: w.base,
+    counter: w.counter,
+    amount: w.amount,
+    count: w.count,
+    converted: w.converted.toNumber(),
+  });
+
+  /** The row the API serves for the parts of a bucket, X = 1, the components in the order the reader lists them. */
+  function ammRow(parts: Part[], start: number, end?: number): Json {
+    const listed = parts
+      .filter((p) => p.converted > 0)
+      .sort(
+        (a, b) => b.converted - a.converted || (a.component < b.component ? -1 : a.component > b.component ? 1 : 0),
+      );
+    return {
+      components: listed.map((p) => ({
+        amm_account: p.component,
+        base: sideOf(p.base),
+        counter: sideOf(p.counter),
+        count: p.count,
+        amount: p.amount.toString(),
+        rate: p8(p.amount.toNumber() / p.converted),
+        converted_amount: String(p.converted),
+      })),
+      count: parts.reduce((n, p) => n + p.count, 0),
+      exchange: { currency: 'XRP' },
+      total: String(listed.reduce((sum, p) => sum + p.converted, 0)),
+      exchange_rate: '1.0000000',
+      start_time: iso(start),
+      ...(end !== undefined && { end_time: iso(end) }),
+    };
+  }
+
+  /** The oracle's pools of `[from, to)`. */
+  const poolsIn = (from: number, to: number): ExpectedAmm[] => ammVolumeOracle(markets, rows, from, to);
+  const dayStartOf = (day: string): number => unix(`${day}T00:00:00Z`);
+
+  /** The days of a bucket added up part by part, in the order of the days (the sides of a part are part of its identity). */
+  function bucketParts(days: string[]): Part[] {
+    const sums = new Map<string, Part>();
+    for (const day of days) {
+      for (const w of poolsIn(dayStartOf(day), dayStartOf(day) + DAY)) {
+        const id = [w.component, assetKeyOf(w.base), assetKeyOf(w.counter)].join('|');
+        const part = partOf(w);
+        const found = sums.get(id);
+        if (found) {
+          found.amount = found.amount.plus(part.amount);
+          found.count += part.count;
+          found.converted += part.converted;
+        } else {
+          sums.set(id, part);
+        }
+      }
+    }
+    return [...sums.values()];
+  }
+  const assetKeyOf = (a: Asset): string => `${a.currency}.${a.issuer ?? ''}`;
+  const mondayOf = (day: string): number => {
+    const t = dayStartOf(day);
+    return t - ((new Date(t * SEC).getUTCDay() + 6) % 7) * DAY;
+  };
+  const monthOf = (day: string): number => Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, 1) / SEC;
+  const nextMonth = (start: number): number => {
+    const d = new Date(start * SEC);
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / SEC;
+  };
+
+  /**
+   * XYZ against XRP at known prices, for the display currency (the existing volume tests do the same). The ledgers close in the
+   * order of their indexes, as real ones do (the window of a set is the range between two ledgers): `first` is the index of the
+   * first, above the one that closed before them and below the one that closed after.
+   */
+  async function insertTrades(first: number, trades: { close: number; xrp: string; xyz: string }[]): Promise<void> {
+    const stored = canonicalPair(XRP, XYZ);
+    const sorted = [...trades].sort((a, b) => a.close - b.close);
+    await h.ch.insert(
+      Table.Ledgers,
+      sorted.map((t, i) => ({
+        ...SAMPLE_ROWS[Table.Ledgers],
+        ledger_index: first + i,
+        ledger_hash: String(first + i).padStart(64, 'F'),
+        close_time: t.close,
+      })),
+    );
+    await h.ch.insert(
+      Table.Exchanges,
+      sorted.map((t, i) => ({
+        ...SAMPLE_ROWS[Table.Exchanges],
+        base_currency: stored.base.currency,
+        base_issuer: stored.base.issuer ?? '',
+        counter_currency: stored.counter.currency,
+        counter_issuer: stored.counter.issuer ?? '',
+        ledger_index: first + i,
+        tx_index: 0,
+        node_index: 0,
+        close_time: t.close,
+        amm_account: '',
+        base_amount: stored.inverted ? t.xyz : t.xrp,
+        counter_amount: stored.inverted ? t.xrp : t.xyz,
+        base_amount_f: Number(stored.inverted ? t.xyz : t.xrp),
+        counter_amount_f: Number(stored.inverted ? t.xrp : t.xyz),
+      })),
+    );
+  }
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-amm', env: NO_RATE_LIMIT });
+    api = await h.api();
+    const rates = new RatesService(h.ch, 'XRP');
+    await computeLiveVolumes(h.ch, rates, markets, NOW);
+    for (const day of DAYS) await computeDailyVolumes(h.ch, rates, markets, new Date(`${day}T00:00:00Z`));
+    // XYZ: 5 trades on 2025-11-11 (10 XYZ for 40 XRP: 0.25 XYZ a coin), in ledgers between the ledger of that day and the next
+    // recorded one, and 12 in the hour before the test runs (10 for 20: 0.5), in ledgers above all the recorded ones
+    await insertTrades(100_132_200, [
+      ...Array.from({ length: 5 }, (_, i) => ({ close: unix('2025-11-11T12:00:00Z') + i, xrp: '40', xyz: '10' })),
+    ]);
+    await insertTrades(
+      110_000_000,
+      Array.from({ length: 12 }, (_, i) => ({ close: Math.floor(Date.now() / SEC) - 3600 + i, xrp: '20', xyz: '10' })),
+    );
+  });
+
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the data is as the tests assume: swaps on 11 days, pools of every kind of conversion', () => {
+    expect(rows.filter((r) => r.amm_account !== '')).toHaveLength(138);
+    expect(DAYS).toHaveLength(11);
+    const month = poolsIn(END - 30 * DAY, END);
+    expect(month.length).toBeGreaterThan(20);
+    // pools against the native currency, pools converted through a base, pools converted through a counter (swapped)
+    expect(month.some((w) => w.counter.currency === 'XRP' && !w.counter.issuer)).toBe(true);
+    expect(month.some((w) => w.counter.currency !== 'XRP')).toBe(true);
+  });
+
+  // ===============================================================================================================
+  describe('live mode', () => {
+    it.each(['hour', 'day', '3day', '7day', '30day'])(
+      'live=%s is the row of the oracle, with the keys in the order of the other volume rows',
+      async (period) => {
+        const res = await ok(`/v2/network/amm_volume?live=${period}`);
+        expect(Object.keys(res)).toEqual(['result', 'count', 'rows']);
+        expect(res.count).toBe(1);
+        const start = END - SECONDS[period];
+        expectSameShape(res.rows[0], ammRow(poolsIn(start, END).map(partOf), start, END));
+        expect(Object.keys(res.rows[0])).toEqual(ROW_KEYS);
+      },
+    );
+
+    it('the hour holds the one swap of the ledger that closed at 08:42:50, the day and the month many', async () => {
+      expect((await ok('/v2/network/amm_volume?live=hour')).rows[0].components).toHaveLength(1);
+      expect((await ok('/v2/network/amm_volume?live=day')).rows[0].components.length).toBeGreaterThan(5);
+      expect((await ok('/v2/network/amm_volume?live=30day')).rows[0].components.length).toBeGreaterThan(20);
+    });
+
+    it('live defaults to day, and an empty live is the default', async () => {
+      const day = await ok('/v2/network/amm_volume?live=day');
+      expect(await ok('/v2/network/amm_volume')).toEqual(day);
+      expect(await ok('/v2/network/amm_volume?live=')).toEqual(day);
+      expect(await ok('/v2/network/amm_volume?start=&end=')).toEqual(day);
+    });
+
+    it('the components have the keys amm_account, base, counter, count, amount, rate, converted_amount, in this order, and the types', async () => {
+      const row = (await ok('/v2/network/amm_volume?live=30day')).rows[0];
+      for (const c of row.components) {
+        expect(Object.keys(c)).toEqual(AMM_KEYS);
+        expect(Object.keys(c.base)).toEqual(c.base.issuer ? ['currency', 'issuer'] : ['currency']);
+        expect(Object.keys(c.counter)).toEqual(c.counter.issuer ? ['currency', 'issuer'] : ['currency']);
+        expect([
+          typeof c.amm_account,
+          typeof c.count,
+          typeof c.amount,
+          typeof c.rate,
+          typeof c.converted_amount,
+        ]).toEqual(['string', 'number', 'string', 'string', 'string']);
+        expect(c.amm_account).toMatch(/^r[1-9A-HJ-NP-Za-km-z]{24,34}$/);
+      }
+      expect(typeof row.count).toBe('number');
+      expect([typeof row.total, typeof row.exchange_rate]).toEqual(['string', 'string']);
+    });
+
+    it('the components are sorted by converted_amount desc and converted_amount = amount / rate for every pool', async () => {
+      const row = (await ok('/v2/network/amm_volume?live=30day')).rows[0];
+      const converted = row.components.map((c: Json) => Number(c.converted_amount));
+      expect(converted.length).toBeGreaterThan(20);
+      expect(converted).toEqual([...converted].sort((a, b) => b - a));
+      for (const c of row.components) {
+        expect(Number(c.converted_amount)).toBeCloseTo(
+          Number(c.amount) / Number(c.rate),
+          -Math.max(0, Math.floor(Math.log10(Number(c.converted_amount))) - 6),
+        );
+      }
+    });
+
+    it('the total is the sum of the converted amounts, which is the sum over the stored swaps of the oracle', async () => {
+      for (const period of ['day', '7day', '30day']) {
+        const start = END - SECONDS[period];
+        const oracle = poolsIn(start, END);
+        const row = (await ok(`/v2/network/amm_volume?live=${period}`)).rows[0];
+        expect(oracle.length).toBeGreaterThan(0);
+        // the oracle: plain JavaScript over the stored swaps, converted to the native currency
+        const sum = oracle.reduce((s, w) => s.plus(w.converted), bn(0));
+        expect(bn(row.total).minus(sum).abs().dividedBy(sum).toNumber()).toBeLessThan(1e-12);
+        expect(row.count).toBe(oracle.reduce((n, w) => n + w.count, 0));
+        expect(row.components.map((c: Json) => c.amm_account)).toEqual(oracle.map((w) => w.component));
+      }
+    });
+
+    it('every swap of a pool with a rate is in the total: the swaps of the stored rows, never the order-book trades', async () => {
+      const start = END - 30 * DAY;
+      const swaps = rows.filter(
+        (r) =>
+          r.amm_account !== '' &&
+          r.close_time >= start &&
+          r.close_time < END &&
+          !(r.base_issuer === '' && bn(r.base_amount).lte('0.0005')) &&
+          !(r.counter_issuer === '' && bn(r.counter_amount).lte('0.0005')),
+      );
+      const row = (await ok('/v2/network/amm_volume?live=30day')).rows[0];
+      // a pool without a rate is dropped, so the count is that of the pools that were converted
+      const converted = new Set(row.components.map((c: Json) => c.amm_account));
+      expect(row.count).toBe(swaps.filter((s) => converted.has(s.amm_account)).length);
+      expect(row.count).toBeLessThanOrEqual(swaps.length);
+      expect(converted.size).toBeGreaterThan(10);
+    });
+
+    it('the unknown parameters, and the historical ones that mean nothing live, are ignored', async () => {
+      const plain = await ok('/v2/network/amm_volume?live=day');
+      for (const extra of ['foo=bar', 'descending=true', 'limit=1', 'format=json', 'interval=week']) {
+        expect(await ok(`/v2/network/amm_volume?live=day&${extra}`)).toEqual(plain);
+      }
+    });
+
+    it('sets nothing in the Link header', async () => {
+      expect((await get('/v2/network/amm_volume')).headers.link).toBeUndefined();
+    });
+  });
+
+  // ===============================================================================================================
+  describe('historical mode', () => {
+    it('day rows are the sets of the days: the oracle, the keys, end_time the next midnight', async () => {
+      const res = await ok(`/v2/network/amm_volume?${RANGE}`);
+      expect(res.count).toBe(DAYS.length);
+      expect(res.rows.map((r) => r.start_time)).toEqual(DAYS.map((d) => `${d}T00:00:00Z`));
+      res.rows.forEach((row, i) => {
+        const start = dayStartOf(DAYS[i]);
+        expectSameShape(row, ammRow(bucketParts([DAYS[i]]), start, start + DAY));
+        expect(Object.keys(row)).toEqual(ROW_KEYS);
+      });
+    });
+
+    it('historical week = sum of the days, from Monday (UTC); the whole week is the row', async () => {
+      const weeks = new Map<number, string[]>();
+      for (const day of DAYS) weeks.set(mondayOf(day), [...(weeks.get(mondayOf(day)) ?? []), day]);
+      const res = await ok(`/v2/network/amm_volume?${RANGE}&interval=week`);
+      // a week is a row when it STARTS in the window: the first week starts before the first day unless it is a Monday
+      const wanted = [...weeks].filter(
+        ([start]) => start >= dayStartOf(DAYS[0]) && start <= dayStartOf(DAYS[DAYS.length - 1]),
+      );
+      expect(wanted.length).toBeGreaterThan(3);
+      expect(res.rows).toHaveLength(wanted.length);
+      res.rows.forEach((row, i) => {
+        const [start, days] = wanted[i];
+        expectSameShape(row, ammRow(bucketParts(days), start, start + 7 * DAY));
+      });
+    });
+
+    it('historical month = sum of the days, the calendar month', async () => {
+      const months = new Map<number, string[]>();
+      for (const day of DAYS) months.set(monthOf(day), [...(months.get(monthOf(day)) ?? []), day]);
+      const res = await ok('/v2/network/amm_volume?start=2025-01&end=2026-10&interval=month');
+      expect(res.rows).toHaveLength(months.size);
+      res.rows.forEach((row, i) => {
+        const [start, days] = [...months][i];
+        expectSameShape(row, ammRow(bucketParts(days), start, nextMonth(start)));
+      });
+      // October 2026: seven days of swaps added up
+      const october = res.rows[res.rows.length - 1];
+      expect(october.start_time).toBe('2026-10-01T00:00:00Z');
+      expect(october.components.length).toBeGreaterThan(20);
+    });
+
+    it.each(['day', 'week', 'month'])('interval=%s: marker pages concatenate to the unpaged list', async (interval) => {
+      const path = `/v2/network/amm_volume?start=2025-01-01&end=2026-10-31&interval=${interval}`;
+      const whole = await ok(path);
+      const buckets = new Set(
+        DAYS.map((d) => (interval === 'day' ? dayStartOf(d) : interval === 'week' ? mondayOf(d) : monthOf(d))),
+      );
+      expect(whole.count).toBe(buckets.size);
+      expect(whole.count).toBeGreaterThanOrEqual(6);
+      expect(whole.marker).toBeUndefined();
+      for (const limit of [1, 2, 3]) {
+        const pages = await api.pages<Body>(path, limit, 'rows');
+        expect(pages.flatMap((p) => p.rows)).toEqual(whole.rows);
+        for (const page of pages.slice(0, -1)) expect(page.rows).toHaveLength(limit);
+        for (const page of pages) expect(page.count).toBe(page.rows.length);
+      }
+    });
+
+    it('follows the Link header: the url of the request with the marker, and none on the last page', async () => {
+      const res = await get(`/v2/network/amm_volume?${RANGE}&limit=2`);
+      expect(res.status).toBe(200);
+      expect(res.body.marker).toBe(markerOf(dayStartOf(DAYS[1])));
+      expect(res.headers.link).toMatch(
+        /^<http:\/\/127\.0\.0\.1:\d+\/v2\/network\/amm_volume\?start=2025-01-24&end=2026-10-17&limit=2&marker=[A-Za-z0-9_-]+>; rel="next"$/,
+      );
+      const last = await get(`/v2/network/amm_volume?${RANGE}&limit=50`);
+      expect(last.headers.link).toBeUndefined();
+    });
+
+    it('an invalid marker is a 400, the checks of dates and intervals are those of exchange_volume', async () => {
+      const bad = await get(`/v2/network/amm_volume?${RANGE}&marker=!!!`);
+      expect([bad.status, bad.body]).toEqual([400, { result: 'error', message: 'invalid marker' }]);
+      expect((await get('/v2/network/amm_volume?start=x2015-01-14T00:00')).body).toEqual({
+        result: 'error',
+        message: 'invalid start date format',
+      });
+      expect((await get('/v2/network/amm_volume?end=x2015-01-14T00:00')).body).toEqual({
+        result: 'error',
+        message: 'invalid end date format',
+      });
+    });
+
+    it('an empty range: count 0, rows empty, a 200', async () => {
+      for (const qs of ['start=2030-01-01&end=2030-02-01', 'start=1990-01-01&end=1990-02-01']) {
+        expect(await ok(`/v2/network/amm_volume?${qs}`)).toEqual({ result: 'success', count: 0, rows: [] });
+      }
+    });
+  });
+
+  // ===============================================================================================================
+  describe('display currency', () => {
+    const display = `exchange_currency=XYZ&exchange_issuer=${I2}`;
+
+    it('live: X is the latest rate of the native currency against the display currency; amounts, rates and totals follow', async () => {
+      const plain = (await ok('/v2/network/amm_volume?live=30day')).rows[0];
+      const row = (await ok(`/v2/network/amm_volume?live=30day&${display}`)).rows[0];
+      expect(Object.keys(row)).toEqual(ROW_KEYS);
+      expect(row.exchange).toEqual({ currency: 'XYZ', issuer: I2 });
+      expect(row.exchange_rate).toBe('0.50000000');
+      expect(row.total).toBe(String(Number(plain.total) * 0.5));
+      expect(row.count).toBe(plain.count);
+      expect(row.components).toHaveLength(plain.components.length);
+      row.components.forEach((c: Json, i: number) => {
+        const p = plain.components[i];
+        expect(Object.keys(c)).toEqual(AMM_KEYS);
+        expect(c.amm_account).toBe(p.amm_account);
+        expect(c.amount).toBe(p.amount);
+        expect(c.count).toBe(p.count);
+        expect(c.converted_amount).toBe(String(Number(p.converted_amount) * 0.5));
+        expect(c.rate).toBe(p8(Number(p.amount) / Number(p.converted_amount) / 0.5));
+      });
+    });
+
+    it('display conversion keeps converted_amount = amount / rate', async () => {
+      const row = (await ok(`/v2/network/amm_volume?live=7day&${display}`)).rows[0];
+      expect(row.components.length).toBeGreaterThan(0);
+      for (const c of row.components) {
+        const converted = Number(c.converted_amount);
+        expect(converted).toBeCloseTo(
+          Number(c.amount) / Number(c.rate),
+          -Math.max(0, Math.floor(Math.log10(converted)) - 6),
+        );
+      }
+    });
+
+    it('historical: the day is converted with the vwap of the native currency against XYZ over ITS OWN day (0 where none traded)', async () => {
+      // 2025-11-11: five trades of 10 XYZ for 40 XRP: 0.25 XYZ a coin
+      const res = await ok(`/v2/network/amm_volume?start=2025-11-11&end=2025-11-11&${display}`);
+      expect(res.rows.map((r) => r.start_time)).toEqual(['2025-11-11T00:00:00Z']);
+      const day = res.rows[0];
+      expect(day.exchange_rate).toBe('0.25000000');
+      expect(day.exchange).toEqual({ currency: 'XYZ', issuer: I2 });
+      const plain = (await ok('/v2/network/amm_volume?start=2025-11-11&end=2025-11-11')).rows[0];
+      expect(plain.components.length).toBeGreaterThan(3);
+      expect(day.total).toBe(String(Number(plain.total) * 0.25));
+      day.components.forEach((c: Json, i: number) => {
+        expect(Object.keys(c)).toEqual(AMM_KEYS);
+        expect(c.converted_amount).toBe(String(Number(plain.components[i].converted_amount) * 0.25));
+        expect(c.rate).toBe(
+          p8(Number(plain.components[i].amount) / Number(plain.components[i].converted_amount) / 0.25),
+        );
+      });
+      // 2026-08-05 has no trade of XYZ: the rate is 0, and the component is kept, with zeros
+      const august = (await ok(`/v2/network/amm_volume?start=2026-08-05&end=2026-08-05&${display}`)).rows[0];
+      expect(august.exchange_rate).toBe('0.0000000');
+      expect(august.total).toBe('0');
+      expect(august.components).toHaveLength(1);
+      expect([august.components[0].rate, august.components[0].converted_amount]).toEqual(['0', '0']);
+      expect(Object.keys(august.components[0])).toEqual(AMM_KEYS);
+    });
+
+    it('the native currency as the display currency is no conversion; the currency is upper-cased', async () => {
+      const plain = await ok('/v2/network/amm_volume?live=day');
+      expect(await ok('/v2/network/amm_volume?live=day&exchange_currency=xrp')).toEqual(plain);
+      const lower = await ok(`/v2/network/amm_volume?live=hour&exchange_currency=xyz&exchange_issuer=${I2}`);
+      expect(lower.rows[0].exchange).toEqual({ currency: 'XYZ', issuer: I2 });
+    });
+  });
+
+  // ===============================================================================================================
+  describe('errors', () => {
+    const msg = async (qs: string): Promise<[number, string]> => {
+      const res = await get(`/v2/network/amm_volume${qs}`);
+      expect(res.body.result).toBe('error');
+      return [res.status, res.body.message];
+    };
+
+    it('an invalid period gives invalid period - use: hour, day, 3day, 7day, 30day (the minute period is not supported)', async () => {
+      for (const live of ['week', 'HOUR', 'minute', '2day', '1']) {
+        expect(await msg(`?live=${live}`)).toEqual([400, 'invalid period - use: hour, day, 3day, 7day, 30day']);
+      }
+      // not checked when start or end is given
+      expect((await get('/v2/network/amm_volume?live=week&start=2026-10-16&end=2026-10-16')).status).toBe(200);
+    });
+
+    it('the checks come in the order of exchange_volume: exchange, start, end, interval, live', async () => {
+      expect(await msg('?exchange_currency=USD&start=junk&end=junk&interval=x&live=x')).toEqual([
+        400,
+        'exchange currency must have an issuer',
+      ]);
+      expect(await msg('?start=junk&end=junk&interval=x&live=x')).toEqual([400, 'invalid start date format']);
+      expect(await msg('?end=junk&interval=x&live=x')).toEqual([400, 'invalid end date format']);
+      expect(await msg('?interval=x&live=x')).toEqual([400, 'invalid interval - use: day, week, month']);
+      expect(await msg('?live=x')).toEqual([400, 'invalid period - use: hour, day, 3day, 7day, 30day']);
+    });
+
+    it('the exchange currency: without an issuer, the native one with an issuer, an issuer that is no address', async () => {
+      expect(await msg('?exchange_currency=USD')).toEqual([400, 'exchange currency must have an issuer']);
+      expect(await msg(`?exchange_currency=XRP&exchange_issuer=${I2}`)).toEqual([400, 'XRP cannot have an issuer']);
+      expect(await msg('?exchange_currency=USD&exchange_issuer=notanaddress')).toEqual([
+        400,
+        'invalid exchange issuer address',
+      ]);
+    });
+
+    it('needs an API key, and the error body is the Ripple one', async () => {
+      const res = await h.http().get('/v2/network/amm_volume');
+      expect(res.status).toBe(401);
+      expect(Object.keys(res.body)).toContain('result');
+    });
+
+    it('answers 500 "error getting data" when the database fails, and leaks nothing', async () => {
+      for (const path of [
+        '/v2/network/amm_volume',
+        '/v2/network/amm_volume?live=hour',
+        '/v2/network/amm_volume?start=2026-01-01',
+        `/v2/network/amm_volume?exchange_currency=XYZ&exchange_issuer=${I2}`,
+      ]) {
+        const spy = jest
+          .spyOn(h.ch, 'query')
+          .mockRejectedValue(new Error('DB::Exception: Cannot connect to the secret host'));
+        const res = await get(path);
+        spy.mockRestore();
+        expect([path, res.status, res.body]).toEqual([path, 500, { result: 'error', message: 'error getting data' }]);
+      }
+    });
+  });
+
+  // ===============================================================================================================
+  describe('CSV', () => {
+    it('format=csv is the rows flattened, a file named amm_volume.csv', async () => {
+      // 2026-08-05: one pool (PLOOP / XRP), two swaps above the dust and one of dust
+      const res = await get('/v2/network/amm_volume?start=2026-08-05&end=2026-08-05&format=csv');
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toMatch(/^text\/csv/);
+      expect(res.headers['content-disposition']).toBe(csvDisposition('amm_volume'));
+      const lines = res.text.trim().split('\n');
+      expect(lines).toHaveLength(2);
+      const want = ammRow(bucketParts(['2026-08-05']), unix('2026-08-05T00:00:00Z'), unix('2026-08-06T00:00:00Z'));
+      expect(want.components).toHaveLength(1);
+      const c = want.components[0];
+      expect(lines[0]).toBe(
+        [
+          'components[0].amm_account',
+          'components[0].base.currency',
+          'components[0].base.issuer',
+          'components[0].counter.currency',
+          'components[0].count',
+          'components[0].amount',
+          'components[0].rate',
+          'components[0].converted_amount',
+          'count',
+          'exchange.currency',
+          'total',
+          'exchange_rate',
+          'start_time',
+          'end_time',
+        ]
+          .map((x) => `"${x}"`)
+          .join(','),
+      );
+      expect(lines[1]).toBe(
+        [
+          c.amm_account,
+          c.base.currency,
+          c.base.issuer,
+          c.counter.currency,
+          String(c.count),
+          c.amount,
+          c.rate,
+          c.converted_amount,
+          String(want.count),
+          'XRP',
+          want.total,
+          '1.0000000',
+          '2026-08-05T00:00:00Z',
+          '2026-08-06T00:00:00Z',
+        ]
+          .map((x) => `"${x}"`)
+          .join(','),
+      );
+    });
+
+    it('live rows are CSV too, the Link header is set for a page with a next one, an empty list is an empty file, an error stays JSON', async () => {
+      const live = await get('/v2/network/amm_volume?live=day&format=csv');
+      expect(live.text.split('\n')[0]).toMatch(/^"components\[0\]\.amm_account"/);
+      expect(live.text.split('\n')[0]).toMatch(/"start_time","end_time"$/);
+      const paged = await get(`/v2/network/amm_volume?${RANGE}&limit=2&format=csv`);
+      expect(paged.headers.link).toMatch(/rel="next"/);
+      expect(paged.text.trim().split('\n')).toHaveLength(3);
+      const empty = await get('/v2/network/amm_volume?start=2030-01-01&end=2030-02-01&format=csv');
+      expect(empty.status).toBe(200);
+      expect(empty.headers['content-type']).toMatch(/^text\/csv/);
+      const bad = await get('/v2/network/amm_volume?live=x&format=csv');
+      expect(bad.status).toBe(400);
+      expect(bad.body).toEqual({ result: 'error', message: 'invalid period - use: hour, day, 3day, 7day, 30day' });
+    });
+  });
+
+  // ===============================================================================================================
+  describe('exchange_volume is unchanged by the AMM volume', () => {
+    it('its totals are those of all the exchanges, swaps included, and the numbers recorded before amm_volume existed', async () => {
+      // the same ledgers, the same markets, the same job: the trade volume of the last 30 days, which holds swaps against
+      // the pools of the markets (the RLUSD/XRP pool among them). Recorded from the code before this metric was added.
+      const res = await ok('/v2/network/exchange_volume?live=30day');
+      const want = tradeOracle(markets, rows, END - 30 * DAY, END);
+      expectSameShape(res.rows[0], tradeRow(want, END - 30 * DAY, END));
+      expect(res.rows[0].count).toBe(RECORDED_TRADE_COUNT);
+      expect(res.rows[0].total).toBe(RECORDED_TRADE_TOTAL);
+      const book = tradeOracle(
+        markets,
+        rows.filter((r) => r.amm_account === ''),
+        END - 30 * DAY,
+        END,
+      );
+      expect(res.rows[0].count).toBeGreaterThan(book.reduce((n, c) => n + c.count, 0));
+    });
+  });
+
+  // ===============================================================================================================
+  describe('a day with a set and no swap', () => {
+    it('is a row without components; a day without a set is no row', async () => {
+      // 2026-10-15 has no ledger in the fixtures: no set
+      const none = await ok('/v2/network/amm_volume?start=2026-10-15&end=2026-10-15');
+      expect(none).toEqual({ result: 'success', count: 0, rows: [] });
+      // the job writes the set of the day all the same: only the sentinel
+      await computeDailyVolumes(h.ch, new RatesService(h.ch, 'XRP'), markets, new Date('2026-10-15T00:00:00Z'));
+      const zero = await ok('/v2/network/amm_volume?start=2026-10-15&end=2026-10-15');
+      expect(zero.rows).toEqual([ammRow([], unix('2026-10-15T00:00:00Z'), unix('2026-10-16T00:00:00Z'))]);
+      expect(zero.rows[0].components).toEqual([]);
+      expect(zero.rows[0].total).toBe('0');
+    });
+  });
+});
+
+/** The count and the total of `exchange_volume?live=30day` of the describe above, before the metric `amm_volume` was added. */
+const RECORDED_TRADE_COUNT = 21;
+const RECORDED_TRADE_TOTAL = '2133.232058';

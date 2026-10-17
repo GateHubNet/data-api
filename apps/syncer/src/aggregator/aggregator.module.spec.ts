@@ -78,8 +78,9 @@ describe('AggregatorModule', () => {
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_daily' });
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     const written = insert.mock.calls.map(([table]) => table);
-    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(7);
-    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(4);
+    // the three metrics: 5 + 2 + 5 live sets, and today and yesterday of each
+    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(12);
+    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(6);
     expect(written).not.toContain(Table.AmmPools);
     const days = insert.mock.calls.filter(([table]) => table === Table.AmmDaily);
     expect(
@@ -117,7 +118,7 @@ describe('AggregatorModule', () => {
       await app.init();
       await jest.advanceTimersByTimeAsync(0);
       const sets = insert.mock.calls.filter(([table]) => table === Table.VolumeLive);
-      expect(sets).toHaveLength(7);
+      expect(sets).toHaveLength(12);
       for (const [, rows] of sets) {
         expect((rows as Array<{ config_version: number }>).every((row) => row.config_version === 42)).toBe(true);
       }
