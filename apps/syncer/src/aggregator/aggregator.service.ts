@@ -202,6 +202,34 @@ export interface AmmPoolsFunctions {
   recompute: typeof recomputeAmmPools;
 }
 
+/** A list of pools in the halving of a batch that fails (see `AggregatorService.runAmmBatch`). */
+interface AmmNode {
+  accounts: string[];
+  parent?: AmmNode;
+  /** What it failed with; set only on a list that failed. */
+  error?: unknown;
+  /** Whether a pool that failed alone is found below it. */
+  leadsToPool?: boolean;
+}
+
+/** The batch of pools `amm_pools` is rebuilding, and where the halving of a failing batch has got to. */
+interface AmmBatch {
+  /** The cursor after the batch: the ledger its pools are complete up to (live batches). */
+  upTo?: number;
+  /** The pools, to tell the same batch when it comes again. */
+  key: string;
+  /** The lists still to rebuild, the first one next. */
+  todo: AmmNode[];
+  /** The pools that failed alone: set aside when the batch is done, if the rest of it worked. */
+  suspects: Array<{ node: AmmNode; error: unknown }>;
+  /** Every list that failed. */
+  failed: AmmNode[];
+  /** Whether any list of the batch was rebuilt. */
+  succeeded: boolean;
+  /** Whether this is the same batch coming again after every one of its lists failed. */
+  repeated: boolean;
+}
+
 export interface AggregatorOptions {
   /** Default: `AGGREGATOR_INTERVAL_MS`. */
   intervalMs?: number;
@@ -283,7 +311,10 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     whole recompute from its state rows, so a batch is idempotent and a failed one is simply done again at the next tick.
  *     A batch that fails is halved to find the pools that fail on their own (at most `MAX_ISOLATED_POOLS_PER_BATCH`): those
  *     are set aside in memory, each counted as an error, and tried again after `AMM_POOL_RETRY_MS`, doubling up to an hour,
- *     while the cursor and the other pools go on; a batch that fails as a whole (the database) is the failure of the job.
+ *     while the cursor and the other pools go on; a batch that fails as a whole (the database) is the failure of the job, and
+ *     its pools are set aside only if the rest of the batch worked or the same batch fails the same way again. The halving
+ *     goes on at the next tick where it stopped when the budget runs out (the cursor waits). Only committed ledgers are read
+ *     (the newest `ledgers` row is the head), and only pools with a row above what their `amm_pools` row has seen come back.
  *  4. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
  *     first, in slices of at most a day:
  *      - the **catch-up**, from the watermark (the newest hour with ledgers) up to two hours ago, or to the hour of the newest
@@ -344,6 +375,14 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private ammWatermark?: number;
   /** The pools of `amm_pools` that failed on their own: when to try each again, and the wait after the next failure. */
   private readonly ammRetry = new Map<string, { until: number; delayMs: number }>();
+  /**
+   * The live batch whose halving did not fit in the budget of a tick: the next tick goes on with it, from the list it stopped
+   * at, instead of asking for the pools again and halving from the whole batch (which would never get further). The cursor
+   * stays where it was until the batch is done.
+   */
+  private ammPending?: AmmBatch;
+  /** The batches (their pools) in which every list failed, the last few: the same batch coming again is a repeat. */
+  private readonly ammAllFailed = new Set<string>();
   /** Whether the back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
   private backfilling = false;
   /** The sets of `volume_live` and `volume_daily` (by job, then `<metric>/<period or day>`) whose last attempt failed. */
@@ -526,75 +565,142 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   /**
    * Rebuilds the pools whose state rows changed since the cursor, a batch at a time, until nothing is left, the budget of the job
-   * is spent, or the shutdown begins; then tries again the pools that were set aside (`ammPoolsRetries`). A pool that fails on
-   * its own does not stop the others (`recomputeAmmPools`); a batch that fails as a whole is the error of the job, which is
-   * logged and counted as `amm_pools`, and the jobs after this one still run. It leaves the cursor where it was, so the next
-   * tick asks for the same pools again.
+   * is spent, or the shutdown begins; then tries again the pools that were set aside (`ammPoolsRetries`), also when the first
+   * part failed. A pool that fails on its own does not stop the others (`runAmmBatch`); a batch that fails as a whole is the
+   * error of the job, which is logged and counted as `amm_pools`, and the jobs after this one still run. It leaves the cursor
+   * where it was, so the next tick asks for the same pools again.
    */
   private async ammPoolsJob(tick: AggregatorTick): Promise<void> {
     const amm = this.ammPools;
     if (!amm) return;
     this.ammWatermark ??= await this.ammFns.watermark(this.ch);
-    await this.ammPoolsLive(tick);
+    let failure: { error: unknown } | undefined;
+    try {
+      await this.ammPoolsLive(tick);
+    } catch (error) {
+      failure = { error };
+    }
     await this.ammPoolsRetries(tick);
+    if (failure) throw failure.error;
   }
 
-  /** The pools that changed since the cursor, a batch at a time. */
+  /** The stale pools after the cursor, a batch at a time; the cursor moves past a batch once it is done. */
   private async ammPoolsLive(tick: AggregatorTick): Promise<void> {
     for (;;) {
       if (!this.mayStartSet(tick, 'amm_pools')) return;
       const ledger = this.ammWatermark as number;
-      const { accounts, upTo } = await this.ammFns.changedSince(this.ch, ledger, AMM_POOLS_BATCH);
-      if (this.closing || accounts.length === 0) return;
-      await this.recomputeAmmBatch(accounts, tick, 'amm_pools');
-      this.logger.debug(`amm_pools: ${accounts.length} pool(s) up to ledger ${upTo}`);
+      let batch = this.ammPending;
+      if (!batch) {
+        const { accounts, upTo } = await this.ammFns.changedSince(this.ch, ledger, AMM_POOLS_BATCH);
+        if (this.closing) return;
+        batch = this.newAmmBatch(accounts, upTo);
+        if (!batch) {
+          // nothing to rebuild up to `upTo` (no stale pool, or those waiting for a retry): the cursor goes there and that is all
+          // there is when the answer has no pool; with pools set aside there may be more
+          if (upTo <= ledger) return;
+          this.ammWatermark = upTo;
+          if (accounts.length === 0) return;
+          continue;
+        }
+        this.ammPending = batch;
+      }
+      let finished: boolean;
+      try {
+        finished = await this.runAmmBatch(batch, tick, 'amm_pools', true);
+      } catch (err) {
+        this.ammPending = undefined;
+        throw err;
+      }
+      if (!finished) return; // the budget, or the shutdown: the batch stays as it is, and the next tick goes on with it
+      this.ammPending = undefined;
+      this.logger.debug(`amm_pools: ${batch.key.split(',').length} pool(s) up to ledger ${batch.upTo}`);
       // a cursor that does not move would ask for the same pools for ever
-      if (upTo <= ledger) return;
-      this.ammWatermark = upTo;
+      if ((batch.upTo as number) <= ledger) return;
+      this.ammWatermark = batch.upTo;
     }
   }
 
+  /** A batch of the pools of `accounts` that are not waiting for a retry (they are rebuilt by it); none if there are none. */
+  private newAmmBatch(accounts: string[], upTo?: number): AmmBatch | undefined {
+    const pools = accounts.filter((account) => !this.ammRetry.has(account));
+    if (pools.length === 0) return undefined;
+    const key = pools.join(',');
+    return {
+      upTo,
+      key,
+      todo: [{ accounts: pools }],
+      suspects: [],
+      failed: [],
+      succeeded: false,
+      repeated: this.ammAllFailed.has(key),
+    };
+  }
+
   /**
-   * Rebuilds a batch of pools. When it fails, it is halved to find the pools that fail on their own (at most
-   * `MAX_ISOLATED_POOLS_PER_BATCH`; a recompute of the others goes on), and those are set aside for a retry
-   * (`AMM_POOL_RETRY_MS`), each counted as an error of `job`. When more fail, or the budget of the job is spent first, the
-   * error of the batch is thrown and nothing is set aside. The pools that wait for a retry are left out: the retry rebuilds
-   * them with everything they have by then.
+   * Rebuilds the lists of a batch, the first of `todo` first (Ruling R-A15). A list that fails is halved, and the halves go
+   * first, so that the pools that fail on their own are found: a list of one pool that fails is a suspect.
+   *
+   *  - More than `MAX_ISOLATED_POOLS_PER_BATCH` suspects: the cause is not the pools, and the error of the batch is thrown.
+   *  - When the batch is done, its suspects are set aside for a retry (`AMM_POOL_RETRY_MS`), each counted as an error of `job`
+   *    ... but only if something in the batch worked, or if it is a repeat of a batch in which everything failed: a batch where
+   *    everything fails (the database is down) is the failure of the job, thrown, and the same batch coming again with the same
+   *    pools failing alone is the one that proves them guilty.
+   *  - A list that failed and yet whose halves worked, with no pool found below it, is warned about and counted: it fails as a
+   *    whole for its size, and would otherwise leave no trace.
+   *
+   * With `budgeted` it stops, returning false, when the budget of the job is spent: the halving goes on at the next tick from
+   * where it stopped, with the state in the batch. A slice of `agg_dirty` is not budgeted (it is started whole). The
+   * shutdown stops it too, returning false.
    */
-  private async recomputeAmmBatch(accounts: string[], tick: AggregatorTick, job: string): Promise<void> {
+  private async runAmmBatch(batch: AmmBatch, tick: AggregatorTick, job: string, budgeted: boolean): Promise<boolean> {
     const amm = this.ammPools as AggregatorAmmPools;
-    const batch = accounts.filter((account) => !this.ammRetry.has(account));
-    if (batch.length === 0) return;
-    const recompute = (list: string[]) => this.ammFns.recompute(this.ch, amm.rates, list, { signal: tick.signal });
-    try {
-      await recompute(batch);
-      return;
-    } catch (err) {
-      if (this.closing) throw err;
-      const isolated: Array<{ account: string; err: unknown }> = [];
-      const isolate = async (list: string[], failure: unknown): Promise<void> => {
-        if (list.length === 1) {
-          isolated.push({ account: list[0], err: failure });
-          if (isolated.length > MAX_ISOLATED_POOLS_PER_BATCH) throw err;
-          return;
+    while (batch.todo.length > 0) {
+      if (this.closing || (budgeted && !this.mayStartSet(tick, 'amm_pools'))) return false;
+      const node = batch.todo[0];
+      try {
+        await this.ammFns.recompute(this.ch, amm.rates, node.accounts, { signal: tick.signal });
+        batch.todo.shift();
+        batch.succeeded = true;
+      } catch (error) {
+        if (this.closing) throw error;
+        node.error = error;
+        batch.failed.push(node);
+        batch.todo.shift();
+        if (node.accounts.length > 1) {
+          const middle = Math.ceil(node.accounts.length / 2);
+          batch.todo.unshift(
+            { accounts: node.accounts.slice(0, middle), parent: node },
+            { accounts: node.accounts.slice(middle), parent: node },
+          );
+        } else {
+          batch.suspects.push({ node, error });
+          if (batch.suspects.length > MAX_ISOLATED_POOLS_PER_BATCH) throw batch.failed[0].error;
         }
-        const middle = Math.ceil(list.length / 2);
-        for (const half of [list.slice(0, middle), list.slice(middle)]) {
-          if (this.closing || this.clock() >= tick.deadline) throw err;
-          try {
-            await recompute(half);
-          } catch (halfErr) {
-            if (this.closing) throw halfErr;
-            await isolate(half, halfErr);
-          }
-        }
-      };
-      await isolate(batch, err);
-      for (const { account, err: failure } of isolated) {
-        this.ammRetry.set(account, { until: this.clock() + AMM_POOL_RETRY_MS, delayMs: AMM_POOL_RETRY_MS });
-        this.failed(job, failure, ` for pool ${account}, set aside to be tried again`);
       }
     }
+
+    if (batch.suspects.length > 0 && !batch.succeeded && !batch.repeated) {
+      this.ammAllFailed.add(batch.key);
+      // the few last batches are enough: the same one comes again at the next tick
+      for (const key of this.ammAllFailed) if (this.ammAllFailed.size > 16) this.ammAllFailed.delete(key);
+      throw batch.failed[0].error;
+    }
+    this.ammAllFailed.delete(batch.key);
+    for (const { node, error } of batch.suspects) {
+      for (let up: AmmNode | undefined = node; up; up = up.parent) up.leadsToPool = true;
+      const account = node.accounts[0];
+      this.ammRetry.set(account, { until: this.clock() + AMM_POOL_RETRY_MS, delayMs: AMM_POOL_RETRY_MS });
+      this.failed(job, error, ` for pool ${account}, set aside to be tried again`);
+    }
+    // a failure from which nothing led to a pool: the topmost of each such tree
+    for (const node of batch.failed) {
+      if (node.leadsToPool || (node.parent && !node.parent.leadsToPool)) continue;
+      this.metrics?.aggregatorErrorsTotal.inc({ job });
+      this.logger.warn(
+        `Aggregator job ${job}: a batch of ${node.accounts.length} pool(s) failed as a whole, but its halves were rebuilt: ${describe(node.error)}`,
+      );
+    }
+    return true;
   }
 
   /** The pools that were set aside and whose wait is over, one at a time, under the budget of the job. */
@@ -628,7 +734,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     const accounts = await this.ammFns.poolsClosedIn(this.ch, amm.rates, new Date(start * 1000), new Date(end * 1000));
     for (let i = 0; i < accounts.length; i += AMM_POOLS_BATCH) {
       if (this.closing) return;
-      await this.recomputeAmmBatch(accounts.slice(i, i + AMM_POOLS_BATCH), tick, 'amm_pools_dirty');
+      const batch = this.newAmmBatch(accounts.slice(i, i + AMM_POOLS_BATCH));
+      if (batch) await this.runAmmBatch(batch, tick, 'amm_pools_dirty', false);
     }
   }
 

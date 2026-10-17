@@ -146,8 +146,21 @@ function state(
   };
 }
 
-/** State rows and the touches that go with them, as the ledger writer writes both. */
+/**
+ * State rows and the touches that go with them, in ledgers that are committed (their `ledgers` row is there), as the ledger
+ * writer leaves a ledger it has written.
+ */
 async function insertStates(ch: ClickHouseService, rows: AmmPoolStatesRow[]): Promise<void> {
+  await insertUncommitted(ch, rows);
+  const closes = new Map(rows.map((r) => [r.ledger_index, r.close_time]));
+  await ch.insert(
+    Table.Ledgers,
+    [...closes].map(([ledger, close]) => ledgerRow(ledger, close)),
+  );
+}
+
+/** State rows and their touches of ledgers that are not committed yet: no `ledgers` row, as while the writer is at them. */
+async function insertUncommitted(ch: ClickHouseService, rows: AmmPoolStatesRow[]): Promise<void> {
   await ch.insert(Table.AmmPoolStates, rows);
   await ch.insert(
     Table.AmmPoolTouches,
@@ -227,8 +240,14 @@ describe('the amm_pools job (e2e)', () => {
         created_by: create ? create.account : null,
         last_ledger: last.ledger_index,
         deleted: last.deleted,
-        // no rates here: only the pools with the native currency have a value
-        value_native: nativeBase ? double(out.reserve_base) : nativeCounter ? double(out.reserve_counter) : null,
+        // no rates here: only the pools with the native currency have a value, and a deleted pool has none
+        value_native: last.deleted
+          ? null
+          : nativeBase
+            ? double(out.reserve_base)
+            : nativeCounter
+              ? double(out.reserve_counter)
+              : null,
       };
     }
 
@@ -307,7 +326,8 @@ describe('the amm_pools job (e2e)', () => {
         reserve_base: '0',
         reserve_counter: '0',
         lp_supply: '0',
-        value_native: 0,
+        // a deleted pool has no value: it does not rank in a list sorted by value
+        value_native: null,
       });
       expect([...pools.values()].filter((p) => p.deleted === 1)).toHaveLength(1);
     });
@@ -424,7 +444,8 @@ describe('the amm_pools job (e2e)', () => {
         last_ledger: 20,
         reserve_base: '5',
         lp_supply: '5.4',
-        value_native: 12,
+        // the amounts are those of the rows before, but a deleted pool has no value (it would rank among the live ones)
+        value_native: null,
       });
       expect(pools.get(OTHER)).toMatchObject({ deleted: 0, last_ledger: 11, reserve_counter: '4', value_native: 8 });
     });
@@ -453,6 +474,37 @@ describe('the amm_pools job (e2e)', () => {
       expect(pools.get(neverSeen)?.value_native).toBeNull();
       // a native pool needs no rate, whatever the rates service can say
       expect(rates.dailyNativeRates).not.toHaveBeenCalled();
+    });
+
+    it('rebuilds a pool from the committed ledgers only: a ledger being written may be there in part', async () => {
+      const ch = await fresh();
+      await insertStates(ch, [state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' })]);
+      await insertUncommitted(ch, [
+        state({ amm_account: POOL, ledger_index: 20, reserve_base: '9', reserve_counter: '9' }),
+      ]);
+      await recomputeAmmPools(ch, noRates(), [POOL]);
+      expect(byAccount(await latest(ch)).get(POOL)).toMatchObject({
+        last_ledger: 10,
+        reserve_base: '1',
+        value_native: 4,
+      });
+
+      // the ledger is committed: the pool is rebuilt with it
+      await ch.insert(Table.Ledgers, [ledgerRow(20, T0 + 20)]);
+      await recomputeAmmPools(ch, noRates(), [POOL]);
+      expect(byAccount(await latest(ch)).get(POOL)).toMatchObject({
+        last_ledger: 20,
+        reserve_base: '9',
+        value_native: 18,
+      });
+    });
+
+    it('writes nothing while no ledger is committed', async () => {
+      const ch = await fresh();
+      await insertUncommitted(ch, [
+        state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' }),
+      ]);
+      expect(await recomputeAmmPools(ch, noRates(), [POOL])).toBe(0);
     });
 
     it('keeps the exact strings of the amounts: only value_native is a float', async () => {
@@ -688,6 +740,8 @@ describe('the amm_pools job (e2e)', () => {
           auction_holder: 'rA',
           auction_price: '3',
         }),
+        // a pool that is not rebuilt: its stale rows are what the scan for changes finds, once, however many copies there are
+        state({ amm_account: OTHER, ledger_index: 100, tx_index: 2, reserve_base: '1', reserve_counter: '1' }),
       ];
       await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolStates}`);
       await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolTouches}`);
@@ -701,13 +755,13 @@ describe('the amm_pools job (e2e)', () => {
           {},
           { settings: { insert_deduplicate: 0 } },
         );
-        expect(await ch.query(`SELECT count() AS n FROM ${Table.AmmPoolStates}`)).toEqual([{ n: 4 }]);
+        expect(await ch.query(`SELECT count() AS n FROM ${Table.AmmPoolStates}`)).toEqual([{ n: 6 }]);
         await ch.command(
           `INSERT INTO ${Table.AmmPoolTouches} SELECT * FROM ${Table.AmmPoolTouches}`,
           {},
           { settings: { insert_deduplicate: 0 } },
         );
-        expect(await ch.query(`SELECT count() AS n FROM ${Table.AmmPoolTouches}`)).toEqual([{ n: 4 }]);
+        expect(await ch.query(`SELECT count() AS n FROM ${Table.AmmPoolTouches}`)).toEqual([{ n: 6 }]);
 
         await recomputeAmmPools(ch, noRates(), [POOL]);
         const after = await latest(ch);
@@ -723,7 +777,7 @@ describe('the amm_pools job (e2e)', () => {
           value_native: 50,
         });
         // and the pools that changed: the duplicate rows name the pool once
-        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [POOL], upTo: 200 });
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [OTHER], upTo: 200 });
       } finally {
         await ch.command(`SYSTEM START MERGES ${Table.AmmPoolStates}`);
         await ch.command(`SYSTEM START MERGES ${Table.AmmPoolTouches}`);
@@ -967,6 +1021,110 @@ describe('the amm_pools job (e2e)', () => {
       }
     });
 
+    describe('only what is committed: the writer fills the tables of a ledger at the same time, and its `ledgers` row last', () => {
+      it('does not report a pool whose touch is readable but whose state row is not, and does not pass its ledger', async () => {
+        const ch = await fresh();
+        await insertStates(ch, [state({ amm_account: acct(1), ledger_index: 100 })]);
+        // ledger 101 is being written: its touches are there, its states (another table, another insert) are not yet
+        await ch.insert(Table.AmmPoolTouches, [{ ledger_index: 101, tx_index: 0, amm_account: acct(2) }]);
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [acct(1)], upTo: 100 });
+        expect(await poolsChangedSince(ch, 100, 10)).toEqual({ accounts: [], upTo: 100 });
+
+        // the ledger is committed: the state row, then the `ledgers` row
+        await ch.insert(Table.AmmPoolStates, [state({ amm_account: acct(2), ledger_index: 101 })]);
+        expect(await poolsChangedSince(ch, 100, 10)).toEqual({ accounts: [], upTo: 100 });
+        await ch.insert(Table.Ledgers, [ledgerRow(101, T0 + 101)]);
+        expect(await poolsChangedSince(ch, 100, 10)).toEqual({ accounts: [acct(2)], upTo: 101 });
+      });
+
+      it('leaves the pools of a ledger above the head out of the tie group as well', async () => {
+        const ch = await fresh();
+        await insertStates(
+          ch,
+          [1, 2, 3, 4, 5].map((n) => state({ amm_account: acct(n), ledger_index: 100 })),
+        );
+        await insertUncommitted(
+          ch,
+          [6, 7, 8].map((n) => state({ amm_account: acct(n), ledger_index: 101 })),
+        );
+        expect(await poolsChangedSince(ch, 50, 2)).toEqual({ accounts: [1, 2, 3, 4, 5].map(acct), upTo: 100 });
+      });
+
+      it('has no pool to report while no ledger is committed', async () => {
+        const ch = await fresh();
+        await insertUncommitted(ch, [state({ amm_account: acct(1), ledger_index: 100 })]);
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [], upTo: 0 });
+      });
+    });
+
+    describe('only the pools that are stale (a catch-up does not rebuild the busy pools again and again)', () => {
+      it('returns a pool once it has been rebuilt up to the head only if it changed since', async () => {
+        const ch = await fresh();
+        await insertStates(ch, [
+          state({ amm_account: acct(1), ledger_index: 10, reserve_base: '1', reserve_counter: '1' }),
+          state({ amm_account: acct(1), ledger_index: 30, reserve_base: '2', reserve_counter: '2' }),
+          state({ amm_account: acct(2), ledger_index: 20, reserve_base: '1', reserve_counter: '1' }),
+        ]);
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [acct(1), acct(2)], upTo: 30 });
+        await recomputeAmmPools(ch, noRates(), [acct(1)]);
+        // acct(1) is rebuilt up to its ledger 30: its rows at 10 and 30 are not stale any more
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [acct(2)], upTo: 30 });
+        expect(await poolsChangedSince(ch, 15, 10)).toEqual({ accounts: [acct(2)], upTo: 30 });
+        await insertStates(ch, [
+          state({ amm_account: acct(1), ledger_index: 40, reserve_base: '3', reserve_counter: '3' }),
+        ]);
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [acct(2), acct(1)], upTo: 40 });
+      });
+
+      it('moves the cursor to the head when nothing is stale, so that ledgers without AMM activity are not scanned again', async () => {
+        const ch = await fresh();
+        await insertStates(ch, [
+          state({ amm_account: acct(1), ledger_index: 10, reserve_base: '1', reserve_counter: '1' }),
+        ]);
+        await recomputeAmmPools(ch, noRates(), [acct(1)]);
+        await ch.insert(Table.Ledgers, [ledgerRow(11, T0 + 11), ledgerRow(12, T0 + 12)]);
+        expect(await poolsChangedSince(ch, 0, 10)).toEqual({ accounts: [], upTo: 12 });
+        expect(await poolsChangedSince(ch, 12, 10)).toEqual({ accounts: [], upTo: 12 });
+      });
+
+      it('a sweep over 1 busy pool and 500 quiet ones rebuilds the busy pool once, not once per batch', async () => {
+        const ch = await fresh();
+        const busy = acct(0);
+        const rows: AmmPoolStatesRow[] = [];
+        for (let ledger = 1; ledger <= 1000; ledger++) {
+          rows.push(
+            state({ amm_account: busy, ledger_index: ledger, tx_index: 0, reserve_base: '1', reserve_counter: '1' }),
+          );
+        }
+        for (let i = 1; i <= 500; i++) {
+          rows.push(
+            state({ amm_account: acct(i), ledger_index: 2 * i, tx_index: 1, reserve_base: '1', reserve_counter: '1' }),
+          );
+        }
+        await insertStates(ch, rows);
+
+        // the sweep of the live job: ask from the cursor, rebuild what comes back, move the cursor to `upTo`
+        const batches: string[][] = [];
+        let cursor = 0;
+        for (;;) {
+          const { accounts, upTo } = await poolsChangedSince(ch, cursor, 200);
+          if (upTo <= cursor) break;
+          if (accounts.length > 0) {
+            await recomputeAmmPools(ch, noRates(), accounts);
+            batches.push(accounts);
+          }
+          cursor = upTo;
+        }
+        expect(batches.length).toBeGreaterThanOrEqual(3);
+        expect(batches.filter((b) => b.includes(busy))).toHaveLength(1);
+        // every pool once: 501 pools in all, and none was rebuilt twice
+        expect(batches.flat()).toHaveLength(501);
+        expect(new Set(batches.flat()).size).toBe(501);
+        expect(cursor).toBe(1000);
+        expect(byAccount(await latest(ch)).get(busy)).toMatchObject({ last_ledger: 1000 });
+      });
+    });
+
     describe('reads the touches by primary-key range, not the partition (Rulings R-A2 and R-A14)', () => {
       /**
        * `amm_pool_touches`: 400,000 rows in four inserts of 100,000 (25,000 ledgers of four transactions each), all in the
@@ -981,6 +1139,8 @@ describe('the amm_pools job (e2e)', () => {
       /** The last ledger of the third part: the range above it is the fourth part, a quarter of the table. */
       const ABOVE_THREE_PARTS = FIRST + 3 * LEDGERS_PER_PART - 1;
       const STATES_BASES = [1_000_000, 2_000_000, 3_000_000, 4_000_000];
+      /** The newest committed ledger: a hundred ledgers past the last touch. */
+      const HEAD = FIRST + PARTS * LEDGERS_PER_PART + 100;
       let ch: ClickHouseService;
       let db: string;
 
@@ -989,6 +1149,7 @@ describe('the amm_pools job (e2e)', () => {
         db = ((await ch.queryOne<{ db: string }>('SELECT currentDatabase() AS db')) as { db: string }).db;
         await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolTouches}`);
         await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolStates}`);
+        await ch.insert(Table.Ledgers, [ledgerRow(HEAD, T0)]);
         for (let part = 0; part < PARTS; part++) {
           await ch.command(
             `INSERT INTO ${Table.AmmPoolTouches}
@@ -1035,11 +1196,25 @@ describe('the amm_pools job (e2e)', () => {
       }
 
       const explain = async (sql: string, params: Record<string, unknown>): Promise<string[]> =>
-        (await ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${sql}`, params)).map((r) => r.explain.trim());
+        (await ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${sql}`, params)).map((r) =>
+          // the plan of a join is drawn as a tree: drop its lines
+          r.explain.replace(/^[\s│├└─]+/, ''),
+        );
+
+      /** The lines of the part of an EXPLAIN that reads one table (the query joins it to `amm_pools`). */
+      function readOf(lines: string[], table: Table): string[] {
+        const at = lines.findIndex((l) => l.includes('ReadFromMergeTree') && l.includes(`.${table})`));
+        expect(at).toBeGreaterThan(-1);
+        const next = lines.findIndex((l, i) => i > at && l.includes('ReadFromMergeTree'));
+        return lines.slice(at, next === -1 ? undefined : next);
+      }
 
       /** The stages of the watermark query for a ledger: the min-max of the parts (partition key), then the primary key. */
       async function stages(ledger: number): Promise<{ minMax: Stage; primaryKey: Stage }> {
-        const lines = await explain(POOLS_CHANGED_SINCE_SQL, { ledger, n: 101 });
+        const lines = readOf(
+          await explain(POOLS_CHANGED_SINCE_SQL, { ledger, head: HEAD, n: 101 }),
+          Table.AmmPoolTouches,
+        );
         const at = lines.indexOf('PrimaryKey');
         expect(at).toBeGreaterThan(-1);
         // the key it searches is the ledger, the first column of the primary key
@@ -1057,16 +1232,16 @@ describe('the amm_pools job (e2e)', () => {
           `SELECT read_rows, tables FROM system.query_log
             WHERE current_database = {db:String} AND type = 'QueryFinish' AND query_kind = 'Select'
               AND query_start_time_microseconds >= {t:DateTime64(6)}
-              AND startsWith(query, 'SELECT amm_account, min(ledger_index)')
+              AND startsWith(query, 'SELECT t.amm_account AS amm_account, min(t.ledger_index)')
             ORDER BY query_start_time_microseconds`,
           { db, t },
         );
         expect(rows).toHaveLength(1);
-        // the touches and nothing else: the wide state table is not read by the watermark scans
-        expect(rows[0].tables).toEqual([`${db}.${Table.AmmPoolTouches}`]);
+        // the touches, and the pools to tell the stale ones: the wide state table is not read by the watermark scans
+        expect([...rows[0].tables].sort()).toEqual([`${db}.${Table.AmmPoolTouches}`, `${db}.${Table.AmmPools}`].sort());
         return Number(rows[0].read_rows);
       }
-      const sinceLedger = (ledger: number) => () => ch.query(POOLS_CHANGED_SINCE_SQL, { ledger, n: 1001 });
+      const sinceLedger = (ledger: number) => () => ch.query(POOLS_CHANGED_SINCE_SQL, { ledger, head: HEAD, n: 1001 });
 
       const activeParts = async (table: Table): Promise<number[]> =>
         (
@@ -1153,7 +1328,7 @@ describe('the amm_pools job (e2e)', () => {
           );
           expect(accounts).toHaveLength(Number(pools));
           expect(accounts.length).toBeGreaterThan(50);
-          expect(upTo).toBe(FIRST + PARTS * LEDGERS_PER_PART - 1);
+          expect(upTo).toBe(HEAD);
         });
       });
 
@@ -1212,6 +1387,27 @@ describe('the amm_pools job (e2e)', () => {
       expect(await ammPoolsWatermark(ch)).toBe(299);
       await recomputeAmmPools(ch, noRates(), [A]);
       expect(await ammPoolsWatermark(ch)).toBe(400);
+    });
+
+    it('is not past the head: a touch of a ledger that is not committed is not a stale row, and the cursor stops at the head', async () => {
+      const ch = await fresh();
+      await insertStates(ch, [state({ amm_account: A, ledger_index: 100, reserve_base: '1', reserve_counter: '1' })]);
+      await recomputeAmmPools(ch, noRates(), [A]);
+      await insertUncommitted(ch, [
+        state({ amm_account: B, ledger_index: 150, reserve_base: '1', reserve_counter: '1' }),
+      ]);
+      expect(await ammPoolsWatermark(ch)).toBe(100);
+      // committed, the row is stale: the cursor is the ledger before it
+      await ch.insert(Table.Ledgers, [ledgerRow(150, T0 + 150)]);
+      expect(await ammPoolsWatermark(ch)).toBe(149);
+    });
+
+    it('is the head when every pool has seen all its rows, also when the newest ledgers have no AMM activity', async () => {
+      const ch = await fresh();
+      await insertStates(ch, [state({ amm_account: A, ledger_index: 100, reserve_base: '1', reserve_counter: '1' })]);
+      await recomputeAmmPools(ch, noRates(), [A]);
+      await ch.insert(Table.Ledgers, [ledgerRow(140, T0 + 140)]);
+      expect(await ammPoolsWatermark(ch)).toBe(140);
     });
 
     it('reads the newest version of a pool, so a rebuild that saw less is not mistaken for one that saw more', async () => {

@@ -96,12 +96,26 @@ describe('AggregatorService amm_pools job (e2e)', () => {
   const rowCount = async (ch: ClickHouseService): Promise<number> =>
     Number((await ch.queryOne<{ n: string | number }>(`SELECT count() AS n FROM ${Table.AmmPools}`))?.n);
 
-  /** State rows made by hand, and their touches: the ledger writer writes both. */
+  /**
+   * State rows made by hand, and their touches: the ledger writer writes both, and then the `ledgers` row of each new ledger
+   * (the rows of a ledger that is not committed are not read).
+   */
   async function insertStates(ch: ClickHouseService, rows: AmmPoolStatesRow[]): Promise<void> {
     await ch.insert(Table.AmmPoolStates, rows);
     await ch.insert(
       Table.AmmPoolTouches,
       rows.map(({ ledger_index, tx_index, amm_account }) => ({ ledger_index, tx_index, amm_account })),
+    );
+    const added = new Map(
+      rows.filter((r) => r.ledger_index > NEWEST_LEDGER).map((r) => [r.ledger_index, r.close_time]),
+    );
+    await ch.insert(
+      Table.Ledgers,
+      [...added].map(([ledger, close]) => ({
+        ledger_index: ledger,
+        ledger_hash: String(ledger).padStart(64, 'D'),
+        close_time: close,
+      })),
     );
   }
 

@@ -21,7 +21,14 @@ import { RatesService } from '../query/rates.service';
  *  - **`value_native`** (spec section 3): 2 × the native reserve when one of the assets is the native currency; otherwise
  *    2 × the reserve of the first asset (base, then counter) that has a rate, divided by that rate, which is how many units
  *    of the asset one native coin buys (`RatesService.dailyNativeRates`, the same rate `converted = amount / rate` of the
- *    volume sets uses) on the UTC day of the pool's newest state; null when neither has one.
+ *    volume sets uses) on the UTC day of the pool's newest state; null when neither has one. A deleted pool has none (null):
+ *    it holds nothing, and a value kept from its last live state would rank it among the pools that do.
+ *  - **Only committed ledgers.** The ledger writer fills the tables of a ledger at the same time and writes its `ledgers` row
+ *    (the commit marker) last, so a row of a ledger above the newest `ledgers` row (the head) may be readable while another
+ *    table's rows of that ledger, or a later chunk of this one, are not. Everything here reads up to the head only: a
+ *    recompute ignores state rows above it (so a pool's `last_ledger` is never past the head, and `last_ledger >= ledger`
+ *    means every row of that ledger was seen), and the scans for what changed stop at it, so that the cursor never passes a
+ *    ledger whose rows are not all readable.
  *  - **Idempotent, versioned.** A pool's row is a function of its state rows. Every recompute writes a new version, never
  *    lower than one more than the newest version the pool has now (the ClickHouse clock in milliseconds otherwise), so the
  *    newest row of a pool is always the newest write even when the clock steps back. Readers keep the highest version of
@@ -120,7 +127,7 @@ const POOL_STATES_SQL = `SELECT amm_account,
   FROM (
        SELECT *, (ledger_index, tx_index) AS row_key
          FROM ${Table.AmmPoolStates}
-        WHERE amm_account IN {accounts:Array(String)}
+        WHERE amm_account IN {accounts:Array(String)} AND ledger_index <= {head:UInt32}
        )
  GROUP BY amm_account
  ORDER BY amm_account`;
@@ -130,7 +137,7 @@ const POOL_CREATED_SQL = `SELECT amm_account,
        min(ledger_index) AS created_ledger,
        argMin(account, (ledger_index, tx_index)) AS created_by
   FROM ${Table.AmmLiquidity}
- WHERE amm_account IN {accounts:Array(String)} AND event = 'create'
+ WHERE amm_account IN {accounts:Array(String)} AND event = 'create' AND ledger_index <= {head:UInt32}
  GROUP BY amm_account`;
 
 /** The newest version each of the pools has now. */
@@ -205,6 +212,7 @@ async function ratesOn(
  * Sets `value_native` of the pools (spec section 3): 2 × the native reserve when the pool has the native currency, else the
  * rate-based value of the first asset, base then counter, that has a reserve and a rate. The counter's rate is only asked for
  * the pools whose base has none.
+ * A deleted pool keeps `null`.
  */
 async function valueNative(rates: RatesService, pools: Valued[], signal: AbortSignal | undefined): Promise<void> {
   const rated = (pool: Valued, side: Valued['base'], rate: BigNumber | undefined): boolean => {
@@ -219,6 +227,8 @@ async function valueNative(rates: RatesService, pools: Valued[], signal: AbortSi
   const others: Valued[] = [];
   for (const pool of pools) {
     const { row } = pool;
+    // a deleted pool holds nothing: no value, and no rate looked up for it
+    if (row.deleted === 1) continue;
     if (isNative(row.base_currency, row.base_issuer, native)) {
       row.value_native = pool.base.reserve ? finiteOrNull(pool.base.reserve.times(2)) : null;
     } else if (isNative(row.counter_currency, row.counter_issuer, native)) {
@@ -260,14 +270,15 @@ async function recomputeChunk(
   ch: ClickHouseService,
   rates: RatesService,
   accounts: string[],
+  head: number,
   signal: AbortSignal | undefined,
 ): Promise<number> {
   throwIfAborted(signal);
-  const params = { accounts };
+  const params = { accounts, head };
   const [states, created, versions] = await Promise.all([
     ch.query<PoolAggregate>(POOL_STATES_SQL, params),
     ch.query<CreatedPool>(POOL_CREATED_SQL, params),
-    ch.query<PoolVersion>(POOL_VERSIONS_SQL, params),
+    ch.query<PoolVersion>(POOL_VERSIONS_SQL, { accounts }),
   ]);
   if (states.length === 0) return 0;
 
@@ -332,7 +343,8 @@ async function recomputeChunk(
  * read and written `AMM_POOLS_CHUNK` at a time.
  *
  * It is idempotent: running it again leaves the same latest values under newer versions (the older versions go away when
- * ClickHouse merges). Without FINAL, so a pre-merge duplicate of a state row changes nothing.
+ * ClickHouse merges). Without FINAL, so a pre-merge duplicate of a state row changes nothing. It reads the committed ledgers
+ * only (see the header): no row above the head is in a pool, and nothing is written while no ledger is committed.
  */
 export async function recomputeAmmPools(
   ch: ClickHouseService,
@@ -342,9 +354,12 @@ export async function recomputeAmmPools(
 ): Promise<number> {
   const { signal } = options;
   throwIfAborted(signal);
+  if (accounts.length === 0) return 0;
+  // read once, before any state row: a ledger at or below it is committed, so all its rows are there to read
+  const head = await committedHead(ch);
   let written = 0;
   for (const chunk of chunksOf([...new Set(accounts)].sort(), AMM_POOLS_CHUNK)) {
-    written += await recomputeChunk(ch, rates, chunk, signal);
+    written += await recomputeChunk(ch, rates, chunk, head, signal);
   }
   return written;
 }
@@ -354,22 +369,49 @@ export async function recomputeAmmPools(
 // ---------------------------------------------------------------------------------------------------------------------
 
 /**
- * The pools with a state row after `ledger`, with the first and newest ledger of those rows. It reads `amm_pool_touches`, the
- * narrow index of the state rows ordered by ledger, so `ledger_index > {ledger}` is a range of its primary key: the granules
- * of older ledgers are not read, whatever the state table's parts look like (Rulings R-A2 and R-A14: `amm_pool_states` is
- * ordered by pool, and once its parts have merged the minmax index on its ledgers skips no granule).
+ * The newest ledger that is committed: the highest `ledgers` row (the commit marker, written after every child table), 0 when
+ * there is none. A ledger at or below it has all its rows readable (the ledger writer waits for every insert of a ledger
+ * before it writes the marker); one above it may be there in part. Read first, by the end of the primary key.
  */
-export const POOLS_CHANGED_SINCE_SQL = `SELECT amm_account, min(ledger_index) AS first_ledger, max(ledger_index) AS newest_ledger
-  FROM ${Table.AmmPoolTouches}
- WHERE ledger_index > {ledger:UInt32}
- GROUP BY amm_account
+export async function committedHead(ch: ClickHouseService): Promise<number> {
+  const row = await ch.queryOne<{ head: Counted }>(
+    `SELECT ledger_index AS head FROM ${Table.Ledgers} ORDER BY ledger_index DESC LIMIT 1`,
+  );
+  return row === undefined ? 0 : Number(row.head);
+}
+
+/**
+ * The touches of the pools with, for each, what the pool's newest `amm_pools` row has seen (`reflected`: its `last_ledger`, and
+ * nothing for a pool that has no row). A touch above it is stale: its state row is not in the pool yet (`IS_STALE`; the same
+ * definition of stale as `ammPoolsWatermark`).
+ */
+const TOUCHES_WITH_REFLECTED = `FROM ${Table.AmmPoolTouches} AS t
+  LEFT JOIN (
+       SELECT amm_account, argMax(last_ledger, version) AS reflected
+         FROM ${Table.AmmPools}
+        GROUP BY amm_account
+       ) AS p ON t.amm_account = p.amm_account`;
+const IS_STALE = 't.ledger_index > ifNull(p.reflected, 0)';
+
+/**
+ * The stale pools after `ledger` (up to the head), with the first and newest stale ledger of each. It reads `amm_pool_touches`,
+ * the narrow index of the state rows ordered by ledger, so the range of ledgers is a range of its primary key: the granules
+ * of older ledgers are not read, whatever the state table's parts look like (Rulings R-A2 and R-A14: `amm_pool_states` is
+ * ordered by pool, and once its parts have merged the minmax index on its ledgers skips no granule). A pool the job has
+ * already rebuilt up to the head is not in it: a catch-up that asks again from a cursor just after the rows of a busy
+ * pool does not get it back.
+ */
+export const POOLS_CHANGED_SINCE_SQL = `SELECT t.amm_account AS amm_account, min(t.ledger_index) AS first_ledger, max(t.ledger_index) AS newest_ledger
+  ${TOUCHES_WITH_REFLECTED}
+ WHERE t.ledger_index > {ledger:UInt32} AND t.ledger_index <= {head:UInt32} AND ${IS_STALE}
+ GROUP BY t.amm_account
  ORDER BY first_ledger ASC, amm_account ASC
  LIMIT {n:UInt32}`;
 
-/** The pools with a state row at one ledger. */
-const POOLS_AT_LEDGER_SQL = `SELECT DISTINCT amm_account
-  FROM ${Table.AmmPoolTouches}
- WHERE ledger_index = {ledger:UInt32}
+/** The stale pools with a touch at one ledger. */
+const POOLS_AT_LEDGER_SQL = `SELECT DISTINCT t.amm_account AS amm_account
+  ${TOUCHES_WITH_REFLECTED}
+ WHERE t.ledger_index = {at:UInt32} AND ${IS_STALE}
  ORDER BY amm_account`;
 
 interface ChangedPool {
@@ -379,39 +421,39 @@ interface ChangedPool {
 }
 
 export interface PoolsChanged {
-  /** The pools whose state rows changed after the ledger, at most `limit` of them (see `poolsChangedSince`). */
+  /** The stale pools after the ledger, at most `limit` of them (see `poolsChangedSince`). */
   accounts: string[];
   /**
-   * The ledger up to which `accounts` is everything there is: every pool with a state row in `(ledger, upTo]` is in it.
-   * Equal to the ledger when nothing changed; higher than it whenever `accounts` is not empty.
+   * The ledger up to which `accounts` is everything there is: every pool with a stale state row in `(ledger, upTo]` is in it.
+   * Equal to the ledger when the committed head is not past it; higher than it otherwise, also with no pool to rebuild.
    */
   upTo: number;
 }
 
 /**
- * The pools whose state changed since `ledger` (a state row with a higher ledger index), oldest change first, at most
- * `limit` of them, and the ledger the answer is complete up to: a caller that has recomputed `accounts` goes on from
- * `upTo`, and nothing is missed or waits for ever.
+ * The pools to rebuild after `ledger`: those with a state row above what their `amm_pools` row has seen, in a committed ledger
+ * (see `committedHead`), oldest such row first, at most `limit` of them, and the ledger the answer is complete up to. A caller
+ * that has rebuilt `accounts` goes on from `upTo`, and nothing is missed or waits for ever.
  *
- *  - When there are no more than `limit` such pools they are all returned and `upTo` is the newest ledger of their rows.
- *  - Otherwise the pools whose first change is before that of the first one left out are returned, and `upTo` is the ledger
+ *  - When there are no more than `limit` such pools they are all returned and `upTo` is the head (the ledgers between their
+ *    rows and the head have no stale row, so the cursor may skip them: also when no pool is returned).
+ *  - Otherwise the pools whose first stale row is before that of the first one left out are returned, and `upTo` is the ledger
  *    before it.
- *  - When more than `limit` pools changed in the very first ledger there is, the cut would never move on, so all the
- *    pools of that ledger are returned (more than `limit` of them) and `upTo` is that ledger.
+ *  - When more than `limit` pools have their first stale row in the very first ledger there is, the cut would never move on,
+ *    so all the pools of that ledger are returned (more than `limit` of them) and `upTo` is that ledger.
+ *  - Nothing is returned, and `upTo` is `ledger`, while the head is not past it.
  */
 export async function poolsChangedSince(ch: ClickHouseService, ledger: number, limit: number): Promise<PoolsChanged> {
   const n = Math.max(1, Math.floor(limit));
-  const rows = await ch.query<ChangedPool>(POOLS_CHANGED_SINCE_SQL, { ledger, n: n + 1 });
-  if (rows.length <= n) {
-    return {
-      accounts: rows.map((r) => r.amm_account),
-      upTo: rows.reduce((newest, r) => Math.max(newest, Number(r.newest_ledger)), ledger),
-    };
-  }
+  const head = await committedHead(ch);
+  if (head <= ledger) return { accounts: [], upTo: ledger };
+  const rows = await ch.query<ChangedPool>(POOLS_CHANGED_SINCE_SQL, { ledger, head, n: n + 1 });
+  if (rows.length <= n) return { accounts: rows.map((r) => r.amm_account), upTo: head };
   const edge = Number(rows[n].first_ledger);
   const before = rows.slice(0, n).filter((r) => Number(r.first_ledger) < edge);
   if (before.length > 0) return { accounts: before.map((r) => r.amm_account), upTo: edge - 1 };
-  const atEdge = await ch.query<{ amm_account: string }>(POOLS_AT_LEDGER_SQL, { ledger: edge });
+  // the ledgers of the edge are committed (the edge is at most the head), so the pools there are all readable
+  const atEdge = await ch.query<{ amm_account: string }>(POOLS_AT_LEDGER_SQL, { at: edge });
   return { accounts: atEdge.map((r) => r.amm_account), upTo: edge };
 }
 
@@ -443,25 +485,22 @@ export async function poolsClosedIn(
  * reflected in `amm_pools` (its newest version has seen the row: `last_ledger` is at least the row's ledger). It is the
  * persistent cursor of the job, worked out from the tables themselves, so that a restart resumes where the last run
  * stopped instead of rebuilding every pool: one scan of `amm_pool_touches` (the ledger and pool of every state row; narrow, and
- * not the state table), at the start of the process. The scan cannot be cut to a range of the key: a pool that was never
- * rebuilt, or not since long ago, may have a stale row anywhere.
+ * not the state table), at the start of the process. The scan reads the whole table, not a range of its key: a pool that was
+ * never rebuilt, or not since long ago, may have a stale row anywhere.
  *
- * It is the ledger before the oldest state row that its pool has not seen, or the newest ledger of the table when there is
- * none (0 for an empty table). It is not `max(last_ledger)` of `amm_pools`: a pool that a dirty slice recomputed up to the
- * live head has a `last_ledger` far past the pools the live job has not got to yet.
+ * It is the ledger before the oldest state row that its pool has not seen, or the committed head (see `committedHead`)
+ * when there is none: 0 for a database without a ledger. Rows above the head are not counted, as they are not for
+ * `poolsChangedSince`. It is not `max(last_ledger)` of `amm_pools`: a pool that a dirty slice recomputed up to the live head
+ * has a `last_ledger` far past the pools the live job has not got to yet.
  */
 export async function ammPoolsWatermark(ch: ClickHouseService): Promise<number> {
-  const row = await ch.queryOne<{ first_stale: Counted; stale: Counted; newest: Counted }>(
-    `SELECT minIf(s.ledger_index, s.ledger_index > ifNull(p.reflected, 0)) AS first_stale,
-            countIf(s.ledger_index > ifNull(p.reflected, 0)) AS stale,
-            max(s.ledger_index) AS newest
-       FROM ${Table.AmmPoolTouches} AS s
-       LEFT JOIN (
-            SELECT amm_account, argMax(last_ledger, version) AS reflected
-              FROM ${Table.AmmPools}
-             GROUP BY amm_account
-            ) AS p ON s.amm_account = p.amm_account`,
+  const head = await committedHead(ch);
+  if (head === 0) return 0;
+  const row = await ch.queryOne<{ first_stale: Counted; stale: Counted }>(
+    `SELECT minIf(t.ledger_index, ${IS_STALE}) AS first_stale, countIf(${IS_STALE}) AS stale
+       ${TOUCHES_WITH_REFLECTED}
+      WHERE t.ledger_index <= {head:UInt32}`,
+    { head },
   );
-  if (!row) return 0;
-  return Number(row.stale) > 0 ? Number(row.first_stale) - 1 : Number(row.newest);
+  return row !== undefined && Number(row.stale) > 0 ? Number(row.first_stale) - 1 : head;
 }
