@@ -5007,6 +5007,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
   "accountExchanges": [
     {
       "account": "rN5nsAc5Kb3NKtuSrvuWWBfoP5FPrseD2i",
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "7.52425e-9",
@@ -5034,6 +5035,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     },
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "7.52425e-9",
@@ -5061,6 +5063,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     },
     {
       "account": "rGFpans8aW7XZNEcNky6RHKyEdLvXPMnUn",
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "12.501485919522",
@@ -5088,6 +5091,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     },
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "12.501485919522",
@@ -5115,6 +5119,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     },
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "2.0039999987941",
@@ -5142,6 +5147,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     },
     {
       "account": "rwmnMXpRXFqHLYzwyeggJQ8fu5bPyxqup1",
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "2.0039999987941",
@@ -6243,6 +6249,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
   ],
   "exchanges": [
     {
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "7.52425e-9",
@@ -6269,6 +6276,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_type": "Payment",
     },
     {
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "12.501485919522",
@@ -6295,6 +6303,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_type": "Payment",
     },
     {
+      "amm_account": "",
       "autobridged_currency": null,
       "autobridged_issuer": null,
       "base_amount": "2.0039999987941",

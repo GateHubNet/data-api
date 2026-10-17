@@ -628,11 +628,17 @@ describe('buildLedgerRows mapping', () => {
         taker: TAKER,
         provider: PROVIDER,
         offer_sequence: 77,
+        amm_account: '',
         autobridged_currency: null,
         autobridged_issuer: null,
         tx_type: 'OfferCreate',
         client: null,
       });
+    });
+
+    it('leaves amm_account empty on every order-book row, in exchanges and in account_exchanges', () => {
+      expect(rows.exchanges.length).toBeGreaterThan(0);
+      for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
     });
 
     it('has a row for the buyer and one for the seller, each a full copy of the exchange', () => {

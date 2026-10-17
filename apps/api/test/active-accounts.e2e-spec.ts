@@ -1119,6 +1119,7 @@ function worldOf(trades: Trade[], native: string): World {
       taker: t.seller,
       provider: t.buyer,
       offer_sequence: 7,
+      amm_account: '',
       autobridged_currency: null,
       autobridged_issuer: null,
       tx_type: 'OfferCreate',

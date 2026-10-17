@@ -302,6 +302,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         taker: exchange.taker,
         provider: exchange.provider,
         offer_sequence: exchange.offer_sequence,
+        amm_account: '',
         autobridged_currency: exchange.autobridged_currency ?? null,
         autobridged_issuer: exchange.autobridged_issuer ?? null,
         tx_type: exchange.tx_type,

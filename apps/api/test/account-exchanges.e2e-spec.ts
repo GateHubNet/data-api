@@ -1059,6 +1059,7 @@ describe('account exchanges API endpoint on the xahau-recorded ledgers', () => {
     taker: TRADER_X,
     provider: EVERNODE,
     offer_sequence: 7,
+    amm_account: '',
     autobridged_currency: null,
     autobridged_issuer: null,
     tx_type: 'OfferCreate',

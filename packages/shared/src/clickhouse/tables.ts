@@ -16,6 +16,11 @@ export enum Table {
   AccountExchanges = 'account_exchanges',
   BalanceChanges = 'balance_changes',
   AccountsCreated = 'accounts_created',
+  // AMM ledger tables (written by ingest, one row per pool and transaction).
+  AmmPoolStates = 'amm_pool_states',
+  AmmLiquidity = 'amm_liquidity',
+  AccountAmmLiquidity = 'account_amm_liquidity',
+  AmmGovernance = 'amm_governance',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -24,6 +29,8 @@ export enum Table {
   StatsHourly = 'stats_hourly',
   VolumeDaily = 'volume_daily',
   VolumeLive = 'volume_live',
+  AmmPools = 'amm_pools',
+  AmmDaily = 'amm_daily',
   // Internal bookkeeping.
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',

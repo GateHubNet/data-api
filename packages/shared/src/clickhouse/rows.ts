@@ -173,6 +173,8 @@ export interface ExchangesRow {
   taker: string;
   provider: string;
   offer_sequence: number;
+  /** The pool account of a swap against an AMM pool; `''` for an order-book trade. */
+  amm_account: string;
   autobridged_currency: string | null;
   autobridged_issuer: string | null;
   tx_type: string;
@@ -215,6 +217,94 @@ export interface AccountsCreatedRow {
   inception: UnixSeconds;
   genesis_balance: string | null;
   genesis_index: number | null;
+}
+
+// -- AMM ledger tables -------------------------------------------------------------------------------------------
+
+/**
+ * The state of a pool after a transaction that touched it: one row per pool and transaction. A value is `null` when the
+ * transaction did not change it; a reader carries the last known value forward. The pair is in Ripple's canonical
+ * (base, counter) order, like `exchanges`.
+ */
+export interface AmmPoolStatesRow {
+  amm_account: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  tx_type: string;
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  reserve_base: string | null;
+  reserve_counter: string | null;
+  lp_supply: string | null;
+  /** The 40-hex currency code of the LP token (it starts with `03`). */
+  lp_currency: string | null;
+  reserve_base_f: number | null;
+  reserve_counter_f: number | null;
+  lp_supply_f: number | null;
+  /** In units of 1/100000. */
+  trading_fee: number | null;
+  auction_holder: string | null;
+  auction_price: string | null;
+  auction_price_f: number | null;
+  auction_discounted_fee: number | null;
+  /** Expiration of the auction slot, in seconds. */
+  auction_expiration: number | null;
+  /** 1 when the transaction deleted the pool. */
+  deleted: number;
+}
+
+/**
+ * One liquidity event of a pool: create, deposit, withdraw, clawback or delete. Amounts are signed from the pool's
+ * perspective: positive in, negative out; `lp_tokens` is positive when minted and negative when burned. `mode` is `''`
+ * for events without one (create, delete).
+ */
+export interface AmmLiquidityRow {
+  amm_account: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  /** The liquidity provider; for a clawback the holder. */
+  account: string;
+  /** The sender of the transaction; differs from `account` for a clawback. */
+  initiator: string;
+  event: string;
+  mode: string;
+  base_amount: string;
+  counter_amount: string;
+  lp_tokens: string;
+  base_amount_f: number;
+  counter_amount_f: number;
+  lp_tokens_f: number;
+}
+
+/** The per-account index of `amm_liquidity`: the same columns, ordered by `account`. */
+export type AccountAmmLiquidityRow = AmmLiquidityRow;
+
+/** One `AMMVote` or `AMMBid`. */
+export interface AmmGovernanceRow {
+  amm_account: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  /** `'vote'` or `'bid'`. */
+  kind: string;
+  account: string;
+  fee_voted: number | null;
+  trading_fee_after: number | null;
+  bid_min: string | null;
+  bid_max: string | null;
+  /** The LP tokens a bid burned. */
+  price_paid: string | null;
+  slot_holder: string | null;
+  slot_discounted_fee: number | null;
+  slot_expiration: number | null;
+  auth_accounts: string[];
 }
 
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
@@ -302,6 +392,63 @@ export interface VolumeLiveRow extends Omit<VolumeDailyRow, 'day'> {
   period: string;
   start_time: UnixSeconds;
   end_time: UnixSeconds;
+}
+
+/** The current state of a pool, rebuilt by the aggregator from `amm_pool_states`. The newest `version` wins. */
+export interface AmmPoolsRow {
+  amm_account: string;
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  lp_currency: string | null;
+  /** Set only when an `AMMCreate` of the pool was ingested. */
+  created_ledger: number | null;
+  created_by: string | null;
+  last_ledger: number;
+  reserve_base: string | null;
+  reserve_counter: string | null;
+  lp_supply: string | null;
+  trading_fee: number | null;
+  auction_holder: string | null;
+  auction_price: string | null;
+  auction_discounted_fee: number | null;
+  auction_expiration: number | null;
+  /** 1 when the pool was deleted. */
+  deleted: number;
+  /** The pool's value in the native currency; `null` when neither asset has a rate. */
+  value_native: number | null;
+  version: UInt64Value;
+}
+
+/** One UTC day of a pool with activity, plus its closing state. The fee amounts are estimates. */
+export interface AmmDailyRow {
+  amm_account: string;
+  /** `'YYYY-MM-DD'` */
+  day: string;
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  swap_count: UInt64Value;
+  /** The amounts that went into the pool, by side. */
+  volume_base: string;
+  volume_counter: string;
+  fees_base_est: string;
+  fees_counter_est: string;
+  deposit_count: UInt64Value;
+  withdraw_count: UInt64Value;
+  liquidity_in_base: string;
+  liquidity_in_counter: string;
+  liquidity_out_base: string;
+  liquidity_out_counter: string;
+  reserve_base: string | null;
+  reserve_counter: string | null;
+  lp_supply: string | null;
+  trading_fee: number | null;
+  value_native: number | null;
+  config_version: number;
+  version: UInt64Value;
 }
 
 // -- Internal bookkeeping ----------------------------------------------------------------------------------------

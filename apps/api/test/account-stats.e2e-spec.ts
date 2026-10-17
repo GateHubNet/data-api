@@ -1489,6 +1489,7 @@ describe('account stats computed from synthetic ledgers', () => {
           taker: B,
           provider: B,
           offer_sequence: 1,
+          amm_account: '',
           autobridged_currency: null,
           autobridged_issuer: null,
           tx_type: 'OfferCreate',

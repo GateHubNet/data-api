@@ -18,6 +18,7 @@ import { RawLedger } from '../src/ingest/raw-ledger';
 import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
+import { SAMPLE_ROWS } from './sample-rows';
 
 const LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/ripple-mock')).list();
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
@@ -27,6 +28,14 @@ const BUILT = LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
 const index = (i: number): number => LEDGERS[i].header.ledger_index;
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
+
+/** The ledger tables of the AMM data: dedup window and partitioning like the others, rows from the AMM parser. */
+const AMM_LEDGER_TABLES: Table[] = [
+  Table.AmmPoolStates,
+  Table.AmmLiquidity,
+  Table.AccountAmmLiquidity,
+  Table.AmmGovernance,
+];
 
 type Counts = Record<string, number>;
 
@@ -111,6 +120,22 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       Table.LedgerByHash,
       rows.map((r) => r.ledgerByHash),
     );
+  }
+
+  /**
+   * One row in each AMM ledger table for every one of `rows`' ledgers: the ingest does not build those yet, so the
+   * recovery and delete tests put them in by hand, to see the deletes reach the tables and their partitions.
+   */
+  async function insertAmmRows(svc: ClickHouseService, rows: LedgerRows[]): Promise<void> {
+    for (const table of AMM_LEDGER_TABLES)
+      await svc.insert(
+        table,
+        rows.map((r) => ({
+          ...SAMPLE_ROWS[table],
+          ledger_index: r.ledger.ledger_index,
+          close_time: r.ledger.close_time,
+        })),
+      );
   }
 
   describe('write', () => {
@@ -367,6 +392,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const committed = 40;
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, committed));
       await insertUncommitted(svc, BUILT.slice(committed));
+      await insertAmmRows(svc, BUILT.slice(committed));
       // A table that is not keyed by ledger must survive.
       await svc.insert(Table.FeeStats, [
         {
@@ -385,7 +411,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const cp = await committedCheckpoint(svc);
       expect(cp).toBe(index(committed - 1));
       const before = await rowsAbove(svc, cp!);
-      // The uncommitted ledgers put rows into every child table and ledger_by_hash, over several partitions.
+      // The uncommitted ledgers put rows into every child table, ledger_by_hash and the AMM tables, over several partitions.
       for (const table of ALL_TABLES) {
         if (table === Table.Ledgers) expect(before[table]).toBe(0);
         else expect([table, before[table] > 0]).toEqual([table, true]);
@@ -421,6 +447,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const committed = 40;
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, committed));
       await insertUncommitted(svc, BUILT.slice(committed));
+      await insertAmmRows(svc, BUILT.slice(committed));
 
       const params: unknown[] = [];
       const real = svc.command.bind(svc);
@@ -439,6 +466,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // Ledger 20,005,122 has transactions but no payment, so payments has no partition 20.
       expect(partitionsOf(Table.Payments)).toEqual([11, 29]);
       expect(partitionsOf(Table.TxByHash)).toEqual([1, 2]);
+      // The AMM ledger tables are P7 like tx_by_hash.
+      for (const table of AMM_LEDGER_TABLES) expect([table, partitionsOf(table)]).toEqual([table, [1, 2]]);
     });
 
     it('is a no-op on committed data when nothing is above the checkpoint', async () => {
@@ -637,6 +666,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
     it('deleteLedgersAbove and deleteLedgerRange tag each statement and make the lightweight delete synchronous', async () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx).write(LEDGERS);
+      await insertAmmRows(svc, BUILT);
       const calls: Array<{ sql: string; queryId?: string; sync?: unknown }> = [];
       const real = svc.command.bind(svc);
       jest.spyOn(svc, 'command').mockImplementation(async (sql, params, opts) => {
@@ -769,9 +799,16 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         "SELECT name, partition_key FROM system.tables WHERE database = currentDatabase() AND engine_full LIKE '%non_replicated_deduplication_window%'",
       );
       expect(new Set(tables.map((t) => t.name))).toEqual(new Set(ALL_TABLES));
-      // The ledgers table and the child tables are exactly the ones LedgerWriter writes.
+      // The ledgers table and the child tables are exactly the ones LedgerWriter writes, except for the AMM ledger
+      // tables, which are declared and deleted with the ledger but filled only once the ingest builds their rows.
+      const childTables = new Set(CHILD_TABLES.map(([t]) => t));
       expect(new Set(ALL_TABLES)).toEqual(
-        new Set([Table.Ledgers, Table.LedgerByHash, ...CHILD_TABLES.map(([t]) => t)]),
+        new Set([
+          Table.Ledgers,
+          Table.LedgerByHash,
+          ...childTables,
+          ...AMM_LEDGER_TABLES.filter((t) => !childTables.has(t)),
+        ]),
       );
 
       for (const { table, partitionSize } of LEDGER_KEYED_TABLES) {
