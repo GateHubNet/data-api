@@ -53,6 +53,8 @@ export interface ActiveExchange {
   taker: string;
   tx_hash: string;
   tx_type: string;
+  /** The pool, on a swap against an AMM pool: the last key, and there only for a swap (see `ExchangeObject`). */
+  amm_account?: string;
 }
 
 /** The columns of `exchanges` this route reads for the exchanges of the accounts: those of the API, and the client. */
@@ -206,6 +208,7 @@ export function toActiveExchange(row: StoredActiveExchange, inverted: boolean): 
     taker: e.taker,
     tx_hash: e.tx_hash,
     tx_type: e.tx_type,
+    ...(e.amm_account !== undefined && { amm_account: e.amm_account }),
   };
 }
 

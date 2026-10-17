@@ -1,6 +1,7 @@
 import { Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { fixtureTransactions } from './support/fixtures';
+import { expectBoundedInOrderRead, explain, innerRead } from './support/plans';
 import {
   BULK_BASES,
   BULK_LEDGERS,
@@ -486,5 +487,292 @@ describe('a page whose duplicates fill the room of the first read (a ledger writ
       marker?: string;
     }>(`/v2/accounts/${account}/transactions`, 1, 'transactions');
     expect(walked.flatMap((p) => p.transactions.map((t) => t.ledger_index))).toEqual(rows.map((r) => r.ledger_index));
+  });
+});
+
+describe('amm=only reads the granules that hold swaps, not the range (read_rows over 100,000 order-book rows and 10 swaps)', () => {
+  // Ruling R-A1: `exchanges` and `account_exchanges` carry `INDEX amm_account_set amm_account TYPE set(1024)
+  // GRANULARITY 1`, and the condition of the filter is inside the read that is capped. `amm_account` is not in the key,
+  // so only the index can tell a granule without swaps from one with them: a read of `amm=only` is bounded by
+  // (the granules that hold swaps + 2) x index_granularity, however many order-book rows the range holds.
+  //
+  // The range is 100,000 order-book rows of one pair in four parts of 25,000 (one account's in `account_exchanges`),
+  // and 10 swaps in a part of their own, in the same range of the key.
+  const BOOK_PER_PART = 25_000;
+  const SWAPS = 10;
+  const SWAP_BASE = 25_000_000;
+  const POOL = 'rBulkPooLxxxxxxxxxxxxxxxxxxxxxxxxx';
+  const SEEDED_BOOK = BULK_BASES.length * BOOK_PER_PART;
+  type Bulky = Table.Exchanges | Table.AccountExchanges;
+
+  let h: Harness;
+  let api: ApiClient;
+  let t0: number;
+  let pair: Pair;
+  let pairPath: string;
+  let account: string;
+  let granule: Record<Bulky, number>;
+  let holding: Record<Bulky, number>;
+
+  const closeTimeOf = (ledger: string): string => `toDateTime({t0:UInt32} + (${ledger} - ${BULK_BASES[0]}), 'UTC')`;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    const [first] = await h.ch.query<{ t: number }>(
+      `SELECT toUnixTimestamp(close_time) AS t FROM ${Table.Ledgers} WHERE ledger_index = 20005122`,
+    );
+    t0 = Number(first.t) + 86_400;
+    const keyed = (base: number): string =>
+      `${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index, ${closeTimeOf(bulkLedger(base))} AS close_time`;
+
+    [pair] = await h.ch.query<Pair>(
+      `SELECT base_currency, base_issuer, counter_currency, counter_issuer, any(node_index) AS node_index
+         FROM ${Table.Exchanges}
+        GROUP BY base_currency, base_issuer, counter_currency, counter_issuer
+        ORDER BY count() DESC, base_currency, counter_currency LIMIT 1`,
+    );
+    pairPath = `${side(pair.base_currency, pair.base_issuer)}/${side(pair.counter_currency, pair.counter_issuer)}`;
+    const pairRow = `SELECT * FROM ${Table.Exchanges}
+        WHERE base_currency = {base_currency:String} AND base_issuer = {base_issuer:String}
+          AND counter_currency = {counter_currency:String} AND counter_issuer = {counter_issuer:String}
+          AND node_index = {node_index:UInt16}
+        ORDER BY ledger_index, tx_index LIMIT 1`;
+    [{ account }] = await h.ch.query<{ account: string }>(
+      `SELECT account FROM ${Table.AccountExchanges} GROUP BY account ORDER BY count() DESC, account LIMIT 1`,
+    );
+    const accountRow = `SELECT * FROM ${Table.AccountExchanges} WHERE account = {account:String}
+        ORDER BY ledger_index, tx_index LIMIT 1`;
+
+    // the order-book rows: four parts, merges stopped
+    await insertBulk(h, Table.Exchanges, pairRow, { ...pair, t0 }, (base) => keyed(base), BOOK_PER_PART);
+    await insertBulk(h, Table.AccountExchanges, accountRow, { account, t0 }, (base) => keyed(base), BOOK_PER_PART);
+    // the swaps: one part, ten ledgers of their own in the range of the key, the pool as provider and amm_account
+    const swap = `${closeTimeOf(`toUInt32(${SWAP_BASE} + n.number)`)} AS close_time,
+                  toUInt32(${SWAP_BASE} + n.number) AS ledger_index, toUInt32(0) AS tx_index,
+                  {pool:String} AS amm_account, {pool:String} AS provider, toUInt32(0) AS offer_sequence`;
+    for (const [table, template, params] of [
+      [Table.Exchanges, pairRow, { ...pair, t0, pool: POOL }],
+      [Table.AccountExchanges, accountRow, { account, t0, pool: POOL }],
+    ] as const) {
+      await h.ch.command(
+        `INSERT INTO ${table} SELECT tpl.* REPLACE (${swap}) FROM (${template}) AS tpl CROSS JOIN numbers(${SWAPS}) AS n`,
+        params,
+        { settings: { insert_deduplicate: 0 } },
+      );
+    }
+
+    granule = { [Table.Exchanges]: 0, [Table.AccountExchanges]: 0 };
+    holding = { [Table.Exchanges]: 0, [Table.AccountExchanges]: 0 };
+    for (const table of [Table.Exchanges, Table.AccountExchanges] as Bulky[]) {
+      // `index_granularity` of the table: its setting, or 8192
+      const [{ ddl }] = await h.ch.query<{ ddl: string }>(
+        `SELECT create_table_query AS ddl FROM system.tables WHERE database = {db:String} AND name = {table:String}`,
+        { db: h.database, table },
+      );
+      granule[table] = Number(/index_granularity\s*=\s*(\d+)/.exec(ddl)?.[1] ?? 8192);
+      // the granules (of a part) that hold a swap
+      const [row] = await h.ch.query<{ granules: string }>(
+        `SELECT uniqExact(_part, intDiv(_part_offset, {granule:UInt32})) AS granules FROM ${table} WHERE amm_account != ''`,
+        { granule: granule[table] },
+      );
+      holding[table] = Number(row.granules);
+    }
+  }, 600_000);
+
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  /** What the plan of a read says about the skip index of `amm_account`: the granules it selects and those it has. */
+  async function skipIndexOf(
+    sql: string,
+    params: Record<string, unknown>,
+  ): Promise<{ selected: number; total: number }> {
+    const plan = await explain(h, 'indexes = 1', sql, params);
+    const found = /Name: amm_account_set[\s\S]*?Granules: (\d+)\/(\d+)/.exec(plan);
+    if (!found) throw new Error(`the plan does not use amm_account_set:\n${plan}`);
+    return { selected: Number(found[1]), total: Number(found[2]) };
+  }
+
+  /** The reads of `table` while `path` was served (the SQL and its params), and what each of them read. */
+  async function served(
+    table: Table,
+    path: string,
+  ): Promise<{ reads: LoggedRead[]; statements: [string, Record<string, unknown>][]; body: Record<string, unknown> }> {
+    const spy = jest.spyOn(h.ch, 'query');
+    let body: Record<string, unknown> = {};
+    const reads = await readsOf(h, table, async () => {
+      body = (await api.ok(path, 'exchanges')).body as Record<string, unknown>;
+    });
+    const statements = spy.mock.calls
+      .filter(([sql]) => new RegExp(`FROM ${table}\\b`).test(String(sql)))
+      .map(
+        ([sql, params]) =>
+          [String(sql), (params ?? {}) as Record<string, unknown>] as [string, Record<string, unknown>],
+      );
+    spy.mockRestore();
+    return { reads, statements, body };
+  }
+
+  /** `read_rows` <= (the granules that hold swaps + 2) x index_granularity, for every SELECT of the request on the table. */
+  const boundOf = (table: Bulky): number => (holding[table] + 2) * granule[table];
+
+  it('the seed is as assumed: 100,000 order-book rows in four parts, 10 swaps in at most two granules', async () => {
+    for (const table of [Table.Exchanges, Table.AccountExchanges] as const) {
+      const [row] = await h.ch.query<{ book: string; swaps: string; parts: string }>(
+        `SELECT countIf(amm_account = '' AND ledger_index >= ${BULK_BASES[0]} AND ledger_index < ${SWAP_BASE}) AS book,
+                countIf(amm_account != '') AS swaps,
+                uniqExactIf(_part, amm_account = '' AND ledger_index >= ${BULK_BASES[0]}) AS parts
+           FROM ${table}`,
+      );
+      expect([table, Number(row.book), Number(row.swaps), Number(row.parts)]).toEqual([
+        table,
+        SEEDED_BOOK,
+        SWAPS,
+        BULK_BASES.length,
+      ]);
+      expect(holding[table]).toBeLessThanOrEqual(2);
+      expect(holding[table]).toBeGreaterThanOrEqual(1);
+      expect(granule[table]).toBeGreaterThan(1000);
+      // the swaps are in a part of their own: not one granule holds both kinds
+      const [mixed] = await h.ch.query<{ n: string }>(
+        `SELECT count() AS n FROM (SELECT _part FROM ${table} GROUP BY _part HAVING countIf(amm_account != '') > 0 AND countIf(amm_account = '') > 0)`,
+      );
+      expect(Number(mixed.n)).toBe(0);
+    }
+    // the bound is far below the range: 100,000 rows
+    expect(boundOf(Table.Exchanges)).toBeLessThan(SEEDED_BOOK);
+    expect(boundOf(Table.AccountExchanges)).toBeLessThan(SEEDED_BOOK);
+  });
+
+  describe.each([false, true])('descending=%s', (descending) => {
+    const direction = `descending=${descending}`;
+
+    it('/v2/exchanges/:base/:counter?amm=only: the swaps, in at most (granules + 2) x index_granularity rows', async () => {
+      for (const limit of [200, 5]) {
+        const path = `/v2/exchanges/${pairPath}?amm=only&limit=${limit}&${direction}`;
+        const { reads, body } = await served(Table.Exchanges, path);
+        expect(reads.length).toBeGreaterThan(0);
+        for (const read of reads)
+          expect([path, read.read_rows <= boundOf(Table.Exchanges) ? 'bounded' : read.read_rows]).toEqual([
+            path,
+            'bounded',
+          ]);
+        const exchanges = body.exchanges as { amm_account: string }[];
+        expect([path, exchanges.length, exchanges.every((e) => e.amm_account === POOL)]).toEqual([
+          path,
+          Math.min(limit, SWAPS),
+          true,
+        ]);
+      }
+    });
+
+    it('/v2/exchanges/:base/:counter?amm=only: the plan uses the skip index, and its page is read in order and capped', async () => {
+      const path = `/v2/exchanges/${pairPath}?amm=only&limit=5&${direction}`;
+      const { statements } = await served(Table.Exchanges, path);
+      expect(statements).toHaveLength(1);
+      const [sql, params] = statements[0];
+      const index = await skipIndexOf(innerRead(sql), params);
+      // the granules of the swaps out of those of all the parts of the pair
+      expect(index.selected).toBeLessThanOrEqual(holding[Table.Exchanges]);
+      expect(index.total).toBeGreaterThan(SEEDED_BOOK / granule[Table.Exchanges]);
+      await expectBoundedInOrderRead(h, sql, params, descending, path);
+    });
+
+    it('/v2/exchanges/:base/:counter?interval and ?reduce with amm=only: every read of the aggregation is bounded too', async () => {
+      const at = new Date((t0 + (SWAP_BASE - BULK_BASES[0])) * 1000).toISOString();
+      for (const query of [
+        `interval=1minute&limit=200&${direction}`,
+        `interval=1hour&limit=2&${direction}`,
+        'reduce=true',
+      ]) {
+        const path = `/v2/exchanges/${pairPath}?amm=only&${query}`;
+        const { reads, statements, body } = await served(Table.Exchanges, path);
+        expect(reads.length).toBeGreaterThan(0);
+        for (const read of reads)
+          expect([path, read.read_rows <= boundOf(Table.Exchanges) ? 'bounded' : read.read_rows]).toEqual([
+            path,
+            'bounded',
+          ]);
+        // and each of them uses the index
+        for (const [sql, params] of statements) {
+          const index = await skipIndexOf(sql, params);
+          expect([path, index.selected <= holding[Table.Exchanges]]).toEqual([path, true]);
+        }
+        // the candles and the reduced row are those of the 10 swaps
+        const rows = body.exchanges as { count: number }[];
+        expect([path, rows.reduce((n, r) => n + r.count, 0)]).toEqual([path, SWAPS]);
+      }
+      expect(at).toBeTruthy();
+    });
+
+    it('/v2/exchanges?amm=only: one read of the range, bounded', async () => {
+      const path = `/v2/exchanges?amm=only&limit=200&${direction}`;
+      const { reads, body } = await served(Table.Exchanges, path);
+      expect(reads).toHaveLength(1);
+      expect(reads[0].read_rows).toBeLessThanOrEqual(boundOf(Table.Exchanges));
+      const exchanges = body.exchanges as { amm_account: string }[];
+      expect([exchanges.length, exchanges.every((e) => e.amm_account === POOL)]).toEqual([SWAPS, true]);
+    });
+
+    it('/v2/accounts/:address/exchanges?amm=only: the swaps, bounded, with and without a pair filter', async () => {
+      for (const filter of ['', `/${pair.base_currency}`]) {
+        const path = `/v2/accounts/${account}/exchanges${filter}?amm=only&limit=200&${direction}`;
+        const { reads, statements, body } = await served(Table.AccountExchanges, path);
+        expect(reads.length).toBeGreaterThan(0);
+        for (const read of reads)
+          expect([path, read.read_rows <= boundOf(Table.AccountExchanges) ? 'bounded' : read.read_rows]).toEqual([
+            path,
+            'bounded',
+          ]);
+        const exchanges = body.exchanges as { amm_account: string }[];
+        expect([path, exchanges.length]).toEqual([path, SWAPS]);
+        const [sql, params] = statements[0];
+        expect((await skipIndexOf(innerRead(sql), params)).selected).toBeLessThanOrEqual(
+          holding[Table.AccountExchanges],
+        );
+        await expectBoundedInOrderRead(h, sql, params, descending, path);
+      }
+    });
+
+    it('amm=exclude reads a page of the order-book rows: about the granules the page needs, no more than without the filter', async () => {
+      for (const [table, base] of [
+        [Table.Exchanges, `/v2/exchanges/${pairPath}`],
+        [Table.AccountExchanges, `/v2/accounts/${account}/exchanges`],
+      ] as const) {
+        const page = (query: string): string => `${base}?limit=5&${direction}${query}`;
+        const total = (reads: LoggedRead[]): number => reads.reduce((n, r) => n + r.read_rows, 0);
+        const { reads: unfiltered } = await served(table, page(''));
+        const { reads: excluded } = await served(table, page('&amm=exclude'));
+        expect(excluded.length).toBeGreaterThan(0);
+        for (const read of excluded) {
+          expect([page('&amm=exclude'), read.read_rows <= PAGE_READ_BOUND ? 'bounded' : read.read_rows]).toEqual([
+            page('&amm=exclude'),
+            'bounded',
+          ]);
+        }
+        // the filter skips the granule of the swaps; it never makes the page read more
+        expect([table, total(excluded) <= total(unfiltered)]).toEqual([table, true]);
+      }
+    });
+  });
+
+  it('without the skip index the same read costs the range: the bound is the index at work (control)', async () => {
+    const path = `/v2/exchanges/${pairPath}?amm=only&limit=200`;
+    const { statements } = await served(Table.Exchanges, path);
+    const [sql, params] = statements[0];
+    const reads = await readsOf(h, Table.Exchanges, async () => {
+      const rows = await h.ch.query(sql, params, { use_skip_indexes: 0 });
+      expect(rows).toHaveLength(SWAPS);
+    });
+    expect(reads).toHaveLength(1);
+    expect(reads[0].read_rows).toBeGreaterThanOrEqual(SEEDED_BOOK);
+    expect(reads[0].read_rows).toBeGreaterThan(boundOf(Table.Exchanges));
+    // and with it, the read of the request
+    const [{ read_rows }] = await readsOf(h, Table.Exchanges, async () => {
+      await h.ch.query(sql, params);
+    });
+    expect(read_rows).toBeLessThanOrEqual(boundOf(Table.Exchanges));
   });
 });

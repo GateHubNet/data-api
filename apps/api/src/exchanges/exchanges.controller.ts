@@ -8,7 +8,7 @@ import { parseAssetPair, splitAsset } from '../common/asset-param';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { badRequest } from '../common/errors';
 import { setLinkHeader } from '../common/pagination';
-import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
+import { ammFilter, bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { NETWORK_PROFILE } from '../config/api.config';
 import { AggregateCsvRow, CandleObject, ReducedObject, toAggregateCsvRow } from './exchange-aggregate';
@@ -28,6 +28,16 @@ interface ExchangesBody {
   marker?: string;
   exchanges: ExchangesRows;
 }
+
+/** The `amm` param of the lists of exchanges (see `ammFilter`). */
+const AMM_QUERY = {
+  name: 'amm',
+  required: false,
+  enum: ['include', 'exclude', 'only'],
+  description:
+    'Swaps against AMM pools are exchanges too (they carry `amm_account`, the pool). `include` (default) lists them ' +
+    'with the order-book exchanges, `exclude` lists the order-book exchanges only, `only` the swaps only.',
+} as const;
 
 /**
  * The name of the CSV file, as `getExchanges.js` has it: `exchanges - <base>-<counter>` of the path, the currencies in
@@ -61,7 +71,9 @@ export class ExchangesController {
       'pair asked for in the reverse order of the stored one is inverted: base and counter, buyer and seller swap ' +
       'and the rate is 1/rate. With `interval`, the candles of the buckets that start between `start` and `end` ' +
       '(open, high, low, close, vwap, volumes, count); with `reduce=true`, one such row of the whole window. An ' +
-      'exchange whose native leg is 0.0005 or less is left out of both. `format=csv` gives the rows as a CSV file.',
+      'exchange whose native leg is 0.0005 or less is left out of both. A swap against an AMM pool is an exchange ' +
+      'too: it has `amm_account` as its last key, and `amm` lists it (`include`, the default), leaves it out ' +
+      '(`exclude`) or lists only the swaps (`only`). `format=csv` gives the rows as a CSV file.',
   })
   @ApiParam({
     name: 'base',
@@ -83,6 +95,7 @@ export class ExchangesController {
     description: 'One row of all the exchanges of the window. Not with `interval`.',
   })
   @ApiQuery({ name: 'autobridged', required: false, type: Boolean, description: 'Only the autobridged exchanges.' })
+  @ApiQuery(AMM_QUERY)
   @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 400.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
@@ -126,6 +139,7 @@ export class ExchangesController {
   @ApiQuery({ name: 'start', required: false, description: 'Start time. Default: 2013-01-01.' })
   @ApiQuery({ name: 'end', required: false, description: 'End time. Default: the newest ledger.' })
   @ApiQuery({ name: 'autobridged', required: false, type: Boolean, description: 'Only the autobridged exchanges.' })
+  @ApiQuery(AMM_QUERY)
   @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 400.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
@@ -141,17 +155,19 @@ export class ExchangesController {
 
   /**
    * What both routes read after the pair: `start` (2013-01-01 when missing or empty), `end`, `limit` (200, at most 400;
-   * a text that is not a number answers `invalid limit: NaN`, as the original did), `autobridged`, `descending` and
-   * the `marker`, which the service checks.
+   * a text that is not a number answers `invalid limit: NaN`, as the original did), then `amm` (400 `invalid amm
+   * filter - use: include, exclude, only`), `autobridged`, `descending` and the `marker`, which the service checks.
    */
   private window(query: QueryParams): ExchangesWindow & { start: Date } {
     const start = dateParam(query, 'start', 'invalid start date format', '2013-01-01');
     const end = dateParam(query, 'end', 'invalid end date format');
     const limit = limitParam(query, { def: 200, max: 400, nanError: 'invalid limit: NaN' });
+    const amm = ammFilter(query);
     return {
       start: start.date,
       ...(end && { endExclusive: endExclusive(end) }),
       autobridged: bool(query, 'autobridged'),
+      amm,
       descending: bool(query, 'descending'),
       limit,
       marker: first(query, 'marker'),

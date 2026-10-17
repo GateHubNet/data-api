@@ -3,6 +3,7 @@ import {
   canonicalPair,
   computeDailyVolumes,
   computeLiveVolumes,
+  ExchangesRow,
   getNetworkProfile,
   loadMarketsConfig,
   MarketsConfig,
@@ -1639,5 +1640,93 @@ describe('GET /v2/network/*_volume on Xahau with an empty markets config', () =>
     expect(res.rows[0].total).toBe('0');
     expect(res.rows[0].exchange_rate).toBe('0.0000000');
     expect(res.rows[0].components[0].converted_amount).toBe('0');
+  });
+});
+
+describe('GET /v2/network/exchange_volume counts the swaps against AMM pools', () => {
+  // A swap against a pool is an exchange: the trade volume of a market is that of ALL its exchanges, the order-book ones
+  // and the swaps (`amm_volume`, the volume of the pools alone, is a metric of its own). The recorded AMM ledgers hold 138
+  // swaps and 39 order-book exchanges; the markets are every pair they trade, so the jobs convert what they can.
+  const rows = fixtureExchanges('xrpl-amm').map((e) => e.row);
+  const isSwap = (r: ExchangesRow): boolean => r.amm_account !== '';
+  const asMarket = (currency: string, issuer: string): Asset => ({ currency, ...(issuer && { issuer }) });
+  const config: MarketsConfig = {
+    version: 1,
+    tradeMarkets: [
+      ...new Map(
+        rows.map((r) => [
+          [r.base_currency, r.base_issuer, r.counter_currency, r.counter_issuer].join('|'),
+          { base: asMarket(r.base_currency, r.base_issuer), counter: asMarket(r.counter_currency, r.counter_issuer) },
+        ]),
+      ).values(),
+    ],
+    paymentCurrencies: [],
+  };
+  const DAYS = [
+    ...new Set(rows.filter(isSwap).map((r) => new Date(r.close_time * 1000).toISOString().slice(0, 10))),
+  ].sort();
+  const NOW = new Date('2026-10-17T12:00:00Z');
+
+  let h: Harness;
+  let api: ApiClient;
+  const ok = async (path: string): Promise<Body> => (await api.ok<Body>(path, 'rows')).body;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-amm', env: NO_RATE_LIMIT });
+    api = await h.api();
+    const rates = new RatesService(h.ch, 'XRP');
+    for (const day of DAYS) await computeDailyVolumes(h.ch, rates, config, new Date(`${day}T00:00:00Z`));
+    await computeLiveVolumes(h.ch, rates, config, NOW);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the data is as the tests assume: days with swaps, markets of both kinds', () => {
+    expect(DAYS.length).toBeGreaterThanOrEqual(8);
+    expect(rows.filter(isSwap)).toHaveLength(138);
+    expect(config.tradeMarkets.length).toBeGreaterThan(50);
+  });
+
+  it('each day: the components, the count and the total are those of all the exchanges of the day, swaps included', async () => {
+    let swapsCounted = 0;
+    let daysChanged = 0;
+    for (const day of DAYS) {
+      const from = unix(`${day}T00:00:00Z`);
+      const to = from + DAY;
+      const all = tradeOracle(config, rows, from, to);
+      const res = await ok(`/v2/network/exchange_volume?start=${day}&end=${day}`);
+      expect([day, res.count]).toEqual([day, 1]);
+      expectSameShape(res.rows[0], tradeRow(all, from, to));
+      // the swaps of the day are in it: without them there are fewer trades (a swap in a market the job cannot convert
+      // to the native currency is in no component, with or without the filter)
+      const book = tradeOracle(
+        config,
+        rows.filter((r) => !isSwap(r)),
+        from,
+        to,
+      );
+      const counted = (list: ExpectedComponent[]): number => list.reduce((n, c) => n + c.count, 0);
+      expect([day, counted(all) >= counted(book)]).toEqual([day, true]);
+      swapsCounted += counted(all) - counted(book);
+      if (counted(all) > counted(book)) daysChanged++;
+    }
+    expect(swapsCounted).toBeGreaterThan(50);
+    expect(daysChanged).toBeGreaterThanOrEqual(6);
+  });
+
+  it('live=day: the last 24 hours, swaps included', async () => {
+    const end = NOW.getTime() / SEC;
+    const all = tradeOracle(config, rows, end - DAY, end);
+    expect(all.reduce((n, c) => n + c.count, 0)).toBeGreaterThan(0);
+    const res = await ok('/v2/network/exchange_volume?live=day');
+    expectSameShape(res.rows[0], tradeRow(all, end - DAY, end));
+    const book = tradeOracle(
+      config,
+      rows.filter((r) => !isSwap(r)),
+      end - DAY,
+      end,
+    );
+    expect(res.rows[0].count).toBeGreaterThan(book.reduce((n, c) => n + c.count, 0));
   });
 });

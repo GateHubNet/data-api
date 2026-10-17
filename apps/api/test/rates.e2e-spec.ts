@@ -828,6 +828,243 @@ describe('exchange rates on trades of the last hour (the default date is now)', 
 
 // ---------------------------------------------------------------------------------------------------------------------
 
+describe('exchange rates and normalize count the swaps against AMM pools', () => {
+  // A swap against a pool is an exchange: the rate of a pair is the volume weighted price of ALL its exchanges, the
+  // order-book ones and the swaps, and there is no parameter to leave the swaps out. The oracle adds up the exchanges
+  // the syncer stored for the recorded AMM ledgers (138 swaps, 39 order-book exchanges, 2025 and 2026).
+  const WIDE = BigNumber.clone({ DECIMAL_PLACES: 120 });
+  const DAY = 86_400;
+  const NATIVE_DUST = 0.0005;
+  const pairs = pairsOf(fixtureExchanges('xrpl-amm'));
+  const isSwap = (r: ExchangesRow): boolean => r.amm_account !== '';
+  const keyOf = (r: ExchangesRow): number[] => [r.ledger_index, r.tx_index, r.node_index];
+  const byKey = (a: ExchangesRow, b: ExchangesRow): number =>
+    a.ledger_index - b.ledger_index || a.tx_index - b.tx_index || a.node_index - b.node_index;
+  const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
+  const lastClose = (p: Pair): number => Math.max(...p.rows.map((r) => r.close_time));
+
+  /** A native leg of 0.0005 or less is rounding noise. */
+  const kept = (rows: ExchangesRow[], p: Pair): ExchangesRow[] =>
+    rows.filter(
+      (r) =>
+        !(!p.base.issuer && new BigNumber(r.base_amount).lte(NATIVE_DUST)) &&
+        !(!p.counter.issuer && new BigNumber(r.counter_amount).lte(NATIVE_DUST)),
+    );
+  /** counter per base of the exchanges (the pair asked the other way round: base per counter); 0 without volume. */
+  function vwap(rows: ExchangesRow[], inverted: boolean): BigNumber {
+    const sum = (pick: (r: ExchangesRow) => string): BigNumber =>
+      rows.reduce((total, r) => total.plus(pick(r)), new WIDE(0));
+    const base = sum((r) => (inverted ? r.counter_amount : r.base_amount));
+    const counter = sum((r) => (inverted ? r.base_amount : r.counter_amount));
+    return base.isZero() ? new WIDE(0) : counter.dividedBy(base);
+  }
+  /**
+   * The rate of `/v2/exchange_rates` as of a second (`date` written to the second, so the window ends with it), for the
+   * exchanges `rows`: with `period` the vwap of the window that ends a second before the date; else the average of the
+   * daily vwap (the day of the date, up to it) and the latest (the last 50 exchanges of the 14 days before it, newest
+   * first, then the noise out), the latest alone when the daily has none (or with `live`). Not strict: any count.
+   */
+  function rateOf(
+    p: Pair,
+    rows: ExchangesRow[],
+    inverted: boolean,
+    at: number,
+    o: { live?: boolean; period?: number } = {},
+  ) {
+    const inWindow = (from: number, before: number): ExchangesRow[] =>
+      rows.filter((r) => r.close_time >= from && r.close_time < before);
+    if (o.period !== undefined) return vwap(kept(inWindow(at - 1 - o.period, at), p), inverted);
+    const dayStart = at - (at % DAY);
+    const daily = o.live ? new WIDE(0) : vwap(kept(inWindow(dayStart, Math.min(at + 1, dayStart + DAY)), p), inverted);
+    const newest = inWindow(at - 14 * DAY, at + 1)
+      .sort((a, b) => -byKey(a, b))
+      .slice(0, 50);
+    const latest = vwap(kept(newest, p), inverted);
+    return daily.gt(0) && latest.gt(0) ? daily.plus(latest).times('0.5') : latest;
+  }
+  const p8 = (v: BigNumber.Value): string => new BigNumber(v).toPrecision(8);
+
+  let h: Harness;
+  let api: ApiClient;
+  const rate = async (
+    p: Pair,
+    inverted: boolean,
+    params: Record<string, string | number | boolean>,
+  ): Promise<string> => {
+    const [b, c] = inverted ? [p.counter, p.base] : [p.base, p.counter];
+    return (await api.ok<RateBody>(`${RATE_PATH(pathOf(b), pathOf(c))}${qs(params)}`, 'rate')).body.rate;
+  };
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-amm', env: NO_RATE_LIMIT });
+    api = await h.api();
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  // the pair that has the most of both kinds, a pair of swaps only
+  const both = [...pairs]
+    .filter((p) => p.rows.some(isSwap) && p.rows.some((r) => !isSwap(r)))
+    .sort((a, b) => b.rows.length - a.rows.length)[0];
+  const swapsOnly = [...pairs].filter((p) => p.rows.every(isSwap)).sort((a, b) => b.rows.length - a.rows.length)[0];
+
+  it('the data is as the tests assume: a pair of both kinds, a pair of swaps only', () => {
+    expect([both.rows.filter(isSwap).length, both.rows.filter((r) => !isSwap(r)).length]).toEqual([4, 14]);
+    expect(swapsOnly.rows.length).toBeGreaterThanOrEqual(6);
+    expect(pairs.filter((p) => p.rows.some(isSwap)).length).toBeGreaterThan(50);
+  });
+
+  it('the latest rate of a pair is the vwap of its last exchanges, swaps included', async () => {
+    const at = lastClose(both);
+    const date = iso(at);
+    for (const inverted of [false, true]) {
+      const asked = await rate(both, inverted, { date, live: true, strict: false });
+      const all = p8(rateOf(both, both.rows, inverted, at, { live: true }));
+      const withoutSwaps = p8(
+        rateOf(
+          both,
+          both.rows.filter((r) => !isSwap(r)),
+          inverted,
+          at,
+          { live: true },
+        ),
+      );
+      expect([inverted, asked]).toEqual([inverted, all]);
+      // the swaps move the rate: this is not a comparison of equal numbers
+      expect(withoutSwaps).not.toBe(all);
+    }
+  });
+
+  it('the daily and the latest rate, the average of both, and the rate of a period, count the swaps', async () => {
+    const at = lastClose(both);
+    const date = iso(at);
+    for (const inverted of [false, true]) {
+      const average = await rate(both, inverted, { date, strict: false });
+      expect([inverted, average]).toEqual([inverted, p8(rateOf(both, both.rows, inverted, at))]);
+      for (const period of ['hour', 'day', '7day', '30day'] as const) {
+        const seconds = { hour: 3600, day: DAY, '7day': 7 * DAY, '30day': 30 * DAY }[period];
+        // a period ends a second before the date, so ask a second later to take the last exchange in
+        const periodic = await rate(both, inverted, { date: iso(at + 1), period });
+        expect([inverted, period, periodic]).toEqual([
+          inverted,
+          period,
+          p8(rateOf(both, both.rows, inverted, at + 1, { period: seconds })),
+        ]);
+      }
+    }
+    // swaps are in the day and in the 14 days: the average differs from that of the order-book exchanges alone
+    const book = both.rows.filter((r) => !isSwap(r));
+    expect(p8(rateOf(both, book, false, at))).not.toBe(p8(rateOf(both, both.rows, false, at)));
+  });
+
+  it('a pair with swaps only has a rate, which is the vwap of its swaps (it has none without them)', async () => {
+    const at = lastClose(swapsOnly);
+    const date = iso(at);
+    for (const inverted of [false, true]) {
+      const asked = await rate(swapsOnly, inverted, { date, live: true, strict: false });
+      expect([inverted, asked]).toEqual([
+        inverted,
+        p8(rateOf(swapsOnly, swapsOnly.rows, inverted, at, { live: true })),
+      ]);
+      expect(Number(asked)).toBeGreaterThan(0);
+    }
+    // in strict mode it still takes 10 exchanges, and the swaps count among them
+    const strict = await rate(swapsOnly, false, { date, live: true });
+    expect(strict).toBe(
+      swapsOnly.rows.length >= 10 ? p8(rateOf(swapsOnly, swapsOnly.rows, false, at, { live: true })) : '0.0000000',
+    );
+  });
+
+  it('every pair that has a swap, both ways round: the rate is that of all its exchanges as of its last one', async () => {
+    let swapsMoved = 0;
+    let compared = 0;
+    for (const p of pairs.filter((x) => x.rows.some(isSwap))) {
+      const at = lastClose(p);
+      for (const inverted of [false, true]) {
+        const asked = await rate(p, inverted, { date: iso(at), live: true, strict: false });
+        const want = p8(rateOf(p, p.rows, inverted, at, { live: true }));
+        expect([pathOf(p.base), pathOf(p.counter), inverted, asked]).toEqual([
+          pathOf(p.base),
+          pathOf(p.counter),
+          inverted,
+          want,
+        ]);
+        compared++;
+        if (
+          p8(
+            rateOf(
+              p,
+              p.rows.filter((r) => !isSwap(r)),
+              inverted,
+              at,
+              { live: true },
+            ),
+          ) !== want
+        )
+          swapsMoved++;
+      }
+    }
+    expect(compared).toBeGreaterThan(100);
+    // for most of them the swaps are all there is, or move the price
+    expect(swapsMoved).toBeGreaterThan(compared / 2);
+  });
+
+  describe('normalize', () => {
+    const normalize = async (params: Record<string, string | number | boolean>): Promise<NormalizeBody> =>
+      (await api.ok<NormalizeBody>(`/v2/normalize${qs(params)}`, 'converted')).body;
+
+    it('converts through the rate of the swaps: a currency that only a pool trades', async () => {
+      const at = lastClose(swapsOnly);
+      const date = iso(at);
+      const wanted = rateOf(swapsOnly, swapsOnly.rows, false, at);
+      expect(wanted.gt(0)).toBe(true);
+      const res = await normalize({
+        amount: 1000,
+        date,
+        currency: swapsOnly.base.currency,
+        issuer: swapsOnly.base.issuer as string,
+        strict: false,
+      });
+      expect([res.rate, Number(res.converted)]).toEqual([p8(wanted), expect.closeTo(1000 * wanted.toNumber(), 6)]);
+      // and back into the currency from the native one
+      const back = await normalize({
+        amount: 3,
+        date,
+        exchange_currency: swapsOnly.base.currency,
+        exchange_issuer: swapsOnly.base.issuer as string,
+        strict: false,
+      });
+      expect(back.rate).toBe(p8(new WIDE(1).dividedBy(wanted)));
+    });
+
+    it('converts through the rate of both kinds: a pair of order-book exchanges and swaps', async () => {
+      const at = lastClose(both);
+      const date = iso(at);
+      const wanted = rateOf(both, both.rows, false, at);
+      const res = await normalize({
+        amount: 10,
+        date,
+        currency: both.base.currency,
+        issuer: both.base.issuer as string,
+        strict: false,
+      });
+      expect(res.rate).toBe(p8(wanted));
+      expect(res.rate).not.toBe(
+        p8(
+          rateOf(
+            both,
+            both.rows.filter((r) => !isSwap(r)),
+            false,
+            at,
+          ),
+        ),
+      );
+      expect(Math.abs(Number(res.converted) / (10 * wanted.toNumber()) - 1)).toBeLessThan(1e-12);
+    });
+  });
+});
+
 describe('exchange rates on Xahau (XAH is the native currency)', () => {
   const ISSUER = 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De';
   const D = Date.UTC(2020, 5, 15, 12, 0, 0) / 1000;

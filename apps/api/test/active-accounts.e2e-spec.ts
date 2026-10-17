@@ -98,6 +98,8 @@ function exchangeOf(row: ExchangesRow, inverted: boolean): Record<string, unknow
     taker: row.taker,
     tx_hash: row.tx_hash,
     tx_type: row.tx_type,
+    // a swap against an AMM pool names the pool, last
+    amm_account: row.amm_account || undefined,
   };
   return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
 }
@@ -962,6 +964,128 @@ describe('active accounts when every exchange was written twice', () => {
     const res = await accountsOf(api, `${active(USD_MWJ, 'xrp')}?date=2015-01-14&period=7day`);
     expect(res.body.exchanges_count).toBe(5);
     expect(res.body.accounts.reduce((n, a) => n + a.count, 0)).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Swaps against AMM pools
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('active accounts count the swaps against AMM pools', () => {
+  // A swap against a pool is an exchange, between its taker and the pool: both are active accounts of the pair, and the
+  // route has no parameter to leave swaps out. The oracle is the one of the mock ledgers, run on the recorded AMM ledgers
+  // (138 swaps and 39 order-book exchanges, 2025 and 2026).
+  const isSwap = (r: ExchangesRow): boolean => r.amm_account !== '';
+  const markets = marketsOf(fixtureExchanges('xrpl-amm'));
+  const withSwaps = markets.filter((m) => m.rows.some(isSwap));
+  const DAY_S = 86_400;
+  /** `YYYY-MM-DD` of the UTC day of a close time. */
+  const dayOf = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
+  const plusDays = (day: string, n: number): string =>
+    new Date(Date.parse(`${day}T00:00:00Z`) + n * DAY_S * 1000).toISOString().slice(0, 19);
+  /** The windows to ask a pair for: each day on which it has a swap, with `period=1day` (`date` to the end of the next day). */
+  const windowsOf = (m: Market): { day: string; rows: ExchangesRow[] }[] =>
+    [...new Set(m.rows.filter(isSwap).map((r) => dayOf(r.close_time)))].sort().map((day) => ({
+      day,
+      rows: closedBetween(m.rows, `${day}T00:00:00`, plusDays(day, 2)),
+    }));
+
+  let h: Harness;
+  let api: ApiClient;
+  const get = (p: string) => api.get(p);
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-amm', env: NO_RATE_LIMIT });
+    api = await h.api();
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the data is as the tests assume', () => {
+    expect(withSwaps.length).toBeGreaterThan(50);
+    expect(withSwaps.flatMap((m) => m.rows).filter(isSwap)).toHaveLength(138);
+    expect(withSwaps.some((m) => m.rows.some((r) => !isSwap(r)))).toBe(true);
+  });
+
+  it('every pair that has a swap, both ways round, on each day it has one: the accounts of all its exchanges', async () => {
+    let windows = 0;
+    let poolsListed = 0;
+    for (const m of withSwaps) {
+      for (const { day, rows } of windowsOf(m)) {
+        windows++;
+        for (const inverted of [false, true]) {
+          const [b, c] = inverted ? [m.counter, m.base] : [m.base, m.counter];
+          const path = `${active(pathOf(b), pathOf(c))}${qs({ date: day, period: '1day' })}`;
+          const res = await accountsOf(api, path);
+          expect([path, text(res.body)]).toEqual([path, text({ result: 'success', ...expectedBody(rows, inverted) })]);
+          // the pools are accounts of the pair, with their own volumes
+          for (const pool of new Set(rows.filter(isSwap).map((r) => r.amm_account))) {
+            expect([path, res.body.accounts.some((a) => a.account === pool)]).toEqual([path, true]);
+            poolsListed++;
+          }
+        }
+      }
+    }
+    expect(windows).toBeGreaterThan(50);
+    expect(poolsListed).toBeGreaterThan(100);
+  });
+
+  it('the swaps change the answer for a pair that has order-book exchanges too', async () => {
+    const m = [...withSwaps]
+      .filter((x) => x.rows.some((r) => !isSwap(r)))
+      .sort((a, b) => b.rows.length - a.rows.length)[0];
+    const { day, rows } = windowsOf(m).sort((a, b) => b.rows.length - a.rows.length)[0];
+    expect(rows.some(isSwap) && rows.some((r) => !isSwap(r))).toBe(true);
+    const res = await accountsOf(api, `${active(pathOf(m.base), pathOf(m.counter))}?date=${day}&period=1day`);
+    expect(res.body.exchanges_count).toBe(rows.length);
+    expect(res.body.exchanges_count).toBeGreaterThan(rows.filter((r) => !isSwap(r)).length);
+    const bookOnly = expectedBody(
+      rows.filter((r) => !isSwap(r)),
+      false,
+    );
+    expect(text(res.body.accounts)).not.toBe(text(bookOnly.accounts));
+  });
+
+  it('include_exchanges: the exchanges of the accounts are the exchanges of the API, a swap with amm_account last', async () => {
+    let swaps = 0;
+    for (const m of withSwaps) {
+      for (const { day, rows } of windowsOf(m)) {
+        for (const inverted of [false, true]) {
+          const [b, c] = inverted ? [m.counter, m.base] : [m.base, m.counter];
+          const path = `${active(pathOf(b), pathOf(c))}${qs({ date: day, period: '1day', include_exchanges: true })}`;
+          const res = await accountsOf(api, path);
+          expect([path, text(res.body)]).toEqual([
+            path,
+            text({ result: 'success', ...expectedBody(rows, inverted, true) }),
+          ]);
+          for (const a of res.body.accounts) {
+            for (const ex of a.exchanges ?? []) {
+              const keys = Object.keys(ex);
+              expect([path, keys.at(-1) === 'amm_account', keys.includes('amm_account')]).toEqual([
+                path,
+                ex.amm_account !== undefined,
+                ex.amm_account !== undefined,
+              ]);
+              if (ex.amm_account !== undefined) swaps++;
+            }
+          }
+        }
+      }
+    }
+    // each swap is in the list of its seller and of its buyer
+    expect(swaps).toBeGreaterThan(300);
+  });
+
+  it('CSV: the swaps are rows of the accounts, with the pool as a column of their exchanges', async () => {
+    const m = [...withSwaps].sort((a, b) => b.rows.length - a.rows.length)[0];
+    const { day, rows } = windowsOf(m)[0];
+    const res = await get(`${active(pathOf(m.base), pathOf(m.counter))}?date=${day}&period=1day&format=csv`);
+    expect(res.status).toBe(200);
+    expect(res.text.split('\n')).toHaveLength(1 + expectedBody(rows, false).count);
+    const withExchanges = await get(
+      `${active(pathOf(m.base), pathOf(m.counter))}?date=${day}&period=1day&include_exchanges=true&format=csv`,
+    );
+    expect(withExchanges.text.split('\n')[0]).toContain('"exchanges[0].amm_account"');
   });
 });
 

@@ -1,5 +1,7 @@
 import { RippleHttpError } from './errors';
 import {
+  ammConditions,
+  ammFilter,
   anyFlag,
   bool,
   dateParam,
@@ -390,4 +392,46 @@ describe('uintParam', () => {
       expect(thrown(() => uintParam({ min_sequence: value }, 'min_sequence', ERR))).toEqual([400, ERR]);
     },
   );
+});
+
+describe('ammFilter', () => {
+  it.each(['include', 'exclude', 'only'] as const)('accepts %s', (value) => {
+    expect(ammFilter({ amm: value })).toBe(value);
+  });
+
+  it('is include when the param is missing or empty (swaps against pools are exchanges, so they are listed)', () => {
+    expect(ammFilter({})).toBe('include');
+    expect(ammFilter({ amm: '' })).toBe('include');
+    expect(ammFilter({ amm: undefined })).toBe('include');
+  });
+
+  it('takes the first of a repeated param, like every param of the routes', () => {
+    expect(ammFilter({ amm: ['only', 'exclude'] })).toBe('only');
+    expect(thrown(() => ammFilter({ amm: ['nope', 'only'] }))).toEqual([
+      400,
+      'invalid amm filter - use: include, exclude, only',
+    ]);
+  });
+
+  it.each(['ONLY', 'Include', 'excluded', 'true', '1', ' only', 'only ', 'none', '*'])(
+    'answers 400 for %j: anything but the three values',
+    (value) => {
+      expect(thrown(() => ammFilter({ amm: value }))).toEqual([
+        400,
+        'invalid amm filter - use: include, exclude, only',
+      ]);
+    },
+  );
+
+  it('reads no other param', () => {
+    expect(ammFilter({ other: 'only', autobridged: 'true' })).toBe('include');
+  });
+});
+
+describe('ammConditions', () => {
+  it('is no condition for include, and a plain condition on amm_account for the others', () => {
+    expect(ammConditions('include')).toEqual([]);
+    expect(ammConditions('only')).toEqual(["amm_account != ''"]);
+    expect(ammConditions('exclude')).toEqual(["amm_account = ''"]);
+  });
 });

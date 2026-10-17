@@ -44,6 +44,9 @@ export interface HarnessOptions {
   /**
    * Ledgers to write to the database before the tests run, through the `LedgerWriter` exactly as the syncer would:
    *  - `ripple-mock`: the 54 mock ledgers of the original Ripple API (`xrpl`);
+   *  - `xrpl-recorded`: XRPL mainnet ledgers recorded from a public node (`xrpl`);
+   *  - `xrpl-amm`: the recorded ledgers around AMM transactions, swaps against pools among them (`xrpl`);
+   *  - `ripple-mock+amm`: the mock ledgers and the AMM ledgers together (`xrpl`);
    *  - `xahau-recorded`: the Xahau mainnet ledgers recorded from a public node (`xahau`);
    *  - `none` (default): an empty database.
    */

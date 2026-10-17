@@ -32,6 +32,8 @@ export interface AccountExchangeObject {
   taker: string;
   tx_hash: string;
   tx_type: string;
+  /** The pool, on a swap against an AMM pool: the last key, and there only for a swap (see `ExchangeObject`). */
+  amm_account?: string;
 }
 
 /** The columns of `account_exchanges` the API reads: those of `exchanges`, and the client. */
@@ -68,6 +70,7 @@ export function toAccountExchangeObject(row: StoredAccountExchange, inverted = f
     taker: e.taker,
     tx_hash: e.tx_hash,
     tx_type: e.tx_type,
+    ...(e.amm_account !== undefined && { amm_account: e.amm_account }),
   };
 }
 
@@ -76,7 +79,13 @@ export function toAccountExchangeObject(row: StoredAccountExchange, inverted = f
  * cell where the exchange has none) and, as a last column, the `client` of an exchange that has one. A CSV takes one
  * column for every key found in any row, so the column is there when some row of the page has a client and empty in the
  * others. The original rewrote its first row into the columns of the list and so dropped the client of that row only.
+ * The `amm_account` of a swap comes after the client, as it does in the JSON, where it is the last key.
  */
 export function toAccountCsvRow(exchange: AccountExchangeObject): ReturnType<typeof toCsvRow> & { client?: string } {
-  return { ...toCsvRow(exchange), ...(exchange.client !== undefined && { client: exchange.client }) };
+  const { amm_account, ...columns } = toCsvRow(exchange);
+  return {
+    ...columns,
+    ...(exchange.client !== undefined && { client: exchange.client }),
+    ...(amm_account !== undefined && { amm_account }),
+  };
 }

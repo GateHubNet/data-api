@@ -27,6 +27,7 @@ const STORED: StoredAccountExchange = Object.freeze({
   taker: 'rTaker',
   provider: 'rProvider',
   offer_sequence: 59207,
+  amm_account: '',
   autobridged_currency: null,
   autobridged_issuer: null,
   tx_type: 'OfferCreate',
@@ -116,12 +117,49 @@ describe('toAccountExchangeObject', () => {
   });
 });
 
+describe('toAccountExchangeObject: a swap against an AMM pool', () => {
+  const POOL = 'rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3';
+  const SWAP: StoredAccountExchange = { ...STORED, amm_account: POOL, provider: POOL, offer_sequence: 0 };
+  const BOOK_KEYS = Object.keys(toAccountExchangeObject(STORED));
+
+  it('has amm_account as its last key, after tx_type; an order-book exchange has no such key', () => {
+    expect(Object.keys(toAccountExchangeObject(SWAP))).toEqual([...BOOK_KEYS, 'amm_account']);
+    expect(BOOK_KEYS).not.toContain('amm_account');
+    expect(toAccountExchangeObject(SWAP).amm_account).toBe(POOL);
+  });
+
+  it('keeps it last with a client, an autobridged currency and in either orientation', () => {
+    const row = { ...SWAP, client: 'rt1.2.1', autobridged_currency: 'EUR', autobridged_issuer: 'rBridge' };
+    for (const inverted of [false, true]) {
+      const keys = Object.keys(toAccountExchangeObject(row, inverted));
+      expect([inverted, keys.at(-1), keys.includes('client')]).toEqual([inverted, 'amm_account', true]);
+    }
+  });
+
+  it('is the exchange of /v2/exchanges: the same amm_account', () => {
+    expect(toAccountExchangeObject(SWAP).amm_account).toBe(toExchangeObject(SWAP as StoredExchange).amm_account);
+  });
+});
+
 describe('toAccountCsvRow', () => {
   it('is the row of /v2/exchanges: every column in its order, an empty cell where the exchange has none', () => {
     const row = toAccountCsvRow(toAccountExchangeObject(STORED));
     expect(row).toEqual(toCsvRow(toExchangeObject(STORED as StoredExchange)));
     expect(Object.keys(row)).toEqual(Object.keys(toCsvRow(toExchangeObject(STORED as StoredExchange))));
     expect(row).not.toHaveProperty('client');
+  });
+
+  it('adds amm_account after the client column for a swap against a pool, and nothing for a book exchange', () => {
+    const POOL = 'rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3';
+    const book = toAccountCsvRow(toAccountExchangeObject({ ...STORED, client: 'rt1.2.1' }));
+    expect(Object.keys(book).at(-1)).toBe('client');
+    const swap = toAccountCsvRow(toAccountExchangeObject({ ...STORED, amm_account: POOL, client: 'rt1.2.1' }));
+    expect(Object.keys(swap).slice(-2)).toEqual(['client', 'amm_account']);
+    const plain = toAccountCsvRow(toAccountExchangeObject({ ...STORED, amm_account: POOL }));
+    expect(Object.keys(plain)).toEqual([
+      ...Object.keys(toCsvRow(toExchangeObject(STORED as StoredExchange))),
+      'amm_account',
+    ]);
   });
 
   it('adds the client as the last column when the exchange has one', () => {
