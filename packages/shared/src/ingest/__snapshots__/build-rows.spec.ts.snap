@@ -2,6 +2,7 @@
 
 exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches the golden rows of the flag ledger 1`] = `
 {
+  "accountAmmLiquidity": [],
   "accountExchanges": [],
   "accountPayments": [
     {
@@ -952,6 +953,9 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     },
   ],
   "accountsCreated": [],
+  "ammGovernance": [],
+  "ammLiquidity": [],
+  "ammPoolStates": [],
   "balanceChanges": [
     {
       "account": "rHktfGUbjqzU4GsYCMc1pDjdHXb5CJamto",
@@ -1944,6 +1948,9 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
       "tx_index": 36,
     },
   ],
+  "diagnostics": {
+    "ammUnclassified": 0,
+  },
   "exchanges": [],
   "ledger": {
     "account_hash": "5C4F9AA82D8570487F37C8C165894FDF7AE2C6C0B07C7F0DB8C7ACC08AD254D2",
@@ -1959,7 +1966,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "ledger_index": 26570752,
     "parent_close_time": 1792166061,
     "parent_hash": "9F2936DE8B5EE15ECD33A9B49E609CCFB2241DD7AAF00DF1E67CF34ADD065A56",
-    "parser_version": 1,
+    "parser_version": 2,
     "payments_count": 15,
     "result_counts": {
       "tesSUCCESS": 37,
@@ -3299,6 +3306,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
 
 exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, URITokenCreateSellOffer, Payment) 1`] = `
 {
+  "accountAmmLiquidity": [],
   "accountExchanges": [],
   "accountPayments": [
     {
@@ -3517,6 +3525,9 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     },
   ],
   "accountsCreated": [],
+  "ammGovernance": [],
+  "ammLiquidity": [],
+  "ammPoolStates": [],
   "balanceChanges": [
     {
       "account": "rDitc4S7Y1GF2yzM4S2dayA4jYuK6YewSz",
@@ -3849,6 +3860,9 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
       "tx_index": 3,
     },
   ],
+  "diagnostics": {
+    "ammUnclassified": 0,
+  },
   "exchanges": [],
   "ledger": {
     "account_hash": "2DE593CCB95E5EEFE34900D6091CD8E8224E6056E9AE404008C7452DBFE125EA",
@@ -3864,7 +3878,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "ledger_index": 26540188,
     "parent_close_time": 1792057530,
     "parent_hash": "C1BB45D8DD5C0E7791932423D7768C60442220D6C5785787FF716DE0D974D2C4",
-    "parser_version": 1,
+    "parser_version": 2,
     "payments_count": 2,
     "result_counts": {
       "tesSUCCESS": 4,
@@ -4049,6 +4063,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
 
 exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
 {
+  "accountAmmLiquidity": [],
   "accountExchanges": [],
   "accountPayments": [],
   "accountTransactions": [
@@ -4359,6 +4374,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     },
   ],
   "accountsCreated": [],
+  "ammGovernance": [],
+  "ammLiquidity": [],
+  "ammPoolStates": [],
   "balanceChanges": [
     {
       "account": "rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg",
@@ -4647,6 +4665,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
       "tx_index": 12,
     },
   ],
+  "diagnostics": {
+    "ammUnclassified": 0,
+  },
   "exchanges": [],
   "ledger": {
     "account_hash": "421662B7A33787943607E0AE5E4B79560FC23F2839B03A4C688991159F9377BA",
@@ -4662,7 +4683,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "ledger_index": 11118827,
     "parent_close_time": 0,
     "parent_hash": "D18572CED3F13BA2AD7B951CB65A943181F1C0DB8FFB4B61F0C4797FBE65E1AC",
-    "parser_version": 1,
+    "parser_version": 2,
     "payments_count": 0,
     "result_counts": {
       "tesSUCCESS": 13,
@@ -5004,6 +5025,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
 
 exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchanges and issued currencies) 1`] = `
 {
+  "accountAmmLiquidity": [],
   "accountExchanges": [
     {
       "account": "rN5nsAc5Kb3NKtuSrvuWWBfoP5FPrseD2i",
@@ -5607,6 +5629,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     },
   ],
   "accountsCreated": [],
+  "ammGovernance": [],
+  "ammLiquidity": [],
+  "ammPoolStates": [],
   "balanceChanges": [
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
@@ -6247,6 +6272,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_index": 10,
     },
   ],
+  "diagnostics": {
+    "ammUnclassified": 0,
+  },
   "exchanges": [
     {
       "amm_account": "",
@@ -6344,7 +6372,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     "ledger_index": 11119620,
     "parent_close_time": 0,
     "parent_hash": "53E8F8A9778B140571E12355244C8DFB832A8B2D5D450B594BD961E204957022",
-    "parser_version": 1,
+    "parser_version": 2,
     "payments_count": 3,
     "result_counts": {
       "tesSUCCESS": 11,
@@ -6725,6 +6753,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
 
 exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that creates an account) 1`] = `
 {
+  "accountAmmLiquidity": [],
   "accountExchanges": [],
   "accountPayments": [
     {
@@ -7012,6 +7041,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
       "tx_index": 4,
     },
   ],
+  "ammGovernance": [],
+  "ammLiquidity": [],
+  "ammPoolStates": [],
   "balanceChanges": [
     {
       "account": "rBSZe33F5oxHTbxSF1nZJooVDpcrrqNFp3",
@@ -7432,6 +7464,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
       "tx_index": 4,
     },
   ],
+  "diagnostics": {
+    "ammUnclassified": 0,
+  },
   "exchanges": [],
   "ledger": {
     "account_hash": "E6EA7D1DACE05259BF9EB3951E7F370E8AF9857298D2969C525C61703B6A29BA",
@@ -7447,7 +7482,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "ledger_index": 11618225,
     "parent_close_time": 1423513790,
     "parent_hash": "EA9C0029FB0171BC7F26B91E952B792FDA634D30E030BA1CDF4E10309554ADB3",
-    "parser_version": 1,
+    "parser_version": 2,
     "payments_count": 4,
     "result_counts": {
       "tesSUCCESS": 5,

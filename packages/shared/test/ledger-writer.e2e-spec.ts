@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
 import { Table } from '../src/clickhouse/tables';
-import { buildLedgerRows, CHILD_TABLES, LedgerParseError, LedgerRows } from '../src/ingest/build-rows';
+import { buildLedgerRows, CHILD_TABLES, ChildRowsKey, LedgerParseError, LedgerRows } from '../src/ingest/build-rows';
 import { FixtureLedgerSource } from '../src/ingest/fixture-ledger-source';
 import {
   awaitQuiescence,
@@ -24,12 +24,16 @@ const LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtur
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 const BUILT = LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
 
+/** Whole mainnet ledgers around the recorded AMM cases: swaps, liquidity events, votes and bids, 16 ledgers. */
+const AMM_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/amm')).list();
+const AMM_BUILT = AMM_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
+
 /** The fixture ledgers are sparse and spread over several partitions: P6 1, 2, 11, 20, 29 and P7 0, 1, 2. */
 const index = (i: number): number => LEDGERS[i].header.ledger_index;
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 
-/** The ledger tables of the AMM data: dedup window and partitioning like the others, rows from the AMM parser. */
+/** The ledger tables of the AMM data: child tables like the others, with rows from the AMM parser. */
 const AMM_LEDGER_TABLES: Table[] = [
   Table.AmmPoolStates,
   Table.AmmLiquidity,
@@ -39,17 +43,36 @@ const AMM_LEDGER_TABLES: Table[] = [
 
 type Counts = Record<string, number>;
 
-/** What the tables hold when exactly the ledgers matching `keep` were written, from the rows `buildLedgerRows` makes. */
-function expectedCounts(keep: (ledgerIndex: number) => boolean = () => true): Counts {
+/**
+ * What the tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows `buildLedgerRows`
+ * made. `seeded` are ledgers that also got one hand-made row in each AMM table (`insertAmmRows`).
+ */
+function countsOf(
+  built: LedgerRows[],
+  keep: (ledgerIndex: number) => boolean = () => true,
+  seeded: readonly LedgerRows[] = [],
+): Counts {
   const counts: Counts = Object.fromEntries(ALL_TABLES.map((t) => [t, 0]));
-  for (const rows of BUILT) {
+  for (const rows of built) {
     if (!keep(rows.ledger.ledger_index)) continue;
     counts[Table.Ledgers] += 1;
     counts[Table.LedgerByHash] += 1;
     for (const [table, key] of CHILD_TABLES) counts[table] += (rows[key] as unknown[]).length;
   }
+  for (const rows of seeded) {
+    if (keep(rows.ledger.ledger_index)) for (const table of AMM_LEDGER_TABLES) counts[table] += 1;
+  }
   return counts;
 }
+
+/** The ripple-mock ledgers (no AMM activity), optionally with seeded AMM rows. */
+const expectedCounts = (keep?: (ledgerIndex: number) => boolean, seeded?: readonly LedgerRows[]): Counts =>
+  countsOf(BUILT, keep, seeded);
+
+/** The AMM fixture ledgers. */
+const expectedAmmCounts = (keep?: (ledgerIndex: number) => boolean): Counts => countsOf(AMM_BUILT, keep);
+
+const aIndex = (i: number): number => AMM_LEDGERS[i].header.ledger_index;
 
 describe('LedgerWriter and ingest state (e2e)', () => {
   let ch: StartedClickHouse;
@@ -123,8 +146,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   }
 
   /**
-   * One row in each AMM ledger table for every one of `rows`' ledgers: the ingest does not build those yet, so the
-   * recovery and delete tests put them in by hand, to see the deletes reach the tables and their partitions.
+   * One row in each AMM ledger table for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no AMM
+   * activity, so the delete tests put these in by hand, over several partitions, to see what the deletes reach and what
+   * they leave. `expectedCounts` takes them as `seeded`.
    */
   async function insertAmmRows(svc: ClickHouseService, rows: LedgerRows[]): Promise<void> {
     for (const table of AMM_LEDGER_TABLES)
@@ -221,10 +245,17 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const tokens = calls.map((c) => c.token);
       expect(new Set(tokens).size).toBe(tokens.length);
 
-      // The 12 child tables start together, before any of them has finished.
-      const childTables = new Set<string>(CHILD_TABLES.map(([t]) => t));
+      // The child tables that have rows (the 12 of the Ripple data: these ledgers have no AMM activity, so the 4 AMM
+      // tables get no insert) start together, before any of them has finished.
+      const childTables = new Set<string>(
+        CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
+      );
+      expect(childTables.size).toBe(12);
       const firstStarts = events.slice(0, childTables.size);
       expect(new Set(firstStarts)).toEqual(new Set([...childTables].map((t) => `start:${t}`)));
+      expect(events.filter((e) => e.startsWith('start:') && AMM_LEDGER_TABLES.includes(e.slice(6) as Table))).toEqual(
+        [],
+      );
 
       const lastChildEnd = Math.max(
         ...events.map((e, i) => (e.startsWith('end:') && childTables.has(e.slice(4)) ? i : -1)),
@@ -392,7 +423,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const committed = 40;
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, committed));
       await insertUncommitted(svc, BUILT.slice(committed));
-      await insertAmmRows(svc, BUILT.slice(committed));
+      // AMM rows in the uncommitted ledgers (to go) and in the committed ones (to stay).
+      await insertAmmRows(svc, BUILT);
       // A table that is not keyed by ledger must survive.
       await svc.insert(Table.FeeStats, [
         {
@@ -427,7 +459,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const after = await rowsAbove(svc, cp!);
       expect(after).toEqual(Object.fromEntries(ALL_TABLES.map((t) => [t, 0])));
-      expect(await storedCounts(svc)).toEqual(expectedCounts((i) => i <= cp!));
+      expect(await storedCounts(svc)).toEqual(expectedCounts((i) => i <= cp!, BUILT));
+      // The AMM rows of the committed ledgers are all still there: one per ledger in each table.
+      for (const table of AMM_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, committed]);
       expect(await count(svc, Table.FeeStats)).toBe(1);
 
       // The DELETEs hit exactly the ledger-keyed tables, partition by partition where the table is partitioned.
@@ -447,7 +481,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const committed = 40;
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, committed));
       await insertUncommitted(svc, BUILT.slice(committed));
-      await insertAmmRows(svc, BUILT.slice(committed));
+      await insertAmmRows(svc, BUILT);
 
       const params: unknown[] = [];
       const real = svc.command.bind(svc);
@@ -567,6 +601,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
     it('deletes the ledgers in [from, to] from every ledger-keyed table, across partitions, and keeps the rest', async () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx).write(LEDGERS);
+      await insertAmmRows(svc, BUILT);
 
       // P6 partitions 2, 11 and 20 and P7 partitions 0, 1 and 2 are touched; the first and the last two ledgers stay.
       const from = index(1);
@@ -574,7 +609,10 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(to).toBe(20_005_122);
       await deleteLedgerRange(svc, from, to);
 
-      expect(await storedCounts(svc)).toEqual(expectedCounts((i) => i < from || i > to));
+      const kept = (i: number): boolean => i < from || i > to;
+      expect(await storedCounts(svc)).toEqual(expectedCounts(kept, BUILT));
+      // The AMM tables lose the rows of the range and keep the three ledgers outside it.
+      for (const table of AMM_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, 3]);
       expect(await committedCheckpoint(svc)).toBe(index(53));
     });
 
@@ -610,6 +648,226 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await deleteLedgerRange(svc, index(0), index(53));
 
       expect(order[0]).toBe(Table.Ledgers);
+    });
+  });
+
+  describe('AMM ledgers (whole mainnet ledgers around the recorded AMM cases)', () => {
+    /** The rows of an AMM table as ClickHouse returns them, close_time as unix seconds, in the order of `orderBy`. */
+    async function readBack(svc: ClickHouseService, table: Table, orderBy: string): Promise<Array<Json>> {
+      return svc.query<Json>(
+        `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${table} ORDER BY ${orderBy}`,
+      );
+    }
+
+    type Json = Record<string, unknown>;
+
+    const AMM_KEYS: Array<[Table, ChildRowsKey, string]> = [
+      [Table.AmmPoolStates, 'ammPoolStates', 'amm_account, ledger_index, tx_index'],
+      [Table.AmmLiquidity, 'ammLiquidity', 'amm_account, ledger_index, tx_index'],
+      [Table.AccountAmmLiquidity, 'accountAmmLiquidity', 'account, ledger_index, tx_index, amm_account'],
+      [Table.AmmGovernance, 'ammGovernance', 'amm_account, ledger_index, tx_index'],
+    ];
+
+    const sortedBy = (rows: Json[], keys: string[]): Json[] =>
+      [...rows].sort((a, b) => {
+        for (const k of keys) {
+          if (a[k] === b[k]) continue;
+          return (a[k] as number | string) < (b[k] as number | string) ? -1 : 1;
+        }
+        return 0;
+      });
+
+    it('the fixtures put rows into all four AMM tables, and AMM swaps into exchanges', () => {
+      const expected = expectedAmmCounts();
+      for (const table of AMM_LEDGER_TABLES) expect([table, expected[table] > 0]).toEqual([table, true]);
+      const swaps = AMM_BUILT.flatMap((r) => r.exchanges).filter((e) => e.amm_account !== '');
+      expect(swaps.length).toBeGreaterThan(10);
+    });
+
+    it('an AMM ledger lands in all four tables: counts and every row as built, and the unclassified count is reported', async () => {
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, ctx).write(AMM_LEDGERS);
+
+      expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+      expect(result).toEqual({
+        ammUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
+      });
+      for (const [table, key, orderBy] of AMM_KEYS) {
+        const built = AMM_BUILT.flatMap((r) => r[key] as unknown as Json[]);
+        const orderKeys = orderBy.split(', ');
+        expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderKeys)]);
+      }
+      // AMM swaps are exchanges next to the order-book trades; the pool is the provider of an offer without sequence.
+      const stored = await svc.queryOne<{ n: string | number; offers: string | number }>(
+        `SELECT count() AS n, countIf(provider = amm_account AND offer_sequence = 0) AS offers
+           FROM ${Table.Exchanges} WHERE amm_account != ''`,
+      );
+      const swaps = AMM_BUILT.flatMap((r) => r.exchanges).filter((e) => e.amm_account !== '').length;
+      expect([Number(stored?.n), Number(stored?.offers)]).toEqual([swaps, swaps]);
+    });
+
+    it('inserts the AMM tables with the other child tables: a token per chunk, all done before ledger_by_hash and the commit marker', async () => {
+      const svc = await freshService();
+      const events: string[] = [];
+      const calls: Array<{ table: string; rows: number; token: string | undefined }> = [];
+      const real = svc.insert.bind(svc);
+      jest.spyOn(svc, 'insert').mockImplementation(async (table, rows, opts) => {
+        events.push(`start:${table}`);
+        calls.push({ table, rows: rows.length, token: opts?.dedupToken });
+        await real(table, rows, opts);
+        events.push(`end:${table}`);
+      });
+
+      await new LedgerWriter(svc, ctx, { runId: 'amm-order', maxRowsPerInsert: 40 }).write(AMM_LEDGERS);
+
+      const span = `${aIndex(0)}-${aIndex(AMM_LEDGERS.length - 1)}`;
+      const expected = expectedAmmCounts();
+      for (const table of AMM_LEDGER_TABLES) {
+        const mine = calls.filter((c) => c.table === table);
+        expect([table, expected[table] > 0, mine.length]).toEqual([table, true, Math.ceil(expected[table] / 40)]);
+        expect(mine.map((c) => c.rows).reduce((a, b) => a + b, 0)).toBe(expected[table]);
+        expect(mine.every((c) => c.rows <= 40)).toBe(true);
+        expect(mine.map((c) => c.token)).toEqual(mine.map((_, n) => `amm-order:${table}:${span}:${n}`));
+      }
+      // The child tables, the AMM ones among them, start before the first of them has finished ...
+      const childStarts = CHILD_TABLES.map(([t]) => events.indexOf(`start:${t}`));
+      const firstEnd = events.findIndex((e) => e.startsWith('end:'));
+      expect(childStarts.every((at) => at >= 0 && at < firstEnd)).toBe(true);
+      // ... and all of them are done before ledger_by_hash and then the commit marker.
+      const childTables = new Set<string>(CHILD_TABLES.map(([t]) => t));
+      const lastChildEnd = Math.max(
+        ...events.map((e, i) => (e.startsWith('end:') && childTables.has(e.slice(4)) ? i : -1)),
+      );
+      expect(events.indexOf(`start:${Table.LedgerByHash}`)).toBeGreaterThan(lastChildEnd);
+      expect(events[events.length - 1]).toBe(`end:${Table.Ledgers}`);
+    });
+
+    it('reports nothing unclassified for a batch without AMM activity', async () => {
+      const svc = await freshService();
+      expect(await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, 5))).toEqual({ ammUnclassified: 0 });
+      expect(await new LedgerWriter(svc, ctx).write([])).toEqual({ ammUnclassified: 0 });
+    });
+
+    it('a retry of the same batch under the same runId is collapsed by the dedup token, a new runId is not', async () => {
+      const svc = await freshService();
+      // Merges are stopped, so it is the insert dedup token and not a merge that keeps the count.
+      for (const table of AMM_LEDGER_TABLES) await svc.command(`SYSTEM STOP MERGES ${table}`);
+      try {
+        await new LedgerWriter(svc, ctx, { runId: 'amm-retry' }).write(AMM_LEDGERS);
+        await new LedgerWriter(svc, ctx, { runId: 'amm-retry' }).write(AMM_LEDGERS);
+        expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+        for (const table of AMM_LEDGER_TABLES) expect([table, (await count(svc, table)) > 0]).toEqual([table, true]);
+
+        // Without the token the same rows are real duplicates: stored twice, until a merge.
+        const expected = expectedAmmCounts();
+        for (const table of AMM_LEDGER_TABLES) {
+          await svc.command(`INSERT INTO ${table} SELECT * FROM ${table}`, {}, { settings: { insert_deduplicate: 0 } });
+          expect([table, await count(svc, table)]).toEqual([table, 2 * expected[table]]);
+        }
+      } finally {
+        for (const table of AMM_LEDGER_TABLES) await svc.command(`SYSTEM START MERGES ${table}`);
+      }
+      for (const table of AMM_LEDGER_TABLES) {
+        await svc.command(`OPTIMIZE TABLE ${table} FINAL`);
+        const key = (
+          await svc.queryOne<{ sorting_key: string }>(
+            'SELECT sorting_key FROM system.tables WHERE database = currentDatabase() AND name = {t:String}',
+            { t: table },
+          )
+        )?.sorting_key;
+        const row = await svc.queryOne<{ n: string | number; u: string | number }>(
+          `SELECT count() AS n, uniqExact(${key}) AS u FROM ${table}`,
+        );
+        expect([table, Number(row?.n), Number(row?.u)]).toEqual([
+          table,
+          expectedAmmCounts()[table],
+          expectedAmmCounts()[table],
+        ]);
+      }
+    });
+
+    it.each([Table.LedgerByHash, Table.Ledgers])(
+      'a failure of the %s insert, after the child inserts, leaves no orphan in the AMM tables once recovery is through',
+      async (failingTable) => {
+        const svc = await freshService();
+        // Six committed ledgers (they hold a bid), then a batch whose last inserts fail (it holds a vote).
+        const committed = 6;
+        await new LedgerWriter(svc, ctx).write(AMM_LEDGERS.slice(0, committed));
+        const checkpoint = aIndex(committed - 1);
+        const survivors = expectedAmmCounts((i) => i <= checkpoint);
+        for (const table of AMM_LEDGER_TABLES) expect([table, survivors[table] > 0]).toEqual([table, true]);
+
+        const failed = new LedgerWriter(svc, ctx, { runId: 'amm-fail' });
+        const real = svc.insert.bind(svc);
+        const failing = jest.spyOn(svc, 'insert').mockImplementation(async (table, rows, opts) => {
+          if (table === failingTable) throw new Error('injected failure after the child rows');
+          await real(table, rows, opts);
+        });
+        await expect(failed.write(AMM_LEDGERS.slice(committed))).rejects.toThrow('injected failure');
+        failing.mockRestore();
+
+        // The child rows are in, the ledgers are not committed.
+        expect(await committedCheckpoint(svc)).toBe(checkpoint);
+        for (const table of AMM_LEDGER_TABLES) {
+          expect([table, (await rowsAbove(svc, checkpoint))[table] > 0]).toEqual([table, true]);
+        }
+
+        // The recovery contract of LedgerWriter.
+        await awaitQuiescence(svc, failed.runId);
+        const cp = await committedCheckpoint(svc);
+        expect(cp).toBe(checkpoint);
+        await deleteLedgersAbove(svc, cp!, { queryIdPrefix: 'amm-recover' });
+        await awaitQuiescence(svc, 'amm-recover');
+
+        expect(await rowsAbove(svc, checkpoint)).toEqual(Object.fromEntries(ALL_TABLES.map((t) => [t, 0])));
+        // The AMM rows of the committed ledgers were not touched.
+        expect(await storedCounts(svc)).toEqual(survivors);
+
+        await failed.withNewRunId().write(AMM_LEDGERS.slice(committed));
+        expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+        expect(await committedCheckpoint(svc)).toBe(aIndex(AMM_LEDGERS.length - 1));
+      },
+    );
+
+    it('deleteLedgersAbove keeps the AMM rows of committed ledgers and removes those of uncommitted ones, table by table', async () => {
+      const svc = await freshService();
+      const committed = 6;
+      await new LedgerWriter(svc, ctx).write(AMM_LEDGERS.slice(0, committed));
+      const before = await Promise.all(AMM_KEYS.map(([table, , orderBy]) => readBack(svc, table, orderBy)));
+      for (const rows of before) expect(rows.length).toBeGreaterThan(0);
+      await insertUncommitted(svc, AMM_BUILT.slice(committed));
+
+      await deleteLedgersAbove(svc, aIndex(committed - 1));
+
+      const after = await Promise.all(AMM_KEYS.map(([table, , orderBy]) => readBack(svc, table, orderBy)));
+      expect(after).toEqual(before);
+      expect(await storedCounts(svc)).toEqual(expectedAmmCounts((i) => i <= aIndex(committed - 1)));
+    });
+
+    it('deleteLedgerRange removes the AMM rows of the range and keeps those outside it, table by table', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(AMM_LEDGERS);
+
+      const from = aIndex(2);
+      const to = aIndex(12);
+      await deleteLedgerRange(svc, from, to);
+
+      const kept = (i: number): boolean => i < from || i > to;
+      const expected = expectedAmmCounts(kept);
+      expect(await storedCounts(svc)).toEqual(expected);
+      // Rows are gone from the range and are all there outside it, as built.
+      for (const [table, key, orderBy] of AMM_KEYS) {
+        const built = AMM_BUILT.filter((r) => kept(r.ledger.ledger_index)).flatMap((r) => r[key] as unknown as Json[]);
+        expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
+        expect([table, await count(svc, table, `ledger_index >= ${from} AND ledger_index <= ${to}`)]).toEqual([
+          table,
+          0,
+        ]);
+      }
+
+      // And the range can be written again without duplicates.
+      await new LedgerWriter(svc, ctx).write(AMM_LEDGERS.slice(2, 13));
+      expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
     });
   });
 
@@ -799,17 +1057,10 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         "SELECT name, partition_key FROM system.tables WHERE database = currentDatabase() AND engine_full LIKE '%non_replicated_deduplication_window%'",
       );
       expect(new Set(tables.map((t) => t.name))).toEqual(new Set(ALL_TABLES));
-      // The ledgers table and the child tables are exactly the ones LedgerWriter writes, except for the AMM ledger
-      // tables, which are declared and deleted with the ledger but filled only once the ingest builds their rows.
+      // The ledgers table, ledger_by_hash and the child tables are exactly the ones LedgerWriter writes.
       const childTables = new Set(CHILD_TABLES.map(([t]) => t));
-      expect(new Set(ALL_TABLES)).toEqual(
-        new Set([
-          Table.Ledgers,
-          Table.LedgerByHash,
-          ...childTables,
-          ...AMM_LEDGER_TABLES.filter((t) => !childTables.has(t)),
-        ]),
-      );
+      expect(new Set(ALL_TABLES)).toEqual(new Set([Table.Ledgers, Table.LedgerByHash, ...childTables]));
+      for (const table of AMM_LEDGER_TABLES) expect(childTables.has(table)).toBe(true);
 
       for (const { table, partitionSize } of LEDGER_KEYED_TABLES) {
         const stored = tables.find((t) => t.name === table)!.partition_key;

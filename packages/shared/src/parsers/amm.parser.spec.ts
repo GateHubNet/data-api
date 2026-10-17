@@ -18,6 +18,17 @@
  * - `one_pool_line`: `swap_iou_iou` without its RLUSD pool line.
  * - `both_reserve_bits`: `swap_payment_xrp_iou` with lsfHighReserve also set on the pool line.
  * - `lines_without_reserve_bit`: `swap_iou_iou` with both pool lines' reserve bits cleared.
+ * - `deposit_mpt_asset`: `deposit_two_asset` whose pool has an MPT as its second asset (`mpt_issuance_id` instead of an
+ *   issuer).
+ * - `swap_iou_iou_pool_high`: `swap_iou_iou` with both pool lines turned around, so that the pool is the HIGH account on
+ *   both (LowLimit and HighLimit exchanged, lsfLowReserve replaced by lsfHighReserve, the balance negated): the same
+ *   swap from the pool's side.
+ * - `swap_iou_iou_same_issuer`: `swap_iou_iou` with the USDC lines issued by the RLUSD issuer, so that both assets of the
+ *   pool have one issuer and only the currency tells them apart, and with the pool's USDC line turned around, so that
+ *   the pool is the low account on the RLUSD line and the high one on the USDC line.
+ * - `bid_exponent_form`, `create_exponent_form`: `bid` and `create` with LPTokenBalance, the auction price and BidMin and
+ *   BidMax written as rippled writes large and small amounts (digits and an exponent, e.g. '294354152174e-9'): the
+ *   same numbers.
  */
 import { BigNumber } from 'bignumber.js';
 import { readFileSync } from 'fs';
@@ -93,7 +104,66 @@ const body = (meta: Json, index: number): Json => {
   return wrapper[Object.keys(wrapper)[0]];
 };
 
+/** The same number as `value`, written as rippled writes large and small amounts: the digits and an exponent. */
+function exponentForm(value: string): string {
+  const [whole, fraction = ''] = value.split('.');
+  return `${BigInt(whole + fraction)}e${-fraction.length}`;
+}
+
+/** `t` with every amount the AMM parser passes on (LPTokenBalance, auction price, BidMin, BidMax) in exponent form. */
+function inExponentForm(t: ParserTx): ParserTx {
+  return variant(t, (tx, meta) => {
+    const rewrite = (amount: Json | undefined) => {
+      if (amount) amount.value = exponentForm(amount.value);
+    };
+    rewrite(tx.BidMin);
+    rewrite(tx.BidMax);
+    for (const wrapper of meta.AffectedNodes as Json[]) {
+      const node = Object.values(wrapper)[0] as Json;
+      if (node.LedgerEntryType !== 'AMM') continue;
+      for (const fields of [node.NewFields, node.FinalFields, node.PreviousFields]) {
+        rewrite(fields?.LPTokenBalance);
+        rewrite(fields?.AuctionSlot?.Price);
+      }
+    }
+  });
+}
+
+/** The body of the (first) AMM node of the metadata. */
+const ammBody = (meta: Json): Json =>
+  meta.AffectedNodes.map((w: Json) => Object.values(w)[0]).find((n: Json) => n.LedgerEntryType === 'AMM');
+
+/** A trust line of the pool as the low account turned around: the pool is the high account, the balance is negated. */
+function poolToHighSide(line: Json): void {
+  for (const fields of [line.FinalFields, line.PreviousFields]) {
+    if (fields.Balance) fields.Balance.value = new BigNumber(fields.Balance.value).negated().toString();
+  }
+  const final = line.FinalFields;
+  [final.LowLimit, final.HighLimit] = [final.HighLimit, final.LowLimit];
+  [final.LowNode, final.HighNode] = [final.HighNode, final.LowNode];
+  final.Flags = LSF_AMM_NODE | LSF_HIGH_RESERVE;
+}
+
 const synthetic: Record<string, (r: (name: string) => Promise<ParserTx>) => Promise<ParserTx>> = {
+  bid_exponent_form: async (r) => inExponentForm(await r('bid')),
+  create_exponent_form: async (r) => inExponentForm(await r('create')),
+  deposit_mpt_asset: async (r) =>
+    variant(await r('deposit_two_asset'), (_tx, meta) => {
+      ammBody(meta).FinalFields.Asset2 = { mpt_issuance_id: '0000012FFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47' };
+    }),
+  swap_iou_iou_pool_high: async (r) =>
+    variant(await r('swap_iou_iou'), (_tx, meta) => {
+      // Nodes 1 and 2 are the pool's lines, with the pool as the low account.
+      for (const index of [1, 2]) poolToHighSide(body(meta, index));
+    }),
+  swap_iou_iou_same_issuer: async (r) =>
+    variant(await r('swap_iou_iou'), (_tx, meta) => {
+      // Nodes 0 (the taker's line) and 1 (the pool's) are the USDC ones: their issuer becomes the RLUSD issuer. The
+      // pool's USDC line is turned around too, so that the pool is the high account on it and the low one on the
+      // RLUSD line: two lines with the same issuer and the pool on different sides.
+      for (const index of [0, 1]) body(meta, index).FinalFields.HighLimit.issuer = RLUSD.issuer;
+      poolToHighSide(body(meta, 1));
+    }),
   deposit_lp_token: async (r) =>
     variant(await r('deposit_two_asset'), (tx) => {
       tx.Flags = 0x00010000;
@@ -331,6 +401,31 @@ describe('AmmParser', () => {
       expect(withRoot.states).toStrictEqual(without.states);
     });
 
+    it('swap_iou_iou with the pool as the HIGH account on both lines: the same swap, the sign flipped back', async () => {
+      const t = await caseTx('swap_iou_iou_pool_high');
+      const lines = (t.meta.AffectedNodes as Json[]).slice(1, 3).map((w) => w.ModifiedNode.FinalFields);
+      for (const line of lines) {
+        expect(line.HighLimit.issuer).toBe(RLUSD_USDC);
+        expect(Number(line.Balance.value)).toBeLessThan(0);
+      }
+      const plain = parser.parse(await recorded('swap_iou_iou'), XRPL);
+      expect(plain.swaps).toHaveLength(1);
+      expect(parser.parse(t, XRPL)).toStrictEqual(plain);
+    });
+
+    it('swap_iou_iou with one issuer for both assets and the pool on different sides: the reserve bit names the pool on both lines', async () => {
+      const t = await caseTx('swap_iou_iou_same_issuer');
+      const [usdc, rlusd] = (t.meta.AffectedNodes as Json[]).slice(1, 3).map((w) => w.ModifiedNode.FinalFields);
+      expect([usdc.HighLimit.issuer, usdc.LowLimit.issuer]).toEqual([RLUSD_USDC, RLUSD.issuer]);
+      expect([rlusd.LowLimit.issuer, rlusd.HighLimit.issuer]).toEqual([RLUSD_USDC, RLUSD.issuer]);
+      const plain = parser.parse(await recorded('swap_iou_iou'), XRPL);
+      const result = parser.parse(t, XRPL);
+      expect(result.unclassified).toBe(0);
+      expect(result.swaps).toStrictEqual([{ ...plain.swaps[0], counter_issuer: RLUSD.issuer }]);
+      expect(result.states).toStrictEqual([{ ...plain.states[0], counter_issuer: RLUSD.issuer }]);
+      expect(result.swaps[0].base_issuer).toBe(result.swaps[0].counter_issuer);
+    });
+
     it('payment_two_pools: one swap per pool, each at its own AccountRoot', async () => {
       const result = parser.parse(await recorded('payment_two_pools'), XRPL);
       const taker = 'rNEpRusKEXTqTpJiGYNi3xrmDBLnT5BUPC';
@@ -473,6 +568,10 @@ describe('AmmParser', () => {
         ...EMPTY,
         unclassified: 2,
       });
+    });
+
+    it('a pool with an MPT asset is unclassified: no rows, counted once', async () => {
+      expect(parser.parse(await caseTx('deposit_mpt_asset'), XRPL)).toStrictEqual({ ...EMPTY, unclassified: 1 });
     });
 
     it('lp_token_transfer: LP-token lines alone touch no pool', async () => {
@@ -790,6 +889,41 @@ describe('AmmParser', () => {
         reserve_counter: '1846230.856091',
         lp_supply: '1791163807.530941',
         trading_fee: 205,
+      });
+    });
+
+    describe("amounts in rippled's mantissa and exponent form are normalised like every other amount", () => {
+      it("an LPTokenBalance of '9993228242855706e-4' is stored as '999322824285.5706'", async () => {
+        const t = variant(await recorded('vote'), (_tx, meta) => {
+          ammBody(meta).FinalFields.LPTokenBalance.value = '9993228242855706e-4';
+        });
+        const [state] = parser.parse(t, XRPL).states;
+        expect(state.lp_supply).toBe('999322824285.5706');
+        expect(ammOracle(t.tx as Json, t.meta as Json, 'XRP').states[0].lp_supply).toBe('999322824285.5706');
+      });
+
+      it('bid: lp_supply, auction_price, bid_min, bid_max and price_paid are the plain bid, to the digit', async () => {
+        const t = await caseTx('bid_exponent_form');
+        // the input really is in exponent form
+        expect(t.tx.BidMin.value).toBe('294354152174e-9');
+        expect(ammBody(t.meta).FinalFields.LPTokenBalance.value).toBe('3340651434735374e-9');
+        const result = parser.parse(t, XRPL);
+        expect(result).toStrictEqual(parser.parse(await recorded('bid'), XRPL));
+        expect(result.states[0]).toMatchObject({ lp_supply: '3340651.434735374', auction_price: '294.354152174' });
+        expect(result.governance[0]).toMatchObject({
+          bid_min: '294.354152174',
+          bid_max: '294.354152174',
+          price_paid: '294.354152174',
+        });
+      });
+
+      it('create: lp_supply and a zero auction price in exponent form are the plain create', async () => {
+        const t = await caseTx('create_exponent_form');
+        expect(ammBody(t.meta).NewFields.LPTokenBalance.value).toBe('2236067977499789e-8');
+        expect(ammBody(t.meta).NewFields.AuctionSlot.Price.value).toBe('0e0');
+        const result = parser.parse(t, XRPL);
+        expect(result).toStrictEqual(parser.parse(await recorded('create'), XRPL));
+        expect(result.states[0]).toMatchObject({ lp_supply: '22360679.77499789', auction_price: '0' });
       });
     });
 

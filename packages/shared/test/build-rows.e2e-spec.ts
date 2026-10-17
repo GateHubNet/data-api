@@ -65,6 +65,8 @@ interface Scenario {
 const SCENARIOS: Scenario[] = [
   { name: 'ripple-mock', database: 'rows_mock', network: 'xrpl', dir: 'xrpl/ripple-mock', ledgers: 54, payments: 182 },
   { name: 'recorded xrpl', database: 'rows_xrpl', network: 'xrpl', dir: 'xrpl/recorded', ledgers: 9 },
+  // Whole ledgers around the recorded AMM cases: swaps, pool states, liquidity events, votes and bids.
+  { name: 'recorded AMM', database: 'rows_amm', network: 'xrpl', dir: 'xrpl/amm', ledgers: 16 },
   { name: 'recorded xahau', database: 'rows_xahau', network: 'xahau', dir: 'xahau/recorded', ledgers: 6 },
   // A flag ledger: 22 UNLReport pseudo-transactions with Account "" (ruling R95).
   { name: 'xahau flag ledger', database: 'rows_xahau_flag', network: 'xahau', dir: 'xahau/flag', ledgers: 1 },

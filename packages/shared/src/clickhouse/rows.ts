@@ -15,8 +15,14 @@
  * and a `DateTime` as a `'YYYY-MM-DD HH:MM:SS'` string. Select `toString(col)` when the exact digits matter.
  */
 
-/** Version of the ledger parsers. Stored on every `ledgers` row so a later parser change can find stale rows. */
-export const PARSER_VERSION = 1;
+/**
+ * Version of the ledger parsers. Stored on every `ledgers` row so a later parser change can find stale rows.
+ *
+ *  - 1: the Ripple v2 data (payments, exchanges, balance changes, accounts created).
+ *  - 2: AMM data (swaps as exchanges, pool states, liquidity, governance). Ledgers from the AMM enablement ledger
+ *       (86795265 on mainnet) written with version 1 lack these rows; `--reprocess` rewrites them.
+ */
+export const PARSER_VERSION = 2;
 
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;
@@ -222,8 +228,9 @@ export interface AccountsCreatedRow {
 // -- AMM ledger tables -------------------------------------------------------------------------------------------
 
 /**
- * The state of a pool after a transaction that touched it: one row per pool and transaction. A value is `null` when the
- * transaction did not change it; a reader carries the last known value forward. The pair is in Ripple's canonical
+ * The state of a pool after a transaction that touched it: one row per pool and transaction. A value is filled whenever
+ * its node is present in the transaction's metadata (the value after the transaction, changed or not) and `null` when
+ * it is not; a reader carries the last known value forward. The pair is in Ripple's canonical
  * (base, counter) order, like `exchanges`.
  */
 export interface AmmPoolStatesRow {

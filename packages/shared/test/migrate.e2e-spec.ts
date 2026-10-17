@@ -553,7 +553,7 @@ describe('migrations (e2e)', () => {
         });
       });
 
-      it('stores NULL for the pool-state values a transaction did not change', async () => {
+      it('stores NULL for the pool-state values whose node the transaction did not carry', async () => {
         const state = SAMPLE_ROWS[Table.AmmPoolStates];
         await svc.insert(Table.AmmPoolStates, [
           {

@@ -97,11 +97,13 @@ const exchange: ExchangesRow = {
   counter_amount_f: 52.5,
   rate: '0.525',
   rate_f: 0.525,
+  // A swap against a pool (the contract of AMM rows): the taker buys from the pool, which is the provider of an offer
+  // that has no sequence.
   buyer: ALICE,
-  seller: BOB,
+  seller: POOL,
   taker: ALICE,
-  provider: BOB,
-  offer_sequence: 77,
+  provider: POOL,
+  offer_sequence: 0,
   amm_account: POOL,
   autobridged_currency: 'EUR',
   autobridged_issuer: ISSUER,
@@ -218,7 +220,7 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     destination_tag: 9,
   },
   [Table.Exchanges]: exchange,
-  [Table.AccountExchanges]: { ...exchange, account: BOB },
+  [Table.AccountExchanges]: { ...exchange, account: POOL },
   [Table.BalanceChanges]: {
     account: ALICE,
     ledger_index: LEDGER,

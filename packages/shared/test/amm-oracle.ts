@@ -217,13 +217,13 @@ export function ammOracle(tx: Json, meta: Json, nativeCurrency: string): OracleR
     if (amm) {
       const f = amm.now!;
       if (deleted) state.lp_supply = '0';
-      else if (f.LPTokenBalance) state.lp_supply = f.LPTokenBalance.value;
+      else if (f.LPTokenBalance) state.lp_supply = new BigNumber(f.LPTokenBalance.value).toString();
       if (f.LPTokenBalance) state.lp_currency = f.LPTokenBalance.currency;
       state.trading_fee = f.TradingFee ?? 0;
       const slot = f.AuctionSlot;
       if (slot) {
         if (slot.Account !== undefined) state.auction_holder = slot.Account;
-        if (slot.Price !== undefined) state.auction_price = slot.Price.value;
+        if (slot.Price !== undefined) state.auction_price = new BigNumber(slot.Price.value).toString();
         state.auction_discounted_fee = slot.DiscountedFee ?? 0;
         if (slot.Expiration !== undefined) state.auction_expiration = slot.Expiration;
       }
@@ -325,8 +325,8 @@ export function ammOracle(tx: Json, meta: Json, nativeCurrency: string): OracleR
         if (tx.TradingFee !== undefined) row.fee_voted = tx.TradingFee;
         row.trading_fee_after = f.TradingFee ?? 0;
       } else {
-        if (tx.BidMin !== undefined) row.bid_min = tx.BidMin.value;
-        if (tx.BidMax !== undefined) row.bid_max = tx.BidMax.value;
+        if (tx.BidMin !== undefined) row.bid_min = new BigNumber(tx.BidMin.value).toString();
+        if (tx.BidMax !== undefined) row.bid_max = new BigNumber(tx.BidMax.value).toString();
         row.price_paid = lpChange().negated().toString();
         const slot = f.AuctionSlot;
         if (slot) {

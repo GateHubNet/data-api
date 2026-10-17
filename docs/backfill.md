@@ -84,6 +84,10 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
 - **Reprocess:** after a parser change (the `parser_version` of `ledgers` records which parser wrote a ledger),
   `--reprocess --from A --to B` fetches and dry-parses first, then deletes and rewrites the committed ledgers of the range.
   It rewrites the whole requested range, not only ledgers of an older parser version.
+  Parser version 2 adds the AMM rows (swaps against pools among the `exchanges`, and `amm_pool_states`, `amm_liquidity`,
+  `account_amm_liquidity` and `amm_governance`): ledgers written by version 1 lack them, so on the XRP Ledger a reprocess from the
+  AMM enablement ledger (86795265) on is needed for complete pool data. Pools or reserve lines the parser could not turn into rows
+  are counted in `syncer_amm_unclassified_total` (and the range-ingest log names the total of its run).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.

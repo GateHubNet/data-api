@@ -2595,8 +2595,11 @@ describe('exchanges API endpoint on the xrpl-recorded ledgers (autobridged excha
     await h?.close();
   });
 
-  it('the recorded ledgers hold 20 exchanges, two of them autobridged', () => {
-    expect(all).toHaveLength(20);
+  it('the recorded ledgers hold 20 order-book exchanges, two of them autobridged, and 34 swaps against AMM pools', () => {
+    // The ledgers are from after the AMM amendment: swaps through pools are exchanges too (amm_account is the pool).
+    expect(all.filter((e) => e.row.amm_account === '')).toHaveLength(20);
+    expect(all.filter((e) => e.row.amm_account !== '')).toHaveLength(34);
+    expect(all).toHaveLength(54);
     expect(autobridged).toHaveLength(2);
     expect(mixed.rows.length).toBeGreaterThan(2);
   });

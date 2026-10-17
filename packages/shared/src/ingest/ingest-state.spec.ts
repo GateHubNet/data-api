@@ -1,5 +1,6 @@
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { Table } from '../clickhouse/tables';
+import { CHILD_TABLES } from './build-rows';
 import { deleteLedgerRange, deleteLedgersAbove, LEDGER_KEYED_TABLES } from './ingest-state';
 
 const P7 = 10_000_000;
@@ -50,7 +51,14 @@ describe('LEDGER_KEYED_TABLES', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(new Set(tables).size).toBe(tables.length);
     expect(tables[0]).toBe(Table.Ledgers);
-    expect(tables).toHaveLength(18);
+  });
+
+  it('is the commit marker, ledger_by_hash and every table the ledger writer fills (CHILD_TABLES), and nothing else', () => {
+    const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
+    expect(new Set(tables)).toEqual(
+      new Set([Table.Ledgers, Table.LedgerByHash, ...CHILD_TABLES.map(([table]) => table)]),
+    );
+    expect(tables).toHaveLength(2 + CHILD_TABLES.length);
   });
 });
 

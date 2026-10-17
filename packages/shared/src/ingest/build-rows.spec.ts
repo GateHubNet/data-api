@@ -5,10 +5,11 @@ import { join } from 'path';
 import { PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
-import { ParseContext, parseContextFor } from '../parsers/parser.interface';
+import { AmmParser } from '../parsers/amm.parser';
+import { ParseContext, parseContextFor, toParserTx } from '../parsers/parser.interface';
 import { PaymentParser } from '../parsers/payment.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
-import { buildLedgerRows, CHILD_TABLES, LedgerParseError, LedgerRows } from './build-rows';
+import { buildLedgerRows, CHILD_TABLES, ChildRowsKey, LedgerParseError, LedgerRows } from './build-rows';
 import { FixtureLedgerSource } from './fixture-ledger-source';
 import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
 
@@ -30,7 +31,7 @@ interface FixtureSet {
   /**
    * Guards for the conservation check (c): at least this many transactions must have had their native total checked
    * and this many trustlines their two sides summed, so that exemptions or a parser regression cannot make it vacuous.
-   * Set below what the fixtures give today (930/542, 1302/192, 193/96) to survive a re-recording.
+   * Set below what the fixtures give today (930/542, 1302/192, 1423/613, 193/96) to survive a re-recording.
    */
   minNativeChecked: number;
   minTrustlinesChecked: number;
@@ -52,6 +53,13 @@ const SETS: FixtureSet[] = [
     minTrustlinesChecked: 150,
   },
   {
+    name: 'recorded AMM cases (xrpl)',
+    ctx: XRPL,
+    dir: join(FIXTURES, 'xrpl', 'amm'),
+    minNativeChecked: 1300,
+    minTrustlinesChecked: 550,
+  },
+  {
     name: 'recorded (xahau)',
     ctx: XAHAU,
     dir: join(FIXTURES, 'xahau', 'recorded'),
@@ -59,6 +67,10 @@ const SETS: FixtureSet[] = [
     minTrustlinesChecked: 50,
   },
 ];
+
+const RIPPLE_MOCK = SETS[0];
+const AMM_SET = SETS[2];
+const XAHAU_SET = SETS[3];
 
 interface Built {
   raw: RawLedger;
@@ -108,7 +120,22 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.AccountExchanges, 'accountExchanges'],
   [Table.BalanceChanges, 'balanceChanges'],
   [Table.AccountsCreated, 'accountsCreated'],
+  [Table.AmmPoolStates, 'ammPoolStates'],
+  [Table.AmmLiquidity, 'ammLiquidity'],
+  [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
+  [Table.AmmGovernance, 'ammGovernance'],
 ];
+
+/** The columns of a table in the order of its CREATE TABLE statement. */
+function ddlColumns(table: Table): string[] {
+  const match = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\n\\(\\n([\\s\\S]*?)\\n\\)\\s*\\nENGINE`).exec(DDL);
+  if (!match) throw new Error(`no CREATE TABLE found for ${table} in 001_baseline.sql`);
+  return match[1]
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('INDEX') && !line.startsWith('--'))
+    .map((line) => line.split(/\s+/)[0]);
+}
 
 function orderByColumns(table: Table): string[] {
   const match = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\n[\\s\\S]*?\\nORDER BY \\(?([^)\\n]+)\\)?`).exec(
@@ -309,7 +336,7 @@ describe('buildLedgerRows snapshots', () => {
   });
 
   it('recorded Xahau ledger 26540188 (GenesisMint, URITokenCreateSellOffer, Payment)', () => {
-    const { rows } = ledgerNamed(SETS[2], 26540188);
+    const { rows } = ledgerNamed(XAHAU_SET, 26540188);
     expect(forSnapshot(rows)).toMatchSnapshot();
   });
 });
@@ -820,8 +847,480 @@ describe('buildLedgerRows mapping', () => {
   });
 });
 
+// -- AMM rows ---------------------------------------------------------------------------------------------------
+
+describe('AMM rows (parser version 2)', () => {
+  const manifest = JSON.parse(readFileSync(join(AMM_SET.dir, 'manifest.json'), 'utf8')) as {
+    cases: Record<string, { ledger: number; hash: string }>;
+  };
+
+  // Pools, assets and accounts of the recorded cases (as in amm.parser.spec.ts).
+  const XRP_RLUSD = 'rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3';
+  const RLUSD_USDC = 'rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb';
+  const XRP_SNK = 'rGLnUKdptCVobJKEkrwxtdyGZ98Evdmqdz';
+  const XRP_VOX = 'rhEypxvxNXMdMTd3GXpb6gTN1jvb4h3nef';
+  const XRP_USD_BITSTAMP = 'rHUpaqUPbwzKZdzQ8ZQCme18FrgW9pB4am';
+  const XRP_DVR = 'rUAEvY1XNvnkurE9RunV7u3yjh3jQsQPsG';
+  const RLUSD = { currency: '524C555344000000000000000000000000000000', issuer: 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De' };
+  const USDC = { currency: '5553444300000000000000000000000000000000', issuer: 'rGm7WCVp9gb4jZHWTEtGUr4dd74z2XuWhE' };
+  const SNK = { currency: 'SNK', issuer: 'rDDYXY17rzuF44gVAAQ9MB6GRQFkvWSccm' };
+  const VOX = { currency: '564F58F09F97BD00000000000000000000000000', issuer: 'rBnJZMDB9HZ6UxUoeQc7eaAQHA3Y1v6Hk3' };
+  const BITSTAMP_USD = { currency: 'USD', issuer: 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B' };
+  const DVR = { currency: 'DVR', issuer: 'rpvRJUcmqQqyCHCmYRPW9FXFAGQEcibVz9' };
+  const XAH_GATEHUB = { currency: 'XAH', issuer: 'rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv' };
+
+  /** A recorded case: the rows of its ledger, and a filter for the rows of the case's own transaction. */
+  function ammCase(name: string) {
+    const c = manifest.cases[name];
+    const { raw, rows } = ledgerNamed(AMM_SET, c.ledger);
+    const tx = rows.transactions.find((r) => r.hash === c.hash);
+    if (!tx) throw new Error(`${name}: ${c.hash} is not in ledger ${c.ledger}`);
+    const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === tx.tx_index);
+    return {
+      raw,
+      rows,
+      mine,
+      tx,
+      client: tx.tx_json.includes('"Memos"') ? undefined : null,
+      at: { ledger_index: c.ledger, tx_index: tx.tx_index, tx_hash: c.hash, close_time: raw.header.close_time },
+    };
+  }
+
+  describe('swaps: exchanges and account_exchanges', () => {
+    it('swap_payment_xrp_iou: one exchange of the pool, the taker and the pool each get a copy', () => {
+      const { rows, mine, at } = ammCase('swap_payment_xrp_iou');
+      const taker = 'rMsrQGK9fZ6B2164QGLnjLMxBYSCY5xJ4W';
+      const rate = new BigNumber('134').dividedBy('179.448166793').toString();
+      const expected = {
+        base_currency: RLUSD.currency,
+        base_issuer: RLUSD.issuer,
+        counter_currency: 'XRP',
+        counter_issuer: '',
+        ledger_index: at.ledger_index,
+        tx_index: at.tx_index,
+        node_index: 1,
+        tx_hash: at.tx_hash,
+        close_time: at.close_time,
+        base_amount: '179.448166793',
+        counter_amount: '134',
+        base_amount_f: 179.448166793,
+        counter_amount_f: 134,
+        rate,
+        rate_f: Number(rate),
+        buyer: taker,
+        seller: XRP_RLUSD,
+        taker,
+        provider: XRP_RLUSD,
+        offer_sequence: 0,
+        amm_account: XRP_RLUSD,
+        autobridged_currency: null,
+        autobridged_issuer: null,
+        tx_type: 'Payment',
+        client: null,
+      };
+      expect(mine(rows.exchanges)).toEqual([expected]);
+      // Like a book row: the buyer first, then the seller, the pool being one of them.
+      expect(mine(rows.accountExchanges)).toEqual([
+        { account: taker, ...expected },
+        { account: XRP_RLUSD, ...expected },
+      ]);
+    });
+
+    it('swap_offercreate_xrp_iou: the pool is the buyer, so it comes first; tx_type is OfferCreate', () => {
+      const { rows, mine } = ammCase('swap_offercreate_xrp_iou');
+      const taker = 'rKYdJJLAgxbJcn9Ria2X5jMMiqP91r4qy';
+      const [exchange] = mine(rows.exchanges);
+      expect(exchange).toMatchObject({ buyer: XRP_RLUSD, seller: taker, taker, tx_type: 'OfferCreate', node_index: 3 });
+      expect(mine(rows.accountExchanges).map((r) => r.account)).toEqual([XRP_RLUSD, taker]);
+    });
+
+    it('swap_iou_iou: the pool is found from its two lsfAMMNode lines alone, with the first as node_index', () => {
+      const { rows, mine } = ammCase('swap_iou_iou');
+      expect(mine(rows.exchanges)).toEqual([
+        expect.objectContaining({
+          base_currency: RLUSD.currency,
+          counter_currency: USDC.currency,
+          counter_issuer: USDC.issuer,
+          base_amount: '22.19651885465',
+          counter_amount: '22.21468168488',
+          node_index: 1,
+          provider: RLUSD_USDC,
+          amm_account: RLUSD_USDC,
+          offer_sequence: 0,
+        }),
+      ]);
+    });
+
+    it('offercreate_autobridged_pool_leg: autobridged currency and issuer are kept, like for a book row', () => {
+      const { rows, mine } = ammCase('offercreate_autobridged_pool_leg');
+      const exchange = mine(rows.exchanges).find((e) => e.amm_account !== '');
+      // The book leg of the same transaction is autobridged to the far side too, through the other asset.
+      expect(mine(rows.exchanges).find((e) => e.amm_account === '')).toMatchObject({
+        autobridged_currency: RLUSD.currency,
+        autobridged_issuer: RLUSD.issuer,
+      });
+      expect(exchange).toMatchObject({
+        amm_account: XRP_RLUSD,
+        autobridged_currency: XAH_GATEHUB.currency,
+        autobridged_issuer: XAH_GATEHUB.issuer,
+      });
+    });
+
+    it('payment_pool_and_book: the book exchange and the pool one side by side, told apart by amm_account and node', () => {
+      const { rows, mine } = ammCase('payment_pool_and_book');
+      const exchanges = mine(rows.exchanges);
+      expect(exchanges.map((e) => e.amm_account)).toEqual(['', XRP_RLUSD]);
+      expect(exchanges.map((e) => e.provider)).toEqual(['rKrVTQChbm1761udZt18u9Aq9onJwEyvZw', XRP_RLUSD]);
+      expect(exchanges.map((e) => e.offer_sequence)).toEqual([107195225, 0]);
+      expect(new Set(exchanges.map((e) => e.node_index)).size).toBe(2);
+      expect(mine(rows.accountExchanges)).toHaveLength(4);
+      // The ledger's exchange count counts swaps like any other exchange.
+      expect(rows.ledger.exchanges_count).toBe(rows.exchanges.length);
+    });
+
+    it('payment_two_pools: one exchange per pool', () => {
+      const { rows, mine } = ammCase('payment_two_pools');
+      expect(mine(rows.exchanges).map((e) => e.amm_account)).toEqual([
+        'rEaErQ5vEbHXThFedUrjz9YFotG5HHcxoW',
+        'rs9ineLqrCzeAGS1bxsrW8x2n3bRJYAh3Q',
+      ]);
+    });
+
+    it('a swap the pool makes with itself is one row for that account, like a self-trade of the order book', () => {
+      const { raw, at } = ammCase('swap_payment_xrp_iou');
+      const changed: RawLedger = {
+        ...raw,
+        transactions: raw.transactions.map((t) =>
+          t.hash === at.tx_hash ? { ...t, tx: { ...t.tx, Account: XRP_RLUSD } } : t,
+        ),
+      };
+      const rows = buildLedgerRows(changed, XRPL);
+      const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === at.tx_index);
+      expect(mine(rows.exchanges)).toEqual([
+        expect.objectContaining({ buyer: XRP_RLUSD, seller: XRP_RLUSD, taker: XRP_RLUSD, amm_account: XRP_RLUSD }),
+      ]);
+      expect(mine(rows.accountExchanges).map((r) => r.account)).toEqual([XRP_RLUSD]);
+    });
+
+    it('failed AMM transactions and ledgers without AMM activity make no AMM swap', () => {
+      for (const { rows } of builtOf(RIPPLE_MOCK)) {
+        for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
+      }
+    });
+  });
+
+  describe('amm_pool_states', () => {
+    it('create: every value is there, with Float64 shadows of the exact strings', () => {
+      const { rows, mine, at } = ammCase('create');
+      expect(mine(rows.ammPoolStates)).toEqual([
+        {
+          amm_account: XRP_DVR,
+          ...pick(at, ['ledger_index', 'tx_index', 'tx_hash', 'close_time']),
+          tx_type: 'AMMCreate',
+          base_currency: DVR.currency,
+          base_issuer: DVR.issuer,
+          counter_currency: 'XRP',
+          counter_issuer: '',
+          reserve_base: '1000000',
+          reserve_counter: '500',
+          lp_supply: '22360679.77499789',
+          lp_currency: '036D9072B9D0C769D60E61FCC2E38D12E1C6BD27',
+          reserve_base_f: 1_000_000,
+          reserve_counter_f: 500,
+          lp_supply_f: 22360679.77499789,
+          trading_fee: 1000,
+          auction_holder: 'rEh4WnsrdmE7V1XeTsWi5dM7FHH8hYuea3',
+          auction_price: '0',
+          auction_price_f: 0,
+          auction_discounted_fee: 100,
+          auction_expiration: 845235400,
+          deleted: 0,
+        },
+      ]);
+    });
+
+    it('a swap: the reserves after it, every AMM node value null (not present in the metadata)', () => {
+      const { rows, mine } = ammCase('swap_payment_xrp_iou');
+      const [state] = mine(rows.ammPoolStates);
+      expect(state).toMatchObject({
+        amm_account: XRP_RLUSD,
+        tx_type: 'Payment',
+        base_currency: RLUSD.currency,
+        counter_currency: 'XRP',
+        reserve_base: '2447341.562339902',
+        reserve_counter: '1823900.107357',
+        reserve_base_f: 2447341.562339902,
+        reserve_counter_f: 1823900.107357,
+        deleted: 0,
+      });
+      for (const column of [
+        'lp_supply',
+        'lp_currency',
+        'lp_supply_f',
+        'trading_fee',
+        'auction_holder',
+        'auction_price',
+        'auction_price_f',
+        'auction_discounted_fee',
+        'auction_expiration',
+      ]) {
+        expect(state).toHaveProperty(column, null);
+      }
+    });
+
+    it('a deposit of one asset: the reserve whose node is absent is null, the AMM node values are there', () => {
+      const { rows, mine } = ammCase('deposit_single_asset');
+      const [state] = mine(rows.ammPoolStates);
+      expect(state.reserve_base).toBeNull();
+      expect(state.reserve_base_f).toBeNull();
+      expect(state).toMatchObject({
+        reserve_counter: '1846230.856091',
+        lp_supply: '1791163807.530941',
+        trading_fee: 205,
+      });
+    });
+
+    it('withdraw_all_deletes_pool: deleted is 1 and the LP supply 0', () => {
+      const { rows, mine } = ammCase('withdraw_all_deletes_pool');
+      expect(mine(rows.ammPoolStates)).toEqual([
+        expect.objectContaining({
+          amm_account: XRP_SNK,
+          tx_type: 'AMMWithdraw',
+          base_currency: SNK.currency,
+          reserve_base: '0',
+          reserve_counter: '0',
+          lp_supply: '0',
+          lp_supply_f: 0,
+          trading_fee: 250,
+          deleted: 1,
+        }),
+      ]);
+    });
+
+    it('vote: the fee and the slot, no reserves', () => {
+      const { rows, mine } = ammCase('vote');
+      expect(mine(rows.ammPoolStates)).toEqual([
+        expect.objectContaining({
+          amm_account: XRP_VOX,
+          tx_type: 'AMMVote',
+          base_currency: VOX.currency,
+          reserve_base: null,
+          reserve_counter: null,
+          reserve_base_f: null,
+          reserve_counter_f: null,
+          lp_supply: '7881180.64345377',
+          trading_fee: 1000,
+          auction_discounted_fee: 100,
+          deleted: 0,
+        }),
+      ]);
+    });
+  });
+
+  describe('amm_liquidity and account_amm_liquidity', () => {
+    it('deposit_two_asset: the signed pool amounts, the LP tokens and the mode, with shadows', () => {
+      const { rows, mine, at } = ammCase('deposit_two_asset');
+      const lp = 'rfzppK1YerX4U8Utr2kVvBuVPLF3m4Yu3z';
+      const expected = {
+        amm_account: XRP_RLUSD,
+        ...pick(at, ['ledger_index', 'tx_index', 'tx_hash', 'close_time']),
+        account: lp,
+        initiator: lp,
+        event: 'deposit',
+        mode: 'two_asset',
+        base_amount: '108.041216585',
+        counter_amount: '82.769304',
+        lp_tokens: '80142.926261',
+        base_amount_f: 108.041216585,
+        counter_amount_f: 82.769304,
+        lp_tokens_f: 80142.926261,
+      };
+      expect(mine(rows.ammLiquidity)).toEqual([expected]);
+      expect(mine(rows.accountAmmLiquidity)).toEqual([expected]);
+    });
+
+    it('withdraw_two_asset: negative amounts and LP tokens, out of the pool', () => {
+      const { rows, mine } = ammCase('withdraw_two_asset');
+      expect(mine(rows.ammLiquidity)).toEqual([
+        expect.objectContaining({
+          amm_account: RLUSD_USDC,
+          event: 'withdraw',
+          mode: 'two_asset',
+          base_amount: '-4.18049701822',
+          counter_amount: '-4.17981839135',
+          lp_tokens: '-4.16712896228',
+          base_amount_f: -4.18049701822,
+          lp_tokens_f: -4.16712896228,
+        }),
+      ]);
+    });
+
+    it('create: an empty mode is the empty string', () => {
+      const { rows, mine } = ammCase('create');
+      const [row] = mine(rows.ammLiquidity);
+      expect(row).toMatchObject({ event: 'create', mode: '', base_amount: '1000000', counter_amount: '500' });
+      expect(mine(rows.accountAmmLiquidity)).toEqual([row]);
+    });
+
+    it('account_amm_liquidity is a copy of amm_liquidity row for row, sharing no object with it', () => {
+      for (const { rows } of builtOf(AMM_SET)) {
+        expect(rows.accountAmmLiquidity).toEqual(rows.ammLiquidity);
+        rows.ammLiquidity.forEach((row, i) => expect(rows.accountAmmLiquidity[i]).not.toBe(row));
+      }
+    });
+
+    it('a swap or a vote makes no liquidity row', () => {
+      for (const name of ['swap_payment_xrp_iou', 'swap_iou_iou', 'vote', 'bid', 'lp_token_transfer']) {
+        const { rows, mine } = ammCase(name);
+        expect(mine(rows.ammLiquidity)).toEqual([]);
+        expect(mine(rows.accountAmmLiquidity)).toEqual([]);
+      }
+    });
+  });
+
+  describe('amm_governance', () => {
+    it('vote: the fee voted and the fee after, nothing else, no auth accounts', () => {
+      const { rows, mine, at } = ammCase('vote');
+      expect(mine(rows.ammGovernance)).toEqual([
+        {
+          amm_account: XRP_VOX,
+          ...pick(at, ['ledger_index', 'tx_index', 'tx_hash', 'close_time']),
+          kind: 'vote',
+          account: 'rthwVkuErKQtat6Sn6X2vAeveCEWfFBnt',
+          fee_voted: 1000,
+          trading_fee_after: 1000,
+          bid_min: null,
+          bid_max: null,
+          price_paid: null,
+          slot_holder: null,
+          slot_discounted_fee: null,
+          slot_expiration: null,
+          auth_accounts: [],
+        },
+      ]);
+    });
+
+    it('bid: the bid range, the price paid and the new slot', () => {
+      const { rows, mine, at } = ammCase('bid');
+      const bidder = 'r4S6hRiKREKkmMeqs8dpgyYAotGyck9g3h';
+      expect(mine(rows.ammGovernance)).toEqual([
+        {
+          amm_account: XRP_USD_BITSTAMP,
+          ...pick(at, ['ledger_index', 'tx_index', 'tx_hash', 'close_time']),
+          kind: 'bid',
+          account: bidder,
+          fee_voted: null,
+          trading_fee_after: null,
+          bid_min: '294.354152174',
+          bid_max: '294.354152174',
+          price_paid: '294.354152174',
+          slot_holder: bidder,
+          slot_discounted_fee: 22,
+          slot_expiration: 839322900,
+          auth_accounts: [],
+        },
+      ]);
+      expect(mine(rows.ammPoolStates)[0]).toMatchObject({
+        base_currency: BITSTAMP_USD.currency,
+        base_issuer: BITSTAMP_USD.issuer,
+      });
+    });
+  });
+
+  describe('every row has the columns of its table, in the order of the DDL', () => {
+    const tables: Array<[Table, keyof LedgerRows]> = [
+      [Table.Exchanges, 'exchanges'],
+      [Table.AccountExchanges, 'accountExchanges'],
+      [Table.AmmPoolStates, 'ammPoolStates'],
+      [Table.AmmLiquidity, 'ammLiquidity'],
+      [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
+      [Table.AmmGovernance, 'ammGovernance'],
+    ];
+
+    it.each(tables)('%s', (table, key) => {
+      const columns = ddlColumns(table);
+      const rows = collect(builtOf(AMM_SET), key);
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) expect(Object.keys(row)).toEqual(columns);
+    });
+
+    it('over the recorded cases every AMM table gets rows', () => {
+      for (const [, key] of CHILD_TABLES.filter(([table]) => table.includes('amm'))) {
+        expect(collect(builtOf(AMM_SET), key).length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  describe('a ledger without AMM activity', () => {
+    it('has empty AMM arrays, no unclassified pool and amm_account empty on every exchange row', () => {
+      for (const { rows } of builtOf(RIPPLE_MOCK)) {
+        expect(rows.ammPoolStates).toEqual([]);
+        expect(rows.ammLiquidity).toEqual([]);
+        expect(rows.accountAmmLiquidity).toEqual([]);
+        expect(rows.ammGovernance).toEqual([]);
+        expect(rows.diagnostics).toEqual({ ammUnclassified: 0 });
+        for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
+      }
+    });
+
+    it('stores parser_version 2', () => {
+      expect(PARSER_VERSION).toBe(2);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(2);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(2);
+    });
+  });
+
+  describe('diagnostics', () => {
+    const ammParser = new AmmParser();
+
+    it('ammUnclassified is the sum of what the parser could not classify, over the transactions of the ledger', () => {
+      let total = 0;
+      for (const { raw, rows } of builtOf(AMM_SET)) {
+        const expected = raw.transactions.reduce(
+          (sum, t) => sum + ammParser.parse(toParserTx(t, raw.header, null), XRPL).unclassified,
+          0,
+        );
+        expect(rows.diagnostics).toEqual({ ammUnclassified: expected });
+        total += expected;
+      }
+      expect(total).toBeGreaterThanOrEqual(0);
+    });
+
+    it('counts the pools of a ledger that give no row, per transaction', () => {
+      // A successful OfferCreate whose only node is an lsfAMMNode line of a pool whose pair no node tells: no rows.
+      const poolLine = (sequence: number): Json => ({
+        ModifiedNode: {
+          LedgerEntryType: 'RippleState',
+          FinalFields: {
+            Balance: { currency: 'USD', issuer: 'rrrrrrrrrrrrrrrrrrrrBZbvji', value: String(sequence + 1) },
+            Flags: 0x01000000 | 0x00010000,
+            HighLimit: { currency: 'USD', issuer: ISSUER, value: '0' },
+            LowLimit: { currency: 'USD', issuer: PROVIDER, value: '0' },
+          },
+          PreviousFields: {
+            Balance: { currency: 'USD', issuer: 'rrrrrrrrrrrrrrrrrrrrBZbvji', value: String(sequence) },
+          },
+        },
+      });
+      const offer = (index: number, hash: string) =>
+        rawTx({ TransactionType: 'OfferCreate', Account: TAKER, TakerPays: usd('1'), TakerGets: '1' }, index, hash, [
+          poolLine(index),
+        ]);
+      const rows = buildLedgerRows(ledgerOf([offer(0, 'A'.repeat(64)), offer(1, 'B'.repeat(64))]), XRPL);
+      expect(rows.diagnostics).toEqual({ ammUnclassified: 2 });
+      expect(rows.ammPoolStates).toEqual([]);
+      expect(rows.exchanges).toEqual([]);
+    });
+  });
+});
+
+/** The listed properties of `object`, in that order. */
+function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]): Pick<T, K> {
+  return Object.fromEntries(keys.map((key) => [key, object[key]])) as Pick<T, K>;
+}
+
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data and the 4 AMM ones', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -838,6 +1337,10 @@ describe('CHILD_TABLES', () => {
         Table.AccountExchanges,
         Table.BalanceChanges,
         Table.AccountsCreated,
+        Table.AmmPoolStates,
+        Table.AmmLiquidity,
+        Table.AccountAmmLiquidity,
+        Table.AmmGovernance,
       ].sort(),
     );
   });
@@ -846,14 +1349,22 @@ describe('CHILD_TABLES', () => {
     const expected = new Map(ROW_KEY);
     for (const [table, key] of CHILD_TABLES) expect(expected.get(table)).toBe(key);
     const covered = new Set(CHILD_TABLES.map(([, key]) => key as string));
+    // `diagnostics` is not rows: it is no child table and never inserted.
     expect(Object.keys(buildLedgerRows(sampleLedger(), XRPL)).sort()).toEqual(
-      [...covered, 'ledger', 'ledgerByHash'].sort(),
+      [...covered, 'ledger', 'ledgerByHash', 'diagnostics'].sort(),
     );
   });
 
   it('holds arrays of rows for every child property', () => {
     const built = buildLedgerRows(sampleLedger(), XRPL);
     for (const [, key] of CHILD_TABLES) expect(Array.isArray(built[key])).toBe(true);
+  });
+
+  it('does not take the diagnostics for a child property', () => {
+    // Compile time: ChildRowsKey leaves out `diagnostics`, as it leaves out `ledger` and `ledgerByHash`.
+    // @ts-expect-error 'diagnostics' is not a ChildRowsKey
+    const key: ChildRowsKey = 'diagnostics';
+    expect(CHILD_TABLES.map(([, k]) => k as string)).not.toContain(key);
   });
 });
 
@@ -876,6 +1387,14 @@ const AMOUNT_FIELDS = new Set([
   'paychannel_fund_final_balance',
   'paychannel_final_balance',
   'paychannel_balance_change',
+  'reserve_base',
+  'reserve_counter',
+  'lp_supply',
+  'auction_price',
+  'lp_tokens',
+  'bid_min',
+  'bid_max',
+  'price_paid',
 ]);
 
 /** Row fields that hold drops as an unsigned integer string. */
