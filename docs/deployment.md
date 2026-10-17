@@ -83,13 +83,14 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
 
 All configuration is environment variables ([configuration](configuration.md)). In production inject them from a secrets manager;
 never commit them. `.env*` files are git-ignored (only `.env.example` files are committed) and excluded from the Docker build
-context. Secrets: `GH_API_KEYS`, `GH_CLICKHOUSE_PASSWORD`, node URLs that carry credentials, and the build-time `NPM_TOKEN`.
+context. Secrets: `GH_API_KEYS`, `GH_RATE_LIMIT_KEYS` (it holds API keys), `GH_CLICKHOUSE_PASSWORD`, node URLs that carry credentials, and the
+build-time `NPM_TOKEN`.
 
 ### `deploy/.env.prod`
 
 `deploy/.env.prod` is only the `--env-file` of `docker compose` (interpolation): **no container gets it as a whole**. Each service
 in `docker-compose.prod.yaml` lists the variables it needs ([which service gets what](configuration.md#which-service-gets-which-variables-production-compose)),
-so `GH_API_KEYS` reaches only the apis. Start from the template:
+so `GH_API_KEYS` and `GH_RATE_LIMIT_KEYS` reach only the apis. Start from the template:
 
 ```bash
 cp deploy/.env.prod.example deploy/.env.prod       # then fill in the secrets; the file is git-ignored
@@ -208,8 +209,8 @@ Manifests are not shipped; the shape is:
 - **migrate** per network: a `Job` (or a Helm pre-install/pre-upgrade hook) run once per release before the apps roll.
 - **ClickHouse**: a managed service or the Altinity operator with `Replicated*MergeTree` engines + Keeper
   ([clickhouse](clickhouse.md#high-availability-and-replication)); the shipped schema uses plain `ReplacingMergeTree`.
-- **Config/secrets:** `ConfigMap` for non-secret env, `Secret` for `GH_API_KEYS` / `GH_CLICKHOUSE_PASSWORD`; do not give the syncer
-  the api keys.
+- **Config/secrets:** `ConfigMap` for non-secret env, `Secret` for `GH_API_KEYS` / `GH_RATE_LIMIT_KEYS` / `GH_CLICKHOUSE_PASSWORD`; do not give the
+  syncer the api keys.
 - **Metrics:** scrape `/metricz` (port 3000) of every pod ([observability](observability.md)).
 
 ## Scaling guidance

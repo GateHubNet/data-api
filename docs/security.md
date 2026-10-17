@@ -56,7 +56,8 @@ rate limit so a request with a bad key spends nobody's budget.
   (the message never echoes the keys). The dev compose runs its API with `NODE_ENV=development` for that reason.
 - **Provisioning and rotation:** `GH_API_KEYS` is a comma separated list; several keys are accepted at once, so rotation needs no client flag day (add the new
   key, roll the clients, remove the old one, [operations](operations.md#rotate-an-api-key)); restarting the apis for each step is still a brief outage per
-  service. Keys come from a secrets manager, never from git.
+  service. A key that has an entry in `GH_RATE_LIMIT_KEYS` is changed there in the same step: an entry for a key that is not in
+  `GH_API_KEYS` fails the boot of every api. Keys come from a secrets manager, never from git.
 
 Caveats: keys are compared by digest in memory but live in the environment as plaintext; validation is per replica, so revoking a key
 needs a roll-out of every replica.
@@ -139,7 +140,8 @@ render another shape).
 
 ## 8. Secrets management
 
-Secrets: `GH_API_KEYS`, `GH_CLICKHOUSE_PASSWORD`, node URLs with credentials, and the build-time `NPM_TOKEN`.
+Secrets: `GH_API_KEYS`, `GH_RATE_LIMIT_KEYS` (it holds API keys), `GH_CLICKHOUSE_PASSWORD`, node URLs with credentials, and the build-time
+`NPM_TOKEN`.
 
 - All runtime secrets are environment variables. `.env` and `.env.*` are git-ignored (only `*.env.example` and `deploy/.env.prod.example`
   are committed) and excluded from the Docker build context (`.dockerignore` excludes all `**/.env*`). In production inject them from a

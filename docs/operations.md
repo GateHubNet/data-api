@@ -64,6 +64,9 @@ failed halfway can simply be run again. Run migrations as a one-shot step, not f
 same instant: add the new key beside the old one in `deploy/.env.prod` (`old,new`) and `dc up -d` (repeat your `--scale` flags), move the clients,
 then remove the old key and `dc up -d` again (with the same `--scale` flags). Each `up` recreates the apis of both networks together, i.e. a brief 502 from nginx (see
 [Deploy a new version](#deploy-a-new-version)). The API refuses to start with an empty list, or a key that is `dev-api-key` or starts with `change-me`.
+A key that has an entry in `GH_RATE_LIMIT_KEYS` is rotated there in the same edit: add `new=limit` beside `old=limit` with the first step and remove
+`old=limit` with the second, or the new key is limited per client address. An entry whose key is not in `GH_API_KEYS` fails the boot of every api, so
+removing the old key from `GH_API_KEYS` alone is an outage (the message names the entry by position, never the key).
 
 ### Rotate the ClickHouse password
 
