@@ -1,4 +1,5 @@
 import {
+  AmmPoolsRecomputeAborted,
   ClickHouseService,
   MarketsConfig,
   RatesService,
@@ -8,6 +9,7 @@ import {
   VolumeRecomputeAborted,
 } from '@gatehub/data-api-shared';
 import {
+  AGGREGATOR_AMM_POOLS_BUDGET_MS,
   AGGREGATOR_DIRTY_BUDGET_MS,
   AGGREGATOR_INTERVAL_MS,
   AGGREGATOR_LIVE_BUDGET_MS,
@@ -19,6 +21,7 @@ import {
   AggregatorJob,
   AggregatorOptions,
   AggregatorService,
+  AMM_POOLS_BATCH,
   MAX_SLICE_SECONDS,
   sliceRange,
   VOLUME_BACKFILL_MAX_RETRY_MS,
@@ -2240,6 +2243,446 @@ describe('AggregatorService volume jobs', () => {
       jest.setSystemTime(NOW);
       await service({ liveBudgetMs: 1, budgetsMs: { volume_live: 100_000 } }).tick();
       expect(liveCalls).toHaveLength(7);
+    });
+  });
+});
+
+describe('AggregatorService amm_pools job', () => {
+  const RATES = { nativeCurrency: 'XRP' } as RatesService;
+  const MARKETS: MarketsConfig = { version: 4, tradeMarkets: [], paymentCurrencies: [] };
+  /** The ledger the persistent watermark of the job is at when the process starts. */
+  const START_LEDGER = 500;
+
+  let ch: FakeClickHouse;
+  let logger: ReturnType<typeof QUIET>;
+  let metrics: {
+    aggregatorRunsTotal: { inc: jest.Mock };
+    aggregatorErrorsTotal: { inc: jest.Mock };
+    aggregatorStatsLagSeconds: { set: jest.Mock };
+  };
+  const created: AggregatorService[] = [];
+  /** What happened, in order. */
+  let events: string[];
+  let statsRecompute: jest.Mock;
+  let watermark: jest.Mock;
+  let changedSince: jest.Mock;
+  let closedIn: jest.Mock;
+  let recomputePools: jest.Mock;
+  /** What `poolsChangedSince` answers for the ledger it is asked from (nothing, and the same ledger, for any other). */
+  let pages: Map<number, { accounts: string[]; upTo: number }>;
+  /** The pools of the slice that starts at an instant (ISO), for the agg_dirty hook. */
+  let slicePools: Map<string, string[]>;
+  /** How long (fake milliseconds) the recompute of a batch of pools takes. */
+  let poolMs: number;
+
+  const mark = (from: string, to: string, createdMs = 1000) => ({ from: unix(from), to: unix(to), created: createdMs });
+  const jobsRun = (): string[] => metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job);
+  const batches = (): string[][] => recomputePools.mock.calls.map(([, , accounts]) => accounts);
+
+  beforeEach(() => {
+    jest.useFakeTimers({ now: NOW });
+    ch = new FakeClickHouse();
+    logger = QUIET();
+    metrics = {
+      aggregatorRunsTotal: { inc: jest.fn() },
+      aggregatorErrorsTotal: { inc: jest.fn() },
+      aggregatorStatsLagSeconds: { set: jest.fn() },
+    };
+    events = [];
+    pages = new Map();
+    slicePools = new Map();
+    poolMs = 0;
+    statsRecompute = jest.fn(async (_ch: unknown, from: Date) => {
+      events.push(`stats ${iso(from.getTime() / 1000)}`);
+      return 1;
+    });
+    watermark = jest.fn(async () => START_LEDGER);
+    changedSince = jest.fn(async (_ch: unknown, ledger: number) => {
+      events.push(`changed ${ledger}`);
+      return pages.get(ledger) ?? { accounts: [], upTo: ledger };
+    });
+    closedIn = jest.fn(
+      async (_ch: unknown, _rates: unknown, from: Date) => slicePools.get(iso(from.getTime() / 1000)) ?? [],
+    );
+    recomputePools = jest.fn(async (_ch: unknown, _rates: unknown, accounts: string[]) => {
+      events.push(`pools ${accounts.join(',')}`);
+      if (poolMs > 0) jest.setSystemTime(Date.now() + poolMs);
+      return accounts.length;
+    });
+    // the stats are up to date: the live window is the last slice only
+    ch.watermark = unix('2026-10-16T12:00:00Z');
+    ch.closes = [unix('2026-10-10T08:00:00Z'), NOW_SECONDS - 3];
+  });
+
+  afterEach(async () => {
+    const stops = created.splice(0).map((svc) => svc.stop());
+    await jest.advanceTimersByTimeAsync(AGGREGATOR_SHUTDOWN_WAIT_MS);
+    await Promise.all(stops);
+    jest.useRealTimers();
+  });
+
+  function service(options: AggregatorOptions = {}): AggregatorService {
+    const svc = new AggregatorService(ch.asService(), metrics as never, { register: jest.fn() } as never, {
+      logger,
+      recompute: statsRecompute,
+      ammPools: { rates: RATES },
+      ammPoolsFunctions: { watermark, changedSince, poolsClosedIn: closedIn, recompute: recomputePools },
+      ...options,
+    });
+    created.push(svc);
+    return svc;
+  }
+
+  describe('the job in the tick', () => {
+    it('comes after volume_daily and before stats_live, with the volume jobs and without them', async () => {
+      const volumeFunctions = {
+        computeLiveSet: jest.fn(async () => 0),
+        computeDailySet: jest.fn(async () => 0),
+        daysDone: jest.fn(async () => new Set<string>()),
+        liveVersions: jest.fn(async () => new Map<string, number>()),
+        dailyVersions: jest.fn(async () => new Map<string, number>()),
+      };
+      await service({ volumes: { rates: RATES, markets: MARKETS }, volumeFunctions }).tick();
+      expect(jobsRun()).toEqual([
+        'volume_live',
+        'volume_daily',
+        'amm_pools',
+        'stats_live',
+        'stats_dirty',
+        'volume_backfill',
+      ]);
+
+      metrics.aggregatorRunsTotal.inc.mockClear();
+      await service().tick();
+      expect(jobsRun()).toEqual(['amm_pools', 'stats_live', 'stats_dirty']);
+    });
+
+    it('is off without the option: nothing is asked of the AMM functions, and a dirty range is only the stats', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      slicePools.set('2026-05-01T00:00:00Z', ['rA']);
+      await service({ ammPools: undefined }).tick();
+      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
+      for (const fn of [watermark, changedSince, closedIn, recomputePools]) expect(fn).not.toHaveBeenCalled();
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('has a budget of 3 s, which is not the live or the dirty one', () => {
+      expect(AGGREGATOR_AMM_POOLS_BUDGET_MS).toBe(3000);
+      expect(AMM_POOLS_BATCH).toBeGreaterThan(0);
+    });
+  });
+
+  describe('the watermark', () => {
+    it('is read once, when the first tick starts, and the job goes on from it', async () => {
+      pages.set(500, { accounts: ['rA', 'rB'], upTo: 700 });
+      pages.set(700, { accounts: ['rC'], upTo: 900 });
+      const svc = service();
+      await svc.tick();
+      expect(watermark).toHaveBeenCalledTimes(1);
+      expect(watermark).toHaveBeenCalledWith(ch);
+      expect(changedSince.mock.calls.map(([, ledger, limit]) => [ledger, limit])).toEqual([
+        [500, AMM_POOLS_BATCH],
+        [700, AMM_POOLS_BATCH],
+        [900, AMM_POOLS_BATCH],
+      ]);
+      expect(batches()).toEqual([['rA', 'rB'], ['rC']]);
+      // every recompute gets the database, the rates of the network and the shutdown signal
+      expect(recomputePools.mock.calls[0][0]).toBe(ch);
+      expect(recomputePools.mock.calls[0][1]).toBe(RATES);
+      expect(recomputePools.mock.calls[0][3]).toEqual({ signal: expect.any(AbortSignal) });
+
+      // the next tick starts where this one ended, without reading the watermark again
+      pages.set(900, { accounts: ['rD'], upTo: 1000 });
+      jest.setSystemTime(NOW_SECONDS * 1000 + 60_000);
+      await svc.tick();
+      expect(watermark).toHaveBeenCalledTimes(1);
+      expect(changedSince.mock.calls.slice(3).map(([, ledger]) => ledger)).toEqual([900, 1000]);
+      expect(batches()).toEqual([['rA', 'rB'], ['rC'], ['rD']]);
+    });
+
+    it('advances after each batch is written, never before: a batch is recomputed, then the cursor moves', async () => {
+      pages.set(500, { accounts: ['rA'], upTo: 700 });
+      pages.set(700, { accounts: ['rB'], upTo: 900 });
+      await service().tick();
+      expect(events.filter((e) => !e.startsWith('stats'))).toEqual([
+        'changed 500',
+        'pools rA',
+        'changed 700',
+        'pools rB',
+        'changed 900',
+      ]);
+    });
+
+    it('does not move when nothing changed, and does not recompute anything', async () => {
+      await service().tick();
+      expect(changedSince).toHaveBeenCalledTimes(1);
+      expect(recomputePools).not.toHaveBeenCalled();
+      expect(jobsRun()).toContain('amm_pools');
+    });
+
+    it('does not ask for the same pools for ever when an answer does not move the cursor', async () => {
+      pages.set(500, { accounts: ['rA'], upTo: 500 });
+      await service().tick();
+      expect(batches()).toEqual([['rA']]);
+      expect(changedSince).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failing read of the watermark is a failed job, the stats still run, and the next tick reads it again', async () => {
+      watermark.mockRejectedValueOnce(new Error('DB::Exception: timeout'));
+      pages.set(500, { accounts: ['rA'], upTo: 700 });
+      const svc = service();
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
+      expect(recomputePools).not.toHaveBeenCalled();
+
+      await svc.tick();
+      expect(watermark).toHaveBeenCalledTimes(2);
+      expect(batches()).toEqual([['rA']]);
+    });
+  });
+
+  describe('failures', () => {
+    it('are logged and counted, the cursor stays behind the batch that failed, and the next tick does it again', async () => {
+      pages.set(500, { accounts: ['rA', 'rB'], upTo: 700 });
+      pages.set(700, { accounts: ['rC'], upTo: 900 });
+      recomputePools
+        .mockImplementationOnce(async () => 2)
+        .mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      const svc = service();
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('amm_pools'));
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('memory limit'));
+      // the jobs after it still ran
+      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
+      expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 700]);
+
+      jest.setSystemTime(NOW_SECONDS * 1000 + 60_000);
+      await svc.tick();
+      // the batch of 700 is the one retried: the cursor was at 700, not at 900
+      expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 700, 700, 900]);
+      expect(batches()).toEqual([['rA', 'rB'], ['rC'], ['rC']]);
+      expect(jobsRun()).toContain('amm_pools');
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failing read of what changed is a failure of the job as well', async () => {
+      changedSince.mockRejectedValueOnce(new Error('DB::Exception: no such table'));
+      await service().tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('no such table'));
+    });
+  });
+
+  describe('the budget', () => {
+    it('stops starting batches when the budget of the job is spent, says so, and goes on from the cursor next tick', async () => {
+      poolMs = 400;
+      for (let i = 0; i < 10; i++) pages.set(500 + i * 10, { accounts: [`r${i}`], upTo: 510 + i * 10 });
+      const svc = service({ budgetsMs: { amm_pools: 1000 } });
+      await svc.tick();
+      // batches start at 0, 400 and 800 ms (inside the 1000 ms) and not at 1200
+      expect(batches()).toEqual([['r0'], ['r1'], ['r2']]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('amm_pools reached its budget'));
+      // the other jobs of the tick were not held up
+      expect(jobsRun()).toEqual(['amm_pools', 'stats_live', 'stats_dirty']);
+
+      jest.setSystemTime(NOW_SECONDS * 1000 + 60_000);
+      await svc.tick();
+      expect(batches().slice(3)).toEqual([['r3'], ['r4'], ['r5']]);
+    });
+
+    it('is 3 s by default: a slow batch uses it up, and the stats still get the rest of the tick', async () => {
+      poolMs = 10_000;
+      for (let i = 0; i < 10; i++) pages.set(500 + i * 10, { accounts: [`r${i}`], upTo: 510 + i * 10 });
+      await service().tick();
+      expect(batches()).toEqual([['r0']]);
+      expect(events.some((e) => e.startsWith('stats'))).toBe(true);
+    });
+
+    it('does not take more than the tick has left either', async () => {
+      poolMs = 5000;
+      for (let i = 0; i < 10; i++) pages.set(500 + i * 10, { accounts: [`r${i}`], upTo: 510 + i * 10 });
+      await service({ tickBudgetMs: 4000, budgetsMs: { amm_pools: 100_000 } }).tick();
+      expect(batches()).toEqual([['r0']]);
+    });
+  });
+
+  describe('the pools of agg_dirty slices (the hook of stats_dirty)', () => {
+    it('recomputes the pools with state rows in the slice, after its stats, and removes the range', async () => {
+      ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
+      slicePools.set('2026-05-01T22:00:00Z', ['rA', 'rB']);
+      await service().tick();
+      expect(closedIn).toHaveBeenCalledTimes(1);
+      const [chArg, ratesArg, from, to] = closedIn.mock.calls[0];
+      expect([chArg, ratesArg]).toEqual([ch, RATES]);
+      expect([iso(from.getTime() / 1000), iso(to.getTime() / 1000)]).toEqual([
+        '2026-05-01T22:00:00Z',
+        '2026-05-02T03:00:00Z',
+      ]);
+      const at = events.indexOf('stats 2026-05-01T22:00:00Z');
+      expect(events.slice(at, at + 2)).toEqual(['stats 2026-05-01T22:00:00Z', 'pools rA,rB']);
+      expect(recomputePools.mock.calls.at(-1)?.[3]).toEqual({ signal: expect.any(AbortSignal) });
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('a range of several days: each slice has its own pools', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-02T12:00:00Z')];
+      slicePools.set('2026-05-01T00:00:00Z', ['rA']);
+      slicePools.set('2026-05-02T00:00:00Z', ['rB']);
+      await service().tick();
+      expect(
+        closedIn.mock.calls.map(([, , from, to]) => [iso(from.getTime() / 1000), iso(to.getTime() / 1000)]),
+      ).toEqual([
+        ['2026-05-01T00:00:00Z', '2026-05-02T00:00:00Z'],
+        ['2026-05-02T00:00:00Z', '2026-05-02T12:00:00Z'],
+      ]);
+      expect(batches()).toEqual([['rA'], ['rB']]);
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('a slice with many pools is recomputed in batches', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      const many = Array.from({ length: AMM_POOLS_BATCH * 2 + 50 }, (_, i) => `r${String(i).padStart(4, '0')}`);
+      slicePools.set('2026-05-01T00:00:00Z', many);
+      await service().tick();
+      expect(batches().map((b) => b.length)).toEqual([AMM_POOLS_BATCH, AMM_POOLS_BATCH, 50]);
+      expect(batches().flat()).toEqual(many);
+    });
+
+    it('a slice without pools recomputes nothing, and the range is removed', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      await service().tick();
+      expect(closedIn).toHaveBeenCalledTimes(1);
+      expect(recomputePools).not.toHaveBeenCalled();
+      expect(ch.dirty).toEqual([]);
+    });
+
+    it('a failure keeps the range, is counted as amm_pools_dirty, and the next tick does the slice again', async () => {
+      ch.dirty = [mark('2026-05-01T22:00:00Z', '2026-05-02T03:00:00Z')];
+      slicePools.set('2026-05-01T22:00:00Z', ['rA']);
+      recomputePools.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      const svc = service();
+      await svc.tick();
+      expect(ch.dirty).toHaveLength(1);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools_dirty' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('amm_pools_dirty'));
+
+      await svc.tick();
+      expect(ch.dirty).toEqual([]);
+      expect(batches().at(-1)).toEqual(['rA']);
+    });
+
+    it('a failure in the middle of a range keeps the progress: the range is narrowed to the slice that failed', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-03T00:00:00Z')];
+      slicePools.set('2026-05-01T00:00:00Z', ['rA']);
+      slicePools.set('2026-05-02T00:00:00Z', ['rB']);
+      recomputePools.mockImplementation(async (_c: unknown, _r: unknown, accounts: string[]) => {
+        if (accounts[0] === 'rB') throw new Error('DB::Exception: boom');
+        return 1;
+      });
+      await service().tick();
+      expect(ch.dirty).toEqual([mark('2026-05-02T00:00:00Z', '2026-05-03T00:00:00Z')]);
+    });
+
+    it('a lookup of the pools of a slice that fails fails the slice the same way', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      closedIn.mockRejectedValueOnce(new Error('DB::Exception: timeout'));
+      await service().tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools_dirty' });
+      expect(ch.dirty).toHaveLength(1);
+    });
+
+    it('does not start a batch after the shutdown began, and the range stays', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      slicePools.set(
+        '2026-05-01T00:00:00Z',
+        Array.from({ length: AMM_POOLS_BATCH * 2 }, (_, i) => `r${String(i).padStart(4, '0')}`),
+      );
+      const svc = service();
+      recomputePools.mockImplementationOnce(async (_c: unknown, _r: unknown, accounts: string[]) => {
+        void svc.stop(); // the shutdown begins during the first batch ...
+        return accounts.length;
+      });
+      await svc.tick();
+      expect(recomputePools).toHaveBeenCalledTimes(1); // ... and the second is not started
+      expect(ch.dirty).toHaveLength(1);
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+    });
+
+    it('a batch cut short by the shutdown is neither an error nor counted, and the range stays', async () => {
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      slicePools.set('2026-05-01T00:00:00Z', ['rA']);
+      const svc = service();
+      recomputePools.mockImplementation(async () => {
+        void svc.stop();
+        throw new AmmPoolsRecomputeAborted();
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(ch.dirty).toHaveLength(1);
+    });
+  });
+
+  describe('shutdown', () => {
+    it('starts nothing once it has begun: no watermark, no read, no recompute', async () => {
+      pages.set(500, { accounts: ['rA'], upTo: 700 });
+      const svc = service();
+      await svc.stop();
+      await svc.tick();
+      for (const fn of [watermark, changedSince, closedIn, recomputePools]) expect(fn).not.toHaveBeenCalled();
+    });
+
+    it('hands the signal of the shutdown to the batch in flight and starts no batch after it', async () => {
+      pages.set(500, { accounts: ['rA'], upTo: 700 });
+      pages.set(700, { accounts: ['rB'], upTo: 900 });
+      let signalOfBatch: AbortSignal | undefined;
+      let release!: () => void;
+      recomputePools.mockImplementationOnce(
+        (_c: unknown, _r: unknown, _a: string[], options?: { signal?: AbortSignal }) =>
+          new Promise<number>((resolve) => {
+            signalOfBatch = options?.signal;
+            release = () => resolve(1);
+          }),
+      );
+      const svc = service();
+      svc.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(signalOfBatch?.aborted).toBe(false);
+
+      const stopping = svc.stop();
+      expect(signalOfBatch?.aborted).toBe(true);
+      release();
+      await stopping;
+      expect(batches()).toEqual([['rA']]);
+      expect(changedSince).toHaveBeenCalledTimes(1);
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('a batch that was aborted at shutdown is neither an error nor counted', async () => {
+      pages.set(500, { accounts: ['rA'], upTo: 700 });
+      const svc = service();
+      recomputePools.mockImplementation(async () => {
+        void svc.stop();
+        throw new AmmPoolsRecomputeAborted();
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('shutdown'));
+    });
+
+    it('a real failure while the shutdown is under way is still an error', async () => {
+      pages.set(500, { accounts: ['rA'], upTo: 700 });
+      const svc = service();
+      recomputePools.mockImplementation(async () => {
+        void svc.stop();
+        throw new Error('DB::Exception: table is read-only');
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('read-only'));
     });
   });
 });

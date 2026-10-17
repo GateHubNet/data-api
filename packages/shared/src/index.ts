@@ -38,6 +38,7 @@ export * from './ingest/ingest-state';
 // Aggregates
 export * from './aggregate/stats.job';
 export * from './aggregate/volume.job';
+export * from './aggregate/amm-pools.job';
 
 // Query
 export * from './query/asset';

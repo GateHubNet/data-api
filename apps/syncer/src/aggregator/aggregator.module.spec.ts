@@ -72,10 +72,13 @@ describe('AggregatorModule', () => {
     for (const job of ['volume_live', 'volume_daily', 'volume_backfill']) {
       expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job });
     }
+    // and so is the AMM pools job, which has nothing to rebuild over an empty database
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     const written = insert.mock.calls.map(([table]) => table);
     expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(7);
     expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(4);
+    expect(written).not.toContain(Table.AmmPools);
 
     await app.close();
     await jest.advanceTimersByTimeAsync(5 * 60_000);

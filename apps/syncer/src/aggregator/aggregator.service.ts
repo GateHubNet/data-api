@@ -1,4 +1,6 @@
 import {
+  AmmPoolsRecomputeAborted,
+  ammPoolsWatermark,
   ClickHouseService,
   computeDailyVolumeSet,
   computeLiveVolumeSet,
@@ -7,7 +9,10 @@ import {
   livePeriodsOf,
   liveSetVersions,
   MarketsConfig,
+  poolsChangedSince,
+  poolsClosedIn,
   RatesService,
+  recomputeAmmPools,
   recomputeStatsHourly,
   ShutdownSignals,
   StatsRecomputeAborted,
@@ -62,6 +67,16 @@ export const AGGREGATOR_VOLUME_DAILY_BUDGET_MS = 4000;
  * one to start on time.
  */
 export const AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS = 10_000;
+
+/**
+ * How much of the tick `amm_pools` may use. It runs right after the daily volumes, so that the pool list is refreshed at every
+ * tick; a batch of pools is a few queries, so this is a bound for a database that has gone slow, or for the first sweep of
+ * a deployment with thousands of pools (the sweep goes on where it stopped at the next tick).
+ */
+export const AGGREGATOR_AMM_POOLS_BUDGET_MS = 3000;
+
+/** How many pools one batch of `amm_pools` recomputes (and so how far the cursor of the job moves at a time). */
+export const AMM_POOLS_BATCH = 200;
 
 /** A volume job gives up after this many sets failed in a tick, so that an outage does not log a line per set. */
 export const MAX_FAILED_VOLUME_SETS_PER_TICK = 3;
@@ -132,7 +147,13 @@ export interface AggregatorJob {
 }
 
 /** The jobs the aggregator has of its own, in the order of a tick. */
-export type AggregatorJobName = 'volume_live' | 'volume_daily' | 'stats_live' | 'stats_dirty' | 'volume_backfill';
+export type AggregatorJobName =
+  | 'volume_live'
+  | 'volume_daily'
+  | 'amm_pools'
+  | 'stats_live'
+  | 'stats_dirty'
+  | 'volume_backfill';
 
 /** What the volume jobs work with: the rates of the network and its versioned markets config. */
 export interface AggregatorVolumes {
@@ -151,6 +172,21 @@ export interface VolumeFunctions {
   dailyVersions: typeof dailySetVersions;
 }
 
+/** What the `amm_pools` job works with: the rates of the network, for the value of a pool. */
+export interface AggregatorAmmPools {
+  rates: RatesService;
+}
+
+/** The functions of the shared package the `amm_pools` job calls; tests replace them. */
+export interface AmmPoolsFunctions {
+  /** Where the job goes on from after a start: see `ammPoolsWatermark`. */
+  watermark: typeof ammPoolsWatermark;
+  changedSince: typeof poolsChangedSince;
+  /** The pools of the ledgers that closed in a window (the slice of an `agg_dirty` range). */
+  poolsClosedIn: typeof poolsClosedIn;
+  recompute: typeof recomputeAmmPools;
+}
+
 export interface AggregatorOptions {
   /** Default: `AGGREGATOR_INTERVAL_MS`. */
   intervalMs?: number;
@@ -164,6 +200,10 @@ export interface AggregatorOptions {
   volumes?: AggregatorVolumes;
   /** Replaces the volume functions of the shared package; for tests. */
   volumeFunctions?: Partial<VolumeFunctions>;
+  /** With it the `amm_pools` job runs (the current state of every AMM pool, and the pools of the days of `agg_dirty`); without it it does not. */
+  ammPools?: AggregatorAmmPools;
+  /** Replaces the AMM functions of the shared package; for tests. */
+  ammPoolsFunctions?: Partial<AmmPoolsFunctions>;
   /** Default: a Nest `Logger` with the context `AggregatorService`. */
   logger?: Pick<Logger, 'log' | 'warn' | 'error' | 'debug'>;
   /** The clock, in unix milliseconds. Default: `Date.now`. */
@@ -220,7 +260,13 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     short for all of them every set is refreshed in turn.
  *  2. **volume_daily**: the daily volume sets of today and of yesterday (UTC), both metrics, the stalest first (yesterday's are
  *     the ones that are finalised after the midnight).
- *  3. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
+ *  3. **amm_pools** (with the `ammPools` option): rebuilds the `amm_pools` row of every AMM pool whose state rows changed
+ *     since the cursor of the job, `AMM_POOLS_BATCH` pools at a time, oldest change first, for at most
+ *     `AGGREGATOR_AMM_POOLS_BUDGET_MS`. The cursor is a ledger index kept in memory and found again from the tables when the
+ *     process starts (`ammPoolsWatermark`: the ledger before the oldest state row that its pool's newest `amm_pools` row has not
+ *     seen), so a restart takes the work up where it was; it moves past a batch only once the batch is written. A pool is a
+ *     whole recompute from its state rows, so a batch is idempotent and a failed one is simply done again at the next tick.
+ *  4. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
  *     first, in slices of at most a day:
  *      - the **catch-up**, from the watermark (the newest hour with ledgers) up to two hours ago, or to the hour of the newest
  *        ledger if that is earlier. The live runner writes no `agg_dirty` row, so after an outage, for a database whose
@@ -234,10 +280,12 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     It gets at most `AGGREGATOR_LIVE_BUDGET_MS` of the tick. **During a long catch-up (weeks of ledgers after an outage, the
  *     first sweep of a database with years of history) the tail is not run, so the stats of the current hour are stale**;
  *     `syncer_aggregator_stats_lag_seconds` says how much is left.
- *  4. **stats_dirty**: drains `agg_dirty`, the ranges that ingest rewrote behind the aggregator, oldest first, each in slices
+ *  5. **stats_dirty**: drains `agg_dirty`, the ranges that ingest rewrote behind the aggregator, oldest first, each in slices
  *     of at most a day, for at most `AGGREGATOR_DIRTY_BUDGET_MS`. The days a slice covers have their daily volume sets
- *     recomputed too (with the `volumes` option), once per tick unless the ingest marked the day again after that.
- *  5. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config,
+ *     recomputed too (with the `volumes` option), once per tick unless the ingest marked the day again after that, and the
+ *     AMM pools with a state row in the slice's ledgers are rebuilt (with the `ammPools` option; a slice is started whole, like
+ *     its volume sets, so the batches of a slice with thousands of pools are not cut by the budget, only by the shutdown).
+ *  6. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config,
  *     newest first, under its own budget. A day is closed when it is before yesterday AND the ingest has passed it (the newest
  *     ledger closed an hour after its end): the wall clock alone would call a day final while its ledgers are still to come.
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
@@ -269,6 +317,13 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly budgets: Record<AggregatorJobName, number>;
   private readonly volumes?: AggregatorVolumes;
   private readonly volumeFns: VolumeFunctions;
+  private readonly ammPools?: AggregatorAmmPools;
+  private readonly ammFns: AmmPoolsFunctions;
+  /**
+   * The cursor of `amm_pools`: every pool with a state row up to this ledger has been rebuilt. Unknown until the first tick
+   * reads it from the tables (`ammPoolsWatermark`); it only moves past a batch that was written.
+   */
+  private ammWatermark?: number;
   /** Whether the back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
   private backfilling = false;
   /** The sets of `volume_live` and `volume_daily` (by job, then `<metric>/<period or day>`) whose last attempt failed. */
@@ -301,6 +356,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     this.budgets = {
       volume_live: AGGREGATOR_VOLUME_LIVE_BUDGET_MS,
       volume_daily: AGGREGATOR_VOLUME_DAILY_BUDGET_MS,
+      amm_pools: AGGREGATOR_AMM_POOLS_BUDGET_MS,
       stats_live: options.liveBudgetMs ?? AGGREGATOR_LIVE_BUDGET_MS,
       stats_dirty: AGGREGATOR_DIRTY_BUDGET_MS,
       volume_backfill: AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS,
@@ -314,6 +370,14 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       liveVersions: liveSetVersions,
       dailyVersions: dailySetVersions,
       ...options.volumeFunctions,
+    };
+    this.ammPools = options.ammPools;
+    this.ammFns = {
+      watermark: ammPoolsWatermark,
+      changedSince: poolsChangedSince,
+      poolsClosedIn,
+      recompute: recomputeAmmPools,
+      ...options.ammPoolsFunctions,
     };
     this.logger = options.logger ?? new Logger(AggregatorService.name);
     this.clock = options.now ?? Date.now;
@@ -332,6 +396,15 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
               name: 'volume_daily',
               budgetMs: this.budgets.volume_daily,
               run: (tick: AggregatorTick) => this.volumeDaily(tick),
+            },
+          ]
+        : []),
+      ...(this.ammPools
+        ? [
+            {
+              name: 'amm_pools',
+              budgetMs: this.budgets.amm_pools,
+              run: (tick: AggregatorTick) => this.ammPoolsJob(tick),
             },
           ]
         : []),
@@ -414,12 +487,60 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   /** Logs and counts a failure of a job (or of one slice of it); one that comes of the shutdown is neither. */
   private failed(job: string, err: unknown, where = ''): void {
-    if (this.closing && (err instanceof StatsRecomputeAborted || err instanceof VolumeRecomputeAborted)) {
+    if (
+      this.closing &&
+      (err instanceof StatsRecomputeAborted ||
+        err instanceof VolumeRecomputeAborted ||
+        err instanceof AmmPoolsRecomputeAborted)
+    ) {
       this.logger.log(`Dropped the ${job} slice in flight at shutdown`);
       return;
     }
     this.metrics?.aggregatorErrorsTotal.inc({ job });
     this.logger.error(`Aggregator job ${job} failed${where}: ${describe(err)}`);
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // amm_pools
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /**
+   * Rebuilds the pools whose state rows changed since the cursor, a batch at a time, until nothing is left, the budget of the job
+   * is spent, or the shutdown begins. A batch that throws leaves the cursor where it was (the error is the tick's: logged,
+   * counted as `amm_pools`, and the jobs after this one still run), so the next tick asks for the same pools again.
+   */
+  private async ammPoolsJob(tick: AggregatorTick): Promise<void> {
+    const amm = this.ammPools;
+    if (!amm) return;
+    this.ammWatermark ??= await this.ammFns.watermark(this.ch);
+    for (;;) {
+      if (!this.mayStartSet(tick, 'amm_pools')) return;
+      const ledger = this.ammWatermark;
+      const { accounts, upTo } = await this.ammFns.changedSince(this.ch, ledger, AMM_POOLS_BATCH);
+      if (this.closing || accounts.length === 0) return;
+      await this.ammFns.recompute(this.ch, amm.rates, accounts, { signal: tick.signal });
+      this.logger.debug(`amm_pools: ${accounts.length} pool(s) up to ledger ${upTo}`);
+      // a cursor that does not move would ask for the same pools for ever
+      if (upTo <= ledger) return;
+      this.ammWatermark = upTo;
+    }
+  }
+
+  /**
+   * The pools with a state row in the ledgers that closed in the slice `[start, end)` of an `agg_dirty` range, rebuilt a batch at
+   * a time. The slice is started whole (the budget is checked before a slice, as for its stats and volumes); only the shutdown
+   * stops it between batches, and then the range is left as it is (`recomputeDirty` writes nothing to `agg_dirty` after it).
+   */
+  private async ammPoolsOfSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
+    const amm = this.ammPools;
+    if (!amm) return;
+    const accounts = await this.ammFns.poolsClosedIn(this.ch, amm.rates, new Date(start * 1000), new Date(end * 1000));
+    for (let i = 0; i < accounts.length; i += AMM_POOLS_BATCH) {
+      if (this.closing) return;
+      await this.ammFns.recompute(this.ch, amm.rates, accounts.slice(i, i + AMM_POOLS_BATCH), {
+        signal: tick.signal,
+      });
+    }
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -598,6 +719,13 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         outcome = 'failed';
         break;
       }
+      try {
+        await this.ammPoolsOfSlice(start, end, tick);
+      } catch (err) {
+        this.failed('amm_pools_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
+        outcome = 'failed';
+        break;
+      }
       done = end;
     }
     // no change to agg_dirty is started once the shutdown has begun; one that is under way (narrowDirtyRange's INSERT and
@@ -646,7 +774,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   }
 
   /**
-   * Whether a volume job may start another set: not after the shutdown began, and not past its budget. Running out of the budget
+   * Whether a job that works in sets or batches (the volume jobs, `amm_pools`) may start another: not after the shutdown began,
+   * and not past its budget. Running out of the budget
    * is how a long back-fill works, tick after tick, so it is said once (a warning) for as long as the runs of the job keep
    * hitting it, and at debug level after that; a run that finishes in time ends the streak.
    */
