@@ -16,10 +16,13 @@ import { RatesService } from '../query/rates.service';
  *    exceptions are `deleted` and `last_ledger`, which are those of the newest row, and the assets, which never change for
  *    one pool account. `created_ledger` and `created_by` are those of the pool's `AMMCreate` (`amm_liquidity`, event
  *    `create`) and are null for a pool whose creation was not ingested (a pool first seen in the middle of its life).
- *  - **A window, then the whole history if need be (Ruling R-A21).** The fill-forward reads the state rows of the last
+ *  - **A window, then older steps if need be (Rulings R-A21 and R-A23).** The fill-forward reads the state rows of the last
  *    `AMM_FILL_WINDOW_LEDGERS` ledgers of the head first, a range of the primary key of each pool (`fillForward`, shared with
- *    `amm_daily`), and only the pools for which that does not give every column a value (or give no row at all) are read from
- *    their first ledger: the answer is the one the whole history gives, and a pool with years of rows costs about a week of them.
+ *    `amm_daily`). A pool for which that does not give every column a value (or gives no row at all) is read further back in
+ *    steps that double (each step reads only the ledgers before the ones already read), until it has them all or its first
+ *    ledger is reached: the answer is the one the whole history gives, and the cost is a window for a pool whose values are
+ *    all recent, about the distance back to its oldest needed value (at most twice that, plus the window) for one whose
+ *    AMM-node row is older, and the whole history only for a pool with a value that is null for ever.
  *  - **Exact amounts.** The reserves, the LP supply and the auction price are the exact strings of the state rows; only
  *    `value_native` is a Float64.
  *  - **`value_native`** (spec section 3): 2 × the native reserve when one of the assets is the native currency; otherwise
@@ -177,15 +180,101 @@ export function fillForwardSql(query: Pick<FillForwardQuery, 'fields' | 'extra'>
  ORDER BY amm_account`;
 }
 
+/** The columns of a fill-forward row that describe its newest row: they come from the newest range in which the pool has a row. */
+const NEWEST_ROW_COLUMNS: ReadonlySet<string> = new Set([
+  'amm_account',
+  'asset_base_currency',
+  'asset_base_issuer',
+  'asset_counter_currency',
+  'asset_counter_issuer',
+  'newest_ledger',
+  'newest_close',
+  'newest_deleted',
+  'now_ms',
+]);
+
 /**
- * The fill-forward state of some pools at a ledger (Ruling R-A21), read from a window: the state rows of the ledgers
- * `[from, upTo]` first (a range of the primary key of each pool, so a busy pool with years of history costs the window and not
- * the years), and then, from the pool's first ledger, only the pools for which the window does not give the whole answer: those
- * with no row in the window and those with one of the `required` columns null in it. The answer is exactly the one the whole
- * history gives: a column that has a value in the window has the same newest value in the history, and `deleted`, the assets
- * and the newest ledger are those of the newest row, which is in the window whenever the pool has a row in it. With `from` 0
- * the window is the history and there is no second read. One row per pool that has state rows up to `upTo`, in the order of
- * `accounts` (the callers pass them sorted, which is the order of the select).
+ * A fill-forward row of a range, completed with the row of an older range: a filled column that is null in the newer one takes
+ * the value of the older one, because the newest non-null value over both ranges is the newest range's if it has one and the
+ * older range's if it has none. The columns about the newest row are the newer range's.
+ */
+function olderInto<R extends object>(newer: R, older: R): R {
+  const merged: Record<string, unknown> = { ...(newer as Record<string, unknown>) };
+  for (const [column, value] of Object.entries(older)) {
+    if (!NEWEST_ROW_COLUMNS.has(column) && merged[column] === null) merged[column] = value;
+  }
+  return merged as R;
+}
+
+/** The pools of `accounts` that have no row yet, or one with a required column still null. */
+function incompleteOf<R extends object>(
+  rows: ReadonlyMap<string, R>,
+  accounts: string[],
+  query: FillForwardQuery,
+): string[] {
+  return accounts.filter((account) => {
+    const row = rows.get(account) as Record<string, unknown> | undefined;
+    return row === undefined || query.required.some((column) => row[column] === null);
+  });
+}
+
+async function readFill<R extends object>(
+  ch: ClickHouseService,
+  accounts: string[],
+  from: number,
+  upTo: number,
+  query: FillForwardQuery,
+): Promise<Array<FillForwardRow & R>> {
+  return ch.query<FillForwardRow & R>(fillForwardSql(query), {
+    accounts,
+    fill_from: from,
+    fill_up_to: upTo,
+    ...query.extra?.params,
+  });
+}
+
+/**
+ * Reads further back, for the pools of `accounts` that `rows` does not give completely, the ledgers before `from` (the first
+ * ledger `rows` has read) in doubling steps (Ruling R-A23): the steps end at `upTo - 2 * (upTo - from)`, `upTo - 4 * (upTo -
+ * from)`, ... and the one that would reach back half of the way to the first ledger goes all the way to it. Each step reads
+ * the pools that are still incomplete, only the ledgers no earlier step read, and completes their rows (`olderInto`): the
+ * rows come out as if they had been read from the first ledger, because the last step, if it is needed, reaches it, and each
+ * step before it only stops when the pools it was for have every required column. The steps number about `log2(upTo / (upTo -
+ * from))`, and a pool pays for the distance back to its oldest needed value, at most twice, never for the rest of its history.
+ * `rows` is changed in place.
+ */
+export async function deepenFill<R extends object>(
+  ch: ClickHouseService,
+  rows: Map<string, FillForwardRow & R>,
+  accounts: string[],
+  upTo: number,
+  from: number,
+  query: FillForwardQuery,
+): Promise<void> {
+  let incomplete = incompleteOf(rows, accounts, query);
+  let read = Math.max(0, Math.floor(from));
+  let span = Math.max(1, 2 * (upTo - read));
+  while (incomplete.length > 0 && read > 0) {
+    const start = span >= upTo / 2 ? 0 : Math.max(0, upTo - span);
+    for (const row of await readFill<R>(ch, incomplete, start, read - 1, query)) {
+      const have = rows.get(row.amm_account);
+      rows.set(row.amm_account, have === undefined ? row : olderInto(have, row));
+    }
+    read = start;
+    incomplete = incompleteOf(rows, accounts, query);
+    span *= 2;
+  }
+}
+
+/**
+ * The fill-forward state of some pools at a ledger, read from a window and, if need be, further back (Rulings R-A21 and
+ * R-A23): the state rows of the ledgers `[from, upTo]` first (a range of the primary key of each pool), and then, for the pools
+ * with no row in the window and those with one of the `required` columns null in it, `deepenFill`. The answer is exactly the
+ * one the whole history gives: a column that has a value in what was read has the same newest value in the history, and
+ * `deleted`, the assets and the newest ledger are those of the newest row, which is in the first range in which the pool has a
+ * row. With `from` 0 the window is the history. One row per pool that has state rows up to `upTo`, in the order of `accounts`
+ * (the callers pass them sorted, which is the order of the select). The `extra` items have to be fill-forwards as well: null
+ * when no row qualifies, and the newest value otherwise.
  */
 export async function fillForward<R extends object = Record<string, never>>(
   ch: ClickHouseService,
@@ -194,24 +283,10 @@ export async function fillForward<R extends object = Record<string, never>>(
   from: number,
   query: FillForwardQuery,
 ): Promise<Array<FillForwardRow & R>> {
-  type Row = FillForwardRow & R;
-  const sql = fillForwardSql(query);
-  const read = (of: string[], start: number): Promise<Row[]> =>
-    ch.query<Row>(sql, { accounts: of, fill_from: start, fill_up_to: upTo, ...query.extra?.params });
   const first = Math.max(0, Math.floor(from));
-  const window = await read(accounts, first);
-  if (first === 0) return window;
-
-  const complete = (row: Row): boolean =>
-    query.required.every((column) => (row as Record<string, unknown>)[column] !== null);
-  const found = new Map(window.map((row) => [row.amm_account, row]));
-  const incomplete = accounts.filter((account) => {
-    const row = found.get(account);
-    return row === undefined || !complete(row);
-  });
-  if (incomplete.length === 0) return window;
-  for (const row of await read(incomplete, 0)) found.set(row.amm_account, row);
-  return accounts.flatMap((account) => found.get(account) ?? []); // the order of the caller, who passes them sorted
+  const rows = new Map((await readFill<R>(ch, accounts, first, upTo, query)).map((row) => [row.amm_account, row]));
+  await deepenFill(ch, rows, accounts, upTo, first, query);
+  return accounts.flatMap((account) => rows.get(account) ?? []);
 }
 
 /** The columns of the pool row that come from the fill-forward, and so decide when a window is enough. */

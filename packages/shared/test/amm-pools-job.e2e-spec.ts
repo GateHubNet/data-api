@@ -1533,10 +1533,12 @@ describe('the amm_pools job (e2e)', () => {
       const reads = query.mock.calls
         .filter(([sql]) => String(sql).includes('argMaxIf(reserve_base'))
         .map(([, params]) => params as { accounts: string[]; fill_from: number; fill_up_to: number });
-      // the window first, all three; then, whole, only the two the window does not give completely
+      // the window first, all three; then, in older steps (Ruling R-A23: 3000-3999, and all the rest), only the two the
+      // window does not give completely
       expect(reads.map((r) => [r.accounts, r.fill_from, r.fill_up_to])).toEqual([
         [[busy, partial, quiet].sort(), HEAD - WINDOW, HEAD],
-        [[partial, quiet].sort(), 0, HEAD],
+        [[partial, quiet].sort(), 3000, 3999],
+        [[partial, quiet].sort(), 0, 2999],
       ]);
 
       const rows = byAccount(await latest(ch));
@@ -1695,6 +1697,206 @@ describe('the amm_pools job (e2e)', () => {
         expect(without(windowed)).toEqual(without(whole));
         expect(windowed).toMatchObject({
           last_ledger: LEDGER_BASE + ROWS - 1,
+          reserve_base: '10',
+          lp_supply: '30',
+          trading_fee: 222,
+        });
+      });
+    });
+
+    describe('a value beyond the window is looked for in doubling steps, each reading only older ledgers (Ruling R-A23)', () => {
+      const TOP = 100_000;
+      const SHORT = 100;
+      /** From the window back: the ranges of the steps (the window itself is [TOP - 100, TOP]). */
+      const STEPS: Array<[number, number]> = [
+        [99_800, 99_899],
+        [99_600, 99_799],
+        [99_200, 99_599],
+        [98_400, 99_199],
+        [96_800, 98_399],
+        [93_600, 96_799],
+        [87_200, 93_599],
+        [74_400, 87_199],
+        [0, 74_399],
+      ];
+      const stateReads = (query: jest.SpyInstance): Array<{ accounts: string[]; range: [number, number] }> =>
+        query.mock.calls
+          .filter(([sql]) => String(sql).includes('argMaxIf(reserve_base'))
+          .map(([, params]) => {
+            const p = params as { accounts: string[]; fill_from: number; fill_up_to: number };
+            return { accounts: p.accounts, range: [p.fill_from, p.fill_up_to] };
+          });
+
+      /** A pool whose only AMM-node row (everything but the reserves) is `back` ledgers before the head, if any. */
+      async function poolWith(back: number | undefined): Promise<{ ch: ClickHouseService; pool: string }> {
+        const ch = await fresh();
+        const pool = `rWalk${back}`.padEnd(33, '0');
+        await insertStates(ch, [
+          ...(back === undefined
+            ? []
+            : [state({ amm_account: pool, ledger_index: TOP - back, ...(OLD as Partial<AmmPoolStatesRow>) })]),
+          state({ amm_account: pool, ledger_index: TOP, reserve_base: '10', reserve_counter: '20' }),
+        ]);
+        return { ch, pool };
+      }
+
+      it.each([
+        [50, 0],
+        [150, 1],
+        [600, 3],
+        [5000, 6],
+        [90_000, 9],
+      ])('a value %i ledgers back is found after %i steps, the row is the whole-history row', async (back, steps) => {
+        const { ch, pool } = await poolWith(back);
+        const query = jest.spyOn(ch, 'query');
+        await recomputeAmmPools(ch, noRates(), [pool], { fillWindow: SHORT });
+        // the window, then the steps up to the one that holds the row, each older than the last and the ledgers read once
+        expect(stateReads(query).map((r) => r.range)).toEqual([[TOP - SHORT, TOP], ...STEPS.slice(0, steps)]);
+        const windowed = (await latest(ch))[0];
+        expect(windowed).toMatchObject({
+          reserve_base: '10',
+          lp_supply: '3',
+          trading_fee: 111,
+          auction_holder: 'rOldHolder',
+        });
+
+        await recomputeAmmPools(ch, noRates(), [pool], { fillWindow: FULL });
+        expect(without((await latest(ch))[0])).toEqual(without(windowed));
+      });
+
+      it('a value that is never set ends with the last step, which reads from the first ledger: ten reads for 100 and 100,000', async () => {
+        const { ch, pool } = await poolWith(undefined);
+        const query = jest.spyOn(ch, 'query');
+        await recomputeAmmPools(ch, noRates(), [pool], { fillWindow: SHORT });
+        const reads = stateReads(query);
+        expect(reads.map((r) => r.range)).toEqual([[TOP - SHORT, TOP], ...STEPS]);
+        expect(reads.length).toBeLessThanOrEqual(Math.ceil(Math.log2(TOP / SHORT)) + 1);
+        expect((await latest(ch))[0]).toMatchObject({ reserve_base: '10', lp_supply: null, trading_fee: null });
+      });
+
+      it('each step reads the pools that are still incomplete and no others', async () => {
+        const ch = await fresh();
+        const [near, far, never] = ['rNear', 'rFar', 'rNever'].map((n) => n.padEnd(33, '0'));
+        await insertStates(ch, [
+          state({ amm_account: near, ledger_index: TOP - 150, ...(OLD as Partial<AmmPoolStatesRow>) }),
+          state({ amm_account: far, ledger_index: TOP - 600, ...(OLD as Partial<AmmPoolStatesRow>) }),
+          ...[near, far, never].map((account) =>
+            state({ amm_account: account, ledger_index: TOP, reserve_base: '10', reserve_counter: '20' }),
+          ),
+        ]);
+        const query = jest.spyOn(ch, 'query');
+        await recomputeAmmPools(ch, noRates(), [near, far, never], { fillWindow: SHORT });
+        const reads = stateReads(query);
+        const all = [near, far, never].sort();
+        expect(reads.slice(0, 4).map((r) => [r.accounts, r.range])).toEqual([
+          [all, [TOP - SHORT, TOP]],
+          [all, STEPS[0]], // near is found here
+          [[far, never].sort(), STEPS[1]],
+          [[far, never].sort(), STEPS[2]], // far is found here
+        ]);
+        expect(reads.slice(4).every((r) => r.accounts.length === 1 && r.accounts[0] === never)).toBe(true);
+        expect(reads).toHaveLength(10);
+        const rows = byAccount(await latest(ch));
+        expect(rows.get(near)).toMatchObject({ lp_supply: '3' });
+        expect(rows.get(far)).toMatchObject({ lp_supply: '3' });
+        expect(rows.get(never)).toMatchObject({ lp_supply: null });
+      });
+
+      it('a pool that has no row in the window is found in a step, with the assets and the newest row it has', async () => {
+        const ch = await fresh();
+        const quiet = 'rQuietWalk'.padEnd(33, '0');
+        await insertStates(ch, [
+          state({ amm_account: quiet, ledger_index: TOP - 700, ...(OLD as Partial<AmmPoolStatesRow>), deleted: 1 }),
+          state({ amm_account: 'rOther'.padEnd(33, '0'), ledger_index: TOP, reserve_base: '1' }),
+        ]);
+        await recomputeAmmPools(ch, noRates(), [quiet], { fillWindow: SHORT });
+        const windowed = (await latest(ch)).find((r) => r.amm_account === quiet) as StoredPool;
+        expect(windowed).toMatchObject({ last_ledger: TOP - 700, deleted: 1, base_currency: 'USD', lp_supply: '3' });
+        await recomputeAmmPools(ch, noRates(), [quiet], { fillWindow: FULL });
+        expect(without((await latest(ch)).find((r) => r.amm_account === quiet) as StoredPool)).toEqual(
+          without(windowed),
+        );
+      });
+    });
+
+    describe('a pool whose only AMM-node row is three windows back (1,200,000 state rows in three parts)', () => {
+      const LEDGER_BASE = 1_000_000;
+      const ROWS = 1_200_000;
+      const PART = ROWS / 3;
+      const TOP_LEDGER = LEDGER_BASE + ROWS - 1;
+      /** The AMM-node row: three windows back from the head, and a thousand ledgers on. */
+      const NODE_ROW = TOP_LEDGER - 3 * AMM_FILL_WINDOW_LEDGERS + 1000;
+      const BUSY = 'rBusyQuiet'.padEnd(33, '0');
+      const GRANULE = 8192;
+      let ch: ClickHouseService;
+      let db: string;
+
+      beforeAll(async () => {
+        ch = await fresh();
+        db = ((await ch.queryOne<{ db: string }>('SELECT currentDatabase() AS db')) as { db: string }).db;
+        await ch.command(`SYSTEM STOP MERGES ${Table.AmmPoolStates}`);
+        await ch.insert(Table.AmmPoolStates, [state({ amm_account: BUSY, ledger_index: 1, reserve_base: '1' })]);
+        for (let part = 0; part < 3; part++) {
+          // a swap in every ledger (the reserves only), and one transaction on the AMM node
+          await ch.command(
+            `INSERT INTO ${Table.AmmPoolStates}
+             SELECT tpl.* REPLACE (
+                      toUInt32({base:UInt32} + n.number) AS ledger_index,
+                      toUInt32(0) AS tx_index,
+                      toNullable('10') AS reserve_base,
+                      toNullable('20') AS reserve_counter,
+                      if(toUInt32({base:UInt32} + n.number) = {node:UInt32}, toNullable('30'), NULL) AS lp_supply,
+                      if(toUInt32({base:UInt32} + n.number) = {node:UInt32}, toNullable('${NEW.lp_currency}'), NULL) AS lp_currency,
+                      if(toUInt32({base:UInt32} + n.number) = {node:UInt32}, toNullable(toUInt16(222)), NULL) AS trading_fee,
+                      if(toUInt32({base:UInt32} + n.number) = {node:UInt32}, toNullable('rSomeHolder'), NULL) AS auction_holder,
+                      if(toUInt32({base:UInt32} + n.number) = {node:UInt32}, toNullable('90'), NULL) AS auction_price,
+                      if(toUInt32({base:UInt32} + n.number) = {node:UInt32}, toNullable(toUInt16(22)), NULL) AS auction_discounted_fee,
+                      if(toUInt32({base:UInt32} + n.number) = {node:UInt32}, toNullable(toUInt32(1)), NULL) AS auction_expiration
+                    )
+               FROM (SELECT * FROM ${Table.AmmPoolStates} WHERE amm_account = {pool:String} AND ledger_index = 1) AS tpl
+              CROSS JOIN numbers({rows:UInt32}) AS n`,
+            { base: LEDGER_BASE + part * PART, node: NODE_ROW, pool: BUSY, rows: PART },
+            { settings: { insert_deduplicate: 0 } },
+          );
+        }
+        await ch.insert(Table.Ledgers, [ledgerRow(TOP_LEDGER, T0)]);
+      });
+
+      async function readRows(run: () => Promise<unknown>): Promise<number[]> {
+        const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
+        await run();
+        await ch.command('SYSTEM FLUSH LOGS');
+        const rows = await ch.query<{ read_rows: string }>(
+          `SELECT read_rows FROM system.query_log
+            WHERE current_database = {db:String} AND type = 'QueryFinish' AND query_kind = 'Select'
+              AND query_start_time_microseconds >= {t:DateTime64(6)} AND has(tables, {table:String})
+              AND position(query, 'argMaxIf(reserve_base') > 0
+            ORDER BY query_start_time_microseconds`,
+          { db, t, table: `${db}.${Table.AmmPoolStates}` },
+        );
+        return rows.map((r) => Number(r.read_rows));
+      }
+
+      it('reads about four windows (the window and two doubling steps), not the 1,200,000 rows of its history', async () => {
+        const steps = await readRows(() => recomputeAmmPools(ch, noRates(), [BUSY]));
+        expect(steps).toHaveLength(3); // the window, a step of one window, a step of two windows (which holds the row)
+        const total = steps.reduce((a, b) => a + b, 0);
+        expect(total).toBeGreaterThanOrEqual(4 * AMM_FILL_WINDOW_LEDGERS);
+        expect(total).toBeLessThanOrEqual(4 * AMM_FILL_WINDOW_LEDGERS + 12 * GRANULE);
+
+        // the control: the whole history in one read, and the old way, the window and then the whole history
+        const whole = await readRows(() => recomputeAmmPools(ch, noRates(), [BUSY], { fillWindow: FULL }));
+        expect(whole[0]).toBeGreaterThanOrEqual(ROWS);
+        expect(whole[0] + AMM_FILL_WINDOW_LEDGERS).toBeGreaterThan(2 * total);
+      });
+
+      it('and the row is the whole-history row', async () => {
+        await recomputeAmmPools(ch, noRates(), [BUSY]);
+        const windowed = (await latest(ch))[0];
+        await recomputeAmmPools(ch, noRates(), [BUSY], { fillWindow: FULL });
+        expect(without((await latest(ch))[0])).toEqual(without(windowed));
+        expect(windowed).toMatchObject({
+          last_ledger: TOP_LEDGER,
           reserve_base: '10',
           lp_supply: '30',
           trading_fee: 222,

@@ -1640,6 +1640,11 @@ describe('the amm_daily job (e2e)', () => {
     ];
     const FRESH = pool('rWindowFresh', USD, XRP); // every value in the window
     const CREATED = pool('rWindowCreatedToday', USD, XRP); // no row before the day
+    // old AMM-node rows (before the window) and one in the day; the fee at the start of the day is only needed by the swapper
+    const LIQUIDITY_ONLY = pool('rWindowLiquidityOnly', USD, XRP);
+    const SWAPPER = pool('rWindowSwapper', USD, XRP);
+    // no swap, a row in the window with the LP supply and the reserves but not the fee, which only an old row has
+    const FEELESS = pool('rWindowFeeless', USD, XRP);
 
     let ch: ClickHouseService;
     const pools = CASES.map((c) => pool(`rWindow_${c.name}`, USD, XRP));
@@ -1661,6 +1666,20 @@ describe('the amm_daily job (e2e)', () => {
       CASES.forEach((c, i) => add(pools[i], i + 1, c.before, c.inWindow, c.taker));
       add(FRESH, 20, OLD, NEW, STRANGER);
       add(CREATED, 21, undefined, {}, STRANGER);
+      // the fee state at the start of the day is in the old row only, the closing state in the row of the day (which comes
+      // after the swap, so the swap is charged at the old fee)
+      for (const [p, node] of [
+        [LIQUIDITY_ONLY, 30],
+        [SWAPPER, 31],
+      ] as const) {
+        states.push(state(p, 900, node, OLD), state(p, 1000, node + 100, NEW));
+      }
+      swaps.push(swap(SWAPPER, 1000, 1, { taker: STRANGER, in: 'base', base: '100000', counter: '1', node: 31 }));
+      states.push(
+        state(FEELESS, 900, 40, OLD),
+        state(FEELESS, 970, 40, minus(NEW, 'trading_fee')),
+        state(FEELESS, 1000, 40, {}),
+      );
       await insertStates(ch, states);
       await ch.insert(Table.Exchanges, swaps);
       await commit(
@@ -1684,23 +1703,34 @@ describe('the amm_daily job (e2e)', () => {
       expect(AMM_FILL_WINDOW_LEDGERS).toBe(160_000);
     });
 
-    it('reads the window first for all the pools and then the whole history of those the window does not give completely', () => {
-      const incomplete = [...pools, CREATED].map((p) => p.account).sort();
-      expect(reads.map((r) => [r.accounts, r.fill_from, r.fill_up_to])).toEqual([
-        [[...pools, FRESH, CREATED].map((p) => p.account).sort(), 1000 - WINDOW, 1003],
-        [incomplete, 0, 1003],
-      ]);
+    it('reads the window first for all the pools and then, in older steps, only the pools that need more (Ruling R-A23)', () => {
+      const all = [...pools, FRESH, CREATED, LIQUIDITY_ONLY, SWAPPER, FEELESS].map((p) => p.account).sort();
+      expect(reads[0]).toMatchObject({ accounts: all, fill_from: 1000 - WINDOW, fill_up_to: 1003 });
+      const later = reads.slice(1);
+      // the steps read ledgers older than the window, never the window again
+      expect(later.length).toBeGreaterThan(0);
+      expect(later.every((r) => r.fill_up_to < 1000 - WINDOW)).toBe(true);
+      const walked = new Set(later.flatMap((r) => r.accounts));
+      // a pool with every value in the window is not read again, and nor is a pool with no swap that day, whose fee at the
+      // start of the day nobody needs although the window does not hold it
+      expect(walked.has(FRESH.account)).toBe(false);
+      expect(walked.has(LIQUIDITY_ONLY.account)).toBe(false);
+      for (const p of [...pools, CREATED, SWAPPER])
+        expect([p.account, walked.has(p.account)]).toEqual([p.account, true]);
     });
 
     it('writes the pools in the order of their account, those read whole among them', () => {
-      expect(written).toEqual(['', ...[...pools, FRESH, CREATED].map((p) => p.account).sort()]);
+      expect(written).toEqual([
+        '',
+        ...[...pools, FRESH, CREATED, LIQUIDITY_ONLY, SWAPPER, FEELESS].map((p) => p.account).sort(),
+      ]);
     });
 
     it('gives the day it gives when it reads the whole history, pool by pool, all fields but the version', () => {
       expect([...windowed.keys()]).toEqual([...whole.keys()]);
       for (const [account, row] of windowed)
         expect([account, withoutVersion(row)]).toEqual([account, withoutVersion(whole.get(account) as StoredDaily)]);
-      expect(windowed.size).toBe(CASES.length + 2);
+      expect(windowed.size).toBe(CASES.length + 5);
     });
 
     it.each(CASES.map((c, i) => [c.name, i] as const))(
@@ -1720,6 +1750,30 @@ describe('the amm_daily job (e2e)', () => {
         lp_supply: '30',
         trading_fee: 222,
         fees_base_est: '222',
+      });
+    });
+
+    it('a pool with a swap has the fee it had at the start of the day, from the old row; one without has its closing state', () => {
+      expect(windowed.get(SWAPPER.account)).toMatchObject({
+        swap_count: 1,
+        fees_base_est: '111',
+        trading_fee: 222,
+        reserve_base: '10',
+      });
+      expect(windowed.get(LIQUIDITY_ONLY.account)).toMatchObject({
+        swap_count: 0,
+        fees_base_est: '0',
+        trading_fee: 222,
+        reserve_base: '10',
+      });
+    });
+
+    it('a pool without swaps still has its closing fee from the old row when the window does not hold it', () => {
+      expect(windowed.get(FEELESS.account)).toMatchObject({
+        swap_count: 0,
+        trading_fee: 111,
+        lp_supply: '30',
+        reserve_base: '10',
       });
     });
 

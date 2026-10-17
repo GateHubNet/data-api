@@ -4223,20 +4223,37 @@ describe('AggregatorService amm_daily job', () => {
       expect(computed().filter((d) => d === '2026-05-01')).toHaveLength(1);
     });
 
-    it('when the retries have no budget left, the floor of the back-fill does not take the owed day: the next run does', async () => {
-      for (const d of ['2026-10-14', '2026-10-13', '2026-10-11', '2026-10-10']) finalDays.add(d);
+    it('when the budget is spent, the floor of the run takes a due owed day, and that is the only day of the floor (Ruling R-A23)', async () => {
       ch.dirty = [mark('2026-10-12T00:00:00Z', '2026-10-12T05:00:00Z')];
-      failing.add('2026-10-12'); // owed, and not final: it is the only day the back-fill wants
+      failing.add('2026-10-12'); // owed
       const svc = service({ ammDailyEveryTicks: 1 });
       await svc.tick();
+      // the closed days after it are wanted again, and the owed day is due, with the budget gone
+      for (const d of ['2026-10-14', '2026-10-13']) finalDays.delete(d);
       failing.clear();
-      currentMs = 5000; // today uses the whole budget: the retries are denied
+      currentMs = 5000;
       events.length = 0;
       jest.setSystemTime(NOW_SECONDS * 1000 + AMM_DAILY_BACKFILL_RETRY_MS);
       await svc.tick();
-      expect(computed().filter(isClosed)).toEqual([]);
-      currentMs = 0;
+      expect(computed().filter(isClosed)).toEqual(['2026-10-12']); // not 2026-10-14 as well
+      // the next run has no owed day: the floor takes the newest wanted closed day
+      events.length = 0;
       jest.setSystemTime(NOW_SECONDS * 1000 + AMM_DAILY_BACKFILL_RETRY_MS + 60_000);
+      await svc.tick();
+      expect(computed().filter(isClosed)).toEqual(['2026-10-14']);
+    });
+
+    it('an owed day that is due and the budget not spent: it is tried with the others, and the back-fill has no floor of its own', async () => {
+      ch.dirty = [mark('2026-10-12T00:00:00Z', '2026-10-12T05:00:00Z')];
+      failing.add('2026-10-12');
+      const svc = service({ ammDailyEveryTicks: 1, budgetsMs: { amm_daily: 1500 } });
+      await svc.tick();
+      for (const d of ['2026-10-14', '2026-10-13']) finalDays.delete(d);
+      failing.clear();
+      currentMs = 1000; // today takes 1 s of the 1.5 s: the owed day starts within the budget, takes 1 s, and the budget is spent
+      closedMs = 1000;
+      events.length = 0;
+      jest.setSystemTime(NOW_SECONDS * 1000 + AMM_DAILY_BACKFILL_RETRY_MS);
       await svc.tick();
       expect(computed().filter(isClosed)).toEqual(['2026-10-12']);
     });

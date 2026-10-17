@@ -8,6 +8,7 @@ import {
   AMM_FILL_WINDOW_LEDGERS,
   committedHead,
   decimalOf,
+  deepenFill,
   fillForward,
   FillForwardQuery,
   FillForwardRow,
@@ -60,9 +61,12 @@ import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTL
  *    of the table (`LIMIT 1 BY`), and the aggregates give the same answer for a row and for two copies of it.
  *
  * Cost: the closing state and the fee state at the start of the day are read from the last `AMM_FILL_WINDOW_LEDGERS` ledgers
- * of the state rows of each pool (`fillForward`, Ruling R-A21), and from the first ledger of the pool only when the window does
- * not give every value; so a day costs about a week of the history of its pools, however old they are, and a back-fill of many
- * days costs that for each day.
+ * before the day of the state rows of each pool (`fillForward`, Rulings R-A21 and R-A23), and a pool whose window does not hold
+ * a value it needs is read further back in doubling steps that read only older ledgers. A pool with all its values in the
+ * window costs the window (about a week of its rows, whatever its age); one whose oldest needed value (an AMM-node row: a
+ * swap does not carry the fee, the LP supply or the slot) is older costs about the distance back to it, at most twice that, plus
+ * the window; the whole history is read only for a pool with a value that is null for ever. A back-fill of many days costs
+ * that for each day.
  */
 
 /** The version of the computation: bump it when the rows would come out differently, so that `ammDaysDone` redoes the days. */
@@ -278,22 +282,22 @@ export const AMM_DAILY_TOUCHES_SQL = `SELECT DISTINCT amm_account
 
 /**
  * The closing state of some pools, a fill-forward of their state rows up to the last ledger of the day (`fillForward`: a window
- * first, then the whole history of the pools the window does not answer for), and the fee state they were carried into the
- * day with: the same fill-forward up to the ledger before it, of the fee and of the auction slot. A value of the carry that
- * is null in the window is read from the history, and so is a reserve or the LP supply: the answer is that of the whole
- * history (Ruling R-A21). The slot values are in `required` as well: a slot that was bid before the window may still be in
- * force at the start of the day when the window is shorter than a day of ledgers, and a pool whose slot values are null in the
- * window and that has swaps has its fees depend on them.
+ * first, then older steps for the pools the window does not answer for), and the fee state they were carried into the day
+ * with: the same fill-forward up to the ledger before it, of the fee and of the auction slot. The answer is that of the whole
+ * history (Rulings R-A21 and R-A23). What decides that the window is enough depends on the pool:
+ *  - every pool needs its closing state, so a reserve, the LP supply or the fee that is null in what was read is looked for
+ *    further back;
+ *  - only a pool with swaps that day needs the fee state at the start of the day (the fee, and the slot: its holder, its
+ *    discounted fee and its expiration), so those columns are looked for further back (`CARRY_REQUIRED`, with `deepenFill`)
+ *    for the pools with swaps and for them only. The slot values are required and not left to the expiration: a slot may be
+ *    in force at the start of the day however far back it was bid when the window is shorter than a day of ledgers.
  */
 const DAILY_CARRIED = ['trading_fee', 'auction_holder', 'auction_discounted_fee', 'auction_expiration'] as const;
-const dailyQuery = (first: number): FillForwardQuery => ({
+const CLOSING_REQUIRED = ['filled_reserve_base', 'filled_reserve_counter', 'filled_lp_supply', 'filled_trading_fee'];
+const CARRY_REQUIRED = DAILY_CARRIED.map((c) => `carry_${c}`);
+const dailyQuery = (first: number, required: readonly string[]): FillForwardQuery => ({
   fields: ['reserve_base', 'reserve_counter', 'lp_supply', 'trading_fee'],
-  required: [
-    'filled_reserve_base',
-    'filled_reserve_counter',
-    'filled_lp_supply',
-    ...DAILY_CARRIED.map((c) => `carry_${c}`),
-  ],
+  required,
   extra: {
     columns: DAILY_CARRIED,
     select: DAILY_CARRIED.map(
@@ -302,7 +306,7 @@ const dailyQuery = (first: number): FillForwardQuery => ({
     params: { first },
   },
 });
-export const AMM_DAILY_STATES_SQL = fillForwardSql(dailyQuery(0));
+export const AMM_DAILY_STATES_SQL = fillForwardSql(dailyQuery(0, CLOSING_REQUIRED));
 
 /**
  * The swaps of pools in the ledgers of the day, through the pair key of each pool (the four asset columns, then the ledgers,
@@ -499,12 +503,25 @@ async function poolDays(
   window: number,
 ): Promise<Array<Omit<AmmDailyRow, 'version'>>> {
   const day = dayKey(start);
-  const [closing, liquidity] = await Promise.all([
+  const from = Math.max(0, ledgers.first - window);
+  const [read, liquidity] = await Promise.all([
     // the state up to the last ledger of the day, and the fee state at the start of it, from a window before the day
-    fillForward<ClosingRow>(ch, accounts, ledgers.last, ledgers.first - window, dailyQuery(ledgers.first)),
+    fillForward<ClosingRow>(ch, accounts, ledgers.last, from, dailyQuery(ledgers.first, CLOSING_REQUIRED)),
     ch.query<LiquidityRow>(LIQUIDITY_SQL, { accounts, ...ledgers }),
   ]);
-  const swaps = await swapsOf(ch, closing, ledgers);
+  const swaps = await swapsOf(ch, read, ledgers);
+  // the fee state at the start of the day is the business of the pools with swaps: those whose window does not hold it go on
+  // further back, the others (a deposit, a vote, a bid, nothing to charge) do not
+  const filled = new Map(read.map((row) => [row.amm_account, row]));
+  await deepenFill(
+    ch,
+    filled,
+    read.map((row) => row.amm_account).filter((account) => swaps.has(account)),
+    ledgers.last,
+    from,
+    dailyQuery(ledgers.first, CARRY_REQUIRED),
+  );
+  const closing = read.map((row) => filled.get(row.amm_account) as ClosingRow);
   const withSwaps = closing.map((c) => c.amm_account).filter((account) => swaps.has(account));
   const { events, carried } =
     withSwaps.length > 0

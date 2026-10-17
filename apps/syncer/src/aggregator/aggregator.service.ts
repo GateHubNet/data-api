@@ -880,7 +880,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
    * Today, and yesterday until its set is final (Ruling R-A21: `ammDaysDone`; the dirty path covers a rewrite after that), the
    * stalest first and a day that failed last time behind the other (R87: a day that keeps failing is the stalest for ever, and
    * would otherwise start first at every run); then the days that failed on the dirty path and are due again (`ammDailyRetries`);
-   * then the back-fill of the closed days: all under the budget of the job, the back-fill with a floor of one day. A day that
+   * then the back-fill of the closed days: all under the budget of the job, with a floor of one day for the run, which is the
+   * first due owed day if there is one and the newest wanted closed day if not. A day that
    * fails is logged and counted once under `amm_daily` and tried again at the next run; it does not stop the other day or the
    * back-fill. A day is one set under one version: there is no isolation of a pool that fails on its own (as `amm_pools` has),
    * the whole day is tried again.
@@ -911,8 +912,10 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         failedLast.add(key);
       }
     }
-    await this.ammDailyRetries(tick, new Set(sets.map((set) => set.key)));
-    await this.ammDailyBackfill(tick);
+    // the floor of the run is one day that starts whatever is left of the budget: a due owed day if there is one, else the
+    // newest wanted closed day
+    const retried = await this.ammDailyRetries(tick, new Set(sets.map((set) => set.key)));
+    await this.ammDailyBackfill(tick, retried === 0);
   }
 
   /** Whether the set of a day is final, made by the current computation. A read that fails is logged and counted: no. */
@@ -930,16 +933,19 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
    * The days that failed on the dirty path (Ruling R-A22) and whose wait is over, tried again under the budget of the job: the
    * ones that have failed fewer times first (R87: a day that keeps failing goes behind the others), then the ones due longest.
    * A day that works is forgotten; one that fails waits twice as long, up to an hour. `except` are the days this run has just
-   * tried.
+   * tried. The first due day starts whatever is left of the budget (the floor of the run, Ruling R-A23: while today alone takes
+   * the budget, an owed day would never be tried); the others need what is left. Returns how many days it started.
    */
-  private async ammDailyRetries(tick: AggregatorTick, except: ReadonlySet<string>): Promise<void> {
+  private async ammDailyRetries(tick: AggregatorTick, except: ReadonlySet<string>): Promise<number> {
     const amm = this.ammDaily;
-    if (!amm) return;
+    if (!amm) return 0;
+    let started = 0;
     const due = [...this.ammDailyBackoff]
       .filter(([key, wait]) => wait.owed && wait.until <= this.clock() && !except.has(key))
       .sort(([, a], [, b]) => a.delayMs - b.delayMs || a.until - b.until);
     for (const [key, wait] of due) {
-      if (!this.mayStartSet(tick, 'amm_daily')) return;
+      if (started > 0 && !this.mayStartSet(tick, 'amm_daily')) return started;
+      started++;
       try {
         await this.ammDailyFns.compute(this.ch, amm.rates, new Date(`${key}T00:00:00Z`), { signal: tick.signal });
         this.ammDailyBackoff.delete(key);
@@ -953,18 +959,19 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         }
       }
     }
+    return started;
   }
 
   /**
    * The closed days that have no final set of the current `AMM_DAILY_CONFIG_VERSION`, newest first, for as long as the budget of
-   * the job and of the tick last, and at least one day at each run (the floor: today and yesterday may have used the budget up,
-   * and the back-fill would never move). A day is closed when it is before yesterday AND the ingest has passed it
+   * the job and of the tick last, and, when the retries have not started a day, at least one day at each run (the floor: today
+   * and yesterday may have used the budget up, and the back-fill would never move). A day is closed when it is before yesterday AND the ingest has passed it
    * (`closedUntil`), and the back-fill starts at the day of the first pool activity. The days that are done are found by one
    * read (`ammDaysDone`), so a day is computed once, and a new config version computes them all again. A day that fails is left
    * alone for a while (`AMM_DAILY_BACKFILL_RETRY_MS`, doubling), so that the days before it go on. It says when it starts and
    * when it is done.
    */
-  private async ammDailyBackfill(tick: AggregatorTick): Promise<void> {
+  private async ammDailyBackfill(tick: AggregatorTick, floor = true): Promise<void> {
     const amm = this.ammDaily;
     if (!amm || this.closing) return;
     const [firstActivity, newestClose] = await Promise.all([
@@ -1006,8 +1013,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         waiting++;
         continue;
       }
-      // the first day of a run is the floor: it starts whatever is left of the budget
-      if (started > 0 && !this.mayStartSet(tick, 'amm_daily')) return;
+      // the first day of a run is the floor, unless the retries have started one: it starts whatever is left of the budget
+      if ((started > 0 || !floor) && !this.mayStartSet(tick, 'amm_daily')) return;
       started++;
       try {
         await this.ammDailyFns.compute(this.ch, amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
