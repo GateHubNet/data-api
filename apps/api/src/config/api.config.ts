@@ -109,6 +109,15 @@ export class ApiConfig {
   @IntValue({ min: 1 })
   rateLimitWindow: number = 60;
 
+  /**
+   * `GH_RATE_LIMIT_KEYS`: comma separated `key=limit` pairs, each an API key from `GH_API_KEYS` with its own requests
+   * per `rateLimitWindow` in place of `rateLimit` (see `rateLimitKeysOf`). Empty, the default, changes nothing. A
+   * secret like `apiKeys`: it holds API keys, so it is never logged or echoed.
+   */
+  @ConfigValue()
+  @MaybeEmptyText()
+  rateLimitKeys: string = '';
+
   /** `GH_LIVE_CACHE_TTL_MS`: how long a live-node response (balances, orders) is cached; 0 disables the cache. */
   @ConfigValue()
   @IntValue({ min: 0 })
@@ -177,6 +186,33 @@ export function apiKeysOf(cfg: Pick<ApiConfig, 'apiKeys'>, env: NodeJS.ProcessEn
     }
   }
   return keys;
+}
+
+/**
+ * The per-key rate limits (`GH_RATE_LIMIT_KEYS`, comma separated `key=limit`): a map from API key to its requests per
+ * window. A pair splits at its last `=` (an API key may end in `=`), and the entry and both sides are trimmed. Every
+ * entry needs a non-empty key and a positive whole limit, the key has to be one of `GH_API_KEYS`, and no key is listed
+ * twice. A failure names the entry by its position (1-based), never by key: the keys are secrets, and the message ends
+ * up in the logs. Empty means no overrides; a non-empty setting without `GH_API_KEYS` throws.
+ */
+export function rateLimitKeysOf(cfg: Pick<ApiConfig, 'apiKeys' | 'rateLimitKeys'>): Map<string, number> {
+  const entries = splitList(cfg.rateLimitKeys);
+  const limits = new Map<string, number>();
+  if (entries.length === 0) return limits;
+  const known = new Set(splitList(cfg.apiKeys));
+  if (known.size === 0) throw new Error('GH_RATE_LIMIT_KEYS needs GH_API_KEYS');
+  entries.forEach((entry, index) => {
+    const at = `GH_RATE_LIMIT_KEYS entry ${index + 1}`;
+    const split = entry.lastIndexOf('=');
+    const key = split < 0 ? '' : entry.slice(0, split).trim();
+    if (key === '') throw new Error(`${at} must be key=limit`);
+    const limit = entry.slice(split + 1).trim();
+    if (!/^[1-9]\d*$/.test(limit)) throw new Error(`${at} must have a positive whole limit`);
+    if (!known.has(key)) throw new Error(`${at} names a key that is not in GH_API_KEYS`);
+    if (limits.has(key)) throw new Error(`${at} repeats a key`);
+    limits.set(key, Number(limit));
+  });
+  return limits;
 }
 
 let loading: Promise<ApiConfig> | undefined;

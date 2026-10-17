@@ -1,4 +1,4 @@
-import { ApiConfig, apiKeysOf, corsOriginOf, endpointList } from './api.config';
+import { ApiConfig, apiKeysOf, corsOriginOf, endpointList, rateLimitKeysOf } from './api.config';
 
 interface Loaded {
   cfg: ApiConfig;
@@ -52,6 +52,7 @@ describe('ApiConfig (GH_* environment)', () => {
       corsOrigins: '',
       rateLimit: 600,
       rateLimitWindow: 60,
+      rateLimitKeys: '',
       liveCacheTtlMs: 10000,
       txCacheSize: 20000,
       trustProxyHops: 1,
@@ -70,6 +71,7 @@ describe('ApiConfig (GH_* environment)', () => {
       GH_CORS_ORIGINS: 'https://app.example.com,http://localhost:3000',
       GH_RATE_LIMIT: '50',
       GH_RATE_LIMIT_WINDOW: '10',
+      GH_RATE_LIMIT_KEYS: 'a=5',
       GH_LIVE_CACHE_TTL_MS: '0',
       GH_TX_CACHE_SIZE: '0',
       GH_TRUST_PROXY_HOPS: '0',
@@ -85,6 +87,7 @@ describe('ApiConfig (GH_* environment)', () => {
       corsOrigins: 'https://app.example.com,http://localhost:3000',
       rateLimit: 50,
       rateLimitWindow: 10,
+      rateLimitKeys: 'a=5',
       liveCacheTtlMs: 0,
       txCacheSize: 0,
       trustProxyHops: 0,
@@ -243,6 +246,45 @@ describe('apiKeysOf', () => {
       expect(() => apiKeysOf({ apiKeys: '' })).toThrow('GH_API_KEYS must be set in production');
     } finally {
       process.env.NODE_ENV = saved;
+    }
+  });
+});
+
+describe('rateLimitKeysOf', () => {
+  const of = (rateLimitKeys: string, apiKeys = 'a,b,abc==') => rateLimitKeysOf({ apiKeys, rateLimitKeys });
+
+  it('is empty for an empty setting', () => expect(of('')).toEqual(new Map()));
+
+  it('parses pairs and trims', () =>
+    expect(of(' a = 5 , b=60000 ')).toEqual(
+      new Map([
+        ['a', 5],
+        ['b', 60000],
+      ]),
+    ));
+
+  it('splits at the last =', () => expect(of('abc===7')).toEqual(new Map([['abc==', 7]])));
+
+  it.each([
+    ['a', 'GH_RATE_LIMIT_KEYS entry 1 must be key=limit'],
+    ['=5', 'GH_RATE_LIMIT_KEYS entry 1 must be key=limit'],
+    ['a=5,b=0', 'GH_RATE_LIMIT_KEYS entry 2 must have a positive whole limit'],
+    ['a=-1', 'GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit'],
+    ['a=1.5', 'GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit'],
+    ['a=abc', 'GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit'],
+    ['a=5,zz=5', 'GH_RATE_LIMIT_KEYS entry 2 names a key that is not in GH_API_KEYS'],
+    ['a=5,a=6', 'GH_RATE_LIMIT_KEYS entry 2 repeats a key'],
+  ])('rejects %s', (value, message) => expect(() => of(value)).toThrow(message));
+
+  it('needs GH_API_KEYS', () => expect(() => of('a=5', '')).toThrow('GH_RATE_LIMIT_KEYS needs GH_API_KEYS'));
+
+  it('never puts a key in a message', () => {
+    for (const v of ['secret-key', 'secret-key=0', 'secret-key=5']) {
+      try {
+        of(v, 'other');
+      } catch (e) {
+        expect((e as Error).message).not.toContain('secret-key');
+      }
     }
   });
 });
