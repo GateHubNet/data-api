@@ -93,6 +93,12 @@ address.
 
 - **Default:** 600 requests per 60 s per client address **and route** (`GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`). Everything except
   `/liveliness/*` is limited (the check is case-insensitive: Express routes ignore case, so `/V2/...` is limited too).
+- **Per key:** a key listed in `GH_RATE_LIMIT_KEYS` (`key=limit` pairs, for a trusted server-side client whose requests share
+  addresses) is counted per key and route, with its own limit, instead of per client address; the 429 answer is unchanged and
+  `X-RateLimit-Limit` shows the key's limit. Like the default, it is counted per replica (see the caveat below). The tracker is `key:`
+  and the first 16 hex digits of the key's SHA-256, so the key itself is never stored. Every listed key must also be in
+  `GH_API_KEYS`; a malformed pair, a limit that is not a positive whole number, a repeated key, or a setting without `GH_API_KEYS`
+  fails the boot, with a message that names the entry by position, never the key. The setting holds API keys: treat it as a secret.
 - **Response:** 429 `{"error":"Rate limit exceeded, retry in N.NNsec"}` with `Retry-After` and `X-RateLimit-*` headers, the wording of
   the original service.
 - **Honest caveat:** the store is in memory, per replica, so with N replicas behind the proxy the effective limit is up to N x the
