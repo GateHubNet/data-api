@@ -263,6 +263,9 @@ describe('rateLimitKeysOf', () => {
       ]),
     ));
 
+  it('accepts the largest safe integer', () =>
+    expect(of('a=9007199254740991')).toEqual(new Map([['a', Number.MAX_SAFE_INTEGER]])));
+
   it('splits at the last =', () => expect(of('abc===7')).toEqual(new Map([['abc==', 7]])));
 
   it.each([
@@ -274,7 +277,12 @@ describe('rateLimitKeysOf', () => {
     ['a=abc', 'GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit'],
     ['a=5,zz=5', 'GH_RATE_LIMIT_KEYS entry 2 names a key that is not in GH_API_KEYS'],
     ['a=5,a=6', 'GH_RATE_LIMIT_KEYS entry 2 repeats a key'],
+    ['a=9007199254740992', 'GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit'],
+    ['a=9999999999999999', 'GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit'],
   ])('rejects %s', (value, message) => expect(() => of(value)).toThrow(message));
+
+  it('rejects a limit of 309 digits (it reads as Infinity)', () =>
+    expect(() => of(`a=${'9'.repeat(309)}`)).toThrow('GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit'));
 
   it('needs GH_API_KEYS', () => expect(() => of('a=5', '')).toThrow('GH_RATE_LIMIT_KEYS needs GH_API_KEYS'));
 

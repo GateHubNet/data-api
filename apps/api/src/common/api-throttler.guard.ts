@@ -62,6 +62,8 @@ export class ApiThrottlerGuard extends ThrottlerGuard {
     getTracker: ThrottlerGetTrackerFunction,
     generateKey: ThrottlerGenerateKeyFunction,
   ): Promise<boolean> {
+    // Replaces the limit of every throttler: a route-level @Throttle or a second named throttler (none exist today)
+    // would need this revisited.
     const key = presentedApiKey(context.switchToHttp().getRequest<Request>());
     const keyLimit = key === undefined ? undefined : this.keyLimits.get(key);
     return super.handleRequest(context, keyLimit ?? limit, ttl, throttler, getTracker, generateKey);

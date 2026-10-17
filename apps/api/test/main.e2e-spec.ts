@@ -155,6 +155,14 @@ describe('main.ts under the toolbox bootstrap()', () => {
     },
   );
 
+  it('refuses to boot with an invalid GH_RATE_LIMIT_KEYS, without printing the key', async () => {
+    await start({ GH_API_KEYS: 'real-key', GH_RATE_LIMIT_KEYS: 'real-key=0' });
+    const [code] = (await once(child as ChildProcess, 'exit')) as [number | null];
+    expect(code).toBe(1);
+    expect(output).toContain('GH_RATE_LIMIT_KEYS entry 1 must have a positive whole limit');
+    expect(output).not.toContain('real-key');
+  });
+
   it('boots in production with a key', async () => {
     const { base } = await start({ NODE_ENV: 'production' });
     await waitFor(

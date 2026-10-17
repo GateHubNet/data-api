@@ -23,7 +23,14 @@ import { CommonModule } from './common/common.module';
 import { MetricsInterceptor } from './common/metrics.interceptor';
 import { NotFoundModule } from './common/not-found.controller';
 import { pathDecodeErrors } from './common/path-decode-errors';
-import { ApiConfig, apiKeysOf, corsOriginOf, loadApiConfig, NETWORK_PROFILE } from './config/api.config';
+import {
+  ApiConfig,
+  apiKeysOf,
+  corsOriginOf,
+  loadApiConfig,
+  NETWORK_PROFILE,
+  rateLimitKeysOf,
+} from './config/api.config';
 import { ExchangesModule } from './exchanges/exchanges.module';
 import { RatesModule } from './exchanges/rates.module';
 import { LedgersModule } from './ledgers/ledgers.module';
@@ -42,6 +49,7 @@ import { XrplModule } from './xrpl/xrpl.module';
 async function assemble(): Promise<DynamicModule> {
   const config = await loadApiConfig();
   apiKeysOf(config); // throws now, before anything is built, when production has no key
+  rateLimitKeysOf(config); // and on an invalid GH_RATE_LIMIT_KEYS (the guard checks it again when it is built)
   const profile = getNetworkProfile(config.network);
   return CommonModule.register({ config, profile, clickHouse: clickHouseConfigFromEnv(process.env, profile) });
 }

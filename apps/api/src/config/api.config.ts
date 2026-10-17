@@ -191,7 +191,8 @@ export function apiKeysOf(cfg: Pick<ApiConfig, 'apiKeys'>, env: NodeJS.ProcessEn
 /**
  * The per-key rate limits (`GH_RATE_LIMIT_KEYS`, comma separated `key=limit`): a map from API key to its requests per
  * window. A pair splits at its last `=` (an API key may end in `=`), and the entry and both sides are trimmed. Every
- * entry needs a non-empty key and a positive whole limit, the key has to be one of `GH_API_KEYS`, and no key is listed
+ * entry needs a non-empty key and a positive whole limit (a safe integer: a larger one is no longer exact), the key has
+ * to be one of `GH_API_KEYS`, and no key is listed
  * twice. A failure names the entry by its position (1-based), never by key: the keys are secrets, and the message ends
  * up in the logs. Empty means no overrides; a non-empty setting without `GH_API_KEYS` throws.
  */
@@ -207,7 +208,9 @@ export function rateLimitKeysOf(cfg: Pick<ApiConfig, 'apiKeys' | 'rateLimitKeys'
     const key = split < 0 ? '' : entry.slice(0, split).trim();
     if (key === '') throw new Error(`${at} must be key=limit`);
     const limit = entry.slice(split + 1).trim();
-    if (!/^[1-9]\d*$/.test(limit)) throw new Error(`${at} must have a positive whole limit`);
+    if (!/^[1-9]\d*$/.test(limit) || !Number.isSafeInteger(Number(limit))) {
+      throw new Error(`${at} must have a positive whole limit`);
+    }
     if (!known.has(key)) throw new Error(`${at} names a key that is not in GH_API_KEYS`);
     if (limits.has(key)) throw new Error(`${at} repeats a key`);
     limits.set(key, Number(limit));
