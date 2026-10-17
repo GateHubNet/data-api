@@ -29,16 +29,22 @@ Every transaction is already stored and listable by type. What is missing is ded
 
 ## How AMM activity looks on the ledger
 
-The facts below were checked on recorded mainnet ledgers in `packages/shared/test/fixtures/xrpl/recorded`.
+The facts below were checked on recorded mainnet ledgers in `packages/shared/test/fixtures/xrpl/amm` (README section "XRPL AMM cases", which has the counts).
 
-- **The pool account.** Every pool has a pseudo-account: an `AccountRoot` whose fields include `AMMID`. It holds the pool's XRP in its `Balance`. It holds IOU reserves on trust lines with each issuer. It issues the LP token, whose currency is a 40-hex code starting with `03`.
+- **The pool account.** Every pool has a pseudo-account: an `AccountRoot` whose fields include `AMMID`. It holds the pool's XRP in its `Balance`; an IOU/IOU pool's balance is 0. It holds IOU reserves on trust lines with each issuer. Those lines carry `lsfAMMNode` (0x01000000) and the reserve bit of the pool's side (`lsfLowReserve` 0x10000 when the pool is the low account, `lsfHighReserve` 0x20000 when it is the high one). It issues the LP token, whose currency is a 40-hex code starting with `03`; the holders' LP-token lines have no `lsfAMMNode`.
 - **The `AMM` object** holds the pool's settings, not its reserves:
   - `Account` (the pool account), `Asset` and `Asset2`;
   - `LPTokenBalance` (the LP-token supply);
   - `TradingFee`, in units of 1/100000;
   - `VoteSlots` and `AuctionSlot` (`Account`, `Price`, `DiscountedFee`, `Expiration`, `AuthAccounts`).
-- **A swap** is a `Payment` or `OfferCreate` whose path goes through the pool. Its metadata changes the pool account's `AccountRoot` and/or its trust lines. The `AMM` object is not touched. In the recorded sample the pool's `AccountRoot` was present in all 14 swap cases. One path can cross several pools, in which case each pool appears with its own nodes.
-- **Deposits, withdrawals, votes, bids, create, delete and clawback** modify the `AMM` object, so its `Account` names the pool. One recorded `AMMWithdraw` changed a pool trust line without the pool `AccountRoot` being in the metadata.
+- **A swap** is a `Payment` or `OfferCreate` whose path goes through the pool. Its metadata changes the pool account's `AccountRoot` and/or its trust lines. The `AMM` object is not touched. How the pool shows depends on its assets:
+  - an XRP/IOU pool shows its `AccountRoot` (its XRP moved) and its one `lsfAMMNode` trust line, in every swap seen;
+  - an IOU/IOU pool shows neither its `AccountRoot` nor its `AMM` node, only its two `lsfAMMNode` trust lines (all 1,852 swaps of the RLUSD/USDC pool).
+
+  One path can cross several pools, in which case each pool appears with its own nodes.
+- **Deposits, withdrawals, votes, bids, create, delete and clawback** modify the `AMM` object, so its `Account` names the pool. An IOU/IOU pool's deposits and withdrawals don't show its `AccountRoot`; single-asset XRP ones show no pool trust line; a vote shows only the pool's `AMM` node. The transaction's `Asset`/`Asset2` order is not the canonical pair order.
+- **Created and deleted nodes.** `NewFields` leave out fields at their default: the `AMM` node of a new XRP/IOU pool has no `Asset` (XRP is the default). A field at its default is also left out of a stored entry: vote entries for a fee of 0 have no `TradingFee`. A pool trust line removed by a withdraw-all is a `DeletedNode` whose `Flags` no longer have the reserve bit (its `PreviousFields.Flags` still do).
+- **An LP-token transfer** between holders shows only the two holders' LP-token lines, with the pool as issuer.
 
 ## 1. Storage
 
@@ -55,7 +61,7 @@ Tables written by ingest are **ledger tables**. They join the set that `LedgerWr
 
 - `exchanges` and `account_exchanges`: add `amm_account String` (empty for order-book trades).
   - In an AMM row, `provider` is the pool account and `offer_sequence` is 0.
-  - `node_index` is the index, in `AffectedNodes`, of the pool account's `AccountRoot` node. If that node is absent, it is the pool's first trust-line node. This keeps the key unique, and order-book rows never use those nodes.
+  - `node_index` is the index, in `AffectedNodes`, of the pool account's `AccountRoot` node. If that node is absent, it is the pool's first reserve line (an `lsfAMMNode` trust line, section 2.1). This keeps the key unique, and order-book rows never use those nodes.
 
 **New ledger tables**
 
@@ -81,32 +87,40 @@ Tables written by ingest are **ledger tables**. They join the set that `LedgerWr
 
 A new pure parser, `packages/shared/src/parsers/amm.parser.ts`, plugs into `buildLedgerRows` next to the existing ones. It follows the same rules: deep-frozen input, `ParseContext`, and a successful (`tes*`) transaction only.
 
-1. **Pools in a transaction.** The pools are the `Account` of every `AccountRoot` node with `AMMID`, plus the `Account` of every `AMM` node (created, modified or deleted). A pool trust line is a `RippleState` whose high or low limit issuer is one of those accounts. The parser does not keep state across ledgers.
-2. **Pool deltas.** For each pool, take the change in each asset it holds from Previous to Final fields:
-   - XRP from `AccountRoot.Balance`, in drops;
-   - an IOU from the trust line with its issuer, from the pool's side, which means flipping the sign when the pool is the high account.
+1. **Pools in a transaction** (amended by ruling R-A6). The pools are:
+   - the `Account` of every `AccountRoot` node with `AMMID`;
+   - the `Account` of every `AMM` node (created, modified or deleted);
+   - for every `RippleState` node with `lsfAMMNode` (0x01000000), the side that holds the reserve: `LowLimit.issuer` for `lsfLowReserve` (0x10000), `HighLimit.issuer` for `lsfHighReserve` (0x20000). A line with neither bit (a deleted line) or both belongs to whichever of its two sides is a pool named by an `AccountRoot` or `AMM` node of the same transaction. A line for which that is not exactly one side names no pool and counts as unclassified (2.3).
 
-   LP-token trust lines, where the pool is the issuer and the currency starts with `03`, are excluded from reserves. They are used for LP deltas.
+   These `lsfAMMNode` lines are the pool's **reserve lines**. A trust line without `lsfAMMNode`, such as an LP-token line the pool issues, belongs to no pool: an LP-token transfer touches none and gives no rows. Nodes without `NewFields` or `FinalFields` are skipped. The parser does not keep state across ledgers.
+2. **Pool deltas and pair.** For each pool, take the change in each asset it holds, from `PreviousFields` to `FinalFields` (from nothing to `NewFields` for a created node; a field absent from `PreviousFields` did not change):
+   - XRP from `AccountRoot.Balance`, in drops, turned into whole XRP the way order-book rows are;
+   - an IOU from the reserve line with its issuer, from the pool's side, which means flipping the sign when the pool is the high account.
+
+   An asset with no node in the metadata has a delta of 0 and no known reserve. LP amounts come from `LPTokenBalance` (2.4), not from trust lines. The pool's pair is `Asset` and `Asset2` of its `AMM` node when that is present, a missing asset being XRP. Otherwise it is the assets of its reserve lines, plus XRP when its `AccountRoot` shows a non-zero balance before or after. Base and counter follow `canonicalPair`. A pool whose pair this does not give as exactly two assets gets no rows and counts as unclassified.
 3. **Swaps.** In a `Payment` or `OfferCreate`, a pool whose two non-LP deltas have opposite signs is a swap: one asset in, the other out.
    - It becomes one `exchanges` row in the canonical pair order of the existing exchange parser, with amounts equal to the absolute deltas.
-   - `rate` uses the same formula and string rules as the order-book rows: counter over base, exact text.
+   - `rate` uses the same formula and string rules as the order-book rows: counter over base, exact text. It is what `ExchangeParser` gives for an offer owned by the pool with these amounts: the quality is what the pool received over what it paid, in whole units, and it is inverted when base is what the pool received.
    - `taker` is the transaction `Account`. If base flowed out of the pool, `buyer` is the taker and `seller` is the pool; otherwise the reverse.
+   - `node_index` is the index of the pool's `AccountRoot` node, or of its first reserve line when that is absent (section 1).
    - `provider` and `amm_account` are the pool, and `offer_sequence` is 0.
    - `tx_type`, `client` and the autobridged fields follow the existing rules. An `OfferCreate` crossing books through XRP is autobridged whether a leg was an offer or a pool.
-   - A pool whose deltas don't form exactly one in and one out in a `Payment` or `OfferCreate` writes a state row but no swap. It is also counted in a Prometheus counter, `syncer_amm_unclassified_total`.
+   - A pool whose deltas don't form exactly one in and one out in a `Payment` or `OfferCreate` writes a state row but no swap. It is also counted in a Prometheus counter, `syncer_amm_unclassified_total`. The count takes every pool of a transaction that gets no swap, liquidity event or governance row, plus the pools and reserve lines of 2.1 and 2.2 that give no rows at all.
 4. **Liquidity events.** These come from `AMMCreate`, `AMMDeposit`, `AMMWithdraw`, `AMMClawback` and `AMMDelete`:
    - Amounts are the pool deltas.
    - `lp_tokens` is the change in `LPTokenBalance` on the `AMM` node: the `NewFields` value for a create, and the full previous balance, negated, when the node is deleted.
    - `account` is the transaction `Account`, except for `AMMClawback`, where it is the `Holder` and `initiator` is the issuer.
-   - `mode` is derived from the transaction flags.
+   - `mode` is derived from the transaction flags of an `AMMDeposit` or `AMMWithdraw`: the one mode flag set. Create, delete and clawback have no mode, and neither has a transaction with no mode flag or several.
    - A withdrawal that empties the pool deletes the `AMM` node. It writes a `withdraw` event, and the state row is marked `deleted`.
 5. **Governance.**
-   - An `AMMVote` row records the voter, `FeeVal` and the resulting `TradingFee`.
-   - An `AMMBid` row records the bidder, `BidMin` and `BidMax`, and `price_paid` (the LP tokens the bid burned, from the change in `LPTokenBalance`). It also records the new `AuctionSlot` fields.
+   - An `AMMVote` row records the voter, the transaction's `TradingFee` and the resulting `TradingFee` of the `AMM` node.
+   - An `AMMBid` row records the bidder, `BidMin` and `BidMax`, and `price_paid` (the LP tokens the bid burned, from the change in `LPTokenBalance`). It also records the new `AuctionSlot` fields; `auth_accounts` is empty when the slot has none.
 6. **State rows.** Every pool touched by a transaction gets one `amm_pool_states` row:
-   - The reserves come from the nodes present.
-   - `lp_supply`, `trading_fee` and the auction fields come from the `AMM` node, when it is in the metadata.
+   - The reserves come from the nodes present: the balance after the transaction, in whole units.
+   - `lp_supply`, `trading_fee` and the auction fields come from the `AMM` node, when it is in the metadata. A missing `TradingFee` or `DiscountedFee` is 0.
+   - `deleted` is set when the `AMM` node or the pool `AccountRoot` is deleted; `lp_supply` is then 0.
    - Anything the transaction did not touch is left null.
+   - Rows come in the order of each pool's first node in `AffectedNodes`.
 7. **Balance changes.** Nothing changes in `balance_changes`. Pool accounts are already treated as ordinary accounts there (ruling R14).
 
 The parser version is bumped (`ledgers.parser_version`) so that `--reprocess` over existing ranges is needed and visible.

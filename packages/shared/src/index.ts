@@ -15,6 +15,7 @@ export * from './parsers/balance-changes.parser';
 export * from './parsers/accounts-created.parser';
 export * from './parsers/affected-accounts.parser';
 export * from './parsers/from-client.parser';
+export * from './parsers/amm.parser';
 
 // Network
 export * from './network';
