@@ -32,7 +32,7 @@ deployment per network.
 | [ADRs](adr/README.md) | Architecture Decision Records: the *why* behind the big choices ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md): AMM data and swaps as exchanges) |
 | [OpenAPI spec](openapi.yaml) | Generated from the running app (also served at `/internal/docs-json`) |
 | [Design spec](superpowers/specs/2026-10-15-ripple-dropin-design.md), [plan](superpowers/plans/2026-10-15-ripple-dropin.md) | The intent and the implementation plan of the Ripple drop-in work (the spec has an "As built" errata on top) |
-| [AMM design spec](superpowers/specs/2026-10-17-amm-data-design.md), [plan](superpowers/plans/2026-10-17-amm-data.md), [roadmap](superpowers/specs/2026-10-17-amendments-roadmap.md) | The intent and the plan of the AMM data work, and the program of the post-2021 amendments it is the first family of |
+| [AMM design spec](superpowers/specs/2026-10-17-amm-data-design.md), [plan](superpowers/plans/2026-10-17-amm-data.md), [rulings](superpowers/plans/2026-10-17-amm-data.rulings.md), [verification](superpowers/plans/2026-10-17-amm-data.verification.md), [roadmap](superpowers/specs/2026-10-17-amendments-roadmap.md) | The intent and the plan of the AMM data work, and the program of the post-2021 amendments it is the first family of |
 
 ## The system in one paragraph
 
