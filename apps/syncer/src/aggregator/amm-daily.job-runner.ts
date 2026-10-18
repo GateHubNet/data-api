@@ -161,6 +161,8 @@ export class AmmDailyJobRunner {
       .filter(([key, wait]) => wait.owed && wait.until <= this.ctx.clock() && !except.has(key))
       .sort(([, a], [, b]) => a.delayMs - b.delayMs || a.until - b.until);
     for (const [key, wait] of due) {
+      // the floor starts whatever is left of the budget, not after the shutdown began
+      if (this.ctx.closing()) return started;
       if (started > 0 && !this.ctx.mayStartSet(tick, 'amm_daily')) return started;
       started++;
       try {
@@ -233,7 +235,9 @@ export class AmmDailyJobRunner {
         waiting++;
         continue;
       }
-      // the first day of a run is the floor, unless the retries have started one: it starts whatever is left of the budget
+      // the first day of a run is the floor, unless the retries have started one: it starts whatever is left of the budget,
+      // and not after the shutdown began (which may have come during the reads above)
+      if (this.ctx.closing()) return;
       if ((started > 0 || !floor) && !this.ctx.mayStartSet(tick, 'amm_daily')) return;
       started++;
       try {

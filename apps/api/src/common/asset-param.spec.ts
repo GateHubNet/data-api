@@ -1,12 +1,5 @@
 import { Asset } from '@gatehub/data-api-shared';
-import {
-  assetFromParts,
-  assetOfColumns,
-  parseAsset,
-  parseAssetFilter,
-  parseAssetPair,
-  splitAsset,
-} from './asset-param';
+import { assetFromParts, parseAsset, parseAssetFilter, parseAssetPair, splitAsset } from './asset-param';
 import { RippleHttpError } from './errors';
 
 const BITSTAMP = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
@@ -207,13 +200,4 @@ describe('assetFromParts', () => {
       expect(badRequestMessage(() => assetFromParts(currency, issuer, native, defaultNative))).toBe(message);
     },
   );
-});
-
-describe('assetOfColumns', () => {
-  it('is the currency and its issuer, and no issuer key for the native currency (stored as an empty issuer)', () => {
-    expect(assetOfColumns('USD', BITSTAMP)).toEqual({ currency: 'USD', issuer: BITSTAMP });
-    const native = assetOfColumns('XRP', '');
-    expect(native).toEqual({ currency: 'XRP' });
-    expect(Object.keys(native)).toEqual(['currency']);
-  });
 });

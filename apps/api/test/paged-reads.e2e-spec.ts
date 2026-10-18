@@ -716,6 +716,16 @@ describe('amm=only reads the granules that hold swaps, not the range (read_rows 
       expect([exchanges.length, exchanges.every((e) => e.amm_account === POOL)]).toEqual([SWAPS, true]);
     });
 
+    it('/v2/exchanges?amm=only: the plan of that read uses the skip index (the granules of the swaps of the range)', async () => {
+      const path = `/v2/exchanges?amm=only&limit=200&${direction}`;
+      const { statements } = await served(Table.Exchanges, path);
+      expect(statements).toHaveLength(1);
+      const [sql, params] = statements[0];
+      const index = await skipIndexOf(sql, params);
+      expect(index.selected).toBeLessThanOrEqual(holding[Table.Exchanges]);
+      expect(index.total).toBeGreaterThan(SEEDED_BOOK / granule[Table.Exchanges]);
+    });
+
     it('/v2/accounts/:address/exchanges?amm=only: the swaps, bounded, with and without a pair filter', async () => {
       for (const filter of ['', `/${pair.base_currency}`]) {
         const path = `/v2/accounts/${account}/exchanges${filter}?amm=only&limit=200&${direction}`;
@@ -756,6 +766,24 @@ describe('amm=only reads the granules that hold swaps, not the range (read_rows 
         expect([table, total(excluded) <= total(unfiltered)]).toEqual([table, true]);
       }
     });
+  });
+
+  it('/v2/exchanges?amm=only without the skip index costs the range too: its bound is the index at work (control)', async () => {
+    const path = '/v2/exchanges?amm=only&limit=200';
+    const { statements } = await served(Table.Exchanges, path);
+    expect(statements).toHaveLength(1);
+    const [sql, params] = statements[0];
+    const reads = await readsOf(h, Table.Exchanges, async () => {
+      const rows = await h.ch.query(sql, params, { use_skip_indexes: 0 });
+      expect(rows.length).toBeGreaterThanOrEqual(SWAPS);
+    });
+    expect(reads).toHaveLength(1);
+    expect(reads[0].read_rows).toBeGreaterThanOrEqual(SEEDED_BOOK);
+    expect(reads[0].read_rows).toBeGreaterThan(boundOf(Table.Exchanges));
+    const [{ read_rows }] = await readsOf(h, Table.Exchanges, async () => {
+      await h.ch.query(sql, params);
+    });
+    expect(read_rows).toBeLessThanOrEqual(boundOf(Table.Exchanges));
   });
 
   it('without the skip index the same read costs the range: the bound is the index at work (control)', async () => {

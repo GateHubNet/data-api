@@ -69,7 +69,7 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   divide 1,000,000: 500, 250, 100, ...) if memory is tight.
 - Budget disk for `transactions` (`tx_json` and `meta_json` are ZSTD-compressed text and by far the largest columns): roughly
   1-1.5 TB compressed for full XRPL history.
-- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written`) and, in ClickHouse,
+- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools`) and, in ClickHouse,
   `SELECT count(), max(ledger_index) FROM xrpl.ledgers`. The aggregator follows by itself (see below).
 
 ### Resuming, gap repair, reprocessing
@@ -176,8 +176,8 @@ again, however long the chunk takes in all. What keeps it moving:
 
 - `--concurrency 1`: Xahau ledgers are about 260 KB, and `wss://xahau.network` throttles even one fetch at a time (the live
   re-check of Task 38 saw 2 to 3 ledgers per 10-second window at concurrency 1); more in flight only meets the pauses sooner and
-  spends the quota on fetches that are refused. On XRPL's public nodes 2 is fine (`wss://s2.ripple.com` did not throttle a first
-  sync at 2).
+  spends the quota on fetches that are refused. On XRPL's public nodes use 1 as well: `wss://s2.ripple.com` throttled at 2 in flight
+  (2026-10-18); 1 in flight at about 1.5 requests a second or less, or your own node.
 - `--chunk 100`: a chunk is written only once all of its ledgers are in, and a chunk that fails (a ledger the node lacks, or a
   pause longer than `--max-wait`) is redone by the next run; a small chunk keeps both the memory and that redo cheap.
 - `--max-wait` longer than the pauses the node asks for. The 10-second quota asks for seconds. The hourly quota asked for about

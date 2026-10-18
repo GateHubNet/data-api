@@ -1309,6 +1309,37 @@ describe('AggregatorService amm_daily job', () => {
       expect(logger.error).not.toHaveBeenCalled();
     });
 
+    it('the floor day of the back-fill does not start once the shutdown has begun (parked 7)', async () => {
+      const svc = service();
+      // the shutdown begins while the back-fill reads where to start
+      firstDay.mockImplementation(async () => {
+        void svc.stop();
+        return FIRST_ACTIVITY;
+      });
+      await svc.tick();
+      expect(computed().filter(isClosed)).toEqual([]);
+      expect(logger.log).not.toHaveBeenCalledWith(expect.stringContaining('Dropped'));
+    });
+
+    it('nor does the first owed day, when the shutdown began during the days before it (parked 7)', async () => {
+      // 2026-05-02 fails on the dirty path at the first tick, and is due five minutes later
+      ch.dirty = [mark('2026-05-02T00:00:00Z', '2026-05-02T03:00:00Z')];
+      failing.add('2026-05-02');
+      const svc = service({ ammDailyEveryTicks: 1 });
+      await svc.tick();
+      failing.clear();
+      jest.setSystemTime(NOW_SECONDS * 1000 + AMM_DAILY_BACKFILL_RETRY_MS);
+      // the shutdown begins during today's set
+      compute.mockImplementation(async (_ch: unknown, _rates: unknown, d: Date) => {
+        events.push(`amm_daily ${day(d)}`);
+        void svc.stop();
+        return 0;
+      });
+      events.length = 0;
+      await svc.tick();
+      expect(computed()).toEqual(['2026-10-16']);
+    });
+
     it('a day that was aborted at shutdown is neither an error nor counted', async () => {
       const svc = service();
       compute.mockImplementation(async () => {

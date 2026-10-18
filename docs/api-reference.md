@@ -698,7 +698,7 @@ kinds (default), the order-book trades, or the swaps (see [Exchanges](#exchanges
 inverted (as in `/v2/exchanges`) so that the asset asked for as `base` is the base of what is served.
 
 Parameters as the account lists (`limit` 200, max 1000) and `amm`; `format=csv`: file `<address> - exchanges[ - BASE[-COUNTER]].csv`, the 20
-columns of `/v2/exchanges` plus, after them, a `client` column when a row of the page has a client and an `amm_account` column when a row of the page is a swap.
+columns of `/v2/exchanges` plus, after them, a `client` column when a row of the page has a client and an `amm_account` column when a row of the page is a swap, in that order whichever row comes first (an empty cell in the rows without one).
 Errors, in order: 400 `invalid base issuer address`,
 `invalid counter issuer address`, `invalid start date format`, `invalid end date format`, `invalid amm filter - use: include, exclude, only`,
 `invalid marker`; 500 `unable to
@@ -1072,7 +1072,7 @@ rules for the objects, whose shape and key order are ours (Ruling R-A24) and are
 - **Carried forward.** A pool's state after a transaction holds only the values that transaction's metadata carried (a swap through an
   XRP/IOU pool says nothing of the LP supply, a vote nothing of the reserves). Every value served for a pool or a state is the newest known
   value up to that point. The `*_est` fields are estimates.
-- **The CSV** of every list has the same columns on every page (`null` is an empty cell, the slot is always its four columns,
+- **The CSV** of every list has the same columns on every non-empty page (an empty page is a zero-length body; `null` is an empty cell, the slot is always its four columns,
   `auction_slot.holder`, `auction_slot.price`, ...), in the order of the keys below.
 - **Dates and ledgers.** `start` is inclusive, `end` inclusive at its precision, as everywhere; the lists are in the order of the ledgers
   (`descending` reverses it) and read the committed ledgers only.
@@ -1196,7 +1196,7 @@ the day it falls in. The days are the ones the aggregator has computed (today is
 **Empty and 404.** A page with no rows is 200 with an empty list when the pool has a state in a committed ledger (a pool with states but
 no day yet answers an empty `days`), and 404 `pool not found` when it has none.
 
-CSV: the same columns on every page, in the order of the keys, the slot as `auction_slot.holder, auction_slot.price,
+CSV: the same columns on every non-empty page, in the order of the keys, the slot as `auction_slot.holder, auction_slot.price,
 auction_slot.discounted_fee, auction_slot.expiration`; with `interval=day` the PoolDay columns.
 
 Errors, in the order they are checked: 400 `invalid pool`, `invalid start date format`, `invalid end date format`, `invalid interval`,

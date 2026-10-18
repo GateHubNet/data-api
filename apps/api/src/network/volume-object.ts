@@ -1,6 +1,6 @@
 import type { Asset, VolumeMetric } from '@gatehub/data-api-shared';
+import { assetOfColumns } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
-import { assetOfColumns } from '../common/asset-param';
 import { fmtTime, precision8 } from '../common/format';
 
 /**

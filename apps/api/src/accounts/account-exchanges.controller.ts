@@ -8,7 +8,7 @@ import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { setLinkHeader } from '../common/pagination';
 import { ammFilter, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
-import { AccountExchangeObject, toAccountCsvRow } from './account-exchange-object';
+import { AccountCsvRow, AccountExchangeObject, toAccountCsvRows } from './account-exchange-object';
 import { AccountExchangesService } from './account-exchanges.service';
 import { accountWindow } from './account-window';
 
@@ -16,7 +16,7 @@ interface AccountExchangesBody {
   result: 'success';
   count: number;
   marker?: string;
-  exchanges: AccountExchangeObject[] | ReturnType<typeof toAccountCsvRow>[];
+  exchanges: AccountExchangeObject[] | AccountCsvRow[];
 }
 
 /**
@@ -105,7 +105,7 @@ export class AccountExchangesController {
       result: 'success',
       count: page.exchanges.length,
       marker: page.marker,
-      exchanges: wantsCsv(query) ? page.exchanges.map(toAccountCsvRow) : page.exchanges,
+      exchanges: wantsCsv(query) ? toAccountCsvRows(page.exchanges) : page.exchanges,
     };
   }
 }

@@ -1085,6 +1085,20 @@ describe('the amm_pools job (e2e)', () => {
         expect(await poolsChangedSince(ch, 50, 2)).toEqual({ accounts: [1, 2, 3, 4, 5].map(acct), upTo: 100 });
       });
 
+      it('a tie of more than the limit above the head is not reported: nothing up to the head, the cursor at the head (parked 5)', async () => {
+        const ch = await fresh();
+        // ledger 100 is committed and touched no pool; ledger 101 is being written, with more pools than the limit
+        await ch.insert(Table.Ledgers, [ledgerRow(100, T0 + 100)]);
+        await insertUncommitted(
+          ch,
+          [6, 7, 8].map((n) => state({ amm_account: acct(n), ledger_index: 101 })),
+        );
+        expect(await poolsChangedSince(ch, 50, 2)).toEqual({ accounts: [], upTo: 100 });
+        // once 101 is committed its pools come, all of them (more than the limit, in one ledger)
+        await ch.insert(Table.Ledgers, [ledgerRow(101, T0 + 101)]);
+        expect(await poolsChangedSince(ch, 100, 2)).toEqual({ accounts: [6, 7, 8].map(acct), upTo: 101 });
+      });
+
       it('has no pool to report while no ledger is committed', async () => {
         const ch = await fresh();
         await insertUncommitted(ch, [state({ amm_account: acct(1), ledger_index: 100 })]);

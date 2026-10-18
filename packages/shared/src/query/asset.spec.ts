@@ -1,4 +1,4 @@
-import { Asset, assetKey, canonicalPair } from './asset';
+import { Asset, assetKey, assetOfColumns, canonicalPair } from './asset';
 
 const BITSTAMP = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 const GATEHUB = 'rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq';
@@ -77,5 +77,15 @@ describe('canonicalPair', () => {
     expect(r.counter).toBe(base);
     expect(base).toEqual(XRP);
     expect(counter).toEqual(USD);
+  });
+});
+
+describe('assetOfColumns', () => {
+  it('is the currency and its issuer, and no issuer key for the native currency (stored as an empty issuer)', () => {
+    const ISSUER = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
+    expect(assetOfColumns('USD', ISSUER)).toEqual({ currency: 'USD', issuer: ISSUER });
+    const native = assetOfColumns('XRP', '');
+    expect(native).toEqual({ currency: 'XRP' });
+    expect(Object.keys(native)).toEqual(['currency']);
   });
 });

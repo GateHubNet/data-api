@@ -1040,9 +1040,12 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
         expect([limit, await count(limit)]).toEqual([limit, all]);
       }
       expect(((await get(`/v2/amm/pools/${BUSY}/history`)).body as HistoryBody).count).toBe(all);
-      // the days take the same limit: this pool has days, and the first page holds exactly one
+      // the days take the same limit: this pool has days, and the first page holds exactly one (the days of the pool are those of
+      // the set of each day: the version of the sentinel of the day)
       const days = await h.ch.query<{ day: string }>(
-        `SELECT DISTINCT day FROM ${Table.AmmDaily} WHERE amm_account = {pool:String}`,
+        `SELECT DISTINCT day FROM ${Table.AmmDaily}
+          WHERE amm_account = {pool:String}
+            AND (day, version) IN (SELECT day, max(version) FROM ${Table.AmmDaily} WHERE amm_account = '' GROUP BY day)`,
         { pool: BUSY },
       );
       expect(days.length).toBeGreaterThanOrEqual(1);
@@ -1904,9 +1907,9 @@ describe('the pool history over states made by hand', () => {
       expect(await viaApi(Z, `&end=${encodeURIComponent(end)}`)).toEqual(carried(rows).slice(0, 5).map(stateOf));
     });
 
-    /** The reads of the fill-forward of a request: the window of the state before the page, and the steps back from it. */
     /** The first window of the carry-in: 2048 ledgers (`AMM_HISTORY_CARRY_LEDGERS`, written out here to pin it). */
     const WINDOW = 2048;
+    /** The reads of the fill-forward of a request: the window of the state before the page, and the steps back from it. */
     const fillReads = (spy: jest.SpyInstance): Array<{ from: number; upTo: number }> =>
       spy.mock.calls
         .filter(([sql]) => String(sql).includes('argMaxIf(reserve_base'))

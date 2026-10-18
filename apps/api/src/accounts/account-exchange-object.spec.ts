@@ -3,6 +3,7 @@ import {
   ACCOUNT_EXCHANGE_COLUMNS,
   StoredAccountExchange,
   toAccountCsvRow,
+  toAccountCsvRows,
   toAccountExchangeObject,
 } from './account-exchange-object';
 
@@ -166,5 +167,42 @@ describe('toAccountCsvRow', () => {
     const row = toAccountCsvRow(toAccountExchangeObject({ ...STORED, client: 'rt1.2.1' }));
     expect(Object.keys(row).at(-1)).toBe('client');
     expect(row.client).toBe('rt1.2.1');
+  });
+});
+
+describe('toAccountCsvRows: the rows of a page', () => {
+  const POOL = 'rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3';
+  const swap = toAccountExchangeObject({ ...STORED, amm_account: POOL });
+  const client = toAccountExchangeObject({ ...STORED, tx_index: 13, client: 'rt1.2.1' });
+  const plain = toAccountExchangeObject({ ...STORED, tx_index: 14 });
+  const base = Object.keys(toCsvRow(toExchangeObject(STORED as StoredExchange)));
+
+  it('has the same columns on every row, client then amm_account, whichever row comes first (an empty cell where none)', () => {
+    // a CSV takes its columns from the keys in the order they first appear: a swap first would put amm_account before client
+    for (const page of [
+      [swap, client, plain],
+      [client, swap, plain],
+      [plain, swap, client],
+    ]) {
+      const rows = toAccountCsvRows(page);
+      for (const row of rows) expect(Object.keys(row)).toEqual([...base, 'client', 'amm_account']);
+      expect(rows).toHaveLength(3);
+      expect(rows[page.indexOf(swap)]).toMatchObject({ client: null, amm_account: POOL });
+      expect(rows[page.indexOf(client)]).toMatchObject({ client: 'rt1.2.1', amm_account: null });
+      expect(rows[page.indexOf(plain)]).toMatchObject({ client: null, amm_account: null });
+    }
+  });
+
+  it('adds a column only when a row of the page has it', () => {
+    expect(toAccountCsvRows([plain]).map(Object.keys)).toEqual([base]);
+    expect(toAccountCsvRows([plain, client]).map(Object.keys)).toEqual([
+      [...base, 'client'],
+      [...base, 'client'],
+    ]);
+    expect(toAccountCsvRows([swap, plain]).map(Object.keys)).toEqual([
+      [...base, 'amm_account'],
+      [...base, 'amm_account'],
+    ]);
+    expect(toAccountCsvRows([])).toEqual([]);
   });
 });

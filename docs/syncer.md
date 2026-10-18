@@ -137,8 +137,8 @@ poller skips its samples (counted in `syncer_fee_stats_errors_total`), the boot 
 once (`... It rate limits this client: nothing is sent to it for 12.6 s`) and counted in
 `syncer_node_rate_limited_total{endpoint}`.
 
-The XRPL default is `wss://s2.ripple.com,wss://xrplcluster.com` (Ripple's full-history server first; it did not throttle a
-first sync at concurrency 2 in the verification run) and `GH_CATCHUP_CONCURRENCY` defaults to 4. A Xahau ledger is about 260 KB:
+The XRPL default is `wss://s2.ripple.com,wss://xrplcluster.com` (Ripple's full-history server first; it throttled at 2 in flight
+on 2026-10-18: use 1 in flight at about 1.5 requests a second or less, or your own node) and `GH_CATCHUP_CONCURRENCY` defaults to 4. A Xahau ledger is about 260 KB:
 `wss://xahau.network` throttles a catch-up even at concurrency 1 (its 50,000 units per 10 s let 2 to 3 such ledgers through), and
 the syncer waits each pause out: the catch-up is slow, it does not fail.
 
@@ -305,13 +305,14 @@ cannot lose a state after merges ([ADR-0011](adr/0011-amm-data-and-swaps-as-exch
   and `created_by`. The cursor moves past a batch
   only once it is written.
 - **A batch that fails is halved** to find the pools that fail on their own. When the budget runs out in the middle of a halving, the
-  state of it is kept and the **next tick goes on with it** (the cursor stays), instead of halving the whole batch again. At most three
-  pools of a batch may fail on their own; more than that means the cause is not the pools (the database, a limit) and the batch is the
-  failure of the job.
+  state of it is kept and the **next tick goes on with it** (the cursor stays), instead of halving the whole batch again; the failure of
+  the batch is then counted and logged at the tick it happened (`a batch of N pool(s) failed, halving it ...`), not only when the
+  halving is over. At most three pools of a batch may fail on their own; more than that means the cause is not the pools (the
+  database, a limit) and the batch is the failure of the job.
 - **Set aside, with conditions.** The pools that fail alone are set aside in memory, each counted as an error under `amm_pools` and tried
   again after 5 minutes, doubling up to an hour (the retries run at every tick, also when the live part failed), while the cursor and the
-  other pools go on. That only happens on **partial success**: if something in the batch worked, or if the very same batch comes again and
-  fails the same way (a **repeat**). A batch in which everything fails the first time is the failure of the job (counted, logged), the
+  other pools go on. That only happens on **partial success**: if something in the batch worked, or if the very same batch comes again in
+  the next run of its job (the live sweep and the dirty slices each remember their own) and fails the same way (a **repeat**). A batch in which everything fails the first time is the failure of the job (counted, logged), the
   cursor stays behind it, and the next tick tries it again. A restart forgets the set: the pool is still stale in the tables, so the new
   process finds it again.
 - **The warning.** A list that failed whole but whose halves were rebuilt, with no pool found below it (it fails for its size), is

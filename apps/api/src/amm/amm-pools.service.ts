@@ -1,5 +1,6 @@
 import {
   Asset,
+  assetOfColumns,
   canonicalPair,
   ClickHouseService,
   FilledColumn,
@@ -10,7 +11,6 @@ import {
   Table,
 } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
-import { assetOfColumns } from '../common/asset-param';
 import { notFound } from '../common/errors';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, KeyValue, paginate } from '../common/pagination';

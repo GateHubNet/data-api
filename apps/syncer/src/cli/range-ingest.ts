@@ -416,9 +416,11 @@ class RangeRunner {
       );
     }
     if (failure !== undefined) throw failure;
+    // the count of the pools it could not classify is always said, 0 too: the absence of the warning above is no proof
     this.logger.log(
       `Range [${this.from},${this.to}] ingested: ${this.chunksDone} chunks complete ` +
-        `(${this.chunksSkipped} had nothing to write), ${this.ledgersWritten} ledgers written`,
+        `(${this.chunksSkipped} had nothing to write), ${this.ledgersWritten} ledgers written, ` +
+        `${this.ammUnclassified} unclassified AMM pools`,
     );
     return { chunksDone: this.chunksDone, ledgers: this.ledgersWritten };
   }

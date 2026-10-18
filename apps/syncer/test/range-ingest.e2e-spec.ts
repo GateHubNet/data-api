@@ -777,6 +777,24 @@ describe('rangeIngest (e2e)', () => {
       expect(await unclassified(metrics)).toBe(before + 30 * UNCLASSIFIED_PER_LEDGER);
     });
 
+    it('says in its final line how many AMM pools it could not classify, 0 too (parked 21)', async () => {
+      const svc = await freshService();
+      const amm = captureLogger();
+      await rangeIngest(new TestSource(AMM_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, logger: amm });
+      const done = (lines: LogLine[]): string | undefined =>
+        lines.find((l) => l.message.includes('ingested:'))?.message;
+      expect(done(amm.lines)).toMatch(new RegExp(`, ${14 * UNCLASSIFIED_PER_LEDGER} unclassified AMM pools$`));
+      // a range without AMM activity says 0: the absence of a warning is not the proof
+      const plain = captureLogger();
+      await rangeIngest(new TestSource(CHAIN_RAW), await freshService(), ctx, {
+        from: L(1),
+        to: L(5),
+        ...FAST,
+        logger: plain,
+      });
+      expect(done(plain.lines)).toMatch(/, 0 unclassified AMM pools$/);
+    });
+
     it('counts only what it wrote: ledgers it finds committed add nothing, and a parse before a delete adds nothing', async () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx).write(AMM_RAW.slice(0, 5)); // L(1)..L(5)

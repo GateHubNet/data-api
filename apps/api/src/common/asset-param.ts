@@ -112,7 +112,3 @@ export function assetFromParts(
   requireValidIssuer(parts);
   return toAsset(parts, native);
 }
-
-/** The Asset of a pair of stored columns: the issuer of the native currency is stored as `''` and the Asset has no key for it. */
-export const assetOfColumns = (currency: string, issuer: string): Asset =>
-  issuer ? { currency, issuer } : { currency };

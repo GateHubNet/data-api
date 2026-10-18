@@ -1172,7 +1172,8 @@ describe('the positions over lines made by hand', () => {
       await api.ok(`/v2/accounts/${account}/amm_positions`);
       const stateReads = spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.AmmPoolStates}`));
       spy.mockRestore();
-      // the batches of the fill-forward (the reads by one account are the look for older rows of a pool)
+      // the batches of the fill-forward: its window, the look for the first ledgers of the pools the window left incomplete and
+      // its steps back, each over the accounts of one batch (Ruling R-A25)
       const batches = stateReads.filter(([, params]) => Array.isArray((params as Obj).accounts));
       expect(batches.length).toBeGreaterThanOrEqual(2);
       for (const [, params] of batches) {

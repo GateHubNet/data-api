@@ -453,11 +453,29 @@ describe('AggregatorService amm_pools job', () => {
         // about two recomputes for each of the log2(200) levels, two a tick
         expect(ticks).toBeLessThanOrEqual(12);
         expect(changedSince.mock.calls.filter(([, ledger]) => ledger === 500)).toHaveLength(1);
-        // every other pool was rebuilt, once, and the failing one is set aside and counted
+        // every other pool was rebuilt, once, and the failing one is set aside and counted; the failure of the batch was counted
+        // at its first tick (the halving went on over the next ones)
         expect([...done].sort()).toEqual(MANY.filter((p) => p !== 'r137'));
-        expect(errors()).toBe(1);
+        expect(errors()).toBe(2);
         expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool r137'));
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('amm_pools reached its budget'));
+      });
+
+      it('is counted and logged once, at its first tick, not only when the halving is over (parked 4)', async () => {
+        pages.set(500, { accounts: MANY, upTo: 700 });
+        failing.add('r137');
+        poolMs = 2000;
+        const svc = service();
+        await tickAt(svc, 0);
+        // the batch failed and its halving goes on at the next tick: the failure is in the metrics and the log now
+        expect(errors()).toBe(1);
+        expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+        expect(logger.error).toHaveBeenCalledWith(
+          `Aggregator job amm_pools: a batch of ${AMM_POOLS_BATCH} pool(s) failed, halving it to find the pools that fail on their own (it goes on at the next tick): DB::Exception: memory limit on pool r137`,
+        );
+        // and not again at the next ticks of the halving
+        for (let i = 1; i < 4; i++) await tickAt(svc, i);
+        expect(errors()).toBe(1);
       });
 
       it('a batch that cannot be halved to a pool because the whole database fails is dropped once four pools fail', async () => {
@@ -465,10 +483,16 @@ describe('AggregatorService amm_pools job', () => {
         for (const pool of MANY) failing.add(pool);
         poolMs = 2000;
         const svc = service();
-        for (let i = 0; i < 40 && errors() === 0; i++) await tickAt(svc, i);
-        expect(errors()).toBe(1);
-        expect(changedSince.mock.calls.map(([, ledger]) => ledger).every((ledger) => ledger === 500)).toBe(true);
+        // its failure at its first tick, and the failure of the job when it is dropped
+        let i = 0;
+        for (; i < 40 && errors() < 2; i++) await tickAt(svc, i);
+        expect(errors()).toBe(2);
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('halving it'));
+        expect(changedSince.mock.calls).toHaveLength(1);
         expect(done).toEqual([]);
+        // dropped: the next tick asks for the same pools again, from the same cursor
+        await tickAt(svc, i);
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 500]);
       });
     });
 
@@ -489,6 +513,46 @@ describe('AggregatorService amm_pools job', () => {
         expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 500, 700]);
         expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool rA'));
         expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool rB'));
+      });
+
+      it('a batch is a repeat only of the run of the job just before: an older all-failed batch is not (parked 3)', async () => {
+        failing.add('rA');
+        failing.add('rB');
+        const svc = service();
+        // tick 0: the batch fails whole, the failure of the job
+        pages.set(500, { accounts: ['rA', 'rB'], upTo: 700 });
+        await tickAt(svc, 0);
+        expect(errors()).toBe(1);
+        // tick 1: other pools first (the ledger they are at is before the batch), which work
+        pages.set(500, { accounts: ['rC'], upTo: 501 });
+        pages.set(501, { accounts: [], upTo: 501 });
+        await tickAt(svc, 1);
+        expect(errors()).toBe(1);
+        // tick 2: the batch again, failing whole again: the failure of tick 0 is two runs back, so it is no repeat, and its pools
+        // are not set aside on its word
+        pages.set(501, { accounts: ['rA', 'rB'], upTo: 700 });
+        await tickAt(svc, 2);
+        expect(errors()).toBe(2);
+        expect(logger.error).not.toHaveBeenCalledWith(expect.stringContaining('set aside'));
+        // tick 3: the same batch of the run just before: now it is a repeat, and its pools are set aside
+        await tickAt(svc, 3);
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool rA, set aside'));
+        expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('pool rB, set aside'));
+      });
+
+      it('the memory of the live batches is not that of the dirty slices: a live failure makes no slice a repeat (parked 3)', async () => {
+        failing.add('rA');
+        failing.add('rB');
+        pages.set(500, { accounts: ['rA', 'rB'], upTo: 700 });
+        // the slice of the same tick has the same pools
+        ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+        slicePools.set('2026-05-01T00:00:00Z', ['rA', 'rB']);
+        await service().tick();
+        const jobs = metrics.aggregatorErrorsTotal.inc.mock.calls.map(([labels]) => labels.job);
+        // the live batch fails whole (the job), and so does the slice's (the slice): no pool set aside on either
+        expect(jobs).toEqual(['amm_pools', 'amm_pools_dirty']);
+        expect(logger.error).not.toHaveBeenCalledWith(expect.stringContaining('set aside'));
+        expect(ch.dirty).toHaveLength(1);
       });
 
       it('when the database comes back the next tick does the batch, and nothing waits for a retry', async () => {

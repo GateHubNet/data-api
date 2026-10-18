@@ -72,9 +72,14 @@ interface AmmBatch {
   failed: AmmNode[];
   /** Whether any list of the batch was rebuilt. */
   succeeded: boolean;
-  /** Whether this is the same batch coming again after every one of its lists failed. */
+  /** Whether this is the same batch coming again after every one of its lists failed in the run of its job just before. */
   repeated: boolean;
+  /** Whether its failure has been counted and logged already (at the end of the tick of its first failure). */
+  counted?: boolean;
 }
+
+/** The two jobs that rebuild pools in batches: the live sweep, and the hook in the slices of `agg_dirty`. */
+type BatchJob = 'amm_pools' | 'amm_pools_dirty';
 
 /**
  * The `amm_pools` job of the aggregator (see `AggregatorService`, job 3), and its hook in the slices of `agg_dirty`: it rebuilds
@@ -96,8 +101,14 @@ export class AmmPoolsJobRunner {
    * stays where it was until the batch is done.
    */
   private pending?: AmmBatch;
-  /** The batches (their pools) in which every list failed, the last few: the same batch coming again is a repeat. */
-  private readonly allFailed = new Set<string>();
+  /**
+   * The batches (their pools) in which every list failed, by job: in the run in progress, and in the run just before. The same
+   * batch coming again in the next run of its job is a repeat (parked 3: a key older than that, or of the other job, is not).
+   */
+  private readonly allFailed: Record<BatchJob, { previous: Set<string>; current: Set<string> }> = {
+    amm_pools: { previous: new Set(), current: new Set() },
+    amm_pools_dirty: { previous: new Set(), current: new Set() },
+  };
 
   constructor(
     private readonly ctx: AggregatorJobContext,
@@ -113,6 +124,7 @@ export class AmmPoolsJobRunner {
    * the next tick asks for the same pools again.
    */
   async run(tick: AggregatorTick): Promise<void> {
+    this.nextRun('amm_pools');
     this.watermark ??= await this.fns.watermark(this.ctx.ch);
     let failure: { error: unknown } | undefined;
     try {
@@ -133,7 +145,7 @@ export class AmmPoolsJobRunner {
       if (!batch) {
         const { accounts, upTo } = await this.fns.changedSince(this.ctx.ch, ledger, AMM_POOLS_BATCH);
         if (this.ctx.closing()) return;
-        batch = this.newBatch(accounts, upTo);
+        batch = this.newBatch('amm_pools', accounts, upTo);
         if (!batch) {
           // nothing to rebuild up to `upTo` (no stale pool, or those waiting for a retry): the cursor goes there and that is all
           // there is when the answer has no pool; with pools set aside there may be more
@@ -160,8 +172,22 @@ export class AmmPoolsJobRunner {
     }
   }
 
+  /** A run of `job` begins: the batches that failed whole in its run before the last one are forgotten. */
+  private nextRun(job: BatchJob): void {
+    const memory = this.allFailed[job];
+    memory.previous = memory.current;
+    memory.current = new Set();
+  }
+
+  /**
+   * A run of the hook of `agg_dirty` begins (`stats_dirty` calls it at the start of each of its runs): see `allFailed`.
+   */
+  beginDirtyRun(): void {
+    this.nextRun('amm_pools_dirty');
+  }
+
   /** A batch of the pools of `accounts` that are not waiting for a retry (they are rebuilt by it); none if there are none. */
-  private newBatch(accounts: string[], upTo?: number): AmmBatch | undefined {
+  private newBatch(job: BatchJob, accounts: string[], upTo?: number): AmmBatch | undefined {
     const pools = accounts.filter((account) => !this.retry.has(account));
     if (pools.length === 0) return undefined;
     const key = pools.join(',');
@@ -172,7 +198,7 @@ export class AmmPoolsJobRunner {
       suspects: [],
       failed: [],
       succeeded: false,
-      repeated: this.allFailed.has(key),
+      repeated: this.allFailed[job].previous.has(key),
     };
   }
 
@@ -189,12 +215,18 @@ export class AmmPoolsJobRunner {
    *    whole for its size, and would otherwise leave no trace.
    *
    * With `budgeted` it stops, returning false, when the budget of the job is spent: the halving goes on at the next tick from
-   * where it stopped, with the state in the batch. A slice of `agg_dirty` is not budgeted (it is started whole). The
+   * where it stopped, with the state in the batch. A batch that has failed by then is counted and logged once, at that tick
+   * (parked 4: a halving can take many ticks, and the failure must not wait for its end to be seen); its end counts the pools it
+   * sets aside, and does not count that failure again. A slice of `agg_dirty` is not budgeted (it is started whole). The
    * shutdown stops it too, returning false.
    */
-  private async runBatch(batch: AmmBatch, tick: AggregatorTick, job: string, budgeted: boolean): Promise<boolean> {
+  private async runBatch(batch: AmmBatch, tick: AggregatorTick, job: BatchJob, budgeted: boolean): Promise<boolean> {
     while (batch.todo.length > 0) {
-      if (this.ctx.closing() || (budgeted && !this.ctx.mayStartSet(tick, 'amm_pools'))) return false;
+      if (this.ctx.closing()) return false;
+      if (budgeted && !this.ctx.mayStartSet(tick, 'amm_pools')) {
+        this.countDeferred(batch, job);
+        return false;
+      }
       const node = batch.todo[0];
       try {
         await this.fns.recompute(this.ctx.ch, this.amm.rates, node.accounts, { signal: tick.signal });
@@ -219,27 +251,36 @@ export class AmmPoolsJobRunner {
     }
 
     if (batch.suspects.length > 0 && !batch.succeeded && !batch.repeated) {
-      this.allFailed.add(batch.key);
-      // the few last batches are enough: the same one comes again at the next tick
-      for (const key of this.allFailed) if (this.allFailed.size > 16) this.allFailed.delete(key);
+      // the same batch comes again at the next run of the job: then it is a repeat
+      this.allFailed[job].current.add(batch.key);
       throw batch.failed[0].error;
     }
-    this.allFailed.delete(batch.key);
     for (const { node, error } of batch.suspects) {
       for (let up: AmmNode | undefined = node; up; up = up.parent) up.leadsToPool = true;
       const account = node.accounts[0];
       this.retry.set(account, { until: this.ctx.clock() + AMM_POOL_RETRY_MS, delayMs: AMM_POOL_RETRY_MS });
       this.ctx.failed(job, error, ` for pool ${account}, set aside to be tried again`);
     }
-    // a failure from which nothing led to a pool: the topmost of each such tree
+    // a failure from which nothing led to a pool: the topmost of each such tree (the whole batch is not counted again when its
+    // failure was counted at the tick of it)
     for (const node of batch.failed) {
       if (node.leadsToPool || (node.parent && !node.parent.leadsToPool)) continue;
-      this.ctx.metrics?.aggregatorErrorsTotal.inc({ job });
+      if (!(batch.counted && node.parent === undefined)) this.ctx.metrics?.aggregatorErrorsTotal.inc({ job });
       this.ctx.logger.warn(
         `Aggregator job ${job}: a batch of ${node.accounts.length} pool(s) failed as a whole, but its halves were rebuilt: ${describe(node.error)}`,
       );
     }
     return true;
+  }
+
+  /** Counts and logs, once, the failure of a batch whose halving goes on at the next tick. */
+  private countDeferred(batch: AmmBatch, job: BatchJob): void {
+    if (batch.counted || batch.failed.length === 0) return;
+    batch.counted = true;
+    this.ctx.metrics?.aggregatorErrorsTotal.inc({ job });
+    this.ctx.logger.error(
+      `Aggregator job ${job}: a batch of ${batch.key.split(',').length} pool(s) failed, halving it to find the pools that fail on their own (it goes on at the next tick): ${describe(batch.failed[0].error)}`,
+    );
   }
 
   /** The pools that were set aside and whose wait is over, one at a time, under the budget of the job. */
@@ -275,7 +316,7 @@ export class AmmPoolsJobRunner {
     );
     for (let i = 0; i < accounts.length; i += AMM_POOLS_BATCH) {
       if (this.ctx.closing()) return;
-      const batch = this.newBatch(accounts.slice(i, i + AMM_POOLS_BATCH));
+      const batch = this.newBatch('amm_pools_dirty', accounts.slice(i, i + AMM_POOLS_BATCH));
       if (batch) await this.runBatch(batch, tick, 'amm_pools_dirty', false);
     }
   }

@@ -276,7 +276,8 @@ export function ammVolumeOracle(markets: MarketsConfig, rows: ExchangesRow[], fr
     sums.native = sums.native.plus(p.counterVolume);
     fromPools.set(assetKey(p.base), sums);
   }
-  for (const [k, sums] of fromPools) if (!rates.has(k)) rates.set(k, new Wide(sums.base).dividedBy(sums.native));
+  // a market rate of 0 does not block the pool-derived rate (the job's rule: `?.gt(0)`, not `has`)
+  for (const [k, sums] of fromPools) if (!rates.get(k)?.gt(0)) rates.set(k, new Wide(sums.base).dividedBy(sums.native));
 
   const out: ExpectedAmm[] = [];
   for (const p of legs) {

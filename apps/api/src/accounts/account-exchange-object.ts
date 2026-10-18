@@ -89,3 +89,26 @@ export function toAccountCsvRow(exchange: AccountExchangeObject): ReturnType<typ
     ...(amm_account !== undefined && { amm_account }),
   };
 }
+
+/** A row of the CSV of a page: `toAccountCsvRow`, with `client` and `amm_account` as cells that may be empty. */
+export type AccountCsvRow = Omit<ReturnType<typeof toCsvRow>, 'amm_account'> & {
+  client?: string | null;
+  amm_account?: string | null;
+};
+
+/**
+ * The rows of the CSV of a page (`toAccountCsvRow` each), with the same columns on every row: when a row of the page has a
+ * client, every row has the `client` column, and the same for `amm_account` (an empty cell where the exchange has none). A CSV
+ * takes its columns from the keys of the rows in the order they first appear, so without it a page whose first row is a swap
+ * and a later one has a client would put `amm_account` before `client`, and another page the other way round.
+ */
+export function toAccountCsvRows(exchanges: readonly AccountExchangeObject[]): AccountCsvRow[] {
+  const rows = exchanges.map(toAccountCsvRow);
+  const withClient = rows.some((row) => row.client !== undefined);
+  const withPool = rows.some((row) => row.amm_account !== undefined);
+  return rows.map(({ client, amm_account, ...columns }) => ({
+    ...columns,
+    ...(withClient && { client: client ?? null }),
+    ...(withPool && { amm_account: amm_account ?? null }),
+  }));
+}

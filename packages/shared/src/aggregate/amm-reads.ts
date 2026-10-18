@@ -1,7 +1,7 @@
 import BigNumber from 'bignumber.js';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { Table } from '../clickhouse/tables';
-import { Asset } from '../query/asset';
+import { Asset, assetOfColumns } from '../query/asset';
 import { volumesOf, VolumeSums } from '../query/decimal';
 import { exchangeSumsSql, LedgerRange } from '../query/rates.service';
 
@@ -115,8 +115,6 @@ interface SumsRow extends VolumeSums {
   amm_account: string;
 }
 
-const assetOf = (currency: string, issuer: string): Asset => (issuer ? { currency, issuer } : { currency });
-
 /**
  * The volume of the swaps of every pool in a range of ledgers (the committed ledgers of a window of time: the caller resolves
  * the window from `ledgers`), the pools that have any swap above the native dust, sorted by account. The pools are the ones the
@@ -148,8 +146,8 @@ export async function ammPoolVolumes(ch: ClickHouseService, range: LedgerRange):
       const { base, counter } = volumesOf(row);
       out.push({
         account: row.amm_account,
-        base: assetOf(pair.base_currency, pair.base_issuer),
-        counter: assetOf(pair.counter_currency, pair.counter_issuer),
+        base: assetOfColumns(pair.base_currency, pair.base_issuer),
+        counter: assetOfColumns(pair.counter_currency, pair.counter_issuer),
         count: Number(row.n),
         baseVolume: base,
         counterVolume: counter,

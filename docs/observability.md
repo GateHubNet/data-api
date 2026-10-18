@@ -203,7 +203,7 @@ Threshold numbers are starting points: tune to your traffic and SLOs.
 
 A range ingest bulk-loads ClickHouse hard ([backfill](backfill.md)). Watch both sides:
 
-- **CLI:** its log (`Range [...] ingested: N chunks complete ... M ledgers written`), and in SQL `SELECT count(), max(ledger_index) FROM
+- **CLI:** its log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools`), and in SQL `SELECT count(), max(ledger_index) FROM
   <db>.ledgers`. The CLI is a separate process and has no metrics endpoint; the live syncer's gauges describe the live runner only.
 - **Aggregator:** `SELECT count() FROM <db>.agg_dirty` shrinks as the aggregator digests the new hours;
   `syncer_aggregator_stats_lag_seconds`.
