@@ -86,7 +86,8 @@ export class AmmPoolsController {
     name: 'asset',
     required: false,
     description:
-      'Only the pools that have this asset on either side: `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`, or the native currency alone.',
+      'Only the pools that have this asset on either side: `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`, or the native currency alone. ' +
+      'A raw `+` (which a query string decodes as a space) works; `%2B` is the strict form.',
   })
   @ApiQuery({
     name: 'asset2',
@@ -202,11 +203,17 @@ export class AmmPoolsController {
     return { result: 'success', pool };
   }
 
-  /** `asset` and `asset2`: the assets to filter by, each as the exchange routes write one. A missing or empty one is none. */
+  /**
+   * `asset` and `asset2`: the assets to filter by, each as the exchange routes write one. A missing or empty one is none. A
+   * query string decodes a raw `+` as a space, and a space can be in neither a currency code nor an address, so a space is the
+   * `+` separator (`asset2=USD+rIssuer` works as written; `%2B` is the strict form).
+   */
   private assets(query: QueryParams): Asset[] {
     return (['asset', 'asset2'] as const).flatMap((name) => {
       const raw = first(query, name);
-      return raw === undefined || raw === '' ? [] : [parseAsset(raw, this.profile.nativeCurrency)];
+      return raw === undefined || raw === ''
+        ? []
+        : [parseAsset(raw.trim().replace(/ /g, '+'), this.profile.nativeCurrency)];
     });
   }
 }

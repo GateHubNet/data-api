@@ -2651,7 +2651,8 @@ paths:
         required: false
         in: query
         description: 'Only the pools that have this asset on either side: `USD+rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`,
-          or the native currency alone.'
+          or the native currency alone. A raw `+` (which a query string decodes as
+          a space) works; `%2B` is the strict form.'
         schema: {}
       responses:
         '200':

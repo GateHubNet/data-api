@@ -503,6 +503,33 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
       expect(none.body).toEqual({ result: 'success', count: 0, pools: [] });
     });
 
+    it('takes a raw + as the separator too: a query string decodes it as a space, and %2B is the strict form', async () => {
+      const wanted = expectedPools((a) => !DELETED.includes(a));
+      const usd = wanted.find((p) => p.base_currency === 'USD' || p.counter_currency === 'USD')!;
+      const usdIssuer = usd[usd.base_currency === 'USD' ? 'base_issuer' : 'counter_issuer'] as string;
+      // the example of the reference, as written: asset=XRP&asset2=USD+rIssuer
+      for (const query of [
+        `asset=XRP&asset2=USD+${usdIssuer}`,
+        `asset=USD+${usdIssuer}`,
+        `asset2=usd+${usdIssuer}`,
+        `asset=USD+${usdIssuer}+`,
+      ]) {
+        const raw = await get(`/v2/amm/pools?limit=1000&${query}`);
+        const strict = await get(`/v2/amm/pools?limit=1000&${query.replace(/\+/g, '%2B')}`);
+        expect([query, raw.status, raw.body.count > 0]).toEqual([query, 200, true]);
+        expect([query, raw.body]).toEqual([query, strict.body]);
+      }
+      // and the errors are those of the strict form
+      for (const [query, message] of [
+        ['asset=XRP+rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q', 'XRP cannot have an issuer'],
+        ['asset=USD+nonsense', 'invalid issuer address'],
+        ['asset2=USD', 'issuer is required'],
+      ]) {
+        const res = await get(`/v2/amm/pools?${query}`);
+        expect([query, res.status, res.body]).toEqual([query, 400, { result: 'error', message }]);
+      }
+    });
+
     it('a filter applies to the deleted pool only with include_deleted, and pages like the whole list', async () => {
       const gone = expectedPools().find((p) => p.deleted === true)!;
       const asset = encodeURIComponent(

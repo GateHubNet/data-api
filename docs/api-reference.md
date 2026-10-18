@@ -1088,7 +1088,7 @@ The pools in their current state, the most valuable first.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `asset`, `asset2` | all | Only the pools that have this asset on either side, written like a path asset of the exchanges (`USD+rIssuer`, or the native currency alone; the separators `+`, `\|` and `.` all work). With both, the pools that have both: `asset=XRP&asset2=USD+rIssuer` is the XRP/USD pool. |
+| `asset`, `asset2` | all | Only the pools that have this asset on either side, written like a path asset of the exchanges (`USD+rIssuer`, or the native currency alone; the separators `+`, `\|` and `.` all work). With both, the pools that have both: `asset=XRP&asset2=USD+rIssuer` is the XRP/USD pool. In a query string `%2B` is the strict form of `+`; a raw `+`, which decodes as a space, works too (a space is in no currency code and no address). |
 | `include_deleted` | false | Boolean: also the pools that were deleted. |
 | `limit` | 200 (max 1000) | |
 | `marker` | | |
