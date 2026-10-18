@@ -33,7 +33,7 @@ pnpm build && GH_ENV=local pnpm --filter @gatehub/data-syncer ingest:range --fro
 Options: `--from`, `--to` (both inclusive, required), `--chunk` (default 1000, must divide 1,000,000), `--concurrency` (default 8),
 `--max-wait` (seconds a chunk may go without a ledger arriving while it waits for a rate-limited node or a ledger the node lacks
 right now, default 1200), `--reprocess`,
-`--run-id`, `--help`. Exit status: `0` done, `1` failed (rerun the same command), `2` wrong command line. The
+`--run-id`, `--help`. Exit status: `0` done, `1` failed (rerun the same command; with `--reprocess` see "Resume a `--reprocess` differently" below), `2` wrong command line. The
 mechanics (aligned chunks, `ingest_log` intents, recovery of a failed attempt, the lease rule, `agg_dirty`) are in
 [syncer](syncer.md#4-range-ingest-cli).
 
@@ -80,6 +80,23 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   range of the rerun, and the hours of all its committed ledgers are marked in `agg_dirty` (the run that died may have committed
   some and never marked them). It is redone once, whatever the chunk size or range of the rerun (Rulings R100, R110). The redo
   fetches the ledgers of the recorded range from the same node as the rest, so a rerun can fetch more than it names.
+- **Resume a `--reprocess` differently.** The skipping above is for a plain run. With `--reprocess` the run writes **every** chunk it is
+  given, whether or not the chunk was finished before, so rerunning the same command rewrites the whole range again. Restart with `--from`
+  just after the last chunk the failed run finished: the last log line `Chunk [a,b] done in ... ms: N ledgers written (redone)` gives it
+  (`--from` = `b` + 1), or read it from `ingest_log` (a chunk is `done` when its newest row says so; set the timestamp to the UTC time
+  the failed run started, because the chunks that earlier runs finished are `done` as well):
+
+  ```sql
+  SELECT max(range_end) + 1 AS restart_from
+  FROM (SELECT range_end, argMax(status, updated_at) AS last_status, max(updated_at) AS last_at
+          FROM xrpl.ingest_log
+         WHERE NOT startsWith(run_id, 'live:') AND range_end > 0
+         GROUP BY range_start, range_end)
+  WHERE last_status = 'done' AND last_at >= toDateTime64('2026-10-18 09:00:00', 3, 'UTC');   -- when the failed run started
+  ```
+
+  (`restart_from` is 1 when the run finished no chunk: keep the original `--from`.) The chunk that was running when the run failed is
+  left `started`; the restart redoes it first over its whole recorded range, with the same `--to` and a `--from` at or below its end.
 - **Gaps:** find them with the SQL in [operations](operations.md#sql-health-checks) and ingest exactly those ranges.
 - **Reprocess:** after a parser change (the `parser_version` of `ledgers` records which parser wrote a ledger),
   `--reprocess --from A --to B` fetches and dry-parses first, then deletes and rewrites the committed ledgers of the range.
@@ -125,7 +142,9 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
 
    That is about 21 million ledgers at the time of writing (the validated head was 107.7 million on 2026-10-17): read
    [Which node?](#2-which-node) and use a node of your own. The reprocess rewrites every table of each ledger, not only the AMM
-   tables, so it costs what the first ingest did. Rerun the same command after a failure (finished chunks are skipped).
+   tables, so it costs what the first ingest did. **After a failure do not rerun the same command**: with `--reprocess` every chunk is
+   written again, so that repeats the whole rewrite. Restart with `--from` just after the last chunk the failed run finished (see
+   [Resuming](#resuming-gap-repair-reprocessing): the `Chunk [a,b] done ... (redone)` log line, or `ingest_log`).
    Ledgers that are not committed yet (a new database that is filled below the live start) need no `--reprocess`: a plain
    `range-ingest --from 86795265 --to <live start - 1>` writes version-2 rows at once.
 3. The aggregates follow by themselves. Every written chunk marks its hours in `agg_dirty`, and for each slice the aggregator

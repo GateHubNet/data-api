@@ -181,8 +181,9 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 | `--run-id <id>` | random | Name of the run in `ingest_log` and in query ids (a per-invocation nonce is appended). Must not start with `live:`. |
 | `--help` | | Prints the usage. |
 
-Exit status: `0` ingested, `1` the run failed (**rerun the same command**: finished chunks are skipped, unfinished ones redone),
-`2` wrong command line.
+Exit status: `0` ingested, `1` the run failed (**rerun the same command**: finished chunks are skipped, unfinished ones redone; **with
+`--reprocess` every chunk is written again**, so restart with `--from` just after the last chunk the failed run finished, see
+[backfill](backfill.md#resuming-gap-repair-reprocessing)), `2` wrong command line.
 
 How it works (aligned chunks, `ingest_log` intents):
 

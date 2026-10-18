@@ -1034,7 +1034,7 @@ days that converted it through its counter are added up apart, because their amo
 rows have no components and zero totals.
 
 Errors: 400 as above, `invalid start date format`, `invalid end date format`, `invalid marker`; 500 `error getting data`
-(also for both routes).
+(also for all three routes).
 
 **Differences from data.ripple.com**: the `amm_volume` route does not exist in the original (an extra); `exchange_volume` includes the swaps against AMM pools in the trades of the configured markets; the `minute` live period of the original's develop branch is **not** supported; component
 `rate` follows the semantics above (the original's non-native trade component carried the pair's vwap, so `amount / rate` did

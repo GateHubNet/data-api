@@ -286,7 +286,9 @@ dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 
 ```
 
 - **Resume:** rerun the same command. Finished chunks are skipped, an unfinished one is redone. Exit status 1 means failed, 2 a
-  wrong command line.
+  wrong command line. **Not with `--reprocess`**: it writes every chunk it is given, so a rerun rewrites the whole range again. Restart
+  with `--from` just after the last chunk the failed run finished (the last `Chunk [a,b] done ... (redone)` line, or `ingest_log`; the SQL
+  is in [backfill](backfill.md#resuming-gap-repair-reprocessing)).
 - **Speed:** `--concurrency` (ledgers of a chunk fetched at once) is bound by the node; `--chunk` (default 1000, must divide
   1,000,000) is the memory a run needs.
 - **Above the checkpoint:** refused while the live syncer's lease is fresh. Backfill is history. A range that **starts** above the

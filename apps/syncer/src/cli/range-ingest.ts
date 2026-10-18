@@ -996,8 +996,8 @@ The network, ClickHouse and node come from the same GH_* environment as the sync
   --run-id <id>          name of this run in ingest_log and in query ids (a nonce is appended)
   --help                 print this text
 
-Exit status: 0 when the range is ingested, 1 when the run failed (rerun the same command: finished chunks are skipped, unfinished ones redone),
-2 for a wrong command line.`;
+Exit status: 0 when the range is ingested, 1 when the run failed (rerun the same command: finished chunks are skipped, unfinished ones redone;
+with --reprocess every chunk is written again, so restart with --from just after the last chunk logged as done), 2 for a wrong command line.`;
 
 /** The command line is wrong. */
 export class UsageError extends Error {
