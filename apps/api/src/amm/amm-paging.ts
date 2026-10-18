@@ -1,6 +1,5 @@
-import type { FilledColumn } from '@gatehub/data-api-shared';
-import { badRequest } from '../common/errors';
-import { encodeMarker } from '../common/pagination';
+import { FilledColumn, POOL_FIELDS } from '@gatehub/data-api-shared';
+import { decodeMarker, encodeMarker, KeysetKey } from '../common/pagination';
 
 /**
  * The pure parts of the paging of the pool routes: the carry-forward of the history, and the marker and the keyset
@@ -10,28 +9,18 @@ import { encodeMarker } from '../common/pagination';
 // -- the carry-forward ---------------------------------------------------------------------------------------------
 
 /**
- * The columns of a state that are carried forward: a state row holds a value only when its transaction's metadata carried
- * it (a swap through an XRP/IOU pool says nothing of the LP supply, a vote nothing of the reserves), so the value of the
- * pool after the row is the newest non-null value of the row and the rows before it.
+ * The value of each filled column: a number for the fee and the slot's fee and expiration, else text; `null` when unknown.
+ *
+ * The columns carried forward are those the aggregator fills for `amm_pools` (`POOL_FIELDS`, the one list of their names): a
+ * state row holds a value only when its transaction's metadata carried it (a swap through an XRP/IOU pool says nothing of the
+ * LP supply, a vote nothing of the reserves), so the value of the pool after the row is the newest non-null value of the row
+ * and the rows before it.
  */
-export const FILLED_COLUMNS: readonly FilledColumn[] = [
-  'reserve_base',
-  'reserve_counter',
-  'lp_supply',
-  'lp_currency',
-  'trading_fee',
-  'auction_holder',
-  'auction_price',
-  'auction_discounted_fee',
-  'auction_expiration',
-];
-
-/** The value of each filled column: a number for the fee and the slot's fee and expiration, else text; `null` when unknown. */
 export type FilledValues = Record<FilledColumn, string | number | null>;
 
 /** A pool about which nothing is known yet. */
 export const EMPTY_FILL: Readonly<FilledValues> = Object.freeze(
-  Object.fromEntries(FILLED_COLUMNS.map((c) => [c, null])) as FilledValues,
+  Object.fromEntries(POOL_FIELDS.map((c) => [c, null])) as FilledValues,
 );
 
 /**
@@ -43,7 +32,7 @@ export function carryForward<T extends FilledValues>(rows: readonly T[], carryIn
   let state: FilledValues = { ...carryIn };
   return rows.map((row) => {
     const next = { ...state };
-    for (const column of FILLED_COLUMNS) {
+    for (const column of POOL_FIELDS) {
       if (row[column] !== null && row[column] !== undefined) next[column] = row[column];
     }
     state = next;
@@ -56,31 +45,25 @@ export function carryForward<T extends FilledValues>(rows: readonly T[], carryIn
 /** The key of the list of pools: `value_native` (null for a pool with none) and `amm_account`. */
 export type PoolsKey = [number | null, string];
 
+/** The columns of the key of the list, as the marker codes them: `value_native` is a Float64 that is null for a pool without one. */
+const POOLS_KEYS: KeysetKey[] = [
+  { column: 'value_native', type: 'Float64', nullable: true },
+  { column: 'amm_account', type: 'String' },
+];
+
 /** The marker of a page: the base64url JSON of the value and the account of its last pool. */
 export function encodePoolsMarker(value: number | null, account: string): string {
-  // `encodeMarker` takes the keys of the tables, which are never null; a pool without a value is `null` in JSON
-  return encodeMarker([value, account] as unknown as Array<string | number>);
+  return encodeMarker([value, account]);
 }
 
 /**
  * The key of a marker, or `undefined` for the first page. Anything that is not a marker of this list answers 400
- * `invalid marker`: text that is not base64url, JSON that is not a pair, a value that is not a finite number or null, an
- * account that is not text.
+ * `invalid marker` (`decodeMarker`): text that is not base64url, JSON that is not a pair, a value that is not a finite number or
+ * null, an account that is not text.
  */
 export function decodePoolsMarker(marker: string | undefined): PoolsKey | undefined {
-  if (marker === undefined || marker === '') return undefined;
-  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(marker)) throw badRequest('invalid marker');
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(marker, 'base64url').toString('utf8'));
-  } catch {
-    throw badRequest('invalid marker');
-  }
-  if (!Array.isArray(parsed) || parsed.length !== 2) throw badRequest('invalid marker');
-  const [value, account] = parsed as unknown[];
-  const validValue = value === null || (typeof value === 'number' && Number.isFinite(value));
-  if (!validValue || typeof account !== 'string') throw badRequest('invalid marker');
-  return [value as number | null, account];
+  const values = decodeMarker(marker, POOLS_KEYS);
+  return values === undefined ? undefined : [values[0] as number | null, values[1] as string];
 }
 
 /**
@@ -88,6 +71,10 @@ export function decodePoolsMarker(marker: string | undefined): PoolsKey | undefi
  * that have none last, then `amm_account` ascending), and its params. After a pool with a value: a lower value, the same value
  * and a later account, or no value at all. After a pool without one: the pools without one and a later account. The first
  * page has none.
+ *
+ * The value of the marker is the Float64 of `value_native` as JavaScript wrote it (the shortest text that reads back as the
+ * same double) and ClickHouse reads back as the identical double, so `=` finds the tie it came from: proven by the walks of
+ * the list with `limit=1` and by the tie test of `0.1 + 0.2` and `0.3` (`amm-pools.e2e-spec.ts`).
  */
 export function poolsKeyset(after: PoolsKey | undefined): { clause: string; params: Record<string, unknown> } {
   if (after === undefined) return { clause: '', params: {} };

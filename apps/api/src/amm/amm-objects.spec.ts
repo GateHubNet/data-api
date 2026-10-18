@@ -141,11 +141,35 @@ describe('toPoolObject', () => {
     expect(typeof toPoolObject(STORED).value_native).toBe('string');
   });
 
-  it('the value is precision8, as the rate of an exchange: eight significant digits', () => {
-    expect(toPoolObject({ ...STORED, value_native: 0.004 }).value_native).toBe('0.0040000000');
-    expect(toPoolObject({ ...STORED, value_native: 12.5 }).value_native).toBe('12.500000');
+  it('the value is a plain decimal of eight significant digits, trailing zeros dropped', () => {
+    const value = (v: number): string | undefined => toPoolObject({ ...STORED, value_native: v }).value_native;
+    expect(value(0.004)).toBe('0.004');
+    expect(value(12.5)).toBe('12.5');
+    expect(value(42)).toBe('42');
+    expect(value(123)).toBe('123');
+    expect(value(28_110_514.1946255)).toBe('28110514');
+    expect(value(0.1 + 0.2)).toBe('0.3');
     // zero is a value: it is served, and not mistaken for a missing one
-    expect(toPoolObject({ ...STORED, value_native: 0 }).value_native).toBe('0.0000000');
+    expect(value(0)).toBe('0');
+  });
+
+  it('never writes the exponent form: not from 1e8 up, not from 1e-7 down, and not when the rounding crosses 1e8', () => {
+    const value = (v: number): string | undefined => toPoolObject({ ...STORED, value_native: v }).value_native;
+    // eight significant digits, the rest of the integer part zeros
+    expect(value(123_456_789.5)).toBe('123456790');
+    expect(value(2.5e11)).toBe('250000000000');
+    expect(value(1e21)).toBe('1000000000000000000000');
+    // 99999999.5 rounds to 1.0000000e+8 in eight digits
+    expect(value(99_999_999.5)).toBe('100000000');
+    expect(value(99_999_999)).toBe('99999999');
+    // small values: the zeros after the point, then eight digits
+    expect(value(1e-7)).toBe('0.0000001');
+    expect(value(3.2e-8)).toBe('0.000000032');
+    expect(value(1.23456789e-7)).toBe('0.00000012345679');
+    expect(value(0.00001234)).toBe('0.00001234');
+    for (const v of [1e-9, 1e-7, 1e7, 1e8, 99_999_999.5, 123_456_789.5, 2.5e11, 1e21, 5e-324]) {
+      expect([v, value(v)]).toEqual([v, expect.not.stringMatching(/e/i)]);
+    }
   });
 
   it('leaves out what the pool does not have: no key is ever undefined or null', () => {
@@ -542,7 +566,17 @@ describe('toPoolDayObject', () => {
     }
     // a count of 0 and a fee of 0 stay
     const quiet = toPoolDayObject(POOL, { ...DAY, swap_count: '0', trading_fee: 0, value_native: 0 });
-    expect(quiet).toMatchObject({ swap_count: 0, trading_fee: 0, value_native: '0.0000000' });
+    expect(quiet).toMatchObject({ swap_count: 0, trading_fee: 0, value_native: '0' });
+  });
+
+  it('serves the value of a day like the value of a pool: a plain decimal, never the exponent form', () => {
+    const value = (v: number): string | undefined => toPoolDayObject(POOL, { ...DAY, value_native: v }).value_native;
+    expect(value(123_456_789.5)).toBe('123456790');
+    expect(value(99_999_999.5)).toBe('100000000');
+    expect(value(1e-7)).toBe('0.0000001');
+    expect(value(3.2e-8)).toBe('0.000000032');
+    expect(value(12.5)).toBe('12.5');
+    expect(value(0)).toBe('0');
   });
 
   it('serves nothing that is internal (the version, the final flag, the config version)', () => {

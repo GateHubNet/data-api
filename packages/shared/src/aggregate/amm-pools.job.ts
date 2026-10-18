@@ -233,6 +233,35 @@ async function readFill<R extends object>(
   });
 }
 
+/** What a fill-forward does besides reading the window and, if need be, walking back from it. */
+export interface FillForwardOptions {
+  /**
+   * Walk back only for the pools that have a state row older than what was read (one look at the key of each pool the window
+   * left incomplete: a row before the first ledger read). A pool with none has every value it will ever have in the rows
+   * read, so the steps would read nothing, one round trip each; a first page of a pool's history is such a pool. Off by
+   * default: the aggregators walk back as before.
+   */
+  onlyPoolsWithOlderRows?: boolean;
+}
+
+/** The accounts among `accounts` that have a state row before `ledger` (the first ledger read): one row of its key looked at for each. */
+async function withRowsBefore(ch: ClickHouseService, accounts: string[], ledger: number): Promise<Set<string>> {
+  const found = await Promise.all(
+    accounts.map(async (account) => {
+      const rows = await ch.query(
+        `SELECT 1 AS found
+           FROM ${Table.AmmPoolStates}
+          WHERE amm_account = {account:String} AND ledger_index < {before:UInt32}
+          ORDER BY amm_account ASC, ledger_index ASC, tx_index ASC
+          LIMIT 1`,
+        { account, before: ledger },
+      );
+      return rows.length > 0 ? [account] : [];
+    }),
+  );
+  return new Set(found.flat());
+}
+
 /**
  * Reads further back, for the pools of `accounts` that `rows` does not give completely, the ledgers before `from` (the first
  * ledger `rows` has read) in doubling steps (Ruling R-A23): the steps end at `upTo - 2 * (upTo - from)`, `upTo - 4 * (upTo -
@@ -241,7 +270,8 @@ async function readFill<R extends object>(
  * rows come out as if they had been read from the first ledger, because the last step, if it is needed, reaches it, and each
  * step before it only stops when the pools it was for have every required column. The steps number about `log2(upTo / (upTo -
  * from))`, and a pool pays for the distance back to its oldest needed value, at most twice, never for the rest of its history.
- * `rows` is changed in place.
+ * `rows` is changed in place. With `options.onlyPoolsWithOlderRows` the pools that have no row before `from` are left out of the
+ * steps (see `FillForwardOptions`).
  */
 export async function deepenFill<R extends object>(
   ch: ClickHouseService,
@@ -250,9 +280,18 @@ export async function deepenFill<R extends object>(
   upTo: number,
   from: number,
   query: FillForwardQuery,
+  options: FillForwardOptions = {},
 ): Promise<void> {
-  let incomplete = incompleteOf(rows, accounts, query);
   let read = Math.max(0, Math.floor(from));
+  // the pools that can still be walked, when the walk is limited to those with older rows
+  let walkable: Set<string> | undefined;
+  if (options.onlyPoolsWithOlderRows && read > 0) {
+    const incomplete = incompleteOf(rows, accounts, query);
+    walkable = incomplete.length > 0 ? await withRowsBefore(ch, incomplete, read) : new Set();
+  }
+  const pending = (): string[] =>
+    incompleteOf(rows, accounts, query).filter((account) => walkable === undefined || walkable.has(account));
+  let incomplete = pending();
   let span = Math.max(1, 2 * (upTo - read));
   while (incomplete.length > 0 && read > 0) {
     const start = span >= upTo / 2 ? 0 : Math.max(0, upTo - span);
@@ -261,7 +300,7 @@ export async function deepenFill<R extends object>(
       rows.set(row.amm_account, have === undefined ? row : olderInto(have, row));
     }
     read = start;
-    incomplete = incompleteOf(rows, accounts, query);
+    incomplete = pending();
     span *= 2;
   }
 }
@@ -274,7 +313,7 @@ export async function deepenFill<R extends object>(
  * `deleted`, the assets and the newest ledger are those of the newest row, which is in the first range in which the pool has a
  * row. With `from` 0 the window is the history. One row per pool that has state rows up to `upTo`, in the order of `accounts`
  * (the callers pass them sorted, which is the order of the select). The `extra` items have to be fill-forwards as well: null
- * when no row qualifies, and the newest value otherwise.
+ * when no row qualifies, and the newest value otherwise. `options` are those of `FillForwardOptions`.
  */
 export async function fillForward<R extends object = Record<string, never>>(
   ch: ClickHouseService,
@@ -282,15 +321,19 @@ export async function fillForward<R extends object = Record<string, never>>(
   upTo: number,
   from: number,
   query: FillForwardQuery,
+  options: FillForwardOptions = {},
 ): Promise<Array<FillForwardRow & R>> {
   const first = Math.max(0, Math.floor(from));
   const rows = new Map((await readFill<R>(ch, accounts, first, upTo, query)).map((row) => [row.amm_account, row]));
-  await deepenFill(ch, rows, accounts, upTo, first, query);
+  await deepenFill(ch, rows, accounts, upTo, first, query, options);
   return accounts.flatMap((account) => rows.get(account) ?? []);
 }
 
-/** The columns of the pool row that come from the fill-forward, and so decide when a window is enough. */
-const POOL_FIELDS: readonly FilledColumn[] = [
+/**
+ * The columns of the pool row that come from the fill-forward, and so decide when a window is enough. The one list of them:
+ * the API's history fills the same columns (`POOL_QUERY`).
+ */
+export const POOL_FIELDS: readonly FilledColumn[] = [
   'reserve_base',
   'reserve_counter',
   'lp_supply',
@@ -301,7 +344,7 @@ const POOL_FIELDS: readonly FilledColumn[] = [
   'auction_discounted_fee',
   'auction_expiration',
 ];
-const POOL_QUERY: FillForwardQuery = {
+export const POOL_QUERY: FillForwardQuery = {
   fields: POOL_FIELDS,
   required: POOL_FIELDS.map((f) => `filled_${f}`),
 };

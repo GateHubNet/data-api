@@ -1,3 +1,4 @@
+import { POOL_FIELDS } from '@gatehub/data-api-shared';
 import { RippleHttpError } from '../common/errors';
 import { encodeMarker } from '../common/pagination';
 import {
@@ -5,7 +6,6 @@ import {
   decodePoolsMarker,
   EMPTY_FILL,
   encodePoolsMarker,
-  FILLED_COLUMNS,
   FilledValues,
   poolsKeyset,
 } from './amm-paging';
@@ -84,7 +84,7 @@ describe('carryForward', () => {
   });
 
   it('knows the nine filled columns of a state', () => {
-    expect([...FILLED_COLUMNS].sort()).toEqual(
+    expect([...POOL_FIELDS].sort()).toEqual(
       [
         'auction_discounted_fee',
         'auction_expiration',
@@ -97,8 +97,13 @@ describe('carryForward', () => {
         'trading_fee',
       ].sort(),
     );
-    expect(Object.keys(EMPTY_FILL).sort()).toEqual([...FILLED_COLUMNS].sort());
+    expect(Object.keys(EMPTY_FILL).sort()).toEqual([...POOL_FIELDS].sort());
     expect(Object.values(EMPTY_FILL).every((v) => v === null)).toBe(true);
+  });
+
+  it('the columns it fills are those the aggregator fills (the list of amm_pools.job, one source for the names)', () => {
+    expect(POOL_FIELDS).toHaveLength(9);
+    expect(Object.keys(EMPTY_FILL)).toEqual([...POOL_FIELDS]);
   });
 });
 

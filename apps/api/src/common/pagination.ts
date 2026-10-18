@@ -15,19 +15,28 @@ import { badRequest } from './errors';
  */
 
 /** The ClickHouse types a marker can hold. The key of a list is made of these. */
-export type KeyType = 'UInt32' | 'UInt16' | 'Int16' | 'UInt64' | 'String' | 'DateTime';
+export type KeyType = 'UInt32' | 'UInt16' | 'Int16' | 'UInt64' | 'String' | 'DateTime' | 'Float64';
 
 /** One column of the ORDER BY of a list. `column` is code, never user input: it is written into the SQL text. */
 export interface KeysetKey {
   column: string;
   type: KeyType;
+  /**
+   * The marker may hold `null` for this column: a list ordered by a nullable column (`NULLS LAST`) has a row without a value as
+   * the last row of a page. `keysetClause` does not compare such a key (a tuple comparison with a null is no comparison): the
+   * list that has one writes its own condition and only uses the marker's coding.
+   */
+  nullable?: boolean;
 }
 
-export type KeyValue = string | number;
+export type KeyValue = string | number | null;
 
 const MAX_UINT32 = 4_294_967_295;
 
-/** What a value of the type looks like in a marker: JSON numbers for the integers (and the seconds of a DateTime). */
+/**
+ * What a value of the type looks like in a marker: JSON numbers for the integers (and the seconds of a DateTime), a finite JSON
+ * number for a Float64 (a double comes back from JSON as the same double).
+ */
 const VALID: Record<KeyType, (v: unknown) => boolean> = {
   UInt16: (v) => isIntegerBetween(v, 0, 65_535),
   UInt32: (v) => isIntegerBetween(v, 0, MAX_UINT32),
@@ -35,6 +44,7 @@ const VALID: Record<KeyType, (v: unknown) => boolean> = {
   Int16: (v) => isIntegerBetween(v, -32_768, 32_767),
   DateTime: (v) => isIntegerBetween(v, 0, MAX_UINT32),
   String: (v) => typeof v === 'string',
+  Float64: (v) => typeof v === 'number' && Number.isFinite(v),
 };
 
 function isIntegerBetween(v: unknown, min: number, max: number): boolean {
@@ -64,7 +74,11 @@ export function decodeMarker(marker: string | undefined, keys: KeysetKey[]): Key
   } catch {
     throw badRequest('invalid marker');
   }
-  if (!Array.isArray(values) || values.length !== keys.length || !values.every((v, i) => VALID[keys[i].type](v))) {
+  if (
+    !Array.isArray(values) ||
+    values.length !== keys.length ||
+    !values.every((v, i) => (v === null && keys[i].nullable === true) || VALID[keys[i].type](v))
+  ) {
     throw badRequest('invalid marker');
   }
   return values as KeyValue[];
@@ -91,6 +105,7 @@ export function keysetClause(
     // paging from the start instead would make a client loop on the same page for ever
     throw new Error(`the key has ${keys.length} columns but ${values.length} value(s) were given`);
   }
+  if (values.includes(null)) throw new Error('a keyset condition cannot compare a null: the list writes its own');
   const columns = keys.map((k) => k.column).join(', ');
   const placeholders = keys.map((k, i) => `{${prefix}${i}:${k.type}}`).join(', ');
   const params: Record<string, unknown> = {};

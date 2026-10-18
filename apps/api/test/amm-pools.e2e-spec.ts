@@ -50,7 +50,12 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
 /** The same object without the keys that are undefined or null: what the API leaves out. */
 const defined = (o: Record<string, unknown>): Record<string, unknown> =>
   Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null));
-const precision8 = (n: number | string): string => new BigNumber(n).toPrecision(8);
+/**
+ * A value of a pool as the API writes it: a plain decimal of eight significant digits, never the exponent form, trailing
+ * zeros dropped (123 is "123", 99999999.5 is "100000000", 1e-7 is "0.0000001"). Worked out here with `precision()` of
+ * BigNumber, apart from the code under test.
+ */
+const fixed8 = (n: number | string): string => new BigNumber(n).precision(8).toFixed();
 const side = (currency: string, issuer: string): string => (issuer ? `${currency}+${issuer}` : currency);
 /** `?a=1&b=2`, encoded. */
 const qs = (params: Record<string, string | number | boolean>): string =>
@@ -238,7 +243,7 @@ function poolOf(
     lp_currency: last.lp_currency,
     trading_fee: last.trading_fee,
     auction_slot: slotOf(last),
-    value_native: last.deleted === 1 || value === null ? undefined : precision8(value),
+    value_native: last.deleted === 1 || value === null ? undefined : fixed8(value),
     created_ledger: created?.created_ledger,
     created_by: created?.created_by,
     last_ledger: last.ledger_index,
@@ -1039,8 +1044,14 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
         expect([limit, await count(limit)]).toEqual([limit, all]);
       }
       expect(((await get(`/v2/amm/pools/${BUSY}/history`)).body as HistoryBody).count).toBe(all);
-      // the days take the same limit
-      expect(await count('1', '&interval=day')).toBeLessThanOrEqual(1);
+      // the days take the same limit: this pool has days, and the first page holds exactly one
+      const days = await h.ch.query<{ day: string }>(
+        `SELECT DISTINCT day FROM ${Table.AmmDaily} WHERE amm_account = {pool:String}`,
+        { pool: BUSY },
+      );
+      expect(days.length).toBeGreaterThanOrEqual(1);
+      expect(await count('1', '&interval=day')).toBe(1);
+      expect(await count('1000', '&interval=day')).toBe(days.length);
     });
   });
 
@@ -1084,7 +1095,7 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
         reserve_counter: r.reserve_counter,
         lp_supply: r.lp_supply,
         trading_fee: r.trading_fee,
-        value_native: r.value_native === null || r.value_native === undefined ? undefined : precision8(r.value_native),
+        value_native: r.value_native === null || r.value_native === undefined ? undefined : fixed8(r.value_native),
       });
 
     let swapper: string;
@@ -1194,13 +1205,24 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
     });
 
     it('a pool that has states and no days has none; a pool that is not one is 404', async () => {
-      const [quiet] = await h.ch.query<{ amm_account: string }>(
-        `SELECT amm_account FROM ${Table.AmmPools} WHERE amm_account NOT IN (SELECT amm_account FROM ${Table.AmmDaily}) LIMIT 1`,
+      // a pool with a state in a committed ledger (a copy of a row of another pool) and no row in amm_daily
+      const quiet = accountAt(0xd000);
+      const [copy] = await h.ch.query<Record<string, unknown>>(
+        `SELECT * FROM ${Table.AmmPoolStates} WHERE amm_account = {from:String} ORDER BY ledger_index, tx_index LIMIT 1`,
+        { from: LONG },
       );
-      if (quiet !== undefined) {
-        const res = await get(`/v2/amm/pools/${quiet.amm_account}/history?interval=day`);
-        expect([res.status, res.body]).toEqual([200, { result: 'success', count: 0, days: [] }]);
-      }
+      await h.ch.insert(Table.AmmPoolStates, [{ ...copy, amm_account: quiet }]);
+      const [{ days }] = await h.ch.query<{ days: string }>(
+        `SELECT count() AS days FROM ${Table.AmmDaily} WHERE amm_account = {quiet:String}`,
+        { quiet },
+      );
+      const [{ states }] = await h.ch.query<{ states: string }>(
+        `SELECT count() AS states FROM ${Table.AmmPoolStates} WHERE amm_account = {quiet:String}`,
+        { quiet },
+      );
+      expect([Number(states), Number(days)]).toEqual([1, 0]);
+      const res = await get(`/v2/amm/pools/${quiet}/history?interval=day`);
+      expect([res.status, res.body]).toEqual([200, { result: 'success', count: 0, days: [] }]);
       const unknown = await get('/v2/amm/pools/rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q/history?interval=day');
       expect([unknown.status, unknown.body]).toEqual([404, { result: 'error', message: 'pool not found' }]);
       const bad = await get('/v2/amm/pools/rnotanaddress/history?interval=day');
@@ -1536,7 +1558,7 @@ describe('the pool routes over pools made by hand', () => {
       expect(whole.pools.map((p) => p.amm_account)).toEqual(ranked.map((r) => r.account));
       // 0.1 + 0.2 and 0.3 are different numbers: they must not be taken for each other, nor lost at a page boundary
       expect(whole.pools.map((p) => p.value_native)).toEqual(
-        ranked.map((r) => (r.value === null ? undefined : precision8(r.value))),
+        ranked.map((r) => (r.value === null ? undefined : fixed8(r.value))),
       );
       for (const limit of [1, 2, 3, 5]) {
         const walked = await pages<ListBody>(`/v2/amm/pools?${filter}`, limit, 'pools');
@@ -1603,6 +1625,42 @@ describe('the pool routes over pools made by hand', () => {
       };
       const res = await get(`/v2/amm/pools/${path}`);
       expectObjects([res.body.pool], [expected], POOL_KEYS);
+    });
+
+    it('serve value_native as a plain decimal of eight significant digits: never the exponent form, at either end', async () => {
+      const { currency } = freshPair();
+      const cases: Array<[number | null, string | undefined]> = [
+        [2.5e11, '250000000000'],
+        [123_456_789.5, '123456790'],
+        [99_999_999.5, '100000000'],
+        [28_110_514.1946255, '28110514'],
+        [42, '42'],
+        [12.5, '12.5'],
+        [0.1 + 0.2, '0.3'],
+        [1e-7, '0.0000001'],
+        [3.2e-8, '0.000000032'],
+        [0, '0'],
+        [null, undefined],
+      ];
+      const accounts = cases.map((_, i) => accountAt(0x7100 + i));
+      await h.ch.insert(
+        Table.AmmPools,
+        cases.map(([value], i) => xrpPool(accounts[i], currency, { value_native: value })),
+      );
+      const filter = `asset=${currency}%2B${ISSUER}`;
+      // by value, descending, the pool without one last: the order the cases are written in
+      const whole = (await get(`/v2/amm/pools?${filter}&limit=1000`)).body as ListBody;
+      expect(whole.pools.map((p) => [p.amm_account, p.value_native])).toEqual(
+        cases.map(([, text], i) => [accounts[i], text]),
+      );
+      for (const pool of whole.pools) expect(String(pool.value_native ?? '')).not.toMatch(/e/i);
+      // a marker holds the value as the double it is stored as (1e-7 and 2.5e11 are not written in plain digits in JSON)
+      for (const limit of [1, 2, 3]) {
+        const walked = await pages<ListBody>(`/v2/amm/pools?${filter}`, limit, 'pools');
+        expect([limit, walked.flatMap((p) => p.pools)]).toEqual([limit, whole.pools]);
+      }
+      const detail = (await get(`/v2/amm/pools/${accounts[7]}`)).body.pool as Obj;
+      expect(detail.value_native).toBe('0.0000001');
     });
 
     it('serve a pool with nothing known as the bare pool: no key that is null', async () => {
@@ -1828,6 +1886,37 @@ describe('the pool history over states made by hand', () => {
       expect(await viaApi(Z, `&end=${encodeURIComponent(end)}`)).toEqual(carried(rows).slice(0, 5).map(stateOf));
     });
 
+    /** The reads of the fill-forward of a request: the window of the state before the page, and the steps back from it. */
+    /** The first window of the carry-in: 2048 ledgers (`AMM_HISTORY_CARRY_LEDGERS`, written out here to pin it). */
+    const WINDOW = 2048;
+    const fillReads = (spy: jest.SpyInstance): Array<{ from: number; upTo: number }> =>
+      spy.mock.calls
+        .filter(([sql]) => String(sql).includes('argMaxIf(reserve_base'))
+        .map(([, params]) => {
+          const p = params as { fill_from: number; fill_up_to: number };
+          return { from: p.fill_from, upTo: p.fill_up_to };
+        });
+
+    it('the first page of a pool reads the window before it once: there is nothing before the pool, so no walk back', async () => {
+      const spy = jest.spyOn(h.ch, 'query');
+      const page = await get(`/v2/amm/pools/${Z}/history?limit=2`);
+      expect(page.status).toBe(200);
+      expect(fillReads(spy)).toEqual([{ from: 100_500_000 - 1 - WINDOW + 1, upTo: 100_500_000 - 1 }]);
+    });
+
+    it('a page after a gap walks back for the values it lacks and stops at the rows that have them, not at the first ledger', async () => {
+      const spy = jest.spyOn(h.ch, 'query');
+      const start = iso(closeAt.get(102186243) as number).replace('Z', '+00:00');
+      const history = await viaApi(Z, `&start=${encodeURIComponent(start)}`);
+      expect(history).toHaveLength(1);
+      const reads = fillReads(spy);
+      // the window, then doubling steps, each older than the one before; the row that has the values is 2,000,000 ledgers back
+      expect(reads.length).toBeGreaterThan(5);
+      expect(Math.min(...reads.map((r) => r.from))).toBeGreaterThan(0);
+      expect(Math.min(...reads.map((r) => r.from))).toBeLessThanOrEqual(100_500_000);
+      for (let i = 1; i < reads.length; i++) expect(reads[i].upTo).toBeLessThan(reads[i - 1].from);
+    });
+
     it('a window that holds nothing is an empty list for a pool that exists, 404 for one that does not', async () => {
       const empty = await get(`/v2/amm/pools/${Z}/history?start=2099-01-01`);
       expect([empty.status, empty.body]).toEqual([200, { result: 'success', count: 0, history: [] }]);
@@ -2011,7 +2100,7 @@ describe('the pool history over states made by hand', () => {
         reserve_counter: r.reserve_counter,
         lp_supply: r.lp_supply,
         trading_fee: r.trading_fee,
-        value_native: r.value_native === null ? undefined : precision8(r.value_native),
+        value_native: r.value_native === null ? undefined : fixed8(r.value_native),
       });
     // a merge of ReplacingMergeTree(version) would drop the older rows of a pool-day by itself: the sets stay as written
     beforeAll(async () => {
@@ -2145,6 +2234,27 @@ describe('the pool history over states made by hand', () => {
         const walked = await pages<DaysBody>(`/v2/amm/pools/${A}/history?interval=day`, limit, 'days');
         expect([limit, walked.flatMap((p) => p.days.map((d) => d.swap_count))]).toEqual([limit, [4, 6]]);
       }
+    });
+
+    it('serves the value of a day as a plain decimal of eight significant digits, never the exponent form', async () => {
+      const A = accountAt(0xc500);
+      const cases: Array<[string, number | null, string | undefined]> = [
+        ['2026-08-01', 123_456_789.5, '123456790'],
+        ['2026-08-02', 99_999_999.5, '100000000'],
+        ['2026-08-03', 1e-7, '0.0000001'],
+        ['2026-08-04', 3.2e-8, '0.000000032'],
+        ['2026-08-05', 12.5, '12.5'],
+        ['2026-08-06', 0, '0'],
+        ['2026-08-07', null, undefined],
+      ];
+      await h.ch.insert(Table.AmmDaily, [
+        ...cases.map(([day, ,]) => sentinel(day, 700)),
+        ...cases.map(([day, value]) => dayRow(A, day, 700, { value_native: value })),
+      ]);
+      const days = await daysOf(A, '&start=2026-08-01&end=2026-08-07');
+      expect(days.map((d) => [d.date, d.value_native])).toEqual(
+        cases.map(([day, , text]) => [`${day}T00:00:00Z`, text]),
+      );
     });
 
     it('a pool whose days were all replaced has none, and the pool is still there (200, not 404)', async () => {

@@ -5,6 +5,8 @@ import {
   AMM_POOLS_CHUNK,
   AmmPoolsRecomputeAborted,
   ammPoolsWatermark,
+  fillForward,
+  POOL_QUERY,
   POOLS_CHANGED_SINCE_SQL,
   poolsChangedSince,
   poolsClosedIn,
@@ -1816,6 +1818,104 @@ describe('the amm_pools job (e2e)', () => {
         expect(without((await latest(ch)).find((r) => r.amm_account === quiet) as StoredPool)).toEqual(
           without(windowed),
         );
+      });
+    });
+
+    describe('the walk back can be limited to the pools that have older rows (onlyPoolsWithOlderRows)', () => {
+      const TOP = 100_000;
+      const SHORT = 100;
+      const stateReads = (query: jest.SpyInstance): Array<{ accounts: string[]; range: [number, number] }> =>
+        query.mock.calls
+          .filter(([sql]) => String(sql).includes('argMaxIf(reserve_base'))
+          .map(([, params]) => {
+            const p = params as { accounts: string[]; fill_from: number; fill_up_to: number };
+            return { accounts: p.accounts, range: [p.fill_from, p.fill_up_to] };
+          });
+      /** The looks at the key of a pool for a row before a ledger: not a fill-forward, a read of one row. */
+      const keyLooks = (query: jest.SpyInstance): Array<{ account: string; before: number }> =>
+        query.mock.calls
+          .filter(([sql]) => /FROM amm_pool_states/.test(String(sql)) && !String(sql).includes('argMaxIf'))
+          .map(([, params]) => params as { account: string; before: number });
+
+      /** A pool with rows in the window only, and a pool whose AMM-node row is 5,000 ledgers back. */
+      async function world(): Promise<{ ch: ClickHouseService; young: string; old: string }> {
+        const ch = await fresh();
+        const young = 'rYoungWalk'.padEnd(33, '0');
+        const old = 'rOldWalk'.padEnd(33, '0');
+        await insertStates(ch, [
+          // a row at the very first ledger of the window is in the window: it is not an older row
+          state({ amm_account: young, ledger_index: TOP - SHORT, reserve_base: '0', reserve_counter: '0' }),
+          state({ amm_account: young, ledger_index: TOP - 10, reserve_base: '1', reserve_counter: '2' }),
+          state({ amm_account: young, ledger_index: TOP, reserve_base: '10', reserve_counter: '20' }),
+          state({ amm_account: old, ledger_index: TOP - 5000, ...(OLD as Partial<AmmPoolStatesRow>) }),
+          state({ amm_account: old, ledger_index: TOP, reserve_base: '10', reserve_counter: '20' }),
+        ]);
+        return { ch, young, old };
+      }
+
+      it('a pool with nothing before the window is read once; the walk back is for the pools that have something', async () => {
+        const { ch, young } = await world();
+        const query = jest.spyOn(ch, 'query');
+        const limited = await fillForward(ch, [young], TOP, TOP - SHORT, POOL_QUERY, { onlyPoolsWithOlderRows: true });
+        expect(stateReads(query).map((r) => r.range)).toEqual([[TOP - SHORT, TOP]]);
+        expect(keyLooks(query)).toEqual([{ account: young, before: TOP - SHORT }]);
+        // without it the pool is walked back, step after step, to the first ledger: nothing is there to be found
+        query.mockClear();
+        const walked = await fillForward(ch, [young], TOP, TOP - SHORT, POOL_QUERY);
+        expect(stateReads(query).length).toBe(10);
+        expect(keyLooks(query)).toEqual([]);
+        // and the answer is the same
+        expect(limited).toEqual(walked.map((w) => ({ ...w, now_ms: expect.anything() })));
+        expect(limited[0]).toMatchObject({ filled_reserve_base: '10', filled_lp_supply: null, newest_ledger: TOP });
+      });
+
+      it('a pool with an older row is walked back as far as it needs, as without the option, and has the same row', async () => {
+        const { ch, old } = await world();
+        const query = jest.spyOn(ch, 'query');
+        const limited = await fillForward(ch, [old], TOP, TOP - SHORT, POOL_QUERY, { onlyPoolsWithOlderRows: true });
+        const limitedReads = stateReads(query).map((r) => r.range);
+        query.mockClear();
+        const walked = await fillForward(ch, [old], TOP, TOP - SHORT, POOL_QUERY);
+        // the same window and the same steps up to the one that holds the row (5,000 back: the sixth step)
+        expect(limitedReads).toEqual(
+          stateReads(query)
+            .slice(0, limitedReads.length)
+            .map((r) => r.range),
+        );
+        expect(limitedReads).toHaveLength(7);
+        expect(limited).toEqual(walked.map((w) => ({ ...w, now_ms: expect.anything() })));
+        expect(limited[0]).toMatchObject({ filled_lp_supply: '3', filled_trading_fee: 111, filled_reserve_base: '10' });
+      });
+
+      it('with several pools, only those with older rows are walked, and a pool that is complete is not looked at', async () => {
+        const { ch, young, old } = await world();
+        const complete = 'rCompleteWalk'.padEnd(33, '0');
+        await insertStates(ch, [
+          state({ amm_account: complete, ledger_index: TOP - 20, ...(NEW as Partial<AmmPoolStatesRow>) }),
+        ]);
+        const query = jest.spyOn(ch, 'query');
+        const accounts = [complete, old, young].sort();
+        const rows = await fillForward(ch, accounts, TOP, TOP - SHORT, POOL_QUERY, { onlyPoolsWithOlderRows: true });
+        expect(rows.map((r) => r.amm_account)).toEqual(accounts);
+        const walks = stateReads(query).slice(1);
+        expect(walks.length).toBeGreaterThan(0);
+        for (const walk of walks) expect(walk.accounts).toEqual([old]);
+        // the key of each pool that the window left incomplete is looked at; the complete one is not
+        const looks = keyLooks(query);
+        expect(looks.map((l) => l.account).sort()).toEqual([old, young].sort());
+        for (const look of looks) expect(look.before).toBe(TOP - SHORT);
+        const byAccount = new Map(rows.map((r) => [r.amm_account, r]));
+        expect(byAccount.get(old)).toMatchObject({ filled_lp_supply: '3' });
+        expect(byAccount.get(young)).toMatchObject({ filled_lp_supply: null, filled_reserve_base: '10' });
+        expect(byAccount.get(complete)).toMatchObject({ filled_lp_supply: '30' });
+      });
+
+      it('is off unless asked for: the aggregators walk back as before', async () => {
+        const { ch, young } = await world();
+        const query = jest.spyOn(ch, 'query');
+        await recomputeAmmPools(ch, noRates(), [young], { fillWindow: SHORT });
+        expect(keyLooks(query)).toEqual([]);
+        expect(stateReads(query)).toHaveLength(10);
       });
     });
 

@@ -1,5 +1,6 @@
 import { RIPPLE_EPOCH_MS } from '@gatehub/data-api-shared';
-import { fmtTime, precision8 } from '../common/format';
+import BigNumber from 'bignumber.js';
+import { fmtTime } from '../common/format';
 
 /**
  * The objects of the AMM pool routes: `Pool` (`/v2/amm/pools` and `/v2/amm/pools/:pool`), `PoolState` (the history of a
@@ -8,9 +9,10 @@ import { fmtTime, precision8 } from '../common/format';
  *
  * Keys are flat, in the style of the exchange objects: `base_currency`, `base_issuer`, `counter_currency`,
  * `counter_issuer`, never an asset object. The pair is the pool's own, in the canonical order the pool is stored in, and the
- * issuer of the native currency has no key. Amounts are the exact strings stored; `value_native` is a string too, eight
- * significant digits (`precision8`, as a rate is: a value of 1e8 or more is therefore written in exponent form, as in
- * `1.2345679e+8`). Counts, ledger indexes and `trading_fee` (units of 1/100000, as stored)
+ * issuer of the native currency has no key. Amounts are the exact strings stored; `value_native` is a string too, a plain decimal
+ * of eight significant digits with the trailing zeros dropped and never the exponent form (`valueText`: 123 is `"123"`,
+ * 99999999.5 is `"100000000"`, 1e-7 is `"0.0000001"`; `precision8`, the text of a rate, would write `1.2345679e+8` from 1e8 up
+ * and `1.0000000e-7` from 1e-7 down). Counts, ledger indexes and `trading_fee` (units of 1/100000, as stored)
  * are numbers; times are `fmtTime` (`YYYY-MM-DDTHH:mm:ssZ`). A key that is undefined or null is left out, and `deleted` is
  * a boolean that every pool and state has. The auction slot is grouped, `auction_slot: {holder, price, discounted_fee,
  * expiration}` (the expiration a time, converted from Ripple seconds), and left out when the pool has no slot.
@@ -303,9 +305,18 @@ function slotOf(v: {
   return Object.keys(slot).length > 0 ? { auction_slot: slot } : {};
 }
 
-/** The value of a pool in the native currency: eight significant digits, as a string. */
+/**
+ * The text of a value in the native currency: eight significant digits as a plain decimal. `toPrecision(8)` rounds, and writes
+ * the exponent form when the exponent is 8 or more or -7 or less (also when the rounding carries 99999999.5 up to 1.0000000e+8);
+ * a BigNumber made of that text writes it out with `toFixed()`, without the trailing zeros.
+ */
+function valueText(value: number): string {
+  return new BigNumber(new BigNumber(value).toPrecision(8)).toFixed();
+}
+
+/** The value of a pool in the native currency, as its text. */
 const valueOf = (value: number | null | undefined): { value_native?: string } =>
-  present(value) ? { value_native: precision8(value) } : {};
+  present(value) ? { value_native: valueText(value) } : {};
 
 /** The Pool of a row of `amm_pools`. */
 export function toPoolObject(row: StoredPool): PoolObject {

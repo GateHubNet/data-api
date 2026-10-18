@@ -2,17 +2,17 @@ import {
   Asset,
   canonicalPair,
   ClickHouseService,
-  deepenFill,
   FilledColumn,
-  FillForwardRow,
-  fillForwardSql,
+  fillForward,
+  POOL_FIELDS,
+  POOL_QUERY,
   readDistinctPage,
   Table,
 } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { notFound } from '../common/errors';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
-import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
+import { columnsOf, decodeMarker, keysetClause, KeysetKey, KeyValue, paginate } from '../common/pagination';
 import {
   POOL_COLUMNS,
   POOL_DAY_COLUMNS,
@@ -32,7 +32,6 @@ import {
   decodePoolsMarker,
   EMPTY_FILL,
   encodePoolsMarker,
-  FILLED_COLUMNS,
   FilledValues,
   poolsKeyset,
 } from './amm-paging';
@@ -113,12 +112,6 @@ export interface DaysPage {
 
 /** The output columns of the fill-forward of a pool's state rows. */
 type FilledRow = Record<`filled_${FilledColumn}`, string | number | null>;
-
-const CARRY_QUERY = {
-  fields: FILLED_COLUMNS,
-  // the carry-in is exact: a column that is still null in the window is looked for further back
-  required: FILLED_COLUMNS.map((c) => `filled_${c}`),
-};
 
 /**
  * The AMM pool routes: the list of pools, a pool by its account or its pair, and its history.
@@ -264,7 +257,7 @@ export class AmmPoolsService {
   private statePage(
     q: HistoryQuery,
     range: { min: number; max: number },
-    after: Array<string | number> | undefined,
+    after: KeyValue[] | undefined,
   ): Promise<StoredPoolState[]> {
     const cursor = keysetClause(STATE_KEYS, q.descending, after);
     return readDistinctPage<StoredPoolState>(this.ch, {
@@ -289,34 +282,27 @@ export class AmmPoolsService {
    * `fillForward` (a window of `AMM_HISTORY_CARRY_LEDGERS`, then further back in doubling steps as far as a column needs:
    * exact and bounded), those of `ledger` itself before `tx` are read apart and put on top of it.
    *
-   * The window is read first, and the steps back only when it leaves a column null and the pool has older rows at all (one
-   * look at its key): a pool that has all its values in the window costs one read, and the first page of a pool, which has
-   * nothing before it, does not walk back to the first ledger of the chain one step after the other.
+   * The window is read first, and the steps back only when it leaves a column null and the pool has older rows at all
+   * (`onlyPoolsWithOlderRows`): a pool that has all its values in the window costs one read, and the first page of a pool, which
+   * has nothing before it, does not walk back to the first ledger of the chain one step after the other.
    */
   private async carryIn(pool: string, ledger: number, tx: number): Promise<FilledValues> {
     let state: FilledValues = EMPTY_FILL;
     if (ledger > 0) {
       const upTo = ledger - 1;
-      const from = Math.max(0, upTo - AMM_HISTORY_CARRY_LEDGERS + 1);
-      const rows = new Map<string, FillForwardRow & FilledRow>();
-      for (const row of await this.ch.query<FillForwardRow & FilledRow>(fillForwardSql(CARRY_QUERY), {
-        accounts: [pool],
-        fill_from: from,
-        fill_up_to: upTo,
-      })) {
-        rows.set(row.amm_account, row);
-      }
-      const window = rows.get(pool);
-      const complete = window !== undefined && FILLED_COLUMNS.every((c) => window[`filled_${c}`] !== null);
-      if (!complete && from > 0 && (await this.hasStateBefore(pool, from))) {
-        await deepenFill(this.ch, rows, [pool], upTo, from, CARRY_QUERY);
-      }
-      const row = rows.get(pool);
+      const [row] = await fillForward<FilledRow>(
+        this.ch,
+        [pool],
+        upTo,
+        Math.max(0, upTo - AMM_HISTORY_CARRY_LEDGERS + 1),
+        POOL_QUERY,
+        { onlyPoolsWithOlderRows: true },
+      );
       if (row !== undefined) state = fromFill(row);
     }
     if (tx > 0) {
       const earlier = await this.ch.query<FilledValues>(
-        `SELECT ${FILLED_COLUMNS.join(', ')}
+        `SELECT ${POOL_FIELDS.join(', ')}
            FROM ${Table.AmmPoolStates}
           WHERE amm_account = {pool:String} AND ledger_index = {ledger:UInt32} AND tx_index < {tx:UInt32}
           ORDER BY amm_account ASC, ledger_index ASC, tx_index ASC
@@ -327,18 +313,6 @@ export class AmmPoolsService {
       if (filled.length > 0) state = valuesOf(filled[filled.length - 1]);
     }
     return state;
-  }
-
-  /** Whether the pool has a state row in a ledger before `ledger`. */
-  private async hasStateBefore(pool: string, ledger: number): Promise<boolean> {
-    const rows = await this.ch.query(
-      `SELECT 1 AS found
-         FROM ${Table.AmmPoolStates}
-        WHERE amm_account = {pool:String} AND ledger_index < {ledger:UInt32}
-        LIMIT 1`,
-      { pool, ledger },
-    );
-    return rows.length > 0;
   }
 
   /** 404 `pool not found` unless the pool has a state in a ledger that is committed. */
@@ -416,10 +390,10 @@ export class AmmPoolsService {
 
 /** The state a fill-forward row says (`filled_<column>`). */
 function fromFill(row: FilledRow): FilledValues {
-  return Object.fromEntries(FILLED_COLUMNS.map((column) => [column, row[`filled_${column}`] ?? null])) as FilledValues;
+  return Object.fromEntries(POOL_FIELDS.map((column) => [column, row[`filled_${column}`] ?? null])) as FilledValues;
 }
 
 /** The filled columns of a row that has them under their own names. */
 function valuesOf(row: FilledValues): FilledValues {
-  return Object.fromEntries(FILLED_COLUMNS.map((column) => [column, row[column] ?? null])) as FilledValues;
+  return Object.fromEntries(POOL_FIELDS.map((column) => [column, row[column] ?? null])) as FilledValues;
 }
