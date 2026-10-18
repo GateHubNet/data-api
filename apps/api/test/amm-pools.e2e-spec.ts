@@ -11,8 +11,8 @@ import {
   Table,
 } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
-import { encodeAccountID } from 'ripple-address-codec';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { accountAt, compare, defined, hashOf, insertParts, iso, primaryKeys, qs } from './support/amm';
 import { csvDisposition } from './support/csv';
 import { fixtureSource } from './support/fixtures';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead } from './support/plans';
@@ -46,10 +46,6 @@ import {
 
 const NATIVE = 'XRP';
 const RIPPLE_EPOCH = 946_684_800;
-const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
-/** The same object without the keys that are undefined or null: what the API leaves out. */
-const defined = (o: Record<string, unknown>): Record<string, unknown> =>
-  Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null));
 /**
  * A value of a pool as the API writes it: a plain decimal of eight significant digits, never the exponent form, trailing
  * zeros dropped (123 is "123", 99999999.5 is "100000000", 1e-7 is "0.0000001"). Worked out here with `precision()` of
@@ -57,21 +53,6 @@ const defined = (o: Record<string, unknown>): Record<string, unknown> =>
  */
 const fixed8 = (n: number | string): string => new BigNumber(n).precision(8).toFixed();
 const side = (currency: string, issuer: string): string => (issuer ? `${currency}+${issuer}` : currency);
-/** `?a=1&b=2`, encoded. */
-const qs = (params: Record<string, string | number | boolean>): string =>
-  `?${new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)]))}`;
-const accountAt = (n: number): string => encodeAccountID(Buffer.from(n.toString(16).padStart(40, '0'), 'hex'));
-const hashOf = (n: number): string => n.toString(16).toUpperCase().padStart(64, '0');
-const compare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
-
-/**
- * Inserts each group of rows as its own insert, so as its own part. Rows of one insert with the same key are collapsed on
- * insert (`optimize_on_insert` runs the merge of a ReplacingMergeTree over the block), so the versions of one pool or pool-day
- * that a reader has to choose between (they exist until a merge) have to come in different inserts.
- */
-async function insertParts(h: Harness, table: Table, ...parts: unknown[][]): Promise<void> {
-  for (const rows of parts) await h.ch.insert(table, rows);
-}
 
 /** The pinned key order of the objects (written out here once more, apart from the code under test). */
 const POOL_KEYS = [
@@ -312,27 +293,6 @@ interface DaysBody {
 /** The base64url JSON marker of a key. */
 const decodeMarker = (marker: string): unknown => JSON.parse(Buffer.from(marker, 'base64url').toString('utf8'));
 const lines = (text: string): string[] => text.split('\n');
-
-/** What an `EXPLAIN indexes = 1` says about the primary key of each read of a MergeTree table, in plan order. */
-interface PrimaryKeyIndex {
-  keys: string[];
-  condition: string;
-  parts: [number, number];
-  granules: [number, number];
-}
-function primaryKeys(plan: string): PrimaryKeyIndex[] {
-  const text = plan.replace(/[│├└─]/g, ' ');
-  return [
-    ...text.matchAll(
-      /PrimaryKey\s+Keys:\s+((?:\w+\s+)+?)Condition: ([^\n]*)\n\s+Parts: (\d+)\/(\d+)\n\s+Granules: (\d+)\/(\d+)/g,
-    ),
-  ].map((m) => ({
-    keys: m[1].trim().split(/\s+/),
-    condition: m[2],
-    parts: [Number(m[3]), Number(m[4])],
-    granules: [Number(m[5]), Number(m[6])],
-  }));
-}
 
 // =====================================================================================================================
 describe('the AMM pool routes over the recorded AMM ledgers', () => {

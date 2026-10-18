@@ -36,6 +36,32 @@ import { fmtTime } from '../common/format';
  * A CSV has the same columns on every page whatever the objects of the page hold (a CSV takes its columns from the keys of
  * the rows, and a key that is left out would move them): the `*CsvRow` functions give every column, `null` (an empty cell)
  * where the object has none, and the slot always as its four columns.
+ *
+ * The objects of the event routes follow the same rules. They carry no pair: an amount is on the base or the counter of the
+ * pool they name (`amm_account`), whose pair `GET /v2/amm/pools/:pool` gives.
+ *
+ * LiquidityEvent (`/pools/:pool/liquidity`, `/accounts/:address/amm_liquidity`; one create, deposit, withdraw, clawback or
+ * delete; amounts signed from the pool's side, + into the pool; `lp_tokens` + minted, - burned; `account` is the liquidity
+ * provider, `initiator` who sent the transaction; the `mode` of a deposit or withdrawal only), in this order:
+ *   amm_account, ledger_index, tx_index, tx_hash, executed_time, account, initiator, event, mode?, base_amount,
+ *   counter_amount, lp_tokens
+ *
+ * Vote (`/pools/:pool/governance`; `type` is `vote`), in this order:
+ *   amm_account, ledger_index, tx_index, tx_hash, executed_time, type, account, fee_voted?, trading_fee_after?
+ *
+ * Bid (`type` is `bid`; `price_paid` the LP tokens the bid burned; `auction_slot` the slot after the bid, left out when the
+ * row holds none of it, with `auth_accounts` always a list), in this order:
+ *   amm_account, ledger_index, tx_index, tx_hash, executed_time, type, account, bid_min?, bid_max?, price_paid?,
+ *   auction_slot? {holder?, discounted_fee?, expiration?, auth_accounts}
+ *
+ * Position (`/accounts/:address/amm_positions`; the account's LP tokens of one pool): `lp_balance` is the balance as stored,
+ * `share` is `lp_balance / lp_supply` and each amount `lp_balance * reserve / lp_supply` (one division, so one rounding), both
+ * worked out with decimals, never floats, and rounded to 30 significant digits when they do not end sooner; plain decimals,
+ * never the exponent form. An amount whose reserve is unknown has no key. In this order:
+ *   pool, lp_currency, lp_balance, share, base_amount?, counter_amount?
+ *
+ * The CSV of a vote or a bid has the columns of both kinds (the `auth_accounts` of the slot in one cell, separated by
+ * semicolons); the CSV of a liquidity event has every column of the object, the mode empty where it has none.
  */
 
 /** A count as ClickHouse hands it over: a number or, depending on the settings of the client, the text of its digits. */
@@ -117,6 +143,42 @@ export const POOL_DAY_COLUMNS = [
   'value_native',
 ].join(', ');
 
+/** The columns of `amm_liquidity` and `account_amm_liquidity` that a liquidity event is made of; the close time as unix seconds. */
+export const LIQUIDITY_COLUMNS = [
+  'amm_account',
+  'ledger_index',
+  'tx_index',
+  'tx_hash',
+  'toUnixTimestamp(close_time) AS close_time',
+  'account',
+  'initiator',
+  'event',
+  'mode',
+  'base_amount',
+  'counter_amount',
+  'lp_tokens',
+].join(', ');
+
+/** The columns of `amm_governance` that a vote or a bid is made of; the close time as unix seconds. */
+export const GOVERNANCE_COLUMNS = [
+  'amm_account',
+  'ledger_index',
+  'tx_index',
+  'tx_hash',
+  'toUnixTimestamp(close_time) AS close_time',
+  'kind',
+  'account',
+  'fee_voted',
+  'trading_fee_after',
+  'bid_min',
+  'bid_max',
+  'price_paid',
+  'slot_holder',
+  'slot_discounted_fee',
+  'slot_expiration',
+  'auth_accounts',
+].join(', ');
+
 // -- stored rows ---------------------------------------------------------------------------------------------------
 
 /** A row of `amm_pools` as `POOL_COLUMNS` reads it. */
@@ -191,6 +253,47 @@ export interface StoredPoolDay {
   value_native: number | null;
 }
 
+/** A row of `amm_liquidity` (or `account_amm_liquidity`) as `LIQUIDITY_COLUMNS` reads it. */
+export interface StoredLiquidity {
+  amm_account: string;
+  ledger_index: Count;
+  tx_index: Count;
+  tx_hash: string;
+  /** Unix seconds. */
+  close_time: Count;
+  account: string;
+  initiator: string;
+  event: string;
+  /** `''` for an event that has no mode. */
+  mode: string;
+  base_amount: string;
+  counter_amount: string;
+  lp_tokens: string;
+}
+
+/** A row of `amm_governance` as `GOVERNANCE_COLUMNS` reads it. */
+export interface StoredGovernance {
+  amm_account: string;
+  ledger_index: Count;
+  tx_index: Count;
+  tx_hash: string;
+  /** Unix seconds. */
+  close_time: Count;
+  /** `vote` or `bid`. */
+  kind: string;
+  account: string;
+  fee_voted: Count | null;
+  trading_fee_after: Count | null;
+  bid_min: string | null;
+  bid_max: string | null;
+  price_paid: string | null;
+  slot_holder: string | null;
+  slot_discounted_fee: Count | null;
+  /** Ripple seconds. */
+  slot_expiration: Count | null;
+  auth_accounts: string[];
+}
+
 // -- objects -------------------------------------------------------------------------------------------------------
 
 export interface AuctionSlotObject {
@@ -263,6 +366,63 @@ export interface PoolDayObject {
   lp_supply?: string;
   trading_fee?: number;
   value_native?: string;
+}
+
+export interface LiquidityObject {
+  amm_account: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  executed_time: string;
+  account: string;
+  initiator: string;
+  event: string;
+  mode?: string;
+  base_amount: string;
+  counter_amount: string;
+  lp_tokens: string;
+}
+
+interface GovernanceHead {
+  amm_account: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  executed_time: string;
+  account: string;
+}
+
+export interface VoteObject extends GovernanceHead {
+  type: 'vote';
+  fee_voted?: number;
+  trading_fee_after?: number;
+}
+
+export interface BidSlotObject {
+  holder?: string;
+  discounted_fee?: number;
+  /** `YYYY-MM-DDTHH:mm:ssZ`. */
+  expiration?: string;
+  auth_accounts: string[];
+}
+
+export interface BidObject extends GovernanceHead {
+  type: 'bid';
+  bid_min?: string;
+  bid_max?: string;
+  price_paid?: string;
+  auction_slot?: BidSlotObject;
+}
+
+export type GovernanceObject = VoteObject | BidObject;
+
+export interface PositionObject {
+  pool: string;
+  lp_currency: string;
+  lp_balance: string;
+  share: string;
+  base_amount?: string;
+  counter_amount?: string;
 }
 
 /** `null` and `undefined` are the same here: nothing (the key is left out). */
@@ -388,6 +548,112 @@ export function toPoolDayObject(account: string, row: StoredPoolDay): PoolDayObj
     ...key('lp_supply', row.lp_supply),
     ...countKey('trading_fee', row.trading_fee),
     ...valueOf(row.value_native),
+  };
+}
+
+/** The LiquidityObject of a row of `amm_liquidity`. `mode` is stored as `''` where the event has none. */
+export function toLiquidityObject(row: StoredLiquidity): LiquidityObject {
+  return {
+    amm_account: row.amm_account,
+    ledger_index: num(row.ledger_index),
+    tx_index: num(row.tx_index),
+    tx_hash: row.tx_hash,
+    executed_time: fmtTime(num(row.close_time)),
+    account: row.account,
+    initiator: row.initiator,
+    event: row.event,
+    ...(row.mode !== '' && { mode: row.mode }),
+    base_amount: row.base_amount,
+    counter_amount: row.counter_amount,
+    lp_tokens: row.lp_tokens,
+  };
+}
+
+/** The Vote or the Bid of a row of `amm_governance`: a vote serves nothing of a bid and a bid nothing of a vote. */
+export function toGovernanceObject(row: StoredGovernance): GovernanceObject {
+  const head = {
+    amm_account: row.amm_account,
+    ledger_index: num(row.ledger_index),
+    tx_index: num(row.tx_index),
+    tx_hash: row.tx_hash,
+    executed_time: fmtTime(num(row.close_time)),
+  };
+  if (row.kind !== 'bid') {
+    return {
+      ...head,
+      type: 'vote',
+      account: row.account,
+      ...countKey('fee_voted', row.fee_voted),
+      ...countKey('trading_fee_after', row.trading_fee_after),
+    };
+  }
+  const slot = {
+    ...key('holder', row.slot_holder),
+    ...countKey('discounted_fee', row.slot_discounted_fee),
+    ...(present(row.slot_expiration) && {
+      expiration: fmtTime(RIPPLE_EPOCH_SECONDS + num(row.slot_expiration)),
+    }),
+  };
+  const known = Object.keys(slot).length > 0 || row.auth_accounts.length > 0;
+  return {
+    ...head,
+    type: 'bid',
+    account: row.account,
+    ...key('bid_min', row.bid_min),
+    ...key('bid_max', row.bid_max),
+    ...key('price_paid', row.price_paid),
+    ...(known && { auction_slot: { ...slot, auth_accounts: [...row.auth_accounts] } }),
+  };
+}
+
+// -- positions -----------------------------------------------------------------------------------------------------
+
+/** Division with room for the amounts the ledger allows (1e-81 to 1e96): a quotient is cut to `POSITION_DIGITS` afterwards. */
+const Wide = BigNumber.clone({ DECIMAL_PLACES: 200 });
+
+/** The significant digits of a share and of an amount of a position that does not end sooner. */
+const POSITION_DIGITS = 30;
+
+/** What a position is made of: the account's balance of an LP token, and its pool as of the ledger asked for. */
+export interface PositionInput {
+  pool: string;
+  lp_currency: string;
+  /** The balance of the account's line, as stored. */
+  lp_balance: string;
+  /** The supply of LP tokens of the pool; `null` when unknown. */
+  lp_supply: string | null;
+  reserve_base: string | null;
+  reserve_counter: string | null;
+  /** The pool had been deleted. */
+  deleted: boolean;
+}
+
+/** A decimal as plain text, cut to `POSITION_DIGITS` significant digits: the exponent form is never written. */
+const plain = (value: BigNumber): string => new BigNumber(value).precision(POSITION_DIGITS).toFixed();
+
+/**
+ * The Position of an LP-token balance, or `undefined` for a balance that is zero (or no number) and for a pool without a
+ * supply (unknown or 0) or a deleted one: those hold nothing. `lp_balance * reserve / lp_supply`, in decimals.
+ */
+export function toPositionObject(input: PositionInput): PositionObject | undefined {
+  const balance = new BigNumber(input.lp_balance);
+  const supply = input.lp_supply === null ? undefined : new BigNumber(input.lp_supply);
+  if (balance.isNaN() || balance.isZero()) return undefined;
+  if (input.deleted || supply === undefined || supply.isNaN() || supply.isZero()) return undefined;
+  const amount = (reserve: string | null): string | undefined => {
+    if (reserve === null) return undefined;
+    const held = new BigNumber(reserve);
+    return held.isNaN() ? undefined : plain(new Wide(balance).times(held).dividedBy(supply));
+  };
+  const base = amount(input.reserve_base);
+  const counter = amount(input.reserve_counter);
+  return {
+    pool: input.pool,
+    lp_currency: input.lp_currency,
+    lp_balance: balance.toFixed(),
+    share: plain(new Wide(balance).dividedBy(supply)),
+    ...(base !== undefined && { base_amount: base }),
+    ...(counter !== undefined && { counter_amount: counter }),
   };
 }
 
@@ -546,5 +812,74 @@ export function toPoolDayCsvRow(day: PoolDayObject): PoolDayCsvRow {
     lp_supply: day.lp_supply ?? null,
     trading_fee: day.trading_fee ?? null,
     value_native: day.value_native ?? null,
+  };
+}
+
+export type LiquidityCsvRow = Omit<LiquidityObject, 'mode'> & { mode: string | null };
+
+/** The event as a row of the CSV: every column, in the pinned order, the mode empty where there is none. */
+export function toLiquidityCsvRow(event: LiquidityObject): LiquidityCsvRow {
+  return {
+    amm_account: event.amm_account,
+    ledger_index: event.ledger_index,
+    tx_index: event.tx_index,
+    tx_hash: event.tx_hash,
+    executed_time: event.executed_time,
+    account: event.account,
+    initiator: event.initiator,
+    event: event.event,
+    mode: event.mode ?? null,
+    base_amount: event.base_amount,
+    counter_amount: event.counter_amount,
+    lp_tokens: event.lp_tokens,
+  };
+}
+
+export interface GovernanceCsvRow {
+  amm_account: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  executed_time: string;
+  type: 'vote' | 'bid';
+  account: string;
+  fee_voted: number | null;
+  trading_fee_after: number | null;
+  bid_min: string | null;
+  bid_max: string | null;
+  price_paid: string | null;
+  auction_slot: {
+    holder: string | null;
+    discounted_fee: number | null;
+    expiration: string | null;
+    /** The accounts, separated by semicolons: one cell. */
+    auth_accounts: string | null;
+  };
+}
+
+/** The vote or bid as a row of the CSV: the columns of both kinds, in the pinned order, `null` where the object has none. */
+export function toGovernanceCsvRow(item: GovernanceObject): GovernanceCsvRow {
+  const vote = item.type === 'vote' ? item : undefined;
+  const bid = item.type === 'bid' ? item : undefined;
+  const accounts = bid?.auction_slot?.auth_accounts ?? [];
+  return {
+    amm_account: item.amm_account,
+    ledger_index: item.ledger_index,
+    tx_index: item.tx_index,
+    tx_hash: item.tx_hash,
+    executed_time: item.executed_time,
+    type: item.type,
+    account: item.account,
+    fee_voted: vote?.fee_voted ?? null,
+    trading_fee_after: vote?.trading_fee_after ?? null,
+    bid_min: bid?.bid_min ?? null,
+    bid_max: bid?.bid_max ?? null,
+    price_paid: bid?.price_paid ?? null,
+    auction_slot: {
+      holder: bid?.auction_slot?.holder ?? null,
+      discounted_fee: bid?.auction_slot?.discounted_fee ?? null,
+      expiration: bid?.auction_slot?.expiration ?? null,
+      auth_accounts: accounts.length > 0 ? accounts.join(';') : null,
+    },
   };
 }

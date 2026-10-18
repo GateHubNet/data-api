@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { RatesModule } from '../exchanges/rates.module';
+import { AccountAmmController } from './account-amm.controller';
+import { AccountAmmService } from './account-amm.service';
 import { AccountBalanceChangesController } from './account-balance-changes.controller';
 import { AccountBalanceChangesService } from './account-balance-changes.service';
 import { AccountBalancesController } from './account-balances.controller';
@@ -24,8 +26,9 @@ import { LiveLedgerService } from './live-ledger.service';
  * `GET /v2/accounts` and `GET /v2/accounts/:address`, `GET /v2/accounts/:address/transactions[/:sequence]`,
  * `GET /v2/accounts/:address/{payments,exchanges[/:base[/:counter]],balance_changes}`,
  * `GET /v2/accounts/:address/reports[/:date]` and `GET /v2/accounts/:address/stats/:family` (their values are in the
- * native currency, converted with the `RatesService` of `RatesModule`), and the two routes that ask the live node
- * instead of the database, `GET /v2/accounts/:address/{balances,orders}`.
+ * native currency, converted with the `RatesService` of `RatesModule`), the two routes that ask the live node
+ * instead of the database, `GET /v2/accounts/:address/{balances,orders}`, and the AMM routes of an account,
+ * `GET /v2/accounts/:address/{amm_liquidity,amm_positions}`.
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
@@ -43,6 +46,7 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountOrdersController,
     AccountReportsController,
     AccountStatsController,
+    AccountAmmController,
   ],
   providers: [
     AccountsService,
@@ -55,6 +59,7 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountOrdersService,
     AccountReportsService,
     AccountStatsService,
+    AccountAmmService,
   ],
 })
 export class AccountsModule {}

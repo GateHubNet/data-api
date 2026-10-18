@@ -8,12 +8,13 @@ import { parseAssetPair, splitAsset } from '../common/asset-param';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { badRequest } from '../common/errors';
 import { setLinkHeader } from '../common/pagination';
-import { ammFilter, bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
+import { bool, first, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { NETWORK_PROFILE } from '../config/api.config';
 import { AggregateCsvRow, CandleObject, ReducedObject, toAggregateCsvRow } from './exchange-aggregate';
 import { EXCHANGE_INTERVALS, ExchangeInterval, isExchangeInterval, readInterval } from './exchange-intervals';
 import { ExchangeObject, toCsvRow } from './exchange-object';
+import { exchangesWindow } from './exchanges-window';
 import { ExchangesService, ExchangesWindow } from './exchanges.service';
 
 type ExchangesRows =
@@ -153,25 +154,9 @@ export class ExchangesController {
     return this.answer(req, res, wantsCsv(query) ? page.exchanges.map(toCsvRow) : page.exchanges, page.marker);
   }
 
-  /**
-   * What both routes read after the pair: `start` (2013-01-01 when missing or empty), `end`, `limit` (200, at most 400;
-   * a text that is not a number answers `invalid limit: NaN`, as the original did), then `amm` (400 `invalid amm
-   * filter - use: include, exclude, only`), `autobridged`, `descending` and the `marker`, which the service checks.
-   */
+  /** What both routes read after the pair (see `exchangesWindow`). */
   private window(query: QueryParams): ExchangesWindow & { start: Date } {
-    const start = dateParam(query, 'start', 'invalid start date format', '2013-01-01');
-    const end = dateParam(query, 'end', 'invalid end date format');
-    const limit = limitParam(query, { def: 200, max: 400, nanError: 'invalid limit: NaN' });
-    const amm = ammFilter(query);
-    return {
-      start: start.date,
-      ...(end && { endExclusive: endExclusive(end) }),
-      autobridged: bool(query, 'autobridged'),
-      amm,
-      descending: bool(query, 'descending'),
-      limit,
-      marker: first(query, 'marker'),
-    };
+    return exchangesWindow(query);
   }
 
   /**

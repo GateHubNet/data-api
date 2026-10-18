@@ -37,7 +37,7 @@ import { ammOracle } from '../../test/amm-oracle';
 import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { getNetworkProfile } from '../network';
 import { deepFreeze } from '../test-utils/deep-freeze';
-import { AmmParser, ParsedAmm, ParsedAmmSwap } from './amm.parser';
+import { AMM_LIQUIDITY_EVENTS, AmmParser, ParsedAmm, ParsedAmmSwap } from './amm.parser';
 import { BalanceChangesParser } from './balance-changes.parser';
 import { ExchangeParser } from './exchanges.parser';
 import { ParseContext, parseContextFor, ParserTx, toParserTx } from './parser.interface';
@@ -752,6 +752,21 @@ describe('AmmParser', () => {
         lp_supply: '0',
         deleted: true,
       });
+    });
+
+    it('AMM_LIQUIDITY_EVENTS is the events the parser writes, all five of them and no other', async () => {
+      const written = new Set<string>();
+      for (const tx of [
+        await recorded('create'),
+        await recorded('deposit_two_asset'),
+        await recorded('withdraw_two_asset'),
+        await caseTx('clawback'),
+        await caseTx('delete'),
+      ]) {
+        for (const row of parser.parse(tx, XRPL).liquidity) written.add(row.event);
+      }
+      expect([...written].sort()).toEqual([...AMM_LIQUIDITY_EVENTS].sort());
+      expect(AMM_LIQUIDITY_EVENTS).toHaveLength(5);
     });
 
     describe('mode follows the flags', () => {

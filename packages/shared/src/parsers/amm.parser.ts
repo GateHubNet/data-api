@@ -61,6 +61,13 @@ export interface ParsedAmmState {
   deleted: boolean;
 }
 
+/**
+ * The events a liquidity row can have (spec §2.4): the one list of them, which the API validates the `event` filter of its
+ * liquidity routes against.
+ */
+export const AMM_LIQUIDITY_EVENTS = ['create', 'deposit', 'withdraw', 'clawback', 'delete'] as const;
+export type AmmLiquidityEvent = (typeof AMM_LIQUIDITY_EVENTS)[number];
+
 /** One create, deposit, withdraw, clawback or delete (spec §2.4). Amounts are signed: + into the pool, − out of it. */
 export interface ParsedAmmLiquidity {
   amm_account: string;
@@ -68,7 +75,7 @@ export interface ParsedAmmLiquidity {
   account: string;
   /** The transaction's `Account`. */
   initiator: string;
-  event: 'create' | 'deposit' | 'withdraw' | 'clawback' | 'delete';
+  event: AmmLiquidityEvent;
   /** The AMMDeposit or AMMWithdraw mode its flags name; absent for the other events. */
   mode?: string;
   base_amount: string;
@@ -141,7 +148,7 @@ const MODES: Readonly<Record<string, ReadonlyArray<readonly [number, string]>>> 
   ],
 };
 
-const LIQUIDITY_EVENTS: Readonly<Record<string, ParsedAmmLiquidity['event']>> = {
+const LIQUIDITY_EVENTS: Readonly<Record<string, AmmLiquidityEvent>> = {
   AMMCreate: 'create',
   AMMDeposit: 'deposit',
   AMMWithdraw: 'withdraw',

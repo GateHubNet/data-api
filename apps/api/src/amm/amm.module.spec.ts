@@ -1,3 +1,4 @@
+import { AmmEventsController } from './amm-events.controller';
 import { AmmPairController } from './amm-pools.controller';
 import { AmmModule } from './amm.module';
 
@@ -11,5 +12,11 @@ describe('AmmModule', () => {
     expect(controllers.length).toBeGreaterThanOrEqual(2);
     expect(controllers[controllers.length - 1]).toBe(AmmPairController);
     expect(controllers.filter((c) => c === AmmPairController)).toHaveLength(1);
+  });
+
+  it('registers the events of a pool (swaps, liquidity, governance) before the pair form', () => {
+    const controllers = Reflect.getMetadata('controllers', AmmModule) as unknown[];
+    expect(controllers).toContain(AmmEventsController);
+    expect(controllers.indexOf(AmmEventsController)).toBeLessThan(controllers.indexOf(AmmPairController));
   });
 });

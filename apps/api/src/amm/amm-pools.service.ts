@@ -67,6 +67,10 @@ const MAX_DAY = 65_535 * DAY_SECONDS;
 /** `YYYY-MM-DD` of a time in unix seconds. */
 const dayText = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
 
+/** The Asset of a pair of columns (the issuer of the native currency is stored as `''`). */
+const assetOfColumns = (currency: string, issuer: string): Asset =>
+  issuer === '' ? { currency } : { currency, issuer };
+
 /** The Asset of a filter as a pair of columns. */
 const columnsOfAsset = (asset: Asset): { currency: string; issuer: string } => ({
   currency: asset.currency,
@@ -315,18 +319,36 @@ export class AmmPoolsService {
     return state;
   }
 
-  /** 404 `pool not found` unless the pool has a state in a ledger that is committed. */
-  private async requirePool(pool: string): Promise<void> {
+  /**
+   * The existence rule of every route of one pool (history, swaps, liquidity, governance): the pool is found as soon as it has a
+   * state row in a committed ledger (`ledger_index` at most the newest `ledgers` row), which is what the ledger writer
+   * commits together with the swap, the liquidity event or the vote that touched the pool. `amm_pools`, which the detail and
+   * the pair read, is rebuilt by the aggregator later: a pool is 404 there until its tick and is found here at once. Returns
+   * the pair of the pool in its canonical order; 404 `pool not found` when there is no such row. One read of the key of the
+   * pool, a granule.
+   */
+  async requirePool(pool: string): Promise<{ base: Asset; counter: Asset }> {
     const head = await this.ranges.latest();
     if (head !== undefined) {
-      const rows = await this.ch.query(
-        `SELECT 1 AS found
+      const [row] = await this.ch.query<{
+        base_currency: string;
+        base_issuer: string;
+        counter_currency: string;
+        counter_issuer: string;
+      }>(
+        `SELECT base_currency, base_issuer, counter_currency, counter_issuer
            FROM ${Table.AmmPoolStates}
           WHERE amm_account = {pool:String} AND ledger_index <= {head:UInt32}
           LIMIT 1`,
         { pool, head },
       );
-      if (rows.length > 0) return;
+      // the assets never change for a pool account: any of its rows names them
+      if (row !== undefined) {
+        return {
+          base: assetOfColumns(row.base_currency, row.base_issuer),
+          counter: assetOfColumns(row.counter_currency, row.counter_issuer),
+        };
+      }
     }
     throw notFound('pool not found');
   }

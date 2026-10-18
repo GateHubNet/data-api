@@ -92,6 +92,11 @@ export interface ExchangesWindow {
 export interface PairExchangesQuery extends ExchangesWindow {
   base: Asset;
   counter: Asset;
+  /**
+   * Only the swaps of this pool (the swaps of `GET /v2/amm/pools/:pool/swaps`): a condition of the capped read beside the pair,
+   * which the skip index on `amm_account` lets skip the granules of the other pools' swaps and of the order book.
+   */
+  ammAccount?: string;
 }
 
 export interface ExchangesPage {
@@ -157,6 +162,7 @@ export class ExchangesService {
       ...(q.autobridged ? ['autobridged_currency IS NOT NULL'] : []),
       // inside the read that is capped: a filter after the page would leave it short or empty
       ...ammConditions(q.amm),
+      ...(q.ammAccount !== undefined ? ['amm_account = {amm_account:String}'] : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
     // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
@@ -172,6 +178,7 @@ export class ExchangesService {
         ...Object.fromEntries(pairValues.map((v, i) => [`pair${i}`, v])),
         min: range.min,
         max: range.max,
+        ...(q.ammAccount !== undefined && { amm_account: q.ammAccount }),
         ...cursor.params,
       },
       limit: q.limit + 1,
