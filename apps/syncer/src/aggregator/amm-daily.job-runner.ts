@@ -4,6 +4,7 @@ import {
   ammDaysDone,
   ammFirstDay,
   computeAmmDaily,
+  markAmmDayOwed,
   RatesService,
 } from '@gatehub/data-api-shared';
 import {
@@ -42,6 +43,8 @@ export interface AmmDailyFunctions {
   versions: typeof ammDailyVersions;
   /** When the first pool activity closed (unix seconds), none without any: where the back-fill starts. */
   firstDay: typeof ammFirstDay;
+  /** Marks the set of a day owed a recompute in the tables (Ruling R-A27): the same rows, not final. */
+  markOwed: typeof markAmmDayOwed;
 }
 
 /** The functions of the shared package, for what the options do not replace. */
@@ -50,6 +53,7 @@ export const AMM_DAILY_FUNCTIONS: AmmDailyFunctions = {
   daysDone: ammDaysDone,
   versions: ammDailyVersions,
   firstDay: ammFirstDay,
+  markOwed: markAmmDayOwed,
 };
 
 /**
@@ -258,8 +262,11 @@ export class AmmDailyJobRunner {
    * The `amm_daily` sets of the days a slice `[start, end)` covers, after its stats. A day is done once per tick (`done` maps a
    * day to the clock reading at which its recompute began), unless the range was marked after that: the ingest wrote more
    * ledgers into the day meanwhile, which that recompute may not have seen. A day that fails does not fail the slice (Ruling
-   * R-A22): it is logged and counted under `amm_daily_dirty` and owed to the retries of the job, and the slice and its range go
-   * on; it is not tried again in this tick. Only the shutdown stops the slice, and then the range stays.
+   * R-A22): it is logged and counted under `amm_daily_dirty`, owed to the retries of the job (in memory: the fast path) and
+   * marked owed in the tables (Ruling R-A27: its set again under a newer version that is not final, so that readers keep their
+   * rows and the back-fill computes the day again, also after a restart, which forgets what is in memory), and the slice and its
+   * range go on; it is not tried again in this tick. A mark that fails is logged and counted as well. Only the shutdown stops
+   * the slice, and then the range stays.
    */
   async daysOfSlice(
     start: number,
@@ -291,7 +298,17 @@ export class AmmDailyJobRunner {
           owed: true,
         });
         done.set(key, Number.POSITIVE_INFINITY); // not again in this tick, whatever the marks
+        await this.markOwed(dayStart);
       }
+    }
+  }
+
+  /** Marks a day owed in the tables (`markAmmDayOwed`); a failure is logged and counted under `amm_daily_dirty`, and that is all. */
+  private async markOwed(dayStart: number): Promise<void> {
+    try {
+      await this.fns.markOwed(this.ctx.ch, new Date(dayStart * 1000));
+    } catch (err) {
+      this.ctx.failed('amm_daily_dirty', err, ` marking ${dayKey(dayStart)} owed in the tables`);
     }
   }
 }

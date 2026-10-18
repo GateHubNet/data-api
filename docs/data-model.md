@@ -217,7 +217,8 @@ for a pool whose creation was not ingested), `last_ledger` (the newest state row
 deleted pool) and `version`. **Written by the aggregator, never by ingest**: every recompute of a pool writes a whole new row under a
 newer version, rebuilt from `amm_pool_states` by the fill-forward, so a recovery delete of a newer state row cannot lose a pool's state
 after merges. **Readers keep the newest version of each pool without `FINAL`**: `ORDER BY amm_account, version DESC LIMIT 1 BY
-amm_account`, and what a pool can lose between versions (`deleted`) is filtered after that.
+amm_account`, and what a pool can lose between versions (`deleted`) is filtered after that. A recompute of a pool that has no state row
+left (a re-ingest dropped them all) deletes its rows with a lightweight `DELETE` (Ruling R-A28).
 
 #### `amm_daily` (`toYYYYMM(day)`, `ReplacingMergeTree(version)`, `ORDER BY (amm_account, day)`)
 One row per pool and UTC day with activity, with the closing state of the pool: the pair, `swap_count`, `volume_base`, `volume_counter`
@@ -232,7 +233,8 @@ which is how it is known to be computed. **The sentinel carries the version of t
 and never return the sentinel itself or a row of an older set, so a pool-day that vanished from a recompute (a re-ingest removed its
 activity) has no row in the newest set and is not served. The sentinel read is a prefix of the primary key (`WHERE amm_account = '' AND
 day = ...`), and the API applies the rule inside its capped read: `(day, version) IN (SELECT day, max(version) ... WHERE amm_account = ''
-... GROUP BY day)`. Nothing relies on a merge.
+... GROUP BY day)`. Nothing relies on a merge. A day whose recompute failed on the dirty path is **marked owed**: its newest set is
+copied under a newer version with `final = 0` (Ruling R-A27), so readers see the same rows and the day is no longer done.
 
 `final` is 1 on the sentinel of a set made once the ingest had passed the day (the newest committed ledger closed at least an hour after
 its end, Ruling R86) and 0 on every other row. `config_version` is the version of the computation, `AMM_DAILY_CONFIG_VERSION` (1 today)

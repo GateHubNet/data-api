@@ -317,8 +317,10 @@ cannot lose a state after merges ([ADR-0011](adr/0011-amm-data-and-swaps-as-exch
 - **The warning.** A list that failed whole but whose halves were rebuilt, with no pool found below it (it fails for its size), is
   counted once as an error and logged as `Aggregator job amm_pools: a batch of N pool(s) failed as a whole, but its halves were rebuilt:
   <cause>`, so that it leaves a trace.
-- **Dirty slices.** `stats_dirty` rebuilds the pools with a touch in the ledgers of each slice (error label `amm_pools_dirty`). A slice
-  is started whole and its batches are not cut by the budget, only by the shutdown.
+- **Dirty slices.** `stats_dirty` rebuilds the pools with a touch in the ledgers of each slice, and the pools whose newest `amm_pools`
+  row last saw one of those ledgers (`last_ledger`: a re-ingest may have dropped their rows there, leaving no touch to find them by),
+  error label `amm_pools_dirty`. A rebuilt pool with no state row left is removed from `amm_pools` with a lightweight DELETE (Ruling
+  R-A28). A slice is started whole and its batches are not cut by the budget, only by the shutdown.
 
 **`amm_daily`** (budget 4 s, **at the first tick and then every 5th tick**: the roadmap's cadence rule keeps the 30 s tick from being over-committed; `AMM_DAILY_EVERY_TICKS`):
 - **Version sets.** A day is written whole under one version: a row for each pool with activity, plus a sentinel row that carries the
@@ -334,7 +336,9 @@ cannot lose a state after merges ([ADR-0011](adr/0011-amm-data-and-swaps-as-exch
 - **Failures.** A day that fails is counted once under `amm_daily` and tried again at the next run; a closed day waits 5 minutes,
   doubling up to an hour, while the older days go on (kept in memory). The days of an `agg_dirty` slice are recomputed with the slice
   (error label `amm_daily_dirty`); a day that fails there does not hold its range: it is counted, owed to the `amm_daily` job (which tries
-  it after 5 minutes, doubling up to an hour), and the slice and the range go on.
+  it after 5 minutes, doubling up to an hour), and the slice and the range go on. The day is also **marked owed in the tables** (Ruling
+  R-A27: its newest set is copied under a newer version with `final = 0`, one `INSERT ... SELECT`), so readers keep the same rows and
+  `ammDaysDone` no longer counts it as done: after a restart, which forgets the in-memory retry, the back-fill computes it again.
 - **Cost.** The closing state and the fee state at the start of a day come from the same windowed fill-forward as `amm_pools`
   (`AMM_FILL_WINDOW_LEDGERS`, then one walk of doubling steps back with the list of what each pool needs, each pool down to its own first
   state ledger at most: Ruling R-A25), so a pool pays for the distance back to its oldest needed value. The swaps are read through the

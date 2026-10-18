@@ -45,6 +45,8 @@ describe('AggregatorService amm_daily job', () => {
   let daysDone: jest.Mock;
   let versions: jest.Mock;
   let firstDay: jest.Mock;
+  /** The days the fake marked owed in the tables (Ruling R-A27). */
+  let markOwed: jest.Mock;
   /** How long (fake milliseconds) the set of a day takes: a closed day, and today or yesterday. */
   let closedMs: number;
   let currentMs: number;
@@ -106,6 +108,11 @@ describe('AggregatorService amm_daily job', () => {
       return new Map([...writes].filter(([k]) => k >= a && k <= b));
     });
     firstDay = jest.fn(async () => FIRST_ACTIVITY);
+    // the fake marks a day owed as the real one does: its set is no longer final
+    markOwed = jest.fn(async (_ch: unknown, d: Date) => {
+      events.push(`owed ${day(d)}`);
+      finalDays.delete(day(d));
+    });
     // the stats are up to date: the live window is the last slice only
     ch.watermark = unix('2026-10-16T12:00:00Z');
     ch.closes = [unix('2026-10-10T08:00:00Z'), NOW_SECONDS - 3];
@@ -123,7 +130,7 @@ describe('AggregatorService amm_daily job', () => {
       logger,
       recompute: statsRecompute,
       ammDaily: { rates: RATES },
-      ammDailyFunctions: { compute, daysDone, versions, firstDay },
+      ammDailyFunctions: { compute, daysDone, versions, firstDay, markOwed },
       ...options,
     });
     created.push(svc);
@@ -999,6 +1006,45 @@ describe('AggregatorService amm_daily job', () => {
       const errors = metrics.aggregatorErrorsTotal.inc.mock.calls.map(([labels]) => labels.job);
       expect(errors).toEqual(['amm_daily_dirty']);
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining(`amm_daily_dirty failed for ${MIDDLE}`));
+    });
+
+    it('marks the day owed in the tables, right after the failure: a restart finds it in the back-fill (Ruling R-A27)', async () => {
+      range();
+      failing.add(MIDDLE);
+      await service(withEverything()).tick();
+      expect(markOwed).toHaveBeenCalledTimes(1);
+      expect(markOwed).toHaveBeenCalledWith(ch, new Date(`${MIDDLE}T00:00:00Z`));
+      expect(events.indexOf(`owed ${MIDDLE}`)).toBe(events.indexOf(`amm_daily ${MIDDLE}`) + 1);
+      // the days that worked are not marked
+      expect(events.filter((e) => e.startsWith('owed'))).toEqual([`owed ${MIDDLE}`]);
+    });
+
+    it('a mark that fails is counted and logged too, and the slice and its range still go on', async () => {
+      range();
+      failing.add(MIDDLE);
+      markOwed.mockRejectedValueOnce(new Error('DB::Exception: read-only'));
+      await service(withEverything()).tick();
+      expect(ch.dirty).toEqual([]);
+      const errors = metrics.aggregatorErrorsTotal.inc.mock.calls.map(([labels]) => labels.job);
+      expect(errors).toEqual(['amm_daily_dirty', 'amm_daily_dirty']);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `amm_daily_dirty failed marking ${MIDDLE} owed in the tables: DB::Exception: read-only`,
+        ),
+      );
+      expect(computed().filter((d) => d.startsWith('2026-05'))).toEqual(['2026-05-01', MIDDLE, '2026-05-03']);
+    });
+
+    it('a day cut short by the shutdown is not marked owed either', async () => {
+      range();
+      compute.mockImplementation(async (_ch: unknown, _rates: unknown, d: Date) => {
+        events.push(`amm_daily ${day(d)}`);
+        const svc = created[created.length - 1];
+        void svc.stop();
+        throw new AmmDailyRecomputeAborted();
+      });
+      await service().tick();
+      expect(markOwed).not.toHaveBeenCalled();
     });
 
     it('does not do the stats of the slice again at the next tick: the range is gone', async () => {

@@ -11,6 +11,7 @@ import {
   ammDaysDone,
   ammFirstDay,
   computeAmmDaily,
+  markAmmDayOwed,
 } from '../src/aggregate/amm-daily.job';
 import { AMM_FILL_WINDOW_LEDGERS, committedHead } from '../src/aggregate/amm-pools.job';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
@@ -1129,6 +1130,65 @@ describe('the amm_daily job (e2e)', () => {
       expect([...versions.keys()].sort()).toEqual([D0_KEY, D1_KEY]);
       expect(versions.get(D0_KEY)).toBe((await sentinelOf(ch, D0_KEY))?.version);
       expect(versions.get(D1_KEY)).toBe((await sentinelOf(ch, D1_KEY))?.version);
+    });
+
+    describe('a day marked owed (Ruling R-A27): the current set again, under a newer version that is not final', () => {
+      it('keeps the rows a reader sees, and ammDaysDone no longer counts the day as done', async () => {
+        const ch = await fresh();
+        await seedHandMade(ch);
+        await computeAmmDaily(ch, rates(ch), at(D1));
+        const before = await dayOf(ch, D1_KEY);
+        expect(before.sentinel.final).toBe(1);
+        expect(await ammDaysDone(ch, AMM_DAILY_CONFIG_VERSION, [at(D1)])).toEqual(new Set([D1_KEY]));
+
+        await markAmmDayOwed(ch, at(D1 + 5 * HOUR)); // any instant of the day is the day
+        const after = await dayOf(ch, D1_KEY);
+        expect(after.sentinel.version).toBeGreaterThan(before.sentinel.version);
+        expect(withoutVersion(after.sentinel)).toEqual({ ...withoutVersion(before.sentinel), final: 0 });
+        expect([...after.pools.keys()]).toEqual([...before.pools.keys()]);
+        for (const [account, row] of after.pools) {
+          expect(row.version).toBe(after.sentinel.version);
+          expect([account, withoutVersion(row)]).toEqual([
+            account,
+            withoutVersion(before.pools.get(account) as StoredDaily),
+          ]);
+        }
+        expect(await ammDaysDone(ch, AMM_DAILY_CONFIG_VERSION, [at(D1)])).toEqual(new Set());
+        // the copy is the newest set: the next recompute is one past it, and final again
+        await computeAmmDaily(ch, rates(ch), at(D1));
+        const redone = await dayOf(ch, D1_KEY);
+        expect(redone.sentinel.version).toBeGreaterThan(after.sentinel.version);
+        expect(await ammDaysDone(ch, AMM_DAILY_CONFIG_VERSION, [at(D1)])).toEqual(new Set([D1_KEY]));
+      });
+
+      it('copies the newest set only, each row once (a real duplicate too), and leaves the other days alone', async () => {
+        const ch = await fresh();
+        await seedHandMade(ch);
+        // an older set of the day stays in the table until a merge: none happens here
+        await ch.command(`SYSTEM STOP MERGES ${Table.AmmDaily}`);
+        await computeAmmDaily(ch, rates(ch), at(D1));
+        await computeAmmDaily(ch, rates(ch), at(D1));
+        await computeAmmDaily(ch, rates(ch), at(D0));
+        const d0 = await dayOf(ch, D0_KEY);
+        const newest = await dayOf(ch, D1_KEY);
+        await ch.command(
+          `INSERT INTO ${Table.AmmDaily} SELECT * FROM ${Table.AmmDaily} WHERE day = {day:Date} AND version = {v:UInt64}`,
+          { day: D1_KEY, v: newest.sentinel.version },
+          { settings: { insert_deduplicate: 0 } },
+        );
+        const stored = await rowCount(ch, `day = '${D1_KEY}'`);
+        expect(stored).toBe(3 * (1 + newest.pools.size)); // two sets, the newest of them twice
+        await markAmmDayOwed(ch, at(D1));
+        expect(await rowCount(ch, `day = '${D1_KEY}'`)).toBe(stored + 1 + newest.pools.size);
+        expect(await dayOf(ch, D0_KEY)).toEqual(d0);
+      });
+
+      it('a day without a set is left without one', async () => {
+        const ch = await fresh();
+        await seedHandMade(ch);
+        await markAmmDayOwed(ch, at(D1));
+        expect(await rowCount(ch)).toBe(0);
+      });
     });
 
     describe('finality (Ruling R86): the sentinel says whether the ingest had passed the day', () => {

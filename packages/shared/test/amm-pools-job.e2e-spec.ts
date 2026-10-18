@@ -574,6 +574,30 @@ describe('the amm_pools job (e2e)', () => {
       expect(await latest(ch)).toEqual([]);
     });
 
+    it('removes the row of a pool that has no state row left (a re-ingest dropped them all), with a lightweight DELETE (Ruling R-A28)', async () => {
+      const ch = await fresh();
+      const kept = 'rKeptPool'.padEnd(33, '0');
+      await insertStates(ch, [
+        state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' }),
+        state({ amm_account: kept, ledger_index: 10, reserve_base: '3', reserve_counter: '4' }),
+      ]);
+      expect(await recomputeAmmPools(ch, noRates(), [POOL, kept])).toBe(2);
+      // a parser fix: the re-ingest of ledger 10 no longer finds POOL
+      await ch.command(`DELETE FROM ${Table.AmmPoolStates} WHERE amm_account = {a:String}`, { a: POOL });
+      await ch.command(`DELETE FROM ${Table.AmmPoolTouches} WHERE amm_account = {a:String}`, { a: POOL });
+      const command = jest.spyOn(ch, 'command');
+      expect(await recomputeAmmPools(ch, noRates(), [POOL, kept])).toBe(1);
+      expect((await latest(ch)).map((r) => r.amm_account)).toEqual([kept]);
+      // no row of it is left, of any version, and the DELETE named it alone
+      expect(await ch.query(`SELECT 1 FROM ${Table.AmmPools} WHERE amm_account = {a:String}`, { a: POOL })).toEqual([]);
+      const deletes = command.mock.calls.filter(([sql]) => String(sql).startsWith(`DELETE FROM ${Table.AmmPools}`));
+      expect(deletes.map(([, params]) => params)).toEqual([{ accounts: [POOL] }]);
+      // a pool with neither state rows nor a row of its own costs no DELETE
+      command.mockClear();
+      expect(await recomputeAmmPools(ch, noRates(), [POOL, 'rNeverAPool'.padEnd(33, '0')])).toBe(0);
+      expect(command.mock.calls.filter(([sql]) => String(sql).startsWith('DELETE'))).toEqual([]);
+    });
+
     it('writes nothing once the signal is aborted: before the read, and just before the write', async () => {
       const ch = await fresh();
       await insertStates(ch, [state({ amm_account: POOL, ledger_index: 10, reserve_base: '1', reserve_counter: '2' })]);
@@ -1466,6 +1490,26 @@ describe('the amm_pools job (e2e)', () => {
       // a window of everything gives every pool
       const all = await poolsClosedIn(ch, rates, new Date(0), new Date(4_000_000_000 * SEC));
       expect(all).toEqual([...new Set(AMM_BUILT.flatMap((b) => b.ammPoolStates.map((s) => s.amm_account)))].sort());
+    });
+
+    it('also finds the pools whose newest amm_pools row last saw a ledger of the window, whatever touches are left (Ruling R-A28)', async () => {
+      const ch = await fresh();
+      const [gone, moved, other] = ['rGonePool', 'rMovedPool', 'rOtherPool'].map((n) => n.padEnd(33, '0'));
+      await insertStates(ch, [
+        state({ amm_account: gone, ledger_index: 20, reserve_base: '1' }),
+        state({ amm_account: moved, ledger_index: 10, reserve_base: '1' }),
+        state({ amm_account: moved, ledger_index: 20, reserve_base: '2' }),
+        state({ amm_account: other, ledger_index: 30, reserve_base: '3' }),
+      ]);
+      await recomputeAmmPools(ch, noRates(), [gone, moved, other]);
+      // the re-ingest of ledger 20 drops the rows of two pools there
+      for (const table of [Table.AmmPoolStates, Table.AmmPoolTouches])
+        await ch.command(`DELETE FROM ${table} WHERE ledger_index = 20`);
+      const rates = new RatesService(ch, 'XRP');
+      const window = [new Date((T0 + 20) * SEC), new Date((T0 + 21) * SEC)] as const;
+      expect(await poolsClosedIn(ch, rates, ...window)).toEqual([gone, moved].sort());
+      // a pool seen elsewhere is not in it
+      expect(await poolsClosedIn(ch, rates, new Date((T0 + 30) * SEC), new Date((T0 + 31) * SEC))).toEqual([other]);
     });
   });
 

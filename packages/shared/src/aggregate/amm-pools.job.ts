@@ -44,6 +44,9 @@ import { RatesService } from '../query/rates.service';
  *    a pool (`LIMIT 1 BY amm_account`, no FINAL).
  *  - **Duplicates change nothing.** The state table is a ReplacingMergeTree that has not merged yet, so a row may be there
  *    twice; the aggregates (`max`, `argMax`) give the same answer for a row and for two copies of it.
+ *  - **A pool with no state row left is removed** (Ruling R-A28): a recompute of it deletes its rows from `amm_pools` (a
+ *    re-ingest dropped its rows, as after a parser fix that no longer finds a false pool). The slices of `agg_dirty` find such a
+ *    pool by the `last_ledger` of its row (`poolsClosedIn`), since no touch is left to find it by.
  */
 
 const DAY_SECONDS = 86_400;
@@ -367,6 +370,13 @@ const POOL_VERSIONS_SQL = `SELECT amm_account, toUInt64(max(version)) AS newest
  WHERE amm_account IN {accounts:Array(String)}
  GROUP BY amm_account`;
 
+/**
+ * Removes the rows of pools that have no state row left (Ruling R-A28): a re-ingest dropped them all, as after a parser fix that
+ * no longer finds a false pool. A lightweight DELETE by the key of the table, synchronous (as the deletes of `agg_dirty`).
+ */
+const DELETE_POOLS_SQL = `DELETE FROM ${Table.AmmPools} WHERE amm_account IN {accounts:Array(String)}`;
+const SYNC_DELETE = { lightweight_deletes_sync: '2' } as const;
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The value of a pool
 // ---------------------------------------------------------------------------------------------------------------------
@@ -519,6 +529,13 @@ async function recomputeChunk(
     ch.query<CreatedPool>(POOL_CREATED_SQL, { accounts, head }),
     ch.query<PoolVersion>(POOL_VERSIONS_SQL, { accounts }),
   ]);
+  // a pool with a row of its own and no state row left (up to the head) is no pool any more: its row goes
+  const withStates = new Set(states.map((s) => s.amm_account));
+  const gone = versions.map((v) => v.amm_account).filter((account) => !withStates.has(account));
+  if (gone.length > 0) {
+    throwIfAborted(signal);
+    await ch.command(DELETE_POOLS_SQL, { accounts: gone.sort() }, { settings: SYNC_DELETE });
+  }
   if (states.length === 0) return 0;
 
   const createdBy = new Map(created.map((c) => [c.amm_account, c]));
@@ -578,8 +595,9 @@ async function recomputeChunk(
 
 /**
  * Rebuilds the `amm_pools` row of each of the pools `accounts` names, from their state rows, and writes them under a new
- * version each (see the header). Returns how many rows it wrote: an account without state rows has none. The pools are
- * read and written `AMM_POOLS_CHUNK` at a time.
+ * version each (see the header). Returns how many rows it wrote: an account without state rows has none, and the rows such an
+ * account has in `amm_pools` (a pool whose state rows a re-ingest dropped) are deleted (Ruling R-A28). The pools are read and
+ * written `AMM_POOLS_CHUNK` at a time.
  *
  * It is idempotent: running it again leaves the same latest values under newer versions (the older versions go away when
  * ClickHouse merges). Without FINAL, so a pre-merge duplicate of a state row changes nothing. It reads the committed ledgers
@@ -698,9 +716,26 @@ export async function poolsChangedSince(ch: ClickHouseService, ledger: number, l
 }
 
 /**
- * The pools with a state row in a ledger that closed in `[from, toExclusive)`: the pools of an `agg_dirty` slice, whose ledgers
- * were rewritten behind the aggregator. The time window becomes a range of ledgers first (`RatesService.ledgersClosedIn`, the
- * way the volume jobs find theirs), and the pools are read from `amm_pool_touches` by a range of its primary key.
+ * The pools whose newest `amm_pools` row last saw a ledger of a range (`last_ledger`): a re-ingest of the range may have dropped
+ * their rows there, and then nothing in `amm_pool_touches` names them. A read of the newest version of every pool: the table is
+ * small (Ruling R-A4).
+ */
+const POOLS_LAST_SEEN_IN_SQL = `SELECT amm_account
+  FROM (
+       SELECT amm_account, argMax(last_ledger, version) AS reflected
+         FROM ${Table.AmmPools}
+        GROUP BY amm_account
+       )
+ WHERE reflected BETWEEN {min:UInt32} AND {max:UInt32}
+ ORDER BY amm_account`;
+
+/**
+ * The pools of an `agg_dirty` slice `[from, toExclusive)`, whose ledgers were rewritten behind the aggregator: those with a state
+ * row in a ledger that closed in the window, and those whose newest `amm_pools` row last saw one of its ledgers (Ruling R-A28: a
+ * re-ingest that dropped the rows of a pool there, such as a parser fix that no longer finds a false pool, leaves no touch to
+ * find it by; its rebuild goes back to its older rows, or removes it when none is left). The time window becomes a range of
+ * ledgers first (`RatesService.ledgersClosedIn`, the way the volume jobs find theirs); the touches are read from
+ * `amm_pool_touches` by a range of its primary key. Sorted, each once.
  */
 export async function poolsClosedIn(
   ch: ClickHouseService,
@@ -710,14 +745,18 @@ export async function poolsClosedIn(
 ): Promise<string[]> {
   const range = await rates.ledgersClosedIn(from, toExclusive);
   if (!range) return [];
-  const rows = await ch.query<{ amm_account: string }>(
-    `SELECT DISTINCT amm_account
-       FROM ${Table.AmmPoolTouches}
-      WHERE ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
-      ORDER BY amm_account`,
-    { min: range.min, max: range.max },
-  );
-  return rows.map((r) => r.amm_account);
+  const params = { min: range.min, max: range.max };
+  const [touched, seen] = await Promise.all([
+    ch.query<{ amm_account: string }>(
+      `SELECT DISTINCT amm_account
+         FROM ${Table.AmmPoolTouches}
+        WHERE ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
+        ORDER BY amm_account`,
+      params,
+    ),
+    ch.query<{ amm_account: string }>(POOLS_LAST_SEEN_IN_SQL, params),
+  ]);
+  return [...new Set([...touched, ...seen].map((r) => r.amm_account))].sort();
 }
 
 /**

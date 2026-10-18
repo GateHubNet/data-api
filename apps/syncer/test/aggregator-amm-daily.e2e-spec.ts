@@ -2,6 +2,7 @@ import {
   AMM_DAILY_CONFIG_VERSION,
   ammDaysDone,
   ClickHouseService,
+  computeAmmDaily,
   ExchangesRow,
   FixtureLedgerSource,
   getNetworkProfile,
@@ -310,6 +311,61 @@ describe('AggregatorService amm_daily job (e2e)', () => {
     );
     for (const [day, sentinel] of before) if (day !== '2026-10-13') expect(after.get(day)).toEqual(sentinel);
     expect(await ch.query(`SELECT * FROM ${Table.AggDirty}`)).toEqual([]);
+  });
+
+  it('a day whose dirty recompute failed is owed in the tables: a restarted aggregator computes it again (Ruling R-A27)', async () => {
+    const ch = await fresh();
+    await aggregator(ch, 1000).tick(NOW);
+    const DAY = '2026-10-13';
+    const before = (await sentinels(ch)).get(DAY) as StoredDay;
+    const poolsBefore = await pools(ch, DAY);
+    expect(before.final).toBe(1);
+    expect(poolsBefore.size).toBe(19);
+
+    // the ingest rewrote an hour of the 13th, and the recompute of the day fails on the dirty path
+    const [{ t }] = await ch.query<{ t: string }>(
+      `SELECT toUnixTimestamp(close_time) AS t FROM ${Table.Ledgers} WHERE toDate(close_time) = {day:Date} ORDER BY ledger_index LIMIT 1`,
+      { day: DAY },
+    );
+    const hour = Math.floor(Number(t) / 3600) * 3600;
+    await ch.command(
+      `INSERT INTO ${Table.AggDirty} (from_hour, to_hour, created_at)
+       SELECT toDateTime({from:UInt32}, 'UTC'), toDateTime({to:UInt32}, 'UTC'), fromUnixTimestamp64Milli({created:Int64})`,
+      { from: hour, to: hour + 3600, created: Date.now() - 5000 },
+    );
+    const failing = new AggregatorService(ch, undefined, undefined, {
+      logger: QUIET,
+      ammDaily: { rates: new RatesService(ch, 'XRP') },
+      ammDailyFunctions: {
+        compute: async (db, rates, day, options) => {
+          if (day.toISOString().startsWith(DAY)) throw new Error('DB::Exception: Memory limit exceeded');
+          return computeAmmDaily(db, rates, day, options);
+        },
+      },
+      ammDailyEveryTicks: 1000,
+      recompute: async () => 0,
+    });
+    aggregators.push(failing);
+    await failing.tick(NOW);
+    // the range is done; the day is owed: its set again, the same rows under a newer version that is not final
+    expect(await ch.query(`SELECT * FROM ${Table.AggDirty}`)).toEqual([]);
+    const owed = (await sentinels(ch)).get(DAY) as StoredDay;
+    expect(owed.version).toBeGreaterThan(before.version);
+    expect(owed.final).toBe(0);
+    const poolsOwed = await pools(ch, DAY);
+    expect([...poolsOwed.keys()]).toEqual([...poolsBefore.keys()]);
+    for (const [account, row] of poolsOwed)
+      expect([account, { ...row, version: 0 }]).toEqual([account, { ...poolsBefore.get(account), version: 0 }]);
+    expect(await ammDaysDone(ch, AMM_DAILY_CONFIG_VERSION, [new Date(`${DAY}T00:00:00Z`)])).toEqual(new Set());
+
+    // the process stops (what it owed in memory is lost) and a new one starts: the back-fill finds the day
+    await failing.stop();
+    await aggregator(ch).tick(NOW);
+    const redone = (await sentinels(ch)).get(DAY) as StoredDay;
+    expect(redone.version).toBeGreaterThan(owed.version);
+    expect(redone.final).toBe(1);
+    expect(await ammDaysDone(ch, AMM_DAILY_CONFIG_VERSION, [new Date(`${DAY}T00:00:00Z`)])).toEqual(new Set([DAY]));
+    expect((await pools(ch, DAY)).size).toBe(19);
   });
 
   it('over the whole fixtures, from January 2025: every closed day since the first pool is final, the days without a pool sentinels', async () => {

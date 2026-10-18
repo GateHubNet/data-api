@@ -248,8 +248,9 @@ operator needs:
   takes longer than it logs `Aggregator job amm_daily: the set of <day> took <n> ms, more than the budget of amm_daily`, and the tick
   runs that much longer (past the 60 s interval the next tick is skipped).
 - **The dirty-slice hooks.** `stats_dirty` (after a `range-ingest`) recomputes, for each slice of an `agg_dirty` range, the stats, the
-  daily volume sets of its days, the `amm_pools` rows of the pools with a touch in its ledgers (error label `amm_pools_dirty`) and the
-  `amm_daily` sets of its days (`amm_daily_dirty`). A slice is started whole, so a slice with thousands of pools runs past the
+  daily volume sets of its days, the `amm_pools` rows of the pools with a touch in its ledgers or whose newest row last saw one of them
+  (error label `amm_pools_dirty`; a pool with no state row left is removed from `amm_pools`, Ruling R-A28) and the `amm_daily` sets of its
+  days (`amm_daily_dirty`). A slice is started whole, so a slice with thousands of pools runs past the
   `amm_pools` budget of 3 s. The budget of `stats_dirty` (10 s) is checked between slices, so a tick can run as long as one slice
   longer; the rest of the range is done at the next tick.
 - **A pool that fails is set aside, not stuck.** `amm_pools` halves a failing batch of up to 200 pools to find the pools that fail on
@@ -260,7 +261,10 @@ operator needs:
   its halves were rebuilt: <cause>` is counted as one error. Nothing is lost; the batch failed for its size (a timeout, a memory limit
   of ClickHouse). If it keeps appearing, look at the cause and at `system.query_log` for the fill-forward query.
 - **`amm_daily`: a day that fails** is counted once and tried again at the next run; a closed day waits 5 minutes, doubling up to an
-  hour. A day that fails on the dirty path (after a re-ingest) is owed to the job and does not hold up `agg_dirty`.
+  hour. A day that fails on the dirty path (after a re-ingest) is owed to the job and does not hold up `agg_dirty`; it is also marked
+  owed in the tables (its set again under a newer version that is not final: readers keep its rows, and a restarted aggregator's
+  back-fill computes it again, Ruling R-A27). A mark that fails is logged as `Aggregator job amm_daily_dirty failed marking <day> owed
+  in the tables` and counted; that day is then owed in memory only.
 - **After a re-ingest** (`range-ingest --reprocess` over AMM ledgers, see [backfill](backfill.md#amm-data-re-ingest)) the written
   ledgers mark `agg_dirty`, and the aggregator rebuilds the pools and the days they cover with the stats: `SELECT count() FROM
   xrpl.agg_dirty` shrinks as it works. The pools of the live ledgers are found by the stale-pool cursor.

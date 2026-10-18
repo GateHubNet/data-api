@@ -283,4 +283,53 @@ describe('AggregatorService amm_pools job (e2e)', () => {
       else expect(after.get(account)).toEqual(pool);
     }
   });
+
+  it('a re-ingest that drops the rows of pools: a pool with none left is removed, one with older rows rebuilt from them (Ruling R-A28)', async () => {
+    const ch = await fresh();
+    const svc = aggregator(ch);
+    await svc.tick(NOW);
+    const before = await pools(ch);
+
+    // the hour of the newest rows of the XRP/RLUSD pool, and a pool whose rows are all in one hour (not that one)
+    const hourOf = (s: AmmPoolStatesRow): number => Math.floor(s.close_time / 3600) * 3600;
+    const rlusdHour = hourOf(STATES.find((s) => s.amm_account === RLUSD_POOL && s.ledger_index === NEWEST_LEDGER)!);
+    const older = STATES.filter((s) => s.amm_account === RLUSD_POOL && hourOf(s) < rlusdHour);
+    expect(older.length).toBeGreaterThan(0);
+    const phantom = POOLS.find((p) => {
+      const hours = new Set(STATES.filter((s) => s.amm_account === p).map(hourOf));
+      return p !== RLUSD_POOL && hours.size === 1 && !hours.has(rlusdHour);
+    }) as string;
+    expect(phantom).toBeDefined();
+    const phantomHour = hourOf(STATES.find((s) => s.amm_account === phantom)!);
+    // a parser fix: the re-ingest of those hours no longer finds the phantom pool, nor the RLUSD rows of the newest hour
+    const ledgersOf = (hour: number): number[] => [
+      ...new Set(STATES.filter((s) => hourOf(s) === hour).map((s) => s.ledger_index)),
+    ];
+    for (const table of [Table.AmmPoolStates, Table.AmmPoolTouches]) {
+      await ch.command(`DELETE FROM ${table} WHERE amm_account = {a:String}`, { a: phantom });
+      await ch.command(
+        `DELETE FROM ${table} WHERE amm_account = {a:String} AND ledger_index IN {ledgers:Array(UInt32)}`,
+        { a: RLUSD_POOL, ledgers: ledgersOf(rlusdHour) },
+      );
+    }
+    for (const hour of [phantomHour, rlusdHour]) {
+      await ch.command(
+        `INSERT INTO ${Table.AggDirty} (from_hour, to_hour, created_at)
+         SELECT toDateTime({from:UInt32}, 'UTC'), toDateTime({to:UInt32}, 'UTC'), fromUnixTimestamp64Milli({created:Int64})`,
+        { from: hour, to: hour + 3600, created: Date.now() - 5000 },
+      );
+    }
+    await svc.tick(NOW);
+
+    const after = await pools(ch);
+    expect(await ch.query(`SELECT * FROM ${Table.AggDirty}`)).toEqual([]);
+    expect(before.has(phantom)).toBe(true);
+    expect(after.has(phantom)).toBe(false);
+    expect(await ch.query(`SELECT 1 FROM ${Table.AmmPools} WHERE amm_account = {a:String}`, { a: phantom })).toEqual(
+      [],
+    );
+    const newestOlder = Math.max(...older.map((s) => s.ledger_index));
+    expect(after.get(RLUSD_POOL)?.last_ledger).toBe(newestOlder);
+    expect(after.get(RLUSD_POOL)?.version).toBeGreaterThan(before.get(RLUSD_POOL)?.version as number);
+  });
 });

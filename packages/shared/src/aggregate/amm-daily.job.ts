@@ -709,6 +709,36 @@ export async function computeAmmDaily(
 }
 
 /**
+ * The rows of the newest set of a day (the sentinel's version: the pool rows of that version and the sentinel), each once,
+ * under a new version and with `final` 0: `markAmmDayOwed`. The rows are picked in a subquery: the `REPLACE` aliases would
+ * otherwise be what the `WHERE` compares (`version` the new one).
+ */
+export const AMM_DAILY_MARK_OWED_SQL = `INSERT INTO ${Table.AmmDaily}
+SELECT * REPLACE (toUInt8(0) AS final, toUInt64({version:UInt64}) AS version)
+  FROM (
+       SELECT *
+         FROM ${Table.AmmDaily}
+        WHERE day = {day:Date}
+          AND version = (SELECT max(version) FROM ${Table.AmmDaily} WHERE amm_account = '' AND day = {day:Date})
+        ORDER BY amm_account
+        LIMIT 1 BY amm_account
+       )`;
+
+/**
+ * Marks the set of the UTC day of `day` as owed a recompute, in the tables (Ruling R-A27): its newest set is written again,
+ * the same rows under a newer version, with a sentinel that is not final. A reader keeps the rows it had (the version of a day
+ * is its sentinel's), and `ammDaysDone` no longer counts the day as done, so the back-fill of the aggregator computes it again,
+ * also after a restart, which forgets what the process owed. The aggregator calls it when the recompute of a day on the dirty
+ * path failed. A day without a set is left without one (nothing says it is done). One `INSERT ... SELECT`, after the read
+ * of the next version.
+ */
+export async function markAmmDayOwed(ch: ClickHouseService, day: Date): Promise<void> {
+  const key = dayKey(dayStartSeconds(day));
+  const version = await nextVersion(ch, Table.AmmDaily, "amm_account = '' AND day = {day:Date}", { day: key });
+  await ch.command(AMM_DAILY_MARK_OWED_SQL, { day: key, version });
+}
+
+/**
  * The days among `days` (UTC days: each is cut to its midnight) that are done: the newest set of the day, by its sentinel, was
  * made with `configVersion` AND is a final one (the ingest had passed the day). A day whose newest set has another config
  * version is not in it, so it is computed again after the computation changed; neither is one whose newest set was made while
