@@ -5,7 +5,9 @@ and for **Xahau**. It indexes a network's validated ledgers into ClickHouse (the
 (the *api*): ledgers, transactions, payments, exchanges and candles, rates, accounts (history, balances, orders, reports, stats), active
 accounts, network fees and volumes, validations and stats. Paths, parameters, defaults, error messages and the shape and key order of the
 answers match what `data.ripple.com` served, so a client of the original works by changing its host and sending an API key. The deliberate
-differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.md).
+differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.md). On top of the Ripple API it serves **AMM data** on the
+XRP Ledger (pools and their history, swaps, liquidity events, votes and bids, LP positions, AMM volume): swaps against pools are exchanges
+([ADR-0011](docs/adr/0011-amm-data-and-swaps-as-exchanges.md)).
 
 One deployment serves one network; the same images run both. The API answers the same `/v2/...` paths on `xrpl.data.<domain>` (native
 currency `XRP`) and `xahau.data.<domain>` (`XAH`).
@@ -67,6 +69,9 @@ pnpm build                                  # ingest:range runs the compiled dis
 pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000     # reads apps/syncer/.env like the syncer (or set GH_ENV=local and the variables)
 ```
 
+On the XRP Ledger the AMM data (pools, swaps as exchanges, liquidity) needs the history re-ingested from the AMM enablement ledger,
+86795265, with `--reprocess`: see [AMM data re-ingest](docs/backfill.md#amm-data-re-ingest).
+
 ## Build and test
 
 ```bash
@@ -102,11 +107,12 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Ledgers | `/v2/ledgers[/{ledger}]`, `/v2/last_validated` |
 | Transactions | `/v2/transactions`, `/v2/transactions/{hash}` |
 | Payments | `/v2/payments[/{currency}]` |
-| Exchanges | `/v2/exchanges/{base}/{counter}` (raw, `interval` candles, `reduce`), `/v2/exchanges` (all pairs, extra) |
+| Exchanges | `/v2/exchanges/{base}/{counter}` (raw, `interval` candles, `reduce`), `/v2/exchanges` (all pairs, extra); swaps against AMM pools are exchanges, filtered with `amm=include\|exclude\|only` |
 | Rates | `/v2/exchange_rates/{base}/{counter}`, `/v2/normalize` |
-| Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]`, `.../stats/{transactions\|value}` |
+| Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]`, `.../stats/{transactions\|value}`, `.../amm_liquidity`, `.../amm_positions` (AMM, extras) |
 | Markets | `/v2/active_accounts/{base}/{counter}` |
-| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume` |
+| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/amm_volume` (AMM, extra) |
+| AMM (extras) | `/v2/amm/pools`, `/v2/amm/pools/{pool}`, `/v2/amm/pools/{base}/{counter}`, `/v2/amm/pools/{pool}/{history,swaps,liquidity,governance}` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
 | Stats | `/v2/stats[/{family}[/{metric}]]` |
 | Operational | `/liveliness/healthz` (api 3001, syncer 3002), `/metricz` (3000), `/internal/docs` |

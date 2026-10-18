@@ -160,6 +160,24 @@ Key order is fixed by tests. There is no Ripple contract to match, so the order 
 - `share` is `lp_balance / lp_supply` of that pool at the same point.
 - The base and counter amounts are the share times the reserves.
 
+**Pair form.** `GET /v2/amm/pools/:base/:counter` serves the **live pool of the pair** and, when the pair has none, the pool that was deleted last (the highest `last_ledger`), then the lowest account: a pair can have had several pools, each deleted before the next was created. The assets may be given in either order.
+
+**History carry-forward.** A state row holds only the values its transaction's metadata carried, so the history of a pool fills every value from the newest earlier row, also from before `start`. The carry-in for a page is read from a window of `AMM_HISTORY_CARRY_LEDGERS` (2,048, about two hours) ledgers before the page, a range of the pool's primary key, and further back in doubling steps only for a column that is still null and a pool that has older rows (`fillForward`, Rulings R-A21 and R-A23). The aggregators use a window of `AMM_FILL_WINDOW_LEDGERS` (160,000, about a week).
+
+**Object shapes** (Ruling R-A24). There is no Ripple contract, so the shapes are ours, written once in `apps/api/src/amm/amm-objects.ts` (the key order is pinned by tests and is the order below). Keys are flat (`base_currency`, `base_issuer`, `counter_currency`, `counter_issuer`, in the pool's canonical pair order, no issuer key for the native currency); amounts are exact strings; `value_native` is a string, a plain decimal of eight significant digits without the exponent form; `trading_fee` is a number in units of 1/100000; times are `fmtTime`; an undefined or null value is left out; `deleted` is a boolean; the auction fields are grouped as `auction_slot {holder?, price?, discounted_fee?, expiration?}` and left out when the pool has none of them.
+
+| Object | Keys, in order |
+|---|---|
+| `Pool` | `amm_account, base_currency, base_issuer?, counter_currency, counter_issuer?, reserve_base?, reserve_counter?, lp_supply?, lp_currency?, trading_fee?, auction_slot?, value_native?, created_ledger?, created_by?, last_ledger, deleted` |
+| `PoolState` | `amm_account, ledger_index, tx_index, tx_hash, tx_type, executed_time, base_currency, base_issuer?, counter_currency, counter_issuer?, reserve_base?, reserve_counter?, lp_supply?, lp_currency?, trading_fee?, auction_slot?, deleted` |
+| `PoolDay` | `amm_account, date, base_currency, base_issuer?, counter_currency, counter_issuer?, swap_count, volume_base, volume_counter, fees_base_est, fees_counter_est, deposit_count, withdraw_count, liquidity_in_base, liquidity_in_counter, liquidity_out_base, liquidity_out_counter, reserve_base?, reserve_counter?, lp_supply?, trading_fee?, value_native?` |
+| `LiquidityEvent` | `amm_account, ledger_index, tx_index, tx_hash, executed_time, account, initiator, event, mode?, base_amount, counter_amount, lp_tokens` |
+| `Vote` | `amm_account, ledger_index, tx_index, tx_hash, executed_time, type, account, fee_voted?, trading_fee_after?` |
+| `Bid` | `amm_account, ledger_index, tx_index, tx_hash, executed_time, type, account, bid_min?, bid_max?, price_paid?, auction_slot?` (`auction_slot {holder?, discounted_fee?, expiration?, auth_accounts}`) |
+| `Position` | `pool, lp_currency, lp_balance, share, base_amount?, counter_amount?` |
+
+`volume_*` of a `PoolDay` are the amounts that went into the pool, by side, and `fees_*_est` are estimates. The event objects carry no pair (read it from `GET /v2/amm/pools/:pool`). A pool found as soon as one of its ledgers is committed (`amm_pool_states`) is the rule of the history, days, swaps, liquidity and governance routes; the detail and the pair form read `amm_pools` and so answer 404 for a brand-new pool until the next aggregator tick (about a minute).
+
 **Changes to existing routes**
 
 - **Exchange objects** gain a last key, `amm_account`, only on AMM rows. Order-book rows are unchanged.
@@ -167,7 +185,7 @@ Key order is fixed by tests. There is no Ripple contract to match, so the order 
   - Values are `include` (default), `exclude` and `only`.
   - Anything else gives 400 `invalid amm filter - use: include, exclude, only`.
 - **Exchange rates, normalize, active accounts and trade volume** always include AMM swaps. They take no filter parameter.
-- **Native dust legs** (≤ 0.0005) are dropped from AMM rows exactly as from order-book rows.
+- **Native dust legs** (≤ 0.0005) are dropped from AMM rows exactly as from order-book rows in the aggregates built on exchanges (candles, `reduce`, exchange rates, normalize, active accounts, trade volume and AMM volume). The per-pool daily stats (`amm_daily`) count every swap (Ruling R-A20): they describe the pool, not a price series.
 
 **Pool value.** `value_native` is computed as follows:
 
@@ -182,12 +200,14 @@ Key order is fixed by tests. There is no Ripple contract to match, so the order 
 
 ## 4. Aggregation
 
-There are three new aggregator jobs in `apps/syncer/src/aggregator`. They use the existing tick, budgets (R83), finality rules (R86) and failure ordering (R87).
+There are two new aggregator jobs in `apps/syncer/src/aggregator`, `amm_pools` and `amm_daily`, and one new metric of the volume jobs, `amm_volume`. They use the existing tick, budgets (R83), finality rules (R86) and failure ordering (R87). The budgets and the cadence are constants of `aggregator.service.ts`, not environment variables.
 
 - **`amm_pools`.** Every tick, it recomputes the pools whose states changed since its watermark, plus pools in `agg_dirty` ranges. Both are found in `amm_pool_touches`.
   - The watermark is a ledger index kept in memory and found again at start: the ledger before the oldest state row that its pool's newest `amm_pools` row has not seen.
   - Only committed ledgers count: the ledger writer fills the tables of a ledger at the same time and writes its `ledgers` row last, so the scans and the rebuild read up to the newest `ledgers` row, and a pool is returned only while it has a row above what its `amm_pools` row has seen (a busy pool rebuilt up to the head is not returned again).
-  - A batch of pools that fails is halved to find the pools that fail on their own. Those (at most three in a batch) are set aside in memory with a backoff of 5 minutes, doubling up to an hour, and counted as errors; the cursor goes on. A batch that fails as a whole is the failure of the job.
+  - A batch of pools that fails is halved to find the pools that fail on their own (Ruling R-A15). The halving is kept **across ticks**: when the budget runs out in the middle of it, the next tick goes on with the same batch from the list it stopped at and the cursor stays where it was, instead of asking for the pools again and halving from the whole batch (which would never get further). More than three pools failing on their own in one batch means the cause is not the pools, and the batch is the failure of the job.
+  - The pools that fail alone are set aside in memory, each counted as an error, with a backoff of 5 minutes doubling up to an hour, and the cursor goes on (the retries run at every tick, also when the live part failed). This happens on **partial success** only: something in the batch worked, or the batch is a **repeat** (the very same batch comes again after every one of its lists failed, and the same pools fail alone again). A batch in which everything fails the first time is the failure of the job: it is counted and logged, the cursor stays behind it, and the next tick tries it again.
+  - A list that failed as a whole but whose halves were rebuilt, with no pool found below it (it fails for its size), is counted once as an error and logged as the **warning** `a batch of N pool(s) failed as a whole, but its halves were rebuilt`, so that it leaves a trace.
   - Each field is filled forward from the latest non-null value over that pool's state rows: `argMaxIf(field, (ledger_index, tx_index), isNotNull(field))`. The rows are read from a window of the last `AMM_FILL_WINDOW_LEDGERS` (160,000, about seven days) ledgers first, a range of the primary key of each pool, and a pool for which a column is still null in it (or that has no row in it) is read further back in steps that double, each reading only the ledgers before the ones already read, until it has every column or its first ledger is reached: the answer is the one the whole history gives, and a pool pays for the distance back to its oldest needed value (an AMM-node row: a swap carries neither the fee, nor the LP supply, nor the slot), the whole history only if a value is null for ever (Rulings R-A21 and R-A23).
   - `value_native` is then computed.
   - Each pool's row is rewritten under a new version.

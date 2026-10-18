@@ -13,7 +13,7 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
-[Active accounts](#active-accounts) · [Network](#network) · [Validations](#validations) · [Stats](#stats) ·
+[Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [Validations](#validations) · [Stats](#stats) ·
 [Operational endpoints](#operational-endpoints)
 
 ---
@@ -103,6 +103,7 @@ parameter is repeated (`?limit=5&limit=10`) the first value wins.
 | `strict` | False only when the text matches `/false/i`; anything else, or nothing, is true. |
 | `include_exchanges` | True for any non-empty text, `0` and `false` included. |
 | `limit` | The default and the maximum differ per endpoint (listed below). Missing or empty gives the default; more than the maximum gives the maximum; a decimal is cut to its whole part; below 1 gives the default. Text that is not a number gives the default, except on the routes that answer `invalid limit` (`/v2/accounts/{address}/balances`, `/orders`) or `invalid limit: NaN` (the exchanges routes). |
+| `amm` (the exchange lists) | `include` (default, also when missing or empty), `exclude` or `only`; case-sensitive. Anything else answers 400 `invalid amm filter - use: include, exclude, only`. See [Exchanges](#exchanges). |
 | `marker` | An opaque token from the previous page (see [Pagination](#pagination)). A marker that is not one answers 400 `invalid marker`. |
 | `format` | `json` (default) or `csv`, in any letter case. See [CSV](#csv). |
 
@@ -184,7 +185,10 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 | Markers | HBase row keys | opaque tokens, same mechanism (`marker` + `Link`) |
 | Bugs of the original | | fixed where they were outright bugs; listed per endpoint and in [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) |
 
-Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs).
+Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs) and the [AMM](#amm) endpoints (`/v2/amm/pools...`,
+`/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`). Exchange-based endpoints also differ in
+what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see [Exchanges](#exchanges) and
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -417,6 +421,7 @@ counter swap with their currencies, issuers and amounts, buyer and seller swap, 
 | `interval` | none | Candles instead of trades: `1minute`, `5minute`, `15minute`, `30minute`, `1hour`, `2hour`, `4hour`, `1day`, `3day`, `7day`, `1month`, `1year` (`week` means `7day`; the text is lower-cased). |
 | `reduce` | false | One row summarizing the whole window. Not together with `interval`. |
 | `autobridged` | false | Only the autobridged trades (the crossing went through the native currency). |
+| `amm` | `include` | Swaps against AMM pools are exchanges too. `include` lists them with the order-book trades, `exclude` lists the order-book trades only (what this route served before AMM), `only` lists the swaps only. Applies to the raw trades, to `interval` and to `reduce`. Anything else is 400 `invalid amm filter - use: include, exclude, only`. |
 | `descending` | false | Newest first. |
 | `limit` | 200 (max 400) | A text that is not a number is 400 `invalid limit: NaN`. |
 | `marker` | | |
@@ -440,9 +445,21 @@ counter swap with their currencies, issuers and amounts, buyer and seller swap, 
 
 Order: `base_amount, counter_amount, node_index, rate, tx_index, autobridged_currency?, autobridged_issuer?, buyer, executed_time,
 ledger_index, offer_sequence, provider, seller, taker, tx_hash, tx_type, base_currency, base_issuer?, counter_currency,
-counter_issuer?`. `rate` is counter per base, 8 significant digits. The native currency has no issuer key; the autobridged
+counter_issuer?, amm_account?`. `rate` is counter per base, 8 significant digits. The native currency has no issuer key; the autobridged
 fields are present only on an autobridged trade. Trades whose native-currency leg is **0.0005 or less** are left out of the
-aggregates (candles, `reduce`).
+aggregates (candles, `reduce`), swaps included.
+
+**Swaps against an AMM pool** ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)) are exchanges: a `Payment` or `OfferCreate` that
+crosses a pool moves the pool's balances, and each pool crossed is one row. Its `amm_account` is the pool (the **last key**, present only on
+a swap, so an order-book trade is served exactly as before AMM), and it is also the `provider`; `offer_sequence` is `0`. `taker` is the
+account that sent the transaction. If base flowed out of the pool, `buyer` is the taker and `seller` is the pool, otherwise the reverse.
+`node_index` is the index of the pool's account node in the transaction metadata (or of its first reserve trust line when the metadata has
+no account node), which keeps the key unique. A transaction that crosses several pools, or a pool and an order book, gives a row for each.
+`tx_type` is the type of the transaction, and `autobridged_*` follow the rules of the order book. **The amounts are the pool's own
+changes** (`base_amount` and `counter_amount` are what the pool received and paid, unsigned), which on the asset the pool pays out include
+the issuer's transfer fee: for an issuer with a `TransferRate` of 1.002 the pool pays 83.28354 and the receiver gets 83.11731. An
+order-book trade uses the change of the offer's `TakerGets`, which leaves the fee out, so the `rate` of a swap through a pool with such an
+issuer is biased by up to the fee. To get the swaps of a pool, use [`GET /v2/amm/pools/{pool}/swaps`](#get-v2ammpoolspoolswaps).
 
 **Candles** (`interval=...`): the candles of the buckets that start within the window. A bucket is whole (a `start` inside a
 bucket leaves that bucket out, an `end` inside one takes all of it). Buckets are aligned in UTC: minutes and hours on the
@@ -466,14 +483,16 @@ of the window. With no trade the row is all zeros (`"0.0000000"` prices, `"0"` v
 
 CSV: the raw rows use the 20 columns of the original, in this order: `base_currency, base_issuer, base_amount, counter_amount,
 counter_currency, counter_issuer, rate, executed_time, ledger_index, buyer, seller, taker, provider, autobridged_currency,
-autobridged_issuer, offer_sequence, tx_type, tx_index, node_index, tx_hash`. Candle and reduce rows use a fixed list of 16 columns, in this
+autobridged_issuer, offer_sequence, tx_type, tx_index, node_index, tx_hash`, and an `amm_account` column last when the page holds a
+swap (empty in the order-book rows), so a CSV of order-book trades has the columns it had before AMM. Candle and reduce rows use a fixed list of 16 columns, in this
 order: `open, high, low, close, vwap, count, base_currency, base_issuer, base_volume, counter_currency, counter_issuer, counter_volume,
 open_time, close_time, start, buy_volume` (an empty cell where a row has no value, e.g. `open_time` of an empty reduce row).
 
 Errors, in the order they are checked: 400 `base currency is required`, `counter currency is required`, `XRP cannot have an
 issuer` (`XAH` on Xahau), `base issuer is required`, `counter issuer is required`, `invalid base issuer address`,
 `invalid counter issuer address`, `invalid start date format`, `invalid end date format`, `invalid limit: NaN`,
-`cannot use reduce with interval`, `invalid interval: <text>`, `invalid marker`; 500 `unable to retrieve exchanges`.
+`invalid amm filter - use: include, exclude, only`, `cannot use reduce with interval`, `invalid interval: <text>`, `invalid marker`; 500
+`unable to retrieve exchanges`.
 
 **Differences from data.ripple.com**
 - Amounts are the **exact** stored decimal text; the original round-tripped them through floats, which only changes digits
@@ -492,14 +511,19 @@ issuer` (`XAH` on Xahau), `base issuer is required`, `counter issuer is required
 - Trades whose rate cannot be derived (a zero leg) or that involve MPT amounts are not stored, instead of being served as
   `NaN`/`Infinity`.
 - A limit below 1 gives the default instead of reaching the database as given.
+- **Swaps against AMM pools are included** (default `amm=include`), in the raw trades, the candles and `reduce`, with `amm_account` as a
+  last key on the swaps; `amm=exclude` serves what the original would have. The original predates AMMs. See
+  [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
 ### `GET /v2/exchanges`
 
 An extra that `data.ripple.com` did not have: the trades of **all** pairs, each with the pair it is stored under (the canonical
 Ripple order: the pair is sorted by the lower-cased `currency+issuer` text), oldest first. A page reads one window of ledgers from
 the marker on, as long as the ledgers' own count of trades says the page needs, sorted to the page on its own, so a page costs the
-trades near it, not the whole window, however long the gap before them (Ruling R107). Parameters: `start` (`2013-01-01`), `end`, `autobridged`, `descending`, `limit` (200, max 400), `marker`,
-`format` (file `exchanges.csv`). Rows are the raw trades above. 500 `unable to retrieve exchanges`.
+trades near it, not the whole window, however long the gap before them (Ruling R107). Parameters: `start` (`2013-01-01`), `end`, `autobridged`, `amm` (as above), `descending`, `limit` (200, max 400), `marker`,
+`format` (file `exchanges.csv`). Rows are the raw trades above. Errors, in order: 400 `invalid start date format`, `invalid end date format`, `invalid limit: NaN`,
+`invalid amm filter - use: include, exclude, only`, `invalid marker`; 500 `unable to retrieve exchanges`. With `amm=only` a page reads the rest of the range in one read narrowed by a skip index on the pool column (Ruling R-A12): ask for a
+window.
 
 **Differences from data.ripple.com**: the route does not exist in the original (it is an extra, [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md)); everything said for
 the raw trades above applies.
@@ -518,6 +542,8 @@ How many `counter` one `base` buys.
 | `strict` | true | The latest-trades price counts only when there are at least 10 trades; `strict=false` counts however many there are. |
 | `period` | none | `hour`, `day`, `3day`, `7day` or `30day`: the volume weighted price of the rolling window of that length that ends a second before `date`, instead of the default rate. |
 | `live` | false | Leave out the daily part: only the latest trades. |
+
+Swaps against AMM pools count as trades like any other (the latest-trades price and the volume weighted price of the day both include them).
 
 The default rate combines two numbers: the volume weighted price of the day of `date` (from 00:00 UTC up to the **end of the period
 `date` names**: the whole day for `date=2015-01-14`, up to the end of the hour for `date=2015-01-14T18`, up to that second for a full time,
@@ -663,15 +689,19 @@ end date format`, `invalid type - use: sent, received`, `invalid marker`; 500 `u
 The trades the account took part in as buyer or seller. Each row is the exchange of `/v2/exchanges` plus the `client` when
 there is one, with the pair among the other keys (not at the end): `base_amount, counter_amount, node_index, rate, tx_index,
 autobridged_currency?, autobridged_issuer?, base_currency, base_issuer?, buyer, client?, counter_currency, counter_issuer?,
-executed_time, ledger_index, offer_sequence, provider, seller, taker, tx_hash, tx_type`.
+executed_time, ledger_index, offer_sequence, provider, seller, taker, tx_hash, tx_type, amm_account?`. A swap against an AMM pool
+is an exchange of the taker and of the pool, and has `amm_account` (the pool) as its last key; `amm=include|exclude|only` keeps both
+kinds (default), the order-book trades, or the swaps (see [Exchanges](#exchanges)). A pool account lists its own swaps here.
 
 `base` and `counter` are **filters**, not a complete pair: `USD` is the dollars of every issuer, `USD+rIssuer` one issuer,
 `/XRP` every trade against the native currency. They work in either orientation; a trade stored the other way round is
 inverted (as in `/v2/exchanges`) so that the asset asked for as `base` is the base of what is served.
 
-Parameters as the account lists (`limit` 200, max 1000); `format=csv`: file `<address> - exchanges[ - BASE[-COUNTER]].csv`, the 20
-columns of `/v2/exchanges` plus a trailing `client` column when a row has one. Errors: 400 `invalid base issuer address`,
-`invalid counter issuer address`, `invalid start date format`, `invalid end date format`, `invalid marker`; 500 `unable to
+Parameters as the account lists (`limit` 200, max 1000) and `amm`; `format=csv`: file `<address> - exchanges[ - BASE[-COUNTER]].csv`, the 20
+columns of `/v2/exchanges` plus, after them, a `client` column when a row of the page has a client and an `amm_account` column when a row of the page is a swap.
+Errors, in order: 400 `invalid base issuer address`,
+`invalid counter issuer address`, `invalid start date format`, `invalid end date format`, `invalid amm filter - use: include, exclude, only`,
+`invalid marker`; 500 `unable to
 retrieve exchanges`.
 
 **Differences**: the filter works for a pair asked for in the reverse order (the original compared with the stored order
@@ -862,8 +892,9 @@ seller and of the buyer of every trade (an account that trades with itself count
 ```
 
 With `include_exchanges` each account gets a last key `exchanges`, a list of trades without the pair fields and with
-`client` when there is one (executed_time with milliseconds). A pair asked for in the reverse order is inverted (base and
-counter, buy and sell swap).
+`client` when there is one (executed_time with milliseconds); a swap against an AMM pool has `amm_account` as the last key of its
+object. A pair asked for in the reverse order is inverted (base and counter, buy and sell swap). Swaps against AMM pools count as
+trades (there is no `amm` filter on this route), so the pool account is in the list like any account that traded the pair.
 
 Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 1day, 3day, 7day`, `invalid date format`;
 500 `unable to retrieve exchanges`.
@@ -876,7 +907,7 @@ Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 
 
 ## Network
 
-`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the two volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`. `marker` is present only when there is a next page.
+`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`. `marker` is present only when there is a next page.
 
 ### `GET /v2/network/fees`
 
@@ -942,10 +973,10 @@ fee summary(s)`.
 stored under exactly that second, which only its cron timing guaranteed); a bucket without a snapshot has no row; `interval=raw`
 is accepted and means the same as none.
 
-### `GET /v2/network/exchange_volume` and `GET /v2/network/payment_volume`
+### `GET /v2/network/exchange_volume`, `payment_volume` and `amm_volume`
 
-The trade volume and the payment volume of the network, converted to the native currency (or to a display currency). The
-components come from the **markets config** of the network (`packages/shared/config/markets/{xrpl,xahau}.json`, or the file in
+The trade volume, the payment volume and the AMM volume of the network, converted to the native currency (or to a display currency). The
+trade and payment components come from the **markets config** of the network (`packages/shared/config/markets/{xrpl,xahau}.json`, or the file in
 `GH_MARKETS_CONFIG`), a versioned list of trade markets and payment currencies that the syncer's aggregator works through; the
 list shipped for Xahau (version 3) was derived from a small sample of three days of Xahau history (one trade market, `EVR`/`XAH`, and
 three payment currencies; the `XXX` test token is left out): it is provisional and should be re-derived from a full-history node
@@ -954,8 +985,9 @@ three payment currencies; the `XXX` test token is left out): it is provisional a
 Two modes, chosen by the parameters:
 
 - **Live** (neither `start` nor `end`): one row for a rolling period ending now. `live` is `hour`, `day`, `3day`, `7day` or
-  `30day` for trades and `hour` or `day` for payments (default `day`; anything else is 400 `invalid period - use: <list>`).
-  The aggregator refreshes these every minute.
+  `30day` for trades and for AMM volume, and `hour` or `day` for payments (default `day`; anything else is 400 `invalid period - use:
+  <list>`). The aggregator refreshes these every minute: twelve live sets in all (five periods for each of the trade volume and the AMM
+  volume, two for the payments).
 - **Historical** (`start` or `end` given): one row per `interval` (`day`, `week` from Monday, `month`, UTC) for the days the
   aggregator has computed. A missing `start` is the epoch, a missing `end` is now. A bucket is a row when it starts within
   `start` and `end`, whole.
@@ -968,7 +1000,7 @@ Two modes, chosen by the parameters:
 | `exchange_currency`, `exchange_issuer` | the native currency | Show the amounts in another currency, at the rate of the live trades (live) or the volume weighted price of the bucket (historical). 400 `exchange currency must have an issuer`, `XRP cannot have an issuer`, `invalid exchange issuer address`. |
 | `limit` | 200 (max 1000) | Historical only. |
 | `marker` | | Historical only. |
-| `format` | json | `csv`: files `trade_volume.csv`, `payment_volume.csv`. |
+| `format` | json | `csv`: files `trade_volume.csv`, `payment_volume.csv`, `amm_volume.csv`. |
 
 ```json
 { "result": "success", "count": 1,
@@ -982,20 +1014,327 @@ Two modes, chosen by the parameters:
 
 Row keys: `components, count, exchange, total, exchange_rate, start_time, end_time`. A **trade** component is `{count, rate, amount,
 base, counter, converted_amount}`, a **payment** component `{currency, issuer?, amount, count, rate, converted_amount}`
-(`issuer` absent for the native currency). `amount` is the exact sum in the component's currency, `converted_amount` and
+(`issuer` absent for the native currency), an **AMM** component `{amm_account, base, counter, count, amount, rate, converted_amount}`. `amount` is the exact sum in the component's currency, `converted_amount` and
 `total` are the value in the native currency (or the display currency), `count` of a row is the number of trades or payments.
 Components are sorted by converted amount, the largest first. A component's `rate` is how many units of its currency one native
 coin buys (`amount / converted_amount`); a market or currency without a rate is left out of the components (but its payments
 count in `count`). Week and month rows add up the converted days (a documented approximation).
 
+**`amm_volume`** is the volume of the swaps against the AMM pools, one component per pool (`amm_account`, its `base` and `counter`, the
+number of swaps as `count`, and `amount`, the volume of that `base`). It is not limited to the markets config: every pool with swaps
+counts, whatever its assets, and swaps whose native leg is 0.0005 or less are left out. A pool against the native currency has the
+native currency as its `counter` (a pool the ledger stores with the native currency first is turned round) and is converted to its own
+native volume (its `rate` is its base volume over its native volume); any other pool is converted through the rate of its
+base asset and, when that has none, of its counter asset (the sides are then swapped, and `amount` is the counter volume). The rate of an
+asset is taken from the markets against the native currency in the same window and, for an asset they have none for, from the AMM
+pools against the native currency in the same window. A pool without a rate on either side is left out. The trade volume
+(`exchange_volume`) counts the swaps too: `amm_volume` is a view of the pools alone, it does not change that one. **A week or month row
+can list a non-native pool twice**, once for each orientation: the days of the bucket that converted the pool through its base and the
+days that converted it through its counter are added up apart, because their amounts are of different currencies. On Xahau (no AMM) the
+rows have no components and zero totals.
+
 Errors: 400 as above, `invalid start date format`, `invalid end date format`, `invalid marker`; 500 `error getting data`
 (also for both routes).
 
-**Differences from data.ripple.com**: the `minute` live period of the original's develop branch is **not** supported; component
+**Differences from data.ripple.com**: the `amm_volume` route does not exist in the original (an extra); `exchange_volume` includes the swaps against AMM pools in the trades of the configured markets; the `minute` live period of the original's develop branch is **not** supported; component
 `rate` follows the semantics above (the original's non-native trade component carried the pair's vwap, so `amount / rate` did
 not reproduce `converted_amount`); `converted_amount` is always a string; historical rows carry `end_time` (the start of the
 next bucket, exclusive); the historical display currency uses each bucket's own native-to-display price. A day counts as final
 only once the ingest has passed it by an hour, so volumes follow the ingest rather than the wall clock.
+
+---
+
+## AMM
+
+GateHub extras: the original predates automated market makers (the XRP Ledger enabled them in March 2024), so none of these endpoints
+has a Ripple original. They serve the pools of the AMM, their history and their events, the liquidity positions of an account and the
+network volume of the swaps. Xahau has no AMM. The reasons for the design are in
+[ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md). A swap against a pool is an exchange and is served by the
+[exchange endpoints](#exchanges) too (`amm_account`, the `amm` filter).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these
+rules for the objects, whose shape and key order are ours (Ruling R-A24) and are pinned by tests:
+
+- **Flat keys.** The pair of a pool is `base_currency, base_issuer?, counter_currency, counter_issuer?`, in the canonical order the pool is
+  stored in (the same order as the exchanges: lexicographic on the lower-cased `currency+issuer`). The native currency has no issuer key. A
+  pool is addressed by its **pool account** (the address of the AMM's pseudo-account); the pair form of the detail route takes the two assets
+  in either order.
+- **Amounts** (`reserve_*`, `lp_supply`, `volume_*`, ...) are exact decimal strings in whole units. `trading_fee` is a number in units of
+  1/100000 (`500` is 0.5%). Times are `YYYY-MM-DDTHH:mm:ssZ`.
+- **`value_native`** is the pool's worth in the native currency, a **string** that is a plain decimal of **eight significant digits**
+  with the trailing zeros dropped and never in the exponent form (`"123"`, `"12.5"`, `"100000000"`, `"0.0000001"`). It is twice the native
+  reserve of a pool that has the native currency; for any other pool twice a reserve over the daily rate of that asset (the units of it one
+  native coin buys, the rate the volume routes divide by), the base tried first, then the counter. It is left out when neither asset has a
+  rate, and for a deleted pool.
+- **The auction slot** is grouped: `auction_slot {holder?, price?, discounted_fee?, expiration?}` (`expiration` a time, `discounted_fee`
+  in units of 1/100000), left out when the pool has none of it. `deleted` is a boolean that every pool and state has. A key whose value is
+  unknown is left out: `null` is never used, and a fee of 0 is a value.
+- **Carried forward.** A pool's state after a transaction holds only the values that transaction's metadata carried (a swap through an
+  XRP/IOU pool says nothing of the LP supply, a vote nothing of the reserves). Every value served for a pool or a state is the newest known
+  value up to that point. The `*_est` fields are estimates.
+- **The CSV** of every list has the same columns on every page (`null` is an empty cell, the slot is always its four columns,
+  `auction_slot.holder`, `auction_slot.price`, ...), in the order of the keys below.
+- **Dates and ledgers.** `start` is inclusive, `end` inclusive at its precision, as everywhere; the lists are in the order of the ledgers
+  (`descending` reverses it) and read the committed ledgers only.
+- **Xahau** answers the lists empty and the pool routes 404 `pool not found`, since there is no pool.
+
+The 404 rule differs between two groups of routes. `GET /v2/amm/pools/{pool}` (and the pair form) is served from the table the aggregator
+rebuilds, so **a brand-new pool is 404 there until the next aggregator tick** (up to about a minute). The history, the days, the swaps,
+the liquidity and the governance of a pool are found **as soon as the ledger that touched the pool is committed**.
+
+### `GET /v2/amm/pools`
+
+The pools in their current state, the most valuable first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `asset`, `asset2` | all | Only the pools that have this asset on either side, written like a path asset of the exchanges (`USD+rIssuer`, or the native currency alone; the separators `+`, `\|` and `.` all work). With both, the pools that have both: `asset=XRP&asset2=USD+rIssuer` is the XRP/USD pool. |
+| `include_deleted` | false | Boolean: also the pools that were deleted. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `amm pools.csv`. |
+
+```json
+{ "result": "success", "count": 1, "marker": "…",
+  "pools": [{
+    "amm_account": "r…", "base_currency": "USD", "base_issuer": "r…", "counter_currency": "XRP",
+    "reserve_base": "1250.5", "reserve_counter": "2500", "lp_supply": "1767.7669", "lp_currency": "03…",
+    "trading_fee": 500,
+    "auction_slot": { "holder": "r…", "price": "12.5", "discounted_fee": 50, "expiration": "2026-10-18T09:00:00Z" },
+    "value_native": "5000", "created_ledger": 107612573, "created_by": "r…", "last_ledger": 107717584, "deleted": false }] }
+```
+
+**Pool**, in this order: `amm_account, base_currency, base_issuer?, counter_currency, counter_issuer?, reserve_base?, reserve_counter?,
+lp_supply?, lp_currency?, trading_fee?, auction_slot?, value_native?, created_ledger?, created_by?, last_ledger, deleted`. `lp_currency` is the
+40-hex-digit currency of the LP token, which the pool issues. `last_ledger` is the newest ledger the pool's state has seen.
+`created_ledger` and `created_by` (the sender of the `AMMCreate`) are left out for a pool whose creation was not ingested (a pool first
+seen in the middle of its life, before the AMM data was re-ingested from the enablement ledger).
+
+**Order and marker.** `value_native` descending, the pools without a value last, then `amm_account` ascending. The marker holds the value
+and account of the last pool. Deleted pools are left out unless asked for. The list is rebuilt by the aggregator about every minute.
+
+Errors, in the order they are checked: 400 for `asset` and then `asset2` (`currency is required`, `XRP cannot have an issuer` (`XAH` on
+Xahau), `issuer is required`, `invalid issuer address`; the messages do not name a side), `invalid marker`; 500 `unable to retrieve pools`.
+
+### `GET /v2/amm/pools/{pool}` and `GET /v2/amm/pools/{base}/{counter}`
+
+One pool, `{ "result": "success", "pool": Pool }`: the Pool above. `{pool}` is the pool account. `{base}/{counter}` is the pair, the assets
+written as in [`/v2/exchanges/{base}/{counter}`](#get-v2exchangesbasecounter), in either order. A deleted pool is served (`deleted` true,
+no `value_native`). When a pair has had several pools (each deleted before the next was created), the pair form serves the **live pool
+first and else the one with the highest `last_ledger`**, then the lowest account.
+
+Errors: 400 `invalid pool` (the text is not an address); for the pair form the pair errors of the exchanges route (`base currency is
+required`, `counter currency is required`, `XRP cannot have an issuer`, `base issuer is required`, `counter issuer is required`, `invalid
+base issuer address`, `invalid counter issuer address`); 404 `pool not found` (there is no such pool, **or the pool was created less than a
+minute ago**, see above); 500 `unable to retrieve pool`. No CSV.
+
+### `GET /v2/amm/pools/{pool}/history`
+
+The pool over time: every state it has been in, or with `interval=day` one row for each day it had activity.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `pool` (path) | | The pool account. |
+| `start` | the first ledger | |
+| `end` | the newest ledger | |
+| `interval` | none | Empty or missing: every state. `day`: the days with activity. Anything else is 400 `invalid interval`. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `<pool> - amm history.csv` (also with `interval=day`). |
+
+**Every state** (`history`): the pool after each transaction that touched it (a swap, a deposit, a withdrawal, a vote, a bid, the
+creation, the deletion), in ledger order. The values are carried forward: a state has the newest value of each column over its own row
+and everything before it, **also from before `start`** (the carry-in is read from the ledgers before the page, going back as far as a
+column needs). A value the pool never had stays out of the object.
+
+```json
+{ "result": "success", "count": 1, "marker": "…",
+  "history": [{
+    "amm_account": "r…", "ledger_index": 107703707, "tx_index": 12, "tx_hash": "…", "tx_type": "AMMDeposit",
+    "executed_time": "2026-10-17T10:24:11Z", "base_currency": "USD", "base_issuer": "r…", "counter_currency": "XRP",
+    "reserve_base": "1250.5", "reserve_counter": "2500", "lp_supply": "1767.7669", "lp_currency": "03…", "trading_fee": 500,
+    "auction_slot": { "holder": "r…", "price": "12.5", "discounted_fee": 50, "expiration": "2026-10-18T09:00:00Z" },
+    "deleted": false }] }
+```
+
+**PoolState**, in this order: `amm_account, ledger_index, tx_index, tx_hash, tx_type, executed_time, base_currency, base_issuer?,
+counter_currency, counter_issuer?, reserve_base?, reserve_counter?, lp_supply?, lp_currency?, trading_fee?, auction_slot?, deleted`. The
+marker holds `ledger_index` and `tx_index`.
+
+**Days** (`interval=day`, the list key is `days`): a UTC day on which a transaction touched the pool, with the stats of the day and the
+closing state of the pool.
+
+```json
+{ "result": "success", "count": 1, "marker": "…",
+  "days": [{
+    "amm_account": "r…", "date": "2026-10-16T00:00:00Z", "base_currency": "USD", "base_issuer": "r…", "counter_currency": "XRP",
+    "swap_count": 120, "volume_base": "340.5", "volume_counter": "680.9", "fees_base_est": "0.85", "fees_counter_est": "1.7",
+    "deposit_count": 2, "withdraw_count": 1, "liquidity_in_base": "10", "liquidity_in_counter": "20",
+    "liquidity_out_base": "5", "liquidity_out_counter": "10", "reserve_base": "1250.5", "reserve_counter": "2500",
+    "lp_supply": "1767.7669", "trading_fee": 500, "value_native": "5000" }] }
+```
+
+**PoolDay**, in this order: `amm_account, date, base_currency, base_issuer?, counter_currency, counter_issuer?, swap_count, volume_base,
+volume_counter, fees_base_est, fees_counter_est, deposit_count, withdraw_count, liquidity_in_base, liquidity_in_counter,
+liquidity_out_base, liquidity_out_counter, reserve_base?, reserve_counter?, lp_supply?, trading_fee?, value_native?`. `date` is the start of
+the UTC day. `volume_base` and `volume_counter` are the amounts that **went into the pool**, by side, over the day's swaps; `fees_*_est` are
+**estimates**: each swap's input times the pool's trading fee at that point (or the auction slot's discounted fee when the taker is the
+slot holder or one of its authorized accounts and the slot has not expired), over 100000. `liquidity_in_*` and `liquidity_out_*` are the
+amounts deposited and withdrawn (a creation counts as a deposit, a clawback as a withdrawal). The reserves, `lp_supply`, `trading_fee`
+and `value_native` are those at the end of the day (a pool deleted during the day has none, and no value). The marker is the start of
+the last day, in unix seconds.
+
+**The window of the days.** A day is a row when its **start** (00:00 UTC) is within `start` and `end`: at or after `start`, and before
+the end of the period `end` names. So `start=2026-10-01&end=2026-10-03` gives up to three days, and a `start` with a time of day leaves out
+the day it falls in. The days are the ones the aggregator has computed (today is refreshed about every five minutes; see
+[syncer](syncer.md#the-amm-jobs)); a day without activity has no row.
+
+**Empty and 404.** A page with no rows is 200 with an empty list when the pool has a state in a committed ledger (a pool with states but
+no day yet answers an empty `days`), and 404 `pool not found` when it has none.
+
+CSV: the same columns on every page, in the order of the keys, the slot as `auction_slot.holder, auction_slot.price,
+auction_slot.discounted_fee, auction_slot.expiration`; with `interval=day` the PoolDay columns.
+
+Errors, in the order they are checked: 400 `invalid pool`, `invalid start date format`, `invalid end date format`, `invalid interval`,
+`invalid marker`; then 404 `pool not found`; 500 `unable to retrieve pool history`.
+
+### `GET /v2/amm/pools/{pool}/swaps`
+
+The exchanges that were swaps against this pool, oldest first: what [`GET /v2/exchanges/{base}/{counter}?amm=only`](#get-v2exchangesbasecounter)
+serves for the pool's pair, restricted to the pool. The rows, the key order (with `amm_account` last), the markers and the CSV are those
+of the exchanges, in the pair as the pool stores it (the pair of `GET /v2/amm/pools/{pool}`), with no inversion. As there, the amounts are
+the pool's own changes, which on the asset the pool pays out include the issuer's transfer fee ([Exchanges](#exchanges)).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start` | `2013-01-01` | |
+| `end` | the newest ledger | |
+| `autobridged` | false | Only the autobridged swaps. |
+| `descending` | false | |
+| `limit` | 200 (**max 400**) | As the exchanges: a text that is not a number is 400 `invalid limit: NaN`. |
+| `marker` | | |
+| `format` | json | `csv`: file `<pool> - amm swaps.csv`, the exchange columns and `amm_account` last. |
+
+`{ "result": "success", "count": n, "marker": "…", "exchanges": [Exchange, …] }`. **`amm` is ignored** here: these are always the swaps,
+and no value of the parameter changes that (so `amm=bogus` is not an error on this route). A pool with no swap in the window is 200 with an empty
+list; the 404 rule is the one of the states (see above), so a pool is found as soon as its ledger is committed. Reads go through the pair key
+of the pool and the skip index on the pool column, never across pairs.
+
+Errors, in the order they are checked: 400 `invalid pool`, `invalid start date format`, `invalid end date format`, `invalid limit: NaN`,
+`invalid marker`; then 404 `pool not found`; 500 `unable to retrieve swaps`.
+
+### `GET /v2/amm/pools/{pool}/liquidity`
+
+The creation, the deposits, the withdrawals, the clawbacks and the deletion of the pool, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | the first ledger, the newest | |
+| `event` | all | `create`, `deposit`, `withdraw`, `clawback` or `delete`, spelt exactly so; empty is none; anything else is 400 `invalid event`. |
+| `account` | all | Only the events of this liquidity provider (not validated: an address that has none gives an empty list). |
+| `descending`, `limit` (200, max 1000), `marker` | | |
+| `format` | json | `csv`: file `<pool> - amm liquidity.csv`. |
+
+```json
+{ "result": "success", "count": 1, "marker": "…",
+  "liquidity": [{
+    "amm_account": "r…", "ledger_index": 107703707, "tx_index": 12, "tx_hash": "…", "executed_time": "2026-10-17T10:24:11Z",
+    "account": "r…", "initiator": "r…", "event": "deposit", "mode": "two_asset",
+    "base_amount": "10", "counter_amount": "20", "lp_tokens": "14.1421356" }] }
+```
+
+**LiquidityEvent**, in this order: `amm_account, ledger_index, tx_index, tx_hash, executed_time, account, initiator, event, mode?,
+base_amount, counter_amount, lp_tokens`. The amounts are **signed, from the pool's side**: positive came into the pool, negative went out
+(a withdrawal has negative amounts), on the pool's `base` and `counter` (the pair of `GET /v2/amm/pools/{pool}`: the event carries no pair).
+`lp_tokens` is positive when LP tokens were minted and negative when they were burned. `account` is the liquidity provider and
+`initiator` the account that sent the transaction (the two differ for a clawback: `account` is the holder, `initiator` the issuer).
+`mode` is the one mode flag of a deposit or withdrawal (deposits: `lp_token`, `single_asset`, `two_asset`, `one_asset_lp_token`,
+`limit_lp_token`, `two_asset_if_empty`; withdrawals: `lp_token`, `withdraw_all`, `one_asset_withdraw_all`, `single_asset`, `two_asset`,
+`one_asset_lp_token`, `limit_lp_token`); it is left out for a creation, a deletion, a clawback, and a transaction with no mode flag or
+several. A withdrawal that empties the pool deletes it and is a `withdraw` event. The marker holds `ledger_index` and `tx_index`. In the
+CSV every column is there and `mode` is an empty cell where the object has none. `event` and `account` are conditions of the read itself,
+so a page is full whatever the share of events that match.
+
+Errors, in the order they are checked: 400 `invalid pool`, `invalid start date format`, `invalid end date format`, `invalid event`,
+`invalid marker`; then 404 `pool not found`; 500 `unable to retrieve liquidity`.
+
+### `GET /v2/amm/pools/{pool}/governance`
+
+The votes on the trading fee and the bids for the auction slot, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | the first ledger, the newest | |
+| `type` | all | `vote` or `bid`; empty is none; anything else is 400 `invalid type`. |
+| `descending`, `limit` (200, max 1000), `marker` | | |
+| `format` | json | `csv`: file `<pool> - amm governance.csv`. |
+
+```json
+{ "result": "success", "count": 2, "marker": "…",
+  "governance": [
+    { "amm_account": "r…", "ledger_index": 107644916, "tx_index": 7, "tx_hash": "…", "executed_time": "2026-10-16T08:00:00Z",
+      "type": "vote", "account": "r…", "fee_voted": 300, "trading_fee_after": 450 },
+    { "amm_account": "r…", "ledger_index": 107650001, "tx_index": 3, "tx_hash": "…", "executed_time": "2026-10-16T09:00:00Z",
+      "type": "bid", "account": "r…", "bid_min": "1", "bid_max": "5", "price_paid": "2.5",
+      "auction_slot": { "holder": "r…", "discounted_fee": 50, "expiration": "2026-10-17T09:00:00Z", "auth_accounts": ["r…"] } }] }
+```
+
+**Vote** (`type` `vote`), in this order: `amm_account, ledger_index, tx_index, tx_hash, executed_time, type, account, fee_voted?,
+trading_fee_after?`: the fee the voter asked for and the pool's fee after the vote. **Bid** (`type` `bid`): `amm_account, ledger_index,
+tx_index, tx_hash, executed_time, type, account, bid_min?, bid_max?, price_paid?, auction_slot?`, where `price_paid` is the LP tokens the
+bid burned and `auction_slot {holder?, discounted_fee?, expiration?, auth_accounts}` is the slot after the bid (`auth_accounts` always a
+list, empty when the slot has none). A vote carries nothing of a bid and a bid nothing of a vote. The marker holds `ledger_index` and
+`tx_index`.
+
+The CSV has the columns of both kinds, in this order: `amm_account, ledger_index, tx_index, tx_hash, executed_time, type, account,
+fee_voted, trading_fee_after, bid_min, bid_max, price_paid, auction_slot.holder, auction_slot.discounted_fee, auction_slot.expiration,
+auction_slot.auth_accounts`; the accounts of `auction_slot.auth_accounts` are one cell, joined by `;`. `type` is a condition of the read
+itself.
+
+Errors, in the order they are checked: 400 `invalid pool`, `invalid start date format`, `invalid end date format`, `invalid type`,
+`invalid marker`; then 404 `pool not found`; 500 `unable to retrieve governance`.
+
+### `GET /v2/accounts/{address}/amm_liquidity`
+
+The liquidity events of an account across all pools, oldest first. The address is not validated: one that is none has no events.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | the first ledger, the newest | |
+| `pool` | all | Only the events of the pool with this account: an address (empty is none), else 400 `invalid pool`; it need not be a pool that exists. |
+| `event` | all | As on the pool route (400 `invalid event`). |
+| `descending`, `limit` (200, max 1000), `marker` | | The marker holds `ledger_index`, `tx_index` and the pool. |
+| `format` | json | `csv`: file `<address> - amm liquidity.csv`. |
+
+`{ "result": "success", "count": n, "marker": "…", "liquidity": [LiquidityEvent, …] }`: the events of the pool route, with the
+same key order and signs. There is no 404. Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date
+format`, `invalid pool`, `invalid event`, `invalid marker`; 500 `unable to retrieve liquidity`.
+
+### `GET /v2/accounts/{address}/amm_positions`
+
+The LP-token positions of an account, one for each pool in which it holds LP tokens. The address is not validated.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `date` | now | The moment the positions are as of. Empty is none. It names an **instant**, not the end of the period: `2026-10-17` is midnight at the start of that day. It is resolved to the last committed ledger that closed at or before it (never past the newest one). A date before the first stored ledger gives no positions. |
+
+```json
+{ "result": "success",
+  "positions": [{ "pool": "r…", "lp_currency": "03…", "lp_balance": "100", "share": "0.25",
+                  "base_amount": "312.625", "counter_amount": "625" }] }
+```
+
+**Position**, in this order: `pool, lp_currency, lp_balance, share, base_amount?, counter_amount?`, sorted by pool. `lp_balance` is the
+account's last balance of the pool's LP token at that ledger, `share` is `lp_balance / lp_supply` with the supply of the pool at the same
+ledger, and each amount is `lp_balance × reserve / lp_supply` for the `reserve_base` and `reserve_counter` of the pool at that ledger (the
+pair of `GET /v2/amm/pools/{pool}`). They are **exact decimals**, never floats and never in the exponent form: a quotient that ends is
+served whole, however many digits it has, and one that does not end is rounded (half up) to **30 significant digits**. An amount whose
+reserve is unknown has no key. A line that is not a position is left out: a zero balance, a pool that was **deleted** by that ledger or
+whose supply is 0 or unknown, an account that is not a pool, and a line whose currency is not the LP currency the pool names. The list is
+not paged (no `count`, `marker` or CSV).
+
+Errors: 400 `invalid date format`; 500 `unable to retrieve positions`.
 
 ---
 
@@ -1064,7 +1403,7 @@ picture, with a family it is a flat row of that family.
 
 The `metric` family has: `accounts_created, exchanges_count, ledger_count, ledger_interval, payments_count, transaction_count,
 tx_per_ledger` (`ledger_interval` is the average seconds between ledgers, `tx_per_ledger` the average transactions per ledger,
-both to 5 significant digits). A bucket is listed when it starts within `start` and `end`.
+both to 5 significant digits). `exchanges_count` counts the order-book trades and the swaps against AMM pools. A bucket is listed when it starts within `start` and `end`.
 
 `ledger_interval` is computed from the **start of the bucket**: (close time of its last ledger − bucket start) / its ledgers. That is
 the average interval for a complete bucket and for the bucket in progress, but not for the first bucket of a database whose first

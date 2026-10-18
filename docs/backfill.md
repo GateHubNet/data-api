@@ -84,13 +84,67 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
 - **Reprocess:** after a parser change (the `parser_version` of `ledgers` records which parser wrote a ledger),
   `--reprocess --from A --to B` fetches and dry-parses first, then deletes and rewrites the committed ledgers of the range.
   It rewrites the whole requested range, not only ledgers of an older parser version.
-  Parser version 2 adds the AMM rows (swaps against pools among the `exchanges`, and `amm_pool_states`, `amm_liquidity`,
-  `account_amm_liquidity` and `amm_governance`): ledgers written by version 1 lack them, so on the XRP Ledger a reprocess from the
-  AMM enablement ledger (86795265) on is needed for complete pool data. Pools or reserve lines the parser could not turn into rows
+  Parser version 2 adds the AMM rows (swaps against pools among the `exchanges`, and `amm_pool_states`, `amm_pool_touches`,
+  `amm_liquidity`, `account_amm_liquidity` and `amm_governance`): ledgers written by version 1 lack them, so on the XRP Ledger a
+  reprocess from the AMM enablement ledger (86795265) on is needed for complete pool data: see
+  [AMM data re-ingest](#amm-data-re-ingest). Pools or reserve lines the parser could not turn into rows
   are counted in `syncer_amm_unclassified_total` (and the range-ingest log names the total of its run).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
+
+### AMM data re-ingest
+
+`PARSER_VERSION` is 2 since the AMM parser ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)). A ledger written by version 1 has no
+AMM rows, and what the live syncer writes from the deploy on is version 2 only: **a database that ingested the XRP Ledger before this
+release is missing every swap, liquidity event and pool state before it**, and `ledgers.exchanges_count` and `/v2/stats` lack the swaps.
+A pool appears in the API when its first transaction is ingested, so until the history is re-ingested the pool list has the pools that were
+touched since the deploy and no earlier history. Xahau has no AMM: there is nothing to re-ingest there.
+
+**Where to start.** No AMM transaction exists before the ledger that enabled the amendment:
+
+| | |
+| --- | --- |
+| Enablement ledger | **86795265**, closed 2024-03-22 20:11:41 UTC (ledger hash `438E0988A35F030ED73C4F3F7C02981485599ABAA9913805EDD7D2B970FD4B33`) |
+| `EnableAmendment` transaction | `75F52BB86416717288999523063D54E24290EFEA2E99DF78E80A12BD1C8FAC99` |
+| Amendment id (`AMM`) | `8CC0774A3BF66D1D22E76BBDA8E8A232E6B6313834301B3B23E8601196AE6455` |
+
+How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enabled amendments without AMM at ledger 86795009, 55 with it at
+86795265) is in the "XRPL AMM cases" section of [`packages/shared/test/fixtures/README.md`](../packages/shared/test/fixtures/README.md).
+
+**Procedure.**
+1. Deploy the release (schema, syncer, api) and let the live syncer run: it writes version-2 rows from now on.
+2. Re-ingest the committed history from the enablement ledger up to the live checkpoint. The range is committed, so it needs
+   `--reprocess` (it fetches and dry-parses before it deletes anything, then rewrites the ledgers in every table):
+
+   ```bash
+   # the checkpoint: SELECT max(ledger_index) FROM xrpl.ledgers
+   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+     node dist/cli/range-ingest.js --from 86795265 --to <checkpoint> --reprocess --concurrency 16
+   ```
+
+   That is about 21 million ledgers at the time of writing (the validated head was 107.7 million on 2026-10-17): read
+   [Which node?](#2-which-node) and use a node of your own. The reprocess rewrites every table of each ledger, not only the AMM
+   tables, so it costs what the first ingest did. Rerun the same command after a failure (finished chunks are skipped).
+   Ledgers that are not committed yet (a new database that is filled below the live start) need no `--reprocess`: a plain
+   `range-ingest --from 86795265 --to <live start - 1>` writes version-2 rows at once.
+3. The aggregates follow by themselves. Every written chunk marks its hours in `agg_dirty`, and for each slice the aggregator
+   rebuilds the **`amm_pools`** rows of the pools with a touch in it, the **`amm_daily`** sets of its days and the daily **`amm_volume`**
+   sets, with the stats, within the per-tick budgets ([syncer](syncer.md#7-the-aggregator)). After that the `amm_daily` back-fill
+   fills any closed day that still has no final set, newest first, from the day of the first pool touch. Watch
+   `SELECT count() FROM xrpl.agg_dirty`. A multi-year re-ingest takes the aggregator a while to digest.
+4. Check:
+
+   ```sql
+   -- every ledger from the enablement on is written by parser version 2
+   SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY parser_version;
+   -- how many pools and days the aggregator has built so far
+   SELECT uniqExact(amm_account) FROM xrpl.amm_pools;
+   SELECT uniqExactIf(day, amm_account = '') AS days, uniqExactIf(day, amm_account = '' AND final = 1) AS days_with_a_final_set FROM xrpl.amm_daily;
+   ```
+
+   `syncer_amm_unclassified_total` counts the pools the parser could not place, and the range-ingest log ends with a warning that names
+   the total of the run. A pool whose creation is older than the first ledger you ingested has no `created_ledger` / `created_by`.
 
 ### Public nodes and rate limits
 

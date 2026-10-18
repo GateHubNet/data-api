@@ -340,8 +340,10 @@ SETTINGS non_replicated_deduplication_window = 1000;
 -- ---------------------------------------------------------------------------
 
 -- The state of a pool after each transaction that touched it. The pair is in Ripple's canonical (base, counter) order.
--- A value is NULL when the transaction did not change it, readers carry the last known value forward. Reserves, the LP
--- supply and the auction price are exact Strings with Float64 shadows, the fee is in units of 1/100000.
+-- A value is filled whenever its node is present in the transaction's metadata (the value after the transaction, whether
+-- or not the transaction changed it) and is NULL when the metadata has no such node, so readers carry the last known value
+-- forward. Reserves, the LP supply and the auction price are exact Strings with Float64 shadows, the fee is in units of
+-- 1/100000.
 CREATE TABLE IF NOT EXISTS amm_pool_states
 (
   amm_account            String,

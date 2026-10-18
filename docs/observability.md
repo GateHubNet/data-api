@@ -130,8 +130,9 @@ Prefix `syncer_`.
 | `syncer_validations_dropped_total` | Counter | `reason` | Validations not kept (`buffer_full`, `no_reporter`, `manifest_no_reporter`, `invalid`, `shutdown`) |
 | `syncer_fee_stats_samples_total` | Counter | | Fee snapshots written |
 | `syncer_fee_stats_errors_total` | Counter | | Snapshots that failed (node silent, ClickHouse refused) |
-| `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `stats_live`, `stats_dirty`, `volume_backfill`) |
-| `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices) that failed; each is retried on the next tick |
+| `syncer_amm_unclassified_total` | Counter | | Pools of AMM transactions for which the parser could make no swap, liquidity or governance row, or whose assets it could not tell (spec section 2.3), counted once per committed write by the live ingest and by `range-ingest` runs of this process. A trickle is normal; a burst means a shape the parser does not know. The range-ingest log names the total of its run |
+| `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `amm_pools`, `stats_live`, `stats_dirty`, `amm_daily`, `volume_backfill`); `amm_daily` runs every fifth tick |
+| `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices, sets, pools) that failed; each is retried. `job` is one of `volume_live`, `volume_daily`, `volume_backfill`, `volume_dirty`, `stats_live`, `stats_dirty`, **`amm_pools`**, **`amm_pools_dirty`**, **`amm_daily`**, **`amm_daily_dirty`** (the `*_dirty` labels are the sets and pools rebuilt for an `agg_dirty` slice) |
 | **`syncer_aggregator_stats_lag_seconds`** | Gauge | | Seconds of ledger history the stats catch-up still has to cover; 0 when the stats are up to the last two hours |
 | `syncer_process_*`, `syncer_nodejs_*` | | | Default process metrics |
 
@@ -141,6 +142,8 @@ syncer_last_commit_age_seconds > 120 and syncer_lag_ledgers < 2     # a live cha
 rate(syncer_head_ledger[5m])                                        # ledgers/s closing; compare with the checkpoint's rate
 rate(syncer_checkpoint_ledger[5m])                                  # ingest throughput while catching up
 rate(syncer_aggregator_errors_total[15m]) > 0
+rate(syncer_aggregator_errors_total{job=~"amm_.*"}[15m]) > 0        # a pool or a day of the AMM aggregates keeps failing
+increase(syncer_amm_unclassified_total[1h])                          # pools the AMM parser could not place
 syncer_aggregator_stats_lag_seconds > 3600
 rate(syncer_validations_flushed_total[5m]) == 0                     # XRPL: validators validate every ledger
 ```
@@ -152,7 +155,10 @@ The gauges describe what *this process* has done since boot: scrape each network
 Both services log through the NestJS `Logger` via the toolbox logger (stdout/stderr; capture it with your container log pipeline).
 There are **no `GH_LOGGER_*` variables**: the toolbox logger decides the format (colour is switched off outside dev/test). Contexts to
 grep for: `Syncer` (boot line with network, workers and node hosts), `NodeClient` (connects, reconnects, silence), `LiveRunner`
-(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService`, `Api` (boot line with
+(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService` (including the AMM lines:
+`Aggregator job amm_pools failed for pool ..., set aside to be tried again`, and the warning `Aggregator job amm_pools: a batch of N pool(s)
+failed as a whole, but its halves were rebuilt: ...`, which is counted as one error and means the batch failed for its size, not that a pool is
+bad), `Api` (boot line with
 network and native currency), `RippleRoute` / `RippleError` (the cause of every 5xx, with the stack; the response body never carries
 it), `ApiKeyGuard`.
 
@@ -183,6 +189,8 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | **Syncer not committing** | `syncer_last_commit_age_seconds > 120` | Ingest wedged, node silent, or ClickHouse refusing writes |
 | **Syncer halted / down** | probe 503 with `state=halted`, `increase(syncer_ingest_halts_total[5m]) > 0`, or `up{job="syncer"} == 0` | Chain break, a ledger the parser rejects, lost lease, or process down |
 | Aggregator failing | `rate(syncer_aggregator_errors_total[15m]) > 0` for 30m | Stats or volumes not refreshing |
+| AMM aggregates failing | `rate(syncer_aggregator_errors_total{job=~"amm_.*"}[15m]) > 0` for 30m | A pool is stale in `/v2/amm/pools` or a day is missing from the pool history; the log names the pool or the day |
+| AMM pools unclassified | `increase(syncer_amm_unclassified_total[1h]) > 100` | The parser meets a pool shape it does not know (tune to your traffic) |
 | Aggregator far behind | `syncer_aggregator_stats_lag_seconds > 3600` for 1h | Sweep slower than the data |
 | Validations flowing | `rate(syncer_validations_flushed_total[10m]) == 0` for 10m on XRPL | Collector or its nodes down |
 | Fee stats flowing | `rate(syncer_fee_stats_samples_total[10m]) == 0` | Node unreachable |

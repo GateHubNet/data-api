@@ -13,9 +13,9 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats + volumes │
    └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┘
           ▼               ▼               ▼                 ▼
-   14 ledger tables   validations    fee_stats        stats_hourly, volume_live,
-   (ledgers = commit  validator_     (every 5 s)      volume_daily   (reads the ledger tables)
-    marker)           manifests
+   19 ledger tables   validations    fee_stats        stats_hourly, volume_live,
+   (ledgers = commit  validator_     (every 5 s)      volume_daily, amm_pools,
+    marker)           manifests                       amm_daily      (read the ledger tables)
                           ClickHouse, database = the network name
 ```
 
@@ -58,11 +58,16 @@ The single writer of the ledger tables. It follows the validated chain, one ledg
 
 ### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 14
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 19
 **ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
-`balance_changes`, `accounts_created`; see [data-model](data-model.md)). The parsers never mutate their input and take the
+`balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
+`account_amm_liquidity`, `amm_governance`; see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
+The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
+copies), and a pool the parser touches gets a state row, plus a liquidity or governance row for the `AMM*` transactions. A pool or a
+reserve line it cannot turn into rows is counted in `syncer_amm_unclassified_total` (live ingest and range ingest, once per committed
+write; the range-ingest log names the total of its run).
 `LedgerWriter.write()` then inserts, in this order:
 
 1. all child tables, in parallel (each insert is chunked at 50,000 rows),
@@ -240,16 +245,19 @@ most 2 s for the sample in flight.
 
 ## 7. The aggregator
 
-Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs five jobs **in priority order**; a job
-gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work:
+Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs seven jobs **in priority order**; a job
+gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work. The budgets are
+constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment variables, and so is the cadence of `amm_daily`:
 
 | # | Job | Budget | What |
 | --- | --- | --- | --- |
-| 1 | `volume_live` | 5 s | The seven live volume sets (trade volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version. **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
-| 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), both metrics, stalest first. |
-| 3 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
-| 4 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes the daily volume sets of the days a slice covers. |
-| 5 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config, **newest first**. |
+| 1 | `volume_live` | 5 s | The twelve live volume sets (trade volume and AMM volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version. **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
+| 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), all three metrics, stalest first. |
+| 3 | `amm_pools` | 3 s | Rebuilds the `amm_pools` row of every AMM pool with state rows that its row has not seen yet, 200 pools at a time ([the AMM jobs](#the-amm-jobs)). |
+| 4 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
+| 5 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days. |
+| 6 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
+| 7 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config, **newest first**, all three metrics. |
 
 Properties that matter operationally:
 
@@ -266,14 +274,75 @@ Properties that matter operationally:
   *newest ingested ledger's* close time (the sentinel row of a set records whether the newest ledger had passed the day end
   when the set was written), not by the wall clock. After an ingest lag of more than a day the days are not computed until their
   ledgers are in.
-- A set that keeps failing waits 5 minutes, doubling up to an hour, and older days go on; the memory of this is lost on restart.
+- A set that keeps failing waits 5 minutes, doubling up to an hour, and older days go on; the memory of this is lost on restart. A pool of `amm_pools` that keeps failing is set aside the same way.
 - **No overlap, graceful stop** (a tick still running is skipped; shutdown aborts the slice in flight and waits at most 2 s).
+- The AMM jobs run on both networks, whenever the aggregator does. Xahau has no AMM: `amm_pools` finds no pool, and the AMM sets
+  (`amm_daily`, the `amm_volume` volume sets) hold only their sentinel.
 - Volume jobs need the **markets config** (`config/markets/<network>.json` or `GH_MARKETS_CONFIG`): without markets there is
   nothing to compute. (The shipped Xahau list, version 3, was derived from a small sample, about 3,800 ledgers spread over three days,
   and is short: one trade market (`EVR`/`XAH`) and three payment currencies; `XXX`, a test token whose ISO code means "no
   currency", was left out. Re-derive it from a full-history node with the queries of the
   [verification report](superpowers/plans/2026-10-15-ripple-dropin.verification.md#8-step-6-packagessharedconfigmarketsxahaujson),
   then bump `version`.) A new `version` in the file recomputes the closed days.
+
+### The AMM jobs
+
+All three AMM aggregates read **committed ledgers only**: the ledger writer fills the tables of a ledger at the same time and writes
+its `ledgers` row last, so the jobs cap every scan at the newest `ledgers` row (the committed head), and a cursor never passes a ledger
+whose rows are not all readable. They are rebuilt from the append-only AMM ledger tables, never written by ingest, so a recovery delete
+cannot lose a state after merges ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)).
+
+**`amm_pools`** (budget 3 s, every tick; `amm_pools` of [data-model](data-model.md#amm-tables-five-ledger-tables-two-aggregates)):
+- **Cursor.** A ledger index kept in memory and found again when the process starts (`ammPoolsWatermark`: the ledger before the oldest
+  state row, in `amm_pool_touches`, that its pool's newest `amm_pools` row has not seen; the committed head when there is none). A
+  restart takes the work up where it was.
+- **Each tick** `poolsChangedSince` returns at most 200 pools (`AMM_POOLS_BATCH`) that have a touch above what their newest
+  `amm_pools` row has seen (**stale only**: a busy pool already rebuilt up to the head is not returned again), oldest first, read from
+  `amm_pool_touches` by a range of its primary key up to the committed head. Each is rebuilt whole from its state rows under a newer
+  version: the fill-forward of every column (a window of `AMM_FILL_WINDOW_LEDGERS` = 160,000 ledgers, about a week, then older doubling
+  steps for the pools the window leaves incomplete), `value_native`, `created_ledger` and `created_by`. The cursor moves past a batch
+  only once it is written.
+- **A batch that fails is halved** to find the pools that fail on their own. When the budget runs out in the middle of a halving, the
+  state of it is kept and the **next tick goes on with it** (the cursor stays), instead of halving the whole batch again. At most three
+  pools of a batch may fail on their own; more than that means the cause is not the pools (the database, a limit) and the batch is the
+  failure of the job.
+- **Set aside, with conditions.** The pools that fail alone are set aside in memory, each counted as an error under `amm_pools` and tried
+  again after 5 minutes, doubling up to an hour (the retries run at every tick, also when the live part failed), while the cursor and the
+  other pools go on. That only happens on **partial success**: if something in the batch worked, or if the very same batch comes again and
+  fails the same way (a **repeat**). A batch in which everything fails the first time is the failure of the job (counted, logged), the
+  cursor stays behind it, and the next tick tries it again. A restart forgets the set: the pool is still stale in the tables, so the new
+  process finds it again.
+- **The warning.** A list that failed whole but whose halves were rebuilt, with no pool found below it (it fails for its size), is
+  counted once as an error and logged as `Aggregator job amm_pools: a batch of N pool(s) failed as a whole, but its halves were rebuilt:
+  <cause>`, so that it leaves a trace.
+- **Dirty slices.** `stats_dirty` rebuilds the pools with a touch in the ledgers of each slice (error label `amm_pools_dirty`). A slice
+  is started whole and its batches are not cut by the budget, only by the shutdown.
+
+**`amm_daily`** (budget 4 s, **at the first tick and then every 5th tick**: the roadmap's cadence rule keeps the 30 s tick from being over-committed; `AMM_DAILY_EVERY_TICKS`):
+- **Version sets.** A day is written whole under one version: a row for each pool with activity, plus a sentinel row that carries the
+  version and the `final` flag ([data-model](data-model.md#amm-tables-five-ledger-tables-two-aggregates)).
+- **One run** does, under the budget: (1) **today every run**, and **yesterday until its set is final** for the current
+  `AMM_DAILY_CONFIG_VERSION`, the stalest first and a day that failed last time behind the other (R87); (2) the **owed days**, days
+  that failed on the dirty path and are due again; (3) the **back-fill of the closed days, newest first**, starting at the day of the
+  first pool touch (the close time of the oldest ledger in `amm_pool_touches`), for the days that have no final set of the current
+  config version. A day is closed when it is before yesterday and the ingest has passed it (the newest committed ledger closed at least an
+  hour after its end, R86), not by the wall clock.
+- **One floor day per run.** At least one day starts at each run whatever is left of the budget: a due owed day if there is one, else the
+  newest wanted closed day. Without it a long today would use the budget up and the back-fill would never move.
+- **Failures.** A day that fails is counted once under `amm_daily` and tried again at the next run; a closed day waits 5 minutes,
+  doubling up to an hour, while the older days go on (kept in memory). The days of an `agg_dirty` slice are recomputed with the slice
+  (error label `amm_daily_dirty`); a day that fails there does not hold its range: it is counted, owed to the `amm_daily` job (which tries
+  it after 5 minutes, doubling up to an hour), and the slice and the range go on.
+- **Cost.** The closing state and the fee state at the start of a day come from the same windowed fill-forward as `amm_pools`
+  (`AMM_FILL_WINDOW_LEDGERS`, then doubling steps back), so a pool pays for the distance back to its oldest needed value. The swaps are
+  read through the pair key of each pool and the `amm_account_set` index, never across pairs. A back-fill of N days costs N such reads.
+- **When the computation changes**, bump `AMM_DAILY_CONFIG_VERSION` (`packages/shared/src/aggregate/amm-daily.job.ts`): every closed
+  day is then computed again by the back-fill.
+
+**`amm_volume`** is a third metric of `volume_live`, `volume_daily` and `volume_backfill`, not a job of its own. It has the sets,
+sentinel, `config_version` and `volumeDaysDone` of the other two metrics. Its components are the pools with swap volume in the window
+(`component` is the pool account), found from `amm_pool_touches` and `amm_pool_states` and read through the pair key, converted to the
+native currency like trade components. It is not limited to the configured markets.
 
 ## 8. What the syncer does not do
 
@@ -306,6 +375,6 @@ Properties that matter operationally:
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | The other three workers |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
-| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |
-| `packages/shared/src/aggregate/{stats,volume}.job.ts`, `query/rates.service.ts` | Aggregation and rates |
+| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM |
+| `packages/shared/src/aggregate/{stats,volume,amm-pools,amm-daily}.job.ts`, `aggregate/amm-reads.ts`, `query/rates.service.ts` | Aggregation and rates (`amm-reads.ts` holds the reads the AMM jobs share) |
 | `packages/shared/src/xrpl/node-client.ts` | The node client |

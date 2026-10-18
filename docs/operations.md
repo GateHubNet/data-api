@@ -21,7 +21,8 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 | Swagger | `GET /internal/docs` (not exposed by nginx; reach the api container directly) |
 | Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` (idempotent) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
-| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total` |
+| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `stats_live`, `stats_dirty`, `amm_daily`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`) |
+| AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 
 Two services per network, never more than **one syncer**: `syncer-xrpl`, `syncer-xahau` are singletons (a fixed
 `container_name`, so compose refuses to scale them, and an application-level lease in ClickHouse that refuses a second writer).
@@ -100,8 +101,8 @@ Only `validations` expires on its own (90-day TTL). Raw ledger data is deleted b
 - A ledger that has a `ledgers` row but fewer stored transactions than its `tx_count` is answered with **500** by `/v2/ledgers/{id}` (and its hash list); lists of
   payments, exchanges and balance changes silently lose the rows whose tables were dropped.
 
-So never drop the partitions of one table alone. Drop **the same ledger range from all 14 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
-partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
+So never drop the partitions of one table alone. Drop **the same ledger range from all 19 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
+partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
 is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledgers vanish from every list at once), then the children. For the block 80,000,000-89,999,999
 (P7 partition 8, P6 partitions 80-89) of the XRPL database:
 
@@ -109,14 +110,16 @@ is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledger
 # run from the repo root; clickhouse-client authenticates with the container's own environment (the secret never touches the host command line)
 ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -q "$0"' "$1"; }
 for p in 80 81 82 83 84 85 86 87 88 89; do ch "ALTER TABLE xrpl.ledgers DROP PARTITION $p"; done      # the commit marker first
-for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
-for t in ledger_by_hash tx_by_hash tx_by_type account_transactions account_tx_by_sequence payments_by_currency account_payments exchanges account_exchanges balance_changes; do
+for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments amm_pool_touches; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
+for t in ledger_by_hash tx_by_hash tx_by_type account_transactions account_tx_by_sequence payments_by_currency account_payments exchanges account_exchanges balance_changes \
+         amm_pool_states amm_liquidity account_amm_liquidity amm_governance; do
   ch "ALTER TABLE xrpl.$t DROP PARTITION 8"
 done
 ch "DELETE FROM xrpl.accounts_created WHERE ledger_index BETWEEN 80000000 AND 89999999"
 ```
 
-The rollups (`stats_hourly`, `volume_*`) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats` and `validations` are independent.
+The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats` and `validations` are independent. A block dropped from the AMM tables and
+brought back by `range-ingest` marks `agg_dirty`, and the aggregator rebuilds the pools and days it covers.
 
 To **bring a dropped block back**, run `range-ingest` over the same range: with no `ledgers` rows left it ingests everything. To repair a **partial** loss (some tables
 dropped, or a ledger answering 500) without caring about partition alignment, use `--reprocess` over exactly the damaged range
@@ -130,7 +133,8 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_last_commit_age_seconds` | under ~10 s live (a ledger closes every 3-4 s on XRPL) | Above 60 s with a lag of 0 means the chain is not closing ledgers or the head hint is stuck |
 | syncer probe `state` | `live` (`catching_up` while behind) | `halted` (chain break, a ledger the parser rejects, or lost lease) |
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
-| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines |
+| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs) |
+| `syncer_amm_unclassified_total` | a trickle at most | A burst: the parser met a pool shape it cannot place (a new kind of AMM transaction, an MPT asset); see [backfill](backfill.md#amm-data-re-ingest) |
 | `rate(syncer_fee_stats_samples_total[5m])` | about 0.2/s | 0 (node unreachable) |
 | `rate(syncer_validations_flushed_total[5m])` | positive on XRPL (validators validate every ledger) | 0 for minutes; `syncer_validations_dropped_total{reason}` rising |
 | `api_http_requests_total{status=~"5.."}` | none | Spike |
@@ -218,6 +222,53 @@ reachable? `[NodeClient]` reconnect warnings), ClickHouse (writes failing? `reco
 stuck mutations in `system.mutations`), and disk. Live load is about one ledger per 3-4 s on XRPL; falling behind in live mode is
 a downstream problem, not throughput. In catch-up, throughput is bound by the node first: raise `GH_CATCHUP_CONCURRENCY` with
 your own node.
+
+## The AMM jobs
+
+The aggregator keeps two AMM tables up to date, `amm_pools` (the current state of every pool) and `amm_daily` (a row per pool and UTC
+day), and a third volume metric, `amm_volume`, in the volume sets. How they work is in [syncer](syncer.md#the-amm-jobs); what an
+operator needs:
+
+| Job | Budget and cadence | Healthy | Watch |
+| --- | --- | --- | --- |
+| `amm_pools` | 3 s, every tick, third in the tick (after `volume_daily`) | A new pool is in `GET /v2/amm/pools/{pool}` within about a minute of its first ledger | `syncer_aggregator_errors_total{job="amm_pools"}` and `{job="amm_pools_dirty"}`; log lines `Aggregator job amm_pools ...` |
+| `amm_daily` | 4 s, at the first tick and then every 5th tick (about five minutes), sixth in the tick (after `stats_dirty`) | Today's row follows the pool within five minutes; the back-fill says `AMM daily back-fill: N days to compute` and then `is done` | `{job="amm_daily"}` and `{job="amm_daily_dirty"}` |
+| `amm_volume` | inside `volume_live` (5 s), `volume_daily` (4 s) and `volume_backfill` (10 s) | `GET /v2/network/amm_volume` has components | the volume jobs' errors, `volume_live` and `volume_daily` |
+
+- **The tick shares its budget.** `volume_live` (twelve live sets) and `volume_daily` (six daily sets of today and yesterday) go first,
+  then `amm_pools`, so the pool list is as fresh as the volumes; `amm_daily` goes after `stats_dirty` and only gets what is left.
+  Each job has its own budget, so a long `amm_daily` back-fill cannot starve the live jobs. If a job logs `reached its budget`, it goes
+  on at the next tick or run (said once until a run finishes in time).
+- **What a recompute costs.** A pool's state is the newest non-null value of each column over its state rows (a swap carries no fee, LP
+  supply or slot). The aggregators read a window of `AMM_FILL_WINDOW_LEDGERS` (160,000 ledgers, about a week) of each pool first, and walk
+  further back in doubling steps only for the pools whose window leaves a column null, so a pool pays for the distance back to its
+  oldest needed value (the whole history only for a column that is null for ever). A back-fill of many days costs that for each day, so
+  the first sweep of a deployment with years of AMM history takes many ticks: watch `AMM daily back-fill: N days to compute` in the log.
+- **The dirty-slice hooks.** `stats_dirty` (after a `range-ingest`) recomputes, for each slice of an `agg_dirty` range, the stats, the
+  daily volume sets of its days, the `amm_pools` rows of the pools with a touch in its ledgers (error label `amm_pools_dirty`) and the
+  `amm_daily` sets of its days (`amm_daily_dirty`). A slice is started whole, so a slice with thousands of pools runs past the
+  `amm_pools` budget of 3 s. The budget of `stats_dirty` (10 s) is checked between slices, so a tick can run as long as one slice
+  longer; the rest of the range is done at the next tick.
+- **A pool that fails is set aside, not stuck.** `amm_pools` halves a failing batch of up to 200 pools to find the pools that fail on
+  their own (at most three per batch), counts each as an error, and retries each after 5 minutes, doubling up to an hour. The log names
+  the pool: `Aggregator job amm_pools failed for pool r..., set aside to be tried again`. The pool is stale in `amm_pools` until its
+  retry works. The set is in memory: a restart recomputes it from the tables and finds the pool again.
+- **`failed as a whole, but its halves were rebuilt`.** A warning `Aggregator job amm_pools: a batch of N pool(s) failed as a whole, but
+  its halves were rebuilt: <cause>` is counted as one error. Nothing is lost; the batch failed for its size (a timeout, a memory limit
+  of ClickHouse). If it keeps appearing, look at the cause and at `system.query_log` for the fill-forward query.
+- **`amm_daily`: a day that fails** is counted once and tried again at the next run; a closed day waits 5 minutes, doubling up to an
+  hour. A day that fails on the dirty path (after a re-ingest) is owed to the job and does not hold up `agg_dirty`.
+- **After a re-ingest** (`range-ingest --reprocess` over AMM ledgers, see [backfill](backfill.md#amm-data-re-ingest)) the written
+  ledgers mark `agg_dirty`, and the aggregator rebuilds the pools and the days they cover with the stats: `SELECT count() FROM
+  xrpl.agg_dirty` shrinks as it works. The pools of the live ledgers are found by the stale-pool cursor.
+- **When the computation of `amm_daily` changes** (a fix to the fee estimate, say), bump `AMM_DAILY_CONFIG_VERSION` in
+  `packages/shared/src/aggregate/amm-daily.job.ts` and deploy: every closed day is computed again by the back-fill, newest first.
+- **A pool that is missing.** `GET /v2/amm/pools/{pool}` answers 404 for a brand-new pool until the first tick of `amm_pools` after
+  its ledger is committed (up to about a minute); its history, swaps, liquidity and governance are served as soon as the ledger is.
+  A 404 that lasts: no ledger of the pool was ingested (the history starts at the ledger the syncer started at, or at the ledger of a
+  `--reprocess`), or `amm_pools` is failing for it (the log names the pool).
+- **Is the AMM data complete?** `SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY parser_version`:
+  ledgers written by version 1 have no AMM rows. A pool whose creation was not ingested has no `created_ledger` / `created_by`.
 
 ## Backfill and repair
 

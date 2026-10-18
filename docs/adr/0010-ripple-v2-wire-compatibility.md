@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted.
+**Status:** Accepted (amended by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md): section 6, AMM swaps are exchanges).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -141,6 +141,22 @@ The three gaps this section listed were fixed in the final fix round; they are k
 39. The live routes `/balances` and `/orders` send `Cache-Control: private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`no-store` when the live cache is off), and
     `limit=all` pages the node within an overall deadline of 30 s, past which the route answers its 500 (Ruling R108). Every other `/v2` answer carries the global
     `GH_CACHE_CONTROL`, now `private, max-age=60` by default (Ruling R109).
+
+### 6. AMM swaps are exchanges (ADR-0011)
+The original predates automated market makers. A swap against an AMM pool is stored as an exchange ([ADR-0011](0011-amm-data-and-swaps-as-exchanges.md)),
+so these items differ from `data.ripple.com` on the XRP Ledger. Xahau has no AMM and is unaffected.
+40. **Exchange-based endpoints include AMM swaps:** `/v2/exchanges/{base}/{counter}` (raw trades, candles and `reduce`), `/v2/exchanges`,
+    `/v2/accounts/{address}/exchanges`, `/v2/exchange_rates`, `/v2/normalize`, `/v2/active_accounts`, `/v2/network/exchange_volume`, and the
+    `exchanges_count` stored with each ledger (`ledgers.exchanges_count`), and so the one of `/v2/stats`. A swap is a trade between the two assets of the pool, with the pool as `provider`
+    and as `seller` or `buyer`. The same applies to everything priced from the rates (account reports and value).
+41. **The `amm` filter** (`include`, the default; `exclude`; `only`) is ours: the three exchange lists accept it, and anything else is 400
+    `invalid amm filter - use: include, exclude, only`. `amm=exclude` gives the exchanges the original would have served.
+42. **`amm_account` is the last key of an exchange object** (also of the exchanges of `active_accounts` with `include_exchanges`, and the last CSV
+    column), present only on a swap. An order-book exchange is served byte for byte as before. A swap has `offer_sequence` 0.
+43. **A swap's amounts are the pool's deltas.** On the asset the pool pays out they include the issuer's transfer fee (the book rows use the
+    offer's change, which excludes it), and the `rate` follows from them.
+44. **New endpoints (extras, not in the original):** `/v2/amm/pools[/{pool}|/{base}/{counter}]`, `/v2/amm/pools/{pool}/{history,swaps,liquidity,governance}`,
+    `/v2/accounts/{address}/{amm_liquidity,amm_positions}` and `/v2/network/amm_volume`, in [api-reference](../api-reference.md#amm).
 
 ## Consequences
 **Positive**
