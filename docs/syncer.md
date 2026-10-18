@@ -301,7 +301,8 @@ cannot lose a state after merges ([ADR-0011](adr/0011-amm-data-and-swaps-as-exch
   `amm_pools` row has seen (**stale only**: a busy pool already rebuilt up to the head is not returned again), oldest first, read from
   `amm_pool_touches` by a range of its primary key up to the committed head. Each is rebuilt whole from its state rows under a newer
   version: the fill-forward of every column (a window of `AMM_FILL_WINDOW_LEDGERS` = 160,000 ledgers, about a week, then older doubling
-  steps for the pools the window leaves incomplete), `value_native`, `created_ledger` and `created_by`. The cursor moves past a batch
+  steps for the pools the window leaves incomplete, each down to its own first state ledger at most), `value_native`, `created_ledger`
+  and `created_by`. The cursor moves past a batch
   only once it is written.
 - **A batch that fails is halved** to find the pools that fail on their own. When the budget runs out in the middle of a halving, the
   state of it is kept and the **next tick goes on with it** (the cursor stays), instead of halving the whole batch again. At most three
@@ -335,8 +336,10 @@ cannot lose a state after merges ([ADR-0011](adr/0011-amm-data-and-swaps-as-exch
   (error label `amm_daily_dirty`); a day that fails there does not hold its range: it is counted, owed to the `amm_daily` job (which tries
   it after 5 minutes, doubling up to an hour), and the slice and the range go on.
 - **Cost.** The closing state and the fee state at the start of a day come from the same windowed fill-forward as `amm_pools`
-  (`AMM_FILL_WINDOW_LEDGERS`, then doubling steps back), so a pool pays for the distance back to its oldest needed value. The swaps are
-  read through the pair key of each pool and the `amm_account_set` index, never across pairs. A back-fill of N days costs N such reads.
+  (`AMM_FILL_WINDOW_LEDGERS`, then one walk of doubling steps back with the list of what each pool needs, each pool down to its own first
+  state ledger at most: Ruling R-A25), so a pool pays for the distance back to its oldest needed value. The swaps are read through the
+  pair key of each pool and the `amm_account_set` index, never across pairs. A back-fill of N days costs N such reads. A day is never cut
+  by the budget; one that takes longer than it is warned about (`... took <n> ms, more than the budget of amm_daily ...`).
 - **When the computation changes**, bump `AMM_DAILY_CONFIG_VERSION` (`packages/shared/src/aggregate/amm-daily.job.ts`): every closed
   day is then computed again by the back-fill.
 

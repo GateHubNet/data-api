@@ -283,9 +283,10 @@ export class AmmPoolsService {
    * `fillForward` (a window of `AMM_HISTORY_CARRY_LEDGERS`, then further back in doubling steps as far as a column needs:
    * exact and bounded), those of `ledger` itself before `tx` are read apart and put on top of it.
    *
-   * The window is read first, and the steps back only when it leaves a column null and the pool has older rows at all
-   * (`onlyPoolsWithOlderRows`): a pool that has all its values in the window costs one read, and the first page of a pool, which
-   * has nothing before it, does not walk back to the first ledger of the chain one step after the other.
+   * The window is read first, and the steps back only when it leaves a column null and the pool has older rows at all (the
+   * walk ends at the pool's first state ledger, Ruling R-A25): a pool that has all its values in the window costs one read, and
+   * the first page of a pool, which has nothing before it, costs the window and one look for its first ledger, and does not
+   * walk back to the first ledger of the chain one step after the other.
    */
   private async carryIn(pool: string, ledger: number, tx: number): Promise<FilledValues> {
     let state: FilledValues = EMPTY_FILL;
@@ -297,7 +298,6 @@ export class AmmPoolsService {
         upTo,
         Math.max(0, upTo - AMM_HISTORY_CARRY_LEDGERS + 1),
         POOL_QUERY,
-        { onlyPoolsWithOlderRows: true },
       );
       if (row !== undefined) state = fromFill(row);
     }

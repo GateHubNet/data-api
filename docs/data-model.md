@@ -254,7 +254,8 @@ first). The version is the ClickHouse clock in milliseconds, never lower than on
   read is bounded by the account prefix.
 - **Fill-forward** (`fillForward`, shared by the jobs and the API): the state rows of a window of ledgers before the point asked for, per
   pool, a range of the primary key (`argMaxIf(column, (ledger_index, tx_index), isNotNull(column))`), and, for the pools the window leaves
-  incomplete, older ledgers in doubling steps until every column has a value or the first ledger is reached (Rulings R-A21 and R-A23).
+  incomplete and that have older rows, older ledgers in doubling steps until every column has a value or the pool's own first state
+  ledger is reached (one grouped read finds those ledgers; Rulings R-A21, R-A23 and R-A25).
   The answer is exactly the one the whole history gives. The window is `AMM_FILL_WINDOW_LEDGERS` (160,000 ledgers, about a week) for
   the aggregators and `AMM_HISTORY_CARRY_LEDGERS` (2,048, about two hours) for the history of a pool and for positions. Pools are read in
   batches of `AMM_POOLS_CHUNK` / `AMM_CHUNK` (200).

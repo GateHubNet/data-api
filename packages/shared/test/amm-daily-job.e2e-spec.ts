@@ -1,6 +1,7 @@
 import BigNumber from 'bignumber.js';
 import { join } from 'node:path';
 import {
+  AMM_DAILY_CHUNK,
   AMM_DAILY_CONFIG_VERSION,
   AMM_DAILY_STATES_SQL,
   AMM_DAILY_SWAPS_SQL,
@@ -1712,11 +1713,15 @@ describe('the amm_daily job (e2e)', () => {
       expect(later.every((r) => r.fill_up_to < 1000 - WINDOW)).toBe(true);
       const walked = new Set(later.flatMap((r) => r.accounts));
       // a pool with every value in the window is not read again, and nor is a pool with no swap that day, whose fee at the
-      // start of the day nobody needs although the window does not hold it
+      // start of the day nobody needs although the window does not hold it, or a pool with nothing before the window (its
+      // first state ledger is in the day: Ruling R-A25)
       expect(walked.has(FRESH.account)).toBe(false);
       expect(walked.has(LIQUIDITY_ONLY.account)).toBe(false);
-      for (const p of [...pools, CREATED, SWAPPER])
-        expect([p.account, walked.has(p.account)]).toEqual([p.account, true]);
+      expect(walked.has(CREATED.account)).toBe(false);
+      for (const p of [...pools, SWAPPER]) expect([p.account, walked.has(p.account)]).toEqual([p.account, true]);
+      // one walk for the closing state and the fee state at the start of the day together: no range is read twice
+      const ranges = later.map((r) => `${r.fill_from}-${r.fill_up_to}`);
+      expect(new Set(ranges).size).toBe(ranges.length);
     });
 
     it('writes the pools in the order of their account, those read whole among them', () => {
@@ -1783,6 +1788,77 @@ describe('the amm_daily job (e2e)', () => {
         reserve_base: null,
         trading_fee: null,
         fees_base_est: '0',
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('a chunk of 200 pools with values null for ever and a first state ledger near the head (Ruling R-A25)', () => {
+    // a database ingested from a recent ledger: every pool is first seen without its AMM node, so its LP supply, its fee and
+    // its slot are null in its whole history, which starts 1,200 ledgers before the day; half of the pools swap that day
+    const BIG = 99_000_000;
+    const FIRST = BIG - 1200;
+    const WINDOW = 1000;
+    const crowd = Array.from({ length: AMM_DAILY_CHUNK }, (_, i) =>
+      pool(`rNullForever${String(i).padStart(4, '0')}`, USD, XRP),
+    );
+    let ch: ClickHouseService;
+    /** The text of every query of the recompute, in order. */
+    let sqls: string[];
+
+    beforeAll(async () => {
+      CLOSES.set(FIRST, D0 + 20 * HOUR);
+      CLOSES.set(BIG, D1 + HOUR);
+      CLOSES.set(BIG + 1, D2 + 2 * HOUR);
+      ch = await fresh();
+      await insertStates(
+        ch,
+        crowd.flatMap((p, i) => [
+          state(p, FIRST, i, { reserve_base: '1', reserve_counter: '2' }),
+          state(p, BIG, i, { reserve_base: '10', reserve_counter: '20' }),
+        ]),
+      );
+      await ch.insert(
+        Table.Exchanges,
+        crowd
+          .filter((_, i) => i % 2 === 0)
+          .map((p, i) => swap(p, BIG, i * 2, { taker: TAKER_1, in: 'base', base: '100', counter: '1' })),
+      );
+      await commit(ch, [FIRST, BIG, BIG + 1]);
+      const query = jest.spyOn(ch, 'query');
+      expect(await computeAmmDaily(ch, rates(ch), at(D1), { fillWindow: WINDOW })).toBe(AMM_DAILY_CHUNK);
+      sqls = query.mock.calls.map(([sql]) => String(sql));
+      query.mockRestore();
+    });
+
+    afterAll(() => {
+      for (const ledger of [FIRST, BIG, BIG + 1]) CLOSES.delete(ledger);
+    });
+
+    it('reads the window, the first ledgers and one step: one walk for the closing state and the carry-in, not two to 0', () => {
+      // the window and one step: the first ledgers are 200 ledgers before the window, less than half of the first span
+      expect(sqls.filter((sql) => sql === AMM_DAILY_STATES_SQL)).toHaveLength(2);
+      expect(
+        sqls.filter((sql) => sql.includes('min(ledger_index) AS first_ledger') && !sql.includes('amm_pool_touches')),
+      ).toHaveLength(1);
+      // in all a constant handful: the head and its close, the first and last ledgers of the day (two), the touches, the window
+      // and the liquidity, the swaps, the first ledgers, the step, the fee events and the bids (three), the version of the set;
+      // the two walks of before (Ruling R-A23) made 33 reads of the states here, a window and two walks of 16 steps to ledger 0
+      expect(sqls).toHaveLength(14);
+    });
+
+    it('and the day is the one of the whole history', async () => {
+      const windowed = (await dayOf(ch, D1_KEY)).pools;
+      await computeAmmDaily(ch, rates(ch), at(D1), { fillWindow: Number.MAX_SAFE_INTEGER });
+      const whole = (await dayOf(ch, D1_KEY)).pools;
+      expect(windowed.size).toBe(AMM_DAILY_CHUNK);
+      for (const [account, row] of windowed)
+        expect([account, withoutVersion(row)]).toEqual([account, withoutVersion(whole.get(account) as StoredDaily)]);
+      expect(windowed.get(crowd[0].account)).toMatchObject({
+        swap_count: 1,
+        reserve_base: '10',
+        lp_supply: null,
+        trading_fee: null,
       });
     });
   });

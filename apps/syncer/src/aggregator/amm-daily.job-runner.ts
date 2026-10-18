@@ -99,7 +99,7 @@ export class AmmDailyJobRunner {
     for (const { dayStart, key } of staleFirst(sets, versions, failedLast)) {
       if (!this.ctx.mayStartSet(tick, 'amm_daily')) break;
       try {
-        await this.fns.compute(this.ctx.ch, this.amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
+        await this.compute('amm_daily', dayStart, tick);
         failedLast.delete(key);
         this.backoff.delete(key);
       } catch (err) {
@@ -111,6 +111,26 @@ export class AmmDailyJobRunner {
     // newest wanted closed day
     const retried = await this.retries(tick, new Set(sets.map((set) => set.key)));
     await this.backfill(tick, retried === 0);
+  }
+
+  /**
+   * Recomputes the set of the day that starts at `dayStart`, and warns when it took longer than the budget of `amm_daily`
+   * (Ruling R-A25), whether it worked or not: the budget is checked between days, a day is never cut, so a day that takes
+   * longer than the budget makes the tick run that much longer (and at worst past its interval, which skips the next tick).
+   */
+  private async compute(job: 'amm_daily' | 'amm_daily_dirty', dayStart: number, tick: AggregatorTick): Promise<void> {
+    const began = this.ctx.clock();
+    try {
+      await this.fns.compute(this.ctx.ch, this.amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
+    } finally {
+      const took = this.ctx.clock() - began;
+      const budget = this.ctx.budgets.amm_daily;
+      if (took > budget && !this.ctx.closing()) {
+        this.ctx.logger.warn(
+          `Aggregator job ${job}: the set of ${dayKey(dayStart)} took ${took} ms, more than the budget of amm_daily (${budget} ms): a day is never cut, so the tick ran that much longer`,
+        );
+      }
+    }
   }
 
   /** Whether the set of a day is final, made by the current computation. A read that fails is logged and counted: no. */
@@ -140,7 +160,7 @@ export class AmmDailyJobRunner {
       if (started > 0 && !this.ctx.mayStartSet(tick, 'amm_daily')) return started;
       started++;
       try {
-        await this.fns.compute(this.ctx.ch, this.amm.rates, new Date(`${key}T00:00:00Z`), { signal: tick.signal });
+        await this.compute('amm_daily', Date.parse(`${key}T00:00:00Z`) / 1000, tick);
         this.backoff.delete(key);
       } catch (err) {
         this.ctx.failed('amm_daily', err, ` in ${key}`);
@@ -213,7 +233,7 @@ export class AmmDailyJobRunner {
       if ((started > 0 || !floor) && !this.ctx.mayStartSet(tick, 'amm_daily')) return;
       started++;
       try {
-        await this.fns.compute(this.ctx.ch, this.amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
+        await this.compute('amm_daily', dayStart, tick);
         this.backoff.delete(key);
       } catch (err) {
         this.ctx.failed('amm_daily', err, ` in ${key}`);
@@ -255,7 +275,7 @@ export class AmmDailyJobRunner {
       if (this.ctx.closing()) return;
       const startedAt = this.ctx.clock();
       try {
-        await this.fns.compute(this.ctx.ch, this.amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
+        await this.compute('amm_daily_dirty', dayStart, tick);
         this.backoff.delete(key);
         done.set(key, startedAt);
       } catch (err) {

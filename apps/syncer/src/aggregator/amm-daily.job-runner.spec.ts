@@ -1286,4 +1286,45 @@ describe('AggregatorService amm_daily job', () => {
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('read-only'));
     });
   });
+
+  describe('a day whose set takes longer than the budget of the job is warned about (Ruling R-A25)', () => {
+    const overran = (): string[] =>
+      logger.warn.mock.calls.map(([text]) => String(text)).filter((text) => text.includes('more than the budget'));
+
+    it('today: the set of one day is never cut, so the run went on that much longer than its budget', async () => {
+      currentMs = AGGREGATOR_AMM_DAILY_BUDGET_MS + 500;
+      await service().tick();
+      expect(overran()).toEqual([
+        `Aggregator job amm_daily: the set of 2026-10-16 took ${AGGREGATOR_AMM_DAILY_BUDGET_MS + 500} ms, more than the budget of amm_daily (${AGGREGATOR_AMM_DAILY_BUDGET_MS} ms): a day is never cut, so the tick ran that much longer`,
+      ]);
+    });
+
+    it('not a day that takes the budget and no more', async () => {
+      currentMs = AGGREGATOR_AMM_DAILY_BUDGET_MS;
+      closedMs = AGGREGATOR_AMM_DAILY_BUDGET_MS;
+      await service().tick();
+      expect(computed().length).toBeGreaterThan(0);
+      expect(overran()).toEqual([]);
+    });
+
+    it('a closed day of the back-fill, and a day of an agg_dirty slice (under its own job name), alike', async () => {
+      closedMs = AGGREGATOR_AMM_DAILY_BUDGET_MS + 1;
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      await service().tick();
+      expect(overran()).toEqual([
+        expect.stringMatching(
+          /^Aggregator job amm_daily_dirty: the set of 2026-05-01 took 4001 ms, more than the budget/,
+        ),
+        expect.stringMatching(/^Aggregator job amm_daily: the set of 2026-10-14 took 4001 ms, more than the budget/),
+      ]);
+    });
+
+    it('also when the day fails after that long', async () => {
+      currentMs = AGGREGATOR_AMM_DAILY_BUDGET_MS + 1;
+      failing.add('2026-10-16');
+      await service().tick();
+      expect(overran()).toEqual([expect.stringContaining('the set of 2026-10-16 took 4001 ms')]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'amm_daily' });
+    });
+  });
 });

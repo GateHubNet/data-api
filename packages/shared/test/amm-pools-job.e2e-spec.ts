@@ -118,6 +118,14 @@ async function latest(ch: ClickHouseService): Promise<StoredPool[]> {
 
 const byAccount = (rows: StoredPool[]): Map<string, StoredPool> => new Map(rows.map((r) => [r.amm_account, r]));
 
+/** The grouped looks for the first state ledger of the pools a window left incomplete (Ruling R-A25), with their parameters. */
+const firstLooks = (query: jest.SpyInstance): Array<{ accounts: string[]; before: number }> =>
+  query.mock.calls
+    .filter(
+      ([sql]) => /FROM amm_pool_states/.test(String(sql)) && String(sql).includes('min(ledger_index) AS first_ledger'),
+    )
+    .map(([, params]) => params as { accounts: string[]; before: number });
+
 /** A state row made by hand: only what is given is set, the rest is null (not in the metadata of the transaction). */
 function state(
   over: Partial<AmmPoolStatesRow> & Pick<AmmPoolStatesRow, 'amm_account' | 'ledger_index'>,
@@ -1535,12 +1543,12 @@ describe('the amm_pools job (e2e)', () => {
       const reads = query.mock.calls
         .filter(([sql]) => String(sql).includes('argMaxIf(reserve_base'))
         .map(([, params]) => params as { accounts: string[]; fill_from: number; fill_up_to: number });
-      // the window first, all three; then, in older steps (Ruling R-A23: 3000-3999, and all the rest), only the two the
-      // window does not give completely
+      // the window first, all three; then, in older steps (Rulings R-A23 and R-A25: 3000-3999, and all the rest down to their
+      // first state ledger, 50, not to ledger 0), only the two the window does not give completely
       expect(reads.map((r) => [r.accounts, r.fill_from, r.fill_up_to])).toEqual([
         [[busy, partial, quiet].sort(), HEAD - WINDOW, HEAD],
         [[partial, quiet].sort(), 3000, 3999],
-        [[partial, quiet].sort(), 0, 2999],
+        [[partial, quiet].sort(), 50, 2999],
       ]);
 
       const rows = byAccount(await latest(ch));
@@ -1709,7 +1717,11 @@ describe('the amm_pools job (e2e)', () => {
     describe('a value beyond the window is looked for in doubling steps, each reading only older ledgers (Ruling R-A23)', () => {
       const TOP = 100_000;
       const SHORT = 100;
-      /** From the window back: the ranges of the steps (the window itself is [TOP - 100, TOP]). */
+      /**
+       * From the window back: the ranges of the steps (the window itself is [TOP - 100, TOP]), each twice as long as the one
+       * before, as long as the first ledger of the pool is more than twice the span away; the step that would reach back half
+       * of the way to it goes all the way to it (Ruling R-A25), and its start is the first ledger.
+       */
       const STEPS: Array<[number, number]> = [
         [99_800, 99_899],
         [99_600, 99_799],
@@ -1719,7 +1731,11 @@ describe('the amm_pools job (e2e)', () => {
         [93_600, 96_799],
         [87_200, 93_599],
         [74_400, 87_199],
-        [0, 74_399],
+      ];
+      /** The steps of a pool whose first state ledger is `first`: the doubling ones, then the last one down to `first`. */
+      const stepsTo = (first: number, steps: number): Array<[number, number]> => [
+        ...STEPS.slice(0, steps - 1),
+        [first, (steps === 1 ? TOP - SHORT : STEPS[steps - 2][0]) - 1],
       ];
       const stateReads = (query: jest.SpyInstance): Array<{ accounts: string[]; range: [number, number] }> =>
         query.mock.calls
@@ -1745,15 +1761,19 @@ describe('the amm_pools job (e2e)', () => {
       it.each([
         [50, 0],
         [150, 1],
-        [600, 3],
-        [5000, 6],
+        [600, 2],
+        [5000, 5],
         [90_000, 9],
       ])('a value %i ledgers back is found after %i steps, the row is the whole-history row', async (back, steps) => {
         const { ch, pool } = await poolWith(back);
         const query = jest.spyOn(ch, 'query');
         await recomputeAmmPools(ch, noRates(), [pool], { fillWindow: SHORT });
-        // the window, then the steps up to the one that holds the row, each older than the last and the ledgers read once
-        expect(stateReads(query).map((r) => r.range)).toEqual([[TOP - SHORT, TOP], ...STEPS.slice(0, steps)]);
+        // the window, then the steps up to the one that holds the row, each older than the last and the ledgers read once; the
+        // row is the first state ledger of the pool, so the last step goes down to it and no further
+        expect(stateReads(query).map((r) => r.range)).toEqual([
+          [TOP - SHORT, TOP],
+          ...(steps === 0 ? [] : stepsTo(TOP - back, steps)),
+        ]);
         const windowed = (await latest(ch))[0];
         expect(windowed).toMatchObject({
           reserve_base: '10',
@@ -1766,13 +1786,30 @@ describe('the amm_pools job (e2e)', () => {
         expect(without((await latest(ch))[0])).toEqual(without(windowed));
       });
 
-      it('a value that is never set ends with the last step, which reads from the first ledger: ten reads for 100 and 100,000', async () => {
+      it('a value that is never set, of a pool with nothing before the window: the window only, no step (Ruling R-A25)', async () => {
         const { ch, pool } = await poolWith(undefined);
         const query = jest.spyOn(ch, 'query');
         await recomputeAmmPools(ch, noRates(), [pool], { fillWindow: SHORT });
+        expect(stateReads(query).map((r) => r.range)).toEqual([[TOP - SHORT, TOP]]);
+        // the one look for the first state ledger of the pool, before the window: there is none
+        expect(firstLooks(query)).toEqual([{ accounts: [pool], before: TOP - SHORT }]);
+        expect((await latest(ch))[0]).toMatchObject({ reserve_base: '10', lp_supply: null, trading_fee: null });
+      });
+
+      it('a value that is never set ends with the step that reaches the first state ledger of the pool, not ledger 0', async () => {
+        const ch = await fresh();
+        const pool = 'rWalkNever'.padEnd(33, '0');
+        await insertStates(ch, [
+          state({ amm_account: pool, ledger_index: 10_000, reserve_base: '1', reserve_counter: '2' }),
+          state({ amm_account: pool, ledger_index: TOP, reserve_base: '10', reserve_counter: '20' }),
+        ]);
+        const query = jest.spyOn(ch, 'query');
+        await recomputeAmmPools(ch, noRates(), [pool], { fillWindow: SHORT });
         const reads = stateReads(query);
-        expect(reads.map((r) => r.range)).toEqual([[TOP - SHORT, TOP], ...STEPS]);
+        expect(reads.map((r) => r.range)).toEqual([[TOP - SHORT, TOP], ...stepsTo(10_000, 9)]);
         expect(reads.length).toBeLessThanOrEqual(Math.ceil(Math.log2(TOP / SHORT)) + 1);
+        expect((await latest(ch))[0]).toMatchObject({ reserve_base: '10', lp_supply: null, trading_fee: null });
+        await recomputeAmmPools(ch, noRates(), [pool], { fillWindow: FULL });
         expect((await latest(ch))[0]).toMatchObject({ reserve_base: '10', lp_supply: null, trading_fee: null });
       });
 
@@ -1790,14 +1827,13 @@ describe('the amm_pools job (e2e)', () => {
         await recomputeAmmPools(ch, noRates(), [near, far, never], { fillWindow: SHORT });
         const reads = stateReads(query);
         const all = [near, far, never].sort();
-        expect(reads.slice(0, 4).map((r) => [r.accounts, r.range])).toEqual([
+        // never has nothing before the window and is not walked; far is the lowest first ledger, 600 back, so the second step
+        // (span 400, more than half of 600) goes down to it
+        expect(reads.map((r) => [r.accounts, r.range])).toEqual([
           [all, [TOP - SHORT, TOP]],
-          [all, STEPS[0]], // near is found here
-          [[far, never].sort(), STEPS[1]],
-          [[far, never].sort(), STEPS[2]], // far is found here
+          [[far, near].sort(), STEPS[0]], // near is found here
+          [[far], [TOP - 600, STEPS[0][0] - 1]], // far is found here
         ]);
-        expect(reads.slice(4).every((r) => r.accounts.length === 1 && r.accounts[0] === never)).toBe(true);
-        expect(reads).toHaveLength(10);
         const rows = byAccount(await latest(ch));
         expect(rows.get(near)).toMatchObject({ lp_supply: '3' });
         expect(rows.get(far)).toMatchObject({ lp_supply: '3' });
@@ -1821,7 +1857,7 @@ describe('the amm_pools job (e2e)', () => {
       });
     });
 
-    describe('the walk back can be limited to the pools that have older rows (onlyPoolsWithOlderRows)', () => {
+    describe('the walk back is for the pools that have older rows, down to the first state ledger of each (Ruling R-A25)', () => {
       const TOP = 100_000;
       const SHORT = 100;
       const stateReads = (query: jest.SpyInstance): Array<{ accounts: string[]; range: [number, number] }> =>
@@ -1831,13 +1867,8 @@ describe('the amm_pools job (e2e)', () => {
             const p = params as { accounts: string[]; fill_from: number; fill_up_to: number };
             return { accounts: p.accounts, range: [p.fill_from, p.fill_up_to] };
           });
-      /** The looks at the key of a pool for a row before a ledger: not a fill-forward, a read of one row. */
-      const keyLooks = (query: jest.SpyInstance): Array<{ account: string; before: number }> =>
-        query.mock.calls
-          .filter(([sql]) => /FROM amm_pool_states/.test(String(sql)) && !String(sql).includes('argMaxIf'))
-          .map(([, params]) => params as { account: string; before: number });
 
-      /** A pool with rows in the window only, and a pool whose AMM-node row is 5,000 ledgers back. */
+      /** A pool with rows in the window only, and a pool whose AMM-node row is 5,000 ledgers back (its first state ledger). */
       async function world(): Promise<{ ch: ClickHouseService; young: string; old: string }> {
         const ch = await fresh();
         const young = 'rYoungWalk'.padEnd(33, '0');
@@ -1853,38 +1884,35 @@ describe('the amm_pools job (e2e)', () => {
         return { ch, young, old };
       }
 
-      it('a pool with nothing before the window is read once; the walk back is for the pools that have something', async () => {
+      /** What a fill-forward from the whole history gives, for the comparison. */
+      const wholeOf = (ch: ClickHouseService, accounts: string[]) => fillForward(ch, accounts, TOP, 0, POOL_QUERY);
+      const sameAs = (rows: unknown[]) => rows.map((w) => ({ ...(w as object), now_ms: expect.anything() }));
+
+      it('a pool with nothing before the window is read once and looked at once; it is not walked back', async () => {
         const { ch, young } = await world();
         const query = jest.spyOn(ch, 'query');
-        const limited = await fillForward(ch, [young], TOP, TOP - SHORT, POOL_QUERY, { onlyPoolsWithOlderRows: true });
+        const rows = await fillForward(ch, [young], TOP, TOP - SHORT, POOL_QUERY);
         expect(stateReads(query).map((r) => r.range)).toEqual([[TOP - SHORT, TOP]]);
-        expect(keyLooks(query)).toEqual([{ account: young, before: TOP - SHORT }]);
-        // without it the pool is walked back, step after step, to the first ledger: nothing is there to be found
-        query.mockClear();
-        const walked = await fillForward(ch, [young], TOP, TOP - SHORT, POOL_QUERY);
-        expect(stateReads(query).length).toBe(10);
-        expect(keyLooks(query)).toEqual([]);
-        // and the answer is the same
-        expect(limited).toEqual(walked.map((w) => ({ ...w, now_ms: expect.anything() })));
-        expect(limited[0]).toMatchObject({ filled_reserve_base: '10', filled_lp_supply: null, newest_ledger: TOP });
+        expect(firstLooks(query)).toEqual([{ accounts: [young], before: TOP - SHORT }]);
+        expect(rows).toEqual(sameAs(await wholeOf(ch, [young])));
+        expect(rows[0]).toMatchObject({ filled_reserve_base: '10', filled_lp_supply: null, newest_ledger: TOP });
       });
 
-      it('a pool with an older row is walked back as far as it needs, as without the option, and has the same row', async () => {
+      it('a pool with an older row is walked back as far as it needs, down to its first ledger, and has the same row', async () => {
         const { ch, old } = await world();
         const query = jest.spyOn(ch, 'query');
-        const limited = await fillForward(ch, [old], TOP, TOP - SHORT, POOL_QUERY, { onlyPoolsWithOlderRows: true });
-        const limitedReads = stateReads(query).map((r) => r.range);
-        query.mockClear();
-        const walked = await fillForward(ch, [old], TOP, TOP - SHORT, POOL_QUERY);
-        // the same window and the same steps up to the one that holds the row (5,000 back: the sixth step)
-        expect(limitedReads).toEqual(
-          stateReads(query)
-            .slice(0, limitedReads.length)
-            .map((r) => r.range),
-        );
-        expect(limitedReads).toHaveLength(7);
-        expect(limited).toEqual(walked.map((w) => ({ ...w, now_ms: expect.anything() })));
-        expect(limited[0]).toMatchObject({ filled_lp_supply: '3', filled_trading_fee: 111, filled_reserve_base: '10' });
+        const rows = await fillForward(ch, [old], TOP, TOP - SHORT, POOL_QUERY);
+        // the window, four doubling steps, and the fifth (span 3,200, more than half of the 5,000 back) down to ledger 95,000
+        expect(stateReads(query).map((r) => r.range)).toEqual([
+          [TOP - SHORT, TOP],
+          [99_800, 99_899],
+          [99_600, 99_799],
+          [99_200, 99_599],
+          [98_400, 99_199],
+          [TOP - 5000, 98_399],
+        ]);
+        expect(rows).toEqual(sameAs(await wholeOf(ch, [old])));
+        expect(rows[0]).toMatchObject({ filled_lp_supply: '3', filled_trading_fee: 111, filled_reserve_base: '10' });
       });
 
       it('with several pools, only those with older rows are walked, and a pool that is complete is not looked at', async () => {
@@ -1895,27 +1923,76 @@ describe('the amm_pools job (e2e)', () => {
         ]);
         const query = jest.spyOn(ch, 'query');
         const accounts = [complete, old, young].sort();
-        const rows = await fillForward(ch, accounts, TOP, TOP - SHORT, POOL_QUERY, { onlyPoolsWithOlderRows: true });
+        const rows = await fillForward(ch, accounts, TOP, TOP - SHORT, POOL_QUERY);
         expect(rows.map((r) => r.amm_account)).toEqual(accounts);
         const walks = stateReads(query).slice(1);
         expect(walks.length).toBeGreaterThan(0);
         for (const walk of walks) expect(walk.accounts).toEqual([old]);
-        // the key of each pool that the window left incomplete is looked at; the complete one is not
-        const looks = keyLooks(query);
-        expect(looks.map((l) => l.account).sort()).toEqual([old, young].sort());
-        for (const look of looks) expect(look.before).toBe(TOP - SHORT);
+        // one look, for the pools that the window left incomplete; the complete one is not in it
+        expect(firstLooks(query)).toEqual([{ accounts: [old, young].sort(), before: TOP - SHORT }]);
+        expect(rows).toEqual(sameAs(await wholeOf(ch, accounts)));
         const byAccount = new Map(rows.map((r) => [r.amm_account, r]));
         expect(byAccount.get(old)).toMatchObject({ filled_lp_supply: '3' });
         expect(byAccount.get(young)).toMatchObject({ filled_lp_supply: null, filled_reserve_base: '10' });
         expect(byAccount.get(complete)).toMatchObject({ filled_lp_supply: '30' });
       });
 
-      it('is off unless asked for: the aggregators walk back as before', async () => {
+      it('the aggregators do the same: a pool with nothing before the window is one read and one look', async () => {
         const { ch, young } = await world();
         const query = jest.spyOn(ch, 'query');
         await recomputeAmmPools(ch, noRates(), [young], { fillWindow: SHORT });
-        expect(keyLooks(query)).toEqual([]);
-        expect(stateReads(query)).toHaveLength(10);
+        expect(firstLooks(query)).toHaveLength(1);
+        expect(stateReads(query)).toHaveLength(1);
+      });
+    });
+
+    describe('a chunk of 200 pools with a value null for ever and a first state ledger near the head (Ruling R-A25)', () => {
+      // a database ingested from a recent ledger: every pool is first seen without its AMM node, so the LP supply, the fee and
+      // the slot are null in its whole history, which is a few windows long
+      const HEAD = 100_000_000;
+      const WINDOW = 1000;
+      const POOLS = Array.from({ length: AMM_POOLS_CHUNK }, (_, i) =>
+        `rNullForever${String(i).padStart(4, '0')}`.padEnd(33, '0'),
+      );
+
+      async function world(): Promise<ClickHouseService> {
+        const ch = await fresh();
+        await insertStates(
+          ch,
+          POOLS.flatMap((amm_account, i) => [
+            // the first state ledger: before the window, at most 1,500 back
+            state({
+              amm_account,
+              ledger_index: HEAD - WINDOW - 1 - (i % 500),
+              reserve_base: '1',
+              reserve_counter: '2',
+            }),
+            state({ amm_account, ledger_index: HEAD, reserve_base: '10', reserve_counter: '20' }),
+          ]),
+        );
+        return ch;
+      }
+
+      it('a recompute is a constant handful of reads: the window, the first ledgers and one step, not a step per doubling to 0', async () => {
+        const ch = await world();
+        const query = jest.spyOn(ch, 'query');
+        expect(await recomputeAmmPools(ch, noRates(), POOLS, { fillWindow: WINDOW })).toBe(AMM_POOLS_CHUNK);
+        const fills = query.mock.calls.filter(([sql]) => String(sql).includes('argMaxIf(reserve_base'));
+        // the window and one step: the first ledgers are at most 1,500 back, less than the first span (2,000)
+        expect(fills).toHaveLength(2);
+        expect(firstLooks(query)).toHaveLength(1);
+        // and in all: the head, the window, the creations, the versions, the first ledgers, one step
+        expect(query).toHaveBeenCalledTimes(6);
+        const rows = await latest(ch);
+        expect(rows).toHaveLength(AMM_POOLS_CHUNK);
+        for (const row of rows) expect(row).toMatchObject({ reserve_base: '10', lp_supply: null, trading_fee: null });
+      });
+
+      it('and the rows are those of the whole history', async () => {
+        const ch = await world();
+        const windowed = await fillForward(ch, POOLS, HEAD, HEAD - WINDOW, POOL_QUERY);
+        const whole = await fillForward(ch, POOLS, HEAD, 0, POOL_QUERY);
+        expect(windowed).toEqual(whole.map((w) => ({ ...w, now_ms: expect.anything() })));
       });
     });
 
@@ -1962,7 +2039,7 @@ describe('the amm_pools job (e2e)', () => {
         await ch.insert(Table.Ledgers, [ledgerRow(TOP_LEDGER, T0)]);
       });
 
-      async function readRows(run: () => Promise<unknown>): Promise<number[]> {
+      async function readRows(run: () => Promise<unknown>, marker = 'argMaxIf(reserve_base'): Promise<number[]> {
         const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
         await run();
         await ch.command('SYSTEM FLUSH LOGS');
@@ -1970,9 +2047,9 @@ describe('the amm_pools job (e2e)', () => {
           `SELECT read_rows FROM system.query_log
             WHERE current_database = {db:String} AND type = 'QueryFinish' AND query_kind = 'Select'
               AND query_start_time_microseconds >= {t:DateTime64(6)} AND has(tables, {table:String})
-              AND position(query, 'argMaxIf(reserve_base') > 0
+              AND position(query, {marker:String}) > 0
             ORDER BY query_start_time_microseconds`,
-          { db, t, table: `${db}.${Table.AmmPoolStates}` },
+          { db, t, table: `${db}.${Table.AmmPoolStates}`, marker },
         );
         return rows.map((r) => Number(r.read_rows));
       }
@@ -1988,6 +2065,16 @@ describe('the amm_pools job (e2e)', () => {
         const whole = await readRows(() => recomputeAmmPools(ch, noRates(), [BUSY], { fillWindow: FULL }));
         expect(whole[0]).toBeGreaterThanOrEqual(ROWS);
         expect(whole[0] + AMM_FILL_WINDOW_LEDGERS).toBeGreaterThan(2 * total);
+      });
+
+      it('the look for its first state ledger (Ruling R-A25) is one read of its rows before the window, the ledger column only', async () => {
+        const looks = await readRows(
+          () => recomputeAmmPools(ch, noRates(), [BUSY]),
+          'min(ledger_index) AS first_ledger',
+        );
+        expect(looks).toHaveLength(1);
+        // the cost of the grouped read: the older rows of the pools the window left incomplete (here 1,040,000), not the table
+        expect(looks[0]).toBeLessThanOrEqual(ROWS - AMM_FILL_WINDOW_LEDGERS + 4 * GRANULE);
       });
 
       it('and the row is the whole-history row', async () => {

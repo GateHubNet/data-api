@@ -190,8 +190,8 @@ export class AccountAmmService {
   /**
    * The state, as of `ledger`, of each of the pools that has a state row up to it: the shared fill-forward (`fillForward`: a
    * window of ledgers before `ledger`, then further back in doubling steps, each read for all the pools of a batch that are
-   * still incomplete), in batches of `AMM_POOLS_CHUNK`. An account that is no pool has no row; the walk for it goes back to
-   * the first ledger in about log2 reads of nothing.
+   * still incomplete and have older rows, down to the first state ledger of each at most: Ruling R-A25), in batches of
+   * `AMM_POOLS_CHUNK`. An account that is no pool has no row, and no walk: the look for the first ledgers finds none.
    */
   private async poolsAt(accounts: string[], ledger: number): Promise<Map<string, PositionState>> {
     const from = Math.max(0, ledger - AMM_HISTORY_CARRY_LEDGERS + 1);

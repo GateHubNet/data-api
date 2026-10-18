@@ -241,9 +241,12 @@ operator needs:
   on at the next tick or run (said once until a run finishes in time).
 - **What a recompute costs.** A pool's state is the newest non-null value of each column over its state rows (a swap carries no fee, LP
   supply or slot). The aggregators read a window of `AMM_FILL_WINDOW_LEDGERS` (160,000 ledgers, about a week) of each pool first, and walk
-  further back in doubling steps only for the pools whose window leaves a column null, so a pool pays for the distance back to its
-  oldest needed value (the whole history only for a column that is null for ever). A back-fill of many days costs that for each day, so
-  the first sweep of a deployment with years of AMM history takes many ticks: watch `AMM daily back-fill: N days to compute` in the log.
+  further back in doubling steps only for the pools whose window leaves a column null and that have older rows, each down to its own
+  first state ledger at most, so a pool pays for the distance back to its oldest needed value (its own history for a column that is null
+  for ever, and nothing below it). A back-fill of many days costs that for each day, so the first sweep of a deployment with years of AMM
+  history takes many ticks: watch `AMM daily back-fill: N days to compute` in the log. A day is never cut by the budget: a day whose set
+  takes longer than it logs `Aggregator job amm_daily: the set of <day> took <n> ms, more than the budget of amm_daily`, and the tick
+  runs that much longer (past the 60 s interval the next tick is skipped).
 - **The dirty-slice hooks.** `stats_dirty` (after a `range-ingest`) recomputes, for each slice of an `agg_dirty` range, the stats, the
   daily volume sets of its days, the `amm_pools` rows of the pools with a touch in its ledgers (error label `amm_pools_dirty`) and the
   `amm_daily` sets of its days (`amm_daily_dirty`). A slice is started whole, so a slice with thousands of pools runs past the
