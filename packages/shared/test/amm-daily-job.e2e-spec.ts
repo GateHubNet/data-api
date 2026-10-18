@@ -685,8 +685,9 @@ describe('the amm_daily job (e2e)', () => {
 
         let volume_base = new BigNumber(0);
         let volume_counter = new BigNumber(0);
-        let fees_base = new BigNumber(0);
-        let fees_counter = new BigNumber(0);
+        // a side whose swaps include one with no known fee has an unknown fee estimate (null: Ruling R-A26)
+        let fees_base: BigNumber | null = new BigNumber(0);
+        let fees_counter: BigNumber | null = new BigNumber(0);
         let swap_count = 0;
         for (const s of allSwaps.filter((x) => x.amm_account === account && inDay(x.ledger_index))) {
           swap_count++;
@@ -707,9 +708,9 @@ describe('the amm_daily job (e2e)', () => {
             (s.taker === holder || (lastBid?.slot_holder === holder && lastBid.auth_accounts.includes(s.taker)));
           const live = expires === null || s.close_time - RIPPLE_EPOCH_S < expires;
           if (member && live && discounted !== null) fee = discounted;
-          const charged = fee === null ? new BigNumber(0) : input.times(fee).dividedBy(100000);
-          if (s.buyer === account) fees_base = fees_base.plus(charged);
-          else fees_counter = fees_counter.plus(charged);
+          const charged = fee === null ? null : input.times(fee).dividedBy(100000);
+          if (s.buyer === account) fees_base = fees_base === null || charged === null ? null : fees_base.plus(charged);
+          else fees_counter = fees_counter === null || charged === null ? null : fees_counter.plus(charged);
         }
 
         let deposit_count = 0;
@@ -757,8 +758,8 @@ describe('the amm_daily job (e2e)', () => {
           swap_count,
           volume_base: volume_base.toString(),
           volume_counter: volume_counter.toString(),
-          fees_base_est: fees_base.toString(),
-          fees_counter_est: fees_counter.toString(),
+          fees_base_est: fees_base === null ? null : fees_base.toString(),
+          fees_counter_est: fees_counter === null ? null : fees_counter.toString(),
           deposit_count,
           withdraw_count,
           liquidity_in_base: flow.in_base.toString(),
@@ -815,14 +816,16 @@ describe('the amm_daily job (e2e)', () => {
 
     it('the XRP/RLUSD pool on 2026-10-16: the amounts that went in, and the fee only from the row that shows it', async () => {
       // three swaps: 134 XRP in (the first, before any row shows the pool fee: no fee estimate), 0.766153 XRP in at a fee of 205,
-      // and 543.870850376 RLUSD in at a fee of 205; two deposits (1010 XRP; 108.041216585 RLUSD and 82.769304 XRP)
+      // and 543.870850376 RLUSD in at a fee of 205; two deposits (1010 XRP; 108.041216585 RLUSD and 82.769304 XRP). The XRP
+      // side had a swap with no known fee, so its estimate is unknown (Ruling R-A26: null, not the 0.00157061365 of the other
+      // swap, which would understate it)
       const row = (await dayOf(ch, '2026-10-16')).pools.get('rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3') as StoredDaily;
       expect(row).toMatchObject({
         swap_count: 3,
         volume_base: '543.870850376',
         volume_counter: '134.766153',
         fees_base_est: '1.1149352432708', // 543.870850376 x 205 / 100000
-        fees_counter_est: '0.00157061365', // 0.766153 x 205 / 100000
+        fees_counter_est: null,
         deposit_count: 2,
         withdraw_count: 0,
         liquidity_in_base: '108.041216585',
@@ -1396,7 +1399,9 @@ describe('the amm_daily job (e2e)', () => {
         buy(X3, 1000, 1, H3), // before the bid of 1000/2: 50
         buy(X3, 1000, 3, N3), // after it: 70
         buy(X3, 1000, 4, H3), // no longer the holder: 300
-        buy(Y, 1000, 1, T), // no fee is known yet: 0
+        // no fee is known yet: counter in, so that the counter estimate is unknown (Ruling R-A26) and the base one is the sum of
+        // the three swaps after it
+        swap(Y, 1000, 1, { taker: T, in: 'counter', base: '1', counter: '100000', node: nodes.get(Y.account) }),
         buy(Y, 1000, 3, T), // the fee of 1000/2: 700
         buy(Y, 1000, 6, T), // the holder of 1000/4 with the discounted fee of 1000/5, no expiration known: 30
         buy(Y, 1001, 1, T), // 05:00, the slot ended at 01:00 (1000/7): 700
@@ -1448,7 +1453,13 @@ describe('the amm_daily job (e2e)', () => {
     });
 
     it('pool Y: rows that carry one value each (a fee, a holder, a discounted fee, an expiration) all count', () => {
-      expect(pools.get(Y.account)).toMatchObject({ swap_count: 4, volume_base: '400000', fees_base_est: '1430' }); // 0 + 700 + 30 + 700
+      expect(pools.get(Y.account)).toMatchObject({
+        swap_count: 4,
+        volume_base: '300000',
+        fees_base_est: '1430', // 700 + 30 + 700
+        volume_counter: '100000',
+        fees_counter_est: null, // the swap before any fee is known
+      });
     });
   });
 
@@ -1782,12 +1793,16 @@ describe('the amm_daily job (e2e)', () => {
       });
     });
 
-    it('a pool created today has the values of the day only', () => {
+    it('a pool first seen today without its AMM node has the values of the day only, and an unknown fee estimate (Ruling R-A26)', () => {
+      // its swap put base in with no fee known: the base estimate is null, not 0; nothing went in on the counter side, whose
+      // estimate is a known 0
       expect(windowed.get(CREATED.account)).toMatchObject({
         swap_count: 1,
+        volume_base: '100000',
         reserve_base: null,
         trading_fee: null,
-        fees_base_est: '0',
+        fees_base_est: null,
+        fees_counter_est: '0',
       });
     });
   });

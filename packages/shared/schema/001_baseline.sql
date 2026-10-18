@@ -620,7 +620,8 @@ ENGINE = ReplacingMergeTree(version)
 ORDER BY amm_account;
 
 -- One row per pool and UTC day with activity, with the closing state of the pool. volume_* are the amounts that went
--- into the pool by side, fees_*_est are estimates, liquidity_in_* and liquidity_out_* the deposited and withdrawn amounts.
+-- into the pool by side, fees_*_est are estimates (NULL when a swap into that side had no known fee), liquidity_in_* and
+-- liquidity_out_* the deposited and withdrawn amounts.
 -- A day is one version set: the pool rows and a sentinel row (amm_account '', empty assets, zero amounts, NULL state) carry
 -- the same version, and a reader takes the version of the day from the sentinel (a primary key prefix read) and keeps the pool
 -- rows with that version, never the sentinel itself. final is 1 on the sentinel of a set that was made once the ingest had
@@ -636,8 +637,8 @@ CREATE TABLE IF NOT EXISTS amm_daily
   swap_count            UInt64,
   volume_base           String,
   volume_counter        String,
-  fees_base_est         String,
-  fees_counter_est      String,
+  fees_base_est         Nullable(String),
+  fees_counter_est      Nullable(String),
   deposit_count         UInt64,
   withdraw_count        UInt64,
   liquidity_in_base     String,

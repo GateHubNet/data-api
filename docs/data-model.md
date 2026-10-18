@@ -221,7 +221,8 @@ amm_account`, and what a pool can lose between versions (`deleted`) is filtered 
 
 #### `amm_daily` (`toYYYYMM(day)`, `ReplacingMergeTree(version)`, `ORDER BY (amm_account, day)`)
 One row per pool and UTC day with activity, with the closing state of the pool: the pair, `swap_count`, `volume_base`, `volume_counter`
-(the amounts that went into the pool, by side), `fees_base_est`, `fees_counter_est` (estimates), `deposit_count`, `withdraw_count`,
+(the amounts that went into the pool, by side), `fees_base_est`, `fees_counter_est` (estimates, `Nullable(String)`: null when a swap into
+that side had no known fee, Ruling R-A26), `deposit_count`, `withdraw_count`,
 `liquidity_in_base`, `liquidity_in_counter`, `liquidity_out_base`, `liquidity_out_counter`, the end-of-day `reserve_base`,
 `reserve_counter`, `lp_supply`, `trading_fee`, `value_native`, then `final`, `config_version` and `version`. Written by the aggregator.
 

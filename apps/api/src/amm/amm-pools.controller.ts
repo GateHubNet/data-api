@@ -135,7 +135,8 @@ export class AmmPoolsController {
       'transaction that touched it. A transaction only tells the values of the pool nodes it changed, so each state has ' +
       'its missing values carried forward from the newest earlier state, also from before `start`. With `interval=day` ' +
       'instead the days of the pool with activity (`swap_count`, `volume_base` and `volume_counter` by side, `fees_*_est`, ' +
-      'estimates, liquidity in and out, and the closing state), a day when its start is within `start` and `end`. ' +
+      'estimates, left out when a swap into the side had no known fee, liquidity in and out, and the closing state), a day ' +
+      'when its start is within `start` and `end`. ' +
       '`format=csv` gives the rows as a CSV file.',
   })
   @ApiParam({ name: 'pool', description: 'The address of the pool account.' })

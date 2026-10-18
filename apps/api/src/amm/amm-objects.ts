@@ -28,10 +28,11 @@ import { fmtTime } from '../common/format';
  *
  * PoolDay (a UTC day with activity and the closing state of the pool; `date` is the start of the day), in this order:
  *   amm_account, date, base_currency, base_issuer?, counter_currency, counter_issuer?, swap_count, volume_base,
- *   volume_counter, fees_base_est, fees_counter_est, deposit_count, withdraw_count, liquidity_in_base, liquidity_in_counter,
+ *   volume_counter, fees_base_est?, fees_counter_est?, deposit_count, withdraw_count, liquidity_in_base, liquidity_in_counter,
  *   liquidity_out_base, liquidity_out_counter, reserve_base?, reserve_counter?, lp_supply?, trading_fee?, value_native?
  *
- * `volume_*` are the amounts that went into the pool by side and `fees_*_est` are estimates (spec section 3).
+ * `volume_*` are the amounts that went into the pool by side and `fees_*_est` are estimates (spec section 3); an estimate is
+ * left out when a swap into its side had no known fee (Ruling R-A26), and an estimate of 0 is a known 0.
  *
  * A CSV has the same columns on every page whatever the objects of the page hold (a CSV takes its columns from the keys of
  * the rows, and a key that is left out would move them): the `*CsvRow` functions give every column, `null` (an empty cell)
@@ -234,8 +235,9 @@ export interface StoredPoolDay {
   swap_count: Count;
   volume_base: string;
   volume_counter: string;
-  fees_base_est: string;
-  fees_counter_est: string;
+  /** Null when a swap into that side had no known fee (Ruling R-A26). */
+  fees_base_est: string | null;
+  fees_counter_est: string | null;
   deposit_count: Count;
   withdraw_count: Count;
   liquidity_in_base: string;
@@ -349,8 +351,8 @@ export interface PoolDayObject {
   swap_count: number;
   volume_base: string;
   volume_counter: string;
-  fees_base_est: string;
-  fees_counter_est: string;
+  fees_base_est?: string;
+  fees_counter_est?: string;
   deposit_count: number;
   withdraw_count: number;
   liquidity_in_base: string;
@@ -522,8 +524,8 @@ export function toPoolDayObject(account: string, row: StoredPoolDay): PoolDayObj
     swap_count: num(row.swap_count),
     volume_base: row.volume_base,
     volume_counter: row.volume_counter,
-    fees_base_est: row.fees_base_est,
-    fees_counter_est: row.fees_counter_est,
+    ...key('fees_base_est', row.fees_base_est),
+    ...key('fees_counter_est', row.fees_counter_est),
     deposit_count: num(row.deposit_count),
     withdraw_count: num(row.withdraw_count),
     liquidity_in_base: row.liquidity_in_base,
@@ -711,8 +713,8 @@ export interface PoolDayCsvRow {
   swap_count: number;
   volume_base: string;
   volume_counter: string;
-  fees_base_est: string;
-  fees_counter_est: string;
+  fees_base_est: string | null;
+  fees_counter_est: string | null;
   deposit_count: number;
   withdraw_count: number;
   liquidity_in_base: string;
@@ -735,8 +737,8 @@ export function toPoolDayCsvRow(day: PoolDayObject): PoolDayCsvRow {
     swap_count: day.swap_count,
     volume_base: day.volume_base,
     volume_counter: day.volume_counter,
-    fees_base_est: day.fees_base_est,
-    fees_counter_est: day.fees_counter_est,
+    fees_base_est: day.fees_base_est ?? null,
+    fees_counter_est: day.fees_counter_est ?? null,
     deposit_count: day.deposit_count,
     withdraw_count: day.withdraw_count,
     liquidity_in_base: day.liquidity_in_base,

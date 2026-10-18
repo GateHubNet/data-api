@@ -164,9 +164,39 @@ describe('swapTotals', () => {
       expect(totals.fees_base_est).toBe('1'); // 400 x 250 / 100000
     });
 
-    it('a swap with no known fee has a volume but no fee (the pool was first seen without its AMM node)', () => {
+    it('a swap with no known fee has a volume and leaves the fee of its side unknown (the pool was first seen without its AMM node)', () => {
+      // Ruling R-A26: null, not 0; the other side has no swap and its fee of 0 is known
       const totals = swapTotals(POOL, [swap({ in: 'base', base_amount: '50' })], NO_FEE, []);
-      expect(totals).toMatchObject({ count: 1, volume_base: '50', fees_base_est: '0', fees_counter_est: '0' });
+      expect(totals).toEqual({
+        count: 1,
+        volume_base: '50',
+        volume_counter: '0',
+        fees_base_est: null,
+        fees_counter_est: '0',
+      });
+    });
+
+    it('one side unknown and the other known: a side is unknown when any swap into it had no known fee', () => {
+      const at = (tx: number): Pick<DaySwap, 'ledger_index' | 'tx_index'> => ({ ledger_index: 100, tx_index: tx });
+      const totals = swapTotals(
+        POOL,
+        [
+          // base in before the fee is first seen, base in after it: the base side is unknown however much is known
+          swap({ in: 'base', base_amount: '1000', ...at(1) }),
+          swap({ in: 'base', base_amount: '1000', ...at(9) }),
+          // counter in after it: known
+          swap({ in: 'counter', counter_amount: '200', ...at(10) }),
+        ],
+        NO_FEE,
+        [{ ledger_index: 100, tx_index: 5, trading_fee: 300 }],
+      );
+      expect(totals).toEqual({
+        count: 3,
+        volume_base: '2000',
+        volume_counter: '200',
+        fees_base_est: null,
+        fees_counter_est: '0.6', // 200 x 300 / 100000
+      });
     });
 
     it('a fee of 0 charges nothing', () => {
@@ -247,13 +277,14 @@ describe('swapTotals', () => {
       const totals = swapTotals(
         POOL,
         [
-          swap({ in: 'base', base_amount: '1000', ...at(100, 1) }),
           swap({ in: 'base', base_amount: '1000', ...at(100, 9) }),
+          swap({ in: 'counter', counter_amount: '1000', ...at(100, 1) }),
         ],
         NO_FEE,
         [{ ledger_index: 100, tx_index: 5, trading_fee: 1000 }],
       );
-      expect(totals).toMatchObject({ volume_base: '2000', fees_base_est: '10' });
+      // the base swap is after the row: 1000 x 1000 / 100000; the counter swap before it has no known fee (Ruling R-A26)
+      expect(totals).toMatchObject({ volume_base: '1000', fees_base_est: '10', fees_counter_est: null });
     });
   });
 

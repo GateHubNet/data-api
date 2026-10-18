@@ -569,6 +569,17 @@ describe('toPoolDayObject', () => {
     expect(quiet).toMatchObject({ swap_count: 0, trading_fee: 0, value_native: '0' });
   });
 
+  it('leaves out a fee estimate that is unknown (Ruling R-A26), and keeps one of 0, in the pinned order', () => {
+    // the base side had a swap with no known fee; the counter side had none, or only swaps with a known fee
+    const day = toPoolDayObject(POOL, { ...DAY, fees_base_est: null, fees_counter_est: '0' });
+    expect(day).not.toHaveProperty('fees_base_est');
+    expect(day).toMatchObject({ fees_counter_est: '0' });
+    expect(Object.keys(day).slice(5, 9)).toEqual(['swap_count', 'volume_base', 'volume_counter', 'fees_counter_est']);
+    const unknown = toPoolDayObject(POOL, { ...DAY, fees_base_est: null, fees_counter_est: null });
+    for (const key of ['fees_base_est', 'fees_counter_est']) expect(unknown).not.toHaveProperty(key);
+    expect(Object.keys(unknown).slice(7, 9)).toEqual(['volume_counter', 'deposit_count']);
+  });
+
   it('serves the value of a day like the value of a pool: a plain decimal, never the exponent form', () => {
     const value = (v: number): string | undefined => toPoolDayObject(POOL, { ...DAY, value_native: v }).value_native;
     expect(value(123_456_789.5)).toBe('123456790');
@@ -594,6 +605,10 @@ describe('toPoolDayObject', () => {
     expect(full).toContain('value_native');
     const row = toPoolDayCsvRow(toPoolDayObject(POOL, { ...DAY, value_native: null }));
     expect(row).toMatchObject({ base_issuer: null, value_native: null });
+    // an unknown fee estimate is an empty cell, in its column
+    const unknown = toPoolDayCsvRow(toPoolDayObject(POOL, { ...DAY, fees_base_est: null, fees_counter_est: null }));
+    expect(Object.keys(unknown)).toEqual(full);
+    expect(unknown).toMatchObject({ fees_base_est: null, fees_counter_est: null });
   });
 });
 

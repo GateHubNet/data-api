@@ -1173,6 +1173,45 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
       expect((await get(`/v2/amm/pools/${swapper}/history?interval=day&limit=1000`)).headers.link).toBeUndefined();
     });
 
+    it('a pool first seen in the middle of its life (no fee known yet): an unknown estimate is left out, an empty cell in CSV (Ruling R-A26)', async () => {
+      // the fixtures start long after the creation of most pools, whose first rows carry no AMM node: the job leaves the
+      // estimate of a side null when a swap into it had no known fee
+      const unknown = await h.ch.query<{
+        amm_account: string;
+        day_text: string;
+        fees_base_est: string | null;
+        fees_counter_est: string | null;
+      }>(
+        `SELECT amm_account, toString(day) AS day_text, fees_base_est, fees_counter_est
+           FROM ${Table.AmmDaily}
+          WHERE amm_account != '' AND swap_count > 0 AND (isNull(fees_base_est) OR isNull(fees_counter_est))
+            AND (day, version) IN (SELECT day, max(version) FROM ${Table.AmmDaily} WHERE amm_account = '' GROUP BY day)
+          ORDER BY amm_account, day
+          LIMIT 1`,
+      );
+      expect(unknown).toHaveLength(1);
+      const [{ amm_account: account, day_text: day, fees_base_est: base, fees_counter_est: counter }] = unknown;
+      const query = `interval=day&limit=1000&start=${day}&end=${day}`;
+      const res = await get(`/v2/amm/pools/${account}/history?${query}`);
+      expect(res.body.count).toBe(1);
+      const [served] = (res.body as DaysBody).days;
+      expect(served).toEqual(dayOf(account, (await storedDays(account)).find((d) => d.day === day) as AmmDailyRow));
+      if (base === null) expect(served).not.toHaveProperty('fees_base_est');
+      else expect(served.fees_base_est).toBe(base);
+      if (counter === null) expect(served).not.toHaveProperty('fees_counter_est');
+      else expect(served.fees_counter_est).toBe(counter);
+      // the key order is still the pinned one, without the keys that are left out
+      const order = keyOrderOf(served, DAY_KEYS);
+      expect(order.keys).toEqual(order.expected);
+      // CSV: the column is there, the cell is empty (every cell is quoted)
+      const csv = await get(`/v2/amm/pools/${account}/history?${query}&format=csv`);
+      const [header, row] = lines(csv.text).map((l) => l.split(','));
+      expect(header).toEqual(DAY_KEYS.map((c) => `"${c}"`));
+      const cell = (column: string): string => row[header.indexOf(`"${column}"`)];
+      expect(cell('fees_base_est')).toBe(base === null ? '""' : `"${base}"`);
+      expect(cell('fees_counter_est')).toBe(counter === null ? '""' : `"${counter}"`);
+    });
+
     it('a pool that has states and no days has none; a pool that is not one is 404', async () => {
       // a pool with a state in a committed ledger (a copy of a row of another pool) and no row in amm_daily
       const quiet = accountAt(0xd000);

@@ -459,8 +459,12 @@ export interface AmmDailyRow {
   /** The amounts that went into the pool, by side. */
   volume_base: string;
   volume_counter: string;
-  fees_base_est: string;
-  fees_counter_est: string;
+  /**
+   * The estimated fees of the swaps by the side that went in; null when a swap into that side had no known fee (the pool was
+   * first seen without its AMM node, so nothing says its fee yet: Ruling R-A26). A known fee of 0 is `'0'`.
+   */
+  fees_base_est: string | null;
+  fees_counter_est: string | null;
   deposit_count: UInt64Value;
   withdraw_count: UInt64Value;
   liquidity_in_base: string;

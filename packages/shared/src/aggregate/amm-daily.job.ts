@@ -51,7 +51,9 @@ import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTL
  *    filled forward over the pool's state rows up to the swap, or the discounted fee of the auction slot when the taker is the
  *    slot holder, or one of the accounts of the holder's last bid, and the slot has not expired (rippled does not discount
  *    once the slot ran out, and the slot stays in the AMM object after that). A swap with no fee known (the pool was first
- *    seen without its AMM node, so nothing says the fee yet) adds its volume and no fee.
+ *    seen without its AMM node, so nothing says the fee yet) adds its volume, and makes the estimate of its side unknown: null,
+ *    not 0, for a sum without it would understate the fees (Ruling R-A26, which amends R-A20). A side without swaps, and a side
+ *    whose swaps all had a known fee (also of 0), has a number.
  *  - **Liquidity.** A create counts as a deposit and a clawback as a withdrawal; a delete counts as neither. The amounts are
  *    the pool's signed changes, the positive part of each side is "in" and the negative part "out".
  *  - **Closing state.** Each field is its newest non-null value over the pool's state rows up to the last ledger of the day,
@@ -157,8 +159,9 @@ export interface SwapTotals {
   count: number;
   volume_base: string;
   volume_counter: string;
-  fees_base_est: string;
-  fees_counter_est: string;
+  /** Null when a swap into that side had no known fee (Ruling R-A26). */
+  fees_base_est: string | null;
+  fees_counter_est: string | null;
 }
 
 interface Keyed {
@@ -194,7 +197,8 @@ function feeOf(state: FeeState, swap: DaySwap): number | null {
 /**
  * The volume and the estimated fees of the swaps of a pool in a day. `carry` is the fee state at the start of the day, and
  * `events` the changes of it during the day; each swap is charged at the state of the rows up to and including its own (a
- * transaction has one row per pool). The inputs may come in any order.
+ * transaction has one row per pool). The estimate of a side is null when any swap into that side had no known fee (Ruling
+ * R-A26). The inputs may come in any order.
  */
 export function swapTotals(
   pool: string,
@@ -207,22 +211,24 @@ export function swapTotals(
   let state = carry;
   let next = 0;
   const volume = { base: ZERO, counter: ZERO };
-  const fees = { base: ZERO, counter: ZERO };
+  // null once a swap into the side had no known fee: the sum would be a part of the fees, read as all of them
+  const fees: { base: BigNumber | null; counter: BigNumber | null } = { base: ZERO, counter: ZERO };
   for (const swap of ordered) {
     while (next < changes.length && byKey(changes[next], swap) <= 0) state = applied(state, changes[next++]);
     const side = swap.buyer === pool ? 'base' : 'counter';
     const input = new BigNumber(side === 'base' ? swap.base_amount : swap.counter_amount);
     volume[side] = volume[side].plus(input);
     const fee = feeOf(state, swap);
+    const sum = fees[side];
     // the shift is exact: a division would round at 20 decimal places
-    if (fee !== null) fees[side] = fees[side].plus(input.times(fee).shiftedBy(-FEE_SCALE));
+    fees[side] = fee === null || sum === null ? null : sum.plus(input.times(fee).shiftedBy(-FEE_SCALE));
   }
   return {
     count: ordered.length,
     volume_base: volume.base.toString(),
     volume_counter: volume.counter.toString(),
-    fees_base_est: fees.base.toString(),
-    fees_counter_est: fees.counter.toString(),
+    fees_base_est: fees.base === null ? null : fees.base.toString(),
+    fees_counter_est: fees.counter === null ? null : fees.counter.toString(),
   };
 }
 

@@ -1176,11 +1176,14 @@ closing state of the pool.
 ```
 
 **PoolDay**, in this order: `amm_account, date, base_currency, base_issuer?, counter_currency, counter_issuer?, swap_count, volume_base,
-volume_counter, fees_base_est, fees_counter_est, deposit_count, withdraw_count, liquidity_in_base, liquidity_in_counter,
+volume_counter, fees_base_est?, fees_counter_est?, deposit_count, withdraw_count, liquidity_in_base, liquidity_in_counter,
 liquidity_out_base, liquidity_out_counter, reserve_base?, reserve_counter?, lp_supply?, trading_fee?, value_native?`. `date` is the start of
 the UTC day. `volume_base` and `volume_counter` are the amounts that **went into the pool**, by side, over the day's swaps; `fees_*_est` are
 **estimates**: each swap's input times the pool's trading fee at that point (or the auction slot's discounted fee when the taker is the
-slot holder or one of its authorized accounts and the slot has not expired), over 100000. `liquidity_in_*` and `liquidity_out_*` are the
+slot holder or one of its authorized accounts and the slot has not expired), over 100000. An estimate is **left out when a swap into its
+side had no known fee** (a pool first seen in the middle of its life, before a transaction showed its fee: the sum of the other swaps
+would understate it), and is `"0"` when every swap into its side had a known fee of 0 or there was none; the CSV cell is then empty.
+`liquidity_in_*` and `liquidity_out_*` are the
 amounts deposited and withdrawn (a creation counts as a deposit, a clawback as a withdrawal). The reserves, `lp_supply`, `trading_fee`
 and `value_native` are those at the end of the day (a pool deleted during the day has none, and no value). The marker is the start of
 the last day, in unix seconds.
