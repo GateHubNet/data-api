@@ -1281,6 +1281,20 @@ describe('the event routes over events made by hand', () => {
       expect(decodeMarker(first.marker!)).toEqual([100_550_003, 0]);
     });
 
+    it('sets the Link header on a page with a next one, for JSON and CSV, and none on the last page', async () => {
+      const page = await get(`/v2/amm/pools/${POOL}/governance?limit=1&type=bid`);
+      const origin = new URL(page.request.url).origin;
+      expect(page.headers.link).toBe(
+        `<${origin}/v2/amm/pools/${POOL}/governance?limit=1&type=bid&marker=${page.body.marker}>; rel="next"`,
+      );
+      const csv = await get(`/v2/amm/pools/${POOL}/governance?limit=1&type=bid&format=csv`);
+      expect(csv.headers.link).toBe(
+        `<${origin}/v2/amm/pools/${POOL}/governance?limit=1&type=bid&format=csv&marker=${page.body.marker}>; rel="next"`,
+      );
+      expect((await get(`/v2/amm/pools/${POOL}/governance`)).headers.link).toBeUndefined();
+      expect((await get(`/v2/amm/pools/${POOL}/governance?limit=2&type=bid`)).headers.link).toBeUndefined();
+    });
+
     it('format=csv: one header for the votes and the bids of a page, the accounts of the slot in one cell', async () => {
       const res = await get(`/v2/amm/pools/${POOL}/governance?format=csv`);
       const table = lines(res.text).map(cells);
@@ -1520,6 +1534,28 @@ describe('the event reads over a bulk of four parts (read_rows and the plans)', 
         expect(primary.condition).toContain('ledger_index in');
       },
     );
+  });
+
+  it('limit: 200 by default, a decimal is cut, below one is the default, over 1000 is 1000 (800,000 events to fill them)', async () => {
+    for (const [route, pool, key] of [
+      ['liquidity', liquidityPool, 'liquidity'],
+      ['governance', governancePool, 'governance'],
+    ] as const) {
+      for (const [limit, count] of [
+        ['', 200],
+        ['0', 200],
+        ['-3', 200],
+        ['abc', 200],
+        ['7.9', 7],
+        ['1000', 1000],
+        ['5000', 1000],
+        ['all', 200],
+      ] as const) {
+        const res = await api.ok(`/v2/amm/pools/${pool}/${route}?limit=${limit}`, key);
+        expect([route, limit, res.body.count, (res.body[key] as Obj[]).length]).toEqual([route, limit, count, count]);
+        expect(res.body.marker).toBeDefined();
+      }
+    }
   });
 
   it('the existence of a pool is one read of the key of its states: a granule out of the table', async () => {

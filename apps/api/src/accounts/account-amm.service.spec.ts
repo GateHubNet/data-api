@@ -1,4 +1,5 @@
 import { AMM_POOLS_CHUNK, ClickHouseService, Table } from '@gatehub/data-api-shared';
+import { AMM_HISTORY_CARRY_LEDGERS } from '../amm/amm-pools.service';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { AccountAmmService } from './account-amm.service';
 
@@ -84,6 +85,18 @@ describe('AccountAmmService.positions', () => {
     await now.service.positions(ACCOUNT);
     expect(now.ranges.ledgerAtOrBefore).not.toHaveBeenCalled();
     expect(now.calls[0].params).toMatchObject({ account: ACCOUNT, ledger: 500 });
+  });
+
+  it('reads the state of the pools from a window of ledgers before the ledger, AMM_HISTORY_CARRY_LEDGERS of them', async () => {
+    const { service, calls } = build(
+      [{ currency: lp(1), counterparty: poolAt(1), balance: '1' }],
+      [{ amm_account: poolAt(1), filled_lp_currency: lp(1) }],
+      { latest: 100_000 },
+    );
+    await service.positions(ACCOUNT);
+    const batch = calls.find((c) => c.sql.includes(Table.AmmPoolStates) && Array.isArray(c.params.accounts))!;
+    expect(batch.params).toMatchObject({ fill_up_to: 100_000, fill_from: 100_000 - AMM_HISTORY_CARRY_LEDGERS + 1 });
+    expect(AMM_HISTORY_CARRY_LEDGERS).toBeGreaterThan(1);
   });
 
   it('reads the lines of the account up to the ledger, the currencies of LP tokens only, with the pattern bound', async () => {

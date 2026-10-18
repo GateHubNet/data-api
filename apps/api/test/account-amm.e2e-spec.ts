@@ -725,6 +725,24 @@ describe('the account liquidity list over events made by hand', () => {
     }
   });
 
+  it('sets the Link header on a page with a next one, for JSON and CSV, and none on the last page', async () => {
+    const page = await get(`/v2/accounts/${ME}/amm_liquidity?limit=2&event=deposit`);
+    const origin = new URL(page.request.url).origin;
+    expect(page.headers.link).toBe(
+      `<${origin}/v2/accounts/${ME}/amm_liquidity?limit=2&event=deposit&marker=${page.body.marker}>; rel="next"`,
+    );
+    const csv = await get(`/v2/accounts/${ME}/amm_liquidity?limit=2&event=deposit&format=csv`);
+    expect(csv.headers.link).toBe(
+      `<${origin}/v2/accounts/${ME}/amm_liquidity?limit=2&event=deposit&format=csv&marker=${page.body.marker}>; rel="next"`,
+    );
+    expect(csv.headers['content-disposition']).toBe(csvDisposition(`${ME} - amm liquidity`));
+    expect((await get(`/v2/accounts/${ME}/amm_liquidity?limit=1000`)).headers.link).toBeUndefined();
+    // the CSV of every page has the header of the object
+    const table = lines(csv.text).map(cells);
+    expect(table[0]).toEqual(LIQUIDITY_KEYS.map((c) => `"${c}"`));
+    expect(table).toHaveLength(3);
+  });
+
   it('does not need the pool to exist: a pool filter of an address with no state is an empty list, not a 404', async () => {
     const res = await get(`/v2/accounts/${ME}/amm_liquidity?pool=${accountAt(0xdead)}`);
     expect([res.status, res.body]).toEqual([200, { result: 'success', count: 0, liquidity: [] }]);
@@ -1379,6 +1397,21 @@ describe('the account reads over a bulk of four parts (read_rows and the plans)'
       expect(primary.condition).toContain(`account in ['${provider}'`);
       expect(primary.condition).toContain('ledger_index in');
     });
+  });
+
+  it('limit: 200 by default, a decimal is cut, below one is the default, over 1000 is 1000 (800,000 events to fill them)', async () => {
+    for (const [limit, count] of [
+      ['', 200],
+      ['0', 200],
+      ['abc', 200],
+      ['7.9', 7],
+      ['1000', 1000],
+      ['5000', 1000],
+    ] as const) {
+      const res = await api.ok(`/v2/accounts/${provider}/amm_liquidity?limit=${limit}`, 'liquidity');
+      expect([limit, res.body.count, (res.body.liquidity as Obj[]).length]).toEqual([limit, count, count]);
+      expect(res.body.marker).toBeDefined();
+    }
   });
 
   it('reads no more of balance_changes for a second request than for the first: no state is kept between requests', async () => {
