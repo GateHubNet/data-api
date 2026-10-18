@@ -223,7 +223,9 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 There are no materialized views ([ADR-0008](adr/0008-no-aggregate-materialized-views.md)). Query-time aggregates are plain `GROUP BY`
 queries over a bounded, key-ordered range (guard them with a window). A precomputed aggregate is a table the **aggregator** writes: a
 `ReplacingMergeTree(version)`, recomputed idempotently (a complete set under one new version; readers keep the highest version), added as a
-job in `aggregator.service.ts` with its own budget, and marked via `agg_dirty` when ingest rewrites its inputs.
+job in `aggregator.service.ts` with its own budget (a job with state of its own, such as `amm_pools` and `amm_daily`, is a runner in a
+file of its own, `*.job-runner.ts`, behind the `AggregatorJobContext` of `job-context.ts`), and marked via `agg_dirty` when ingest
+rewrites its inputs.
 
 ## 7. Testing
 

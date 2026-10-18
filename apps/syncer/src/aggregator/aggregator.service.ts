@@ -1,13 +1,7 @@
 import {
-  AMM_DAILY_CONFIG_VERSION,
   AmmDailyRecomputeAborted,
-  ammDailyVersions,
-  ammDaysDone,
-  ammFirstDay,
   AmmPoolsRecomputeAborted,
-  ammPoolsWatermark,
   ClickHouseService,
-  computeAmmDaily,
   computeDailyVolumeSet,
   computeLiveVolumeSet,
   dailySetVersions,
@@ -15,15 +9,11 @@ import {
   livePeriodsOf,
   liveSetVersions,
   MarketsConfig,
-  poolsChangedSince,
-  poolsClosedIn,
   RatesService,
-  recomputeAmmPools,
   recomputeStatsHourly,
   ShutdownSignals,
   StatsRecomputeAborted,
   Table,
-  VOLUME_DAY_SETTLE_MS,
   VOLUME_METRICS,
   volumeDaysDone,
   VolumeMetric,
@@ -32,6 +22,35 @@ import {
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { deleteDirtyRange, DirtyRange, narrowDirtyRange, readDirtyRanges } from './agg-dirty';
+import { AggregatorAmmDaily, AMM_DAILY_FUNCTIONS, AmmDailyFunctions, AmmDailyJobRunner } from './amm-daily.job-runner';
+import { AggregatorAmmPools, AMM_POOLS_FUNCTIONS, AmmPoolsFunctions, AmmPoolsJobRunner } from './amm-pools.job-runner';
+import {
+  AggregatorJobContext,
+  AggregatorJobName,
+  AggregatorTick,
+  Backoff,
+  backoffAfterFailure,
+  closedUntil,
+  DAY_SECONDS,
+  dayKey,
+  describe,
+  MAX_FAILED_VOLUME_SETS_PER_TICK,
+  staleFirst,
+  utcDayStart,
+} from './job-context';
+
+// the AMM jobs live in files of their own; what they export is part of the options of the service, so it is exported here too
+export { AMM_DAILY_BACKFILL_MAX_RETRY_MS, AMM_DAILY_BACKFILL_RETRY_MS } from './amm-daily.job-runner';
+export type { AggregatorAmmDaily, AmmDailyFunctions } from './amm-daily.job-runner';
+export {
+  AMM_POOL_MAX_RETRY_MS,
+  AMM_POOL_RETRY_MS,
+  AMM_POOLS_BATCH,
+  MAX_ISOLATED_POOLS_PER_BATCH,
+} from './amm-pools.job-runner';
+export type { AggregatorAmmPools, AmmPoolsFunctions } from './amm-pools.job-runner';
+export { MAX_FAILED_VOLUME_SETS_PER_TICK } from './job-context';
+export type { AggregatorJobName, AggregatorTick } from './job-context';
 
 /** The aggregator runs its jobs once a minute. */
 export const AGGREGATOR_INTERVAL_MS = 60_000;
@@ -95,35 +114,6 @@ export const AGGREGATOR_AMM_DAILY_BUDGET_MS = 4000;
  */
 export const AMM_DAILY_EVERY_TICKS = 5;
 
-/** How many pools one batch of `amm_pools` recomputes (and so how far the cursor of the job moves at a time). */
-export const AMM_POOLS_BATCH = 200;
-
-/**
- * A batch of `amm_pools` that fails is halved until the pools that fail on their own are found (Ruling R-A15). When more than
- * this many of one batch fail, the cause is not the pools (the database, a limit) and the batch is the failure of the job: the
- * cursor stays behind it and the next tick does it again.
- */
-export const MAX_ISOLATED_POOLS_PER_BATCH = 3;
-
-/**
- * A pool that fails on its own is set aside, in memory, and tried again after this long, and after twice as long after each
- * further failure, up to `AMM_POOL_MAX_RETRY_MS`, while the cursor and the other pools go on. A restart forgets the set: the
- * pool is stale in the tables (`ammPoolsWatermark`), so the new process finds it again.
- */
-export const AMM_POOL_RETRY_MS = 5 * 60_000;
-export const AMM_POOL_MAX_RETRY_MS = 60 * 60_000;
-
-/**
- * A closed day of `amm_daily` whose set failed is left alone for this long before the back-fill tries it again, and for twice
- * as long after each further failure, up to `AMM_DAILY_BACKFILL_MAX_RETRY_MS`, so that a day that fails every time does not
- * stop the back-fill of the older days (as `VOLUME_BACKFILL_RETRY_MS`). Kept in memory: a restart tries them all again.
- */
-export const AMM_DAILY_BACKFILL_RETRY_MS = 5 * 60_000;
-export const AMM_DAILY_BACKFILL_MAX_RETRY_MS = 60 * 60_000;
-
-/** A volume job gives up after this many sets failed in a tick, so that an outage does not log a line per set. */
-export const MAX_FAILED_VOLUME_SETS_PER_TICK = 3;
-
 /**
  * A closed day whose set failed is left alone for this long before the back-fill tries it again, and for twice as long after
  * each further failure, up to `VOLUME_BACKFILL_MAX_RETRY_MS`: a day that fails every time (bad data, a query over the memory
@@ -160,16 +150,6 @@ export const MAX_FAILED_DIRTY_RANGES_PER_TICK = 3;
 /** Optional `AggregatorOptions` (interval, budget, logger, clock, ...); tests shorten the interval and capture the log. */
 export const AGGREGATOR_OPTIONS = Symbol('AGGREGATOR_OPTIONS');
 
-/** What a job is handed by the tick it runs in. */
-export interface AggregatorTick {
-  /** The time of the tick. */
-  now: Date;
-  /** The clock reading (`Date.now()` scale, milliseconds) after which a job should not start another slice. */
-  deadline: number;
-  /** Aborted when the shutdown begins: pass it to whatever writes, so that nothing is written after that. */
-  signal: AbortSignal;
-}
-
 /**
  * One piece of the tick. The tick runs its jobs one after the other; a job that throws is logged and counted
  * (`syncer_aggregator_errors_total{job}`), and the jobs after it still run. A job that finishes counts in
@@ -191,16 +171,6 @@ export interface AggregatorJob {
   run(tick: AggregatorTick): Promise<void>;
 }
 
-/** The jobs the aggregator has of its own, in the order of a tick. */
-export type AggregatorJobName =
-  | 'volume_live'
-  | 'volume_daily'
-  | 'amm_pools'
-  | 'stats_live'
-  | 'stats_dirty'
-  | 'amm_daily'
-  | 'volume_backfill';
-
 /** What the volume jobs work with: the rates of the network and its versioned markets config. */
 export interface AggregatorVolumes {
   rates: RatesService;
@@ -216,66 +186,6 @@ export interface VolumeFunctions {
   liveVersions: typeof liveSetVersions;
   /** The same for the daily sets of today and of yesterday, keyed `<metric>/<day>`. */
   dailyVersions: typeof dailySetVersions;
-}
-
-/** What the `amm_pools` job works with: the rates of the network, for the value of a pool. */
-export interface AggregatorAmmPools {
-  rates: RatesService;
-}
-
-/** The functions of the shared package the `amm_pools` job calls; tests replace them. */
-export interface AmmPoolsFunctions {
-  /** Where the job goes on from after a start: see `ammPoolsWatermark`. */
-  watermark: typeof ammPoolsWatermark;
-  changedSince: typeof poolsChangedSince;
-  /** The pools of the ledgers that closed in a window (the slice of an `agg_dirty` range). */
-  poolsClosedIn: typeof poolsClosedIn;
-  recompute: typeof recomputeAmmPools;
-}
-
-/** What the `amm_daily` job works with: the rates of the network, for the value of a pool at the end of a day. */
-export interface AggregatorAmmDaily {
-  rates: RatesService;
-}
-
-/** The functions of the shared package the `amm_daily` job calls; tests replace them. */
-export interface AmmDailyFunctions {
-  /** Recomputes the set of a UTC day. */
-  compute: typeof computeAmmDaily;
-  /** Which of some days have a final set of a config version. */
-  daysDone: typeof ammDaysDone;
-  /** The newest version of the set of each day of a range, keyed `YYYY-MM-DD`: the stalest is started first. */
-  versions: typeof ammDailyVersions;
-  /** When the first pool activity closed (unix seconds), none without any: where the back-fill starts. */
-  firstDay: typeof ammFirstDay;
-}
-
-/** A list of pools in the halving of a batch that fails (see `AggregatorService.runAmmBatch`). */
-interface AmmNode {
-  accounts: string[];
-  parent?: AmmNode;
-  /** What it failed with; set only on a list that failed. */
-  error?: unknown;
-  /** Whether a pool that failed alone is found below it. */
-  leadsToPool?: boolean;
-}
-
-/** The batch of pools `amm_pools` is rebuilding, and where the halving of a failing batch has got to. */
-interface AmmBatch {
-  /** The cursor after the batch: the ledger its pools are complete up to (live batches). */
-  upTo?: number;
-  /** The pools, to tell the same batch when it comes again. */
-  key: string;
-  /** The lists still to rebuild, the first one next. */
-  todo: AmmNode[];
-  /** The pools that failed alone: set aside when the batch is done, if the rest of it worked. */
-  suspects: Array<{ node: AmmNode; error: unknown }>;
-  /** Every list that failed. */
-  failed: AmmNode[];
-  /** Whether any list of the batch was rebuilt. */
-  succeeded: boolean;
-  /** Whether this is the same batch coming again after every one of its lists failed. */
-  repeated: boolean;
 }
 
 export interface AggregatorOptions {
@@ -324,57 +234,7 @@ export function sliceRange(from: number, to: number): Array<[number, number]> {
 }
 
 const hourStart = (seconds: number): number => Math.floor(seconds / HOUR_SECONDS) * HOUR_SECONDS;
-const DAY_SECONDS = 86_400;
-/** The start of the UTC day of a time, unix seconds. */
-const utcDayStart = (seconds: number): number => Math.floor(seconds / DAY_SECONDS) * DAY_SECONDS;
-/** `YYYY-MM-DD` of the UTC day that starts at `seconds`. */
-const dayKey = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
-
-/**
- * The end (exclusive, unix seconds) of the closed days: a day is closed when it is before yesterday AND the ingest has passed
- * it (the newest ingested ledger closed `VOLUME_DAY_SETTLE_MS` after its end: R86). By wall clock alone a day would be taken for
- * final while its ledgers are still to come. The back-fills of the volume sets and of `amm_daily` use the same rule.
- */
-function closedUntil(nowSeconds: number, newestCloseSeconds: number): number {
-  return Math.min(utcDayStart(nowSeconds) - DAY_SECONDS, utcDayStart(newestCloseSeconds - VOLUME_DAY_SETTLE_MS / 1000));
-}
-
-/** When a set that failed is tried again: and what it waits after the next failure. */
-interface Backoff {
-  until: number;
-  delayMs: number;
-  /** A day of `amm_daily` that failed on the dirty path: it is owed a recompute even though it is final. */
-  owed?: boolean;
-}
-
-/**
- * The wait after a failure of a set that is retried: `firstMs` the first time, twice the last wait (at most `maxMs`) after
- * each further failure. The back-fills of the volume sets and of `amm_daily` use the same rule.
- */
-function backoffAfterFailure(previous: Backoff | undefined, now: number, firstMs: number, maxMs: number): Backoff {
-  const delayMs = previous === undefined ? firstMs : Math.min(previous.delayMs * 2, maxMs);
-  return { until: now + delayMs, delayMs };
-}
-
-/**
- * The sets in the order they are started: first the ones whose last attempt did not fail, then the ones whose did, and within
- * each group the one whose newest version is the oldest first, a set with no version (never written) before all of them, equals
- * in the order they are listed in. A set that keeps failing is always the stalest, so without the second rule it would start
- * first at every tick, and a failure that is slow (a timeout longer than the budget), or three fast ones, would keep every
- * healthy set from being refreshed; it is tried last instead, with the budget that is left.
- */
-function staleFirst<T extends { key: string }>(
-  sets: T[],
-  versions: ReadonlyMap<string, number>,
-  failedLast: ReadonlySet<string> = new Set(),
-): T[] {
-  return sets
-    .map((set, i) => ({ set, i, version: versions.get(set.key) ?? 0, failed: failedLast.has(set.key) ? 1 : 0 }))
-    .sort((a, b) => a.failed - b.failed || a.version - b.version || a.i - b.i)
-    .map(({ set }) => set);
-}
 const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
-const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /**
  * The `aggregator` worker: once a minute it runs its jobs, in this order (the order is the priority: a job only gets what the
@@ -432,6 +292,9 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
  *     doubling, until the config version changes) and the older days go on.
  *
+ * The AMM jobs (3 and 6) are runners in files of their own (`AmmPoolsJobRunner`, `AmmDailyJobRunner`), with their own state; the
+ * service lends them the database, the clock, the budgets and the rules of the tick (`AggregatorJobContext`).
+ *
  * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set is a complete set under a new version), which is
  * what lets this retry, resume and crash anywhere:
  *
@@ -458,32 +321,10 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly budgets: Record<AggregatorJobName, number>;
   private readonly volumes?: AggregatorVolumes;
   private readonly volumeFns: VolumeFunctions;
-  private readonly ammPools?: AggregatorAmmPools;
-  private readonly ammFns: AmmPoolsFunctions;
-  /**
-   * The cursor of `amm_pools`: every pool with a state row up to this ledger has been rebuilt. Unknown until the first tick
-   * reads it from the tables (`ammPoolsWatermark`); it only moves past a batch that was written.
-   */
-  private ammWatermark?: number;
-  /** The pools of `amm_pools` that failed on their own: when to try each again, and the wait after the next failure. */
-  private readonly ammRetry = new Map<string, { until: number; delayMs: number }>();
-  /**
-   * The live batch whose halving did not fit in the budget of a tick: the next tick goes on with it, from the list it stopped
-   * at, instead of asking for the pools again and halving from the whole batch (which would never get further). The cursor
-   * stays where it was until the batch is done.
-   */
-  private ammPending?: AmmBatch;
-  /** The batches (their pools) in which every list failed, the last few: the same batch coming again is a repeat. */
-  private readonly ammAllFailed = new Set<string>();
-  private readonly ammDaily?: AggregatorAmmDaily;
-  private readonly ammDailyFns: AmmDailyFunctions;
-  /** Today and yesterday (`YYYY-MM-DD`) whose set failed last time: they are tried behind the other. */
-  private readonly ammDailyFailedLast = new Set<string>();
-  /**
-   * The days of `amm_daily` (`YYYY-MM-DD`) that failed and wait to be tried again: closed days of the back-fill, and days that
-   * failed on the dirty path (`owed`: Ruling R-A22). When to try each again, and the wait after the next failure.
-   */
-  private readonly ammDailyBackoff = new Map<string, Backoff>();
+  /** The `amm_pools` job and its hook in the slices of `agg_dirty` (with the `ammPools` option). */
+  private readonly ammPools?: AmmPoolsJobRunner;
+  /** The `amm_daily` job and its hook in the slices of `agg_dirty` (with the `ammDaily` option). */
+  private readonly ammDaily?: AmmDailyJobRunner;
   /** How many ticks have run their jobs: the cadence of the jobs that do not run at every tick. */
   private tickCount = 0;
   /** The back-fills that have announced that they are under way (so that each says so once, and once more when it is done). */
@@ -534,25 +375,16 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       dailyVersions: dailySetVersions,
       ...options.volumeFunctions,
     };
-    this.ammPools = options.ammPools;
-    this.ammFns = {
-      watermark: ammPoolsWatermark,
-      changedSince: poolsChangedSince,
-      poolsClosedIn,
-      recompute: recomputeAmmPools,
-      ...options.ammPoolsFunctions,
-    };
-    this.ammDaily = options.ammDaily;
-    this.ammDailyFns = {
-      compute: computeAmmDaily,
-      daysDone: ammDaysDone,
-      versions: ammDailyVersions,
-      firstDay: ammFirstDay,
-      ...options.ammDailyFunctions,
-    };
     this.logger = options.logger ?? new Logger(AggregatorService.name);
     this.clock = options.now ?? Date.now;
     this.recompute = options.recompute ?? recomputeStatsHourly;
+    const context = this.jobContext();
+    this.ammPools = options.ammPools
+      ? new AmmPoolsJobRunner(context, options.ammPools, { ...AMM_POOLS_FUNCTIONS, ...options.ammPoolsFunctions })
+      : undefined;
+    this.ammDaily = options.ammDaily
+      ? new AmmDailyJobRunner(context, options.ammDaily, { ...AMM_DAILY_FUNCTIONS, ...options.ammDailyFunctions })
+      : undefined;
     // The order is the priority (see `AggregatorJob.budgetMs`): what must be fresh at every tick, the live volumes, goes first;
     // the sweeps and the back-fill, which can run long, come after it and have budgets of their own.
     this.jobs = [
@@ -575,7 +407,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
             {
               name: 'amm_pools',
               budgetMs: this.budgets.amm_pools,
-              run: (tick: AggregatorTick) => this.ammPoolsJob(tick),
+              run: (tick: AggregatorTick) => (this.ammPools as AmmPoolsJobRunner).run(tick),
             },
           ]
         : []),
@@ -587,7 +419,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
               name: 'amm_daily',
               budgetMs: this.budgets.amm_daily,
               everyTicks: options.ammDailyEveryTicks ?? AMM_DAILY_EVERY_TICKS,
-              run: (tick: AggregatorTick) => this.ammDailyJob(tick),
+              run: (tick: AggregatorTick) => (this.ammDaily as AmmDailyJobRunner).run(tick),
             },
           ]
         : []),
@@ -609,6 +441,23 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         );
       }
     }
+  }
+
+  /** What the runners of the jobs in files of their own (`amm_pools`, `amm_daily`) are lent of the service. */
+  private jobContext(): AggregatorJobContext {
+    return {
+      ch: this.ch,
+      logger: this.logger,
+      metrics: this.metrics,
+      budgets: this.budgets,
+      clock: () => this.clock(),
+      closing: () => this.closing,
+      mayStartSet: (tick, job) => this.mayStartSet(tick, job),
+      failed: (job, err, where) => this.failed(job, err, where),
+      versionsOf: (job, read) => this.versionsOf(job, read),
+      latestCloseTime: () => this.latestCloseTime(),
+      announceBackfill: (job, under, count) => this.announceBackfill(job, under, count),
+    };
   }
 
   /** Runs the first tick at once (not awaited: a slow database does not hold up the boot), then one every interval. */
@@ -690,390 +539,6 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     }
     this.metrics?.aggregatorErrorsTotal.inc({ job });
     this.logger.error(`Aggregator job ${job} failed${where}: ${describe(err)}`);
-  }
-
-  // -------------------------------------------------------------------------------------------------------------------
-  // amm_pools
-  // -------------------------------------------------------------------------------------------------------------------
-
-  /**
-   * Rebuilds the pools whose state rows changed since the cursor, a batch at a time, until nothing is left, the budget of the job
-   * is spent, or the shutdown begins; then tries again the pools that were set aside (`ammPoolsRetries`), also when the first
-   * part failed. A pool that fails on its own does not stop the others (`runAmmBatch`); a batch that fails as a whole is the
-   * error of the job, which is logged and counted as `amm_pools`, and the jobs after this one still run. It leaves the cursor
-   * where it was, so the next tick asks for the same pools again.
-   */
-  private async ammPoolsJob(tick: AggregatorTick): Promise<void> {
-    const amm = this.ammPools;
-    if (!amm) return;
-    this.ammWatermark ??= await this.ammFns.watermark(this.ch);
-    let failure: { error: unknown } | undefined;
-    try {
-      await this.ammPoolsLive(tick);
-    } catch (error) {
-      failure = { error };
-    }
-    await this.ammPoolsRetries(tick);
-    if (failure) throw failure.error;
-  }
-
-  /** The stale pools after the cursor, a batch at a time; the cursor moves past a batch once it is done. */
-  private async ammPoolsLive(tick: AggregatorTick): Promise<void> {
-    for (;;) {
-      if (!this.mayStartSet(tick, 'amm_pools')) return;
-      const ledger = this.ammWatermark as number;
-      let batch = this.ammPending;
-      if (!batch) {
-        const { accounts, upTo } = await this.ammFns.changedSince(this.ch, ledger, AMM_POOLS_BATCH);
-        if (this.closing) return;
-        batch = this.newAmmBatch(accounts, upTo);
-        if (!batch) {
-          // nothing to rebuild up to `upTo` (no stale pool, or those waiting for a retry): the cursor goes there and that is all
-          // there is when the answer has no pool; with pools set aside there may be more
-          if (upTo <= ledger) return;
-          this.ammWatermark = upTo;
-          if (accounts.length === 0) return;
-          continue;
-        }
-        this.ammPending = batch;
-      }
-      let finished: boolean;
-      try {
-        finished = await this.runAmmBatch(batch, tick, 'amm_pools', true);
-      } catch (err) {
-        this.ammPending = undefined;
-        throw err;
-      }
-      if (!finished) return; // the budget, or the shutdown: the batch stays as it is, and the next tick goes on with it
-      this.ammPending = undefined;
-      this.logger.debug(`amm_pools: ${batch.key.split(',').length} pool(s) up to ledger ${batch.upTo}`);
-      // a cursor that does not move would ask for the same pools for ever
-      if ((batch.upTo as number) <= ledger) return;
-      this.ammWatermark = batch.upTo;
-    }
-  }
-
-  /** A batch of the pools of `accounts` that are not waiting for a retry (they are rebuilt by it); none if there are none. */
-  private newAmmBatch(accounts: string[], upTo?: number): AmmBatch | undefined {
-    const pools = accounts.filter((account) => !this.ammRetry.has(account));
-    if (pools.length === 0) return undefined;
-    const key = pools.join(',');
-    return {
-      upTo,
-      key,
-      todo: [{ accounts: pools }],
-      suspects: [],
-      failed: [],
-      succeeded: false,
-      repeated: this.ammAllFailed.has(key),
-    };
-  }
-
-  /**
-   * Rebuilds the lists of a batch, the first of `todo` first (Ruling R-A15). A list that fails is halved, and the halves go
-   * first, so that the pools that fail on their own are found: a list of one pool that fails is a suspect.
-   *
-   *  - More than `MAX_ISOLATED_POOLS_PER_BATCH` suspects: the cause is not the pools, and the error of the batch is thrown.
-   *  - When the batch is done, its suspects are set aside for a retry (`AMM_POOL_RETRY_MS`), each counted as an error of `job`
-   *    ... but only if something in the batch worked, or if it is a repeat of a batch in which everything failed: a batch where
-   *    everything fails (the database is down) is the failure of the job, thrown, and the same batch coming again with the same
-   *    pools failing alone is the one that proves them guilty.
-   *  - A list that failed and yet whose halves worked, with no pool found below it, is warned about and counted: it fails as a
-   *    whole for its size, and would otherwise leave no trace.
-   *
-   * With `budgeted` it stops, returning false, when the budget of the job is spent: the halving goes on at the next tick from
-   * where it stopped, with the state in the batch. A slice of `agg_dirty` is not budgeted (it is started whole). The
-   * shutdown stops it too, returning false.
-   */
-  private async runAmmBatch(batch: AmmBatch, tick: AggregatorTick, job: string, budgeted: boolean): Promise<boolean> {
-    const amm = this.ammPools as AggregatorAmmPools;
-    while (batch.todo.length > 0) {
-      if (this.closing || (budgeted && !this.mayStartSet(tick, 'amm_pools'))) return false;
-      const node = batch.todo[0];
-      try {
-        await this.ammFns.recompute(this.ch, amm.rates, node.accounts, { signal: tick.signal });
-        batch.todo.shift();
-        batch.succeeded = true;
-      } catch (error) {
-        if (this.closing) throw error;
-        node.error = error;
-        batch.failed.push(node);
-        batch.todo.shift();
-        if (node.accounts.length > 1) {
-          const middle = Math.ceil(node.accounts.length / 2);
-          batch.todo.unshift(
-            { accounts: node.accounts.slice(0, middle), parent: node },
-            { accounts: node.accounts.slice(middle), parent: node },
-          );
-        } else {
-          batch.suspects.push({ node, error });
-          if (batch.suspects.length > MAX_ISOLATED_POOLS_PER_BATCH) throw batch.failed[0].error;
-        }
-      }
-    }
-
-    if (batch.suspects.length > 0 && !batch.succeeded && !batch.repeated) {
-      this.ammAllFailed.add(batch.key);
-      // the few last batches are enough: the same one comes again at the next tick
-      for (const key of this.ammAllFailed) if (this.ammAllFailed.size > 16) this.ammAllFailed.delete(key);
-      throw batch.failed[0].error;
-    }
-    this.ammAllFailed.delete(batch.key);
-    for (const { node, error } of batch.suspects) {
-      for (let up: AmmNode | undefined = node; up; up = up.parent) up.leadsToPool = true;
-      const account = node.accounts[0];
-      this.ammRetry.set(account, { until: this.clock() + AMM_POOL_RETRY_MS, delayMs: AMM_POOL_RETRY_MS });
-      this.failed(job, error, ` for pool ${account}, set aside to be tried again`);
-    }
-    // a failure from which nothing led to a pool: the topmost of each such tree
-    for (const node of batch.failed) {
-      if (node.leadsToPool || (node.parent && !node.parent.leadsToPool)) continue;
-      this.metrics?.aggregatorErrorsTotal.inc({ job });
-      this.logger.warn(
-        `Aggregator job ${job}: a batch of ${node.accounts.length} pool(s) failed as a whole, but its halves were rebuilt: ${describe(node.error)}`,
-      );
-    }
-    return true;
-  }
-
-  /** The pools that were set aside and whose wait is over, one at a time, under the budget of the job. */
-  private async ammPoolsRetries(tick: AggregatorTick): Promise<void> {
-    const amm = this.ammPools as AggregatorAmmPools;
-    const due = [...this.ammRetry].filter(([, retry]) => retry.until <= this.clock()).map(([account]) => account);
-    for (const account of due) {
-      if (!this.mayStartSet(tick, 'amm_pools')) return;
-      try {
-        await this.ammFns.recompute(this.ch, amm.rates, [account], { signal: tick.signal });
-        this.ammRetry.delete(account);
-        this.logger.log(`amm_pools: pool ${account} is rebuilt again`);
-      } catch (err) {
-        if (this.closing) throw err;
-        const delayMs = Math.min((this.ammRetry.get(account)?.delayMs ?? AMM_POOL_RETRY_MS) * 2, AMM_POOL_MAX_RETRY_MS);
-        this.ammRetry.set(account, { until: this.clock() + delayMs, delayMs });
-        this.failed('amm_pools', err, ` for pool ${account}, tried again in ${Math.round(delayMs / 60_000)} min`);
-      }
-    }
-  }
-
-  /**
-   * The pools with a state row in the ledgers that closed in the slice `[start, end)` of an `agg_dirty` range, rebuilt a batch at
-   * a time (a pool that fails on its own is set aside like those of the live job; a slice most of whose pools fail fails the
-   * slice). The slice is started whole (the budget is checked before a slice, as for its stats and volumes); only the shutdown
-   * stops it between batches, and then the range is left as it is (`recomputeDirty` writes nothing to `agg_dirty` after it).
-   */
-  private async ammPoolsOfSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
-    const amm = this.ammPools;
-    if (!amm) return;
-    const accounts = await this.ammFns.poolsClosedIn(this.ch, amm.rates, new Date(start * 1000), new Date(end * 1000));
-    for (let i = 0; i < accounts.length; i += AMM_POOLS_BATCH) {
-      if (this.closing) return;
-      const batch = this.newAmmBatch(accounts.slice(i, i + AMM_POOLS_BATCH));
-      if (batch) await this.runAmmBatch(batch, tick, 'amm_pools_dirty', false);
-    }
-  }
-
-  // -------------------------------------------------------------------------------------------------------------------
-  // amm_daily
-  // -------------------------------------------------------------------------------------------------------------------
-
-  /**
-   * Today, and yesterday until its set is final (Ruling R-A21: `ammDaysDone`; the dirty path covers a rewrite after that), the
-   * stalest first and a day that failed last time behind the other (R87: a day that keeps failing is the stalest for ever, and
-   * would otherwise start first at every run); then the days that failed on the dirty path and are due again (`ammDailyRetries`);
-   * then the back-fill of the closed days: all under the budget of the job, with a floor of one day for the run, which is the
-   * first due owed day if there is one and the newest wanted closed day if not. A day that
-   * fails is logged and counted once under `amm_daily` and tried again at the next run; it does not stop the other day or the
-   * back-fill. A day is one set under one version: there is no isolation of a pool that fails on its own (as `amm_pools` has),
-   * the whole day is tried again.
-   */
-  private async ammDailyJob(tick: AggregatorTick): Promise<void> {
-    const amm = this.ammDaily;
-    if (!amm) return;
-    const today = utcDayStart(Math.floor(tick.now.getTime() / 1000));
-    const yesterday = today - DAY_SECONDS;
-    const sets = [today, ...((await this.finalDay(yesterday)) ? [] : [yesterday])].map((dayStart) => ({
-      dayStart,
-      key: dayKey(dayStart),
-    }));
-    const versions = await this.versionsOf('amm_daily', () =>
-      this.ammDailyFns.versions(this.ch, new Date(yesterday * 1000), new Date(today * 1000)),
-    );
-    // the memory of a failure does not outlive the day it was about
-    const failedLast = this.ammDailyFailedLast;
-    for (const key of failedLast) if (!sets.some((set) => set.key === key)) failedLast.delete(key);
-    for (const { dayStart, key } of staleFirst(sets, versions, failedLast)) {
-      if (!this.mayStartSet(tick, 'amm_daily')) break;
-      try {
-        await this.ammDailyFns.compute(this.ch, amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
-        failedLast.delete(key);
-        this.ammDailyBackoff.delete(key);
-      } catch (err) {
-        this.failed('amm_daily', err, ` in ${key}`);
-        failedLast.add(key);
-      }
-    }
-    // the floor of the run is one day that starts whatever is left of the budget: a due owed day if there is one, else the
-    // newest wanted closed day
-    const retried = await this.ammDailyRetries(tick, new Set(sets.map((set) => set.key)));
-    await this.ammDailyBackfill(tick, retried === 0);
-  }
-
-  /** Whether the set of a day is final, made by the current computation. A read that fails is logged and counted: no. */
-  private async finalDay(dayStart: number): Promise<boolean> {
-    try {
-      const done = await this.ammDailyFns.daysDone(this.ch, AMM_DAILY_CONFIG_VERSION, [new Date(dayStart * 1000)]);
-      return done.has(dayKey(dayStart));
-    } catch (err) {
-      this.failed('amm_daily', err, ' reading the days done');
-      return false;
-    }
-  }
-
-  /**
-   * The days that failed on the dirty path (Ruling R-A22) and whose wait is over, tried again under the budget of the job: the
-   * ones that have failed fewer times first (R87: a day that keeps failing goes behind the others), then the ones due longest.
-   * A day that works is forgotten; one that fails waits twice as long, up to an hour. `except` are the days this run has just
-   * tried. The first due day starts whatever is left of the budget (the floor of the run, Ruling R-A23: while today alone takes
-   * the budget, an owed day would never be tried); the others need what is left. Returns how many days it started.
-   */
-  private async ammDailyRetries(tick: AggregatorTick, except: ReadonlySet<string>): Promise<number> {
-    const amm = this.ammDaily;
-    if (!amm) return 0;
-    let started = 0;
-    const due = [...this.ammDailyBackoff]
-      .filter(([key, wait]) => wait.owed && wait.until <= this.clock() && !except.has(key))
-      .sort(([, a], [, b]) => a.delayMs - b.delayMs || a.until - b.until);
-    for (const [key, wait] of due) {
-      if (started > 0 && !this.mayStartSet(tick, 'amm_daily')) return started;
-      started++;
-      try {
-        await this.ammDailyFns.compute(this.ch, amm.rates, new Date(`${key}T00:00:00Z`), { signal: tick.signal });
-        this.ammDailyBackoff.delete(key);
-      } catch (err) {
-        this.failed('amm_daily', err, ` in ${key}`);
-        if (!this.closing) {
-          this.ammDailyBackoff.set(key, {
-            ...backoffAfterFailure(wait, this.clock(), AMM_DAILY_BACKFILL_RETRY_MS, AMM_DAILY_BACKFILL_MAX_RETRY_MS),
-            owed: true,
-          });
-        }
-      }
-    }
-    return started;
-  }
-
-  /**
-   * The closed days that have no final set of the current `AMM_DAILY_CONFIG_VERSION`, newest first, for as long as the budget of
-   * the job and of the tick last, and, when the retries have not started a day, at least one day at each run (the floor: today
-   * and yesterday may have used the budget up, and the back-fill would never move). A day is closed when it is before yesterday AND the ingest has passed it
-   * (`closedUntil`), and the back-fill starts at the day of the first pool activity. The days that are done are found by one
-   * read (`ammDaysDone`), so a day is computed once, and a new config version computes them all again. A day that fails is left
-   * alone for a while (`AMM_DAILY_BACKFILL_RETRY_MS`, doubling), so that the days before it go on. It says when it starts and
-   * when it is done.
-   */
-  private async ammDailyBackfill(tick: AggregatorTick, floor = true): Promise<void> {
-    const amm = this.ammDaily;
-    if (!amm || this.closing) return;
-    const [firstActivity, newestClose] = await Promise.all([
-      this.ammDailyFns.firstDay(this.ch),
-      this.latestCloseTime(),
-    ]);
-    if (firstActivity === undefined || newestClose === undefined) return;
-    const until = closedUntil(Math.floor(tick.now.getTime() / 1000), newestClose);
-    const first = utcDayStart(firstActivity);
-    if (first >= until) return;
-
-    const days: number[] = [];
-    for (let dayStart = until - DAY_SECONDS; dayStart >= first; dayStart -= DAY_SECONDS) days.push(dayStart);
-    const done = await this.ammDailyFns.daysDone(
-      this.ch,
-      AMM_DAILY_CONFIG_VERSION,
-      days.map((dayStart) => new Date(dayStart * 1000)),
-    );
-    const missing = days.filter((dayStart) => !done.has(dayKey(dayStart)));
-    // a day that is done (or is no longer wanted) has no failure to remember: if it is wanted and fails again, it waits afresh
-    // (a day owed by the dirty path is kept: it is final, and not wanted here, but its recompute is due)
-    const wanted = new Set(missing.map(dayKey));
-    for (const [key, wait] of this.ammDailyBackoff)
-      if (!wait.owed && !wanted.has(key)) this.ammDailyBackoff.delete(key);
-    if (missing.length === 0) {
-      this.announceBackfill('amm_daily', false, 0);
-      return;
-    }
-    this.announceBackfill('amm_daily', true, missing.length);
-
-    let started = 0;
-    let failed = 0;
-    let waiting = 0;
-    for (const dayStart of missing) {
-      const key = dayKey(dayStart);
-      const backoff = this.ammDailyBackoff.get(key);
-      // a day that waits, and a day that failed on the dirty path (the retries of the job take it when it is due), is left alone
-      if (backoff !== undefined && (backoff.owed || backoff.until > this.clock())) {
-        waiting++;
-        continue;
-      }
-      // the first day of a run is the floor, unless the retries have started one: it starts whatever is left of the budget
-      if ((started > 0 || !floor) && !this.mayStartSet(tick, 'amm_daily')) return;
-      started++;
-      try {
-        await this.ammDailyFns.compute(this.ch, amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
-        this.ammDailyBackoff.delete(key);
-      } catch (err) {
-        this.failed('amm_daily', err, ` in ${key}`);
-        if (!this.closing) {
-          this.ammDailyBackoff.set(
-            key,
-            backoffAfterFailure(backoff, this.clock(), AMM_DAILY_BACKFILL_RETRY_MS, AMM_DAILY_BACKFILL_MAX_RETRY_MS),
-          );
-        }
-        if (++failed >= MAX_FAILED_VOLUME_SETS_PER_TICK) return;
-      }
-    }
-    if (failed === 0 && waiting === 0 && !this.closing) this.announceBackfill('amm_daily', false, 0);
-  }
-
-  /**
-   * The `amm_daily` sets of the days a slice `[start, end)` covers, after its stats. A day is done once per tick (`done` maps a
-   * day to the clock reading at which its recompute began), unless the range was marked after that: the ingest wrote more
-   * ledgers into the day meanwhile, which that recompute may not have seen. A day that fails does not fail the slice (Ruling
-   * R-A22): it is logged and counted under `amm_daily_dirty` and owed to the retries of the job, and the slice and its range go
-   * on; it is not tried again in this tick. Only the shutdown stops the slice, and then the range stays.
-   */
-  private async ammDaysOfSlice(
-    start: number,
-    end: number,
-    marked: number,
-    done: Map<string, number>,
-    tick: AggregatorTick,
-  ): Promise<void> {
-    const amm = this.ammDaily;
-    if (!amm) return;
-    for (let dayStart = utcDayStart(start); dayStart < end; dayStart += DAY_SECONDS) {
-      const key = dayKey(dayStart);
-      const began = done.get(key);
-      if (began !== undefined && began >= marked) continue;
-      if (this.closing) return;
-      const startedAt = this.clock();
-      try {
-        await this.ammDailyFns.compute(this.ch, amm.rates, new Date(dayStart * 1000), { signal: tick.signal });
-        this.ammDailyBackoff.delete(key);
-        done.set(key, startedAt);
-      } catch (err) {
-        if (this.closing) throw err;
-        this.failed('amm_daily_dirty', err, ` for ${key}, owed to the retries of amm_daily`);
-        this.ammDailyBackoff.set(key, {
-          ...backoffAfterFailure(
-            this.ammDailyBackoff.get(key),
-            this.clock(),
-            AMM_DAILY_BACKFILL_RETRY_MS,
-            AMM_DAILY_BACKFILL_MAX_RETRY_MS,
-          ),
-          owed: true,
-        });
-        done.set(key, Number.POSITIVE_INFINITY); // not again in this tick, whatever the marks
-      }
-    }
   }
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -1255,14 +720,14 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         break;
       }
       try {
-        await this.ammPoolsOfSlice(start, end, tick);
+        await this.ammPools?.ofSlice(start, end, tick);
       } catch (err) {
         this.failed('amm_pools_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
         outcome = 'failed';
         break;
       }
       try {
-        await this.ammDaysOfSlice(start, end, range.created, ammDays, tick);
+        await this.ammDaily?.daysOfSlice(start, end, range.created, ammDays, tick);
       } catch (err) {
         this.failed('amm_daily_dirty', err, ` in ${iso(start)} - ${iso(end)}`);
         outcome = 'failed';
