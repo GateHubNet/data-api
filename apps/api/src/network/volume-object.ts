@@ -1,5 +1,6 @@
 import type { Asset, VolumeMetric } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
+import { assetOfColumns } from '../common/asset-param';
 import { fmtTime, precision8 } from '../common/format';
 
 /**
@@ -96,8 +97,6 @@ export interface DisplayCurrency {
   rate: BigNumber;
 }
 
-const assetOf = (currency: string, issuer: string): Asset => (issuer ? { currency, issuer } : { currency });
-
 /** `{currency}` or `{currency, issuer}`: the key `issuer` is absent for the native currency. */
 const volumeAsset = (a: Asset): VolumeAsset =>
   a.issuer ? { currency: a.currency, issuer: a.issuer } : { currency: a.currency };
@@ -117,8 +116,8 @@ export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
   const parts = new Map<string, VolumePart>();
   for (const row of rows) {
     if (row.component === '') continue;
-    const base = assetOf(row.base_currency, row.base_issuer);
-    const counter = row.counter_currency === '' ? undefined : assetOf(row.counter_currency, row.counter_issuer);
+    const base = assetOfColumns(row.base_currency, row.base_issuer);
+    const counter = row.counter_currency === '' ? undefined : assetOfColumns(row.counter_currency, row.counter_issuer);
     // rows with a converted amount and rows without one are summed apart
     const id = [
       row.component,

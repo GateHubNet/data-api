@@ -1,4 +1,4 @@
-import type { Table } from '@gatehub/data-api-shared';
+import { AmmLiquidityRow, AmmPoolStatesRow, Table } from '@gatehub/data-api-shared';
 import { encodeAccountID } from 'ripple-address-codec';
 import type { ApiClient, Harness } from '../harness';
 import { LoggedRead, readsOf } from './read-rows';
@@ -82,4 +82,112 @@ export async function served(h: Harness, api: ApiClient, table: Table, path: str
     );
   spy.mockRestore();
   return { reads, statements, body };
+}
+
+// -- text of a response ----------------------------------------------------------------------------------------------
+
+export const lines = (text: string): string[] => text.split('\n');
+export const cells = (line: string): string[] => line.split(',');
+/** The key a base64url marker holds. */
+export const decodeMarker = (marker: string): unknown => JSON.parse(Buffer.from(marker, 'base64url').toString('utf8'));
+
+// -- the liquidity events ---------------------------------------------------------------------------------------------
+
+/** The pinned key order of a liquidity event (written out here, apart from the code under test). */
+export const LIQUIDITY_KEYS = [
+  'amm_account',
+  'ledger_index',
+  'tx_index',
+  'tx_hash',
+  'executed_time',
+  'account',
+  'initiator',
+  'event',
+  'mode',
+  'base_amount',
+  'counter_amount',
+  'lp_tokens',
+];
+
+/** The object the API serves for a liquidity row (the oracle). */
+export const liquidityOf = (r: AmmLiquidityRow): Record<string, unknown> =>
+  defined({
+    amm_account: r.amm_account,
+    ledger_index: r.ledger_index,
+    tx_index: r.tx_index,
+    tx_hash: r.tx_hash,
+    executed_time: iso(r.close_time),
+    account: r.account,
+    initiator: r.initiator,
+    event: r.event,
+    mode: r.mode === '' ? undefined : r.mode,
+    base_amount: r.base_amount,
+    counter_amount: r.counter_amount,
+    lp_tokens: r.lp_tokens,
+  });
+
+// -- rows made by hand --------------------------------------------------------------------------------------------------
+
+/** The issuer of the `AAA` side of the pools made by hand. */
+export const AAA_ISSUER = 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q';
+
+/**
+ * When a ledger made by hand closes: one second a ledger from the recorded ledger 93663334 back (it closed at 1737679022) and
+ * from 100132150 on (1762843711, before the next recorded one, 102186243). The order of the ledgers is the order of their
+ * times, which the lookups of a date by a ledger rely on.
+ */
+export const ledgerCloseTime = (ledger: number): number =>
+  ledger <= 93_663_334 ? 1_737_679_022 + (ledger - 93_663_334) : 1_762_843_711 + (ledger - 100_132_150);
+
+/**
+ * A state row of a pool made by hand: the pool AAA+AAA_ISSUER / XRP after a deposit, every value unknown (null) unless `over`
+ * names it. The one list of the columns of the row, for every suite.
+ */
+export function poolStateRow(
+  account: string,
+  ledger: number,
+  tx: number,
+  over: Partial<AmmPoolStatesRow> = {},
+): AmmPoolStatesRow {
+  return {
+    amm_account: account,
+    ledger_index: ledger,
+    tx_index: tx,
+    tx_hash: hashOf(ledger * 1000 + tx),
+    close_time: ledgerCloseTime(ledger),
+    tx_type: 'AMMDeposit',
+    base_currency: 'AAA',
+    base_issuer: AAA_ISSUER,
+    counter_currency: 'XRP',
+    counter_issuer: '',
+    reserve_base: null,
+    reserve_counter: null,
+    lp_supply: null,
+    lp_currency: null,
+    reserve_base_f: null,
+    reserve_counter_f: null,
+    lp_supply_f: null,
+    trading_fee: null,
+    auction_holder: null,
+    auction_price: null,
+    auction_price_f: null,
+    auction_discounted_fee: null,
+    auction_expiration: null,
+    deleted: 0,
+    ...over,
+  };
+}
+
+/**
+ * A `ledgers` row for a ledger made by hand, so that a date can name it: a copy of the first ledger of the table with this
+ * index, hash and close time (unix seconds; `ledgerCloseTime` by default).
+ */
+export async function insertLedgerRow(h: Harness, ledger: number, closeTime = ledgerCloseTime(ledger)): Promise<void> {
+  await h.ch.command(
+    `INSERT INTO ${Table.Ledgers}
+     SELECT tpl.* REPLACE (toUInt32({ledger:UInt32}) AS ledger_index, toDateTime({time:UInt32}, 'UTC') AS close_time,
+                           {hash:String} AS ledger_hash)
+       FROM (SELECT * FROM ${Table.Ledgers} ORDER BY ledger_index LIMIT 1) AS tpl`,
+    { ledger, time: closeTime, hash: hashOf(ledger) },
+  );
 }

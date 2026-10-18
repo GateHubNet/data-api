@@ -54,9 +54,6 @@ describe('AmmEventsService.liquidity and governance', () => {
     expect(order).toEqual(['pool', 'range', 'page']);
 
     const bad = build();
-    await expect(service.liquidity({ ...window, marker: '!' }))
-      .resolves.toBeDefined()
-      .catch(() => undefined);
     await expect(bad.service.liquidity({ ...window, marker: '!' })).rejects.toMatchObject({
       response: { message: 'invalid marker' },
     });

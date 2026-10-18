@@ -4,6 +4,7 @@ import {
   ammFilter,
   anyFlag,
   bool,
+  dateOf,
   dateParam,
   endExclusive,
   first,
@@ -319,6 +320,20 @@ describe('endExclusive', () => {
     const end = endExclusive(p);
     expect(end).not.toBe(p.date);
     expect(iso(p.date)).toBe('2015-08-31T00:00:00.000Z');
+  });
+});
+
+describe('dateOf', () => {
+  it('is none for a missing or an empty date (the original failed on an empty one with a 500)', () => {
+    expect(dateOf({})).toBeUndefined();
+    expect(dateOf({ date: '' })).toBeUndefined();
+  });
+
+  it('is the date with its granularity, or 400 invalid date format', () => {
+    expect(dateOf({ date: '2015-01-14' })).toEqual(parseDate('2015-01-14'));
+    expect(dateOf({ date: ['2015-01-14', 'bogus'] })).toEqual(parseDate('2015-01-14'));
+    expect(thrown(() => dateOf({ date: 'zzzz' }))).toEqual([400, 'invalid date format']);
+    expect(thrown(() => dateOf({ date: '2015-02-30' }))[0]).toBe(400);
   });
 });
 

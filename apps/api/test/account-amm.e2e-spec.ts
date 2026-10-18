@@ -9,8 +9,26 @@ import {
 } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
-import { accountAt, compare, defined, hashOf, iso, primaryKeys, qs, served } from './support/amm';
+import {
+  accountAt,
+  cells,
+  compare,
+  decodeMarker,
+  defined,
+  hashOf,
+  insertLedgerRow,
+  iso,
+  ledgerCloseTime,
+  lines,
+  LIQUIDITY_KEYS,
+  liquidityOf,
+  poolStateRow,
+  primaryKeys,
+  qs,
+  served,
+} from './support/amm';
 import { csvDisposition } from './support/csv';
+import { decimalQuotient } from './support/decimal';
 import { fixtureSource } from './support/fixtures';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead } from './support/plans';
 import {
@@ -40,25 +58,8 @@ import {
  */
 
 type Obj = Record<string, unknown>;
-const lines = (text: string): string[] => text.split('\n');
-const decodeMarker = (marker: string): unknown => JSON.parse(Buffer.from(marker, 'base64url').toString('utf8'));
-const cells = (line: string): string[] => line.split(',');
 
 /** The pinned key order of the objects (written out here once more, apart from the code under test). */
-const LIQUIDITY_KEYS = [
-  'amm_account',
-  'ledger_index',
-  'tx_index',
-  'tx_hash',
-  'executed_time',
-  'account',
-  'initiator',
-  'event',
-  'mode',
-  'base_amount',
-  'counter_amount',
-  'lp_tokens',
-];
 const POSITION_KEYS = ['pool', 'lp_currency', 'lp_balance', 'share', 'base_amount', 'counter_amount'];
 
 function expectOrdered(objects: Obj[], order: string[], label: unknown = ''): void {
@@ -68,27 +69,11 @@ function expectOrdered(objects: Obj[], order: string[], label: unknown = ''): vo
   });
 }
 
-const liquidityOf = (r: AmmLiquidityRow): Obj =>
-  defined({
-    amm_account: r.amm_account,
-    ledger_index: r.ledger_index,
-    tx_index: r.tx_index,
-    tx_hash: r.tx_hash,
-    executed_time: iso(r.close_time),
-    account: r.account,
-    initiator: r.initiator,
-    event: r.event,
-    mode: r.mode === '' ? undefined : r.mode,
-    base_amount: r.base_amount,
-    counter_amount: r.counter_amount,
-    lp_tokens: r.lp_tokens,
-  });
-
-/** A decimal as the API writes a share or an amount of a position: 30 significant digits, plain, trailing zeros dropped. */
-const Wide = BigNumber.clone({ DECIMAL_PLACES: 300 });
-const digits30 = (value: BigNumber): string => new BigNumber(value).precision(30).toFixed();
-
-/** The position the spec describes: the share of the supply, and the same share of each reserve. */
+/**
+ * The position the spec describes: the share of the supply, and the same share of each reserve. Each number is worked out
+ * as an exact fraction (`decimalQuotient`, BigInt): a quotient that ends is whole, one that does not is rounded to 30
+ * significant digits.
+ */
 function positionOf(
   pool: string,
   currency: string,
@@ -97,14 +82,13 @@ function positionOf(
   reserveBase: string | null,
   reserveCounter: string | null,
 ): Obj {
-  const lp = new Wide(balance);
   return defined({
     pool,
     lp_currency: currency,
-    lp_balance: new BigNumber(balance).toFixed(),
-    share: digits30(lp.dividedBy(supply)),
-    base_amount: reserveBase === null ? undefined : digits30(lp.times(reserveBase).dividedBy(supply)),
-    counter_amount: reserveCounter === null ? undefined : digits30(lp.times(reserveCounter).dividedBy(supply)),
+    lp_balance: decimalQuotient([balance], '1'),
+    share: decimalQuotient([balance], supply),
+    base_amount: reserveBase === null ? undefined : decimalQuotient([balance, reserveBase], supply),
+    counter_amount: reserveCounter === null ? undefined : decimalQuotient([balance, reserveCounter], supply),
   });
 }
 
@@ -192,8 +176,6 @@ describe('the account AMM routes over the recorded AMM ledgers', () => {
   let h: Harness;
   let api: ApiClient;
   let get: ApiClient['get'];
-  const pages = <T extends { marker?: string }>(p: string, limit: number, key: string): Promise<T[]> =>
-    api.pages<T>(p, limit, key);
   const head = LEDGERS[LEDGERS.length - 1].index;
 
   beforeAll(async () => {
@@ -511,7 +493,7 @@ describe('the account AMM routes over the recorded AMM ledgers', () => {
 
 // =====================================================================================================================
 describe('the account liquidity list over events made by hand', () => {
-  const closeOf = (ledger: number): number => 1_762_843_711 + (ledger - 100_132_150);
+  const closeOf = ledgerCloseTime;
   const POOLS = [accountAt(0xc1), accountAt(0xc2), accountAt(0xc3)];
   const ME = accountAt(0xd1);
   const OTHER = accountAt(0xd2);
@@ -751,43 +733,10 @@ describe('the account liquidity list over events made by hand', () => {
 
 // =====================================================================================================================
 describe('the positions over lines made by hand', () => {
-  const ISSUER = 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q';
-  /**
-   * One second a ledger from the recorded ledger 93663334 back (it closed at 1737679022) and from 100132150 on (1762843711, before
-   * the next recorded one, 102186243): the order of the ledgers is the order of the times.
-   */
-  const closeOf = (ledger: number): number =>
-    ledger <= 93_663_334 ? 1_737_679_022 + (ledger - 93_663_334) : 1_762_843_711 + (ledger - 100_132_150);
+  const closeOf = ledgerCloseTime;
   const lp = (n: number): string => `03${n.toString(16).toUpperCase().padStart(38, '0')}`;
-  const ME = accountAt(0x1000);
 
-  const state = (pool: string, ledger: number, tx: number, over: Partial<AmmPoolStatesRow> = {}): AmmPoolStatesRow => ({
-    amm_account: pool,
-    ledger_index: ledger,
-    tx_index: tx,
-    tx_hash: hashOf(ledger * 1000 + tx),
-    close_time: closeOf(ledger),
-    tx_type: 'AMMDeposit',
-    base_currency: 'AAA',
-    base_issuer: ISSUER,
-    counter_currency: 'XRP',
-    counter_issuer: '',
-    reserve_base: null,
-    reserve_counter: null,
-    lp_supply: null,
-    lp_currency: null,
-    reserve_base_f: null,
-    reserve_counter_f: null,
-    lp_supply_f: null,
-    trading_fee: null,
-    auction_holder: null,
-    auction_price: null,
-    auction_price_f: null,
-    auction_discounted_fee: null,
-    auction_expiration: null,
-    deleted: 0,
-    ...over,
-  });
+  const state = poolStateRow;
 
   const line = (
     account: string,
@@ -825,16 +774,7 @@ describe('the positions over lines made by hand', () => {
   let get: ApiClient['get'];
   let head: number;
 
-  /** A ledger row, so that a date can name the ledger. */
-  async function addLedger(ledger: number): Promise<void> {
-    await h.ch.command(
-      `INSERT INTO ${Table.Ledgers}
-       SELECT tpl.* REPLACE (toUInt32({ledger:UInt32}) AS ledger_index, toDateTime({time:UInt32}, 'UTC') AS close_time,
-                             {hash:String} AS ledger_hash)
-         FROM (SELECT * FROM ${Table.Ledgers} ORDER BY ledger_index LIMIT 1) AS tpl`,
-      { ledger, time: closeOf(ledger), hash: hashOf(ledger) },
-    );
-  }
+  const addLedger = (ledger: number): Promise<void> => insertLedgerRow(h, ledger);
   const positions = async (account: string, query = ''): Promise<Obj[]> => {
     const res = await get(`/v2/accounts/${account}/amm_positions${query}`);
     expect([account, query, res.status]).toEqual([account, query, 200]);
@@ -900,7 +840,7 @@ describe('the positions over lines made by hand', () => {
 
     beforeAll(async () => {
       // before the transfer, 100,000 XRP and 500 of the other asset, 565,685,424.949238 LP tokens (a quarter is 141,421,356.2373095)
-      await addLedger(93_663_000);
+      await insertLedgerRow(h, 93_663_000);
       await h.ch.insert(Table.AmmPoolStates, [
         state(POOL, 93_663_000, 0, {
           lp_currency: TOKEN,
@@ -992,7 +932,6 @@ describe('the positions over lines made by hand', () => {
     const L0 = 100_800_000;
     const L1 = 100_800_100;
     const L2 = 100_800_500;
-    const L3 = 100_801_000;
 
     beforeAll(async () => {
       await h.ch.insert(Table.AmmPoolStates, [
@@ -1067,6 +1006,47 @@ describe('the positions over lines made by hand', () => {
       const slow = served.find((p) => p.pool === SLOW)!;
       expect(slow).toEqual({ pool: SLOW, lp_currency: lp(10), lp_balance: '2', share: '0.25', base_amount: '4' });
       expect(slow).not.toHaveProperty('counter_amount');
+    });
+
+    it('serves the exact amount when the quotient ends, however many digits it has, and 30 digits when it does not', async () => {
+      const account = accountAt(0x4100);
+      const ends = accountAt(0x4101);
+      const third = accountAt(0x4102);
+      await h.ch.insert(Table.AmmPoolStates, [
+        state(ends, L0, 0, {
+          lp_currency: lp(40),
+          lp_supply: '1000',
+          reserve_base: '9876543210.987654',
+          reserve_counter: '0.5',
+        }),
+        state(third, L0, 0, { lp_currency: lp(41), lp_supply: '3', reserve_base: '1000', reserve_counter: '2' }),
+      ]);
+      await h.ch.insert(Table.BalanceChanges, [
+        line(account, ends, lp(40), L0, 0, 0, '0.1234567890123456'),
+        line(account, third, lp(41), L0, 0, 1, '1'),
+      ]);
+      const [first, second] = (await positions(account)).sort((a, b) =>
+        compare(a.pool as string, b.pool as string),
+      ) as Obj[];
+      const byPool = new Map([first, second].map((p) => [p.pool, p]));
+      // 0.1234567890123456 * 9876543210.987654 / 1000 has 32 digits and ends: all of them
+      expect(byPool.get(ends)).toEqual({
+        pool: ends,
+        lp_currency: lp(40),
+        lp_balance: '0.1234567890123456',
+        share: '0.0001234567890123456',
+        base_amount: '1219326.3113702171333485751812224',
+        counter_amount: '0.0000617283945061728',
+      });
+      // 1 / 3 does not end: 30 digits, the last one rounded
+      expect(byPool.get(third)).toEqual({
+        pool: third,
+        lp_currency: lp(41),
+        lp_balance: '1',
+        share: '0.333333333333333333333333333333',
+        base_amount: '333.333333333333333333333333333',
+        counter_amount: '0.666666666666666666666666666667',
+      });
     });
 
     it('takes the values of a pool from the states far back, as far as it takes (a supply and a currency 600,000 ledgers before the reserves)', async () => {

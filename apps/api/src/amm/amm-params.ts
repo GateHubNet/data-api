@@ -1,4 +1,6 @@
 import { AMM_LIQUIDITY_EVENTS } from '@gatehub/data-api-shared';
+import { applyDecorators } from '@nestjs/common';
+import { ApiQuery } from '@nestjs/swagger';
 import { badRequest } from '../common/errors';
 import { dateParam, endExclusive, first, Query } from '../common/params';
 
@@ -34,3 +36,12 @@ export function ledgerDates(query: Query): { start?: Date; endExclusive?: Date }
   const end = dateParam(query, 'end', 'invalid end date format');
   return { ...(start && { start: start.date }), ...(end && { endExclusive: endExclusive(end) }) };
 }
+
+/** The params every list of the AMM routes has beside its own: the order, the page and the format. */
+export const PagingQuery = (): MethodDecorator =>
+  applyDecorators(
+    ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' }),
+    ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' }),
+    ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' }),
+    ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' }),
+  ) as MethodDecorator;

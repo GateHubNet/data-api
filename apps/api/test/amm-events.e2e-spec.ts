@@ -1,7 +1,6 @@
 import {
   AmmGovernanceRow,
   AmmLiquidityRow,
-  AmmPoolStatesRow,
   buildLedgerRows,
   ExchangesRow,
   getNetworkProfile,
@@ -9,7 +8,24 @@ import {
   Table,
 } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
-import { accountAt, defined, hashOf, iso, primaryKeys, qs, served } from './support/amm';
+import {
+  AAA_ISSUER,
+  accountAt,
+  cells,
+  decodeMarker,
+  defined,
+  hashOf,
+  insertLedgerRow,
+  iso,
+  ledgerCloseTime,
+  lines,
+  LIQUIDITY_KEYS,
+  liquidityOf,
+  poolStateRow,
+  primaryKeys,
+  qs,
+  served,
+} from './support/amm';
 import { csvDisposition } from './support/csv';
 import { fixtureSource } from './support/fixtures';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead } from './support/plans';
@@ -40,25 +56,8 @@ import {
 type Obj = Record<string, unknown>;
 const RIPPLE_EPOCH = 946_684_800;
 const side = (currency: string, issuer: string): string => (issuer ? `${currency}+${issuer}` : currency);
-const lines = (text: string): string[] => text.split('\n');
-const decodeMarker = (marker: string): unknown => JSON.parse(Buffer.from(marker, 'base64url').toString('utf8'));
-const cells = (line: string): string[] => line.split(',');
 
 /** The pinned key order of the objects (written out here once more, apart from the code under test). */
-const LIQUIDITY_KEYS = [
-  'amm_account',
-  'ledger_index',
-  'tx_index',
-  'tx_hash',
-  'executed_time',
-  'account',
-  'initiator',
-  'event',
-  'mode',
-  'base_amount',
-  'counter_amount',
-  'lp_tokens',
-];
 const VOTE_KEYS = [
   'amm_account',
   'ledger_index',
@@ -106,23 +105,6 @@ function expectGovernanceOrdered(objects: Obj[], label: unknown = ''): void {
 
 // =====================================================================================================================
 // The oracle: the events of the recorded ledgers, in plain JavaScript
-
-/** The object the API serves for a liquidity row. */
-const liquidityOf = (r: AmmLiquidityRow): Obj =>
-  defined({
-    amm_account: r.amm_account,
-    ledger_index: r.ledger_index,
-    tx_index: r.tx_index,
-    tx_hash: r.tx_hash,
-    executed_time: iso(r.close_time),
-    account: r.account,
-    initiator: r.initiator,
-    event: r.event,
-    mode: r.mode === '' ? undefined : r.mode,
-    base_amount: r.base_amount,
-    counter_amount: r.counter_amount,
-    lp_tokens: r.lp_tokens,
-  });
 
 /** The object the API serves for a governance row: a vote, or a bid with the slot after it. */
 function governanceOf(r: AmmGovernanceRow): Obj {
@@ -821,39 +803,10 @@ describe('the AMM event routes over the recorded AMM ledgers', () => {
 
 // =====================================================================================================================
 describe('the event routes over events made by hand', () => {
-  const ISSUER = 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q';
-  /** Between the close times of the recorded ledgers 100132150 and 102186243, one second a ledger: the order of the ledgers is the order of the times. */
-  const closeOf = (ledger: number): number => 1_762_843_711 + (ledger - 100_132_150);
+  const ISSUER = AAA_ISSUER;
+  const closeOf = ledgerCloseTime;
+  const stateRow = poolStateRow;
   const ACCOUNTS = [accountAt(0xa1), accountAt(0xa2), accountAt(0xa3)];
-
-  const stateRow = (account: string, ledger: number, tx: number, over: Partial<AmmPoolStatesRow> = {}) =>
-    ({
-      amm_account: account,
-      ledger_index: ledger,
-      tx_index: tx,
-      tx_hash: hashOf(ledger * 1000 + tx),
-      close_time: closeOf(ledger),
-      tx_type: 'AMMDeposit',
-      base_currency: 'AAA',
-      base_issuer: ISSUER,
-      counter_currency: 'XRP',
-      counter_issuer: '',
-      reserve_base: null,
-      reserve_counter: null,
-      lp_supply: null,
-      lp_currency: null,
-      reserve_base_f: null,
-      reserve_counter_f: null,
-      lp_supply_f: null,
-      trading_fee: null,
-      auction_holder: null,
-      auction_price: null,
-      auction_price_f: null,
-      auction_discounted_fee: null,
-      auction_expiration: null,
-      deleted: 0,
-      ...over,
-    }) satisfies AmmPoolStatesRow;
 
   const liquidityRow = (
     pool: string,
@@ -1325,15 +1278,7 @@ describe('the event routes over events made by hand', () => {
       await h.ch.insert(Table.AmmPoolStates, [stateRow(ONE, 100_559_000, 0), stateRow(TWO, 100_559_000, 1)]);
       await h.ch.insert(Table.Exchanges, [...book, ...ones, ...twos]);
       // the dates of the window test are those of the ledgers: a ledger row for each ledger of the pool's swaps
-      for (const ledger of new Set(ones.map((r) => r.ledger_index))) {
-        await h.ch.command(
-          `INSERT INTO ${Table.Ledgers}
-           SELECT tpl.* REPLACE (toUInt32({ledger:UInt32}) AS ledger_index, toDateTime({time:UInt32}, 'UTC') AS close_time,
-                                 {hash:String} AS ledger_hash)
-             FROM (SELECT * FROM ${Table.Ledgers} ORDER BY ledger_index LIMIT 1) AS tpl`,
-          { ledger, time: closeOf(ledger), hash: hashOf(ledger) },
-        );
-      }
+      for (const ledger of new Set(ones.map((r) => r.ledger_index))) await insertLedgerRow(h, ledger);
     });
 
     const keyOf = (e: Obj): unknown[] => [e.ledger_index, e.tx_index, e.node_index];

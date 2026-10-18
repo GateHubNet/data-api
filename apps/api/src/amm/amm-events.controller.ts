@@ -1,4 +1,5 @@
-import { applyDecorators, Get, Param, Query, Req, Res } from '@nestjs/common';
+import { AMM_LIQUIDITY_EVENTS } from '@gatehub/data-api-shared';
+import { Get, Param, Query, Req, Res } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is
 // not a dependency of this app (only its types are)
@@ -18,7 +19,7 @@ import {
   toGovernanceCsvRow,
   toLiquidityCsvRow,
 } from './amm-objects';
-import { eventParam, ledgerDates, typeParam } from './amm-params';
+import { eventParam, GOVERNANCE_TYPES, ledgerDates, PagingQuery, typeParam } from './amm-params';
 import { poolParam } from './amm-pools.controller';
 
 interface SwapsBody {
@@ -47,15 +48,6 @@ const filenameOf =
   (what: string) =>
   (req: Request): string =>
     `${req.params.pool} - amm ${what}`;
-
-/** The params every list of a pool has: the order, the page and the format. */
-const PagingQuery = (): MethodDecorator =>
-  applyDecorators(
-    ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' }),
-    ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' }),
-    ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' }),
-    ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' }),
-  ) as MethodDecorator;
 
 /**
  * The event lists of a pool (GateHub extra, no Ripple original): its swaps, its liquidity events and its votes and bids. A
@@ -127,7 +119,7 @@ export class AmmEventsController {
   @ApiQuery({
     name: 'event',
     required: false,
-    enum: ['create', 'deposit', 'withdraw', 'clawback', 'delete'],
+    enum: [...AMM_LIQUIDITY_EVENTS],
     description: 'Only the events of this kind.',
   })
   @ApiQuery({ name: 'account', required: false, description: 'Only the events of this liquidity provider.' })
@@ -177,7 +169,12 @@ export class AmmEventsController {
   @ApiParam({ name: 'pool', description: 'The address of the pool account.' })
   @ApiQuery({ name: 'start', required: false, description: 'Start time. Default: the first ledger.' })
   @ApiQuery({ name: 'end', required: false, description: 'End time. Default: the newest ledger.' })
-  @ApiQuery({ name: 'type', required: false, enum: ['vote', 'bid'], description: 'Only the votes, or only the bids.' })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    enum: [...GOVERNANCE_TYPES],
+    description: 'Only the votes, or only the bids.',
+  })
   @PagingQuery()
   async governance(
     @Param('pool') poolRaw: string,

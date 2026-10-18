@@ -159,6 +159,15 @@ export function dateParam(q: Query, name: string, error: string, def?: string): 
   return parsed;
 }
 
+/**
+ * `date`, with the granularity of what was written; none when missing or empty. Text that is not a date answers 400
+ * `invalid date format`. An empty `date` counts as none, as the check of the original did (`req.query.date && ...`).
+ */
+export function dateOf(query: Query): ParsedDate | undefined {
+  if ((first(query, 'date') ?? '') === '') return undefined;
+  return dateParam(query, 'date', 'invalid date format');
+}
+
 /** `moment.add(n, 'month')` in UTC: the day of the month is kept, or cut to the last day of a shorter month. */
 function addMonths(date: Date, months: number): Date {
   const result = new Date(date.getTime());

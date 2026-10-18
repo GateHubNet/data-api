@@ -92,11 +92,15 @@ export interface ExchangesWindow {
 export interface PairExchangesQuery extends ExchangesWindow {
   base: Asset;
   counter: Asset;
-  /**
-   * Only the swaps of this pool (the swaps of `GET /v2/amm/pools/:pool/swaps`): a condition of the capped read beside the pair,
-   * which the skip index on `amm_account` lets skip the granules of the other pools' swaps and of the order book.
-   */
-  ammAccount?: string;
+}
+
+/**
+ * The swaps of one pool (`GET /v2/amm/pools/:pool/swaps`): the pair read with the pool's account as a condition of the
+ * capped read beside the pair, which the skip index on `amm_account` lets skip the granules of the other pools' swaps and of
+ * the order book. Only `pair()` takes it; the candles and the reduced row of a pair do not.
+ */
+export interface PoolSwapsQuery extends PairExchangesQuery {
+  ammAccount: string;
 }
 
 export interface ExchangesPage {
@@ -141,7 +145,8 @@ export class ExchangesService {
   ) {}
 
   /** One page of the exchanges of a pair, in the order asked for, with the marker of the next page when there is one. */
-  async pair(q: PairExchangesQuery): Promise<ExchangesPage> {
+  async pair(q: PairExchangesQuery | PoolSwapsQuery): Promise<ExchangesPage> {
+    const ammAccount = 'ammAccount' in q ? q.ammAccount : undefined;
     // before any query: a marker that is none of ours is the client's mistake, whatever the range holds
     const after = decodeMarker(q.marker, EXCHANGE_KEYS);
 
@@ -162,7 +167,7 @@ export class ExchangesService {
       ...(q.autobridged ? ['autobridged_currency IS NOT NULL'] : []),
       // inside the read that is capped: a filter after the page would leave it short or empty
       ...ammConditions(q.amm),
-      ...(q.ammAccount !== undefined ? ['amm_account = {amm_account:String}'] : []),
+      ...(ammAccount !== undefined ? ['amm_account = {amm_account:String}'] : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
     // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
@@ -178,7 +183,7 @@ export class ExchangesService {
         ...Object.fromEntries(pairValues.map((v, i) => [`pair${i}`, v])),
         min: range.min,
         max: range.max,
-        ...(q.ammAccount !== undefined && { amm_account: q.ammAccount }),
+        ...(ammAccount !== undefined && { amm_account: ammAccount }),
         ...cursor.params,
       },
       limit: q.limit + 1,

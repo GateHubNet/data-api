@@ -10,6 +10,7 @@ import {
   Table,
 } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
+import { assetOfColumns } from '../common/asset-param';
 import { notFound } from '../common/errors';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, KeyValue, paginate } from '../common/pagination';
@@ -66,10 +67,6 @@ const MAX_DAY = 65_535 * DAY_SECONDS;
 
 /** `YYYY-MM-DD` of a time in unix seconds. */
 const dayText = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
-
-/** The Asset of a pair of columns (the issuer of the native currency is stored as `''`). */
-const assetOfColumns = (currency: string, issuer: string): Asset =>
-  issuer === '' ? { currency } : { currency, issuer };
 
 /** The Asset of a filter as a pair of columns. */
 const columnsOfAsset = (asset: Asset): { currency: string; issuer: string } => ({

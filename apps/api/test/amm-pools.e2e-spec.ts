@@ -12,7 +12,18 @@ import {
 } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
-import { accountAt, compare, defined, hashOf, insertParts, iso, primaryKeys, qs } from './support/amm';
+import {
+  accountAt,
+  compare,
+  decodeMarker,
+  defined,
+  insertParts,
+  iso,
+  lines,
+  poolStateRow,
+  primaryKeys,
+  qs,
+} from './support/amm';
 import { csvDisposition } from './support/csv';
 import { fixtureSource } from './support/fixtures';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead } from './support/plans';
@@ -291,8 +302,6 @@ interface DaysBody {
 }
 
 /** The base64url JSON marker of a key. */
-const decodeMarker = (marker: string): unknown => JSON.parse(Buffer.from(marker, 'base64url').toString('utf8'));
-const lines = (text: string): string[] => text.split('\n');
 
 // =====================================================================================================================
 describe('the AMM pool routes over the recorded AMM ledgers', () => {
@@ -1661,33 +1670,16 @@ describe('the pool history over states made by hand', () => {
     ledger: number,
     tx: number,
     over: Partial<AmmPoolStatesRow> = {},
-  ): AmmPoolStatesRow => ({
-    amm_account: account,
-    ledger_index: ledger,
-    tx_index: tx,
-    tx_hash: hashOf(ledger * 1000 + tx),
-    close_time: closeOf(ledger),
-    tx_type: 'Payment',
-    base_currency: 'XRP',
-    base_issuer: '',
-    counter_currency: 'EUR',
-    counter_issuer: ISSUER,
-    reserve_base: null,
-    reserve_counter: null,
-    lp_supply: null,
-    lp_currency: null,
-    reserve_base_f: null,
-    reserve_counter_f: null,
-    lp_supply_f: null,
-    trading_fee: null,
-    auction_holder: null,
-    auction_price: null,
-    auction_price_f: null,
-    auction_discounted_fee: null,
-    auction_expiration: null,
-    deleted: 0,
-    ...over,
-  });
+  ): AmmPoolStatesRow =>
+    poolStateRow(account, ledger, tx, {
+      close_time: closeOf(ledger),
+      tx_type: 'Payment',
+      base_currency: 'XRP',
+      base_issuer: '',
+      counter_currency: 'EUR',
+      counter_issuer: ISSUER,
+      ...over,
+    });
 
   let h: Harness;
   let api: ApiClient;

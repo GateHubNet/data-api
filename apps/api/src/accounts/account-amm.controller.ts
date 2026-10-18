@@ -1,15 +1,16 @@
+import { AMM_LIQUIDITY_EVENTS } from '@gatehub/data-api-shared';
 import { Get, Param, Query, Req, Res } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is
 // not a dependency of this app (only its types are)
 import type { Request, Response } from 'express';
-import { dateOf } from '../active-accounts/active-window';
-import { LiquidityCsvRow, LiquidityObject, PositionObject, toLiquidityCsvRow } from '../amm/amm-objects';
-import { eventParam, ledgerDates } from '../amm/amm-params';
+import { LiquidityCsvRow, LiquidityObject, toLiquidityCsvRow } from '../amm/amm-objects';
+import { eventParam, ledgerDates, PagingQuery } from '../amm/amm-params';
 import { poolParam } from '../amm/amm-pools.controller';
+import { PositionObject } from '../amm/amm-positions';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { setLinkHeader } from '../common/pagination';
-import { bool, first, limitParam, Query as QueryParams } from '../common/params';
+import { bool, dateOf, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { AccountAmmService } from './account-amm.service';
 
@@ -58,13 +59,10 @@ export class AccountAmmController {
   @ApiQuery({
     name: 'event',
     required: false,
-    enum: ['create', 'deposit', 'withdraw', 'clawback', 'delete'],
+    enum: [...AMM_LIQUIDITY_EVENTS],
     description: 'Only the events of this kind.',
   })
-  @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
-  @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
-  @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
+  @PagingQuery()
   async liquidity(
     @Param('address') address: string,
     @Query() query: QueryParams,

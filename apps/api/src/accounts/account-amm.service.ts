@@ -8,15 +8,9 @@ import {
 } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import BigNumber from 'bignumber.js';
-import {
-  LIQUIDITY_COLUMNS,
-  LiquidityObject,
-  PositionObject,
-  StoredLiquidity,
-  toLiquidityObject,
-  toPositionObject,
-} from '../amm/amm-objects';
+import { LIQUIDITY_COLUMNS, LiquidityObject, StoredLiquidity, toLiquidityObject } from '../amm/amm-objects';
 import { AMM_HISTORY_CARRY_LEDGERS } from '../amm/amm-pools.service';
+import { PositionObject, toPositionObject } from '../amm/amm-positions';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 
@@ -195,8 +189,9 @@ export class AccountAmmService {
 
   /**
    * The state, as of `ledger`, of each of the pools that has a state row up to it: the shared fill-forward (`fillForward`: a
-   * window of ledgers before `ledger`, then further back in doubling steps for the pools whose window leaves a value null and
-   * that have older rows), in batches of `AMM_POOLS_CHUNK`. An account that is no pool has no row.
+   * window of ledgers before `ledger`, then further back in doubling steps, each read for all the pools of a batch that are
+   * still incomplete), in batches of `AMM_POOLS_CHUNK`. An account that is no pool has no row; the walk for it goes back to
+   * the first ledger in about log2 reads of nothing.
    */
   private async poolsAt(accounts: string[], ledger: number): Promise<Map<string, PositionState>> {
     const from = Math.max(0, ledger - AMM_HISTORY_CARRY_LEDGERS + 1);
@@ -208,7 +203,6 @@ export class AccountAmmService {
         ledger,
         from,
         POSITION_QUERY,
-        { onlyPoolsWithOlderRows: true },
       );
       for (const row of rows) pools.set(row.amm_account, row);
     }

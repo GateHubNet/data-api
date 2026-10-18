@@ -9,7 +9,7 @@ import { parseAsset, parseAssetPair } from '../common/asset-param';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { badRequest, notFound } from '../common/errors';
 import { setLinkHeader } from '../common/pagination';
-import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
+import { bool, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { NETWORK_PROFILE } from '../config/api.config';
 import {
@@ -23,6 +23,7 @@ import {
   toPoolDayCsvRow,
   toPoolStateCsvRow,
 } from './amm-objects';
+import { ledgerDates, PagingQuery } from './amm-params';
 import { AmmPoolsService, HistoryQuery } from './amm-pools.service';
 
 interface PoolsBody {
@@ -146,10 +147,7 @@ export class AmmPoolsController {
     enum: ['day'],
     description: 'Without it every state; `day`: one row a day.',
   })
-  @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
-  @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
-  @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
+  @PagingQuery()
   async history(
     @Param('pool') poolRaw: string,
     @Query() query: QueryParams,
@@ -158,16 +156,14 @@ export class AmmPoolsController {
   ): Promise<HistoryBody> {
     // the checks come in the order of the params: the pool, start, end, limit, interval, then the marker (the service)
     const pool = poolParam(poolRaw);
-    const start = dateParam(query, 'start', 'invalid start date format');
-    const end = dateParam(query, 'end', 'invalid end date format');
+    const dates = ledgerDates(query);
     const limit = limitParam(query, { def: 200, max: 1000 });
     const interval = first(query, 'interval');
     if (interval !== undefined && interval !== '' && interval !== 'day') throw badRequest('invalid interval');
 
     const window: HistoryQuery = {
       pool,
-      ...(start && { start: start.date }),
-      ...(end && { endExclusive: endExclusive(end) }),
+      ...dates,
       descending: bool(query, 'descending'),
       limit,
       marker: first(query, 'marker'),
