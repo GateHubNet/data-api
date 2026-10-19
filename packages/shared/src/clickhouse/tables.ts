@@ -35,6 +35,16 @@ export enum Table {
   StatsHourly = 'stats_hourly',
   VolumeDaily = 'volume_daily',
   VolumeLive = 'volume_live',
+  // Account and market aggregates (migration 003).
+  NativeRatesDaily = 'native_rates_daily',
+  PairHourly = 'pair_hourly',
+  MarketsLive = 'markets_live',
+  AccountRollupState = 'account_rollup_state',
+  AccountPartitionRows = 'account_partition_rows',
+  AccountRollupDays = 'account_rollup_days',
+  AccountLinesDaily = 'account_lines_daily',
+  AccountTxDaily = 'account_tx_daily',
+  AccountTradesDaily = 'account_trades_daily',
   // Internal bookkeeping.
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
