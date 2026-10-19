@@ -1449,6 +1449,110 @@ Errors: 400 `invalid validator public key`; 404 `Validator not found`; 500 `unab
 **Differences from data.ripple.com**: the original answered this route with the same flat object, with the keys of its row; this one adds the keys of the new list row, the
 vote on every amendment, the manifest and the daily agreement, and answers a validator seen long ago and a signing key. See the table above for the list.
 
+### `GET /v2/network/validators/{key}/validations`
+
+The validations one validator made in the last 7 days (the table keeps 7), newest first: for each ledger and ledger hash the sightings added up, whether the
+ledger is the one the indexer holds, and when the validation was first and last seen.
+
+`key` is taken as in `GET /v2/network/validators/{key}`: a master key (`nH...`) or a signing key (`n9...`), base58, or 66 hex digits starting `02`, `03` or `ED`, in either
+case. A signing key answers with the validator it belongs to, and `validation_public_key` names the master. Any other text answers 400
+`invalid validator public key`; a key of the right form that the deployment has no record of answers 404 `Validator not found`. A validator the deployment knows
+that made no validation in the last 7 days answers an empty page.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `limit` | 200 | At most 1000; 0 or less is the default. |
+| `marker` | | From the previous page: the base64url of `[ledger_index, ledger_hash]`, the key of the last validation of that page. Anything that is not one answers 400 `invalid marker`. |
+| `descending` | `true` | Any text that contains `false`, in any case, lists the oldest first; any other text (or none) newest first. |
+| `format` | `json` | `csv`: the page as a CSV file named `<validation_public_key> - validations.csv` (the master key, whichever key the path has), one row for each validation, the keys of a validation as columns. The columns come in the order the keys first appear, so `validated_hash`, which only a `different` validation has, comes last unless the first row has it. |
+
+**Which rows.** The page lists the rows of the master key **and** of every signing key whose newest manifest names that master: a validation that the collector
+recorded under a signing key before its manifest was known is the master's, as it is for every other figure of the validators. The sightings of one ledger and
+hash under two of the keys are one validation: their `count` is summed, `first_datetime` is the earliest and `last_datetime` the latest of them, `full` is
+true when any of them was full, and `signing_key` and `signing_time` are those of the earliest sighting. Two validations of the same `ledger_index` with different hashes (a
+fork) are two rows, in the order of the hash. The page is cut after that merge, and a marker is the key of its last row.
+
+An example (the e2e suite's validator with two signing keys, `limit=4`; the page has more, so it has a `marker`). The first row is a partial validation. The second and
+third rows are two hashes of one ledger (a fork): the indexer holds the hash of the third, so the second is `different` and names it as `validated_hash`. The fourth row was
+recorded under both the master key and an old signing key of it, three sightings in all; `signing_key` is that of the earliest, the old one:
+
+```json
+{
+  "result": "success",
+  "validation_public_key": "nHBFpmLgxtyCSPCW4fWLgqwefcLBuQdkU7R6FNQVF2B5czacYLLA",
+  "count": 4,
+  "marker": "WzEwNzc0ODAwNSwiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwNjZDMUFBNSJd",
+  "validations": [
+    {
+      "ledger_index": 107748007,
+      "ledger_hash": "00000000000000000000000000000000000000000000000000000000066C1AA7",
+      "validated": "matches",
+      "full": false,
+      "signing_key": "nHUZmMp1ohFVujJbVvBzDrXJBDMiwpchREv5x466VeJesK8SQCuY",
+      "signing_time": "2026-10-19T16:00:49Z",
+      "first_datetime": "2026-10-19T16:00:49.250Z",
+      "last_datetime": "2026-10-19T16:00:49.250Z",
+      "count": 1
+    },
+    {
+      "ledger_index": 107748006,
+      "ledger_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "validated": "different",
+      "validated_hash": "00000000000000000000000000000000000000000000000000000000066C1AA6",
+      "full": true,
+      "signing_key": "nHUZmMp1ohFVujJbVvBzDrXJBDMiwpchREv5x466VeJesK8SQCuY",
+      "signing_time": "2026-10-19T16:00:45Z",
+      "first_datetime": "2026-10-19T16:00:45.500Z",
+      "last_datetime": "2026-10-19T16:00:45.500Z",
+      "count": 1
+    },
+    {
+      "ledger_index": 107748006,
+      "ledger_hash": "00000000000000000000000000000000000000000000000000000000066C1AA6",
+      "validated": "matches",
+      "full": true,
+      "signing_key": "nHUZmMp1ohFVujJbVvBzDrXJBDMiwpchREv5x466VeJesK8SQCuY",
+      "signing_time": "2026-10-19T16:00:45Z",
+      "first_datetime": "2026-10-19T16:00:45.250Z",
+      "last_datetime": "2026-10-19T16:00:45.750Z",
+      "count": 2
+    },
+    {
+      "ledger_index": 107748005,
+      "ledger_hash": "00000000000000000000000000000000000000000000000000000000066C1AA5",
+      "validated": "matches",
+      "full": true,
+      "signing_key": "nHDffGxdB1yhbamZJFGJwJmZTrLJhvjL6gq2Sb8Xgp8mxLvs2tep",
+      "signing_time": "2026-10-19T16:00:41Z",
+      "first_datetime": "2026-10-19T16:00:41.250Z",
+      "last_datetime": "2026-10-19T16:00:41.750Z",
+      "count": 3
+    }
+  ]
+}
+```
+
+Keys of the validations answer, in order: `result, validation_public_key, count, marker, validations`.
+
+Keys of a validation, in order: `ledger_index, ledger_hash, validated, validated_hash, full, signing_key, signing_time, first_datetime, last_datetime, count`.
+
+| Key | Meaning |
+| --- | --- |
+| `count` (answer), `marker` | The validations of the page; `marker` only when more follow (and a `Link: <...>; rel="next"` header, as in every list). |
+| `validation_public_key` | The master key, base58. |
+| `ledger_index`, `ledger_hash` | The ledger that was validated: the hash the validator signed. |
+| `validated` | `matches`: the indexed ledger at that index has this hash. `different`: it has another, given as `validated_hash` (only then); the validator signed a ledger that is not the one of the indexed chain. `unknown`: no ledger is indexed at that index yet, or it lies outside the indexed history. |
+| `full` | `true` for a full validation, `false` for a partial one. A validation seen both ways is `true`. |
+| `signing_key`, `signing_time` | The signing key of the earliest sighting, and the time it signed (`YYYY-MM-DDTHH:mm:ssZ`; the validator sends it in seconds since 2000-01-01, which is converted). |
+| `first_datetime`, `last_datetime` | When a collector first and last saw the validation (`YYYY-MM-DDTHH:mm:ss.SSSZ`). |
+| `count` (validation) | How often the validation was seen: all the sightings, whatever key they were recorded under and however many partial rows they were written in. |
+
+The page is read as every other list is ([ADR-0004](adr/0004-keyset-pagination.md)): one read for each of the keys (the master and its signing keys) in the order of the
+table's key with a limit, so it costs what a page costs wherever it lies in the 7 days; the sightings are added up outside those reads, and the page is read again with more room when
+partial rows fill the room; then one lookup of the ledgers of the page. `Cache-Control: private, max-age=5`; with a `marker`: `private, max-age=300`.
+
+Errors: 400 `invalid validator public key`, `invalid marker`; 404 `Validator not found`; 500 `unable to retrieve validator(s)`.
+
 ### `GET /v2/network/amendments`
 
 Every amendment the network knows: the enabled ones, the ones with a majority, the ones validators are voting on, the obsolete ones and the ones

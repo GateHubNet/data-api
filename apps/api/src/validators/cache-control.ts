@@ -3,6 +3,15 @@ import { ApiConfig } from '../config/api.config';
 /** The `Cache-Control` of `/v2/network/validators` (the list, `/summary` and `/{key}`): private, and 30 s. */
 export const VALIDATORS_CACHE_CONTROL = 'private, max-age=30';
 
+/** The `Cache-Control` of `/v2/network/validators/{key}/validations`: private, and 5 s. */
+export const VALIDATIONS_CACHE_CONTROL = 'private, max-age=5';
+
+/**
+ * The `Cache-Control` of `/v2/network/validators/{key}/validations` when the request has a `marker`: private, and 300 s. A page
+ * behind a marker lies further back than the first one, where a validation is complete, so it is kept longer.
+ */
+export const VALIDATIONS_MARKER_CACHE_CONTROL = 'private, max-age=300';
+
 /** The `Cache-Control` of `/v2/network/amendments` and `/v2/network/amendments/{name}`: private, and 60 s. */
 export const AMENDMENTS_CACHE_CONTROL = 'private, max-age=60';
 

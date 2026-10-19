@@ -1,6 +1,7 @@
 import { Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { fixtureTransactions } from './support/fixtures';
+import { expectBoundedInOrderRead, isPageRead, tableReads } from './support/plans';
 import {
   BULK_BASES,
   BULK_LEDGERS,
@@ -13,6 +14,7 @@ import {
   markerOf,
   readsOf,
 } from './support/read-rows';
+import { fleet, insertManifests, insertSeen, insertValidatorValidations } from './support/validators-seed';
 
 /**
  * What a page of every paged list reads (Ruling R106, final review C1): about the granules the page needs, never the
@@ -25,11 +27,16 @@ import {
  * asked for a page of 5 that starts inside the bulk (a marker in the middle of the second part), ascending and
  * descending. `system.query_log` then says what every SELECT of the request on that table read.
  *
+ * `/v2/network/validators/{key}/validations` pages a validator that is several keys: its master key and the signing keys its
+ * manifests name, each read in the order of its own key and combined (the bulk of `validator_validations` has the three keys
+ * of one validator, a fourth key of another that has none, and the same ledger and hash under every key of the first).
+ *
  * A page touches one or two parts and ClickHouse reads whole granules (8192 rows; 1024 for `transactions`), a few of
  * each part it opens: `PAGE_READ_BOUND` is far below the 200,000 rows of one part, and far below what the old reads
  * took (most of the 800,000).
  */
 const PAGE_READ_BOUND = 40_000;
+const DAY_SECONDS = 86_400;
 
 /** The middle of the second part of the bulk: a marker there makes the page start inside the bulk. */
 const MID = BULK_BASES[1] + BULK_LEDGERS / 2;
@@ -55,6 +62,8 @@ describe('a page reads the granules it needs, not the range (read_rows over a bu
   let pair: Pair;
   let pairPath: string;
   const accounts: Record<string, string> = {};
+  /** The validators of the `validator_validations` bulk: a master with two signing keys, and one with none. */
+  const validators = { master: '', signing: [] as string[], lone: '' };
 
   /** The account with the most rows in a table of the mock ledgers. */
   async function busiest(table: Table): Promise<string> {
@@ -195,6 +204,39 @@ describe('a page reads the granules it needs, not the range (read_rows over a bu
         ORDER BY ledger_index, tx_index LIMIT 1`,
       { account: accounts.balances, t0 },
       (base) => keyed(base),
+    );
+
+    // validator_validations: the rows of a validator and of its two signing keys (a ledger of each, with one hash for all of
+    // them: they are one validation of the master), and of a validator with no signing key; the sightings are of an hour ago
+    const keys = fleet('xrpl', 5);
+    validators.master = keys[0].key;
+    validators.signing = [keys[1].ephemeral, keys[2].ephemeral];
+    validators.lone = keys[3].key;
+    const hourAgo = Math.floor(Date.now() / 1000) - 3600;
+    await insertManifests(h.ch, [
+      { ephemeral_key: validators.signing[0], master_key: validators.master, seq: 1 },
+      { ephemeral_key: validators.signing[1], master_key: validators.master, seq: 2 },
+    ]);
+    await insertSeen(h.ch, [
+      { key: validators.master, first: hourAgo - DAY_SECONDS, last: hourAgo },
+      { key: validators.lone, first: hourAgo - DAY_SECONDS, last: hourAgo },
+    ]);
+    await insertValidatorValidations(h.ch, [
+      { validation_public_key: validators.master, ledger_index: 20_999_999, first_datetime: hourAgo },
+    ]);
+    await insertBulk(
+      h,
+      Table.ValidatorValidations,
+      `SELECT * FROM ${Table.ValidatorValidations} ORDER BY validation_public_key, ledger_index LIMIT 1`,
+      {
+        master: validators.master,
+        signing0: validators.signing[0],
+        signing1: validators.signing[1],
+        lone: validators.lone,
+      },
+      (base) =>
+        `toUInt32(${base} + intDiv(n.number, 4)) AS ledger_index, ` +
+        `transform(n.number % 4, [0, 1, 2, 3], [{master:String}, {signing0:String}, {signing1:String}, {lone:String}], {master:String}) AS validation_public_key`,
     );
 
     // fee_stats: snapshots of the node, a second apart, a part in each of four months (the table is partitioned by month)
@@ -360,6 +402,67 @@ describe('a page reads the granules it needs, not the range (read_rows over a bu
     it('/v2/network/fees (ledgers)', async () => {
       const { body } = await expectBounded(Table.Ledgers, page('/v2/network/fees', [MID]), 'rows');
       expect((body.rows as unknown[]).length).toBe(5);
+    });
+
+    describe('/v2/network/validators/:key/validations (validator_validations)', () => {
+      /** A page of 200 validations, the default, that starts inside the bulk: the statement reads 201 rows. */
+      const validationsPage = async (key: string): Promise<string> => {
+        const [{ ledger_hash }] = await h.ch.query<{ ledger_hash: string }>(
+          `SELECT ledger_hash FROM ${Table.ValidatorValidations} WHERE ledger_index = {ledger:UInt32} LIMIT 1`,
+          { ledger: MID },
+        );
+        return `/v2/network/validators/${key}/validations?limit=200&descending=${descending}&marker=${markerOf([MID, ledger_hash])}`;
+      };
+
+      /** The statement of the page that a request sent to ClickHouse, with its bound values. */
+      const statementOf = async (path: string): Promise<{ sql: string; params: Record<string, unknown> }> => {
+        const spy = jest.spyOn(h.ch, 'query');
+        let calls: [string, Record<string, unknown>][] = [];
+        try {
+          await api.ok(path, 'validations');
+          calls = spy.mock.calls
+            .filter(([sql]) => isPageRead(String(sql)))
+            .map(([sql, params]) => [String(sql), params as Record<string, unknown>]);
+        } finally {
+          spy.mockRestore();
+        }
+        expect(calls).toHaveLength(1);
+        return { sql: calls[0][0], params: calls[0][1] };
+      };
+
+      it('reads about a granule of each part for each of the three keys of a master, and every validation is whole', async () => {
+        const path = await validationsPage(validators.master);
+        let body: { validations: { count: number }[]; marker?: string } = { validations: [] };
+        const reads = await readsOf(h, Table.ValidatorValidations, async () => {
+          body = (await api.ok(path, 'validations')).body;
+        });
+        // 200 validations, each the sightings under the master key and its two signing keys
+        expect(body.validations).toHaveLength(200);
+        expect(body.validations.map((row) => row.count)).toEqual(Array(200).fill(3));
+        expect(body.marker).toEqual(expect.any(String));
+        // the page is the read that groups by validation (the directory built for the request reads the table too, boundedly)
+        const pageReads = reads.filter((read) => /GROUP BY ledger_index, ledger_hash/.test(read.query));
+        expect(pageReads).toHaveLength(1);
+        // an inner read for each of the three keys, each within what a page of any other list reads
+        const bound = (1 + validators.signing.length) * PAGE_READ_BOUND;
+        expect([path, pageReads[0].read_rows <= bound ? 'bounded' : pageReads[0].read_rows]).toEqual([path, 'bounded']);
+      });
+
+      it('reads the table in the order of its key, with a limit: the one inner read of a validator with no signing key', async () => {
+        const { sql, params } = await statementOf(await validationsPage(validators.lone));
+        await expectBoundedInOrderRead(h, sql, params, descending, 'the validations of a validator with one key');
+      });
+
+      it('reads each of the three keys of a master in the order of the key, each with a limit', async () => {
+        const { sql, params } = await statementOf(await validationsPage(validators.master));
+        expect(await tableReads(h, sql, params)).toEqual(
+          Array(3).fill({
+            readType: descending ? 'InReverseOrder' : 'InOrder',
+            prefixSorted: true,
+            limit: params.distinct_page_cap,
+          }),
+        );
+      });
     });
 
     it('/v2/network/fee_stats (fee_stats)', async () => {

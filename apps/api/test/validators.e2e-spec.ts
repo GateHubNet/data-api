@@ -1,7 +1,8 @@
-import { Table } from '@gatehub/data-api-shared';
+import { RIPPLE_EPOCH_MS, Table } from '@gatehub/data-api-shared';
 import { join } from 'node:path';
 import type { Directory } from '../src/validators/directory';
 import { PUBLISHER_KEYS, SUMMARY_KEYS } from '../src/validators/summary-object';
+import { VALIDATION_ROW_KEYS, VALIDATIONS_BODY_KEYS } from '../src/validators/validation-row-object';
 import type { ValidatorDirectoryService } from '../src/validators/validator-directory.service';
 import {
   AGREEMENT_KEYS,
@@ -17,7 +18,7 @@ import {
 } from '../src/validators/validator-object';
 import { ApiClient, Harness, HarnessOptions, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
-import { BULK_BASES, BULK_PER_PART, insertBulk, LoggedRead, readsOf } from './support/read-rows';
+import { BULK_BASES, BULK_PER_PART, insertBulk, LoggedRead, markerOf, readsOf } from './support/read-rows';
 import {
   BOARD_IDS,
   BOARD_NAMES,
@@ -35,6 +36,8 @@ import {
   insertRound,
   insertSeen,
   insertState,
+  insertValidatorValidations,
+  ledgerRow,
   PUBLISHER_KEY,
   RC1,
   seedAmendmentBoard,
@@ -52,6 +55,10 @@ import {
  * `GET /v2/network/validators` and `GET /v2/network/validators/{key}` on the same fleet, on the board of the amendments
  * spec (the votes on the amendments, unknown ones included) and on Xahau: the scopes and filters of the list, its order,
  * markers and CSV, the detail by a master key, a signing key and 66 hex digits, and the failures.
+ *
+ * `GET /v2/network/validators/{key}/validations` on a master with signing keys, some of whose validations were recorded under
+ * them (merged into the master's), partial sightings, a fork, the window of 7 days, markers in both orders, CSV, `Cache-Control`
+ * and the failures, and on a page that duplicates and several keys fill (the read grows its room).
  *
  * The directory is cached for 10 s, so each scenario has an app of its own (the cache is the app's).
  */
@@ -2090,6 +2097,876 @@ describe('GET /v2/network/validators and /{key}: with GH_CACHE_CONTROL empty', (
     expect(list.status).toBe(200);
     expect(list.headers['cache-control']).toBeUndefined();
     const missing = await api.get(detailOf(fleet('xrpl', 1)[0].key));
+    expect(missing.status).toBe(404);
+    expect(missing.headers['cache-control']).toBe('no-store');
+  });
+});
+
+// ===================================================================================================================
+// the validations of a validator
+// ===================================================================================================================
+
+const validationsOf = (key: string): string => `${LIST}/${key}/validations`;
+
+/** The seconds from the Unix epoch to the Ripple epoch. */
+const RIPPLE_EPOCH = RIPPLE_EPOCH_MS / 1000;
+
+/** The cap of an inner read of a page of `limit` rows over a first read: the page and as much room again (16 at least). */
+const firstCap = (limit: number): number => limit + Math.max(limit, 16);
+
+/** Every statement the app sent to ClickHouse while `run` ran, with its bound values. */
+async function queriesDuring(h: Harness, run: () => Promise<unknown>): Promise<{ sql: string; params: any }[]> {
+  const queries: { sql: string; params: any }[] = [];
+  const original = h.ch.query.bind(h.ch);
+  const spy = jest.spyOn(h.ch, 'query').mockImplementation(((
+    sql: string,
+    params: Record<string, unknown> = {},
+    settings?: object,
+  ) => {
+    queries.push({ sql, params });
+    return original(sql, params, settings as never);
+  }) as never);
+  try {
+    await run();
+  } finally {
+    spy.mockRestore();
+  }
+  return queries;
+}
+
+/** The reads of a page of validations among the statements of a request (not the ones of the directory). */
+const pageReadsIn = (queries: { sql: string; params: any }[]): { sql: string; params: any }[] =>
+  queries.filter((query) => query.sql.includes('{distinct_page_cap:UInt32}'));
+
+describe('GET /v2/network/validators/{key}/validations: a master with signing keys (XRPL)', () => {
+  const [M, N, STRANGER] = fleet('xrpl', 3);
+  const QUIET = fleet('xrpl', 8)[7];
+  /** M's current signing key, an older one (rotated away) and one that a later manifest gave to N. */
+  const S1 = M.ephemeral;
+  const S0 = fleet('xrpl', 4)[3].ephemeral;
+  const REASSIGNED = fleet('xrpl', 5)[4].ephemeral;
+  /** A signing key of nobody: no manifest names it. */
+  const NOBODY = fleet('xrpl', 6)[5].ephemeral;
+
+  /** The ledger the scenario counts from. */
+  const L = 107_748_000;
+  const T0 = Math.floor(Date.now() / 1000) - 3 * HOUR;
+  /** When the `k`-th ledger of the scenario is validated: four seconds apart. `fraction` is exact in binary (.25, .5, .75). */
+  const at = (k: number, fraction = 0): number => T0 + k * 4 + fraction;
+  const signedAt = (seconds: number): number => Math.floor(seconds) - RIPPLE_EPOCH;
+  const hashOf = (ledger: number): string => ledger.toString(16).toUpperCase().padStart(64, '0');
+  /** A hash that the ledgers table does not hold at its index. */
+  const FORK = 'BB'.repeat(32);
+  const iso = (seconds: number): string => new Date(Math.round(seconds * 1000)).toISOString();
+  const wall = (seconds: number): string => `${iso(seconds).slice(0, 19)}Z`;
+
+  let h: Harness;
+  let api: ApiClient;
+  let page: Answer;
+  let ascending: Answer;
+
+  /** The validations of M that the scenario writes, in the order of the page, with what each must be served as. */
+  const expectedRows = [
+    // newest first; the fork of ledger 6 comes in descending order of hash: BB.. before the hash of the ledger
+    {
+      k: 7,
+      hash: hashOf(L + 7),
+      validated: 'matches',
+      full: false,
+      signing_key: S1,
+      first: at(7, 0.25),
+      last: at(7, 0.25),
+      signed: at(7),
+      count: 1,
+    },
+    {
+      k: 6,
+      hash: FORK,
+      validated: 'different',
+      validated_hash: hashOf(L + 6),
+      full: true,
+      signing_key: S1,
+      first: at(6, 0.5),
+      last: at(6, 0.5),
+      signed: at(6),
+      count: 1,
+    },
+    {
+      k: 6,
+      hash: hashOf(L + 6),
+      validated: 'matches',
+      full: true,
+      signing_key: S1,
+      first: at(6, 0.25),
+      last: at(6, 0.75),
+      signed: at(6),
+      count: 2,
+    },
+    // recorded under the old signing key first (the earliest sighting), then under the master
+    {
+      k: 5,
+      hash: hashOf(L + 5),
+      validated: 'matches',
+      full: true,
+      signing_key: S0,
+      first: at(5, 0.25),
+      last: at(5, 0.75),
+      signed: at(5),
+      count: 3,
+    },
+    // under the master first, then under the old signing key: the sum is the same, the signing key is the earliest's
+    {
+      k: 4,
+      hash: hashOf(L + 4),
+      validated: 'matches',
+      full: true,
+      signing_key: S1,
+      first: at(4, 0.25),
+      last: at(4, 0.75),
+      signed: at(4),
+      count: 3,
+    },
+    // under the current signing key only: its manifest was not known when the collector recorded it
+    {
+      k: 3,
+      hash: hashOf(L + 3),
+      validated: 'matches',
+      full: true,
+      signing_key: S1,
+      first: at(3, 0.5),
+      last: at(3, 0.5),
+      signed: at(3),
+      count: 1,
+    },
+    // two partial sightings of the master, in two inserts: they add up; the ledger is not indexed
+    {
+      k: 2,
+      hash: hashOf(L + 2),
+      validated: 'unknown',
+      full: true,
+      signing_key: S1,
+      first: at(2, 0.25),
+      last: at(2, 0.75),
+      signed: at(2),
+      count: 3,
+    },
+    // one full validation
+    {
+      k: 1,
+      hash: hashOf(L + 1),
+      validated: 'matches',
+      full: true,
+      signing_key: S1,
+      first: at(1, 0.25),
+      last: at(1, 0.25),
+      signed: at(1),
+      count: 1,
+    },
+    // six days old: still in the window
+    {
+      k: 0,
+      hash: hashOf(L),
+      validated: 'matches',
+      full: true,
+      signing_key: S1,
+      first: T0 - 6 * DAY,
+      last: T0 - 6 * DAY,
+      signed: T0 - 6 * DAY,
+      count: 1,
+    },
+  ];
+  const served = (rows: typeof expectedRows): Record<string, unknown>[] =>
+    rows.map((row) => ({
+      ledger_index: L + row.k,
+      ledger_hash: row.hash,
+      validated: row.validated,
+      ...(row.validated_hash === undefined ? {} : { validated_hash: row.validated_hash }),
+      full: row.full,
+      signing_key: row.signing_key,
+      signing_time: wall(row.signed),
+      first_datetime: iso(row.first),
+      last_datetime: iso(row.last),
+      count: row.count,
+    }));
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xrpl', env: NO_RATE_LIMIT });
+    api = await h.api();
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.ValidatorValidations}`);
+    await insertManifests(h.ch, [
+      { ephemeral_key: S0, master_key: M.key, seq: 1 },
+      { ephemeral_key: S1, master_key: M.key, seq: 2 },
+      { ephemeral_key: N.ephemeral, master_key: N.key, seq: 1 },
+      // the newest manifest of this signing key names N: it is N's now
+      { ephemeral_key: REASSIGNED, master_key: M.key, seq: 1 },
+      { ephemeral_key: REASSIGNED, master_key: N.key, seq: 2 },
+    ]);
+    await insertSeen(h.ch, [
+      { key: M.key, first: T0 - 30 * DAY, last: at(7), ledger: L + 7 },
+      { key: N.key, first: T0 - 30 * DAY, last: at(7), ledger: L + 7 },
+      // seen, 20 days ago, and nothing since: no validation in the last 7 days, and no signing key
+      { key: QUIET.key, first: T0 - 30 * DAY, last: T0 - 20 * DAY },
+    ]);
+    // the ledgers the indexer holds: all but L+2 (not indexed); its hash at L+6 is the one that is not the fork's
+    await h.ch.insert(
+      Table.Ledgers,
+      [0, 1, 3, 4, 5, 6, 7].map((k) => ledgerRow(L + k, at(k))),
+    );
+
+    const sighting = (
+      key: string,
+      k: number,
+      o: {
+        first: number;
+        last?: number;
+        count?: number;
+        full?: number;
+        signing?: string;
+        hash?: string;
+        signed?: number;
+      },
+    ) => ({
+      validation_public_key: key,
+      ledger_index: L + k,
+      ledger_hash: o.hash ?? hashOf(L + k),
+      first_datetime: o.first,
+      last_datetime: o.last ?? o.first,
+      count: o.count ?? 1,
+      full: o.full ?? 1,
+      ephemeral_public_key: o.signing ?? S1,
+      signing_time: signedAt(o.signed ?? at(k)),
+    });
+    const insert = (...rows: ReturnType<typeof sighting>[]): Promise<void> => insertValidatorValidations(h.ch, rows);
+
+    await insert(sighting(M.key, 0, { first: T0 - 6 * DAY, signed: T0 - 6 * DAY }));
+    // eight days old: out of the window
+    await insert(sighting(M.key, -100, { first: T0 - 8 * DAY }));
+    await insert(sighting(M.key, 1, { first: at(1, 0.25) }));
+    // the same ledger and hash, another validator: not M's
+    await insert(sighting(N.key, 1, { first: at(1, 0.5), count: 7, signing: N.ephemeral }));
+    // two partial sightings, two inserts: 1 + 2
+    await insert(sighting(M.key, 2, { first: at(2, 0.25), last: at(2, 0.5), count: 1, full: 0 }));
+    await insert(
+      sighting(M.key, 2, { first: at(2, 0.5), last: at(2, 0.75), count: 2, full: 1, signing: S0, signed: at(2) + 1 }),
+    );
+    // under the signing key only
+    await insert(sighting(S1, 3, { first: at(3, 0.5) }));
+    // the master's row first, the old signing key's later
+    await insert(sighting(M.key, 4, { first: at(4, 0.25), last: at(4, 0.5), count: 1 }));
+    await insert(sighting(S0, 4, { first: at(4, 0.5), last: at(4, 0.75), count: 2, signing: S0, signed: at(4) + 1 }));
+    // the old signing key's row first, the master's later
+    await insert(sighting(S0, 5, { first: at(5, 0.25), last: at(5, 0.5), count: 2, signing: S0 }));
+    await insert(
+      sighting(M.key, 5, { first: at(5, 0.5), last: at(5, 0.75), count: 1, signing: S1, signed: at(5) + 1 }),
+    );
+    // a fork: two hashes for one ledger, one of them the ledger the indexer holds; the master and the signing key both saw it
+    await insert(sighting(M.key, 6, { first: at(6, 0.25), last: at(6, 0.5), count: 1 }));
+    await insert(sighting(S1, 6, { first: at(6, 0.5), last: at(6, 0.75), count: 1 }));
+    await insert(sighting(M.key, 6, { first: at(6, 0.5), hash: FORK }));
+    // a partial validation
+    await insert(sighting(M.key, 7, { first: at(7, 0.25), full: 0 }));
+    // the signing key a later manifest gave to N, one nobody knows, and a validator nobody knows
+    await insert(sighting(REASSIGNED, 3, { first: at(3, 0.25), count: 5 }));
+    await insert(sighting(NOBODY, 3, { first: at(3, 0.25), count: 9, signing: NOBODY }));
+    await insert(sighting(STRANGER.key, 2, { first: at(2, 0.25), count: 11 }));
+
+    page = await api.get(validationsOf(M.key));
+    ascending = await api.get(`${validationsOf(M.key)}?descending=false`);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('answers the validations of the last 7 days of the master, newest first', () => {
+    expect(page.status).toBe(200);
+    expect(page.body).toEqual({
+      result: 'success',
+      validation_public_key: M.key,
+      count: 9,
+      validations: served(expectedRows),
+    });
+    expect(page.body).not.toHaveProperty('marker');
+    expect(page.headers.link).toBeUndefined();
+  });
+
+  it('lists the keys of the answer in the order of VALIDATIONS_BODY_KEYS and those of a validation in the order of VALIDATION_ROW_KEYS', () => {
+    expect(Object.keys(page.body)).toEqual(orderedBy(VALIDATIONS_BODY_KEYS, page.body));
+    for (const row of page.body.validations) expect(Object.keys(row)).toEqual(orderedBy(VALIDATION_ROW_KEYS, row));
+    const different = page.body.validations.find((row: { validated: string }) => row.validated === 'different');
+    expect(Object.keys(different)).toEqual([...VALIDATION_ROW_KEYS]);
+    expect(JSON.stringify(page.body)).not.toContain('null');
+  });
+
+  it('says matches, different (with the hash of the ledger) and unknown', () => {
+    const verdicts = page.body.validations.map((row: Record<string, string>) => [
+      row.ledger_index,
+      row.validated,
+      row.validated_hash,
+    ]);
+    expect(verdicts).toEqual([
+      [L + 7, 'matches', undefined],
+      [L + 6, 'different', hashOf(L + 6)],
+      [L + 6, 'matches', undefined],
+      [L + 5, 'matches', undefined],
+      [L + 4, 'matches', undefined],
+      [L + 3, 'matches', undefined],
+      [L + 2, 'unknown', undefined],
+      [L + 1, 'matches', undefined],
+      [L, 'matches', undefined],
+    ]);
+  });
+
+  it('adds up the partial sightings: two inserts of 1 and 2 are a count of 3, full once one of them is', () => {
+    const row = page.body.validations.find((each: { ledger_index: number }) => each.ledger_index === L + 2);
+    expect(row).toMatchObject({
+      count: 3,
+      full: true,
+      first_datetime: iso(at(2, 0.25)),
+      last_datetime: iso(at(2, 0.75)),
+    });
+    expect(row.signing_key).toBe(S1);
+    expect(row.signing_time).toBe(wall(at(2)));
+  });
+
+  it('keeps the milliseconds of the first and the last sighting, and converts the signing time of the validator', () => {
+    const row = page.body.validations.find((each: { ledger_index: number }) => each.ledger_index === L + 4);
+    expect(row.first_datetime).toBe(iso(at(4, 0.25)));
+    expect(row.last_datetime).toBe(iso(at(4, 0.75)));
+    expect(row.first_datetime).toMatch(MILLIS);
+    expect(row.signing_time).toBe(wall(at(4)));
+    expect(row.signing_time).not.toMatch(/\./);
+  });
+
+  it('merges the rows recorded under a signing key of the master into its own: the sum, the extremes, the earliest sighting', () => {
+    const byLedger = (k: number): Record<string, any>[] =>
+      page.body.validations.filter((row: { ledger_index: number }) => row.ledger_index === L + k);
+    // L+3 exists only under the signing key
+    expect(byLedger(3)).toEqual(served(expectedRows.filter((row) => row.k === 3)));
+    // L+4: the master first, then the old signing key; L+5: the other way round
+    expect(byLedger(4)[0]).toMatchObject({
+      count: 3,
+      signing_key: S1,
+      first_datetime: iso(at(4, 0.25)),
+      last_datetime: iso(at(4, 0.75)),
+    });
+    expect(byLedger(5)[0]).toMatchObject({
+      count: 3,
+      signing_key: S0,
+      first_datetime: iso(at(5, 0.25)),
+      last_datetime: iso(at(5, 0.75)),
+    });
+    // the fork: the hash the master and the signing key both saw is one row of count 2
+    expect(byLedger(6).map((row) => [row.ledger_hash === FORK, row.count])).toEqual([
+      [true, 1],
+      [false, 2],
+    ]);
+  });
+
+  it('leaves out another validator, a signing key a later manifest gave to another master, an unknown key, and a row of 8 days ago', () => {
+    const indices = page.body.validations.map((row: { ledger_index: number }) => row.ledger_index);
+    expect(indices).not.toContain(L - 100);
+    // the count of ledger L+1 is M's own: N's sighting of the same ledger (7) is not in it
+    expect(page.body.validations.find((row: { ledger_index: number }) => row.ledger_index === L + 1).count).toBe(1);
+    // the sightings under REASSIGNED (5), NOBODY (9) and the stranger (11) are in no count
+    expect(page.body.validations.find((row: { ledger_index: number }) => row.ledger_index === L + 3).count).toBe(1);
+    expect(page.body.validations.find((row: { ledger_index: number }) => row.ledger_index === L + 2).count).toBe(3);
+  });
+
+  it('gives N the validations recorded under the signing key that a later manifest gave to N, with its own', async () => {
+    const res = await api.get(validationsOf(N.key));
+    expect(res.status).toBe(200);
+    expect(res.body.validation_public_key).toBe(N.key);
+    expect(
+      res.body.validations.map((row: { ledger_index: number; count: number }) => [row.ledger_index, row.count]),
+    ).toEqual([
+      [L + 3, 5],
+      [L + 1, 7],
+    ]);
+  });
+
+  it('lists the oldest first with descending=false, the hashes of one ledger in ascending order', () => {
+    expect(ascending.status).toBe(200);
+    expect(ascending.body.validations).toEqual(served([...expectedRows].reverse()));
+  });
+
+  it.each(['false', 'FALSE', 'xfalsex'])('reads descending=%s as false', async (text) => {
+    const res = await api.get(`${validationsOf(M.key)}?descending=${text}`);
+    expect(res.body.validations).toEqual(ascending.body.validations);
+  });
+
+  it.each(['true', '0', '', 'no', '1'])(
+    'reads descending=%s as true: only the text false turns it off',
+    async (text) => {
+      const res = await api.get(`${validationsOf(M.key)}?descending=${text}`);
+      expect(res.body.validations).toEqual(page.body.validations);
+    },
+  );
+
+  describe('paging', () => {
+    it.each([1, 2, 3, 4])('concatenates the pages of limit=%i to the unpaged list, newest first', async (limit) => {
+      const pages = await api.pages<Answer['body']>(validationsOf(M.key), limit, 'validations');
+      expect(pages.flatMap((each) => each.validations)).toEqual(page.body.validations);
+      for (const each of pages.slice(0, -1)) {
+        expect(each.count).toBe(limit);
+        expect(each.marker).toEqual(expect.any(String));
+      }
+      expect(pages[pages.length - 1]).not.toHaveProperty('marker');
+      expect(pages).toHaveLength(Math.ceil(9 / limit));
+    });
+
+    it.each([1, 2, 3, 4])('concatenates the pages of limit=%i to the unpaged list, oldest first', async (limit) => {
+      const pages = await api.pages<Answer['body']>(`${validationsOf(M.key)}?descending=false`, limit, 'validations');
+      expect(pages.flatMap((each) => each.validations)).toEqual(ascending.body.validations);
+    });
+
+    it('has the marker of the last row, base64url of [ledger_index, ledger_hash], and the Link header', async () => {
+      const first = await api.get(`${validationsOf(M.key)}?limit=2`);
+      expect(first.body.count).toBe(2);
+      expect(Object.keys(first.body)).toEqual([...VALIDATIONS_BODY_KEYS]);
+      expect(JSON.parse(Buffer.from(first.body.marker, 'base64url').toString('utf8'))).toEqual([L + 6, FORK]);
+      expect(first.headers.link).toMatch(
+        new RegExp(`^<http://[^>]+${validationsOf(M.key)}\\?limit=2&marker=${first.body.marker}>; rel="next"$`),
+      );
+    });
+
+    it('puts the hashes of one ledger either side of a marker in the right page', async () => {
+      // a marker on the first hash of ledger L+6 (the fork): the next page starts with the other hash of that ledger
+      const marker = markerOf([L + 6, FORK]);
+      const next = await api.get(`${validationsOf(M.key)}?limit=2&marker=${marker}`);
+      expect(
+        next.body.validations.map((row: { ledger_index: number; ledger_hash: string }) => [
+          row.ledger_index,
+          row.ledger_hash,
+        ]),
+      ).toEqual([
+        [L + 6, hashOf(L + 6)],
+        [L + 5, hashOf(L + 5)],
+      ]);
+      const up = await api.get(
+        `${validationsOf(M.key)}?limit=2&descending=false&marker=${markerOf([L + 6, hashOf(L + 6)])}`,
+      );
+      expect(
+        up.body.validations.map((row: { ledger_index: number; ledger_hash: string }) => [
+          row.ledger_index,
+          row.ledger_hash,
+        ]),
+      ).toEqual([
+        [L + 6, FORK],
+        [L + 7, hashOf(L + 7)],
+      ]);
+    });
+
+    it('resumes after a marker whose row is gone', async () => {
+      const res = await api.get(`${validationsOf(M.key)}?marker=${markerOf([L + 4, 'FFFF'])}`);
+      expect(res.body.validations.map((row: { ledger_index: number }) => row.ledger_index)).toEqual([
+        L + 4,
+        L + 3,
+        L + 2,
+        L + 1,
+        L,
+      ]);
+    });
+
+    it('takes limit as it is taken everywhere: 200 by default, 1000 at most', async () => {
+      expect((await api.get(`${validationsOf(M.key)}?limit=0`)).body.count).toBe(9);
+      expect((await api.get(`${validationsOf(M.key)}?limit=5000`)).body.count).toBe(9);
+      expect((await api.get(`${validationsOf(M.key)}?limit=4`)).body.count).toBe(4);
+    });
+
+    it('answers a marker it cannot read with 400 invalid marker', async () => {
+      const bad = [
+        '%25%25%25',
+        Buffer.from('[1]').toString('base64url'),
+        Buffer.from('[1,"A","B"]').toString('base64url'),
+        Buffer.from('["1","A"]').toString('base64url'),
+        Buffer.from('[1,2]').toString('base64url'),
+        Buffer.from('{"a":1}').toString('base64url'),
+        Buffer.from('[-1,"A"]').toString('base64url'),
+      ];
+      for (const marker of bad) {
+        const res = await api.get(`${validationsOf(M.key)}?marker=${marker}`);
+        expect([marker, res.status, res.body]).toEqual([marker, 400, { result: 'error', message: 'invalid marker' }]);
+        expect(res.headers['cache-control']).toBe('no-store');
+      }
+    });
+  });
+
+  describe('the key of the path', () => {
+    it('answers a signing key of the master, the current one and an older one, with the master and its rows', async () => {
+      for (const key of [S1, S0]) {
+        const res = await api.get(validationsOf(key));
+        expect([key, res.status]).toEqual([key, 200]);
+        expect(res.body).toEqual(page.body);
+      }
+    });
+
+    it('answers 66 hex digits, in either case, of the master or of a signing key', async () => {
+      for (const key of [M.master.publicKeyHex, M.master.publicKeyHex.toLowerCase(), M.signing.publicKeyHex]) {
+        const res = await api.get(validationsOf(key));
+        expect([key, res.status]).toEqual([key, 200]);
+        expect(res.body).toEqual(page.body);
+      }
+    });
+
+    it('answers the signing key a later manifest gave to N with N, and not with M', async () => {
+      const res = await api.get(validationsOf(REASSIGNED));
+      expect(res.body.validation_public_key).toBe(N.key);
+    });
+
+    it('answers a validator seen with no validation in the last 7 days with an empty page', async () => {
+      const res = await api.get(validationsOf(QUIET.key));
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ result: 'success', validation_public_key: QUIET.key, count: 0, validations: [] });
+      expect(res.headers['cache-control']).toBe('private, max-age=5');
+    });
+
+    it('answers a key of the right form that nobody knows with 404 Validator not found', async () => {
+      for (const key of [STRANGER.key, STRANGER.ephemeral, NOBODY, STRANGER.master.publicKeyHex]) {
+        const res = await api.get(validationsOf(key));
+        expect([key, res.status, res.body]).toEqual([key, 404, { result: 'error', message: 'Validator not found' }]);
+        expect(res.headers['cache-control']).toBe('no-store');
+      }
+    });
+
+    it('answers a key that is none with 400 invalid validator public key, before anything is read', async () => {
+      const queries = await queriesDuring(h, async () => {
+        for (const key of [
+          'nothing',
+          'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh',
+          'summary',
+          M.key.slice(0, -2),
+          `${M.master.publicKeyHex}00`,
+        ]) {
+          const res = await api.get(validationsOf(key));
+          expect([key, res.status, res.body]).toEqual([
+            key,
+            400,
+            { result: 'error', message: 'invalid validator public key' },
+          ]);
+          expect(res.headers['cache-control']).toBe('no-store');
+        }
+      });
+      expect(queries).toEqual([]);
+    });
+
+    it('checks the key before the marker: a key nobody knows is 404 even with a marker that is none', async () => {
+      const res = await api.get(`${validationsOf(STRANGER.key)}?marker=%25%25`);
+      expect([res.status, res.body]).toEqual([404, { result: 'error', message: 'Validator not found' }]);
+      const bad = await api.get(`${validationsOf('nothing')}?marker=%25%25`);
+      expect([bad.status, bad.body.message]).toEqual([400, 'invalid validator public key']);
+    });
+  });
+
+  describe('format=csv', () => {
+    const cells = (line: string): string[] => line.split(',').map((cell) => cell.replace(/^"|"$/g, ''));
+    let csv: Answer;
+
+    beforeAll(async () => {
+      csv = await api.get(`${validationsOf(M.key)}?format=csv`);
+    });
+
+    it('is <key> - validations.csv, one row for each validation of the page', () => {
+      expect(csv.status).toBe(200);
+      expect(csv.headers['content-type']).toMatch(/^text\/csv/);
+      expect(csv.headers['content-disposition']).toBe(csvDisposition(`${M.key} - validations`));
+      expect(csv.text.split('\n')).toHaveLength(1 + 9);
+    });
+
+    it('has a column for each key of a validation, in the order of first appearance', () => {
+      const [header, newest, fork] = csv.text.split('\n');
+      // the columns come in the order of first appearance: validated_hash first appears with the fork, the second row of the page
+      expect(cells(header)).toEqual([
+        ...VALIDATION_ROW_KEYS.filter((key) => key !== 'validated_hash'),
+        'validated_hash',
+      ]);
+      expect(cells(newest)[0]).toBe(String(L + 7));
+      expect(cells(fork)[cells(header).indexOf('validated_hash')]).toBe(hashOf(L + 6));
+    });
+
+    it('is named after the master key when the path has a signing key, and follows the page', async () => {
+      const res = await api.get(`${validationsOf(S0)}?format=csv&limit=2`);
+      expect(res.headers['content-disposition']).toBe(csvDisposition(`${M.key} - validations`));
+      expect(res.text.split('\n')).toHaveLength(3);
+      expect(res.headers.link).toMatch(/rel="next"/);
+    });
+
+    it('sends Cache-Control: private, max-age=5 as the JSON does', () => {
+      expect(csv.headers['cache-control']).toBe('private, max-age=5');
+    });
+  });
+
+  describe('Cache-Control', () => {
+    it('is private, max-age=5 without a marker', () => {
+      expect(page.headers['cache-control']).toBe('private, max-age=5');
+      expect(ascending.headers['cache-control']).toBe('private, max-age=5');
+    });
+
+    it('is private, max-age=300 with a marker: a page far back does not change', async () => {
+      const first = await api.get(`${validationsOf(M.key)}?limit=2`);
+      expect(first.headers['cache-control']).toBe('private, max-age=5');
+      const next = await api.get(`${validationsOf(M.key)}?limit=2&marker=${first.body.marker}`);
+      expect(next.headers['cache-control']).toBe('private, max-age=300');
+      const csv = await api.get(`${validationsOf(M.key)}?limit=2&format=csv&marker=${first.body.marker}`);
+      expect(csv.headers['cache-control']).toBe('private, max-age=300');
+    });
+
+    it('is no-store on an error whatever the marker', async () => {
+      const bad = await api.get(`${validationsOf(M.key)}?marker=%25%25`);
+      expect(bad.headers['cache-control']).toBe('no-store');
+    });
+  });
+
+  describe('the reads', () => {
+    it('reads one capped inner read for each key of the master, in the order of the key, each once for a page', async () => {
+      const reads = pageReadsIn(await queriesDuring(h, () => api.get(`${validationsOf(M.key)}?limit=3`)));
+      expect(reads).toHaveLength(1);
+      const [{ sql, params }] = reads;
+      // the master and its two signing keys (the third, REASSIGNED, belongs to N)
+      expect(params.distinct_page_cap).toBe(firstCap(3));
+      expect(sql.match(/ORDER BY validation_public_key DESC, ledger_index DESC, ledger_hash DESC/g)).toHaveLength(3);
+      expect(sql.match(/LIMIT \{distinct_page_cap:UInt32\}/g)).toHaveLength(3);
+      expect(sql.match(/UNION ALL/g)).toHaveLength(2);
+      expect([params.key0, params.key1, params.key2].sort()).toEqual([M.key, S0, S1].sort());
+      expect(params.key3).toBeUndefined();
+    });
+
+    it('reads a validator that has no signing key with one inner read, in ascending order of the key for the oldest first', async () => {
+      const reads = pageReadsIn(
+        await queriesDuring(h, () => api.get(`${validationsOf(QUIET.key)}?descending=false&limit=1`)),
+      );
+      expect(reads).toHaveLength(1);
+      const [{ sql }] = reads;
+      expect(sql.match(/LIMIT \{distinct_page_cap:UInt32\}/g)).toHaveLength(1);
+      expect(sql).not.toContain('UNION');
+      expect(sql).toContain('ORDER BY validation_public_key ASC, ledger_index ASC, ledger_hash ASC');
+      expect(sql).not.toContain('DESC');
+    });
+
+    it('binds its values, uses no FINAL, takes its tables from the Table enum, and names no aggregate after its own column', async () => {
+      const queries = await queriesDuring(h, () =>
+        api.get(`${validationsOf(M.key)}?limit=2&marker=${markerOf([L + 6, hashOf(L + 6)])}`),
+      );
+      const tables = Object.values(Table) as string[];
+      const own = queries.filter(
+        ({ sql }) => sql.includes('{distinct_page_cap:UInt32}') || sql.includes('{indexes:Array(UInt32)}'),
+      );
+      expect(own).toHaveLength(2);
+      for (const { sql } of own) {
+        expect(sql).not.toMatch(/\bFINAL\b/i);
+        for (const [, name] of sql.matchAll(/\b(?:FROM|JOIN)\s+([a-z_][a-z_0-9.]*)/gi)) expect(tables).toContain(name);
+        expect(sql).not.toMatch(/\bnH[1-9A-HJ-NP-Za-km-z]{20,}/);
+        expect(sql).not.toContain(String(L));
+        expect(sql).not.toMatch(/\bAS (count|full|signing_time|first_datetime|last_datetime|ephemeral_public_key)\b/);
+      }
+    });
+
+    it('looks the ledgers up once, by the indices of the page and not those of the row that only tells there is more', async () => {
+      const queries = await queriesDuring(h, () => api.get(`${validationsOf(M.key)}?limit=4`));
+      const lookups = queries.filter(({ sql }) => sql.includes('{indexes:Array(UInt32)}'));
+      expect(lookups).toHaveLength(1);
+      expect(lookups[0].sql).toMatch(/FROM ledgers\b/);
+      expect([...lookups[0].params.indexes].map(Number).sort()).toEqual([L + 5, L + 6, L + 7]);
+    });
+  });
+});
+
+describe('GET /v2/network/validators/{key}/validations: a page that duplicates and several keys fill (XRPL)', () => {
+  // M has partial sightings: ledgers 100..61 three times each; its old signing key has ledger 100..90 once, with a count of 2
+  const [M] = fleet('xrpl', 1);
+  const S0 = fleet('xrpl', 2)[1].ephemeral;
+  const BASE = 107_800_000;
+  let h: Harness;
+  let api: ApiClient;
+
+  /**
+   * One sighting of each ledger from `from` to `to`, in one insert. The rows of one insert are merged by the table when they
+   * have the same key (`optimize_on_insert`), so a ledger seen several times is several inserts.
+   */
+  const sightings = (
+    key: string,
+    from: number,
+    to: number,
+    count: number,
+  ): Parameters<typeof insertValidatorValidations>[1] =>
+    range(from, to).map((ledger) => ({
+      validation_public_key: key,
+      ledger_index: BASE + ledger,
+      first_datetime: Date.now() / 1000 - 600 + (ledger % 50) / 64,
+      count,
+      ephemeral_public_key: key,
+    }));
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xrpl', env: NO_RATE_LIMIT });
+    api = await h.api();
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.ValidatorValidations}`);
+    const now = Date.now() / 1000;
+    await insertManifests(h.ch, [{ ephemeral_key: S0, master_key: M.key, seq: 1 }]);
+    await insertSeen(h.ch, [{ key: M.key, first: now - DAY, last: now - 60 }]);
+    // ledgers 61 to 100 seen three times by the master (three partial validations), 90 to 100 once by its old signing key
+    for (let copy = 0; copy < 3; copy++) await insertValidatorValidations(h.ch, sightings(M.key, 61, 100, 1));
+    await insertValidatorValidations(h.ch, sightings(S0, 90, 100, 2));
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('reads again with more room when the duplicates of the first read leave fewer rows than the page', async () => {
+    let body: Answer['body'] = {};
+    const reads = pageReadsIn(
+      await queriesDuring(h, async () => {
+        body = (await api.ok(`${validationsOf(M.key)}?limit=10`, 'validations')).body;
+      }),
+    );
+    // 10 rows and room for 16 more: 26 rows of the master are 8 ledgers and 2 of the 9th, which the signing key's row would
+    // have completed: only the 8 before it are sure, so the page is read again, with four times the room
+    expect(reads.map((read) => read.params.distinct_page_cap)).toEqual([26, 74]);
+    expect(body.validations.map((row: { ledger_index: number }) => row.ledger_index)).toEqual(
+      range(0, 9).map((i) => BASE + 100 - i),
+    );
+    // every ledger of the page is whole: 3 sightings of the master and the signing key's 2 down to ledger 90
+    expect(body.validations.map((row: { count: number }) => row.count)).toEqual(Array(10).fill(5));
+    expect(body.marker).toEqual(expect.any(String));
+  });
+
+  it('reads again with more room in ascending order too: the least ledgers, each whole', async () => {
+    let body: Answer['body'] = {};
+    const reads = pageReadsIn(
+      await queriesDuring(h, async () => {
+        body = (await api.ok(`${validationsOf(M.key)}?limit=10&descending=false`, 'validations')).body;
+      }),
+    );
+    // 26 rows of the master are the ledgers 61 to 68 and two of 69 (the signing key has none of them), so 8 are sure
+    expect(reads.map((read) => read.params.distinct_page_cap)).toEqual([26, 74]);
+    expect(
+      body.validations.map((row: { ledger_index: number; count: number }) => [row.ledger_index, row.count]),
+    ).toEqual(range(61, 70).map((ledger) => [BASE + ledger, 3]));
+  });
+
+  it('adds up the sightings of every page of a walk, each ledger once, in both orders', async () => {
+    for (const descending of [true, false]) {
+      const pages = await api.pages<Answer['body']>(
+        `${validationsOf(M.key)}?descending=${descending}`,
+        7,
+        'validations',
+      );
+      const rows = pages.flatMap((each) => each.validations);
+      const expected = range(61, 100).map((ledger) => [BASE + ledger, ledger >= 90 ? 5 : 3]);
+      if (descending) expected.reverse();
+      expect([descending, rows.map((row) => [row.ledger_index, row.count])]).toEqual([descending, expected]);
+    }
+  });
+
+  it('serves a page of one ledger written many times: 40 sightings are a count of 40', async () => {
+    const ledger = BASE + 500;
+    for (let copy = 0; copy < 40; copy++) {
+      await insertValidatorValidations(h.ch, [
+        { validation_public_key: M.key, ledger_index: ledger, first_datetime: Date.now() / 1000 - 100, count: 1 },
+      ]);
+    }
+    const reads = pageReadsIn(
+      await queriesDuring(h, async () => {
+        const res = await api.ok(`${validationsOf(M.key)}?limit=2`, 'validations');
+        expect(
+          res.body.validations.map((row: { ledger_index: number; count: number }) => [row.ledger_index, row.count]),
+        ).toEqual([
+          [ledger, 40],
+          [BASE + 100, 5],
+        ]);
+      }),
+    );
+    // 18 rows are all the ledger's; 66 hold it whole and more
+    expect(reads.map((read) => read.params.distinct_page_cap)).toEqual([18, 66]);
+  });
+});
+
+describe('GET /v2/network/validators/{key}/validations: when ClickHouse fails', () => {
+  const [M] = fleet('xrpl', 1);
+  let h: Harness;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xrpl', env: NO_RATE_LIMIT });
+    await insertSeen(h.ch, [{ key: M.key, first: Date.now() / 1000 - DAY, last: Date.now() / 1000 - 60 }]);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('is a failure of the route: 500 unable to retrieve validator(s), no-store, the cause not sent', async () => {
+    const api = await h.api();
+    // the directory first: it is kept for 10 s, so the failure below is the read of the page
+    expect((await api.get(validationsOf(M.key))).status).toBe(200);
+    const original = h.ch.query.bind(h.ch);
+    jest
+      .spyOn(h.ch, 'query')
+      .mockImplementation(((sql: string, params?: Record<string, unknown>, s?: object) =>
+        sql.includes('distinct_page_cap')
+          ? Promise.reject(new Error('Code: 241. Memory limit exceeded'))
+          : original(sql, params, s as never)) as never);
+    for (const path of [validationsOf(M.key), `${validationsOf(M.key)}?format=csv`]) {
+      const failed = await api.get(path);
+      expect([path, failed.status, failed.body]).toEqual([
+        path,
+        500,
+        { result: 'error', message: 'unable to retrieve validator(s)' },
+      ]);
+      expect(failed.headers['cache-control']).toBe('no-store');
+      expect(JSON.stringify(failed.body)).not.toContain('Memory limit');
+    }
+    // a key that is none, and a marker that is none, are refused before the read
+    expect((await api.get(validationsOf('nothing'))).status).toBe(400);
+    expect((await api.get(`${validationsOf(M.key)}?marker=%25%25`)).body).toEqual({
+      result: 'error',
+      message: 'invalid marker',
+    });
+    jest.restoreAllMocks();
+    expect((await api.get(validationsOf(M.key))).status).toBe(200);
+  });
+
+  it('is 500 too when the directory cannot be read', async () => {
+    const fresh = await startHarness({ seed: 'none', network: 'xrpl', env: NO_RATE_LIMIT });
+    try {
+      jest.spyOn(fresh.ch, 'query').mockRejectedValue(new Error('Code: 241. Memory limit exceeded'));
+      const failed = await (await fresh.api()).get(validationsOf(M.key));
+      expect([failed.status, failed.body]).toEqual([
+        500,
+        { result: 'error', message: 'unable to retrieve validator(s)' },
+      ]);
+    } finally {
+      jest.restoreAllMocks();
+      await fresh.close();
+    }
+  });
+
+  it('requires the API key', async () => {
+    const res = await h.http().get(validationsOf(M.key));
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ result: 'error', message: 'Missing or invalid API key.' });
+  });
+});
+
+describe('GET /v2/network/validators/{key}/validations: with GH_CACHE_CONTROL empty', () => {
+  const [M] = fleet('xrpl', 1);
+  let h: Harness;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', env: { ...NO_RATE_LIMIT, GH_CACHE_CONTROL: '' } });
+    await insertSeen(h.ch, [{ key: M.key, first: Date.now() / 1000 - DAY, last: Date.now() / 1000 - 60 }]);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('sends no Cache-Control on a success, with a marker or without, and no-store on an error', async () => {
+    const api = await h.api();
+    const ok = await api.get(validationsOf(M.key));
+    expect(ok.status).toBe(200);
+    expect(ok.headers['cache-control']).toBeUndefined();
+    const marked = await api.get(`${validationsOf(M.key)}?marker=${markerOf([1, 'A'])}`);
+    expect(marked.status).toBe(200);
+    expect(marked.headers['cache-control']).toBeUndefined();
+    const missing = await api.get(validationsOf(fleet('xrpl', 2)[1].key));
     expect(missing.status).toBe(404);
     expect(missing.headers['cache-control']).toBe('no-store');
   });
