@@ -1,4 +1,5 @@
 import { ClickHouseService, StoredUnlList, Table } from '@gatehub/data-api-shared';
+import { SyncerConfig, unlPublishersOf, unlThresholdOf } from '../config/syncer.config';
 
 interface StoredListRow {
   publisher: string;
@@ -45,4 +46,23 @@ export async function readStoredLists(
     validators: row.validators,
     fetchedAt: Number(row.fetched_ms) / 1000,
   }));
+}
+
+/** What a run of a compute job (`rounds`, `agreement`) reads once, and the rounds or hours of the run share. */
+export interface ListContext {
+  /** Every list the configured publishers served, whatever key it was served under: a round or an hour reads the past. */
+  lists: StoredUnlList[];
+  /** The ids of the configured publishers. */
+  publishers: string[];
+  /** The number of lists that must name a validator for it to be trusted (`unlThresholdOf`). */
+  threshold: number;
+}
+
+/** The `ListContext` of a run: the stored lists of the configured publishers, and the threshold. */
+export async function loadListContext(
+  ch: Pick<ClickHouseService, 'query'>,
+  cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlThreshold'>,
+): Promise<ListContext> {
+  const publishers = unlPublishersOf(cfg).map((publisher) => publisher.id);
+  return { lists: await readStoredLists(ch, publishers), publishers, threshold: unlThresholdOf(cfg) };
 }

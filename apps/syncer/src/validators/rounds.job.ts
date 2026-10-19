@@ -1,11 +1,10 @@
 import {
   AmendmentTalliesRow,
   ClickHouseService,
-  keyMapParams,
-  MANIFEST_MAP_SQL,
+  KEY_MAP_WITH,
+  mappedKey,
   RECORD_LIFETIME_SECONDS,
   RoundMembership,
-  StoredUnlList,
   Table,
   unlAt,
   ValidatorVotesRow,
@@ -13,10 +12,10 @@ import {
   votingLedgerAtOrAfter,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import { SyncerConfig, unlPublishersOf, unlThresholdOf } from '../config/syncer.config';
+import { SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { ComputeJob, ComputeTick } from './compute-loop';
-import { readStoredLists } from './stored-lists';
+import { ListContext, loadListContext } from './stored-lists';
 import { Fees, feesOfSetFee, missingRound, roundQuorum, tallyRound, voteAmendmentsOf } from './tally';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
 
@@ -35,17 +34,14 @@ export const VALIDATIONS_RETENTION_SECONDS = 90 * 86_400;
 /** The fees recorded when neither a `SetFee` nor a ledger state is there to say (the columns are not nullable). */
 const NO_FEES: Fees = { base_fee: '0', reserve_base: '0', reserve_inc: '0' };
 
-/** What a run reads once and the rounds of it share. */
-interface RunContext {
-  /** Every list the configured publishers served, whatever key it was served under: a round reads the past. */
-  lists: StoredUnlList[];
-  publishers: string[];
-  threshold: number;
-  /** The manifest map as the query parameters of `transform(k, {ephemerals}, {masters}, k)`. */
-  keyMap: { ephemerals: string[]; masters: string[] };
+/** What a run reads once and the rounds of it share: the lists, and the newest ledger state. */
+interface RunContext extends ListContext {
   /** The newest `network_state` row, if any. */
   state?: { ledgerIndex: number; majorities: string[]; negativeUnl: string[]; fees: Fees };
 }
+
+/** The key of a validation or a vote, mapped to its master through the manifest map of the statement (`KEY_MAP_WITH`). */
+const MAPPED_KEY = mappedKey('validation_public_key');
 
 /** A round that can be processed: where its close time and, if the ingest has it, its hash come from. */
 interface ReadyRound {
@@ -222,10 +218,8 @@ export class RoundsJob implements ComputeJob {
   // -- what a run reads once --------------------------------------------------------------------------------------------
 
   private async loadContext(): Promise<RunContext> {
-    const publishers = unlPublishersOf(this.cfg).map((publisher) => publisher.id);
-    const [lists, manifests, state] = await Promise.all([
-      readStoredLists(this.ch, publishers),
-      this.ch.query<{ ephemeral_key: string; master_key: string }>(MANIFEST_MAP_SQL),
+    const [lists, state] = await Promise.all([
+      loadListContext(this.ch, this.cfg),
       this.ch.queryOne<{
         ledger_index: number;
         majority_ids: string[];
@@ -245,10 +239,7 @@ export class RoundsJob implements ComputeJob {
       ),
     ]);
     return {
-      lists,
-      publishers,
-      threshold: unlThresholdOf(this.cfg),
-      keyMap: keyMapParams(manifests),
+      ...lists,
       state:
         state === undefined
           ? undefined
@@ -312,8 +303,8 @@ export class RoundsJob implements ComputeJob {
       };
     }
 
-    const votes = await this.votesOf(round, ready.hash, closeTime, context);
-    const { history, membership } = await this.historyOf(round, closeTime, unl, context, anchor);
+    const votes = await this.votesOf(round, ready.hash, closeTime);
+    const { history, membership } = await this.historyOf(round, closeTime, unl, anchor);
     const { tallies, quorum, counted } = tallyRound({
       round,
       closeTime,
@@ -517,7 +508,7 @@ export class RoundsJob implements ComputeJob {
    * The vote of each validator that signed the ledger with `hash`, as the earliest sighting recorded it (the values of the
    * validation `ValidationsService` shows), under the master key. A validator seen under its signing key and under its master is one.
    */
-  private async votesOf(round: number, hash: string, closeTime: number, context: RunContext): Promise<VoteRow[]> {
+  private async votesOf(round: number, hash: string, closeTime: number): Promise<VoteRow[]> {
     const rows = await this.ch.query<{
       vote_key: string;
       vote_full: number;
@@ -527,7 +518,8 @@ export class RoundsJob implements ComputeJob {
       vote_reserve_inc: string | null;
       vote_server_version: string | null;
     }>(
-      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS vote_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT ${MAPPED_KEY} AS vote_key,
               argMin(full, first_datetime) AS vote_full,
               argMin(amendments, first_datetime) AS vote_amendments,
               toString(argMin(base_fee, first_datetime)) AS vote_base_fee,
@@ -538,7 +530,7 @@ export class RoundsJob implements ComputeJob {
         WHERE ledger_hash = {hash:String}
         GROUP BY vote_key
         ORDER BY vote_key`,
-      { hash, ...context.keyMap },
+      { hash },
     );
     return rows.map((row) => ({
       ledger_index: round,
@@ -564,7 +556,6 @@ export class RoundsJob implements ComputeJob {
     round: number,
     closeTime: number,
     unl: ReadonlySet<string>,
-    context: RunContext,
     anchor?: BuiltRound,
   ): Promise<{ history: VoteRow[]; membership: Map<number, RoundMembership> }> {
     const membership = new Map<number, RoundMembership>();
@@ -600,8 +591,9 @@ export class RoundsJob implements ComputeJob {
         closed: number;
         amendments: string[];
       }>(
-        `SELECT ledger_index,
-                transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS vote_key,
+        `WITH ${KEY_MAP_WITH}
+         SELECT ledger_index,
+                ${MAPPED_KEY} AS vote_key,
                 toUnixTimestamp(close_time) AS closed, amendments
            FROM ${Table.ValidatorVotes}
           WHERE ledger_index IN {rounds:Array(UInt32)}
@@ -612,7 +604,6 @@ export class RoundsJob implements ComputeJob {
           rounds: sentinels.map((sentinel) => Number(sentinel.ledger_index)),
           versions: sentinels.map((sentinel) => Number(sentinel.newest_version)),
           unl: [...unl],
-          ...context.keyMap,
         },
       );
       history = rows.map((row) => ({

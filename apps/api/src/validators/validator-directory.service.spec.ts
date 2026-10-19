@@ -1,4 +1,4 @@
-import { getNetworkProfile } from '@gatehub/data-api-shared';
+import { getNetworkProfile, KEY_MAP_WITH, MANIFEST_MAP_SQL, mappedKey, Table } from '@gatehub/data-api-shared';
 import { CacheService } from '../common/cache.service';
 import { ValidatorDirectoryService } from './validator-directory.service';
 
@@ -14,6 +14,46 @@ function service(
   network: 'xrpl' | 'xahau' = 'xrpl',
 ): { svc: ValidatorDirectoryService; ch: ReturnType<typeof fakeClickHouse> } {
   return { svc: new ValidatorDirectoryService(ch as never, cache, getNetworkProfile(network)), ch };
+}
+
+/**
+ * A ClickHouse with a little of everything, so that every read of a build runs: a head, a final hour with its sentinel, and a
+ * round of the last 24 hours. The rows of the validators are empty.
+ */
+function fakeClickHouseWithData(nowSeconds: number) {
+  const hour = Math.floor(nowSeconds / 3600) * 3600 - 3600;
+  const query = jest.fn(async (sql: string): Promise<unknown[]> => {
+    if (sql.includes(`FROM ${Table.Ledgers}`)) return [{ ledger_index: 1000, closed: nowSeconds - 4 }];
+    if (sql.includes(`FROM ${Table.ValidatorAgreementHourly}`) && sql.includes('LIMIT 1'))
+      return [{ stored_hour: hour }];
+    if (sql.includes('newest_final')) {
+      return [{ sentinel_hour: hour, newest_version: '5', newest_final: 1, newest_ledgers: 900, newest_unobserved: 0 }];
+    }
+    if (sql.includes(`FROM ${Table.AmendmentTallies}`) && sql.includes('LIMIT 1')) {
+      return [{ ledger_index: 1023, round_close: nowSeconds - 100 }];
+    }
+    if (sql.includes('round_unl_size')) {
+      return [
+        {
+          ledger_index: 1023,
+          newest_version: '7',
+          round_close: nowSeconds - 100,
+          round_unl_size: 0,
+          round_trusted: 0,
+          round_threshold: 1,
+          round_observed: 0,
+          round_unl: [],
+          round_negative_unl: [],
+          round_base_fee: '10',
+          round_reserve_base: '1000000',
+          round_reserve_inc: '200000',
+        },
+      ];
+    }
+    if (sql.includes(`FROM ${Table.AmendmentTallies}`)) return [{ ledger_index: 1023, newest_version: '7' }];
+    return [];
+  });
+  return { query, queryOne: async (...args: unknown[]) => ((await query(...(args as [string]))) as unknown[])[0] };
 }
 
 describe('ValidatorDirectoryService', () => {
@@ -87,5 +127,61 @@ describe('ValidatorDirectoryService', () => {
     await Promise.all([xrpl.svc.get(), xahau.svc.get()]);
     expect(xrpl.ch.query).toHaveBeenCalledTimes(perBuild);
     expect(xahau.ch.query).toHaveBeenCalledTimes(perBuild);
+  });
+
+  describe('the manifest map', () => {
+    /** The statements and the parameters of one build over `fakeClickHouseWithData`. */
+    async function oneBuild(): Promise<{ sql: string; params?: Record<string, unknown> }[]> {
+      const ch = fakeClickHouseWithData(Math.floor(Date.now() / 1000));
+      await service(ch as never).svc.get();
+      return ch.query.mock.calls.map((call) => {
+        const [sql, params] = call as unknown as [string, Record<string, unknown> | undefined];
+        return { sql, params };
+      });
+    }
+
+    it('is never a parameter of a statement: a map of every manifest stored would travel in the URL', async () => {
+      const calls = await oneBuild();
+      expect(calls.length).toBeGreaterThan(10);
+      for (const { sql, params } of calls) {
+        expect([sql, Object.keys(params ?? {}).filter((name) => name === 'ephemerals' || name === 'masters')]).toEqual([
+          sql,
+          [],
+        ]);
+      }
+    });
+
+    it('is computed inside every statement that adds up the rows of the validators', async () => {
+      const calls = await oneBuild();
+      const mapped = calls.filter(({ sql }) => sql.includes(mappedKey('validation_public_key')));
+      for (const table of [
+        Table.ValidatorSeen,
+        Table.ValidatorDomains,
+        Table.ValidatorValidations,
+        Table.ValidatorAgreementHourly,
+        Table.ValidatorVotes,
+      ]) {
+        expect([table, mapped.some(({ sql }) => sql.includes(`FROM ${table}`))]).toEqual([table, true]);
+      }
+      // the votes of the last 24 h and the versions of 30 days
+      expect(mapped.filter(({ sql }) => sql.includes(`FROM ${Table.ValidatorVotes}`))).toHaveLength(2);
+      for (const { sql } of mapped) expect(sql.trimStart().startsWith(`WITH ${KEY_MAP_WITH}`)).toBe(true);
+    });
+
+    it('is read on its own once, for the map the directory carries (signingToMaster)', async () => {
+      const calls = await oneBuild();
+      expect(calls.filter(({ sql }) => sql === MANIFEST_MAP_SQL)).toEqual([
+        { sql: MANIFEST_MAP_SQL, params: undefined },
+      ]);
+    });
+
+    it('carries the rows of that read as signingToMaster', async () => {
+      const ch = fakeClickHouse();
+      ch.query.mockImplementation(async (sql: string) =>
+        sql === MANIFEST_MAP_SQL ? [{ ephemeral_key: 'n9Signing', map_master: 'nHMaster' }] : [],
+      );
+      const directory = await service(ch).svc.get();
+      expect([...directory.signingToMaster]).toEqual([['n9Signing', 'nHMaster']]);
+    });
   });
 });

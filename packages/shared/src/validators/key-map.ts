@@ -9,24 +9,31 @@ import { Table } from '../clickhouse/tables';
 export const NEWEST_MANIFEST_ORDER = '(seq, notEmpty(manifest))';
 
 /**
- * The manifest map (Global Constraints, "Key mapping"): per `ephemeral_key` of `validator_manifests`, the `master_key` of the
- * manifest with the highest `seq`. Every job and every API read that aggregates rows by validator maps each key through it
- * first, so that a validation recorded under a signing key before its manifest was known is counted for the right validator.
- * Read it with no parameters, give the rows to `keyMapParams`, and map a key in SQL with
- * `transform(k, {ephemerals:Array(String)}, {masters:Array(String)}, k)`: a key the map does not know stays as it is.
+ * The manifest map (Global Constraints, "Key mapping"): per `ephemeral_key` of `validator_manifests`, the master key of the
+ * manifest with the highest `seq` (`map_master`; a row without a master key counts for nothing). Every job and every API read
+ * that aggregates rows by validator maps each key through it first, so that a validation recorded under a signing key before
+ * its manifest was known is counted for the right validator.
+ *
+ * A statement maps its keys with the map computed inside it (`KEY_MAP_WITH` and `mappedKey`), never with the map sent as
+ * parameters: the client puts parameters in the URL, and a map of some 9,000 manifests (which anyone who broadcasts
+ * manifests can make) is more than the 1 MiB of a URL ClickHouse takes. This statement on its own is for a map that an
+ * answer carries (the API's `signingToMaster`). It has no parameters.
  */
-export const MANIFEST_MAP_SQL = `SELECT ephemeral_key, argMax(master_key, seq) AS master_key
+export const MANIFEST_MAP_SQL = `SELECT ephemeral_key, argMax(master_key, seq) AS map_master
   FROM ${Table.ValidatorManifests}
+ WHERE master_key != ''
  GROUP BY ephemeral_key
  ORDER BY ephemeral_key`;
 
 /**
- * The query parameters `{ephemerals:Array(String)}` and `{masters:Array(String)}` of the manifest map: the keys and their
- * masters, in the order of the rows (position `i` of one is position `i` of the other).
+ * The manifest map as an element of the WITH clause of a statement: `key_map`, a scalar of two arrays (the ephemeral keys,
+ * then their masters) that one `groupArray` pass over `MANIFEST_MAP_SQL` keeps aligned. ClickHouse computes it once for the
+ * statement, and its subqueries and common table expressions see it. A statement starts `WITH ${KEY_MAP_WITH}` (or adds it to
+ * its WITH list) and maps a key column with `mappedKey`.
  */
-export function keyMapParams(rows: readonly { ephemeral_key: string; master_key: string }[]): {
-  ephemerals: string[];
-  masters: string[];
-} {
-  return { ephemerals: rows.map((row) => row.ephemeral_key), masters: rows.map((row) => row.master_key) };
+export const KEY_MAP_WITH = `(SELECT tuple(groupArray(ephemeral_key), groupArray(map_master)) FROM (${MANIFEST_MAP_SQL})) AS key_map`;
+
+/** The master key of `column` through the manifest map of `KEY_MAP_WITH`: a key the map does not know stays as it is. */
+export function mappedKey(column: string): string {
+  return `transform(${column}, key_map.1, key_map.2, ${column})`;
 }

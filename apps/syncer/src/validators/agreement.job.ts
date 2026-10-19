@@ -1,19 +1,11 @@
-import {
-  ClickHouseService,
-  keyMapParams,
-  MANIFEST_MAP_SQL,
-  quorumOf,
-  StoredUnlList,
-  Table,
-  unlAt,
-} from '@gatehub/data-api-shared';
+import { ClickHouseService, KEY_MAP_WITH, mappedKey, quorumOf, Table, unlAt } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import { SyncerConfig, unlPublishersOf, unlThresholdOf } from '../config/syncer.config';
+import { SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { agreementRows, gapsOf } from './agreement';
 import { ComputeJob, ComputeTick } from './compute-loop';
 import { VALIDATIONS_RETENTION_SECONDS } from './rounds.job';
-import { readStoredLists } from './stored-lists';
+import { ListContext, loadListContext } from './stored-lists';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
 
 /** An hour is computed once it ended this long ago: the validations of its last ledgers are in (spec 2.5). */
@@ -33,15 +25,11 @@ const READ_LEAD_MS = 600_000;
 /** ... to this long after its end (a validation that is recorded again later is still counted). */
 const READ_TAIL_MS = 7_200_000;
 
-/** What a run reads once and the hours of it share. */
-interface RunContext {
-  /** Every list the configured publishers served, whatever key it was served under: an hour reads the past. */
-  lists: StoredUnlList[];
-  publishers: string[];
-  threshold: number;
-  /** The manifest map as the query parameters of `transform(k, {ephemerals}, {masters}, k)`. */
-  keyMap: { ephemerals: string[]; masters: string[] };
-}
+/** What a run reads once and the hours of it share: the lists. */
+type RunContext = ListContext;
+
+/** The key of a validation or a row of an hour, mapped to its master through the manifest map of the statement (`KEY_MAP_WITH`). */
+const MAPPED_KEY = mappedKey('validation_public_key');
 
 /** An hour to compute, with its UNL and its quorum. */
 interface HourPlan {
@@ -78,13 +66,15 @@ interface WindowReads {
 /**
  * The read of the agreement of a window of hours (one hour, or a whole UTC day).
  *
- * `l` is the chain of the window (the ledgers of `ledgers` with a close time in it, one hash per hash, each with its hour);
- * `v` is, per ledger of it and validator (keys mapped to master keys through the manifest map), the newest validation as the
+ * `key_map` is the manifest map (`KEY_MAP_WITH`), computed in the statement; `l` is the chain of the window (the ledgers of
+ * `ledgers` with a close time in it, one hash per hash, each with its hour); `v` is, per ledger of it and validator (keys mapped
+ * to master keys through `key_map`), the newest validation as the
  * collector recorded it (`f` = 1 for a full one) and the time of its last receipt, among the rows received from 10 minutes
  * before the window to 2 hours after it; `obs` is the ledgers with full validations from at least `quorum` members of the UNL.
  * The ledgers outside `obs` count for nobody.
  */
-const AGREEMENT_WITH = `WITH l AS (
+const AGREEMENT_WITH = `WITH ${KEY_MAP_WITH},
+       l AS (
          SELECT ledger_hash, any(intDiv(toUnixTimestamp(close_time), 3600) * 3600) AS chain_hour
            FROM ${Table.Ledgers}
           WHERE ledger_index BETWEEN {first:UInt32} AND {last:UInt32}
@@ -93,7 +83,7 @@ const AGREEMENT_WITH = `WITH l AS (
        ),
        v AS (
          SELECT ledger_hash,
-                transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS k,
+                ${MAPPED_KEY} AS k,
                 max(full) AS f,
                 max(last_datetime) AS seen
            FROM ${Table.Validations}
@@ -179,7 +169,7 @@ export class AgreementJob implements ComputeJob {
       while (next !== undefined && this.mayStart(tick)) {
         const plans = await this.planWindow(next, contextOf, tick.now / 1000, newestClosed);
         if (plans === undefined) break;
-        if (!(await this.computeWindow(plans, await contextOf(), tick))) break;
+        if (!(await this.computeWindow(plans, tick))) break;
         if (first) this.logger.log(`Agreement: none was stored, the first hour is ${isoOf(plans[0].hour)}`);
         first = false;
         next = plans[plans.length - 1].hour + HOUR;
@@ -309,13 +299,8 @@ export class AgreementJob implements ComputeJob {
 
   // -- what a run reads once --------------------------------------------------------------------------------------------
 
-  private async loadContext(): Promise<RunContext> {
-    const publishers = unlPublishersOf(this.cfg).map((publisher) => publisher.id);
-    const [lists, manifests] = await Promise.all([
-      readStoredLists(this.ch, publishers),
-      this.ch.query<{ ephemeral_key: string; master_key: string }>(MANIFEST_MAP_SQL),
-    ]);
-    return { lists, publishers, threshold: unlThresholdOf(this.cfg), keyMap: keyMapParams(manifests) };
+  private loadContext(): Promise<RunContext> {
+    return loadListContext(this.ch, this.cfg);
   }
 
   // -- one window -------------------------------------------------------------------------------------------------------
@@ -324,13 +309,13 @@ export class AgreementJob implements ComputeJob {
    * Reads and writes the hours of a window, oldest first. Resolves `false` when the shutdown stopped it before all of them were
    * written; each hour written is whole.
    */
-  private async computeWindow(plans: HourPlan[], context: RunContext, tick: ComputeTick): Promise<boolean> {
+  private async computeWindow(plans: HourPlan[], tick: ComputeTick): Promise<boolean> {
     const start = plans[0].hour;
     const end = plans[plans.length - 1].hour + HOUR;
     const chain = await this.readChain(start, end);
-    const reads = await this.readWindow(plans[0], chain, start, end, context);
+    const reads = await this.readWindow(plans[0], chain, start, end);
     const versions = await this.storedVersions(start, end);
-    let previous = await this.previousRows(start - HOUR, context);
+    let previous = await this.previousRows(start - HOUR);
     const edges = edgesOf(plans, chain);
 
     for (const plan of plans) {
@@ -407,20 +392,15 @@ export class AgreementJob implements ComputeJob {
    * The observed ledgers, what each validator signed of them and when each validator was last heard, per hour of the window.
    * `first` carries the UNL and the quorum, which every hour of a window shares.
    */
-  private async readWindow(
-    first: HourPlan,
-    chain: WindowLedgers,
-    start: number,
-    end: number,
-    context: RunContext,
-  ): Promise<WindowReads> {
+  private async readWindow(first: HourPlan, chain: WindowLedgers, start: number, end: number): Promise<WindowReads> {
     const reads: WindowReads = { observed: new Map(), perKey: new Map(), seen: new Map(), late: new Map() };
     const fromMs = start * 1000 - READ_LEAD_MS;
     const toMs = end * 1000 + READ_TAIL_MS;
     // heard in the hour: the newest receipt of every validator in it, of any ledger
     const heard = await this.ch.query<{ seen_hour: number; seen_key: string; seen_ms: number | string }>(
-      `SELECT intDiv(toUnixTimestamp64Milli(last_datetime), 3600000) * 3600 AS seen_hour,
-              transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS seen_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT intDiv(toUnixTimestamp64Milli(last_datetime), 3600000) * 3600 AS seen_hour,
+              ${MAPPED_KEY} AS seen_key,
               toUnixTimestamp64Milli(max(last_datetime)) AS seen_ms
          FROM ${Table.Validations}
         WHERE last_datetime >= fromUnixTimestamp64Milli({startMs:Int64}, 'UTC')
@@ -428,7 +408,7 @@ export class AgreementJob implements ComputeJob {
           AND validation_public_key != ''
         GROUP BY seen_hour, seen_key
         ORDER BY seen_hour, seen_key`,
-      { startMs: start * 1000, endMs: end * 1000, ...context.keyMap },
+      { startMs: start * 1000, endMs: end * 1000 },
     );
     for (const row of heard) mapOf(reads.seen, Number(row.seen_hour)).set(row.seen_key, Number(row.seen_ms) / 1000);
     if (chain.first !== undefined && chain.last !== undefined) {
@@ -441,7 +421,6 @@ export class AgreementJob implements ComputeJob {
         toMs,
         unl: [...first.unl],
         quorum: first.quorum,
-        ...context.keyMap,
       };
       // one read, one snapshot: the rows of the validators, and (WITH ROLLUP) the rows of the hours with the distinct observed
       // ledgers of each, the key `''` that no validator has (the reads of `validations` leave it out)
@@ -496,12 +475,10 @@ export class AgreementJob implements ComputeJob {
    * has them and no other (a set that is being rewritten, or was cut short, never mixes with the one a reader takes). The keys are
    * mapped to master keys through the manifest map, as one stored under a signing key counts for its master.
    */
-  private async previousRows(
-    hour: number,
-    context: RunContext,
-  ): Promise<Array<{ validation_public_key: string; last_seen: number }>> {
+  private async previousRows(hour: number): Promise<Array<{ validation_public_key: string; last_seen: number }>> {
     const rows = await this.ch.query<{ tracked_key: string; seen_ms: number | string }>(
-      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS tracked_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT ${MAPPED_KEY} AS tracked_key,
               toUnixTimestamp64Milli(max(last_seen)) AS seen_ms
          FROM ${Table.ValidatorAgreementHourly}
         WHERE hour = toDateTime({hour:UInt32}, 'UTC')
@@ -510,7 +487,7 @@ export class AgreementJob implements ComputeJob {
                           WHERE hour = toDateTime({hour:UInt32}, 'UTC') AND validation_public_key = '')
         GROUP BY tracked_key
         ORDER BY tracked_key`,
-      { hour, ...context.keyMap },
+      { hour },
     );
     return rows.map((row) => ({ validation_public_key: row.tracked_key, last_seen: Number(row.seen_ms) / 1000 }));
   }
@@ -545,7 +522,7 @@ export class AgreementJob implements ComputeJob {
       const context = await contextOf();
       const plan = await this.planHour(hour, context);
       if (plan.unl.size === 0) continue;
-      if (!(await this.computeWindow([plan], context, tick))) return;
+      if (!(await this.computeWindow([plan], tick))) return;
     }
   }
 

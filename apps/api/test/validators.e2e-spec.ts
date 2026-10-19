@@ -1,4 +1,4 @@
-import { RIPPLE_EPOCH_MS, Table } from '@gatehub/data-api-shared';
+import { KEY_MAP_WITH, MANIFEST_MAP_SQL, mappedKey, RIPPLE_EPOCH_MS, Table } from '@gatehub/data-api-shared';
 import { join } from 'node:path';
 import { makeManifest } from '../../../packages/shared/src/test-utils/validator-keys';
 import type { Directory } from '../src/validators/directory';
@@ -33,6 +33,7 @@ import {
   insertHours,
   insertLists,
   insertManifests,
+  insertManyManifests,
   insertPublishers,
   insertRound,
   insertSeen,
@@ -281,6 +282,8 @@ describe('GET /v2/network/validators/summary: a fleet of 35 trusted validators (
       const text = queries.join('\n');
       expect(text).not.toMatch(/\bnH[1-9A-HJ-NP-Za-km-z]{20,}/);
       expect(text).not.toContain('107748');
+      // the manifest map is computed in the statements, never sent with one: it would travel in the URL
+      expect(params.filter((p) => 'ephemerals' in p || 'masters' in p)).toEqual([]);
     });
 
     it('maps the keys through the manifest map in every read that adds up rows by validator', async () => {
@@ -301,8 +304,10 @@ describe('GET /v2/network/validators/summary: a fleet of 35 trusted validators (
       } finally {
         await fresh.close();
       }
-      const mapped =
-        'transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key)';
+      const mapped = mappedKey('validation_public_key');
+      expect(mapped).toBe('transform(validation_public_key, key_map.1, key_map.2, validation_public_key)');
+      // a statement that maps its keys computes the map itself
+      for (const sql of queries.filter((each) => each.includes(mapped))) expect(sql).toContain(`WITH ${KEY_MAP_WITH}`);
       const readsFrom = (table: Table): string[] => queries.filter((sql) => sql.includes(`FROM ${table}`));
       // validator_seen, validator_validations, validator_votes and validator_domains: every statement
       for (const table of [
@@ -320,8 +325,8 @@ describe('GET /v2/network/validators/summary: a fleet of 35 trusted validators (
       expect(
         hours.filter((sql) => !sql.includes(mapped)).every((sql) => sql.includes("validation_public_key = ''")),
       ).toBe(true);
-      // the map itself is read once, from validator_manifests
-      expect(queries.filter((sql) => sql.includes('argMax(master_key, seq)'))).toHaveLength(1);
+      // the map the directory carries (signingToMaster) is read once, on its own
+      expect(queries.filter((sql) => sql === MANIFEST_MAP_SQL)).toHaveLength(1);
     });
   });
 });
@@ -3204,3 +3209,59 @@ describe.each([
     });
   },
 );
+
+// ===================================================================================================================
+// a manifest map of 12,000 keys
+// ===================================================================================================================
+
+describe('GET /v2/network/validators/summary and /v2/network/validators: with 12,000 manifests stored', () => {
+  // The manifest map is computed inside every statement that maps keys. Sent with a statement as query parameters, which the
+  // client puts in the URL, a map of this size is more than the 1 MiB of a URL ClickHouse takes (`http_max_uri_size`).
+  const MANIFESTS = 12_000;
+  let h: Harness;
+  let api: ApiClient;
+  let s: FleetScenario;
+  let stored: number;
+  let summary: Answer;
+  let list: Answer;
+
+  beforeAll(async () => {
+    h = await startHarness({
+      seed: 'none',
+      network: 'xrpl',
+      env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+    });
+    api = await h.api();
+    s = await seedFleet(h.ch, { activity: true });
+    await insertManyManifests(h.ch, MANIFESTS);
+    const [row] = await h.ch.query<{ n: string }>(
+      `SELECT uniqExact(ephemeral_key) AS n FROM ${Table.ValidatorManifests}`,
+    );
+    stored = Number(row.n);
+    summary = await api.get(SUMMARY);
+    list = await api.get(`${LIST}?scope=all`);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('has the manifests of the fleet and 12,000 more', () => {
+    expect(stored).toBeGreaterThan(MANIFESTS);
+  });
+
+  it('answers the summary, and still maps the keys: unl[34], seen under its signing key, is seen', () => {
+    expect([summary.status, summary.body.result]).toEqual([200, 'success']);
+    expect(summary.body.validators.unl_seen_24h).toBe(34);
+  });
+
+  it('answers the list, and still maps the keys: unl[34] has its votes and its current ledger', () => {
+    expect([list.status, list.body.result]).toEqual([200, 'success']);
+    const row = list.body.validators.find(
+      (each: { validation_public_key: string }) => each.validation_public_key === s.unl[34].key,
+    );
+    expect(row).toMatchObject({ version: '3.4.0', current_index: HEAD_LEDGER });
+    expect(
+      list.body.validators.map((each: { validation_public_key: string }) => each.validation_public_key),
+    ).not.toContain(s.unl[34].ephemeral);
+  });
+});

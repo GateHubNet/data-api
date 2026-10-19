@@ -2,9 +2,9 @@ import {
   ClickHouseService,
   decodeManifest,
   isProperlyFormedTomlDomain,
-  keyMapParams,
+  KEY_MAP_WITH,
   listInUse,
-  MANIFEST_MAP_SQL,
+  mappedKey,
   NetworkProfile,
   NEWEST_MANIFEST_ORDER,
   NodeClient,
@@ -341,15 +341,16 @@ export class DomainChecker {
       const own = lists.filter((list) => list.publisher === p.id && list.publisherKey === p.publicKey);
       for (const key of listInUse(own, p.id, now)?.list.validators ?? []) keys.add(key);
     }
-    // a validator seen under its signing key is that of its master: the keys go through the manifest map first
-    const manifestMap = await this.ch.query<{ ephemeral_key: string; master_key: string }>(MANIFEST_MAP_SQL);
+    // a validator seen under its signing key is that of its master: the keys go through the manifest map first, which the
+    // statement computes itself
     const seen = await this.ch.query<{ master: string }>(
-      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS master
+      `WITH ${KEY_MAP_WITH}
+       SELECT ${mappedKey('validation_public_key')} AS master
          FROM ${Table.ValidatorSeen}
         GROUP BY master
        HAVING toUnixTimestamp(max(last_seen)) >= {since:UInt32}
         ORDER BY master`,
-      { since: Math.max(Math.floor(now) - DOMAIN_SEEN_WITHIN_S, 0), ...keyMapParams(manifestMap) },
+      { since: Math.max(Math.floor(now) - DOMAIN_SEEN_WITHIN_S, 0) },
     );
     for (const row of seen) keys.add(row.master);
     return [...keys].sort();

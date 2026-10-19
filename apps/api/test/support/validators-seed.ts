@@ -96,6 +96,21 @@ export function insertManifests(
   );
 }
 
+/**
+ * `count` manifests of validators nobody has seen, as one insert: distinct keys of the length of a base58 node key (52
+ * characters), made from the row number. They are not keys of any curve and have no signature: the manifest map needs neither.
+ */
+export function insertManyManifests(ch: Pick<ClickHouseService, 'command'>, count: number): Promise<void> {
+  return ch.command(
+    `INSERT INTO ${Table.ValidatorManifests} (ephemeral_key, master_key, seq, domain, manifest, source)
+     SELECT concat('n9', substring(hex(SHA256(concat('signing-', toString(number)))), 1, 50)),
+            concat('nH', substring(hex(SHA256(concat('master-', toString(number)))), 1, 50)),
+            1, '', '', 'stream'
+       FROM numbers({count:UInt32})`,
+    { count },
+  );
+}
+
 export function insertSeen(
   ch: Ch,
   rows: { key: string; first: number; last: number; ledger?: number }[],

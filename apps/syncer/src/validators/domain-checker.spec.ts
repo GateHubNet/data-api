@@ -1,6 +1,8 @@
 import {
   getNetworkProfile,
+  KEY_MAP_WITH,
   MANIFEST_MAP_SQL,
+  mappedKey,
   NetworkProfile,
   Table,
   UnlListsRow,
@@ -328,21 +330,19 @@ class FakeClickHouse {
       }));
     }
     if (sql.includes(Table.ValidatorSeen)) {
-      // each key is mapped through the manifest map (`transform(k, ephemerals, masters, k)`) and the masters are grouped
-      const { ephemerals, masters } = params as { ephemerals: string[]; masters: string[] };
-      const mapped = this.seen
-        .filter((s) => s.lastSeen >= (params.since as number))
-        .map((s) => (ephemerals.includes(s.key) ? masters[ephemerals.indexOf(s.key)] : s.key));
-      return [...new Set(mapped)].sort().map((master) => ({ master }));
-    }
-    if (sql.includes(Table.ValidatorManifests) && params.keys === undefined) {
-      // the manifest map: the master of the highest seq per ephemeral key
+      // each key is mapped through the manifest map the statement computes (`WITH key_map`: the master of the highest seq per
+      // ephemeral key, rows without a master left out) and the masters are grouped
+      if (!sql.includes(`WITH ${KEY_MAP_WITH}`))
+        throw new Error('the read of the validators seen does not map its keys');
       const top = new Map<string, ValidatorManifestsRow>();
-      for (const m of this.manifests) {
+      for (const m of this.manifests.filter((row) => row.master_key !== '')) {
         const held = top.get(m.ephemeral_key);
         if (held === undefined || m.seq > held.seq) top.set(m.ephemeral_key, m);
       }
-      return [...top.values()].map((m) => ({ ephemeral_key: m.ephemeral_key, master_key: m.master_key }));
+      const mapped = this.seen
+        .filter((s) => s.lastSeen >= (params.since as number))
+        .map((s) => top.get(s.key)?.master_key ?? s.key);
+      return [...new Set(mapped)].sort().map((master) => ({ master }));
     }
     if (sql.includes(Table.ValidatorManifests)) {
       const wanted = params.keys as string[];
@@ -612,19 +612,25 @@ describe('DomainChecker', () => {
       expect(t.fetcher.get).not.toHaveBeenCalled();
     });
 
-    it('reads the manifest map once a pass and gives it to the read of the validators seen', async () => {
+    it('maps the keys of the validators seen inside the read: the map is never a parameter, nor a read of its own', async () => {
       const t = setup();
       const a = validator(1);
       t.ch.seen.push({ key: a.signing.base58, lastSeen: NOW - 60 });
       t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
       t.serve({});
       await t.checker.pass();
-      const maps = t.ch.query.mock.calls.filter(([sql, params]) => sql === MANIFEST_MAP_SQL && params === undefined);
-      expect(maps).toHaveLength(1);
       const seenRead = t.ch.query.mock.calls.find(([sql]) => String(sql).includes(Table.ValidatorSeen));
-      expect(seenRead?.[1]).toEqual(
-        expect.objectContaining({ ephemerals: [a.signing.base58], masters: [a.master.base58] }),
-      );
+      expect(seenRead?.[0]).toContain(`WITH ${KEY_MAP_WITH}`);
+      expect(seenRead?.[0]).toContain(`${mappedKey('validation_public_key')} AS master`);
+      for (const [sql, params] of t.ch.query.mock.calls) {
+        expect([sql, Object.keys(params ?? {}).filter((name) => name === 'ephemerals' || name === 'masters')]).toEqual([
+          sql,
+          [],
+        ]);
+      }
+      expect(t.ch.query.mock.calls.filter(([sql]) => sql === MANIFEST_MAP_SQL)).toEqual([]);
+      // and the master is checked
+      expect(t.fetched()).toEqual([url('a.example')]);
     });
 
     it('checks a validator that is both on a list and seen once', async () => {

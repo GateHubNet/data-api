@@ -4238,5 +4238,44 @@ describe('the validators worker (e2e)', () => {
       expect(await counted('agreement', 'error')).toBe(0);
       expect(await counted('rounds', 'ok')).toBeGreaterThanOrEqual(1);
     });
+
+    // last of the describe: the manifests are not among the tables it empties before a test
+    it('ends a rounds tick and an agreement tick ok with 12,000 manifests stored, the keys mapped in the statements', async () => {
+      // Sent with a statement as query parameters (which the client puts in the URL), a manifest map of this size is more than
+      // the 1 MiB of a URL ClickHouse takes; computed inside the statement, it is not sent at all.
+      await seedK2Manifest();
+      await db.ch.command(
+        `INSERT INTO ${Table.ValidatorManifests} (ephemeral_key, master_key, seq, domain, manifest, source)
+         SELECT concat('n9', substring(hex(SHA256(concat('signing-', toString(number)))), 1, 50)),
+                concat('nH', substring(hex(SHA256(concat('master-', toString(number)))), 1, 50)),
+                1, '', '', 'stream'
+           FROM numbers({count:UInt32})`,
+        { count: 12_000 },
+      );
+      await seed({ signingK2: true });
+      const app = await boot(PUBLISHERS, { start: { unl: false, domains: false, state: false, compute: true } });
+
+      await waitFor('the three hours', async () => hoursOf(await currentRows()).length >= 3);
+      const counted = async (job: string, outcome: string) =>
+        (await app.metrics.validatorsJobsTotal.get()).values
+          .filter((v) => v.labels.job === job && v.labels.outcome === outcome)
+          .reduce((n, v) => n + v.value, 0);
+      await waitFor('a rounds run and an agreement run', async () =>
+        (await counted('agreement', 'ok')) >= 1 && (await counted('rounds', 'ok')) >= 1 ? true : undefined,
+      );
+      expect(await counted('agreement', 'error')).toBe(0);
+      expect(await counted('rounds', 'error')).toBe(0);
+      // the hours: K2's validations, recorded under its signing key, are its master's
+      const rows = await currentRows();
+      for (const hour of [0, 1, 2]) expectHour(rows, MAIN, hourOf(hour), {});
+      expect(rows.map((row) => row.key)).not.toContain(K2_SIGNING.base58);
+      // the round of the voting ledger 5119 of the chain: K2 votes under its master
+      const voters = await db.ch.query<{ key: string }>(
+        `SELECT DISTINCT validation_public_key AS key FROM ${Table.ValidatorVotes} WHERE ledger_index = {round:UInt32}`,
+        { round: 5119 },
+      );
+      expect(voters.map((row) => row.key)).toContain(K2.base58);
+      expect(voters.map((row) => row.key)).not.toContain(K2_SIGNING.base58);
+    });
   });
 });

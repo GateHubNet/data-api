@@ -1,7 +1,8 @@
 import {
   ClickHouseService,
-  keyMapParams,
+  KEY_MAP_WITH,
   MANIFEST_MAP_SQL,
+  mappedKey,
   NetworkProfile,
   NEWEST_MANIFEST_ORDER,
   StoredUnlList,
@@ -44,8 +45,8 @@ const AGREEMENT_RETENTION_HOURS = 400 * 24;
  * rounds, which then filters them by their close time.
  */
 const MAX_LEDGERS_30D = 30 * DAY;
-/** The manifest map as the query parameters of `transform(k, {ephemerals}, {masters}, k)`. */
-type KeyMap = ReturnType<typeof keyMapParams>;
+/** The key of a row of the validators, mapped to its master through the manifest map of the statement (`KEY_MAP_WITH`). */
+const MAPPED_KEY = mappedKey('validation_public_key');
 
 /** A row of ClickHouse with numbers that may arrive as text (64-bit integers). */
 type Num = number | string;
@@ -67,7 +68,8 @@ interface RoundVersions {
  * Builds the validator directory (spec 3.0, 9) and keeps it for 10 s.
  *
  * **Reads.** The reads of a build run in parallel. Every one that aggregates rows maps their keys through the manifest map
- * first (`transform(k, {ephemerals}, {masters}, k)`, the map read once at the start of the build); every read of a version set
+ * first, with the map computed inside the statement (`KEY_MAP_WITH`, `mappedKey`), never sent with it (parameters travel in
+ * the URL); the map the directory carries for its answers (`signingToMaster`) is a read of its own; every read of a version set
  * (`validator_votes`, `amendment_tallies`, `validator_agreement_hourly`) takes the newest sentinel's version of each round or
  * hour and only the rows of that version. They are bounded and read in the order of the key: the validations by the head, the
  * hours by the range of the window, the votes by the range of the rounds of the last 30 days. Values are bound as query
@@ -109,11 +111,11 @@ export class ValidatorDirectoryService {
     const state = this.readState();
     const publishers = this.readPublishers();
     const manifests = this.readManifests();
-    const domains = keyMap.then((map) => this.readDomains(map));
-    const seen = keyMap.then((map) => this.readSeen(map));
-    const activity = Promise.all([head, state, keyMap]).then(([h, s, map]) => this.readActivity(h, s, map));
-    const agreement = keyMap.then((map) => this.readAgreement(map));
-    const votes = keyMap.then((map) => this.readVotes(map, now));
+    const domains = this.readDomains();
+    const seen = this.readSeen();
+    const activity = Promise.all([head, state]).then(([h, s]) => this.readActivity(h, s));
+    const agreement = this.readAgreement();
+    const votes = this.readVotes(now);
 
     const [map, headRow, stateRow, publisherRows, manifestRows, domainRows, seenRows, activityRows, hours, voted] =
       await Promise.all([keyMap, head, state, publishers, manifests, domains, seen, activity, agreement, votes]);
@@ -126,7 +128,7 @@ export class ValidatorDirectoryService {
       state: stateRow,
       publishers: publisherRows.publishers,
       lists: publisherRows.lists,
-      manifestMap: map.rows,
+      manifestMap: map,
       manifests: manifestRows,
       seen: seenRows,
       activity: activityRows,
@@ -142,9 +144,10 @@ export class ValidatorDirectoryService {
 
   // -- the manifest map -----------------------------------------------------------------------------------------------
 
-  private async readKeyMap(): Promise<KeyMap & { rows: { ephemeral_key: string; master_key: string }[] }> {
-    const rows = await this.ch.query<{ ephemeral_key: string; master_key: string }>(MANIFEST_MAP_SQL);
-    return { ...keyMapParams(rows), rows };
+  /** The manifest map the directory carries (`signingToMaster`): the reads that map keys compute it themselves. */
+  private async readKeyMap(): Promise<{ ephemeral_key: string; master_key: string }[]> {
+    const rows = await this.ch.query<{ ephemeral_key: string; map_master: string }>(MANIFEST_MAP_SQL);
+    return rows.map((row) => ({ ephemeral_key: row.ephemeral_key, master_key: row.map_master }));
   }
 
   // -- the chain ----------------------------------------------------------------------------------------------------------
@@ -323,15 +326,15 @@ export class ValidatorDirectoryService {
   }
 
   /** When each validator was first and last seen, the keys mapped to their masters. */
-  private async readSeen(map: KeyMap): Promise<SeenRow[]> {
+  private async readSeen(): Promise<SeenRow[]> {
     const rows = await this.ch.query<{ seen_key: string; first_ms: Num; last_ms: Num }>(
-      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS seen_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT ${MAPPED_KEY} AS seen_key,
               toUnixTimestamp64Milli(min(first_seen)) AS first_ms,
               toUnixTimestamp64Milli(max(last_seen)) AS last_ms
          FROM ${Table.ValidatorSeen}
         GROUP BY seen_key
         ORDER BY seen_key`,
-      { ephemerals: map.ephemerals, masters: map.masters },
     );
     return rows.map((row) => ({
       key: row.seen_key,
@@ -341,7 +344,7 @@ export class ValidatorDirectoryService {
   }
 
   /** The newest result of every (validator, domain), the keys mapped to their masters. */
-  private async readDomains(map: KeyMap): Promise<DomainRow[]> {
+  private async readDomains(): Promise<DomainRow[]> {
     const rows = await this.ch.query<{
       domain_key: string;
       domain_name: string;
@@ -353,7 +356,8 @@ export class ValidatorDirectoryService {
       verified_ms: Num | null;
       newest_accounts: string[];
     }>(
-      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS domain_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT ${MAPPED_KEY} AS domain_key,
               domain AS domain_name,
               argMax(status, checked_at) AS newest_status,
               argMax(reason, checked_at) AS newest_reason,
@@ -365,7 +369,6 @@ export class ValidatorDirectoryService {
          FROM ${Table.ValidatorDomains}
         GROUP BY domain_key, domain_name
         ORDER BY domain_key, domain_name`,
-      { ephemerals: map.ephemerals, masters: map.masters },
     );
     return rows.map(
       (row): DomainRow => ({
@@ -386,23 +389,20 @@ export class ValidatorDirectoryService {
    * The newest validation of each validator among the last 300 ledgers (of the head: the larger of the newest committed ledger
    * and the newest ledger state), and whether it was a full one. Without a head there is nothing to count back from.
    */
-  private async readActivity(
-    head: HeadInfo | undefined,
-    state: NetworkStateInfo | undefined,
-    map: KeyMap,
-  ): Promise<ActivityRow[]> {
+  private async readActivity(head: HeadInfo | undefined, state: NetworkStateInfo | undefined): Promise<ActivityRow[]> {
     const newest = Math.max(head?.ledgerIndex ?? 0, state?.ledgerIndex ?? 0);
     if (newest === 0) return [];
     const rows = await this.ch.query<{ activity_key: string; newest_ledger: Num; newest_full: Num }>(
-      `SELECT activity_key, max(ledger_index) AS newest_ledger, argMax(ledger_full, ledger_index) AS newest_full
-         FROM (SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS activity_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT activity_key, max(ledger_index) AS newest_ledger, argMax(ledger_full, ledger_index) AS newest_full
+         FROM (SELECT ${MAPPED_KEY} AS activity_key,
                       ledger_index, max(full) AS ledger_full
                  FROM ${Table.ValidatorValidations}
                 WHERE ledger_index >= {since:UInt32}
                 GROUP BY activity_key, ledger_index)
         GROUP BY activity_key
         ORDER BY activity_key`,
-      { since: Math.max(0, newest - ACTIVITY_LEDGERS), ephemerals: map.ephemerals, masters: map.masters },
+      { since: Math.max(0, newest - ACTIVITY_LEDGERS) },
     );
     return rows.map((row) => ({
       key: row.activity_key,
@@ -427,7 +427,7 @@ export class ValidatorDirectoryService {
    * the 30-day window, not the start of a UTC day; the 30 daily entries lie inside it), and the rows of its hours are read. Per
    * validator one row comes back with its hours in an array, which keeps the answer a fraction of the rows read.
    */
-  private async readAgreement(map: KeyMap): Promise<{
+  private async readAgreement(): Promise<{
     sentinels: ReadonlyMap<number, HourSentinel>;
     hourly: ReadonlyMap<string, ReadonlyMap<number, KeyHour>>;
   }> {
@@ -495,8 +495,9 @@ export class ValidatorDirectoryService {
     const window = [...sentinels.keys()].filter((hour) => hour >= from && hour <= finalHour).sort((a, b) => a - b);
 
     const rows = await this.ch.query<{ agreement_key: string; hourly: [number, number, number, number][] }>(
-      `SELECT agreement_key, groupArray((agreement_hour, hour_agreed, hour_missed, hour_partial)) AS hourly
-         FROM (SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS agreement_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT agreement_key, groupArray((agreement_hour, hour_agreed, hour_missed, hour_partial)) AS hourly
+         FROM (SELECT ${MAPPED_KEY} AS agreement_key,
                       toUnixTimestamp(hour) AS agreement_hour,
                       toUInt32(sum(agreed)) AS hour_agreed, toUInt32(sum(missed)) AS hour_missed, toUInt32(sum(partial)) AS hour_partial
                  FROM ${Table.ValidatorAgreementHourly}
@@ -511,8 +512,6 @@ export class ValidatorDirectoryService {
         until: finalHour,
         hours: window,
         versions: window.map((hour) => versionOf.get(hour) as string),
-        ephemerals: map.ephemerals,
-        masters: map.masters,
       },
     );
     const hourly = new Map<string, Map<number, KeyHour>>(
@@ -535,10 +534,7 @@ export class ValidatorDirectoryService {
    * The rounds of the last 24 h before the newest, with their votes (records), and the versions of the last 30 days. A round
    * is the rows of its newest sentinel's version.
    */
-  private async readVotes(
-    map: KeyMap,
-    now: number,
-  ): Promise<{ rounds: RoundInfo[]; votes: VoteRow[]; versions: VersionRow[] }> {
+  private async readVotes(now: number): Promise<{ rounds: RoundInfo[]; votes: VoteRow[]; versions: VersionRow[] }> {
     const none = { rounds: [], votes: [], versions: [] };
     const newest = await this.ch.queryOne<{ ledger_index: Num; round_close: Num }>(
       `SELECT ledger_index, toUnixTimestamp(close_time) AS round_close
@@ -617,12 +613,11 @@ export class ValidatorDirectoryService {
       }),
     );
     const [votes, versions] = await Promise.all([
-      this.readRecentVotes(map, rounds, {
+      this.readRecentVotes(rounds, {
         rounds: recent.map((row) => asNumber(row.ledger_index)),
         versions: recent.map((row) => row.newest_version),
       }),
       this.readVersions(
-        map,
         {
           rounds: month.map((row) => asNumber(row.ledger_index)),
           versions: month.map((row) => row.newest_version),
@@ -634,7 +629,7 @@ export class ValidatorDirectoryService {
   }
 
   /** The full votes of the given rounds, by the key of their master. */
-  private async readRecentVotes(map: KeyMap, rounds: readonly RoundInfo[], sets: RoundVersions): Promise<VoteRow[]> {
+  private async readRecentVotes(rounds: readonly RoundInfo[], sets: RoundVersions): Promise<VoteRow[]> {
     if (sets.rounds.length === 0) return [];
     const rows = await this.ch.query<{
       ledger_index: Num;
@@ -645,8 +640,9 @@ export class ValidatorDirectoryService {
       vote_reserve_inc: string | null;
       vote_server_version: string | null;
     }>(
-      `SELECT ledger_index,
-              transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS vote_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT ledger_index,
+              ${MAPPED_KEY} AS vote_key,
               amendments,
               toString(base_fee) AS vote_base_fee, toString(reserve_base) AS vote_reserve_base,
               toString(reserve_inc) AS vote_reserve_inc, toString(server_version) AS vote_server_version
@@ -659,8 +655,6 @@ export class ValidatorDirectoryService {
         last: sets.rounds[sets.rounds.length - 1],
         rounds: sets.rounds,
         versions: sets.versions,
-        ephemerals: map.ephemerals,
-        masters: map.masters,
       },
     );
     const closeOf = new Map(rounds.map((round) => [round.ledgerIndex, round.closeTime]));
@@ -683,14 +677,15 @@ export class ValidatorDirectoryService {
    * The newest `server_version` of each validator over the rounds of the last 30 days, and the distinct ones it reported since
    * `recentSince` (unix seconds): the last 24 h, for the latest version.
    */
-  private async readVersions(map: KeyMap, sets: RoundVersions, recentSince: number): Promise<VersionRow[]> {
+  private async readVersions(sets: RoundVersions, recentSince: number): Promise<VersionRow[]> {
     if (sets.rounds.length === 0) return [];
     const rows = await this.ch.query<{
       version_key: string;
       newest_server_version: string;
       recent_server_versions: string[];
     }>(
-      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS version_key,
+      `WITH ${KEY_MAP_WITH}
+       SELECT ${MAPPED_KEY} AS version_key,
               toString(argMax(server_version, ledger_index)) AS newest_server_version,
               groupUniqArrayIf(toString(server_version), close_time >= toDateTime({recent:UInt32}, 'UTC')) AS recent_server_versions
          FROM ${Table.ValidatorVotes}
@@ -705,8 +700,6 @@ export class ValidatorDirectoryService {
         recent: recentSince,
         rounds: sets.rounds,
         versions: sets.versions,
-        ephemerals: map.ephemerals,
-        masters: map.masters,
       },
     );
     return rows.map((row) => ({
