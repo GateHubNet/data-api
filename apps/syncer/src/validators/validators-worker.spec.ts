@@ -1,7 +1,9 @@
-import { ShutdownSignals } from '@gatehub/data-api-shared';
+import { ClickHouseService, ShutdownSignals } from '@gatehub/data-api-shared';
 import { SyncerConfig } from '../config/syncer.config';
+import { ComputeLoop } from './compute-loop';
 import { DomainChecker } from './domain-checker';
 import { NetworkStatePoller } from './network-state-poller';
+import { seedValidatorSeen } from './seen-seed';
 import { UnlFetcher } from './unl-fetcher';
 import {
   DOMAIN_PASS_INTERVAL_MS,
@@ -10,6 +12,9 @@ import {
   ValidatorsWorker,
 } from './validators-worker';
 import { ValidatorsWorkerOptions } from './validators.options';
+
+jest.mock('./seen-seed', () => ({ seedValidatorSeen: jest.fn() }));
+const seed = jest.mocked(seedValidatorSeen);
 
 /** The workers a test made: each is stopped after it, so that no loop outlives its test. */
 const made: ValidatorsWorker[] = [];
@@ -52,18 +57,36 @@ function setup(options: ValidatorsWorkerOptions = {}, config: Partial<SyncerConf
       calls.push('stop state');
     }),
   };
+  // the order in which the seeding and the compute loop were started and stopped, apart from the calls of the other loops
+  const order: string[] = [];
+  const compute = {
+    start: jest.fn(() => {
+      order.push('start compute');
+    }),
+    stop: jest.fn(async () => {
+      order.push('stop compute');
+    }),
+  };
+  seed.mockReset();
+  seed.mockImplementation(async () => {
+    order.push('seed');
+    return true;
+  });
+  const ch = { query: jest.fn(), command: jest.fn() };
   const signals = { register: jest.fn() };
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
   const worker = new ValidatorsWorker(
     unl as unknown as UnlFetcher,
     domains as unknown as DomainChecker,
     state as unknown as NetworkStatePoller,
+    compute as unknown as ComputeLoop,
+    ch as unknown as ClickHouseService,
     { domainVerification: true, ...config } as SyncerConfig,
     signals as unknown as ShutdownSignals,
     { logger, ...options },
   );
   made.push(worker);
-  return { worker, unl, domains, state, signals, calls, logger };
+  return { worker, unl, domains, state, compute, ch, signals, calls, order, logger };
 }
 
 describe('ValidatorsWorker', () => {
@@ -489,6 +512,80 @@ describe('ValidatorsWorker', () => {
       t.state.pollState.mockImplementationOnce(() => new Promise<boolean>(() => undefined));
       await t.worker.onApplicationBootstrap();
       await jest.advanceTimersByTimeAsync(0);
+      let stopped = false;
+      const stopping = t.worker.stop().then(() => (stopped = true));
+      await jest.advanceTimersByTimeAsync(1_999);
+      expect(stopped).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      await stopping;
+      expect(stopped).toBe(true);
+    });
+  });
+
+  describe('the compute loop', () => {
+    it('seeds validator_seen first, then starts the compute loop after the other loops', async () => {
+      const t = setup();
+      await t.worker.onApplicationBootstrap();
+      expect(t.order).toEqual(['seed', 'start compute']);
+      // the seeding is the first thing the worker does: before the publishers are registered
+      expect(seed).toHaveBeenCalledWith(t.ch);
+      expect(seed.mock.invocationCallOrder[0]).toBeLessThan(t.unl.registerPublishers.mock.invocationCallOrder[0]);
+      expect(t.compute.start.mock.invocationCallOrder[0]).toBeGreaterThan(t.unl.start.mock.invocationCallOrder[0]);
+      await t.worker.stop();
+    });
+
+    it('says so when it seeded, and nothing when the table had rows', async () => {
+      const seeded = setup();
+      await seeded.worker.onApplicationBootstrap();
+      expect(seeded.logger.log).toHaveBeenCalledWith('validator_seen was empty: seeded it from validations');
+      const present = setup();
+      seed.mockImplementation(async () => false);
+      await present.worker.onApplicationBootstrap();
+      expect(present.logger.log).not.toHaveBeenCalled();
+      expect(present.compute.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('starts neither the seeding nor the loop when start.compute is false, and the others all the same', async () => {
+      const t = setup({ start: { compute: false } });
+      await t.worker.onApplicationBootstrap();
+      expect(seed).not.toHaveBeenCalled();
+      expect(t.compute.start).not.toHaveBeenCalled();
+      expect(t.unl.start).toHaveBeenCalled();
+      await t.worker.stop();
+      expect(t.compute.stop).not.toHaveBeenCalled();
+    });
+
+    it('starts the compute loop when only the other loops are switched off', async () => {
+      const t = setup({ start: { unl: false, domains: false, state: false } });
+      await t.worker.onApplicationBootstrap();
+      expect(t.order).toEqual(['seed', 'start compute']);
+      expect(t.unl.start).not.toHaveBeenCalled();
+      await t.worker.stop();
+    });
+
+    it('fails the boot, with nothing started, when validator_seen cannot be seeded', async () => {
+      const t = setup();
+      seed.mockRejectedValueOnce(new Error('ClickHouse is down'));
+      await expect(t.worker.onApplicationBootstrap()).rejects.toThrow('ClickHouse is down');
+      expect(t.unl.registerPublishers).not.toHaveBeenCalled();
+      expect(t.unl.start).not.toHaveBeenCalled();
+      expect(t.compute.start).not.toHaveBeenCalled();
+    });
+
+    it('stops the compute loop with the others on module destroy and on the shutdown signal', async () => {
+      const t = setup();
+      await t.worker.onApplicationBootstrap();
+      await t.worker.onModuleDestroy();
+      expect(t.compute.stop).toHaveBeenCalledTimes(1);
+      await (t.signals.register.mock.calls[0][1] as () => Promise<void>)();
+      expect(t.compute.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops waiting for a compute loop that does not stop after 2 s, like for any loop', async () => {
+      jest.useFakeTimers();
+      const t = setup();
+      t.compute.stop.mockImplementation(() => new Promise<void>(() => undefined));
+      await t.worker.onApplicationBootstrap();
       let stopped = false;
       const stopping = t.worker.stop().then(() => (stopped = true));
       await jest.advanceTimersByTimeAsync(1_999);

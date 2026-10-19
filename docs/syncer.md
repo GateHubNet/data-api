@@ -314,9 +314,9 @@ section 2. Like every worker it is switched on and off with `GH_WORKERS`.
 
 **Two loops.** An **I/O loop** that fetches the UNL lists (below), checks validator domains and polls the node, each on its own
 timer; and a **compute loop**, once a minute, that runs two ClickHouse jobs in the aggregator's job model (a budget per job, a job
-that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher and the
-domain checker and the network state poller are the parts of the I/O loop that are in place; the rest joins the worker as it is built,
-started from the same bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
+that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher, the
+domain checker and the network state poller are the parts of the I/O loop that are in place, and the compute loop runs its `rounds`
+job ([voting rounds](#voting-rounds-and-tallies)); the rest joins the worker as it is built, started from the same bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
 private, loopback or reserved address, no redirect to one, 20 s, 1 MiB, 3 redirects), which also sends the `User-Agent`
 `gatehub-data-api/<version> (validators)`.
 
@@ -460,6 +460,51 @@ off in a test).
   (`the node answered slowDown`) or the message of the error, and its end once at `log`; an answer whose fields cannot be stored is
   logged with the field at fault. A log line never holds an error object.
 
+### Voting rounds and tallies
+
+The compute loop (`ComputeLoop`, `compute-loop.ts`) is the aggregator's job model without its file: once a minute it runs its jobs in
+order inside a tick of 20 s, each with a deadline of its own (`rounds` 5 s; `agreement` 10 s joins it later), so what has to run at
+every tick goes first and none takes the tick from the ones after it. A job that throws is logged (its message) and counted
+(`syncer_validators_jobs_total{job, outcome="error"}`, `ok` otherwise) and the next job still runs; a tick called while one runs is
+skipped with a warning; a stop aborts the signal of the tick, so that nothing more is written or started, and waits for it at most 2 s.
+`start.compute` switches the loop (and the seeding below) off in a test.
+
+Before any loop starts, the worker fills `validator_seen` from `validations` when the table has no row (`seedValidatorSeen`,
+`seen-seed.ts`): one row per validator key with its first and last time of receipt and its newest ledger. It is written at boot, like
+the rows of the publishers, so a ClickHouse that cannot be written fails the boot; a table that has rows is left alone.
+
+`RoundsJob` (`rounds.job.ts`) writes, for each voting ledger V (index % 256 = 255), `validator_votes` (each validator's vote) and
+`amendment_tallies` (the tally of each amendment):
+
+- **Which rounds.** A round is ready when `ledgers` holds a committed ledger at or above V and it is 120 s past the close of V (of
+  the first committed ledger above V when V is missing). Rounds are done oldest first until the deadline. The first round is the first
+  voting ledger at or after the higher of the lowest ledger (above 0) that the oldest active partition of `validations` (`system.parts`)
+  holds a validation of, and the lowest ledger of `ledgers`; then always the newest stored round (its newest sentinel) + 256, so a
+  restart goes on where the last run ended. A voting ledger `ledgers` lacks gets only a sentinel: `observed 0`, `trusted 0`,
+  `threshold 1`, the size of the UNL, the close time of the first committed ledger above it, and no vote.
+- **Votes.** The hash H of V from `ledgers`; the validations of H, one row per validator, keys mapped to master keys through the
+  manifest map (a validation recorded under a signing key counts for its master), with the values of the earliest sighting
+  (`argMin(…, first_datetime)`: `full`, the amendments, the fee votes, the server version). A validation of another hash at V is
+  ignored, as rippled ignores it. The `amendments` text is read as a list of IDs (upper case; an entry that is not an ID is dropped).
+- **UNL and negative UNL.** UNL(V) is the trusted UNL at the close of V from every stored list of the configured publishers (each
+  key a publisher served under was trusted in its time; the filter by the configured key is for "in use now" only), with
+  `GH_UNL_THRESHOLD`; nUNL(V) is the negative UNL of the newest `network_state` row at or before V (none: empty).
+- **Records and tallies** (`tallyRound`, `tally.ts`, F7). The vote record of a UNL member is its newest full validation from a round
+  it was on the UNL of and off the negative UNL of, no more than 24 h before V. The history is the votes and sentinels of the stored
+  rounds of the last 24 h (the rows of the newest sentinel's version of each), plus V. `trusted` is the members with a record,
+  `yes` of an amendment the records that name it, `threshold` is max(1, ⌊trusted × 80 / 100⌋), `observed` the members with a full
+  validation of H, `unl_size` the size of UNL(V). One row per amendment with a yes or in the `Majorities` of the newest
+  `network_state` row, in the order of the IDs, and then the sentinel (`amendment_id ''`) with the UNL, the negative UNL and the fees.
+- **Fees.** The fees in force at V: the newest `SetFee` with `ledger_index <= V` (found through `tx_by_type`; `BaseFeeDrops`,
+  `ReserveBaseDrops`, `ReserveIncrementDrops`, or the legacy `BaseFee` in hex, `ReserveBase`, `ReserveIncrement`), else the newest
+  `network_state` row, else zeros.
+- **Version sets.** The votes are inserted first, then the tallies with the sentinel last, all under one `version` (wall-clock
+  milliseconds, above any version the round has stored). A reader keeps the rows of the newest sentinel's version of a round, so a round
+  that crashed half way is invisible until its sentinel is in, and is redone as a newer set; the job itself reads the history that way.
+- **Observability.** `syncer_validators_rounds_lag_ledgers` is the newest committed voting ledger minus the newest stored round, set
+  at the end of every run (also one that failed or ran out of time). A round whose `observed` is below the quorum of its UNL and
+  negative UNL is warned about: `round <V>: recorded <observed> of <unl size> UNL validations, below quorum <quorum>`.
+
 ## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
@@ -485,6 +530,9 @@ off in a test).
 | `Domain "<domain>": the fetch was blocked (blocked_address, <range>)` | A validator's domain resolves to a private, loopback or reserved address | Nothing is requested; the pair is `unverified` (`blocked_address`) and is checked again in 6 h. Logged at every check. |
 | `Domain verification: N of M manifest lookups failed (...)`, `... were answered with an error (<codes>)` | The node cannot be asked, or answers an error (`actNotFound`, `slowDown`, ...), for the manifests that were stored before migration 002 | Those validators are not checked until an answer is stored; each key is asked again after 10 minutes. |
 | `Network state poll failed: <request>: ...`, `Amendment features poll failed: ...` | The node cannot be asked, times out (5 s), answers an error, or answers with something that cannot be stored | No row is written for that poll; the next one (60 s, or 10 min for the features) is the retry. Logged when the failure starts or changes, and `... recovered` once when it ends; counted in `syncer_validators_node_polls_total{outcome="error"}`. |
+| `Compute job <name> failed: ...` | A job of the compute loop threw (ClickHouse refusing a query or an insert, mostly) | Counted in `syncer_validators_jobs_total{outcome="error"}`; the other jobs of the tick still ran. The job runs again at the next tick from the newest stored round, and a round that was half written is redone as a newer set. |
+| `round <V>: recorded N of M UNL validations, below quorum Q` | The collector missed validations of the round (it was down or behind), the ingest lacks the voting ledger, or the UNL validators did not validate it | The round is recorded as it is, with `observed N`; the votes of the validators that were missed are carried from their last record (24 h). |
+| `Skipping a compute tick: ...`, `Abandoning the compute tick in flight: ...` | A tick took longer than a minute, or did not end within 2 s of the shutdown | The tick was skipped, or was left to finish by itself (it was told to write nothing more). |
 | `amendment <ID> has no metadata entry` | The node, the ledger or the votes name an amendment that the amendment metadata lacks | Warned once per ID; `syncer_amendments_without_metadata` counts them. Add the entry (`amendments:check` lists them). |
 
 ## 11. Source map
@@ -495,7 +543,7 @@ off in a test).
 | `apps/syncer/src/ingest/{live-runner,rpc-ledger-source}.ts` | The ingest worker and its ledger source |
 | `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
-| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `stored-lists`, `safe-fetch` (the only outbound HTTP) |
+| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `compute-loop`, `rounds.job` and `tally` (the compute loop, the voting rounds and the pure tally), `seen-seed`, `stored-lists`, `safe-fetch` (the only outbound HTTP) |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
 | `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |

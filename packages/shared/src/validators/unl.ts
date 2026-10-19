@@ -66,3 +66,18 @@ export function trustedUnl(
   for (const [validator, count] of counts) if (count >= threshold) trusted.add(validator);
   return trusted;
 }
+
+/**
+ * The UNL in force at time `t` (spec 2.4 step 3): the trusted UNL at `t` of the stored lists of `publishers`, each list read
+ * as it stood then. This is the read of the past: it keeps the lists of every key a publisher served under, since each key
+ * was trusted in its time, so a reader of "now" that wants only the configured key filters the lists itself first (the
+ * `publisherKey` of a stored list). The set is new on each call.
+ */
+export function unlAt(
+  lists: readonly StoredUnlList[],
+  publishers: readonly string[],
+  threshold: number,
+  t: number,
+): Set<string> {
+  return trustedUnl(lists, publishers, threshold, t);
+}

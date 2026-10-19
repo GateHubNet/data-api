@@ -4,7 +4,9 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { join } from 'path';
 import { NETWORK_PROFILE, NODE_CLIENT, SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { ComputeLoop } from './compute-loop';
 import { NetworkStatePoller } from './network-state-poller';
+import { RoundsJob } from './rounds.job';
 import { AMENDMENTS_CONFIG, ValidatorsModule } from './validators.module';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
@@ -48,6 +50,12 @@ describe('ValidatorsModule', () => {
   it('provides the network state poller', async () => {
     const moduleRef = await build('xrpl', '');
     expect(moduleRef.get(NetworkStatePoller)).toBeInstanceOf(NetworkStatePoller);
+  });
+
+  it('provides the rounds job and the compute loop', async () => {
+    const moduleRef = await build('xrpl', '');
+    expect(moduleRef.get(RoundsJob)).toBeInstanceOf(RoundsJob);
+    expect(moduleRef.get(ComputeLoop)).toBeInstanceOf(ComputeLoop);
   });
 
   describe('AMENDMENTS_CONFIG', () => {

@@ -1,4 +1,4 @@
-import { normalizeLedgerResponse, RawLedger } from '@gatehub/data-api-shared';
+import { normalizeLedgerResponse, RawLedger, RIPPLE_EPOCH_MS } from '@gatehub/data-api-shared';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -28,7 +28,15 @@ export interface SyntheticChainOptions {
   salt?: string;
   /** This ledger's first transaction has a `Fee` the parser rejects (`buildLedgerRows` throws on it). */
   malformedAt?: number;
+  /**
+   * When ledger `index` closed, in unix seconds. It is written as the ledger's `close_time` and, for the next ledger, as its
+   * `parent_close_time`, both in Ripple time (seconds since 2000-01-01) as a node reports them. Without it every ledger keeps
+   * the template's close time and no `parent_close_time`.
+   */
+  closeTime?: (index: number) => number;
 }
+
+const RIPPLE_EPOCH_SECONDS = RIPPLE_EPOCH_MS / 1000;
 
 /**
  * `count` contiguous ledgers `first` .. `first + count - 1`, all made from one recorded ripple-mock ledger (ruling R5):
@@ -49,6 +57,10 @@ export function syntheticChain(first: number, count: number, opts: SyntheticChai
       hash,
       parent_hash: parentHash,
     };
+    if (opts.closeTime !== undefined) {
+      json.close_time = opts.closeTime(index) - RIPPLE_EPOCH_SECONDS;
+      json.parent_close_time = opts.closeTime(index - 1) - RIPPLE_EPOCH_SECONDS;
+    }
     if (index === opts.malformedAt) {
       const [first, ...rest] = json.transactions as Record<string, unknown>[];
       json.transactions = [{ ...first, Fee: 'not a number' }, ...rest];

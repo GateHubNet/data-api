@@ -2,10 +2,14 @@ import {
   AMENDMENTS_OBJECT_INDEX,
   FEE_SETTINGS_OBJECT_INDEX,
   getNetworkProfile,
+  LedgerWriter,
   listInUse,
   loadAmendmentsConfig,
   NEGATIVE_UNL_OBJECT_INDEX,
+  NetworkStateRow,
+  parseContextFor,
   Table,
+  ValidationsRow,
 } from '@gatehub/data-api-shared';
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -17,7 +21,12 @@ import {
   TestKey,
   testKey,
 } from '../../../packages/shared/src/test-utils/validator-keys';
+import { SyncerConfig } from '../src/config/syncer.config';
+import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
+import { ComputeTick } from '../src/validators/compute-loop';
 import { NetworkStatePoller } from '../src/validators/network-state-poller';
+import { RoundsJob } from '../src/validators/rounds.job';
+import { seedValidatorSeen } from '../src/validators/seen-seed';
 import { readStoredLists } from '../src/validators/stored-lists';
 import {
   FakeNode,
@@ -34,6 +43,7 @@ import {
   ValidatorsAppOptions,
   waitFor,
 } from './support/validators-env';
+import { syntheticChain, syntheticHash } from './synthetic-chain';
 
 /**
  * The validators worker against a real ClickHouse, a node and an HTTPS publisher (`https://unl.example`) that serve
@@ -1661,6 +1671,830 @@ describe('the validators worker (e2e)', () => {
         expect(stateNode.requests.filter((r) => r.command !== 'server_info')).toEqual([]);
         expect(await polled(app, 'amendments', 'ok')).toBe(0);
       });
+    });
+  });
+  describe('voting rounds and tallies', () => {
+    const ctx = parseContextFor(getNetworkProfile('xrpl'));
+    /** Voting ledgers: 256k - 1. */
+    const R1 = 511;
+    const R2 = 767;
+    const R3 = 1023;
+    /** Four validators of the test-signed list, one that is not on it, and a signing key of the first. */
+    const [K1, K2, K3, K4, OUTSIDER] = ['k1', 'k2', 'k3', 'k4', 'outsider'].map((label) => testKey(`rounds-${label}`));
+    const K1_SIGNING = testKey('rounds-k1-signing');
+    const K2_SIGNING = testKey('rounds-k2-signing');
+    const [AM_A, AM_B, AM_C, AM_D, AM_E, AM_Z] = ['A1', 'B2', 'C3', 'D4', 'E5', 'F6'].map((x) => x.repeat(32));
+    /** The ledger R2 + 1 closed two hours ago, the ledgers 4 s apart. */
+    const END = nowSeconds() - 2 * 3600;
+    const closeOf = (index: number): number => END + (index - (R2 + 1)) * 4;
+
+    /** The rows the voting rounds read and write, and the ledger tables the test writes. */
+    const TABLES = [
+      Table.Ledgers,
+      Table.LedgerByHash,
+      Table.Transactions,
+      Table.TxByType,
+      Table.Validations,
+      Table.ValidatorManifests,
+      Table.ValidatorSeen,
+      Table.ValidatorVotes,
+      Table.AmendmentTallies,
+      Table.NetworkState,
+    ];
+
+    /** The log lines of the jobs of the test. */
+    let warnings: string[] = [];
+
+    beforeEach(async () => {
+      warnings = [];
+      for (const table of TABLES) await db.ch.command(`TRUNCATE TABLE ${table}`);
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    /** Writes the synthetic ledgers `first .. first + count - 1` of each group through the real ledger writer. */
+    async function writeLedgers(...groups: Array<[first: number, count: number]>): Promise<void> {
+      const ledgers = groups.flatMap(([first, count]) =>
+        syntheticChain(first, count, { closeTime: closeOf }).map((ledger) => ledger.raw),
+      );
+      await new LedgerWriter(db.ch, ctx).write(ledgers);
+    }
+
+    /** The ledgers around the voting ledgers R1 and R2. */
+    const writeBaseLedgers = () => writeLedgers([R1 - 1, 3], [R2 - 1, 3]);
+
+    /** A validation of `ledger` (of the hash of the synthetic ledger unless `hash` says another) as the collector stores it. */
+    async function validate(
+      key: string,
+      ledger: number,
+      o: {
+        amendments?: string[];
+        full?: boolean;
+        hash?: string;
+        signing?: string;
+        at?: number;
+        baseFee?: string;
+        reserveBase?: string;
+        reserveInc?: string;
+        serverVersion?: string;
+      } = {},
+    ): Promise<void> {
+      const at = o.at ?? closeOf(ledger) + 3.5;
+      const row: ValidationsRow = {
+        ledger_hash: o.hash ?? syntheticHash(ledger),
+        validation_public_key: key,
+        count: 1,
+        first_datetime: at,
+        last_datetime: at,
+        ledger_index: ledger,
+        reporter_public_key: '',
+        ephemeral_public_key: o.signing ?? '',
+        signature: '',
+        signing_time: 0,
+        flags: 0,
+        full: o.full === false ? 0 : 1,
+        amendments: o.amendments === undefined || o.amendments.length === 0 ? '' : JSON.stringify(o.amendments),
+        base_fee: o.baseFee ?? null,
+        load_fee: null,
+        reserve_base: o.reserveBase ?? null,
+        reserve_inc: o.reserveInc ?? null,
+        server_version: o.serverVersion ?? null,
+      };
+      await db.ch.insert(Table.Validations, [row]);
+    }
+
+    /** The four validators of the list each send a full validation of `ledger` that votes for `amendments`. */
+    async function validateAll(ledger: number, amendments: string[]): Promise<void> {
+      for (const key of [K1, K2, K3, K4]) await validate(key.base58, ledger, { amendments });
+    }
+
+    /** A `SetFee` pseudo-transaction in `ledger`, in `transactions` and in its index. */
+    async function seedSetFee(ledger: number, fields: Record<string, unknown>): Promise<void> {
+      const account = 'rrrrrrrrrrrrrrrrrrrrrhoLvTp';
+      await db.ch.insert(Table.Transactions, [
+        {
+          ledger_index: ledger,
+          tx_index: 0,
+          hash: syntheticHash(ledger, 'setfee'),
+          tx_type: 'SetFee',
+          result: 'tesSUCCESS',
+          account,
+          sequence: 0,
+          fee: 0,
+          close_time: closeOf(ledger),
+          tx_json: JSON.stringify({ TransactionType: 'SetFee', Account: account, Fee: '0', Sequence: 0, ...fields }),
+          meta_json: '{}',
+        },
+      ]);
+      await db.ch.insert(Table.TxByType, [
+        { tx_type: 'SetFee', ledger_index: ledger, tx_index: 0, result: 'tesSUCCESS' },
+      ]);
+    }
+
+    const networkState = (ledger: number, over: Partial<NetworkStateRow> = {}): NetworkStateRow => ({
+      ledger_index: ledger,
+      ledger_hash: '',
+      polled_at: closeOf(ledger) + 1,
+      amendments: [],
+      majorities: [],
+      negative_unl: [],
+      to_disable: '',
+      to_reenable: '',
+      base_fee: '10',
+      reserve_base: '1000000',
+      reserve_inc: '200000',
+      node_quorum: 0,
+      ...over,
+    });
+
+    /** The worker, started only for its UNL loop, with `validators` on the list `https://unl.example` serves. */
+    async function bootWithList(validators = [K1, K2, K3, K4]): Promise<ValidatorsApp> {
+      web.serveJson(
+        'unl.example',
+        '/',
+        makeUnlResponse({
+          publisher: PUBLISHER,
+          publisherSigning: SIGNING_1,
+          blobs: [
+            {
+              blob: makeUnlBlob({
+                sequence: 3,
+                expiration: nowSeconds() + 30 * DAY,
+                validators: validators.map((master) => ({ master })),
+              }),
+            },
+          ],
+        }),
+      );
+      const app = await boot(PUBLISHERS, { start: { state: false, domains: false, compute: false } });
+      await firstAttempt(app, 'ok');
+      return app;
+    }
+
+    /** A job of its own over the database of the test (a restart is another one). */
+    function makeJob(now?: () => number): RoundsJob {
+      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS });
+      const logger = { log: () => undefined, warn: (line: string) => void warnings.push(line), error: () => undefined };
+      return new RoundsJob(db.ch, cfg, new PrometheusService(), { now, logger });
+    }
+
+    /** The tick of a job at `ms` (the clock of the job says the same), with a minute to spare. */
+    const tickAt = (ms: number): ComputeTick => ({
+      now: ms,
+      deadline: ms + 60_000,
+      signal: new AbortController().signal,
+    });
+
+    /** Runs a job now. */
+    const runNow = (job: RoundsJob) => job.run(tickAt(Date.now()));
+
+    /** Runs a job as if it were `ms` (unix milliseconds). */
+    const runAt = (ms: number) => makeJob(() => ms).run(tickAt(ms));
+
+    interface VoteOut {
+      validation_public_key: string;
+      ledger_hash: string;
+      close_time: number;
+      full: number;
+      amendments: string[];
+      base_fee: string | null;
+      reserve_base: string | null;
+      reserve_inc: string | null;
+      server_version: string | null;
+      version: string;
+    }
+
+    const votesOf = (ledger: number) =>
+      db.ch.query<VoteOut>(
+        `SELECT validation_public_key, ledger_hash, toUnixTimestamp(close_time) AS close_time, full, amendments,
+                toString(base_fee) AS base_fee, toString(reserve_base) AS reserve_base, toString(reserve_inc) AS reserve_inc,
+                toString(server_version) AS server_version, toString(version) AS version
+           FROM ${Table.ValidatorVotes} WHERE ledger_index = {ledger:UInt32} ORDER BY validation_public_key`,
+        { ledger },
+      );
+
+    interface TallyOut {
+      amendment_id: string;
+      close_time: number;
+      yes: number;
+      trusted: number;
+      threshold: number;
+      unl_size: number;
+      observed: number;
+      unl: string[];
+      negative_unl: string[];
+      base_fee: string;
+      reserve_base: string;
+      reserve_inc: string;
+      version: string;
+    }
+
+    const talliesOf = (ledger: number) =>
+      db.ch.query<TallyOut>(
+        `SELECT amendment_id, toUnixTimestamp(close_time) AS close_time, yes, trusted, threshold, unl_size, observed, unl,
+                negative_unl, toString(base_fee) AS base_fee, toString(reserve_base) AS reserve_base,
+                toString(reserve_inc) AS reserve_inc, toString(version) AS version
+           FROM ${Table.AmendmentTallies} WHERE ledger_index = {ledger:UInt32} ORDER BY amendment_id`,
+        { ledger },
+      );
+
+    /** The amendment rows of a round as `[id, yes]`, without the sentinel. */
+    const yesOf = (rows: TallyOut[]) =>
+      rows.filter((row) => row.amendment_id !== '').map((row) => [row.amendment_id, row.yes]);
+
+    const sentinelsOf = () =>
+      db.ch.query<{ ledger_index: number; version: string }>(
+        `SELECT ledger_index, toString(version) AS version FROM ${Table.AmendmentTallies}
+          WHERE amendment_id = '' ORDER BY ledger_index, version`,
+      );
+
+    const lagOf = async () => (await new PrometheusService().validatorsRoundsLagLedgers.get()).values[0]?.value;
+
+    const sorted = (keys: string[]) => [...keys].sort();
+    const UNL_KEYS = sorted([K1, K2, K3, K4].map((key) => key.base58));
+
+    it('writes votes and tallies of each round, sentinel last', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      // fees: the SetFee in force at each round (the one after R2 is not), the legacy form among them
+      await seedSetFee(300, { BaseFeeDrops: '10', ReserveBaseDrops: '1000000', ReserveIncrementDrops: '200000' });
+      await seedSetFee(600, {
+        BaseFee: '000000000000000F',
+        ReferenceFeeUnits: 10,
+        ReserveBase: 20000000,
+        ReserveIncrement: 5000000,
+      });
+      await seedSetFee(800, { BaseFeeDrops: '99', ReserveBaseDrops: '99', ReserveIncrementDrops: '99' });
+      // the negative UNL of the newest state at or before each round, and the majorities of the newest state
+      await db.ch.insert(Table.NetworkState, [
+        networkState(400),
+        networkState(700, {
+          negative_unl: [{ validation_public_key: K4.base58, first_ledger: 650 }],
+          majorities: [{ amendment: AM_D, since: closeOf(700) }],
+        }),
+      ]);
+      // round 1: A has four yes, B one (K4), C is the vote of a validator that is not on the list
+      for (const key of [K1, K2, K3]) await validate(key.base58, R1, { amendments: [AM_A] });
+      await validate(K4.base58, R1, { amendments: [AM_A, AM_B], serverVersion: '5817044467490840576' });
+      await validate(OUTSIDER.base58, R1, {
+        amendments: [AM_C],
+        baseFee: '12',
+        reserveBase: '1000000',
+        reserveInc: '200000',
+      });
+      // round 2: K4 is on the negative UNL, so its vote of the round does not count and its record of round 1 stays
+      for (const key of [K1, K2]) await validate(key.base58, R2, { amendments: [AM_A] });
+      await validate(K3.base58, R2, { amendments: [AM_A, AM_E] });
+      await validate(K4.base58, R2, { amendments: [] });
+      await validate(OUTSIDER.base58, R2, { amendments: [AM_A] });
+
+      const insert = jest.spyOn(db.ch, 'insert');
+      const before = Date.now();
+      await runNow(makeJob());
+      const after = Date.now();
+
+      // round 1: the votes of the validators that signed the ledger, the earliest sighting's values
+      const votes1 = await votesOf(R1);
+      expect(votes1.map((v) => v.validation_public_key)).toEqual(
+        sorted([K1, K2, K3, K4, OUTSIDER].map((k) => k.base58)),
+      );
+      const byKey = (votes: VoteOut[], key: string) => votes.find((v) => v.validation_public_key === key);
+      expect(byKey(votes1, K4.base58)).toMatchObject({
+        ledger_hash: syntheticHash(R1),
+        close_time: closeOf(R1),
+        full: 1,
+        amendments: [AM_A, AM_B],
+        base_fee: null,
+        reserve_base: null,
+        reserve_inc: null,
+        server_version: '5817044467490840576',
+      });
+      expect(byKey(votes1, OUTSIDER.base58)).toMatchObject({
+        amendments: [AM_C],
+        base_fee: '12',
+        reserve_base: '1000000',
+        reserve_inc: '200000',
+        server_version: null,
+      });
+      expect(byKey(votes1, K1.base58)?.amendments).toEqual([AM_A]);
+
+      const tallies1 = await talliesOf(R1);
+      expect(yesOf(tallies1)).toEqual([
+        [AM_A, 4],
+        [AM_B, 1],
+        [AM_D, 0], // in a majority in the newest state, with no vote
+      ]);
+      const sentinel1 = tallies1.find((row) => row.amendment_id === '');
+      expect(sentinel1).toMatchObject({
+        close_time: closeOf(R1),
+        yes: 0,
+        trusted: 4,
+        threshold: 3,
+        unl_size: 4,
+        observed: 4,
+        unl: UNL_KEYS,
+        negative_unl: [],
+        base_fee: '10',
+        reserve_base: '1000000',
+        reserve_inc: '200000',
+      });
+      for (const row of tallies1) expect(row).toMatchObject({ trusted: 4, threshold: 3, unl_size: 4, observed: 4 });
+
+      // round 2: K4's carried record gives A and B their votes; fees from the legacy SetFee of ledger 600
+      const tallies2 = await talliesOf(R2);
+      expect(yesOf(tallies2)).toEqual([
+        [AM_A, 4],
+        [AM_B, 1],
+        [AM_D, 0],
+        [AM_E, 1],
+      ]);
+      expect(tallies2.find((row) => row.amendment_id === '')).toMatchObject({
+        close_time: closeOf(R2),
+        trusted: 4,
+        threshold: 3,
+        unl_size: 4,
+        observed: 4, // the validation of K4 was seen, though it does not count
+        unl: UNL_KEYS,
+        negative_unl: [K4.base58],
+        base_fee: '15',
+        reserve_base: '20000000',
+        reserve_inc: '5000000',
+      });
+      const votes2 = await votesOf(R2);
+      expect(votes2.map((v) => v.validation_public_key)).toEqual(
+        sorted([K1, K2, K3, K4, OUTSIDER].map((k) => k.base58)),
+      );
+
+      // one version per round, shared by its votes and its tallies: wall-clock milliseconds
+      for (const rows of [
+        [...votes1, ...tallies1],
+        [...votes2, ...tallies2],
+      ]) {
+        const versions = new Set(rows.map((row) => row.version));
+        expect(versions.size).toBe(1);
+        expect(Number([...versions][0])).toBeGreaterThanOrEqual(before);
+        expect(Number([...versions][0])).toBeLessThanOrEqual(after);
+      }
+
+      // the votes go in before the tallies, and the sentinel is the last row of the tallies
+      const written = insert.mock.calls
+        .filter(([table]) => table === Table.ValidatorVotes || table === Table.AmendmentTallies)
+        .map(
+          ([table, rows]) =>
+            [table, (rows as Array<{ amendment_id?: string }>).map((row) => row.amendment_id)] as const,
+        );
+      expect(written.map(([table]) => table)).toEqual([
+        Table.ValidatorVotes,
+        Table.AmendmentTallies,
+        Table.ValidatorVotes,
+        Table.AmendmentTallies,
+      ]);
+      for (const [table, ids] of written) {
+        if (table !== Table.AmendmentTallies) continue;
+        expect(ids[ids.length - 1]).toBe('');
+        expect(ids.filter((id) => id === '')).toHaveLength(1);
+      }
+
+      // nothing is behind: the newest committed voting ledger is the newest stored round
+      expect(await lagOf()).toBe(0);
+      expect(warnings).toEqual([]);
+    });
+
+    it('takes the fees of the newest ledger state when the index holds no SetFee', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      await db.ch.insert(Table.NetworkState, [
+        networkState(900, { base_fee: '11', reserve_base: '1100000', reserve_inc: '210000' }),
+      ]);
+      await validateAll(R1, [AM_A]);
+      await validateAll(R2, [AM_A]);
+
+      await runNow(makeJob());
+
+      for (const round of [R1, R2]) {
+        expect((await talliesOf(round)).find((row) => row.amendment_id === '')).toMatchObject({
+          base_fee: '11',
+          reserve_base: '1100000',
+          reserve_inc: '210000',
+        });
+      }
+    });
+
+    it('counts a vote recorded under the signing key for its master', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      await db.ch.insert(Table.ValidatorManifests, [
+        { ephemeral_key: K1_SIGNING.base58, master_key: K1.base58, seq: 2, domain: '', manifest: '', source: 'stream' },
+        { ephemeral_key: K2_SIGNING.base58, master_key: K2.base58, seq: 1, domain: '', manifest: '', source: 'stream' },
+      ]);
+      // K1 was recorded under its signing key before the manifest was known
+      await validate(K1_SIGNING.base58, R1, { amendments: [AM_A], signing: K1_SIGNING.base58 });
+      // K2 under both, the signing key first: the earliest sighting's values are the vote
+      await validate(K2_SIGNING.base58, R1, { amendments: [AM_A], at: closeOf(R1) + 2 });
+      await validate(K2.base58, R1, { amendments: [AM_B], at: closeOf(R1) + 4 });
+      await validate(K3.base58, R1, { amendments: [AM_A] });
+      await validate(K4.base58, R1, { amendments: [AM_A] });
+
+      await runNow(makeJob());
+
+      const votes = await votesOf(R1);
+      expect(votes.map((v) => v.validation_public_key)).toEqual(sorted([K1, K2, K3, K4].map((k) => k.base58)));
+      expect(votes.find((v) => v.validation_public_key === K2.base58)?.amendments).toEqual([AM_A]);
+      const tallies = await talliesOf(R1);
+      expect(yesOf(tallies)).toEqual([[AM_A, 4]]);
+      expect(tallies.find((row) => row.amendment_id === '')).toMatchObject({ trusted: 4, observed: 4 });
+    });
+
+    it('ignores validations of another hash at V', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      // all four validated a ledger of another hash at the voting ledger, with other votes
+      for (const key of [K1, K2, K3, K4]) {
+        await validate(key.base58, R1, { amendments: [AM_B, AM_C], hash: 'E'.repeat(64) });
+      }
+      // only K1 validated the ledger that was ingested
+      await validate(K1.base58, R1, { amendments: [AM_A] });
+
+      await runNow(makeJob());
+
+      expect((await votesOf(R1)).map((v) => [v.validation_public_key, v.ledger_hash, v.amendments])).toEqual([
+        [K1.base58, syntheticHash(R1), [AM_A]],
+      ]);
+      const tallies = await talliesOf(R1);
+      expect(yesOf(tallies)).toEqual([[AM_A, 1]]);
+      expect(tallies.find((row) => row.amendment_id === '')).toMatchObject({
+        trusted: 1,
+        threshold: 1,
+        unl_size: 4,
+        observed: 1,
+      });
+      expect(warnings).toContain('round 511: recorded 1 of 4 UNL validations, below quorum 4');
+    });
+
+    it('writes an observed-0 sentinel for a voting ledger the ingest lacks', async () => {
+      await bootWithList();
+      // the ledgers around R1 and R3, none of R2
+      await writeLedgers([R1 - 1, 3], [R3 - 1, 3]);
+      await db.ch.insert(Table.NetworkState, [networkState(400)]);
+      await validateAll(R1, [AM_A]);
+      // K4 does not validate round 3
+      for (const key of [K1, K2, K3]) await validate(key.base58, R3, { amendments: [AM_B] });
+
+      await runNow(makeJob());
+
+      expect(await votesOf(R2)).toEqual([]);
+      const gap = await talliesOf(R2);
+      expect(gap).toEqual([
+        {
+          amendment_id: '',
+          // the first committed ledger above R2
+          close_time: closeOf(R3 - 1),
+          yes: 0,
+          trusted: 0,
+          threshold: 1,
+          unl_size: 4,
+          observed: 0,
+          unl: UNL_KEYS,
+          negative_unl: [],
+          base_fee: '10',
+          reserve_base: '1000000',
+          reserve_inc: '200000',
+          version: expect.any(String),
+        },
+      ]);
+      expect(warnings).toContain('round 767: recorded 0 of 4 UNL validations, below quorum 4');
+      // the round after it builds on the records of the first (within 24 h): K4's is the only one it has
+      const tallies3 = await talliesOf(R3);
+      expect(yesOf(tallies3)).toEqual([
+        [AM_A, 1],
+        [AM_B, 3],
+      ]);
+      expect(tallies3.find((row) => row.amendment_id === '')).toMatchObject({ trusted: 4, threshold: 3, observed: 3 });
+      expect(warnings).toContain('round 1023: recorded 3 of 4 UNL validations, below quorum 4');
+      expect((await sentinelsOf()).map((row) => row.ledger_index)).toEqual([R1, R2, R3]);
+    });
+
+    it('resumes from the newest stored round after a restart', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      await validateAll(R1, [AM_A]);
+      await validateAll(R2, [AM_A]);
+
+      // the first run is at a time when only round 1 is ready: 120 s after it closed
+      await runAt((closeOf(R1) + 600) * 1000);
+      const afterFirst = await sentinelsOf();
+      expect(afterFirst.map((row) => row.ledger_index)).toEqual([R1]);
+      // round 2 is on its way: the newest committed voting ledger (R2) is 256 ahead
+      expect(await lagOf()).toBe(256);
+
+      // a new job instance (a restart) writes the next round only, and leaves the first alone
+      const insert = jest.spyOn(db.ch, 'insert');
+      await runNow(makeJob());
+      const written = insert.mock.calls.flatMap(([table, rows]) =>
+        table === Table.AmendmentTallies
+          ? (rows as Array<{ ledger_index: number }>).map((row) => row.ledger_index)
+          : [],
+      );
+      expect(new Set(written)).toEqual(new Set([R2]));
+      const afterSecond = await sentinelsOf();
+      expect(afterSecond.map((row) => row.ledger_index)).toEqual([R1, R2]);
+      expect(afterSecond[0]).toEqual(afterFirst[0]);
+      expect(await lagOf()).toBe(0);
+
+      // and with nothing new, a job writes nothing
+      insert.mockClear();
+      await runNow(makeJob());
+      expect(
+        insert.mock.calls.filter(([table]) => table === Table.ValidatorVotes || table === Table.AmendmentTallies),
+      ).toEqual([]);
+    });
+
+    describe('which rounds', () => {
+      const rounds = async () => (await sentinelsOf()).map((row) => row.ledger_index);
+
+      it('waits until 120 s after the voting ledger closed', async () => {
+        await bootWithList();
+        await writeBaseLedgers();
+        await validateAll(R1, [AM_A]);
+
+        await runAt((closeOf(R1) + 119) * 1000);
+        expect(await rounds()).toEqual([]);
+        await runAt((closeOf(R1) + 120) * 1000);
+        expect(await rounds()).toEqual([R1]);
+      });
+
+      it('waits for the ingest to reach the voting ledger', async () => {
+        await bootWithList();
+        await writeLedgers([R1 - 1, 2]); // 510 and 511, nothing above
+        await validateAll(R1, [AM_A]);
+        await runNow(makeJob());
+        // the voting ledger itself is committed: it is a round
+        expect(await rounds()).toEqual([R1]);
+        // the next voting ledger is not there at all
+        await runNow(makeJob());
+        expect(await rounds()).toEqual([R1]);
+      });
+
+      it('starts at the first voting ledger at or after the lowest ledger of the oldest validations', async () => {
+        await bootWithList();
+        await writeBaseLedgers();
+        // validations of round 2 only, and a record of one with no ledger index, which says nothing
+        await validateAll(R2, [AM_A]);
+        await validate(K1.base58, 0, { hash: 'D'.repeat(64) });
+
+        await runNow(makeJob());
+
+        expect(await rounds()).toEqual([R2]);
+      });
+
+      it('takes the lowest ledger of the oldest partition of validations, not of all of them', async () => {
+        await bootWithList();
+        await writeBaseLedgers();
+        // received two days ago: the oldest partition, holding round 2 only; today's holds round 1 (a late arrival)
+        await validateAll(R2, [AM_A]);
+        for (const key of [K1, K2, K3, K4]) {
+          await validate(key.base58, R2, { amendments: [AM_A], at: END - 2 * DAY });
+        }
+        await validate(K1.base58, R1, { amendments: [AM_A] });
+
+        await runNow(makeJob());
+
+        expect(await rounds()).toEqual([R2]);
+      });
+
+      it('starts no earlier than the first ledger the ingest holds', async () => {
+        await bootWithList();
+        // the ingest began after round 1: 512 is the lowest ledger
+        await writeLedgers([R1 + 1, 2], [R2 - 1, 3]);
+        await validateAll(R1, [AM_A]);
+        await validateAll(R2, [AM_A]);
+
+        await runNow(makeJob());
+
+        expect(await rounds()).toEqual([R2]);
+      });
+
+      it('does nothing while there are no validations or no ledgers', async () => {
+        await bootWithList();
+        const insert = jest.spyOn(db.ch, 'insert');
+        await runNow(makeJob()); // neither
+        await writeBaseLedgers();
+        await runNow(makeJob()); // ledgers only
+        await validateAll(R1, [AM_A]);
+        await db.ch.command(`TRUNCATE TABLE ${Table.Ledgers}`);
+        await runNow(makeJob()); // validations only
+        expect(await rounds()).toEqual([]);
+        expect(
+          insert.mock.calls.filter(([table]) => table === Table.ValidatorVotes || table === Table.AmendmentTallies),
+        ).toEqual([]);
+      });
+
+      it('stops starting rounds at the deadline of the tick', async () => {
+        await bootWithList();
+        await writeBaseLedgers();
+        await validateAll(R1, [AM_A]);
+        await validateAll(R2, [AM_A]);
+        // a clock that moves a second each time it is read: the deadline is passed after the first round
+        const start = Date.now();
+        let reads = 0;
+        const job = makeJob(() => start + 1000 * reads++);
+
+        await job.run({ now: start, deadline: start + 500, signal: new AbortController().signal });
+
+        expect(await rounds()).toEqual([R1]);
+        // the lag shows the round that is left
+        expect(await lagOf()).toBe(256);
+        // the next tick goes on with it
+        await runNow(makeJob());
+        expect(await rounds()).toEqual([R1, R2]);
+      });
+    });
+
+    it('writes no sentinel once the shutdown began, and redoes the round as a newer set', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      await validateAll(R1, [AM_A]);
+      const controller = new AbortController();
+      const real = db.ch.insert.bind(db.ch);
+      // the shutdown comes between the votes and the tallies of round 1
+      jest.spyOn(db.ch, 'insert').mockImplementation(async (table, rows, opts) => {
+        await real(table, rows, opts);
+        if (table === Table.ValidatorVotes) controller.abort();
+      });
+
+      await makeJob().run({ now: Date.now(), deadline: Date.now() + 60_000, signal: controller.signal });
+
+      expect(await sentinelsOf()).toEqual([]);
+      const half = await votesOf(R1);
+      expect(half).toHaveLength(4);
+      jest.restoreAllMocks();
+
+      await runNow(makeJob());
+
+      const sentinels = await sentinelsOf();
+      expect(sentinels.map((row) => row.ledger_index)).toEqual([R1, R2]);
+      expect(Number(sentinels[0].version)).toBeGreaterThan(Number(half[0].version));
+    });
+
+    it('writes nothing for a tick whose signal is already aborted', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      await validateAll(R1, [AM_A]);
+      const controller = new AbortController();
+      controller.abort();
+      const insert = jest.spyOn(db.ch, 'insert');
+
+      await makeJob().run({ now: Date.now(), deadline: Date.now() + 60_000, signal: controller.signal });
+
+      expect(insert).not.toHaveBeenCalled();
+    });
+
+    it('writes a version newer than anything stored for the round', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      await validateAll(R1, [AM_A]);
+      // a half-written set from a crash, with a version in the future: votes and no sentinel, so no round
+      const future = Date.now() + 3_600_000;
+      await db.ch.insert(Table.ValidatorVotes, [
+        {
+          ledger_index: R1,
+          validation_public_key: OUTSIDER.base58,
+          ledger_hash: syntheticHash(R1),
+          close_time: closeOf(R1),
+          full: 1,
+          amendments: [AM_Z],
+          base_fee: null,
+          reserve_base: null,
+          reserve_inc: null,
+          server_version: null,
+          version: future,
+        },
+      ]);
+
+      await runNow(makeJob());
+
+      const sentinels = await sentinelsOf();
+      expect(sentinels.map((row) => row.ledger_index)).toEqual([R1, R2]);
+      expect(Number(sentinels[0].version)).toBe(future + 1);
+      expect((await talliesOf(R1)).every((row) => row.version === sentinels[0].version)).toBe(true);
+      // the set of the round is the rows of the sentinel's version: the half-written row is of an older one
+      const set = (await votesOf(R1)).filter((v) => v.version === sentinels[0].version);
+      expect(set.map((v) => v.validation_public_key)).toEqual(sorted([K1, K2, K3, K4].map((k) => k.base58)));
+    });
+
+    it('builds on the rows of the newest version of a stored round and no other', async () => {
+      await bootWithList();
+      await writeBaseLedgers();
+      for (const key of [K1, K2, K4]) await validate(key.base58, R1, { amendments: [AM_A] });
+      // K3's validation of round 1 is partial: it makes no record
+      await validate(K3.base58, R1, { amendments: [AM_A], full: false });
+      await validate(K1.base58, R2, { amendments: [AM_A] });
+      await validate(K2.base58, R2, { amendments: [AM_A] });
+      await validate(K4.base58, R2, { amendments: [AM_A] });
+      await runAt((closeOf(R1) + 600) * 1000); // round 1 only
+      expect((await sentinelsOf()).map((row) => row.ledger_index)).toEqual([R1]);
+
+      // an older version of round 1 turns up (a stale writer): a full vote of K3 and a sentinel
+      await db.ch.insert(Table.ValidatorVotes, [
+        {
+          ledger_index: R1,
+          validation_public_key: K3.base58,
+          ledger_hash: syntheticHash(R1),
+          close_time: closeOf(R1),
+          full: 1,
+          amendments: [AM_Z],
+          base_fee: null,
+          reserve_base: null,
+          reserve_inc: null,
+          server_version: null,
+          version: 1,
+        },
+      ]);
+      await db.ch.insert(Table.AmendmentTallies, [
+        {
+          ledger_index: R1,
+          amendment_id: '',
+          close_time: closeOf(R1),
+          yes: 0,
+          trusted: 0,
+          threshold: 1,
+          unl_size: 0,
+          observed: 0,
+          unl: [],
+          negative_unl: [],
+          base_fee: '0',
+          reserve_base: '0',
+          reserve_inc: '0',
+          version: 1,
+        },
+      ]);
+
+      await runNow(makeJob()); // round 2, on top of round 1
+
+      // K3 has no record: its full vote is of an old version, and it did not validate round 2
+      const tallies = await talliesOf(R2);
+      expect(yesOf(tallies)).toEqual([[AM_A, 3]]);
+      expect(tallies.find((row) => row.amendment_id === '')).toMatchObject({ trusted: 3, unl_size: 4, observed: 3 });
+    });
+
+    it('seeds validator_seen once from validations', async () => {
+      await validate(K1.base58, R1, { at: END + 100.25 });
+      await validate(K1.base58, R2, { at: END + 900.5 });
+      await validate(K2.base58, R1, { at: END + 150 });
+      const seen = () =>
+        db.ch.query<{ key: string; first_ms: number | string; last_ms: number | string; ledger: number }>(
+          `SELECT validation_public_key AS key, toUnixTimestamp64Milli(min(first_seen)) AS first_ms,
+                  toUnixTimestamp64Milli(max(last_seen)) AS last_ms, max(last_ledger_index) AS ledger
+             FROM ${Table.ValidatorSeen} GROUP BY validation_public_key ORDER BY validation_public_key`,
+        );
+
+      expect(await seedValidatorSeen(db.ch)).toBe(true);
+      const expected = [
+        { key: K1.base58, first_ms: (END + 100.25) * 1000, last_ms: (END + 900.5) * 1000, ledger: R2 },
+        { key: K2.base58, first_ms: (END + 150) * 1000, last_ms: (END + 150) * 1000, ledger: R1 },
+      ].sort((a, b) => (a.key < b.key ? -1 : 1));
+      expect((await seen()).map((r) => ({ ...r, first_ms: Number(r.first_ms), last_ms: Number(r.last_ms) }))).toEqual(
+        expected,
+      );
+
+      // it has rows now: a later call seeds nothing, whatever validations holds
+      await validate(K3.base58, R1, { at: END + 200 });
+      expect(await seedValidatorSeen(db.ch)).toBe(false);
+      expect((await seen()).map((r) => r.key)).toEqual(expected.map((r) => r.key));
+    });
+
+    it('does not seed validator_seen when it already has a row', async () => {
+      await validate(K1.base58, R1);
+      await db.ch.insert(Table.ValidatorSeen, [
+        { validation_public_key: K4.base58, first_seen: 1_760_000_000, last_seen: 1_760_000_000, last_ledger_index: 1 },
+      ]);
+      expect(await seedValidatorSeen(db.ch)).toBe(false);
+      const rows = await db.ch.query<{ key: string }>(
+        `SELECT validation_public_key AS key FROM ${Table.ValidatorSeen}`,
+      );
+      expect(rows).toEqual([{ key: K4.base58 }]);
+    });
+
+    it('is run by the worker at start, after it seeds validator_seen', async () => {
+      await writeBaseLedgers();
+      await validateAll(R1, [AM_A]);
+      await validateAll(R2, [AM_A]);
+      const app = await boot(PUBLISHERS, { start: { unl: false, domains: false, state: false, compute: true } });
+
+      await waitFor('both rounds', async () => (await sentinelsOf()).length >= 2);
+      // the loop counts the run when the job has returned
+      const counted = async (outcome: string) =>
+        (await app.metrics.validatorsJobsTotal.get()).values
+          .filter((v) => v.labels.job === 'rounds' && v.labels.outcome === outcome)
+          .reduce((n, v) => n + v.value, 0);
+      await waitFor('the run to be counted', async () => (await counted('ok')) >= 1);
+      expect(await counted('error')).toBe(0);
+      const seen = await db.ch.query<{ key: string }>(
+        `SELECT validation_public_key AS key FROM ${Table.ValidatorSeen} GROUP BY validation_public_key ORDER BY key`,
+      );
+      expect(seen.map((r) => r.key)).toEqual(UNL_KEYS);
     });
   });
 });

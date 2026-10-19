@@ -36,6 +36,7 @@ describe('validators index', () => {
         'quorumOf',
         'recordOf',
         'trustedUnl',
+        'unlAt',
         'verifyManifest',
         'verifyUnlList',
         'votingLedgerAtOrAfter',

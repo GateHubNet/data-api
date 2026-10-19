@@ -16,8 +16,10 @@ import { startClickHouse } from '../../../../packages/shared/test/clickhouse-con
 import { SyncerConfig, WorkerName } from '../../src/config/syncer.config';
 import { SyncerCoreModule } from '../../src/core/syncer-core.module';
 import { PrometheusService } from '../../src/modules/prometheus/prometheus.service';
+import { ComputeLoop } from '../../src/validators/compute-loop';
 import { DomainChecker } from '../../src/validators/domain-checker';
 import { NetworkStatePoller } from '../../src/validators/network-state-poller';
+import { RoundsJob } from '../../src/validators/rounds.job';
 import { SafeFetchTestOptions } from '../../src/validators/safe-fetch';
 import { UnlFetcher } from '../../src/validators/unl-fetcher';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from '../../src/validators/validators.options';
@@ -53,7 +55,9 @@ import { TEST_TLS } from './tls';
  *                                      client made when `needsNodeClient` says so), booted as the application does: the
  *                                      result holds the app, the `UnlFetcher`, the `DomainChecker` (a test that switches
  *                                      its loop off with `worker.start.domains = false` makes the passes itself), the
- *                                      `NetworkStatePoller` (likewise with `worker.start.state = false`), the
+ *                                      `NetworkStatePoller` (likewise with `worker.start.state = false`), the `RoundsJob`
+ *                                      and the `ComputeLoop` (whose loop is OFF unless `worker.start.compute = true`: a
+ *                                      test runs `rounds.run(tick)` itself), the
  *                                      metrics, and `stop()`. `options.config`
  *                                      overrides `SyncerConfig` (for instance `unlPublishers`), `options.worker` the
  *                                      `ValidatorsWorkerOptions` (`now`, `start`, ...; the `fetch` options of the web server
@@ -266,6 +270,8 @@ export interface ValidatorsApp {
   fetcher: UnlFetcher;
   domains: DomainChecker;
   state: NetworkStatePoller;
+  rounds: RoundsJob;
+  compute: ComputeLoop;
   metrics: PrometheusService;
   stop(): Promise<void>;
 }
@@ -302,6 +308,8 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
     ...o.config,
   });
   const options: ValidatorsWorkerOptions = { logger: quietLogger(), fetch: o.web.fetchOptions(), ...o.worker };
+  // the compute loop reads and writes the tables of the whole database: a spec that does not exercise it leaves it off
+  options.start = { compute: false, ...options.start };
 
   // the options reach the module the way the core stub of a unit spec provides them: from a global module
   @Global()
@@ -338,6 +346,8 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
     fetcher: app.get(UnlFetcher),
     domains: app.get(DomainChecker),
     state: app.get(NetworkStatePoller),
+    rounds: app.get(RoundsJob),
+    compute: app.get(ComputeLoop),
     metrics: app.get(PrometheusService),
     stop: () => app.close(),
   };
@@ -350,6 +360,8 @@ export const VALIDATORS_METRICS = [
   'validatorsUnlSize',
   'validatorsDomainChecksTotal',
   'validatorsNodePollsTotal',
+  'validatorsJobsTotal',
+  'validatorsRoundsLagLedgers',
   'amendmentsWithoutMetadata',
 ] as const;
 

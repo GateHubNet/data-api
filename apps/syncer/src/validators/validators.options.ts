@@ -13,7 +13,7 @@ export const AMENDMENTS_CONFIG = Symbol('AMENDMENTS_CONFIG');
 
 /** For tests. Every field has a default that production uses. */
 export interface ValidatorsWorkerOptions {
-  /** The clock: milliseconds since the Unix epoch. Default `Date.now`. */
+  /** The clock of the loops and the jobs: milliseconds since the Unix epoch. Default `Date.now`. */
   now?: () => number;
   /** Default: a Nest `Logger` with the context of the class that logs. */
   logger?: Pick<Logger, 'log' | 'warn' | 'error'>;
@@ -21,6 +21,9 @@ export interface ValidatorsWorkerOptions {
   fetch?: SafeFetchTestOptions;
   /** The timeout of each request to the node for the network state and the features, in ms. Default 5000. */
   nodeRequestTimeoutMs?: number;
-  /** Which loops the worker starts, each on by default. A test switches off the ones it does not exercise. */
+  /**
+   * Which loops the worker starts, each on by default. A test switches off the ones it does not exercise. `compute` is the
+   * compute loop with the seeding of `validator_seen` before it.
+   */
   start?: { unl?: boolean; domains?: boolean; state?: boolean; compute?: boolean };
 }

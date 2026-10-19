@@ -1,4 +1,4 @@
-import { listInUse, StoredUnlList, trustedUnl } from './unl';
+import { listInUse, StoredUnlList, trustedUnl, unlAt } from './unl';
 
 const DAY = 86_400;
 
@@ -163,5 +163,56 @@ describe('the publisher key of a stored list', () => {
     const own = lists.filter((l) => l.publisherKey === NEW_KEY);
     expect(listInUse(own, 'p', 800)?.list.publisherKey).toBe(NEW_KEY);
     expect(trustedUnl(own, ['p'], 1, 800)).toEqual(new Set(['nHb']));
+  });
+});
+
+describe('unlAt', () => {
+  const OLD_KEY = `ED${'11'.repeat(32)}`;
+  const NEW_KEY = `ED${'22'.repeat(32)}`;
+  const a1 = list('a', 1, { validators: ['n1', 'n2'], fetchedAt: 100, expiration: 1_000 });
+  const a2 = list('a', 2, { validators: ['n2', 'n3'], fetchedAt: 900, effective: 1_000, expiration: 5_000 });
+  const b1 = list('b', 1, { validators: ['n2', 'n4'], fetchedAt: 100, expiration: 5_000 });
+
+  it('is the trusted UNL at the time asked for, whatever the lists say about now', () => {
+    expect(unlAt([a1, a2], ['a'], 1, 500)).toEqual(new Set(['n1', 'n2']));
+    expect(unlAt([a1, a2], ['a'], 1, 1_000)).toEqual(new Set(['n2', 'n3']));
+    expect(unlAt([a1, a2, b1], ['a', 'b'], 2, 1_500)).toEqual(new Set(['n2']));
+    expect(unlAt([a1, a2, b1], ['a', 'b'], 1, 1_500)).toEqual(new Set(['n2', 'n3', 'n4']));
+  });
+
+  it('gives what trustedUnl gives', () => {
+    for (const t of [0, 99, 100, 999, 1_000, 4_999, 9_999]) {
+      for (const threshold of [1, 2, 3]) {
+        expect(unlAt([a1, a2, b1], ['a', 'b'], threshold, t)).toEqual(
+          trustedUnl([a1, a2, b1], ['a', 'b'], threshold, t),
+        );
+      }
+    }
+  });
+
+  it('keeps the lists of every key of a publisher: each key was trusted in its time', () => {
+    const oldKey = list('a', 7, { publisherKey: OLD_KEY, validators: ['nHold'], fetchedAt: 100, expiration: 1_000 });
+    const newKey = list('a', 3, { publisherKey: NEW_KEY, validators: ['nHnew'], fetchedAt: 900, effective: 1_000 });
+    // before the new key's list takes effect the list of the old key is the one in use, though the lists of the new key
+    // alone would only stand in for it
+    expect(unlAt([oldKey, newKey], ['a'], 1, 500)).toEqual(new Set(['nHold']));
+    expect(unlAt([newKey], ['a'], 1, 500)).toEqual(new Set(['nHnew']));
+    // after it, the list of the old key has expired and the new key's is in use
+    expect(unlAt([oldKey, newKey], ['a'], 1, 2_000)).toEqual(new Set(['nHnew']));
+  });
+
+  it('is empty without lists, without publishers, or when the threshold is not met', () => {
+    expect(unlAt([], ['a'], 1, 500).size).toBe(0);
+    expect(unlAt([a1], [], 1, 500).size).toBe(0);
+    expect(unlAt([a1], ['a'], 2, 500).size).toBe(0);
+  });
+
+  it('gives a new set each time and does not change the lists', () => {
+    const lists = [a1];
+    const frozen = JSON.stringify(lists);
+    const first = unlAt(lists, ['a'], 1, 500);
+    first.add('intruder');
+    expect(unlAt(lists, ['a'], 1, 500)).toEqual(new Set(['n1', 'n2']));
+    expect(JSON.stringify(lists)).toBe(frozen);
   });
 });
