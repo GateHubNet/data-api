@@ -7,7 +7,7 @@ shared library. This page explains the moving parts; the reasons for the big cho
 ## System diagram
 
 ```
-                       rippled / xahaud (websocket)  ─ ledger, fee, validations, manifests, server_info
+                       rippled / xahaud (websocket)  ─ ledger, fee, validations, manifests, server_info, feature
                                      │
                                      ▼
  ┌───────────────────────────────────────────────────────────────────┐
@@ -15,6 +15,7 @@ shared library. This page explains the moving parts; the reasons for the big cho
  │   ingest ─ LiveRunner (live + catch-up)   range-ingest CLI        │
  │   validations ─ collector      fee_stats ─ poller                 │
  │   aggregator ─ stats_hourly, volume_live, volume_daily            │
+ │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
  └──────────────────────────────┬────────────────────────────────────┘
                                 │ bulk inserts (ledger tables: children first, `ledgers` row = commit)
                                 ▼
@@ -53,9 +54,11 @@ Everything both services need, written once:
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
-A NestJS process with four optional **workers** (`GH_WORKERS`) and a probe/metrics HTTP surface: `ingest` (the single writer of the
-ledger tables, atomic per ledger), `validations`, `fee_stats` and `aggregator`, plus the `range-ingest` CLI in the same image.
-Exactly one per network. Details: [syncer](syncer.md).
+A NestJS process with five optional **workers** (`GH_WORKERS`) and a probe/metrics HTTP surface: `ingest` (the single writer of the
+ledger tables, atomic per ledger), `validations`, `fee_stats`, `aggregator` and `validators` (the validator lists of the UNL publishers,
+domain verification, the node's amendment state, voting rounds and validator agreement; it makes outbound HTTPS requests to the
+publishers and to the validators' domains, [ADR-0012](adr/0012-validators-and-amendments-data.md)), plus the `range-ingest` CLI in the same image. Exactly one per
+network. Details: [syncer](syncer.md).
 
 ### API: `apps/api` (`@gatehub/data-api-service`)
 
@@ -71,7 +74,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts`, `active-accounts`, `network`, `validations`,
-  `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `validators` with the amendments routes, `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -90,8 +93,10 @@ views. See [clickhouse](clickhouse.md).
 2. `buildLedgerRows(raw, ctx)` (pure) produces the rows of all tables plus the ledger summary row.
 3. `LedgerWriter` inserts every child table in parallel, then `ledger_by_hash`, then `ledgers` (the atomic commit), synchronously, with
    dedup tokens.
-4. Workers on the side: validations stream -> `validations`/`validator_manifests`; `fee` every 5 s -> `fee_stats`; the aggregator
-   rolls `ledgers` into `stats_hourly` and computes `volume_*` from `exchanges`/`payments` and rates.
+4. Workers on the side: validations stream -> `validations`/`validator_manifests` (and `validator_validations`, `validator_seen`); `fee` every 5 s
+   -> `fee_stats`; the aggregator rolls `ledgers` into `stats_hourly` and computes `volume_*` from `exchanges`/`payments` and rates; the
+   `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
+   rounds and the hourly agreement from `validations` and `ledgers`.
 5. Crashes recover from the database alone: re-read the checkpoint, delete the uncommitted tail, carry on
    ([syncer](syncer.md#checkpoint-boot-and-recovery)).
 
@@ -117,6 +122,7 @@ views. See [clickhouse](clickhouse.md).
 | No aggregate materialized views | [0008](adr/0008-no-aggregate-materialized-views.md) |
 | One deployment per network | [0009](adr/0009-one-deployment-per-network.md) |
 | Ripple v2 wire compatibility and every deliberate deviation | [0010](adr/0010-ripple-v2-wire-compatibility.md) |
+| Validators and amendments data: a worker of its own, agreement over the indexed chain, the safe fetcher, migration 002 | [0012](adr/0012-validators-and-amendments-data.md) |
 | CTID dedup (superseded by the commit marker and dedup tokens) | [0002](adr/0002-ctid-idempotent-ingest.md) |
 
 ## Cross-cutting concerns

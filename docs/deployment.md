@@ -93,6 +93,8 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
 - It is idempotent and checksummed. By hand: `docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl`.
 - `GH_RUN_MIGRATIONS_ON_BOOT` is `false` in the compose files (convenient only for a single dev process). See
   [data-model](data-model.md#5-migrations).
+- `002_validators_amendments.sql` must be applied before the new syncer starts, and it has a deploy-order constraint with the AMM branch:
+  [Rolling out the validators and amendments data](#rolling-out-the-validators-and-amendments-data).
 
 ## Configuration and secrets
 
@@ -238,10 +240,41 @@ Manifests are not shipped; the shape is:
 
 ## Rollout and health
 
-- Run migrations before the code that needs them (compose does it for you in start order).
+- Run migrations before the code that needs them (compose does it for you in start order; elsewhere the syncer needs `002` applied before it starts, see [Rolling out the validators and amendments data](#rolling-out-the-validators-and-amendments-data)).
 - **Compose has no rolling update and no zero-downtime deploy.** `up -d` recreates all containers of a changed service together, so a release means a brief outage
   of that service (nginx answers 502 for that network's host while the new api containers start; the other network is unaffected). Options without promises: an
   orchestrator with rolling updates for the same images (Kubernetes, above), or a second compose project next to the first with the nginx upstream switched
   between them. The healthcheck (`start_period` 30 s) tells you when an api is up.
 - The syncer is safe to restart at any time: it re-derives its position from ClickHouse, cleans its uncommitted tail and resumes
   with no double counting ([syncer](syncer.md#checkpoint-boot-and-recovery)). It gets a 30 s grace period to finish its write.
+
+## Rolling out the validators and amendments data
+
+The `validators` worker, the validators and amendments routes and migration `002_validators_amendments.sql` are one change
+([ADR-0012](adr/0012-validators-and-amendments-data.md)). Everything is additive: rolling back the api removes the routes, taking
+`validators` out of `GH_WORKERS` stops the worker, and `002` needs no undo.
+
+**The deploy-order constraint, for the owner.** Deploy this to a persistent environment only after `feat/amm-data` has been merged, or accept
+the loss below. That branch edits `001_baseline.sql` in place, and the migration runner refuses an applied file whose checksum changed
+(`Migration 001_baseline.sql was modified after being applied`). So a database created before that merge has to be recreated when it is merged
+(the AMM design asks for that anyway), and with it goes what the validators and amendments data collected and cannot recompute: the
+`validations` (90 days, from which the votes and the agreement are back-filled), `validator_votes`, `amendment_tallies`,
+`validator_agreement_hourly`, the first-seen history of `validator_seen`, the stored UNL lists and the domain results. The account and market
+aggregates (D2) are recomputable and set no such constraint. A throwaway environment (development, tests) may run it before the merge.
+
+**The order is `migrate-<network>`, then `syncer-<network>`, then `api-<network>`.**
+
+1. `migrate-<network>` applies `002`: two `ADD COLUMN IF NOT EXISTS` statements on `validations` and `validator_manifests` and ten
+   `CREATE TABLE IF NOT EXISTS`. The compose files make the syncer and the api wait for it (`depends_on: service_completed_successfully`).
+2. `syncer-<network>` starts the new collector and the `validators` worker. **The syncer needs `002` applied before it starts**: its collector
+   writes the new columns and tables as `JSONEachRow`, which ClickHouse refuses when a row has a field the table lacks, so against a database
+   without `002` the collector's inserts fail and no validation is stored. Compose guarantees the order; with another orchestrator (Kubernetes,
+   `docker run`) run the migrate job to completion first. The syncer is a singleton: it is recreated, never scaled.
+3. `api-<network>` serves the new routes. Compose starts the apis and the syncers together once the migration is done; an api that comes first
+   answers from empty tables (200 with empty lists, no errors, because the tables exist) until the syncer has filled them.
+
+**Before the deploy:** the amendment metadata files are filled and `amendments:check` passes
+([operations](operations.md#keep-the-amendment-metadata-current)); `GH_WORKERS` is updated wherever it is set explicitly (the default and
+`deploy/.env.prod.example` have `validators`); egress to the publishers (and to the validators' domains, or `GH_DOMAIN_VERIFICATION=false`) is
+open ([outbound network access](#outbound-network-access)). After the deploy, the data fill in over minutes to hours:
+[operations](operations.md#roll-out-the-validators-and-amendments-data) has the table and what to watch.

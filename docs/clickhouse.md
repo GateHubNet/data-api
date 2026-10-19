@@ -131,8 +131,9 @@ The production compose already runs **ClickHouse Keeper** and wires the server t
 defines `<zookeeper>`, `<macros>` and a one-shard cluster). To make it highly available:
 
 1. Switch the engines to `ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}'[, version])` in a **new
-   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the ledger-derived tables.
-   `{shard}` and `{replica}` come from the `<macros>`.
+   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 14 ledger-derived tables
+   **and** on `validator_validations` and `validator_seen` (migration 002: the collector's retried inserts carry a deduplication token, and
+   those two tables have a window of 100). `{shard}` and `{replica}` come from the `<macros>`.
 2. Run two or more replicas and an odd number (3) of Keeper nodes (the compose ships 1 for local use).
 3. Run the syncer recovery tests (`apps/syncer/test`) against your topology before relying on it: the recovery depends on synchronous
    `DELETE`s, on insert deduplication and on the single-writer lease behaving the same on every replica.
@@ -148,7 +149,10 @@ Do not run production without a tested restore:
   incremental; restore regularly.
 - **Reproducible from source:** the data is a deterministic function of the ledger, so a total loss can also be recovered by
   re-running `range-ingest` over the history (slower, a real safety net; [backfill](backfill.md)). Backups make recovery *fast*.
-  `fee_stats` and `validations` are collected live and cannot be re-derived from ledgers: back those up.
+  `fee_stats` and `validations` are collected live and cannot be re-derived from ledgers: back those up. Some of the validators and
+  amendments data (migration 002) is collected live too and is lost with the database: `validator_seen` (the first-seen history), the stored
+  lists (`unl_lists`, `unl_publishers`) and the domain results (`validator_domains`). `validator_votes`, `amendment_tallies` and `validator_agreement_hourly` are recomputed from `validations`
+  and `ledgers` within the 90 days `validations` keeps.
 
 ## Retention and TTL
 
@@ -167,7 +171,17 @@ The safe procedure drops **one 10,000,000-ledger block from all 14 ledger-derive
 [operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair
 a partial loss use `range-ingest --reprocess` over exactly the damaged range. Dropping a block makes lists in that window empty.
 
-`validations` has a 90-day TTL (`toDateTime(last_datetime) + INTERVAL 90 DAY`); `fee_stats` and the rollups (`stats_hourly`, `volume_*`) are small, keep them.
+Four tables expire by TTL, none of them a ledger table, so no ledger retention touches them:
+
+| Table | TTL |
+| --- | --- |
+| `validations` | 90 days (`toDateTime(last_datetime) + INTERVAL 90 DAY`) |
+| `validator_validations` | 7 days (`toDateTime(last_datetime) + INTERVAL 7 DAY`; `ttl_only_drop_parts = 1`, whole parts are dropped) |
+| `network_state` | 100 days (`toDateTime(polled_at) + INTERVAL 100 DAY`) |
+| `validator_agreement_hourly` | 400 days (`hour + INTERVAL 400 DAY`) |
+
+`fee_stats`, the rollups (`stats_hourly`, `volume_*`) and the other tables of migration 002 (`validator_seen`, `validator_votes`, `amendment_tallies`,
+`unl_lists`, `unl_publishers`, `validator_domains`, `amendment_features`) are small, keep them.
 
 ## Useful operational queries
 

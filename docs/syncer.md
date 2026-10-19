@@ -8,19 +8,25 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
 ```
                       GH_NODE_ENDPOINTS (rippled / xahaud, websocket)
                                   │  NodeClient: failover, watchdog, re-subscribe
-   ┌──────────────┬───────────────┼────────────────┬─────────────────┐
-   │ ingest       │ validations   │ fee_stats      │ aggregator      │   <- GH_WORKERS
-   │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats + volumes │
-   └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┘
-          ▼               ▼               ▼                 ▼
-   14 ledger tables   validations    fee_stats        stats_hourly, volume_live,
-   (ledgers = commit  validator_     (every 5 s)      volume_daily   (reads the ledger tables)
-    marker)           manifests
+   ┌──────────────┬───────────────┼────────────────┬─────────────────┬──────────────────┐
+   │ ingest       │ validations   │ fee_stats      │ aggregator      │ validators       │   <- GH_WORKERS
+   │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats + volumes │ lists, domains,  │
+   │              │               │                │                 │ state, rounds,   │
+   │              │               │                │                 │ agreement        │
+   └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴─────────┬────────┘
+          ▼               ▼               ▼                 ▼                  ▼
+   14 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
+   (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
+    marker)           manifests,                      volume_daily       network_state,
+                      validator_                      (reads the         amendment_features,
+                      validations,                    ledger tables)     validator_votes,
+                      validator_seen                                     amendment_tallies,
+                                                                         validator_agreement_hourly
                           ClickHouse, database = the network name
 ```
 
-The fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers and the TOML
-files of the validators' domains over HTTPS and reads the node; it is not drawn.
+Besides the node, the fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers and
+the TOML files of the validators' domains over HTTPS, and reads the ledgers and validations the other workers stored.
 
 ## 1. Boot
 
@@ -300,9 +306,9 @@ Properties that matter operationally:
 ## 8. The validators worker
 
 The `validators` worker (`apps/syncer/src/validators/`) keeps the data behind the validators and amendments endpoints current:
-which validators the UNL publishers name, their domains, and (as the worker grows) the state of the ledger and the votes
-derived from it. Its design is in the [validators and amendments design](superpowers/specs/2026-10-19-validators-amendments-design.md),
-section 2. Like every worker it is switched on and off with `GH_WORKERS`.
+which validators the UNL publishers name, their domains, the state of the ledger, and the votes and the agreement derived from it. Its
+design is in the [validators and amendments design](superpowers/specs/2026-10-19-validators-amendments-design.md), section 2, and the
+decision in [ADR-0012](adr/0012-validators-and-amendments-data.md). Like every worker it is switched on and off with `GH_WORKERS`.
 
 **Why a worker, and not steps of the aggregator.**
 
@@ -315,11 +321,11 @@ section 2. Like every worker it is switched on and off with `GH_WORKERS`.
 **Two loops.** An **I/O loop** that fetches the UNL lists (below), checks validator domains and polls the node, each on its own
 timer; and a **compute loop**, once a minute, that runs two ClickHouse jobs in the aggregator's job model (a budget per job, a job
 that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher, the
-domain checker and the network state poller are the parts of the I/O loop that are in place, and the compute loop runs its `rounds`
-job ([voting rounds](#voting-rounds-and-tallies)) and its `agreement` job ([hourly agreement](#hourly-agreement)); the rest joins the
-worker as it is built, started from the same bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
-private, loopback or reserved address, no redirect to one, 20 s, 1 MiB, 3 redirects), which also sends the `User-Agent`
-`gatehub-data-api/<version> (validators)`.
+domain checker and the network state poller are the I/O loop, and the compute loop runs the `rounds` job
+([voting rounds](#voting-rounds-and-tallies)) and the `agreement` job ([hourly agreement](#hourly-agreement)); both loops start from the
+same bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe
+fetcher (HTTPS only, no private, loopback or reserved address, no redirect to one, 20 s, 1 MiB, 3 redirects), which also sends the
+`User-Agent` `gatehub-data-api/<version> (validators)`.
 
 ### The UNL lists
 
@@ -365,8 +371,10 @@ rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists 
   outcome as `error`, `checked_at`, the `threshold` in force, and `last_ok_at` (the time of the last ok attempt, kept through
   failures). At start the worker writes a row for every configured publisher (a new one is `ok` with no `last_ok_at`, a known one
   keeps its status) and sets `configured = 0` on stored publishers that are no longer configured. A ClickHouse failure ends the
-  attempt with no outcome: a warning and the same backoff, and no metric. Rows inserted earlier in the same attempt can remain, and
-  the retry then reports `unchanged`.
+  attempt with no outcome: a warning and the same backoff, and no metric. Rows inserted earlier in the same attempt can remain: the
+  manifests go in first, then the lists, then the publisher row. The retry reports `unchanged` only when the list insert had landed
+  (the list is then stored, and its sequence is the newest); when it had not (the manifests only, or nothing), the list is still new
+  and the retry reports `ok`.
 - **The list in use, and the trusted UNL.** The current list of a publisher at time *t* is the stored one with the highest
   `sequence` whose `effective` (none = always) is at or before *t* and whose `expiration` is after it. When none is current, the
   newest is used and reported as expired: a flagged old UNL is better than none. The trusted UNL at *t* is the validators on at
@@ -450,7 +458,7 @@ off in a test).
 - **No retry, no partial write.** Every request has a timeout of 5 s and is not retried; a poll in which a request fails, or an answer
   cannot be stored, writes nothing, and the next poll is the retry. A ClickHouse that fails makes the pass fail (logged, retried on
   time).
-- **The gauge** `syncer_amendments_without_metadata`, set after each feature poll that ended, also one that wrote nothing (it reads what is stored): the
+- **The gauge** `syncer_amendments_without_metadata`, set after each feature poll that resolved, also one that wrote nothing (it reads what is stored); a poll that rejects (a ClickHouse failure) skips it: the
   number of amendment IDs in the newest `amendment_features` rows, in the newest `network_state` row (enabled, or in `Majorities`) and in
   the newest round of `amendment_tallies` that the amendment metadata (`GH_AMENDMENTS_CONFIG`, else the file shipped with the shared
   package) does not list. Each ID is warned about once, `amendment <ID> has no metadata entry`, and remembered until the syncer restarts.

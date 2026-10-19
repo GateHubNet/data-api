@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted.
+**Status:** Accepted. Amended 2026-10-19: the validators routes (see the amendment at the end and [ADR-0012](0012-validators-and-amendments-data.md)).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -151,3 +151,32 @@ The three gaps this section listed were fixed in the final fix round; they are k
 - Reproducing served behaviour reproduces oddities (string-typed ledger fields, copied failure messages such as `unable to retrieve payments` on the reports route).
 - Markers, exact amounts and canonical transactions differ from the original in digits or tokens a client should not parse.
 - The deviation list must be maintained: a new ruling that changes served behaviour adds a line here and to [api-reference](../api-reference.md).
+
+## Amendment (2026-10-19): the validators routes and the amendments routes
+Item 7 above lists `/v2/network/validators[/{pubkey}[/manifests|/reports]]` among the routes of the original that answer 404. That has changed
+([ADR-0012](0012-validators-and-amendments-data.md)): `GET /v2/network/validators` and `GET /v2/network/validators/{key}` are served, and so are the
+routes the original had no counterpart of: `GET /v2/network/validators/summary`, `GET /v2/network/validators/{key}/validations` and
+`GET /v2/network/amendments[/{name}]`. Of the validators routes, only `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`,
+`/v2/network/validator_reports` and `/v2/network/rippled_versions` still answer 404 `Cannot GET ...`. The original served `/v2/network/validators[/{pubkey}]` from its
+own crawler (`api/routes/network/getValidators.js`, `topology.js`); this API serves them from the validations and validator lists it collects, and deliberately differs:
+
+40. **`scope`.** The original listed only the validators whose last validation was less than 60 s old. Here `scope=unl` (the default) lists the trusted UNL, offline
+    members included, and `scope=all` adds every validator seen in the last 24 hours.
+41. **Paging.** The original had none. Here `limit` (200, at most 1000), `marker` and a `Link` header, as every list.
+42. **Order.** The original sorted by chain, UNL first, 24 h score, domain, key. Here: validators with a domain first, alphabetically by domain, then by key (the board's
+    order).
+43. **Row.** The original's row was `{validation_public_key, domain, chain, current_index, agreement_1h, agreement_24h, partial, unl}`. Here the same keys in the same order,
+    without `chain` (one network per deployment), then the new ones. The agreement objects keep `{missed, total, score, incomplete}` and add `partial`; `agreement_30d` is new.
+44. **`unl`** was "on Ripple's main or altnet list". Here it is "on the trusted UNL of the configured publishers" (`GH_UNL_PUBLISHERS`), and `unl_lists` names the lists.
+45. **`domain`** came from the original's own domain check. Here it is the domain of the validator's manifest, and `domain_verification` says whether the validator's
+    `/.well-known/xrp-ledger.toml` (Xahau: `xahau.toml`) confirms it.
+46. **Agreement** was counted against the ledgers the original's chain logic saw. Here it is counted against the indexed validated chain, over full validations only,
+    and a ledger the collector did not see (fewer than quorum UNL validations recorded) is left out for everybody.
+47. **`{key}`** is a master key (`nH...`), a signing key (`n9...`) or 66 hex digits, and a signing key answers with the validator it belongs to. Every validator the deployment
+    has seen or has on a list answers, however long ago it was last seen.
+48. **Caching.** The validators and amendments routes send their own `Cache-Control` while `GH_CACHE_CONTROL` is not empty: `private, max-age=30` for the list, the summary
+    and one validator, `max-age=5` for the validations of a validator (`max-age=300` with a `marker`), `max-age=60` for the amendments.
+
+Kept from the original: the messages `Validator not found` and `unable to retrieve validator(s)` and the CSV name `validators.csv`. New 400s exist for the new parameters
+(`invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`, `invalid validator public key`). The endpoint-by-endpoint wording is in
+[api-reference](../api-reference.md#validators-and-amendments).

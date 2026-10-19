@@ -2058,6 +2058,199 @@ paths:
           description: ''
       tags:
       - ledgers
+  "/v2/network/validators/summary":
+    get:
+      operationId: ValidatorsController_summary
+      summary: Get the summary of the validators of the network
+      description: 'The figures of the Validators board: the validators seen in the
+        last 24 hours, the trusted UNL with its publishers and the quorum, the negative
+        UNL, the fees, the next flag ledger, the software versions and how far the
+        agreement and the votes are computed. There are no parameters.'
+      parameters: []
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/validators":
+    get:
+      operationId: ValidatorsController_list
+      summary: Get the validators of the network
+      description: 'The validators of the trusted UNL, or of the UNL and every validator
+        seen in the last 24 hours, with their agreement, their domain and its verification,
+        the lists they are on, their software version, and what they vote for: fees
+        and amendments. Validators with a domain come first, by domain, then the others
+        by key. `format=csv` gives the rows as a CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: q
+        required: false
+        in: query
+        description: A part of the domain, the master key or the signing key (at most
+          100 characters).
+        schema: {}
+      - name: amendment
+        required: false
+        in: query
+        description: 'The name or the ID (64 hex digits) of an amendment: the validators
+          that vote for it.'
+        schema: {}
+      - name: publisher
+        required: false
+        in: query
+        description: 'The id of a publisher of the summary: its list in use.'
+        schema: {}
+      - name: scope
+        required: false
+        in: query
+        description: 'Default: unl.'
+        schema:
+          enum:
+          - unl
+          - all
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/validators/{key}":
+    get:
+      operationId: ValidatorsController_detail
+      summary: Get a validator of the network
+      description: 'One validator by its master key, its signing key or 66 hex digits:
+        the row of the list, its vote on every amendment being decided, its manifest
+        and its agreement of each of the last 30 days. JSON only.'
+      parameters:
+      - name: key
+        required: true
+        in: path
+        description: A master key (nH...), a signing key (n9...) or 66 hex digits
+          (02, 03 or ED first).
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/validators/{key}/validations":
+    get:
+      operationId: ValidatorsController_validatorValidations
+      summary: Get the validations of a validator
+      description: 'The validations one validator made in the last 7 days, newest
+        first: for each ledger and hash the sightings added up, whether the ledger
+        is the one the indexer holds, and the first and last time the validation was
+        seen. The rows recorded under the validator''s signing keys are its own. `format=csv`
+        gives the page as a CSV file.'
+      parameters:
+      - name: key
+        required: true
+        in: path
+        description: A master key (nH...), a signing key (n9...) or 66 hex digits
+          (02, 03 or ED first).
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: descending
+        required: false
+        in: query
+        description: Default true; false lists the oldest first.
+        schema:
+          type: boolean
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/amendments":
+    get:
+      operationId: AmendmentsController_list
+      summary: Get the amendments of the network
+      description: 'Every amendment the network knows: enabled, with a majority, voting,
+        obsolete or unknown, with the votes of the newest voting round and, for the
+        enabled ones, when they were enabled. The answer states the rules, the newest
+        round and the next flag ledger. `format=csv` gives the amendments as a CSV
+        file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: status
+        required: false
+        in: query
+        description: 'A comma list of enabled, majority, voting, obsolete and unknown.
+          Default: all.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/amendments/{name}":
+    get:
+      operationId: AmendmentsController_detail
+      summary: Get an amendment of the network
+      description: One amendment by its name or its ID, with the envelope of the list,
+        how each validator votes on it, its rounds of the last 30 days and its history.
+        JSON only.
+      parameters:
+      - name: name
+        required: true
+        in: path
+        description: The name of the amendment (as written, else in any case when
+          only one has it) or its ID (64 hex digits).
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
   "/v2/stats":
     get:
       operationId: StatsController_list

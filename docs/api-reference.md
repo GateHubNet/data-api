@@ -187,7 +187,11 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 | Markers | HBase row keys | opaque tokens, same mechanism (`marker` + `Link`) |
 | Bugs of the original | | fixed where they were outright bugs; listed per endpoint and in [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) |
 
-Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs).
+Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs), `GET /v2/network/amendments` and
+`GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
+`GET /v2/network/validators/{key}/validations`. `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
+[Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -195,7 +199,7 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 | Group | Routes of the original |
 | --- | --- |
 | Health, gateways, currencies | `/v2/health[/{aspect}]`, `/v2/gateways[/{gateway}]`, `/v2/gateways/{gateway}/assets[/{filename}]`, `/v2/currencies[/{currencyAsset}]` |
-| Network | `/v2/network/external_markets`, `/v2/network/xrp_distribution`, `/v2/network/top_markets[/{date}]`, `/v2/network/top\_currencies[/{date}]`, `/v2/network/topology`, `/v2/network/topology/nodes[/{pubkey}]`, `/v2/network/topology/links`, `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`, `/v2/network/validator_reports`, `/v2/network/rippled_versions` (`/v2/network/validators[/{pubkey}]` is served, with `/v2/network/validators/summary`: see [Validators and amendments](#validators-and-amendments)) |
+| Network | `/v2/network/external_markets`, `/v2/network/xrp_distribution`, `/v2/network/top_markets[/{date}]`, `/v2/network/top\_currencies[/{date}]`, `/v2/network/topology`, `/v2/network/topology/nodes[/{pubkey}]`, `/v2/network/topology/links`, `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`, `/v2/network/validator_reports`, `/v2/network/rippled_versions` (of the validators routes only these four are out of scope: `/v2/network/validators[/{pubkey}]` is served, see [Validators and amendments](#validators-and-amendments)) |
 | Accounts | `/v2/accounts/{address}/escrows`, `/v2/accounts/{address}/payment_channels` |
 | Reports and tools | `/v2/reports[/{date}]`, `/v2/maintenance/{domain}`, `/v2/estimate` |
 | API map | `GET /` and `GET /v2` (the index of all routes) |
@@ -1049,7 +1053,9 @@ whose `count` adds up (the original's mock data mixed both shapes); `limit` of 0
 ## Validators and amendments
 
 The validators of the network, the trusted UNL and the amendments. `data.ripple.com` served a validator list and per-validator reports from
-its own crawler (its routes are listed as out of scope [above](#compatibility)); these routes are new: the data come from the validations the
+its own crawler. Its list and its validator (`/v2/network/validators[/{pubkey}]`) are served here from other data and differ from it (see
+**Differences from data.ripple.com** under each route); its manifests, reports, validator reports and rippled versions are out of scope
+[above](#compatibility); the summary, the validations of a validator and the amendments are new. The data come from the validations the
 syncer collects, the validator lists the syncer fetches from the publishers, the ledger state it polls from the node and what it computes from
 them, not from a crawler.
 
@@ -1199,12 +1205,12 @@ Link: <https://xrpl.data.example.com/v2/network/validators?limit=2&marker=WzAsIn
       "partial": false,
       "unl": true,
       "agreement_30d": {"missed": 3, "total": 43200, "score": "0.9999", "incomplete": true, "partial": 2},
-      "signing_key": "nHUccdvZzqePXCHG6c6LXmAbX22V68YJV5sQnUbu3rx9wmPzMV4P",
+      "signing_key": "n9Licf177qJUupBi7K4zt6ZTVToMGYgYZqCyTQSkmTSjywumRWso",
       "domain_verification": {
         "status": "verified",
         "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
-        "checked": "2026-10-19T18:10:33.489Z",
-        "verified": "2026-10-19T18:10:33.489Z",
+        "checked": "2026-10-19T19:15:52.489Z",
+        "verified": "2026-10-19T19:15:52.489Z",
         "accounts": ["rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"]
       },
       "unl_lists": ["unl.xrplf.org", "vl.ripple.com"],
@@ -1219,8 +1225,8 @@ Link: <https://xrpl.data.example.com/v2/network/validators?limit=2&marker=WzAsIn
           {"id": "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76"}
         ]
       },
-      "first_seen": "2026-07-21T18:20:34.000Z",
-      "last_seen": "2026-10-19T18:19:33.750Z"
+      "first_seen": "2026-07-21T19:25:53.000Z",
+      "last_seen": "2026-10-19T19:24:52.750Z"
     },
     {
       "validation_public_key": "nHUkKoJy83JptKcB56T38wQwjvH3EVYdcvwAfLDHwH7QBkLEv4nD",
@@ -1231,12 +1237,12 @@ Link: <https://xrpl.data.example.com/v2/network/validators?limit=2&marker=WzAsIn
       "partial": true,
       "unl": true,
       "agreement_30d": {"missed": 2, "total": 43200, "score": "1.0000", "incomplete": true, "partial": 1},
-      "signing_key": "nHUsGpxNkyiGnZUozbSCcyRU5ztL8rQjpmnPmYipcu9F8zuKinWa",
+      "signing_key": "n9KvdobdhFC7Xwjshw7CxpWdfh8FFU3RHrFEYtpapEGkg3kANxTd",
       "domain_verification": {
         "status": "unverified",
         "reason": "not_listed",
         "toml_url": "https://shoreline.example/.well-known/xrp-ledger.toml",
-        "checked": "2026-10-19T18:08:53.750Z"
+        "checked": "2026-10-19T19:14:12.750Z"
       },
       "unl_lists": ["unl.xrplf.org", "vl.ripple.com"],
       "negative_unl": false,
@@ -1250,8 +1256,8 @@ Link: <https://xrpl.data.example.com/v2/network/validators?limit=2&marker=WzAsIn
           {"id": "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76"}
         ]
       },
-      "first_seen": "2026-07-21T18:20:34.000Z",
-      "last_seen": "2026-10-19T18:19:33.750Z"
+      "first_seen": "2026-07-21T19:25:53.000Z",
+      "last_seen": "2026-10-19T19:24:52.750Z"
     }
   ]
 }
@@ -1296,7 +1302,7 @@ A member of the UNL that was never seen is a row too, with what its lists and it
   "agreement_24h": {"missed": 0, "total": 0, "incomplete": false, "partial": 0},
   "unl": true,
   "agreement_30d": {"missed": 0, "total": 0, "incomplete": true, "partial": 0},
-  "signing_key": "nHBm6i72dScKWscQg7w4S2GWZkgZo4i19CQC9kQopcjPc8myZHxU",
+  "signing_key": "n9KNNXQTfTKSAucXQXbWDyCd48wU2MmyLeDvirY1Fd8sXKdkfqhw",
   "unl_lists": ["unl.xrplf.org", "vl.ripple.com"],
   "negative_unl": false
 }
@@ -1343,12 +1349,12 @@ An example (the same validator, `northpeak.example`; `daily_agreement` is shorte
   "partial": false,
   "unl": true,
   "agreement_30d": {"missed": 3, "total": 43200, "score": "0.9999", "incomplete": true, "partial": 2},
-  "signing_key": "nHUccdvZzqePXCHG6c6LXmAbX22V68YJV5sQnUbu3rx9wmPzMV4P",
+  "signing_key": "n9Licf177qJUupBi7K4zt6ZTVToMGYgYZqCyTQSkmTSjywumRWso",
   "domain_verification": {
     "status": "verified",
     "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
-    "checked": "2026-10-19T18:10:33.489Z",
-    "verified": "2026-10-19T18:10:33.489Z",
+    "checked": "2026-10-19T19:15:52.489Z",
+    "verified": "2026-10-19T19:15:52.489Z",
     "accounts": ["rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"]
   },
   "unl_lists": ["unl.xrplf.org", "vl.ripple.com"],
@@ -1366,14 +1372,14 @@ An example (the same validator, `northpeak.example`; `daily_agreement` is shorte
       {"id": "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76", "status": "voting", "vote": "yes"}
     ]
   },
-  "first_seen": "2026-07-21T18:20:34.000Z",
-  "last_seen": "2026-10-19T18:19:33.750Z",
-  "manifest": {"sequence": 2, "signing_key": "nHUccdvZzqePXCHG6c6LXmAbX22V68YJV5sQnUbu3rx9wmPzMV4P", "signing_keys_seen": 2, "domain": "northpeak.example"},
+  "first_seen": "2026-07-21T19:25:53.000Z",
+  "last_seen": "2026-10-19T19:24:52.750Z",
+  "manifest": {"sequence": 2, "signing_key": "n9Licf177qJUupBi7K4zt6ZTVToMGYgYZqCyTQSkmTSjywumRWso", "signing_keys_seen": 2, "domain": "northpeak.example"},
   "daily_agreement": [
     {"date": "2026-09-20", "missed": 0, "total": 0, "incomplete": true, "partial": 0},
-    {"date": "2026-10-17", "missed": 0, "total": 5400, "score": "1.0000", "incomplete": true, "partial": 0},
+    {"date": "2026-10-17", "missed": 0, "total": 4500, "score": "1.0000", "incomplete": true, "partial": 0},
     {"date": "2026-10-18", "missed": 1, "total": 21600, "score": "1.0000", "incomplete": false, "partial": 1},
-    {"date": "2026-10-19", "missed": 2, "total": 16200, "score": "0.9999", "incomplete": true, "partial": 1}
+    {"date": "2026-10-19", "missed": 2, "total": 17100, "score": "0.9999", "incomplete": true, "partial": 1}
   ],
   "result": "success"
 }
@@ -1488,10 +1494,10 @@ recorded under both the master key and an old signing key of it, three sightings
       "ledger_hash": "00000000000000000000000000000000000000000000000000000000066C1AA7",
       "validated": "matches",
       "full": false,
-      "signing_key": "nHUZmMp1ohFVujJbVvBzDrXJBDMiwpchREv5x466VeJesK8SQCuY",
-      "signing_time": "2026-10-19T16:00:49Z",
-      "first_datetime": "2026-10-19T16:00:49.250Z",
-      "last_datetime": "2026-10-19T16:00:49.250Z",
+      "signing_key": "n9K1XhRwDoN8U2h49cSSzr8DLGNaoYmBdijREixAeM9rbWHjNSMv",
+      "signing_time": "2026-10-19T16:26:20Z",
+      "first_datetime": "2026-10-19T16:26:20.250Z",
+      "last_datetime": "2026-10-19T16:26:20.250Z",
       "count": 1
     },
     {
@@ -1500,10 +1506,10 @@ recorded under both the master key and an old signing key of it, three sightings
       "validated": "different",
       "validated_hash": "00000000000000000000000000000000000000000000000000000000066C1AA6",
       "full": true,
-      "signing_key": "nHUZmMp1ohFVujJbVvBzDrXJBDMiwpchREv5x466VeJesK8SQCuY",
-      "signing_time": "2026-10-19T16:00:45Z",
-      "first_datetime": "2026-10-19T16:00:45.500Z",
-      "last_datetime": "2026-10-19T16:00:45.500Z",
+      "signing_key": "n9K1XhRwDoN8U2h49cSSzr8DLGNaoYmBdijREixAeM9rbWHjNSMv",
+      "signing_time": "2026-10-19T16:26:16Z",
+      "first_datetime": "2026-10-19T16:26:16.500Z",
+      "last_datetime": "2026-10-19T16:26:16.500Z",
       "count": 1
     },
     {
@@ -1511,10 +1517,10 @@ recorded under both the master key and an old signing key of it, three sightings
       "ledger_hash": "00000000000000000000000000000000000000000000000000000000066C1AA6",
       "validated": "matches",
       "full": true,
-      "signing_key": "nHUZmMp1ohFVujJbVvBzDrXJBDMiwpchREv5x466VeJesK8SQCuY",
-      "signing_time": "2026-10-19T16:00:45Z",
-      "first_datetime": "2026-10-19T16:00:45.250Z",
-      "last_datetime": "2026-10-19T16:00:45.750Z",
+      "signing_key": "n9K1XhRwDoN8U2h49cSSzr8DLGNaoYmBdijREixAeM9rbWHjNSMv",
+      "signing_time": "2026-10-19T16:26:16Z",
+      "first_datetime": "2026-10-19T16:26:16.250Z",
+      "last_datetime": "2026-10-19T16:26:16.750Z",
       "count": 2
     },
     {
@@ -1522,10 +1528,10 @@ recorded under both the master key and an old signing key of it, three sightings
       "ledger_hash": "00000000000000000000000000000000000000000000000000000000066C1AA5",
       "validated": "matches",
       "full": true,
-      "signing_key": "nHDffGxdB1yhbamZJFGJwJmZTrLJhvjL6gq2Sb8Xgp8mxLvs2tep",
-      "signing_time": "2026-10-19T16:00:41Z",
-      "first_datetime": "2026-10-19T16:00:41.250Z",
-      "last_datetime": "2026-10-19T16:00:41.750Z",
+      "signing_key": "n9MQ1UFdKJmDsDsBauDdZ5VP6LjjDtnhzZ1NiKG6N5Rg8Pm75ncB",
+      "signing_time": "2026-10-19T16:26:12Z",
+      "first_datetime": "2026-10-19T16:26:12.250Z",
+      "last_datetime": "2026-10-19T16:26:12.750Z",
       "count": 3
     }
   ]

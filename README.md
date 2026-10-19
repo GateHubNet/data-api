@@ -3,7 +3,7 @@
 A drop-in replacement for the **Ripple Data API v2** (`data.ripple.com`, the `rippled-historical-database` project) for the **XRP Ledger**
 and for **Xahau**. It indexes a network's validated ledgers into ClickHouse (the *syncer*) and serves the Ripple v2 endpoints over REST
 (the *api*): ledgers, transactions, payments, exchanges and candles, rates, accounts (history, balances, orders, reports, stats), active
-accounts, network fees and volumes, validations and stats. Paths, parameters, defaults, error messages and the shape and key order of the
+accounts, network fees and volumes, validations, validators and amendments, and stats. Paths, parameters, defaults, error messages and the shape and key order of the
 answers match what `data.ripple.com` served, so a client of the original works by changing its host and sending an API key. The deliberate
 differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.md).
 
@@ -16,7 +16,7 @@ This is a **pnpm workspace** with two services and a shared library:
 data-api-new/
 ├── apps/
 │   ├── api/        @gatehub/data-api-service — REST API (reads ClickHouse; live node for balances/orders)
-│   └── syncer/     @gatehub/data-syncer      — ingest worker: ingest, validations, fee_stats, aggregator; range-ingest CLI
+│   └── syncer/     @gatehub/data-syncer      — five workers (ingest, validations, fee_stats, aggregator, validators); range-ingest CLI
 ├── packages/
 │   └── shared/     @gatehub/data-api-shared  — parsers, ledger writer, ClickHouse client + schema, node client, network profiles
 ├── deploy/         nginx template, ClickHouse/Keeper config, .env.prod.example
@@ -108,6 +108,8 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Markets | `/v2/active_accounts/{base}/{counter}` |
 | Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
+| Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
+| Amendments | `/v2/network/amendments[/{name}]` |
 | Stats | `/v2/stats[/{family}[/{metric}]]` |
 | Operational | `/liveliness/healthz` (api 3001, syncer 3002), `/metricz` (3000), `/internal/docs` |
 
@@ -133,6 +135,9 @@ and a still-running old syncer holds the writer lease), update `deploy/.env.prod
 
 Migrations are owned by the migrate jobs (the apps wait for them): each `schema/*.sql` is a checksummed, tracked migration applied at most once per
 network database. Set `TRUSTED_PROXIES` to your front proxy and bind nginx to an interface only it can reach ([docs/security.md](docs/security.md#4-transport-and-the-client-address)).
+
+The `validators` worker needs outbound HTTPS to public hosts, and its migration (`002`) has a deploy order and a constraint with the AMM branch:
+read [Rolling out the validators and amendments data](docs/deployment.md#rolling-out-the-validators-and-amendments-data) before deploying it to a persistent environment.
 
 ## Load and capacity testing
 

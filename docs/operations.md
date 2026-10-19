@@ -22,6 +22,7 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 | Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` (idempotent) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total` |
+| Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
 
 Two services per network, never more than **one syncer**: `syncer-xrpl`, `syncer-xahau` are singletons (a fixed
 `container_name`, so compose refuses to scale them, and an application-level lease in ClickHouse that refuses a second writer).
@@ -47,7 +48,7 @@ dc up -d --scale api-xrpl=<n> --scale api-xahau=<m>   # migrate jobs run first (
 api containers start (a few seconds to the end of their healthcheck `start_period`) that network's host answers 502 from nginx, and the other network is not
 affected. A changed **syncer** is stopped (SIGTERM, 30 s grace: it finishes its write and releases the lease) before the new one starts, so the two never
 overlap; the new one catches up from its checkpoint, and the api keeps serving what is committed meanwhile. Order does not matter for the schema: the migrate
-jobs run before the apps start. If a brief outage per release is not acceptable, put an orchestrator with rolling updates (Kubernetes, see
+jobs run before the apps start (the syncer needs migration 002 applied before it starts, see [Apply a schema migration](#apply-a-schema-migration)). If a brief outage per release is not acceptable, put an orchestrator with rolling updates (Kubernetes, see
 [deployment](deployment.md#option-3-kubernetes)) in front of the same images, or run a second compose project next to the first and switch the nginx
 upstream between them; neither is shipped or tested here.
 
@@ -60,6 +61,41 @@ flags: a plain `dc up -d` scales the apis back to 1). **Never edit an applied fi
 checksum is a hard error (`Migration ... was modified after being applied`). All DDL is `CREATE ... IF NOT EXISTS`, so a file that
 failed halfway can simply be run again. Run migrations as a one-shot step, not from every replica. Details:
 [data-model](data-model.md#5-migrations).
+
+**The syncer needs migration `002_validators_amendments.sql` applied before it starts.** Its collector inserts rows as `JSONEachRow`, and ClickHouse
+refuses a row that has a field the table lacks, so a syncer of this version against a database without `002` stores no validation until it is applied.
+The compose files order it for you (the syncer waits for its `migrate-<network>` job); with another orchestrator run the job first. The whole rollout
+(and the constraint with `feat/amm-data`) is [below](#roll-out-the-validators-and-amendments-data).
+
+### Roll out the validators and amendments data
+
+The change that adds the `validators` worker, migration `002` and the validators and amendments routes ([ADR-0012](adr/0012-validators-and-amendments-data.md)).
+
+**Constraint.** Deploy it to a persistent environment only after `feat/amm-data` is merged, or accept losing what it collected: that branch edits
+`001_baseline.sql` in place, the migration runner refuses the changed checksum, so a database created before the merge is recreated, and the
+`validations` (90 days), votes, tallies, agreement, first-seen history, stored UNL lists and domain results cannot be recomputed
+([deployment](deployment.md#rolling-out-the-validators-and-amendments-data) has the whole text).
+
+**Order.** `migrate-<network>` (applies `002`), then `syncer-<network>`, then `api-<network>`. `dc up -d` with your `--scale` flags runs the migrate jobs first
+and starts the syncers and the apis together once they are done (an api that comes first answers from empty tables, with no errors; everything is additive,
+so a rollback removes the routes or takes `validators` out of `GH_WORKERS`, and `002` needs no undo). Before it: the amendment metadata is filled ([below](#keep-the-amendment-metadata-current)), `GH_WORKERS` includes `validators` where it is set
+explicitly, and egress to the publishers (and to the validators' domains, or `GH_DOMAIN_VERIFICATION=false`) is open.
+
+**Filling.** After the syncer starts the tables fill by themselves; the times are estimates for XRPL, and the metrics ([observability](observability.md))
+show the progress:
+
+| Data | Ready after | Watch |
+| --- | --- | --- |
+| UNL lists, network state, amendment names | The first fetch and poll: seconds to a minute | `syncer_validators_unl_fetches_total{outcome="ok"}`, `syncer_validators_node_polls_total`; the `unl.publishers` of the summary |
+| First seen | The seeding scan of `validations`, in the background, one statement per partition: about a minute | The log line `validator_seen was seeded from validations` |
+| Domain verification | Passes of up to 100 checks a minute: minutes for a few hundred domains | `syncer_validators_domain_checks_total` |
+| Versions | The first voting ledger after the new collector: at most about 17 minutes | `version` on a validator row |
+| Votes and tallies | The back-fill of the retained rounds (up to about 7,600 on XRPL), 5 s of every minute: about 1-2 hours | `syncer_validators_rounds_lag_ledgers` falling to 0; `votes_through_ledger` of the summary |
+| Agreement 1 h / 24 h / 30 d | A day per query during catch-up, 10 s of every minute: about 1-2 hours for 90 days. A window is complete once the collector has run, and the ledgers are indexed, for as long as the window is: 30-day agreement needs 30 days of both | `syncer_validators_agreement_lag_seconds`; `agreement_through` of the summary; `incomplete` on a window |
+| Recent validations of a validator | From the deploy on (the table keeps 7 days) | `GET /v2/network/validators/{key}/validations` |
+
+History from before the collector ran does not exist: "first seen" means first seen by this deployment, and there is no agreement or vote
+history before the first stored hour or round.
 
 ### Keep the amendment metadata current
 
@@ -145,7 +181,9 @@ OPTIMIZE TABLE xrpl.transactions FINAL;   -- per table, off-peak; expensive on b
 
 ### Retention
 
-Only `validations` expires on its own (90-day TTL). Raw ledger data is deleted by dropping whole partitions, **but a ledger exists only if all its tables agree**:
+Four tables expire on their own, by TTL: `validations` (90 days), `validator_validations` (7 days), `network_state` (100 days) and
+`validator_agreement_hourly` (400 days); none of them is a ledger table ([clickhouse](clickhouse.md#retention-and-ttl)). Raw ledger data is deleted by
+dropping whole partitions, **but a ledger exists only if all its tables agree**:
 
 - `ledgers` is the commit marker; `range-ingest` **skips every ledger that has a `ledgers` row** (it believes it is complete), and the live syncer never looks
   behind its checkpoint.
@@ -168,7 +206,7 @@ done
 ch "DELETE FROM xrpl.accounts_created WHERE ledger_index BETWEEN 80000000 AND 89999999"
 ```
 
-The rollups (`stats_hourly`, `volume_*`) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats` and `validations` are independent.
+The rollups (`stats_hourly`, `volume_*`) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations` and the tables of the validators and amendments data are independent.
 
 To **bring a dropped block back**, run `range-ingest` over the same range: with no `ledgers` rows left it ingests everything. To repair a **partial** loss (some tables
 dropped, or a ledger answering 500) without caring about partition alignment, use `--reprocess` over exactly the damaged range

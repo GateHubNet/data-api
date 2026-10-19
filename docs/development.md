@@ -45,7 +45,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 | Path | Package | Role |
 | --- | --- | --- |
 | `apps/api` | `@gatehub/data-api-service` | NestJS REST API: the `/v2` Ripple-compatible endpoints over ClickHouse, plus live-node lookups (balances, orders) |
-| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the `ingest`, `validations`, `fee_stats` and `aggregator` workers, and the `range-ingest` CLI |
+| `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the five workers `ingest`, `validations`, `fee_stats`, `aggregator` and `validators`, and the `range-ingest` CLI |
 | `packages/shared` | `@gatehub/data-api-shared` | ClickHouse client and migration runner, the `Table` enum and row types, parsers, `buildLedgerRows` / `LedgerWriter`, the `NodeClient`, `RatesService`, the aggregation jobs, the network profiles |
 
 `packages/shared` in more detail:
@@ -125,7 +125,8 @@ From the repo root; `pnpm -r <script>` fans out in dependency order.
 | `pnpm format` | Prettier write over `{apps,packages}/**/src/**/*.ts`. (`pnpm lint` runs `eslint --fix`, but the repo has no ESLint configuration yet, so it does not work.) |
 | `pnpm ch:migrate` | applies the schema to the database of `GH_NETWORK` (`ts-node` on `migrate.ts`) |
 | `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source: it runs `dist/`, so `pnpm build` first, and it needs the syncer's `GH_*` environment (`.env` or `GH_ENV=local`) ([backfill](backfill.md)) |
-| `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures |
+| `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures. Two more modes record the inputs of the `validators` worker: `--unl --network xrpl\|xahau [--out <dir>]` the validator lists of the network's default publishers (needs no node), and `--network-state --network xrpl\|xahau --endpoint <wss> [--out <dir>] [--ledger <n>]` what the worker asks the node for (the Amendments, NegativeUNL and FeeSettings objects at the validated ledger, or at `--ledger`, which the node must still hold, `server_info` and `feature`) |
+| `pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl\|xahau [--clickhouse]` | compares the amendment metadata file with a node (and with the database) and exits 1 on a difference ([operations](operations.md#keep-the-amendment-metadata-current)) |
 | `pnpm start:api` / `pnpm start:syncer` | `nest start --watch` |
 | `pnpm docker:up` / `pnpm docker:down` | start/stop the dev ClickHouse container |
 

@@ -122,9 +122,9 @@ const backoff = (failures: number): number =>
  *
  * **Every attempt** writes the `unl_publishers` row of the publisher and updates the metrics; the status of a publisher is
  * logged when it changes. A ClickHouse failure ends the attempt with no outcome (it is logged and retried with the
- * backoff, and no metric is set). What was inserted earlier in the same attempt can remain, and the retry then reports
- * `unchanged`. `stop()` ends the timers and waits for the attempts under way; one that has not yet written anything writes
- * nothing.
+ * backoff, and no metric is set). What was inserted earlier in the same attempt can remain (the manifests, then the lists,
+ * then the publisher row), and the retry then reports `unchanged` only if the lists had landed, else `ok`. `stop()` ends
+ * the timers and waits for the attempts under way; one that has not yet written anything writes nothing.
  */
 @Injectable()
 export class UnlFetcher {
