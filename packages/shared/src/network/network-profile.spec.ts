@@ -36,6 +36,28 @@ describe('network profiles', () => {
       expect(getNetworkProfile('xahau').defaultNodeEndpoints).toEqual(['wss://xahau.network']);
     });
 
+    it('has the validator and amendment values of each network', () => {
+      const xrplPublishers =
+        'https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,' +
+        'https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1';
+      expect(getNetworkProfile('xrpl')).toMatchObject({
+        software: 'rippled',
+        tomlPath: '/.well-known/xrp-ledger.toml',
+        defaultUnlPublishers: xrplPublishers,
+        majorityHoldSeconds: 1_209_600,
+        amendmentThresholdPercent: 80,
+        flagInterval: 256,
+      });
+      expect(getNetworkProfile('xahau')).toMatchObject({
+        software: 'xahaud',
+        tomlPath: '/.well-known/xahau.toml',
+        defaultUnlPublishers: 'https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8',
+        majorityHoldSeconds: 432_000,
+        amendmentThresholdPercent: 80,
+        flagInterval: 256,
+      });
+    });
+
     it('defaults to xrpl when GH_NETWORK is unset', () => {
       expect(getNetworkProfile()).toMatchObject({
         name: 'xrpl',

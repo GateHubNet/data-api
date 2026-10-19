@@ -32,6 +32,21 @@ export interface NetworkProfile {
   defaultNodeEndpoints: string[];
   /** First ledger from which a partial payment's delivered amount is taken from `delivered_amount` metadata. */
   partialPaymentFixLedger: number;
+  /** The node software of the network: it decides how `server_version` is decoded. */
+  software: 'rippled' | 'xahaud';
+  /** Where a validator's domain publishes its TOML file. */
+  tomlPath: '/.well-known/xrp-ledger.toml' | '/.well-known/xahau.toml';
+  /**
+   * The `GH_UNL_PUBLISHERS` text used when that variable is not set: comma separated `url=publicKey` pairs of the
+   * network's default validator list publishers (see `parseUnlPublishers`).
+   */
+  defaultUnlPublishers: string;
+  /** How long an amendment must hold its majority before it is enabled, in seconds. */
+  majorityHoldSeconds: number;
+  /** The share of trusted validators, in percent, an amendment needs. */
+  amendmentThresholdPercent: 80;
+  /** Ledgers between two flag ledgers. */
+  flagInterval: 256;
   /**
    * Binary-codec definitions (the `server_definitions` result shape) to use when the node cannot supply them: the
    * file recorded from a public node of the network, bundled as `config/definitions/<network>.json`. `undefined`
@@ -59,6 +74,14 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultDatabase: 'xrpl',
     defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
     partialPaymentFixLedger: 4594094,
+    software: 'rippled',
+    tomlPath: '/.well-known/xrp-ledger.toml',
+    defaultUnlPublishers:
+      'https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,' +
+      'https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1',
+    majorityHoldSeconds: 1_209_600,
+    amendmentThresholdPercent: 80,
+    flagInterval: 256,
     definitionsFallback: (definitionsPath) => readDefinitions('xrpl', definitionsPath),
   },
   xahau: {
@@ -68,6 +91,12 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultDatabase: 'xahau',
     defaultNodeEndpoints: ['wss://xahau.network'],
     partialPaymentFixLedger: 0,
+    software: 'xahaud',
+    tomlPath: '/.well-known/xahau.toml',
+    defaultUnlPublishers: 'https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8',
+    majorityHoldSeconds: 432_000,
+    amendmentThresholdPercent: 80,
+    flagInterval: 256,
     definitionsFallback: (definitionsPath) => readDefinitions('xahau', definitionsPath),
   },
 };
