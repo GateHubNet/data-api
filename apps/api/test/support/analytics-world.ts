@@ -18,6 +18,17 @@ import type { Harness } from '../harness';
  *    `counterparty` (3): lines with a negative balance. Its own USD has a rate on some days.
  *  - `counterparty` (B): receives what A pays, and holds 5 USD, 3 EUR of `issuer` and 5 CAD of A.
  *  - `issuer2`: an issuer whose currency never trades, so it has no rate. `stranger`: nothing at all.
+ *  - `holder` (H), for `analytics/balances` and `balance_changes`: seven lines, each a different story. XRP (500 on 02-01, the fee
+ *    and 100 paid on 02-20, 10 more on 03-20: 409.999988); USD of `issuer` (100 on 02-12, 150 on 03-10); EUR of `issuer`
+ *    (30 on 03-01, which is a Sunday); JPY of `issuer2` (1000 on 01-20, before most windows) and GBP of `issuer2` (1000 on
+ *    02-15), two lines that tie on |balance|; BTC of `issuer` (5 on 02-10, back to 0 on 04-01); and CAD owed to `counterparty`
+ *    (8 on 05-06, a negative balance: an owed line). It has two changes of a type the original never classified (+2 on 04-10
+ *    and -2 on 04-11: no `change_type`).
+ *  - `many` (M): the native line (1 XRP) and 55 lines of `issuer2`, `C00` to `C54`, the balance of `Cnn` being nn + 1, all on
+ *    03-12: more lines than the 50 a route serves.
+ *
+ * The changes of the later accounts lie between 2020-01-10T09:00 and 2020-06-15T09:00, the first and last times of the earlier
+ * ones, so that the ledgers of "the whole world" are the same ledgers as before.
  *
  * The rates: USD of `issuer` trades against XRP 12 times on 2020-02-10 (10 USD for 5 XRP: 2 USD per XRP) and 12 times on
  * 2020-04-20 (20 USD for 5 XRP: 4 USD per XRP), both at 12:30. The rate of a day is that of the trades of the day and of
@@ -30,6 +41,12 @@ export const COUNTERPARTY = 'rnCEEqDnCuSjDsHiJrca4VYUqaMyi4vGF7';
 export const ISSUER = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 export const ISSUER2 = 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De';
 export const STRANGER = 'rrrrUBy92h6worVCYERZcVCzgzgmHb17Dx';
+export const HOLDER = 'rBtgXXrLQntDfCoJFhdnmhPqMuK2DuwepA';
+export const MANY = 'rByzQTinTUkMW9RHrCkDfQt8MbNiCCDe7o';
+/** How many issued lines `many` has: more than the 50 of a page of lines. */
+export const MANY_LINES = 55;
+/** The currency of the `i`-th line of `many`, `C00` to `C54`. */
+export const manyCurrency = (i: number): string => `C${String(i).padStart(2, '0')}`;
 
 /** The first ledger of the world; ledgers are numbered from it in the order of their times. */
 const FIRST_LEDGER = 5_000_000;
@@ -79,6 +96,39 @@ export const CHANGES: ChangeSpec[] = [
   IOU(COUNTERPARTY, '2020-02-20T10:00:00Z', 1, 2, 'USD', ISSUER, '5', '5', 'payment_destination'),
   IOU(COUNTERPARTY, '2020-04-02T10:00:00Z', 1, 2, 'EUR', ISSUER, '3', '3', 'payment_destination'),
   IOU(COUNTERPARTY, '2020-05-06T09:00:00Z', 1, 2, 'CAD', TYPICAL, '5', '5', 'payment_destination'),
+
+  // the holder: seven lines (see the header)
+  IOU(HOLDER, '2020-01-20T10:00:00Z', 1, 1, 'JPY', ISSUER2, '1000', '1000', 'payment_destination'),
+  XRP(HOLDER, '2020-02-01T10:00:00Z', 1, 1, '500', '500', 'payment_destination'),
+  IOU(HOLDER, '2020-02-10T10:00:00Z', 1, 1, 'BTC', ISSUER, '5', '5', 'payment_destination'),
+  IOU(HOLDER, '2020-02-12T10:00:00Z', 1, 1, 'USD', ISSUER, '100', '100', 'payment_destination'),
+  IOU(HOLDER, '2020-02-15T10:00:00Z', 1, 1, 'GBP', ISSUER2, '1000', '1000', 'payment_destination'),
+  FEE(HOLDER, '2020-02-20T09:00:00Z', 1, '499.999988'),
+  XRP(HOLDER, '2020-02-20T09:00:00Z', 1, 2, '399.999988', '-100', 'payment_source'),
+  IOU(HOLDER, '2020-03-01T10:00:00Z', 1, 1, 'EUR', ISSUER, '30', '30', 'payment_destination'), // a Sunday
+  IOU(HOLDER, '2020-03-10T10:00:00Z', 1, 1, 'USD', ISSUER, '150', '50', 'payment_destination'),
+  XRP(HOLDER, '2020-03-20T10:00:00Z', 1, 1, '409.999988', '10', 'payment_destination'),
+  IOU(HOLDER, '2020-04-01T10:00:00Z', 1, 1, 'BTC', ISSUER, '0', '-5', 'payment_source'),
+  // two changes of a transaction type the original never classified: no change type; the balance is back where it was
+  XRP(HOLDER, '2020-04-10T10:00:00Z', 1, 1, '411.999988', '2', ''),
+  XRP(HOLDER, '2020-04-11T10:00:00Z', 1, 1, '409.999988', '-2', ''),
+  IOU(HOLDER, '2020-05-06T10:00:00Z', 1, 1, 'CAD', COUNTERPARTY, '-8', '-8', 'intermediary'), // what H owes
+
+  // many: 1 XRP and 55 lines of an issuer that does not trade
+  XRP(MANY, '2020-03-12T10:00:00Z', 1, 1, '1', '1', 'payment_destination'),
+  ...Array.from({ length: MANY_LINES }, (_, i) =>
+    IOU(
+      MANY,
+      '2020-03-12T10:00:00Z',
+      1,
+      i + 2,
+      manyCurrency(i),
+      ISSUER2,
+      String(i + 1),
+      String(i + 1),
+      'payment_destination',
+    ),
+  ),
 ];
 
 /** `[account, time, tx_index, tx_type, result, sent by the account]` */
@@ -135,6 +185,10 @@ export interface AnalyticsWorld {
   issuer2: string;
   /** An address with nothing at all. */
   stranger: string;
+  /** Seven lines, one of them owed (see the header). */
+  holder: string;
+  /** The native line and 55 lines of an issuer that does not trade. */
+  many: string;
   /** The ledger that closed at a time of the world (`YYYY-MM-DDTHH:mm:ssZ`), `undefined` for any other time. */
   ledgerAt(time: string): number | undefined;
 }
@@ -248,6 +302,8 @@ export async function seedAnalyticsWorld(h: Harness): Promise<AnalyticsWorld> {
     issuer: ISSUER,
     issuer2: ISSUER2,
     stranger: STRANGER,
+    holder: HOLDER,
+    many: MANY,
     ledgerAt: (time) => ledgerOf.get(seconds(time)),
   };
 }
