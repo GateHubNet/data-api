@@ -372,9 +372,47 @@ Between the rewrite and the hook the aggregates show the old data (eventual, lik
 - `GH_ACCOUNT_ROLLUP_MIN_ROWS` is the size from which an account is heavy (default 1,000,000 balance changes). Raising it demotes accounts (their coverage is dropped, and the API reads their rows again) and lowering it promotes more, at the next run of the job (it classifies the accounts from the counts it already has; the counts themselves are refreshed every 24 hours for the newest partition of `balance_changes` and every 7 days for the others, so an account that
   grows past the threshold is found within a day).
   `0` turns the job off: the rollups that exist are still used by the API and still corrected after a re-ingest, and simply stop growing (`syncer_account_rollups_pending_accounts` is not updated while it is off).
-- **Superseded rollup versions are never pruned.** A correction of a day (the hook above) writes a new set beside the old one; the old rows are not read, they stay in `account_lines_daily`, `account_tx_daily`, `account_trades_daily` and the old sentinels in `account_rollup_days`, and they only
-  accumulate with re-ingests of covered days. Watch the size with `SELECT table, formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE active AND database = 'xrpl' AND table LIKE 'account_%' GROUP BY table`; no cleanup is shipped.
+- **Superseded rollup versions are never pruned.** A correction of a day (the hook above) writes a new set beside the old one: one more copy of the day for each covered account on every correction pass (the ranges of a day that were marked before its roll began share one roll). The old rows are not read; they stay in `account_lines_daily`, `account_tx_daily`, `account_trades_daily` and the old sentinels in `account_rollup_days`, and they only
+  accumulate with re-ingests of covered days. Watch the size with `SELECT table, formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE active AND database = 'xrpl' AND table LIKE 'account_%' GROUP BY table`; no cleanup is shipped, and [Superseded rollup versions](#superseded-rollup-versions) has the query to run by hand.
 - A heavy account whose rollup fails or lags is read raw for the days after `rolled_through` (slower, right); the failure is in the log of `account_rollups` and `syncer_aggregator_errors_total{job="account_rollups"}`.
+
+### Superseded rollup versions
+
+Nothing prunes the old copies of a corrected day (above). If they have grown enough to matter, delete them by hand: in each of the three row tables, the rows of an (account, day) whose `version` is below the newest version of that day's sentinel in `account_rollup_days` (the readers use only the rows of the newest sentinel), and in `account_rollup_days` the sentinels that are below the newest of their day. A set that is still being written has no newer sentinel yet, and what is above the newest sentinel is left alone. The database is `xrpl` (`xahau` on the other network).
+
+```sql
+-- the rows of the superseded sets, per table
+ALTER TABLE xrpl.account_lines_daily DELETE WHERE (account, day, version) IN (
+  SELECT r.account, r.day, r.version
+  FROM (SELECT DISTINCT account, day, version FROM xrpl.account_lines_daily) AS r
+  INNER JOIN (SELECT account, day, max(version) AS newest FROM xrpl.account_rollup_days GROUP BY account, day) AS s
+    ON r.account = s.account AND r.day = s.day
+  WHERE r.version < s.newest);
+ALTER TABLE xrpl.account_tx_daily DELETE WHERE (account, day, version) IN (
+  SELECT r.account, r.day, r.version
+  FROM (SELECT DISTINCT account, day, version FROM xrpl.account_tx_daily) AS r
+  INNER JOIN (SELECT account, day, max(version) AS newest FROM xrpl.account_rollup_days GROUP BY account, day) AS s
+    ON r.account = s.account AND r.day = s.day
+  WHERE r.version < s.newest);
+ALTER TABLE xrpl.account_trades_daily DELETE WHERE (account, day, version) IN (
+  SELECT r.account, r.day, r.version
+  FROM (SELECT DISTINCT account, day, version FROM xrpl.account_trades_daily) AS r
+  INNER JOIN (SELECT account, day, max(version) AS newest FROM xrpl.account_rollup_days GROUP BY account, day) AS s
+    ON r.account = s.account AND r.day = s.day
+  WHERE r.version < s.newest);
+-- the superseded sentinels
+ALTER TABLE xrpl.account_rollup_days DELETE WHERE (account, day, version) IN (
+  SELECT r.account, r.day, r.version
+  FROM xrpl.account_rollup_days AS r
+  INNER JOIN (SELECT account, day, max(version) AS newest FROM xrpl.account_rollup_days GROUP BY account, day) AS s
+    ON r.account = s.account AND r.day = s.day
+  WHERE r.version < s.newest);
+
+-- each is a mutation that returns at once; follow them here (no row left: all done)
+SELECT table, command FROM system.mutations WHERE database = 'xrpl' AND table LIKE 'account_%' AND NOT is_done;
+```
+
+**Run it only when no rollup write is in flight**: no `range-ingest` is draining through `agg_dirty` and the aggregator's `account_rollups` job is not running (stop the syncer for the minutes it takes, or choose a quiet time), and preferably off-peak, because a request that picked an older sentinel just before a newer one landed can find the rows of that set deleted under it. The delete cannot be undone, but these tables are recomputable from the raw rows. No cleanup is shipped: nothing runs this for you.
 
 ### Stopped or broken aggregator
 

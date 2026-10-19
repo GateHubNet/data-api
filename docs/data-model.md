@@ -228,9 +228,11 @@ column of their `ORDER BY`. A rollup set is three inserts of rows and then the s
 merge keeps one row per sorting key, so without `version` in the key the rows of a newer set that is still being written (and whose
 sentinel may never come) would replace the same groups of the set the sentinel points to, and a reader would find them gone. With it every
 set keeps its rows and a merge only collapses a row written twice. The writer's version is the largest over all four rollup tables.
-**Superseded rollup versions are never pruned**: they accumulate, but only when `agg_dirty` corrects a day a rollup covers (a re-ingest of
-history), they are not read, and they are small next to the rollups themselves. Dropping them is a manual operation
-([operations](operations.md#account-and-market-aggregates)).
+**Superseded rollup versions are never pruned**: a correction of a covered day (a re-ingest of history, through `agg_dirty`) writes one more
+copy of the day's rows for each covered account beside the old one, one copy per correction pass (the ranges of a day that were marked
+before its roll began share one roll, they do not make one copy each), and every earlier copy stays. They are not read, and they are small
+next to the rollups themselves. Dropping them is a manual operation with a documented query
+([operations](operations.md#superseded-rollup-versions)); no cleanup is shipped.
 
 **Retention and size.** `pair_hourly` is the only table that expires (45 days after its hour; the aggregator keeps the last 31 days
 complete). `markets_live` holds a row per period, filter and pair ever seen (a few thousand); `native_rates_daily` some million rows over
