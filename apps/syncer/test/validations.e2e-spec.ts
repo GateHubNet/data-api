@@ -1,4 +1,11 @@
-import { ClickHouseService, getNetworkProfile, NodeClient, runMigrations, Table } from '@gatehub/data-api-shared';
+import {
+  ClickHouseService,
+  getNetworkProfile,
+  NodeClient,
+  runMigrations,
+  Table,
+  ValidatorValidationsRow,
+} from '@gatehub/data-api-shared';
 import { EventEmitter, once } from 'node:events';
 import { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -104,8 +111,12 @@ describe('ValidationsCollector (e2e)', () => {
   });
 
   const config = (endpoints: string) => ({ validationEndpoints: endpoints }) as SyncerConfig;
-  const collectorFor = (endpoints = 'ws://127.0.0.1:1', network: 'xrpl' | 'xahau' = 'xrpl') =>
-    new ValidationsCollector(config(endpoints), getNetworkProfile(network), ch, undefined, undefined, {
+  const collectorFor = (
+    endpoints = 'ws://127.0.0.1:1',
+    network: 'xrpl' | 'xahau' = 'xrpl',
+    clickhouse: ClickHouseService = ch,
+  ) =>
+    new ValidationsCollector(config(endpoints), getNetworkProfile(network), clickhouse, undefined, undefined, {
       logger: QUIET,
       flushIntervalMs: NO_FLUSH_TIMER,
       makeClient: quietClient,
@@ -315,6 +326,218 @@ describe('ValidationsCollector (e2e)', () => {
     });
   });
 
+  describe('server_version and the per-validator tables', () => {
+    const VERSION = '1745992596280311808'; // 0x183B..., more than 2^53: it must not pass through a JS number
+    const at = (ms: number) => new Date(Date.parse(`${YESTERDAY}T12:00:00.000Z`) + ms);
+    /** A key of its own for a test: the three tables are shared by the whole file. */
+    const key = (prefix: string, name: string) => `${prefix}E2e${name}`.padEnd(52, '1');
+    const sumCount = async (master: string, ledgerHash: string): Promise<number> => {
+      const [row] = await ch.query<{ n: number }>(
+        `SELECT sum(count) AS n FROM ${Table.ValidatorValidations}
+          WHERE validation_public_key = {m:String} AND ledger_hash = {h:String}`,
+        { m: master, h: ledgerHash },
+      );
+      return Number(row?.n ?? 0);
+    };
+
+    it('writes the four tables of a flush, and reads server_version back exactly', async () => {
+      const master = key('nH', 'FourTablesMaster');
+      const signing = key('n9', 'FourTablesSigning');
+      const [h1, h2] = [hash(300), hash(301)];
+      const collector = collectorFor();
+      collector.handleManifest({
+        master_key: master,
+        signing_key: signing,
+        seq: 7,
+        domain: 'e2e.example.com',
+        manifest: '24000000077121ed1f2e',
+      });
+      const msg = (overrides: Record<string, unknown>) =>
+        validation({ master_key: master, validation_public_key: signing, ...overrides });
+      collector.handleValidation(
+        msg({ ledger_hash: h1, ledger_index: '300', server_version: VERSION }),
+        REPORTER,
+        at(100),
+      );
+      // the same validation seen by another node a little earlier: one row of two sightings
+      collector.handleValidation(
+        msg({ ledger_hash: h1, ledger_index: '300', server_version: VERSION }),
+        'n9Other',
+        at(40),
+      );
+      collector.handleValidation(msg({ ledger_hash: h2, ledger_index: '302', full: false }), REPORTER, at(900));
+      expect(await collector.flush()).toBe(2);
+
+      expect(
+        await ch.query(
+          `SELECT domain, manifest, source FROM ${Table.ValidatorManifests} WHERE ephemeral_key = {e:String}`,
+          { e: signing },
+        ),
+      ).toEqual([{ domain: 'e2e.example.com', manifest: '24000000077121ED1F2E', source: 'stream' }]);
+
+      // validations: the version as exact digits, NULL where the message had none
+      expect(
+        await ch.query(
+          `SELECT ledger_hash, toString(server_version) AS server_version FROM ${Table.Validations}
+            WHERE validation_public_key = {m:String} ORDER BY ledger_hash`,
+          { m: master },
+        ),
+      ).toEqual([
+        { ledger_hash: h1, server_version: VERSION },
+        { ledger_hash: h2, server_version: null },
+      ]);
+
+      // validator_validations: the same two validations, narrow
+      const byValidator = await ch.query(
+        `SELECT ledger_index, ledger_hash, sum(count) AS count, toString(min(first_datetime)) AS first,
+                toString(max(last_datetime)) AS last, any(ephemeral_public_key) AS ephemeral, max(full) AS full,
+                any(signing_time) AS signing_time, toString(any(server_version)) AS server_version
+           FROM ${Table.ValidatorValidations} WHERE validation_public_key = {m:String}
+          GROUP BY ledger_index, ledger_hash ORDER BY ledger_index`,
+        { m: master },
+      );
+      expect(byValidator).toEqual([
+        {
+          ledger_index: 300,
+          ledger_hash: h1,
+          count: 2,
+          first: `${YESTERDAY} 12:00:00.040`,
+          last: `${YESTERDAY} 12:00:00.100`,
+          ephemeral: signing,
+          full: 1,
+          signing_time: 606933920,
+          server_version: VERSION,
+        },
+        {
+          ledger_index: 302,
+          ledger_hash: h2,
+          count: 1,
+          first: `${YESTERDAY} 12:00:00.900`,
+          last: `${YESTERDAY} 12:00:00.900`,
+          ephemeral: signing,
+          full: 0,
+          signing_time: 606933920,
+          server_version: null,
+        },
+      ]);
+
+      // validator_seen: one row for the master key
+      expect(
+        await ch.query(
+          `SELECT toString(min(first_seen)) AS first, toString(max(last_seen)) AS last, max(last_ledger_index) AS ledger,
+                  count() AS rows
+             FROM ${Table.ValidatorSeen} WHERE validation_public_key = {m:String}`,
+          { m: master },
+        ),
+      ).toEqual([{ first: `${YESTERDAY} 12:00:00.040`, last: `${YESTERDAY} 12:00:00.900`, ledger: 302, rows: 1 }]);
+      await collector.stop();
+    });
+
+    it('adds up the batches of several flushes: counts sum, the first time stays, the last moves on', async () => {
+      const master = key('nH', 'TwoFlushesMaster');
+      const signing = key('n9', 'TwoFlushesSigning');
+      const h = hash(310);
+      const collector = collectorFor();
+      const see = (ms: number, ledger: string, ledgerHash = h) =>
+        collector.handleValidation(
+          validation({
+            ledger_hash: ledgerHash,
+            ledger_index: ledger,
+            master_key: master,
+            validation_public_key: signing,
+          }),
+          REPORTER,
+          at(ms),
+        );
+      see(100, '310');
+      see(200, '310');
+      await collector.flush();
+      see(20_100, '310');
+      await collector.flush();
+      see(40_000, '311', hash(311)); // another ledger of the same validator
+      await collector.flush();
+
+      expect(await sumCount(master, h)).toBe(3);
+      const [seen] = await ch.query(
+        `SELECT toString(min(first_seen)) AS first, toString(max(last_seen)) AS last, max(last_ledger_index) AS ledger
+           FROM ${Table.ValidatorSeen} WHERE validation_public_key = {m:String}`,
+        { m: master },
+      );
+      expect(seen).toEqual({ first: `${YESTERDAY} 12:00:00.100`, last: `${YESTERDAY} 12:00:40.000`, ledger: 311 });
+      await collector.stop();
+    });
+
+    it('a replay of a batch with its token adds nothing', async () => {
+      const master = key('nH', 'ReplayMaster');
+      const signing = key('n9', 'ReplaySigning');
+      const h = hash(320);
+      // a ClickHouse whose first answer to each per-validator insert is lost: the rows are in, the collector is told not
+      const lose = new Set<string>([Table.ValidatorValidations, Table.ValidatorSeen]);
+      const attempts: [string, string | undefined][] = [];
+      const flaky = {
+        insert: async (table: string, rows: unknown[], opts?: { dedupToken?: string }) => {
+          attempts.push([table, opts?.dedupToken]);
+          await ch.insert(table, rows, opts);
+          if (lose.delete(table)) throw new Error('socket hang up');
+        },
+        query: ch.query.bind(ch),
+      } as unknown as ClickHouseService;
+      const collector = collectorFor('ws://127.0.0.1:1', 'xrpl', flaky);
+      const see = (ms: number) =>
+        collector.handleValidation(
+          validation({ ledger_hash: h, ledger_index: '320', master_key: master, validation_public_key: signing }),
+          REPORTER,
+          at(ms),
+        );
+      for (const ms of [100, 200, 300]) see(ms);
+      await collector.flush(); // lands, but the collector does not know: both batches stay pending
+      expect(await sumCount(master, h)).toBe(3);
+
+      await collector.flush(); // the same batches, with the same tokens: the server drops them
+      expect(await sumCount(master, h)).toBe(3); // not 6
+      const rawSeen = () =>
+        ch.query<{ rows: number }>(
+          `SELECT count() AS rows FROM ${Table.ValidatorSeen} WHERE validation_public_key = {m:String}`,
+          { m: master },
+        );
+      expect(await rawSeen()).toEqual([{ rows: 1 }]);
+      // the second attempt of each batch carried the token of the first
+      const tokens = (table: string) => attempts.filter(([t]) => t === table).map(([, token]) => token);
+      for (const table of [Table.ValidatorValidations, Table.ValidatorSeen]) {
+        const [first, second] = tokens(table);
+        expect(first).toMatch(new RegExp(`^vc:[0-9a-f-]{36}:${table}:\\d+$`));
+        expect(second).toBe(first);
+      }
+
+      // and a later batch has a token of its own, so it counts
+      see(400);
+      await collector.flush();
+      expect(await sumCount(master, h)).toBe(4);
+      await collector.stop();
+    });
+
+    it('drops a replayed token and counts a new one, in both tables', async () => {
+      const master = key('nH', 'TokenMaster');
+      const row: ValidatorValidationsRow = {
+        validation_public_key: master,
+        ledger_index: 330,
+        ledger_hash: hash(330),
+        count: 5,
+        first_datetime: Date.parse(`${YESTERDAY}T12:00:00Z`) / 1000,
+        last_datetime: Date.parse(`${YESTERDAY}T12:00:00Z`) / 1000,
+        ephemeral_public_key: 'n9Token',
+        signing_time: 1,
+        full: 1,
+        server_version: null,
+      };
+      await ch.insert(Table.ValidatorValidations, [row], { dedupToken: 'vc:e2e-token:validator_validations:1' });
+      await ch.insert(Table.ValidatorValidations, [row], { dedupToken: 'vc:e2e-token:validator_validations:1' });
+      expect(await sumCount(master, hash(330))).toBe(5);
+      await ch.insert(Table.ValidatorValidations, [row], { dedupToken: 'vc:e2e-token:validator_validations:2' });
+      expect(await sumCount(master, hash(330))).toBe(10);
+    });
+  });
+
   describe('with real node clients', () => {
     interface FakeNode {
       url: string;
@@ -322,8 +545,8 @@ describe('ValidationsCollector (e2e)', () => {
       server: WebSocketServer;
       subscribed: string[][];
       requests: Record<string, unknown>[];
-      /** The `manifest` answers by public key. */
-      manifests: Record<string, { master_key: string; seq: number }>;
+      /** The `manifest` answers by public key (`manifest` is base64, as the node gives it). */
+      manifests: Record<string, { master_key: string; seq: number; domain?: string; manifest?: string }>;
       sockets: Set<WebSocket>;
       push(message: Record<string, unknown>): void;
       stop(): Promise<void>;
@@ -368,8 +591,14 @@ describe('ValidationsCollector (e2e)', () => {
             respond({
               requested: request.public_key,
               ...(known && {
-                details: { ephemeral_key: request.public_key, master_key: known.master_key, seq: known.seq },
+                details: {
+                  ephemeral_key: request.public_key,
+                  master_key: known.master_key,
+                  seq: known.seq,
+                  ...(known.domain !== undefined && { domain: known.domain }),
+                },
               }),
+              ...(known?.manifest !== undefined && { manifest: known.manifest }),
             });
           } else {
             respond({});
@@ -422,7 +651,12 @@ describe('ValidationsCollector (e2e)', () => {
 
     it('maps an ephemeral key by a manifest of the stream, and by the manifest RPC when no manifest came', async () => {
       const node = await startNode(REPORTER);
-      node.manifests[SIGNING_2] = { master_key: MASTER_2, seq: 12 };
+      node.manifests[SIGNING_2] = {
+        master_key: MASTER_2,
+        seq: 12,
+        domain: 'rpc.example.com',
+        manifest: 'JAAAAAJxIe0fLg==', // 24000000027121ED1F2E
+      };
       const collector = collectorFor(node.url);
       try {
         collector.onApplicationBootstrap();
@@ -431,7 +665,15 @@ describe('ValidationsCollector (e2e)', () => {
 
         const h = hash(210);
         // the messages of one connection arrive in order: the manifest is known when the validation behind it is handled
-        node.push({ type: 'manifestReceived', master_key: MASTER, seq: 5, signature: 'AA', signing_key: SIGNING });
+        node.push({
+          type: 'manifestReceived',
+          master_key: MASTER,
+          seq: 5,
+          signature: 'AA',
+          signing_key: SIGNING,
+          domain: 'stream.example.com',
+          manifest: '24000000057121ed0a0b', // the stream gives hex
+        });
         node.push(validation({ ledger_hash: h, master_key: undefined })); // mapped by the manifest of the stream
         node.push(validation({ ledger_hash: h, master_key: undefined, validation_public_key: SIGNING_2 })); // by the RPC
         node.push(validation({ ledger_hash: h, master_key: undefined, validation_public_key: 'n9Unknown' })); // by neither
@@ -462,6 +704,31 @@ describe('ValidationsCollector (e2e)', () => {
           [
             { ephemeral_key: SIGNING, master: MASTER, highest: 5 },
             { ephemeral_key: SIGNING_2, master: MASTER_2, highest: 12 },
+          ].sort((x, y) => x.ephemeral_key.localeCompare(y.ephemeral_key)),
+        );
+
+        // with the domain, the raw manifest as upper-case hex, and where each one came from
+        const raw = await ch.query<Record<string, unknown>>(
+          `SELECT ephemeral_key, argMax(domain, seq) AS domain, argMax(manifest, seq) AS manifest,
+                  argMax(source, seq) AS source
+             FROM ${Table.ValidatorManifests} WHERE ephemeral_key IN ({a:String}, {b:String})
+            GROUP BY ephemeral_key ORDER BY ephemeral_key`,
+          { a: SIGNING, b: SIGNING_2 },
+        );
+        expect(raw.sort((x, y) => String(x.ephemeral_key).localeCompare(String(y.ephemeral_key)))).toEqual(
+          [
+            {
+              ephemeral_key: SIGNING,
+              domain: 'stream.example.com',
+              manifest: '24000000057121ED0A0B',
+              source: 'stream',
+            },
+            {
+              ephemeral_key: SIGNING_2,
+              domain: 'rpc.example.com',
+              manifest: '24000000027121ED1F2E',
+              source: 'rpc',
+            },
           ].sort((x, y) => x.ephemeral_key.localeCompare(y.ephemeral_key)),
         );
       } finally {

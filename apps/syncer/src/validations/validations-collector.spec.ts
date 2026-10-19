@@ -7,16 +7,22 @@ import {
   Table,
   ValidationsRow,
   ValidatorManifestsRow,
+  ValidatorSeenRow,
+  ValidatorValidationsRow,
 } from '@gatehub/data-api-shared';
 import { EventEmitter } from 'node:events';
 import { SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import {
+  byValidatorRowFrom,
   MANIFEST_FAILURE_TTL_MS,
   MANIFEST_MISS_TTL_MS,
   MANIFEST_RPC_TIMEOUT_MS,
   MAX_BUFFERED_ROWS,
+  mergeByValidatorRows,
+  mergeSeenRows,
   REPORTER_RETRY_MS,
+  seenRowFrom,
   validationRowFrom,
   VALIDATIONS_FLUSH_INTERVAL_MS,
   VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS,
@@ -86,7 +92,16 @@ class FakeNode extends EventEmitter {
   pubkey: string | undefined;
   networkId: number | undefined;
   /** What the `manifest` RPC answers, by requested key; no entry: a node that knows no manifest for it. */
-  manifests: Record<string, { master_key: string; ephemeral_key?: string; seq: number }> = {};
+  manifests: Record<
+    string,
+    {
+      master_key: string;
+      ephemeral_key?: string;
+      seq: number;
+      domain?: string;
+      /** base64, at the top of the answer */ manifest?: string;
+    }
+  > = {};
 
   constructor(
     readonly endpoint: string,
@@ -114,8 +129,12 @@ class FakeNode extends EventEmitter {
   }));
   request = jest.fn(async (req: Record<string, unknown>, _opts?: unknown): Promise<unknown> => {
     const key = String(req.public_key);
-    const details = this.manifests[key];
-    return { requested: key, ...(details && { details: { ephemeral_key: key, ...details } }) };
+    const { manifest, ...details } = this.manifests[key] ?? {};
+    return {
+      requested: key,
+      ...(this.manifests[key] && { details: { ephemeral_key: key, ...details } }),
+      ...(manifest !== undefined && { manifest }),
+    };
   });
 }
 
@@ -124,7 +143,13 @@ interface Setup {
   nodes: FakeNode[];
   insert: jest.Mock;
   query: jest.Mock;
-  metrics: Record<'validationsFlushedTotal' | 'validationsErrorsTotal' | 'validationsDroppedTotal', { inc: jest.Mock }>;
+  metrics: Record<
+    | 'validationsFlushedTotal'
+    | 'validationsErrorsTotal'
+    | 'validationsDroppedTotal'
+    | 'validatorValidationsFlushedTotal',
+    { inc: jest.Mock }
+  >;
   signals: { register: jest.Mock };
   logger: { log: jest.Mock; warn: jest.Mock; error: jest.Mock };
 }
@@ -147,6 +172,7 @@ function setup(
     validationsFlushedTotal: { inc: jest.fn() },
     validationsErrorsTotal: { inc: jest.fn() },
     validationsDroppedTotal: { inc: jest.fn() },
+    validatorValidationsFlushedTotal: { inc: jest.fn() },
   };
   const signals = { register: jest.fn() };
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
@@ -186,12 +212,36 @@ const written = (s: Setup): ValidationsRow[] =>
 /** The rows of the last insert into `validations`, failed or not. */
 const lastInsert = (s: Setup): ValidationsRow[] =>
   s.insert.mock.calls.filter(([table]) => table === Table.Validations).at(-1)![1] as ValidationsRow[];
-/** What the collector adds to a manifest row today: no domain or raw manifest, and the stream as the source. */
+/** What a manifest row of the stream gets when the message names no domain and carries no raw manifest. */
 const STREAM_ONLY = { domain: '', manifest: '', source: 'stream' } as const;
 const writtenManifests = (s: Setup): ValidatorManifestsRow[] =>
   s.insert.mock.calls
     .filter(([table]) => table === Table.ValidatorManifests)
     .flatMap(([, rows]) => rows as ValidatorManifestsRow[]);
+/** The calls `insert(table, rows, opts)` made into one table, in order, failed ones too. */
+const insertsInto = (s: Setup, table: Table) =>
+  s.insert.mock.calls
+    .filter(([t]) => t === table)
+    .map(([, rows, opts]) => ({
+      rows: rows as unknown[],
+      token: (opts as { dedupToken?: string } | undefined)?.dedupToken,
+    }));
+const writtenByValidator = (s: Setup): ValidatorValidationsRow[] =>
+  insertsInto(s, Table.ValidatorValidations).flatMap((call) => call.rows as ValidatorValidationsRow[]);
+const writtenSeen = (s: Setup): ValidatorSeenRow[] =>
+  insertsInto(s, Table.ValidatorSeen).flatMap((call) => call.rows as ValidatorSeenRow[]);
+/** The tables the collector inserted into, in order. */
+const tablesWritten = (s: Setup): string[] => s.insert.mock.calls.map(([table]) => String(table));
+/** Makes every insert into `table` fail (until `mockImplementation` is set again); the others succeed. */
+const failInto = (s: Setup, table: Table, message = 'ClickHouse is down') =>
+  s.insert.mockImplementation(async (t: Table | string) => {
+    if (t === table) throw new Error(message);
+  });
+/** The `buffer_full` drops counted so far, over all tables. */
+const bufferFullDrops = (s: Setup): number =>
+  s.metrics.validationsDroppedTotal.inc.mock.calls
+    .filter(([labels]) => (labels as { reason: string }).reason === 'buffer_full')
+    .reduce((sum, [, n]) => sum + (typeof n === 'number' ? n : 1), 0);
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -362,6 +412,18 @@ describe('ValidationsCollector', () => {
       expect(row(validation({ signature: undefined }))?.signature).toBe('');
     });
 
+    it('writes server_version as exact digits, and null when the message has none', () => {
+      expect(row(validation({ server_version: '1745992596280311808' }))?.server_version).toBe('1745992596280311808');
+      expect(row(validation({ server_version: '18446744073709551615' }))?.server_version).toBe('18446744073709551615');
+      expect(row(validation({ server_version: 42 }))?.server_version).toBe('42');
+      expect(row(validation())?.server_version).toBeNull();
+      expect(row(validation({ server_version: undefined }))?.server_version).toBeNull();
+      // a value that is no UInt64 is no version: never a row ClickHouse would refuse
+      for (const odd of ['x', '', -1, '18446744073709551616', 1.5, null, {}, ['1']]) {
+        expect([odd, row(validation({ server_version: odd }))?.server_version]).toEqual([odd, null]);
+      }
+    });
+
     it('is undefined for a ledger hash that is not 64 hex digits', () => {
       expect(validationRowFrom(validation({ ledger_hash: 'zz' }), REPORTER, 1, MASTER, SIGNING)).toBeUndefined();
       expect(
@@ -472,8 +534,10 @@ describe('ValidationsCollector', () => {
       );
       await s.collector.flush();
       expect(written(s)[0]).toMatchObject({ validation_public_key: MASTER, ephemeral_public_key: SIGNING });
-      // what the node said is kept for the next start
-      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 9, ...STREAM_ONLY }]);
+      // what the node said is kept for the next start, as the node's own answer
+      expect(writtenManifests(s)).toEqual([
+        { ephemeral_key: SIGNING, master_key: MASTER, seq: 9, domain: '', manifest: '', source: 'rpc' },
+      ]);
 
       // and is known now
       s.nodes[0].emit('validationReceived', bare());
@@ -631,6 +695,82 @@ describe('ValidationsCollector', () => {
       await s.collector.stop();
     });
 
+    it('keeps the domain and the raw manifest of a stream manifest, the manifest as upper-case hex', async () => {
+      const s = setup();
+      await boot(s);
+      s.nodes[0].emit(
+        'manifestReceived',
+        manifest({ seq: 4, domain: 'example.com', manifest: '24000000027121ed1f2e' }),
+      );
+      await s.collector.flush();
+      expect(writtenManifests(s)).toEqual([
+        {
+          ephemeral_key: SIGNING,
+          master_key: MASTER,
+          seq: 4,
+          domain: 'example.com',
+          manifest: '24000000027121ED1F2E',
+          source: 'stream',
+        },
+      ]);
+      await s.collector.stop();
+    });
+
+    it('keeps no domain for a manifest that names none, and no manifest that is not hex', async () => {
+      const s = setup();
+      await boot(s);
+      s.nodes[0].emit('manifestReceived', manifest({ seq: 1, domain: '', manifest: 'not hex!' }));
+      s.nodes[0].emit(
+        'manifestReceived',
+        manifest({ signing_key: SIGNING_2, master_key: MASTER_2, seq: 2, domain: 7 }),
+      );
+      await s.collector.flush();
+      expect(writtenManifests(s)).toEqual([
+        { ephemeral_key: SIGNING, master_key: MASTER, seq: 1, ...STREAM_ONLY },
+        { ephemeral_key: SIGNING_2, master_key: MASTER_2, seq: 2, ...STREAM_ONLY },
+      ]);
+      await s.collector.stop();
+    });
+
+    it('keeps them from the manifest RPC, base64 to hex', async () => {
+      const s = setup();
+      await boot(s);
+      s.nodes[0].manifests[SIGNING] = {
+        master_key: MASTER,
+        seq: 9,
+        domain: 'example.com',
+        manifest: 'JAAAAAJxIe0fLg==', // 24000000027121ED1F2E
+      };
+      s.nodes[0].emit('validationReceived', bare());
+      await jest.advanceTimersByTimeAsync(0);
+      await s.collector.flush();
+      expect(writtenManifests(s)).toEqual([
+        {
+          ephemeral_key: SIGNING,
+          master_key: MASTER,
+          seq: 9,
+          domain: 'example.com',
+          manifest: '24000000027121ED1F2E',
+          source: 'rpc',
+        },
+      ]);
+
+      // an answer whose manifest is no base64 keeps the rest of it
+      s.nodes[0].manifests[SIGNING_2] = { master_key: MASTER_2, seq: 3, manifest: '***' };
+      s.nodes[0].emit('validationReceived', bare({ validation_public_key: SIGNING_2, ledger_hash: OTHER_HASH }));
+      await jest.advanceTimersByTimeAsync(0);
+      await s.collector.flush();
+      expect(writtenManifests(s).at(-1)).toEqual({
+        ephemeral_key: SIGNING_2,
+        master_key: MASTER_2,
+        seq: 3,
+        domain: '',
+        manifest: '',
+        source: 'rpc',
+      });
+      await s.collector.stop();
+    });
+
     it('writes a manifest again only when its seq is higher (the table keeps the highest seq per key)', async () => {
       const s = setup();
       await boot(s);
@@ -749,7 +889,7 @@ describe('ValidationsCollector', () => {
         T0,
       );
       expect(await s.collector.flush()).toBe(2);
-      expect(s.insert).toHaveBeenCalledTimes(1);
+      expect(insertsInto(s, Table.Validations)).toHaveLength(1);
       expect(s.insert.mock.calls[0][0]).toBe(Table.Validations);
       expect(s.collector.bufferedRows).toBe(0);
       expect(s.metrics.validationsFlushedTotal.inc).toHaveBeenCalledWith(2);
@@ -759,9 +899,9 @@ describe('ValidationsCollector', () => {
       const s = setup();
       s.collector.handleValidation(validation(), REPORTER, T0);
       expect(await s.collector.flush()).toBe(1);
-      // nothing new: nothing is written again
+      // nothing new: nothing is written again, into no table
       expect(await s.collector.flush()).toBe(0);
-      expect(s.insert).toHaveBeenCalledTimes(1);
+      expect(tablesWritten(s)).toEqual([Table.Validations, Table.ValidatorValidations, Table.ValidatorSeen]);
 
       // a new sighting of the same validation is a new partial row; the table adds them up
       s.collector.handleValidation(validation(), REPORTER, new Date(T0.getTime() + 20_000));
@@ -871,16 +1011,16 @@ describe('ValidationsCollector', () => {
       s.insert.mockReturnValueOnce(slow.promise);
       s.nodes[0].emit('validationReceived', validation());
       await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS);
-      expect(s.insert).toHaveBeenCalledTimes(1);
+      expect(insertsInto(s, Table.Validations)).toHaveLength(1);
 
       s.nodes[0].emit('validationReceived', validation({ ledger_hash: OTHER_HASH }));
       await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS);
-      expect(s.insert).toHaveBeenCalledTimes(1);
+      expect(insertsInto(s, Table.Validations)).toHaveLength(1);
       expect(s.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/previous flush is still running/i));
 
       slow.resolve();
       await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS);
-      expect(s.insert).toHaveBeenCalledTimes(2);
+      expect(insertsInto(s, Table.Validations)).toHaveLength(2);
       expect(written(s).map((r) => r.ledger_hash)).toEqual([HASH, OTHER_HASH]);
       await s.collector.stop();
     });
@@ -891,6 +1031,543 @@ describe('ValidationsCollector', () => {
       const [a, b] = await Promise.all([s.collector.flush(), s.collector.flush()]);
       expect(a + b).toBe(1);
       expect(written(s)).toHaveLength(1);
+    });
+  });
+
+  describe('the per-validator tables: validator_validations and validator_seen', () => {
+    const at = (ms: number) => new Date(T0.getTime() + ms);
+    /** `at(ms)` as the unix seconds the collector writes. */
+    const sec = (ms: number) => (T0.getTime() + ms) / 1000;
+    const BOOT_TOKEN = /^vc:([0-9a-f-]{36}):(validator_validations|validator_seen):(\d+)$/;
+    /** The ledger hash `n` as 64 hex digits. */
+    const hashOf = (n: number): string => n.toString(16).toUpperCase().padStart(64, '0');
+    const hashesOf = (rows: unknown[]): string[] => (rows as ValidatorValidationsRow[]).map((r) => r.ledger_hash);
+
+    describe('byValidatorRowFrom() and seenRowFrom()', () => {
+      const sighting = (overrides: Record<string, unknown> = {}, time = T0_SECONDS): ValidationsRow =>
+        validationRowFrom(validation(overrides), REPORTER, time, MASTER, SIGNING)!;
+
+      it('takes the narrow row of one validator and ledger from a validations row', () => {
+        const row = sighting({ server_version: '1745992596280311808' });
+        expect(byValidatorRowFrom(row)).toEqual({
+          validation_public_key: MASTER,
+          ledger_index: 46087342,
+          ledger_hash: HASH,
+          count: 1,
+          first_datetime: T0_SECONDS,
+          last_datetime: T0_SECONDS,
+          ephemeral_public_key: SIGNING,
+          signing_time: 606933920,
+          full: 1,
+          server_version: '1745992596280311808',
+        });
+        expect(byValidatorRowFrom(sighting({ full: false })).server_version).toBeNull();
+        expect(byValidatorRowFrom(sighting({ full: false })).full).toBe(0);
+      });
+
+      it('shares nothing with the row it was made from', () => {
+        const row = sighting();
+        const narrow = byValidatorRowFrom(row);
+        narrow.count = 99;
+        const seen = seenRowFrom(row);
+        seen.last_ledger_index = 1;
+        expect(row.count).toBe(1);
+        expect(row.ledger_index).toBe(46087342);
+      });
+
+      it('takes the validator, its first and last time and its ledger from a validations row', () => {
+        expect(seenRowFrom(sighting({}, 1_792_152_003.5))).toEqual({
+          validation_public_key: MASTER,
+          first_seen: 1_792_152_003.5,
+          last_seen: 1_792_152_003.5,
+          last_ledger_index: 46087342,
+        });
+      });
+
+      it('merges sightings of one validator and ledger: count sum, first min, last max, full max, the rest of the first', () => {
+        const first = byValidatorRowFrom(sighting({ full: false, signing_time: 5, server_version: '7' }, 1_000.25));
+        const second = byValidatorRowFrom(sighting({ full: true, signing_time: 9 }, 999.5));
+        const third = byValidatorRowFrom(sighting({ full: false, signing_time: 11 }, 1_002));
+        const merged = mergeByValidatorRows(mergeByValidatorRows(first, second), third);
+        expect(merged).toEqual({
+          validation_public_key: MASTER,
+          ledger_index: 46087342,
+          ledger_hash: HASH,
+          count: 3,
+          first_datetime: 999.5,
+          last_datetime: 1_002,
+          ephemeral_public_key: SIGNING,
+          signing_time: 5,
+          full: 1,
+          server_version: '7',
+        });
+      });
+
+      it('merges sightings of one validator: first_seen min, last_seen max, last_ledger_index max', () => {
+        const a = seenRowFrom(sighting({ ledger_index: '10' }, 50));
+        const b = seenRowFrom(sighting({ ledger_index: '12' }, 10));
+        const c = seenRowFrom(sighting({ ledger_index: '11' }, 90));
+        expect(mergeSeenRows(mergeSeenRows(a, b), c)).toEqual({
+          validation_public_key: MASTER,
+          first_seen: 10,
+          last_seen: 90,
+          last_ledger_index: 12,
+        });
+      });
+    });
+
+    describe('what a flush writes', () => {
+      it('writes the four tables in order', async () => {
+        const s = setup();
+        await boot(s);
+        s.nodes[0].emit('manifestReceived', manifest({ seq: 4 }));
+        s.nodes[0].emit('validationReceived', validation());
+        await s.collector.flush();
+
+        expect(tablesWritten(s)).toEqual([
+          Table.ValidatorManifests,
+          Table.Validations,
+          Table.ValidatorValidations,
+          Table.ValidatorSeen,
+        ]);
+        // only the two new tables carry an insert token; the first two are written as they always were
+        expect(s.insert.mock.calls[0]).toHaveLength(2);
+        expect(s.insert.mock.calls[1]).toHaveLength(2);
+        expect(s.insert.mock.calls[2][2]).toEqual({ dedupToken: expect.stringMatching(BOOT_TOKEN) });
+        expect(s.insert.mock.calls[3][2]).toEqual({ dedupToken: expect.stringMatching(BOOT_TOKEN) });
+        expect(s.metrics.validatorValidationsFlushedTotal.inc).toHaveBeenCalledWith(
+          { table: Table.ValidatorValidations },
+          1,
+        );
+        expect(s.metrics.validatorValidationsFlushedTotal.inc).toHaveBeenCalledWith({ table: Table.ValidatorSeen }, 1);
+        await s.collector.stop();
+      });
+
+      it('writes nothing into the per-validator tables when no validation was seen', async () => {
+        const s = setup();
+        await boot(s);
+        s.nodes[0].emit('manifestReceived', manifest({ seq: 4 }));
+        await s.collector.flush();
+        expect(tablesWritten(s)).toEqual([Table.ValidatorManifests]);
+        await s.collector.stop();
+      });
+
+      it('writes one validator_validations row per master, ledger and hash: counts add up, first min, last max, full max', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation({ full: false, signing_time: 5, server_version: '7' }), 'n9A', at(100));
+        s.collector.handleValidation(validation({ full: true, signing_time: 9 }), 'n9B', at(50));
+        s.collector.handleValidation(validation({ ledger_hash: OTHER_HASH }), 'n9A', at(70));
+        s.collector.handleValidation(
+          validation({ master_key: MASTER_2, validation_public_key: SIGNING_2 }),
+          'n9A',
+          at(10),
+        );
+        await s.collector.flush();
+
+        const base = { ledger_index: 46087342, ephemeral_public_key: SIGNING, signing_time: 5, server_version: null };
+        expect(writtenByValidator(s)).toEqual([
+          {
+            ...base,
+            validation_public_key: MASTER,
+            ledger_hash: HASH,
+            count: 2,
+            first_datetime: sec(50),
+            last_datetime: sec(100),
+            signing_time: 5, // the other fields are those of the first sighting
+            server_version: '7',
+            full: 1,
+          },
+          {
+            ...base,
+            validation_public_key: MASTER,
+            ledger_hash: OTHER_HASH,
+            signing_time: 606933920,
+            count: 1,
+            first_datetime: sec(70),
+            last_datetime: sec(70),
+            full: 1,
+          },
+          {
+            ...base,
+            validation_public_key: MASTER_2,
+            ledger_hash: HASH,
+            ephemeral_public_key: SIGNING_2,
+            signing_time: 606933920,
+            count: 1,
+            first_datetime: sec(10),
+            last_datetime: sec(10),
+            full: 1,
+          },
+        ]);
+      });
+
+      it('writes one validator_seen row per master: min first, max last, max ledger', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation({ ledger_index: '10' }), REPORTER, at(5_000));
+        s.collector.handleValidation(validation({ ledger_index: '12', ledger_hash: OTHER_HASH }), REPORTER, at(1_000));
+        s.collector.handleValidation(validation({ ledger_index: '11', ledger_hash: hashOf(3) }), REPORTER, at(9_000));
+        s.collector.handleValidation(
+          validation({ master_key: MASTER_2, validation_public_key: SIGNING_2, ledger_index: '9' }),
+          REPORTER,
+          at(2_000),
+        );
+        await s.collector.flush();
+
+        expect(writtenSeen(s)).toEqual([
+          {
+            validation_public_key: MASTER,
+            first_seen: sec(1_000),
+            last_seen: sec(9_000),
+            last_ledger_index: 12,
+          },
+          {
+            validation_public_key: MASTER_2,
+            first_seen: sec(2_000),
+            last_seen: sec(2_000),
+            last_ledger_index: 9,
+          },
+        ]);
+      });
+
+      it('keys the rows by the master key, not by the signing key', async () => {
+        const s = setup();
+        await boot(s);
+        s.nodes[0].emit('manifestReceived', manifest({ seq: 1 })); // SIGNING belongs to MASTER
+        s.nodes[0].emit('validationReceived', bare());
+        s.nodes[0].emit('validationReceived', validation({ validation_public_key: SIGNING_2, master_key: MASTER }));
+        await s.collector.flush();
+        expect(writtenSeen(s).map((r) => r.validation_public_key)).toEqual([MASTER]);
+        // two signing keys of one validator are one validator: one row, of the first sighting's signing key
+        expect(writtenByValidator(s).map((r) => [r.validation_public_key, r.ephemeral_public_key, r.count])).toEqual([
+          [MASTER, SIGNING, 2],
+        ]);
+        await s.collector.stop();
+      });
+
+      it('writes the version it read into validations and validator_validations', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation({ server_version: '1745992596280311808' }), REPORTER, T0);
+        await s.collector.flush();
+        expect(written(s)[0].server_version).toBe('1745992596280311808');
+        expect(writtenByValidator(s)[0].server_version).toBe('1745992596280311808');
+      });
+
+      it('writes the rows of a flush once: the next flush has only what came after', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        await s.collector.flush();
+        await s.collector.flush();
+        s.collector.handleValidation(validation(), REPORTER, at(20_000));
+        await s.collector.flush();
+        expect(writtenByValidator(s).map((r) => r.count)).toEqual([1, 1]);
+        expect(writtenSeen(s).map((r) => [r.first_seen, r.last_seen])).toEqual([
+          [T0_SECONDS, T0_SECONDS],
+          [sec(20_000), sec(20_000)],
+        ]);
+        const tokens = insertsInto(s, Table.ValidatorValidations).map((c) => c.token);
+        expect(tokens).toHaveLength(2);
+        expect(tokens[0]).not.toBe(tokens[1]); // two batches, two tokens
+      });
+
+      it('gives the tokens of one process the same boot id, a table name and one number per flush', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        await s.collector.flush();
+        s.collector.handleValidation(validation({ ledger_hash: OTHER_HASH }), REPORTER, T0);
+        await s.collector.flush();
+        const tokens = [Table.ValidatorValidations, Table.ValidatorSeen].flatMap((table) =>
+          insertsInto(s, table).map((c) => c.token as string),
+        );
+        const parsed = tokens.map((token) => BOOT_TOKEN.exec(token)!.slice(1));
+        expect(new Set(parsed.map(([boot]) => boot)).size).toBe(1);
+        expect(parsed.map(([, table, n]) => [table, n])).toEqual([
+          ['validator_validations', '1'],
+          ['validator_validations', '2'],
+          ['validator_seen', '1'],
+          ['validator_seen', '2'],
+        ]);
+        // another process has another boot id
+        const other = setup();
+        other.collector.handleValidation(validation(), REPORTER, T0);
+        await other.collector.flush();
+        expect(insertsInto(other, Table.ValidatorSeen)[0].token).not.toBe(insertsInto(s, Table.ValidatorSeen)[0].token);
+      });
+    });
+
+    describe('a table that fails', () => {
+      it('re-sends a failed validator_validations batch with its own token before the new one', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        failInto(s, Table.ValidatorValidations, 'Code: 210. Connection reset');
+        expect(await s.collector.flush()).toBe(1); // the failure of this table does not fail the flush
+        expect(s.metrics.validationsErrorsTotal.inc).toHaveBeenCalledTimes(1);
+        expect(s.metrics.validationsErrorsTotal.inc).toHaveBeenCalledWith({ stage: 'flush_by_validator' });
+        expect(s.logger.error).toHaveBeenCalledWith(expect.stringContaining('Connection reset'));
+        expect(s.metrics.validatorValidationsFlushedTotal.inc).not.toHaveBeenCalledWith(
+          { table: Table.ValidatorValidations },
+          expect.anything(),
+        );
+
+        s.insert.mockImplementation(async () => undefined);
+        s.collector.handleValidation(validation({ ledger_hash: OTHER_HASH }), REPORTER, at(20_000));
+        await s.collector.flush();
+
+        const calls = insertsInto(s, Table.ValidatorValidations);
+        const boot = BOOT_TOKEN.exec(calls[0].token!)![1];
+        expect(calls.map((c) => c.token)).toEqual([
+          `vc:${boot}:validator_validations:1`, // the one that failed
+          `vc:${boot}:validator_validations:1`, // sent again, first
+          `vc:${boot}:validator_validations:2`, // and then the new one
+        ]);
+        expect(hashesOf(calls[1].rows)).toEqual([HASH]);
+        expect(hashesOf(calls[2].rows)).toEqual([OTHER_HASH]);
+        expect(
+          s.metrics.validatorValidationsFlushedTotal.inc.mock.calls.filter(
+            ([l]) => l.table === Table.ValidatorValidations,
+          ),
+        ).toEqual([
+          [{ table: Table.ValidatorValidations }, 1],
+          [{ table: Table.ValidatorValidations }, 1],
+        ]);
+      });
+
+      it('re-sends a failed validator_seen batch the same way, counted as flush_seen', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        failInto(s, Table.ValidatorSeen);
+        expect(await s.collector.flush()).toBe(1);
+        expect(s.metrics.validationsErrorsTotal.inc).toHaveBeenCalledWith({ stage: 'flush_seen' });
+        expect(s.metrics.validationsErrorsTotal.inc).toHaveBeenCalledTimes(1);
+
+        s.insert.mockImplementation(async () => undefined);
+        s.collector.handleValidation(
+          validation({ ledger_index: '46087343', ledger_hash: OTHER_HASH }),
+          REPORTER,
+          at(20_000),
+        );
+        await s.collector.flush();
+        const calls = insertsInto(s, Table.ValidatorSeen);
+        expect(calls.map((c) => c.token!.replace(/^vc:[^:]+:/, ''))).toEqual([
+          'validator_seen:1',
+          'validator_seen:1',
+          'validator_seen:2',
+        ]);
+        expect(calls[1].rows).toEqual(calls[0].rows);
+        expect(calls[2].rows).toEqual([
+          {
+            validation_public_key: MASTER,
+            first_seen: sec(20_000),
+            last_seen: sec(20_000),
+            last_ledger_index: 46087343,
+          },
+        ]);
+      });
+
+      it('sends the failed rows again unchanged: what is seen meanwhile goes into a batch of its own', async () => {
+        const s = setup();
+        const sent: string[] = [];
+        s.insert.mockImplementation(async (table: Table | string, rows: unknown[]) => {
+          if (table === Table.ValidatorValidations) {
+            sent.push(JSON.stringify(rows));
+            if (sent.length === 1) throw new Error('timed out');
+          }
+        });
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        await s.collector.flush();
+        // the same validation again, in the time the first batch is waiting
+        s.collector.handleValidation(validation(), REPORTER, at(5_000));
+        await s.collector.flush();
+
+        expect(sent).toHaveLength(3);
+        expect(sent[1]).toBe(sent[0]); // byte for byte what was sent the first time
+        expect(JSON.parse(sent[0])[0]).toMatchObject({ count: 1, last_datetime: T0_SECONDS });
+        expect(JSON.parse(sent[2])[0]).toMatchObject({ count: 1, first_datetime: sec(5_000) });
+      });
+
+      it('does not re-send a table that succeeded when another failed', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        failInto(s, Table.ValidatorValidations);
+        await s.collector.flush();
+        s.insert.mockImplementation(async () => undefined);
+        s.collector.handleValidation(validation({ ledger_hash: OTHER_HASH }), REPORTER, at(20_000));
+        await s.collector.flush();
+
+        // validations and validator_seen: one insert per flush, each with the rows of that flush only
+        expect(
+          insertsInto(s, Table.Validations).map((c) => (c.rows as ValidationsRow[]).map((r) => r.ledger_hash)),
+        ).toEqual([[HASH], [OTHER_HASH]]);
+        expect(insertsInto(s, Table.ValidatorSeen)).toHaveLength(2);
+        expect(writtenSeen(s).map((r) => r.first_seen)).toEqual([T0_SECONDS, sec(20_000)]);
+        // validator_validations: the failed one, sent again, and the new one
+        expect(insertsInto(s, Table.ValidatorValidations)).toHaveLength(3);
+      });
+
+      it('does not re-send the per-validator tables when the validations insert is what failed', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        failInto(s, Table.Validations);
+        await expect(s.collector.flush()).rejects.toThrow('ClickHouse is down');
+        // validations is first and failed; the others were still tried
+        expect(tablesWritten(s)).toEqual([Table.Validations, Table.ValidatorValidations, Table.ValidatorSeen]);
+        expect(s.metrics.validationsErrorsTotal.inc).toHaveBeenCalledTimes(1);
+        expect(s.metrics.validationsErrorsTotal.inc).toHaveBeenCalledWith({ stage: 'flush' });
+
+        s.insert.mockImplementation(async () => undefined);
+        expect(await s.collector.flush()).toBe(1); // the rows of validations were kept
+        expect(tablesWritten(s)).toEqual([
+          Table.Validations,
+          Table.ValidatorValidations,
+          Table.ValidatorSeen,
+          Table.Validations, // only the table that failed is written again
+        ]);
+      });
+
+      it('does not stop the tables after a failed one: validator_seen is written when validator_validations failed', async () => {
+        const s = setup();
+        s.collector.handleValidation(validation(), REPORTER, T0);
+        failInto(s, Table.ValidatorValidations);
+        await s.collector.flush();
+        expect(tablesWritten(s)).toEqual([Table.Validations, Table.ValidatorValidations, Table.ValidatorSeen]);
+        expect(s.metrics.validatorValidationsFlushedTotal.inc).toHaveBeenCalledTimes(1);
+        expect(s.metrics.validatorValidationsFlushedTotal.inc).toHaveBeenCalledWith({ table: Table.ValidatorSeen }, 1);
+      });
+
+      it('tries the oldest batch of a table first and, when it fails again, leaves the others for the next flush', async () => {
+        const s = setup();
+        failInto(s, Table.ValidatorValidations);
+        for (const n of [1, 2, 3]) {
+          s.collector.handleValidation(validation({ ledger_hash: hashOf(n) }), REPORTER, T0);
+          await s.collector.flush();
+        }
+        // one attempt per flush (the oldest batch), not one per batch: a ClickHouse that is down is asked once
+        expect(insertsInto(s, Table.ValidatorValidations).map((c) => c.token!.split(':').at(-1))).toEqual([
+          '1',
+          '1',
+          '1',
+        ]);
+
+        s.insert.mockImplementation(async () => undefined);
+        await s.collector.flush();
+        const sent = insertsInto(s, Table.ValidatorValidations).slice(3);
+        expect(sent.map((c) => [c.token!.split(':').at(-1), hashesOf(c.rows)])).toEqual([
+          ['1', [hashOf(1)]],
+          ['2', [hashOf(2)]],
+          ['3', [hashOf(3)]],
+        ]);
+      });
+    });
+
+    describe('the bound on a table that keeps failing', () => {
+      it('counts all pending batches together and drops the oldest rows first, with one line per flush that dropped', async () => {
+        const s = setup({ collector: { maxBufferedRows: 5 } });
+        const add = (...ns: number[]) =>
+          ns.forEach((n) => s.collector.handleValidation(validation({ ledger_hash: hashOf(n) }), REPORTER, T0));
+        failInto(s, Table.ValidatorValidations);
+
+        add(1, 2);
+        await s.collector.flush(); // batch 1: rows 1, 2
+        add(3, 4);
+        await s.collector.flush(); // batch 2: rows 3, 4
+        expect(bufferFullDrops(s)).toBe(0);
+        expect(s.logger.warn).not.toHaveBeenCalled();
+
+        add(5, 6); // 2 + 2 pending and 2 new: one over the bound of 5
+        expect(bufferFullDrops(s)).toBe(1);
+        await s.collector.flush(); // batch 3: rows 5, 6
+        expect(s.logger.warn).toHaveBeenCalledTimes(1);
+        expect(s.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/validator_validations.*dropped 1 /));
+        await s.collector.flush(); // nothing dropped since: nothing said
+        expect(s.logger.warn).toHaveBeenCalledTimes(1);
+
+        s.insert.mockImplementation(async () => undefined);
+        await s.collector.flush();
+        const sent = insertsInto(s, Table.ValidatorValidations).slice(-3);
+        // row 1, the oldest of all, is the one that is gone; the batches go out oldest first, each with its own token
+        expect(sent.map((c) => [c.token!.split(':').at(-1), hashesOf(c.rows)])).toEqual([
+          ['1', [hashOf(2)]],
+          ['2', [hashOf(3), hashOf(4)]],
+          ['3', [hashOf(5), hashOf(6)]],
+        ]);
+        expect(bufferFullDrops(s)).toBe(1);
+      });
+
+      it('holds a table at the bound however many flushes fail, and keeps the newest rows', async () => {
+        const s = setup({ collector: { maxBufferedRows: 5 } });
+        failInto(s, Table.ValidatorValidations);
+        let n = 0;
+        for (let flush = 0; flush < 30; flush += 1) {
+          for (let i = 0; i < 2; i += 1) {
+            n += 1;
+            s.collector.handleValidation(validation({ ledger_hash: hashOf(n) }), REPORTER, T0);
+          }
+          await s.collector.flush();
+        }
+        expect(bufferFullDrops(s)).toBe(60 - 5);
+        expect(s.logger.warn).toHaveBeenCalledTimes(28); // one line per flush that dropped rows: the third to the thirtieth
+
+        s.insert.mockImplementation(async () => undefined);
+        await s.collector.flush();
+        const sent = insertsInto(s, Table.ValidatorValidations).slice(30);
+        expect(sent.flatMap((c) => hashesOf(c.rows))).toEqual([56, 57, 58, 59, 60].map(hashOf));
+      });
+
+      it('applies the bound to validator_seen as to the other table', async () => {
+        const s = setup({ collector: { maxBufferedRows: 2 } });
+        failInto(s, Table.ValidatorSeen);
+        const validator = (i: number) => ({ master_key: `nHValidator${i}`, validation_public_key: `n9Signing${i}` });
+        for (const i of [1, 2]) s.collector.handleValidation(validation(validator(i)), REPORTER, T0);
+        await s.collector.flush();
+        for (const i of [3, 4]) s.collector.handleValidation(validation(validator(i)), REPORTER, T0);
+        // validators 1 and 2 are gone from validator_seen; the other tables were written and held 2 rows at a time
+        expect(bufferFullDrops(s)).toBe(2);
+        await s.collector.flush();
+        expect(s.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/validator_seen.*dropped 2 /));
+
+        s.insert.mockImplementation(async () => undefined);
+        await s.collector.flush();
+        const last = insertsInto(s, Table.ValidatorSeen).at(-1)!;
+        expect(last.token).toMatch(/:validator_seen:2$/);
+        expect((last.rows as ValidatorSeenRow[]).map((r) => r.validation_public_key)).toEqual([
+          'nHValidator3',
+          'nHValidator4',
+        ]);
+      });
+    });
+
+    describe('shutdown', () => {
+      it('writes the four tables in the final flush', async () => {
+        const s = setup();
+        await boot(s);
+        s.nodes[0].emit('manifestReceived', manifest({ seq: 2 }));
+        s.nodes[0].emit('validationReceived', validation());
+        await s.collector.stop();
+        expect(tablesWritten(s)).toEqual([
+          Table.ValidatorManifests,
+          Table.Validations,
+          Table.ValidatorValidations,
+          Table.ValidatorSeen,
+        ]);
+      });
+
+      it('starts no further insert once the final flush is abandoned, whichever table hangs', async () => {
+        const s = setup();
+        await boot(s);
+        const hung = deferred<void>();
+        s.insert.mockImplementation(async (table: Table | string) => {
+          if (table === Table.ValidatorValidations) return hung.promise;
+        });
+        s.nodes[0].emit('validationReceived', validation());
+        const stopping = s.collector.stop();
+        await jest.advanceTimersByTimeAsync(VALIDATIONS_SHUTDOWN_WAIT_MS);
+        await stopping;
+        expect(tablesWritten(s)).toEqual([Table.Validations, Table.ValidatorValidations]);
+
+        hung.resolve(); // the hung insert comes back: the flush behind it must not go on to validator_seen
+        await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS * 3);
+        expect(tablesWritten(s)).toEqual([Table.Validations, Table.ValidatorValidations]);
+        expect(jest.getTimerCount()).toBe(0);
+      });
     });
   });
 
@@ -905,9 +1582,10 @@ describe('ValidationsCollector', () => {
       for (const hash of hashes) s.collector.handleValidation(validation({ ledger_hash: hash }), REPORTER, T0);
 
       expect(s.collector.bufferedRows).toBe(3);
-      expect(s.metrics.validationsDroppedTotal.inc).toHaveBeenCalledTimes(2);
+      // 2 rows of `validations` and 2 of `validator_validations` (the cap is per table; one master: `validator_seen` has 1 row)
+      expect(bufferFullDrops(s)).toBe(4);
       expect(s.metrics.validationsDroppedTotal.inc).toHaveBeenCalledWith({ reason: 'buffer_full' });
-      expect(s.logger.warn).toHaveBeenCalledTimes(1);
+      expect(s.logger.warn).toHaveBeenCalledTimes(1); // the per-validator tables say theirs once per flush, see below
       expect(s.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/buffer is full.*dropped 1 /i));
 
       await s.collector.flush();
@@ -936,7 +1614,7 @@ describe('ValidationsCollector', () => {
 
       // 3 failed + 2 new = 5 rows for a cap of 3: the two oldest of the failed ones are gone
       expect(s.collector.bufferedRows).toBe(3);
-      expect(s.metrics.validationsDroppedTotal.inc).toHaveBeenCalledTimes(2);
+      expect(bufferFullDrops(s)).toBe(4); // 2 of `validations`, and the same 2 of `validator_validations`
       await s.collector.flush();
       expect(lastInsert(s).map((r) => r.ledger_hash)).toEqual(['3', '4', '5'].map((c) => c.repeat(64)));
     });
@@ -950,7 +1628,7 @@ describe('ValidationsCollector', () => {
       add(3);
       add(4); // within the minute: only counted
       expect(s.logger.warn).toHaveBeenCalledTimes(1);
-      expect(s.metrics.validationsDroppedTotal.inc).toHaveBeenCalledTimes(3);
+      expect(bufferFullDrops(s)).toBe(6); // 3 of `validations` and 3 of `validator_validations`
 
       await jest.advanceTimersByTimeAsync(60_000);
       add(5);
@@ -1181,7 +1859,7 @@ describe('ValidationsCollector', () => {
       s.nodes[0].emit('validationReceived', validation());
       expect(s.collector.bufferedRows).toBe(0);
       await jest.advanceTimersByTimeAsync(VALIDATIONS_FLUSH_INTERVAL_MS * 3);
-      expect(s.insert).toHaveBeenCalledTimes(1);
+      expect(tablesWritten(s)).toEqual([Table.Validations, Table.ValidatorValidations, Table.ValidatorSeen]); // the final flush only
     });
 
     it('stops listening to the streams', async () => {

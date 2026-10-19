@@ -216,7 +216,7 @@ ClickHouse; raise `--concurrency` with your own node.
 
 `ValidationsCollector` listens to the `validations` and `manifests` streams of every node of `GH_VALIDATION_ENDPOINTS` (one
 `NodeClient` per endpoint, so each reporter is distinct; a node that is down does not hold up the others) and writes
-`validations` / `validator_manifests`:
+`validator_manifests`, `validations`, `validator_validations` and `validator_seen`:
 
 - **`reporter_public_key`** is the `pubkey_node` of the node the message came from (asked of `server_info` on each (re)connect).
   A message that arrives while it is unknown is dropped and counted (`reason="no_reporter"`).
@@ -225,11 +225,30 @@ ClickHouse; raise `--concurrency` with your own node.
   remembered for 10 minutes, a failure for 30 s), else the signing key. `ephemeral_public_key` is the signing key.
 - **Merging:** one row per (`ledger_hash`, `validator`); `count` goes up, first/last time of receipt are kept; the table adds
   partial sightings up on merge (AggregatingMergeTree) and the API on read.
-- **Flush every 20 s.** A failed flush puts its rows back into the buffer (at-least-once; an insert that times out after
-  ClickHouse took the rows is written twice and that validation's `count` is too high — rare, accepted). The buffer is bounded
-  (50,000 rows); past it the oldest rows are dropped and counted.
-- Messages in the replay window of a reconnect are lost; a node of another network is refused. Rows expire after 90 days (TTL).
-- Shutdown: lookups get 1 s, the final flush at most 3 s in total; nothing starts after that.
+- **`validations.server_version`** is the `server_version` of the message (the software version the validator reports in its
+  validation of a voting ledger; absent elsewhere, so NULL), kept as exact digits of the UInt64.
+- **Manifests** keep the `domain` they name and the raw manifest as upper-case hex (the stream gives hex, the `manifest` RPC
+  base64), with `source` `stream` or `rpc`. The highest `seq` per signing key still wins.
+- **Per-validator tables.** The same sightings are also merged into `validator_validations` (one row per master key, ledger index
+  and ledger hash: narrow, `full` the max; kept 7 days) and `validator_seen` (one row per master key: first and last time seen and
+  the newest ledger; kept for ever). A flush writes the four tables in the order `validator_manifests`, `validations`,
+  `validator_validations`, `validator_seen`; a table that fails neither stops the ones after it nor makes the ones before it be
+  written again.
+- **Flush every 20 s.** A failed `validations` flush puts its rows back into the buffer (at-least-once; an insert that times out
+  after ClickHouse took the rows is written twice and that validation's `count` is too high — rare, accepted). The two
+  per-validator tables are exactly-once instead: their rows leave in one batch per flush with the
+  `insert_deduplication_token` `vc:<bootId>:<table>:<flushSeq>` (`bootId` is random per process), and both tables keep a dedup
+  window of 100 inserts. A batch that failed stays as it was and is sent again, oldest first, before the new one, with its own
+  token, so a retry of an insert that landed after all is dropped by the server. A table whose oldest batch fails again is
+  left alone for that flush, and what is seen meanwhile collects in a new batch. Failures are counted in
+  `syncer_validations_errors_total{stage}` (`flush`, `flush_by_validator`, `flush_seen`), and the rows written in
+  `syncer_validator_validations_flushed_total{table}`.
+- **Bounds.** Each of the three buffers holds at most 50,000 rows (for the per-validator tables: all of their pending batches
+  together); past it the oldest rows are dropped, counted (`syncer_validations_dropped_total{reason="buffer_full"}`) and logged
+  (`validations`: at most once a minute; the per-validator tables: one line per flush that dropped rows, with the table).
+- Messages in the replay window of a reconnect are lost; a node of another network is refused. `validations` rows expire after
+  90 days (TTL), `validator_validations` rows after 7.
+- Shutdown: lookups get 1 s, the final flush (all four tables) at most 3 s in total; nothing starts after that.
 
 ## 6. The fee_stats worker
 

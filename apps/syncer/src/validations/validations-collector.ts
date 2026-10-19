@@ -8,8 +8,11 @@ import {
   UInt64Value,
   ValidationsRow,
   ValidatorManifestsRow,
+  ValidatorSeenRow,
+  ValidatorValidationsRow,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { endpointHost, endpointList, NETWORK_PROFILE, SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 
@@ -32,9 +35,11 @@ export const VALIDATIONS_SHUTDOWN_WAIT_MS = 3_000;
 export const VALIDATIONS_LOOKUP_SHUTDOWN_WAIT_MS = 1_000;
 
 /**
- * The most rows the buffer holds. A mainnet node reports about 10 validations a second, so a flush (every 20 s) writes
- * a few hundred rows; 50 000 is a hundred times that, an outage of ClickHouse of more than an hour at about 25 MB.
- * Past it the oldest rows are dropped, counted (`syncer_validations_dropped_total{reason="buffer_full"}`) and logged.
+ * The most rows a table's buffer holds, for each of `validations`, `validator_validations` and `validator_seen` (the
+ * rows of a table that waits to be written again count together, however many batches they are). A mainnet node reports
+ * about 10 validations a second, so a flush (every 20 s) writes a few hundred rows; 50 000 is a hundred times that, an
+ * outage of ClickHouse of more than an hour at about 25 MB. Past it the oldest rows are dropped, counted
+ * (`syncer_validations_dropped_total{reason="buffer_full"}`) and logged.
  */
 export const MAX_BUFFERED_ROWS = 50_000;
 
@@ -97,6 +102,26 @@ function uint64(value: unknown): UInt64Value | null {
   return null;
 }
 
+/** The domain a manifest names, `''` when it names none (or something that is no text). */
+function domainOf(value: unknown): string {
+  return text(value) ?? '';
+}
+
+const HEX_BYTES = /^(?:[0-9A-Fa-f]{2})+$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** The raw manifest of a `manifestReceived` message (hex in either case) as upper-case hex; `''` for anything else. */
+function manifestFromHex(value: unknown): string {
+  return typeof value === 'string' && HEX_BYTES.test(value) ? value.toUpperCase() : '';
+}
+
+/** The raw manifest of a `manifest` answer (base64) as upper-case hex; `''` for anything else. */
+function manifestFromBase64(value: unknown): string {
+  return typeof value === 'string' && BASE64.test(value)
+    ? Buffer.from(value, 'base64').toString('hex').toUpperCase()
+    : '';
+}
+
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -146,7 +171,7 @@ export function validationRowFrom(
     load_fee: uint64(msg.load_fee),
     reserve_base: uint64(msg.reserve_base),
     reserve_inc: uint64(msg.reserve_inc),
-    server_version: null,
+    server_version: uint64(msg.server_version),
   };
 }
 
@@ -159,6 +184,141 @@ function mergeRows(older: ValidationsRow, newer: ValidationsRow): ValidationsRow
 }
 
 const keyOf = (row: ValidationsRow): string => `${row.ledger_hash}|${row.validation_public_key}`;
+
+/**
+ * The `validator_validations` row of one sighting: the same validation, narrow and keyed by the validator (no reporter,
+ * signature, flags, amendments or fee fields). It shares nothing with `row`.
+ */
+export function byValidatorRowFrom(row: ValidationsRow): ValidatorValidationsRow {
+  return {
+    validation_public_key: row.validation_public_key,
+    ledger_index: row.ledger_index,
+    ledger_hash: row.ledger_hash,
+    count: row.count,
+    first_datetime: row.first_datetime,
+    last_datetime: row.last_datetime,
+    ephemeral_public_key: row.ephemeral_public_key,
+    signing_time: row.signing_time,
+    full: row.full,
+    server_version: row.server_version,
+  };
+}
+
+/** The `validator_seen` row of one sighting: when the validator was seen, and in which ledger. */
+export function seenRowFrom(row: ValidationsRow): ValidatorSeenRow {
+  return {
+    validation_public_key: row.validation_public_key,
+    first_seen: row.first_datetime,
+    last_seen: row.last_datetime,
+    last_ledger_index: row.ledger_index,
+  };
+}
+
+/**
+ * `older` plus `newer` sightings of one validation of one validator, as the table merges them: the counts add up, the
+ * first time is the min, the last the max, `full` the max (a full validation wins over a partial one); every other
+ * field is the first sighting's.
+ */
+export function mergeByValidatorRows(
+  older: ValidatorValidationsRow,
+  newer: ValidatorValidationsRow,
+): ValidatorValidationsRow {
+  older.count = Number(older.count) + Number(newer.count);
+  older.first_datetime = Math.min(older.first_datetime, newer.first_datetime);
+  older.last_datetime = Math.max(older.last_datetime, newer.last_datetime);
+  older.full = Math.max(older.full, newer.full);
+  return older;
+}
+
+/** `older` plus `newer` sightings of one validator: `first_seen` the min, `last_seen` and `last_ledger_index` the max. */
+export function mergeSeenRows(older: ValidatorSeenRow, newer: ValidatorSeenRow): ValidatorSeenRow {
+  older.first_seen = Math.min(older.first_seen, newer.first_seen);
+  older.last_seen = Math.max(older.last_seen, newer.last_seen);
+  older.last_ledger_index = Math.max(older.last_ledger_index, newer.last_ledger_index);
+  return older;
+}
+
+const byValidatorKeyOf = (row: ValidatorValidationsRow): string =>
+  `${row.validation_public_key}|${row.ledger_index}|${row.ledger_hash}`;
+
+/** The rows cut at one flush: sent as they are, with their own insert token, until a send is acknowledged. */
+interface Batch<R> {
+  /** The `insert_deduplication_token`: the same on every attempt, so a replay of an attempt that landed is dropped. */
+  readonly token: string;
+  readonly rows: Map<string, R>;
+}
+
+/**
+ * What one of the per-validator tables (`validator_validations`, `validator_seen`) holds between flushes. New rows
+ * collect in `collecting`, merged by key. A flush cuts them into a batch, and a batch stays in `batches` until its insert
+ * has been acknowledged: it is never changed after the cut (what is seen meanwhile collects for the next batch), so
+ * its retry is the insert that failed, and the dedup window of the table can drop it if the first attempt landed after
+ * all. The rows of `collecting` and of all batches together are bounded.
+ */
+class Spool<R> {
+  /** The batches already cut and not yet written, oldest first. */
+  readonly batches: Batch<R>[] = [];
+  /** The rows not cut yet, oldest first. */
+  collecting = new Map<string, R>();
+  /** The rows dropped for the bound since a flush said so. */
+  dropped = 0;
+
+  constructor(
+    readonly table: Table.ValidatorValidations | Table.ValidatorSeen,
+    /** The `syncer_validations_errors_total` stage of a failed insert. */
+    readonly stage: 'flush_by_validator' | 'flush_seen',
+    private readonly merge: (older: R, newer: R) => R,
+  ) {}
+
+  /** All rows that wait to be written: those of every batch, and the ones still collecting. */
+  get size(): number {
+    let n = this.collecting.size;
+    for (const batch of this.batches) n += batch.rows.size;
+    return n;
+  }
+
+  /** Merges `row` into the collecting row of its key, else adds it; returns how many old rows the bound pushed out. */
+  add(key: string, row: R, max: number): number {
+    const existing = this.collecting.get(key);
+    if (existing !== undefined) {
+      this.merge(existing, row);
+      return 0;
+    }
+    this.collecting.set(key, row);
+    return this.trim(max);
+  }
+
+  /** Cuts the rows collected so far into a batch with `token`. */
+  cut(token: string): void {
+    if (this.collecting.size === 0) return;
+    this.batches.push({ token, rows: this.collecting });
+    this.collecting = new Map();
+  }
+
+  remove(batch: Batch<R>): void {
+    const at = this.batches.indexOf(batch);
+    if (at >= 0) this.batches.splice(at, 1);
+  }
+
+  /** Drops the oldest rows (the oldest batch's first) until `max` are left; returns how many. */
+  private trim(max: number): number {
+    const excess = this.size - max;
+    if (excess <= 0) return 0;
+    let left = excess;
+    while (left > 0) {
+      const oldest = this.batches[0];
+      const rows = oldest?.rows ?? this.collecting;
+      for (const key of rows.keys()) {
+        rows.delete(key);
+        left -= 1;
+        if (left === 0) break;
+      }
+      if (oldest !== undefined && oldest.rows.size === 0) this.batches.shift();
+      else if (oldest === undefined && rows.size === 0) break; // nothing left to drop
+    }
+    return excess;
+  }
+}
 
 /** One node the collector listens to. */
 interface Feed {
@@ -178,15 +338,17 @@ interface Feed {
   onConnected: () => void;
 }
 
-/** The `details` of a `manifest` answer. */
+/** A `manifest` answer: `details` of the manifest the node knows, and the manifest itself in base64. */
 interface ManifestAnswer {
-  details?: { master_key?: unknown; ephemeral_key?: unknown; seq?: unknown };
+  details?: { master_key?: unknown; ephemeral_key?: unknown; seq?: unknown; domain?: unknown };
+  manifest?: unknown;
 }
 
 /**
  * The `validations` worker: listens to the `validations` and `manifests` streams of every node of
- * `GH_VALIDATION_ENDPOINTS`, merges what it sees in memory and writes it to `validations` every 20 s (what
- * `rippled-historical-database` did with `lib/validations`, with ClickHouse in place of HBase).
+ * `GH_VALIDATION_ENDPOINTS`, merges what it sees in memory and writes it to `validations`, `validator_validations` and
+ * `validator_seen` every 20 s (what `rippled-historical-database` did with `lib/validations`, with ClickHouse in place
+ * of HBase).
  *
  * - **One client per endpoint**, each a client of that single node, so every reporter is a distinct node. A node that is
  *   down does not hold up the boot or the other nodes: each client connects (and reconnects, with the backoff of
@@ -204,14 +366,30 @@ interface ManifestAnswer {
  *   that has no manifest is remembered for 10 minutes, one whose request failed for 30 s, so a validator without a
  *   manifest does not cost an RPC per validation. `ephemeral_public_key` is always the signing key. Manifests are taken
  *   from the node as they come (rippled has checked their signatures before it publishes them); they are written to
- *   `validator_manifests` with the next flush (ReplacingMergeTree: the highest `seq` wins).
+ *   `validator_manifests` with the next flush (ReplacingMergeTree: the highest `seq` wins), with the domain they name,
+ *   the raw manifest (upper-case hex; the stream gives hex, the `manifest` RPC base64) and where they came from
+ *   (`stream`, `rpc`).
  * - **Merging**: one row per (`ledger_hash`, `validation_public_key`): `count` goes up, the first and the last time of
  *   RECEIPT are kept as unix seconds with a fraction, the other fields are those of the first sighting. The rows are
- *   partial sightings; the table adds them up on merge and the API on read.
- * - **At-least-once.** A failed flush puts its rows back into the buffer, merged with whatever came in meanwhile, and the
- *   next flush writes them. An insert that times out after ClickHouse has taken the rows is written a second time (the
- *   count of that validation is then too high by the rows of that flush): rare, and accepted. The buffer is bounded
- *   (`MAX_BUFFERED_ROWS`); past it the oldest rows are dropped, counted and logged.
+ *   partial sightings; the table adds them up on merge and the API on read. The same sightings are merged into two more
+ *   buffers: `validator_validations` (one row per master key, ledger index and ledger hash: narrow, `full` the max) and
+ *   `validator_seen` (one row per master key: first and last time, newest ledger). `server_version` is the validator's
+ *   software version, in the validation of a voting ledger.
+ * - **At-least-once.** A failed `validations` flush puts its rows back into the buffer, merged with whatever came in
+ *   meanwhile, and the next flush writes them. An insert that times out after ClickHouse has taken the rows is written a
+ *   second time (the count of that validation is then too high by the rows of that flush): rare, and accepted. The
+ *   buffer is bounded (`MAX_BUFFERED_ROWS`); past it the oldest rows are dropped, counted and logged.
+ * - **Exactly-once for the per-validator tables.** A flush writes `validator_manifests`, `validations`,
+ *   `validator_validations`, `validator_seen`, in that order; a table that fails neither stops the ones after it nor makes
+ *   the ones before it be written again (`flush()` rejects only for `validations`). The rows of `validator_validations`
+ *   and `validator_seen` leave in batches, one per flush, each with the `insert_deduplication_token`
+ *   `vc:<bootId>:<table>:<flushSeq>`. A batch that failed stays as it was and is sent again, oldest first, before the
+ *   new one, with its own token: both tables keep a window of 100 tokens (`non_replicated_deduplication_window`), so a
+ *   retry of an insert that landed after all (a timeout) is dropped by the server and counts nothing twice. A table whose
+ *   oldest batch fails again is left alone for that flush (a ClickHouse that is down is asked once, not once per batch).
+ *   What is seen meanwhile collects in a new batch, and the rows of all of a table's batches together are bounded by
+ *   `MAX_BUFFERED_ROWS`: past it the oldest rows are dropped, counted (`reason="buffer_full"`), and one line per flush
+ *   says how many of which table.
  * - **Messages in the replay window of a reconnect** (between the connection dropping and the subscription being sent
  *   again) are lost; so are the ones a node never sent. That is the node client's contract.
  * - **Stops** on module destroy and on SIGTERM / SIGINT (`ShutdownSignals`): the timers stop, the messages are no longer
@@ -240,6 +418,18 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
   /** Insertion order is age: the first entry is the oldest. */
   private buffer = new Map<string, ValidationsRow>();
   private readonly pendingManifests = new Map<string, ValidatorManifestsRow>();
+  /** `validator_validations`: keyed by `master|ledger_index|ledger_hash`. */
+  private readonly byValidator = new Spool<ValidatorValidationsRow>(
+    Table.ValidatorValidations,
+    'flush_by_validator',
+    mergeByValidatorRows,
+  );
+  /** `validator_seen`: keyed by master key. */
+  private readonly seen = new Spool<ValidatorSeenRow>(Table.ValidatorSeen, 'flush_seen', mergeSeenRows);
+  /** Part of every insert token: tells this process from the one before it, whose batches may be in the dedup window. */
+  private readonly bootId = randomUUID();
+  /** Counts the flushes of this process, for the insert tokens. */
+  private flushSeq = 0;
 
   /** ephemeral (signing) key -> master key. */
   private readonly masters = new Map<string, string>();
@@ -356,9 +546,10 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
   }
 
   /**
-   * Takes a `manifestReceived` message: the signing key now belongs to the master key, and the row goes to
-   * `validator_manifests` with the next flush. A manifest whose `seq` is not higher than the one known for its signing
-   * key is ignored; so is one without a signing key (a revocation), a master key or a `seq`.
+   * Takes a `manifestReceived` message: the signing key now belongs to the master key, and the row (with the domain and
+   * the raw manifest the message carries) goes to `validator_manifests` with the next flush. A manifest whose `seq` is
+   * not higher than the one known for its signing key is ignored; so is one without a signing key (a revocation), a
+   * master key or a `seq`.
    */
   handleManifest(msg: Record<string, unknown>): void {
     if (typeof msg !== 'object' || msg === null) return;
@@ -371,13 +562,23 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
     this.rememberSeq(ephemeral, seq);
     this.learn(ephemeral, master);
     this.misses.delete(ephemeral);
-    this.queueManifest(ephemeral, master, seq);
+    this.queueManifest({
+      ephemeral_key: ephemeral,
+      master_key: master,
+      seq,
+      domain: domainOf(msg.domain),
+      manifest: manifestFromHex(msg.manifest),
+      source: 'stream',
+    });
   }
 
   /**
-   * Writes the manifests that are waiting, then the buffer, and returns the number of validation rows written. A failed
-   * manifest insert is counted and retried with the next flush, and does not fail the flush. A failed validations insert
-   * puts the rows back (see the class comment), is counted and logged, and rejects. Flushes run one after the other.
+   * Writes the manifests that are waiting, then the buffer, then the batches of `validator_validations` and of
+   * `validator_seen`, and returns the number of validation rows written. A failed manifest insert is counted and retried
+   * with the next flush, and does not fail the flush; neither does a failed insert of a per-validator table (counted
+   * as `flush_by_validator` / `flush_seen`, its batches stay and are sent again). A failed validations insert puts the
+   * rows back (see the class comment), is counted and logged, and rejects, after the other tables were tried. Flushes
+   * run one after the other.
    */
   flush(): Promise<number> {
     const previous = this.lastFlush;
@@ -557,17 +758,11 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
     if (this.misses.size > MAX_CACHED_KEYS) this.misses.delete(this.misses.keys().next().value as string);
   }
 
-  private queueManifest(ephemeral: string, master: string, seq: number): void {
-    const pending = this.pendingManifests.get(ephemeral);
-    if (pending !== undefined && pending.seq >= seq) return;
-    this.pendingManifests.set(ephemeral, {
-      ephemeral_key: ephemeral,
-      master_key: master,
-      seq,
-      domain: '',
-      manifest: '',
-      source: 'stream',
-    });
+  /** Keeps the manifest for the next flush, if its `seq` is higher than that of the one waiting for the same signing key. */
+  private queueManifest(row: ValidatorManifestsRow): void {
+    const pending = this.pendingManifests.get(row.ephemeral_key);
+    if (pending !== undefined && pending.seq >= row.seq) return;
+    this.pendingManifests.set(row.ephemeral_key, row);
   }
 
   /**
@@ -597,7 +792,14 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
         const seq = uint(answer?.details?.seq, MAX_UINT32);
         if (answer?.details?.ephemeral_key === signing && seq !== undefined) {
           this.rememberSeq(signing, Math.max(seq, this.manifestSeqs.get(signing) ?? 0));
-          this.queueManifest(signing, master, seq);
+          this.queueManifest({
+            ephemeral_key: signing,
+            master_key: master,
+            seq,
+            domain: domainOf(answer.details.domain),
+            manifest: manifestFromBase64(answer.manifest),
+            source: 'rpc',
+          });
         }
         return master;
       } catch (err) {
@@ -626,14 +828,27 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
   private record(msg: Record<string, unknown>, reporter: string, at: number, master: string, signing: string): void {
     const row = validationRowFrom(msg, reporter, at, master, signing);
     if (row === undefined) return this.drop('invalid');
+    // the per-validator rows are copies: the buffer goes on merging later sightings into `row`
+    const byValidator = byValidatorRowFrom(row);
+    const seen = seenRowFrom(row);
     const key = keyOf(row);
     const existing = this.buffer.get(key);
     if (existing !== undefined) {
       mergeRows(existing, row);
-      return;
+    } else {
+      this.buffer.set(key, row);
+      this.enforceCap();
     }
-    this.buffer.set(key, row);
-    this.enforceCap();
+    this.spool(this.byValidator, byValidatorKeyOf(byValidator), byValidator);
+    this.spool(this.seen, seen.validation_public_key, seen);
+  }
+
+  /** Adds a sighting to a per-validator table; rows the bound pushes out are counted now and logged at the next flush. */
+  private spool<R>(spool: Spool<R>, key: string, row: R): void {
+    const dropped = spool.add(key, row, this.maxBufferedRows);
+    if (dropped === 0) return;
+    spool.dropped += dropped;
+    this.metrics?.validationsDroppedTotal.inc({ reason: 'buffer_full' }, dropped);
   }
 
   /** Puts the rows of a failed flush back in front of what has come in since, merged by key, oldest first. */
@@ -685,23 +900,71 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
     // a flush that was chained behind one that hangs, or that was waiting for the manifests, starts after the shutdown
     // has given up on the final flush: it must not write anything then
     if (this.abandoned) return 0;
+    this.flushSeq += 1;
+    const seq = this.flushSeq;
     await this.flushManifests();
     if (this.abandoned) return 0;
+
+    let written = 0;
+    let failure: { error: unknown } | undefined;
     const rows = [...this.buffer.values()];
-    if (rows.length === 0) return 0;
-    this.buffer = new Map();
-    this.rowsInFlight = rows.length;
-    try {
-      await this.ch.insert(Table.Validations, rows);
-    } catch (err) {
-      this.putBack(rows);
-      this.failed('flush', `Writing ${rows.length} validation rows failed; they stay in the buffer`, err);
-      throw err;
-    } finally {
-      this.rowsInFlight = 0;
+    if (rows.length > 0) {
+      this.buffer = new Map();
+      this.rowsInFlight = rows.length;
+      try {
+        await this.ch.insert(Table.Validations, rows);
+        written = rows.length;
+      } catch (err) {
+        this.putBack(rows);
+        this.failed('flush', `Writing ${rows.length} validation rows failed; they stay in the buffer`, err);
+        failure = { error: err };
+      } finally {
+        this.rowsInFlight = 0;
+      }
+      if (written > 0) this.metrics?.validationsFlushedTotal.inc(written);
     }
-    this.metrics?.validationsFlushedTotal.inc(rows.length);
-    return rows.length;
+
+    // each table has its own batches: one that fails neither stops the next nor makes the written ones be written again
+    if (!this.abandoned) await this.flushSpool(this.byValidator, seq);
+    if (!this.abandoned) await this.flushSpool(this.seen, seq);
+    if (failure !== undefined) throw failure.error;
+    return written;
+  }
+
+  /**
+   * Cuts the rows collected for a per-validator table into the batch `vc:<bootId>:<table>:<seq>`, then writes the
+   * batches that wait, oldest first, each with its own token. A batch that fails stays as it is (and so do the ones
+   * behind it, for the next flush); it is counted and logged, and does not throw.
+   */
+  private async flushSpool<R>(spool: Spool<R>, seq: number): Promise<void> {
+    if (spool.dropped > 0) {
+      this.logger.warn(
+        `The ${spool.table} buffer is full (cap ${this.maxBufferedRows} rows): dropped ${spool.dropped} of the ` +
+          `oldest rows since the last flush; is ClickHouse down?`,
+      );
+      spool.dropped = 0;
+    }
+    spool.cut(`vc:${this.bootId}:${spool.table}:${seq}`);
+    for (const batch of [...spool.batches]) {
+      if (this.abandoned) return;
+      if (batch.rows.size === 0) {
+        spool.remove(batch); // all of it was pushed out by the bound
+        continue;
+      }
+      const rows = [...batch.rows.values()];
+      try {
+        await this.ch.insert(spool.table, rows, { dedupToken: batch.token });
+      } catch (err) {
+        this.failed(
+          spool.stage,
+          `Writing ${rows.length} ${spool.table} rows failed; they stay pending (token ${batch.token})`,
+          err,
+        );
+        return;
+      }
+      spool.remove(batch);
+      this.metrics?.validatorValidationsFlushedTotal.inc({ table: spool.table }, rows.length);
+    }
   }
 
   private async flushManifests(): Promise<void> {
@@ -711,7 +974,7 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
     try {
       await this.ch.insert(Table.ValidatorManifests, rows);
     } catch (err) {
-      for (const row of rows) this.queueManifest(row.ephemeral_key, row.master_key, row.seq);
+      for (const row of rows) this.queueManifest(row);
       this.failed(
         'manifests_flush',
         `Writing ${rows.length} validator manifests failed; they will be tried again`,

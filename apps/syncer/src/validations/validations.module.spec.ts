@@ -30,13 +30,16 @@ describe('ValidationsModule', () => {
       serverInfo: jest.fn(async () => ({ complete_ledgers: '1-2', pubkey_node: 'n9Reporter' })),
       request: jest.fn(async () => ({})),
     });
-    const insert = jest.fn(async () => undefined);
+    const insert = jest.fn(
+      async (_table: Table | string, _rows: unknown[], _opts?: unknown): Promise<void> => undefined,
+    );
     const query = jest.fn(async () => []);
     const shutdown = { register: jest.fn() };
     const metrics = {
       validationsFlushedTotal: { inc: jest.fn() },
       validationsErrorsTotal: { inc: jest.fn() },
       validationsDroppedTotal: { inc: jest.fn() },
+      validatorValidationsFlushedTotal: { inc: jest.fn() },
     };
     // what the global core module and the ClickHouse module provide to every worker
     @Global()
@@ -74,6 +77,11 @@ describe('ValidationsModule', () => {
     expect(node.subscribe).toHaveBeenCalledWith(['validations', 'manifests']);
     expect(node.start).toHaveBeenCalledTimes(1);
 
+    node.emit('manifestReceived', {
+      master_key: 'nHUkp7WhouVMobBUKGrV5FNqjsdD9zKP5jpGnnLLnYxUQSGAwrZ6',
+      signing_key: 'n9MzwWa4dwdZkRzj6XmihBG4ymGtMPd12cLjfhKwx5Hoqeu6WEgy',
+      seq: 1,
+    });
     node.emit('validationReceived', {
       ledger_hash: '9373383605D0994AF33ACECA206693B331BA61C3CDA511AF3E7DD569593E126C',
       validation_public_key: 'n9MzwWa4dwdZkRzj6XmihBG4ymGtMPd12cLjfhKwx5Hoqeu6WEgy',
@@ -82,19 +90,41 @@ describe('ValidationsModule', () => {
       full: true,
     });
     await jest.advanceTimersByTimeAsync(20_000);
+    // a flush writes the four tables, in this order
+    expect(insert.mock.calls.map(([table]) => table)).toEqual([
+      Table.ValidatorManifests,
+      Table.Validations,
+      Table.ValidatorValidations,
+      Table.ValidatorSeen,
+    ]);
     expect(insert).toHaveBeenCalledWith(Table.Validations, [
       expect.objectContaining({ count: 1, reporter_public_key: 'n9Reporter' }),
     ]);
+    expect(insert).toHaveBeenCalledWith(
+      Table.ValidatorValidations,
+      [expect.objectContaining({ count: 1, ledger_index: 46087342, full: 1, server_version: null })],
+      { dedupToken: expect.stringMatching(/^vc:.+:validator_validations:1$/) },
+    );
+    expect(insert).toHaveBeenCalledWith(
+      Table.ValidatorSeen,
+      [expect.objectContaining({ last_ledger_index: 46087342 })],
+      { dedupToken: expect.stringMatching(/^vc:.+:validator_seen:1$/) },
+    );
 
     node.emit('validationReceived', {
       ledger_hash: '9373383605D0994AF33ACECA206693B331BA61C3CDA511AF3E7DD569593E126C',
       validation_public_key: 'n9MzwWa4dwdZkRzj6XmihBG4ymGtMPd12cLjfhKwx5Hoqeu6WEgy',
       master_key: 'nHUkp7WhouVMobBUKGrV5FNqjsdD9zKP5jpGnnLLnYxUQSGAwrZ6',
     });
-    await app.close(); // the final flush
-    expect(insert).toHaveBeenCalledTimes(2);
+    await app.close(); // the final flush: no manifest is waiting, so three tables
+    expect(insert).toHaveBeenCalledTimes(4 + 3);
+    expect(insert.mock.calls.slice(4).map(([table]) => table)).toEqual([
+      Table.Validations,
+      Table.ValidatorValidations,
+      Table.ValidatorSeen,
+    ]);
     expect(node.stop).toHaveBeenCalledTimes(1);
     await jest.advanceTimersByTimeAsync(60_000);
-    expect(insert).toHaveBeenCalledTimes(2);
+    expect(insert).toHaveBeenCalledTimes(4 + 3);
   });
 });
