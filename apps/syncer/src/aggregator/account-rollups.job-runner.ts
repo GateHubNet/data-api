@@ -60,8 +60,9 @@ interface Run {
  * The `account_rollups` job of the aggregator (job 10 of a tick, see spec 3 and 3.4): the day groups of the heavy accounts
  * (those with `GH_ACCOUNT_ROLLUP_MIN_ROWS` balance changes or more), kept per UTC day so that a read of years does not read the
  * millions of rows behind them, and the hook of the slices of `agg_dirty` (`ofSlice`). The job is off when the minimum is 0:
- * nothing is read or written, by the run or by the hook. The state of the job (the waits of what failed, the partitions that a
- * slice marked) is its own; the database, the clock, the budget and the rule of failure are the deps'.
+ * the run reads and writes nothing (the hook still keeps existing coverage right, see `ofSlice`). The state of the job (the
+ * waits of what failed, the partitions that a slice marked) is its own; the database, the clock, the budget and the rule of
+ * failure are the deps'.
  *
  * Per run, in order, each set only while the deadline of the tick has not passed, the shutdown has not begun and fewer than 3
  * sets have failed:
@@ -120,17 +121,24 @@ export class AccountRollupsJobRunner {
 
   /**
    * The hook of `agg_dirty`: a slice `[start, end)` (unix seconds, at most a day) recomputes, for every account whose rollups
-   * cover a day of it, that day (a call for each day, of 500 accounts at most), and marks the partitions of its ledgers for the
-   * next discovery to recount. A failure rejects: the caller fails the slice, which keeps its range for the next tick. Nothing
-   * is started once the shutdown has begun, or when the job is off.
+   * cover a day of it (its newest state row is of the current config version and its coverage holds the day: the state rows say
+   * so, not the heavy accounts), that day (a call for each day, of 500 accounts at most), and marks the partitions of its
+   * ledgers for the next discovery to recount. A failure rejects: the caller fails the slice, which keeps its range for the next
+   * tick. Nothing is started once the shutdown has begun.
+   *
+   * With `GH_ACCOUNT_ROLLUP_MIN_ROWS` 0 the job is off, but the API still uses the coverage that exists, so a re-ingest must
+   * not leave its days stale: the slice still recomputes them, and marks no partition (there is no discovery to recount it). With
+   * no account that has coverage it does nothing.
    */
   async ofSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
     const { deps, fns } = this;
-    if (this.aggregates.accountRollupMinRows <= 0 || deps.closing() || end <= start) return;
-    const range = await this.ranges(new Date(start * 1000), new Date(end * 1000));
-    if (range !== null) {
-      for (let partition = partitionOf(range.min); partition <= partitionOf(range.max); partition++) {
-        this.marked.add(partition);
+    if (deps.closing() || end <= start) return;
+    if (this.aggregates.accountRollupMinRows > 0) {
+      const range = await this.ranges(new Date(start * 1000), new Date(end * 1000));
+      if (range !== null) {
+        for (let partition = partitionOf(range.min); partition <= partitionOf(range.max); partition++) {
+          this.marked.add(partition);
+        }
       }
     }
     const states = await fns.rollupStates(deps.ch);

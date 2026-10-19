@@ -209,7 +209,6 @@ describe('AccountRollupsJobRunner', () => {
     world.partitionVersions.clear(); // partitions that would be due
     const r = runner();
     await run(r);
-    await r.ofSlice(unix('2026-10-12T05:00:00Z'), unix('2026-10-12T09:00:00Z'), fake.tick());
     expect(world.newestReads).toBe(0);
     expect(world.versionReads).toBe(0);
     expect(world.heavyReads).toEqual([]);
@@ -718,6 +717,135 @@ describe('AccountRollupsJobRunner', () => {
       world.clear();
       await run(r);
       expect(world.recounts).toEqual([]);
+    });
+
+    it('with GH_ACCOUNT_ROLLUP_MIN_ROWS 0, ofSlice still recomputes the covered days of accounts with coverage, from their state rows alone', async () => {
+      minRows = 0;
+      // not heavy to anyone any more (the job is off): only the state rows say what is covered
+      world.states.set('rWide', {
+        account: 'rWide',
+        rows: 5,
+        firstDay: '2025-01-01',
+        rolledFrom: '2026-09-01',
+        rolledThrough: THROUGH,
+        configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+      });
+      world.states.set('rNarrow', {
+        account: 'rNarrow',
+        rows: 5,
+        firstDay: '2025-01-01',
+        rolledFrom: '2026-10-10',
+        rolledThrough: THROUGH,
+        configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+      });
+      // none of these holds the day: the coverage ends before it, there is none, the config version is another
+      world.states.set('rEarly', {
+        account: 'rEarly',
+        rows: 5,
+        firstDay: '2025-01-01',
+        rolledFrom: '2026-07-01',
+        rolledThrough: '2026-09-30',
+        configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+      });
+      world.states.set('rNone', {
+        account: 'rNone',
+        rows: 5,
+        firstDay: '2025-01-01',
+        configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+      });
+      world.states.set('rOld', {
+        account: 'rOld',
+        rows: 5,
+        firstDay: '2025-01-01',
+        rolledFrom: '2026-01-01',
+        rolledThrough: THROUGH,
+        configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION - 1,
+      });
+      const r = runner();
+
+      await ofSlice(r, '2026-10-12T05:00:00Z', '2026-10-12T09:00:00Z');
+      expect(world.calls()).toEqual([[['rNarrow', 'rWide'], '2026-10-12', '2026-10-12']]);
+      expect(world.rollups[0].signal).toBe(fake.abort.signal);
+      // across midnight: a call for each day
+      world.clear();
+      await ofSlice(r, '2026-10-09T20:00:00Z', '2026-10-10T03:00:00Z');
+      expect(world.calls()).toEqual([
+        [['rWide'], '2026-10-09', '2026-10-09'],
+        [['rNarrow', 'rWide'], '2026-10-10', '2026-10-10'],
+      ]);
+      // the job is off: nothing else is read or written, and no partition is marked (the lookup of the ledgers is what marks)
+      expect(world.heavyReads).toEqual([]);
+      expect(world.stateWrites).toEqual([]);
+      expect(rates.ledgersClosedIn).not.toHaveBeenCalled();
+      // and the run is still off
+      await run(r);
+      expect(world.newestReads).toBe(0);
+      expect(world.recounts).toEqual([]);
+      expect(world.rollups).toHaveLength(2); // the two calls of the slice across midnight: the run added none
+    });
+
+    it('with GH_ACCOUNT_ROLLUP_MIN_ROWS 0 and no account with coverage, ofSlice does nothing: no write, no partition marked', async () => {
+      minRows = 0;
+      world.states.set('rNone', {
+        account: 'rNone',
+        rows: 5,
+        firstDay: '2025-01-01',
+        configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+      });
+      await ofSlice(runner(), '2026-10-12T05:00:00Z', '2026-10-12T09:00:00Z');
+      expect(world.rollups).toEqual([]);
+      expect(world.stateWrites).toEqual([]);
+      expect(rates.ledgersClosedIn).not.toHaveBeenCalled();
+    });
+
+    it('with GH_ACCOUNT_ROLLUP_MIN_ROWS 0, ofSlice writes at most 500 accounts a call too, and starts nothing once closing', async () => {
+      minRows = 0;
+      for (let i = 0; i < 1100; i++) {
+        world.states.set(accountName(i), {
+          account: accountName(i),
+          rows: 5,
+          firstDay: '2025-01-01',
+          rolledFrom: '2026-10-01',
+          rolledThrough: THROUGH,
+          configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+        });
+      }
+      const r = runner();
+      fake.closing = true;
+      await ofSlice(r, '2026-10-12T05:00:00Z', '2026-10-12T09:00:00Z');
+      expect(world.rollups).toEqual([]);
+      fake.closing = false;
+      await ofSlice(r, '2026-10-12T05:00:00Z', '2026-10-12T09:00:00Z');
+      expect(world.rollups.map((c) => c.accounts.length)).toEqual([500, 500, 100]);
+    });
+
+    it('the accounts it recomputes are the same with the job on and off: those whose newest state is of the current config and whose coverage holds the day', async () => {
+      const states: Array<[string, Partial<RollupState>]> = [
+        ['rA', { rolledFrom: '2026-10-12', rolledThrough: '2026-10-12' }], // holds it, on the first day of the coverage and on the last
+        ['rB', { rolledFrom: '2026-10-13', rolledThrough: '2026-10-15' }], // starts the day after
+        ['rC', { rolledFrom: '2026-10-01', rolledThrough: '2026-10-11' }], // ends the day before
+        ['rD', { rolledFrom: '2026-10-01', rolledThrough: '2026-10-31', configVersion: 0 }], // another config
+        ['rE', {}], // no coverage
+        ['rF', { rolledFrom: '2026-10-01' }], // half a coverage is none
+      ];
+      const recomputed = async (rows: number): Promise<string[]> => {
+        minRows = rows;
+        world = new FakeRollups();
+        rates = fakeRates(world);
+        for (const [account, state] of states) {
+          world.states.set(account, {
+            account,
+            rows: 5,
+            firstDay: '2025-01-01',
+            configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+            ...state,
+          });
+        }
+        await ofSlice(runner(), '2026-10-12T05:00:00Z', '2026-10-12T09:00:00Z');
+        return world.rollups.flatMap((c) => c.accounts);
+      };
+      expect(await recomputed(MIN_ROWS)).toEqual(['rA']);
+      expect(await recomputed(0)).toEqual(['rA']);
     });
 
     it('writes at most 500 accounts a call', async () => {
