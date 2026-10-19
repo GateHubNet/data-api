@@ -102,6 +102,34 @@ describe('PrometheusService', () => {
     expect(labels('syncer_markets_live_age_seconds')).toEqual(['period']);
   });
 
+  it('exposes the gauges of the rates_daily and account_rollups jobs, by name, type, label set and help text (spec section 11)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.ratesDailyMissingDays.set(4);
+    service.accountRollupsHeavyAccounts.set(120);
+    service.accountRollupsPendingAccounts.set(7);
+
+    const text = await service.getMetrics();
+    const declared: [string, string, number][] = [
+      [
+        'syncer_rates_daily_missing_days',
+        'Closed final days without a valid rates set, from the first native trade to the newest final day.',
+        4,
+      ],
+      ['syncer_account_rollups_heavy_accounts', 'Heavy accounts.', 120],
+      [
+        'syncer_account_rollups_pending_accounts',
+        'Heavy accounts whose coverage does not yet reach from first_day to the newest final day.',
+        7,
+      ],
+    ];
+    for (const [name, help, value] of declared) {
+      expect(text).toContain(`# HELP ${name} ${help}\n# TYPE ${name} gauge\n`);
+      expect(text).toMatch(new RegExp(`^${name} ${value}$`, 'm'));
+      expect((service.registry.getSingleMetric(name) as unknown as { labelNames: string[] }).labelNames).toEqual([]);
+    }
+  });
+
   describe('the declaration of the validators metrics', () => {
     // [name, type, declared label names (exactly), HELP text (spec section 6)]
     const declared: [string, string, string[], string][] = [

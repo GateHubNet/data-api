@@ -1,0 +1,488 @@
+import {
+  ACCOUNT_ROLLUP_CONFIG_VERSION,
+  LedgerRange,
+  LedgerRangeOf,
+  partitionOf,
+  promotionSlice,
+  RollupState,
+  UTC_DAY_MS,
+  utcDayStart,
+} from '@gatehub/data-api-shared';
+import {
+  AggregateFunctions,
+  AggregateJobDeps,
+  AggregatorAggregates,
+  DAY_SECONDS,
+  defaultAggregateFunctions,
+  isoDay,
+  MAX_FAILED_AGGREGATE_SETS_PER_TICK,
+  newestFinalDay,
+  SetBackoff,
+  SetGate,
+} from './aggregate-job-deps';
+import type { AggregatorJob, AggregatorTick } from './aggregator.service';
+
+/**
+ * Every call of `writeAccountRollups` of the runner (the daily increment, a promotion, the correction of a slice) is for this
+ * many accounts at most; more are split into several calls, each its own set version. The accounts of a call go to ClickHouse
+ * in a URL parameter (about 100 bytes each), and the URI has a limit of 1 MiB.
+ */
+export const ACCOUNT_ROLLUPS_BATCH_ACCOUNTS = 500;
+
+/** The set of a partition is recounted when it is older than this: the partition of the newest ledger, which grows. */
+const NEWEST_PARTITION_RECOUNT_MS = 24 * 3_600_000;
+/** ... and every other partition, which only changes by a re-ingest (and that marks it, see `ofSlice`). */
+const OTHER_PARTITION_RECOUNT_MS = 7 * 86_400_000;
+
+const chunksOf = <T>(items: T[], size: number): T[][] =>
+  Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size));
+
+/** Whether the rollups of the state cover days, both ends of them. */
+const hasCoverage = (state: RollupState): boolean =>
+  state.rolledFrom !== undefined && state.rolledThrough !== undefined;
+
+/** What one run of the job works with. */
+interface Run {
+  readonly tick: AggregatorTick;
+  /** The newest final day, `YYYY-MM-DD`. */
+  readonly through: string;
+  /** The state of every heavy account that has one, as the run goes on (what a run writes replaces what it read). */
+  readonly states: Map<string, RollupState>;
+  /** The sets that failed in this run. */
+  failed: number;
+  /** What the promotions of the run have read, once for each partition, account and day. */
+  readonly daysOfPartition: Map<number, number>;
+  readonly rowsOfAccount: Map<string, Map<number, number>>;
+  readonly partitionOfDay: Map<string, number | undefined>;
+}
+
+/**
+ * The `account_rollups` job of the aggregator (job 10 of a tick, see spec 3 and 3.4): the day groups of the heavy accounts
+ * (those with `GH_ACCOUNT_ROLLUP_MIN_ROWS` balance changes or more), kept per UTC day so that a read of years does not read the
+ * millions of rows behind them, and the hook of the slices of `agg_dirty` (`ofSlice`). The job is off when the minimum is 0:
+ * nothing is read or written, by the run or by the hook. The state of the job (the waits of what failed, the partitions that a
+ * slice marked) is its own; the database, the clock, the budget and the rule of failure are the deps'.
+ *
+ * Per run, in order, each set only while the deadline of the tick has not passed, the shutdown has not begun and fewer than 3
+ * sets have failed:
+ *
+ *  1. **Discovery.** The partitions of `balance_changes` that are due, newest first, are recounted (`recountPartition`): one that
+ *     has no set, the newest one when its set is over 24 hours old, any other when it is over 7 days old, and one that a slice
+ *     marked. Then the heavy accounts are read, and the states are brought in line in one insert: a new heavy account gets a
+ *     state with its first day and no coverage; an account that is no longer heavy loses its coverage; the state of another
+ *     config version is an account without coverage (the API does not use it either); the count of rows is kept up to date.
+ *  2. **The daily increment.** For each final day d after the `rolled_through` of an account, oldest first, the accounts whose
+ *     `rolled_through` is d - 1 are rolled together (in calls of 500 accounts at most), and then their state has
+ *     `rolled_through = d`. An account that failed inside a call of several is rolled alone from then on, so that one bad account
+ *     does not keep the others.
+ *  3. **The promotion**, in rounds: every account whose coverage does not reach back to its first day gets one slice, the ones
+ *     without coverage first, then the newest `rolled_from` first, so that a year is covered before all of it. An account with
+ *     no coverage starts at the newest final day; the others go on backwards from their `rolled_from`. A slice is as many whole
+ *     days as hold about 2,000,000 rows of the account (`promotionSlice`), from its rows in the partition of the slice's end
+ *     over the days of the partition.
+ *  4. The gauges `syncer_account_rollups_heavy_accounts` and `syncer_account_rollups_pending_accounts`.
+ *
+ * What fails (a partition, a call of accounts, a slice) is logged and counted (`deps.failed`), waits 5 minutes and twice as long
+ * after each further failure, up to an hour, while the rest goes on. A day is final as for `rates_daily`.
+ */
+export class AccountRollupsJobRunner {
+  private readonly fns: AggregateFunctions;
+  private readonly backoff = new SetBackoff();
+  private readonly gate: SetGate;
+  /** The ledger ranges of days, from the rates of the network (what `writeAccountRollups` and the promotions work with). */
+  private readonly ranges: LedgerRangeOf;
+  /** The partitions that the slices of `agg_dirty` touched: the next discovery recounts them. */
+  private readonly marked = new Set<number>();
+  /** The accounts that failed inside a call of several: they are rolled alone until they work. */
+  private readonly solo = new Set<string>();
+
+  constructor(
+    private readonly deps: AggregateJobDeps,
+    private readonly aggregates: AggregatorAggregates,
+    fns: Partial<AggregateFunctions> = {},
+  ) {
+    this.fns = { ...defaultAggregateFunctions(), ...fns };
+    this.gate = new SetGate(deps, 'account_rollups');
+    this.ranges = (from, toExclusive) => aggregates.rates.ledgersClosedIn(from, toExclusive);
+  }
+
+  job(): AggregatorJob {
+    return { name: 'account_rollups', budgetMs: this.deps.budgetMs, run: (tick) => this.run(tick) };
+  }
+
+  private async run(tick: AggregatorTick): Promise<void> {
+    try {
+      await this.refresh(tick);
+    } finally {
+      this.gate.endRun();
+    }
+  }
+
+  /**
+   * The hook of `agg_dirty`: a slice `[start, end)` (unix seconds, at most a day) recomputes, for every account whose rollups
+   * cover a day of it, that day (a call for each day, of 500 accounts at most), and marks the partitions of its ledgers for the
+   * next discovery to recount. A failure rejects: the caller fails the slice, which keeps its range for the next tick. Nothing
+   * is started once the shutdown has begun, or when the job is off.
+   */
+  async ofSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
+    const { deps, fns } = this;
+    if (this.aggregates.accountRollupMinRows <= 0 || deps.closing() || end <= start) return;
+    const range = await this.ranges(new Date(start * 1000), new Date(end * 1000));
+    if (range !== null) {
+      for (let partition = partitionOf(range.min); partition <= partitionOf(range.max); partition++) {
+        this.marked.add(partition);
+      }
+    }
+    const states = await fns.rollupStates(deps.ch);
+    for (let day = Math.floor(start / DAY_SECONDS) * DAY_SECONDS; day < end; day += DAY_SECONDS) {
+      const key = isoDay(day);
+      const accounts = [...states.values()]
+        .filter(
+          (s) =>
+            s.configVersion === ACCOUNT_ROLLUP_CONFIG_VERSION &&
+            s.rolledFrom !== undefined &&
+            s.rolledThrough !== undefined &&
+            s.rolledFrom <= key &&
+            key <= s.rolledThrough,
+        )
+        .map((s) => s.account)
+        .sort();
+      for (const batch of chunksOf(accounts, ACCOUNT_ROLLUPS_BATCH_ACCOUNTS)) {
+        if (deps.closing()) return;
+        await fns.writeAccountRollups(deps.ch, this.ranges, batch, key, key, { signal: tick.signal });
+      }
+      deps.logger.debug(`account_rollups: ${key}: ${accounts.length} account(s) (agg_dirty)`);
+    }
+  }
+
+  private async refresh(tick: AggregatorTick): Promise<void> {
+    const { deps, fns } = this;
+    const minRows = this.aggregates.accountRollupMinRows;
+    if (minRows <= 0) return;
+    // the jobs before this one may have used the tick up: do not even read what cannot be worked on
+    if (!this.gate.mayStart(tick.deadline)) return;
+    const newest = await fns.newestLedgerClose(deps.ch);
+    // the first and the last ledger give the partitions of `balance_changes` there are
+    const ledgers = newest === undefined ? null : await this.ranges(new Date(0), new Date((newest + 1) * 1000));
+    if (newest === undefined || ledgers === null) {
+      deps.metrics?.accountRollupsHeavyAccounts.set(0);
+      deps.metrics?.accountRollupsPendingAccounts.set(0);
+      return;
+    }
+    const run: Run = {
+      tick,
+      through: isoDay(newestFinalDay(newest, tick.now)),
+      states: new Map(),
+      failed: 0,
+      daysOfPartition: new Map(),
+      rowsOfAccount: new Map(),
+      partitionOfDay: new Map(),
+    };
+
+    const due = await this.recount(run, ledgers);
+    if (deps.closing()) return;
+    const heavy = await this.classify(run, minRows);
+    if (heavy === undefined) return;
+    // a set that is done (or an account that is no longer heavy) has no failure to remember
+    this.backoff.keepOnly(
+      new Set([...due.map((p) => `partition/${p}`), ...[...heavy.keys()].flatMap((a) => [`inc/${a}`, `promo/${a}`])]),
+    );
+    for (const account of this.solo) if (!heavy.has(account)) this.solo.delete(account);
+
+    await this.increment(run);
+    await this.promote(run);
+    this.report(run, heavy);
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // 1. discovery
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /** Recounts the partitions that are due, newest first, as far as the run may go; returns the ones that were due. */
+  private async recount(run: Run, ledgers: LedgerRange): Promise<number[]> {
+    const { deps } = this;
+    const newestPartition = partitionOf(ledgers.max);
+    const oldestPartition = partitionOf(ledgers.min);
+    const versions = await this.fns.partitionSetVersions(deps.ch);
+    const now = run.tick.now.getTime();
+    const due: number[] = [];
+    for (let partition = newestPartition; partition >= oldestPartition; partition--) {
+      const version = versions.get(partition);
+      const maxAge = partition === newestPartition ? NEWEST_PARTITION_RECOUNT_MS : OTHER_PARTITION_RECOUNT_MS;
+      if (version === undefined || this.marked.has(partition) || now - version > maxAge) due.push(partition);
+    }
+    for (const partition of this.marked) {
+      if (partition < oldestPartition || partition > newestPartition) this.marked.delete(partition);
+    }
+
+    for (const partition of due) {
+      const key = `partition/${partition}`;
+      if (this.backoff.waiting(key, deps.clock())) continue;
+      if (!this.mayStart(run)) break;
+      try {
+        const accounts = await this.fns.recountPartition(deps.ch, partition, { signal: run.tick.signal });
+        this.backoff.done(key);
+        this.marked.delete(partition);
+        deps.logger.debug(`account_rollups: partition ${partition}: ${accounts} account(s) counted`);
+      } catch (err) {
+        this.fail(run, err, ` recounting partition ${partition}`, [key]);
+      }
+    }
+    return due;
+  }
+
+  /**
+   * Reads the heavy accounts and their states and writes the changes, in one insert. `run.states` becomes the state of every
+   * heavy account that has one. Returns the heavy accounts (the account and its balance changes); undefined when the shutdown
+   * began.
+   */
+  private async classify(run: Run, minRows: number): Promise<Map<string, number> | undefined> {
+    const { deps, fns } = this;
+    const [heavy, stored] = await Promise.all([fns.heavyAccounts(deps.ch, minRows), fns.rollupStates(deps.ch)]);
+    if (deps.closing()) return undefined;
+    const changes: RollupState[] = [];
+    const fresh: Array<[account: string, rows: number]> = [];
+    for (const [account, rows] of heavy) {
+      const state = stored.get(account);
+      if (state === undefined) {
+        fresh.push([account, rows]);
+      } else if (state.configVersion !== ACCOUNT_ROLLUP_CONFIG_VERSION) {
+        // its coverage is not the API's to use: it has none, and is promoted from the newest final day
+        const uncovered: RollupState = {
+          account,
+          rows,
+          firstDay: state.firstDay,
+          configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+        };
+        changes.push(uncovered);
+        run.states.set(account, uncovered);
+      } else if (state.rows !== rows) {
+        const counted = { ...state, rows };
+        changes.push(counted);
+        run.states.set(account, counted);
+      } else {
+        run.states.set(account, state);
+      }
+    }
+    // an account that is no longer heavy loses its coverage (its rollup rows stay, unused)
+    for (const [account, state] of stored) {
+      if (!heavy.has(account) && hasCoverage(state)) {
+        changes.push({ account, rows: state.rows, firstDay: state.firstDay, configVersion: state.configVersion });
+      }
+    }
+    // a new heavy account: the day of its first balance change, one read each, as far as the budget lasts
+    for (const [account, rows] of fresh) {
+      if (!this.gate.mayStart(run.tick.deadline)) break;
+      const firstDay = await fns.firstChangeDay(deps.ch, account);
+      if (firstDay === undefined) continue;
+      const created: RollupState = { account, rows, firstDay, configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION };
+      changes.push(created);
+      run.states.set(account, created);
+    }
+    if (changes.length > 0) await fns.writeRollupStates(deps.ch, changes, { signal: run.tick.signal });
+    return heavy;
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // 2. the daily increment
+  // -------------------------------------------------------------------------------------------------------------------
+
+  private async increment(run: Run): Promise<void> {
+    const { deps } = this;
+    let lowest: number | undefined;
+    for (const state of run.states.values()) {
+      if (hasCoverage(state) && state.rolledThrough !== undefined) {
+        const day = utcDayStart(state.rolledThrough);
+        if (lowest === undefined || day < lowest) lowest = day;
+      }
+    }
+    if (lowest === undefined) return;
+    const through = utcDayStart(run.through);
+    for (let day = lowest + UTC_DAY_MS; day <= through; day += UTC_DAY_MS) {
+      const key = isoDay(day / 1000);
+      const before = isoDay((day - UTC_DAY_MS) / 1000);
+      // the accounts that are at the day before, not those that wait for a failure; the ones that failed in a call of several
+      // are a call of their own
+      const ready = [...run.states.values()]
+        .filter((s) => hasCoverage(s) && s.rolledThrough === before)
+        .map((s) => s.account)
+        .filter((account) => !this.backoff.waiting(`inc/${account}`, deps.clock()))
+        .sort();
+      const calls = [
+        ...chunksOf(
+          ready.filter((account) => !this.solo.has(account)),
+          ACCOUNT_ROLLUPS_BATCH_ACCOUNTS,
+        ),
+        ...ready.filter((account) => this.solo.has(account)).map((account) => [account]),
+      ];
+      for (const accounts of calls) {
+        if (!this.mayStart(run)) return;
+        await this.roll(run, accounts, key);
+      }
+    }
+  }
+
+  /** Rolls a day of the accounts and writes their state; a failure is logged and counted, and the accounts are made to wait. */
+  private async roll(run: Run, accounts: string[], day: string): Promise<void> {
+    const { deps, fns } = this;
+    const who = accounts.length === 1 ? accounts[0] : `${accounts.length} accounts`;
+    try {
+      const rows = await fns.writeAccountRollups(deps.ch, this.ranges, accounts, day, day, { signal: run.tick.signal });
+      const next = accounts.flatMap((account) => {
+        const state = run.states.get(account);
+        return state === undefined ? [] : [{ ...state, rolledThrough: day }];
+      });
+      await fns.writeRollupStates(deps.ch, next, { signal: run.tick.signal });
+      for (const state of next) run.states.set(state.account, state);
+      for (const account of accounts) {
+        this.backoff.done(`inc/${account}`);
+        this.solo.delete(account);
+      }
+      deps.logger.debug(`account_rollups: ${day}: ${who}: ${rows} row(s)`);
+    } catch (err) {
+      this.fail(
+        run,
+        err,
+        ` rolling ${who} on ${day}`,
+        accounts.map((account) => `inc/${account}`),
+      );
+      if (!deps.closing() && accounts.length > 1) for (const account of accounts) this.solo.add(account);
+    }
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // 3. the promotion
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /** Whether the coverage of an account has to grow: it has none and has a day to cover, or it does not reach its first day. */
+  private needsPromotion(state: RollupState, through: string): boolean {
+    if (state.rolledFrom === undefined || state.rolledThrough === undefined) return state.firstDay <= through;
+    return state.rolledFrom > state.firstDay;
+  }
+
+  private async promote(run: Run): Promise<void> {
+    const { deps } = this;
+    // the accounts without coverage first, then the one that is covered back the least
+    const order = (a: RollupState, b: RollupState): number => {
+      const [x, y] = [a.rolledFrom ?? '9999-12-31', b.rolledFrom ?? '9999-12-31'];
+      return x !== y ? (x < y ? 1 : -1) : a.account < b.account ? -1 : 1;
+    };
+    for (;;) {
+      const pending = [...run.states.values()]
+        .filter((s) => this.needsPromotion(s, run.through) && !this.backoff.waiting(`promo/${s.account}`, deps.clock()))
+        .sort(order);
+      if (pending.length === 0) return;
+      for (const state of pending) {
+        if (!this.mayStart(run)) return;
+        await this.promoteOne(run, state);
+      }
+    }
+  }
+
+  /** One slice of an account, and its state after it; a failure is logged and counted, and the account is made to wait. */
+  private async promoteOne(run: Run, state: RollupState): Promise<void> {
+    const { deps, fns } = this;
+    const { account, rolledFrom, rolledThrough } = state;
+    // an account with coverage goes on from the day before it; one without starts at the newest final day
+    const covered = rolledFrom !== undefined && rolledThrough !== undefined;
+    const throughDay = covered ? isoDay((utcDayStart(rolledFrom) - UTC_DAY_MS) / 1000) : run.through;
+    let slice: { fromDay: string; throughDay: string } | undefined;
+    try {
+      slice = await this.sliceOf(run, state, throughDay);
+      const rows = await fns.writeAccountRollups(deps.ch, this.ranges, [account], slice.fromDay, slice.throughDay, {
+        signal: run.tick.signal,
+      });
+      const next: RollupState = {
+        ...state,
+        rolledFrom: slice.fromDay,
+        rolledThrough: covered ? rolledThrough : slice.throughDay,
+      };
+      await fns.writeRollupStates(deps.ch, [next], { signal: run.tick.signal });
+      run.states.set(account, next);
+      this.backoff.done(`promo/${account}`);
+      deps.logger.debug(`account_rollups: ${account}: ${slice.fromDay} - ${slice.throughDay}: ${rows} row(s)`);
+    } catch (err) {
+      const days = slice === undefined ? '' : ` (${slice.fromDay} - ${slice.throughDay})`;
+      this.fail(run, err, ` promoting ${account}${days}`, [`promo/${account}`]);
+    }
+  }
+
+  /**
+   * The next slice of an account backwards from `throughDay`: as many whole days as hold about 2,000,000 of its rows, from its
+   * rows in the partition of the slice's end over the days of that partition (`promotionSlice`; with no count, or a day without
+   * ledgers, it takes everything back to the first day).
+   */
+  private async sliceOf(
+    run: Run,
+    state: RollupState,
+    throughDay: string,
+  ): Promise<{ fromDay: string; throughDay: string }> {
+    const partition = await this.partitionOfDay(run, throughDay);
+    let rowsPerDay = 0;
+    if (partition !== undefined) {
+      const rows = (await this.rowsOf(run, state.account)).get(partition) ?? 0;
+      rowsPerDay = rows / (await this.daysOf(run, partition));
+    }
+    return promotionSlice({ firstDay: state.firstDay, throughDay, rowsPerDay });
+  }
+
+  /** The partition of `balance_changes` of the last ledger of a day; none for a day without ledgers. */
+  private async partitionOfDay(run: Run, day: string): Promise<number | undefined> {
+    if (!run.partitionOfDay.has(day)) {
+      const start = utcDayStart(day);
+      const range = await this.ranges(new Date(start), new Date(start + UTC_DAY_MS));
+      run.partitionOfDay.set(day, range === null ? undefined : partitionOf(range.max));
+    }
+    return run.partitionOfDay.get(day);
+  }
+
+  private async rowsOf(run: Run, account: string): Promise<Map<number, number>> {
+    let rows = run.rowsOfAccount.get(account);
+    if (rows === undefined) {
+      rows = await this.fns.accountPartitionRows(this.deps.ch, account);
+      run.rowsOfAccount.set(account, rows);
+    }
+    return rows;
+  }
+
+  private async daysOf(run: Run, partition: number): Promise<number> {
+    let days = run.daysOfPartition.get(partition);
+    if (days === undefined) {
+      days = await this.fns.partitionDays(this.deps.ch, partition);
+      run.daysOfPartition.set(partition, days);
+    }
+    return days;
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // 4. the gauges, and what the steps share
+  // -------------------------------------------------------------------------------------------------------------------
+
+  /** The heavy accounts, and those whose coverage does not reach from the first day to the newest final day. */
+  private report(run: Run, heavy: Map<string, number>): void {
+    const pending = [...heavy.keys()].filter((account) => {
+      const state = run.states.get(account);
+      if (state === undefined) return true;
+      // an account whose first day is not over yet has nothing to cover
+      if (state.firstDay > run.through) return false;
+      return (
+        !hasCoverage(state) || (state.rolledFrom ?? '') > state.firstDay || (state.rolledThrough ?? '') < run.through
+      );
+    });
+    this.deps.metrics?.accountRollupsHeavyAccounts.set(heavy.size);
+    this.deps.metrics?.accountRollupsPendingAccounts.set(pending.length);
+  }
+
+  /** Whether the run may start another set: fewer than 3 failed, and the gate (the shutdown, the deadline) says so. */
+  private mayStart(run: Run): boolean {
+    return run.failed < MAX_FAILED_AGGREGATE_SETS_PER_TICK && this.gate.mayStart(run.tick.deadline);
+  }
+
+  /** A set failed: logged and counted, and the keys of what was in it made to wait (not after the shutdown, which aborted it). */
+  private fail(run: Run, err: unknown, where: string, keys: string[]): void {
+    const { deps } = this;
+    run.failed++;
+    deps.failed('account_rollups', err, where);
+    if (!deps.closing()) for (const key of keys) this.backoff.failed(key, deps.clock());
+  }
+}

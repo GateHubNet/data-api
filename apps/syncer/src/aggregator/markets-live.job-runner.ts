@@ -4,6 +4,7 @@ import {
   AggregateJobDeps,
   AggregatorAggregates,
   defaultAggregateFunctions,
+  iso,
   SetBackoff,
   SetGate,
 } from './aggregate-job-deps';
@@ -11,8 +12,6 @@ import type { AggregatorJob, AggregatorTick } from './aggregator.service';
 
 /** The `7day` and `30day` sets are written on every this-many-th run of the job (the `day` set on every run). */
 export const MARKETS_LONG_EVERY_TICKS = 5;
-
-const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
 
 /**
  * The `markets_live` job of the aggregator (job 5 of a tick, see spec 3 and 3.3): the Markets set of each period, made from the

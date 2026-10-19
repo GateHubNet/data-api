@@ -4,6 +4,7 @@ import {
   AggregateJobDeps,
   AggregatorAggregates,
   defaultAggregateFunctions,
+  iso,
   MAX_FAILED_AGGREGATE_SETS_PER_TICK,
   SetBackoff,
   SetGate,
@@ -14,7 +15,6 @@ const DAY_SECONDS = 86_400;
 const floorHour = (seconds: number): number => Math.floor(seconds / HOUR_SECONDS) * HOUR_SECONDS;
 const ceilHour = (seconds: number): number => Math.ceil(seconds / HOUR_SECONDS) * HOUR_SECONDS;
 const floorDay = (seconds: number): number => Math.floor(seconds / DAY_SECONDS) * DAY_SECONDS;
-const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
 
 /**
  * The `pair_hourly` job of the aggregator (job 4 of a tick, see spec 3 and 3.2): the hour sets of `pair_hourly`, the candle of

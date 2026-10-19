@@ -1,12 +1,26 @@
 import {
+  accountPartitionRows,
   ClickHouseService,
   computeMarketsSet,
   computePairHourSets,
+  computeRatesDailySet,
+  firstChangeDay,
+  firstNativeTradeDay,
+  heavyAccounts,
   marketsSetEndTimes,
+  markRatesStale,
   newestLedgerClose,
   pairHourSets,
+  partitionDays,
+  partitionSetVersions,
   RatesService,
+  recountPartition,
+  rollupStates,
   Table,
+  validRateDays,
+  VOLUME_DAY_SETTLE_MS,
+  writeAccountRollups,
+  writeRollupStates,
 } from '@gatehub/data-api-shared';
 import type { Logger } from '@nestjs/common';
 import type { PrometheusService } from '../modules/prometheus/prometheus.service';
@@ -43,6 +57,28 @@ export interface AggregatorAggregates {
   accountRollupMinRows: number;
 }
 
+/** `YYYY-MM-DDTHH:mm:ssZ` of a unix time in seconds, as the log lines and the answers spell a time. */
+export const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString().slice(0, 19)}Z`;
+
+/** `YYYY-MM-DD`, the UTC day of a unix time in seconds. */
+export const isoDay = (seconds: number): string => new Date(seconds * 1000).toISOString().slice(0, 10);
+
+export const DAY_SECONDS = 86_400;
+
+/**
+ * The start (unix seconds) of the newest **final** UTC day: one that is over and that the ingest has passed, the newest
+ * committed ledger having closed at least `VOLUME_DAY_SETTLE_MS` after its end (as the volume back-fill has it). Today is
+ * never final, and yesterday only once the ledger of its first hour is there. `newestClose` is the close time of the newest
+ * ledger, `now` the time of the tick.
+ */
+export function newestFinalDay(newestClose: number, now: Date): number {
+  const floorDay = (seconds: number): number => Math.floor(seconds / DAY_SECONDS) * DAY_SECONDS;
+  return Math.min(
+    floorDay(Math.floor(now.getTime() / 1000)) - DAY_SECONDS,
+    floorDay(newestClose - VOLUME_DAY_SETTLE_MS / 1000) - DAY_SECONDS,
+  );
+}
+
 /**
  * The close time of the oldest ingested ledger (the lowest index: a read of the start of the primary key), unix seconds;
  * none without a ledger.
@@ -62,6 +98,19 @@ export interface AggregateFunctions {
   marketsSetEndTimes: typeof marketsSetEndTimes;
   newestLedgerClose: typeof newestLedgerClose;
   firstLedgerClose: typeof firstLedgerClose;
+  computeRatesDailySet: typeof computeRatesDailySet;
+  markRatesStale: typeof markRatesStale;
+  validRateDays: typeof validRateDays;
+  firstNativeTradeDay: typeof firstNativeTradeDay;
+  rollupStates: typeof rollupStates;
+  writeRollupStates: typeof writeRollupStates;
+  writeAccountRollups: typeof writeAccountRollups;
+  recountPartition: typeof recountPartition;
+  partitionSetVersions: typeof partitionSetVersions;
+  heavyAccounts: typeof heavyAccounts;
+  accountPartitionRows: typeof accountPartitionRows;
+  firstChangeDay: typeof firstChangeDay;
+  partitionDays: typeof partitionDays;
 }
 
 export function defaultAggregateFunctions(): AggregateFunctions {
@@ -72,6 +121,19 @@ export function defaultAggregateFunctions(): AggregateFunctions {
     marketsSetEndTimes,
     newestLedgerClose,
     firstLedgerClose,
+    computeRatesDailySet,
+    markRatesStale,
+    validRateDays,
+    firstNativeTradeDay,
+    rollupStates,
+    writeRollupStates,
+    writeAccountRollups,
+    recountPartition,
+    partitionSetVersions,
+    heavyAccounts,
+    accountPartitionRows,
+    firstChangeDay,
+    partitionDays,
   };
 }
 

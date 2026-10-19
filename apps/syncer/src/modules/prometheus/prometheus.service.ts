@@ -106,6 +106,21 @@ const metrics = {
     labelNames: ['period'],
     registers: [registry],
   }),
+  ratesDailyMissingDays: new Gauge({
+    name: 'syncer_rates_daily_missing_days',
+    help: 'Closed final days without a valid rates set, from the first native trade to the newest final day.',
+    registers: [registry],
+  }),
+  accountRollupsHeavyAccounts: new Gauge({
+    name: 'syncer_account_rollups_heavy_accounts',
+    help: 'Heavy accounts.',
+    registers: [registry],
+  }),
+  accountRollupsPendingAccounts: new Gauge({
+    name: 'syncer_account_rollups_pending_accounts',
+    help: 'Heavy accounts whose coverage does not yet reach from first_day to the newest final day.',
+    registers: [registry],
+  }),
   validatorsUnlFetchesTotal: new Counter({
     name: 'syncer_validators_unl_fetches_total',
     help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
@@ -196,6 +211,9 @@ export class PrometheusService implements OnModuleInit {
   readonly aggregatorStatsLagSeconds = metrics.aggregatorStatsLagSeconds;
   readonly pairHourlyMissingHours = metrics.pairHourlyMissingHours;
   readonly marketsLiveAgeSeconds = metrics.marketsLiveAgeSeconds;
+  readonly ratesDailyMissingDays = metrics.ratesDailyMissingDays;
+  readonly accountRollupsHeavyAccounts = metrics.accountRollupsHeavyAccounts;
+  readonly accountRollupsPendingAccounts = metrics.accountRollupsPendingAccounts;
   readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;

@@ -26,7 +26,13 @@ export interface FakeDeps {
   /** Set it to make `deps.closing()` true, as a shutdown does. */
   closing: boolean;
   /** The gauges the runners set. */
-  readonly metrics: { pairHourlyMissingHours: { set: jest.Mock }; marketsLiveAgeSeconds: { set: jest.Mock } };
+  readonly metrics: {
+    pairHourlyMissingHours: { set: jest.Mock };
+    marketsLiveAgeSeconds: { set: jest.Mock };
+    ratesDailyMissingDays: { set: jest.Mock };
+    accountRollupsHeavyAccounts: { set: jest.Mock };
+    accountRollupsPendingAccounts: { set: jest.Mock };
+  };
   /** Aborts the signal of the ticks. */
   readonly abort: AbortController;
   /** The tick a job is run with: the deadline is the clock plus the budget, as `runJobs` narrows it; the signal is `abort`'s. */
@@ -43,6 +49,9 @@ export function fakeDeps(o: { budgetMs?: number } = {}): FakeDeps {
   const metrics = {
     pairHourlyMissingHours: { set: jest.fn() },
     marketsLiveAgeSeconds: { set: jest.fn() },
+    ratesDailyMissingDays: { set: jest.fn() },
+    accountRollupsHeavyAccounts: { set: jest.fn() },
+    accountRollupsPendingAccounts: { set: jest.fn() },
   };
   const abort = new AbortController();
   const fake: FakeDeps = {
