@@ -258,6 +258,50 @@ describe('assembleDirectory', () => {
       expect(entry.domainState).toBeUndefined();
       expect(entry.manifest).toEqual({ sequence: 1, signingKey: 'n9S1', signingKeysSeen: 1 });
     });
+
+    it('leaves out a domain that is not a properly formed TOML domain: no domain, no verification, none in the manifest', () => {
+      for (const domain of ['localhost', '1.2.3.4', 'a.com/x', 'a b.com', 'north.example:8443', 'café.example']) {
+        const entry = entryOf(
+          assembleDirectory(
+            reads({
+              seen: [seenRow('nHM1')],
+              manifests: [{ masterKey: 'nHM1', sequence: 1, signingKey: 'n9S1', domain, signingKeysSeen: 1 }],
+              // what the checker stores for such a domain
+              domains: [
+                {
+                  key: 'nHM1',
+                  domain,
+                  status: 'unverified',
+                  reason: 'domain_invalid',
+                  statusCode: 0,
+                  tomlUrl: '',
+                  checked: NOW_S - 60,
+                  accounts: [],
+                },
+              ],
+            }),
+          ),
+          'nHM1',
+        );
+        expect([domain, entry.domain, entry.domainState]).toEqual([domain, undefined, undefined]);
+        expect(entry.manifest).toEqual({ sequence: 1, signingKey: 'n9S1', signingKeysSeen: 1 });
+      }
+    });
+
+    it('serves a properly formed domain as the manifest names it, upper case included', () => {
+      const entry = entryOf(
+        assembleDirectory(
+          reads({
+            seen: [seenRow('nHM1')],
+            manifests: [
+              { masterKey: 'nHM1', sequence: 1, signingKey: 'n9S1', domain: 'North.Example', signingKeysSeen: 1 },
+            ],
+          }),
+        ),
+        'nHM1',
+      );
+      expect(entry.domain).toBe('North.Example');
+    });
   });
 
   describe('domain verification', () => {

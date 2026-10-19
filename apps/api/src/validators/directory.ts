@@ -1,6 +1,7 @@
 import {
   compareTriples,
   decodeServerVersion,
+  isProperlyFormedTomlDomain,
   listInUse,
   quorumOf,
   recordOf,
@@ -437,7 +438,10 @@ export function assembleDirectory(reads: DirectoryReads): Directory {
   for (const key of keys) {
     const seenAt = seen.get(key);
     const manifest = manifests.get(key);
-    const domain = manifest?.domain === undefined || manifest.domain === '' ? undefined : manifest.domain;
+    // a domain that is not one rippled would check (`isProperlyFormedTomlDomain`) is served nowhere: not as the domain, not in
+    // the manifest, not as the address of a TOML file
+    const domain =
+      manifest?.domain === undefined || !isProperlyFormedTomlDomain(manifest.domain) ? undefined : manifest.domain;
     const rows = votes.get(key);
     const record =
       rows === undefined || newestRound === undefined

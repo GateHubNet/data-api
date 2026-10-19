@@ -1,22 +1,27 @@
 import {
   ClickHouseConfig,
   ClickHouseModule,
+  ClickHouseService,
   NetworkProfile,
   NodeClient,
   parseContextFor,
   ShutdownSignals,
 } from '@gatehub/data-api-shared';
 import { DynamicModule, Global, Inject, Injectable, Logger, Module, OnApplicationShutdown } from '@nestjs/common';
-import { NETWORK_PROFILE, NODE_CLIENT, PARSE_CONTEXT, SyncerConfig } from '../config/syncer.config';
+import { enabledWorkers, NETWORK_PROFILE, NODE_CLIENT, PARSE_CONTEXT, SyncerConfig } from '../config/syncer.config';
 import { LivelinessModule } from '../modules/liveliness/liveliness.module';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { WorkerModule } from '../worker-registry';
 import { migrateOnBoot } from './migrate-on-boot';
 import { createNodeClient } from './node-client.provider';
+import { assertValidatorsSchema } from './schema-check';
 
 /**
- * Token of the async provider that applies the boot-time migrations. Nest awaits async providers before it calls any
- * lifecycle hook, so workers (which start in their hooks) always find the migrated schema; nothing injects this.
+ * Token of the async provider that applies the boot-time migrations and then checks that the schema of
+ * `002_validators_amendments.sql` is there when a worker that writes it is enabled (`assertValidatorsSchema`). Nest awaits
+ * async providers before it calls any lifecycle hook, so workers (which start in their hooks) always find the migrated
+ * schema, and a database without 002 fails the boot instead of every write of the validations and validators workers;
+ * nothing injects this.
  */
 const SCHEMA_READY = Symbol('SCHEMA_READY');
 
@@ -78,7 +83,15 @@ export class SyncerCoreModule {
         { provide: SyncerConfig, useValue: config },
         { provide: NETWORK_PROFILE, useValue: profile },
         { provide: PARSE_CONTEXT, useValue: parseContextFor(profile) },
-        { provide: SCHEMA_READY, useFactory: () => migrateOnBoot(config, clickHouse, logger) },
+        {
+          provide: SCHEMA_READY,
+          useFactory: async (ch: ClickHouseService) => {
+            const migrated = await migrateOnBoot(config, clickHouse, logger);
+            await assertValidatorsSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            return migrated;
+          },
+          inject: [ClickHouseService],
+        },
         ShutdownSignals,
         ...node,
         PrometheusService,

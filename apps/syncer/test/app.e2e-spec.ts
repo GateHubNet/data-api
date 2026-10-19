@@ -1,7 +1,9 @@
 import type { INestApplication } from '@nestjs/common';
 import { ChildProcess, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { AddressInfo, createServer } from 'node:net';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
@@ -9,6 +11,7 @@ import { syntheticChain, SyntheticLedger } from './synthetic-chain';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 const APP_ROOT = join(__dirname, '..');
+const SCHEMA_DIR = join(APP_ROOT, '..', '..', 'packages', 'shared', 'schema');
 
 let clickhouse: StartedClickHouse;
 
@@ -161,6 +164,29 @@ describe('AppModule on a real ClickHouse', () => {
     );
     const res = await fetch(`${baseUrl}/liveliness/healthz`);
     expect(res.status).toBe(200);
+  });
+
+  it('fails the boot, naming 002_validators_amendments.sql, when the validations worker runs on a database of 001 alone', async () => {
+    const database = 'syncer_app_e2e_without_002';
+    // a database that was never upgraded: the migration runner applies a folder that holds 001 alone
+    const only001 = mkdtempSync(join(tmpdir(), 'syncer-schema-001-'));
+    try {
+      copyFileSync(join(SCHEMA_DIR, '001_baseline.sql'), join(only001, '001_baseline.sql'));
+      await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: only001 });
+    } finally {
+      rmSync(only001, { recursive: true, force: true });
+    }
+    await app?.close();
+    app = undefined;
+    const tables = await tablesOf(database);
+    expect(tables).toEqual(expect.arrayContaining(['validations', 'validator_manifests', 'schema_migrations']));
+    expect(tables).not.toContain('validator_seen');
+
+    await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'validations' })).rejects.toThrow(
+      /lacks the schema of 002_validators_amendments\.sql \(column validations\.server_version, .*\), which the validations worker writes/,
+    );
+    // the other workers do not need it
+    await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' });
   });
 
   it('leaves the database alone when migrations are off', async () => {

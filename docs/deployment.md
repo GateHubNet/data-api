@@ -267,9 +267,11 @@ aggregates (D2) are recomputable and set no such constraint. A throwaway environ
 1. `migrate-<network>` applies `002`: two `ADD COLUMN IF NOT EXISTS` statements on `validations` and `validator_manifests` and ten
    `CREATE TABLE IF NOT EXISTS`. The compose files make the syncer and the api wait for it (`depends_on: service_completed_successfully`).
 2. `syncer-<network>` starts the new collector and the `validators` worker. **The syncer needs `002` applied before it starts**: its collector
-   writes the new columns and tables as `JSONEachRow`, which ClickHouse refuses when a row has a field the table lacks, so against a database
-   without `002` the collector's inserts fail and no validation is stored. Compose guarantees the order; with another orchestrator (Kubernetes,
-   `docker run`) run the migrate job to completion first. The syncer is a singleton: it is recreated, never scaled.
+   writes the new columns and tables as `JSONEachRow`, which ClickHouse refuses when a row has a field the table lacks. So a syncer with the
+   `validations` or `validators` worker enabled checks the schema at boot (`system.columns`) and refuses to start against a database without
+   `002`, with a message that names `002_validators_amendments.sql` and what is missing (a check that cannot reach ClickHouse is logged and
+   does not stop the boot). Compose guarantees the order; with another orchestrator (Kubernetes, `docker run`) run the migrate job to
+   completion first. The syncer is a singleton: it is recreated, never scaled.
 3. `api-<network>` serves the new routes. Compose starts the apis and the syncers together once the migration is done; an api that comes first
    answers from empty tables (200 with empty lists, no errors, because the tables exist) until the syncer has filled them.
 

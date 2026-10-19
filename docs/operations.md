@@ -63,7 +63,8 @@ failed halfway can simply be run again. Run migrations as a one-shot step, not f
 [data-model](data-model.md#5-migrations).
 
 **The syncer needs migration `002_validators_amendments.sql` applied before it starts.** Its collector inserts rows as `JSONEachRow`, and ClickHouse
-refuses a row that has a field the table lacks, so a syncer of this version against a database without `002` stores no validation until it is applied.
+refuses a row that has a field the table lacks, so a syncer of this version with the `validations` or `validators` worker refuses to boot against a
+database without `002`: the message names the file and what is missing. Apply the migration and start it again.
 The compose files order it for you (the syncer waits for its `migrate-<network>` job); with another orchestrator run the job first. The whole rollout
 (and the constraint with `feat/amm-data`) is [below](#roll-out-the-validators-and-amendments-data).
 

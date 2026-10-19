@@ -3265,3 +3265,83 @@ describe('GET /v2/network/validators/summary and /v2/network/validators: with 12
     ).not.toContain(s.unl[34].ephemeral);
   });
 });
+
+// ===================================================================================================================
+// a domain that is not one
+// ===================================================================================================================
+
+describe('GET /v2/network/validators and /{key}: a manifest that names a domain that is not properly formed', () => {
+  // the domain checker never fetches such a domain (domain_invalid); the API serves it nowhere either
+  let h: Harness;
+  let api: ApiClient;
+  let list: Answer;
+  let csv: Answer;
+  let detail: Answer;
+  const [bad, good] = fleet('xrpl', 2);
+
+  beforeAll(async () => {
+    h = await startHarness({
+      seed: 'none',
+      network: 'xrpl',
+      env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+    });
+    api = await h.api();
+    const now = Math.floor(Date.now() / 1000);
+    await insertLists(h.ch, [
+      { publisher: 'vl.ripple.com', sequence: 85, expiration: now + 30 * DAY, validators: [bad.key, good.key] },
+    ]);
+    await insertPublishers(h.ch, [{ publisher: 'vl.ripple.com', checked_at: now - 10 }]);
+    await insertSeen(
+      h.ch,
+      [bad, good].map((m) => ({ key: m.key, first: now - DAY, last: now - 30 })),
+    );
+    await insertManifests(h.ch, [
+      { ephemeral_key: bad.ephemeral, master_key: bad.key, seq: 1, domain: 'localhost:8443' },
+      { ephemeral_key: good.ephemeral, master_key: good.key, seq: 1, domain: 'south.example' },
+    ]);
+    await insertDomains(h.ch, [
+      {
+        validation_public_key: bad.key,
+        domain: 'localhost:8443',
+        status: 'unverified',
+        reason: 'domain_invalid',
+        toml_url: '',
+        verified_at: null,
+        checked_at: now - 100,
+      },
+    ]);
+    list = await api.get(LIST);
+    csv = await api.get(`${LIST}?format=csv`);
+    detail = await api.get(detailOf(bad.key));
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  const rowOf = (key: string) =>
+    list.body.validators.find((row: { validation_public_key: string }) => row.validation_public_key === key);
+
+  it('lists the validator without a domain and without a verification, after the one with a domain', () => {
+    expect(list.status).toBe(200);
+    expect(list.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key)).toEqual([
+      good.key,
+      bad.key,
+    ]);
+    expect(rowOf(bad.key)).not.toHaveProperty('domain');
+    expect(rowOf(bad.key)).not.toHaveProperty('domain_verification');
+    expect(rowOf(good.key)).toMatchObject({ domain: 'south.example', domain_verification: { status: 'pending' } });
+  });
+
+  it('has it nowhere in the CSV: not as a domain, not as the address of a TOML file', () => {
+    expect(csv.status).toBe(200);
+    expect(csv.text).not.toContain('localhost');
+    expect(csv.text).toContain('south.example');
+  });
+
+  it('has the detail without a domain, and the manifest without one', () => {
+    expect(detail.status).toBe(200);
+    expect(detail.body).not.toHaveProperty('domain');
+    expect(detail.body).not.toHaveProperty('domain_verification');
+    expect(detail.body.manifest).toEqual({ sequence: 1, signing_key: bad.ephemeral, signing_keys_seen: 1 });
+  });
+});

@@ -35,7 +35,9 @@ the **enabled workers** only (`GH_WORKERS`, default all five), and starts the to
 Then, in order:
 
 1. If `GH_RUN_MIGRATIONS_ON_BOOT=true`, the schema is applied (the compose stacks leave this off: the `migrate-<network>` job
-   owns it).
+   owns it). Then, with the `validations` or `validators` worker enabled, the schema of `002_validators_amendments.sql` is checked
+   (`system.columns`): a database without it refuses the boot with a message that names the file and what is missing (a check
+   that cannot reach ClickHouse is logged and the boot goes on).
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
    (`server_info.network_id`: XRPL reports 0 or nothing, Xahau 21337/21338). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,

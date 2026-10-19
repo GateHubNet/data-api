@@ -30,9 +30,10 @@ missing ledgers. Hours are written as version sets and are final only once the i
 
 **Outbound HTTPS only through the safe fetcher.** Publisher lists and validator-domain TOML files are fetched over HTTPS on port 443, to
 public addresses only, pinned to the address that was checked, with size and time limits and hand-followed redirects, each checked again
-(`apps/syncer/src/validators/safe-fetch.ts`). Domains come only from manifests whose signatures the worker verified itself. An operator who
-cannot allow egress to arbitrary public hosts sets `GH_DOMAIN_VERIFICATION=false` (domains then show `pending`) and keeps egress to the
-publishers.
+(`apps/syncer/src/validators/safe-fetch.ts`). A domain is fetched, and can be `verified`, only when it is that of a manifest whose signatures
+the worker verified itself. The `domain` served is that of a validator's newest stored manifest, and only a properly formed one (rippled's
+`isProperlyFormedTomlDomain`): any other is left out of `domain`, the manifest, the CSV and `toml_url`. An operator who cannot allow egress to
+arbitrary public hosts sets `GH_DOMAIN_VERIFICATION=false` (domains then show `pending`) and keeps egress to the publishers.
 
 **The quorum is derived, not read.** `max(⌈0.8 × (UNL − negative-UNL members on it)⌉, ⌈0.6 × UNL⌉)` over the trusted UNL, rippled's
 rule, in integer arithmetic. The node's `validation_quorum` (0 on public nodes) is shown as `node` only when it is above 0.
@@ -86,8 +87,9 @@ lists, the domain results).
 **Positive**
 - The boards' data is served from tables, with no call to a node or a third-party site on the request path; each unit (list, domain,
   round, hour) fails and recovers on its own, and the feature switches off with `GH_WORKERS`.
-- Everything the compute jobs write is recomputable from `validations`, `ledgers` and the stored lists within retention, and is written as
-  a version set, so a crash is invisible and a late ledger is repaired.
+- Everything the compute jobs write is recomputable from `validations`, `ledgers`, the stored lists and `network_state` (the negative UNL
+  and the majorities that the rounds and the hours read) within retention, and is written as a version set, so a crash is invisible and a
+  late ledger is repaired.
 - Additive: removing `validators` from `GH_WORKERS` stops the worker, rolling back the API removes the routes, and `002` needs no undo.
 
 **Negative / trade-offs**
