@@ -4,6 +4,7 @@ import { WORKER_NAMES, WorkerName } from './config/syncer.config';
 import { FeesModule } from './fees/fees.module';
 import { IngestModule } from './ingest/ingest.module';
 import { ValidationsModule } from './validations/validations.module';
+import { ValidatorsModule } from './validators/validators.module';
 
 /** What a worker contributes to the app: its Nest module (static or dynamic). */
 export type WorkerModule = Type<unknown> | DynamicModule;
@@ -22,10 +23,11 @@ export const WORKER_MODULES: WorkerModuleRegistry = {
   fee_stats: FeesModule,
   validations: ValidationsModule,
   aggregator: AggregatorModule,
+  validators: ValidatorsModule,
 };
 
 /** The workers that read from the shared node client (`NODE_CLIENT`). The validations collector makes its own. */
-export const NODE_CLIENT_WORKERS: ReadonlySet<WorkerName> = new Set<WorkerName>(['ingest', 'fee_stats']);
+export const NODE_CLIENT_WORKERS: ReadonlySet<WorkerName> = new Set<WorkerName>(['ingest', 'fee_stats', 'validators']);
 
 /** Whether one of the enabled workers reads from the shared node client: only then does the app make one (ruling R99). */
 export function needsNodeClient(enabled: ReadonlySet<WorkerName>): boolean {

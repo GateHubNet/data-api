@@ -1,7 +1,7 @@
 # The syncer (ingestion service)
 
 `apps/syncer` (`@gatehub/data-syncer`) fills the ClickHouse database of **one network** with everything the
-[API](api-reference.md) serves. It is a NestJS process that runs up to four **workers** and exposes a liveliness probe
+[API](api-reference.md) serves. It is a NestJS process that runs up to five **workers** and exposes a liveliness probe
 (`GET /liveliness/healthz`, port 3002) and Prometheus metrics (`GET /metricz`, port 3000). Run **exactly one syncer per network
 and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer); metrics: [observability](observability.md).
 
@@ -19,10 +19,13 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
                           ClickHouse, database = the network name
 ```
 
+The fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers over HTTPS and
+reads the node; it is not drawn.
+
 ## 1. Boot
 
 `main.ts` loads and validates the configuration (the process exits with a message naming the bad variable), builds the app from
-the **enabled workers** only (`GH_WORKERS`, default all four), and starts the toolbox bootstrap (probe + metrics ports).
+the **enabled workers** only (`GH_WORKERS`, default all five), and starts the toolbox bootstrap (probe + metrics ports).
 Then, in order:
 
 1. If `GH_RUN_MIGRATIONS_ON_BOOT=true`, the schema is applied (the compose stacks leave this off: the `migrate-<network>` job
@@ -139,7 +142,7 @@ the syncer waits each pause out: the catch-up is slow, it does not fail.
 
 ### Boot without a node
 
-The shared node client is made only when a worker reads from it (`ingest`, `fee_stats`); the validations collector opens its own
+The shared node client is made only when a worker reads from it (`ingest`, `fee_stats`, `validators`); the validations collector opens its own
 client per node. A syncer with `GH_WORKERS=aggregator` boots and serves its probe while every node is down. The boot network check
 (`server_info`, which must report the network of `GH_NETWORK`) is retried with a backoff (1 s doubling to 30 s, or the wait a
 rate-limiting node asks for) instead of ending the boot; only a node of another network ends it.
@@ -294,7 +297,78 @@ Properties that matter operationally:
   [verification report](superpowers/plans/2026-10-15-ripple-dropin.verification.md#8-step-6-packagessharedconfigmarketsxahaujson),
   then bump `version`.) A new `version` in the file recomputes the closed days.
 
-## 8. What the syncer does not do
+## 8. The validators worker
+
+The `validators` worker (`apps/syncer/src/validators/`) keeps the data behind the validators and amendments endpoints current:
+which validators the UNL publishers name, and (as the worker grows) their domains, the state of the ledger and the votes
+derived from it. Its design is in the [validators and amendments design](superpowers/specs/2026-10-19-validators-amendments-design.md),
+section 2. Like every worker it is switched on and off with `GH_WORKERS`.
+
+**Why a worker, and not steps of the aggregator.**
+
+1. It needs the node and outbound HTTPS to third-party sites. The aggregator needs neither and boots while every node is down.
+2. Its cadences (flag rounds, hours, re-check intervals) and failure modes (a publisher or a domain is down) are its own.
+3. The aggregator's 30 s tick is shared by the volume and stats jobs: the new jobs must neither compete for that budget nor change
+   its job order, and keeping out of the aggregator's code keeps the two branches apart.
+4. An operator can switch the whole feature on or off with `GH_WORKERS`.
+
+**Two loops.** An **I/O loop** that fetches the UNL lists (below), checks validator domains and polls the node, each on its own
+timer; and a **compute loop**, once a minute, that runs two ClickHouse jobs in the aggregator's job model (a budget per job, a job
+that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher is the
+part of the I/O loop that is in place; the rest joins the worker as it is built, started from the same bootstrap. A stop ends every
+loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
+private, loopback or reserved address, no redirect to one, 20 s, 1 MiB, 3 redirects), which also sends the `User-Agent`
+`gatehub-data-api/<version> (validators)`.
+
+### The UNL lists
+
+`UnlFetcher` fetches the validator list of every publisher of `GH_UNL_PUBLISHERS` (`url=publicKeyHex` pairs; a publisher's id is its
+URL without the scheme and the trailing slash, `vl.ripple.com`) and stores the ones that verify. `GH_UNL_THRESHOLD` (0 = rippled's
+rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists must name a validator for it to be trusted.
+
+- **Schedule.** One timer per publisher, never two fetches of one publisher at a time. A fetch at start, then one after
+  `GH_UNL_REFRESH_MS` (5 min), or after the `refresh_interval` of the last list (minutes, clamped to 1 min – 24 h, as rippled does)
+  when the list gives one. After a failure the wait is 30 s and doubles with each failure in a row to 10 min; any outcome other
+  than `ok` and `unchanged` counts as a failure, a list that is `stale` or `expired` included.
+- **Verification**, in the order rippled's `ValidatorList::verify` uses. A response that fails any of steps 1–5 is rejected whole,
+  and each failure has a reason code:
+  1. The body is JSON with `public_key`, `manifest` and `version` 1 (`blob`, `signature`) or 2 (`blobs_v2`, 1 to 5 entries); any
+     other version is read as 2. Else `invalid_format`.
+  2. `public_key` is the configured key (case does not matter). Else `untrusted_key`.
+  3. The publisher manifest decodes, is the configured key's own and both its signatures verify; a manifest with the sequence
+     `0xFFFFFFFF` revokes the key. Else `manifest_invalid`, or `revoked`. A version 2 entry's own manifest counts when its sequence is
+     higher, and the highest manifest signs every blob of the response.
+  4. Each blob's signature verifies over the decoded blob with that manifest's signing key. Else `signature_invalid`.
+  5. The blob is JSON with an integer `sequence` and `expiration`, an optional `effective` before the expiration, and validators
+     with 33-byte keys. Else `blob_invalid`.
+  6. Each blob is then compared with the newest sequence stored for the publisher: a lower one is `stale`, the same one
+     `unchanged` (nothing is written), a newer one that has expired `expired`, else it is new. The outcome of the attempt is `ok`
+     if any blob was new, else `unchanged` if any was unchanged, else the outcome of the first blob.
+- **A publisher cannot take a key back.** When a publisher rotates its signing key it serves a manifest of a higher sequence. A
+  body that replays an older manifest, with a list signed by the superseded key, is refused (`signature_invalid`): the highest
+  publisher manifest seen is kept in memory and, after a restart, read from the newest stored response.
+- **Writes.** Each new blob is one `unl_lists` row: the publisher, its key, `sequence`, `version`, `effective`, `expiration`, the
+  validators' master keys (base58, sorted), the SHA-256 of the blob, the time of the fetch, and the JSON as served. The manifest
+  of every validator in a new list is decoded, checked to be that validator's own, verified, and written to `validator_manifests`
+  with `source = 'unl'` (before the list, so that a list is never visible without its manifests; a revoked manifest has no signing
+  key and is skipped; one that fails is skipped, logged, and counted as `validator_manifest_invalid`). Every attempt, whatever its
+  outcome, writes the `unl_publishers` row of the publisher: `status` `ok` (outcomes `ok` and `unchanged`) or `error` with the
+  outcome as `error`, `checked_at`, the `threshold` in force, and `last_ok_at` (the time of the last ok attempt, kept through
+  failures). At start the worker writes a row for every configured publisher (a new one is `ok` with no `last_ok_at`, a known one
+  keeps its status) and sets `configured = 0` on stored publishers that are no longer configured. A ClickHouse failure ends the
+  attempt with a warning and the same backoff, and writes no row.
+- **The list in use, and the trusted UNL.** The current list of a publisher at time *t* is the stored one with the highest
+  `sequence` whose `effective` (none = always) is at or before *t* and whose `expiration` is after it. When none is current, the
+  newest is used and reported as expired: a flagged old UNL is better than none. The trusted UNL at *t* is the validators on at
+  least `threshold` of the current lists (for a time before the first fetch, the oldest stored list stands in). Both are in
+  `packages/shared` (`listInUse`, `trustedUnl`); `readStoredLists` reads the stored lists, one per publisher and sequence.
+- **Observability.** `syncer_validators_unl_fetches_total{publisher, outcome}` counts every attempt (`ok`, `unchanged`, or the
+  reason), `syncer_validators_unl_expiry_seconds{publisher}` is the expiration of the list in use minus now (negative when it
+  expired) and `syncer_validators_unl_size{publisher}` its validators. The status of a publisher is logged when it changes, not on
+  every retry, and a stored list is logged once. A log line names the publisher, the reason and the message of the failure, never
+  the body of a response.
+
+## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
 - It does not write `agg_dirty` for live ingest (the aggregator's catch-up watermark covers that); only range ingest does.
@@ -302,7 +376,7 @@ Properties that matter operationally:
 - It has no SQLite history importer (the `LedgerSource` interface is there for one; `genesis_*` of `accounts_created` stays empty
   until such an import loads ledger 32570).
 
-## 9. Failure modes
+## 10. Failure modes
 
 | Symptom | Cause | What happens |
 | --- | --- | --- |
@@ -314,15 +388,17 @@ Properties that matter operationally:
 | `Node network_id ... does not match GH_NETWORK` | Wrong node for the network | Boot refused. |
 | `... It rate limits this client: nothing is sent to it for N s` | A public node throttles the process | That endpoint is left alone for N s, the next one is used; with none left the syncer waits. See [Rate limits](#rate-limits). |
 | `The boot network check (server_info) failed: ...; retry in N s` | The node is unreachable, busy or rate limiting at boot | Retried until it answers; only a node of another network ends the boot. |
+| `UNL publisher <id>: error (<reason>): ...` | A publisher cannot be fetched, serves a list that fails verification, or serves one that is stale or expired | The list is not stored and the last stored one stays in use (reported as expired once it expires). Retried after 30 s, doubling to 10 min; the line is logged once, when the status changes. The reason is in `unl_publishers.error` and `syncer_validators_unl_fetches_total`. |
 
-## 10. Source map
+## 11. Source map
 
 | Where | What |
 | --- | --- |
 | `apps/syncer/src/main.ts`, `app.module.ts`, `worker-registry.ts`, `core/*` | Bootstrap, worker selection, node client provider, migrate-on-boot |
 | `apps/syncer/src/ingest/{live-runner,rpc-ledger-source}.ts` | The ingest worker and its ledger source |
 | `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
-| `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | The other three workers |
+| `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
+| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `stored-lists`, `safe-fetch` (the only outbound HTTP) |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
 | `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |

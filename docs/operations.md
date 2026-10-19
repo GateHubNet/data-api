@@ -97,6 +97,25 @@ A key that has an entry in `GH_RATE_LIMIT_KEYS` is rotated there in the same edi
 `old=limit` with the second, or the new key is limited per client address. An entry whose key is not in `GH_API_KEYS` fails the boot of every api, so
 removing the old key from `GH_API_KEYS` alone is an outage (the message names the entry by position, never the key).
 
+### Rotate a validator list publisher
+
+`GH_UNL_PUBLISHERS` (in the compose stacks `XRPL_UNL_PUBLISHERS` / `XAHAU_UNL_PUBLISHERS` of `deploy/.env.prod`) pairs the URL of each
+validator list publisher with its master key and is read at boot. A publisher that moves its signing key by a new manifest needs
+nothing from you: the syncer follows the manifests in the lists it fetches. When the **master key** or the **URL** changes:
+
+1. Edit the entry (`https://vl.example.org=<new key>`), or add the new one beside it, and apply it with `dc up -d` (repeat your `--scale` flags, see
+   [Deploy a new version](#deploy-a-new-version)): only the syncer of that network is recreated, a brief restart. An invalid entry fails the boot with `GH_UNL_PUBLISHERS entry <n>: <why>`.
+2. A publisher that is no longer listed is not fetched again. Its `unl_publishers` row is kept with `configured = 0` and its lists stay in
+   `unl_lists`, but it no longer counts: the trusted UNL is built from the configured publishers only. A new entry gets its row at the
+   first start and its first list at the first fetch.
+3. Check the new publisher:
+   `SELECT publisher, argMax(configured, checked_at) AS configured, argMax(status, checked_at) AS status, argMax(error, checked_at) AS error FROM xrpl.unl_publishers GROUP BY publisher`
+   shows `configured = 1`, `ok` and an empty `error` for it, and `configured = 0` for the one you replaced.
+
+The id of a publisher is its URL, so a new key at the **same** URL is the same publisher: a list of the new key is compared with the
+sequence numbers already stored for that URL, and one below the newest stored is `stale` until the publisher's numbering passes it.
+Use a different URL when the new key has its own numbering.
+
 ### Rotate the ClickHouse password
 
 `data_api` is not a SQL-created user: the clickhouse-server entrypoint writes `users.d/default-user.xml` (a user defined in XML, with `default` removed) from

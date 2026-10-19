@@ -71,7 +71,7 @@ indicator, up or down. For example a runner halted on a chain break (the body of
                            "message": "halted" } } }
 ```
 
-A syncer whose workers read from the node (`ingest`, `fee_stats`) opens its probe port only after its node connection is up and
+A syncer whose workers read from the node (`ingest`, `fee_stats`, `validators`) opens its probe port only after its node connection is up and
 the boot network check has passed (it is retried until it does), so an unreachable node shows as a failing healthcheck
 (`start_period` 60 s in compose). A syncer without such a worker (`GH_WORKERS=aggregator`) makes no node connection at all.
 
