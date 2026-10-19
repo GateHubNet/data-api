@@ -5,11 +5,24 @@
   "testEnvironment": "node",
   "testRegex": ".e2e-spec.ts$",
   "transform": {
-    "^.+\\.ts$": "ts-jest"
+    "^.+\\.ts$": "ts-jest",
+    "/node_modules/(@noble/hashes|@scure/base)/.+\\.js$": [
+      "ts-jest",
+      {
+        "tsconfig": {
+          "allowJs": true,
+          "module": "commonjs",
+          "target": "ES2021",
+          "esModuleInterop": true
+        },
+        "diagnostics": false
+      }
+    ]
   },
   "setupFiles": ["<rootDir>/test/jest-setup.js"],
   "moduleNameMapper": {
     "^src/(.*)$": "<rootDir>/src/$1"
   },
-  "testTimeout": 180000
+  "testTimeout": 180000,
+  "transformIgnorePatterns": ["/node_modules/(?!\\.pnpm/(@noble\\+hashes|@scure\\+base)@|@noble/hashes/|@scure/base/)"]
 }

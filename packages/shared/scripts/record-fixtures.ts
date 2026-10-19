@@ -15,15 +15,27 @@
  * TransactionType that has not been found yet. It stops when every wanted type is found or `--scan` ledgers have been
  * checked. A type counts as found on its first `tesSUCCESS` transaction unless `--any-result` is given.
  * Requests are sequential with a small delay so public servers are not hammered. Missing types are not an error.
+ *
+ * `--unl` records the validator lists of the network's default publishers instead of ledgers:
+ *
+ *   pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|xahau [--out <dir>]
+ *
+ * It GETs each publisher URL of the network profile (Node `https`, at most 3 redirects) and writes the body exactly as
+ * served to `<out>/<publisher id>.json`; `--out` defaults to `test/fixtures/<network>/unl`. It needs no node endpoint
+ * and takes none of the ledger options.
  */
 import { mkdirSync, writeFileSync } from 'fs';
+import { request } from 'https';
 import { join, resolve } from 'path';
 import { Client } from 'xrpl';
 import { gzipSync } from 'zlib';
-import { getNetworkProfile } from '../src/network';
+import { getNetworkProfile, parseUnlPublishers, publisherIdOf } from '../src/network';
 
-interface Options {
-  network: string;
+export interface Options {
+  network: 'xrpl' | 'xahau';
+  /** Record the validator lists of the default publishers instead of ledgers. */
+  unl: boolean;
+  /** The node endpoint; empty with `unl`. */
   endpoint: string;
   out: string;
   ledgers: number[];
@@ -48,12 +60,16 @@ function usage(message?: string): never {
   if (message) console.error(`error: ${message}\n`);
   console.error(
     'usage: record-fixtures --network xrpl|xahau --endpoint <wss url> --out <dir>\n' +
-      '         [--ledgers a,b,c] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]',
+      '         [--ledgers a,b,c] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]\n' +
+      '       record-fixtures --unl --network xrpl|xahau [--out <dir>]',
   );
   process.exit(2);
 }
 
-function parseArgs(argv: string[]): Options {
+/** The options that only make sense when recording ledgers from a node. */
+const LEDGER_ONLY_OPTIONS = ['endpoint', 'ledgers', 'want', 'scan', 'delay-ms', 'any-result'];
+
+export function parseArgs(argv: string[]): Options {
   const values: Record<string, string> = {};
   const flags = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
@@ -61,7 +77,7 @@ function parseArgs(argv: string[]): Options {
     if (arg === '--') continue;
     if (!arg.startsWith('--')) usage(`unexpected argument "${arg}"`);
     const name = arg.slice(2);
-    if (name === 'any-result') {
+    if (name === 'any-result' || name === 'unl') {
       flags.add(name);
       continue;
     }
@@ -74,6 +90,22 @@ function parseArgs(argv: string[]): Options {
 
   const network = values.network;
   if (network !== 'xrpl' && network !== 'xahau') usage('--network must be xrpl or xahau');
+  if (flags.has('unl')) {
+    for (const name of LEDGER_ONLY_OPTIONS) {
+      if (name in values || flags.has(name)) usage(`--${name} is for recording ledgers, not with --unl`);
+    }
+    return {
+      network,
+      unl: true,
+      endpoint: '',
+      out: resolve(values.out ?? join(__dirname, '..', 'test', 'fixtures', network, 'unl')),
+      ledgers: [],
+      want: [],
+      scan: 0,
+      delayMs: 0,
+      anyResult: false,
+    };
+  }
   if (!values.endpoint) usage('--endpoint is required');
   if (!values.out) usage('--out is required');
 
@@ -95,6 +127,7 @@ function parseArgs(argv: string[]): Options {
 
   return {
     network,
+    unl: false,
     endpoint: values.endpoint,
     out: resolve(values.out),
     ledgers,
@@ -156,8 +189,92 @@ function errorText(err: unknown): string {
   }
 }
 
+const UNL_MAX_REDIRECTS = 3;
+const UNL_MAX_BYTES = 1024 * 1024;
+const UNL_TIMEOUT_MS = 20_000;
+
+/**
+ * Where a redirect leads: `location` resolved against the URL it came from. Only `https://` is followed, and at most
+ * `UNL_MAX_REDIRECTS` times (`followed` redirects were taken already).
+ */
+export function redirectTarget(from: string, location: string | undefined, followed: number): string {
+  if (followed >= UNL_MAX_REDIRECTS) throw new Error(`${from}: more than ${UNL_MAX_REDIRECTS} redirects`);
+  if (!location) throw new Error(`${from}: redirect without a Location`);
+  const target = new URL(location, from);
+  if (target.protocol !== 'https:') throw new Error(`${from}: redirect to ${target.protocol}// is refused`);
+  return target.href;
+}
+
+/** GET a URL with Node `https` and return the body as served: at most 3 redirects, 20 s, 1 MiB. */
+function fetchBody(url: string, followed = 0): Promise<Buffer> {
+  return new Promise<Buffer>((resolveBody, reject) => {
+    const req = request(
+      url,
+      { method: 'GET', timeout: UNL_TIMEOUT_MS, headers: { Accept: 'application/json' } },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        if (status >= 300 && status < 400) {
+          res.resume();
+          try {
+            const next = redirectTarget(url, res.headers.location, followed);
+            fetchBody(next, followed + 1).then(resolveBody, reject);
+          } catch (err) {
+            reject(err);
+          }
+          return;
+        }
+        if (status !== 200) {
+          res.resume();
+          reject(new Error(`${url}: HTTP ${status}`));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on('data', (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > UNL_MAX_BYTES) {
+            req.destroy(new Error(`${url}: more than ${UNL_MAX_BYTES} bytes`));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => resolveBody(Buffer.concat(chunks)));
+        res.on('error', reject);
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error(`${url}: no answer within ${UNL_TIMEOUT_MS} ms`)));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** Record the validator list of each default publisher of the network, byte for byte as served. */
+async function recordUnlLists(options: Options): Promise<void> {
+  const profile = getNetworkProfile(options.network);
+  const publishers = parseUnlPublishers(profile.defaultUnlPublishers);
+  mkdirSync(options.out, { recursive: true });
+  let failed = 0;
+  for (const publisher of publishers) {
+    console.log(`GET ${publisher.url}`);
+    try {
+      const body = await fetchBody(publisher.url);
+      const list = JSON.parse(body.toString('utf8')) as { public_key?: unknown; version?: unknown };
+      if (typeof list.public_key !== 'string') throw new Error('the body is not a validator list (no public_key)');
+      const file = `${publisherIdOf(publisher.url)}.json`;
+      writeFileSync(join(options.out, file), body);
+      console.log(`  wrote ${file} (${body.length} bytes, version ${String(list.version)}, key ${list.public_key})`);
+    } catch (err) {
+      failed++;
+      console.error(`  FAILED ${publisher.url}: ${errorText(err)}`);
+    }
+  }
+  console.log(`\nrecorded ${publishers.length - failed} of ${publishers.length} lists into ${options.out}`);
+  if (failed > 0) process.exitCode = 1;
+}
+
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+  if (options.unl) return recordUnlLists(options);
   const profile = getNetworkProfile(options.network);
   mkdirSync(options.out, { recursive: true });
 
@@ -312,7 +429,9 @@ async function main(): Promise<void> {
   if (failure !== undefined) process.exitCode = 1;
 }
 
-main().catch((err) => {
-  console.error(errorText(err));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(errorText(err));
+    process.exit(1);
+  });
+}

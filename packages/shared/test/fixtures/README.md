@@ -9,6 +9,8 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/ripple-mock/` | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`. |
 | `xrpl/recorded/`    | Mainnet ledgers recorded from a public node (see below).                            |
 | `xahau/recorded/`   | Xahau mainnet ledgers recorded from a public node (see below).                      |
+| `xrpl/unl/`         | Validator lists of the XRPL default publishers, as served (see "UNL lists").        |
+| `xahau/unl/`        | The validator list of the Xahau default publisher, as served (see "UNL lists").     |
 
 ## Recorded fixtures
 
@@ -80,3 +82,34 @@ Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, 
 | URITokenMint    | 26541060 | `2EC9B35DA9FABDA4E375EBB158F7454E864FF24DDE4BD597F1EF6C04BC4EF4C3` |
 
 **Not found** within the 5000-ledger window (no successful transaction of that type): `Import`, `SetHook`.
+
+### UNL lists (`xrpl/unl/`, `xahau/unl/`)
+
+Not ledgers: the validator lists the default publishers of each network profile serve (`defaultUnlPublishers`), saved
+byte for byte as served, one file per publisher (`<publisher id>.json`). `FixtureLedgerSource` does not read these
+directories. They are the real data behind `src/validators/manifest.spec.ts`, `unl-list.spec.ts` and `node-key.spec.ts`:
+every list has to verify with the key of its profile, and every validator manifest in it has to decode and verify.
+
+Recorded 2026-10-19 (06:42 UTC) with `record:fixtures -- --unl` (below). All three are version 1 lists with one blob, no
+`effective` time and no `refresh_interval`.
+
+| Publisher (file)              | Source URL              | Sequence   | Validators | Expires (blob)       | Bytes |
+| ----------------------------- | ----------------------- | ---------- | ---------- | -------------------- | ----- |
+| `xrpl/unl/vl.ripple.com.json` | `https://vl.ripple.com` | 85         | 35         | 2027-04-06T17:51:34Z | 20026 |
+| `xrpl/unl/unl.xrplf.org.json` | `https://unl.xrplf.org` | 2026070302 | 35         | 2027-07-03T00:00:00Z | 20255 |
+| `xahau/unl/vl.xahau.org.json` | `https://vl.xahau.org`  | 2026092401 | 19         | 2027-09-25T00:00:00Z | 11232 |
+
+Every validator entry in the three lists carries its manifest (35 + 35 + 19 manifests); each decodes, re-encodes
+identically and verifies. The specs assert these sequences and counts, so after re-recording they have to be updated to
+what the new lists say. The specs take the time from the data (expiration minus one second, and so on), never from the
+clock, so the lists expiring does not break them.
+
+#### Re-recording
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|xahau [--out <dir>]
+```
+
+`--unl` needs no `--endpoint` and takes none of the ledger options; `--out` defaults to `test/fixtures/<network>/unl`. It
+GETs the URL of each default publisher of the network profile (Node `https`, at most 3 redirects, 20 s, 1 MiB) and
+writes the body unchanged. Do not run a formatter over these files.

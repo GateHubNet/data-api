@@ -247,6 +247,15 @@ importers:
       bignumber.js:
         specifier: ^9.1.2
         version: 9.3.1
+      ripple-address-codec:
+        specifier: ^5.0.0
+        version: 5.0.1
+      ripple-binary-codec:
+        specifier: ^2.11.0
+        version: 2.11.0
+      ripple-keypairs:
+        specifier: ^2.0.0
+        version: 2.0.0
       ripple-lib-transactionparser:
         specifier: ^0.8.2
         version: 0.8.2
@@ -881,9 +890,6 @@ packages:
   '@scarf/scarf@1.4.0':
     resolution: {integrity: sha512-xxeapPiUXdZAE3che6f3xogoJPeZgig6omHEy1rIY5WVsB3H2BHNnZH+gHG6x91SCWyQCzWGsuL2Hh3ClO5/qQ==}
 
-  '@scure/base@1.2.6':
-    resolution: {integrity: sha512-g/nm5FgUa//MCj1gV09zTJTaM6KBAHqLN907YVQqf7zC49+DcO4B1so4ZX07Ef10Twr6nuqYEH9GEggFXA4Fmg==}
-
   '@scure/base@2.4.0':
     resolution: {integrity: sha512-thZ1TuJwFwBblOhgsjDKvvGirBxNp+wSvY/DR6tJBJOTDhdAAcHJ8Vbr2eFnqaxeca4+t0i9KBf+uHYGWwZORg==}
 
@@ -1103,10 +1109,6 @@ packages:
 
   '@webassemblyjs/wast-printer@1.14.1':
     resolution: {integrity: sha512-kPSSXE6De1XOR820C90RIo2ogvZG+c3KiHzqUoO/F34Y2shGzesfqv7o57xrxovZJH/MetF5UjroJ/R/3isoiw==}
-
-  '@xrplf/isomorphic@1.0.1':
-    resolution: {integrity: sha512-0bIpgx8PDjYdrLFeC3csF305QQ1L7sxaWnL5y71mCvhenZzJgku9QsA+9QCXBC1eNYtxWO/xR91zrXJy2T/ixg==}
-    engines: {node: '>=16.0.0'}
 
   '@xrplf/isomorphic@1.0.2':
     resolution: {integrity: sha512-ncZUdMXr6VlSXtdoiDi0jTH+gBrgGxwVeEidhoegII3PmyErbQsyj6e+j7acmR4LW/lvBkPkzb9QzRfJH0n3rA==}
@@ -3022,10 +3024,6 @@ packages:
     resolution: {integrity: sha512-Qa3+9wKVvpL/xYtT6+wANsn0A1QcC5CT6IMZbRJZ/1lGt7gmwIfsrCuz1X0+LCEO7zgb+3UT1I1dc0k/5dwKQQ==}
     engines: {node: '>= 10'}
 
-  ripple-address-codec@5.0.0:
-    resolution: {integrity: sha512-de7osLRH/pt5HX2xw2TRJtbdLLWHu0RXirpQaEeCnWKY5DYHykh3ETSkofvm0aX0LJiV7kwkegJxQkmbO94gWw==}
-    engines: {node: '>= 16'}
-
   ripple-address-codec@5.0.1:
     resolution: {integrity: sha512-JQHLKuVJV8lv9Qobmn4aUM2Dpv9WRRLKnNWfM8tN02fAbUtG8mUPsu9q9UYX8P76G4qzytEc5ZKMp/3JggNYmw==}
     engines: {node: '>= 18'}
@@ -4606,8 +4604,6 @@ snapshots:
 
   '@scarf/scarf@1.4.0': {}
 
-  '@scure/base@1.2.6': {}
-
   '@scure/base@2.4.0': {}
 
   '@sinclair/typebox@0.27.10': {}
@@ -4901,15 +4897,6 @@ snapshots:
     dependencies:
       '@webassemblyjs/ast': 1.14.1
       '@xtuc/long': 4.2.2
-
-  '@xrplf/isomorphic@1.0.1':
-    dependencies:
-      '@noble/hashes': 1.8.0
-      eventemitter3: 5.0.1
-      ws: 8.21.0
-    transitivePeerDependencies:
-      - bufferutil
-      - utf-8-validate
 
   '@xrplf/isomorphic@1.0.2':
     dependencies:
@@ -7145,14 +7132,6 @@ snapshots:
       base-x: 3.0.11
       create-hash: 1.2.0
 
-  ripple-address-codec@5.0.0:
-    dependencies:
-      '@scure/base': 1.2.6
-      '@xrplf/isomorphic': 1.0.1
-    transitivePeerDependencies:
-      - bufferutil
-      - utf-8-validate
-
   ripple-address-codec@5.0.1:
     dependencies:
       '@scure/base': 2.4.0
@@ -7190,8 +7169,8 @@ snapshots:
   ripple-keypairs@2.0.0:
     dependencies:
       '@noble/curves': 1.9.7
-      '@xrplf/isomorphic': 1.0.1
-      ripple-address-codec: 5.0.0
+      '@xrplf/isomorphic': 1.0.2
+      ripple-address-codec: 5.0.1
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
