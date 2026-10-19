@@ -40,6 +40,7 @@ import { PaymentsModule } from './payments/payments.module';
 import { StatsModule } from './stats/stats.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { ValidationsModule } from './validations/validations.module';
+import { ValidatorsModule } from './validators/validators.module';
 import { XrplModule } from './xrpl/xrpl.module';
 
 /**
@@ -74,6 +75,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ActiveAccountsModule,
   NetworkModule,
   ValidationsModule,
+  ValidatorsModule,
   StatsModule,
 ];
 

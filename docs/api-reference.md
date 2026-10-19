@@ -13,8 +13,8 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
-[Active accounts](#active-accounts) · [Network](#network) · [Validations](#validations) · [Stats](#stats) ·
-[Operational endpoints](#operational-endpoints)
+[Active accounts](#active-accounts) · [Network](#network) · [Validations](#validations) ·
+[Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Operational endpoints](#operational-endpoints)
 
 ---
 
@@ -172,7 +172,7 @@ name is the same, quoted (M12).
 
 Successful `/v2` answers carry `Cache-Control: private, max-age=60` (the `GH_CACHE_CONTROL` setting; empty sends no header):
 `private`, because an answer is for the holder of an API key and a shared cache that ignores the key would serve it to anybody. The
-live routes `/balances` and `/orders` send their own (see there).
+live routes `/balances` and `/orders` send their own (see there), and so do the validator routes (see [Validators and amendments](#validators-and-amendments)).
 Responses are gzip-compressed when the client asks for it. CORS headers are sent only for the origins in `GH_CORS_ORIGINS`.
 Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it (see [deployment](deployment.md)).
 
@@ -195,7 +195,7 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 | Group | Routes of the original |
 | --- | --- |
 | Health, gateways, currencies | `/v2/health[/{aspect}]`, `/v2/gateways[/{gateway}]`, `/v2/gateways/{gateway}/assets[/{filename}]`, `/v2/currencies[/{currencyAsset}]` |
-| Network | `/v2/network/external_markets`, `/v2/network/xrp_distribution`, `/v2/network/top_markets[/{date}]`, `/v2/network/top\_currencies[/{date}]`, `/v2/network/topology`, `/v2/network/topology/nodes[/{pubkey}]`, `/v2/network/topology/links`, `/v2/network/validators[/{pubkey}]`, `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`, `/v2/network/validator_reports`, `/v2/network/rippled_versions` |
+| Network | `/v2/network/external_markets`, `/v2/network/xrp_distribution`, `/v2/network/top_markets[/{date}]`, `/v2/network/top\_currencies[/{date}]`, `/v2/network/topology`, `/v2/network/topology/nodes[/{pubkey}]`, `/v2/network/topology/links`, `/v2/network/validators[/{pubkey}]` (except `/v2/network/validators/summary`, see [Validators and amendments](#validators-and-amendments)), `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`, `/v2/network/validator_reports`, `/v2/network/rippled_versions` |
 | Accounts | `/v2/accounts/{address}/escrows`, `/v2/accounts/{address}/payment_channels` |
 | Reports and tools | `/v2/reports[/{date}]`, `/v2/maintenance/{domain}`, `/v2/estimate` |
 | API map | `GET /` and `GET /v2` (the index of all routes) |
@@ -1043,6 +1043,111 @@ Errors of both: 400 `invalid ledger hash`, `invalid marker`; 500 `unable to retr
 validations are kept **per (ledger, validator)**, not per reporting node: a validation that two collector nodes saw is one row
 whose `count` adds up (the original's mock data mixed both shapes); `limit` of 0 or less is the default; a database failure is a
 500 `unable to retrieve ledger`.
+
+---
+
+## Validators and amendments
+
+The validators of the network, the trusted UNL and the amendments. `data.ripple.com` served a validator list and per-validator reports from
+its own crawler (its routes are listed as out of scope [above](#compatibility)); these routes are new: the data come from the validations the
+syncer collects, the validator lists the syncer fetches from the publishers, the ledger state it polls from the node and what it computes from
+them, not from a crawler.
+
+**Formats.** A key without a value is absent, never `null`. Instants of receipt (`fetched`, `first_seen`, `last_seen`, `last_error_at`, and
+`updated` of the summary) are `YYYY-MM-DDTHH:mm:ss.SSSZ`; ledger and wall times (`close_time`, `expiration`, `agreement_through`, `expected`) are
+`YYYY-MM-DDTHH:mm:ssZ`; days are `YYYY-MM-DD`. Native amounts are whole units as exact decimal text (`"0.00001"`, `"1"`, `"0.2"`). Counts are
+numbers; a percentage is a number to 2 decimals; an agreement `score` is text to 4 decimals, rounded half up. The key order of every object is the
+one written here and is pinned by tests.
+
+**Cache-Control** (only while `GH_CACHE_CONTROL` is not empty; an error is always `no-store`):
+
+| Route | `Cache-Control` |
+| --- | --- |
+| `/v2/network/validators`, `/v2/network/validators/summary`, `/v2/network/validators/{key}` | `private, max-age=30` |
+| `/v2/network/validators/{key}/validations` | `private, max-age=5`; with a `marker`: `private, max-age=300` |
+| `/v2/network/amendments`, `/v2/network/amendments/{name}` | `private, max-age=60` |
+
+**Where the data come from.** The API reads only tables of the database; it never asks a node.
+
+- The syncer's `validations` collector writes the validations, the manifests (the signing key of every validator, its domain) and when each validator
+  was first and last seen.
+- The syncer's `validators` worker fetches the validator lists of the publishers (`GH_UNL_PUBLISHERS`), checks the domains of the validators,
+  polls the ledger state of the node (the enabled amendments and their majorities, the negative UNL, the fees) every minute, and computes the voting
+  rounds (what each validator voted at each voting ledger, 256 ledgers apart) and the agreement of each validator per UTC hour.
+- A **validator directory** is built from those tables, one build at a time per replica, and kept for 10 seconds: a request costs at most one build
+  in 10 s, whatever the number of requests. Every read that adds up rows by validator first maps a signing key to its master key through the
+  manifests, so a validation recorded before its manifest was known counts for the right validator; a round and an hour are read whole, in the
+  newest version written (a rewritten round or hour is never mixed with its older version).
+- "In use now" (the trusted UNL, which publishers name a validator) uses the lists a publisher served under the key it is configured with; a
+  list of a key it no longer uses was trusted in its time and is history.
+
+The routes of the original `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`,
+`/v2/network/validator_reports` and `/v2/network/rippled_versions` are not served and answer 404 `{"result":"error","message":"Cannot GET ..."}`.
+
+### `GET /v2/network/validators/summary`
+
+The network overview of the Validators board: how many validators there are, the trusted UNL and its publishers, the quorum, the negative UNL, the
+fees, the next flag ledger, the software versions, and how far agreement and votes are computed. No parameters (any that are sent are ignored).
+
+```json
+{
+  "result": "success",
+  "ledger_index": 107748183,
+  "close_time": "2026-10-19T15:54:12Z",
+  "validators": {"seen_24h": 54, "unl_seen_24h": 34, "others_seen_24h": 20, "all": 55},
+  "unl": {
+    "trusted": 35,
+    "threshold": 1,
+    "publishers": [
+      { "id": "unl.xrplf.org", "url": "https://unl.xrplf.org", "public_key": "ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1", "status": "expired", "sequence": 2026070302,
+        "version": 1, "expiration": "2026-10-18T15:54:20Z", "fetched": "2026-10-12T15:54:20.380Z", "validators": 34,
+        "seen_24h": 33, "last_error": "http_status", "last_error_at": "2026-10-19T15:44:19.620Z" },
+      { "id": "vl.ripple.com", "url": "https://vl.ripple.com", "public_key": "ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734", "status": "ok", "sequence": 85,
+        "version": 1, "expiration": "2027-04-07T15:54:20Z", "fetched": "2026-10-19T15:51:26.114Z", "validators": 35,
+        "seen_24h": 34 }
+    ]
+  },
+  "quorum": {"value": 28, "unl_size": 35, "negative_unl": 1, "node": 28},
+  "negative_unl": [ {"validation_public_key": "nHUH2dDP9pG4fbUza2gV5Uzq1cprSQvuNLQbRagPW6uVnUA4qwdP", "first_ledger": 107747000} ],
+  "negative_unl_pending": {"to_reenable": "nHUH2dDP9pG4fbUza2gV5Uzq1cprSQvuNLQbRagPW6uVnUA4qwdP"},
+  "fees": {"base_fee": "0.00001", "reserve_base": "1", "reserve_inc": "0.2"},
+  "next_flag_ledger": {"ledger_index": 107748352, "voting_ledger": 107748351, "expected": "2026-10-19T16:05:28Z"},
+  "latest_version": "3.4.1",
+  "versions": [ {"version": "3.5.0-rc1", "unl": 0, "all": 3}, {"version": "3.4.1", "unl": 30, "all": 40}, {"version": "3.4.0", "unl": 4, "all": 9} ],
+  "versions_unknown": {"unl": 1, "all": 2},
+  "agreement_through": "2026-10-19T15:00:00Z",
+  "votes_through_ledger": 107748095,
+  "updated": "2026-10-19T15:54:20.222Z"
+}
+```
+
+Keys of the summary, in order: `result, ledger_index, close_time, validators, unl, quorum, negative_unl, negative_unl_pending, fees, next_flag_ledger, latest_version, versions, versions_unknown, agreement_through, votes_through_ledger, updated`.
+
+Keys of a publisher, in order: `id, url, public_key, status, sequence, version, expiration, fetched, validators, seen_24h, last_error, last_error_at`.
+
+| Key | Meaning |
+| --- | --- |
+| `ledger_index`, `close_time` | The newest committed ledger of the index. Without one, the ledger of the newest ledger state and no `close_time`; without either, both are absent. |
+| `validators` | `seen_24h`: validators seen in the last 24 hours (a signing key counts for its master); `unl_seen_24h`: of those on the trusted UNL; `others_seen_24h`: the rest; `all`: the trusted UNL together with those seen in 24 hours. |
+| `unl` | `trusted`: validators named by at least `threshold` of the lists in use; `threshold`: how many lists must name one (absent while no publisher is known); `publishers`: one entry per configured publisher, by `id`. |
+| publisher | `id` is the URL without scheme (`vl.ripple.com`); `public_key` the key it is configured with (66 hex digits); `status`: `ok` (a current list), `expired` (only an expired list, which is still used: a flagged old UNL is better than none) or `unavailable` (never fetched). With a list: its `sequence`, `version` (1 or 2), `expiration`, when it was `fetched`, the number of `validators` on it and how many of them were seen in 24 hours (`seen_24h`). `last_error` (the reason code) and `last_error_at` are there when the newest attempt to fetch the list failed, whatever the status. |
+| `quorum` | `value`: the validations a ledger needs, derived with rippled's rule over the trusted UNL and the negative UNL, max(⌈0.8 × (`unl_size` − `negative_unl`)⌉, ⌈0.6 × `unl_size`⌉); `unl_size`: the trusted validators; `negative_unl`: how many of them are on the negative UNL. `node` is the quorum the node reports, only when it reports one above 0 (public nodes report 0). With no trusted validator `value` is 0. |
+| `negative_unl` | The validators disabled now, `{validation_public_key, first_ledger}`; an empty list when none. `negative_unl_pending` is there only when a validator is about to be disabled or re-enabled: `{to_disable?, to_reenable?}`. |
+| `fees` | `base_fee`, `reserve_base`, `reserve_inc` in whole units: those the node reported in the newest ledger state, else those in force at the newest voting round. |
+| `next_flag_ledger` | The multiple of 256 above `ledger_index` and the `voting_ledger` before it (the ledger the validators' votes are counted at). `expected` is `close_time` plus the ledgers to go times the mean interval of the last 1,000 ledgers. |
+| `latest_version` | The newest release build among the versions the trusted validators reported in the last 24 hours. A release candidate or a beta is not one. |
+| `versions` | The software versions of the trusted validators (`unl`) and of the validators seen in 24 hours (`all`), newest first: `{version, unl, all}`. A version is `major.minor.patch`, with `-rcN` or `-bN` for a candidate or a beta; on Xahau the major counts from 2023 (`2026.10.13`) and the builds of a version are one entry. |
+| `versions_unknown` | The same two counts for the validators that reported no version (only a validation of a voting ledger carries one). |
+| `agreement_through` | The end of the newest final hour of agreement. |
+| `votes_through_ledger` | The newest voting ledger whose votes are computed. |
+| `updated` | When the directory this answer comes from was built. |
+
+An empty database answers 200 with `result`, `validators` (all 0), `unl` (`trusted` 0, no `publishers`), `quorum` (all 0), `negative_unl` (empty),
+`versions` (empty), `versions_unknown` (both 0) and `updated`.
+
+Errors: 500 `unable to retrieve validator(s)`.
+
+**Differences from data.ripple.com**: the original has no such route; this one is new. It answers from the database only and does not wait for a node.
 
 ---
 
