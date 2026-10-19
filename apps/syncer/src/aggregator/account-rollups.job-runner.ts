@@ -96,6 +96,11 @@ interface Run {
  *     An account whose slice ends in a partition that has no set yet waits for the discovery to count it.
  *  4. The gauges `syncer_account_rollups_heavy_accounts` and `syncer_account_rollups_pending_accounts`.
  *
+ * It says once (a log line, as `rates_daily` and `pair_hourly` do for theirs) that the promotion back-fill is under way, when a run
+ * finds a heavy account whose coverage has to grow back, and once that it is done, when no heavy account is pending any more
+ * (the pending of the gauge: its coverage reaches from its first day to the newest final day); it says so again if accounts
+ * become pending again. A new day that only has to be rolled on (the daily increment) is no back-fill and says nothing.
+ *
  * What fails (a partition, a call of accounts, a slice) is logged and counted (`deps.failed`), waits 5 minutes and twice as long
  * after each further failure, up to an hour, while the rest goes on. A day is final as for `rates_daily`.
  */
@@ -109,6 +114,8 @@ export class AccountRollupsJobRunner {
   private readonly marked = new Set<number>();
   /** The accounts that failed inside a call of several: they are rolled alone until they work. */
   private readonly solo = new Set<string>();
+  /** Whether the promotion back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
+  private backfilling = false;
 
   constructor(
     private readonly deps: AggregateJobDeps,
@@ -212,6 +219,9 @@ export class AccountRollupsJobRunner {
     );
     for (const account of this.solo) if (!heavy.has(account)) this.solo.delete(account);
 
+    // the promotion is under way when an account has to be covered further back (not for a new day, which only rolls on)
+    const toPromote = [...run.states.values()].filter((s) => this.needsPromotion(s, run.through)).length;
+    if (toPromote > 0) this.announceBackfill(true, toPromote);
     await this.increment(run);
     await this.promote(run);
     this.report(run, heavy);
@@ -523,6 +533,21 @@ export class AccountRollupsJobRunner {
     });
     this.deps.metrics?.accountRollupsHeavyAccounts.set(heavy.size);
     this.deps.metrics?.accountRollupsPendingAccounts.set(pending.length);
+    // an account that failed or waits is still pending, so the back-fill is not done while one does
+    if (pending.length === 0) this.announceBackfill(false, 0);
+  }
+
+  /** Says once that the promotion back-fill is under way (and how many accounts wait for it), and once that it is done. */
+  private announceBackfill(under: boolean, accounts: number): void {
+    if (under && !this.backfilling) {
+      this.backfilling = true;
+      this.deps.logger.log(`Account-rollups back-fill: ${accounts} heavy account(s) to cover, newest days first`);
+    } else if (!under && this.backfilling) {
+      this.backfilling = false;
+      this.deps.logger.log(
+        'Account-rollups back-fill is done: every heavy account is covered from its first day to the newest final day',
+      );
+    }
   }
 
   /** Whether the run may start another set: fewer than 3 failed, and the gate (the shutdown, the deadline) says so. */

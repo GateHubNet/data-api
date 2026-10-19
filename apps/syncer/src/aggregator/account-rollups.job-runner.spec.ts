@@ -791,6 +791,86 @@ describe('AccountRollupsJobRunner', () => {
     });
   });
 
+  describe('the announcement of the promotion back-fill', () => {
+    const said = (): string[] => fake.logger.log.mock.calls.map((c) => c[0]).filter((t) => /back-fill/i.test(t));
+
+    it('announces the promotion back-fill once under way and once done, and again when accounts become pending again', async () => {
+      for (let i = 0; i < 10; i++) world.heavyAccount(accountName(i), { firstDay: '2026-10-14' });
+      world.callMs = 3000; // the budget is 8 s: three promotions start in a run
+      const r = runner();
+
+      await run(r); // 3 of the 10
+      expect(said()).toEqual([
+        expect.stringMatching(/^Account-rollups back-fill: 10 heavy account\(s\) to cover, newest days first$/),
+      ]);
+      await run(r); // 6
+      await run(r); // 9
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(1);
+      expect(said()).toHaveLength(1);
+      await run(r); // the last one
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(0);
+      expect(said()).toHaveLength(2);
+      expect(said()[1]).toMatch(
+        /^Account-rollups back-fill is done: every heavy account is covered from its first day to the newest final day$/,
+      );
+
+      // a run with nothing to do says nothing
+      await run(r);
+      expect(said()).toHaveLength(2);
+
+      // a new day only rolls the accounts on: it is no back-fill, and says nothing
+      world.newest = unix('2026-10-17T01:00:00Z');
+      jest.setSystemTime(unix('2026-10-17T01:00:10Z') * 1000);
+      await r.job().run(fake.tick(new Date('2026-10-17T01:00:10Z')));
+      expect(world.rollups.some((c) => c.from === '2026-10-16' && c.through === '2026-10-16')).toBe(true);
+      expect(said()).toHaveLength(2);
+
+      // a heavy account that has to be covered back says so again, and when it is done
+      world.heavyAccount('rLate', { firstDay: '2026-10-10' });
+      jest.setSystemTime(unix('2026-10-17T02:00:00Z') * 1000);
+      await r.job().run(fake.tick(new Date('2026-10-17T02:00:00Z')));
+      expect(said()).toHaveLength(4);
+      expect(said()[2]).toMatch(/Account-rollups back-fill: 1 heavy account\(s\) to cover/);
+      expect(said()[3]).toMatch(/is done/);
+    });
+
+    it('does not say it is done while a heavy account failed or waits, and says it when it works', async () => {
+      world.heavyAccount('rGood', { firstDay: '2026-10-14' });
+      world.heavyAccount('rBad', { firstDay: '2026-10-14' });
+      world.failingAccounts.add('rBad');
+      const r = runner();
+
+      await run(r);
+      expect(said()).toEqual([expect.stringMatching(/Account-rollups back-fill: 2 heavy account\(s\) to cover/)]);
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(1);
+
+      // it waits (5 minutes): nothing is said, and the run that retries it and fails says nothing either
+      await run(r);
+      jest.setSystemTime(Date.now() + minutes(5));
+      await run(r);
+      expect(said()).toHaveLength(1);
+
+      world.failingAccounts.clear();
+      jest.setSystemTime(Date.now() + minutes(10));
+      await run(r);
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(0);
+      expect(said()).toHaveLength(2);
+      expect(said()[1]).toMatch(/is done/);
+    });
+
+    it('says nothing when no heavy account needs covering, or the job is off', async () => {
+      world.heavyAccount('rDone', { rolledFrom: '2025-01-01', rolledThrough: THROUGH });
+      await run(runner());
+      expect(said()).toEqual([]);
+
+      minRows = 0;
+      world.heavyAccount('rUncovered', {});
+      await run(runner());
+      expect(said()).toEqual([]);
+      expect(fake.logger.log).not.toHaveBeenCalled();
+    });
+  });
+
   describe('ofSlice', () => {
     const ofSlice = (r: AccountRollupsJobRunner, from: string, to: string): Promise<void> =>
       r.ofSlice(unix(from), unix(to), fake.tick());
