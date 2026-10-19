@@ -1,13 +1,5 @@
 import BigNumber from 'bignumber.js';
-import {
-  ratedAssets,
-  rateSpans,
-  StatsRates,
-  StoredBalance,
-  toTransactionStats,
-  toValueStats,
-  VALUE_DAYS_PER_RATE_CALL,
-} from './account-stats-object';
+import { ratedAssets, StatsRates, StoredBalance, toTransactionStats, toValueStats } from './account-stats-object';
 
 /** Freezes the whole structure: the functions are pure and a write to their input would throw. */
 function deepFreeze<T>(value: T): T {
@@ -91,46 +83,18 @@ describe('ratedAssets', () => {
   });
 });
 
-describe('rateSpans', () => {
-  it('is one span from the first day to the day after the last', () => {
-    expect(rateSpans(['2020-03-02', '2020-03-09', '2020-03-10'])).toEqual([
-      { from: new Date('2020-03-02T00:00:00Z'), toExclusive: new Date('2020-03-11T00:00:00Z') },
-    ]);
-  });
-
-  it('is none for no days', () => {
-    expect(rateSpans([])).toEqual([]);
-  });
-
-  it('starts another span when one would run over what a single call of the rates takes', () => {
-    expect(VALUE_DAYS_PER_RATE_CALL).toBeLessThan(3660);
-    const first = Date.parse('2005-01-01T00:00:00Z');
-    const day = (n: number): string => new Date(first + n * 86_400_000).toISOString().slice(0, 10);
-    const spans = rateSpans([
-      day(0),
-      day(100),
-      day(VALUE_DAYS_PER_RATE_CALL - 1),
-      day(VALUE_DAYS_PER_RATE_CALL),
-      day(7000),
-    ]);
-    expect(spans.map((s) => [s.from.toISOString().slice(0, 10), s.toExclusive.toISOString().slice(0, 10)])).toEqual([
-      [day(0), day(VALUE_DAYS_PER_RATE_CALL)],
-      [day(VALUE_DAYS_PER_RATE_CALL), day(VALUE_DAYS_PER_RATE_CALL + 1)],
-      [day(7000), day(7001)],
-    ]);
-    for (const s of spans) {
-      expect((s.toExclusive.getTime() - s.from.getTime()) / 86_400_000).toBeLessThanOrEqual(VALUE_DAYS_PER_RATE_CALL);
-    }
-  });
-});
-
 describe('toValueStats', () => {
   const input = (
-    days: [string, number][],
+    days: ([day: string, n: number] | [day: string, n: number, valueDay: string])[],
     balances: StoredBalance[],
     rate: StatsRates = new Map(),
   ): Parameters<typeof toValueStats>[0] =>
-    deepFreeze({ native: 'XRP', days: days.map(([day, n]) => ({ day, n })), balances, rates: rate });
+    deepFreeze({
+      native: 'XRP',
+      days: days.map(([day, n, valueDay]) => ({ day, n, ...(valueDay !== undefined && { valueDay }) })),
+      balances,
+      rates: rate,
+    });
 
   it('is {date, account_value, balance_change_count}, the value a string', () => {
     const rows = toValueStats(input([['2015-01-14', 3]], [native('2015-01-14', '12.5')]));
@@ -305,6 +269,39 @@ describe('toValueStats', () => {
       ),
     );
     expect(rows.map((r) => r.date)).toEqual(['2020-03-02T00:00:00Z', '2020-03-03T00:00:00Z']);
+  });
+
+  it('values the balances and the rates of the valueDay of a row, and dates the row by its day (a bucket)', () => {
+    // a month: the row is dated by its first day, valued at the end of its last
+    const rows = toValueStats(
+      input(
+        [['2020-02-01', 0, '2020-02-29']],
+        [native('', '10'), usd('', '8'), usd('2020-02-01', '12')],
+        rates({ [`USD.${ISSUER}`]: { '2020-02-01': '100', '2020-02-29': '4' } }),
+      ),
+    );
+    expect(rows).toEqual([{ date: '2020-02-01T00:00:00Z', account_value: '13', balance_change_count: 0 }]);
+    expect(Object.keys(rows[0])).toEqual(['date', 'account_value', 'balance_change_count']);
+  });
+
+  it('takes the balances of a label up to and including the day of the row, whatever its valueDay', () => {
+    const rows = toValueStats(
+      input(
+        [
+          ['2020-01-01', 1, '2020-01-31'],
+          ['2020-02-01', 0, '2020-02-29'],
+          ['2020-03-01', 2, '2020-03-31'],
+        ],
+        [native('', '1'), native('2020-01-01', '2'), native('2020-03-01', '5'), usd('2020-02-01', '8')],
+        rates({ [`USD.${ISSUER}`]: { '2020-01-31': '1', '2020-02-29': '4', '2020-03-31': '2' } }),
+      ),
+    );
+    // January: 2; February: 2 + 8 / 4; March: 5 + 8 / 2 (the balance carried from February)
+    expect(rows.map((r) => [r.date, r.account_value, r.balance_change_count])).toEqual([
+      ['2020-01-01T00:00:00Z', '2', 1],
+      ['2020-02-01T00:00:00Z', '4', 0],
+      ['2020-03-01T00:00:00Z', '9', 2],
+    ]);
   });
 
   it('is none for no days', () => {

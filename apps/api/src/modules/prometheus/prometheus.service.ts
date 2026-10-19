@@ -45,6 +45,13 @@ const ratesOnRead = new Counter({
   registers: [registry],
 });
 
+const accountDayGroups = new Counter({
+  name: 'api_account_day_groups_total',
+  help: 'Day-group reads by source (raw, rollup).',
+  labelNames: ['source'] as const,
+  registers: [registry],
+});
+
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
 nodeThrottle.on('pause', (pause: ThrottlePause) => nodeRateLimited.inc({ endpoint: pause.host }));
 
@@ -61,6 +68,8 @@ export class PrometheusService implements OnModuleInit {
   readonly nodeRateLimited = nodeRateLimited;
   /** Asset-days whose rate was computed on read, because the table had no valid set for the day (`DailyRates`). */
   readonly ratesOnReadTotal = ratesOnRead;
+  /** Day-group reads (`AccountDayGroupsService`) by the source they used: `raw` or `rollup`, one count per source per read. */
+  readonly accountDayGroupsTotal = accountDayGroups;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

@@ -1,7 +1,5 @@
-import { Asset, assetKey, ratio } from '@gatehub/data-api-shared';
+import { Asset, assetKey, DayRates, nativeValue } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
-import { QUOTIENT_DIGITS, ReportRates } from './account-report-object';
-import { DAY_MS } from './account-stats-window';
 
 /**
  * What one UTC day of `GET /v2/accounts/:address/stats/transactions` reads: the transactions the account sent that day
@@ -65,7 +63,7 @@ export interface StoredBalance {
 }
 
 /** The rate of each asset against the native currency for each day: `assetKey -> YYYY-MM-DD -> units per native coin`. */
-export type StatsRates = ReportRates;
+export type StatsRates = DayRates;
 
 const ZERO = new BigNumber(0);
 
@@ -86,41 +84,19 @@ export function ratedAssets(balances: StoredBalance[], native: string): Asset[] 
   return [...assets.values()];
 }
 
-/**
- * The most days one call of `RatesService.dailyNativeRates` is given. It refuses more than 3660 (ten years), and the
- * days of one page of values can lie further apart than that.
- */
-export const VALUE_DAYS_PER_RATE_CALL = 3000;
-
-/**
- * The runs of days to ask the rates for: `[from, toExclusive)` from the first of the days to the day after the last, a
- * new run when one would be more than `VALUE_DAYS_PER_RATE_CALL` days long. `days` are `YYYY-MM-DD`, oldest first.
- */
-export function rateSpans(days: string[]): { from: Date; toExclusive: Date }[] {
-  const spans: { from: Date; toExclusive: Date }[] = [];
-  let from: number | undefined;
-  let last = 0;
-  for (const day of days) {
-    const at = Date.parse(`${day}T00:00:00Z`);
-    if (from !== undefined && (at - from) / DAY_MS >= VALUE_DAYS_PER_RATE_CALL) {
-      spans.push({ from: new Date(from), toExclusive: new Date(last + DAY_MS) });
-      from = undefined;
-    }
-    from ??= at;
-    last = at;
-  }
-  if (from !== undefined) spans.push({ from: new Date(from), toExclusive: new Date(last + DAY_MS) });
-  return spans;
-}
-
 export interface ValueInput {
   /** The native currency of the network. */
   native: string;
-  /** The days of the rows, oldest first, each with the number of balance changes it had. */
-  days: { day: string; n: number }[];
+  /**
+   * The rows, oldest first, each with the number of balance changes it had. `day` is what dates the row and says which
+   * balances it has (those left on that day or before it, `YYYY-MM-DD`); `valueDay` is the day whose rates value it,
+   * `day` itself when it has none. A bucket of a week or a month is dated by its first day and valued on its last.
+   */
+  days: { day: string; n: number; valueDay?: string }[];
   /**
    * The last balance of every line on every day it changed, and (`day: ''`) before the first row. Days that are no row
    * are here too, for the lines they changed (a day that only paid the fee): their balances are carried to the next row.
+   * With buckets, `day` is the start of the bucket the balance was left in.
    */
   balances: StoredBalance[];
   rates: StatsRates;
@@ -129,7 +105,8 @@ export interface ValueInput {
 /**
  * The value of an account at the end of each of the days: what it holds in the native currency, plus what it holds of
  * each issued currency over that currency's rate of the day (how many units of it a native coin buys), as
- * `agg_account_balance_changes` had it.
+ * `agg_account_balance_changes` had it. A row with a `valueDay` is valued at the rates of that day (a bucket, valued at the
+ * end of its last day) and dated by its `day`.
  *
  * A line keeps the balance it was left with until a later day changes it, so a row is the whole account, not what
  * changed that day; the lines change from the balances before the first day. The native balance counts as it is. An
@@ -147,30 +124,25 @@ export function toValueStats(input: ValueInput): ValueStats[] {
   }
   const updateDays = [...byDay.keys()].filter((day) => day !== '').sort();
 
-  const lines = new Map<string, { balance: BigNumber; asset?: string }>();
+  const lines = new Map<string, { balance: BigNumber; asset: Asset }>();
   const apply = (updates: StoredBalance[] | undefined): void => {
     for (const b of updates ?? []) {
-      const line = isNative(b, input.native)
-        ? { balance: new BigNumber(b.balance) }
-        : { balance: new BigNumber(b.balance), asset: assetKey({ currency: b.currency, issuer: b.counterparty }) };
-      lines.set(`${b.currency}\u0000${b.counterparty}`, line);
+      // the issuer of what an account holds is the other side of its trust line; the native currency has none
+      const asset: Asset = isNative(b, input.native)
+        ? { currency: b.currency }
+        : { currency: b.currency, issuer: b.counterparty };
+      lines.set(`${b.currency}\u0000${b.counterparty}`, { balance: new BigNumber(b.balance), asset });
     }
   };
   apply(byDay.get(''));
 
   let next = 0;
-  return input.days.map(({ day, n }): ValueStats => {
+  return input.days.map(({ day, n, valueDay }): ValueStats => {
     for (; next < updateDays.length && updateDays[next] <= day; next++) apply(byDay.get(updateDays[next]));
 
     let total = ZERO;
     for (const { balance, asset } of lines.values()) {
-      if (!balance.gt(0)) continue;
-      if (asset === undefined) {
-        total = total.plus(balance);
-        continue;
-      }
-      const rate = input.rates.get(asset)?.get(day);
-      if (rate?.gt(0)) total = total.plus(ratio(balance, rate).precision(QUOTIENT_DIGITS));
+      if (balance.gt(0)) total = total.plus(nativeValue(balance, asset, valueDay ?? day, input.rates, input.native));
     }
     return { date: midnight(day), account_value: total.toString(), balance_change_count: n };
   });

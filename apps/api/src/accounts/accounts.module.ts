@@ -4,6 +4,7 @@ import { AccountBalanceChangesController } from './account-balance-changes.contr
 import { AccountBalanceChangesService } from './account-balance-changes.service';
 import { AccountBalancesController } from './account-balances.controller';
 import { AccountBalancesService } from './account-balances.service';
+import { AccountDayGroupsService } from './account-day-groups.service';
 import { AccountExchangesController } from './account-exchanges.controller';
 import { AccountExchangesService } from './account-exchanges.service';
 import { AccountOrdersController } from './account-orders.controller';
@@ -55,6 +56,7 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountOrdersService,
     AccountReportsService,
     AccountStatsService,
+    AccountDayGroupsService,
   ],
 })
 export class AccountsModule {}

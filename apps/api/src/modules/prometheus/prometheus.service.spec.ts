@@ -35,6 +35,17 @@ describe('PrometheusService', () => {
     expect(metrics).toContain('api_rates_on_read_total 3');
   });
 
+  it('counts the day-group reads by source, raw and rollup', async () => {
+    const service = new PrometheusService();
+    service.accountDayGroupsTotal.inc({ source: 'raw' });
+    service.accountDayGroupsTotal.inc({ source: 'rollup' }, 2);
+    const metrics = await service.getMetrics();
+    expect(metrics).toContain('# HELP api_account_day_groups_total Day-group reads by source (raw, rollup).');
+    expect(metrics).toContain('# TYPE api_account_day_groups_total counter');
+    expect(metrics).toContain('api_account_day_groups_total{source="raw"} 1');
+    expect(metrics).toContain('api_account_day_groups_total{source="rollup"} 2');
+  });
+
   it('counts every pause a rate-limited node asked for, by endpoint host (no credentials, no default port; ruling R98)', async () => {
     const service = new PrometheusService();
     service.onModuleInit();
