@@ -89,8 +89,9 @@ class PassLoop implements Loop {
  *   one ended, and a poll of the amendment features, followed by the update of the gauge of the amendments without
  *   metadata, at start and then every 10 min (spec 2.3). The two polls are timers of their own, so a slow node holds up
  *   neither; each never overlaps itself.
- * - the **compute loop** (`ComputeLoop`): once a minute the jobs that derive the votes and tallies of the amendment voting rounds
- *   from what is stored (`RoundsJob`, spec 2.4). Alongside it, in the background, the worker fills `validator_seen` from
+ * - the **compute loop** (`ComputeLoop`): once a minute the jobs that derive from what is stored the votes and tallies of the
+ *   amendment voting rounds (`RoundsJob`, spec 2.4) and the hourly agreement of the validators (`AgreementJob`, spec 2.5).
+ *   Alongside it, in the background, the worker fills `validator_seen` from
  *   `validations` when that was not done (`seedValidatorSeen`, spec 1.5): it neither delays nor fails the boot, a failure is
  *   logged (its message) and left for the next start, and a stop ends it between two partitions.
  *

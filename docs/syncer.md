@@ -316,7 +316,8 @@ section 2. Like every worker it is switched on and off with `GH_WORKERS`.
 timer; and a **compute loop**, once a minute, that runs two ClickHouse jobs in the aggregator's job model (a budget per job, a job
 that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher, the
 domain checker and the network state poller are the parts of the I/O loop that are in place, and the compute loop runs its `rounds`
-job ([voting rounds](#voting-rounds-and-tallies)); the rest joins the worker as it is built, started from the same bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
+job ([voting rounds](#voting-rounds-and-tallies)) and its `agreement` job ([hourly agreement](#hourly-agreement)); the rest joins the
+worker as it is built, started from the same bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
 private, loopback or reserved address, no redirect to one, 20 s, 1 MiB, 3 redirects), which also sends the `User-Agent`
 `gatehub-data-api/<version> (validators)`.
 
@@ -463,7 +464,7 @@ off in a test).
 ### Voting rounds and tallies
 
 The compute loop (`ComputeLoop`, `compute-loop.ts`) is the aggregator's job model without its file: once a minute it runs its jobs in
-order inside a tick of 20 s, each with a deadline of its own (`rounds` 5 s; `agreement` 10 s joins it later), so what has to run at
+order inside a tick of 20 s, each with a deadline of its own (`rounds` 5 s, `agreement` 10 s), so what has to run at
 every tick goes first and none takes the tick from the ones after it. A job that throws is logged (its message) and counted
 (`syncer_validators_jobs_total{job, outcome="error"}`, `ok` otherwise) and the next job still runs; a tick called while one runs is
 skipped with a warning; a stop aborts the signal of the tick, so that nothing more is written or started, and waits for it at most 2 s.
@@ -526,6 +527,49 @@ and left for the next start.
   excludes the members of the negative UNL, whose validations rippled discounts, from `n`, so `n` can be below the stored `observed`,
   which counts them.
 
+### Hourly agreement
+
+`AgreementJob` (`agreement.job.ts`, with the counting itself in the pure `agreement.ts`) writes `validator_agreement_hourly` (spec 2.5): per
+UTC hour, how many of the ledgers of the indexed validated chain each tracked validator agreed with, missed, or only partially validated.
+
+- **What counts.** The reference is `ledgers`, the chain the ingest committed. Only **full** validations agree. A ledger is **observed**
+  when full validations of its hash are recorded from at least quorum(h) members of UNL(h) (keys mapped to master keys through the manifest
+  map); a ledger with fewer recorded is **unobserved**: it is left out for everybody and counted in the hour's `unobserved`, so a collector
+  outage never shows as validators missing ledgers. UNL(h) is the trusted UNL at the end of the hour from every stored list of the
+  configured publishers (as in a voting round, each key a publisher served under was trusted in its time); nUNL(h) is the negative UNL of
+  the newest `network_state` row polled at or before that time (none: empty); quorum(h) = `quorumOf(|UNL|, |nUNL ∩ UNL|)`.
+- **Hours.** An hour is ready when it ended at least 10 minutes ago and the newest committed ledger closed at or after its end (the ingest
+  has passed it). Hours are computed oldest first, until the deadline of the job (10 s), because the tracked set carries from the hour
+  before. The first hour is the first whole hour at or after both the first ledger of `ledgers` and the oldest validation of the oldest
+  active partition of `validations` (`system.parts`); then always the hour after the newest stored one (its newest sentinel), so a
+  restart goes on where the last run ended. While no UNL is known (no list stored, or the threshold not met) nothing is computed, and
+  `Agreement: no UNL is known at the end of <hour>, the hour waits for a validator list` is logged once: an hour with an empty UNL would be
+  written final with nothing observed.
+- **A read.** One hour, or, from midnight UTC, a whole day when it ended more than 24 hours ago, is ready, and every hour of it has the
+  same UNL and quorum (a day that does not goes hour by hour; so do the hours before the first midnight). The hashes of the window come from a subquery on `ledgers` (the ledger-index
+  range of the window and its close times, one hash per hash, each with its hour: a day's 21,600 hashes would not fit the query string),
+  the validations from the rows received between 10 minutes before the window and 2 hours after it. The day's rows are the same as the
+  hours' one by one. "Heard in the hour" is the newest receipt of every validator among the validations received in the hour, of any ledger.
+- **An hour's rows** (`agreementRows`). Tracked validators: the UNL, those heard in the hour, and those of the hour before (the rows of
+  its newest sentinel's version, keys mapped through the manifest map) whose `last_seen` is no more than 24 hours before the end of the
+  hour, so a validator that goes quiet keeps missing ledgers for a day. Per tracked validator: `agreed` = observed ledgers with a full
+  validation of the hash by it, `partial` = observed ledgers with only a partial one, `missed` = observed - `agreed` (the partial ones
+  included), `last_seen` = the newest receipt known (the hour's, else the row before's, 0 for a UNL member never heard). The sentinel
+  (`validation_public_key ''`) holds `ledgers` (the observed ones), `unobserved`, `gaps`, `unl_size`, `quorum` and `final`.
+- **Gaps and `final`.** `gaps` counts the ledger indices missing in the hour, as spec 2.5 has it, and also those missing between the hour
+  and the nearest committed ledger before it and after it (an hour with no ledger counts the indices between its neighbours): a ledger
+  missing at the border of two hours keeps both of them from being final. This deliberately goes beyond the spec's formula (ADR-0012). An
+  hour with `gaps = 0` is written once, with `final = 1`, and never again. An hour with gaps is written with `final = 0` and recomputed,
+  as a new version, at most once an hour (by the age of its version) while `validations` still holds its validations (90 days), oldest
+  first and after the new hours of a run; filling the ledgers (a range ingest) is what makes it final. A recomputed hour does not change
+  the hours after it: what carries over is who was tracked, not what was counted.
+- **Version sets.** An hour is one `INSERT` under one `version` (wall-clock milliseconds, above any version stored for the hour), the
+  sentinel its last row. One insert is one part, so a reader never sees half an hour even when a recompute replaces rows of the old
+  version, and a reader keeps the rows of the newest sentinel's version of each hour. A shutdown stops the job between hours and before an
+  insert.
+- **Observability.** `syncer_validators_agreement_lag_seconds` is now minus the end of the newest final hour, set at the end of every run
+  (also one that failed or ran out of time), and not set while no hour is final.
+
 ## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
@@ -553,6 +597,8 @@ and left for the next start.
 | `Network state poll failed: <request>: ...`, `Amendment features poll failed: ...` | The node cannot be asked, times out (5 s), answers an error, or answers with something that cannot be stored | No row is written for that poll; the next one (60 s, or 10 min for the features) is the retry. Logged when the failure starts or changes, and `... recovered` once when it ends; counted in `syncer_validators_node_polls_total{outcome="error"}`. |
 | `Compute job <name> failed: ...` | A job of the compute loop threw (ClickHouse refusing a query or an insert, mostly) | Counted in `syncer_validators_jobs_total{outcome="error"}`; the other jobs of the tick still ran. The job runs again at the next tick from the newest stored round, and a round that was half written is redone as a newer set. |
 | `round <V>: recorded N of M UNL validations, below quorum Q` | The collector missed validations of the round (it was down or behind), the ingest lacks the voting ledger, or the UNL validators did not validate it | The round is recorded as it is, with `observed N`; the votes of the validators that were missed are carried from their last record (24 h). |
+| `Agreement: no UNL is known at the end of <hour>, the hour waits for a validator list` | No list of a configured publisher is stored (or too few agree for `GH_UNL_THRESHOLD`), so the UNL of the hour is empty | No hour is written, and the lag gauge of the agreement grows. Logged once; the hour is computed when a list is stored. |
+| `syncer_validators_agreement_lag_seconds` grows | The ingest is behind (an hour is ready when the newest committed ledger closed after its end), or the job fails (`Compute job agreement failed: ...`), or the budget of 10 s is spent on a backlog | Hours are done oldest first and the job resumes from the newest stored hour. An hour with a gap is `final = 0` and recomputed once an hour; the gauge counts from the newest final hour. |
 | `Seeding validator_seen failed: <message>; it is tried again at the next start` | ClickHouse refused a statement of the one-off seeding of `validator_seen` | The worker is booted and the compute loop runs. The partitions done stay; the next start seeds again until the oldest partition of `validations` is covered. |
 | `Skipping a compute tick: ...`, `Abandoning the compute tick in flight: ...` | A tick took longer than a minute, or did not end within 2 s of the shutdown | The tick was skipped, or was left to finish by itself (it was told to write nothing more). |
 | `amendment <ID> has no metadata entry` | The node, the ledger or the votes name an amendment that the amendment metadata lacks | Warned once per ID; `syncer_amendments_without_metadata` counts them. Add the entry (`amendments:check` lists them). |
@@ -565,7 +611,7 @@ and left for the next start.
 | `apps/syncer/src/ingest/{live-runner,rpc-ledger-source}.ts` | The ingest worker and its ledger source |
 | `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
-| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `compute-loop`, `rounds.job` and `tally` (the compute loop, the voting rounds and the pure tally), `seen-seed`, `stored-lists`, `safe-fetch` (the only outbound HTTP) |
+| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `compute-loop`, `rounds.job` and `tally` (the compute loop, the voting rounds and the pure tally), `agreement.job` and `agreement` (the hourly agreement and its pure counting), `seen-seed`, `stored-lists`, `safe-fetch` (the only outbound HTTP) |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
 | `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |

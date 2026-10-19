@@ -16,6 +16,7 @@ import { startClickHouse } from '../../../../packages/shared/test/clickhouse-con
 import { SyncerConfig, WorkerName } from '../../src/config/syncer.config';
 import { SyncerCoreModule } from '../../src/core/syncer-core.module';
 import { PrometheusService } from '../../src/modules/prometheus/prometheus.service';
+import { AgreementJob } from '../../src/validators/agreement.job';
 import { ComputeLoop } from '../../src/validators/compute-loop';
 import { DomainChecker } from '../../src/validators/domain-checker';
 import { NetworkStatePoller } from '../../src/validators/network-state-poller';
@@ -55,9 +56,9 @@ import { TEST_TLS } from './tls';
  *                                      client made when `needsNodeClient` says so), booted as the application does: the
  *                                      result holds the app, the `UnlFetcher`, the `DomainChecker` (a test that switches
  *                                      its loop off with `worker.start.domains = false` makes the passes itself), the
- *                                      `NetworkStatePoller` (likewise with `worker.start.state = false`), the `RoundsJob`
- *                                      and the `ComputeLoop` (whose loop is OFF unless `worker.start.compute = true`: a
- *                                      test runs `rounds.run(tick)` itself), the
+ *                                      `NetworkStatePoller` (likewise with `worker.start.state = false`), the `RoundsJob`,
+ *                                      the `AgreementJob` and the `ComputeLoop` (whose loop is OFF unless
+ *                                      `worker.start.compute = true`: a test runs `rounds.run(tick)` itself), the
  *                                      metrics, and `stop()`. `options.config`
  *                                      overrides `SyncerConfig` (for instance `unlPublishers`), `options.worker` the
  *                                      `ValidatorsWorkerOptions` (`now`, `start`, ...; the `fetch` options of the web server
@@ -271,6 +272,7 @@ export interface ValidatorsApp {
   domains: DomainChecker;
   state: NetworkStatePoller;
   rounds: RoundsJob;
+  agreement: AgreementJob;
   compute: ComputeLoop;
   metrics: PrometheusService;
   stop(): Promise<void>;
@@ -347,6 +349,7 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
     domains: app.get(DomainChecker),
     state: app.get(NetworkStatePoller),
     rounds: app.get(RoundsJob),
+    agreement: app.get(AgreementJob),
     compute: app.get(ComputeLoop),
     metrics: app.get(PrometheusService),
     stop: () => app.close(),
@@ -362,6 +365,7 @@ export const VALIDATORS_METRICS = [
   'validatorsNodePollsTotal',
   'validatorsJobsTotal',
   'validatorsRoundsLagLedgers',
+  'validatorsAgreementLagSeconds',
   'amendmentsWithoutMetadata',
 ] as const;
 

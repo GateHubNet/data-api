@@ -4,6 +4,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { join } from 'path';
 import { NETWORK_PROFILE, NODE_CLIENT, SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { AgreementJob } from './agreement.job';
 import { ComputeLoop } from './compute-loop';
 import { NetworkStatePoller } from './network-state-poller';
 import { RoundsJob } from './rounds.job';
@@ -52,10 +53,17 @@ describe('ValidatorsModule', () => {
     expect(moduleRef.get(NetworkStatePoller)).toBeInstanceOf(NetworkStatePoller);
   });
 
-  it('provides the rounds job and the compute loop', async () => {
+  it('provides the rounds job, the agreement job and the compute loop', async () => {
     const moduleRef = await build('xrpl', '');
     expect(moduleRef.get(RoundsJob)).toBeInstanceOf(RoundsJob);
+    expect(moduleRef.get(AgreementJob)).toBeInstanceOf(AgreementJob);
     expect(moduleRef.get(ComputeLoop)).toBeInstanceOf(ComputeLoop);
+  });
+
+  it('runs the compute loop with the rounds job and then the agreement job', async () => {
+    const moduleRef = await build('xrpl', '');
+    const jobs = (moduleRef.get(ComputeLoop) as unknown as { jobs: Array<{ name: string }> }).jobs;
+    expect(jobs.map((job) => job.name)).toEqual(['rounds', 'agreement']);
   });
 
   describe('AMENDMENTS_CONFIG', () => {

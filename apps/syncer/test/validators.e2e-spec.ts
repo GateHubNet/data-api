@@ -23,6 +23,7 @@ import {
 } from '../../../packages/shared/src/test-utils/validator-keys';
 import { SyncerConfig } from '../src/config/syncer.config';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
+import { AgreementJob } from '../src/validators/agreement.job';
 import { ComputeTick } from '../src/validators/compute-loop';
 import { NetworkStatePoller } from '../src/validators/network-state-poller';
 import { RoundsJob } from '../src/validators/rounds.job';
@@ -44,7 +45,7 @@ import {
   ValidatorsAppOptions,
   waitFor,
 } from './support/validators-env';
-import { syntheticChain, syntheticHash } from './synthetic-chain';
+import { range, syntheticChain, syntheticHash } from './synthetic-chain';
 
 /**
  * The validators worker against a real ClickHouse, a node and an HTTPS publisher (`https://unl.example`) that serve
@@ -181,6 +182,17 @@ describe('the validators worker (e2e)', () => {
     return values
       .filter((v) => v.labels.publisher === publisher && v.labels.outcome === outcome)
       .reduce((n, v) => n + v.value, 0);
+  }
+
+  /**
+   * Resolves when the tick the compute loop makes at start is over: the loop counts a job when it has returned and the
+   * `agreement` job is the last of the tick. A test that starts the loop waits for it, so that nothing of the tick is
+   * under way, against ClickHouse, when the application is closed.
+   */
+  async function tickEnded(app: ValidatorsApp): Promise<void> {
+    await waitFor('the tick of the compute loop to end', async () =>
+      (await app.metrics.validatorsJobsTotal.get()).values.some((v) => v.labels.job === 'agreement' && v.value >= 1),
+    );
   }
 
   /** Resolves when the fetch the worker makes at start is done and counted (the loop runs on its own after boot). */
@@ -3066,12 +3078,13 @@ describe('the validators worker (e2e)', () => {
       await validateAll(R1, [AM_A]);
       await validateAll(R2, [AM_A]);
       const lines: string[] = [];
-      await boot(PUBLISHERS, {
+      const app = await boot(PUBLISHERS, {
         start: { unl: false, domains: false, state: false, compute: true },
         logger: { log: () => undefined, warn: (line: string) => void lines.push(line), error: () => undefined },
       });
 
       await waitFor('both rounds', async () => (await sentinelsOf()).length >= 2);
+      await tickEnded(app);
       expect(seeding).toHaveBeenCalledTimes(1);
       expect(lines).toEqual(['Seeding validator_seen failed: seed down; it is tried again at the next start']);
       expect(await seenRows()).toEqual([]);
@@ -3091,10 +3104,1012 @@ describe('the validators worker (e2e)', () => {
           .reduce((n, v) => n + v.value, 0);
       await waitFor('the run to be counted', async () => (await counted('ok')) >= 1);
       expect(await counted('error')).toBe(0);
+      await tickEnded(app);
       const seen = await db.ch.query<{ key: string }>(
         `SELECT validation_public_key AS key FROM ${Table.ValidatorSeen} GROUP BY validation_public_key ORDER BY key`,
       );
       expect(seen.map((r) => r.key)).toEqual(UNL_KEYS);
+    });
+  });
+
+  describe('hourly agreement', () => {
+    const ctx = parseContextFor(getNetworkProfile('xrpl'));
+    const HOUR = 3600;
+    const [K1, K2, K3, K4, K5, OUT, GONE] = ['k1', 'k2', 'k3', 'k4', 'k5', 'out', 'gone'].map((label) =>
+      testKey(`agreement-${label}`),
+    );
+    const K2_SIGNING = testKey('agreement-k2-signing');
+    /** The UNL of the tests: five validators, so that a ledger needs the full validations of four of them (quorum 4). */
+    const UNL = [K1, K2, K3, K4, K5];
+    /** Everybody who signs: the UNL, one validator that is not on it, and one that is quiet after the first 120 ledgers. */
+    const SIGNERS = [...UNL, OUT, GONE];
+    const BY_BASE58 = new Map(SIGNERS.map((key) => [key.base58, key]));
+
+    /** Where a chain starts (unix seconds), the index of its first ledger and how far apart its ledgers close. */
+    interface Chain {
+      first: number;
+      start: number;
+      step: number;
+    }
+    /** Six hours back, on an hour boundary: three hours are over by far, and the ledgers go past all of them. */
+    const H0 = Math.floor(nowSeconds() / HOUR) * HOUR - 6 * HOUR;
+    /** Ledgers 30 s apart, 120 an hour. */
+    const MAIN: Chain = { first: 5000, start: H0, step: 30 };
+    /** Three hours and the first ledgers of the fourth, which is not over for the ingest: hours 0, 1 and 2 are ready. */
+    const MAIN_COUNT = 3 * 120 + 3;
+    const hourOf = (hour: number) => H0 + hour * HOUR;
+    const closeOf = (chain: Chain, n: number) => chain.start + n * chain.step;
+
+    type Signed = 'full' | 'partial' | 'none';
+    /**
+     * What a validator does with the n-th ledger of a chain. The patterns make ledgers that nobody is blamed for (50 and 51: only
+     * three UNL validations), validators that miss (K2), sign partially (K3, and the one that is not on the UNL) and go quiet.
+     * Before the chain (negative n) only K1 signs: the collector ran before the ledgers were indexed.
+     */
+    function signed(key: TestKey, n: number): Signed {
+      if (n < 0) return key === K1 ? 'full' : 'none';
+      switch (key) {
+        case K2:
+          return n % 7 === 3 ? 'none' : 'full';
+        case K3:
+          return n % 11 === 5 ? 'partial' : 'full';
+        case K4:
+        case K5:
+          return n === 50 || n === 51 ? 'none' : 'full';
+        case OUT:
+          return n % 3 === 0 ? 'full' : n % 3 === 1 ? 'partial' : 'none';
+        case GONE:
+          return n < 120 && n % 2 === 0 ? 'full' : 'none';
+        default:
+          return 'full';
+      }
+    }
+
+    /** What an hour should hold, by counting: `ns` are the numbers of its ledgers that are in `ledgers`. */
+    function expected(ns: number[], quorum = 4, unl: TestKey[] = UNL) {
+      const observed = ns.filter((n) => unl.filter((key) => signed(key, n) === 'full').length >= quorum);
+      const perKey = new Map(
+        SIGNERS.map((key) => {
+          const agreed = observed.filter((n) => signed(key, n) === 'full').length;
+          const partial = observed.filter((n) => signed(key, n) === 'partial').length;
+          return [key.base58, { agreed, partial, missed: observed.length - agreed }] as const;
+        }),
+      );
+      return { observed: observed.length, unobserved: ns.length - observed.length, perKey };
+    }
+
+    interface Counts {
+      /** The ledgers 0 .. count - 1 are written. Default `MAIN_COUNT`. */
+      count?: number;
+      /** The numbers of the ledgers the ingest lacks. */
+      skip?: number[];
+    }
+
+    interface Fixture extends Counts {
+      chain?: Chain;
+    }
+
+    /** The numbers of the ledgers of the hour that starts at `hourStart`. */
+    const ledgersOf = (chain: Chain, hourStart: number, o: Counts) =>
+      range(0, (o.count ?? MAIN_COUNT) - 1).filter(
+        (n) => !(o.skip ?? []).includes(n) && closeOf(chain, n) >= hourStart && closeOf(chain, n) < hourStart + HOUR,
+      );
+
+    /** The newest receipt of `key` before `end`, in ms: validations are received 3.5 s after their ledger closed. */
+    function lastSeenMs(chain: Chain, key: TestKey, end: number, count: number): number {
+      let best = 0;
+      for (let n = -2; n < count; n++) {
+        const at = closeOf(chain, n) + 3.5;
+        if (at < end && signed(key, n) !== 'none') best = Math.max(best, at);
+      }
+      return Math.round(best * 1000);
+    }
+
+    interface AgreementOut {
+      hour_ts: number;
+      key: string;
+      agreed: number;
+      missed: number;
+      partial: number;
+      last_ms: number | string;
+      ledgers: number;
+      unobserved: number;
+      gaps: number;
+      unl_size: number;
+      quorum: number;
+      final: number;
+      version: string;
+    }
+
+    const COLUMNS = `toUnixTimestamp(hour) AS hour_ts, validation_public_key AS key, agreed, missed, partial,
+              toUnixTimestamp64Milli(last_seen) AS last_ms, ledgers, unobserved, gaps, unl_size, quorum, final,
+              toString(version) AS version`;
+
+    /** Every row stored, the older versions of an hour too. */
+    const storedRows = () =>
+      db.ch.query<AgreementOut>(`SELECT ${COLUMNS} FROM ${Table.ValidatorAgreementHourly} ORDER BY hour, key, version`);
+
+    /** The rows a reader takes: for each hour those of the version of its newest sentinel. */
+    const currentRows = () =>
+      db.ch.query<AgreementOut>(
+        `SELECT ${COLUMNS} FROM ${Table.ValidatorAgreementHourly}
+          WHERE (hour, version) IN (SELECT hour, max(version) FROM ${Table.ValidatorAgreementHourly}
+                                     WHERE validation_public_key = '' GROUP BY hour)
+          ORDER BY hour, key`,
+      );
+
+    const sentinelsOf = (rows: AgreementOut[]) => rows.filter((row) => row.key === '');
+    const hoursOf = (rows: AgreementOut[]) => sentinelsOf(rows).map((row) => row.hour_ts);
+    const versionOf = (rows: AgreementOut[], hourStart: number) =>
+      Number(sentinelsOf(rows).find((row) => row.hour_ts === hourStart)?.version);
+
+    /** Checks the rows of one hour against the count of the model. */
+    function expectHour(
+      rows: AgreementOut[],
+      chain: Chain,
+      hourStart: number,
+      o: Counts & { quorum?: number; unl?: TestKey[]; gaps?: number; final?: number; keys?: TestKey[] },
+    ): void {
+      const unl = o.unl ?? UNL;
+      const quorum = o.quorum ?? 4;
+      const model = expected(ledgersOf(chain, hourStart, o), quorum, unl);
+      const mine = rows.filter((row) => row.hour_ts === hourStart);
+      expect(mine.find((row) => row.key === '')).toMatchObject({
+        ledgers: model.observed,
+        unobserved: model.unobserved,
+        gaps: o.gaps ?? 0,
+        unl_size: unl.length,
+        quorum,
+        final: o.final ?? 1,
+      });
+      const tracked = mine.filter((row) => row.key !== '');
+      expect(tracked.map((row) => row.key)).toEqual((o.keys ?? SIGNERS).map((key) => key.base58).sort());
+      for (const row of tracked) {
+        expect({ key: row.key, agreed: row.agreed, partial: row.partial, missed: row.missed }).toEqual({
+          key: row.key,
+          ...model.perKey.get(row.key),
+        });
+        const key = BY_BASE58.get(row.key) as TestKey;
+        expect({ key: row.key, last_ms: Number(row.last_ms) }).toEqual({
+          key: row.key,
+          last_ms: lastSeenMs(chain, key, hourStart + HOUR, o.count ?? MAIN_COUNT),
+        });
+      }
+    }
+
+    /** The tables the agreement reads and writes, and the ledger tables and the loops' own the tests write. */
+    const TABLES = [
+      Table.Ledgers,
+      Table.LedgerByHash,
+      Table.Transactions,
+      Table.TxByType,
+      Table.Validations,
+      Table.ValidatorSeen,
+      Table.ValidatorVotes,
+      Table.AmendmentTallies,
+      Table.NetworkState,
+      Table.ValidatorAgreementHourly,
+    ];
+
+    /** The log lines of the jobs of the test. */
+    let lines: string[] = [];
+
+    /** A `network_state` row polled at `polledAt` (unix seconds) with the given negative UNL. */
+    const networkState = (ledger: number, polledAt: number, negative: TestKey[]): NetworkStateRow => ({
+      ledger_index: ledger,
+      ledger_hash: '',
+      polled_at: polledAt,
+      amendments: [],
+      majorities: [],
+      negative_unl: negative.map((key) => ({ validation_public_key: key.base58, first_ledger: 1 })),
+      to_disable: '',
+      to_reenable: '',
+      base_fee: '10',
+      reserve_base: '1000000',
+      reserve_inc: '200000',
+      node_quorum: 0,
+    });
+
+    beforeEach(async () => {
+      lines = [];
+      for (const table of TABLES) await db.ch.command(`TRUNCATE TABLE ${table}`);
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    /** A list of the publisher the job is configured with. Fetched now, so every hour of the past reads this one list. */
+    const seedList = (
+      validators: TestKey[] = UNL,
+      o: { sequence?: number; fetchedAt?: number; effective?: number | null } = {},
+    ) =>
+      db.ch.insert(Table.UnlLists, [
+        {
+          publisher: ID,
+          publisher_key: PUBLISHER.publicKeyHex,
+          sequence: o.sequence ?? 3,
+          version: 1,
+          effective: o.effective ?? null,
+          expiration: nowSeconds() + 30 * DAY,
+          validators: validators.map((key) => key.base58).sort(),
+          blob_sha256: 'AB',
+          fetched_at: o.fetchedAt ?? nowSeconds(),
+          response: '{}',
+        },
+      ]);
+
+    /** Writes the ledgers `from .. to - 1` of a chain through the real ledger writer, without the numbers in `skip`. */
+    async function writeChain(chain: Chain, from: number, to: number, skip: number[] = []): Promise<void> {
+      const ledgers = syntheticChain(chain.first + from, to - from, {
+        closeTime: (index) => closeOf(chain, index - chain.first),
+      })
+        .filter((ledger) => !skip.includes(ledger.index - chain.first))
+        .map((ledger) => ledger.raw);
+      await new LedgerWriter(db.ch, ctx).write(ledgers);
+    }
+
+    /** The validation of the n-th ledger of a chain that `key` (a base58 key, as recorded) sent, received 3.5 s after it closed. */
+    const validationRow = (chain: Chain, n: number, key: string, full: boolean, signing = ''): ValidationsRow => ({
+      ledger_hash: syntheticHash(chain.first + n),
+      validation_public_key: key,
+      count: 1,
+      first_datetime: closeOf(chain, n) + 3.5,
+      last_datetime: closeOf(chain, n) + 3.5,
+      ledger_index: chain.first + n,
+      reporter_public_key: '',
+      ephemeral_public_key: signing,
+      signature: '',
+      signing_time: 0,
+      flags: 0,
+      full: full ? 1 : 0,
+      amendments: '',
+      base_fee: null,
+      load_fee: null,
+      reserve_base: null,
+      reserve_inc: null,
+      server_version: null,
+    });
+
+    /**
+     * The validations of the ledgers `from .. to - 1` (negative numbers are before the chain), as the collector stores them;
+     * with `signingK2`, those of K2 under its signing key.
+     */
+    async function writeValidations(
+      chain: Chain,
+      from: number,
+      to: number,
+      o: { signingK2?: boolean } = {},
+    ): Promise<void> {
+      const rows: ValidationsRow[] = [];
+      for (let n = from; n < to; n++) {
+        for (const key of SIGNERS) {
+          const how = signed(key, n);
+          if (how === 'none') continue;
+          const under = o.signingK2 === true && key === K2;
+          rows.push(
+            under
+              ? validationRow(chain, n, K2_SIGNING.base58, how === 'full', K2_SIGNING.base58)
+              : validationRow(chain, n, key.base58, how === 'full'),
+          );
+        }
+      }
+      await db.ch.insert(Table.Validations, rows);
+    }
+
+    /** The list, the ledgers and the validations of a chain. */
+    async function seed(o: Fixture & { signingK2?: boolean } = {}): Promise<void> {
+      const chain = o.chain ?? MAIN;
+      const count = o.count ?? MAIN_COUNT;
+      await seedList();
+      await writeChain(chain, 0, count, o.skip);
+      await writeValidations(chain, -2, count, o);
+    }
+
+    /** The manifest that makes `K2_SIGNING` the signing key of `K2`. */
+    const seedK2Manifest = () =>
+      db.ch.insert(Table.ValidatorManifests, [
+        { ephemeral_key: K2_SIGNING.base58, master_key: K2.base58, seq: 1, domain: '', manifest: '', source: 'stream' },
+      ]);
+
+    /** A job of its own over the database of the test (a restart is another one). */
+    function makeJob(now?: () => number): AgreementJob {
+      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS });
+      const logger = {
+        log: (line: string) => void lines.push(line),
+        warn: (line: string) => void lines.push(line),
+        error: () => undefined,
+      };
+      return new AgreementJob(db.ch, cfg, new PrometheusService(), { now, logger });
+    }
+
+    /** The tick of a job at `ms`, with a minute to spare. */
+    const tickAt = (ms: number, signal: AbortSignal = new AbortController().signal): ComputeTick => ({
+      now: ms,
+      deadline: ms + 60_000,
+      signal,
+    });
+
+    /** Runs a job as if it were `ms` (unix milliseconds). */
+    const runAt = (ms: number) => makeJob(() => ms).run(tickAt(ms));
+
+    /** A whole second, so that a lag in seconds is exact. */
+    const wholeSecond = () => Math.floor(Date.now() / 1000) * 1000;
+
+    /** The inserts into the table of the agreement, one entry per call. */
+    const insertedHours = (insert: jest.SpyInstance) =>
+      insert.mock.calls
+        .filter(([table]) => table === Table.ValidatorAgreementHourly)
+        .map(([, rows]) => (rows as Array<{ hour: number }>)[0].hour);
+
+    const lagOf = async () => (await new PrometheusService().validatorsAgreementLagSeconds.get()).values[0]?.value;
+
+    it('computes final hours with agreed, missed and partial', async () => {
+      await seed();
+      const ms = wholeSecond();
+
+      await runAt(ms);
+
+      const rows = await currentRows();
+      expect(hoursOf(rows)).toEqual([0, 1, 2].map(hourOf));
+      for (const hour of [0, 1, 2]) expectHour(rows, MAIN, hourOf(hour), {});
+      // the counts above are not vacuous: ledgers nobody is blamed for, and validators that miss and sign partially
+      const first = rows.filter((row) => row.hour_ts === H0);
+      const valueOf = (key: TestKey, field: 'agreed' | 'missed' | 'partial') =>
+        first.find((row) => row.key === key.base58)?.[field];
+      expect(first.find((row) => row.key === '')).toMatchObject({
+        ledgers: 116,
+        unobserved: 4,
+        unl_size: 5,
+        quorum: 4,
+      });
+      expect(valueOf(K1, 'missed')).toBe(0);
+      expect(valueOf(K2, 'missed')).toBeGreaterThan(10);
+      expect(valueOf(K3, 'partial')).toBeGreaterThan(5);
+      expect(valueOf(OUT, 'partial')).toBeGreaterThan(30);
+      // the validator that went quiet after the first hour keeps its row for the next two hours (their counts and its last_seen
+      // are checked against the model above), missing every observed ledger
+      const quiet = rows.filter((row) => row.key === GONE.base58);
+      expect(quiet.map((row) => row.agreed > 0)).toEqual([true, false, false]);
+      // the hour after them is not over for the ingest
+      expect(hoursOf(rows)).not.toContain(hourOf(3));
+      // every row of an hour is of one version, a wall-clock time
+      for (const hour of [0, 1, 2]) {
+        expect(new Set(rows.filter((row) => row.hour_ts === hourOf(hour)).map((row) => row.version)).size).toBe(1);
+      }
+      expect(versionOf(rows, H0)).toBe(ms);
+      // the lag is now minus the end of the newest final hour
+      expect(await lagOf()).toBe(ms / 1000 - hourOf(3));
+    });
+
+    it('leaves a ledger with fewer than the quorum of recorded validations out for everybody', async () => {
+      await seed();
+
+      await runAt(Date.now());
+
+      const hour = (await currentRows()).filter((row) => row.hour_ts === H0);
+      // ledgers 50 and 51 have only three UNL validations (quorum 4): unobserved, and in nobody's missed
+      expect(hour.find((row) => row.key === '')?.unobserved).toBeGreaterThanOrEqual(2);
+      const k4 = hour.find((row) => row.key === K4.base58);
+      const sentinel = hour.find((row) => row.key === '');
+      expect(k4).toMatchObject({ agreed: sentinel?.ledgers, missed: 0 });
+    });
+
+    it('maps a signing-key validation to its master', async () => {
+      await seedK2Manifest();
+      await seed({ signingK2: true });
+
+      await runAt(Date.now());
+
+      const rows = await currentRows();
+      for (const hour of [0, 1, 2]) expectHour(rows, MAIN, hourOf(hour), {});
+      expect(rows.map((row) => row.key)).not.toContain(K2_SIGNING.base58);
+    });
+
+    it('counts a validator seen under its master and under its signing key once, and a full validation over a partial one', async () => {
+      await seedK2Manifest();
+      await seed({ signingK2: true });
+      // K2 is also recorded under its master: twice full (ledgers 1 and 2), and partial for ledger 4, which it signed fully
+      await db.ch.insert(Table.Validations, [
+        validationRow(MAIN, 1, K2.base58, true),
+        validationRow(MAIN, 2, K2.base58, true),
+        validationRow(MAIN, 4, K2.base58, false),
+      ]);
+
+      await runAt(Date.now());
+
+      for (const hour of [0, 1, 2]) expectHour(await currentRows(), MAIN, hourOf(hour), {});
+    });
+
+    describe('gaps', () => {
+      it('writes an hour with a gap as not final and recomputes it once the gap is filled', async () => {
+        const skip = [130];
+        await seed({ skip });
+        const ms = wholeSecond();
+        await runAt(ms);
+
+        const first = await currentRows();
+        expect(hoursOf(first)).toEqual([0, 1, 2].map(hourOf));
+        expectHour(first, MAIN, hourOf(0), {});
+        expectHour(first, MAIN, hourOf(1), { skip, gaps: 1, final: 0 });
+        expectHour(first, MAIN, hourOf(2), {});
+        const versions = [0, 1, 2].map((hour) => versionOf(first, hourOf(hour)));
+        // the lag is measured from the end of the newest final hour, the third, not from the hour with the gap
+        expect(await lagOf()).toBe(ms / 1000 - hourOf(3));
+
+        // the ingest fills the gap, but an hour is recomputed at most once an hour
+        await writeChain(MAIN, 130, 131);
+        const insert = jest.spyOn(db.ch, 'insert');
+        await runAt(versions[1] + 3_599_999);
+        expect(insertedHours(insert)).toEqual([]);
+
+        await runAt(versions[1] + 3_600_000);
+
+        expect(insertedHours(insert)).toEqual([hourOf(1)]);
+        const second = await currentRows();
+        expectHour(second, MAIN, hourOf(1), {});
+        expect(versionOf(second, hourOf(1))).toBe(versions[1] + 3_600_000);
+        // the final hours around it were not touched
+        expect(versionOf(second, hourOf(0))).toBe(versions[0]);
+        expect(versionOf(second, hourOf(2))).toBe(versions[2]);
+      });
+
+      it('recomputes a gap that stays once an hour, as a new version each time', async () => {
+        await seed({ skip: [130] });
+        await runAt(wholeSecond());
+        const v1 = versionOf(await currentRows(), hourOf(1));
+
+        await runAt(v1 + 3_600_000);
+        const v2 = versionOf(await currentRows(), hourOf(1));
+        expect(v2).toBe(v1 + 3_600_000);
+
+        const insert = jest.spyOn(db.ch, 'insert');
+        await runAt(v2 + 1000);
+        expect(insertedHours(insert)).toEqual([]);
+        await runAt(v2 + 3_600_000);
+        expect(insertedHours(insert)).toEqual([hourOf(1)]);
+        expectHour(await currentRows(), MAIN, hourOf(1), { skip: [130], gaps: 1, final: 0 });
+      });
+
+      it('recomputes the hours that are not final oldest first, as many as the tick has time for', async () => {
+        const skip = [10, 130];
+        await seed({ skip });
+        const ms = wholeSecond();
+        await runAt(ms);
+        expect(sentinelsOf(await currentRows()).map((row) => row.final)).toEqual([0, 0, 1]);
+        await writeChain(MAIN, 10, 11);
+        await writeChain(MAIN, 130, 131);
+        const insert = jest.spyOn(db.ch, 'insert');
+
+        // a clock that moves 600 ms each time it is read: the deadline is passed after the first hour
+        const later = ms + 3_600_000;
+        let reads = 0;
+        await makeJob(() => later + 600 * reads++).run({
+          now: later,
+          deadline: later + 1000,
+          signal: new AbortController().signal,
+        });
+
+        expect(insertedHours(insert)).toEqual([hourOf(0)]);
+        await runAt(later + 1);
+        expect(insertedHours(insert)).toEqual([hourOf(0), hourOf(1)]);
+        const rows = await currentRows();
+        for (const hour of [0, 1, 2]) expectHour(rows, MAIN, hourOf(hour), {});
+      });
+
+      it('counts the ledgers missing in an hour that has none, for it and the hours around it', async () => {
+        // the whole second hour (ledgers 120 to 239) is missing from the ingest, its validations are there
+        const skip = range(120, 239);
+        await seed({ skip });
+
+        await runAt(Date.now());
+
+        const rows = await currentRows();
+        for (const hour of [0, 1, 2]) expectHour(rows, MAIN, hourOf(hour), { skip, gaps: 120, final: 0 });
+        // nothing was observed in it, and the validators that were heard keep their rows
+        expect(rows.find((row) => row.hour_ts === hourOf(1) && row.key === '')).toMatchObject({
+          ledgers: 0,
+          unobserved: 0,
+        });
+      });
+
+      it('counts a ledger missing at the edge of an hour for the hour on both sides', async () => {
+        // ledger 120 is the first of hour 1: hour 0 lacks the one after it, hour 1 the one before it
+        const skip = [120];
+        await seed({ skip });
+
+        await runAt(Date.now());
+
+        const rows = await currentRows();
+        expectHour(rows, MAIN, hourOf(0), { skip, gaps: 1, final: 0 });
+        expectHour(rows, MAIN, hourOf(1), { skip, gaps: 1, final: 0 });
+        expectHour(rows, MAIN, hourOf(2), { skip, gaps: 0, final: 1 });
+      });
+    });
+
+    describe('which hours', () => {
+      it('waits for an hour until 10 minutes after its end and the ingest has passed it', async () => {
+        // the ingest is in the first hour: its newest ledger closed before the hour ended
+        await seed({ count: 119 });
+        await runAt(Date.now());
+        expect(await currentRows()).toEqual([]);
+
+        // the ingest passes the end of the hour (ledger 120 closes at it), the validations are all there
+        await writeChain(MAIN, 119, 121);
+        await writeValidations(MAIN, 119, 121);
+        await runAt(hourOf(1) * 1000 + 599_999);
+        expect(await currentRows()).toEqual([]);
+
+        await runAt(hourOf(1) * 1000 + 600_000);
+
+        expect(hoursOf(await currentRows())).toEqual([hourOf(0)]);
+        // the first hour was complete (its last ledger is 119 and the next is committed): final
+        expectHour(await currentRows(), MAIN, hourOf(0), { count: 121 });
+      });
+
+      it('computes the hours in order, each as it becomes ready', async () => {
+        await seed();
+
+        await runAt(hourOf(2) * 1000 + 600_000);
+
+        expect(hoursOf(await currentRows())).toEqual([hourOf(0), hourOf(1)]);
+        await runAt(hourOf(3) * 1000 + 599_000);
+        expect(hoursOf(await currentRows())).toEqual([hourOf(0), hourOf(1)]);
+        await runAt(hourOf(3) * 1000 + 600_000);
+        expect(hoursOf(await currentRows())).toEqual([hourOf(0), hourOf(1), hourOf(2)]);
+      });
+
+      it('starts no hour once the deadline of the tick has passed, and the next tick goes on', async () => {
+        await seed();
+        // a clock that moves a second each time it is read: the deadline is passed after the first hour
+        const start = Date.now();
+        let reads = 0;
+        const job = makeJob(() => start + 1000 * reads++);
+
+        await job.run({ now: start, deadline: start + 500, signal: new AbortController().signal });
+
+        expect(hoursOf(await currentRows())).toEqual([hourOf(0)]);
+        // the lag shows the hours that are left
+        expect(await lagOf()).toBe(Math.floor(start / 1000) - hourOf(1));
+        await runAt(Date.now());
+        expect(hoursOf(await currentRows())).toEqual([0, 1, 2].map(hourOf));
+      });
+
+      it('starts at the first whole hour after both the oldest validation and the first ledger', async () => {
+        // the ledgers and the validations start 10 minutes into the first hour
+        const shifted: Chain = { first: 5000, start: H0 + 600, step: 30 };
+        await seed({ chain: shifted, count: 345 });
+
+        await runAt(Date.now());
+
+        const rows = await currentRows();
+        expect(hoursOf(rows)).toEqual([hourOf(1), hourOf(2)]);
+        expectHour(rows, shifted, hourOf(1), { count: 345 });
+        expectHour(rows, shifted, hourOf(2), { count: 345 });
+        expect(lines.filter((line) => line.includes(new Date(hourOf(1) * 1000).toISOString()))).toHaveLength(1);
+      });
+
+      it('starts after the oldest validation when the ledgers go back further', async () => {
+        await seedList();
+        await writeChain(MAIN, 0, MAIN_COUNT);
+        // the collector began 5 minutes into the first hour
+        await writeValidations(MAIN, 10, MAIN_COUNT);
+
+        await runAt(Date.now());
+
+        expect(hoursOf(await currentRows())).toEqual([hourOf(1), hourOf(2)]);
+      });
+
+      it('does nothing while there are no validations, or no ledgers', async () => {
+        await seedList();
+        await writeChain(MAIN, 0, MAIN_COUNT);
+        await runAt(Date.now());
+        expect(await storedRows()).toEqual([]);
+
+        await db.ch.command(`TRUNCATE TABLE ${Table.Ledgers}`);
+        await writeValidations(MAIN, -2, MAIN_COUNT);
+        await runAt(Date.now());
+        expect(await storedRows()).toEqual([]);
+      });
+
+      it('writes nothing while no UNL is known, and the hours when one is', async () => {
+        await writeChain(MAIN, 0, MAIN_COUNT);
+        await writeValidations(MAIN, -2, MAIN_COUNT);
+        await runAt(Date.now());
+        expect(await storedRows()).toEqual([]);
+
+        await seedList();
+        await runAt(Date.now());
+        expect(hoursOf(await currentRows())).toEqual([0, 1, 2].map(hourOf));
+      });
+    });
+
+    describe('a day at a time', () => {
+      const DAY_START = Math.floor(nowSeconds() / DAY) * DAY - 3 * DAY;
+      /** Ledgers 10 minutes apart, six an hour, from midnight three days ago, and two of the next day. */
+      const DAY_CHAIN: Chain = { first: 9000, start: DAY_START, step: 600 };
+      const DAY_COUNT = 24 * 6 + 2;
+      const dayHour = (hour: number) => DAY_START + hour * HOUR;
+
+      /** How many reads of the agreement (the per-validator count and the observed count of a window) a job made. */
+      const agreementReads = (query: jest.SpyInstance) =>
+        query.mock.calls.filter(([, params]) => (params as Record<string, unknown> | undefined)?.quorum !== undefined)
+          .length;
+
+      /** The rows without the version (a wall-clock time), to compare two computations. */
+      const withoutVersion = (rows: AgreementOut[]) => rows.map(({ version, ...row }) => row);
+
+      it('computes a day per query while more than 24 hours behind', async () => {
+        // ledgers 60 to 65, the whole of hour 10, are missing from the ingest: the rows of the hours around it are in the day too
+        const skip = range(60, 65);
+        await seed({ chain: DAY_CHAIN, count: DAY_COUNT, skip });
+        const query = jest.spyOn(db.ch, 'query');
+
+        // the day ended more than 24 hours ago: one read of each kind for all of it
+        await runAt(Date.now());
+        expect(agreementReads(query)).toBe(2);
+        const byDay = await currentRows();
+        expect(hoursOf(byDay)).toEqual(range(0, 23).map(dayHour));
+
+        // the same data one day later than it ended is done hour by hour
+        await db.ch.command(`TRUNCATE TABLE ${Table.ValidatorAgreementHourly}`);
+        query.mockClear();
+        await runAt((dayHour(24) + 12 * HOUR) * 1000);
+        // (the hour with no ledger has nothing to read)
+        expect(agreementReads(query)).toBe(46);
+        const byHour = await currentRows();
+
+        expect(withoutVersion(byDay)).toEqual(withoutVersion(byHour));
+        for (const hour of [0, 8, 23]) expectHour(byDay, DAY_CHAIN, dayHour(hour), { count: DAY_COUNT, skip });
+        for (const hour of [9, 10, 11]) {
+          expectHour(byDay, DAY_CHAIN, dayHour(hour), { count: DAY_COUNT, skip, gaps: 6, final: 0 });
+        }
+        // the hour with the ledgers nobody could be blamed for (ledgers 50 and 51)
+        expect(byDay.find((row) => row.hour_ts === dayHour(8) && row.key === '')?.unobserved).toBe(2);
+      });
+
+      it('does not use a day the ingest has not passed the end of', async () => {
+        // the ingest has the first ten hours of the day only
+        const count = 10 * 6 + 2;
+        await seed({ chain: DAY_CHAIN, count });
+        const query = jest.spyOn(db.ch, 'query');
+
+        await runAt(Date.now());
+
+        expect(hoursOf(await currentRows())).toEqual(range(0, 9).map(dayHour));
+        expect(agreementReads(query)).toBe(20);
+      });
+
+      it('does not use a day for hours that do not begin at midnight', async () => {
+        // the chain begins five hours into the first day: those hours, and the hours of the day after it, go one by one
+        const late: Chain = { first: 9000, start: DAY_START + 5 * HOUR, step: 600 };
+        await seed({ chain: late, count: DAY_COUNT });
+        const query = jest.spyOn(db.ch, 'query');
+
+        await runAt(Date.now());
+
+        expect(hoursOf(await currentRows())).toEqual(range(5, 28).map(dayHour));
+        expect(agreementReads(query)).toBe(48);
+      });
+
+      it('goes hour by hour through a day whose UNL changes', async () => {
+        // the first list was fetched before the day began; the second is in force from noon on and names four validators
+        await seedList(UNL, { sequence: 3, fetchedAt: DAY_START - HOUR });
+        await seedList([K1, K2, K3, K4], {
+          sequence: 4,
+          effective: DAY_START + 12 * HOUR,
+          fetchedAt: DAY_START + 12 * HOUR,
+        });
+        await writeChain(DAY_CHAIN, 0, DAY_COUNT);
+        await writeValidations(DAY_CHAIN, -2, DAY_COUNT);
+        const query = jest.spyOn(db.ch, 'query');
+
+        await runAt(Date.now());
+
+        expect(agreementReads(query)).toBe(48);
+        const rows = await currentRows();
+        expect(sentinelsOf(rows).map((row) => row.unl_size)).toEqual([...Array(11).fill(5), ...Array(13).fill(4)]);
+        for (const hour of [3, 14]) {
+          expectHour(rows, DAY_CHAIN, dayHour(hour), {
+            count: DAY_COUNT,
+            unl: hour < 11 ? UNL : [K1, K2, K3, K4],
+          });
+        }
+      });
+
+      it('goes hour by hour through a day whose quorum changes', async () => {
+        await seed({ chain: DAY_CHAIN, count: DAY_COUNT });
+        // two members of the UNL go on the negative UNL at noon: the quorum is 3 from then on
+        await db.ch.insert(Table.NetworkState, [networkState(1, DAY_START + 12 * HOUR - 60, [K4, K5])]);
+        const query = jest.spyOn(db.ch, 'query');
+
+        await runAt(Date.now());
+
+        expect(agreementReads(query)).toBe(48);
+        expect(sentinelsOf(await currentRows()).map((row) => row.quorum)).toEqual([
+          ...Array(11).fill(4),
+          ...Array(13).fill(3),
+        ]);
+      });
+
+      it('uses a day only when it ended more than 24 hours ago', async () => {
+        await seed({ chain: DAY_CHAIN, count: DAY_COUNT });
+        const query = jest.spyOn(db.ch, 'query');
+
+        await runAt((dayHour(24) + 24 * HOUR) * 1000);
+        expect(agreementReads(query)).toBe(48);
+        // one second more than 24 hours after the end of the day
+        await db.ch.command(`TRUNCATE TABLE ${Table.ValidatorAgreementHourly}`);
+        query.mockClear();
+        await runAt((dayHour(24) + 24 * HOUR + 1) * 1000);
+        expect(agreementReads(query)).toBe(2);
+      });
+    });
+
+    it('resumes after a restart without rewriting final hours', async () => {
+      await seed();
+      await runAt(wholeSecond());
+      const before = await currentRows();
+      expect(hoursOf(before)).toEqual([0, 1, 2].map(hourOf));
+
+      // a new job (a restart) finds nothing to do, though the hours were written long enough ago to be recomputed if they were not final
+      const insert = jest.spyOn(db.ch, 'insert');
+      await runAt(Date.now() + 2 * HOUR * 1000);
+      expect(insertedHours(insert)).toEqual([]);
+
+      // the ingest and the collector move on: the new job computes the hour that is over now, and only that
+      const count = 4 * 120 + 3;
+      await writeChain(MAIN, MAIN_COUNT, count);
+      await writeValidations(MAIN, MAIN_COUNT, count);
+      await runAt(Date.now() + 2 * HOUR * 1000 + 10_000);
+
+      expect(insertedHours(insert)).toEqual([hourOf(3)]);
+      const after = await currentRows();
+      expect(hoursOf(after)).toEqual([0, 1, 2, 3].map(hourOf));
+      for (const hour of [0, 1, 2]) {
+        expect(after.filter((row) => row.hour_ts === hourOf(hour))).toEqual(
+          before.filter((row) => row.hour_ts === hourOf(hour)),
+        );
+      }
+      expectHour(after, MAIN, hourOf(3), { count });
+    });
+
+    it('goes on from the newest stored hour with the tracked validators of its newest version only', async () => {
+      await seed();
+      const [QUIET, STALE, ORPHAN] = ['quiet', 'stale', 'orphan'].map((label) => testKey(`agreement-${label}`));
+      const before = hourOf(-1);
+      const row = (key: string, version: number, over: Partial<AgreementOut> = {}) => ({
+        hour: before,
+        validation_public_key: key,
+        agreed: 4,
+        missed: 1,
+        partial: 0,
+        last_seen: before + 10.5,
+        ledgers: 0,
+        unobserved: 0,
+        gaps: 0,
+        unl_size: 0,
+        quorum: 0,
+        final: 0,
+        version,
+        ...over,
+      });
+      await db.ch.insert(Table.ValidatorAgreementHourly, [
+        // the set of the newest sentinel
+        row(QUIET.base58, 5000),
+        row('', 5000, { ledgers: 9, unl_size: 5, quorum: 4, final: 1 }),
+        // an older set of the hour, with its sentinel, a validator the newer one does not have
+        row(STALE.base58, 4000),
+        row('', 4000, { ledgers: 9, unl_size: 5, quorum: 4, final: 1 }),
+        // rows of a set whose sentinel never arrived
+        row(ORPHAN.base58, 6000),
+      ]);
+
+      await runAt(Date.now());
+
+      const rows = await currentRows();
+      expect(hoursOf(rows)).toEqual([-1, 0, 1, 2].map(hourOf));
+      const keys = rows.filter((r) => r.hour_ts === H0 && r.key !== '').map((r) => r.key);
+      expect(keys).toContain(QUIET.base58);
+      expect(keys).not.toContain(STALE.base58);
+      expect(keys).not.toContain(ORPHAN.base58);
+      const carried = rows.find((r) => r.hour_ts === H0 && r.key === QUIET.base58);
+      const observed = rows.find((r) => r.hour_ts === H0 && r.key === '')?.ledgers;
+      expect(carried).toMatchObject({ agreed: 0, partial: 0, missed: observed });
+      expect(Number(carried?.last_ms)).toBe((before + 10.5) * 1000);
+    });
+
+    describe('the UNL and the negative UNL of an hour', () => {
+      const state = networkState;
+
+      it('takes the negative UNL of the newest state polled by the end of the hour', async () => {
+        await seed();
+        await db.ch.insert(Table.NetworkState, [
+          // in force for hour 0: two members of the UNL and one that is not on it
+          state(100, H0 + 1800, [K4, K5, OUT]),
+          // in force for hours 1 and 2: one member of the UNL and one that is not on it (counted, the quorum would be 3)
+          state(200, H0 + 5400, [K5, OUT]),
+          // polled after hour 2 ended: not for it
+          state(300, H0 + 3 * HOUR + 1800, [K3, K4, K5]),
+        ]);
+
+        await runAt(Date.now());
+
+        const rows = await currentRows();
+        expect(sentinelsOf(rows).map((row) => row.quorum)).toEqual([3, 4, 4]);
+        expectHour(rows, MAIN, hourOf(0), { quorum: 3 });
+        expectHour(rows, MAIN, hourOf(1), { quorum: 4 });
+        expectHour(rows, MAIN, hourOf(2), { quorum: 4 });
+      });
+
+      it('has no negative UNL before the first state was polled', async () => {
+        await seed();
+        await db.ch.insert(Table.NetworkState, [state(100, H0 + 3 * HOUR + 1, [K1, K2, K3, K4])]);
+
+        await runAt(Date.now());
+
+        expect(sentinelsOf(await currentRows()).map((row) => row.quorum)).toEqual([4, 4, 4]);
+      });
+
+      it('takes the UNL from the lists in force at the end of the hour', async () => {
+        // the first list was fetched before the first hour, the second is in force from the start of the second hour
+        await seedList([K1, K2, K3, K4, K5], { sequence: 3, fetchedAt: H0 - HOUR });
+        // in force a second after the end of the first hour: the UNL of an hour is the one in force at its end
+        await seedList([K1, K2, K3, K4], { sequence: 4, effective: hourOf(1) + 1, fetchedAt: hourOf(1) + 1 });
+        await writeChain(MAIN, 0, MAIN_COUNT);
+        await writeValidations(MAIN, -2, MAIN_COUNT);
+
+        await runAt(Date.now());
+
+        const rows = await currentRows();
+        expect(sentinelsOf(rows).map((row) => row.unl_size)).toEqual([5, 4, 4]);
+        expectHour(rows, MAIN, hourOf(0), {});
+        expectHour(rows, MAIN, hourOf(1), { unl: [K1, K2, K3, K4] });
+      });
+    });
+
+    describe('version sets', () => {
+      it('writes an hour in one insert, the sentinel last, under one version above any stored for the hour', async () => {
+        await seed();
+        // rows of a set a crash left without its sentinel, with a version from the future
+        const future = Date.now() + 3_600_000;
+        await db.ch.insert(Table.ValidatorAgreementHourly, [
+          {
+            hour: H0,
+            validation_public_key: OUT.base58,
+            agreed: 99,
+            missed: 99,
+            partial: 99,
+            last_seen: H0 + 1,
+            ledgers: 0,
+            unobserved: 0,
+            gaps: 0,
+            unl_size: 0,
+            quorum: 0,
+            final: 0,
+            version: future,
+          },
+        ]);
+        const insert = jest.spyOn(db.ch, 'insert');
+
+        await runAt(Date.now());
+
+        const calls = insert.mock.calls.filter(([table]) => table === Table.ValidatorAgreementHourly);
+        expect(calls).toHaveLength(3);
+        for (const [, rows] of calls) {
+          const written = rows as Array<{ validation_public_key: string; version: number }>;
+          expect(written[written.length - 1].validation_public_key).toBe('');
+          expect(written.slice(0, -1).every((row) => row.validation_public_key !== '')).toBe(true);
+          expect(new Set(written.map((row) => row.version)).size).toBe(1);
+        }
+        const rows = await currentRows();
+        expect(versionOf(rows, H0)).toBe(future + 1);
+        // the half-written row is of an older version than the sentinel's: it is not read
+        expectHour(rows, MAIN, H0, {});
+      });
+
+      it('writes nothing for a tick whose signal is already aborted', async () => {
+        await seed();
+        const controller = new AbortController();
+        controller.abort();
+        const insert = jest.spyOn(db.ch, 'insert');
+
+        await makeJob().run(tickAt(Date.now(), controller.signal));
+
+        expect(insert).not.toHaveBeenCalled();
+      });
+
+      it('stops between two hours when the shutdown comes, and goes on from there at the next run', async () => {
+        await seed();
+        const controller = new AbortController();
+        const real = db.ch.insert.bind(db.ch);
+        jest.spyOn(db.ch, 'insert').mockImplementation(async (table, rows, opts) => {
+          await real(table, rows, opts);
+          if (table === Table.ValidatorAgreementHourly) controller.abort();
+        });
+
+        await makeJob().run(tickAt(Date.now(), controller.signal));
+
+        // the hour written is whole, with its sentinel
+        const first = await currentRows();
+        expect(hoursOf(first)).toEqual([hourOf(0)]);
+        expectHour(first, MAIN, hourOf(0), {});
+        jest.restoreAllMocks();
+
+        await runAt(Date.now());
+
+        const rows = await currentRows();
+        expect(hoursOf(rows)).toEqual([0, 1, 2].map(hourOf));
+        expect(rows.filter((row) => row.hour_ts === hourOf(0))).toEqual(first);
+      });
+
+      it('writes no hour once the shutdown began before its insert', async () => {
+        await seed();
+        const controller = new AbortController();
+        const real = db.ch.query.bind(db.ch);
+        // the shutdown comes while the first hour is being read
+        jest.spyOn(db.ch, 'query').mockImplementation(((...args: Parameters<typeof real>) =>
+          real(...args).then((rows) => {
+            if (args[1]?.quorum !== undefined) controller.abort();
+            return rows;
+          })) as never);
+        const insert = jest.spyOn(db.ch, 'insert');
+
+        await makeJob().run(tickAt(Date.now(), controller.signal));
+
+        expect(insertedHours(insert)).toEqual([]);
+      });
+    });
+
+    describe('while validations holds the hour', () => {
+      it('recomputes a stored hour that is not final, and leaves one that validations no longer holds', async () => {
+        await seed();
+        const old = Math.floor(nowSeconds() / HOUR) * HOUR - 48 * HOUR;
+        const ancient = Math.floor(nowSeconds() / HOUR) * HOUR - 100 * 24 * HOUR;
+        const sentinel = (hour: number, final: number) => ({
+          hour,
+          validation_public_key: '',
+          agreed: 0,
+          missed: 0,
+          partial: 0,
+          last_seen: 0,
+          ledgers: 0,
+          unobserved: 0,
+          gaps: 1,
+          unl_size: 5,
+          quorum: 4,
+          final,
+          version: 1000,
+        });
+        // the hour before the first one the job computes is final, so the job goes on from H0
+        await db.ch.insert(Table.ValidatorAgreementHourly, [
+          sentinel(hourOf(-1), 1),
+          sentinel(old, 0),
+          sentinel(ancient, 0),
+        ]);
+
+        await runAt(Date.now());
+
+        const rows = await currentRows();
+        expect(versionOf(rows, ancient)).toBe(1000);
+        expect(sentinelsOf(rows).find((row) => row.hour_ts === ancient)?.final).toBe(0);
+        expect(versionOf(rows, old)).toBeGreaterThan(1000);
+        expect(hoursOf(rows).filter((hour) => hour >= H0)).toEqual([0, 1, 2].map(hourOf));
+      });
+    });
+
+    it('is run by the compute loop', async () => {
+      await seed();
+      const app = await boot(PUBLISHERS, { start: { unl: false, domains: false, state: false, compute: true } });
+
+      await waitFor('the three hours', async () => hoursOf(await currentRows()).length >= 3);
+      const counted = async (job: string, outcome: string) =>
+        (await app.metrics.validatorsJobsTotal.get()).values
+          .filter((v) => v.labels.job === job && v.labels.outcome === outcome)
+          .reduce((n, v) => n + v.value, 0);
+      await waitFor('the run to be counted', async () => (await counted('agreement', 'ok')) >= 1);
+      expect(await counted('agreement', 'error')).toBe(0);
+      expect(await counted('rounds', 'ok')).toBeGreaterThanOrEqual(1);
     });
   });
 });

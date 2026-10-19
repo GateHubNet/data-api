@@ -29,8 +29,8 @@ export const ROUNDS_BUDGET_MS = 5_000;
 /** Ledgers between voting ledgers (the flag interval of both networks). */
 const ROUND_STRIDE = 256;
 
-/** How long `validations` keeps a validation (the TTL of `001_baseline.sql`): older rounds cannot be counted again. */
-const VALIDATIONS_RETENTION_SECONDS = 90 * 86_400;
+/** How long `validations` keeps a validation (the TTL of `001_baseline.sql`): older rounds and hours cannot be counted again. */
+export const VALIDATIONS_RETENTION_SECONDS = 90 * 86_400;
 
 /** The fees recorded when neither a `SetFee` nor a ledger state is there to say (the columns are not nullable). */
 const NO_FEES: Fees = { base_fee: '0', reserve_base: '0', reserve_inc: '0' };
