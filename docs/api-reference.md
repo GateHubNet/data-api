@@ -821,7 +821,6 @@ week, month`, `choose a date range less than 200 days` (`weeks`, `months`), `pay
 every day); the rate of an issued currency is the rate of the UTC day, not the rate at each payment's time (an approximation
 the design accepts); sums are exact.
 
-
 #### `interval` on `reports`
 
 Added by [ADR-0013](adr/0013-account-and-market-aggregates.md); the original ignored it, and without it the answers above are
@@ -917,7 +916,6 @@ month`, `invalid marker`; 500 `unable to retrieve exchanges` (the original's mes
 The account stats were computed by an external job of the original that is not in its repository; the semantics above
 (transactions sent, results/types of those, value at the end of the day, fee not counted) are this API's reading of its
 README, see [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md).
-
 
 #### `interval` on `stats/{family}`
 
@@ -1521,7 +1519,6 @@ Errors: 400 as above, `invalid start date format`, `invalid end date format`, `i
 not reproduce `converted_amount`); `converted_amount` is always a string; historical rows carry `end_time` (the start of the
 next bucket, exclusive); the historical display currency uses each bucket's own native-to-display price. A day counts as final
 only once the ingest has passed it by an hour, so volumes follow the ingest rather than the wall clock.
-
 
 ### `GET /v2/network/markets`
 
