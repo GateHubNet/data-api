@@ -186,7 +186,7 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines |
 | `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
 | `syncer_pair_hourly_missing_hours` | 0 | Above 0 for 30 minutes |
-| `syncer_rates_daily_missing_days` | 0 (1 or 2 at the turn of the day) | Above 2 for 6 hours after the first back-fill; the size of the history on a fresh deployment, falling over about a day |
+| `syncer_rates_daily_missing_days` | 0 (the day that has just become final is computed by the next run) | Above 2 for 6 hours after the first back-fill; the size of the history on a fresh deployment, falling over about a day |
 | `syncer_account_rollups_pending_accounts` | 0 | Positive for days: a heavy account is not being promoted |
 | `rate(syncer_fee_stats_samples_total[5m])` | about 0.2/s | 0 (node unreachable) |
 | `rate(syncer_validations_flushed_total[5m])` | positive on XRPL (validators validate every ledger) | 0 for minutes; `syncer_validations_dropped_total{reason}` rising |
@@ -324,7 +324,9 @@ answer is the same and only slower, except for the `network/markets` table, whic
 | Markets | `MARKETS` | `syncer_pair_hourly_missing_hours` = 0, and `syncer_markets_live_age_seconds{period}` under 600 for `day`, `7day` and `30day` |
 | Account analytics | `ACCOUNT_ANALYTICS` | `syncer_rates_daily_missing_days` = 0 and `syncer_account_rollups_pending_accounts` = 0 |
 | The AMM parts of the explorer | `AMM_DATA` | Only once that data API has merged the AMM work, re-ingested history with the AMM parser and back-filled: `syncer_pair_hourly_missing_hours` = 0 and `syncer_rates_daily_missing_days` = 0 again after the reprocess (it marks hours and rate days for recompute). The AMM share of the Markets table comes with the AMM additions of the aggregates, which bring their own gauge |
-| Network dashboard, AMM pages, validators and amendments | none of these | no gauge of these aggregates gates them |
+| Network dashboard | none | the network dashboard reads no route of these aggregates |
+| AMM pages | `AMM_PAGES` | no gauge of these aggregates: the AMM work's routes and its `amm_daily` back-fill gate it (the AMM additions of the aggregates are used when present) |
+| Validators and amendments | `VALIDATORS` | no gauge of these aggregates: the validators work's own |
 
 ### The back-fills
 

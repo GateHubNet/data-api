@@ -11,7 +11,7 @@ D2's branch is rebased onto it with the same resolutions. D2b (the AMM additions
 ## What was checked, and how to find the files
 
 - **D2's files** are `git diff --name-only e26bc0c HEAD` of the D2 branch. `e26bc0c` is the commit the branch was cut from (the plan's "parent of Task 1
-  Step 0's commit" does not exist: that step was skipped, Ruling P1). The files that **both** branches change are:
+  Step 0's commit" does not exist: that step was skipped). The files that **both** branches change are:
 
   ```bash
   comm -12 <(git diff --name-only e26bc0c HEAD | sort) <(git diff --name-only main...feat/amm-data | sort)
@@ -107,7 +107,7 @@ interfaces (the conflict interleaves `AmmPoolsRow` with `NativeRatesDailyRow` an
 ### 7. `packages/shared/test/migrate.e2e-spec.ts` and `packages/shared/test/sample-rows.ts` (conflicts)
 
 Both sides' tables in the lists: the physical design of the AMM tables and of D2's nine in the migrate suite (D2's `ORDER BY` keep `version` last in the three rollup row tables), and both sides' row samples and imports in `sample-rows.ts` (D1's `AmendmentFeaturesRow` imports are D1's). The migrate suite's test of the applied files
-(`applied: [...]`, Ruling P4) lists `002` and `003`; the AMM work adds no migration file, so nothing of it changes there.
+(`applied: [...]`: the schema of the real directory) lists `002` and `003`; the AMM work adds no migration file, so nothing of it changes there.
 
 ### 8. `packages/shared/src/query/rates.service.ts` (merges by itself)
 
@@ -122,7 +122,7 @@ that they still agree (item 10).
 
 ### 10. The API tests: `apps/api/test/account-stats.e2e-spec.ts`, `apps/api/test/account-reports.e2e-spec.ts` (merge by themselves)
 
-These are AMM-list files that D2 edited (Rulings R11a and R12a): the `controllers` option of `startHarness` (`CACHE_CONTROLLERS`, `cache-controllers.ts`) and a cache clear before each test, and `granularity=day` instead of `interval=day` in account-stats' "unknown params ignored" (`interval` is a parameter now).
+These are AMM-list files that D2 edited (the stats and reports e2e suites changed for the new `interval`): the `controllers` option of `startHarness` (`CACHE_CONTROLLERS`, `cache-controllers.ts`) and a cache clear before each test, and `granularity=day` instead of `interval=day` in account-stats' "unknown params ignored" (`interval` is a parameter now).
 The AMM side edits other places of the same files (the seeded trades gain `amm_account`). Both apply; **keep both**, and if a hunk ever conflicts keep both.
 
 ### 11. The syncer tests: `aggregator.service.spec.ts`, `apps/syncer/test/aggregator-fakes.ts`, D2's `aggregator.schedule.spec.ts`
@@ -148,7 +148,7 @@ Both sides' sections everywhere; D2's material is in blocks of its own, so most 
 | `docs/adr/0010-ripple-v2-wire-compatibility.md` | yes (the status line) | `**Status:** Accepted (amended by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md): section 6, AMM swaps are exchanges; by [ADR-0013](0013-account-and-market-aggregates.md): section 2, items 10a to 10f, the routes and parameters of the account and market aggregates).` The AMM side's section 6 (items 40 to 44) and D2's items 10a to 10f are separate blocks. |
 | `docs/adr/README.md` | yes | The rows in order: `0010` (status "Accepted (amended by 0011: AMM swaps are exchanges; by 0013: the account and market routes and `interval`)"), `0011` (AMM), `0012` (D1), `0013` (D2). |
 | `docs/openapi.yaml` | yes | **Regenerated after the merge, not merged by hand**: take either side to clear the conflict (`git checkout --ours docs/openapi.yaml`), then regenerate by the procedure of `docs/development.md` section 8 (keep its header comment). |
-| `README.md`, `docs/development.md` | none | Merge by themselves (D2 only adds `003_account_market_aggregates` to the migration lists next to `002`, Ruling R16a). |
+| `README.md`, `docs/development.md` | none | Merge by themselves (D2 only adds `003_account_market_aggregates` to the migration lists next to `002`). |
 
 ## The database consequence
 
@@ -164,13 +164,13 @@ votes and agreement) is what a recreation would lose. After the AMM rollout (its
    (`markets-live-job`, `rates-daily-job`, `pair-hourly-job`, `account-rollups-job`), `account-day-groups` (rollups are invisible), the migrate suite, the API suites of the analytics routes and of `network/markets`, `account-parity` (the answers of `stats` and `reports` before D2) and the syncer's `aggregator-aggregates` suite.
 3. Regenerate `docs/openapi.yaml` (above) and run `pnpm --filter @gatehub/data-api-service test:e2e -- api-reference-examples`: the examples of the reference are proved against the seeded worlds.
 4. Optional follow-ups, with no change of behaviour: (a) `packages/shared/src/aggregate/volume.job.ts` keeps its own private `nextVersion`, `newestLedgerClose` and `throwIfAborted`, which `packages/shared/src/aggregate/aggregate-sets.ts` (D2) repeats; point the first at the second (the SQL of `nextSetVersion` is the same as `nextVersion`'s).
-   (b) The display-currency check of `volume.controller.ts` and of `markets.controller.ts` is the same text twice; one helper can serve both (Ruling R15b). (c) `docs/architecture.md` (not a D2 file) says "33 tables", and the AMM side's version says 30: it should say 49.
+   (b) The display-currency check of `volume.controller.ts` and of `markets.controller.ts` is the same text twice; one helper can serve both. (c) `docs/architecture.md` (not a D2 file) says "33 tables", and the AMM side's version says 30: it should say 49. (d) The endpoint table of the root `README.md` (an AMM-list file that D2 only touched for the migration list) does not list the new routes yet: add `.../analytics/{balances|balance_changes|counterparties|exchanges}` to its Accounts row and `/v2/network/markets` to its Network row (and `interval` where it names `reports` and `stats`).
 5. **D2b** (the AMM additions of the aggregates) follows. One note for it: `pairHourSets` reads the hour sentinels **without a `source` filter** (only `book` sentinels exist in D2); D2b must add `source = 'book'`, or accept both, when it writes `amm` rows.
 
 ## Is every file in this document? (the check)
 
 ```bash
-for f in $(comm -12 <(git diff --name-only e26bc0c HEAD | sort) <(git diff --name-only main...feat/amm-data | sort)); do grep -q -- "$f" docs/superpowers/plans/2026-10-19-account-market-aggregates.merge-recipe.md || echo "MISSING: $f"; done
+for f in $(comm -12 <(git diff --name-only e26bc0c HEAD | sort) <(git diff --name-only main...feat/amm-data | sort)); do grep -qF -- "\`$f\`" docs/superpowers/plans/2026-10-19-account-market-aggregates.merge-recipe.md || echo "MISSING: $f"; done
 ```
 
 Prints nothing when it holds.
