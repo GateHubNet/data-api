@@ -219,6 +219,8 @@ describe('GET /v2/network/validators/summary: a fleet of 35 trusted validators (
   });
 
   it('serves a later request within 10 s from the directory it has: no read at all', async () => {
+    // a build right before the measure, so that the 10 s of the directory are not over however long the tests before took
+    expect((await api.get(SUMMARY)).status).toBe(200);
     const reads = await readsOf(h, Table.ValidatorSeen, async () => {
       expect((await api.get(SUMMARY)).status).toBe(200);
     });
@@ -1493,6 +1495,15 @@ describe('GET /v2/network/validators and /{key}: a fleet of 35 trusted validator
 
     it('sends Cache-Control: private, max-age=30 as the JSON does', () => {
       expect(csv.headers['cache-control']).toBe('private, max-age=30');
+    });
+
+    it('is an empty validators.csv when nothing passes the filters', async () => {
+      const res = await api.get(`${LIST}?format=csv&q=nothing-is-called-this`);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toMatch(/^text\/csv/);
+      expect(res.headers['content-disposition']).toBe(csvDisposition('validators'));
+      expect(res.text).toBe('');
+      expect(res.headers.link).toBeUndefined();
     });
   });
 

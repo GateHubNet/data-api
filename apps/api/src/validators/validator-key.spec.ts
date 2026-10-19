@@ -75,6 +75,16 @@ describe('parseValidatorKey', () => {
     expectBadKey(MASTER.slice(0, -4));
   });
 
+  it('answers 400 for a base58 key in the wrong case: base58 is case-sensitive', () => {
+    expectBadKey(MASTER.toLowerCase());
+    expectBadKey(MASTER.toUpperCase());
+    expectBadKey(SIGNING.toLowerCase());
+    // one letter of another case
+    const at = [...MASTER].findIndex((c, i) => i > 2 && /[a-km-zA-HJ-NP-Z]/.test(c));
+    const flipped = MASTER[at] === MASTER[at].toLowerCase() ? MASTER[at].toUpperCase() : MASTER[at].toLowerCase();
+    expectBadKey(`${MASTER.slice(0, at)}${flipped}${MASTER.slice(at + 1)}`);
+  });
+
   it('answers 400 for a base58 key of another kind (an account public key)', () => {
     // an account public key ("aB...") has the length of a node key and a good checksum, but another version byte
     const account = encodeAccountPublic(Buffer.from(`ED${'2a'.repeat(32)}`, 'hex'));

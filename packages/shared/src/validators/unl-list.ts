@@ -75,7 +75,8 @@ function entriesOf(body: Json): { version: 1 | 2; entries: Entry[] } {
   const invalid = (why: string): never => {
     throw new UnlListError('invalid_format', why);
   };
-  if (typeof body.public_key !== 'string' || !PUBLIC_KEY.test(body.public_key)) invalid('public_key is missing');
+  if (typeof body.public_key !== 'string') invalid('public_key is missing');
+  if (!PUBLIC_KEY.test(body.public_key as string)) invalid('public_key is not 66 hex digits');
   if (typeof body.manifest !== 'string') invalid('manifest is missing');
   if (typeof body.version !== 'number' || !Number.isInteger(body.version)) invalid('version is missing');
 

@@ -8,7 +8,7 @@ export const VALIDATIONS_CACHE_CONTROL = 'private, max-age=5';
 
 /**
  * The `Cache-Control` of `/v2/network/validators/{key}/validations` when the request has a `marker`: private, and 300 s. A page
- * behind a marker lies further back than the first one, where a validation is complete, so it is kept longer.
+ * behind a marker is a fixed slice of history (the rows after the place the marker names, in either order), so it is kept longer.
  */
 export const VALIDATIONS_MARKER_CACHE_CONTROL = 'private, max-age=300';
 

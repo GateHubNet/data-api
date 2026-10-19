@@ -38,7 +38,10 @@ const HOUR = 3600;
 const DAY = 86_400;
 /** The hours of a range of sentinels read while looking for the newest final hour: the hours of the 30-day window. */
 const AGREEMENT_RANGE_HOURS = 720;
-/** The most hours back from the newest hour stored the search for a final hour goes: `validator_agreement_hourly` keeps 400 days. */
+/**
+ * The hours the search for a final hour reads at most, the newest hour stored included: `validator_agreement_hourly` keeps an
+ * hour 400 days (its TTL), so the search reaches 400 days back and no further.
+ */
 const AGREEMENT_RETENTION_HOURS = 400 * 24;
 /**
  * The most ledgers a 30-day window can span: no network closes more than one ledger a second. A lower bound for the read of the
@@ -476,12 +479,15 @@ export class ValidatorDirectoryService {
       }
     };
 
-    // back from the newest hour stored, a range of 720 hours at a time, to the first with a final hour
+    // back from the newest hour stored, a range of 720 hours at a time, to the first with a final hour, but no further than the
+    // oldest hour the table keeps (the last range is cut there)
+    const oldest = newestStored - (AGREEMENT_RETENTION_HOURS - 1) * HOUR;
     let covered = newestStored + HOUR;
     let finalHour: number | undefined;
-    while (finalHour === undefined && covered > newestStored - AGREEMENT_RETENTION_HOURS * HOUR) {
-      await readSentinels(covered - AGREEMENT_RANGE_HOURS * HOUR, covered - HOUR);
-      covered -= AGREEMENT_RANGE_HOURS * HOUR;
+    while (finalHour === undefined && covered > oldest) {
+      const since = Math.max(oldest, covered - AGREEMENT_RANGE_HOURS * HOUR);
+      await readSentinels(since, covered - HOUR);
+      covered = since;
       finalHour = newestFinalHour(sentinels);
     }
     if (finalHour === undefined) return none;

@@ -4,8 +4,9 @@
  *
  *   pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl|xahau [--endpoint <wss url>] [--clickhouse]
  *
- * It loads `config/amendments/<network>.json` (a file that does not pass the loader's checks fails the run), asks the
- * node for `feature` and for the `Amendments` ledger object (`ledger_entry`, the validated ledger), and prints:
+ * It loads `config/amendments/<network>.json` (a file that does not pass the loader's checks fails the run), checks that the
+ * node is of that network (`server_info.network_id`: a Xahau node for the XRPL file fails the run), asks the node for `feature`
+ * and for the `Amendments` ledger object (`ledger_entry`, the validated ledger), and prints:
  *
  *   - the names the node knows that the file lacks (add an entry for each);
  *   - the IDs of the ledger (enabled, or with a majority) and of the current votes that neither the file nor the node
@@ -26,7 +27,7 @@ import {
   amendmentsCheckFindings,
   loadAmendmentsConfig,
 } from '../src/validators';
-import { NodeClient } from '../src/xrpl/node-client';
+import { assertNetwork, NodeClient } from '../src/xrpl/node-client';
 import { redactEndpoint } from '../src/xrpl/node-throttle';
 
 export interface Options {
@@ -68,8 +69,34 @@ export function parseArgs(argv: string[]): Options {
   return { network, endpoint, clickhouse };
 }
 
-/** What the node says: the entries of `feature`, and the IDs of the `Amendments` object. */
-async function askNode(profile: NetworkProfile, endpoint: string) {
+/** What the node says (`askNode`). */
+export interface NodeAnswers {
+  nodeFeatures: { id: string; name?: string }[];
+  ledgerIds: string[];
+}
+
+/**
+ * What the node says: the entries of `feature`, and the IDs of the `Amendments` object of the validated ledger. The node must
+ * be of the network of the file (`server_info.network_id`, as the syncer checks it): the file of one network is never checked
+ * against a node of the other.
+ */
+export async function askNode(
+  profile: NetworkProfile,
+  node: Pick<NodeClient, 'serverInfo' | 'request'>,
+): Promise<NodeAnswers> {
+  assertNetwork(await node.serverInfo(), profile);
+  const { features } = await node.request<{ features: Record<string, { name?: string }> }>({ command: 'feature' });
+  const { node: object } = await node.request<{
+    node: { Amendments?: string[]; Majorities?: { Majority: { Amendment: string } }[] };
+  }>({ command: 'ledger_entry', index: AMENDMENTS_OBJECT_INDEX, ledger_index: 'validated' });
+  return {
+    nodeFeatures: Object.entries(features).map(([id, feature]) => ({ id, name: feature.name })),
+    ledgerIds: [...(object.Amendments ?? []), ...(object.Majorities ?? []).map((entry) => entry.Majority.Amendment)],
+  };
+}
+
+/** Connects to `endpoint` and asks it (`askNode`). */
+async function askEndpoint(profile: NetworkProfile, endpoint: string): Promise<NodeAnswers> {
   const node = new NodeClient({
     endpoints: [endpoint],
     // The report goes to stdout; the node client's own chatter (connects, retries) would only bury it.
@@ -88,14 +115,7 @@ async function askNode(profile: NetworkProfile, endpoint: string) {
         );
       }),
     ]);
-    const { features } = await node.request<{ features: Record<string, { name?: string }> }>({ command: 'feature' });
-    const { node: object } = await node.request<{
-      node: { Amendments?: string[]; Majorities?: { Majority: { Amendment: string } }[] };
-    }>({ command: 'ledger_entry', index: AMENDMENTS_OBJECT_INDEX, ledger_index: 'validated' });
-    return {
-      nodeFeatures: Object.entries(features).map(([id, feature]) => ({ id, name: feature.name })),
-      ledgerIds: [...(object.Amendments ?? []), ...(object.Majorities ?? []).map((entry) => entry.Majority.Amendment)],
-    };
+    return await askNode(profile, node);
   } catch (err) {
     throw new Error(`${profile.name} node ${redactEndpoint(endpoint)}: ${(err as Error).message}`);
   } finally {
@@ -154,7 +174,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   const profile = getNetworkProfile(options.network);
   const config = loadAmendmentsConfig(profile);
-  const { nodeFeatures, ledgerIds } = await askNode(profile, options.endpoint);
+  const { nodeFeatures, ledgerIds } = await askEndpoint(profile, options.endpoint);
 
   let votes: string[] | undefined;
   let events: { id: string; ledgerIndex: number }[] | undefined;

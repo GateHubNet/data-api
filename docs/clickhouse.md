@@ -151,8 +151,9 @@ Do not run production without a tested restore:
   re-running `range-ingest` over the history (slower, a real safety net; [backfill](backfill.md)). Backups make recovery *fast*.
   `fee_stats` and `validations` are collected live and cannot be re-derived from ledgers: back those up. Some of the validators and
   amendments data (migration 002) is collected live too and is lost with the database: `validator_seen` (the first-seen history), the stored
-  lists (`unl_lists`, `unl_publishers`) and the domain results (`validator_domains`). `validator_votes`, `amendment_tallies` and `validator_agreement_hourly` are recomputed from `validations`
-  and `ledgers` within the 90 days `validations` keeps.
+  lists (`unl_lists`, `unl_publishers`), the domain results (`validator_domains`) and the polled ledger states (`network_state`, kept 100
+  days). `validator_votes`, `amendment_tallies` and `validator_agreement_hourly` are recomputed from `validations`, `ledgers`, the stored
+  lists and `network_state` within the 90 days `validations` keeps.
 
 ## Retention and TTL
 

@@ -128,8 +128,9 @@ describe('AgreementJob and the manifest map', () => {
   /** Three hours ago, on the hour: the first hour to compute, after a stored one. */
   const FIRST = Math.floor(NOW / HOUR) * HOUR - 3 * HOUR;
 
-  function agreementDatabase() {
+  function agreementDatabase(counts: Record<string, unknown>[] = []) {
     return recordingClickHouse((sql) => {
+      if (sql.includes('AS counted_hour')) return counts;
       if (sql.includes('AS newest_closed')) return [{ newest_closed: NOW - 10 }];
       if (
         sql.includes(`FROM ${Table.ValidatorAgreementHourly}`) &&
@@ -166,5 +167,95 @@ describe('AgreementJob and the manifest map', () => {
     expectMapped(calls, 'AS seen_hour');
     expectMapped(calls, 'AS counted_hour');
     expectMapped(calls, 'AS tracked_key');
+  });
+
+  it('tells the rows of an hour and of the total of WITH ROLLUP by grouping(), not by the values of their keys', async () => {
+    // the hour's row and the total come back here with a key and an hour that a validator's row could have
+    const counted = { agreed: 2, partial_only: 0, last_ms: (FIRST + 60) * 1000 };
+    const { ch, calls } = agreementDatabase([
+      { counted_hour: FIRST, counted_key: 'nHA', rollup_level: 0, observed_ledgers: 2, ...counted },
+      { counted_hour: FIRST, counted_key: 'nHB', rollup_level: 1, observed_ledgers: 2, ...counted, agreed: 3 },
+      { counted_hour: FIRST, counted_key: 'nHC', rollup_level: 3, observed_ledgers: 9, ...counted, agreed: 9 },
+    ]);
+    const job = new AgreementJob(ch as never, config(), new PrometheusService(), { now: () => NOW_MS, logger: quiet });
+
+    await job.run(tick());
+
+    const [sql] = calls.filter((call) => call.sql.includes('AS counted_hour')).map((call) => call.sql);
+    expect(sql).toContain('grouping(counted_hour, counted_key) AS rollup_level');
+    expect(sql).toContain('WITH ROLLUP');
+    expect(sql).toContain('SETTINGS force_grouping_standard_compatibility = 1');
+    const [[, rows]] = ch.insert.mock.calls as [
+      string,
+      { hour: number; validation_public_key: string; agreed: number; ledgers: number }[],
+    ][];
+    // the observed ledgers of the hour come from its row; nHB's and nHC's counts are not those of the hour and the total
+    expect(rows.map((row) => [row.validation_public_key, row.agreed, row.ledgers])).toEqual([
+      ['nHA', 2, 0],
+      ['nHB', 0, 0],
+      ['nHC', 0, 0],
+      ['', 0, 2],
+    ]);
+  });
+});
+
+describe('AgreementJob: the lag of the newest final hour', () => {
+  /** The newest hour stored, not final. */
+  const STORED = Math.floor(NOW / HOUR) * HOUR - 2 * HOUR;
+  const DAYS_400 = 400 * 24;
+
+  /** A database whose newest final hour is `final` (none: undefined), and that has no ledger (the run ends at once). */
+  function lagDatabase(final: number | undefined) {
+    return recordingClickHouse((sql, params) => {
+      if (
+        sql.includes(`FROM ${Table.ValidatorAgreementHourly}`) &&
+        sql.includes('AS stored_hour') &&
+        sql.includes('LIMIT 1')
+      ) {
+        return [{ stored_hour: STORED }];
+      }
+      if (sql.includes('AS newest_final')) {
+        const since = params.since as number;
+        const until = params.until as number;
+        return final !== undefined && final >= since && final <= until ? [{ newest_final: final }] : [];
+      }
+      return undefined;
+    });
+  }
+  const lagReads = (calls: Call[]) =>
+    calls
+      .filter((call) => call.sql.includes('AS newest_final'))
+      .map((call) => call.params as { since: number; until: number });
+
+  it('searches back from the newest hour stored, 720 hours at a time, and stops at the first range with a final hour', async () => {
+    const final = STORED - 800 * HOUR;
+    const { ch, calls } = lagDatabase(final);
+    const metrics = new PrometheusService();
+    await new AgreementJob(ch as never, config(), metrics, { now: () => NOW_MS, logger: quiet }).run(tick());
+
+    expect(lagReads(calls)).toEqual([
+      { since: STORED - 719 * HOUR, until: STORED },
+      { since: STORED - 1439 * HOUR, until: STORED - 720 * HOUR },
+    ]);
+    // every read is a range of the key: the sentinels of its hours
+    for (const { sql } of calls.filter((call) => call.sql.includes('AS newest_final'))) {
+      expect(sql).toContain("validation_public_key = ''");
+      expect(sql).toContain('hour >= toDateTime({since:UInt32}');
+      expect(sql).toContain('hour <= toDateTime({until:UInt32}');
+    }
+    expect((await metrics.validatorsAgreementLagSeconds.get()).values[0]?.value).toBe(NOW - (final + HOUR));
+  });
+
+  it('goes back no further than the 400 days the table keeps an hour, and says nothing without a final hour', async () => {
+    const { ch, calls } = lagDatabase(undefined);
+    await new AgreementJob(ch as never, config(), new PrometheusService(), { now: () => NOW_MS, logger: quiet }).run(
+      tick(),
+    );
+    const ranges = lagReads(calls);
+    expect(ranges).toHaveLength(Math.ceil(DAYS_400 / 720));
+    expect(ranges[0]).toEqual({ since: STORED - 719 * HOUR, until: STORED });
+    expect(ranges[ranges.length - 1].since).toBe(STORED - (DAYS_400 - 1) * HOUR);
+    // the ranges touch, and none overlaps
+    for (let i = 1; i < ranges.length; i++) expect(ranges[i].until).toBe(ranges[i - 1].since - HOUR);
   });
 });

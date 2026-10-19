@@ -106,12 +106,16 @@ function checkedMarker(values: KeyValue[]): ListMarker {
 
 const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
-/** The place of an entry in the list: the key of its order, as a marker writes it. */
-function placeOf(entry: Pick<DirectoryEntry, 'key' | 'domain'>): ListMarker {
+/**
+ * The place of an entry in the list: the key of its order, as a marker writes it. The order of places (`comparePlaces`) is the
+ * order of the directory (`compareEntries`), which the tests hold them to: a marker resumes where the page it came from ended.
+ */
+export function placeOf(entry: Pick<DirectoryEntry, 'key' | 'domain'>): ListMarker {
   return entry.domain === undefined ? [1, '', entry.key] : [0, entry.domain.toLowerCase(), entry.key];
 }
 
-function comparePlaces(a: ListMarker, b: ListMarker): number {
+/** The order of two places (`placeOf`): the group, then the sort text, then the key. */
+export function comparePlaces(a: ListMarker, b: ListMarker): number {
   return a[0] - b[0] || compareText(a[1], b[1]) || compareText(a[2], b[2]);
 }
 

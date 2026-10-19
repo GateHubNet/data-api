@@ -17,10 +17,11 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
           ▼               ▼               ▼                 ▼                  ▼
    14 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
    (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
-    marker)           manifests,                      volume_daily       network_state,
-                      validator_                      (reads the         amendment_features,
-                      validations,                    ledger tables)     validator_votes,
-                      validator_seen                                     amendment_tallies,
+    marker)           manifests,                      volume_daily       validator_manifests (rpc),
+                      validator_                      (reads the         network_state,
+                      validations,                    ledger tables)     amendment_features,
+                      validator_seen                                     validator_votes,
+                                                                         amendment_tallies,
                                                                          validator_agreement_hourly
                           ClickHouse, database = the network name
 ```
@@ -247,7 +248,7 @@ ClickHouse; raise `--concurrency` with your own node.
   written again.
 - **Flush every 20 s.** A failed `validations` flush puts its rows back into the buffer (at-least-once; an insert that times out
   after ClickHouse took the rows is written twice and that validation's `count` is too high — rare, accepted). The two
-  per-validator tables are exactly-once instead: their rows leave in one batch per flush with the
+  per-validator tables have no duplicates on a retried batch instead: their rows leave in one batch per flush with the
   `insert_deduplication_token` `vc:<bootId>:<table>:<flushSeq>` (`bootId` is random per process), and both tables keep a dedup
   window of 100 inserts. A batch that failed stays as it was and is sent again, oldest first, before the new one, with its own
   token, so a retry of an insert that landed after all is dropped by the server. A table whose oldest batch fails again is
@@ -397,9 +398,11 @@ and the next one is made on time.
 
 - **Which validators.** The masters on the list in use of each configured publisher (only the lists stored under the key configured
   for it: a list of an earlier key of the same URL counts for nothing), and those in `validator_seen` with `last_seen` in the last 30
-  days. A key seen under a signing key is mapped to its master through the manifest map first (`MANIFEST_MAP_SQL` and
-  `keyMapParams` of `packages/shared`: per `ephemeral_key`, the `master_key` of the highest `seq`), as every read that aggregates
-  by validator does. Of each, the newest manifest (the highest `seq` per master key).
+  days. A key seen under a signing key is mapped to its master through the manifest map first (per `ephemeral_key`, the
+  `master_key` of the highest `seq`), as every read that aggregates by validator does: the map is computed inside the statement
+  (`KEY_MAP_WITH` and `mappedKey` of `packages/shared`), never sent with it as parameters, which the client would put in the URL
+  (a map of every manifest stored outgrows the 1 MiB of a URL ClickHouse takes). Of each, the newest manifest (the highest `seq`
+  per master key; of one `seq`, the row with the raw manifest: `NEWEST_MANIFEST_ORDER`).
 - **The manifest is verified here.** A manifest with raw bytes is decoded and its signatures verified, and it must be the key's own;
   the domain is that of the verified manifest, so the stream's word is not enough, and a manifest that does not verify gives
   `manifest_unverified` with no fetch. A validator whose newest manifest has no raw bytes (rows from before migration 002) is asked of
@@ -584,7 +587,9 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
   version, and a reader keeps the rows of the newest sentinel's version of each hour. A shutdown stops the job between hours and before an
   insert.
 - **Observability.** `syncer_validators_agreement_lag_seconds` is now minus the end of the newest final hour, set at the end of every run
-  (also one that failed or ran out of time), and not set while no hour is final.
+  (also one that failed or ran out of time), and not set while no hour is final. The newest final hour is searched for from the newest
+  hour stored back, 720 hours (a range of the key) at a time, the next range only when one has none, and no further than the 400 days
+  the table keeps: a run reads the sentinels of one range, not of the table.
 
 ## 9. What the syncer does not do
 

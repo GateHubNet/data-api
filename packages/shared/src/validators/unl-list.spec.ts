@@ -183,6 +183,29 @@ describe('verifyUnlList refuses a recorded list that was changed', () => {
     expect(failureOf(lowered, ripple)).toBeUndefined();
   });
 
+  it('invalid_format says why: a public_key that is missing, and one that is not 66 hex digits', () => {
+    const messageOf = (body: Body): string | undefined => {
+      try {
+        verifyUnlList(body, ripple);
+        return undefined;
+      } catch (err) {
+        expect(err).toMatchObject({ reason: 'invalid_format' });
+        return (err as Error).message;
+      }
+    };
+    const missing = real();
+    delete missing.public_key;
+    expect(messageOf(missing)).toBe('public_key is missing');
+    const number = real();
+    number.public_key = 7;
+    expect(messageOf(number)).toBe('public_key is missing');
+    for (const publicKey of [ripple.slice(0, 64), ripple + '00', ' ' + ripple, ripple.replace('FF', '\uFB00'), '']) {
+      const body = real();
+      body.public_key = publicKey;
+      expect([publicKey, messageOf(body)]).toEqual([publicKey, 'public_key is not 66 hex digits']);
+    }
+  });
+
   it('manifest_invalid: a byte of the publisher manifest signature', () => {
     const body = real();
     // The master signature closes the canonical encoding of a manifest.

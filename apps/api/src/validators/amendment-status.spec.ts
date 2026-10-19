@@ -631,7 +631,7 @@ describe('assembleAmendments', () => {
       for (const each of written.amendments) expect(each.id).toBe(each.id.toUpperCase());
     });
 
-    it('adds the yes votes of an ID written in both cases once each way: the larger', () => {
+    it('takes the larger of the yes counts of an ID written in both cases, not their sum', () => {
       const both = assembleAmendments(
         directoryOf(),
         sources({

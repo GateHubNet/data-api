@@ -155,6 +155,25 @@ describe('amendmentsCheckFindings (spec 2.6)', () => {
       ).toEqual([]);
     });
 
+    it('lists a contradiction once: the same event indexed twice, or under an ID of another case', () => {
+      const findings = amendmentsCheckFindings({
+        config,
+        nodeFeatures: [],
+        ledgerIds: [],
+        enabledEvents: [
+          { id: AMM, ledgerIndex: 86795266 },
+          { id: AMM.toLowerCase(), ledgerIndex: 86795266 },
+          { id: AMM, ledgerIndex: 86795266 },
+          // another indexed ledger is another contradiction
+          { id: AMM, ledgerIndex: 86795267 },
+        ],
+      });
+      expect(findings.contradictions).toEqual([
+        { name: 'AMM', file: 86795265, indexed: 86795266 },
+        { name: 'AMM', file: 86795265, indexed: 86795267 },
+      ]);
+    });
+
     it('is sorted by name', () => {
       const wide = parseAmendmentsConfig(
         {

@@ -259,13 +259,14 @@ the loss below. That branch edits `001_baseline.sql` in place, and the migration
 (`Migration 001_baseline.sql was modified after being applied`). So a database created before that merge has to be recreated when it is merged
 (the AMM design asks for that anyway), and with it goes what the validators and amendments data collected and cannot recompute: the
 `validations` (90 days, from which the votes and the agreement are back-filled), `validator_votes`, `amendment_tallies`,
-`validator_agreement_hourly`, the first-seen history of `validator_seen`, the stored UNL lists and the domain results. The account and market
+`validator_agreement_hourly`, the first-seen history of `validator_seen`, the stored UNL lists, the domain results and the polled ledger
+states of `network_state` (the negative UNL and the majorities the rounds and the hours read). The account and market
 aggregates (D2) are recomputable and set no such constraint. A throwaway environment (development, tests) may run it before the merge.
 
 **The order is `migrate-<network>`, then `syncer-<network>`, then `api-<network>`.**
 
-1. `migrate-<network>` applies `002`: two `ADD COLUMN IF NOT EXISTS` statements on `validations` and `validator_manifests` and ten
-   `CREATE TABLE IF NOT EXISTS`. The compose files make the syncer and the api wait for it (`depends_on: service_completed_successfully`).
+1. `migrate-<network>` applies `002`: two `ALTER TABLE` statements on `validations` and `validator_manifests` adding four columns
+   (`ADD COLUMN IF NOT EXISTS`), and ten `CREATE TABLE IF NOT EXISTS`. The compose files make the syncer and the api wait for it (`depends_on: service_completed_successfully`).
 2. `syncer-<network>` starts the new collector and the `validators` worker. **The syncer needs `002` applied before it starts**: its collector
    writes the new columns and tables as `JSONEachRow`, which ClickHouse refuses when a row has a field the table lacks. So a syncer with the
    `validations` or `validators` worker enabled checks the schema at boot (`system.columns`) and refuses to start against a database without

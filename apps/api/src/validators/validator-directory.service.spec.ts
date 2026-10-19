@@ -184,4 +184,29 @@ describe('ValidatorDirectoryService', () => {
       expect([...directory.signingToMaster]).toEqual([['n9Signing', 'nHMaster']]);
     });
   });
+
+  describe('the search for the newest final hour', () => {
+    it('goes back, 720 hours at a time, no further than the 400 days the table keeps an hour', async () => {
+      const stored = Math.floor(Date.now() / 3_600_000) * 3600 - 3600;
+      const query = jest.fn(async (sql: string): Promise<unknown[]> => {
+        if (sql.includes(`FROM ${Table.ValidatorAgreementHourly}`) && sql.includes('LIMIT 1'))
+          return [{ stored_hour: stored }];
+        // sentinels, none final
+        return [];
+      });
+      const ch = {
+        query,
+        queryOne: async (...args: unknown[]) => ((await query(...(args as [string]))) as unknown[])[0],
+      };
+      await service(ch as never).svc.get();
+      const ranges = query.mock.calls
+        .filter(([sql]) => sql.includes('newest_final'))
+        .map((call) => (call as unknown as [string, { since: number; until: number }])[1]);
+      expect(ranges[0]).toEqual({ since: stored - 719 * 3600, until: stored });
+      // the ranges touch, and the last ends with the oldest hour the table keeps: 9,600 hours with the newest
+      for (let i = 1; i < ranges.length; i++) expect(ranges[i].until).toBe(ranges[i - 1].since - 3600);
+      expect(ranges[ranges.length - 1].since).toBe(stored - (400 * 24 - 1) * 3600);
+      expect(ranges).toHaveLength(Math.ceil((400 * 24) / 720));
+    });
+  });
 });

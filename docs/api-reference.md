@@ -1082,7 +1082,7 @@ one written here and is pinned by tests.
   rounds (what each validator voted at each voting ledger, 256 ledgers apart) and the agreement of each validator per UTC hour.
 - A **validator directory** is built from those tables, one build at a time per replica, and kept for up to 10 seconds (counted from the start of the
   build): a request costs at most one build in 10 s, whatever the number of requests. Every read that adds up rows by validator first maps a signing key to its master key through the
-  manifests, so a validation recorded before its manifest was known counts for the right validator; a round and an hour are read whole, in the
+  manifests (a map each statement computes inside itself, so its size does not matter), so a validation recorded before its manifest was known counts for the right validator; a round and an hour are read whole, in the
   newest version written (a rewritten round or hour is never mixed with its older version).
 - "In use now" (the trusted UNL, which publishers name a validator) uses the lists a publisher served under the key it is configured with; a
   list of a key it no longer uses was trusted in its time and is history.

@@ -17,8 +17,17 @@ export const AGREEMENT_BUDGET_MS = 10_000;
 const HOUR = 3600;
 const DAY = 86_400;
 
+/** The hours of a range of the search for the newest final hour (`reportLag`): those of a 30-day window. */
+const LAG_SEARCH_HOURS = 720;
+/** The hours `validator_agreement_hourly` keeps (its TTL: 400 days), the farthest the search goes back from the newest stored. */
+const AGREEMENT_RETENTION_HOURS = 400 * 24;
+
 /** An hour with a gap is recomputed this often at most (milliseconds: versions are wall-clock milliseconds). */
 const RECOMPUTE_INTERVAL_MS = 3_600_000;
+
+/** `grouping(counted_hour, counted_key)` of the row of an hour (its key rolled up) and of the total (both rolled up). */
+const ROLLUP_HOUR = 1;
+const ROLLUP_TOTAL = 3;
 
 /** The validations of a ledger are read from this long before the start of the window ... */
 const READ_LEAD_MS = 600_000;
@@ -422,29 +431,34 @@ export class AgreementJob implements ComputeJob {
         unl: [...first.unl],
         quorum: first.quorum,
       };
-      // one read, one snapshot: the rows of the validators, and (WITH ROLLUP) the rows of the hours with the distinct observed
-      // ledgers of each, the key `''` that no validator has (the reads of `validations` leave it out)
+      // one read, one snapshot: the rows of the validators, and (WITH ROLLUP) the row of each hour with the distinct observed
+      // ledgers of it, and the total of the window; `grouping()` tells them apart (the standard bits, which the setting pins:
+      // 0 a validator's row, 1 an hour's, 3 the total), not the values ROLLUP leaves in the columns it rolls up
       const counts = await this.ch.query<{
         counted_hour: number;
         counted_key: string;
+        rollup_level: number | string;
         agreed: number | string;
         partial_only: number | string;
         last_ms: number | string;
         observed_ledgers: number | string;
       }>(
         `${AGREEMENT_WITH}
-         SELECT l.chain_hour AS counted_hour, v.k AS counted_key, countIf(v.f = 1) AS agreed, countIf(v.f = 0) AS partial_only,
+         SELECT l.chain_hour AS counted_hour, v.k AS counted_key, grouping(counted_hour, counted_key) AS rollup_level,
+                countIf(v.f = 1) AS agreed, countIf(v.f = 0) AS partial_only,
                 toUnixTimestamp64Milli(max(v.seen)) AS last_ms, uniqExact(v.ledger_hash) AS observed_ledgers
            FROM v INNER JOIN l USING ledger_hash
           WHERE v.ledger_hash IN (SELECT ledger_hash FROM obs)
           GROUP BY counted_hour, counted_key WITH ROLLUP
-          ORDER BY counted_hour, counted_key`,
+          ORDER BY counted_hour, counted_key
+         SETTINGS force_grouping_standard_compatibility = 1`,
         params,
       );
       for (const row of counts) {
+        const level = Number(row.rollup_level);
+        if (level === ROLLUP_TOTAL) continue;
         const hour = Number(row.counted_hour);
-        if (hour === 0) continue; // the total of all the hours
-        if (row.counted_key === '') {
+        if (level === ROLLUP_HOUR) {
           reads.observed.set(hour, Number(row.observed_ledgers));
           continue;
         }
@@ -530,19 +544,37 @@ export class AgreementJob implements ComputeJob {
 
   /** Sets the gauge: now minus the end of the newest final hour. Without a final hour it says nothing. */
   private async reportLag(nowMs: number): Promise<void> {
-    const row = await this.ch.queryOne<{ newest_final: number }>(
-      `SELECT toUnixTimestamp(hour) AS newest_final, argMax(final, version) AS newest_is_final
-         FROM ${Table.ValidatorAgreementHourly}
-        WHERE validation_public_key = ''
-        GROUP BY hour
-       HAVING newest_is_final = 1
-        ORDER BY hour DESC
-        LIMIT 1`,
-    );
-    if (row === undefined) return;
-    this.metrics.validatorsAgreementLagSeconds.set(
-      Math.max(0, Math.floor(nowMs / 1000) - (Number(row.newest_final) + HOUR)),
-    );
+    const newestFinal = await this.newestFinalHour();
+    if (newestFinal === undefined) return;
+    this.metrics.validatorsAgreementLagSeconds.set(Math.max(0, Math.floor(nowMs / 1000) - (newestFinal + HOUR)));
+  }
+
+  /**
+   * The newest hour whose newest sentinel is final. It can lie any number of hours below the newest hour stored (hours that
+   * are not final), so it is searched for from the newest hour stored back, `LAG_SEARCH_HOURS` at a time, a range of the key
+   * each, and only when a range has none, the next, at most as far back as the table keeps an hour: the usual run reads the
+   * sentinels of one range, not those of the 400 days.
+   */
+  private async newestFinalHour(): Promise<number | undefined> {
+    const stored = await this.newestStoredHour();
+    if (stored === undefined) return undefined;
+    const oldest = stored - (AGREEMENT_RETENTION_HOURS - 1) * HOUR;
+    for (let until = stored; until >= oldest; until -= LAG_SEARCH_HOURS * HOUR) {
+      const since = Math.max(oldest, until - (LAG_SEARCH_HOURS - 1) * HOUR);
+      const row = await this.ch.queryOne<{ newest_final: number }>(
+        `SELECT toUnixTimestamp(hour) AS newest_final, argMax(final, version) AS newest_is_final
+           FROM ${Table.ValidatorAgreementHourly}
+          WHERE validation_public_key = ''
+            AND hour >= toDateTime({since:UInt32}, 'UTC') AND hour <= toDateTime({until:UInt32}, 'UTC')
+          GROUP BY hour
+         HAVING newest_is_final = 1
+          ORDER BY hour DESC
+          LIMIT 1`,
+        { since, until },
+      );
+      if (row !== undefined) return Number(row.newest_final);
+    }
+    return undefined;
   }
 }
 

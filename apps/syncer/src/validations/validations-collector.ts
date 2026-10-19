@@ -379,7 +379,7 @@ interface ManifestAnswer {
  *   meanwhile, and the next flush writes them. An insert that times out after ClickHouse has taken the rows is written a
  *   second time (the count of that validation is then too high by the rows of that flush): rare, and accepted. The
  *   buffer is bounded (`MAX_BUFFERED_ROWS`); past it the oldest rows are dropped, counted and logged.
- * - **Exactly-once for the per-validator tables.** A flush writes `validator_manifests`, `validations`,
+ * - **No duplicates on a retried batch, for the per-validator tables.** A flush writes `validator_manifests`, `validations`,
  *   `validator_validations`, `validator_seen`, in that order; a table that fails neither stops the ones after it nor makes
  *   the ones before it be written again (`flush()` rejects only for `validations`). The rows of `validator_validations`
  *   and `validator_seen` leave in batches, one per flush, each with the `insert_deduplication_token`

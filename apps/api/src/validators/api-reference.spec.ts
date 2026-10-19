@@ -48,6 +48,12 @@ import {
 const REFERENCE = join(__dirname, '..', '..', '..', '..', 'docs', 'api-reference.md');
 const SECTION = 'Validators and amendments';
 
+/**
+ * Whether `key` is an own key of `object`: `in` would take a key of the prototype (`constructor`, `toString`) for one of the
+ * map. (`Object.hasOwn` is ES2022, past the ES2021 library of the repo's TypeScript.)
+ */
+const hasOwn = (object: object, key: string): boolean => Object.prototype.hasOwnProperty.call(object, key);
+
 /** The object as the reference names it on its line, and the constant that holds its keys. One entry for each constant of the routes. */
 const OBJECTS: Record<string, readonly string[]> = {
   // GET /v2/network/validators/summary
@@ -123,7 +129,7 @@ function problemsOf(markdown: string): string[] {
     }
   }
   for (const { object } of lines) {
-    if (!(object in OBJECTS)) problems.push(`unknown: a line for "${object}", which the map does not name`);
+    if (!hasOwn(OBJECTS, object)) problems.push(`unknown: a line for "${object}", which the map does not name`);
   }
   return problems;
 }
@@ -139,7 +145,7 @@ describe('the "Validators and amendments" section of docs/api-reference.md', () 
 
   it('has no line for an object the map does not name, and none twice', () => {
     const names = keyLines(markdown).map((line) => line.object);
-    expect(names.filter((name) => !(name in OBJECTS))).toEqual([]);
+    expect(names.filter((name) => !hasOwn(OBJECTS, name))).toEqual([]);
     expect(names.filter((name, i) => names.indexOf(name) !== i)).toEqual([]);
     expect(names).toHaveLength(Object.keys(OBJECTS).length);
   });

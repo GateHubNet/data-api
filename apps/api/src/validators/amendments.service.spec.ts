@@ -211,7 +211,7 @@ describe('AmendmentsService', () => {
       });
     });
 
-    it('keeps the newest round when it is older than 30 days, and the older ones are not read', async () => {
+    it('keeps the newest round when it is older than 30 days, and reads the tallies of that round', async () => {
       const old = { ...round, closeTime: NOW_S - 40 * 86_400 };
       const { svc, ch } = setup({
         ch: fakeClickHouse(() => []),

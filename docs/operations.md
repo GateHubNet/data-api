@@ -74,7 +74,7 @@ The change that adds the `validators` worker, migration `002` and the validators
 
 **Constraint.** Deploy it to a persistent environment only after `feat/amm-data` is merged, or accept losing what it collected: that branch edits
 `001_baseline.sql` in place, the migration runner refuses the changed checksum, so a database created before the merge is recreated, and the
-`validations` (90 days), votes, tallies, agreement, first-seen history, stored UNL lists and domain results cannot be recomputed
+`validations` (90 days), votes, tallies, agreement, first-seen history, stored UNL lists, domain results and polled ledger states (`network_state`) cannot be recomputed
 ([deployment](deployment.md#rolling-out-the-validators-and-amendments-data) has the whole text).
 
 **Order.** `migrate-<network>` (applies `002`), then `syncer-<network>`, then `api-<network>`. `dc up -d` with your `--scale` flags runs the migrate jobs first
@@ -85,15 +85,15 @@ explicitly, and egress to the publishers (and to the validators' domains, or `GH
 **Filling.** After the syncer starts the tables fill by themselves; the times are estimates for XRPL, and the metrics ([observability](observability.md))
 show the progress:
 
-| Data | Ready after | Watch |
-| --- | --- | --- |
-| UNL lists, network state, amendment names | The first fetch and poll: seconds to a minute | `syncer_validators_unl_fetches_total{outcome="ok"}`, `syncer_validators_node_polls_total`; the `unl.publishers` of the summary |
-| First seen | The seeding scan of `validations`, in the background, one statement per partition: about a minute | The log line `validator_seen was seeded from validations` |
-| Domain verification | Passes of up to 100 checks a minute: minutes for a few hundred domains | `syncer_validators_domain_checks_total` |
-| Versions | The first voting ledger after the new collector: at most about 17 minutes | `version` on a validator row |
-| Votes and tallies | The back-fill of the retained rounds (up to about 7,600 on XRPL), 5 s of every minute: about 1-2 hours | `syncer_validators_rounds_lag_ledgers` falling to 0; `votes_through_ledger` of the summary |
-| Agreement 1 h / 24 h / 30 d | A day per query during catch-up, 10 s of every minute: about 1-2 hours for 90 days. A window is complete once the collector has run, and the ledgers are indexed, for as long as the window is: 30-day agreement needs 30 days of both | `syncer_validators_agreement_lag_seconds`; `agreement_through` of the summary; `incomplete` on a window |
-| Recent validations of a validator | From the deploy on (the table keeps 7 days) | `GET /v2/network/validators/{key}/validations` |
+| Data                                      | Ready after                                                                                                                                                                                                                            | Watch                                                                                                                          |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| UNL lists, network state, amendment names | The first fetch and poll: seconds to a minute                                                                                                                                                                                          | `syncer_validators_unl_fetches_total{outcome="ok"}`, `syncer_validators_node_polls_total`; the `unl.publishers` of the summary |
+| First seen                                | The seeding scan of `validations`, in the background, one statement per partition: about a minute                                                                                                                                      | The log line `validator_seen was seeded from validations`                                                                      |
+| Domain verification                       | Passes of up to 100 checks a minute: minutes for a few hundred domains                                                                                                                                                                 | `syncer_validators_domain_checks_total`                                                                                        |
+| Versions                                  | The first voting ledger after the new collector: at most about 17 minutes                                                                                                                                                              | `version` on a validator row                                                                                                   |
+| Votes and tallies                         | The back-fill of the retained rounds (up to about 7,600 on XRPL), 5 s of every minute: about 1-2 hours                                                                                                                                 | `syncer_validators_rounds_lag_ledgers` falling to 0; `votes_through_ledger` of the summary                                     |
+| Agreement 1 h / 24 h / 30 d               | A day per query during catch-up, 10 s of every minute: about 1-2 hours for 90 days. A window is complete once the collector has run, and the ledgers are indexed, for as long as the window is: 30-day agreement needs 30 days of both | `syncer_validators_agreement_lag_seconds`; `agreement_through` of the summary; `incomplete` on a window                        |
+| Recent validations of a validator         | From the deploy on (the table keeps 7 days)                                                                                                                                                                                            | `GET /v2/network/validators/{key}/validations`                                                                                 |
 
 History from before the collector ran does not exist: "first seen" means first seen by this deployment, and there is no agreement or vote
 history before the first stored hour or round.
@@ -111,7 +111,8 @@ pnpm --filter @gatehub/data-api-shared amendments:check -- --network xahau --cli
 ```
 
 It asks a public node (`--endpoint <wss url>`, by default the first default endpoint of the network) for `feature` and the `Amendments`
-ledger object, prints three lists and exits 1 when any is not empty. With `--clickhouse` it also reads the newest round's votes and the
+ledger object, prints three lists and exits 1 when any is not empty. A node of the other network (its `server_info.network_id`) fails the
+run before anything is compared. With `--clickhouse` it also reads the newest round's votes and the
 indexed `EnableAmendment` transactions from the database the `GH_CLICKHOUSE_*` variables name.
 
 | List | What to do |

@@ -959,7 +959,8 @@ describe('GET /v2/network/amendments: a newest round rewritten after the directo
   const X = 'AB'.repeat(32);
   let started: Started;
   let h: Harness;
-  let api: ApiClient;
+  let list: Record<string, any>;
+  let d: Record<string, any>;
 
   beforeAll(async () => {
     started = await startWithDirectory({
@@ -968,7 +969,7 @@ describe('GET /v2/network/amendments: a newest round rewritten after the directo
       env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: FIXTURE },
     });
     h = started.h;
-    api = await h.api();
+    const api = await h.api();
     const [a, b, c] = fleet('xrpl', 3);
     const now = Math.floor(Date.now() / 1000);
     // the rewrite must not hide the older version: stop the merges
@@ -1005,13 +1006,15 @@ describe('GET /v2/network/amendments: a newest round rewritten after the directo
       ],
       tallies: [{ id: X, yes: 1 }],
     });
+    // the answers right after: within the 10 s the directory built above is kept, however slow the runner
+    list = (await api.ok(LIST)).body;
+    d = (await api.ok(detailOf(X))).body;
   });
   afterAll(async () => {
     await h?.close();
   });
 
-  it('states the round, its votes and its tallies of one version: the one the directory has', async () => {
-    const list = (await api.ok(LIST)).body;
+  it('states the round, its votes and its tallies of one version: the one the directory has', () => {
     expect(list.round).toMatchObject({ ledger_index: VOTING_LEDGER, unl_size: 2, trusted: 2, threshold: 1, needed: 2 });
     expect(list.amendments.find((a: { id: string }) => a.id === X)).toEqual({
       id: X,
@@ -1020,8 +1023,7 @@ describe('GET /v2/network/amendments: a newest round rewritten after the directo
     });
   });
 
-  it('has the rounds and the votes of the validators of that version too', async () => {
-    const d = (await api.ok(detailOf(X))).body;
+  it('has the rounds and the votes of the validators of that version too', () => {
     expect(d.round).toMatchObject({ trusted: 2, unl_size: 2 });
     expect(d.rounds).toMatchObject([{ ledger_index: VOTING_LEDGER, yes: 2, trusted: 2, threshold: 1, passes: true }]);
     expect(d.unl_votes.map((v: { vote: string }) => v.vote)).toEqual(['yes', 'yes']);

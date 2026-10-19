@@ -49,16 +49,17 @@ and its URL, description, `obsolete`, `retired`). `amendments:check` compares it
 **Version sets.** A voting round (`validator_votes` + `amendment_tallies`) and an hour (`validator_agreement_hourly`) are each written whole
 under one `version`, the sentinel row last; a reader keeps only the newest sentinel's version of each unit, so no read mixes two.
 
-**Migration `002_validators_amendments.sql` and the deploy-order constraint.** The migration is additive (two `ADD COLUMN IF NOT EXISTS`
-and ten `CREATE TABLE IF NOT EXISTS`) and needs no undo. It is deployed in the order `migrate-<network>`, `syncer-<network>`,
+**Migration `002_validators_amendments.sql` and the deploy-order constraint.** The migration is additive (two `ALTER TABLE` statements
+adding four columns with `ADD COLUMN IF NOT EXISTS`, and ten `CREATE TABLE IF NOT EXISTS`) and needs no undo. It is deployed in the order `migrate-<network>`, `syncer-<network>`,
 `api-<network>`. D1 goes to a persistent environment only after the owner has merged `feat/amm-data`, or the owner accepts the loss
 below: that branch edits `001_baseline.sql` in place, the migration runner refuses an applied file whose checksum changed, so a database
 created before that merge is recreated, and with it what D1 collected and cannot recompute (the 90 days of `validations` from which votes
 and agreement are back-filled, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly`, the first-seen history, the stored
-lists, the domain results).
+lists, the domain results, and the polled ledger states of `network_state`, whose negative UNL and majorities the rounds and the hours
+read).
 
 ### Deviations and decisions made while building it
-- **`gapsOf` is edge-aware** (a deliberate deviation from spec 2.5's formula). Spec 2.5 counts the ledger indices missing between an hour's
+- **`gapsOf` is edge-aware** (ruling P10; a deliberate deviation from spec 2.5's formula). Spec 2.5 counts the ledger indices missing between an hour's
   first and last ledger. Here the indices missing between the hour and the nearest committed ledger before and after it count too, so a
   ledger missing at the border of two hours keeps both from being final. An hour that borders a gap is not final.
 - **The safe fetcher blocks more special-purpose ranges than spec 8.1 lists** (a deliberate widening): on top of the nine IPv6 ranges of the
@@ -77,8 +78,13 @@ lists, the domain results).
   `first_seen` is more than an hour newer than the oldest validation (an interrupted seeding shows at the next start).
 - **The below-quorum warning of a round counts the observed UNL members that are not on the negative UNL**, whose validations rippled
   discounts; so the count in the warning can be below the stored `observed`.
-- **Recent validations merge the rows recorded under the master's signing keys** (a validation recorded before its manifest was known is
-  the master's), with one bounded inner read per key and a sum outside them; the read grows its room while partial rows fill it.
+- **Recent validations merge the rows recorded under the master's signing keys** (ruling P9: a validation recorded before its manifest was
+  known is the master's), with one bounded inner read per key and a sum outside them; the read grows its room while partial rows fill it.
+- **The manifest map is computed inside each statement that maps keys** (`KEY_MAP_WITH` and `mappedKey` of `packages/shared`), not
+  sent with it as the query parameters the plan named: the client puts parameters in the URL, about 122 bytes a manifest, and
+  `validator_manifests` keeps every manifest the stream brings, so some 9,000 manifests (which anyone can broadcast) would pass the 1 MiB
+  of a URL ClickHouse takes and fail every route and job of D1. The newest manifest of a master is `argMax(…, (seq, notEmpty(manifest)))`
+  (`NEWEST_MANIFEST_ORDER`): a row of 001 and the row with the raw manifest share a `seq` until a merge.
 - **An hour with an empty UNL is not written.** It would be final with nothing observed; the hour waits for a validator list.
 - **Deviations from `data.ripple.com`** are the amendment to [ADR-0010](0010-ripple-v2-wire-compatibility.md) and the "Differences" of the
   routes in [api-reference](../api-reference.md#validators-and-amendments).

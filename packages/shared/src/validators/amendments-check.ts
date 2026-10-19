@@ -6,7 +6,7 @@ export interface AmendmentsCheckFindings {
   missingNames: string[];
   /** IDs of the ledger or of the current votes that neither the file nor the node names. */
   unnamedIds: string[];
-  /** Entries whose `enabled.ledger_index` differs from the ledger of the indexed `EnableAmendment`. */
+  /** Entries whose `enabled.ledger_index` differs from the ledger of the indexed `EnableAmendment`, once per entry and ledger. */
   contradictions: { name: string; file: number; indexed: number }[];
 }
 
@@ -45,11 +45,15 @@ export function amendmentsCheckFindings(input: AmendmentsCheckInput): Amendments
     if (!config.byId.has(id) && !namedByNode.has(id)) unnamedIds.add(id);
   }
 
+  // once per entry and indexed ledger: the index can hold an event twice, or under an ID of another case
   const contradictions: AmendmentsCheckFindings['contradictions'] = [];
+  const listed = new Set<string>();
   for (const event of input.enabledEvents ?? []) {
     const entry = config.byId.get(event.id.toUpperCase());
     const file = entry?.enabled?.ledger_index;
-    if (entry && file !== undefined && file !== event.ledgerIndex) {
+    const key = `${entry?.name}\u0000${event.ledgerIndex}`;
+    if (entry && file !== undefined && file !== event.ledgerIndex && !listed.has(key)) {
+      listed.add(key);
       contradictions.push({ name: entry.name, file, indexed: event.ledgerIndex });
     }
   }

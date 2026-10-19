@@ -438,7 +438,14 @@ describe('loadAmendmentsConfig', () => {
         'fix1523',
         'fix1528',
       ];
-      expect(config.amendments.filter((a) => a.retired).map((a) => a.name)).toEqual(expect.arrayContaining(retired));
+      // exactly these 15: no other entry of the file is retired
+      expect(retired).toHaveLength(15);
+      expect(
+        config.amendments
+          .filter((a) => a.retired)
+          .map((a) => a.name)
+          .sort(),
+      ).toEqual([...retired].sort());
       for (const name of retired) expect(config.byName.get(name)?.enabled).toBeUndefined();
     });
 

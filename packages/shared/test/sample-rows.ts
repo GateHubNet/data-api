@@ -283,7 +283,8 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
   },
   // validator_validations expires 7 days after last_datetime, network_state 100 days after polled_at and the hourly
   // agreement 400 days after its hour: their samples are recent. A DateTime64(3) sample ends in .125, .375, .625 or
-  // .875: a double holds those exactly and ClickHouse prints three decimals, so the round trip compares equal as text.
+  // .875, three decimals that are not zero: ClickHouse prints a DateTime64(3) with all three of its decimals, trailing
+  // zeros included (a .25 is read back as .250), and the round trip compares the values as text.
   [Table.ValidatorValidations]: {
     validation_public_key: 'nHmaster',
     ledger_index: LEDGER,

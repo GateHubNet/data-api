@@ -1,7 +1,7 @@
 import { deepFreeze } from '../../../../packages/shared/src/test-utils/deep-freeze';
 import { decodeMarker, encodeMarker } from '../common/pagination';
-import { Directory, DirectoryEntry, PublisherState } from './directory';
-import { listValidators, MARKER_KEYS, parseListQuery } from './validators-query';
+import { compareEntries, Directory, DirectoryEntry, PublisherState } from './directory';
+import { comparePlaces, listValidators, MARKER_KEYS, parseListQuery, placeOf } from './validators-query';
 
 const ID_A = 'AB'.repeat(32);
 const NAMES: Record<string, string> = { TestVoting: ID_A, testvoting: ID_A };
@@ -118,6 +118,10 @@ describe('parseListQuery', () => {
       expect(parse({ q: '\u{1F600}'.repeat(100) }).q).toBe('\u{1F600}'.repeat(100));
       expectBad(() => parse({ q: '\u{1F600}'.repeat(101) }), 'invalid search');
     });
+
+    it.each(['(', '[', '.*', '%', '\\', '^$', '?'])('takes %j as it is: text, not a pattern', (q) => {
+      expect(parse({ q }).q).toBe(q);
+    });
   });
 
   describe('marker', () => {
@@ -218,9 +222,66 @@ describe('listValidators', () => {
     expect(keysOf(list({ scope: 'all' }).rows)).toEqual(['nHA', 'nHB', 'nHE', 'nHC', 'nHD', 'nHF']);
   });
 
-  it('keeps the order of the directory: the domain first, case-insensitively, then the key', () => {
-    // 'Alpha.example' before 'beta.example' although 'A' < 'b' would not say so for 'B' vs 'a' in a plain comparison
-    expect(keysOf(list({ scope: 'all' }).rows).slice(0, 3)).toEqual(['nHA', 'nHB', 'nHE']);
+  describe('the order of a marker', () => {
+    // mixed case, domains that are one once lower-cased, upper-case keys before lower-case ones, and validators without a domain
+    const mixed = [
+      entry('nHQ2', { domain: 'Same.example' }),
+      entry('nHQ1', { domain: 'same.EXAMPLE' }),
+      entry('nHQ3', { domain: 'same.example' }),
+      entry('nHA9', { domain: 'alpha.example' }),
+      entry('nHZ1', { domain: 'Beta.example' }),
+      entry('nHB1', { domain: 'beta.example' }),
+      entry('nHC1'),
+      entry('nHA1'),
+      entry('nHc0'),
+      entry('nHD1', { domain: 'A.Example' }),
+      entry('nHD0', { domain: 'a.example' }),
+      entry('nHA2', { domain: 'Zulu.example' }),
+    ].map((each) => ({ ...each, unl: true }));
+    // the order of the directory (assembleDirectory sorts its list with compareEntries)
+    const orderedMixed = [...mixed].sort(compareEntries);
+
+    it('is the order of the directory: placeOf and comparePlaces say what compareEntries says of every pair', () => {
+      for (const a of orderedMixed) {
+        for (const b of orderedMixed) {
+          expect([a.key, b.key, Math.sign(comparePlaces(placeOf(a), placeOf(b)))]).toEqual([
+            a.key,
+            b.key,
+            Math.sign(compareEntries(a, b)),
+          ]);
+        }
+      }
+      expect(keysOf(orderedMixed)).toEqual([
+        'nHD0',
+        'nHD1',
+        'nHA9',
+        'nHB1',
+        'nHZ1',
+        'nHQ1',
+        'nHQ2',
+        'nHQ3',
+        'nHA2',
+        'nHA1',
+        'nHC1',
+        'nHc0',
+      ]);
+    });
+
+    it('so pages of one row, marker after marker, walk the directory in its order', () => {
+      const directory = directoryOf(orderedMixed);
+      const walked: string[] = [];
+      let marker: string | undefined;
+      for (let guard = 0; guard < 20; guard++) {
+        const page = listValidators(
+          directory,
+          parse({ limit: '1', ...(marker === undefined ? {} : { marker }) }, directory),
+        );
+        walked.push(...keysOf(page.rows));
+        marker = page.marker;
+        if (marker === undefined) break;
+      }
+      expect(walked).toEqual(keysOf(orderedMixed));
+    });
   });
 
   it('filters by publisher: the validators on its list in use', () => {
@@ -242,6 +303,14 @@ describe('listValidators', () => {
     expect(keysOf(list({ q: 'betakey' }).rows)).toEqual(['nHB']);
     expect(keysOf(list({ q: 'FOXKEY', scope: 'all' }).rows)).toEqual(['nHF']);
     expect(list({ q: 'nothing' }).rows).toEqual([]);
+  });
+
+  it('searches for the text of a search, not for a pattern: regular expression and LIKE characters match themselves', () => {
+    for (const q of ['(', '[', '.*', '%', '_', '\\', '^', '$', '?']) {
+      expect([q, list({ q, scope: 'all' }).rows]).toEqual([q, []]);
+    }
+    // a dot is a dot: the validators with a domain
+    expect(keysOf(list({ q: '.', scope: 'all' }).rows)).toEqual(['nHA', 'nHB', 'nHE']);
   });
 
   it('applies every filter together', () => {
