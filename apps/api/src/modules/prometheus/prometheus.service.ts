@@ -39,6 +39,12 @@ const nodeRateLimited = new Counter({
   registers: [registry],
 });
 
+const ratesOnRead = new Counter({
+  name: 'api_rates_on_read_total',
+  help: 'Asset-days valued with dailyNativeRates because native_rates_daily had no valid set for the day.',
+  registers: [registry],
+});
+
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
 nodeThrottle.on('pause', (pause: ThrottlePause) => nodeRateLimited.inc({ endpoint: pause.host }));
 
@@ -53,6 +59,8 @@ export class PrometheusService implements OnModuleInit {
   readonly txEncodeFallback = txEncodeFallback;
   /** Pauses that rate-limited nodes asked for, by endpoint host. */
   readonly nodeRateLimited = nodeRateLimited;
+  /** Asset-days whose rate was computed on read, because the table had no valid set for the day (`DailyRates`). */
+  readonly ratesOnReadTotal = ratesOnRead;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

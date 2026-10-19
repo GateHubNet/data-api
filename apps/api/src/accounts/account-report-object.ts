@@ -1,4 +1,4 @@
-import { Asset, assetKey, ratio, sumOf } from '@gatehub/data-api-shared';
+import { Asset, assetKey, QUOTIENT_DIGITS, ratio, sumOf } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 
 /** The side of a payment for the account whose report it is. */
@@ -119,8 +119,8 @@ export function ratedAssets(groups: StoredReportGroup[], native: string): Asset[
   return [...assets.values()];
 }
 
-/** The significant digits of a quotient: what the double the original printed could tell apart. */
-export const QUOTIENT_DIGITS = 17;
+/** The significant digits of a quotient (the rule of `nativeValue`, in the shared package). */
+export { QUOTIENT_DIGITS } from '@gatehub/data-api-shared';
 
 /**
  * What the payments of a group are worth in the native currency: the sum of their amounts and the largest of them. The

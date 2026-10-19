@@ -24,6 +24,17 @@ describe('PrometheusService', () => {
     expect(metrics).toContain('api_tx_encode_fallback_total{mode="binary"} 2');
   });
 
+  it('counts the asset-days valued on read because native_rates_daily had no valid set for them', async () => {
+    const service = new PrometheusService();
+    service.ratesOnReadTotal.inc(3);
+    const metrics = await service.getMetrics();
+    expect(metrics).toContain(
+      '# HELP api_rates_on_read_total Asset-days valued with dailyNativeRates because native_rates_daily had no valid set for the day.',
+    );
+    expect(metrics).toContain('# TYPE api_rates_on_read_total counter');
+    expect(metrics).toContain('api_rates_on_read_total 3');
+  });
+
   it('counts every pause a rate-limited node asked for, by endpoint host (no credentials, no default port; ruling R98)', async () => {
     const service = new PrometheusService();
     service.onModuleInit();

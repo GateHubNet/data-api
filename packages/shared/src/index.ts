@@ -45,9 +45,11 @@ export * from './aggregate/volume.job';
 
 // Query
 export * from './query/asset';
+export * from './query/daily-rates';
 export * from './query/decimal';
 export * from './query/distinct-page';
 export * from './query/rates.service';
+export * from './query/valuation';
 
 // Utils
 export * from './util/amount';
