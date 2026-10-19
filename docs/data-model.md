@@ -1,14 +1,17 @@
 # Data model and ClickHouse schema
 
-The source of truth is [`packages/shared/schema/001_baseline.sql`](../packages/shared/schema/001_baseline.sql) (one migration file,
-applied per network database by the `migrate` job); the row types are in
+The source of truth is the migration files of [`packages/shared/schema/`](../packages/shared/schema/):
+[`001_baseline.sql`](../packages/shared/schema/001_baseline.sql) and
+[`002_validators_amendments.sql`](../packages/shared/schema/002_validators_amendments.sql) (applied in file-name order, per network
+database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **23 tables** per network database, in four groups:
+enum: queries use `${Table.X}`, never string literals). **33 tables** per network database, in five groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
 | Ledger-derived (14) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created` | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
 | Node-sourced (3) | `fee_stats`, `validations`, `validator_manifests` | the `fee_stats` and `validations` workers |
+| Validators and amendments (10, migration 002) | `validator_validations`, `validator_seen`, `unl_lists`, `unl_publishers`, `validator_domains`, `network_state`, `amendment_features`, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly` | the `validations` worker (the first two) and the `validators` worker (the rest) |
 | Aggregates (3) | `stats_hourly`, `volume_daily`, `volume_live` | the `aggregator` worker |
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
 
@@ -33,10 +36,14 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | `accounts_created`, `volume_live`, `stats_hourly`, internal | `ReplacingMergeTree` | none (`volume_daily`: `toYYYYMM(day)`) | Small tables |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
 | `validations` | `AggregatingMergeTree` | `toYYYYMMDD(last_datetime)`, TTL 90 days | Partial sightings add up |
+| `validator_validations` | `AggregatingMergeTree` | `intDiv(ledger_index, 100000)`, TTL 7 days, `ttl_only_drop_parts = 1` | Sightings add up; a partition is about four days of ledgers, so expiry drops whole parts |
+| `validator_seen` | `AggregatingMergeTree` | none, no TTL | One row per validator: min / max / max |
+| The other validators and amendments tables | `ReplacingMergeTree` | none | Small tables, newest row (or newest `version`) wins |
 
 `ORDER BY` of a `ReplacingMergeTree` is its **natural unique key**. That is a safety net only: list queries never use `FINAL`, and
 recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 14 ledger-derived tables carry
-`non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped.
+`non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped; the
+two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason.
 There are no projections (they conflict with lightweight `DELETE`) and no materialized views.
 
 ### Value types
@@ -160,14 +167,30 @@ creation of an address. Read by `/accounts` and `/accounts/{a}`.
 | Table | Key / engine | Contents | Used by |
 | --- | --- | --- | --- |
 | `fee_stats` | `MergeTree`, `ORDER BY ts`, `toYYYYMM(ts)` | One rippled `fee` snapshot every ~5 s: `ts DateTime64(3)`, `current_ledger_size`, `expected_ledger_size`, `current_queue_size`, `max_queue_size UInt32`, `pct_max_queue_size Float64`, `median_fee`, `minimum_fee`, `open_ledger_fee UInt64` (drops) | `/network/fee_stats` |
-| `validations` | `AggregatingMergeTree`, `ORDER BY (ledger_hash, validation_public_key)`, TTL 90 d | `SimpleAggregateFunction` columns: `count sum`, `first_datetime min`, `last_datetime max`, the rest `any` (`ledger_index`, `reporter_public_key`, `ephemeral_public_key`, `signature`, `signing_time`, `flags`, `full`, `amendments`, `base_fee`, `load_fee`, `reserve_base`, `reserve_inc`). Rows are partial sightings, split across days and flushes: **always `GROUP BY (ledger_hash, validation_public_key)`** | `/ledgers/{hash}/validations` |
-| `validator_manifests` | `ReplacingMergeTree(seq)`, `ORDER BY ephemeral_key` | `ephemeral_key`, `master_key`, `seq` (highest wins) | the validations collector |
+| `validations` | `AggregatingMergeTree`, `ORDER BY (ledger_hash, validation_public_key)`, TTL 90 d | `SimpleAggregateFunction` columns: `count sum`, `first_datetime min`, `last_datetime max`, the rest `any` (`ledger_index`, `reporter_public_key`, `ephemeral_public_key`, `signature`, `signing_time`, `flags`, `full`, `amendments`, `base_fee`, `load_fee`, `reserve_base`, `reserve_inc`, and, added by migration 002, `server_version Nullable(UInt64)`: the software version, only in the validation of a voting ledger). Rows are partial sightings, split across days and flushes: **always `GROUP BY (ledger_hash, validation_public_key)`** | `/ledgers/{hash}/validations` |
+| `validator_manifests` | `ReplacingMergeTree(seq)`, `ORDER BY ephemeral_key` | `ephemeral_key`, `master_key`, `seq` (highest wins); added by migration 002: `domain` (`''` when none), `manifest` (raw, upper-case hex, `''` when unknown), `source` (`stream`, `rpc` or `unl`; a row written before 002 reads `stream`) | the validations collector |
+| `validator_validations` | `AggregatingMergeTree`, `ORDER BY (validation_public_key, ledger_index, ledger_hash)`, `intDiv(ledger_index, 100000)`, TTL 7 d on `last_datetime`, dedup window 100 | A validator's validations, one row per (validator, ledger, hash): `count sum`, `first_datetime min`, `last_datetime max`, `full max`, `ephemeral_public_key`, `signing_time`, `server_version` (`any`). Sightings are partial: **`GROUP BY (validation_public_key, ledger_index, ledger_hash)`** | validators endpoints (recent validations) |
+| `validator_seen` | `AggregatingMergeTree`, `ORDER BY validation_public_key`, no TTL, dedup window 100 | `first_seen min`, `last_seen max`, `last_ledger_index max` per validator: when this deployment first and last saw it | validators endpoints |
+| `unl_lists` | `ReplacingMergeTree(fetched_at)`, `ORDER BY (publisher, sequence)` | Every UNL list a publisher served: `publisher_key` (hex), `version` (1 or 2), `effective` (nullable), `expiration`, `validators` (master keys, sorted), `blob_sha256`, `response` (the JSON as served, `ZSTD(3)`) | validators worker, validators endpoints |
+| `unl_publishers` | `ReplacingMergeTree(checked_at)`, `ORDER BY publisher` | State of each configured publisher: `url`, `publisher_key`, `configured`, `threshold`, `status` (`ok` / `error`), `error` (reason code), `last_ok_at` | validators worker, validators endpoints |
+| `validator_domains` | `ReplacingMergeTree(checked_at)`, `ORDER BY (validation_public_key, domain)` | Domain verification: `status` (`verified` / `unverified`), `reason`, `status_code`, `toml_url`, `verified_at` (last success), `next_check_at`, `accounts` (the `[[ACCOUNTS]]` addresses of the last TOML that verified) | validators worker, validators endpoints |
+| `network_state` | `ReplacingMergeTree(polled_at)`, `ORDER BY ledger_index`, TTL 100 d | The ledger state read from the node at `ledger_index`: `amendments` (enabled IDs), `majorities` (`Array(Tuple(amendment, since))`), `negative_unl` (`Array(Tuple(validation_public_key, first_ledger))`), `to_disable`, `to_reenable`, the fees in force (`base_fee`, `reserve_base`, `reserve_inc`, drops) and `node_quorum` (0 = none reported) | validators worker, amendments endpoints |
+| `amendment_features` | `ReplacingMergeTree(polled_at)`, `ORDER BY amendment_id` | The `name` and `supported` flag the node reports per amendment ID | validators worker, amendments endpoints |
+| `validator_votes` | `ReplacingMergeTree(version)`, `ORDER BY (ledger_index, validation_public_key)` | Each validator's vote in a voting ledger (`ledger_index` = 256k - 1): `amendments`, the fee votes (`Nullable`, drops) and `server_version`. A **version set** | validators worker, amendments endpoints |
+| `amendment_tallies` | `ReplacingMergeTree(version)`, `ORDER BY (amendment_id, ledger_index)` | Per voting ledger and amendment: `yes`, `trusted`, `threshold`, `unl_size`, `observed`; the sentinel row (`amendment_id = ''`) also holds `unl`, `negative_unl` and the fees in force. A **version set** | validators worker, amendments endpoints |
+| `validator_agreement_hourly` | `ReplacingMergeTree(version)`, `ORDER BY (hour, validation_public_key)`, TTL 400 d on `hour` | Per hour and validator: `agreed`, `missed`, `partial`, `last_seen`; the sentinel row (`validation_public_key = ''`) holds the hour's `ledgers`, `unobserved`, `gaps`, `unl_size`, `quorum` and `final`. A **version set** | validators worker, validators endpoints |
 | `stats_hourly` | `ReplacingMergeTree(version)`, `ORDER BY hour` | Per hour: `transaction_count`, `payments_count`, `exchanges_count`, `accounts_created`, `ledger_count`, `first_close_time`, `last_close_time`, `type_counts`, `result_counts` (`Map(..., UInt64)`), `version` | `/stats` |
 | `volume_daily` | `ReplacingMergeTree(version)`, `ORDER BY (metric, day, component)`, `toYYYYMM(day)` | Per metric (`trade_volume` / `payment_volume`) and UTC day, one row per component (market or currency): the pair, `amount` (exact string) and `amount_f`, `count`, `rate_f`, `converted_f` (value in the native currency), `config_version`, `version`. A sentinel row (empty component) marks a computed day with no volume. A day's rows are written as one set under one `version`; readers keep the highest | `/network/*_volume` (historical) |
 | `volume_live` | `ReplacingMergeTree(version)`, `ORDER BY (metric, period, component)` | The same for the rolling live periods, with `start_time`, `end_time` | `/network/*_volume` (live) |
 | `ingest_log` | `ReplacingMergeTree(updated_at)`, `ORDER BY (range_start, range_end)` | Range-ingest intent: `status Enum8('started'=1,'done'=2)`. Live first-write intents use `run_id live:<bootId>` and `range_end = 0` | range-ingest, ingest boot |
 | `agg_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_hour, to_hour)` | Hour ranges whose stats must be recomputed because ingest rewrote ledgers behind the aggregator | aggregator |
 | `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network: `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
+
+The three **version sets** (`validator_votes` with `amendment_tallies` for a voting ledger, `validator_agreement_hourly` for an hour)
+follow the pattern of `volume_daily`: a unit is written whole under one `version` (wall-clock milliseconds, greater than any version
+already stored for it), its sentinel row last; a reader takes the newest sentinel's `version` and keeps only that version's rows, so
+no reader mixes two. None of the ten tables of migration 002 is a ledger table: none is in `CHILD_TABLES` or `LEDGER_KEYED_TABLES`,
+so ingest recovery never deletes from them.
 
 ## 4. Relationships
 
@@ -189,7 +212,14 @@ creation of an address. Read by `/accounts` and `/accounts/{a}`.
 2. It verifies the SHA-256 checksum of every applied file; **an applied file that changed is a hard error**
    (`Migration ... was modified after being applied`).
 3. It applies the new files in file-name order, statement by statement, and records each with its checksum. All DDL is `CREATE ...
-   IF NOT EXISTS`, so a file that failed halfway can be run again.
+   IF NOT EXISTS` (or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`), so a file that failed halfway can be run again.
+
+The files so far:
+
+| File | Contents |
+| --- | --- |
+| `001_baseline.sql` | The 23 tables of the baseline |
+| `002_validators_amendments.sql` | Two `ALTER TABLE` statements (`validations.server_version`; `validator_manifests.domain`, `.manifest`, `.source`) and the ten validators and amendments tables. Additive: it reads nothing of 001 but those two tables, so it applies on a database that already ran 001, and a half-applied run is completed by running it again |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -202,7 +232,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add `002_*.sql`; never edit `001_baseline.sql` once it has been applied anywhere. A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
@@ -212,6 +242,10 @@ local volumes).
   fraction of it.
 - Retention is by partition, but always the same ledger block from all 14 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
   expires by TTL after 90 days.
+- The tables of migration 002 are not ledger tables, so no ledger retention touches them. They expire by TTL: `validator_validations`
+  after 7 days of `last_datetime` (about 1 GB on XRPL; whole parts are dropped), `network_state` after 100 days of `polled_at` and
+  `validator_agreement_hourly` after 400 days of its `hour`. `validator_seen`, `validator_votes`, `amendment_tallies`, `unl_lists`,
+  `unl_publishers`, `validator_domains` and `amendment_features` are kept for ever (small); `validations` keeps its 90 days.
 - Rollups (`stats_hourly`, `volume_*`) and `fee_stats` are small; keep them.
 
 ## 7. Adding a table or column

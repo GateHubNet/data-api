@@ -5,12 +5,15 @@ import {
   AccountTransactionsRow,
   AccountTxBySequenceRow,
   AggDirtyRow,
+  AmendmentFeaturesRow,
+  AmendmentTalliesRow,
   BalanceChangesRow,
   ExchangesRow,
   FeeStatsRow,
   IngestLogRow,
   LedgerByHashRow,
   LedgersRow,
+  NetworkStateRow,
   PARSER_VERSION,
   PaymentsByCurrencyRow,
   PaymentsRow,
@@ -19,8 +22,15 @@ import {
   TransactionsRow,
   TxByHashRow,
   TxByTypeRow,
+  UnlListsRow,
+  UnlPublishersRow,
   ValidationsRow,
+  ValidatorAgreementHourlyRow,
+  ValidatorDomainsRow,
   ValidatorManifestsRow,
+  ValidatorSeenRow,
+  ValidatorValidationsRow,
+  ValidatorVotesRow,
   VolumeDailyRow,
   VolumeLiveRow,
 } from '../src/clickhouse/rows';
@@ -45,6 +55,16 @@ export interface TableRows {
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
+  [Table.ValidatorValidations]: ValidatorValidationsRow;
+  [Table.ValidatorSeen]: ValidatorSeenRow;
+  [Table.UnlLists]: UnlListsRow;
+  [Table.UnlPublishers]: UnlPublishersRow;
+  [Table.ValidatorDomains]: ValidatorDomainsRow;
+  [Table.NetworkState]: NetworkStateRow;
+  [Table.AmendmentFeatures]: AmendmentFeaturesRow;
+  [Table.ValidatorVotes]: ValidatorVotesRow;
+  [Table.AmendmentTallies]: AmendmentTalliesRow;
+  [Table.ValidatorAgreementHourly]: ValidatorAgreementHourlyRow;
   [Table.StatsHourly]: StatsHourlyRow;
   [Table.VolumeDaily]: VolumeDailyRow;
   [Table.VolumeLive]: VolumeLiveRow;
@@ -63,6 +83,10 @@ const CLOSE_MS = 1_700_000_000.123;
  * written) and is partitioned by day, so its samples need a recent time that is far from a day boundary.
  */
 export const TODAY_NOON = Math.floor(Date.now() / 86_400_000) * 86_400 + 43_200;
+/** A rippled 2.3.0 release as `encodeSoftwareVersion` packs it: above 2^53, so it is a string. */
+const SERVER_VERSION = '1745991492456939520';
+/** Wall-clock milliseconds, as the `version` of a version set. */
+const VERSION_MS = 1_700_000_000_123;
 const ISSUER = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 const ALICE = 'rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn';
 const BOB = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
@@ -247,8 +271,131 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     load_fee: 256,
     reserve_base: 10_000_000,
     reserve_inc: 2_000_000,
+    server_version: SERVER_VERSION,
   },
-  [Table.ValidatorManifests]: { ephemeral_key: 'n9ephemeral', master_key: 'nHmaster', seq: 5 },
+  [Table.ValidatorManifests]: {
+    ephemeral_key: 'n9ephemeral',
+    master_key: 'nHmaster',
+    seq: 5,
+    domain: 'validator.example',
+    manifest: 'ABCDEF0123456789',
+    source: 'rpc',
+  },
+  // validator_validations expires 7 days after last_datetime, network_state 100 days after polled_at and the hourly
+  // agreement 400 days after its hour: their samples are recent. A DateTime64(3) sample ends in .125, .375, .625 or
+  // .875: a double holds those exactly and ClickHouse prints three decimals, so the round trip compares equal as text.
+  [Table.ValidatorValidations]: {
+    validation_public_key: 'nHmaster',
+    ledger_index: LEDGER,
+    ledger_hash: hash(1),
+    count: 2,
+    first_datetime: TODAY_NOON + 0.125,
+    last_datetime: TODAY_NOON + 0.875,
+    ephemeral_public_key: 'n9ephemeral',
+    signing_time: 750_000_000,
+    full: 1,
+    server_version: SERVER_VERSION,
+  },
+  [Table.ValidatorSeen]: {
+    validation_public_key: 'nHmaster',
+    first_seen: 1_699_000_000.125,
+    last_seen: 1_700_000_000.875,
+    last_ledger_index: LEDGER,
+  },
+  [Table.UnlLists]: {
+    publisher: 'vl.example',
+    publisher_key: 'ED' + '0'.repeat(64),
+    sequence: 2026070302,
+    version: 1,
+    effective: CLOSE - 3_600,
+    expiration: CLOSE + 86_400,
+    validators: ['nHmaster', 'nHother'],
+    blob_sha256: hash(21).toLowerCase(),
+    fetched_at: CLOSE_MS,
+    response: '{"version":1,"blob":"e30="}',
+  },
+  [Table.UnlPublishers]: {
+    publisher: 'vl.example',
+    url: 'https://vl.example',
+    publisher_key: 'ED' + '0'.repeat(64),
+    configured: 1,
+    threshold: 1,
+    checked_at: CLOSE_MS,
+    status: 'error',
+    error: 'timeout',
+    last_ok_at: 1_699_999_400.625,
+  },
+  [Table.ValidatorDomains]: {
+    validation_public_key: 'nHmaster',
+    domain: 'validator.example',
+    status: 'verified',
+    reason: '',
+    status_code: 0,
+    toml_url: 'https://validator.example/.well-known/xrp-ledger.toml',
+    checked_at: CLOSE_MS,
+    verified_at: 1_699_999_990.375,
+    next_check_at: CLOSE + 3_600,
+    accounts: [ALICE, BOB],
+  },
+  [Table.NetworkState]: {
+    ledger_index: LEDGER,
+    ledger_hash: hash(1),
+    polled_at: TODAY_NOON + 0.125,
+    amendments: [hash(31), hash(32)],
+    majorities: [{ amendment: hash(33), since: CLOSE }],
+    negative_unl: [{ validation_public_key: 'nHdisabled', first_ledger: LEDGER - 100 }],
+    to_disable: 'nHtodisable',
+    to_reenable: 'nHtoreenable',
+    base_fee: 10,
+    reserve_base: 10_000_000,
+    reserve_inc: 2_000_000,
+    node_quorum: 28,
+  },
+  [Table.AmendmentFeatures]: { amendment_id: hash(31), name: 'AMM', supported: 1, polled_at: CLOSE_MS },
+  [Table.ValidatorVotes]: {
+    ledger_index: LEDGER,
+    validation_public_key: 'nHmaster',
+    ledger_hash: hash(1),
+    close_time: CLOSE,
+    full: 1,
+    amendments: [hash(31), hash(32)],
+    base_fee: 10,
+    reserve_base: 10_000_000,
+    reserve_inc: 2_000_000,
+    server_version: SERVER_VERSION,
+    version: VERSION_MS,
+  },
+  [Table.AmendmentTallies]: {
+    ledger_index: LEDGER,
+    amendment_id: hash(31),
+    close_time: CLOSE,
+    yes: 28,
+    trusted: 35,
+    threshold: 28,
+    unl_size: 35,
+    observed: 34,
+    unl: ['nHmaster', 'nHother'],
+    negative_unl: ['nHdisabled'],
+    base_fee: 10,
+    reserve_base: 10_000_000,
+    reserve_inc: 2_000_000,
+    version: VERSION_MS,
+  },
+  [Table.ValidatorAgreementHourly]: {
+    hour: TODAY_NOON - 43_200,
+    validation_public_key: 'nHmaster',
+    agreed: 900,
+    missed: 3,
+    partial: 1,
+    last_seen: TODAY_NOON - 40_000 + 0.875,
+    ledgers: 1_000,
+    unobserved: 2,
+    gaps: 1,
+    unl_size: 35,
+    quorum: 28,
+    final: 1,
+    version: VERSION_MS,
+  },
   [Table.StatsHourly]: {
     hour: 1_699_999_200,
     transaction_count: 300,

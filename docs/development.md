@@ -57,7 +57,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
   `FixtureLedgerSource`, `raw-ledger.ts`.
 - `src/xrpl/node-client.ts`, `src/query/` (rates, decimals), `src/aggregate/` (stats and volume jobs), `src/util/`.
-- `schema/001_baseline.sql`: the schema (a migration unit; **not** under `src/`).
+- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
 - `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
 Everything the apps use is re-exported from `packages/shared/src/index.ts`: **export what you add there.**
@@ -199,8 +199,9 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/002_*.sql` (never edit an applied one; `CREATE ... IF NOT EXISTS`, and the
-   semicolon of a statement must end its last line, no comment line may end with `;`).
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `002_validators_amendments.sql`;
+   never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
+   statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.
 3. For a ledger-derived table: have `buildLedgerRows` produce the rows and add the table to `CHILD_TABLES` (`build-rows.ts`), to
    `LEDGER_KEYED_TABLES` (`ingest-state.ts`, so recovery deletes it; keep its partitioning identical to the DDL) and give it

@@ -9,7 +9,7 @@ The workload is append-only, ledger-ordered data read two ways: selective lookup
 and aggregates (candles, rates, volumes, stats). That is columnar-OLAP territory and what the previous design (a search engine
 used for aggregations) was weakest at ([ADR-0001](adr/0001-use-clickhouse.md)).
 
-One ClickHouse **server** holds one **database per network** (`xrpl`, `xahau`), each with the same 23 tables
+One ClickHouse **server** holds one **database per network** (`xrpl`, `xahau`), each with the same 33 tables
 ([ADR-0009](adr/0009-one-deployment-per-network.md)). The image is pinned to `clickhouse/clickhouse-server:26.8.14.3` (the schema
 and the syncer's recovery rely on partition-scoped lightweight `DELETE` and on `async_insert=0`, both verified on that version);
 `clickhouse-keeper` is pinned to the same version.

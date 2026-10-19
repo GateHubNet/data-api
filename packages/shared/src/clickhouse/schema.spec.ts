@@ -28,15 +28,16 @@ describe('schema files', () => {
 
     it('ends exactly one line per statement with a semicolon, and that line closes the statement', () => {
       const code = lines.filter((l) => !l.trim().startsWith('--'));
-      const creates = code.filter((l) => /^CREATE\s/i.test(l)).length;
-      expect(creates).toBeGreaterThan(0);
+      // A statement starts with CREATE or ALTER (the additive migrations alter the baseline's tables).
+      const starts = code.filter((l) => /^(CREATE|ALTER)\s/i.test(l)).length;
+      expect(starts).toBeGreaterThan(0);
 
       const enders = code.map((l, i) => (l.trimEnd().endsWith(';') ? i : -1)).filter((i) => i >= 0);
-      expect(enders).toHaveLength(creates);
-      // After a terminator comes a blank line, the next CREATE or the end of the file, never a continuation.
+      expect(enders).toHaveLength(starts);
+      // After a terminator comes a blank line, the next CREATE or ALTER, or the end of the file, never a continuation.
       for (const i of enders) {
         const next = code.slice(i + 1).find((l) => l.trim() !== '');
-        expect(next === undefined || /^CREATE\s/i.test(next)).toBe(true);
+        expect(next === undefined || /^(CREATE|ALTER)\s/i.test(next)).toBe(true);
       }
     });
   });

@@ -1,6 +1,6 @@
 /**
- * Row types: one interface per table of `schema/001_baseline.sql`, named `<Table enum key>Row`. Field names are the
- * column names (snake_case) and follow the DDL order. Rows are sent to ClickHouse as `JSONEachRow`.
+ * Row types: one interface per table of `schema/*.sql`, named `<Table enum key>Row`. Field names are the column names
+ * (snake_case) and follow the DDL order. Rows are sent to ClickHouse as `JSONEachRow`.
  *
  * Type mapping:
  *  - `UInt64` is `string | number`. Use a string for anything that can exceed 2^53 (drops, `total_coins`).
@@ -10,6 +10,7 @@
  *  - `Date` is a `'YYYY-MM-DD'` string.
  *  - `Map(LowCardinality(String), UIntN)` is `Record<string, number>`.
  *  - `Nullable(T)` is `T | null`; `Enum8` is the union of its labels; everything else follows its plain TS type.
+ *  - `Array(String)` is `string[]`; a named `Tuple` is an object with the tuple's element names.
  *
  * Reading back is not symmetric: with the server defaults a `UInt64` comes back as a JSON number (lossy above 2^53)
  * and a `DateTime` as a `'YYYY-MM-DD HH:MM:SS'` string. Select `toString(col)` when the exact digits matter.
@@ -255,12 +256,189 @@ export interface ValidationsRow {
   load_fee: UInt64Value | null;
   reserve_base: UInt64Value | null;
   reserve_inc: UInt64Value | null;
+  /**
+   * The software version the validator reported (`sfServerVersion`), an encoded UInt64 (keep it a string: it exceeds
+   * 2^53). NULL when the validation carries none: only a validation of a voting ledger does. Added by migration 002.
+   */
+  server_version: UInt64Value | null;
 }
 
 export interface ValidatorManifestsRow {
   ephemeral_key: string;
   master_key: string;
   seq: number;
+  /** The domain the manifest names, `''` when it names none. Added by migration 002. */
+  domain: string;
+  /** The raw manifest, upper-case hex, `''` when not known. Added by migration 002. */
+  manifest: string;
+  /** Where the manifest came from: the validations stream, the `manifest` RPC or a published UNL list. */
+  source: 'stream' | 'rpc' | 'unl';
+}
+
+// -- Validators and amendments (migration 002) -------------------------------------------------------------------
+
+/**
+ * One validator's validations of one ledger, kept 7 days. Rows with the same `(validation_public_key, ledger_index,
+ * ledger_hash)` merge in the background like `validations` does: `count` sums, `first_datetime` takes the min,
+ * `last_datetime` the max, `full` the max (a full validation wins over a partial one), the rest keep one value.
+ */
+export interface ValidatorValidationsRow {
+  validation_public_key: string;
+  ledger_index: number;
+  ledger_hash: string;
+  count: UInt64Value;
+  first_datetime: UnixSecondsMs;
+  last_datetime: UnixSecondsMs;
+  ephemeral_public_key: string;
+  signing_time: number;
+  /** 1 for a full validation, 0 for a partial one. */
+  full: number;
+  server_version: UInt64Value | null;
+}
+
+/** When a validator was first and last seen by this deployment. Rows of one key merge: min, max, max. */
+export interface ValidatorSeenRow {
+  validation_public_key: string;
+  first_seen: UnixSecondsMs;
+  last_seen: UnixSecondsMs;
+  last_ledger_index: number;
+}
+
+/** One list a UNL publisher served (the newest row of a `(publisher, sequence)` wins). */
+export interface UnlListsRow {
+  /** The publisher's id, e.g. `vl.ripple.com`. */
+  publisher: string;
+  /** The publisher's master key, hex. */
+  publisher_key: string;
+  sequence: UInt64Value;
+  /** The list format: 1 or 2. */
+  version: number;
+  effective: UnixSeconds | null;
+  expiration: UnixSeconds;
+  /** Master keys (base58), sorted. */
+  validators: string[];
+  blob_sha256: string;
+  fetched_at: UnixSecondsMs;
+  /** The JSON as the publisher served it. */
+  response: string;
+}
+
+/** The newest state of each configured UNL publisher. */
+export interface UnlPublishersRow {
+  publisher: string;
+  url: string;
+  publisher_key: string;
+  /** 1 while the publisher is in the configuration. */
+  configured: number;
+  /** The trusted-set threshold in force. */
+  threshold: number;
+  checked_at: UnixSecondsMs;
+  /** `ok` or `error`. */
+  status: string;
+  /** A reason code, `''` when `ok`. */
+  error: string;
+  last_ok_at: UnixSecondsMs | null;
+}
+
+/** The newest domain check of a validator. */
+export interface ValidatorDomainsRow {
+  validation_public_key: string;
+  domain: string;
+  /** `verified` or `unverified`. */
+  status: string;
+  reason: string;
+  /** The HTTP status when `reason` is `http_status`, else 0. */
+  status_code: number;
+  toml_url: string;
+  checked_at: UnixSecondsMs;
+  /** The last time the check succeeded. */
+  verified_at: UnixSecondsMs | null;
+  next_check_at: UnixSeconds;
+  /** The `[[ACCOUNTS]]` addresses of the last TOML that verified, sorted; empty when unverified. */
+  accounts: string[];
+}
+
+/** The ledger state the node reports: enabled amendments, majorities, negative UNL and fees at `ledger_index`. */
+export interface NetworkStateRow {
+  ledger_index: number;
+  ledger_hash: string;
+  polled_at: UnixSecondsMs;
+  /** Enabled amendment IDs, upper-case hex. */
+  amendments: string[];
+  majorities: { amendment: string; since: UnixSeconds }[];
+  negative_unl: { validation_public_key: string; first_ledger: number }[];
+  /** base58, `''` when none. */
+  to_disable: string;
+  /** base58, `''` when none. */
+  to_reenable: string;
+  /** Fees in force, in drops. */
+  base_fee: UInt64Value;
+  reserve_base: UInt64Value;
+  reserve_inc: UInt64Value;
+  /** The quorum the node reports, 0 when it reports none. */
+  node_quorum: number;
+}
+
+/** The name and support the node reports for an amendment ID. */
+export interface AmendmentFeaturesRow {
+  amendment_id: string;
+  name: string;
+  supported: number;
+  polled_at: UnixSecondsMs;
+}
+
+/** One validator's vote in one voting ledger. Part of a version set: read only the newest sentinel's `version`. */
+export interface ValidatorVotesRow {
+  /** The voting ledger V. */
+  ledger_index: number;
+  validation_public_key: string;
+  ledger_hash: string;
+  close_time: UnixSeconds;
+  full: number;
+  amendments: string[];
+  /** Drops. NULL when the validation carries no such vote. */
+  base_fee: UInt64Value | null;
+  reserve_base: UInt64Value | null;
+  reserve_inc: UInt64Value | null;
+  server_version: UInt64Value | null;
+  version: UInt64Value;
+}
+
+/** The tally of one amendment in one voting ledger; `amendment_id = ''` is the round's sentinel. A version set. */
+export interface AmendmentTalliesRow {
+  ledger_index: number;
+  amendment_id: string;
+  close_time: UnixSeconds;
+  yes: number;
+  trusted: number;
+  threshold: number;
+  unl_size: number;
+  observed: number;
+  /** Filled on the sentinel only: the UNL and the negative UNL of the round, and the fees in force (drops). */
+  unl: string[];
+  negative_unl: string[];
+  base_fee: UInt64Value;
+  reserve_base: UInt64Value;
+  reserve_inc: UInt64Value;
+  version: UInt64Value;
+}
+
+/** One validator's agreement in one hour; `validation_public_key = ''` is the hour's sentinel. A version set. */
+export interface ValidatorAgreementHourlyRow {
+  hour: UnixSeconds;
+  validation_public_key: string;
+  agreed: number;
+  missed: number;
+  partial: number;
+  last_seen: UnixSecondsMs;
+  /** Filled on the sentinel only: the hour's totals. */
+  ledgers: number;
+  unobserved: number;
+  gaps: number;
+  unl_size: number;
+  quorum: number;
+  final: number;
+  version: UInt64Value;
 }
 
 // -- Aggregates --------------------------------------------------------------------------------------------------

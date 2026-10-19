@@ -101,6 +101,7 @@ function sighting(row: MockRow): ValidationsRow {
     load_fee: null,
     reserve_base: null,
     reserve_inc: null,
+    server_version: null,
   };
 }
 
@@ -124,6 +125,7 @@ function row(overrides: Partial<ValidationsRow> = {}): ValidationsRow {
     load_fee: null,
     reserve_base: null,
     reserve_inc: null,
+    server_version: null,
     ...overrides,
   };
 }

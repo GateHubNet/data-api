@@ -77,7 +77,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
 
 ### ClickHouse
 
-One server, one database per network, 23 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network, 33 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 

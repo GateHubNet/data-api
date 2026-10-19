@@ -146,6 +146,7 @@ export function validationRowFrom(
     load_fee: uint64(msg.load_fee),
     reserve_base: uint64(msg.reserve_base),
     reserve_inc: uint64(msg.reserve_inc),
+    server_version: null,
   };
 }
 
@@ -559,7 +560,14 @@ export class ValidationsCollector implements OnApplicationBootstrap, OnModuleDes
   private queueManifest(ephemeral: string, master: string, seq: number): void {
     const pending = this.pendingManifests.get(ephemeral);
     if (pending !== undefined && pending.seq >= seq) return;
-    this.pendingManifests.set(ephemeral, { ephemeral_key: ephemeral, master_key: master, seq });
+    this.pendingManifests.set(ephemeral, {
+      ephemeral_key: ephemeral,
+      master_key: master,
+      seq,
+      domain: '',
+      manifest: '',
+      source: 'stream',
+    });
   }
 
   /**

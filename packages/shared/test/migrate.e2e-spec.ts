@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
@@ -11,6 +11,8 @@ const REAL_SCHEMA_DIR = join(__dirname, '..', 'schema');
 
 const P6 = 'intDiv(ledger_index, 1000000)';
 const P7 = 'intDiv(ledger_index, 10000000)';
+/** `validator_validations`: 100 000 ledgers are about four days, so its 7-day expiry drops whole partitions. */
+const P5 = 'intDiv(ledger_index, 100000)';
 
 interface Shape {
   engine: string;
@@ -77,6 +79,50 @@ const SHAPES: Record<Table, Shape> = {
     partition: '',
     order: 'ephemeral_key',
   },
+  [Table.ValidatorValidations]: {
+    engine: 'AggregatingMergeTree',
+    partition: P5,
+    order: 'validation_public_key, ledger_index, ledger_hash',
+  },
+  [Table.ValidatorSeen]: { engine: 'AggregatingMergeTree', partition: '', order: 'validation_public_key' },
+  [Table.UnlLists]: {
+    engine: 'ReplacingMergeTree',
+    version: 'fetched_at',
+    partition: '',
+    order: 'publisher, sequence',
+  },
+  [Table.UnlPublishers]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'publisher' },
+  [Table.ValidatorDomains]: {
+    engine: 'ReplacingMergeTree',
+    version: 'checked_at',
+    partition: '',
+    order: 'validation_public_key, domain',
+  },
+  [Table.NetworkState]: { engine: 'ReplacingMergeTree', version: 'polled_at', partition: '', order: 'ledger_index' },
+  [Table.AmendmentFeatures]: {
+    engine: 'ReplacingMergeTree',
+    version: 'polled_at',
+    partition: '',
+    order: 'amendment_id',
+  },
+  [Table.ValidatorVotes]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'ledger_index, validation_public_key',
+  },
+  [Table.AmendmentTallies]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'amendment_id, ledger_index',
+  },
+  [Table.ValidatorAgreementHourly]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'hour, validation_public_key',
+  },
   [Table.StatsHourly]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'hour' },
   [Table.VolumeDaily]: {
     engine: 'ReplacingMergeTree',
@@ -122,6 +168,19 @@ const DEDUP_TABLES: Table[] = [
   Table.BalanceChanges,
   Table.AccountsCreated,
 ];
+
+/** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
+const statementsOf = (sql: string): string[] =>
+  sql
+    .split(/;\s*$/m)
+    .map((s) =>
+      s
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('--'))
+        .join('\n')
+        .trim(),
+    )
+    .filter((s) => s.length > 0);
 
 const CONTROLLED_SCHEMA = `-- Controlled schema for the migration runner e2e test.
 CREATE TABLE IF NOT EXISTS dedup_t (id UInt32, v String)
@@ -246,6 +305,15 @@ describe('migrations (e2e)', () => {
         }
       });
 
+      it('keeps the collector tables on a dedup window of 100', async () => {
+        const full = new Map((await systemTables()).map((t) => [t.name, t.engine_full]));
+        // `(?!\d)`: a window of 1000, the ledger tables', must not pass for one of 100.
+        const window100 = /non_replicated_deduplication_window = 100(?!\d)/;
+        expect(full.get(Table.ValidatorValidations)).toMatch(window100);
+        expect(full.get(Table.ValidatorSeen)).toMatch(window100);
+        expect(full.get(Table.ValidatorValidations)).toContain('ttl_only_drop_parts = 1');
+      });
+
       it('keeps transactions on a finer index granularity', async () => {
         const rows = await systemTables();
         const grain = (name: string) =>
@@ -271,6 +339,29 @@ describe('migrations (e2e)', () => {
           { db: 'xahau', t: Table.Validations },
         );
         expect(row?.create_table_query).toMatch(/TTL toDateTime\(last_datetime\) \+ toIntervalDay\(90\)/);
+      });
+
+      it('expires validator_validations after 7 days, network_state after 100 and the hourly agreement after 400', async () => {
+        const ddl = async (table: Table) =>
+          (
+            await svc.queryOne<{ create_table_query: string }>(
+              `SELECT create_table_query FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
+              { db: 'xahau', t: table },
+            )
+          )?.create_table_query;
+        expect(await ddl(Table.ValidatorValidations)).toMatch(/TTL toDateTime\(last_datetime\) \+ toIntervalDay\(7\)/);
+        expect(await ddl(Table.NetworkState)).toMatch(/TTL toDateTime\(polled_at\) \+ toIntervalDay\(100\)/);
+        expect(await ddl(Table.ValidatorAgreementHourly)).toMatch(/TTL hour \+ toIntervalDay\(400\)/);
+      });
+
+      it('keeps validator_seen, the votes and the tallies for ever', async () => {
+        const kept = await svc.query<{ name: string; create_table_query: string }>(
+          `SELECT name, create_table_query FROM system.tables WHERE database = {db:String} AND name IN {names:Array(String)}`,
+          { db: 'xahau', names: [Table.ValidatorSeen, Table.ValidatorVotes, Table.AmendmentTallies] },
+        );
+        expect(kept).toHaveLength(3);
+        for (const t of kept)
+          expect({ table: t.name, ttl: /\bTTL\b/.test(t.create_table_query) }).toEqual({ table: t.name, ttl: false });
       });
 
       it('uses DateTime(UTC) for every second-resolution time column', async () => {
@@ -407,6 +498,66 @@ describe('migrations (e2e)', () => {
         expect(rows).toEqual([{ master_key: 'nHnew', seq: 9 }]);
       });
 
+      it('fills the added columns for a row written without them', async () => {
+        const { domain: _d, manifest: _m, source: _s, ...oldManifest } = SAMPLE_ROWS[Table.ValidatorManifests];
+        await svc.insert(Table.ValidatorManifests, [{ ...oldManifest, ephemeral_key: 'n9oldshape' }]);
+        const manifest = await svc.queryOne(
+          `SELECT domain, manifest, source FROM validator_manifests WHERE ephemeral_key = 'n9oldshape'`,
+        );
+        expect(manifest).toEqual({ domain: '', manifest: '', source: 'stream' });
+
+        const { server_version: _v, ...oldValidation } = SAMPLE_ROWS[Table.Validations];
+        const ledger_hash = 'D'.repeat(64);
+        await svc.insert(Table.Validations, [{ ...oldValidation, ledger_hash }]);
+        const validation = await svc.queryOne(`SELECT server_version FROM validations WHERE ledger_hash = {h:String}`, {
+          h: ledger_hash,
+        });
+        expect(validation).toEqual({ server_version: null });
+      });
+
+      it('validator_validations: sightings merge: counts add up, first is the min, last the max, full the max', async () => {
+        const base = SAMPLE_ROWS[Table.ValidatorValidations];
+        const key = {
+          validation_public_key: 'nHmerge',
+          ledger_index: base.ledger_index + 1,
+          ledger_hash: 'F'.repeat(64),
+        };
+        await svc.insert(Table.ValidatorValidations, [
+          { ...base, ...key, count: 1, first_datetime: TODAY_NOON + 2.5, last_datetime: TODAY_NOON + 2.5, full: 0 },
+          { ...base, ...key, count: 2, first_datetime: TODAY_NOON + 0.25, last_datetime: TODAY_NOON + 8.75, full: 1 },
+        ]);
+        await svc.command('OPTIMIZE TABLE validator_validations FINAL');
+
+        const rows = await svc.query(
+          `SELECT toString(count) AS count, toString(toUnixTimestamp64Milli(first_datetime)) AS first,
+                  toString(toUnixTimestamp64Milli(last_datetime)) AS last, full
+           FROM validator_validations WHERE validation_public_key = {k:String}`,
+          { k: key.validation_public_key },
+        );
+        expect(rows).toEqual([
+          { count: '3', first: String(TODAY_NOON * 1000 + 250), last: String(TODAY_NOON * 1000 + 8750), full: 1 },
+        ]);
+      });
+
+      it('validator_seen: min of first_seen, max of last_seen and of last_ledger_index', async () => {
+        const base = SAMPLE_ROWS[Table.ValidatorSeen];
+        const key = { validation_public_key: 'nHseenmerge' };
+        // The min, the max of last_seen and the max of last_ledger_index come from different rows on purpose.
+        await svc.insert(Table.ValidatorSeen, [
+          { ...base, ...key, first_seen: 1_699_000_000.5, last_seen: 1_700_000_000.75, last_ledger_index: 200 },
+          { ...base, ...key, first_seen: 1_698_000_000.25, last_seen: 1_699_500_000.5, last_ledger_index: 300 },
+        ]);
+        await svc.command('OPTIMIZE TABLE validator_seen FINAL');
+
+        const rows = await svc.query(
+          `SELECT toString(toUnixTimestamp64Milli(first_seen)) AS first, toString(toUnixTimestamp64Milli(last_seen)) AS last,
+                  last_ledger_index
+           FROM validator_seen WHERE validation_public_key = {k:String}`,
+          { k: key.validation_public_key },
+        );
+        expect(rows).toEqual([{ first: '1698000000250', last: '1700000000750', last_ledger_index: 300 }]);
+      });
+
       it('a ledger-derived table drops a replayed insert token', async () => {
         const row = SAMPLE_ROWS[Table.LedgerByHash];
         await svc.insert(Table.LedgerByHash, [{ ...row, ledger_hash: 'A'.repeat(64) }], { dedupToken: 'replay-1' });
@@ -482,6 +633,83 @@ describe('migrations (e2e)', () => {
       await svc.command('DELETE FROM part_t IN PARTITION 1 WHERE k > {k:UInt32}', { k: 7 });
       const left = await svc.query<{ k: number }>('SELECT k FROM part_t WHERE p = 1 ORDER BY k');
       expect(left.map((r) => r.k)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    });
+  });
+
+  describe('a migration that failed half way', () => {
+    const DB = 'ctl_half';
+    let halfDir: string;
+
+    beforeAll(() => {
+      halfDir = mkdtempSync(join(tmpdir(), 'gh-schema-half-'));
+    });
+
+    afterAll(() => {
+      if (halfDir) rmSync(halfDir, { recursive: true, force: true });
+    });
+
+    it('(f) completes 002 after it failed half way', async () => {
+      const config = { ...ch.config, database: DB };
+      const previousDir = process.env.GH_SCHEMA_DIR;
+      const svc = new ClickHouseService(config);
+      const columns = (database: string) =>
+        admin.query(
+          `SELECT table, name, type, default_expression FROM system.columns
+           WHERE database = {db:String} AND table != 'schema_migrations' ORDER BY table, position`,
+          { db: database },
+        );
+      const tableNames = async (): Promise<string[]> =>
+        (
+          await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+            db: DB,
+          })
+        ).map((t) => t.name);
+
+      try {
+        // 001 alone, from a copy.
+        copyFileSync(join(REAL_SCHEMA_DIR, '001_baseline.sql'), join(halfDir, '001_baseline.sql'));
+        process.env.GH_SCHEMA_DIR = halfDir;
+        expect((await runMigrations({ config, log })).applied).toEqual(['001_baseline.sql']);
+
+        // The first half of 002 by hand, as if the runner had died after it: file not recorded, six statements applied.
+        const statements = statementsOf(readFileSync(join(REAL_SCHEMA_DIR, '002_validators_amendments.sql'), 'utf8'));
+        expect(statements).toHaveLength(12);
+        for (const statement of statements.slice(0, 6)) await svc.command(statement);
+        expect(await tableNames()).toContain(Table.UnlPublishers);
+        expect(await tableNames()).not.toContain(Table.ValidatorDomains);
+
+        // The real directory: 002 runs again from its first statement and completes.
+        process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
+        const result = await runMigrations({ config, log });
+        expect(result).toEqual({ applied: ['002_validators_amendments.sql'], skipped: ['001_baseline.sql'] });
+
+        // Every statement took effect: the ten tables, and the columns the two ALTERs added.
+        const names = await tableNames();
+        for (const table of [
+          Table.ValidatorValidations,
+          Table.ValidatorSeen,
+          Table.UnlLists,
+          Table.UnlPublishers,
+          Table.ValidatorDomains,
+          Table.NetworkState,
+          Table.AmendmentFeatures,
+          Table.ValidatorVotes,
+          Table.AmendmentTallies,
+          Table.ValidatorAgreementHourly,
+        ]) {
+          expect(names).toContain(table);
+        }
+        await expect(svc.query('SELECT server_version FROM validations LIMIT 0')).resolves.toEqual([]);
+        await expect(svc.query('SELECT domain, manifest, source FROM validator_manifests LIMIT 0')).resolves.toEqual(
+          [],
+        );
+        // And the result is the schema a straight run makes (database `xahau`, migrated by test (a)).
+        expect(await columns(DB)).toEqual(await columns('xahau'));
+      } finally {
+        if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+        else process.env.GH_SCHEMA_DIR = previousDir;
+        await svc.onModuleDestroy();
+      }
     });
   });
 });

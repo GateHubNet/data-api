@@ -186,6 +186,8 @@ const written = (s: Setup): ValidationsRow[] =>
 /** The rows of the last insert into `validations`, failed or not. */
 const lastInsert = (s: Setup): ValidationsRow[] =>
   s.insert.mock.calls.filter(([table]) => table === Table.Validations).at(-1)![1] as ValidationsRow[];
+/** What the collector adds to a manifest row today: no domain or raw manifest, and the stream as the source. */
+const STREAM_ONLY = { domain: '', manifest: '', source: 'stream' } as const;
 const writtenManifests = (s: Setup): ValidatorManifestsRow[] =>
   s.insert.mock.calls
     .filter(([table]) => table === Table.ValidatorManifests)
@@ -236,6 +238,7 @@ describe('ValidationsCollector', () => {
           load_fee: '256000',
           reserve_base: '10000000',
           reserve_inc: '2000000',
+          server_version: null,
         },
       ]);
     });
@@ -470,7 +473,7 @@ describe('ValidationsCollector', () => {
       await s.collector.flush();
       expect(written(s)[0]).toMatchObject({ validation_public_key: MASTER, ephemeral_public_key: SIGNING });
       // what the node said is kept for the next start
-      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 9 }]);
+      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 9, ...STREAM_ONLY }]);
 
       // and is known now
       s.nodes[0].emit('validationReceived', bare());
@@ -624,7 +627,7 @@ describe('ValidationsCollector', () => {
       s.nodes[0].emit('manifestReceived', manifest({ seq: 4 }));
       expect(s.insert).not.toHaveBeenCalled();
       await s.collector.flush();
-      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 4 }]);
+      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 4, ...STREAM_ONLY }]);
       await s.collector.stop();
     });
 
@@ -642,8 +645,8 @@ describe('ValidationsCollector', () => {
       s.nodes[0].emit('manifestReceived', manifest({ seq: 6 }));
       await s.collector.flush();
       expect(writtenManifests(s)).toEqual([
-        { ephemeral_key: SIGNING, master_key: MASTER, seq: 4 },
-        { ephemeral_key: SIGNING, master_key: MASTER, seq: 6 }, // one row for the two that were pending
+        { ephemeral_key: SIGNING, master_key: MASTER, seq: 4, ...STREAM_ONLY },
+        { ephemeral_key: SIGNING, master_key: MASTER, seq: 6, ...STREAM_ONLY }, // one row for the two that were pending
       ]);
       await s.collector.stop();
     });
@@ -656,7 +659,7 @@ describe('ValidationsCollector', () => {
       expect(writtenManifests(s)).toEqual([]);
       s.nodes[0].emit('manifestReceived', manifest({ seq: 8 }));
       await s.collector.flush();
-      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 8 }]);
+      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 8, ...STREAM_ONLY }]);
       await s.collector.stop();
     });
 
@@ -699,7 +702,7 @@ describe('ValidationsCollector', () => {
       await jest.advanceTimersByTimeAsync(0);
       s.nodes[0].emit('manifestReceived', manifest({ seq: 4 })); // the same manifest, now from a node that is known
       await s.collector.flush();
-      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 4 }]);
+      expect(writtenManifests(s)).toEqual([{ ephemeral_key: SIGNING, master_key: MASTER, seq: 4, ...STREAM_ONLY }]);
       await s.collector.stop();
 
       // a node of another network is not believed at all
@@ -729,8 +732,8 @@ describe('ValidationsCollector', () => {
       s.insert.mockImplementation(async () => undefined);
       await s.collector.flush();
       expect(writtenManifests(s)).toEqual([
-        { ephemeral_key: SIGNING, master_key: MASTER, seq: 4 }, // the failed attempt
-        { ephemeral_key: SIGNING, master_key: MASTER, seq: 4 }, // and the retry
+        { ephemeral_key: SIGNING, master_key: MASTER, seq: 4, ...STREAM_ONLY }, // the failed attempt
+        { ephemeral_key: SIGNING, master_key: MASTER, seq: 4, ...STREAM_ONLY }, // and the retry
       ]);
       await s.collector.stop();
     });

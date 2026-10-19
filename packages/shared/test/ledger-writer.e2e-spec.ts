@@ -28,6 +28,12 @@ const index = (i: number): number => LEDGERS[i].header.ledger_index;
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 
+/**
+ * The tables with a dedup window that are not ledger tables: the validations collector's `validator_validations` and
+ * `validator_seen` (window 100). Ingest recovery never touches them, so they are not in `LEDGER_KEYED_TABLES`.
+ */
+const COLLECTOR_DEDUP_TABLES: Table[] = [Table.ValidatorValidations, Table.ValidatorSeen];
+
 type Counts = Record<string, number>;
 
 /** What the tables hold when exactly the ledgers matching `keep` were written, from the rows `buildLedgerRows` makes. */
@@ -763,12 +769,15 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   });
 
   describe('schema contract', () => {
-    it('LEDGER_KEYED_TABLES is the set of tables with a dedup window, partitioned as declared', async () => {
+    it('LEDGER_KEYED_TABLES all have a dedup window, partitioned as declared; the collector tables are the only others', async () => {
       const svc = await freshService();
       const tables = await svc.query<{ name: string; partition_key: string }>(
         "SELECT name, partition_key FROM system.tables WHERE database = currentDatabase() AND engine_full LIKE '%non_replicated_deduplication_window%'",
       );
-      expect(new Set(tables.map((t) => t.name))).toEqual(new Set(ALL_TABLES));
+      const withWindow = new Set(tables.map((t) => t.name));
+      for (const table of ALL_TABLES)
+        expect({ table, hasWindow: withWindow.has(table) }).toEqual({ table, hasWindow: true });
+      expect(withWindow).toEqual(new Set([...ALL_TABLES, ...COLLECTOR_DEDUP_TABLES]));
       // The ledgers table and the child tables are exactly the ones LedgerWriter writes.
       expect(new Set(ALL_TABLES)).toEqual(
         new Set([Table.Ledgers, Table.LedgerByHash, ...CHILD_TABLES.map(([t]) => t)]),
