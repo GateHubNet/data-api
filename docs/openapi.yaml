@@ -1578,9 +1578,10 @@ paths:
         its start is at or after `start` and before `end`. `transactions` has a row
         for each bucket in which the account sent a transaction, with the counts of
         the whole bucket. `value` has a row for every bucket from the first one in
-        which the account had a balance to the last before `end`, active or not: its
-        value at the end of the last day of the bucket (today, for the current one)
-        and the number of balance changes in it (0 for a quiet bucket).'
+        which the account had a balance to the last before `end`, active or not, but
+        none that has not begun (the rows stop at the bucket that holds now, whatever
+        `end` says): its value at the end of the last day of the bucket (today, for
+        the current one) and the number of balance changes in it (0 for a quiet bucket).'
       parameters:
       - name: address
         required: true

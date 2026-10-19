@@ -279,18 +279,24 @@ export class AccountStatsService {
   /**
    * One page of `stats/value` per bucket: a row for every bucket from the first one in which the account had a balance (the
    * bucket of its first change, or the first that starts in the window when it changed before) to the last that starts
-   * before the end of the window, active or not.
+   * before the end of the window, active or not, and **no later than the bucket that holds now**: a bucket that has not begun
+   * is no row, whatever the end of the window says.
    *
-   * (1) The buckets of the page, by arithmetic: the span of the window, narrowed by the marker, from the first change of the
-   * account. (2) A bucket is valued at the end of its last day, or today for one that has not ended. (3) One read of the
+   * (1) The buckets of the page, by arithmetic: the span of the window, cut at the bucket of now and narrowed by the marker,
+   * from the first change of the account. (2) A bucket is valued at the end of its last day, or today for the one that has not
+   * ended. (3) One read of the
    * `lines` day groups from the epoch to the last day valued gives, for each line, the balance it was left with in each
    * bucket (the days before the page's first bucket are one group, `''`) and the number of changes of each bucket; it keeps
    * only the native line and the lines that are above 0 at some bucket end, since the others are worth 0 at every one.
    * (4) The buckets are valued with `toValueStats` and the rates of their value days.
    */
   private async valuePerBucket(q: StatsQuery, interval: VolumeInterval): Promise<StatsPage<ValueStats>> {
-    const span = this.spanOf(q, interval);
-    if (!span) return { rows: [] };
+    const window = this.spanOf(q, interval);
+    if (!window) return { rows: [] };
+    // a bucket that has not begun is no row: the rows end at the bucket that holds now, whatever the end of the window
+    const current = bucketStart(q.now, interval);
+    const span: BucketSpan = { first: window.first, last: Math.min(window.last, current) };
+    if (span.first > span.last) return { rows: [] };
     const firstDay = await firstChangeDay(this.ch, q.account);
     if (firstDay === undefined) return { rows: [] };
     // a bucket before the one of the first change is not a row: the account had nothing in it
@@ -301,7 +307,7 @@ export class AccountStatsService {
     );
     if (buckets.starts.length === 0) return { rows: [] };
 
-    // a bucket is valued at the end of its last day, or on today's rates when it has not ended (or has not begun)
+    // a bucket is valued at the end of its last day, or on today's rates when it has not ended (the one that holds now)
     const today = Math.floor(q.now / DAY_MS) * DAY_MS;
     // oldest first, whichever way the page is listed
     const items: ValueBucket[] = [...buckets.starts]

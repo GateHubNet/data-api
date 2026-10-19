@@ -929,11 +929,12 @@ the marker is that day (`YYYY-MM-DD`, the existing marker format); `descending` 
 - `family=transactions`: a row for each bucket in which the account sent a transaction, with the counts of the whole bucket. A
   bucket without one has no row, as a day has none.
 - `family=value`: a row for **every** bucket from the first one in which the account had a balance (the bucket of its first
-  balance change, or the first bucket of the window when it changed before) to the last bucket before `end`, active or not: a
+  balance change, or the first bucket of the window when it changed before) to the last bucket before `end` that has begun (see the next item), active or not: a
   value exists at every bucket end and moves with the rates. `account_value` is the value at the end of the bucket's last day
   (today, for the bucket that holds now) at that day's rates, in the native currency; `balance_change_count` counts the changes of
   the bucket, the fee not counted (0 for a quiet bucket).
-- No row is served for a bucket that has not begun: the rows end at the bucket that holds now, whatever `end` says. No bucket that
+- No row of `value` is served for a bucket that has not begun: the rows end at the bucket that holds now, whatever `end` says (a window wholly in the future has no
+  row; `transactions` is not affected: a bucket in which the account sent nothing has no row anyway). No bucket that
   starts after 2149-06-06 (the last day a ClickHouse `Date` holds) is served.
 
 Paging is unchanged (`limit` 200, at most 1000): the whole history of an account per month is about 170 rows, one page. A heavy
@@ -1036,6 +1037,8 @@ The balance of each trust line (and the native balance) of the account at the en
 | `counterparty` (alias `issuer`) | all | Only the lines with this account. Not together with the native currency: 400 `counterparty cannot be specified for XRP` (`XAH` on Xahau), the message of `balance_changes`. |
 | `limit` | 10 (max 50) | How many lines. |
 | `format` | json | `csv`: file `<address> - balance history.csv`, the `rows`. |
+
+A bare call, with no `start` (the default is 2013-01-01) and the default `interval=day`, is 400 `choose a date range of at most 1000 buckets`: send a `start`.
 
 A **line** is a currency and its counterparty (none for the native currency), as in `balance_changes`. The balance of a line at the end
 of a bucket is its last balance up to then; a bucket without a change carries the balance before it. A balance below 0 is what the

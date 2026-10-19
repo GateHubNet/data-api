@@ -54,8 +54,9 @@ export class AccountStatsController {
       'buckets instead of days, `date` being the start of the bucket: a bucket is a row when its start is at or after ' +
       '`start` and before `end`. `transactions` has a row for each bucket in which the account sent a transaction, with ' +
       'the counts of the whole bucket. `value` has a row for every bucket from the first one in which the account had a ' +
-      'balance to the last before `end`, active or not: its value at the end of the last day of the bucket (today, for ' +
-      'the current one) and the number of balance changes in it (0 for a quiet bucket).',
+      'balance to the last before `end`, active or not, but none that has not begun (the rows stop at the bucket that holds ' +
+      'now, whatever `end` says): its value at the end of the last day of the bucket (today, for the current one) and the ' +
+      'number of balance changes in it (0 for a quiet bucket).',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
   @ApiParam({ name: 'family', enum: FAMILIES, description: 'What to count: `transactions` or `value`.' })

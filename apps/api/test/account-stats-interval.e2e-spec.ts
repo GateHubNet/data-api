@@ -485,13 +485,42 @@ describe('account stats with interval, on the hand-worked world', () => {
       }
     });
 
-    it('a window that ends in the future has a row for each bucket before the end, valued as now', async () => {
-      const rows2 = await rows<ValueRow>(`${path(A, 'value')}?interval=month&start=2100-01-01&end=2100-04-01`);
-      expect(rows2).toEqual([
-        value('2100-01-01', '84.999976', 0),
-        value('2100-02-01', '84.999976', 0),
-        value('2100-03-01', '84.999976', 0),
-      ]);
+    it('a bucket that has not begun is no row: the rows end at the bucket that holds now, whatever the end of the window says', async () => {
+      const now = Date.now();
+      for (const interval of ['week', 'month'] as const) {
+        const url = `${path(A, 'value')}?interval=${interval}`;
+        const current = new Date(bucketStart(now, interval)).toISOString().slice(0, 10);
+        const untilNow = bucketsUntilNow('2026-01-01', interval, now);
+
+        // an end a century away is the same answer as no end: no row for a bucket after the one of now
+        const open = await rows<ValueRow>(`${url}&start=2026-01-01`);
+        const far = await rows<ValueRow>(`${url}&start=2026-01-01&end=2100-01-01`);
+        expect(far.map((r) => r.date.slice(0, 10))).toEqual(untilNow);
+        expect(far).toEqual(open);
+        expect(far[far.length - 1]).toEqual(value(current, '84.999976', 0));
+
+        // a window that lies wholly in the future has no row, though buckets start in it
+        expect(await rows(`${url}&start=2100-01-01&end=2100-04-01`)).toEqual([]);
+        // a window that starts after the end of the current bucket too, whatever its size
+        expect(
+          await rows(`${url}&start=${new Date(nextBucket(now, interval)).toISOString().slice(0, 10)}&end=2100-01-01`),
+        ).toEqual([]);
+
+        // descending, the first row is the bucket of now, and a page after it holds the buckets before
+        const desc = await get(`${url}&start=2026-01-01&end=2100-01-01&descending=true&limit=2`);
+        expect(desc.body.rows.map((r: ValueRow) => r.date.slice(0, 10))).toEqual(untilNow.slice(-2).reverse());
+        const next = await get(
+          `${url}&start=2026-01-01&end=2100-01-01&descending=true&limit=2&marker=${desc.body.marker}`,
+        );
+        expect(next.body.rows.map((r: ValueRow) => r.date.slice(0, 10))).toEqual(untilNow.slice(-4, -2).reverse());
+
+        // the last page of an ascending walk has no marker: the buckets after now are not a next page
+        const pages = await api.pages<Body<ValueRow>>(`${url}&start=2026-01-01&end=2100-01-01`, 2, 'rows');
+        expect(pages.flatMap((p) => p.rows).map((r) => r.date.slice(0, 10))).toEqual(untilNow);
+        expect(pages[pages.length - 1].marker).toBeUndefined();
+      }
+      // transactions are unaffected: a bucket in which the account sent nothing has no row, in the future too
+      expect(await rows(`${path(A, 'transactions')}?interval=month&start=2100-01-01&end=2100-04-01`)).toEqual([]);
     });
 
     it('is no row for an account without a balance change, or for a window before its first', async () => {

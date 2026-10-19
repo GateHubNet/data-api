@@ -61,7 +61,7 @@ below. Where a ruling made during implementation changed served behaviour it is 
     and key orders are ours, pinned by tests, and none serves an AMM field.
 10b. **New parameters on routes of the original:** `interval` (`day`, `week`, `month`) on `/v2/accounts/{address}/stats/{family}` and on `/v2/accounts/{address}/reports`. Without it the answers are the
     original's. Before this change an `interval` there was ignored like any unknown parameter, so **a client that sent one now gets buckets**. With `interval`, `stats/value` has a row for every bucket from the first one in which
-    the account had a balance, not only for active ones; `reports` allows 200 buckets of the interval (200 days, weeks or months; 200 months is all of the history), `payments=true` stays per day (400 `payments can only be listed with interval day`
+    the account had a balance up to the bucket that holds now, not only for active ones; `reports` allows 200 buckets of the interval (200 days, weeks or months; 200 months is all of the history), `payments=true` stays per day (400 `payments can only be listed with interval day`
     with a week or a month), and the counterparties of a bucket are counted over the whole bucket.
 10c. **Markets:** `network/markets` lists every pair that traded, not a configured list; its windows start on the hour (those of the live volumes are exact); the native volume of a pair goes through the window's rate of any native pair
     (`exchange_volume` takes only the configured native markets); prices are in the canonical stored orientation. `network/exchange_volume` is unchanged, so for a configured market the two routes can differ.
