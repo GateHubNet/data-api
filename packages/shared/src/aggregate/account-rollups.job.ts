@@ -1,5 +1,5 @@
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
-import { AccountRollupStateRow } from '../clickhouse/rows';
+import { AccountPartitionRowsRow, AccountRollupStateRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import {
   DAY_GROUP_COLUMNS,
@@ -25,6 +25,11 @@ import { AggregateSetOptions, nextSetVersion, throwIfSetAborted } from './aggreg
  * where they are while a newer set is written beside them, and are not replaced by it. The old sets stay in the tables,
  * unread. `account_rollup_state` says which days of an account its rollups cover (`rollupCoverage`).
  * Which accounts and days are due, and when, is the runner's.
+ *
+ * Which accounts get rollups is decided by discovery (spec section 3.4, step 1): `balance_changes` is counted per account in
+ * each of its partitions, and only the accounts with many rows in a partition are kept, in `account_partition_rows`.
+ * A partition's accounts are a **set** too (`recountPartition`), and an account is heavy when its rows over the newest set
+ * of every partition reach the minimum (`heavyAccounts`).
  */
 
 /** What `account_rollup_state` holds for a heavy account, the newest row of it (`rollupStates`). */
@@ -185,4 +190,180 @@ export async function writeAccountRollups(
     { ...days, version },
   );
   return written;
+}
+
+/** The accounts with at least this many balance changes in a partition are kept in its set; the others are not counted. */
+export const ACCOUNT_PARTITION_ROWS_FLOOR = 10_000;
+
+/** A promotion slice (`promotionSlice`) holds about this many rows of an account. */
+export const ACCOUNT_ROLLUP_SLICE_ROWS = 2_000_000;
+
+/** The ledgers in a partition of `balance_changes` (`PARTITION BY intDiv(ledger_index, 10000000)`, migration 001). */
+export const BALANCE_PARTITION_LEDGERS = 10_000_000;
+
+/**
+ * The characters an address can have after its first one (every address starts with `r`): the 58 of the base58 alphabet, in
+ * code-point order. Slice i of a recount is the key range from `r` + the i-th of them up to `r` + the next, so that the
+ * 58 slices together are every account there can be: the first has no lower bound, the last no upper one.
+ */
+export const ADDRESS_SLICE_CHARS: readonly string[] = [...'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'];
+
+/** The partition of `balance_changes` a ledger is in (the `partition` of `account_partition_rows`). */
+export function partitionOf(ledgerIndex: number): number {
+  return Math.floor(ledgerIndex / BALANCE_PARTITION_LEDGERS);
+}
+
+/**
+ * Counts the balance changes of every account in a partition and writes the set of the partition: the accounts with at
+ * least `ACCOUNT_PARTITION_ROWS_FLOOR` of them, plus the sentinel (`account = ''`), in one insert under one version (the
+ * newest set's plus one at least: `nextSetVersion`), so that a reader never sees a part of a set. Returns the accounts kept.
+ *
+ * The count is one read per slice of the address space (`ADDRESS_SLICE_CHARS`), each a key range of `balance_changes` within
+ * the partition's ledgers, so that no read has to hold the accounts of a whole partition. The count is of rows as stored: a
+ * row that was written twice and is not merged yet counts twice, which is fine for a threshold. The sentinel's `rows` is 0.
+ * An aborted `signal` throws `AggregateSetAborted` before each read and before the insert; an abort writes nothing.
+ */
+export async function recountPartition(
+  ch: ClickHouseService,
+  partition: number,
+  options: AggregateSetOptions = {},
+): Promise<number> {
+  const { signal } = options;
+  const range = {
+    p_min: partition * BALANCE_PARTITION_LEDGERS,
+    p_max: (partition + 1) * BALANCE_PARTITION_LEDGERS - 1,
+  };
+  const heavy: { account: string; rows: number }[] = [];
+  const last = ADDRESS_SLICE_CHARS.length - 1;
+  for (const [i, char] of ADDRESS_SLICE_CHARS.entries()) {
+    throwIfSetAborted(signal);
+    const next = ADDRESS_SLICE_CHARS[i + 1];
+    const found = await ch.query<{ account: string; n: number | string }>(
+      `SELECT account, count() AS n
+         FROM ${Table.BalanceChanges}
+        WHERE ${[
+          'ledger_index BETWEEN {p_min:UInt32} AND {p_max:UInt32}',
+          ...(i > 0 ? ['account >= {lo:String}'] : []),
+          ...(i < last ? ['account < {hi:String}'] : []),
+        ].join(' AND ')}
+        GROUP BY account
+       HAVING count() >= {floor:UInt64}`,
+      {
+        ...range,
+        floor: ACCOUNT_PARTITION_ROWS_FLOOR,
+        ...(i > 0 && { lo: `r${char}` }),
+        ...(i < last && { hi: `r${next}` }),
+      },
+    );
+    for (const r of found) heavy.push({ account: r.account, rows: Number(r.n) });
+  }
+
+  throwIfSetAborted(signal);
+  const version = await nextSetVersion(ch, Table.AccountPartitionRows, 'partition = {partition:UInt16}', { partition });
+  throwIfSetAborted(signal);
+  await ch.insert<AccountPartitionRowsRow>(Table.AccountPartitionRows, [
+    ...heavy.map((r): AccountPartitionRowsRow => ({ partition, ...r, version })),
+    { partition, account: '', rows: 0, version },
+  ]);
+  return heavy.length;
+}
+
+/**
+ * The rows of the newest set of every partition: a partition's sentinel (`account = ''`) says its newest version, and only
+ * rows of that version are read, so that the row of an older set (of an account that has since dropped below the floor)
+ * does not count. A set is one insert, so a partition whose sentinel is there has all its rows.
+ */
+const NEWEST_SETS = `(partition, version) IN (
+          SELECT partition, max(version) FROM ${Table.AccountPartitionRows} WHERE account = '' GROUP BY partition)`;
+
+/** The version (ms) of the newest set of every partition that has one. */
+export async function partitionSetVersions(ch: ClickHouseService): Promise<Map<number, number>> {
+  const rows = await ch.query<{ partition: number | string; version: number | string }>(
+    `SELECT partition, max(version) AS version
+       FROM ${Table.AccountPartitionRows}
+      WHERE account = ''
+      GROUP BY partition`,
+  );
+  return new Map(rows.map((r): [number, number] => [Number(r.partition), Number(r.version)]));
+}
+
+/**
+ * The heavy accounts: the rows of each account summed over the newest set of every partition, kept when the sum is at least
+ * `minRows`. An account is in a set only for a partition where it has `ACCOUNT_PARTITION_ROWS_FLOOR` rows or more, so a
+ * `minRows` under the floor still misses an account that has fewer than that in every partition. Each row of a set is
+ * read once, though its insert was repeated.
+ */
+export async function heavyAccounts(ch: ClickHouseService, minRows: number): Promise<Map<string, number>> {
+  const rows = await ch.query<{ account: string; total: number | string }>(
+    `SELECT account, sum(account_rows) AS total
+       FROM (SELECT partition, account, rows AS account_rows
+               FROM ${Table.AccountPartitionRows}
+              WHERE account != '' AND ${NEWEST_SETS}
+              LIMIT 1 BY partition, account)
+      GROUP BY account
+     HAVING total >= {min_rows:UInt64}`,
+    { min_rows: minRows },
+  );
+  return new Map(rows.map((r): [string, number] => [r.account, Number(r.total)]));
+}
+
+/** The rows an account has in each partition whose newest set holds it (a partition where it is under the floor has none). */
+export async function accountPartitionRows(ch: ClickHouseService, account: string): Promise<Map<number, number>> {
+  const rows = await ch.query<{ partition: number | string; account_rows: number | string }>(
+    `SELECT partition, rows AS account_rows
+       FROM ${Table.AccountPartitionRows}
+      WHERE account = {account:String} AND account != '' AND ${NEWEST_SETS}
+      ORDER BY partition
+      LIMIT 1 BY partition`,
+    { account },
+  );
+  return new Map(rows.map((r): [number, number] => [Number(r.partition), Number(r.account_rows)]));
+}
+
+/**
+ * The UTC day (`YYYY-MM-DD`) of an account's first balance change, undefined when it has none: a read of one row in key order
+ * (the primary key is the account, then the ledger), whatever the account's history.
+ */
+export async function firstChangeDay(ch: ClickHouseService, account: string): Promise<string | undefined> {
+  const [row] = await ch.query<{ day: string }>(
+    `SELECT toString(toDate(close_time, 'UTC')) AS day
+       FROM ${Table.BalanceChanges}
+      WHERE account = {account:String}
+      ORDER BY account, ledger_index, tx_index, node_index
+      LIMIT 1`,
+    { account },
+  );
+  return row?.day;
+}
+
+/**
+ * The UTC days the ledgers of a partition span, first day and last day included, at least 1 (a partition with one ledger or
+ * none). With an account's rows in the partition it gives the rows per day for `promotionSlice`.
+ */
+export async function partitionDays(ch: ClickHouseService, partition: number): Promise<number> {
+  const [row] = await ch.query<{ days: number | string }>(
+    `SELECT dateDiff('day', toDate(min(close_time), 'UTC'), toDate(max(close_time), 'UTC')) + 1 AS days
+       FROM ${Table.Ledgers}
+      WHERE ledger_index BETWEEN {p_min:UInt32} AND {p_max:UInt32}`,
+    { p_min: partition * BALANCE_PARTITION_LEDGERS, p_max: (partition + 1) * BALANCE_PARTITION_LEDGERS - 1 },
+  );
+  return Math.max(1, Number(row?.days ?? 1));
+}
+
+/**
+ * The next slice of a promotion, backwards from `throughDay`: as many whole days as hold about `ACCOUNT_ROLLUP_SLICE_ROWS`
+ * rows at `rowsPerDay`, at least one, and never before `firstDay` (the account's first day). All days are `YYYY-MM-DD`. Rows
+ * per day of 0 (unknown) take everything back to the first day.
+ */
+export function promotionSlice(o: { firstDay: string; throughDay: string; rowsPerDay: number }): {
+  fromDay: string;
+  throughDay: string;
+} {
+  const first = utcDayStart(o.firstDay);
+  const through = utcDayStart(o.throughDay);
+  const days = o.rowsPerDay > 0 ? Math.max(1, Math.floor(ACCOUNT_ROLLUP_SLICE_ROWS / o.rowsPerDay)) : Infinity;
+  return {
+    fromDay: new Date(Math.max(first, through - (days - 1) * UTC_DAY_MS)).toISOString().slice(0, 10),
+    throughDay: o.throughDay,
+  };
 }
