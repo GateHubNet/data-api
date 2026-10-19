@@ -95,6 +95,17 @@ const metrics = {
     labelNames: ['job'],
     registers: [registry],
   }),
+  pairHourlyMissingHours: new Gauge({
+    name: 'syncer_pair_hourly_missing_hours',
+    help: 'Hours of the last 31 days without a set of the current config version.',
+    registers: [registry],
+  }),
+  marketsLiveAgeSeconds: new Gauge({
+    name: 'syncer_markets_live_age_seconds',
+    help: 'Now minus the end_time of the newest include set.',
+    labelNames: ['period'],
+    registers: [registry],
+  }),
   validatorsUnlFetchesTotal: new Counter({
     name: 'syncer_validators_unl_fetches_total',
     help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
@@ -183,6 +194,8 @@ export class PrometheusService implements OnModuleInit {
   readonly aggregatorRunsTotal = metrics.aggregatorRunsTotal;
   readonly aggregatorErrorsTotal = metrics.aggregatorErrorsTotal;
   readonly aggregatorStatsLagSeconds = metrics.aggregatorStatsLagSeconds;
+  readonly pairHourlyMissingHours = metrics.pairHourlyMissingHours;
+  readonly marketsLiveAgeSeconds = metrics.marketsLiveAgeSeconds;
   readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;
