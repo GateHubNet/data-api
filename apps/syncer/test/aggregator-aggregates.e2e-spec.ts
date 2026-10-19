@@ -117,8 +117,16 @@ describe('AggregatorService account and market jobs (e2e)', () => {
     return { svc, errors };
   }
 
-  /** Budgets that are never the limit of a tick (a slow machine must not make a test of what is written flaky). */
-  const GENEROUS: AggregatorOptions = { tickBudgetMs: 10 * 60_000, budgetsMs: { pair_hourly: 5 * 60_000 } };
+  /** Budgets that are never the limit of a tick or of a job (a slow machine must not make a test of what is written flaky). */
+  const GENEROUS: AggregatorOptions = {
+    tickBudgetMs: 10 * 60_000,
+    budgetsMs: {
+      pair_hourly: 5 * 60_000,
+      markets_live: 5 * 60_000,
+      rates_daily: 5 * 60_000,
+      account_rollups: 5 * 60_000,
+    },
+  };
 
   const runs = (metrics: FakeMetrics): string[] =>
     metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job);
