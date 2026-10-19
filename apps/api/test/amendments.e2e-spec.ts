@@ -60,8 +60,6 @@ const time = (seconds: number): string => `${new Date(Math.round(seconds * 1000)
 /** `2026-10-19T15:40:02.114Z` */
 const instant = (seconds: number): string => new Date(Math.round(seconds * 1000)).toISOString();
 
-const pctOf = (yes: number, trusted: number): number => Math.round((yes * 10000) / trusted) / 100;
-
 interface Started {
   h: Harness;
   directory: () => Promise<Directory>;
