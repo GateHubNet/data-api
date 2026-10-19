@@ -22,6 +22,7 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 | Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` (idempotent) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total` |
+| Account and market aggregates | `syncer_markets_live_age_seconds{period}`, `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`, `syncer_account_rollups_pending_accounts`; see [Account and market aggregates](#account-and-market-aggregates) |
 
 Two services per network, never more than **one syncer**: `syncer-xrpl`, `syncer-xahau` are singletons (a fixed
 `container_name`, so compose refuses to scale them, and an application-level lease in ClickHouse that refuses a second writer).
@@ -183,6 +184,10 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | syncer probe `state` | `live` (`catching_up` while behind) | `halted` (chain break, a ledger the parser rejects, or lost lease) |
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
 | `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines |
+| `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
+| `syncer_pair_hourly_missing_hours` | 0 | Above 0 for 30 minutes |
+| `syncer_rates_daily_missing_days` | 0 (1 or 2 at the turn of the day) | Above 2 for 6 hours after the first back-fill; the size of the history on a fresh deployment, falling over about a day |
+| `syncer_account_rollups_pending_accounts` | 0 | Positive for days: a heavy account is not being promoted |
 | `rate(syncer_fee_stats_samples_total[5m])` | about 0.2/s | 0 (node unreachable) |
 | `rate(syncer_validations_flushed_total[5m])` | positive on XRPL (validators validate every ledger) | 0 for minutes; `syncer_validations_dropped_total{reason}` rising |
 | `api_http_requests_total{status=~"5.."}` | none | Spike |
@@ -299,6 +304,79 @@ dc run --rm --no-deps syncer-xrpl node dist/cli/range-ingest.js --from 90000000 
 - **Aggregates follow by themselves:** every chunk marks `agg_dirty`, the aggregator recomputes the affected hours and days within
   its per-tick budgets. Watch `SELECT count() FROM xrpl.agg_dirty`.
 - **Do not** run two range ingests over overlapping ranges at once.
+
+## Account and market aggregates
+
+The routes `GET /v2/network/markets` and `GET /v2/accounts/{address}/analytics/*`, and `interval` on `stats/{family}` and `reports`, are served from aggregates that the syncer's
+aggregator keeps ([syncer](syncer.md#7-the-aggregator), [ADR-0013](adr/0013-account-and-market-aggregates.md)). **Correctness never depends on them**: before an aggregate exists or while it lags, an
+answer is the same and only slower, except for the `network/markets` table, which is only as current as its newest set.
+
+### Rolling it out
+
+1. **Deploy the syncer first.** `migrate` applies `003_account_market_aggregates.sql` (nine new tables; additive, nothing existing changes), then the syncer starts the four jobs. `pair_hourly` fills its 31 days in minutes and the Markets sets appear;
+   `rates_daily` back-fills newest first (`syncer_rates_daily_missing_days` falls to 0 within about a day on XRPL); `account_rollups` discovers and promotes the heavy accounts (`syncer_account_rollups_pending_accounts` falls to 0
+   within one to two days). A database that is recreated (a new baseline: the migration runner refuses an applied file that changed, see [Schema migration failed](#schema-migration-failed)) goes through this step again: all of D2's tables are recomputable.
+2. **Deploy the API.** The routes are right at once and fast where the tables already cover them: `network/markets` as soon as the first sets exist, an ordinary account once the rates of its days are stored, a heavy account once it is promoted.
+3. **Switch the explorer** (one switch per sub-project, each a per-environment variable of the explorer's Worker) once the gauges of the data API that environment reads are at their mark:
+
+| Explorer sub-project | Switch | Gauges that gate it |
+| --- | --- | --- |
+| Markets | `MARKETS` | `syncer_pair_hourly_missing_hours` = 0, and `syncer_markets_live_age_seconds{period}` under 600 for `day`, `7day` and `30day` |
+| Account analytics | `ACCOUNT_ANALYTICS` | `syncer_rates_daily_missing_days` = 0 and `syncer_account_rollups_pending_accounts` = 0 |
+| The AMM parts of the explorer | `AMM_DATA` | Only once that data API has merged the AMM work, re-ingested history with the AMM parser and back-filled: `syncer_pair_hourly_missing_hours` = 0 and `syncer_rates_daily_missing_days` = 0 again after the reprocess (it marks hours and rate days for recompute). The AMM share of the Markets table comes with the AMM additions of the aggregates, which bring their own gauge |
+| Network dashboard, AMM pages, validators and amendments | none of these | no gauge of these aggregates gates them |
+
+### The back-fills
+
+While a back-fill runs, the API is **right and slower**. What that means:
+
+- A closed day without a stored rate set is valued on read: a window over years can reach the 30 s `max_execution_time` guard (the route's 500), and `api_rates_on_read_total` climbs. Short windows (30 D, 90 D) are not noticeably slower.
+- **`analytics/counterparties`** of an account with very many paid asset-days (a heavy account that paid thousands of assets over years) can answer 500 `unable to retrieve counterparties` **during the rates back-fill**: the rates of the days that are not stored
+  travel in the request to ClickHouse, whose URI limit is 1 MiB. It is the same class of failure as the guard above and disappears once `syncer_rates_daily_missing_days` is 0 (then only the rates of today and yesterday travel). It is not a reason to
+  raise `GH_CLICKHOUSE_MAX_EXECUTION_TIME`; wait for the back-fill.
+- A heavy account that has not been promoted yet is read from its own rows: right, and as slow as the rows it holds (tens of seconds for years of an exchange's hot wallet, or the 500 of the guard).
+- `network/markets` is not affected by the rates back-fill; it waits for `pair_hourly` (minutes). An old or missing hour (`Markets set of period <p> not written ...` in the log, `syncer_pair_hourly_missing_hours` > 0) keeps the previous set, whose `end_time` ages.
+
+Watch them with the gauges of [observability](observability.md#4-metrics-syncer); each job also logs once that its back-fill is under way and once that it is done. To follow one in SQL (the database `xrpl`; use `xahau` on the other network):
+
+```sql
+-- hours of pair_hourly that have a set (the sentinel is the empty pair), by day: 24 a day for the last 31 days
+SELECT toDate(hour) AS day, uniqExact(hour) AS hours
+FROM xrpl.pair_hourly WHERE base_currency = '' AND base_issuer = '' AND counter_currency = '' AND counter_issuer = ''
+GROUP BY day ORDER BY day DESC LIMIT 32;
+
+-- the newest sentinel of each rates day: stale = 1 is a day waiting to be computed again
+SELECT day, argMax(stale, version) AS stale FROM xrpl.native_rates_daily WHERE currency = '' AND issuer = ''
+GROUP BY day ORDER BY day DESC LIMIT 10;
+
+-- the heavy accounts and what their rollups cover
+SELECT account, rows, first_day, rolled_from, rolled_through, config_version
+FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account;
+```
+
+### What a re-ingest does to them
+
+`range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)):
+
+- **Rates**: the days of the slice and the 14 after it that have a valid set are marked stale (a day's rate reads the trades of the 14 days before it). Until `rates_daily` has computed them again, newest first, the API values those days on read, so `syncer_rates_daily_missing_days` rises by up to the range plus 14 days and falls again; expect the
+  slower path for the window of the range, and `api_rates_on_read_total` to show it.
+- **Hours**: the hours of the slice in the last 31 days are recomputed at once.
+- **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
+
+Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`) says which.
+
+### Rollups of heavy accounts
+
+- `GH_ACCOUNT_ROLLUP_MIN_ROWS` is the size from which an account is heavy (default 1,000,000 balance changes). Raising it demotes accounts (their coverage is dropped, and the API reads their rows again) and lowering it promotes more, at the next run of the job (it classifies the accounts from the counts it already has; the counts themselves are refreshed every 24 hours for the newest partition of `balance_changes` and every 7 days for the others, so an account that
+  grows past the threshold is found within a day).
+  `0` turns the job off: the rollups that exist are still used by the API and still corrected after a re-ingest, and simply stop growing (`syncer_account_rollups_pending_accounts` is not updated while it is off).
+- **Superseded rollup versions are never pruned.** A correction of a day (the hook above) writes a new set beside the old one; the old rows are not read, they stay in `account_lines_daily`, `account_tx_daily`, `account_trades_daily` and the old sentinels in `account_rollup_days`, and they only
+  accumulate with re-ingests of covered days. Watch the size with `SELECT table, formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE active AND database = 'xrpl' AND table LIKE 'account_%' GROUP BY table`; no cleanup is shipped.
+- A heavy account whose rollup fails or lags is read raw for the days after `rolled_through` (slower, right); the failure is in the log of `account_rollups` and `syncer_aggregator_errors_total{job="account_rollups"}`.
+
+### Stopped or broken aggregator
+
+With the aggregator stopped, the Markets sets age (`end_time` says so, the age gauge alerts), new days are valued on read, and a heavy account's raw part grows by a day per day: slower, right. A `pair_hourly` gap leaves the previous Markets set in place. Nothing needs repairing by hand: restart it and the back-fills resume (their waits are in memory), newest first.
 
 ## Scaling
 

@@ -1396,7 +1396,16 @@ paths:
         their number, or the accounts with `accounts`. The values are in the native
         currency: an issued currency counts at the rate of the day (`/v2/exchange_rates`,
         in strict mode), and as 0 where it has none. `payments` lists each payment
-        with its delivered amount. `format=csv` gives the reports as a CSV file.'
+        with its delivered amount. `format=csv` gives the reports as a CSV file. With
+        `interval` (`week` from Monday, or `month`; `day` is the default) a report
+        is a bucket, from the bucket of `start` to the bucket of `end` (`/{date}`
+        is the one that holds the date), `date` being the start of the bucket and
+        the bucket whole, up to now. The limit is 200 buckets: 200 days, 200 weeks
+        or 200 months. A bucket adds up the values of its days (each at the rate of
+        its day), takes the largest of their highs and adds up the payment counts;
+        its counterparties are counted (or listed, in the order of their first payment
+        in the bucket) over the whole bucket, so one that was paid on two days is
+        one. `payments` can only be listed with `interval=day`.'
       parameters:
       - name: address
         required: true
@@ -1422,9 +1431,20 @@ paths:
       - name: payments
         required: false
         in: query
-        description: List the payments of each day.
+        description: List the payments of each day. Only with `interval=day`.
         schema:
           type: boolean
+      - name: interval
+        required: false
+        in: query
+        description: 'A report per day, week (from Monday) or month, UTC. Default:
+          day.'
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
       - name: accounts
         required: false
         in: query
@@ -1464,7 +1484,16 @@ paths:
         their number, or the accounts with `accounts`. The values are in the native
         currency: an issued currency counts at the rate of the day (`/v2/exchange_rates`,
         in strict mode), and as 0 where it has none. `payments` lists each payment
-        with its delivered amount. `format=csv` gives the reports as a CSV file.'
+        with its delivered amount. `format=csv` gives the reports as a CSV file. With
+        `interval` (`week` from Monday, or `month`; `day` is the default) a report
+        is a bucket, from the bucket of `start` to the bucket of `end` (`/{date}`
+        is the one that holds the date), `date` being the start of the bucket and
+        the bucket whole, up to now. The limit is 200 buckets: 200 days, 200 weeks
+        or 200 months. A bucket adds up the values of its days (each at the rate of
+        its day), takes the largest of their highs and adds up the payment counts;
+        its counterparties are counted (or listed, in the order of their first payment
+        in the bucket) over the whole bucket, so one that was paid on two days is
+        one. `payments` can only be listed with `interval=day`.'
       parameters:
       - name: address
         required: true
@@ -1490,9 +1519,20 @@ paths:
       - name: payments
         required: false
         in: query
-        description: List the payments of each day.
+        description: List the payments of each day. Only with `interval=day`.
         schema:
           type: boolean
+      - name: interval
+        required: false
+        in: query
+        description: 'A report per day, week (from Monday) or month, UTC. Default:
+          day.'
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
       - name: accounts
         required: false
         in: query
@@ -1532,7 +1572,15 @@ paths:
         the account held at the end of the day in the native currency (the native
         balance, plus each issued currency it holds at the rate of the day, as a string;
         what the account owes is not counted) and how many times its balances changed
-        that day, not counting the fee. `format=csv` gives the rows as a CSV file.'
+        that day, not counting the fee. `format=csv` gives the rows as a CSV file.
+        With `interval` (`day`, `week` from Monday or `month`) the rows are buckets
+        instead of days, `date` being the start of the bucket: a bucket is a row when
+        its start is at or after `start` and before `end`. `transactions` has a row
+        for each bucket in which the account sent a transaction, with the counts of
+        the whole bucket. `value` has a row for every bucket from the first one in
+        which the account had a balance to the last before `end`, active or not: its
+        value at the end of the last day of the bucket (today, for the current one)
+        and the number of balance changes in it (0 for a quiet bucket).'
       parameters:
       - name: address
         required: true
@@ -1572,9 +1620,20 @@ paths:
       - name: descending
         required: false
         in: query
-        description: Newest day first.
+        description: Newest day or bucket first.
         schema:
           type: boolean
+      - name: interval
+        required: false
+        in: query
+        description: 'Rows per day, week (from Monday) or month, UTC. Without it:
+          a row per active day.'
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
       - name: end
         required: false
         in: query
@@ -1585,6 +1644,285 @@ paths:
         required: false
         in: query
         description: 'The first day, from its midnight on. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/analytics/balances":
+    get:
+      operationId: AccountAnalyticsController_balances
+      summary: Get the balance history of an account, per line
+      description: 'A line is a currency and its counterparty (none for the native
+        currency). `lines` are the lines of the account that changed up to the end
+        of the window, after the filters, ranked: the native line first, then the
+        lines that have a rate by their balance over that rate (the rate of the asset
+        `(currency, counterparty)` on the newest valid day at or before the end of
+        the window), largest first, then the others by the size of the balance; the
+        first `limit` are served, and `lines_total` counts them all. `balance` of
+        a line is its balance at the end of the window. `rows` are the balance of
+        each of those lines at the end of each bucket: the last balance up to then,
+        so a bucket without a change carries the balance before it. A line has rows
+        from the bucket of its first change, or from the first bucket of the window
+        when it changed before it, and a line that went back to 0 keeps its rows of
+        "0". A balance below 0 is what the account owes on that line. A bucket that
+        has not begun has no row, so the rows stop at the bucket that holds now whatever
+        the end. The window is whole UTC days, from the day of `start` to the day
+        of `end` (both included, whatever the time of day), widened to whole buckets
+        when there is an `interval`; the answer''s `start` is the start of the first
+        day or bucket and `end` the start of the one after the last, so it is exclusive.
+        An `end` before `start` is an empty answer. At most 1000 buckets. `format=csv`
+        gives the rows as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: limit
+        required: false
+        in: query
+        description: How many lines. Default 10, at most 50.
+        schema:
+          type: number
+      - name: counterparty
+        required: false
+        in: query
+        description: 'Only the lines with this account; not with the native currency.
+          Alias: issuer.'
+        schema: {}
+      - name: currency
+        required: false
+        in: query
+        description: Only the lines of this currency (upper-cased).
+        schema: {}
+      - name: interval
+        required: false
+        in: query
+        description: 'The bucket of a row: day, week (from Monday) or month, UTC.
+          Default: day.'
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'The last day, whole. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The first day. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/analytics/balance_changes":
+    get:
+      operationId: AccountAnalyticsController_balanceChanges
+      summary: Get the sums of the balance changes of an account by change type and
+        currency
+      description: Every balance change of the window counts once, the fees (`transaction_cost`)
+        too. A change type is one of transaction_cost, payment_destination, payment_source,
+        exchange, intermediary, escrow_create, escrow_finish, escrow_cancel, paychannel_fund,
+        paychannel_payout; the changes of transaction types that have none are grouped
+        without a `change_type`. `in` is the sum of the positive changes and `out`
+        the sum of the negative ones as a positive amount; `in_value` and `out_value`
+        are their values in the native currency (the native currency is worth itself,
+        an issued amount its amount over the rate of its day, cut to 17 significant
+        digits per change type, asset and day, and 0 without a rate; a change on a
+        line the account owes on is a change of its own currency), and `net_value`
+        is `in_value` minus `out_value`. `totals` has an entry for each change type
+        that has a change, in that order. Without `interval` `rows` are per change
+        type and asset (`issuer` is left out for the native currency), the largest
+        `in_value + out_value` first; with one they are per bucket and change type,
+        with `date` the start of the bucket. The window is whole UTC days, from the
+        day of `start` to the day of `end` (both included, whatever the time of day),
+        widened to whole buckets when there is an `interval`; the answer's `start`
+        is the start of the first day or bucket and `end` the start of the one after
+        the last, so it is exclusive. An `end` before `start` is an empty answer.
+        With an interval, at most 1000 buckets. `format=csv` gives the rows as a CSV
+        file.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: interval
+        required: false
+        in: query
+        description: Rows per bucket (day, week from Monday, month; UTC) and change
+          type instead of per change type and asset.
+        schema:
+          enum:
+          - day
+          - week
+          - month
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'The last day, whole. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The first day. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/analytics/counterparties":
+    get:
+      operationId: AccountAnalyticsController_counterparties
+      summary: Get the accounts an account paid and was paid by, with what the payments
+        were worth
+      description: 'The payments of the account in the window, each once, by the account
+        on the other side. A payment to oneself is a payment sent, its counterparty
+        being the account itself. `sent_value` is what the account paid the counterparty
+        and `received_value` what the counterparty paid the account: the delivered
+        amounts, the native currency worth itself and an issued amount its amount
+        over the rate of its day (cut to 17 significant digits per counterparty, direction,
+        asset and day, and 0 without a rate); `total_value` is their sum. `payments_sent`
+        and `payments_received` are the numbers of payments each way, `first` and
+        `last` the times of the first and the last payment between the two in the
+        window. `total` is the number of different counterparties in the window and
+        `count` the number served: the first `limit` by `sort`, the largest first,
+        then by the account. The window is whole UTC days, from the day of `start`
+        to the day of `end` (both included, whatever the time of day), widened to
+        whole buckets when there is an `interval`; the answer''s `start` is the start
+        of the first day or bucket and `end` the start of the one after the last,
+        so it is exclusive. An `end` before `start` is an empty answer. The route
+        has no `interval`. `format=csv` gives the counterparties as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: limit
+        required: false
+        in: query
+        description: How many counterparties. Default 20, at most 1000.
+        schema:
+          type: number
+      - name: sort
+        required: false
+        in: query
+        description: 'value (`total_value`) or count (`payments_sent + payments_received`).
+          Default: value.'
+        schema:
+          enum:
+          - value
+          - count
+          type: string
+      - name: end
+        required: false
+        in: query
+        description: 'The last day, whole. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The first day. Default: 2013-01-01.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/analytics/exchanges":
+    get:
+      operationId: AccountAnalyticsController_exchanges
+      summary: Get the summary of the trades of an account on the exchange, per pair
+      description: 'The trades of the account in the window (it is the buyer or the
+        seller), each once, per pair in the canonical stored order. `bought` is the
+        base the account received (it was the buyer) and `sold` the base it gave (it
+        was the seller), `bought_counter` the counter it paid for what it bought and
+        `sold_counter` the counter it received for what it sold; a trade with oneself
+        is in both. `native_volume` is, for a pair with a native side, the volume
+        of that side; for another, per day the base volume over the rate of the base,
+        or, without one, the counter volume over the rate of the counter (cut to 17
+        significant digits per day), summed; it is left out when no day of the pair
+        had a rate. The pairs are sorted by `native_volume`, the largest first, the
+        pairs without one last by `count`, then by the pair; `total` is the number
+        of pairs in the window and `count` the number served: the first `limit`. The
+        window is whole UTC days, from the day of `start` to the day of `end` (both
+        included, whatever the time of day), widened to whole buckets when there is
+        an `interval`; the answer''s `start` is the start of the first day or bucket
+        and `end` the start of the one after the last, so it is exclusive. An `end`
+        before `start` is an empty answer. The route has no `interval`. `format=csv`
+        gives the pairs as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: limit
+        required: false
+        in: query
+        description: How many pairs. Default 20, at most 1000.
+        schema:
+          type: number
+      - name: end
+        required: false
+        in: query
+        description: 'The last day, whole. Default: now.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'The first day. Default: 2013-01-01.'
         schema: {}
       responses:
         '200':
@@ -1928,6 +2266,81 @@ paths:
           enum:
           - hour
           - day
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - network
+  "/v2/network/markets":
+    get:
+      operationId: MarketsController_list
+      summary: Get the trade statistics of every market in a live period
+      description: Every pair that traded in the period (not the markets config),
+        in the canonical stored order of its currencies; a price is counter per base.
+        The pairs with at least `min_trades` trades are listed, by `native_volume`,
+        the largest first, the pairs without one last by `count`, then by the pair;
+        at most `limit`. A trade counts when its native leg is above 0.0005 (as candles).
+        `open`, `high`, `low` and `last` have 8 significant digits; `change` is `(last
+        / open - 1) * 100` in percent, rounded half up to 2 decimals; the volumes
+        are exact. `native_volume` is the volume of the native side of a pair that
+        has one; for another pair the base volume over the rate of the base, or, without
+        one, the counter volume over the rate of the counter (an asset has a rate
+        when it traded against the native currency in the period), cut to 17 significant
+        digits; a pair without a rate has none. `sparkline` is the close of each of
+        the last 7 UTC days, ending with today (a day without a trade carries the
+        close before it; `close` is left out where there is none). `start_time` and
+        `end_time` are the window of the set. `totals.pairs` counts the listed pairs,
+        whatever the limit; `pairs_traded`, `count` and `native_volume` are over every
+        pair that traded. With `exchange_currency` the answer has `exchange` and `exchange_rate`
+        (units of it per native coin, at the rate of the latest trades) and a `converted_volume`
+        (the native volume times the rate) on the totals and on every market that
+        has a native volume. The sets are written every minute (day) or five minutes
+        (7day, 30day); before the first one the answer has no markets.
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json (csv: markets.csv).'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: limit
+        required: false
+        in: query
+        description: Default 1000, at most 5000.
+        schema:
+          type: number
+      - name: exchange_issuer
+        required: false
+        in: query
+        description: Required for every currency but the native one.
+        schema: {}
+      - name: exchange_currency
+        required: false
+        in: query
+        description: 'Also show the volumes in this currency. Default: the native
+          currency (nothing is added).'
+        schema: {}
+      - name: min_trades
+        required: false
+        in: query
+        description: 'List the pairs with at least this many trades: a whole number
+          from 1 to 1000000. Default: 10.'
+        schema:
+          type: number
+      - name: period
+        required: false
+        in: query
+        description: 'The rolling period: the last 24 hours, 7 days or 30 days. Default:
+          day.'
+        schema:
+          enum:
+          - day
+          - 7day
+          - 30day
           type: string
       responses:
         '200':

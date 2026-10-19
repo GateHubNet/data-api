@@ -262,16 +262,20 @@ most 2 s for the sample in flight.
 
 ## 7. The aggregator
 
-Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs five jobs **in priority order**; a job
+Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs nine jobs **in priority order**; a job
 gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work:
 
 | # | Job | Budget | What |
 | --- | --- | --- | --- |
 | 1 | `volume_live` | 5 s | The seven live volume sets (trade volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version. **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
 | 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), both metrics, stalest first. |
-| 3 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
-| 4 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes the daily volume sets of the days a slice covers. |
-| 5 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config, **newest first**. |
+| 3 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
+| 4 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
+| 5 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
+| 6 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes the daily volume sets of the days a slice covers, and runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)). |
+| 7 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
+| 8 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
+| 9 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config, **newest first**. |
 
 Properties that matter operationally:
 
@@ -296,6 +300,116 @@ Properties that matter operationally:
   currency", was left out. Re-derive it from a full-history node with the queries of the
   [verification report](superpowers/plans/2026-10-15-ripple-dropin.verification.md#8-step-6-packagessharedconfigmarketsxahaujson),
   then bump `version`.) A new `version` in the file recomputes the closed days.
+
+### 7.1 `rates_daily`
+
+Writes `native_rates_daily` ([data-model](data-model.md#account-and-market-aggregates-migration-003)): for a closed, **final** UTC day D, the rate against the
+native currency of every issued asset that has one above 0, exactly what `RatesService.dailyNativeRates([asset], D, D + 1)` gives (the e2e
+suite proves they agree for every asset: `RatesService.dailyNativeRatesOfDay(D)` is the same computation for all assets in two reads of 15 days
+of native-pair trades). A day is final when the newest committed ledger closed at least `VOLUME_DAY_SETTLE_MS` (one hour) after its end, so
+today is never final and yesterday only once the ingest has passed it; today, and yesterday until it is final, are valued on read by the API.
+
+- **A day is a set**: the assets with a rate and a sentinel (`currency = ''`, `issuer = ''`) with `config_version = RATES_DAILY_CONFIG_VERSION`
+  (1) and `stale = 0`, in one insert. A day is **valid** when its newest sentinel is not stale and has the current config version.
+- **Per run**, newest first, one day at a time: yesterday once it is final and not valid, then the closed final days that are not valid, down to
+  the day of the first trade against the native currency (read once, and again only while there is none). **At least one day per run**,
+  whatever is left of the budget (the readers value an uncovered day on read, the slow path); the others only while the tick's deadline
+  has not passed.
+- **A re-ingest marks days stale** (the hook, [7.6](#76-the-agg_dirty-hooks)); the same list brings them back, newest first.
+- Gauge `syncer_rates_daily_missing_days`: the closed final days, from the first native trade, that have no valid set (0 once the back-fill is done).
+  Log lines: `Rates back-fill: N day(s) to compute, newest first` once when it starts and `Rates back-fill is done: every closed final day has its set` once when it ends.
+
+### 7.2 `pair_hourly`
+
+Writes the hourly trade statistics of every pair for the last 31 days (`PAIR_HOURLY_DAYS`); the table's TTL drops what is older than 45 days.
+
+- **An hour is a set**: from `exchanges` in the ledger range of the hour, all pairs, each row once, the kept trades only (native legs of 0.0005 or less are
+  left out, as in candles and `reduce`), grouped by pair and source, with the candle expressions of the API (open and close by key, high and low by
+  rate with the key as tie-break) and the keys of the trades they name. Every row is `book` (the column `source` exists for the AMM work). The sentinel
+  (the empty pair) carries `is_final` (a ledger that closed at or after the hour's end was there), `config_version` (`PAIR_HOURLY_CONFIG_VERSION`, 1) and `through_time`.
+- **Per run**: the current hour (always) and the previous hour until its set is final, the stalest first; then the **back-fill**, the hours of the
+  last 31 days that have no final set of the current config version, newest first. An hour whose set is not final is done again only once a **newer ledger
+  closed after its end** (until then a new set would be the same). A run of consecutive hours inside one UTC day is one call, so a day without a set is one
+  read of the trades and 24 inserts; **a multi-hour call that fails is retried hour by hour**, so one bad hour does not keep the day. No hour before the hour of
+  the first ledger is computed. At first start the 31 days take minutes.
+- Gauge `syncer_pair_hourly_missing_hours`: the hours of the last 31 days without a set of the current config version. Log lines `Pair-hourly back-fill: N hour(s) to compute, newest first`
+  and `Pair-hourly back-fill is done: every hour of the last 31 days has its set`.
+
+### 7.3 `markets_live`
+
+Writes the Markets sets from `pair_hourly` (`markets_live`; read by `GET /v2/network/markets`, [api-reference](api-reference.md#get-v2networkmarkets)).
+
+- **Window** of a period P (24 h, 7 days or 30 days): the hours from `floorHour(t) - P` to `floorHour(t)`, where t is the `through_time` of the newest set of the
+  current hour; `start_time = floorHour(t) - P`, `end_time = t`. The window is at least P and at most P + 59 min 59 s long. A set is written only when every hour of its
+  window and of its 7 sparkline days has a set of the current config version (final, except the last two hours); otherwise it is **skipped** (logged once per gap:
+  `Markets set of period <p> not written: N hour(s) of pair_hourly have no usable set ...; the previous set stays`) and the previous set stays.
+- **Per pair**, over the window's hour rows (sums exact, with the `sumOf` fallback when an hour is unfit or a sum is at or above 1e36): `count`, the volumes, `open` and `last`
+  (first and last trade by key), `high` and `low` (by rate, key as tie-break), the two times, the native volume, and the 7 daily `closes`. The **native volume** of a pair is the
+  volume of its native side; otherwise the base volume over the base's rate, else the counter volume over the counter's rate (an asset's rate is its volume over the native volume of
+  its pair against the native currency in the same window, all trades; the quotient has 17 significant digits); without a rate on either side there is none. The sentinel carries the
+  window and the totals (`pairs_traded`, `total_count`, `total_native_volume`). `amm_share`, `amm_pool` and `total_amm_share` are NULL.
+- **Cadence**: the `day` set at every run, the `7day` and `30day` sets on the 1st, 6th, 11th ... run (`MARKETS_LONG_EVERY_TICKS` = 5, **counted by the runner itself**). A long set that the budget kept
+  from starting is **written on the next run**, after the `day` set.
+- Gauge `syncer_markets_live_age_seconds{period}`: now minus the `end_time` of the newest `include` set of the period (set after the sets of each run).
+
+### 7.4 `account_rollups`
+
+Keeps **daily rollups of the heavy accounts** (the accounts with `GH_ACCOUNT_ROLLUP_MIN_ROWS` balance changes or more, default 1,000,000), in `account_lines_daily`,
+`account_tx_daily` and `account_trades_daily`, so that a read of years of such an account (`stats/*` with `interval`, `reports`, `analytics/*`) reads thousands of day groups instead
+of tens of millions of rows. A rollup stores amounts, never values, so it does not depend on `native_rates_daily`. **The API's answer is the same with or without it**: it uses a rollup only
+for the days its state row says it covers and reads the raw rows for every other day. The job is off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0` (the run reads and writes nothing; existing coverage is still used by the API
+and still corrected by the hook). A value below 10,000 (`ACCOUNT_PARTITION_ROWS_FLOOR`) behaves like 10,000: the discovery only keeps accounts with that many rows in a partition. Per run, in order, each set only while
+the tick's deadline has not passed, the shutdown has not begun and fewer than 3 sets have failed:
+
+1. **Discovery.** The partitions of `balance_changes` (P7: `intDiv(ledger_index, 10000000)`) that are due are recounted (`account_partition_rows`), newest first: one without a set, the newest partition when its set is older than 24 hours,
+   any other when it is older than 7 days, and one that a slice of `agg_dirty` touched. A recount is `SELECT account, count()` over the partition's ledger range in 58 slices by the second character of the address, keeping the accounts with
+   at least 10,000 rows. An account is **heavy** when its rows over the newest set of every partition reach the minimum. A new heavy account gets a state row with its `first_day` (the day of its first balance change) and no coverage; an account
+   that is no longer heavy (the setting was raised) loses its coverage (its rollup rows stay, unused); a state of another `ACCOUNT_ROLLUP_CONFIG_VERSION` is an account without coverage, promoted again.
+2. **The daily increment.** For each final day d after an account's `rolled_through`, oldest first, the accounts whose `rolled_through` is d - 1 are rolled together: three reads (`balance_changes`, the transactions the account sent, `account_exchanges`)
+   with `account IN (...)` and the ledger range of d, each row once, grouped by account and the table's group columns; the rows are inserted under one version, then a sentinel per (account, day), then the state rows with `rolled_through = d`.
+   **At most 500 accounts per call** (`ACCOUNT_ROLLUPS_BATCH_ACCOUNTS`: they travel in a URL parameter and the URI limit is 1 MiB); an account that failed inside a call of several is rolled alone until it works.
+3. **The promotion**, in rounds: every account whose coverage does not reach back to its first day gets a slice, the accounts without coverage first, then the newest `rolled_from` first, so that a year is covered before all of it. An account
+   without coverage starts at the newest final day. A slice is as many whole days as hold about 2,000,000 rows (`ACCOUNT_ROLLUP_SLICE_ROWS`) at the account's rows per day in the partition of the slice's end, at least one day, and it **never crosses the
+   start of that partition** (its count says nothing of older ones). An account whose slice ends in a partition with no `account_partition_rows` set yet **is deferred** to the next run (no error), and under the 10,000-row floor the slice is the rest of the partition.
+   The rollup is written first and the state only when it worked, so a state never claims days that are not there.
+4. The gauges `syncer_account_rollups_heavy_accounts` and `syncer_account_rollups_pending_accounts` (heavy accounts whose coverage does not reach from `first_day` to the newest final day).
+
+The writer's version is the largest over all four rollup tables, so a retry never reuses the version of a failed attempt. The rollup rows of a set stay beside those of a newer set (`version` is in the key); superseded versions are never pruned
+([data-model](data-model.md#account-and-market-aggregates-migration-003)).
+
+### 7.5 Runners, registration and failures
+
+Each job is a **runner** in a file of its own in `apps/syncer/src/aggregator/` (`rates-daily`, `pair-hourly`, `markets-live` and `account-rollups` `.job-runner.ts`). A runner keeps its own state (cursors, waits, announcements,
+the run counter of `markets_live`) and gets what it needs of the service through one small interface of its own, **`AggregateJobDeps`** (`aggregate-job-deps.ts`): the `ClickHouseService`, the logger, the metrics, the clock, `closing()`,
+`failed(job, err, where?)` and the job's budget. A runner imports only the shared package, that file and the types of `aggregator.service.ts` (`AggregatorTick`, `AggregatorJob`); its constructor takes the deps, the shared options
+(`AggregatorAggregates`: the `RatesService` and the minimum of rows) and, for tests, the functions of the shared package to replace. A runner's `job()` is its entry in the jobs list, and three of them have an `ofSlice(start, end, tick)` hook.
+
+The **registration** is all that changes in the service: the four names in `AggregatorJobName`, four budget constants (`AGGREGATOR_PAIR_HOURLY_BUDGET_MS`, `AGGREGATOR_MARKETS_LIVE_BUDGET_MS`, `AGGREGATOR_RATES_DAILY_BUDGET_MS`,
+`AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS`), the option `aggregates` (without it the four jobs and their hooks do not exist, as in the unit tests of the volume jobs), the four entries of the jobs list at the places of the table above, and one
+private method, `hooksOfSlice`, called once after a slice's volume sets. `aggregator.module.ts` builds `aggregates` from the one `RatesService` that the volume jobs share and `GH_ACCOUNT_ROLLUP_MIN_ROWS`. Budgets and cadences are constants, not
+settings. The scheduling test (`aggregator.schedule.spec.ts`) pins the order and shows that the live volume jobs are not starved with every job registered.
+
+**Failures follow the rules of the other jobs.** Only committed ledgers count (a window becomes a range of `ledgers` first). A set is idempotent and retried at the next tick; a failure is logged and counted
+(`syncer_aggregator_errors_total{job}`) and never stops the loop; a set that keeps failing waits 5 minutes, doubling up to an hour, while the others go on (the waits are in memory: a restart tries them all again); a runner gives up after 3 failed sets
+in a tick; a shutdown aborts the set in flight before it writes (`AggregateSetAborted`), which is neither logged as an error nor counted. A job that reaches its budget says so once (a warning) until a run finishes in time.
+
+### 7.6 The `agg_dirty` hooks
+
+A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order**:
+
+1. `rates_daily`: a slice that touches the days X..Y marks the days X..Y+14 **stale** (the rate of a day reads the trades of the 14 days before it): for each of them that has a valid set, a new sentinel with `stale = 1` and no rows. The back-fill then computes them again, newest first; until it has, the readers value those days on read.
+2. `pair_hourly`: the hours of the slice that lie in the last 31 days are recomputed, a call for each UTC day.
+3. `account_rollups`: for every account whose rollups cover a day of the slice (its newest state row is of the current config version and its coverage holds the day: the state rows say so, not the heavy accounts), that (account, day) is recomputed, a call for each day of 500 accounts at most, and the partitions of the slice's ledgers are
+   marked for the next discovery to recount. With `GH_ACCOUNT_ROLLUP_MIN_ROWS=0` the job is off but the slice **still recomputes the covered days** (the API still uses that coverage, so a re-ingest must not leave it stale) and marks no partition.
+
+A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
+because the range is not changed after it. Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`).
+
+### 7.7 The back-fills
+
+A fresh deployment (or a database recreated for a new baseline) fills the new tables by itself, each back-fill under the budget of its job and newest first: `pair_hourly` its 31 days in minutes (the Markets sets appear at once); `rates_daily` the closed days back to the first native trade, which for
+about 5,000 XRPL days takes some hours of query time, so about a day within its budget; `account_rollups` the heavy accounts (a third to half of all balance changes), one to two days. Each says once in the log that it is under way and once that it is done, and each has a gauge that reaches 0 (`syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`,
+`syncer_account_rollups_pending_accounts`). Until then the API is right and slower ([operations](operations.md#account-and-market-aggregates)).
 
 ## 8. The validators worker
 
@@ -500,4 +614,7 @@ off in a test).
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
 | `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |
 | `packages/shared/src/aggregate/{stats,volume}.job.ts`, `query/rates.service.ts` | Aggregation and rates |
+| `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
+| `packages/shared/src/aggregate/{rates-daily,pair-hourly,markets-live,account-rollups}.job.ts`, `aggregate-sets.ts` | What the runners write: the sets, their versions and their readers |
+| `packages/shared/src/query/{daily-rates,account-day-groups,valuation}.ts` | What the API reads them with: `DailyRates`, the day groups (raw or rollup), the valuation rule |
 | `packages/shared/src/xrpl/node-client.ts` | The node client |

@@ -14,7 +14,8 @@ consequences. They explain *why* the system is the way it is.
 | [0007](0007-ledger-index-axis-and-secondary-tables.md) | `ledger_index` is the time axis; narrow secondary tables; commit-marker writes | Accepted |
 | [0008](0008-no-aggregate-materialized-views.md) | No aggregate materialized views | Accepted |
 | [0009](0009-one-deployment-per-network.md) | One deployment per network (XRPL, Xahau) | Accepted |
-| [0010](0010-ripple-v2-wire-compatibility.md) | Ripple Data API v2 wire compatibility, and every deliberate deviation | Accepted |
+| [0010](0010-ripple-v2-wire-compatibility.md) | Ripple Data API v2 wire compatibility, and every deliberate deviation | Accepted (amended by 0013: the account and market routes and `interval`) |
+| [0013](0013-account-and-market-aggregates.md) | Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats, self-contained runners | Accepted |
 
 ## Format
 Each ADR: **Context** (the forces), **Decision** (what we chose), **Consequences**

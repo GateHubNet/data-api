@@ -9,7 +9,7 @@ The workload is append-only, ledger-ordered data read two ways: selective lookup
 and aggregates (candles, rates, volumes, stats). That is columnar-OLAP territory and what the previous design (a search engine
 used for aggregations) was weakest at ([ADR-0001](adr/0001-use-clickhouse.md)).
 
-One ClickHouse **server** holds one **database per network** (`xrpl`, `xahau`), each with the same 33 tables
+One ClickHouse **server** holds one **database per network** (`xrpl`, `xahau`), each with the same 42 tables
 ([ADR-0009](adr/0009-one-deployment-per-network.md)). The image is pinned to `clickhouse/clickhouse-server:26.8.14.3` (the schema
 and the syncer's recovery rely on partition-scoped lightweight `DELETE` and on `async_insert=0`, both verified on that version);
 `clickhouse-keeper` is pinned to the same version.
@@ -40,6 +40,7 @@ errors), while the same query without `FINAL` ran at 127 QPS with zero errors.
 | Single-row lookups (`tx_by_hash`, `ledger_by_hash`, ...) | not needed | the lookup table gives the key; the `ledgers` row is the commit marker |
 | Aggregates (candles, rates, active accounts, reports) | **No** | the aggregation reads `LIMIT 1 BY` deduplicated rows, and sums are exact decimals so a row counted once is counted once |
 | Rollups the aggregator writes (`stats_hourly`, `volume_*`) | **No** | readers keep the newest `version` of a row/set (`argMax` / `max(version)`), so a half-written newer version is never mixed with an older one |
+| The account and market aggregates (`native_rates_daily`, `pair_hourly`, `markets_live`, the account rollups) | **No** | the newest version of a set, found from its sentinel or as `max(version)` of its key prefix; see [the aggregate families](#the-aggregate-families-and-their-reads) |
 | `validations` (AggregatingMergeTree) | **No** | readers `GROUP BY (ledger_hash, validation_public_key)` and add the partial rows up |
 
 > A new list endpoint must not use `FINAL` on its scan ([ADR-0003](adr/0003-no-final-on-list-queries.md)); the unit test
@@ -70,6 +71,32 @@ sized by `ledgers.exchanges_count` (a read of `ledgers` in key order finds the l
 the page) and sorted on its own to the page (a top-N); a window that holds fewer than counted (a marker inside its first ledger,
 `autobridged`) is followed by one sized for twice as many (Ruling R107). Its cost is the granules of that window, which for the long
 tail of small pairs can be most of the partition (10 million ledgers) it lies in, never the whole history.
+
+## The aggregate families and their reads
+
+Sub-project D2 ([ADR-0013](adr/0013-account-and-market-aggregates.md)) adds nine aggregate tables ([data-model](data-model.md#account-and-market-aggregates-migration-003)).
+They are `ReplacingMergeTree(version)` tables whose unit is a **set**, written whole in one insert under a new version by the aggregator.
+Every read follows three rules: it starts from a **key prefix** of the table (so it reads the granules of one account, day or period,
+never the table), it keeps the **newest version** of the set (never `FINAL`: a merge may not have run, and `FINAL` would merge across
+every part), and it reads a row that may be there twice **once** (`LIMIT 1 BY` the key). The reads, by family:
+
+| Family | Who reads it | The read |
+| --- | --- | --- |
+| `native_rates_daily` | `DailyRates` (the API's valuation) | One query for the days of a request that have a valid set: the assets as tuples (`(currency, issuer) IN ...`), the key prefix, `day BETWEEN`, and `(day, version) IN` the newest not-stale sentinel of each day of the current config version, so only the rows of that version are read. The days without a valid set are computed on read (`RatesService.dailyNativeRates`, a call per run of at most 3,000 days) and cached 60 s in the API |
+| `pair_hourly` | `markets_live` and the `pair_hourly` runner | The sentinels of an hour range (`hour` is the first key column), then the rows of the newest version of each hour; each hour's rows are summed or combined as a market window (open and last by the key of the trade, high and low by rate with the key as tie-break, sums with the `sumOf` fallback) |
+| `markets_live` | `MarketsService` (`/v2/network/markets`) | The key prefix `(period, amm)` with `version = (SELECT max(version) ... WHERE period AND amm)`, ordered by the key, `LIMIT 1 BY` the pair: one set, up to a few thousand rows, in tens of milliseconds |
+| `account_rollup_state` | `AccountDayGroupsService`, the `account_rollups` runner | `account = ...`, `ORDER BY account, version DESC LIMIT 1`: the newest row is the state, and a state of another config version has no coverage. Cached 60 s per account in the API |
+| `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the day-groups read of the API (the rollup source) | `account = ... AND day BETWEEN ...` and `(day, version) IN (SELECT day, max(version) FROM account_rollup_days WHERE account = ... GROUP BY day)`: the rows of the version of each day's sentinel, ordered by the key and `LIMIT 1 BY` the group. A set whose sentinel is not written is not read |
+| The raw rows of an account | the day-groups read of the API (the raw source), and the rollup writer | The account's key range in `balance_changes`, `account_transactions` or `account_exchanges` (the primary key starts with `account`, so a window is one key range per part) for the ledger range of the days read (at most two ranges outside the rolled days), each row once: a subquery ordered by the whole key with `LIMIT 1 BY` the rest of it, as the other account reads do. The writer reads `account IN (...)` for the heavy accounts of a day |
+
+**Where the cost is.** An account window costs the rows the account holds in it (a key range); a heavy account (1,000,000 balance
+changes or more) is served from its daily rollups for the days they cover, so the same answer costs the groups (days x lines) instead of
+millions of rows. A window of time across all accounts is no key range: every part that holds a ledger of it is read whole, which is why
+nothing reads "all accounts of a day" except the aggregator, once, over the youngest parts (`pair_hourly`, one hour at a time) or by
+the heavy accounts' own key ranges (`account_rollups`). `pair_hourly` expires by whole parts (`ttl_only_drop_parts = 1`, 45 days; a
+part is one day), so a TTL merge never rewrites a part. The query plans are pinned by tests (`apps/api/test/support/plans.ts`: a
+`ReadFromMergeTree` on a key range that starts with `account`, the set reads on their key prefixes, no `FINAL`), and a light account's
+All window reads about its own rows (`system.query_log.read_rows`).
 
 ## Writes: parts, insert modes, deduplication
 
@@ -168,6 +195,9 @@ The safe procedure drops **one 10,000,000-ledger block from all 14 ledger-derive
 a partial loss use `range-ingest --reprocess` over exactly the damaged range. Dropping a block makes lists in that window empty.
 
 `validations` has a 90-day TTL (`toDateTime(last_datetime) + INTERVAL 90 DAY`); `fee_stats` and the rollups (`stats_hourly`, `volume_*`) are small, keep them.
+The aggregate tables of migration 003 are not ledger tables, so no ledger retention touches them: only `pair_hourly` expires (45 days after its hour),
+the others are recomputable and kept, and the retention procedure leaves them alone. A re-ingest of a range reaches them through `agg_dirty`
+([syncer](syncer.md#76-the-agg_dirty-hooks)).
 
 ## Useful operational queries
 

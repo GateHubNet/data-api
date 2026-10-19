@@ -189,6 +189,11 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 
 Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs).
 
+More additions ([ADR-0013](adr/0013-account-and-market-aggregates.md)): the routes `GET /v2/accounts/{address}/analytics/{balances,
+balance_changes, counterparties, exchanges}` and `GET /v2/network/markets`, and the parameter `interval` on
+`GET /v2/accounts/{address}/stats/{family}` and `GET /v2/accounts/{address}/reports` (the original ignored it there: a client that sent
+one now gets buckets).
+
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
 
@@ -787,12 +792,13 @@ What the account sent and received, a report for each UTC day, with every value 
 | `date` (path) | | One day: the report of the day of that date (replaces `start` and `end`). |
 | `start` | now | The first day. |
 | `end` | now | The last day (whole). |
+| `interval` | `day` | `day`, `week` or `month`: a report per bucket (see [`interval` on `reports`](#interval-on-reports) below). |
 | `accounts` (alias `counterparties`) | false | List the counterparties instead of counting them. |
 | `payments` | false | List the payments of each day. |
 | `descending` | false | Newest day first. |
 | `format` | json | `csv`: file `<address> - reports.csv` (counterparty lists joined with `, `). |
 
-The window may span at most 200 days (counted as the whole days between `start` and `end`).
+The window may span at most 200 days (counted as the whole days between `start` and `end`); with an `interval`, at most 200 buckets.
 
 ```json
 { "result": "success", "start": "2015-01-14T00:00:00Z", "end": "2015-01-15T00:00:00Z", "count": 2,
@@ -807,22 +813,93 @@ Quotients are cut to 17 significant digits, sums are exact. `payments` adds a li
 currency, issuer?, type}]` as the last key of each report. A payment from the account to itself would count once, as sent (the
 original tested the sender's side first), and the account would be among its own `receiving_counterparties`.
 
-Errors, in order: 400 `invalid date format` (`start`, or the path date), `invalid end date format`, `choose a date range less
-than 200 days`; 500 `unable to retrieve payments` (the message the original has: it copied the payments route).
+Errors, in order: 400 `invalid date format` (`start`, or the path date), `invalid end date format`, `invalid interval - use: day,
+week, month`, `choose a date range less than 200 days` (`weeks`, `months`), `payments can only be listed with interval day`; 500
+`unable to retrieve payments` (the message the original has: it copied the payments route).
 
 **Differences**: the days are the calendar days of the window (a `start` with a time of day gave the original zero rows for
 every day); the rate of an issued currency is the rate of the UTC day, not the rate at each payment's time (an approximation
 the design accepts); sums are exact.
 
+
+#### `interval` on `reports`
+
+Added by [ADR-0013](adr/0013-account-and-market-aggregates.md); the original ignored it, and without it the answers above are
+unchanged. `interval` is `day` (the default), `week` (from Monday) or `month` (calendar), all UTC; anything else answers 400
+`invalid interval - use: day, week, month`. A report is then a **bucket**, from the bucket of `start` to the bucket of `end`
+(`/{date}` gives the one bucket that holds the date); `date` is the start of the bucket, the bucket is whole although the window ends in
+the middle of it (the days to come have no payments), and the answer's `start` and `end` are the request's.
+
+- **The limit is 200 buckets**, counted between the bucket of `start` and the bucket of `end`: 200 days with `day` (unchanged: `choose
+  a date range less than 200 days`), 200 weeks with `week` (about 3.8 years: `choose a date range less than 200 weeks`) and 200
+  months with `month` (about 16.7 years, all of the history: `choose a date range less than 200 months`).
+- A bucket's report adds its days up: the totals are the sums of the days' values (each payment at its own day's rate), the highs the
+  largest of the days', the payment counts sums. The counterparties are counted (or, with `accounts`, listed in the order of their
+  first payment in the bucket) over the whole bucket, not added per day: an account paid on two days of a week is one.
+- `payments=true` lists every payment of each report, which a week or a month would make unbounded: with `week` or `month` it is 400
+  `payments can only be listed with interval day`.
+
+The checks come in this order: `invalid date format` (the path date, or `start`), `invalid end date format`, `invalid interval - use:
+day, week, month`, the window length, then `payments`. The payments are read on read for every account (a payment is not rolled
+up), and the rates come from `native_rates_daily` where the day has a set and are worked out on read for the others (as for
+`stats/value`).
+
+Example: the buckets of January and February: the window starts in the middle of January and ends on February 20, and
+the reports are whole months. The 20 and 10 USD received in February are worth 10 and 5 XRP at the rate of their days, so the
+largest of them (`high_value_received`) is 10; an account that was paid on two days of a month (here, in February, the one
+the account paid 4 XRP and 8 USD) is counted once:
+
+`GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/reports?interval=month&start=2020-01-15&end=2020-02-20`
+
+<!-- d2-example GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/reports?interval=month&start=2020-01-15&end=2020-02-20 -->
+
+```json
+{
+  "result": "success",
+  "start": "2020-01-15T00:00:00Z",
+  "end": "2020-02-20T00:00:00Z",
+  "count": 2,
+  "reports": [
+    {
+      "account": "rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD",
+      "date": "2020-01-01T00:00:00Z",
+      "high_value_received": "7",
+      "high_value_sent": "10",
+      "total_value_received": "7",
+      "total_value_sent": "17",
+      "total_value": "24",
+      "payments_sent": 3,
+      "payments_received": 1,
+      "receiving_counterparties": 2,
+      "sending_counterparties": 1
+    },
+    {
+      "account": "rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD",
+      "date": "2020-02-01T00:00:00Z",
+      "high_value_received": "10",
+      "high_value_sent": "4",
+      "total_value_received": "15",
+      "total_value_sent": "8",
+      "total_value": "23",
+      "payments_sent": 2,
+      "payments_received": 2,
+      "receiving_counterparties": 1,
+      "sending_counterparties": 1
+    }
+  ]
+}
+```
+
 ### `GET /v2/accounts/{address}/stats/{family}`
 
 `family` is `transactions` or `value`. A row per UTC day on which the account was **active** (a day without activity has no
-row), from `start` up to but **not including** `end`.
+row), from `start` up to but **not including** `end`; with `interval`, a row per bucket of days, see [`interval` on `stats/{family}`](#interval-on-statsfamily) below.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `start` | `2013-01-01` | The first day, from its midnight on. |
 | `end` | now | Exclusive: `end=2015-01-16` gives the days before it (a day is in when its midnight is at or after `start` and before `end`). If `start` and `end` are less than a whole day apart, `start` is cut back to the start of its day. |
+| `interval` | none | `day`, `week` or `month`: the rows are buckets, not active days (see [`interval` on `stats/{family}`](#interval-on-statsfamily) below). |
 | `descending`, `limit` (200, max 1000), `marker` | | The marker is the day of the last row. |
 | `format` | json | `csv`: file `<address> - stats.<family>.csv`. |
 
@@ -834,12 +911,457 @@ The answer is `{ "result": "success", "count": n, "marker": "…", "rows": [ ...
 the native balance plus each issued currency it holds at the rate of the day; a negative issued balance, what the account
 owes, is worth 0; `balance_change_count` does not count the fee).
 
-Errors, in order: 400 `invalid start date format`, `invalid end date format`, `invalid family`, `invalid marker`; 500 `unable to
-retrieve exchanges` (the original's message, copied from another route).
+Errors, in order: 400 `invalid start date format`, `invalid end date format`, `invalid family`, `invalid interval - use: day, week,
+month`, `invalid marker`; 500 `unable to retrieve exchanges` (the original's message, copied from another route).
 
 The account stats were computed by an external job of the original that is not in its repository; the semantics above
 (transactions sent, results/types of those, value at the end of the day, fee not counted) are this API's reading of its
 README, see [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md).
+
+
+#### `interval` on `stats/{family}`
+
+Added by [ADR-0013](adr/0013-account-and-market-aggregates.md); the original ignored it, and without it the answers above are
+unchanged. `interval` is `day`, `week` (Monday to Monday) or `month` (calendar), all UTC; anything else answers 400 `invalid
+interval - use: day, week, month` (checked after the family and before the marker; an empty `interval` is none). The rows are then
+**buckets**: a bucket is a row when its start is at or after `start` and before `end` (the rule for days, applied to bucket
+starts, and `end` stays exclusive, so `start=2020-01-15&interval=month` has no January row). `date` is the start of the bucket and
+the marker is that day (`YYYY-MM-DD`, the existing marker format); `descending` and `limit` count buckets.
+
+- `family=transactions`: a row for each bucket in which the account sent a transaction, with the counts of the whole bucket. A
+  bucket without one has no row, as a day has none.
+- `family=value`: a row for **every** bucket from the first one in which the account had a balance (the bucket of its first
+  balance change, or the first bucket of the window when it changed before) to the last bucket before `end`, active or not: a
+  value exists at every bucket end and moves with the rates. `account_value` is the value at the end of the bucket's last day
+  (today, for the bucket that holds now) at that day's rates, in the native currency; `balance_change_count` counts the changes of
+  the bucket, the fee not counted (0 for a quiet bucket).
+- No row is served for a bucket that has not begun: the rows end at the bucket that holds now, whatever `end` says. No bucket that
+  starts after 2149-06-06 (the last day a ClickHouse `Date` holds) is served.
+
+Paging is unchanged (`limit` 200, at most 1000): the whole history of an account per month is about 170 rows, one page. A heavy
+account (1,000,000 balance changes or more) is read from its daily rollups ([syncer](syncer.md#74-account_rollups)); the answer is
+the same with or without them.
+
+Example: the weeks of January 13 and 27 and of February 3 (the week of January 20 had no transaction, so it has no row):
+
+`GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/stats/transactions?interval=week&start=2020-01-13&end=2020-02-10`
+
+<!-- d2-example GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/stats/transactions?interval=week&start=2020-01-13&end=2020-02-10 -->
+
+```json
+{
+  "result": "success",
+  "count": 3,
+  "rows": [
+    {
+      "date": "2020-01-13T00:00:00Z",
+      "transaction_count": 3,
+      "result": { "tesSUCCESS": 3 },
+      "type": { "Payment": 2, "TrustSet": 1 }
+    },
+    {
+      "date": "2020-01-27T00:00:00Z",
+      "transaction_count": 1,
+      "result": { "tecUNFUNDED_OFFER": 1 },
+      "type": { "OfferCreate": 1 }
+    },
+    {
+      "date": "2020-02-03T00:00:00Z",
+      "transaction_count": 1,
+      "result": { "tesSUCCESS": 1 },
+      "type": { "Payment": 1 }
+    }
+  ]
+}
+```
+
+Example: a row for each month, with the value of the account at the end of it. At the end of April the 20 USD it held
+are worth 5 XRP at the rate of that day, so the account is worth 84.999976 + 5:
+
+`GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/stats/value?interval=month&start=2020-01-01&end=2020-05-01`
+
+<!-- d2-example GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/stats/value?interval=month&start=2020-01-01&end=2020-05-01 -->
+
+```json
+{
+  "result": "success",
+  "count": 4,
+  "rows": [
+    { "date": "2020-01-01T00:00:00Z", "account_value": "100", "balance_change_count": 1 },
+    { "date": "2020-02-01T00:00:00Z", "account_value": "79.999988", "balance_change_count": 2 },
+    { "date": "2020-03-01T00:00:00Z", "account_value": "79.999976", "balance_change_count": 1 },
+    { "date": "2020-04-01T00:00:00Z", "account_value": "89.999976", "balance_change_count": 2 }
+  ]
+}
+```
+
+### Account analytics: `GET /v2/accounts/{address}/analytics/…`
+
+Four routes that sum up what an account did over a period, for the account pages of the explorer: the balance of each line over
+time, the balance changes by type, the counterparties and the DEX trades. They are **additions** (not in the original; see
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#2-endpoints-kept-added-dropped) and
+[ADR-0013](adr/0013-account-and-market-aggregates.md)): their object shapes and key orders are ours, pinned by tests. They use the
+contract layer of every route (API key, rate limit, `Cache-Control: private, max-age=60`, `format=csv`, errors `{"result":"error",
+"message"}`), and their answers are the same whether an account is read from its own rows or, when it is a heavy one, from its daily
+rollups.
+
+| Topic | Rule |
+| --- | --- |
+| Address | Not validated, as on the other account routes: an address that is none (or has nothing in the window) has an empty answer. |
+| `start`, `end` | The date formats above. The defaults are `2013-01-01` and now. The window is the **UTC days** from the day of `start` to the day of `end`, both whole, whatever the time of day (`end` is included, as in `reports`, unlike the exclusive `end` of `stats/{family}`). With an `interval` it is widened to whole buckets. An `end` on a day before the day of `start` is an empty answer. The answer's `start` is the start of the first day or bucket and its `end` the start of the day or bucket after the last one (so exclusive): `end=2020-06-30` is answered `2020-07-01T00:00:00Z`. |
+| `interval` | `day`, `week` (Monday to Monday) or `month` (calendar), all UTC, where a route takes one; anything else answers 400 `invalid interval - use: day, week, month`. A route that has none ignores the parameter, even a wrong one. |
+| Bucket limit | At most **1000** buckets, else 400 `choose a date range of at most 1000 buckets`. Only the routes with an `interval` have it. Note the defaults: `analytics/balances` has `interval=day`, and a call with no `start` is a window from 2013-01-01, which is far more than 1000 days: send a `start` (the explorer sends one that fits its period). |
+| Error order | `invalid start date format`, `invalid end date format`, then `invalid interval - use: day, week, month`, then the route's other parameter errors in the order of its table, then the bucket limit. |
+| Units | Amounts are whole units as exact decimal strings; values are in the native currency, as exact decimal strings; counts are numbers; times are `YYYY-MM-DDTHH:mm:ssZ`; the `date` of a bucket is its start. A key without a value is left out; `null` is never served. |
+| Sorting | As each route says, with a last tie-break on the key text, so an answer is deterministic. The lists are whole answers or top lists: there is no `marker`. |
+| `format=csv` | The list of the route (`rows`, `counterparties`, `pairs`) as a CSV file, flattened like every other CSV; the file names are given per route. |
+
+**Values.** The value of an amount follows the rule of `reports` and `stats/value`: the native currency is worth itself, an issued
+amount is worth the amount over the rate of its asset on its UTC day (units of the asset per native coin, as
+[`/v2/exchange_rates`](#get-v2exchange_ratesbasecounter) gives it in strict mode), the quotient cut to 17 significant digits for
+each group and day; an asset without a rate that day, or with a rate of 0, is worth 0 (so are LP tokens and any other asset with no
+DEX rate); sums of values are exact. For a balance change the asset is `(currency, counterparty)`, or `(currency, the account
+itself)` where the change's balance is below 0: the account owes on that line, so what it moves is its own IOU. The rates of closed
+days are precomputed once a day for every asset (`native_rates_daily`); today, and yesterday until the ingest has passed it, are
+worked out on read and kept for 60 seconds, so a value of those days may be a minute old. Where a closed day has no stored rate yet
+(a deployment still back-filling them) it is worked out on read too: the answer is the same, only slower.
+
+#### `GET /v2/accounts/{address}/analytics/balances`
+
+The balance of each trust line (and the native balance) of the account at the end of each bucket of the window.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | | The window (above). |
+| `interval` | `day` | `day`, `week` or `month`; the answer always carries it. |
+| `currency` | all | Only the lines of this currency (upper-cased). |
+| `counterparty` (alias `issuer`) | all | Only the lines with this account. Not together with the native currency: 400 `counterparty cannot be specified for XRP` (`XAH` on Xahau), the message of `balance_changes`. |
+| `limit` | 10 (max 50) | How many lines. |
+| `format` | json | `csv`: file `<address> - balance history.csv`, the `rows`. |
+
+A **line** is a currency and its counterparty (none for the native currency), as in `balance_changes`. The balance of a line at the end
+of a bucket is its last balance up to then; a bucket without a change carries the balance before it. A balance below 0 is what the
+account owes on that line, and is served negative. A line has rows from the bucket of its first change, or from the first bucket of
+the window when it changed before it, and a line whose balance went back to 0 keeps its rows of `"0"`. A bucket that has not begun
+has no row, so the rows stop at the bucket that holds now, whatever the `end`.
+
+`lines` are the lines that changed up to the end of the window (after the filters), ranked: the native line first; then the lines
+that have a rate, by their balance over that rate (the rate of the asset `(currency, counterparty)` on the newest valid day of
+`native_rates_daily` at or before the end of the window), largest first; then the lines without one by the size of the balance,
+largest first; ties by currency and counterparty. The first `limit` are served, and `lines_total` counts all of them. While the
+stored rates are not there yet (a deployment back-filling them) no line has a rate and the lines after the native one rank by the
+size of their balance. The `balance` of a line in `lines` is its balance at the end of the window.
+
+`GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/balances?interval=month&start=2020-03-01&end=2020-05-31&limit=3`
+
+<!-- d2-example GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/balances?interval=month&start=2020-03-01&end=2020-05-31&limit=3 -->
+
+```json
+{
+  "result": "success",
+  "start": "2020-03-01T00:00:00Z",
+  "end": "2020-06-01T00:00:00Z",
+  "interval": "month",
+  "lines_total": 3,
+  "lines": [
+    { "currency": "XRP", "balance": "84.999976" },
+    { "currency": "USD", "counterparty": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B", "balance": "20" },
+    { "currency": "CAD", "counterparty": "rnCEEqDnCuSjDsHiJrca4VYUqaMyi4vGF7", "balance": "-5" }
+  ],
+  "count": 7,
+  "rows": [
+    { "date": "2020-03-01T00:00:00Z", "currency": "XRP", "balance": "79.999976" },
+    { "date": "2020-03-01T00:00:00Z", "currency": "USD", "counterparty": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B", "balance": "40" },
+    { "date": "2020-04-01T00:00:00Z", "currency": "XRP", "balance": "84.999976" },
+    { "date": "2020-04-01T00:00:00Z", "currency": "USD", "counterparty": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B", "balance": "20" },
+    { "date": "2020-05-01T00:00:00Z", "currency": "XRP", "balance": "84.999976" },
+    { "date": "2020-05-01T00:00:00Z", "currency": "USD", "counterparty": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B", "balance": "20" },
+    { "date": "2020-05-01T00:00:00Z", "currency": "CAD", "counterparty": "rnCEEqDnCuSjDsHiJrca4VYUqaMyi4vGF7", "balance": "-5" }
+  ]
+}
+```
+
+Keys: answer `result, start, end, interval, lines_total, lines, count, rows`; line `currency, counterparty?, balance`; row `date,
+currency, counterparty?, balance`. `count` is the number of rows. The rows are ordered by `date`, then by the order of `lines`. In
+the example the XRP and USD lines began before the window, so they have a row from its first bucket on; the CAD line, which the
+account owes, starts inside it, in May, with a negative balance.
+
+Errors, in order: 400 `invalid start date format`, `invalid end date format`, `invalid interval - use: day, week, month`, `counterparty
+cannot be specified for XRP` (`XAH`), `choose a date range of at most 1000 buckets`; 500 `unable to retrieve balance history`.
+
+#### `GET /v2/accounts/{address}/analytics/balance_changes`
+
+The sums of the balance changes of the account in the window, by change type, with what they were worth.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | | The window (above). |
+| `interval` | none | Without it the `rows` are per change type and asset; with `day`, `week` or `month` they are per bucket and change type. |
+| `format` | json | `csv`: file `<address> - balance change totals.csv`, the `rows`. |
+
+Every balance change of the window counts once, the fee rows (`transaction_cost`) included. A **change type** is one of the ten of
+`balance_changes`; the changes of transaction types the original never classified have none, and are grouped without a `change_type`
+key (as the objects of `balance_changes` leave it out). `in` is the sum of the positive changes, `out` the sum of the negative ones
+as a positive amount, `in_value` and `out_value` their values in the native currency (see Values above), `net_value` is `in_value -
+out_value`, `count` the number of changes. An asset has no `issuer` key for the native currency; on a line the account owes on, the
+`issuer` is the account itself.
+
+Change types come in this order: `transaction_cost`, `payment_destination`, `payment_source`, `exchange`, `intermediary`,
+`escrow_create`, `escrow_finish`, `escrow_cancel`, `paychannel_fund`, `paychannel_payout`, then the changes without one. `totals` has an
+entry for each type that has a change, in that order. `rows` without an `interval` are ordered by type, then by `in_value + out_value`,
+largest first, then by currency and issuer; with an `interval`, by date, then type, and only for the buckets and types that have a
+change.
+
+`GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/balance_changes?start=2020-02-01&end=2020-03-31`
+
+<!-- d2-example GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/balance_changes?start=2020-02-01&end=2020-03-31 -->
+
+```json
+{
+  "result": "success",
+  "start": "2020-02-01T00:00:00Z",
+  "end": "2020-04-01T00:00:00Z",
+  "totals": [
+    { "change_type": "transaction_cost", "count": 2, "in_value": "0", "out_value": "0.000024", "net_value": "-0.000024" },
+    { "change_type": "payment_destination", "count": 2, "in_value": "5", "out_value": "0", "net_value": "5" },
+    { "change_type": "payment_source", "count": 1, "in_value": "0", "out_value": "20", "net_value": "-20" }
+  ],
+  "count": 3,
+  "rows": [
+    {
+      "change_type": "transaction_cost",
+      "currency": "XRP",
+      "count": 2,
+      "in": "0",
+      "out": "0.000024",
+      "in_value": "0",
+      "out_value": "0.000024"
+    },
+    {
+      "change_type": "payment_destination",
+      "currency": "USD",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "count": 2,
+      "in": "40",
+      "out": "0",
+      "in_value": "5",
+      "out_value": "0"
+    },
+    {
+      "change_type": "payment_source",
+      "currency": "XRP",
+      "count": 1,
+      "in": "0",
+      "out": "20",
+      "in_value": "0",
+      "out_value": "20"
+    }
+  ]
+}
+```
+
+With an `interval` a row is `{ "date", "change_type"?, "count", "in_value", "out_value" }` (no asset: the values already added the
+assets up) and the answer carries `interval` after `end`. This is the account `rBtgXX…` of the test world, whose two changes of 2 XRP
+in April belong to a transaction type with no change type:
+
+`GET /v2/accounts/rBtgXXrLQntDfCoJFhdnmhPqMuK2DuwepA/analytics/balance_changes?interval=month&start=2020-02-01&end=2020-04-30`
+
+<!-- d2-example GET /v2/accounts/rBtgXXrLQntDfCoJFhdnmhPqMuK2DuwepA/analytics/balance_changes?interval=month&start=2020-02-01&end=2020-04-30 -->
+
+```json
+{
+  "result": "success",
+  "start": "2020-02-01T00:00:00Z",
+  "end": "2020-05-01T00:00:00Z",
+  "interval": "month",
+  "totals": [
+    { "change_type": "transaction_cost", "count": 1, "in_value": "0", "out_value": "0.000012", "net_value": "-0.000012" },
+    { "change_type": "payment_destination", "count": 7, "in_value": "560", "out_value": "0", "net_value": "560" },
+    { "change_type": "payment_source", "count": 2, "in_value": "0", "out_value": "100", "net_value": "-100" },
+    { "count": 2, "in_value": "2", "out_value": "2", "net_value": "0" }
+  ],
+  "count": 6,
+  "rows": [
+    { "date": "2020-02-01T00:00:00Z", "change_type": "transaction_cost", "count": 1, "in_value": "0", "out_value": "0.000012" },
+    { "date": "2020-02-01T00:00:00Z", "change_type": "payment_destination", "count": 4, "in_value": "550", "out_value": "0" },
+    { "date": "2020-02-01T00:00:00Z", "change_type": "payment_source", "count": 1, "in_value": "0", "out_value": "100" },
+    { "date": "2020-03-01T00:00:00Z", "change_type": "payment_destination", "count": 3, "in_value": "10", "out_value": "0" },
+    { "date": "2020-04-01T00:00:00Z", "change_type": "payment_source", "count": 1, "in_value": "0", "out_value": "0" },
+    { "date": "2020-04-01T00:00:00Z", "count": 2, "in_value": "2", "out_value": "2" }
+  ]
+}
+```
+
+Keys: answer `result, start, end, interval?, totals, count, rows`; total `change_type?, count, in_value, out_value, net_value`; row
+without an interval `change_type?, currency, issuer?, count, in, out, in_value, out_value`; row with an interval `date,
+change_type?, count, in_value, out_value`. `count` is the number of rows.
+
+Errors, in order: 400 `invalid start date format`, `invalid end date format`, `invalid interval - use: day, week, month`, `choose a
+date range of at most 1000 buckets`; 500 `unable to retrieve balance changes`.
+
+#### `GET /v2/accounts/{address}/analytics/counterparties`
+
+The accounts the account paid and was paid by in the window, with what the payments were worth.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | | The window (above). The route has no `interval`. |
+| `sort` | `value` | `value` (by `total_value`) or `count` (by `payments_sent + payments_received`), largest first, then by account. Anything else: 400 `invalid sort - use: value, count`. |
+| `limit` | 20 (max 1000) | |
+| `format` | json | `csv`: file `<address> - counterparties.csv`. |
+
+The payments of the account in the window (the rows of `account_payments`), each once, grouped by the account on the other side, with the
+side rule of `reports` (a payment of the account to itself would be a payment sent, its counterparty being the account; the ingest
+stores none). `sent_value` is what the account paid the counterparty and `received_value` what the counterparty paid the account (the
+delivered amounts, valued as above); `payments_sent` and `payments_received` count the payments each way; `first` and `last` are the
+times of the first and the last payment between the two in the window. `total` is the number of different counterparties in the window
+and `count` the number served: the first `limit` by `sort`. The order is exact (the values are exact decimals), whatever the database
+ranked first.
+
+`GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/counterparties?limit=6&start=2020-01-01&end=2020-06-30`
+
+<!-- d2-example GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/counterparties?limit=6&start=2020-01-01&end=2020-06-30 -->
+
+```json
+{
+  "result": "success",
+  "start": "2020-01-01T00:00:00Z",
+  "end": "2020-07-01T00:00:00Z",
+  "sort": "value",
+  "total": 3,
+  "count": 3,
+  "counterparties": [
+    {
+      "account": "rnCEEqDnCuSjDsHiJrca4VYUqaMyi4vGF7",
+      "sent_value": "15",
+      "received_value": "24",
+      "total_value": "39",
+      "payments_sent": 2,
+      "payments_received": 3,
+      "first": "2020-01-16T09:00:00Z",
+      "last": "2020-06-15T09:00:00Z"
+    },
+    {
+      "account": "rrrrUBy92h6worVCYERZcVCzgzgmHb17Dx",
+      "sent_value": "20",
+      "received_value": "0",
+      "total_value": "20",
+      "payments_sent": 4,
+      "payments_received": 1,
+      "first": "2020-01-17T09:00:00Z",
+      "last": "2020-04-20T12:00:00Z"
+    },
+    {
+      "account": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "sent_value": "0",
+      "received_value": "7",
+      "total_value": "7",
+      "payments_sent": 0,
+      "payments_received": 1,
+      "first": "2020-01-17T09:00:00Z",
+      "last": "2020-01-17T09:00:00Z"
+    }
+  ]
+}
+```
+
+Keys: `result, start, end, sort, total, count, counterparties`; counterparty `account, sent_value, received_value, total_value,
+payments_sent, payments_received, first, last`.
+
+Errors, in order: 400 `invalid start date format`, `invalid end date format`, `invalid sort - use: value, count`; 500 `unable to retrieve
+counterparties`.
+
+Counterparties are always read from the payments themselves, for every account (a payment table grouped by counterparty compresses
+badly, so nothing is rolled up): well under 500 ms for an ordinary account, 2 to 10 seconds for a year or more of an exchange's
+hundreds of thousands of payments (the explorer gives this one call a 15 second timeout). An account with very many paid assets over
+many days, **while the stored rates are still being back-filled**, can overrun what one query may carry (the rates of the days
+that are not stored travel in the request to the database) and answer the 500 above; once the back-fill is done
+(`syncer_rates_daily_missing_days` is 0) only the rates of today and yesterday travel, and it does not happen in practice (see
+[operations](operations.md#account-and-market-aggregates)).
+
+#### `GET /v2/accounts/{address}/analytics/exchanges`
+
+What the account traded on the exchange in the window, per pair.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | | The window (above). The route has no `interval`. |
+| `limit` | 20 (max 1000) | |
+| `format` | json | `csv`: file `<address> - exchange pairs.csv`. |
+
+The trades of the account in the window (it is the buyer or the seller; the rows of `account_exchanges`), each once, per pair **in the
+canonical stored order** (as `/v2/exchanges` serves a pair). `bought` is the base the account received (it was the buyer) and `sold` the
+base it gave (it was the seller); a trade of the account with itself is in both. `bought_counter` is the counter the account paid for
+what it `bought`, and `sold_counter` the counter it received for what it `sold`: a client that shows a pair the other way round (the
+explorer's natural orientation) has both sides of each direction exactly, and only has to swap them. `native_volume` is, for a pair
+with a native side, the volume of that side; for another pair, for each day the base volume over the rate of the base (or, where the
+base has none, the counter volume over the rate of the counter), cut to 17 significant digits and added up; it is left out when no day
+of the pair had a rate. The pairs are sorted by `native_volume`, largest first, the pairs without one last by `count`, then by the pair;
+`total` is the number of pairs in the window and `count` the number served: the first `limit`. Swaps against AMM pools, where the data
+holds them, are trades like any other: no filter, and no AMM key.
+
+`GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/exchanges?start=2020-01-01&end=2020-06-30`
+
+<!-- d2-example GET /v2/accounts/rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD/analytics/exchanges?start=2020-01-01&end=2020-06-30 -->
+
+```json
+{
+  "result": "success",
+  "start": "2020-01-01T00:00:00Z",
+  "end": "2020-07-01T00:00:00Z",
+  "total": 3,
+  "count": 3,
+  "pairs": [
+    {
+      "base_currency": "EUR",
+      "base_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "counter_currency": "USD",
+      "counter_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "count": 4,
+      "base_volume": "139",
+      "counter_volume": "85",
+      "bought": "130",
+      "sold": "9",
+      "bought_counter": "67",
+      "sold_counter": "18",
+      "native_volume": "37"
+    },
+    {
+      "base_currency": "USD",
+      "base_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "counter_currency": "XRP",
+      "count": 4,
+      "base_volume": "35.5",
+      "counter_volume": "13.25",
+      "bought": "15.5",
+      "sold": "21",
+      "bought_counter": "8.25",
+      "sold_counter": "5.25",
+      "native_volume": "13.25"
+    },
+    {
+      "base_currency": "XRP",
+      "counter_currency": "ZAR",
+      "counter_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "count": 1,
+      "base_volume": "5",
+      "counter_volume": "100",
+      "bought": "5",
+      "sold": "0",
+      "bought_counter": "100",
+      "sold_counter": "0",
+      "native_volume": "5"
+    }
+  ]
+}
+```
+
+Keys: `result, start, end, total, count, pairs`; pair `base_currency, base_issuer?, counter_currency, counter_issuer?, count,
+base_volume, counter_volume, bought, sold, bought_counter, sold_counter, native_volume?`. In the example the EUR/USD pair has no
+native side: its volume is worked out through the rate of USD on each day (the USD that was paid on a day without a rate is worth
+nothing, so 100 EUR for 7 USD adds none), and the XRP/ZAR pair has a native base.
+
+Errors, in order: 400 `invalid start date format`, `invalid end date format`; 500 `unable to retrieve exchanges`.
 
 ---
 
@@ -999,6 +1521,161 @@ Errors: 400 as above, `invalid start date format`, `invalid end date format`, `i
 not reproduce `converted_amount`); `converted_amount` is always a string; historical rows carry `end_time` (the start of the
 next bucket, exclusive); the historical display currency uses each bucket's own native-to-display price. A day counts as final
 only once the ingest has passed it by an hour, so volumes follow the ingest rather than the wall clock.
+
+
+### `GET /v2/network/markets`
+
+The trade statistics of **every pair** that traded in a live period, in one call: the table of the explorer's Markets page. It is an
+**addition** (not in the original; see [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#2-endpoints-kept-added-dropped) and
+[ADR-0013](adr/0013-account-and-market-aggregates.md)): its object and key order are ours, and it uses the contract layer of every
+route (API key, rate limit, `Cache-Control: private, max-age=60`, `format=csv`, errors `{"result":"error","message"}`). The answer is
+one precomputed set, read in a few milliseconds.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `period` | `day` | `day`, `7day` or `30day`, the live periods of `exchange_volume` that the explorer uses. Anything else: 400 `invalid period - use: day, 7day, 30day`. An empty `period` is the default. |
+| `min_trades` | 10 | List the pairs with at least this many trades: a whole number (plain digits) from 1 to 1,000,000, else 400 `invalid min_trades`. An empty one is the default. |
+| `exchange_currency`, `exchange_issuer` | the native currency | Also show the volumes in this currency, at the live rate, as the live volume rows do. The errors of the volume routes: 400 `exchange currency must have an issuer`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid exchange issuer address`. The native currency (with no issuer) adds nothing. |
+| `limit` | 1000 (max 5000) | How many markets. |
+| `format` | json | `csv`: file `markets.csv`, the `markets` (flattened: the sparkline is the columns `sparkline[0].date`, `sparkline[0].close`, ...). |
+
+- **Pairs.** Every pair traded in the window, not the markets config, in the canonical stored order of its currencies (as
+  `/v2/exchanges` serves a pair); a price is **counter per base**. A trade counts when its native leg is above 0.0005 (the rule of the
+  candles and of `reduce`: dust is left out), and `count` counts those. The pairs with at least `min_trades` trades are listed, sorted by
+  `native_volume`, largest first (compared as numbers), the pairs without one last by `count`, then by the pair; at most `limit` are
+  served.
+- **Window.** The periods start on the hour: a set is made of whole hours of trade statistics, so the 24 hours of `day` are 24 to 25
+  hours (`start_time` is the hour that is 24 hours before the hour of `end_time`, and `end_time` is the close time of the newest
+  ledger the set covers), and `7day` and `30day` the same on 7 and 30 days. The `day` set is rewritten every minute, `7day` and
+  `30day` every five minutes; `end_time` says how current a set is. A set is written only when every hour of its window (and of the
+  7 days of its sparkline) has its statistics; otherwise the previous set stays and its `end_time` ages.
+- **Prices.** `open`, `high`, `low` and `last` have 8 significant digits (as candles): `open` and `last` are the rates of the first and
+  last trade of the window (by ledger, transaction and node), `high` and `low` the largest and smallest rate. `open_time` and
+  `last_time` are the close times of those two trades. `change` is `(last / open - 1) * 100` in percent, exact, rounded half up (away
+  from zero) to 2 decimals; it is left out where `open` is not above 0, which no trade is.
+- **Volumes** are exact sums in whole units: `base_volume` of the base, `counter_volume` of the counter. `native_volume` is the volume in
+  the native currency: for a pair with a native side, that side's volume; for another pair the base volume over the rate of the base,
+  or, where the base has none, the counter volume over the rate of the counter (cut to 17 significant digits); a pair without a rate
+  on either side has none, and the key is left out. The rate of an asset is its volume over the native volume of its pair against the
+  native currency in the same window (all trades, whether or not that pair is listed), so every asset that trades against the native
+  currency has one.
+- **`sparkline`** is the close of each of the last 7 UTC days, ending with the day of `end_time` (6 closed days and today so far), as
+  `{ "date", "close"? }`: a day without a trade carries the close before it, and `close` is left out for a day with none before it
+  within the 7 days.
+- **Totals.** `pairs` is the number of listed pairs (with `count >= min_trades`), whatever the `limit`; `pairs_traded`, `count` and
+  `native_volume` are over every pair that traded in the window (the pairs without a native volume add none).
+- **Display currency.** With `exchange_currency` the answer adds `exchange` (`{currency, issuer?}`) and `exchange_rate` (units of it per
+  native coin at the live rate, 8 significant digits) after `end_time`, and a `converted_volume` after `native_volume` in the totals
+  and in each market that has one: the native volume times the unrounded rate, cut to 17 significant digits.
+- **No set yet** (a database whose aggregator has not written one): `{ "result": "success", "period": "day", "count": 0, "markets": [] }`.
+
+`GET /v2/network/markets?period=day&limit=1`
+
+<!-- d2-example GET /v2/network/markets?period=day&limit=1 -->
+
+```json
+{
+  "result": "success",
+  "period": "day",
+  "start_time": "2020-07-01T10:00:00Z",
+  "end_time": "2020-07-02T10:42:17Z",
+  "totals": { "pairs": 9, "pairs_traded": 11, "count": 112, "native_volume": "243.5" },
+  "count": 1,
+  "markets": [
+    {
+      "base_currency": "USD",
+      "base_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "counter_currency": "XRP",
+      "count": 13,
+      "base_volume": "130",
+      "counter_volume": "65",
+      "native_volume": "65",
+      "open": "0.50000000",
+      "high": "0.80000000",
+      "low": "0.30000000",
+      "last": "0.40000000",
+      "change": "-20.00",
+      "open_time": "2020-07-01T12:00:00Z",
+      "last_time": "2020-07-02T10:42:17Z",
+      "sparkline": [
+        { "date": "2020-06-26T00:00:00Z" },
+        { "date": "2020-06-27T00:00:00Z" },
+        { "date": "2020-06-28T00:00:00Z", "close": "0.52500000" },
+        { "date": "2020-06-29T00:00:00Z", "close": "0.52500000" },
+        { "date": "2020-06-30T00:00:00Z", "close": "0.52500000" },
+        { "date": "2020-07-01T00:00:00Z", "close": "0.50000000" },
+        { "date": "2020-07-02T00:00:00Z", "close": "0.40000000" }
+      ]
+    }
+  ]
+}
+```
+
+With a display currency:
+
+`GET /v2/network/markets?period=day&limit=1&exchange_currency=USD&exchange_issuer=rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`
+
+<!-- d2-example GET /v2/network/markets?period=day&limit=1&exchange_currency=USD&exchange_issuer=rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B -->
+
+```json
+{
+  "result": "success",
+  "period": "day",
+  "start_time": "2020-07-01T10:00:00Z",
+  "end_time": "2020-07-02T10:42:17Z",
+  "exchange": { "currency": "USD", "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B" },
+  "exchange_rate": "2.0000000",
+  "totals": { "pairs": 9, "pairs_traded": 11, "count": 112, "native_volume": "243.5", "converted_volume": "487" },
+  "count": 1,
+  "markets": [
+    {
+      "base_currency": "USD",
+      "base_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "counter_currency": "XRP",
+      "count": 13,
+      "base_volume": "130",
+      "counter_volume": "65",
+      "native_volume": "65",
+      "converted_volume": "130",
+      "open": "0.50000000",
+      "high": "0.80000000",
+      "low": "0.30000000",
+      "last": "0.40000000",
+      "change": "-20.00",
+      "open_time": "2020-07-01T12:00:00Z",
+      "last_time": "2020-07-02T10:42:17Z",
+      "sparkline": [
+        { "date": "2020-06-26T00:00:00Z" },
+        { "date": "2020-06-27T00:00:00Z" },
+        { "date": "2020-06-28T00:00:00Z", "close": "0.52500000" },
+        { "date": "2020-06-29T00:00:00Z", "close": "0.52500000" },
+        { "date": "2020-06-30T00:00:00Z", "close": "0.52500000" },
+        { "date": "2020-07-01T00:00:00Z", "close": "0.50000000" },
+        { "date": "2020-07-02T00:00:00Z", "close": "0.40000000" }
+      ]
+    }
+  ]
+}
+```
+
+Keys: answer `result, period, start_time, end_time, exchange?, exchange_rate?, totals, count, markets`; totals `pairs, pairs_traded,
+count, native_volume, converted_volume?`; market `base_currency, base_issuer?, counter_currency, counter_issuer?, count,
+base_volume, counter_volume, native_volume?, converted_volume?, open, high, low, last, change?, open_time, last_time, sparkline`.
+`count` is the number of markets served.
+
+Errors, in order: 400 `invalid period - use: day, 7day, 30day`, `invalid min_trades`, `exchange currency must have an issuer`, `XRP cannot
+have an issuer` (`XAH`), `invalid exchange issuer address`; 500 `unable to retrieve markets`.
+
+**No AMM field is served.** The answer has no `amm` key, no `totals.amm_share`, and no `amm_share` or `amm_pool` on a market, and `amm` is not
+a parameter: it is ignored, like any unknown one. A later release that knows the AMM data will add them under one contract that is
+fixed now: they are present **only when known** (every ledger of the window was parsed with AMM support); an absent field means "not
+known", never 0 or `false`. The analytics routes above carry no AMM field either way.
+
+**Differences from `exchange_volume`** (which is unchanged: its components stay the markets config, for Ripple compatibility). For a
+market that both routes show, the numbers can differ: the markets window starts on the hour, where the live volume window is exact (the
+last 24 hours to the second); the markets rate of an asset comes from its native pair whether or not that pair is configured, where
+`exchange_volume` takes only the configured native markets; `network/markets` lists every pair that traded, `exchange_volume` the
+configured ones; and prices are in the canonical stored orientation of the pair.
 
 ---
 

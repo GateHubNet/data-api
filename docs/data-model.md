@@ -2,10 +2,11 @@
 
 The source of truth is the migration files of [`packages/shared/schema/`](../packages/shared/schema/):
 [`001_baseline.sql`](../packages/shared/schema/001_baseline.sql) and
-[`002_validators_amendments.sql`](../packages/shared/schema/002_validators_amendments.sql) (applied in file-name order, per network
+[`002_validators_amendments.sql`](../packages/shared/schema/002_validators_amendments.sql) and
+[`003_account_market_aggregates.sql`](../packages/shared/schema/003_account_market_aggregates.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **33 tables** per network database, in five groups:
+enum: queries use `${Table.X}`, never string literals). **42 tables** per network database, in six groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
@@ -13,6 +14,7 @@ enum: queries use `${Table.X}`, never string literals). **33 tables** per networ
 | Node-sourced (3) | `fee_stats`, `validations`, `validator_manifests` | the `fee_stats` and `validations` workers |
 | Validators and amendments (10, migration 002) | `validator_validations`, `validator_seen`, `unl_lists`, `unl_publishers`, `validator_domains`, `network_state`, `amendment_features`, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly` | the `validations` worker (the first two) and the `validators` worker (the rest) |
 | Aggregates (3) | `stats_hourly`, `volume_daily`, `volume_live` | the `aggregator` worker |
+| Account and market aggregates (9, migration 003) | `native_rates_daily`, `pair_hourly`, `markets_live`, `account_rollup_state`, `account_partition_rows`, `account_rollup_days`, `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the `aggregator` worker (jobs `rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) |
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
 
 Plus `schema_migrations` (the migration runner's bookkeeping). The previous design (CTID-keyed tables, insert-triggered materialized
@@ -35,6 +37,7 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | Prefix-keyed secondary tables and `exchanges` | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
 | `accounts_created`, `volume_live`, `stats_hourly`, internal | `ReplacingMergeTree` | none (`volume_daily`: `toYYYYMM(day)`) | Small tables |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
+| The nine tables of migration 003 | `ReplacingMergeTree(version)` | `toYear(day)` for the rates and the account rollups, `toDate(hour)` for `pair_hourly` (TTL 45 days, `ttl_only_drop_parts = 1`), none for the others | Recomputable aggregates written as complete sets; a year of days is a small partition, an hour table expires by whole days |
 | `validations` | `AggregatingMergeTree` | `toYYYYMMDD(last_datetime)`, TTL 90 days | Partial sightings add up |
 | `validator_validations` | `AggregatingMergeTree` | `intDiv(ledger_index, 100000)`, TTL 7 days, `ttl_only_drop_parts = 1` | Sightings add up; a partition is about four days of ledgers, so expiry drops whole parts |
 | `validator_seen` | `AggregatingMergeTree` | none, no TTL | One row per validator: min / max / max |
@@ -192,6 +195,47 @@ already stored for it), its sentinel row last; a reader takes the newest sentine
 no reader mixes two. None of the ten tables of migration 002 is a ledger table: none is in `CHILD_TABLES` or `LEDGER_KEYED_TABLES`,
 so ingest recovery never deletes from them.
 
+### Account and market aggregates (migration 003)
+
+Nine tables, all `ReplacingMergeTree(version)`, all **recomputable** from the ledger tables and written only by the aggregator ([syncer](syncer.md#7-the-aggregator),
+[ADR-0013](adr/0013-account-and-market-aggregates.md)). None is a ledger table: none is in `CHILD_TABLES` or `LEDGER_KEYED_TABLES`, so ingest
+recovery never deletes from them; a re-ingest reaches them through `agg_dirty` (the hooks of [syncer](syncer.md#76-the-agg_dirty-hooks)). Amounts are exact
+decimal strings with a `Float64` shadow (`_f`) where SQL ranks or falls back (the `sumOf` rule of `decimal.ts`).
+
+| Table | `ORDER BY`, partition | Contents | Used by |
+| --- | --- | --- | --- |
+| `native_rates_daily` | `(currency, issuer, day)`, `toYear(day)` | Per closed UTC day, the rate of every issued asset whose rate that day is above 0: `rate` (exact text), `rate_f`, `daily_count` and `latest_count` (diagnostics: the kept trades of the day, and how many of them are among the newest 50), `config_version`, `stale`, `version`. A day is a **set**; its **sentinel** is the row with `currency = ''` and `issuer = ''`, which carries `config_version` and `stale` | `DailyRates` (every value of `stats/value`, `reports`, `analytics/*`) |
+| `pair_hourly` | `(hour, base_currency, base_issuer, counter_currency, counter_issuer, source)`, `toDate(hour)`, TTL `hour + INTERVAL 45 DAY`, `ttl_only_drop_parts = 1` | Per UTC hour, pair (canonical order) and `source Enum8('book' = 1, 'amm' = 2)` (only `book` is written): `count`, `base_sum`, `counter_sum`, `unfit`, `base_sum_f`, `counter_sum_f`; `open_rate` with its key (`open_ledger`, `open_tx`, `open_node`) and `open_time`; `close_rate`, its key and `close_time`; `high_rate`, `high_rate_f` and its key; `low_rate`, `low_rate_f` and its key. An hour is a set; its sentinel (the empty pair, source `book`) carries `is_final`, `config_version` and `through_time` (the close time of the newest ledger the read covered). The flag is `is_final`: `FINAL` is a ClickHouse keyword | `markets_live` job |
+| `markets_live` | `(period, amm, base_currency, base_issuer, counter_currency, counter_issuer)`, none | Per period (`day`, `7day`, `30day`), filter `amm Enum8('include' = 1, 'exclude' = 2, 'only' = 3)` (only `include` is written) and pair: `count`, `base_volume`, `counter_volume`, `native_volume Nullable(String)`, `open`, `high`, `low`, `last` (exact rate text), `open_time`, `last_time`, `closes Array(Nullable(String))` (7 daily closes, oldest first), `amm_share Nullable(String)` and `amm_pool Nullable(UInt8)` (always NULL). A (period, filter) is a set written in one insert; its sentinel (the empty pair) carries `start_time`, `end_time`, `pairs_traded`, `total_count`, `total_native_volume` and `total_amm_share Nullable(String)` (NULL) | `/network/markets` |
+| `account_rollup_state` | `account`, none | One row per heavy account: `rows` (its balance changes when counted), `first_day`, `rolled_from Nullable(Date)` and `rolled_through Nullable(Date)` (the contiguous days its rollups cover), `config_version`. The newest row of an account is its state | `AccountDayGroupsService` (cached 60 s per account), the `account_rollups` job |
+| `account_partition_rows` | `(partition, account)`, none | Per partition of `balance_changes` (`partition UInt16` = `intDiv(ledger_index, 10000000)`), the accounts with at least 10,000 (`ACCOUNT_PARTITION_ROWS_FLOOR`) balance changes in it and their count; a partition is a set, its sentinel has `account = ''` | the discovery of heavy accounts |
+| `account_rollup_days` | `(account, day)`, `toYear(day)` | The sentinel of an (account, day) rollup set: `version` only, written **after** the rows of the set | the day-groups read |
+| `account_lines_daily` | `(account, day, currency, counterparty, change_type, owes, version)`, `toYear(day)` | From `balance_changes`: `count`, `in_sum` and `out_sum` (the sum of the positive and of the negative `amount_change`s, exact, the negatives as positive amounts), `unfit`, `in_sum_f`, `out_sum_f` and `end_balance` (the line's last `final_balance` of the day by `(ledger_index, tx_index, node_index)`, the same on every row of the line and day). `owes` is `final_balance < 0` | `analytics/balances`, `analytics/balance_changes`, `stats/value` |
+| `account_tx_daily` | `(account, day, tx_type, result, version)`, `toYear(day)` | From `account_transactions`, the transactions the account sent (`is_initiator = 1`): `count` | `stats/transactions` |
+| `account_trades_daily` | `(account, day, base_currency, base_issuer, counter_currency, counter_issuer, version)`, `toYear(day)` | From `account_exchanges`: `count`, `base_sum`, `counter_sum`, `bought_sum` (the base where the account is the buyer), `sold_sum` (the base where it is the seller; a self-trade is in both), `bought_counter_sum` and `sold_counter_sum` (the counter of those same trades), `unfit` and the six `_f` shadows | `analytics/exchanges` |
+
+**Sets and sentinels.** A recompute writes a complete set in one insert under one new `version`: the larger of the ClickHouse clock in
+milliseconds and the newest version of the set plus one (so a retry never reuses the version of a failed attempt). A reader keeps the rows
+of the **newest version** of a set and never uses `FINAL`: for `markets_live` the rows whose `version` is the largest of the period and
+filter (a set is one insert); for `native_rates_daily`, `pair_hourly` and the rollups the version of the newest sentinel of the day, hour
+or (account, day), which says which rows are the set; a row that was written twice is read once (`LIMIT 1 BY` its key). The day of
+`native_rates_daily` is *valid* when its newest sentinel has `stale = 0` and the current `config_version` (`RATES_DAILY_CONFIG_VERSION`,
+1); the hour of `pair_hourly` when its sentinel has the current `config_version` (`PAIR_HOURLY_CONFIG_VERSION`, 1); the rollups of an
+account when its state row has the current `ACCOUNT_ROLLUP_CONFIG_VERSION` (1).
+
+**The rollup sets keep their own rows.** `account_lines_daily`, `account_tx_daily` and `account_trades_daily` have `version` as the **last**
+column of their `ORDER BY`. A rollup set is three inserts of rows and then the sentinel of each (account, day) in `account_rollup_days`; a
+merge keeps one row per sorting key, so without `version` in the key the rows of a newer set that is still being written (and whose
+sentinel may never come) would replace the same groups of the set the sentinel points to, and a reader would find them gone. With it every
+set keeps its rows and a merge only collapses a row written twice. The writer's version is the largest over all four rollup tables.
+**Superseded rollup versions are never pruned**: they accumulate, but only when `agg_dirty` corrects a day a rollup covers (a re-ingest of
+history), they are not read, and they are small next to the rollups themselves. Dropping them is a manual operation
+([operations](operations.md#account-and-market-aggregates)).
+
+**Retention and size.** `pair_hourly` is the only table that expires (45 days after its hour; the aggregator keeps the last 31 days
+complete). `markets_live` holds a row per period, filter and pair ever seen (a few thousand); `native_rates_daily` some million rows over
+the history; the rollups of a few thousand heavy accounts some hundred million rows, mostly the lines of issuers.
+
 ## 4. Relationships
 
 ```
@@ -200,6 +244,8 @@ so ingest recovery never deletes from them.
  exchanges    (pair prefix)            ──▶ account_exchanges (copy per account)
  ledgers (commit marker) ◀── ledger_by_hash;  ledger_index -> close_time resolves every start/end
  ledgers ──▶ stats_hourly (rollup);  exchanges + payments + RatesService ──▶ volume_daily / volume_live
+ exchanges ──▶ native_rates_daily, pair_hourly ──▶ markets_live;  balance_changes + account_transactions + account_exchanges ──▶
+ account_lines_daily / account_tx_daily / account_trades_daily (heavy accounts only; sentinels in account_rollup_days)
 ```
 
 ## 5. Migrations
@@ -220,6 +266,7 @@ The files so far:
 | --- | --- |
 | `001_baseline.sql` | The 23 tables of the baseline |
 | `002_validators_amendments.sql` | Two `ALTER TABLE` statements (`validations.server_version`; `validator_manifests.domain`, `.manifest`, `.source`) and the ten validators and amendments tables. Additive: it reads nothing of 001 but those two tables, so it applies on a database that already ran 001, and a half-applied run is completed by running it again |
+| `003_account_market_aggregates.sql` | The nine tables of the account and market aggregates, nine `CREATE TABLE IF NOT EXISTS` statements and nothing else. Additive: it reads no table of 001 or 002 and none of its tables depends on them, so it applies after 001 alone or after 001 and 002, on a fresh and on a migrated database |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -232,7 +279,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`). A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
