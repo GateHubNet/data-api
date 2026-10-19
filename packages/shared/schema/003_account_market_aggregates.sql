@@ -15,8 +15,10 @@
 --    have it, the rows of a newer set that is still being written (its sentinel is not in account_rollup_days yet, and
 --    may never be) would replace the same groups of the set the sentinel points to, and those groups would be gone for
 --    a reader. With version in the key every set keeps its own rows; a merge only collapses a row that was written twice.
---  * pair_hourly expires 45 days after its hour. ttl_only_drop_parts drops a part only when every row of it has
---    expired (a part holds one day) and never rewrites a part to cut rows out of it.
+--  * pair_hourly expires 45 days after its hour (a part holds one day). With ttl_only_drop_parts the background TTL job
+--    drops only the parts whose rows have all expired, and never rewrites a part to cut expired rows out of it. An
+--    ordinary merge can still remove expired rows from a part that is only partly expired. Readers use the last 31 days
+--    only, so whether the expired rows of the last few days are still there does not matter.
 --  * Amounts are exact decimal Strings with a Float64 shadow (_f) where SQL ranks or falls back. The sentinel's
 --    final flag of pair_hourly is called is_final, because FINAL is a ClickHouse keyword.
 --  * Times: DateTime('UTC') for ledger and wall times (unix seconds), Date for UTC days.

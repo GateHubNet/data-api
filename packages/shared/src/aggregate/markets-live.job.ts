@@ -327,7 +327,7 @@ export async function computeMarketsSet(
 /**
  * The `end_time` of the newest `include` set of each period, unix seconds (the newest by version: a set that was written
  * twice counts once, and a set of another filter does not count). A period that has no set is not in the map. The runner
- * starts with the period whose set is the stalest.
+ * goes through the periods in the order day, 7day, 30day, and reads this for the age of each set it reports.
  */
 export async function marketsSetEndTimes(ch: ClickHouseService): Promise<Map<MarketsPeriod, number>> {
   const rows = await ch.query<{ period: string; end: number | string }>(

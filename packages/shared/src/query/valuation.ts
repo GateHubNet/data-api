@@ -27,6 +27,8 @@ export function nativeValue(
   nativeCurrency: string,
 ): BigNumber {
   if (asset.currency === nativeCurrency && !asset.issuer) return amount;
+  // an issued currency without an issuer has no rate to look up
+  if (!asset.issuer) return new BigNumber(0);
   const rate = rates.get(assetKey(asset))?.get(day);
   if (!rate || !rate.gt(0)) return new BigNumber(0);
   return ratio(amount, rate).precision(QUOTIENT_DIGITS);

@@ -504,8 +504,8 @@ export interface NativeRatesDailyRow {
 
 /**
  * One UTC hour of one pair (canonical order) and source. An hour is a version set: its sentinel row (empty pair, source
- * `'book'`) carries `is_final`, `config_version` and `through_time`, the close time of the newest ledger the read covered.
- * (`is_final`, because `FINAL` is a ClickHouse keyword.) Rows expire 45 days after their hour.
+ * `'book'`) carries `is_final`, `config_version` and `through_time`, the close time of the newest ledger the read
+ * covered. (`is_final`, because `FINAL` is a ClickHouse keyword.) Rows expire 45 days after their hour.
  */
 export interface PairHourlyRow {
   hour: UnixSeconds;
@@ -598,7 +598,10 @@ export interface AccountRollupStateRow {
   version: UInt64Value;
 }
 
-/** The accounts with many balance changes in one P7 partition (`intDiv(ledger_index, 10000000)`); `account = ''` is its sentinel. */
+/**
+ * The accounts with many balance changes in one partition of `balance_changes` (`intDiv(ledger_index, 10000000)`);
+ * `account = ''` is its sentinel.
+ */
 export interface AccountPartitionRowsRow {
   partition: number;
   account: string;

@@ -113,11 +113,22 @@ function runsOf(days: string[]): string[][] {
   return runs;
 }
 
-/** `fn` over `items`, at most `limit` at a time. */
+/**
+ * `fn` over `items`, at most `limit` at a time. After the first failure no further item is started (the runs in flight go on;
+ * the failure is the answer of the call), so that a read that is going to fail does not run all the queries that are left.
+ */
 async function forEachLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
+  let failed = false;
   const worker = async (): Promise<void> => {
-    while (next < items.length) await fn(items[next++]);
+    while (!failed && next < items.length) {
+      try {
+        await fn(items[next++]);
+      } catch (err) {
+        failed = true;
+        throw err;
+      }
+    }
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }

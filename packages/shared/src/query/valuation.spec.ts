@@ -42,6 +42,15 @@ describe('nativeValue', () => {
     expect(nativeValue(new BigNumber(5), USD, DAY, ratesOf(-3), 'XRP').toString()).toBe('0');
   });
 
+  it('values an issued currency without an issuer at 0 without looking for a rate, even where the table has one under the bare currency', () => {
+    const bare: DayRates = new Map([['USD', new Map([[DAY, new BigNumber(3)]])]]);
+    expect(nativeValue(new BigNumber(9), { currency: 'USD' }, DAY, bare, 'XRP').toString()).toBe('0');
+    expect(nativeValue(new BigNumber(9), { currency: 'USD', issuer: '' }, DAY, bare, 'XRP').toString()).toBe('0');
+    // XRP is issued on Xahau: without an issuer it is worth nothing there, whatever the table says
+    const xrp: DayRates = new Map([['XRP', new Map([[DAY, new BigNumber(2)]])]]);
+    expect(nativeValue(new BigNumber(9), XRP, DAY, xrp, 'XAH').toString()).toBe('0');
+  });
+
   it('knows the native currency of the network: XRP is an issued currency on Xahau', () => {
     expect(nativeValue(new BigNumber(5), XRP, DAY, new Map(), 'XAH').toString()).toBe('0');
     expect(nativeValue(new BigNumber(5), { currency: 'XAH' }, DAY, new Map(), 'XAH').toString()).toBe('5');

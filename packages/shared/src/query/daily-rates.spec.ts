@@ -356,6 +356,29 @@ describe('DailyRates', () => {
     expect(peak).toBeLessThanOrEqual(4);
   });
 
+  it('starts no further run after the first failure, rejects with it, and counts what was computed', async () => {
+    const { ch } = fakeClickHouse([], []);
+    let started = 0;
+    const dailyNativeRates = jest.fn(async (assets: Asset[], from: Date) => {
+      const call = ++started;
+      await new Promise((resolve) => setImmediate(resolve));
+      if (call === 2) throw new Error('memory limit');
+      const day = from.toISOString().slice(0, 10);
+      return new Map(assets.map((asset) => [assetKey(asset), new Map([[day, new BigNumber(1)]])]));
+    });
+    const service = { nativeCurrency: 'XRP', dailyNativeRates } as unknown as RatesService;
+    const onRead = jest.fn();
+    const assets = Array.from({ length: 20 }, (_, i): Asset => ({ currency: `A${i}`, issuer: ISSUER }));
+
+    await expect(new DailyRates(ch, service, { onRead }).rates(assets, ['2020-01-01'])).rejects.toThrow('memory limit');
+    // started: the four of the limit, and the fifth by the worker whose run had finished before the failure; no sixth, later
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(dailyNativeRates).toHaveBeenCalledTimes(5);
+    // the run that had finished before the failure was counted
+    expect(onRead).toHaveBeenCalledTimes(1);
+    expect(onRead).toHaveBeenCalledWith(1);
+  });
+
   it('what it computes on read is cached for 60 s per asset and day', async () => {
     const { ch } = fakeClickHouse([], []);
     const { service, dailyNativeRates } = fakeRates((asset, day) => `${day.slice(-2)}.5`);

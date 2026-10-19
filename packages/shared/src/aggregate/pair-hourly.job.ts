@@ -231,7 +231,11 @@ export async function computePairHourSets(
         params,
       ),
     ]);
-    for (const g of pairs) groups.set(g.hour_start, [...(groups.get(g.hour_start) ?? []), g]);
+    for (const g of pairs) {
+      const ofHour = groups.get(g.hour_start);
+      if (ofHour) ofHour.push(g);
+      else groups.set(g.hour_start, [g]);
+    }
     for (const l of ledgers) closed.set(l.hour_start, l.closed);
   }
 
