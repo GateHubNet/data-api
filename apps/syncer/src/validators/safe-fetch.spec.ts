@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { TEST_TLS } from '../../test/support/tls';
 import {
   blockedRangeOf,
+  FetchFailure,
   FetchLimits,
   SAFE_FETCHER,
   SafeFetcher,
@@ -219,6 +220,26 @@ describe('blockedRangeOf', () => {
     ['64:ff9b::808:808', '64:ff9b::/96'],
     ['2002::1', '2002::/16'],
     ['2002:ffff::1', '2002::/16'],
+    // special-purpose ranges added as defence in depth (the design's nine are above)
+    ['::2', '::/96'], // IPv4-compatible
+    ['::7f00:1', '::/96'],
+    ['::127.0.0.1', '::/96'],
+    ['::ffff:ffff', '::/96'],
+    ['0:0:0:0:0:0:ffff:ffff', '::/96'],
+    ['64:ff9b:1::1', '64:ff9b:1::/48'], // local-use NAT64 (RFC 8215)
+    ['64:ff9b:1:ffff:ffff:ffff:ffff:ffff', '64:ff9b:1::/48'],
+    ['2001::1', '2001::/23'], // IETF protocol assignments: Teredo, ORCHID
+    ['2001:0:4136:e378:8000:63bf:3fff:fdd2', '2001::/23'],
+    ['2001:10::1', '2001::/23'],
+    ['2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff', '2001::/23'],
+    ['fec0::1', 'fec0::/10'], // deprecated site-local
+    ['feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', 'fec0::/10'],
+    ['3fff::1', '3fff::/20'], // documentation (RFC 9637)
+    ['3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff', '3fff::/20'],
+    ['5f00::1', '5f00::/16'], // SRv6 SIDs
+    ['5f00:ffff::1', '5f00::/16'],
+    ['100:0:0:1::1', '100:0:0:1::/64'], // dummy prefix
+    ['100:0:0:1:ffff:ffff:ffff:ffff', '100:0:0:1::/64'],
     // ::ffff:0:0/96 is judged by its IPv4, dotted and hex, in any spelling
     ['::ffff:127.0.0.1', '127.0.0.0/8'],
     ['::ffff:7f00:1', '127.0.0.0/8'],
@@ -229,6 +250,16 @@ describe('blockedRangeOf', () => {
     ['::ffff:a00:1', '10.0.0.0/8'],
     ['::ffff:169.254.169.254', '169.254.0.0/16'],
     ['::ffff:0.0.0.0', '0.0.0.0/8'],
+    // so is ::ffff:0:0:0/96 (SIIT, IPv4-translated), dotted and hex
+    ['::ffff:0:127.0.0.1', '127.0.0.0/8'],
+    ['::ffff:0:7f00:1', '127.0.0.0/8'],
+    ['::FFFF:0:7F00:0001', '127.0.0.0/8'],
+    ['0:0:0:0:ffff:0:7f00:1', '127.0.0.0/8'],
+    ['0000:0000:0000:0000:ffff:0000:127.0.0.1', '127.0.0.0/8'],
+    ['::ffff:0:10.0.0.1', '10.0.0.0/8'],
+    ['::ffff:0:a00:1', '10.0.0.0/8'],
+    ['::ffff:0:169.254.169.254', '169.254.0.0/16'],
+    ['::ffff:0:0.0.0.0', '0.0.0.0/8'],
   ];
 
   it('refuses every blocked range', () => {
@@ -237,9 +268,8 @@ describe('blockedRangeOf', () => {
     }
   });
 
-  it('covers all 24 listed ranges, 15 IPv4 and 9 IPv6', () => {
-    const listed = new Set(BLOCKED.map(([, range]) => range));
-    for (const range of [
+  it('names exactly the listed ranges: the 15 IPv4 and 9 IPv6 of the design, and 7 more IPv6', () => {
+    const designed = [
       '0.0.0.0/8',
       '10.0.0.0/8',
       '100.64.0.0/10',
@@ -264,9 +294,17 @@ describe('blockedRangeOf', () => {
       '100::/64',
       '64:ff9b::/96',
       '2002::/16',
-    ]) {
-      expect(listed.has(range)).toBe(true);
-    }
+    ];
+    const added = ['::/96', '64:ff9b:1::/48', '2001::/23', 'fec0::/10', '3fff::/20', '5f00::/16', '100:0:0:1::/64'];
+    expect(designed).toHaveLength(24);
+    expect(added).toHaveLength(7);
+    expect([...new Set(BLOCKED.map(([, range]) => range))].sort()).toEqual([...designed, ...added].sort());
+  });
+
+  it('keeps the names of :: and ::1 although ::/96 contains them', () => {
+    expect(blockedRangeOf('::')).toBe('::/128');
+    expect(blockedRangeOf('::1')).toBe('::1/128');
+    expect(blockedRangeOf('::2')).toBe('::/96');
   });
 
   it('lets public addresses through, also next to a blocked range', () => {
@@ -295,13 +333,27 @@ describe('blockedRangeOf', () => {
       '2606:4700::1111',
       '2001:4860:4860::8888',
       '2001:db9::1',
-      '100:0:0:1::1',
-      '64:ff9b:1::1',
+      '100:0:0:2::1', // next to the dummy prefix 100:0:0:1::/64
+      '100:0:1::1',
+      '64:ff9b:2::1', // next to 64:ff9b:1::/48
+      '64:ff9b:0:1::1',
+      '2001:200::1', // next to 2001::/23
+      'fe7f:ffff::1', // next to fe80::/10 and fec0::/10
+      'fbff::1',
+      '3fff:1000::1', // next to 3fff::/20
+      '3ffe::1',
+      '5eff::1', // next to 5f00::/16
+      '5f01::1',
+      '::1:0:0', // outside ::/96: the 96th bit is set
       '2003::1',
       '2a00:1450:4001::1',
       '::ffff:8.8.8.8',
       '::ffff:808:808',
       '::ffff:172.32.0.1',
+      '::ffff:0:8.8.8.8', // SIIT with a public IPv4
+      '::ffff:0:808:808',
+      '::ffff:0:172.32.0.1',
+      '::ffff:1:7f00:1', // neither mapped nor translated: the group between is not 0
     ]) {
       expect({ address, range: blockedRangeOf(address) }).toEqual({ address, range: undefined });
     }
@@ -415,7 +467,7 @@ describe('SafeFetcher', () => {
   });
 
   describe('DNS', () => {
-    it('refuses a host with one private address among public ones, and connects to none of them', async () => {
+    it('refuses a host with one private address among public ones', async () => {
       const s = await startServer(ok('x'));
       let asked = 0;
       const fetcher = new SafeFetcher(UA, {
@@ -503,7 +555,7 @@ describe('SafeFetcher', () => {
         expect(got.body.toString()).toBe('via dns');
       });
 
-      it('accepts a host that has only AAAA records (the A lookup says not found)', async () => {
+      it('judges the AAAA records of a host whose A lookup says not found, and refuses a link-local one', async () => {
         jest.spyOn(dnsPromises, 'resolve4').mockRejectedValue(dnsError('ENOTFOUND'));
         jest.spyOn(dnsPromises, 'resolve6').mockResolvedValue(['fe80::1']);
         const err = await failureOf(new SafeFetcher(UA).get('https://a.example/', UNL_FETCH_LIMITS, ACCEPT));
@@ -527,7 +579,7 @@ describe('SafeFetcher', () => {
   });
 
   describe('pinning', () => {
-    it('connects to the address it checked, one resolve per hop', async () => {
+    it('connects to the address it checked', async () => {
       const s = await startServer(ok('pinned'));
       let calls = 0;
       const fetcher = new SafeFetcher(UA, {
@@ -545,7 +597,7 @@ describe('SafeFetcher', () => {
       expect(s.serverNames).toEqual(['a.example']);
     });
 
-    it('goes to the next checked address when the first one refuses the connection', async () => {
+    it('tries the next checked address when the first one does not answer', async () => {
       const s = await startServer(ok('second'));
       const fetcher = new SafeFetcher(UA, {
         resolve: async () => [
@@ -556,7 +608,8 @@ describe('SafeFetcher', () => {
         ca: TEST_TLS.cert,
         connectPort: s.port,
       });
-      // 127.0.0.9 is loopback too, but the server listens on 127.0.0.1 only
+      // 127.0.0.9 is loopback too, but nothing listens there: Linux refuses the connection at once, macOS (whose lo0 has
+      // 127.0.0.1 only) does not answer, and Node moves on to the next address after its attempt timeout
       const got = await fetcher.get('https://a.example/', UNL_FETCH_LIMITS, ACCEPT);
       expect(got.body.toString()).toBe('second');
     });
@@ -580,7 +633,7 @@ describe('SafeFetcher', () => {
         return redirectTo(next)(req, res);
       };
 
-    it('follows three redirects and checks every hop from the top', async () => {
+    it('checks every redirect from the top', async () => {
       const s = await startServer(
         chain({
           'a.example': 'https://b.example/one',
@@ -989,6 +1042,10 @@ describe('SafeFetcher', () => {
       expect(err.reason).toBe('connect_error');
     });
 
+    // Node reads HTTP_PROXY / HTTPS_PROXY only at startup (and only with NODE_USE_ENV_PROXY, for its global agents), and
+    // jest's process.env is a copy, so setting them here cannot change what Node does. This test shows that a fetch goes
+    // direct with the variables set; the real guard is the assertion below ('asks Node for a verified connection ...')
+    // that every request gets an Agent of its own, which no environment proxy reaches.
     it('ignores the proxy variables of the environment', async () => {
       const names = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'];
       const saved = names.map((name) => [name, process.env[name]] as const);
@@ -1031,6 +1088,88 @@ describe('SafeFetcher', () => {
         makeFetcher(s.port, { ca: undefined }).fetcher.get('https://a.example/', UNL_FETCH_LIMITS, ACCEPT),
       );
       expect(request.mock.calls[0][0]).not.toHaveProperty('ca');
+    });
+  });
+
+  describe('the cause of a failure', () => {
+    it('keeps the socket error of a connect_error', async () => {
+      const s = await startServer(ok('x'));
+      const { port } = s;
+      await new Promise<void>((resolve) => s.server.close(() => resolve()));
+      const err = await failureOf(makeFetcher(port).fetcher.get('https://a.example/', UNL_FETCH_LIMITS, ACCEPT));
+      expect(err.reason).toBe('connect_error');
+      expect((err.cause as NodeJS.ErrnoException).code).toBe('ECONNREFUSED');
+    });
+
+    it('keeps the TLS error of a tls_error', async () => {
+      const s = await startServer(ok('x'));
+      const err = await failureOf(
+        makeFetcher(s.port, { ca: undefined }).fetcher.get('https://a.example/', UNL_FETCH_LIMITS, ACCEPT),
+      );
+      expect(err.reason).toBe('tls_error');
+      expect((err.cause as NodeJS.ErrnoException).code).toBe('DEPTH_ZERO_SELF_SIGNED_CERT');
+    });
+
+    it('keeps the error of a resolver that failed', async () => {
+      const boom = new Error('boom');
+      const err = await failureOf(
+        new SafeFetcher(UA, { resolve: async () => Promise.reject(boom) }).get(
+          'https://a.example/',
+          UNL_FETCH_LIMITS,
+          ACCEPT,
+        ),
+      );
+      expect(err.reason).toBe('dns_error');
+      expect(err.cause).toBe(boom);
+    });
+
+    it('keeps the error of the default resolver', async () => {
+      const servfail = Object.assign(new Error('queryA ESERVFAIL a.example'), { code: 'ESERVFAIL' });
+      jest.spyOn(dnsPromises, 'resolve4').mockRejectedValue(servfail);
+      jest.spyOn(dnsPromises, 'resolve6').mockResolvedValue([]);
+      const err = await failureOf(new SafeFetcher(UA).get('https://a.example/', UNL_FETCH_LIMITS, ACCEPT));
+      expect(err.reason).toBe('dns_error');
+      expect(err.cause).toBe(servfail);
+    });
+
+    it('is not enumerable, like the cause of a built-in error', async () => {
+      const boom = new Error('boom');
+      const err = await failureOf(
+        new SafeFetcher(UA, { resolve: async () => Promise.reject(boom) }).get(
+          'https://a.example/',
+          UNL_FETCH_LIMITS,
+          ACCEPT,
+        ),
+      );
+      expect(Object.keys(err)).not.toContain('cause');
+      expect(Object.getOwnPropertyDescriptor(err, 'cause')).toMatchObject({ value: boom, enumerable: false });
+    });
+
+    it('is absent when nothing underneath failed', async () => {
+      const s = await startServer((req, res) => {
+        if (req.url === '/hang') return;
+        if (req.url === '/big') {
+          res.writeHead(200, { 'Content-Length': '99' });
+          res.flushHeaders();
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      const { fetcher } = makeFetcher(s.port);
+      const blocked = new SafeFetcher(UA, { resolve: async () => [{ address: '10.0.0.1', family: 4 }] });
+      const failures: [FetchFailure, () => Promise<unknown>][] = [
+        ['http_status', () => fetcher.get('https://a.example/missing', UNL_FETCH_LIMITS, ACCEPT)],
+        ['too_large', () => fetcher.get('https://a.example/big', { ...UNL_FETCH_LIMITS, maxBytes: 10 }, ACCEPT)],
+        ['timeout', () => fetcher.get('https://a.example/hang', { ...UNL_FETCH_LIMITS, timeoutMs: 100 }, ACCEPT)],
+        ['domain_invalid', () => fetcher.get('http://a.example/', UNL_FETCH_LIMITS, ACCEPT)],
+        ['blocked_address', () => blocked.get('https://a.example/', UNL_FETCH_LIMITS, ACCEPT)],
+      ];
+      for (const [reason, run] of failures) {
+        const err = await failureOf(run());
+        expect(err.reason).toBe(reason);
+        expect(err.cause).toBeUndefined();
+      }
     });
   });
 

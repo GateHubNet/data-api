@@ -11,7 +11,7 @@ import { join } from 'node:path';
  * claim). A URL comes from configuration or from a validator's signed manifest, so it is untrusted: a request must not
  * be made to a private, loopback or reserved address (SSRF), not even through a DNS name that points there, a DNS
  * answer that changes between the check and the connect (rebinding), or a redirect. The rules are those of the design
- * (§8.1), fixed in code; no environment variable loosens any of them. `SafeFetchTestOptions` exist for tests only and
+ * (§8.1) plus the extra special-purpose IPv6 ranges below, fixed in code; no environment variable loosens any of them. `SafeFetchTestOptions` exist for tests only and
  * are reached through a constructor argument.
  */
 
@@ -31,16 +31,22 @@ export class SafeFetchError extends Error {
   readonly statusCode?: number;
   /** The blocked range (CIDR) of a `blocked_address` failure. */
   readonly addressClass?: string;
+  /** The error that caused the failure (a socket, TLS or DNS error), when there is one: the root cause of a `connect_error`. */
+  readonly cause?: unknown;
 
   constructor(
     readonly reason: FetchFailure,
     message: string,
-    details: { statusCode?: number; addressClass?: string } = {},
+    details: { statusCode?: number; addressClass?: string; cause?: unknown } = {},
   ) {
     super(message);
     this.name = 'SafeFetchError';
     this.statusCode = details.statusCode;
     this.addressClass = details.addressClass;
+    // Like the `cause` of a built-in error: set only when there is one, and not enumerable
+    if (details.cause !== undefined) {
+      Object.defineProperty(this, 'cause', { value: details.cause, writable: true, configurable: true });
+    }
   }
 }
 
@@ -77,7 +83,7 @@ export interface SafeFetchTestOptions {
 
 export const SAFE_FETCHER = Symbol('SAFE_FETCHER');
 
-/** The addresses that are not public (spec §8.1). `::ffff:0:0/96` is not listed: it is judged by its IPv4. */
+/** The IPv4 addresses that are not public (spec §8.1). */
 const BLOCKED_IPV4 = [
   '0.0.0.0/8',
   '10.0.0.0/8',
@@ -95,6 +101,13 @@ const BLOCKED_IPV4 = [
   '224.0.0.0/4',
   '240.0.0.0/4',
 ];
+
+/**
+ * The IPv6 addresses that are not public: the nine of the design (§8.1), and, as defence in depth, the special-purpose
+ * ranges that follow them. The first match names the range, so `::/96` comes after `::/128` and `::1/128`.
+ * `::ffff:0:0/96` (IPv4-mapped) and `::ffff:0:0:0/96` (SIIT, IPv4-translated) are not listed: they are judged by their
+ * IPv4 (`embeddedIpv4`).
+ */
 const BLOCKED_IPV6 = [
   '::/128',
   '::1/128',
@@ -105,6 +118,15 @@ const BLOCKED_IPV6 = [
   '100::/64',
   '64:ff9b::/96',
   '2002::/16',
+  // added: IPv4-compatible, local-use NAT64 (RFC 8215), IETF protocol assignments (Teredo, ORCHID), deprecated
+  // site-local, documentation (RFC 9637), SRv6 SIDs, the dummy prefix
+  '::/96',
+  '64:ff9b:1::/48',
+  '2001::/23',
+  'fec0::/10',
+  '3fff::/20',
+  '5f00::/16',
+  '100:0:0:1::/64',
 ];
 
 interface Range {
@@ -153,16 +175,28 @@ function rangeContaining(ranges: Range[], bytes: number[]): string | undefined {
 }
 
 /**
- * The range (CIDR) that makes `address` unusable, or `undefined` for a public address. An IPv4-mapped IPv6 address
- * (`::ffff:0:0/96`, in dotted or hex form) is judged by its IPv4 and named by the IPv4 range. Throws a `TypeError` for
- * a string that is not an IP address: nothing unknown passes as public.
+ * The IPv4 inside an IPv4-mapped (`::ffff:0:0/96`) or an SIIT IPv4-translated (`::ffff:0:0:0/96`) address, which is
+ * judged by that IPv4; `undefined` for any other IPv6 address.
+ */
+function embeddedIpv4(bytes: number[]): number[] | undefined {
+  if (!bytes.slice(0, 8).every((byte) => byte === 0)) return undefined;
+  const [a, b, c, d] = bytes.slice(8, 12);
+  const mapped = a === 0 && b === 0 && c === 0xff && d === 0xff;
+  const translated = a === 0xff && b === 0xff && c === 0 && d === 0;
+  return mapped || translated ? bytes.slice(12) : undefined;
+}
+
+/**
+ * The range (CIDR) that makes `address` unusable, or `undefined` for a public address. An IPv4-mapped or IPv4-translated
+ * IPv6 address (`::ffff:0:0/96`, `::ffff:0:0:0/96`, in dotted or hex form) is judged by its IPv4 and named by the IPv4
+ * range. Throws a `TypeError` for a string that is not an IP address: nothing unknown passes as public.
  */
 export function blockedRangeOf(address: string): string | undefined {
   if (isIPv4(address)) return rangeContaining(RANGES_V4, ipv4Bytes(address));
   if (isIPv6(address)) {
     const bytes = ipv6Bytes(address);
-    const mapped = bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff;
-    return mapped ? rangeContaining(RANGES_V4, bytes.slice(12)) : rangeContaining(RANGES_V6, bytes);
+    const embedded = embeddedIpv4(bytes);
+    return embedded ? rangeContaining(RANGES_V4, embedded) : rangeContaining(RANGES_V6, bytes);
   }
   throw new TypeError(`not an IP address: ${address}`);
 }
@@ -174,7 +208,9 @@ async function resolveAddresses(host: string): Promise<ResolvedAddress[]> {
       (addresses) => addresses.map((address) => ({ address, family })),
       (err: NodeJS.ErrnoException) => {
         if (err.code === 'ENODATA' || err.code === 'ENOTFOUND') return [];
-        throw new SafeFetchError('dns_error', `the DNS lookup of ${host} failed: ${err.code ?? err.message}`);
+        throw new SafeFetchError('dns_error', `the DNS lookup of ${host} failed: ${err.code ?? err.message}`, {
+          cause: err,
+        });
       },
     );
   const [v4, v6] = await Promise.all([records(4, dnsPromises.resolve4(host)), records(6, dnsPromises.resolve6(host))]);
@@ -221,9 +257,9 @@ function failureOf(err: unknown): SafeFetchError {
   const message = err instanceof Error ? err.message : String(err);
   // A peer that does not speak TLS fails the handshake with the socket error EPROTO and an OpenSSL message
   if (TLS_CODES.has(code) || /^ERR_(TLS|SSL|OSSL)_/.test(code) || (code === 'EPROTO' && /SSL routines/.test(message))) {
-    return new SafeFetchError('tls_error', `TLS failed: ${code}`);
+    return new SafeFetchError('tls_error', `TLS failed: ${code}`, { cause: err });
   }
-  return new SafeFetchError('connect_error', `the connection failed: ${code || message}`);
+  return new SafeFetchError('connect_error', `the connection failed: ${code || message}`, { cause: err });
 }
 
 function parseUrl(value: string, base?: string): URL | undefined {
@@ -322,6 +358,7 @@ export class SafeFetcher {
       throw new SafeFetchError(
         'dns_error',
         `could not resolve ${host}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
       );
     }
     if (!Array.isArray(answers) || answers.length === 0) {

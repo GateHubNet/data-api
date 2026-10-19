@@ -196,8 +196,11 @@ validator claims. The URL is data from outside (a validator's operator chooses i
   if **any** address is not public: IPv4 `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16` (this covers the
   cloud metadata address), `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`,
   `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`; IPv6 `::/128`, `::1/128`, `fc00::/7`, `fe80::/10`, `ff00::/8`,
-  `2001:db8::/32`, `100::/64`, `64:ff9b::/96`, `2002::/16`; an IPv4-mapped address (`::ffff:a.b.c.d` or `::ffff:xxxx:xxxx`) is judged
-  by its IPv4. A host that resolves to nothing is `dns_error`.
+  `2001:db8::/32`, `100::/64`, `64:ff9b::/96`, `2002::/16`, and, as defence in depth, the special-purpose ranges `::/96`
+  (IPv4-compatible), `64:ff9b:1::/48` (local-use NAT64), `2001::/23` (IETF protocol assignments: Teredo, ORCHID), `fec0::/10`
+  (deprecated site-local), `3fff::/20` (documentation), `5f00::/16` (SRv6 SIDs) and `100:0:0:1::/64` (dummy prefix); an IPv4-mapped
+  address (`::ffff:0:0/96`, written `::ffff:a.b.c.d` or `::ffff:xxxx:xxxx`) and an SIIT IPv4-translated one (`::ffff:0:0:0/96`,
+  `::ffff:0:a.b.c.d`) are judged by their IPv4. A host that resolves to nothing is `dns_error`.
 - **Pinned connection:** the request connects to an address that was checked: the connection's `lookup` returns it, with no second
   DNS query, so an answer that changes between the check and the connect (DNS rebinding) cannot redirect it. SNI and `Host` are the
   domain; TLS uses Node's default trust store and checks the certificate against the domain, with no override
