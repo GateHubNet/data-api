@@ -3,7 +3,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { getNetworkProfile, parseUnlPublishers } from '../network';
 import { makeManifest, makeUnlBlob, makeUnlResponse, TestKey, testKey } from '../test-utils/validator-keys';
-import { decodeManifest, REVOKED_SEQUENCE } from './manifest';
+import { decodeManifest, Manifest, REVOKED_SEQUENCE } from './manifest';
 import { nodePublicKeyFromHex } from './node-key';
 import { classifyUnlBlob, UnlBlob, UnlFailure, UnlListError, verifyUnlList } from './unl-list';
 
@@ -36,9 +36,9 @@ function flipByte(hex: string, at: number): string {
 }
 
 /** The failure reason of a verification, or `undefined` when the list verified. */
-function failureOf(body: unknown, key: string): UnlFailure | undefined {
+function failureOf(body: unknown, key: string, known?: Manifest): UnlFailure | undefined {
   try {
-    verifyUnlList(body, key);
+    verifyUnlList(body, key, known);
     return undefined;
   } catch (err) {
     expect(err).toBeInstanceOf(UnlListError);
@@ -122,6 +122,16 @@ describe('verifyUnlList on the recorded lists', () => {
     expect(verifyUnlList(lowered, key).publisherKey).toBe(key);
   });
 
+  it.each(RECORDED)('$id verifies with its own manifest as the known one, too, and answers it', (recorded) => {
+    const body = load(recorded.file);
+    const key = configuredKey(recorded.network, recorded.id);
+    const own = decodeManifest(body.manifest as string, 'base64');
+    const without = verifyUnlList(body, key);
+    const withKnown = verifyUnlList(body, key, own);
+    expect(withKnown).toEqual(without);
+    expect(withKnown.manifest).toEqual(own);
+  });
+
   it('takes the body as JSON text, too', () => {
     const body = load('xrpl/unl/vl.ripple.com.json');
     expect(verifyUnlList(JSON.stringify(body), configuredKey('xrpl', 'vl.ripple.com')).blobs).toHaveLength(1);
@@ -150,6 +160,27 @@ describe('verifyUnlList refuses a recorded list that was changed', () => {
     const body = real();
     body.public_key = xrplf;
     expect(failureOf(body, ripple)).toBe('untrusted_key');
+  });
+
+  it('invalid_format: a public_key that is not 66 ASCII hex digits, even if it upper-cases to the configured key', () => {
+    // 'ﬀ' (U+FB00) upper-cases to 'FF', and this key has one: toUpperCase alone would take the body for the configured key.
+    expect(ripple).toContain('FF');
+    for (const publicKey of [
+      ripple.replace('FF', '\uFB00'),
+      ripple.slice(0, 64),
+      ripple + '00',
+      ' ' + ripple,
+      ripple + '\n',
+      '0x' + ripple.slice(2),
+      ripple.replace('AB', 'ab\u0000'),
+    ]) {
+      const body = real();
+      body.public_key = publicKey;
+      expect(failureOf(body, ripple)).toBe('invalid_format');
+    }
+    const lowered = real();
+    lowered.public_key = ripple.toLowerCase();
+    expect(failureOf(lowered, ripple)).toBeUndefined();
   });
 
   it('manifest_invalid: a byte of the publisher manifest signature', () => {
@@ -517,6 +548,12 @@ describe('verifyUnlList on test-signed lists', () => {
       expect(blobFailure(rawBlob(valid({ effective: expiration + 1 })))).toBe('blob_invalid');
     });
 
+    it("is the answer to an expiration of 0 without an effective time, rippled's validFrom being 0", () => {
+      expect(blobFailure(rawBlob(valid({ expiration: 0 })))).toBe('blob_invalid');
+      expect(blobFailure(rawBlob(valid({ expiration: 1 })))).toBeUndefined();
+      expect(blobFailure(rawBlob(valid({ expiration: 0, effective: 0 })))).toBe('blob_invalid');
+    });
+
     it('is the answer to validators that are not a list of objects', () => {
       for (const validators of [undefined, null, 'x', 5, {}, [null], ['x'], [5], [[]], [{}]]) {
         expect(blobFailure(rawBlob(valid({ validators })))).toBe('blob_invalid');
@@ -601,9 +638,10 @@ describe('verifyUnlList on test-signed lists', () => {
       }
     });
 
-    describe('an entry with a manifest of its own', () => {
+    describe('the highest publisher manifest of the body signs every blob', () => {
       const oldSigning = signing;
       const newSigning = testKey('unl-publisher-new-signing');
+      const second = () => makeUnlBlob({ sequence: 8, expiration: NOW + 7200, validators: [{ master: beta }] });
       const body = (entryManifestHex: string | undefined, signer: TestKey, publisherSequence = 5) => {
         const response = makeUnlResponse({
           publisher,
@@ -615,19 +653,37 @@ describe('verifyUnlList on test-signed lists', () => {
         if (entryManifestHex) (response.blobs_v2 as Body[])[0].manifest = base64Of(entryManifestHex);
         return response;
       };
+      /** A v2 body of two blobs signed by `signers`, with `manifests[i]` (hex) as the own manifest of blob i. */
+      const two = (signers: [TestKey, TestKey], manifests: [string?, string?]) => {
+        const response = makeUnlResponse({
+          publisher,
+          publisherSigning: oldSigning,
+          manifestSequence: 5,
+          version: 2,
+          blobs: [
+            { blob: goodBlob(), signer: signers[0] },
+            { blob: second(), signer: signers[1] },
+          ],
+        });
+        manifests.forEach((hex, i) => {
+          if (hex) (response.blobs_v2 as Body[])[i].manifest = base64Of(hex);
+        });
+        return response;
+      };
       const entryManifest = (sequence: number, signingKey = newSigning, master = publisher) =>
         makeManifest({ master, signing: signingKey, sequence });
 
-      it('replaces the publisher manifest for its blob when its sequence is higher', () => {
+      it('replaces the publisher manifest when its sequence is higher', () => {
         expect(failureOf(body(undefined, newSigning), publisher.publicKeyHex)).toBe('signature_invalid');
         expect(failureOf(body(entryManifest(6), newSigning), publisher.publicKeyHex)).toBeUndefined();
         expect(failureOf(body(entryManifest(6), oldSigning), publisher.publicKeyHex)).toBe('signature_invalid');
       });
 
-      it('leaves the publisher manifest of the list as it was', () => {
+      it('answers the highest manifest as the manifest of the list', () => {
         const list = verifyUnlList(body(entryManifest(6), newSigning), publisher.publicKeyHex);
-        expect(list.manifest.sequence).toBe(5);
-        expect(list.manifest.signingKey).toBe(oldSigning.base58);
+        expect(list.manifest).toEqual(decodeManifest(entryManifest(6), 'hex'));
+        expect(list.manifest.sequence).toBe(6);
+        expect(list.manifest.signingKey).toBe(newSigning.base58);
       });
 
       it('is ignored when its sequence is not higher', () => {
@@ -637,6 +693,45 @@ describe('verifyUnlList on test-signed lists', () => {
           );
           expect(failureOf(body(entryManifest(sequence), oldSigning), publisher.publicKeyHex)).toBeUndefined();
         }
+        const list = verifyUnlList(body(entryManifest(4), oldSigning), publisher.publicKeyHex);
+        expect(list.manifest.sequence).toBe(5);
+      });
+
+      it('applies to the other blobs, whichever blob carries it: a blob signed by the superseded key is refused', () => {
+        const newer = entryManifest(6);
+        expect(failureOf(two([newSigning, oldSigning], [newer, undefined]), publisher.publicKeyHex)).toBe(
+          'signature_invalid',
+        );
+        expect(failureOf(two([oldSigning, newSigning], [undefined, newer]), publisher.publicKeyHex)).toBe(
+          'signature_invalid',
+        );
+        expect(failureOf(two([oldSigning, newSigning], [newer, undefined]), publisher.publicKeyHex)).toBe(
+          'signature_invalid',
+        );
+      });
+
+      it('lets every blob be signed by the highest manifest key, with the manifest on one blob only', () => {
+        const newer = entryManifest(6);
+        for (const manifests of [
+          [newer, undefined],
+          [undefined, newer],
+          [newer, newer],
+        ] as [string?, string?][]) {
+          const list = verifyUnlList(two([newSigning, newSigning], manifests), publisher.publicKeyHex);
+          expect(list.blobs.map((blob) => blob.sequence)).toEqual([7, 8]);
+          expect(list.manifest.sequence).toBe(6);
+        }
+      });
+
+      it('takes the highest of several entry manifests', () => {
+        const six = entryManifest(6);
+        const seven = entryManifest(7, testKey('unl-publisher-newest-signing'));
+        const newest = testKey('unl-publisher-newest-signing');
+        expect(failureOf(two([newest, newest], [six, seven]), publisher.publicKeyHex)).toBeUndefined();
+        expect(failureOf(two([newSigning, newSigning], [six, seven]), publisher.publicKeyHex)).toBe(
+          'signature_invalid',
+        );
+        expect(failureOf(two([newest, newest], [seven, six]), publisher.publicKeyHex)).toBeUndefined();
       });
 
       it('is manifest_invalid when it does not decode, does not verify or names another master key', () => {
@@ -654,9 +749,117 @@ describe('verifyUnlList on test-signed lists', () => {
         ).toBe('manifest_invalid');
       });
 
+      it('is manifest_invalid for any blob that carries a bad manifest, also one that would not be the highest', () => {
+        const bad = flipByte(entryManifest(4), -10);
+        expect(failureOf(two([oldSigning, oldSigning], [undefined, bad]), publisher.publicKeyHex)).toBe(
+          'manifest_invalid',
+        );
+      });
+
       it('is revoked when it revokes the master key', () => {
         const revoking = makeManifest({ master: publisher, sequence: REVOKED_SEQUENCE });
         expect(failureOf(body(revoking, oldSigning), publisher.publicKeyHex)).toBe('revoked');
+        expect(failureOf(two([oldSigning, oldSigning], [undefined, revoking]), publisher.publicKeyHex)).toBe('revoked');
+      });
+    });
+
+    describe('knownManifest, the highest publisher manifest seen before', () => {
+      const oldSigning = signing;
+      const newSigning = testKey('unl-publisher-known-signing');
+      const known = (sequence: number, signingKey: TestKey = newSigning, master: TestKey = publisher): Manifest =>
+        decodeManifest(makeManifest({ master, signing: signingKey, sequence }), 'hex');
+      /** A v1 body whose manifest has sequence `sequence` and key `oldSigning`; the blob is signed by `signer`. */
+      const replay = (signer: TestKey, sequence = 5) =>
+        makeUnlResponse({
+          publisher,
+          publisherSigning: oldSigning,
+          manifestSequence: sequence,
+          blobs: [{ blob: goodBlob(), signer }],
+        });
+
+      it('is optional: without it the manifest of the body decides', () => {
+        expect(failureOf(replay(oldSigning), publisher.publicKeyHex)).toBeUndefined();
+        expect(verifyUnlList(replay(oldSigning), publisher.publicKeyHex, undefined).manifest.sequence).toBe(5);
+      });
+
+      it('refuses a body that replays an older manifest with a blob signed by the superseded key', () => {
+        expect(() => verifyUnlList(replay(oldSigning), publisher.publicKeyHex, known(6))).toThrow(UnlListError);
+        try {
+          verifyUnlList(replay(oldSigning), publisher.publicKeyHex, known(6));
+        } catch (err) {
+          expect((err as UnlListError).reason).toBe('signature_invalid');
+        }
+      });
+
+      it('verifies the same blob signed by the key of the known manifest, and answers the known manifest', () => {
+        const newer = known(6);
+        const list = verifyUnlList(replay(newSigning), publisher.publicKeyHex, newer);
+        expect(list.manifest).toEqual(newer);
+        expect(list.blobs).toHaveLength(1);
+        // Without the known manifest the same body is refused: its own manifest names the old key.
+        expect(failureOf(replay(newSigning), publisher.publicKeyHex)).toBe('signature_invalid');
+      });
+
+      it('lets the known manifest win a tie, as the one seen first', () => {
+        const tie = known(5);
+        expect(verifyUnlList(replay(newSigning), publisher.publicKeyHex, tie).manifest).toEqual(tie);
+        expect(() => verifyUnlList(replay(oldSigning), publisher.publicKeyHex, tie)).toThrow(UnlListError);
+      });
+
+      it('is beaten by a manifest of the body with a higher sequence', () => {
+        const list = verifyUnlList(replay(oldSigning, 9), publisher.publicKeyHex, known(6));
+        expect(list.manifest.sequence).toBe(9);
+        expect(list.manifest.signingKey).toBe(oldSigning.base58);
+        expect(failureOf(replay(newSigning, 9), publisher.publicKeyHex, known(6))).toBe('signature_invalid');
+      });
+
+      it('is beaten by a higher entry manifest of a version 2 body', () => {
+        const response = makeUnlResponse({
+          publisher,
+          publisherSigning: oldSigning,
+          manifestSequence: 5,
+          version: 2,
+          blobs: [{ blob: goodBlob(), signer: oldSigning }],
+        });
+        (response.blobs_v2 as Body[])[0].manifest = base64Of(
+          makeManifest({ master: publisher, signing: oldSigning, sequence: 8 }),
+        );
+        const list = verifyUnlList(response, publisher.publicKeyHex, known(6));
+        expect(list.manifest.sequence).toBe(8);
+      });
+
+      it('is revoked when the known manifest revokes the key', () => {
+        const revoked = decodeManifest(makeManifest({ master: publisher, sequence: REVOKED_SEQUENCE }), 'hex');
+        expect(revoked.revoked).toBe(true);
+        expect(failureOf(replay(oldSigning), publisher.publicKeyHex, revoked)).toBe('revoked');
+        expect(failureOf(replay(oldSigning, 9), publisher.publicKeyHex, revoked)).toBe('revoked');
+      });
+
+      it('is ignored when it is of another master key, e.g. after the configured key was changed', () => {
+        const other = testKey('unl-other-publisher');
+        const foreign = known(9, newSigning, other);
+        const list = verifyUnlList(replay(oldSigning), publisher.publicKeyHex, foreign);
+        expect(list.manifest.sequence).toBe(5);
+        expect(failureOf(replay(newSigning), publisher.publicKeyHex, foreign)).toBe('signature_invalid');
+        const foreignRevoked = decodeManifest(makeManifest({ master: other, sequence: REVOKED_SEQUENCE }), 'hex');
+        expect(failureOf(replay(oldSigning), publisher.publicKeyHex, foreignRevoked)).toBeUndefined();
+      });
+
+      it('is ignored when it does not verify, or its fields do not say what its bytes say', () => {
+        const good = known(9);
+        const brokenBytes = decodeManifest(flipByte(good.hex, -10), 'hex');
+        expect(failureOf(replay(oldSigning), publisher.publicKeyHex, brokenBytes)).toBeUndefined();
+        expect(failureOf(replay(oldSigning), publisher.publicKeyHex, { ...good, sequence: 99 })).toBeUndefined();
+        expect(failureOf(replay(oldSigning), publisher.publicKeyHex, { ...good, revoked: true })).toBeUndefined();
+        const bogus = { ...good, hex: 'ZZ' };
+        expect(failureOf(replay(oldSigning), publisher.publicKeyHex, bogus)).toBeUndefined();
+      });
+
+      it('is not changed', () => {
+        const manifest = known(6);
+        const before = JSON.stringify(manifest);
+        verifyUnlList(replay(newSigning), publisher.publicKeyHex, manifest);
+        expect(JSON.stringify(manifest)).toBe(before);
       });
     });
   });

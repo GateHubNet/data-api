@@ -37,7 +37,10 @@ export interface VerifiedUnlList {
   version: 1 | 2;
   /** The configured publisher key, upper-case hex. */
   publisherKey: string;
-  /** The publisher manifest of the list. */
+  /**
+   * The publisher manifest the blobs were verified with: the one of the highest sequence among the manifest of the
+   * body, the own manifests of its version 2 entries and the `knownManifest` given.
+   */
   manifest: Manifest;
   blobs: UnlBlob[];
   /** `refresh_interval` of the body as it is (minutes); the fetcher clamps it. */
@@ -49,6 +52,8 @@ const RIPPLE_EPOCH_OFFSET = 946_684_800;
 const MAX_BLOBS_V2 = 5;
 const UINT32_MAX = 0xffff_ffff;
 const HEX = /^(?:[0-9A-F]{2})+$/i;
+/** A public key as the body names it: 66 hex digits, ASCII only (`toUpperCase` would fold characters like U+FB00). */
+const PUBLIC_KEY = /^[0-9A-Fa-f]{66}$/;
 
 type Json = Record<string, unknown>;
 
@@ -70,7 +75,7 @@ function entriesOf(body: Json): { version: 1 | 2; entries: Entry[] } {
   const invalid = (why: string): never => {
     throw new UnlListError('invalid_format', why);
   };
-  if (typeof body.public_key !== 'string') invalid('public_key is missing');
+  if (typeof body.public_key !== 'string' || !PUBLIC_KEY.test(body.public_key)) invalid('public_key is missing');
   if (typeof body.manifest !== 'string') invalid('manifest is missing');
   if (typeof body.version !== 'number' || !Number.isInteger(body.version)) invalid('version is missing');
 
@@ -112,7 +117,6 @@ function manifestOf(base64: string, masterKeyHex: string, whose: string): Manife
   }
   if (manifest.masterKeyHex !== masterKeyHex) throw new UnlListError('manifest_invalid', `${whose} is for another key`);
   if (!verifyManifest(manifest)) throw new UnlListError('manifest_invalid', `${whose} does not verify`);
-  if (manifest.revoked) throw new UnlListError('revoked', `${whose} revokes the publisher key`);
   return manifest;
 }
 
@@ -142,7 +146,8 @@ function parseBlob(bytes: Buffer): UnlBlob {
   if (!isUint32(sequence)) return invalid('the blob has no integer sequence');
   if (!isUint32(expiration)) return invalid('the blob has no integer expiration');
   if (effective !== undefined && !isUint32(effective)) return invalid('the blob effective is not an integer');
-  if (effective !== undefined && !(expiration > effective)) return invalid('the blob expires before it is effective');
+  // rippled's validFrom is 0 without an `effective`.
+  if (!(expiration > (effective ?? 0))) return invalid('the blob expires before it is effective');
   if (!Array.isArray(validators)) return invalid('the blob has no validators');
 
   return {
@@ -167,18 +172,23 @@ function parseBlob(bytes: Buffer): UnlBlob {
  * Verify a validator list as fetched from a publisher (`body` is the parsed JSON, or its text), in the order of
  * rippled's `ValidatorList::verify` (spec 2.1; F14, F15):
  *
- * 1. the shape: `public_key`, `manifest` and `version` 1 (`blob`, `signature`) or 2 (`blobs_v2` of 1 to 5 entries) →
- *    `invalid_format`;
+ * 1. the shape: `public_key` (66 hex digits), `manifest` and `version` 1 (`blob`, `signature`) or 2 (`blobs_v2` of 1 to
+ *    5 entries) → `invalid_format`;
  * 2. `public_key` is `configuredKey` (any case) → `untrusted_key`;
- * 3. the publisher manifest is the key's own and verifies → `manifest_invalid`; a revoked one → `revoked`. A version 2
- *    entry's own manifest replaces it for that blob when its sequence is higher;
- * 4. each signature verifies over the decoded blob with the signing key of the manifest → `signature_invalid`;
+ * 3. the publisher manifest, and the own manifest of each version 2 entry that has one, are each the key's own and
+ *    verify → `manifest_invalid`. The one of the highest sequence signs every blob of the body, so that a blob signed by
+ *    a superseded key is refused whichever entry carries the newer manifest; on a tie the earlier one stands. It is
+ *    `revoked` when it revokes the key;
+ * 4. each signature verifies over the decoded blob with the signing key of that manifest → `signature_invalid`;
  * 5. each blob has an integer `sequence` and `expiration`, an optional integer `effective` before the expiration, and
  *    `validators` with 33-byte node keys → `blob_invalid`.
  *
- * Times come back as unix seconds. Throws `UnlListError`.
+ * `knownManifest` is the highest publisher manifest seen before (a body that replays an older one cannot bring back a
+ * superseded signing key). It counts like a manifest of the body, and first on a tie, when it is the configured key's
+ * own and verifies; otherwise it is ignored (the operator may have changed the configured key). Times come back as unix
+ * seconds. Throws `UnlListError`.
  */
-export function verifyUnlList(body: unknown, configuredKey: string): VerifiedUnlList {
+export function verifyUnlList(body: unknown, configuredKey: string, knownManifest?: Manifest): VerifiedUnlList {
   let parsed = body;
   if (typeof parsed === 'string') {
     try {
@@ -195,16 +205,18 @@ export function verifyUnlList(body: unknown, configuredKey: string): VerifiedUnl
     throw new UnlListError('untrusted_key', 'the list is not from the configured key');
   }
 
-  const manifest = manifestOf(parsed.manifest as string, publisherKey, 'the publisher manifest');
+  const candidates: Manifest[] = [manifestOf(parsed.manifest as string, publisherKey, 'the publisher manifest')];
+  for (const entry of entries) {
+    if (entry.manifest !== undefined) candidates.push(manifestOf(entry.manifest, publisherKey, 'a blob manifest'));
+  }
+  if (knownManifest?.masterKeyHex === publisherKey && verifyManifest(knownManifest)) candidates.unshift(knownManifest);
+  // The highest sequence; the first of equals, so the manifest seen before wins a tie.
+  const manifest = candidates.reduce((best, next) => (next.sequence > best.sequence ? next : best));
+  if (manifest.revoked) throw new UnlListError('revoked', 'the publisher key is revoked');
 
   const blobs = entries.map((entry) => {
-    let signer = manifest;
-    if (entry.manifest !== undefined) {
-      const own = manifestOf(entry.manifest, publisherKey, 'a blob manifest');
-      if (own.sequence > manifest.sequence) signer = own;
-    }
     const bytes = Buffer.from(entry.blob, 'base64');
-    if (!signedBlob(bytes, entry.signature, signer.signingKeyHex)) {
+    if (!signedBlob(bytes, entry.signature, manifest.signingKeyHex)) {
       throw new UnlListError('signature_invalid', 'a blob signature does not verify');
     }
     return bytes;

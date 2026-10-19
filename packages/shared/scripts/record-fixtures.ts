@@ -25,7 +25,7 @@
  * and takes none of the ledger options.
  */
 import { mkdirSync, writeFileSync } from 'fs';
-import { request } from 'https';
+import { request as httpsRequest } from 'https';
 import { join, resolve } from 'path';
 import { Client } from 'xrpl';
 import { gzipSync } from 'zlib';
@@ -208,7 +208,7 @@ export function redirectTarget(from: string, location: string | undefined, follo
 /** GET a URL with Node `https` and return the body as served: at most 3 redirects, 20 s, 1 MiB. */
 function fetchBody(url: string, followed = 0): Promise<Buffer> {
   return new Promise<Buffer>((resolveBody, reject) => {
-    const req = request(
+    const req = httpsRequest(
       url,
       { method: 'GET', timeout: UNL_TIMEOUT_MS, headers: { Accept: 'application/json' } },
       (res) => {

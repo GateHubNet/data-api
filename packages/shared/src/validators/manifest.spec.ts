@@ -227,6 +227,70 @@ describe('decodeManifest refuses what is not a manifest', () => {
   it('refuses an object that is not a manifest at all', () => {
     refused(encode({ TransactionType: 'Payment', Account: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh', Fee: '10' }), 'hex');
   });
+
+  describe('the structure rippled reads (deserializeManifest), with real signatures so that only the structure is wrong', () => {
+    /** The master signs the payload of F15 over `body`; `signedBy` adds a `Signature` of that payload. */
+    const built = (body: Record<string, unknown>, signedBy?: TestKey) => {
+      const payload = '4D414E00' + encode(body);
+      return encode({
+        ...body,
+        MasterSignature: master.sign(payload),
+        ...(signedBy ? { Signature: signedBy.sign(payload) } : {}),
+      });
+    };
+    const ordinary = { Sequence: 3, PublicKey: master.publicKeyHex, SigningPubKey: signing.publicKeyHex };
+    const revoking = { Sequence: REVOKED_SEQUENCE, PublicKey: master.publicKeyHex };
+
+    it('reads the two well-formed shapes: signing key and signature, or a revocation with neither', () => {
+      const ordinaryManifest = decodeManifest(built(ordinary, signing), 'hex');
+      expect(ordinaryManifest).toMatchObject({ revoked: false, signingKeyHex: signing.publicKeyHex });
+      expect(verifyManifest(ordinaryManifest)).toBe(true);
+      const highest = decodeManifest(built({ ...ordinary, Sequence: REVOKED_SEQUENCE - 1 }, signing), 'hex');
+      expect(highest.revoked).toBe(false); // the highest sequence that does not revoke
+      const revokedManifest = decodeManifest(built(revoking), 'hex');
+      expect(revokedManifest).toMatchObject({ revoked: true });
+      expect(revokedManifest.signingKey).toBeUndefined();
+      expect(verifyManifest(revokedManifest)).toBe(true);
+    });
+
+    it('refuses a revoked manifest that has a SigningPubKey, a Signature, or both', () => {
+      refused(built({ ...revoking, SigningPubKey: signing.publicKeyHex }), 'hex');
+      refused(built(revoking, signing), 'hex');
+      refused(built({ ...revoking, SigningPubKey: signing.publicKeyHex }, signing), 'hex');
+    });
+
+    it('refuses a manifest that does not revoke and lacks the signing key or the signature', () => {
+      refused(built(ordinary), 'hex'); // no Signature
+      refused(built({ Sequence: 3, PublicKey: master.publicKeyHex }, signing), 'hex'); // no SigningPubKey
+      refused(built({ Sequence: 3, PublicKey: master.publicKeyHex }), 'hex'); // neither
+    });
+
+    it('refuses a signing key that is the master key', () => {
+      const same = { ...ordinary, SigningPubKey: master.publicKeyHex };
+      refused(built(same, master), 'hex');
+      expect(decodeManifest(built(ordinary, signing), 'hex').signingKeyHex).not.toBe(master.publicKeyHex);
+    });
+
+    it('accepts Version 0 and refuses any other Version', () => {
+      const zero = decodeManifest(built({ ...ordinary, Version: 0 }, signing), 'hex');
+      expect(zero.sequence).toBe(3);
+      expect(verifyManifest(zero)).toBe(true);
+      refused(built({ ...ordinary, Version: 1 }, signing), 'hex');
+      refused(built({ ...ordinary, Version: 65535 }, signing), 'hex');
+      refused(built({ ...revoking, Version: 1 }), 'hex');
+    });
+
+    it('refuses a field outside the manifest fields, even when both signatures cover it', () => {
+      refused(built({ ...ordinary, Fee: '10' }, signing), 'hex');
+      refused(built({ ...ordinary, Account: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh' }, signing), 'hex');
+      refused(built({ ...revoking, Flags: 1 }), 'hex');
+    });
+
+    it('keeps a Domain, which this code does not judge', () => {
+      const body = { ...ordinary, Domain: Buffer.from('localhost').toString('hex').toUpperCase() };
+      expect(decodeManifest(built(body, signing), 'hex').domain).toBe('localhost');
+    });
+  });
 });
 
 describe('made manifests', () => {
@@ -341,14 +405,6 @@ describe('made manifests', () => {
   it('keeps the signed bytes in upper-case hex', () => {
     const hex = makeManifest({ master, signing, sequence: 1 });
     expect(decodeManifest(hex.toLowerCase(), 'hex').hex).toBe(hex);
-  });
-
-  it('reads a manifest with a field it does not use, as rippled does; the signatures cover that field too', () => {
-    const body = { Sequence: 1, PublicKey: master.publicKeyHex, SigningPubKey: signing.publicKeyHex, Fee: '10' };
-    const payload = '4D414E00' + encode(body);
-    const hex = encode({ ...body, Signature: signing.sign(payload), MasterSignature: master.sign(payload) });
-    expect(verifyManifest(decodeManifest(hex, 'hex'))).toBe(true);
-    expect(verifyManifest(decodeManifest(hex.replace('68400000000000000A', '68400000000000000B'), 'hex'))).toBe(false);
   });
 });
 

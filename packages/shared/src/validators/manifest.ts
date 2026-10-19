@@ -2,7 +2,7 @@ import { decode, encode } from 'ripple-binary-codec';
 import { verify } from 'ripple-keypairs';
 import { nodePublicKeyFromHex } from './node-key';
 
-/** A manifest with this sequence revokes its master key: it has no signing key and only the master signature. */
+/** A manifest with this sequence revokes its master key: it has no signing key or signature, only the master signature. */
 export const REVOKED_SEQUENCE = 0xffff_ffff;
 
 /** A manifest as the rippled and xahaud `manifest` machinery reads it (F15). */
@@ -13,7 +13,7 @@ export interface Manifest {
   masterKeyHex: string;
   sequence: number;
   revoked: boolean;
-  /** The ephemeral signing key, base58 (`n9...`); none in a revoked manifest. */
+  /** The ephemeral signing key, base58 (`n9...`); none in a revoked manifest, which has no signing key. */
   signingKey?: string;
   signingKeyHex?: string;
   /** The `Domain` field as it was signed, one character per byte. Not judged here: `isProperlyFormedTomlDomain` does. */
@@ -36,6 +36,16 @@ const SIGNING_PREFIX = '4D414E00';
 const HEX = /^(?:[0-9A-F]{2})+$/i;
 const KEY_HEX = /^(?:02|03|ED)[0-9A-F]{64}$/i;
 const SIGNATURE_FIELDS = ['Signature', 'MasterSignature'];
+/** The fields rippled's `deserializeManifest` knows; a manifest with any other field is refused. */
+const MANIFEST_FIELDS = new Set([
+  'PublicKey',
+  'MasterSignature',
+  'Sequence',
+  'Version',
+  'Domain',
+  'SigningPubKey',
+  'Signature',
+]);
 
 const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
 
@@ -46,11 +56,16 @@ interface ParsedManifest {
 }
 
 /**
- * Read a serialized manifest: an STObject `{PublicKey, MasterSignature, Sequence, Domain?, SigningPubKey, Signature}`.
- * Only a canonical encoding is accepted (`encode(decode(bytes))` has to give the bytes back), the master key and the
- * signing key have to be keys of a known type, and a manifest that does not revoke has to have a signing key and its
- * signature. Fields this code does not use are allowed, as in rippled; both signatures cover them. The signatures are
- * not checked here, `verifyManifest` does. Throws `ManifestError`.
+ * Read a serialized manifest, with the structure rippled's `deserializeManifest` demands (F15). An STObject
+ * `{PublicKey, MasterSignature, Sequence, Version?, Domain?, SigningPubKey, Signature}`:
+ *
+ * - only a canonical encoding (`encode(decode(bytes))` gives the bytes back), and no field outside those listed;
+ * - `PublicKey` (and `SigningPubKey`) a key of a known type (`02`, `03`, `ED`), `Version` 0 when present;
+ * - a manifest that revokes (`Sequence` `0xFFFFFFFF`) has neither `SigningPubKey` nor `Signature`; any other has both,
+ *   and its signing key is not its master key.
+ *
+ * `Domain` is not judged (`isProperlyFormedTomlDomain` does); an empty one counts as none. The signatures are not
+ * checked here, `verifyManifest` does. Throws `ManifestError`.
  */
 export function decodeManifest(bytes: string, encoding: 'hex' | 'base64'): Manifest {
   return parseManifest(bytes, encoding).manifest;
@@ -71,6 +86,10 @@ function parseManifest(bytes: string, encoding: 'hex' | 'base64'): ParsedManifes
     return fail(`the manifest does not decode: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  const unknown = Object.keys(fields).find((name) => !MANIFEST_FIELDS.has(name));
+  if (unknown !== undefined) return fail(`the manifest has a field it should not have: ${unknown}`);
+  if (fields.Version !== undefined && fields.Version !== 0) return fail('the manifest has a Version other than 0');
+
   const masterKeyHex = text(fields.PublicKey)?.toUpperCase();
   if (masterKeyHex === undefined || !KEY_HEX.test(masterKeyHex)) return fail('the master key is missing or not a key');
   if (text(fields.MasterSignature) === undefined) return fail('the master signature is missing');
@@ -80,8 +99,15 @@ function parseManifest(bytes: string, encoding: 'hex' | 'base64'): ParsedManifes
   const revoked = sequence === REVOKED_SEQUENCE;
   const signingKeyHex = text(fields.SigningPubKey)?.toUpperCase();
   if (signingKeyHex !== undefined && !KEY_HEX.test(signingKeyHex)) return fail('the signing key is not a key');
-  if (!revoked && signingKeyHex === undefined) return fail('the signing key is missing');
-  if (!revoked && text(fields.Signature) === undefined) return fail('the signature is missing');
+  const hasSignature = fields.Signature !== undefined;
+  if (hasSignature && text(fields.Signature) === undefined) return fail('the signature is not a signature');
+  if (revoked) {
+    if (signingKeyHex !== undefined || hasSignature) return fail('a revoking manifest has a signing key or signature');
+  } else {
+    if (signingKeyHex === undefined) return fail('the signing key is missing');
+    if (!hasSignature) return fail('the signature is missing');
+    if (signingKeyHex === masterKeyHex) return fail('the signing key is the master key');
+  }
 
   const domain = text(fields.Domain);
   const manifest: Manifest = {
