@@ -2454,6 +2454,186 @@ describe('the validators worker (e2e)', () => {
         ).toEqual([]);
       });
 
+      describe('a gap of two voting ledgers', () => {
+        const R4 = 1279;
+        const R5 = 1535;
+        /** The first ledger after the gap. */
+        const AFTER_GAP = 800;
+        let closeAt!: (index: number) => number;
+        let first: Array<{ ledger_index: number; version: string }>;
+
+        /**
+         * Rounds 1 and 2 are missing from the ingest, with ledger 800 the first one after them (so both sentinels carry its close
+         * time, 3 500 s after round 1). Round 3 closes 4 000 s after round 1 and nobody validated its ledger: it is real, with
+         * nothing observed and nothing trusted. Round 4 closes 40 000 s after round 1, within 24 h of both late rounds. Round 5
+         * closes at 87 400 s: past the 24 h window of round 1, inside that of round 2. K4 votes in rounds 1 and 2 only. Run once,
+         * with the gap.
+         */
+        async function gapOfTwo(): Promise<void> {
+          const base = nowSeconds() - 3 * DAY;
+          const closes = new Map([
+            [255, base - 1000],
+            [R1, base],
+            [R2, base + 3000],
+            [AFTER_GAP, base + 3500],
+            [R3, base + 4000],
+            [R4, base + 40_000],
+            [R5, base + 87_400],
+          ]);
+          closeAt = (index) => closes.get(index) ?? base - 5000;
+          const validateAt = (
+            key: TestKey,
+            ledger: number,
+            amendments: string[],
+            over: { full?: boolean; hash?: string } = {},
+          ) => validate(key.base58, ledger, { amendments, at: (closes.get(ledger) ?? base) + 3.5, ...over });
+          await bootWithList();
+          await writeLedgersClosing(closeAt, [255, 1], [AFTER_GAP, 1], [R3, 1], [R4, 1], [R5, 1]);
+          await validateAt(K1, 255, [], { full: false }); // there, to start from, and no record
+          for (const key of [K1, K2, K3, K4]) await validateAt(key, R1, [AM_A]);
+          for (const key of [K1, K2, K3, K4]) await validateAt(key, R2, [AM_B]);
+          await validateAt(K1, R3, [AM_C], { hash: 'E'.repeat(64) }); // a ledger that was not ingested
+          for (const key of [K1, K2, K3]) await validateAt(key, R4, [AM_C]);
+          for (const key of [K1, K2, K3]) await validateAt(key, R5, [AM_D]);
+          await runNow(makeJob());
+          first = await currentSentinels();
+          expect(first.map((row) => row.ledger_index)).toEqual([255, R1, R2, R3, R4, R5]);
+          // both are sealed with the close time of the ledger after the gap
+          for (const round of [R1, R2]) {
+            expect((await currentTallies(round))[0]).toMatchObject({
+              observed: 0,
+              trusted: 0,
+              close_time: closeAt(AFTER_GAP),
+            });
+          }
+          // round 3 is sealed too, with its own close time; K4 has no record in rounds 4 and 5
+          expect((await currentTallies(R3))[0]).toMatchObject({ observed: 0, trusted: 0, close_time: closeAt(R3) });
+          for (const round of [R4, R5]) {
+            expect((await currentTallies(round)).find((row) => row.amendment_id === '')?.trusted).toBe(3);
+          }
+        }
+
+        /** The ledgers of the gap arrive. */
+        const gapFilled = () => writeLedgersClosing(closeAt, [R1, 1], [R2, 1]);
+
+        /** Every round of the gap and after it has the votes it should, K4's record being that of round 2 from then on. */
+        async function expectRoundsRight(): Promise<void> {
+          const sentinelOf = async (round: number) =>
+            (await currentTallies(round)).find((row) => row.amendment_id === '');
+          expect((await currentVotes(R1)).map((v) => v.validation_public_key)).toEqual(UNL_KEYS);
+          expect(yesOf(await currentTallies(R1))).toEqual([[AM_A, 4]]);
+          expect(await sentinelOf(R1)).toMatchObject({ close_time: closeAt(R1), trusted: 4, observed: 4 });
+          expect((await currentVotes(R2)).map((v) => v.validation_public_key)).toEqual(UNL_KEYS);
+          expect(yesOf(await currentTallies(R2))).toEqual([[AM_B, 4]]);
+          expect(await sentinelOf(R2)).toMatchObject({ close_time: closeAt(R2), trusted: 4, observed: 4 });
+          // a real round with nothing observed carries the records of the late rounds now
+          expect(yesOf(await currentTallies(R3))).toEqual([[AM_B, 4]]);
+          expect(await sentinelOf(R3)).toMatchObject({ close_time: closeAt(R3), trusted: 4, observed: 0 });
+          expect(yesOf(await currentTallies(R4))).toEqual([
+            [AM_B, 1],
+            [AM_C, 3],
+          ]);
+          expect(await sentinelOf(R4)).toMatchObject({ trusted: 4, observed: 3 });
+          // closing after round 1 by more than 24 h, and inside the 24 h of round 2
+          expect(yesOf(await currentTallies(R5))).toEqual([
+            [AM_B, 1],
+            [AM_D, 3],
+          ]);
+          expect(await sentinelOf(R5)).toMatchObject({ trusted: 4, observed: 3 });
+        }
+
+        it('redoes each round with its votes, and every round between them and after them', async () => {
+          await gapOfTwo();
+          await gapFilled();
+
+          await runNow(makeJob());
+
+          await expectRoundsRight();
+          const second = await currentSentinels();
+          expect(second[0]).toEqual(first[0]); // before the gap
+          for (const index of [1, 2, 3, 4, 5]) {
+            expect(Number(second[index].version)).toBeGreaterThan(Number(first[index].version));
+          }
+          // nothing is left to do
+          const insert = jest.spyOn(db.ch, 'insert');
+          await runNow(makeJob());
+          expect(
+            insert.mock.calls.filter(([table]) => table === Table.ValidatorVotes || table === Table.AmendmentTallies),
+          ).toEqual([]);
+        });
+
+        it('leaves the second round a late round after the first is redone, and a run cut short between them goes on', async () => {
+          await gapOfTwo();
+          await gapFilled();
+          const controller = new AbortController();
+          const real = db.ch.insert.bind(db.ch);
+          // the shutdown comes when the unit of round 1 is over
+          jest.spyOn(db.ch, 'insert').mockImplementation(async (table, rows, opts) => {
+            await real(table, rows, opts);
+            if (table === Table.AmendmentTallies && (rows as Array<{ ledger_index: number }>)[0].ledger_index === R1) {
+              controller.abort();
+            }
+          });
+
+          await makeJob().run({ now: Date.now(), deadline: Date.now() + 60_000, signal: controller.signal });
+          jest.restoreAllMocks();
+
+          // round 1 has its votes; round 2 is still sealed, and so is round 5, which was not touched
+          expect((await currentVotes(R1)).length).toBe(4);
+          expect((await currentTallies(R2))[0]).toMatchObject({
+            observed: 0,
+            trusted: 0,
+            close_time: closeAt(AFTER_GAP),
+          });
+          expect(await currentVotes(R2)).toEqual([]);
+          expect((await currentTallies(R5)).find((row) => row.amendment_id === '')?.trusted).toBe(3);
+
+          await runNow(makeJob());
+
+          await expectRoundsRight();
+        });
+      });
+
+      it('finishes the rewrite of a round that was complete once its votes are in, though the shutdown comes', async () => {
+        await bootWithList();
+        await writeLedgers([R1 - 1, 3], [R3 - 1, 3]);
+        await validateAll(R1, [AM_A]);
+        await validateAll(R2, [AM_B]);
+        for (const key of [K1, K2, K3]) await validate(key.base58, R3, { amendments: [AM_C] });
+        await runNow(makeJob());
+        const before = await currentVersionOf(R3);
+        await writeLedgers([R2 - 1, 3]);
+        const controller = new AbortController();
+        const real = db.ch.insert.bind(db.ch);
+        // the shutdown comes right after the votes of round 3, the round after the late one, are in
+        jest.spyOn(db.ch, 'insert').mockImplementation(async (table, rows, opts) => {
+          await real(table, rows, opts);
+          if (table === Table.ValidatorVotes && (rows as Array<{ ledger_index: number }>)[0].ledger_index === R3) {
+            controller.abort();
+          }
+        });
+
+        await makeJob().run({ now: Date.now(), deadline: Date.now() + 60_000, signal: controller.signal });
+        jest.restoreAllMocks();
+
+        // round 3 is complete in its new version: its sentinel is in, and a merge of the votes keeps the set it names
+        const after = await currentVersionOf(R3);
+        expect(Number(after)).toBeGreaterThan(Number(before));
+        await db.ch.command(`OPTIMIZE TABLE ${Table.ValidatorVotes} FINAL`);
+        const votes = await currentVotes(R3);
+        expect(votes.map((v) => v.validation_public_key)).toEqual(sorted([K1, K2, K3].map((k) => k.base58)));
+        expect(votes.every((v) => v.version === after)).toBe(true);
+        // the late round, written last, is still to do
+        expect((await currentTallies(R2))[0]).toMatchObject({ observed: 0, trusted: 0 });
+
+        await runNow(makeJob());
+        expect(yesOf(await currentTallies(R3))).toEqual([
+          [AM_B, 1],
+          [AM_C, 3],
+        ]);
+        expect((await currentVotes(R2)).length).toBe(4);
+      });
+
       it('does not redo a round that was real with observed 0', async () => {
         await bootWithList();
         await writeBaseLedgers();

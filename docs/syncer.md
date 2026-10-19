@@ -496,7 +496,10 @@ and left for the next start.
   ledger and is never redone), past the 120 s delay, while that ledger is inside the 90 days `validations` keeps. Every stored round
   whose close time is within 24 h after the late one is redone too, because its records may be carried from it: those first, oldest
   first, each with the late round in its history, then the late round last, so that a run that is cut short leaves the late round a
-  candidate and the whole is done again. A follower whose own ledger is still missing is left as it is.
+  candidate and the whole is done again. A follower whose own ledger is still missing is left as it is, and so is a follower that is a
+  candidate itself (a gap of several voting ledgers): its own unit comes next and redoes the rounds up to 24 h after it, which the
+  unit before it would leave out. A follower is rewritten with both its inserts once its votes are in (a merge of `validator_votes`
+  could otherwise leave the set of the old sentinel without votes); a shutdown stops the job between rounds.
 - **Votes.** The hash H of V from `ledgers`; the validations of H, one row per validator, keys mapped to master keys through the
   manifest map (a validation recorded under a signing key counts for its master), with the values of the earliest sighting
   (`argMin(…, first_datetime)`: `full`, the amendments, the fee votes, the server version). A validation of another hash at V is

@@ -106,7 +106,10 @@ interface LateRound {
  * `observed 0` and `trusted 0` and a close time that is not the one of its ledger (a round that was real with nobody observed
  * keeps the close time of its ledger and is never redone). The rounds stored after it whose close time is within 24 h of
  * its own are redone too, because their records may be carried from it: they first, each with the late round in its history, and the
- * late round last, so that a run that is cut short leaves it a candidate and the whole is done again.
+ * late round last, so that a run that is cut short leaves it a candidate and the whole is done again. A gap of several
+ * voting ledgers is done round by round: a follower that is a candidate itself is skipped, and its own unit, the next one in the
+ * order, redoes the rounds up to 24 h after it. A follower that is rewritten gets both inserts once its votes are in, as
+ * `validator_votes` has no version in its key.
  *
  * **Observability.** A round recorded with fewer full validations than the quorum is warned about, counting the observed members
  * that are off the negative UNL, as rippled does; the gauge
@@ -328,16 +331,20 @@ export class RoundsJob implements ComputeJob {
 
   /**
    * Inserts a round: the votes first, then the tallies with the sentinel last, the sentinel being what makes the set visible.
-   * Resolves `false` when the shutdown began before the set was complete.
+   * Resolves `false` when the shutdown began before the set was complete. A round that is written over a complete one (`rewrite`)
+   * is not stopped between the two inserts: once its votes are in, its sentinel follows. `validator_votes` is keyed by round and
+   * validator, not by version, so a merge may replace the votes of the set the old sentinel names with these, and the set would
+   * be left without votes if the new sentinel did not follow. A round that has no set yet can be left half written: nothing
+   * names its votes and the next run writes it again as a newer set.
    */
-  private async writeRound(built: BuiltRound, tick: ComputeTick): Promise<boolean> {
+  private async writeRound(built: BuiltRound, tick: ComputeTick, rewrite = false): Promise<boolean> {
     if (tick.signal.aborted) return false;
     if (built.hash !== undefined) {
       await this.ch.insert(
         Table.ValidatorVotes,
         voteRows(built.round, built.hash, built.closeTime, built.votes, built.version),
       );
-      if (tick.signal.aborted) return false;
+      if (!rewrite && tick.signal.aborted) return false;
     }
     await this.ch.insert(Table.AmendmentTallies, built.tallies);
     return true;
@@ -398,7 +405,7 @@ export class RoundsJob implements ComputeJob {
         WHERE ledger_close != sealed_close AND ledger_close >= {since:UInt32} AND ledger_close <= {ready:UInt32}
         ORDER BY sealed_round
         LIMIT 1`,
-      { since: Math.max(0, now - VALIDATIONS_RETENTION_SECONDS), ready: Math.max(0, now - ROUND_DELAY_SECONDS) },
+      { since: retentionStart(now), ready: Math.max(0, now - ROUND_DELAY_SECONDS) },
     );
     return row === undefined
       ? undefined
@@ -407,19 +414,24 @@ export class RoundsJob implements ComputeJob {
 
   /**
    * Redoes a late round and the stored rounds that closed within 24 h after it: the followers first, oldest first, each with the
-   * late round in its history, then the late round itself. Resolves `false` when the shutdown cut it short.
+   * late round in its history, then the late round itself. A follower that is a late round itself (a gap of several voting
+   * ledgers) is not touched: it is the next candidate, and its unit redoes the rounds up to 24 h after it, which this one's would
+   * leave out when they are past the 24 h of this round. A follower is rewritten whole once its votes are in (see `writeRound`).
+   * Resolves `false` when the shutdown cut it short.
    */
   private async redoRound(late: LateRound, context: RunContext, tick: ComputeTick): Promise<boolean> {
     const anchor = await this.buildRound(late.round, { hash: late.hash, closeTime: late.closeTime }, context, tick);
+    const nowSeconds = tick.now / 1000;
     for (const follower of await this.followersOf(late.round, late.closeTime + RECORD_LIFETIME_SECONDS)) {
       if (tick.signal.aborted) return false;
-      const ready = await this.readyRound(follower.round, tick.now / 1000);
+      const ready = await this.readyRound(follower.round, nowSeconds);
       // a follower whose ledger is still missing (or not past its delay) is left as it is: it is not changed by this round
       if (ready?.hash === undefined) continue;
+      // a late round itself (sealed with a close time that is not its ledger's; it is inside the retention like this one, which
+      // it closed after): left for its own unit, the next one
+      if (follower.sealed && follower.closeTime !== ready.closeTime) continue;
       const built = await this.buildRound(follower.round, ready, context, tick, anchor);
-      if (!(await this.writeRound(built, tick))) return false;
-      // one that was sealed as missing has its votes now, the others have the same ones as before
-      if (follower.sealed && follower.closeTime !== ready.closeTime) this.checkQuorum(built);
+      if (!(await this.writeRound(built, tick, true))) return false;
     }
     if (!(await this.writeRound(anchor, tick))) return false;
     this.checkQuorum(anchor);
@@ -639,6 +651,11 @@ export class RoundsJob implements ComputeJob {
     const newestVoting = votingLedgerAtOrAfter(Number(row.ledger_index) - (ROUND_STRIDE - 1));
     this.metrics.validatorsRoundsLagLedgers.set(Math.max(0, newestVoting - newest));
   }
+}
+
+/** The oldest close time a ledger can have for `validations` to still hold its validations, at `nowSeconds`. */
+function retentionStart(nowSeconds: number): number {
+  return Math.max(0, Math.floor(nowSeconds) - VALIDATIONS_RETENTION_SECONDS);
 }
 
 /** The `validator_votes` rows of a round, all of one version. */
