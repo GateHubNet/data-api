@@ -523,26 +523,50 @@ describe('ValidatorsWorker', () => {
   });
 
   describe('the compute loop', () => {
-    it('seeds validator_seen first, then starts the compute loop after the other loops', async () => {
+    it('starts the seeding of validator_seen in the background, then the compute loop', async () => {
       const t = setup();
       await t.worker.onApplicationBootstrap();
       expect(t.order).toEqual(['seed', 'start compute']);
-      // the seeding is the first thing the worker does: before the publishers are registered
-      expect(seed).toHaveBeenCalledWith(t.ch);
-      expect(seed.mock.invocationCallOrder[0]).toBeLessThan(t.unl.registerPublishers.mock.invocationCallOrder[0]);
-      expect(t.compute.start.mock.invocationCallOrder[0]).toBeGreaterThan(t.unl.start.mock.invocationCallOrder[0]);
+      expect(seed).toHaveBeenCalledWith(t.ch, { signal: expect.any(AbortSignal) });
       await t.worker.stop();
     });
 
-    it('says so when it seeded, and nothing when the table had rows', async () => {
+    it('does not wait for the seeding: the boot is over and the compute loop runs while it is under way', async () => {
+      const t = setup();
+      seed.mockImplementation(() => new Promise<boolean>(() => undefined)); // a seeding that never ends
+      await expect(t.worker.onApplicationBootstrap()).resolves.toBeUndefined();
+      expect(t.unl.start).toHaveBeenCalled();
+      expect(t.compute.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('says so when it seeded, and nothing when there was nothing to seed', async () => {
       const seeded = setup();
       await seeded.worker.onApplicationBootstrap();
-      expect(seeded.logger.log).toHaveBeenCalledWith('validator_seen was empty: seeded it from validations');
+      await seeded.worker.stop();
+      expect(seeded.logger.log).toHaveBeenCalledWith('validator_seen was seeded from validations');
       const present = setup();
       seed.mockImplementation(async () => false);
       await present.worker.onApplicationBootstrap();
+      await present.worker.stop();
       expect(present.logger.log).not.toHaveBeenCalled();
       expect(present.compute.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('is left booted, with the compute loop running, by a seeding that fails, and logs the message only', async () => {
+      const t = setup();
+      seed.mockRejectedValueOnce(Object.assign(new Error('ClickHouse is down'), { secret: 'SECRET' }));
+      await expect(t.worker.onApplicationBootstrap()).resolves.toBeUndefined();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(t.compute.start).toHaveBeenCalledTimes(1);
+      expect(t.unl.start).toHaveBeenCalled();
+      expect(t.logger.warn).toHaveBeenCalledTimes(1);
+      const [line, ...rest] = t.logger.warn.mock.calls[0] as unknown[];
+      expect(line).toBe('Seeding validator_seen failed: ClickHouse is down; it is tried again at the next start');
+      expect(rest).toEqual([]);
+      await t.worker.stop();
+      // the loop is stopped as the others are
+      expect(t.compute.stop).toHaveBeenCalledTimes(1);
     });
 
     it('starts neither the seeding nor the loop when start.compute is false, and the others all the same', async () => {
@@ -563,15 +587,6 @@ describe('ValidatorsWorker', () => {
       await t.worker.stop();
     });
 
-    it('fails the boot, with nothing started, when validator_seen cannot be seeded', async () => {
-      const t = setup();
-      seed.mockRejectedValueOnce(new Error('ClickHouse is down'));
-      await expect(t.worker.onApplicationBootstrap()).rejects.toThrow('ClickHouse is down');
-      expect(t.unl.registerPublishers).not.toHaveBeenCalled();
-      expect(t.unl.start).not.toHaveBeenCalled();
-      expect(t.compute.start).not.toHaveBeenCalled();
-    });
-
     it('stops the compute loop with the others on module destroy and on the shutdown signal', async () => {
       const t = setup();
       await t.worker.onApplicationBootstrap();
@@ -579,6 +594,31 @@ describe('ValidatorsWorker', () => {
       expect(t.compute.stop).toHaveBeenCalledTimes(1);
       await (t.signals.register.mock.calls[0][1] as () => Promise<void>)();
       expect(t.compute.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it('tells the seeding to stop at a stop, and waits for it', async () => {
+      let signal: AbortSignal | undefined;
+      let finish!: () => void;
+      const t = setup();
+      seed.mockImplementation(
+        (_ch, options) =>
+          new Promise<boolean>((resolve) => {
+            signal = options?.signal;
+            finish = () => resolve(false);
+          }),
+      );
+      await t.worker.onApplicationBootstrap();
+      expect(signal?.aborted).toBe(false);
+      let stopped = false;
+      const stopping = t.worker.stop().then(() => (stopped = true));
+      await Promise.resolve();
+      expect(signal?.aborted).toBe(true);
+      expect(stopped).toBe(false);
+      finish();
+      await stopping;
+      expect(stopped).toBe(true);
+      // a seeding that was stopped is not a failure to report
+      expect(t.logger.warn).not.toHaveBeenCalled();
     });
 
     it('stops waiting for a compute loop that does not stop after 2 s, like for any loop', async () => {

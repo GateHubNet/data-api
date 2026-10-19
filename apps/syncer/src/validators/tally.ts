@@ -42,8 +42,13 @@ export interface TallyResult {
   tallies: AmendmentTalliesRow[];
   /** The validations a ledger needs to be fully validated with this UNL and negative UNL. */
   quorum: number;
-  /** The UNL members with a full validation of the hash of V. */
+  /** The UNL members with a full validation of the hash of V (the stored `observed`). */
   observed: number;
+  /**
+   * The same members less those on the negative UNL: what a ledger is validated with, since rippled discounts the validations of
+   * the negative UNL. It is what is compared with `quorum`; `observed` is stored as it is.
+   */
+  counted: number;
 }
 
 const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -84,7 +89,8 @@ function rowOf(
  * The `amendment_tallies` set of a round (spec 2.4 steps 4 and 5, F7): of each UNL member the vote record (`recordOf`: the
  * newest full validation of a round it was on the UNL of and off the negative UNL of, no older than 24 h), `trusted` the members
  * with a record, `yes` of an amendment the records that name it, `threshold` that of `trusted`, `observed` the members with a
- * full validation of this round, `quorum` what a ledger needs to be fully validated. One row per amendment that has a yes or is in
+ * full validation of this round, `quorum` what a ledger needs to be fully validated and `counted` the observed members that
+ * count towards it (not on the negative UNL). One row per amendment that has a yes or is in
  * a majority, in the order of the IDs, and the sentinel (`amendment_id ''`: the UNL, the negative UNL and the fees) last.
  * The input is not changed.
  */
@@ -112,6 +118,7 @@ export function tallyRound(i: TallyInput): TallyResult {
   const observers = new Set<string>();
   for (const row of i.votes)
     if (row.full === 1 && i.unl.has(row.validation_public_key)) observers.add(row.validation_public_key);
+  const counted = [...observers].filter((key) => !i.negativeUnl.has(key)).length;
 
   const counts = { trusted, threshold: amendmentThreshold(trusted), unlSize: i.unl.size, observed: observers.size };
   const ids = [...new Set([...yes.keys(), ...i.majorities])].sort(byText);
@@ -119,7 +126,7 @@ export function tallyRound(i: TallyInput): TallyResult {
   tallies.push(
     rowOf(i, '', 0, counts, { unl: sortedKeys(i.unl), negativeUnl: sortedKeys(i.negativeUnl), fees: i.fees }),
   );
-  return { tallies, quorum: roundQuorum(i.unl, i.negativeUnl), observed: counts.observed };
+  return { tallies, quorum: roundQuorum(i.unl, i.negativeUnl), observed: counts.observed, counted };
 }
 
 /**

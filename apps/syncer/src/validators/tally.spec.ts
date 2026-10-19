@@ -384,6 +384,21 @@ describe('tallyRound', () => {
       expect(tallies[tallies.length - 1]).toMatchObject({ observed: 2, unl_size: 6, trusted: 3 });
     });
 
+    it('counts for the quorum the observed members that are not on the negative UNL, and stores all of them as observed', () => {
+      const unl = new Set(names(5));
+      const [u0, u1, u2, u3] = names(5);
+      const { tallies, observed, counted } = tallyRound(
+        input({
+          unl,
+          negativeUnl: new Set([u2, 'nHoutside']),
+          votes: [vote(u0), vote(u1), vote(u2), vote(u3, { full: 0 })],
+        }),
+      );
+      expect(observed).toBe(3);
+      expect(counted).toBe(2);
+      expect(tallies[tallies.length - 1].observed).toBe(3);
+    });
+
     it('gives the quorum of the UNL and of the members of the negative UNL that are on it', () => {
       const unl = new Set(names(10));
       const [, , , , , , , , u8, u9] = names(10);

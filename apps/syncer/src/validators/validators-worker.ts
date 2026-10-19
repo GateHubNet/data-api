@@ -2,6 +2,7 @@ import { ClickHouseService, ShutdownSignals } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { SyncerConfig } from '../config/syncer.config';
 import { ComputeLoop } from './compute-loop';
+import { describeError } from './describe-error';
 import { DomainChecker } from './domain-checker';
 import { NetworkStatePoller } from './network-state-poller';
 import { seedValidatorSeen } from './seen-seed';
@@ -89,9 +90,9 @@ class PassLoop implements Loop {
  *   metadata, at start and then every 10 min (spec 2.3). The two polls are timers of their own, so a slow node holds up
  *   neither; each never overlaps itself.
  * - the **compute loop** (`ComputeLoop`): once a minute the jobs that derive the votes and tallies of the amendment voting rounds
- *   from what is stored (`RoundsJob`, spec 2.4). First of all at boot, before any loop starts, the worker fills `validator_seen`
- *   from `validations` when it is empty (`seedValidatorSeen`, spec 1.5); like the rows of the publishers this is written at
- *   boot, so a ClickHouse that cannot be written fails the boot.
+ *   from what is stored (`RoundsJob`, spec 2.4). Alongside it, in the background, the worker fills `validator_seen` from
+ *   `validations` when that was not done (`seedValidatorSeen`, spec 1.5): it neither delays nor fails the boot, a failure is
+ *   logged (its message) and left for the next start, and a stop ends it between two partitions.
  *
  * It is a worker of its own, and not steps of the aggregator, because it needs outbound HTTPS to third-party sites and the
  * node, because its cadences and failure modes are its own, and because the aggregator's 30 s tick is not its to share (spec
@@ -107,6 +108,8 @@ export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy
   /** The loops that were started, in the order they were. */
   private readonly loops: Loop[] = [];
   private stopping?: Promise<void>;
+  /** Aborted by a stop: the seeding starts no further partition. */
+  private readonly seedAbort = new AbortController();
 
   constructor(
     @Inject(UnlFetcher) private readonly unl: UnlFetcher,
@@ -124,10 +127,6 @@ export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy
 
   async onApplicationBootstrap(): Promise<void> {
     this.shutdownSignals?.register('validators', () => this.stop());
-    // first, so that a ClickHouse that cannot be written fails the boot before any loop has started
-    if (this.start.compute !== false && (await seedValidatorSeen(this.ch))) {
-      this.logger.log('validator_seen was empty: seeded it from validations');
-    }
     if (this.start.unl !== false) {
       await this.unl.registerPublishers();
       this.unl.start();
@@ -168,8 +167,27 @@ export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy
       this.loops.push(stateLoop, featureLoop);
     }
     if (this.start.compute !== false) {
+      const seeding = this.seed();
       this.compute.start();
-      this.loops.push(this.compute);
+      this.loops.push(this.compute, {
+        stop: async () => {
+          this.seedAbort.abort();
+          await seeding;
+        },
+      });
+    }
+  }
+
+  /** The seeding of `validator_seen`, in the background. It never rejects: a failure is logged and left for the next start. */
+  private async seed(): Promise<void> {
+    try {
+      if (await seedValidatorSeen(this.ch, { signal: this.seedAbort.signal })) {
+        this.logger.log('validator_seen was seeded from validations');
+      }
+    } catch (err) {
+      if (!this.seedAbort.signal.aborted) {
+        this.logger.warn(`Seeding validator_seen failed: ${describeError(err)}; it is tried again at the next start`);
+      }
     }
   }
 

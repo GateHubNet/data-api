@@ -469,9 +469,15 @@ every tick goes first and none takes the tick from the ones after it. A job that
 skipped with a warning; a stop aborts the signal of the tick, so that nothing more is written or started, and waits for it at most 2 s.
 `start.compute` switches the loop (and the seeding below) off in a test.
 
-Before any loop starts, the worker fills `validator_seen` from `validations` when the table has no row (`seedValidatorSeen`,
-`seen-seed.ts`): one row per validator key with its first and last time of receipt and its newest ledger. It is written at boot, like
-the rows of the publishers, so a ClickHouse that cannot be written fails the boot; a table that has rows is left alone.
+Alongside the compute loop, in the background, the worker fills `validator_seen` from `validations` when that was not done
+(`seedValidatorSeen`, `seen-seed.ts`): one row per validator key with its first and last time of receipt and its newest ledger. It is
+needed when the table has no row, or when its oldest `first_seen` is more than an hour newer than the oldest validation of the oldest
+partition of `validations` (the collector wrote its first rows before the seeding did). It does one `INSERT ... SELECT` per partition
+of `validations`, **newest first**, so that each statement fits the request timeout of ClickHouse and an interrupted seeding (a failure,
+a shutdown between two partitions) shows at the next start: the oldest partition is the last one done, until then the oldest
+`first_seen` is still newer than the oldest validation and the seeding is made again (`min` and `max` are idempotent). It neither
+delays nor fails the boot: a failure is logged (`Seeding validator_seen failed: <message>; it is tried again at the next start`)
+and left for the next start.
 
 `RoundsJob` (`rounds.job.ts`) writes, for each voting ledger V (index % 256 = 255), `validator_votes` (each validator's vote) and
 `amendment_tallies` (the tally of each amendment):
@@ -481,7 +487,16 @@ the rows of the publishers, so a ClickHouse that cannot be written fails the boo
   voting ledger at or after the higher of the lowest ledger (above 0) that the oldest active partition of `validations` (`system.parts`)
   holds a validation of, and the lowest ledger of `ledgers`; then always the newest stored round (its newest sentinel) + 256, so a
   restart goes on where the last run ended. A voting ledger `ledgers` lacks gets only a sentinel: `observed 0`, `trusted 0`,
-  `threshold 1`, the size of the UNL, the close time of the first committed ledger above it, and no vote.
+  `threshold 1`, the size of the UNL, the close time of the first committed ledger above it, and no vote. The first round is looked
+  for with the ingest first: without a ledger the partitions of `validations` are not read.
+- **A voting ledger that arrives late.** A range ingest can fill `ledgers` below the checkpoint of the live ingest, after the rounds
+  of the gap were sealed as missing. After the forward rounds of a run, inside its deadline, the job redoes such a round, oldest first,
+  as a new version with its hash and its votes. A candidate is a round whose newest sentinel has `observed 0` and `trusted 0` and a close
+  time that is not the one of its own ledger now in `ledgers` (a round that was real with nobody observed has the close time of its
+  ledger and is never redone), past the 120 s delay, while that ledger is inside the 90 days `validations` keeps. Every stored round
+  whose close time is within 24 h after the late one is redone too, because its records may be carried from it: those first, oldest
+  first, each with the late round in its history, then the late round last, so that a run that is cut short leaves the late round a
+  candidate and the whole is done again. A follower whose own ledger is still missing is left as it is.
 - **Votes.** The hash H of V from `ledgers`; the validations of H, one row per validator, keys mapped to master keys through the
   manifest map (a validation recorded under a signing key counts for its master), with the values of the earliest sighting
   (`argMin(…, first_datetime)`: `full`, the amendments, the fee votes, the server version). A validation of another hash at V is
@@ -491,7 +506,8 @@ the rows of the publishers, so a ClickHouse that cannot be written fails the boo
   `GH_UNL_THRESHOLD`; nUNL(V) is the negative UNL of the newest `network_state` row at or before V (none: empty).
 - **Records and tallies** (`tallyRound`, `tally.ts`, F7). The vote record of a UNL member is its newest full validation from a round
   it was on the UNL of and off the negative UNL of, no more than 24 h before V. The history is the votes and sentinels of the stored
-  rounds of the last 24 h (the rows of the newest sentinel's version of each), plus V. `trusted` is the members with a record,
+  rounds of the last 24 h (the rows of the newest sentinel's version of each, their keys mapped through the manifest map like those
+  of the votes), plus V. `trusted` is the members with a record,
   `yes` of an amendment the records that name it, `threshold` is max(1, ⌊trusted × 80 / 100⌋), `observed` the members with a full
   validation of H, `unl_size` the size of UNL(V). One row per amendment with a yes or in the `Majorities` of the newest
   `network_state` row, in the order of the IDs, and then the sentinel (`amendment_id ''`) with the UNL, the negative UNL and the fees.
@@ -502,8 +518,10 @@ the rows of the publishers, so a ClickHouse that cannot be written fails the boo
   milliseconds, above any version the round has stored). A reader keeps the rows of the newest sentinel's version of a round, so a round
   that crashed half way is invisible until its sentinel is in, and is redone as a newer set; the job itself reads the history that way.
 - **Observability.** `syncer_validators_rounds_lag_ledgers` is the newest committed voting ledger minus the newest stored round, set
-  at the end of every run (also one that failed or ran out of time). A round whose `observed` is below the quorum of its UNL and
-  negative UNL is warned about: `round <V>: recorded <observed> of <unl size> UNL validations, below quorum <quorum>`.
+  at the end of every run (also one that failed or ran out of time). A round recorded with fewer validations than the quorum of its UNL
+  and negative UNL is warned about: `round <V>: recorded <n> of <unl size> UNL validations, below quorum <quorum>`. The warning
+  excludes the members of the negative UNL, whose validations rippled discounts, from `n`, so `n` can be below the stored `observed`,
+  which counts them.
 
 ## 9. What the syncer does not do
 
@@ -532,6 +550,7 @@ the rows of the publishers, so a ClickHouse that cannot be written fails the boo
 | `Network state poll failed: <request>: ...`, `Amendment features poll failed: ...` | The node cannot be asked, times out (5 s), answers an error, or answers with something that cannot be stored | No row is written for that poll; the next one (60 s, or 10 min for the features) is the retry. Logged when the failure starts or changes, and `... recovered` once when it ends; counted in `syncer_validators_node_polls_total{outcome="error"}`. |
 | `Compute job <name> failed: ...` | A job of the compute loop threw (ClickHouse refusing a query or an insert, mostly) | Counted in `syncer_validators_jobs_total{outcome="error"}`; the other jobs of the tick still ran. The job runs again at the next tick from the newest stored round, and a round that was half written is redone as a newer set. |
 | `round <V>: recorded N of M UNL validations, below quorum Q` | The collector missed validations of the round (it was down or behind), the ingest lacks the voting ledger, or the UNL validators did not validate it | The round is recorded as it is, with `observed N`; the votes of the validators that were missed are carried from their last record (24 h). |
+| `Seeding validator_seen failed: <message>; it is tried again at the next start` | ClickHouse refused a statement of the one-off seeding of `validator_seen` | The worker is booted and the compute loop runs. The partitions done stay; the next start seeds again until the oldest partition of `validations` is covered. |
 | `Skipping a compute tick: ...`, `Abandoning the compute tick in flight: ...` | A tick took longer than a minute, or did not end within 2 s of the shutdown | The tick was skipped, or was left to finish by itself (it was told to write nothing more). |
 | `amendment <ID> has no metadata entry` | The node, the ledger or the votes name an amendment that the amendment metadata lacks | Warned once per ID; `syncer_amendments_without_metadata` counts them. Add the entry (`amendments:check` lists them). |
 

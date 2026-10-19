@@ -23,7 +23,7 @@ export interface ValidatorsWorkerOptions {
   nodeRequestTimeoutMs?: number;
   /**
    * Which loops the worker starts, each on by default. A test switches off the ones it does not exercise. `compute` is the
-   * compute loop with the seeding of `validator_seen` before it.
+   * compute loop, with the seeding of `validator_seen` that runs in the background beside it.
    */
   start?: { unl?: boolean; domains?: boolean; state?: boolean; compute?: boolean };
 }
