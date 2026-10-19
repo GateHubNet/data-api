@@ -171,19 +171,19 @@ const SHAPES: Record<Table, Shape> = {
     engine: 'ReplacingMergeTree',
     version: 'version',
     partition: 'toYear(day)',
-    order: 'account, day, currency, counterparty, change_type, owes',
+    order: 'account, day, currency, counterparty, change_type, owes, version',
   },
   [Table.AccountTxDaily]: {
     engine: 'ReplacingMergeTree',
     version: 'version',
     partition: 'toYear(day)',
-    order: 'account, day, tx_type, result',
+    order: 'account, day, tx_type, result, version',
   },
   [Table.AccountTradesDaily]: {
     engine: 'ReplacingMergeTree',
     version: 'version',
     partition: 'toYear(day)',
-    order: 'account, day, base_currency, base_issuer, counter_currency, counter_issuer',
+    order: 'account, day, base_currency, base_issuer, counter_currency, counter_issuer, version',
   },
   [Table.IngestLog]: {
     engine: 'ReplacingMergeTree',

@@ -7,6 +7,7 @@ import {
   DayGroupFamily,
   LedgerRangeOf,
   rawDayGroupsSql,
+  UTC_DAY_MS,
   utcDayStart,
 } from '../query/account-day-groups';
 import { AggregateSetOptions, nextSetVersion, throwIfSetAborted } from './aggregate-sets';
@@ -18,12 +19,13 @@ import { AggregateSetOptions, nextSetVersion, throwIfSetAborted } from './aggreg
  *
  * A rollup of some accounts and days is a **set**: the rows of the three tables, then a sentinel for each (account, day)
  * in `account_rollup_days`, all under one version. A reader takes the rows of the version of each day's newest sentinel
- * (`AccountDayGroups`), so a set whose sentinel is not written yet (or was never) is not read, and a rewritten day is
- * read from its newest set only. `account_rollup_state` says which days of an account its rollups cover (`rollupCoverage`).
+ * (`AccountDayGroups`), so a set whose sentinel is not written yet (or never was: an abort, an error) is not read, and a
+ * rewritten day is read from its newest set only. That holds because the row tables have `version` in their sorting key
+ * (migration 003): a merge only collapses a row that was written twice, so the rows of the set a sentinel points to stay
+ * where they are while a newer set is written beside them, and are not replaced by it. The old sets stay in the tables,
+ * unread. `account_rollup_state` says which days of an account its rollups cover (`rollupCoverage`).
  * Which accounts and days are due, and when, is the runner's.
  */
-
-const DAY_MS = 86_400_000;
 
 /** What `account_rollup_state` holds for a heavy account, the newest row of it (`rollupStates`). */
 export interface RollupState {
@@ -100,6 +102,9 @@ export async function writeRollupStates(
 
 const FAMILIES: readonly DayGroupFamily[] = ['lines', 'txs', 'trades'];
 
+/** The rows of the accounts and days of a `writeAccountRollups` call, in any of the rollup tables (all key on both). */
+const OF_THESE_DAYS = 'account IN {dg_accounts:Array(String)} AND day BETWEEN {from:Date} AND {through:Date}';
+
 /**
  * Rolls up the days `fromDay` to `throughDay` (`YYYY-MM-DD`, both included) of the accounts, as one set under one version:
  *  1. per table, a server-side `INSERT ... SELECT` of the raw day groups of all the accounts (`rawDayGroupsSql` for
@@ -108,11 +113,13 @@ const FAMILIES: readonly DayGroupFamily[] = ['lines', 'txs', 'trades'];
  *  2. then the sentinels, in one insert: an (account, day) that has rows of this version, or that had a sentinel before. A
  *     day that lost its rows is a sentinel with none, which is what hides the rows of its older set.
  *
- * The version is the next one of the sentinels of these accounts and days: the rows carry it, and the rows of an earlier
- * attempt that never got its sentinel are of another version and not read. A range of days with no ledger has no rows
- * (the sentinels of its earlier sets are still replaced). An aborted `signal` throws `AggregateSetAborted` before the
- * work and before each insert; what an abort leaves is rows without a sentinel, which nobody reads. Returns how many rows
- * the three tables got (sentinels are not counted).
+ * The version is the next one over all four tables of the rollups for these accounts and days (`nextSetVersion` of each,
+ * the largest): the clock in milliseconds, but past the newest version any of them holds. So a set never gets the
+ * version of an attempt that failed after it wrote rows (its sentinel was never written, and its rows would otherwise
+ * mix with the new ones), even when the clock of the server has stepped back. The rows of such an attempt are not read: no
+ * sentinel names their version. A range of days with no ledger has no rows (the sentinels of its earlier sets are still
+ * replaced). An aborted `signal` throws `AggregateSetAborted` before the work and before each insert; what an abort leaves
+ * is rows without a sentinel, which nobody reads. Returns how many rows the three tables got (sentinels are not counted).
  */
 export async function writeAccountRollups(
   ch: ClickHouseService,
@@ -129,13 +136,14 @@ export async function writeAccountRollups(
   const wanted = [...new Set(accounts)].sort();
   if (wanted.length === 0 || from > through) return 0;
 
-  const range = await ranges(new Date(from), new Date(through + DAY_MS));
+  const range = await ranges(new Date(from), new Date(through + UTC_DAY_MS));
   const days = { dg_accounts: wanted, from: fromDay, through: throughDay };
-  const version = await nextSetVersion(
-    ch,
-    Table.AccountRollupDays,
-    'account IN {dg_accounts:Array(String)} AND day BETWEEN {from:Date} AND {through:Date}',
-    days,
+  const version = Math.max(
+    ...(await Promise.all(
+      [Table.AccountRollupDays, ...FAMILIES.map((family) => DAY_GROUP_TABLES[family])].map((table) =>
+        nextSetVersion(ch, table, OF_THESE_DAYS, days),
+      ),
+    )),
   );
 
   let written = 0;
@@ -155,7 +163,7 @@ export async function writeAccountRollups(
     const [counted] = await ch.query<{ n: number | string }>(
       `SELECT ${FAMILIES.map(
         (family) =>
-          `(SELECT count() FROM ${DAY_GROUP_TABLES[family]} WHERE account IN {dg_accounts:Array(String)} AND day BETWEEN {from:Date} AND {through:Date} AND version = {version:UInt64})`,
+          `(SELECT count() FROM ${DAY_GROUP_TABLES[family]} WHERE ${OF_THESE_DAYS} AND version = {version:UInt64})`,
       ).join(' + ')} AS n`,
       { ...days, version },
     );
@@ -170,9 +178,9 @@ export async function writeAccountRollups(
        FROM (${[
          ...FAMILIES.map(
            (family) =>
-             `SELECT account, day FROM ${DAY_GROUP_TABLES[family]} WHERE account IN {dg_accounts:Array(String)} AND day BETWEEN {from:Date} AND {through:Date} AND version = {version:UInt64}`,
+             `SELECT account, day FROM ${DAY_GROUP_TABLES[family]} WHERE ${OF_THESE_DAYS} AND version = {version:UInt64}`,
          ),
-         `SELECT account, day FROM ${Table.AccountRollupDays} WHERE account IN {dg_accounts:Array(String)} AND day BETWEEN {from:Date} AND {through:Date}`,
+         `SELECT account, day FROM ${Table.AccountRollupDays} WHERE ${OF_THESE_DAYS}`,
        ].join(' UNION DISTINCT ')})`,
     { ...days, version },
   );

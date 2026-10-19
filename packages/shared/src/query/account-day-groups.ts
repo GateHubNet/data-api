@@ -72,7 +72,7 @@ export const DAY_GROUP_COLUMNS: Record<DayGroupFamily, readonly string[]> = {
   ],
 };
 
-/** The table of a family's rollup, and the columns that make a group (the table's key after `account`). */
+/** The table of a family's rollup. */
 export const DAY_GROUP_TABLES: Record<DayGroupFamily, Table> = {
   lines: Table.AccountLinesDaily,
   txs: Table.AccountTxDaily,
@@ -259,7 +259,8 @@ export interface DayGroupsSource {
   sources: Array<'raw' | 'rollup'>;
 }
 
-const DAY_MS = 86_400_000;
+/** The length of a UTC day in ms. */
+export const UTC_DAY_MS = 86_400_000;
 
 /** The unix ms of the start of a UTC day (`YYYY-MM-DD`); anything else is a `RangeError`. */
 export function utcDayStart(day: string): number {
@@ -306,10 +307,10 @@ export class AccountDayGroups {
     const rawDays: Array<[number, number]> = [];
     if (rolled === undefined) rawDays.push([from, through]);
     else {
-      if (from < rolled[0]) rawDays.push([from, rolled[0] - DAY_MS]);
-      if (rolled[1] < through) rawDays.push([rolled[1] + DAY_MS, through]);
+      if (from < rolled[0]) rawDays.push([from, rolled[0] - UTC_DAY_MS]);
+      if (rolled[1] < through) rawDays.push([rolled[1] + UTC_DAY_MS, through]);
     }
-    const found = await Promise.all(rawDays.map(([lo, hi]) => this.ranges(new Date(lo), new Date(hi + DAY_MS))));
+    const found = await Promise.all(rawDays.map(([lo, hi]) => this.ranges(new Date(lo), new Date(hi + UTC_DAY_MS))));
     const raw = found.filter((range): range is LedgerRange => range !== null);
 
     const params: Record<string, unknown> = { dg_account: account };

@@ -10,6 +10,11 @@
 --    with the empty pair and source book), markets_live (a period and filter, with the empty pair),
 --    account_partition_rows (a partition, with account = '') and account_rollup_days (an account and day, where the
 --    sentinel is the whole row, written last).
+--  * The row tables of the account rollups (account_lines_daily, account_tx_daily, account_trades_daily) have version as
+--    the last column of their ORDER BY. A merge keeps the newest version of each sorting key, so with a key that did not
+--    have it, the rows of a newer set that is still being written (its sentinel is not in account_rollup_days yet, and
+--    may never be) would replace the same groups of the set the sentinel points to, and those groups would be gone for
+--    a reader. With version in the key every set keeps its own rows; a merge only collapses a row that was written twice.
 --  * pair_hourly expires 45 days after its hour. ttl_only_drop_parts drops a part only when every row of it has
 --    expired (a part holds one day) and never rewrites a part to cut rows out of it.
 --  * Amounts are exact decimal Strings with a Float64 shadow (_f) where SQL ranks or falls back. The sentinel's
@@ -189,7 +194,7 @@ CREATE TABLE IF NOT EXISTS account_lines_daily
 )
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYear(day)
-ORDER BY (account, day, currency, counterparty, change_type, owes);
+ORDER BY (account, day, currency, counterparty, change_type, owes, version);
 
 -- From account_transactions: the transactions the account sent (is_initiator = 1).
 CREATE TABLE IF NOT EXISTS account_tx_daily
@@ -203,7 +208,7 @@ CREATE TABLE IF NOT EXISTS account_tx_daily
 )
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYear(day)
-ORDER BY (account, day, tx_type, result);
+ORDER BY (account, day, tx_type, result, version);
 
 -- From account_exchanges. bought_sum is the base where the account is the buyer, sold_sum where it is the seller (a
 -- self-trade is in both), and bought_counter_sum and sold_counter_sum are the counter of those same trades. Each of
@@ -234,4 +239,4 @@ CREATE TABLE IF NOT EXISTS account_trades_daily
 )
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYear(day)
-ORDER BY (account, day, base_currency, base_issuer, counter_currency, counter_issuer);
+ORDER BY (account, day, base_currency, base_issuer, counter_currency, counter_issuer, version);

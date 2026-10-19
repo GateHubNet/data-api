@@ -204,11 +204,13 @@ function edgeRows(): { rows: Rows; twice: Rows } {
   const fee1 = bc(EDGE, a0, 1, -1, 'XRP', '', '-0.0000152587890625', '99.9999847412109375', 'transaction_cost');
   const rows: Rows = {
     bc: [
-      // the line crosses zero within the day: 10, -5, 2, -1 after its changes, so the same type is on both sides of it
+      // the line crosses zero within the day: 10, -5, 2, 1, -2 after its changes, so a payment_source is on both sides of
+      // zero (two groups, owes 0 and 1) and the end balance, -2, is the same on every group of the line
       usd1,
       bc(EDGE, a0, 1, 1, 'USD', ISSUER_B, '-15', '-5', 'payment_source'),
       bc(EDGE, a0, 2, 0, 'USD', ISSUER_B, '7', '2', 'payment_destination'),
-      bc(EDGE, a1, 0, 0, 'USD', ISSUER_B, '-3', '-1', 'payment_source'),
+      bc(EDGE, a0, 3, 0, 'USD', ISSUER_B, '-1', '1', 'payment_source'),
+      bc(EDGE, a1, 0, 0, 'USD', ISSUER_B, '-3', '-2', 'payment_source'),
       // fee rows have node_index -1: the payment of the same transaction comes after its fee
       fee1,
       bc(EDGE, a0, 2, -1, 'XRP', '', '-0.0000152587890625', '99.999969482421875', 'transaction_cost'),
@@ -703,9 +705,10 @@ describe('account day groups and the rollup writer (e2e)', () => {
         // a change type of '' and a change of 0 (counted, in neither sum)
         group(BIG_DAY, 'EUR', ISSUER_C, '', 0, 1, '5', '0', '5'),
         group(BIG_DAY, 'EUR', ISSUER_C, 'payment_source', 0, 1, '0', '0', '5'),
-        // the line crosses zero: the same type is two groups, and the end balance is the last change's
-        group(BIG_DAY, 'USD', ISSUER_B, 'payment_destination', 0, 2, '17', '0', '-1'),
-        group(BIG_DAY, 'USD', ISSUER_B, 'payment_source', 1, 2, '0', '18', '-1'),
+        // the line crosses zero: payment_source is two groups, and the end balance is the last change's on all three
+        group(BIG_DAY, 'USD', ISSUER_B, 'payment_destination', 0, 2, '17', '0', '-2'),
+        group(BIG_DAY, 'USD', ISSUER_B, 'payment_source', 0, 1, '0', '1', '-2'),
+        group(BIG_DAY, 'USD', ISSUER_B, 'payment_source', 1, 2, '0', '18', '-2'),
         group(SECOND_DAY, 'USD', ISSUER_B, 'payment_destination', 0, 1, '1', '0', '3'),
       ];
       const sortKey = (g: Group): string => [g.day, g.currency, g.counterparty, g.change_type, g.owes].join('\u0000');
@@ -923,22 +926,26 @@ describe('account day groups and the rollup writer (e2e)', () => {
 
     it('rolled-up groups equal raw groups: complete, partial before, partial after', async () => {
       const rangeOf = rangesOf(ch);
-      // four accounts, four coverages of the window: all of it; only from the middle of it (the days before are raw); only
-      // up to the middle (the days after are raw); the middle only (raw on both sides)
+      // five accounts, five coverages of the window: all of it; only from the middle of it (the days before are raw); only
+      // up to the middle (the days after are raw); the middle only (raw on both sides); and all of it for the edge account,
+      // whose lines cross zero within a day, so that every group of its rollup is pinned, end_balance included
+      const rolled = [...HEAVY, EDGE];
       const coverages: RollupCoverage[] = [
         { from: WINDOW[0], through: WINDOW[1] },
         { from: BIG_DAY, through: WINDOW[1] },
         { from: WINDOW[0], through: SECOND_DAY },
         { from: BIG_DAY, through: SECOND_DAY },
+        { from: WINDOW[0], through: WINDOW[1] },
       ];
-      const expectedSources = [['rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['raw', 'rollup']];
+      const expectedSources = [['rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['rollup']];
+      const rowCounts = [...heavy.map((h) => h.bc.length), edge.rows.bc.length];
       const states: RollupState[] = [];
-      for (const [i, account] of HEAVY.entries()) {
+      for (const [i, account] of rolled.entries()) {
         const written = await writeAccountRollups(ch, rangeOf, [account], coverages[i].from, coverages[i].through);
-        expect(written).toBeGreaterThan(40);
+        expect(written).toBeGreaterThan(i < HEAVY.length ? 40 : 10);
         states.push({
           account,
-          rows: heavy[i].bc.length,
+          rows: rowCounts[i],
           firstDay: DAYS[0],
           rolledFrom: coverages[i].from,
           rolledThrough: coverages[i].through,
@@ -960,24 +967,24 @@ describe('account day groups and the rollup writer (e2e)', () => {
       ];
       let rolledGroups = 0;
       let touchedBoth = 0;
-      for (const [i, account] of HEAVY.entries()) {
+      for (const [i, account] of rolled.entries()) {
         // the coverage comes from the state rows, as the API reads it
         expect(await rollupCoverage(ch, account)).toEqual(coverages[i]);
         for (const family of ['lines', 'txs', 'trades'] as const) {
           for (const window of windows) {
             const withRollups = await new AccountDayGroups(ch, rangeOf).source(family, account, window[0], window[1]);
             const rawOnly = await readGroups(ch, family, account, window);
-            const rolled = withRollups
+            const fromRollups = withRollups
               ? await ch.query<Group>(
                   `SELECT * FROM (${withRollups.sql}) ORDER BY ${ORDER_BY(family)}`,
                   withRollups.params,
                 )
               : [];
             // the very same groups, as JSON
-            expect(JSON.stringify(rolled)).toBe(
+            expect(JSON.stringify(fromRollups)).toBe(
               JSON.stringify(rawOnly.rows.map(({ account: _account, ...group }) => group)),
             );
-            if (withRollups?.sources.includes('rollup')) rolledGroups += rolled.length;
+            if (withRollups?.sources.includes('rollup')) rolledGroups += fromRollups.length;
             if (withRollups?.sources.length === 2) touchedBoth++;
             if (window === WINDOW) expect(withRollups?.sources).toEqual(expectedSources[i]);
           }
@@ -985,6 +992,17 @@ describe('account day groups and the rollup writer (e2e)', () => {
       }
       expect(rolledGroups).toBeGreaterThan(1000);
       expect(touchedBoth).toBeGreaterThan(20);
+
+      // the edge account's rollup alone: the line that crosses zero is one end balance over its three groups of the day
+      const edgeLines = await readGroups(ch, 'lines', EDGE, WINDOW, coverages[4]);
+      expect(edgeLines.source?.sources).toEqual(['rollup']);
+      expectGroups('lines', edgeLines.rows, linesOracle(edge.rows.bc), 'edge from its rollup');
+      const usd = edgeLines.rows.filter((g) => g.day === BIG_DAY && g.currency === 'USD').map(normalized);
+      expect(usd.map((g) => [g.change_type, g.owes, g.end_balance])).toEqual([
+        ['payment_destination', 0, '-2'],
+        ['payment_source', 0, '-2'],
+        ['payment_source', 1, '-2'],
+      ]);
     });
 
     it('rolled-up groups equal raw groups of the real accounts of the mock ledgers too (the floats to 12 digits)', async () => {
@@ -1176,7 +1194,7 @@ describe('account day groups and the rollup writer (e2e)', () => {
       const second = versions[versions.length - 1];
       expect(second).toBeGreaterThan(first);
 
-      // the old rows are all still there: the old EUR group has no newer row to replace it
+      // the old rows are all still there: a newer set does not replace the rows of an older one (version is in the key)
       const physical = await ch.query<{ currency: string; version: string }>(
         `SELECT currency, toUInt64(version) AS version FROM ${Table.AccountLinesDaily}
           WHERE account = {a:String} AND day = {d:Date} ORDER BY version, currency, change_type`,
@@ -1203,24 +1221,81 @@ describe('account day groups and the rollup writer (e2e)', () => {
         `INSERT INTO ${Table.AccountLinesDaily} SELECT * FROM ${Table.AccountLinesDaily} WHERE account = {a:String} AND version = {v:UInt64}`,
         { a: R, v: second },
       );
-      // a set that is being written, newer than the sentinel of its day, is not read
-      await ch.command(
-        `INSERT INTO ${Table.AccountLinesDaily}
-         SELECT account, day, currency, counterparty, change_type, owes, 999, in_sum, out_sum, unfit, in_sum_f, out_sum_f, end_balance, version + 1000
-           FROM ${Table.AccountLinesDaily} WHERE account = {a:String} AND version = {v:UInt64}`,
-        { a: R, v: second },
-      );
       const duplicates = await ch.query<{ n: string }>(
         `SELECT count() AS n FROM ${Table.AccountLinesDaily} WHERE account = {a:String} AND day = {d:Date} AND version = {v:UInt64}`,
         { a: R, d: TINY[0], v: second },
       );
       expect(Number(duplicates[0].n)).toBe(4); // two groups, each twice
-      const planted = await ch.query<{ n: string }>(
-        `SELECT count() AS n FROM ${Table.AccountLinesDaily} WHERE account = {a:String} AND count = 999`,
-        { a: R },
-      );
-      expect(Number(planted[0].n)).toBe(2);
       expect((await lines()).rows).toEqual(afterRewrite.rows);
+    });
+
+    it('a set that is being written, newer than the sentinel of its day, is not read and does not take the place of the rows the sentinel points to, whatever the merges do', async () => {
+      const ch = await freshService();
+      await seedTiny(ch);
+      const ranges = rangesOf(ch);
+      const window: [string, string] = [TINY[0], TINY[4]];
+      const rolledOnly = { from: TINY[0], through: TINY[4] };
+      const expectRolledEqualsRaw = async (): Promise<number> => {
+        let groups = 0;
+        for (const family of ['lines', 'txs', 'trades'] as const) {
+          for (const account of [R, R2]) {
+            const rolled = await readGroups(ch, family, account, window, rolledOnly);
+            expect(rolled.source?.sources).toEqual(['rollup']);
+            expect(rolled.rows).toEqual((await readGroups(ch, family, account, window)).rows);
+            groups += rolled.rows.length;
+          }
+        }
+        return groups;
+      };
+
+      await writeAccountRollups(ch, ranges, [R, R2], TINY[0], TINY[4]);
+      const [first] = await versionsIn(ch, Table.AccountLinesDaily);
+      expect(await expectRolledEqualsRaw()).toBeGreaterThan(8);
+
+      // a newer attempt wrote the rows of every group again (other counts), and failed before its sentinel: its version
+      // is the same for the three tables, and no sentinel names it
+      const attempt = first + 1000;
+      for (const table of DAILY) {
+        await ch.command(
+          `INSERT INTO ${table} SELECT * REPLACE (count + 999 AS count, ${attempt} AS version)
+             FROM (SELECT * FROM ${table} WHERE version = {v:UInt64})`,
+          { v: first },
+        );
+      }
+      expect(await expectRolledEqualsRaw()).toBeGreaterThan(8);
+
+      // a merge of all the parts of the tables keeps both sets, each group of each set: no group of the set the
+      // sentinels point to is replaced by the same group of the attempt
+      for (const table of DAILY) await ch.command(`OPTIMIZE TABLE ${table} FINAL`);
+      for (const table of DAILY) {
+        expect([table, await versionsIn(ch, table)]).toEqual([table, [first, attempt]]);
+        const [counts] = await ch.query<{ older: string; newer: string }>(
+          `SELECT countIf(version = {a:UInt64}) AS older, countIf(version = {b:UInt64}) AS newer FROM ${table}`,
+          { a: first, b: attempt },
+        );
+        expect([table, Number(counts.older)]).toEqual([table, Number(counts.newer)]);
+        expect(Number(counts.older)).toBeGreaterThan(0);
+      }
+      expect(await expectRolledEqualsRaw()).toBeGreaterThan(8);
+      const bogus = await ch.query<{ n: string }>(
+        `SELECT count() AS n FROM ${Table.AccountLinesDaily} WHERE count >= 999`,
+      );
+      expect(Number(bogus[0].n)).toBeGreaterThan(0);
+
+      // a retry never takes the version of a failed attempt, of any of the tables: a row far ahead of the clock in one
+      // table of the trades (a server clock that stepped back since) is still passed
+      const ahead = attempt + 10_000_000_000;
+      await ch.command(
+        `INSERT INTO ${Table.AccountTradesDaily} SELECT * REPLACE (${ahead} AS version)
+           FROM (SELECT * FROM ${Table.AccountTradesDaily} WHERE version = {v:UInt64} LIMIT 1)`,
+        { v: first },
+      );
+      await writeAccountRollups(ch, ranges, [R, R2], TINY[0], TINY[4]);
+      const newest = (await versionsIn(ch, Table.AccountLinesDaily)).slice(-1)[0];
+      expect(newest).toBeGreaterThan(ahead);
+      expect((await sentinels(ch)).map(([, , version]) => version)).toEqual([newest, newest, newest, newest, newest]);
+      for (const table of DAILY) await ch.command(`OPTIMIZE TABLE ${table} FINAL`);
+      expect(await expectRolledEqualsRaw()).toBeGreaterThan(8);
     });
 
     it('an aborted set writes nothing, and no account or an empty window is nothing to write', async () => {
