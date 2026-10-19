@@ -190,15 +190,32 @@ function nodeOf(answer: unknown): Json {
 function amendmentsAnswerOf(answer: unknown): AmendmentsAnswer {
   const node = nodeOf(answer);
   const { ledger_index: ledgerIndex, ledger_hash: ledgerHash } = answer as Json;
-  if (typeof ledgerIndex !== 'number') return invalid('the answer has no ledger_index');
+  // the ledger the other two objects are asked for: it has to be one the node can be asked for
+  if (!isUInt32(ledgerIndex) || ledgerIndex < 1)
+    return invalid('the answer has no ledger_index that is a ledger sequence');
   return { ledger_index: ledgerIndex, ledger_hash: typeof ledgerHash === 'string' ? ledgerHash : undefined, node };
 }
 
-/** The `validation_quorum` of a `server_info` result; none when the node does not report one. */
+/**
+ * The reader of the answer to a `ledger_entry` asked for ledger `at`: its `node`, provided the answer says it is of that
+ * ledger (a node that answers for another one would make a row of two ledgers).
+ */
+const nodeAt =
+  (at: number) =>
+  (answer: unknown): Json => {
+    const node = nodeOf(answer);
+    const answered = (answer as Json).ledger_index;
+    if (typeof answered !== 'number') return invalid('the answer has no ledger_index');
+    if (answered !== at) return invalid(`the answer is of ledger ${answered}, asked for ledger ${at}`);
+    return node;
+  };
+
+/** The `validation_quorum` of a `server_info` result; none when the node does not report one, a count when it does. */
 function quorumOf(answer: unknown): number | undefined {
   const info = isObject(answer) ? answer.info : undefined;
   if (!isObject(info)) return invalid('the answer has no info');
-  return isUInt32(info.validation_quorum) ? info.validation_quorum : undefined;
+  if (info.validation_quorum === undefined) return undefined;
+  return isUInt32(info.validation_quorum) ? info.validation_quorum : invalid('validation_quorum is not a count');
 }
 
 /**
@@ -206,8 +223,9 @@ function quorumOf(answer: unknown): number | undefined {
  * that have no entry in the amendment metadata.
  *
  * **State** (`pollState`, every 60 s): `ledger_entry` of the Amendments object at the `validated` ledger L, then, at L, the
- * NegativeUNL (`entryNotFound` is an empty one) and FeeSettings objects, and `server_info` for the quorum, together; one
- * `network_state` row. **Features** (`pollFeatures`, at start and every 10 min): `feature`, one `amendment_features` row per
+ * NegativeUNL (`entryNotFound` is an empty one) and FeeSettings objects, whose answers have to be of L, and `server_info`
+ * for the quorum, together; one `network_state` row. `server_info` takes no ledger: it is the node's current answer, read
+ * together with the state at L. **Features** (`pollFeatures`, at start and every 10 min): `feature`, one `amendment_features` row per
  * ID. Each request has a timeout of 5 s and no retry (the next poll is the retry), and is counted
  * (`syncer_validators_node_polls_total{request, outcome}`). A poll in which any request fails, or an answer cannot be
  * stored, writes nothing and resolves `false`; a ClickHouse that fails rejects. A poll called while one of its kind is
@@ -298,10 +316,14 @@ export class NetworkStatePoller {
       this.ask<Json | undefined>(
         'negative_unl',
         { command: 'ledger_entry', index: NEGATIVE_UNL_OBJECT_INDEX, ledger_index: at },
-        nodeOf,
+        nodeAt(at),
         { value: undefined },
       ),
-      this.ask('fee_settings', { command: 'ledger_entry', index: FEE_SETTINGS_OBJECT_INDEX, ledger_index: at }, nodeOf),
+      this.ask(
+        'fee_settings',
+        { command: 'ledger_entry', index: FEE_SETTINGS_OBJECT_INDEX, ledger_index: at },
+        nodeAt(at),
+      ),
       this.ask('server_info', { command: 'server_info' }, quorumOf),
     ]);
     if (!negativeUnl.ok || !feeSettings.ok || !quorum.ok) {

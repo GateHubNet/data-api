@@ -1440,14 +1440,29 @@ describe('the validators worker (e2e)', () => {
         expect(await polled(app, 'negative_unl', 'ok')).toBe(1);
       });
 
+      it('writes no row when the node answers for another ledger than the one asked for', async () => {
+        const app = await bootState({ network: 'xahau' });
+        stateNode.answers.ledger_entry = ledgerEntries({
+          [AMENDMENTS_OBJECT_INDEX]: recorded('xahau', 'amendments'),
+          [NEGATIVE_UNL_OBJECT_INDEX]: { ...recorded('xahau', 'negative_unl'), ledger_index: 26633716 },
+          [FEE_SETTINGS_OBJECT_INDEX]: recorded('xahau', 'fee_settings'),
+        });
+        expect(await app.state.pollState()).toBe(false);
+        expect(await stateRows()).toEqual([]);
+        expect(await polled(app, 'negative_unl', 'error')).toBe(1);
+        expect(await polled(app, 'fee_settings', 'ok')).toBe(1);
+        expect(warnings).toEqual([expect.stringMatching(/negative_unl.*26633716.*26633715/)]);
+      });
+
       it('writes a row for every poll, one per ledger answered', async () => {
         const app = await bootState();
         await app.state.pollState();
-        const next = { ...recorded('xrpl', 'amendments'), ledger_index: 107760800 };
+        // the next ledger: the objects are answered for it (the NegativeUNL as before: not there)
+        const at = (name: string) => ({ ...recorded('xrpl', name), ledger_index: 107760800 });
         stateNode.answers.ledger_entry = ledgerEntries({
-          [AMENDMENTS_OBJECT_INDEX]: next,
+          [AMENDMENTS_OBJECT_INDEX]: at('amendments'),
           [NEGATIVE_UNL_OBJECT_INDEX]: recorded('xrpl', 'negative_unl'),
-          [FEE_SETTINGS_OBJECT_INDEX]: recorded('xrpl', 'fee_settings'),
+          [FEE_SETTINGS_OBJECT_INDEX]: at('fee_settings'),
         });
         await app.state.pollState();
         expect((await stateRows()).map((r) => r.ledger_index)).toEqual([107760758, 107760800]);
@@ -1631,10 +1646,7 @@ describe('the validators worker (e2e)', () => {
             const [state, features] = await Promise.all([stateRows(), featureRows()]);
             return state.length > 0 && features.length > 0 && gaugeUpdates.mock.calls.length > 0;
           });
-          await waitFor(
-            'the gauge update to end',
-            async () => (await gaugeUpdates.mock.results[0]?.value) === undefined,
-          );
+          await gaugeUpdates.mock.results[0].value; // the update the loop started, to its end
           expect(await gauge(app)).toBe(0);
           expect((await stateRows())[0].ledger_index).toBe(107760758);
           expect(await featureRows()).toHaveLength(115);

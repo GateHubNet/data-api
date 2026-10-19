@@ -571,6 +571,107 @@ describe('NetworkStatePoller', () => {
       }
     });
 
+    describe('the ledger of the answers', () => {
+      /** The recorded answer for an object, said to be of another ledger. */
+      const of = (network: Network, name: string, ledger_index: unknown) => ({
+        ...recorded(network, name),
+        ledger_index,
+      });
+
+      it.each([
+        ['negative_unl', NEGATIVE_UNL_OBJECT_INDEX, 'negative_unl', 'fee_settings'],
+        ['fee_settings', FEE_SETTINGS_OBJECT_INDEX, 'fee_settings', 'negative_unl'],
+      ])(
+        'fails the poll, with a warning naming the request and both ledgers, when the answer for %s is of another ledger',
+        async (name, key, file, other) => {
+          // the Xahau NegativeUNL exists, so that it has a ledger of its own to be wrong about
+          const t = setup({
+            network: 'xahau',
+            node: recordedNode('xahau', { [key]: () => of('xahau', file, 26633716) }),
+          });
+          expect(await t.poller.pollState()).toBe(false);
+          expect(t.inserts).toEqual([]);
+          expect(counted(t, name)).toEqual(['error']);
+          expect(counted(t, other)).toEqual(['ok']);
+          expect(counted(t, 'amendments')).toEqual(['ok']);
+          expect(t.logger.warn).toHaveBeenCalledTimes(1);
+          const line = String(t.logger.warn.mock.calls[0][0]);
+          expect(line).toContain(name);
+          expect(line).toContain('26633716');
+          expect(line).toContain('26633715');
+        },
+      );
+
+      it('counts an answer without a ledger_index as an error too', async () => {
+        for (const [name, key, file] of [
+          ['negative_unl', NEGATIVE_UNL_OBJECT_INDEX, 'negative_unl'],
+          ['fee_settings', FEE_SETTINGS_OBJECT_INDEX, 'fee_settings'],
+        ] as const) {
+          const t = setup({
+            network: 'xahau',
+            node: recordedNode('xahau', { [key]: () => of('xahau', file, undefined) }),
+          });
+          expect(await t.poller.pollState()).toBe(false);
+          expect(t.inserts).toEqual([]);
+          expect(counted(t, name)).toEqual(['error']);
+        }
+      });
+
+      it('asks for the ledger it was given, whatever the node says validated is now', async () => {
+        const t = setup({ network: 'xahau' });
+        expect(await t.poller.pollState()).toBe(true);
+        expect(t.inserts[0].rows[0].ledger_index).toBe(26633715);
+      });
+    });
+
+    describe('the ledger of the Amendments answer', () => {
+      it.each([[0], [-1], [1.5], ['107760758'], [null], [4294967296]])(
+        'counts an answer whose ledger_index is %p as an error, and sends no follow-up',
+        async (ledger_index) => {
+          const t = setup({
+            node: recordedNode('xrpl', {
+              [AMENDMENTS_OBJECT_INDEX]: () => ({ ...recorded('xrpl', 'amendments'), ledger_index }),
+            }),
+          });
+          expect(await t.poller.pollState()).toBe(false);
+          expect(t.inserts).toEqual([]);
+          expect(t.node.requests).toHaveLength(1);
+          expect(counted(t, 'amendments')).toEqual(['error']);
+          expect(t.polls).toHaveLength(1);
+          expect(String(t.logger.warn.mock.calls[0][0])).toContain('ledger_index');
+        },
+      );
+    });
+
+    describe('the quorum', () => {
+      it.each([[-1], [1.5], ['28'], [null], [4294967296], [{}]])(
+        'fails the poll, with a warning naming the field, when validation_quorum is %p',
+        async (validation_quorum) => {
+          const t = setup({
+            node: recordedNode('xrpl', { server_info: () => ({ info: { validation_quorum } }) }),
+          });
+          expect(await t.poller.pollState()).toBe(false);
+          expect(t.inserts).toEqual([]);
+          expect(counted(t, 'server_info')).toEqual(['error']);
+          expect(t.logger.warn).toHaveBeenCalledTimes(1);
+          expect(String(t.logger.warn.mock.calls[0][0])).toContain('validation_quorum');
+        },
+      );
+
+      it('is 0 when the node reports none, and the count when it reports one, 0 included', async () => {
+        for (const [info, quorum] of [
+          [{}, 0],
+          [{ validation_quorum: 0 }, 0],
+          [{ validation_quorum: 28 }, 28],
+        ] as const) {
+          const t = setup({ node: recordedNode('xrpl', { server_info: () => ({ info }) }) });
+          expect(await t.poller.pollState()).toBe(true);
+          expect(t.inserts[0].rows[0].node_quorum).toBe(quorum);
+          expect(counted(t, 'server_info')).toEqual(['ok']);
+        }
+      });
+    });
+
     it('writes nothing, and says why, when the answers are complete but one is malformed', async () => {
       const t = setup({
         node: recordedNode('xrpl', {

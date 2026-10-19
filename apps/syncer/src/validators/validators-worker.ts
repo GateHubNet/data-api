@@ -144,7 +144,7 @@ export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy
         'Amendment features',
         async () => {
           await this.state.pollFeatures();
-          // also after a poll that failed: the gauge reads what is stored, which the state polls change too
+          // after a poll that resolved, written or not (a poll that rejects skips it): the gauge reads what is stored
           await this.state.updateMetadataGauge();
         },
         () => this.state.stop(),

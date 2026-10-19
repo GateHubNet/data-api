@@ -435,7 +435,9 @@ off in a test).
 
 - **Every 60 s, the state.** `ledger_entry` of the Amendments object (index `7DB0788C…`) at the `validated` ledger; its `ledger_index`
   *L* is the ledger the other two objects are read at, `ledger_entry` of NegativeUNL (`2E8A59AA…`) and FeeSettings (`4BC50C9B…`), together
-  with `server_info` for `validation_quorum` (0 when the node reports none). **One `network_state` row**: the enabled amendment IDs; the
+  with `server_info` for `validation_quorum` (0 when the node reports none, an error when it reports something that is not a count;
+  `server_info` takes no ledger, so it is the node's current answer, read together with the state at *L*). An answer for either object
+  that is not of *L* fails the poll. **One `network_state` row**: the enabled amendment IDs; the
   majorities (`Majorities[].Majority.{Amendment, CloseTime}`, a CloseTime in Ripple time, stored as unix time); the negative UNL
   (`DisabledValidators[].DisabledValidator.{PublicKey, FirstLedgerSequence}`, the hex key stored as a base58 node public key) and
   `ValidatorToDisable` / `ValidatorToReEnable` (base58, `''` when none); and the fees in drops, from `BaseFeeDrops`,
@@ -447,7 +449,7 @@ off in a test).
 - **No retry, no partial write.** Every request has a timeout of 5 s and is not retried; a poll in which a request fails, or an answer
   cannot be stored, writes nothing, and the next poll is the retry. A ClickHouse that fails makes the pass fail (logged, retried on
   time).
-- **The gauge** `syncer_amendments_without_metadata`, set after each feature poll (also one that failed: it reads what is stored): the
+- **The gauge** `syncer_amendments_without_metadata`, set after each feature poll that ended, also one that wrote nothing (it reads what is stored): the
   number of amendment IDs in the newest `amendment_features` rows, in the newest `network_state` row (enabled, or in `Majorities`) and in
   the newest round of `amendment_tallies` that the amendment metadata (`GH_AMENDMENTS_CONFIG`, else the file shipped with the shared
   package) does not list. Each ID is warned about once, `amendment <ID> has no metadata entry`, and remembered until the syncer restarts.
