@@ -1,6 +1,4 @@
 import {
-  Asset,
-  assetKey,
   ClickHouseService,
   DailyRates,
   DAY_GROUPS_EPOCH,
@@ -393,7 +391,7 @@ export class AccountAnalyticsService {
    * payment once, in the order of its key (`readPayments`, as `reports` has it), a payment to oneself the account's own
    * (`SIDE`):
    *
-   *  1. The issued assets that were paid and the days they were, so that the rates to ask for are known.
+   *  1. The issued (asset, day) pairs that were paid, so that the rates to ask for are known.
    *  2. Per counterparty, in SQL: the numbers of payments each way, the first and last time, and a Float64 value (the
    *     delivered amounts over the rate of their day, as `DailyRates.rateRowsSql` gives the rates: the stored sets of the valid
    *     days and the others computed on read). It gives the number of all the counterparties and the best `limit` and a few
@@ -421,9 +419,10 @@ export class AccountAnalyticsService {
        HAVING sum(delivered_amount_f) > 0`,
       params,
     );
-    const assets = new Map<string, Asset>();
-    for (const p of paid) assets.set(assetKey(p), { currency: p.currency, issuer: p.issuer });
-    const rateRows = await this.rates.rateRowsSql([...assets.values()], [...new Set(paid.map((p) => p.day_text))]);
+    // the rates are asked for these asset-days, not for every asset on every day: the arrays go in the URL
+    const rateRows = await this.rates.rateRowsSql(
+      paid.map((p) => ({ asset: { currency: p.currency, issuer: p.issuer }, day: p.day_text })),
+    );
 
     // (2) the value of a payment is its amount, or its amount over the rate of its day; a payment without a rate is worth 0.
     // (`p.` and `r.` of the join: both have a currency, an issuer and a day.)
