@@ -1,8 +1,10 @@
-import { listInUse, Table } from '@gatehub/data-api-shared';
+import { getNetworkProfile, listInUse, Table } from '@gatehub/data-api-shared';
+import { encodeAccountID } from 'ripple-address-codec';
 import {
   makeManifest,
   makeUnlBlob,
   makeUnlResponse,
+  TestKey,
   testKey,
 } from '../../../packages/shared/src/test-utils/validator-keys';
 import { readStoredLists } from '../src/validators/stored-lists';
@@ -22,8 +24,9 @@ import {
 
 /**
  * The validators worker against a real ClickHouse, a node and an HTTPS publisher (`https://unl.example`) that serve
- * lists signed with test keys. The worker is booted as the application boots it (the core module of the syncer), and
- * nothing leaves the machine: the fetches resolve the names to 127.0.0.1 and trust the test certificate.
+ * lists signed with test keys, and HTTPS domains (`https://northpeak.example`, ...) that serve hand-written TOML files.
+ * The worker is booted as the application boots it (the core module of the syncer), and nothing leaves the machine: the
+ * fetches resolve the names to 127.0.0.1 and trust the test certificate.
  */
 
 const DAY = 86_400;
@@ -580,6 +583,526 @@ describe('the validators worker (e2e)', () => {
       ]);
       expect(await readStoredLists(db.ch, ['nobody.example'])).toEqual([]);
       expect(await readStoredLists(db.ch, [])).toEqual([]);
+    });
+  });
+
+  describe('domain verification', () => {
+    const TOML_PATH = '/.well-known/xrp-ledger.toml';
+    const NORTHPEAK = 'northpeak.example';
+    const GENESIS = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+    const OTHER_ACCOUNT = encodeAccountID(Buffer.alloc(20, 7));
+    const HOUR = 3_600;
+    const clock = { ms: 0 };
+
+    interface Val {
+      master: TestKey;
+      signing: TestKey;
+    }
+    const val = (n: number): Val => ({ master: testKey(`e2e-dom-${n}`), signing: testKey(`e2e-dom-${n}-signing`) });
+
+    /** A TOML file as a validator's domain might publish it. Hand-written test data, not a recorded file. */
+    const toml = (key: string, accounts: string[] = []): string =>
+      [
+        '# Hand-written test data, not recorded from any real domain.',
+        '[METADATA]',
+        'modified = 2026-10-19T12:00:00.000Z',
+        '',
+        '[[PRINCIPALS]]',
+        'name = "North Peak Validators"',
+        '',
+        '[[VALIDATORS]]',
+        `public_key = "${key}"`,
+        'network = "main"',
+        'owner_country = "SI"',
+        '',
+        ...accounts.flatMap((address) => ['[[ACCOUNTS]]', `address = "${address}"`, 'desc = "treasury"', '']),
+      ].join('\n');
+
+    interface DomainRow {
+      validation_public_key: string;
+      domain: string;
+      status: string;
+      reason: string;
+      status_code: number;
+      toml_url: string;
+      checked_ms: number | string;
+      verified_ms: number | string | null;
+      next_check: number;
+      accounts: string[];
+    }
+
+    const domainRows = () =>
+      db.ch.query<DomainRow>(
+        `SELECT validation_public_key, domain,
+                argMax(status, checked_at) AS status, argMax(reason, checked_at) AS reason,
+                argMax(status_code, checked_at) AS status_code, argMax(toml_url, checked_at) AS toml_url,
+                toUnixTimestamp64Milli(max(checked_at)) AS checked_ms,
+                toUnixTimestamp64Milli(argMax(verified_at, checked_at)) AS verified_ms,
+                toUnixTimestamp(argMax(next_check_at, checked_at)) AS next_check,
+                argMax(accounts, checked_at) AS accounts
+           FROM ${Table.ValidatorDomains}
+          GROUP BY validation_public_key, domain
+          ORDER BY validation_public_key, domain`,
+      );
+
+    /** The manifest rows as the collector or a list would have written them; `raw: false` is a row from before 002. */
+    async function putManifest(
+      v: Val,
+      o: { seq?: number; domain?: string; hex?: string; raw?: boolean; source?: 'stream' | 'unl' } = {},
+    ): Promise<string> {
+      const seq = o.seq ?? 1;
+      const hex = o.hex ?? makeManifest({ master: v.master, signing: v.signing, sequence: seq, domain: o.domain });
+      await db.ch.insert(Table.ValidatorManifests, [
+        {
+          ephemeral_key: v.signing.base58,
+          master_key: v.master.base58,
+          seq,
+          domain: o.domain ?? '',
+          manifest: o.raw === false ? '' : hex,
+          source: o.source ?? 'unl',
+        },
+      ]);
+      return hex;
+    }
+
+    async function putSeen(v: Val, secondsAgo = 60): Promise<void> {
+      const last = clock.ms / 1000 - secondsAgo;
+      await db.ch.insert(Table.ValidatorSeen, [
+        { validation_public_key: v.master.base58, first_seen: last - 1_000, last_seen: last, last_ledger_index: 100 },
+      ]);
+    }
+
+    /** A stored list of the publisher `unl.example`, served under `key` (default the configured one). */
+    async function putList(validators: string[], o: { key?: string; sequence?: number } = {}): Promise<void> {
+      await db.ch.insert(Table.UnlLists, [
+        {
+          publisher: ID,
+          publisher_key: o.key ?? PUBLISHER.publicKeyHex,
+          sequence: o.sequence ?? 1,
+          version: 1,
+          effective: null,
+          expiration: clock.ms / 1000 + 30 * DAY,
+          validators: [...validators].sort(),
+          blob_sha256: 'AB'.repeat(32),
+          fetched_at: clock.ms / 1000 - HOUR,
+          response: '{}',
+        },
+      ]);
+    }
+
+    /** The worker with the clock of the test and, unless the test says otherwise, no loops: the test makes the passes. */
+    async function bootDomains(
+      o: {
+        config?: ValidatorsAppOptions['config'];
+        worker?: ValidatorsAppOptions['worker'];
+        node?: FakeNode;
+        profile?: ValidatorsAppOptions['profile'];
+      } = {},
+    ): Promise<ValidatorsApp> {
+      const app = await startValidatorsApp({
+        clickhouse: db.config,
+        node: o.node ?? node,
+        web,
+        config: { unlPublishers: PUBLISHERS, ...o.config },
+        worker: { now: () => clock.ms, start: { unl: false, domains: false }, ...o.worker },
+        profile: o.profile,
+      });
+      apps.push(app);
+      return app;
+    }
+
+    async function counted(app: ValidatorsApp, outcome: string): Promise<number> {
+      const { values } = await app.metrics.validatorsDomainChecksTotal.get();
+      return values.filter((v) => v.labels.outcome === outcome).reduce((n, v) => n + v.value, 0);
+    }
+
+    beforeEach(async () => {
+      // whole seconds: the next check time is a whole second
+      clock.ms = Math.floor(Date.now() / 1000) * 1000;
+      node.requests.length = 0;
+      delete node.answers.manifest;
+      for (const table of [Table.ValidatorDomains, Table.ValidatorSeen]) await db.ch.command(`TRUNCATE TABLE ${table}`);
+    });
+
+    it('verifies a domain whose hand-written TOML lists the key, and stores the accounts it names', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putList([v.master.base58]);
+      web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58, [OTHER_ACCOUNT, GENESIS, 'not an address']));
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+
+      expect(await domainRows()).toEqual([
+        {
+          validation_public_key: v.master.base58,
+          domain: NORTHPEAK,
+          status: 'verified',
+          reason: '',
+          status_code: 0,
+          toml_url: `https://${NORTHPEAK}/.well-known/xrp-ledger.toml`,
+          checked_ms: expect.anything(),
+          verified_ms: expect.anything(),
+          next_check: Math.ceil(clock.ms / 1000 + 6 * HOUR),
+          accounts: [GENESIS, OTHER_ACCOUNT].sort(),
+        },
+      ]);
+      const [row] = await domainRows();
+      expect(Number(row.checked_ms)).toBe(clock.ms);
+      expect(Number(row.verified_ms)).toBe(clock.ms);
+      expect(web.requests).toEqual([
+        expect.objectContaining({
+          host: NORTHPEAK,
+          path: TOML_PATH,
+          headers: expect.objectContaining({ accept: 'application/toml, text/plain, */*' }),
+        }),
+      ]);
+      expect(await counted(app, 'verified')).toBe(1);
+    });
+
+    it('is not_listed when the file lists other keys only, and reads no account from it', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      web.serveToml(NORTHPEAK, TOML_PATH, toml(val(2).master.base58, [GENESIS]));
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({ status: 'unverified', reason: 'not_listed', status_code: 0, accounts: [] }),
+      ]);
+      expect(await counted(app, 'not_listed')).toBe(1);
+    });
+
+    it('is toml_invalid when the file is not TOML', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      web.serveToml(NORTHPEAK, TOML_PATH, '<html>Welcome to North Peak</html>');
+      const app = await bootDomains();
+      await app.domains.pass();
+      expect(await domainRows()).toEqual([expect.objectContaining({ status: 'unverified', reason: 'toml_invalid' })]);
+    });
+
+    it('is http_status 404 when the domain has no file, and checks again in 6 h', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({
+          status: 'unverified',
+          reason: 'http_status',
+          status_code: 404,
+          verified_ms: null,
+          next_check: Math.ceil(clock.ms / 1000 + 6 * HOUR),
+          accounts: [],
+        }),
+      ]);
+      expect(await counted(app, 'http_status')).toBe(1);
+    });
+
+    it('follows a redirect to the other name of the site, and still names the URL of the domain', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      web.serve(NORTHPEAK, TOML_PATH, {
+        status: 302,
+        headers: { location: `https://www.${NORTHPEAK}${TOML_PATH}` },
+        body: '',
+      });
+      web.serveToml(`www.${NORTHPEAK}`, TOML_PATH, toml(v.master.base58, [GENESIS]));
+      const app = await bootDomains();
+
+      await app.domains.pass();
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({
+          status: 'verified',
+          toml_url: `https://${NORTHPEAK}${TOML_PATH}`,
+          accounts: [GENESIS],
+        }),
+      ]);
+      expect(web.requests.map((r) => r.host)).toEqual([NORTHPEAK, `www.${NORTHPEAK}`]);
+    });
+
+    it('is manifest_unverified, without a fetch, for a manifest with a tampered signature', async () => {
+      const v = val(1);
+      const good = makeManifest({ master: v.master, signing: v.signing, sequence: 1, domain: 'a.example' });
+      const tampered = good.replace(
+        Buffer.from('a.example').toString('hex').toUpperCase(),
+        Buffer.from('b.example').toString('hex').toUpperCase(),
+      );
+      expect(tampered).not.toBe(good);
+      // what the stream said: the manifest and the domain it claims
+      await putManifest(v, { domain: 'b.example', hex: tampered, source: 'stream' });
+      await putSeen(v);
+      web.serveToml('b.example', TOML_PATH, toml(v.master.base58));
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+      expect(web.requests).toEqual([]);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({
+          domain: 'b.example',
+          status: 'unverified',
+          reason: 'manifest_unverified',
+          accounts: [],
+        }),
+      ]);
+      expect(await counted(app, 'manifest_unverified')).toBe(1);
+    });
+
+    it('is domain_invalid, without a fetch, for a domain that is an IP address', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: '203.0.113.7' });
+      await putSeen(v);
+      const app = await bootDomains();
+      expect(await app.domains.pass()).toBe(1);
+      expect(web.requests).toEqual([]);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({ domain: '203.0.113.7', status: 'unverified', reason: 'domain_invalid' }),
+      ]);
+    });
+
+    it('asks the node for a manifest stored before 002, keeps its answer as an rpc row, and checks it in a later pass', async () => {
+      const v = val(1);
+      const hex = makeManifest({ master: v.master, signing: v.signing, sequence: 3, domain: NORTHPEAK });
+      // the row the collector wrote before 002: no domain, no raw bytes
+      await putManifest(v, { seq: 3, raw: false, source: 'stream' });
+      await putSeen(v);
+      node.answers.manifest = (request) => ({
+        details: {
+          domain: NORTHPEAK,
+          ephemeral_key: v.signing.base58,
+          master_key: request.public_key,
+          seq: 3,
+        },
+        manifest: Buffer.from(hex, 'hex').toString('base64'),
+        requested: request.public_key,
+      });
+      web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58, [GENESIS]));
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(0);
+      expect(node.requests.filter((r) => r.command === 'manifest')).toEqual([
+        expect.objectContaining({ command: 'manifest', public_key: v.master.base58 }),
+      ]);
+      expect(
+        await db.ch.query(
+          `SELECT ephemeral_key, master_key, seq, domain, manifest, source FROM ${Table.ValidatorManifests} WHERE source = 'rpc'`,
+        ),
+      ).toEqual([
+        {
+          ephemeral_key: v.signing.base58,
+          master_key: v.master.base58,
+          seq: 3,
+          domain: NORTHPEAK,
+          manifest: hex,
+          source: 'rpc',
+        },
+      ]);
+      expect(web.requests).toEqual([]);
+      expect(await domainRows()).toEqual([]);
+
+      // the answer is checked in the next pass, and the node is not asked again
+      clock.ms += 60_000;
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({ domain: NORTHPEAK, status: 'verified', accounts: [GENESIS] }),
+      ]);
+      expect(node.requests.filter((r) => r.command === 'manifest')).toHaveLength(1);
+    });
+
+    it('does not take the word of the node for a manifest: an answer that does not verify is manifest_unverified', async () => {
+      const v = val(1);
+      const hex = makeManifest({ master: v.master, signing: v.signing, sequence: 3, domain: 'a.example' });
+      const lie = hex.replace(
+        Buffer.from('a.example').toString('hex').toUpperCase(),
+        Buffer.from('b.example').toString('hex').toUpperCase(),
+      );
+      await putManifest(v, { seq: 3, raw: false, source: 'stream' });
+      await putSeen(v);
+      node.answers.manifest = (request) => ({
+        details: { domain: 'b.example', ephemeral_key: v.signing.base58, master_key: request.public_key, seq: 3 },
+        manifest: Buffer.from(lie, 'hex').toString('base64'),
+      });
+      web.serveToml('b.example', TOML_PATH, toml(v.master.base58));
+      const app = await bootDomains();
+
+      await app.domains.pass();
+      clock.ms += 60_000;
+      await app.domains.pass();
+      expect(web.requests).toEqual([]);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({ domain: 'b.example', reason: 'manifest_unverified' }),
+      ]);
+    });
+
+    it('takes the validators on the list in use or seen in the last 30 days, and no master from the list of another key', async () => {
+      const [seen, longGone, listed, otherKey] = [val(1), val(2), val(3), val(4)];
+      await putManifest(seen, { domain: 'a.example' });
+      await putManifest(longGone, { domain: 'b.example' });
+      await putManifest(listed, { domain: 'c.example' });
+      await putManifest(otherKey, { domain: 'd.example' });
+      await putSeen(seen, 5 * DAY);
+      await putSeen(longGone, 31 * DAY);
+      await putList([listed.master.base58]);
+      // a list of the same publisher id under a key that is not the configured one: not the list in use
+      await putList([otherKey.master.base58], { key: OTHER_PUBLISHER.publicKeyHex, sequence: 9 });
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(2);
+      expect((await domainRows()).map((r) => r.domain).sort()).toEqual(['a.example', 'c.example']);
+      expect(web.requests.map((r) => r.host).sort()).toEqual(['a.example', 'c.example']);
+    });
+
+    it('uses the newest manifest of a master: its domain, and a change of domain is a new pair', async () => {
+      const v = val(1);
+      await putManifest(v, { seq: 1, domain: 'a.example' });
+      await putSeen(v);
+      web.serveToml('a.example', TOML_PATH, toml(v.master.base58));
+      web.serveToml('b.example', TOML_PATH, toml(v.master.base58, [GENESIS]));
+      const app = await bootDomains();
+      await app.domains.pass();
+      expect((await domainRows()).map((r) => [r.domain, r.status])).toEqual([['a.example', 'verified']]);
+
+      await putManifest(v, { seq: 2, domain: 'b.example' });
+      clock.ms += 60_000;
+      expect(await app.domains.pass()).toBe(1);
+      expect((await domainRows()).map((r) => [r.domain, r.status, r.accounts])).toEqual([
+        ['a.example', 'verified', []],
+        ['b.example', 'verified', [GENESIS]],
+      ]);
+    });
+
+    it('keeps a verified domain verified through a failing website for 24 h, then says why it is not', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58, [GENESIS]));
+      const app = await bootDomains();
+      await app.domains.pass();
+      const verifiedAt = clock.ms;
+
+      // the website starts failing; it is checked again after 6 h
+      web.serveToml(NORTHPEAK, TOML_PATH, 'maintenance', 503);
+      clock.ms = verifiedAt + 6 * HOUR * 1000;
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({
+          status: 'verified',
+          reason: '',
+          status_code: 0,
+          accounts: [GENESIS],
+          next_check: Math.ceil(clock.ms / 1000 + HOUR),
+        }),
+      ]);
+      expect(Number((await domainRows())[0].verified_ms)).toBe(verifiedAt);
+
+      // not yet due: nothing is asked
+      clock.ms += 30 * 60 * 1000;
+      expect(await app.domains.pass()).toBe(0);
+
+      // an hour later it fails again, and still within 24 h of the last success
+      clock.ms = verifiedAt + 7 * HOUR * 1000;
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([expect.objectContaining({ status: 'verified', accounts: [GENESIS] })]);
+
+      // after 24 h of failures it is unverified, says why, and has no accounts; the last success is remembered
+      clock.ms = verifiedAt + 25 * HOUR * 1000;
+      expect(await app.domains.pass()).toBe(1);
+      const [row] = await domainRows();
+      expect(row).toMatchObject({ status: 'unverified', reason: 'http_status', status_code: 503, accounts: [] });
+      expect(Number(row.verified_ms)).toBe(verifiedAt);
+      expect(await counted(app, 'verified')).toBe(1);
+      expect(await counted(app, 'http_status')).toBe(3);
+    });
+
+    it('is blocked_address for a domain that resolves to a private address, and logs it at warn with the address class', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      const lines: string[] = [];
+      const logger = { log: () => undefined, warn: (line: string) => void lines.push(line), error: () => undefined };
+      // the real address policy, and a DNS that answers with a private address
+      const app = await bootDomains({
+        worker: { logger, fetch: { resolve: async () => [{ address: '10.1.2.3', family: 4 }] } },
+      });
+
+      await app.domains.pass();
+      expect(web.requests).toEqual([]);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({ status: 'unverified', reason: 'blocked_address', next_check: expect.anything() }),
+      ]);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(NORTHPEAK);
+      expect(lines[0]).toContain('10.0.0.0/8');
+      expect(await counted(app, 'blocked_address')).toBe(1);
+    });
+
+    it('fetches /.well-known/xahau.toml on Xahau, and does not fall back to the other name', async () => {
+      const xahauNode = await startFakeNode({
+        server_info: { info: { complete_ledgers: '1-100', validated_ledger: { seq: 100 }, network_id: 21337 } },
+      });
+      let app: ValidatorsApp | undefined;
+      try {
+        const v = val(1);
+        await putManifest(v, { domain: NORTHPEAK });
+        await putSeen(v);
+        web.serveToml(NORTHPEAK, '/.well-known/xahau.toml', toml(v.master.base58, [GENESIS]));
+        web.serveToml(NORTHPEAK, TOML_PATH, toml(val(2).master.base58));
+        app = await bootDomains({ node: xahauNode, profile: getNetworkProfile('xahau') });
+
+        expect(await app.domains.pass()).toBe(1);
+        expect(web.requests.map((r) => r.path)).toEqual(['/.well-known/xahau.toml']);
+        expect(await domainRows()).toEqual([
+          expect.objectContaining({
+            status: 'verified',
+            toml_url: `https://${NORTHPEAK}/.well-known/xahau.toml`,
+            accounts: [GENESIS],
+          }),
+        ]);
+      } finally {
+        if (app !== undefined) {
+          await app.stop();
+          apps = apps.filter((a) => a !== app);
+        }
+        await xahauNode.stop();
+      }
+    });
+
+    it('checks domains from boot while GH_DOMAIN_VERIFICATION is true', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58, [GENESIS]));
+      await bootDomains({ worker: { start: { unl: false } } });
+
+      const [row] = await waitFor('the first pass to write a row', async () => {
+        const rows = await domainRows();
+        return rows.length > 0 && rows;
+      });
+      expect(row).toMatchObject({ domain: NORTHPEAK, status: 'verified', accounts: [GENESIS] });
+    });
+
+    it('makes no check, no fetch and no row while GH_DOMAIN_VERIFICATION is false', async () => {
+      const v = val(1);
+      const pre = val(2);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putManifest(pre, { raw: false, source: 'stream' });
+      await putSeen(v);
+      await putSeen(pre);
+      web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58));
+      const app = await bootDomains({ config: { domainVerification: false }, worker: { start: { unl: false } } });
+
+      // the loop would have made its first pass by now
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(await domainRows()).toEqual([]);
+      expect(web.requests).toEqual([]);
+      expect(node.requests.filter((r) => r.command === 'manifest')).toEqual([]);
+      expect(await counted(app, 'verified')).toBe(0);
     });
   });
 });

@@ -16,6 +16,7 @@ import { startClickHouse } from '../../../../packages/shared/test/clickhouse-con
 import { SyncerConfig, WorkerName } from '../../src/config/syncer.config';
 import { SyncerCoreModule } from '../../src/core/syncer-core.module';
 import { PrometheusService } from '../../src/modules/prometheus/prometheus.service';
+import { DomainChecker } from '../../src/validators/domain-checker';
 import { SafeFetchTestOptions } from '../../src/validators/safe-fetch';
 import { UnlFetcher } from '../../src/validators/unl-fetcher';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from '../../src/validators/validators.options';
@@ -30,7 +31,7 @@ import { TEST_TLS } from './tls';
  *   startTestWeb()                     an HTTPS server on 127.0.0.1 that answers by host and path. The publishers of UNL
  *                                      lists and (for the domain checks) the `.well-known` TOML files of validators are
  *                                      routes of it: `web.serveJson('unl.example', '/', body)`,
- *                                      `web.serve('a.example', '/.well-known/xrp-ledger.toml', { body })`. Serving the
+ *                                      `web.serveToml('a.example', '/.well-known/xrp-ledger.toml', text)`. Serving the
  *                                      same host and path again swaps the answer; a route no one serves is a 404.
  *                                      `web.requests` logs what was asked, `web.fetchOptions()` is the
  *                                      `SafeFetchTestOptions` that send every `*.example` host to it (the certificate is
@@ -44,7 +45,9 @@ import { TEST_TLS } from './tls';
  *                                      node client made from the fake node) with the modules of `options.workers` (default
  *                                      `['validators']`, chosen by the application's own `selectWorkerModules`, and the node
  *                                      client made when `needsNodeClient` says so), booted as the application does: the
- *                                      result holds the app, the `UnlFetcher`, the metrics, and `stop()`. `options.config`
+ *                                      result holds the app, the `UnlFetcher`, the `DomainChecker` (a test that switches
+ *                                      its loop off with `worker.start.domains = false` makes the passes itself), the
+ *                                      metrics, and `stop()`. `options.config`
  *                                      overrides `SyncerConfig` (for instance `unlPublishers`), `options.worker` the
  *                                      `ValidatorsWorkerOptions` (`now`, `start`, ...; the `fetch` options of the web server
  *                                      are already in it), `options.profile` is the network (default XRPL; the fake node must
@@ -123,6 +126,8 @@ export interface TestWeb {
   serve(host: string, path: string, reply: WebReply | ((request: WebRequest) => WebReply)): void;
   /** `serve` with a JSON body. */
   serveJson(host: string, path: string, body: unknown): void;
+  /** `serve` with a TOML text (`content-type: application/toml`), by default status 200. */
+  serveToml(host: string, path: string, text: string, status?: number): void;
   /** Forgets every route and request. */
   clear(): void;
   /** Send every fetch of `SafeFetcher` to this server: the name resolves to 127.0.0.1 (the only address allowed), the certificate of the test is trusted. */
@@ -154,6 +159,12 @@ export async function startTestWeb(): Promise<TestWeb> {
     requests,
     serve: (host, path, reply) => void routes.set(`${host.toLowerCase()}${path}`, reply),
     serveJson: (host, path, body) => void routes.set(`${host.toLowerCase()}${path}`, { body: JSON.stringify(body) }),
+    serveToml: (host, path, text, status = 200) =>
+      void routes.set(`${host.toLowerCase()}${path}`, {
+        status,
+        headers: { 'content-type': 'application/toml' },
+        body: text,
+      }),
     clear: () => {
       routes.clear();
       requests.length = 0;
@@ -228,6 +239,7 @@ export async function startFakeNode(answers: Record<string, NodeAnswer> = {}): P
 export interface ValidatorsApp {
   app: INestApplication;
   fetcher: UnlFetcher;
+  domains: DomainChecker;
   metrics: PrometheusService;
   stop(): Promise<void>;
 }
@@ -298,6 +310,7 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
   return {
     app,
     fetcher: app.get(UnlFetcher),
+    domains: app.get(DomainChecker),
     metrics: app.get(PrometheusService),
     stop: () => app.close(),
   };
@@ -308,6 +321,7 @@ export const VALIDATORS_METRICS = [
   'validatorsUnlFetchesTotal',
   'validatorsUnlExpirySeconds',
   'validatorsUnlSize',
+  'validatorsDomainChecksTotal',
 ] as const;
 
 /** The metrics are one set per process, so a spec clears the ones the worker sets before each test. */

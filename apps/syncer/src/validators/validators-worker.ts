@@ -1,14 +1,69 @@
 import { ShutdownSignals } from '@gatehub/data-api-shared';
-import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
+import { SyncerConfig } from '../config/syncer.config';
+import { DomainChecker } from './domain-checker';
 import { UnlFetcher } from './unl-fetcher';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
 
 /** How long a stop waits for the loops all together. The cleanups of `ShutdownSignals` share a budget of 10 s. */
 export const VALIDATORS_STOP_WAIT_MS = 2_000;
 
+/** The wait between the end of a domain pass and the start of the next. */
+export const DOMAIN_PASS_INTERVAL_MS = 60_000;
+
 /** A loop of the worker: it ends its timers on `stop()` and resolves when what it had under way is over. */
 interface Loop {
   stop(): Promise<void>;
+}
+
+/**
+ * Calls `pass` at once, and again `everyMs` after each call ended, never two at a time. A pass that rejects is logged (its
+ * message only) and the next one is made on time. `stop()` ends the timer, stops what `pass` runs (`end`) and waits for
+ * the pass under way.
+ */
+class PassLoop implements Loop {
+  private timer?: NodeJS.Timeout;
+  private running?: Promise<void>;
+  private stopped = false;
+
+  constructor(
+    private readonly name: string,
+    private readonly pass: () => Promise<unknown>,
+    private readonly end: () => Promise<void>,
+    private readonly everyMs: number,
+    private readonly logger: Pick<Logger, 'warn'>,
+  ) {}
+
+  start(): void {
+    this.schedule(0);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.timer !== undefined) clearTimeout(this.timer);
+    this.timer = undefined;
+    await Promise.all([this.end(), this.running]);
+  }
+
+  private schedule(delayMs: number): void {
+    if (this.stopped) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.running = this.run().finally(() => {
+        this.running = undefined;
+      });
+    }, delayMs);
+  }
+
+  private async run(): Promise<void> {
+    try {
+      await this.pass();
+    } catch (err) {
+      if (!this.stopped)
+        this.logger.warn(`${this.name}: the pass failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.schedule(this.everyMs);
+  }
 }
 
 /**
@@ -18,6 +73,8 @@ interface Loop {
  * - the **UNL loop** (`UnlFetcher`): fetches the validator lists of the publishers (`GH_UNL_PUBLISHERS`), verifies them and
  *   stores them. At boot it first writes the publisher rows (`registerPublishers`), then starts the fetches in the
  *   background. A ClickHouse that cannot be written at boot fails the boot, like the ingest worker's lease does.
+ * - the **domain loop** (`DomainChecker`), while `GH_DOMAIN_VERIFICATION` is true: a pass at start and then one every
+ *   60 s after the previous one ended, which verifies the domains of the validators (spec 2.2).
  *
  * It is a worker of its own, and not steps of the aggregator, because it needs outbound HTTPS to third-party sites and the
  * node, because its cadences and failure modes are its own, and because the aggregator's 30 s tick is not its to share (spec
@@ -29,16 +86,20 @@ interface Loop {
 @Injectable()
 export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly start: NonNullable<ValidatorsWorkerOptions['start']>;
+  private readonly logger: Pick<Logger, 'log' | 'warn' | 'error'>;
   /** The loops that were started, in the order they were. */
   private readonly loops: Loop[] = [];
   private stopping?: Promise<void>;
 
   constructor(
     @Inject(UnlFetcher) private readonly unl: UnlFetcher,
+    @Inject(DomainChecker) private readonly domains: DomainChecker,
+    @Inject(SyncerConfig) private readonly cfg: Pick<SyncerConfig, 'domainVerification'>,
     @Optional() private readonly shutdownSignals?: ShutdownSignals,
     @Optional() @Inject(VALIDATORS_WORKER_OPTIONS) options: ValidatorsWorkerOptions = {},
   ) {
     this.start = options.start ?? {};
+    this.logger = options.logger ?? new Logger(ValidatorsWorker.name);
   }
 
   async onApplicationBootstrap(): Promise<void> {
@@ -47,6 +108,17 @@ export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy
       await this.unl.registerPublishers();
       this.unl.start();
       this.loops.push(this.unl);
+    }
+    if (this.start.domains !== false && this.cfg.domainVerification) {
+      const loop = new PassLoop(
+        'Domain verification',
+        () => this.domains.pass(),
+        () => this.domains.stop(),
+        DOMAIN_PASS_INTERVAL_MS,
+        this.logger,
+      );
+      loop.start();
+      this.loops.push(loop);
     }
   }
 

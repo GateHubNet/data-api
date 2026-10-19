@@ -19,8 +19,8 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
                           ClickHouse, database = the network name
 ```
 
-The fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers over HTTPS and
-reads the node; it is not drawn.
+The fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers and the TOML
+files of the validators' domains over HTTPS and reads the node; it is not drawn.
 
 ## 1. Boot
 
@@ -300,7 +300,7 @@ Properties that matter operationally:
 ## 8. The validators worker
 
 The `validators` worker (`apps/syncer/src/validators/`) keeps the data behind the validators and amendments endpoints current:
-which validators the UNL publishers name, and (as the worker grows) their domains, the state of the ledger and the votes
+which validators the UNL publishers name, their domains, and (as the worker grows) the state of the ledger and the votes
 derived from it. Its design is in the [validators and amendments design](superpowers/specs/2026-10-19-validators-amendments-design.md),
 section 2. Like every worker it is switched on and off with `GH_WORKERS`.
 
@@ -314,9 +314,9 @@ section 2. Like every worker it is switched on and off with `GH_WORKERS`.
 
 **Two loops.** An **I/O loop** that fetches the UNL lists (below), checks validator domains and polls the node, each on its own
 timer; and a **compute loop**, once a minute, that runs two ClickHouse jobs in the aggregator's job model (a budget per job, a job
-that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher is the
-part of the I/O loop that is in place; the rest joins the worker as it is built, started from the same bootstrap. A stop ends every
-loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
+that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher and the
+domain checker are the parts of the I/O loop that are in place; the rest joins the worker as it is built, started from the same
+bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
 private, loopback or reserved address, no redirect to one, 20 s, 1 MiB, 3 redirects), which also sends the `User-Agent`
 `gatehub-data-api/<version> (validators)`.
 
@@ -377,6 +377,51 @@ rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists 
   every retry, and a stored list is logged once. A log line names the publisher, the reason and the message of the failure, never
   the body of a response.
 
+### Domain verification
+
+`DomainChecker` (`domain-checker.ts`, with the pure `matchToml` of `toml-match.ts`) verifies the domain each validator names in its
+manifest, as `validator_domains` rows. The worker makes a **pass every 60 s** (the first at start, the next 60 s after the previous
+one ended, never two at a time) while `GH_DOMAIN_VERIFICATION` is `true`; a pass that fails (ClickHouse) is logged with its message
+and the next one is made on time.
+
+- **Which validators.** The masters on the list in use of each configured publisher (only the lists stored under the key configured
+  for it: a list of an earlier key of the same URL counts for nothing), and those in `validator_seen` with `last_seen` in the last 30
+  days. Of each, the newest manifest (the highest `seq` per master key).
+- **The manifest is verified here.** A manifest with raw bytes is decoded and its signatures verified, and it must be the key's own;
+  the domain is that of the verified manifest, so the stream's word is not enough, and a manifest that does not verify gives
+  `manifest_unverified` with no fetch. A validator whose newest manifest has no raw bytes (rows from before migration 002) is asked of
+  the node (`manifest` with the master key; 5 s, no retry) at most once in 10 minutes per key, at most 100 keys and 4 requests at a
+  time in a pass, and the answer is stored with `source = 'rpc'` and checked in a later pass like any manifest. No domain: no check
+  and no row.
+- **Which pairs are due.** A (validator, domain) pair with no stored row, or with `next_check_at` passed; a changed domain is a new
+  pair, checked in the next pass. Never-checked pairs first, then the oldest `next_check_at`, at most 100 a pass.
+- **The checks.** A domain that is not properly formed (rippled's `isProperlyFormedTomlDomain`: no IP literal, port, path or single
+  label) is `domain_invalid` before any DNS query. Otherwise the file `https://{domain}/.well-known/xrp-ledger.toml` (Xahau:
+  `/.well-known/xahau.toml`; no fall-back to the other name) is fetched through the safe fetcher (`GH_DOMAIN_FETCH_TIMEOUT_MS`, 256
+  KiB, 3 redirects, each checked like the first URL): **one fetch per domain per pass**, shared by the validators that name it, at
+  most **4 in flight**. The rows of a domain are written as soon as it is done.
+- **What is read of the file.** It is parsed (`smol-toml`), never evaluated. The key is listed when a `[[VALIDATORS]]` entry has it as
+  `public_key` (trimmed). Only then are the `[[ACCOUNTS]]` read: the `address` of each entry (trimmed), kept when it is a classic
+  address with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each, sorted, the first
+  10. Every other field is ignored, and nothing in the file is fetched or followed. A file that is not TOML is `toml_invalid`, and
+  its error says nothing of its content.
+- **The result of a pair.**
+
+  | Result | Reason | Next check |
+  | --- | --- | --- |
+  | `verified` | `''` (with the `accounts`) | `GH_DOMAIN_RECHECK_MS` (6 h) |
+  | `unverified` | `not_listed`, `toml_invalid`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid`, `manifest_unverified`, `http_status` with a 4xx other than 429 (`status_code` is the status) | 6 h |
+  | `unverified` | transient: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | 1 h |
+
+  A transient failure within 24 h of the last success keeps `verified` (with `verified_at` and `accounts` unchanged), so that a website
+  that blips does not flap the badge; after 24 h of failures it is `unverified` with the transient reason and no accounts. A definite
+  failure takes the badge at once and keeps `verified_at`, the time of the last success.
+- **Observability.** `syncer_validators_domain_checks_total{outcome}` counts every check as `verified` or the reason (also a
+  transient failure that left the domain `verified`). The result of a pair is logged when it changes (the validator, the domain
+  quoted, the status, the reason and the status code); a fetch refused by the address policy is logged at `warn` every time, with the
+  domain and the blocked range (`addressClass`). A log line never holds the body of a response, an error object or the message of a
+  failure, and a domain is quoted because it comes from a manifest.
+
 ## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
@@ -398,6 +443,9 @@ rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists 
 | `... It rate limits this client: nothing is sent to it for N s` | A public node throttles the process | That endpoint is left alone for N s, the next one is used; with none left the syncer waits. See [Rate limits](#rate-limits). |
 | `The boot network check (server_info) failed: ...; retry in N s` | The node is unreachable, busy or rate limiting at boot | Retried until it answers; only a node of another network ends the boot. |
 | `UNL publisher <id>: error (<reason>): ...` | A publisher cannot be fetched, serves a list that fails verification, or serves one that is stale or expired | The list is not stored and the last stored one stays in use (reported as expired once it expires). Retried after 30 s, doubling to 10 min; the line is logged once, when the status changes. The reason is in `unl_publishers.error` and `syncer_validators_unl_fetches_total`. |
+| `Validator <key>: domain "<domain>" is unverified (<reason>)` | A validator's domain does not serve a TOML file that lists it, or cannot be reached | The domain shows `unverified` with the reason in `validator_domains` and `syncer_validators_domain_checks_total`; a definite failure is checked again in 6 h, a transient one in 1 h, and a domain verified within 24 h stays verified through transient failures. Logged once, when the result changes. |
+| `Domain "<domain>": the fetch was blocked (blocked_address, <range>)` | A validator's domain resolves to a private, loopback or reserved address | Nothing is requested; the pair is `unverified` (`blocked_address`) and is checked again in 6 h. Logged at every check. |
+| `Domain verification: N of M manifest lookups failed (...)` | The node cannot be asked for the manifests that were stored before migration 002 | Those validators are not checked until an answer is stored; each key is asked again after 10 minutes. |
 
 ## 11. Source map
 
@@ -407,7 +455,7 @@ rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists 
 | `apps/syncer/src/ingest/{live-runner,rpc-ledger-source}.ts` | The ingest worker and its ledger source |
 | `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
-| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `stored-lists`, `safe-fetch` (the only outbound HTTP) |
+| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `stored-lists`, `safe-fetch` (the only outbound HTTP) |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
 | `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |
