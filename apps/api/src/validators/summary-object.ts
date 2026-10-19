@@ -74,7 +74,7 @@ export interface ValidatorsSummary {
 }
 
 /** Drops (text) as whole native units, exact decimal text: `10` is `"0.00001"`, `1000000` is `"1"`, `200000` is `"0.2"`. */
-function wholeUnits(drops: string): string {
+export function wholeUnits(drops: string): string {
   return new BigNumber(drops).shiftedBy(-6).toFixed();
 }
 

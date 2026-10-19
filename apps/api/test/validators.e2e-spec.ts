@@ -1,10 +1,27 @@
 import { Table } from '@gatehub/data-api-shared';
+import { join } from 'node:path';
 import type { Directory } from '../src/validators/directory';
 import { PUBLISHER_KEYS, SUMMARY_KEYS } from '../src/validators/summary-object';
 import type { ValidatorDirectoryService } from '../src/validators/validator-directory.service';
+import {
+  AGREEMENT_KEYS,
+  DAILY_KEYS,
+  DETAIL_AMENDMENT_VOTES_KEYS,
+  DETAIL_TAIL_KEYS,
+  DOMAIN_VERIFICATION_KEYS,
+  FEE_VOTE_KEYS,
+  LIST_BODY_KEYS,
+  MANIFEST_KEYS,
+  VALIDATOR_ROW_KEYS,
+  VOTE_ENTRY_KEYS,
+} from '../src/validators/validator-object';
 import { ApiClient, Harness, HarnessOptions, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import { BULK_BASES, BULK_PER_PART, insertBulk, LoggedRead, readsOf } from './support/read-rows';
 import {
+  BOARD_IDS,
+  BOARD_NAMES,
+  BoardScenario,
   DAY,
   fleet,
   FleetScenario,
@@ -20,6 +37,7 @@ import {
   insertState,
   PUBLISHER_KEY,
   RC1,
+  seedAmendmentBoard,
   seedFleet,
   serverVersion,
   VOTING_LEDGER,
@@ -30,6 +48,10 @@ import {
  * publishers (one list current, one expired with a failed newest attempt), the answer with every publisher unavailable and
  * with an empty database, the formats and the key order, `Cache-Control` and the errors, one build of the directory for
  * requests within 10 s, the version sets of rounds and hours, Xahau, and the routes of the original that stay 404.
+ *
+ * `GET /v2/network/validators` and `GET /v2/network/validators/{key}` on the same fleet, on the board of the amendments
+ * spec (the votes on the amendments, unknown ones included) and on Xahau: the scopes and filters of the list, its order,
+ * markers and CSV, the detail by a master key, a signing key and 66 hex digits, and the failures.
  *
  * The directory is cached for 10 s, so each scenario has an app of its own (the cache is the app's).
  */
@@ -969,6 +991,1107 @@ describe('GET /v2/network/validators/summary: on Xahau', () => {
       tomlUrl: 'https://south.example/.well-known/xahau.toml',
     });
     expect(directory.entries.get(members[2].key)?.domainState).toBeUndefined();
+  });
+});
+
+// ===================================================================================================================
+// the list and the detail of a validator
+// ===================================================================================================================
+
+const LIST = '/v2/network/validators';
+const detailOf = (key: string): string => `${LIST}/${key}`;
+
+/** The vote of every validator of the fleet, and so the only amendment of that scenario (nameless). */
+const FLEET_AMENDMENT = '98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76';
+const FIXTURE = join(__dirname, 'support', 'amendments-xrpl.json');
+/** Metadata files with no amendment (made for the tests): the only amendments are the ones validators vote for. */
+const NO_AMENDMENTS = {
+  xrpl: join(__dirname, 'support', 'amendments-none-xrpl.json'),
+  xahau: join(__dirname, 'support', 'amendments-none-xahau.json'),
+} as const;
+
+type Answer = { status: number; body: Record<string, any>; headers: Record<string, string>; text: string };
+
+/** What the seed of the fleet puts in the window of validator `i` of its tracked ones: the newest `hours` hours of 900 ledgers each. */
+function seededWindow(i: number, hours: number, complete: boolean) {
+  const backs = range(0, hours - 1);
+  const missed = backs.filter((back) => (i + back) % 17 === 0).length;
+  const partial = backs.filter((back) => (i + back) % 17 === 0 && (i + back) % 34 === 0).length;
+  const total = hours * 900;
+  return { missed, total, score: ((total - missed) / total).toFixed(4), incomplete: !complete, partial };
+}
+
+/** The keys of an object that a key list says come in that order, the ones the object has. */
+const orderedBy = (keys: readonly string[], object: object): string[] => keys.filter((key) => key in object);
+
+describe('GET /v2/network/validators and /{key}: a fleet of 35 trusted validators (XRPL)', () => {
+  let started: Awaited<ReturnType<typeof startWithDirectory>>;
+  let h: Harness;
+  let api: ApiClient;
+  let s: FleetScenario;
+  let unlList: Answer;
+  let allList: Answer;
+  let directoryBefore: string;
+  let directoryAfter: string;
+  let sameDirectory: boolean;
+
+  /** The master keys of a list, in order. */
+  const keys = (answer: Answer): string[] =>
+    answer.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key);
+  const rowOf = (answer: Answer, key: string): Record<string, any> => {
+    const found = answer.body.validators.find(
+      (row: { validation_public_key: string }) => row.validation_public_key === key,
+    );
+    if (!found) throw new Error(`no row for ${key}`);
+    return found;
+  };
+  /** The order of the list: with a domain first, by domain, then the rest by key. */
+  const sortedKeys = (withDomain: string[], rest: string[]): string[] => [...withDomain, ...[...rest].sort()];
+
+  beforeAll(async () => {
+    started = await startWithDirectory({
+      seed: 'none',
+      network: 'xrpl',
+      env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+    });
+    h = started.h;
+    api = await h.api();
+    s = await seedFleet(h.ch, { activity: true });
+    unlList = await api.get(LIST);
+    allList = await api.get(`${LIST}?scope=all`);
+    // the directory the requests are made on, before and after a series of them (all within the 10 s it is kept)
+    const before = await started.directory();
+    directoryBefore = JSON.stringify([...before.entries.values()]);
+    await api.get(`${LIST}?scope=all&q=e&limit=2`);
+    await api.get(`${LIST}?scope=all&publisher=vl.ripple.com&amendment=${FLEET_AMENDMENT}&format=csv`);
+    await api.get(detailOf(s.unl[0].key));
+    await api.get(detailOf(s.dormant.key));
+    const after = await started.directory();
+    directoryAfter = JSON.stringify([...after.entries.values()]);
+    sameDirectory = before === after;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  // -- the list -----------------------------------------------------------------------------------------------------
+
+  describe('the list: scope=unl, the default', () => {
+    it('lists the trusted UNL, seen or not: the 35 members, the two with a domain first', () => {
+      expect(unlList.status).toBe(200);
+      expect(unlList.body.result).toBe('success');
+      expect(unlList.body.count).toBe(35);
+      expect(unlList.body.validators).toHaveLength(35);
+      expect(keys(unlList)).toEqual(
+        sortedKeys(
+          [s.unl[0].key, s.unl[1].key],
+          s.unl.slice(2).map((m) => m.key),
+        ),
+      );
+    });
+
+    it('has the keys of LIST_BODY_KEYS in order, with no marker when everything fits', () => {
+      expect(Object.keys(unlList.body)).toEqual(['result', 'count', 'validators']);
+      expect([...LIST_BODY_KEYS]).toEqual(['result', 'count', 'marker', 'validators']);
+    });
+
+    it('includes a member of the UNL that was never seen, with what it has: its windows, its lists, its signing key', () => {
+      expect(rowOf(unlList, s.unl[33].key)).toEqual({
+        validation_public_key: s.unl[33].key,
+        agreement_1h: { missed: 0, total: 0, incomplete: false, partial: 0 },
+        agreement_24h: { missed: 0, total: 0, incomplete: false, partial: 0 },
+        unl: true,
+        agreement_30d: { missed: 0, total: 0, incomplete: true, partial: 0 },
+        signing_key: s.unl[33].ephemeral,
+        unl_lists: ['unl.xrplf.org', 'vl.ripple.com'],
+        negative_unl: false,
+      });
+    });
+
+    it('leaves out the others, those seen only within 30 days and the one seen 40 days ago', () => {
+      const listed = new Set(keys(unlList));
+      for (const other of [...s.others, ...s.lapsed, s.dormant]) expect(listed.has(other.key)).toBe(false);
+    });
+
+    it('is the row of the specification for a validator with everything: northpeak.example', () => {
+      expect(rowOf(unlList, s.unl[0].key)).toEqual({
+        validation_public_key: s.unl[0].key,
+        domain: 'northpeak.example',
+        current_index: HEAD_LEDGER,
+        agreement_1h: seededWindow(0, 1, true),
+        agreement_24h: seededWindow(0, 24, true),
+        partial: false,
+        unl: true,
+        agreement_30d: seededWindow(0, 48, false),
+        signing_key: s.rotated.base58,
+        domain_verification: {
+          status: 'verified',
+          toml_url: 'https://northpeak.example/.well-known/xrp-ledger.toml',
+          checked: instant(s.now - 600.511),
+          verified: instant(s.now - 600.511),
+          accounts: ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+        },
+        unl_lists: ['unl.xrplf.org', 'vl.ripple.com'],
+        negative_unl: false,
+        version: '3.4.1',
+        version_latest: true,
+        server_version: serverVersion(3, 4, 1),
+        fee_vote: { ledger_index: VOTING_LEDGER, base_fee: '0.00001', reserve_base: '1', reserve_inc: '0.2' },
+        amendment_votes: { ledger_index: VOTING_LEDGER, yes: [{ id: FLEET_AMENDMENT }] },
+        first_seen: instant(s.now - 90 * DAY),
+        last_seen: instant(s.now - 60.25),
+      });
+    });
+
+    it('lists the keys of every row in the order of VALIDATOR_ROW_KEYS, and never has a null', () => {
+      for (const row of unlList.body.validators) {
+        expect(Object.keys(row)).toEqual(orderedBy(VALIDATOR_ROW_KEYS, row));
+        expect(Object.keys(row.agreement_1h)).toEqual(orderedBy(AGREEMENT_KEYS, row.agreement_1h));
+        expect(Object.keys(row.agreement_24h)).toEqual(orderedBy(AGREEMENT_KEYS, row.agreement_24h));
+        expect(Object.keys(row.agreement_30d)).toEqual(orderedBy(AGREEMENT_KEYS, row.agreement_30d));
+        if (row.domain_verification) {
+          expect(Object.keys(row.domain_verification)).toEqual(
+            orderedBy(DOMAIN_VERIFICATION_KEYS, row.domain_verification),
+          );
+        }
+        if (row.fee_vote) expect(Object.keys(row.fee_vote)).toEqual([...FEE_VOTE_KEYS]);
+        if (row.amendment_votes) expect(Object.keys(row.amendment_votes)).toEqual(['ledger_index', 'yes']);
+      }
+      expect(Object.keys(rowOf(unlList, s.unl[0].key))).toEqual(
+        [...VALIDATOR_ROW_KEYS].filter((key) => key !== 'version_build'),
+      );
+      expect(JSON.stringify(unlList.body)).not.toContain('null');
+    });
+
+    it('says partial for a validator whose newest validation was partial', () => {
+      expect(rowOf(unlList, s.unl[1].key)).toMatchObject({ current_index: HEAD_LEDGER, partial: true });
+    });
+
+    it('has the fee vote of a validator: its own base fee and the fees in force for the rest', () => {
+      // unl[2] voted a base fee of 12 drops; the reserves are the ones in force at the round
+      expect(rowOf(unlList, s.unl[2].key).fee_vote).toEqual({
+        ledger_index: VOTING_LEDGER,
+        base_fee: '0.000012',
+        reserve_base: '1',
+        reserve_inc: '0.2',
+      });
+      expect(rowOf(unlList, s.unl[3].key).fee_vote).toEqual({
+        ledger_index: VOTING_LEDGER,
+        base_fee: '0.00001',
+        reserve_base: '1',
+        reserve_inc: '0.2',
+      });
+    });
+
+    it('says which validator is on the negative UNL', () => {
+      expect(rowOf(unlList, s.unl[4].key).negative_unl).toBe(true);
+      expect(rowOf(unlList, s.unl[5].key).negative_unl).toBe(false);
+    });
+
+    it('gives the verification of a domain: unverified with its reason, absent without a domain', () => {
+      expect(rowOf(unlList, s.unl[1].key).domain_verification).toEqual({
+        status: 'unverified',
+        reason: 'not_listed',
+        toml_url: 'https://shoreline.example/.well-known/xrp-ledger.toml',
+        checked: instant(s.now - 700.25),
+      });
+      expect(rowOf(unlList, s.unl[2].key)).not.toHaveProperty('domain_verification');
+      expect(rowOf(unlList, s.unl[2].key)).not.toHaveProperty('domain');
+    });
+
+    it('counts a validator seen and voting under its signing key for its master: unl[34]', () => {
+      expect(rowOf(unlList, s.unl[34].key)).toMatchObject({
+        current_index: HEAD_LEDGER,
+        version: '3.4.0',
+        version_latest: false,
+        amendment_votes: { ledger_index: VOTING_LEDGER },
+        last_seen: instant(s.now - 90.5),
+        first_seen: instant(s.now - 90 * DAY),
+      });
+      expect(rowOf(unlList, s.unl[34].key).agreement_30d.total).toBe(48 * 900);
+    });
+
+    it('sends Cache-Control: private, max-age=30', () => {
+      expect(unlList.headers['cache-control']).toBe('private, max-age=30');
+    });
+  });
+
+  describe('the list: scope=all', () => {
+    it('adds the 20 others seen in 24 hours to the UNL, and not those seen only within 30 days', () => {
+      expect(allList.body.count).toBe(55);
+      const others = s.others.map((m) => m.key);
+      const rest = [...s.unl.slice(2).map((m) => m.key), ...others.filter((key) => key !== s.others[1].key)];
+      expect(keys(allList)).toEqual(sortedKeys([s.unl[0].key, s.unl[1].key, s.others[1].key], rest));
+      const listed = new Set(keys(allList));
+      for (const lapsed of [...s.lapsed, s.dormant]) expect(listed.has(lapsed.key)).toBe(false);
+    });
+
+    it('has the others with what they have: tidewater.example, its verification recorded under a signing key', () => {
+      expect(rowOf(allList, s.others[1].key)).toMatchObject({
+        domain: 'tidewater.example',
+        unl: false,
+        unl_lists: [],
+        negative_unl: false,
+        domain_verification: {
+          status: 'verified',
+          toml_url: 'https://tidewater.example/.well-known/xrp-ledger.toml',
+          checked: instant(s.now - 300.125),
+          verified: instant(s.now - 300.125),
+        },
+      });
+      expect(rowOf(allList, s.others[1].key).domain_verification).not.toHaveProperty('accounts');
+    });
+
+    it('says what a validator off the UNL votes: its version, fee vote and amendments', () => {
+      expect(rowOf(allList, s.others[16].key)).toMatchObject({ version: '3.5.0-rc1', version_latest: true });
+      expect(rowOf(allList, s.others[19].key)).not.toHaveProperty('version');
+      expect(rowOf(allList, s.others[19].key)).not.toHaveProperty('server_version');
+      expect(rowOf(allList, s.others[0].key).amendment_votes).toEqual({
+        ledger_index: VOTING_LEDGER,
+        yes: [{ id: FLEET_AMENDMENT }],
+      });
+    });
+
+    it('answers scope=x with 400 invalid scope', async () => {
+      const res = await api.get(`${LIST}?scope=x`);
+      expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'invalid scope' }]);
+      expect(res.headers['cache-control']).toBe('no-store');
+    });
+  });
+
+  describe('filters', () => {
+    it('filters by publisher: the validators on its list in use', async () => {
+      const xrplf = await api.get(`${LIST}?publisher=unl.xrplf.org`);
+      expect(xrplf.status).toBe(200);
+      // its list is expired and still in use: 34 validators, the last UNL member (never seen) is not on it
+      expect(keys(xrplf)).toEqual(
+        sortedKeys(
+          [s.unl[0].key, s.unl[1].key],
+          s.unl.slice(2, 34).map((m) => m.key),
+        ),
+      );
+      for (const row of xrplf.body.validators) expect(row.unl_lists).toContain('unl.xrplf.org');
+      const ripple = await api.get(`${LIST}?publisher=vl.ripple.com`);
+      expect(ripple.body.count).toBe(35);
+    });
+
+    it('applies the scope and the publisher together', async () => {
+      const res = await api.get(`${LIST}?publisher=unl.xrplf.org&scope=all`);
+      expect(res.body.count).toBe(34);
+    });
+
+    it('answers a publisher it does not know with 400 invalid publisher', async () => {
+      const res = await api.get(`${LIST}?publisher=example.com`);
+      expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'invalid publisher' }]);
+    });
+
+    it('filters by amendment ID, in either case: the validators whose record votes for it', async () => {
+      const upper = await api.get(`${LIST}?scope=all&amendment=${FLEET_AMENDMENT}`);
+      // 54 voted: every validator seen in 24 hours; the member of the UNL never seen did not
+      expect(upper.body.count).toBe(54);
+      expect(keys(upper)).not.toContain(s.unl[33].key);
+      const lower = await api.get(`${LIST}?scope=all&amendment=${FLEET_AMENDMENT.toLowerCase()}`);
+      expect(keys(lower)).toEqual(keys(upper));
+      for (const row of upper.body.validators) {
+        expect(row.amendment_votes.yes.map((entry: { id: string }) => entry.id)).toContain(FLEET_AMENDMENT);
+      }
+    });
+
+    it('answers an ID nobody voted for with an empty list, and a name nobody knows with 400 invalid amendment', async () => {
+      const none = await api.get(`${LIST}?amendment=${'0F'.repeat(32)}`);
+      expect([none.status, none.body]).toEqual([200, { result: 'success', count: 0, validators: [] }]);
+      for (const bad of ['NoSuchAmendment', 'AB'.repeat(31), 'zz'.repeat(32)]) {
+        const res = await api.get(`${LIST}?amendment=${bad}`);
+        expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'invalid amendment' }]);
+      }
+    });
+
+    it('searches the domain, without regard to case', async () => {
+      const res = await api.get(`${LIST}?q=NorthPeak`);
+      expect(keys(res)).toEqual([s.unl[0].key]);
+      const both = await api.get(`${LIST}?q=.example&scope=all`);
+      expect(keys(both)).toEqual([s.unl[0].key, s.unl[1].key, s.others[1].key]);
+    });
+
+    it('searches a master key by a part of it', async () => {
+      const part = s.unl[7].key.slice(4, 20);
+      const res = await api.get(`${LIST}?q=${part.toLowerCase()}`);
+      expect(keys(res)).toEqual([s.unl[7].key]);
+    });
+
+    it('searches a signing key by a part of it: the one unl[0] rotated to, not the one before it', async () => {
+      const rotated = await api.get(`${LIST}?q=${s.rotated.base58.slice(3, 22)}`);
+      expect(keys(rotated)).toEqual([s.unl[0].key]);
+      const older = await api.get(`${LIST}?q=${s.unl[0].ephemeral}`);
+      expect(older.body.count).toBe(0);
+      const current = await api.get(`${LIST}?q=${s.unl[9].ephemeral}`);
+      expect(keys(current)).toEqual([s.unl[9].key]);
+    });
+
+    it('searches within the scope: tidewater.example is off the UNL', async () => {
+      expect((await api.get(`${LIST}?q=tidewater`)).body.count).toBe(0);
+      expect(keys(await api.get(`${LIST}?q=tidewater&scope=all`))).toEqual([s.others[1].key]);
+    });
+
+    it('allows a search of 100 characters and refuses 101 with 400 invalid search', async () => {
+      expect((await api.get(`${LIST}?q=${'a'.repeat(100)}`)).status).toBe(200);
+      const res = await api.get(`${LIST}?q=${'a'.repeat(101)}`);
+      expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'invalid search' }]);
+    });
+
+    it('applies every filter together', async () => {
+      const res = await api.get(
+        `${LIST}?scope=all&publisher=vl.ripple.com&amendment=${FLEET_AMENDMENT}&q=${encodeURIComponent('.example')}`,
+      );
+      expect(keys(res)).toEqual([s.unl[0].key, s.unl[1].key]);
+    });
+
+    it('checks in the order scope, publisher, amendment, search, marker', async () => {
+      const message = async (query: string): Promise<string> => (await api.get(`${LIST}?${query}`)).body.message;
+      const q = 'a'.repeat(101);
+      expect(await message(`scope=x&publisher=x&amendment=x&q=${q}&marker=%25%25%25`)).toBe('invalid scope');
+      expect(await message(`publisher=x&amendment=x&q=${q}&marker=%25%25%25`)).toBe('invalid publisher');
+      expect(await message(`amendment=x&q=${q}&marker=%25%25%25`)).toBe('invalid amendment');
+      expect(await message(`q=${q}&marker=%25%25%25`)).toBe('invalid search');
+      expect(await message('marker=%25%25%25')).toBe('invalid marker');
+    });
+
+    it('ignores the parameters it does not know', async () => {
+      const res = await api.get(`${LIST}?foo=bar&sort=desc&descending=true&strict=false`);
+      expect(keys(res)).toEqual(keys(unlList));
+    });
+  });
+
+  describe('paging', () => {
+    it.each([1, 2, 3])('concatenates the pages of limit=%i to the unpaged list', async (limit) => {
+      const pages = await api.pages<Answer['body']>(`${LIST}?scope=all`, limit, 'validators');
+      const walked = pages.flatMap((page) =>
+        page.validators.map((row: { validation_public_key: string }) => row.validation_public_key),
+      );
+      expect(walked).toEqual(keys(allList));
+      // every page but the last is full and has the marker; the last has none
+      for (const page of pages.slice(0, -1)) {
+        expect(page.count).toBe(limit);
+        expect(page.marker).toEqual(expect.any(String));
+      }
+      expect(pages[pages.length - 1]).not.toHaveProperty('marker');
+      expect(pages).toHaveLength(Math.ceil(55 / limit));
+    });
+
+    it('has the marker of the last row, base64url of [group, sort text, master key], and the Link header', async () => {
+      const first = await api.get(`${LIST}?scope=all&limit=3`);
+      expect(first.body.count).toBe(3);
+      expect(Object.keys(first.body)).toEqual([...LIST_BODY_KEYS]);
+      const decoded = JSON.parse(Buffer.from(first.body.marker, 'base64url').toString('utf8'));
+      // the third of the list is tidewater.example, the last with a domain
+      expect(decoded).toEqual([0, 'tidewater.example', s.others[1].key]);
+      expect(first.headers.link).toMatch(
+        new RegExp(
+          `^<http://[^>]+/v2/network/validators\\?scope=all&limit=3&marker=${first.body.marker}>; rel="next"$`,
+        ),
+      );
+      const second = await api.get(`${LIST}?scope=all&limit=3&marker=${first.body.marker}`);
+      // the first without a domain: group 1, the empty text
+      expect(JSON.parse(Buffer.from(second.body.marker, 'base64url').toString('utf8'))).toEqual([
+        1,
+        '',
+        second.body.validators[2].validation_public_key,
+      ]);
+      expect(keys(second)).toEqual(keys(allList).slice(3, 6));
+    });
+
+    it('has no Link header on the last page', async () => {
+      const last = await api.get(`${LIST}?scope=all&limit=1000`);
+      expect(last.headers.link).toBeUndefined();
+      expect(last.body).not.toHaveProperty('marker');
+    });
+
+    it('resumes after a marker whose row is gone', async () => {
+      const marker = Buffer.from(JSON.stringify([1, '', 'nHAAAA'])).toString('base64url');
+      const res = await api.get(`${LIST}?scope=all&marker=${marker}`);
+      expect(keys(res)).toEqual(
+        keys(allList).filter((key) => key > 'nHAAAA' && !keys(allList).slice(0, 3).includes(key)),
+      );
+    });
+
+    it('answers a marker it cannot read with 400 invalid marker', async () => {
+      const bad = [
+        '%25%25%25',
+        Buffer.from('[2,"a","b"]').toString('base64url'),
+        Buffer.from('[0,"a"]').toString('base64url'),
+        Buffer.from('{"a":1}').toString('base64url'),
+        Buffer.from('[0,1,"b"]').toString('base64url'),
+      ];
+      for (const marker of bad) {
+        const res = await api.get(`${LIST}?marker=${marker}`);
+        expect([marker, res.status, res.body]).toEqual([marker, 400, { result: 'error', message: 'invalid marker' }]);
+      }
+    });
+
+    it('takes limit as it is taken everywhere: 200 by default, 1000 at most', async () => {
+      expect((await api.get(`${LIST}?scope=all&limit=0`)).body.count).toBe(55);
+      expect((await api.get(`${LIST}?scope=all&limit=5000`)).body.count).toBe(55);
+      expect((await api.get(`${LIST}?scope=all&limit=10`)).body.count).toBe(10);
+    });
+  });
+
+  describe('format=csv', () => {
+    const cells = (line: string): string[] => line.split(',').map((cell) => cell.replace(/^"|"$/g, ''));
+    let csv: Answer;
+
+    beforeAll(async () => {
+      csv = await api.get(`${LIST}?format=csv`);
+    });
+
+    it('is validators.csv, one row for each validator of the page', () => {
+      expect(csv.status).toBe(200);
+      expect(csv.headers['content-type']).toMatch(/^text\/csv/);
+      expect(csv.headers['content-disposition']).toBe(csvDisposition('validators'));
+      expect(csv.text.split('\n')).toHaveLength(1 + 35);
+    });
+
+    it('flattens the rows: a column for each nested key, the master key first', () => {
+      const [header, first] = csv.text.split('\n');
+      const columns = cells(header);
+      expect(columns.slice(0, 3)).toEqual(['validation_public_key', 'domain', 'current_index']);
+      expect(columns).toEqual(
+        expect.arrayContaining([
+          'agreement_24h.score',
+          'agreement_30d.incomplete',
+          'domain_verification.accounts[0]',
+          'unl_lists[0]',
+          'unl_lists[1]',
+          'fee_vote.base_fee',
+          'amendment_votes.yes[0].id',
+          'last_seen',
+        ]),
+      );
+      expect(cells(first)[0]).toBe(s.unl[0].key);
+      expect(cells(first)[columns.indexOf('fee_vote.base_fee')]).toBe('0.00001');
+    });
+
+    it('follows the filters and the page', async () => {
+      const res = await api.get(`${LIST}?format=csv&q=northpeak`);
+      expect(res.text.split('\n')).toHaveLength(2);
+      const paged = await api.get(`${LIST}?format=csv&limit=4`);
+      expect(paged.text.split('\n')).toHaveLength(5);
+      expect(paged.headers.link).toMatch(/rel="next"/);
+    });
+
+    it('sends Cache-Control: private, max-age=30 as the JSON does', () => {
+      expect(csv.headers['cache-control']).toBe('private, max-age=30');
+    });
+  });
+
+  // -- the detail -----------------------------------------------------------------------------------------------------
+
+  describe('the detail of a validator', () => {
+    let northpeak: Answer;
+
+    beforeAll(async () => {
+      northpeak = await api.get(detailOf(s.unl[0].key));
+    });
+
+    const daily = (answer: Answer): Record<string, any>[] => answer.body.daily_agreement;
+
+    it('is the flat object: the row, then the manifest, the days and the result', () => {
+      expect(northpeak.status).toBe(200);
+      const { daily_agreement: days, ...rest } = northpeak.body;
+      expect(rest).toEqual({
+        ...rowOf(unlList, s.unl[0].key),
+        amendment_votes: {
+          ledger_index: VOTING_LEDGER,
+          yes: [{ id: FLEET_AMENDMENT }],
+          votes: [{ id: FLEET_AMENDMENT, status: 'voting', vote: 'yes' }],
+        },
+        manifest: { sequence: 2, signing_key: s.rotated.base58, signing_keys_seen: 2, domain: 'northpeak.example' },
+        result: 'success',
+      });
+      expect(days).toHaveLength(30);
+    });
+
+    it('lists its keys in the order of the row, then DETAIL_TAIL_KEYS', () => {
+      expect(Object.keys(northpeak.body)).toEqual(
+        [...VALIDATOR_ROW_KEYS, ...DETAIL_TAIL_KEYS].filter((key) => key !== 'version_build'),
+      );
+      expect(Object.keys(northpeak.body.amendment_votes)).toEqual([...DETAIL_AMENDMENT_VOTES_KEYS]);
+      expect(Object.keys(northpeak.body.amendment_votes.votes[0])).toEqual(
+        orderedBy(VOTE_ENTRY_KEYS, northpeak.body.amendment_votes.votes[0]),
+      );
+      expect(Object.keys(northpeak.body.manifest)).toEqual([...MANIFEST_KEYS]);
+      expect(JSON.stringify(northpeak.body)).not.toContain('null');
+    });
+
+    it('has 30 days of agreement, the oldest first, the last of them the day of the newest final hour', () => {
+      const days = daily(northpeak);
+      expect(days).toHaveLength(30);
+      const dates = days.map((day) => day.date);
+      expect(dates).toEqual([...dates].sort());
+      expect(new Set(dates).size).toBe(30);
+      expect(dates[29]).toBe(new Date(s.newestHour * 1000).toISOString().slice(0, 10));
+      for (const day of days) expect(Object.keys(day)).toEqual(orderedBy(DAILY_KEYS, day));
+      // no hour was recorded 29 days ago: nothing was held, nothing to score, and the day is not complete
+      expect(days[0]).toEqual({ date: dates[0], missed: 0, total: 0, incomplete: true, partial: 0 });
+    });
+
+    it('adds the days up to the window of 30 days, and finishes the newest day with the newest final hour', () => {
+      const days = daily(northpeak);
+      const sum = (field: 'total' | 'missed' | 'partial'): number => days.reduce((all, day) => all + day[field], 0);
+      const thirty = northpeak.body.agreement_30d;
+      expect([sum('total'), sum('missed'), sum('partial')]).toEqual([thirty.total, thirty.missed, thirty.partial]);
+      const hourOfDay = new Date(s.newestHour * 1000).getUTCHours();
+      expect(days[29]).toMatchObject({ total: (hourOfDay + 1) * 900, incomplete: hourOfDay !== 23 });
+    });
+
+    it('has the vote of every amendment being decided: the one of the fleet, yes', () => {
+      expect(northpeak.body.amendment_votes.votes).toEqual([{ id: FLEET_AMENDMENT, status: 'voting', vote: 'yes' }]);
+    });
+
+    it('answers a signing key with the validator it belongs to, which it names as validation_public_key', async () => {
+      const current = await api.get(detailOf(s.rotated.base58));
+      expect(current.status).toBe(200);
+      expect(current.body).toEqual(northpeak.body);
+      // a signing key it left is still its signing key
+      const older = await api.get(detailOf(s.unl[0].ephemeral));
+      expect(older.body.validation_public_key).toBe(s.unl[0].key);
+      const other = await api.get(detailOf(s.unl[2].ephemeral));
+      expect(other.body.validation_public_key).toBe(s.unl[2].key);
+      // a validator whose master key was seen only under its signing key
+      expect((await api.get(detailOf(s.unl[34].ephemeral))).body.validation_public_key).toBe(s.unl[34].key);
+    });
+
+    it('answers 66 hex digits as the key they are, in either case, a master or a signing key', async () => {
+      const hex = s.unl[0].master.publicKeyHex;
+      expect(hex).toMatch(/^ED[0-9A-F]{64}$/);
+      for (const spelled of [hex, hex.toLowerCase()]) {
+        const res = await api.get(detailOf(spelled));
+        expect([res.status, res.body]).toEqual([200, northpeak.body]);
+      }
+      const signing = await api.get(detailOf(s.unl[2].signing.publicKeyHex.toLowerCase()));
+      expect(signing.body.validation_public_key).toBe(s.unl[2].key);
+    });
+
+    it('answers a validator seen 40 days ago, which no list has', async () => {
+      const res = await api.get(detailOf(s.dormant.key));
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        validation_public_key: s.dormant.key,
+        unl: false,
+        unl_lists: [],
+        first_seen: instant(s.now - 80 * DAY),
+        last_seen: instant(s.now - 40 * DAY),
+        manifest: { sequence: 1, signing_key: s.dormant.ephemeral, signing_keys_seen: 1 },
+        amendment_votes: { yes: [], votes: [{ id: FLEET_AMENDMENT, status: 'voting', vote: 'none' }] },
+        result: 'success',
+      });
+      expect(res.body.amendment_votes).not.toHaveProperty('ledger_index');
+      expect(res.body.daily_agreement).toHaveLength(30);
+      // it is not listed
+      expect(keys(allList)).not.toContain(s.dormant.key);
+    });
+
+    it('answers a validator seen 3 days ago with the version of its last vote, and no record: none, no ledger_index', async () => {
+      const res = await api.get(detailOf(s.lapsed[0].key));
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        version: '3.4.0',
+        version_latest: false,
+        server_version: serverVersion(3, 4, 0),
+      });
+      expect(res.body).not.toHaveProperty('fee_vote');
+      expect(res.body.amendment_votes).toEqual({
+        yes: [],
+        votes: [{ id: FLEET_AMENDMENT, status: 'voting', vote: 'none' }],
+      });
+      expect(Object.keys(res.body.amendment_votes)).toEqual(['yes', 'votes']);
+    });
+
+    it('answers the member of the UNL that was never seen, with its manifest and no first_seen', async () => {
+      const res = await api.get(detailOf(s.unl[33].key));
+      expect(res.status).toBe(200);
+      expect(res.body).not.toHaveProperty('first_seen');
+      expect(res.body).not.toHaveProperty('last_seen');
+      expect(res.body.unl).toBe(true);
+      expect(res.body.manifest).toEqual({ sequence: 1, signing_key: s.unl[33].ephemeral, signing_keys_seen: 1 });
+    });
+
+    it('answers a key of the right form that nobody knows with 404 Validator not found', async () => {
+      const unknown = fleet('xrpl', 60)[59];
+      for (const key of [unknown.key, unknown.ephemeral, unknown.master.publicKeyHex]) {
+        const res = await api.get(detailOf(key));
+        expect([res.status, res.body]).toEqual([404, { result: 'error', message: 'Validator not found' }]);
+        expect(res.headers['cache-control']).toBe('no-store');
+      }
+    });
+
+    it('answers a key that is none with 400 invalid validator public key', async () => {
+      const bad = [
+        'nothing',
+        'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh',
+        s.unl[0].master.publicKeyHex.slice(2),
+        `04${s.unl[0].master.publicKeyHex.slice(2)}`,
+        `${s.unl[0].master.publicKeyHex}00`,
+        s.unl[0].key.slice(0, -2),
+      ];
+      for (const key of bad) {
+        const res = await api.get(detailOf(key));
+        expect([key, res.status, res.body]).toEqual([
+          key,
+          400,
+          { result: 'error', message: 'invalid validator public key' },
+        ]);
+      }
+    });
+
+    it('is JSON only: format=csv is ignored', async () => {
+      const res = await api.get(`${detailOf(s.unl[0].key)}?format=csv&limit=1&marker=x`);
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toMatch(/json/);
+      expect(res.body).toEqual(northpeak.body);
+    });
+
+    it('sends Cache-Control: private, max-age=30', () => {
+      expect(northpeak.headers['cache-control']).toBe('private, max-age=30');
+    });
+
+    it('does not take summary for a key: the summary is still the summary', async () => {
+      const res = await api.get(`${LIST}/summary`);
+      expect(res.status).toBe(200);
+      expect(res.body.validators).toEqual({ seen_24h: 54, unl_seen_24h: 34, others_seen_24h: 20, all: 55 });
+    });
+  });
+
+  describe('the shared directory and the reads', () => {
+    it('is not changed by any of the answers: the same directory, entry for entry', () => {
+      expect(sameDirectory).toBe(true);
+      expect(directoryAfter).toBe(directoryBefore);
+    });
+
+    it('serves the list and the detail from the directory and the amendments it has: no read at all within 10 s', async () => {
+      // a build right before the measure, so that the 10 s of the directory and of the assembly are not over
+      expect((await api.get(LIST)).status).toBe(200);
+      const reads = await readsOf(h, Table.ValidatorSeen, async () => {
+        expect((await api.get(`${LIST}?scope=all&limit=5`)).status).toBe(200);
+        expect((await api.get(detailOf(s.unl[0].key))).status).toBe(200);
+      });
+      expect(reads).toHaveLength(0);
+    });
+  });
+});
+
+// ===================================================================================================================
+// the amendments a validator votes on
+// ===================================================================================================================
+
+describe('GET /v2/network/validators and /{key}: the votes on the amendments of a board (XRPL)', () => {
+  let h: Harness;
+  let api: ApiClient;
+  let b: BoardScenario;
+
+  const keys = (answer: Answer): string[] =>
+    answer.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key);
+  /** unl[0] and unl[1] have a domain: first, then the others by key. */
+  const unlOrder = (indexes: number[]): string[] => {
+    const withDomain = indexes.filter((i) => i < 2).map((i) => b.unl[i].key);
+    return [
+      ...withDomain,
+      ...indexes
+        .filter((i) => i >= 2)
+        .map((i) => b.unl[i].key)
+        .sort(),
+    ];
+  };
+
+  beforeAll(async () => {
+    h = (
+      await startWithDirectory({
+        seed: 'none',
+        network: 'xrpl',
+        env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: FIXTURE },
+      })
+    ).h;
+    api = await h.api();
+    b = await seedAmendmentBoard(h.ch);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  describe('the list', () => {
+    it('filters by the name of an amendment: the validators whose record votes for it', async () => {
+      const res = await api.get(`${LIST}?amendment=${BOARD_NAMES.voting}`);
+      expect(res.status).toBe(200);
+      // TestVoting has four yes votes: unl[0..3]
+      expect(keys(res)).toEqual(unlOrder([0, 1, 2, 3]));
+      for (const row of res.body.validators) {
+        expect(row.amendment_votes.yes).toContainEqual({ id: BOARD_IDS.voting, name: BOARD_NAMES.voting });
+      }
+    });
+
+    it('filters by the name in any case when only one amendment has it, and by the ID in either case', async () => {
+      const expected = unlOrder([0, 1, 2, 3]);
+      expect(keys(await api.get(`${LIST}?amendment=${BOARD_NAMES.voting.toLowerCase()}`))).toEqual(expected);
+      expect(keys(await api.get(`${LIST}?amendment=${BOARD_IDS.voting}`))).toEqual(expected);
+      expect(keys(await api.get(`${LIST}?amendment=${BOARD_IDS.voting.toLowerCase()}`))).toEqual(expected);
+    });
+
+    it('counts the validators of the UNL that vote for an amendment, and those off the UNL with scope=all', async () => {
+      // 31 yes in the newest round; others[0] votes for it too, and others[3] (seen 3 days ago) does as well
+      expect((await api.get(`${LIST}?amendment=${BOARD_NAMES.majority}`)).body.count).toBe(31);
+      const all = await api.get(`${LIST}?amendment=${BOARD_NAMES.majority}&scope=all`);
+      expect(all.body.count).toBe(32);
+      expect(keys(all)).toContain(b.others[0].key);
+      expect(keys(all)).not.toContain(b.others[3].key);
+    });
+
+    it('lists a validator off the UNL for an amendment only it votes for, and none on the UNL', async () => {
+      expect((await api.get(`${LIST}?amendment=${BOARD_IDS.votedByOther}`)).body.count).toBe(0);
+      const all = await api.get(`${LIST}?amendment=${BOARD_IDS.votedByOther}&scope=all`);
+      expect(keys(all)).toEqual([b.others[0].key]);
+    });
+
+    it('names the amendments of a yes list from the metadata and from the node, not those with no name', async () => {
+      const res = await api.get(`${LIST}?q=northpeak`);
+      expect(res.body.validators[0].amendment_votes).toEqual({
+        ledger_index: VOTING_LEDGER,
+        yes: [
+          { id: BOARD_IDS.majority, name: 'TestMajority' },
+          { id: BOARD_IDS.voting, name: 'TestVoting' },
+          { id: BOARD_IDS.enabledLedger, name: 'TestEnabledLedger' },
+          { id: BOARD_IDS.majorityNameless },
+          { id: BOARD_IDS.nodeOnly, name: 'NodeNamedOnly' },
+          { id: BOARD_IDS.unsupportedVoted, name: 'StillVoted' },
+        ],
+      });
+    });
+
+    it('answers 400 invalid amendment for a name that is none', async () => {
+      const res = await api.get(`${LIST}?amendment=TestNothing`);
+      expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'invalid amendment' }]);
+    });
+
+    it('searches the domains of the board', async () => {
+      expect(keys(await api.get(`${LIST}?q=shoreline`))).toEqual([b.unl[1].key]);
+      expect(keys(await api.get(`${LIST}?q=tidewater&scope=all`))).toEqual([b.others[0].key]);
+    });
+  });
+
+  describe('the detail', () => {
+    let first: Answer;
+    let none: Answer;
+    let nothing: Answer;
+
+    beforeAll(async () => {
+      first = await api.get(detailOf(b.unl[0].key));
+      // unl[35] is on the UNL and never voted; others[1] voted for nothing
+      none = await api.get(detailOf(b.unl[35].key));
+      nothing = await api.get(detailOf(b.others[1].key));
+    });
+
+    it('has a vote for every amendment being decided, in the order of the amendments, unknown ones included', () => {
+      expect(first.body.amendment_votes.votes).toEqual([
+        { id: BOARD_IDS.majorityNameless, status: 'majority', vote: 'yes' },
+        { id: BOARD_IDS.majority, name: BOARD_NAMES.majority, status: 'majority', vote: 'yes' },
+        { id: BOARD_IDS.voting, name: BOARD_NAMES.voting, status: 'voting', vote: 'yes' },
+        { id: BOARD_IDS.unsupportedVoted, name: 'StillVoted', status: 'voting', vote: 'yes' },
+        { id: BOARD_IDS.nodeOnly, name: 'NodeNamedOnly', status: 'voting', vote: 'yes' },
+        { id: BOARD_IDS.idle, name: BOARD_NAMES.idle, status: 'voting', vote: 'no' },
+        { id: BOARD_IDS.votedByOther, status: 'voting', vote: 'no' },
+        { id: BOARD_IDS.unknown, status: 'unknown', vote: 'no' },
+      ]);
+    });
+
+    it('holds an unknown amendment without a name (G4), and leaves out the enabled and the obsolete ones', () => {
+      const unknown = first.body.amendment_votes.votes.find((vote: { id: string }) => vote.id === BOARD_IDS.unknown);
+      expect(unknown).toEqual({ id: BOARD_IDS.unknown, status: 'unknown', vote: 'no' });
+      expect(unknown).not.toHaveProperty('name');
+      const ids = first.body.amendment_votes.votes.map((vote: { id: string }) => vote.id);
+      for (const left of [
+        BOARD_IDS.enabledLedger,
+        BOARD_IDS.enabledFile,
+        BOARD_IDS.enabledBare,
+        BOARD_IDS.obsolete,
+        BOARD_IDS.obsoleteNode,
+      ]) {
+        expect(ids).not.toContain(left);
+      }
+      // what it voted for stays in its yes list, enabled or not
+      expect(first.body.amendment_votes.yes.map((entry: { id: string }) => entry.id)).toContain(
+        BOARD_IDS.enabledLedger,
+      );
+    });
+
+    it('lists the keys of the votes, of every vote and of the amendment_votes in order', () => {
+      expect(Object.keys(first.body.amendment_votes)).toEqual([...DETAIL_AMENDMENT_VOTES_KEYS]);
+      for (const vote of first.body.amendment_votes.votes) {
+        expect(Object.keys(vote)).toEqual(orderedBy(VOTE_ENTRY_KEYS, vote));
+      }
+    });
+
+    it('says none for every amendment, with an empty yes and no ledger_index, for a validator that never voted', () => {
+      expect(none.status).toBe(200);
+      expect(none.body.amendment_votes).toEqual({
+        yes: [],
+        votes: [
+          { id: BOARD_IDS.majorityNameless, status: 'majority', vote: 'none' },
+          { id: BOARD_IDS.majority, name: BOARD_NAMES.majority, status: 'majority', vote: 'none' },
+          { id: BOARD_IDS.voting, name: BOARD_NAMES.voting, status: 'voting', vote: 'none' },
+          { id: BOARD_IDS.unsupportedVoted, name: 'StillVoted', status: 'voting', vote: 'none' },
+          { id: BOARD_IDS.nodeOnly, name: 'NodeNamedOnly', status: 'voting', vote: 'none' },
+          { id: BOARD_IDS.idle, name: BOARD_NAMES.idle, status: 'voting', vote: 'none' },
+          { id: BOARD_IDS.votedByOther, status: 'voting', vote: 'none' },
+          { id: BOARD_IDS.unknown, status: 'unknown', vote: 'none' },
+        ],
+      });
+      expect(Object.keys(none.body.amendment_votes)).toEqual(['yes', 'votes']);
+      expect(none.body).not.toHaveProperty('fee_vote');
+    });
+
+    it('says no, not none, for a validator whose record votes for nothing', () => {
+      expect(nothing.body.amendment_votes.ledger_index).toBe(VOTING_LEDGER);
+      expect(nothing.body.amendment_votes.yes).toEqual([]);
+      expect(nothing.body.amendment_votes.votes.map((vote: { vote: string }) => vote.vote)).toEqual(
+        Array(8).fill('no'),
+      );
+    });
+
+    it('answers a validator whose votes were recorded under its signing key', async () => {
+      const res = await api.get(detailOf(b.unl[5].ephemeral));
+      expect(res.body.validation_public_key).toBe(b.unl[5].key);
+      // unl[5] votes for the amendments with more than 5 yes votes: of the ones being decided, the two majorities
+      expect(
+        res.body.amendment_votes.votes
+          .filter((vote: { vote: string }) => vote.vote === 'yes')
+          .map((vote: { id: string }) => vote.id),
+      ).toEqual([BOARD_IDS.majorityNameless, BOARD_IDS.majority]);
+    });
+  });
+});
+
+// ===================================================================================================================
+// Xahau
+// ===================================================================================================================
+
+describe('GET /v2/network/validators and /{key}: on Xahau', () => {
+  let h: Harness;
+  let api: ApiClient;
+  let members: ReturnType<typeof fleet>;
+  let list: Answer;
+  const XA = 'AA'.repeat(32);
+
+  beforeAll(async () => {
+    h = (
+      await startWithDirectory({
+        seed: 'none',
+        network: 'xahau',
+        env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xahau },
+      })
+    ).h;
+    api = await h.api();
+    members = fleet('xahau', 5);
+    const now = Math.floor(Date.now() / 1000);
+    await insertLists(h.ch, [
+      {
+        publisher: 'vl.xahau.org',
+        sequence: 2_026_092_401,
+        expiration: now + 86_400,
+        validators: members.map((m) => m.key),
+      },
+    ]);
+    await insertPublishers(h.ch, [{ publisher: 'vl.xahau.org', checked_at: now - 10 }]);
+    // the fifth has no manifest
+    await insertManifests(h.ch, [
+      { ephemeral_key: members[0].ephemeral, master_key: members[0].key, seq: 1, domain: 'north.example' },
+      { ephemeral_key: members[1].ephemeral, master_key: members[1].key, seq: 1, domain: 'south.example' },
+      { ephemeral_key: members[2].ephemeral, master_key: members[2].key, seq: 1 },
+      { ephemeral_key: members[3].ephemeral, master_key: members[3].key, seq: 1 },
+    ]);
+    await insertDomains(h.ch, [
+      {
+        validation_public_key: members[1].key,
+        domain: 'south.example',
+        toml_url: 'https://south.example/.well-known/xahau.toml',
+        checked_at: now - 100,
+        accounts: ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+      },
+    ]);
+    await insertSeen(
+      h.ch,
+      members.map((m) => ({ key: m.key, first: now - 86_400, last: now - 30 })),
+    );
+    // 3.10.13 builds 4119 and 4120 are 2026.10.13, 3.9.2 is 2026.9.2, 3.10.14-rc1 is a candidate of a newer version
+    await insertRound(h.ch, {
+      ledgerIndex: 26_633_471,
+      closeTime: now - 600,
+      unl: members.map((m) => m.key),
+      votes: [
+        { key: members[0].key, amendments: [XA], serverVersion: serverVersion(3, 10, 13, 0, 4119), base_fee: 20 },
+        { key: members[1].key, serverVersion: serverVersion(3, 10, 13, 0, 4120) },
+        { key: members[2].key, serverVersion: serverVersion(3, 9, 2, 0, 1) },
+        { key: members[3].key, serverVersion: serverVersion(3, 10, 14, RC1, 7) },
+      ],
+    });
+    list = await api.get(LIST);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('lists the UNL of Xahau: the validators with a domain first, then by key', () => {
+    expect(list.status).toBe(200);
+    expect(list.body.count).toBe(5);
+    expect(list.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key)).toEqual([
+      members[0].key,
+      members[1].key,
+      ...[2, 3, 4].map((i) => members[i].key).sort(),
+    ]);
+  });
+
+  it('has the build of a validator after its version, and the year of the version counted from 2023', () => {
+    const north = list.body.validators[0];
+    expect(north).toMatchObject({ version: '2026.10.13', version_build: 4119, version_latest: true });
+    const keysOfNorth = Object.keys(north);
+    expect(keysOfNorth.indexOf('version_build')).toBe(keysOfNorth.indexOf('version') + 1);
+    expect(keysOfNorth).toEqual(orderedBy(VALIDATOR_ROW_KEYS, north));
+    expect(list.body.validators[1]).toMatchObject({ version: '2026.10.13', version_build: 4120 });
+    const byKey = (key: string) =>
+      list.body.validators.find((row: { validation_public_key: string }) => row.validation_public_key === key);
+    expect(byKey(members[2].key)).toMatchObject({ version: '2026.9.2', version_build: 1, version_latest: false });
+    expect(byKey(members[3].key)).toMatchObject({ version: '2026.10.14-rc1', version_build: 7, version_latest: true });
+    expect(byKey(members[4].key)).not.toHaveProperty('version');
+    expect(byKey(members[4].key)).not.toHaveProperty('version_build');
+  });
+
+  it('checks the TOML of Xahau at /.well-known/xahau.toml: pending before a check, verified with its accounts after', () => {
+    expect(list.body.validators[0].domain_verification).toEqual({
+      status: 'pending',
+      toml_url: 'https://north.example/.well-known/xahau.toml',
+    });
+    expect(list.body.validators[1].domain_verification).toMatchObject({
+      status: 'verified',
+      toml_url: 'https://south.example/.well-known/xahau.toml',
+      accounts: ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+    });
+  });
+
+  it('says the fee a validator voted for in whole units, and the fees in force for what it left out', () => {
+    expect(list.body.validators[0].fee_vote).toEqual({
+      ledger_index: 26_633_471,
+      base_fee: '0.00002',
+      reserve_base: '1',
+      reserve_inc: '0.2',
+    });
+  });
+
+  it('has the detail of a validator with its build, its pending verification and the votes of Xahau', async () => {
+    const res = await api.get(detailOf(members[0].ephemeral));
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      validation_public_key: members[0].key,
+      domain: 'north.example',
+      signing_key: members[0].ephemeral,
+      version: '2026.10.13',
+      version_build: 4119,
+      amendment_votes: {
+        ledger_index: 26_633_471,
+        yes: [{ id: XA }],
+        votes: [{ id: XA, status: 'voting', vote: 'yes' }],
+      },
+      manifest: { sequence: 1, signing_key: members[0].ephemeral, signing_keys_seen: 1, domain: 'north.example' },
+      result: 'success',
+    });
+    // no validation of the last 300 ledgers is stored here: no current_index and no partial
+    expect(Object.keys(res.body)).toEqual(orderedBy([...VALIDATOR_ROW_KEYS, ...DETAIL_TAIL_KEYS], res.body));
+    expect(res.body).not.toHaveProperty('current_index');
+  });
+
+  it('has the detail of a validator with no manifest: no signing_key and no manifest', async () => {
+    const res = await api.get(detailOf(members[4].key));
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty('signing_key');
+    expect(res.body).not.toHaveProperty('manifest');
+    expect(res.body).not.toHaveProperty('domain');
+    expect(res.body.unl).toBe(true);
+    // no hour of agreement is final yet
+    expect(res.body.daily_agreement).toEqual([]);
+    expect(Object.keys(res.body).slice(-2)).toEqual(['daily_agreement', 'result']);
+  });
+
+  it('answers a hex key on Xahau too', async () => {
+    const res = await api.get(detailOf(members[1].master.publicKeyHex.toLowerCase()));
+    expect(res.body.validation_public_key).toBe(members[1].key);
+  });
+});
+
+// ===================================================================================================================
+// failures and the transport
+// ===================================================================================================================
+
+describe('GET /v2/network/validators and /{key}: when ClickHouse fails', () => {
+  let h: Harness;
+
+  beforeAll(async () => {
+    // an app that has not built a directory yet: a built one is answered from the cache for 10 s
+    h = await startHarness({ seed: 'none', env: NO_RATE_LIMIT });
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('is a failure of the route: 500 unable to retrieve validator(s), no-store, and the failure is not cached', async () => {
+    const api = await h.api();
+    const key = fleet('xrpl', 1)[0].key;
+    const spy = jest.spyOn(h.ch, 'query').mockRejectedValue(new Error('Code: 241. Memory limit exceeded'));
+    for (const path of [LIST, `${LIST}?format=csv`, detailOf(key)]) {
+      const failed = await api.get(path);
+      expect([path, failed.status, failed.body]).toEqual([
+        path,
+        500,
+        { result: 'error', message: 'unable to retrieve validator(s)' },
+      ]);
+      expect(failed.headers['cache-control']).toBe('no-store');
+      expect(JSON.stringify(failed.body)).not.toContain('Memory limit');
+    }
+    // a key that is none is refused before anything is read
+    const refused = await api.get(detailOf('nothing'));
+    expect([refused.status, refused.body]).toEqual([400, { result: 'error', message: 'invalid validator public key' }]);
+
+    spy.mockRestore();
+    const recovered = await api.get(LIST);
+    expect(recovered.status).toBe(200);
+    expect(recovered.headers['cache-control']).toBe('private, max-age=30');
+    // nobody is known: an empty list, and 404 for a key
+    expect(recovered.body).toEqual({ result: 'success', count: 0, validators: [] });
+    expect((await api.get(detailOf(key))).status).toBe(404);
+  });
+
+  it('requires the API key', async () => {
+    for (const path of [LIST, detailOf(fleet('xrpl', 1)[0].key)]) {
+      const res = await h.http().get(path);
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ result: 'error', message: 'Missing or invalid API key.' });
+    }
+  });
+});
+
+describe('GET /v2/network/validators and /{key}: with GH_CACHE_CONTROL empty', () => {
+  let h: Harness;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', env: { ...NO_RATE_LIMIT, GH_CACHE_CONTROL: '' } });
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('sends no Cache-Control on a success and no-store on an error', async () => {
+    const api = await h.api();
+    const list = await api.get(LIST);
+    expect(list.status).toBe(200);
+    expect(list.headers['cache-control']).toBeUndefined();
+    const missing = await api.get(detailOf(fleet('xrpl', 1)[0].key));
+    expect(missing.status).toBe(404);
+    expect(missing.headers['cache-control']).toBe('no-store');
   });
 });
 
