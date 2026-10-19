@@ -276,7 +276,7 @@ type Triple = [number, number, number];
 /** How a validator votes on an amendment by its record; `none` without one. */
 function voteOf(record: RecordRow | undefined, id: string): UnlVote['vote'] {
   if (record === undefined) return 'none';
-  return record.amendments.includes(id) ? 'yes' : 'no';
+  return record.amendments.some((each) => each.toUpperCase() === id) ? 'yes' : 'no';
 }
 
 function memberOf(

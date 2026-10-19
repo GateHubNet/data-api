@@ -166,20 +166,40 @@ export interface AmendmentSources {
   majorityHoldSeconds: number;
 }
 
-/** Every amendment ID the routes know of (spec 2.7): the ledger state, the node, the file and the votes of 30 days. */
+/**
+ * The one rule for the case of an ID: upper case (the form amendment IDs have, Global Constraints), whatever a source wrote.
+ * Every ID that comes in from a read (the ledger state, the node, the votes, the tallies, the index) goes through it, so that
+ * nothing depends on the case the writer used.
+ */
+const upper = (id: string): string => id.toUpperCase();
+
+/** A map by ID with its keys in upper case; the values of two keys that become one are merged. */
+function byUpperId<T>(entries: ReadonlyMap<string, T>, merge: (a: T, b: T) => T): Map<string, T> {
+  const out = new Map<string, T>();
+  for (const [id, value] of entries) {
+    const key = upper(id);
+    const known = out.get(key);
+    out.set(key, known === undefined ? value : merge(known, value));
+  }
+  return out;
+}
+
+/** Every amendment ID the routes know of (spec 2.7): the ledger state, the node, the file and the votes of 30 days. Upper case. */
 export function amendmentIds(
   directory: Directory,
   sources: Pick<AmendmentSources, 'config' | 'features' | 'voted'>,
 ): string[] {
   const state = directory.state;
   return [
-    ...new Set([
-      ...(state?.amendments ?? []),
-      ...(state?.majorities ?? []).map((majority) => majority.amendment),
-      ...sources.features.keys(),
-      ...sources.config.byId.keys(),
-      ...sources.voted,
-    ]),
+    ...new Set(
+      [
+        ...(state?.amendments ?? []),
+        ...(state?.majorities ?? []).map((majority) => majority.amendment),
+        ...sources.features.keys(),
+        ...sources.config.byId.keys(),
+        ...sources.voted,
+      ].map(upper),
+    ),
   ];
 }
 
@@ -243,10 +263,15 @@ const GROUPS: readonly { status: AmendmentStatus; compare: (a: AmendmentView, b:
  * activation, by yes, by ID, by the ledger it was enabled in (newest first) and by name.
  */
 export function assembleAmendments(directory: Directory, sources: AmendmentSources): AmendmentsAssembly {
-  const { config, features, voted, yes, majorityHoldSeconds } = sources;
+  const { config, majorityHoldSeconds } = sources;
   const round = directory.newestRound;
-  const inLedger = new Set(directory.state?.amendments ?? []);
-  const since = new Map((directory.state?.majorities ?? []).map((majority) => [majority.amendment, majority.since]));
+  const inLedger = new Set((directory.state?.amendments ?? []).map(upper));
+  const since = new Map(
+    (directory.state?.majorities ?? []).map((majority) => [upper(majority.amendment), majority.since]),
+  );
+  const features = byUpperId(sources.features, (a, b) => (a.name !== '' ? a : b));
+  const voted = new Set([...sources.voted].map(upper));
+  const yes = byUpperId(sources.yes, Math.max);
   const history = historyByAmendment(sources.transactions);
 
   const view = (id: string): AmendmentView => {
@@ -267,11 +292,15 @@ export function assembleAmendments(directory: Directory, sources: AmendmentSourc
     let majority: AmendmentView['majority'];
     if (status === 'majority') {
       const majoritySince = since.get(id) as number;
+      // the transaction behind this majority is the newest got_majority, unless a lost_majority or an enabling came after it:
+      // then the majority now was regained and its transaction is not indexed yet (G5)
       const got = lastOf('got_majority');
+      const regained =
+        got !== undefined && events.slice(events.lastIndexOf(got) + 1).some((e) => e.event !== 'got_majority');
       majority = compact({
         since: majoritySince,
-        ledgerIndex: got?.ledgerIndex,
-        txHash: got?.txHash,
+        ledgerIndex: regained ? undefined : got?.ledgerIndex,
+        txHash: regained ? undefined : got?.txHash,
         expectedActivation: majoritySince + majorityHoldSeconds,
       });
     }

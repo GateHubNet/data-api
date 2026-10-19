@@ -89,6 +89,7 @@ const seen = (k: string, ago: number) => ({ key: k, firstSeen: NOW_S - 90 * 86_4
 const newestRound: RoundInfo = {
   ledgerIndex: 107_748_095,
   closeTime: NOW_S - 400,
+  version: '1',
   unlSize: 35,
   trusted: 35,
   threshold: 28,

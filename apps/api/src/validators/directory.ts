@@ -109,6 +109,8 @@ export interface DirectoryEntry {
 /** A voting round (the newest version of its sentinel). */
 export interface RoundInfo {
   readonly ledgerIndex: number;
+  /** The version of the sentinel the round was read at: UInt64 as text. The rows of the round are those of that version. */
+  readonly version: string;
   readonly closeTime: number;
   readonly unlSize: number;
   readonly trusted: number;

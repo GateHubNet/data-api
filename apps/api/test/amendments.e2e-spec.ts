@@ -26,6 +26,8 @@ import {
   enableHash,
   fleet,
   HEAD_LEDGER,
+  insertEnableAmendments,
+  insertFeatures,
   insertLedgers,
   insertLists,
   insertPublishers,
@@ -435,14 +437,6 @@ describe('GET /v2/network/amendments: the board of an XRPL deployment', () => {
       expect(refused.body).toEqual({ result: 'error', message: 'Missing or invalid API key.' });
       expect(refused.headers['cache-control']).toBe('no-store');
     });
-
-    it('serves a later request within 10 s from the assembly it has: no read of the node features', async () => {
-      const reads = await readsOf(h, Table.AmendmentFeatures, async () => {
-        expect((await api.get(LIST)).status).toBe(200);
-        expect((await api.get(detailOf(BOARD_NAMES.voting))).status).toBe(200);
-      });
-      expect(reads).toHaveLength(0);
-    });
   });
 
   // -- the detail ----------------------------------------------------------------------------------------------------
@@ -810,7 +804,7 @@ describe('the SQL of the amendment routes', () => {
   });
 
   it('reads the rounds of an amendment by the key of amendment_tallies: its amendment_id and a range of ledgers', async () => {
-    const read = queries.find(({ sql }) => sql.includes('amendment_id = {amendment:String}'));
+    const read = queries.find(({ sql }) => sql.includes('amendment_id IN {amendments:Array(String)}'));
     if (!read) throw new Error('no read of the rounds of an amendment');
     const plan = await explain(h, 'indexes = 1', read.sql, read.params);
     expect(plan).toContain('PrimaryKey');
@@ -958,6 +952,266 @@ describe('GET /v2/network/amendments/{name}: one trusted validator', () => {
   it('needs one vote', () => {
     expect(d.round).toMatchObject({ trusted: 1, threshold: 1, needed: 1 });
     expect(d.votes).toEqual({ ledger_index: VOTING_LEDGER, yes: 0, trusted: 1, needed: 1, pct: 0 });
+  });
+});
+
+describe('GET /v2/network/amendments: a newest round rewritten after the directory was built', () => {
+  const X = 'AB'.repeat(32);
+  let started: Started;
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    started = await startWithDirectory({
+      seed: 'none',
+      network: 'xrpl',
+      env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: FIXTURE },
+    });
+    h = started.h;
+    api = await h.api();
+    const [a, b, c] = fleet('xrpl', 3);
+    const now = Math.floor(Date.now() / 1000);
+    // the rewrite must not hide the older version: stop the merges
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.ValidatorVotes}`);
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.AmendmentTallies}`);
+    await insertSeen(
+      h.ch,
+      [a, b, c].map((m) => ({ key: m.key, first: now - DAY, last: now - 30 })),
+    );
+    const close = now - 600;
+    await insertRound(h.ch, {
+      ledgerIndex: VOTING_LEDGER,
+      closeTime: close,
+      version: OLDER_ROUND,
+      unl: [a.key, b.key],
+      votes: [
+        { key: a.key, amendments: [X] },
+        { key: b.key, amendments: [X] },
+      ],
+      tallies: [{ id: X, yes: 2 }],
+    });
+    // the directory reads the round as it is now ...
+    await started.directory();
+    // ... and the syncer writes it again, with three trusted validators and one yes
+    await insertRound(h.ch, {
+      ledgerIndex: VOTING_LEDGER,
+      closeTime: close,
+      version: NEWER_ROUND,
+      unl: [a.key, b.key, c.key],
+      votes: [
+        { key: a.key, amendments: [X] },
+        { key: b.key, amendments: [] },
+        { key: c.key, amendments: [] },
+      ],
+      tallies: [{ id: X, yes: 1 }],
+    });
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('states the round, its votes and its tallies of one version: the one the directory has', async () => {
+    const list = (await api.ok(LIST)).body;
+    expect(list.round).toMatchObject({ ledger_index: VOTING_LEDGER, unl_size: 2, trusted: 2, threshold: 1, needed: 2 });
+    expect(list.amendments.find((a: { id: string }) => a.id === X)).toEqual({
+      id: X,
+      status: 'voting',
+      votes: { ledger_index: VOTING_LEDGER, yes: 2, trusted: 2, needed: 2, pct: 100 },
+    });
+  });
+
+  it('has the rounds and the votes of the validators of that version too', async () => {
+    const d = (await api.ok(detailOf(X))).body;
+    expect(d.round).toMatchObject({ trusted: 2, unl_size: 2 });
+    expect(d.rounds).toMatchObject([{ ledger_index: VOTING_LEDGER, yes: 2, trusted: 2, threshold: 1, passes: true }]);
+    expect(d.unl_votes.map((v: { vote: string }) => v.vote)).toEqual(['yes', 'yes']);
+  });
+});
+
+describe('GET /v2/network/amendments: a newest round older than 30 days', () => {
+  const X = 'AB'.repeat(32);
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xrpl', env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: FIXTURE } });
+    api = await h.api();
+    const [a, b] = fleet('xrpl', 2);
+    const now = Math.floor(Date.now() / 1000);
+    await insertSeen(
+      h.ch,
+      [a, b].map((m) => ({ key: m.key, first: now - 60 * DAY, last: now - 40 * DAY })),
+    );
+    // the syncer has stood still for 40 days: this is the newest round there is
+    await insertRound(h.ch, {
+      ledgerIndex: VOTING_LEDGER,
+      closeTime: now - 40 * DAY,
+      version: 1,
+      unl: [a.key, b.key],
+      votes: [
+        { key: a.key, amendments: [X] },
+        { key: b.key, amendments: [X] },
+      ],
+      tallies: [{ id: X, yes: 2 }],
+    });
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('still counts the votes of the newest round and lists what was voted for in it', async () => {
+    const list = (await api.ok(LIST)).body;
+    expect(list.round).toMatchObject({ ledger_index: VOTING_LEDGER, trusted: 2 });
+    expect(list.amendments.find((a: { id: string }) => a.id === X)).toMatchObject({
+      status: 'voting',
+      votes: { ledger_index: VOTING_LEDGER, yes: 2, trusted: 2, needed: 2, pct: 100 },
+    });
+  });
+
+  it('has the newest round among the rounds of the amendment', async () => {
+    const d = (await api.ok(detailOf(X))).body;
+    expect(d.rounds).toMatchObject([{ ledger_index: VOTING_LEDGER, yes: 2, trusted: 2, passes: true }]);
+  });
+});
+
+describe('GET /v2/network/amendments: a majority regained, the EnableAmendment not indexed yet', () => {
+  const REGAINED = 'AB'.repeat(32);
+  const KEPT = 'CD'.repeat(32);
+  let h: Harness;
+  let list: Record<string, any>;
+  let now: number;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xrpl', env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: FIXTURE } });
+    const [a] = fleet('xrpl', 1);
+    now = Math.floor(Date.now() / 1000);
+    await insertSeen(h.ch, [{ key: a.key, first: now - DAY, last: now - 30 }]);
+    await insertState(h.ch, [
+      {
+        ledger_index: HEAD_LEDGER,
+        polled_at: now - 5,
+        majorities: [
+          { amendment: REGAINED, since: now - 2 * DAY },
+          { amendment: KEPT, since: now - 3 * DAY },
+        ],
+      },
+    ]);
+    await insertEnableAmendments(h.ch, [
+      { amendment: REGAINED, flags: 0x10000, ledgerIndex: 106_500_001, closeTime: now - 30 * DAY },
+      { amendment: REGAINED, flags: 0x20000, ledgerIndex: 106_600_001, closeTime: now - 20 * DAY },
+      // the majority it has now was gained after: nothing of it is indexed
+      { amendment: KEPT, flags: 0x10000, ledgerIndex: 107_700_001, closeTime: now - 3 * DAY + 5 },
+    ]);
+    await insertRound(h.ch, {
+      ledgerIndex: VOTING_LEDGER,
+      closeTime: now - 600,
+      version: 1,
+      unl: [a.key],
+      votes: [{ key: a.key, amendments: [REGAINED, KEPT] }],
+      tallies: [
+        { id: REGAINED, yes: 1 },
+        { id: KEPT, yes: 1 },
+      ],
+    });
+    list = (await (await h.api()).ok(LIST)).body;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('has the majority without ledger_index and tx_hash when a lost_majority is newer than the got_majority (G5)', () => {
+    const row = list.amendments.find((a: { id: string }) => a.id === REGAINED);
+    expect(row.status).toBe('majority');
+    expect(row.majority).toEqual({
+      since: time(now - 2 * DAY),
+      expected_activation: time(now - 2 * DAY + HOLD_XRPL),
+    });
+  });
+
+  it('keeps them for an amendment whose newest event is the got_majority', () => {
+    const row = list.amendments.find((a: { id: string }) => a.id === KEPT);
+    expect(row.majority).toMatchObject({
+      ledger_index: 107_700_001,
+      tx_hash: enableHash(107_700_001, KEPT, 0x10000),
+    });
+  });
+
+  it('still lists the events of the earlier majority in the history', async () => {
+    const d = (await (await h.api()).ok(detailOf(REGAINED))).body;
+    expect(d.history.map((e: { event: string }) => e.event)).toEqual(['got_majority', 'lost_majority']);
+  });
+});
+
+describe('GET /v2/network/amendments: IDs written in lower case', () => {
+  const X = 'AB'.repeat(32);
+  const ENABLED = 'EF'.repeat(32);
+  let h: Harness;
+  let api: ApiClient;
+  let list: Record<string, any>;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xrpl', env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: FIXTURE } });
+    api = await h.api();
+    const [a, b] = fleet('xrpl', 2);
+    const now = Math.floor(Date.now() / 1000);
+    await insertSeen(
+      h.ch,
+      [a, b].map((m) => ({ key: m.key, first: now - DAY, last: now - 30 })),
+    );
+    // everything a writer could have written in lower case: the ledger state, the node, the votes, the tallies, the index
+    await insertState(h.ch, [
+      {
+        ledger_index: HEAD_LEDGER,
+        polled_at: now - 5,
+        amendments: [ENABLED.toLowerCase()],
+        majorities: [{ amendment: X.toLowerCase(), since: now - DAY }],
+      },
+    ]);
+    await insertFeatures(h.ch, [{ amendment_id: X.toLowerCase(), name: 'WrittenInLower', polled_at: now - 60 }]);
+    await insertEnableAmendments(h.ch, [
+      { amendment: X.toLowerCase(), flags: 0x10000, ledgerIndex: 107_700_001, closeTime: now - DAY + 5 },
+    ]);
+    await insertRound(h.ch, {
+      ledgerIndex: VOTING_LEDGER,
+      closeTime: now - 600,
+      version: 1,
+      unl: [a.key, b.key],
+      votes: [
+        { key: a.key, amendments: [X.toLowerCase()] },
+        { key: b.key, amendments: [] },
+      ],
+      tallies: [{ id: X.toLowerCase(), yes: 1 }],
+    });
+    list = (await api.ok(LIST)).body;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('serves every ID in upper case, and finds what was written in lower case', () => {
+    for (const a of list.amendments) expect(a.id).toBe(a.id.toUpperCase());
+    expect(list.amendments.find((a: { id: string }) => a.id === ENABLED)).toEqual({ id: ENABLED, status: 'enabled' });
+    expect(list.amendments.find((a: { id: string }) => a.id === X)).toEqual({
+      id: X,
+      name: 'WrittenInLower',
+      status: 'majority',
+      node_supported: true,
+      votes: { ledger_index: VOTING_LEDGER, yes: 1, trusted: 2, needed: 2, pct: 50 },
+      majority: {
+        since: expect.any(String),
+        ledger_index: 107_700_001,
+        tx_hash: enableHash(107_700_001, X.toLowerCase(), 0x10000),
+        expected_activation: expect.any(String),
+      },
+    });
+  });
+
+  it('counts the votes and the rounds of an amendment written in lower case', async () => {
+    const d = (await api.ok(detailOf(X.toLowerCase()))).body;
+    expect(d.id).toBe(X);
+    expect(d.unl_votes.map((v: { vote: string }) => v.vote).sort()).toEqual(['no', 'yes']);
+    expect(d.rounds).toMatchObject([{ ledger_index: VOTING_LEDGER, yes: 1, trusted: 2, passes: false }]);
+    expect(d.history).toHaveLength(1);
   });
 });
 
@@ -1215,6 +1469,13 @@ describe('GET /v2/network/amendments: the assembly is built once', () => {
       expect(answers.map((a) => a.status)).toEqual([200, 200, 200, 200]);
     });
     expect(features).toHaveLength(1);
+
+    // a later request within the 10 s is served from the assembly: no read of the node features at all
+    const later = await readsOf(h, Table.AmendmentFeatures, async () => {
+      expect((await api.get(LIST)).status).toBe(200);
+      expect((await api.get(detailOf(BOARD_NAMES.voting))).status).toBe(200);
+    });
+    expect(later).toHaveLength(0);
 
     // the rounds of one amendment are read once for requests of the same 10 s; the next amendment has its own read
     const again = await readsOf(h, Table.AmendmentTallies, async () => {

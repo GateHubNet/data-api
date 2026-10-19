@@ -57,6 +57,7 @@ const ID = {
 const ROUND: RoundInfo = {
   ledgerIndex: 107_748_095,
   closeTime: NOW_S - 400,
+  version: '1',
   unlSize: 5,
   trusted: 4,
   threshold: 3,
@@ -604,6 +605,20 @@ describe('buildAmendmentDetail', () => {
       const d = buildAmendmentDetail(other, XRPL, other.byId.get(ID.voting) as AmendmentView, []);
       expect(d.unl_votes.find((v) => v.validation_public_key === 'nH02')?.vote).toBe('none');
       expect(d.unl_votes.find((v) => v.validation_public_key === 'nH01')?.vote).toBe('yes');
+    });
+
+    it('reads an ID in a record in any case', () => {
+      const written = assemble(
+        directoryOf({
+          votes: [
+            vote('nH01', [ID.voting.toLowerCase()]),
+            vote('nH02', [ID.voting]),
+            vote('nH03', [ID.majority.toLowerCase()]),
+          ],
+        }),
+      );
+      const d = buildAmendmentDetail(written, XRPL, written.byId.get(ID.voting) as AmendmentView, []);
+      expect(d.unl_votes.map((v) => v.vote)).toEqual(['yes', 'yes', 'no', 'none', 'none']);
     });
 
     it('puts a member that the directory does not know among those without a domain, by key', () => {

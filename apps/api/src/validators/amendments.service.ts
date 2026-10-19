@@ -28,6 +28,10 @@ export const AMENDMENTS_TTL_MS = 10_000;
 
 const DAY = 86_400;
 
+/** The IDs in upper and in lower case, for a read that must find an ID in either: the first key of the table keeps it on its key. */
+const bothCases = (ids: readonly string[]): string[] =>
+  [...new Set(ids.flatMap((id) => [id.toUpperCase(), id.toLowerCase()]))].sort();
+
 /** A number that may arrive as text (64-bit integers). */
 type Num = number | string;
 
@@ -51,6 +55,9 @@ interface VotingWindow {
  * Every read of `validator_votes` and `amendment_tallies` takes the version of the newest sentinel of each round and only the
  * rows of that version. None aggregates by validator, so none maps a key; the votes of each validator are the directory's.
  * Values are bound as query parameters; table names come from `Table`; nothing uses `FINAL`.
+ *
+ * **How old an answer can be.** The assembly is kept 10 s from the start of its build, on top of a directory that can be 10 s old
+ * when the build starts: about 20 s at most (the reference says so). The newest round, with its version, is the directory's.
  *
  * **One build at a time.** As the directory does: `CacheService` keeps the result for 10 s but does not stop two requests that
  * find it empty from both building, so the service keeps its own promise of the build in flight, and drops it when it settles
@@ -136,10 +143,7 @@ export class AmendmentsService {
         ORDER BY amendment_id`,
     );
     return new Map(
-      rows.map((row) => [
-        row.amendment_id.toUpperCase(),
-        { name: row.feature_name, supported: Number(row.feature_supported) === 1 },
-      ]),
+      rows.map((row) => [row.amendment_id, { name: row.feature_name, supported: Number(row.feature_supported) === 1 }]),
     );
   }
 
@@ -187,11 +191,14 @@ export class AmendmentsService {
   }
 
   /**
-   * The rounds of the last 30 days, up to the newest the directory has (a round stored since belongs to the next directory),
-   * and always that newest round: oldest first, each with the version of its newest sentinel.
+   * The rounds of the last 30 days, oldest first, each with the version of its newest sentinel, up to the newest round the
+   * directory has. That round, the newest, is the directory's own, with the version the directory read it at, and is there
+   * however old it is: the figures of the answer (`round`, `votes.trusted`, `needed`, the votes of the validators) are the
+   * directory's, so the tallies and the rows read for them have to be of the same version. A syncer that writes the round
+   * again between the directory's read and this one is for the next directory. The rounds below it are read here.
    */
   private async readWindow(directory: Directory): Promise<VotingWindow> {
-    const newest = directory.newestRound?.ledgerIndex;
+    const newest = directory.newestRound;
     if (newest === undefined) return { rounds: [], versions: [] };
     const since = Math.max(0, Math.floor(directory.builtAt / 1000) - WINDOW_DAYS * DAY);
     const rows = await this.ch.query<{
@@ -207,20 +214,28 @@ export class AmendmentsService {
               argMax(trusted, version) AS round_trusted,
               argMax(threshold, version) AS round_threshold
          FROM ${Table.AmendmentTallies}
-        WHERE amendment_id = '' AND ledger_index >= {floor:UInt32} AND ledger_index <= {newest:UInt32}
+        WHERE amendment_id = '' AND ledger_index >= {floor:UInt32} AND ledger_index < {newest:UInt32}
         GROUP BY ledger_index
-       HAVING round_close >= {since:UInt32} OR ledger_index = {newest:UInt32}
+       HAVING round_close >= {since:UInt32}
         ORDER BY ledger_index`,
-      { floor: windowFloor(newest), newest, since },
+      { floor: windowFloor(newest.ledgerIndex), newest: newest.ledgerIndex, since },
     );
     return {
-      rounds: rows.map((row) => ({
-        ledgerIndex: Number(row.ledger_index),
-        closeTime: Number(row.round_close),
-        trusted: Number(row.round_trusted),
-        threshold: Number(row.round_threshold),
-      })),
-      versions: rows.map((row) => row.newest_version),
+      rounds: [
+        ...rows.map((row) => ({
+          ledgerIndex: Number(row.ledger_index),
+          closeTime: Number(row.round_close),
+          trusted: Number(row.round_trusted),
+          threshold: Number(row.round_threshold),
+        })),
+        {
+          ledgerIndex: newest.ledgerIndex,
+          closeTime: newest.closeTime,
+          trusted: newest.trusted,
+          threshold: newest.threshold,
+        },
+      ],
+      versions: [...rows.map((row) => row.newest_version), newest.version],
     };
   }
 
@@ -234,10 +249,14 @@ export class AmendmentsService {
           AND version = toUInt64(transform(ledger_index, {rounds:Array(UInt32)}, {versions:Array(String)}, '0'))`,
       this.rangeOf(window),
     );
-    return new Set((row?.voted_ids ?? []).map((id) => id.toUpperCase()));
+    return new Set(row?.voted_ids ?? []);
   }
 
-  /** The yes votes of the amendments in the newest round: its tally rows of the version of its sentinel. */
+  /**
+   * The yes votes of the amendments in the newest round: its tally rows of the version of its sentinel. Each ID is asked for
+   * in upper and in lower case (a list of the first key of the table, which keeps the read on its key), and the answer is
+   * merged by ID where the case is dropped, so the case a writer used does not matter.
+   */
   private async readTallies(window: VotingWindow, ids: readonly string[]): Promise<Map<string, number>> {
     const index = window.rounds.length - 1;
     if (index < 0 || ids.length === 0) return new Map();
@@ -247,9 +266,9 @@ export class AmendmentsService {
         WHERE amendment_id IN {ids:Array(String)} AND ledger_index = {round:UInt32} AND version = toUInt64({version:String})
         GROUP BY amendment_id
         ORDER BY amendment_id`,
-      { ids: [...ids].sort(), round: window.rounds[index].ledgerIndex, version: window.versions[index] },
+      { ids: bothCases(ids), round: window.rounds[index].ledgerIndex, version: window.versions[index] },
     );
-    return new Map(rows.map((row) => [row.amendment_id.toUpperCase(), Number(row.round_yes)]));
+    return new Map(rows.map((row) => [row.amendment_id, Number(row.round_yes)]));
   }
 
   private async readPoints(view: AmendmentView, directory: Directory): Promise<RoundPoint[]> {
@@ -260,7 +279,7 @@ export class AmendmentsService {
     const rows = await this.ch.query<{ ledger_index: Num; round_yes: Num }>(
       `SELECT ledger_index, max(yes) AS round_yes
          FROM ${Table.AmendmentTallies}
-        WHERE amendment_id = {amendment:String}
+        WHERE amendment_id IN {amendments:Array(String)}
           AND ledger_index >= {first:UInt32} AND ledger_index <= {last:UInt32}
           AND version = toUInt64(transform(ledger_index, {rounds:Array(UInt32)}, {versions:Array(String)}, '0'))
         GROUP BY ledger_index
@@ -269,7 +288,7 @@ export class AmendmentsService {
         ...this.rangeOf(window),
         first: wanted[0].ledgerIndex,
         last: wanted[wanted.length - 1].ledgerIndex,
-        amendment: view.id,
+        amendments: bothCases([view.id]),
       },
     );
     return roundPoints(

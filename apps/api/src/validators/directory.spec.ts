@@ -91,6 +91,7 @@ function round(ledgerIndex: number, closeAgo: number, over: Partial<RoundInfo> =
   return {
     ledgerIndex,
     closeTime: NOW_S - closeAgo,
+    version: '1',
     unlSize: unl.length,
     trusted: unl.length,
     threshold: Math.max(1, Math.floor((unl.length * 80) / 100)),

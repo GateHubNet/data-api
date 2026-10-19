@@ -179,6 +179,7 @@ const ENABLE_AT = 200;
 const ROUND: RoundInfo = {
   ledgerIndex: 1023,
   closeTime: NOW_S - 600,
+  version: '1',
   unlSize: 36,
   trusted: 35,
   threshold: 28,
@@ -412,6 +413,32 @@ describe('assembleAmendments', () => {
       expect(several.byId.get(ID.majority)?.majority).toMatchObject({ ledgerIndex: 500, txHash: 'NEW' });
     });
 
+    it('has neither ledger_index nor tx_hash when a lost_majority or an enabling is newer than the got_majority: a regain not indexed yet', () => {
+      const after = (...later: EnableTx[]) =>
+        assembleAmendments(
+          directoryOf(),
+          sources({
+            transactions: [{ amendment: ID.majority, flags: GOT, ledgerIndex: 300, date: 1, txHash: 'GOT' }, ...later],
+          }),
+        ).byId.get(ID.majority)?.majority;
+      const lost: EnableTx = { amendment: ID.majority, flags: LOST, ledgerIndex: 400, date: 2, txHash: 'LOST' };
+      const enabled: EnableTx = { amendment: ID.majority, flags: 0, ledgerIndex: 450, date: 3, txHash: 'ENABLED' };
+      for (const majority of [after(lost), after(enabled), after(lost, enabled)]) {
+        expect(majority).toEqual({
+          since: NOW_S - 3 * 86_400,
+          expectedActivation: NOW_S - 3 * 86_400 + 1_209_600,
+        });
+      }
+      // the regain, once indexed, is the one that shows; an event of another amendment is no later event of this one
+      const regained: EnableTx = { amendment: ID.majority, flags: GOT, ledgerIndex: 500, date: 4, txHash: 'REGAIN' };
+      expect(after(lost, regained)).toMatchObject({ ledgerIndex: 500, txHash: 'REGAIN' });
+      const other: EnableTx = { amendment: ID.votingA, flags: LOST, ledgerIndex: 400, date: 2, txHash: 'OTHER' };
+      expect(after(other)).toMatchObject({ ledgerIndex: 300, txHash: 'GOT' });
+      // a lost_majority older than the got_majority does not matter
+      const earlier: EnableTx = { amendment: ID.majority, flags: LOST, ledgerIndex: 200, date: 0, txHash: 'EARLIER' };
+      expect(after(earlier)).toMatchObject({ ledgerIndex: 300, txHash: 'GOT' });
+    });
+
     it('has neither ledger_index nor tx_hash when the EnableAmendment is not indexed (G5)', () => {
       const majority = view(ID.majorityNameless).majority;
       expect(majority).toEqual({
@@ -571,6 +598,50 @@ describe('assembleAmendments', () => {
         }),
       );
       expect(lower.byId.get(ID.votingA)?.history.map((h) => h.txHash)).toEqual(['X']);
+    });
+  });
+
+  describe('the case of an ID', () => {
+    it('is upper case whatever the writer or the node wrote: every source gives the same amendments', () => {
+      const lower = (ids: Iterable<string>) => [...ids].map((each) => each.toLowerCase());
+      const base = sources();
+      const written = assembleAmendments(
+        directoryOf(
+          {},
+          {
+            amendments: lower([ID.ledger, ID.meta]),
+            majorities: [
+              { amendment: ID.majority.toLowerCase(), since: NOW_S - 3 * 86_400 },
+              { amendment: ID.majorityNameless.toLowerCase(), since: NOW_S - 4 * 86_400 },
+            ],
+          },
+        ),
+        {
+          ...base,
+          features: new Map([...base.features].map(([key, feature]) => [key.toLowerCase(), feature])),
+          voted: new Set(lower(base.voted)),
+          yes: new Map([...base.yes].map(([key, count]) => [key.toLowerCase(), count])),
+          transactions: base.transactions.map((tx) => ({ ...tx, amendment: tx.amendment.toLowerCase() })),
+        },
+      );
+      const expected = assembleAmendments(directoryOf(), base);
+      expect(written.amendments).toEqual(expected.amendments);
+      expect(written.counts).toEqual(expected.counts);
+      expect([...written.byId.keys()]).toEqual([...expected.byId.keys()]);
+      for (const each of written.amendments) expect(each.id).toBe(each.id.toUpperCase());
+    });
+
+    it('adds the yes votes of an ID written in both cases once each way: the larger', () => {
+      const both = assembleAmendments(
+        directoryOf(),
+        sources({
+          yes: new Map([
+            [ID.votingA, 3],
+            [ID.votingA.toLowerCase(), 4],
+          ]),
+        }),
+      );
+      expect(both.byId.get(ID.votingA)?.votes?.yes).toBe(4);
     });
   });
 

@@ -597,6 +597,7 @@ export class ValidatorDirectoryService {
     const rounds = recent.map(
       (row): RoundInfo => ({
         ledgerIndex: asNumber(row.ledger_index),
+        version: row.newest_version,
         closeTime: asNumber(row.round_close),
         unlSize: asNumber(row.round_unl_size),
         trusted: asNumber(row.round_trusted),

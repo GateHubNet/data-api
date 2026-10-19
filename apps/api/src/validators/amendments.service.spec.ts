@@ -13,6 +13,7 @@ const VOTING = 'CD'.repeat(32);
 const round: RoundInfo = {
   ledgerIndex: 1023,
   closeTime: NOW_S - 600,
+  version: '9007199254740993',
   unlSize: 5,
   trusted: 5,
   threshold: 4,
@@ -48,20 +49,20 @@ type Sql = (sql: string) => unknown[];
 
 /** A ClickHouse that answers each statement by what it reads; `queryOne` is a `query`, as the real service has it. */
 function fakeClickHouse(answer: Sql = () => []) {
-  const query = jest.fn(async (sql: string) => answer(sql));
-  return { query, queryOne: async (sql: string) => (await query(sql))[0] };
+  const query = jest.fn(async (sql: string, _params?: Record<string, unknown>) => answer(sql));
+  return { query, queryOne: async (sql: string, params?: Record<string, unknown>) => (await query(sql, params))[0] };
 }
 
-/** The rows of the window: one stored round. */
+/** The rows of the window: the stored rounds below the newest one, which the directory gives. */
 const WINDOW_ROW = {
-  ledger_index: 1023,
-  newest_version: '9007199254740993',
-  round_close: NOW_S - 600,
+  ledger_index: 767,
+  newest_version: '8',
+  round_close: NOW_S - 1000,
   round_trusted: 5,
   round_threshold: 4,
 };
 const isWindowRead = (sql: string): boolean => sql.includes("amendment_id = ''");
-const isRoundsRead = (sql: string): boolean => sql.includes('amendment_id = {amendment:String}');
+const isRoundsRead = (sql: string): boolean => sql.includes('amendment_id IN {amendments:Array(String)}');
 const isTalliesRead = (sql: string): boolean => sql.includes('amendment_id IN {ids:Array(String)}');
 
 function setup(options: { ch?: ReturnType<typeof fakeClickHouse>; directory?: Directory; cache?: CacheService } = {}) {
@@ -182,14 +183,69 @@ describe('AmendmentsService', () => {
       expect(count(ch, (sql) => sql.includes('validator_votes'))).toBe(0);
     });
 
-    it('asks the tallies of the version of the newest sentinel, as the text it came as', async () => {
+    it('takes the newest round, with its version, from the directory: the window read stops below it', async () => {
       const { svc, ch } = setup();
       await svc.get();
+      const [window] = ch.query.mock.calls.find(([sql]) => isWindowRead(sql)) as unknown as [string, ...unknown[]];
+      expect(window).toContain('ledger_index < {newest:UInt32}');
+      const windowCall = ch.query.mock.calls.find(([sql]) => isWindowRead(sql)) as unknown as [
+        string,
+        Record<string, unknown>,
+      ];
+      expect(windowCall[1]).toMatchObject({ newest: 1023 });
+      // the tallies are those of the version the directory read the round at, as the text it came as
       const call = ch.query.mock.calls.find(([sql]) => isTalliesRead(sql)) as unknown as [
         string,
         Record<string, unknown>,
       ];
       expect(call[1]).toMatchObject({ round: 1023, version: '9007199254740993' });
+      const votes = ch.query.mock.calls.find(([sql]) => sql.includes('validator_votes')) as unknown as [
+        string,
+        Record<string, unknown>,
+      ];
+      expect(votes[1]).toMatchObject({
+        first: 767,
+        last: 1023,
+        rounds: [767, 1023],
+        versions: ['8', '9007199254740993'],
+      });
+    });
+
+    it('keeps the newest round when it is older than 30 days, and the older ones are not read', async () => {
+      const old = { ...round, closeTime: NOW_S - 40 * 86_400 };
+      const { svc, ch } = setup({
+        ch: fakeClickHouse(() => []),
+        directory: directoryOf({ rounds: [old] }),
+      });
+      const assembly = await svc.get();
+      expect(assembly.directory.newestRound?.closeTime).toBe(NOW_S - 40 * 86_400);
+      const call = ch.query.mock.calls.find(([sql]) => isTalliesRead(sql)) as unknown as [
+        string,
+        Record<string, unknown>,
+      ];
+      expect(call[1]).toMatchObject({ round: 1023, version: '9007199254740993' });
+    });
+
+    it('asks for an ID in both cases, so that what the writer wrote does not matter, and merges them', async () => {
+      const ch = fakeClickHouse((sql) =>
+        isWindowRead(sql)
+          ? [WINDOW_ROW]
+          : sql.includes('amendment_features')
+            ? [{ amendment_id: VOTING.toLowerCase(), feature_name: 'Written', feature_supported: 1 }]
+            : isTalliesRead(sql)
+              ? [
+                  { amendment_id: VOTING.toLowerCase(), round_yes: 2 },
+                  { amendment_id: VOTING, round_yes: 3 },
+                ]
+              : [],
+      );
+      const { svc } = setup({ ch });
+      const assembly = await svc.get();
+      const call = ch.query.mock.calls.find(([sql]) => isTalliesRead(sql)) as unknown as [string, { ids: string[] }];
+      expect(call[1].ids).toEqual(
+        expect.arrayContaining([ENABLED, ENABLED.toLowerCase(), VOTING, VOTING.toLowerCase()]),
+      );
+      expect(assembly.byId.get(VOTING)?.votes?.yes).toBe(3);
     });
   });
 
@@ -208,12 +264,7 @@ describe('AmendmentsService', () => {
       { ledger_index: 1023, round_yes: 4 },
       { ledger_index: 767, round_yes: 5 },
     ];
-    const answer: Sql = (sql) =>
-      isWindowRead(sql)
-        ? [{ ...WINDOW_ROW, ledger_index: 767, newest_version: '8', round_close: NOW_S - 1000 }, WINDOW_ROW]
-        : isRoundsRead(sql)
-          ? tallyRows
-          : [];
+    const answer: Sql = (sql) => (isWindowRead(sql) ? [WINDOW_ROW] : isRoundsRead(sql) ? tallyRows : []);
 
     it('is the rounds of the window with the yes of the amendment, and 0 for a round with no row', async () => {
       const { svc, directory } = setup({ ch: fakeClickHouse(answer) });

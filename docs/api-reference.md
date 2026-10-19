@@ -1080,9 +1080,11 @@ one written here and is pinned by tests.
   newest version written (a rewritten round or hour is never mixed with its older version).
 - "In use now" (the trusted UNL, which publishers name a validator) uses the lists a publisher served under the key it is configured with; a
   list of a key it no longer uses was trusted in its time and is history.
-- The **amendments** are assembled on top of the directory (up to 10 seconds old, like it), from the newest ledger state, what the node says of each
-  amendment ID, the metadata file of the network (`GH_AMENDMENTS_CONFIG`: names, the version that introduced an amendment, its standard, a description;
-  an invalid file fails the boot), the votes of the last 30 days and the `EnableAmendment` transactions the index holds.
+- The **amendments** are assembled on top of the directory, from the newest ledger state, what the node says of each amendment ID, the metadata file
+  of the network (`GH_AMENDMENTS_CONFIG`: names, the version that introduced an amendment, its standard, a description; an invalid file fails the
+  boot), the votes of the last 30 days and the `EnableAmendment` transactions the index holds. The assembly is kept for up to 10 seconds on top of a
+  directory that is itself up to 10 seconds old, so an answer can be up to about 20 seconds old. The newest round, its votes and its tallies are
+  always of one version (the one the directory read), and an amendment ID is matched whatever its case in the tables.
 
 The routes of the original `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`,
 `/v2/network/validator_reports` and `/v2/network/rippled_versions` are not served and answer 404 `{"result":"error","message":"Cannot GET ..."}`.
@@ -1267,7 +1269,7 @@ only when they have a value, and `ledger_index`, `round` and `next_flag_ledger` 
 | `introduced`, `xls`, `xls_url`, `description` | From the metadata file (names, descriptions and links of the standards: `GH_AMENDMENTS_CONFIG`, a file per network that ships with the API): the software version that introduced it (a rippled version on XRPL, a xahaud date version on Xahau), the standard (`XLS-30`) and its address, which always lies under `https://github.com/XRPLF/XRPL-Standards/`, and one line about it. Absent for an amendment the file does not have. |
 | `node_supported` | Whether the node says it supports the amendment, when it lists it. |
 | `votes` | For an amendment that is `majority`, `voting` or `unknown`, when a round is stored: what the newest round says. `ledger_index` is its voting ledger, `yes` the trusted validators with the amendment in their vote record (0 when the round has no tally of it), `trusted` and `needed` as in `round`, `pct` = `yes` / `trusted` × 100 to two decimals, rounded half up (0 when `trusted` is 0). |
-| `majority` | For an amendment that has a majority: `since`, the close time of the ledger that recorded it; `ledger_index` and `tx_hash`, of the newest indexed `EnableAmendment` that gave it the majority (absent when none is indexed: the majority was gained before the indexed history, or the index has not reached that ledger yet); `expected_activation`, `since` plus the hold. It is enabled by the first flag ledger after that, in the ledger after the flag ledger. |
+| `majority` | For an amendment that has a majority: `since`, the close time of the ledger that recorded it; `ledger_index` and `tx_hash`, of the newest indexed `EnableAmendment` that gave it the majority (absent when none is indexed: the majority was gained before the indexed history, or the index has not reached that ledger yet; and absent when a `lost_majority` or an enabling of the amendment is indexed after it: the majority it has now was regained and its transaction is not indexed yet); `expected_activation`, `since` plus the hold. It is enabled by the first flag ledger after that, in the ledger after the flag ledger. |
 | `enabled` | For an enabled amendment: `ledger_index`, `date` (the close time) and `tx_hash` of the indexed `EnableAmendment` that enabled it, with `source` `ledger`; else what the metadata file says, `ledger_index` and `date` (a day, `YYYY-MM-DD`; either may be missing), with `source` `metadata`; else none. A retired name has one only when the ledger has it. |
 
 **Status.** The first row that matches:
@@ -1285,7 +1287,8 @@ first, then by name; `unknown` by ID; `enabled` by the ledger it was enabled in,
 named amendment comes before an unnamed one, and an unnamed one is compared by its ID.
 
 The amendments are assembled from the newest ledger state, what the node says of each ID (`feature`), the metadata file, the votes of the last 30 days and the indexed `EnableAmendment` transactions, and kept
-for up to 10 seconds (counted from the start of the build), one build at a time per replica. Every read of votes and tallies takes the newest version written of a round.
+for up to 10 seconds (counted from the start of the build), one build at a time per replica, on top of a directory that can be up to 10 seconds old: an answer can be up to about 20 seconds old. Every read of
+votes and tallies takes the newest version written of a round, and the newest round is the directory's, with the version it read, so that `round`, `votes` and the votes of the validators agree.
 
 Errors: 400 `invalid status`; 500 `unable to retrieve amendments`. `Cache-Control: private, max-age=60`.
 
