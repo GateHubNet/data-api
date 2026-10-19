@@ -340,6 +340,14 @@ export class SyncerConfig {
   @ConfigValue()
   @MaybeEmptyText()
   amendmentsConfig: string = '';
+
+  /**
+   * `GH_ACCOUNT_ROLLUP_MIN_ROWS`: balance changes from which an account is heavy and gets daily rollups from the `account_rollups`
+   * job of the aggregator. 0 turns the job off (the rollups that exist are still used by the API, and stop growing).
+   */
+  @ConfigValue()
+  @IntValue({ min: 0 })
+  accountRollupMinRows: number = 1000000;
 }
 
 /** An instance holds the defaults (the property initializers) for the decorators above. */

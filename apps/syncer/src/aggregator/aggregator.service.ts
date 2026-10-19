@@ -1,4 +1,5 @@
 import {
+  AggregateSetAborted,
   ClickHouseService,
   computeDailyVolumeSet,
   computeLiveVolumeSet,
@@ -20,7 +21,12 @@ import {
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { AccountRollupsJobRunner } from './account-rollups.job-runner';
 import { deleteDirtyRange, DirtyRange, narrowDirtyRange, readDirtyRanges } from './agg-dirty';
+import { AggregateFunctions, AggregateJobDeps, AggregatorAggregates } from './aggregate-job-deps';
+import { MarketsLiveJobRunner } from './markets-live.job-runner';
+import { PairHourlyJobRunner } from './pair-hourly.job-runner';
+import { RatesDailyJobRunner } from './rates-daily.job-runner';
 
 /** The aggregator runs its jobs once a minute. */
 export const AGGREGATOR_INTERVAL_MS = 60_000;
@@ -54,6 +60,24 @@ export const AGGREGATOR_VOLUME_LIVE_BUDGET_MS = 5000;
 
 /** How much of the tick `volume_daily` (the sets of today and of yesterday: four) may use; it runs second, for the same reason. */
 export const AGGREGATOR_VOLUME_DAILY_BUDGET_MS = 4000;
+
+/**
+ * How much of the tick `pair_hourly` (the sets of the live hours, then its back-fill of the last 31 days) may use. It runs
+ * after the volume jobs and before the stats, so that the Markets sets, which are made of its hours, are fresh at every tick.
+ */
+export const AGGREGATOR_PAIR_HOURLY_BUDGET_MS = 3000;
+
+/** How much of the tick `markets_live` (the Markets sets of the periods) may use; it runs right after the hours it is made of. */
+export const AGGREGATOR_MARKETS_LIVE_BUDGET_MS = 3000;
+
+/**
+ * How much of the tick `rates_daily` (the rates of the closed days, newest first) may use. It does real work once a day, and
+ * its back-fill after the stats: what is left of the tick after them.
+ */
+export const AGGREGATOR_RATES_DAILY_BUDGET_MS = 8000;
+
+/** How much of the tick `account_rollups` (the discovery of heavy accounts, their daily increment and their back-fill) may use. */
+export const AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS = 8000;
 
 /**
  * How much of the tick `volume_backfill` may use. The closed days (a fresh deployment over years of history, or a new config
@@ -132,7 +156,16 @@ export interface AggregatorJob {
 }
 
 /** The jobs the aggregator has of its own, in the order of a tick. */
-export type AggregatorJobName = 'volume_live' | 'volume_daily' | 'stats_live' | 'stats_dirty' | 'volume_backfill';
+export type AggregatorJobName =
+  | 'volume_live'
+  | 'volume_daily'
+  | 'pair_hourly'
+  | 'markets_live'
+  | 'stats_live'
+  | 'stats_dirty'
+  | 'rates_daily'
+  | 'account_rollups'
+  | 'volume_backfill';
 
 /** What the volume jobs work with: the rates of the network and its versioned markets config. */
 export interface AggregatorVolumes {
@@ -164,6 +197,13 @@ export interface AggregatorOptions {
   volumes?: AggregatorVolumes;
   /** Replaces the volume functions of the shared package; for tests. */
   volumeFunctions?: Partial<VolumeFunctions>;
+  /**
+   * With it the account and market jobs run (`pair_hourly`, `markets_live`, `rates_daily`, `account_rollups`, and their hooks on
+   * the slices of `agg_dirty`); without it they do not.
+   */
+  aggregates?: AggregatorAggregates;
+  /** Replaces the functions of the shared package the account and market jobs call; for tests. */
+  aggregateFunctions?: Partial<AggregateFunctions>;
   /** Default: a Nest `Logger` with the context `AggregatorService`. */
   logger?: Pick<Logger, 'log' | 'warn' | 'error' | 'debug'>;
   /** The clock, in unix milliseconds. Default: `Date.now`. */
@@ -220,7 +260,11 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     short for all of them every set is refreshed in turn.
  *  2. **volume_daily**: the daily volume sets of today and of yesterday (UTC), both metrics, the stalest first (yesterday's are
  *     the ones that are finalised after the midnight).
- *  3. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
+ *  3. **pair_hourly** (with the `aggregates` option): the candle of every pair in each hour of the last 31 days, the live hours
+ *     first, then the back-fill (`PairHourlyJobRunner`).
+ *  4. **markets_live** (with `aggregates`): the Markets set of each period, made of the hours of `pair_hourly`; the `day` set at
+ *     every tick, the `7day` and `30day` sets at every fifth (`MarketsLiveJobRunner`).
+ *  5. **stats_live**: recomputes `stats_hourly` for the hours that may have changed since the last tick, in two parts, oldest
  *     first, in slices of at most a day:
  *      - the **catch-up**, from the watermark (the newest hour with ledgers) up to two hours ago, or to the hour of the newest
  *        ledger if that is earlier. The live runner writes no `agg_dirty` row, so after an outage, for a database whose
@@ -234,22 +278,28 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *     It gets at most `AGGREGATOR_LIVE_BUDGET_MS` of the tick. **During a long catch-up (weeks of ledgers after an outage, the
  *     first sweep of a database with years of history) the tail is not run, so the stats of the current hour are stale**;
  *     `syncer_aggregator_stats_lag_seconds` says how much is left.
- *  4. **stats_dirty**: drains `agg_dirty`, the ranges that ingest rewrote behind the aggregator, oldest first, each in slices
+ *  6. **stats_dirty**: drains `agg_dirty`, the ranges that ingest rewrote behind the aggregator, oldest first, each in slices
  *     of at most a day, for at most `AGGREGATOR_DIRTY_BUDGET_MS`. The days a slice covers have their daily volume sets
- *     recomputed too (with the `volumes` option), once per tick unless the ingest marked the day again after that.
- *  5. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config,
+ *     recomputed too (with the `volumes` option), once per tick unless the ingest marked the day again after that; and the
+ *     hooks of the account and market jobs (with `aggregates`) correct what the slice touched: the rates of its days (marked
+ *     stale), its hours of `pair_hourly` and the day rollups of the heavy accounts, in this order (`ofSlice` of each runner).
+ *  7. **rates_daily** (with `aggregates`): the rates of the closed final days, newest first (`RatesDailyJobRunner`).
+ *  8. **account_rollups** (with `aggregates`): the discovery of heavy accounts and their day rollups, the increment of each new
+ *     day and the promotion of the days before (`AccountRollupsJobRunner`).
+ *  9. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config,
  *     newest first, under its own budget. A day is closed when it is before yesterday AND the ingest has passed it (the newest
  *     ledger closed an hour after its end): the wall clock alone would call a day final while its ledgers are still to come.
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
  *     doubling, until the config version changes) and the older days go on.
  *
- * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set is a complete set under a new version), which is
- * what lets this retry, resume and crash anywhere:
+ * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set or a set of the account and market jobs is a
+ * complete set under a new version), which is what lets this retry, resume and crash anywhere:
  *
  *  - **A failed slice or set is retried next tick.** The live job stops at the first failure (its slices are in order, and a
  *    later one would move the watermark past it); the dirty job leaves the range in the queue, keeps the progress it made, and
  *    goes on with the next range, until three ranges have failed in a tick; the volume jobs go on with the next set until three
- *    have failed. Errors are logged and counted, and never stop the loop.
+ *    have failed, and so do the account and market jobs. A hook of a slice that fails (`<job>_dirty`) fails the slice, like a
+ *    volume set of it. Errors are logged and counted, and never stop the loop.
  *  - **A range of years does not stall a tick.** Slices and sets are started until the budget of the job or of the tick
  *    (`AGGREGATOR_TICK_BUDGET_MS`) is spent. The unfinished `agg_dirty` range is replaced by one that starts where the work
  *    stopped (inserted first, then the old one deleted), with the `created_at` it had; the live window picks up from the
@@ -258,9 +308,10 @@ const describe = (err: unknown): string => (err instanceof Error ? err.message :
  *    the one that was read; a range that the ingest marked again meanwhile stays and is done again.
  *  - **No overlap.** A tick that finds the previous one still running is skipped and logged.
  *  - **Shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it; the signal of the slice or set
- *    in flight is aborted, so that its rows are not written; no change to `agg_dirty` is started after it (a narrowing that
- *    has inserted its row finishes its delete, so as not to leave the old row beside the new one). The stop waits for the
- *    tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`, then abandons it and says so.
+ *    in flight is aborted, so that its rows are not written (the abort, `StatsRecomputeAborted`, `VolumeRecomputeAborted` or
+ *    `AggregateSetAborted`, is neither logged as an error nor counted); no change to `agg_dirty` is started after it (a
+ *    narrowing that has inserted its row finishes its delete, so as not to leave the old row beside the new one). The stop
+ *    waits for the tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`, then abandons it and says so.
  */
 @Injectable()
 export class AggregatorService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -269,6 +320,13 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly budgets: Record<AggregatorJobName, number>;
   private readonly volumes?: AggregatorVolumes;
   private readonly volumeFns: VolumeFunctions;
+  /** The runners of the account and market jobs; only with the `aggregates` option. */
+  private readonly aggregateRunners?: {
+    pairHourly: PairHourlyJobRunner;
+    marketsLive: MarketsLiveJobRunner;
+    ratesDaily: RatesDailyJobRunner;
+    accountRollups: AccountRollupsJobRunner;
+  };
   /** Whether the back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
   private backfilling = false;
   /** The sets of `volume_live` and `volume_daily` (by job, then `<metric>/<period or day>`) whose last attempt failed. */
@@ -301,8 +359,12 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     this.budgets = {
       volume_live: AGGREGATOR_VOLUME_LIVE_BUDGET_MS,
       volume_daily: AGGREGATOR_VOLUME_DAILY_BUDGET_MS,
+      pair_hourly: AGGREGATOR_PAIR_HOURLY_BUDGET_MS,
+      markets_live: AGGREGATOR_MARKETS_LIVE_BUDGET_MS,
       stats_live: options.liveBudgetMs ?? AGGREGATOR_LIVE_BUDGET_MS,
       stats_dirty: AGGREGATOR_DIRTY_BUDGET_MS,
+      rates_daily: AGGREGATOR_RATES_DAILY_BUDGET_MS,
+      account_rollups: AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS,
       volume_backfill: AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS,
       ...options.budgetsMs,
     };
@@ -318,6 +380,26 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     this.logger = options.logger ?? new Logger(AggregatorService.name);
     this.clock = options.now ?? Date.now;
     this.recompute = options.recompute ?? recomputeStatsHourly;
+    const aggregates = options.aggregates;
+    if (aggregates) {
+      // what a runner is lent: the database, the log and the metrics, the clock, its budget, the stop and the rule of failure
+      const depsOf = (job: AggregatorJobName): AggregateJobDeps => ({
+        ch,
+        logger: this.logger,
+        metrics,
+        budgetMs: this.budgets[job],
+        clock: () => this.clock(),
+        closing: () => this.closing,
+        failed: (name, err, where) => this.failed(name, err, where),
+      });
+      const fns = options.aggregateFunctions;
+      this.aggregateRunners = {
+        pairHourly: new PairHourlyJobRunner(depsOf('pair_hourly'), aggregates, fns),
+        marketsLive: new MarketsLiveJobRunner(depsOf('markets_live'), aggregates, fns),
+        ratesDaily: new RatesDailyJobRunner(depsOf('rates_daily'), aggregates, fns),
+        accountRollups: new AccountRollupsJobRunner(depsOf('account_rollups'), aggregates, fns),
+      };
+    }
     // The order is the priority (see `AggregatorJob.budgetMs`): what must be fresh at every tick, the live volumes, goes first;
     // the sweeps and the back-fill, which can run long, come after it and have budgets of their own.
     this.jobs = [
@@ -335,8 +417,14 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
             },
           ]
         : []),
+      ...(this.aggregateRunners
+        ? [this.aggregateRunners.pairHourly.job(), this.aggregateRunners.marketsLive.job()]
+        : []),
       { name: 'stats_live', budgetMs: this.budgets.stats_live, run: (tick) => this.statsLive(tick) },
       { name: 'stats_dirty', budgetMs: this.budgets.stats_dirty, run: (tick) => this.statsDirty(tick) },
+      ...(this.aggregateRunners
+        ? [this.aggregateRunners.ratesDaily.job(), this.aggregateRunners.accountRollups.job()]
+        : []),
       ...(this.volumes
         ? [
             {
@@ -414,7 +502,12 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   /** Logs and counts a failure of a job (or of one slice of it); one that comes of the shutdown is neither. */
   private failed(job: string, err: unknown, where = ''): void {
-    if (this.closing && (err instanceof StatsRecomputeAborted || err instanceof VolumeRecomputeAborted)) {
+    if (
+      this.closing &&
+      (err instanceof StatsRecomputeAborted ||
+        err instanceof VolumeRecomputeAborted ||
+        err instanceof AggregateSetAborted)
+    ) {
       this.logger.log(`Dropped the ${job} slice in flight at shutdown`);
       return;
     }
@@ -598,6 +691,10 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         outcome = 'failed';
         break;
       }
+      if (!(await this.hooksOfSlice(start, end, tick))) {
+        outcome = 'failed';
+        break;
+      }
       done = end;
     }
     // no change to agg_dirty is started once the shutdown has begun; one that is under way (narrowDirtyRange's INSERT and
@@ -643,6 +740,32 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       }
       done.set(key, startedAt);
     }
+  }
+
+  /**
+   * The hooks of the account and market jobs for a slice `[start, end)` that was recomputed, in this order: the rates of its
+   * days (`rates_daily`), its hours of `pair_hourly`, the day rollups of the heavy accounts (`account_rollups`). Without the
+   * `aggregates` option there are none. A hook that fails is logged and counted as `<job>_dirty`, and the hooks after it are not
+   * run: false, so that the slice fails and its range stays in the queue. A hook does nothing once the shutdown has begun,
+   * which is safe because the range is not changed after it (`recomputeDirty`).
+   */
+  private async hooksOfSlice(start: number, end: number, tick: AggregatorTick): Promise<boolean> {
+    const runners = this.aggregateRunners;
+    if (!runners) return true;
+    const hooks = [
+      ['rates_daily', runners.ratesDaily],
+      ['pair_hourly', runners.pairHourly],
+      ['account_rollups', runners.accountRollups],
+    ] as const;
+    for (const [job, runner] of hooks) {
+      try {
+        await runner.ofSlice(start, end, tick);
+      } catch (err) {
+        this.failed(`${job}_dirty`, err, ` in ${iso(start)} - ${iso(end)}`);
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
