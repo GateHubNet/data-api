@@ -2,6 +2,7 @@ import { ShutdownSignals } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { SyncerConfig } from '../config/syncer.config';
 import { DomainChecker } from './domain-checker';
+import { NetworkStatePoller } from './network-state-poller';
 import { UnlFetcher } from './unl-fetcher';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
 
@@ -10,6 +11,12 @@ export const VALIDATORS_STOP_WAIT_MS = 2_000;
 
 /** The wait between the end of a domain pass and the start of the next. */
 export const DOMAIN_PASS_INTERVAL_MS = 60_000;
+
+/** The wait between the end of a network state poll and the start of the next (spec 2.3). */
+export const STATE_POLL_INTERVAL_MS = 60_000;
+
+/** The wait between the end of a feature poll (and the gauge update after it) and the start of the next (spec 2.3). */
+export const FEATURE_POLL_INTERVAL_MS = 600_000;
 
 /** A loop of the worker: it ends its timers on `stop()` and resolves when what it had under way is over. */
 interface Loop {
@@ -75,6 +82,10 @@ class PassLoop implements Loop {
  *   background. A ClickHouse that cannot be written at boot fails the boot, like the ingest worker's lease does.
  * - the **domain loop** (`DomainChecker`), while `GH_DOMAIN_VERIFICATION` is true: a pass at start and then one every
  *   60 s after the previous one ended, which verifies the domains of the validators (spec 2.2).
+ * - the **state loop** (`NetworkStatePoller`): a poll of the ledger state at start and then one every 60 s after the previous
+ *   one ended, and a poll of the amendment features, followed by the update of the gauge of the amendments without
+ *   metadata, at start and then every 10 min (spec 2.3). The two polls are timers of their own, so a slow node holds up
+ *   neither; each never overlaps itself.
  *
  * It is a worker of its own, and not steps of the aggregator, because it needs outbound HTTPS to third-party sites and the
  * node, because its cadences and failure modes are its own, and because the aggregator's 30 s tick is not its to share (spec
@@ -94,6 +105,7 @@ export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy
   constructor(
     @Inject(UnlFetcher) private readonly unl: UnlFetcher,
     @Inject(DomainChecker) private readonly domains: DomainChecker,
+    @Inject(NetworkStatePoller) private readonly state: NetworkStatePoller,
     @Inject(SyncerConfig) private readonly cfg: Pick<SyncerConfig, 'domainVerification'>,
     @Optional() private readonly shutdownSignals?: ShutdownSignals,
     @Optional() @Inject(VALIDATORS_WORKER_OPTIONS) options: ValidatorsWorkerOptions = {},
@@ -119,6 +131,29 @@ export class ValidatorsWorker implements OnApplicationBootstrap, OnModuleDestroy
       );
       loop.start();
       this.loops.push(loop);
+    }
+    if (this.start.state !== false) {
+      const stateLoop = new PassLoop(
+        'Network state',
+        () => this.state.pollState(),
+        () => this.state.stop(),
+        STATE_POLL_INTERVAL_MS,
+        this.logger,
+      );
+      const featureLoop = new PassLoop(
+        'Amendment features',
+        async () => {
+          await this.state.pollFeatures();
+          // also after a poll that failed: the gauge reads what is stored, which the state polls change too
+          await this.state.updateMetadataGauge();
+        },
+        () => this.state.stop(),
+        FEATURE_POLL_INTERVAL_MS,
+        this.logger,
+      );
+      stateLoop.start();
+      featureLoop.start();
+      this.loops.push(stateLoop, featureLoop);
     }
   }
 

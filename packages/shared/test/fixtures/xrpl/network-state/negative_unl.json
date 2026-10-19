@@ -1,0 +1,20 @@
+{
+  "error": "entryNotFound",
+  "error_code": 98,
+  "error_message": "Entry not found.",
+  "status": "error",
+  "type": "response",
+  "id": 2,
+  "request": {
+    "command": "ledger_entry",
+    "index": "2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244",
+    "ledger_index": 107760758,
+    "id": 2
+  },
+  "warnings": [
+    {
+      "id": 2001,
+      "message": "This is a clio server. clio only serves validated data. If you want to talk to rippled, include 'ledger_index':'current' in your request"
+    }
+  ]
+}

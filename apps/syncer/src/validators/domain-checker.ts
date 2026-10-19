@@ -15,7 +15,7 @@ import {
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { NETWORK_PROFILE, NODE_CLIENT, SyncerConfig, unlPublishersOf } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
-import { describeError } from './describe-error';
+import { describeError, isRippledError, rippledCodeOf, SIMPLE_NAME } from './describe-error';
 import { SAFE_FETCHER, SafeFetcher, SafeFetchError, tomlFetchLimits } from './safe-fetch';
 import { readStoredLists } from './stored-lists';
 import { matchToml, TomlInvalidError } from './toml-match';
@@ -189,15 +189,6 @@ interface ManifestAnswer {
 }
 
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-/** A node's own answer (`RippledError`, matched by name: the class is not the same across package copies). */
-const isRippledError = (err: unknown): boolean => err instanceof Error && err.name === 'RippledError';
-const SIMPLE_NAME = /^[A-Za-z0-9_.$]{1,64}$/;
-/** The error code of an answer of the node (`actNotFound`, ...), `unknown` for anything that is not a plain code. */
-function rippledCodeOf(err: unknown): string {
-  const data = (err as { data?: unknown }).data;
-  const code = typeof data === 'object' && data !== null ? (data as { error?: unknown }).error : undefined;
-  return typeof code === 'string' && SIMPLE_NAME.test(code) ? code : 'unknown';
-}
 /** The name of whatever was thrown (`TypeError`; `string` for a thrown text), `Error` when it is not a plain name. */
 function errorNameOf(err: unknown): string {
   const name = err instanceof Error ? err.name : typeof err;

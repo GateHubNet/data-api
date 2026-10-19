@@ -1,0 +1,21 @@
+{
+  "index": "2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244",
+  "ledger_hash": "D6C133939B3B166C11F88645C4D5913C030D057B03DAEABA9EC73CF868362B80",
+  "ledger_index": 26633715,
+  "node": {
+    "DisabledValidators": [
+      {
+        "DisabledValidator": {
+          "FirstLedgerSequence": 26615296,
+          "PublicKey": "EDC38F0AC1B575A6AAC59C60D375ABE2E270BF5FAF8B9DA4A010F3C35B44A4464C"
+        }
+      }
+    ],
+    "Flags": 0,
+    "LedgerEntryType": "NegativeUNL",
+    "PreviousTxnID": "B22659DD951CE280D1FCCAE816DA08D36A9A988AE8DC47D53EB474E7435FFC59",
+    "PreviousTxnLgrSeq": 26615040,
+    "index": "2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244"
+  },
+  "validated": true
+}

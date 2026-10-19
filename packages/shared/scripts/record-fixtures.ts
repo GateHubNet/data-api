@@ -23,21 +23,43 @@
  * It GETs each publisher URL of the network profile (Node `https`, at most 3 redirects) and writes the body exactly as
  * served to `<out>/<publisher id>.json`; `--out` defaults to `test/fixtures/<network>/unl`. It needs no node endpoint
  * and takes none of the ledger options.
+ *
+ * `--network-state` records what the validators worker asks the node for (spec 2.3) instead of ledgers:
+ *
+ *   pnpm --filter @gatehub/data-api-shared record:fixtures -- --network-state --network xrpl|xahau --endpoint <wss url>
+ *     [--out <dir>] [--ledger <n>]
+ *
+ * It asks for the Amendments object at the validated ledger (or at ledger `--ledger`, which the node has to still hold:
+ * the way to record a ledger with a disabled validator), then for the NegativeUNL and FeeSettings objects at that same
+ * ledger, and for `server_info` and `feature` (both as of now), at most 2 requests in flight, and writes the answers as the node served
+ * them to `<out>/{amendments,negative_unl,fee_settings,server_info,feature}.json`; `--out` defaults to
+ * `test/fixtures/<network>/network-state`. An `entryNotFound` answer for the NegativeUNL (the object does not exist while
+ * no validator is disabled) is recorded as the error message the node served. All five files are written together, or
+ * none. It takes none of the ledger options.
  */
 import { mkdirSync, writeFileSync } from 'fs';
 import { request as httpsRequest } from 'https';
 import { join, resolve } from 'path';
 import { Client } from 'xrpl';
 import { gzipSync } from 'zlib';
-import { getNetworkProfile, parseUnlPublishers, publisherIdOf } from '../src/network';
+import { getNetworkProfile, NetworkProfile, parseUnlPublishers, publisherIdOf } from '../src/network';
+import {
+  AMENDMENTS_OBJECT_INDEX,
+  FEE_SETTINGS_OBJECT_INDEX,
+  NEGATIVE_UNL_OBJECT_INDEX,
+} from '../src/validators/ledger-objects';
 
 export interface Options {
   network: 'xrpl' | 'xahau';
   /** Record the validator lists of the default publishers instead of ledgers. */
   unl: boolean;
+  /** Record the ledger state the validators worker polls (Amendments, NegativeUNL, FeeSettings, `server_info`, `feature`). */
+  networkState: boolean;
   /** The node endpoint; empty with `unl`. */
   endpoint: string;
   out: string;
+  /** With `networkState`: the ledger to record the state of; none is the validated ledger. */
+  ledger?: number;
   ledgers: number[];
   want: string[];
   scan: number;
@@ -61,13 +83,16 @@ function usage(message?: string): never {
   console.error(
     'usage: record-fixtures --network xrpl|xahau --endpoint <wss url> --out <dir>\n' +
       '         [--ledgers a,b,c] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]\n' +
-      '       record-fixtures --unl --network xrpl|xahau [--out <dir>]',
+      '       record-fixtures --unl --network xrpl|xahau [--out <dir>]\n' +
+      '       record-fixtures --network-state --network xrpl|xahau --endpoint <wss url> [--out <dir>] [--ledger <n>]',
   );
   process.exit(2);
 }
 
 /** The options that only make sense when recording ledgers from a node. */
 const LEDGER_ONLY_OPTIONS = ['endpoint', 'ledgers', 'want', 'scan', 'delay-ms', 'any-result'];
+/** The ones of them that `--network-state` has no use for (it takes `--endpoint`). */
+const LEDGER_ONLY_WITHOUT_ENDPOINT = LEDGER_ONLY_OPTIONS.filter((name) => name !== 'endpoint');
 
 export function parseArgs(argv: string[]): Options {
   const values: Record<string, string> = {};
@@ -77,7 +102,7 @@ export function parseArgs(argv: string[]): Options {
     if (arg === '--') continue;
     if (!arg.startsWith('--')) usage(`unexpected argument "${arg}"`);
     const name = arg.slice(2);
-    if (name === 'any-result' || name === 'unl') {
+    if (name === 'any-result' || name === 'unl' || name === 'network-state') {
       flags.add(name);
       continue;
     }
@@ -85,11 +110,35 @@ export function parseArgs(argv: string[]): Options {
     if (value === undefined || value.startsWith('--')) usage(`--${name} needs a value`);
     values[name] = value;
   }
-  const known = new Set(['network', 'endpoint', 'out', 'ledgers', 'want', 'scan', 'delay-ms']);
+  const known = new Set(['network', 'endpoint', 'out', 'ledger', 'ledgers', 'want', 'scan', 'delay-ms']);
   for (const name of Object.keys(values)) if (!known.has(name)) usage(`unknown option --${name}`);
 
   const network = values.network;
   if (network !== 'xrpl' && network !== 'xahau') usage('--network must be xrpl or xahau');
+  if (flags.has('unl') && flags.has('network-state')) usage('--unl and --network-state are separate modes');
+  if ('ledger' in values && !flags.has('network-state')) usage('--ledger is only for --network-state');
+  if (flags.has('network-state')) {
+    for (const name of LEDGER_ONLY_WITHOUT_ENDPOINT) {
+      if (name in values || flags.has(name)) usage(`--${name} is for recording ledgers, not with --network-state`);
+    }
+    if (!values.endpoint) usage('--endpoint is required');
+    if (values.ledger !== undefined && !/^[1-9]\d*$/.test(values.ledger)) {
+      usage(`--ledger must be a positive integer, got "${values.ledger}"`);
+    }
+    return {
+      network,
+      unl: false,
+      networkState: true,
+      endpoint: values.endpoint,
+      out: resolve(values.out ?? join(__dirname, '..', 'test', 'fixtures', network, 'network-state')),
+      ...(values.ledger === undefined ? {} : { ledger: Number(values.ledger) }),
+      ledgers: [],
+      want: [],
+      scan: 0,
+      delayMs: 0,
+      anyResult: false,
+    };
+  }
   if (flags.has('unl')) {
     for (const name of LEDGER_ONLY_OPTIONS) {
       if (name in values || flags.has(name)) usage(`--${name} is for recording ledgers, not with --unl`);
@@ -97,6 +146,7 @@ export function parseArgs(argv: string[]): Options {
     return {
       network,
       unl: true,
+      networkState: false,
       endpoint: '',
       out: resolve(values.out ?? join(__dirname, '..', 'test', 'fixtures', network, 'unl')),
       ledgers: [],
@@ -128,6 +178,7 @@ export function parseArgs(argv: string[]): Options {
   return {
     network,
     unl: false,
+    networkState: false,
     endpoint: values.endpoint,
     out: resolve(values.out),
     ledgers,
@@ -148,9 +199,10 @@ function retryHintMs(err: unknown): number {
 
 /**
  * Retry a request. Failures that carry a server-supplied wait (rate limiting) are retried for as long as it takes, up to
- * a generous cap; any other failure is retried a few times with a growing delay and then thrown.
+ * a generous cap; any other failure is retried a few times with a growing delay and then thrown. A failure that
+ * `isFinal` calls final (an answer of the node, which asking again would not change) is thrown at once.
  */
-async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+async function withRetry<T>(label: string, fn: () => Promise<T>, isFinal?: (err: unknown) => boolean): Promise<T> {
   const attempts = 6;
   const maxThrottled = 120;
   let failures = 0;
@@ -166,6 +218,7 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
         await sleep(hint);
         continue;
       }
+      if (isFinal?.(err)) throw err;
       failures++;
       if (failures >= attempts) throw err;
       const wait = Math.min(500 * 2 ** (failures - 1), 8_000);
@@ -187,6 +240,123 @@ function errorText(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/** XRPL mainnet reports network_id 0 or omits it; Xahau reports 21337. `undefined` when the node is of the network. */
+function networkIdProblem(
+  info: { network_id?: number },
+  profile: Pick<NetworkProfile, 'name' | 'networkId'>,
+): string | undefined {
+  if (info.network_id === undefined || info.network_id === profile.networkId) return undefined;
+  return `reports network_id ${info.network_id}, but --network ${profile.name} is ${profile.networkId}`;
+}
+
+/**
+ * Runs the tasks with at most `limit` of them in flight, and resolves with their results in the order of the tasks. After
+ * a task fails nothing more is started; the rejection (the first failure) comes when the ones under way are over.
+ */
+export async function runLimited<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<T[]> {
+  const results: T[] = new Array<T>(tasks.length);
+  let next = 0;
+  let failure: { error: unknown } | undefined;
+  const lane = async (): Promise<void> => {
+    while (failure === undefined && next < tasks.length) {
+      const index = next++;
+      try {
+        results[index] = await tasks[index]();
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, lane));
+  if (failure !== undefined) throw failure.error;
+  return results;
+}
+
+/** An answer of the node itself (`RippledError`): the error message the node served is in `data`. */
+type RippledAnswer = Error & { data?: Record<string, unknown> };
+/** Matched by name: the class differs across package copies. */
+const isRippledError = (err: unknown): err is RippledAnswer => err instanceof Error && err.name === 'RippledError';
+
+/** The error code of a rippled error answer (`entryNotFound`), or `''`. */
+const rippledCode = (err: unknown): string =>
+  isRippledError(err) && typeof err.data?.error === 'string' ? err.data.error : '';
+
+const json = (value: unknown): string => JSON.stringify(value, null, 2) + '\n';
+
+/** What `recordNetworkState` found. */
+export interface NetworkStateRecording {
+  /** The validated ledger of the Amendments answer, which the NegativeUNL and FeeSettings answers are of too. */
+  ledgerIndex: number;
+  /** `present`, or `entryNotFound` when the node served that error for the NegativeUNL (no validator is disabled). */
+  negativeUnl: 'present' | 'entryNotFound';
+}
+
+/**
+ * Asks the node for the ledger state of spec 2.3 and writes the answers as served, all together or not at all: the
+ * Amendments object at the validated ledger L, then (at most 2 requests in flight) the NegativeUNL and FeeSettings objects
+ * at L, `server_info` and `feature`. `request` gives a result or throws what the node answered (`RippledError`).
+ */
+export async function recordNetworkState(o: {
+  network: 'xrpl' | 'xahau';
+  /** The ledger to record the state of. Default: the validated ledger. */
+  ledger?: number;
+  request: (command: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  write: (name: string, body: string) => void;
+  /** Progress lines. Default: none. */
+  log?: (line: string) => void;
+}): Promise<NetworkStateRecording> {
+  const profile = getNetworkProfile(o.network);
+  const ask = async (name: string, command: Record<string, unknown>) => {
+    try {
+      return await o.request(command);
+    } catch (err) {
+      throw new Error(`${name}: ${errorText(err)}`);
+    }
+  };
+
+  const amendments = await ask('amendments', {
+    command: 'ledger_entry',
+    index: AMENDMENTS_OBJECT_INDEX,
+    ledger_index: o.ledger ?? 'validated',
+  });
+  const ledgerIndex = amendments.ledger_index;
+  if (typeof ledgerIndex !== 'number' || !Number.isInteger(ledgerIndex) || ledgerIndex < 1) {
+    throw new Error(`amendments: the answer has no ledger_index (${JSON.stringify(ledgerIndex)})`);
+  }
+  o.log?.(`amendments: ledger ${ledgerIndex}`);
+
+  const at = (index: string) => ({ command: 'ledger_entry', index, ledger_index: ledgerIndex });
+  let negativeUnlNotFound = false;
+  const [negativeUnl, feeSettings, serverInfo, feature] = await runLimited(
+    [
+      async () => {
+        try {
+          return await o.request(at(NEGATIVE_UNL_OBJECT_INDEX));
+        } catch (err) {
+          // no validator is disabled: the object does not exist, and the node says so
+          if (rippledCode(err) !== 'entryNotFound') throw new Error(`negative_unl: ${errorText(err)}`);
+          negativeUnlNotFound = true;
+          return (err as RippledAnswer).data ?? {};
+        }
+      },
+      () => ask('fee_settings', at(FEE_SETTINGS_OBJECT_INDEX)),
+      () => ask('server_info', { command: 'server_info' }),
+      () => ask('feature', { command: 'feature' }),
+    ],
+    2,
+  );
+
+  const wrongNetwork = networkIdProblem((serverInfo.info ?? {}) as { network_id?: number }, profile);
+  if (wrongNetwork) throw new Error(`server_info: the node ${wrongNetwork}`);
+
+  o.write('amendments.json', json(amendments));
+  o.write('negative_unl.json', json(negativeUnl));
+  o.write('fee_settings.json', json(feeSettings));
+  o.write('server_info.json', json(serverInfo));
+  o.write('feature.json', json(feature));
+  return { ledgerIndex, negativeUnl: negativeUnlNotFound ? 'entryNotFound' : 'present' };
 }
 
 const UNL_MAX_REDIRECTS = 3;
@@ -272,19 +442,64 @@ async function recordUnlLists(options: Options): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-async function main(): Promise<void> {
-  const options = parseArgs(process.argv.slice(2));
-  if (options.unl) return recordUnlLists(options);
-  const profile = getNetworkProfile(options.network);
-  mkdirSync(options.out, { recursive: true });
-
-  const client = new Client(options.endpoint, { timeout: 30_000, connectionTimeout: 20_000 });
+/** A client of the endpoint, and a function that sends a command and gives its `result`. */
+function nodeRequester(endpoint: string) {
+  const client = new Client(endpoint, { timeout: 30_000, connectionTimeout: 20_000 });
   // No api_version is sent: both xrpl and xahau servers default to API v1.
   const request = async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
     if (!client.isConnected()) await client.connect();
     const response = await client.request(command as never);
     return response.result as unknown as Record<string, unknown>;
   };
+  return { client, request };
+}
+
+/** Record the ledger state the validators worker polls from the node, as served (see `recordNetworkState`). */
+async function recordNetworkStateFromNode(options: Options): Promise<void> {
+  mkdirSync(options.out, { recursive: true });
+  const { client, request } = nodeRequester(options.endpoint);
+  try {
+    console.log(`connecting to ${options.endpoint} (${options.network})`);
+    await client.connect();
+    const recording = await recordNetworkState({
+      network: options.network,
+      ledger: options.ledger,
+      log: console.log,
+      // the answers of the node are final (an `entryNotFound` is not a failure to retry); a lost connection is retried
+      request: (command) =>
+        withRetry(
+          String(command.command),
+          () => request(command),
+          (err) => isRippledError(err),
+        ),
+      write: (name, body) => {
+        writeFileSync(join(options.out, name), body);
+        console.log(`  wrote ${name} (${body.length} bytes)`);
+      },
+    });
+    console.log(
+      `\nrecorded the network state at ledger ${recording.ledgerIndex} into ${options.out} (NegativeUNL: ${recording.negativeUnl})`,
+    );
+  } catch (err) {
+    console.error(`stopped: ${errorText(err)}`);
+    process.exitCode = 1;
+  } finally {
+    try {
+      await client.disconnect();
+    } catch {
+      // ignore: the connection may already be gone
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.unl) return recordUnlLists(options);
+  if (options.networkState) return recordNetworkStateFromNode(options);
+  const profile = getNetworkProfile(options.network);
+  mkdirSync(options.out, { recursive: true });
+
+  const { client, request } = nodeRequester(options.endpoint);
 
   const found = new Map<string, FoundType>();
   const recorded: { ledger: number; bytes: number; gzipBytes: number }[] = [];
@@ -342,12 +557,8 @@ async function main(): Promise<void> {
       network_id?: number;
       validated_ledger?: { seq: number };
     };
-    // XRPL mainnet reports network_id 0 or omits it; Xahau reports 21337.
-    if (serverInfo.network_id !== undefined && serverInfo.network_id !== profile.networkId) {
-      throw new Error(
-        `${options.endpoint} reports network_id ${serverInfo.network_id}, but --network ${options.network} is ${profile.networkId}`,
-      );
-    }
+    const wrongNetwork = networkIdProblem(serverInfo, profile);
+    if (wrongNetwork) throw new Error(`${options.endpoint} ${wrongNetwork}`);
     head = serverInfo.validated_ledger?.seq ?? 0;
     if (!head) throw new Error(`${options.endpoint} has no validated ledger`);
     write('server_info.json', JSON.stringify(info, null, 2) + '\n');

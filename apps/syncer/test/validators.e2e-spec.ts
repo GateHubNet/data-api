@@ -1,4 +1,14 @@
-import { getNetworkProfile, listInUse, Table } from '@gatehub/data-api-shared';
+import {
+  AMENDMENTS_OBJECT_INDEX,
+  FEE_SETTINGS_OBJECT_INDEX,
+  getNetworkProfile,
+  listInUse,
+  loadAmendmentsConfig,
+  NEGATIVE_UNL_OBJECT_INDEX,
+  Table,
+} from '@gatehub/data-api-shared';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { encodeAccountID } from 'ripple-address-codec';
 import {
   makeManifest,
@@ -7,10 +17,13 @@ import {
   TestKey,
   testKey,
 } from '../../../packages/shared/src/test-utils/validator-keys';
+import { NetworkStatePoller } from '../src/validators/network-state-poller';
 import { readStoredLists } from '../src/validators/stored-lists';
 import {
   FakeNode,
+  ledgerEntries,
   MigratedClickHouse,
+  NODE_SILENCE,
   resetValidatorsMetrics,
   startFakeNode,
   startMigratedClickHouse,
@@ -145,7 +158,7 @@ describe('the validators worker (e2e)', () => {
       node,
       web,
       config: { unlPublishers: publishers },
-      worker,
+      worker: { start: { state: false }, ...worker },
     });
     apps.push(app);
     return app;
@@ -705,7 +718,7 @@ describe('the validators worker (e2e)', () => {
         node: o.node ?? node,
         web,
         config: { unlPublishers: PUBLISHERS, ...o.config },
-        worker: { now: () => clock.ms, start: { unl: false, domains: false }, ...o.worker },
+        worker: { now: () => clock.ms, start: { unl: false, domains: false, state: false }, ...o.worker },
         profile: o.profile,
       });
       apps.push(app);
@@ -1138,7 +1151,7 @@ describe('the validators worker (e2e)', () => {
       await putManifest(v, { domain: NORTHPEAK });
       await putSeen(v);
       web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58, [GENESIS]));
-      await bootDomains({ worker: { start: { unl: false } } });
+      await bootDomains({ worker: { start: { unl: false, state: false } } });
 
       const [row] = await waitFor('the first pass to write a row', async () => {
         const rows = await domainRows();
@@ -1155,7 +1168,10 @@ describe('the validators worker (e2e)', () => {
       await putSeen(v);
       await putSeen(pre);
       web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58));
-      const app = await bootDomains({ config: { domainVerification: false }, worker: { start: { unl: false } } });
+      const app = await bootDomains({
+        config: { domainVerification: false },
+        worker: { start: { unl: false, state: false } },
+      });
 
       // the loop would have made its first pass by now
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1163,6 +1179,476 @@ describe('the validators worker (e2e)', () => {
       expect(web.requests).toEqual([]);
       expect(node.requests.filter((r) => r.command === 'manifest')).toEqual([]);
       expect(await counted(app, 'verified')).toBe(0);
+    });
+  });
+
+  describe('network state and amendment names', () => {
+    const FIXTURES = join(__dirname, '../../../packages/shared/test/fixtures');
+    type Network = 'xrpl' | 'xahau';
+    /** What `record-fixtures --network-state` saved from the public node of the network, as the node served it. */
+    const recorded = (network: Network, name: string): any =>
+      JSON.parse(readFileSync(join(FIXTURES, network, 'network-state', `${name}.json`), 'utf8'));
+    const NO_METADATA = 'AB'.repeat(32);
+    /** An amendment the shipped metadata names (RequireFullyCanonicalSig). */
+    const NAMED = '00C1FC4A53E60AB02C864641002B3172F38677E29C26C5406685179B37E1EDAC';
+    const NAMED_2 = '157D2D480E006395B76F948E3E07A45A05FE10230D88A7993C71F97AE4B1F2D1';
+
+    let stateNode: FakeNode;
+    /** The warn lines the worker logged, in order. */
+    let warnings: string[] = [];
+
+    beforeAll(async () => {
+      stateNode = await startFakeNode();
+    });
+
+    afterAll(async () => {
+      await stateNode?.stop();
+    });
+
+    beforeEach(async () => {
+      warnings = [];
+      stateNode.requests.length = 0;
+      for (const table of [Table.NetworkState, Table.AmendmentFeatures, Table.AmendmentTallies]) {
+        await db.ch.command(`TRUNCATE TABLE ${table}`);
+      }
+    });
+
+    /** The node answers as the recorded files of `network` say: the answers it served, errors included. */
+    function answerRecorded(network: Network): void {
+      stateNode.answers.server_info = recorded(network, 'server_info');
+      stateNode.answers.feature = recorded(network, 'feature');
+      stateNode.answers.ledger_entry = ledgerEntries({
+        [AMENDMENTS_OBJECT_INDEX]: recorded(network, 'amendments'),
+        [NEGATIVE_UNL_OBJECT_INDEX]: recorded(network, 'negative_unl'),
+        [FEE_SETTINGS_OBJECT_INDEX]: recorded(network, 'fee_settings'),
+      });
+    }
+
+    /** The worker with the answers of `network`; the loops of the state are off unless the test turns them on. */
+    async function bootState(
+      o: { network?: Network; worker?: ValidatorsAppOptions['worker']; answers?: boolean } = {},
+    ): Promise<ValidatorsApp> {
+      const network = o.network ?? 'xrpl';
+      if (o.answers !== false) answerRecorded(network);
+      const app = await startValidatorsApp({
+        clickhouse: db.config,
+        node: stateNode,
+        web,
+        profile: getNetworkProfile(network),
+        worker: {
+          logger: { log: () => undefined, warn: (line: string) => void warnings.push(line), error: () => undefined },
+          nodeRequestTimeoutMs: 500,
+          ...o.worker,
+          start: { unl: false, domains: false, state: false, ...o.worker?.start },
+        },
+      });
+      apps.push(app);
+      return app;
+    }
+
+    interface StateRow {
+      ledger_index: number;
+      ledger_hash: string;
+      polled_ms: number | string;
+      amendments: string[];
+      majority_ids: string[];
+      majority_since: number[];
+      nunl_keys: string[];
+      nunl_first: number[];
+      to_disable: string;
+      to_reenable: string;
+      base_fee: string;
+      reserve_base: string;
+      reserve_inc: string;
+      node_quorum: number;
+    }
+
+    const stateRows = () =>
+      db.ch.query<StateRow>(
+        `SELECT ledger_index, ledger_hash, toUnixTimestamp64Milli(polled_at) AS polled_ms, amendments,
+                arrayMap(m -> tupleElement(m, 'amendment'), majorities) AS majority_ids,
+                arrayMap(m -> toUnixTimestamp(tupleElement(m, 'since')), majorities) AS majority_since,
+                arrayMap(v -> tupleElement(v, 'validation_public_key'), negative_unl) AS nunl_keys,
+                arrayMap(v -> tupleElement(v, 'first_ledger'), negative_unl) AS nunl_first,
+                to_disable, to_reenable, toString(base_fee) AS base_fee, toString(reserve_base) AS reserve_base,
+                toString(reserve_inc) AS reserve_inc, node_quorum
+           FROM ${Table.NetworkState} ORDER BY ledger_index, polled_at`,
+      );
+
+    interface FeatureRow {
+      amendment_id: string;
+      name: string;
+      supported: number;
+      polled_ms: number | string;
+    }
+
+    const featureRows = () =>
+      db.ch.query<FeatureRow>(
+        `SELECT amendment_id, name, supported, toUnixTimestamp64Milli(polled_at) AS polled_ms
+           FROM ${Table.AmendmentFeatures} ORDER BY amendment_id, polled_at`,
+      );
+
+    /** How often the worker counted `outcome` for the request of the node. */
+    async function polled(app: ValidatorsApp, request: string, outcome: string): Promise<number> {
+      const { values } = await app.metrics.validatorsNodePollsTotal.get();
+      return values
+        .filter((v) => v.labels.request === request && v.labels.outcome === outcome)
+        .reduce((n, v) => n + v.value, 0);
+    }
+
+    const gauge = async (app: ValidatorsApp) => (await app.metrics.amendmentsWithoutMetadata.get()).values[0]?.value;
+
+    describe('the ledger state', () => {
+      it('writes one network_state row at the ledger the node answered, from the answers recorded from the XRPL', async () => {
+        const app = await bootState();
+        const before = Date.now();
+        expect(await app.state.pollState()).toBe(true);
+        const after = Date.now();
+
+        const amendments = recorded('xrpl', 'amendments');
+        const rows = await stateRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          ledger_index: 107760758,
+          ledger_hash: '75B3F5DE8A04C31028C08CD612921551DEA6B16C3F3203D0F2B509221830EF19',
+          amendments: amendments.node.Amendments,
+          majority_ids: ['98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76'],
+          majority_since: [844853670 + 946684800],
+          nunl_keys: [],
+          nunl_first: [],
+          to_disable: '',
+          to_reenable: '',
+          base_fee: '10',
+          reserve_base: '1000000',
+          reserve_inc: '200000',
+          node_quorum: 28,
+        });
+        expect(Number(rows[0].polled_ms)).toBeGreaterThanOrEqual(before);
+        expect(Number(rows[0].polled_ms)).toBeLessThanOrEqual(after);
+      });
+
+      it('asks for the Amendments object at the validated ledger and for the other objects at that ledger', async () => {
+        const app = await bootState();
+        await app.state.pollState();
+        const asked = stateNode.requests.filter((r) => r.command === 'ledger_entry');
+        expect(asked).toHaveLength(3);
+        expect(asked.find((r) => r.index === AMENDMENTS_OBJECT_INDEX)).toMatchObject({ ledger_index: 'validated' });
+        for (const index of [NEGATIVE_UNL_OBJECT_INDEX, FEE_SETTINGS_OBJECT_INDEX]) {
+          expect(asked.find((r) => r.index === index)).toMatchObject({ ledger_index: 107760758 });
+        }
+        expect(stateNode.requests.filter((r) => r.command === 'server_info')).toHaveLength(2); // the boot check, and the poll
+        for (const request of ['amendments', 'negative_unl', 'fee_settings', 'server_info']) {
+          expect(await polled(app, request, 'ok')).toBe(1);
+          expect(await polled(app, request, 'error')).toBe(0);
+        }
+      });
+
+      it('reads the disabled validator and the two majorities from the answers recorded from Xahau', async () => {
+        const app = await bootState({ network: 'xahau' });
+        expect(await app.state.pollState()).toBe(true);
+        const [row] = await stateRows();
+        expect(row).toMatchObject({
+          ledger_index: 26633715,
+          nunl_keys: ['nHUqZcdCzkccxHQJp43M7nTTbHDbj2Yv9R1ty8zM1zFbtQFPnDu7'],
+          nunl_first: [26615296],
+          to_disable: '',
+          to_reenable: '',
+          majority_ids: [
+            '2339E37C9DCD516CABC37FE91C4BBBFBA3EA152FD45331C3C18F183129AEF65F',
+            '6902B1DEAFD9C05D0E897EBEF5A5F7C563D1F9681EA957C4C6B0874C8E009E1A',
+          ],
+          majority_since: [845332143 + 946684800, 845352140 + 946684800],
+          base_fee: '10',
+          node_quorum: 0,
+        });
+        expect(row.amendments).toHaveLength(75);
+      });
+
+      it('writes empty arrays when the node says entryNotFound for the NegativeUNL, and counts that request as ok', async () => {
+        const app = await bootState();
+        expect(recorded('xrpl', 'negative_unl')).toMatchObject({ error: 'entryNotFound', status: 'error' });
+        await app.state.pollState();
+        const [row] = await stateRows();
+        expect(row).toMatchObject({ nunl_keys: [], nunl_first: [], to_disable: '', to_reenable: '' });
+        expect(await polled(app, 'negative_unl', 'ok')).toBe(1);
+        expect(await polled(app, 'negative_unl', 'error')).toBe(0);
+      });
+
+      it('writes the validators to disable and to re-enable in base58, and reads the legacy fees', async () => {
+        const app = await bootState();
+        // hand-written answers (not recorded): the form of a ledger before the XRPFees amendment, with a pending change
+        const key = recorded('xahau', 'negative_unl').node.DisabledValidators[0].DisabledValidator.PublicKey;
+        stateNode.answers.ledger_entry = ledgerEntries({
+          [AMENDMENTS_OBJECT_INDEX]: recorded('xrpl', 'amendments'),
+          [NEGATIVE_UNL_OBJECT_INDEX]: { ledger_index: 107760758, node: { ValidatorToDisable: key } },
+          [FEE_SETTINGS_OBJECT_INDEX]: {
+            ledger_index: 107760758,
+            node: { BaseFee: '000000000000000A', ReserveBase: 10000000, ReserveIncrement: 2000000 },
+          },
+        });
+        expect(await app.state.pollState()).toBe(true);
+        const [row] = await stateRows();
+        expect(row).toMatchObject({
+          to_disable: 'nHUqZcdCzkccxHQJp43M7nTTbHDbj2Yv9R1ty8zM1zFbtQFPnDu7',
+          to_reenable: '',
+          base_fee: '10',
+          reserve_base: '10000000',
+          reserve_inc: '2000000',
+        });
+      });
+
+      it('writes no row, and counts an error, when server_info does not answer in time; the next poll is the retry', async () => {
+        const app = await bootState();
+        stateNode.answers.server_info = () => NODE_SILENCE;
+        expect(await app.state.pollState()).toBe(false);
+        expect(await stateRows()).toEqual([]);
+        expect(await polled(app, 'server_info', 'error')).toBe(1);
+        expect(await polled(app, 'server_info', 'ok')).toBe(0);
+        // the others were answered and counted all the same
+        for (const request of ['amendments', 'negative_unl', 'fee_settings']) {
+          expect(await polled(app, request, 'ok')).toBe(1);
+        }
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain('server_info');
+
+        stateNode.answers.server_info = recorded('xrpl', 'server_info');
+        expect(await app.state.pollState()).toBe(true);
+        expect(await stateRows()).toHaveLength(1);
+        expect(await polled(app, 'server_info', 'ok')).toBe(1);
+      });
+
+      it('writes no row when the node answers the Amendments object with an error, and asks for nothing else', async () => {
+        const app = await bootState();
+        stateNode.answers.ledger_entry = ledgerEntries({});
+        stateNode.requests.length = 0;
+        expect(await app.state.pollState()).toBe(false);
+        expect(await stateRows()).toEqual([]);
+        expect(stateNode.requests.map((r) => r.command)).toEqual(['ledger_entry']);
+        expect(await polled(app, 'amendments', 'error')).toBe(1);
+        expect(warnings).toEqual([expect.stringContaining('entryNotFound')]);
+      });
+
+      it('writes no row when the FeeSettings object is not there: it always is', async () => {
+        const app = await bootState();
+        stateNode.answers.ledger_entry = ledgerEntries({
+          [AMENDMENTS_OBJECT_INDEX]: recorded('xrpl', 'amendments'),
+          [NEGATIVE_UNL_OBJECT_INDEX]: recorded('xrpl', 'negative_unl'),
+        });
+        expect(await app.state.pollState()).toBe(false);
+        expect(await stateRows()).toEqual([]);
+        expect(await polled(app, 'fee_settings', 'error')).toBe(1);
+        expect(await polled(app, 'negative_unl', 'ok')).toBe(1);
+      });
+
+      it('writes a row for every poll, one per ledger answered', async () => {
+        const app = await bootState();
+        await app.state.pollState();
+        const next = { ...recorded('xrpl', 'amendments'), ledger_index: 107760800 };
+        stateNode.answers.ledger_entry = ledgerEntries({
+          [AMENDMENTS_OBJECT_INDEX]: next,
+          [NEGATIVE_UNL_OBJECT_INDEX]: recorded('xrpl', 'negative_unl'),
+          [FEE_SETTINGS_OBJECT_INDEX]: recorded('xrpl', 'fee_settings'),
+        });
+        await app.state.pollState();
+        expect((await stateRows()).map((r) => r.ledger_index)).toEqual([107760758, 107760800]);
+      });
+    });
+
+    describe('the features', () => {
+      it('writes an amendment_features row for each amendment of the answer recorded from the XRPL', async () => {
+        const app = await bootState();
+        const before = Date.now();
+        expect(await app.state.pollFeatures()).toBe(true);
+        const after = Date.now();
+
+        const features = recorded('xrpl', 'feature').features;
+        const rows = await featureRows();
+        expect(rows).toHaveLength(115);
+        expect(rows.map((r) => r.amendment_id)).toEqual(Object.keys(features).sort());
+        for (const row of rows) {
+          expect(row.name).toBe(features[row.amendment_id].name);
+          expect(row.supported).toBe(features[row.amendment_id].supported ? 1 : 0);
+          expect(Number(row.polled_ms)).toBeGreaterThanOrEqual(before);
+          expect(Number(row.polled_ms)).toBeLessThanOrEqual(after);
+        }
+        expect(rows.filter((r) => r.supported === 0)).toHaveLength(11);
+        expect(await polled(app, 'feature', 'ok')).toBe(1);
+        // the answer of the node is all there is: nothing asked besides `feature`
+        expect(stateNode.requests.filter((r) => r.command !== 'server_info')).toEqual([
+          expect.objectContaining({ command: 'feature' }),
+        ]);
+      });
+
+      it('keeps an amendment the node has no name for, with an empty name', async () => {
+        const app = await bootState();
+        stateNode.answers.feature = {
+          features: { [NO_METADATA]: { enabled: false, supported: false }, [NAMED]: { name: 'X', supported: true } },
+        };
+        await app.state.pollFeatures();
+        expect(await featureRows()).toEqual([
+          expect.objectContaining({ amendment_id: NAMED, name: 'X', supported: 1 }),
+          expect.objectContaining({ amendment_id: NO_METADATA, name: '', supported: 0 }),
+        ]);
+      });
+
+      it('writes nothing, and counts an error, when the feature request fails', async () => {
+        const app = await bootState();
+        stateNode.answers.feature = () => NODE_SILENCE;
+        expect(await app.state.pollFeatures()).toBe(false);
+        expect(await featureRows()).toEqual([]);
+        expect(await polled(app, 'feature', 'error')).toBe(1);
+      });
+    });
+
+    describe('the gauge of the amendments without metadata', () => {
+      it('is 1 for an amendment the metadata does not name, with one warning, not repeated on the next poll', async () => {
+        const app = await bootState();
+        stateNode.answers.feature = {
+          features: {
+            [NAMED]: { name: 'RequireFullyCanonicalSig', enabled: true, supported: true },
+            [NO_METADATA]: { enabled: false, supported: false },
+          },
+        };
+        await app.state.pollFeatures();
+        await app.state.updateMetadataGauge();
+        expect(await gauge(app)).toBe(1);
+        expect(warnings).toEqual([`amendment ${NO_METADATA} has no metadata entry`]);
+
+        await app.state.pollFeatures();
+        await app.state.updateMetadataGauge();
+        expect(await gauge(app)).toBe(1);
+        expect(warnings).toHaveLength(1);
+      });
+
+      it('is 0 for the amendments recorded from the XRPL and from Xahau, which the shipped metadata all names', async () => {
+        for (const network of ['xrpl', 'xahau'] as const) {
+          warnings.length = 0;
+          const app = await bootState({ network });
+          await app.state.pollState();
+          await app.state.pollFeatures();
+          await app.state.updateMetadataGauge();
+          expect(await gauge(app)).toBe(0);
+          expect(warnings).toEqual([]);
+          await app.stop();
+          apps = apps.filter((a) => a !== app);
+          await db.ch.command(`TRUNCATE TABLE ${Table.NetworkState}`);
+          await db.ch.command(`TRUNCATE TABLE ${Table.AmendmentFeatures}`);
+        }
+        // the same, worked out from the metadata and the recorded answers
+        for (const network of ['xrpl', 'xahau'] as const) {
+          const byId = loadAmendmentsConfig(getNetworkProfile(network)).byId;
+          const seen = [
+            ...Object.keys(recorded(network, 'feature').features),
+            ...recorded(network, 'amendments').node.Amendments,
+          ];
+          expect(seen.filter((id) => !byId.has(id))).toEqual([]);
+        }
+      });
+
+      it('reads the newest rows of the features, the state and the tallies, and nothing older', async () => {
+        const app = await bootState();
+        const ids = [1, 2, 3, 4, 5, 6, 7].map((n) => String(n).repeat(64));
+        const [OLD_FEATURE, NEW_FEATURE, OLD_ENABLED, NEW_ENABLED, NEW_MAJORITY, OLD_ROUND, NEW_ROUND] = ids;
+        const OLD_VERSION = ids[0].replace(/1/g, '9');
+        // recent times: `network_state` keeps its rows 100 days, and a row older than that is not kept at all
+        const now = Math.floor(Date.now() / 1000);
+
+        // two feature polls: only the newest one counts
+        await db.ch.insert(Table.AmendmentFeatures, [
+          { amendment_id: OLD_FEATURE, name: '', supported: 0, polled_at: now - 600.5 },
+          { amendment_id: NAMED, name: 'RequireFullyCanonicalSig', supported: 1, polled_at: now - 600.5 },
+          { amendment_id: NEW_FEATURE, name: '', supported: 0, polled_at: now - 0.25 },
+          { amendment_id: NAMED, name: 'RequireFullyCanonicalSig', supported: 1, polled_at: now - 0.25 },
+        ]);
+        // two state polls: the newest ledger counts, its enabled list and its majorities
+        const state = {
+          ledger_hash: '',
+          polled_at: now - 60.5,
+          negative_unl: [],
+          to_disable: '',
+          to_reenable: '',
+          base_fee: '10',
+          reserve_base: '1000000',
+          reserve_inc: '200000',
+          node_quorum: 28,
+        };
+        await db.ch.insert(Table.NetworkState, [
+          { ...state, ledger_index: 100, amendments: [OLD_ENABLED, NAMED], majorities: [] },
+          {
+            ...state,
+            ledger_index: 200,
+            amendments: [NEW_ENABLED, NAMED],
+            majorities: [{ amendment: NEW_MAJORITY, since: now - 3600 }],
+          },
+        ]);
+        // two rounds, and two versions of the newest one: the newest version of the newest round counts
+        const tally = {
+          close_time: 1_760_000_000,
+          yes: 1,
+          trusted: 1,
+          threshold: 1,
+          unl_size: 1,
+          observed: 1,
+          unl: [],
+          negative_unl: [],
+          base_fee: '10',
+          reserve_base: '1000000',
+          reserve_inc: '200000',
+        };
+        await db.ch.insert(Table.AmendmentTallies, [
+          { ...tally, ledger_index: 255, amendment_id: OLD_ROUND, version: '1760000000100' },
+          { ...tally, ledger_index: 255, amendment_id: '', version: '1760000000100' },
+          { ...tally, ledger_index: 511, amendment_id: OLD_VERSION, version: '1760000000200' },
+          { ...tally, ledger_index: 511, amendment_id: '', version: '1760000000200' },
+          { ...tally, ledger_index: 511, amendment_id: NEW_ROUND, version: '1760000000300' },
+          { ...tally, ledger_index: 511, amendment_id: NAMED_2, version: '1760000000300' },
+          { ...tally, ledger_index: 511, amendment_id: '', version: '1760000000300' },
+        ]);
+
+        await app.state.updateMetadataGauge();
+        expect(await gauge(app)).toBe(4);
+        expect(warnings.sort()).toEqual(
+          [NEW_FEATURE, NEW_ENABLED, NEW_MAJORITY, NEW_ROUND]
+            .sort()
+            .map((id) => `amendment ${id} has no metadata entry`),
+        );
+      });
+
+      it('is 0, and quiet, when nothing is stored yet', async () => {
+        const app = await bootState();
+        await app.state.updateMetadataGauge();
+        expect(await gauge(app)).toBe(0);
+        expect(warnings).toEqual([]);
+      });
+    });
+
+    describe('the loops', () => {
+      it('poll the state and the features from boot, and update the gauge after the feature poll', async () => {
+        const gaugeUpdates = jest.spyOn(NetworkStatePoller.prototype, 'updateMetadataGauge');
+        try {
+          const app = await bootState({ worker: { start: { state: true } } });
+          await waitFor('the state, the features and the gauge', async () => {
+            const [state, features] = await Promise.all([stateRows(), featureRows()]);
+            return state.length > 0 && features.length > 0 && gaugeUpdates.mock.calls.length > 0;
+          });
+          await waitFor(
+            'the gauge update to end',
+            async () => (await gaugeUpdates.mock.results[0]?.value) === undefined,
+          );
+          expect(await gauge(app)).toBe(0);
+          expect((await stateRows())[0].ledger_index).toBe(107760758);
+          expect(await featureRows()).toHaveLength(115);
+        } finally {
+          gaugeUpdates.mockRestore();
+        }
+      });
+
+      it('make no request when start.state is false', async () => {
+        const app = await bootState();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        expect(stateNode.requests.filter((r) => r.command !== 'server_info')).toEqual([]);
+        expect(await polled(app, 'amendments', 'ok')).toBe(0);
+      });
     });
   });
 });

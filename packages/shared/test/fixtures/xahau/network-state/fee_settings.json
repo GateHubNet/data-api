@@ -1,0 +1,19 @@
+{
+  "index": "4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651",
+  "ledger_hash": "D6C133939B3B166C11F88645C4D5913C030D057B03DAEABA9EC73CF868362B80",
+  "ledger_index": 26633715,
+  "node": {
+    "AccountCount": "3501d",
+    "BaseFeeDrops": "10",
+    "Flags": 0,
+    "LedgerEntryType": "FeeSettings",
+    "NetworkID": 21337,
+    "PreviousTxnID": "1B50A80DCFF98AA502D19B3929314069777C0E09743989F55ED5905F6E6DF6EF",
+    "PreviousTxnLgrSeq": 26633341,
+    "ReserveBaseDrops": "1000000",
+    "ReserveIncrementDrops": "200000",
+    "XahauActivationLgrSeq": 3,
+    "index": "4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651"
+  },
+  "validated": true
+}

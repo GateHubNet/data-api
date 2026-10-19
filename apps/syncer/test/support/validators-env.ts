@@ -17,6 +17,7 @@ import { SyncerConfig, WorkerName } from '../../src/config/syncer.config';
 import { SyncerCoreModule } from '../../src/core/syncer-core.module';
 import { PrometheusService } from '../../src/modules/prometheus/prometheus.service';
 import { DomainChecker } from '../../src/validators/domain-checker';
+import { NetworkStatePoller } from '../../src/validators/network-state-poller';
 import { SafeFetchTestOptions } from '../../src/validators/safe-fetch';
 import { UnlFetcher } from '../../src/validators/unl-fetcher';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from '../../src/validators/validators.options';
@@ -40,13 +41,19 @@ import { TEST_TLS } from './tls';
  *   startFakeNode(answers?)            a websocket server that talks like rippled and answers by `command`:
  *                                      `node.answers.ledger_entry = (request) => ({ node: { ... } })` swaps or adds an
  *                                      answer (a value, or a function of the request); `node.requests` logs the requests; a
- *                                      command with no answer is an `unknownCmd` error. `server_info` is answered from the start
+ *                                      command with no answer is an `unknownCmd` error. `server_info` is answered from the start.
+ *                                      An answer that is an error message as a node serves it (`status: 'error'`, as
+ *                                      `record-fixtures --network-state` saves `entryNotFound`) is sent as an error; a
+ *                                      function that gives `NODE_SILENCE` sends no reply at all (the request times out);
+ *                                      `ledgerEntries({ [index]: answer })` answers `ledger_entry` by the `index` asked for
+ *                                      (`entryNotFound` for an index it has none for)
  *   startValidatorsApp(options)        the real `SyncerCoreModule` (config, ClickHouse, metrics, shutdown signals and the
  *                                      node client made from the fake node) with the modules of `options.workers` (default
  *                                      `['validators']`, chosen by the application's own `selectWorkerModules`, and the node
  *                                      client made when `needsNodeClient` says so), booted as the application does: the
  *                                      result holds the app, the `UnlFetcher`, the `DomainChecker` (a test that switches
  *                                      its loop off with `worker.start.domains = false` makes the passes itself), the
+ *                                      `NetworkStatePoller` (likewise with `worker.start.state = false`), the
  *                                      metrics, and `stop()`. `options.config`
  *                                      overrides `SyncerConfig` (for instance `unlPublishers`), `options.worker` the
  *                                      `ValidatorsWorkerOptions` (`now`, `start`, ...; the `fetch` options of the web server
@@ -184,8 +191,21 @@ export async function startTestWeb(): Promise<TestWeb> {
 
 // -- The node ---------------------------------------------------------------------------------------------------------
 
-/** What a node answers to a command: the `result`, or a function of the request that gives it. */
-export type NodeAnswer = object | ((request: Record<string, unknown>) => object);
+/** Returned by the function that answers a command: the node sends no reply, so that the request times out. */
+export const NODE_SILENCE = Symbol('NODE_SILENCE');
+
+/** What a node answers to a command: the `result`, or a function of the request that gives it (or `NODE_SILENCE`). */
+export type NodeAnswer = object | ((request: Record<string, unknown>) => object | typeof NODE_SILENCE);
+
+/** An error message as a node serves it, as recorded: `{ error: 'entryNotFound', status: 'error', ... }`. */
+const isErrorMessage = (answer: object): answer is { error: string; status: 'error' } =>
+  (answer as { status?: unknown }).status === 'error' && typeof (answer as { error?: unknown }).error === 'string';
+
+/** The answer of `ledger_entry`: that of `byIndex` for the `index` of the request, else `entryNotFound`. */
+export const ledgerEntries =
+  (byIndex: Record<string, object>): NodeAnswer =>
+  (request) =>
+    byIndex[String(request.index)] ?? { error: 'entryNotFound', error_message: 'Entry not found.', status: 'error' };
 
 export interface FakeNode {
   /** `ws://127.0.0.1:<port>` */
@@ -218,6 +238,11 @@ export async function startFakeNode(answers: Record<string, NodeAnswer> = {}): P
         return;
       }
       const result = typeof answer === 'function' ? answer(request) : answer;
+      if (result === NODE_SILENCE) return;
+      if (isErrorMessage(result)) {
+        socket.send(JSON.stringify({ ...result, id: request.id, type: 'response', status: 'error', request }));
+        return;
+      }
       socket.send(JSON.stringify({ id: request.id, type: 'response', status: 'success', result }));
     });
   });
@@ -240,6 +265,7 @@ export interface ValidatorsApp {
   app: INestApplication;
   fetcher: UnlFetcher;
   domains: DomainChecker;
+  state: NetworkStatePoller;
   metrics: PrometheusService;
   stop(): Promise<void>;
 }
@@ -311,6 +337,7 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
     app,
     fetcher: app.get(UnlFetcher),
     domains: app.get(DomainChecker),
+    state: app.get(NetworkStatePoller),
     metrics: app.get(PrometheusService),
     stop: () => app.close(),
   };
@@ -322,6 +349,8 @@ export const VALIDATORS_METRICS = [
   'validatorsUnlExpirySeconds',
   'validatorsUnlSize',
   'validatorsDomainChecksTotal',
+  'validatorsNodePollsTotal',
+  'amendmentsWithoutMetadata',
 ] as const;
 
 /** The metrics are one set per process, so a spec clears the ones the worker sets before each test. */

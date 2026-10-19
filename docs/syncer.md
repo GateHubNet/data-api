@@ -315,8 +315,8 @@ section 2. Like every worker it is switched on and off with `GH_WORKERS`.
 **Two loops.** An **I/O loop** that fetches the UNL lists (below), checks validator domains and polls the node, each on its own
 timer; and a **compute loop**, once a minute, that runs two ClickHouse jobs in the aggregator's job model (a budget per job, a job
 that fails is logged and counted and retried at the next tick, no overlap, shutdown waits at most 2 s). The UNL fetcher and the
-domain checker are the parts of the I/O loop that are in place; the rest joins the worker as it is built, started from the same
-bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
+domain checker and the network state poller are the parts of the I/O loop that are in place; the rest joins the worker as it is built,
+started from the same bootstrap. A stop ends every loop and waits for them for at most 2 s. Everything that goes out to the internet goes through the safe fetcher (HTTPS only, no
 private, loopback or reserved address, no redirect to one, 20 s, 1 MiB, 3 redirects), which also sends the `User-Agent`
 `gatehub-data-api/<version> (validators)`.
 
@@ -427,6 +427,37 @@ and the next one is made on time.
   never holds the body of a response, an error object or the message of a fetch failure, and a domain is quoted because it comes
   from a manifest.
 
+### Network state and amendment names
+
+`NetworkStatePoller` (`network-state-poller.ts`) reads the ledger state and the names of the amendments from the node, on two timers of
+the worker (each a pass at start and then one after the previous one ended, never two of a kind at a time; `start.state` switches both
+off in a test).
+
+- **Every 60 s, the state.** `ledger_entry` of the Amendments object (index `7DB0788C…`) at the `validated` ledger; its `ledger_index`
+  *L* is the ledger the other two objects are read at, `ledger_entry` of NegativeUNL (`2E8A59AA…`) and FeeSettings (`4BC50C9B…`), together
+  with `server_info` for `validation_quorum` (0 when the node reports none). **One `network_state` row**: the enabled amendment IDs; the
+  majorities (`Majorities[].Majority.{Amendment, CloseTime}`, a CloseTime in Ripple time, stored as unix time); the negative UNL
+  (`DisabledValidators[].DisabledValidator.{PublicKey, FirstLedgerSequence}`, the hex key stored as a base58 node public key) and
+  `ValidatorToDisable` / `ValidatorToReEnable` (base58, `''` when none); and the fees in drops, from `BaseFeeDrops`,
+  `ReserveBaseDrops` and `ReserveIncrementDrops`, or from the legacy `BaseFee` (hex), `ReserveBase` and `ReserveIncrement` of a ledger
+  before the XRPFees amendment (a field with both forms is read from the drops one). NegativeUNL does not exist while no validator is
+  disabled: the node answers `entryNotFound`, which is an answer (empty arrays), whereas FeeSettings that is not found is an error.
+- **At start and every 10 min, the features.** `feature`: one `amendment_features` row per amendment ID (`name` is `''` when the node has
+  none, `supported` 1 or 0).
+- **No retry, no partial write.** Every request has a timeout of 5 s and is not retried; a poll in which a request fails, or an answer
+  cannot be stored, writes nothing, and the next poll is the retry. A ClickHouse that fails makes the pass fail (logged, retried on
+  time).
+- **The gauge** `syncer_amendments_without_metadata`, set after each feature poll (also one that failed: it reads what is stored): the
+  number of amendment IDs in the newest `amendment_features` rows, in the newest `network_state` row (enabled, or in `Majorities`) and in
+  the newest round of `amendment_tallies` that the amendment metadata (`GH_AMENDMENTS_CONFIG`, else the file shipped with the shared
+  package) does not list. Each ID is warned about once, `amendment <ID> has no metadata entry`, and remembered until the syncer restarts.
+  An invalid metadata file does not load and so fails the boot.
+- **Observability.** `syncer_validators_node_polls_total{request, outcome}` counts every request (`amendments`, `negative_unl`,
+  `fee_settings`, `server_info`, `feature`; `ok` or `error`: an `entryNotFound` for the NegativeUNL is `ok`, an answer that is not what was
+  asked for is `error`). A failure is logged at `warn` when it starts or changes, naming the request and the error code of the node
+  (`the node answered slowDown`) or the message of the error, and its end once at `log`; an answer whose fields cannot be stored is
+  logged with the field at fault. A log line never holds an error object.
+
 ## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
@@ -451,6 +482,8 @@ and the next one is made on time.
 | `Validator <key>: domain "<domain>" is unverified (<reason>)` | A validator's domain does not serve a TOML file that lists it, or cannot be reached | The domain shows `unverified` with the reason in `validator_domains` and `syncer_validators_domain_checks_total`; a definite failure is checked again in 6 h, a transient one in 1 h, and a domain verified within 24 h stays verified through transient failures. Logged once, when the result changes. |
 | `Domain "<domain>": the fetch was blocked (blocked_address, <range>)` | A validator's domain resolves to a private, loopback or reserved address | Nothing is requested; the pair is `unverified` (`blocked_address`) and is checked again in 6 h. Logged at every check. |
 | `Domain verification: N of M manifest lookups failed (...)`, `... were answered with an error (<codes>)` | The node cannot be asked, or answers an error (`actNotFound`, `slowDown`, ...), for the manifests that were stored before migration 002 | Those validators are not checked until an answer is stored; each key is asked again after 10 minutes. |
+| `Network state poll failed: <request>: ...`, `Amendment features poll failed: ...` | The node cannot be asked, times out (5 s), answers an error, or answers with something that cannot be stored | No row is written for that poll; the next one (60 s, or 10 min for the features) is the retry. Logged when the failure starts or changes, and `... recovered` once when it ends; counted in `syncer_validators_node_polls_total{outcome="error"}`. |
+| `amendment <ID> has no metadata entry` | The node, the ledger or the votes name an amendment that the amendment metadata lacks | Warned once per ID; `syncer_amendments_without_metadata` counts them. Add the entry (`amendments:check` lists them). |
 
 ## 11. Source map
 
@@ -460,7 +493,7 @@ and the next one is made on time.
 | `apps/syncer/src/ingest/{live-runner,rpc-ledger-source}.ts` | The ingest worker and its ledger source |
 | `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
-| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `stored-lists`, `safe-fetch` (the only outbound HTTP) |
+| `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `stored-lists`, `safe-fetch` (the only outbound HTTP) |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
 | `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts |
