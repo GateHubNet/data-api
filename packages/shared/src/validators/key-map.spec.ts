@@ -1,5 +1,5 @@
 import { Table } from '../clickhouse/tables';
-import { keyMapParams, MANIFEST_MAP_SQL } from './key-map';
+import { keyMapParams, MANIFEST_MAP_SQL, NEWEST_MANIFEST_ORDER } from './key-map';
 
 describe('keyMapParams', () => {
   it('gives the ephemeral keys and their masters side by side, in the order of the rows', () => {
@@ -30,5 +30,11 @@ describe('MANIFEST_MAP_SQL', () => {
     expect(MANIFEST_MAP_SQL).toContain('argMax(master_key, seq)');
     expect(MANIFEST_MAP_SQL).toContain('GROUP BY ephemeral_key');
     expect(MANIFEST_MAP_SQL).not.toMatch(/\{\w+:/);
+  });
+});
+
+describe('NEWEST_MANIFEST_ORDER', () => {
+  it('orders by seq, and among rows of one seq puts the one with the raw manifest last (argMax takes it)', () => {
+    expect(NEWEST_MANIFEST_ORDER).toBe('(seq, notEmpty(manifest))');
   });
 });

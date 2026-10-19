@@ -1,5 +1,6 @@
 import { RIPPLE_EPOCH_MS, Table } from '@gatehub/data-api-shared';
 import { join } from 'node:path';
+import { makeManifest } from '../../../packages/shared/src/test-utils/validator-keys';
 import type { Directory } from '../src/validators/directory';
 import { PUBLISHER_KEYS, SUMMARY_KEYS } from '../src/validators/summary-object';
 import { VALIDATION_ROW_KEYS, VALIDATIONS_BODY_KEYS } from '../src/validators/validation-row-object';
@@ -3121,3 +3122,85 @@ describe('the reads of the directory stay within their window (read_rows over a 
     for (const read of reads.votes) expect(read.read_rows).toBeLessThanOrEqual(bound(4 * 54 + 2));
   });
 });
+
+// ===================================================================================================================
+// the newest manifest on a database upgraded from 001
+// ===================================================================================================================
+
+describe.each([
+  ['the row of 001 inserted first', 'old-first'],
+  ['the row of the list inserted first', 'list-first'],
+])(
+  'GET /v2/network/validators/{key}: two manifests of one seq, %s (an upgraded database, merges stopped)',
+  (_name, order) => {
+    // A row of 001 has neither a domain nor a raw manifest (the columns of 002 have their defaults). The list brings the same
+    // manifest, of the same seq, with both. Until a merge keeps one of the two, a read by seq alone could take either.
+    let h: Harness;
+    let detail: Answer;
+    let parts: number;
+    const [member] = fleet('xrpl', 1);
+    const domain = 'northpeak.example';
+
+    beforeAll(async () => {
+      h = await startHarness({
+        seed: 'none',
+        network: 'xrpl',
+        env: { ...NO_RATE_LIMIT, GH_AMENDMENTS_CONFIG: NO_AMENDMENTS.xrpl },
+      });
+      const now = Math.floor(Date.now() / 1000);
+      await insertLists(h.ch, [
+        { publisher: 'vl.ripple.com', sequence: 85, expiration: now + 30 * DAY, validators: [member.key] },
+      ]);
+      await insertPublishers(h.ch, [{ publisher: 'vl.ripple.com', checked_at: now - 10 }]);
+      await insertSeen(h.ch, [{ key: member.key, first: now - DAY, last: now - 30 }]);
+      await insertDomains(h.ch, [
+        {
+          validation_public_key: member.key,
+          domain,
+          checked_at: now - 100,
+          accounts: ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+        },
+      ]);
+      await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.ValidatorManifests}`);
+      const of001 = { ephemeral_key: member.ephemeral, master_key: member.key, seq: 1 };
+      const ofList = {
+        ...of001,
+        domain,
+        manifest: makeManifest({ master: member.master, signing: member.signing, sequence: 1, domain }),
+        source: 'unl',
+      };
+      // two inserts: two parts
+      for (const row of order === 'old-first' ? [of001, ofList] : [ofList, of001]) await insertManifests(h.ch, [row]);
+      const [row] = await h.ch.query<{ n: string }>(
+        `SELECT count() AS n FROM system.parts WHERE database = {db:String} AND table = {table:String} AND active`,
+        { db: h.database, table: Table.ValidatorManifests },
+      );
+      parts = Number(row.n);
+      detail = await (await h.api()).get(detailOf(member.key));
+    });
+    afterAll(async () => {
+      await h?.ch.command(`SYSTEM START MERGES ${h.database}.${Table.ValidatorManifests}`);
+      await h?.close();
+    });
+
+    it('has the two rows in two parts', () => {
+      expect(parts).toBe(2);
+    });
+
+    it('has the domain of the manifest with the raw bytes, and its verification', () => {
+      expect(detail.status).toBe(200);
+      expect(detail.body.domain).toBe(domain);
+      expect(detail.body.manifest).toEqual({
+        sequence: 1,
+        signing_key: member.ephemeral,
+        signing_keys_seen: 1,
+        domain,
+      });
+      expect(detail.body.domain_verification).toMatchObject({
+        status: 'verified',
+        toml_url: `https://${domain}/.well-known/xrp-ledger.toml`,
+        accounts: ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+      });
+    });
+  },
+);

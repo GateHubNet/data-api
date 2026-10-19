@@ -3,6 +3,7 @@ import {
   keyMapParams,
   MANIFEST_MAP_SQL,
   NetworkProfile,
+  NEWEST_MANIFEST_ORDER,
   StoredUnlList,
   Table,
   VoteRow,
@@ -289,7 +290,10 @@ export class ValidatorDirectoryService {
 
   // -- the validators -------------------------------------------------------------------------------------------------
 
-  /** The newest manifest of every master key and the number of signing keys it has used. */
+  /**
+   * The newest manifest of every master key (`NEWEST_MANIFEST_ORDER`: among rows of one `seq` the one with the raw manifest,
+   * which brings the domain) and the number of signing keys it has used.
+   */
   private async readManifests(): Promise<ManifestRow[]> {
     const rows = await this.ch.query<{
       master_key: string;
@@ -300,8 +304,8 @@ export class ValidatorDirectoryService {
     }>(
       `SELECT master_key,
               max(seq) AS newest_seq,
-              argMax(ephemeral_key, seq) AS newest_signing,
-              argMax(domain, seq) AS newest_domain,
+              argMax(ephemeral_key, ${NEWEST_MANIFEST_ORDER}) AS newest_signing,
+              argMax(domain, ${NEWEST_MANIFEST_ORDER}) AS newest_domain,
               uniqExact(ephemeral_key) AS signing_keys_seen
          FROM ${Table.ValidatorManifests}
         GROUP BY master_key

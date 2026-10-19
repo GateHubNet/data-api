@@ -6,6 +6,7 @@ import {
   listInUse,
   MANIFEST_MAP_SQL,
   NetworkProfile,
+  NEWEST_MANIFEST_ORDER,
   NodeClient,
   Table,
   ValidatorDomainsRow,
@@ -354,13 +355,13 @@ export class DomainChecker {
     return [...keys].sort();
   }
 
-  /** The newest manifest of each of the masters that has one. */
+  /** The newest manifest of each of the masters that has one (`NEWEST_MANIFEST_ORDER`: of one `seq`, the one with raw bytes). */
   private async newestManifests(keys: string[]): Promise<{ key: string; domain: string; manifest: string }[]> {
     // the aliases differ from the columns on purpose: ClickHouse would read a column named like an alias as the alias
     const rows = await this.ch.query<NewestManifestRow>(
       `SELECT master_key,
-              argMax(domain, (seq, notEmpty(manifest))) AS top_domain,
-              argMax(manifest, (seq, notEmpty(manifest))) AS top_manifest
+              argMax(domain, ${NEWEST_MANIFEST_ORDER}) AS top_domain,
+              argMax(manifest, ${NEWEST_MANIFEST_ORDER}) AS top_manifest
          FROM ${Table.ValidatorManifests}
         WHERE master_key IN {keys:Array(String)}
         GROUP BY master_key

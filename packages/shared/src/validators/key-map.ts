@@ -1,6 +1,14 @@
 import { Table } from '../clickhouse/tables';
 
 /**
+ * The order of the newest manifest of a master (`argMax(column, NEWEST_MANIFEST_ORDER)`): the highest `seq`, and among rows of
+ * one `seq` the one that has the raw manifest. A database upgraded from 001 holds rows with neither a domain nor a manifest
+ * (`domain = ''`, `manifest = ''`), and the row of the same manifest that brings them (from a list, or the node) has the same
+ * `seq`: until a merge keeps one of them, `argMax(…, seq)` could take either.
+ */
+export const NEWEST_MANIFEST_ORDER = '(seq, notEmpty(manifest))';
+
+/**
  * The manifest map (Global Constraints, "Key mapping"): per `ephemeral_key` of `validator_manifests`, the `master_key` of the
  * manifest with the highest `seq`. Every job and every API read that aggregates rows by validator maps each key through it
  * first, so that a validation recorded under a signing key before its manifest was known is counted for the right validator.

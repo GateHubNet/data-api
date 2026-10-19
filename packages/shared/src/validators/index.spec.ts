@@ -9,6 +9,7 @@ describe('validators index', () => {
         'MANIFEST_MAP_SQL',
         'ManifestError',
         'NEGATIVE_UNL_OBJECT_INDEX',
+        'NEWEST_MANIFEST_ORDER',
         'RECORD_LIFETIME_SECONDS',
         'REVOKED_SEQUENCE',
         'UnlListError',
