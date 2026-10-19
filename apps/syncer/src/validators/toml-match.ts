@@ -4,6 +4,8 @@ import { parse } from 'smol-toml';
 /** The most account addresses kept from a file (spec 2.2, G1). */
 export const MAX_ACCOUNTS = 10;
 
+const BYTE_ORDER_MARK = 0xfeff;
+
 /** The text is not TOML. The message says nothing of the file: a parser's own message quotes the line that failed. */
 export class TomlInvalidError extends Error {
   constructor() {
@@ -40,14 +42,15 @@ function textOf(entry: Record<string, unknown>, field: string): string | undefin
  * fields are read: the `public_key` of the `[[VALIDATORS]]` entries (the key is listed when one equals `masterKey` once
  * trimmed) and, only when it is listed, the `address` of the `[[ACCOUNTS]]` entries, which are kept when they are classic
  * addresses with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each,
- * sorted, the first `MAX_ACCOUNTS`. Every other field is ignored.
+ * sorted, the first `MAX_ACCOUNTS`. Every other field is ignored. A byte order mark at the start of the text is ignored.
  *
  * Throws `TomlInvalidError` when the text is not TOML.
  */
 export function matchToml(text: string, masterKey: string): TomlMatch {
   let document: Record<string, unknown>;
   try {
-    document = parse(text);
+    // an editor may have put a byte order mark at the start of the file (U+FEFF once decoded); the parser would refuse it
+    document = parse(text.charCodeAt(0) === BYTE_ORDER_MARK ? text.slice(1) : text);
   } catch {
     // whatever the parser met (a syntax error, a structure nested too deep): no word of the file goes into the error
     throw new TomlInvalidError();

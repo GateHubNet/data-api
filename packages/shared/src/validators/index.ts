@@ -1,6 +1,7 @@
 export * from './amendments-check';
 export * from './amendments-config';
 export * from './consensus';
+export * from './key-map';
 export * from './ledger-objects';
 export * from './manifest';
 export * from './node-key';

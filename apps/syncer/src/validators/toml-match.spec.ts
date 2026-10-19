@@ -60,6 +60,18 @@ describe('matchToml', () => {
     });
   });
 
+  describe('a byte order mark', () => {
+    it('is ignored at the start of the file, and the key it lists is found with its accounts', () => {
+      expect(matchToml(`\uFEFF${listing(address(1))}`, KEY)).toEqual({ listed: true, accounts: [address(1)] });
+      expect(matchToml(`\uFEFF${validator(OTHER_KEY)}`, KEY)).toEqual({ listed: false, accounts: [] });
+    });
+
+    it('is taken off once only, and not from the middle of the file', () => {
+      expect(() => matchToml(`\uFEFF\uFEFF${validator(KEY)}`, KEY)).toThrow(TomlInvalidError);
+      expect(() => matchToml(`${validator(KEY)}\uFEFF`, KEY)).toThrow(TomlInvalidError);
+    });
+  });
+
   describe('TOML that is not valid', () => {
     it.each([
       ['an unterminated string', `[[VALIDATORS]]\npublic_key = "${KEY}\n`],

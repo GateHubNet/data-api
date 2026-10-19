@@ -665,10 +665,11 @@ describe('the validators worker (e2e)', () => {
       return hex;
     }
 
-    async function putSeen(v: Val, secondsAgo = 60): Promise<void> {
+    /** The validator was seen `secondsAgo` seconds ago, under its master key unless `key` says another. */
+    async function putSeen(v: Val, secondsAgo = 60, key: string = v.master.base58): Promise<void> {
       const last = clock.ms / 1000 - secondsAgo;
       await db.ch.insert(Table.ValidatorSeen, [
-        { validation_public_key: v.master.base58, first_seen: last - 1_000, last_seen: last, last_ledger_index: 100 },
+        { validation_public_key: key, first_seen: last - 1_000, last_seen: last, last_ledger_index: 100 },
       ]);
     }
 
@@ -975,6 +976,65 @@ describe('the validators worker (e2e)', () => {
         ['a.example', 'verified', []],
         ['b.example', 'verified', [GENESIS]],
       ]);
+    });
+
+    it('maps a validator seen only under its signing key to its master through the manifests, and checks the master', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v, 60, v.signing.base58);
+      web.serveToml(NORTHPEAK, TOML_PATH, toml(v.master.base58, [GENESIS]));
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({ validation_public_key: v.master.base58, status: 'verified', accounts: [GENESIS] }),
+      ]);
+    });
+
+    it('takes the validators seen under a master and its signing key as one, and the latest sighting of either', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v, 40 * DAY);
+      await putSeen(v, 60, v.signing.base58);
+      const app = await bootDomains();
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([expect.objectContaining({ validation_public_key: v.master.base58 })]);
+    });
+
+    it('reads the validators seen when no manifest is stored at all', async () => {
+      await putSeen(val(1));
+      const app = await bootDomains();
+      expect(await app.domains.pass()).toBe(0);
+      expect(await domainRows()).toEqual([]);
+    });
+
+    it('verifies a TOML file that starts with a byte order mark', async () => {
+      const v = val(1);
+      await putManifest(v, { domain: NORTHPEAK });
+      await putSeen(v);
+      web.serveToml(NORTHPEAK, TOML_PATH, `\uFEFF${toml(v.master.base58, [GENESIS])}`);
+      const app = await bootDomains();
+
+      expect(await app.domains.pass()).toBe(1);
+      expect(await domainRows()).toEqual([
+        expect.objectContaining({ status: 'verified', reason: '', accounts: [GENESIS] }),
+      ]);
+    });
+
+    it('names the code of the error the node answers a manifest request with, in one warn', async () => {
+      const v = val(1);
+      await putManifest(v, { seq: 3, raw: false, source: 'stream' });
+      await putSeen(v);
+      // the fake node has no `manifest` answer: it answers with the error `unknownCmd`
+      const lines: string[] = [];
+      const logger = { log: () => undefined, warn: (line: string) => void lines.push(line), error: () => undefined };
+      const app = await bootDomains({ worker: { logger } });
+
+      expect(await app.domains.pass()).toBe(0);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('1 of 1');
+      expect(lines[0]).toContain('unknownCmd');
+      expect(await domainRows()).toEqual([]);
     });
 
     it('keeps a verified domain verified through a failing website for 24 h, then says why it is not', async () => {

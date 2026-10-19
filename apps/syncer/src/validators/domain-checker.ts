@@ -2,7 +2,9 @@ import {
   ClickHouseService,
   decodeManifest,
   isProperlyFormedTomlDomain,
+  keyMapParams,
   listInUse,
+  MANIFEST_MAP_SQL,
   NetworkProfile,
   NodeClient,
   Table,
@@ -13,6 +15,7 @@ import {
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { NETWORK_PROFILE, NODE_CLIENT, SyncerConfig, unlPublishersOf } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { describeError } from './describe-error';
 import { SAFE_FETCHER, SafeFetcher, SafeFetchError, tomlFetchLimits } from './safe-fetch';
 import { readStoredLists } from './stored-lists';
 import { matchToml, TomlInvalidError } from './toml-match';
@@ -30,6 +33,9 @@ export const MANIFEST_LOOKUP_TIMEOUT_MS = 5_000;
 /** A transient failure is checked again after an hour; it keeps `verified` for this long after the last success. */
 export const DOMAIN_TRANSIENT_RECHECK_S = 3_600;
 export const DOMAIN_VERIFIED_GRACE_S = 86_400;
+
+/** The manifests verified between two turns of the event loop: a verification costs about 2 ms. */
+export const DOMAIN_VERIFICATIONS_PER_TURN = 50;
 
 const ACCEPT = 'application/toml, text/plain, */*';
 const MAX_UINT32 = 0xffff_ffff;
@@ -112,17 +118,17 @@ export function nextDomainRow(
   }
 
   const verifiedAt = prev?.verified_at ?? null;
-  if (!isTransientReason(check.reason, check.statusCode)) {
-    return {
-      ...row,
-      status: 'unverified',
-      reason: check.reason,
-      status_code: check.reason === 'http_status' ? (check.statusCode ?? 0) : 0,
-      verified_at: verifiedAt,
-      next_check_at: after(recheckMs / 1000),
-      accounts: [],
-    };
-  }
+  const unverified = (nextCheckSeconds: number): ValidatorDomainsRow => ({
+    ...row,
+    status: 'unverified',
+    reason: check.reason,
+    status_code: check.reason === 'http_status' ? (check.statusCode ?? 0) : 0,
+    verified_at: verifiedAt,
+    next_check_at: after(nextCheckSeconds),
+    accounts: [],
+  });
+
+  if (!isTransientReason(check.reason, check.statusCode)) return unverified(recheckMs / 1000);
   if (prev?.status === 'verified' && verifiedAt !== null && now - verifiedAt <= DOMAIN_VERIFIED_GRACE_S) {
     return {
       ...row,
@@ -134,15 +140,7 @@ export function nextDomainRow(
       accounts: [...prev.accounts],
     };
   }
-  return {
-    ...row,
-    status: 'unverified',
-    reason: check.reason,
-    status_code: check.reason === 'http_status' ? (check.statusCode ?? 0) : 0,
-    verified_at: verifiedAt,
-    next_check_at: after(DOMAIN_TRANSIENT_RECHECK_S),
-    accounts: [],
-  };
+  return unverified(DOMAIN_TRANSIENT_RECHECK_S);
 }
 
 // -- the checker --------------------------------------------------------------------------------------------------------
@@ -191,9 +189,27 @@ interface ManifestAnswer {
 }
 
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 /** A node's own answer (`RippledError`, matched by name: the class is not the same across package copies). */
 const isRippledError = (err: unknown): boolean => err instanceof Error && err.name === 'RippledError';
+const SIMPLE_NAME = /^[A-Za-z0-9_.$]{1,64}$/;
+/** The error code of an answer of the node (`actNotFound`, ...), `unknown` for anything that is not a plain code. */
+function rippledCodeOf(err: unknown): string {
+  const data = (err as { data?: unknown }).data;
+  const code = typeof data === 'object' && data !== null ? (data as { error?: unknown }).error : undefined;
+  return typeof code === 'string' && SIMPLE_NAME.test(code) ? code : 'unknown';
+}
+/** The name of whatever was thrown (`TypeError`; `string` for a thrown text), `Error` when it is not a plain name. */
+function errorNameOf(err: unknown): string {
+  const name = err instanceof Error ? err.name : typeof err;
+  return SIMPLE_NAME.test(name) ? name : 'Error';
+}
+/** `a x2, b` for the counts of a map: the keys sorted, a count above 1 shown. */
+const countsText = (counts: Map<string, number>): string =>
+  [...counts]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([name, n]) => (n > 1 ? `${name} x${n}` : name))
+    .join(', ');
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 /** A text from a manifest, safe for a log line: quoted, control characters escaped, cut short. */
 const quoted = (text: string): string => JSON.stringify(text.length > 128 ? `${text.slice(0, 128)}...` : text);
 const pairOf = (key: string, domain: string): string => `${key}\u0000${domain}`;
@@ -248,6 +264,8 @@ export class DomainChecker {
   private readonly askedAt = new Map<string, number>();
   /** The result of verifying the manifests of the last pass, so that a manifest is not verified again every minute. */
   private verdicts = new Map<string, Verdict>();
+  /** The fetch failures of the pass under way that were not the safe fetcher's own, by the name of the error. */
+  private foreignFetchErrors = new Map<string, number>();
   private running?: Promise<number>;
   private stopped = false;
 
@@ -283,21 +301,37 @@ export class DomainChecker {
   }
 
   private async run(): Promise<number> {
-    const now = this.now() / 1000;
-    const keys = await this.validatorKeys(now);
-    if (keys.length === 0 || this.stopped) return 0;
+    this.foreignFetchErrors = new Map();
+    try {
+      const now = this.now() / 1000;
+      const keys = await this.validatorKeys(now);
+      if (keys.length === 0 || this.stopped) return 0;
 
-    const newest = await this.newestManifests(keys);
-    let checked = 0;
-    const candidates = this.candidates(newest);
-    if (candidates.length > 0 && !this.stopped) {
-      const stored = await this.storedDomains([...new Set(candidates.map((c) => c.key))]);
-      const due = this.dueFirst(candidates, stored, now).slice(0, DOMAIN_PASS_LIMIT);
-      checked = await this.check(due, stored);
+      const newest = await this.newestManifests(keys);
+      let checked = 0;
+      const candidates = await this.candidates(newest);
+      if (candidates.length > 0 && !this.stopped) {
+        const stored = await this.storedDomains([...new Set(candidates.map((c) => c.key))]);
+        const due = this.dueFirst(candidates, stored, now).slice(0, DOMAIN_PASS_LIMIT);
+        checked = await this.check(due, stored);
+      }
+      // last: a node that is slow to answer must not hold up the checks of the manifests that are known
+      await this.lookUpManifests(newest.filter((m) => m.manifest === ''));
+      return checked;
+    } finally {
+      this.reportForeignFetchErrors();
     }
-    // last: a node that is slow to answer must not hold up the checks of the manifests that are known
-    await this.lookUpManifests(newest.filter((m) => m.manifest === ''));
-    return checked;
+  }
+
+  /** One line for the fetches of the pass that failed with an error the fetcher does not throw: the names, no more. */
+  private reportForeignFetchErrors(): void {
+    if (this.foreignFetchErrors.size === 0) return;
+    const total = [...this.foreignFetchErrors.values()].reduce((sum, n) => sum + n, 0);
+    this.logger.warn(
+      `Domain verification: ${total} ${total === 1 ? 'fetch' : 'fetches'} failed with an error that is not the fetcher's own ` +
+        `(${countsText(this.foreignFetchErrors)})`,
+    );
+    this.foreignFetchErrors = new Map();
   }
 
   // -- which validators ---------------------------------------------------------------------------------------------
@@ -315,15 +349,17 @@ export class DomainChecker {
       const own = lists.filter((list) => list.publisher === p.id && list.publisherKey === p.publicKey);
       for (const key of listInUse(own, p.id, now)?.list.validators ?? []) keys.add(key);
     }
-    const seen = await this.ch.query<{ validation_public_key: string }>(
-      `SELECT validation_public_key
+    // a validator seen under its signing key is that of its master: the keys go through the manifest map first
+    const manifestMap = await this.ch.query<{ ephemeral_key: string; master_key: string }>(MANIFEST_MAP_SQL);
+    const seen = await this.ch.query<{ master: string }>(
+      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS master
          FROM ${Table.ValidatorSeen}
-        GROUP BY validation_public_key
+        GROUP BY master
        HAVING toUnixTimestamp(max(last_seen)) >= {since:UInt32}
-        ORDER BY validation_public_key`,
-      { since: Math.max(Math.floor(now) - DOMAIN_SEEN_WITHIN_S, 0) },
+        ORDER BY master`,
+      { since: Math.max(Math.floor(now) - DOMAIN_SEEN_WITHIN_S, 0), ...keyMapParams(manifestMap) },
     );
-    for (const row of seen) keys.add(row.validation_public_key);
+    for (const row of seen) keys.add(row.master);
     return [...keys].sort();
   }
 
@@ -364,6 +400,7 @@ export class DomainChecker {
     const rows: ValidatorManifestsRow[] = [];
     let failures = 0;
     let firstFailure = '';
+    const answeredWithError = new Map<string, number>();
     await this.inLanes(keys, async (key) => {
       try {
         const answer = await this.node.request<ManifestAnswer>(
@@ -373,19 +410,25 @@ export class DomainChecker {
         const row = manifestRowOf(key, answer);
         if (row !== undefined) rows.push(row);
       } catch (err) {
-        // the node saying it does not know the key is an answer; anything else is a node that cannot be asked
-        if (isRippledError(err)) return;
+        if (isRippledError(err)) {
+          // the node's own answer (it does not know the key, it is busy): counted by its error code
+          const code = rippledCodeOf(err);
+          answeredWithError.set(code, (answeredWithError.get(code) ?? 0) + 1);
+          return;
+        }
         failures += 1;
         firstFailure ||= describeError(err);
       }
     });
     if (this.stopped) return;
     if (rows.length > 0) await this.ch.insert(Table.ValidatorManifests, rows);
-    if (failures > 0) {
-      this.logger.warn(
-        `Domain verification: ${failures} of ${keys.length} manifest lookups failed (first: ${firstFailure})`,
-      );
+    const problems: string[] = [];
+    if (failures > 0) problems.push(`${failures} of ${keys.length} manifest lookups failed (first: ${firstFailure})`);
+    const answered = [...answeredWithError.values()].reduce((sum, n) => sum + n, 0);
+    if (answered > 0) {
+      problems.push(`${answered} of ${keys.length} were answered with an error (${countsText(answeredWithError)})`);
     }
+    if (problems.length > 0) this.logger.warn(`Domain verification: ${problems.join('; ')}`);
   }
 
   // -- the pairs ----------------------------------------------------------------------------------------------------
@@ -395,13 +438,19 @@ export class DomainChecker {
    * and, unless it revokes, the signing key's, and the key must be the row's), and the domain is the verified manifest's.
    * An unverified manifest keeps the domain it claims, so that the failure is shown with it. No domain, no pair.
    */
-  private candidates(manifests: { key: string; domain: string; manifest: string }[]): Candidate[] {
+  private async candidates(manifests: { key: string; domain: string; manifest: string }[]): Promise<Candidate[]> {
     const verdicts = new Map<string, Verdict>();
     const pairs: Candidate[] = [];
+    let verifications = 0;
     for (const { key, domain: claimed, manifest } of manifests) {
       if (manifest === '') continue;
       const id = pairOf(key, manifest);
-      const verdict = this.verdicts.get(id) ?? verdictOf(key, manifest);
+      let verdict = this.verdicts.get(id);
+      if (verdict === undefined) {
+        verdict = verdictOf(key, manifest);
+        // the first pass after a start verifies every manifest: let the rest of the process run in between
+        if (++verifications % DOMAIN_VERIFICATIONS_PER_TURN === 0) await yieldToEventLoop();
+      }
       verdicts.set(id, verdict);
 
       const domain = verdict.verified ? verdict.domain : claimed;
@@ -518,7 +567,11 @@ export class DomainChecker {
       return { text: body.toString('utf8') };
     } catch (err) {
       // `get` throws SafeFetchError and nothing else; anything else is a failure of the connection all the same
-      if (!(err instanceof SafeFetchError)) return { reason: 'connect_error' };
+      if (!(err instanceof SafeFetchError)) {
+        const name = errorNameOf(err);
+        this.foreignFetchErrors.set(name, (this.foreignFetchErrors.get(name) ?? 0) + 1);
+        return { reason: 'connect_error' };
+      }
       if (err.reason === 'blocked_address') {
         this.logger.warn(
           `Domain ${quoted(domain)}: the fetch was blocked (blocked_address, ${err.addressClass ?? 'unknown range'})`,

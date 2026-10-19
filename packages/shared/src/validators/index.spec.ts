@@ -6,6 +6,7 @@ describe('validators index', () => {
       [
         'AMENDMENTS_OBJECT_INDEX',
         'FEE_SETTINGS_OBJECT_INDEX',
+        'MANIFEST_MAP_SQL',
         'ManifestError',
         'NEGATIVE_UNL_OBJECT_INDEX',
         'RECORD_LIFETIME_SECONDS',
@@ -24,6 +25,7 @@ describe('validators index', () => {
         'isNodePublicKey',
         'isProperlyFormedTomlDomain',
         'isVotingLedger',
+        'keyMapParams',
         'listInUse',
         'loadAmendmentsConfig',
         'nextFlagLedger',

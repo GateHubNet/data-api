@@ -1,5 +1,6 @@
 import {
   getNetworkProfile,
+  MANIFEST_MAP_SQL,
   NetworkProfile,
   Table,
   UnlListsRow,
@@ -327,9 +328,21 @@ class FakeClickHouse {
       }));
     }
     if (sql.includes(Table.ValidatorSeen)) {
-      return this.seen
+      // each key is mapped through the manifest map (`transform(k, ephemerals, masters, k)`) and the masters are grouped
+      const { ephemerals, masters } = params as { ephemerals: string[]; masters: string[] };
+      const mapped = this.seen
         .filter((s) => s.lastSeen >= (params.since as number))
-        .map((s) => ({ validation_public_key: s.key }));
+        .map((s) => (ephemerals.includes(s.key) ? masters[ephemerals.indexOf(s.key)] : s.key));
+      return [...new Set(mapped)].sort().map((master) => ({ master }));
+    }
+    if (sql.includes(Table.ValidatorManifests) && params.keys === undefined) {
+      // the manifest map: the master of the highest seq per ephemeral key
+      const top = new Map<string, ValidatorManifestsRow>();
+      for (const m of this.manifests) {
+        const held = top.get(m.ephemeral_key);
+        if (held === undefined || m.seq > held.seq) top.set(m.ephemeral_key, m);
+      }
+      return [...top.values()].map((m) => ({ ephemeral_key: m.ephemeral_key, master_key: m.master_key }));
     }
     if (sql.includes(Table.ValidatorManifests)) {
       const wanted = params.keys as string[];
@@ -425,7 +438,7 @@ function setup(o: { profile?: NetworkProfile; publishers?: string; recheckMs?: n
       throw new SafeFetchError('dns_error', 'unexpected fetch');
     }),
   };
-  const node = { request: jest.fn(async (): Promise<unknown> => ({})) };
+  const node = { request: jest.fn(async (_request?: unknown, _options?: unknown): Promise<unknown> => ({})) };
   const metrics = { validatorsDomainChecksTotal: { inc: jest.fn() } };
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
   const cfg = {
@@ -553,6 +566,65 @@ describe('DomainChecker', () => {
 
       await t.checker.pass();
       expect(t.fetched().sort()).toEqual([url('a.example'), url('b.example')]);
+    });
+
+    it('maps a key seen only under its signing key to its master through the manifests', async () => {
+      const t = setup();
+      const [a, b] = [validator(1), validator(2)];
+      // a was seen under its signing key, b under its master key
+      t.ch.seen.push({ key: a.signing.base58, lastSeen: NOW - 60 }, { key: b.master.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }), manifestRow(b, { domain: 'b.example' }));
+      t.serve({ [url('a.example')]: toml(a.master.base58) });
+
+      expect(await t.checker.pass()).toBe(2);
+      expect(t.fetched().sort()).toEqual([url('a.example'), url('b.example')]);
+      expect(t.ch.written.map((r) => r.validation_public_key).sort()).toEqual(
+        [a.master.base58, b.master.base58].sort(),
+      );
+    });
+
+    it('checks a master once when it was seen under its master key and under its signing keys', async () => {
+      const t = setup();
+      const a = validator(1);
+      const rotated = validator(1).signing; // the same key again: one manifest
+      expect(rotated.base58).toBe(a.signing.base58);
+      t.ch.seen.push({ key: a.master.base58, lastSeen: NOW - 60 }, { key: a.signing.base58, lastSeen: NOW - 30 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.serve({});
+
+      expect(await t.checker.pass()).toBe(1);
+      expect(t.fetched()).toEqual([url('a.example')]);
+    });
+
+    it('takes the window of a master from the latest sighting under any of its keys', async () => {
+      const t = setup();
+      const a = validator(1);
+      t.ch.seen.push({ key: a.master.base58, lastSeen: NOW - 40 * DAY }, { key: a.signing.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.serve({});
+      expect(await t.checker.pass()).toBe(1);
+    });
+
+    it('leaves a key the manifests do not know as it is, so it has no manifest and nothing to check', async () => {
+      const t = setup();
+      t.ch.seen.push({ key: validator(1).signing.base58, lastSeen: NOW - 60 });
+      expect(await t.checker.pass()).toBe(0);
+      expect(t.fetcher.get).not.toHaveBeenCalled();
+    });
+
+    it('reads the manifest map once a pass and gives it to the read of the validators seen', async () => {
+      const t = setup();
+      const a = validator(1);
+      t.ch.seen.push({ key: a.signing.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.serve({});
+      await t.checker.pass();
+      const maps = t.ch.query.mock.calls.filter(([sql, params]) => sql === MANIFEST_MAP_SQL && params === undefined);
+      expect(maps).toHaveLength(1);
+      const seenRead = t.ch.query.mock.calls.find(([sql]) => String(sql).includes(Table.ValidatorSeen));
+      expect(seenRead?.[1]).toEqual(
+        expect.objectContaining({ ephemerals: [a.signing.base58], masters: [a.master.base58] }),
+      );
     });
 
     it('checks a validator that is both on a list and seen once', async () => {
@@ -684,6 +756,29 @@ describe('DomainChecker', () => {
       expect(t.ch.written).toEqual([]);
     });
 
+    it('yields to the event loop every 50 verifications, and not for a manifest it has verified already', async () => {
+      const t = setup();
+      const vals = Array.from({ length: 120 }, (_, i) => validator(i + 1));
+      vals.forEach((v, i) => {
+        t.ch.seen.push({ key: v.master.base58, lastSeen: NOW - 60 });
+        t.ch.manifests.push(manifestRow(v, { domain: `d${i}.example` }));
+      });
+      t.serve({});
+      const yielded = jest.spyOn(globalThis, 'setImmediate');
+      try {
+        expect(await t.checker.pass()).toBe(100);
+        // 120 verifications: after the 50th and the 100th
+        expect(yielded).toHaveBeenCalledTimes(2);
+
+        yielded.mockClear();
+        t.clock.ms += 60_000;
+        expect(await t.checker.pass()).toBe(20);
+        expect(yielded).not.toHaveBeenCalled();
+      } finally {
+        yielded.mockRestore();
+      }
+    });
+
     it('prefers the row with the raw bytes among rows of the same sequence', async () => {
       const t = setup();
       const a = validator(1);
@@ -789,6 +884,76 @@ describe('DomainChecker', () => {
       expect(message).toContain('2 of 2');
       expect(rest).toEqual([]);
       expect(JSON.stringify(t.logger.warn.mock.calls)).not.toContain('SECRET');
+    });
+
+    const rippledError = (code: unknown, message = 'The node says no.') =>
+      Object.assign(new Error(message), { name: 'RippledError', data: { error: code, status: 'error' } });
+
+    it('counts the answers of the node that are errors and names their codes, only the codes, in one warn', async () => {
+      const t = setup();
+      const vals = [validator(1), validator(2), validator(3)];
+      vals.forEach((v) => preMigration(t, v));
+      const codes = ['actNotFound', 'actNotFound', 'slowDown'];
+      let i = 0;
+      t.node.request.mockImplementation(async () => {
+        throw rippledError(codes[i++], 'The account was not found, SECRET-MESSAGE');
+      });
+
+      await t.checker.pass();
+      expect(t.logger.warn).toHaveBeenCalledTimes(1);
+      const [line, ...rest] = t.logger.warn.mock.calls[0] as unknown[];
+      expect(rest).toEqual([]);
+      expect(line).toContain('3 of 3');
+      expect(line).toContain('actNotFound x2');
+      expect(line).toContain('slowDown');
+      expect(line).not.toContain('SECRET-MESSAGE');
+      expect(t.ch.rowsOf(Table.ValidatorManifests)).toEqual([]);
+    });
+
+    it('says what the codes are in the same warn as the lookups that could not be made', async () => {
+      const t = setup();
+      const [a, b] = [validator(1), validator(2)];
+      preMigration(t, a);
+      preMigration(t, b);
+      t.node.request.mockImplementation(async (request: unknown) => {
+        if ((request as { public_key: string }).public_key === a.master.base58) throw rippledError('actNotFound');
+        throw new Error('NodeClient is stopped');
+      });
+
+      await t.checker.pass();
+      expect(t.logger.warn).toHaveBeenCalledTimes(1);
+      const line = String(t.logger.warn.mock.calls[0][0]);
+      expect(line).toContain('1 of 2 manifest lookups failed');
+      expect(line).toContain('NodeClient is stopped');
+      expect(line).toContain('1 of 2');
+      expect(line).toContain('actNotFound');
+    });
+
+    it.each([
+      ['no code', undefined],
+      ['a code that is not text', 12],
+      ['a code with a line break', 'bad\ncode'],
+      ['a code that is far too long', 'x'.repeat(200)],
+    ])('names %s as unknown', async (_name, code) => {
+      const t = setup();
+      const a = validator(1);
+      preMigration(t, a);
+      t.node.request.mockRejectedValue(rippledError(code));
+      await t.checker.pass();
+      expect(t.logger.warn).toHaveBeenCalledTimes(1);
+      const line = String(t.logger.warn.mock.calls[0][0]);
+      expect(line).toContain('unknown');
+      expect(line).not.toContain('\n');
+      expect(line.length).toBeLessThan(200);
+    });
+
+    it('says nothing when every answer of the node was usable', async () => {
+      const t = setup();
+      const a = validator(1);
+      preMigration(t, a);
+      t.node.request.mockResolvedValue(answerFor(a));
+      await t.checker.pass();
+      expect(t.logger.warn).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -1076,6 +1241,82 @@ describe('DomainChecker', () => {
     it("counts a failure of the connection that is not the fetcher's own as connect_error", async () => {
       const { row } = await checkWith(new Error('something else'));
       expect(row).toMatchObject({ reason: 'connect_error', status: 'unverified' });
+    });
+
+    it("names an error that is not the fetcher's own, once a pass and without its message or object", async () => {
+      const t = setup();
+      const [a, b] = [validator(1), validator(2)];
+      for (const [v, domain] of [
+        [a, 'a.example'],
+        [b, 'b.example'],
+      ] as const) {
+        t.ch.seen.push({ key: v.master.base58, lastSeen: NOW - 60 });
+        t.ch.manifests.push(manifestRow(v, { domain }));
+      }
+      t.fetcher.get.mockRejectedValue(Object.assign(new TypeError('SECRET-MESSAGE'), { extra: 'SECRET-FIELD' }));
+
+      expect(await t.checker.pass()).toBe(2);
+      expect(t.ch.written.map((r) => r.reason)).toEqual(['connect_error', 'connect_error']);
+      expect(t.logger.warn).toHaveBeenCalledTimes(1);
+      const [line, ...rest] = t.logger.warn.mock.calls[0] as unknown[];
+      expect(rest).toEqual([]);
+      expect(line).toContain('TypeError');
+      expect(line).toContain('2 fetches');
+      expect(JSON.stringify(t.logger.warn.mock.calls)).not.toContain('SECRET');
+
+      // a pass of its own: one more line
+      t.clock.ms += 6 * 3_600_000;
+      await t.checker.pass();
+      expect(t.logger.warn).toHaveBeenCalledTimes(2);
+    });
+
+    it('names each kind of such an error once, also what is not an error object, and nothing when there is none', async () => {
+      const t = setup();
+      const vals = [validator(1), validator(2), validator(3)];
+      const failures: unknown[] = [
+        new RangeError('x'),
+        'SECRET string',
+        Object.assign(new Error('x'), { name: 'bad\nname' }),
+      ];
+      vals.forEach((v, i) => {
+        t.ch.seen.push({ key: v.master.base58, lastSeen: NOW - 60 });
+        t.ch.manifests.push(manifestRow(v, { domain: `d${i}.example` }));
+      });
+      t.fetcher.get.mockImplementation(async (u: string) => {
+        throw failures[Number(/d(\d)\.example/.exec(u)?.[1])];
+      });
+      await t.checker.pass();
+      expect(t.logger.warn).toHaveBeenCalledTimes(1);
+      const line = String(t.logger.warn.mock.calls[0][0]);
+      expect(line).toContain('RangeError');
+      expect(line).toContain('string');
+      expect(line).toContain('Error');
+      expect(line).not.toContain('SECRET');
+      expect(line).not.toContain('\n');
+
+      const quiet = setup();
+      const c = validator(4);
+      quiet.ch.seen.push({ key: c.master.base58, lastSeen: NOW - 60 });
+      quiet.ch.manifests.push(manifestRow(c, { domain: 'a.example' }));
+      quiet.serve({ [url('a.example')]: new SafeFetchError('timeout', 'x') });
+      await quiet.checker.pass();
+      expect(quiet.logger.warn).not.toHaveBeenCalled();
+    });
+
+    it('verifies a file that starts with a byte order mark', async () => {
+      const t = setup();
+      const a = validator(1);
+      t.ch.seen.push({ key: a.master.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.fetcher.get.mockResolvedValue({
+        url: 'unused',
+        body: Buffer.concat([
+          Buffer.from([0xef, 0xbb, 0xbf]),
+          Buffer.from(`${toml(a.master.base58)}\n[[ACCOUNTS]]\naddress = "${ACCOUNT_1}"\n`),
+        ]),
+      });
+      await t.checker.pass();
+      expect(t.ch.written).toEqual([expect.objectContaining({ status: 'verified', accounts: [ACCOUNT_1] })]);
     });
 
     it('counts the outcome of every check: verified, or the reason', async () => {

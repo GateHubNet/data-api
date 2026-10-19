@@ -386,7 +386,9 @@ and the next one is made on time.
 
 - **Which validators.** The masters on the list in use of each configured publisher (only the lists stored under the key configured
   for it: a list of an earlier key of the same URL counts for nothing), and those in `validator_seen` with `last_seen` in the last 30
-  days. Of each, the newest manifest (the highest `seq` per master key).
+  days. A key seen under a signing key is mapped to its master through the manifest map first (`MANIFEST_MAP_SQL` and
+  `keyMapParams` of `packages/shared`: per `ephemeral_key`, the `master_key` of the highest `seq`), as every read that aggregates
+  by validator does. Of each, the newest manifest (the highest `seq` per master key).
 - **The manifest is verified here.** A manifest with raw bytes is decoded and its signatures verified, and it must be the key's own;
   the domain is that of the verified manifest, so the stream's word is not enough, and a manifest that does not verify gives
   `manifest_unverified` with no fetch. A validator whose newest manifest has no raw bytes (rows from before migration 002) is asked of
@@ -403,8 +405,8 @@ and the next one is made on time.
 - **What is read of the file.** It is parsed (`smol-toml`), never evaluated. The key is listed when a `[[VALIDATORS]]` entry has it as
   `public_key` (trimmed). Only then are the `[[ACCOUNTS]]` read: the `address` of each entry (trimmed), kept when it is a classic
   address with a valid checksum (an X-address, a bad checksum, a missing or non-text address is skipped), once each, sorted, the first
-  10. Every other field is ignored, and nothing in the file is fetched or followed. A file that is not TOML is `toml_invalid`, and
-  its error says nothing of its content.
+  10. Every other field is ignored, and nothing in the file is fetched or followed. A byte order mark at the start of the file is ignored. A file that
+  is not TOML is `toml_invalid`, and its error says nothing of its content.
 - **The result of a pair.**
 
   | Result | Reason | Next check |
@@ -419,8 +421,11 @@ and the next one is made on time.
 - **Observability.** `syncer_validators_domain_checks_total{outcome}` counts every check as `verified` or the reason (also a
   transient failure that left the domain `verified`). The result of a pair is logged when it changes (the validator, the domain
   quoted, the status, the reason and the status code); a fetch refused by the address policy is logged at `warn` every time, with the
-  domain and the blocked range (`addressClass`). A log line never holds the body of a response, an error object or the message of a
-  failure, and a domain is quoted because it comes from a manifest.
+  domain and the blocked range (`addressClass`). Once a pass, one `warn` says how many manifest lookups the node
+  could not answer (and the first message) and how many it answered with an error (their codes, only the codes), and one how many
+  fetches failed with an error that is not the safe fetcher's own (the names of the errors, recorded as `connect_error`). A log line
+  never holds the body of a response, an error object or the message of a fetch failure, and a domain is quoted because it comes
+  from a manifest.
 
 ## 9. What the syncer does not do
 
@@ -445,7 +450,7 @@ and the next one is made on time.
 | `UNL publisher <id>: error (<reason>): ...` | A publisher cannot be fetched, serves a list that fails verification, or serves one that is stale or expired | The list is not stored and the last stored one stays in use (reported as expired once it expires). Retried after 30 s, doubling to 10 min; the line is logged once, when the status changes. The reason is in `unl_publishers.error` and `syncer_validators_unl_fetches_total`. |
 | `Validator <key>: domain "<domain>" is unverified (<reason>)` | A validator's domain does not serve a TOML file that lists it, or cannot be reached | The domain shows `unverified` with the reason in `validator_domains` and `syncer_validators_domain_checks_total`; a definite failure is checked again in 6 h, a transient one in 1 h, and a domain verified within 24 h stays verified through transient failures. Logged once, when the result changes. |
 | `Domain "<domain>": the fetch was blocked (blocked_address, <range>)` | A validator's domain resolves to a private, loopback or reserved address | Nothing is requested; the pair is `unverified` (`blocked_address`) and is checked again in 6 h. Logged at every check. |
-| `Domain verification: N of M manifest lookups failed (...)` | The node cannot be asked for the manifests that were stored before migration 002 | Those validators are not checked until an answer is stored; each key is asked again after 10 minutes. |
+| `Domain verification: N of M manifest lookups failed (...)`, `... were answered with an error (<codes>)` | The node cannot be asked, or answers an error (`actNotFound`, `slowDown`, ...), for the manifests that were stored before migration 002 | Those validators are not checked until an answer is stored; each key is asked again after 10 minutes. |
 
 ## 11. Source map
 

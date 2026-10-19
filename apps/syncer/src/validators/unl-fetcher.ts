@@ -20,6 +20,7 @@ import {
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { SyncerConfig, unlPublishersOf, unlThresholdOf } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { describeError } from './describe-error';
 import { FetchFailure, SAFE_FETCHER, SafeFetcher, SafeFetchError, UNL_FETCH_LIMITS } from './safe-fetch';
 import { readStoredLists } from './stored-lists';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
@@ -90,7 +91,6 @@ const failure = (outcome: UnlOutcome, detail: string): Verdict => ({ outcome, de
 const clamp = (ms: number): number => Math.min(Math.max(ms, UNL_MIN_REFRESH_MS), UNL_MAX_REFRESH_MS);
 const backoff = (failures: number): number =>
   Math.min(UNL_RETRY_INITIAL_MS * 2 ** Math.max(failures - 1, 0), UNL_RETRY_MAX_MS);
-const describeError = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /**
  * Fetches the validator lists (UNL) of the configured publishers and stores the ones that verify (spec 2.1).
