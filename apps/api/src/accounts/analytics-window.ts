@@ -21,15 +21,19 @@ export function intervalParam(query: Query): VolumeInterval | undefined {
   return interval as VolumeInterval;
 }
 
-/** The SQL of the start of the bucket of a day, over a `Date` column named `day`. Code, chosen by the validated interval. */
-const BUCKET_OF_DAY: Record<VolumeInterval, string> = {
-  day: 'day',
-  week: 'toMonday(day)',
-  month: 'toStartOfMonth(day)',
+/** The SQL of the start of the bucket of a day, over the SQL of a `Date`. Code, chosen by the validated interval. */
+const BUCKET_OF_DAY: Record<VolumeInterval, (day: string) => string> = {
+  day: (day) => day,
+  week: (day) => `toMonday(${day})`,
+  month: (day) => `toStartOfMonth(${day})`,
 };
 
-export function bucketOfDaySql(interval: VolumeInterval): string {
-  return BUCKET_OF_DAY[interval];
+/**
+ * The SQL of the start of the bucket of a day: over a `Date` column named `day`, or over the SQL given as `day` (code of
+ * the caller, never a value of the request), as `toDate(close_time, 'UTC')` for the rows of a table that has no day column.
+ */
+export function bucketOfDaySql(interval: VolumeInterval, day = 'day'): string {
+  return BUCKET_OF_DAY[interval](day);
 }
 
 /** The buckets of a window: the starts (unix ms) of its first and of its last, both included. */

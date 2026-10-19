@@ -60,6 +60,13 @@ describe('bucketOfDaySql', () => {
     expect(bucketOfDaySql('week')).toBe('toMonday(day)');
     expect(bucketOfDaySql('month')).toBe('toStartOfMonth(day)');
   });
+
+  it('is the same over the SQL of a date that is given', () => {
+    const date = "toDate(close_time, 'UTC')";
+    expect(bucketOfDaySql('day', date)).toBe(date);
+    expect(bucketOfDaySql('week', date)).toBe("toMonday(toDate(close_time, 'UTC'))");
+    expect(bucketOfDaySql('month', date)).toBe("toStartOfMonth(toDate(close_time, 'UTC'))");
+  });
 });
 
 describe('bucketSpan', () => {

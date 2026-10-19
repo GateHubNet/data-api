@@ -25,14 +25,20 @@ export interface StoredReportGroup {
   amount_max_f: number | null;
 }
 
-/** How many different counterparties the account had on a day in one direction (without `accounts`). */
+/**
+ * How many different counterparties the account had on a day in one direction (without `accounts`). With an interval the
+ * query counts them over the whole bucket, and `day` is the start of the bucket.
+ */
 export interface StoredCounterpartyCount {
   day: string;
   dir: ReportSide;
   n: number;
 }
 
-/** A counterparty of the account on a day in one direction (with `accounts`), given in the order of its first payment. */
+/**
+ * A counterparty of the account on a day in one direction (with `accounts`), given in the order of its first payment. With
+ * an interval `day` is the start of the bucket, and the counterparty is listed once for the whole bucket.
+ */
 export interface StoredCounterparty {
   day: string;
   dir: ReportSide;
@@ -64,9 +70,10 @@ export interface ReportPayment {
 }
 
 /**
- * The report of an account on a UTC day, with the keys in the order of the route. The values are in the native
- * currency of the network. `receiving_counterparties` are the accounts the account paid, `sending_counterparties` the
- * ones that paid it; each is their count, or the accounts themselves with `accounts`.
+ * The report of an account on a UTC day (or on a week or a month, with an interval: `date` is the start of the bucket),
+ * with the keys in the order of the route. The values are in the native currency of the network.
+ * `receiving_counterparties` are the accounts the account paid, `sending_counterparties` the ones that paid it; each is
+ * their count, or the accounts themselves with `accounts`.
  */
 export interface Report {
   account: string;
@@ -89,13 +96,20 @@ export interface ReportInput {
   account: string;
   /** The native currency of the network. */
   native: string;
-  /** `YYYY-MM-DD`, oldest first. */
+  /** `YYYY-MM-DD`, oldest first: the days of the reports, which are those of `buckets` unless it is given. */
   days: string[];
+  /** `YYYY-MM-DD`, oldest first: the start of each report, when a report is more than a day. Default: `days`. */
+  buckets?: string[];
+  /** The start of the bucket a day is in. Default: the day itself. */
+  bucketOf?: (day: string) => string;
   groups: StoredReportGroup[];
   rates: ReportRates;
-  /** `list` (with `accounts`) gives the counterparties themselves, else `counts` their number. */
+  /**
+   * `list` (with `accounts`) gives the counterparties themselves, else `counts` their number. Their `day` is that of the
+   * bucket they are for.
+   */
   counterparties: { counts?: StoredCounterpartyCount[]; list?: StoredCounterparty[] };
-  /** Only with `payments`. */
+  /** Only with `payments`, which a report of more than a day does not list: the buckets are the days. */
   payments?: StoredReportPayment[];
 }
 
@@ -103,6 +117,10 @@ const ZERO = new BigNumber(0);
 const ZEROS = { total: ZERO, high: ZERO };
 
 const isNative = (currency: string, issuer: string, native: string): boolean => currency === native && !issuer;
+
+/** Whether a group is valued through a rate: an issued currency with an issuer. */
+const hasRate = (g: StoredReportGroup, native: string): boolean =>
+  !isNative(g.currency, g.issuer, native) && !!g.issuer;
 
 /**
  * The issued currencies whose rate a report needs: those of the groups that have an issuer, each once. The native
@@ -112,11 +130,19 @@ const isNative = (currency: string, issuer: string, native: string): boolean => 
 export function ratedAssets(groups: StoredReportGroup[], native: string): Asset[] {
   const assets = new Map<string, Asset>();
   for (const g of groups) {
-    if (isNative(g.currency, g.issuer, native) || !g.issuer) continue;
+    if (!hasRate(g, native)) continue;
     const asset = { currency: g.currency, issuer: g.issuer };
     assets.set(assetKey(asset), asset);
   }
   return [...assets.values()];
+}
+
+/**
+ * The days (`YYYY-MM-DD`, each once) on which the groups have an issued currency a rate is needed for: the days to ask the
+ * rates of. A day with native payments alone has no use for one.
+ */
+export function ratedDays(groups: StoredReportGroup[], native: string): string[] {
+  return [...new Set(groups.filter((g) => hasRate(g, native)).map((g) => g.day))];
 }
 
 /** The significant digits of a quotient (the rule of `nativeValue`, in the shared package). */
@@ -154,12 +180,17 @@ interface Side {
 
 const sideKey = (day: string, dir: ReportSide): string => `${day}|${dir}`;
 
-/** The reports of an account for the days given, one for each, whether or not it had a payment. */
+/**
+ * The reports of an account for the days given (or for the buckets, when it has any), one for each, whether or not it had a
+ * payment. A bucket adds up the values of its days, each worth what its day's rate says, takes the largest of their highs
+ * and adds up their counts; its counterparties are as they come, for the bucket (a counterparty paid on two days is one).
+ */
 export function toReports(input: ReportInput): Report[] {
+  const bucketOf = input.bucketOf ?? ((day: string): string => day);
   const sides = new Map<string, Side>();
   for (const g of input.groups) {
     const { total, high } = worth(g, input.native, input.rates);
-    const key = sideKey(g.day, g.dir);
+    const key = sideKey(bucketOf(g.day), g.dir);
     const side = sides.get(key) ?? { n: 0, total: ZERO, high: ZERO };
     sides.set(key, { n: side.n + g.n, total: side.total.plus(total), high: BigNumber.max(side.high, high) });
   }
@@ -190,7 +221,7 @@ export function toReports(input: ReportInput): Report[] {
     payments.set(p.day, list);
   }
 
-  return input.days.map((day): Report => {
+  return (input.buckets ?? input.days).map((day): Report => {
     const sent = sides.get(sideKey(day, 'sent')) ?? { n: 0, total: ZERO, high: ZERO };
     const received = sides.get(sideKey(day, 'received')) ?? { n: 0, total: ZERO, high: ZERO };
     return {
