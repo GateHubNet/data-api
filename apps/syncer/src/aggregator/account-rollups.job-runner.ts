@@ -37,9 +37,16 @@ const OTHER_PARTITION_RECOUNT_MS = 7 * 86_400_000;
 const chunksOf = <T>(items: T[], size: number): T[][] =>
   Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size));
 
-/** Whether the rollups of the state cover days, both ends of them. */
-const hasCoverage = (state: RollupState): boolean =>
+/** A state whose rollups cover days, both ends of them. */
+type Covered = RollupState & { rolledFrom: string; rolledThrough: string };
+const hasCoverage = (state: RollupState): state is Covered =>
   state.rolledFrom !== undefined && state.rolledThrough !== undefined;
+
+/** The days of a promotion slice, `YYYY-MM-DD`, both included. */
+interface Slice {
+  fromDay: string;
+  throughDay: string;
+}
 
 /** What one run of the job works with. */
 interface Run {
@@ -54,6 +61,11 @@ interface Run {
   readonly daysOfPartition: Map<number, number>;
   readonly rowsOfAccount: Map<string, Map<number, number>>;
   readonly partitionOfDay: Map<string, number | undefined>;
+  readonly firstDayOfPartition: Map<number, string | undefined>;
+  /** The newest set of each partition that has one, as the run goes on (a recount of the run adds its partition). */
+  readonly partitionVersions: Map<number, number>;
+  /** The accounts whose promotion waits for the count of a partition, this run. */
+  readonly deferred: Set<string>;
 }
 
 /**
@@ -80,7 +92,8 @@ interface Run {
  *     without coverage first, then the newest `rolled_from` first, so that a year is covered before all of it. An account with
  *     no coverage starts at the newest final day; the others go on backwards from their `rolled_from`. A slice is as many whole
  *     days as hold about 2,000,000 rows of the account (`promotionSlice`), from its rows in the partition of the slice's end
- *     over the days of the partition.
+ *     over the days of the partition, and it stays inside that partition (`sliceOf`): its count says nothing of the older ones.
+ *     An account whose slice ends in a partition that has no set yet waits for the discovery to count it.
  *  4. The gauges `syncer_account_rollups_heavy_accounts` and `syncer_account_rollups_pending_accounts`.
  *
  * What fails (a partition, a call of accounts, a slice) is logged and counted (`deps.failed`), waits 5 minutes and twice as long
@@ -148,8 +161,7 @@ export class AccountRollupsJobRunner {
         .filter(
           (s) =>
             s.configVersion === ACCOUNT_ROLLUP_CONFIG_VERSION &&
-            s.rolledFrom !== undefined &&
-            s.rolledThrough !== undefined &&
+            hasCoverage(s) &&
             s.rolledFrom <= key &&
             key <= s.rolledThrough,
         )
@@ -185,6 +197,9 @@ export class AccountRollupsJobRunner {
       daysOfPartition: new Map(),
       rowsOfAccount: new Map(),
       partitionOfDay: new Map(),
+      firstDayOfPartition: new Map(),
+      partitionVersions: new Map(),
+      deferred: new Set(),
     };
 
     const due = await this.recount(run, ledgers);
@@ -212,6 +227,7 @@ export class AccountRollupsJobRunner {
     const newestPartition = partitionOf(ledgers.max);
     const oldestPartition = partitionOf(ledgers.min);
     const versions = await this.fns.partitionSetVersions(deps.ch);
+    for (const [partition, version] of versions) run.partitionVersions.set(partition, version);
     const now = run.tick.now.getTime();
     const due: number[] = [];
     for (let partition = newestPartition; partition >= oldestPartition; partition--) {
@@ -231,6 +247,7 @@ export class AccountRollupsJobRunner {
         const accounts = await this.fns.recountPartition(deps.ch, partition, { signal: run.tick.signal });
         this.backoff.done(key);
         this.marked.delete(partition);
+        run.partitionVersions.set(partition, deps.clock());
         deps.logger.debug(`account_rollups: partition ${partition}: ${accounts} account(s) counted`);
       } catch (err) {
         this.fail(run, err, ` recounting partition ${partition}`, [key]);
@@ -299,7 +316,7 @@ export class AccountRollupsJobRunner {
     const { deps } = this;
     let lowest: number | undefined;
     for (const state of run.states.values()) {
-      if (hasCoverage(state) && state.rolledThrough !== undefined) {
+      if (hasCoverage(state)) {
         const day = utcDayStart(state.rolledThrough);
         if (lowest === undefined || day < lowest) lowest = day;
       }
@@ -364,8 +381,7 @@ export class AccountRollupsJobRunner {
 
   /** Whether the coverage of an account has to grow: it has none and has a day to cover, or it does not reach its first day. */
   private needsPromotion(state: RollupState, through: string): boolean {
-    if (state.rolledFrom === undefined || state.rolledThrough === undefined) return state.firstDay <= through;
-    return state.rolledFrom > state.firstDay;
+    return hasCoverage(state) ? state.rolledFrom > state.firstDay : state.firstDay <= through;
   }
 
   private async promote(run: Run): Promise<void> {
@@ -377,7 +393,12 @@ export class AccountRollupsJobRunner {
     };
     for (;;) {
       const pending = [...run.states.values()]
-        .filter((s) => this.needsPromotion(s, run.through) && !this.backoff.waiting(`promo/${s.account}`, deps.clock()))
+        .filter(
+          (s) =>
+            this.needsPromotion(s, run.through) &&
+            !run.deferred.has(s.account) &&
+            !this.backoff.waiting(`promo/${s.account}`, deps.clock()),
+        )
         .sort(order);
       if (pending.length === 0) return;
       for (const state of pending) {
@@ -387,23 +408,31 @@ export class AccountRollupsJobRunner {
     }
   }
 
-  /** One slice of an account, and its state after it; a failure is logged and counted, and the account is made to wait. */
+  /**
+   * One slice of an account, and its state after it. The rollup is written first and the state only when it worked, so that a
+   * state never claims days that are not there. A failure is logged and counted, and the account is made to wait; a slice that
+   * has to wait for the count of a partition (`sliceOf`) is neither, and is the next run's.
+   */
   private async promoteOne(run: Run, state: RollupState): Promise<void> {
     const { deps, fns } = this;
-    const { account, rolledFrom, rolledThrough } = state;
+    const { account } = state;
     // an account with coverage goes on from the day before it; one without starts at the newest final day
-    const covered = rolledFrom !== undefined && rolledThrough !== undefined;
-    const throughDay = covered ? isoDay((utcDayStart(rolledFrom) - UTC_DAY_MS) / 1000) : run.through;
-    let slice: { fromDay: string; throughDay: string } | undefined;
+    const throughDay = hasCoverage(state) ? isoDay((utcDayStart(state.rolledFrom) - UTC_DAY_MS) / 1000) : run.through;
+    let slice: Slice | undefined;
     try {
       slice = await this.sliceOf(run, state, throughDay);
+      if (slice === undefined) {
+        run.deferred.add(account);
+        deps.logger.debug(`account_rollups: ${account}: waits for the count of the partition of ${throughDay}`);
+        return;
+      }
       const rows = await fns.writeAccountRollups(deps.ch, this.ranges, [account], slice.fromDay, slice.throughDay, {
         signal: run.tick.signal,
       });
       const next: RollupState = {
         ...state,
         rolledFrom: slice.fromDay,
-        rolledThrough: covered ? rolledThrough : slice.throughDay,
+        rolledThrough: hasCoverage(state) ? state.rolledThrough : slice.throughDay,
       };
       await fns.writeRollupStates(deps.ch, [next], { signal: run.tick.signal });
       run.states.set(account, next);
@@ -416,32 +445,49 @@ export class AccountRollupsJobRunner {
   }
 
   /**
-   * The next slice of an account backwards from `throughDay`: as many whole days as hold about 2,000,000 of its rows, from its
-   * rows in the partition of the slice's end over the days of that partition (`promotionSlice`; with no count, or a day without
-   * ledgers, it takes everything back to the first day).
+   * The next slice of an account backwards from `throughDay`, which is about the rows of ONE partition, the one of the newest
+   * ledger that closed before the end of `throughDay`, and stays inside it:
+   *  - with the count of the account in that partition, as many whole days as hold about 2,000,000 rows at the rows per day of
+   *    the partition (`promotionSlice`), but never before the first day of the partition (the count says nothing of the older
+   *    ones, which may hold far more);
+   *  - without a count (the account is under `ACCOUNT_PARTITION_ROWS_FLOOR` in the partition), the rest of the partition, which
+   *    holds less than that by definition;
+   *  - both are bounded below by the first day of the account;
+   *  - no ledger closed before the end of the day: nothing is older, so the days down to the first day of the account are
+   *    the slice (they have no rows in the rollups or in the raw rows, and the write of them reads none);
+   *  - the partition has no set yet: undefined. Its count of the account is not known; the discovery counts it (it is due),
+   *    and the promotion waits, with no error and no wait of its own.
    */
-  private async sliceOf(
-    run: Run,
-    state: RollupState,
-    throughDay: string,
-  ): Promise<{ fromDay: string; throughDay: string }> {
+  private async sliceOf(run: Run, state: RollupState, throughDay: string): Promise<Slice | undefined> {
     const partition = await this.partitionOfDay(run, throughDay);
-    let rowsPerDay = 0;
-    if (partition !== undefined) {
-      const rows = (await this.rowsOf(run, state.account)).get(partition) ?? 0;
-      rowsPerDay = rows / (await this.daysOf(run, partition));
-    }
-    return promotionSlice({ firstDay: state.firstDay, throughDay, rowsPerDay });
+    if (partition === undefined) return { fromDay: state.firstDay, throughDay };
+    if (!run.partitionVersions.has(partition)) return undefined;
+    const partitionStart = (await this.firstDayOf(run, partition)) ?? state.firstDay;
+    const floorDay = partitionStart > state.firstDay ? partitionStart : state.firstDay;
+    const rows = (await this.rowsOf(run, state.account)).get(partition);
+    if (rows === undefined) return { fromDay: floorDay, throughDay };
+    const { fromDay } = promotionSlice({
+      firstDay: state.firstDay,
+      throughDay,
+      rowsPerDay: rows / (await this.daysOf(run, partition)),
+    });
+    return { fromDay: fromDay > floorDay ? fromDay : floorDay, throughDay };
   }
 
-  /** The partition of `balance_changes` of the last ledger of a day; none for a day without ledgers. */
+  /** The partition of `balance_changes` of the newest ledger that closed before the end of a day; none when there is none. */
   private async partitionOfDay(run: Run, day: string): Promise<number | undefined> {
     if (!run.partitionOfDay.has(day)) {
-      const start = utcDayStart(day);
-      const range = await this.ranges(new Date(start), new Date(start + UTC_DAY_MS));
+      const range = await this.ranges(new Date(0), new Date(utcDayStart(day) + UTC_DAY_MS));
       run.partitionOfDay.set(day, range === null ? undefined : partitionOf(range.max));
     }
     return run.partitionOfDay.get(day);
+  }
+
+  private async firstDayOf(run: Run, partition: number): Promise<string | undefined> {
+    if (!run.firstDayOfPartition.has(partition)) {
+      run.firstDayOfPartition.set(partition, await this.fns.partitionFirstDay(this.deps.ch, partition));
+    }
+    return run.firstDayOfPartition.get(partition);
   }
 
   private async rowsOf(run: Run, account: string): Promise<Map<number, number>> {
@@ -473,9 +519,7 @@ export class AccountRollupsJobRunner {
       if (state === undefined) return true;
       // an account whose first day is not over yet has nothing to cover
       if (state.firstDay > run.through) return false;
-      return (
-        !hasCoverage(state) || (state.rolledFrom ?? '') > state.firstDay || (state.rolledThrough ?? '') < run.through
-      );
+      return !hasCoverage(state) || state.rolledFrom > state.firstDay || state.rolledThrough < run.through;
     });
     this.deps.metrics?.accountRollupsHeavyAccounts.set(heavy.size);
     this.deps.metrics?.accountRollupsPendingAccounts.set(pending.length);

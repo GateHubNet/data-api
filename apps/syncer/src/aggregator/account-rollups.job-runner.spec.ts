@@ -46,6 +46,8 @@ class FakeRollups {
   daysOfPartition = new Map<number, number>();
   failingAccounts = new Set<string>();
   failingPartitions = new Set<number>();
+  /** Makes `writeRollupStates` throw, before it writes. */
+  stateWriteError?: Error;
   callMs = 0;
   onRollup?: (accounts: string[]) => void;
 
@@ -56,6 +58,7 @@ class FakeRollups {
   heavyReads: number[] = [];
   partitionRowReads: string[] = [];
   partitionDaysReads: number[] = [];
+  partitionFirstDayReads: number[] = [];
   firstDayReads: string[] = [];
   newestReads = 0;
   versionReads = 0;
@@ -102,6 +105,7 @@ class FakeRollups {
       },
       rollupStates: async () => new Map([...this.states].map(([a, s]) => [a, { ...s }])),
       writeRollupStates: async (_ch, states) => {
+        if (this.stateWriteError) throw this.stateWriteError;
         this.stateWrites.push(states.map((s) => ({ ...s })));
         for (const s of states) this.states.set(s.account, { ...s });
       },
@@ -116,6 +120,13 @@ class FakeRollups {
       partitionDays: async (_ch, partition) => {
         this.partitionDaysReads.push(partition);
         return this.daysOfPartition.get(partition) ?? 100;
+      },
+      partitionFirstDay: async (_ch, partition) => {
+        this.partitionFirstDayReads.push(partition);
+        // the first ledger of the partition on the chain above; the chain ends in partition 1
+        if (partition > 1) return undefined;
+        const first = Math.max(partition * 10_000_000, FIRST_LEDGER);
+        return new Date((T0 + (first - FIRST_LEDGER) * 4) * 1000).toISOString().slice(0, 10);
       },
       writeAccountRollups: async (ch, ranges, accounts, from, through, options) => {
         this.rollups.push({ accounts, from, through, signal: options?.signal, ranges, ch });
@@ -203,7 +214,7 @@ describe('AccountRollupsJobRunner', () => {
     expect(ACCOUNT_ROLLUPS_BATCH_ACCOUNTS).toBe(500);
   });
 
-  it('does nothing at all when GH_ACCOUNT_ROLLUP_MIN_ROWS is 0', async () => {
+  it('the run does nothing at all when GH_ACCOUNT_ROLLUP_MIN_ROWS is 0', async () => {
     minRows = 0;
     world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: '2026-10-14' });
     world.partitionVersions.clear(); // partitions that would be due
@@ -322,7 +333,12 @@ describe('AccountRollupsJobRunner', () => {
       // of another config version: its coverage does not count
       world.heavyAccount(
         'rOld',
-        { configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION - 1, rolledFrom: '2025-01-01', rolledThrough: THROUGH },
+        {
+          configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION - 1,
+          firstDay: '2026-09-15',
+          rolledFrom: '2026-09-15',
+          rolledThrough: THROUGH,
+        },
         1_200_000,
       );
       world.setPartitionRows('rOld', { 1: 10_000 });
@@ -358,16 +374,16 @@ describe('AccountRollupsJobRunner', () => {
         },
         { account: 'rDemoted', rows: 900_000, firstDay: '2025-03-03', configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION },
         { account: 'rNew', rows: 3_000_000, firstDay: '2026-09-10', configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION },
-        { account: 'rOld', rows: 1_200_000, firstDay: '2025-01-01', configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION },
+        { account: 'rOld', rows: 1_200_000, firstDay: '2026-09-15', configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION },
       ]);
       // the first day of an account is read once, when it is new
       expect(world.firstDayReads).toEqual(['rNew']);
       // the uncovered accounts (the new one, and the one of the old config) are promoted from the newest final day; the covered ones not
       expect(world.calls()).toEqual([
         [['rNew'], '2026-09-10', THROUGH],
-        [['rOld'], '2025-01-01', THROUGH],
+        [['rOld'], '2026-09-15', THROUGH],
       ]);
-      expect(world.states.get('rOld')).toMatchObject({ rolledFrom: '2025-01-01', rolledThrough: THROUGH });
+      expect(world.states.get('rOld')).toMatchObject({ rolledFrom: '2026-09-15', rolledThrough: THROUGH });
       expect(world.states.get('rDemoted')?.rolledFrom).toBeUndefined();
 
       // the next run has nothing to write: every state is as discovery wants it
@@ -538,7 +554,8 @@ describe('AccountRollupsJobRunner', () => {
       // uncovered, 8M rows over 40 days of partition 1: 200,000 a day, 10 days a slice
       world.heavyAccount('rU', { firstDay: '2026-09-10' });
       world.setPartitionRows('rU', { 1: 8_000_000 });
-      // covered from 2026-09-01: its next slice ends on 08-31 (partition 1, 10 days), then 08-21 (partition 1), then 08-11 (partition 0: 3M rows over 300 days, 200 days a slice)
+      // covered from 2026-09-01: its next slice ends on 08-31 (partition 1, 10 days), then 08-21 (partition 1, which starts on 08-20: the slice stops there),
+      // then 08-19 (partition 0: 3M rows over 300 days, 200 days a slice)
       world.heavyAccount('rV1', { firstDay: '2026-07-01', rolledFrom: '2026-09-01', rolledThrough: THROUGH });
       world.setPartitionRows('rV1', { 1: 8_000_000, 0: 3_000_000 });
       // covered from 2026-08-05: it gets all it lacks in one slice (partition 0)
@@ -556,10 +573,10 @@ describe('AccountRollupsJobRunner', () => {
         [['rV2'], '2026-07-01', '2026-08-04'],
         // round 2: rU (rolled_from 10-06) before rV1 (08-22)
         [['rU'], '2026-09-26', '2026-10-05'],
-        [['rV1'], '2026-08-12', '2026-08-21'],
+        [['rV1'], '2026-08-20', '2026-08-21'],
         // round 3
         [['rU'], '2026-09-16', '2026-09-25'],
-        [['rV1'], '2026-07-01', '2026-08-11'],
+        [['rV1'], '2026-07-01', '2026-08-19'],
         // round 4: its first day is the end of it
         [['rU'], '2026-09-10', '2026-09-15'],
       ]);
@@ -571,7 +588,7 @@ describe('AccountRollupsJobRunner', () => {
         ['rV1', '2026-08-22', THROUGH],
         ['rV2', '2026-07-01', THROUGH],
         ['rU', '2026-09-26', THROUGH],
-        ['rV1', '2026-08-12', THROUGH],
+        ['rV1', '2026-08-20', THROUGH],
         ['rU', '2026-09-16', THROUGH],
         ['rV1', '2026-07-01', THROUGH],
         ['rU', '2026-09-10', THROUGH],
@@ -579,16 +596,84 @@ describe('AccountRollupsJobRunner', () => {
       // the rows per day come from the partition of the slice's end, counted once for an account and a partition a run
       expect(world.partitionRowReads.sort()).toEqual(['rU', 'rV1', 'rV2']);
       expect(world.partitionDaysReads.sort()).toEqual([0, 1]);
+      expect(world.partitionFirstDayReads.sort()).toEqual([0, 1]);
 
       world.clear();
       await run(runner());
       expect(world.rollups).toEqual([]);
     });
 
-    it("takes everything back to the first day when the account has no count in the partition of the slice's end", async () => {
-      world.heavyAccount('rU', { firstDay: '2025-01-01' }); // no count in any partition
+    it('a slice never starts before the first day of the partition of its end, whatever the rows per day say', async () => {
+      // 20,000 rows over 400 days of partition 1 is 50 a day: 40,000 days a slice, which would be all the history
+      world.daysOfPartition.set(1, 400);
+      world.daysOfPartition.set(0, 300);
+      // a dormant account: 3M rows long ago (partition 0), almost none in the newest partition
+      world.heavyAccount('rDormant', { firstDay: '2026-02-01' });
+      world.setPartitionRows('rDormant', { 1: 20_000, 0: 3_000_000 });
       await run(runner());
-      expect(world.calls()).toEqual([[['rU'], '2025-01-01', THROUGH]]);
+      expect(world.calls()).toEqual([
+        // partition 1 starts on 2026-08-20: this slice is about the rows of partition 1 only
+        [['rDormant'], '2026-08-20', THROUGH],
+        // partition 0: 3M rows over 300 days, 200 days a slice, but its first day is 2026-02-01
+        [['rDormant'], '2026-02-01', '2026-08-19'],
+      ]);
+      expect(world.states.get('rDormant')).toMatchObject({ rolledFrom: '2026-02-01', rolledThrough: THROUGH });
+    });
+
+    it('a slice of an account with no count in the partition of its end is the rest of the partition, down to the first day, and all of what is left when no ledger is older', async () => {
+      world.heavyAccount('rU', { firstDay: '2025-01-01' }); // no count in any partition: under the floor in each
+      await run(runner());
+      expect(world.calls()).toEqual([
+        [['rU'], '2026-08-20', THROUGH], // the rest of partition 1 (it starts on 2026-08-20)
+        [['rU'], '2026-01-01', '2026-08-19'], // the rest of partition 0 (the first ledger closed on 2026-01-01)
+        // no ledger closed before 2026-01-01: there is nothing older, and the days before have no rows in the rollups or in the raw rows
+        [['rU'], '2025-01-01', '2025-12-31'],
+      ]);
+      expect(world.states.get('rU')).toMatchObject({ rolledFrom: '2025-01-01', rolledThrough: THROUGH });
+
+      // the rest of the partition is bounded below by the first day of the account, too
+      world.rollups = [];
+      world.heavyAccount('rV', { firstDay: '2026-09-20' });
+      await run(runner());
+      expect(world.calls()).toEqual([[['rV'], '2026-09-20', THROUGH]]);
+    });
+
+    it('defers an account whose slice ends in a partition that has no set yet, without an error or a wait, and promotes it once the partition is counted', async () => {
+      world.partitionVersions.delete(0); // the partition of 2026-08-19 and before
+      world.failingPartitions.add(0); // and its recount fails
+      world.heavyAccount('rV', { firstDay: '2026-06-01', rolledFrom: '2026-08-20', rolledThrough: THROUGH });
+      world.heavyAccount('rW', { firstDay: '2026-09-20' }); // its slice ends in partition 1, which is counted
+      const r = runner();
+
+      await run(r);
+      // only the recount failed; rV was not promoted (its count in partition 0 is not known), rW was
+      expect(world.recounts).toEqual([0]);
+      expect(fake.failures).toHaveLength(1);
+      expect(fake.failures[0].where).toContain('partition 0');
+      expect(world.calls()).toEqual([[['rW'], '2026-09-20', THROUGH]]);
+      expect(world.partitionRowReads).toEqual(['rW']);
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(1);
+
+      // the partition is counted a minute later (the wait of its recount is not over): rV was not made to wait itself
+      world.failingPartitions.clear();
+      world.partitionVersions.set(0, Date.now());
+      world.setPartitionRows('rV', { 0: 3_000_000 });
+      world.daysOfPartition.set(0, 300); // 10,000 a day: 200 days a slice
+      world.clear();
+      jest.setSystemTime(Date.now() + minutes(1));
+      await run(r);
+      expect(world.calls()).toEqual([[['rV'], '2026-06-01', '2026-08-19']]);
+      expect(fake.failures).toHaveLength(1);
+    });
+
+    it('counts the partition of an account whose slice ends in it before it promotes it, in the same run', async () => {
+      world.partitionVersions.delete(0);
+      world.heavyAccount('rV', { firstDay: '2026-06-01', rolledFrom: '2026-08-20', rolledThrough: THROUGH });
+      world.setPartitionRows('rV', { 0: 3_000_000 });
+      world.daysOfPartition.set(0, 300); // 10,000 a day: 200 days a slice
+      await run(runner());
+      expect(world.recounts).toEqual([0]);
+      expect(world.calls()).toEqual([[['rV'], '2026-06-01', '2026-08-19']]);
     });
 
     it('promotes an account of another config version again from the newest final day', async () => {
@@ -613,6 +698,40 @@ describe('AccountRollupsJobRunner', () => {
         rolledThrough: THROUGH,
         configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
       });
+    });
+
+    it('a failed promotion writes no state: the rollup is written first, and the state only when it worked', async () => {
+      world.heavyAccount('rA', { firstDay: '2026-10-14' }); // its state is as discovery wants it: no write of discovery
+      world.failingAccounts.add('rA');
+      const r = runner();
+      await run(r);
+      expect(world.rollups).toHaveLength(1);
+      expect(fake.failures).toHaveLength(1);
+      expect(fake.failures[0].where).toContain('rA');
+      expect(world.stateWrites).toEqual([]);
+      expect(world.states.get('rA')?.rolledFrom).toBeUndefined();
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(1);
+    });
+
+    it('a state that cannot be written after the rollup leaves the account as it was: the slice is rolled again after the wait', async () => {
+      world.heavyAccount('rA', { firstDay: '2026-10-14' });
+      world.stateWriteError = new Error('read only');
+      const r = runner();
+      await run(r);
+      expect(world.calls()).toEqual([[['rA'], '2026-10-14', THROUGH]]);
+      expect(fake.failures).toHaveLength(1);
+      expect(world.states.get('rA')?.rolledFrom).toBeUndefined();
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(1);
+
+      world.stateWriteError = undefined;
+      jest.setSystemTime(Date.now() + minutes(5));
+      await run(r);
+      expect(world.calls()).toEqual([
+        [['rA'], '2026-10-14', THROUGH],
+        [['rA'], '2026-10-14', THROUGH],
+      ]);
+      expect(world.states.get('rA')).toMatchObject({ rolledFrom: '2026-10-14', rolledThrough: THROUGH });
+      expect(fake.metrics.accountRollupsPendingAccounts.set).toHaveBeenLastCalledWith(0);
     });
 
     it('a promotion is a call of one account, whatever the count of the accounts that wait', async () => {
@@ -926,7 +1045,9 @@ describe('AccountRollupsJobRunner', () => {
     });
 
     it('gives up after 3 failed sets in a run, across its steps', async () => {
-      world.partitionVersions.clear();
+      // both partitions are due (their sets are old) and fail to be recounted
+      world.partitionVersions.set(1, NOW.getTime() - 25 * HOUR * 1000);
+      world.partitionVersions.set(0, NOW.getTime() - 8 * DAY * 1000);
       world.failingPartitions.add(1);
       world.failingPartitions.add(0);
       for (let i = 0; i < 4; i++) world.heavyAccount(accountName(i), { firstDay: '2026-10-14' });

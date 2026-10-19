@@ -351,6 +351,21 @@ export async function partitionDays(ch: ClickHouseService, partition: number): P
 }
 
 /**
+ * The UTC day (`YYYY-MM-DD`) of the first ledger of a partition of `balance_changes`, undefined when the partition has no
+ * ledger. A promotion slice never starts before it: the count of an account in the partition says how many rows a day holds
+ * there, and says nothing of the partitions before it.
+ */
+export async function partitionFirstDay(ch: ClickHouseService, partition: number): Promise<string | undefined> {
+  const row = await ch.queryOne<{ day: string; n: number | string }>(
+    `SELECT toString(toDate(min(close_time), 'UTC')) AS day, count() AS n
+       FROM ${Table.Ledgers}
+      WHERE ledger_index BETWEEN {p_min:UInt32} AND {p_max:UInt32}`,
+    { p_min: partition * BALANCE_PARTITION_LEDGERS, p_max: (partition + 1) * BALANCE_PARTITION_LEDGERS - 1 },
+  );
+  return row === undefined || Number(row.n) === 0 ? undefined : row.day;
+}
+
+/**
  * The next slice of a promotion, backwards from `throughDay`: as many whole days as hold about `ACCOUNT_ROLLUP_SLICE_ROWS`
  * rows at `rowsPerDay`, at least one, and never before `firstDay` (the account's first day). All days are `YYYY-MM-DD`. Rows
  * per day of 0 (unknown) take everything back to the first day.

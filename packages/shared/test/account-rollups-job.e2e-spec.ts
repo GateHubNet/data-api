@@ -6,6 +6,7 @@ import {
   firstChangeDay,
   heavyAccounts,
   partitionDays,
+  partitionFirstDay,
   partitionOf,
   partitionSetVersions,
   recountPartition,
@@ -17,7 +18,7 @@ import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 
 /**
  * The discovery of heavy accounts (`account-rollups.job.ts`: `recountPartition`, `heavyAccounts`, `accountPartitionRows`,
- * `partitionSetVersions`, `firstChangeDay`, `partitionDays`) on a real ClickHouse.
+ * `partitionSetVersions`, `firstChangeDay`, `partitionDays`, `partitionFirstDay`) on a real ClickHouse.
  *
  * The world is synthetic `balance_changes` of made-up accounts, written with `INSERT ... SELECT FROM numbers()` into
  * the first two partitions of the table (ledgers below and from 10,000,000). The accounts sit on both sides of the floor
@@ -419,6 +420,38 @@ describe('heavy-account discovery (e2e)', () => {
       // a partition with one ledger (2: its first one) and one with none are at least one day
       expect(await partitionDays(ch, 2)).toBe(1);
       expect(await partitionDays(ch, 7)).toBe(1);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('partitionFirstDay', () => {
+    it('is the UTC day of the first ledger of the partition, and none for a partition without a ledger', async () => {
+      const ch = await freshService();
+      const ledger = (index: number, closed: string): Promise<void> =>
+        ch.command(
+          `INSERT INTO ${Table.Ledgers} (ledger_index, close_time) SELECT {index:UInt32}, toDateTime({closed:String}, 'UTC')`,
+          { index, closed },
+        );
+      // partition 0: its last ledgers; the ledgers of the neighbours are not its own
+      await ledger(P - 2, '2016-03-03 23:59:58');
+      await ledger(P - 1, '2016-03-03 23:59:59');
+      // partition 1: the first ledger is not the one with the lowest index inserted first, and the next day follows
+      await ledger(P + 900, '2016-03-05 01:00:00');
+      await ledger(P + 1, '2016-03-04 00:00:00');
+      await ledger(P + 500, '2016-03-04 12:00:00');
+      // partition 3: one ledger, on the last second of a day
+      await ledger(3 * P + 7, '2016-02-29 23:59:59');
+      // partition 4: its first ledger is the first second of a day (the leap day)
+      await ledger(4 * P, '2016-02-29 00:00:00');
+      await ledger(4 * P + 1, '2016-03-01 00:00:00');
+
+      expect(await partitionFirstDay(ch, 0)).toBe('2016-03-03');
+      expect(await partitionFirstDay(ch, 1)).toBe('2016-03-04');
+      expect(await partitionFirstDay(ch, 3)).toBe('2016-02-29');
+      expect(await partitionFirstDay(ch, 4)).toBe('2016-02-29');
+      // a partition with no ledger has no first day (not 1970-01-01)
+      expect(await partitionFirstDay(ch, 2)).toBeUndefined();
+      expect(await partitionFirstDay(ch, 9)).toBeUndefined();
     });
   });
 });

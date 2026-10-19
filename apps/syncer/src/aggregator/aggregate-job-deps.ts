@@ -12,6 +12,7 @@ import {
   newestLedgerClose,
   pairHourSets,
   partitionDays,
+  partitionFirstDay,
   partitionSetVersions,
   RatesService,
   recountPartition,
@@ -111,6 +112,7 @@ export interface AggregateFunctions {
   accountPartitionRows: typeof accountPartitionRows;
   firstChangeDay: typeof firstChangeDay;
   partitionDays: typeof partitionDays;
+  partitionFirstDay: typeof partitionFirstDay;
 }
 
 export function defaultAggregateFunctions(): AggregateFunctions {
@@ -134,6 +136,7 @@ export function defaultAggregateFunctions(): AggregateFunctions {
     accountPartitionRows,
     firstChangeDay,
     partitionDays,
+    partitionFirstDay,
   };
 }
 
