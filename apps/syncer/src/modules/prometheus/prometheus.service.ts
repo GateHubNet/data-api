@@ -95,6 +95,63 @@ const metrics = {
     labelNames: ['job'],
     registers: [registry],
   }),
+  validatorsUnlFetchesTotal: new Counter({
+    name: 'syncer_validators_unl_fetches_total',
+    help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
+    labelNames: ['publisher', 'outcome'],
+    registers: [registry],
+  }),
+  validatorsUnlExpirySeconds: new Gauge({
+    name: 'syncer_validators_unl_expiry_seconds',
+    help: 'Seconds until the current validator list of a publisher expires (negative when expired).',
+    labelNames: ['publisher'],
+    registers: [registry],
+  }),
+  validatorsUnlSize: new Gauge({
+    name: 'syncer_validators_unl_size',
+    help: 'Validators on the current list of a publisher.',
+    labelNames: ['publisher'],
+    registers: [registry],
+  }),
+  validatorsDomainChecksTotal: new Counter({
+    name: 'syncer_validators_domain_checks_total',
+    help: 'Domain checks of validators, by outcome (verified, or the reason code of the failure).',
+    labelNames: ['outcome'],
+    registers: [registry],
+  }),
+  validatorsNodePollsTotal: new Counter({
+    name: 'syncer_validators_node_polls_total',
+    help: 'Polls of the node by the validators worker, by request (amendments, negative_unl, fee_settings, server_info, feature) and outcome (ok, error).',
+    labelNames: ['request', 'outcome'],
+    registers: [registry],
+  }),
+  validatorsJobsTotal: new Counter({
+    name: 'syncer_validators_jobs_total',
+    help: 'Runs of the validators worker jobs, by job (rounds, agreement) and outcome (ok, error).',
+    labelNames: ['job', 'outcome'],
+    registers: [registry],
+  }),
+  validatorsAgreementLagSeconds: new Gauge({
+    name: 'syncer_validators_agreement_lag_seconds',
+    help: 'Now minus the end of the newest final hour of validator agreement, in seconds.',
+    registers: [registry],
+  }),
+  validatorsRoundsLagLedgers: new Gauge({
+    name: 'syncer_validators_rounds_lag_ledgers',
+    help: 'Newest committed voting ledger minus the newest stored amendment voting round, in ledgers.',
+    registers: [registry],
+  }),
+  amendmentsWithoutMetadata: new Gauge({
+    name: 'syncer_amendments_without_metadata',
+    help: 'Amendments seen (node, ledger, votes) without an entry in the amendment metadata.',
+    registers: [registry],
+  }),
+  validatorValidationsFlushedTotal: new Counter({
+    name: 'syncer_validator_validations_flushed_total',
+    help: 'Rows written to validator_validations and validator_seen, by table.',
+    labelNames: ['table'],
+    registers: [registry],
+  }),
 };
 
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
@@ -126,6 +183,16 @@ export class PrometheusService implements OnModuleInit {
   readonly aggregatorRunsTotal = metrics.aggregatorRunsTotal;
   readonly aggregatorErrorsTotal = metrics.aggregatorErrorsTotal;
   readonly aggregatorStatsLagSeconds = metrics.aggregatorStatsLagSeconds;
+  readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
+  readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
+  readonly validatorsUnlSize = metrics.validatorsUnlSize;
+  readonly validatorsDomainChecksTotal = metrics.validatorsDomainChecksTotal;
+  readonly validatorsNodePollsTotal = metrics.validatorsNodePollsTotal;
+  readonly validatorsJobsTotal = metrics.validatorsJobsTotal;
+  readonly validatorsAgreementLagSeconds = metrics.validatorsAgreementLagSeconds;
+  readonly validatorsRoundsLagLedgers = metrics.validatorsRoundsLagLedgers;
+  readonly amendmentsWithoutMetadata = metrics.amendmentsWithoutMetadata;
+  readonly validatorValidationsFlushedTotal = metrics.validatorValidationsFlushedTotal;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.

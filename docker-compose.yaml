@@ -112,9 +112,15 @@ services:
       GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
+      # Empty = the validator list publishers of XRPL: an empty GH_UNL_PUBLISHERS would mean "no lists", so the default is spelled out.
+      GH_UNL_PUBLISHERS: ${XRPL_UNL_PUBLISHERS:-https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1}
+      # Empty = the config/amendments/xrpl.json that ships in the image (the syncer and the api read the same file).
+      GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
       GH_RUN_MIGRATIONS_ON_BOOT: 'false'
       GH_HTTP_API_PORT: 3002
       GH_METRICZ_PORT: 3000
+    # volumes:
+    #   - ./deploy/amendments-xrpl.json:/etc/gatehub/amendments.json:ro # and XRPL_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
     depends_on:
       migrate-xrpl:
         condition: service_completed_successfully
@@ -137,8 +143,12 @@ services:
       # key below is a development default. Set GH_API_KEYS to use your own.
       NODE_ENV: development
       GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
+      # Empty = the config/amendments/xrpl.json that ships in the image (the same file as the syncer's).
+      GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
       GH_HTTP_API_PORT: 3001
       GH_METRICZ_PORT: 3000
+    # volumes:
+    #   - ./deploy/amendments-xrpl.json:/etc/gatehub/amendments.json:ro # and XRPL_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
     depends_on:
       migrate-xrpl:
         condition: service_completed_successfully
@@ -176,9 +186,15 @@ services:
       GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
       GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
       GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
+      # Empty = the validator list publishers of Xahau: an empty GH_UNL_PUBLISHERS would mean "no lists", so the default is spelled out.
+      GH_UNL_PUBLISHERS: ${XAHAU_UNL_PUBLISHERS:-https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8}
+      # Empty = the config/amendments/xahau.json that ships in the image (the syncer and the api read the same file).
+      GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
       GH_RUN_MIGRATIONS_ON_BOOT: 'false'
       GH_HTTP_API_PORT: 3002
       GH_METRICZ_PORT: 3000
+    # volumes:
+    #   - ./deploy/amendments-xahau.json:/etc/gatehub/amendments.json:ro # and XAHAU_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
     depends_on:
       migrate-xahau:
         condition: service_completed_successfully
@@ -199,8 +215,12 @@ services:
       GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
       NODE_ENV: development # see api-xrpl
       GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
+      # Empty = the config/amendments/xahau.json that ships in the image (the same file as the syncer's).
+      GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
       GH_HTTP_API_PORT: 3001
       GH_METRICZ_PORT: 3000
+    # volumes:
+    #   - ./deploy/amendments-xahau.json:/etc/gatehub/amendments.json:ro # and XAHAU_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
     depends_on:
       migrate-xahau:
         condition: service_completed_successfully

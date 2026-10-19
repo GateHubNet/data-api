@@ -146,6 +146,14 @@ export class ApiConfig {
   @MaybeEmptyText()
   @IsHeaderValue()
   cacheControl: string = 'private, max-age=60';
+
+  /**
+   * `GH_AMENDMENTS_CONFIG`: path of the amendment metadata file (the same file as the syncer's, so that both name an amendment
+   * alike). Empty, the default, is the file shipped as `config/amendments/<network>.json`.
+   */
+  @ConfigValue()
+  @MaybeEmptyText()
+  amendmentsConfig: string = '';
 }
 
 /** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */

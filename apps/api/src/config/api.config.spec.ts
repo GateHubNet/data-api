@@ -58,6 +58,7 @@ describe('ApiConfig (GH_* environment)', () => {
       trustProxyHops: 1,
       // key-gated answers: private, so a shared cache does not serve one client's answer to another (R109)
       cacheControl: 'private, max-age=60',
+      amendmentsConfig: '',
     });
   });
 
@@ -76,6 +77,7 @@ describe('ApiConfig (GH_* environment)', () => {
       GH_TX_CACHE_SIZE: '0',
       GH_TRUST_PROXY_HOPS: '0',
       GH_CACHE_CONTROL: 'public, max-age=5',
+      GH_AMENDMENTS_CONFIG: ' /etc/gatehub/amendments.json ',
     });
     expect(exits).toEqual([]);
     expect(cfg).toMatchObject({
@@ -92,6 +94,7 @@ describe('ApiConfig (GH_* environment)', () => {
       txCacheSize: 0,
       trustProxyHops: 0,
       cacheControl: 'public, max-age=5',
+      amendmentsConfig: '/etc/gatehub/amendments.json',
     });
   });
 
@@ -104,6 +107,7 @@ describe('ApiConfig (GH_* environment)', () => {
       GH_API_KEYS: '',
       GH_CORS_ORIGINS: '',
       GH_CACHE_CONTROL: '',
+      GH_AMENDMENTS_CONFIG: '',
     });
     expect(exits).toEqual([]);
     expect(cfg).toMatchObject({
@@ -114,6 +118,7 @@ describe('ApiConfig (GH_* environment)', () => {
       apiKeys: '',
       corsOrigins: '',
       cacheControl: '', // set to empty: no Cache-Control at all
+      amendmentsConfig: '', // empty = the file shipped for the network
     });
   });
 

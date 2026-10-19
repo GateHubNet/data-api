@@ -39,6 +39,44 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_aggregator_stats_lag_seconds 86400$/m);
   });
 
+  it('exposes the metrics of the validators worker, by name, type and label set', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    // A labelled metric shows no series until a label set was observed, so each is observed once.
+    service.validatorsUnlFetchesTotal.inc({ publisher: 'vl.ripple.com', outcome: 'ok' });
+    service.validatorsUnlExpirySeconds.set({ publisher: 'vl.ripple.com' }, 1_209_600);
+    service.validatorsUnlSize.set({ publisher: 'vl.ripple.com' }, 35);
+    service.validatorsDomainChecksTotal.inc({ outcome: 'verified' });
+    service.validatorsNodePollsTotal.inc({ request: 'server_info', outcome: 'ok' });
+    service.validatorsJobsTotal.inc({ job: 'rounds', outcome: 'error' });
+    service.validatorsAgreementLagSeconds.set(3600);
+    service.validatorsRoundsLagLedgers.set(256);
+    service.amendmentsWithoutMetadata.set(2);
+    service.validatorValidationsFlushedTotal.inc({ table: 'validator_validations' }, 12);
+
+    const text = await service.getMetrics();
+    expect(text).toMatch(/^# TYPE syncer_validators_unl_fetches_total counter$/m);
+    expect(text).toMatch(/^syncer_validators_unl_fetches_total\{publisher="vl.ripple.com",outcome="ok"\} 1$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_unl_expiry_seconds gauge$/m);
+    expect(text).toMatch(/^syncer_validators_unl_expiry_seconds\{publisher="vl.ripple.com"\} 1209600$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_unl_size gauge$/m);
+    expect(text).toMatch(/^syncer_validators_unl_size\{publisher="vl.ripple.com"\} 35$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_domain_checks_total counter$/m);
+    expect(text).toMatch(/^syncer_validators_domain_checks_total\{outcome="verified"\} 1$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_node_polls_total counter$/m);
+    expect(text).toMatch(/^syncer_validators_node_polls_total\{request="server_info",outcome="ok"\} 1$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_jobs_total counter$/m);
+    expect(text).toMatch(/^syncer_validators_jobs_total\{job="rounds",outcome="error"\} 1$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_agreement_lag_seconds gauge$/m);
+    expect(text).toMatch(/^syncer_validators_agreement_lag_seconds 3600$/m);
+    expect(text).toMatch(/^# TYPE syncer_validators_rounds_lag_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_validators_rounds_lag_ledgers 256$/m);
+    expect(text).toMatch(/^# TYPE syncer_amendments_without_metadata gauge$/m);
+    expect(text).toMatch(/^syncer_amendments_without_metadata 2$/m);
+    expect(text).toMatch(/^# TYPE syncer_validator_validations_flushed_total counter$/m);
+    expect(text).toMatch(/^syncer_validator_validations_flushed_total\{table="validator_validations"\} 12$/m);
+  });
+
   it('shares one registry between instances, as the main app and the metricz app each create one', async () => {
     const worker = new PrometheusService();
     const scraper = new PrometheusService();

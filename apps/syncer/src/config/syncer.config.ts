@@ -1,9 +1,15 @@
 // Only the network profile, not the package root: the config is loaded (and its tests reload it) before anything else.
-import { getNetworkProfile } from '@gatehub/data-api-shared/dist/network';
+import {
+  defaultUnlThreshold,
+  getNetworkProfile,
+  NetworkProfile,
+  parseUnlPublishers,
+  UnlPublisherConfig,
+} from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsIn, registerDecorator, ValidateIf, ValidationArguments } from 'class-validator';
+import { IsIn, IsString, registerDecorator, ValidateIf, ValidationArguments } from 'class-validator';
 
 /**
  * Syncer configuration, read from `GH_*` environment variables by the toolbox ConfigService (`@ConfigValue()` maps the
@@ -21,7 +27,7 @@ import { IsBoolean, IsIn, registerDecorator, ValidateIf, ValidationArguments } f
  * that file is missing, so containers (NODE_ENV=production) must set `GH_ENV` to any value.
  */
 
-export const WORKER_NAMES = ['ingest', 'validations', 'fee_stats', 'aggregator'] as const;
+export const WORKER_NAMES = ['ingest', 'validations', 'fee_stats', 'aggregator', 'validators'] as const;
 export type WorkerName = (typeof WORKER_NAMES)[number];
 
 /** `ledgerFetchTimeoutMs` -> `GH_LEDGER_FETCH_TIMEOUT_MS`: the name the ConfigService reads. */
@@ -43,7 +49,7 @@ function defaultOf(key: string): unknown {
 /** A class-validator decorator whose message names the environment variable instead of the property. */
 function validator(
   name: string,
-  validate: (value: unknown) => boolean,
+  validate: (value: unknown, args: ValidationArguments) => boolean,
   describe: (variable: string, args: ValidationArguments) => string,
 ): () => PropertyDecorator {
   return () => (target, propertyKey) =>
@@ -95,6 +101,43 @@ const IsEndpointList = validator(
   (variable) => `${variable} must be a comma separated list of ws:// or wss:// URLs`,
 );
 
+/** The publishers of a `GH_UNL_PUBLISHERS` text, or the reason it cannot be read (the message names the variable). */
+function tryParsePublishers(text: unknown): { publishers: UnlPublisherConfig[] } | { reason: string } {
+  try {
+    return { publishers: parseUnlPublishers(String(text)) };
+  } catch (err) {
+    return { reason: (err as Error).message };
+  }
+}
+
+/** Every entry of `GH_UNL_PUBLISHERS` must be a valid `url=key` pair; the message is the one `parseUnlPublishers` throws. */
+const IsUnlPublishers = validator(
+  'isUnlPublishers',
+  (value) => 'publishers' in tryParsePublishers(value),
+  (variable, args) => {
+    const parsed = tryParsePublishers(args.value);
+    return 'reason' in parsed ? parsed.reason : `${variable} is invalid`;
+  },
+);
+
+/**
+ * The threshold may not exceed the number of publishers. Publishers that cannot be read, and a threshold that is not a
+ * non-negative integer, are reported on their own (by `IsUnlPublishers` and `IntValue`), and not again here.
+ */
+const IsWithinPublishers = validator(
+  'isWithinPublishers',
+  (value, args) => {
+    const parsed = tryParsePublishers((args.object as SyncerConfig).unlPublishers);
+    if (!('publishers' in parsed) || !Number.isSafeInteger(value) || (value as number) < 0) return true;
+    return (value as number) <= parsed.publishers.length;
+  },
+  (variable, args) => {
+    const parsed = tryParsePublishers((args.object as SyncerConfig).unlPublishers);
+    const count = 'publishers' in parsed ? parsed.publishers.length : 0;
+    return `${variable} must be between 0 and the number of publishers (${count})`;
+  },
+);
+
 /** An integer between `min` and `max`, read from the env as plain decimal digits (so `1.5`, `1e3` and `abc` are invalid). */
 function IntValue(options: { min: number; max?: number; optional?: boolean }): PropertyDecorator {
   const { min, max, optional } = options;
@@ -122,17 +165,56 @@ function IntValue(options: { min: number; max?: number; optional?: boolean }): P
 }
 
 /**
- * The public node endpoints of `GH_NETWORK` (a Xahau syncer must not fall back to an XRPL node). An unknown network takes
- * the XRPL ones: `IsIn` on `network` reports it.
+ * A string that may be empty (`GH_UNL_PUBLISHERS=`): an unset variable takes `fallback` (the initializer by default), a set
+ * one is used as it is (trimmed), and an empty value skips the other validators of the property.
  */
-function defaultNodeEndpoints(obj: Record<string, unknown>): string {
-  let profile;
+function MaybeEmptyText(fallback?: (obj: Record<string, unknown>) => string): PropertyDecorator {
+  return (target, key) => {
+    Transform(({ obj }) => {
+      const value = obj[key as string];
+      return typeof value === 'string' ? value.trim() : (fallback?.(obj) ?? defaultOf(key as string));
+    })(target, key);
+    ValidateIf((config: Record<string, unknown>) => config[key as string] !== '')(target, key);
+    IsString()(target, key);
+  };
+}
+
+/** `true`, `false`, `1` or `0` in any case; unset or blank takes the initializer. */
+function BoolValue(): PropertyDecorator {
+  const check = validator(
+    'isConfigBoolean',
+    (value) => typeof value === 'boolean',
+    (variable) => `${variable} must be true or false`,
+  )();
+  return (target, key) => {
+    Transform(({ obj }) => {
+      const raw = rawValue(obj, key as string)?.toLowerCase();
+      if (raw === undefined) return defaultOf(key as string);
+      if (raw === 'true' || raw === '1') return true;
+      if (raw === 'false' || raw === '0') return false;
+      return raw; // not a boolean: the check rejects it
+    })(target, key);
+    check(target, key);
+  };
+}
+
+/** The profile of `GH_NETWORK`. An unknown network takes the XRPL one: `IsIn` on `network` reports it. */
+function networkProfileOf(obj: Record<string, unknown>): NetworkProfile {
   try {
-    profile = getNetworkProfile(rawValue(obj, 'network') ?? 'xrpl');
+    return getNetworkProfile(rawValue(obj, 'network') ?? 'xrpl');
   } catch {
-    profile = getNetworkProfile('xrpl');
+    return getNetworkProfile('xrpl');
   }
-  return profile.defaultNodeEndpoints.join(',');
+}
+
+/** The public node endpoints of `GH_NETWORK` (a Xahau syncer must not fall back to an XRPL node). */
+function defaultNodeEndpoints(obj: Record<string, unknown>): string {
+  return networkProfileOf(obj).defaultNodeEndpoints.join(',');
+}
+
+/** The default validator list publishers of `GH_NETWORK` (a Xahau syncer must not fall back to the XRPL lists). */
+function defaultUnlPublishersOf(obj: Record<string, unknown>): string {
+  return networkProfileOf(obj).defaultUnlPublishers;
 }
 
 export class SyncerConfig {
@@ -157,7 +239,7 @@ export class SyncerConfig {
   @IsEndpointList()
   validationEndpoints!: string;
 
-  /** `GH_WORKERS`: comma separated subset of `ingest,validations,fee_stats,aggregator`; empty runs none of them. */
+  /** `GH_WORKERS`: comma separated subset of `ingest,validations,fee_stats,aggregator,validators`; empty runs none of them. */
   @ConfigValue()
   @Transform(({ obj, key }) => (typeof obj[key] === 'string' ? obj[key].trim() : defaultOf(key)))
   @ValidateIf((config: SyncerConfig) => config.workers !== '')
@@ -201,14 +283,7 @@ export class SyncerConfig {
 
   /** `GH_RUN_MIGRATIONS_ON_BOOT`: apply the ClickHouse schema before the workers start. */
   @ConfigValue()
-  @Transform(({ obj, key }) => {
-    const raw = rawValue(obj, key)?.toLowerCase();
-    if (raw === undefined) return defaultOf(key);
-    if (raw === 'true' || raw === '1') return true;
-    if (raw === 'false' || raw === '0') return false;
-    return raw; // not a boolean: IsBoolean rejects it
-  })
-  @IsBoolean({ message: 'GH_RUN_MIGRATIONS_ON_BOOT must be true or false' })
+  @BoolValue()
   runMigrationsOnBoot: boolean = false;
 
   /** `GH_HTTP_API_PORT`: liveliness probe. */
@@ -225,6 +300,46 @@ export class SyncerConfig {
   @ConfigValue()
   @IntValue({ min: 0 })
   maxLagHealthy: number = 10;
+
+  /**
+   * `GH_UNL_PUBLISHERS`: comma separated `url=publicKey` validator list publishers of the `validators` worker (see
+   * `parseUnlPublishers`). Unset: the default publishers of `network`. Set but empty: no lists, so every validator is untrusted.
+   */
+  @ConfigValue()
+  @MaybeEmptyText(defaultUnlPublishersOf)
+  @IsUnlPublishers()
+  unlPublishers!: string;
+
+  /** `GH_UNL_THRESHOLD`: lists that must name a validator for it to be trusted; 0 is rippled's rule (see `unlThresholdOf`). */
+  @ConfigValue()
+  @IntValue({ min: 0 })
+  @IsWithinPublishers()
+  unlThreshold: number = 0;
+
+  /** `GH_UNL_REFRESH_MS`: refresh interval of a list that gives no `refresh_interval`. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  unlRefreshMs: number = 300000;
+
+  /** `GH_DOMAIN_VERIFICATION`: `false` skips the checks of validator domains (a host without outbound HTTPS). */
+  @ConfigValue()
+  @BoolValue()
+  domainVerification: boolean = true;
+
+  /** `GH_DOMAIN_RECHECK_MS`: how long a definite domain result stands before it is checked again. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  domainRecheckMs: number = 21600000;
+
+  /** `GH_DOMAIN_FETCH_TIMEOUT_MS`: overall timeout of one TOML fetch, redirects included. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  domainFetchTimeoutMs: number = 10000;
+
+  /** `GH_AMENDMENTS_CONFIG`: path of the amendment metadata file; empty is the file shipped as `config/amendments/<network>.json`. */
+  @ConfigValue()
+  @MaybeEmptyText()
+  amendmentsConfig: string = '';
 }
 
 /** An instance holds the defaults (the property initializers) for the decorators above. */
@@ -257,6 +372,22 @@ function parseWorkers(csv: string): WorkerName[] {
     }
   }
   return names as WorkerName[];
+}
+
+/**
+ * The validator list publishers of `cfg.unlPublishers`, parsed. A syncer that booted holds a valid text, so this does not
+ * throw there; an invalid one throws `GH_UNL_PUBLISHERS entry <n>: <why>`.
+ */
+export function unlPublishersOf(cfg: Pick<SyncerConfig, 'unlPublishers'>): UnlPublisherConfig[] {
+  return parseUnlPublishers(cfg.unlPublishers);
+}
+
+/**
+ * The number of lists that must name a validator for it to be trusted: `GH_UNL_THRESHOLD`, or when that is 0 rippled's rule
+ * for the number of publishers (`defaultUnlThreshold`).
+ */
+export function unlThresholdOf(cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlThreshold'>): number {
+  return cfg.unlThreshold > 0 ? cfg.unlThreshold : defaultUnlThreshold(unlPublishersOf(cfg).length);
 }
 
 /** The workers named by `cfg.workers`. An empty list enables none; an unknown name throws `Unknown worker "<name>"`. */

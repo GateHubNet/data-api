@@ -16,7 +16,9 @@ truth are
   `ws://` / `wss://`, `GH_NETWORK` other than `xrpl` / `xahau`) prints a message that **names the variable** and stops the
   process with a non-zero exit status. Integers are plain decimal digits: `1.5`, `1e3` and `abc` are rejected.
 - An unset or blank variable takes the default of the table. A variable that may be empty (`GH_API_KEYS`,
-  `GH_RATE_LIMIT_KEYS`, `GH_CORS_ORIGINS`, `GH_CACHE_CONTROL`, `GH_WORKERS`) is empty when it is set to the empty string.
+  `GH_RATE_LIMIT_KEYS`, `GH_CORS_ORIGINS`, `GH_CACHE_CONTROL`, `GH_WORKERS`, `GH_UNL_PUBLISHERS`, `GH_AMENDMENTS_CONFIG`) is
+  empty when it is set to the empty string. For `GH_UNL_PUBLISHERS` that is not the default but a setting of its own: no validator
+  lists.
 - **Env files.** Without `GH_ENV` the toolbox loads `.env` (or `.env.$NODE_ENV` when `NODE_ENV` is set) from the working
   directory and **refuses to start when that file is missing**. That is what you want when running from source
   (`cp apps/api/.env.example apps/api/.env`). In containers the variables come from the environment: the images set
@@ -66,6 +68,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_CACHE_CONTROL` | `private, max-age=60` | `Cache-Control` of successful `/v2/*` responses (printable ASCII); empty sends none. Errors are always `no-store`. `private` because the answers are key-gated: a shared cache that ignores the API key would serve them to anybody (Ruling R109); behind a CDN that keys on the API key, `public` is an option. The live routes `/balances` and `/orders` send `private, max-age=<GH_LIVE_CACHE_TTL_MS in seconds>` (`no-store` when it is 0) instead (R108). |
 | `GH_LIVE_CACHE_TTL_MS` | `10000` | How long the live-node answers (balances, orders) are cached in memory; 0 disables the cache. Their `Cache-Control` follows it: `private, max-age=<it in whole seconds>`, `no-store` at 0. |
 | `GH_TX_CACHE_SIZE` | `20000` | Serialized transactions (decoded JSON and binary hex) kept in memory by hash, to spare the codec on repeated requests; a transaction never changes so nothing expires; each entry is a few KB. 0 disables. |
+| `GH_AMENDMENTS_CONFIG` | empty: the file shipped as `config/amendments/<network>.json` | Path of the amendment metadata file (names, descriptions, specifications) behind `/v2/network/amendments`. The syncer reads the same variable ([section 5](#5-syncer-appssyncer)): give both the same file, or the API and the syncer name an amendment differently. Empty counts as the shipped file. |
 | `GH_SERVICE_NAME`, `GH_SERVICE_DESCRIPTION`, `GH_SERVICE_VERSION` | `data-api`, `Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.`, the package version | The title of the Swagger document (read by the toolbox bootstrap; the API fills in the defaults). Optional. The syncer has no Swagger and ignores them. |
 
 ## 5. Syncer (`apps/syncer`)
@@ -73,7 +76,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GH_VALIDATION_ENDPOINTS` | the value of `GH_NODE_ENDPOINTS` | Nodes the validations collector subscribes to, one client per endpoint (each is a distinct reporter). Use several independent nodes for a good validations picture. |
-| `GH_WORKERS` | `ingest,validations,fee_stats,aggregator` | Comma separated subset of the four workers; empty runs none. An unknown name fails the boot (`Unknown worker "x"`). Run **exactly one syncer per network and database**; see [syncer](syncer.md). |
+| `GH_WORKERS` | `ingest,validations,fee_stats,aggregator,validators` | Comma separated subset of the five workers; empty runs none. An unknown name fails the boot (`Unknown worker "x"`). Run **exactly one syncer per network and database**; see [syncer](syncer.md). |
 | `GH_SYNC_START_LEDGER` | unset: the validated head at the first boot | Where the very first run starts. **Ignored once the database has a committed ledger.** |
 | `GH_LEDGER_FETCH_TIMEOUT_MS` | `120000` | Timeout of one expanded `ledger` request (a busy ledger is big). |
 | `GH_CATCHUP_CONCURRENCY` | `4` | Ledgers the **live runner** fetches in parallel while catching up. Observed on the public nodes: `wss://s2.ripple.com` did not throttle a first sync at 2; `wss://xahau.network` throttles even at 1, which the syncer waits out (see [syncer](syncer.md#rate-limits)). Raise it with your own node. It is not read by `range-ingest`, which has its own `--concurrency` flag (default 8; see [backfill](backfill.md#public-nodes-and-rate-limits) for public nodes). |
@@ -83,6 +86,13 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_RUN_MIGRATIONS_ON_BOOT` | `false` | Apply the schema before the workers start (`true`/`1`/`false`/`0`). Convenient for a single dev process; the compose files leave it `false` because the `migrate-<network>` job owns the schema. |
 | `GH_MAX_LAG_HEALTHY` | `10` | `/liveliness/healthz` answers 503 when the ingest lag (validated head minus committed checkpoint, in ledgers) stays above this for more than 60 s. |
 | `GH_MARKETS_CONFIG` | the file shipped as `config/markets/<network>.json` | Path of the markets config (versioned list of trade markets and payment currencies) of the aggregator's volume jobs. Per network: with two syncers use two files. Empty counts as unset. |
+| `GH_UNL_PUBLISHERS` | XRPL: `https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1`; Xahau: `https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8` | The validator list publishers of the `validators` worker: comma separated `url=key` pairs, split at the last `=`. The URL is `https://`; the key is 66 hex digits starting `ED`, `02` or `03`; no URL or key twice. An invalid entry fails the boot with `GH_UNL_PUBLISHERS entry <n>: <why>`. **Unset takes the default of `GH_NETWORK`; set but empty means no lists**, so every validator is untrusted. |
+| `GH_UNL_THRESHOLD` | `0` | Lists that must name a validator for it to be trusted. `0` is rippled's rule: 1 below three publishers, else half of them plus one (rounded down). At most the number of publishers, or the boot fails. |
+| `GH_UNL_REFRESH_MS` | `300000` | Refresh interval of a validator list that gives no `refresh_interval`. At least 1. |
+| `GH_DOMAIN_VERIFICATION` | `true` | `true`/`1`/`false`/`0`. `false` skips the checks of the domains validators claim (a host without outbound HTTPS); the domains then show `pending`. |
+| `GH_DOMAIN_RECHECK_MS` | `21600000` (6 h) | How long a definite domain result stands before the domain is checked again. At least 1. |
+| `GH_DOMAIN_FETCH_TIMEOUT_MS` | `10000` | Overall timeout of one TOML fetch, redirects included. At least 1. |
+| `GH_AMENDMENTS_CONFIG` | empty: the file shipped as `config/amendments/<network>.json` | Path of the amendment metadata file the `validators` worker reads. The API reads the same variable ([section 4](#4-api-appsapi)): give both the same file. Empty counts as the shipped file. |
 
 ## 6. Other variables
 
@@ -103,6 +113,8 @@ variables above, per network.
 | `XRPL_VALIDATION_ENDPOINTS`, `XAHAU_VALIDATION_ENDPOINTS` | prod, dev | empty (= the node endpoints) | `GH_VALIDATION_ENDPOINTS` of the syncer |
 | `XRPL_SYNC_START_LEDGER`, `XAHAU_SYNC_START_LEDGER` | prod, dev | empty (= the validated head) | `GH_SYNC_START_LEDGER` of the syncer |
 | `XRPL_MARKETS_CONFIG`, `XAHAU_MARKETS_CONFIG` | prod | empty (= the shipped file) | `GH_MARKETS_CONFIG` of the syncer; the file must be mounted into the container (a commented `volumes:` line shows how) |
+| `XRPL_UNL_PUBLISHERS`, `XAHAU_UNL_PUBLISHERS` | prod, dev | empty (= the default publishers of the network, spelled out in the compose file) | `GH_UNL_PUBLISHERS` of the syncer. An empty `GH_UNL_PUBLISHERS` would mean "no lists", so compose never passes an empty one on: this variable falls back to the default text. |
+| `XRPL_AMENDMENTS_CONFIG`, `XAHAU_AMENDMENTS_CONFIG` | prod, dev | empty (= the shipped file) | `GH_AMENDMENTS_CONFIG` of the network's syncer **and** api; the file must be mounted into both containers (a commented `volumes:` line in each shows how) |
 | `GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD` | prod, dev | prod: `data_api` and **required**; dev: `default` and empty | The ClickHouse server's user (`CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`) and the login of every client |
 | `GH_API_KEYS` | prod, dev | prod: **required**; dev: `dev-api-key` | `GH_API_KEYS` of the apis |
 | `IMAGE_TAG` | prod, dev | prod `latest`, dev `dev` | tag of the locally built `gatehub/data-api` and `gatehub/data-syncer` images |
@@ -119,8 +131,8 @@ variable that is unset in the file is not passed on and the application's own de
 | Service | Variables it gets |
 | --- | --- |
 | `migrate-xrpl`, `migrate-xahau` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_NETWORK` |
-| `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
-| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`; `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
+| `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG`, `GH_UNL_PUBLISHERS`, `GH_AMENDMENTS_CONFIG` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`, `GH_UNL_THRESHOLD`, `GH_UNL_REFRESH_MS`, `GH_DOMAIN_VERIFICATION`, `GH_DOMAIN_RECHECK_MS`, `GH_DOMAIN_FETCH_TIMEOUT_MS`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
+| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`, `GH_AMENDMENTS_CONFIG` (from `XRPL_AMENDMENTS_CONFIG` / `XAHAU_AMENDMENTS_CONFIG`); `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
 | `clickhouse` | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` (from `GH_CLICKHOUSE_USER` / `_PASSWORD`) |
 | `nginx` | `TRUSTED_PROXIES`, and the fixed `NGINX_ENVSUBST_*` of the template |
 
@@ -202,4 +214,5 @@ grep -o 'env\.GH_[A-Z_]*' "$ROOT/packages/shared/src/clickhouse/clickhouse.confi
 ```
 
 Every name printed must have a row in this page (and in the matching `.env.example`), and every `GH_*` name in a row must be
-printed or be one of `GH_ENV`, `GH_MARKETS_CONFIG`, `GH_SCHEMA_DIR`, `GH_SERVICE_*`.
+printed or be one of `GH_ENV`, `GH_MARKETS_CONFIG`, `GH_SCHEMA_DIR`, `GH_SERVICE_*`. `GH_AMENDMENTS_CONFIG` is a property of both
+classes: both lists print it, and it has a row in section 4 and in section 5.

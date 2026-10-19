@@ -133,7 +133,21 @@ Prefix `syncer_`.
 | `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `stats_live`, `stats_dirty`, `volume_backfill`) |
 | `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices) that failed; each is retried on the next tick |
 | **`syncer_aggregator_stats_lag_seconds`** | Gauge | | Seconds of ledger history the stats catch-up still has to cover; 0 when the stats are up to the last two hours |
+| `syncer_validators_unl_fetches_total` | Counter | `publisher, outcome` | Validator list fetches: `ok`, `unchanged`, or the reason code of the failure |
+| **`syncer_validators_unl_expiry_seconds`** | Gauge | `publisher` | Seconds until the current list of a publisher expires (negative when it expired) |
+| `syncer_validators_unl_size` | Gauge | `publisher` | Validators on the current list of a publisher |
+| `syncer_validators_domain_checks_total` | Counter | `outcome` | Domain checks: `verified`, or the reason code of the failure |
+| `syncer_validators_node_polls_total` | Counter | `request, outcome` | Node polls of the validators worker: `request` is `amendments`, `negative_unl`, `fee_settings`, `server_info` or `feature`; `outcome` is `ok` or `error` |
+| **`syncer_validators_jobs_total`** | Counter | `job, outcome` | Runs of the `rounds` and `agreement` jobs, `ok` or `error` |
+| **`syncer_validators_agreement_lag_seconds`** | Gauge | | Now minus the end of the newest final hour of validator agreement |
+| **`syncer_validators_rounds_lag_ledgers`** | Gauge | | Newest committed voting ledger minus the newest stored amendment voting round |
+| **`syncer_amendments_without_metadata`** | Gauge | | Amendments seen (node, ledger, votes) without an entry in the amendment metadata file |
+| `syncer_validator_validations_flushed_total` | Counter | `table` | Rows written to `validator_validations` and `validator_seen` |
 | `syncer_process_*`, `syncer_nodejs_*` | | | Default process metrics |
+
+The `syncer_validators_*` and `syncer_amendments_*` metrics are set by the `validators` worker, `syncer_validator_validations_flushed_total`
+by the validations collector. A labelled metric has no series until its first observation: a publisher that was never fetched has no
+`syncer_validators_unl_*` series.
 
 ```promql
 syncer_lag_ledgers                                                  # the number to alert on
@@ -143,6 +157,8 @@ rate(syncer_checkpoint_ledger[5m])                                  # ingest thr
 rate(syncer_aggregator_errors_total[15m]) > 0
 syncer_aggregator_stats_lag_seconds > 3600
 rate(syncer_validations_flushed_total[5m]) == 0                     # XRPL: validators validate every ledger
+syncer_validators_unl_expiry_seconds < 7 * 86400                    # a validator list expires within a week
+rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0        # a rounds or agreement run failed
 ```
 
 The gauges describe what *this process* has done since boot: scrape each network's syncer separately.
@@ -184,6 +200,11 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | **Syncer halted / down** | probe 503 with `state=halted`, `increase(syncer_ingest_halts_total[5m]) > 0`, or `up{job="syncer"} == 0` | Chain break, a ledger the parser rejects, lost lease, or process down |
 | Aggregator failing | `rate(syncer_aggregator_errors_total[15m]) > 0` for 30m | Stats or volumes not refreshing |
 | Aggregator far behind | `syncer_aggregator_stats_lag_seconds > 3600` for 1h | Sweep slower than the data |
+| **Validator list expiring** | `syncer_validators_unl_expiry_seconds < 7 * 86400` | A publisher's list expires within a week (it already has when the value is negative; an expired list is still used, flagged `expired`): check the publisher |
+| Validator agreement behind | `syncer_validators_agreement_lag_seconds > 7200` for 30m | The agreement job has not finalised an hour for over two hours |
+| Voting rounds behind | `syncer_validators_rounds_lag_ledgers > 1024` for 30m | The rounds job is more than four flag intervals behind the committed ledgers |
+| Validators jobs failing | `rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0` for 30m | Rounds or agreement not refreshing |
+| Amendment without metadata | `syncer_amendments_without_metadata > 0` for 1d | The node, the ledger or the votes name an amendment that the metadata file lacks: add its entry (`pnpm --filter @gatehub/data-api-shared amendments:check --network xrpl\|xahau` lists them) |
 | Validations flowing | `rate(syncer_validations_flushed_total[10m]) == 0` for 10m on XRPL | Collector or its nodes down |
 | Fee stats flowing | `rate(syncer_fee_stats_samples_total[10m]) == 0` | Node unreachable |
 | Codec fallback | `increase(api_tx_encode_fallback_total[1h]) > 0` | Definitions out of date for a new transaction type |

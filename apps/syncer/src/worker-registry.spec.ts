@@ -32,6 +32,24 @@ describe('selectWorkerModules', () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('"aggregator"'));
   });
 
+  it('warns about the validators worker, without failing, until its module is registered', () => {
+    const log = logger();
+    const enabled = new Set<WorkerName>(['ingest', 'validators']);
+    expect(selectWorkerModules(enabled, registry, log)).toEqual([IngestStubModule]);
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('"validators"'));
+  });
+
+  it('selects the validators module after the other workers when it is registered', () => {
+    const ValidatorsStubModule = class {};
+    const enabled = new Set<WorkerName>(['validators', 'fee_stats', 'ingest']);
+    expect(selectWorkerModules(enabled, { ...registry, validators: ValidatorsStubModule }, logger())).toEqual([
+      IngestStubModule,
+      FeesStubModule,
+      ValidatorsStubModule,
+    ]);
+  });
+
   it('accepts dynamic modules', () => {
     const dynamic = { module: IngestStubModule, providers: [] };
     expect(selectWorkerModules(new Set<WorkerName>(['ingest']), { ingest: dynamic }, logger())).toEqual([dynamic]);

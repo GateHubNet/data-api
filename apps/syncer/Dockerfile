@@ -41,7 +41,7 @@ RUN --mount=type=secret,id=npm_token,required=true \
   && pnpm --filter @gatehub/data-syncer build \
   && pnpm --filter @gatehub/data-syncer --legacy deploy --prod /app/out \
   && for f in dist/clickhouse/migrate.js schema/001_baseline.sql config/markets/xrpl.json config/markets/xahau.json \
-    config/definitions/xrpl.json config/definitions/xahau.json; do \
+    config/amendments/xrpl.json config/amendments/xahau.json config/definitions/xrpl.json config/definitions/xahau.json; do \
     test -f "/app/out/node_modules/@gatehub/data-api-shared/$f" || { echo "missing $f in the deployed shared package"; exit 1; }; \
   done \
   && test -f /app/out/dist/cli/range-ingest.js
@@ -52,7 +52,7 @@ WORKDIR /app
 # unless GH_ENV is set to anything: then the configuration comes from the environment only (compose `environment`).
 ENV NODE_ENV=production \
   GH_ENV=container
-# The shared package ships schema/ (migrations) and config/ (markets, binary-codec definitions) next to its dist/.
+# The shared package ships schema/ (migrations) and config/ (markets, amendments, binary-codec definitions) next to its dist/.
 COPY --from=builder --chown=node:node /app/out/package.json ./package.json
 COPY --from=builder --chown=node:node /app/out/dist ./dist
 COPY --from=builder --chown=node:node /app/out/node_modules ./node_modules
