@@ -7,8 +7,14 @@
 // Ramps virtual users across the read endpoints (all of them exist in apps/api) and asserts latency/error thresholds. The paths
 // need the synthetic data of load/seed.js (USD/EUR of rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq, BTC of rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B,
 // the native currency). Raise GH_RATE_LIMIT of the API for the run: one client address makes all the requests.
+//
+// The group `aggregates` is the five routes of the account and market aggregates (ADR-0013): the four routes under
+// /v2/accounts/{ACCOUNT}/analytics/ and /v2/network/markets, a share of the requests (AGGREGATE_SHARE, default 0.3) and a
+// threshold of their own. ACCOUNT is the account the seeder prints; the window is the last 30 days, per day. An account that
+// has rollups (see load/README.md) is read from them. /v2/network/markets answers an empty 200 until a syncer's aggregator has
+// written the sets.
+import { check, group, sleep } from 'k6';
 import http from 'k6/http';
-import { check, sleep } from 'k6';
 import { Rate } from 'k6/metrics';
 
 const errors = new Rate('errors');
@@ -17,6 +23,7 @@ const KEY = __ENV.API_KEY || '';
 const ACCOUNT = __ENV.ACCOUNT || 'rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq';
 const FIRST_LEDGER = Number(__ENV.FIRST_LEDGER || 90000000);
 const LEDGERS = Number(__ENV.LEDGERS || 20000);
+const AGGREGATE_SHARE = Number(__ENV.AGGREGATE_SHARE || 0.3);
 
 export const options = {
   scenarios: {
@@ -33,6 +40,7 @@ export const options = {
   },
   thresholds: {
     http_req_duration: ['p(95)<500', 'p(99)<1500'],
+    'http_req_duration{group:::aggregates}': ['p(95)<500', 'p(99)<1500'],
     errors: ['rate<0.01'],
     http_req_failed: ['rate<0.01'],
   },
@@ -64,13 +72,32 @@ const endpoints = [
   () => `${BASE}/v2/accounts/${ACCOUNT}/balance_changes?limit=100`,
 ];
 
-export default function () {
-  const url = pick(endpoints)();
+// The routes of the account and market aggregates, for the account of the seeder over the last 30 days (the seeded ledgers end now).
+const DAY_MS = 86_400_000;
+const START = new Date(Date.now() - 29 * DAY_MS).toISOString().slice(0, 10);
+const aggregates = [
+  () => `${BASE}/v2/accounts/${ACCOUNT}/analytics/balances?interval=day&start=${START}`,
+  () => `${BASE}/v2/accounts/${ACCOUNT}/analytics/balance_changes?interval=day&start=${START}`,
+  () => `${BASE}/v2/accounts/${ACCOUNT}/analytics/balance_changes?start=${START}`,
+  () => `${BASE}/v2/accounts/${ACCOUNT}/analytics/counterparties?limit=6&start=${START}`,
+  () => `${BASE}/v2/accounts/${ACCOUNT}/analytics/exchanges?start=${START}`,
+  () => `${BASE}/v2/network/markets?period=day`,
+];
+
+function get(url) {
   const res = http.get(url, params);
   const ok = check(res, {
     'status 200': (r) => r.status === 200,
     'has body': (r) => r.body && r.body.length > 0,
   });
   errors.add(!ok);
+}
+
+export default function () {
+  if (Math.random() < AGGREGATE_SHARE) {
+    group('aggregates', () => get(pick(aggregates)()));
+  } else {
+    get(pick(endpoints)());
+  }
   sleep(Math.random() * 0.5);
 }
