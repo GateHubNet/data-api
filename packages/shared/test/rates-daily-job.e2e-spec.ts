@@ -499,10 +499,17 @@ describe('daily native rates of a day and the rates_daily sets (e2e)', () => {
       expect(onExchanges[1].sql).toMatch(/LIMIT 1 BY/);
       expect(onExchanges[1].sql).toMatch(/row_number\(\) OVER/);
       expect(onExchanges[0].params).toMatchObject({ native: 'XRP' });
-      // the second read asks for the pairs of the XRP service only: the pairs against XAH are none of its business
-      const asked = onExchanges[1].params as Record<'pair0' | 'pair2', string[]>;
-      expect([...asked.pair0, ...asked.pair2]).toContain('XRP');
-      expect([...asked.pair0, ...asked.pair2]).not.toContain('XAH');
+      // the second read selects its pairs itself, with the filter of the first (the native pairs of the XRP service only: the
+      // pairs against XAH are none of its business), so that no pair travels as a parameter, however many there are (a
+      // client puts them in the URL, which is limited to 1 MiB)
+      const asked = onExchanges[1].params as Record<string, unknown>;
+      expect(asked).toMatchObject({ native: 'XRP' });
+      expect(Object.values(asked).filter(Array.isArray)).toEqual([]);
+      expect(onExchanges[1].sql).toMatch(
+        /IN \(\s*SELECT base_currency, base_issuer, counter_currency, counter_issuer\s+FROM exchanges/,
+      );
+      expect(onExchanges[1].sql).toContain('base_currency = {native:String}');
+      expect(onExchanges[1].sql).not.toMatch(/arrayZip|\{pair\d:/);
 
       // no ledger in the 15 days: no read of the exchanges; no native pair in them: the first read only
       spy.mockClear();

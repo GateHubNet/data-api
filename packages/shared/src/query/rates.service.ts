@@ -421,7 +421,9 @@ export class RatesService {
    * asset. The map holds the assets whose rate is above 0 (an asset that is not in it has none), keyed by `assetKey`.
    *
    * (1) The native pairs that traded in the ledgers of `[day - 14 days, day + 1 day)`. (2) The rows of those pairs in that
-   * range, each once (`LIMIT 1 BY` the key), numbered newest first within their pair. Over them, twice per pair, the sums
+   * range, each once (`LIMIT 1 BY` the key), numbered newest first within their pair; the pairs are selected by a subquery of
+   * the table itself (the same range and filter as (1)), not bound as parameters: a client sends parameters in the URL, which
+   * is limited to 1 MiB, and the native pairs of 15 days can be many thousands. Over them, twice per pair, the sums
    * of the trades that count (a native leg of more than 0.0005): the "latest" part is the newest 50 rows (dust included in
    * the 50, left out of the sums, as `sums` does), the "daily" part the rows from the first ledger of the day. The rate is
    * `combineRates` of the vwaps, the latest one counted only with 10 kept trades among the newest 50, oriented native → asset.
@@ -458,7 +460,6 @@ export class RatesService {
     }
     if (candidates.size === 0) return out;
 
-    const pairs = [...candidates.values()].map((c) => c.stored);
     const rows = await this.ch.query<PairSumsRow & { part: 'daily' | 'latest' }>(
       `SELECT ${PAIR_COLUMNS.join(', ')}, part, ${volumeColumns(KEEP_ANY_PAIR)}
          FROM (SELECT ${PAIR_COLUMNS.join(', ')}, ledger_index, base_exact, counter_exact, base_amount_f, counter_amount_f,
@@ -467,7 +468,10 @@ export class RatesService {
                  FROM (SELECT ${KEY_COLUMNS.join(', ')}, ${VOLUME_SOURCE_COLUMNS}
                          FROM ${Table.Exchanges}
                         WHERE (${PAIR_COLUMNS.join(', ')}) IN (
-                              SELECT arrayJoin(arrayZip({pair0:Array(String)}, {pair1:Array(String)}, {pair2:Array(String)}, {pair3:Array(String)})))
+                              SELECT ${PAIR_COLUMNS.join(', ')}
+                                FROM ${Table.Exchanges}
+                               WHERE ledger_index BETWEEN {min:UInt32} AND {max:UInt32} AND ${NATIVE_PAIR_FILTER}
+                               GROUP BY ${PAIR_COLUMNS.join(', ')})
                           AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
                         ORDER BY ${orderBy(false)}
                         LIMIT 1 BY ${KEY_COLUMNS.join(', ')}))
@@ -475,10 +479,7 @@ export class RatesService {
         WHERE (part = 'latest' AND newest_rank <= {latest:UInt32}) OR (part = 'daily' AND ledger_index >= {day_min:UInt32})
         GROUP BY ${PAIR_COLUMNS.join(', ')}, part`,
       {
-        pair0: pairs.map((p) => p.base.currency),
-        pair1: pairs.map((p) => p.base.issuer ?? ''),
-        pair2: pairs.map((p) => p.counter.currency),
-        pair3: pairs.map((p) => p.counter.issuer ?? ''),
+        native: this.nativeCurrency,
         min: range.min,
         max: range.max,
         latest: LATEST_TRADES,

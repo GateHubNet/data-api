@@ -442,3 +442,65 @@ describe('RatesService.dailyNativeRates', () => {
     expect(query).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('RatesService.dailyNativeRatesOfDay', () => {
+  const day = new Date('2016-06-02T00:00:00Z');
+  const pair = (currency: string) => ({
+    base_currency: currency,
+    base_issuer: ISSUER,
+    counter_currency: 'XRP',
+    counter_issuer: '',
+  });
+
+  it('the rate of an asset is the average of its daily and its latest rate, read for the pairs that traded', async () => {
+    const { ch, query } = fakeClickHouse((params) =>
+      // the read of the pairs has no `latest`; the read of their trades has it
+      params.latest === undefined
+        ? [pair('USD')]
+        : [
+            { ...pair('USD'), part: 'daily', ...sums(3, '10', '20') },
+            { ...pair('USD'), part: 'latest', ...sums(12, '10', '40') },
+          ],
+    );
+    const out = await new RatesService(ch, 'XRP').dailyNativeRatesOfDay(day);
+    // XRP -> USD is stored as USD/XRP, inverted: the day's 10 USD for 20 XRP is 0.5 USD per XRP, the last 50 are 0.25
+    expect([...out.keys()]).toEqual([`USD.${ISSUER}`]);
+    expect(out.get(`USD.${ISSUER}`)).toMatchObject({ dailyCount: 3, latestCount: 12 });
+    expect(out.get(`USD.${ISSUER}`)?.rate.toFixed()).toBe('0.375');
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it('selects the pairs of its second read with a subquery of the exchanges: no pair is bound as a parameter, whatever their number', async () => {
+    // 12,000 native pairs: as four arrays in the URL they were over the 1 MiB it is limited to
+    const traded = Array.from({ length: 12_000 }, (_, i) => pair(`C${String(i).padStart(5, '0')}`));
+    const { ch, query } = fakeClickHouse((params) => (params.latest === undefined ? traded : []));
+    const out = await new RatesService(ch, 'XRP').dailyNativeRatesOfDay(day);
+    expect(out.size).toBe(0);
+
+    const [[read1, params1], [read2, rawParams2]] = query.mock.calls;
+    const params2 = rawParams2 ?? {};
+    expect(params1).toEqual({ native: 'XRP', min: 100, max: 200 });
+    // the second read binds only what it needs, and the pairs come from the table, in the same range and with the same filter
+    expect(Object.keys(params2).sort()).toEqual(['day_min', 'latest', 'max', 'min', 'native']);
+    expect(Object.values(params2).some(Array.isArray)).toBe(false);
+    expect(JSON.stringify(params2).length).toBeLessThan(200);
+    expect(read2).not.toMatch(/arrayZip|\{pair\d:/);
+    expect(read2).toMatch(
+      /\(base_currency, base_issuer, counter_currency, counter_issuer\) IN \(\s*SELECT base_currency, base_issuer, counter_currency, counter_issuer\s+FROM exchanges\s+WHERE ledger_index BETWEEN \{min:UInt32\} AND \{max:UInt32\} AND \(\(base_issuer = '' AND base_currency = \{native:String\}\)/,
+    );
+    expect(read1).toMatch(/GROUP BY base_currency, base_issuer, counter_currency, counter_issuer/);
+  });
+
+  it('asks nothing more when no native pair traded, and for a day without ledgers', async () => {
+    const none = fakeClickHouse(() => []);
+    expect((await new RatesService(none.ch, 'XRP').dailyNativeRatesOfDay(day)).size).toBe(0);
+    expect(none.query).toHaveBeenCalledTimes(1);
+
+    const noLedgers = fakeClickHouse(
+      () => [pair('USD')],
+      () => undefined,
+    );
+    expect((await new RatesService(noLedgers.ch, 'XRP').dailyNativeRatesOfDay(day)).size).toBe(0);
+    expect(noLedgers.query).not.toHaveBeenCalled();
+  });
+});
