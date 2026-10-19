@@ -233,12 +233,20 @@ describe('account reports API endpoint', () => {
   let get: ApiClient['get'];
 
   beforeAll(async () => {
-    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    h = await startHarness({
+      seed: 'ripple-mock',
+      env: NO_RATE_LIMIT,
+      controllers: async () => (await import('./cache-controllers')).CACHE_CONTROLLERS,
+    });
     api = await h.api();
     get = api.get;
   });
   afterAll(async () => {
     await h?.close();
+  });
+  // the rates computed on read are kept for a minute: a test that counts the reads of the trades starts without them
+  beforeEach(async () => {
+    await api.ok('/v2/test-cache/clear', 'result');
   });
   afterEach(() => jest.restoreAllMocks());
 
@@ -1039,7 +1047,11 @@ describe('account reports API endpoint when rows were written twice', () => {
     Number((await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${table}`))[0].n);
 
   beforeAll(async () => {
-    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    h = await startHarness({
+      seed: 'ripple-mock',
+      env: NO_RATE_LIMIT,
+      controllers: async () => (await import('./cache-controllers')).CACHE_CONTROLLERS,
+    });
     api = await h.api();
     once = [];
     for (const url of requests) once.push((await okBody(api, url, 'reports')).body);
@@ -1053,6 +1065,10 @@ describe('account reports API endpoint when rows were written twice', () => {
   });
   afterAll(async () => {
     await h?.close();
+  });
+  // the rates computed on read are kept for a minute: a test that counts the reads of the trades starts without them
+  beforeEach(async () => {
+    await api.ok('/v2/test-cache/clear', 'result');
   });
 
   it('counts every payment once: the same reports as before the copy', async () => {
@@ -1203,7 +1219,11 @@ describe('account reports computed from synthetic ledgers', () => {
     (await okBody(api, `${path(A, day)}${extra}`, 'reports')).body.reports[0];
 
   beforeAll(async () => {
-    h = await startHarness({ seed: 'none', env: NO_RATE_LIMIT });
+    h = await startHarness({
+      seed: 'none',
+      env: NO_RATE_LIMIT,
+      controllers: async () => (await import('./cache-controllers')).CACHE_CONTROLLERS,
+    });
     api = await h.api();
     // ledger indexes follow close times
     const times = [...new Set([...PAYS.map((p) => Date.parse(p.time)), ...TRADES.map((t) => t.time)])].sort(
@@ -1271,6 +1291,10 @@ describe('account reports computed from synthetic ledgers', () => {
   });
   afterAll(async () => {
     await h?.close();
+  });
+  // the rates computed on read are kept for a minute: a test that counts the reads of the trades starts without them
+  beforeEach(async () => {
+    await api.ok('/v2/test-cache/clear', 'result');
   });
 
   it('has a report for each of the 21 days, in order, and zeros where nothing happened', async () => {
@@ -1424,11 +1448,20 @@ describe('account reports on Xahau (XAH is the native currency)', () => {
   let api: ApiClient;
 
   beforeAll(async () => {
-    h = await startHarness({ network: 'xahau', seed: 'xahau-recorded', env: NO_RATE_LIMIT });
+    h = await startHarness({
+      network: 'xahau',
+      seed: 'xahau-recorded',
+      env: NO_RATE_LIMIT,
+      controllers: async () => (await import('./cache-controllers')).CACHE_CONTROLLERS,
+    });
     api = await h.api();
   });
   afterAll(async () => {
     await h?.close();
+  });
+  // the rates computed on read are kept for a minute: a test that counts the reads of the trades starts without them
+  beforeEach(async () => {
+    await api.ok('/v2/test-cache/clear', 'result');
   });
 
   it('counts XAH as itself, summed exactly', async () => {
