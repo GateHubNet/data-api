@@ -1,10 +1,14 @@
 import {
+  AmendmentFeaturesRow,
+  amendmentId,
   AmendmentTalliesRow,
   ClickHouseService,
   LedgersRow,
   NetworkName,
   NetworkStateRow,
   Table,
+  TransactionsRow,
+  TxByTypeRow,
   UnlListsRow,
   UnlPublishersRow,
   ValidatorAgreementHourlyRow,
@@ -14,6 +18,7 @@ import {
   ValidatorValidationsRow,
   ValidatorVotesRow,
 } from '@gatehub/data-api-shared';
+import { createHash } from 'node:crypto';
 import { testKey, TestKey } from '../../../../packages/shared/src/test-utils/validator-keys';
 
 /**
@@ -243,10 +248,14 @@ export interface SeedRound {
   version?: number | string;
   unl: string[];
   negativeUnl?: string[];
+  /** The validators of the UNL with a record. Default: all of the UNL. */
+  trusted?: number;
   observed?: number;
   fees?: { base_fee: number; reserve_base: number; reserve_inc: number };
   /** The votes of the round, by (master or signing) key. */
   votes?: SeedVote[];
+  /** The tally rows of the round: the amendments with yes votes (or in `Majorities`). */
+  tallies?: { id: string; yes: number }[];
 }
 
 export interface SeedVote {
@@ -259,7 +268,7 @@ export interface SeedVote {
   serverVersion?: string | null;
 }
 
-/** The votes first, then the sentinel last, as the rounds job writes them. */
+/** The votes and the tallies first, then the sentinel last, as the rounds job writes them. */
 export async function insertRound(ch: Ch, round: SeedRound): Promise<void> {
   const version = round.version ?? Date.now();
   const fees = round.fees ?? { base_fee: 10, reserve_base: 1_000_000, reserve_inc: 200_000 };
@@ -277,13 +286,14 @@ export async function insertRound(ch: Ch, round: SeedRound): Promise<void> {
     version,
   }));
   await ch.insert(Table.ValidatorVotes, votes);
+  const trusted = round.trusted ?? round.unl.length;
   const sentinel: AmendmentTalliesRow = {
     ledger_index: round.ledgerIndex,
     amendment_id: '',
     close_time: round.closeTime,
     yes: 0,
-    trusted: round.unl.length,
-    threshold: Math.max(1, Math.floor((round.unl.length * 80) / 100)),
+    trusted,
+    threshold: Math.max(1, Math.floor((trusted * 80) / 100)),
     unl_size: round.unl.length,
     observed: round.observed ?? round.unl.length,
     unl: round.unl,
@@ -291,7 +301,86 @@ export async function insertRound(ch: Ch, round: SeedRound): Promise<void> {
     ...fees,
     version,
   };
+  await ch.insert(
+    Table.AmendmentTallies,
+    (round.tallies ?? []).map(
+      (tally): AmendmentTalliesRow => ({
+        ...sentinel,
+        amendment_id: tally.id,
+        yes: tally.yes,
+        unl: [],
+        negative_unl: [],
+      }),
+    ),
+  );
   await ch.insert(Table.AmendmentTallies, [sentinel]);
+}
+
+/** What the node says of amendments (`feature`): the name, which may be empty, and whether it supports it. */
+export function insertFeatures(
+  ch: Ch,
+  rows: (Pick<AmendmentFeaturesRow, 'amendment_id' | 'polled_at'> & Partial<AmendmentFeaturesRow>)[],
+): Promise<void> {
+  return ch.insert(
+    Table.AmendmentFeatures,
+    rows.map((row): AmendmentFeaturesRow => ({ name: '', supported: 1, ...row })),
+  );
+}
+
+/** An `EnableAmendment` pseudo-transaction as the index holds it: the ledger of it, and what it did (its flags). */
+export interface SeedEnableAmendment {
+  amendment: string;
+  /** 0 enables, 0x10000 is tfGotMajority, 0x20000 tfLostMajority. */
+  flags: number;
+  ledgerIndex: number;
+  closeTime: number;
+  /** Default: made from the other fields. */
+  hash?: string;
+  /** Leave `Flags` out of the transaction, as a transaction that enables has no use for it. */
+  withoutFlags?: boolean;
+}
+
+/** The hash a seeded `EnableAmendment` gets: upper-case hex of the ledger, the amendment and the flags. */
+export const enableHash = (ledgerIndex: number, amendment: string, flags: number): string =>
+  createHash('sha256').update(`${ledgerIndex}:${amendment}:${flags}`).digest('hex').toUpperCase();
+
+export async function insertEnableAmendments(ch: Ch, rows: SeedEnableAmendment[]): Promise<void> {
+  const transactions = rows.map(
+    (row): TransactionsRow => ({
+      ledger_index: row.ledgerIndex,
+      tx_index: 0,
+      hash: row.hash ?? enableHash(row.ledgerIndex, row.amendment, row.flags),
+      tx_type: 'EnableAmendment',
+      result: 'tesSUCCESS',
+      account: 'rrrrrrrrrrrrrrrrrrrrrhoLvTp',
+      sequence: 0,
+      fee: 0,
+      close_time: row.closeTime,
+      tx_json: JSON.stringify({
+        Account: 'rrrrrrrrrrrrrrrrrrrrrhoLvTp',
+        Amendment: row.amendment,
+        Fee: '0',
+        ...(row.withoutFlags ? {} : { Flags: row.flags }),
+        LedgerSequence: row.ledgerIndex - 1,
+        Sequence: 0,
+        SigningPubKey: '',
+        TransactionType: 'EnableAmendment',
+      }),
+      meta_json: '{}',
+    }),
+  );
+  await ch.insert(Table.Transactions, transactions);
+  await ch.insert(
+    Table.TxByType,
+    rows.map(
+      (row): TxByTypeRow => ({
+        tx_type: 'EnableAmendment',
+        ledger_index: row.ledgerIndex,
+        tx_index: 0,
+        result: 'tesSUCCESS',
+      }),
+    ),
+  );
 }
 
 /** One hour as `validator_agreement_hourly` holds it: the rows of the keys first, the sentinel last, under one version. */
@@ -614,5 +703,268 @@ export async function seedFleet(ch: ClickHouseService, options: FleetOptions = {
     newestHour,
     roundClose,
     roundLedger,
+  };
+}
+
+// -- the amendment board ------------------------------------------------------------------------------------------------
+
+/**
+ * The amendments of the board's metadata file, `test/support/amendments-xrpl.json` (hand-written for the tests: the names
+ * and the figures in it are made up, none is recorded from the network).
+ */
+export const BOARD_NAMES = {
+  enabledLedger: 'TestEnabledLedger',
+  enabledFile: 'TestEnabledFile',
+  majority: 'TestMajority',
+  voting: 'TestVoting',
+  idle: 'TestVotingIdle',
+  obsolete: 'TestObsolete',
+} as const;
+
+/**
+ * The IDs of the board. The ones of the file are the SHA-512Half of their names; the others are not in the file: a name only
+ * the node gives, none at all, the one mainnet's majority has (F10).
+ */
+export const BOARD_IDS = {
+  enabledLedger: amendmentId(BOARD_NAMES.enabledLedger),
+  enabledFile: amendmentId(BOARD_NAMES.enabledFile),
+  majority: amendmentId(BOARD_NAMES.majority),
+  voting: amendmentId(BOARD_NAMES.voting),
+  idle: amendmentId(BOARD_NAMES.idle),
+  obsolete: amendmentId(BOARD_NAMES.obsolete),
+  /** In `Majorities`, named by nobody, no `EnableAmendment` indexed (G5). */
+  majorityNameless: '98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76',
+  /** Named by the node only, voted for by one validator of the UNL. */
+  nodeOnly: '11'.repeat(32),
+  /** Listed by the node without a name, voted for by nobody. */
+  unknown: '22'.repeat(32),
+  /** The node does not support it and nobody votes yes. */
+  obsoleteNode: '33'.repeat(32),
+  /** The node does not support it but two validators of the UNL vote yes. */
+  unsupportedVoted: '44'.repeat(32),
+  /** No name; voted for only by a validator that is not on the UNL. */
+  votedByOther: '55'.repeat(32),
+  /** Enabled in the ledger, and no source says when. */
+  enabledBare: '66'.repeat(32),
+  /** Voted for by a validator only before the last 30 days. */
+  votedLongAgo: '77'.repeat(32),
+} as const;
+
+/** The yes votes of each amendment in the four newest rounds, oldest (round 3) to newest (round 0). */
+const BOARD_YES: Record<string, [number, number, number, number]> = {
+  [BOARD_IDS.majority]: [25, 29, 31, 31],
+  [BOARD_IDS.voting]: [2, 3, 3, 4],
+  [BOARD_IDS.enabledLedger]: [32, 32, 32, 32],
+  [BOARD_IDS.majorityNameless]: [30, 30, 30, 30],
+  [BOARD_IDS.nodeOnly]: [0, 0, 0, 1],
+  [BOARD_IDS.unsupportedVoted]: [0, 0, 0, 2],
+};
+
+/** What `seedAmendmentBoard` wrote. */
+export interface BoardScenario {
+  /** The clock of the seed, in seconds. */
+  now: number;
+  /** The 36 validators of the UNL. [0..34] vote in every round; [35] never voted. */
+  unl: FleetMember[];
+  /** [0] votes for the majority amendment and for one only it votes for; [1] votes for nothing; [2] never voted; [3] voted, but was seen three days ago. */
+  others: FleetMember[];
+  headClose: number;
+  /** The voting ledger of round `i` (0 is the newest), and its close time. */
+  roundLedger(round: number): number;
+  roundClose(round: number): number;
+  /** The voting ledger of the round of ten days ago, and of the one of forty days ago (outside the 30-day window). */
+  oldLedger: number;
+  oldClose: number;
+  veryOldLedger: number;
+  /** The ledger and close time of the `EnableAmendment` that enabled `TestEnabledLedger`. */
+  enabledAt: { ledgerIndex: number; closeTime: number };
+  /** `Majorities`: when each majority was gained. */
+  since: { majority: number; majorityNameless: number };
+  /** The ledger and time of the `EnableAmendment` (tfGotMajority) behind the `TestMajority` majority. */
+  gotMajority: { ledgerIndex: number; closeTime: number };
+  /** The `EnableAmendment` transactions written. */
+  transactions: SeedEnableAmendment[];
+  /** The ledger state the amendments are read from. */
+  state: { amendments: string[] };
+}
+
+/**
+ * The board of the amendments page (XRPL, with the metadata file `test/support/amendments-xrpl.json`): 36 validators on the
+ * UNL of one publisher (35 with a record, so `trusted` is 35, the threshold 28), 4 others, and thirteen amendments, at least
+ * one in every state:
+ *
+ *  - enabled: `TestEnabledLedger` (an indexed `EnableAmendment` in the middle of the rounds), `TestEnabledFile` (only the
+ *    file says when) and an ID nobody says anything of;
+ *  - majority: `TestMajority` (31 yes of 35; an indexed tfGotMajority, after a lost majority and an earlier one) and the
+ *    nameless one of mainnet (30 yes, no indexed transaction);
+ *  - voting: `TestVoting` (4 yes), `TestVotingIdle` (no vote at all), one named by the node only, one the node does not
+ *    support with two yes, and one nameless voted for by an outsider;
+ *  - obsolete: `TestObsolete` (the file) and one the node does not support;
+ *  - unknown: an ID the node lists without a name.
+ *
+ * Rounds: four of 256 ledgers apart ending with `VOTING_LEDGER`, one ten days ago and one forty days ago, which the 30-day
+ * window leaves out. The votes of each round are what its tallies say (member `i` of the UNL votes for an amendment that has
+ * `n` yes when `i < n`); unl[5] is recorded under its signing key, and the ledger state was polled twice (the newer wins).
+ * Versions: unl[0..29] 3.4.1, unl[30..34] 3.4.0, others[0] 3.4.1, others[1] 3.5.0.
+ */
+export async function seedAmendmentBoard(ch: ClickHouseService): Promise<BoardScenario> {
+  const members = fleet('xrpl', 40);
+  const unl = members.slice(0, 36);
+  const others = members.slice(36);
+  const now = Math.floor(Date.now() / 1000);
+  const headClose = now - 8;
+  const closeOfLedger = (ledger: number): number => headClose - (HEAD_LEDGER - ledger) * LEDGER_INTERVAL;
+  const roundLedger = (round: number): number => VOTING_LEDGER - round * 256;
+  const roundClose = (round: number): number => closeOfLedger(roundLedger(round));
+  const oldLedger = roundLedger(800);
+  const oldClose = now - 10 * DAY;
+  const veryOldLedger = roundLedger(5000);
+
+  await insertLedgers(ch, HEAD_LEDGER, headClose, 1000, LEDGER_INTERVAL);
+
+  // the UNL: one publisher with all 36; manifests with the domains of three
+  await insertLists(ch, [
+    {
+      publisher: 'vl.ripple.com',
+      sequence: 85,
+      expiration: now + 170 * DAY,
+      fetched_at: now - 200,
+      validators: unl.map((m) => m.key),
+    },
+  ]);
+  await insertPublishers(ch, [{ publisher: 'vl.ripple.com', checked_at: now - 200 }]);
+  await insertManifests(ch, [
+    ...members.map((m) => ({ ephemeral_key: m.ephemeral, master_key: m.key, seq: 1 })),
+    { ephemeral_key: unl[0].ephemeral, master_key: unl[0].key, seq: 2, domain: 'northpeak.example' },
+    { ephemeral_key: unl[1].ephemeral, master_key: unl[1].key, seq: 2, domain: 'shoreline.example' },
+    { ephemeral_key: others[0].ephemeral, master_key: others[0].key, seq: 2, domain: 'tidewater.example' },
+  ]);
+  await insertSeen(
+    ch,
+    members.map((m) => ({
+      key: m.key,
+      first: now - 90 * DAY,
+      last: m === others[3] ? now - 3 * DAY : now - 60.25,
+    })),
+  );
+
+  // the ledger state, polled twice: the newer one is the one that counts
+  const since = { majority: now - 2 * DAY, majorityNameless: now - 5 * DAY };
+  const state = {
+    amendments: [BOARD_IDS.enabledLedger, BOARD_IDS.enabledFile, BOARD_IDS.enabledBare],
+    majorities: [
+      { amendment: BOARD_IDS.majority, since: since.majority },
+      { amendment: BOARD_IDS.majorityNameless, since: since.majorityNameless },
+    ],
+  };
+  await insertState(ch, [
+    { ledger_index: HEAD_LEDGER - 600, polled_at: now - 700, amendments: [BOARD_IDS.enabledFile], majorities: [] },
+    { ledger_index: HEAD_LEDGER - 3, polled_at: now - 20.5, ...state },
+  ]);
+
+  // what the node says: the newer row of an amendment wins
+  await insertFeatures(ch, [
+    { amendment_id: BOARD_IDS.unknown, name: 'OldName', supported: 0, polled_at: now - 5000 },
+    { amendment_id: BOARD_IDS.unknown, name: '', supported: 1, polled_at: now - 300 },
+    { amendment_id: BOARD_IDS.nodeOnly, name: 'NodeNamedOnly', supported: 1, polled_at: now - 300 },
+    { amendment_id: BOARD_IDS.obsoleteNode, name: 'NodeGone', supported: 0, polled_at: now - 300 },
+    { amendment_id: BOARD_IDS.unsupportedVoted, name: 'StillVoted', supported: 0, polled_at: now - 300 },
+    { amendment_id: BOARD_IDS.voting, name: BOARD_NAMES.voting, supported: 1, polled_at: now - 300 },
+    { amendment_id: BOARD_IDS.majority, name: BOARD_NAMES.majority, supported: 1, polled_at: now - 300 },
+    { amendment_id: BOARD_IDS.enabledLedger, name: BOARD_NAMES.enabledLedger, supported: 1, polled_at: now - 300 },
+  ]);
+
+  // the indexed EnableAmendment transactions
+  const enabledAt = { ledgerIndex: roundLedger(1) + 2, closeTime: roundClose(1) + 8 };
+  const gotMajority = { ledgerIndex: 107_704_833, closeTime: since.majority + 5 };
+  const transactions: SeedEnableAmendment[] = [
+    { amendment: BOARD_IDS.majority, flags: 0x10000, ledgerIndex: 106_500_001, closeTime: now - 60 * DAY },
+    { amendment: BOARD_IDS.majority, flags: 0x20000, ledgerIndex: 106_600_001, closeTime: now - 50 * DAY },
+    { amendment: BOARD_IDS.majority, flags: 0x10000, ...gotMajority },
+    { amendment: BOARD_IDS.enabledLedger, flags: 0x10000, ledgerIndex: 107_000_001, closeTime: now - 20 * DAY },
+    // the plain enabling carries no flags
+    { amendment: BOARD_IDS.enabledLedger, flags: 0, withoutFlags: true, ...enabledAt },
+    // another amendment's: it must not show up in these
+    { amendment: BOARD_IDS.voting, flags: 0x10000, ledgerIndex: 106_000_001, closeTime: now - 100 * DAY },
+  ];
+  await insertEnableAmendments(ch, transactions);
+
+  // the rounds
+  const v341 = serverVersion(3, 4, 1);
+  const v340 = serverVersion(3, 4, 0);
+  const versionOf = (m: FleetMember): string | null => {
+    const unlIndex = unl.indexOf(m);
+    if (unlIndex >= 0) return unlIndex < 30 ? v341 : unlIndex < 35 ? v340 : null;
+    return m === others[0] ? v341 : m === others[1] ? serverVersion(3, 5, 0) : null;
+  };
+  const unlKeys = unl.map((m) => m.key);
+  const base = Date.now();
+  for (let round = 3; round >= 0; round--) {
+    const column = 3 - round;
+    const yesOf = (id: string): number => BOARD_YES[id]?.[column] ?? 0;
+    const voting = (i: number): string[] => Object.keys(BOARD_YES).filter((id) => i < yesOf(id));
+    await insertRound(ch, {
+      ledgerIndex: roundLedger(round),
+      closeTime: roundClose(round),
+      version: base + column,
+      unl: unlKeys,
+      trusted: 35,
+      observed: 35,
+      tallies: Object.keys(BOARD_YES)
+        .filter((id) => yesOf(id) > 0 || id === BOARD_IDS.majority || id === BOARD_IDS.majorityNameless)
+        .map((id) => ({ id, yes: yesOf(id) })),
+      votes: [
+        // unl[5] is recorded under its signing key
+        ...unl.slice(0, 35).map((m, i) => ({
+          key: i === 5 ? m.ephemeral : m.key,
+          amendments: voting(i),
+          serverVersion: versionOf(m),
+        })),
+        {
+          key: others[0].key,
+          amendments: [BOARD_IDS.majority, BOARD_IDS.votedByOther],
+          serverVersion: versionOf(others[0]),
+        },
+        { key: others[1].key, amendments: [], serverVersion: versionOf(others[1]) },
+        { key: others[3].key, amendments: [BOARD_IDS.majority] },
+      ],
+    });
+  }
+  // ten days ago: no votes kept, two tallies; forty days ago: outside the 30-day window
+  await insertRound(ch, {
+    ledgerIndex: oldLedger,
+    closeTime: oldClose,
+    version: base,
+    unl: unlKeys,
+    trusted: 35,
+    observed: 35,
+    tallies: [{ id: BOARD_IDS.enabledLedger, yes: 20 }],
+  });
+  await insertRound(ch, {
+    ledgerIndex: veryOldLedger,
+    closeTime: now - 40 * DAY,
+    version: base,
+    unl: unlKeys,
+    trusted: 35,
+    observed: 35,
+    tallies: [{ id: BOARD_IDS.voting, yes: 9 }],
+    votes: [{ key: others[2].key, amendments: [BOARD_IDS.votedLongAgo] }],
+  });
+
+  return {
+    now,
+    unl,
+    others,
+    headClose,
+    roundLedger,
+    roundClose,
+    oldLedger,
+    oldClose,
+    veryOldLedger,
+    enabledAt,
+    since,
+    gotMajority,
+    transactions,
+    state,
   };
 }

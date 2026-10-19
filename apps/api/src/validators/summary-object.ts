@@ -85,7 +85,7 @@ const feesOf = (drops: Drops): NonNullable<ValidatorsSummary['fees']> => ({
 });
 
 /** An instant of receipt, `YYYY-MM-DDTHH:mm:ss.SSSZ`, from unix seconds with a fraction (cut to the millisecond, not floored). */
-const instant = (seconds: number): string => fmtMillis(new Date(Math.round(seconds * 1000)));
+export const instant = (seconds: number): string => fmtMillis(new Date(Math.round(seconds * 1000)));
 
 function publisherOf(state: PublisherState): SummaryPublisher {
   const list = state.list;
@@ -123,6 +123,16 @@ function expectedFlagTime(head: NonNullable<Directory['head']>, flag: number): s
 }
 
 /**
+ * The next flag ledger after the head, the voting ledger before it, and when it is expected (the amendment routes state the
+ * same figures as the summary); nothing without a head.
+ */
+export function nextFlagLedgerOf(head: Directory['head']): ValidatorsSummary['next_flag_ledger'] {
+  if (head === undefined) return undefined;
+  const flag = nextFlagLedger(head.ledgerIndex);
+  return compact({ ledger_index: flag, voting_ledger: flag - 1, expected: expectedFlagTime(head, flag) });
+}
+
+/**
  * The summary of the validator directory (spec 3.1): the figures of the board's header. Pure; keys in the order of
  * `SUMMARY_KEYS`, a key with no value absent, never `null`.
  */
@@ -152,7 +162,6 @@ export function buildSummary(directory: Directory): ValidatorsSummary {
   );
   count(seen, 'all');
 
-  const flag = head === undefined ? undefined : nextFlagLedger(head.ledgerIndex);
   const pending = compact({ to_disable: state?.toDisable, to_reenable: state?.toReenable });
   const fees = state?.fees ?? newestRound?.fees;
 
@@ -183,10 +192,7 @@ export function buildSummary(directory: Directory): ValidatorsSummary {
     })),
     negative_unl_pending: Object.keys(pending).length === 0 ? undefined : pending,
     fees: fees === undefined ? undefined : feesOf(fees),
-    next_flag_ledger:
-      head === undefined || flag === undefined
-        ? undefined
-        : compact({ ledger_index: flag, voting_ledger: flag - 1, expected: expectedFlagTime(head, flag) }),
+    next_flag_ledger: nextFlagLedgerOf(head),
     latest_version: directory.latest?.version,
     versions: [...byVersion.values()]
       .sort((a, b) => compareVersions(a.version, b.version))

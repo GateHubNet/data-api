@@ -274,8 +274,14 @@ const DAY_SECONDS = 86_400;
 
 const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
-/** List order (spec 3.2): with a domain first, by lower-case domain then key; then the rest by key. */
-function compareEntries(a: DirectoryEntry, b: DirectoryEntry): number {
+/**
+ * List order (spec 3.2): with a domain first, by lower-case domain then key; then the rest by key. Of a validator it needs
+ * the key and the domain only, so that a member of a round the directory has no entry for is put in its place as well.
+ */
+export function compareEntries(
+  a: Pick<DirectoryEntry, 'key' | 'domain'>,
+  b: Pick<DirectoryEntry, 'key' | 'domain'>,
+): number {
   if ((a.domain === undefined) !== (b.domain === undefined)) return a.domain === undefined ? 1 : -1;
   if (a.domain !== undefined && b.domain !== undefined) {
     const byDomain = compareText(a.domain.toLowerCase(), b.domain.toLowerCase());

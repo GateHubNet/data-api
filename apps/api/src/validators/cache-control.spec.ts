@@ -1,4 +1,4 @@
-import { VALIDATORS_CACHE_CONTROL, routeCacheControl } from './cache-control';
+import { AMENDMENTS_CACHE_CONTROL, routeCacheControl, VALIDATORS_CACHE_CONTROL } from './cache-control';
 
 describe('routeCacheControl', () => {
   it('is the value of the route while GH_CACHE_CONTROL is set', () => {
@@ -14,5 +14,9 @@ describe('routeCacheControl', () => {
 
   it('is private with 30 s for the validators routes of the list, the summary and the detail', () => {
     expect(VALIDATORS_CACHE_CONTROL).toBe('private, max-age=30');
+  });
+
+  it('is private with 60 s for the amendments routes of the list and the detail', () => {
+    expect(AMENDMENTS_CACHE_CONTROL).toBe('private, max-age=60');
   });
 });

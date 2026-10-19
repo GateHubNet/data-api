@@ -1,0 +1,5 @@
+{
+  "network": "xrpl",
+  "updated": "2026-10-19",
+  "amendments": [{ "name": "TestBadUrl", "xls_url": "http://example.com/XRPLF/XRPL-Standards/" }]
+}

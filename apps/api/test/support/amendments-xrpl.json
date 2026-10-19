@@ -1,0 +1,28 @@
+{
+  "network": "xrpl",
+  "updated": "2026-10-19",
+  "amendments": [
+    {
+      "name": "TestEnabledLedger",
+      "introduced": "1.12.0",
+      "xls": "XLS-30",
+      "xls_url": "https://github.com/XRPLF/XRPL-Standards/tree/master/XLS-0030-automated-market-maker",
+      "description": "Made up for the tests: enabled, with an indexed EnableAmendment that wins over the file.",
+      "enabled": { "ledger_index": 86795265, "date": "2024-03-22" }
+    },
+    {
+      "name": "TestEnabledFile",
+      "introduced": "2.0.0",
+      "enabled": { "ledger_index": 90000001, "date": "2025-02-03" }
+    },
+    {
+      "name": "TestMajority",
+      "introduced": "3.4.1",
+      "xls": "XLS-99",
+      "xls_url": "https://github.com/XRPLF/XRPL-Standards/discussions/99"
+    },
+    { "name": "TestVoting", "introduced": "3.5.0", "description": "Made up for the tests: voted for by four." },
+    { "name": "TestVotingIdle" },
+    { "name": "TestObsolete", "introduced": "0.60.0", "obsolete": true }
+  ]
+}

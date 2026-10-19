@@ -1080,6 +1080,9 @@ one written here and is pinned by tests.
   newest version written (a rewritten round or hour is never mixed with its older version).
 - "In use now" (the trusted UNL, which publishers name a validator) uses the lists a publisher served under the key it is configured with; a
   list of a key it no longer uses was trusted in its time and is history.
+- The **amendments** are assembled on top of the directory (up to 10 seconds old, like it), from the newest ledger state, what the node says of each
+  amendment ID, the metadata file of the network (`GH_AMENDMENTS_CONFIG`: names, the version that introduced an amendment, its standard, a description;
+  an invalid file fails the boot), the votes of the last 30 days and the `EnableAmendment` transactions the index holds.
 
 The routes of the original `/v2/network/validators/{pubkey}/manifests`, `/v2/network/validators/{pubkey}/reports`,
 `/v2/network/validator_reports` and `/v2/network/rippled_versions` are not served and answer 404 `{"result":"error","message":"Cannot GET ..."}`.
@@ -1148,6 +1151,217 @@ An empty database answers 200 with `result`, `validators` (all 0), `unl` (`trust
 Errors: 500 `unable to retrieve validator(s)`.
 
 **Differences from data.ripple.com**: the original has no such route; this one is new. It answers from the database only and does not wait for a node.
+
+### `GET /v2/network/amendments`
+
+Every amendment the network knows: the enabled ones, the ones with a majority, the ones validators are voting on, the obsolete ones and the ones
+nothing is known of. With each, its status, the votes it has in the newest voting round, and, for an enabled one, when it was enabled. About 120 on
+XRPL, so there is no paging. The answer also states the rules of the network, the newest stored round and the next flag ledger, so that the Amendments
+board needs no other call for them.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `status` | all | A comma list of `enabled`, `majority`, `voting`, `obsolete` and `unknown`: only the amendments of those statuses are listed (in the order of the list), but `counts` still counts all of them. A parameter that is empty is all. Anything else answers 400 `invalid status`. |
+| `format` | `json` | `csv`: the amendments as a CSV file named `amendments.csv`, one row each, the nested objects flattened (`votes.yes`, `majority.since`). |
+
+An example (the e2e suite's board: 13 amendments, 7 of which are shown here; the rows left out are of the same shapes):
+
+```json
+{
+  "result": "success",
+  "ledger_index": 107748183,
+  "rules": {"threshold_percent": 80, "majority_hold_seconds": 1209600, "flag_interval": 256},
+  "round": {"ledger_index": 107748095, "date": "2026-10-19T15:48:20Z", "unl_size": 36, "trusted": 35, "threshold": 28, "needed": 29, "observed": 35},
+  "next_flag_ledger": {"ledger_index": 107748352, "voting_ledger": 107748351, "expected": "2026-10-19T16:05:28Z"},
+  "counts": {"enabled": 3, "majority": 2, "voting": 5, "obsolete": 2, "unknown": 1},
+  "count": 13,
+  "amendments": [
+    {
+      "id": "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76",
+      "status": "majority",
+      "votes": {"ledger_index": 107748095, "yes": 30, "trusted": 35, "needed": 29, "pct": 85.71},
+      "majority": {"since": "2026-10-14T15:54:20Z", "expected_activation": "2026-10-28T15:54:20Z"}
+    },
+    {
+      "id": "B05DE10B9A021C900FC39DC73CAA31F5735A8657AF97122B9B24725A0D2DEC84",
+      "name": "TestMajority",
+      "status": "majority",
+      "introduced": "3.4.1",
+      "xls": "XLS-99",
+      "xls_url": "https://github.com/XRPLF/XRPL-Standards/discussions/99",
+      "node_supported": true,
+      "votes": {"ledger_index": 107748095, "yes": 31, "trusted": 35, "needed": 29, "pct": 88.57},
+      "majority": {"since": "2026-10-17T15:54:20Z", "ledger_index": 107704833, "tx_hash": "F78430ADBAF1464366DC4AAA169171604FFD56A9BB28F27835A80EDB455F7ED4", "expected_activation": "2026-10-31T15:54:20Z"}
+    },
+    {
+      "id": "5DAA33FCBE27A650FDF1057665CE135F7CEAE8A7FD085D807E168B4945D7FF0D",
+      "name": "TestVoting",
+      "status": "voting",
+      "introduced": "3.5.0",
+      "description": "Made up for the tests: voted for by four.",
+      "node_supported": true,
+      "votes": {"ledger_index": 107748095, "yes": 4, "trusted": 35, "needed": 29, "pct": 11.43}
+    },
+    {
+      "id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "status": "unknown",
+      "node_supported": true,
+      "votes": {"ledger_index": 107748095, "yes": 0, "trusted": 35, "needed": 29, "pct": 0}
+    },
+    {
+      "id": "53C82FC39AEA945DA2344727BD88EFA0DC54D0C52A82DDC656F9C8D9E3417C58",
+      "name": "TestEnabledLedger",
+      "status": "enabled",
+      "introduced": "1.12.0",
+      "xls": "XLS-30",
+      "xls_url": "https://github.com/XRPLF/XRPL-Standards/tree/master/XLS-0030-automated-market-maker",
+      "description": "Made up for the tests: enabled, with an indexed EnableAmendment that wins over the file.",
+      "node_supported": true,
+      "enabled": {"ledger_index": 107747841, "date": "2026-10-19T15:31:24Z", "tx_hash": "F5AFF7C2C2CD3F3CD74221F3D78C190BAAF45B3A6867CD165CB0253679EE0C6E", "source": "ledger"}
+    },
+    {
+      "id": "4E9CC7512DFA8BA60E7571CBA7DC44DC7948739B4E342D9E18AE0B8F20B224F0",
+      "name": "TestEnabledFile",
+      "status": "enabled",
+      "introduced": "2.0.0",
+      "enabled": {"ledger_index": 90000001, "date": "2025-02-03", "source": "metadata"}
+    },
+    {
+      "id": "1ED1958A27DE4444C02559D145D2479ABE8A3C98A690DB993A48303779444A09",
+      "name": "TestObsolete",
+      "status": "obsolete",
+      "introduced": "0.60.0"
+    }
+  ]
+}
+```
+
+Keys of the amendments answer, in order: `result, ledger_index, rules, round, next_flag_ledger, counts, count, amendments`.
+
+Keys of the newest round, in order: `ledger_index, date, unl_size, trusted, threshold, needed, observed`.
+
+Keys of an amendment row, in order: `id, name, status, retired, introduced, xls, xls_url, description, node_supported, votes, majority, enabled`.
+
+Keys of votes, in order: `ledger_index, yes, trusted, needed, pct`.
+
+Keys of majority, in order: `since, ledger_index, tx_hash, expected_activation`.
+
+Keys of enabled, in order: `ledger_index, date, tx_hash, source`.
+
+A key without a value is absent. In particular `name`, `introduced`, `xls`, `xls_url`, `description`, `node_supported`, `retired`, `votes`, `majority` and `enabled` are there
+only when they have a value, and `ledger_index`, `round` and `next_flag_ledger` are absent from the answer of a database that has no ledger, no round or no head yet.
+
+| Key | Meaning |
+| --- | --- |
+| `ledger_index` | The newest committed ledger of the index: the summary's. |
+| `rules` | The rules of the network: `threshold_percent` (80: an amendment needs more than that share of the trusted validators), `majority_hold_seconds` (how long it must hold its majority before it is enabled: 1,209,600 on XRPL, 432,000 on Xahau) and `flag_interval` (256). |
+| `round` | The newest voting round stored: its voting `ledger_index`, `date` (its close time), `unl_size` (the validators on the UNL), `trusted` (the ones of them with a vote record, the ones that count), `threshold` (the votes an amendment has to exceed: max(1, ⌊`trusted` × 80 / 100⌋)), `needed` (the votes that pass: `threshold` + 1, and 1 when `trusted` is 1 or less) and `observed` (the validators of the UNL whose full validation of the voting ledger was seen). Absent while no round is stored. |
+| `next_flag_ledger` | The summary's: the next multiple of 256 and the voting ledger before it, and when it is expected. |
+| `counts` | How many amendments there are of each status, all of them, whatever `status` asks for. |
+| `count` | The number of amendments listed. |
+| `amendments` | The amendments, in the order below. |
+| `id` | The ID: 64 hex digits, upper case. It is the SHA-512Half of the name. |
+| `name` | The name of the amendment: the one in the metadata file, else the one the node gives (the node may not know a name: public nodes lack the one of an amendment that is new), else absent. |
+| `status` | One of the five below. |
+| `retired` | `true` for a name of the metadata file that is retired (Xahau: behaviour that is always on although the ledger does not list the name). |
+| `introduced`, `xls`, `xls_url`, `description` | From the metadata file (names, descriptions and links of the standards: `GH_AMENDMENTS_CONFIG`, a file per network that ships with the API): the software version that introduced it (a rippled version on XRPL, a xahaud date version on Xahau), the standard (`XLS-30`) and its address, which always lies under `https://github.com/XRPLF/XRPL-Standards/`, and one line about it. Absent for an amendment the file does not have. |
+| `node_supported` | Whether the node says it supports the amendment, when it lists it. |
+| `votes` | For an amendment that is `majority`, `voting` or `unknown`, when a round is stored: what the newest round says. `ledger_index` is its voting ledger, `yes` the trusted validators with the amendment in their vote record (0 when the round has no tally of it), `trusted` and `needed` as in `round`, `pct` = `yes` / `trusted` × 100 to two decimals, rounded half up (0 when `trusted` is 0). |
+| `majority` | For an amendment that has a majority: `since`, the close time of the ledger that recorded it; `ledger_index` and `tx_hash`, of the newest indexed `EnableAmendment` that gave it the majority (absent when none is indexed: the majority was gained before the indexed history, or the index has not reached that ledger yet); `expected_activation`, `since` plus the hold. It is enabled by the first flag ledger after that, in the ledger after the flag ledger. |
+| `enabled` | For an enabled amendment: `ledger_index`, `date` (the close time) and `tx_hash` of the indexed `EnableAmendment` that enabled it, with `source` `ledger`; else what the metadata file says, `ledger_index` and `date` (a day, `YYYY-MM-DD`; either may be missing), with `source` `metadata`; else none. A retired name has one only when the ledger has it. |
+
+**Status.** The first row that matches:
+
+| Status | When |
+| --- | --- |
+| `enabled` | The ledger lists it as enabled; or the file calls it `retired`. |
+| `majority` | The ledger lists a majority for it. |
+| `obsolete` | The file calls it `obsolete`; or the node does not support it and no validator of the trusted UNL votes yes in the newest round. |
+| `voting` | The node or the file names it, or any validator voted for it in the last 30 days. |
+| `unknown` | The rest: the node lists it without a name, and nobody voted for it. |
+
+**Order.** The groups come in the order `majority`, `voting`, `unknown`, `enabled`, `obsolete`. Inside a group: `majority` by `expected_activation`; `voting` by `votes.yes`, most
+first, then by name; `unknown` by ID; `enabled` by the ledger it was enabled in, the newest first (the ones without one last, by name); `obsolete` by name. A name is compared without regard to case, a
+named amendment comes before an unnamed one, and an unnamed one is compared by its ID.
+
+The amendments are assembled from the newest ledger state, what the node says of each ID (`feature`), the metadata file, the votes of the last 30 days and the indexed `EnableAmendment` transactions, and kept
+for up to 10 seconds (counted from the start of the build), one build at a time per replica. Every read of votes and tallies takes the newest version written of a round.
+
+Errors: 400 `invalid status`; 500 `unable to retrieve amendments`. `Cache-Control: private, max-age=60`.
+
+**Differences from data.ripple.com**: the original has no such route; this one is new. It answers from the database only and does not wait for a node.
+
+### `GET /v2/network/amendments/{name}`
+
+One amendment, by its name or its ID. `name` is a name as it is written, else a name in any other case when only one amendment has it, or the 64 hex digits of an ID in either case. Anything else answers
+404 `amendment not found`. JSON only: `format` is ignored.
+
+The answer starts with the envelope of the list (`ledger_index`, `rules`, `round`, `next_flag_ledger`: the same values, so that a page of one amendment needs no call of the list for them), then the
+amendment as the list has it, then how the validators vote on it, its rounds and its history.
+
+An example (`TestMajority` of the e2e suite's board; `unl_votes` is shortened to five of the 36 members of the UNL, whose first two are the ones with a domain, listed first):
+
+```json
+{
+  "ledger_index": 107748183,
+  "rules": {"threshold_percent": 80, "majority_hold_seconds": 1209600, "flag_interval": 256},
+  "round": {"ledger_index": 107748095, "date": "2026-10-19T15:48:20Z", "unl_size": 36, "trusted": 35, "threshold": 28, "needed": 29, "observed": 35},
+  "next_flag_ledger": {"ledger_index": 107748352, "voting_ledger": 107748351, "expected": "2026-10-19T16:05:28Z"},
+  "id": "B05DE10B9A021C900FC39DC73CAA31F5735A8657AF97122B9B24725A0D2DEC84",
+  "name": "TestMajority",
+  "status": "majority",
+  "introduced": "3.4.1",
+  "xls": "XLS-99",
+  "xls_url": "https://github.com/XRPLF/XRPL-Standards/discussions/99",
+  "node_supported": true,
+  "votes": {"ledger_index": 107748095, "yes": 31, "trusted": 35, "needed": 29, "pct": 88.57},
+  "majority": {"since": "2026-10-17T15:54:20Z", "ledger_index": 107704833, "tx_hash": "F78430ADBAF1464366DC4AAA169171604FFD56A9BB28F27835A80EDB455F7ED4", "expected_activation": "2026-10-31T15:54:20Z"},
+  "unl_votes": [
+    {"validation_public_key": "nHBFpmLgxtyCSPCW4fWLgqwefcLBuQdkU7R6FNQVF2B5czacYLLA", "domain": "northpeak.example", "vote": "yes", "version": "3.4.1", "version_supports": true, "last_seen": "2026-10-19T15:53:19.750Z"},
+    {"validation_public_key": "nHUkKoJy83JptKcB56T38wQwjvH3EVYdcvwAfLDHwH7QBkLEv4nD", "domain": "shoreline.example", "vote": "yes", "version": "3.4.1", "version_supports": true, "last_seen": "2026-10-19T15:53:19.750Z"},
+    {"validation_public_key": "nHUQGzW4J3ZH3mms7Dhf6FyuJWXGYzX5A8sYwnX4TWwRYdkJU1pv", "vote": "yes", "version": "3.4.0", "version_supports": false, "last_seen": "2026-10-19T15:53:19.750Z"},
+    {"validation_public_key": "nHBZUmz9mhzGE2XnNd1S3LAxwT7NMwToY2SsdAMBYfaemcr3pJaD", "vote": "no", "version": "3.4.0", "version_supports": false, "last_seen": "2026-10-19T15:53:19.750Z"},
+    {"validation_public_key": "nHUZzKfNLsYGbfKCqEqgy2uk76JZqoHWQjt2wrm5t39Jads1g2kQ", "vote": "none", "last_seen": "2026-10-19T15:53:19.750Z"}
+  ],
+  "other_votes": [
+    {"validation_public_key": "nHBSrmG2Ng7SERr69XRdEsP1qLfENMmbn4oc7SN6bZJjkadfqnKC", "domain": "tidewater.example", "vote": "yes", "version": "3.4.1", "version_supports": true, "last_seen": "2026-10-19T15:53:19.750Z"},
+    {"validation_public_key": "nHU6XWBJQH7SQuDmC59hwWLmbN2uWUGBzm2pU698DuHnVDE68srx", "vote": "no", "version": "3.5.0", "version_supports": true, "last_seen": "2026-10-19T15:53:19.750Z"}
+  ],
+  "rounds": [
+    {"ledger_index": 107543295, "flag_ledger": 107543296, "date": "2026-10-09T15:54:20Z", "yes": 0, "trusted": 35, "threshold": 28, "passes": false},
+    {"ledger_index": 107747327, "flag_ledger": 107747328, "date": "2026-10-19T14:57:08Z", "yes": 25, "trusted": 35, "threshold": 28, "passes": false},
+    {"ledger_index": 107747583, "flag_ledger": 107747584, "date": "2026-10-19T15:14:12Z", "yes": 29, "trusted": 35, "threshold": 28, "passes": true},
+    {"ledger_index": 107747839, "flag_ledger": 107747840, "date": "2026-10-19T15:31:16Z", "yes": 31, "trusted": 35, "threshold": 28, "passes": true},
+    {"ledger_index": 107748095, "flag_ledger": 107748096, "date": "2026-10-19T15:48:20Z", "yes": 31, "trusted": 35, "threshold": 28, "passes": true}
+  ],
+  "history": [
+    {"event": "got_majority", "ledger_index": 106500001, "date": "2026-08-20T15:54:20Z", "tx_hash": "62C1656A2A1702F45C414DB330DBBEA25FDA830A80131B0C56BE514A7B6B68B1"},
+    {"event": "lost_majority", "ledger_index": 106600001, "date": "2026-08-30T15:54:20Z", "tx_hash": "322F9E58EDBEEB643D949CF33F3FD6D0049E537B493EB08D262446CBD9C189E1"},
+    {"event": "got_majority", "ledger_index": 107704833, "date": "2026-10-17T15:54:25Z", "tx_hash": "F78430ADBAF1464366DC4AAA169171604FFD56A9BB28F27835A80EDB455F7ED4"}
+  ],
+  "result": "success"
+}
+```
+
+Keys of the amendment answer, in order: `ledger_index, rules, round, next_flag_ledger, id, name, status, retired, introduced, xls, xls_url, description, node_supported, votes, majority, enabled, unl_votes, other_votes, rounds, history, result`.
+
+Keys of a UNL vote, in order: `validation_public_key, domain, vote, version, version_supports, last_seen`.
+
+Keys of a round, in order: `ledger_index, flag_ledger, date, yes, trusted, threshold, passes`.
+
+Keys of a history event, in order: `event, ledger_index, date, tx_hash`.
+
+| Key | Meaning |
+| --- | --- |
+| `unl_votes` | Every validator on the UNL of the newest round, in the order of the validators list (the ones with a domain first, by domain, then the rest by key). `vote` is `yes` or `no` as the record the round counts for it says (its newest full vote within 24 hours, from a round where it was on the UNL and not on the negative UNL), `none` without such a record. `domain` is the one of its newest manifest; `version` the software version it reported most recently in the last 30 days; `version_supports` is true when that version is at least `introduced` (it is absent when either is unknown); `last_seen` is when this deployment last saw the validator (`YYYY-MM-DDTHH:mm:ss.SSSZ`). A validator is keyed by its master key, whichever key signed its votes. |
+| `other_votes` | The validators that are not on the UNL of the newest round, were seen in the last 24 hours and have a vote record: the same objects, `vote` being `yes` or `no`. |
+| `rounds` | One per stored voting round of the last 30 days, the oldest first (about 2,600 on XRPL): `ledger_index` is the voting ledger and `flag_ledger` the one after it, `date` its close time, `yes` the votes the amendment had in it (0 when the round has no tally of it), `trusted` and `threshold` those of the round, and `passes` whether `yes` carried it: more than `threshold` (at least `threshold` when `trusted` is 1). An amendment that is `enabled` has only the rounds before the ledger it was enabled in, and none when that ledger is not known. |
+| `history` | Every indexed `EnableAmendment` of the amendment, the oldest first: `event` is `got_majority` (`tfGotMajority`), `lost_majority` (`tfLostMajority`) or `enabled` (no flags), with its `ledger_index`, the close time of the ledger as `date`, and its `tx_hash`. |
+| `result` | `success`, last. |
+
+Errors: 404 `amendment not found`; 500 `unable to retrieve amendments`. `Cache-Control: private, max-age=60`.
+
+**Differences from data.ripple.com**: the original has no such route; this one is new.
 
 ---
 
