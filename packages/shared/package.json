@@ -18,6 +18,7 @@
     "test": "jest --config jest.config.js --passWithNoTests",
     "test:e2e": "jest --config jest.e2e.config.js --runInBand",
     "record:fixtures": "ts-node scripts/record-fixtures.ts",
+    "amendments:check": "ts-node scripts/amendments-check.ts",
     "ch:migrate": "ts-node src/clickhouse/migrate.ts"
   },
   "dependencies": {

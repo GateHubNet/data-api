@@ -31,6 +31,9 @@ The apis (`api-xrpl`, `api-xahau`) scale freely.
 
 ### Deploy a new version
 
+**Release checklist.** A rippled or xahaud release with new amendments gets its entries in the amendment metadata *before* the deploy
+([Keep the amendment metadata current](#keep-the-amendment-metadata-current)).
+
 ```bash
 git pull                                              # or check out the release tag
 export NPM_TOKEN=...                                  # the private @gatehub/toolbox; BuildKit secret, never baked in
@@ -57,6 +60,32 @@ flags: a plain `dc up -d` scales the apis back to 1). **Never edit an applied fi
 checksum is a hard error (`Migration ... was modified after being applied`). All DDL is `CREATE ... IF NOT EXISTS`, so a file that
 failed halfway can simply be run again. Run migrations as a one-shot step, not from every replica. Details:
 [data-model](data-model.md#5-migrations).
+
+### Keep the amendment metadata current
+
+No node or ledger serves an amendment's version, standard or description, so they are kept by hand in
+`packages/shared/config/amendments/xrpl.json` and `xahau.json` (shipped with the package; the shape is in the
+[design](superpowers/specs/2026-10-19-validators-amendments-design.md), 2.6). Do this after every rippled or xahaud release that adds or
+retires amendments, and before the deploy that needs it:
+
+```bash
+pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl
+pnpm --filter @gatehub/data-api-shared amendments:check -- --network xahau --clickhouse
+```
+
+It asks a public node (`--endpoint <wss url>`, by default the first default endpoint of the network) for `feature` and the `Amendments`
+ledger object, prints three lists and exits 1 when any is not empty. With `--clickhouse` it also reads the newest round's votes and the
+indexed `EnableAmendment` transactions from the database the `GH_CLICKHOUSE_*` variables name.
+
+| List | What to do |
+| --- | --- |
+| Names the node knows that the file lacks | Add an entry with the `name` (the ID is computed, never written) and, from the release notes, `introduced` (a rippled version `1.12.0` on XRPL, a xahaud date version `2024.4.21` on Xahau). Add `xls` / `xls_url` (under `https://github.com/XRPLF/XRPL-Standards/`) and `description` (one line, at most 200 characters) when you have them. |
+| IDs in the ledger or the votes that no one names | The node may lack a name. Find it in the newest `features.macro` of rippled or xahaud (an ID is the SHA-512Half of the name) and add the entry. |
+| Entries whose `enabled.ledger_index` contradicts the index | The indexed `EnableAmendment` is right: correct or remove the `enabled` of the entry. |
+
+Mark an amendment `obsolete: true` when current software can no longer vote it in (rippled's `VoteBehavior::Obsolete`, a withdrawn one),
+and on Xahau `retired: true` for a name in xahaud's retired list that the `Amendments` object does not list. Set `updated`. An invalid
+file (a duplicate name, an unknown key, an `xls_url` outside the standards repository) fails the loader with the entry named.
 
 ### Rotate an API key
 

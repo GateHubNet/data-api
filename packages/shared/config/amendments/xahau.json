@@ -1,0 +1,214 @@
+{
+  "network": "xahau",
+  "updated": "2026-10-19",
+  "amendments": [
+    { "name": "AMM", "obsolete": true },
+    { "name": "AMMClawback", "obsolete": true },
+    { "name": "BalanceRewards" },
+    { "name": "CheckCashMakesTrustLine" },
+    { "name": "Checks" },
+    { "name": "Clawback", "introduced": "2025.7.9", "enabled": { "ledger_index": 16172289, "date": "2025-08-07" } },
+    { "name": "Credentials", "obsolete": true },
+    { "name": "Cron", "introduced": "2025.10.27", "enabled": { "ledger_index": 19379713, "date": "2025-12-20" } },
+    { "name": "CryptoConditions", "retired": true },
+    { "name": "CryptoConditionsSuite", "obsolete": true },
+    { "name": "DeepFreeze", "introduced": "2025.7.9", "enabled": { "ledger_index": 16172289, "date": "2025-08-07" } },
+    { "name": "DeletableAccounts" },
+    { "name": "DepositAuth" },
+    { "name": "DepositPreauth" },
+    { "name": "DID", "obsolete": true },
+    { "name": "DisallowIncoming" },
+    { "name": "DynamicNFT", "obsolete": true },
+    { "name": "EnforceInvariants", "retired": true },
+    { "name": "Escrow", "retired": true },
+    { "name": "EscrowDestinationCancel", "introduced": "2026.10.13" },
+    { "name": "ExpandedSignerList" },
+    {
+      "name": "ExtendedHookState",
+      "introduced": "2025.10.27",
+      "enabled": { "ledger_index": 18543361, "date": "2025-11-15" }
+    },
+    { "name": "FeeEscalation", "retired": true },
+    { "name": "fix1201", "retired": true },
+    { "name": "fix1368", "retired": true },
+    { "name": "fix1373", "retired": true },
+    { "name": "fix1512", "retired": true },
+    { "name": "fix1513" },
+    { "name": "fix1515" },
+    { "name": "fix1523", "retired": true },
+    { "name": "fix1528", "retired": true },
+    { "name": "fix1543" },
+    { "name": "fix1571" },
+    { "name": "fix1578" },
+    { "name": "fix1623" },
+    { "name": "fix1781" },
+    { "name": "fix20250131", "introduced": "2025.2.6", "enabled": { "ledger_index": 12125185, "date": "2025-02-16" } },
+    { "name": "fix20260929", "introduced": "2026.10.13" },
+    { "name": "fix20261005", "introduced": "2026.10.13" },
+    { "name": "fix240819", "introduced": "2024.8.20", "enabled": { "ledger_index": 8045313, "date": "2024-08-26" } },
+    { "name": "fix240911", "introduced": "2024.9.11", "enabled": { "ledger_index": 8716289, "date": "2024-09-24" } },
+    { "name": "fixAmendmentMajorityCalc" },
+    { "name": "fixCheckThreading" },
+    {
+      "name": "fixCronStacking",
+      "introduced": "2025.12.1",
+      "enabled": { "ledger_index": 19231745, "date": "2025-12-14" }
+    },
+    {
+      "name": "fixDisallowIncomingV1",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 23979777, "date": "2026-06-30" }
+    },
+    { "name": "fixEnforceNFTokenTrustline", "introduced": "2026.6.21" },
+    {
+      "name": "fixFillOrKill",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 23979777, "date": "2026-06-30" }
+    },
+    {
+      "name": "fixFloatDivide",
+      "introduced": "2024.11.18",
+      "enabled": { "ledger_index": 10186497, "date": "2024-11-27" }
+    },
+    {
+      "name": "fixGuardDepth32",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 25504001, "date": "2026-09-02" }
+    },
+    {
+      "name": "fixHookAPI20251128",
+      "introduced": "2025.12.1",
+      "enabled": { "ledger_index": 19231745, "date": "2025-12-14" }
+    },
+    { "name": "fixHookMap", "introduced": "2026.6.21", "enabled": { "ledger_index": 23979777, "date": "2026-06-30" } },
+    {
+      "name": "fixImportIssuer",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 23979777, "date": "2026-06-30" }
+    },
+    {
+      "name": "fixInnerObjTemplate",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 23979777, "date": "2026-06-30" }
+    },
+    {
+      "name": "fixInvalidTxFlags",
+      "introduced": "2025.10.27",
+      "enabled": { "ledger_index": 18286849, "date": "2025-11-04" }
+    },
+    {
+      "name": "fixIOULockedBalanceInvariant",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 25438977, "date": "2026-08-30" }
+    },
+    { "name": "fixMasterKeyAsRegularKey" },
+    { "name": "fixNFTokenDirV1", "obsolete": true },
+    { "name": "fixNFTokenNegOffer", "obsolete": true },
+    { "name": "fixNFTokenPageLinks", "introduced": "2026.6.21" },
+    { "name": "fixNFTokenRemint" },
+    { "name": "fixNFTokenReserve", "introduced": "2026.6.21" },
+    { "name": "fixNonFungibleTokensV1_2" },
+    { "name": "fixNSDelete", "introduced": "2024.4.21", "enabled": { "ledger_index": 5297153, "date": "2024-05-11" } },
+    { "name": "fixPageCap", "introduced": "2024.9.7", "enabled": { "ledger_index": 8472833, "date": "2024-09-13" } },
+    { "name": "fixPayChanRecipientOwnerDir" },
+    {
+      "name": "fixPreviousTxnID",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 23979777, "date": "2026-06-30" }
+    },
+    {
+      "name": "fixProvisionalDoubleThreading",
+      "introduced": "2025.7.9",
+      "enabled": { "ledger_index": 16053505, "date": "2025-08-02" }
+    },
+    { "name": "fixQualityUpperBound" },
+    {
+      "name": "fixReducedOffersV1",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 23979777, "date": "2026-06-30" }
+    },
+    {
+      "name": "fixReducedOffersV2",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 23979777, "date": "2026-06-30" }
+    },
+    {
+      "name": "fixReduceImport",
+      "introduced": "2025.2.6",
+      "enabled": { "ledger_index": 12125185, "date": "2025-02-16" }
+    },
+    { "name": "fixRemoveNFTokenAutoTrustLine" },
+    {
+      "name": "fixRewardClaimFlags",
+      "introduced": "2025.5.1",
+      "enabled": { "ledger_index": 14101249, "date": "2025-05-11" }
+    },
+    { "name": "fixRmSmallIncreasedQOffers" },
+    { "name": "fixSTAmountCanonicalize" },
+    { "name": "fixTakerDryOfferRemoval" },
+    { "name": "fixTrustLinesToSelf", "introduced": "2026.6.21" },
+    { "name": "fixUniversalNumber" },
+    { "name": "fixXahauV1", "introduced": "2023.12.29", "enabled": { "ledger_index": 2060289, "date": "2024-01-10" } },
+    { "name": "fixXahauV2", "introduced": "2024.1.25", "enabled": { "ledger_index": 2718721, "date": "2024-02-03" } },
+    { "name": "fixXahauV3", "introduced": "2025.2.6", "enabled": { "ledger_index": 12125185, "date": "2025-02-16" } },
+    { "name": "Flow" },
+    { "name": "FlowCross" },
+    { "name": "FlowSortStrands" },
+    { "name": "HardenedValidations" },
+    { "name": "HookAPISerializedType240", "introduced": "2026.6.21" },
+    { "name": "HookCanEmit", "introduced": "2025.5.1", "enabled": { "ledger_index": 14259201, "date": "2025-05-18" } },
+    { "name": "HookOnV2", "introduced": "2026.6.21", "obsolete": true },
+    { "name": "HookOnV2_1", "introduced": "2026.10.13" },
+    { "name": "Hooks" },
+    { "name": "HooksUpdate1" },
+    { "name": "HooksUpdate2", "introduced": "2026.6.21" },
+    { "name": "ImmediateOfferKilled" },
+    { "name": "Import" },
+    { "name": "InvariantsV1_1", "obsolete": true },
+    {
+      "name": "IOUIssuerWeakTSH",
+      "introduced": "2025.7.9",
+      "enabled": { "ledger_index": 17069313, "date": "2025-09-14" }
+    },
+    {
+      "name": "IOURewardClaim",
+      "introduced": "2026.6.21",
+      "enabled": { "ledger_index": 24415489, "date": "2026-07-18" }
+    },
+    { "name": "MPTokensV1", "obsolete": true },
+    { "name": "MultiSign", "retired": true },
+    { "name": "MultiSignReserve" },
+    { "name": "NamedHooks", "introduced": "2026.6.21" },
+    { "name": "NegativeUNL" },
+    { "name": "NFTokenMintOffer", "obsolete": true },
+    { "name": "NonFungibleTokensV1", "obsolete": true },
+    { "name": "NonFungibleTokensV1_1" },
+    { "name": "OnChainManifests", "introduced": "2026.10.13" },
+    { "name": "OwnerPaysFee", "obsolete": true },
+    { "name": "PayChan", "retired": true },
+    { "name": "PaychanAndEscrowForTokens" },
+    { "name": "PermissionedDomains", "obsolete": true },
+    { "name": "PriceOracle", "introduced": "2026.6.21", "enabled": { "ledger_index": 24415489, "date": "2026-07-18" } },
+    { "name": "PWALoader", "introduced": "2026.10.13" },
+    { "name": "Remarks", "introduced": "2025.5.1", "enabled": { "ledger_index": 14259201, "date": "2025-05-18" } },
+    {
+      "name": "Remit",
+      "introduced": "2024.3.12",
+      "xls": "XLS-55",
+      "xls_url": "https://github.com/XRPLF/XRPL-Standards/discussions/156",
+      "enabled": { "ledger_index": 4206593, "date": "2024-03-30" }
+    },
+    { "name": "RequireFullyCanonicalSig" },
+    { "name": "RNG", "introduced": "2026.10.13" },
+    { "name": "SortedDirectories", "retired": true },
+    { "name": "TicketBatch" },
+    { "name": "TickSize", "retired": true },
+    { "name": "Touch", "introduced": "2025.5.1", "enabled": { "ledger_index": 14259201, "date": "2025-05-18" } },
+    { "name": "TrustSetAuth", "retired": true },
+    { "name": "URIToken" },
+    { "name": "XahauGenesis", "enabled": { "ledger_index": 3, "date": "2023-10-30" } },
+    { "name": "XChainBridge", "obsolete": true },
+    { "name": "XRPFees" },
+    { "name": "ZeroB2M", "introduced": "2024.4.21", "enabled": { "ledger_index": 5297153, "date": "2024-05-11" } }
+  ]
+}
