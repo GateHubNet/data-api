@@ -53,15 +53,16 @@ export interface FleetMember {
 const fleets = new Map<string, FleetMember[]>();
 
 /**
- * `size` validators with valid keys (`nH...` master, `n9...` signing), made from labels, so the same call gives the same
- * keys. The keys of the first `n` do not depend on `size`.
+ * `size` validators with valid keys, made from labels, so the same call gives the same keys. The keys of the first `n` do
+ * not depend on `size`. The master key is an ed25519 key (`nH...`), as the master keys of the real validators are; the
+ * signing key is a secp256k1 key (`n9...`), as rippled makes its signing keys.
  */
 export function fleet(network: NetworkName, size: number): FleetMember[] {
   const members = fleets.get(network) ?? [];
   fleets.set(network, members);
   for (let index = members.length; index < size; index++) {
     const master = testKey(`${network}-validator-${index}`);
-    const signing = testKey(`${network}-signing-${index}`);
+    const signing = testKey(`${network}-signing-${index}`, 'ecdsa-secp256k1');
     members.push({ index, master, signing, key: master.base58, ephemeral: signing.base58 });
   }
   return members.slice(0, size);
@@ -535,7 +536,7 @@ export async function seedFleet(ch: ClickHouseService, options: FleetOptions = {
   await insertLedgers(ch, HEAD_LEDGER, headClose, 1000, LEDGER_INTERVAL);
 
   // manifests: every validator has one; unl[0] rotated its signing key and has a domain, as have unl[1] and others[1]
-  const rotated = testKey('xrpl-signing-rotated-0');
+  const rotated = testKey('xrpl-signing-rotated-0', 'ecdsa-secp256k1');
   await insertManifests(ch, [
     ...members.map((m) => ({ ephemeral_key: m.ephemeral, master_key: m.key, seq: 1 })),
     { ephemeral_key: rotated.base58, master_key: unl[0].key, seq: 2, domain: 'northpeak.example' },
