@@ -9,8 +9,8 @@ interface Entry<T> {
  * Minimal in-process TTL cache with a size cap.
  *
  * Used to shield the XRPL node from repeated identical live-state calls
- * (balances / open orders) within a short window, and ClickHouse from recomputing the rates of days that have no
- * `native_rates_daily` set yet (`DailyRates`). In-process is fine for a single
+ * (balances / open orders) within a short window, and, as an instance of its own (`RATES_CACHE`), ClickHouse from
+ * recomputing the rates of days that have no `native_rates_daily` set yet (`DailyRates`). In-process is fine for a single
  * instance; for a horizontally-scaled deployment swap this for a shared Redis cache
  * (the `wrap`, `get` and `set` signatures are the same) so the cache is shared across replicas.
  */
@@ -49,6 +49,8 @@ export class CacheService {
   }
 
   private put<T>(key: string, value: T, expiresAt: number): void {
+    // a key that is kept already is taken out first: refreshing it evicts no other key, and puts it at the newest position
+    this.store.delete(key);
     if (this.store.size >= this.maxEntries) {
       // cheap eviction: drop the oldest inserted key
       const oldest = this.store.keys().next().value;

@@ -110,6 +110,38 @@ describe('CacheService', () => {
       expect(cache.get('new')).toBe('v');
     });
 
+    it('refreshing a key that is kept evicts no other key, even at 10,000 entries', () => {
+      const cache = new CacheService();
+      for (let i = 0; i < MAX; i++) cache.set(`k${i}`, i, 60_000);
+
+      cache.set('k5', 'again', 60_000);
+      expect(cache.get('k5')).toBe('again');
+      for (let i = 0; i < MAX; i++) if (i !== 5) expect(cache.get(`k${i}`)).toBe(i);
+    });
+
+    it('wrap refreshing a key whose ttl is over evicts no other key either', async () => {
+      const cache = new CacheService();
+      for (let i = 0; i < MAX; i++) cache.set(`k${i}`, i, i === 7 ? 1000 : 60_000);
+      now += 1001;
+
+      expect(await cache.wrap('k7', 60_000, async () => 'produced')).toBe('produced');
+      expect(cache.get('k7')).toBe('produced');
+      for (let i = 0; i < MAX; i++) if (i !== 7) expect(cache.get(`k${i}`)).toBe(i);
+    });
+
+    it('a refreshed key moves to the newest position: the evictions after it take the oldest of the others', () => {
+      const cache = new CacheService();
+      for (let i = 0; i < MAX; i++) cache.set(`k${i}`, i, 60_000);
+      cache.set('k5', 'refreshed', 60_000);
+
+      // ten more keys push out ten: k0 to k4 and k6 to k10 (k5 is the newest of the keys that were there)
+      for (let i = 0; i < 10; i++) cache.set(`n${i}`, i, 60_000);
+      expect(cache.get('k5')).toBe('refreshed');
+      for (const gone of ['k0', 'k4', 'k6', 'k10']) expect(cache.get(gone)).toBeUndefined();
+      expect(cache.get('k11')).toBe(11);
+      expect(cache.get('n9')).toBe(9);
+    });
+
     it('counts the entries of set and of wrap together', async () => {
       const cache = new CacheService();
       for (let i = 0; i < MAX / 2; i++) cache.set(`s${i}`, i, 60_000);
