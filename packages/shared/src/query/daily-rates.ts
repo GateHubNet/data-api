@@ -29,6 +29,21 @@ export interface DailyRatesOptions {
   onRead?: (assetDays: number) => void;
 }
 
+/**
+ * The rates of assets on days as rows for a SQL join (`DailyRates.rateRowsSql`): a subquery of `currency`, `issuer`, `day`
+ * and `rate_f` (the rate as a Float64), the parameters it names (all prefixed `dr_`), and what was computed on read.
+ */
+export interface RateRows {
+  /**
+   * What was computed on read, as `rates` has it, and only that: the issued assets on the days that have no valid set,
+   * 0 where an asset has no rate. The valid days are rows of the SQL and are not here; the native currency is 1 on every day.
+   */
+  rates: DayRates;
+  /** `SELECT currency, issuer, day, rate_f ...`, to use as a subquery. Each (currency, issuer, day) is in it once. */
+  sql: string;
+  params: Record<string, unknown>;
+}
+
 /** How long an asset-day computed on read is kept: it is a day that is not closed or not final yet, or has no set. */
 export const ON_READ_CACHE_MS = 60_000;
 /** The most days of one asset that one `dailyNativeRates` call is asked for (it answers 3660 at most). */
@@ -39,6 +54,36 @@ const ON_READ_CONCURRENCY = 4;
 const DAY_MS = 86_400_000;
 const ZERO = new BigNumber(0);
 const ONE = new BigNumber(1);
+
+/** The rows of the rates a SQL join reads, when there are none: no asset, no day, or nothing issued. */
+const NO_RATE_ROWS = "SELECT '' AS currency, '' AS issuer, toDate('1970-01-01') AS day, toFloat64(0) AS rate_f WHERE 0";
+
+/**
+ * The rows of the assets `{dr_asset_currencies}` and `{dr_asset_issuers}` for the valid days between `{dr_from}` and
+ * `{dr_through}` that are not computed on read (`{dr_read_days}`). The valid days are found in the SQL itself, from the
+ * sentinels of the range (the newest of each day, not stale, of the current config version), and a day's rows are those of
+ * its sentinel's version: nothing per day is passed. Each (currency, issuer, day) once.
+ */
+const STORED_RATE_ROWS = `SELECT toString(currency) AS currency, issuer, day, rate_f
+  FROM (SELECT currency, issuer, day, rate_f
+          FROM ${Table.NativeRatesDaily}
+         WHERE (currency, issuer) IN (SELECT arrayJoin(arrayZip({dr_asset_currencies:Array(String)}, {dr_asset_issuers:Array(String)})))
+           AND day BETWEEN {dr_from:Date} AND {dr_through:Date}
+           AND NOT has({dr_read_days:Array(Date)}, day)
+           AND (day, version) IN (SELECT day, version
+                                    FROM (SELECT day, version, stale, config_version
+                                            FROM ${Table.NativeRatesDaily}
+                                           WHERE currency = '' AND issuer = '' AND day BETWEEN {dr_from:Date} AND {dr_through:Date}
+                                           ORDER BY currency, issuer, day, version DESC
+                                           LIMIT 1 BY day)
+                                   WHERE stale = 0 AND config_version = {dr_config_version:UInt32})
+           AND rate_f > 0
+         ORDER BY currency, issuer, day
+         LIMIT 1 BY currency, issuer, day)`;
+
+/** The asset-days computed on read, one row each: `{dr_currencies}`, `{dr_issuers}`, `{dr_days}` and `{dr_rates}` side by side. */
+const READ_RATE_ROWS = `SELECT t.1 AS currency, t.2 AS issuer, t.3 AS day, t.4 AS rate_f
+  FROM (SELECT arrayJoin(arrayZip({dr_currencies:Array(String)}, {dr_issuers:Array(String)}, {dr_days:Array(Date)}, {dr_rates:Array(Float64)})) AS t)`;
 
 const midnightOf = (day: string): number => Date.parse(`${day}T00:00:00Z`);
 const cacheKeyOf = (key: string, day: string): string => `daily-rate:${key}:${day}`;
@@ -92,6 +137,80 @@ export class DailyRates {
    * that is not in the cache, is computed with `dailyNativeRates` in runs of consecutive days, and kept for a minute.
    */
   async rates(assets: Asset[], days: string[]): Promise<DayRates> {
+    const { wanted, out, issued } = this.start(assets, days);
+    if (issued.size === 0 || wanted.length === 0) return out;
+
+    const valid = await validRateDays(this.ch, wanted[0], wanted[wanted.length - 1]);
+    const stored = wanted.filter((day) => valid.has(day));
+    if (stored.length > 0) await this.readSets(out, [...issued.values()], stored, valid);
+    const missing = wanted.filter((day) => !valid.has(day));
+    if (missing.length > 0) await this.computeOnRead(out, issued, missing);
+    return out;
+  }
+
+  /**
+   * The same rates as `rates` gives, for a SQL that joins them to rows (a route that ranks in SQL by value): a subquery of
+   * `currency`, `issuer`, `day` and `rate_f` with a row for each asset-day that has a rate above 0, and its parameters.
+   *
+   * What is stored is not read here. The rows of the valid days are selected by the SQL itself, from the sentinels of the
+   * range, so no list of days or versions travels in the parameters; only the asset-days computed on read are passed, as
+   * arrays (`dr_currencies`, `dr_issuers`, `dr_days`, `dr_rates`), each with its rate above 0. A day computed on read is
+   * left out of the stored rows (`dr_read_days`), so that a day that becomes valid between the two reads is in one of them only.
+   * The one read made here is `validRateDays`, which tells the days to compute; they go through the cache of the rates as
+   * the days of `rates` do. The native currency and an issued currency without an issuer have no rows.
+   */
+  async rateRowsSql(assets: Asset[], days: string[]): Promise<RateRows> {
+    const { wanted, out, issued } = this.start(assets, days);
+    if (issued.size === 0 || wanted.length === 0) return { rates: out, sql: NO_RATE_ROWS, params: {} };
+
+    const valid = await validRateDays(this.ch, wanted[0], wanted[wanted.length - 1]);
+    const stored = wanted.filter((day) => valid.has(day));
+    const missing = wanted.filter((day) => !valid.has(day));
+    // the rates of the valid days are the SQL's: what `rates` holds is only what is computed here
+    for (const key of issued.keys()) for (const day of stored) out.get(key)?.delete(day);
+    if (missing.length > 0) await this.computeOnRead(out, issued, missing);
+
+    const parts: string[] = [];
+    const params: Record<string, unknown> = {};
+    if (stored.length > 0) {
+      parts.push(STORED_RATE_ROWS);
+      Object.assign(params, {
+        dr_asset_currencies: [...issued.values()].map((a) => a.currency),
+        dr_asset_issuers: [...issued.values()].map((a) => a.issuer),
+        dr_from: stored[0],
+        dr_through: stored[stored.length - 1],
+        dr_read_days: missing,
+        dr_config_version: RATES_DAILY_CONFIG_VERSION,
+      });
+    }
+    const read = { currencies: [] as string[], issuers: [] as string[], days: [] as string[], rates: [] as number[] };
+    for (const [key, asset] of issued) {
+      for (const day of missing) {
+        const rate = out.get(key)?.get(day)?.toNumber();
+        if (rate === undefined || !(rate > 0) || !Number.isFinite(rate)) continue;
+        read.currencies.push(asset.currency);
+        read.issuers.push(asset.issuer as string);
+        read.days.push(day);
+        read.rates.push(rate);
+      }
+    }
+    if (read.days.length > 0) {
+      parts.push(READ_RATE_ROWS);
+      Object.assign(params, {
+        dr_currencies: read.currencies,
+        dr_issuers: read.issuers,
+        dr_days: read.days,
+        dr_rates: read.rates,
+      });
+    }
+    return { rates: out, sql: parts.length > 0 ? parts.join('\nUNION ALL\n') : NO_RATE_ROWS, params };
+  }
+
+  /**
+   * The days asked for (each once, ascending), an entry in the answer for every asset (the native currency is 1, every
+   * other 0 until it is found), and the issued assets, which are the ones with a rate to find.
+   */
+  private start(assets: Asset[], days: string[]): { wanted: string[]; out: DayRates; issued: Map<string, Asset> } {
     const wanted = [...new Set(days)].sort();
     const out: DayRates = new Map();
     const issued = new Map<string, Asset>();
@@ -102,14 +221,7 @@ export class DailyRates {
       out.set(key, new Map(wanted.map((day) => [day, native ? ONE : ZERO])));
       if (!native && asset.issuer) issued.set(key, asset);
     }
-    if (issued.size === 0 || wanted.length === 0) return out;
-
-    const valid = await validRateDays(this.ch, wanted[0], wanted[wanted.length - 1]);
-    const stored = wanted.filter((day) => valid.has(day));
-    if (stored.length > 0) await this.readSets(out, [...issued.values()], stored, valid);
-    const missing = wanted.filter((day) => !valid.has(day));
-    if (missing.length > 0) await this.computeOnRead(out, issued, missing);
-    return out;
+    return { wanted, out, issued };
   }
 
   /** The rates of `assets` on `days`, from the sets whose versions `valid` names. */

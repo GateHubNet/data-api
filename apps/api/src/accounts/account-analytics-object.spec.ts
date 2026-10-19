@@ -8,13 +8,22 @@ import {
   changeAsset,
   ChangeAssetRow,
   ChangeBucketRow,
+  counterpartiesAnswer,
+  exchangesAnswer,
   ratedChangeAssets,
+  ratedCounterpartyAssets,
+  ratedPairAssets,
   StoredChangeGroup,
+  StoredCounterparty,
+  StoredCounterpartySum,
   StoredLine,
   StoredLineBucket,
+  StoredPairGroup,
   toBalanceChanges,
   toBalanceLines,
   toBalanceRows,
+  toCounterparties,
+  toExchangePairs,
 } from './account-analytics-object';
 import { analyticsWindow } from './analytics-window';
 
@@ -196,6 +205,183 @@ describe('the key orders', () => {
         out_value: '0.000036',
       });
     });
+  });
+});
+
+describe('the key orders of counterparties and exchanges', () => {
+  const window = analyticsWindow({ start: '2026-09-20', end: '2026-10-19' }, NOW, 'none');
+
+  it('counterparties: the answer is result, start, end, sort, total, count, counterparties', () => {
+    const answer = counterpartiesAnswer(window, 'value', {
+      total: 14,
+      counterparties: [
+        {
+          account: OTHER,
+          sent_value: '4820',
+          received_value: '0',
+          total_value: '4820',
+          payments_sent: 9,
+          payments_received: 0,
+          first: '2026-09-21T10:11:12Z',
+          last: '2026-10-17T08:00:01Z',
+        },
+      ],
+    });
+    expect(Object.keys(answer)).toEqual(['result', 'start', 'end', 'sort', 'total', 'count', 'counterparties']);
+    expect(answer).toMatchObject({
+      result: 'success',
+      start: '2026-09-20T00:00:00Z',
+      end: '2026-10-20T00:00:00Z',
+      sort: 'value',
+      total: 14,
+      count: 1,
+    });
+    expect(counterpartiesAnswer(window, 'count', { total: 0, counterparties: [] })).toMatchObject({
+      sort: 'count',
+      total: 0,
+      count: 0,
+      counterparties: [],
+    });
+  });
+
+  it('a counterparty is account, sent_value, received_value, total_value, payments_sent, payments_received, first, last', () => {
+    const [entry] = toCounterparties({
+      native: 'XRP',
+      sort: 'value',
+      limit: 20,
+      chosen: [
+        {
+          counterparty: OTHER,
+          payments_sent: 2,
+          payments_received: 1,
+          first_at: 1_600_000_000,
+          last_at: 1_600_086_400,
+        },
+      ],
+      sums: [
+        {
+          counterparty: OTHER,
+          side: 'sent',
+          currency: 'XRP',
+          issuer: '',
+          day: '2020-09-13',
+          amount_sum: '5',
+          unfit: 0,
+          amount_sum_f: 5,
+        },
+      ],
+      rates: new Map(),
+    });
+    expect(Object.keys(entry)).toEqual([
+      'account',
+      'sent_value',
+      'received_value',
+      'total_value',
+      'payments_sent',
+      'payments_received',
+      'first',
+      'last',
+    ]);
+    expect(entry).toEqual({
+      account: OTHER,
+      sent_value: '5',
+      received_value: '0',
+      total_value: '5',
+      payments_sent: 2,
+      payments_received: 1,
+      first: '2020-09-13T12:26:40Z',
+      last: '2020-09-14T12:26:40Z',
+    });
+  });
+
+  it('exchanges: the answer is result, start, end, total, count, pairs', () => {
+    const answer = exchangesAnswer(window, { total: 4, pairs: [] });
+    expect(Object.keys(answer)).toEqual(['result', 'start', 'end', 'total', 'count', 'pairs']);
+    expect(answer).toEqual({
+      result: 'success',
+      start: '2026-09-20T00:00:00Z',
+      end: '2026-10-20T00:00:00Z',
+      total: 4,
+      count: 0,
+      pairs: [],
+    });
+    expect(exchangesAnswer(window, { total: 9, pairs: [{} as never, {} as never] })).toMatchObject({
+      total: 9,
+      count: 2,
+    });
+  });
+
+  it('a pair is base_currency, base_issuer?, counter_currency, counter_issuer?, count, base_volume, counter_volume, bought, sold, bought_counter, sold_counter, native_volume?', () => {
+    const group = (extra: Partial<StoredPairGroup>): StoredPairGroup => ({
+      day: '2026-09-21',
+      base_currency: 'USD',
+      base_issuer: ISSUER,
+      counter_currency: 'XRP',
+      counter_issuer: '',
+      n: 9,
+      base_sum: '3500',
+      counter_sum: '8420',
+      bought_sum: '1500',
+      sold_sum: '2000',
+      bought_counter_sum: '3610',
+      sold_counter_sum: '4810',
+      unfit: 0,
+      base_sum_f: 3500,
+      counter_sum_f: 8420,
+      bought_sum_f: 1500,
+      sold_sum_f: 2000,
+      bought_counter_sum_f: 3610,
+      sold_counter_sum_f: 4810,
+      ...extra,
+    });
+    // a native side: native_volume is that side's volume, and the issuer of the native side is left out
+    const [native] = toExchangePairs({ native: 'XRP', groups: [group({})], rates: new Map(), limit: 20 }).pairs;
+    expect(Object.keys(native)).toEqual([
+      'base_currency',
+      'base_issuer',
+      'counter_currency',
+      'count',
+      'base_volume',
+      'counter_volume',
+      'bought',
+      'sold',
+      'bought_counter',
+      'sold_counter',
+      'native_volume',
+    ]);
+    expect(native).toEqual({
+      base_currency: 'USD',
+      base_issuer: ISSUER,
+      counter_currency: 'XRP',
+      count: 9,
+      base_volume: '3500',
+      counter_volume: '8420',
+      bought: '1500',
+      sold: '2000',
+      bought_counter: '3610',
+      sold_counter: '4810',
+      native_volume: '8420',
+    });
+    // two issued sides, both issuers; no rate on any day: no native_volume
+    const [issued] = toExchangePairs({
+      native: 'XRP',
+      groups: [group({ counter_currency: 'EUR', counter_issuer: OTHER })],
+      rates: new Map(),
+      limit: 20,
+    }).pairs;
+    expect(Object.keys(issued)).toEqual([
+      'base_currency',
+      'base_issuer',
+      'counter_currency',
+      'counter_issuer',
+      'count',
+      'base_volume',
+      'counter_volume',
+      'bought',
+      'sold',
+      'bought_counter',
+      'sold_counter',
+    ]);
   });
 });
 
@@ -575,5 +761,371 @@ describe('ratedChangeAssets', () => {
 
   it('is nothing for groups that moved only the native currency', () => {
     expect(ratedChangeAssets([g('2020-02-10', 'XRP', '', '1', '0')])).toEqual({ assets: [], days: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('toCounterparties', () => {
+  const USD = `USD.${ISSUER}`;
+  const B = 'rBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+  const C = 'rCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC';
+  const D = 'rDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD';
+  const rates = (entries: Record<string, Record<string, string>>): DayRates =>
+    new Map(
+      Object.entries(entries).map(([asset, days]) => [
+        asset,
+        new Map(Object.entries(days).map(([day, rate]) => [day, new BigNumber(rate)])),
+      ]),
+    );
+  const chosen = (counterparty: string, sent: number, received: number): StoredCounterparty => ({
+    counterparty,
+    payments_sent: sent,
+    payments_received: received,
+    first_at: 1_580_000_000,
+    last_at: 1_590_000_000,
+  });
+  const sum = (
+    counterparty: string,
+    side: 'sent' | 'received',
+    currency: string,
+    issuer: string,
+    day: string,
+    amount: string,
+    extra: Partial<StoredCounterpartySum> = {},
+  ): StoredCounterpartySum => ({
+    counterparty,
+    side,
+    currency,
+    issuer,
+    day,
+    amount_sum: amount,
+    unfit: 0,
+    amount_sum_f: Number(amount),
+    ...extra,
+  });
+  const run = (
+    over: Partial<Parameters<typeof toCounterparties>[0]> &
+      Pick<Parameters<typeof toCounterparties>[0], 'chosen' | 'sums'>,
+  ) => toCounterparties({ native: 'XRP', sort: 'value', limit: 20, rates: new Map(), ...over });
+
+  it('values each sum at the rate of its day: the native currency is itself, an issued amount over its rate, 0 without one', () => {
+    const [entry] = run({
+      chosen: [chosen(B, 3, 2)],
+      sums: deepFreeze([
+        sum(B, 'sent', 'XRP', '', '2020-02-10', '7'),
+        sum(B, 'sent', 'USD', ISSUER, '2020-02-10', '20'), // 20 / 2
+        sum(B, 'sent', 'USD', ISSUER, '2020-04-20', '40'), // 40 / 4
+        sum(B, 'received', 'USD', ISSUER, '2020-03-01', '6'), // no rate that day
+        sum(B, 'received', 'EUR', OTHER, '2020-02-10', '3'), // no rate at all
+      ]),
+      rates: rates({ [USD]: { '2020-02-10': '2', '2020-04-20': '4' } }),
+    });
+    expect(entry).toMatchObject({ sent_value: '27', received_value: '0', total_value: '27' });
+  });
+
+  it('sent and received are valued apart, and the total is their sum', () => {
+    const [entry] = run({
+      chosen: [chosen(B, 1, 1)],
+      sums: [sum(B, 'sent', 'XRP', '', '2020-02-10', '3.5'), sum(B, 'received', 'XRP', '', '2020-02-11', '1.25')],
+    });
+    expect(entry).toMatchObject({ sent_value: '3.5', received_value: '1.25', total_value: '4.75' });
+  });
+
+  it('the quotient is cut to 17 significant digits per counterparty, side, asset and day, and the sums are exact', () => {
+    const [entry] = run({
+      chosen: [chosen(B, 2, 0)],
+      sums: [sum(B, 'sent', 'USD', ISSUER, '2020-02-10', '1'), sum(B, 'sent', 'USD', ISSUER, '2020-02-11', '1')],
+      rates: rates({ [USD]: { '2020-02-10': '3', '2020-02-11': '3' } }),
+    });
+    // 1 / 3 = 0.33333333333333333 (17 digits), twice
+    expect(entry.sent_value).toBe('0.66666666666666666');
+  });
+
+  it('adds exact decimals: 0.1 and 0.2 are 0.3', () => {
+    const [entry] = run({
+      chosen: [chosen(B, 2, 0)],
+      sums: [sum(B, 'sent', 'XRP', '', '2020-02-10', '0.1'), sum(B, 'sent', 'XRP', '', '2020-02-11', '0.2')],
+    });
+    expect(entry.sent_value).toBe('0.3');
+  });
+
+  it('uses the Float64 sum of a group that holds an amount a decimal cannot', () => {
+    const [entry] = run({
+      chosen: [chosen(B, 2, 0)],
+      sums: [sum(B, 'sent', 'XRP', '', '2020-02-10', '1', { unfit: 1, amount_sum_f: 1.5 })],
+    });
+    expect(entry.sent_value).toBe('1.5');
+  });
+
+  it('sort=value: the largest total value first, then the account; the exact value decides what the Float64 one ties', () => {
+    // the Float64 values of B and C are the same (2^53), and their exact values differ by one: C is the larger
+    const found = run({
+      chosen: [chosen(B, 1, 0), chosen(C, 1, 0), chosen(D, 1, 0)],
+      sums: [
+        sum(B, 'sent', 'XRP', '', '2020-02-10', '9007199254740992'),
+        sum(C, 'sent', 'XRP', '', '2020-02-10', '9007199254740993', { amount_sum_f: 9007199254740992 }),
+        sum(D, 'sent', 'XRP', '', '2020-02-10', '9007199254740992'),
+      ],
+    });
+    expect(found.map((c) => [c.account, c.total_value])).toEqual([
+      [C, '9007199254740993'],
+      [B, '9007199254740992'],
+      [D, '9007199254740992'],
+    ]);
+  });
+
+  it('sort=count: payments_sent + payments_received, largest first, then the account, whatever the values', () => {
+    const found = run({
+      sort: 'count',
+      chosen: [chosen(D, 1, 1), chosen(B, 1, 0), chosen(C, 0, 2)],
+      sums: [
+        sum(B, 'sent', 'XRP', '', '2020-02-10', '1000'),
+        sum(C, 'received', 'XRP', '', '2020-02-10', '1'),
+        sum(D, 'sent', 'XRP', '', '2020-02-10', '1'),
+      ],
+    });
+    expect(found.map((c) => c.account)).toEqual([C, D, B]);
+  });
+
+  it('serves the first limit of them', () => {
+    const accounts = [B, C, D];
+    const input = {
+      chosen: accounts.map((a) => chosen(a, 1, 0)),
+      sums: accounts.map((a, i) => sum(a, 'sent', 'XRP', '', '2020-02-10', String(i + 1))),
+    };
+    expect(run({ ...input, limit: 2 }).map((c) => c.account)).toEqual([D, C]);
+    expect(run({ ...input, limit: 1 }).map((c) => c.account)).toEqual([D]);
+    expect(run({ ...input, limit: 10 })).toHaveLength(3);
+  });
+
+  it('first and last are the times of the first and the last payment', () => {
+    const [entry] = run({ chosen: [chosen(B, 1, 0)], sums: [sum(B, 'sent', 'XRP', '', '2020-02-10', '1')] });
+    expect([entry.first, entry.last]).toEqual(['2020-01-26T00:53:20Z', '2020-05-20T18:40:00Z']);
+  });
+
+  it('a counterparty without a sum is worth 0, and nothing for nothing', () => {
+    expect(run({ chosen: [chosen(B, 1, 0)], sums: [] })[0]).toMatchObject({ total_value: '0', payments_sent: 1 });
+    expect(run({ chosen: [], sums: [] })).toEqual([]);
+  });
+
+  it('ratedCounterpartyAssets asks for the issued assets that moved and the days, each once, and for no native currency', () => {
+    expect(
+      ratedCounterpartyAssets([
+        sum(B, 'sent', 'USD', ISSUER, '2020-02-11', '1'),
+        sum(C, 'received', 'USD', ISSUER, '2020-02-10', '2'),
+        sum(B, 'sent', 'EUR', OTHER, '2020-02-10', '3'),
+        sum(B, 'sent', 'XRP', '', '2020-02-12', '3'),
+        sum(B, 'sent', 'CAD', ISSUER, '2020-02-13', '0'),
+      ]),
+    ).toEqual({
+      assets: [
+        { currency: 'USD', issuer: ISSUER },
+        { currency: 'EUR', issuer: OTHER },
+      ],
+      days: ['2020-02-10', '2020-02-11'],
+    });
+    expect(ratedCounterpartyAssets([sum(B, 'sent', 'XRP', '', '2020-02-12', '3')])).toEqual({ assets: [], days: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('toExchangePairs', () => {
+  const USD = `USD.${ISSUER}`;
+  const EUR = `EUR.${OTHER}`;
+  const rates = (entries: Record<string, Record<string, string>>): DayRates =>
+    new Map(
+      Object.entries(entries).map(([asset, days]) => [
+        asset,
+        new Map(Object.entries(days).map(([day, rate]) => [day, new BigNumber(rate)])),
+      ]),
+    );
+  /** A day group of the pair USD (of ISSUER) / XRP unless said otherwise. The sums are those of its two volumes. */
+  const group = (
+    day: string,
+    base: string,
+    counter: string,
+    extra: Partial<StoredPairGroup> = {},
+  ): StoredPairGroup => ({
+    day,
+    base_currency: 'USD',
+    base_issuer: ISSUER,
+    counter_currency: 'XRP',
+    counter_issuer: '',
+    n: 1,
+    base_sum: base,
+    counter_sum: counter,
+    bought_sum: base,
+    sold_sum: '0',
+    bought_counter_sum: counter,
+    sold_counter_sum: '0',
+    unfit: 0,
+    base_sum_f: Number(base),
+    counter_sum_f: Number(counter),
+    bought_sum_f: Number(base),
+    sold_sum_f: 0,
+    bought_counter_sum_f: Number(counter),
+    sold_counter_sum_f: 0,
+    ...extra,
+  });
+  const eurUsd = (day: string, base: string, counter: string, n = 1): StoredPairGroup =>
+    group(day, base, counter, {
+      base_currency: 'EUR',
+      base_issuer: OTHER,
+      counter_currency: 'USD',
+      counter_issuer: ISSUER,
+      n,
+    });
+  const run = (groups: StoredPairGroup[], r: DayRates = new Map(), limit = 20) =>
+    toExchangePairs({ native: 'XRP', groups: deepFreeze(groups), rates: r, limit });
+
+  it('adds the days of a pair up: count, the volumes, bought, sold, and the counter of those', () => {
+    const { total, pairs } = run([
+      group('2020-02-10', '10', '5', {
+        n: 2,
+        bought_sum: '4',
+        sold_sum: '6',
+        bought_counter_sum: '2',
+        sold_counter_sum: '3',
+      }),
+      group('2020-02-11', '0.5', '0.25', {
+        n: 1,
+        bought_sum: '0',
+        sold_sum: '0.5',
+        bought_counter_sum: '0',
+        sold_counter_sum: '0.25',
+      }),
+    ]);
+    expect(total).toBe(1);
+    expect(pairs[0]).toMatchObject({
+      count: 3,
+      base_volume: '10.5',
+      counter_volume: '5.25',
+      bought: '4',
+      sold: '6.5',
+      bought_counter: '2',
+      sold_counter: '3.25',
+    });
+  });
+
+  it('native_volume of a pair with a native side is that side: the counter, or the base', () => {
+    const { pairs } = run([
+      group('2020-02-10', '10', '5'),
+      group('2020-02-11', '0.5', '0.25'),
+      group('2020-02-10', '8', '3', {
+        base_currency: 'XRP',
+        base_issuer: '',
+        counter_currency: 'ZAR',
+        counter_issuer: OTHER,
+      }),
+    ]);
+    expect(pairs.map((p) => [p.base_currency, p.counter_currency, p.native_volume])).toEqual([
+      ['XRP', 'ZAR', '8'],
+      ['USD', 'XRP', '5.25'],
+    ]);
+  });
+
+  it("without a native side: per day the base volume over the base's rate, else the counter volume over the counter's rate, summed", () => {
+    const { pairs } = run(
+      [
+        eurUsd('2020-02-10', '30', '60'), // the base has a rate: 30 / 0.5 = 60
+        eurUsd('2020-02-11', '10', '20'), // only the counter: 20 / 4 = 5
+        eurUsd('2020-02-12', '10', '20'), // neither: nothing
+        eurUsd('2020-02-13', '9', '18'), // both: the base's, 9 / 3 = 3
+      ],
+      rates({
+        [EUR]: { '2020-02-10': '0.5', '2020-02-12': '0', '2020-02-13': '3' },
+        [USD]: { '2020-02-10': '2', '2020-02-11': '4', '2020-02-13': '6' },
+      }),
+    );
+    expect(pairs[0].native_volume).toBe('68');
+  });
+
+  it('is left out when no day of the pair had a rate', () => {
+    const { pairs } = run([eurUsd('2020-02-10', '30', '60')], rates({ [EUR]: { '2020-02-10': '0' } }));
+    expect(pairs[0]).not.toHaveProperty('native_volume');
+    expect(Object.keys(pairs[0])).not.toContain('native_volume');
+  });
+
+  it('the quotient is cut to 17 significant digits per pair and day', () => {
+    const { pairs } = run(
+      [eurUsd('2020-02-10', '1', '1'), eurUsd('2020-02-11', '1', '1')],
+      rates({ [EUR]: { '2020-02-10': '3', '2020-02-11': '3' } }),
+    );
+    expect(pairs[0].native_volume).toBe('0.66666666666666666');
+  });
+
+  it('sorts by native_volume, the largest first; the pairs without one last, by count; then by the pair', () => {
+    const noRate = (base: string, n: number): StoredPairGroup =>
+      group('2020-02-10', '1', '1', {
+        base_currency: base,
+        base_issuer: OTHER,
+        counter_currency: 'CCC',
+        counter_issuer: OTHER,
+        n,
+      });
+    const { pairs, total } = run([
+      // native volumes 5, 5 and 7: the two of 5 are USD of two issuers, and the pair key tells them apart (OTHER sorts first)
+      group('2020-02-10', '1', '5'),
+      group('2020-02-10', '1', '5', { base_issuer: OTHER }),
+      group('2020-02-10', '1', '7', { base_currency: 'AAA', base_issuer: OTHER }),
+      // and three pairs without one: by count, then the pair
+      noRate('BBB', 2),
+      noRate('DDD', 5),
+      noRate('AAB', 2),
+    ]);
+    expect(total).toBe(6);
+    expect(pairs.map((p) => [p.base_currency, p.base_issuer, p.counter_currency])).toEqual([
+      ['AAA', OTHER, 'XRP'],
+      ['USD', OTHER, 'XRP'],
+      ['USD', ISSUER, 'XRP'],
+      ['DDD', OTHER, 'CCC'],
+      ['AAB', OTHER, 'CCC'],
+      ['BBB', OTHER, 'CCC'],
+    ]);
+  });
+
+  it('serves the first limit pairs and counts them all', () => {
+    const groups = ['A', 'B', 'C'].map((c, i) => group('2020-02-10', '1', String(i + 1), { base_currency: c }));
+    const { total, pairs } = run(groups, new Map(), 2);
+    expect([total, pairs.map((p) => p.base_currency)]).toEqual([3, ['C', 'B']]);
+  });
+
+  it('uses the Float64 sums of a group that holds an amount a decimal cannot', () => {
+    const { pairs } = run([
+      group('2020-02-10', '1', '5', { unfit: 1, base_sum_f: 1.5, counter_sum_f: 5.5, bought_sum_f: 1.5 }),
+    ]);
+    expect(pairs[0]).toMatchObject({ base_volume: '1.5', counter_volume: '5.5', bought: '1.5', native_volume: '5.5' });
+  });
+
+  it('is nothing for nothing', () => {
+    expect(run([])).toEqual({ total: 0, pairs: [] });
+  });
+
+  it('ratedPairAssets asks for the issued sides of the pairs without a native side, and the days of their groups', () => {
+    expect(
+      ratedPairAssets(
+        [
+          eurUsd('2020-02-11', '1', '1'),
+          eurUsd('2020-02-10', '1', '1'),
+          group('2020-02-12', '1', '1'), // a native counter: no rate is needed
+          group('2020-02-13', '1', '1', {
+            base_currency: 'XRP',
+            base_issuer: '',
+            counter_currency: 'ZAR',
+            counter_issuer: OTHER,
+          }),
+        ],
+        'XRP',
+      ),
+    ).toEqual({
+      assets: [
+        { currency: 'EUR', issuer: OTHER },
+        { currency: 'USD', issuer: ISSUER },
+      ],
+      days: ['2020-02-10', '2020-02-11'],
+    });
+    expect(ratedPairAssets([group('2020-02-12', '1', '1')], 'XRP')).toEqual({ assets: [], days: [] });
   });
 });

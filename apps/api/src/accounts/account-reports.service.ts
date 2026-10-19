@@ -51,7 +51,7 @@ const bucketOf = (interval: VolumeInterval): string =>
  * whichever of them `LIMIT 1 BY` reads, and a payment to oneself is never in `payments_received` nor in
  * `sending_counterparties`.
  */
-const SIDE = "if(counterparty = account, 'sent', toString(direction))";
+export const SIDE = "if(counterparty = account, 'sent', toString(direction))";
 
 /**
  * The rows of the account in the ledgers `[min, max]`, each payment once. The tables are not collapsed before a merge
@@ -60,10 +60,14 @@ const SIDE = "if(counterparty = account, 'sent', toString(direction))";
  * `account_payments` (`account, ledger_index, tx_index, direction`), account included though it is fixed: ClickHouse then
  * reads the table in the order of its primary key and does not sort, as a suffix alone could make it read the whole
  * history of the account and sort it.
+ *
+ * `also` is a condition on the columns of the payment (code, never input), added to the key range: it must be true of both
+ * rows of a payment to oneself, or of neither (a condition on the counterparty or the asset is), or the payment would be
+ * read from the one row that is left. The params are `account`, `min` and `max`.
  */
-function read(columns: string): string {
+export function readPayments(columns: string, also?: string): string {
   return `SELECT ${columns} FROM ${Table.AccountPayments}
-           WHERE account = {account:String} AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
+           WHERE account = {account:String} AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}${also === undefined ? '' : ` AND ${also}`}
            ORDER BY account, ledger_index, tx_index, direction
            LIMIT 1 BY ledger_index, tx_index`;
 }
@@ -147,7 +151,7 @@ export class AccountReportsService {
               toUInt32(countIf(delivered_exact IS NULL)) AS unfit,
               sumKahan(delivered_amount_f) AS amount_sum_f,
               max(delivered_amount_f) AS amount_max_f
-         FROM (${read(`${DAY} AS day, ${SIDE} AS dir, currency, issuer, delivered_amount_f, ${exactAmount('delivered_amount')} AS delivered_exact`)})
+         FROM (${readPayments(`${DAY} AS day, ${SIDE} AS dir, currency, issuer, delivered_amount_f, ${exactAmount('delivered_amount')} AS delivered_exact`)})
         GROUP BY day, dir, currency, issuer`,
       params,
     );
@@ -160,7 +164,7 @@ export class AccountReportsService {
   ): Promise<StoredCounterpartyCount[]> {
     return this.ch.query<StoredCounterpartyCount>(
       `SELECT day, dir, toUInt32(uniqExact(counterparty)) AS n
-         FROM (${read(`${bucketOf(interval)} AS day, ${SIDE} AS dir, counterparty`)})
+         FROM (${readPayments(`${bucketOf(interval)} AS day, ${SIDE} AS dir, counterparty`)})
         GROUP BY day, dir`,
       params,
     );
@@ -170,7 +174,7 @@ export class AccountReportsService {
   private counterpartyList(params: Record<string, unknown>, interval: VolumeInterval): Promise<StoredCounterparty[]> {
     return this.ch.query<StoredCounterparty>(
       `SELECT day, dir, counterparty
-         FROM (${read(`${bucketOf(interval)} AS day, ${SIDE} AS dir, counterparty, ledger_index, tx_index`)})
+         FROM (${readPayments(`${bucketOf(interval)} AS day, ${SIDE} AS dir, counterparty, ledger_index, tx_index`)})
         GROUP BY day, dir, counterparty
         ORDER BY day, dir, min(tuple(ledger_index, tx_index))`,
       params,
@@ -180,7 +184,7 @@ export class AccountReportsService {
   /** Every payment, in the order of the ledgers. */
   private payments(params: Record<string, unknown>): Promise<StoredReportPayment[]> {
     return this.ch.query<StoredReportPayment>(
-      read(`${DAY} AS day, tx_hash, delivered_amount AS amount, currency, issuer, ${SIDE} AS type`),
+      readPayments(`${DAY} AS day, tx_hash, delivered_amount AS amount, currency, issuer, ${SIDE} AS type`),
       params,
     );
   }

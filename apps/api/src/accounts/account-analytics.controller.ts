@@ -15,6 +15,12 @@ import {
   BalancesAnswer,
   balancesAnswer,
   CHANGE_TYPE_ORDER,
+  CounterpartiesAnswer,
+  counterpartiesAnswer,
+  COUNTERPARTY_SORTS,
+  CounterpartySort,
+  ExchangesAnswer,
+  exchangesAnswer,
 } from './account-analytics-object';
 import { AccountAnalyticsService } from './account-analytics.service';
 import { ANALYTICS_INTERVALS, analyticsWindow, checkBucketLimit, MAX_ANALYTICS_BUCKETS } from './analytics-window';
@@ -24,6 +30,14 @@ const csvName =
   (what: string) =>
   (req: Request): string =>
     `${req.params.address} - ${what}`;
+
+/** The `sort` of `analytics/counterparties`: `value` when missing or empty, else 400 `invalid sort - use: value, count`. */
+function sortParam(query: QueryParams): CounterpartySort {
+  const sort = first(query, 'sort');
+  if (sort === undefined || sort === '') return 'value';
+  if (!(COUNTERPARTY_SORTS as readonly string[]).includes(sort)) throw badRequest('invalid sort - use: value, count');
+  return sort as CounterpartySort;
+}
 
 const WINDOW_DESCRIPTION =
   'The window is whole UTC days, from the day of `start` to the day of `end` (both included, whatever the time of day), ' +
@@ -136,5 +150,76 @@ export class AccountAnalyticsController {
     const window = analyticsWindow(query, Date.now(), 'optional');
     checkBucketLimit(window);
     return balanceChangesAnswer(window, await this.analytics.balanceChanges({ account: address, window }));
+  }
+
+  @Get(':address/analytics/counterparties')
+  @RippleRoute('unable to retrieve counterparties')
+  @Csv(csvName('counterparties'), 'counterparties')
+  @ApiOperation({
+    summary: 'Get the accounts an account paid and was paid by, with what the payments were worth',
+    description:
+      'The payments of the account in the window, each once, by the account on the other side. A payment to oneself is a ' +
+      'payment sent, its counterparty being the account itself. `sent_value` is what the account paid the counterparty and ' +
+      '`received_value` what the counterparty paid the account: the delivered amounts, the native currency worth itself ' +
+      'and an issued amount its amount over the rate of its day (cut to 17 significant digits per counterparty, direction, ' +
+      'asset and day, and 0 without a rate); `total_value` is their sum. `payments_sent` and `payments_received` are the ' +
+      'numbers of payments each way, `first` and `last` the times of the first and the last payment between the two in ' +
+      'the window. `total` is the number of different counterparties in the window and `count` the number served: the ' +
+      'first `limit` by `sort`, the largest first, then by the account. ' +
+      `${WINDOW_DESCRIPTION} The route has no \`interval\`. \`format=csv\` gives the counterparties as a CSV file.`,
+  })
+  @ApiParam({ name: 'address', description: 'The address of the account.' })
+  @ApiQuery({ name: 'start', required: false, description: 'The first day. Default: 2013-01-01.' })
+  @ApiQuery({ name: 'end', required: false, description: 'The last day, whole. Default: now.' })
+  @ApiQuery({
+    name: 'sort',
+    required: false,
+    enum: COUNTERPARTY_SORTS,
+    description: 'value (`total_value`) or count (`payments_sent + payments_received`). Default: value.',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'How many counterparties. Default 20, at most 1000.',
+  })
+  @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
+  async counterparties(@Param('address') address: string, @Query() query: QueryParams): Promise<CounterpartiesAnswer> {
+    // the checks come in the order of the table of parameters: start, end (there is no interval), then the sort
+    const window = analyticsWindow(query, Date.now(), 'none');
+    const sort = sortParam(query);
+    const limit = limitParam(query, { def: 20, max: 1000 });
+    return counterpartiesAnswer(
+      window,
+      sort,
+      await this.analytics.counterparties({ account: address, window, sort, limit }),
+    );
+  }
+
+  @Get(':address/analytics/exchanges')
+  @RippleRoute('unable to retrieve exchanges')
+  @Csv(csvName('exchange pairs'), 'pairs')
+  @ApiOperation({
+    summary: 'Get the summary of the trades of an account on the exchange, per pair',
+    description:
+      'The trades of the account in the window (it is the buyer or the seller), each once, per pair in the canonical ' +
+      'stored order. `bought` is the base the account received (it was the buyer) and `sold` the base it gave (it was the ' +
+      'seller), `bought_counter` the counter it paid for what it bought and `sold_counter` the counter it received for ' +
+      'what it sold; a trade with oneself is in both. `native_volume` is, for a pair with a native side, the volume of ' +
+      'that side; for another, per day the base volume over the rate of the base, or, without one, the counter volume ' +
+      'over the rate of the counter (cut to 17 significant digits per day), summed; it is left out when no day of the ' +
+      'pair had a rate. The pairs are sorted by `native_volume`, the largest first, the pairs without one last by ' +
+      '`count`, then by the pair; `total` is the number of pairs in the window and `count` the number served: the first ' +
+      `\`limit\`. ${WINDOW_DESCRIPTION} The route has no \`interval\`. \`format=csv\` gives the pairs as a CSV file.`,
+  })
+  @ApiParam({ name: 'address', description: 'The address of the account.' })
+  @ApiQuery({ name: 'start', required: false, description: 'The first day. Default: 2013-01-01.' })
+  @ApiQuery({ name: 'end', required: false, description: 'The last day, whole. Default: now.' })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'How many pairs. Default 20, at most 1000.' })
+  @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
+  async exchanges(@Param('address') address: string, @Query() query: QueryParams): Promise<ExchangesAnswer> {
+    const window = analyticsWindow(query, Date.now(), 'none');
+    const limit = limitParam(query, { def: 20, max: 1000 });
+    return exchangesAnswer(window, await this.analytics.exchanges({ account: address, window, limit }));
   }
 }

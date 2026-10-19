@@ -1,4 +1,11 @@
-import { AccountTransactionsRow, BalanceChangesRow, ExchangesRow, Table } from '@gatehub/data-api-shared';
+import {
+  AccountExchangesRow,
+  AccountPaymentsRow,
+  AccountTransactionsRow,
+  BalanceChangesRow,
+  ExchangesRow,
+  Table,
+} from '@gatehub/data-api-shared';
 import type { Harness } from '../harness';
 
 /**
@@ -29,6 +36,9 @@ import type { Harness } from '../harness';
  *
  * The changes of the later accounts lie between 2020-01-10T09:00 and 2020-06-15T09:00, the first and last times of the earlier
  * ones, so that the ledgers of "the whole world" are the same ledgers as before.
+ *
+ * The payments and the trades of an account (`account_payments` and `account_exchanges`) are not part of the world: a suite that
+ * reads them writes the ones it needs with `seedAccountPayments` and `seedAccountTrades`, at times the world has a ledger for.
  *
  * The rates: USD of `issuer` trades against XRP 12 times on 2020-02-10 (10 USD for 5 XRP: 2 USD per XRP) and 12 times on
  * 2020-04-20 (20 USD for 5 XRP: 4 USD per XRP), both at 12:30. The rate of a day is that of the trades of the day and of
@@ -306,4 +316,124 @@ export async function seedAnalyticsWorld(h: Harness): Promise<AnalyticsWorld> {
     many: MANY,
     ledgerAt: (time) => ledgerOf.get(seconds(time)),
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The payments and the trades of an account
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** An asset as the URLs of the API write it: `XRP`, or `USD+rIssuer`. */
+const assetOf = (text: string): { currency: string; issuer: string } => {
+  const [currency, issuer = ''] = text.split('+');
+  return { currency, issuer };
+};
+
+/** The ledger of a time of the world; a time that has none is a mistake of the test. */
+function ledgerOf(world: AnalyticsWorld, time: string): number {
+  const ledger = world.ledgerAt(time);
+  if (ledger === undefined) throw new Error(`the world has no ledger that closed at ${time}`);
+  return ledger;
+}
+
+/**
+ * A row of `account_payments` of an account: `[time, tx_index, direction, counterparty, delivered amount, asset]`. A payment
+ * to oneself has two rows with the same `tx_index` (`sent` and `received`) and the account as the counterparty.
+ */
+export type PaymentSpec = [
+  time: string,
+  tx_index: number,
+  direction: 'sent' | 'received',
+  counterparty: string,
+  amount: string,
+  asset: string,
+];
+
+/** Writes the rows of `account_payments` of `account`, each at a time the world has a ledger for. */
+export async function seedAccountPayments(
+  h: Harness,
+  world: AnalyticsWorld,
+  account: string,
+  specs: PaymentSpec[],
+): Promise<void> {
+  await h.ch.insert(
+    Table.AccountPayments,
+    specs.map(([time, tx_index, direction, counterparty, amount, asset]) => {
+      const { currency, issuer } = assetOf(asset);
+      return {
+        account,
+        ledger_index: ledgerOf(world, time),
+        tx_index,
+        tx_hash: `${tx_index}`.padStart(64, 'D'),
+        close_time: seconds(time),
+        direction,
+        counterparty,
+        currency,
+        issuer,
+        delivered_amount: amount,
+        delivered_amount_f: Number(amount),
+        source_tag: null,
+        destination_tag: null,
+      } satisfies AccountPaymentsRow;
+    }),
+  );
+}
+
+/**
+ * A row of `account_exchanges` of an account, in the canonical order of its pair:
+ * `[time, tx_index, base, counter, base amount, counter amount, buyer, seller]`. The buyer received the base and paid the
+ * counter; a trade of the account with itself has it as both.
+ */
+export type TradeSpec = [
+  time: string,
+  tx_index: number,
+  base: string,
+  counter: string,
+  base_amount: string,
+  counter_amount: string,
+  buyer: string,
+  seller: string,
+];
+
+/** Writes the rows of `account_exchanges` of `account`, each at a time the world has a ledger for. */
+export async function seedAccountTrades(
+  h: Harness,
+  world: AnalyticsWorld,
+  account: string,
+  specs: TradeSpec[],
+): Promise<void> {
+  await h.ch.insert(
+    Table.AccountExchanges,
+    specs.map(([time, tx_index, base, counter, base_amount, counter_amount, buyer, seller]) => {
+      const b = assetOf(base);
+      const c = assetOf(counter);
+      const rate = Number(counter_amount) / Number(base_amount);
+      return {
+        account,
+        base_currency: b.currency,
+        base_issuer: b.issuer,
+        counter_currency: c.currency,
+        counter_issuer: c.issuer,
+        ledger_index: ledgerOf(world, time),
+        tx_index,
+        node_index: 1,
+        tx_hash: `${tx_index}`.padStart(64, 'E'),
+        close_time: seconds(time),
+        base_amount,
+        counter_amount,
+        base_amount_f: Number(base_amount),
+        counter_amount_f: Number(counter_amount),
+        rate: String(rate),
+        rate_f: rate,
+        buyer,
+        seller,
+        taker: buyer,
+        provider: seller,
+        offer_sequence: 1,
+        autobridged_currency: null,
+        autobridged_issuer: null,
+        tx_type: 'OfferCreate',
+        client: null,
+      } satisfies AccountExchangesRow;
+    }),
+  );
 }

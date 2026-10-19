@@ -453,6 +453,152 @@ describe('DailyRates', () => {
     expect(dailyNativeRates).not.toHaveBeenCalled();
   });
 
+  describe('rateRowsSql', () => {
+    /** The days 2020-01-01 to 01-05: 1 and 2 have a valid set, 3 is stale, 4 has none, 5 has another config version. */
+    const days = daysFrom('2020-01-01', 5);
+    const world = () =>
+      fakeClickHouse(
+        [
+          sentinel(days[0], 10),
+          sentinel(days[1], 20),
+          sentinel(days[2], 30),
+          sentinel(days[2], 31, { stale: 1 }),
+          sentinel(days[4], 50, { config_version: 2 }),
+        ],
+        [],
+      );
+    const arrays = (params: Record<string, unknown>): [string, unknown[]][] =>
+      Object.entries(params).filter((e): e is [string, unknown[]] => Array.isArray(e[1]));
+
+    it('the valid days are selected in SQL from the sentinels and not passed: only the asset-days computed on read are arrays', async () => {
+      const { ch, calls } = world();
+      // USD is worth 2 on every day, EUR has a rate on day 4 only
+      const { service, dailyNativeRates } = fakeRates((asset, day) => (asset === USD || day === days[3] ? 2 : 0));
+      const { rates, sql, params } = await new DailyRates(ch, service).rateRowsSql([USD, EUR, XRP], days);
+
+      // the on-read days are the stale one, the one without a set and the one of another config version: 3, 4 and 5
+      expect(params.dr_days).toEqual([days[2], days[3], days[4], days[3]]);
+      expect(params.dr_currencies).toEqual(['USD', 'USD', 'USD', 'EUR']);
+      expect(params.dr_issuers).toEqual([ISSUER, ISSUER, ISSUER, ISSUER]);
+      expect(params.dr_rates).toEqual([2, 2, 2, 2]);
+      expect(params.dr_read_days).toEqual([days[2], days[3], days[4]]);
+      // no array holds a valid day, whatever its name, and nothing but the rates computed on read is passed per day
+      for (const [name, values] of arrays(params)) {
+        expect(name).toMatch(/^dr_/);
+        expect(values).not.toContain(days[0]);
+        expect(values).not.toContain(days[1]);
+      }
+      expect(params).toMatchObject({
+        dr_asset_currencies: ['USD', 'EUR'],
+        dr_asset_issuers: [ISSUER, ISSUER],
+        dr_from: days[0],
+        dr_through: days[1],
+        dr_config_version: RATES_DAILY_CONFIG_VERSION,
+      });
+      // one read of the database, the sentinels of the range; the rows of the table are the SQL's
+      expect(calls).toHaveLength(1);
+      expect(calls[0].params).toEqual({ from: days[0], through: days[4], configVersion: RATES_DAILY_CONFIG_VERSION });
+      expect(dailyNativeRates.mock.calls.map(([assets, from, to]) => [assets.map(assetKey), from, to])).toEqual([
+        [[assetKey(USD)], midnight(days[2]), midnight('2020-01-06')],
+        [[assetKey(EUR)], midnight(days[2]), midnight('2020-01-06')],
+      ]);
+
+      // the SQL: the rows of the valid sentinel versions of the assets, then the on-read ones
+      expect(sql).toContain('FROM native_rates_daily');
+      expect(sql).toContain('(currency, issuer) IN');
+      expect(sql).toContain('(day, version) IN');
+      expect(sql).toContain('stale = 0 AND config_version = {dr_config_version:UInt32}');
+      expect(sql).toContain('LIMIT 1 BY currency, issuer, day');
+      expect(sql).toContain('UNION ALL');
+      expect(sql).not.toMatch(/\bFINAL\b/);
+      // every parameter the SQL names is one that is passed
+      for (const name of sql.match(/\{(dr_\w+):/g) ?? []) expect(params).toHaveProperty([name.slice(1, -1)]);
+
+      // what was computed is returned: the on-read days only, 0 where there is no rate; the native currency is 1
+      expect(tableOf(rates, USD)).toEqual([
+        [days[2], '2'],
+        [days[3], '2'],
+        [days[4], '2'],
+      ]);
+      expect(tableOf(rates, EUR)).toEqual([
+        [days[2], '0'],
+        [days[3], '2'],
+        [days[4], '0'],
+      ]);
+      expect(tableOf(rates, XRP)).toEqual(days.map((day) => [day, '1']));
+    });
+
+    it('with every day valid nothing is computed and no array is passed', async () => {
+      const { ch } = fakeClickHouse([sentinel(days[0], 10), sentinel(days[1], 20)], []);
+      const { service, dailyNativeRates } = fakeRates(() => 5);
+      const { rates, sql, params } = await new DailyRates(ch, service).rateRowsSql([USD], days.slice(0, 2));
+      expect(dailyNativeRates).not.toHaveBeenCalled();
+      expect(params).not.toHaveProperty('dr_days');
+      expect(params.dr_read_days).toEqual([]);
+      expect(sql).toContain('FROM native_rates_daily');
+      expect(sql).not.toContain('UNION ALL');
+      expect(tableOf(rates, USD)).toEqual([]);
+    });
+
+    it('with no valid day the SQL has only the on-read rows, and no table to read', async () => {
+      const { ch } = fakeClickHouse([], []);
+      const { service } = fakeRates(() => 3);
+      const { sql, params } = await new DailyRates(ch, service).rateRowsSql([USD], [days[0], days[1]]);
+      expect(sql).not.toContain('native_rates_daily');
+      expect(sql).not.toContain('UNION ALL');
+      expect(params).toMatchObject({ dr_days: [days[0], days[1]], dr_rates: [3, 3] });
+      expect(params).not.toHaveProperty('dr_asset_currencies');
+    });
+
+    it('the days it is given are read in order, once, whatever the order or the repeats', async () => {
+      const { ch, calls } = fakeClickHouse([], []);
+      const { service } = fakeRates(() => 3);
+      const { params } = await new DailyRates(ch, service).rateRowsSql([USD, USD], [days[3], days[1], days[3]]);
+      expect(params.dr_days).toEqual([days[1], days[3]]);
+      expect(params.dr_currencies).toEqual(['USD', 'USD']);
+      expect(calls[0].params).toMatchObject({ from: days[1], through: days[3] });
+    });
+
+    it('no rate computed means no row: an asset without a rate on a day gives none', async () => {
+      const { ch } = fakeClickHouse([], []);
+      const { service } = fakeRates((asset) => (asset === USD ? 4 : 0));
+      const { params } = await new DailyRates(ch, service).rateRowsSql([USD, EUR], [days[0]]);
+      expect(params).toMatchObject({ dr_currencies: ['USD'], dr_days: [days[0]], dr_rates: [4] });
+    });
+
+    it('what it computes on read goes through the cache of the rates, and the cache keeps it', async () => {
+      const { ch } = fakeClickHouse([], []);
+      const { service, dailyNativeRates } = fakeRates(() => 6);
+      const cache = new FakeCache();
+      const daily = new DailyRates(ch, service, { cache });
+      await daily.rateRowsSql([USD], [days[0]]);
+      expect(cache.sets.map(({ key }) => key)).toEqual([`daily-rate:${assetKey(USD)}:${days[0]}`]);
+      // the rates of the same asset and day, asked for the other way, are the cached ones
+      await daily.rates([USD], [days[0]]);
+      expect(dailyNativeRates).toHaveBeenCalledTimes(1);
+    });
+
+    it('the native currency, an issued currency without an issuer, no assets or no days: no rate rows, and no read', async () => {
+      const { ch, calls } = fakeClickHouse([sentinel(days[0], 10)], []);
+      const { service, dailyNativeRates } = fakeRates(() => 9);
+      const daily = new DailyRates(ch, service);
+      for (const [assets, ds] of [
+        [[XRP], days],
+        [[{ currency: 'USD' }], days],
+        [[], days],
+        [[USD], []],
+      ] as const) {
+        const { rates, sql, params } = await daily.rateRowsSql([...assets], [...ds]);
+        expect(params).toEqual({});
+        expect(sql).not.toContain('native_rates_daily');
+        expect(sql).toMatch(/WHERE 0$/);
+        expect(rates.size).toBe(assets.length);
+      }
+      expect(calls).toEqual([]);
+      expect(dailyNativeRates).not.toHaveBeenCalled();
+    });
+  });
+
   it('no assets, or no days, reads nothing', async () => {
     const { ch, calls } = fakeClickHouse([sentinel('2020-01-01', 10)], []);
     const { service, dailyNativeRates } = fakeRates();

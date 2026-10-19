@@ -402,3 +402,368 @@ export function balanceChangesAnswer(window: AnalyticsWindow, found: BalanceChan
     rows: found.rows,
   };
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// counterparties
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** What `analytics/counterparties` can be sorted by: the value of the payments between them, or their number. */
+export const COUNTERPARTY_SORTS = ['value', 'count'] as const;
+export type CounterpartySort = (typeof COUNTERPARTY_SORTS)[number];
+
+/**
+ * A counterparty the database chose (its `limit + 10` best by the sort, with the Float64 values): how many payments went
+ * each way, and the first and last time (unix seconds) of a payment between the two.
+ */
+export interface StoredCounterparty {
+  counterparty: string;
+  payments_sent: number | string;
+  payments_received: number | string;
+  first_at: number | string;
+  last_at: number | string;
+}
+
+/**
+ * What the account paid a counterparty (`sent`) or was paid by it (`received`) in one asset on one UTC day: the exact sum of
+ * the delivered amounts, with the Float64 sum for the amounts a decimal cannot hold whole (`unfit` counts those: if there
+ * are any, the float is used, as `sumOf` has it).
+ */
+export interface StoredCounterpartySum {
+  counterparty: string;
+  side: 'sent' | 'received';
+  currency: string;
+  /** `''` for the native currency. */
+  issuer: string;
+  /** `YYYY-MM-DD` */
+  day: string;
+  amount_sum: string | null;
+  unfit: number | string;
+  amount_sum_f: number | null;
+}
+
+/** A counterparty of the answer. */
+export interface Counterparty {
+  account: string;
+  sent_value: string;
+  received_value: string;
+  total_value: string;
+  payments_sent: number;
+  payments_received: number;
+  first: string;
+  last: string;
+}
+
+const counterpartyAmount = (s: StoredCounterpartySum): BigNumber =>
+  sumOf(Number(s.unfit), s.amount_sum, s.amount_sum_f);
+
+/**
+ * What the values of `sums` need: the issued assets that were paid, each once, and the days (`YYYY-MM-DD`, ascending) on
+ * which one was. The native currency is worth itself and a sum of 0 is worth nothing, so neither asks for a rate.
+ */
+export function ratedCounterpartyAssets(sums: StoredCounterpartySum[]): { assets: Asset[]; days: string[] } {
+  const assets = new Map<string, Asset>();
+  const days = new Set<string>();
+  for (const s of sums) {
+    const asset = changeAsset(s);
+    if (asset.issuer === undefined || !counterpartyAmount(s).gt(0)) continue;
+    assets.set(assetKey(asset), asset);
+    days.add(s.day);
+  }
+  return { assets: [...assets.values()], days: [...days].sort() };
+}
+
+export interface CounterpartiesInput {
+  /** The native currency of the network. */
+  native: string;
+  sort: CounterpartySort;
+  /** How many counterparties to serve. */
+  limit: number;
+  /** The counterparties the database chose: at least the `limit` best, and a few more for the Float64 values to be wrong in. */
+  chosen: StoredCounterparty[];
+  sums: StoredCounterpartySum[];
+  /** The rate of each issued asset that was paid, on each day it was (`ratedCounterpartyAssets`). */
+  rates: DayRates;
+}
+
+/**
+ * The counterparties of the answer, from those the database chose and their exact sums.
+ *
+ * Each sum is valued on its own day (the native currency is worth itself, an issued amount its amount over the rate of its
+ * asset on that day, cut to 17 significant digits per counterparty, side, asset and day, and 0 without a rate: `nativeValue`);
+ * the sums of values are exact. The order is exact too, so it does not depend on how the database ranked the Float64 values
+ * (which tie where exact ones differ): `value` is `total_value`, `count` is `payments_sent + payments_received`, the largest
+ * first, then the account. The first `limit` are served.
+ */
+export function toCounterparties(input: CounterpartiesInput): Counterparty[] {
+  const values = new Map<string, { sent: BigNumber; received: BigNumber }>();
+  for (const s of input.sums) {
+    const value = nativeValue(counterpartyAmount(s), changeAsset(s), s.day, input.rates, input.native);
+    const v = entry(values, s.counterparty, () => ({ sent: ZERO, received: ZERO }));
+    if (s.side === 'sent') v.sent = v.sent.plus(value);
+    else v.received = v.received.plus(value);
+  }
+
+  const ranked = input.chosen.map((c) => {
+    const { sent, received } = values.get(c.counterparty) ?? { sent: ZERO, received: ZERO };
+    return {
+      c,
+      sent,
+      received,
+      total: sent.plus(received),
+      sentCount: Number(c.payments_sent),
+      receivedCount: Number(c.payments_received),
+    };
+  });
+  ranked.sort((a, b) =>
+    input.sort === 'count'
+      ? b.sentCount + b.receivedCount - (a.sentCount + a.receivedCount) || compare(a.c.counterparty, b.c.counterparty)
+      : b.total.comparedTo(a.total) || compare(a.c.counterparty, b.c.counterparty),
+  );
+  return ranked.slice(0, input.limit).map(
+    (r): Counterparty => ({
+      account: r.c.counterparty,
+      sent_value: r.sent.toString(),
+      received_value: r.received.toString(),
+      total_value: r.total.toString(),
+      payments_sent: r.sentCount,
+      payments_received: r.receivedCount,
+      first: fmtTime(Number(r.c.first_at)),
+      last: fmtTime(Number(r.c.last_at)),
+    }),
+  );
+}
+
+/** The answer of `analytics/counterparties`: `result, start, end, sort, total, count, counterparties`. */
+export interface CounterpartiesAnswer {
+  result: 'success';
+  start: string;
+  end: string;
+  sort: CounterpartySort;
+  total: number;
+  count: number;
+  counterparties: Counterparty[];
+}
+
+export function counterpartiesAnswer(
+  window: AnalyticsWindow,
+  sort: CounterpartySort,
+  found: { total: number; counterparties: Counterparty[] },
+): CounterpartiesAnswer {
+  return {
+    result: 'success',
+    start: fmtTime(window.start),
+    end: fmtTime(window.end),
+    sort,
+    total: found.total,
+    count: found.counterparties.length,
+    counterparties: found.counterparties,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// exchanges
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The trades of the account on one UTC day in one pair, in the canonical stored order (`GROUP BY day, pair` of the `trades`
+ * day groups): their number, and the exact sums of the base and the counter, of the base the account received as buyer
+ * (`bought_sum`) and gave as seller (`sold_sum`) and of the counter of those trades, with their Float64 shadows for the
+ * trades a decimal cannot hold whole (`unfit` counts those: if there are any, the floats are used, as `sumOf` has it).
+ */
+export interface StoredPairGroup {
+  /** `YYYY-MM-DD` */
+  day: string;
+  base_currency: string;
+  /** `''` for the native currency. */
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  n: number | string;
+  base_sum: string | null;
+  counter_sum: string | null;
+  bought_sum: string | null;
+  sold_sum: string | null;
+  bought_counter_sum: string | null;
+  sold_counter_sum: string | null;
+  unfit: number | string;
+  base_sum_f: number | null;
+  counter_sum_f: number | null;
+  bought_sum_f: number | null;
+  sold_sum_f: number | null;
+  bought_counter_sum_f: number | null;
+  sold_counter_sum_f: number | null;
+}
+
+/** A pair of the answer. */
+export interface ExchangePair {
+  base_currency: string;
+  base_issuer?: string;
+  counter_currency: string;
+  counter_issuer?: string;
+  count: number;
+  base_volume: string;
+  counter_volume: string;
+  bought: string;
+  sold: string;
+  bought_counter: string;
+  sold_counter: string;
+  native_volume?: string;
+}
+
+const baseAsset = (g: StoredPairGroup): Asset => changeAsset({ currency: g.base_currency, issuer: g.base_issuer });
+const counterAsset = (g: StoredPairGroup): Asset =>
+  changeAsset({ currency: g.counter_currency, issuer: g.counter_issuer });
+const isNativeAsset = (a: Asset, native: string): boolean => a.currency === native && !a.issuer;
+
+/**
+ * What the native volumes of `groups` need: the issued sides of the pairs that have no native side, each once, and the
+ * days (`YYYY-MM-DD`, ascending) of their groups. A pair with a native side is worth that side, so asks for no rate.
+ */
+export function ratedPairAssets(groups: StoredPairGroup[], native: string): { assets: Asset[]; days: string[] } {
+  const assets = new Map<string, Asset>();
+  const days = new Set<string>();
+  for (const g of groups) {
+    const sides = [baseAsset(g), counterAsset(g)];
+    if (sides.some((a) => isNativeAsset(a, native))) continue;
+    for (const a of sides) if (a.issuer !== undefined) assets.set(assetKey(a), a);
+    days.add(g.day);
+  }
+  return { assets: [...assets.values()], days: [...days].sort() };
+}
+
+export interface ExchangePairsInput {
+  /** The native currency of the network. */
+  native: string;
+  groups: StoredPairGroup[];
+  /** The rate of each issued side of the pairs without a native side, on each day of their groups (`ratedPairAssets`). */
+  rates: DayRates;
+  /** How many pairs to serve. */
+  limit: number;
+}
+
+interface PairSums {
+  key: string;
+  group: StoredPairGroup;
+  count: number;
+  base: BigNumber;
+  counter: BigNumber;
+  bought: BigNumber;
+  sold: BigNumber;
+  boughtCounter: BigNumber;
+  soldCounter: BigNumber;
+  /** `undefined` while no day of the pair has had a rate. */
+  native: BigNumber | undefined;
+}
+
+/**
+ * The value of the volume of a pair on a day in the native currency: the volume of its native side; else the base volume
+ * over the rate of the base on that day, or, where the base has none (no rate, or a rate of 0), the counter volume over the
+ * rate of the counter; `undefined` where neither has a rate. The quotient is cut to 17 significant digits (`nativeValue`).
+ */
+function nativeVolumeOf(
+  g: StoredPairGroup,
+  base: BigNumber,
+  counter: BigNumber,
+  rates: DayRates,
+  native: string,
+): BigNumber | undefined {
+  const baseSide = baseAsset(g);
+  const counterSide = counterAsset(g);
+  if (isNativeAsset(baseSide, native)) return base;
+  if (isNativeAsset(counterSide, native)) return counter;
+  const has = (a: Asset): boolean => rates.get(assetKey(a))?.get(g.day)?.gt(0) === true;
+  if (has(baseSide)) return nativeValue(base, baseSide, g.day, rates, native);
+  if (has(counterSide)) return nativeValue(counter, counterSide, g.day, rates, native);
+  return undefined;
+}
+
+/**
+ * The pairs of the answer from the day groups of the window, and how many pairs there are.
+ *
+ * A pair adds its days up: `count`, the volumes, `bought` and `sold` and the counter of each. A day group's sums are exact,
+ * or the Float64 ones where it holds an amount a decimal cannot (`sumOf`). `native_volume` adds up the volume of each day
+ * (`nativeVolumeOf`) and is left out where no day had a value. The pairs are sorted by it, the largest first, the pairs
+ * without one last by `count`, then by the pair (base currency and issuer, counter currency and issuer). The first `limit`
+ * are served.
+ */
+export function toExchangePairs(input: ExchangePairsInput): { total: number; pairs: ExchangePair[] } {
+  const perPair = new Map<string, PairSums>();
+  for (const g of input.groups) {
+    const unfit = Number(g.unfit);
+    const base = sumOf(unfit, g.base_sum, g.base_sum_f);
+    const counter = sumOf(unfit, g.counter_sum, g.counter_sum_f);
+    const key = [g.base_currency, g.base_issuer, g.counter_currency, g.counter_issuer].join('\u0000');
+    const pair = entry(
+      perPair,
+      key,
+      (): PairSums => ({
+        key,
+        group: g,
+        count: 0,
+        base: ZERO,
+        counter: ZERO,
+        bought: ZERO,
+        sold: ZERO,
+        boughtCounter: ZERO,
+        soldCounter: ZERO,
+        native: undefined,
+      }),
+    );
+    pair.count += Number(g.n);
+    pair.base = pair.base.plus(base);
+    pair.counter = pair.counter.plus(counter);
+    pair.bought = pair.bought.plus(sumOf(unfit, g.bought_sum, g.bought_sum_f));
+    pair.sold = pair.sold.plus(sumOf(unfit, g.sold_sum, g.sold_sum_f));
+    pair.boughtCounter = pair.boughtCounter.plus(sumOf(unfit, g.bought_counter_sum, g.bought_counter_sum_f));
+    pair.soldCounter = pair.soldCounter.plus(sumOf(unfit, g.sold_counter_sum, g.sold_counter_sum_f));
+    const value = nativeVolumeOf(g, base, counter, input.rates, input.native);
+    if (value !== undefined) pair.native = (pair.native ?? ZERO).plus(value);
+  }
+
+  const sorted = [...perPair.values()].sort((a, b) => {
+    if (a.native !== undefined && b.native !== undefined) return b.native.comparedTo(a.native) || compare(a.key, b.key);
+    if (a.native !== undefined || b.native !== undefined) return a.native === undefined ? 1 : -1;
+    return b.count - a.count || compare(a.key, b.key);
+  });
+  const pairs = sorted.slice(0, input.limit).map(
+    (p): ExchangePair => ({
+      base_currency: p.group.base_currency,
+      ...(p.group.base_issuer !== '' && { base_issuer: p.group.base_issuer }),
+      counter_currency: p.group.counter_currency,
+      ...(p.group.counter_issuer !== '' && { counter_issuer: p.group.counter_issuer }),
+      count: p.count,
+      base_volume: p.base.toString(),
+      counter_volume: p.counter.toString(),
+      bought: p.bought.toString(),
+      sold: p.sold.toString(),
+      bought_counter: p.boughtCounter.toString(),
+      sold_counter: p.soldCounter.toString(),
+      ...(p.native !== undefined && { native_volume: p.native.toString() }),
+    }),
+  );
+  return { total: perPair.size, pairs };
+}
+
+/** The answer of `analytics/exchanges`: `result, start, end, total, count, pairs`. */
+export interface ExchangesAnswer {
+  result: 'success';
+  start: string;
+  end: string;
+  total: number;
+  count: number;
+  pairs: ExchangePair[];
+}
+
+export function exchangesAnswer(
+  window: AnalyticsWindow,
+  found: { total: number; pairs: ExchangePair[] },
+): ExchangesAnswer {
+  return {
+    result: 'success',
+    start: fmtTime(window.start),
+    end: fmtTime(window.end),
+    total: found.total,
+    count: found.pairs.length,
+    pairs: found.pairs,
+  };
+}
