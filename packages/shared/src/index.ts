@@ -39,6 +39,7 @@ export * from './ingest/raw-ledger';
 
 // Aggregates
 export * from './aggregate/aggregate-sets';
+export * from './aggregate/markets-live.job';
 export * from './aggregate/pair-hourly.job';
 export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
