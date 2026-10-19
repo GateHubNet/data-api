@@ -1018,6 +1018,131 @@ describe('AccountRollupsJobRunner', () => {
       expect(world.rollups.map((c) => c.accounts.length)).toEqual([500, 500, 100]);
     });
 
+    describe('with the mark of the range (the created of its agg_dirty row, unix ms)', () => {
+      const MARK = NOW.getTime() - 60_000;
+      /** One slice of a re-ingested day, as the hook of a range of an hour gets it. */
+      const hour = (r: AccountRollupsJobRunner, h: number, marked?: number): Promise<void> =>
+        r.ofSlice(
+          unix('2026-10-12T00:00:00Z') + h * HOUR,
+          unix('2026-10-12T00:00:00Z') + (h + 1) * HOUR,
+          fake.tick(),
+          marked,
+        );
+
+      it('rolls a day once for the ranges of it that were all marked before the first roll began', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: THROUGH });
+        const r = runner();
+        for (let h = 0; h < 24; h++) await hour(r, h, MARK + h); // 24 ranges, the newest marked before the clock reading
+        expect(world.calls()).toEqual([[['rA'], '2026-10-12', '2026-10-12']]);
+      });
+
+      it('keeps what it rolled across ticks, and skips a mark that is the very moment the roll began', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: THROUGH });
+        const r = runner();
+        await hour(r, 5, MARK);
+        jest.setSystemTime(Date.now() + minutes(10)); // the next tick
+        await hour(r, 6, MARK + 1);
+        await hour(r, 7, Date.now() - minutes(10)); // marked exactly when the roll began: it saw what the mark says
+        expect(world.rollups).toHaveLength(1);
+      });
+
+      it('rolls the day again for a range that was marked after the roll began', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: THROUGH });
+        const r = runner();
+        await hour(r, 5, MARK);
+        jest.setSystemTime(Date.now() + 5000);
+        await hour(r, 6, Date.now() - 1000); // marked after the first roll began, before now
+        expect(world.rollups).toHaveLength(2);
+        // that roll began now: a range marked before it needs none, one marked after it does
+        await hour(r, 7, Date.now() - 1000);
+        expect(world.rollups).toHaveLength(2);
+        await hour(r, 8, Date.now() + 1);
+        expect(world.rollups).toHaveLength(3);
+      });
+
+      it('rolls only the days of a slice across midnight that it has not rolled', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: THROUGH });
+        const r = runner();
+        await r.ofSlice(unix('2026-10-12T05:00:00Z'), unix('2026-10-12T06:00:00Z'), fake.tick(), MARK);
+        world.clear();
+        // the 12th is done, the 13th is not
+        await r.ofSlice(unix('2026-10-12T23:00:00Z'), unix('2026-10-13T01:00:00Z'), fake.tick(), MARK);
+        expect(world.calls()).toEqual([[['rA'], '2026-10-13', '2026-10-13']]);
+        // both are done: the slice reads and writes nothing
+        world.clear();
+        rates.ledgersClosedIn.mockClear();
+        await r.ofSlice(unix('2026-10-12T22:00:00Z'), unix('2026-10-13T02:00:00Z'), fake.tick(), MARK);
+        expect(world.rollups).toEqual([]);
+      });
+
+      it('rolls every slice when it is not given the mark', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: THROUGH });
+        const r = runner();
+        await hour(r, 5);
+        await hour(r, 6);
+        await hour(r, 7, MARK); // what it rolled without a mark is remembered, and this mark is not after it
+        expect(world.rollups).toHaveLength(2);
+      });
+
+      it('does not remember a roll that failed, or a slice that did not start because of the shutdown', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: THROUGH });
+        const r = runner();
+        world.failingAccounts.add('rA');
+        await expect(hour(r, 5, MARK)).rejects.toThrow('memory limit');
+        world.failingAccounts.clear();
+        fake.closing = true;
+        await hour(r, 5, MARK);
+        expect(world.rollups).toHaveLength(1); // the failing call only
+        fake.closing = false;
+        await hour(r, 5, MARK);
+        expect(world.rollups).toHaveLength(2);
+        await hour(r, 6, MARK); // done now
+        expect(world.rollups).toHaveLength(2);
+      });
+
+      it('the job being off does not change it: it rolls the covered days once for the ranges of a day', async () => {
+        minRows = 0;
+        world.states.set('rA', {
+          account: 'rA',
+          rows: 5,
+          firstDay: '2025-01-01',
+          rolledFrom: '2026-10-01',
+          rolledThrough: THROUGH,
+          configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+        });
+        const r = runner();
+        for (let h = 0; h < 4; h++) await hour(r, h, MARK);
+        expect(world.rollups).toHaveLength(1);
+      });
+
+      it('still marks the partition of a slice whose day it does not roll again', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2026-10-01', rolledThrough: THROUGH });
+        const r = runner();
+        await hour(r, 5, MARK);
+        await run(r); // the discovery recounts the partition the slice marked (and no other)
+        expect(world.recounts).toEqual([1]);
+        world.clear();
+        await hour(r, 6, MARK); // skipped
+        await run(r);
+        expect(world.recounts).toEqual([1]);
+      });
+
+      it('remembers at most 1000 days, the oldest roll going first', async () => {
+        world.heavyAccount('rA', { rolledFrom: '2020-01-01', rolledThrough: THROUGH });
+        const r = runner();
+        const day = (i: number): number => unix('2023-01-01T00:00:00Z') + i * DAY;
+        for (let i = 0; i < 1001; i++) await r.ofSlice(day(i), day(i) + HOUR, fake.tick(), MARK);
+        expect(world.rollups).toHaveLength(1001);
+        world.clear();
+        // the newest 1000 are remembered; the first, which was forgotten, is rolled again (and then remembered)
+        await r.ofSlice(day(1), day(1) + HOUR, fake.tick(), MARK);
+        await r.ofSlice(day(1000), day(1000) + HOUR, fake.tick(), MARK);
+        expect(world.rollups).toEqual([]);
+        await r.ofSlice(day(0), day(0) + HOUR, fake.tick(), MARK);
+        expect(world.calls()).toEqual([[['rA'], '2023-01-01', '2023-01-01']]);
+      });
+    });
+
     it('the accounts it recomputes are the same with the job on and off: those whose newest state is of the current config and whose coverage holds the day', async () => {
       const states: Array<[string, Partial<RollupState>]> = [
         ['rA', { rolledFrom: '2026-10-12', rolledThrough: '2026-10-12' }], // holds it, on the first day of the coverage and on the last

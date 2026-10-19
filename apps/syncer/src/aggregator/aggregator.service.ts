@@ -691,7 +691,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         outcome = 'failed';
         break;
       }
-      if (!(await this.hooksOfSlice(start, end, tick))) {
+      if (!(await this.hooksOfSlice(start, end, range.created, tick))) {
         outcome = 'failed';
         break;
       }
@@ -744,12 +744,14 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
 
   /**
    * The hooks of the account and market jobs for a slice `[start, end)` that was recomputed, in this order: the rates of its
-   * days (`rates_daily`), its hours of `pair_hourly`, the day rollups of the heavy accounts (`account_rollups`). Without the
-   * `aggregates` option there are none. A hook that fails is logged and counted as `<job>_dirty`, and the hooks after it are not
-   * run: false, so that the slice fails and its range stays in the queue. A hook does nothing once the shutdown has begun,
-   * which is safe because the range is not changed after it (`recomputeDirty`).
+   * days (`rates_daily`), its hours of `pair_hourly`, the day rollups of the heavy accounts (`account_rollups`). Each gets the
+   * slice and the tick, and `marked`, when the range was marked (the day rollups do not roll a day again for a range that was
+   * marked before the roll of it began, as `volumesOfSlice` does). Without the `aggregates` option there are none. A hook that
+   * fails is logged and counted as `<job>_dirty`, and the hooks after it are not run: false, so that the slice fails and its
+   * range stays in the queue. A hook does nothing once the shutdown has begun, which is safe because the range is not changed
+   * after it (`recomputeDirty`).
    */
-  private async hooksOfSlice(start: number, end: number, tick: AggregatorTick): Promise<boolean> {
+  private async hooksOfSlice(start: number, end: number, marked: number, tick: AggregatorTick): Promise<boolean> {
     const runners = this.aggregateRunners;
     if (!runners) return true;
     const hooks = [
@@ -759,7 +761,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     ] as const;
     for (const [job, runner] of hooks) {
       try {
-        await runner.ofSlice(start, end, tick);
+        await runner.ofSlice(start, end, tick, marked);
       } catch (err) {
         this.failed(`${job}_dirty`, err, ` in ${iso(start)} - ${iso(end)}`);
         return false;

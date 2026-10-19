@@ -435,6 +435,28 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       expect(logger.error).not.toHaveBeenCalled();
     });
 
+    it('hands the created mark of the range to the account_rollups hook: ranges of one day, marked before the first roll, roll it once, and one marked after the roll began rolls it again', async () => {
+      caughtUp();
+      rolledAccount();
+      const rolls = (): number => events().filter((event) => event === HOOKS.account_rollups).length;
+      // two ranges of the 14th (their ingest chunks), both marked before the tick: one roll of the day answers both
+      markRange('2026-10-14T20:00:00Z', '2026-10-14T21:00:00Z', 1000);
+      markRange('2026-10-14T21:00:00Z', '2026-10-14T22:00:00Z', 1001);
+      const svc = service();
+      await svc.tick();
+      expect(rolls()).toBe(1);
+      expect(ch.dirty).toEqual([]);
+
+      // the roll of the 14th began at the clock reading of the first tick: a range marked before it (NOW_MS - 1) needs no roll,
+      // one marked after it (the ingest wrote more ledgers into the day meanwhile) rolls the day again
+      log.length = 0;
+      markRange('2026-10-14T22:00:00Z', '2026-10-14T23:00:00Z', NOW_MS - 1);
+      markRange('2026-10-14T23:00:00Z', '2026-10-15T00:00:00Z', NOW_MS + 5000);
+      await svc.tick();
+      expect(rolls()).toBe(1);
+      expect(ch.dirty).toEqual([]);
+    });
+
     it.each(['rates_daily', 'pair_hourly', 'account_rollups'] as const)(
       'a failing %s hook is counted and logged as <job>_dirty, the hooks after it are not run, the range stays, and the next tick does it again',
       async (job) => {

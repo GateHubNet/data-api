@@ -34,6 +34,9 @@ const NEWEST_PARTITION_RECOUNT_MS = 24 * 3_600_000;
 /** ... and every other partition, which only changes by a re-ingest (and that marks it, see `ofSlice`). */
 const OTHER_PARTITION_RECOUNT_MS = 7 * 86_400_000;
 
+/** The days whose hook roll the runner remembers (the oldest are forgotten first); a forgotten day is only rolled once more. */
+const ROLLED_DAYS_KEPT = 1000;
+
 const chunksOf = <T>(items: T[], size: number): T[][] =>
   Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size));
 
@@ -114,6 +117,11 @@ export class AccountRollupsJobRunner {
   private readonly marked = new Set<number>();
   /** The accounts that failed inside a call of several: they are rolled alone until they work. */
   private readonly solo = new Set<string>();
+  /**
+   * The days the hook (`ofSlice`) has rolled, across ticks, each with the clock reading (ms) at which that roll began, oldest
+   * first, at most `ROLLED_DAYS_KEPT`. A range of `agg_dirty` that was marked at or before it needs no roll of the day again.
+   */
+  private readonly rolledDays = new Map<string, number>();
   /** Whether the promotion back-fill has announced that it is under way (so that it says so once, and once more when it is done). */
   private backfilling = false;
 
@@ -146,11 +154,18 @@ export class AccountRollupsJobRunner {
    * ledgers for the next discovery to recount. A failure rejects: the caller fails the slice, which keeps its range for the next
    * tick. Nothing is started once the shutdown has begun.
    *
+   * `marked` is when the range of the slice was marked (`DirtyRange.created`, unix ms). A re-ingested day comes as many ranges
+   * (one for each chunk of ledgers, about an hour), each its own slice, and one roll of the day answers them all: a day that was
+   * rolled, from a roll that began at or after `marked`, is not rolled again, as the volume sets of the day are not (see
+   * `volumesOfSlice`). A range that was marked after the roll began rolls the day again: the ingest wrote ledgers into it
+   * meanwhile, which that roll may not have seen. Without `marked` every slice rolls its days. A roll that failed is not
+   * remembered.
+   *
    * With `GH_ACCOUNT_ROLLUP_MIN_ROWS` 0 the job is off, but the API still uses the coverage that exists, so a re-ingest must
    * not leave its days stale: the slice still recomputes them, and marks no partition (there is no discovery to recount it). With
    * no account that has coverage it does nothing.
    */
-  async ofSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
+  async ofSlice(start: number, end: number, tick: AggregatorTick, marked?: number): Promise<void> {
     const { deps, fns } = this;
     if (deps.closing() || end <= start) return;
     if (this.aggregates.accountRollupMinRows > 0) {
@@ -161,9 +176,20 @@ export class AccountRollupsJobRunner {
         }
       }
     }
-    const states = await fns.rollupStates(deps.ch);
+    const days: string[] = [];
     for (let day = Math.floor(start / DAY_SECONDS) * DAY_SECONDS; day < end; day += DAY_SECONDS) {
       const key = isoDay(day);
+      const began = this.rolledDays.get(key);
+      if (marked !== undefined && began !== undefined && began >= marked) {
+        deps.logger.debug(`account_rollups: ${key}: rolled since the range was marked (agg_dirty)`);
+      } else {
+        days.push(key);
+      }
+    }
+    if (days.length === 0) return;
+    const states = await fns.rollupStates(deps.ch);
+    for (const key of days) {
+      const began = deps.clock();
       const accounts = [...states.values()]
         .filter(
           (s) =>
@@ -178,7 +204,18 @@ export class AccountRollupsJobRunner {
         if (deps.closing()) return;
         await fns.writeAccountRollups(deps.ch, this.ranges, batch, key, key, { signal: tick.signal });
       }
+      this.rememberRolled(key, began);
       deps.logger.debug(`account_rollups: ${key}: ${accounts.length} account(s) (agg_dirty)`);
+    }
+  }
+
+  /** Remembers that a day's roll began at `began`; the oldest day goes when more than `ROLLED_DAYS_KEPT` are kept. */
+  private rememberRolled(day: string, began: number): void {
+    this.rolledDays.delete(day);
+    this.rolledDays.set(day, began);
+    if (this.rolledDays.size > ROLLED_DAYS_KEPT) {
+      const [oldest] = this.rolledDays.keys();
+      this.rolledDays.delete(oldest);
     }
   }
 
