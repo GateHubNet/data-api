@@ -147,7 +147,9 @@ Prefix `syncer_`.
 
 The `syncer_validators_*` and `syncer_amendments_*` metrics are set by the `validators` worker, `syncer_validator_validations_flushed_total`
 by the validations collector. A labelled metric has no series until its first observation: a publisher that was never fetched has no
-`syncer_validators_unl_*` series.
+`syncer_validators_unl_*` series. The three unlabelled gauges (`syncer_validators_agreement_lag_seconds`,
+`syncer_validators_rounds_lag_ledgers`, `syncer_amendments_without_metadata`) read 0 until the `validators` worker first sets them,
+so alert on them only once the worker runs.
 
 ```promql
 syncer_lag_ledgers                                                  # the number to alert on

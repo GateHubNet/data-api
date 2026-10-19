@@ -381,6 +381,13 @@ describe('loadAmendmentsConfig', () => {
             expect(amendment.id).toBe(amendmentId(amendment.name));
           }
         });
+
+        it('is also the file for an empty or blank path (GH_AMENDMENTS_CONFIG left empty)', () => {
+          const shipped = loadAmendmentsConfig(profile);
+          for (const path of ['', '  ']) {
+            expect(loadAmendmentsConfig(profile, path)).toEqual(shipped);
+          }
+        });
       });
     }
 

@@ -207,11 +207,12 @@ export function parseAmendmentsConfig(raw: unknown, profile: NetworkProfile): Am
 }
 
 /**
- * Load the amendment metadata of a network. The path defaults to the bundled `config/amendments/<network>.json`, next
- * to `config/markets`. An invalid file throws with its path and the entry at fault.
+ * Load the amendment metadata of a network. An absent, empty or blank path (`GH_AMENDMENTS_CONFIG` left empty, which both
+ * config classes hand over as `''`) is the bundled `config/amendments/<network>.json`, next to `config/markets`. An invalid
+ * file throws with its path and the entry at fault.
  */
 export function loadAmendmentsConfig(profile: NetworkProfile, path?: string): AmendmentsConfig {
-  const file = path ?? join(DEFAULT_AMENDMENTS_DIR, `${profile.name}.json`);
+  const file = path === undefined || path.trim() === '' ? join(DEFAULT_AMENDMENTS_DIR, `${profile.name}.json`) : path;
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(file, 'utf8'));

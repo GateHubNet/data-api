@@ -77,6 +77,77 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_validator_validations_flushed_total\{table="validator_validations"\} 12$/m);
   });
 
+  describe('the declaration of the validators metrics', () => {
+    // [name, type, declared label names (exactly), HELP text (spec section 6)]
+    const declared: [string, string, string[], string][] = [
+      [
+        'syncer_validators_unl_fetches_total',
+        'counter',
+        ['publisher', 'outcome'],
+        'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
+      ],
+      [
+        'syncer_validators_unl_expiry_seconds',
+        'gauge',
+        ['publisher'],
+        'Seconds until the current validator list of a publisher expires (negative when expired).',
+      ],
+      ['syncer_validators_unl_size', 'gauge', ['publisher'], 'Validators on the current list of a publisher.'],
+      [
+        'syncer_validators_domain_checks_total',
+        'counter',
+        ['outcome'],
+        'Domain checks of validators, by outcome (verified, or the reason code of the failure).',
+      ],
+      [
+        'syncer_validators_node_polls_total',
+        'counter',
+        ['request', 'outcome'],
+        'Polls of the node by the validators worker, by request (amendments, negative_unl, fee_settings, server_info, feature) and outcome (ok, error).',
+      ],
+      [
+        'syncer_validators_jobs_total',
+        'counter',
+        ['job', 'outcome'],
+        'Runs of the validators worker jobs, by job (rounds, agreement) and outcome (ok, error).',
+      ],
+      [
+        'syncer_validators_agreement_lag_seconds',
+        'gauge',
+        [],
+        'Now minus the end of the newest final hour of validator agreement, in seconds.',
+      ],
+      [
+        'syncer_validators_rounds_lag_ledgers',
+        'gauge',
+        [],
+        'Newest committed voting ledger minus the newest stored amendment voting round, in ledgers.',
+      ],
+      [
+        'syncer_amendments_without_metadata',
+        'gauge',
+        [],
+        'Amendments seen (node, ledger, votes) without an entry in the amendment metadata.',
+      ],
+      [
+        'syncer_validator_validations_flushed_total',
+        'counter',
+        ['table'],
+        'Rows written to validator_validations and validator_seen, by table.',
+      ],
+    ];
+
+    it.each(declared)('%s is a %s with the labels %j and its help text', async (name, type, labelNames, help) => {
+      const service = new PrometheusService();
+      // prom-client types `labelNames` only on the constructor options; the metric object keeps it.
+      const metric = service.registry.getSingleMetric(name) as unknown as { labelNames: string[] } | undefined;
+      expect(metric?.labelNames).toEqual(labelNames);
+      const exposed = (await service.registry.getMetricsAsJSON()).find((m) => m.name === name);
+      expect(exposed).toMatchObject({ type, help });
+      expect(await service.getMetrics()).toContain(`# HELP ${name} ${help}\n# TYPE ${name} ${type}\n`);
+    });
+  });
+
   it('shares one registry between instances, as the main app and the metricz app each create one', async () => {
     const worker = new PrometheusService();
     const scraper = new PrometheusService();
