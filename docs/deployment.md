@@ -32,6 +32,21 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
 - The API answers the same `/v2/...` paths on both hosts; the **host name** selects the network
   ([api-reference](api-reference.md#hosts-one-per-network)). Native currency per network: `XRP` / `XAH`.
 
+## Outbound network access
+
+- **api-xrpl / api-xahau:** ClickHouse and the node(s) they forward live lookups to; nothing else.
+- **syncer-xrpl / syncer-xahau:** ClickHouse and its node(s) (WSS/HTTP), plus, for the `validators` worker, **outbound HTTPS (port 443)
+  to public hosts**:
+  - the **UNL publishers** of `GH_UNL_PUBLISHERS` (by default `vl.ripple.com` and `unl.xrplf.org` on XRPL, `vl.xahau.org` on Xahau), and
+  - the **domains validators claim**: `https://<domain>/.well-known/xrp-ledger.toml` (Xahau: `xahau.toml`) for every validator that names a
+    domain in its manifest. These hosts are open-ended, so a hostname allowlist cannot cover them; a host that has no outbound HTTPS
+    to arbitrary sites sets **`GH_DOMAIN_VERIFICATION=false`** (the domains then show `pending`) and keeps egress to the publishers only.
+  - A DNS resolver that answers A and AAAA queries (the fetch resolves names itself; `/etc/hosts` is not consulted).
+- The fetches ignore `HTTP_PROXY` / `HTTPS_PROXY`: reach the internet by NAT or a transparent egress, not through a proxy variable.
+- The syncer refuses, by itself, every host that resolves to a private, loopback, link-local, reserved or metadata address
+  ([security](security.md#outbound-https-to-arbitrary-public-hosts-syncer)). As a second line, deny those ranges for the syncer's
+  egress at the network too.
+
 ## Build
 
 Both images build from the **repo root** (the context is the whole workspace) on the public `node:22.23.2-bookworm-slim` base

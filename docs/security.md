@@ -16,10 +16,15 @@ terminates TLS, then through the stack's **nginx**, which routes by host name. C
    client ──HTTPS──▶ front proxy (TLS, edge) ──HTTP, X-Forwarded-For──▶ nginx ──▶ api-xrpl / api-xahau ──▶ ClickHouse
    ═══════════ untrusted ═════════════════════ │ ═══════════════ internal network ═════════════════════════════
                                                 ClickHouse ◀── syncer-xrpl / syncer-xahau ──▶ XRPL / Xahau node (WSS, outbound)
+                                                                      └─HTTPS─▶ UNL publishers, validator domains (public hosts, outbound; §9)
 ```
 
 The API authenticates clients (API keys) and rate-limits them, but relies on the proxy chain to terminate TLS and to hand it a
 correct client address (§4).
+
+The syncer is the one component that connects to hosts nobody on the team chose: the `validators` worker fetches the lists of the
+configured UNL publishers and the TOML file of every domain that a validator claims in its signed manifest, and a validator's operator
+picks that domain. Those requests are untrusted-URL requests and are made only through the `SafeFetcher` (§9).
 
 | Threat | Control |
 | --- | --- |
@@ -29,6 +34,7 @@ correct client address (§4).
 | Information disclosure through errors | Ripple-shaped errors, 5xx causes only in the log (§7) |
 | Client-address spoofing (rate-limit evasion) | nginx trusts `X-Forwarded-For` only from `TRUSTED_PROXIES` and sets exactly one address (§4) |
 | Secret leakage | Env-only secrets, git/docker-ignored env files, BuildKit secret for the npm token, per-service env (§8) |
+| Server-side request forgery through a fetched URL (a validator's domain, a publisher, a redirect, a DNS name that points inward) | Every outbound HTTP request of the syncer goes through `SafeFetcher`: HTTPS on port 443 to public addresses only, every resolved address checked and the connection pinned to it, redirects checked again, bounded time and size (§9) |
 | Direct ClickHouse access | Not published (§9) |
 | Exposure of internals | `/internal/` and `/liveliness/` blocked at the edge for the public (§9) |
 
@@ -177,6 +183,39 @@ Production compose (`docker-compose.prod.yaml`):
 - **ClickHouse users:** a dedicated `data_api` user (access management enabled), not `default`. The api and the syncers share it
   (full access); a read-only user for the api would be better.
 
+### Outbound HTTPS to arbitrary public hosts (syncer)
+
+The only HTTP requests to hosts outside the stack are those of the syncer's `validators` worker: the validator lists of the
+publishers in `GH_UNL_PUBLISHERS` and, unless `GH_DOMAIN_VERIFICATION=false`, the `/.well-known/` TOML file of each domain a
+validator claims. The URL is data from outside (a validator's operator chooses its domain), so the rules of
+`apps/syncer/src/validators/safe-fetch.ts` are fixed in code and no environment variable loosens any of them:
+
+- **URL:** `https:` only, port 443 only, no user name or password, and a host that is a domain name (4 to 128 characters, an alphabetic
+  top-level label): no IP literal, port or single label such as `localhost`.
+- **DNS, all addresses judged:** the A and AAAA records are resolved before connecting, and the request is refused (`blocked_address`)
+  if **any** address is not public: IPv4 `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16` (this covers the
+  cloud metadata address), `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`,
+  `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`; IPv6 `::/128`, `::1/128`, `fc00::/7`, `fe80::/10`, `ff00::/8`,
+  `2001:db8::/32`, `100::/64`, `64:ff9b::/96`, `2002::/16`; an IPv4-mapped address (`::ffff:a.b.c.d` or `::ffff:xxxx:xxxx`) is judged
+  by its IPv4. A host that resolves to nothing is `dns_error`.
+- **Pinned connection:** the request connects to an address that was checked: the connection's `lookup` returns it, with no second
+  DNS query, so an answer that changes between the check and the connect (DNS rebinding) cannot redirect it. SNI and `Host` are the
+  domain; TLS uses Node's default trust store and checks the certificate against the domain, with no override
+  (`rejectUnauthorized` is set to `true` explicitly, so `NODE_TLS_REJECT_UNAUTHORIZED=0` has no effect, and `checkServerIdentity` is
+  never replaced).
+- **Redirects:** followed by hand, at most 3. Each target is checked from the top (scheme, port, credentials, domain syntax, DNS and
+  address range); another scheme or port, credentials in the URL or a fourth redirect is `redirect_rejected`.
+- **Limits:** one timeout for the whole fetch, redirects included (20 s for a list, `GH_DOMAIN_FETCH_TIMEOUT_MS` for a TOML file); the
+  body is capped at 1 MiB for a list and 256 KiB for a TOML file, counted while it is read, and a `Content-Length` above the cap is
+  refused before a byte is read; only status 200 is accepted; no cookies are kept, no `Accept-Encoding` is sent and nothing is
+  decompressed; the `User-Agent` is the fixed `gatehub-data-api/<version> (validators)`.
+- **No environment agent:** `HTTP_PROXY` and `HTTPS_PROXY` are ignored. Only the tests can replace the resolver, the address policy
+  and the CA, through a constructor argument.
+
+Residual: the syncer can be made to send a `GET` to any public host on port 443 (the path is the fixed TOML path, or the configured
+publisher URL), and its address is the source of that request. [Deployment](deployment.md#outbound-network-access) says what egress
+to allow and recommends blocking the private ranges at the network as well.
+
 ## 10. Security checklist
 
 ### Implemented
@@ -194,6 +233,9 @@ Production compose (`docker-compose.prod.yaml`):
 - [x] Secrets via environment; env files git- and docker-ignored; per-service env in compose.
 - [x] The npm token is a BuildKit secret, in no layer.
 - [x] Containers run as non-root; ClickHouse, Keeper, syncers and metrics are not published; `/internal/` and `/liveliness/` blocked at the edge.
+- [x] Outbound HTTPS to arbitrary public hosts (UNL lists, validator TOML files) only through `SafeFetcher`: https on 443 without
+  credentials, every resolved address checked against the non-public ranges, the connection pinned to a checked address, redirects
+  checked again from the top, one timeout and a body cap enforced while reading, no environment proxy, no environment switch (§9).
 
 ### Backlog
 
@@ -205,4 +247,6 @@ Production compose (`docker-compose.prod.yaml`):
 - [ ] **Count 401/429 in the metrics** (guard rejections are not in `api_http_requests_total`).
 - [ ] **Secret scanning and dependency/base-image vulnerability scanning in CI.**
 - [ ] **Audit logging** (which key called which endpoint).
+- [ ] **Egress policy at the network for the syncer** (deny the private ranges and the metadata address as a second line behind
+  `SafeFetcher`; a hostname allowlist is not possible, the validator domains are open-ended).
 - [ ] **Narrow the nginx trust defaults** by shipping no default for `TRUSTED_PROXIES` (today: private ranges).
