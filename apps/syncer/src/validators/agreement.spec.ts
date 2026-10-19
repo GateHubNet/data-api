@@ -175,6 +175,38 @@ describe('agreementRows', () => {
     expect(rowOf(rows, Q)).toMatchObject({ agreed: 5, partial: 2, missed: 4, last_seen: H + 3000.25 });
   });
 
+  it('does not track a validator that has a count but no receipt in the hour, and is not on the UNL or carried', () => {
+    const rows = agreementRows(
+      input({
+        perKey: new Map([[Q, { agreed: 1, partialOnly: 0 }]]),
+        seenOutside: new Map([[Q, END + 2.5]]),
+      }),
+    );
+    expect(keysOf(rows)).toEqual([A, B, C, D, '']);
+  });
+
+  it('fills the last_seen of a tracked validator that has no receipt in the hour from one outside it, and not the other way', () => {
+    const rows = agreementRows(
+      input({
+        perKey: new Map([
+          [A, { agreed: 1, partialOnly: 0 }],
+          [B, { agreed: 1, partialOnly: 0 }],
+          [C, { agreed: 1, partialOnly: 0 }],
+        ]),
+        seenInHour: new Map([[B, H + 3500]]),
+        seenOutside: new Map([
+          [A, END + 2.5],
+          [B, END + 2.5],
+          [Q, END + 2.5],
+        ]),
+        previous: [previousRow(C, H - 100)],
+      }),
+    );
+    // A: only a receipt after the hour; B: its receipt in the hour stands; C: the row before; D: none known
+    expect([A, B, C, D].map((key) => rowOf(rows, key)?.last_seen)).toEqual([END + 2.5, H + 3500, H - 100, 0]);
+    expect(keysOf(rows)).not.toContain(Q);
+  });
+
   it('tracks a validator seen in the hour that agreed with nothing, with all the observed ledgers missed', () => {
     const rows = agreementRows(input({ seenInHour: new Map([[Q, H + 10]]) }));
     expect(rowOf(rows, Q)).toMatchObject({ agreed: 0, partial: 0, missed: 9 });

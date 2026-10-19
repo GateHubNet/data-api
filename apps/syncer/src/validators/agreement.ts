@@ -49,6 +49,11 @@ export interface HourAgreementInput {
   /** Per validator (master key), the newest receipt of a validation in the hour. */
   seenInHour: ReadonlyMap<string, number>;
   /**
+   * Per validator (master key), the newest receipt of a validation of one of the hour's ledgers that came outside the hour (after
+   * its end). It makes nobody tracked: it only fills the `last_seen` of a validator that is tracked and has no receipt in the hour.
+   */
+  seenOutside?: ReadonlyMap<string, number>;
+  /**
    * The rows of the hour before, of the version its newest sentinel names (only the key and `last_seen` of a row are read; the
    * sentinel, with the key `''`, is ignored).
    */
@@ -62,11 +67,12 @@ export interface HourAgreementInput {
  * The rows of an hour of `validator_agreement_hourly` (spec 2.5): a row per tracked validator, in the order of the keys, then
  * the hour's sentinel (`validation_public_key ''`) last.
  *
- * Tracked: the UNL of the hour, the validators with a validation received in it, and those of the hour before whose `last_seen` is
- * no more than `TRACK_CARRY_SECONDS` before the end of the hour. Per tracked validator, `agreed` and `partial` are the observed
- * ledgers it signed fully and only partially, `missed` is the rest of the observed ledgers (a partial one included), and
- * `last_seen` is the newest receipt known (this hour's, else the row before's, else 0 for a validator never seen). A ledger that
- * is not observed (fewer than quorum UNL validations recorded) is in the `unobserved` of the sentinel and in nobody's count.
+ * Tracked, exactly: the UNL of the hour, the validators with a validation received in it, and those of the hour before whose
+ * `last_seen` is no more than `TRACK_CARRY_SECONDS` before the end of the hour. A validator with a count but none of these is not
+ * tracked. Per tracked validator, `agreed` and `partial` are the observed ledgers it signed fully and only partially, `missed` is
+ * the rest of the observed ledgers (a partial one included), and `last_seen` is the newest receipt known (this hour's, else the
+ * newer of a receipt outside the hour and the row before's, else 0 for a validator never seen). A ledger that is not observed
+ * (fewer than quorum UNL validations recorded) is in the `unobserved` of the sentinel and in nobody's count.
  */
 export function agreementRows(i: HourAgreementInput): ValidatorAgreementHourlyRow[] {
   const horizon = i.hour + HOUR_SECONDS - TRACK_CARRY_SECONDS;
@@ -87,7 +93,7 @@ export function agreementRows(i: HourAgreementInput): ValidatorAgreementHourlyRo
       agreed,
       missed: Math.max(0, i.observed - agreed),
       partial: counts?.partialOnly ?? 0,
-      last_seen: Math.max(i.seenInHour.get(key) ?? 0, carried.get(key) ?? 0),
+      last_seen: Math.max(i.seenInHour.get(key) ?? i.seenOutside?.get(key) ?? 0, carried.get(key) ?? 0),
       ledgers: 0,
       unobserved: 0,
       gaps: 0,

@@ -69,12 +69,14 @@ interface WindowReads {
   observed: Map<number, number>;
   /** Per hour and validator: the observed ledgers it signed fully and only partially. */
   perKey: Map<number, Map<string, { agreed: number; partialOnly: number }>>;
-  /** Per hour and validator: the newest receipt, in seconds. */
+  /** Per hour and validator: the newest receipt in the hour, in seconds. */
   seen: Map<number, Map<string, number>>;
+  /** Per hour and validator: the newest receipt of a validation of an observed ledger of the hour, in seconds, whenever it came. */
+  late: Map<number, Map<string, number>>;
 }
 
 /**
- * The read of the agreement of a window of hours (one hour, or a whole UTC day), shared by the two queries that use it.
+ * The read of the agreement of a window of hours (one hour, or a whole UTC day).
  *
  * `l` is the chain of the window (the ledgers of `ledgers` with a close time in it, one hash per hash, each with its hour);
  * `v` is, per ledger of it and validator (keys mapped to master keys through the manifest map), the newest validation as the
@@ -98,6 +100,7 @@ const AGREEMENT_WITH = `WITH l AS (
           WHERE last_datetime >= fromUnixTimestamp64Milli({fromMs:Int64}, 'UTC')
             AND last_datetime < fromUnixTimestamp64Milli({toMs:Int64}, 'UTC')
             AND ledger_hash IN (SELECT ledger_hash FROM l)
+            AND validation_public_key != ''
           GROUP BY ledger_hash, k
        ),
        obs AS (
@@ -116,7 +119,8 @@ const AGREEMENT_WITH = `WITH l AS (
  * ingest has passed it). They are computed oldest first, until the deadline of the tick, because the tracked validators of an hour
  * carry over from the hour before. The first hour is the first whole hour at or after both the oldest validation of the oldest
  * active `validations` partition (`system.parts`) and the first ledger of `ledgers`; then always the hour after the newest stored one
- * (its newest sentinel), so a restart goes on where the last run ended and a final hour is never done twice. While no UNL is known
+ * (its newest sentinel), so a restart goes on where the last run ended and a final hour is never done twice, though never from an
+ * hour whose validations `validations` no longer holds whole (the 90 days of its TTL). While no UNL is known
  * (no list stored yet) nothing is computed: an hour with an empty UNL would be written final with nothing observed.
  *
  * **A window.** One hour per read, or, from midnight UTC while the whole day ended more than 24 hours ago and is ready, a whole day
@@ -169,6 +173,8 @@ export class AgreementJob implements ComputeJob {
       if (newestClosed === undefined) return;
       const stored = await this.newestStoredHour();
       let next = stored === undefined ? await this.firstHour() : stored + HOUR;
+      // an hour whose validations are past their TTL cannot be counted: it is not sealed
+      if (next !== undefined) next = Math.max(next, retentionFloor(tick.now / 1000));
       let first = stored === undefined;
       while (next !== undefined && this.mayStart(tick)) {
         const plans = await this.planWindow(next, contextOf, tick.now / 1000, newestClosed);
@@ -231,7 +237,7 @@ export class AgreementJob implements ComputeJob {
     const received = await this.ch.queryOne<{ first_ms: number | string; received: number | string }>(
       `SELECT toUnixTimestamp64Milli(min(last_datetime)) AS first_ms, count() AS received
          FROM ${Table.Validations}
-        WHERE _partition_id = {partition:String}`,
+        WHERE _partition_id = {partition:String} AND validation_public_key != ''`,
       { partition: oldest.oldest_partition },
     );
     if (received === undefined || Number(received.received) === 0) return undefined;
@@ -340,6 +346,7 @@ export class AgreementJob implements ComputeJob {
         quorum: plan.quorum,
         perKey: reads.perKey.get(plan.hour) ?? new Map(),
         seenInHour: reads.seen.get(plan.hour) ?? new Map(),
+        seenOutside: reads.late.get(plan.hour),
         previous,
         final: gaps === 0,
         version: Math.max(Math.floor(tick.now), (versions.get(plan.hour) ?? 0) + 1),
@@ -407,7 +414,7 @@ export class AgreementJob implements ComputeJob {
     end: number,
     context: RunContext,
   ): Promise<WindowReads> {
-    const reads: WindowReads = { observed: new Map(), perKey: new Map(), seen: new Map() };
+    const reads: WindowReads = { observed: new Map(), perKey: new Map(), seen: new Map(), late: new Map() };
     const fromMs = start * 1000 - READ_LEAD_MS;
     const toMs = end * 1000 + READ_TAIL_MS;
     // heard in the hour: the newest receipt of every validator in it, of any ledger
@@ -418,6 +425,7 @@ export class AgreementJob implements ComputeJob {
          FROM ${Table.Validations}
         WHERE last_datetime >= fromUnixTimestamp64Milli({startMs:Int64}, 'UTC')
           AND last_datetime < fromUnixTimestamp64Milli({endMs:Int64}, 'UTC')
+          AND validation_public_key != ''
         GROUP BY seen_hour, seen_key
         ORDER BY seen_hour, seen_key`,
       { startMs: start * 1000, endMs: end * 1000, ...context.keyMap },
@@ -435,41 +443,38 @@ export class AgreementJob implements ComputeJob {
         quorum: first.quorum,
         ...context.keyMap,
       };
+      // one read, one snapshot: the rows of the validators, and (WITH ROLLUP) the rows of the hours with the distinct observed
+      // ledgers of each, the key `''` that no validator has (the reads of `validations` leave it out)
       const counts = await this.ch.query<{
-        agreed_hour: number;
-        agreed_key: string;
+        counted_hour: number;
+        counted_key: string;
         agreed: number | string;
         partial_only: number | string;
         last_ms: number | string;
+        observed_ledgers: number | string;
       }>(
         `${AGREEMENT_WITH}
-         SELECT l.chain_hour AS agreed_hour, v.k AS agreed_key, countIf(v.f = 1) AS agreed, countIf(v.f = 0) AS partial_only,
-                toUnixTimestamp64Milli(max(v.seen)) AS last_ms
+         SELECT l.chain_hour AS counted_hour, v.k AS counted_key, countIf(v.f = 1) AS agreed, countIf(v.f = 0) AS partial_only,
+                toUnixTimestamp64Milli(max(v.seen)) AS last_ms, uniqExact(v.ledger_hash) AS observed_ledgers
            FROM v INNER JOIN l USING ledger_hash
           WHERE v.ledger_hash IN (SELECT ledger_hash FROM obs)
-          GROUP BY agreed_hour, agreed_key
-          ORDER BY agreed_hour, agreed_key`,
+          GROUP BY counted_hour, counted_key WITH ROLLUP
+          ORDER BY counted_hour, counted_key`,
         params,
       );
       for (const row of counts) {
-        const hour = Number(row.agreed_hour);
-        mapOf(reads.perKey, hour).set(row.agreed_key, {
+        const hour = Number(row.counted_hour);
+        if (hour === 0) continue; // the total of all the hours
+        if (row.counted_key === '') {
+          reads.observed.set(hour, Number(row.observed_ledgers));
+          continue;
+        }
+        mapOf(reads.perKey, hour).set(row.counted_key, {
           agreed: Number(row.agreed),
           partialOnly: Number(row.partial_only),
         });
-        // a validator with a count was heard, however late its validations came (only when none came in the hour itself)
-        const seen = mapOf(reads.seen, hour);
-        if (!seen.has(row.agreed_key)) seen.set(row.agreed_key, Number(row.last_ms) / 1000);
+        mapOf(reads.late, hour).set(row.counted_key, Number(row.last_ms) / 1000);
       }
-      const observed = await this.ch.query<{ observed_hour: number; observed_count: number | string }>(
-        `${AGREEMENT_WITH}
-         SELECT l.chain_hour AS observed_hour, count() AS observed_count
-           FROM obs INNER JOIN l USING ledger_hash
-          GROUP BY observed_hour
-          ORDER BY observed_hour`,
-        params,
-      );
-      for (const row of observed) reads.observed.set(Number(row.observed_hour), Number(row.observed_count));
     }
     return reads;
   }
@@ -522,7 +527,7 @@ export class AgreementJob implements ComputeJob {
     newestClosed: number,
   ): Promise<void> {
     const nowSeconds = tick.now / 1000;
-    const since = Math.max(0, Math.floor(nowSeconds) - VALIDATIONS_RETENTION_SECONDS + HOUR_DELAY_SECONDS);
+    const since = retentionFloor(nowSeconds);
     const stale = await this.ch.query<{ stale_hour: number; stale_version: string }>(
       `SELECT toUnixTimestamp(hour) AS stale_hour, toString(max(version)) AS stale_version, argMax(final, version) AS stale_final
          FROM ${Table.ValidatorAgreementHourly}
@@ -562,6 +567,15 @@ export class AgreementJob implements ComputeJob {
       Math.max(0, Math.floor(nowMs / 1000) - (Number(row.newest_final) + HOUR)),
     );
   }
+}
+
+/**
+ * The first hour whose validations `validations` still holds whole: the hour and the 10 minutes read before it are inside the 90
+ * days of its TTL. Earlier hours are neither started from nor recomputed.
+ */
+function retentionFloor(nowSeconds: number): number {
+  const since = Math.floor(nowSeconds) - VALIDATIONS_RETENTION_SECONDS + HOUR_DELAY_SECONDS;
+  return Math.max(0, Math.ceil(since / HOUR) * HOUR);
 }
 
 /** The `ledger_index` of a row, if there is one. */

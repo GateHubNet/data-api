@@ -3731,7 +3731,7 @@ describe('the validators worker (e2e)', () => {
       const DAY_COUNT = 24 * 6 + 2;
       const dayHour = (hour: number) => DAY_START + hour * HOUR;
 
-      /** How many reads of the agreement (the per-validator count and the observed count of a window) a job made. */
+      /** How many reads of the agreement (one per window that has ledgers: the counts of the validators and of the hours) a job made. */
       const agreementReads = (query: jest.SpyInstance) =>
         query.mock.calls.filter(([, params]) => (params as Record<string, unknown> | undefined)?.quorum !== undefined)
           .length;
@@ -3745,9 +3745,9 @@ describe('the validators worker (e2e)', () => {
         await seed({ chain: DAY_CHAIN, count: DAY_COUNT, skip });
         const query = jest.spyOn(db.ch, 'query');
 
-        // the day ended more than 24 hours ago: one read of each kind for all of it
+        // the day ended more than 24 hours ago: one read for all of it
         await runAt(Date.now());
-        expect(agreementReads(query)).toBe(2);
+        expect(agreementReads(query)).toBe(1);
         const byDay = await currentRows();
         expect(hoursOf(byDay)).toEqual(range(0, 23).map(dayHour));
 
@@ -3756,7 +3756,7 @@ describe('the validators worker (e2e)', () => {
         query.mockClear();
         await runAt((dayHour(24) + 12 * HOUR) * 1000);
         // (the hour with no ledger has nothing to read)
-        expect(agreementReads(query)).toBe(46);
+        expect(agreementReads(query)).toBe(23);
         const byHour = await currentRows();
 
         expect(withoutVersion(byDay)).toEqual(withoutVersion(byHour));
@@ -3768,6 +3768,28 @@ describe('the validators worker (e2e)', () => {
         expect(byDay.find((row) => row.hour_ts === dayHour(8) && row.key === '')?.unobserved).toBe(2);
       });
 
+      it('gives the same rows in a day as hour by hour when validations come after the end of the hour', async () => {
+        // the ledgers close a second before the hour boundaries: ledger 6 of each hour closes at 3599 s and its validations are
+        // received 2.5 s into the next hour, so every hour of the day has validations that cross its end
+        const cross: Chain = { first: 9000, start: DAY_START - 1, step: 600 };
+        await seed({ chain: cross, count: DAY_COUNT });
+        const query = jest.spyOn(db.ch, 'query');
+
+        await runAt(Date.now());
+        expect(agreementReads(query)).toBe(1);
+        const byDay = await currentRows();
+        expect(hoursOf(byDay)).toEqual(range(0, 23).map(dayHour));
+
+        await db.ch.command(`TRUNCATE TABLE ${Table.ValidatorAgreementHourly}`);
+        query.mockClear();
+        await runAt((dayHour(24) + 12 * HOUR) * 1000);
+        expect(agreementReads(query)).toBe(24);
+
+        expect(withoutVersion(byDay)).toEqual(withoutVersion(await currentRows()));
+        // the counts are those of the model, which counts a ledger in the hour it closed in, whenever its validations came
+        for (const hour of [0, 8, 23]) expectHour(byDay, cross, dayHour(hour), { count: DAY_COUNT });
+      });
+
       it('does not use a day the ingest has not passed the end of', async () => {
         // the ingest has the first ten hours of the day only
         const count = 10 * 6 + 2;
@@ -3777,7 +3799,7 @@ describe('the validators worker (e2e)', () => {
         await runAt(Date.now());
 
         expect(hoursOf(await currentRows())).toEqual(range(0, 9).map(dayHour));
-        expect(agreementReads(query)).toBe(20);
+        expect(agreementReads(query)).toBe(10);
       });
 
       it('does not use a day for hours that do not begin at midnight', async () => {
@@ -3789,7 +3811,7 @@ describe('the validators worker (e2e)', () => {
         await runAt(Date.now());
 
         expect(hoursOf(await currentRows())).toEqual(range(5, 28).map(dayHour));
-        expect(agreementReads(query)).toBe(48);
+        expect(agreementReads(query)).toBe(24);
       });
 
       it('goes hour by hour through a day whose UNL changes', async () => {
@@ -3806,7 +3828,7 @@ describe('the validators worker (e2e)', () => {
 
         await runAt(Date.now());
 
-        expect(agreementReads(query)).toBe(48);
+        expect(agreementReads(query)).toBe(24);
         const rows = await currentRows();
         expect(sentinelsOf(rows).map((row) => row.unl_size)).toEqual([...Array(11).fill(5), ...Array(13).fill(4)]);
         for (const hour of [3, 14]) {
@@ -3825,7 +3847,7 @@ describe('the validators worker (e2e)', () => {
 
         await runAt(Date.now());
 
-        expect(agreementReads(query)).toBe(48);
+        expect(agreementReads(query)).toBe(24);
         expect(sentinelsOf(await currentRows()).map((row) => row.quorum)).toEqual([
           ...Array(11).fill(4),
           ...Array(13).fill(3),
@@ -3837,12 +3859,12 @@ describe('the validators worker (e2e)', () => {
         const query = jest.spyOn(db.ch, 'query');
 
         await runAt((dayHour(24) + 24 * HOUR) * 1000);
-        expect(agreementReads(query)).toBe(48);
+        expect(agreementReads(query)).toBe(24);
         // one second more than 24 hours after the end of the day
         await db.ch.command(`TRUNCATE TABLE ${Table.ValidatorAgreementHourly}`);
         query.mockClear();
         await runAt((dayHour(24) + 24 * HOUR + 1) * 1000);
-        expect(agreementReads(query)).toBe(2);
+        expect(agreementReads(query)).toBe(1);
       });
     });
 
@@ -3917,6 +3939,56 @@ describe('the validators worker (e2e)', () => {
       const observed = rows.find((r) => r.hour_ts === H0 && r.key === '')?.ledgers;
       expect(carried).toMatchObject({ agreed: 0, partial: 0, missed: observed });
       expect(Number(carried?.last_ms)).toBe((before + 10.5) * 1000);
+    });
+
+    describe('validations that come after the end of the hour', () => {
+      /** Ledgers 30 s apart that close a second before the hour boundaries: hour 0 is ledgers 1 to 120, and 120 closes at 3599 s. */
+      const CROSS: Chain = { first: 5000, start: H0 - 1, step: 30 };
+      const CROSS_COUNT = 242;
+      const LATE = testKey('agreement-late');
+      const EVERY_UNL_KEY = UNL.map((key) => key.base58).sort();
+
+      it('counts them for the hour of their ledger, tracks nobody for them, and fills only the last_seen of a tracked validator', async () => {
+        await seedList();
+        await writeChain(CROSS, 0, CROSS_COUNT);
+        const rows: ValidationsRow[] = [];
+        for (let n = -2; n < CROSS_COUNT; n++) {
+          for (const key of [K1, K2, K3, K4]) rows.push(validationRow(CROSS, n, key.base58, true));
+        }
+        // K5, on the UNL, and LATE, which is not, sign ledger 120 only; it closes a second before the hour ends and their
+        // validations are received 2.5 s into the next hour
+        rows.push(validationRow(CROSS, 120, K5.base58, true), validationRow(CROSS, 120, LATE.base58, true));
+        await db.ch.insert(Table.Validations, rows);
+
+        await runAt(Date.now());
+
+        const current = await currentRows();
+        expect(hoursOf(current)).toEqual([hourOf(0), hourOf(1)]);
+        const hour = (h: number) => current.filter((row) => row.hour_ts === hourOf(h) && row.key !== '');
+        const row = (h: number, key: TestKey) => hour(h).find((r) => r.key === key.base58);
+        const received = (seconds: number) => (H0 + seconds) * 1000;
+        // the last ledger of the hour is observed, thanks to validations that came after the hour ended
+        for (const h of [0, 1]) {
+          expect(current.find((r) => r.hour_ts === hourOf(h) && r.key === '')).toMatchObject({
+            ledgers: 120,
+            unobserved: 0,
+            gaps: 0,
+            final: 1,
+            unl_size: 5,
+            quorum: 4,
+          });
+        }
+        // hour 0: LATE has a count but no receipt in the hour: no row. K5 has one and is on the UNL: its last_seen is that receipt
+        expect(hour(0).map((r) => r.key)).toEqual(EVERY_UNL_KEY);
+        expect(row(0, K5)).toMatchObject({ agreed: 1, missed: 119, last_ms: received(3602.5) });
+        // a validator with a receipt in the hour keeps it, not the later one for the last ledger
+        expect(row(0, K1)).toMatchObject({ agreed: 120, missed: 0, last_ms: received(3572.5) });
+        // hour 1: the receipt is in the hour, so LATE is tracked (it agreed with nothing of the hour)
+        expect(hour(1).map((r) => r.key)).toEqual([...EVERY_UNL_KEY, LATE.base58].sort());
+        expect(row(1, LATE)).toMatchObject({ agreed: 0, missed: 120, last_ms: received(3602.5) });
+        expect(row(1, K5)).toMatchObject({ agreed: 0, missed: 120, last_ms: received(3602.5) });
+        expect(row(1, K1)).toMatchObject({ agreed: 120, last_ms: received(7172.5) });
+      });
     });
 
     describe('the UNL and the negative UNL of an hour', () => {
@@ -4061,7 +4133,62 @@ describe('the validators worker (e2e)', () => {
       });
     });
 
+    it('leaves a validation with an empty key out of every read: that key is the sentinel', async () => {
+      await seed();
+      await db.ch.insert(
+        Table.Validations,
+        [1, 2, 3].map((n) => validationRow(MAIN, n, '', true)),
+      );
+      const query = jest.spyOn(db.ch, 'query');
+
+      await runAt(Date.now());
+
+      const rows = await currentRows();
+      for (const hour of [0, 1, 2]) {
+        expectHour(rows, MAIN, hourOf(hour), {});
+        expect(rows.filter((row) => row.hour_ts === hourOf(hour) && row.key === '')).toHaveLength(1);
+      }
+      // every read of validations says so: the start of the first hour, what was heard in an hour, the counts of a window
+      const reads = query.mock.calls
+        .map(([sql]) => String(sql))
+        .filter((sql) => sql.includes(`FROM ${Table.Validations}`));
+      expect(reads.length).toBeGreaterThanOrEqual(3);
+      for (const sql of reads) expect(sql).toContain("validation_public_key != ''");
+    });
+
     describe('while validations holds the hour', () => {
+      it('does not seal an hour whose validations are past their TTL: it resumes at the first one that is held', async () => {
+        await seed();
+        const ms = wholeSecond();
+        const stored = Math.floor(ms / 1000 / HOUR) * HOUR - 100 * DAY;
+        await db.ch.insert(Table.ValidatorAgreementHourly, [
+          {
+            hour: stored,
+            validation_public_key: '',
+            agreed: 0,
+            missed: 0,
+            partial: 0,
+            last_seen: 0,
+            ledgers: 0,
+            unobserved: 0,
+            gaps: 0,
+            unl_size: 5,
+            quorum: 4,
+            final: 1,
+            version: 1000,
+          },
+        ]);
+        // a clock that moves a second each time it is read: only the first window of the run is done
+        let reads = 0;
+        const job = makeJob(() => ms + 1000 * reads++);
+
+        await job.run({ now: ms, deadline: ms + 500, signal: new AbortController().signal });
+
+        // the hour after the stored one is 100 days old: the first hour written is the first of the last 90 days
+        const first = Math.ceil((ms / 1000 - 90 * DAY + 600) / HOUR) * HOUR;
+        expect(hoursOf(await currentRows()).slice(0, 2)).toEqual([stored, first]);
+      });
+
       it('recomputes a stored hour that is not final, and leaves one that validations no longer holds', async () => {
         await seed();
         const old = Math.floor(nowSeconds() / HOUR) * HOUR - 48 * HOUR;

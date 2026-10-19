@@ -542,19 +542,25 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
   has passed it). Hours are computed oldest first, until the deadline of the job (10 s), because the tracked set carries from the hour
   before. The first hour is the first whole hour at or after both the first ledger of `ledgers` and the oldest validation of the oldest
   active partition of `validations` (`system.parts`); then always the hour after the newest stored one (its newest sentinel), so a
-  restart goes on where the last run ended. While no UNL is known (no list stored, or the threshold not met) nothing is computed, and
+  restart goes on where the last run ended. Neither starts before the first hour whose validations `validations` still holds whole
+  (90 days back, less the 10 minutes read before the hour), so an hour whose validations are past their TTL is never sealed. While no UNL is known (no list stored, or the threshold not met) nothing is computed, and
   `Agreement: no UNL is known at the end of <hour>, the hour waits for a validator list` is logged once: an hour with an empty UNL would be
   written final with nothing observed.
 - **A read.** One hour, or, from midnight UTC, a whole day when it ended more than 24 hours ago, is ready, and every hour of it has the
   same UNL and quorum (a day that does not goes hour by hour; so do the hours before the first midnight). The hashes of the window come from a subquery on `ledgers` (the ledger-index
   range of the window and its close times, one hash per hash, each with its hour: a day's 21,600 hashes would not fit the query string),
-  the validations from the rows received between 10 minutes before the window and 2 hours after it. The day's rows are the same as the
-  hours' one by one. "Heard in the hour" is the newest receipt of every validator among the validations received in the hour, of any ledger.
-- **An hour's rows** (`agreementRows`). Tracked validators: the UNL, those heard in the hour, and those of the hour before (the rows of
-  its newest sentinel's version, keys mapped through the manifest map) whose `last_seen` is no more than 24 hours before the end of the
-  hour, so a validator that goes quiet keeps missing ledgers for a day. Per tracked validator: `agreed` = observed ledgers with a full
+  the validations from the rows received between 10 minutes before the window and 2 hours after it (a ledger that closes just before the end
+  of an hour has validations received just after it: they count for the hour of the ledger). The per-validator counts and the observed
+  ledgers of each hour come from one query (`GROUP BY hour, key WITH ROLLUP`), so one snapshot of `validations` decides both. The day's rows
+  are the same as the hours' one by one. "Heard in the hour" is the newest receipt of every validator among the validations received in
+  the hour, of any ledger. Rows with an empty key are left out of every read of `validations`: that key is the sentinel's.
+- **An hour's rows** (`agreementRows`). Tracked validators, exactly: the UNL, those heard in the hour, and those of the hour before (the
+  rows of its newest sentinel's version, keys mapped through the manifest map) whose `last_seen` is no more than 24 hours before the end of
+  the hour, so a validator that goes quiet keeps missing ledgers for a day. A validator whose only validations of the hour's ledgers were
+  received after the hour ended is not tracked for it (it is for the hour they were received in). Per tracked validator: `agreed` = observed ledgers with a full
   validation of the hash by it, `partial` = observed ledgers with only a partial one, `missed` = observed - `agreed` (the partial ones
-  included), `last_seen` = the newest receipt known (the hour's, else the row before's, 0 for a UNL member never heard). The sentinel
+  included), `last_seen` = the newest receipt known (the hour's; else the newer of a receipt of the hour's ledgers that came after the hour
+  and the row before's; 0 for a UNL member never heard). The sentinel
   (`validation_public_key ''`) holds `ledgers` (the observed ones), `unobserved`, `gaps`, `unl_size`, `quorum` and `final`.
 - **Gaps and `final`.** `gaps` counts the ledger indices missing in the hour, as spec 2.5 has it, and also those missing between the hour
   and the nearest committed ledger before it and after it (an hour with no ledger counts the indices between its neighbours): a ledger
