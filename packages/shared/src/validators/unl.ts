@@ -2,6 +2,12 @@
 export interface StoredUnlList {
   /** The publisher's id (`vl.ripple.com`). */
   publisher: string;
+  /**
+   * The master key the list was served under: 66 upper-case hex digits. A publisher's id is its URL and its key can change,
+   * and sequences are numbered by the key, so a reader that compares or counts sequences keeps the rows of one key.
+   * `listInUse` and `trustedUnl` do not look at it.
+   */
+  publisherKey?: string;
   sequence: number;
   version: number;
   /** The list is valid from this time on; none means always. */

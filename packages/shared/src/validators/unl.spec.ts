@@ -147,3 +147,21 @@ describe('trustedUnl', () => {
     expect([...trustedUnl([a1], ['a'], 1, 10)].sort()).toEqual(['n1', 'n2', 'n3']);
   });
 });
+
+describe('the publisher key of a stored list', () => {
+  const OLD_KEY = `ED${'11'.repeat(32)}`;
+  const NEW_KEY = `ED${'22'.repeat(32)}`;
+
+  it('is carried by the list and not looked at by listInUse and trustedUnl', () => {
+    const lists = [
+      list('p', 7, { publisherKey: OLD_KEY, validators: ['nHa'] }),
+      list('p', 3, { publisherKey: NEW_KEY, validators: ['nHb'], fetchedAt: 700 }),
+    ];
+    // the readers pick by sequence whatever the key; a caller that keeps the rows of one key filters them first
+    expect(listInUse(lists, 'p', 800)?.list.publisherKey).toBe(OLD_KEY);
+    expect(trustedUnl(lists, ['p'], 1, 800)).toEqual(new Set(['nHa']));
+    const own = lists.filter((l) => l.publisherKey === NEW_KEY);
+    expect(listInUse(own, 'p', 800)?.list.publisherKey).toBe(NEW_KEY);
+    expect(trustedUnl(own, ['p'], 1, 800)).toEqual(new Set(['nHb']));
+  });
+});

@@ -1,4 +1,10 @@
-import { ClickHouseConfig, ClickHouseService, getNetworkProfile, runMigrations } from '@gatehub/data-api-shared';
+import {
+  ClickHouseConfig,
+  ClickHouseService,
+  getNetworkProfile,
+  NetworkProfile,
+  runMigrations,
+} from '@gatehub/data-api-shared';
 import { Global, INestApplication, Module } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { once } from 'node:events';
@@ -7,14 +13,13 @@ import { createServer, Server } from 'node:https';
 import { AddressInfo } from 'node:net';
 import { WebSocketServer } from 'ws';
 import { startClickHouse } from '../../../../packages/shared/test/clickhouse-container';
-import { SyncerConfig } from '../../src/config/syncer.config';
+import { SyncerConfig, WorkerName } from '../../src/config/syncer.config';
 import { SyncerCoreModule } from '../../src/core/syncer-core.module';
 import { PrometheusService } from '../../src/modules/prometheus/prometheus.service';
 import { SafeFetchTestOptions } from '../../src/validators/safe-fetch';
 import { UnlFetcher } from '../../src/validators/unl-fetcher';
-import { ValidatorsModule } from '../../src/validators/validators.module';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from '../../src/validators/validators.options';
-import { needsNodeClient } from '../../src/worker-registry';
+import { needsNodeClient, selectWorkerModules } from '../../src/worker-registry';
 import { TEST_TLS } from './tls';
 
 /*
@@ -36,12 +41,18 @@ import { TEST_TLS } from './tls';
  *                                      answer (a value, or a function of the request); `node.requests` logs the requests; a
  *                                      command with no answer is an `unknownCmd` error. `server_info` is answered from the start
  *   startValidatorsApp(options)        the real `SyncerCoreModule` (config, ClickHouse, metrics, shutdown signals and the
- *                                      node client made from the fake node) with the `ValidatorsModule` as the only worker,
- *                                      booted as the application does: the result holds the app, the `UnlFetcher`, the
- *                                      metrics, and `stop()`. `options.config` overrides `SyncerConfig` (for instance
- *                                      `unlPublishers`), `options.worker` the `ValidatorsWorkerOptions` (`now`, `start`,
- *                                      ...; the `fetch` options of the web server are already in it)
- *   quietLogger / resetValidatorsMetrics / waitFor   helpers
+ *                                      node client made from the fake node) with the modules of `options.workers` (default
+ *                                      `['validators']`, chosen by the application's own `selectWorkerModules`, and the node
+ *                                      client made when `needsNodeClient` says so), booted as the application does: the
+ *                                      result holds the app, the `UnlFetcher`, the metrics, and `stop()`. `options.config`
+ *                                      overrides `SyncerConfig` (for instance `unlPublishers`), `options.worker` the
+ *                                      `ValidatorsWorkerOptions` (`now`, `start`, ...; the `fetch` options of the web server
+ *                                      are already in it), `options.profile` is the network (default XRPL; the fake node must
+ *                                      then report that network's `network_id`: `startFakeNode({ server_info: ... })`). A boot
+ *                                      that fails closes the Nest application before it rethrows
+ *   resetValidatorsMetrics()           clears the metrics of the worker, one set per process: a loop that adds a metric adds
+ *                                      its name to `VALIDATORS_METRICS`
+ *   quietLogger / waitFor              helpers
  *
  * A spec ends what it starts: `app.stop()`, `web.stop()`, `node.stop()`, `clickhouse.stop()`.
  */
@@ -229,18 +240,26 @@ export interface ValidatorsAppOptions {
   config?: Partial<SyncerConfig>;
   /** Over the defaults: a quiet logger and the fetch options of `web`. */
   worker?: ValidatorsWorkerOptions;
+  /** The network the syncer is of. Default XRPL. */
+  profile?: NetworkProfile;
+  /** The workers whose modules are loaded. Default only `validators`. */
+  workers?: WorkerName[];
 }
 
 /**
- * Boots the validators worker the way the application does: the core module of the syncer with the `ValidatorsModule` as
- * its only worker, a node client made from the fake node, and a ClickHouse that is already migrated. Resolves when the
- * application is initialised, i.e. after the worker registered its publishers (the loops run in the background).
+ * Boots the validators worker the way the application does: the core module of the syncer with the modules of
+ * `o.workers` (by default only `ValidatorsModule`), a node client made from the fake node when one of them reads from it,
+ * and a ClickHouse that is already migrated. Resolves when the application is initialised, i.e. after the worker
+ * registered its publishers (the loops run in the background).
  */
 export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<ValidatorsApp> {
+  const profile = o.profile ?? getNetworkProfile('xrpl');
+  const workers = new Set<WorkerName>(o.workers ?? ['validators']);
   const config = Object.assign(new SyncerConfig(), {
+    network: profile.name,
     nodeEndpoints: o.node.url,
     validationEndpoints: o.node.url,
-    workers: 'validators',
+    workers: [...workers].join(','),
     unlPublishers: '',
     ...o.config,
   });
@@ -254,15 +273,14 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
   })
   class OptionsModule {}
 
-  const profile = getNetworkProfile('xrpl');
   const moduleRef = await Test.createTestingModule({
     imports: [
       SyncerCoreModule.register({
         config,
         profile,
         clickHouse: o.clickhouse,
-        workerModules: [ValidatorsModule],
-        nodeClient: needsNodeClient(new Set(['validators'])),
+        workerModules: selectWorkerModules(workers),
+        nodeClient: needsNodeClient(workers),
       }),
       OptionsModule,
     ],
@@ -270,7 +288,13 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
     .setLogger(quietLogger())
     .compile();
   const app = moduleRef.createNestApplication();
-  await app.init();
+  try {
+    await app.init();
+  } catch (err) {
+    // a boot that failed half way has started things (the node client, the ClickHouse client): end them
+    await app.close().catch(() => undefined);
+    throw err;
+  }
   return {
     app,
     fetcher: app.get(UnlFetcher),
@@ -279,10 +303,15 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
   };
 }
 
+/** The metrics the validators worker sets: add the name of a new one here and `resetValidatorsMetrics` clears it too. */
+export const VALIDATORS_METRICS = [
+  'validatorsUnlFetchesTotal',
+  'validatorsUnlExpirySeconds',
+  'validatorsUnlSize',
+] as const;
+
 /** The metrics are one set per process, so a spec clears the ones the worker sets before each test. */
 export function resetValidatorsMetrics(): void {
   const metrics = new PrometheusService();
-  metrics.validatorsUnlFetchesTotal.reset();
-  metrics.validatorsUnlExpirySeconds.reset();
-  metrics.validatorsUnlSize.reset();
+  for (const name of VALIDATORS_METRICS) metrics[name].reset();
 }

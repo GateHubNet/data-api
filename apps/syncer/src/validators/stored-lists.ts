@@ -2,6 +2,7 @@ import { ClickHouseService, StoredUnlList, Table } from '@gatehub/data-api-share
 
 interface StoredListRow {
   publisher: string;
+  publisher_key: string;
   sequence: number | string;
   version: number | string;
   effective: number | string | null;
@@ -12,7 +13,8 @@ interface StoredListRow {
 
 /**
  * The lists the given publishers served, as stored in `unl_lists`: one entry per `(publisher, sequence)`, the newest row
- * (by `fetched_at`) standing for it, in the order of the table's key. Without publishers there is nothing to read.
+ * (by `fetched_at`) standing for it, in the order of the table's key, each with the key it was served under
+ * (`publisherKey`). Without publishers there is nothing to read.
  */
 export async function readStoredLists(
   ch: Pick<ClickHouseService, 'query'>,
@@ -21,6 +23,7 @@ export async function readStoredLists(
   if (publishers.length === 0) return [];
   const rows = await ch.query<StoredListRow>(
     `SELECT publisher, sequence,
+            argMax(publisher_key, fetched_at) AS publisher_key,
             argMax(version, fetched_at) AS version,
             toUnixTimestamp(argMax(effective, fetched_at)) AS effective,
             toUnixTimestamp(argMax(expiration, fetched_at)) AS expiration,
@@ -34,6 +37,7 @@ export async function readStoredLists(
   );
   return rows.map((row) => ({
     publisher: row.publisher,
+    publisherKey: row.publisher_key,
     sequence: Number(row.sequence),
     version: Number(row.version),
     ...(row.effective === null ? {} : { effective: Number(row.effective) }),

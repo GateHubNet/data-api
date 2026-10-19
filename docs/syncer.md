@@ -327,8 +327,9 @@ URL without the scheme and the trailing slash, `vl.ripple.com`) and stores the o
 rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists must name a validator for it to be trusted.
 
 - **Schedule.** One timer per publisher, never two fetches of one publisher at a time. A fetch at start, then one after
-  `GH_UNL_REFRESH_MS` (5 min), or after the `refresh_interval` of the last list (minutes, clamped to 1 min – 24 h, as rippled does)
-  when the list gives one. After a failure the wait is 30 s and doubles with each failure in a row to 10 min; any outcome other
+  `GH_UNL_REFRESH_MS` (5 min), or after the `refresh_interval` of the last list (minutes) when the list gives one; either wait is
+  kept between 1 min and 24 h (rippled does so for the interval of a list), so that `GH_UNL_REFRESH_MS=1` cannot make a loop
+  and a huge value cannot overflow a timer. After a failure the wait is 30 s and doubles with each failure in a row to 10 min; any outcome other
   than `ok` and `unchanged` counts as a failure, a list that is `stale` or `expired` included.
 - **Verification**, in the order rippled's `ValidatorList::verify` uses. A response that fails any of steps 1–5 is rejected whole,
   and each failure has a reason code:
@@ -341,12 +342,19 @@ rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists 
   4. Each blob's signature verifies over the decoded blob with that manifest's signing key. Else `signature_invalid`.
   5. The blob is JSON with an integer `sequence` and `expiration`, an optional `effective` before the expiration, and validators
      with 33-byte keys. Else `blob_invalid`.
-  6. Each blob is then compared with the newest sequence stored for the publisher: a lower one is `stale`, the same one
+  6. Each blob is then compared with the newest sequence stored for the publisher **under its configured key** (see below): a lower one is `stale`, the same one
      `unchanged` (nothing is written), a newer one that has expired `expired`, else it is new. The outcome of the attempt is `ok`
      if any blob was new, else `unchanged` if any was unchanged, else the outcome of the first blob.
 - **A publisher cannot take a key back.** When a publisher rotates its signing key it serves a manifest of a higher sequence. A
   body that replays an older manifest, with a list signed by the superseded key, is refused (`signature_invalid`): the highest
-  publisher manifest seen is kept in memory and, after a restart, read from the newest stored response.
+  publisher manifest seen is kept in memory (a response that revokes the key leaves the revoking manifest behind, so an older
+  body that follows is `revoked` too) and, after a restart, rebuilt from the newest stored response under the configured key. What
+  only a response that stored nothing showed, a revocation or a rotation, is then forgotten: the next response has to show it again.
+- **Lists are told apart by key.** The id of a publisher is its URL, but sequences are numbered by its key and a manifest belongs to
+  it. The newest stored sequence a blob is compared with, the manifest above, and the gauges come from the rows stored under the
+  **configured** key (`unl_lists.publisher_key`); the lists of an earlier key stay in the table and count for nothing. A publisher
+  that changes its master key and starts numbering anew is therefore not `stale`. `readStoredLists` gives each list its
+  `publisherKey` for the readers that need the same.
 - **Writes.** Each new blob is one `unl_lists` row: the publisher, its key, `sequence`, `version`, `effective`, `expiration`, the
   validators' master keys (base58, sorted), the SHA-256 of the blob, the time of the fetch, and the JSON as served. The manifest
   of every validator in a new list is decoded, checked to be that validator's own, verified, and written to `validator_manifests`
@@ -356,7 +364,8 @@ rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists 
   outcome as `error`, `checked_at`, the `threshold` in force, and `last_ok_at` (the time of the last ok attempt, kept through
   failures). At start the worker writes a row for every configured publisher (a new one is `ok` with no `last_ok_at`, a known one
   keeps its status) and sets `configured = 0` on stored publishers that are no longer configured. A ClickHouse failure ends the
-  attempt with a warning and the same backoff, and writes no row.
+  attempt with no outcome: a warning and the same backoff, and no metric. Rows inserted earlier in the same attempt can remain, and
+  the retry then reports `unchanged`.
 - **The list in use, and the trusted UNL.** The current list of a publisher at time *t* is the stored one with the highest
   `sequence` whose `effective` (none = always) is at or before *t* and whose `expiration` is after it. When none is current, the
   newest is used and reported as expired: a flagged old UNL is better than none. The trusted UNL at *t* is the validators on at

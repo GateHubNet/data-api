@@ -132,7 +132,9 @@ class FakeClickHouse {
     const own = this.lists.filter((l) => wanted.includes(l.publisher));
     if (sql.includes('DESC')) {
       this.reads.push('response');
-      const newest = [...own].sort((a, b) => b.fetched_at - a.fetched_at)[0];
+      const newest = [...own]
+        .filter((l) => l.publisher_key === params.key)
+        .sort((a, b) => b.fetched_at - a.fetched_at)[0];
       return newest ? [{ response: newest.response }] : [];
     }
     this.reads.push('lists');
@@ -143,6 +145,7 @@ class FakeClickHouse {
     )
       .map((l) => ({
         publisher: l.publisher,
+        publisher_key: l.publisher_key,
         sequence: Number(l.sequence),
         version: l.version,
         effective: l.effective,
@@ -249,6 +252,21 @@ describe('UnlFetcher', () => {
     });
 
     it.each([
+      ['below a minute', 1, 60_000],
+      ['above a day', 10_000_000_000, 86_400_000], // more than a timer can hold
+    ])('keeps the wait of GH_UNL_REFRESH_MS between 1 min and 24 h (%s)', async (_label, refreshMs, waitMs) => {
+      const t = setup({ refreshMs });
+      t.fetcher.start();
+      await jest.advanceTimersByTimeAsync(10);
+      expect(t.fetches).toHaveLength(1); // a wait of 1 ms would have fetched ten times by now
+      await jest.advanceTimersByTimeAsync(waitMs - 11);
+      expect(t.fetches).toHaveLength(1);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(t.fetches).toHaveLength(2);
+      await t.fetcher.stop();
+    });
+
+    it.each([
       ['0', 0, 60_000],
       ['1', 1, 60_000],
       ['10', 10, 600_000],
@@ -257,7 +275,9 @@ describe('UnlFetcher', () => {
     ])('waits refresh_interval minutes, clamped to 1 min and 24 h (%s min)', async (_label, minutes, waitMs) => {
       const t = setup({ serve: served({ refreshInterval: minutes }), refreshMs: 5_000 });
       t.fetcher.start();
-      await jest.advanceTimersByTimeAsync(waitMs - 1);
+      await jest.advanceTimersByTimeAsync(10);
+      expect(t.fetches).toHaveLength(1); // a wait of none would have fetched ten times by now
+      await jest.advanceTimersByTimeAsync(waitMs - 11);
       expect(t.fetches).toHaveLength(1);
       await jest.advanceTimersByTimeAsync(1);
       expect(t.fetches).toHaveLength(2);
@@ -726,6 +746,101 @@ describe('UnlFetcher', () => {
           response: JSON.stringify(served({ sequence: 7, manifestSequence: 5, publisher: OTHER_PUBLISHER })),
         }),
       );
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('ok');
+    });
+  });
+
+  describe('lists of another key of the same publisher', () => {
+    const OTHER_KEY = OTHER_PUBLISHER.publicKeyHex;
+
+    it('are not compared with: a lower sequence under the configured key is new, not stale', async () => {
+      const t = setup({ serve: served({ sequence: 3 }) });
+      t.ch.lists.push(listRow({ sequence: 9, publisher_key: OTHER_KEY }));
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('ok');
+      expect(t.ch.rowsOf<UnlListsRow>(Table.UnlLists).map((r) => [r.sequence, r.publisher_key])).toEqual([
+        [3, PUBLISHER.publicKeyHex],
+      ]);
+    });
+
+    it('do not make the same sequence unchanged', async () => {
+      const t = setup({ serve: served({ sequence: 7 }) });
+      t.ch.lists.push(listRow({ sequence: 7, publisher_key: OTHER_KEY }));
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('ok');
+    });
+
+    it('still leave the lists of the configured key to decide: stale and unchanged as before', async () => {
+      const t = setup({ serve: served({ sequence: 7 }) });
+      t.ch.lists.push(listRow({ sequence: 9, publisher_key: OTHER_KEY }), listRow({ sequence: 8 }));
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('stale');
+      t.state.answer = served({ sequence: 8 });
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('unchanged');
+    });
+
+    it('give no manifest to compare with: the one of the newest response under the configured key is used', async () => {
+      const t = setup();
+      t.ch.lists.push(
+        listRow({
+          sequence: 7,
+          fetched_at: NOW - 3600,
+          response: JSON.stringify(served({ sequence: 7, manifestSequence: 2 })),
+        }),
+        // newer, but the response of another key
+        listRow({
+          sequence: 9,
+          publisher_key: OTHER_KEY,
+          fetched_at: NOW - 60,
+          response: JSON.stringify(served({ sequence: 9, manifestSequence: 1, publisher: OTHER_PUBLISHER })),
+        }),
+      );
+      t.state.answer = served({ sequence: 10, manifestSequence: 1, publisherSigning: OLD_SIGNING });
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('signature_invalid');
+    });
+
+    it('are not the list in use: no gauge is set from them', async () => {
+      const t = setup({ serve: new SafeFetchError('timeout', 'the fetch ran out of time') });
+      t.ch.lists.push(listRow({ sequence: 9, publisher_key: OTHER_KEY }));
+      await t.fetcher.fetchOnce(ID1);
+      expect(t.metrics.validatorsUnlExpirySeconds.set).not.toHaveBeenCalled();
+      expect(t.metrics.validatorsUnlSize.set).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a revoked publisher key', () => {
+    const revoked = Buffer.from(makeManifest({ master: PUBLISHER, sequence: REVOKED_SEQUENCE }), 'hex').toString(
+      'base64',
+    );
+
+    it('is remembered: an older valid body that follows is refused as revoked too', async () => {
+      const t = setup({ serve: { ...served(), manifest: revoked } });
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('revoked');
+      t.state.answer = served({ sequence: 9 });
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('revoked');
+      expect(t.ch.rowsOf(Table.UnlLists)).toHaveLength(0);
+      expect(t.ch.publisherRows.map((r) => r.error)).toEqual(['revoked', 'revoked']);
+    });
+
+    it('is remembered when only an entry of a version 2 response carries the revocation', async () => {
+      const body = makeUnlResponse({
+        publisher: PUBLISHER,
+        publisherSigning: SIGNING,
+        version: 2,
+        blobs: [{ blob: makeUnlBlob({ sequence: 7, expiration: NOW + 30 * DAY, validators: [{ master: V1 }] }) }],
+      }) as { blobs_v2: { manifest?: string }[] };
+      body.blobs_v2[0].manifest = revoked;
+      const t = setup({ serve: body });
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('revoked');
+      t.state.answer = served({ sequence: 9 });
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('revoked');
+    });
+
+    it("is not taken from a manifest that is not the configured key's", async () => {
+      const otherRevoked = Buffer.from(
+        makeManifest({ master: OTHER_PUBLISHER, sequence: REVOKED_SEQUENCE }),
+        'hex',
+      ).toString('base64');
+      const t = setup({ serve: { ...served(), manifest: otherRevoked } });
+      expect(await t.fetcher.fetchOnce(ID1)).toBe('manifest_invalid');
+      t.state.answer = served({ sequence: 9 });
       expect(await t.fetcher.fetchOnce(ID1)).toBe('ok');
     });
   });

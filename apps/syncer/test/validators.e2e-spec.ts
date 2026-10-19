@@ -424,6 +424,92 @@ describe('the validators worker (e2e)', () => {
     });
   });
 
+  it('numbers the lists of a new key at the same URL anew: its lower sequence is new, not stale', async () => {
+    web.serveJson('unl.example', '/', list({ sequence: 7 }));
+    const first = await boot();
+    await firstAttempt(first, 'ok');
+    await first.stop();
+    apps = [];
+    resetValidatorsMetrics();
+
+    // the publisher moved to another master key, at the same address, and counts from 3 again
+    web.serveJson(
+      'unl.example',
+      '/',
+      makeUnlResponse({
+        publisher: OTHER_PUBLISHER,
+        publisherSigning: SIGNING_1,
+        blobs: [
+          {
+            blob: makeUnlBlob({
+              sequence: 3,
+              expiration: nowSeconds() + 10 * DAY,
+              validators: [{ master: V2 }],
+            }),
+          },
+        ],
+      }),
+    );
+    const second = await boot(`https://unl.example=${OTHER_PUBLISHER.publicKeyHex}`);
+    await firstAttempt(second, 'ok');
+
+    expect((await storedLists()).map((r) => [r.sequence, r.publisher_key])).toEqual([
+      ['3', OTHER_PUBLISHER.publicKeyHex],
+      ['7', PUBLISHER.publicKeyHex],
+    ]);
+    expect(await publisherRows()).toEqual([
+      expect.objectContaining({
+        publisher: ID,
+        publisher_key: OTHER_PUBLISHER.publicKeyHex,
+        configured: 1,
+        status: 'ok',
+        error: '',
+      }),
+    ]);
+    // the list in use is the new key's: its size and its expiry, not those of the old key's list
+    expect(await gauge(second, 'validatorsUnlSize')).toBe(1);
+    expect(await gauge(second, 'validatorsUnlExpirySeconds')).toBeLessThan(10 * DAY + 5);
+    expect(await second.fetcher.fetchOnce(ID)).toBe('unchanged');
+  });
+
+  it('remembers the manifest of the configured key when the newest stored response is of another key', async () => {
+    // the publisher's key moves from one master key to another and back; the manifest of sequence 2 moved the first to SIGNING_2
+    web.serveJson('unl.example', '/', list({ sequence: 7, manifestSequence: 2, signing: SIGNING_2 }));
+    const first = await boot();
+    await firstAttempt(first, 'ok');
+    await first.stop();
+    apps = [];
+    resetValidatorsMetrics();
+
+    web.serveJson(
+      'unl.example',
+      '/',
+      makeUnlResponse({
+        publisher: OTHER_PUBLISHER,
+        publisherSigning: SIGNING_1,
+        blobs: [
+          { blob: makeUnlBlob({ sequence: 3, expiration: nowSeconds() + 10 * DAY, validators: [{ master: V2 }] }) },
+        ],
+      }),
+    );
+    const other = await boot(`https://unl.example=${OTHER_PUBLISHER.publicKeyHex}`);
+    await firstAttempt(other, 'ok');
+    await other.stop();
+    apps = [];
+    resetValidatorsMetrics();
+
+    // back to the first key, and a body replays its manifest of sequence 1: the newest response stored is the other key's,
+    // but it is the first key's own newest that counts
+    web.serveJson('unl.example', '/', list({ sequence: 8, manifestSequence: 1, signing: SIGNING_1 }));
+    const back = await boot();
+    await firstAttempt(back, 'signature_invalid');
+
+    expect((await storedLists()).map((r) => [r.sequence, r.publisher_key])).toEqual([
+      ['3', OTHER_PUBLISHER.publicKeyHex],
+      ['7', PUBLISHER.publicKeyHex],
+    ]);
+  });
+
   describe('readStoredLists', () => {
     it('reads the lists of the given publishers, the newest row of a sequence standing for it', async () => {
       const row = (o: Record<string, unknown>) => ({
@@ -443,15 +529,21 @@ describe('the validators worker (e2e)', () => {
         row({ validators: ['nHOld'], fetched_at: 1_800_000_000.5 }),
         row({ validators: ['nHNew1', 'nHNew2'], effective: 1_790_000_000, fetched_at: 1_800_000_100.25 }),
         row({ sequence: 8, expiration: 2_100_000_000, validators: ['nHB'], fetched_at: 1_800_000_200 }),
-        row({ publisher: 'other.example', sequence: 3, validators: ['nHC'] }),
-        // a newer row without an effective time wins over an older one that had one: NULL is a value
+        row({
+          publisher: 'other.example',
+          publisher_key: OTHER_PUBLISHER.publicKeyHex,
+          sequence: 3,
+          validators: ['nHC'],
+        }),
+        // a newer row wins over an older one of the same sequence, NULL (no effective time) and key included
         row({ sequence: 9, effective: 1_790_000_000, fetched_at: 1_800_000_000 }),
-        row({ sequence: 9, effective: null, fetched_at: 1_800_000_300 }),
+        row({ sequence: 9, effective: null, fetched_at: 1_800_000_300, publisher_key: OTHER_PUBLISHER.publicKeyHex }),
       ]);
 
       expect(await readStoredLists(db.ch, [ID])).toEqual([
         {
           publisher: ID,
+          publisherKey: PUBLISHER.publicKeyHex,
           sequence: 7,
           version: 1,
           effective: 1_790_000_000,
@@ -461,6 +553,7 @@ describe('the validators worker (e2e)', () => {
         },
         {
           publisher: ID,
+          publisherKey: PUBLISHER.publicKeyHex,
           sequence: 8,
           version: 1,
           expiration: 2_100_000_000,
@@ -469,6 +562,7 @@ describe('the validators worker (e2e)', () => {
         },
         {
           publisher: ID,
+          publisherKey: OTHER_PUBLISHER.publicKeyHex,
           sequence: 9,
           version: 1,
           expiration: 2_000_000_000,
@@ -476,11 +570,13 @@ describe('the validators worker (e2e)', () => {
           fetchedAt: 1_800_000_300,
         },
       ]);
-      expect((await readStoredLists(db.ch, [ID, 'other.example'])).map((l) => [l.publisher, l.sequence])).toEqual([
-        ['other.example', 3],
-        [ID, 7],
-        [ID, 8],
-        [ID, 9],
+      expect(
+        (await readStoredLists(db.ch, [ID, 'other.example'])).map((l) => [l.publisher, l.sequence, l.publisherKey]),
+      ).toEqual([
+        ['other.example', 3, OTHER_PUBLISHER.publicKeyHex],
+        [ID, 7, PUBLISHER.publicKeyHex],
+        [ID, 8, PUBLISHER.publicKeyHex],
+        [ID, 9, OTHER_PUBLISHER.publicKeyHex],
       ]);
       expect(await readStoredLists(db.ch, ['nobody.example'])).toEqual([]);
       expect(await readStoredLists(db.ch, [])).toEqual([]);

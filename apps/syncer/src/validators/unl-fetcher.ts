@@ -24,7 +24,7 @@ import { FetchFailure, SAFE_FETCHER, SafeFetcher, SafeFetchError, UNL_FETCH_LIMI
 import { readStoredLists } from './stored-lists';
 import { VALIDATORS_WORKER_OPTIONS, ValidatorsWorkerOptions } from './validators.options';
 
-/** The wait between two fetches of a list is the `refresh_interval` of the list, kept between these (rippled's bounds). */
+/** The wait between two fetches, from the `refresh_interval` of a list or from `GH_UNL_REFRESH_MS`, is kept between these. */
 export const UNL_MIN_REFRESH_MS = 60_000;
 export const UNL_MAX_REFRESH_MS = 24 * 3_600_000;
 /** After a failed attempt the wait is 30 s, doubling with each failure in a row up to 10 min. */
@@ -96,10 +96,11 @@ const describeError = (err: unknown): string => (err instanceof Error ? err.mess
  * Fetches the validator lists (UNL) of the configured publishers and stores the ones that verify (spec 2.1).
  *
  * **Schedule.** Each publisher has its own timer: a fetch at start, then one after `GH_UNL_REFRESH_MS`, or the
- * `refresh_interval` of the last list (minutes, kept between 1 min and 24 h), after an attempt that stored a list or found
- * it unchanged. After any other outcome (a fetch that failed, a response that was rejected, a list that is stale or expired)
- * the wait is 30 s and doubles with each failure in a row, to 10 min. Never two fetches of one publisher at a time, and a
- * timer is set only when the attempt is over, so a slow publisher is not asked again meanwhile.
+ * `refresh_interval` of the last list (minutes), after an attempt that stored a list or found it unchanged. Either wait is
+ * kept between 1 min and 24 h, so that a tiny setting cannot make a loop and a huge one cannot overflow a timer. After any
+ * other outcome (a fetch that failed, a response that was rejected, a list that is stale or expired) the wait is 30 s and
+ * doubles with each failure in a row, to 10 min. Never two fetches of one publisher at a time, and a timer is set only when
+ * the attempt is over, so a slow publisher is not asked again meanwhile.
  *
  * **An attempt.** The body is fetched through the safe fetcher (HTTPS only, 20 s, 1 MiB, 3 redirects), parsed, and verified
  * by `verifyUnlList`: a response that fails any check is rejected whole and nothing of it is stored. Each blob of a
@@ -111,12 +112,19 @@ const describeError = (err: unknown): string => (err instanceof Error ? err.mess
  *
  * **Rollback.** A publisher key is rotated by a manifest of a higher sequence. A response that replays an older publisher
  * manifest, with a list signed by the superseded key, must not be accepted: `verifyUnlList` is given the highest manifest
- * seen, which is kept in memory and, after a restart, decoded from the newest stored response.
+ * seen, which is kept in memory (a revocation too: the response that revoked the key leaves its manifest behind) and, after
+ * a restart, decoded from the newest response stored under the configured key. What only a response that stored nothing
+ * showed (a revocation, or a rotation) is forgotten with a restart.
+ *
+ * **Keys.** The id of a publisher is its URL, but sequences and manifests belong to its key. Everything that is compared
+ * with a response (the newest stored sequence, the manifest seen before) and the gauges come from the rows stored under the
+ * configured key; those of an earlier key stay in `unl_lists` and count for nothing.
  *
  * **Every attempt** writes the `unl_publishers` row of the publisher and updates the metrics; the status of a publisher is
- * logged when it changes. A ClickHouse failure ends the attempt with an error (logged, retried with the backoff) and no
- * row or metric. `stop()` ends the timers and waits for the attempts under way; one that has not yet written anything
- * writes nothing.
+ * logged when it changes. A ClickHouse failure ends the attempt with no outcome (it is logged and retried with the
+ * backoff, and no metric is set). What was inserted earlier in the same attempt can remain, and the retry then reports
+ * `unchanged`. `stop()` ends the timers and waits for the attempts under way; one that has not yet written anything writes
+ * nothing.
  */
 @Injectable()
 export class UnlFetcher {
@@ -139,7 +147,7 @@ export class UnlFetcher {
       this.publishers.set(config.id, {
         config,
         failures: 0,
-        waitMs: cfg.unlRefreshMs,
+        waitMs: clamp(cfg.unlRefreshMs),
         status: 'ok',
         lastOkAt: null,
         knownLoaded: false,
@@ -155,23 +163,12 @@ export class UnlFetcher {
   async registerPublishers(): Promise<void> {
     const stored = new Map((await this.storedPublishers()).map((row) => [row.publisher, row]));
     const checkedAt = this.now() / 1000;
-    const threshold = unlThresholdOf(this.cfg);
     const rows: UnlPublishersRow[] = [];
     for (const p of this.publishers.values()) {
       const row = stored.get(p.config.id);
       p.lastOkAt = row?.last_ok_ms == null ? null : Number(row.last_ok_ms) / 1000;
       p.status = row?.status === 'error' ? 'error' : 'ok';
-      rows.push({
-        publisher: p.config.id,
-        url: p.config.url,
-        publisher_key: p.config.publicKey,
-        configured: 1,
-        threshold,
-        checked_at: checkedAt,
-        status: row?.status ?? 'ok',
-        error: row?.error ?? '',
-        last_ok_at: p.lastOkAt,
-      });
+      rows.push(this.publisherRow(p, checkedAt, row?.status ?? 'ok', row?.error ?? '', p.lastOkAt));
     }
     for (const [id, row] of stored) {
       if (this.publishers.has(id) || Number(row.configured) === 0) continue;
@@ -249,7 +246,8 @@ export class UnlFetcher {
     const fetched = await this.fetchBody(p);
     this.assertRunning();
     const nowSeconds = this.now() / 1000;
-    const stored = await readStoredLists(this.ch, [id]);
+    // the rows of the configured key only: a publisher that changed its key numbers its lists anew
+    const stored = (await readStoredLists(this.ch, [id])).filter((list) => list.publisherKey === p.config.publicKey);
     const verdict =
       'body' in fetched
         ? await this.judge(p, fetched.body, stored, nowSeconds)
@@ -268,24 +266,35 @@ export class UnlFetcher {
     const ok = outcome === 'ok' || outcome === 'unchanged';
     const lastOkAt = ok ? nowSeconds : p.lastOkAt;
     await this.ch.insert(Table.UnlPublishers, [
-      {
-        publisher: id,
-        url: p.config.url,
-        publisher_key: p.config.publicKey,
-        configured: 1,
-        threshold: unlThresholdOf(this.cfg),
-        checked_at: nowSeconds,
-        status: ok ? 'ok' : 'error',
-        error: ok ? '' : outcome,
-        last_ok_at: lastOkAt,
-      } satisfies UnlPublishersRow,
+      this.publisherRow(p, nowSeconds, ok ? 'ok' : 'error', ok ? '' : outcome, lastOkAt),
     ]);
 
     p.lastOkAt = lastOkAt;
     p.failures = ok ? 0 : p.failures + 1;
-    p.waitMs = ok ? (verdict.refreshMs ?? this.cfg.unlRefreshMs) : backoff(p.failures);
+    p.waitMs = ok ? clamp(verdict.refreshMs ?? this.cfg.unlRefreshMs) : backoff(p.failures);
     this.record(p, verdict, stored, lists, invalid, nowSeconds);
     return outcome;
+  }
+
+  /** The `unl_publishers` row of a configured publisher: the one place that knows its url, key and the threshold in force. */
+  private publisherRow(
+    p: Publisher,
+    checkedAt: number,
+    status: string,
+    error: string,
+    lastOkAt: number | null,
+  ): UnlPublishersRow {
+    return {
+      publisher: p.config.id,
+      url: p.config.url,
+      publisher_key: p.config.publicKey,
+      configured: 1,
+      threshold: unlThresholdOf(this.cfg),
+      checked_at: checkedAt,
+      status,
+      error,
+      last_ok_at: lastOkAt,
+    };
   }
 
   private assertRunning(): void {
@@ -313,14 +322,17 @@ export class UnlFetcher {
       return failure('invalid_format', 'the body is not JSON');
     }
     if (!p.knownLoaded) {
-      p.known = await this.storedManifest(p.config.id);
+      p.known = await this.storedManifest(p.config.id, p.config.publicKey);
       p.knownLoaded = true;
     }
     let verified: VerifiedUnlList;
     try {
       verified = verifyUnlList(json, p.config.publicKey, p.known);
     } catch (err) {
-      if (err instanceof UnlListError) return failure(err.reason, err.message);
+      if (err instanceof UnlListError) {
+        if (err.reason === 'revoked') p.known = this.revocationIn(json, p.config.publicKey) ?? p.known;
+        return failure(err.reason, err.message);
+      }
       throw err;
     }
     p.known = verified.manifest;
@@ -332,7 +344,7 @@ export class UnlFetcher {
     const kinds = verified.blobs.map((blob) => classifyUnlBlob(blob, newest, nowSeconds));
     const blobs = verified.blobs.filter((_, i) => kinds[i] === 'new');
     const refreshMs =
-      verified.refreshIntervalMinutes === undefined ? undefined : clamp(verified.refreshIntervalMinutes * 60_000);
+      verified.refreshIntervalMinutes === undefined ? undefined : verified.refreshIntervalMinutes * 60_000;
     if (blobs.length > 0) {
       return { outcome: 'ok', fresh: { blobs, version: verified.version, response: text }, refreshMs };
     }
@@ -343,11 +355,39 @@ export class UnlFetcher {
       : failure('expired', `sequence ${first.sequence} expired at ${new Date(first.expiration * 1000).toISOString()}`);
   }
 
-  /** The publisher manifest of the newest list stored for the publisher, `undefined` when there is none or it cannot be read. */
-  private async storedManifest(id: string): Promise<Manifest | undefined> {
+  /**
+   * The manifest that revokes the publisher key, in the manifests of a body that `verifyUnlList` refused as `revoked`: the
+   * highest of its top-level one and the own ones of its version 2 entries that decode, verify and are the configured key's
+   * own, when that one revokes. Kept as the manifest seen, it makes every later body with a lower sequence `revoked` too, in
+   * this process; the response stores nothing, so a restart forgets it.
+   */
+  private revocationIn(body: unknown, key: string): Manifest | undefined {
+    const root = (body ?? {}) as { manifest?: unknown; blobs_v2?: unknown };
+    const entries = Array.isArray(root.blobs_v2) ? (root.blobs_v2 as { manifest?: unknown }[]) : [];
+    let highest: Manifest | undefined;
+    for (const candidate of [root.manifest, ...entries.map((entry) => entry?.manifest)]) {
+      if (typeof candidate !== 'string') continue;
+      try {
+        const manifest = decodeManifest(candidate, 'base64');
+        if (manifest.masterKeyHex !== key || !verifyManifest(manifest)) continue;
+        if (highest === undefined || manifest.sequence > highest.sequence) highest = manifest;
+      } catch {
+        // a manifest that does not decode was not what revoked the key
+      }
+    }
+    return highest?.revoked ? highest : undefined;
+  }
+
+  /**
+   * The publisher manifest of the newest list stored for the publisher under `key`, `undefined` when there is none or it
+   * cannot be read.
+   */
+  private async storedManifest(id: string, key: string): Promise<Manifest | undefined> {
     const [row] = await this.ch.query<{ response: string }>(
-      `SELECT response FROM ${Table.UnlLists} WHERE publisher = {publisher:String} ORDER BY fetched_at DESC LIMIT 1`,
-      { publisher: id },
+      `SELECT response FROM ${Table.UnlLists}
+        WHERE publisher = {publisher:String} AND publisher_key = {key:String}
+        ORDER BY fetched_at DESC LIMIT 1`,
+      { publisher: id, key },
     );
     if (row === undefined) return undefined;
     try {

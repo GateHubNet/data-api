@@ -112,9 +112,10 @@ nothing from you: the syncer follows the manifests in the lists it fetches. When
    `SELECT publisher, argMax(configured, checked_at) AS configured, argMax(status, checked_at) AS status, argMax(error, checked_at) AS error FROM xrpl.unl_publishers GROUP BY publisher`
    shows `configured = 1`, `ok` and an empty `error` for it, and `configured = 0` for the one you replaced.
 
-The id of a publisher is its URL, so a new key at the **same** URL is the same publisher: a list of the new key is compared with the
-sequence numbers already stored for that URL, and one below the newest stored is `stale` until the publisher's numbering passes it.
-Use a different URL when the new key has its own numbering.
+The id of a publisher is its URL, so a new key at the **same** URL is the same publisher, with the same `unl_publishers` row (it
+stays `configured = 1`). Its lists are told apart by key: a list of the new key is compared only with the lists stored under the new
+key (`unl_lists.publisher_key`), so a publisher that starts numbering anew with its new key is not `stale`. The lists of the old key
+stay in `unl_lists` and count for nothing.
 
 ### Rotate the ClickHouse password
 
