@@ -38,6 +38,8 @@ export * from './ingest/ledger-writer';
 export * from './ingest/raw-ledger';
 
 // Aggregates
+export * from './aggregate/aggregate-sets';
+export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
 export * from './aggregate/volume.job';
 

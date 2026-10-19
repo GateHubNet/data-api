@@ -173,7 +173,13 @@ const BUCKET_START: Record<VwapBucket, string> = {
  * Both native legs above the dust, spelled for any pair (a side is native when it has no issuer, as `keepConditions`
  * has it): what the grouped reads (`vwaps`, `bucketVwaps`) keep, one condition for all the pairs of the group.
  */
-const KEEP_ANY_PAIR = `(base_issuer != '' OR base_amount_f > ${NATIVE_DUST}) AND (counter_issuer != '' OR counter_amount_f > ${NATIVE_DUST})`;
+export const KEEP_ANY_PAIR = `(base_issuer != '' OR base_amount_f > ${NATIVE_DUST}) AND (counter_issuer != '' OR counter_amount_f > ${NATIVE_DUST})`;
+
+/**
+ * The pairs of `exchanges` that have the native currency on a side (`{native:String}`, bound: `XRP` or `XAH`; it has no
+ * issuer), the pairs a daily rate against the native currency is made of.
+ */
+export const NATIVE_PAIR_FILTER = `((base_issuer = '' AND base_currency = {native:String}) OR (counter_issuer = '' AND counter_currency = {native:String}))`;
 
 /** The pair columns and the sums of one group of `vwaps`. */
 interface PairSumsRow extends VolumeSums {
@@ -191,6 +197,17 @@ interface DayRow extends VolumeSums {
   day: string;
   first_ledger: number;
   last_ledger: number;
+}
+
+/** The rate of one asset against the native currency on one UTC day (`RatesService.dailyNativeRatesOfDay`). */
+export interface DayNativeRate {
+  asset: Asset;
+  /** How many units of the asset one native coin buys; above 0. */
+  rate: BigNumber;
+  /** The kept trades of the day (a native leg above 0.0005). */
+  dailyCount: number;
+  /** The kept trades among the newest 50 of the pair, in the 14 days up to the end of the day. */
+  latestCount: number;
 }
 
 /** The trades of a pair as a rate sees them: oriented as asked for (stored base and counter swap when inverted). */
@@ -394,6 +411,93 @@ export class RatesService {
           ? new Map(days.map((day) => [day.key, ONE]))
           : await this.dailyRatesOf({ currency: this.nativeCurrency }, asset, days),
       );
+    }
+    return out;
+  }
+
+  /**
+   * The rate of every asset against the native currency on one UTC day, the day of `day`: what `dailyNativeRates([asset],
+   * day, day + 1)` gives for each asset, for all of them at once, in two reads of the exchanges instead of a few for each
+   * asset. The map holds the assets whose rate is above 0 (an asset that is not in it has none), keyed by `assetKey`.
+   *
+   * (1) The native pairs that traded in the ledgers of `[day - 14 days, day + 1 day)`. (2) The rows of those pairs in that
+   * range, each once (`LIMIT 1 BY` the key), numbered newest first within their pair. Over them, twice per pair, the sums
+   * of the trades that count (a native leg of more than 0.0005): the "latest" part is the newest 50 rows (dust included in
+   * the 50, left out of the sums, as `sums` does), the "daily" part the rows from the first ledger of the day. The rate is
+   * `combineRates` of the vwaps, the latest one counted only with 10 kept trades among the newest 50, oriented native → asset.
+   */
+  async dailyNativeRatesOfDay(day: Date): Promise<Map<string, DayNativeRate>> {
+    const out = new Map<string, DayNativeRate>();
+    const start = startOfDay(timeOf(day));
+    const [range, ofDay] = await Promise.all([
+      this.ledgerRange(start - LATEST_DAYS * DAY_MS, start + DAY_MS),
+      this.ledgerRange(start, start + DAY_MS),
+    ]);
+    if (!range) return out;
+
+    const native: Asset = { currency: this.nativeCurrency };
+    const traded = await this.ch.query<
+      Pick<PairSumsRow, 'base_currency' | 'base_issuer' | 'counter_currency' | 'counter_issuer'>
+    >(
+      `SELECT ${PAIR_COLUMNS.join(', ')}
+         FROM ${Table.Exchanges}
+        WHERE ledger_index BETWEEN {min:UInt32} AND {max:UInt32} AND ${NATIVE_PAIR_FILTER}
+        GROUP BY ${PAIR_COLUMNS.join(', ')}`,
+      { native: this.nativeCurrency, min: range.min, max: range.max },
+    );
+    // the asset of a pair is its side that is not native; its pair as `dailyNativeRates` reads it is the canonical one
+    const candidates = new Map<string, { asset: Asset; stored: StoredPair }>();
+    for (const pair of traded) {
+      const [base, counter] = [
+        { currency: pair.base_currency, ...(pair.base_issuer && { issuer: pair.base_issuer }) },
+        { currency: pair.counter_currency, ...(pair.counter_issuer && { issuer: pair.counter_issuer }) },
+      ];
+      const asset = this.isNative(base) ? counter : base;
+      if (this.isNative(asset) || candidates.has(assetKey(asset))) continue;
+      candidates.set(assetKey(asset), { asset, stored: canonicalPair(native, asset) });
+    }
+    if (candidates.size === 0) return out;
+
+    const pairs = [...candidates.values()].map((c) => c.stored);
+    const rows = await this.ch.query<PairSumsRow & { part: 'daily' | 'latest' }>(
+      `SELECT ${PAIR_COLUMNS.join(', ')}, part, ${volumeColumns(KEEP_ANY_PAIR)}
+         FROM (SELECT ${PAIR_COLUMNS.join(', ')}, ledger_index, base_exact, counter_exact, base_amount_f, counter_amount_f,
+                      row_number() OVER (PARTITION BY ${PAIR_COLUMNS.join(', ')}
+                                         ORDER BY ledger_index DESC, tx_index DESC, node_index DESC) AS newest_rank
+                 FROM (SELECT ${KEY_COLUMNS.join(', ')}, ${VOLUME_SOURCE_COLUMNS}
+                         FROM ${Table.Exchanges}
+                        WHERE (${PAIR_COLUMNS.join(', ')}) IN (
+                              SELECT arrayJoin(arrayZip({pair0:Array(String)}, {pair1:Array(String)}, {pair2:Array(String)}, {pair3:Array(String)})))
+                          AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
+                        ORDER BY ${orderBy(false)}
+                        LIMIT 1 BY ${KEY_COLUMNS.join(', ')}))
+        ARRAY JOIN ['latest', 'daily'] AS part
+        WHERE (part = 'latest' AND newest_rank <= {latest:UInt32}) OR (part = 'daily' AND ledger_index >= {day_min:UInt32})
+        GROUP BY ${PAIR_COLUMNS.join(', ')}, part`,
+      {
+        pair0: pairs.map((p) => p.base.currency),
+        pair1: pairs.map((p) => p.base.issuer ?? ''),
+        pair2: pairs.map((p) => p.counter.currency),
+        pair3: pairs.map((p) => p.counter.issuer ?? ''),
+        min: range.min,
+        max: range.max,
+        latest: LATEST_TRADES,
+        // a day without a ledger has no daily trades: no ledger index is past the last one
+        day_min: ofDay ? ofDay.min : MAX_UINT32,
+      },
+    );
+    const sums = new Map<string, Partial<Record<'daily' | 'latest', VolumeSums>>>();
+    for (const row of rows) {
+      const key = [row.base_currency, row.base_issuer, row.counter_currency, row.counter_issuer].join('\u0000');
+      sums.set(key, { ...sums.get(key), [row.part]: row });
+    }
+
+    for (const { asset, stored } of candidates.values()) {
+      const parts = sums.get(storedKey(stored));
+      const daily = orient(parts?.daily ?? NO_TRADES, stored.inverted);
+      const latest = orient(parts?.latest ?? NO_TRADES, stored.inverted);
+      const rate = combineRates(daily.vwap, latest.count < LATEST_MIN_TRADES ? ZERO : latest.vwap);
+      if (rate.gt(0)) out.set(assetKey(asset), { asset, rate, dailyCount: daily.count, latestCount: latest.count });
     }
     return out;
   }
