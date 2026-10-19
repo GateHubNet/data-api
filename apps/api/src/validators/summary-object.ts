@@ -105,13 +105,21 @@ function publisherOf(state: PublisherState): SummaryPublisher {
   });
 }
 
-/** The seconds the next flag ledger is expected at: the close time plus the ledgers to go at the mean interval, to the second. */
+/**
+ * When the next flag ledger is expected: the close time of the head plus (flag - ledger) x seconds / ledgers of the last 1,000
+ * ledgers (the mean interval), in whole seconds. All in whole numbers: the product is divided exactly and rounded half up to the
+ * second (the time of a ledger has no fraction, and `.5` goes up).
+ */
 function expectedFlagTime(head: NonNullable<Directory['head']>, flag: number): string | undefined {
-  if (head.closeTime === undefined || head.meanIntervalSeconds === undefined) return undefined;
-  const wait = new BigNumber(flag - head.ledgerIndex)
-    .times(head.meanIntervalSeconds)
-    .integerValue(BigNumber.ROUND_HALF_UP);
-  return fmtTime(head.closeTime + wait.toNumber());
+  const { closeTime, spanSeconds, spanLedgers } = head;
+  if (closeTime === undefined || spanSeconds === undefined || spanLedgers === undefined || spanLedgers <= 0) {
+    return undefined;
+  }
+  const numerator = new BigNumber(flag - head.ledgerIndex).times(spanSeconds);
+  const wait = numerator.idiv(spanLedgers);
+  const remainder = numerator.minus(wait.times(spanLedgers));
+  const seconds = remainder.times(2).gte(spanLedgers) ? wait.plus(1) : wait;
+  return fmtTime(closeTime + seconds.toNumber());
 }
 
 /**

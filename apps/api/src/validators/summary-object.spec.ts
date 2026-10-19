@@ -125,7 +125,7 @@ function fleet(): Directory {
   ];
   return assembleDirectory(
     reads({
-      head: { ledgerIndex: 107_748_183, closeTime: NOW_S - 8, meanIntervalSeconds: 4 },
+      head: { ledgerIndex: 107_748_183, closeTime: NOW_S - 8, spanSeconds: 3996, spanLedgers: 999 },
       state,
       publishers: [
         publisherRow('unl.xrplf.org', PUBLISHER_B, {
@@ -445,20 +445,33 @@ describe('buildSummary', () => {
       expect(summaryAt({ ledgerIndex: 107_748_351 }).next_flag_ledger?.voting_ledger).toBe(107_748_351);
     });
 
-    it('expects the flag ledger at the close time plus the ledgers left times the mean interval', () => {
-      // 169 ledgers at 3.9 s: 659.1 s, to the second
+    it('expects the flag ledger at the close time plus the ledgers left times seconds over ledgers', () => {
+      // 169 ledgers at 3,900 s for 1,000 ledgers (3.9 s): 659.1 s, to the second
       const close = NOW_S - 8;
-      const expected = summaryAt({ ledgerIndex: 107_748_183, closeTime: close, meanIntervalSeconds: 3.9 })
+      const expected = summaryAt({ ledgerIndex: 107_748_183, closeTime: close, spanSeconds: 3900, spanLedgers: 1000 })
         .next_flag_ledger?.expected;
       expect(expected).toBe('2026-10-19T15:53:44Z');
     });
 
-    it('has no expected time without a close time or a mean interval', () => {
+    it('rounds the expected time half up to the whole second, computed exactly', () => {
+      const close = NOW_S - 8;
+      const at = (spanSeconds: number, spanLedgers: number) =>
+        summaryAt({ ledgerIndex: 107_748_183, closeTime: close, spanSeconds, spanLedgers }).next_flag_ledger?.expected;
+      // 169 × 1001 / 2 = 84,584.5 s: up to 84,585
+      expect(at(1001, 2)).toBe(`${new Date((close + 84_585) * 1000).toISOString().slice(0, 19)}Z`);
+      // 169 × 3.9 = 659.1: down; 169 × 3.903 = 659.607: up
+      expect(at(3900, 1000)).toBe(`${new Date((close + 659) * 1000).toISOString().slice(0, 19)}Z`);
+      expect(at(3903, 1000)).toBe(`${new Date((close + 660) * 1000).toISOString().slice(0, 19)}Z`);
+      // a quotient with no end in decimals: 169 × 3,997 / 999 = 676.17 (not a float 4.0010010010...)
+      expect(at(3997, 999)).toBe(`${new Date((close + 676) * 1000).toISOString().slice(0, 19)}Z`);
+    });
+
+    it('has no expected time without a close time, or without a span of seconds and ledgers', () => {
       expect(summaryAt({ ledgerIndex: 107_748_183, closeTime: NOW_S }).next_flag_ledger).toEqual({
         ledger_index: 107_748_352,
         voting_ledger: 107_748_351,
       });
-      expect(summaryAt({ ledgerIndex: 107_748_183, meanIntervalSeconds: 4 }).next_flag_ledger).toEqual({
+      expect(summaryAt({ ledgerIndex: 107_748_183, spanSeconds: 4000, spanLedgers: 1000 }).next_flag_ledger).toEqual({
         ledger_index: 107_748_352,
         voting_ledger: 107_748_351,
       });

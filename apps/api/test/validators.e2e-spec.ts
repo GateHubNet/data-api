@@ -274,8 +274,13 @@ describe('GET /v2/network/validators/summary: a fleet of 35 trusted validators (
       const mapped =
         'transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key)';
       const readsFrom = (table: Table): string[] => queries.filter((sql) => sql.includes(`FROM ${table}`));
-      // validator_seen, validator_validations and validator_votes: every statement
-      for (const table of [Table.ValidatorSeen, Table.ValidatorValidations, Table.ValidatorVotes]) {
+      // validator_seen, validator_validations, validator_votes and validator_domains: every statement
+      for (const table of [
+        Table.ValidatorSeen,
+        Table.ValidatorValidations,
+        Table.ValidatorVotes,
+        Table.ValidatorDomains,
+      ]) {
         expect(readsFrom(table).length).toBeGreaterThan(0);
         for (const sql of readsFrom(table)) expect([table, sql.includes(mapped)]).toEqual([table, true]);
       }
@@ -350,8 +355,9 @@ describe('the validator directory of a fleet of 35 trusted validators (XRPL)', (
 
   it('orders the list with a domain first, by domain, then by key', () => {
     const keys = directory.ordered.map((e) => e.key);
-    expect(keys.slice(0, 2)).toEqual([scenario.unl[0].key, scenario.unl[1].key]);
-    const rest = keys.slice(2);
+    // northpeak, shoreline, tidewater
+    expect(keys.slice(0, 3)).toEqual([scenario.unl[0].key, scenario.unl[1].key, scenario.others[1].key]);
+    const rest = keys.slice(3);
     expect(rest).toEqual([...rest].sort());
   });
 
@@ -388,6 +394,17 @@ describe('the validator directory of a fleet of 35 trusted validators (XRPL)', (
       checked: expect.closeTo(scenario.now - 700.25, 2),
     });
     expect(entry(scenario.unl[2].key).domainState).toBeUndefined();
+  });
+
+  it('maps the key of a domain check recorded under a signing key to its master', () => {
+    // the check of tidewater.example was stored under the signing key of others[1]
+    expect(entry(scenario.others[1].key)).toMatchObject({ domain: 'tidewater.example' });
+    expect(entry(scenario.others[1].key).domainState).toEqual({
+      status: 'verified',
+      tomlUrl: 'https://tidewater.example/.well-known/xrp-ledger.toml',
+      checked: expect.closeTo(scenario.now - 300.125, 2),
+      verified: expect.closeTo(scenario.now - 300.125, 2),
+    });
   });
 
   it('knows the newest validation of each validator among the last 300 ledgers, under whichever key it was recorded', () => {
@@ -669,6 +686,13 @@ describe('GET /v2/network/validators/summary: with GH_CACHE_CONTROL empty', () =
 // version sets
 // ===================================================================================================================
 
+// A version is a UInt64 (a wall-clock millisecond today). These are above 2^53, where a JavaScript number is not exact: a reader
+// that turns a version into a number looks for rows that are not there.
+const OLDER_ROUND = '9007199254740991';
+const NEWER_ROUND = '9007199254740993';
+const OLDER_HOUR = '9007199254740993';
+const NEWER_HOUR = '9007199254740995';
+
 describe('GET /v2/network/validators/summary: version sets', () => {
   let h: Harness;
   let body: Record<string, any>;
@@ -702,7 +726,7 @@ describe('GET /v2/network/validators/summary: version sets', () => {
     await insertRound(h.ch, {
       ledgerIndex: VOTING_LEDGER,
       closeTime: close,
-      version: 1_000,
+      version: OLDER_ROUND,
       unl: [a.key, b.key, ghost.key],
       votes: [
         { key: a.key, serverVersion: serverVersion(3, 3, 0) },
@@ -713,7 +737,7 @@ describe('GET /v2/network/validators/summary: version sets', () => {
     await insertRound(h.ch, {
       ledgerIndex: VOTING_LEDGER,
       closeTime: close,
-      version: 2_000,
+      version: NEWER_ROUND,
       unl: [a.key, b.key],
       votes: [
         { key: a.key, serverVersion: serverVersion(3, 4, 1) },
@@ -728,24 +752,24 @@ describe('GET /v2/network/validators/summary: version sets', () => {
     await insertHours(h.ch, [
       {
         hour: hourBefore,
-        version: 1_000,
+        version: OLDER_HOUR,
         rows: [
           { key: a.key, agreed: 800, missed: 100 },
           { key: ghost.key, agreed: 500, missed: 400 },
         ],
       },
-      { hour: hourBefore + HOUR, version: 1_000, final: true },
+      { hour: hourBefore + HOUR, version: OLDER_HOUR, final: true },
     ]);
     await insertHours(h.ch, [
       {
         hour: hourBefore,
-        version: 2_000,
+        version: NEWER_HOUR,
         rows: [
           { key: a.key, agreed: 900, missed: 0 },
           { key: b.key, agreed: 890, missed: 10 },
         ],
       },
-      { hour: hourBefore + HOUR, version: 2_000, final: false },
+      { hour: hourBefore + HOUR, version: NEWER_HOUR, final: false },
     ]);
     body = (await (await h.api()).get(SUMMARY)).body;
     directory = await started.directory();
@@ -785,6 +809,72 @@ describe('GET /v2/network/validators/summary: version sets', () => {
     expect(b?.agreement1h).toEqual({ missed: 10, total: 900, score: '0.9889', incomplete: false, partial: 0 });
     // the ghost has a row in the older set only
     expect(ghost?.agreement1h).toEqual({ missed: 0, total: 0, incomplete: false, partial: 0 });
+  });
+});
+
+// ===================================================================================================================
+// a stall above a complete window
+// ===================================================================================================================
+
+describe.each([
+  ['30 hours, more than the 24 of slack of a first version of the read', 30],
+  ['800 hours, more than a range of 720 of the search', 800],
+])('the directory when %s are not final above a complete window of final hours', (_name, stalled) => {
+  let h: Harness;
+  let body: Record<string, any>;
+  let directory: Directory;
+  let finalHour: number;
+  let members: ReturnType<typeof fleet>;
+
+  beforeAll(async () => {
+    const started = await startWithDirectory({ seed: 'none', env: NO_RATE_LIMIT });
+    h = started.h;
+    members = fleet('xrpl', 2);
+    const now = Math.floor(Date.now() / 1000);
+    await insertLists(h.ch, [
+      { publisher: 'vl.ripple.com', sequence: 1, expiration: now + 86_400, validators: members.map((m) => m.key) },
+    ]);
+    await insertPublishers(h.ch, [{ publisher: 'vl.ripple.com', checked_at: now - 10 }]);
+    await insertSeen(
+      h.ch,
+      members.map((m) => ({ key: m.key, first: now - 86_400, last: now - 30 })),
+    );
+    // 720 final hours, then hours that are not final up to the previous hour
+    finalHour = Math.floor(now / HOUR) * HOUR - (stalled + 1) * HOUR;
+    const hours = (from: number, count: number, final: boolean, agreed: number, missed: number) =>
+      range(0, count - 1).map((i) => ({
+        hour: from + i * HOUR,
+        version: Date.now(),
+        final,
+        rows: [{ key: members[0].key, agreed, missed }],
+      }));
+    await insertHours(h.ch, hours(finalHour - 719 * HOUR, 720, true, 899, 1));
+    await insertHours(h.ch, hours(finalHour + HOUR, stalled, false, 500, 50));
+    body = (await (await h.api()).get(SUMMARY)).body;
+    directory = await started.directory();
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('takes the newest final hour, not the newest hour stored', () => {
+    expect(directory.newestFinalHour).toBe(finalHour);
+    expect(body.agreement_through).toBe(time(finalHour + HOUR));
+  });
+
+  it('has the 30-day window complete, with the 720 hours of it', () => {
+    const entry = directory.entries.get(members[0].key);
+    expect(entry?.agreement30d).toEqual({
+      missed: 720,
+      total: 720 * 900,
+      score: '0.9989',
+      incomplete: false,
+      partial: 0,
+    });
+    expect(entry?.agreement24h).toMatchObject({ total: 24 * 900, incomplete: false });
+    expect(entry?.agreement1h).toMatchObject({ total: 900, missed: 1, incomplete: false });
+    // the hours above the newest final hour are not in any window
+    expect(entry?.daily[entry.daily.length - 1]).toMatchObject({ incomplete: true });
   });
 });
 
@@ -924,12 +1014,15 @@ describe('the reads of the directory stay within their window (read_rows over a 
   let h: Harness;
   let scenario: FleetScenario;
   const reads: Record<string, LoggedRead[]> = {};
+  let directoryOf: () => Promise<Directory>;
 
   /** The most rows a read of a window of `window` rows may read: the window and a granule of every part. */
   const bound = (window: number): number => window + PARTS * GRANULE;
 
   beforeAll(async () => {
-    h = await startHarness({ seed: 'none', env: NO_RATE_LIMIT });
+    const started = await startWithDirectory({ seed: 'none', env: NO_RATE_LIMIT });
+    h = started.h;
+    directoryOf = started.directory;
     scenario = await seedFleet(h.ch, { hours: 720, activity: true });
 
     // validations: four parts of one validator each, in the partition of the head (ledgers 107,700,000 and on, three hashes a
@@ -1005,6 +1098,21 @@ describe('the reads of the directory stay within their window (read_rows over a 
     // 720 hours of 54 validators and a sentinel
     expect(reads.hours.length).toBeGreaterThan(0);
     for (const read of reads.hours) expect(read.read_rows).toBeLessThanOrEqual(bound(720 * 55));
+  });
+
+  it('has the 30-day window complete with the 720 hours seeded: the read starts at the first hour of the window (P6)', async () => {
+    const directory = await directoryOf();
+    expect(directory.newestFinalHour).toBe(scenario.newestHour);
+    for (const m of [scenario.unl[0], scenario.unl[34], scenario.others[19]]) {
+      // every validator is tracked in every hour with 900 ledgers (agreed and missed); unl[34]'s older hours are stored under its signing key
+      expect(directory.entries.get(m.key)?.agreement30d).toMatchObject({
+        total: 720 * 900,
+        incomplete: false,
+      });
+    }
+    // 29 whole days before the day of the newest hour are complete, that day itself is not (the newest hour is not its last)
+    const daily = directory.entries.get(scenario.unl[0].key)?.daily ?? [];
+    expect(daily.slice(0, 29).filter((day) => day.incomplete)).toEqual([]);
   });
 
   it('reads the votes of the rounds of the last 30 days, not the table', () => {

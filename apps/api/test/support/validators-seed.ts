@@ -239,7 +239,8 @@ export function insertLedgers(
 export interface SeedRound {
   ledgerIndex: number;
   closeTime: number;
-  version?: number;
+  /** A UInt64: text keeps what a number cannot (above 2^53). Default: the clock in milliseconds. */
+  version?: number | string;
   unl: string[];
   negativeUnl?: string[];
   observed?: number;
@@ -296,7 +297,8 @@ export async function insertRound(ch: Ch, round: SeedRound): Promise<void> {
 /** One hour as `validator_agreement_hourly` holds it: the rows of the keys first, the sentinel last, under one version. */
 export interface SeedHour {
   hour: number;
-  version?: number;
+  /** A UInt64: text keeps what a number cannot (above 2^53). Default: the clock in milliseconds. */
+  version?: number | string;
   final?: boolean;
   /** Observed ledgers; default 900. */
   ledgers?: number;
@@ -443,12 +445,13 @@ export async function seedFleet(ch: ClickHouseService, options: FleetOptions = {
 
   await insertLedgers(ch, HEAD_LEDGER, headClose, 1000, LEDGER_INTERVAL);
 
-  // manifests: every validator has one; unl[0] rotated its signing key and has a domain, as has unl[1]
+  // manifests: every validator has one; unl[0] rotated its signing key and has a domain, as have unl[1] and others[1]
   const rotated = testKey('xrpl-signing-rotated-0');
   await insertManifests(ch, [
     ...members.map((m) => ({ ephemeral_key: m.ephemeral, master_key: m.key, seq: 1 })),
     { ephemeral_key: rotated.base58, master_key: unl[0].key, seq: 2, domain: 'northpeak.example' },
     { ephemeral_key: unl[1].ephemeral, master_key: unl[1].key, seq: 3, domain: 'shoreline.example' },
+    { ephemeral_key: others[1].ephemeral, master_key: others[1].key, seq: 2, domain: 'tidewater.example' },
   ]);
   await insertDomains(ch, [
     {
@@ -456,6 +459,12 @@ export async function seedFleet(ch: ClickHouseService, options: FleetOptions = {
       domain: 'northpeak.example',
       checked_at: now - 600.511,
       accounts: ['rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+    },
+    // recorded under the signing key, before the manifest was known to the checker
+    {
+      validation_public_key: others[1].ephemeral,
+      domain: 'tidewater.example',
+      checked_at: now - 300.125,
     },
     {
       validation_public_key: unl[1].key,

@@ -31,140 +31,159 @@ export type { AgreementWindow, DailyAgreement } from './agreement-windows';
  * text.
  */
 
+/*
+ * The directory is shared: `ValidatorDirectoryService` keeps one build for every request of 10 s, so a route that changed
+ * a field of it in place would change the answers of the others. Everything the routes receive is `readonly`, arrays
+ * included, and the placeholder `NO_AGREEMENT` that entries share is frozen.
+ */
+
 /** Fees in drops, as text. */
 export interface Drops {
-  base_fee: string;
-  reserve_base: string;
-  reserve_inc: string;
+  readonly base_fee: string;
+  readonly reserve_base: string;
+  readonly reserve_inc: string;
 }
 
 /** The domain verification of a validator (spec 3.2). */
 export interface DomainState {
-  status: 'verified' | 'unverified' | 'pending';
-  reason?: string;
-  statusCode?: number;
-  tomlUrl: string;
+  readonly status: 'verified' | 'unverified' | 'pending';
+  readonly reason?: string;
+  readonly statusCode?: number;
+  readonly tomlUrl: string;
   /** When the domain was last checked: unix seconds with a millisecond fraction. */
-  checked?: number;
+  readonly checked?: number;
   /** The last success. */
-  verified?: number;
-  accounts?: string[];
+  readonly verified?: number;
+  readonly accounts?: readonly string[];
 }
 
 export interface ManifestInfo {
-  sequence: number;
-  signingKey?: string;
+  readonly sequence: number;
+  readonly signingKey?: string;
   /** The distinct signing keys stored for the master key. */
-  signingKeysSeen: number;
-  domain?: string;
+  readonly signingKeysSeen: number;
+  readonly domain?: string;
 }
+
+/** A row of `validator_votes` as the directory serves it: no field, and no amendment, can be changed. */
+export type RecordRow = Readonly<Omit<VoteRow, 'amendments'>> & { readonly amendments: readonly string[] };
 
 export interface DirectoryEntry {
   /** The master key (or the key as it is, when no manifest maps it). */
-  key: string;
-  domain?: string;
-  signingKey?: string;
-  manifest?: ManifestInfo;
-  domainState?: DomainState;
+  readonly key: string;
+  readonly domain?: string;
+  readonly signingKey?: string;
+  readonly manifest?: ManifestInfo;
+  readonly domainState?: DomainState;
   /** The ledger of its newest validation among the last 300, and whether that validation was partial. */
-  currentIndex?: number;
-  partial?: boolean;
-  agreement1h: AgreementWindow;
-  agreement24h: AgreementWindow;
-  agreement30d: AgreementWindow;
+  readonly currentIndex?: number;
+  readonly partial?: boolean;
+  readonly agreement1h: AgreementWindow;
+  readonly agreement24h: AgreementWindow;
+  readonly agreement30d: AgreementWindow;
   /** The 30 UTC days, oldest first. */
-  daily: DailyAgreement[];
+  readonly daily: readonly DailyAgreement[];
   /** On the trusted UNL. */
-  unl: boolean;
+  readonly unl: boolean;
   /** The ids of the publishers whose list in use names the validator, sorted. */
-  unlLists: string[];
+  readonly unlLists: readonly string[];
   /** On the negative UNL. */
-  negativeUnl: boolean;
-  version?: ServerVersion;
+  readonly negativeUnl: boolean;
+  readonly version?: Readonly<ServerVersion>;
   /** The newest `server_version` of the last 30 days, as reported. */
-  serverVersion?: string;
-  versionLatest?: boolean;
+  readonly serverVersion?: string;
+  readonly versionLatest?: boolean;
   /** The vote record (F7 applied to everybody, spec 3.0). */
-  record?: VoteRow;
+  readonly record?: RecordRow;
   /** The record's fees, with the fees in force at its round for the ones the validation left out. */
-  recordFees?: Drops;
+  readonly recordFees?: Drops;
   /** The record as the newest round counts it: only rounds at which the validator was on the UNL and off the negative UNL. */
-  countedRecord?: VoteRow;
-  firstSeen?: number;
-  lastSeen?: number;
-  seen24h: boolean;
+  readonly countedRecord?: RecordRow;
+  readonly firstSeen?: number;
+  readonly lastSeen?: number;
+  readonly seen24h: boolean;
   /** On a list in use, or seen in the last 30 days. */
-  listed: boolean;
+  readonly listed: boolean;
 }
 
 /** A voting round (the newest version of its sentinel). */
 export interface RoundInfo {
-  ledgerIndex: number;
-  closeTime: number;
-  unlSize: number;
-  trusted: number;
-  threshold: number;
-  observed: number;
-  unl: string[];
-  negativeUnl: string[];
+  readonly ledgerIndex: number;
+  readonly closeTime: number;
+  readonly unlSize: number;
+  readonly trusted: number;
+  readonly threshold: number;
+  readonly observed: number;
+  readonly unl: readonly string[];
+  readonly negativeUnl: readonly string[];
   /** The fees in force. */
-  fees: Drops;
+  readonly fees: Drops;
 }
 
 export interface PublisherState {
-  id: string;
-  url: string;
+  readonly id: string;
+  readonly url: string;
   /** The configured key: 66 hex digits. */
-  publicKey: string;
+  readonly publicKey: string;
   /** `ok` a current list, `expired` only an expired one (still used), `unavailable` none. */
-  status: 'ok' | 'expired' | 'unavailable';
-  list?: StoredUnlList;
+  readonly status: 'ok' | 'expired' | 'unavailable';
+  readonly list?: Readonly<StoredUnlList>;
   /** The validators of the list in use that were seen in the last 24 h. */
-  seen24h?: number;
-  lastError?: string;
-  lastErrorAt?: number;
+  readonly seen24h?: number;
+  readonly lastError?: string;
+  readonly lastErrorAt?: number;
 }
 
 export interface HeadInfo {
-  ledgerIndex: number;
-  closeTime?: number;
-  /** The mean seconds between the last 1,000 committed ledgers. */
-  meanIntervalSeconds?: number;
+  readonly ledgerIndex: number;
+  readonly closeTime?: number;
+  /**
+   * The span of the last 1,000 committed ledgers: the seconds between the close of the oldest and of the newest, and the
+   * ledgers between them. Kept as two whole numbers, so that the time of a future ledger is worked out exactly (seconds
+   * over ledgers is the mean interval). Both are present or neither.
+   */
+  readonly spanSeconds?: number;
+  readonly spanLedgers?: number;
 }
 
 /** The newest ledger state the syncer polled. */
 export interface NetworkStateInfo {
-  ledgerIndex: number;
-  amendments: string[];
-  majorities: { amendment: string; since: number }[];
-  negativeUnl: { key: string; firstLedger: number }[];
-  toDisable?: string;
-  toReenable?: string;
-  fees: Drops;
+  readonly ledgerIndex: number;
+  readonly amendments: readonly string[];
+  readonly majorities: readonly { readonly amendment: string; readonly since: number }[];
+  readonly negativeUnl: readonly { readonly key: string; readonly firstLedger: number }[];
+  readonly toDisable?: string;
+  readonly toReenable?: string;
+  readonly fees: Drops;
   /** The quorum the node reports; 0 when it reports none. */
-  nodeQuorum: number;
+  readonly nodeQuorum: number;
 }
 
 export interface Directory {
   /** When the directory was built, in milliseconds. */
-  builtAt: number;
-  head?: HeadInfo;
-  state?: NetworkStateInfo;
-  publishers: PublisherState[];
+  readonly builtAt: number;
+  readonly head?: HeadInfo;
+  readonly state?: NetworkStateInfo;
+  readonly publishers: readonly PublisherState[];
   /** Absent without a publisher row. */
-  threshold?: number;
+  readonly threshold?: number;
   /** The trusted UNL now: the validators named by enough of the lists in use. */
-  trusted: ReadonlySet<string>;
-  quorum: { value: number; unlSize: number; negativeOnUnl: number; node?: number };
+  readonly trusted: ReadonlySet<string>;
+  readonly quorum: {
+    readonly value: number;
+    readonly unlSize: number;
+    readonly negativeOnUnl: number;
+    readonly node?: number;
+  };
   /** Every master key of `validator_seen` and of the lists in use. */
-  entries: ReadonlyMap<string, DirectoryEntry>;
+  readonly entries: ReadonlyMap<string, DirectoryEntry>;
   /** The listed entries in list order: with a domain first, by lower-case domain then key; then the rest by key. */
-  ordered: DirectoryEntry[];
-  signingToMaster: ReadonlyMap<string, string>;
-  newestRound?: RoundInfo;
-  newestFinalHour?: number;
+  readonly ordered: readonly DirectoryEntry[];
+  readonly signingToMaster: ReadonlyMap<string, string>;
+  readonly newestRound?: RoundInfo;
+  readonly newestFinalHour?: number;
   /** The newest release build among the trusted validators' versions of the last 24 h. */
-  latest?: ServerVersion;
+  readonly latest?: Readonly<ServerVersion>;
 }
 
 // -- the reads --------------------------------------------------------------------------------------------------------

@@ -3,34 +3,34 @@ import BigNumber from 'bignumber.js';
 /** The sentinel of an hour in `validator_agreement_hourly` (its newest version): what decides whether a window is whole. */
 export interface HourSentinel {
   /** The hour was computed from complete data and is never recomputed. */
-  final: boolean;
+  readonly final: boolean;
   /** The ledgers of the hour that were observed (recorded by enough of the UNL): the ones validators are held to. */
-  ledgers: number;
+  readonly ledgers: number;
   /** The validated ledgers that were left out because too few validations of them were recorded. */
-  unobserved: number;
+  readonly unobserved: number;
 }
 
 /** A tracked validator's row of one hour (the newest version of the hour). */
 export interface KeyHour {
-  agreed: number;
-  missed: number;
-  partial: number;
+  readonly agreed: number;
+  readonly missed: number;
+  readonly partial: number;
 }
 
-/** A window of agreement (spec 2.5, "Windows"). Keys in this order. */
+/** A window of agreement (spec 2.5, "Windows"). Keys in this order. Read-only: the windows are part of the shared directory. */
 export interface AgreementWindow {
-  missed: number;
+  readonly missed: number;
   /** The ledgers the validator was held to: agreed plus missed. */
-  total: number;
+  readonly total: number;
   /** `(total - missed) / total` to 4 decimals, half up, as text. Absent at a total of 0. */
-  score?: string;
-  incomplete: boolean;
-  partial: number;
+  readonly score?: string;
+  readonly incomplete: boolean;
+  readonly partial: number;
 }
 
 /** A UTC day of agreement: `date` is `YYYY-MM-DD`. */
 export interface DailyAgreement extends AgreementWindow {
-  date: string;
+  readonly date: string;
 }
 
 export const HOUR_SECONDS = 3600;
@@ -41,8 +41,11 @@ export const HOURS_30D = 720;
 /** The days of `daily`. */
 export const DAILY_DAYS = 30;
 
-/** A validator before any hour is final: nothing is known, so the window is incomplete. */
-export const NO_AGREEMENT: AgreementWindow = { missed: 0, total: 0, incomplete: true, partial: 0 };
+/**
+ * A validator before any hour is final: nothing is known, so the window is incomplete. Every such entry of the shared directory
+ * holds this one object, so it is frozen.
+ */
+export const NO_AGREEMENT: AgreementWindow = Object.freeze({ missed: 0, total: 0, incomplete: true, partial: 0 });
 
 /**
  * The window `[from, toExclusive)` of a validator, `from` and `toExclusive` being hours in unix seconds. The figures are the
@@ -109,11 +112,11 @@ export function agreementReadFrom(newestFinal: number): number {
 
 /** The windows of a validator: the three of the specification and the 30 UTC days. */
 export interface AgreementWindows {
-  agreement1h: AgreementWindow;
-  agreement24h: AgreementWindow;
-  agreement30d: AgreementWindow;
+  readonly agreement1h: AgreementWindow;
+  readonly agreement24h: AgreementWindow;
+  readonly agreement30d: AgreementWindow;
   /** The 30 UTC days ending with the day of the newest final hour, oldest first. */
-  daily: DailyAgreement[];
+  readonly daily: readonly DailyAgreement[];
 }
 
 /**

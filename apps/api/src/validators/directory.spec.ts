@@ -1,5 +1,5 @@
 import { StoredUnlList, VoteRow } from '@gatehub/data-api-shared';
-import { HourSentinel, KeyHour } from './agreement-windows';
+import { HourSentinel, KeyHour, NO_AGREEMENT } from './agreement-windows';
 import { assembleDirectory, Directory, DirectoryReads, Drops, PublisherRow, RoundInfo } from './directory';
 
 const NOW = Date.UTC(2026, 9, 19, 15, 42, 53); // ms
@@ -483,6 +483,15 @@ describe('assembleDirectory', () => {
       expect(directory.entries.has('nHOLD')).toBe(false);
     });
 
+    it('is unavailable, with no trusted validator, when every stored list was served under a key the publisher no longer uses', () => {
+      const old = list('vl.ripple.com', ['nHOLD1', 'nHOLD2'], { publisherKey: 'ED' + 'FF'.repeat(32) });
+      const directory = assembleDirectory(reads({ publishers: [publisher('vl.ripple.com')], lists: [old] }));
+      expect(directory.publishers[0].status).toBe('unavailable');
+      expect(directory.publishers[0].list).toBeUndefined();
+      expect(directory.trusted.size).toBe(0);
+      expect(directory.entries.size).toBe(0);
+    });
+
     it('compares the key of a list with the configured key without regard to case, and ignores a list without a key', () => {
       const lower = list('vl.ripple.com', ['nHA'], { publisherKey: PUBLISHER_A.toLowerCase() });
       const keyless = { ...list('vl.ripple.com', ['nHB'], { sequence: 99 }), publisherKey: undefined };
@@ -790,9 +799,54 @@ describe('assembleDirectory', () => {
     });
   });
 
+  describe('read-only', () => {
+    // the directory is shared by every request for 10 s: the types do not let a route change it in place
+    it('has no field a route can assign: of the directory, an entry, a window or a publisher', () => {
+      const directory = assembleDirectory(
+        reads({
+          publishers: [publisher('vl.ripple.com')],
+          lists: [list('vl.ripple.com', ['nHA'])],
+          seen: [seenRow('nHA')],
+        }),
+      );
+      const mutate = (d: Directory): void => {
+        // @ts-expect-error a field of the directory is read-only
+        d.builtAt = 1;
+        // @ts-expect-error a field of the directory is read-only
+        d.quorum = { value: 0, unlSize: 0, negativeOnUnl: 0 };
+        // @ts-expect-error the list order is a read-only array
+        d.ordered.push(d.ordered[0]);
+        // @ts-expect-error the list order is a read-only array
+        d.ordered[0] = d.ordered[1];
+        // @ts-expect-error a field of an entry is read-only
+        d.ordered[0].unl = false;
+        // @ts-expect-error a field of a window is read-only
+        d.ordered[0].agreement24h.total = 1;
+        // @ts-expect-error the days of an entry are a read-only array
+        d.ordered[0].daily.push(d.ordered[0].daily[0]);
+        // @ts-expect-error the lists of an entry are a read-only array
+        d.ordered[0].unlLists.push('x');
+        // @ts-expect-error a field of a publisher is read-only
+        d.publishers[0].status = 'ok';
+        // @ts-expect-error the publishers are a read-only array
+        d.publishers.push(d.publishers[0]);
+      };
+      expect(mutate).toBeDefined();
+      expect(directory.ordered).toHaveLength(1);
+    });
+
+    it('shares one frozen placeholder between the entries before any hour is final', () => {
+      const directory = assembleDirectory(reads({ seen: [seenRow('nHA'), seenRow('nHB')] }));
+      const [a, b] = [entryOf(directory, 'nHA'), entryOf(directory, 'nHB')];
+      expect(a.agreement1h).toBe(NO_AGREEMENT);
+      expect(b.agreement30d).toBe(NO_AGREEMENT);
+      expect(Object.isFrozen(a.agreement24h)).toBe(true);
+    });
+  });
+
   describe('state and head', () => {
     it('passes the head and the state of the network through', () => {
-      const head = { ledgerIndex: 107_748_183, closeTime: NOW_S - 8, meanIntervalSeconds: 3.8 };
+      const head = { ledgerIndex: 107_748_183, closeTime: NOW_S - 8, spanSeconds: 3800, spanLedgers: 1000 };
       const state = {
         ledgerIndex: 107_748_180,
         amendments: ['AB'],

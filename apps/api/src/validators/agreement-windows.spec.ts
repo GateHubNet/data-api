@@ -280,4 +280,24 @@ describe('agreementWindows', () => {
   it('has a placeholder for a validator before any hour is final', () => {
     expect(NO_AGREEMENT).toEqual({ missed: 0, total: 0, incomplete: true, partial: 0 });
   });
+
+  it('shares the placeholder between validators, so it is frozen: it cannot be changed in place', () => {
+    expect(Object.isFrozen(NO_AGREEMENT)).toBe(true);
+    expect(() => {
+      // @ts-expect-error a field of a window is read-only
+      NO_AGREEMENT.missed = 1;
+    }).toThrow(TypeError);
+    expect(NO_AGREEMENT.missed).toBe(0);
+  });
+
+  it('has windows whose fields are read-only', () => {
+    const window = agreementWindow(new Map(), new Map(), NEWEST, NEWEST + HOUR);
+    const mutate = (): void => {
+      // @ts-expect-error a field of a window is read-only
+      window.total = 1;
+      // @ts-expect-error a field of a window is read-only
+      window.incomplete = false;
+    };
+    expect(mutate).toBeDefined();
+  });
 });

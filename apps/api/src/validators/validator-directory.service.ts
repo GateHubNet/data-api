@@ -10,7 +10,7 @@ import {
 import { Inject, Injectable } from '@nestjs/common';
 import { CacheService } from '../common/cache.service';
 import { NETWORK_PROFILE } from '../config/api.config';
-import { agreementReadFrom, HOURS_30D, HourSentinel, KeyHour, newestFinalHour } from './agreement-windows';
+import { agreementReadFrom, HourSentinel, KeyHour, newestFinalHour } from './agreement-windows';
 import {
   ActivityRow,
   assembleDirectory,
@@ -34,14 +34,15 @@ export const ACTIVITY_LEDGERS = 300;
 
 const HOUR = 3600;
 const DAY = 86_400;
+/** The hours of a range of sentinels read while looking for the newest final hour: the hours of the 30-day window. */
+const AGREEMENT_RANGE_HOURS = 720;
+/** The most hours back from the newest hour stored the search for a final hour goes: `validator_agreement_hourly` keeps 400 days. */
+const AGREEMENT_RETENTION_HOURS = 400 * 24;
 /**
  * The most ledgers a 30-day window can span: no network closes more than one ledger a second. A lower bound for the read of the
  * rounds, which then filters them by their close time.
  */
 const MAX_LEDGERS_30D = 30 * DAY;
-/** Hours before the 30-day window that the sentinels are read, in case the newest hour stored is not final. */
-const HOURS_OF_SLACK = 24;
-
 /** The manifest map as the query parameters of `transform(k, {ephemerals}, {masters}, k)`. */
 type KeyMap = ReturnType<typeof keyMapParams>;
 
@@ -54,7 +55,11 @@ const asSeconds = (milliseconds: Num): number => Number(milliseconds) / 1000;
 /** A set of rounds as the version-set reads take them: the newest version of every round. */
 interface RoundVersions {
   rounds: number[];
-  versions: number[];
+  /**
+   * UInt64 as text: a version is passed back to ClickHouse exactly as it came out, never through a JavaScript number (as
+   * `Array(String)`, since an `Array(UInt64)` parameter does not take quoted numbers).
+   */
+  versions: string[];
 }
 
 /**
@@ -103,7 +108,7 @@ export class ValidatorDirectoryService {
     const state = this.readState();
     const publishers = this.readPublishers();
     const manifests = this.readManifests();
-    const domains = this.readDomains();
+    const domains = keyMap.then((map) => this.readDomains(map));
     const seen = keyMap.then((map) => this.readSeen(map));
     const activity = Promise.all([head, state, keyMap]).then(([h, s, map]) => this.readActivity(h, s, map));
     const agreement = keyMap.then((map) => this.readAgreement(map));
@@ -159,7 +164,7 @@ export class ValidatorDirectoryService {
     return {
       ledgerIndex: asNumber(newest.ledger_index),
       closeTime: asNumber(newest.closed),
-      ...(ledgers > 0 && seconds > 0 && { meanIntervalSeconds: seconds / ledgers }),
+      ...(ledgers > 0 && seconds > 0 && { spanSeconds: seconds, spanLedgers: ledgers }),
     };
   }
 
@@ -331,8 +336,8 @@ export class ValidatorDirectoryService {
     }));
   }
 
-  /** The newest result of every (validator, domain). */
-  private async readDomains(): Promise<DomainRow[]> {
+  /** The newest result of every (validator, domain), the keys mapped to their masters. */
+  private async readDomains(map: KeyMap): Promise<DomainRow[]> {
     const rows = await this.ch.query<{
       domain_key: string;
       domain_name: string;
@@ -344,7 +349,8 @@ export class ValidatorDirectoryService {
       verified_ms: Num | null;
       newest_accounts: string[];
     }>(
-      `SELECT validation_public_key AS domain_key, domain AS domain_name,
+      `SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS domain_key,
+              domain AS domain_name,
               argMax(status, checked_at) AS newest_status,
               argMax(reason, checked_at) AS newest_reason,
               argMax(status_code, checked_at) AS newest_status_code,
@@ -355,6 +361,7 @@ export class ValidatorDirectoryService {
          FROM ${Table.ValidatorDomains}
         GROUP BY domain_key, domain_name
         ORDER BY domain_key, domain_name`,
+      { ephemerals: map.ephemerals, masters: map.masters },
     );
     return rows.map(
       (row): DomainRow => ({
@@ -403,13 +410,18 @@ export class ValidatorDirectoryService {
   // -- agreement ------------------------------------------------------------------------------------------------------
 
   /**
-   * The sentinels of the hours near the 30-day window and the rows of the validators in it, as the newest sentinel's version of
-   * each hour has them and no other.
+   * The sentinels of the 720 hours of the 30-day window and the rows of the validators in them, as the newest sentinel's
+   * version of each hour has them and no other.
    *
-   * It looks for the newest hour stored (the first granule of the table, read from the end), takes the sentinels of the 744 hours
-   * up to it, finds the newest final hour among them, and reads the rows of the 720 hours that end there: from the first hour of
-   * the 30-day window (ruling P6; not the start of a UTC day, the 30 daily entries lie inside it). Per validator one row comes
-   * back with its hours in an array, which keeps the answer a fraction of the rows read.
+   * The window ends at the newest FINAL hour, which can lie any number of non-final hours below the newest hour stored (an
+   * ingest that stalled). So it is found first, from the sentinels, going back from the newest hour stored (the first granule
+   * of the table, read from the end) in ranges of 720 hours until a range has an hour whose newest version is final (at most as
+   * far back as the table keeps an hour, 400 days). Each range is a range of the key, so a stall costs the ranges it spans and the
+   * usual case one. (The agreement job asks for the newest final hour with `GROUP BY hour ... ORDER BY hour DESC LIMIT 1`; read
+   * here that statement reads the whole table when ClickHouse does not hand it the granules a previous run skipped: 839,600 rows
+   * of the bulk of the e2e suite.) Then the window is completed down to `newest final - 719 h` (ruling P6: the first hour of
+   * the 30-day window, not the start of a UTC day; the 30 daily entries lie inside it), and the rows of its hours are read. Per
+   * validator one row comes back with its hours in an array, which keeps the answer a fraction of the rows read.
    */
   private async readAgreement(map: KeyMap): Promise<{
     sentinels: ReadonlyMap<number, HourSentinel>;
@@ -426,42 +438,58 @@ export class ValidatorDirectoryService {
     if (stored === undefined) return none;
     const newestStored = asNumber(stored.stored_hour);
 
-    const sentinelRows = await this.ch.query<{
-      sentinel_hour: Num;
-      newest_version: Num;
-      newest_final: Num;
-      newest_ledgers: Num;
-      newest_unobserved: Num;
-    }>(
-      `SELECT toUnixTimestamp(hour) AS sentinel_hour,
-              toString(max(version)) AS newest_version,
-              argMax(final, version) AS newest_final,
-              argMax(ledgers, version) AS newest_ledgers,
-              argMax(unobserved, version) AS newest_unobserved
-         FROM ${Table.ValidatorAgreementHourly}
-        WHERE validation_public_key = ''
-          AND hour >= toDateTime({since:UInt32}, 'UTC') AND hour <= toDateTime({until:UInt32}, 'UTC')
-        GROUP BY hour
-        ORDER BY hour`,
-      { since: newestStored - (HOURS_30D - 1 + HOURS_OF_SLACK) * HOUR, until: newestStored },
-    );
-    const sentinels = new Map<number, HourSentinel>(
-      sentinelRows.map((row) => [
-        asNumber(row.sentinel_hour),
-        {
+    // the sentinels read so far, and the version of the newest of each hour
+    const sentinels = new Map<number, HourSentinel>();
+    const versionOf = new Map<number, string>();
+    const readSentinels = async (since: number, until: number): Promise<void> => {
+      const rows = await this.ch.query<{
+        sentinel_hour: Num;
+        newest_version: string;
+        newest_final: Num;
+        newest_ledgers: Num;
+        newest_unobserved: Num;
+      }>(
+        `SELECT toUnixTimestamp(hour) AS sentinel_hour,
+                toString(max(version)) AS newest_version,
+                argMax(final, version) AS newest_final,
+                argMax(ledgers, version) AS newest_ledgers,
+                argMax(unobserved, version) AS newest_unobserved
+           FROM ${Table.ValidatorAgreementHourly}
+          WHERE validation_public_key = ''
+            AND hour >= toDateTime({since:UInt32}, 'UTC') AND hour <= toDateTime({until:UInt32}, 'UTC')
+          GROUP BY hour
+          ORDER BY hour`,
+        { since, until },
+      );
+      for (const row of rows) {
+        const hour = asNumber(row.sentinel_hour);
+        versionOf.set(hour, row.newest_version);
+        sentinels.set(hour, {
           final: asNumber(row.newest_final) === 1,
           ledgers: asNumber(row.newest_ledgers),
           unobserved: asNumber(row.newest_unobserved),
-        },
-      ]),
-    );
-    const finalHour = newestFinalHour(sentinels);
-    if (finalHour === undefined) return { sentinels, hourly: none.hourly };
+        });
+      }
+    };
 
+    // back from the newest hour stored, a range of 720 hours at a time, to the first with a final hour
+    let covered = newestStored + HOUR;
+    let finalHour: number | undefined;
+    while (finalHour === undefined && covered > newestStored - AGREEMENT_RETENTION_HOURS * HOUR) {
+      await readSentinels(covered - AGREEMENT_RANGE_HOURS * HOUR, covered - HOUR);
+      covered -= AGREEMENT_RANGE_HOURS * HOUR;
+      finalHour = newestFinalHour(sentinels);
+    }
+    if (finalHour === undefined) return none;
+
+    // the window of 720 hours ends at the newest final hour; read the hours of it below what is read
     const from = agreementReadFrom(finalHour);
-    const window = sentinelRows.filter(
-      (row) => asNumber(row.sentinel_hour) >= from && asNumber(row.sentinel_hour) <= finalHour,
-    );
+    if (from < covered) {
+      await readSentinels(from, covered - HOUR);
+      covered = from;
+    }
+    const window = [...sentinels.keys()].filter((hour) => hour >= from && hour <= finalHour).sort((a, b) => a - b);
+
     const rows = await this.ch.query<{ agreement_key: string; hourly: [number, number, number, number][] }>(
       `SELECT agreement_key, groupArray((agreement_hour, hour_agreed, hour_missed, hour_partial)) AS hourly
          FROM (SELECT transform(validation_public_key, {ephemerals:Array(String)}, {masters:Array(String)}, validation_public_key) AS agreement_key,
@@ -470,15 +498,15 @@ export class ValidatorDirectoryService {
                  FROM ${Table.ValidatorAgreementHourly}
                 WHERE hour >= toDateTime({since:UInt32}, 'UTC') AND hour <= toDateTime({until:UInt32}, 'UTC')
                   AND validation_public_key != ''
-                  AND version = transform(toUnixTimestamp(hour), {hours:Array(UInt32)}, {versions:Array(UInt64)}, toUInt64(0))
+                  AND version = toUInt64(transform(toUnixTimestamp(hour), {hours:Array(UInt32)}, {versions:Array(String)}, '0'))
                 GROUP BY agreement_key, agreement_hour)
         GROUP BY agreement_key
         ORDER BY agreement_key`,
       {
         since: from,
         until: finalHour,
-        hours: window.map((row) => asNumber(row.sentinel_hour)),
-        versions: window.map((row) => asNumber(row.newest_version)),
+        hours: window,
+        versions: window.map((hour) => versionOf.get(hour) as string),
         ephemerals: map.ephemerals,
         masters: map.masters,
       },
@@ -524,7 +552,7 @@ export class ValidatorDirectoryService {
     const [recent, month] = await Promise.all([
       this.ch.query<{
         ledger_index: Num;
-        newest_version: Num;
+        newest_version: string;
         round_close: Num;
         round_unl_size: Num;
         round_trusted: Num;
@@ -555,7 +583,7 @@ export class ValidatorDirectoryService {
           ORDER BY ledger_index`,
         { floor, newest: newestRound, since: since24 },
       ),
-      this.ch.query<{ ledger_index: Num; newest_version: Num }>(
+      this.ch.query<{ ledger_index: Num; newest_version: string }>(
         `SELECT ledger_index, toString(max(version)) AS newest_version
            FROM ${Table.AmendmentTallies}
           WHERE amendment_id = '' AND ledger_index >= {floor:UInt32} AND ledger_index <= {newest:UInt32}
@@ -586,13 +614,13 @@ export class ValidatorDirectoryService {
     const [votes, versions] = await Promise.all([
       this.readRecentVotes(map, rounds, {
         rounds: recent.map((row) => asNumber(row.ledger_index)),
-        versions: recent.map((row) => asNumber(row.newest_version)),
+        versions: recent.map((row) => row.newest_version),
       }),
       this.readVersions(
         map,
         {
           rounds: month.map((row) => asNumber(row.ledger_index)),
-          versions: month.map((row) => asNumber(row.newest_version)),
+          versions: month.map((row) => row.newest_version),
         },
         now - DAY,
       ),
@@ -620,7 +648,7 @@ export class ValidatorDirectoryService {
          FROM ${Table.ValidatorVotes}
         WHERE ledger_index >= {first:UInt32} AND ledger_index <= {last:UInt32}
           AND full = 1
-          AND version = transform(ledger_index, {rounds:Array(UInt32)}, {versions:Array(UInt64)}, toUInt64(0))`,
+          AND version = toUInt64(transform(ledger_index, {rounds:Array(UInt32)}, {versions:Array(String)}, '0'))`,
       {
         first: sets.rounds[0],
         last: sets.rounds[sets.rounds.length - 1],
@@ -663,7 +691,7 @@ export class ValidatorDirectoryService {
          FROM ${Table.ValidatorVotes}
         WHERE ledger_index >= {first:UInt32} AND ledger_index <= {last:UInt32}
           AND server_version IS NOT NULL
-          AND version = transform(ledger_index, {rounds:Array(UInt32)}, {versions:Array(UInt64)}, toUInt64(0))
+          AND version = toUInt64(transform(ledger_index, {rounds:Array(UInt32)}, {versions:Array(String)}, '0'))
         GROUP BY version_key
         ORDER BY version_key`,
       {
