@@ -39,12 +39,14 @@ export * from './ingest/raw-ledger';
 
 // Aggregates
 export * from './aggregate/aggregate-sets';
+export * from './aggregate/pair-hourly.job';
 export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
 export * from './aggregate/volume.job';
 
 // Query
 export * from './query/asset';
+export * from './query/candle-columns';
 export * from './query/daily-rates';
 export * from './query/decimal';
 export * from './query/distinct-page';
