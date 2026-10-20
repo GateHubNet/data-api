@@ -150,6 +150,8 @@ Both sides' sections everywhere; D2's material is in blocks of its own, so most 
 | `docs/openapi.yaml` | yes | **Regenerated after the merge, not merged by hand**: take either side to clear the conflict (`git checkout --ours docs/openapi.yaml`), then regenerate by the procedure of `docs/development.md` section 8 (keep its header comment). |
 | `README.md`, `docs/development.md` | none | Merge by themselves (D2 only adds `003_account_market_aggregates` to the migration lists next to `002`). |
 
+**The numbering of ADR-0010.** The items 40 to 48 of the ADR are taken: they are Amendment 1 (D1, [ADR-0012](../../adr/0012-validators-and-amendments-data.md)), which is already on `feat/explorer-data`. The AMM side's section 6 cites its items as 40 to 44, which would collide with them, so at the merge **its items are numbered from 49 on** (49 to 53), and where its section is headed as an amendment it is "Amendment 3" (Amendment 2 is D2's). Renumber the AMM side's items and the references to them; leave the items of Amendment 1 as they are.
+
 ## The database consequence
 
 The AMM work changes `001_baseline.sql` **in place** (it adds columns and tables to the baseline instead of a new migration). The migration runner refuses an applied file whose checksum changed

@@ -876,8 +876,13 @@ describe.each([
       h.ch,
       members.map((m) => ({ key: m.key, first: now - 86_400, last: now - 30 })),
     );
-    // 720 final hours, then hours that are not final up to the previous hour
-    finalHour = Math.floor(now / HOUR) * HOUR - (stalled + 1) * HOUR;
+    // 720 final hours, then hours that are not final up to the previous hour. The directory reads the clock itself, so the seed
+    // is placed so that the newest final hour is never 23:00 UTC: the last `daily` entry is the day of that hour, and a day
+    // whole in 24 final hours is complete, which would fail the `incomplete` assertion below in one hour of the day out of 24.
+    // At that hour the stall is one hour longer (still above the minimum the case names).
+    const newestAtMost = Math.floor(now / HOUR) * HOUR - (stalled + 1) * HOUR;
+    finalHour = newestAtMost % DAY === DAY - HOUR ? newestAtMost - HOUR : newestAtMost;
+    const stall = (Math.floor(now / HOUR) * HOUR - finalHour) / HOUR - 1;
     const hours = (from: number, count: number, final: boolean, agreed: number, missed: number) =>
       range(0, count - 1).map((i) => ({
         hour: from + i * HOUR,
@@ -886,7 +891,7 @@ describe.each([
         rows: [{ key: members[0].key, agreed, missed }],
       }));
     await insertHours(h.ch, hours(finalHour - 719 * HOUR, 720, true, 899, 1));
-    await insertHours(h.ch, hours(finalHour + HOUR, stalled, false, 500, 50));
+    await insertHours(h.ch, hours(finalHour + HOUR, stall, false, 500, 50));
     body = (await (await h.api()).get(SUMMARY)).body;
     directory = await started.directory();
   });
