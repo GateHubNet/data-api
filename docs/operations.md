@@ -185,6 +185,7 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
 | `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines |
 | `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
+| `syncer_markets_live_age_seconds{period=~"7day\|30day"}` | under about 300 s (a set every fifth run, about every 5 minutes); about 900 s for a few minutes after one failed set | Above 600 s for 10 minutes: that period of the Markets table is stale (the `MARKETS` switch needs all three periods under 600 s) |
 | `syncer_pair_hourly_missing_hours` | 0 | Above 0 for 30 minutes |
 | `syncer_rates_daily_missing_days` | 0 (the day that has just become final is computed by the next run) | Above 2 for 6 hours after the first back-fill; the size of the history on a fresh deployment, falling over about a day |
 | `syncer_account_rollups_pending_accounts` | 0 | Positive for days: a heavy account is not being promoted |
