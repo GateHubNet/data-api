@@ -1,16 +1,28 @@
-import { ClickHouseService, getNetworkProfile, ShutdownSignals, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, getNetworkProfile, RatesService, ShutdownSignals, Table } from '@gatehub/data-api-shared';
 import { Global, Module } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { NETWORK_PROFILE } from '../config/syncer.config';
+import { NETWORK_PROFILE, SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { WORKER_MODULES } from '../worker-registry';
-import { AggregatorModule } from './aggregator.module';
+import { AggregatorModule, aggregatorOptions } from './aggregator.module';
 import { AggregatorService } from './aggregator.service';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
+
+/** The metrics of the aggregator and of the account and market jobs, over fakes. */
+const fakeMetrics = () => ({
+  aggregatorRunsTotal: { inc: jest.fn() },
+  aggregatorErrorsTotal: { inc: jest.fn() },
+  aggregatorStatsLagSeconds: { set: jest.fn() },
+  pairHourlyMissingHours: { set: jest.fn() },
+  marketsLiveAgeSeconds: { set: jest.fn() },
+  ratesDailyMissingDays: { set: jest.fn() },
+  accountRollupsHeavyAccounts: { set: jest.fn() },
+  accountRollupsPendingAccounts: { set: jest.fn() },
+});
 
 describe('AggregatorModule', () => {
   afterEach(() => {
@@ -19,7 +31,13 @@ describe('AggregatorModule', () => {
   });
 
   /** What the global core module and the ClickHouse module provide to every worker, over fakes. */
-  function coreStub(query: jest.Mock, insert: jest.Mock, shutdown: { register: jest.Mock }, metrics: object) {
+  function coreStub(
+    query: jest.Mock,
+    insert: jest.Mock,
+    shutdown: { register: jest.Mock },
+    metrics: object,
+    config: Partial<SyncerConfig> = { accountRollupMinRows: 1_000_000 },
+  ) {
     @Global()
     @Module({
       providers: [
@@ -30,8 +48,9 @@ describe('AggregatorModule', () => {
         { provide: PrometheusService, useValue: metrics },
         { provide: ShutdownSignals, useValue: shutdown },
         { provide: NETWORK_PROFILE, useValue: getNetworkProfile('xrpl') },
+        { provide: SyncerConfig, useValue: config },
       ],
-      exports: [ClickHouseService, PrometheusService, ShutdownSignals, NETWORK_PROFILE],
+      exports: [ClickHouseService, PrometheusService, ShutdownSignals, NETWORK_PROFILE, SyncerConfig],
     })
     class CoreStub {}
     return CoreStub;
@@ -49,11 +68,7 @@ describe('AggregatorModule', () => {
     });
     const insert = jest.fn(async (_table: string, _rows: unknown[]) => undefined);
     const shutdown = { register: jest.fn() };
-    const metrics = {
-      aggregatorRunsTotal: { inc: jest.fn() },
-      aggregatorErrorsTotal: { inc: jest.fn() },
-      aggregatorStatsLagSeconds: { set: jest.fn() },
-    };
+    const metrics = fakeMetrics();
     const CoreStub = coreStub(query, insert, shutdown, metrics);
     const moduleRef = await Test.createTestingModule({ imports: [CoreStub, AggregatorModule] })
       .setLogger(QUIET)
@@ -70,6 +85,10 @@ describe('AggregatorModule', () => {
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'stats_dirty' });
     // the volume jobs are on, with the bundled markets config of the network
     for (const job of ['volume_live', 'volume_daily', 'volume_backfill']) {
+      expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job });
+    }
+    // and so are the account and market jobs, which have nothing to do on a database without a ledger
+    for (const job of ['pair_hourly', 'markets_live', 'rates_daily', 'account_rollups']) {
       expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job });
     }
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
@@ -91,16 +110,7 @@ describe('AggregatorModule', () => {
       process.env.GH_MARKETS_CONFIG = file;
       const query = jest.fn(async () => [] as unknown[]);
       const insert = jest.fn(async (_table: string, _rows: unknown[]) => undefined);
-      const CoreStub = coreStub(
-        query,
-        insert,
-        { register: jest.fn() },
-        {
-          aggregatorRunsTotal: { inc: jest.fn() },
-          aggregatorErrorsTotal: { inc: jest.fn() },
-          aggregatorStatsLagSeconds: { set: jest.fn() },
-        },
-      );
+      const CoreStub = coreStub(query, insert, { register: jest.fn() }, fakeMetrics());
       const moduleRef = await Test.createTestingModule({ imports: [CoreStub, AggregatorModule] })
         .setLogger(QUIET)
         .compile();
@@ -116,6 +126,25 @@ describe('AggregatorModule', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('gives the volume jobs and the account and market jobs one RatesService, and the minimum of the config', () => {
+    const ch = {} as ClickHouseService;
+    const profile = getNetworkProfile('xrpl');
+    const options = aggregatorOptions(
+      ch,
+      profile,
+      { accountRollupMinRows: 1234 } as SyncerConfig,
+      { log: jest.fn() } as never,
+    );
+    expect(options.volumes?.rates).toBeInstanceOf(RatesService);
+    expect(options.aggregates?.rates).toBe(options.volumes?.rates);
+    expect(options.aggregates?.rates.nativeCurrency).toBe('XRP');
+    expect(options.aggregates?.accountRollupMinRows).toBe(1234);
+    expect(
+      aggregatorOptions(ch, profile, { accountRollupMinRows: 0 } as SyncerConfig, { log: jest.fn() } as never)
+        .aggregates?.accountRollupMinRows,
+    ).toBe(0);
   });
 
   it('refuses to boot on a markets config that is not valid, and says what is wrong with it', async () => {

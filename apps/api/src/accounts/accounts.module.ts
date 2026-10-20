@@ -1,9 +1,12 @@
 import { Module } from '@nestjs/common';
 import { RatesModule } from '../exchanges/rates.module';
+import { AccountAnalyticsController } from './account-analytics.controller';
+import { AccountAnalyticsService } from './account-analytics.service';
 import { AccountBalanceChangesController } from './account-balance-changes.controller';
 import { AccountBalanceChangesService } from './account-balance-changes.service';
 import { AccountBalancesController } from './account-balances.controller';
 import { AccountBalancesService } from './account-balances.service';
+import { AccountDayGroupsService } from './account-day-groups.service';
 import { AccountExchangesController } from './account-exchanges.controller';
 import { AccountExchangesService } from './account-exchanges.service';
 import { AccountOrdersController } from './account-orders.controller';
@@ -43,6 +46,7 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountOrdersController,
     AccountReportsController,
     AccountStatsController,
+    AccountAnalyticsController,
   ],
   providers: [
     AccountsService,
@@ -55,6 +59,8 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountOrdersService,
     AccountReportsService,
     AccountStatsService,
+    AccountDayGroupsService,
+    AccountAnalyticsService,
   ],
 })
 export class AccountsModule {}

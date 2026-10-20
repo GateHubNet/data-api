@@ -482,6 +482,201 @@ export interface VolumeLiveRow extends Omit<VolumeDailyRow, 'day'> {
   end_time: UnixSeconds;
 }
 
+/**
+ * Per closed UTC day, the rate of an issued asset (units of the asset per unit of native). A day is a version set: its
+ * sentinel row has `currency = ''` and `issuer = ''` and carries `config_version` and `stale`.
+ */
+export interface NativeRatesDailyRow {
+  currency: string;
+  issuer: string;
+  /** `'YYYY-MM-DD'` */
+  day: string;
+  /** Exact decimal text of the rate. */
+  rate: string;
+  rate_f: number;
+  /** Diagnostics: the kept trades of the day, and how many of them are among the newest 50. */
+  daily_count: number;
+  latest_count: number;
+  config_version: number;
+  stale: number;
+  version: UInt64Value;
+}
+
+/**
+ * One UTC hour of one pair (canonical order) and source. An hour is a version set: its sentinel row (empty pair, source
+ * `'book'`) carries `is_final`, `config_version` and `through_time`, the close time of the newest ledger the read
+ * covered. (`is_final`, because `FINAL` is a ClickHouse keyword.) Rows expire 45 days after their hour.
+ */
+export interface PairHourlyRow {
+  hour: UnixSeconds;
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  source: 'book' | 'amm';
+  count: UInt64Value;
+  base_sum: string;
+  counter_sum: string;
+  unfit: number;
+  base_sum_f: number;
+  counter_sum_f: number;
+  /** The first, last, highest and lowest rate of the hour, with the `(ledger, tx, node)` key of the trade. */
+  open_rate: string;
+  open_ledger: number;
+  open_tx: number;
+  open_node: number;
+  open_time: UnixSeconds;
+  close_rate: string;
+  close_ledger: number;
+  close_tx: number;
+  close_node: number;
+  close_time: UnixSeconds;
+  high_rate: string;
+  high_rate_f: number;
+  high_ledger: number;
+  high_tx: number;
+  high_node: number;
+  low_rate: string;
+  low_rate_f: number;
+  low_ledger: number;
+  low_tx: number;
+  low_node: number;
+  is_final: number;
+  config_version: number;
+  through_time: UnixSeconds;
+  version: UInt64Value;
+}
+
+/**
+ * One pair of one (period, AMM filter) set. A set is written whole in one insert; its sentinel row (empty pair) carries
+ * `start_time`, `end_time`, `pairs_traded`, `total_count`, `total_native_volume` and `total_amm_share`.
+ */
+export interface MarketsLiveRow {
+  /** `'day'`, `'7day'` or `'30day'` */
+  period: string;
+  amm: 'include' | 'exclude' | 'only';
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  count: UInt64Value;
+  base_volume: string;
+  counter_volume: string;
+  native_volume: string | null;
+  open: string;
+  high: string;
+  low: string;
+  last: string;
+  open_time: UnixSeconds;
+  last_time: UnixSeconds;
+  /** The 7 daily closes, oldest first. */
+  closes: (string | null)[];
+  /** NULL until the AMM data lands. */
+  amm_share: string | null;
+  amm_pool: number | null;
+  start_time: UnixSeconds;
+  end_time: UnixSeconds;
+  pairs_traded: number;
+  total_count: UInt64Value;
+  total_native_volume: string;
+  total_amm_share: string | null;
+  version: UInt64Value;
+}
+
+/** One row per heavy account: the contiguous days its rollups cover are `rolled_from` to `rolled_through`. */
+export interface AccountRollupStateRow {
+  account: string;
+  /** Its balance changes, when counted. */
+  rows: UInt64Value;
+  /** `'YYYY-MM-DD'` */
+  first_day: string;
+  /** `'YYYY-MM-DD'` or NULL */
+  rolled_from: string | null;
+  /** `'YYYY-MM-DD'` or NULL */
+  rolled_through: string | null;
+  config_version: number;
+  version: UInt64Value;
+}
+
+/**
+ * The accounts with many balance changes in one partition of `balance_changes` (`intDiv(ledger_index, 10000000)`);
+ * `account = ''` is its sentinel.
+ */
+export interface AccountPartitionRowsRow {
+  partition: number;
+  account: string;
+  rows: UInt64Value;
+  version: UInt64Value;
+}
+
+/** The sentinel of an (account, day) rollup set: written after the set's rows. */
+export interface AccountRollupDaysRow {
+  account: string;
+  /** `'YYYY-MM-DD'` */
+  day: string;
+  version: UInt64Value;
+}
+
+/** One account's balance changes of one line (asset) and UTC day. */
+export interface AccountLinesDailyRow {
+  account: string;
+  /** `'YYYY-MM-DD'` */
+  day: string;
+  currency: string;
+  counterparty: string;
+  change_type: string;
+  /** `final_balance < 0` */
+  owes: number;
+  count: UInt64Value;
+  /** Sum of the positive and minus the sum of the negative `amount_change`, exact. */
+  in_sum: string;
+  out_sum: string;
+  unfit: number;
+  in_sum_f: number;
+  out_sum_f: number;
+  /** The line's last `final_balance` of the day, the same on every row of the line and day. */
+  end_balance: string;
+  version: UInt64Value;
+}
+
+/** The transactions an account sent (`is_initiator = 1`) on one UTC day. */
+export interface AccountTxDailyRow {
+  account: string;
+  /** `'YYYY-MM-DD'` */
+  day: string;
+  tx_type: string;
+  result: string;
+  count: UInt64Value;
+  version: UInt64Value;
+}
+
+/** One account's trades of one pair and UTC day; `bought_*` is where it is the buyer, `sold_*` the seller. */
+export interface AccountTradesDailyRow {
+  account: string;
+  /** `'YYYY-MM-DD'` */
+  day: string;
+  base_currency: string;
+  base_issuer: string;
+  counter_currency: string;
+  counter_issuer: string;
+  count: UInt64Value;
+  base_sum: string;
+  counter_sum: string;
+  bought_sum: string;
+  sold_sum: string;
+  /** The counter amounts of the same trades as `bought_sum` and `sold_sum`. */
+  bought_counter_sum: string;
+  sold_counter_sum: string;
+  unfit: number;
+  base_sum_f: number;
+  counter_sum_f: number;
+  bought_sum_f: number;
+  sold_sum_f: number;
+  bought_counter_sum_f: number;
+  sold_counter_sum_f: number;
+  version: UInt64Value;
+}
+
 // -- Internal bookkeeping ----------------------------------------------------------------------------------------
 
 export interface IngestLogRow {

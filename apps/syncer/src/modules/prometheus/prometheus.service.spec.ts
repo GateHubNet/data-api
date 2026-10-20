@@ -77,6 +77,59 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_validator_validations_flushed_total\{table="validator_validations"\} 12$/m);
   });
 
+  it('exposes the gauges of the pair_hourly and markets_live jobs, by name, type, label set and help text (spec section 11)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.pairHourlyMissingHours.set(3);
+    service.marketsLiveAgeSeconds.set({ period: 'day' }, 75);
+    service.marketsLiveAgeSeconds.set({ period: '30day' }, 610);
+
+    const text = await service.getMetrics();
+    const pair = 'Hours of the last 31 days without a set of the current config version.';
+    const age = 'Now minus the end_time of the newest include set.';
+    expect(text).toContain(
+      `# HELP syncer_pair_hourly_missing_hours ${pair}\n# TYPE syncer_pair_hourly_missing_hours gauge\n`,
+    );
+    expect(text).toMatch(/^syncer_pair_hourly_missing_hours 3$/m);
+    expect(text).toContain(
+      `# HELP syncer_markets_live_age_seconds ${age}\n# TYPE syncer_markets_live_age_seconds gauge\n`,
+    );
+    expect(text).toMatch(/^syncer_markets_live_age_seconds\{period="day"\} 75$/m);
+    expect(text).toMatch(/^syncer_markets_live_age_seconds\{period="30day"\} 610$/m);
+    const labels = (name: string): string[] | undefined =>
+      (service.registry.getSingleMetric(name) as unknown as { labelNames: string[] } | undefined)?.labelNames;
+    expect(labels('syncer_pair_hourly_missing_hours')).toEqual([]);
+    expect(labels('syncer_markets_live_age_seconds')).toEqual(['period']);
+  });
+
+  it('exposes the gauges of the rates_daily and account_rollups jobs, by name, type, label set and help text (spec section 11)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.ratesDailyMissingDays.set(4);
+    service.accountRollupsHeavyAccounts.set(120);
+    service.accountRollupsPendingAccounts.set(7);
+
+    const text = await service.getMetrics();
+    const declared: [string, string, number][] = [
+      [
+        'syncer_rates_daily_missing_days',
+        'Closed final days without a valid rates set, from the first native trade to the newest final day.',
+        4,
+      ],
+      ['syncer_account_rollups_heavy_accounts', 'Heavy accounts.', 120],
+      [
+        'syncer_account_rollups_pending_accounts',
+        'Heavy accounts whose coverage does not yet reach from first_day to the newest final day.',
+        7,
+      ],
+    ];
+    for (const [name, help, value] of declared) {
+      expect(text).toContain(`# HELP ${name} ${help}\n# TYPE ${name} gauge\n`);
+      expect(text).toMatch(new RegExp(`^${name} ${value}$`, 'm'));
+      expect((service.registry.getSingleMetric(name) as unknown as { labelNames: string[] }).labelNames).toEqual([]);
+    }
+  });
+
   describe('the declaration of the validators metrics', () => {
     // [name, type, declared label names (exactly), HELP text (spec section 6)]
     const declared: [string, string, string[], string][] = [

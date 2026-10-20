@@ -93,6 +93,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_DOMAIN_RECHECK_MS` | `21600000` (6 h) | How long a definite domain result stands before the domain is checked again. At least 1. |
 | `GH_DOMAIN_FETCH_TIMEOUT_MS` | `10000` | Overall timeout of one TOML fetch, redirects included. At least 1. |
 | `GH_AMENDMENTS_CONFIG` | empty: the file shipped as `config/amendments/<network>.json` | Path of the amendment metadata file the `validators` worker reads. The API reads the same variable ([section 4](#4-api-appsapi)): give both the same file. Empty counts as the shipped file. |
+| `GH_ACCOUNT_ROLLUP_MIN_ROWS` | `1000000` | Balance changes from which an account is **heavy** and gets daily rollups from the `account_rollups` job of the aggregator ([syncer](syncer.md#74-account_rollups)): a read of years of such an account (`stats` and `reports` with `interval`, `analytics/*`) then reads thousands of day groups instead of tens of millions of rows. A whole number in plain digits (`1.5`, `1e6` and `abc` fail the boot, naming the variable). **`0` turns the job off**: the rollups that exist are still used by the API (and corrected after a re-ingest), and simply stop growing. A value below 10,000 behaves like 10,000. The API needs no setting: it reads the state tables. Lower it only to try rollups on a seeded account (see `load/README.md`). |
 
 ## 6. Other variables
 
@@ -115,6 +116,7 @@ variables above, per network.
 | `XRPL_MARKETS_CONFIG`, `XAHAU_MARKETS_CONFIG` | prod | empty (= the shipped file) | `GH_MARKETS_CONFIG` of the syncer; the file must be mounted into the container (a commented `volumes:` line shows how) |
 | `XRPL_UNL_PUBLISHERS`, `XAHAU_UNL_PUBLISHERS` | prod, dev | empty (= the default publishers of the network, spelled out in the compose file) | `GH_UNL_PUBLISHERS` of the syncer. An empty `GH_UNL_PUBLISHERS` would mean "no lists", so compose never passes an empty one on: this variable falls back to the default text. |
 | `XRPL_AMENDMENTS_CONFIG`, `XAHAU_AMENDMENTS_CONFIG` | prod, dev | empty (= the shipped file) | `GH_AMENDMENTS_CONFIG` of the network's syncer **and** api; the file must be mounted into both containers (a commented `volumes:` line in each shows how) |
+| `XRPL_ACCOUNT_ROLLUP_MIN_ROWS`, `XAHAU_ACCOUNT_ROLLUP_MIN_ROWS` | prod, dev | empty (= `1000000`) | `GH_ACCOUNT_ROLLUP_MIN_ROWS` of the network's syncer. Plain digits; empty is the default; `0` turns the `account_rollups` job off |
 | `GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD` | prod, dev | prod: `data_api` and **required**; dev: `default` and empty | The ClickHouse server's user (`CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`) and the login of every client |
 | `GH_API_KEYS` | prod, dev | prod: **required**; dev: `dev-api-key` | `GH_API_KEYS` of the apis |
 | `IMAGE_TAG` | prod, dev | prod `latest`, dev `dev` | tag of the locally built `gatehub/data-api` and `gatehub/data-syncer` images |
@@ -131,7 +133,7 @@ variable that is unset in the file is not passed on and the application's own de
 | Service | Variables it gets |
 | --- | --- |
 | `migrate-xrpl`, `migrate-xahau` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_NETWORK` |
-| `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG`, `GH_UNL_PUBLISHERS`, `GH_AMENDMENTS_CONFIG` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`, `GH_UNL_THRESHOLD`, `GH_UNL_REFRESH_MS`, `GH_DOMAIN_VERIFICATION`, `GH_DOMAIN_RECHECK_MS`, `GH_DOMAIN_FETCH_TIMEOUT_MS`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
+| `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG`, `GH_UNL_PUBLISHERS`, `GH_AMENDMENTS_CONFIG`, `GH_ACCOUNT_ROLLUP_MIN_ROWS` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`, `GH_UNL_THRESHOLD`, `GH_UNL_REFRESH_MS`, `GH_DOMAIN_VERIFICATION`, `GH_DOMAIN_RECHECK_MS`, `GH_DOMAIN_FETCH_TIMEOUT_MS`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
 | `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`, `GH_AMENDMENTS_CONFIG` (from `XRPL_AMENDMENTS_CONFIG` / `XAHAU_AMENDMENTS_CONFIG`); `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
 | `clickhouse` | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` (from `GH_CLICKHOUSE_USER` / `_PASSWORD`) |
 | `nginx` | `TRUSTED_PROXIES`, and the fixed `NGINX_ENVSUBST_*` of the template |
@@ -184,6 +186,7 @@ NGINX_BIND=<interface only the front proxy reaches>
 | Concern | Variables |
 | --- | --- |
 | Query cost and memory | `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `GH_CLICKHOUSE_MAX_QUERY_MEMORY`, `GH_CLICKHOUSE_MAX_CONNECTIONS` |
+| Account aggregates | `GH_ACCOUNT_ROLLUP_MIN_ROWS` (which accounts get rollups; the budgets and cadences of the aggregator jobs are constants, not settings) |
 | API CPU and latency | `GH_TX_CACHE_SIZE`, `GH_LIVE_CACHE_TTL_MS`, `GH_CACHE_CONTROL` |
 | Ingest speed | `GH_CATCHUP_CONCURRENCY` (live runner; `range-ingest --concurrency` for the CLI), `GH_CATCHUP_FLUSH_LEDGERS`, `GH_CATCHUP_FLUSH_TXS`, `GH_CATCHUP_FLUSH_MS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, the node you point at |
 | Abuse and exposure | `GH_API_KEYS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_CORS_ORIGINS`, `TRUSTED_PROXIES`, `NGINX_BIND` |

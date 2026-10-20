@@ -1,9 +1,15 @@
 import {
   AccountExchangesRow,
+  AccountLinesDailyRow,
+  AccountPartitionRowsRow,
   AccountPaymentsRow,
+  AccountRollupDaysRow,
+  AccountRollupStateRow,
   AccountsCreatedRow,
+  AccountTradesDailyRow,
   AccountTransactionsRow,
   AccountTxBySequenceRow,
+  AccountTxDailyRow,
   AggDirtyRow,
   AmendmentFeaturesRow,
   AmendmentTalliesRow,
@@ -13,7 +19,10 @@ import {
   IngestLogRow,
   LedgerByHashRow,
   LedgersRow,
+  MarketsLiveRow,
+  NativeRatesDailyRow,
   NetworkStateRow,
+  PairHourlyRow,
   PARSER_VERSION,
   PaymentsByCurrencyRow,
   PaymentsRow,
@@ -68,6 +77,15 @@ export interface TableRows {
   [Table.StatsHourly]: StatsHourlyRow;
   [Table.VolumeDaily]: VolumeDailyRow;
   [Table.VolumeLive]: VolumeLiveRow;
+  [Table.NativeRatesDaily]: NativeRatesDailyRow;
+  [Table.PairHourly]: PairHourlyRow;
+  [Table.MarketsLive]: MarketsLiveRow;
+  [Table.AccountRollupState]: AccountRollupStateRow;
+  [Table.AccountPartitionRows]: AccountPartitionRowsRow;
+  [Table.AccountRollupDays]: AccountRollupDaysRow;
+  [Table.AccountLinesDaily]: AccountLinesDailyRow;
+  [Table.AccountTxDaily]: AccountTxDailyRow;
+  [Table.AccountTradesDaily]: AccountTradesDailyRow;
   [Table.IngestLog]: IngestLogRow;
   [Table.AggDirty]: AggDirtyRow;
   [Table.SyncerLease]: SyncerLeaseRow;
@@ -83,6 +101,11 @@ const CLOSE_MS = 1_700_000_000.123;
  * written) and is partitioned by day, so its samples need a recent time that is far from a day boundary.
  */
 export const TODAY_NOON = Math.floor(Date.now() / 86_400_000) * 86_400 + 43_200;
+/**
+ * An hour boundary two hours before the middle of today: `pair_hourly` expires rows 45 days after their hour, so its
+ * sample needs a recent hour, or a background TTL merge could drop it mid-test.
+ */
+const RECENT_HOUR = TODAY_NOON - 7_200;
 /** A rippled 2.3.0 release as `encodeSoftwareVersion` packs it: above 2^53, so it is a string. */
 const SERVER_VERSION = '1745991492456939520';
 /** Wall-clock milliseconds, as the `version` of a version set. */
@@ -443,6 +466,142 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     converted_f: 500.25,
     config_version: 3,
     version: 1,
+  },
+  [Table.NativeRatesDaily]: {
+    currency: 'USD',
+    issuer: ISSUER,
+    day: '2023-11-14',
+    rate: '0.5',
+    rate_f: 0.5,
+    daily_count: 12,
+    latest_count: 5,
+    config_version: 3,
+    stale: 1,
+    version: VERSION_MS,
+  },
+  [Table.PairHourly]: {
+    hour: RECENT_HOUR,
+    base_currency: 'USD',
+    base_issuer: ISSUER,
+    counter_currency: 'EUR',
+    counter_issuer: BOB,
+    source: 'amm',
+    count: 12,
+    base_sum: '1000.5',
+    counter_sum: '525.25',
+    unfit: 2,
+    base_sum_f: 1000.5,
+    counter_sum_f: 525.25,
+    open_rate: '0.52',
+    open_ledger: LEDGER,
+    open_tx: 3,
+    open_node: 4,
+    open_time: RECENT_HOUR + 5,
+    close_rate: '0.53',
+    close_ledger: LEDGER + 10,
+    close_tx: 6,
+    close_node: 7,
+    close_time: RECENT_HOUR + 3_000,
+    high_rate: '0.55',
+    high_rate_f: 0.55,
+    high_ledger: LEDGER + 4,
+    high_tx: 8,
+    high_node: 9,
+    low_rate: '0.51',
+    low_rate_f: 0.51,
+    low_ledger: LEDGER + 2,
+    low_tx: 10,
+    low_node: 11,
+    is_final: 1,
+    config_version: 2,
+    through_time: RECENT_HOUR + 3_599,
+    version: VERSION_MS,
+  },
+  [Table.MarketsLive]: {
+    period: '7day',
+    amm: 'exclude',
+    base_currency: 'USD',
+    base_issuer: ISSUER,
+    counter_currency: 'EUR',
+    counter_issuer: BOB,
+    count: 12,
+    base_volume: '1000.5',
+    counter_volume: '525.25',
+    native_volume: '2001',
+    open: '0.52',
+    high: '0.55',
+    low: '0.51',
+    last: '0.53',
+    open_time: CLOSE - 86_400,
+    last_time: CLOSE,
+    closes: [null, '0.52', '0.53', '0.54', '0.52', '0.51', '0.53'],
+    amm_share: null,
+    amm_pool: null,
+    start_time: CLOSE - 7 * 86_400,
+    end_time: CLOSE,
+    pairs_traded: 9,
+    total_count: 120,
+    total_native_volume: '40020',
+    total_amm_share: null,
+    version: VERSION_MS,
+  },
+  [Table.AccountRollupState]: {
+    account: ALICE,
+    rows: 1_500_000,
+    first_day: '2020-03-05',
+    rolled_from: '2021-01-01',
+    rolled_through: '2023-11-13',
+    config_version: 1,
+    version: VERSION_MS,
+  },
+  [Table.AccountPartitionRows]: { partition: 8, account: ALICE, rows: 12_345, version: VERSION_MS },
+  [Table.AccountRollupDays]: { account: ALICE, day: '2023-11-14', version: VERSION_MS },
+  [Table.AccountLinesDaily]: {
+    account: ALICE,
+    day: '2023-11-14',
+    currency: 'USD',
+    counterparty: ISSUER,
+    change_type: 'payment_destination',
+    owes: 1,
+    count: 7,
+    in_sum: '100.5',
+    out_sum: '40.25',
+    unfit: 1,
+    in_sum_f: 100.5,
+    out_sum_f: 40.25,
+    end_balance: '-60.25',
+    version: VERSION_MS,
+  },
+  [Table.AccountTxDaily]: {
+    account: ALICE,
+    day: '2023-11-14',
+    tx_type: 'Payment',
+    result: 'tesSUCCESS',
+    count: 9,
+    version: VERSION_MS,
+  },
+  [Table.AccountTradesDaily]: {
+    account: ALICE,
+    day: '2023-11-14',
+    base_currency: 'USD',
+    base_issuer: ISSUER,
+    counter_currency: 'EUR',
+    counter_issuer: BOB,
+    count: 10,
+    base_sum: '1000.5',
+    counter_sum: '525.25',
+    bought_sum: '600.25',
+    sold_sum: '400.25',
+    bought_counter_sum: '315.125',
+    sold_counter_sum: '210.125',
+    unfit: 1,
+    base_sum_f: 1000.5,
+    counter_sum_f: 525.25,
+    bought_sum_f: 600.25,
+    sold_sum_f: 400.25,
+    bought_counter_sum_f: 315.125,
+    sold_counter_sum_f: 210.125,
+    version: VERSION_MS,
   },
   [Table.IngestLog]: { range_start: 100, range_end: 199, run_id: 'run-1', status: 'done', updated_at: CLOSE_MS },
   [Table.AggDirty]: { from_hour: 1_699_999_200, to_hour: 1_700_002_800, created_at: CLOSE_MS },

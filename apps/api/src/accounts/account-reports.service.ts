@@ -1,9 +1,11 @@
-import { ClickHouseService, exactAmount, NetworkProfile, RatesService, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, DailyRates, exactAmount, NetworkProfile, Table } from '@gatehub/data-api-shared';
 import { Inject, Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { NETWORK_PROFILE } from '../config/api.config';
+import { bucketStart, dayText, VolumeInterval } from '../network/volume-buckets';
 import {
   ratedAssets,
+  ratedDays,
   Report,
   ReportInput,
   StoredCounterparty,
@@ -12,14 +14,19 @@ import {
   StoredReportPayment,
   toReports,
 } from './account-report-object';
+import { bucketOfDaySql } from './analytics-window';
 
 const DAY_MS = 86_400_000;
 
 /** What `GET /v2/accounts/:address/reports` is asked for; the values are already validated. */
 export interface AccountReportsQuery {
   account: string;
-  /** The UTC days to report, `YYYY-MM-DD`, oldest first (`reportWindow`). */
+  /** The UTC days the reports are made of, `YYYY-MM-DD`, oldest first (`reportWindow`). */
   days: string[];
+  /** The start of each report, `YYYY-MM-DD`, oldest first: the days, or the buckets of the `interval` (`reportWindow`). */
+  buckets: string[];
+  /** The bucket of a report. */
+  interval: VolumeInterval;
   /** The counterparties themselves instead of their number. */
   accounts: boolean;
   /** The payments of each day. */
@@ -30,6 +37,13 @@ export interface AccountReportsQuery {
 const DAY = "toString(toDate(close_time, 'UTC'))";
 
 /**
+ * The start of the bucket of a payment, `YYYY-MM-DD`: for `day` the day itself, which is `DAY` to the letter. The
+ * counterparties are read by bucket, not added up from the days (one paid on two days of a week is one in it).
+ */
+const bucketOf = (interval: VolumeInterval): string =>
+  `toString(${bucketOfDaySql(interval, "toDate(close_time, 'UTC')")})`;
+
+/**
  * The side of a payment for the account. A payment to oneself has a row of each side (`sent` and `received`, two keys
  * of `account_payments` since R112, so a merge keeps both), and the original counted it once, as the sender's: it
  * tested `payment.account === payment.data.source` first, and only the rest was the receiver's side
@@ -37,7 +51,7 @@ const DAY = "toString(toDate(close_time, 'UTC'))";
  * whichever of them `LIMIT 1 BY` reads, and a payment to oneself is never in `payments_received` nor in
  * `sending_counterparties`.
  */
-const SIDE = "if(counterparty = account, 'sent', toString(direction))";
+export const SIDE = "if(counterparty = account, 'sent', toString(direction))";
 
 /**
  * The rows of the account in the ledgers `[min, max]`, each payment once. The tables are not collapsed before a merge
@@ -46,10 +60,14 @@ const SIDE = "if(counterparty = account, 'sent', toString(direction))";
  * `account_payments` (`account, ledger_index, tx_index, direction`), account included though it is fixed: ClickHouse then
  * reads the table in the order of its primary key and does not sort, as a suffix alone could make it read the whole
  * history of the account and sort it.
+ *
+ * `also` is a condition on the columns of the payment (code, never input), added to the key range: it must be true of both
+ * rows of a payment to oneself, or of neither (a condition on the counterparty or the asset is), or the payment would be
+ * read from the one row that is left. The params are `account`, `min` and `max`.
  */
-function read(columns: string): string {
+export function readPayments(columns: string, also?: string): string {
   return `SELECT ${columns} FROM ${Table.AccountPayments}
-           WHERE account = {account:String} AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
+           WHERE account = {account:String} AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}${also === undefined ? '' : ` AND ${also}`}
            ORDER BY account, ledger_index, tx_index, direction
            LIMIT 1 BY ledger_index, tx_index`;
 }
@@ -64,26 +82,33 @@ function read(columns: string): string {
  * currency (exact decimal sums, with the Float64 fallback of `decimal.ts`) and counts or lists the counterparties; only
  * those groups come back, not the payments, which are read only for `payments=true`.
  *
- * The value of an issued currency is its amount over the rate of its day (`RatesService.dailyNativeRates`, asked for
- * the issued currencies seen only). The original used the rate of the moment of each payment, which it asked HBase for
- * one by one; a rate per day is the same for every payment of the day, which is what lets ClickHouse add them up first.
- * It is the rate at the end of the day: the trades of the day, and the last trades of the 14 days before it.
+ * With an `interval` (`week` or `month`; `day` is as it always was) a report is a bucket: the groups stay per day, so that
+ * each day is valued at its own rate and `toReports` adds the days of a bucket up, and the counterparties are counted or
+ * listed over the bucket by the same queries, grouped by the start of the bucket.
+ *
+ * The value of an issued currency is its amount over the rate of its day (`DailyRates`, asked for the issued currencies
+ * seen, on the days they were paid on: the stored sets of the days that have one, the rest computed on read). The original
+ * used the rate of the moment of each payment, which it asked HBase for one by one; a rate per day is the same for every
+ * payment of the day, which is what lets ClickHouse add them up first. It is the rate at the end of the day: the trades of
+ * the day, and the last trades of the 14 days before it.
  */
 @Injectable()
 export class AccountReportsService {
   constructor(
     private readonly ch: ClickHouseService,
     private readonly ranges: LedgerRangeResolver,
-    private readonly rates: RatesService,
+    private readonly rates: DailyRates,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
   ) {}
 
-  /** The report of each day asked for, oldest first. */
+  /** The report of each bucket asked for (each day, with `day`), oldest first. */
   async reports(q: AccountReportsQuery): Promise<Report[]> {
     const input: ReportInput = {
       account: q.account,
       native: this.profile.nativeCurrency,
       days: q.days,
+      buckets: q.buckets,
+      bucketOf: (day) => dayText(bucketStart(Date.parse(`${day}T00:00:00Z`), q.interval)),
       groups: [],
       rates: new Map(),
       counterparties: q.accounts ? { list: [] } : { counts: [] },
@@ -99,12 +124,12 @@ export class AccountReportsService {
 
     const [groups, counterparties, payments] = await Promise.all([
       this.groups(params),
-      q.accounts ? this.counterpartyList(params) : this.counterpartyCounts(params),
+      q.accounts ? this.counterpartyList(params, q.interval) : this.counterpartyCounts(params, q.interval),
       q.payments ? this.payments(params) : undefined,
     ]);
 
     const assets = ratedAssets(groups, input.native);
-    const rates = assets.length > 0 ? await this.rates.dailyNativeRates(assets, from, toExclusive) : new Map();
+    const rates = assets.length > 0 ? await this.rates.rates(assets, ratedDays(groups, input.native)) : new Map();
     return toReports({
       ...input,
       groups,
@@ -126,27 +151,30 @@ export class AccountReportsService {
               toUInt32(countIf(delivered_exact IS NULL)) AS unfit,
               sumKahan(delivered_amount_f) AS amount_sum_f,
               max(delivered_amount_f) AS amount_max_f
-         FROM (${read(`${DAY} AS day, ${SIDE} AS dir, currency, issuer, delivered_amount_f, ${exactAmount('delivered_amount')} AS delivered_exact`)})
+         FROM (${readPayments(`${DAY} AS day, ${SIDE} AS dir, currency, issuer, delivered_amount_f, ${exactAmount('delivered_amount')} AS delivered_exact`)})
         GROUP BY day, dir, currency, issuer`,
       params,
     );
   }
 
-  /** How many different accounts the account paid and was paid by on each day. */
-  private counterpartyCounts(params: Record<string, unknown>): Promise<StoredCounterpartyCount[]> {
+  /** How many different accounts the account paid and was paid by in each bucket (`day` is its start). */
+  private counterpartyCounts(
+    params: Record<string, unknown>,
+    interval: VolumeInterval,
+  ): Promise<StoredCounterpartyCount[]> {
     return this.ch.query<StoredCounterpartyCount>(
       `SELECT day, dir, toUInt32(uniqExact(counterparty)) AS n
-         FROM (${read(`${DAY} AS day, ${SIDE} AS dir, counterparty`)})
+         FROM (${readPayments(`${bucketOf(interval)} AS day, ${SIDE} AS dir, counterparty`)})
         GROUP BY day, dir`,
       params,
     );
   }
 
-  /** The accounts it paid and was paid by on each day, each once, in the order of the first payment. */
-  private counterpartyList(params: Record<string, unknown>): Promise<StoredCounterparty[]> {
+  /** The accounts it paid and was paid by in each bucket, each once, in the order of the first payment in it. */
+  private counterpartyList(params: Record<string, unknown>, interval: VolumeInterval): Promise<StoredCounterparty[]> {
     return this.ch.query<StoredCounterparty>(
       `SELECT day, dir, counterparty
-         FROM (${read(`${DAY} AS day, ${SIDE} AS dir, counterparty, ledger_index, tx_index`)})
+         FROM (${readPayments(`${bucketOf(interval)} AS day, ${SIDE} AS dir, counterparty, ledger_index, tx_index`)})
         GROUP BY day, dir, counterparty
         ORDER BY day, dir, min(tuple(ledger_index, tx_index))`,
       params,
@@ -156,7 +184,7 @@ export class AccountReportsService {
   /** Every payment, in the order of the ledgers. */
   private payments(params: Record<string, unknown>): Promise<StoredReportPayment[]> {
     return this.ch.query<StoredReportPayment>(
-      read(`${DAY} AS day, tx_hash, delivered_amount AS amount, currency, issuer, ${SIDE} AS type`),
+      readPayments(`${DAY} AS day, tx_hash, delivered_amount AS amount, currency, issuer, ${SIDE} AS type`),
       params,
     );
   }

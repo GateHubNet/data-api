@@ -95,6 +95,8 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   [data-model](data-model.md#5-migrations).
 - `002_validators_amendments.sql` must be applied before the new syncer starts, and it has a deploy-order constraint with the AMM branch:
   [Rolling out the validators and amendments data](#rolling-out-the-validators-and-amendments-data).
+- `003_account_market_aggregates.sql` is additive (nine tables) and sets no order: the syncer fills them, the api is right without them and only slower
+  ([operations](operations.md#account-and-market-aggregates)). The migrate job applies pending files in file-name order, so a database that lacks `002` gets it first.
 
 ## Configuration and secrets
 

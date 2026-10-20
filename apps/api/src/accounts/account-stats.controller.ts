@@ -11,6 +11,7 @@ import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { TransactionStats, ValueStats } from './account-stats-object';
 import { statsWindow } from './account-stats-window';
 import { AccountStatsService } from './account-stats.service';
+import { ANALYTICS_INTERVALS, intervalParam } from './analytics-window';
 
 /** The families of `accountStats.js`: `transactions` and `value`. */
 const FAMILIES = ['transactions', 'value'];
@@ -49,7 +50,13 @@ export class AccountStatsController {
       '`{date, account_value, balance_change_count}`, what the account held at the end of the day in the native ' +
       'currency (the native balance, plus each issued currency it holds at the rate of the day, as a string; what the ' +
       'account owes is not counted) and how many times its balances changed that day, not counting the fee. ' +
-      '`format=csv` gives the rows as a CSV file.',
+      '`format=csv` gives the rows as a CSV file. With `interval` (`day`, `week` from Monday or `month`) the rows are ' +
+      'buckets instead of days, `date` being the start of the bucket: a bucket is a row when its start is at or after ' +
+      '`start` and before `end`. `transactions` has a row for each bucket in which the account sent a transaction, with ' +
+      'the counts of the whole bucket. `value` has a row for every bucket from the first one in which the account had a ' +
+      'balance to the last before `end`, active or not, but none that has not begun (the rows stop at the bucket that holds ' +
+      'now, whatever `end` says): its value at the end of the last day of the bucket (today, for the current one) and the ' +
+      'number of balance changes in it (0 for a quiet bucket).',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
   @ApiParam({ name: 'family', enum: FAMILIES, description: 'What to count: `transactions` or `value`.' })
@@ -63,7 +70,13 @@ export class AccountStatsController {
     required: false,
     description: 'Where the days stop, exclusive: `end=2015-01-16` is the days before it. Default: now.',
   })
-  @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest day first.' })
+  @ApiQuery({
+    name: 'interval',
+    required: false,
+    enum: ANALYTICS_INTERVALS,
+    description: 'Rows per day, week (from Monday) or month, UTC. Without it: a row per active day.',
+  })
+  @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest day or bucket first.' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
   @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
@@ -74,9 +87,12 @@ export class AccountStatsController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<AccountStatsBody> {
-    // the checks come in the order of the original: start, end, then the family (the marker is checked where it is used)
-    const window = statsWindow(query, Date.now());
+    // the checks come in the order of the original: start, end, then the family; `interval` is ours and comes next (the
+    // marker is checked where it is used)
+    const now = Date.now();
+    const window = statsWindow(query, now);
     if (!FAMILIES.includes(family)) throw badRequest('invalid family');
+    const interval = intervalParam(query);
 
     const q = {
       account: address,
@@ -84,6 +100,8 @@ export class AccountStatsController {
       descending: bool(query, 'descending'),
       limit: limitParam(query, { def: 200, max: 1000 }),
       marker: first(query, 'marker'),
+      ...(interval !== undefined && { interval }),
+      now,
     };
     const page = family === 'transactions' ? await this.stats.transactions(q) : await this.stats.value(q);
 

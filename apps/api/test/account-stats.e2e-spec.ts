@@ -208,7 +208,11 @@ describe('account stats API endpoint', () => {
   const pages = <R>(p: string, limit: number): Promise<Body<R>[]> => api.pages<Body<R>>(p, limit, 'rows');
 
   beforeAll(async () => {
-    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    h = await startHarness({
+      seed: 'ripple-mock',
+      env: NO_RATE_LIMIT,
+      controllers: async () => (await import('./cache-controllers')).CACHE_CONTROLLERS,
+    });
     api = await h.api();
     get = api.get;
   });
@@ -216,6 +220,10 @@ describe('account stats API endpoint', () => {
     await h?.close();
   });
   afterEach(() => jest.restoreAllMocks());
+  // the rates computed on read are kept for a minute: a test that counts the reads of the trades starts without them
+  beforeEach(async () => {
+    await api.ok('/v2/test-cache/clear', 'result');
+  });
 
   /** The queries the harness's ClickHouse service ran while `fn` ran. */
   async function queriesOf(fn: () => Promise<unknown>): Promise<{ sql: string; params: Record<string, unknown> }[]> {
@@ -788,7 +796,7 @@ describe('account stats API endpoint', () => {
     it('unknown params ignored', async () => {
       for (const family of FAMILIES) {
         const plain = await get(`${path(TRADER, family)}?limit=5`);
-        const res = await get(`${path(TRADER, family)}?limit=5&foo=bar&interval=day&reduce=true&autobridged=true`);
+        const res = await get(`${path(TRADER, family)}?limit=5&foo=bar&granularity=day&reduce=true&autobridged=true`);
         expect(res.status).toBe(200);
         expect(res.body).toEqual(plain.body);
       }
@@ -1393,7 +1401,11 @@ describe('account stats computed from synthetic ledgers', () => {
   const A_VALUE_URL = path(A, 'value');
 
   beforeAll(async () => {
-    h = await startHarness({ seed: 'none', env: NO_RATE_LIMIT });
+    h = await startHarness({
+      seed: 'none',
+      env: NO_RATE_LIMIT,
+      controllers: async () => (await import('./cache-controllers')).CACHE_CONTROLLERS,
+    });
     api = await h.api();
     get = api.get;
 
@@ -1501,6 +1513,9 @@ describe('account stats computed from synthetic ledgers', () => {
     await h?.close();
   });
   afterEach(() => jest.restoreAllMocks());
+  beforeEach(async () => {
+    await api.ok('/v2/test-cache/clear', 'result');
+  });
 
   describe('stats/transactions', () => {
     it('is a row for each UTC day the account sent a transaction, with the counts of its results and types', async () => {
@@ -1710,12 +1725,20 @@ describe('account stats on Xahau (XAH is the native currency)', () => {
   let get: ApiClient['get'];
 
   beforeAll(async () => {
-    h = await startHarness({ network: 'xahau', seed, env: NO_RATE_LIMIT });
+    h = await startHarness({
+      network: 'xahau',
+      seed,
+      env: NO_RATE_LIMIT,
+      controllers: async () => (await import('./cache-controllers')).CACHE_CONTROLLERS,
+    });
     api = await h.api();
     get = api.get;
   });
   afterAll(async () => {
     await h?.close();
+  });
+  beforeEach(async () => {
+    await api.ok('/v2/test-cache/clear', 'result');
   });
 
   it('the recorded ledgers have no trades, so an issued currency has no rate: the value is the XAH an account holds', () => {

@@ -58,6 +58,8 @@ const rates = (entries: Record<string, Record<string, string>>): ReportRates =>
 const build = (
   input: {
     days?: string[];
+    buckets?: string[];
+    bucketOf?: (day: string) => string;
     groups?: StoredReportGroup[];
     rates?: ReportRates;
     native?: string;
@@ -71,6 +73,8 @@ const build = (
       account: ACCOUNT,
       native: input.native ?? 'XRP',
       days: input.days ?? ['2015-01-14'],
+      ...(input.buckets && { buckets: input.buckets }),
+      ...(input.bucketOf && { bucketOf: input.bucketOf }),
       groups: input.groups ?? [],
       rates: input.rates ?? new Map(),
       counterparties: { counts: input.counts, list: input.list },
@@ -365,6 +369,126 @@ describe('toReports', () => {
     const [r] = build({ counts, groups: [group('2015-01-14', 'sent', 'XRP', '', 1, '1', '1')] });
     expect(r.payments_sent).toBe(1);
     // (the build above froze every input deeply: an assignment to one would have thrown)
+  });
+});
+
+describe('toReports with buckets', () => {
+  // the week of Monday 2020-01-13 and the one after; a bucket is named by its Monday
+  const weekOf = (day: string): string => (day < '2020-01-20' ? '2020-01-13' : '2020-01-20');
+  const days = ['2020-01-13', '2020-01-14', '2020-01-15', '2020-01-20', '2020-01-21'];
+  const buckets = ['2020-01-13', '2020-01-20', '2020-01-27'];
+  const weeks = (input: Parameters<typeof build>[0] = {}) => build({ days, buckets, bucketOf: weekOf, ...input });
+
+  it('is a report for each bucket, dated at its start, with the keys of a report and zeros for a bucket without days', () => {
+    const reports = weeks();
+    expect(reports.map((r) => r.date)).toEqual([
+      '2020-01-13T00:00:00Z',
+      '2020-01-20T00:00:00Z',
+      '2020-01-27T00:00:00Z',
+    ]);
+    expect(reports[2]).toEqual({
+      account: ACCOUNT,
+      date: '2020-01-27T00:00:00Z',
+      high_value_received: '0',
+      high_value_sent: '0',
+      total_value_received: '0',
+      total_value_sent: '0',
+      total_value: '0',
+      payments_sent: 0,
+      payments_received: 0,
+      receiving_counterparties: 0,
+      sending_counterparties: 0,
+    });
+    expect(Object.keys(reports[0])).toEqual(Object.keys(build()[0]));
+  });
+
+  it('adds up the values of its days, each payment at the rate of its day: the quotients, not the quotient of the sums', () => {
+    const [first, second] = weeks({
+      groups: [
+        group('2020-01-13', 'sent', 'CNY', KIC, 1, '30', '30'),
+        group('2020-01-14', 'sent', 'CNY', KIC, 2, '60', '40'),
+        group('2020-01-15', 'sent', 'XRP', '', 1, '4', '4'),
+        group('2020-01-20', 'received', 'CNY', KIC, 1, '30', '30'),
+      ],
+      rates: rates({ [`CNY.${KIC}`]: { '2020-01-13': '2', '2020-01-14': '6', '2020-01-15': '1', '2020-01-20': '3' } }),
+    });
+    // 30 / 2 + 60 / 6 + 4 = 29; the quotient of the sums of the CNY would be 90 / 2 = 45 or 90 / 6 = 15
+    expect(first).toMatchObject({
+      total_value_sent: '29',
+      total_value_received: '0',
+      total_value: '29',
+      payments_sent: 4,
+    });
+    expect(second).toMatchObject({
+      total_value_sent: '0',
+      total_value_received: '10',
+      total_value: '10',
+      payments_received: 1,
+    });
+  });
+
+  it('takes the largest of the highs of its days, at their own rates', () => {
+    const [first] = weeks({
+      groups: [
+        group('2020-01-13', 'sent', 'CNY', KIC, 1, '30', '30'),
+        group('2020-01-14', 'sent', 'CNY', KIC, 2, '60', '40'),
+        group('2020-01-15', 'sent', 'XRP', '', 1, '12', '12'),
+        group('2020-01-13', 'received', 'XRP', '', 2, '5', '3'),
+        group('2020-01-15', 'received', 'XRP', '', 1, '4', '4'),
+      ],
+      rates: rates({ [`CNY.${KIC}`]: { '2020-01-13': '2', '2020-01-14': '5' } }),
+    });
+    // sent: 30 / 2 = 15, 40 / 5 = 8, 12: the largest is 15
+    expect([first.high_value_sent, first.high_value_received]).toEqual(['15', '4']);
+  });
+
+  it('sums the counts of the payments of its days', () => {
+    const [first, second] = weeks({
+      groups: [
+        group('2020-01-13', 'sent', 'XRP', '', 3, '3', '1'),
+        group('2020-01-15', 'sent', 'XRP', '', 2, '2', '1'),
+        group('2020-01-15', 'received', 'XRP', '', 4, '4', '1'),
+        group('2020-01-21', 'received', 'XRP', '', 1, '1', '1'),
+      ],
+    });
+    expect([first.payments_sent, first.payments_received]).toEqual([5, 4]);
+    expect([second.payments_sent, second.payments_received]).toEqual([0, 1]);
+  });
+
+  it('takes the counterparties as they are given for the bucket, counted or listed, and does not add them up', () => {
+    const [first, second] = weeks({
+      groups: [
+        group('2020-01-13', 'sent', 'XRP', '', 1, '1', '1'),
+        group('2020-01-15', 'sent', 'XRP', '', 1, '1', '1'),
+      ],
+      // one account paid on two days is one in the week: the query counted it once, under the bucket
+      counts: [
+        { day: '2020-01-13', dir: 'sent', n: 1 },
+        { day: '2020-01-20', dir: 'received', n: 2 },
+      ],
+    });
+    expect([first.receiving_counterparties, first.sending_counterparties]).toEqual([1, 0]);
+    expect([second.receiving_counterparties, second.sending_counterparties]).toEqual([0, 2]);
+
+    const listed = weeks({
+      list: [
+        { day: '2020-01-13', dir: 'sent', counterparty: 'rB' },
+        { day: '2020-01-13', dir: 'sent', counterparty: 'rA' },
+        { day: '2020-01-20', dir: 'sent', counterparty: 'rA' },
+      ],
+    });
+    expect(listed.map((r) => r.receiving_counterparties)).toEqual([['rB', 'rA'], ['rA'], []]);
+  });
+
+  it('is the days when there are no buckets, and a day is its own bucket when there is no bucketOf', () => {
+    const groups = [group('2020-01-13', 'sent', 'XRP', '', 1, '1', '1')];
+    expect(build({ days: ['2020-01-13', '2020-01-14'], groups }).map((r) => r.date)).toEqual([
+      '2020-01-13T00:00:00Z',
+      '2020-01-14T00:00:00Z',
+    ]);
+    expect(build({ days: ['2020-01-13', '2020-01-14'], buckets: ['2020-01-14'], groups })).toEqual([
+      expect.objectContaining({ date: '2020-01-14T00:00:00Z', payments_sent: 0 }),
+    ]);
   });
 });
 

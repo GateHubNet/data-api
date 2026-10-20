@@ -56,8 +56,8 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
   `clickhouse.config.ts`, `migrate.ts`, `tables.ts` (the `Table` enum), `rows.ts` (row types).
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
   `FixtureLedgerSource`, `raw-ledger.ts`.
-- `src/xrpl/node-client.ts`, `src/query/` (rates, decimals), `src/aggregate/` (stats and volume jobs), `src/util/`.
-- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
+- `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, and account and market jobs), `src/util/`.
+- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
 - `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
 Everything the apps use is re-exported from `packages/shared/src/index.ts`: **export what you add there.**
@@ -200,7 +200,7 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `002_validators_amendments.sql`;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `003_account_market_aggregates.sql`;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.
@@ -242,7 +242,7 @@ Jest with `ts-jest`, in three layers.
   commit, a gap that is filled, `validated:false` retried, a `parent_hash` mismatch that halts, a WS close with a refused reconnect, a
   range-ingest intent that is redone, the aggregator run twice. They use a synthetic contiguous chain built from a mock ledger.
 - **Shared e2e tests** (`packages/shared/test`): migrations, the writer, `buildLedgerRows` against real data, rates, the stats and
-  volume jobs.
+  volume jobs, the account and market jobs and the day-group and daily-rate reads.
 
 ```bash
 # Docker must be running

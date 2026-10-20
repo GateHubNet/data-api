@@ -14,7 +14,7 @@ shared library. This page explains the moving parts; the reasons for the big cho
  │ syncer (apps/syncer) — ONE per network                            │
  │   ingest ─ LiveRunner (live + catch-up)   range-ingest CLI        │
  │   validations ─ collector      fee_stats ─ poller                 │
- │   aggregator ─ stats_hourly, volume_live, volume_daily            │
+ │   aggregator ─ stats, volumes, rates, markets, account rollups    │
  │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
  └──────────────────────────────┬────────────────────────────────────┘
                                 │ bulk inserts (ledger tables: children first, `ledgers` row = commit)
@@ -49,8 +49,10 @@ Everything both services need, written once:
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
 - **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
-- **`query/`**: `RatesService` (exchange rates, vwap, used by the API *and* the aggregator) and amount/decimal helpers.
-- **`aggregate/`**: the `stats_hourly` and volume jobs the aggregator runs.
+- **`query/`**: `RatesService` (exchange rates, vwap, used by the API *and* the aggregator), the daily-rate and account day-group reads of the
+  account and market aggregates, and amount/decimal helpers.
+- **`aggregate/`**: the `stats_hourly` and volume jobs the aggregator runs, and the jobs of the account and market aggregates (`rates_daily`, `pair_hourly`,
+  `markets_live`, `account_rollups`).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
@@ -73,14 +75,14 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   the Ripple object, binary codec with the node's definitions, an LRU of serialized forms), `XrplService` (the shared `NodeClient` with
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
-- **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts`, `active-accounts`, `network`, `validations`,
+- **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `validations`,
   `validators` with the amendments routes, `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
 ### ClickHouse
 
-One server, one database per network, 33 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network, 42 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 
@@ -94,8 +96,9 @@ views. See [clickhouse](clickhouse.md).
 3. `LedgerWriter` inserts every child table in parallel, then `ledger_by_hash`, then `ledgers` (the atomic commit), synchronously, with
    dedup tokens.
 4. Workers on the side: validations stream -> `validations`/`validator_manifests` (and `validator_validations`, `validator_seen`); `fee` every 5 s
-   -> `fee_stats`; the aggregator rolls `ledgers` into `stats_hourly` and computes `volume_*` from `exchanges`/`payments` and rates; the
-   `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
+   -> `fee_stats`; the aggregator rolls `ledgers` into `stats_hourly`, computes `volume_*` from `exchanges`/`payments` and rates, and keeps the account and market
+   aggregates (daily native rates, `pair_hourly` and `markets_live` from `exchanges`, rollups of heavy accounts from `balance_changes`,
+   `account_transactions` and `account_exchanges`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
    rounds and the hourly agreement from `validations` and `ledgers`.
 5. Crashes recover from the database alone: re-read the checkpoint, delete the uncommitted tail, carry on
    ([syncer](syncer.md#checkpoint-boot-and-recovery)).
@@ -123,6 +126,7 @@ views. See [clickhouse](clickhouse.md).
 | One deployment per network | [0009](adr/0009-one-deployment-per-network.md) |
 | Ripple v2 wire compatibility and every deliberate deviation | [0010](adr/0010-ripple-v2-wire-compatibility.md) |
 | Validators and amendments data: a worker of its own, agreement over the indexed chain, the safe fetcher, migration 002 | [0012](adr/0012-validators-and-amendments-data.md) |
+| Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats, migration 003 | [0013](adr/0013-account-and-market-aggregates.md) |
 | CTID dedup (superseded by the commit marker and dedup tokens) | [0002](adr/0002-ctid-idempotent-ingest.md) |
 
 ## Cross-cutting concerns

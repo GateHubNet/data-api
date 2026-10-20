@@ -3,7 +3,7 @@
 A drop-in replacement for the **Ripple Data API v2** (`data.ripple.com`, the `rippled-historical-database` project) for the **XRP Ledger**
 and for **Xahau**. It indexes a network's validated ledgers into ClickHouse (the *syncer*) and serves the Ripple v2 endpoints over REST
 (the *api*): ledgers, transactions, payments, exchanges and candles, rates, accounts (history, balances, orders, reports, stats), active
-accounts, network fees and volumes, validations, validators and amendments, and stats. Paths, parameters, defaults, error messages and the shape and key order of the
+accounts, network fees, volumes and markets, validations, validators and amendments, and stats. Paths, parameters, defaults, error messages and the shape and key order of the
 answers match what `data.ripple.com` served, so a client of the original works by changing its host and sending an API key. The deliberate
 differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.md).
 
@@ -40,7 +40,7 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123
 cp apps/syncer/.env.example apps/syncer/.env
 cp apps/api/.env.example    apps/api/.env  # GH_NETWORK=xrpl by default; GH_API_KEYS empty = no authentication (development only)
 
-pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline, 002_validators_amendments)
+pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline, 002_validators_amendments, 003_account_market_aggregates)
 
 pnpm start:syncer                          # ingests the XRP Ledger from the validated head  (probe on :3002)
 pnpm start:api                             # serves /v2/* on :3001, Swagger at /internal/docs
@@ -104,9 +104,9 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Payments | `/v2/payments[/{currency}]` |
 | Exchanges | `/v2/exchanges/{base}/{counter}` (raw, `interval` candles, `reduce`), `/v2/exchanges` (all pairs, extra) |
 | Rates | `/v2/exchange_rates/{base}/{counter}`, `/v2/normalize` |
-| Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]`, `.../stats/{transactions\|value}` |
+| Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]` (`interval`), `.../stats/{transactions\|value}` (`interval`), `.../analytics/{balances\|balance_changes\|counterparties\|exchanges}` (extra) |
 | Markets | `/v2/active_accounts/{base}/{counter}` |
-| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume` |
+| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra) |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
 | Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |

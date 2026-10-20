@@ -223,6 +223,8 @@ services:
       GH_UNL_PUBLISHERS: ${XRPL_UNL_PUBLISHERS:-https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1}
       # Empty = the config/amendments/xrpl.json that ships in the image. Another file must be mounted into the syncer and the api.
       GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
+      # Balance changes from which an account is heavy and gets rollups; empty = 1000000, 0 turns the account_rollups job off.
+      GH_ACCOUNT_ROLLUP_MIN_ROWS: ${XRPL_ACCOUNT_ROLLUP_MIN_ROWS:-}
     # volumes:
     #   - ./deploy/markets-xrpl.json:/etc/gatehub/markets.json:ro # and XRPL_MARKETS_CONFIG=/etc/gatehub/markets.json
     #   - ./deploy/amendments-xrpl.json:/etc/gatehub/amendments.json:ro # and XRPL_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
@@ -272,6 +274,8 @@ services:
       GH_UNL_PUBLISHERS: ${XAHAU_UNL_PUBLISHERS:-https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8}
       # Empty = the config/amendments/xahau.json that ships in the image. Another file must be mounted into the syncer and the api.
       GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
+      # Balance changes from which an account is heavy and gets rollups; empty = 1000000, 0 turns the account_rollups job off.
+      GH_ACCOUNT_ROLLUP_MIN_ROWS: ${XAHAU_ACCOUNT_ROLLUP_MIN_ROWS:-}
     # volumes:
     #   - ./deploy/markets-xahau.json:/etc/gatehub/markets.json:ro # and XAHAU_MARKETS_CONFIG=/etc/gatehub/markets.json
     #   - ./deploy/amendments-xahau.json:/etc/gatehub/amendments.json:ro # and XAHAU_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json

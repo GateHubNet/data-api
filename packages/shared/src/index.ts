@@ -38,14 +38,23 @@ export * from './ingest/ledger-writer';
 export * from './ingest/raw-ledger';
 
 // Aggregates
+export * from './aggregate/account-rollups.job';
+export * from './aggregate/aggregate-sets';
+export * from './aggregate/markets-live.job';
+export * from './aggregate/pair-hourly.job';
+export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
 export * from './aggregate/volume.job';
 
 // Query
+export * from './query/account-day-groups';
 export * from './query/asset';
+export * from './query/candle-columns';
+export * from './query/daily-rates';
 export * from './query/decimal';
 export * from './query/distinct-page';
 export * from './query/rates.service';
+export * from './query/valuation';
 
 // Utils
 export * from './util/amount';

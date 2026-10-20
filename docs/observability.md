@@ -98,6 +98,8 @@ Prefix `api_`; one `prom-client` registry per process.
 | `api_http_request_duration_seconds` | Histogram | `method, route, status` | Duration; buckets 0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5, 5 s |
 | `api_node_rate_limited_total` | Counter | `endpoint` | Pauses a node asked for with a rate-limit answer; while every endpoint is paused `/balances` and `/orders` fail at once (500) |
 | `api_tx_encode_fallback_total` | Counter | `mode` (`json` / `binary`) | Transactions served as their stored JSON because the binary codec could not serialize them (a type or field missing from the definitions). Should be 0 |
+| `api_rates_on_read_total` | Counter | | Asset-days valued with `dailyNativeRates` because `native_rates_daily` had no valid set for the day (today, yesterday until it is final, and every day of a deployment still back-filling the rates). Each valuation call adds the number of asset-days it computed; a rate kept in the 60 s cache is not computed, nor counted, again. It falls to a few a minute once `syncer_rates_daily_missing_days` is 0 |
+| `api_account_day_groups_total` | Counter | `source` (`raw` / `rollup`) | Day-group reads of the account aggregates by the source they used: one count per source per read, so a read that serves the days a heavy account's rollups cover and the days after them counts both. `rollup` should follow the heavy accounts' traffic; a heavy account that only ever counts `raw` has no coverage yet (`syncer_account_rollups_pending_accounts`) |
 | `api_process_*`, `api_nodejs_*` | | | Default process metrics (CPU, memory, event-loop lag, GC, handles) |
 
 The `route` label is the Express route **pattern** (`/v2/accounts/:address/transactions`), never the concrete URL, so the series count
@@ -130,9 +132,14 @@ Prefix `syncer_`.
 | `syncer_validations_dropped_total` | Counter | `reason` | Validations not kept (`buffer_full`, `no_reporter`, `manifest_no_reporter`, `invalid`, `shutdown`) |
 | `syncer_fee_stats_samples_total` | Counter | | Fee snapshots written |
 | `syncer_fee_stats_errors_total` | Counter | | Snapshots that failed (node silent, ClickHouse refused) |
-| `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `stats_live`, `stats_dirty`, `volume_backfill`) |
-| `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices) that failed; each is retried on the next tick |
+| `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `rates_daily`, `account_rollups`, `volume_backfill`) |
+| `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices) that failed; each is retried on the next tick. The four account and market jobs count under their own names; a failing `agg_dirty` hook counts as `rates_daily_dirty`, `pair_hourly_dirty` or `account_rollups_dirty` and fails its `stats_dirty` slice |
 | **`syncer_aggregator_stats_lag_seconds`** | Gauge | | Seconds of ledger history the stats catch-up still has to cover; 0 when the stats are up to the last two hours |
+| **`syncer_rates_daily_missing_days`** | Gauge | | Closed final days without a valid rates set, from the first native trade to the newest final day. 0 once the back-fill is done, and normally 0 after it: the day that has just become final (an hour after its end) is the first the next run computes |
+| **`syncer_pair_hourly_missing_hours`** | Gauge | | Hours of the last 31 days without a set of the current config version. 0 once the back-fill is done |
+| **`syncer_markets_live_age_seconds`** | Gauge | `period` (`day`, `7day`, `30day`) | Now minus the `end_time` of the newest `include` set of the period. The `day` set is rewritten every minute (under about 120 s), the others every five minutes. A period that never had a set has no series |
+| `syncer_account_rollups_heavy_accounts` | Gauge | | Heavy accounts (those with `GH_ACCOUNT_ROLLUP_MIN_ROWS` balance changes or more) |
+| **`syncer_account_rollups_pending_accounts`** | Gauge | | Heavy accounts whose coverage does not yet reach from `first_day` to the newest final day. 0 once the promotion is done |
 | `syncer_validators_unl_fetches_total` | Counter | `publisher, outcome` | Validator list fetches: `ok`, `unchanged`, or the reason code of the failure |
 | **`syncer_validators_unl_expiry_seconds`** | Gauge | `publisher` | Seconds until the current list of a publisher expires (negative when it expired) |
 | `syncer_validators_unl_size` | Gauge | `publisher` | Validators on the current list of a publisher |
@@ -158,6 +165,12 @@ rate(syncer_head_ledger[5m])                                        # ledgers/s 
 rate(syncer_checkpoint_ledger[5m])                                  # ingest throughput while catching up
 rate(syncer_aggregator_errors_total[15m]) > 0
 syncer_aggregator_stats_lag_seconds > 3600
+syncer_markets_live_age_seconds{period="day"} > 600                 # the Markets table is stale
+syncer_pair_hourly_missing_hours > 0                                # an hour of the last 31 days has no set
+syncer_rates_daily_missing_days > 2                                 # the daily rates are not being written (after the back-fill)
+syncer_account_rollups_pending_accounts > 0                         # a heavy account is not covered yet
+sum by (source) (rate(api_account_day_groups_total[5m]))            # raw vs rollup reads of the account aggregates
+rate(api_rates_on_read_total[5m])                                   # rates worked out on read: high while rates_daily back-fills
 rate(syncer_validations_flushed_total[5m]) == 0                     # XRPL: validators validate every ledger
 syncer_validators_unl_expiry_seconds < 7 * 86400                    # a validator list expires within a week
 rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0        # a rounds or agreement run failed
@@ -170,7 +183,7 @@ The gauges describe what *this process* has done since boot: scrape each network
 Both services log through the NestJS `Logger` via the toolbox logger (stdout/stderr; capture it with your container log pipeline).
 There are **no `GH_LOGGER_*` variables**: the toolbox logger decides the format (colour is switched off outside dev/test). Contexts to
 grep for: `Syncer` (boot line with network, workers and node hosts), `NodeClient` (connects, reconnects, silence), `LiveRunner`
-(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService`, `Api` (boot line with
+(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService` (also the log of the four account and market jobs: `Rates back-fill ...`, `Pair-hourly back-fill ...`, `Account-rollups back-fill ...`, `Markets set of period ... not written`, and the shared `reached its budget` warning), `Api` (boot line with
 network and native currency), `RippleRoute` / `RippleError` (the cause of every 5xx, with the stack; the response body never carries
 it), `ApiKeyGuard`.
 
@@ -202,6 +215,9 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | **Syncer halted / down** | probe 503 with `state=halted`, `increase(syncer_ingest_halts_total[5m]) > 0`, or `up{job="syncer"} == 0` | Chain break, a ledger the parser rejects, lost lease, or process down |
 | Aggregator failing | `rate(syncer_aggregator_errors_total[15m]) > 0` for 30m | Stats or volumes not refreshing |
 | Aggregator far behind | `syncer_aggregator_stats_lag_seconds > 3600` for 1h | Sweep slower than the data |
+| **Markets stale** | `syncer_markets_live_age_seconds{period="day"} > 600` for 10m | The `markets_live` job has not written the `day` set for over ten minutes (it writes one a minute): `/v2/network/markets` serves an old set, and the explorer's Markets page with it. Look for `Markets set of period day not written` (a gap in `pair_hourly`) and for errors of the `markets_live` and `pair_hourly` jobs |
+| **Hours of pair statistics missing** | `syncer_pair_hourly_missing_hours > 0` for 30m | An hour of the last 31 days has no set of the current config version, so a Markets set that needs it is not written. The live hours are recomputed every tick; a gap that stays is a failing hour (see the `pair_hourly` errors, which wait 5 minutes and then more) |
+| **Daily rates not written** | `syncer_rates_daily_missing_days > 2` for 6h, **once the back-fill has finished** | The `rates_daily` job is not writing the daily sets (normally the gauge is 0: the day that has just become final is computed by the next run, so more than two days pending for hours are days that cannot be computed). Alert only after the first back-fill: on a fresh deployment the gauge is the size of the history and falls over about a day. Until the sets exist the API values on read: right, and slow |
 | **Validator list expiring** | `syncer_validators_unl_expiry_seconds < 7 * 86400` | A publisher's list expires within a week (it already has when the value is negative; an expired list is still used, flagged `expired`): check the publisher |
 | Validator agreement behind | `syncer_validators_agreement_lag_seconds > 7200` for 30m | The agreement job has not finalised an hour for over two hours |
 | Voting rounds behind | `syncer_validators_rounds_lag_ledgers > 1024` for 30m | The rounds job is more than four flag intervals behind the committed ledgers |
@@ -222,6 +238,9 @@ A range ingest bulk-loads ClickHouse hard ([backfill](backfill.md)). Watch both 
   <db>.ledgers`. The CLI is a separate process and has no metrics endpoint; the live syncer's gauges describe the live runner only.
 - **Aggregator:** `SELECT count() FROM <db>.agg_dirty` shrinks as the aggregator digests the new hours;
   `syncer_aggregator_stats_lag_seconds`.
+- **Account and market aggregates:** `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days` and `syncer_account_rollups_pending_accounts` show the
+  back-fills of a fresh deployment (and what a re-ingest re-marks: rate days and heavy accounts' days are recomputed as `agg_dirty` drains, its hours of the last 31 days at once); see
+  [operations](operations.md#account-and-market-aggregates).
 - **ClickHouse:** parts per partition and merge activity (`system.merges`): if parts pile up faster than merges drain them you risk
   `too many parts`; lower `--concurrency`. Memory and disk: bulk loads are the likeliest time to hit the memory limit or fill the volume.
 

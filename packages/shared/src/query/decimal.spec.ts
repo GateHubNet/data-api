@@ -53,6 +53,26 @@ describe('exactAmount', () => {
   });
 });
 
+describe('exactAmount of a column without a float shadow', () => {
+  it('reads amount_change with the float of its own text as the shadow, below 1e36 either way round', () => {
+    const sql = exactAmount('amount_change');
+    expect(sql).toContain('abs(toFloat64OrZero(amount_change)) < 1e36');
+    expect(sql).toContain(`toDecimal256OrNull(amount_change, ${EXACT_SCALE})`);
+    expect(sql).toContain(`<= ${EXACT_SCALE}`);
+    expect(sql).not.toContain('amount_change_f');
+  });
+
+  it('leaves the columns that have a shadow as they were', () => {
+    const literal = (column: string): string =>
+      `if(toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.'))) - ` +
+      `toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', '')) <= 30 AND ${column}_f < 1e36, ` +
+      `toDecimal256OrNull(${column}, 30), NULL)`;
+    expect(exactAmount('base_amount')).toBe(literal('base_amount'));
+    expect(exactAmount('counter_amount')).toBe(literal('counter_amount'));
+    expect(exactAmount('delivered_amount')).toBe(literal('delivered_amount'));
+  });
+});
+
 describe('volumeColumns', () => {
   it('sums every row of the source', () => {
     const sql = volumeColumns();

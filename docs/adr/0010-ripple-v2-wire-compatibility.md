@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended 2026-10-19: the validators routes (see the amendment at the end and [ADR-0012](0012-validators-and-amendments-data.md)).
+**Status:** Accepted. Amended twice, both on 2026-10-19: Amendment 1, by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2, by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10f).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -55,6 +55,19 @@ below. Where a ruling made during implementation changed served behaviour it is 
    3day, 7day, 30day` (trades) are. The historical mode (`start`/`end`/`interval=day|week|month`) of the develop branch is implemented.
 10. **Data dropped:** the offers, issuers, escrows and paychannels tables and parsers. Escrow and payment-channel *typing* stays in `balance_changes`.
     `accounts_created.genesis_*` stays empty until a history import loads ledger 32570.
+
+**Amendment 2 (2026-10-19), added by the account and market aggregates ([ADR-0013](0013-account-and-market-aggregates.md)); the wording is in [api-reference](../api-reference.md#account-analytics-get-v2accountsaddressanalytics):**
+10a. **New routes (extras, not in the original):** `/v2/accounts/{address}/analytics/{balances, balance_changes, counterparties, exchanges}` and `/v2/network/markets`. Their object shapes
+    and key orders are ours, pinned by tests, and none serves an AMM field.
+10b. **New parameters on routes of the original:** `interval` (`day`, `week`, `month`) on `/v2/accounts/{address}/stats/{family}` and on `/v2/accounts/{address}/reports`. Without it the answers are the
+    original's. Before this change an `interval` there was ignored like any unknown parameter, so **a client that sent one now gets buckets**. With `interval`, `stats/value` has a row for every bucket from the first one in which
+    the account had a balance up to the bucket that holds now, not only for active ones; `reports` allows 200 buckets of the interval (200 days, weeks or months; 200 months is all of the history), `payments=true` stays per day (400 `payments can only be listed with interval day`
+    with a week or a month), and the counterparties of a bucket are counted over the whole bucket.
+10c. **Markets:** `network/markets` lists every pair that traded, not a configured list; its windows start on the hour (those of the live volumes are exact); the native volume of a pair goes through the window's rate of any native pair
+    (`exchange_volume` takes only the configured native markets); prices are in the canonical stored orientation. `network/exchange_volume` is unchanged, so for a configured market the two routes can differ.
+10d. **Analytics windows are whole UTC days, `end` included** (as `reports`), unlike the exclusive `end` of `stats/{family}`; with an `interval` they widen to whole buckets, at most 1000.
+10e. **Valuing balance changes:** a change on a line the account owes on (its balance is below 0) is valued as the account's own IOU; LP tokens and assets without a DEX rate are worth 0, as in `stats/value` and `reports`.
+10f. **Unclassified balance changes** (those of transaction types the original never classified) are a group without a `change_type` key in `analytics/balance_changes`, as the `balance_changes` objects leave it out.
 
 ### 3. Outright bugs fixed
 **Ledgers / transactions**
@@ -152,7 +165,7 @@ The three gaps this section listed were fixed in the final fix round; they are k
 - Markers, exact amounts and canonical transactions differ from the original in digits or tokens a client should not parse.
 - The deviation list must be maintained: a new ruling that changes served behaviour adds a line here and to [api-reference](../api-reference.md).
 
-## Amendment (2026-10-19): the validators routes and the amendments routes
+## Amendment 1 (2026-10-19): the validators routes and the amendments routes
 Item 7 above lists `/v2/network/validators[/{pubkey}[/manifests|/reports]]` among the routes of the original that answer 404. That has changed
 ([ADR-0012](0012-validators-and-amendments-data.md)): `GET /v2/network/validators` and `GET /v2/network/validators/{key}` are served, and so are the
 routes the original had no counterpart of: `GET /v2/network/validators/summary`, `GET /v2/network/validators/{key}/validations` and

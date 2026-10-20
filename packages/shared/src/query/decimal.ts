@@ -26,15 +26,18 @@ export const EXACT_LIMIT = '1e36';
  * 1e96, and a stored amount is the difference of two ledger amounts, which can have more digits than either. The
  * decimal places are counted on the text, as BigNumber writes it: `123.456`, or a mantissa and an exponent,
  * `1.234567890123456e-25` (15 places, less the exponent: 40), `1e+21` (-21).
+ *
+ * `amount_change` of `balance_changes` has no `_f` shadow, and its amounts are signed: the shadow is the float of its own
+ * text (`toFloat64OrZero`, 0 for a text that is none, which the decimal then refuses) and the limit holds for the
+ * magnitude, either way round.
  */
-export function exactAmount(column: 'base_amount' | 'counter_amount' | 'delivered_amount'): string {
+export function exactAmount(column: 'base_amount' | 'counter_amount' | 'delivered_amount' | 'amount_change'): string {
   const places =
     `toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.')))` +
     ` - toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', ''))`;
-  return (
-    `if(${places} <= ${EXACT_SCALE} AND ${column}_f < ${EXACT_LIMIT}, ` +
-    `toDecimal256OrNull(${column}, ${EXACT_SCALE}), NULL)`
-  );
+  const belowLimit =
+    column === 'amount_change' ? `abs(toFloat64OrZero(${column})) < ${EXACT_LIMIT}` : `${column}_f < ${EXACT_LIMIT}`;
+  return `if(${places} <= ${EXACT_SCALE} AND ${belowLimit}, toDecimal256OrNull(${column}, ${EXACT_SCALE}), NULL)`;
 }
 
 // 1 / rate, with room for the rates the ledger allows: an amount runs from 1e-81 to 1e96, so a rate and its inverse

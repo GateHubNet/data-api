@@ -136,6 +136,55 @@ const SHAPES: Record<Table, Shape> = {
     partition: '',
     order: 'metric, period, component',
   },
+  [Table.NativeRatesDaily]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toYear(day)',
+    order: 'currency, issuer, day',
+  },
+  [Table.PairHourly]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toDate(hour)',
+    order: 'hour, base_currency, base_issuer, counter_currency, counter_issuer, source',
+  },
+  [Table.MarketsLive]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'period, amm, base_currency, base_issuer, counter_currency, counter_issuer',
+  },
+  [Table.AccountRollupState]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'account' },
+  [Table.AccountPartitionRows]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'partition, account',
+  },
+  [Table.AccountRollupDays]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toYear(day)',
+    order: 'account, day',
+  },
+  [Table.AccountLinesDaily]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toYear(day)',
+    order: 'account, day, currency, counterparty, change_type, owes, version',
+  },
+  [Table.AccountTxDaily]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toYear(day)',
+    order: 'account, day, tx_type, result, version',
+  },
+  [Table.AccountTradesDaily]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toYear(day)',
+    order: 'account, day, base_currency, base_issuer, counter_currency, counter_issuer, version',
+  },
   [Table.IngestLog]: {
     engine: 'ReplacingMergeTree',
     version: 'updated_at',
@@ -150,6 +199,20 @@ const SHAPES: Record<Table, Shape> = {
   },
   [Table.SyncerLease]: { engine: 'ReplacingMergeTree', version: 'heartbeat', partition: '', order: 'network' },
 };
+
+/** The aggregate tables of migration 003 (D2). */
+const MIGRATION_003 = '003_account_market_aggregates.sql';
+const MIGRATION_003_TABLES: Table[] = [
+  Table.NativeRatesDaily,
+  Table.PairHourly,
+  Table.MarketsLive,
+  Table.AccountRollupState,
+  Table.AccountPartitionRows,
+  Table.AccountRollupDays,
+  Table.AccountLinesDaily,
+  Table.AccountTxDaily,
+  Table.AccountTradesDaily,
+];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -352,6 +415,15 @@ describe('migrations (e2e)', () => {
         expect(await ddl(Table.ValidatorValidations)).toMatch(/TTL toDateTime\(last_datetime\) \+ toIntervalDay\(7\)/);
         expect(await ddl(Table.NetworkState)).toMatch(/TTL toDateTime\(polled_at\) \+ toIntervalDay\(100\)/);
         expect(await ddl(Table.ValidatorAgreementHourly)).toMatch(/TTL hour \+ toIntervalDay\(400\)/);
+      });
+
+      it('expires pair_hourly 45 days after its hour, dropping whole parts only', async () => {
+        const row = await svc.queryOne<{ create_table_query: string; engine_full: string }>(
+          `SELECT create_table_query, engine_full FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
+          { db: 'xahau', t: Table.PairHourly },
+        );
+        expect(row?.create_table_query).toMatch(/TTL hour \+ toIntervalDay\(45\)/);
+        expect(row?.engine_full).toContain('ttl_only_drop_parts = 1');
       });
 
       it('keeps validator_seen, the votes and the tallies for ever', async () => {
@@ -678,10 +750,13 @@ describe('migrations (e2e)', () => {
         expect(await tableNames()).toContain(Table.UnlPublishers);
         expect(await tableNames()).not.toContain(Table.ValidatorDomains);
 
-        // The real directory: 002 runs again from its first statement and completes.
+        // The real directory: 002 runs again from its first statement and completes, and 003, which comes after it, is applied too.
         process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
         const result = await runMigrations({ config, log });
-        expect(result).toEqual({ applied: ['002_validators_amendments.sql'], skipped: ['001_baseline.sql'] });
+        expect(result).toEqual({
+          applied: ['002_validators_amendments.sql', MIGRATION_003],
+          skipped: ['001_baseline.sql'],
+        });
 
         // Every statement took effect: the ten tables, and the columns the two ALTERs added.
         const names = await tableNames();
@@ -710,6 +785,68 @@ describe('migrations (e2e)', () => {
         else process.env.GH_SCHEMA_DIR = previousDir;
         await svc.onModuleDestroy();
       }
+    });
+  });
+
+  describe('migration 003', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-003-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 003 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_003_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_003);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_003);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_003_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_003]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_003], skipped: before });
+      for (const table of MIGRATION_003_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('needs no table of 002: 001 and 003 alone apply', async () => {
+      const config = { ...ch.config, database: 'ctl_003_alone' };
+      copyReal(['001_baseline.sql', MIGRATION_003]);
+
+      expect(await runMigrations({ config, log })).toEqual({
+        applied: ['001_baseline.sql', MIGRATION_003],
+        skipped: [],
+      });
+
+      const names = await tablesOf(config.database);
+      for (const table of MIGRATION_003_TABLES) expect(names).toContain(table);
+      expect(names).not.toContain(Table.ValidatorVotes);
     });
   });
 });

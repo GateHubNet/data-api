@@ -88,6 +88,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       httpApiPort: 3002,
       metriczPort: 3000,
       maxLagHealthy: 10,
+      accountRollupMinRows: 1000000,
     });
     expect(cfg.syncStartLedger).toBeUndefined();
   });
@@ -161,6 +162,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       GH_DOMAIN_RECHECK_MS: ' ',
       GH_DOMAIN_FETCH_TIMEOUT_MS: '',
       GH_AMENDMENTS_CONFIG: '',
+      GH_ACCOUNT_ROLLUP_MIN_ROWS: '', // what the compose files pass when XRPL_ACCOUNT_ROLLUP_MIN_ROWS is empty
     });
     expect(exits).toEqual([]);
     expect(cfg.syncStartLedger).toBeUndefined();
@@ -174,6 +176,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       domainRecheckMs: 21600000,
       domainFetchTimeoutMs: 10000,
       amendmentsConfig: '',
+      accountRollupMinRows: 1000000,
     });
   });
 
@@ -224,6 +227,34 @@ describe('SyncerConfig (GH_* environment)', () => {
       expect({ bad, exits }).toEqual({ bad, exits: [1] });
       expect(errors).toContain('GH_UNL_THRESHOLD');
     }
+  });
+
+  describe('GH_ACCOUNT_ROLLUP_MIN_ROWS', () => {
+    it('is 1000000 unless it is set', async () => {
+      const { cfg, exits } = await loadConfig(MINIMAL_ENV);
+      expect(exits).toEqual([]);
+      expect(cfg.accountRollupMinRows).toBe(1000000);
+    });
+
+    it('reads the digits it is given, and 0 turns the account_rollups job off', async () => {
+      for (const [value, expected] of [
+        ['0', 0],
+        ['5', 5],
+        ['2500000', 2500000],
+      ] as const) {
+        const { cfg, exits } = await loadConfig({ ...MINIMAL_ENV, GH_ACCOUNT_ROLLUP_MIN_ROWS: value });
+        expect({ value, exits }).toEqual({ value, exits: [] });
+        expect(cfg.accountRollupMinRows).toBe(expected);
+      }
+    });
+
+    it('refuses what is not a non-negative integer, naming the variable', async () => {
+      for (const bad of ['1.5', 'abc', '-1', '1e6']) {
+        const { exits, errors } = await loadConfig({ ...MINIMAL_ENV, GH_ACCOUNT_ROLLUP_MIN_ROWS: bad });
+        expect({ bad, exits }).toEqual({ bad, exits: [1] });
+        expect(errors).toContain('GH_ACCOUNT_ROLLUP_MIN_ROWS must be a non-negative integer');
+      }
+    });
   });
 
   it('rejects an unknown network', async () => {
