@@ -48,6 +48,26 @@ export async function readDirtyRanges(ch: ClickHouseService, limit: number): Pro
   return rows.map((r) => ({ from: Number(r.from_hour), to: Number(r.to_hour), created: Number(r.created_ms) }));
 }
 
+/** The first and the last UTC day (`YYYY-MM-DD`) of a pending range: the days of its `from` and of the second before its `to`. */
+export interface DirtyDaySpan {
+  first: string;
+  last: string;
+}
+
+/**
+ * The days the pending ranges touch, as the distinct spans of their first and last day, oldest first: a few rows per day
+ * of the queue, however many hours it holds. A range marked twice has the same span, so no row of a key needs to be
+ * told from the others; a range that was worked on is deleted, and is not read.
+ */
+export async function dirtyDaySpans(ch: ClickHouseService): Promise<DirtyDaySpan[]> {
+  return ch.query<DirtyDaySpan>(
+    `SELECT DISTINCT toString(toDate(from_hour, 'UTC')) AS first, toString(toDate(to_hour - 1, 'UTC')) AS last
+       FROM ${Table.AggDirty}
+      WHERE to_hour > from_hour
+      ORDER BY first, last`,
+  );
+}
+
 /**
  * Removes a range that was worked on: every row of its key marked at or before `created`, the mark that was read. A row of
  * the same key that was marked after the read (the ingest rewrote more ledgers of the range while it was being

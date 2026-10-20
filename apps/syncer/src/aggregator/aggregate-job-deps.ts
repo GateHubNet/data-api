@@ -26,6 +26,7 @@ import {
 } from '@gatehub/data-api-shared';
 import type { Logger } from '@nestjs/common';
 import type { PrometheusService } from '../modules/prometheus/prometheus.service';
+import { dirtyDaySpans } from './agg-dirty';
 
 /**
  * What the runners of the account and market jobs (`pair_hourly`, `markets_live`, `rates_daily`, `account_rollups`) share: the
@@ -102,6 +103,7 @@ export interface AggregateFunctions {
   firstLedgerClose: typeof firstLedgerClose;
   computeRatesDailySet: typeof computeRatesDailySet;
   markRatesStale: typeof markRatesStale;
+  dirtyDaySpans: typeof dirtyDaySpans;
   validRateDays: typeof validRateDays;
   firstNativeTradeDay: typeof firstNativeTradeDay;
   rollupStates: typeof rollupStates;
@@ -127,6 +129,7 @@ export function defaultAggregateFunctions(): AggregateFunctions {
     firstLedgerClose,
     computeRatesDailySet,
     markRatesStale,
+    dirtyDaySpans,
     validRateDays,
     firstNativeTradeDay,
     rollupStates,

@@ -12,7 +12,7 @@ import {
 } from '@gatehub/data-api-shared';
 import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
-import { deleteDirtyRange, narrowDirtyRange, readDirtyRanges } from '../src/aggregator/agg-dirty';
+import { deleteDirtyRange, dirtyDaySpans, narrowDirtyRange, readDirtyRanges } from '../src/aggregator/agg-dirty';
 import { AggregatorService } from '../src/aggregator/aggregator.service';
 import { syntheticChain } from './synthetic-chain';
 
@@ -595,6 +595,32 @@ describe('AggregatorService (e2e)', () => {
       const rows = await readDirtyRanges(ch, 100);
       expect(rows.map((r) => r.created)).toEqual([3000, 4000]);
       expect(await readDirtyRanges(ch, 1)).toHaveLength(1);
+    });
+
+    it('dirtyDaySpans: the first and last UTC day of the pending ranges, each span once, the end of a range excluded', async () => {
+      const ch = await fresh();
+      expect(await dirtyDaySpans(ch)).toEqual([]);
+      const database = (await ch.query<{ db: string }>('SELECT currentDatabase() AS db'))[0].db;
+      await ch.command(`SYSTEM STOP MERGES ${database}.${Table.AggDirty}`);
+      await mark(ch, '2015-01-14T17:00:00Z', '2015-01-14T18:00:00Z', 1000); // an hour
+      await mark(ch, '2015-01-14T17:00:00Z', '2015-01-14T18:00:00Z', 2000); // the same range marked again: two rows
+      await mark(ch, '2015-01-14T22:00:00Z', '2015-01-15T00:00:00Z', 1000); // up to midnight: the 14th only
+      await mark(ch, '2015-01-15T23:00:00Z', '2015-01-17T01:00:00Z', 1500); // across two midnights
+      await mark(ch, '2013-01-01T00:00:00Z', '2013-01-02T00:00:00Z', 3000); // a whole day
+      expect(await dirtyDaySpans(ch)).toEqual([
+        { first: '2013-01-01', last: '2013-01-01' },
+        { first: '2015-01-14', last: '2015-01-14' },
+        { first: '2015-01-15', last: '2015-01-17' },
+      ]);
+
+      // a range that was worked on (deleted) is not pending; the delete is a mutation, which waits for merges to run
+      await ch.command(`SYSTEM START MERGES ${database}.${Table.AggDirty}`);
+      await deleteDirtyRange(ch, {
+        from: unix('2013-01-01T00:00:00Z'),
+        to: unix('2013-01-02T00:00:00Z'),
+        created: 3000,
+      });
+      expect((await dirtyDaySpans(ch)).map((span) => span.first)).toEqual(['2015-01-14', '2015-01-15']);
     });
   });
 

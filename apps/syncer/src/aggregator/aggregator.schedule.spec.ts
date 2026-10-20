@@ -174,6 +174,8 @@ class D2World {
         this.call('rates_daily_mark', `${days[0]}..${days[days.length - 1]}`);
         return days.length;
       },
+      // which days rates_daily defers for the ranges of agg_dirty is its own spec's: here it defers none
+      dirtyDaySpans: async () => [],
       partitionSetVersions: async () => new Map(),
       countPartitionSlice: async (_ch, partition, slice) => {
         this.call('account_rollups_recount', `${partition}/${slice}`, true);

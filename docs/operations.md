@@ -362,7 +362,8 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 `range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)):
 
 - **Rates**: the days of the slice and the 14 after it that have a valid set are marked stale (a day's rate reads the trades of the 14 days before it). Until `rates_daily` has computed them again, newest first, the API values those days on read, so `syncer_rates_daily_missing_days` rises by up to the range plus 14 days and falls again; expect the
-  slower path for the window of the range, and `api_rates_on_read_total` to show it.
+  slower path for the window of the range, and `api_rates_on_read_total` to show it. While ranges of the re-ingest wait in `agg_dirty`, `rates_daily` leaves the days they reach (the range and the 14 days after it) for after they are drained, so the gauge falls only as the queue empties. A range
+  that keeps failing keeps its days waiting too: the "Daily rates not written" alert and `syncer_aggregator_errors_total` both show it.
 - **Hours**: the hours of the slice in the last 31 days are recomputed at once.
 - **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
 

@@ -316,6 +316,9 @@ today is never final and yesterday only once the ingest has passed it; today, an
   whatever is left of the budget (the readers value an uncovered day on read, the slow path); the others only while the tick's deadline
   has not passed.
 - **A re-ingest marks days stale** (the hook, [7.6](#76-the-agg_dirty-hooks)); the same list brings them back, newest first.
+- **Days of pending `agg_dirty` ranges wait.** A due day whose 15-day window meets a range that `agg_dirty` still holds (the days X..Y+14 of a range of the days X..Y: the days its hook marks once it is drained) is **deferred**: not computed while the range is pending, so that a long
+  re-ingest that `stats_dirty` drains behind does not have the same days computed again for every chunk. A deferred day is valued on read, stays in the gauge, and keeps the back-fill from being "done"; a run whose due days are all deferred computes none.
+  The queue is read once a run, only when a day is due ([design note](superpowers/specs/2026-10-20-rates-daily-dirty-deferral-design.md)).
 - Gauge `syncer_rates_daily_missing_days`: the closed final days, from the first native trade, that have no valid set (0 once the back-fill is done).
   Log lines: `Rates back-fill: N day(s) to compute, newest first` once when it starts and `Rates back-fill is done: every closed final day has its set` once when it ends.
 
