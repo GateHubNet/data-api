@@ -4,6 +4,7 @@ import {
   computeMarketsSet,
   computePairHourSets,
   computeRatesDailySet,
+  countPartitionSlice,
   firstChangeDay,
   firstNativeTradeDay,
   heavyAccounts,
@@ -15,12 +16,12 @@ import {
   partitionFirstDay,
   partitionSetVersions,
   RatesService,
-  recountPartition,
   rollupStates,
   Table,
   validRateDays,
   VOLUME_DAY_SETTLE_MS,
   writeAccountRollups,
+  writePartitionSet,
   writeRollupStates,
 } from '@gatehub/data-api-shared';
 import type { Logger } from '@nestjs/common';
@@ -106,7 +107,8 @@ export interface AggregateFunctions {
   rollupStates: typeof rollupStates;
   writeRollupStates: typeof writeRollupStates;
   writeAccountRollups: typeof writeAccountRollups;
-  recountPartition: typeof recountPartition;
+  countPartitionSlice: typeof countPartitionSlice;
+  writePartitionSet: typeof writePartitionSet;
   partitionSetVersions: typeof partitionSetVersions;
   heavyAccounts: typeof heavyAccounts;
   accountPartitionRows: typeof accountPartitionRows;
@@ -130,7 +132,8 @@ export function defaultAggregateFunctions(): AggregateFunctions {
     rollupStates,
     writeRollupStates,
     writeAccountRollups,
-    recountPartition,
+    countPartitionSlice,
+    writePartitionSet,
     partitionSetVersions,
     heavyAccounts,
     accountPartitionRows,

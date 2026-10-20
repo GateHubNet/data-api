@@ -28,8 +28,9 @@ import { AggregateSetOptions, nextSetVersion, throwIfSetAborted } from './aggreg
  *
  * Which accounts get rollups is decided by discovery (spec section 3.4, step 1): `balance_changes` is counted per account in
  * each of its partitions, and only the accounts with many rows in a partition are kept, in `account_partition_rows`.
- * A partition's accounts are a **set** too (`recountPartition`), and an account is heavy when its rows over the newest set
- * of every partition reach the minimum (`heavyAccounts`).
+ * A partition's accounts are a **set** too, counted one slice of the address space at a time (`countPartitionSlice`) and
+ * written in one insert once all 58 are counted (`writePartitionSet`; `recountPartition` does both at once), and an account
+ * is heavy when its rows over the newest set of every partition reach the minimum (`heavyAccounts`).
  */
 
 /** What `account_rollup_state` holds for a heavy account, the newest row of it (`rollupStates`). */
@@ -213,59 +214,91 @@ export function partitionOf(ledgerIndex: number): number {
   return Math.floor(ledgerIndex / BALANCE_PARTITION_LEDGERS);
 }
 
+/** An account a recount keeps, and its balance changes in the partition. */
+export interface PartitionAccountRows {
+  account: string;
+  rows: number;
+}
+
 /**
- * Counts the balance changes of every account in a partition and writes the set of the partition: the accounts with at
- * least `ACCOUNT_PARTITION_ROWS_FLOOR` of them, plus the sentinel (`account = ''`), in one insert under one version (the
- * newest set's plus one at least: `nextSetVersion`), so that a reader never sees a part of a set. Returns the accounts kept.
- *
- * The count is one read per slice of the address space (`ADDRESS_SLICE_CHARS`), each a key range of `balance_changes` within
- * the partition's ledgers, so that no read has to hold the accounts of a whole partition. The count is of rows as stored: a
- * row that was written twice and is not merged yet counts twice, which is fine for a threshold. The sentinel's `rows` is 0.
- * An aborted `signal` throws `AggregateSetAborted` before each read and before the insert; an abort writes nothing.
+ * Counts the balance changes of every account of one slice of a partition and returns the accounts with at least
+ * `ACCOUNT_PARTITION_ROWS_FLOOR` of them; writes nothing. Slice i (0 to 57) is the key range of `balance_changes` from `r` +
+ * the i-th of `ADDRESS_SLICE_CHARS` up to `r` + the next one, within the partition's ledgers, so that no read has to hold the
+ * accounts of a whole partition. The count is of rows as stored: a row that was written twice and is not merged yet counts
+ * twice, which is fine for a threshold. A slice that is not one of the 58 is a `RangeError`; an aborted `signal` throws
+ * `AggregateSetAborted`, both before the read.
+ */
+export async function countPartitionSlice(
+  ch: ClickHouseService,
+  partition: number,
+  slice: number,
+  options: AggregateSetOptions = {},
+): Promise<PartitionAccountRows[]> {
+  const last = ADDRESS_SLICE_CHARS.length - 1;
+  if (!Number.isInteger(slice) || slice < 0 || slice > last) {
+    throw new RangeError(`A slice of a partition is 0 to ${last}, not ${slice}`);
+  }
+  throwIfSetAborted(options.signal);
+  const found = await ch.query<{ account: string; n: number | string }>(
+    `SELECT account, count() AS n
+       FROM ${Table.BalanceChanges}
+      WHERE ${[
+        'ledger_index BETWEEN {p_min:UInt32} AND {p_max:UInt32}',
+        ...(slice > 0 ? ['account >= {lo:String}'] : []),
+        ...(slice < last ? ['account < {hi:String}'] : []),
+      ].join(' AND ')}
+      GROUP BY account
+     HAVING count() >= {floor:UInt64}`,
+    {
+      p_min: partition * BALANCE_PARTITION_LEDGERS,
+      p_max: (partition + 1) * BALANCE_PARTITION_LEDGERS - 1,
+      floor: ACCOUNT_PARTITION_ROWS_FLOOR,
+      ...(slice > 0 && { lo: `r${ADDRESS_SLICE_CHARS[slice]}` }),
+      ...(slice < last && { hi: `r${ADDRESS_SLICE_CHARS[slice + 1]}` }),
+    },
+  );
+  return found.map((r) => ({ account: r.account, rows: Number(r.n) }));
+}
+
+/**
+ * Writes the set of a partition: the accounts its 58 slices kept (`countPartitionSlice`), plus the sentinel (`account = ''`,
+ * `rows` 0), in one insert under one version (the newest set's plus one at least: `nextSetVersion`), so that a reader never
+ * sees a part of a set. Returns how many accounts it wrote. An aborted `signal` throws `AggregateSetAborted` before the version
+ * read and before the insert; an abort writes nothing.
+ */
+export async function writePartitionSet(
+  ch: ClickHouseService,
+  partition: number,
+  accounts: readonly PartitionAccountRows[],
+  options: AggregateSetOptions = {},
+): Promise<number> {
+  const { signal } = options;
+  throwIfSetAborted(signal);
+  const version = await nextSetVersion(ch, Table.AccountPartitionRows, 'partition = {partition:UInt16}', { partition });
+  throwIfSetAborted(signal);
+  await ch.insert<AccountPartitionRowsRow>(Table.AccountPartitionRows, [
+    ...accounts.map((r): AccountPartitionRowsRow => ({ partition, account: r.account, rows: r.rows, version })),
+    { partition, account: '', rows: 0, version },
+  ]);
+  return accounts.length;
+}
+
+/**
+ * Counts the balance changes of every account in a partition, all 58 slices one after the other (`countPartitionSlice`), and
+ * writes the set of the partition (`writePartitionSet`). Returns the accounts kept. An aborted `signal` throws
+ * `AggregateSetAborted` before each read and before the insert; an abort writes nothing. The `account_rollups` runner does not
+ * call it: it counts a few slices a tick and writes the set once all of them are counted.
  */
 export async function recountPartition(
   ch: ClickHouseService,
   partition: number,
   options: AggregateSetOptions = {},
 ): Promise<number> {
-  const { signal } = options;
-  const range = {
-    p_min: partition * BALANCE_PARTITION_LEDGERS,
-    p_max: (partition + 1) * BALANCE_PARTITION_LEDGERS - 1,
-  };
-  const heavy: { account: string; rows: number }[] = [];
-  const last = ADDRESS_SLICE_CHARS.length - 1;
-  for (const [i, char] of ADDRESS_SLICE_CHARS.entries()) {
-    throwIfSetAborted(signal);
-    const next = ADDRESS_SLICE_CHARS[i + 1];
-    const found = await ch.query<{ account: string; n: number | string }>(
-      `SELECT account, count() AS n
-         FROM ${Table.BalanceChanges}
-        WHERE ${[
-          'ledger_index BETWEEN {p_min:UInt32} AND {p_max:UInt32}',
-          ...(i > 0 ? ['account >= {lo:String}'] : []),
-          ...(i < last ? ['account < {hi:String}'] : []),
-        ].join(' AND ')}
-        GROUP BY account
-       HAVING count() >= {floor:UInt64}`,
-      {
-        ...range,
-        floor: ACCOUNT_PARTITION_ROWS_FLOOR,
-        ...(i > 0 && { lo: `r${char}` }),
-        ...(i < last && { hi: `r${next}` }),
-      },
-    );
-    for (const r of found) heavy.push({ account: r.account, rows: Number(r.n) });
+  const heavy: PartitionAccountRows[] = [];
+  for (let slice = 0; slice < ADDRESS_SLICE_CHARS.length; slice++) {
+    heavy.push(...(await countPartitionSlice(ch, partition, slice, options)));
   }
-
-  throwIfSetAborted(signal);
-  const version = await nextSetVersion(ch, Table.AccountPartitionRows, 'partition = {partition:UInt16}', { partition });
-  throwIfSetAborted(signal);
-  await ch.insert<AccountPartitionRowsRow>(Table.AccountPartitionRows, [
-    ...heavy.map((r): AccountPartitionRowsRow => ({ partition, ...r, version })),
-    { partition, account: '', rows: 0, version },
-  ]);
-  return heavy.length;
+  return writePartitionSet(ch, partition, heavy, options);
 }
 
 /**
