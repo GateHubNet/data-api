@@ -118,8 +118,9 @@ class FakeClickHouse {
  * The shared functions of the four account and market jobs, as their runners call them. By default the world is quiet: the
  * first ledger is the newest one, so there is no hour, day or partition to back-fill, and each job has its few sets of every
  * tick and no more. `busy()` gives every job far more to do than its budget lets it. Each call is noted as `<kind> <detail>`;
- * the sets (`pair_hourly`, `markets_live`, `rates_daily` days, partition recounts) take `setMs` of the fake clock. A test makes
- * a kind fail, or abort as a shutdown does, by naming it in `throwOn` (the function says for which call).
+ * the sets (`pair_hourly`, `markets_live`, `rates_daily` days, the slices of partition recounts: `account_rollups_recount`)
+ * take `setMs` of the fake clock. A test makes a kind fail, or abort as a shutdown does, by naming it in `throwOn` (the
+ * function says for which call).
  */
 class D2World {
   setMs = 0;
@@ -173,9 +174,15 @@ class D2World {
         this.call('rates_daily_mark', `${days[0]}..${days[days.length - 1]}`);
         return days.length;
       },
+      // which days rates_daily defers for the ranges of agg_dirty is its own spec's: here it defers none
+      dirtyDaySpans: async () => [],
       partitionSetVersions: async () => new Map(),
-      recountPartition: async (_ch, partition) => {
-        this.call('account_rollups_recount', String(partition), true);
+      countPartitionSlice: async (_ch, partition, slice) => {
+        this.call('account_rollups_recount', `${partition}/${slice}`, true);
+        return [];
+      },
+      writePartitionSet: async (_ch, partition) => {
+        this.call('account_rollups_partition_set', String(partition));
         return 0;
       },
       heavyAccounts: async () => new Map(),
@@ -346,7 +353,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     await service({
       budgetsMs: { pair_hourly: 5500, markets_live: 1500, rates_daily: 1500, account_rollups: 2500 },
     }).tick();
-    // a set at a time while the budget of the job is not spent: 1 s a set
+    // a set at a time while the budget of the job is not spent: 1 s a set (a slice of a recount, for account_rollups)
     expect(count('pair_hourly')).toBe(6);
     expect(count('markets_live')).toBe(2);
     expect(count('rates_daily ')).toBe(2);

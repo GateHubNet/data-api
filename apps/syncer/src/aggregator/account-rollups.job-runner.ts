@@ -1,7 +1,9 @@
 import {
   ACCOUNT_ROLLUP_CONFIG_VERSION,
+  ADDRESS_SLICE_CHARS,
   LedgerRange,
   LedgerRangeOf,
+  PartitionAccountRows,
   partitionOf,
   promotionSlice,
   RollupState,
@@ -45,6 +47,19 @@ type Covered = RollupState & { rolledFrom: string; rolledThrough: string };
 const hasCoverage = (state: RollupState): state is Covered =>
   state.rolledFrom !== undefined && state.rolledThrough !== undefined;
 
+/**
+ * A recount of a partition that is under way: the slices of the address space counted so far (`countPartitionSlice`), in
+ * order, and what they kept. Kept in memory from run to run until its set is written; a restart starts it over.
+ */
+interface Recount {
+  /** The clock reading (ms) at which it began: a mark of the partition after that may be of rows its slices did not see. */
+  readonly began: number;
+  /** The next slice to count; all 58 are counted when it is `ADDRESS_SLICE_CHARS.length`. */
+  next: number;
+  /** The accounts the counted slices kept, and their rows. */
+  readonly accounts: PartitionAccountRows[];
+}
+
 /** The days of a promotion slice, `YYYY-MM-DD`, both included. */
 interface Slice {
   fromDay: string;
@@ -76,17 +91,20 @@ interface Run {
  * (those with `GH_ACCOUNT_ROLLUP_MIN_ROWS` balance changes or more), kept per UTC day so that a read of years does not read the
  * millions of rows behind them, and the hook of the slices of `agg_dirty` (`ofSlice`). The job is off when the minimum is 0:
  * the run reads and writes nothing (the hook still keeps existing coverage right, see `ofSlice`). The state of the job (the
- * waits of what failed, the partitions that a slice marked) is its own; the database, the clock, the budget and the rule of
- * failure are the deps'.
+ * waits of what failed, the partitions that a slice marked, the recounts under way) is its own; the database, the clock, the
+ * budget and the rule of failure are the deps'.
  *
  * Per run, in order, each set only while the deadline of the tick has not passed, the shutdown has not begun and fewer than 3
  * sets have failed:
  *
- *  1. **Discovery.** The partitions of `balance_changes` that are due, newest first, are recounted (`recountPartition`): one that
- *     has no set, the newest one when its set is over 24 hours old, any other when it is over 7 days old, and one that a slice
- *     marked. Then the heavy accounts are read, and the states are brought in line in one insert: a new heavy account gets a
- *     state with its first day and no coverage; an account that is no longer heavy loses its coverage; the state of another
- *     config version is an account without coverage (the API does not use it either); the count of rows is kept up to date.
+ *  1. **Discovery.** The partitions of `balance_changes` that are due, newest first, are recounted: one that has no set, the
+ *     newest one when its set is over 24 hours old, any other when it is over 7 days old, and one that a slice marked. A recount
+ *     is 58 slice reads of about a second each, so it goes on across runs, a slice at a time while the budget lasts, and writes
+ *     the set of the partition once all 58 are counted (`recount`). Then the heavy accounts are read (from the newest set of
+ *     each partition: a recount under way changes nothing yet), and the states are brought in line in one insert: a new heavy
+ *     account gets a state with its first day and no coverage; an account that is no longer heavy loses its coverage; the
+ *     state of another config version is an account without coverage (the API does not use it either); the count of rows is
+ *     kept up to date.
  *  2. **The daily increment.** For each final day d after the `rolled_through` of an account, oldest first, the accounts whose
  *     `rolled_through` is d - 1 are rolled together (in calls of 500 accounts at most), and then their state has
  *     `rolled_through = d`. An account that failed inside a call of several is rolled alone from then on, so that one bad account
@@ -113,8 +131,13 @@ export class AccountRollupsJobRunner {
   private readonly gate: SetGate;
   /** The ledger ranges of days, from the rates of the network (what `writeAccountRollups` and the promotions work with). */
   private readonly ranges: LedgerRangeOf;
-  /** The partitions that the slices of `agg_dirty` touched: the next discovery recounts them. */
-  private readonly marked = new Set<number>();
+  /**
+   * The partitions that the slices of `agg_dirty` touched, each with the clock reading (ms) of its newest mark: the next
+   * discovery recounts them.
+   */
+  private readonly marked = new Map<number, number>();
+  /** The recounts that are under way, by partition (a few slices a run; see `recount`). */
+  private readonly recounts = new Map<number, Recount>();
   /** The accounts that failed inside a call of several: they are rolled alone until they work. */
   private readonly solo = new Set<string>();
   /**
@@ -172,7 +195,7 @@ export class AccountRollupsJobRunner {
       const range = await this.ranges(new Date(start * 1000), new Date(end * 1000));
       if (range !== null) {
         for (let partition = partitionOf(range.min); partition <= partitionOf(range.max); partition++) {
-          this.marked.add(partition);
+          this.marked.set(partition, deps.clock());
         }
       }
     }
@@ -268,7 +291,16 @@ export class AccountRollupsJobRunner {
   // 1. discovery
   // -------------------------------------------------------------------------------------------------------------------
 
-  /** Recounts the partitions that are due, newest first, as far as the run may go; returns the ones that were due. */
+  /**
+   * Recounts the partitions that are due, newest first, as far as the run may go; returns the ones that were due. A recount
+   * is 58 reads, one per slice of the address space (about a second each on the XRPL), so it is done a few slices a run: each
+   * slice only while the run may start a set, what the slices kept is kept in memory (`recounts`), and the set of the partition
+   * is written in one insert once all 58 are counted (`writePartitionSet`). A slice that fails makes the partition wait, and
+   * its recount goes on at that slice; a recount whose partition is no longer due is dropped (the newest partition stops being
+   * due when the chain reaches the next one), and so is every recount at a restart. A mark of the partition (`ofSlice`) after a
+   * recount began is not cleared by it: the ingest may have written rows into slices it had counted, so the partition is
+   * recounted again, from the first slice.
+   */
   private async recount(run: Run, ledgers: LedgerRange): Promise<number[]> {
     const { deps } = this;
     const newestPartition = partitionOf(ledgers.max);
@@ -282,22 +314,37 @@ export class AccountRollupsJobRunner {
       const maxAge = partition === newestPartition ? NEWEST_PARTITION_RECOUNT_MS : OTHER_PARTITION_RECOUNT_MS;
       if (version === undefined || this.marked.has(partition) || now - version > maxAge) due.push(partition);
     }
-    for (const partition of this.marked) {
+    for (const partition of [...this.marked.keys()]) {
       if (partition < oldestPartition || partition > newestPartition) this.marked.delete(partition);
     }
+    for (const partition of [...this.recounts.keys()]) if (!due.includes(partition)) this.recounts.delete(partition);
 
+    const slices = ADDRESS_SLICE_CHARS.length;
+    const { signal } = run.tick;
     for (const partition of due) {
       const key = `partition/${partition}`;
       if (this.backoff.waiting(key, deps.clock())) continue;
       if (!this.mayStart(run)) break;
+      let recount = this.recounts.get(partition);
+      if (recount === undefined) {
+        recount = { began: deps.clock(), next: 0, accounts: [] };
+        this.recounts.set(partition, recount);
+      }
       try {
-        const accounts = await this.fns.recountPartition(deps.ch, partition, { signal: run.tick.signal });
+        for (; recount.next < slices; recount.next++) {
+          if (!this.mayStart(run)) return due;
+          recount.accounts.push(...(await this.fns.countPartitionSlice(deps.ch, partition, recount.next, { signal })));
+        }
+        const accounts = await this.fns.writePartitionSet(deps.ch, partition, recount.accounts, { signal });
+        this.recounts.delete(partition);
         this.backoff.done(key);
-        this.marked.delete(partition);
+        const mark = this.marked.get(partition);
+        if (mark !== undefined && mark <= recount.began) this.marked.delete(partition);
         run.partitionVersions.set(partition, deps.clock());
         deps.logger.debug(`account_rollups: partition ${partition}: ${accounts} account(s) counted`);
       } catch (err) {
-        this.fail(run, err, ` recounting partition ${partition}`, [key]);
+        const where = recount.next < slices ? `slice ${recount.next} of ${slices}` : 'writing its set';
+        this.fail(run, err, ` recounting partition ${partition} (${where})`, [key]);
       }
     }
     return due;

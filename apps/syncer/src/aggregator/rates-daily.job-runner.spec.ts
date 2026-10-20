@@ -35,6 +35,9 @@ class FakeDays {
   /** The days `markRatesStale` was asked for, a list per call, with its options. */
   marks: Array<{ days: string[]; signal?: AbortSignal }> = [];
   markError?: Error;
+  /** The first and last day of each range of `agg_dirty` that is pending (`dirtyDaySpans`). */
+  dirty: Array<{ first: string; last: string }> = [];
+  dirtyReads = 0;
   private version = 1000;
 
   fns(): Partial<AggregateFunctions> {
@@ -64,6 +67,10 @@ class FakeDays {
         this.marks.push({ days, signal: options?.signal });
         if (this.markError) throw this.markError;
         return days.length;
+      },
+      dirtyDaySpans: async () => {
+        this.dirtyReads++;
+        return this.dirty.map((span) => ({ ...span }));
       },
     };
   }
@@ -433,6 +440,75 @@ describe('RatesDailyJobRunner', () => {
     jest.setSystemTime(Date.now() + minutes(5));
     await run(r);
     expect(fake.logger.log.mock.calls.filter((c) => /done/.test(c[0]))).toHaveLength(1);
+  });
+
+  describe('the days of the ranges that agg_dirty still holds', () => {
+    /** The days from `from` down to `to`, both included, newest first. */
+    const daysDown = (from: string, to: string): string[] => {
+      const out: string[] = [];
+      for (let ms = Date.parse(from); ms >= Date.parse(to); ms -= DAY * 1000)
+        out.push(new Date(ms).toISOString().slice(0, 10));
+      return out;
+    };
+
+    beforeEach(() => {
+      days.firstDay = '2026-09-20'; // 26 days to compute, 2026-10-15 down to 2026-09-20
+    });
+
+    it('defers every due day whose 15-day window meets a pending range (the days X..Y+14 of a range of days X..Y), and computes the others, newest first', async () => {
+      days.dirty = [{ first: '2026-09-24', last: '2026-09-25' }];
+      const r = runner();
+      await run(r);
+      // the hook of the range will mark 09-24..10-09 stale once it is drained: they wait for it
+      expect(days.days()).toEqual([...daysDown('2026-10-15', '2026-10-10'), ...daysDown('2026-09-23', '2026-09-20')]);
+      expect(days.dirtyReads).toBe(1);
+      // they are still missing, and the back-fill is not done
+      expect(fake.metrics.ratesDailyMissingDays.set).toHaveBeenLastCalledWith(16);
+      expect(fake.logger.log.mock.calls.filter((c) => /done/.test(c[0]))).toEqual([]);
+      expect(fake.logger.debug).toHaveBeenCalledWith(
+        'rates_daily: 16 day(s) deferred (2026-09-24 - 2026-10-09): agg_dirty still has ranges of the trades they read',
+      );
+
+      // the range is drained: the next run computes them, newest first, and the back-fill is done
+      days.dirty = [];
+      days.calls = [];
+      jest.setSystemTime(Date.now() + minutes(1));
+      await run(r);
+      expect(days.days()).toEqual(daysDown('2026-10-09', '2026-09-24'));
+      expect(fake.metrics.ratesDailyMissingDays.set).toHaveBeenLastCalledWith(0);
+      expect(fake.logger.log.mock.calls.filter((c) => /done/.test(c[0]))).toHaveLength(1);
+    });
+
+    it('defers the days of every pending range; the days it reaches before the first trade day or after the newest final day are not due anyway', async () => {
+      days.dirty = [
+        { first: '2026-09-01', last: '2026-09-05' }, // defers 09-01..09-19: all before the first trade day
+        { first: '2026-10-14', last: '2026-10-16' }, // defers 10-14 and 10-15 (today and later are never due)
+        { first: '2026-09-30', last: '2026-09-30' }, // defers 09-30..10-14
+      ];
+      await run(runner());
+      expect(days.days()).toEqual(daysDown('2026-09-29', '2026-09-20'));
+      expect(fake.metrics.ratesDailyMissingDays.set).toHaveBeenLastCalledWith(16);
+    });
+
+    it('a run whose due days are all deferred computes none, though a run otherwise computes one past its deadline', async () => {
+      days.fill('2026-09-20', '2026-10-15');
+      days.valid.delete('2026-10-02');
+      days.valid.delete('2026-10-03');
+      days.dirty = [{ first: '2026-10-01', last: '2026-10-01' }];
+      const tick = fake.tick();
+      jest.setSystemTime(tick.deadline + 1);
+      await runner().job().run(tick);
+      expect(days.calls).toEqual([]);
+      expect(fake.metrics.ratesDailyMissingDays.set).toHaveBeenLastCalledWith(2);
+    });
+
+    it('reads agg_dirty only when a day is due', async () => {
+      days.fill('2026-09-20', '2026-10-15');
+      days.dirty = [{ first: '2026-10-01', last: '2026-10-01' }];
+      await run(runner());
+      expect(days.dirtyReads).toBe(0);
+      expect(days.calls).toEqual([]);
+    });
   });
 
   describe('ofSlice', () => {

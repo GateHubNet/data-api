@@ -325,6 +325,9 @@ today is never final and yesterday only once the ingest has passed it; today, an
   whatever is left of the budget (the readers value an uncovered day on read, the slow path); the others only while the tick's deadline
   has not passed.
 - **A re-ingest marks days stale** (the hook, [7.6](#76-the-agg_dirty-hooks)); the same list brings them back, newest first.
+- **Days of pending `agg_dirty` ranges wait.** A due day whose 15-day window meets a range that `agg_dirty` still holds (the days X..Y+14 of a range of the days X..Y: the days its hook marks once it is drained) is **deferred**: not computed while the range is pending, so that a long
+  re-ingest that `stats_dirty` drains behind does not have the same days computed again for every chunk. A deferred day is valued on read, stays in the gauge, and keeps the back-fill from being "done"; a run whose due days are all deferred computes none.
+  The queue is read once a run, only when a day is due ([design note](superpowers/specs/2026-10-20-rates-daily-dirty-deferral-design.md)).
 - Gauge `syncer_rates_daily_missing_days`: the closed final days, from the first native trade, that have no valid set (0 once the back-fill is done).
   Log lines: `Rates back-fill: N day(s) to compute, newest first` once when it starts and `Rates back-fill is done: every closed final day has its set` once when it ends.
 
@@ -372,7 +375,11 @@ the tick's deadline has not passed, the shutdown has not begun and fewer than 3 
 
 1. **Discovery.** The partitions of `balance_changes` (P7: `intDiv(ledger_index, 10000000)`) that are due are recounted (`account_partition_rows`), newest first: one without a set, the newest partition when its set is older than 24 hours,
    any other when it is older than 7 days, and one that a slice of `agg_dirty` touched. A recount is `SELECT account, count()` over the partition's ledger range in 58 slices by the second character of the address, keeping the accounts with
-   at least 10,000 rows. An account is **heavy** when its rows over the newest set of every partition reach the minimum. A new heavy account gets a state row with its `first_day` (the day of its first balance change) and no coverage; an account
+   at least 10,000 rows. The 58 slice reads take about a second each on the XRPL, so **a recount goes on across runs**: the slices are counted in order while the budget lasts, what they kept is held in memory, and the partition's set
+   (its accounts and its sentinel, one insert) is written only once all 58 are counted; until then readers use the previous set. A slice that fails waits like any set and the recount goes on at it; a restart, or the partition no longer
+   being due (the newest partition once the chain reaches the next one), starts it over; a slice of `agg_dirty` that marks the partition after its recount began has it recounted again, from the first slice, once that set is written.
+   The discovery goes first, so a recount (about 8 runs at the 8 s budget) holds back the daily increment and the promotion for those runs; no run overruns its budget by more than one slice.
+   An account is **heavy** when its rows over the newest set of every partition reach the minimum. A new heavy account gets a state row with its `first_day` (the day of its first balance change) and no coverage; an account
    that is no longer heavy (the setting was raised) loses its coverage (its rollup rows stay, unused); a state of another `ACCOUNT_ROLLUP_CONFIG_VERSION` is an account without coverage, promoted again.
 2. **The daily increment.** For each final day d after an account's `rolled_through`, oldest first, the accounts whose `rolled_through` is d - 1 are rolled together: three reads (`balance_changes`, the transactions the account sent, `account_exchanges`)
    with `account IN (...)` and the ledger range of d, each row once, grouped by account and the table's group columns; the rows are inserted under one version, then a sentinel per (account, day), then the state rows with `rolled_through = d`.

@@ -235,8 +235,9 @@ describe('AggregatorService account and market jobs (e2e)', () => {
 
   it('the back-fills resume after a restart', async () => {
     // 27 days to compute the rates of (the 14th of January to the 9th of February) and the hours of 31 days to compute, with budgets
-    // that allow a few sets a tick: the clock of the aggregator is a fake that moves a second for every set that is written, so
-    // that how many sets a tick makes does not depend on how fast the machine is.
+    // that allow a few sets a tick: the clock of the aggregator is a fake that moves a second for every set that is written (and
+    // 15 ms for every slice of a partition's recount, about a second for its 58), so that how many sets a tick makes does not
+    // depend on how fast the machine is.
     const later = new Date('2015-02-10T12:00:00Z');
     const ch = await fresh();
     let clock = later.getTime();
@@ -256,9 +257,9 @@ describe('AggregatorService account and market jobs (e2e)', () => {
             clock += 1000;
             return written;
           },
-          recountPartition: async (...args) => {
-            const counted = await real.recountPartition(...args);
-            clock += 1000;
+          countPartitionSlice: async (...args) => {
+            const counted = await real.countPartitionSlice(...args);
+            clock += 15;
             return counted;
           },
         },
@@ -278,7 +279,12 @@ describe('AggregatorService account and market jobs (e2e)', () => {
     };
 
     const first = aggregatorOf();
-    await tickTwice(first);
+    await first.tick(later);
+    clock += 60_000;
+    // the first tick counted partitions 2 and 1 and the first slices of 0 (2.5 s); the second goes on with the slices of 0
+    expect([...(await partitionSetVersions(ch)).keys()].sort()).toEqual([1, 2]);
+    await first.tick(later);
+    clock += 60_000;
     await first.stop();
     const afterFirst = await missing();
     expect(afterFirst.days).toBeLessThan(27);

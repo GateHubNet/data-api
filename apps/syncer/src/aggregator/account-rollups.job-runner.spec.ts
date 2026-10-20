@@ -1,4 +1,11 @@
-import { ACCOUNT_ROLLUP_CONFIG_VERSION, LedgerRangeOf, RatesService, RollupState } from '@gatehub/data-api-shared';
+import {
+  ACCOUNT_ROLLUP_CONFIG_VERSION,
+  ADDRESS_SLICE_CHARS,
+  LedgerRangeOf,
+  PartitionAccountRows,
+  RatesService,
+  RollupState,
+} from '@gatehub/data-api-shared';
 import { DAY, fakeDeps, FakeDeps, HOUR, NOW, unix } from '../../test/aggregate-job-fakes';
 import { ACCOUNT_ROLLUPS_BATCH_ACCOUNTS, AccountRollupsJobRunner } from './account-rollups.job-runner';
 import { AGGREGATE_MAX_RETRY_MS, AGGREGATE_RETRY_MS, AggregateFunctions } from './aggregate-job-deps';
@@ -29,7 +36,8 @@ interface RollupCall {
  * The shared functions of `account_rollups` as the runner calls them, over a small world: the partition sets, the heavy accounts,
  * the state rows (a write replaces them, so that the next run reads what this one wrote), the partition counts of the accounts
  * and the days of the partitions. Every write records its call; the writes that take a ledger range or do real work take
- * `callMs` of the fake clock, and throw for the accounts and partitions in `failing`.
+ * `callMs` of the fake clock, and throw for the accounts in `failingAccounts`. A slice of a recount takes `sliceMs`, finds
+ * the accounts of `sliceAccounts`, and throws for the partitions in `failingPartitions` and the slices in `failingSlices`.
  */
 class FakeRollups {
   newest: number | undefined = NOW_SECONDS - 3;
@@ -46,13 +54,23 @@ class FakeRollups {
   daysOfPartition = new Map<number, number>();
   failingAccounts = new Set<string>();
   failingPartitions = new Set<number>();
+  /** `${partition}/${slice}` of the slices whose read throws. */
+  failingSlices = new Set<string>();
+  /** The accounts a slice of a recount keeps, by `${partition}/${slice}`; none by default. */
+  sliceAccounts = new Map<string, PartitionAccountRows[]>();
+  sliceMs = 0;
   /** Makes `writeRollupStates` throw, before it writes. */
   stateWriteError?: Error;
   callMs = 0;
   onRollup?: (accounts: string[]) => void;
 
+  /** `${partition}/${slice}` of every slice read of a recount, in order (those that failed too). */
+  slices: string[] = [];
+  sliceSignals: Array<AbortSignal | undefined> = [];
+  /** The partitions whose set was written, and what each write held. */
   recounts: number[] = [];
   recountSignals: Array<AbortSignal | undefined> = [];
+  partitionSets: Array<{ partition: number; accounts: PartitionAccountRows[] }> = [];
   rollups: RollupCall[] = [];
   stateWrites: RollupState[][] = [];
   heavyReads: number[] = [];
@@ -91,13 +109,20 @@ class FakeRollups {
         this.versionReads++;
         return new Map(this.partitionVersions);
       },
-      recountPartition: async (_ch, partition, options) => {
+      countPartitionSlice: async (_ch, partition, slice, options) => {
+        const key = `${partition}/${slice}`;
+        this.slices.push(key);
+        this.sliceSignals.push(options?.signal);
+        if (this.sliceMs > 0) jest.setSystemTime(Date.now() + this.sliceMs);
+        if (this.failingPartitions.has(partition) || this.failingSlices.has(key)) throw new Error('memory limit');
+        return (this.sliceAccounts.get(key) ?? []).map((r) => ({ ...r }));
+      },
+      writePartitionSet: async (_ch, partition, accounts, options) => {
         this.recounts.push(partition);
         this.recountSignals.push(options?.signal);
-        if (this.callMs > 0) jest.setSystemTime(Date.now() + this.callMs);
-        if (this.failingPartitions.has(partition)) throw new Error('memory limit');
+        this.partitionSets.push({ partition, accounts: accounts.map((r) => ({ ...r })) });
         this.partitionVersions.set(partition, Date.now());
-        return 7;
+        return accounts.length;
       },
       heavyAccounts: async (_ch, minRows) => {
         this.heavyReads.push(minRows);
@@ -148,7 +173,13 @@ class FakeRollups {
     return this.rollups.filter((c) => c.accounts.includes(account)).length;
   }
 
+  /** The slice reads of a partition. */
+  slicesOf(partition: number): string[] {
+    return this.slices.filter((key) => key.startsWith(`${partition}/`));
+  }
+
   clear(): void {
+    this.slices = [];
     this.recounts = [];
     this.rollups = [];
     this.stateWrites = [];
@@ -249,6 +280,8 @@ describe('AccountRollupsJobRunner', () => {
       await run(r);
       expect(world.recounts).toEqual([1, 0]);
       expect(world.recountSignals).toEqual([fake.abort.signal, fake.abort.signal]);
+      expect(world.slices).toHaveLength(2 * ADDRESS_SLICE_CHARS.length);
+      expect(world.sliceSignals.every((signal) => signal === fake.abort.signal)).toBe(true);
 
       // their sets are new now: nothing is due
       world.clear();
@@ -289,7 +322,9 @@ describe('AccountRollupsJobRunner', () => {
       world.heavyAccount('rA', { rolledFrom: '2025-01-01', rolledThrough: '2026-10-14' });
       const r = runner();
       await run(r);
-      expect(world.recounts).toEqual([1, 0]);
+      // partition 1 failed at its first slice; partition 0 was counted and written
+      expect(world.slicesOf(1)).toEqual(['1/0']);
+      expect(world.recounts).toEqual([0]);
       expect(fake.failures).toHaveLength(1);
       expect(fake.failures[0].job).toBe('account_rollups');
       expect(fake.failures[0].where).toContain('partition 1');
@@ -304,21 +339,186 @@ describe('AccountRollupsJobRunner', () => {
       for (const wait of [5, 10, 20, 40, 60, 60]) {
         jest.setSystemTime(failedAt + minutes(wait) - 1);
         await run(r);
-        expect(world.recounts.filter((p) => p === 1)).toHaveLength(attempts); // still waiting
+        expect(world.slicesOf(1)).toHaveLength(attempts); // still waiting
         jest.setSystemTime(failedAt + minutes(wait));
         await run(r);
-        expect(world.recounts.filter((p) => p === 1)).toHaveLength(++attempts);
+        expect(world.slicesOf(1)).toHaveLength(++attempts);
         failedAt += minutes(wait);
       }
       // partition 0 was recounted once: its new set is not due
-      expect(world.recounts.filter((p) => p === 0)).toHaveLength(1);
+      expect(world.recounts).toEqual([0]);
+      expect(world.slicesOf(0)).toHaveLength(ADDRESS_SLICE_CHARS.length);
 
       world.failingPartitions.clear();
       jest.setSystemTime(failedAt + minutes(60));
       await run(r);
-      expect(world.recounts.filter((p) => p === 1)).toHaveLength(attempts + 1);
+      expect(world.recounts).toEqual([0, 1]);
       await run(r);
-      expect(world.recounts.filter((p) => p === 1)).toHaveLength(attempts + 1);
+      expect(world.recounts).toEqual([0, 1]);
+    });
+
+    describe('a recount goes on across runs, a few slices at a time', () => {
+      /** `${partition}/${slice}` of the slices from `from` up to `to` (not included). */
+      const slices = (partition: number, from: number, to: number): string[] =>
+        Array.from({ length: to - from }, (_, i) => `${partition}/${from + i}`);
+      /** Runs a minute apart, until a set is written or 20 runs went by. */
+      const runUntilWritten = async (r: AccountRollupsJobRunner): Promise<number> => {
+        const before = world.recounts.length;
+        for (let runs = 1; runs <= 20; runs++) {
+          jest.setSystemTime(Date.now() + minutes(1));
+          await run(r);
+          if (world.recounts.length > before) return runs;
+        }
+        throw new Error('no set was written in 20 runs');
+      };
+
+      beforeEach(() => {
+        // partition 0 has no set (it is due), partition 1 has a fresh one; a slice takes 1 s of the 8 s budget
+        world.partitionVersions.delete(0);
+        world.sliceMs = 1000;
+      });
+
+      it('counts the slices in order while the budget lasts, goes on where it stopped at the next run, and writes the set once, when all 58 are counted, with the accounts of every slice', async () => {
+        world.sliceAccounts.set('0/3', [{ account: 'r4Alpha', rows: 12_000 }]);
+        world.sliceAccounts.set('0/40', [
+          { account: 'rhBeta', rows: 10_000 },
+          { account: 'rhGamma', rows: 55_555 },
+        ]);
+        world.sliceAccounts.set('0/57', [{ account: 'rzDelta', rows: 30_000 }]);
+        const r = runner();
+
+        // the slices start at 0 to 7 s; the ninth would start at 8 s
+        await run(r);
+        expect(world.slices).toEqual(slices(0, 0, 8));
+        expect(world.recounts).toEqual([]);
+        for (let i = 1; i < 7; i++) {
+          jest.setSystemTime(Date.now() + minutes(1));
+          await run(r);
+        }
+        expect(world.slices).toEqual(slices(0, 0, 56));
+        expect(world.recounts).toEqual([]);
+
+        // the eighth run counts the last two and writes the set, in one insert, the sentinel included (writePartitionSet)
+        jest.setSystemTime(Date.now() + minutes(1));
+        await run(r);
+        expect(world.slices).toEqual(slices(0, 0, 58));
+        expect(world.partitionSets).toEqual([
+          {
+            partition: 0,
+            accounts: [
+              { account: 'r4Alpha', rows: 12_000 },
+              { account: 'rhBeta', rows: 10_000 },
+              { account: 'rhGamma', rows: 55_555 },
+              { account: 'rzDelta', rows: 30_000 },
+            ],
+          },
+        ]);
+        expect(world.recountSignals).toEqual([fake.abort.signal]);
+        expect(world.sliceSignals.every((signal) => signal === fake.abort.signal)).toBe(true);
+        expect(fake.failures).toEqual([]);
+
+        // the set is new: nothing is due
+        world.clear();
+        jest.setSystemTime(Date.now() + minutes(1));
+        await run(r);
+        expect(world.slices).toEqual([]);
+        expect(world.recounts).toEqual([]);
+      });
+
+      it('a recount that is under way delays the promotion of an account whose slice ends in its partition, and the run goes on with the rest', async () => {
+        world.heavyAccount('rV', { firstDay: '2026-06-01', rolledFrom: '2026-08-20', rolledThrough: THROUGH });
+        world.setPartitionRows('rV', { 0: 3_000_000 });
+        world.daysOfPartition.set(0, 300); // 10,000 a day: 200 days a slice
+        const r = runner();
+        await run(r);
+        expect(world.recounts).toEqual([]);
+        expect(world.calls()).toEqual([]);
+        expect(await runUntilWritten(r)).toBe(7);
+        expect(world.calls()).toEqual([[['rV'], '2026-06-01', '2026-08-19']]);
+        expect(fake.failures).toEqual([]);
+      });
+
+      it('a restart starts the recount over: what a runner has counted is in its memory only', async () => {
+        await run(runner());
+        expect(world.slices).toEqual(slices(0, 0, 8));
+        world.clear();
+        jest.setSystemTime(Date.now() + minutes(1));
+        const second = runner();
+        await run(second);
+        expect(world.slices).toEqual(slices(0, 0, 8));
+        expect(await runUntilWritten(second)).toBe(7);
+        expect(world.slices).toEqual(slices(0, 0, 58));
+      });
+
+      it('a slice that fails is logged, counted and waits; the slices before it are kept, and the recount goes on at it', async () => {
+        world.sliceAccounts.set('0/2', [{ account: 'r3Alpha', rows: 12_000 }]);
+        world.failingSlices.add('0/5');
+        const r = runner();
+        await run(r);
+        expect(world.slices).toEqual(slices(0, 0, 6));
+        expect(fake.failures).toHaveLength(1);
+        expect(fake.failures[0].job).toBe('account_rollups');
+        expect(fake.failures[0].where).toContain('partition 0');
+
+        // it waits 5 minutes
+        world.failingSlices.clear();
+        world.clear();
+        const failedAt = Date.now();
+        jest.setSystemTime(failedAt + minutes(5) - 1);
+        await run(r);
+        expect(world.slices).toEqual([]);
+        jest.setSystemTime(failedAt + minutes(5));
+        await run(r);
+        expect(world.slices).toEqual(slices(0, 5, 13));
+        await runUntilWritten(r);
+        expect(world.slices).toEqual(slices(0, 5, 58));
+        expect(world.partitionSets).toEqual([{ partition: 0, accounts: [{ account: 'r3Alpha', rows: 12_000 }] }]);
+      });
+
+      it('a partition that ofSlice marks after its recount began is recounted again, from the first slice, once its set is written', async () => {
+        const r = runner();
+        await run(r);
+        // a slice of agg_dirty of 2026-07-01 marks partition 0 while its recount is under way
+        jest.setSystemTime(Date.now() + minutes(1));
+        await r.ofSlice(unix('2026-07-01T05:00:00Z'), unix('2026-07-01T06:00:00Z'), fake.tick());
+        // the recount goes on where it was, and writes its set
+        expect(await runUntilWritten(r)).toBe(7);
+        expect(world.slices).toEqual(slices(0, 0, 58));
+
+        // the ingest may have written rows into slices it had counted: a new recount, from the first slice
+        world.clear();
+        expect(await runUntilWritten(r)).toBe(8);
+        expect(world.slices).toEqual(slices(0, 0, 58));
+        expect(world.recounts).toEqual([0]);
+
+        // that one began after the mark: nothing is due
+        world.clear();
+        jest.setSystemTime(Date.now() + minutes(1));
+        await run(r);
+        expect(world.slices).toEqual([]);
+      });
+
+      it('drops a recount whose partition is no longer due, so that its next recount starts over instead of going on with old counts', async () => {
+        world.partitionVersions.set(0, NOW.getTime() - HOUR * 1000);
+        world.partitionVersions.set(1, NOW.getTime() - 25 * HOUR * 1000); // the newest partition, a day old: due
+        const r = runner();
+        await run(r);
+        expect(world.slices).toEqual(slices(1, 0, 8));
+
+        // the chain reaches partition 2 (which has a set): partition 1 is not the newest any more, and only due at 7 days old
+        world.newest = T0 + (20_000_000 - FIRST_LEDGER) * 4 + 60;
+        world.partitionVersions.set(2, Date.now());
+        world.clear();
+        jest.setSystemTime(Date.now() + minutes(1));
+        await run(r);
+        expect(world.slices).toEqual([]);
+
+        // a slice of agg_dirty marks it: its recount starts at the first slice
+        await r.ofSlice(unix('2026-09-01T00:00:00Z'), unix('2026-09-01T01:00:00Z'), fake.tick());
+        jest.setSystemTime(Date.now() + minutes(1));
+        await run(r);
+        expect(world.slices).toEqual(slices(1, 0, 8));
+      });
     });
 
     it('a new heavy account gets a state row with its first_day and no coverage; one that is no longer heavy loses its coverage; a state of another config version counts as uncovered', async () => {
@@ -646,8 +846,9 @@ describe('AccountRollupsJobRunner', () => {
       const r = runner();
 
       await run(r);
-      // only the recount failed; rV was not promoted (its count in partition 0 is not known), rW was
-      expect(world.recounts).toEqual([0]);
+      // only the recount failed (at its first slice); rV was not promoted (its count in partition 0 is not known), rW was
+      expect(world.slices).toEqual(['0/0']);
+      expect(world.recounts).toEqual([]);
       expect(fake.failures).toHaveLength(1);
       expect(fake.failures[0].where).toContain('partition 0');
       expect(world.calls()).toEqual([[['rW'], '2026-09-20', THROUGH]]);
@@ -1259,8 +1460,9 @@ describe('AccountRollupsJobRunner', () => {
       world.failingAccounts.add(accountName(0));
       world.failingAccounts.add(accountName(1));
       await run(runner());
-      // two partitions, then one account; the run gave up there
-      expect(world.recounts).toEqual([1, 0]);
+      // two partitions (each at its first slice), then one account; the run gave up there
+      expect(world.slices).toEqual(['1/0', '0/0']);
+      expect(world.recounts).toEqual([]);
       expect(world.calls().map(([accounts]) => accounts[0])).toEqual([accountName(0)]);
       expect(fake.failures).toHaveLength(3);
     });

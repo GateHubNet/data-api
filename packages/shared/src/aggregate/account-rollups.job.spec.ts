@@ -6,10 +6,12 @@ import {
   ACCOUNT_ROLLUP_SLICE_ROWS,
   ADDRESS_SLICE_CHARS,
   BALANCE_PARTITION_LEDGERS,
+  countPartitionSlice,
   firstChangeDay,
   partitionOf,
   promotionSlice,
   recountPartition,
+  writePartitionSet,
 } from './account-rollups.job';
 import { AggregateSetAborted } from './aggregate-sets';
 
@@ -132,6 +134,95 @@ function fakeService(slices: (i: number) => { account: string; n: string }[] = (
   } as unknown as ClickHouseService;
   return { ch, reads, inserts };
 }
+
+describe('countPartitionSlice', () => {
+  it('reads one slice of the partition: the key range of its character up to the next one, and writes nothing', async () => {
+    const chars = [...ADDRESS_SLICE_CHARS];
+    for (const i of [0, 1, 40, 57]) {
+      const { ch, reads, inserts } = fakeService();
+      expect(await countPartitionSlice(ch, 3, i)).toEqual([]);
+      expect(reads).toHaveLength(1);
+      expect(reads[0].params).toEqual({
+        p_min: 30_000_000,
+        p_max: 39_999_999,
+        floor: 10_000,
+        ...(i > 0 && { lo: `r${chars[i]}` }),
+        ...(i < 57 && { hi: `r${chars[i + 1]}` }),
+      });
+      expect(reads[0].sql.includes('account >= {lo:String}')).toBe(i > 0);
+      expect(reads[0].sql.includes('account < {hi:String}')).toBe(i < 57);
+      expect(inserts).toEqual([]);
+    }
+  });
+
+  it('returns the accounts the slice keeps, with their rows as numbers', async () => {
+    const { ch } = fakeService(() => [
+      { account: 'rBeta', n: '10000' },
+      { account: 'rGamma', n: '55555555555' },
+    ]);
+    expect(await countPartitionSlice(ch, 1, 40)).toEqual([
+      { account: 'rBeta', rows: 10_000 },
+      { account: 'rGamma', rows: 55_555_555_555 },
+    ]);
+  });
+
+  it('rejects a slice that is not one of the 58, before it reads', async () => {
+    for (const slice of [-1, 58, 1.5, Number.NaN]) {
+      const { ch, reads } = fakeService();
+      await expect(countPartitionSlice(ch, 0, slice)).rejects.toBeInstanceOf(RangeError);
+      expect(reads).toHaveLength(0);
+    }
+  });
+
+  it('throws AggregateSetAborted before the read when the signal is aborted', async () => {
+    const { ch, reads } = fakeService();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(countPartitionSlice(ch, 0, 5, { signal: controller.signal })).rejects.toBeInstanceOf(
+      AggregateSetAborted,
+    );
+    expect(reads).toHaveLength(0);
+  });
+});
+
+describe('writePartitionSet', () => {
+  it('writes the accounts and the sentinel in one insert under one version, and returns how many accounts it wrote', async () => {
+    const { ch, reads, inserts } = fakeService();
+    const accounts = [
+      { account: 'rAlpha', rows: 12_000 },
+      { account: 'rBeta', rows: 10_000 },
+    ];
+    expect(await writePartitionSet(ch, 2, accounts)).toBe(2);
+    expect(reads).toHaveLength(0);
+    const version = 1_760_000_000_000;
+    expect(inserts).toEqual([
+      {
+        table: Table.AccountPartitionRows,
+        rows: [
+          { partition: 2, account: 'rAlpha', rows: 12_000, version },
+          { partition: 2, account: 'rBeta', rows: 10_000, version },
+          { partition: 2, account: '', rows: 0, version },
+        ],
+      },
+    ]);
+  });
+
+  it('writes the sentinel alone for no account', async () => {
+    const { ch, inserts } = fakeService();
+    expect(await writePartitionSet(ch, 0, [])).toBe(0);
+    expect(inserts[0].rows).toEqual([{ partition: 0, account: '', rows: 0, version: 1_760_000_000_000 }]);
+  });
+
+  it('writes nothing when the signal is aborted', async () => {
+    const { ch, inserts } = fakeService();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      writePartitionSet(ch, 0, [{ account: 'rAlpha', rows: 12_000 }], { signal: controller.signal }),
+    ).rejects.toBeInstanceOf(AggregateSetAborted);
+    expect(inserts).toHaveLength(0);
+  });
+});
 
 describe('recountPartition', () => {
   it('reads the partition in 58 slices, the first without a lower bound and the last without an upper one', async () => {

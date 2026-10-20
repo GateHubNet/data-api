@@ -225,6 +225,7 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
 | `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines |
 | `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
+| `syncer_markets_live_age_seconds{period=~"7day\|30day"}` | under about 300 s (a set every fifth run, about every 5 minutes); about 900 s for a few minutes after one failed set | Above 600 s for 10 minutes: that period of the Markets table is stale (the `MARKETS` switch needs all three periods under 600 s) |
 | `syncer_pair_hourly_missing_hours` | 0 | Above 0 for 30 minutes |
 | `syncer_rates_daily_missing_days` | 0 (the day that has just become final is computed by the next run) | Above 2 for 6 hours after the first back-fill; the size of the history on a fresh deployment, falling over about a day |
 | `syncer_account_rollups_pending_accounts` | 0 | Positive for days: a heavy account is not being promoted |
@@ -401,7 +402,8 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 `range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)):
 
 - **Rates**: the days of the slice and the 14 after it that have a valid set are marked stale (a day's rate reads the trades of the 14 days before it). Until `rates_daily` has computed them again, newest first, the API values those days on read, so `syncer_rates_daily_missing_days` rises by up to the range plus 14 days and falls again; expect the
-  slower path for the window of the range, and `api_rates_on_read_total` to show it.
+  slower path for the window of the range, and `api_rates_on_read_total` to show it. While ranges of the re-ingest wait in `agg_dirty`, `rates_daily` leaves the days they reach (the range and the 14 days after it) for after they are drained, so the gauge falls only as the queue empties. A range
+  that keeps failing keeps its days waiting too: the "Daily rates not written" alert and `syncer_aggregator_errors_total` both show it.
 - **Hours**: the hours of the slice in the last 31 days are recomputed at once.
 - **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
 

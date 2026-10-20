@@ -25,7 +25,9 @@ import type { AggregatorJob, AggregatorTick } from './aggregator.service';
  * yesterday only once the ingest has passed it. A day is valid when its newest sentinel is not stale and has the current config
  * version (`validRateDays`), which is why a correction (`ofSlice`) and a new config version both come back to the same list.
  * At least one day is computed per run, whatever is left of the budget (the readers value a day that has no set on read, and
- * that is the slow path); the others only while the deadline of the tick has not passed and the shutdown has not begun.
+ * that is the slow path); the others only while the deadline of the tick has not passed and the shutdown has not begun. A day
+ * whose rate reads the trades of a range that `agg_dirty` still holds waits until the range is drained (`deferredDays`): its
+ * hook would make a set computed now stale again.
  *
  * A day that fails is logged and counted (`deps.failed`), waits 5 minutes before it is tried again and twice as long after each
  * further failure, up to an hour, while the others go on; the run gives up after 3 days failed. The job says once that the
@@ -108,15 +110,44 @@ export class RatesDailyJobRunner {
     const backfill = due.filter((day) => day !== yesterday).length;
     this.announceBackfill(backfill > 0, backfill);
 
-    const done = await this.sweep(tick, due);
+    const deferred = await this.deferredDays(due);
+    const done = await this.sweep(
+      tick,
+      due.filter((day) => !deferred.has(day)),
+      deferred.size > 0,
+    );
+    // a deferred day is still missing
     deps.metrics?.ratesDailyMissingDays.set(due.length - done);
   }
 
   /**
-   * The days of `due`, in order, as long as the deadline lasts (after the first one) and fewer than 3 have failed. Returns
-   * how many were computed.
+   * The due days whose rate reads the trades of a range that `agg_dirty` still holds: for a pending range of the days X to Y,
+   * the days X to Y + 14, which its hook (`ofSlice`) marks stale once the range is drained. A set computed now would be made
+   * stale by that mark, so they wait for it (the readers value them on read meanwhile, as any day without a set). During a
+   * long re-ingest that `stats_dirty` drains behind, this keeps the job from computing the same days again for every chunk.
+   * One read of `agg_dirty`, and only when a day is due.
    */
-  private async sweep(tick: AggregatorTick, due: string[]): Promise<number> {
+  private async deferredDays(due: string[]): Promise<Set<string>> {
+    if (due.length === 0) return new Set();
+    const spans = (await this.fns.dirtyDaySpans(this.deps.ch)).map(({ first, last }) => ({
+      first,
+      through: isoDay(Date.parse(`${last}T00:00:00Z`) / 1000 + LATEST_DAYS * DAY_SECONDS),
+    }));
+    const deferred = due.filter((day) => spans.some(({ first, through }) => first <= day && day <= through));
+    if (deferred.length > 0) {
+      this.deps.logger.debug(
+        `rates_daily: ${deferred.length} day(s) deferred (${deferred[deferred.length - 1]} - ${deferred[0]}): ` +
+          'agg_dirty still has ranges of the trades they read',
+      );
+    }
+    return new Set(deferred);
+  }
+
+  /**
+   * The days of `due`, in order, as long as the deadline lasts (after the first one) and fewer than 3 have failed. Returns
+   * how many were computed. The back-fill is done when none failed or waits, and no day was `deferred`.
+   */
+  private async sweep(tick: AggregatorTick, due: string[], deferred: boolean): Promise<number> {
     const { deps } = this;
     let computed = 0;
     let failed = 0;
@@ -137,7 +168,7 @@ export class RatesDailyJobRunner {
         return computed;
       }
     }
-    if (failed === 0 && waiting === 0 && !deps.closing()) this.announceBackfill(false, 0);
+    if (failed === 0 && waiting === 0 && !deferred && !deps.closing()) this.announceBackfill(false, 0);
     return computed;
   }
 
