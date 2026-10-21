@@ -25,6 +25,9 @@
  */
 export const PARSER_VERSION = 2;
 
+/** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
+export const AMM_PARSER_VERSION = 2;
+
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;
 /** `DateTime('UTC')` column: unix seconds. */

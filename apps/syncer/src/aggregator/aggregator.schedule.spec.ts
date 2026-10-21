@@ -168,7 +168,7 @@ class D2World {
       },
       computeMarketsSet: async (_ch, _native, period) => {
         this.call('markets_live', period, true);
-        return { written: true, pairs: 1, startTime: this.newest - DAY, endTime: this.newest };
+        return { written: true, pairs: 1, startTime: this.newest - DAY, endTime: this.newest, ammShareKnown: true };
       },
       marketsSetEndTimes: async () => new Map(),
       firstNativeTradeDay: async () => this.firstTradeDay,

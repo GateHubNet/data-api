@@ -35,7 +35,13 @@ class FakeMarkets {
         this.order.push(period);
         this.onCompute?.(period);
         if (this.callMs > 0) jest.setSystemTime(Date.now() + this.callMs);
-        const outcome = this.outcomes.get(period) ?? { written: true, pairs: 3, startTime: 0, endTime: 0 };
+        const outcome = this.outcomes.get(period) ?? {
+          written: true,
+          pairs: 3,
+          startTime: 0,
+          endTime: 0,
+          ammShareKnown: true,
+        };
         if (outcome instanceof Error) throw outcome;
         return outcome;
       },
