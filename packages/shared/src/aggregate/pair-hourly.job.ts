@@ -7,20 +7,26 @@ import { KEEP_ANY_PAIR, RatesService } from '../query/rates.service';
 import { AggregateSetOptions, newestLedgerClose, nextSetVersion, throwIfSetAborted } from './aggregate-sets';
 
 /**
- * The `pair_hourly` job: for each UTC hour, the candle of every pair (the trades of the hour summed, with the open,
- * close, high and low rate and the `(ledger, tx, node)` key of the trade each came from), kept in `pair_hourly` so that
- * the markets and the sparklines read a few rows per pair and hour instead of its trades.
+ * The `pair_hourly` job: for each UTC hour, the candle of every pair and source (the trades of the hour summed, with the
+ * open, close, high and low rate and the `(ledger, tx, node)` key of the trade each came from), kept in `pair_hourly` so
+ * that the markets and the sparklines read a few rows per pair and hour instead of its trades. The source is `amm` for
+ * a swap against a pool (a row of `exchanges` with `amm_account` set) and `book` for an order-book trade: a pair with
+ * both in an hour has a row of each, and each is the candle of its own trades.
  *
- * An hour is a **set**: a row for each pair that has a kept trade in it (native legs of 0.0005 or less are left out, as
- * in candles and `reduce`: `KEEP_ANY_PAIR`) and a **sentinel** row (the empty pair) that every hour has, trades or not.
+ * An hour is a **set**: a row for each pair and source that has a kept trade in it (native legs of 0.0005 or less are
+ * left out, swaps too, as in candles and `reduce`: `KEEP_ANY_PAIR`) and a **sentinel** row (the empty pair, source
+ * `book`) that every hour has, trades or not.
  * Every row of the set carries the set's `is_final` (a ledger closed at or after the hour's end, so no trade can still
  * come), `config_version` and `through_time` (the close time of the hour's newest ledger, or the hour's start when it
  * has none). The whole set is one insert under one version, and a reader takes the newest sentinel of an hour
  * (`pairHourSets`) and then the rows of that version. Which hours are due, and when, is the runner's.
  */
 
-/** The version of what a set means: a change of the candle rules is a new one, and every hour is computed again. */
-export const PAIR_HOURLY_CONFIG_VERSION = 1;
+/**
+ * The version of what a set means: a change of the candle rules is a new one, and every hour is computed again. 2 is the
+ * split of each pair by source (`book`, `amm`); 1 had one row per pair, of the order book and the pools together.
+ */
+export const PAIR_HOURLY_CONFIG_VERSION = 2;
 
 /** How many days back the aggregator keeps sets for (the table's TTL, 45 days, drops what is older). */
 export const PAIR_HOURLY_DAYS = 31;
@@ -43,13 +49,14 @@ const ROWS_OF_HOUR = "hour = toDateTime({hour:UInt32}, 'UTC')";
 /** The key of a trade: its ledger, transaction and node. */
 type TradeKey = [ledger: number, tx: number, node: number];
 
-/** One group of the read of `exchanges`: a pair in an hour. `n` and the sums are those of `volumeColumns`. */
+/** One group of the read of `exchanges`: a pair and source in an hour. `n` and the sums are those of `volumeColumns`. */
 interface PairHourGroup extends VolumeSums {
   hour_start: number;
   base_currency: string;
   base_issuer: string;
   counter_currency: string;
   counter_issuer: string;
+  source: 'book' | 'amm';
   open_rate: string;
   close_rate: string;
   high_rate: string;
@@ -126,7 +133,7 @@ function sentinelOf(set: SetFields): PairHourlyRow {
   };
 }
 
-/** The row of a pair in an hour. The sums are stored as ClickHouse wrote them (`'0'` for no amount to sum). */
+/** The row of a pair and source in an hour. The sums are stored as ClickHouse wrote them (`'0'` for no amount to sum). */
 function pairRowOf(g: PairHourGroup, set: SetFields): PairHourlyRow {
   return {
     ...sentinelOf(set),
@@ -134,6 +141,7 @@ function pairRowOf(g: PairHourGroup, set: SetFields): PairHourlyRow {
     base_issuer: g.base_issuer,
     counter_currency: g.counter_currency,
     counter_issuer: g.counter_issuer,
+    source: g.source,
     count: g.n,
     base_sum: g.base_sum ?? '0',
     counter_sum: g.counter_sum ?? '0',
@@ -206,7 +214,7 @@ export async function computePairHourSets(
     const [pairs, ledgers] = await Promise.all([
       ch.query<PairHourGroup>(
         `SELECT toUnixTimestamp(toStartOfHour(close_time)) AS hour_start,
-                ${PAIR_COLUMNS.join(', ')},
+                ${PAIR_COLUMNS.join(', ')}, source,
                 ${AGGREGATE_COLUMNS},
                 min(${TRADE_KEY}) AS open_key,
                 max(${TRADE_KEY}) AS close_key,
@@ -214,13 +222,14 @@ export async function computePairHourSets(
                 max(rate_f) AS high_rate_f,
                 argMin(${TRADE_KEY}, (rate_f, ledger_index, tx_index, node_index)) AS low_key,
                 min(rate_f) AS low_rate_f
-           FROM (SELECT ${PAIR_COLUMNS.join(', ')}, ${AGGREGATE_SOURCE_COLUMNS}
+           FROM (SELECT ${PAIR_COLUMNS.join(', ')}, if(amm_account != '', 'amm', 'book') AS source,
+                        ${AGGREGATE_SOURCE_COLUMNS}
                    FROM ${Table.Exchanges}
                   WHERE ledger_index BETWEEN {min:UInt32} AND {max:UInt32} AND ${KEEP_ANY_PAIR}
                   ORDER BY ${KEY_COLUMNS.join(', ')}
                   LIMIT 1 BY ${KEY_COLUMNS.join(', ')})
-          GROUP BY hour_start, ${PAIR_COLUMNS.join(', ')}
-          ORDER BY hour_start, ${PAIR_COLUMNS.join(', ')}`,
+          GROUP BY hour_start, ${PAIR_COLUMNS.join(', ')}, source
+          ORDER BY hour_start, ${PAIR_COLUMNS.join(', ')}, source`,
         params,
       ),
       ch.query<{ hour_start: number; closed: number }>(

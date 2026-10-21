@@ -24,7 +24,9 @@ import { SAMPLE_ROWS } from './sample-rows';
  * hour (the key tells them apart), rates whose text sorts the other way than their value, several trades in one ledger
  * (told apart by their transaction and node), a trade at the first and one at the last second of an hour, the native
  * dust of 0.0005 on either side, a pair whose only trades in an hour are dust, and an amount of 1e40 that the exact
- * sums cannot hold. An oracle written from the stored `exchanges` rows says what every candle is.
+ * sums cannot hold. Some of the rows are swaps against a pool (`amm_account` set): in an hour that also has order-book
+ * trades of the pair, in a pair of their own, and as native dust. An oracle written from the stored `exchanges` rows
+ * says what every candle is, for each source apart.
  *
  * The hours are in 2016, long before the real clock of the ClickHouse server, so `pair_hourly` is stopped from merging
  * for TTL in each database the tests use (see `freshService`): its rows expire 45 days after their hour, and an expired
@@ -52,9 +54,16 @@ const USD_XRP = canonicalPair(issued('USD'), XRP); // the native currency is the
 const XRP_ZZZ = canonicalPair(XRP, issued('ZZZ')); // the native currency is the base
 const EUR_USD = canonicalPair(issued('EUR'), issued('USD'));
 const BTC_USD = canonicalPair(issued('BTC'), issued('USD'));
+const GBP_USD = canonicalPair(issued('GBP'), issued('USD')); // a pair of swaps only
 type StoredPair = typeof USD_XRP;
 
-/** A trade of a stored pair: its close time, its transaction and node, and its amounts as exact decimal text. */
+const POOL_A = 'rPoolAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const POOL_B = 'rPoolBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+
+/**
+ * A trade of a stored pair: its close time, its transaction and node, and its amounts as exact decimal text. A swap
+ * against a pool has the pool's account; an order-book trade has none.
+ */
 interface Trade {
   pair: StoredPair;
   close: number;
@@ -62,15 +71,34 @@ interface Trade {
   node: number;
   base: string;
   counter: string;
+  pool: string;
 }
-const trade = (pair: StoredPair, close: number, tx: number, node: number, base: string, counter: string): Trade => ({
+const trade = (
+  pair: StoredPair,
+  close: number,
+  tx: number,
+  node: number,
+  base: string,
+  counter: string,
+  pool = '',
+): Trade => ({
   pair,
   close,
   tx,
   node,
   base,
   counter,
+  pool,
 });
+const swap = (
+  pool: string,
+  pair: StoredPair,
+  close: number,
+  tx: number,
+  node: number,
+  base: string,
+  counter: string,
+): Trade => trade(pair, close, tx, node, base, counter, pool);
 
 function worldTrades(): Trade[] {
   return [
@@ -112,6 +140,31 @@ function worldTrades(): Trade[] {
   ];
 }
 
+/**
+ * The swaps of the world, in the hours and pairs of its order-book trades and apart from them:
+ *  - XRP/ZZZ in hour 3 (six order-book trades, all of rate 2.5): three swaps of the rates 2, 3 and 3.5, two pools, the
+ *    first in the ledger of 03:00:00 that holds order-book trades too;
+ *  - EUR/USD in hour 5 (one order-book trade, at 05:59:59): a swap in the same ledger;
+ *  - GBP/USD, a pair of swaps only: three in hour 4 (the rates 1.2, 1.5 and 1.2) and one in hour 5;
+ *  - native dust: the base of 0.0005 in XRP/ZZZ in hour 4 (which has a kept order-book trade), the counter of 0.0004 in
+ *    USD/XRP in hour 4, and the base of 0.0003 in XRP/ZZZ in hour 5 (whose only other trade is dust too).
+ */
+function worldSwaps(): Trade[] {
+  return [
+    swap(POOL_A, XRP_ZZZ, at(3, 0, 0), 5, 1, '4', '8'),
+    swap(POOL_A, XRP_ZZZ, at(3, 10, 0), 1, 1, '5', '15'),
+    swap(POOL_B, XRP_ZZZ, at(3, 40, 0), 3, 2, '10', '35'),
+    swap(POOL_B, EUR_USD, at(5, 59, 59), 2, 1, '3', '9'),
+    swap(POOL_B, GBP_USD, at(4, 6, 0), 1, 1, '10', '12'),
+    swap(POOL_B, GBP_USD, at(4, 16, 0), 1, 1, '10', '15'),
+    swap(POOL_B, GBP_USD, at(4, 26, 0), 1, 1, '10', '12'),
+    swap(POOL_B, GBP_USD, at(5, 40, 0), 1, 1, '1', '1.1'),
+    swap(POOL_A, XRP_ZZZ, at(4, 15, 0), 1, 1, '0.0005', '3'),
+    swap(POOL_A, USD_XRP, at(4, 20, 0), 1, 1, '2', '0.0004'),
+    swap(POOL_A, XRP_ZZZ, at(5, 6, 0), 1, 1, '0.0003', '2'),
+  ];
+}
+
 /** The ledgers with no trade in them: the newest ledger of the world closes at 08:30:00. */
 const EXTRA_LEDGERS = [at(8, 30, 0)];
 
@@ -128,6 +181,8 @@ function exchangeRowsOf(trades: Trade[], ledgerOf: Map<number, number>): Exchang
       tx_index: t.tx,
       node_index: t.node,
       tx_hash: `${i}`.padStart(64, 'E'),
+      // the sample row is a swap: an order-book trade has no pool
+      amm_account: t.pool,
       close_time: t.close,
       base_amount: t.base,
       counter_amount: t.counter,
@@ -142,7 +197,7 @@ function exchangeRowsOf(trades: Trade[], ledgerOf: Map<number, number>): Exchang
 /** Writes a ledger for every second that has a trade (and the given ledgers) and the trades; returns the exchange rows. */
 async function seedWorld(
   ch: ClickHouseService,
-  trades: Trade[] = worldTrades(),
+  trades: Trade[] = [...worldTrades(), ...worldSwaps()],
   ledgers: number[] = EXTRA_LEDGERS,
 ): Promise<ExchangesRow[]> {
   const closes = [...new Set([...trades.map((t) => t.close), ...ledgers])].sort((a, b) => a - b);
@@ -177,6 +232,7 @@ interface Candle {
   base_issuer: string;
   counter_currency: string;
   counter_issuer: string;
+  source: 'book' | 'amm';
   count: number;
   unfit: number;
   base_sum: string;
@@ -210,6 +266,9 @@ interface FloatSums {
 const byKey = (a: ExchangesRow, b: ExchangesRow): number =>
   a.ledger_index - b.ledger_index || a.tx_index - b.tx_index || a.node_index - b.node_index;
 
+/** A swap against a pool is source amm, an order-book trade source book. */
+const sourceOf = (r: ExchangesRow): 'book' | 'amm' => (r.amm_account !== '' ? 'amm' : 'book');
+
 /** Both native legs above the dust: a side without an issuer is native. */
 const kept = (r: ExchangesRow): boolean =>
   (r.base_issuer !== '' || new BigNumber(r.base_amount).gt(DUST)) &&
@@ -229,7 +288,7 @@ function oracle(rows: ExchangesRow[]): Array<Candle & FloatSums> {
   const groups = new Map<string, ExchangesRow[]>();
   for (const r of rows.filter(kept)) {
     const hour = Math.floor(r.close_time / HOUR) * HOUR;
-    const key = [hour, r.base_currency, r.base_issuer, r.counter_currency, r.counter_issuer].join('|');
+    const key = [hour, r.base_currency, r.base_issuer, r.counter_currency, r.counter_issuer, sourceOf(r)].join('|');
     groups.set(key, [...(groups.get(key) ?? []), r]);
   }
   return [...groups.entries()].map(([, group]) => {
@@ -246,6 +305,7 @@ function oracle(rows: ExchangesRow[]): Array<Candle & FloatSums> {
       base_issuer: open.base_issuer,
       counter_currency: open.counter_currency,
       counter_issuer: open.counter_issuer,
+      source: sourceOf(open),
       count: group.length,
       unfit: group.filter((r) => !fits(r.base_amount) || !fits(r.counter_amount)).length,
       base_sum: sumOfAmounts(group.map((r) => r.base_amount)),
@@ -282,7 +342,8 @@ const candleOrder = (a: Candle, b: Candle): number =>
     ? -1
     : a.base_currency + a.counter_currency > b.base_currency + b.counter_currency
       ? 1
-      : 0);
+      : 0) ||
+  (a.source < b.source ? -1 : a.source > b.source ? 1 : 0);
 
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -366,6 +427,7 @@ describe('the pair_hourly sets (e2e)', () => {
       .filter((r) => !isSentinel(r))
       .map(({ source, is_final, config_version, through_time, version, base_sum, counter_sum, ...candle }) => ({
         ...candle,
+        source: source as Candle['source'],
         base_sum: new BigNumber(base_sum).toFixed(),
         counter_sum: new BigNumber(counter_sum).toFixed(),
       }))
@@ -399,24 +461,28 @@ describe('the pair_hourly sets (e2e)', () => {
     const compute = (from: number, to: number, signal?: AbortSignal): Promise<number> =>
       computePairHourSets(current, rates, from, to, { signal });
 
-    it('the constants are 1 and 31', () => {
-      expect(PAIR_HOURLY_CONFIG_VERSION).toBe(1);
+    it('the constants are 2 and 31', () => {
+      expect(PAIR_HOURLY_CONFIG_VERSION).toBe(2);
       expect(PAIR_HOURLY_DAYS).toBe(31);
     });
 
     it('the world has the shape the tests rely on', async () => {
-      // 24 trades in 21 ledgers; the dust and the 1e40 are in the table
-      expect(exchanges).toHaveLength(24);
-      expect(new Set(exchanges.map((r) => r.ledger_index)).size).toBe(21);
-      expect(exchanges.filter((r) => !kept(r))).toHaveLength(5);
+      // 24 order-book trades and 11 swaps in 29 ledgers; the dust and the 1e40 are in the table
+      expect(exchanges).toHaveLength(35);
+      expect(exchanges.filter((r) => r.amm_account === '')).toHaveLength(24);
+      expect(exchanges.filter((r) => r.amm_account !== '')).toHaveLength(11);
+      expect(new Set(exchanges.map((r) => r.ledger_index)).size).toBe(29);
+      expect(exchanges.filter((r) => !kept(r))).toHaveLength(8);
       expect(exchanges.filter((r) => r.base_amount === '1e+40')).toHaveLength(1);
-      // trades on the first second of an hour (three in one ledger) and on the last second of an hour
-      expect(exchanges.filter((r) => r.close_time % HOUR === 0)).toHaveLength(3);
-      expect(exchanges.filter((r) => r.close_time % HOUR === HOUR - 1)).toHaveLength(3);
+      // trades on the first second of an hour (three in one ledger, with a swap) and on the last second of an hour
+      expect(exchanges.filter((r) => r.close_time % HOUR === 0)).toHaveLength(4);
+      expect(exchanges.filter((r) => r.close_time % HOUR === HOUR - 1)).toHaveLength(4);
       // the text of the rates 9 and 100 sorts the other way than their value
       expect(['9', '100'].sort()).toEqual(['100', '9']);
-      // the oracle has 6 candles in 3 hours
-      expect(oracle(exchanges)).toHaveLength(6);
+      // the oracle has 6 candles of the order book and 4 of swaps, in 3 hours
+      expect(oracle(exchanges.filter((r) => r.amm_account === ''))).toHaveLength(6);
+      expect(oracle(exchanges.filter((r) => r.amm_account !== ''))).toHaveLength(4);
+      expect(oracle(exchanges)).toHaveLength(10);
     });
 
     it('every pair of an hour is its candle', async () => {
@@ -438,7 +504,9 @@ describe('the pair_hourly sets (e2e)', () => {
           )
         )[0].ledger_index;
       const [ledger0300, ledger0359] = [await ledgerAt(at(3, 0, 0)), await ledgerAt(at(3, 59, 59))];
-      const [zzz] = candlesOf(rows).filter((c) => c.counter_currency === 'ZZZ' && c.hour === hourAt(3));
+      const [zzz] = candlesOf(rows).filter(
+        (c) => c.counter_currency === 'ZZZ' && c.hour === hourAt(3) && c.source === 'book',
+      );
       expect(zzz).toMatchObject({
         count: 6,
         base_sum: '50',
@@ -468,7 +536,9 @@ describe('the pair_hourly sets (e2e)', () => {
       // EUR/USD in hour 3: rates 9, 100, 10, 100, 9 in the order of the keys. The high (rate 100: by value, its text
       // sorts before that of 9) is the trade of the earlier ledger, though the later one has the lower transaction
       // index; so is the low (rate 9)
-      const [eur] = candlesOf(rows).filter((c) => c.base_currency === 'EUR' && c.hour === hourAt(3));
+      const [eur] = candlesOf(rows).filter(
+        (c) => c.base_currency === 'EUR' && c.hour === hourAt(3) && c.source === 'book',
+      );
       expect(eur).toMatchObject({
         count: 5,
         base_sum: '1.5', // 0.2 + 0.1 + 0.4 + 0.3 + 0.5, which a Float64 sum does not give
@@ -487,7 +557,9 @@ describe('the pair_hourly sets (e2e)', () => {
         low_tx: 7,
       });
       // the hour of a trade is the hour of its close time: 03:00:00 is hour 3, and 05:59:59 is hour 5
-      expect(candlesOf(rows).find((c) => c.base_currency === 'EUR' && c.hour === hourAt(5))).toMatchObject({
+      expect(
+        candlesOf(rows).find((c) => c.base_currency === 'EUR' && c.hour === hourAt(5) && c.source === 'book'),
+      ).toMatchObject({
         count: 1,
         open_time: at(5, 59, 59),
         close_time: at(5, 59, 59),
@@ -501,7 +573,8 @@ describe('the pair_hourly sets (e2e)', () => {
     it('native dust (0.0005 or less) is left out', async () => {
       await compute(hourAt(3), hourAt(6));
       const candles = candlesOf(await storedRows());
-      const at4 = (currency: string) => candles.find((c) => c.hour === hourAt(4) && c.base_currency === currency);
+      const at4 = (currency: string) =>
+        candles.find((c) => c.hour === hourAt(4) && c.base_currency === currency && c.source === 'book');
 
       // the native counter: 5 trades, 2 of dust (0.0005 and 0.0004); the open is the first kept trade (rate 0.00051), and
       // the low is that rate, not the rates of the dust (5e-7 and 0.0004), which are lower
@@ -532,9 +605,120 @@ describe('the pair_hourly sets (e2e)', () => {
       // and the dust is in the table, so that this proves something
       const dust = await ch().query<{ n: string }>(
         `SELECT count() AS n FROM ${Table.Exchanges}
-          WHERE (base_issuer = '' AND base_amount_f <= 0.0005) OR (counter_issuer = '' AND counter_amount_f <= 0.0005)`,
+          WHERE amm_account = '' AND ((base_issuer = '' AND base_amount_f <= 0.0005)
+             OR (counter_issuer = '' AND counter_amount_f <= 0.0005))`,
       );
       expect(Number(dust[0].n)).toBe(5);
+    });
+
+    it('a swap is source amm and an order-book trade source book: a pair with both in an hour has a row of each, each the candle of its own trades', async () => {
+      await compute(hourAt(3), hourAt(6));
+      const rows = await storedRows();
+      const candles = candlesOf(rows);
+
+      // each source is the oracle over the trades of that source alone
+      const bookTrades = exchanges.filter((r) => r.amm_account === '');
+      const swaps = exchanges.filter((r) => r.amm_account !== '');
+      expectCandles(
+        candles.filter((c) => c.source === 'book'),
+        oracle(bookTrades),
+      );
+      expectCandles(
+        candles.filter((c) => c.source === 'amm'),
+        oracle(swaps),
+      );
+      // a pair, an hour and a source have one row
+      const keys = candles.map((c) => [c.hour, c.base_currency, c.counter_currency, c.source].join('|'));
+      expect(new Set(keys).size).toBe(keys.length);
+
+      // by hand, so that the oracle and the job cannot share a mistake. XRP/ZZZ in hour 3 has six order-book trades of
+      // rate 2.5 (see 'every pair of an hour is its candle') and three swaps, of the rates 2 (03:00:00, in a ledger
+      // that holds order-book trades too), 3 (03:10:00) and 3.5 (03:40:00, another pool): a row of each source
+      const xrpZzz = candles.filter((c) => c.counter_currency === 'ZZZ' && c.hour === hourAt(3));
+      expect(xrpZzz.map((c) => c.source)).toEqual(['amm', 'book']);
+      const [amm, book] = xrpZzz;
+      expect(book).toMatchObject({
+        count: 6,
+        base_sum: '50',
+        counter_sum: '125',
+        open_rate: '2.5',
+        open_tx: 2,
+        open_node: 3,
+        close_rate: '2.5',
+        high_rate: '2.5',
+        low_rate: '2.5',
+      });
+      expect(amm).toMatchObject({
+        count: 3,
+        base_sum: '19',
+        counter_sum: '58',
+        open_rate: '2',
+        open_time: at(3, 0, 0),
+        open_tx: 5,
+        open_node: 1,
+        close_rate: '3.5',
+        close_time: at(3, 40, 0),
+        close_tx: 3,
+        close_node: 2,
+        high_rate: '3.5',
+        high_tx: 3,
+        low_rate: '2',
+        low_tx: 5,
+      });
+      expect(amm.base_sum_f).toBe(19);
+      expect(amm.counter_sum_f).toBe(58);
+
+      // EUR/USD in hour 5: its one order-book trade (rate 2) and its one swap (rate 3), in the same ledger
+      const eurUsd = candles.filter((c) => c.base_currency === 'EUR' && c.hour === hourAt(5));
+      expect(eurUsd.map((c) => [c.source, c.count, c.open_rate])).toEqual([
+        ['amm', 1, '3'],
+        ['book', 1, '2'],
+      ]);
+      expect(eurUsd[0].open_ledger).toBe(eurUsd[1].open_ledger);
+
+      // GBP/USD has swaps only: a row of source amm in hours 4 and 5, none of source book. Hour 4: the rates 1.2, 1.5,
+      // 1.2; the low is the first of the two equal rates, by key
+      const gbp = candles.filter((c) => c.base_currency === 'GBP');
+      expect(gbp.map((c) => [c.hour, c.source, c.count])).toEqual([
+        [hourAt(4), 'amm', 3],
+        [hourAt(5), 'amm', 1],
+      ]);
+      expect(gbp[0]).toMatchObject({
+        base_sum: '30',
+        counter_sum: '39',
+        open_rate: '1.2',
+        open_time: at(4, 6, 0),
+        close_rate: '1.2',
+        close_time: at(4, 26, 0),
+        high_rate: '1.5',
+        low_rate: '1.2',
+      });
+      expect(gbp[0].low_ledger).toBe(gbp[0].open_ledger);
+      expect(gbp[0].high_ledger).toBeGreaterThan(gbp[0].open_ledger);
+    });
+
+    it('a native-dust swap is left out like a dust trade', async () => {
+      await compute(hourAt(3), hourAt(6));
+      const candles = candlesOf(await storedRows());
+      const sourcesOf = (hour: number, base: string): string[] =>
+        candles.filter((c) => c.hour === hourAt(hour) && c.base_currency === base).map((c) => c.source);
+
+      // the dust swaps are in the table, so that this proves something: a native leg of 0.0005 or less
+      const dust = await ch().query<{ n: string }>(
+        `SELECT count() AS n FROM ${Table.Exchanges}
+          WHERE amm_account != '' AND ((base_issuer = '' AND base_amount_f <= 0.0005)
+             OR (counter_issuer = '' AND counter_amount_f <= 0.0005))`,
+      );
+      expect(Number(dust[0].n)).toBe(3);
+
+      // XRP/ZZZ in hour 4 has a kept order-book trade and a swap of native dust (0.0005): a row of source book only
+      expect(sourcesOf(4, 'XRP')).toEqual(['book']);
+      // USD/XRP in hour 4: a swap with 0.0004 of the native counter is left out, the order-book trades stay
+      expect(sourcesOf(4, 'USD')).toEqual(['book']);
+      // XRP/ZZZ in hour 5: its order-book trade and its swap are both dust, so the pair has no row at all
+      expect(sourcesOf(5, 'XRP')).toEqual([]);
+      // of the 11 swaps, the 8 of kept amounts are counted
+      expect(candles.filter((c) => c.source === 'amm').reduce((n, c) => n + c.count, 0)).toBe(8);
     });
 
     it('an amount the exact sums cannot hold makes the hour unfit, with its Float64 sums', async () => {
@@ -549,7 +733,7 @@ describe('the pair_hourly sets (e2e)', () => {
       expect(btc.counter_sum_f).toBe(9);
       expect(sumOf(btc.unfit, btc.base_sum, btc.base_sum_f).toNumber()).toBe(1e40);
       // no other pair is unfit
-      expect(candles.filter((c) => c.base_currency !== 'BTC').map((c) => c.unfit)).toEqual([0, 0, 0, 0, 0]);
+      expect(candles.filter((c) => c.base_currency !== 'BTC').map((c) => c.unfit)).toEqual(Array(9).fill(0));
       // the sums are plain decimal text, as ClickHouse wrote them
       for (const r of await storedRows()) {
         expect(r.base_sum).toMatch(/^\d+(\.\d+)?$/);
@@ -587,18 +771,19 @@ describe('the pair_hourly sets (e2e)', () => {
       expect(sets.map((rows) => rows[0].hour)).toEqual(Array.from({ length: 24 }, (_, h) => hourAt(h)));
       for (const rows of sets) expect(Math.abs(Number(rows[0].version) - before)).toBeLessThan(5 * 60_000);
 
-      // an hour without a trade has its sentinel and nothing else: 6 pair rows in hours 3 to 5, 24 sentinels
+      // an hour without a trade has its sentinel and nothing else: 10 pair rows (6 of the order book and 4 of swaps) in
+      // hours 3 to 5, 24 sentinels
       const stored = await storedRows();
-      expect(stored).toHaveLength(30);
+      expect(stored).toHaveLength(34);
       expect(stored.filter(isSentinel).map((r) => r.hour)).toEqual(Array.from({ length: 24 }, (_, h) => hourAt(h)));
-      expect(sets.map((rows) => rows.length)).toEqual([...Array(3).fill(1), 3, 3, 3, ...Array(18).fill(1)]);
+      expect(sets.map((rows) => rows.length)).toEqual([...Array(3).fill(1), 4, 4, 5, ...Array(18).fill(1)]);
       // each set is one part: a reader sees all of it or none
       const parts = await ch().query<{ rows: string }>(
         `SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = {table:String} AND active ORDER BY rows`,
         { table: Table.PairHourly },
       );
       expect(parts).toHaveLength(24);
-      expect(parts.map((p) => Number(p.rows)).reduce((a, b) => a + b, 0)).toBe(30);
+      expect(parts.map((p) => Number(p.rows)).reduce((a, b) => a + b, 0)).toBe(34);
     });
 
     it("is_final: once a ledger closed at or after the hour's end; through_time is the close time of the hour's newest ledger, or the hour's start when the hour has none", async () => {
@@ -621,11 +806,14 @@ describe('the pair_hourly sets (e2e)', () => {
       for (const set of sets.values()) expect(set.configVersion).toBe(PAIR_HOURLY_CONFIG_VERSION);
     });
 
-    it("every row is source book, and every row carries the set's is_final, config_version and through_time", async () => {
+    it("the sentinel is source book, and every row carries the set's is_final, config_version (2) and through_time", async () => {
       await compute(hourAt(3), hourAt(9));
       const rows = await storedRows();
       expect(rows.length).toBeGreaterThan(6);
-      expect(new Set(rows.map((r) => r.source))).toEqual(new Set(['book']));
+      expect(rows.filter(isSentinel)).toHaveLength(6);
+      expect(new Set(rows.filter(isSentinel).map((r) => r.source))).toEqual(new Set(['book']));
+      // the pair rows are of both sources
+      expect(new Set(rows.filter((r) => !isSentinel(r)).map((r) => r.source))).toEqual(new Set(['book', 'amm']));
       const expected = new Map([
         [3, { is_final: 1, through_time: at(3, 59, 59) }],
         [4, { is_final: 1, through_time: at(4, 50, 0) }],
@@ -638,12 +826,7 @@ describe('the pair_hourly sets (e2e)', () => {
         const ofHour = rows.filter((r) => r.hour === hourAt(h));
         expect(ofHour.length).toBeGreaterThan(0);
         for (const r of ofHour)
-          expect([h, r.is_final, r.config_version, r.through_time]).toEqual([
-            h,
-            set.is_final,
-            PAIR_HOURLY_CONFIG_VERSION,
-            set.through_time,
-          ]);
+          expect([h, r.is_final, r.config_version, r.through_time]).toEqual([h, set.is_final, 2, set.through_time]);
       }
       // the sentinel is the empty pair with zeros and empty rates, and its times are the hour
       const sentinel = rows.find((r) => isSentinel(r) && r.hour === hourAt(4)) as Stored;
@@ -913,6 +1096,14 @@ describe('the pair_hourly sets (e2e)', () => {
       );
       const total = await current.query<{ n: string }>(`SELECT count() AS n FROM ${Table.Exchanges}`);
       expect(Number(total[0].n)).toBeGreaterThan(exchanges.length + 5);
+      // some swaps are there twice too, and they count once
+      const swaps = exchanges.filter((r) => r.amm_account !== '');
+      const copiedSwaps = swaps.filter((r) => r.ledger_index % 2 === 0);
+      expect(copiedSwaps.length).toBeGreaterThan(2);
+      const storedSwaps = await current.query<{ n: string }>(
+        `SELECT count() AS n FROM ${Table.Exchanges} WHERE amm_account != ''`,
+      );
+      expect(Number(storedSwaps[0].n)).toBe(swaps.length + copiedSwaps.length);
 
       await computePairHourSets(current, new RatesService(current, 'XRP'), hourAt(3), hourAt(6));
       expectCandles(candlesOf(await storedRows()), oracle(exchanges));

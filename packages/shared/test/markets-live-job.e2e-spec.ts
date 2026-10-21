@@ -464,7 +464,7 @@ describe('the markets_live sets (e2e)', () => {
       expect([...MARKETS_PERIODS]).toEqual(['day', '7day', '30day']);
       expect(MARKETS_PERIOD_HOURS).toEqual({ day: 24, '7day': 168, '30day': 720 });
       expect(SPARKLINE_DAYS).toBe(7);
-      expect(PAIR_HOURLY_CONFIG_VERSION).toBe(1);
+      expect(PAIR_HOURLY_CONFIG_VERSION).toBe(2);
     });
   });
 
@@ -875,7 +875,7 @@ describe('the markets_live sets (e2e)', () => {
       await restore(CURRENT_HOUR - HOUR);
 
       // a set of another config version
-      await copyNewest(dayAt(31, 3), 'toUInt32(2) AS config_version');
+      await copyNewest(dayAt(31, 3), `toUInt32(${PAIR_HOURLY_CONFIG_VERSION + 1}) AS config_version`);
       await expectSkipped('day', [dayAt(31, 3)]);
       await restore(dayAt(31, 3));
       await copyNewest(CURRENT_HOUR, 'toUInt32(0) AS config_version');
