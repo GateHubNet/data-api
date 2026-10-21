@@ -49,11 +49,33 @@ import type { Harness } from '../harness';
  * The trades of a run are a minute apart. USD has a rate of 2 (USD per native coin) in each
  * period, ZZZ too, and EUR, GBP and BTC have none: EUR/USD has a native volume through the counter, USD/ZZZ through the base,
  * and BTC/EUR, BTC/GBP and EUR/GBP have none.
+ *
+ * Every trade above is an order-book trade (`amm_account` ''), so the numbers are those of the order book: with no swap in
+ * the world, the `exclude` set is the `include` one and the `only` set is empty, and every pair has an `amm_share` of
+ * "0.0000" and no pool. (`SAMPLE_ROWS[Table.Exchanges]` is a swap against a pool, which a spread of it would make every
+ * trade of the world: the account is set on purpose.)
+ *
+ * With `{ amm: true }` the world also has two pairs that traded in the day window, new currencies against the native one, so
+ * that no number above changes (a rate of USD or ZZZ comes from their own pairs), and the pool of one of them:
+ *
+ * | pair      | trades                                                                                                           |
+ * | --------- | ---------------------------------------------------------------------------------------------------------------- |
+ * | MIX/N     | D: 6 x (10, 2) today 01:00 to 01:05 in the order book, then 4 x (10, 3) 01:10 to 01:13, swaps of `MARKETS_POOL`  |
+ * | SWP/N     | D: 10 x (5, 1) today 01:20 to 01:29, all swaps of `MARKETS_POOL2`                                                |
+ *
+ * `MARKETS_POOL` has an `amm_pools` row (MIX/N, not deleted); `MARKETS_POOL2` has none. So MIX/N has 10 trades, 100 MIX and
+ * 24 of native volume, 40 of the MIX are swaps: `amm_share` "0.4000", `amm_pool` true; SWP/N has 10 trades, 50 SWP and 10 of
+ * native volume, all swaps: "1.0000", no pool. The native volume of the day is 243.5 + 24 + 10 = 277.5 and its share
+ * (24 x 0.4 + 10 x 1) / 277.5 = 0.0706.
  */
 
 /** Two addresses that are valid (the issuers of the world and of the display currency). */
 export const MARKETS_ISSUER = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 export const MARKETS_ISSUER2 = 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q';
+
+/** The accounts of two pools, only names: nothing reads them as addresses. The first has an `amm_pools` row, the second none. */
+export const MARKETS_POOL = 'rPoolMixXrp11111111111111111111111';
+export const MARKETS_POOL2 = 'rPoolSwpXrp11111111111111111111111';
 
 /** The `now` the suites make their sets at. */
 export const MARKETS_NOW = new Date('2020-07-02T10:42:17Z');
@@ -67,6 +89,8 @@ export interface MarketsWorldOptions {
   native?: string;
   /** The periods to write a set for. Default: all three. A short list is quicker: the hours that are read are fewer. */
   periods?: readonly MarketsPeriod[];
+  /** Add the pairs and the pool with swaps of the table at the top (MIX/N and SWP/N). Default: no, the order book only. */
+  amm?: boolean;
 }
 
 export interface MarketsWorld {
@@ -83,6 +107,8 @@ interface Trade {
   close: number;
   base: string;
   counter: string;
+  /** The pool a swap is against; none for an order-book trade (`amm_account` ''). */
+  pool?: string;
 }
 
 const issued = (currency: string): Asset => ({ currency, issuer: MARKETS_ISSUER });
@@ -94,8 +120,8 @@ function stored(base: Asset, counter: Asset): StoredPair {
   return pair;
 }
 
-/** The trades of the world (see the table at the top), with `now` in unix seconds. */
-function worldTrades(now: number, native: string): Trade[] {
+/** The trades of the world (see the table at the top), with `now` in unix seconds; `amm` adds the swaps and their pairs. */
+function worldTrades(now: number, native: string, amm: boolean): Trade[] {
   const today = Math.floor(now / DAY) * DAY;
   /** `days` before today, at the given time of day. */
   const at = (days: number, hour: number, minute = 0, second = 0): number =>
@@ -119,6 +145,19 @@ function worldTrades(now: number, native: string): Trade[] {
   const chfN = stored(issued('CHF'), N);
   const nzdN = stored(issued('NZD'), N);
   const jpyN = stored(issued('JPY'), N);
+  const mixN = stored(issued('MIX'), N);
+  const swpN = stored(issued('SWP'), N);
+  /** `n` swaps against `pool` a minute apart from `from`. */
+  const swaps = (pair: StoredPair, from: number, n: number, base: string, counter: string, pool: string): Trade[] =>
+    run(pair, from, n, base, counter).map((trade) => ({ ...trade, pool }));
+
+  const swapTrades = [
+    // MIX/N: the order book, then the pool
+    ...run(mixN, at(0, 1), 6, '10', '2'),
+    ...swaps(mixN, at(0, 1, 10), 4, '10', '3', MARKETS_POOL),
+    // SWP/N: swaps only
+    ...swaps(swpN, at(0, 1, 20), 10, '5', '1', MARKETS_POOL2),
+  ];
 
   return [
     // USD/N
@@ -151,6 +190,7 @@ function worldTrades(now: number, native: string): Trade[] {
     ...run(chfN, at(0, 8), 9, '10', '2'),
     ...one(nzdN, at(0, 8, 30), '1', '0.5'),
     ...run(jpyN, at(20, 14), 12, '100', '1'),
+    ...(amm ? swapTrades : []),
   ];
 }
 
@@ -186,6 +226,8 @@ async function writeTrades(h: Harness, trades: Trade[]): Promise<void> {
       node_index: 0,
       tx_hash: String(i).padStart(64, 'E'),
       close_time: t.close,
+      // the sample row is a swap against a pool: an order-book trade has no pool
+      amm_account: t.pool ?? '',
       base_amount: t.base,
       counter_amount: t.counter,
       base_amount_f: Number(t.base),
@@ -195,6 +237,22 @@ async function writeTrades(h: Harness, trades: Trade[]): Promise<void> {
     };
   });
   await h.ch.insert(Table.Exchanges, rows);
+}
+
+/** The `amm_pools` row of a pool of a pair: not deleted, the first and only version. */
+async function writePool(h: Harness, pair: StoredPair, account: string): Promise<void> {
+  await h.ch.insert(Table.AmmPools, [
+    {
+      ...SAMPLE_ROWS[Table.AmmPools],
+      amm_account: account,
+      base_currency: pair.base.currency,
+      base_issuer: pair.base.issuer ?? '',
+      counter_currency: pair.counter.currency,
+      counter_issuer: pair.counter.issuer ?? '',
+      deleted: 0,
+      version: 1,
+    },
+  ]);
 }
 
 /** The hour sets of `firstHour` to `lastHour` (unix seconds of whole hours, both included), a UTC day at a time. */
@@ -228,7 +286,8 @@ export async function seedMarketsWorld(
 
   // Ruling P5: the hours are far past the 45 days of the TTL, so a TTL merge would drop the rows of pair_hourly mid-test
   await h.ch.command(`SYSTEM STOP TTL MERGES ${h.database}.${Table.PairHourly}`);
-  await writeTrades(h, worldTrades(seconds, native));
+  await writeTrades(h, worldTrades(seconds, native, options.amm === true));
+  if (options.amm) await writePool(h, stored(issued('MIX'), { currency: native }), MARKETS_POOL);
 
   // the hours the sets read: the longest window, and the days of the sparkline
   const currentHour = Math.floor(seconds / HOUR) * HOUR;
@@ -287,6 +346,8 @@ export async function seedLiveRate(
         node_index: 0,
         tx_hash: String(i).padStart(64, 'D'),
         close_time: close,
+        // a trade of the rate, not a swap: the sample row is one
+        amm_account: '',
         base_amount: baseAmount,
         counter_amount: counterAmount,
         base_amount_f: Number(baseAmount),
@@ -305,12 +366,15 @@ export interface HandPair {
   count: number;
   /** The native volume; none when it is left out. */
   native?: string;
+  /** The AMM share (text, 4 decimals) and the pool flag; NULL (not known) when left out. */
+  ammShare?: string;
+  ammPool?: 0 | 1;
 }
 
 /**
  * The rows of a `markets_live` set written by hand: the sentinel (window and totals, which are those of the pairs) and a row
  * for each pair, all under one `version`. A pair's volumes are its count and twice its count, its rates 1 to 2, and its closes
- * `2` on the last day.
+ * `2` on the last day. The AMM columns are NULL (not known) unless a pair or `totalAmmShare` names them.
  */
 export function handSet(o: {
   period: string;
@@ -319,6 +383,8 @@ export function handSet(o: {
   start: number;
   end: number;
   pairs: HandPair[];
+  /** The `total_amm_share` of the sentinel; NULL when left out. */
+  totalAmmShare?: string;
 }): MarketsLiveRow[] {
   const amm = o.amm ?? 'include';
   const frame = {
@@ -328,7 +394,7 @@ export function handSet(o: {
     end_time: o.end,
     amm_share: null,
     amm_pool: null,
-    total_amm_share: null,
+    total_amm_share: o.totalAmmShare ?? null,
     version: o.version,
   };
   const sentinel: MarketsLiveRow = {
@@ -371,6 +437,9 @@ export function handSet(o: {
         base_volume: String(p.count),
         counter_volume: String(2 * p.count),
         native_volume: p.native ?? null,
+        amm_share: p.ammShare ?? null,
+        amm_pool: p.ammPool ?? null,
+        total_amm_share: null,
         open: '1',
         high: '2',
         low: '1',

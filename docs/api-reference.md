@@ -1626,9 +1626,10 @@ one precomputed set, read in a few milliseconds.
 {
   "result": "success",
   "period": "day",
+  "amm": "include",
   "start_time": "2020-07-01T10:00:00Z",
   "end_time": "2020-07-02T10:42:17Z",
-  "totals": { "pairs": 9, "pairs_traded": 11, "count": 112, "native_volume": "243.5" },
+  "totals": { "pairs": 9, "pairs_traded": 11, "count": 112, "native_volume": "243.5", "amm_share": "0.0000" },
   "count": 1,
   "markets": [
     {
@@ -1646,6 +1647,8 @@ one precomputed set, read in a few milliseconds.
       "change": "-20.00",
       "open_time": "2020-07-01T12:00:00Z",
       "last_time": "2020-07-02T10:42:17Z",
+      "amm_share": "0.0000",
+      "amm_pool": false,
       "sparkline": [
         { "date": "2020-06-26T00:00:00Z" },
         { "date": "2020-06-27T00:00:00Z" },
@@ -1670,11 +1673,19 @@ With a display currency:
 {
   "result": "success",
   "period": "day",
+  "amm": "include",
   "start_time": "2020-07-01T10:00:00Z",
   "end_time": "2020-07-02T10:42:17Z",
   "exchange": { "currency": "USD", "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B" },
   "exchange_rate": "2.0000000",
-  "totals": { "pairs": 9, "pairs_traded": 11, "count": 112, "native_volume": "243.5", "converted_volume": "487" },
+  "totals": {
+    "pairs": 9,
+    "pairs_traded": 11,
+    "count": 112,
+    "native_volume": "243.5",
+    "converted_volume": "487",
+    "amm_share": "0.0000"
+  },
   "count": 1,
   "markets": [
     {
@@ -1693,6 +1704,8 @@ With a display currency:
       "change": "-20.00",
       "open_time": "2020-07-01T12:00:00Z",
       "last_time": "2020-07-02T10:42:17Z",
+      "amm_share": "0.0000",
+      "amm_pool": false,
       "sparkline": [
         { "date": "2020-06-26T00:00:00Z" },
         { "date": "2020-06-27T00:00:00Z" },

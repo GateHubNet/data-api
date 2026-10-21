@@ -1,5 +1,6 @@
-import { Table } from '@gatehub/data-api-shared';
+import { AMM_PARSER_VERSION, computeMarketsSet, Table } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
+import { SAMPLE_ROWS } from '../../../packages/shared/test/sample-rows';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
 import {
@@ -17,10 +18,14 @@ import { explain } from './support/plans';
  * `GET /v2/network/markets` on a real ClickHouse.
  *
  * The first suite runs on the world of `support/markets-world.ts` (read its header for the trades: every number below is
- * worked out from them), with the hour sets and the markets sets of the three periods written by the jobs of the syncer at
- * 2020-07-02T10:42:17Z. Decoys sit next to them in `markets_live`: an older version of the day set, and the sets of the filters
- * `exclude` and `only` with versions above every real one. A reader that took a wrong version or filter would serve them.
- * The second suite writes sets by hand into an empty database (no set yet, the limits), and the third is the world on Xahau.
+ * worked out from them), with the hour sets and the markets sets of the three periods and the three filters written by the jobs
+ * of the syncer at 2020-07-02T10:42:17Z. The world is an order-book world (no swap): its `exclude` set is its `include` set,
+ * its `only` set is empty, and the AMM fields are the ones of a window that was parsed with AMM and has no swap, "0.0000" and
+ * false. Decoys sit next to the real sets in `markets_live`: an older version of the set of each period and filter, with other
+ * numbers and a pair that is gone. A reader that took a wrong version or filter would serve them.
+ * The second suite writes sets by hand into an empty database (no set yet, the limits, the AMM fields that are NULL), the third
+ * is the world on Xahau, the fourth a world with swaps and a pool (`seedMarketsWorld(..., { amm: true })`: read its header for
+ * the numbers), and the fifth the same world with one ledger of an old parser in the window, so that the job writes no AMM field.
  *
  * The periods, at that `now` (t = 10:42:17 today, the day of the sparkline's last entry, 2020-07-02):
  *  - day: from 2020-07-01T10:00:00Z; 11 pairs traded, 112 trades, 243.5 of native volume;
@@ -56,12 +61,17 @@ interface Want {
   openTime: string;
   lastTime: string;
   closes: (string | null)[];
+  /** The AMM share and the pool flag; "0.0000" and false (a window without a swap) when missing, left out when `null`. */
+  ammShare?: string | null;
+  ammPool?: boolean | null;
 }
 
 /** The market of the answer, keys in order. `base` and `counter` as `CUR` or `CUR+issuer`. */
 function market(base: string, counter: string, w: Want): Json {
   const [baseCurrency, baseIssuer] = base.split('+');
   const [counterCurrency, counterIssuer] = counter.split('+');
+  const ammShare = w.ammShare === undefined ? '0.0000' : w.ammShare;
+  const ammPool = w.ammPool === undefined ? false : w.ammPool;
   return {
     base_currency: baseCurrency,
     ...(baseIssuer && { base_issuer: baseIssuer }),
@@ -78,6 +88,8 @@ function market(base: string, counter: string, w: Want): Json {
     change: w.change,
     open_time: w.openTime,
     last_time: w.lastTime,
+    ...(ammShare !== null && { amm_share: ammShare }),
+    ...(ammPool !== null && { amm_pool: ammPool }),
     sparkline: spark(w.closes),
   };
 }
@@ -430,15 +442,17 @@ const MONTH_ORDER = [
 function answerOf(
   period: string,
   window: [start: string, end: string],
-  totals: { pairs_traded: number; count: number; native_volume: string },
+  totals: { pairs_traded: number; count: number; native_volume: string; amm_share?: string },
   all: Record<string, Json>,
   order: string[],
   without: string[] = [],
+  amm = 'include',
 ): Json {
   const listed = order.filter((name) => !without.includes(name)).map((name) => all[name]);
   return {
     result: 'success',
     period,
+    amm,
     start_time: window[0],
     end_time: window[1],
     totals: { pairs: listed.length, ...totals },
@@ -448,37 +462,40 @@ function answerOf(
 }
 
 const END = '2020-07-02T10:42:17Z';
-const dayAnswer = (n = 'XRP', without = BELOW_TEN): Json =>
+const dayAnswer = (n = 'XRP', without = BELOW_TEN, amm = 'include'): Json =>
   answerOf(
     'day',
     ['2020-07-01T10:00:00Z', END],
-    { pairs_traded: 11, count: 112, native_volume: '243.5' },
+    { pairs_traded: 11, count: 112, native_volume: '243.5', amm_share: '0.0000' },
     dayMarkets(n),
     DAY_ORDER,
     without,
+    amm,
   );
-const weekAnswer = (without = BELOW_TEN): Json =>
+const weekAnswer = (without = BELOW_TEN, amm = 'include'): Json =>
   answerOf(
     '7day',
     ['2020-06-25T10:00:00Z', END],
-    { pairs_traded: 11, count: 137, native_volume: '348.4' },
+    { pairs_traded: 11, count: 137, native_volume: '348.4', amm_share: '0.0000' },
     weekMarkets('XRP'),
     WEEK_ORDER,
     without,
+    amm,
   );
-const monthAnswer = (without = BELOW_TEN): Json =>
+const monthAnswer = (without = BELOW_TEN, amm = 'include'): Json =>
   answerOf(
     '30day',
     ['2020-06-02T10:00:00Z', END],
-    { pairs_traded: 12, count: 177, native_volume: '500.4' },
+    { pairs_traded: 12, count: 177, native_volume: '500.4', amm_share: '0.0000' },
     monthMarkets('XRP'),
     MONTH_ORDER,
     without,
+    amm,
   );
 
 /** The keys of an answer, its totals and a market, in the order the spec pins. */
-const ANSWER_KEYS = ['result', 'period', 'start_time', 'end_time', 'totals', 'count', 'markets'];
-const TOTALS_KEYS = ['pairs', 'pairs_traded', 'count', 'native_volume'];
+const ANSWER_KEYS = ['result', 'period', 'amm', 'start_time', 'end_time', 'totals', 'count', 'markets'];
+const TOTALS_KEYS = ['pairs', 'pairs_traded', 'count', 'native_volume', 'amm_share'];
 const MARKET_KEYS = [
   'base_currency',
   'base_issuer',
@@ -494,10 +511,16 @@ const MARKET_KEYS = [
   'change',
   'open_time',
   'last_time',
+  'amm_share',
+  'amm_pool',
   'sparkline',
 ];
 
 const bad = (message: string): Json => ({ result: 'error', message });
+
+/** The markets of an answer as `BASE/COUNTER`, in the order served. */
+const names = (body: Json): string[] =>
+  body.markets.map((m: Json) => `${m.base_currency}/${m.counter_currency}`).map((s: string) => s.replace('XRP', 'N'));
 
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -507,9 +530,6 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
   const get = (qs = '') => api.get(`/v2/network/markets${qs ? `?${qs}` : ''}`);
   const ok = async (qs = ''): Promise<Json> =>
     (await api.ok(`/v2/network/markets${qs ? `?${qs}` : ''}`, 'markets')).body;
-  /** The markets of an answer as `BASE/COUNTER`, in the order served. */
-  const names = (body: Json): string[] =>
-    body.markets.map((m: Json) => `${m.base_currency}/${m.counter_currency}`).map((s: string) => s.replace('XRP', 'N'));
 
   beforeAll(async () => {
     h = await startHarness({ env: NO_RATE_LIMIT });
@@ -518,44 +538,29 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
     // the live rate of EUR of I2: 12 trades in the last hour, 20 native coins for 10 EUR: 0.5 EUR a coin
     await seedLiveRate(h, 'XRP', { currency: 'EUR', issuer: I2 }, { native: '20', display: '10' });
 
-    // the decoys. Merges are stopped so that they stay where the reader can meet them
+    // the decoys: an older version of the set of each period and filter, with other numbers for a pair the set has and a pair
+    // that is gone. Merges are stopped so that they stay where the reader can meet them
     await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.MarketsLive}`);
-    const [{ version }] = await h.ch.query<{ version: string }>(
-      `SELECT toString(max(version)) AS version FROM ${Table.MarketsLive} WHERE period = 'day' AND amm = 'include'`,
-    );
     const start = Date.parse('2020-07-01T10:00:00Z') / 1000;
     const end = Date.parse(END) / 1000;
-    const decoy = (period: string, amm: 'include' | 'exclude' | 'only', version: number, base: string, count: number) =>
-      h.ch.insert(
-        Table.MarketsLive,
-        handSet({
-          period,
-          amm,
-          version,
-          start,
-          end,
-          pairs: [{ base: `${base}+${I}`, counter: 'XRP', count, native: '1000000' }],
-        }),
-      );
-    // an older version of the day set: other numbers for a pair the set has, and a pair that is gone
-    await h.ch.insert(
-      Table.MarketsLive,
-      handSet({
-        period: 'day',
-        version: 1,
-        start,
-        end,
-        pairs: [
-          { base: `USD+${I}`, counter: 'XRP', count: 999, native: '999' },
-          { base: `GONE+${I}`, counter: 'XRP', count: 500, native: '500' },
-        ],
-      }),
-    );
-    // the other filters: one at the version of the day set (a read of the version of the filter `include` would take it) and
-    // one above every version (a read of the newest version of any filter would take it)
-    await decoy('day', 'exclude', Number(version), 'EXC', 5000);
-    await decoy('day', 'exclude', 9_000_000_000_000_000, 'EXCHIGH', 5000);
-    await decoy('7day', 'only', 9_000_000_000_000_001, 'ONLY', 5000);
+    for (const period of ['day', '7day', '30day']) {
+      for (const amm of ['include', 'exclude', 'only'] as const) {
+        await h.ch.insert(
+          Table.MarketsLive,
+          handSet({
+            period,
+            amm,
+            version: 1,
+            start,
+            end,
+            pairs: [
+              { base: `USD+${I}`, counter: 'XRP', count: 999, native: '999' },
+              { base: `GONE+${I}`, counter: 'XRP', count: 500, native: '500' },
+            ],
+          }),
+        );
+      }
+    }
   }, 600_000);
 
   afterEach(() => {
@@ -573,13 +578,18 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
         GROUP BY period, filter
         ORDER BY period, filter`,
     );
+    // each set is its pairs and a sentinel, and the decoy under it (two pairs and a sentinel) is an older version: 2 versions
+    // and 3 rows more. The world has no swap: `exclude` has the pairs of `include`, and `only` the sentinel alone
     expect(sets).toEqual([
-      { period: '30day', filter: 'include', versions: '1', rows: '13' }, // 12 pairs and the sentinel
-      { period: '7day', filter: 'include', versions: '1', rows: '12' },
-      { period: '7day', filter: 'only', versions: '1', rows: '2' },
-      { period: 'day', filter: 'exclude', versions: '2', rows: '4' },
-      // the set (11 pairs and a sentinel) and the older one (2 and a sentinel)
+      { period: '30day', filter: 'exclude', versions: '2', rows: '16' }, // 12 pairs and the sentinel, and the 3 of the decoy
+      { period: '30day', filter: 'include', versions: '2', rows: '16' },
+      { period: '30day', filter: 'only', versions: '2', rows: '4' },
+      { period: '7day', filter: 'exclude', versions: '2', rows: '15' }, // 11 pairs and the sentinel
+      { period: '7day', filter: 'include', versions: '2', rows: '15' },
+      { period: '7day', filter: 'only', versions: '2', rows: '4' },
+      { period: 'day', filter: 'exclude', versions: '2', rows: '15' },
       { period: 'day', filter: 'include', versions: '2', rows: '15' },
+      { period: 'day', filter: 'only', versions: '2', rows: '4' },
     ]);
   });
 
@@ -593,13 +603,13 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
     expect([day.start_time, day.end_time]).toEqual(['2020-07-01T10:00:00Z', END]);
     // an empty period is the default, as an empty parameter is elsewhere
     expect(await ok('period=')).toEqual(day);
-    // not the older version of the day set, and not the sets of the other filters
+    // not the older version of the sets
     const text = JSON.stringify([day, await ok('period=7day')]);
-    expect(text).not.toMatch(/GONE|EXC|ONLY/);
+    expect(text).not.toMatch(/GONE|999/);
     expect(day.totals.count).toBe(112);
   });
 
-  it('serves the keys in the order of the spec, and no AMM key', async () => {
+  it('serves the keys in the order of the spec, the AMM keys among them', async () => {
     const answer = await ok();
     expect(Object.keys(answer)).toEqual(ANSWER_KEYS);
     expect(Object.keys(answer.totals)).toEqual(TOTALS_KEYS);
@@ -617,8 +627,14 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
     // a pair without a native volume has no native_volume
     const none = answer.markets.find((m: Json) => m.base_currency === 'BTC');
     expect(Object.keys(none)).not.toContain('native_volume');
+    // every period and every filter has them
     for (const period of ['day', '7day', '30day']) {
-      expect(JSON.stringify(await ok(`period=${period}&min_trades=1`))).not.toMatch(/amm/i);
+      for (const amm of ['include', 'exclude', 'only']) {
+        const body = await ok(`period=${period}&min_trades=1&amm=${amm}`);
+        expect(Object.keys(body)).toEqual(ANSWER_KEYS);
+        expect(Object.keys(body.totals)).toEqual(TOTALS_KEYS);
+        for (const m of body.markets) expect(Object.keys(m)).toEqual(expect.arrayContaining(['amm_share', 'amm_pool']));
+      }
     }
     // a sparkline entry is a date, and a close where the day has one
     const sparkline = answer.markets[0].sparkline;
@@ -636,7 +652,7 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
   it('min_trades 10 by default lists the pairs with count >= min_trades; totals.pairs counts them, listed or not; pairs_traded, count and native_volume are over every traded pair', async () => {
     const ten = await ok();
     expect(names(ten)).toEqual(DAY_ORDER.filter((name) => !BELOW_TEN.includes(name)));
-    expect(ten.totals).toEqual({ pairs: 9, pairs_traded: 11, count: 112, native_volume: '243.5' });
+    expect(ten.totals).toEqual({ pairs: 9, pairs_traded: 11, count: 112, native_volume: '243.5', amm_share: '0.0000' });
     expect(ten.markets.every((m: Json) => m.count >= 10)).toBe(true);
     expect(await ok('min_trades=10')).toEqual(ten);
 
@@ -703,6 +719,7 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
     expect(Object.keys(body)).toEqual([
       'result',
       'period',
+      'amm',
       'start_time',
       'end_time',
       'exchange',
@@ -715,13 +732,14 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
     expect(Object.keys(body.exchange)).toEqual(['currency', 'issuer']);
     // one native coin buys 0.5 of it
     expect(body.exchange_rate).toBe(p8('0.5'));
-    expect(Object.keys(body.totals)).toEqual([...TOTALS_KEYS, 'converted_volume']);
+    expect(Object.keys(body.totals)).toEqual([...TOTALS_KEYS.slice(0, 4), 'converted_volume', 'amm_share']);
     expect(body.totals).toEqual({
       pairs: 11,
       pairs_traded: 11,
       count: 112,
       native_volume: '243.5',
       converted_volume: '121.75',
+      amm_share: '0.0000',
     });
     // the native volume times the rate, for the markets that have a native volume
     const day = dayMarkets('XRP');
@@ -803,27 +821,115 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
     expect(await msg('min_trades=x&exchange_currency=USD')).toEqual([400, bad('invalid min_trades')]);
   });
 
-  it('amm=only is ignored: the same answer, with no amm key', async () => {
+  it('unknown parameters are ignored, and the Cache-Control is the global one', async () => {
     const plain = await get('min_trades=1');
-    for (const amm of ['only', 'exclude', 'include', '', 'nonsense', 'only&amm=exclude']) {
-      const res = await get(`min_trades=1&amm=${amm}`);
-      expect([amm, res.status, res.body]).toEqual([amm, 200, plain.body]);
-    }
-    expect(JSON.stringify(plain.body)).not.toMatch(/amm/);
-    expect(Object.keys(plain.body)).not.toContain('amm');
-    // the decoys of the other filters are not what it reads, and every period ignores it
-    expect((await ok('period=7day&amm=only')).markets).toEqual(weekAnswer().markets);
-    // unknown parameters are ignored, and the Cache-Control is the global one
     const extra = await get('min_trades=1&foo=bar&marker=x&interval=week&start=2020-01-01');
     expect(extra.body).toEqual(plain.body);
     expect(plain.headers['cache-control']).toBe('private, max-age=60');
     expect(extra.headers['cache-control']).toBe('private, max-age=60');
-    // and the read does not mention it: the period is its one parameter
+  });
+
+  it('amm=exclude and amm=only serve their sets; the answer echoes amm, include by default', async () => {
+    // the default and an empty amm are include, echoed
+    const plain = await ok('min_trades=1');
+    expect(plain.amm).toBe('include');
+    expect(Object.keys(plain).slice(0, 3)).toEqual(['result', 'period', 'amm']);
+    for (const qs of ['amm=include', 'amm=', 'amm=include&amm=only', 'amm=&amm=only']) {
+      expect([qs, await ok(`min_trades=1&${qs}`)]).toEqual([qs, plain]);
+    }
+
+    // the world has no swap: exclude is its include set under another name, and only has no pair
+    const answers = {
+      day: (without: string[], amm: string) => dayAnswer('XRP', without, amm),
+      '7day': weekAnswer,
+      '30day': monthAnswer,
+    };
+    for (const period of ['day', '7day', '30day'] as const) {
+      expect(await ok(`period=${period}&amm=exclude`)).toEqual(answers[period](BELOW_TEN, 'exclude'));
+      expect(await ok(`period=${period}&min_trades=1&amm=exclude`)).toEqual(answers[period]([], 'exclude'));
+      const { start_time } = await ok(`period=${period}`);
+      expect(await ok(`period=${period}&min_trades=1&amm=only`)).toEqual({
+        result: 'success',
+        period,
+        amm: 'only',
+        start_time,
+        end_time: END,
+        totals: { pairs: 0, pairs_traded: 0, count: 0, native_volume: '0', amm_share: '0.0000' },
+        count: 0,
+        markets: [],
+      });
+    }
+    // the first of a repeated parameter counts
+    expect((await ok('amm=only&amm=exclude')).amm).toBe('only');
+    expect((await ok('amm=exclude&amm=only')).amm).toBe('exclude');
+    // the display currency, the limit and the minimum work on the set of the filter
+    const eur = `exchange_currency=EUR&exchange_issuer=${I2}`;
+    const shown = await ok(`min_trades=1&limit=3&${eur}&amm=exclude`);
+    expect(shown).toEqual({ ...(await ok(`min_trades=1&limit=3&${eur}`)), amm: 'exclude' });
+    expect(Object.keys(shown)).toEqual([
+      'result',
+      'period',
+      'amm',
+      'start_time',
+      'end_time',
+      'exchange',
+      'exchange_rate',
+      'totals',
+      'count',
+      'markets',
+    ]);
+    const empty = await ok(`${eur}&amm=only`);
+    expect(empty.totals).toEqual({
+      pairs: 0,
+      pairs_traded: 0,
+      count: 0,
+      native_volume: '0',
+      converted_volume: '0',
+      amm_share: '0.0000',
+    });
+    // the older versions of the sets are not what is read, in any filter
+    expect(JSON.stringify([await ok('amm=exclude'), await ok('amm=only')])).not.toMatch(/GONE|999/);
+  });
+
+  it('an unknown amm is 400 invalid amm filter - use: include, exclude, only, after the display currency checks', async () => {
+    const msg = async (qs: string): Promise<[number, Json]> => {
+      const res = await get(qs);
+      return [res.status, res.body];
+    };
+    const wrong = bad('invalid amm filter - use: include, exclude, only');
+    for (const amm of ['x', 'INCLUDE', 'Only', 'exclude ', ' only', 'all', 'both', 'true', '1', 'includes', 'on']) {
+      expect([amm, await msg(`amm=${encodeURIComponent(amm)}`)]).toEqual([amm, [400, wrong]]);
+    }
+    // the first of a repeated parameter counts
+    expect(await msg('amm=x&amm=only')).toEqual([400, wrong]);
+    expect((await get('amm=only&amm=x')).status).toBe(200);
+    // after period, min_trades and the display currency
+    expect(await msg('period=x&amm=x')).toEqual([400, bad('invalid period - use: day, 7day, 30day')]);
+    expect(await msg('min_trades=x&amm=x')).toEqual([400, bad('invalid min_trades')]);
+    expect(await msg('exchange_currency=USD&amm=x')).toEqual([400, bad('exchange currency must have an issuer')]);
+    expect(await msg(`exchange_issuer=${I2}&amm=x`)).toEqual([400, bad('XRP cannot have an issuer')]);
+    expect(await msg('exchange_currency=USD&exchange_issuer=notanaddress&amm=x')).toEqual([
+      400,
+      bad('invalid exchange issuer address'),
+    ]);
+    expect(await msg(`exchange_currency=USD&exchange_issuer=${I2}&amm=x`)).toEqual([400, wrong]);
+    // in any format, and the error never reads a set
+    expect((await get('amm=x&format=csv')).body).toEqual(wrong);
     const spy = jest.spyOn(h.ch, 'query');
-    await get('amm=only');
+    await get('amm=x');
     const reads = spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.MarketsLive}`));
     spy.mockRestore();
-    expect(reads.map(([, params]) => params)).toEqual([{ period: 'day' }]);
+    expect(reads).toEqual([]);
+  });
+
+  it('a world parsed with AMM and without a swap serves "0.0000" and false in every period and filter', async () => {
+    for (const period of ['day', '7day', '30day']) {
+      for (const amm of ['include', 'exclude', 'only']) {
+        const body = await ok(`period=${period}&min_trades=1&amm=${amm}`);
+        expect(body.totals.amm_share).toBe('0.0000');
+        for (const m of body.markets) expect([m.amm_share, m.amm_pool]).toEqual(['0.0000', false]);
+      }
+    }
   });
 
   it('format=csv is markets.csv with the markets', async () => {
@@ -853,6 +959,9 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
         'last_time',
       ].map((column) => `"${column}"`),
     );
+    // the AMM fields follow last_time, ahead of the sparkline; false is a cell like any other
+    expect(header.slice(14, 17)).toEqual(['"amm_share"', '"amm_pool"', '"sparkline[0].date"']);
+    expect(lines[1].split(',').slice(14, 16)).toEqual(['"0.0000"', '"false"']);
     expect(header).toContain('"sparkline[0].date"');
     expect(header).toContain('"sparkline[6].close"');
     expect(header).toContain('"counter_issuer"');
@@ -884,34 +993,38 @@ describe('GET /v2/network/markets on the world of markets-world.ts', () => {
 
   it('the set read is a key prefix (period, amm) of markets_live, with no FINAL', async () => {
     for (const period of ['day', '7day', '30day']) {
-      const spy = jest.spyOn(h.ch, 'query');
-      await ok(`period=${period}`);
-      const reads = spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.MarketsLive}`));
-      spy.mockRestore();
-      // one read of the set (and the newest version in a subquery of it)
-      expect(reads).toHaveLength(1);
-      const sql = String(reads[0][0]);
-      const params = reads[0][1] as Record<string, unknown>;
-      expect(sql).not.toMatch(/\bFINAL\b/);
-      expect(params).toEqual({ period });
-      // bound, and the filter is the one of D2
-      expect(sql).not.toMatch(new RegExp(`'${period}'`));
-      expect(sql).toContain("WHERE period = {period:String} AND amm = 'include'");
-      expect(sql).toContain(
-        `version = (SELECT max(version) FROM ${Table.MarketsLive} WHERE period = {period:String} AND amm = 'include')`,
-      );
-      // each pair once, in the order of the key
-      expect(sql).toMatch(
-        /ORDER BY period, amm, base_currency, base_issuer, counter_currency, counter_issuer\s+LIMIT 1 BY base_currency, base_issuer, counter_currency, counter_issuer/,
-      );
-      // no column of the AMM is read
-      expect(sql).not.toMatch(/amm_share|amm_pool|total_amm_share/);
-      // the primary key (period, amm, pair) is searched by its first two columns, and the rows are read in the order of the key
-      const indexes = await explain(h, 'indexes = 1', sql, params);
-      expect(indexes).toMatch(
-        /PrimaryKey\s+Keys:\s+period\s+amm\s+Condition: and\(\(amm in \[1, 1\]\), \(period in \['[^']+', '[^']+'\]\)\)/,
-      );
-      expect(indexes).toContain('Read type: InOrder');
+      for (const amm of ['include', 'exclude', 'only']) {
+        const spy = jest.spyOn(h.ch, 'query');
+        await ok(`period=${period}&amm=${amm}`);
+        const reads = spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.MarketsLive}`));
+        spy.mockRestore();
+        // one read of the set (and the newest version in a subquery of it)
+        expect(reads).toHaveLength(1);
+        const sql = String(reads[0][0]);
+        const params = reads[0][1] as Record<string, unknown>;
+        expect(sql).not.toMatch(/\bFINAL\b/);
+        expect(params).toEqual({ period, amm });
+        // bound: neither the period nor the filter is in the text
+        expect(sql).not.toMatch(new RegExp(`'${period}'|'${amm}'`));
+        expect(sql).toContain('WHERE period = {period:String} AND amm = {amm:String}');
+        expect(sql).toContain(
+          `version = (SELECT max(version) FROM ${Table.MarketsLive} WHERE period = {period:String} AND amm = {amm:String})`,
+        );
+        // each pair once, in the order of the key
+        expect(sql).toMatch(
+          /ORDER BY period, amm, base_currency, base_issuer, counter_currency, counter_issuer\s+LIMIT 1 BY base_currency, base_issuer, counter_currency, counter_issuer/,
+        );
+        // the columns of the AMM are read
+        expect(sql).toMatch(/\bamm_share\b/);
+        expect(sql).toMatch(/\bamm_pool\b/);
+        expect(sql).toMatch(/\btotal_amm_share\b/);
+        // the primary key (period, amm, pair) is searched by its first two columns, and the rows are read in the order of the key
+        const indexes = await explain(h, 'indexes = 1', sql, params);
+        expect(indexes).toMatch(
+          /PrimaryKey\s+Keys:\s+period\s+amm\s+Condition: and\(\(amm in \[\d, \d\]\), \(period in \['[^']+', '[^']+'\]\)\)/,
+        );
+        expect(indexes).toContain('Read type: InOrder');
+      }
     }
   });
 });
@@ -936,23 +1049,44 @@ describe('GET /v2/network/markets on a database with no set, then with sets writ
     await h?.close();
   });
 
-  it('a fresh database answers {result, period, count: 0, markets: []}', async () => {
+  it('a fresh database answers {result, period, amm, count: 0, markets: []}', async () => {
     const res = await get();
-    expect([res.status, res.body]).toEqual([200, { result: 'success', period: 'day', count: 0, markets: [] }]);
-    expect(Object.keys(res.body)).toEqual(['result', 'period', 'count', 'markets']);
+    expect([res.status, res.body]).toEqual([
+      200,
+      { result: 'success', period: 'day', amm: 'include', count: 0, markets: [] },
+    ]);
+    expect(Object.keys(res.body)).toEqual(['result', 'period', 'amm', 'count', 'markets']);
     for (const period of ['7day', '30day']) {
-      expect((await get(`period=${period}`)).body).toEqual({ result: 'success', period, count: 0, markets: [] });
+      expect((await get(`period=${period}`)).body).toEqual({
+        result: 'success',
+        period,
+        amm: 'include',
+        count: 0,
+        markets: [],
+      });
+    }
+    // the filter is echoed, whichever it is: there is no set of it either
+    for (const amm of ['include', 'exclude', 'only']) {
+      expect((await get(`period=7day&amm=${amm}`)).body).toEqual({
+        result: 'success',
+        period: '7day',
+        amm,
+        count: 0,
+        markets: [],
+      });
     }
     // the parameters that change nothing for it: the minimum, the limit, and a display currency
     expect((await get('min_trades=1&limit=5')).body).toEqual({
       result: 'success',
       period: 'day',
+      amm: 'include',
       count: 0,
       markets: [],
     });
-    expect((await get(`exchange_currency=USD&exchange_issuer=${MARKETS_ISSUER}`)).body).toEqual({
+    expect((await get(`exchange_currency=USD&exchange_issuer=${MARKETS_ISSUER}&amm=only`)).body).toEqual({
       result: 'success',
       period: 'day',
+      amm: 'only',
       count: 0,
       markets: [],
     });
@@ -1110,6 +1244,92 @@ describe('GET /v2/network/markets on a database with no set, then with sets writ
     expect(newer.totals).toEqual({ pairs: 2, pairs_traded: 2, count: 29, native_volume: '17' });
   });
 
+  it('each AMM field is served when its column is not NULL and left out when it is: the share, the pool and the total on their own', async () => {
+    const start = Date.parse('2020-06-02T10:00:00Z') / 1000;
+    const end = Date.parse('2020-07-02T10:42:17Z') / 1000;
+    const pairs: HandPair[] = [
+      { base: `AAA+${I}`, counter: 'XRP', count: 12, native: '30', ammShare: '0.3400', ammPool: 1 },
+      { base: `BBB+${I}`, counter: 'XRP', count: 11, native: '20', ammShare: '0.0000', ammPool: 0 },
+      { base: `CCC+${I}`, counter: 'XRP', count: 10, native: '10', ammShare: '1.0000' },
+      { base: `DDD+${I}`, counter: 'XRP', count: 10, native: '5', ammPool: 1 },
+      { base: `EEE+${I}`, counter: 'XRP', count: 10 },
+    ];
+    await h.ch.insert(
+      Table.MarketsLive,
+      handSet({ period: '30day', version: 3, start, end, pairs, totalAmmShare: '0.2000' }),
+    );
+    const AMM_OF_PAIRS = [
+      ['AAA', '0.3400', true],
+      ['BBB', '0.0000', false],
+      ['CCC', '1.0000', undefined],
+      ['DDD', undefined, true],
+      ['EEE', undefined, undefined],
+    ];
+    const body = (await get('period=30day')).body;
+    expect(body.markets.map((m: Json) => [m.base_currency, m.amm_share, m.amm_pool])).toEqual(AMM_OF_PAIRS);
+    expect(body.totals.amm_share).toBe('0.2000');
+    expect(Object.keys(body.totals)).toEqual(['pairs', 'pairs_traded', 'count', 'native_volume', 'amm_share']);
+    // each key is there on its own, after last_time and before the sparkline
+    const ammKeys = (m: Json): string[] => Object.keys(m).filter((key) => key.startsWith('amm_'));
+    expect(body.markets.map(ammKeys)).toEqual([
+      ['amm_share', 'amm_pool'],
+      ['amm_share', 'amm_pool'],
+      ['amm_share'],
+      ['amm_pool'],
+      [],
+    ]);
+    expect(Object.keys(body.markets[0]).slice(-4)).toEqual(['last_time', 'amm_share', 'amm_pool', 'sparkline']);
+    expect(JSON.stringify(body)).not.toContain('null');
+
+    // a newer version of the set whose total is NULL: the pairs keep theirs, the totals have none
+    await h.ch.insert(Table.MarketsLive, handSet({ period: '30day', version: 4, start, end, pairs }));
+    const noTotal = (await get('period=30day')).body;
+    expect(noTotal.markets.map((m: Json) => [m.base_currency, m.amm_share, m.amm_pool])).toEqual(AMM_OF_PAIRS);
+    expect(Object.keys(noTotal.totals)).toEqual(['pairs', 'pairs_traded', 'count', 'native_volume']);
+
+    // and a set of every AMM column NULL, as the job writes it when the parser gate keeps them out: none is served
+    await h.ch.insert(
+      Table.MarketsLive,
+      handSet({
+        period: '30day',
+        version: 5,
+        start,
+        end,
+        pairs: pairs.map(({ base, counter, count, native }) => ({ base, counter, count, native })),
+      }),
+    );
+    const unknown = (await get('period=30day')).body;
+    expect(JSON.stringify(unknown)).not.toMatch(/amm_|null/);
+    expect(Object.keys(unknown)).toEqual(ANSWER_KEYS);
+    expect(unknown.markets.map(ammKeys)).toEqual([[], [], [], [], []]);
+
+    // each filter is its own set: exclude is read on its own, and only, which has none, answers as no set does
+    await h.ch.insert(
+      Table.MarketsLive,
+      handSet({
+        period: '30day',
+        amm: 'exclude',
+        version: 1,
+        start,
+        end,
+        pairs: [{ base: `AAA+${I}`, counter: 'XRP', count: 5, native: '8', ammShare: '0.3400', ammPool: 1 }],
+        totalAmmShare: '0.3400',
+      }),
+    );
+    const exclude = (await get('period=30day&amm=exclude&min_trades=1')).body;
+    expect(exclude).toMatchObject({ amm: 'exclude', count: 1, totals: { amm_share: '0.3400', count: 5 } });
+    expect(exclude.markets[0]).toMatchObject({ base_currency: 'AAA', amm_share: '0.3400', amm_pool: true });
+    expect((await get('period=30day&amm=only')).body).toEqual({
+      result: 'success',
+      period: '30day',
+      amm: 'only',
+      count: 0,
+      markets: [],
+    });
+    // the filter include still reads its own newest version
+    expect((await get('period=30day')).body.totals).toMatchObject({ count: 53 });
+  });
+
   it('a failing read is 500 unable to retrieve markets', async () => {
     jest.spyOn(h.ch, 'query').mockRejectedValue(new Error('boom'));
     const res = await get();
@@ -1147,7 +1367,15 @@ describe('GET /v2/network/markets on Xahau', () => {
     expect([usd.base_currency, usd.counter_currency, usd.native_volume]).toEqual(['USD', 'XAH', '65']);
     expect(Object.keys(usd)).not.toContain('counter_issuer');
     expect(res.body.totals.native_volume).toBe('243.5');
-    expect(JSON.stringify(res.body)).not.toMatch(/amm/);
+    // there are no swaps and no pools on Xahau: the AMM fields are known, and they say so
+    expect(res.body.totals.amm_share).toBe('0.0000');
+    for (const m of res.body.markets) expect([m.amm_share, m.amm_pool]).toEqual(['0.0000', false]);
+    expect((await get('min_trades=1&amm=exclude')).body).toEqual(dayAnswer('XAH', [], 'exclude'));
+    expect((await get('min_trades=1&amm=only')).body).toMatchObject({
+      amm: 'only',
+      totals: { pairs: 0, pairs_traded: 0, count: 0, native_volume: '0', amm_share: '0.0000' },
+      markets: [],
+    });
 
     // the native currency is XAH: it has no issuer, and its messages say so
     expect((await get(`exchange_currency=XAH&exchange_issuer=${I}`)).body).toEqual(bad('XAH cannot have an issuer'));
@@ -1165,6 +1393,332 @@ describe('GET /v2/network/markets on Xahau', () => {
     expect(display.body.markets[0]).toMatchObject({ native_volume: '65', converted_volume: '32.5' });
 
     // a period without a set
-    expect((await get('period=7day')).body).toEqual({ result: 'success', period: '7day', count: 0, markets: [] });
+    expect((await get('period=7day')).body).toEqual({
+      result: 'success',
+      period: '7day',
+      amm: 'include',
+      count: 0,
+      markets: [],
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The markets of the day window of the world with swaps (`{ amm: true }`), by name: those of the order-book world, which the
+ * swaps do not touch, and the two pairs they add. MIX/N is traded on the order book and against `MARKETS_POOL`, SWP/N against
+ * `MARKETS_POOL2` only (read the header of `support/markets-world.ts` for the trades). A filter keeps its own trades: `exclude`
+ * has no swap, so MIX/N is its order-book trades and SWP/N is no pair of it; `only` has the swaps, MIX/N's and SWP/N's, and no
+ * other pair. `amm_share` and `amm_pool` describe the pair, so they are the same in every filter.
+ */
+function swapMarkets(filter: 'include' | 'exclude' | 'only'): Record<string, Json> {
+  const mix: Record<typeof filter, Want> = {
+    include: {
+      count: 10,
+      baseVolume: '100',
+      counterVolume: '24',
+      native: '24',
+      open: '0.2',
+      high: '0.3',
+      low: '0.2',
+      last: '0.3',
+      change: '50.00',
+      openTime: '2020-07-02T01:00:00Z',
+      lastTime: '2020-07-02T01:13:00Z',
+      closes: [...NONE, '0.3'],
+      ammShare: '0.4000',
+      ammPool: true,
+    },
+    exclude: {
+      count: 6,
+      baseVolume: '60',
+      counterVolume: '12',
+      native: '12',
+      open: '0.2',
+      high: '0.2',
+      low: '0.2',
+      last: '0.2',
+      change: '0.00',
+      openTime: '2020-07-02T01:00:00Z',
+      lastTime: '2020-07-02T01:05:00Z',
+      closes: [...NONE, '0.2'],
+      ammShare: '0.4000',
+      ammPool: true,
+    },
+    only: {
+      count: 4,
+      baseVolume: '40',
+      counterVolume: '12',
+      native: '12',
+      open: '0.3',
+      high: '0.3',
+      low: '0.3',
+      last: '0.3',
+      change: '0.00',
+      openTime: '2020-07-02T01:10:00Z',
+      lastTime: '2020-07-02T01:13:00Z',
+      closes: [...NONE, '0.3'],
+      ammShare: '0.4000',
+      ammPool: true,
+    },
+  };
+  return {
+    ...dayMarkets('XRP'),
+    'MIX/N': market(`MIX+${I}`, 'XRP', mix[filter]),
+    // swaps only, and no row of amm_pools for its pool: a share of 1 and no pool
+    'SWP/N': market(`SWP+${I}`, 'XRP', {
+      count: 10,
+      baseVolume: '50',
+      counterVolume: '10',
+      native: '10',
+      open: '0.2',
+      high: '0.2',
+      low: '0.2',
+      last: '0.2',
+      change: '0.00',
+      openTime: '2020-07-02T01:20:00Z',
+      lastTime: '2020-07-02T01:29:00Z',
+      closes: [...NONE, '0.2'],
+      ammShare: '1.0000',
+      ammPool: false,
+    }),
+  };
+}
+
+/** The order of the markets of each filter with `min_trades=1`: MIX/N sorts by the native volume it has in the filter. */
+const SWAP_ORDER = {
+  include: [
+    'USD/N', // 65
+    'USD/ZZZ', // 60
+    'N/ZZZ', // 55
+    'EUR/USD', // 25
+    'MIX/N', // 24
+    'CHF/N', // 18
+    'AUD/N', // 10, and CAD/N and SWP/N have the same: the pair breaks the tie
+    'CAD/N',
+    'SWP/N',
+    'NZD/N', // 0.5
+    'EUR/GBP',
+    'BTC/EUR',
+    'BTC/GBP',
+  ],
+  exclude: [
+    'USD/N',
+    'USD/ZZZ',
+    'N/ZZZ',
+    'EUR/USD',
+    'CHF/N',
+    'MIX/N',
+    'AUD/N',
+    'CAD/N',
+    'NZD/N',
+    'EUR/GBP',
+    'BTC/EUR',
+    'BTC/GBP',
+  ],
+  only: ['MIX/N', 'SWP/N'],
+};
+
+/** The totals of each filter: the pairs, the trades and the native volume that are those of the filter; the share is the pairs' */
+const SWAP_TOTALS = {
+  include: { pairs_traded: 13, count: 132, native_volume: '277.5', amm_share: '0.0706' },
+  exclude: { pairs_traded: 12, count: 118, native_volume: '255.5', amm_share: '0.0706' },
+  only: { pairs_traded: 2, count: 14, native_volume: '22', amm_share: '0.0706' },
+};
+
+/** The answer of the day for a filter, `min_trades=1`, from the markets above. */
+const swapAnswer = (filter: 'include' | 'exclude' | 'only'): Json =>
+  answerOf(
+    'day',
+    ['2020-07-01T10:00:00Z', END],
+    SWAP_TOTALS[filter],
+    swapMarkets(filter),
+    SWAP_ORDER[filter],
+    [],
+    filter,
+  );
+
+describe('GET /v2/network/markets on a world with swaps and a pool', () => {
+  let h: Harness;
+  let api: ApiClient;
+  const get = (qs = '') => api.get(`/v2/network/markets${qs ? `?${qs}` : ''}`);
+  const ok = async (qs = ''): Promise<Json> =>
+    (await api.ok(`/v2/network/markets${qs ? `?${qs}` : ''}`, 'markets')).body;
+
+  beforeAll(async () => {
+    h = await startHarness({ env: NO_RATE_LIMIT });
+    api = await h.api();
+    // the day only: it reads the days of the sparkline, not the 30
+    await seedMarketsWorld(h, MARKETS_NOW, { periods: ['day'], amm: true });
+    // the live rate of EUR of I2: 0.5 EUR a coin
+    await seedLiveRate(h, 'XRP', { currency: 'EUR', issuer: I2 }, { native: '20', display: '10' });
+  }, 600_000);
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('a pool pair: amm_share and amm_pool true; only lists the swaps; exclude leaves out a pair of swaps only', async () => {
+    const include = await ok('min_trades=1');
+    expect(include).toEqual(swapAnswer('include'));
+    // MIX/N: 40 of its 100 are swaps, and its pool is in amm_pools; SWP/N is all swaps and its pool has no row
+    const mix = include.markets.find((m: Json) => m.base_currency === 'MIX');
+    const swp = include.markets.find((m: Json) => m.base_currency === 'SWP');
+    expect([mix.amm_share, mix.amm_pool]).toEqual(['0.4000', true]);
+    expect([swp.amm_share, swp.amm_pool]).toEqual(['1.0000', false]);
+    // the others have no swap: "0.0000", and no pool
+    const others = include.markets.filter((m: Json) => !['MIX', 'SWP'].includes(m.base_currency));
+    expect(others).toHaveLength(11);
+    for (const m of others) expect([m.amm_share, m.amm_pool]).toEqual(['0.0000', false]);
+    // the share of the native volume: (24 x 0.4 + 10 x 1) / 277.5
+    expect(include.totals.amm_share).toBe('0.0706');
+
+    // exclude: the order book only, so SWP/N (swaps only) is not a pair of it, and MIX/N has its order-book trades
+    const exclude = await ok('min_trades=1&amm=exclude');
+    expect(exclude).toEqual(swapAnswer('exclude'));
+    expect(names(exclude)).not.toContain('SWP/N');
+    expect(exclude.markets.find((m: Json) => m.base_currency === 'MIX')).toMatchObject({
+      count: 6,
+      base_volume: '60',
+      native_volume: '12',
+    });
+    // only: the swaps, and nothing else
+    const only = await ok('min_trades=1&amm=only');
+    expect(only).toEqual(swapAnswer('only'));
+    expect(names(only)).toEqual(['MIX/N', 'SWP/N']);
+    expect(only.markets.find((m: Json) => m.base_currency === 'MIX')).toMatchObject({
+      count: 4,
+      base_volume: '40',
+      open: p8('0.3'),
+      open_time: '2020-07-02T01:10:00Z',
+    });
+
+    // amm_share describes the pair, whichever trades the filter keeps: the same in every filter's set
+    for (const amm of ['include', 'exclude', 'only']) {
+      const body = await ok(`min_trades=1&amm=${amm}`);
+      expect(body.markets.find((m: Json) => m.base_currency === 'MIX')).toMatchObject({
+        amm_share: '0.4000',
+        amm_pool: true,
+      });
+      expect(body.totals.amm_share).toBe('0.0706');
+    }
+  });
+
+  it('the default min_trades lists the pairs of ten trades, and a filter keeps the pairs that reach it with its own trades', async () => {
+    // MIX/N has ten trades in all, six of the order book and four swaps; SWP/N ten swaps
+    expect(names(await ok())).toContain('MIX/N');
+    expect(names(await ok())).toContain('SWP/N');
+    expect(names(await ok('amm=exclude'))).not.toContain('MIX/N'); // 6 trades
+    expect(names(await ok('amm=exclude'))).not.toContain('SWP/N');
+    expect(names(await ok('amm=only'))).toEqual(['SWP/N']); // MIX/N has 4 swaps
+    expect((await ok('amm=only')).totals).toEqual({
+      pairs: 1,
+      ...SWAP_TOTALS.only,
+    });
+  });
+
+  it('a display currency converts the volumes of the filter, and the share stays last in the totals', async () => {
+    const body = await ok(`min_trades=1&amm=only&exchange_currency=EUR&exchange_issuer=${I2}`);
+    expect(Object.keys(body.totals)).toEqual([
+      'pairs',
+      'pairs_traded',
+      'count',
+      'native_volume',
+      'converted_volume',
+      'amm_share',
+    ]);
+    // 22 native coins at 0.5
+    expect(body.totals).toEqual({ pairs: 2, ...SWAP_TOTALS.only, converted_volume: '11' });
+    expect(body.markets.map((m: Json) => [m.base_currency, m.native_volume, m.converted_volume])).toEqual([
+      ['MIX', '12', '6'],
+      ['SWP', '10', '5'],
+    ]);
+    expect(Object.keys(body.markets[0]).slice(-4)).toEqual(['last_time', 'amm_share', 'amm_pool', 'sparkline']);
+  });
+
+  it('format=csv has amm_share and amm_pool for the pairs of the filter', async () => {
+    const res = await get('min_trades=1&amm=only&format=csv');
+    expect(res.status).toBe(200);
+    const lines = res.text.split('\n');
+    expect(lines).toHaveLength(1 + 2);
+    const header = lines[0].split(',');
+    const column = (name: string): number => header.indexOf(`"${name}"`);
+    expect(column('amm_pool')).toBe(column('amm_share') + 1);
+    const cells = (line: string): string[] => line.split(',');
+    // MIX/N, then SWP/N
+    expect([cells(lines[1])[column('amm_share')], cells(lines[1])[column('amm_pool')]]).toEqual(['"0.4000"', '"true"']);
+    expect([cells(lines[2])[column('amm_share')], cells(lines[2])[column('amm_pool')]]).toEqual([
+      '"1.0000"',
+      '"false"',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+describe('GET /v2/network/markets when a ledger of the window was parsed without AMM', () => {
+  let h: Harness;
+  let api: ApiClient;
+  const ok = async (qs = ''): Promise<Json> =>
+    (await api.ok(`/v2/network/markets${qs ? `?${qs}` : ''}`, 'markets')).body;
+
+  beforeAll(async () => {
+    h = await startHarness({ env: NO_RATE_LIMIT });
+    api = await h.api();
+    await seedMarketsWorld(h, MARKETS_NOW, { periods: ['day'], amm: true });
+  }, 600_000);
+
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('amm_share, amm_pool and totals.amm_share are served when the set has them, and left out when the parser gate kept them out', async () => {
+    // every ledger of the window was written by a parser that knows AMM: the fields are there, in every filter
+    const known: Json = {};
+    for (const amm of ['include', 'exclude', 'only'] as const) {
+      known[amm] = await ok(`min_trades=1&amm=${amm}`);
+      expect(known[amm]).toEqual(swapAnswer(amm));
+    }
+
+    // one more ledger of the window, of the parser before AMM (the newest, at the close time of the world's last one), and the
+    // job writes the day's three sets again
+    const closed = Math.floor(MARKETS_NOW.getTime() / 1000);
+    await h.ch.insert(Table.Ledgers, [
+      {
+        ...SAMPLE_ROWS[Table.Ledgers],
+        ledger_index: 2_900_000,
+        ledger_hash: '2900000'.padStart(64, 'A'),
+        close_time: closed,
+        parser_version: AMM_PARSER_VERSION - 1,
+      },
+    ]);
+    const outcome = await computeMarketsSet(h.ch, 'XRP', 'day', MARKETS_NOW);
+    expect(outcome).toMatchObject({ written: true, ammShareKnown: false });
+
+    for (const amm of ['include', 'exclude', 'only'] as const) {
+      const unknown = await ok(`min_trades=1&amm=${amm}`);
+      // not one AMM field, and the filter is still echoed
+      expect(JSON.stringify(unknown)).not.toMatch(/amm_/);
+      expect(JSON.stringify(unknown)).not.toContain('null');
+      expect(unknown.amm).toBe(amm);
+      expect(Object.keys(unknown)).toEqual(ANSWER_KEYS);
+      expect(Object.keys(unknown.totals)).toEqual(TOTALS_KEYS.slice(0, 4));
+      // and the rest of the set is what it was: the filter's trades, volumes, prices and closes
+      const { amm_share: total, ...totals } = known[amm].totals;
+      expect(total).toBeDefined();
+      expect(unknown).toEqual({
+        ...known[amm],
+        totals,
+        markets: known[amm].markets.map(({ amm_share, amm_pool, ...rest }: Json) => {
+          expect([amm_share, amm_pool]).not.toContain(undefined);
+          return rest;
+        }),
+      });
+    }
   });
 });

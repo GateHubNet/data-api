@@ -4,7 +4,7 @@ import { ApiOperation, ApiQuery } from '@nestjs/swagger';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { Csv } from '../common/csv.interceptor';
 import { badRequest } from '../common/errors';
-import { first, limitParam, Query as QueryParams } from '../common/params';
+import { ammFilter, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { NETWORK_PROFILE } from '../config/api.config';
 import { MarketsAnswer, NoMarketsAnswer } from './markets-object';
@@ -37,9 +37,12 @@ function minTradesParam(query: QueryParams): number {
  * `GET /v2/network/markets` (spec 7): the trade statistics of every pair in a live period, from the newest set of the
  * `markets_live` job (`MarketsService`). A new route: its object and key order are ours (`markets-object.ts`), and it uses the
  * contract layer of the others (the API key, the rate limit, `GH_CACHE_CONTROL`, `format=csv`, errors
- * `{result: "error", message}`). It serves no AMM field, and `amm` is no parameter: it is ignored like any unknown one (spec 8).
+ * `{result: "error", message}`). `amm` (`include`, the default, `exclude` or `only`) picks the set of the trades to count, and
+ * the answer echoes it. The AMM fields (`amm_share`, `amm_pool`, `totals.amm_share`) are there only when the set has them: the
+ * syncer writes them when every ledger of the window was parsed with AMM support, and leaves them NULL otherwise (spec 8).
  *
- * The checks come in order: `period`, `min_trades`, then the display currency, with the checks and messages of the volume routes.
+ * The checks come in order: `period`, `min_trades`, the display currency (with the checks and messages of the volume routes),
+ * then `amm`.
  */
 @RippleController('v2/network')
 export class MarketsController {
@@ -66,8 +69,14 @@ export class MarketsController {
       'and `end_time` are the window of the set. `totals.pairs` counts the listed pairs, whatever the limit; ' +
       '`pairs_traded`, `count` and `native_volume` are over every pair that traded. With `exchange_currency` the answer has ' +
       '`exchange` and `exchange_rate` (units of it per native coin, at the rate of the latest trades) and a `converted_volume` ' +
-      '(the native volume times the rate) on the totals and on every market that has a native volume. The sets are written ' +
-      'every minute (day) or five minutes (7day, 30day); before the first one the answer has no markets.',
+      '(the native volume times the rate) on the totals and on every market that has a native volume. With `amm` the pairs, ' +
+      'volumes, prices and counts are those of the trades it keeps (`exclude`: the order book; `only`: the swaps against AMM ' +
+      "pools), and the answer has `amm`. `amm_share` is the part of the pair's base volume that was swaps, over every trade " +
+      'of the pair in the window, text with 4 decimals (the same in every filter; it does not change if a consumer shows the ' +
+      'pair inverted), `amm_pool` whether the pair has a pool that is not deleted, and `totals.amm_share` the part of the native ' +
+      'volume that was swaps. They are left out unless every ledger of the window was parsed with AMM support: an absent ' +
+      'field means not known, never 0 or false. The sets are written every minute (day) or five minutes (7day, 30day); ' +
+      'before the first one the answer has no markets.',
   })
   @ApiQuery({
     name: 'period',
@@ -91,6 +100,14 @@ export class MarketsController {
     required: false,
     description: 'Required for every currency but the native one.',
   })
+  @ApiQuery({
+    name: 'amm',
+    required: false,
+    enum: ['include', 'exclude', 'only'],
+    description:
+      'From the AMM data: `include` (default) counts every trade, `exclude` the order-book trades only, `only` the swaps. ' +
+      'The AMM fields are there only when every ledger of the window was parsed with AMM.',
+  })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 1000, at most 5000.' })
   @ApiQuery({
     name: 'format',
@@ -110,9 +127,11 @@ export class MarketsController {
     if (currency === native && issuer) throw badRequest(`${native} cannot have an issuer`);
     if (issuer && !isValidClassicAddress(issuer)) throw badRequest('invalid exchange issuer address');
     const display = currency === native ? undefined : { currency, issuer: issuer as string };
+    const amm = ammFilter(query);
 
     return this.markets.markets({
       period,
+      amm,
       minTrades,
       limit: limitParam(query, { def: 1000, max: 5000 }),
       ...(display && { display }),

@@ -1,12 +1,17 @@
 import { Asset, MarketsPeriod, QUOTIENT_DIGITS } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { fmtTime, precision8 } from '../common/format';
+import { AmmFilter } from '../common/params';
 
 /**
  * The answer of `GET /v2/network/markets` (spec 7), with the keys in the order the spec pins. A key without a value is left out
- * and `null` is never served. The answer has no AMM field in D2 (spec 8): no `amm`, no `totals.amm_share`, no `amm_share` or
- * `amm_pool` on a market. The objects are built key by key, so a column of the stored rows that is none of the keys below
- * (`amm_share`, `amm_pool`, `total_amm_share`) can never get into an answer.
+ * and `null` is never served.
+ *
+ * `amm` (the filter the set was read for) is in every answer, after `period`. The AMM fields are present only when known
+ * (spec 8): `amm_share` and `amm_pool` on a market and `amm_share` on the totals are served when the stored column is not
+ * NULL, which is when every ledger of the set's window was parsed with AMM support (the parser gate of the syncer's
+ * `markets_live` job); otherwise the key is left out, and a value that is known is served, `"0.0000"` and `false` too. The
+ * objects are built key by key, so a column of the stored rows that is none of the keys below can never get into an answer.
  */
 
 const DAY = 86_400;
@@ -31,6 +36,10 @@ export interface StoredMarket {
   last_time: number | string;
   /** The close of each of the 7 days that end with the day of the set's `end_time`, oldest first; `null`: none. */
   closes: readonly (string | null)[];
+  /** The share of the pair's base volume that was swaps, text with 4 decimals; `null`: not known (the same in every filter's set). */
+  amm_share: string | null;
+  /** Whether a pool of the pair exists (1) or not (0); `null`: not known. */
+  amm_pool: number | null;
 }
 
 /** The newest set of a period: the pairs, and what its sentinel row carries (the window and the totals). */
@@ -41,6 +50,8 @@ export interface StoredMarketsSet {
   pairs_traded: number | string;
   total_count: number | string;
   total_native_volume: string;
+  /** The AMM share of the native volume, text with 4 decimals; `null`: not known. */
+  total_amm_share: string | null;
   /** Every pair with a kept trade in the window, in no order the answer relies on. */
   markets: readonly StoredMarket[];
 }
@@ -53,6 +64,8 @@ export interface MarketsDisplay {
 
 export interface MarketsInput {
   period: MarketsPeriod;
+  /** The filter the set was read for; the answer echoes it. */
+  amm: AmmFilter;
   set: StoredMarketsSet;
   /** The pairs with at least this many trades are listed. */
   minTrades: number;
@@ -84,6 +97,9 @@ export interface Market {
   change?: string;
   open_time: string;
   last_time: string;
+  /** Left out where not known. */
+  amm_share?: string;
+  amm_pool?: boolean;
   sparkline: SparklineEntry[];
 }
 
@@ -93,11 +109,14 @@ export interface MarketsTotals {
   count: number;
   native_volume: string;
   converted_volume?: string;
+  /** Left out where not known. */
+  amm_share?: string;
 }
 
 export interface MarketsAnswer {
   result: 'success';
   period: MarketsPeriod;
+  amm: AmmFilter;
   start_time: string;
   end_time: string;
   exchange?: { currency: string; issuer?: string };
@@ -107,10 +126,11 @@ export interface MarketsAnswer {
   markets: Market[];
 }
 
-/** The answer while no set has been written: `result, period, count, markets`. */
+/** The answer while no set has been written: `result, period, amm, count, markets`. */
 export interface NoMarketsAnswer {
   result: 'success';
   period: MarketsPeriod;
+  amm: AmmFilter;
   count: 0;
   markets: [];
 }
@@ -169,6 +189,8 @@ function toMarket(m: StoredMarket, endTime: number, display?: MarketsDisplay): M
     ...(change !== undefined && { change }),
     open_time: fmtTime(Number(m.open_time)),
     last_time: fmtTime(Number(m.last_time)),
+    ...(typeof m.amm_share === 'string' && { amm_share: m.amm_share }),
+    ...(typeof m.amm_pool === 'number' && { amm_pool: m.amm_pool === 1 }),
     sparkline: sparklineOf(m.closes, endTime),
   };
 }
@@ -194,7 +216,9 @@ interface Listed {
  * not: the `limit` comes after), sorted by `native_volume`, the largest first (compared as numbers), the pairs without one
  * last by `count`, the largest first, and then by the pair; the first `limit` are served. The other totals are those of the
  * set (over every pair that traded). With a display currency the answer has `exchange` and `exchange_rate` after `end_time`,
- * and a `converted_volume` after the `native_volume` of every market that has one and in the totals.
+ * and a `converted_volume` after the `native_volume` of every market that has one and in the totals. The answer echoes the
+ * `amm` filter after `period`; a market has `amm_share` and `amm_pool` after `last_time`, and the totals an `amm_share` last,
+ * where the set has them (they are not there for a set the parser gate kept them out of).
  */
 export function marketsAnswer(input: MarketsInput): MarketsAnswer {
   const { set, display } = input;
@@ -216,6 +240,7 @@ export function marketsAnswer(input: MarketsInput): MarketsAnswer {
   return {
     result: 'success',
     period: input.period,
+    amm: input.amm,
     start_time: fmtTime(Number(set.start_time)),
     end_time: fmtTime(end),
     ...(display && {
@@ -231,12 +256,13 @@ export function marketsAnswer(input: MarketsInput): MarketsAnswer {
       count: Number(set.total_count),
       native_volume: set.total_native_volume,
       ...(display && { converted_volume: convertedVolume(set.total_native_volume, display.rate) }),
+      ...(typeof set.total_amm_share === 'string' && { amm_share: set.total_amm_share }),
     },
     count: markets.length,
     markets,
   };
 }
 
-export function noMarketsAnswer(period: MarketsPeriod): NoMarketsAnswer {
-  return { result: 'success', period, count: 0, markets: [] };
+export function noMarketsAnswer(period: MarketsPeriod, amm: AmmFilter): NoMarketsAnswer {
+  return { result: 'success', period, amm, count: 0, markets: [] };
 }

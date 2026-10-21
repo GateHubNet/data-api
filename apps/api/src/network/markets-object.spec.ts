@@ -1,4 +1,5 @@
 import BigNumber from 'bignumber.js';
+import { flattenJSON } from '../common/csv.interceptor';
 import {
   changePercent,
   convertedVolume,
@@ -39,6 +40,8 @@ const USD_XRP: StoredMarket = {
   open_time: sec('2026-10-18T11:00:03Z'),
   last_time: sec('2026-10-19T11:42:30Z'),
   closes: ['0.4123', '0.418', '0.418', '0.4201', '0.415', '0.4199', '0.4099'],
+  amm_share: null,
+  amm_pool: null,
 };
 
 /** A pair that has no pair of its own with the native currency, and no rate: no native volume. */
@@ -58,6 +61,8 @@ const BTC_EUR: StoredMarket = {
   open_time: sec('2026-10-18T12:00:00Z'),
   last_time: sec('2026-10-19T09:00:00Z'),
   closes: [null, null, null, null, null, '20', '25'],
+  amm_share: null,
+  amm_pool: null,
 };
 
 const SET: StoredMarketsSet = {
@@ -66,6 +71,7 @@ const SET: StoredMarketsSet = {
   pairs_traded: 1840,
   total_count: 61234,
   total_native_volume: '123456789.12',
+  total_amm_share: null,
   markets: [BTC_EUR, USD_XRP],
 };
 
@@ -94,6 +100,7 @@ function market(
 const answerOf = (markets: StoredMarket[], o: { minTrades?: number; limit?: number } = {}) =>
   marketsAnswer({
     period: 'day',
+    amm: 'include',
     set: { ...SET, markets },
     minTrades: o.minTrades ?? 1,
     limit: o.limit ?? 1000,
@@ -238,13 +245,23 @@ describe('the sparkline: the 7 days that end with the day of end_time, close lef
 });
 
 describe('the answer', () => {
-  const answer = marketsAnswer({ period: 'day', set: SET, minTrades: 10, limit: 1000 });
+  const answer = marketsAnswer({ period: 'day', amm: 'include', set: SET, minTrades: 10, limit: 1000 });
 
-  it('is result, period, start_time, end_time, totals, count, markets', () => {
-    expect(Object.keys(answer)).toEqual(['result', 'period', 'start_time', 'end_time', 'totals', 'count', 'markets']);
+  it('is result, period, amm, start_time, end_time, totals, count, markets', () => {
+    expect(Object.keys(answer)).toEqual([
+      'result',
+      'period',
+      'amm',
+      'start_time',
+      'end_time',
+      'totals',
+      'count',
+      'markets',
+    ]);
     expect(answer).toMatchObject({
       result: 'success',
       period: 'day',
+      amm: 'include',
       start_time: '2026-10-18T11:00:00Z',
       end_time: '2026-10-19T11:42:31Z',
       count: 2,
@@ -340,6 +357,7 @@ describe('the answer', () => {
     expect(m.count).toBe(7);
     const text = marketsAnswer({
       period: '7day',
+      amm: 'include',
       set: {
         ...SET,
         start_time: String(SET.start_time),
@@ -357,31 +375,43 @@ describe('the answer', () => {
     expect(text.markets[0]).toMatchObject({ open_time: '1970-01-01T00:00:01Z', last_time: '1970-01-01T00:00:02Z' });
   });
 
-  it('has no amm, amm_share or amm_pool key, whatever the stored rows carry', () => {
+  it('is built key by key: a column of the stored rows that is none of the keys never gets into an answer', () => {
     const stored = {
       ...USD_XRP,
-      amm_share: '0.25',
-      amm_pool: 1,
-      amm: 'include',
+      amm: 'only',
+      start_time: 1,
+      pairs_traded: 7,
+      total_amm_share: '0.5',
     } as StoredMarket;
-    const full = marketsAnswer({
+    const [m] = marketsAnswer({
       period: 'day',
-      set: { ...SET, markets: [stored], total_amm_share: '0.1', amm: 'include' } as StoredMarketsSet,
+      amm: 'include',
+      set: { ...SET, markets: [stored] },
       minTrades: 1,
       limit: 10,
-      display: { asset: { currency: 'USD', issuer: OTHER }, rate: new BigNumber('1.5') },
-    });
-    const text = JSON.stringify(full);
-    expect(text).not.toMatch(/amm/);
-    expect(Object.keys(full)).not.toContain('amm');
-    expect(Object.keys(full.totals)).not.toContain('amm_share');
-    expect(Object.keys(full.markets[0])).not.toContain('amm_share');
-    expect(Object.keys(full.markets[0])).not.toContain('amm_pool');
+    }).markets;
+    expect(Object.keys(m)).toEqual([
+      'base_currency',
+      'base_issuer',
+      'counter_currency',
+      'count',
+      'base_volume',
+      'counter_volume',
+      'native_volume',
+      'open',
+      'high',
+      'low',
+      'last',
+      'change',
+      'open_time',
+      'last_time',
+      'sparkline',
+    ]);
   });
 
   it('does not change its input', () => {
     const frozen = deepFreeze({ ...SET, markets: [{ ...BTC_EUR }, { ...USD_XRP }] });
-    expect(() => marketsAnswer({ period: 'day', set: frozen, minTrades: 1, limit: 10 })).not.toThrow();
+    expect(() => marketsAnswer({ period: 'day', amm: 'include', set: frozen, minTrades: 1, limit: 10 })).not.toThrow();
   });
 
   it('serves change next to a price that never moved, and no change for an open that is 0', () => {
@@ -505,12 +535,13 @@ describe('the order of the markets', () => {
 
 describe('a display currency', () => {
   const display = { asset: { currency: 'EUR', issuer: OTHER }, rate: new BigNumber('0.3333333333333333333') };
-  const shown = marketsAnswer({ period: 'day', set: SET, minTrades: 1, limit: 10, display });
+  const shown = marketsAnswer({ period: 'day', amm: 'include', set: SET, minTrades: 1, limit: 10, display });
 
   it('adds exchange and exchange_rate after end_time, and converted_volume to the totals', () => {
     expect(Object.keys(shown)).toEqual([
       'result',
       'period',
+      'amm',
       'start_time',
       'end_time',
       'exchange',
@@ -545,6 +576,7 @@ describe('a display currency', () => {
   it('is zeros for a rate of 0, with the rate shown as 0.0000000', () => {
     const zero = marketsAnswer({
       period: 'day',
+      amm: 'include',
       set: SET,
       minTrades: 1,
       limit: 10,
@@ -556,7 +588,7 @@ describe('a display currency', () => {
   });
 
   it('shows no exchange key without one', () => {
-    const plain = marketsAnswer({ period: 'day', set: SET, minTrades: 1, limit: 10 });
+    const plain = marketsAnswer({ period: 'day', amm: 'include', set: SET, minTrades: 1, limit: 10 });
     expect(Object.keys(plain)).not.toContain('exchange');
     expect(Object.keys(plain)).not.toContain('exchange_rate');
     expect(Object.keys(plain.totals)).not.toContain('converted_volume');
@@ -564,8 +596,216 @@ describe('a display currency', () => {
 });
 
 describe('no set yet', () => {
-  it('is result, period, count and markets', () => {
-    expect(noMarketsAnswer('7day')).toEqual({ result: 'success', period: '7day', count: 0, markets: [] });
-    expect(Object.keys(noMarketsAnswer('day'))).toEqual(['result', 'period', 'count', 'markets']);
+  it('is result, period, amm, count and markets', () => {
+    expect(noMarketsAnswer('7day', 'include')).toEqual({
+      result: 'success',
+      period: '7day',
+      amm: 'include',
+      count: 0,
+      markets: [],
+    });
+    expect(Object.keys(noMarketsAnswer('day', 'include'))).toEqual(['result', 'period', 'amm', 'count', 'markets']);
+  });
+
+  it('echoes the filter that was asked for', () => {
+    for (const amm of ['include', 'exclude', 'only'] as const) {
+      expect(noMarketsAnswer('30day', amm)).toEqual({ result: 'success', period: '30day', amm, count: 0, markets: [] });
+    }
+  });
+});
+
+describe('the AMM fields', () => {
+  /** USD/XRP with every AMM column known, and BTC/EUR with none: a pair with swaps against a pool, a pair without any. */
+  const KNOWN: StoredMarket = { ...USD_XRP, amm_share: '0.3400', amm_pool: 1 };
+  const display = { asset: { currency: 'EUR', issuer: OTHER }, rate: new BigNumber('0.5') };
+  const known: StoredMarketsSet = { ...SET, total_amm_share: '0.0706', markets: [BTC_EUR, KNOWN] };
+  const input = (amm: 'include' | 'exclude' | 'only', set: StoredMarketsSet, shown = false) => ({
+    period: 'day' as const,
+    amm,
+    set,
+    minTrades: 1,
+    limit: 10,
+    ...(shown && { display }),
+  });
+
+  it('echoes amm after period, whatever the filter', () => {
+    for (const amm of ['include', 'exclude', 'only'] as const) {
+      const answer = marketsAnswer(input(amm, known));
+      expect(answer.amm).toBe(amm);
+      expect(Object.keys(answer).slice(0, 3)).toEqual(['result', 'period', 'amm']);
+    }
+  });
+
+  it('has the answer keys in order, with and without every optional key', () => {
+    const bare = marketsAnswer(input('include', SET));
+    expect(Object.keys(bare)).toEqual([
+      'result',
+      'period',
+      'amm',
+      'start_time',
+      'end_time',
+      'totals',
+      'count',
+      'markets',
+    ]);
+    const full = marketsAnswer(input('exclude', known, true));
+    expect(Object.keys(full)).toEqual([
+      'result',
+      'period',
+      'amm',
+      'start_time',
+      'end_time',
+      'exchange',
+      'exchange_rate',
+      'totals',
+      'count',
+      'markets',
+    ]);
+  });
+
+  it('has the totals keys in order: amm_share last, after converted_volume', () => {
+    expect(Object.keys(marketsAnswer(input('include', SET)).totals)).toEqual([
+      'pairs',
+      'pairs_traded',
+      'count',
+      'native_volume',
+    ]);
+    expect(Object.keys(marketsAnswer(input('include', known)).totals)).toEqual([
+      'pairs',
+      'pairs_traded',
+      'count',
+      'native_volume',
+      'amm_share',
+    ]);
+    expect(Object.keys(marketsAnswer(input('include', known, true)).totals)).toEqual([
+      'pairs',
+      'pairs_traded',
+      'count',
+      'native_volume',
+      'converted_volume',
+      'amm_share',
+    ]);
+  });
+
+  it('has the market keys in order: amm_share and amm_pool after last_time, before the sparkline', () => {
+    // every optional key: both issuers, a native volume and its conversion, a change, the AMM fields
+    const everything = marketsAnswer(
+      input('include', { ...known, markets: [{ ...KNOWN, counter_currency: 'EUR', counter_issuer: OTHER }] }, true),
+    ).markets[0];
+    expect(Object.keys(everything)).toEqual([
+      'base_currency',
+      'base_issuer',
+      'counter_currency',
+      'counter_issuer',
+      'count',
+      'base_volume',
+      'counter_volume',
+      'native_volume',
+      'converted_volume',
+      'open',
+      'high',
+      'low',
+      'last',
+      'change',
+      'open_time',
+      'last_time',
+      'amm_share',
+      'amm_pool',
+      'sparkline',
+    ]);
+    // none of them: no issuers, no native volume, no change (an open of 0), and the AMM fields not known
+    const bare = marketsAnswer(
+      input('include', {
+        ...SET,
+        markets: [{ ...BTC_EUR, base_issuer: '', counter_issuer: '', open: '0', native_volume: null }],
+      }),
+    ).markets[0];
+    expect(Object.keys(bare)).toEqual([
+      'base_currency',
+      'counter_currency',
+      'count',
+      'base_volume',
+      'counter_volume',
+      'open',
+      'high',
+      'low',
+      'last',
+      'open_time',
+      'last_time',
+      'sparkline',
+    ]);
+  });
+
+  it('serves amm_share as stored and amm_pool as true or false, on a market whose columns are not NULL', () => {
+    // the pair with a native volume is listed first
+    const [pooled, none] = marketsAnswer(input('include', known)).markets;
+    expect(pooled).toMatchObject({ amm_share: '0.3400', amm_pool: true });
+    // the pair of the BTC/EUR row has nothing stored: neither key is there
+    expect(Object.keys(none)).not.toContain('amm_share');
+    expect(Object.keys(none)).not.toContain('amm_pool');
+    // 0 is false, and "0.0000" is a share: a value that is known is never left out
+    const [quiet] = marketsAnswer(
+      input('include', { ...known, markets: [{ ...USD_XRP, amm_share: '0.0000', amm_pool: 0 }] }),
+    ).markets;
+    expect(quiet.amm_share).toBe('0.0000');
+    expect(quiet.amm_pool).toBe(false);
+    expect(JSON.stringify(quiet)).toContain('"amm_pool":false');
+  });
+
+  it('serves each of the two on its own: the one that is NULL is left out, the other is not', () => {
+    const [shareOnly, poolOnly] = marketsAnswer(
+      input('include', {
+        ...known,
+        markets: [
+          { ...USD_XRP, base_currency: 'AAA', amm_share: '1.0000', amm_pool: null },
+          { ...USD_XRP, base_currency: 'BBB', amm_share: null, amm_pool: 1 },
+        ],
+      }),
+    ).markets;
+    expect(Object.keys(shareOnly)).toContain('amm_share');
+    expect(Object.keys(shareOnly)).not.toContain('amm_pool');
+    expect(Object.keys(poolOnly)).not.toContain('amm_share');
+    expect(poolOnly.amm_pool).toBe(true);
+  });
+
+  it('serves totals.amm_share only when total_amm_share is not NULL, as stored', () => {
+    expect(marketsAnswer(input('include', known)).totals.amm_share).toBe('0.0706');
+    expect(Object.keys(marketsAnswer(input('include', SET)).totals)).not.toContain('amm_share');
+    // "0.0000" is known
+    const zero = marketsAnswer(input('only', { ...known, total_amm_share: '0.0000' }));
+    expect(zero.totals.amm_share).toBe('0.0000');
+    expect(JSON.stringify(marketsAnswer(input('include', SET)))).not.toMatch(/amm_/);
+  });
+
+  it('leaves out every AMM field of a set the parser gate kept out, and still echoes amm', () => {
+    const answer = marketsAnswer(input('exclude', SET, true));
+    expect(answer.amm).toBe('exclude');
+    expect(JSON.stringify(answer)).not.toMatch(/amm_/);
+    expect(JSON.stringify(answer)).not.toContain('null');
+  });
+
+  it('flattens a market for the CSV with amm_share and amm_pool after last_time, and without them where unknown', () => {
+    // the pair with a native volume is listed first
+    const [pooled, none] = marketsAnswer(input('include', known)).markets;
+    const columns = Object.keys(flattenJSON(pooled));
+    expect(columns.slice(columns.indexOf('last_time'), columns.indexOf('last_time') + 4)).toEqual([
+      'last_time',
+      'amm_share',
+      'amm_pool',
+      'sparkline[0].date',
+    ]);
+    expect(flattenJSON(pooled)).toMatchObject({ amm_share: '0.3400', amm_pool: true });
+    expect(Object.keys(flattenJSON(none))).not.toContain('amm_share');
+    expect(Object.keys(flattenJSON(none))).not.toContain('amm_pool');
+    // false is a value of the column too
+    const [off] = marketsAnswer(
+      input('include', { ...known, markets: [{ ...USD_XRP, amm_share: '0.0000', amm_pool: 0 }] }),
+    ).markets;
+    expect(flattenJSON(off)).toMatchObject({ amm_share: '0.0000', amm_pool: false });
+  });
+
+  it('does not change its input', () => {
+    const frozen = deepFreeze({ ...known, markets: [{ ...BTC_EUR }, { ...KNOWN }] });
+    expect(() => marketsAnswer(input('only', frozen, true))).not.toThrow();
   });
 });
