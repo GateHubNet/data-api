@@ -19,12 +19,14 @@ import {
   AGGREGATOR_TICK_BUDGET_MS,
   AggregatorOptions,
   AggregatorService,
+  AmmDailyFunctions,
+  AmmPoolsFunctions,
 } from './aggregator.service';
 
 /**
- * The order of a tick with the account and market jobs registered, and what that order is for: the live volume jobs are
- * not starved, whatever the jobs after them are doing. The shared functions of the jobs, the volume functions and the
- * database are fakes; the services, the runners and their hooks in `agg_dirty` are the real ones.
+ * The order of a tick with the account and market jobs registered (and the AMM jobs), and what that order is for: the live
+ * volume jobs are not starved, whatever the jobs after them are doing. The shared functions of the jobs, the volume
+ * functions and the database are fakes; the services, the runners and their hooks in `agg_dirty` are the real ones.
  */
 
 const NOW_SECONDS = NOW.getTime() / 1000;
@@ -35,14 +37,19 @@ const MARKETS: MarketsConfig = { version: 4, tradeMarkets: [], paymentCurrencies
 const EVERY_JOB = [
   'volume_live',
   'volume_daily',
+  'amm_pools',
   'pair_hourly',
   'markets_live',
   'stats_live',
   'stats_dirty',
+  'amm_daily',
   'rates_daily',
   'account_rollups',
   'volume_backfill',
 ];
+
+/** The jobs of D2 (the account and market jobs). */
+const D2_JOBS = ['pair_hourly', 'markets_live', 'rates_daily', 'account_rollups'];
 
 /** The range of `agg_dirty` of the tests of the hooks: two hours of a day inside the last 31 days. */
 const DIRTY_FROM = '2026-10-14T20:00:00Z';
@@ -196,6 +203,35 @@ class D2World {
   }
 }
 
+/**
+ * The functions of the AMM jobs, quiet: no pool has changed or is in a slice, and no pool was ever active, so `amm_pools`
+ * rebuilds nothing and `amm_daily` writes the empty sets of today and yesterday (and of the days of a slice). Each set of
+ * `amm_daily` is noted as `amm_daily <day>` and takes no time.
+ */
+function quietAmm(note: (event: string) => void): {
+  pools: Partial<AmmPoolsFunctions>;
+  daily: Partial<AmmDailyFunctions>;
+} {
+  return {
+    pools: {
+      watermark: async () => 0,
+      changedSince: async (_ch, ledger) => ({ accounts: [], upTo: ledger }),
+      poolsClosedIn: async () => [],
+      recompute: async () => 0,
+    },
+    daily: {
+      compute: async (_ch, _rates, day) => {
+        note(`amm_daily ${day.toISOString().slice(0, 10)}`);
+        return 0;
+      },
+      daysDone: async () => new Set<string>(),
+      versions: async () => new Map<string, number>(),
+      firstDay: async () => undefined,
+      markOwed: async () => undefined,
+    },
+  };
+}
+
 describe('the schedule of the aggregator with the account and market jobs', () => {
   let ch: FakeClickHouse;
   let world: D2World;
@@ -265,8 +301,9 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     jest.useRealTimers();
   });
 
-  /** A service with every job registered; the volume sets and the account and market sets are the fakes above. */
+  /** A service with every job registered; the volume sets, the AMM sets and the account and market sets are the fakes above. */
   function service(options: AggregatorOptions = {}): AggregatorService {
+    const amm = quietAmm(note);
     const svc = new AggregatorService(ch.asService(), metrics as never, { register: jest.fn() } as never, {
       logger,
       recompute,
@@ -284,6 +321,12 @@ describe('the schedule of the aggregator with the account and market jobs', () =
         liveVersions: async () => new Map(),
         dailyVersions: async () => new Map(),
       },
+      ammPools: { rates },
+      ammPoolsFunctions: amm.pools,
+      ammDaily: { rates },
+      ammDailyFunctions: amm.daily,
+      // amm_daily at every tick, so that every tick of a test has every job
+      ammDailyEveryTicks: 1,
       aggregates: { rates, accountRollupMinRows: 1_000_000 },
       aggregateFunctions: world.fns(),
       ...options,
@@ -312,7 +355,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     });
   };
 
-  it('the jobs of a tick are volume_live, volume_daily, pair_hourly, markets_live, stats_live, stats_dirty, rates_daily, account_rollups, volume_backfill', async () => {
+  it('the jobs of a tick are volume_live, volume_daily, amm_pools, pair_hourly, markets_live, stats_live, stats_dirty, amm_daily, rates_daily, account_rollups, volume_backfill', async () => {
     caughtUp();
     await service().tick();
     expect(runs()).toEqual(EVERY_JOB);
@@ -322,22 +365,37 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     const at = (prefix: string): number => events().findIndex((event) => event.startsWith(prefix));
     expect(at('daily')).toBeLessThan(at('pair_hourly'));
     expect(at('markets_live')).toBeLessThan(at('stats'));
+    // and amm_daily after the stats (its quiet sets of today and yesterday)
+    expect(at('stats')).toBeLessThan(at('amm_daily'));
   });
 
   it('the account and market jobs keep their places without the volume jobs, and the volume jobs theirs without them', async () => {
     caughtUp();
     await service({ volumes: undefined }).tick();
     expect(runs()).toEqual([
+      'amm_pools',
       'pair_hourly',
       'markets_live',
       'stats_live',
       'stats_dirty',
+      'amm_daily',
       'rates_daily',
       'account_rollups',
     ]);
     metrics.aggregatorRunsTotal.inc.mockClear();
     await service({ aggregates: undefined }).tick();
-    expect(runs()).toEqual(['volume_live', 'volume_daily', 'stats_live', 'stats_dirty', 'volume_backfill']);
+    expect(runs()).toEqual([
+      'volume_live',
+      'volume_daily',
+      'amm_pools',
+      'stats_live',
+      'stats_dirty',
+      'amm_daily',
+      'volume_backfill',
+    ]);
+    metrics.aggregatorRunsTotal.inc.mockClear();
+    await service({ ammPools: undefined, ammDaily: undefined }).tick();
+    expect(runs()).toEqual(EVERY_JOB.filter((job) => !job.startsWith('amm_')));
   });
 
   it('every D2 job has a budget of its own, and budgetsMs changes it', async () => {
@@ -392,11 +450,11 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       metrics.aggregatorRunsTotal.inc.mockClear();
       await svc.tick();
 
-      // the seven live sets and the four daily ones are the first things the tick does, at its very start
-      const first = log.slice(0, 11);
+      // the twelve live sets and the six daily ones (amm_volume among them) are the first things the tick does, at its very start
+      const first = log.slice(0, 18);
       expect(first.map((entry) => entry.event.split(' ')[0])).toEqual([
-        ...Array(7).fill('live'),
-        ...Array(4).fill('daily'),
+        ...Array(12).fill('live'),
+        ...Array(6).fill('daily'),
       ]);
       expect(first.every((entry) => entry.at === tickStart)).toBe(true);
       // they finished (a run is counted when the job ends without throwing), and so did every job after them
@@ -429,10 +487,14 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       rolledAccount();
       await service().tick();
       const at = events().indexOf(`stats ${DIRTY_FROM}`);
-      expect(events().slice(at, at + 6)).toEqual([
+      // the volume sets of the slice's day, then the hooks of the AMM jobs (amm_pools finds no pool in the slice; the day's
+      // amm_daily set), then D2's
+      expect(events().slice(at, at + 8)).toEqual([
         `stats ${DIRTY_FROM}`,
         'daily trade_volume 2026-10-14',
         'daily payment_volume 2026-10-14',
+        'daily amm_volume 2026-10-14',
+        'amm_daily 2026-10-14',
         HOOKS.rates_daily,
         HOOKS.pair_hourly,
         HOOKS.account_rollups,
@@ -573,7 +635,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     rolledAccount();
     world.busy(0);
     await service({ aggregates: undefined }).tick();
-    expect(runs()).toEqual(['volume_live', 'volume_daily', 'stats_live', 'stats_dirty', 'volume_backfill']);
+    expect(runs()).toEqual(EVERY_JOB.filter((job) => !D2_JOBS.includes(job)));
     expect(events().filter((event) => /^(pair_hourly|markets_live|rates_daily|account_rollups)/.test(event))).toEqual(
       [],
     );

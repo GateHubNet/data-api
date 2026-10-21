@@ -159,6 +159,15 @@ export function dateParam(q: Query, name: string, error: string, def?: string): 
   return parsed;
 }
 
+/**
+ * `date`, with the granularity of what was written; none when missing or empty. Text that is not a date answers 400
+ * `invalid date format`. An empty `date` counts as none, as the check of the original did (`req.query.date && ...`).
+ */
+export function dateOf(query: Query): ParsedDate | undefined {
+  if ((first(query, 'date') ?? '') === '') return undefined;
+  return dateParam(query, 'date', 'invalid date format');
+}
+
 /** `moment.add(n, 'month')` in UTC: the day of the month is kept, or cut to the last day of a shorter month. */
 function addMonths(date: Date, months: number): Date {
   const result = new Date(date.getTime());
@@ -200,4 +209,41 @@ export function uintParam(q: Query, name: string, error: string): number | undef
   const n = Number(raw);
   if (!Number.isSafeInteger(n)) throw badRequest(error);
   return n;
+}
+
+/** Which exchanges a list serves, as the `amm` param names them. */
+export type AmmFilter = 'include' | 'exclude' | 'only';
+export const AMM_FILTERS: readonly AmmFilter[] = ['include', 'exclude', 'only'];
+
+/**
+ * `amm`, for the lists of exchanges: a swap against an AMM pool is an exchange too, so `include` (the default, also for a
+ * missing or empty param) lists it with the order-book ones, `exclude` lists the order-book exchanges only (what the
+ * routes served before AMM) and `only` the swaps. Anything else answers 400 `invalid amm filter - use: include, exclude,
+ * only` (the text must be exactly one of the three).
+ */
+export function ammFilter(q: Query): AmmFilter {
+  const raw = first(q, 'amm');
+  if (raw === undefined || raw === '') return 'include';
+  if (!(AMM_FILTERS as readonly string[]).includes(raw)) {
+    throw badRequest(`invalid amm filter - use: ${AMM_FILTERS.join(', ')}`);
+  }
+  return raw as AmmFilter;
+}
+
+/**
+ * The condition of an `amm` filter on `exchanges` or `account_exchanges` (both have `amm_account`, empty for an
+ * order-book exchange), for the WHERE of the read that is capped, never for a step after the page: a swap is not where
+ * the key puts the rows of its pair, so a filter applied to the rows of a page would leave pages short or empty. Both
+ * tables carry `INDEX amm_account_set amm_account TYPE set(1024) GRANULARITY 1` (Ruling R-A1), which lets the read skip
+ * the granules that hold no swap (for `only`) or nothing but swaps (for `exclude`).
+ */
+export function ammConditions(filter: AmmFilter): string[] {
+  switch (filter) {
+    case 'only':
+      return ["amm_account != ''"];
+    case 'exclude':
+      return ["amm_account = ''"];
+    default:
+      return [];
+  }
 }

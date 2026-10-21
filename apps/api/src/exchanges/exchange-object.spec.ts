@@ -21,6 +21,7 @@ const STORED: StoredExchange = Object.freeze({
   taker: 'rTaker',
   provider: 'rProvider',
   offer_sequence: 59207,
+  amm_account: '',
   autobridged_currency: null,
   autobridged_issuer: null,
   tx_type: 'OfferCreate',
@@ -200,6 +201,55 @@ describe('toExchangeObject', () => {
   });
 });
 
+const POOL = 'rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3';
+/** A swap against an AMM pool as `exchanges` stores it: the pool is the provider and the account, there is no offer. */
+const SWAP: StoredExchange = { ...STORED, amm_account: POOL, provider: POOL, offer_sequence: 0, tx_type: 'Payment' };
+
+describe('toExchangeObject: a swap against an AMM pool', () => {
+  const BOOK_KEYS = Object.keys(toExchangeObject(STORED));
+
+  it('has amm_account as its last key, after the pair; an order-book exchange has no such key', () => {
+    expect(Object.keys(toExchangeObject(SWAP))).toEqual([...BOOK_KEYS, 'amm_account']);
+    expect(BOOK_KEYS).not.toContain('amm_account');
+    expect(toExchangeObject(STORED)).not.toHaveProperty('amm_account');
+    expect(toExchangeObject(SWAP).amm_account).toBe(POOL);
+  });
+
+  it('is last whichever keys the exchange has: both issuers, an autobridged currency, either orientation', () => {
+    const full = {
+      ...SWAP,
+      counter_currency: 'EUR',
+      counter_issuer: 'rOther',
+      autobridged_currency: 'EUR',
+      autobridged_issuer: 'rBridge',
+    };
+    for (const row of [full, SWAP]) {
+      for (const inverted of [false, true]) {
+        const keys = Object.keys(toExchangeObject(row, inverted));
+        expect([inverted, keys.at(-1), keys.filter((k) => k === 'amm_account')]).toEqual([
+          inverted,
+          'amm_account',
+          ['amm_account'],
+        ]);
+      }
+    }
+  });
+
+  it('is the same pool from both sides, and changes nothing else of the exchange', () => {
+    for (const inverted of [false, true]) {
+      const { amm_account, ...rest } = toExchangeObject(SWAP, inverted) as unknown as Record<string, unknown>;
+      expect(amm_account).toBe(POOL);
+      expect(rest).toEqual({
+        ...toExchangeObject({ ...STORED, provider: POOL, offer_sequence: 0, tx_type: 'Payment' }, inverted),
+      });
+    }
+  });
+
+  it('leaves the key out for an empty pool, as the order book stores it', () => {
+    expect(Object.keys(toExchangeObject({ ...SWAP, amm_account: '' }))).toEqual(BOOK_KEYS);
+  });
+});
+
 describe('toCsvRow', () => {
   it('has every column of the original in its order, an empty cell where the exchange has none', () => {
     const row = toCsvRow(toExchangeObject(STORED));
@@ -213,6 +263,13 @@ describe('toCsvRow', () => {
       node_index: 4,
       tx_hash: 'A'.repeat(64),
     });
+  });
+
+  it('adds amm_account as a last column for a swap against a pool, and no column for an order-book exchange', () => {
+    expect(Object.keys(toCsvRow(toExchangeObject(STORED)))).toEqual([...EXCHANGE_CSV_COLUMNS]);
+    const row = toCsvRow(toExchangeObject(SWAP));
+    expect(Object.keys(row)).toEqual([...EXCHANGE_CSV_COLUMNS, 'amm_account']);
+    expect((row as Record<string, unknown>).amm_account).toBe(POOL);
   });
 
   it('is the exchange and nothing else', () => {
@@ -235,6 +292,10 @@ describe('EXCHANGE_COLUMNS', () => {
   it('reads the close time as unix seconds and no Float64 shadow or client', () => {
     expect(EXCHANGE_COLUMNS).toContain('toUnixTimestamp(close_time) AS close_time');
     expect(EXCHANGE_COLUMNS).not.toMatch(/_f\b|client/);
-    expect(EXCHANGE_COLUMNS.split(', ')).toHaveLength(20);
+    expect(EXCHANGE_COLUMNS.split(', ')).toHaveLength(21);
+  });
+
+  it('reads the pool of a swap against an AMM pool', () => {
+    expect(EXCHANGE_COLUMNS.split(', ')).toContain('amm_account');
   });
 });

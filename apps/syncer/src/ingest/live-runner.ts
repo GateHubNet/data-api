@@ -7,6 +7,7 @@ import {
   LedgerParseError,
   LedgerSource,
   LedgerWriter,
+  LedgerWriteResult,
   RawLedger,
   retryAfterMsOf,
   ShutdownSignals,
@@ -774,8 +775,9 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       }
       const first = batch[0].header.ledger_index;
       const last = batch[batch.length - 1].header.ledger_index;
+      let written: LedgerWriteResult;
       try {
-        await this.writer.write(batch);
+        written = await this.writer.write(batch);
       } catch (err) {
         if (isLedgerParseError(err)) {
           await this.haltOnUnparsable(batch, err);
@@ -793,9 +795,19 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       this.batch = [];
       this.batchTxs = 0;
       this.batchSince = 0;
+      this.countUnclassified(written);
       await this.committedBatch(first, last);
     }
     if (this.pendingBreak) throw this.pendingBreak;
+  }
+
+  /**
+   * `syncer_amm_unclassified_total`: the pools of AMM transactions the parser made no swap, liquidity or governance row
+   * for, in a batch that is committed. Only a batch that is, so that a write that failed and was recovered is counted
+   * once, when its rewrite commits.
+   */
+  private countUnclassified(written: LedgerWriteResult): void {
+    if (written.ammUnclassified > 0) this.metrics?.ammUnclassifiedTotal.inc(written.ammUnclassified);
   }
 
   /** The bookkeeping after the ledgers `first`..`last` were committed. */
@@ -828,8 +840,9 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     if (prefix.length > 0) {
       const first = prefix[0].header.ledger_index;
       const last = prefix[prefix.length - 1].header.ledger_index;
+      let written: LedgerWriteResult;
       try {
-        await this.writer.write(prefix);
+        written = await this.writer.write(prefix);
       } catch (prefixErr) {
         this.writeFailures += 1;
         this.logger.error(
@@ -840,6 +853,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         await this.recover(prefixErr);
         return;
       }
+      this.countUnclassified(written);
       await this.committedBatch(first, last);
     }
     this.batch = [];

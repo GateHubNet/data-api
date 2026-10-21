@@ -102,6 +102,11 @@ describe('decodeMarker', () => {
       ['DateTime', 1_421_256_550],
       ['String', ''],
       ['String', 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh'],
+      ['Float64', 0],
+      ['Float64', -2.25],
+      ['Float64', 28_110_514.1946255],
+      ['Float64', 1e21],
+      ['Float64', 5e-324],
     ] as [KeyType, string | number][])('%s accepts %j', (type, value) => ok(type, value));
 
     it.each([
@@ -127,7 +132,46 @@ describe('decodeMarker', () => {
       ['String', 1],
       ['String', null],
       ['String', ['a']],
+      ['Float64', '1.5'],
+      ['Float64', true],
+      ['Float64', null],
+      ['Float64', [1]],
     ] as [KeyType, unknown][])('%s rejects %j', (type, value) => bad(type, value));
+
+    it('Float64 rejects what is not finite (JSON.parse reads 1e999 as Infinity)', () => {
+      expectInvalidMarker(() =>
+        decodeMarker(Buffer.from('[1e999]').toString('base64url'), [{ column: 'k', type: 'Float64' }]),
+      );
+      expectInvalidMarker(() =>
+        decodeMarker(Buffer.from('[-1e999]').toString('base64url'), [{ column: 'k', type: 'Float64' }]),
+      );
+    });
+  });
+
+  describe('a nullable key', () => {
+    // a list sorted by a nullable column (NULLS LAST) has a pool without a value as the last row of a page
+    const KEYS_WITH_NULL: KeysetKey[] = [
+      { column: 'value', type: 'Float64', nullable: true },
+      { column: 'account', type: 'String' },
+    ];
+
+    it('takes null for its column and a value of its type, and nothing else', () => {
+      expect(decodeMarker(raw([null, 'rA']), KEYS_WITH_NULL)).toEqual([null, 'rA']);
+      expect(decodeMarker(raw([1.5, 'rA']), KEYS_WITH_NULL)).toEqual([1.5, 'rA']);
+      expectInvalidMarker(() => decodeMarker(raw(['x', 'rA']), KEYS_WITH_NULL));
+      expectInvalidMarker(() => decodeMarker(raw([true, 'rA']), KEYS_WITH_NULL));
+      expectInvalidMarker(() => decodeMarker(raw([1, 'rA', 3]), KEYS_WITH_NULL));
+      expectInvalidMarker(() => decodeMarker(raw([1]), KEYS_WITH_NULL));
+    });
+
+    it('does not take null for a column that is not nullable', () => {
+      expectInvalidMarker(() => decodeMarker(raw([1.5, null]), KEYS_WITH_NULL));
+      expectInvalidMarker(() => decodeMarker(raw([null, 2]), KEYS));
+    });
+
+    it('is encoded as JSON null', () => {
+      expect(encodeMarker([null, 'rA'])).toBe(raw([null, 'rA']));
+    });
   });
 });
 
@@ -185,6 +229,12 @@ describe('keysetClause', () => {
 
   it('refuses values that do not fit the keys instead of silently paging from the start', () => {
     expect(() => keysetClause(KEYS, false, [1])).toThrow(/2 columns.*1 value/);
+  });
+});
+
+describe('keysetClause with a null', () => {
+  it('refuses a null: a tuple comparison does not compare it, the list that has one builds its own condition', () => {
+    expect(() => keysetClause(KEYS, false, [null, 2])).toThrow(/null/);
   });
 });
 

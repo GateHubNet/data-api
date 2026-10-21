@@ -8,6 +8,7 @@ import {
   LedgerParseError,
   LedgerSource,
   LedgerWriter,
+  LedgerWriteResult,
   NodeThrottledError,
   parseContextFor,
   RawLedger,
@@ -27,7 +28,7 @@ import {
 } from '../src/ingest/live-runner';
 import { LedgerNotValidatedError } from '../src/ingest/rpc-ledger-source';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { range, syntheticChain, SyntheticLedger } from './synthetic-chain';
+import { ammTemplate, range, syntheticChain, SyntheticLedger } from './synthetic-chain';
 
 /** `L(1)` .. `L(30)` = 9999986 .. 10000015: the chain crosses the partition boundary at ledger 10,000,000. */
 const BASE = 9_999_985;
@@ -44,10 +45,10 @@ const COUNTED_TABLES = LEDGER_KEYED_TABLES.map((t) => t.table).filter((t) => t !
 
 type Counts = Record<string, number>;
 
-/** What the counted tables hold when exactly the ledgers `L(1)` .. `last` of `CHAIN` are committed. */
-function expectedCounts(last: number): Counts {
+/** What the counted tables hold when exactly the ledgers `L(1)` .. `last` of `chain` are committed. */
+function expectedCounts(last: number, chain: SyntheticLedger[] = CHAIN): Counts {
   const counts: Counts = Object.fromEntries(COUNTED_TABLES.map((t) => [t, 0]));
-  for (const { index, raw } of CHAIN) {
+  for (const { index, raw } of chain) {
     if (index > last) continue;
     const rows = buildLedgerRows(raw, ctx);
     counts[Table.Ledgers] += 1;
@@ -547,7 +548,7 @@ describe('LiveRunner (e2e)', () => {
       super(svc, ctx);
     }
 
-    override async write(ledgers: RawLedger[]): Promise<void> {
+    override async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
       this.calls += 1;
       if (this.calls !== 2) return super.write(ledgers);
       const commitFails = Object.create(this.svc) as ClickHouseService;
@@ -557,7 +558,7 @@ describe('LiveRunner (e2e)', () => {
       };
       try {
         // Same runId: these inserts are this writer's, and recovery must wait for exactly them.
-        await new LedgerWriter(commitFails, ctx, { runId: this.runId }).write(ledgers);
+        return await new LedgerWriter(commitFails, ctx, { runId: this.runId }).write(ledgers);
       } catch (err) {
         const first = Math.min(...ledgers.map((l) => l.header.ledger_index));
         this.orphanTransactions = await count(this.svc, Table.Transactions, `ledger_index >= ${first}`);
@@ -587,6 +588,94 @@ describe('LiveRunner (e2e)', () => {
         message: expect.stringContaining('injected failure after the child rows'),
       }),
     );
+  });
+
+  describe('AMM rows and syncer_amm_unclassified_total', () => {
+    /** Transactions per ledger that touch a pool the parser cannot classify (see `ammTemplate`). */
+    const UNCLASSIFIED_PER_LEDGER = 2;
+    // Every ledger: an AMMCreate, an AMMVote and 10 swaps against pools of two recorded mainnet ledgers, and 2 pools
+    // that give no row.
+    const AMM_CHAIN = syntheticChain(L(1), 12, { template: ammTemplate(UNCLASSIFIED_PER_LEDGER) });
+
+    /** What the parser could not classify in the ledgers `L(1)` .. `last` of the chain. */
+    const unclassifiedUpTo = (last: number): number =>
+      AMM_CHAIN.filter((l) => l.index <= last).reduce(
+        (sum, l) => sum + buildLedgerRows(l.raw, ctx).diagnostics.ammUnclassified,
+        0,
+      );
+
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const unclassified = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.ammUnclassifiedTotal.get()).values[0]?.value ?? 0;
+
+    it('the chain has rows for all five AMM tables and two unclassified pools per ledger', () => {
+      expect(unclassifiedUpTo(L(12))).toBe(12 * UNCLASSIFIED_PER_LEDGER);
+      const counts = expectedCounts(L(12), AMM_CHAIN);
+      for (const table of [
+        Table.AmmPoolStates,
+        Table.AmmPoolTouches,
+        Table.AmmLiquidity,
+        Table.AccountAmmLiquidity,
+        Table.AmmGovernance,
+      ]) {
+        expect([table, counts[table] > 0]).toEqual([table, true]);
+      }
+    });
+
+    it('writes the AMM rows with the ledgers and adds the pools it could not classify to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), AMM_CHAIN), { metrics });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 AMM ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), AMM_CHAIN));
+      expect(await unclassified(metrics)).toBe(before + 12 * UNCLASSIFIED_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without AMM activity', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await unclassified(metrics)).toBe(before);
+    });
+
+    it('counts a batch once: not for a write that failed and was recovered, only for the one that committed', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+      // The second batch fails after its child rows went in; recovery deletes them and writes the batch again.
+      const writer = new FailOnSecondWrite(svc);
+      const { runner } = makeRunner(svc, new TestSource(L(12), AMM_CHAIN), { metrics, writer });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 AMM ledgers through a failed write');
+
+      expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), AMM_CHAIN));
+      expect(await unclassified(metrics)).toBe(before + 12 * UNCLASSIFIED_PER_LEDGER);
+    });
+
+    it('counts the ledgers committed before a ledger the parser rejects, and no more', async () => {
+      const svc = await freshService();
+      const chain = syntheticChain(L(1), 12, { template: ammTemplate(UNCLASSIFIED_PER_LEDGER), malformedAt: L(10) });
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+      // Batches of 7: L(1)..L(7) commit, then L(8)..L(14) holds the bad ledger: its prefix L(8)..L(9) commits too.
+      const { runner } = makeRunner(svc, new TestSource(L(12), chain), { metrics });
+
+      await expect(runner.runOnce()).rejects.toBeInstanceOf(LedgerParseError);
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(9)));
+      expect(await unclassified(metrics)).toBe(before + 9 * UNCLASSIFIED_PER_LEDGER);
+    });
   });
 
   it('keeps retrying a stuck recovery and writes nothing until it succeeds', async () => {

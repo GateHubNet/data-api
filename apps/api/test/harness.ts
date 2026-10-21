@@ -44,6 +44,9 @@ export interface HarnessOptions {
   /**
    * Ledgers to write to the database before the tests run, through the `LedgerWriter` exactly as the syncer would:
    *  - `ripple-mock`: the 54 mock ledgers of the original Ripple API (`xrpl`);
+   *  - `xrpl-recorded`: XRPL mainnet ledgers recorded from a public node (`xrpl`);
+   *  - `xrpl-amm`: the recorded ledgers around AMM transactions, swaps against pools among them (`xrpl`);
+   *  - `ripple-mock+amm`: the mock ledgers and the AMM ledgers together (`xrpl`);
    *  - `xahau-recorded`: the Xahau mainnet ledgers recorded from a public node (`xahau`);
    *  - `none` (default): an empty database.
    */
@@ -93,15 +96,13 @@ export interface ApiClient {
 export interface Harness {
   app: INestApplication;
   /**
-   * A supertest agent on the app. It starts and closes a server for every request, which is fine for a few requests; a
-   * test that makes hundreds of them (a walk over a list) should use `api()`.
+   * A supertest agent on the app's one listener (on 127.0.0.1, opened when the harness starts, closed by `close()`), with no
+   * API key. Supertest on the server object would listen on a new port of every interface for each request: on a machine
+   * where another process holds 127.0.0.1 at that port (a container's port), the request reached that process and came back
+   * with its 403 or 404 (parked 13); and now and then one of hundreds fails with ECONNRESET.
    */
   http(): ReturnType<typeof request>;
-  /**
-   * A client on a socket of the app's own, opened by the first call and used by every call after it (closed by
-   * `close()`). The requests of `http()` each listen on a new port, and now and then one of hundreds lands on a port
-   * whose connection the client still holds and fails with ECONNRESET.
-   */
+  /** A client on the same listener that sends the API key, the same object for every call (`ApiClient`). */
   api(): Promise<ApiClient>;
   /** The app's own ClickHouse service, bound to this harness's database. */
   ch: ClickHouseService;
@@ -193,11 +194,14 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   }
 
   const running = app as unknown as NestExpressApplication;
+  // one listener for the life of the harness, on the address the clients dial
+  await running.listen(0, '127.0.0.1');
+  const url = await running.getUrl();
   let client: Promise<ApiClient> | undefined;
   return {
     app: running,
-    http: () => request(running.getHttpServer()),
-    api: () => (client ??= listeningClient(running, TEST_API_KEY)),
+    http: () => request(url),
+    api: () => (client ??= Promise.resolve(clientOn(url, TEST_API_KEY))),
     ch: ch as unknown as ClickHouseService,
     database,
     key: TEST_API_KEY,
@@ -208,10 +212,8 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   };
 }
 
-/** Opens the app on a port of its own and returns a client on it (`app.close()` closes the socket again). */
-async function listeningClient(app: NestExpressApplication, key: string): Promise<ApiClient> {
-  await app.listen(0, '127.0.0.1');
-  const url = await app.getUrl();
+/** A client on the listener of the app at `url` that sends `key` (`app.close()` closes the listener). */
+function clientOn(url: string, key: string): ApiClient {
   const get = (path: string): request.Test => request(url).get(path).set('X-API-Key', key);
 
   const ok: ApiClient['ok'] = async (path, expectedKey) => {

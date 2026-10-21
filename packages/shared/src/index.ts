@@ -10,6 +10,7 @@ export * from './clickhouse/tables';
 // Parsers
 export * from './parsers/accounts-created.parser';
 export * from './parsers/affected-accounts.parser';
+export * from './parsers/amm.parser';
 export * from './parsers/balance-changes.parser';
 export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
@@ -40,6 +41,9 @@ export * from './ingest/raw-ledger';
 // Aggregates
 export * from './aggregate/account-rollups.job';
 export * from './aggregate/aggregate-sets';
+export * from './aggregate/amm-daily.job';
+export * from './aggregate/amm-pools.job';
+export * from './aggregate/amm-reads';
 export * from './aggregate/markets-live.job';
 export * from './aggregate/pair-hourly.job';
 export * from './aggregate/rates-daily.job';

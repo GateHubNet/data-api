@@ -72,17 +72,56 @@ function consumed(before: unknown, after: unknown, ctx: ParseContext): Side {
   return { currency: ctx.nativeCurrency, issuer: undefined, native: true, amount: dropsToNative(drops) };
 }
 
+const usable = (rate: BigNumber) => rate.isFinite() && rate.gt(0);
+
+/**
+ * The quality of an exchange from the amounts that changed hands: what the provider (the offer's owner, or an AMM pool)
+ * received per unit it paid, both in whole units. Undefined when that is not a positive finite number (a zero side).
+ */
+export function amountsQuality(received: string, paid: string): BigNumber | undefined {
+  const ratio = new BigNumber(received).dividedBy(paid);
+  return usable(ratio) ? ratio : undefined;
+}
+
+/**
+ * The `rate` of an exchange row, counter per base as BigNumber prints it, from the provider's quality (received per
+ * paid). `paidIsBase` says the canonical pair order put what the provider paid first; otherwise base is what it
+ * received and the quality is inverted.
+ */
+export function exchangeRate(quality: BigNumber, paidIsBase: boolean): string {
+  return paidIsBase ? quality.toString() : quality.pow(-1).toString();
+}
+
 /** The rate of a consumed offer: base per counter, from the offer's quality, else from the amounts that changed hands. */
 function offerRate(bookDirectory: unknown, base: Side, counter: Side): BigNumber | undefined {
-  const usable = (rate: BigNumber) => rate.isFinite() && rate.gt(0);
   try {
     const quality = parseQuality(bookDirectory as string, base.native, counter.native);
     if (usable(quality)) return quality;
   } catch {
     /* no usable book directory: use the amounts */
   }
-  const ratio = new BigNumber(base.amount).dividedBy(counter.amount);
-  return usable(ratio) ? ratio : undefined;
+  return amountsQuality(base.amount, counter.amount);
+}
+
+/**
+ * An OfferCreate between two issued currencies whose exchange has a native side was bridged through the native
+ * currency. The reference names the bridge by currency code alone, not by issuer: if the issued side of the exchange
+ * has the code of the transaction's TakerPays the far side is TakerGets, else if it has TakerGets's code the far side is
+ * TakerPays. The caller checks that the transaction is an OfferCreate. Used for order-book and AMM exchanges alike.
+ */
+export function autobridgedThrough(
+  tx: Json,
+  base: { currency: string; native: boolean },
+  counter: { currency: string; native: boolean },
+): { currency: string; issuer: string } | undefined {
+  if (!isIssued(tx.TakerPays) || !isIssued(tx.TakerGets) || base.native === counter.native) return undefined;
+
+  const issued = base.native ? counter : base;
+  if (issued.currency === tx.TakerPays.currency)
+    return { currency: tx.TakerGets.currency, issuer: tx.TakerGets.issuer };
+  if (issued.currency === tx.TakerGets.currency)
+    return { currency: tx.TakerPays.currency, issuer: tx.TakerPays.issuer };
+  return undefined;
 }
 
 export class ExchangeParser {
@@ -132,19 +171,17 @@ export class ExchangeParser {
     const quality = offerRate(after.BookDirectory, base, counter);
     if (!quality) return undefined;
 
-    const autobridged = tx.TransactionType === 'OfferCreate' ? this.autobridged(tx, base, counter) : undefined;
+    const autobridged = tx.TransactionType === 'OfferCreate' ? autobridgedThrough(tx, base, counter) : undefined;
 
     let buyer: string = after.Account;
     let seller: string = tx.Account;
-    let rate: string;
-    if (canonicalPairKey(counter.currency, counter.issuer) < canonicalPairKey(base.currency, base.issuer)) {
+    const flipped = canonicalPairKey(counter.currency, counter.issuer) < canonicalPairKey(base.currency, base.issuer);
+    if (flipped) {
       [base, counter] = [counter, base];
       [buyer, seller] = [seller, buyer];
-      // The quality was base per counter, which is now counter per base.
-      rate = quality.toString();
-    } else {
-      rate = quality.pow(-1).toString();
     }
+    // The quality was base per counter; once flipped that is counter per base.
+    const rate = exchangeRate(quality, flipped);
 
     const exchange: ParsedExchange = {
       base_currency: base.currency,
@@ -167,22 +204,5 @@ export class ExchangeParser {
       exchange.autobridged_issuer = autobridged.issuer;
     }
     return exchange;
-  }
-
-  /**
-   * An OfferCreate between two issued currencies that consumed an offer with a native side was bridged through the
-   * native currency. The reference names the bridge by currency code alone, not by issuer: if the issued side of the
-   * consumed offer has the code of the transaction's TakerPays the far side is TakerGets, else if it has TakerGets's
-   * code the far side is TakerPays.
-   */
-  private autobridged(tx: Json, base: Side, counter: Side): { currency: string; issuer: string } | undefined {
-    if (!isIssued(tx.TakerPays) || !isIssued(tx.TakerGets) || base.native === counter.native) return undefined;
-
-    const issued = base.native ? counter : base;
-    if (issued.currency === tx.TakerPays.currency)
-      return { currency: tx.TakerGets.currency, issuer: tx.TakerGets.issuer };
-    if (issued.currency === tx.TakerGets.currency)
-      return { currency: tx.TakerPays.currency, issuer: tx.TakerPays.issuer };
-    return undefined;
   }
 }

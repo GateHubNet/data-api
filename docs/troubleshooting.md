@@ -159,8 +159,22 @@ boot). Check `SELECT min(ledger_index), max(ledger_index) FROM xrpl.ledgers` and
 
 ### Volumes are empty / stats are stale
 `/v2/network/exchange_volume` and `payment_volume` need markets in the markets config (`GH_MARKETS_CONFIG` or `config/markets/<network>.json`); the Xahau
-file ships empty. `/v2/stats` and the volumes are written by the aggregator once a minute; after an outage or on a database with years of
-history the current hour lags until it has caught up (`syncer_aggregator_stats_lag_seconds`).
+file ships empty. `/v2/network/amm_volume` does not depend on the markets for its components (every pool with swaps counts), but converts them with the rates of the
+markets against the native currency and of the pools, and Xahau has no AMM, so it is empty there. `/v2/stats` and the volumes (all three metrics, twelve live sets) are
+written by the aggregator once a minute; after an outage or on a database with years of history the current hour lags until it has caught up
+(`syncer_aggregator_stats_lag_seconds`).
+
+### `GET /v2/amm/pools/{pool}` is 404 `pool not found` for a pool that exists
+Three causes, in the order to check. (1) The pool is new: the detail and the pair form are served from `amm_pools`, which the aggregator rebuilds once a minute, so a
+pool is 404 there for up to about a minute after its ledger committed while its history, swaps, liquidity and governance are already served. (2) The pool's ledgers
+are not ingested: the syncer started after them and the history was not re-ingested ([backfill](backfill.md#amm-data-re-ingest)); `SELECT count() FROM xrpl.amm_pool_states
+WHERE amm_account = '<pool>'`. (3) `amm_pools` fails for this pool: the aggregator log names it (`Aggregator job amm_pools failed for pool ..., set aside to be tried
+again`) and `syncer_aggregator_errors_total{job="amm_pools"}` rises ([operations](operations.md#the-amm-jobs)).
+
+### AMM swaps, pools or days are missing before a date
+The ledgers were written by parser version 1, which has no AMM rows (`SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY
+parser_version`). Re-ingest them with `--reprocess` from the enablement ledger 86795265 ([backfill](backfill.md#amm-data-re-ingest)); the aggregator then rebuilds
+`amm_pools`, `amm_daily` and the AMM volume from `agg_dirty`.
 
 ### `/balances` or `/orders` answer 400 `the date provided is too old`, 404 `account not found` or 500
 They read the live node (`GH_NODE_ENDPOINTS` of the **api**): a date before the first stored ledger or a ledger the node no longer has is the

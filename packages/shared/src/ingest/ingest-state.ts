@@ -16,9 +16,10 @@ export interface LedgerKeyedTable {
 }
 
 /**
- * Every table whose rows belong to one ledger: the 14 ledger-derived tables of the baseline schema, the ones that carry
- * a `ledger_index` column and a dedup window. Fee stats, validations, manifests, aggregates and the bookkeeping tables
- * are not in the list, because a ledger's rewrite must not touch them.
+ * Every table whose rows belong to one ledger: the 19 ledger-derived tables of the baseline schema (the 14 of the
+ * Ripple v2 data and the 5 AMM ledger tables), the ones that carry a `ledger_index` column and a dedup window. Fee
+ * stats, validations, manifests, aggregates (`amm_pools` and `amm_daily` among them) and the bookkeeping tables are not
+ * in the list, because a ledger's rewrite must not touch them.
  *
  * The first entry is the commit marker (`ledgers`): a ledger is deleted by removing that row first, so a delete that
  * dies halfway leaves uncommitted rows behind, which recovery removes, and never a committed ledger with missing rows.
@@ -39,6 +40,11 @@ export const LEDGER_KEYED_TABLES: ReadonlyArray<LedgerKeyedTable> = [
   { table: Table.AccountExchanges, partitionSize: P7 },
   { table: Table.BalanceChanges, partitionSize: P7 },
   { table: Table.AccountsCreated },
+  { table: Table.AmmPoolStates, partitionSize: P7 },
+  { table: Table.AmmPoolTouches, partitionSize: P6 },
+  { table: Table.AmmLiquidity, partitionSize: P7 },
+  { table: Table.AccountAmmLiquidity, partitionSize: P7 },
+  { table: Table.AmmGovernance, partitionSize: P7 },
 ];
 
 export interface DeleteOptions {

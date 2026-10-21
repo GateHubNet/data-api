@@ -25,18 +25,33 @@ import { gunzipSync } from 'node:zlib';
 const FIXTURES = join(__dirname, '..', '..', '..', '..', 'packages', 'shared', 'test', 'fixtures');
 export const RIPPLE_MOCK_DIR = join(FIXTURES, 'xrpl', 'ripple-mock');
 export const XRPL_RECORDED_DIR = join(FIXTURES, 'xrpl', 'recorded');
+/** Mainnet ledgers recorded around AMM transactions (swaps, deposits, withdrawals, votes, bids): see the fixtures README. */
+export const XRPL_AMM_DIR = join(FIXTURES, 'xrpl', 'amm');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
 /** Xahau flag ledger 26570752: 22 UNLReport pseudo-transactions with `Account: ""`, and 15 Payments. */
 export const XAHAU_FLAG_DIR = join(FIXTURES, 'xahau', 'flag');
 export const XAHAU_FLAG_LEDGER = 26570752;
 
-export type SeedName = 'ripple-mock' | 'xrpl-recorded' | 'xahau-recorded' | 'xahau-flag';
+/**
+ * The fixture sets the API tests seed. `xrpl-amm` is the AMM ledgers alone (16 ledgers from 93663334 on: 39 order-book
+ * exchanges and 138 swaps against pools). `ripple-mock+amm` is the 54 mock ledgers of the original Ripple suite (2013 to
+ * 2015) and the AMM ledgers together: the book-only history of the original next to the swaps of today, in one database.
+ */
+export type SeedName =
+  | 'ripple-mock'
+  | 'xrpl-recorded'
+  | 'xrpl-amm'
+  | 'ripple-mock+amm'
+  | 'xahau-recorded'
+  | 'xahau-flag';
 
-const DIRS: Record<SeedName, string> = {
-  'ripple-mock': RIPPLE_MOCK_DIR,
-  'xrpl-recorded': XRPL_RECORDED_DIR,
-  'xahau-recorded': XAHAU_RECORDED_DIR,
-  'xahau-flag': XAHAU_FLAG_DIR,
+const DIRS: Record<SeedName, string[]> = {
+  'ripple-mock': [RIPPLE_MOCK_DIR],
+  'xrpl-recorded': [XRPL_RECORDED_DIR],
+  'xrpl-amm': [XRPL_AMM_DIR],
+  'ripple-mock+amm': [RIPPLE_MOCK_DIR, XRPL_AMM_DIR],
+  'xahau-recorded': [XAHAU_RECORDED_DIR],
+  'xahau-flag': [XAHAU_FLAG_DIR],
 };
 
 const sources = new Map<SeedName, FixtureLedgerSource>();
@@ -45,7 +60,7 @@ const sources = new Map<SeedName, FixtureLedgerSource>();
 export function fixtureSource(seed: SeedName): FixtureLedgerSource {
   let source = sources.get(seed);
   if (!source) {
-    source = FixtureLedgerSource.fromDir(DIRS[seed]);
+    source = new FixtureLedgerSource(DIRS[seed].flatMap((dir) => FixtureLedgerSource.fromDir(dir).list()));
     sources.set(seed, source);
   }
   return source;
@@ -55,6 +70,8 @@ export function fixtureSource(seed: SeedName): FixtureLedgerSource {
 export const SEED_NETWORK: Record<SeedName, NetworkName> = {
   'ripple-mock': 'xrpl',
   'xrpl-recorded': 'xrpl',
+  'xrpl-amm': 'xrpl',
+  'ripple-mock+amm': 'xrpl',
   'xahau-recorded': 'xahau',
   'xahau-flag': 'xahau',
 };

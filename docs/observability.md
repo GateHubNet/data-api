@@ -132,8 +132,9 @@ Prefix `syncer_`.
 | `syncer_validations_dropped_total` | Counter | `reason` | Validations not kept (`buffer_full`, `no_reporter`, `manifest_no_reporter`, `invalid`, `shutdown`) |
 | `syncer_fee_stats_samples_total` | Counter | | Fee snapshots written |
 | `syncer_fee_stats_errors_total` | Counter | | Snapshots that failed (node silent, ClickHouse refused) |
-| `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `rates_daily`, `account_rollups`, `volume_backfill`) |
-| `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices) that failed; each is retried on the next tick. The four account and market jobs count under their own names; a failing `agg_dirty` hook counts as `rates_daily_dirty`, `pair_hourly_dirty` or `account_rollups_dirty` and fails its `stats_dirty` slice |
+| `syncer_amm_unclassified_total` | Counter | | Pools of AMM transactions for which the parser could make no swap, liquidity or governance row, or whose assets it could not tell (spec section 2.3), counted once per committed write by the live ingest and by `range-ingest` runs of this process. A trickle is normal; a burst means a shape the parser does not know. The range-ingest log names the total of its run |
+| `syncer_aggregator_runs_total` | Counter | `job` | Aggregator job runs (`volume_live`, `volume_daily`, `amm_pools`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `rates_daily`, `account_rollups`, `volume_backfill`); `amm_daily` runs every fifth tick |
+| `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices, sets, pools) that failed; each is retried. `job` is one of `volume_live`, `volume_daily`, `volume_backfill`, `volume_dirty`, `stats_live`, `stats_dirty`, **`amm_pools`**, **`amm_pools_dirty`**, **`amm_daily`**, **`amm_daily_dirty`**, `pair_hourly`, `markets_live`, `rates_daily`, `account_rollups`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty` (the `*_dirty` labels are the sets, pools and hooks run for an `agg_dirty` slice; a failing hook of the account and market jobs fails its `stats_dirty` slice) |
 | **`syncer_aggregator_stats_lag_seconds`** | Gauge | | Seconds of ledger history the stats catch-up still has to cover; 0 when the stats are up to the last two hours |
 | **`syncer_rates_daily_missing_days`** | Gauge | | Closed final days without a valid rates set, from the first native trade to the newest final day. 0 once the back-fill is done, and normally 0 after it: the day that has just become final (an hour after its end) is the first the next run computes |
 | **`syncer_pair_hourly_missing_hours`** | Gauge | | Hours of the last 31 days without a set of the current config version. 0 once the back-fill is done |
@@ -164,6 +165,8 @@ syncer_last_commit_age_seconds > 120 and syncer_lag_ledgers < 2     # a live cha
 rate(syncer_head_ledger[5m])                                        # ledgers/s closing; compare with the checkpoint's rate
 rate(syncer_checkpoint_ledger[5m])                                  # ingest throughput while catching up
 rate(syncer_aggregator_errors_total[15m]) > 0
+rate(syncer_aggregator_errors_total{job=~"amm_.*"}[15m]) > 0        # a pool or a day of the AMM aggregates keeps failing
+increase(syncer_amm_unclassified_total[1h])                          # pools the AMM parser could not place
 syncer_aggregator_stats_lag_seconds > 3600
 syncer_markets_live_age_seconds{period="day"} > 600                 # the Markets table is stale
 syncer_markets_live_age_seconds{period=~"7day|30day"} > 600         # a long Markets period is stale (rewritten every 5 minutes)
@@ -184,7 +187,11 @@ The gauges describe what *this process* has done since boot: scrape each network
 Both services log through the NestJS `Logger` via the toolbox logger (stdout/stderr; capture it with your container log pipeline).
 There are **no `GH_LOGGER_*` variables**: the toolbox logger decides the format (colour is switched off outside dev/test). Contexts to
 grep for: `Syncer` (boot line with network, workers and node hosts), `NodeClient` (connects, reconnects, silence), `LiveRunner`
-(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService` (also the log of the four account and market jobs: `Rates back-fill ...`, `Pair-hourly back-fill ...`, `Account-rollups back-fill ...`, `Markets set of period ... not written`, and the shared `reached its budget` warning), `Api` (boot line with
+(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService` (including the AMM lines:
+`Aggregator job amm_pools failed for pool ..., set aside to be tried again`, and the warning `Aggregator job amm_pools: a batch of N pool(s)
+failed as a whole, but its halves were rebuilt: ...`, which is counted as one error and means the batch failed for its size, not that a pool is
+bad; also the log of the four account and market jobs: `Rates back-fill ...`, `Pair-hourly back-fill ...`, `Account-rollups back-fill ...`,
+`Markets set of period ... not written`, and the shared `reached its budget` warning), `Api` (boot line with
 network and native currency), `RippleRoute` / `RippleError` (the cause of every 5xx, with the stack; the response body never carries
 it), `ApiKeyGuard`.
 
@@ -215,6 +222,8 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | **Syncer not committing** | `syncer_last_commit_age_seconds > 120` | Ingest wedged, node silent, or ClickHouse refusing writes |
 | **Syncer halted / down** | probe 503 with `state=halted`, `increase(syncer_ingest_halts_total[5m]) > 0`, or `up{job="syncer"} == 0` | Chain break, a ledger the parser rejects, lost lease, or process down |
 | Aggregator failing | `rate(syncer_aggregator_errors_total[15m]) > 0` for 30m | Stats or volumes not refreshing |
+| AMM aggregates failing | `rate(syncer_aggregator_errors_total{job=~"amm_.*"}[15m]) > 0` for 30m | A pool is stale in `/v2/amm/pools` or a day is missing from the pool history; the log names the pool or the day |
+| AMM pools unclassified | `increase(syncer_amm_unclassified_total[1h]) > 100` | The parser meets a pool shape it does not know (tune to your traffic) |
 | Aggregator far behind | `syncer_aggregator_stats_lag_seconds > 3600` for 1h | Sweep slower than the data |
 | **Markets stale** | `syncer_markets_live_age_seconds{period="day"} > 600` for 10m | The `markets_live` job has not written the `day` set for over ten minutes (it writes one a minute): `/v2/network/markets` serves an old set, and the explorer's Markets page with it. Look for `Markets set of period day not written` (a gap in `pair_hourly`) and for errors of the `markets_live` and `pair_hourly` jobs |
 | **Long Markets periods stale** | `syncer_markets_live_age_seconds{period=~"7day\|30day"} > 600` for 10m (one alert per period) | The `7day` or `30day` set has not been rewritten for over 20 minutes. They are rewritten every fifth run (about every 5 minutes), so their age climbs to about 300 s between rewrites, and one failure of a set (a 5-minute wait that misses its next turn) takes it to about 900 s for a few minutes: the 10 minutes above 600 s let that pass. 600 s is also what the explorer's `MARKETS` switch needs of all three periods ([operations](operations.md#rolling-it-out)): while this fires, `/v2/network/markets?period=7day` or `30day` serves an old set. Look for `markets_live` errors and `Markets set of period <p> not written` (a gap in `pair_hourly`); if the `day` set alone uses the job's 3 s budget every run, the long sets never start (the budget warning of `markets_live` says so) |
@@ -236,7 +245,7 @@ Threshold numbers are starting points: tune to your traffic and SLOs.
 
 A range ingest bulk-loads ClickHouse hard ([backfill](backfill.md)). Watch both sides:
 
-- **CLI:** its log (`Range [...] ingested: N chunks complete ... M ledgers written`), and in SQL `SELECT count(), max(ledger_index) FROM
+- **CLI:** its log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools`), and in SQL `SELECT count(), max(ledger_index) FROM
   <db>.ledgers`. The CLI is a separate process and has no metrics endpoint; the live syncer's gauges describe the live runner only.
 - **Aggregator:** `SELECT count() FROM <db>.agg_dirty` shrinks as the aggregator digests the new hours;
   `syncer_aggregator_stats_lag_seconds`.

@@ -21,7 +21,7 @@ import { VolumeInterval } from './volume-buckets';
 import { VolumeRow } from './volume-object';
 import { VOLUME_INTERVALS, VolumeService } from './volume.service';
 
-/** The message of both routes when something other than a Ripple 4xx goes wrong (`getMetric.js`). */
+/** The message of the routes when something other than a Ripple 4xx goes wrong (`getMetric.js`). */
 const FAILURE = 'error getting data';
 
 interface VolumeBody {
@@ -32,8 +32,9 @@ interface VolumeBody {
 }
 
 /**
- * `GET /v2/network/exchange_volume` and `GET /v2/network/payment_volume` (`api/routes/network/getMetric.js` of the develop
- * branch of the original, which has the historical mode): the trade volume and the payment volume of the network, converted
+ * `GET /v2/network/exchange_volume`, `GET /v2/network/payment_volume` (`api/routes/network/getMetric.js` of the develop
+ * branch of the original, which has the historical mode) and `GET /v2/network/amm_volume` (new, the same route for the swaps
+ * against the AMM pools): the trade volume, the payment volume and the AMM volume of the network, converted
  * to the native currency or to a display currency. With neither `start` nor `end` it is the live row of a rolling period
  * (`live`, default `day`); with either, a row per day, week or month.
  *
@@ -123,6 +124,48 @@ export class VolumeController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<VolumeBody> {
     return this.rows('payment_volume', PAYMENT_LIVE_PERIODS, query, req, res);
+  }
+
+  @Get('amm_volume')
+  @RippleRoute(FAILURE)
+  @Csv('amm_volume', 'rows')
+  @ApiOperation({
+    summary: 'Get the volume of the swaps against the AMM pools on the network',
+    description:
+      'The swaps against the AMM pools, per pool, in the native currency: per pool the account, its assets, the number of ' +
+      'swaps, the volume of the base and the rate, and the volume converted to the native currency (a pool against the native ' +
+      'currency by its own native volume, the others through the rate of the base or of the counter, from the configured ' +
+      'markets against the native currency or else from the pools; a pool without a rate is left out). Every pool with swaps ' +
+      'counts, not only the configured markets; swaps of 0.0005 of the native currency or less are left out. Without `start` ' +
+      'and `end`, the live row of the rolling period `live` (hour, day, 3day, 7day, 30day; default day). With them, a row per ' +
+      '`interval` (day, week from Monday, month, UTC) for the days that were computed: a bucket is a row when it starts within ' +
+      '`start` and `end`, whole. `exchange_currency` / `exchange_issuer` show the amounts in another currency, as for the ' +
+      'exchange volume. The trade volume (`exchange_volume`) counts the swaps as well.',
+  })
+  @ApiQuery({
+    name: 'live',
+    required: false,
+    enum: TRADE_LIVE_PERIODS,
+    description: 'Default: day. Ignored with start or end.',
+  })
+  @ApiQuery({ name: 'start', required: false, description: 'Start time of the historical rows. Default: the epoch.' })
+  @ApiQuery({ name: 'end', required: false, description: 'End time of the historical rows. Default: now.' })
+  @ApiQuery({ name: 'interval', required: false, enum: VOLUME_INTERVALS, description: 'Default: day.' })
+  @ApiQuery({ name: 'exchange_currency', required: false, description: 'Default: the native currency.' })
+  @ApiQuery({
+    name: 'exchange_issuer',
+    required: false,
+    description: 'Required for every currency but the native one.',
+  })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
+  @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
+  @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
+  ammVolume(
+    @Query() query: QueryParams,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<VolumeBody> {
+    return this.rows('amm_volume', TRADE_LIVE_PERIODS, query, req, res);
   }
 
   private async rows(

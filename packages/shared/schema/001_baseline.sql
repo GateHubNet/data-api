@@ -207,7 +207,9 @@ ORDER BY (account, ledger_index, tx_index, direction)
 SETTINGS non_replicated_deduplication_window = 1000;
 
 -- ---------------------------------------------------------------------------
--- Exchanges. The pair is stored in Ripple's canonical (base, counter) order.
+-- Exchanges. The pair is stored in Ripple's canonical (base, counter) order. A swap against an AMM pool is an
+-- exchange too: amm_account is the pool account (provider is the same account, offer_sequence is 0) and is empty for an
+-- order-book trade. The set index lets amm=only reads skip the granules that hold no AMM row.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS exchanges
 (
@@ -231,10 +233,12 @@ CREATE TABLE IF NOT EXISTS exchanges
   taker                String,
   provider             String,
   offer_sequence       UInt32,
+  amm_account          String,
   autobridged_currency Nullable(String),
   autobridged_issuer   Nullable(String),
   tx_type              LowCardinality(String),
-  client               Nullable(String)
+  client               Nullable(String),
+  INDEX amm_account_set amm_account TYPE set(1024) GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY intDiv(ledger_index, 10000000)
@@ -265,10 +269,12 @@ CREATE TABLE IF NOT EXISTS account_exchanges
   taker                String,
   provider             String,
   offer_sequence       UInt32,
+  amm_account          String,
   autobridged_currency Nullable(String),
   autobridged_issuer   Nullable(String),
   tx_type              LowCardinality(String),
-  client               Nullable(String)
+  client               Nullable(String),
+  INDEX amm_account_set amm_account TYPE set(1024) GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY intDiv(ledger_index, 10000000)
@@ -324,6 +330,143 @@ CREATE TABLE IF NOT EXISTS accounts_created
 )
 ENGINE = ReplacingMergeTree
 ORDER BY (ledger_index, tx_index, account)
+SETTINGS non_replicated_deduplication_window = 1000;
+
+-- ---------------------------------------------------------------------------
+-- AMM ledger tables. One row per pool (or account) and transaction, written with the other ledger tables. The minmax
+-- index on ledger_index lets scans by ledger skip whole parts, because the tables are ordered by pool or account and not by
+-- ledger; it does not skip granules once the parts have merged, which is why the aggregator's watermark and day scans read
+-- the narrow ledger-ordered amm_pool_touches instead.
+-- ---------------------------------------------------------------------------
+
+-- The state of a pool after each transaction that touched it. The pair is in Ripple's canonical (base, counter) order.
+-- A value is filled whenever its node is present in the transaction's metadata (the value after the transaction, whether
+-- or not the transaction changed it) and is NULL when the metadata has no such node, so readers carry the last known value
+-- forward. Reserves, the LP supply and the auction price are exact Strings with Float64 shadows, the fee is in units of
+-- 1/100000.
+CREATE TABLE IF NOT EXISTS amm_pool_states
+(
+  amm_account            String,
+  ledger_index           UInt32,
+  tx_index               UInt32,
+  tx_hash                String,
+  close_time             DateTime('UTC'),
+  tx_type                LowCardinality(String),
+  base_currency          LowCardinality(String),
+  base_issuer            String,
+  counter_currency       LowCardinality(String),
+  counter_issuer         String,
+  reserve_base           Nullable(String),
+  reserve_counter        Nullable(String),
+  lp_supply              Nullable(String),
+  lp_currency            Nullable(String),
+  reserve_base_f         Nullable(Float64),
+  reserve_counter_f      Nullable(Float64),
+  lp_supply_f            Nullable(Float64),
+  trading_fee            Nullable(UInt16),
+  auction_holder         Nullable(String),
+  auction_price          Nullable(String),
+  auction_price_f        Nullable(Float64),
+  auction_discounted_fee Nullable(UInt16),
+  auction_expiration     Nullable(UInt32),
+  deleted                UInt8,
+  INDEX ledger_mm ledger_index TYPE minmax GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY intDiv(ledger_index, 10000000)
+ORDER BY (amm_account, ledger_index, tx_index)
+SETTINGS non_replicated_deduplication_window = 1000;
+
+-- The pools touched by each transaction: one row per amm_pool_states row, with the three columns of its identity, in the
+-- order of the ledgers. amm_pool_states is ordered by pool, so once its parts have merged a "which pools changed after this
+-- ledger" scan reads every granule (the minmax index cannot skip granules that hold a bit of every pool's history). This
+-- table answers it by a range of the primary key: the aggregator's watermark and day scans read it, never the wide table.
+CREATE TABLE IF NOT EXISTS amm_pool_touches
+(
+  ledger_index UInt32,
+  tx_index     UInt32,
+  amm_account  String
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY intDiv(ledger_index, 1000000)
+ORDER BY (ledger_index, tx_index, amm_account)
+SETTINGS non_replicated_deduplication_window = 1000;
+
+-- One row per create, deposit, withdraw, clawback or delete. Amounts are signed from the pool's perspective (positive
+-- in, negative out), lp_tokens is positive when minted and negative when burned. mode is empty for create and delete.
+CREATE TABLE IF NOT EXISTS amm_liquidity
+(
+  amm_account      String,
+  ledger_index     UInt32,
+  tx_index         UInt32,
+  tx_hash          String,
+  close_time       DateTime('UTC'),
+  account          String,
+  initiator        String,
+  event            LowCardinality(String),
+  mode             LowCardinality(String),
+  base_amount      String,
+  counter_amount   String,
+  lp_tokens        String,
+  base_amount_f    Float64,
+  counter_amount_f Float64,
+  lp_tokens_f      Float64,
+  INDEX ledger_mm ledger_index TYPE minmax GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY intDiv(ledger_index, 10000000)
+ORDER BY (amm_account, ledger_index, tx_index)
+SETTINGS non_replicated_deduplication_window = 1000;
+
+-- The per-account index of amm_liquidity: the same columns, ordered by account.
+CREATE TABLE IF NOT EXISTS account_amm_liquidity
+(
+  amm_account      String,
+  ledger_index     UInt32,
+  tx_index         UInt32,
+  tx_hash          String,
+  close_time       DateTime('UTC'),
+  account          String,
+  initiator        String,
+  event            LowCardinality(String),
+  mode             LowCardinality(String),
+  base_amount      String,
+  counter_amount   String,
+  lp_tokens        String,
+  base_amount_f    Float64,
+  counter_amount_f Float64,
+  lp_tokens_f      Float64,
+  INDEX ledger_mm ledger_index TYPE minmax GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY intDiv(ledger_index, 10000000)
+ORDER BY (account, ledger_index, tx_index, amm_account)
+SETTINGS non_replicated_deduplication_window = 1000;
+
+-- One row per AMMVote or AMMBid (kind is vote or bid). price_paid is the LP tokens a bid burned.
+CREATE TABLE IF NOT EXISTS amm_governance
+(
+  amm_account         String,
+  ledger_index        UInt32,
+  tx_index            UInt32,
+  tx_hash             String,
+  close_time          DateTime('UTC'),
+  kind                LowCardinality(String),
+  account             String,
+  fee_voted           Nullable(UInt16),
+  trading_fee_after   Nullable(UInt16),
+  bid_min             Nullable(String),
+  bid_max             Nullable(String),
+  price_paid          Nullable(String),
+  slot_holder         Nullable(String),
+  slot_discounted_fee Nullable(UInt16),
+  slot_expiration     Nullable(UInt32),
+  auth_accounts       Array(String),
+  INDEX ledger_mm ledger_index TYPE minmax GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY intDiv(ledger_index, 10000000)
+ORDER BY (amm_account, ledger_index, tx_index)
 SETTINGS non_replicated_deduplication_window = 1000;
 
 -- ---------------------------------------------------------------------------
@@ -446,6 +589,74 @@ CREATE TABLE IF NOT EXISTS volume_live
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (metric, period, component);
+
+-- The current state of each pool, for the pool list. The aggregator rebuilds it from amm_pool_states, never ingest.
+-- created_ledger and created_by are NULL for a pool whose AMMCreate was not ingested, value_native is NULL when neither
+-- asset has a rate.
+CREATE TABLE IF NOT EXISTS amm_pools
+(
+  amm_account            String,
+  base_currency          LowCardinality(String),
+  base_issuer            String,
+  counter_currency       LowCardinality(String),
+  counter_issuer         String,
+  lp_currency            Nullable(String),
+  created_ledger         Nullable(UInt32),
+  created_by             Nullable(String),
+  last_ledger            UInt32,
+  reserve_base           Nullable(String),
+  reserve_counter        Nullable(String),
+  lp_supply              Nullable(String),
+  trading_fee            Nullable(UInt16),
+  auction_holder         Nullable(String),
+  auction_price          Nullable(String),
+  auction_discounted_fee Nullable(UInt16),
+  auction_expiration     Nullable(UInt32),
+  deleted                UInt8,
+  value_native           Nullable(Float64),
+  version                UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY amm_account;
+
+-- One row per pool and UTC day with activity, with the closing state of the pool. volume_* are the amounts that went
+-- into the pool by side, fees_*_est are estimates (NULL when a swap into that side had no known fee), liquidity_in_* and
+-- liquidity_out_* the deposited and withdrawn amounts.
+-- A day is one version set: the pool rows and a sentinel row (amm_account '', empty assets, zero amounts, NULL state) carry
+-- the same version, and a reader takes the version of the day from the sentinel (a primary key prefix read) and keeps the pool
+-- rows with that version, never the sentinel itself. final is 1 on the sentinel of a set that was made once the ingest had
+-- passed the day (0 on every other row); config_version is the version of the computation that made the set.
+CREATE TABLE IF NOT EXISTS amm_daily
+(
+  amm_account           String,
+  day                   Date,
+  base_currency         LowCardinality(String),
+  base_issuer           String,
+  counter_currency      LowCardinality(String),
+  counter_issuer        String,
+  swap_count            UInt64,
+  volume_base           String,
+  volume_counter        String,
+  fees_base_est         Nullable(String),
+  fees_counter_est      Nullable(String),
+  deposit_count         UInt64,
+  withdraw_count        UInt64,
+  liquidity_in_base     String,
+  liquidity_in_counter  String,
+  liquidity_out_base    String,
+  liquidity_out_counter String,
+  reserve_base          Nullable(String),
+  reserve_counter       Nullable(String),
+  lp_supply             Nullable(String),
+  trading_fee           Nullable(UInt16),
+  value_native          Nullable(Float64),
+  final                 UInt8,
+  config_version        UInt32,
+  version               UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (amm_account, day);
 
 -- ---------------------------------------------------------------------------
 -- Internal bookkeeping

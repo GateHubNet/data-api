@@ -3,6 +3,7 @@ import { Injectable } from '@nestjs/common';
 import { AssetParts } from '../common/asset-param';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
+import { ammConditions, AmmFilter } from '../common/params';
 import {
   ACCOUNT_EXCHANGE_COLUMNS,
   AccountExchangeObject,
@@ -32,6 +33,8 @@ export interface AccountExchangesQuery extends AccountWindow {
   base?: AssetParts;
   /** The asset on the other side, as the counter. */
   counter?: AssetParts;
+  /** Whether the swaps against AMM pools are listed with the order-book exchanges, instead of them, or alone. */
+  amm: AmmFilter;
 }
 
 export interface AccountExchangesPage {
@@ -98,6 +101,8 @@ export class AccountExchangesService {
       'account = {account:String}',
       'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
       ...(asStored.length > 0 ? [`((${asStored.join(' AND ')}) OR (${reversed.join(' AND ')}))`] : []),
+      // inside the read that is capped: a filter after the page would leave it short or empty
+      ...ammConditions(q.amm),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
 

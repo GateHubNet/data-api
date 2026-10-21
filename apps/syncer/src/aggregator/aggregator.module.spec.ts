@@ -87,14 +87,24 @@ describe('AggregatorModule', () => {
     for (const job of ['volume_live', 'volume_daily', 'volume_backfill']) {
       expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job });
     }
+    // and so is the AMM pools job, which has nothing to rebuild over an empty database
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+    // and the AMM daily job, which runs at the first tick: today and yesterday, each a sentinel without any pool
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_daily' });
     // and so are the account and market jobs, which have nothing to do on a database without a ledger
     for (const job of ['pair_hourly', 'markets_live', 'rates_daily', 'account_rollups']) {
       expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job });
     }
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     const written = insert.mock.calls.map(([table]) => table);
-    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(7);
-    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(4);
+    // the three metrics: 5 + 2 + 5 live sets, and today and yesterday of each
+    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(12);
+    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(6);
+    expect(written).not.toContain(Table.AmmPools);
+    const days = insert.mock.calls.filter(([table]) => table === Table.AmmDaily);
+    expect(
+      days.map(([, rows]) => (rows as Array<{ day: string; amm_account: string }>).map((r) => [r.day, r.amm_account])),
+    ).toEqual([[['2026-10-16', '']], [['2026-10-15', '']]]);
 
     await app.close();
     await jest.advanceTimersByTimeAsync(5 * 60_000);
@@ -118,7 +128,7 @@ describe('AggregatorModule', () => {
       await app.init();
       await jest.advanceTimersByTimeAsync(0);
       const sets = insert.mock.calls.filter(([table]) => table === Table.VolumeLive);
-      expect(sets).toHaveLength(7);
+      expect(sets).toHaveLength(12);
       for (const [, rows] of sets) {
         expect((rows as Array<{ config_version: number }>).every((row) => row.config_version === 42)).toBe(true);
       }

@@ -3,13 +3,20 @@
  *
  *   pnpm --filter @gatehub/data-api-shared record:fixtures -- \
  *     --network xrpl|xahau --endpoint <wss url> --out <dir> \
- *     [--ledgers 1,2,3] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]
+ *     [--ledgers 1,2,3] [--txs HASH,HASH] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]
  *
  * Writes into `--out`:
  *   <index>.json.gz          the rippled `ledger` result (`transactions: true, expand: true`, API v1)
  *   server_definitions.json  the `server_definitions` result
  *   server_info.json         the `server_info` result
  *   manifest.json            what was recorded and which wanted types were found / missing
+ *
+ * `--txs` looks each transaction up with `tx`, takes its `ledger_index` and records that whole ledger, the same way
+ * `--ledgers` does (a ledger holding several of the transactions, or also listed in `--ledgers`, is fetched once). The
+ * lookup must be validated and the recorded ledger must contain the hash, else the run stops naming it. The manifest gets
+ * a `txs` map: hash -> { ledger, type, result }. What an earlier run left in the manifest of `--out` is merged in, so a run
+ * that adds to the directory keeps the rest: its `cases` (hand-written case names), its `txs` and its `ledgers` (the
+ * latter two only while the `<index>.json.gz` files are still there). Everything else describes the current run.
  *
  * `--want` walks back from the validated head, one ledger at a time, and keeps a ledger only when it holds a wanted
  * TransactionType that has not been found yet. It stops when every wanted type is found or `--scan` ledgers have been
@@ -37,7 +44,7 @@
  * no validator is disabled) is recorded as the error message the node served. All five files are written together, or
  * none. It takes none of the ledger options.
  */
-import { mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { request as httpsRequest } from 'https';
 import { join, resolve } from 'path';
 import { Client } from 'xrpl';
@@ -65,6 +72,8 @@ export interface Options {
   scan: number;
   delayMs: number;
   anyResult: boolean;
+  /** Transaction hashes (64 upper-case hex digits); the ledger of each one is recorded. */
+  txs: string[];
 }
 
 interface FoundType {
@@ -78,19 +87,22 @@ type LedgerResult = {
 
 const MAX_GZ_BYTES = 2 * 1024 * 1024;
 
-function usage(message?: string): never {
-  if (message) console.error(`error: ${message}\n`);
-  console.error(
-    'usage: record-fixtures --network xrpl|xahau --endpoint <wss url> --out <dir>\n' +
-      '         [--ledgers a,b,c] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]\n' +
-      '       record-fixtures --unl --network xrpl|xahau [--out <dir>]\n' +
-      '       record-fixtures --network-state --network xrpl|xahau --endpoint <wss url> [--out <dir>] [--ledger <n>]',
-  );
-  process.exit(2);
+/** What `main` prints after the error of a refused command line. */
+export const USAGE =
+  'usage: record-fixtures --network xrpl|xahau --endpoint <wss url> --out <dir>\n' +
+  '         [--ledgers a,b,c] [--txs HASH,HASH] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]\n' +
+  '       record-fixtures --unl --network xrpl|xahau [--out <dir>]\n' +
+  '       record-fixtures --network-state --network xrpl|xahau --endpoint <wss url> [--out <dir>] [--ledger <n>]';
+
+/** Bad command line. `main` prints it with the usage text and exits with status 2. */
+export class UsageError extends Error {}
+
+function usage(message: string): never {
+  throw new UsageError(message);
 }
 
 /** The options that only make sense when recording ledgers from a node. */
-const LEDGER_ONLY_OPTIONS = ['endpoint', 'ledgers', 'want', 'scan', 'delay-ms', 'any-result'];
+const LEDGER_ONLY_OPTIONS = ['endpoint', 'ledgers', 'txs', 'want', 'scan', 'delay-ms', 'any-result'];
 /** The ones of them that `--network-state` has no use for (it takes `--endpoint`). */
 const LEDGER_ONLY_WITHOUT_ENDPOINT = LEDGER_ONLY_OPTIONS.filter((name) => name !== 'endpoint');
 
@@ -110,7 +122,7 @@ export function parseArgs(argv: string[]): Options {
     if (value === undefined || value.startsWith('--')) usage(`--${name} needs a value`);
     values[name] = value;
   }
-  const known = new Set(['network', 'endpoint', 'out', 'ledger', 'ledgers', 'want', 'scan', 'delay-ms']);
+  const known = new Set(['network', 'endpoint', 'out', 'ledger', 'ledgers', 'txs', 'want', 'scan', 'delay-ms']);
   for (const name of Object.keys(values)) if (!known.has(name)) usage(`unknown option --${name}`);
 
   const network = values.network;
@@ -137,6 +149,7 @@ export function parseArgs(argv: string[]): Options {
       scan: 0,
       delayMs: 0,
       anyResult: false,
+      txs: [],
     };
   }
   if (flags.has('unl')) {
@@ -154,6 +167,7 @@ export function parseArgs(argv: string[]): Options {
       scan: 0,
       delayMs: 0,
       anyResult: false,
+      txs: [],
     };
   }
   if (!values.endpoint) usage('--endpoint is required');
@@ -164,6 +178,14 @@ export function parseArgs(argv: string[]): Options {
     return Number(text);
   };
   const ledgers = values.ledgers ? values.ledgers.split(',').map((s) => toInt('ledgers', s.trim())) : [];
+  const txs =
+    values.txs === undefined
+      ? []
+      : values.txs.split(',').map((entry) => {
+          const hash = entry.trim();
+          if (!/^[0-9a-fA-F]{64}$/.test(hash)) usage(`--txs needs 64-digit hex transaction hashes, got "${hash}"`);
+          return hash.toUpperCase();
+        });
   const want = values.want
     ? values.want
         .split(',')
@@ -173,7 +195,7 @@ export function parseArgs(argv: string[]): Options {
   const scan = values.scan === undefined ? 0 : toInt('scan', values.scan);
   if (want.length > 0 && scan === 0) usage('--want needs --scan N (N > 0)');
   if (want.length === 0 && values.scan !== undefined) usage('--scan only makes sense with --want');
-  if (want.length === 0 && ledgers.length === 0) usage('give --ledgers and/or --want');
+  if (want.length === 0 && ledgers.length === 0 && txs.length === 0) usage('give --ledgers and/or --want and/or --txs');
 
   return {
     network,
@@ -186,6 +208,7 @@ export function parseArgs(argv: string[]): Options {
     scan,
     delayMs: values['delay-ms'] === undefined ? 75 : toInt('delay-ms', values['delay-ms']),
     anyResult: flags.has('any-result'),
+    txs,
   };
 }
 
@@ -202,7 +225,12 @@ function retryHintMs(err: unknown): number {
  * a generous cap; any other failure is retried a few times with a growing delay and then thrown. A failure that
  * `isFinal` calls final (an answer of the node, which asking again would not change) is thrown at once.
  */
-async function withRetry<T>(label: string, fn: () => Promise<T>, isFinal?: (err: unknown) => boolean): Promise<T> {
+async function withRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  env: Pick<RecorderEnv, 'warn'>,
+  isFinal?: (err: unknown) => boolean,
+): Promise<T> {
   const attempts = 6;
   const maxThrottled = 120;
   let failures = 0;
@@ -214,7 +242,7 @@ async function withRetry<T>(label: string, fn: () => Promise<T>, isFinal?: (err:
       const hint = retryHintMs(err) || (/too busy|slowDown/i.test(errorText(err)) ? 3_000 : 0);
       if (hint > 0 && throttled < maxThrottled) {
         throttled++;
-        console.warn(`${label} throttled (${errorText(err)}); waiting ${hint} ms`);
+        env.warn(`${label} throttled (${errorText(err)}); waiting ${hint} ms`);
         await sleep(hint);
         continue;
       }
@@ -222,7 +250,7 @@ async function withRetry<T>(label: string, fn: () => Promise<T>, isFinal?: (err:
       failures++;
       if (failures >= attempts) throw err;
       const wait = Math.min(500 * 2 ** (failures - 1), 8_000);
-      console.warn(`${label} failed (${errorText(err)}); retry ${failures}/${attempts - 1} in ${wait} ms`);
+      env.warn(`${label} failed (${errorText(err)}); retry ${failures}/${attempts - 1} in ${wait} ms`);
       await sleep(wait);
     }
   }
@@ -231,6 +259,12 @@ async function withRetry<T>(label: string, fn: () => Promise<T>, isFinal?: (err:
 /** rippled answers `ledgerNotFound` (or `lgrNotFound`) when the node behind the endpoint lacks that ledger. */
 function isLedgerNotFound(err: unknown): boolean {
   return /ledgerNotFound|lgrNotFound/i.test(errorText(err));
+}
+
+/** rippled answers `txnNotFound` for a hash it does not know, or one in a ledger it does not hold. */
+function isTxNotFound(err: unknown): boolean {
+  const data = (err as { data?: { error?: unknown } } | undefined)?.data;
+  return data?.error === 'txnNotFound' || /txnNotFound|transaction not found/i.test(errorText(err));
 }
 
 function errorText(err: unknown): string {
@@ -470,6 +504,7 @@ async function recordNetworkStateFromNode(options: Options): Promise<void> {
         withRetry(
           String(command.command),
           () => request(command),
+          consoleEnv,
           (err) => isRippledError(err),
         ),
       write: (name, body) => {
@@ -492,16 +527,99 @@ async function recordNetworkStateFromNode(options: Options): Promise<void> {
   }
 }
 
-async function main(): Promise<void> {
-  const options = parseArgs(process.argv.slice(2));
-  if (options.unl) return recordUnlLists(options);
-  if (options.networkState) return recordNetworkStateFromNode(options);
+interface EarlierManifest {
+  cases: unknown;
+  txs: Record<string, unknown>;
+  ledgers: { ledger: number }[];
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * What an earlier run left in `manifest.json` of `--out`, so a run that adds to the directory does not forget what is
+ * already there: the hand-written `cases`, the `txs` and the recorded `ledgers`. A ledger counts only while its
+ * `<index>.json.gz` is still in the directory, and a transaction only while its ledger does.
+ */
+function readEarlierManifest(dir: string, env: Pick<RecorderEnv, 'warn'>): EarlierManifest {
+  const none: EarlierManifest = { cases: undefined, txs: {}, ledgers: [] };
+  const manifestPath = join(dir, 'manifest.json');
+  let text: string;
+  try {
+    text = readFileSync(manifestPath, 'utf8');
+  } catch {
+    return none; // no earlier manifest
+  }
+  let earlier: unknown;
+  try {
+    earlier = JSON.parse(text);
+  } catch (err) {
+    env.warn(`WARNING: ${manifestPath} is not valid JSON (${errorText(err)}); not carrying anything over`);
+    return none;
+  }
+  if (!isRecord(earlier)) return none;
+
+  const ledgers: { ledger: number }[] = [];
+  for (const entry of Array.isArray(earlier.ledgers) ? earlier.ledgers : []) {
+    if (!isRecord(entry) || !Number.isInteger(entry.ledger)) continue;
+    const index = entry.ledger as number;
+    if (existsSync(join(dir, `${index}.json.gz`))) ledgers.push({ ...entry, ledger: index });
+    else env.warn(`WARNING: ledger ${index} of the earlier manifest has no ${index}.json.gz; dropping it`);
+  }
+  const kept = new Set(ledgers.map((l) => l.ledger));
+  const txs: Record<string, unknown> = {};
+  for (const [hash, info] of Object.entries(isRecord(earlier.txs) ? earlier.txs : {})) {
+    if (isRecord(info) && kept.has(info.ledger as number)) txs[hash] = info;
+  }
+  return { cases: earlier.cases, txs, ledgers };
+}
+
+/** What the recorder needs from a node. `main` backs it with an `xrpl.Client`; tests pass a stub. */
+export interface RecorderNode {
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  /** One request; resolves to the `result` of the response, rejects with the server's error. */
+  request(command: Record<string, unknown>): Promise<Record<string, unknown>>;
+}
+
+export interface RecorderEnv {
+  log: (message: string) => void;
+  warn: (message: string) => void;
+  error: (message: string) => void;
+  /** Polled between requests; true stops the run and still writes the manifest. */
+  isInterrupted: () => boolean;
+}
+
+export interface RecorderRun {
+  /** The error that stopped the run early, if any. */
+  failure: unknown;
+  interrupted: boolean;
+  /** Undefined when a run died before recording anything (the manifest of an earlier run is then left alone). */
+  manifest: Record<string, unknown> | undefined;
+}
+
+const consoleEnv: RecorderEnv = {
+  log: (message) => console.log(message),
+  warn: (message) => console.warn(message),
+  error: (message) => console.error(message),
+  isInterrupted: () => false,
+};
+
+export async function recordFixtures(
+  options: Options,
+  node: RecorderNode,
+  envOverrides: Partial<RecorderEnv> = {},
+): Promise<RecorderRun> {
+  const env: RecorderEnv = { ...consoleEnv, ...envOverrides };
   const profile = getNetworkProfile(options.network);
   mkdirSync(options.out, { recursive: true });
 
-  const { client, request } = nodeRequester(options.endpoint);
+  const request = (command: Record<string, unknown>) => node.request(command);
 
   const found = new Map<string, FoundType>();
+  const txInfo: Record<string, { ledger: number; type: string; result: string | undefined }> = {};
+  /** Transaction hashes of every ledger kept so far, to check a `tx` answer against the ledger that was recorded. */
+  const ledgerHashes = new Map<number, Set<string>>();
   const recorded: { ledger: number; bytes: number; gzipBytes: number }[] = [];
   let scanned = 0;
   const skipped: number[] = [];
@@ -509,10 +627,10 @@ async function main(): Promise<void> {
   let hasDefinitions = false;
   let failure: unknown;
   let interrupted = false;
-  process.once('SIGINT', () => {
-    interrupted = true;
-    console.warn('\ninterrupt received: finishing the current request, then writing the manifest');
-  });
+  const stopRequested = () => {
+    if (!interrupted && env.isInterrupted()) interrupted = true;
+    return interrupted;
+  };
 
   const wanted = new Set(options.want);
   const write = (name: string, body: string | Buffer) => writeFileSync(join(options.out, name), body);
@@ -528,7 +646,7 @@ async function main(): Promise<void> {
       if (!options.anyResult && t.metaData?.TransactionResult !== 'tesSUCCESS') continue;
       found.set(type, { ledger: index, hash: t.hash as string });
       isNew = true;
-      console.log(`  found ${type} in ledger ${index}: ${t.hash as string}`);
+      env.log(`  found ${type} in ledger ${index}: ${t.hash as string}`);
     }
     return isNew;
   };
@@ -539,20 +657,26 @@ async function main(): Promise<void> {
     const gz = gzipSync(json, { level: 9 });
     write(`${index}.json.gz`, gz);
     recorded.push({ ledger: index, bytes: json.length, gzipBytes: gz.length });
+    ledgerHashes.set(
+      index,
+      new Set((result.ledger.transactions ?? []).map((t) => String((t as { hash?: string }).hash).toUpperCase())),
+    );
     const note = gz.length > MAX_GZ_BYTES ? '  WARNING: larger than 2 MB gzipped' : '';
-    console.log(`  wrote ${index}.json.gz (${gz.length} bytes gzipped, ${json.length} raw)${note}`);
+    env.log(`  wrote ${index}.json.gz (${gz.length} bytes gzipped, ${json.length} raw)${note}`);
   };
 
   const fetchLedger = (index: number) =>
-    withRetry(`ledger ${index}`, () =>
-      request({ command: 'ledger', ledger_index: index, transactions: true, expand: true }),
+    withRetry(
+      `ledger ${index}`,
+      () => request({ command: 'ledger', ledger_index: index, transactions: true, expand: true }),
+      env,
     ) as Promise<LedgerResult>;
 
   try {
-    console.log(`connecting to ${options.endpoint} (${options.network})`);
-    await client.connect();
+    env.log(`connecting to ${options.endpoint} (${options.network})`);
+    await node.connect();
 
-    const info = await withRetry('server_info', () => request({ command: 'server_info' }));
+    const info = await withRetry('server_info', () => request({ command: 'server_info' }), env);
     const serverInfo = info.info as Record<string, unknown> & {
       network_id?: number;
       validated_ledger?: { seq: number };
@@ -562,27 +686,69 @@ async function main(): Promise<void> {
     head = serverInfo.validated_ledger?.seq ?? 0;
     if (!head) throw new Error(`${options.endpoint} has no validated ledger`);
     write('server_info.json', JSON.stringify(info, null, 2) + '\n');
-    console.log(`validated head: ${head}`);
+    env.log(`validated head: ${head}`);
 
     try {
-      const definitions = await withRetry('server_definitions', () => request({ command: 'server_definitions' }));
+      const definitions = await withRetry('server_definitions', () => request({ command: 'server_definitions' }), env);
       write('server_definitions.json', JSON.stringify(definitions, null, 2) + '\n');
       hasDefinitions = true;
-      console.log(`wrote server_definitions.json (${Object.keys(definitions).length} top-level keys)`);
+      env.log(`wrote server_definitions.json (${Object.keys(definitions).length} top-level keys)`);
     } catch (err) {
-      console.warn(`WARNING: no server_definitions from this node (${errorText(err)}); continuing without them`);
+      env.warn(`WARNING: no server_definitions from this node (${errorText(err)}); continuing without them`);
     }
 
     for (const index of options.ledgers) {
-      if (interrupted) break;
-      console.log(`ledger ${index}`);
+      if (stopRequested()) break;
+      env.log(`ledger ${index}`);
       const result = await fetchLedger(index);
       inspect(result);
       keep(result);
       await sleep(options.delayMs);
     }
 
-    for (let i = 0; wanted.size > 0 && i < options.scan && found.size < wanted.size && !interrupted; i++) {
+    for (const hash of new Set(options.txs)) {
+      if (stopRequested()) break;
+      env.log(`tx ${hash}`);
+      const lookup = await withRetry(
+        `tx ${hash}`,
+        async () => {
+          try {
+            return await request({ command: 'tx', transaction: hash });
+          } catch (err) {
+            // Not retried: asking again does not make an unknown hash known.
+            if (isTxNotFound(err)) return undefined;
+            throw err;
+          }
+        },
+        env,
+      );
+      await sleep(options.delayMs);
+      if (!lookup) {
+        throw new Error(
+          `transaction ${hash} not found on ${options.endpoint} (txnNotFound: unknown hash, or the node does not hold its ledger)`,
+        );
+      }
+      const ledger = Number(lookup.ledger_index);
+      if (!Number.isInteger(ledger) || ledger < 1) {
+        throw new Error(`transaction ${hash}: ${options.endpoint} did not say which ledger it is in`);
+      }
+      if (lookup.validated !== true) {
+        throw new Error(`transaction ${hash} is not validated yet (ledger ${ledger}); record it once it is`);
+      }
+      if (!ledgerHashes.has(ledger)) {
+        const result = await fetchLedger(ledger);
+        inspect(result);
+        keep(result);
+        await sleep(options.delayMs);
+      }
+      if (!ledgerHashes.get(ledger)?.has(hash)) {
+        throw new Error(`transaction ${hash} is not in the ledger ${ledger} that ${options.endpoint} gave for it`);
+      }
+      const meta = (lookup.meta ?? lookup.metaData) as { TransactionResult?: string } | undefined;
+      txInfo[hash] = { ledger, type: String(lookup.TransactionType), result: meta?.TransactionResult };
+    }
+
+    for (let i = 0; wanted.size > 0 && i < options.scan && found.size < wanted.size && !stopRequested(); i++) {
       const index = head - i;
       if (index < 1) break;
       scanned++;
@@ -591,29 +757,32 @@ async function main(): Promise<void> {
         result = await fetchLedger(index);
       } catch (err) {
         if (!isLedgerNotFound(err)) throw err;
-        console.warn(`  skipping ledger ${index}: the node does not have it`);
+        env.warn(`  skipping ledger ${index}: the node does not have it`);
         skipped.push(index);
         await sleep(options.delayMs);
         continue;
       }
       if (scanned % 100 === 0) {
-        console.log(`scanned ${scanned}/${options.scan} (at ledger ${index}), found ${found.size}/${wanted.size}`);
+        env.log(`scanned ${scanned}/${options.scan} (at ledger ${index}), found ${found.size}/${wanted.size}`);
       }
       if (inspect(result) && !recorded.some((r) => r.ledger === index)) keep(result);
       await sleep(options.delayMs);
     }
   } catch (err) {
     failure = err;
-    console.error(`stopped early: ${errorText(err)}`);
+    env.error(`stopped early: ${errorText(err)}`);
   } finally {
     try {
-      await client.disconnect();
+      await node.disconnect();
     } catch {
       // ignore: the connection may already be gone
     }
   }
 
   const missing = options.want.filter((type) => !found.has(type));
+  const earlier = readEarlierManifest(options.out, env);
+  const ledgers = new Map<number, { ledger: number }>(earlier.ledgers.map((l) => [l.ledger, l]));
+  for (const entry of recorded) ledgers.set(entry.ledger, entry);
   const manifest = {
     network: options.network,
     endpoint: options.endpoint,
@@ -627,17 +796,51 @@ async function main(): Promise<void> {
     server_definitions: hasDefinitions,
     found: Object.fromEntries([...found.entries()].sort(([a], [b]) => a.localeCompare(b))),
     missing,
-    ledgers: recorded.sort((a, b) => a.ledger - b.ledger),
+    txs: { ...earlier.txs, ...txInfo },
+    ...(earlier.cases === undefined ? {} : { cases: earlier.cases }),
+    ledgers: [...ledgers.values()].sort((a, b) => a.ledger - b.ledger),
   };
   // A run that died before recording anything must not overwrite the manifest of an earlier good run.
-  if (failure === undefined || recorded.length > 0) write('manifest.json', JSON.stringify(manifest, null, 2) + '\n');
+  const writeManifest = failure === undefined || recorded.length > 0;
+  if (writeManifest) write('manifest.json', JSON.stringify(manifest, null, 2) + '\n');
 
-  console.log(`\nrecorded ${recorded.length} ledgers, scanned ${scanned} (head ${head})`);
+  env.log(`\nrecorded ${recorded.length} ledgers, scanned ${scanned} (head ${head})`);
   for (const [type, hit] of [...found.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    console.log(`  FOUND   ${type}: ledger ${hit.ledger} tx ${hit.hash}`);
+    env.log(`  FOUND   ${type}: ledger ${hit.ledger} tx ${hit.hash}`);
   }
-  for (const type of missing) console.log(`  MISSING ${type}`);
-  if (failure !== undefined) process.exitCode = 1;
+  for (const type of missing) env.log(`  MISSING ${type}`);
+  return { failure, interrupted, manifest: writeManifest ? manifest : undefined };
+}
+
+async function main(): Promise<void> {
+  let options: Options;
+  try {
+    options = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    if (!(err instanceof UsageError)) throw err;
+    console.error(`error: ${err.message}\n`);
+    console.error(USAGE);
+    process.exit(2);
+  }
+
+  if (options.unl) return recordUnlLists(options);
+  if (options.networkState) return recordNetworkStateFromNode(options);
+
+  const { client, request } = nodeRequester(options.endpoint);
+  const node: RecorderNode = {
+    connect: () => client.connect(),
+    disconnect: () => client.disconnect(),
+    request,
+  };
+
+  let interrupted = false;
+  process.once('SIGINT', () => {
+    interrupted = true;
+    console.warn('\ninterrupt received: finishing the current request, then writing the manifest');
+  });
+
+  const run = await recordFixtures(options, node, { isInterrupted: () => interrupted });
+  if (run.failure !== undefined) process.exitCode = 1;
 }
 
 if (require.main === module) {

@@ -1,6 +1,6 @@
 import { RippleHttpError } from '../common/errors';
 import { parseDate } from '../common/params';
-import { ACTIVE_PERIODS, activeWindow, dateOf, periodOf } from './active-window';
+import { ACTIVE_PERIODS, activeWindow, periodOf } from './active-window';
 
 function failure(fn: () => unknown): { status: number; message: string } {
   try {
@@ -35,20 +35,6 @@ describe('periodOf', () => {
         { status: 400, message: 'invalid period - use: 1day, 3day, 7day' },
       ]);
     }
-  });
-});
-
-describe('dateOf', () => {
-  it('is none for a missing or an empty date (the original failed on an empty one with a 500)', () => {
-    expect(dateOf({})).toBeUndefined();
-    expect(dateOf({ date: '' })).toBeUndefined();
-  });
-
-  it('is the date with its granularity, or 400 invalid date format', () => {
-    expect(dateOf({ date: '2015-01-14' })).toEqual(parseDate('2015-01-14'));
-    expect(dateOf({ date: ['2015-01-14', 'bogus'] })).toEqual(parseDate('2015-01-14'));
-    expect(failure(() => dateOf({ date: 'zzzz' }))).toEqual({ status: 400, message: 'invalid date format' });
-    expect(failure(() => dateOf({ date: '2015-02-30' })).status).toBe(400);
   });
 });
 

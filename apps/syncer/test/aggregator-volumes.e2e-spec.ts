@@ -136,7 +136,7 @@ describe('AggregatorService volume jobs (e2e)', () => {
 
   const days = (sets: SetInfo[]): string[] => sets.map((s) => s.day);
 
-  it('a tick writes the seven live sets for its time and the daily sets of today and of yesterday', async () => {
+  it('a tick writes the twelve live sets for its time and the daily sets of today and of yesterday', async () => {
     const ch = await fresh();
     const now = new Date('2015-01-14T19:30:00Z');
     await aggregator(ch).tick(now);
@@ -149,6 +149,11 @@ describe('AggregatorService volume jobs (e2e)', () => {
         ORDER BY metric, period`,
     );
     expect(live.map((s) => `${s.metric} ${s.period}`)).toEqual([
+      'amm_volume 30day',
+      'amm_volume 3day',
+      'amm_volume 7day',
+      'amm_volume day',
+      'amm_volume hour',
       'payment_volume day',
       'payment_volume hour',
       'trade_volume 30day',
@@ -167,6 +172,11 @@ describe('AggregatorService volume jobs (e2e)', () => {
     expect(trade.find((s) => s.day === '2015-01-14')?.components).toBeGreaterThan(8);
     expect(trade.find((s) => s.day === '2015-01-13')?.components).toBe(0);
     expect((await daily(ch, 'payment_volume')).find((s) => s.day === '2015-01-14')?.components).toBe(6);
+    // the mock ledgers hold no swap against a pool: the AMM volume is the sentinel only, in every set
+    const amm = await daily(ch, 'amm_volume');
+    expect(days(amm).filter((d) => d >= '2015-01-13')).toEqual(['2015-01-13', '2015-01-14']);
+    expect(amm.every((s) => s.components === 0)).toBe(true);
+    expect(live.filter((s) => s.metric === 'amm_volume').every((s) => Number(s.components) === 0)).toBe(true);
   });
 
   it('back-fills the closed days from the first ledger, both metrics, and a second tick leaves them alone', async () => {
@@ -174,7 +184,7 @@ describe('AggregatorService volume jobs (e2e)', () => {
     const svc = aggregator(ch);
     await svc.tick(new Date('2015-01-14T19:30:00Z'));
     // closed days: before yesterday (the 13th), from the day of the first ledger (the 8th)
-    for (const metric of ['trade_volume', 'payment_volume']) {
+    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume']) {
       expect(days(await daily(ch, metric))).toEqual([
         '2015-01-08',
         '2015-01-09',
@@ -237,15 +247,16 @@ describe('AggregatorService volume jobs (e2e)', () => {
       },
     });
     await svc.tick(new Date(clock));
-    // 4 s a set: sets start at 0, 4 and 8 s; at 12 s the 10 s are spent. Both metrics of the 12th, then the 11th (trade)
-    expect(days(await daily(ch, 'trade_volume')).filter((d) => d < '2015-01-13')).toEqual(['2015-01-11', '2015-01-12']);
-    expect(days(await daily(ch, 'payment_volume')).filter((d) => d < '2015-01-13')).toEqual(['2015-01-12']);
+    // 4 s a set: sets start at 0, 4 and 8 s; at 12 s the 10 s are spent. The three metrics of the 12th
+    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume']) {
+      expect(days(await daily(ch, metric)).filter((d) => d < '2015-01-13')).toEqual(['2015-01-12']);
+    }
 
     for (let i = 0; i < 10; i++) {
       clock += 60_000;
       await svc.tick(new Date(clock));
     }
-    for (const metric of ['trade_volume', 'payment_volume']) {
+    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume']) {
       expect(days(await daily(ch, metric)).filter((d) => d < '2015-01-13')).toEqual([
         '2015-01-08',
         '2015-01-09',
@@ -302,7 +313,7 @@ describe('AggregatorService volume jobs (e2e)', () => {
     // the native currency is always there
     expect((await daily(ch, 'payment_volume')).find((s) => s.day === '2015-01-14')?.components).toBe(1);
     const live = await ch.query<{ n: string }>(`SELECT countIf(component = '') AS n FROM ${Table.VolumeLive}`);
-    expect(Number(live[0].n)).toBe(7);
+    expect(Number(live[0].n)).toBe(12);
   });
 
   describe('the ingest decides which days are closed and final, not the clock', () => {

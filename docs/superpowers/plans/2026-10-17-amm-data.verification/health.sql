@@ -1,0 +1,17 @@
+SELECT 'span/count/distinct ledgers (two ranges, so span > count by the gap)' AS check, max(ledger_index) - min(ledger_index) + 1 AS span, count() AS n, uniqExact(ledger_index) AS d FROM xrpl.ledgers;
+SELECT 'gaps (the where-are-the-gaps query of docs/operations.md)' AS check, prev + 1 AS missing_from, ledger_index - 1 AS missing_to FROM (SELECT ledger_index, lagInFrame(ledger_index, 1, 0) OVER (ORDER BY ledger_index ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS prev FROM (SELECT DISTINCT ledger_index FROM xrpl.ledgers)) WHERE prev > 0 AND ledger_index - prev > 1;
+SELECT 'transactions rows vs distinct' AS check, count() AS n, uniqExact(ledger_index, tx_index) AS d FROM xrpl.transactions;
+SELECT 'exchanges rows vs distinct' AS check, count() AS n, uniqExact(ledger_index, tx_index, node_index, base_currency, base_issuer, counter_currency, counter_issuer) AS d FROM xrpl.exchanges;
+SELECT 'amm_pool_states rows vs distinct' AS check, count() AS n, uniqExact(amm_account, ledger_index, tx_index) AS d FROM xrpl.amm_pool_states;
+SELECT 'amm_pool_touches rows vs distinct' AS check, count() AS n, uniqExact(ledger_index, tx_index, amm_account) AS d FROM xrpl.amm_pool_touches;
+SELECT 'touches = states' AS check, (SELECT count() FROM xrpl.amm_pool_touches) AS touches, (SELECT count() FROM xrpl.amm_pool_states) AS states;
+SELECT 'amm_liquidity rows vs distinct' AS check, count() AS n, uniqExact(amm_account, ledger_index, tx_index) AS d FROM xrpl.amm_liquidity;
+SELECT 'account_amm_liquidity rows (>= amm_liquidity: LP and initiator copies)' AS check, (SELECT count() FROM xrpl.account_amm_liquidity) AS n, (SELECT count() FROM xrpl.amm_liquidity) AS liq;
+SELECT 'sum(ledgers.exchanges_count) = count(exchanges)' AS check, (SELECT sum(exchanges_count) FROM xrpl.ledgers) AS ledgers_sum, (SELECT count() FROM xrpl.exchanges) AS exchanges_n;
+SELECT 'sum(amm_daily.swap_count) = swaps' AS check, (SELECT sum(swap_count) FROM xrpl.amm_daily FINAL WHERE (day, version) IN (SELECT day, max(version) FROM xrpl.amm_daily GROUP BY day)) AS daily_sum, (SELECT count() FROM xrpl.exchanges WHERE amm_account != '') AS swaps;
+SELECT 'orphans: transactions without ledger' AS check, count() AS n FROM xrpl.transactions WHERE ledger_index NOT IN (SELECT ledger_index FROM xrpl.ledgers);
+SELECT 'orphans: exchanges without ledger' AS check, count() AS n FROM xrpl.exchanges WHERE ledger_index NOT IN (SELECT ledger_index FROM xrpl.ledgers);
+SELECT 'orphans: amm_pool_states without ledger' AS check, count() AS n FROM xrpl.amm_pool_states WHERE ledger_index NOT IN (SELECT ledger_index FROM xrpl.ledgers);
+SELECT 'unfinished range-ingest chunks' AS check, count() AS n FROM xrpl.ingest_log FINAL WHERE status = 'started' AND range_end > 0;
+SELECT 'agg_dirty' AS check, count() AS n FROM xrpl.agg_dirty;
+SELECT 'parser_version' AS check, parser_version, count() AS n FROM xrpl.ledgers GROUP BY parser_version;

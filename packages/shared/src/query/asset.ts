@@ -12,6 +12,13 @@ export function assetKey(a: Asset): string {
 }
 
 /**
+ * The Asset of a pair of stored columns (`base_currency`/`base_issuer`, ...): the issuer of the native currency is stored as
+ * `''`, and the Asset has no `issuer` key for it.
+ */
+export const assetOfColumns = (currency: string, issuer: string): Asset =>
+  issuer ? { currency, issuer } : { currency };
+
+/**
  * Orders a pair the way the Ripple Data API stores every exchange: the side with the lower `canonicalPairKey` is the
  * base. `inverted` says the caller asked for the opposite order, so rates and volumes of the stored rows have to be
  * flipped. The returned assets are the given objects, in the stored order.

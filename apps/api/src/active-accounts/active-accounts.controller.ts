@@ -3,12 +3,12 @@ import { Get, Inject, Param, Query } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 import { parseAssetPair } from '../common/asset-param';
 import { Csv } from '../common/csv.interceptor';
-import { anyFlag, Query as QueryParams } from '../common/params';
+import { anyFlag, dateOf, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { NETWORK_PROFILE } from '../config/api.config';
 import { ActiveAccount } from './active-account-object';
 import { ActiveAccountsService } from './active-accounts.service';
-import { ACTIVE_PERIODS, activeWindow, dateOf, periodOf } from './active-window';
+import { ACTIVE_PERIODS, activeWindow, periodOf } from './active-window';
 
 interface ActiveAccountsBody {
   result: 'success';

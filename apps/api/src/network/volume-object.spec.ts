@@ -1,5 +1,13 @@
 import BigNumber from 'bignumber.js';
-import { StoredVolumeRow, sumParts, toVolumeRow, TradeComponent, VolumeBucket, VolumePart } from './volume-object';
+import {
+  AmmComponent,
+  StoredVolumeRow,
+  sumParts,
+  toVolumeRow,
+  TradeComponent,
+  VolumeBucket,
+  VolumePart,
+} from './volume-object';
 
 /** Freezes an object graph, so that a write to it throws (the objects are strict mode code). */
 function deepFreeze<T>(value: T): T {
@@ -386,5 +394,123 @@ describe('sumParts', () => {
 
   it('does not change what it is given', () => {
     expect(() => sumParts(deepFreeze([stored(), stored({ amount: '1' })]))).not.toThrow();
+  });
+});
+
+describe('the AMM volume row', () => {
+  const POOL = 'rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3';
+  const POOL2 = 'rP9jPyP5kyvFRb6ZiRghAGw5u8SGAmU4bd';
+  const amm = (over: Partial<VolumePart> = {}): VolumePart => ({
+    component: POOL,
+    base: { currency: 'USD', issuer: I1 },
+    counter: { currency: 'XRP' },
+    amount: bn('30'),
+    count: 3,
+    converted: 90,
+    ...over,
+  });
+
+  it('is a row with the keys of every volume row', () => {
+    const row = toVolumeRow('amm_volume', bucket([amm()], { end: T0 + 86_400 }), 'XRP');
+    expect(Object.keys(row)).toEqual([
+      'components',
+      'count',
+      'exchange',
+      'total',
+      'exchange_rate',
+      'start_time',
+      'end_time',
+    ]);
+  });
+
+  it('a component is amm_account, base, counter, count, amount, rate, converted_amount, in this order', () => {
+    const [component] = toVolumeRow('amm_volume', bucket([amm()]), 'XRP').components as AmmComponent[];
+    expect(Object.keys(component)).toEqual([
+      'amm_account',
+      'base',
+      'counter',
+      'count',
+      'amount',
+      'rate',
+      'converted_amount',
+    ]);
+    expect(component).toEqual({
+      amm_account: POOL,
+      base: { currency: 'USD', issuer: I1 },
+      counter: { currency: 'XRP' },
+      count: 3,
+      amount: '30',
+      rate: '0.33333333',
+      converted_amount: '90',
+    });
+    // the sides are formatted as the trade components format them: an issuer key only for an issued currency
+    expect(Object.keys(component.base)).toEqual(['currency', 'issuer']);
+    expect(Object.keys(component.counter)).toEqual(['currency']);
+    expect([
+      typeof component.count,
+      typeof component.amount,
+      typeof component.rate,
+      typeof component.converted_amount,
+    ]).toEqual(['number', 'string', 'string', 'string']);
+  });
+
+  it('is sorted by converted amount, largest first, the same amount by pool account; total and count add up', () => {
+    const row = toVolumeRow(
+      'amm_volume',
+      bucket([
+        amm({ component: POOL2, converted: 30, count: 2 }),
+        amm({ component: 'rZ', converted: 100, count: 5 }),
+        amm({ component: POOL, converted: 30, count: 1 }),
+      ]),
+      'XRP',
+    );
+    expect((row.components as AmmComponent[]).map((c) => c.amm_account)).toEqual(['rZ', POOL2, POOL]);
+    expect(row.total).toBe('160');
+    expect(row.count).toBe(8);
+  });
+
+  it('a pool without a converted amount is not listed, as a trade component without one is not', () => {
+    const row = toVolumeRow('amm_volume', bucket([amm({ converted: 0 })]), 'XRP');
+    expect(row.components).toEqual([]);
+    expect(row.count).toBe(3);
+    expect(row.total).toBe('0');
+  });
+
+  it('a display currency converts as it does a trade row: total, exchange_rate, rate / X, converted_amount * X', () => {
+    const row = toVolumeRow('amm_volume', bucket([amm()]), 'XRP', {
+      asset: { currency: 'BTC', issuer: I2 },
+      rate: bn('0.5'),
+    });
+    expect(row.exchange).toEqual({ currency: 'BTC', issuer: I2 });
+    expect(row.exchange_rate).toBe('0.50000000');
+    expect(row.total).toBe('45');
+    const [c] = row.components as AmmComponent[];
+    expect(Object.keys(c)).toEqual(['amm_account', 'base', 'counter', 'count', 'amount', 'rate', 'converted_amount']);
+    expect(c.converted_amount).toBe('45');
+    expect(c.rate).toBe('0.66666667');
+    expect(c.amount).toBe('30');
+  });
+
+  it('sums the days of a bucket per pool and sides: the pool of another orientation on another day is a part of its own', () => {
+    const stored = (over: Partial<StoredVolumeRow> = {}): StoredVolumeRow => ({
+      component: POOL,
+      base_currency: 'USD',
+      base_issuer: I1,
+      counter_currency: 'XRP',
+      counter_issuer: '',
+      amount: '10',
+      count: 2,
+      converted_f: 30,
+      ...over,
+    });
+    const parts = sumParts([
+      stored(),
+      stored({ amount: '5', count: '1', converted_f: 15 }),
+      stored({ base_currency: 'XRP', base_issuer: '', counter_currency: 'USD', counter_issuer: I1 }),
+      stored({ component: '' }),
+    ]);
+    expect(parts).toHaveLength(2);
+    expect(parts[0]).toMatchObject({ component: POOL, count: 3, converted: 45 });
+    expect(parts[0].amount.toString()).toBe('15');
   });
 });

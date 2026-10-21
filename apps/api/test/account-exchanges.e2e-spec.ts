@@ -1,8 +1,9 @@
 import { AccountExchangesRow, Table } from '@gatehub/data-api-shared';
+import BigNumber from 'bignumber.js';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
 import { fixtureAccountExchanges, fixtureExchanges, fixtureSource } from './support/fixtures';
-import { expectBoundedInOrderRead } from './support/plans';
+import { expectBoundedInOrderRead, innerRead } from './support/plans';
 
 /**
  * `GET /v2/accounts/:address/exchanges[/:base[/:counter]]` on a real ClickHouse, seeded with the 54 ledgers of the
@@ -1032,6 +1033,434 @@ describe('account exchanges API endpoint when a ledger was written twice', () =>
   });
 });
 
+describe('account exchanges API endpoint: swaps against AMM pools (amm_account and the amm filter)', () => {
+  // The mock ledgers of the original next to the recorded AMM ledgers: a swap is an exchange of its taker and of the
+  // pool, and `amm_account` is the pool. The rows of `account_exchanges` are one per participating account.
+  const SEED = 'ripple-mock+amm';
+  const MODES = ['include', 'exclude', 'only'] as const;
+  type Mode = (typeof MODES)[number];
+  const MESSAGE = 'invalid amm filter - use: include, exclude, only';
+  const ALL_ROWS = [...fixtureAccountExchanges(SEED)].sort(
+    (a, b) => byKey(a, b) || (a.account < b.account ? -1 : a.account > b.account ? 1 : 0),
+  );
+  const isSwap = (r: AccountExchangesRow): boolean => r.amm_account !== '';
+  const own = (account: string): AccountExchangesRow[] => ALL_ROWS.filter((r) => r.account === account);
+  const kept = (list: AccountExchangesRow[], mode?: Mode): AccountExchangesRow[] =>
+    mode === 'exclude' ? list.filter((r) => !isSwap(r)) : mode === 'only' ? list.filter(isSwap) : list;
+  const accounts = [...new Set(ALL_ROWS.map((r) => r.account))];
+  /** The account that traded most in both ways: the most of the rarer kind, then the most rows. */
+  const trader = [...accounts].sort((a, b) => {
+    const score = (x: string): number => Math.min(kept(own(x), 'only').length, kept(own(x), 'exclude').length);
+    return score(b) - score(a) || own(b).length - own(a).length || (a < b ? -1 : 1);
+  })[0];
+  /** A pool: every row it has is a swap. */
+  const pool = [...new Set(ALL_ROWS.filter(isSwap).map((r) => r.amm_account))].sort(
+    (a, b) => own(b).length - own(a).length || (a < b ? -1 : 1),
+  )[0];
+
+  const url = (base: string, ...params: string[]): string => {
+    const given = params.filter((p) => p !== '');
+    return given.length === 0 ? base : `${base}${base.includes('?') ? '&' : '?'}${given.join('&')}`;
+  };
+  const ammQuery = (mode?: string): string => (mode === undefined ? '' : `amm=${mode}`);
+
+  /**
+   * The exchange as the account route serves it, written out: the keys of the HBase row in order (the `d` family, then
+   * the `f` family, each sorted by name, with the pair among them), the client when the transaction had one, and last the
+   * pool of a swap. `inverted` is the pair asked for the other way round.
+   */
+  function exchangeOf(row: AccountExchangesRow, inverted = false): Record<string, unknown> {
+    const rate = new BigNumber(row.rate);
+    const fields: Record<string, unknown> = {
+      base_amount: inverted ? row.counter_amount : row.base_amount,
+      counter_amount: inverted ? row.base_amount : row.counter_amount,
+      node_index: row.node_index,
+      rate: (inverted ? new BigNumber(1).dividedBy(rate) : rate).toPrecision(8),
+      tx_index: row.tx_index,
+      autobridged_currency: row.autobridged_currency ?? undefined,
+      autobridged_issuer: row.autobridged_issuer || undefined,
+      base_currency: inverted ? row.counter_currency : row.base_currency,
+      base_issuer: (inverted ? row.counter_issuer : row.base_issuer) || undefined,
+      buyer: inverted ? row.seller : row.buyer,
+      client: row.client ?? undefined,
+      counter_currency: inverted ? row.base_currency : row.counter_currency,
+      counter_issuer: (inverted ? row.base_issuer : row.counter_issuer) || undefined,
+      executed_time: `${new Date(row.close_time * 1000).toISOString().slice(0, 19)}Z`,
+      ledger_index: row.ledger_index,
+      offer_sequence: row.offer_sequence,
+      provider: row.provider,
+      seller: inverted ? row.buyer : row.seller,
+      taker: row.taker,
+      tx_hash: row.tx_hash,
+      tx_type: row.tx_type,
+      amm_account: row.amm_account || undefined,
+    };
+    return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+  }
+  const exchangesOf = (rows: AccountExchangesRow[], inverted = false): Record<string, unknown>[] =>
+    rows.map((r) => exchangeOf(r, inverted));
+
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (p: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(p, limit, 'exchanges');
+  const accountCalls = (spy: jest.SpyInstance): unknown[][] =>
+    spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.AccountExchanges}\\b`).test(String(q)));
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: SEED, env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the data is as the tests assume: an account that traded both ways, and a pool that only has swaps', () => {
+    expect(kept(own(trader), 'only').length).toBeGreaterThanOrEqual(2);
+    expect(kept(own(trader), 'exclude').length).toBeGreaterThanOrEqual(2);
+    expect(own(pool).length).toBeGreaterThanOrEqual(3);
+    expect(own(pool).every(isSwap)).toBe(true);
+    // a swap is in the list of the pool: the pool is a party of it, and its provider
+    for (const r of kept(own(pool))) expect([r.amm_account, r.provider]).toEqual([pool, pool]);
+  });
+
+  it('amm unset, include, exclude and only list the exchanges of the account, the order-book ones and the swaps', async () => {
+    for (const account of [trader, pool, accounts.find((a) => own(a).every((r) => !isSwap(r))) as string]) {
+      for (const mode of [undefined, ...MODES]) {
+        const p = url(path(account), 'limit=1000', ammQuery(mode));
+        const res = await get(p);
+        const want = kept(own(account), mode);
+        expect([p, res.status, res.body.count]).toEqual([p, 200, want.length]);
+        expect([p, res.body.exchanges]).toEqual([p, exchangesOf(want)]);
+      }
+    }
+    const sets = MODES.map((mode) => kept(own(trader), mode).length);
+    expect(sets[0]).toBe(sets[1] + sets[2]);
+  });
+
+  it('a pool has no order-book exchange, an account that never swapped has no swap: empty lists', async () => {
+    const empty = { result: 'success', count: 0, exchanges: [] };
+    expect((await get(`${path(pool)}?amm=exclude`)).body).toEqual(empty);
+    const neverSwapped = accounts.find((a) => own(a).every((r) => !isSwap(r))) as string;
+    expect((await get(`${path(neverSwapped)}?amm=only`)).body).toEqual(empty);
+    expect((await get(`${path(NOBODY)}?amm=only`)).body).toEqual(empty);
+  });
+
+  it('is include when amm is missing or empty, and the first of a repeated param counts', async () => {
+    const plain = await get(`${path(trader)}?limit=1000`);
+    for (const amm of ['amm=', 'amm=include']) {
+      expect([amm, (await get(`${path(trader)}?limit=1000&${amm}`)).body]).toEqual([amm, plain.body]);
+    }
+    expect((await get(`${path(trader)}?amm=only&amm=exclude`)).body.exchanges).toEqual(
+      exchangesOf(kept(own(trader), 'only')),
+    );
+    expect((await get(`${path(trader)}?amm=exclude&amm=nonsense`)).body.exchanges).toEqual(
+      exchangesOf(kept(own(trader), 'exclude')),
+    );
+  });
+
+  describe('the exchange object', () => {
+    const D_FAMILY = ['base_amount', 'counter_amount', 'node_index', 'rate', 'tx_index'];
+
+    it('a swap has amm_account as its last key, after tx_type and the client; an order-book exchange has no such key', async () => {
+      const res = await get(`${path(trader)}?limit=1000`);
+      const rows = own(trader);
+      (res.body as ListBody).exchanges.forEach((ex, i) => {
+        const keys = Object.keys(ex);
+        expect([i, keys]).toEqual([i, Object.keys(exchangeOf(rows[i]))]);
+        expect([i, keys.includes('amm_account'), keys.at(-1) === 'amm_account']).toEqual([
+          i,
+          isSwap(rows[i]),
+          isSwap(rows[i]),
+        ]);
+        expect([i, keys.at(-1)]).toEqual([i, isSwap(rows[i]) ? 'amm_account' : 'tx_type']);
+      });
+      // pinned: a swap of an issued currency against the native one
+      const swap = kept(own(trader), 'only').find(
+        (r) => r.base_issuer !== '' && r.counter_issuer === '',
+      ) as AccountExchangesRow;
+      const served = (await get(`${path(trader)}?limit=1000&amm=only`)).body as ListBody;
+      const at = kept(own(trader), 'only').indexOf(swap);
+      expect(Object.keys(served.exchanges[at])).toEqual([
+        ...D_FAMILY,
+        ...(swap.autobridged_currency !== null ? ['autobridged_currency', 'autobridged_issuer'] : []),
+        'base_currency',
+        'base_issuer',
+        'buyer',
+        'counter_currency',
+        'executed_time',
+        'ledger_index',
+        'offer_sequence',
+        'provider',
+        'seller',
+        'taker',
+        'tx_hash',
+        'tx_type',
+        'amm_account',
+      ]);
+    });
+
+    it('is the same pool in both orientations of a pair filter, and last', async () => {
+      const swap = kept(own(trader), 'only')[0];
+      const base = `${swap.base_currency}${swap.base_issuer ? `+${swap.base_issuer}` : ''}`;
+      const counter = `${swap.counter_currency}${swap.counter_issuer ? `+${swap.counter_issuer}` : ''}`;
+      for (const [b, c, inverted] of [
+        [base, counter, false],
+        [counter, base, true],
+      ] as const) {
+        const res = await get(`${path(trader, `/${b}/${c}`)}?limit=1000&amm=only`);
+        const served = (res.body as ListBody).exchanges;
+        // the swaps of the pair, as asked: every stored row of this pair is as stored when asked as stored
+        const want = kept(own(trader), 'only').filter(
+          (r) =>
+            `${r.base_currency}|${r.base_issuer}|${r.counter_currency}|${r.counter_issuer}` ===
+            `${swap.base_currency}|${swap.base_issuer}|${swap.counter_currency}|${swap.counter_issuer}`,
+        );
+        expect(want.length).toBeGreaterThan(0);
+        expect([b, c, served]).toEqual([b, c, exchangesOf(want, inverted)]);
+        for (const ex of served) expect(Object.keys(ex).at(-1)).toBe('amm_account');
+      }
+    });
+
+    it('amm=exclude serves every account as before AMM: no object has the key', async () => {
+      for (const account of accounts.slice(0, 40)) {
+        const res = await get(`${path(account)}?limit=1000&amm=exclude`);
+        for (const ex of (res.body as ListBody).exchanges) expect(Object.keys(ex)).not.toContain('amm_account');
+      }
+    });
+  });
+
+  describe('the list', () => {
+    it('composes with the pair filter, in either orientation', async () => {
+      const swaps = kept(own(trader), 'only');
+      const pairs = [
+        ...new Set(swaps.map((r) => `${r.base_currency}+${r.base_issuer}/${r.counter_currency}+${r.counter_issuer}`)),
+      ];
+      expect(pairs.length).toBeGreaterThan(0);
+      for (const mode of MODES) {
+        // a currency alone, any issuer: the account's exchanges of it (base, or counter inverted)
+        const currency = swaps[0].base_currency;
+        const res = await get(url(path(trader, `/${currency}`), 'limit=1000', ammQuery(mode)));
+        const want = kept(own(trader), mode)
+          .map((row) => ({
+            row,
+            asStored: row.base_currency === currency,
+            reversed: row.counter_currency === currency,
+          }))
+          .filter((r) => r.asStored || r.reversed)
+          .map((r) => exchangeOf(r.row, !r.asStored));
+        expect([mode, res.body.exchanges]).toEqual([mode, want]);
+        expect(want.length).toBeGreaterThan(0);
+      }
+    });
+
+    it('composes with the window and the pages, in both directions; the marker continues inside the filtered rows', async () => {
+      for (const mode of MODES) {
+        const want = keysOf(kept(own(trader), mode));
+        for (const limit of [1, 3]) {
+          const walked = (await pages(url(path(trader), ammQuery(mode)), limit)).flatMap(keysIn);
+          expect([mode, limit, walked]).toEqual([mode, limit, want]);
+        }
+        const back = (await pages(url(path(trader), ammQuery(mode), 'descending=true'), 2)).flatMap(keysIn);
+        expect([mode, 'descending', back]).toEqual([mode, 'descending', [...want].reverse()]);
+      }
+      // a window: the day of the first swap
+      const swaps = kept(own(trader), 'only');
+      const day = new Date(swaps[0].close_time * 1000).toISOString().slice(0, 10);
+      const next = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 19);
+      const within = closedBetween(own(trader), `${day}T00:00:00`, next);
+      for (const mode of MODES) {
+        const res = await get(url(path(trader), `start=${day}`, `end=${day}`, 'limit=1000', ammQuery(mode)));
+        expect([mode, keysIn(res.body)]).toEqual([mode, keysOf(kept(within, mode))]);
+      }
+      // the marker of an order-book row: the swaps after it
+      const middle = kept(own(trader), 'exclude')[1];
+      const after = swaps.filter((r) => byKey(r, middle) > 0);
+      const res = await get(url(path(trader), 'amm=only', 'limit=1000', `marker=${markerOf(middle)}`));
+      expect(keysIn(res.body)).toEqual(keysOf(after));
+    });
+
+    it('the Link header keeps the filter', async () => {
+      const res = await get(`${path(trader)}?limit=1&amm=only`);
+      expect(res.headers.link).toBe(
+        `<${new URL(res.request.url).origin}${path(trader)}?limit=1&amm=only&marker=${markerOf(kept(own(trader), 'only')[0])}>; rel="next"`,
+      );
+    });
+  });
+
+  describe('an amm that is none of the three', () => {
+    it('is 400 invalid amm filter - use: include, exclude, only, with or without a pair filter', async () => {
+      for (const route of [
+        path(trader),
+        path(trader, '/XRP'),
+        path(trader, `/USD+${MWJ}/XRP`),
+        `${path(trader)}?format=csv`,
+      ]) {
+        for (const amm of ['nonsense', 'ONLY', 'Exclude', 'true', '1', 'none']) {
+          const p = url(route, `amm=${amm}`);
+          const res = await get(p);
+          expect([p, res.status, res.body]).toEqual([p, 400, { result: 'error', message: MESSAGE }]);
+        }
+      }
+    });
+
+    it('is checked after the assets, start and end, and before the marker', async () => {
+      const message = async (p: string): Promise<unknown> => (await get(p)).body.message;
+      expect(await message(`${path(trader, '/USD+x')}?amm=nonsense`)).toBe('invalid base issuer address');
+      expect(await message(`${path(trader)}?start=2015x&amm=nonsense`)).toBe('invalid start date format');
+      expect(await message(`${path(trader)}?end=2015x&amm=nonsense`)).toBe('invalid end date format');
+      expect(await message(`${path(trader)}?amm=nonsense&marker=garbage`)).toBe(MESSAGE);
+      expect(await message(`${path(trader)}?amm=only&marker=garbage`)).toBe('invalid marker');
+    });
+  });
+
+  describe('format=csv', () => {
+    const lines = (text: string): string[] => text.split('\n');
+    const COLUMNS = [
+      'base_currency',
+      'base_issuer',
+      'base_amount',
+      'counter_amount',
+      'counter_currency',
+      'counter_issuer',
+      'rate',
+      'executed_time',
+      'ledger_index',
+      'buyer',
+      'seller',
+      'taker',
+      'provider',
+      'autobridged_currency',
+      'autobridged_issuer',
+      'offer_sequence',
+      'tx_type',
+      'tx_index',
+      'node_index',
+      'tx_hash',
+    ];
+
+    it('amm_account is a last column when a swap is on the page, empty for the order-book rows', async () => {
+      const res = await get(`${path(trader)}?format=csv&limit=1000`);
+      const table = lines(res.text).map((l) => l.split(','));
+      const rows = own(trader);
+      expect(table).toHaveLength(1 + rows.length);
+      // the client column comes before it, when some row has a client
+      const expected = [...COLUMNS, ...(rows.some((r) => r.client !== null) ? ['client'] : []), 'amm_account'];
+      expect(table[0]).toEqual(expected.map((c) => `"${c}"`));
+      rows.forEach((r, i) => expect([i, table[1 + i].at(-1)]).toEqual([i, isSwap(r) ? `"${r.amm_account}"` : '""']));
+    });
+
+    it('a list of order-book exchanges has the columns it had before AMM', async () => {
+      const res = await get(`${path(trader)}?format=csv&limit=1000&amm=exclude`);
+      const header = lines(res.text)[0].split(',');
+      expect(header.slice(0, COLUMNS.length)).toEqual(COLUMNS.map((c) => `"${c}"`));
+      expect(header).not.toContain('"amm_account"');
+      const swapsOnly = await get(`${path(trader)}?format=csv&limit=1000&amm=only`);
+      expect(lines(swapsOnly.text)[0].split(',').at(-1)).toBe('"amm_account"');
+    });
+  });
+
+  describe('the SQL', () => {
+    it('the condition is inside the read that is capped, never after the page: bound, in order, whatever the direction', async () => {
+      for (const [mode, condition] of [
+        ['only', "amm_account != ''"],
+        ['exclude', "amm_account = ''"],
+      ] as const) {
+        for (const descending of [false, true]) {
+          for (const filter of ['', '/XRP']) {
+            const query = jest.spyOn(h.ch, 'query');
+            await get(
+              `${path(trader, filter)}?limit=3&amm=${mode}&descending=${descending}&marker=${markerOf(own(trader)[1])}`,
+            );
+            const calls = accountCalls(query);
+            jest.restoreAllMocks();
+            const where = [mode, descending, filter];
+            expect([...where, calls.length]).toEqual([...where, 1]);
+            const [sql, params] = calls[0] as [string, Record<string, unknown>];
+            expect([...where, innerRead(sql).includes(condition)]).toEqual([...where, true]);
+            expect([...where, sql.split(condition).length - 1]).toEqual([...where, 1]);
+            await expectBoundedInOrderRead(h, sql, params, descending, where);
+          }
+        }
+      }
+    });
+
+    it('include adds no condition: amm=include reads what no amm reads', async () => {
+      const readOf = async (query: string): Promise<string> => {
+        const spy = jest.spyOn(h.ch, 'query');
+        await get(`${path(trader)}?limit=3${query}`);
+        const calls = accountCalls(spy);
+        jest.restoreAllMocks();
+        expect(calls).toHaveLength(1);
+        return String(calls[0][0]);
+      };
+      const include = await readOf('&amm=include');
+      expect(include).not.toMatch(/amm_account\s*(!=|=)/);
+      expect(await readOf('')).toBe(include);
+    });
+  });
+});
+
+describe('account exchanges API endpoint: swaps that were written twice (the amm filter)', () => {
+  const SEED = 'ripple-mock+amm';
+  const ALL_ROWS = [...fixtureAccountExchanges(SEED)].sort(
+    (a, b) => byKey(a, b) || (a.account < b.account ? -1 : a.account > b.account ? 1 : 0),
+  );
+  const isSwap = (r: AccountExchangesRow): boolean => r.amm_account !== '';
+  // the account with most swaps in its busiest swap ledger
+  const perLedger = new Map<string, number>();
+  for (const r of ALL_ROWS.filter(isSwap)) {
+    const key = `${r.account}|${r.ledger_index}`;
+    perLedger.set(key, (perLedger.get(key) ?? 0) + 1);
+  }
+  const [busiest] = [...perLedger.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0];
+  const [ACCOUNT, ledger] = busiest.split('|');
+  const LEDGER = Number(ledger);
+  const rows = ALL_ROWS.filter((r) => r.account === ACCOUNT);
+
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (p: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(p, limit, 'exchanges');
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: SEED, env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.AccountExchanges}`);
+    await h.ch.command(
+      `INSERT INTO ${Table.AccountExchanges} SELECT * FROM ${Table.AccountExchanges} WHERE ledger_index = {index:UInt32}`,
+      { index: LEDGER },
+      { settings: { insert_deduplicate: 0 } },
+    );
+    const [{ n }] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM ${Table.AccountExchanges} WHERE ledger_index = {index:UInt32} AND account = {account:String} AND amm_account != ''`,
+      { index: LEDGER, account: ACCOUNT },
+    );
+    expect(Number(n)).toBe(rows.filter((r) => r.ledger_index === LEDGER && isSwap(r)).length * 2);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('lists every swap once, and a page cut inside the duplicates neither repeats nor skips a row', async () => {
+    expect(rows.filter((r) => r.ledger_index === LEDGER && isSwap(r)).length).toBeGreaterThan(1);
+    for (const mode of ['include', 'exclude', 'only'] as const) {
+      const want = mode === 'exclude' ? rows.filter((r) => !isSwap(r)) : mode === 'only' ? rows.filter(isSwap) : rows;
+      const unpaged = await get(`${path(ACCOUNT)}?limit=1000&amm=${mode}`);
+      expect([mode, keysIn(unpaged.body)]).toEqual([mode, keysOf(want)]);
+      for (const limit of [1, 2, 3]) {
+        const walked = (await pages(`${path(ACCOUNT)}?amm=${mode}`, limit)).flatMap(keysIn);
+        expect([mode, limit, walked]).toEqual([mode, limit, keysOf(want)]);
+      }
+      const desc = await pages(`${path(ACCOUNT)}?amm=${mode}&descending=true`, 2);
+      expect([mode, desc.flatMap(keysIn)]).toEqual([mode, keysOf(want).reverse()]);
+    }
+  });
+});
+
 describe('account exchanges API endpoint on the xahau-recorded ledgers', () => {
   const EVERNODE = 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8';
   const TRADER_X = 'rDripFkNyrKz7XUEWKCa18aTeGQ9mi7afj';
@@ -1059,6 +1488,7 @@ describe('account exchanges API endpoint on the xahau-recorded ledgers', () => {
     taker: TRADER_X,
     provider: EVERNODE,
     offer_sequence: 7,
+    amm_account: '',
     autobridged_currency: null,
     autobridged_issuer: null,
     tx_type: 'OfferCreate',

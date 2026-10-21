@@ -6,9 +6,9 @@ import type { Request, Response } from 'express';
 import { parseAssetFilter, splitAsset } from '../common/asset-param';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { setLinkHeader } from '../common/pagination';
-import { Query as QueryParams } from '../common/params';
+import { ammFilter, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
-import { AccountExchangeObject, toAccountCsvRow } from './account-exchange-object';
+import { AccountCsvRow, AccountExchangeObject, toAccountCsvRows } from './account-exchange-object';
 import { AccountExchangesService } from './account-exchanges.service';
 import { accountWindow } from './account-window';
 
@@ -16,7 +16,7 @@ interface AccountExchangesBody {
   result: 'success';
   count: number;
   marker?: string;
-  exchanges: AccountExchangeObject[] | ReturnType<typeof toAccountCsvRow>[];
+  exchanges: AccountExchangeObject[] | AccountCsvRow[];
 }
 
 /**
@@ -51,7 +51,9 @@ export class AccountExchangesController {
       '`end`, oldest first. Each is the exchange `GET /v2/exchanges` serves, plus the `client` when there is one. With ' +
       '`base`, only the trades of that asset, and with `counter` only against that asset, in whichever order the pair ' +
       'is stored: a trade stored the other way round is inverted (base and counter, buyer and seller swap, the rate ' +
-      'is 1/rate). `format=csv` gives the trades as a CSV file.',
+      'is 1/rate). A swap against an AMM pool is an exchange too: it has `amm_account` as its last key, and `amm` ' +
+      'lists it (`include`, the default), leaves it out (`exclude`) or lists only the swaps (`only`). ' +
+      '`format=csv` gives the trades as a CSV file.',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
   @ApiParam({
@@ -63,6 +65,14 @@ export class AccountExchangesController {
   @ApiParam({ name: 'counter', required: false, description: 'The other side of the pair, written like `base`.' })
   @ApiQuery({ name: 'start', required: false, description: 'Start time. Default: 2013-01-01.' })
   @ApiQuery({ name: 'end', required: false, description: 'End time. Default: the newest ledger.' })
+  @ApiQuery({
+    name: 'amm',
+    required: false,
+    enum: ['include', 'exclude', 'only'],
+    description:
+      'Swaps against AMM pools are exchanges too (they carry `amm_account`, the pool). `include` (default) lists ' +
+      'them with the order-book exchanges, `exclude` lists the order-book exchanges only, `only` the swaps only.',
+  })
   @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
   @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
@@ -76,13 +86,15 @@ export class AccountExchangesController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<AccountExchangesBody> {
     // the checks come in the order of the pair routes: the assets (the original checked none: ruling R33 validates the
-    // issuers), then start, end
+    // issuers), then start, end, limit (the window), then amm
     const base = parseAssetFilter(baseRaw, 'base');
     const counter = parseAssetFilter(counterRaw, 'counter');
     const window = accountWindow(query);
+    const amm = ammFilter(query);
 
     const page = await this.exchanges.list({
       ...window,
+      amm,
       account: address,
       ...(base && { base }),
       ...(counter && { counter }),
@@ -93,7 +105,7 @@ export class AccountExchangesController {
       result: 'success',
       count: page.exchanges.length,
       marker: page.marker,
-      exchanges: wantsCsv(query) ? page.exchanges.map(toAccountCsvRow) : page.exchanges,
+      exchanges: wantsCsv(query) ? toAccountCsvRows(page.exchanges) : page.exchanges,
     };
   }
 }

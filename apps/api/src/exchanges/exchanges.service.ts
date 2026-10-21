@@ -17,6 +17,7 @@ import {
   orderByClause,
   paginate,
 } from '../common/pagination';
+import { ammConditions, AmmFilter } from '../common/params';
 import {
   AGGREGATE_COLUMNS,
   AGGREGATE_SOURCE_COLUMNS,
@@ -79,6 +80,8 @@ export interface ExchangesWindow {
   endExclusive?: Date;
   /** Only the exchanges that were autobridged (have an autobridged currency). */
   autobridged: boolean;
+  /** Whether the swaps against AMM pools are listed with the order-book exchanges, instead of them, or alone. */
+  amm: AmmFilter;
   descending: boolean;
   limit: number;
   /** As the client got it from the last page; `decodeMarker` checks it. */
@@ -89,6 +92,15 @@ export interface ExchangesWindow {
 export interface PairExchangesQuery extends ExchangesWindow {
   base: Asset;
   counter: Asset;
+}
+
+/**
+ * The swaps of one pool (`GET /v2/amm/pools/:pool/swaps`): the pair read with the pool's account as a condition of the
+ * capped read beside the pair, which the skip index on `amm_account` lets skip the granules of the other pools' swaps and of
+ * the order book. Only `pair()` takes it; the candles and the reduced row of a pair do not.
+ */
+export interface PoolSwapsQuery extends PairExchangesQuery {
+  ammAccount: string;
 }
 
 export interface ExchangesPage {
@@ -133,7 +145,8 @@ export class ExchangesService {
   ) {}
 
   /** One page of the exchanges of a pair, in the order asked for, with the marker of the next page when there is one. */
-  async pair(q: PairExchangesQuery): Promise<ExchangesPage> {
+  async pair(q: PairExchangesQuery | PoolSwapsQuery): Promise<ExchangesPage> {
+    const ammAccount = 'ammAccount' in q ? q.ammAccount : undefined;
     // before any query: a marker that is none of ours is the client's mistake, whatever the range holds
     const after = decodeMarker(q.marker, EXCHANGE_KEYS);
 
@@ -152,6 +165,9 @@ export class ExchangesService {
       ...PAIR_KEYS.map((k, i) => `${k.column} = {pair${i}:${k.type}}`),
       'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
       ...(q.autobridged ? ['autobridged_currency IS NOT NULL'] : []),
+      // inside the read that is capped: a filter after the page would leave it short or empty
+      ...ammConditions(q.amm),
+      ...(ammAccount !== undefined ? ['amm_account = {amm_account:String}'] : []),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
     // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
@@ -167,6 +183,7 @@ export class ExchangesService {
         ...Object.fromEntries(pairValues.map((v, i) => [`pair${i}`, v])),
         min: range.min,
         max: range.max,
+        ...(ammAccount !== undefined && { amm_account: ammAccount }),
         ...cursor.params,
       },
       limit: q.limit + 1,
@@ -187,6 +204,11 @@ export class ExchangesService {
    * written twice, no FINAL, sorts next to its copy). Usually that is one read of each table, however long the gap
    * before the next exchange; when a window holds fewer than counted (the marker cut its first ledger, a filter such as
    * `autobridged`, a ledger row written twice) the next one is sized for twice as many (Ruling R107).
+   *
+   * The `amm` filter is a condition of the read of a window. `exclude` leaves a window with fewer exchanges than its
+   * ledgers count only by the swaps in it, which the doubling above covers. `only` is read in one window, the rest of the
+   * range: the ledgers count the order-book exchanges as well, so they size nothing, and the skip index on `amm_account`
+   * (Ruling R-A1) lets the read skip the granules that hold no swap.
    */
   async all(q: ExchangesWindow): Promise<ExchangesPage> {
     const after = decodeMarker(q.marker, EXCHANGE_KEYS);
@@ -205,12 +227,22 @@ export class ExchangesService {
     // one row more than the page: it only tells whether there is a next page
     const fetch = q.limit + 1;
     const rows: StoredExchange[] = [];
+    if (q.amm === 'only') {
+      // The `exchanges_count` of a ledger counts its order-book exchanges as well, so it says nothing of where the swaps
+      // are, and windows sized by it would be walked one after the other through years of order-book exchanges to find
+      // them. The swaps are found by the skip index on `amm_account` instead: one read of the rest of the range reads
+      // the granules that hold swaps, and nothing else (Ruling R-A1).
+      if (lo <= hi) {
+        rows.push(...(await this.allIn({ min: lo, max: hi }, cursor, q.autobridged, q.amm, q.descending, fetch)));
+      }
+      return this.page(rows, q.limit, false);
+    }
     for (let round = 0; lo <= hi && rows.length < fetch; round++) {
       const want = fetch - rows.length;
       const edge = await this.windowEdge(lo, hi, Math.min(want * 2 ** round, MAX_WINDOW_EXCHANGES), q.descending);
       if (edge === undefined) break;
       const window = q.descending ? { min: edge, max: hi } : { min: lo, max: edge };
-      rows.push(...(await this.allIn(window, cursor, q.autobridged, q.descending, want)));
+      rows.push(...(await this.allIn(window, cursor, q.autobridged, q.amm, q.descending, want)));
       if (q.descending) hi = edge - 1;
       else lo = edge + 1;
     }
@@ -251,12 +283,14 @@ export class ExchangesService {
     window: { min: number; max: number },
     cursor: { clause: string; params: Record<string, unknown> },
     autobridged: boolean,
+    amm: AmmFilter,
     descending: boolean,
     want: number,
   ): Promise<StoredExchange[]> {
     const where = [
       'ledger_index BETWEEN {lo:UInt32} AND {hi:UInt32}',
       ...(autobridged ? ['autobridged_currency IS NOT NULL'] : []),
+      ...ammConditions(amm),
       ...(cursor.clause !== '' ? [cursor.clause] : []),
     ];
     const sql = `SELECT ${EXCHANGE_COLUMNS} FROM ${Table.Exchanges}
@@ -318,7 +352,7 @@ export class ExchangesService {
     const bucket = `toUnixTimestamp(${bucketExpr(q.interval)})`;
     const direction = q.descending ? 'DESC' : 'ASC';
 
-    const pair = this.pairFilter(stored, q.autobridged);
+    const pair = this.pairFilter(stored, q.autobridged, q.amm);
     const fetch = q.limit + 1;
     const edges = await readGrowingCap(
       fetch,
@@ -349,7 +383,7 @@ export class ExchangesService {
         ? { min: next + 1, max: range.max }
         : { min: range.min, max: next - 1 };
 
-    const source = this.aggregationSource(stored, ledgers, q.autobridged);
+    const source = this.aggregationSource(stored, ledgers, q.autobridged, q.amm);
     const rows = await this.ch.query<BucketRow>(
       `SELECT ${bucket} AS bucket,
          ${AGGREGATE_COLUMNS}
@@ -382,7 +416,7 @@ export class ExchangesService {
     );
     if (!range) return toReducedObject(undefined, q, stored.inverted, q.start);
 
-    const source = this.aggregationSource(stored, range, q.autobridged);
+    const source = this.aggregationSource(stored, range, q.autobridged, q.amm);
     const [row] = await this.ch.query<AggregateRow>(
       `SELECT ${AGGREGATE_COLUMNS}
        FROM (${source.sql})`,
@@ -395,11 +429,13 @@ export class ExchangesService {
    * The exchanges of a stored pair that the original aggregated: the conditions on `exchanges` and their params. An
    * exchange whose native leg (the side without an issuer) is 0.0005 or less is left out, as the original's aggregation
    * did ("tiny amounts that exist from rounding errors in XRP"; its reduce used `< 0.0005`, its candles `<= 0.0005`:
-   * the candles' rule is used for both).
+   * the candles' rule is used for both). The `amm` filter is one of the conditions, so the buckets of a page and their
+   * aggregation both read the swaps, or the order-book exchanges, only.
    */
   private pairFilter(
     stored: { base: Asset; counter: Asset },
     autobridged: boolean,
+    amm: AmmFilter,
   ): { where: string[]; params: Record<string, unknown> } {
     const pairValues = [
       stored.base.currency,
@@ -411,6 +447,7 @@ export class ExchangesService {
       where: [
         ...PAIR_KEYS.map((k, i) => `${k.column} = {pair${i}:${k.type}}`),
         ...(autobridged ? ['autobridged_currency IS NOT NULL'] : []),
+        ...ammConditions(amm),
         ...(stored.base.issuer ? [] : ['base_amount_f > 0.0005']),
         ...(stored.counter.issuer ? [] : ['counter_amount_f > 0.0005']),
       ],
@@ -428,8 +465,9 @@ export class ExchangesService {
     stored: { base: Asset; counter: Asset },
     range: { min: number; max: number },
     autobridged: boolean,
+    amm: AmmFilter,
   ): { sql: string; params: Record<string, unknown> } {
-    const pair = this.pairFilter(stored, autobridged);
+    const pair = this.pairFilter(stored, autobridged, amm);
     return {
       sql: `SELECT ${AGGREGATE_SOURCE_COLUMNS}
            FROM ${Table.Exchanges}

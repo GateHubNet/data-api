@@ -21,7 +21,8 @@ import {
 import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { rangeIngest, RangeIngestOptions } from '../src/cli/range-ingest';
-import { range, syntheticChain } from './synthetic-chain';
+import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
+import { ammTemplate, range, syntheticChain } from './synthetic-chain';
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 
@@ -38,6 +39,14 @@ const BASE = 9_999_985;
 const L = (i: number): number => BASE + i;
 const CHAIN = syntheticChain(L(1), 30);
 const CHAIN_RAW = CHAIN.map((l) => l.raw);
+
+/** Transactions per ledger of `AMM_RAW` that touch a pool the parser cannot classify (see `ammTemplate`). */
+const UNCLASSIFIED_PER_LEDGER = 2;
+/**
+ * The same 30 ledgers with AMM activity: each holds an AMMCreate, an AMMVote and 10 swaps against pools of two recorded
+ * mainnet ledgers (rows in all five AMM tables), and `UNCLASSIFIED_PER_LEDGER` pools that give no row.
+ */
+const AMM_RAW = syntheticChain(L(1), 30, { template: ammTemplate(UNCLASSIFIED_PER_LEDGER) }).map((l) => l.raw);
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 /**
@@ -716,6 +725,168 @@ describe('rangeIngest (e2e)', () => {
       expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(CHAIN_RAW.slice(0, 14), CHAIN_TABLES));
       await expectNoDuplicateTransactions(svc);
+    });
+  });
+
+  describe('AMM ledgers (parser version 2)', () => {
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const unclassified = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.ammUnclassifiedTotal.get()).values[0]?.value ?? 0;
+
+    const AMM_TABLES = [
+      Table.AmmPoolStates,
+      Table.AmmPoolTouches,
+      Table.AmmLiquidity,
+      Table.AccountAmmLiquidity,
+      Table.AmmGovernance,
+    ];
+
+    /** `count() == uniqExact(<sorting key>)` in each AMM table: no row is there twice, and there are rows. */
+    async function expectNoDuplicateAmmRows(svc: ClickHouseService): Promise<void> {
+      for (const table of AMM_TABLES) {
+        const key = (
+          await svc.queryOne<{ sorting_key: string }>(
+            'SELECT sorting_key FROM system.tables WHERE database = currentDatabase() AND name = {t:String}',
+            { t: table },
+          )
+        )?.sorting_key;
+        const row = await svc.queryOne<{ n: string | number; u: string | number }>(
+          `SELECT count() AS n, uniqExact(${key}) AS u FROM ${table}`,
+        );
+        expect([table, Number(row?.n) > 0, Number(row?.n)]).toEqual([table, true, Number(row?.u)]);
+      }
+    }
+
+    it('the ledgers have rows for all five AMM tables, and two pools per ledger the parser cannot classify', () => {
+      const counts = expectedCounts(AMM_RAW, CHAIN_TABLES);
+      for (const table of AMM_TABLES) expect([table, counts[table] > 0]).toEqual([table, true]);
+      const total = AMM_RAW.reduce((sum, raw) => sum + buildLedgerRows(raw, ctx).diagnostics.ammUnclassified, 0);
+      expect(total).toBe(30 * UNCLASSIFIED_PER_LEDGER);
+    });
+
+    it('writes the AMM tables, and adds the pools it could not classify to syncer_amm_unclassified_total', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+
+      const result = await rangeIngest(new TestSource(AMM_RAW), svc, ctx, { from: L(1), to: L(30), ...FAST, metrics });
+
+      expect(result).toEqual({ chunksDone: 2, ledgers: 30 });
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(AMM_RAW, CHAIN_TABLES));
+      await expectNoDuplicateAmmRows(svc);
+      expect(await unclassified(metrics)).toBe(before + 30 * UNCLASSIFIED_PER_LEDGER);
+    });
+
+    it('says in its final line how many AMM pools it could not classify, 0 too (parked 21)', async () => {
+      const svc = await freshService();
+      const amm = captureLogger();
+      await rangeIngest(new TestSource(AMM_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, logger: amm });
+      const done = (lines: LogLine[]): string | undefined =>
+        lines.find((l) => l.message.includes('ingested:'))?.message;
+      expect(done(amm.lines)).toMatch(new RegExp(`, ${14 * UNCLASSIFIED_PER_LEDGER} unclassified AMM pools$`));
+      // a range without AMM activity says 0: the absence of a warning is not the proof
+      const plain = captureLogger();
+      await rangeIngest(new TestSource(CHAIN_RAW), await freshService(), ctx, {
+        from: L(1),
+        to: L(5),
+        ...FAST,
+        logger: plain,
+      });
+      expect(done(plain.lines)).toMatch(/, 0 unclassified AMM pools$/);
+    });
+
+    it('counts only what it wrote: ledgers it finds committed add nothing, and a parse before a delete adds nothing', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(AMM_RAW.slice(0, 5)); // L(1)..L(5)
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+
+      await rangeIngest(new TestSource(AMM_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, metrics });
+      expect(await unclassified(metrics)).toBe(before + 9 * UNCLASSIFIED_PER_LEDGER);
+
+      // A reprocess parses the chunk first (nothing is deleted if that fails), then writes it once: counted once.
+      await rangeIngest(new TestSource(AMM_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+        metrics,
+      });
+      expect(await unclassified(metrics)).toBe(before + (9 + 14) * UNCLASSIFIED_PER_LEDGER);
+    });
+
+    it('redo of an unfinished intent over AMM ledgers removes the orphans in the AMM tables and leaves no duplicates', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+      // A write that died after its child rows, before the commit marker: AMM rows, no ledgers rows.
+      await insertUncommitted(svc, AMM_RAW.slice(0, 14));
+      await seedIntent(svc, L(1), 9_999_999, 'crashed-run');
+      for (const table of AMM_TABLES) expect([table, (await count(svc, table)) > 0]).toEqual([table, true]);
+
+      const result = await rangeIngest(new TestSource(AMM_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        ...FAST,
+        metrics,
+      });
+
+      expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(AMM_RAW.slice(0, 14), CHAIN_TABLES));
+      await expectNoDuplicateAmmRows(svc);
+      expect((await intents(svc)).map((i) => i.status)).toEqual(['done']);
+      expect(await unclassified(metrics)).toBe(before + 14 * UNCLASSIFIED_PER_LEDGER);
+    });
+
+    it('recovers a failed write: the rows of the failed attempt are deleted from the AMM tables too, and the retry is counted once', async () => {
+      const svc = await freshService();
+      const events = recordEvents(svc, true);
+      const metrics = new PrometheusService();
+      const before = await unclassified(metrics);
+
+      const result = await rangeIngest(new TestSource(AMM_RAW), svc, ctx, { ...FAST, from: L(1), to: L(14), metrics });
+
+      expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
+      expect(events.some((e) => e.startsWith('fail:'))).toBe(true);
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(AMM_RAW.slice(0, 14), CHAIN_TABLES));
+      await expectNoDuplicateAmmRows(svc);
+      expect(await unclassified(metrics)).toBe(before + 14 * UNCLASSIFIED_PER_LEDGER);
+    });
+
+    it('reprocess gives ledgers written without AMM rows (parser version 1) their AMM rows, without duplicates', async () => {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(AMM_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST });
+      // What parser version 1 wrote: no rows in the AMM tables, and no swaps among the exchanges.
+      for (const table of AMM_TABLES) {
+        await svc.command(`DELETE FROM ${table} WHERE 1`, {}, { settings: { lightweight_deletes_sync: '2' } });
+      }
+      await svc.command(
+        `DELETE FROM ${Table.Exchanges} WHERE amm_account != ''`,
+        {},
+        {
+          settings: { lightweight_deletes_sync: '2' },
+        },
+      );
+      await svc.command(
+        `DELETE FROM ${Table.AccountExchanges} WHERE amm_account != ''`,
+        {},
+        {
+          settings: { lightweight_deletes_sync: '2' },
+        },
+      );
+      for (const table of AMM_TABLES) expect(await count(svc, table)).toBe(0);
+      expect(await tableCounts(svc, CHAIN_TABLES)).not.toEqual(expectedCounts(AMM_RAW.slice(0, 14), CHAIN_TABLES));
+
+      const result = await rangeIngest(new TestSource(AMM_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+      });
+
+      expect(result.ledgers).toBe(14);
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(AMM_RAW.slice(0, 14), CHAIN_TABLES));
+      await expectNoDuplicateAmmRows(svc);
     });
   });
 

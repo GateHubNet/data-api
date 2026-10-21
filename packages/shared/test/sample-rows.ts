@@ -1,4 +1,5 @@
 import {
+  AccountAmmLiquidityRow,
   AccountExchangesRow,
   AccountLinesDailyRow,
   AccountPartitionRowsRow,
@@ -13,6 +14,12 @@ import {
   AggDirtyRow,
   AmendmentFeaturesRow,
   AmendmentTalliesRow,
+  AmmDailyRow,
+  AmmGovernanceRow,
+  AmmLiquidityRow,
+  AmmPoolsRow,
+  AmmPoolStatesRow,
+  AmmPoolTouchesRow,
   BalanceChangesRow,
   ExchangesRow,
   FeeStatsRow,
@@ -61,6 +68,11 @@ export interface TableRows {
   [Table.AccountExchanges]: AccountExchangesRow;
   [Table.BalanceChanges]: BalanceChangesRow;
   [Table.AccountsCreated]: AccountsCreatedRow;
+  [Table.AmmPoolStates]: AmmPoolStatesRow;
+  [Table.AmmPoolTouches]: AmmPoolTouchesRow;
+  [Table.AmmLiquidity]: AmmLiquidityRow;
+  [Table.AccountAmmLiquidity]: AccountAmmLiquidityRow;
+  [Table.AmmGovernance]: AmmGovernanceRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -77,6 +89,8 @@ export interface TableRows {
   [Table.StatsHourly]: StatsHourlyRow;
   [Table.VolumeDaily]: VolumeDailyRow;
   [Table.VolumeLive]: VolumeLiveRow;
+  [Table.AmmPools]: AmmPoolsRow;
+  [Table.AmmDaily]: AmmDailyRow;
   [Table.NativeRatesDaily]: NativeRatesDailyRow;
   [Table.PairHourly]: PairHourlyRow;
   [Table.MarketsLive]: MarketsLiveRow;
@@ -113,6 +127,8 @@ const VERSION_MS = 1_700_000_000_123;
 const ISSUER = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 const ALICE = 'rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn';
 const BOB = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+const POOL = 'rJ8pBKtDeSyHAUhrjZGfUQJdE1MVxrZEXp';
+const CAROL = 'rDsbeomae4FXwgQTJp9Rs64Qg9vDiTCdBv';
 
 const exchange: ExchangesRow = {
   base_currency: 'XRP',
@@ -130,15 +146,37 @@ const exchange: ExchangesRow = {
   counter_amount_f: 52.5,
   rate: '0.525',
   rate_f: 0.525,
+  // A swap against a pool (the contract of AMM rows): the taker buys from the pool, which is the provider of an offer
+  // that has no sequence.
   buyer: ALICE,
-  seller: BOB,
+  seller: POOL,
   taker: ALICE,
-  provider: BOB,
-  offer_sequence: 77,
+  provider: POOL,
+  offer_sequence: 0,
+  amm_account: POOL,
   autobridged_currency: 'EUR',
   autobridged_issuer: ISSUER,
   tx_type: 'OfferCreate',
   client: 'xumm',
+};
+
+/** `account_amm_liquidity` has the columns of `amm_liquidity`, so one row serves both. */
+const ammLiquidity: AmmLiquidityRow = {
+  amm_account: POOL,
+  ledger_index: LEDGER,
+  tx_index: 3,
+  tx_hash: hash(13),
+  close_time: CLOSE,
+  account: ALICE,
+  initiator: BOB,
+  event: 'clawback',
+  mode: 'two_asset',
+  base_amount: '-50000000',
+  counter_amount: '-26.25',
+  lp_tokens: '-1144.5',
+  base_amount_f: -50000000,
+  counter_amount_f: -26.25,
+  lp_tokens_f: -1144.5,
 };
 
 /** One distinct value per column of every table, in the shape the row interfaces describe. */
@@ -231,7 +269,7 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     destination_tag: 9,
   },
   [Table.Exchanges]: exchange,
-  [Table.AccountExchanges]: { ...exchange, account: BOB },
+  [Table.AccountExchanges]: { ...exchange, account: POOL },
   [Table.BalanceChanges]: {
     account: ALICE,
     ledger_index: LEDGER,
@@ -264,6 +302,54 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     inception: CLOSE,
     genesis_balance: '100000000',
     genesis_index: 32570,
+  },
+  [Table.AmmPoolStates]: {
+    amm_account: POOL,
+    ledger_index: LEDGER,
+    tx_index: 2,
+    tx_hash: hash(12),
+    close_time: CLOSE,
+    tx_type: 'AMMDeposit',
+    base_currency: 'XRP',
+    base_issuer: '',
+    counter_currency: 'USD',
+    counter_issuer: ISSUER,
+    reserve_base: '1000000000',
+    reserve_counter: '523.5',
+    lp_supply: '22881.5',
+    lp_currency: '03930D02208264E2E40EC1B0C09E4DB96EE197B1',
+    reserve_base_f: 1000000000,
+    reserve_counter_f: 523.5,
+    lp_supply_f: 22881.5,
+    trading_fee: 500,
+    auction_holder: CAROL,
+    auction_price: '12.25',
+    auction_price_f: 12.25,
+    auction_discounted_fee: 50,
+    auction_expiration: 750_086_400,
+    deleted: 0,
+  },
+  // the touch of the pool state above: the same ledger, transaction and pool
+  [Table.AmmPoolTouches]: { ledger_index: LEDGER, tx_index: 2, amm_account: POOL },
+  [Table.AmmLiquidity]: ammLiquidity,
+  [Table.AccountAmmLiquidity]: ammLiquidity,
+  [Table.AmmGovernance]: {
+    amm_account: POOL,
+    ledger_index: LEDGER,
+    tx_index: 4,
+    tx_hash: hash(14),
+    close_time: CLOSE,
+    kind: 'bid',
+    account: CAROL,
+    fee_voted: 400,
+    trading_fee_after: 500,
+    bid_min: '10',
+    bid_max: '15.5',
+    price_paid: '12.25',
+    slot_holder: CAROL,
+    slot_discounted_fee: 50,
+    slot_expiration: 750_086_400,
+    auth_accounts: [ALICE, BOB],
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
@@ -464,6 +550,55 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     count: 12,
     rate_f: 0.5,
     converted_f: 500.25,
+    config_version: 3,
+    version: 1,
+  },
+  [Table.AmmPools]: {
+    amm_account: POOL,
+    base_currency: 'XRP',
+    base_issuer: '',
+    counter_currency: 'USD',
+    counter_issuer: ISSUER,
+    lp_currency: '03930D02208264E2E40EC1B0C09E4DB96EE197B1',
+    created_ledger: LEDGER - 1000,
+    created_by: ALICE,
+    last_ledger: LEDGER,
+    reserve_base: '1000000000',
+    reserve_counter: '523.5',
+    lp_supply: '22881.5',
+    trading_fee: 500,
+    auction_holder: CAROL,
+    auction_price: '12.25',
+    auction_discounted_fee: 50,
+    auction_expiration: 750_086_400,
+    deleted: 0,
+    value_native: 2000,
+    version: 1,
+  },
+  [Table.AmmDaily]: {
+    amm_account: POOL,
+    day: '2023-11-14',
+    base_currency: 'XRP',
+    base_issuer: '',
+    counter_currency: 'USD',
+    counter_issuer: ISSUER,
+    swap_count: 40,
+    volume_base: '8000000',
+    volume_counter: '4.2',
+    fees_base_est: '2400',
+    fees_counter_est: '0.0126',
+    deposit_count: 3,
+    withdraw_count: 2,
+    liquidity_in_base: '300000000',
+    liquidity_in_counter: '157.5',
+    liquidity_out_base: '100000000',
+    liquidity_out_counter: '52.5',
+    reserve_base: '1000000000',
+    reserve_counter: '523.5',
+    lp_supply: '22881.5',
+    trading_fee: 500,
+    value_native: 2000,
+    final: 1,
     config_version: 3,
     version: 1,
   },

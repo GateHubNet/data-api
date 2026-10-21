@@ -4,7 +4,7 @@ import { bucketExpr, bucketStart, EXCHANGE_INTERVALS } from '../src/exchanges/ex
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
 import { FixtureExchange, fixtureExchanges, fixtureSource } from './support/fixtures';
-import { expectBoundedInOrderRead, explain, tableReads } from './support/plans';
+import { expectBoundedInOrderRead, explain, innerRead, tableReads } from './support/plans';
 
 /**
  * `GET /v2/exchanges/:base/:counter` (raw exchanges) and `GET /v2/exchanges` (every pair, a GateHub extra) on a real
@@ -114,6 +114,8 @@ function exchangeOf(row: ExchangesRow, inverted = false): Record<string, unknown
     base_issuer: (inverted ? row.counter_issuer : row.base_issuer) || undefined,
     counter_currency: inverted ? row.base_currency : row.counter_currency,
     counter_issuer: (inverted ? row.base_issuer : row.counter_issuer) || undefined,
+    // a swap against an AMM pool names the pool, last; an order-book exchange has no such key
+    amm_account: row.amm_account || undefined,
   };
   return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
 }
@@ -2595,8 +2597,11 @@ describe('exchanges API endpoint on the xrpl-recorded ledgers (autobridged excha
     await h?.close();
   });
 
-  it('the recorded ledgers hold 20 exchanges, two of them autobridged', () => {
-    expect(all).toHaveLength(20);
+  it('the recorded ledgers hold 20 order-book exchanges, two of them autobridged, and 34 swaps against AMM pools', () => {
+    // The ledgers are from after the AMM amendment: swaps through pools are exchanges too (amm_account is the pool).
+    expect(all.filter((e) => e.row.amm_account === '')).toHaveLength(20);
+    expect(all.filter((e) => e.row.amm_account !== '')).toHaveLength(34);
+    expect(all).toHaveLength(54);
     expect(autobridged).toHaveLength(2);
     expect(mixed.rows.length).toBeGreaterThan(2);
   });
@@ -2710,6 +2715,750 @@ describe('exchanges API endpoint on the xrpl-recorded ledgers (autobridged excha
   });
 });
 
+describe('exchanges API endpoint: swaps against AMM pools (amm_account and the amm filter)', () => {
+  // The mock ledgers of the original (158 order-book exchanges, 2013 to 2016) next to the recorded AMM ledgers (39
+  // order-book exchanges and 138 swaps against pools, 2025 and 2026): swaps are exchanges too, `amm_account` is the pool.
+  const SEED = 'ripple-mock+amm';
+  const MODES = ['include', 'exclude', 'only'] as const;
+  type Mode = (typeof MODES)[number];
+  const MESSAGE = 'invalid amm filter - use: include, exclude, only';
+  const MIXED = [...fixtureExchanges(SEED)].sort(byKey);
+  const isSwap = (e: FixtureExchange): boolean => e.row.amm_account !== '';
+  /** What the filter keeps; no `amm` is `include`. */
+  const kept = (list: FixtureExchange[], mode?: Mode): FixtureExchange[] =>
+    mode === 'exclude' ? list.filter((e) => !isSwap(e)) : mode === 'only' ? list.filter(isSwap) : list;
+  const biggest = (list: Market[]): Market => [...list].sort((a, b) => b.rows.length - a.rows.length)[0];
+  const markets = marketsOf(MIXED);
+  /** A pair that has both kinds of exchange, one that has swaps only and one that has order-book exchanges only. */
+  const mixed = biggest(markets.filter((m) => m.rows.some(isSwap) && m.rows.some((e) => !isSwap(e))));
+  const swapsOnly = biggest(markets.filter((m) => m.rows.every(isSwap)));
+  const bookOnly = biggest(markets.filter((m) => m.rows.every((e) => !isSwap(e))));
+  /** A pair that has autobridged exchanges of both kinds. */
+  const bridgedBoth = markets.find(
+    (m) =>
+      m.rows.some((e) => isSwap(e) && e.row.autobridged_currency !== null) &&
+      m.rows.some((e) => !isSwap(e) && e.row.autobridged_currency !== null),
+  ) as Market;
+  const pairPath = (m: Market, inverted = false): string =>
+    inverted ? `${pathOf(m.counter)}/${pathOf(m.base)}` : `${pathOf(m.base)}/${pathOf(m.counter)}`;
+  const ammQuery = (mode?: string): string => (mode === undefined ? '' : `amm=${mode}`);
+  /** `path` with the params (the empty ones left out) joined to what it has. */
+  const url = (path: string, ...params: string[]): string => {
+    const kept = params.filter((p) => p !== '');
+    return kept.length === 0 ? path : `${path}${path.includes('?') ? '&' : '?'}${kept.join('&')}`;
+  };
+
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (path: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(path, limit, 'exchanges');
+  const exchangesCalls = (spy: jest.SpyInstance): unknown[][] =>
+    spy.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Exchanges}\\b`).test(String(q)));
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: SEED, env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the data is as the tests assume: both kinds of exchange in one pair, and pairs of one kind', () => {
+    expect(MIXED).toHaveLength(158 + 39 + 138);
+    expect(MIXED.filter(isSwap)).toHaveLength(138);
+    // a pair of both kinds, one of swaps only, one of order-book exchanges only
+    expect([mixed.rows.filter(isSwap).length, mixed.rows.filter((e) => !isSwap(e)).length]).toEqual([4, 14]);
+    expect(swapsOnly.rows.length).toBeGreaterThanOrEqual(6);
+    expect(bookOnly.rows.length).toBeGreaterThanOrEqual(30);
+    // a swap's provider is the pool, and there is no offer behind it
+    for (const e of MIXED.filter(isSwap))
+      expect([e.row.provider, e.row.offer_sequence]).toEqual([e.row.amm_account, 0]);
+  });
+
+  describe('the exchanges of a pair (raw)', () => {
+    it('amm unset, include, exclude and only give the exchanges, the order-book ones and the swaps, both ways round', async () => {
+      for (const m of [mixed, swapsOnly, bookOnly]) {
+        for (const inverted of [false, true]) {
+          for (const mode of [undefined, ...MODES]) {
+            const path = url(`/v2/exchanges/${pairPath(m, inverted)}`, 'limit=400', ammQuery(mode));
+            const want = kept(m.rows, mode);
+            const res = await get(path);
+            expect([path, res.status, res.body.count]).toEqual([path, 200, want.length]);
+            expect([path, res.body.exchanges]).toEqual([path, exchangesOf(want, inverted)]);
+          }
+        }
+      }
+      // the three sets are not the same: the filter does something on the pair that has both
+      const sets = MODES.map((mode) => kept(mixed.rows, mode).length);
+      expect(sets[0]).toBe(sets[1] + sets[2]);
+      expect(sets[1]).toBeGreaterThan(0);
+      expect(sets[2]).toBeGreaterThan(0);
+    });
+
+    it('an empty set is the usual empty answer: only on a pair of order-book exchanges, exclude on a pair of swaps', async () => {
+      const none = await get(`/v2/exchanges/${pairPath(bookOnly)}?amm=only`);
+      expect(none.body).toEqual({ result: 'success', count: 0, exchanges: [] });
+      const noneLeft = await get(`/v2/exchanges/${pairPath(swapsOnly)}?amm=exclude`);
+      expect(noneLeft.body).toEqual({ result: 'success', count: 0, exchanges: [] });
+    });
+
+    it('is include when amm is missing or empty; the rest of the query is as before', async () => {
+      const path = `/v2/exchanges/${pairPath(mixed)}`;
+      const plain = await get(`${path}?limit=400`);
+      for (const amm of ['amm=', 'amm=include']) {
+        const res = await get(`${path}?limit=400&${amm}`);
+        expect([amm, res.body]).toEqual([amm, plain.body]);
+      }
+      // a repeated param: the first value wins; other params and other values of it are ignored
+      expect((await get(`${path}?limit=400&amm=only&amm=exclude`)).body.exchanges).toEqual(
+        exchangesOf(kept(mixed.rows, 'only')),
+      );
+      expect((await get(`${path}?limit=400&amm=exclude&amm=nonsense`)).body.exchanges).toEqual(
+        exchangesOf(kept(mixed.rows, 'exclude')),
+      );
+    });
+
+    it('the filter composes with the window, autobridged, descending and the pages', async () => {
+      const path = `/v2/exchanges/${pairPath(mixed)}`;
+      // the day of the first swap of the pair: its book and swap exchanges are both in the window
+      const swaps = kept(mixed.rows, 'only');
+      const day = executedTime(swaps[0].row.close_time).slice(0, 10);
+      const nextDay = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 19);
+      const within = closedBetween(mixed.rows, `${day}T00:00:00`, nextDay);
+      expect(within.some(isSwap)).toBe(true);
+      for (const mode of MODES) {
+        const res = await get(url(path, `start=${day}`, `end=${day}`, `amm=${mode}`));
+        expect([mode, res.body.exchanges]).toEqual([mode, exchangesOf(kept(within, mode))]);
+      }
+      // autobridged=true with amm: a pair that has autobridged exchanges of both kinds
+      const autobridged = (e: FixtureExchange): boolean => e.row.autobridged_currency !== null;
+      expect(bridgedBoth.rows.some((e) => isSwap(e) && autobridged(e))).toBe(true);
+      expect(bridgedBoth.rows.some((e) => !isSwap(e) && autobridged(e))).toBe(true);
+      for (const mode of MODES) {
+        const bridgedPath = `/v2/exchanges/${pairPath(bridgedBoth)}`;
+        const res = await get(url(bridgedPath, 'limit=400', 'autobridged=true', ammQuery(mode)));
+        const want = kept(bridgedBoth.rows.filter(autobridged), mode);
+        expect([mode, res.body.exchanges]).toEqual([mode, exchangesOf(want)]);
+        expect(want.length).toBeGreaterThan(0);
+      }
+      // pages, ascending and descending: the marker continues inside the filtered rows
+      for (const mode of MODES) {
+        const want = hashesOf(kept(mixed.rows, mode));
+        for (const limit of [1, 3]) {
+          const walked = (await pages(url(path, `amm=${mode}`), limit)).flatMap(hashesIn);
+          expect([mode, limit, walked]).toEqual([mode, limit, want]);
+        }
+        const back = (await pages(url(path, `amm=${mode}`, 'descending=true'), 2)).flatMap(hashesIn);
+        expect([mode, 'descending', back]).toEqual([mode, 'descending', [...want].reverse()]);
+      }
+    });
+
+    it('a marker of an order-book row continues in the swaps after it', async () => {
+      const path = `/v2/exchanges/${pairPath(mixed)}`;
+      // the marker of a book row, in the middle of the pair: the swaps after it
+      const middle = mixed.rows.filter((e) => !isSwap(e))[5];
+      const after = mixed.rows.filter((e) => isSwap(e) && byKey(e, middle) > 0);
+      expect(after.length).toBeGreaterThan(0);
+      const res = await get(url(path, 'limit=400', 'amm=only', `marker=${markerOf(middle.row)}`));
+      expect(res.body.exchanges).toEqual(exchangesOf(after));
+    });
+
+    it('the Link header keeps the filter, so the next page is of the same list', async () => {
+      const res = await get(`/v2/exchanges/${pairPath(mixed)}?limit=1&amm=only`);
+      const first = kept(mixed.rows, 'only')[0];
+      expect(res.headers.link).toBe(
+        `<${new URL(res.request.url).origin}/v2/exchanges/${pairPath(mixed)}?limit=1&amm=only&marker=${markerOf(first.row)}>; rel="next"`,
+      );
+    });
+  });
+
+  describe('the exchange object', () => {
+    // the keys of the HBase row, in the order of the original, and amm_account last
+    const D_FAMILY = ['base_amount', 'counter_amount', 'node_index', 'rate', 'tx_index'];
+    const F_FAMILY = [
+      'buyer',
+      'executed_time',
+      'ledger_index',
+      'offer_sequence',
+      'provider',
+      'seller',
+      'taker',
+      'tx_hash',
+      'tx_type',
+    ];
+    /** The keys of an exchange of a market, whichever way round: what it has of the optional ones, in the original's order. */
+    const keysFor = (m: Market, e: FixtureExchange, inverted: boolean): string[] => {
+      const [base, counter] = inverted ? [m.counter, m.base] : [m.base, m.counter];
+      return [
+        ...D_FAMILY,
+        ...(e.row.autobridged_currency !== null ? ['autobridged_currency'] : []),
+        ...(e.row.autobridged_issuer ? ['autobridged_issuer'] : []),
+        ...F_FAMILY,
+        'base_currency',
+        ...(base.issuer ? ['base_issuer'] : []),
+        'counter_currency',
+        ...(counter.issuer ? ['counter_issuer'] : []),
+        ...(isSwap(e) ? ['amm_account'] : []),
+      ];
+    };
+    const swapOf = (m: Market): FixtureExchange => m.rows.find(isSwap) as FixtureExchange;
+
+    it('a swap has amm_account as its last key; an order-book exchange of the same pair has no such key', async () => {
+      const res = await get(`/v2/exchanges/${pairPath(mixed)}?limit=400`);
+      const body = res.body as ListBody;
+      expect(body.exchanges).toHaveLength(mixed.rows.length);
+      mixed.rows.forEach((e, i) => {
+        const keys = Object.keys(body.exchanges[i]);
+        expect([i, isSwap(e), keys]).toEqual([i, isSwap(e), keysFor(mixed, e, false)]);
+        expect(keys.includes('amm_account')).toBe(isSwap(e));
+        if (isSwap(e)) expect(body.exchanges[i].amm_account).toBe(e.row.amm_account);
+      });
+      // pinned: a swap against a pool of an issued currency and the native one
+      expect(Object.keys(body.exchanges[mixed.rows.indexOf(swapOf(mixed))])).toEqual([
+        'base_amount',
+        'counter_amount',
+        'node_index',
+        'rate',
+        'tx_index',
+        'buyer',
+        'executed_time',
+        'ledger_index',
+        'offer_sequence',
+        'provider',
+        'seller',
+        'taker',
+        'tx_hash',
+        'tx_type',
+        'base_currency',
+        'base_issuer',
+        'counter_currency',
+        'amm_account',
+      ]);
+    });
+
+    it('is last whatever else the exchange has: an issuer on both sides, an autobridged currency, either way round', async () => {
+      const both = markets.find((m) => m.base.issuer && m.counter.issuer && m.rows.some(isSwap)) as Market;
+      const bridged = markets.find((m) =>
+        m.rows.some((e) => isSwap(e) && e.row.autobridged_currency !== null),
+      ) as Market;
+      expect(both).toBeDefined();
+      expect(bridged).toBeDefined();
+      for (const m of [both, bridged]) {
+        for (const inverted of [false, true]) {
+          const res = await get(`/v2/exchanges/${pairPath(m, inverted)}?limit=400`);
+          const served = (res.body as ListBody).exchanges;
+          expect(served).toHaveLength(m.rows.length);
+          served.forEach((ex, i) => {
+            const label = [pairPath(m, inverted), i];
+            expect([...label, Object.keys(ex)]).toEqual([...label, keysFor(m, m.rows[i], inverted)]);
+          });
+        }
+      }
+      // pinned: an issued currency on both sides
+      const issued = await get(`/v2/exchanges/${pairPath(both)}?limit=400&amm=only`);
+      expect(Object.keys(issued.body.exchanges[0])).toEqual([
+        'base_amount',
+        'counter_amount',
+        'node_index',
+        'rate',
+        'tx_index',
+        'buyer',
+        'executed_time',
+        'ledger_index',
+        'offer_sequence',
+        'provider',
+        'seller',
+        'taker',
+        'tx_hash',
+        'tx_type',
+        'base_currency',
+        'base_issuer',
+        'counter_currency',
+        'counter_issuer',
+        'amm_account',
+      ]);
+      // pinned: an autobridged swap, the autobridged currency and issuer in the place of the f family
+      const swaps = kept(bridged.rows, 'only');
+      const at = swaps.findIndex((e) => e.row.autobridged_currency !== null);
+      const autobridged = await get(`/v2/exchanges/${pairPath(bridged)}?limit=400&amm=only`);
+      expect(Object.keys(autobridged.body.exchanges[at])).toEqual([
+        'base_amount',
+        'counter_amount',
+        'node_index',
+        'rate',
+        'tx_index',
+        'autobridged_currency',
+        'autobridged_issuer',
+        'buyer',
+        'executed_time',
+        'ledger_index',
+        'offer_sequence',
+        'provider',
+        'seller',
+        'taker',
+        'tx_hash',
+        'tx_type',
+        'base_currency',
+        'base_issuer',
+        'counter_currency',
+        ...(bridged.counter.issuer ? ['counter_issuer'] : []),
+        'amm_account',
+      ]);
+    });
+
+    it('the pool is the same account whichever way round the pair is asked, and is the provider of the swap', async () => {
+      for (const inverted of [false, true]) {
+        const res = await get(`/v2/exchanges/${pairPath(mixed, inverted)}?limit=400&amm=only`);
+        for (const [i, e] of kept(mixed.rows, 'only').entries()) {
+          const ex = (res.body as ListBody).exchanges[i];
+          expect([inverted, i, ex.amm_account, ex.provider, ex.offer_sequence]).toEqual([
+            inverted,
+            i,
+            e.row.amm_account,
+            e.row.amm_account,
+            0,
+          ]);
+        }
+      }
+    });
+
+    it('amm=exclude serves the pair exactly as before AMM: no object has the key', async () => {
+      for (const m of markets) {
+        const res = await get(`/v2/exchanges/${pairPath(m)}?limit=400&amm=exclude`);
+        for (const ex of (res.body as ListBody).exchanges) expect(Object.keys(ex)).not.toContain('amm_account');
+      }
+    });
+  });
+
+  describe('interval and reduce', () => {
+    const rowsOf = (m: Market, mode?: Mode): ExchangesRow[] => kept(m.rows, mode).map((e) => e.row);
+
+    it('the candles and the reduced row of each mode are the aggregation of the exchanges it keeps, both ways round', async () => {
+      let candles = 0;
+      for (const m of [mixed, swapsOnly, bookOnly]) {
+        for (const inverted of [false, true]) {
+          const path = `/v2/exchanges/${pairPath(m, inverted)}`;
+          for (const mode of [undefined, ...MODES]) {
+            for (const interval of ['1hour', '1day', '1year']) {
+              const res = await get(url(path, `interval=${interval}`, ammQuery(mode)));
+              const want = candlesOf(m, interval, inverted, rowsOf(m, mode));
+              expectAggregates([path, interval, mode], res.body.exchanges, want);
+              candles += want.length;
+            }
+            const reduced = await get(url(path, 'reduce=true', ammQuery(mode)));
+            expectAggregates([path, 'reduce', mode], reduced.body.exchanges, [
+              reducedOf(m, inverted, '2013-01-01T00:00:00Z', rowsOf(m, mode)),
+            ]);
+          }
+        }
+      }
+      expect(candles).toBeGreaterThan(40);
+    });
+
+    it('the reduced row counts what the filter keeps: include is exclude and only added up', async () => {
+      const count = async (mode: Mode): Promise<number> =>
+        (await get(`/v2/exchanges/${pairPath(mixed)}?reduce=true&amm=${mode}`)).body.exchanges[0].count;
+      const [include, exclude, only] = [await count('include'), await count('exclude'), await count('only')];
+      expect([include, exclude, only]).toEqual([
+        aggregated(rowsOf(mixed)).length,
+        aggregated(rowsOf(mixed, 'exclude')).length,
+        aggregated(rowsOf(mixed, 'only')).length,
+      ]);
+      expect(include).toBe(exclude + only);
+      expect(only).toBeGreaterThan(0);
+      expect(exclude).toBeGreaterThan(0);
+    });
+
+    it('a pair without exchanges of the kind: no candles, the row of zeros', async () => {
+      const none = await get(`/v2/exchanges/${pairPath(bookOnly)}?interval=1day&amm=only`);
+      expect(none.body).toEqual({ result: 'success', count: 0, exchanges: [] });
+      const zeros = await get(`/v2/exchanges/${pairPath(bookOnly)}?reduce=true&amm=only`);
+      expect(zeros.body.exchanges[0]).toMatchObject({ count: 0, base_volume: '0', counter_volume: '0' });
+    });
+
+    it('a swap whose native leg is 0.0005 or less is listed, and left out of the candles and the reduced row, as an order-book exchange is', async () => {
+      const tiny = (e: FixtureExchange): boolean => aggregated([e.row]).length === 0;
+      const dust = markets.filter((m) => m.rows.some((e) => isSwap(e) && tiny(e)));
+      expect(dust.length).toBeGreaterThanOrEqual(3);
+      for (const m of dust) {
+        const swaps = kept(m.rows, 'only');
+        for (const inverted of [false, true]) {
+          const path = `/v2/exchanges/${pairPath(m, inverted)}`;
+          // listed: the raw list has every swap, the dust ones too
+          const raw = await get(`${path}?limit=400&amm=only`);
+          expect([path, raw.body.exchanges]).toEqual([path, exchangesOf(swaps, inverted)]);
+          // aggregated: the dust ones are out of it
+          const reduced = await get(`${path}?reduce=true&amm=only`);
+          const want = reducedOf(m, inverted, '2013-01-01T00:00:00Z', rowsOf(m, 'only'));
+          expectAggregates([path, 'reduce'], reduced.body.exchanges, [want]);
+          expect(reduced.body.exchanges[0].count).toBe(aggregated(rowsOf(m, 'only')).length);
+          expect(reduced.body.exchanges[0].count).toBeLessThan(swaps.length);
+          const candles = await get(`${path}?interval=1day&amm=only`);
+          expectAggregates([path, '1day'], candles.body.exchanges, candlesOf(m, '1day', inverted, rowsOf(m, 'only')));
+        }
+      }
+    });
+
+    it('candle pages hold the candles of the filtered exchanges, in both directions', async () => {
+      for (const mode of MODES) {
+        const path = `/v2/exchanges/${pairPath(mixed)}?interval=1hour&amm=${mode}`;
+        const whole = await get(path);
+        expectAggregates([path], whole.body.exchanges, candlesOf(mixed, '1hour', false, rowsOf(mixed, mode)));
+        for (const descending of [false, true]) {
+          const walked = (await pages(`${path}&descending=${descending}`, 1)).flatMap((p) => p.exchanges);
+          expect([mode, descending, walked]).toEqual([
+            mode,
+            descending,
+            descending ? [...whole.body.exchanges].reverse() : whole.body.exchanges,
+          ]);
+        }
+      }
+    });
+
+    it('autobridged=true and amm together aggregate the autobridged exchanges of the kind', async () => {
+      const autobridged = bridgedBoth.rows.filter((e) => e.row.autobridged_currency !== null);
+      for (const mode of MODES) {
+        const rows = kept(autobridged, mode).map((e) => e.row);
+        expect(rows.length).toBeGreaterThan(0);
+        const reduced = await get(`/v2/exchanges/${pairPath(bridgedBoth)}?reduce=true&autobridged=true&amm=${mode}`);
+        expectAggregates(['reduce', mode], reduced.body.exchanges, [
+          reducedOf(bridgedBoth, false, '2013-01-01T00:00:00Z', rows),
+        ]);
+      }
+    });
+
+    it('format=csv: the candles of swaps in the columns of the original', async () => {
+      const res = await get(`/v2/exchanges/${pairPath(mixed)}?interval=1day&amm=only&format=csv`);
+      const lines = res.text.split('\n');
+      expect(lines[0]).toBe(AGGREGATE_CSV_COLUMNS.map((c) => `"${c}"`).join(','));
+      expect(lines).toHaveLength(1 + candlesOf(mixed, '1day', false, rowsOf(mixed, 'only')).length);
+    });
+  });
+
+  describe('/v2/exchanges (all pairs)', () => {
+    it('amm unset, include, exclude and only list every exchange, the order-book ones and the swaps, oldest first', async () => {
+      for (const mode of [undefined, ...MODES]) {
+        const path = url('/v2/exchanges', 'limit=400', ammQuery(mode));
+        const want = kept(MIXED, mode);
+        const res = await get(path);
+        expect([path, res.body.count, res.body.marker]).toEqual([path, want.length, undefined]);
+        expect([path, res.body.exchanges]).toEqual([path, exchangesOf(want)]);
+      }
+      expect(kept(MIXED, 'only')).toHaveLength(138);
+      expect(kept(MIXED, 'exclude')).toHaveLength(197);
+    });
+
+    it('walks each list page by page, ascending and descending, whatever the size of the page', async () => {
+      for (const [mode, limits] of [
+        ['include', [60]],
+        ['exclude', [7, 50]],
+        ['only', [1, 7, 50]],
+      ] as const) {
+        const want = hashesOf(kept(MIXED, mode));
+        for (const limit of limits) {
+          const walked = (await pages(`/v2/exchanges?amm=${mode}`, limit)).flatMap(hashesIn);
+          expect([mode, limit, walked]).toEqual([mode, limit, want]);
+        }
+        const back = (await pages(`/v2/exchanges?amm=${mode}&descending=true`, 9)).flatMap(hashesIn);
+        expect([mode, 'descending', back]).toEqual([mode, 'descending', [...want].reverse()]);
+      }
+    });
+
+    it('a window of dates, and a marker in the middle of the swaps', async () => {
+      const from = '2026-10-16T00:00:00';
+      const before = '2026-10-17T00:00:00';
+      const day = closedBetween(MIXED, from, before);
+      expect(day.filter(isSwap).length).toBeGreaterThan(3);
+      expect(day.filter((e) => !isSwap(e)).length).toBeGreaterThan(3);
+      for (const mode of MODES) {
+        const res = await get(
+          url('/v2/exchanges', 'limit=400', `start=${from}`, 'end=2026-10-16T23:59:59', `amm=${mode}`),
+        );
+        expect([mode, res.body.exchanges]).toEqual([mode, exchangesOf(kept(day, mode))]);
+      }
+      const swaps = kept(MIXED, 'only');
+      const from3 = swaps[3];
+      const res = await get(`/v2/exchanges?amm=only&limit=400&marker=${markerOf(from3.row)}`);
+      expect(res.body.exchanges).toEqual(exchangesOf(swaps.slice(4)));
+      const back = await get(`/v2/exchanges?amm=only&limit=400&descending=true&marker=${markerOf(from3.row)}`);
+      expect(back.body.exchanges).toEqual(exchangesOf(swaps.slice(0, 3).reverse()));
+    });
+
+    it('autobridged=true and amm=only: the autobridged swaps', async () => {
+      const want = MIXED.filter((e) => isSwap(e) && e.row.autobridged_currency !== null);
+      expect(want).toHaveLength(2);
+      const res = await get('/v2/exchanges?autobridged=true&amm=only&limit=400');
+      expect(res.body.exchanges).toEqual(exchangesOf(want));
+      const none = await get('/v2/exchanges?autobridged=true&amm=exclude&limit=400');
+      expect(none.body.exchanges).toEqual(
+        exchangesOf(MIXED.filter((e) => !isSwap(e) && e.row.autobridged_currency !== null)),
+      );
+    });
+
+    it('format=csv: amm_account is a last column when a swap is on the page, and the usual columns when none is', async () => {
+      const book = await get('/v2/exchanges?format=csv&limit=400&amm=exclude');
+      const lines = book.text.split('\n');
+      // byte for byte the header of before AMM
+      expect(lines[0]).toBe(CSV_COLUMNS.map((c) => `"${c}"`).join(','));
+      expect(lines).toHaveLength(1 + 197);
+
+      const swaps = await get('/v2/exchanges?format=csv&limit=400&amm=only');
+      const rows = swaps.text.split('\n');
+      expect(rows[0]).toBe([...CSV_COLUMNS, 'amm_account'].map((c) => `"${c}"`).join(','));
+      expect(rows).toHaveLength(1 + 138);
+      const pools = kept(MIXED, 'only').map((e) => `"${e.row.amm_account}"`);
+      expect(rows.slice(1).map((row) => row.split(',').at(-1))).toEqual(pools);
+
+      // a page of both: the column is there, empty for the order-book rows
+      const both = await get('/v2/exchanges?format=csv&limit=400');
+      const all = both.text.split('\n');
+      expect(all[0]).toBe([...CSV_COLUMNS, 'amm_account'].map((c) => `"${c}"`).join(','));
+      all.slice(1).forEach((row, i) => {
+        const e = MIXED[i];
+        expect([i, row.split(',').at(-1)]).toEqual([i, isSwap(e) ? `"${e.row.amm_account}"` : '""']);
+      });
+    });
+
+    it('the pair route has the column too, and is named as before', async () => {
+      const res = await get(`/v2/exchanges/${pairPath(mixed)}?format=csv&limit=400&amm=only`);
+      expect(res.headers['content-disposition']).toBe(
+        csvDisposition(`exchanges - ${mixed.base.currency}-${mixed.counter.currency}`),
+      );
+      expect(res.text.split('\n')[0].endsWith(',"amm_account"')).toBe(true);
+    });
+  });
+
+  describe('an amm that is none of the three', () => {
+    const PAIR_PATH = `/v2/exchanges/${pairPath(mixed)}`;
+    const routes = [
+      PAIR_PATH,
+      `${PAIR_PATH}?interval=1day`,
+      `${PAIR_PATH}?reduce=true`,
+      `${PAIR_PATH}?format=csv`,
+      '/v2/exchanges',
+      '/v2/exchanges?format=csv',
+    ];
+
+    it('is 400 invalid amm filter - use: include, exclude, only, on every route that takes it', async () => {
+      for (const route of routes) {
+        for (const amm of ['nonsense', 'ONLY', 'Exclude', 'true', '1', 'none', '%20only']) {
+          const path = url(route, `amm=${amm}`);
+          const res = await get(path);
+          expect([path, res.status, res.body]).toEqual([path, 400, { result: 'error', message: MESSAGE }]);
+        }
+      }
+    });
+
+    it('is the first value that counts: a bad one first is an error, a good one first is not', async () => {
+      expect((await get(`${PAIR_PATH}?amm=nope&amm=only`)).status).toBe(400);
+      expect((await get(`${PAIR_PATH}?amm=only&amm=nope`)).status).toBe(200);
+    });
+
+    it('is checked after the pair, start, end and limit, and before the interval and reduce and the marker', async () => {
+      const bad = (extra: string): string => `${extra}&amm=nonsense`;
+      const message = async (path: string): Promise<unknown> => (await get(path)).body.message;
+      expect(await message(`/v2/exchanges/USD/XRP?${bad('limit=abc')}`)).toBe('base issuer is required');
+      expect(await message(`${PAIR_PATH}?${bad('start=2015x')}`)).toBe('invalid start date format');
+      expect(await message(`${PAIR_PATH}?${bad('end=2015x')}`)).toBe('invalid end date format');
+      expect(await message(`${PAIR_PATH}?${bad('limit=abc')}`)).toBe('invalid limit: NaN');
+      expect(await message(`${PAIR_PATH}?${bad('reduce=true&interval=1day')}`)).toBe(MESSAGE);
+      expect(await message(`${PAIR_PATH}?${bad('interval=3weeks')}`)).toBe(MESSAGE);
+      expect(await message(`${PAIR_PATH}?${bad('marker=garbage')}`)).toBe(MESSAGE);
+      // a good filter changes none of the other answers
+      expect(await message(`${PAIR_PATH}?amm=only&marker=garbage`)).toBe('invalid marker');
+      expect(await message(`${PAIR_PATH}?amm=only&interval=3weeks`)).toBe('invalid interval: 3weeks');
+      expect(await message(`${PAIR_PATH}?amm=only&reduce=true&interval=1day`)).toBe('cannot use reduce with interval');
+      expect(await message('/v2/exchanges?amm=only&limit=abc')).toBe('invalid limit: NaN');
+      expect(await message('/v2/exchanges?limit=abc&amm=nonsense')).toBe('invalid limit: NaN');
+      expect(await message('/v2/exchanges?amm=nonsense&marker=garbage')).toBe(MESSAGE);
+    });
+  });
+
+  describe('the SQL', () => {
+    /** The text of the read of `exchanges` inside the capped inner select of a page. */
+    const inner = (sql: string): string => innerRead(sql);
+
+    it('the condition is inside the read that is capped, never after the page: amm=only and amm=exclude, bound and in order', async () => {
+      for (const [mode, condition] of [
+        ['only', "amm_account != ''"],
+        ['exclude', "amm_account = ''"],
+      ] as const) {
+        for (const descending of [false, true]) {
+          for (const m of [mixed, swapsOnly]) {
+            const query = jest.spyOn(h.ch, 'query');
+            await get(
+              `/v2/exchanges/${pairPath(m)}?limit=3&amm=${mode}&descending=${descending}&marker=${markerOf(m.rows[1].row)}`,
+            );
+            const calls = exchangesCalls(query);
+            jest.restoreAllMocks();
+            expect(calls).toHaveLength(1);
+            const [sql, params] = calls[0] as [string, Record<string, unknown>];
+            const where = [mode, descending, pairPath(m)];
+            expect([...where, inner(sql).includes(condition)]).toEqual([...where, true]);
+            // not once more outside the read: the page is cut by the LIMIT of the read, and the filter is what it counts
+            expect([...where, sql.split(condition).length - 1]).toEqual([...where, 1]);
+            expect(sql).not.toMatch(/\bFINAL\b/);
+            await expectBoundedInOrderRead(h, sql, params, descending, where);
+          }
+        }
+      }
+    });
+
+    it('include adds no condition: amm=include reads what no amm reads', async () => {
+      const readOf = async (query: string): Promise<string> => {
+        const spy = jest.spyOn(h.ch, 'query');
+        await get(`/v2/exchanges/${pairPath(mixed)}?limit=3${query}`);
+        const calls = exchangesCalls(spy);
+        jest.restoreAllMocks();
+        expect(calls).toHaveLength(1);
+        return String(calls[0][0]);
+      };
+      const include = await readOf('&amm=include');
+      // the column is read (it is in the object of a swap), but nothing is asked of it
+      expect(include).not.toMatch(/amm_account\s*(!=|=)/);
+      expect(await readOf('')).toBe(include);
+    });
+
+    it('interval and reduce: every read of exchanges has the condition, the buckets of the page and their aggregation', async () => {
+      for (const [mode, condition] of [
+        ['only', "amm_account != ''"],
+        ['exclude', "amm_account = ''"],
+      ] as const) {
+        const query = jest.spyOn(h.ch, 'query');
+        await get(`/v2/exchanges/${pairPath(mixed)}?interval=1hour&limit=2&amm=${mode}`);
+        const candles = exchangesCalls(query).map(([sql]) => String(sql));
+        jest.restoreAllMocks();
+        expect(candles).toHaveLength(2);
+        for (const sql of candles) expect([mode, sql.includes(condition)]).toEqual([mode, true]);
+
+        const reduce = jest.spyOn(h.ch, 'query');
+        await get(`/v2/exchanges/${pairPath(mixed)}?reduce=true&amm=${mode}`);
+        const reads = exchangesCalls(reduce).map(([sql]) => String(sql));
+        jest.restoreAllMocks();
+        expect(reads).toHaveLength(1);
+        expect([mode, reads[0].includes(condition)]).toEqual([mode, true]);
+      }
+    });
+
+    it('/v2/exchanges: the condition is in the read of the exchanges of the window', async () => {
+      for (const [mode, condition] of [
+        ['only', "amm_account != ''"],
+        ['exclude', "amm_account = ''"],
+      ] as const) {
+        const query = jest.spyOn(h.ch, 'query');
+        await get(`/v2/exchanges?limit=3&amm=${mode}`);
+        const reads = exchangesCalls(query).map(([sql]) => String(sql));
+        jest.restoreAllMocks();
+        expect(reads.length).toBeGreaterThan(0);
+        for (const sql of reads) expect([mode, sql.includes(condition)]).toEqual([mode, true]);
+      }
+    });
+
+    it('/v2/exchanges?amm=only reads the range once: the ledgers count the order-book exchanges too, so they size no window', async () => {
+      const query = jest.spyOn(h.ch, 'query');
+      const res = await get('/v2/exchanges?limit=3&amm=only');
+      expect(hashesIn(res.body)).toEqual(hashesOf(kept(MIXED, 'only').slice(0, 3)));
+      expect(exchangesCalls(query)).toHaveLength(1);
+      const ledgers = query.mock.calls.filter(([q]) => new RegExp(`FROM ${Table.Ledgers}\\b`).test(String(q)));
+      // the range of the dates (one read of the ledgers), no window edge
+      expect(ledgers.every(([q]) => !String(q).includes('exchanges_count'))).toBe(true);
+    });
+  });
+});
+
+describe('exchanges API endpoint: swaps that were written twice (the amm filter)', () => {
+  // The tables are ReplacingMergeTree and no list uses FINAL: until a merge a row can be there twice. The swaps of one
+  // ledger are written a second time (a real duplicate: merges stopped, a separate insert, no insert deduplication).
+  const SEED = 'ripple-mock+amm';
+  const MIXED = [...fixtureExchanges(SEED)].sort(byKey);
+  const isSwap = (e: FixtureExchange): boolean => e.row.amm_account !== '';
+  const markets = marketsOf(MIXED);
+  const swapCounts = new Map<number, number>();
+  for (const e of MIXED.filter(isSwap))
+    swapCounts.set(e.row.ledger_index, (swapCounts.get(e.row.ledger_index) ?? 0) + 1);
+  const LEDGER = [...swapCounts.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0][0];
+  const written = MIXED.filter((e) => e.row.ledger_index === LEDGER);
+  // the pair with the most swaps in that ledger
+  const market = marketsOf(written.filter(isSwap)).sort((a, b) => b.rows.length - a.rows.length)[0];
+  const full = markets.find(
+    (m) => pathOf(m.base) === pathOf(market.base) && pathOf(m.counter) === pathOf(market.counter),
+  ) as Market;
+  const path = `/v2/exchanges/${pathOf(full.base)}/${pathOf(full.counter)}`;
+
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  const pages = (p: string, limit: number): Promise<ListBody[]> => api.pages<ListBody>(p, limit, 'exchanges');
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: SEED, env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.Exchanges}`);
+    await h.ch.command(
+      `INSERT INTO ${Table.Exchanges} SELECT * FROM ${Table.Exchanges} WHERE ledger_index = {index:UInt32}`,
+      { index: LEDGER },
+      { settings: { insert_deduplicate: 0 } },
+    );
+    const [{ n }] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM ${Table.Exchanges} WHERE ledger_index = {index:UInt32}`,
+      { index: LEDGER },
+    );
+    expect(Number(n)).toBe(written.length * 2);
+    const [{ swaps }] = await h.ch.query<{ swaps: string }>(
+      `SELECT count() AS swaps FROM ${Table.Exchanges} WHERE ledger_index = {index:UInt32} AND amm_account != ''`,
+      { index: LEDGER },
+    );
+    expect(Number(swaps)).toBe(written.filter(isSwap).length * 2);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('lists the swaps of a pair once, each mode, page by page', async () => {
+    expect(full.rows.filter((e) => e.row.ledger_index === LEDGER && isSwap(e)).length).toBeGreaterThan(0);
+    for (const mode of ['include', 'exclude', 'only'] as const) {
+      const want =
+        mode === 'exclude'
+          ? full.rows.filter((e) => !isSwap(e))
+          : mode === 'only'
+            ? full.rows.filter(isSwap)
+            : full.rows;
+      const unpaged = await get(`${path}?limit=400&amm=${mode}`);
+      expect([mode, unpaged.body.exchanges]).toEqual([mode, exchangesOf(want)]);
+      for (const limit of [1, 2, 3]) {
+        const walked = (await pages(`${path}?amm=${mode}`, limit)).flatMap(hashesIn);
+        expect([mode, limit, walked]).toEqual([mode, limit, hashesOf(want)]);
+      }
+    }
+  });
+
+  it('lists the swaps of the whole range once', async () => {
+    const want = MIXED.filter(isSwap);
+    const unpaged = await get('/v2/exchanges?amm=only&limit=400');
+    expect(unpaged.body.exchanges).toEqual(exchangesOf(want));
+    for (const limit of [1, 5]) {
+      const walked = (await pages('/v2/exchanges?amm=only', limit)).flatMap(hashesIn);
+      expect([limit, walked]).toEqual([limit, hashesOf(want)]);
+    }
+  });
+
+  it('aggregates the swaps once: candles and reduce', async () => {
+    for (const mode of ['include', 'only'] as const) {
+      const rows = (mode === 'only' ? full.rows.filter(isSwap) : full.rows).map((e) => e.row);
+      for (const inverted of [false, true]) {
+        const p = inverted ? `/v2/exchanges/${pathOf(full.counter)}/${pathOf(full.base)}` : path;
+        const candles = await get(`${p}?interval=1day&amm=${mode}`);
+        expectAggregates([p, mode], candles.body.exchanges, candlesOf(full, '1day', inverted, rows));
+        const reduced = await get(`${p}?reduce=true&amm=${mode}`);
+        expectAggregates([p, mode], reduced.body.exchanges, [reducedOf(full, inverted, '2013-01-01T00:00:00Z', rows)]);
+      }
+    }
+  });
+});
+
 describe('exchanges API endpoint on Xahau (synthetic rows: the recorded ledgers hold no exchange)', () => {
   const ISSUER = 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De';
   const ledgers = fixtureSource('xahau-recorded').list();
@@ -2742,6 +3491,7 @@ describe('exchanges API endpoint on Xahau (synthetic rows: the recorded ledgers 
       taker: 'rnCEEqDnCuSjDsHiJrca4VYUqaMyi4vGF7',
       provider: 'rBun4BLewDvTfLHQLqWuAnqucTzwaoPXoD',
       offer_sequence: 12,
+      amm_account: '',
       autobridged_currency: null,
       autobridged_issuer: null,
       tx_type: 'OfferCreate',
@@ -2931,6 +3681,7 @@ describe.each([
       taker: takerBuys ? BUYER : SELLER,
       provider: takerBuys ? SELLER : BUYER,
       offer_sequence: 7,
+      amm_account: '',
       autobridged_currency: null,
       autobridged_issuer: null,
       tx_type: 'OfferCreate',

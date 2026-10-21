@@ -31,6 +31,11 @@ export interface ExchangeObject {
   base_issuer?: string;
   counter_currency: string;
   counter_issuer?: string;
+  /**
+   * The pool, on a swap against an AMM pool (the pool is also the `provider`, and `offer_sequence` is 0). The last key,
+   * and there only when the exchange was a swap: an order-book exchange is served exactly as before AMM.
+   */
+  amm_account?: string;
 }
 
 /** The columns of `exchanges` the API reads: what `StoredExchange` holds, with the close time as unix seconds. */
@@ -55,6 +60,7 @@ export const EXCHANGE_COLUMNS = [
   'autobridged_currency',
   'autobridged_issuer',
   'tx_type',
+  'amm_account',
 ].join(', ');
 
 /** A row of `exchanges` as `EXCHANGE_COLUMNS` reads it. The Float64 shadows and the client are not read. */
@@ -80,6 +86,7 @@ export type StoredExchange = Pick<
   | 'autobridged_currency'
   | 'autobridged_issuer'
   | 'tx_type'
+  | 'amm_account'
 >;
 
 /**
@@ -121,6 +128,8 @@ export function toExchangeObject(row: StoredExchange, inverted = false): Exchang
     ...(base.issuer !== '' && { base_issuer: base.issuer }),
     counter_currency: counter.currency,
     ...(counter.issuer !== '' && { counter_issuer: counter.issuer }),
+    // the pool of a swap, from either side; an order-book exchange stores '' and has no such key
+    ...(row.amm_account !== '' && { amm_account: row.amm_account }),
   };
 }
 
@@ -152,13 +161,18 @@ export const EXCHANGE_CSV_COLUMNS = [
  * The exchange as a row of the CSV: every column, in the order of the original, `null` (an empty cell) where the
  * exchange has none. The original rewrote its first row this way "to ensure consistent order and inclusion of all
  * fields", because a CSV takes its columns from the keys of the rows, and the first row may lack some.
+ *
+ * A swap against an AMM pool adds one more column, `amm_account`, last: like the key of the JSON it is there only for a
+ * swap, so a CSV of order-book exchanges has the columns it had before AMM, and a CSV that has a swap has the column
+ * (empty for the order-book rows, as every column a row lacks is).
  */
 export function toCsvRow(
   exchange: ExchangeObject,
-): Record<(typeof EXCHANGE_CSV_COLUMNS)[number], string | number | null> {
+): Record<(typeof EXCHANGE_CSV_COLUMNS)[number], string | number | null> & { amm_account?: string } {
   const fields = exchange as unknown as Record<string, string | number | undefined>;
-  return Object.fromEntries(EXCHANGE_CSV_COLUMNS.map((column) => [column, fields[column] ?? null])) as Record<
+  const columns = Object.fromEntries(EXCHANGE_CSV_COLUMNS.map((column) => [column, fields[column] ?? null])) as Record<
     (typeof EXCHANGE_CSV_COLUMNS)[number],
     string | number | null
   >;
+  return { ...columns, ...(exchange.amm_account !== undefined && { amm_account: exchange.amm_account }) };
 }

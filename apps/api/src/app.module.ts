@@ -17,6 +17,7 @@ import cors from 'cors';
 import { NextFunction, Request, Response } from 'express';
 import { AccountsModule } from './accounts/accounts.module';
 import { ActiveAccountsModule } from './active-accounts/active-accounts.module';
+import { AmmModule } from './amm/amm.module';
 import { ApiKeyGuard } from './auth/api-key.guard';
 import { ApiThrottlerGuard } from './common/api-throttler.guard';
 import { CommonModule } from './common/common.module';
@@ -77,6 +78,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ValidationsModule,
   ValidatorsModule,
   StatsModule,
+  AmmModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

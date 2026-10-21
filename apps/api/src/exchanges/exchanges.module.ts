@@ -6,5 +6,7 @@ import { ExchangesService } from './exchanges.service';
 @Module({
   controllers: [ExchangesController],
   providers: [ExchangesService],
+  // the swaps of a pool (`AmmModule`) are the pair read of this service with the pool's account
+  exports: [ExchangesService],
 })
 export class ExchangesModule {}

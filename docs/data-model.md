@@ -6,14 +6,14 @@ The source of truth is the migration files of [`packages/shared/schema/`](../pac
 [`003_account_market_aggregates.sql`](../packages/shared/schema/003_account_market_aggregates.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **42 tables** per network database, in six groups:
+enum: queries use `${Table.X}`, never string literals). **49 tables** per network database, in six groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
-| Ledger-derived (14) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created` | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
+| Ledger-derived (19) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, and the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance` | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
 | Node-sourced (3) | `fee_stats`, `validations`, `validator_manifests` | the `fee_stats` and `validations` workers |
 | Validators and amendments (10, migration 002) | `validator_validations`, `validator_seen`, `unl_lists`, `unl_publishers`, `validator_domains`, `network_state`, `amendment_features`, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly` | the `validations` worker (the first two) and the `validators` worker (the rest) |
-| Aggregates (3) | `stats_hourly`, `volume_daily`, `volume_live` | the `aggregator` worker |
+| Aggregates (5) | `stats_hourly`, `volume_daily`, `volume_live`, `amm_pools`, `amm_daily` | the `aggregator` worker |
 | Account and market aggregates (9, migration 003) | `native_rates_daily`, `pair_hourly`, `markets_live`, `account_rollup_state`, `account_partition_rows`, `account_rollup_days`, `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the `aggregator` worker (jobs `rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) |
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
 
@@ -33,9 +33,9 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 
 | Kind | Engine | Partition | Why |
 | --- | --- | --- | --- |
-| Ledger-prefixed (`ledgers`, `transactions`, `payments`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
-| Prefix-keyed secondary tables and `exchanges` | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
-| `accounts_created`, `volume_live`, `stats_hourly`, internal | `ReplacingMergeTree` | none (`volume_daily`: `toYYYYMM(day)`) | Small tables |
+| Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
+| Prefix-keyed secondary tables, `exchanges` and the AMM tables ordered by pool or account | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
+| `accounts_created`, `volume_live`, `stats_hourly`, `amm_pools`, internal | `ReplacingMergeTree` | none (`volume_daily` and `amm_daily`: `toYYYYMM(day)`) | Small tables |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
 | The nine tables of migration 003 | `ReplacingMergeTree(version)` | `toYear(day)` for the rates and the account rollups, `toDate(hour)` for `pair_hourly` (TTL 45 days, `ttl_only_drop_parts = 1`), none for the others | Recomputable aggregates written as complete sets; a year of days is a small partition, an hour table expires by whole days |
 | `validations` | `AggregatingMergeTree` | `toYYYYMMDD(last_datetime)`, TTL 90 days | Partial sightings add up |
@@ -44,7 +44,7 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | The other validators and amendments tables | `ReplacingMergeTree` | none | Small tables, newest row (or newest `version`) wins |
 
 `ORDER BY` of a `ReplacingMergeTree` is its **natural unique key**. That is a safety net only: list queries never use `FINAL`, and
-recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 14 ledger-derived tables carry
+recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 19 ledger-derived tables carry
 `non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped; the
 two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason. The nine tables of
 migration 003 have no window: a set is written whole under a new `version`, so a retry is idempotent without one.
@@ -89,7 +89,7 @@ and [ADR-0003](adr/0003-no-final-on-list-queries.md).
 Header and summary of a ledger; **the commit marker**. Columns: `ledger_index UInt32`, `ledger_hash`, `parent_hash`, `account_hash`,
 `transaction_hash` (String), `total_coins UInt64`, `close_time`, `parent_close_time` (DateTime), `close_time_resolution UInt8`,
 `close_flags UInt8`, `tx_count UInt32`, `type_counts` / `result_counts Map(LowCardinality(String), UInt32)`, `payments_count`,
-`exchanges_count`, `accounts_created UInt32`, `fee_total`, `fee_min`, `fee_max UInt64` (drops), `parser_version UInt16`,
+`exchanges_count` (order-book exchanges and AMM swaps), `accounts_created UInt32`, `fee_total`, `fee_min`, `fee_max UInt64` (drops), `parser_version UInt16` (2 since the AMM parser: a ledger written by version 1 has no AMM rows, see [backfill](backfill.md#amm-data-re-ingest)),
 `ingested_at DateTime DEFAULT now()`; skip index `close_time_mm` (`minmax` on `close_time`, granularity 1). Read by `/ledgers`,
 `/last_validated`, `/network/fees`, the stats rollup, the date resolver of every list.
 
@@ -148,12 +148,24 @@ baseline keeps the old key (`CREATE TABLE IF NOT EXISTS`) and fails the checksum
 One row per trade. **The pair is stored in Ripple's canonical order** (lexicographic on the lower-cased `currency+issuer`), so a pair
 is a prefix of the primary key and a request for the reverse order is read as stored and inverted. Columns: the pair, the key tail,
 `tx_hash`, `close_time`, `base_amount`, `counter_amount`, `rate` (exact strings) with `base_amount_f`, `counter_amount_f`, `rate_f`,
-`buyer`, `seller`, `taker`, `provider`, `offer_sequence`, `autobridged_currency` / `autobridged_issuer Nullable(String)`, `tx_type`,
-`client Nullable(String)`. A trade with a zero leg or an MPT amount is skipped. Read by the pair endpoints, rates, normalize, active
-accounts and the trade volume aggregation.
+`buyer`, `seller`, `taker`, `provider`, `offer_sequence`, `amm_account String`, `autobridged_currency` / `autobridged_issuer
+Nullable(String)`, `tx_type`, `client Nullable(String)`, and the skip index `amm_account_set` (`amm_account TYPE set(1024) GRANULARITY 1`).
+A trade with a zero leg or an MPT amount is skipped. Read by the pair endpoints, rates, normalize, active accounts, the trade volume
+aggregation and the AMM jobs.
+
+**AMM swaps are exchanges** ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)). A swap against a pool is a row of this table,
+written by the AMM parser, with `amm_account` the pool account and `''` for an order-book trade. In an AMM row `provider` is the pool
+account and `offer_sequence` is 0; the amounts are the pool's deltas, so on the asset the pool pays out they include the issuer's
+transfer fee (Ruling R-A10). `node_index` is the index, in `AffectedNodes`, of the pool account's `AccountRoot` node, or of the pool's
+first reserve line (a trust line with `lsfAMMNode`) when that node is absent (an IOU/IOU pool): that keeps the key unique, because
+order-book rows never use those nodes. `amm_account` is not in the key. The set index (Ruling R-A1) is what lets `amm=only` reads and the
+swap reads of the AMM jobs skip the granules that hold no swap. The `amm` filter is a condition of the capped read itself (`only`:
+`amm_account != ''`, `exclude`: `amm_account = ''`, `include`: none), never a step after the page, which would leave pages short.
 
 ### `account_exchanges` (P7, `ORDER BY (account, ledger_index, tx_index, node_index)`)
-A full copy of every `exchanges` row per participating account (a self-trade appears once). Read by `/accounts/{a}/exchanges`.
+A full copy of every `exchanges` row per participating account (a self-trade appears once), `amm_account` and its `amm_account_set`
+index included. A swap is copied for its taker and for the pool, which is its buyer or its seller, so a pool account lists its own
+swaps here too. Read by `/accounts/{a}/exchanges`.
 
 ### `balance_changes` (P7, `ORDER BY (account, ledger_index, tx_index, node_index)`)
 `account`, key tail, `tx_hash`, `close_time`, `currency`, `counterparty` (`''` for the native currency), `amount_change`,
@@ -166,7 +178,107 @@ transaction is a row with `node_index = -1` (hidden in output). Read by `/accoun
 (nullable, empty until a history import loads ledger 32570); bloom-filter index on `account`. The lookup returns the **latest**
 creation of an address. Read by `/accounts` and `/accounts/{a}`.
 
+### AMM tables (five ledger tables, two aggregates)
+
+Written together with the other ledger tables, so they are in `CHILD_TABLES`, in `LEDGER_KEYED_TABLES`, have the deduplication window
+and are deleted by recovery and `--reprocess` partition by partition. Every one is rebuilt by re-ingesting a ledger range
+(`PARSER_VERSION` 2). Readers of all five read up to the newest committed ledger (`ledgers`), never past it. Amounts are exact `String`s
+in whole units; the fee is `UInt16` in units of 1/100000; the pair is in Ripple's canonical order (`base_*`, `counter_*`).
+
+#### `amm_pool_states` (P7, `ORDER BY (amm_account, ledger_index, tx_index)`)
+One row per pool and transaction that touched it: `tx_hash`, `close_time`, `tx_type`, the pair (`base_currency`, `base_issuer`,
+`counter_currency`, `counter_issuer`), `reserve_base`, `reserve_counter`, `lp_supply`, `lp_currency` (`Nullable(String)`),
+`reserve_base_f`, `reserve_counter_f`, `lp_supply_f`, `auction_price_f` (Float64 shadows, Ruling R-A8), `trading_fee Nullable(UInt16)`,
+`auction_holder`, `auction_price`, `auction_discounted_fee Nullable(UInt16)`, `auction_expiration Nullable(UInt32)` (Ripple seconds) and
+`deleted UInt8`. Skip index `ledger_mm` (`minmax` on `ledger_index`, Ruling R-A2).
+
+**A value is filled whenever its node is present in the transaction's metadata** (the value after the transaction, whether or not the
+transaction changed it), and is `NULL` when the metadata has no such node: a swap through an XRP/IOU pool says nothing of the LP supply,
+the fee or the auction slot, a vote nothing of the reserves. **Readers carry the last known value forward**: a column's value after a
+row is its newest non-null value over that row and the rows before it. `deleted` is 1 when the transaction deleted the `AMM` node or the
+pool's `AccountRoot`; `lp_supply` is then `'0'` if the `AMM` node was in the metadata. The same transaction can touch several pools (one
+row each). The `ledger_mm` index prunes nothing once the parts have merged, because the table is ordered by pool: scans by ledger
+read `amm_pool_touches` instead.
+
+#### `amm_pool_touches` (P6, `ORDER BY (ledger_index, tx_index, amm_account)`)
+One row per `amm_pool_states` row with only those three columns: a narrow index in the order of the ledgers (Ruling R-A14). The aggregator's
+watermark scan, the `agg_dirty` slices and the day scans ("which pools were touched in these ledgers, and since when") read it by a
+range of its primary key; the one scan that reads all of it is the stale-pool scan at the start of the aggregator.
+
+#### `amm_liquidity` (P7, `ORDER BY (amm_account, ledger_index, tx_index)`)
+One row per `create`, `deposit`, `withdraw`, `clawback` or `delete`: `tx_hash`, `close_time`, `account` (the liquidity provider; the
+`Holder` of a clawback), `initiator` (the sender), `event`, `mode` (`''` when the event has none), `base_amount`, `counter_amount`
+(signed, from the pool's side: positive into the pool), `lp_tokens` (positive minted, negative burned) and the `*_f` shadows. Skip
+index `ledger_mm`. Read by `/amm/pools/{pool}/liquidity`; the earliest `create` row gives `amm_pools.created_ledger` and `created_by`.
+
+#### `account_amm_liquidity` (P7, `ORDER BY (account, ledger_index, tx_index, amm_account)`)
+The per-account index of `amm_liquidity`: the same columns, ordered by account (as `account_payments` is for payments). Read by
+`/accounts/{a}/amm_liquidity`.
+
+#### `amm_governance` (P7, `ORDER BY (amm_account, ledger_index, tx_index)`)
+One row per `AMMVote` or `AMMBid`: `kind` (`vote` or `bid`), `account`, `fee_voted`, `trading_fee_after` (votes), `bid_min`, `bid_max`,
+`price_paid` (the LP tokens a bid burned), `slot_holder`, `slot_discounted_fee`, `slot_expiration` (the slot after the bid) and
+`auth_accounts Array(String)`. Skip index `ledger_mm`. Read by `/amm/pools/{pool}/governance`, and by `amm_daily` for the authorized
+accounts of the holder's last bid.
+
+#### `amm_pools` (no partition, `ReplacingMergeTree(version)`, `ORDER BY amm_account`)
+The current state of each pool, for the pool list. Columns: the pair, `lp_currency`, `created_ledger` / `created_by` (`Nullable`: null
+for a pool whose creation was not ingested), `last_ledger` (the newest state row the row has seen), `reserve_base`, `reserve_counter`,
+`lp_supply`, `trading_fee`, the four auction columns, `deleted`, `value_native Nullable(Float64)` (null when no asset has a rate, and for a
+deleted pool) and `version`. **Written by the aggregator, never by ingest**: every recompute of a pool writes a whole new row under a
+newer version, rebuilt from `amm_pool_states` by the fill-forward, so a recovery delete of a newer state row cannot lose a pool's state
+after merges. **Readers keep the newest version of each pool without `FINAL`**: `ORDER BY amm_account, version DESC LIMIT 1 BY
+amm_account`, and what a pool can lose between versions (`deleted`) is filtered after that. A recompute of a pool that has no state row
+left (a re-ingest dropped them all) deletes its rows with a lightweight `DELETE` (Ruling R-A28).
+
+#### `amm_daily` (`toYYYYMM(day)`, `ReplacingMergeTree(version)`, `ORDER BY (amm_account, day)`)
+One row per pool and UTC day with activity, with the closing state of the pool: the pair, `swap_count`, `volume_base`, `volume_counter`
+(the amounts that went into the pool, by side), `fees_base_est`, `fees_counter_est` (estimates, `Nullable(String)`: null when a swap into
+that side had no known fee, Ruling R-A26), `deposit_count`, `withdraw_count`,
+`liquidity_in_base`, `liquidity_in_counter`, `liquidity_out_base`, `liquidity_out_counter`, the end-of-day `reserve_base`,
+`reserve_counter`, `lp_supply`, `trading_fee`, `value_native`, then `final`, `config_version` and `version`. Written by the aggregator.
+
+**A day is a version set.** One insert writes, under one `version`, a row for every pool with activity that day and a **sentinel** row
+(`amm_account = ''`, empty assets, zero amounts and counts, null state) that stands for the day: a day without any pool is still a set,
+which is how it is known to be computed. **The sentinel carries the version of the set; readers keep the pool rows with that version**
+and never return the sentinel itself or a row of an older set, so a pool-day that vanished from a recompute (a re-ingest removed its
+activity) has no row in the newest set and is not served. The sentinel read is a prefix of the primary key (`WHERE amm_account = '' AND
+day = ...`), and the API applies the rule inside its capped read: `(day, version) IN (SELECT day, max(version) ... WHERE amm_account = ''
+... GROUP BY day)`. Nothing relies on a merge. A day whose recompute failed on the dirty path is **marked owed**: its newest set is
+copied under a newer version with `final = 0` (Ruling R-A27), so readers see the same rows and the day is no longer done.
+
+`final` is 1 on the sentinel of a set made once the ingest had passed the day (the newest committed ledger closed at least an hour after
+its end, Ruling R86) and 0 on every other row. `config_version` is the version of the computation, `AMM_DAILY_CONFIG_VERSION` (1 today)
+in `packages/shared/src/aggregate/amm-daily.job.ts`. **Bump it whenever a change makes the rows come out differently**: a day counts
+as done only for a final set of the current number, so a bump makes the aggregator compute every closed day again (the back-fill, newest
+first). The version is the ClickHouse clock in milliseconds, never lower than one more than the day's newest.
+
+#### The AMM reader rules
+- **Committed head.** Every AMM read is capped at the newest `ledgers` row: the writer fills the tables of a ledger at the same time and
+  writes the marker last, so a row above it may be there while another table's rows are not.
+- **Pool prefix.** The history, liquidity and governance of a pool are a range of the primary key (the pool, then the ledgers), read a
+  page at a time by `readDistinctPage`. The filters (`event`, `account`, `type`) are conditions of the inner capped read, never a step
+  after the page.
+- **Narrow account index.** The per-account lists read `account_amm_liquidity` (the account, then the ledgers), with the `pool` filter
+  inside the read.
+- **LP positions** read `balance_changes` (an LP token is a trust line issued by the pool, so the ledger tables already record it): the
+  account's rows up to the ledger asked for with `match(currency, '^03[0-9A-Fa-f]{38}$')`, grouped to the latest balance of each
+  `(currency, counterparty)` (`argMax(final_balance, (ledger_index, tx_index, node_index))`). A line is a position only when its
+  counterparty is a pool whose LP currency, as of that ledger, is the line's currency. There is no currency index on this table: the
+  read is bounded by the account prefix.
+- **Fill-forward** (`fillForward`, shared by the jobs and the API): the state rows of a window of ledgers before the point asked for, per
+  pool, a range of the primary key (`argMaxIf(column, (ledger_index, tx_index), isNotNull(column))`), and, for the pools the window leaves
+  incomplete and that have older rows, older ledgers in doubling steps until every column has a value or the pool's own first state
+  ledger is reached (one grouped read finds those ledgers; Rulings R-A21, R-A23 and R-A25).
+  The answer is exactly the one the whole history gives. The window is `AMM_FILL_WINDOW_LEDGERS` (160,000 ledgers, about a week) for
+  the aggregators and `AMM_HISTORY_CARRY_LEDGERS` (2,048, about two hours) for the history of a pool and for positions. Pools are read in
+  batches of `AMM_POOLS_CHUNK` / `AMM_CHUNK` (200).
+- **Pair key for swaps.** The swaps of a pool are read through the pair prefix of `exchanges` and the `amm_account_set` index; the
+  exchanges are never scanned across pairs (Rulings R-A3 and R-A18).
+
 ## 3. Node-sourced, aggregate and internal tables
+
+The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM tables above.
 
 | Table | Key / engine | Contents | Used by |
 | --- | --- | --- | --- |
@@ -184,8 +296,8 @@ creation of an address. Read by `/accounts` and `/accounts/{a}`.
 | `amendment_tallies` | `ReplacingMergeTree(version)`, `ORDER BY (amendment_id, ledger_index)` | Per voting ledger and amendment: `yes`, `trusted`, `threshold`, `unl_size`, `observed`; the sentinel row (`amendment_id = ''`) also holds `unl`, `negative_unl` and the fees in force. A **version set** | validators worker, amendments endpoints |
 | `validator_agreement_hourly` | `ReplacingMergeTree(version)`, `ORDER BY (hour, validation_public_key)`, TTL 400 d on `hour` | Per hour and validator: `agreed`, `missed`, `partial`, `last_seen`; the sentinel row (`validation_public_key = ''`) holds the hour's `ledgers`, `unobserved`, `gaps`, `unl_size`, `quorum` and `final`. A **version set** | validators worker, validators endpoints |
 | `stats_hourly` | `ReplacingMergeTree(version)`, `ORDER BY hour` | Per hour: `transaction_count`, `payments_count`, `exchanges_count`, `accounts_created`, `ledger_count`, `first_close_time`, `last_close_time`, `type_counts`, `result_counts` (`Map(..., UInt64)`), `version` | `/stats` |
-| `volume_daily` | `ReplacingMergeTree(version)`, `ORDER BY (metric, day, component)`, `toYYYYMM(day)` | Per metric (`trade_volume` / `payment_volume`) and UTC day, one row per component (market or currency): the pair, `amount` (exact string) and `amount_f`, `count`, `rate_f`, `converted_f` (value in the native currency), `config_version`, `version`. A sentinel row (empty component) marks a computed day with no volume. A day's rows are written as one set under one `version`; readers keep the highest | `/network/*_volume` (historical) |
-| `volume_live` | `ReplacingMergeTree(version)`, `ORDER BY (metric, period, component)` | The same for the rolling live periods, with `start_time`, `end_time` | `/network/*_volume` (live) |
+| `volume_daily` | `ReplacingMergeTree(version)`, `ORDER BY (metric, day, component)`, `toYYYYMM(day)` | Per metric (`trade_volume` / `payment_volume` / `amm_volume`) and UTC day, one row per component (market or currency; for `amm_volume` the **pool account**): the pair, `amount` (exact string) and `amount_f`, `count`, `rate_f`, `converted_f` (value in the native currency), `config_version`, `version`. A sentinel row (empty component) marks a computed day with no volume. A day's rows are written as one set under one `version`; readers keep the highest | `/network/*_volume` (historical) |
+| `volume_live` | `ReplacingMergeTree(version)`, `ORDER BY (metric, period, component)` | The same for the rolling live periods, with `start_time`, `end_time`. Twelve sets: `trade_volume` and `amm_volume` for hour, day, 3day, 7day and 30day, `payment_volume` for hour and day | `/network/*_volume` (live) |
 | `ingest_log` | `ReplacingMergeTree(updated_at)`, `ORDER BY (range_start, range_end)` | Range-ingest intent: `status Enum8('started'=1,'done'=2)`. Live first-write intents use `run_id live:<bootId>` and `range_end = 0` | range-ingest, ingest boot |
 | `agg_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_hour, to_hour)` | Hour ranges whose stats must be recomputed because ingest rewrote ledgers behind the aggregator | aggregator |
 | `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network: `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
@@ -247,6 +359,11 @@ the history; the rollups of a few thousand heavy accounts some hundred million r
  exchanges    (pair prefix)            ──▶ account_exchanges (copy per account)
  ledgers (commit marker) ◀── ledger_by_hash;  ledger_index -> close_time resolves every start/end
  ledgers ──▶ stats_hourly (rollup);  exchanges + payments + RatesService ──▶ volume_daily / volume_live
+ amm_pool_states (pool prefix)  ◀── amm_pool_touches (ledger order: which pools, since when)
+ amm_pool_states ──▶ amm_pools (current state);  + amm_liquidity + amm_governance + exchanges (amm_account) ──▶ amm_daily
+ amm_liquidity (pool prefix)    ──▶ account_amm_liquidity (copy per liquidity provider)
+ exchanges (amm_account set) + amm_pool_touches + amm_pool_states ──▶ volume_* (metric amm_volume)
+ balance_changes (LP-token lines of an account) + amm_pool_states ──▶ /accounts/{a}/amm_positions
  exchanges ──▶ native_rates_daily, pair_hourly ──▶ markets_live;  balance_changes + account_transactions + account_exchanges ──▶
  account_lines_daily / account_tx_daily / account_trades_daily (heavy accounts only; sentinels in account_rollup_days)
 ```
@@ -290,7 +407,7 @@ local volumes).
 
 - `transactions.tx_json` and `meta_json` dominate (full XRPL history is roughly 1-1.5 TB compressed). Everything else together is a
   fraction of it.
-- Retention is by partition, but always the same ledger block from all 14 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
+- Retention is by partition, but always the same ledger block from all 19 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
   expires by TTL after 90 days.
 - The tables of migration 002 are not ledger tables, so no ledger retention touches them. They expire by TTL: `validator_validations`
   after 7 days of `last_datetime` (about 1 GB on XRPL; whole parts are dropped), `network_state` after 100 days of `polled_at` and
@@ -298,7 +415,7 @@ local volumes).
   `unl_publishers`, `validator_domains` and `amendment_features` are kept for ever (small); `validations` keeps its 90 days.
 - The tables of migration 003 are not ledger tables either, so no ledger retention touches them. Only `pair_hourly` expires, 45 days after its hour
   (about a day per part, whole parts are dropped); `native_rates_daily`, `markets_live` and the six account rollup tables are recomputable and kept.
-- Rollups (`stats_hourly`, `volume_*`) and `fee_stats` are small; keep them.
+- Rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and `fee_stats` are small; keep them.
 
 ## 7. Adding a table or column
 

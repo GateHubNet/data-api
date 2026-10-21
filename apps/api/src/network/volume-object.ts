@@ -1,17 +1,21 @@
 import type { Asset, VolumeMetric } from '@gatehub/data-api-shared';
+import { assetOfColumns } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { fmtTime, precision8 } from '../common/format';
 
 /**
  * The rows of `/v2/network/exchange_volume` and `/v2/network/payment_volume`, as the original served them
- * (`api/routes/network/getMetric.js` and `lib/hbase/hbase-thrift/data.js getMetric`).
+ * (`api/routes/network/getMetric.js` and `lib/hbase/hbase-thrift/data.js getMetric`), and of `/v2/network/amm_volume`, which
+ * has the same rows with a component of its own (a pool).
  *
  * The key order of the objects is the one of the original, which came of how the object was built: the columns of an
  * HBase row come sorted (`components, count, endTime, exchange, exchangeRate, startTime, total`), the reassignments of
  * `handleResponse` and `formatRows` keep their place, and what `formatRows` adds comes after, in the order it adds it: the row
  * is `components, count, exchange, total, exchange_rate, start_time, end_time`; a trade component is the object the
  * aggregation script built, `count, rate, amount, base, counter, converted_amount`, and a payment component
- * `currency, issuer, amount, count, rate, converted_amount` (`issuer` is absent for the native currency, which has none).
+ * `currency, issuer, amount, count, rate, converted_amount` (`issuer` is absent for the native currency, which has none). An AMM
+ * component has no original; its keys are `amm_account, base, counter, count, amount, rate, converted_amount`, the sides
+ * formatted as a trade component formats them.
  */
 
 export type VolumeAsset = { currency: string; issuer?: string };
@@ -25,6 +29,17 @@ export interface TradeComponent {
   converted_amount: string;
 }
 
+export interface AmmComponent {
+  /** The pool. */
+  amm_account: string;
+  base: VolumeAsset;
+  counter: VolumeAsset;
+  count: number;
+  amount: string;
+  rate: string;
+  converted_amount: string;
+}
+
 export interface PaymentComponent {
   currency: string;
   issuer?: string;
@@ -35,7 +50,7 @@ export interface PaymentComponent {
 }
 
 export interface VolumeRow {
-  components: (TradeComponent | PaymentComponent)[];
+  components: (TradeComponent | PaymentComponent | AmmComponent)[];
   count: number;
   exchange: VolumeAsset;
   total: string;
@@ -82,8 +97,6 @@ export interface DisplayCurrency {
   rate: BigNumber;
 }
 
-const assetOf = (currency: string, issuer: string): Asset => (issuer ? { currency, issuer } : { currency });
-
 /** `{currency}` or `{currency, issuer}`: the key `issuer` is absent for the native currency. */
 const volumeAsset = (a: Asset): VolumeAsset =>
   a.issuer ? { currency: a.currency, issuer: a.issuer } : { currency: a.currency };
@@ -103,8 +116,8 @@ export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
   const parts = new Map<string, VolumePart>();
   for (const row of rows) {
     if (row.component === '') continue;
-    const base = assetOf(row.base_currency, row.base_issuer);
-    const counter = row.counter_currency === '' ? undefined : assetOf(row.counter_currency, row.counter_issuer);
+    const base = assetOfColumns(row.base_currency, row.base_issuer);
+    const counter = row.counter_currency === '' ? undefined : assetOfColumns(row.counter_currency, row.counter_issuer);
     // rows with a converted amount and rows without one are summed apart
     const id = [
       row.component,
@@ -161,12 +174,23 @@ export function toVolumeRow(
   const x = display ? display.rate.toNumber() : 1;
   const listed = bucket.parts.filter((p) => p.converted > 0).sort(byConverted);
 
-  const components = listed.map((p): TradeComponent | PaymentComponent => {
+  const components = listed.map((p): TradeComponent | PaymentComponent | AmmComponent => {
     const rate = p.converted > 0 ? p.amount.toNumber() / p.converted : 0;
     const shownRate = display ? (x ? rate / x : 0) : rate;
     const rateOut = rateText(shownRate);
     const amount = p.amount.toString();
     const converted = String(p.converted * x);
+    if (metric === 'amm_volume') {
+      return {
+        amm_account: p.component,
+        base: volumeAsset(p.base),
+        counter: volumeAsset(p.counter as Asset),
+        count: p.count,
+        amount,
+        rate: rateOut,
+        converted_amount: converted,
+      };
+    }
     if (metric === 'trade_volume') {
       return {
         count: p.count,

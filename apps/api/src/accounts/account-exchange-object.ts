@@ -32,6 +32,8 @@ export interface AccountExchangeObject {
   taker: string;
   tx_hash: string;
   tx_type: string;
+  /** The pool, on a swap against an AMM pool: the last key, and there only for a swap (see `ExchangeObject`). */
+  amm_account?: string;
 }
 
 /** The columns of `account_exchanges` the API reads: those of `exchanges`, and the client. */
@@ -68,6 +70,7 @@ export function toAccountExchangeObject(row: StoredAccountExchange, inverted = f
     taker: e.taker,
     tx_hash: e.tx_hash,
     tx_type: e.tx_type,
+    ...(e.amm_account !== undefined && { amm_account: e.amm_account }),
   };
 }
 
@@ -76,7 +79,36 @@ export function toAccountExchangeObject(row: StoredAccountExchange, inverted = f
  * cell where the exchange has none) and, as a last column, the `client` of an exchange that has one. A CSV takes one
  * column for every key found in any row, so the column is there when some row of the page has a client and empty in the
  * others. The original rewrote its first row into the columns of the list and so dropped the client of that row only.
+ * The `amm_account` of a swap comes after the client, as it does in the JSON, where it is the last key.
  */
 export function toAccountCsvRow(exchange: AccountExchangeObject): ReturnType<typeof toCsvRow> & { client?: string } {
-  return { ...toCsvRow(exchange), ...(exchange.client !== undefined && { client: exchange.client }) };
+  const { amm_account, ...columns } = toCsvRow(exchange);
+  return {
+    ...columns,
+    ...(exchange.client !== undefined && { client: exchange.client }),
+    ...(amm_account !== undefined && { amm_account }),
+  };
+}
+
+/** A row of the CSV of a page: `toAccountCsvRow`, with `client` and `amm_account` as cells that may be empty. */
+export type AccountCsvRow = Omit<ReturnType<typeof toCsvRow>, 'amm_account'> & {
+  client?: string | null;
+  amm_account?: string | null;
+};
+
+/**
+ * The rows of the CSV of a page (`toAccountCsvRow` each), with the same columns on every row: when a row of the page has a
+ * client, every row has the `client` column, and the same for `amm_account` (an empty cell where the exchange has none). A CSV
+ * takes its columns from the keys of the rows in the order they first appear, so without it a page whose first row is a swap
+ * and a later one has a client would put `amm_account` before `client`, and another page the other way round.
+ */
+export function toAccountCsvRows(exchanges: readonly AccountExchangeObject[]): AccountCsvRow[] {
+  const rows = exchanges.map(toAccountCsvRow);
+  const withClient = rows.some((row) => row.client !== undefined);
+  const withPool = rows.some((row) => row.amm_account !== undefined);
+  return rows.map(({ client, amm_account, ...columns }) => ({
+    ...columns,
+    ...(withClient && { client: client ?? null }),
+    ...(withPool && { amm_account: amm_account ?? null }),
+  }));
 }

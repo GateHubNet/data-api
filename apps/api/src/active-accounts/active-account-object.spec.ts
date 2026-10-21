@@ -138,6 +138,7 @@ describe('toActiveExchange and attachExchanges', () => {
     taker: 'rS',
     provider: 'rB',
     offer_sequence: 4,
+    amm_account: '',
     autobridged_currency: null,
     autobridged_issuer: null,
     tx_type: 'OfferCreate',
@@ -164,6 +165,20 @@ describe('toActiveExchange and attachExchanges', () => {
       'tx_type',
     ]);
     expect(e).toMatchObject({ executed_time: '2015-01-14T18:27:20.000Z', rate: '2.0000000', base_amount: '10' });
+  });
+
+  it('a swap against an AMM pool has amm_account as its last key; an order-book exchange has no such key', () => {
+    const book = Object.keys(toActiveExchange(row(), false));
+    expect(book).not.toContain('amm_account');
+    for (const inverted of [false, true]) {
+      const e = toActiveExchange(
+        row({ amm_account: 'rPool', provider: 'rPool', offer_sequence: 0, client: 'rt1.2.1' }),
+        inverted,
+      );
+      expect(Object.keys(e).at(-1)).toBe('amm_account');
+      expect(e.amm_account).toBe('rPool');
+    }
+    expect(Object.keys(toActiveExchange(row({ amm_account: 'rPool' }), false))).toEqual([...book, 'amm_account']);
   });
 
   it('keeps the client of the transaction, between the buyer and the time, as the row of HBase had it', () => {

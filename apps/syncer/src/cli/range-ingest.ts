@@ -10,6 +10,7 @@ import {
   LedgerNotAvailableError,
   LedgerSource,
   LedgerWriter,
+  LedgerWriteResult,
   NodeClient,
   ParseContext,
   parseContextFor,
@@ -27,6 +28,7 @@ import { migrateOnBoot } from '../core/migrate-on-boot';
 import { createNodeClient } from '../core/node-client.provider';
 import { LEDGERS_PARTITION_SIZE, LIVE_INTENT_PREFIX } from '../ingest/live-runner';
 import { RpcLedgerSource } from '../ingest/rpc-ledger-source';
+import { PrometheusService } from '../modules/prometheus/prometheus.service';
 
 export interface RangeIngestOptions {
   /** First ledger of the range (inclusive), at least 1. */
@@ -82,6 +84,12 @@ export interface RangeIngestOptions {
   quiescenceTimeoutMs?: number;
   /** Default: a Nest `Logger` with context `RangeIngest`. */
   logger?: RangeLogger;
+  /**
+   * Where `syncer_amm_unclassified_total` is counted: the pools of AMM transactions the parser could make no row for, in
+   * the ledgers this run wrote (once per write that committed; a ledger found committed and skipped adds nothing).
+   * Default: a `PrometheusService`, whose counters are the process-wide ones. Tests pass their own.
+   */
+  metrics?: Pick<PrometheusService, 'ammUnclassifiedTotal'>;
 }
 
 export interface RangeLogger {
@@ -300,6 +308,9 @@ class RangeRunner {
   private readonly outOfTime = new WeakMap<object, string>();
   /** The ledgers the redo of the unfinished intents wrote in this run (and marked in agg_dirty). */
   private readonly redone = new Set<number>();
+  private readonly metrics: Pick<PrometheusService, 'ammUnclassifiedTotal'>;
+  /** Pools of AMM transactions the parser made no row for, in what this run wrote: for the log at the end. */
+  private ammUnclassified = 0;
 
   private chunksDone = 0;
   /** Of `chunksDone`, the chunks that needed no write. */
@@ -370,6 +381,7 @@ class RangeRunner {
 
     this.network = opts.network ?? networkOf(ctx);
     this.logger = opts.logger ?? new Logger('RangeIngest');
+    this.metrics = opts.metrics ?? new PrometheusService();
     this.writer = new LedgerWriter(ch, ctx, { runId: this.runId });
   }
 
@@ -397,10 +409,18 @@ class RangeRunner {
       else this.logger.error(`Could not mark the skipped hours in agg_dirty: ${describe(err)}`);
     }
 
+    if (this.ammUnclassified > 0) {
+      this.logger.warn(
+        `${this.ammUnclassified} AMM pool${this.ammUnclassified === 1 ? '' : 's'} in the ledgers written could not be ` +
+          'classified (no swap, liquidity or governance row, or an unknown pair): see syncer_amm_unclassified_total',
+      );
+    }
     if (failure !== undefined) throw failure;
+    // the count of the pools it could not classify is always said, 0 too: the absence of the warning above is no proof
     this.logger.log(
       `Range [${this.from},${this.to}] ingested: ${this.chunksDone} chunks complete ` +
-        `(${this.chunksSkipped} had nothing to write), ${this.ledgersWritten} ledgers written`,
+        `(${this.chunksSkipped} had nothing to write), ${this.ledgersWritten} ledgers written, ` +
+        `${this.ammUnclassified} unclassified AMM pools`,
     );
     return { chunksDone: this.chunksDone, ledgers: this.ledgersWritten };
   }
@@ -527,13 +547,19 @@ class RangeRunner {
           await this.logIntent(chunk, this.writer.runId, 'started');
           loggedRun = this.writer.runId;
         }
+        let written: LedgerWriteResult;
         try {
-          await this.writer.write(ledgers);
+          written = await this.writer.write(ledgers);
         } catch (err) {
           // Some of its inserts may have landed, and some may still be running on the server.
           needsCleanup = true;
           failedRuns.push(this.writer.runId);
           throw err;
+        }
+        // Counted once the write is committed, so that a failed attempt and its retry are one.
+        if (written.ammUnclassified > 0) {
+          this.ammUnclassified += written.ammUnclassified;
+          this.metrics.ammUnclassifiedTotal.inc(written.ammUnclassified);
         }
         return ledgers;
       } catch (err) {
@@ -972,8 +998,8 @@ The network, ClickHouse and node come from the same GH_* environment as the sync
   --run-id <id>          name of this run in ingest_log and in query ids (a nonce is appended)
   --help                 print this text
 
-Exit status: 0 when the range is ingested, 1 when the run failed (rerun the same command: finished chunks are skipped, unfinished ones redone),
-2 for a wrong command line.`;
+Exit status: 0 when the range is ingested, 1 when the run failed (rerun the same command: finished chunks are skipped, unfinished ones redone;
+with --reprocess every chunk is written again, so restart with --from just after the last chunk logged as done), 2 for a wrong command line.`;
 
 /** The command line is wrong. */
 export class UsageError extends Error {

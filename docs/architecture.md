@@ -14,7 +14,7 @@ shared library. This page explains the moving parts; the reasons for the big cho
  │ syncer (apps/syncer) — ONE per network                            │
  │   ingest ─ LiveRunner (live + catch-up)   range-ingest CLI        │
  │   validations ─ collector      fee_stats ─ poller                 │
- │   aggregator ─ stats, volumes, rates, markets, account rollups    │
+ │   aggregator ─ stats, volumes, AMM pools, rates, markets, rollups │
  │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
  └──────────────────────────────┬────────────────────────────────────┘
                                 │ bulk inserts (ledger tables: children first, `ledgers` row = commit)
@@ -44,15 +44,16 @@ Everything both services need, written once:
   for when the node cannot supply `server_definitions`) and the markets config (`config/markets/<network>.json`).
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
-- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts) and
-  `buildLedgerRows` (a raw ledger -> rows of the 14 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM) and
+  `buildLedgerRows` (a raw ledger -> rows of the 19 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
 - **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
 - **`query/`**: `RatesService` (exchange rates, vwap, used by the API *and* the aggregator), the daily-rate and account day-group reads of the
   account and market aggregates, and amount/decimal helpers.
-- **`aggregate/`**: the `stats_hourly` and volume jobs the aggregator runs, and the jobs of the account and market aggregates (`rates_daily`, `pair_hourly`,
-  `markets_live`, `account_rollups`).
+- **`aggregate/`**: the `stats_hourly`, volume and AMM jobs (`amm_pools`, `amm_daily`) the aggregator runs, and the reads they share
+  (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), and the jobs of the account and market aggregates
+  (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
@@ -75,14 +76,36 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   the Ripple object, binary codec with the node's definitions, an LRU of serialized forms), `XrplService` (the shared `NodeClient` with
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
-- **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `validations`,
-  `validators` with the amendments routes, `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+- **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `amm`,
+  `validations`, `validators` with the amendments routes, `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
+#### The AMM module (`apps/api/src/amm`)
+
+The AMM routes are GateHub extras ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)); a few structural facts matter when you add to them.
+
+- **Route order, and why the pair controller is last.** `AmmModule` lists its controllers as `AmmPoolsController` (the list,
+  `:pool/history`, `:pool`), `AmmEventsController` (`:pool/swaps`, `:pool/liquidity`, `:pool/governance`) and **`AmmPairController`
+  last**. The pair form `GET /v2/amm/pools/:base/:counter` matches every path of two segments under `pools`, so a route such as
+  `/pools/:pool/history` registered after it would be taken for a pair (base the pool, counter `history`). Nest registers routes in the
+  order of `controllers`; `amm.module.spec.ts` pins the order, and a new two-segment route under `pools` goes before the pair controller.
+- **The events controller reuses the exchanges.** `AmmModule` imports `ExchangesModule`, which exports `ExchangesService`:
+  `/pools/:pool/swaps` is `ExchangesService.pair` on the pool's pair with `amm=only` and the pool's account, so the rows, the mapper and
+  the markers are the exchange route's. The window of the exchange routes (`start`, `end`, `limit` 200/400, `amm`, `autobridged`,
+  `descending`, `marker`) is parsed by `exchanges/exchanges-window.ts`, shared by them and by the swaps route (which passes a reader that
+  ignores `amm`).
+- **One list of events.** `AMM_LIQUIDITY_EVENTS` in the shared AMM parser is the list of liquidity events the parser writes; the API validates
+  the `event` filter and builds the Swagger enum from it (as `GOVERNANCE_TYPES` does for `type`).
+- **Object shapes in one file.** `amm/amm-objects.ts` holds every object and its CSV row, with the key order in its header, and
+  `amm/amm-positions.ts` the position and the exact division. The account routes (`amm_liquidity`, `amm_positions`) are
+  `AccountAmmController` in `AccountsModule`.
+- **Existence of a pool.** The pool routes other than detail and pair share `AmmPoolsService.requirePool` (a state row in a committed
+  ledger); detail and pair read `amm_pools`, which the aggregator rebuilds.
+
 ### ClickHouse
 
-One server, one database per network, 42 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network, 49 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 
@@ -96,7 +119,8 @@ views. See [clickhouse](clickhouse.md).
 3. `LedgerWriter` inserts every child table in parallel, then `ledger_by_hash`, then `ledgers` (the atomic commit), synchronously, with
    dedup tokens.
 4. Workers on the side: validations stream -> `validations`/`validator_manifests` (and `validator_validations`, `validator_seen`); `fee` every 5 s
-   -> `fee_stats`; the aggregator rolls `ledgers` into `stats_hourly`, computes `volume_*` from `exchanges`/`payments` and rates, and keeps the account and market
+   -> `fee_stats`; the aggregator rolls `ledgers` into `stats_hourly`, computes `volume_*` from `exchanges`/`payments` and rates, rebuilds the AMM
+   aggregates (`amm_pools`, `amm_daily`) from the append-only AMM ledger tables, and keeps the account and market
    aggregates (daily native rates, `pair_hourly` and `markets_live` from `exchanges`, rollups of heavy accounts from `balance_changes`,
    `account_transactions` and `account_exchanges`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
    rounds and the hourly agreement from `validations` and `ledgers`.
@@ -125,6 +149,7 @@ views. See [clickhouse](clickhouse.md).
 | No aggregate materialized views | [0008](adr/0008-no-aggregate-materialized-views.md) |
 | One deployment per network | [0009](adr/0009-one-deployment-per-network.md) |
 | Ripple v2 wire compatibility and every deliberate deviation | [0010](adr/0010-ripple-v2-wire-compatibility.md) |
+| AMM data, and swaps against pools as exchanges | [0011](adr/0011-amm-data-and-swaps-as-exchanges.md) |
 | Validators and amendments data: a worker of its own, agreement over the indexed chain, the safe fetcher, migration 002 | [0012](adr/0012-validators-and-amendments-data.md) |
 | Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats, migration 003 | [0013](adr/0013-account-and-market-aggregates.md) |
 | CTID dedup (superseded by the commit marker and dedup tokens) | [0002](adr/0002-ctid-idempotent-ingest.md) |

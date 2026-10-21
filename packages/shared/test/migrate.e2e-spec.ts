@@ -67,6 +67,24 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, ledger_index, tx_index, node_index',
   },
   [Table.AccountsCreated]: { engine: 'ReplacingMergeTree', partition: '', order: 'ledger_index, tx_index, account' },
+  [Table.AmmPoolStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'amm_account, ledger_index, tx_index',
+  },
+  // the narrow ledger-ordered index of amm_pool_states (R-A14): the watermark and day scans read it by primary-key range
+  [Table.AmmPoolTouches]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, amm_account',
+  },
+  [Table.AmmLiquidity]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
+  [Table.AccountAmmLiquidity]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index, amm_account',
+  },
+  [Table.AmmGovernance]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -135,6 +153,13 @@ const SHAPES: Record<Table, Shape> = {
     version: 'version',
     partition: '',
     order: 'metric, period, component',
+  },
+  [Table.AmmPools]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'amm_account' },
+  [Table.AmmDaily]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'toYYYYMM(day)',
+    order: 'amm_account, day',
   },
   [Table.NativeRatesDaily]: {
     engine: 'ReplacingMergeTree',
@@ -230,6 +255,11 @@ const DEDUP_TABLES: Table[] = [
   Table.AccountExchanges,
   Table.BalanceChanges,
   Table.AccountsCreated,
+  Table.AmmPoolStates,
+  Table.AmmPoolTouches,
+  Table.AmmLiquidity,
+  Table.AccountAmmLiquidity,
+  Table.AmmGovernance,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -387,13 +417,255 @@ describe('migrations (e2e)', () => {
 
       it('declares the skipping indexes', async () => {
         const idx = await svc.query<{ table: string; name: string; type: string }>(
-          `SELECT table, name, type FROM system.data_skipping_indices WHERE database = {db:String} ORDER BY table`,
+          `SELECT table, name, type FROM system.data_skipping_indices WHERE database = {db:String} ORDER BY table, name`,
           { db: 'xahau' },
         );
         expect(idx).toEqual([
+          { table: Table.AccountAmmLiquidity, name: 'ledger_mm', type: 'minmax' },
+          { table: Table.AccountExchanges, name: 'amm_account_set', type: 'set' },
           { table: Table.AccountsCreated, name: 'account_bf', type: 'bloom_filter' },
+          { table: Table.AmmGovernance, name: 'ledger_mm', type: 'minmax' },
+          { table: Table.AmmLiquidity, name: 'ledger_mm', type: 'minmax' },
+          { table: Table.AmmPoolStates, name: 'ledger_mm', type: 'minmax' },
+          { table: Table.Exchanges, name: 'amm_account_set', type: 'set' },
           { table: Table.Ledgers, name: 'close_time_mm', type: 'minmax' },
         ]);
+      });
+
+      it('lets `amm=only` reads skip granules without AMM rows: a set(1024) index on amm_account (R-A1)', async () => {
+        const idx = await svc.query<{
+          table: string;
+          name: string;
+          type_full: string;
+          expr: string;
+          granularity: number;
+        }>(
+          `SELECT table, name, type_full, expr, granularity FROM system.data_skipping_indices
+           WHERE database = {db:String} AND name = 'amm_account_set' ORDER BY table`,
+          { db: 'xahau' },
+        );
+        expect(idx.map((i) => ({ ...i, granularity: Number(i.granularity) }))).toEqual([
+          {
+            table: Table.AccountExchanges,
+            name: 'amm_account_set',
+            type_full: 'set(1024)',
+            expr: 'amm_account',
+            granularity: 1,
+          },
+          {
+            table: Table.Exchanges,
+            name: 'amm_account_set',
+            type_full: 'set(1024)',
+            expr: 'amm_account',
+            granularity: 1,
+          },
+        ]);
+      });
+
+      it('lets watermark and day scans skip parts of the AMM ledger tables: a minmax index on ledger_index (R-A2)', async () => {
+        const idx = await svc.query<{
+          table: string;
+          name: string;
+          type_full: string;
+          expr: string;
+          granularity: number;
+        }>(
+          `SELECT table, name, type_full, expr, granularity FROM system.data_skipping_indices
+           WHERE database = {db:String} AND name = 'ledger_mm' ORDER BY table`,
+          { db: 'xahau' },
+        );
+        expect(idx.map((i) => ({ ...i, granularity: Number(i.granularity) }))).toEqual(
+          [Table.AccountAmmLiquidity, Table.AmmGovernance, Table.AmmLiquidity, Table.AmmPoolStates].map((table) => ({
+            table,
+            name: 'ledger_mm',
+            type_full: 'minmax',
+            expr: 'ledger_index',
+            granularity: 1,
+          })),
+        );
+      });
+
+      it('the baseline creates the AMM tables with their keys', async () => {
+        const rows = await systemTables();
+        const keys = Object.fromEntries(
+          rows.map((t) => [t.name, { sorting: t.sorting_key, partition: t.partition_key }]),
+        );
+        const ledgerP7 = 'intDiv(ledger_index, 10000000)';
+        const ledgerP6 = 'intDiv(ledger_index, 1000000)';
+
+        expect({
+          [Table.AmmPoolStates]: keys[Table.AmmPoolStates],
+          [Table.AmmPoolTouches]: keys[Table.AmmPoolTouches],
+          [Table.AmmLiquidity]: keys[Table.AmmLiquidity],
+          [Table.AccountAmmLiquidity]: keys[Table.AccountAmmLiquidity],
+          [Table.AmmGovernance]: keys[Table.AmmGovernance],
+          [Table.AmmPools]: keys[Table.AmmPools],
+          [Table.AmmDaily]: keys[Table.AmmDaily],
+        }).toEqual({
+          amm_pool_states: { sorting: 'amm_account, ledger_index, tx_index', partition: ledgerP7 },
+          amm_pool_touches: { sorting: 'ledger_index, tx_index, amm_account', partition: ledgerP6 },
+          amm_liquidity: { sorting: 'amm_account, ledger_index, tx_index', partition: ledgerP7 },
+          account_amm_liquidity: { sorting: 'account, ledger_index, tx_index, amm_account', partition: ledgerP7 },
+          amm_governance: { sorting: 'amm_account, ledger_index, tx_index', partition: ledgerP7 },
+          amm_pools: { sorting: 'amm_account', partition: '' },
+          amm_daily: { sorting: 'amm_account, day', partition: 'toYYYYMM(day)' },
+        });
+
+        const engines = Object.fromEntries(rows.map((t) => [t.name, t.engine_full.split(' ')[0]]));
+        expect(engines[Table.AmmPools]).toBe('ReplacingMergeTree(version)');
+        expect(engines[Table.AmmDaily]).toBe('ReplacingMergeTree(version)');
+        for (const table of [
+          Table.AmmPoolStates,
+          Table.AmmPoolTouches,
+          Table.AmmLiquidity,
+          Table.AccountAmmLiquidity,
+          Table.AmmGovernance,
+        ]) {
+          expect({ table, engine: engines[table] }).toEqual({ table, engine: 'ReplacingMergeTree' });
+        }
+      });
+
+      it('gives exchanges and account_exchanges an amm_account String column, empty for order-book trades', async () => {
+        const cols = await svc.query<{ table: string; name: string; type: string; default_kind: string }>(
+          `SELECT table, name, type, default_kind FROM system.columns
+           WHERE database = {db:String} AND name = 'amm_account' AND table IN ({exchanges:String}, {account:String})
+           ORDER BY table`,
+          { db: 'xahau', exchanges: Table.Exchanges, account: Table.AccountExchanges },
+        );
+        expect(cols).toEqual([
+          { table: Table.AccountExchanges, name: 'amm_account', type: 'String', default_kind: '' },
+          { table: Table.Exchanges, name: 'amm_account', type: 'String', default_kind: '' },
+        ]);
+      });
+
+      it('gives amm_daily the columns of a day, in order: the finality flag of the sentinel is a UInt8 before the versions', async () => {
+        const cols = await svc.query<{ name: string; type: string }>(
+          `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,
+          { db: 'xahau', t: Table.AmmDaily },
+        );
+        expect(cols.map((c) => [c.name, c.type])).toEqual([
+          ['amm_account', 'String'],
+          ['day', 'Date'],
+          ['base_currency', 'LowCardinality(String)'],
+          ['base_issuer', 'String'],
+          ['counter_currency', 'LowCardinality(String)'],
+          ['counter_issuer', 'String'],
+          ['swap_count', 'UInt64'],
+          ['volume_base', 'String'],
+          ['volume_counter', 'String'],
+          ['fees_base_est', 'Nullable(String)'],
+          ['fees_counter_est', 'Nullable(String)'],
+          ['deposit_count', 'UInt64'],
+          ['withdraw_count', 'UInt64'],
+          ['liquidity_in_base', 'String'],
+          ['liquidity_in_counter', 'String'],
+          ['liquidity_out_base', 'String'],
+          ['liquidity_out_counter', 'String'],
+          ['reserve_base', 'Nullable(String)'],
+          ['reserve_counter', 'Nullable(String)'],
+          ['lp_supply', 'Nullable(String)'],
+          ['trading_fee', 'Nullable(UInt16)'],
+          ['value_native', 'Nullable(Float64)'],
+          ['final', 'UInt8'],
+          ['config_version', 'UInt32'],
+          ['version', 'UInt64'],
+        ]);
+      });
+
+      it('types the values of a pool state as Nullable, so a reader can tell "unchanged" from a value', async () => {
+        const cols = await svc.query<{ name: string; type: string }>(
+          `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,
+          { db: 'xahau', t: Table.AmmPoolStates },
+        );
+        const types = Object.fromEntries(cols.map((c) => [c.name, c.type]));
+        expect(types).toEqual({
+          amm_account: 'String',
+          ledger_index: 'UInt32',
+          tx_index: 'UInt32',
+          tx_hash: 'String',
+          close_time: "DateTime('UTC')",
+          tx_type: 'LowCardinality(String)',
+          base_currency: 'LowCardinality(String)',
+          base_issuer: 'String',
+          counter_currency: 'LowCardinality(String)',
+          counter_issuer: 'String',
+          reserve_base: 'Nullable(String)',
+          reserve_counter: 'Nullable(String)',
+          lp_supply: 'Nullable(String)',
+          lp_currency: 'Nullable(String)',
+          reserve_base_f: 'Nullable(Float64)',
+          reserve_counter_f: 'Nullable(Float64)',
+          lp_supply_f: 'Nullable(Float64)',
+          trading_fee: 'Nullable(UInt16)',
+          auction_holder: 'Nullable(String)',
+          auction_price: 'Nullable(String)',
+          auction_price_f: 'Nullable(Float64)',
+          auction_discounted_fee: 'Nullable(UInt16)',
+          auction_expiration: 'Nullable(UInt32)',
+          deleted: 'UInt8',
+        });
+      });
+
+      it('keeps amm_pool_touches narrow: the ledger, the transaction and the pool, in the order of its key', async () => {
+        const cols = await svc.query<{ name: string; type: string }>(
+          `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,
+          { db: 'xahau', t: Table.AmmPoolTouches },
+        );
+        expect(cols).toEqual([
+          { name: 'ledger_index', type: 'UInt32' },
+          { name: 'tx_index', type: 'UInt32' },
+          { name: 'amm_account', type: 'String' },
+        ]);
+      });
+
+      it('types the liquidity and governance columns', async () => {
+        const typesOf = async (table: Table) =>
+          Object.fromEntries(
+            (
+              await svc.query<{ name: string; type: string }>(
+                `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,
+                { db: 'xahau', t: table },
+              )
+            ).map((c) => [c.name, c.type]),
+          );
+        const liquidity = {
+          amm_account: 'String',
+          ledger_index: 'UInt32',
+          tx_index: 'UInt32',
+          tx_hash: 'String',
+          close_time: "DateTime('UTC')",
+          account: 'String',
+          initiator: 'String',
+          event: 'LowCardinality(String)',
+          mode: 'LowCardinality(String)',
+          base_amount: 'String',
+          counter_amount: 'String',
+          lp_tokens: 'String',
+          base_amount_f: 'Float64',
+          counter_amount_f: 'Float64',
+          lp_tokens_f: 'Float64',
+        };
+        expect(await typesOf(Table.AmmLiquidity)).toEqual(liquidity);
+        // The per-account index has the same columns.
+        expect(await typesOf(Table.AccountAmmLiquidity)).toEqual(liquidity);
+        expect(await typesOf(Table.AmmGovernance)).toEqual({
+          amm_account: 'String',
+          ledger_index: 'UInt32',
+          tx_index: 'UInt32',
+          tx_hash: 'String',
+          close_time: "DateTime('UTC')",
+          kind: 'LowCardinality(String)',
+          account: 'String',
+          fee_voted: 'Nullable(UInt16)',
+          trading_fee_after: 'Nullable(UInt16)',
+          bid_min: 'Nullable(String)',
+          bid_max: 'Nullable(String)',
+          price_paid: 'Nullable(String)',
+          slot_holder: 'Nullable(String)',
+          slot_discounted_fee: 'Nullable(UInt16)',
+          slot_expiration: 'Nullable(UInt32)',
+          auth_accounts: 'Array(String)',
+        });
       });
 
       it('expires validations after 90 days of last_datetime', async () => {
@@ -503,6 +775,51 @@ describe('migrations (e2e)', () => {
           destination_tag: null,
           invoice_id: null,
           client: null,
+        });
+      });
+
+      it('stores NULL for the pool-state values whose node the transaction did not carry', async () => {
+        const state = SAMPLE_ROWS[Table.AmmPoolStates];
+        await svc.insert(Table.AmmPoolStates, [
+          {
+            ...state,
+            tx_index: 6,
+            reserve_base: null,
+            reserve_counter: null,
+            lp_supply: null,
+            lp_currency: null,
+            reserve_base_f: null,
+            reserve_counter_f: null,
+            lp_supply_f: null,
+            trading_fee: null,
+            auction_holder: null,
+            auction_price: null,
+            auction_price_f: null,
+            auction_discounted_fee: null,
+            auction_expiration: null,
+          },
+        ]);
+        const row = await svc.queryOne(
+          `SELECT reserve_base, reserve_counter, lp_supply, lp_currency, reserve_base_f, reserve_counter_f, lp_supply_f,
+                  trading_fee, auction_holder, auction_price, auction_price_f, auction_discounted_fee, auction_expiration,
+                  deleted
+           FROM amm_pool_states WHERE tx_index = 6`,
+        );
+        expect(row).toEqual({
+          reserve_base: null,
+          reserve_counter: null,
+          lp_supply: null,
+          lp_currency: null,
+          reserve_base_f: null,
+          reserve_counter_f: null,
+          lp_supply_f: null,
+          trading_fee: null,
+          auction_holder: null,
+          auction_price: null,
+          auction_price_f: null,
+          auction_discounted_fee: null,
+          auction_expiration: null,
+          deleted: 0,
         });
       });
 

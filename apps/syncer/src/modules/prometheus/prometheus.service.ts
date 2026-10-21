@@ -51,6 +51,11 @@ const metrics = {
     labelNames: ['reason'],
     registers: [registry],
   }),
+  ammUnclassifiedTotal: new Counter({
+    name: 'syncer_amm_unclassified_total',
+    help: 'Pools of AMM transactions the parser could make no swap, liquidity or governance row for, or whose assets it could not tell (spec §2.3), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    registers: [registry],
+  }),
   validationsFlushedTotal: new Counter({
     name: 'syncer_validations_flushed_total',
     help: 'Validation rows flushed to ClickHouse.',
@@ -201,6 +206,7 @@ export class PrometheusService implements OnModuleInit {
   readonly lastCommitAgeSeconds = metrics.lastCommitAgeSeconds;
   readonly ingestHaltsTotal = metrics.ingestHaltsTotal;
   readonly nodeRateLimitedTotal = metrics.nodeRateLimitedTotal;
+  readonly ammUnclassifiedTotal = metrics.ammUnclassifiedTotal;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly validationsErrorsTotal = metrics.validationsErrorsTotal;
   readonly validationsDroppedTotal = metrics.validationsDroppedTotal;

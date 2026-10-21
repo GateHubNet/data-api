@@ -9,6 +9,16 @@ import { RawLedger } from './raw-ledger';
 /** Rows per INSERT unless the caller says otherwise. */
 export const DEFAULT_MAX_ROWS_PER_INSERT = 50_000;
 
+/** What a successful `LedgerWriter.write()` reports besides the rows: the ledgers' diagnostics, summed over the batch. */
+export interface LedgerWriteResult {
+  /**
+   * Pools of AMM transactions the parser could make no swap, liquidity or governance row for (`LedgerRows.diagnostics`).
+   * Counted once a batch is written, not when the write fails and is retried: the caller adds it to
+   * `syncer_amm_unclassified_total`.
+   */
+  ammUnclassified: number;
+}
+
 export interface LedgerWriterOptions {
   /** Identifies this writer in the dedup tokens. Default: a random UUID. */
   runId?: string;
@@ -76,9 +86,11 @@ export class LedgerWriter {
    *
    * Every ledger is parsed before the first insert: a ledger the parser rejects throws a `LedgerParseError` (naming the
    * ledger) with nothing of the batch written, so the caller may write the ledgers before it with this same writer.
+   *
+   * Resolves to the diagnostics of the batch once it is committed; a failure throws and reports nothing.
    */
-  async write(ledgers: RawLedger[]): Promise<void> {
-    if (ledgers.length === 0) return;
+  async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
+    if (ledgers.length === 0) return { ammUnclassified: 0 };
 
     // Parsing is pure and throws before anything has been written.
     const built = ledgers.map((raw) => buildLedgerRows(raw, this.ctx));
@@ -106,6 +118,7 @@ export class LedgerWriter {
       span,
       byIndex.map((rows) => rows.ledger),
     );
+    return { ammUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.ammUnclassified, 0) };
   }
 
   /** Insert `rows` in chunks of at most `maxRowsPerInsert`, one after the other; no rows, no insert. */

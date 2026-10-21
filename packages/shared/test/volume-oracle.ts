@@ -173,3 +173,151 @@ export async function paymentOracle(
   }
   return out.sort((a, b) => b.converted.comparedTo(a.converted) || (a.component < b.component ? -1 : 1));
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The oracle for the AMM volume: the swaps of each pool in a window, converted like trade components (Ruling R-A19).
+// ---------------------------------------------------------------------------------------------------------------------
+
+export interface ExpectedAmm {
+  /** The pool account. */
+  component: string;
+  base: Asset;
+  counter: Asset;
+  amount: BigNumber;
+  count: number;
+  converted: BigNumber;
+  rate: BigNumber;
+}
+
+interface PoolSums {
+  account: string;
+  base: Asset;
+  counter: Asset;
+  count: number;
+  baseVolume: BigNumber;
+  counterVolume: BigNumber;
+}
+
+/**
+ * How many units of an asset one native coin buys, from the configured trade markets against the native currency in a
+ * window (the first source of Ruling R-A19: exactly how the trade components build it).
+ */
+export function marketNativeRates(
+  markets: MarketsConfig,
+  rows: ExchangesRow[],
+  from: number,
+  to: number,
+): Map<string, BigNumber> {
+  const seen = new Set<string>();
+  const rates = new Map<string, BigNumber>();
+  for (const m of markets.tradeMarkets) {
+    const [base, counter] = isNative(m.base) ? [asset(m.counter), asset(m.base)] : [asset(m.base), asset(m.counter)];
+    const id = [assetKey(base), assetKey(counter)].sort().join('|');
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (counter.currency !== 'XRP' || counter.issuer) continue;
+    const t = tradesOf(rows, base, counter, from, to);
+    if (t.count > 0 && t.counterVolume.gt(0))
+      rates.set(assetKey(base), new Wide(t.baseVolume).dividedBy(t.counterVolume));
+  }
+  return rates;
+}
+
+/**
+ * The AMM components of `[from, to)` over the stored exchanges (order-book rows and swaps alike; only the rows with an
+ * `amm_account` are the pools'). Plain JavaScript over the rows, never the job:
+ *  - a swap whose native leg is 0.0005 or less is left out; the others add up per pool (`amm_account`);
+ *  - a pool with the native currency as its base is turned round, so that the native currency is the counter;
+ *  - the units of an asset per native coin come from the markets against the native currency first, and for an asset they
+ *    have none for from the pools against the native currency in the window (all the base volume over all the native
+ *    volume of such pools);
+ *  - a pool against the native currency: `converted` is its native volume and `rate` its own base volume over native volume;
+ *    any other pool through the rate of its base, else through the rate of its counter (swapped, `amount` the counter
+ *    volume); a pool without a rate on either side is dropped; largest converted amount first, then the account.
+ */
+export function ammVolumeOracle(markets: MarketsConfig, rows: ExchangesRow[], from: number, to: number): ExpectedAmm[] {
+  const pools = new Map<string, PoolSums>();
+  for (const r of rows) {
+    if (r.amm_account === '' || r.close_time < from || r.close_time >= to) continue;
+    if (
+      (r.base_issuer === '' && new BigNumber(r.base_amount).lte(DUST)) ||
+      (r.counter_issuer === '' && new BigNumber(r.counter_amount).lte(DUST))
+    ) {
+      continue;
+    }
+    let pool = pools.get(r.amm_account);
+    if (!pool) {
+      pool = {
+        account: r.amm_account,
+        base: asset({ currency: r.base_currency, issuer: r.base_issuer }),
+        counter: asset({ currency: r.counter_currency, issuer: r.counter_issuer }),
+        count: 0,
+        baseVolume: new BigNumber(0),
+        counterVolume: new BigNumber(0),
+      };
+      pools.set(r.amm_account, pool);
+    }
+    pool.count++;
+    pool.baseVolume = pool.baseVolume.plus(r.base_amount);
+    pool.counterVolume = pool.counterVolume.plus(r.counter_amount);
+  }
+  const legs = [...pools.values()].map((p) =>
+    isNative(p.base)
+      ? { ...p, base: p.counter, counter: p.base, baseVolume: p.counterVolume, counterVolume: p.baseVolume }
+      : p,
+  );
+
+  const rates = marketNativeRates(markets, rows, from, to);
+  const fromPools = new Map<string, { base: BigNumber; native: BigNumber }>();
+  for (const p of legs) {
+    if (!isNative(p.counter) || p.count === 0 || !p.counterVolume.gt(0)) continue;
+    const sums = fromPools.get(assetKey(p.base)) ?? { base: new BigNumber(0), native: new BigNumber(0) };
+    sums.base = sums.base.plus(p.baseVolume);
+    sums.native = sums.native.plus(p.counterVolume);
+    fromPools.set(assetKey(p.base), sums);
+  }
+  // a market rate of 0 does not block the pool-derived rate (the job's rule: `?.gt(0)`, not `has`)
+  for (const [k, sums] of fromPools) if (!rates.get(k)?.gt(0)) rates.set(k, new Wide(sums.base).dividedBy(sums.native));
+
+  const out: ExpectedAmm[] = [];
+  for (const p of legs) {
+    const baseRate = rates.get(assetKey(p.base));
+    const counterRate = rates.get(assetKey(p.counter));
+    if (isNative(p.counter)) {
+      if (p.counterVolume.gt(0)) {
+        out.push({
+          component: p.account,
+          base: p.base,
+          counter: p.counter,
+          amount: p.baseVolume,
+          count: p.count,
+          converted: p.counterVolume,
+          rate: new Wide(p.baseVolume).dividedBy(p.counterVolume),
+        });
+      }
+    } else if (baseRate?.gt(0)) {
+      out.push({
+        component: p.account,
+        base: p.base,
+        counter: p.counter,
+        amount: p.baseVolume,
+        count: p.count,
+        converted: new Wide(p.baseVolume).dividedBy(baseRate),
+        rate: baseRate,
+      });
+    } else if (counterRate?.gt(0)) {
+      out.push({
+        component: p.account,
+        base: p.counter,
+        counter: p.base,
+        amount: p.counterVolume,
+        count: p.count,
+        converted: new Wide(p.counterVolume).dividedBy(counterRate),
+        rate: counterRate,
+      });
+    }
+  }
+  return out
+    .filter((c) => c.converted.gt(0))
+    .sort((a, b) => b.converted.comparedTo(a.converted) || (a.component < b.component ? -1 : 1));
+}

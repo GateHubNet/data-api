@@ -227,6 +227,34 @@ describe('startHarness', () => {
     });
   });
 
+  describe('http()', () => {
+    let h: Harness;
+    beforeAll(async () => {
+      h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('is a client on one listener of the app on 127.0.0.1, open from the start, whatever api() does (parked 13)', async () => {
+      // supertest on the server object would listen on a new port, on every interface, for each request: on a machine where
+      // another process holds 127.0.0.1 at that port the request reaches that process
+      const listening = h.app.getHttpServer().address() as { address: string; port: number } | null;
+      expect(listening).toMatchObject({ address: '127.0.0.1' });
+      const urls: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const test = h.http().get('/v2/transactions?limit=1').set('X-API-Key', h.key);
+        urls.push((test as unknown as { url: string }).url);
+        expect((await test).status).toBe(200);
+      }
+      expect(urls).toEqual(Array(3).fill(`http://127.0.0.1:${listening?.port}/v2/transactions?limit=1`));
+      // and api() is a client on the same listener
+      const api = await h.api();
+      expect((await api.get('/v2/transactions?limit=1')).request.url).toBe(urls[0]);
+      expect(h.app.getHttpServer().address()).toEqual(listening);
+    });
+  });
+
   describe('api()', () => {
     let h: Harness;
     beforeAll(async () => {

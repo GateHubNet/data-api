@@ -1,5 +1,5 @@
 import { badRequest } from '../common/errors';
-import { dateParam, endExclusive, first, ParsedDate, Query } from '../common/params';
+import { endExclusive, first, ParsedDate, Query } from '../common/params';
 
 /** The periods of `activeAccounts.js`, in the order its error message lists them. */
 export const ACTIVE_PERIODS = ['1day', '3day', '7day'] as const;
@@ -16,16 +16,6 @@ export function periodOf(query: Query): ActivePeriod {
     throw badRequest(`invalid period - use: ${ACTIVE_PERIODS.join(', ')}`);
   }
   return period as ActivePeriod;
-}
-
-/**
- * `date`, with the granularity of what was written; none when missing or empty. Text that is not a date answers 400
- * `invalid date format`. An empty `date` counts as none, as the check of the original did (`req.query.date && ...`); the
- * original then failed on it with a 500, having no end for its scan.
- */
-export function dateOf(query: Query): ParsedDate | undefined {
-  if ((first(query, 'date') ?? '') === '') return undefined;
-  return dateParam(query, 'date', 'invalid date format');
 }
 
 const DAY_MS = 86_400_000;
