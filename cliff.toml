@@ -1,0 +1,45 @@
+# git-cliff (https://git-cliff.org): the changelog of a release, made from the Conventional Commits since the previous tag.
+# The release workflow (.github/workflows/release.yml) writes it as the body of the GitHub release and attaches it as
+# CHANGELOG.md; CI shows the part not released yet in its job summary. Locally: `git cliff --unreleased`.
+
+[changelog]
+header = ""
+body = """
+{% if version -%}
+## {{ version }} ({{ timestamp | date(format="%Y-%m-%d") }})
+{% else -%}
+## Unreleased
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.breaking %}**Breaking:** {% endif %}{% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | trim }} ({{ commit.id | truncate(length=7, end="") }})
+{%- endfor %}
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+# A commit that does not follow the convention still appears, under "Other".
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+commit_parsers = [
+  # A merge commit repeats the commits it brings in, which are listed on their own.
+  { message = "^[Mm]erge", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Tests" },
+  { message = "^(build|ci)", group = "<!-- 6 -->Build and CI" },
+  { message = "^chore", group = "<!-- 7 -->Chores" },
+  { message = ".*", group = "<!-- 8 -->Other" },
+]
+filter_commits = false
+# Release tags: v1.4.0, and pre-releases such as v1.4.0-rc.1.
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+.*"
+sort_commits = "oldest"

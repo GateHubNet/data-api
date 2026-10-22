@@ -80,6 +80,40 @@ Notes:
 - Entry points of the syncer image (all relative to `/app`): `node dist/main.js` (default), the migration job below, and
   `node dist/cli/range-ingest.js --from <n> --to <m>`.
 
+## CI and releases
+
+GitHub Actions runs two workflows (`.github/workflows/`):
+
+- **`ci.yml`**, on every pull request to `master` and every push to `master`. It has three parts:
+  - one job runs `pnpm build` and `pnpm test`;
+  - three jobs run the e2e suites (shared, api, syncer) in parallel, each against its own testcontainers ClickHouse;
+  - a job summary shows the changelog of what is not released yet.
+
+  A newer push to a pull request cancels its older run.
+- **`release.yml`**, on every pushed tag `v*` (`v1.4.0`, or a pre-release such as `v1.4.0-rc.1`). It runs in order, and each step
+  stops the release if it fails:
+  1. **Test:** the whole of `ci.yml`.
+  2. **Images:** both images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api` and
+     `ghcr.io/gatehubnet/data-syncer`. Each gets two tags: the version without its `v` (`1.4.0`), and `latest`, which every tag
+     moves, a pre-release included.
+  3. **Release:** the GitHub release of the tag. Its body is the changelog since the previous tag, made by [git-cliff](https://git-cliff.org)
+     from the Conventional Commits (`cliff.toml`) and attached as `CHANGELOG.md`. A tag with a `-` is a pre-release.
+
+To release, tag a commit of `master` and push the tag:
+
+```bash
+git tag v1.4.0 && git push origin v1.4.0
+```
+
+**One secret** is needed in the repository's settings (Settings → Secrets and variables → Actions): `NPM_TOKEN`, an npm token that can
+read `@gatehub/toolbox`. Both workflows install with it. The image builds get it as the BuildKit secret `npm_token`, as above, so it is in
+no layer. The images are pushed with the workflow's own `GITHUB_TOKEN`.
+
+Pull requests from forks get no secrets, so their install fails. A new package on ghcr.io starts **private**: make it public under the
+organisation's Packages → the package → Package settings, if it should be pulled without a login. The compose files keep building their
+images from the checkout (`pull_policy: build`). To run a released image, use its ghcr.io name instead, for example
+`ghcr.io/gatehubnet/data-api:1.4.0`.
+
 ## Schema migrations
 
 Migrations are **owned by one-shot jobs**, not run on every replica at boot:

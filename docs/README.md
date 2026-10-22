@@ -24,7 +24,7 @@ deployment per network.
 | [Syncer](syncer.md) | The ingest, validations, fee_stats, aggregator (the AMM jobs included) and validators workers; recovery; the range-ingest CLI |
 | [ClickHouse](clickhouse.md) | The store: no-`FINAL` rule, inserts and deduplication, memory guards, HA, backups, retention |
 | [Backfilling](backfill.md) | Filling history, repairing gaps, reprocessing, the AMM re-ingest; which node to read from |
-| [Deployment](deployment.md) | Topology, images and the BuildKit npm secret, compose stacks, nginx, cutover from the old stack |
+| [Deployment](deployment.md) | Topology, images and the BuildKit npm secret, CI and releases (GitHub Actions, ghcr.io images, changelog), compose stacks, nginx, cutover from the old stack |
 | [Operations / runbook](operations.md) | Routine tasks, what to watch, after an outage, scaling, incident playbooks |
 | [Security](security.md) | Auth, rate limiting, client address, injection, secrets, threat model |
 | [Observability](observability.md) | Health (`/liveliness/healthz`), metrics (`/metricz`), logs, alerts |
