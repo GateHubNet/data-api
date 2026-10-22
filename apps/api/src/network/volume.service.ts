@@ -77,12 +77,14 @@ export class VolumeService {
 
   /**
    * The live row of a period, or none while the syncer has not written the set. The components of the AMM volume's day set carry
-   * the estimated fees of their pool (`fees_est_f`, NULL when not known); no other set has any.
+   * the estimated fees of their pool (`fees_est_f`, NULL when not known); no other set has any, so only that read selects the
+   * column (the others do not depend on migration 004).
    */
   async live(q: LiveVolumeQuery): Promise<VolumeRow[]> {
+    const fees = q.metric === 'amm_volume' && q.period === 'day' ? ', fees_est_f' : '';
     const rows = await this.ch.query<LiveRow>(
       `SELECT component, base_currency, base_issuer, counter_currency, counter_issuer, amount,
-              toUInt64(count) AS count, converted_f, fees_est_f,
+              toUInt64(count) AS count, converted_f${fees},
               toUnixTimestamp(start_time) AS start_time, toUnixTimestamp(end_time) AS end_time
          FROM ${Table.VolumeLive}
         WHERE metric = {metric:String} AND period = {period:String}
