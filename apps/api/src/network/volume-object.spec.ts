@@ -491,6 +491,180 @@ describe('the AMM volume row', () => {
     expect(c.amount).toBe('30');
   });
 
+  describe('fees_est (the estimated fees of the live day row, D2b.3, D9)', () => {
+    it('a component with an estimate has fees_est after converted_amount, the row has it after end_time', () => {
+      const row = toVolumeRow('amm_volume', bucket([amm({ feesEst: 0.75 })], { end: T0 + 86_400 }), 'XRP');
+      expect(Object.keys(row)).toEqual([
+        'components',
+        'count',
+        'exchange',
+        'total',
+        'exchange_rate',
+        'start_time',
+        'end_time',
+        'fees_est',
+      ]);
+      const [c] = row.components as AmmComponent[];
+      expect(Object.keys(c)).toEqual([
+        'amm_account',
+        'base',
+        'counter',
+        'count',
+        'amount',
+        'rate',
+        'converted_amount',
+        'fees_est',
+      ]);
+      expect([c.fees_est, row.fees_est]).toEqual(['0.75', '0.75']);
+      expect([typeof c.fees_est, typeof row.fees_est]).toEqual(['string', 'string']);
+    });
+
+    it('an estimate of 0 is an estimate: the text "0", not a missing key', () => {
+      const row = toVolumeRow('amm_volume', bucket([amm({ feesEst: 0 })]), 'XRP');
+      expect([(row.components[0] as AmmComponent).fees_est, row.fees_est]).toEqual(['0', '0']);
+    });
+
+    it('a row without an end has fees_est right after start_time', () => {
+      const row = toVolumeRow('amm_volume', bucket([amm({ feesEst: 1 })]), 'XRP');
+      expect(Object.keys(row).slice(-2)).toEqual(['start_time', 'fees_est']);
+    });
+
+    it('the row sums the components, which keep the order of the converted amounts', () => {
+      const row = toVolumeRow(
+        'amm_volume',
+        bucket([
+          amm({ component: POOL, converted: 90, feesEst: 0.25 }),
+          amm({ component: POOL2, converted: 100, feesEst: 0.5 }),
+          amm({ component: 'rZ', converted: 10, feesEst: 0.125 }),
+        ]),
+        'XRP',
+      );
+      expect((row.components as AmmComponent[]).map((c) => [c.amm_account, c.fees_est])).toEqual([
+        [POOL2, '0.5'],
+        [POOL, '0.25'],
+        ['rZ', '0.125'],
+      ]);
+      expect(row.fees_est).toBe('0.875');
+    });
+
+    it('a display currency converts them like converted_amount: fees_est * X per component, (the sum) * X for the row', () => {
+      const row = toVolumeRow(
+        'amm_volume',
+        bucket([amm({ component: POOL, feesEst: 1 }), amm({ component: POOL2, converted: 30, feesEst: 0.5 })]),
+        'XRP',
+        { asset: { currency: 'BTC', issuer: I2 }, rate: bn('0.5') },
+      );
+      expect((row.components as AmmComponent[]).map((c) => [c.converted_amount, c.fees_est])).toEqual([
+        ['45', '0.5'],
+        ['15', '0.25'],
+      ]);
+      expect(row.total).toBe('60');
+      expect(row.fees_est).toBe('0.75');
+    });
+
+    it('a display currency whose rate is 0 makes the estimates 0 as it makes the amounts 0', () => {
+      const row = toVolumeRow('amm_volume', bucket([amm({ feesEst: 1 })]), 'XRP', {
+        asset: { currency: 'BTC', issuer: I2 },
+        rate: bn(0),
+      });
+      expect([(row.components[0] as AmmComponent).fees_est, row.fees_est]).toEqual(['0', '0']);
+    });
+
+    it('a component whose estimate is not known has no fees_est, and then the row has none', () => {
+      const row = toVolumeRow(
+        'amm_volume',
+        bucket([
+          amm({ component: POOL, converted: 90, feesEst: 0.25 }),
+          amm({ component: POOL2, converted: 30, feesEst: null }),
+        ]),
+        'XRP',
+      );
+      const [known, unknown] = row.components as AmmComponent[];
+      expect(Object.keys(known)).toContain('fees_est');
+      expect(Object.keys(unknown)).toEqual([
+        'amm_account',
+        'base',
+        'counter',
+        'count',
+        'amount',
+        'rate',
+        'converted_amount',
+      ]);
+      expect(Object.keys(row)).not.toContain('fees_est');
+    });
+
+    it('a part without feesEst (the key absent) has no fees_est either, and the row neither', () => {
+      const row = toVolumeRow('amm_volume', bucket([amm()]), 'XRP');
+      expect(Object.keys(row.components[0])).not.toContain('fees_est');
+      expect(Object.keys(row)).not.toContain('fees_est');
+      const mixed = toVolumeRow(
+        'amm_volume',
+        bucket([amm({ feesEst: 1 }), amm({ component: POOL2, converted: 5 })]),
+        'XRP',
+      );
+      expect(Object.keys(mixed.components[0])).toContain('fees_est');
+      expect(Object.keys(mixed.components[1])).not.toContain('fees_est');
+      expect(Object.keys(mixed)).not.toContain('fees_est');
+    });
+
+    it('a part that is not listed (no converted amount) does not count: the others make the row', () => {
+      const row = toVolumeRow(
+        'amm_volume',
+        bucket([amm({ feesEst: 0.5 }), amm({ component: POOL2, converted: 0, feesEst: null })]),
+        'XRP',
+      );
+      expect(row.components).toHaveLength(1);
+      expect(row.fees_est).toBe('0.5');
+    });
+
+    it('a row that lists no component has no fees_est', () => {
+      expect(Object.keys(toVolumeRow('amm_volume', bucket([]), 'XRP'))).not.toContain('fees_est');
+      const unlisted = toVolumeRow('amm_volume', bucket([amm({ converted: 0, feesEst: 1 })]), 'XRP');
+      expect(unlisted.components).toEqual([]);
+      expect(Object.keys(unlisted)).not.toContain('fees_est');
+    });
+
+    it('trade and payment rows have none, whatever the parts carry', () => {
+      const trades = toVolumeRow('trade_volume', bucket([trade({ feesEst: 1 })], { end: T0 + 86_400 }), 'XRP');
+      expect(Object.keys(trades)).not.toContain('fees_est');
+      expect(Object.keys(trades.components[0])).not.toContain('fees_est');
+      const payments = toVolumeRow('payment_volume', bucket([payment({ feesEst: 1 })]), 'XRP');
+      expect(Object.keys(payments)).not.toContain('fees_est');
+      expect(Object.keys(payments.components[0])).not.toContain('fees_est');
+    });
+
+    const storedPool = (over: Partial<StoredVolumeRow> = {}): StoredVolumeRow => ({
+      component: POOL,
+      base_currency: 'USD',
+      base_issuer: I1,
+      counter_currency: 'XRP',
+      counter_issuer: '',
+      amount: '10',
+      count: 2,
+      converted_f: 30,
+      ...over,
+    });
+
+    it('sumParts takes the estimate of a stored row, and leaves the part without one when the row has no such column', () => {
+      expect(sumParts([storedPool({ fees_est_f: 0.25 })])[0].feesEst).toBe(0.25);
+      // a Float64 may come back as text
+      expect(sumParts([storedPool({ fees_est_f: '0.5' })])[0].feesEst).toBe(0.5);
+      // NULL: the estimate is not known
+      expect(sumParts([storedPool({ fees_est_f: null })])[0].feesEst).toBeNull();
+      // the column was not read (the daily sets): the key is not there at all
+      expect(Object.keys(sumParts([storedPool()])[0])).not.toContain('feesEst');
+    });
+
+    it('sumParts adds the estimates of the rows of a part, and one that is not known makes the sum not known', () => {
+      const fees = (a: number | null, b: number | null): number | null =>
+        sumParts([storedPool({ fees_est_f: a }), storedPool({ fees_est_f: b })])[0].feesEst as number | null;
+      expect(fees(0.25, 0.5)).toBe(0.75);
+      expect(fees(0.25, null)).toBeNull();
+      expect(fees(null, 0.25)).toBeNull();
+      expect(fees(null, null)).toBeNull();
+    });
+  });
+
   it('sums the days of a bucket per pool and sides: the pool of another orientation on another day is a part of its own', () => {
     const stored = (over: Partial<StoredVolumeRow> = {}): StoredVolumeRow => ({
       component: POOL,

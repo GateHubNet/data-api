@@ -10,6 +10,7 @@ import {
   RatesService,
   Table,
   VolumeDailyRow,
+  VolumeLiveRow,
 } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { join } from 'node:path';
@@ -1975,6 +1976,27 @@ describe('GET /v2/network/amm_volume', () => {
       },
     );
 
+    it('the day row of the recorded swaps has fees_est where the job stored an estimate: per component, and for the row only when every listed pool has one', async () => {
+      const stored = new Map(
+        (
+          await h.ch.query<{ component: string; fees_est_f: number | null }>(
+            `SELECT component, fees_est_f FROM ${Table.VolumeLive}
+              WHERE metric = 'amm_volume' AND period = 'day'
+                AND version = (SELECT max(version) FROM ${Table.VolumeLive} WHERE metric = 'amm_volume' AND period = 'day')`,
+          )
+        ).map((r) => [r.component, r.fees_est_f === null ? null : Number(r.fees_est_f)]),
+      );
+      const row = (await ok('/v2/network/amm_volume?live=day')).rows[0];
+      expect(row.components.length).toBeGreaterThan(5);
+      for (const c of row.components) {
+        const fees = stored.get(c.amm_account);
+        expect([c.amm_account, c.fees_est]).toEqual([c.amm_account, fees === null ? undefined : String(fees)]);
+        expect(Object.keys(c)).toEqual(fees === null ? AMM_KEYS : [...AMM_KEYS, 'fees_est']);
+      }
+      const all = row.components.every((c: Json) => stored.get(c.amm_account) !== null);
+      expect(Object.keys(row)).toEqual(all ? [...ROW_KEYS, 'fees_est'] : ROW_KEYS);
+    });
+
     it('the hour holds the one swap of the ledger that closed at 08:42:50, the day and the month many', async () => {
       expect((await ok('/v2/network/amm_volume?live=hour')).rows[0].components).toHaveLength(1);
       expect((await ok('/v2/network/amm_volume?live=day')).rows[0].components.length).toBeGreaterThan(5);
@@ -2223,6 +2245,238 @@ describe('GET /v2/network/amm_volume', () => {
       expect(await ok('/v2/network/amm_volume?live=day&exchange_currency=xrp')).toEqual(plain);
       const lower = await ok(`/v2/network/amm_volume?live=hour&exchange_currency=xyz&exchange_issuer=${I2}`);
       expect(lower.rows[0].exchange).toEqual({ currency: 'XYZ', issuer: I2 });
+    });
+  });
+
+  // ===============================================================================================================
+  describe('fees_est: the estimated fees of the live day row (D2b.3, D9)', () => {
+    // The recordings give the day set no usable estimate (most pools were first seen without their fee state), so the set is
+    // written by hand: three pools with numbers that are exact in binary, over the set the job wrote, which comes back in
+    // afterAll. The newest version of a set is the set, so each write is one version above the last.
+    const POOL1 = 'rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3';
+    const POOL2 = 'rP9jPyP5kyvFRb6ZiRghAGw5u8SGAmU4bd';
+    const POOL3 = I2;
+    interface Pool {
+      account: string;
+      base: Asset;
+      counter: Asset;
+      amount: string;
+      count: number;
+      converted: number;
+      fees: number | null;
+    }
+    const POOLS: Pool[] = [
+      {
+        account: POOL1,
+        base: { currency: 'USD', issuer: I1 },
+        counter: XRP,
+        amount: '30',
+        count: 3,
+        converted: 90,
+        fees: 0.25,
+      },
+      {
+        account: POOL2,
+        base: { currency: 'EUR', issuer: I1 },
+        counter: XRP,
+        amount: '4',
+        count: 2,
+        converted: 20,
+        fees: 0.5,
+      },
+      { account: POOL3, base: XYZ, counter: BTC, amount: '5', count: 1, converted: 10, fees: 0.125 },
+    ];
+    const display = `exchange_currency=XYZ&exchange_issuer=${I2}`;
+    const COLUMNS = [
+      'metric',
+      'period',
+      'toUnixTimestamp(start_time) AS start_time',
+      'toUnixTimestamp(end_time) AS end_time',
+      'component',
+      'base_currency',
+      'base_issuer',
+      'counter_currency',
+      'counter_issuer',
+      'amount',
+      'amount_f',
+      'toUInt64(count) AS count',
+      'rate_f',
+      'converted_f',
+      'config_version',
+      'version',
+      'fees_est_f',
+    ].join(', ');
+    const NEWEST = `metric = 'amm_volume' AND period = 'day'
+      AND version = (SELECT max(version) FROM ${Table.VolumeLive} WHERE metric = 'amm_volume' AND period = 'day')`;
+    const newestVersion = async (): Promise<number> =>
+      Number(
+        (
+          await h.ch.queryOne<{ newest: string }>(
+            `SELECT toUInt64(max(version)) AS newest FROM ${Table.VolumeLive} WHERE metric = 'amm_volume' AND period = 'day'`,
+          )
+        )?.newest,
+      );
+    let job: VolumeLiveRow[];
+
+    /** The live day set of the pools, a sentinel and then a row each, as a job tick writes it, under a version above all. */
+    async function writeSet(pools: Pool[]): Promise<void> {
+      const version = (await newestVersion()) + 1;
+      const row = (p?: Pool): VolumeLiveRow => ({
+        metric: 'amm_volume',
+        period: 'day',
+        start_time: END - DAY,
+        end_time: END,
+        component: p?.account ?? '',
+        base_currency: p?.base.currency ?? '',
+        base_issuer: p?.base.issuer ?? '',
+        counter_currency: p?.counter.currency ?? '',
+        counter_issuer: p?.counter.issuer ?? '',
+        amount: p?.amount ?? '0',
+        amount_f: p ? Number(p.amount) : 0,
+        count: p?.count ?? 0,
+        rate_f: p ? Number(p.amount) / p.converted : 0,
+        converted_f: p?.converted ?? 0,
+        config_version: markets.version,
+        version,
+        fees_est_f: p?.fees ?? null,
+      });
+      await h.ch.insert(Table.VolumeLive, [row(), ...pools.map(row)]);
+    }
+
+    beforeAll(async () => {
+      job = await h.ch.query<VolumeLiveRow>(`SELECT ${COLUMNS} FROM ${Table.VolumeLive} WHERE ${NEWEST}`);
+      expect(job.length).toBeGreaterThan(1);
+    });
+
+    afterAll(async () => {
+      // the set the job wrote is the newest again: the tests after this one read it
+      const version = (await newestVersion()) + 1;
+      await h.ch.insert(
+        Table.VolumeLive,
+        job.map((r) => ({ ...r, version })),
+      );
+    });
+
+    it('the live day row has fees_est per component and their sum, converted like converted_amount, also with exchange_currency', async () => {
+      await writeSet(POOLS);
+      const plain = (await ok('/v2/network/amm_volume?live=day')).rows[0];
+      expect(Object.keys(plain)).toEqual([...ROW_KEYS, 'fees_est']);
+      for (const c of plain.components) expect(Object.keys(c)).toEqual([...AMM_KEYS, 'fees_est']);
+      expect(plain.components.map((c: Json) => [c.amm_account, c.converted_amount, c.fees_est])).toEqual([
+        [POOL1, '90', '0.25'],
+        [POOL2, '20', '0.5'],
+        [POOL3, '10', '0.125'],
+      ]);
+      expect(typeof plain.fees_est).toBe('string');
+      expect([plain.total, plain.fees_est]).toEqual(['120', '0.875']);
+      expect([plain.start_time, plain.end_time]).toEqual([iso(END - DAY), iso(END)]);
+
+      // X = 0.5 (the latest rate of the native currency against XYZ): the estimates are converted as converted_amount is
+      const shown = (await ok(`/v2/network/amm_volume?live=day&${display}`)).rows[0];
+      expect(Object.keys(shown)).toEqual([...ROW_KEYS, 'fees_est']);
+      expect(shown.exchange_rate).toBe('0.50000000');
+      expect(shown.components.map((c: Json) => [c.amm_account, c.converted_amount, c.fees_est])).toEqual([
+        [POOL1, '45', '0.125'],
+        [POOL2, '10', '0.25'],
+        [POOL3, '5', '0.0625'],
+      ]);
+      for (const c of shown.components) expect(Object.keys(c)).toEqual([...AMM_KEYS, 'fees_est']);
+      expect([shown.total, shown.fees_est]).toEqual(['60', '0.4375']);
+
+      // the native currency as the display currency is no conversion
+      expect(await ok('/v2/network/amm_volume?live=day&exchange_currency=xrp')).toEqual(
+        await ok('/v2/network/amm_volume'),
+      );
+    });
+
+    it('a pool whose estimate is 0 has "0": a known estimate, not a missing one', async () => {
+      await writeSet(POOLS.map((p) => ({ ...p, fees: p.account === POOL3 ? 0 : p.fees })));
+      const row = (await ok('/v2/network/amm_volume?live=day')).rows[0];
+      expect(row.components.map((c: Json) => c.fees_est)).toEqual(['0.25', '0.5', '0']);
+      expect(row.fees_est).toBe('0.75');
+    });
+
+    it('a component without fees_est leaves the row without one', async () => {
+      await writeSet(POOLS.map((p) => ({ ...p, fees: p.account === POOL2 ? null : p.fees })));
+      for (const qs of ['', `&${display}`]) {
+        const row = (await ok(`/v2/network/amm_volume?live=day${qs}`)).rows[0];
+        expect(Object.keys(row)).toEqual(ROW_KEYS);
+        expect(row.components.map((c: Json) => [c.amm_account, Object.keys(c)])).toEqual([
+          [POOL1, [...AMM_KEYS, 'fees_est']],
+          [POOL2, AMM_KEYS],
+          [POOL3, [...AMM_KEYS, 'fees_est']],
+        ]);
+        expect(row.components.map((c: Json) => c.fees_est)).toEqual(
+          qs ? ['0.125', undefined, '0.0625'] : ['0.25', undefined, '0.125'],
+        );
+      }
+      // no pool has one: no key anywhere
+      await writeSet(POOLS.map((p) => ({ ...p, fees: null })));
+      const none = (await ok('/v2/network/amm_volume?live=day')).rows[0];
+      expect(Object.keys(none)).toEqual(ROW_KEYS);
+      for (const c of none.components) expect(Object.keys(c)).toEqual(AMM_KEYS);
+    });
+
+    it('a day without a swap is a row without components, and so without fees_est', async () => {
+      await writeSet([]);
+      const row = (await ok('/v2/network/amm_volume?live=day')).rows[0];
+      expect(row.components).toEqual([]);
+      expect(Object.keys(row)).toEqual(ROW_KEYS);
+    });
+
+    it('live=3day, the historical rows and the other metrics have no fees_est', async () => {
+      // the day set has estimates, so that a leak of them into the answer of any other set would show
+      await writeSet(POOLS);
+      const keysOf = (r: Json): string[] => [...Object.keys(r), ...r.components.flatMap((c: Json) => Object.keys(c))];
+      const bodies = [
+        ...['hour', '3day', '7day', '30day'].map((p) => `/v2/network/amm_volume?live=${p}`),
+        `/v2/network/amm_volume?${RANGE}`,
+        `/v2/network/amm_volume?${RANGE}&interval=week`,
+        `/v2/network/amm_volume?${RANGE}&interval=month`,
+        `/v2/network/amm_volume?live=3day&${display}`,
+        `/v2/network/amm_volume?${RANGE}&${display}`,
+        '/v2/network/exchange_volume?live=day',
+        '/v2/network/exchange_volume?live=30day',
+        `/v2/network/exchange_volume?${RANGE}`,
+        '/v2/network/payment_volume?live=day',
+      ];
+      for (const path of bodies) {
+        const res = await ok(path);
+        expect(res.rows.length).toBeGreaterThan(0);
+        for (const r of res.rows) expect([path, keysOf(r).includes('fees_est')]).toEqual([path, false]);
+      }
+      // the periods that have components, so the check is of something
+      expect((await ok('/v2/network/amm_volume?live=30day')).rows[0].components.length).toBeGreaterThan(20);
+      expect((await ok('/v2/network/amm_volume?live=3day')).rows[0].components.length).toBeGreaterThan(5);
+    });
+
+    it('the CSV has the fees_est columns', async () => {
+      await writeSet(POOLS);
+      const res = await get('/v2/network/amm_volume?live=day&format=csv');
+      expect(res.status).toBe(200);
+      const [header, line, ...rest] = res.text.trim().split('\n');
+      expect(rest).toEqual([]);
+      const names = header.split(',').map((c) => c.slice(1, -1));
+      const cells = line.split(',').map((c) => c.slice(1, -1));
+      expect(cells).toHaveLength(names.length);
+      const at = (name: string): string => cells[names.indexOf(name)];
+      // a column per component, right after its converted_amount, and the row's after end_time
+      POOLS.forEach((p, i) => {
+        expect(names.indexOf(`components[${i}].fees_est`)).toBe(names.indexOf(`components[${i}].converted_amount`) + 1);
+        expect(at(`components[${i}].amm_account`)).toBe(p.account);
+        expect(at(`components[${i}].fees_est`)).toBe(String(p.fees));
+      });
+      expect(names.slice(-3)).toEqual(['start_time', 'end_time', 'fees_est']);
+      expect(at('fees_est')).toBe('0.875');
+      expect(at('total')).toBe('120');
+
+      // a component without an estimate has no column of its own, and neither has the row
+      await writeSet(POOLS.map((p) => ({ ...p, fees: p.account === POOL2 ? null : p.fees })));
+      const partial = (await get('/v2/network/amm_volume?live=day&format=csv')).text.trim().split('\n')[0];
+      expect(partial).toMatch(/"components\[0\]\.fees_est"/);
+      expect(partial).not.toMatch(/"components\[1\]\.fees_est"/);
+      expect(partial).toMatch(/"components\[2\]\.fees_est"/);
+      expect(partial).toMatch(/"start_time","end_time"$/);
     });
   });
 

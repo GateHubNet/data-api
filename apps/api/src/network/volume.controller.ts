@@ -140,7 +140,10 @@ export class VolumeController {
       'and `end`, the live row of the rolling period `live` (hour, day, 3day, 7day, 30day; default day). With them, a row per ' +
       '`interval` (day, week from Monday, month, UTC) for the days that were computed: a bucket is a row when it starts within ' +
       '`start` and `end`, whole. `exchange_currency` / `exchange_issuer` show the amounts in another currency, as for the ' +
-      'exchange volume. The trade volume (`exchange_volume`) counts the swaps as well.',
+      'exchange volume. The live row of the rolling day (`live=day`) also has `fees_est`, the estimated trading fees the pool ' +
+      'charged on the swaps of the 24 hours, per pool and as the sum of the row, in the currency of `converted_amount`; a pool ' +
+      'whose fees are not known has none, and then the row has none. The other rows have no `fees_est`: the fees of a pool per ' +
+      'day are in `/v2/amm/pools/{pool}/history?interval=day`. The trade volume (`exchange_volume`) counts the swaps as well.',
   })
   @ApiQuery({
     name: 'live',

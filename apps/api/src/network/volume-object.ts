@@ -14,8 +14,9 @@ import { fmtTime, precision8 } from '../common/format';
  * is `components, count, exchange, total, exchange_rate, start_time, end_time`; a trade component is the object the
  * aggregation script built, `count, rate, amount, base, counter, converted_amount`, and a payment component
  * `currency, issuer, amount, count, rate, converted_amount` (`issuer` is absent for the native currency, which has none). An AMM
- * component has no original; its keys are `amm_account, base, counter, count, amount, rate, converted_amount`, the sides
- * formatted as a trade component formats them.
+ * component has no original; its keys are `amm_account, base, counter, count, amount, rate, converted_amount, fees_est?`, the
+ * sides formatted as a trade component formats them. `fees_est` (the estimated fees of a pool, converted like `converted_amount`)
+ * is there on the live day row only, where the row has the sum of them after `end_time` (D2b.3, D9).
  */
 
 export type VolumeAsset = { currency: string; issuer?: string };
@@ -38,6 +39,8 @@ export interface AmmComponent {
   amount: string;
   rate: string;
   converted_amount: string;
+  /** The estimated trading fees of the pool in the window, in the unit of `converted_amount`: the live day row only. */
+  fees_est?: string;
 }
 
 export interface PaymentComponent {
@@ -57,6 +60,8 @@ export interface VolumeRow {
   exchange_rate: string;
   start_time: string;
   end_time?: string;
+  /** The sum of the `fees_est` of the components: there when the row lists a component and every listed one has it. */
+  fees_est?: string;
 }
 
 /** The columns of a stored set that the API reads (see `volume_daily`, `volume_live`). */
@@ -70,6 +75,8 @@ export interface StoredVolumeRow {
   /** A 64-bit column may come back as text. */
   count: number | string;
   converted_f: number | string;
+  /** Only the live read selects it: NULL when the estimate is not known. A Float64 may come back as text. */
+  fees_est_f?: number | string | null;
 }
 
 /** One component of a bucket, the days of it added up. `converted` is in the native currency. */
@@ -81,6 +88,11 @@ export interface VolumePart {
   amount: BigNumber;
   count: number;
   converted: number;
+  /**
+   * The estimated fees in the native currency (D2b.3). Absent when the rows were read without them; `null` when they are not
+   * known, which a part of several rows is when any of them is.
+   */
+  feesEst?: number | null;
 }
 
 /** A row to be: the parts of a bucket (a live period, a day, a week, a month) from `start` to `end`, exclusive (unix seconds). */
@@ -111,6 +123,9 @@ const volumeAsset = (a: Asset): VolumeAsset =>
  * put an amount in the sum that nothing was converted for, and `amount / converted_amount` would no longer be a rate. Such
  * rows are parts of their own (never listed, see `toVolumeRow`), which keeps their payments in the `count` of the row only,
  * as a daily set, which does not list them either, has them.
+ *
+ * The estimated fees of a live row (`fees_est_f`, D2b.3) are a part's too, when the rows were read with them: `null` is a row
+ * whose estimate is not known, and a part of several rows is not known if any is (part of the fees is never shown as all).
  */
 export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
   const parts = new Map<string, VolumePart>();
@@ -127,11 +142,16 @@ export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
       row.counter_issuer,
       Number(row.converted_f) > 0 ? 'converted' : 'unconverted',
     ].join('\u0000');
+    // undefined: the rows were read without the column; null: the estimate is not known
+    const fees = row.fees_est_f === undefined ? undefined : row.fees_est_f === null ? null : Number(row.fees_est_f);
     const found = parts.get(id);
     if (found) {
       found.amount = found.amount.plus(row.amount);
       found.count += Number(row.count);
       found.converted += Number(row.converted_f);
+      if (found.feesEst !== undefined || fees !== undefined) {
+        found.feesEst = found.feesEst == null || fees == null ? null : found.feesEst + fees;
+      }
     } else {
       parts.set(id, {
         component: row.component,
@@ -140,6 +160,7 @@ export function sumParts(rows: readonly StoredVolumeRow[]): VolumePart[] {
         amount: new BigNumber(row.amount),
         count: Number(row.count),
         converted: Number(row.converted_f),
+        ...(fees !== undefined && { feesEst: fees }),
       });
     }
   }
@@ -189,6 +210,7 @@ export function toVolumeRow(
         amount,
         rate: rateOut,
         converted_amount: converted,
+        ...(p.feesEst != null && { fees_est: String(p.feesEst * x) }),
       };
     }
     if (metric === 'trade_volume') {
@@ -212,6 +234,11 @@ export function toVolumeRow(
   });
 
   const total = listed.reduce((sum, p) => sum + p.converted, 0);
+  // D9: the row has the sum of the estimates when it lists a component and every listed one has its estimate
+  const feesEst =
+    metric === 'amm_volume' && listed.length > 0 && listed.every((p) => p.feesEst != null)
+      ? listed.reduce((sum, p) => sum + (p.feesEst as number), 0)
+      : undefined;
   return {
     components,
     count: bucket.parts.reduce((sum, p) => sum + p.count, 0),
@@ -220,5 +247,6 @@ export function toVolumeRow(
     exchange_rate: precision8(display ? display.rate : 1),
     start_time: fmtTime(bucket.start),
     ...(bucket.end !== undefined && { end_time: fmtTime(bucket.end) }),
+    ...(feesEst !== undefined && { fees_est: String(feesEst * x) }),
   };
 }
