@@ -8,7 +8,6 @@ import {
   pairHourSets,
   parseContextFor,
   partitionSetVersions,
-  RatesService,
   rollupStates,
   runMigrations,
   Table,
@@ -18,7 +17,16 @@ import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { readDirtyRanges } from '../src/aggregator/agg-dirty';
 import { defaultAggregateFunctions } from '../src/aggregator/aggregate-job-deps';
-import { AggregatorOptions, AggregatorService } from '../src/aggregator/aggregator.service';
+import { AggregatorService } from '../src/aggregator/aggregator.service';
+import {
+  aggregator,
+  FakeMetrics,
+  fakeMetrics,
+  GENEROUS,
+  rateSentinels,
+  rollupSentinels,
+  stopAggregators,
+} from './aggregates-e2e-support';
 
 /**
  * The account and market jobs of the `AggregatorService` against a real ClickHouse, together with the stats jobs: the 54 mock
@@ -43,26 +51,10 @@ const NOW = new Date('2015-01-15T12:00:00Z');
 /** The account that is heavy, and the ledger (2015-01-14T18:27:10Z) its balance changes are on. */
 const HEAVY = 'rHeavyAccount'.padEnd(34, 'x');
 const HEAVY_LEDGER = 11_119_600;
-const NOOP = (): void => undefined;
-
-/** The metrics of the aggregator and of the account and market jobs, over fakes. */
-const fakeMetrics = () => ({
-  aggregatorRunsTotal: { inc: jest.fn() },
-  aggregatorErrorsTotal: { inc: jest.fn() },
-  aggregatorStatsLagSeconds: { set: jest.fn() },
-  pairHourlyMissingHours: { set: jest.fn() },
-  marketsLiveAgeSeconds: { set: jest.fn() },
-  marketsLiveAmmShareKnown: { set: jest.fn() },
-  ratesDailyMissingDays: { set: jest.fn() },
-  accountRollupsHeavyAccounts: { set: jest.fn() },
-  accountRollupsPendingAccounts: { set: jest.fn() },
-});
-type FakeMetrics = ReturnType<typeof fakeMetrics>;
 
 describe('AggregatorService account and market jobs (e2e)', () => {
   let container: StartedClickHouse;
   const services: ClickHouseService[] = [];
-  const aggregators: AggregatorService[] = [];
   let dbCounter = 0;
 
   beforeAll(async () => {
@@ -70,7 +62,7 @@ describe('AggregatorService account and market jobs (e2e)', () => {
   });
 
   afterAll(async () => {
-    for (const svc of aggregators) await svc.stop();
+    await stopAggregators();
     for (const svc of services) await svc.onModuleDestroy();
     await container?.container.stop();
   });
@@ -99,36 +91,6 @@ describe('AggregatorService account and market jobs (e2e)', () => {
     return svc;
   }
 
-  /**
-   * An aggregator with the account and market jobs (and the stats jobs; the volume jobs have their own e2e), with `aggregates`
-   * over the mock's rates and 5 as the size of a heavy account. Its errors are collected in `errors`.
-   */
-  function aggregator(
-    ch: ClickHouseService,
-    metrics: FakeMetrics,
-    options: AggregatorOptions = {},
-  ): { svc: AggregatorService; errors: jest.Mock } {
-    const errors = jest.fn();
-    const svc = new AggregatorService(ch, metrics as never, undefined, {
-      logger: { log: NOOP, warn: NOOP, debug: NOOP, error: errors },
-      aggregates: { rates: new RatesService(ch, 'XRP'), accountRollupMinRows: 5 },
-      ...options,
-    });
-    aggregators.push(svc);
-    return { svc, errors };
-  }
-
-  /** Budgets that are never the limit of a tick or of a job (a slow machine must not make a test of what is written flaky). */
-  const GENEROUS: AggregatorOptions = {
-    tickBudgetMs: 10 * 60_000,
-    budgetsMs: {
-      pair_hourly: 5 * 60_000,
-      markets_live: 5 * 60_000,
-      rates_daily: 5 * 60_000,
-      account_rollups: 5 * 60_000,
-    },
-  };
-
   const runs = (metrics: FakeMetrics): string[] =>
     metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job);
 
@@ -139,26 +101,6 @@ describe('AggregatorService account and market jobs (e2e)', () => {
         WHERE base_currency = '' AND counter_currency = '' ORDER BY hour`,
     );
     return rows.map((r) => r.hour);
-  }
-
-  /** `[version, stale]` of every sentinel written for a day of `native_rates_daily`, oldest first (merges are stopped). */
-  async function rateSentinels(ch: ClickHouseService, day: string): Promise<Array<[number, number]>> {
-    const rows = await ch.query<{ version: number | string; stale: number | string }>(
-      `SELECT toUInt64(version) AS version, stale FROM ${Table.NativeRatesDaily}
-        WHERE currency = '' AND issuer = '' AND day = {day:Date} ORDER BY version`,
-      { day },
-    );
-    return rows.map((r): [number, number] => [Number(r.version), Number(r.stale)]);
-  }
-
-  /** The versions of the sentinels of an (account, day) rollup set, oldest first (merges are stopped). */
-  async function rollupSentinels(ch: ClickHouseService, account: string, day: string): Promise<number[]> {
-    const rows = await ch.query<{ version: number | string }>(
-      `SELECT toUInt64(version) AS version FROM ${Table.AccountRollupDays}
-        WHERE account = {account:String} AND day = {day:Date} ORDER BY version`,
-      { account, day },
-    );
-    return rows.map((r) => Number(r.version));
   }
 
   const versionsOfHours = async (ch: ClickHouseService, from: string, to: string): Promise<Map<number, number>> =>

@@ -15,9 +15,17 @@ import {
 } from '@gatehub/data-api-shared';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { readDirtyRanges } from '../src/aggregator/agg-dirty';
-import { AggregatorOptions, AggregatorService } from '../src/aggregator/aggregator.service';
 import { MARKETS_LONG_EVERY_TICKS } from '../src/aggregator/markets-live.job-runner';
 import { rangeIngest } from '../src/cli/range-ingest';
+import {
+  aggregator,
+  FakeMetrics,
+  fakeMetrics,
+  GENEROUS,
+  rateSentinels,
+  rollupSentinels,
+  stopAggregators,
+} from './aggregates-e2e-support';
 import { ammTemplate, syntheticChain } from './synthetic-chain';
 
 /**
@@ -96,24 +104,9 @@ const SYNC_DELETE = { settings: { lightweight_deletes_sync: '2' } } as const;
 /** Options that keep `range-ingest` quick and the output of the suite clean. */
 const FAST = { retryBackoffMs: 1, quiescenceTimeoutMs: 5_000, maxTransientWaitMs: 0, logger: QUIET };
 
-/** The metrics of the aggregator and of the account and market jobs, over fakes. */
-const fakeMetrics = () => ({
-  aggregatorRunsTotal: { inc: jest.fn() },
-  aggregatorErrorsTotal: { inc: jest.fn() },
-  aggregatorStatsLagSeconds: { set: jest.fn() },
-  pairHourlyMissingHours: { set: jest.fn() },
-  marketsLiveAgeSeconds: { set: jest.fn() },
-  marketsLiveAmmShareKnown: { set: jest.fn() },
-  ratesDailyMissingDays: { set: jest.fn() },
-  accountRollupsHeavyAccounts: { set: jest.fn() },
-  accountRollupsPendingAccounts: { set: jest.fn() },
-});
-type FakeMetrics = ReturnType<typeof fakeMetrics>;
-
 describe('AggregatorService after a range-ingest --reprocess from parser 1 to parser 2 (e2e)', () => {
   let container: StartedClickHouse;
   const services: ClickHouseService[] = [];
-  const aggregators: AggregatorService[] = [];
   let dbCounter = 0;
 
   beforeAll(async () => {
@@ -121,7 +114,7 @@ describe('AggregatorService after a range-ingest --reprocess from parser 1 to pa
   });
 
   afterAll(async () => {
-    for (const svc of aggregators) await svc.stop();
+    await stopAggregators();
     for (const svc of services) await svc.onModuleDestroy();
     await container?.container.stop();
   });
@@ -172,48 +165,8 @@ describe('AggregatorService after a range-ingest --reprocess from parser 1 to pa
     return svc;
   }
 
-  /**
-   * An aggregator with the account and market jobs (and the stats jobs), with `aggregates` over the world's rates and 5 as the
-   * size of a heavy account. Its errors are collected in `errors`.
-   */
-  function aggregator(
-    ch: ClickHouseService,
-    metrics: FakeMetrics,
-    options: AggregatorOptions = {},
-  ): { svc: AggregatorService; errors: jest.Mock } {
-    const errors = jest.fn();
-    const svc = new AggregatorService(ch, metrics as never, undefined, {
-      logger: { log: NOOP, warn: NOOP, debug: NOOP, error: errors },
-      aggregates: { rates: new RatesService(ch, 'XRP'), accountRollupMinRows: 5 },
-      ...options,
-    });
-    aggregators.push(svc);
-    return { svc, errors };
-  }
-
-  /** Budgets that are never the limit of a tick or of a job (a slow machine must not make a test of what is written flaky). */
-  const GENEROUS: AggregatorOptions = {
-    tickBudgetMs: 10 * 60_000,
-    budgetsMs: {
-      pair_hourly: 5 * 60_000,
-      markets_live: 5 * 60_000,
-      rates_daily: 5 * 60_000,
-      account_rollups: 5 * 60_000,
-    },
-  };
-
   const count = async (ch: ClickHouseService, table: Table, where = '1'): Promise<number> =>
     Number((await ch.queryOne<{ n: string | number }>(`SELECT count() AS n FROM ${table} WHERE ${where}`))?.n);
-
-  /** `[version, stale]` of every sentinel written for a day of `native_rates_daily`, oldest first (merges are stopped). */
-  async function rateSentinels(ch: ClickHouseService, day: string): Promise<Array<[number, number]>> {
-    const rows = await ch.query<{ version: number | string; stale: number | string }>(
-      `SELECT toUInt64(version) AS version, stale FROM ${Table.NativeRatesDaily}
-        WHERE currency = '' AND issuer = '' AND day = {day:Date} ORDER BY version`,
-      { day },
-    );
-    return rows.map((r): [number, number] => [Number(r.version), Number(r.stale)]);
-  }
 
   /** The rates of the set of a day under one version, `currency/issuer` to the rate as it is stored. */
   async function storedRates(ch: ClickHouseService, day: string, version: number): Promise<Map<string, string>> {
@@ -229,16 +182,6 @@ describe('AggregatorService after a range-ingest --reprocess from parser 1 to pa
   async function ratesNow(rates: RatesService, day: string): Promise<Map<string, string>> {
     const ofDay = await rates.dailyNativeRatesOfDay(new Date(`${day}T00:00:00Z`));
     return new Map([...ofDay.values()].map((r) => [`${r.asset.currency}/${r.asset.issuer ?? ''}`, r.rate.toString()]));
-  }
-
-  /** The versions of the sentinels of an (account, day) rollup set, oldest first (merges are stopped). */
-  async function rollupSentinels(ch: ClickHouseService, account: string, day: string): Promise<number[]> {
-    const rows = await ch.query<{ version: number | string }>(
-      `SELECT toUInt64(version) AS version FROM ${Table.AccountRollupDays}
-        WHERE account = {account:String} AND day = {day:Date} ORDER BY version`,
-      { account, day },
-    );
-    return rows.map((r) => Number(r.version));
   }
 
   /** The trades the rollup set of an (account, day) under one version counts. */
@@ -409,7 +352,9 @@ describe('AggregatorService after a range-ingest --reprocess from parser 1 to pa
     expect(await count(ch, Table.Exchanges, "amm_account != ''")).toBe(CHAIN_LEDGERS * SWAPS_PER_LEDGER);
     expect(await readDirtyRanges(ch, 10)).toHaveLength(1);
 
-    // the range is drained within a few ticks; then a tick that makes the long periods again (every fifth run)
+    // the range is drained within a few ticks; then a tick that makes the long periods again. The markets runner counts its
+    // runs from its first tick and makes them on the 1st, 6th, 11th ... (`MARKETS_LONG_EVERY_TICKS`): `ticks` counts the
+    // same runs, as this aggregator ticks only through `tick()`, so the run after a multiple of it is a long one
     await settle();
     while (ticks % MARKETS_LONG_EVERY_TICKS !== 0) await tick();
     await tick();
@@ -455,6 +400,7 @@ describe('AggregatorService after a range-ingest --reprocess from parser 1 to pa
       const sets = await marketsSets(ch, period);
       for (const filter of FILTERS) {
         expect([period, filter, sets[filter].total === null]).toEqual([period, filter, false]);
+        // (`amm_pool` is only checked to be present: the `amm_pools` job is not run here, so every flag is 0)
         for (const [pair, { share, pool }] of sets[filter].pairs) {
           expect([period, filter, pair, share !== null, pool !== null]).toEqual([period, filter, pair, true, true]);
         }
