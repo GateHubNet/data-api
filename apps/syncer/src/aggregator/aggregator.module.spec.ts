@@ -19,6 +19,7 @@ const fakeMetrics = () => ({
   aggregatorStatsLagSeconds: { set: jest.fn() },
   pairHourlyMissingHours: { set: jest.fn() },
   marketsLiveAgeSeconds: { set: jest.fn() },
+  marketsLiveAmmShareKnown: { set: jest.fn() },
   ratesDailyMissingDays: { set: jest.fn() },
   accountRollupsHeavyAccounts: { set: jest.fn() },
   accountRollupsPendingAccounts: { set: jest.fn() },

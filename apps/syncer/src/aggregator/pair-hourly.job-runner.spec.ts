@@ -164,7 +164,36 @@ describe('PairHourlyJobRunner', () => {
     expect(hours.attempts(PREVIOUS)).toBe(1);
   });
 
-  it('back-fills the hours of the last 31 days that have no final set of config version 1, newest first; a wholly missing UTC day is one call of 24 hours', async () => {
+  it('an hour of the last 31 days whose newest set has config version 1 is due, final or not, newest first', async () => {
+    expect(PAIR_HOURLY_CONFIG_VERSION).toBe(2);
+    hours.fill(WINDOW_START, CURRENT + HOUR);
+    // the hours D2 left: sets of config version 1, final and not final, among hours of version 2
+    const final = unix('2026-10-14T07:00:00Z');
+    const notFinal = unix('2026-10-13T03:00:00Z');
+    const oldest = WINDOW_START;
+    hours.put(final, { configVersion: 1, final: true });
+    hours.put(notFinal, { configVersion: 1, final: false });
+    hours.put(oldest, { configVersion: 1, final: true });
+
+    const r = runner();
+    await run(r);
+    expect(hours.ranges()).toEqual([
+      [iso(CURRENT), iso(CURRENT + HOUR)], // the current hour first
+      [iso(final), iso(final + HOUR)],
+      [iso(notFinal), iso(notFinal + HOUR)],
+      [iso(oldest), iso(oldest + HOUR)],
+    ]);
+    expect(fake.failures).toEqual([]);
+    // the hours were counted as missing until they were computed
+    expect(fake.metrics.pairHourlyMissingHours.set).toHaveBeenLastCalledWith(0);
+
+    // they are written at version 2 now: only the current hour is left
+    hours.calls = [];
+    await run(r);
+    expect(hours.ranges()).toEqual([[iso(CURRENT), iso(CURRENT + HOUR)]]);
+  });
+
+  it('back-fills the hours of the last 31 days that have no final set of the current config version, newest first; a wholly missing UTC day is one call of 24 hours', async () => {
     hours.fill(WINDOW_START, CURRENT + HOUR);
     // an hour of a set of the previous config version, and an hour whose set is not final though the ingest has passed it
     hours.put(unix('2026-10-14T07:00:00Z'), { configVersion: PAIR_HOURLY_CONFIG_VERSION - 1, final: true });

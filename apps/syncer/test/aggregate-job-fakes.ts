@@ -29,6 +29,7 @@ export interface FakeDeps {
   readonly metrics: {
     pairHourlyMissingHours: { set: jest.Mock };
     marketsLiveAgeSeconds: { set: jest.Mock };
+    marketsLiveAmmShareKnown: { set: jest.Mock };
     ratesDailyMissingDays: { set: jest.Mock };
     accountRollupsHeavyAccounts: { set: jest.Mock };
     accountRollupsPendingAccounts: { set: jest.Mock };
@@ -49,6 +50,7 @@ export function fakeDeps(o: { budgetMs?: number } = {}): FakeDeps {
   const metrics = {
     pairHourlyMissingHours: { set: jest.fn() },
     marketsLiveAgeSeconds: { set: jest.fn() },
+    marketsLiveAmmShareKnown: { set: jest.fn() },
     ratesDailyMissingDays: { set: jest.fn() },
     accountRollupsHeavyAccounts: { set: jest.fn() },
     accountRollupsPendingAccounts: { set: jest.fn() },

@@ -52,6 +52,7 @@ const fakeMetrics = () => ({
   aggregatorStatsLagSeconds: { set: jest.fn() },
   pairHourlyMissingHours: { set: jest.fn() },
   marketsLiveAgeSeconds: { set: jest.fn() },
+  marketsLiveAmmShareKnown: { set: jest.fn() },
   ratesDailyMissingDays: { set: jest.fn() },
   accountRollupsHeavyAccounts: { set: jest.fn() },
   accountRollupsPendingAccounts: { set: jest.fn() },
@@ -192,12 +193,22 @@ describe('AggregatorService account and market jobs (e2e)', () => {
     expect(traded.map((r) => r.hour)).toEqual(['2015-01-14 18:00:00', '2015-01-14 19:00:00']);
     expect(metrics.pairHourlyMissingHours.set).toHaveBeenLastCalledWith(0);
 
-    // markets_live: the day set (the first run of the job is a long one: all three periods), made of those hours
+    // markets_live: the sets (the first run of the job is a long one: all three periods, each with its three filters), made of
+    // those hours
     const markets = await ch.query<{ period: string; amm: string; pairs: number | string }>(
-      `SELECT period, amm, pairs_traded AS pairs FROM ${Table.MarketsLive} WHERE base_currency = '' ORDER BY period`,
+      `SELECT period, amm, pairs_traded AS pairs FROM ${Table.MarketsLive}
+        WHERE base_currency = ''`,
     );
-    expect(markets.map((r) => `${r.period}/${r.amm}`)).toEqual(['30day/include', '7day/include', 'day/include']);
-    expect(Number(markets.find((r) => r.period === 'day')?.pairs)).toBeGreaterThan(0);
+    expect(markets.map((r) => `${r.period}/${r.amm}`).sort()).toEqual(
+      ['30day', '7day', 'day'].flatMap((period) => ['exclude', 'include', 'only'].map((amm) => `${period}/${amm}`)),
+    );
+    expect(Number(markets.find((r) => r.period === 'day' && r.amm === 'include')?.pairs)).toBeGreaterThan(0);
+    // and the gauge of the AMM share is set for every period
+    expect(metrics.marketsLiveAmmShareKnown.set.mock.calls.map(([labels]) => labels.period)).toEqual([
+      'day',
+      '7day',
+      '30day',
+    ]);
 
     // rates_daily: the days with trades against the native currency, from the first one to the newest final day (the 14th)
     const rateDays = await ch.query<{ day: string }>(

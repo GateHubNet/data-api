@@ -25,7 +25,9 @@ export const MARKETS_LONG_EVERY_TICKS = 5;
  *   what alerts.
  * - A set that fails is logged and counted as `markets_live` (`deps.failed`), waits 5 minutes before it is tried again and
  *   twice as long after each further failure, up to an hour, and the other periods go on.
- * - After its sets the job reads the `end_time` of the newest set of each period and sets `syncer_markets_live_age_seconds`.
+ * - After its sets the job reads the `end_time` of the newest set of each period and sets `syncer_markets_live_age_seconds`, then
+ *   whether the newest `include` set of each period has `total_amm_share` and sets `syncer_markets_live_amm_share_known` (the
+ *   gate of `AMM_DATA`, spec D2b.1): 1 when it has, 0 when it has not or the period has no set.
  */
 export class MarketsLiveJobRunner {
   private readonly fns: AggregateFunctions;
@@ -90,6 +92,7 @@ export class MarketsLiveJobRunner {
       }
     }
     await this.reportAges();
+    await this.reportAmmShareKnown();
   }
 
   /** What a set came to: the first skip of a gap is said (a warning), a written set ends the gap. */
@@ -125,6 +128,22 @@ export class MarketsLiveJobRunner {
     const now = deps.clock() / 1000;
     for (const [period, end] of ends) {
       deps.metrics.marketsLiveAgeSeconds.set({ period }, Math.max(0, Math.floor(now - end)));
+    }
+  }
+
+  /** `syncer_markets_live_amm_share_known{period}`: 1 when the newest `include` set of the period has `total_amm_share`, else 0. */
+  private async reportAmmShareKnown(): Promise<void> {
+    const { deps } = this;
+    if (!deps.metrics || deps.closing()) return;
+    let known: Map<MarketsPeriod, boolean>;
+    try {
+      known = await this.fns.marketsAmmShareKnown(deps.ch);
+    } catch (err) {
+      deps.failed('markets_live', err, ' reading whether the AMM share is known');
+      return;
+    }
+    for (const period of MARKETS_PERIODS) {
+      deps.metrics.marketsLiveAmmShareKnown.set({ period }, known.get(period) === true ? 1 : 0);
     }
   }
 }

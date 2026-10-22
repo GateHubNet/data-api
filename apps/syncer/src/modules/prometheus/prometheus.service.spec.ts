@@ -86,10 +86,14 @@ describe('PrometheusService', () => {
     service.pairHourlyMissingHours.set(3);
     service.marketsLiveAgeSeconds.set({ period: 'day' }, 75);
     service.marketsLiveAgeSeconds.set({ period: '30day' }, 610);
+    service.marketsLiveAmmShareKnown.set({ period: 'day' }, 1);
+    service.marketsLiveAmmShareKnown.set({ period: '7day' }, 0);
 
     const text = await service.getMetrics();
     const pair = 'Hours of the last 31 days without a set of the current config version.';
     const age = 'Now minus the end_time of the newest include set.';
+    const known =
+      '1 when the newest include markets set of the period has total_amm_share (every ledger of its window parsed with AMM), else 0.';
     expect(text).toContain(
       `# HELP syncer_pair_hourly_missing_hours ${pair}\n# TYPE syncer_pair_hourly_missing_hours gauge\n`,
     );
@@ -99,10 +103,16 @@ describe('PrometheusService', () => {
     );
     expect(text).toMatch(/^syncer_markets_live_age_seconds\{period="day"\} 75$/m);
     expect(text).toMatch(/^syncer_markets_live_age_seconds\{period="30day"\} 610$/m);
+    expect(text).toContain(
+      `# HELP syncer_markets_live_amm_share_known ${known}\n# TYPE syncer_markets_live_amm_share_known gauge\n`,
+    );
+    expect(text).toMatch(/^syncer_markets_live_amm_share_known\{period="day"\} 1$/m);
+    expect(text).toMatch(/^syncer_markets_live_amm_share_known\{period="7day"\} 0$/m);
     const labels = (name: string): string[] | undefined =>
       (service.registry.getSingleMetric(name) as unknown as { labelNames: string[] } | undefined)?.labelNames;
     expect(labels('syncer_pair_hourly_missing_hours')).toEqual([]);
     expect(labels('syncer_markets_live_age_seconds')).toEqual(['period']);
+    expect(labels('syncer_markets_live_amm_share_known')).toEqual(['period']);
   });
 
   it('exposes the gauges of the rates_daily and account_rollups jobs, by name, type, label set and help text (spec section 11)', async () => {

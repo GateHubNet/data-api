@@ -8,6 +8,7 @@ import {
   firstChangeDay,
   firstNativeTradeDay,
   heavyAccounts,
+  marketsAmmShareKnown,
   marketsSetEndTimes,
   markRatesStale,
   newestLedgerClose,
@@ -99,6 +100,7 @@ export interface AggregateFunctions {
   pairHourSets: typeof pairHourSets;
   computeMarketsSet: typeof computeMarketsSet;
   marketsSetEndTimes: typeof marketsSetEndTimes;
+  marketsAmmShareKnown: typeof marketsAmmShareKnown;
   newestLedgerClose: typeof newestLedgerClose;
   firstLedgerClose: typeof firstLedgerClose;
   computeRatesDailySet: typeof computeRatesDailySet;
@@ -125,6 +127,7 @@ export function defaultAggregateFunctions(): AggregateFunctions {
     pairHourSets,
     computeMarketsSet,
     marketsSetEndTimes,
+    marketsAmmShareKnown,
     newestLedgerClose,
     firstLedgerClose,
     computeRatesDailySet,

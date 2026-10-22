@@ -171,6 +171,7 @@ class D2World {
         return { written: true, pairs: 1, startTime: this.newest - DAY, endTime: this.newest, ammShareKnown: true };
       },
       marketsSetEndTimes: async () => new Map(),
+      marketsAmmShareKnown: async () => new Map(),
       firstNativeTradeDay: async () => this.firstTradeDay,
       validRateDays: async () => new Map(),
       computeRatesDailySet: async (_ch, _rates, day) => {
@@ -242,6 +243,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     | 'aggregatorStatsLagSeconds'
     | 'pairHourlyMissingHours'
     | 'marketsLiveAgeSeconds'
+    | 'marketsLiveAmmShareKnown'
     | 'ratesDailyMissingDays'
     | 'accountRollupsHeavyAccounts'
     | 'accountRollupsPendingAccounts',
@@ -279,6 +281,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       aggregatorStatsLagSeconds: { inc: jest.fn(), set: jest.fn() },
       pairHourlyMissingHours: { inc: jest.fn(), set: jest.fn() },
       marketsLiveAgeSeconds: { inc: jest.fn(), set: jest.fn() },
+      marketsLiveAmmShareKnown: { inc: jest.fn(), set: jest.fn() },
       ratesDailyMissingDays: { inc: jest.fn(), set: jest.fn() },
       accountRollupsHeavyAccounts: { inc: jest.fn(), set: jest.fn() },
       accountRollupsPendingAccounts: { inc: jest.fn(), set: jest.fn() },
@@ -644,6 +647,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     for (const gauge of [
       'pairHourlyMissingHours',
       'marketsLiveAgeSeconds',
+      'marketsLiveAmmShareKnown',
       'ratesDailyMissingDays',
       'accountRollupsHeavyAccounts',
       'accountRollupsPendingAccounts',

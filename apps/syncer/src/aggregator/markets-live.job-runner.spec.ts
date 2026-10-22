@@ -16,7 +16,7 @@ interface Call {
 /**
  * The shared functions of `markets_live` as the runner calls them: `computeMarketsSet` records its call, takes `callMs` of the
  * fake clock and answers what `outcomes` says for the period (a set written by default; an `Error` is thrown);
- * `marketsSetEndTimes` answers `ends`. `order` is what was called, in order.
+ * `marketsSetEndTimes` answers `ends`, `marketsAmmShareKnown` answers `ammKnown`. `order` is what was called, in order.
  */
 class FakeMarkets {
   calls: Call[] = [];
@@ -25,6 +25,9 @@ class FakeMarkets {
   /** The `end_time` of the newest set of each period. */
   ends = new Map<MarketsPeriod, number>();
   endsError?: Error;
+  /** Whether the newest include set of each period has `total_amm_share`; a period without a set is not in the map. */
+  ammKnown = new Map<MarketsPeriod, boolean>();
+  ammKnownError?: Error;
   order: string[] = [];
   onCompute?: (period: MarketsPeriod) => void;
 
@@ -49,6 +52,11 @@ class FakeMarkets {
         this.order.push('ends');
         if (this.endsError) throw this.endsError;
         return new Map(this.ends);
+      },
+      marketsAmmShareKnown: async () => {
+        this.order.push('amm');
+        if (this.ammKnownError) throw this.ammKnownError;
+        return new Map(this.ammKnown);
       },
     };
   }
@@ -159,8 +167,8 @@ describe('MarketsLiveJobRunner', () => {
       [{ period: '7day' }, 3600],
       [{ period: '30day' }, 7200],
     ]);
-    // read after the sets of the run, once
-    expect(markets.order).toEqual(['day', '7day', '30day', 'ends']);
+    // read after the sets of the run, once (and the AMM share after it)
+    expect(markets.order).toEqual(['day', '7day', '30day', 'ends', 'amm']);
   });
 
   it('measures the age by the clock, not by the time of the tick; a set from the future is as old as nothing', async () => {
@@ -186,7 +194,7 @@ describe('MarketsLiveJobRunner', () => {
     expect(fake.metrics.marketsLiveAgeSeconds.set.mock.calls).toEqual([[{ period: 'day' }, 14]]);
   });
 
-  it('reads no ages without metrics', async () => {
+  it('reads no ages and no AMM share without metrics', async () => {
     await run(runner({ ...fake.deps, metrics: undefined }));
     expect(markets.order).toEqual(['day', '7day', '30day']);
   });
@@ -198,6 +206,58 @@ describe('MarketsLiveJobRunner', () => {
     expect(fake.failures[0].job).toBe('markets_live');
     expect(fake.failures[0].where).toContain('age');
     expect(fake.metrics.marketsLiveAgeSeconds.set).not.toHaveBeenCalled();
+  });
+
+  it('sets syncer_markets_live_amm_share_known per period after its sets: 1 when the newest include set has total_amm_share, 0 when not or when the period has no set', async () => {
+    markets.ammKnown = new Map<MarketsPeriod, boolean>([
+      ['day', true],
+      ['7day', false],
+    ]); // 30day has no set
+    await run(runner());
+    expect(fake.metrics.marketsLiveAmmShareKnown.set.mock.calls).toEqual([
+      [{ period: 'day' }, 1],
+      [{ period: '7day' }, 0],
+      [{ period: '30day' }, 0],
+    ]);
+    // read once, after the sets and the ages of the run
+    expect(markets.order).toEqual(['day', '7day', '30day', 'ends', 'amm']);
+
+    // it is set on every run, also on one that wrote the day set only
+    fake.metrics.marketsLiveAmmShareKnown.set.mockClear();
+    markets.ammKnown = new Map<MarketsPeriod, boolean>([
+      ['day', true],
+      ['7day', true],
+      ['30day', true],
+    ]);
+    await run(runner());
+    expect(fake.metrics.marketsLiveAmmShareKnown.set.mock.calls).toEqual([
+      [{ period: 'day' }, 1],
+      [{ period: '7day' }, 1],
+      [{ period: '30day' }, 1],
+    ]);
+  });
+
+  it('a failing read of the gauge is counted as markets_live and the run goes on', async () => {
+    markets.ammKnownError = new Error('timeout');
+    markets.ends = new Map<MarketsPeriod, number>([['day', NOW_SECONDS - 5]]);
+    await expect(run(runner())).resolves.toBeUndefined();
+    expect(fake.failures).toHaveLength(1);
+    expect(fake.failures[0].job).toBe('markets_live');
+    expect(fake.failures[0].where).toBe(' reading whether the AMM share is known');
+    expect((fake.failures[0].err as Error).message).toBe('timeout');
+    expect(fake.metrics.marketsLiveAmmShareKnown.set).not.toHaveBeenCalled();
+    // the sets were written and the ages set all the same
+    expect(markets.periods()).toEqual(['day', '7day', '30day']);
+    expect(fake.metrics.marketsLiveAgeSeconds.set).toHaveBeenCalledWith({ period: 'day' }, 5);
+  });
+
+  it('a failing read of the ages does not keep the gauge of the AMM share from being set', async () => {
+    markets.endsError = new Error('timeout');
+    markets.ammKnown = new Map<MarketsPeriod, boolean>([['day', true]]);
+    await run(runner());
+    expect(fake.failures).toHaveLength(1);
+    expect(fake.failures[0].where).toContain('age');
+    expect(fake.metrics.marketsLiveAmmShareKnown.set).toHaveBeenCalledWith({ period: 'day' }, 1);
   });
 
   it('a failing period is counted as markets_live, and the other periods still run', async () => {

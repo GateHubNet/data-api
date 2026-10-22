@@ -111,6 +111,12 @@ const metrics = {
     labelNames: ['period'],
     registers: [registry],
   }),
+  marketsLiveAmmShareKnown: new Gauge({
+    name: 'syncer_markets_live_amm_share_known',
+    help: '1 when the newest include markets set of the period has total_amm_share (every ledger of its window parsed with AMM), else 0.',
+    labelNames: ['period'],
+    registers: [registry],
+  }),
   ratesDailyMissingDays: new Gauge({
     name: 'syncer_rates_daily_missing_days',
     help: 'Closed final days without a valid rates set, from the first native trade to the newest final day.',
@@ -217,6 +223,7 @@ export class PrometheusService implements OnModuleInit {
   readonly aggregatorStatsLagSeconds = metrics.aggregatorStatsLagSeconds;
   readonly pairHourlyMissingHours = metrics.pairHourlyMissingHours;
   readonly marketsLiveAgeSeconds = metrics.marketsLiveAgeSeconds;
+  readonly marketsLiveAmmShareKnown = metrics.marketsLiveAmmShareKnown;
   readonly ratesDailyMissingDays = metrics.ratesDailyMissingDays;
   readonly accountRollupsHeavyAccounts = metrics.accountRollupsHeavyAccounts;
   readonly accountRollupsPendingAccounts = metrics.accountRollupsPendingAccounts;
