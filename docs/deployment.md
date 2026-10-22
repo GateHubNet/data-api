@@ -91,8 +91,9 @@ GitHub Actions runs two workflows (`.github/workflows/`):
 
   A newer push to a pull request cancels its older run.
 - **`release.yml`**, on every pushed version tag: `v1.4.0`, or a pre-release such as `v1.4.0-rc.1`. It runs in order:
-  1. **Version:** the tag must be a semantic version, `vMAJOR.MINOR.PATCH` with an optional `-pre-release` and no `+build`.
-     Anything else (`vtest`, `v1.4`) stops the run, and nothing is published.
+  1. **Version:** the tag must be a semantic version, `vMAJOR.MINOR.PATCH` with an optional `-pre-release` and no `+build`. As in
+     SemVer, numbers have no leading zeros, in the pre-release too. Anything else (`vtest`, `v1.4`, `v1.2.3-rc.01`) stops the run, and
+     nothing is published.
   2. **Test:** the whole of `ci.yml`.
   3. **Images:** both images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api` and
      `ghcr.io/gatehubnet/data-syncer`, tagged with the version without its `v` (`1.4.0`).
@@ -100,7 +101,9 @@ GitHub Actions runs two workflows (`.github/workflows/`):
      published. Every release works this out again when it reaches this step, one release at a time. So:
      - a release that finishes after a newer one leaves `latest` on the newer one;
      - a late patch for an older line, such as `v1.3.5` after `v1.4.0`, publishes `1.3.5` and leaves `latest` alone;
-     - both images are always on the same version.
+     - both images are always on the same version;
+     - a registry error is retried, and if it persists the step fails and leaves `latest` alone. Only the registry's "not found"
+       counts as not published.
   5. **Release:** the GitHub release of the tag. Its body is the changelog since the previous tag, made by [git-cliff](https://git-cliff.org)
      from the Conventional Commits (`cliff.toml`) and attached as `CHANGELOG.md`. A tag with a `-` is a pre-release.
 

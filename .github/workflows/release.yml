@@ -31,9 +31,9 @@ env:
   REGISTRY: ghcr.io
   # Image names on ghcr.io must be lower case.
   NAMESPACE: ghcr.io/gatehubnet
-  # A semantic version as a tag: v, then MAJOR.MINOR.PATCH without leading zeros, then an optional pre-release. No build
-  # metadata: a + cannot be part of an image tag.
-  SEMVER_TAG: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+  # A semantic version as a tag: v, then MAJOR.MINOR.PATCH without leading zeros, then an optional pre-release of dot-separated
+  # identifiers, a numeric one without leading zeros (rc.1, not rc.01). No build metadata: a + cannot be part of an image tag.
+  SEMVER_TAG: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
 
 jobs:
   version:
@@ -139,15 +139,42 @@ jobs:
       # latest is the newest version tag (a pre-release included) whose two images are both published, whichever tag started
       # this run. The tags are read as they are now, so a run that finishes after a newer release points latest at the newer
       # one, not back at its own, and a newer tag whose images are not out yet (or never will be) is passed over. Both images
-      # always move to the same version.
+      # always move to the same version. Only the registry's "not found" passes a tag over: any other failure to inspect is
+      # retried, and if it persists the job fails and latest stays where it is, rather than going back to an older version
+      # because the newest could not be seen.
       - name: Point latest at the newest published version
         run: |
+          # 0: published; 1: not published (the registry says not found); 2: cannot tell.
+          published() {
+            local ref="$1" attempt error
+            for attempt in 1 2 3; do
+              if error="$(docker buildx imagetools inspect "$ref" 2>&1 > /dev/null)"; then
+                return 0
+              fi
+              case "$error" in
+                *"$ref: not found"*) return 1 ;;
+              esac
+              echo "inspecting $ref failed (attempt $attempt of 3): $error"
+              [ "$attempt" -eq 3 ] || sleep $((attempt * 10))
+            done
+            return 2
+          }
+
           git fetch --force --tags origin
           target=""
           for tag in $(git -c versionsort.suffix=- tag -l 'v*' --sort=-v:refname | grep -E "$SEMVER_TAG"); do
             version="${tag#v}"
-            if docker buildx imagetools inspect "$NAMESPACE/data-api:$version" > /dev/null 2>&1 \
-              && docker buildx imagetools inspect "$NAMESPACE/data-syncer:$version" > /dev/null 2>&1; then
+            both=true
+            for image in data-api data-syncer; do
+              status=0
+              published "$NAMESPACE/$image:$version" || status=$?
+              if [ "$status" -eq 2 ]; then
+                echo "::error::Cannot tell whether $NAMESPACE/$image:$version is published: latest stays where it is."
+                exit 1
+              fi
+              [ "$status" -eq 0 ] || both=false
+            done
+            if [ "$both" = true ]; then
               target="$version"
               break
             fi
