@@ -701,7 +701,9 @@ and left for the next start.
   the first committed ledger above V when V is missing). Rounds are done oldest first until the deadline. The first round is the first
   voting ledger at or after the higher of the lowest ledger (above 0) that the oldest active partition of `validations` (`system.parts`)
   holds a validation of, and the lowest ledger of `ledgers`; then always the newest stored round (its newest sentinel) + 256, so a
-  restart goes on where the last run ended. A voting ledger `ledgers` lacks gets only a sentinel: `observed 0`, `trusted 0`,
+  restart goes on where the last run ended. A partition that holds only records with no ledger index (0) is passed over for the next
+  one, so such a partition at the old end never keeps the first round from being found; the partitions are read one at a time, oldest
+  first, each on its own. A voting ledger `ledgers` lacks gets only a sentinel: `observed 0`, `trusted 0`,
   `threshold 1`, the size of the UNL, the close time of the first committed ledger above it, and no vote. The first round is looked
   for with the ingest first: without a ledger the partitions of `validations` are not read.
 - **A voting ledger that arrives late.** A range ingest can fill `ledgers` below the checkpoint of the live ingest, after the rounds

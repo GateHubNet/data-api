@@ -2318,9 +2318,40 @@ describe('the validators worker (e2e)', () => {
       it('starts at the first voting ledger at or after the lowest ledger of the oldest validations', async () => {
         await bootWithList();
         await writeBaseLedgers();
-        // validations of round 2 only, and a record of one with no ledger index, which says nothing
+        // validations of round 2 only, and a record of one with no ledger index, which says nothing. The record is stamped as
+        // the validations are, so that it is in their partition (a UTC day) at any hour of the day.
         await validateAll(R2, [AM_A]);
-        await validate(K1.base58, 0, { hash: 'D'.repeat(64) });
+        await validate(K1.base58, 0, { hash: 'D'.repeat(64), at: closeOf(R2) + 3.5 });
+
+        await runNow(makeJob());
+
+        expect(await rounds()).toEqual([R2]);
+      });
+
+      it('skips an oldest partition of validations that holds records with no ledger index only', async () => {
+        await bootWithList();
+        await writeBaseLedgers();
+        // received two days ago: the oldest partition, holding nothing but a record with no ledger index
+        await validate(K1.base58, 0, { hash: 'D'.repeat(64), at: END - 2 * DAY });
+        await validateAll(R2, [AM_A]);
+
+        await runNow(makeJob());
+
+        expect(await rounds()).toEqual([R2]);
+      });
+
+      it('takes the lowest ledger of the first partition that holds one, not of all of them', async () => {
+        await bootWithList();
+        await writeBaseLedgers();
+        // the two oldest partitions (four and three days ago) hold records with no ledger index only; the next one (two days
+        // ago) holds round 2; the last one holds round 1 (a late arrival)
+        await validate(K1.base58, 0, { hash: 'D'.repeat(64), at: END - 4 * DAY });
+        await validate(K2.base58, 0, { hash: 'E'.repeat(64), at: END - 4 * DAY });
+        await validate(K1.base58, 0, { hash: 'F'.repeat(64), at: END - 3 * DAY });
+        for (const key of [K1, K2, K3, K4]) {
+          await validate(key.base58, R2, { amendments: [AM_A], at: END - 2 * DAY });
+        }
+        await validate(K1.base58, R1, { amendments: [AM_A] });
 
         await runNow(makeJob());
 
@@ -2330,7 +2361,7 @@ describe('the validators worker (e2e)', () => {
       it('takes the lowest ledger of the oldest partition of validations, not of all of them', async () => {
         await bootWithList();
         await writeBaseLedgers();
-        // received two days ago: the oldest partition, holding round 2 only; today's holds round 1 (a late arrival)
+        // received two days ago: the oldest partition, holding round 2 only; a later one holds round 1 (a late arrival)
         await validateAll(R2, [AM_A]);
         for (const key of [K1, K2, K3, K4]) {
           await validate(key.base58, R2, { amendments: [AM_A], at: END - 2 * DAY });
