@@ -403,8 +403,8 @@ function swapHandRows(): Rows {
 
 /**
  * Swaps among the offers' trades, on every day of the mock, on two ledgers: in each, three swaps with the pools in turn (the
- * taker buys from the pool and sells to it) and a trade of an offer, in the pairs of the heavy accounts. Binary fractions,
- * so that the float sums are exact in any order.
+ * taker buys from the pool and sells to it) and a trade of an offer, in the pairs of the heavy accounts. Whole amounts, so
+ * that the float sums are exact in any order.
  */
 function swapperRows(): Rows {
   const rows = noRows();
@@ -1013,54 +1013,68 @@ describe('account day groups and the rollup writer (e2e)', () => {
       }
     });
 
-    it('rolled-up groups equal raw groups: complete, partial before, partial after', async () => {
+    // Five accounts, five coverages of the window: all of it; only from the middle of it (the days before are raw); only up to
+    // the middle (the days after are raw); the middle only (raw on both sides); and all of it for the fifth. The account of
+    // coverage i is rolled for that coverage, and its state row says so (`rollupCoverage` reads it, as the API does).
+    const COVERAGES: RollupCoverage[] = [
+      { from: WINDOW[0], through: WINDOW[1] },
+      { from: BIG_DAY, through: WINDOW[1] },
+      { from: WINDOW[0], through: SECOND_DAY },
+      { from: BIG_DAY, through: SECOND_DAY },
+      { from: WINDOW[0], through: WINDOW[1] },
+    ];
+    /** What a read of the whole window takes from, for each coverage: the rollups only, or raw rows besides. */
+    const SOURCES = [['rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['rollup']];
+    // windows: all of it, the middle, a single day, the days a coverage starts and ends on, days without rows around
+    const WINDOWS: Array<[string, string]> = [
+      WINDOW,
+      ['2014-06-01', '2016-12-31'],
+      ['2015-01-01', '2015-12-31'],
+      [BIG_DAY, BIG_DAY],
+      [SECOND_DAY, SECOND_DAY],
+      ['2013-10-25', '2015-01-14'],
+      ['2015-02-09', '2016-03-28'],
+      ['2013-01-01', '2013-06-10'],
+    ];
+
+    /**
+     * Rolls up each of the five accounts for its coverage, writes the state rows, and then reads every window of every family
+     * from the rollups (and the raw rows where the coverage stops) and from the raw rows alone: the very same groups, as JSON.
+     * Returns how many groups came from rollups, and how many reads took from both sources, so that a test can see it compared
+     * something.
+     */
+    async function expectRollupsEqualRaw(options: {
+      accounts: string[];
+      families: readonly DayGroupFamily[];
+      /** The rows of the account, as its state row counts them. */
+      rowsOf: (account: string, i: number) => number;
+      /** At least how many rows the rollup of account i writes. */
+      minWritten: (i: number) => number;
+    }): Promise<{ rolledGroups: number; touchedBoth: number }> {
+      const { accounts, families, rowsOf, minWritten } = options;
       const rangeOf = rangesOf(ch);
-      // five accounts, five coverages of the window: all of it; only from the middle of it (the days before are raw); only
-      // up to the middle (the days after are raw); the middle only (raw on both sides); and all of it for the edge account,
-      // whose lines cross zero within a day, so that every group of its rollup is pinned, end_balance included
-      const rolled = [...HEAVY, EDGE];
-      const coverages: RollupCoverage[] = [
-        { from: WINDOW[0], through: WINDOW[1] },
-        { from: BIG_DAY, through: WINDOW[1] },
-        { from: WINDOW[0], through: SECOND_DAY },
-        { from: BIG_DAY, through: SECOND_DAY },
-        { from: WINDOW[0], through: WINDOW[1] },
-      ];
-      const expectedSources = [['rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['rollup']];
-      const rowCounts = [...heavy.map((h) => h.bc.length), edge.rows.bc.length];
       const states: RollupState[] = [];
-      for (const [i, account] of rolled.entries()) {
-        const written = await writeAccountRollups(ch, rangeOf, [account], coverages[i].from, coverages[i].through);
-        expect(written).toBeGreaterThan(i < HEAVY.length ? 40 : 10);
+      for (const [i, account] of accounts.entries()) {
+        const written = await writeAccountRollups(ch, rangeOf, [account], COVERAGES[i].from, COVERAGES[i].through);
+        expect(written).toBeGreaterThan(minWritten(i));
         states.push({
           account,
-          rows: rowCounts[i],
+          rows: rowsOf(account, i),
           firstDay: DAYS[0],
-          rolledFrom: coverages[i].from,
-          rolledThrough: coverages[i].through,
+          rolledFrom: COVERAGES[i].from,
+          rolledThrough: COVERAGES[i].through,
           configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
         });
       }
       await writeRollupStates(ch, states);
 
-      // windows: all of it, the middle, a single day, the days a coverage starts and ends on, days without rows around
-      const windows: Array<[string, string]> = [
-        WINDOW,
-        ['2014-06-01', '2016-12-31'],
-        ['2015-01-01', '2015-12-31'],
-        [BIG_DAY, BIG_DAY],
-        [SECOND_DAY, SECOND_DAY],
-        ['2013-10-25', '2015-01-14'],
-        ['2015-02-09', '2016-03-28'],
-        ['2013-01-01', '2013-06-10'],
-      ];
       let rolledGroups = 0;
       let touchedBoth = 0;
-      for (const [i, account] of rolled.entries()) {
+      for (const [i, account] of accounts.entries()) {
         // the coverage comes from the state rows, as the API reads it
-        expect(await rollupCoverage(ch, account)).toEqual(coverages[i]);
-        for (const family of ['lines', 'txs', 'trades'] as const) {
-          for (const window of windows) {
+        expect(await rollupCoverage(ch, account)).toEqual(COVERAGES[i]);
+        for (const family of families) {
+          for (const window of WINDOWS) {
             const withRollups = await new AccountDayGroups(ch, rangeOf).source(family, account, window[0], window[1]);
             const rawOnly = await readGroups(ch, family, account, window);
             const fromRollups = withRollups
@@ -1075,15 +1089,29 @@ describe('account day groups and the rollup writer (e2e)', () => {
             );
             if (withRollups?.sources.includes('rollup')) rolledGroups += fromRollups.length;
             if (withRollups?.sources.length === 2) touchedBoth++;
-            if (window === WINDOW) expect(withRollups?.sources).toEqual(expectedSources[i]);
+            if (window === WINDOW) expect(withRollups?.sources).toEqual(SOURCES[i]);
           }
         }
       }
+      return { rolledGroups, touchedBoth };
+    }
+
+    it('rolled-up groups equal raw groups: complete, partial before, partial after', async () => {
+      // the fifth account is the edge account, whose lines cross zero within a day, so that every group of its rollup is
+      // pinned, end_balance included
+      const rolled = [...HEAVY, EDGE];
+      const rowCounts = [...heavy.map((h) => h.bc.length), edge.rows.bc.length];
+      const { rolledGroups, touchedBoth } = await expectRollupsEqualRaw({
+        accounts: rolled,
+        families: ['lines', 'txs', 'trades'],
+        rowsOf: (_account, i) => rowCounts[i],
+        minWritten: (i) => (i < HEAVY.length ? 40 : 10),
+      });
       expect(rolledGroups).toBeGreaterThan(1000);
       expect(touchedBoth).toBeGreaterThan(20);
 
       // the edge account's rollup alone: the line that crosses zero is one end balance over its three groups of the day
-      const edgeLines = await readGroups(ch, 'lines', EDGE, WINDOW, coverages[4]);
+      const edgeLines = await readGroups(ch, 'lines', EDGE, WINDOW, COVERAGES[4]);
       expect(edgeLines.source?.sources).toEqual(['rollup']);
       expectGroups('lines', edgeLines.rows, linesOracle(edge.rows.bc), 'edge from its rollup');
       const usd = edgeLines.rows.filter((g) => g.day === BIG_DAY && g.currency === 'USD').map(normalized);
@@ -1170,76 +1198,26 @@ describe('account day groups and the rollup writer (e2e)', () => {
     });
 
     it('swaps in the window: rolled-up groups equal raw groups, complete, partial before and partial after', async () => {
-      const rangeOf = rangesOf(ch);
-      // five accounts that trade against pools, five coverages of the window: all of it; only from the middle of it (the
-      // days before are raw); only up to the middle (the days after are raw); the middle only (raw on both sides); all of it
-      const rolled = [SWAPPER, POOLS[0], POOLS[1], TAKER, POOL];
-      const coverages: RollupCoverage[] = [
-        { from: WINDOW[0], through: WINDOW[1] },
-        { from: BIG_DAY, through: WINDOW[1] },
-        { from: WINDOW[0], through: SECOND_DAY },
-        { from: BIG_DAY, through: SECOND_DAY },
-        { from: WINDOW[0], through: WINDOW[1] },
-      ];
-      const expectedSources = [['rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['rollup']];
-      const states: RollupState[] = [];
-      for (const [i, account] of rolled.entries()) {
-        const written = await writeAccountRollups(ch, rangeOf, [account], coverages[i].from, coverages[i].through);
-        expect(written).toBeGreaterThan(0);
-        states.push({
-          account,
-          rows: logical.ex.filter((r) => r.account === account).length,
-          firstDay: DAYS[0],
-          rolledFrom: coverages[i].from,
-          rolledThrough: coverages[i].through,
-          configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
-        });
-      }
-      await writeRollupStates(ch, states);
-
-      const windows: Array<[string, string]> = [
-        WINDOW,
-        ['2014-06-01', '2016-12-31'],
-        ['2015-01-01', '2015-12-31'],
-        [BIG_DAY, BIG_DAY],
-        [SECOND_DAY, SECOND_DAY],
-        ['2013-10-25', '2015-01-14'],
-        ['2015-02-09', '2016-03-28'],
-        ['2013-01-01', '2013-06-10'],
-      ];
-      let rolledGroups = 0;
-      let touchedBoth = 0;
-      for (const [i, account] of rolled.entries()) {
-        expect(await rollupCoverage(ch, account)).toEqual(coverages[i]);
-        for (const window of windows) {
-          const withRollups = await new AccountDayGroups(ch, rangeOf).source('trades', account, window[0], window[1]);
-          const rawOnly = await readGroups(ch, 'trades', account, window);
-          const fromRollups = withRollups
-            ? await ch.query<Group>(
-                `SELECT * FROM (${withRollups.sql}) ORDER BY ${ORDER_BY('trades')}`,
-                withRollups.params,
-              )
-            : [];
-          // the very same groups, as JSON
-          expect(JSON.stringify(fromRollups)).toBe(
-            JSON.stringify(rawOnly.rows.map(({ account: _account, ...group }) => group)),
-          );
-          if (withRollups?.sources.includes('rollup')) rolledGroups += fromRollups.length;
-          if (withRollups?.sources.length === 2) touchedBoth++;
-          if (window === WINDOW) expect(withRollups?.sources).toEqual(expectedSources[i]);
-        }
-      }
+      // the taker that swaps on every day, its two pools, and the hand-worked taker and pool: the trades they made, swaps
+      // among them (no lines and no transactions)
+      const { rolledGroups, touchedBoth } = await expectRollupsEqualRaw({
+        accounts: [SWAPPER, POOLS[0], POOLS[1], TAKER, POOL],
+        families: ['trades'],
+        rowsOf: (account) => logical.ex.filter((r) => r.account === account).length,
+        minWritten: () => 0,
+      });
       expect(rolledGroups).toBeGreaterThan(100);
       expect(touchedBoth).toBeGreaterThan(8);
 
-      // the rollup alone gives the groups worked out by hand
-      const taker = await readGroups(ch, 'trades', TAKER, WINDOW, coverages[3]);
+      // the groups worked out by hand, from the rollups where the coverage has them: the taker's coverage is the big day to the
+      // second (raw rows on both sides), the pool's is the whole window
+      const taker = await readGroups(ch, 'trades', TAKER, WINDOW, COVERAGES[3]);
       expect(taker.source?.sources).toEqual(['raw', 'rollup']);
       expect(taker.rows.map(normalized)).toEqual([
         normalized(tradeGroup(TAKER, BIG_DAY, XRP_SIDE, USD_B, 3, ['148', '37'], ['108', '27'], ['40', '10'])),
         normalized(tradeGroup(TAKER, SECOND_DAY, EUR_C, XRP_SIDE, 1, ['2', '20'], ['0', '0'], ['2', '20'])),
       ]);
-      const pool = await readGroups(ch, 'trades', POOL, WINDOW, coverages[4]);
+      const pool = await readGroups(ch, 'trades', POOL, WINDOW, COVERAGES[4]);
       expect(pool.source?.sources).toEqual(['rollup']);
       expect(pool.rows.map(normalized)).toEqual([
         normalized(tradeGroup(POOL, BIG_DAY, XRP_SIDE, USD_B, 2, ['140', '35'], ['40', '10'], ['100', '25'])),
