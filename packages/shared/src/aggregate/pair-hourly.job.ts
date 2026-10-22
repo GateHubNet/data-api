@@ -186,8 +186,8 @@ function checkHours(fromHour: number, toHour: number): void {
 
 /**
  * Computes the sets of the hours of `[fromHour, toHour)` (unix seconds of whole hours, 1 to 24 of them, inside one UTC
- * day: else a `RangeError`) and writes them: each hour is one insert, the sentinel and a row for each pair with a kept
- * trade, under a version of its own. Returns how many sets it wrote, one for each hour of the range, an hour without a
+ * day: else a `RangeError`) and writes them: each hour is one insert, the sentinel and a row for each pair and source with a
+ * kept trade, under a version of its own. Returns how many sets it wrote, one for each hour of the range, an hour without a
  * trade included. The exchanges of the whole range are read once, however many hours it has.
  *
  * `is_final` is judged by the newest ledger, read before the others: a ledger that comes in later can only make an hour

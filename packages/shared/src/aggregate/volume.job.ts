@@ -7,6 +7,7 @@ import { MarketAsset, MarketsConfig } from '../network/network-profile';
 import { Asset, assetKey } from '../query/asset';
 import { exactAmount, exactSum, floatSum, ratio, sumOf } from '../query/decimal';
 import { LedgerRange, RatesService } from '../query/rates.service';
+// amm-daily.job imports this module too: neither may use the other's exports at load time, only inside functions
 import { ammWindowSwapTotals, SwapTotals } from './amm-daily.job';
 import { AmmPoolVolume, ammPoolVolumes } from './amm-reads';
 
@@ -599,16 +600,37 @@ async function paymentComponents(
 
 type SetRow = Omit<VolumeDailyRow, 'day'>;
 
+/** A row of a live set: those of `setRows`, with the fee estimate of its own component. */
+type LiveSetRow = SetRow & Pick<VolumeLiveRow, 'fees_est_f'>;
+
 /**
  * The rows of a set: the sentinel first, then the components. The `rate_f` of a daily sentinel is 1 when the set is the final
- * one of its day (`final`, see `computeDailyVolumeSet`), else 0; a live set's is 0.
+ * one of its day (`final`, see `computeDailyVolumeSet`), else 0; a live set's is 0. With `withFees` (a live set) each row also
+ * has `fees_est_f`, taken from its own component (`feesEst`; NULL on the sentinel and where it is not known); a daily row has no
+ * such column.
  */
 function setRows(
   metric: VolumeMetric,
   components: VolumeComponent[],
   configVersion: number,
   version: number,
+  final?: boolean,
+): SetRow[];
+function setRows(
+  metric: VolumeMetric,
+  components: VolumeComponent[],
+  configVersion: number,
+  version: number,
+  final: boolean,
+  withFees: true,
+): LiveSetRow[];
+function setRows(
+  metric: VolumeMetric,
+  components: VolumeComponent[],
+  configVersion: number,
+  version: number,
   final = false,
+  withFees = false,
 ): SetRow[] {
   const row = (c: VolumeComponent | undefined): SetRow => ({
     metric,
@@ -624,6 +646,7 @@ function setRows(
     converted_f: c ? c.converted.toNumber() : 0,
     config_version: configVersion,
     version,
+    ...(withFees && { fees_est_f: c?.feesEst?.toNumber() ?? null }),
   });
   return [row(undefined), ...components.map(row)];
 }
@@ -739,10 +762,8 @@ export async function computeLiveVolumeSet(
     period,
   });
   throwIfAborted(signal);
-  // the rows of the set are the sentinel and then the components, in their order
-  const fees = [null, ...components.map((c) => c.feesEst?.toNumber() ?? null)];
-  const rows = setRows(metric, components, markets.version, version).map(
-    (r, i): VolumeLiveRow => ({ ...r, period, start_time: start, end_time: end, fees_est_f: fees[i] }),
+  const rows = setRows(metric, components, markets.version, version, false, true).map(
+    (r): VolumeLiveRow => ({ ...r, period, start_time: start, end_time: end }),
   );
   await ch.insert(Table.VolumeLive, rows);
   return components.length;

@@ -18,6 +18,7 @@ import {
   valueNative,
 } from './amm-pools.job';
 import { AMM_CHUNK, AMM_SWAPS_WHERE, AMM_TOUCHED_POOLS_SQL, ammChunks, ammSwapParams, PairColumns } from './amm-reads';
+// volume.job imports this module too: neither may use the other's exports at load time, only inside functions
 import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTLE_MS } from './volume.job';
 
 /**
