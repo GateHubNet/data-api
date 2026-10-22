@@ -161,8 +161,24 @@ jobs:
           }
 
           git fetch --force --tags origin
+          # The version tags, newest first by SemVer precedence (semver.org, section 11): MAJOR, MINOR and PATCH as numbers; a version
+          # above its pre-releases; pre-release identifiers left to right, a number as a number and below a name, names in ASCII order;
+          # more identifiers above fewer when the rest are equal. git's version sort gets some of that wrong (alpha.2 above alpha-10).
+          newest_first="$(git tag -l 'v*' | { grep -E "$SEMVER_TAG" || true; } | python3 -c '
+          import sys
+
+          def precedence(tag):
+              core, _, pre = tag[1:].partition("-")
+              numbers = tuple(int(part) for part in core.split("."))
+              if not pre:
+                  return numbers + (1, ())
+              return numbers + (0, tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split(".")))
+
+          for tag in sorted(sys.stdin.read().split(), key=precedence, reverse=True):
+              print(tag)
+          ')"
           target=""
-          for tag in $(git -c versionsort.suffix=- tag -l 'v*' --sort=-v:refname | grep -E "$SEMVER_TAG"); do
+          for tag in $newest_first; do
             version="${tag#v}"
             both=true
             for image in data-api data-syncer; do
