@@ -40,6 +40,8 @@ interface PoolBody {
 
 interface HistoryBody {
   result: 'success';
+  computed_start?: string;
+  computed_end?: string;
   count: number;
   marker?: string;
   history?: PoolStateObject[] | PoolStateCsvRow[] | PoolDayCsvRow[];
@@ -138,7 +140,12 @@ export class AmmPoolsController {
       'instead the days of the pool with activity (`swap_count`, `volume_base` and `volume_counter` by side, `fees_*_est`, ' +
       'estimates, left out when a swap into the side had no known fee, liquidity in and out, and the closing state), a day ' +
       'when its start is within `start` and `end`. ' +
-      '`format=csv` gives the rows as a CSV file.',
+      '`format=csv` gives the rows as a CSV file. With `interval=day` the answer also has `computed_start` and ' +
+      "`computed_end` (`YYYY-MM-DD`, after `result`, not in the CSV): the days of the request's window that the daily " +
+      'figures have been computed for. `computed_end` is the newest day of the window that has been computed, and ' +
+      '`computed_start` the oldest day from which every day up to it has been. A day inside the range without a row of ' +
+      'the pool is a day it was quiet; a day outside it is not computed yet. Both are left out when no day of the window ' +
+      'has been computed, and they are the same on every page of an answer.',
   })
   @ApiParam({ name: 'pool', description: 'The address of the pool account.' })
   @ApiQuery({ name: 'start', required: false, description: 'Start time. Default: the first ledger.' })
@@ -175,9 +182,22 @@ export class AmmPoolsController {
       const page = await this.pools.days(window);
       setLinkHeader(req, res, page.marker);
       // a CSV has its rows under one key (`@Csv`): the body is replaced by the CSV, so the key is only that
-      return csv
-        ? { result: 'success', count: page.days.length, marker: page.marker, history: page.days.map(toPoolDayCsvRow) }
-        : { result: 'success', count: page.days.length, marker: page.marker, days: page.days };
+      if (csv) {
+        return {
+          result: 'success',
+          count: page.days.length,
+          marker: page.marker,
+          history: page.days.map(toPoolDayCsvRow),
+        };
+      }
+      return {
+        result: 'success',
+        // the days the daily figures are computed for, after `result`; left out when no day of the window is (D2b.4)
+        ...(page.computed && { computed_start: page.computed.start, computed_end: page.computed.end }),
+        count: page.days.length,
+        marker: page.marker,
+        days: page.days,
+      };
     }
     const page = await this.pools.states(window);
     setLinkHeader(req, res, page.marker);

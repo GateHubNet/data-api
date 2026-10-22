@@ -540,6 +540,33 @@ export function toPoolDayObject(account: string, row: StoredPoolDay): PoolDayObj
   };
 }
 
+/** The days (`YYYY-MM-DD`, UTC) of the history of a pool that `amm_daily` has computed: the oldest and the newest of a run. */
+export interface ComputedRange {
+  start: string;
+  end: string;
+}
+
+const DAY_MS = 86_400_000;
+
+/** The number of the UTC day a `YYYY-MM-DD` text names (days since 1970-01-01), so that two neighbours differ by 1. */
+const dayNumber = (day: string): number => Date.parse(`${day}T00:00:00Z`) / DAY_MS;
+
+/**
+ * The range of the computed days among `days` (`YYYY-MM-DD`, in any order, a day twice is one): `end` is the newest day, and
+ * `start` the oldest day that is reached from it without a missing day, so the days under a hole are not in the range. None
+ * for no day. A day inside the range without a row for a pool is a quiet day of it; one outside is not computed yet.
+ */
+export function computedRange(days: readonly string[]): ComputedRange | undefined {
+  // `YYYY-MM-DD` sorts as the dates do: the newest first
+  const newestFirst = [...new Set(days)].sort().reverse();
+  if (newestFirst.length === 0) return undefined;
+  let oldest = 0;
+  while (oldest + 1 < newestFirst.length && dayNumber(newestFirst[oldest]) - dayNumber(newestFirst[oldest + 1]) === 1) {
+    oldest += 1;
+  }
+  return { start: newestFirst[oldest], end: newestFirst[0] };
+}
+
 /** The LiquidityObject of a row of `amm_liquidity`. `mode` is stored as `''` where the event has none. */
 export function toLiquidityObject(row: StoredLiquidity): LiquidityObject {
   return {

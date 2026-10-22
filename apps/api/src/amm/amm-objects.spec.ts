@@ -1,4 +1,5 @@
 import {
+  computedRange,
   POOL_COLUMNS,
   POOL_DAY_COLUMNS,
   POOL_STATE_COLUMNS,
@@ -638,5 +639,76 @@ describe('POOL_DAY_COLUMNS', () => {
       'trading_fee',
       'value_native',
     ]);
+  });
+});
+
+describe('computedRange', () => {
+  it('has no range for no day', () => {
+    expect(computedRange([])).toBeUndefined();
+  });
+
+  it('is a single day when there is one', () => {
+    expect(computedRange(['2026-03-14'])).toEqual({ start: '2026-03-14', end: '2026-03-14' });
+  });
+
+  it('runs from the oldest day to the newest when no day is missing between them', () => {
+    expect(computedRange(['2026-03-12', '2026-03-13', '2026-03-14', '2026-03-15'])).toEqual({
+      start: '2026-03-12',
+      end: '2026-03-15',
+    });
+  });
+
+  it('ends the range at a hole: the start is the oldest day reached from the newest without a missing day', () => {
+    expect(computedRange(['2026-01-01', '2026-01-02', '2026-01-04', '2026-01-05'])).toEqual({
+      start: '2026-01-04',
+      end: '2026-01-05',
+    });
+    // a hole right under the newest day leaves that day alone
+    expect(computedRange(['2026-01-01', '2026-01-02', '2026-01-03', '2026-01-05'])).toEqual({
+      start: '2026-01-05',
+      end: '2026-01-05',
+    });
+    // the holes under the range do not matter
+    expect(computedRange(['2026-01-01', '2026-01-03', '2026-01-04', '2026-01-05'])).toEqual({
+      start: '2026-01-03',
+      end: '2026-01-05',
+    });
+  });
+
+  it('takes the days in any order', () => {
+    expect(computedRange(['2026-01-05', '2026-01-01', '2026-01-04', '2026-01-02'])).toEqual({
+      start: '2026-01-04',
+      end: '2026-01-05',
+    });
+    expect(computedRange(['2026-01-03', '2026-01-05', '2026-01-04'])).toEqual({
+      start: '2026-01-03',
+      end: '2026-01-05',
+    });
+  });
+
+  it('counts a day given twice once', () => {
+    expect(computedRange(['2026-01-02', '2026-01-02', '2026-01-03', '2026-01-03'])).toEqual({
+      start: '2026-01-02',
+      end: '2026-01-03',
+    });
+  });
+
+  it('is contiguous across a month boundary, a leap day and a year boundary', () => {
+    expect(computedRange(['2026-02-28', '2026-03-01', '2026-03-02'])).toEqual({
+      start: '2026-02-28',
+      end: '2026-03-02',
+    });
+    expect(computedRange(['2024-02-28', '2024-02-29', '2024-03-01'])).toEqual({
+      start: '2024-02-28',
+      end: '2024-03-01',
+    });
+    expect(computedRange(['2025-12-30', '2025-12-31', '2026-01-01', '2026-01-02'])).toEqual({
+      start: '2025-12-30',
+      end: '2026-01-02',
+    });
+    // 28 February to 1 March is not contiguous in a leap year, 29 February is missing
+    expect(computedRange(['2024-02-28', '2024-03-01'])).toEqual({ start: '2024-03-01', end: '2024-03-01' });
+    // 31 December and 2 January have 1 January missing between them
+    expect(computedRange(['2025-12-31', '2026-01-02'])).toEqual({ start: '2026-01-02', end: '2026-01-02' });
   });
 });

@@ -1,4 +1,5 @@
 import {
+  AMM_DAILY_CONFIG_VERSION,
   AmmDailyRow,
   AmmPoolsRow,
   AmmPoolStatesRow,
@@ -261,6 +262,15 @@ const createdOf = (account: string): { created_ledger: number; created_by: strin
   return made ? { created_ledger: made.ledger_index, created_by: made.account } : undefined;
 };
 const DAYS = [...new Set(STATES.map((s) => new Date(s.close_time * 1000).toISOString().slice(0, 10)))].sort();
+/**
+ * The range of the computed days an answer over the whole recording has: the job computed `DAYS`, so it is the run of
+ * consecutive days that ends at the newest one (an oracle in plain JavaScript, not the code under test).
+ */
+const COMPUTED = (() => {
+  let oldest = DAYS.length - 1;
+  while (oldest > 0 && Date.parse(DAYS[oldest]) - Date.parse(DAYS[oldest - 1]) === 86_400_000) oldest -= 1;
+  return { computed_start: DAYS[oldest], computed_end: DAYS[DAYS.length - 1] };
+})();
 
 /** A pool with several rows in one ledger (the same ledger holds several of its transactions). */
 const sameLedger = (rows: AmmPoolStatesRow[]): number => {
@@ -296,6 +306,8 @@ interface HistoryBody {
 }
 interface DaysBody {
   result: string;
+  computed_start?: string;
+  computed_end?: string;
   count: number;
   marker?: string;
   days: Obj[];
@@ -1112,13 +1124,23 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
       expect(stored.some((d) => Number(d.swap_count) > 0)).toBe(true);
       const res = await get(`/v2/amm/pools/${swapper}/history?interval=day&limit=1000`);
       expect([res.status, res.body.count]).toEqual([200, stored.length]);
-      expect(Object.keys(res.body)).toEqual(['result', 'count', 'days']);
+      expect(Object.keys(res.body)).toEqual(['result', 'computed_start', 'computed_end', 'count', 'days']);
+      // the sentinels the job wrote: the days it computed, as far back as no day is missing
+      expect([res.body.computed_start, res.body.computed_end]).toEqual([
+        COMPUTED.computed_start,
+        COMPUTED.computed_end,
+      ]);
       expectObjects(
         res.body.days,
         stored.map((d) => dayOf(swapper, d)),
         DAY_KEYS,
       );
       expect((res.body as DaysBody).days.every((d) => d.amm_account === swapper)).toBe(true);
+      // a window of one computed day is that day, one with none is neither
+      const one = await get(`/v2/amm/pools/${swapper}/history?interval=day&start=${DAYS[0]}&end=${DAYS[0]}`);
+      expect([one.body.computed_start, one.body.computed_end]).toEqual([DAYS[0], DAYS[0]]);
+      const none = await get(`/v2/amm/pools/${swapper}/history?interval=day&start=2001-01-01&end=2001-01-31`);
+      expect(Object.keys(none.body)).toEqual(['result', 'count', 'days']);
     });
 
     it('every pool with days serves them, as the SELECT has them, and the days of a pool are only its own', async () => {
@@ -1260,7 +1282,8 @@ describe('the AMM pool routes over the recorded AMM ledgers', () => {
       );
       expect([Number(states), Number(days)]).toEqual([1, 0]);
       const res = await get(`/v2/amm/pools/${quiet}/history?interval=day`);
-      expect([res.status, res.body]).toEqual([200, { result: 'success', count: 0, days: [] }]);
+      // the range is the window's, not the pool's: the days that have a set, whatever the pool did on them
+      expect([res.status, res.body]).toEqual([200, { result: 'success', ...COMPUTED, count: 0, days: [] }]);
       const unknown = await get('/v2/amm/pools/rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q/history?interval=day');
       expect([unknown.status, unknown.body]).toEqual([404, { result: 'error', message: 'pool not found' }]);
       const bad = await get('/v2/amm/pools/rnotanaddress/history?interval=day');
@@ -2283,7 +2306,11 @@ describe('the pool history over states made by hand', () => {
       await h.ch.insert(Table.AmmDaily, [sentinel('2026-06-01', 500), dayRow(A, '2026-06-01', 400)]);
       await h.ch.insert(Table.AmmPoolStates, [stateRow(A, 100_930_000, 1, { reserve_base: '1' })]);
       const res = await get(`/v2/amm/pools/${A}/history?interval=day&start=2026-06-01&end=2026-06-30`);
-      expect([res.status, res.body]).toEqual([200, { result: 'success', count: 0, days: [] }]);
+      // the day has a set (the sentinel), so it is computed: it is the pool that has nothing in it
+      expect([res.status, res.body]).toEqual([
+        200,
+        { result: 'success', computed_start: '2026-06-01', computed_end: '2026-06-01', count: 0, days: [] },
+      ]);
     });
 
     it('the days of a pool never come from a state read: interval=day reads amm_daily and the pool check only', async () => {
@@ -2297,6 +2324,243 @@ describe('the pool history over states made by hand', () => {
       expect(sql.some((q) => new RegExp(`FROM ${Table.AmmDaily}\\b`).test(q))).toBe(true);
       // a page with days needs no look at the states
       expect(sql.some((q) => new RegExp(`FROM ${Table.AmmPoolStates}\\b`).test(q))).toBe(false);
+    });
+
+    // -- the range of the days amm_daily has computed (D2b.4, D10) -----------------------------------------------------
+
+    /** A sentinel for each of the days, one set a day; `over` changes them (a version, a config version, `final`). */
+    const sentinels = (days: string[], version: number, over: Partial<AmmDailyRow> = {}): AmmDailyRow[] =>
+      days.map((day, i) => ({ ...sentinel(day, version + i), ...over }));
+    /** The pool exists (a state): an empty page of it is 200, not 404. */
+    const exists = (account: string, tx: number): Promise<void> =>
+      h.ch.insert(Table.AmmPoolStates, [stateRow(account, 100_950_000, tx, { reserve_base: '1' })]);
+    const bodyOf = async (account: string, query: string, limit = 1000): Promise<DaysBody> =>
+      (await get(`/v2/amm/pools/${account}/history?interval=day&limit=${limit}&${query}`)).body as DaysBody;
+    const rangeOf = async (account: string, query: string): Promise<[string | undefined, string | undefined]> => {
+      const body = await bodyOf(account, query);
+      return [body.computed_start, body.computed_end];
+    };
+
+    it('computed_start and computed_end: a fully computed window', async () => {
+      const A = accountAt(0xc600);
+      const days = ['2026-01-01', '2026-01-02', '2026-01-03', '2026-01-04', '2026-01-05'];
+      await h.ch.insert(Table.AmmDaily, [
+        ...sentinels(days, 1000),
+        dayRow(A, '2026-01-02', 1001),
+        dayRow(A, '2026-01-04', 1003),
+      ]);
+      await exists(A, 1);
+
+      const whole = await bodyOf(A, 'start=2026-01-01&end=2026-01-05');
+      // the days are YYYY-MM-DD texts, not the timestamps of the rows
+      expect([whole.computed_start, whole.computed_end]).toEqual(['2026-01-01', '2026-01-05']);
+      expect(whole.days.map((d) => d.date)).toEqual(['2026-01-02T00:00:00Z', '2026-01-04T00:00:00Z']);
+      // a window wider than the sets: the days of the window that have one
+      expect(await rangeOf(A, 'start=2025-12-20&end=2026-01-31')).toEqual(['2026-01-01', '2026-01-05']);
+      // a window inside them: only its own days count
+      expect(await rangeOf(A, 'start=2026-01-02&end=2026-01-04')).toEqual(['2026-01-02', '2026-01-04']);
+      expect(await rangeOf(A, 'start=2026-01-03&end=2026-01-03')).toEqual(['2026-01-03', '2026-01-03']);
+      // a window that starts or ends in the middle of a day leaves that day out (a day is in it when it starts within it)
+      expect(await rangeOf(A, 'start=2026-01-01T12:00:00&end=2026-01-05')).toEqual(['2026-01-02', '2026-01-05']);
+    });
+
+    it('computed_start and computed_end: a back-fill under way: only the newest days', async () => {
+      const A = accountAt(0xc601);
+      // the back-fill goes from the newest day back: the last four days of the month have a set (the newest not final yet)
+      const newest = ['2026-02-25', '2026-02-26', '2026-02-27', '2026-02-28'];
+      await h.ch.insert(Table.AmmDaily, [
+        ...sentinels(newest.slice(0, 3), 1100),
+        ...sentinels(newest.slice(3), 1103, { final: 0 }),
+        dayRow(A, '2026-02-26', 1101),
+      ]);
+      await exists(A, 2);
+      expect(await rangeOf(A, 'start=2026-02-01&end=2026-02-28')).toEqual(['2026-02-25', '2026-02-28']);
+      // the back-fill has reached one day more: the range grows downwards
+      await h.ch.insert(Table.AmmDaily, sentinels(['2026-02-24'], 1200));
+      expect(await rangeOf(A, 'start=2026-02-01&end=2026-02-28')).toEqual(['2026-02-24', '2026-02-28']);
+      // a window that ends before the back-fill has got that far has no range
+      expect(await rangeOf(A, 'start=2026-02-01&end=2026-02-23')).toEqual([undefined, undefined]);
+    });
+
+    it('computed_start and computed_end: a hole ends the range', async () => {
+      const A = accountAt(0xc602);
+      const days = ['2025-11-01', '2025-11-02', '2025-11-04', '2025-11-05'];
+      await h.ch.insert(Table.AmmDaily, [...sentinels(days, 1300), dayRow(A, '2025-11-02', 1301)]);
+      await exists(A, 3);
+      // 3 November has no set: the range is the run that ends at the newest day, and the days under the hole are not in it
+      expect(await rangeOf(A, 'start=2025-11-01&end=2025-11-05')).toEqual(['2025-11-04', '2025-11-05']);
+      // a window that holds only the older run has that one
+      expect(await rangeOf(A, 'start=2025-11-01&end=2025-11-03')).toEqual(['2025-11-01', '2025-11-02']);
+      // a hole right under the newest day leaves it alone
+      expect(await rangeOf(A, 'start=2025-11-02&end=2025-11-05')).toEqual(['2025-11-04', '2025-11-05']);
+      // the row of the pool is served either way: the page does not depend on the range
+      expect((await bodyOf(A, 'start=2025-11-01&end=2025-11-05')).days.map((d) => d.date)).toEqual([
+        '2025-11-02T00:00:00Z',
+      ]);
+    });
+
+    it('computed_start and computed_end: no set in the window: both keys absent', async () => {
+      const A = accountAt(0xc603);
+      await h.ch.insert(Table.AmmDaily, [
+        // a set on the day after the window, a pool row on a day with no sentinel at all
+        ...sentinels(['2025-12-10'], 1400),
+        dayRow(A, '2025-12-04', 1401),
+      ]);
+      await exists(A, 4);
+      const res = await get(`/v2/amm/pools/${A}/history?interval=day&start=2025-12-01&end=2025-12-09`);
+      expect([res.status, res.body]).toEqual([200, { result: 'success', count: 0, days: [] }]);
+      expect(await rangeOf(A, 'start=2025-12-11&end=2025-12-20')).toEqual([undefined, undefined]);
+      // a window that is empty (start after end) has none either
+      expect(await rangeOf(A, 'start=2025-12-10&end=2025-12-01')).toEqual([undefined, undefined]);
+      // and a pool that does not exist is still 404, whatever the sets say
+      const unknown = await get(
+        `/v2/amm/pools/${accountAt(0xc6ff)}/history?interval=day&start=2025-12-10&end=2025-12-10`,
+      );
+      expect([unknown.status, unknown.body]).toEqual([404, { result: 'error', message: 'pool not found' }]);
+    });
+
+    it('computed_start and computed_end: a quiet day inside the range has no row and is inside it', async () => {
+      const A = accountAt(0xc604);
+      const days = ['2025-09-01', '2025-09-02', '2025-09-03'];
+      // the pool has a row on the first and the third day: on the second it had nothing to do
+      await h.ch.insert(Table.AmmDaily, [
+        ...sentinels(days, 1500),
+        dayRow(A, '2025-09-01', 1500),
+        dayRow(A, '2025-09-03', 1502),
+      ]);
+      await exists(A, 5);
+      const body = await bodyOf(A, 'start=2025-09-01&end=2025-09-05');
+      expect(body.days.map((d) => d.date)).toEqual(['2025-09-01T00:00:00Z', '2025-09-03T00:00:00Z']);
+      // the range says that 2 September is computed (a quiet day), 4 and 5 September are not yet
+      expect([body.computed_start, body.computed_end]).toEqual(['2025-09-01', '2025-09-03']);
+      // a pool with no row at all in the range is in the same range
+      const other = accountAt(0xc605);
+      await exists(other, 6);
+      const none = await bodyOf(other, 'start=2025-09-01&end=2025-09-05');
+      expect([none.count, none.days, none.computed_start, none.computed_end]).toEqual([
+        0,
+        [],
+        '2025-09-01',
+        '2025-09-03',
+      ]);
+    });
+
+    it('computed_start and computed_end: a sentinel of another config version is not computed', async () => {
+      const A = accountAt(0xc606);
+      const other = AMM_DAILY_CONFIG_VERSION + 1;
+      await h.ch.insert(Table.AmmDaily, [
+        // the current config version
+        sentinel('2025-08-01', 1600),
+        // another config version (a newer computation): the day is to be computed again
+        { ...sentinel('2025-08-02', 1601), config_version: other },
+        sentinel('2025-08-03', 1602),
+        // the newest set of the day decides: an older set of the current version does not count ...
+        sentinel('2025-08-04', 1603),
+        // ... and an older set of another version does not count against a newer one of the current version
+        { ...sentinel('2025-08-05', 1604), config_version: other },
+        dayRow(A, '2025-08-05', 1604),
+      ]);
+      await exists(A, 7);
+      await h.ch.insert(Table.AmmDaily, [
+        { ...sentinel('2025-08-04', 1700), config_version: other },
+        sentinel('2025-08-05', 1701),
+      ]);
+      const query = (end: number): string => `start=2025-08-01&end=2025-08-0${end}`;
+      expect(await rangeOf(A, query(1))).toEqual(['2025-08-01', '2025-08-01']);
+      // 2 August is another config version: it is not computed, so it is not the end of the range, and by itself it has none
+      expect(await rangeOf(A, query(2))).toEqual(['2025-08-01', '2025-08-01']);
+      expect(await rangeOf(A, 'start=2025-08-02&end=2025-08-02')).toEqual([undefined, undefined]);
+      // ... and it is a hole: the days under it are not in the range of 3 August
+      expect(await rangeOf(A, query(3))).toEqual(['2025-08-03', '2025-08-03']);
+      // 4 August: the newest set is of another version
+      expect(await rangeOf(A, query(4))).toEqual(['2025-08-03', '2025-08-03']);
+      // 5 August: the newest set is of the current version, 4 August is not
+      expect(await rangeOf(A, query(5))).toEqual(['2025-08-05', '2025-08-05']);
+      // the row of the pool on 5 August is of the set of its sentinel (v1701): the row of the older set is not served
+      expect((await bodyOf(A, 'start=2025-08-05&end=2025-08-05')).days).toEqual([]);
+    });
+
+    it('computed_start and computed_end: every page of a paged answer has the same range', async () => {
+      const A = accountAt(0xc607);
+      // 2 July has no set; the pool has a row on four of the days of the run
+      const days = ['2025-07-01', '2025-07-03', '2025-07-04', '2025-07-05', '2025-07-06', '2025-07-07', '2025-07-08'];
+      await h.ch.insert(Table.AmmDaily, [
+        ...sentinels(days, 1800),
+        dayRow(A, '2025-07-03', 1801),
+        dayRow(A, '2025-07-05', 1803),
+        dayRow(A, '2025-07-06', 1804),
+        dayRow(A, '2025-07-08', 1806),
+      ]);
+      await exists(A, 8);
+      const window = 'start=2025-07-01&end=2025-07-09';
+      const all = await bodyOf(A, window);
+      expect([all.computed_start, all.computed_end]).toEqual(['2025-07-03', '2025-07-08']);
+      const want = all.days.map((d) => d.date);
+      expect(want).toHaveLength(4);
+      for (const descending of [false, true]) {
+        for (const limit of [1, 2, 3]) {
+          const walked = await pages<DaysBody>(
+            `/v2/amm/pools/${A}/history?interval=day&${window}&descending=${descending}`,
+            limit,
+            'days',
+          );
+          // the marker narrows the page, not the range: the last page of the walk, which holds one day, has the whole range
+          expect([descending, limit, walked.map((p) => [p.computed_start, p.computed_end])]).toEqual([
+            descending,
+            limit,
+            walked.map(() => ['2025-07-03', '2025-07-08']),
+          ]);
+          expect(walked.flatMap((p) => p.days.map((d) => d.date))).toEqual(descending ? [...want].reverse() : want);
+        }
+      }
+      // a page after the last day that has a row holds no day, and still has the range
+      const marker = markerOf([Date.parse('2025-07-08T00:00:00Z') / 1000]);
+      const beyond = await bodyOf(A, `${window}&marker=${marker}`);
+      expect([beyond.count, beyond.computed_start, beyond.computed_end]).toEqual([0, '2025-07-03', '2025-07-08']);
+    });
+
+    it('computed_start and computed_end: not in the CSV, and not on the history without interval', async () => {
+      const A = accountAt(0xc608);
+      await h.ch.insert(Table.AmmDaily, [
+        ...sentinels(['2025-06-01', '2025-06-02'], 1900),
+        dayRow(A, '2025-06-02', 1901),
+      ]);
+      await exists(A, 9);
+      const window = 'start=2025-06-01&end=2025-06-02';
+      const json = await get(`/v2/amm/pools/${A}/history?interval=day&${window}`);
+      expect([json.body.computed_start, json.body.computed_end]).toEqual(['2025-06-01', '2025-06-02']);
+      const csv = await get(`/v2/amm/pools/${A}/history?interval=day&${window}&format=csv`);
+      expect(csv.headers['content-type']).toMatch(/^text\/csv/);
+      const [header, ...rows] = lines(csv.text).map((l) => l.split(','));
+      expect(header).toEqual(DAY_KEYS.map((c) => `"${c}"`));
+      expect(rows).toHaveLength(1);
+      expect(csv.text).not.toContain('computed');
+      // the states: with the interval empty, or without it, the answer is the history of the states
+      for (const interval of ['', '?interval=']) {
+        const states = await get(`/v2/amm/pools/${A}/history${interval}`);
+        expect([states.status, states.body.count, Object.keys(states.body)]).toEqual([
+          200,
+          1,
+          ['result', 'count', 'history'],
+        ]);
+      }
+    });
+
+    it('computed_start and computed_end: after result and before count, in that order, in every page', async () => {
+      const A = accountAt(0xc609);
+      await h.ch.insert(Table.AmmDaily, [
+        ...sentinels(['2025-05-01', '2025-05-02', '2025-05-03'], 2000),
+        dayRow(A, '2025-05-01', 2000),
+        dayRow(A, '2025-05-02', 2001),
+        dayRow(A, '2025-05-03', 2002),
+      ]);
+      await exists(A, 10);
+      const first = await get(`/v2/amm/pools/${A}/history?interval=day&limit=2&start=2025-05-01&end=2025-05-03`);
+      expect(Object.keys(first.body)).toEqual(['result', 'computed_start', 'computed_end', 'count', 'marker', 'days']);
+      const last = await get(
+        `/v2/amm/pools/${A}/history?interval=day&limit=2&start=2025-05-01&end=2025-05-03&marker=${first.body.marker}`,
+      );
+      expect(Object.keys(last.body)).toEqual(['result', 'computed_start', 'computed_end', 'count', 'days']);
     });
   });
 });
@@ -2488,8 +2752,13 @@ describe('the pool reads over a bulk of four parts (read_rows and the plans)', (
       const window = `start=${monthStart}&end=${monthEnd}`;
       const path = `/v2/amm/pools/${swapper}/history?interval=day&limit=5&${direction}&${window}`;
       const { reads, statements, body } = await served(Table.AmmDaily, path);
-      expect(reads).toHaveLength(1);
-      expect(reads[0].read_rows).toBeLessThanOrEqual(DAILY_READ_BOUND);
+      // two reads of amm_daily, started together: the page and, next to it, the sentinels of the request's window (the range
+      // of the computed days)
+      const pageReads = reads.filter((read) => read.query.includes('distinct_page_read'));
+      const sentinelReads = reads.filter((read) => !read.query.includes('distinct_page_read'));
+      expect([pageReads.length, sentinelReads.length]).toEqual([1, 1]);
+      expect(pageReads[0].read_rows).toBeLessThanOrEqual(DAILY_READ_BOUND);
+      expect(sentinelReads[0].read_rows).toBeLessThanOrEqual(DAILY_READ_BOUND);
       // the days are the pool's own, as a plain SELECT has them
       const expected = await h.ch.query<{ day_text: string }>(
         `SELECT toString(day) AS day_text FROM ${Table.AmmDaily}
@@ -2525,6 +2794,18 @@ describe('the pool reads over a bulk of four parts (read_rows and the plans)', (
       expect(prefix.condition).toContain('day in (-Inf');
       expect(prefix.granules[0]).toBeLessThanOrEqual(2);
       expect(prefix.granules[1]).toBeGreaterThan(40);
+
+      // the read of the computed range is the same prefix of the key, and no pool's rows: the sentinels of the window's days
+      const computed = statements.filter(([text]) => !isPageRead(text));
+      expect(computed).toHaveLength(1);
+      const [computedSql, computedParams] = computed[0];
+      expect(computedSql).toContain("amm_account = ''");
+      const [range] = primaryKeys(await explain(h, 'indexes = 1', computedSql, computedParams));
+      expect(range.keys).toEqual(['amm_account', 'day']);
+      expect(range.condition).toContain("amm_account in ['', '']");
+      expect(range.condition).toContain('day in [');
+      expect(range.granules[0]).toBeLessThanOrEqual(2);
+      expect(range.granules[1]).toBeGreaterThan(40);
     });
   });
 

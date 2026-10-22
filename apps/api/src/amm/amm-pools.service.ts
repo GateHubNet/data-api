@@ -1,4 +1,5 @@
 import {
+  AMM_DAILY_CONFIG_VERSION,
   Asset,
   assetOfColumns,
   canonicalPair,
@@ -15,6 +16,8 @@ import { notFound } from '../common/errors';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, KeyValue, paginate } from '../common/pagination';
 import {
+  ComputedRange,
+  computedRange,
   POOL_COLUMNS,
   POOL_DAY_COLUMNS,
   POOL_STATE_COLUMNS,
@@ -109,6 +112,8 @@ export interface StatesPage {
 export interface DaysPage {
   days: PoolDayObject[];
   marker?: string;
+  /** The days of the request's window that `amm_daily` has computed; none when no day of it has a set. */
+  computed?: ComputedRange;
 }
 
 /** The output columns of the fill-forward of a pool's state rows. */
@@ -357,29 +362,38 @@ export class AmmPoolsService {
    * version of the sentinel of their day (`amm_account ''`, a prefix of the primary key, read in the same statement for the
    * days of the window), which leaves out the pool-days that a newer set no longer holds. A day is in the window when it
    * starts within `start` and `endExclusive`. 404 `pool not found` when the page is empty and the pool has no state.
+   *
+   * The page comes with the range of the days of the request's window that `amm_daily` has computed (D2b.4, D10): the window
+   * as asked for, which the marker does not narrow, so every page of an answer has the same one.
    */
   async days(q: HistoryQuery): Promise<DaysPage> {
     const after = decodeMarker(q.marker, DAY_KEYS);
 
-    // the first and last day (their start, unix seconds) of the window
-    let first = q.start === undefined ? 0 : Math.ceil(q.start.getTime() / 1000 / DAY_SECONDS) * DAY_SECONDS;
-    let last =
+    // the first and last day (their start, unix seconds) of the request's window, within what a `Date` holds
+    const windowFirst = Math.max(
+      q.start === undefined ? 0 : Math.ceil(q.start.getTime() / 1000 / DAY_SECONDS) * DAY_SECONDS,
+      0,
+    );
+    const windowLast = Math.min(
       q.endExclusive === undefined
         ? MAX_DAY
-        : Math.ceil(q.endExclusive.getTime() / 1000 / DAY_SECONDS) * DAY_SECONDS - DAY_SECONDS;
+        : Math.ceil(q.endExclusive.getTime() / 1000 / DAY_SECONDS) * DAY_SECONDS - DAY_SECONDS,
+      MAX_DAY,
+    );
+    // the days of the page: the window, after the day the marker names
+    let first = windowFirst;
+    let last = windowLast;
     if (after !== undefined) {
       // strictly after (before, descending) the day the marker names
       const marked = Math.floor(Number(after[0]) / DAY_SECONDS) * DAY_SECONDS;
       if (q.descending) last = Math.min(last, marked - DAY_SECONDS);
       else first = Math.max(first, marked + DAY_SECONDS);
     }
-    first = Math.max(first, 0);
-    last = Math.min(last, MAX_DAY);
 
-    const stored =
+    const [stored, computed] = await Promise.all([
       first > last
         ? []
-        : await readDistinctPage<StoredPoolDay>(this.ch, {
+        : readDistinctPage<StoredPoolDay>(this.ch, {
             columns: POOL_DAY_COLUMNS,
             table: Table.AmmDaily,
             where: [
@@ -394,16 +408,41 @@ export class AmmPoolsService {
             descending: q.descending,
             params: { pool: q.pool, first: dayText(first), last: dayText(last) },
             limit: q.limit + 1,
-          });
+          }),
+      this.computedDays(windowFirst, windowLast),
+    ]);
+    const range = computed === undefined ? {} : { computed };
     if (stored.length === 0) {
       await this.requirePool(q.pool);
-      return { days: [] };
+      return { days: [], ...range };
     }
     const page = paginate(stored, q.limit, (row) => [Date.parse(`${row.day}T00:00:00Z`) / 1000]);
     return {
       days: page.rows.map((row) => toPoolDayObject(q.pool, row)),
       ...(page.marker !== undefined && { marker: page.marker }),
+      ...range,
     };
+  }
+
+  /**
+   * The range of the days from `first` to `last` (their start, unix seconds) that have a set of the current
+   * `AMM_DAILY_CONFIG_VERSION`: the sentinels of the days (`amm_account ''`, a key prefix of `amm_daily`), the newest of each
+   * day, final or not. A day whose newest sentinel was made with another config version is to be computed again, so it is not
+   * counted. None when no day has one.
+   */
+  private async computedDays(first: number, last: number): Promise<ComputedRange | undefined> {
+    if (first > last) return undefined;
+    const rows = await this.ch.query<{ day: string }>(
+      `SELECT toString(day) AS day
+         FROM (SELECT day, config_version
+                 FROM ${Table.AmmDaily}
+                WHERE amm_account = '' AND day BETWEEN {first:Date} AND {last:Date}
+                ORDER BY day, version DESC
+                LIMIT 1 BY day)
+        WHERE config_version = {configVersion:UInt32}`,
+      { first: dayText(first), last: dayText(last), configVersion: AMM_DAILY_CONFIG_VERSION },
+    );
+    return computedRange(rows.map((row) => row.day));
   }
 }
 
