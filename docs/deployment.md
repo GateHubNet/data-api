@@ -97,8 +97,9 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   [Rolling out the validators and amendments data](#rolling-out-the-validators-and-amendments-data).
 - `003_account_market_aggregates.sql` is additive (nine tables) and sets no order: the syncer fills them, the api is right without them and only slower
   ([operations](operations.md#account-and-market-aggregates)). The migrate job applies pending files in file-name order, so a database that lacks `002` gets it first.
-- `004_amm_fee_estimates.sql` (one `ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS`) is additive but **sets an order**: the api reads its column in every live volume read, so `migrate` runs before the api
-  (the compose files wait for it) and the syncer follows ([the AMM data additions](operations.md#the-amm-data-additions)).
+- `004_amm_fee_estimates.sql` (one `ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS`) is additive but **sets an order**: `migrate` runs first, then the syncer, then the api. `migrate` must come before **both**:
+  the syncer writes the column on every row of every live volume set (its inserts fail without it, at every tick), and the api reads it on the live `amm_volume` read of the period `day`. The compose files
+  make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last ([the AMM data additions](operations.md#the-amm-data-additions)).
 
 ## Configuration and secrets
 

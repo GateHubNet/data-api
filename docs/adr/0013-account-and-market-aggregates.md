@@ -129,12 +129,14 @@ range (D10); a day inside it without a row is a quiet day, one outside it is not
 | D10 | The computed range is that of the request's window and counts a day only when its newest sentinel has the current config version |
 
 **Consequences and trade-offs.**
-- **The gate is not the whole answer.** The parser gate opens as soon as every ledger of the window is parser 2, which after a `--reprocess` can be a tick before the reprocessed hours are recomputed (`markets_live` runs before `stats_dirty`,
-  whose hook recomputes them). The share is then understated for minutes. The design accepts this (aggregates are eventual after a re-ingest), and the docs ask that `AMM_DATA` is turned on only once `agg_dirty` has drained
+- **The gate is not the whole answer.** The parser gate opens as soon as every ledger of the window is parser 2, which after a `--reprocess` can be before the reprocessed hours are recomputed (`markets_live` runs before `stats_dirty`,
+  whose hook recomputes them slice by slice). The share is then understated until `agg_dirty` has drained, which on a large reprocess takes longer than a tick. The design accepts this (aggregates are eventual after a re-ingest), and the docs ask that `AMM_DATA` is turned on only once `agg_dirty` has drained
   ([operations](../operations.md#the-amm-data-additions)); no gauge shows that backlog.
 - **A deploy waits for the catch-up.** The first run of the syncer after D2b computes the 31 days again, and the Markets sets are skipped until the hours they need are done; the previous `include` sets stay and age for those minutes, and the filters
   `exclude` and `only` answer the no-set answer until their first run. A database whose history is not ingested again has the AMM fields on its `30day` set only 30 days after parser 2 started writing.
-- **The order of the rollout is binding**: the API reads `fees_est_f` in every live volume read, so `migrate` (004), then the syncer, then the API; an API before 004 fails the live volume routes.
+- **The order of the rollout is binding**: `migrate` (004), then the syncer, then the API. `migrate` comes before **both**: the syncer writes `fees_est_f` on every row of every live volume set, and `ClickHouseService.insert` sends JSONEachRow
+  without skipping unknown fields, so a D2b syncer against a database without 004 fails every live volume insert at every tick; the API reads the column on the live `amm_volume` read of the period `day` only, so an API before 004 fails that one read.
 - **No counter-side share.** `amm_share` is of the stored base; a consumer that shows a pair inverted shows the same number.
-- **A heavier live set.** The `amm_volume` day set reads the 24 h of swaps of its listed pools every tick (one day-read of `amm_daily`), on top of the walk-back cost above.
+- **A heavier live set.** The `amm_volume` day set reads the 24 h of swaps of its listed pools every tick (one day-read of `amm_daily`), on top of the walk-back cost above, inside the 5 s `volume_live` budget the twelve live sets share;
+  its duration on the mainnet database is to be measured before `AMM_DATA` is turned on, and the options if it crowds the budget are in [operations](../operations.md#the-amm-data-additions).
 

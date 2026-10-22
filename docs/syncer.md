@@ -392,8 +392,8 @@ only with a kept trade of its filter.
   of those ledgers is at least `AMM_PARSER_VERSION` (2, in `rows.ts` beside `PARSER_VERSION`), or no ledger closed in the window. The read is a range of the primary key of `ledgers` (from the first
   ledger that closed at or after `start_time`, found by the order of the key, to the last that closed at or before `end_time`). Otherwise the columns are NULL on every row of the three sets
   (the sets are still written, and the API leaves the fields out). The rule is the same on both networks: Xahau has no swaps and no pools, so its sets have `"0.0000"` and `0`. The gate opens
-  as soon as every ledger of the window is parser 2, which after a `--reprocess` can be one tick **before** the reprocessed hours have been recomputed (`markets_live` runs before
-  `stats_dirty`, whose hook recomputes the hours of an `agg_dirty` slice): until `agg_dirty` is drained the share can be understated ([operations](operations.md#the-amm-data-additions)).
+  as soon as every ledger of the window is parser 2, which after a `--reprocess` can be **before** the reprocessed hours have been recomputed (`markets_live` runs before
+  `stats_dirty`, whose hook recomputes the hours of an `agg_dirty` slice): until `agg_dirty` has drained, which on a large reprocess takes longer than a tick, the share can be understated ([operations](operations.md#the-amm-data-additions)).
 - **Cadence**: the `day` set at every run, the `7day` and `30day` sets on the 1st, 6th, 11th ... run (`MARKETS_LONG_EVERY_TICKS` = 5, **counted by the runner itself**). A long set that the budget kept
   from starting is **written on the next run**, after the `day` set.
 - Gauge `syncer_markets_live_age_seconds{period}`: now minus the `end_time` of the newest `include` set of the period (set after the sets of each run).

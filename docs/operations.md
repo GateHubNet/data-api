@@ -479,23 +479,32 @@ data (a swap against a pool is an `exchanges` row written by parser version 2) a
 
 **Rolling it out**, in this order:
 
-1. **`migrate`** applies `004_amm_fee_estimates.sql`: one `ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS`, additive and safe to run again.
+1. **`migrate`** applies `004_amm_fee_estimates.sql`: one `ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS`, additive and safe to run again. It runs before **both** the syncer and the API: the syncer writes `fees_est_f` on
+   every row of every live volume set, and `ClickHouseService.insert` sends JSONEachRow without skipping unknown fields, so a D2b syncer against a database without `004` fails every live volume insert at every tick
+   (`syncer_aggregator_errors_total{job="volume_live"}`); the API reads the column on the live `amm_volume` read of the period `day` (step 3).
 2. **The syncer.** `pair_hourly` computes its 31 days again at config version 2 (each pair split by source): `syncer_pair_hourly_missing_hours` starts at 745 and falls to 0 in minutes, and the Markets
-   sets wait for it (`Markets set of period <p> not written ...` in the log, `syncer_markets_live_age_seconds` climbing): `day` and `7day` resume once the newest week of hours has its sets, `30day` after all 31
-   days. Until a period's first run after that, `amm=exclude` and `amm=only` answer the no-set answer (those sets do not exist yet) and the old `include` set has no AMM fields. The `agg_dirty` ranges of
+   sets wait for it (`Markets set of period <p> not written ...` in the log, `syncer_markets_live_age_seconds` climbing): `day` and `7day` resume once the newest week of hours has its sets, `30day` once the hours of its 720-hour
+   window and the current hour (and its 7 sparkline days) have theirs, not all 31 days ([syncer 7.2](syncer.md#72-pair_hourly)). Until a period's first run after that, `amm=exclude` and `amm=only` answer the no-set answer (those sets do not exist yet) and the old `include` set has no AMM fields. The `agg_dirty` ranges of
    the reprocess, while they drain, correct the rates and the heavy accounts' days and recompute the hours of the last 31 days ([syncer 7.6](syncer.md#76-the-agg_dirty-hooks)). The live day set of
    `amm_volume` gets its fee estimates at its next recompute (a set written before the column reads as not known).
-3. **The API, last.** It reads `fees_est_f` in every live volume read, so an API that runs before `004` fails the live routes of `exchange_volume`, `payment_volume` and `amm_volume` (500 `error getting data`).
+3. **The API, last.** It reads `fees_est_f` on the live `amm_volume` read of the period `day` (`?live=day`) and on no other, so an API that runs before `004` fails that one read (500 `error getting data`); the other live reads do not name the column.
    The compose files order it (`migrate` completes before the services start); a deploy that starts the API by hand runs `migrate` first.
 4. **The explorer's `AMM_DATA` switch** is the owner's, per environment (section 16 of the design). The gauges for it are in the table above; read the rest of this section first.
 
+**What to watch: the cost of the live day set.** The live `amm_volume`/`day` set now estimates the fees of its pools at every tick (the swaps of 24 hours of the listed pools, one day-read of `amm_daily`), inside the
+5 s budget of `volume_live` that the twelve live sets share (`AGGREGATOR_VOLUME_LIVE_BUDGET_MS` in `aggregator.service.ts`, a constant, not a setting). After the deploy check that the live sets keep refreshing: the
+spacing of the `version`s (the write time in milliseconds) of the live `amm_volume`/`day` and `trade_volume`/`day` sets in `volume_live`, about a minute apart; `syncer_aggregator_errors_total{job="volume_live"}`; and the warning
+`Aggregator job volume_live reached its budget; the sets left go on next tick` in the log (said once until a tick finishes in time). Measure the duration of the `amm_volume`/`day` set on the mainnet database before turning
+`AMM_DATA` on. If it crowds the budget, the options are raising `AGGREGATOR_VOLUME_LIVE_BUDGET_MS`, computing the estimate only every Nth tick, or narrowing the carry it requires to the trading fee (a slot lasts 24 h, far less
+than the 160,000-ledger window) in both jobs, the live set and `amm_daily`.
+
 **Turning on `AMM_DATA`.** `syncer_markets_live_amm_share_known{period}` is 1 when the newest `include` set of the period has its AMM share, which `markets_live` writes only when every ledger of the set's window was
-written by parser 2 (the parser gate). The gate opens as soon as the last ledger of the window is rewritten, which can be **one tick before the reprocessed hours are recomputed**: `markets_live`
-runs before `stats_dirty`, and the hook of `stats_dirty` recomputes the hours of an `agg_dirty` slice. In that window the gauge is 1 and the AMM share is understated (a window whose hours still hold the data of
+written by parser 2 (the parser gate). The gate opens as soon as the last ledger of the window is rewritten, which can be **before the reprocessed hours are recomputed**: `markets_live`
+runs before `stats_dirty`, and the hook of `stats_dirty` recomputes the hours of an `agg_dirty` slice, slice by slice. Until `agg_dirty` has drained (on a large reprocess that is longer than a tick) the gauge is 1 and the AMM share is understated (a window whose hours still hold the data of
 the parser before AMM shows a share near 0). So turn `AMM_DATA` on once, in this order:
 
 1. the reprocess has finished and **`agg_dirty` has drained**: `SELECT count() FROM xrpl.agg_dirty` is 0 (no metric shows the backlog; `stats_dirty` drains a day at a time, so a long reprocess takes a while);
-2. `syncer_pair_hourly_missing_hours` = 0 and `syncer_rates_daily_missing_days` = 0 again (the reprocess marks hours and rate days for recompute);
+2. `syncer_pair_hourly_missing_hours` = 0 and `syncer_rates_daily_missing_days` = 0 again (the reprocess marks the rate days stale; the hook recomputes its hours in place, so the hours gauge does not move for it);
 3. `syncer_markets_live_amm_share_known` = 1 for `day`, `7day` and `30day`, read **after** the queue is empty: the `7day` and `30day` sets are rewritten every fifth run, so give them one more five-minute turn
    to be made from the corrected hours.
 
