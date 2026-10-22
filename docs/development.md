@@ -57,7 +57,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
   `FixtureLedgerSource`, `raw-ledger.ts`.
 - `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, and account and market jobs), `src/util/`.
-- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
+- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
 - `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
 Everything the apps use is re-exported from `packages/shared/src/index.ts`: **export what you add there.**
@@ -200,7 +200,7 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `003_account_market_aggregates.sql`;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `004_amm_fee_estimates.sql`;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.

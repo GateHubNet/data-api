@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended three times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10f); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53).
+**Status:** Accepted. Amended three times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -58,7 +58,7 @@ below. Where a ruling made during implementation changed served behaviour it is 
 
 **Amendment 2 (2026-10-19), added by the account and market aggregates ([ADR-0013](0013-account-and-market-aggregates.md)); the wording is in [api-reference](../api-reference.md#account-analytics-get-v2accountsaddressanalytics):**
 10a. **New routes (extras, not in the original):** `/v2/accounts/{address}/analytics/{balances, balance_changes, counterparties, exchanges}` and `/v2/network/markets`. Their object shapes
-    and key orders are ours, pinned by tests, and none serves an AMM field.
+    and key orders are ours, pinned by tests, and none serves an AMM field (until 10g: `network/markets` does, from the AMM data additions; the analytics routes never do).
 10b. **New parameters on routes of the original:** `interval` (`day`, `week`, `month`) on `/v2/accounts/{address}/stats/{family}` and on `/v2/accounts/{address}/reports`. Without it the answers are the
     original's. Before this change an `interval` there was ignored like any unknown parameter, so **a client that sent one now gets buckets**. With `interval`, `stats/value` has a row for every bucket from the first one in which
     the account had a balance up to the bucket that holds now, not only for active ones; `reports` allows 200 buckets of the interval (200 days, weeks or months; 200 months is all of the history), `payments=true` stays per day (400 `payments can only be listed with interval day`
@@ -68,6 +68,9 @@ below. Where a ruling made during implementation changed served behaviour it is 
 10d. **Analytics windows are whole UTC days, `end` included** (as `reports`), unlike the exclusive `end` of `stats/{family}`; with an `interval` they widen to whole buckets, at most 1000.
 10e. **Valuing balance changes:** a change on a line the account owes on (its balance is below 0) is valued as the account's own IOU; LP tokens and assets without a DEX rate are worth 0, as in `stats/value` and `reports`.
 10f. **Unclassified balance changes** (those of transaction types the original never classified) are a group without a `change_type` key in `analytics/balance_changes`, as the `balance_changes` objects leave it out.
+10g. **AMM data additions to these aggregates** ([ADR-0013, D2b](0013-account-and-market-aggregates.md#d2b-the-amm-data-additions)): `network/markets` takes `amm` (`include`, `exclude`, `only`) and serves `amm` (the filter, after `period`),
+    `amm_share` and `amm_pool` per market and `amm_share` in the totals, only when every ledger of the window was parsed with AMM support; the live day row of `network/amm_volume` (a route of ours) has `fees_est`, per component and on the row; the
+    daily history of a pool has `computed_start` and `computed_end`. Wording in [api-reference](../api-reference.md#get-v2networkmarkets).
 
 ### 3. Outright bugs fixed
 **Ledgers / transactions**

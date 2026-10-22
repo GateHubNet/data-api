@@ -1,7 +1,8 @@
 # ADR-0013: Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats
 
 **Status:** Accepted. Extends [ADR-0008](0008-no-aggregate-materialized-views.md) (precomputed aggregates are tables the aggregator writes) and
-adds routes and parameters to the contract of [ADR-0010](0010-ripple-v2-wire-compatibility.md) (section 2, items 10a to 10f).
+adds routes and parameters to the contract of [ADR-0010](0010-ripple-v2-wire-compatibility.md) (section 2, items 10a to 10g). The last section, [D2b](#d2b-the-amm-data-additions), adds the AMM data
+to these aggregates once the AMM work ([ADR-0011](0011-amm-data-and-swaps-as-exchanges.md)) is merged.
 
 ## Context
 The public explorer needs two things this API could not serve. An **account's analytics** for a period (30 days, 90 days, a year, all of it):
@@ -49,7 +50,7 @@ Two details of the rollups follow from it. The three rollup row tables have `ver
 the rows of the set a sentinel points to with a newer set that is still being written. And the **superseded versions are never pruned**: they accumulate only when a re-ingest corrects a covered day, they are not read, and no cleanup is shipped.
 
 **The AMM boundary.** D2 serves no AMM field: `network/markets` has no `amm` key, no `totals.amm_share`, no `amm_share` or `amm_pool`, and `amm` is not a parameter (it is ignored). The columns that will hold them exist from migration 003 (`pair_hourly.source`,
-`markets_live.amm`, `amm_share`, `amm_pool`, `total_amm_share`) and are written `book`, `include` and NULL, so the AMM additions need no migration for them. When they come, they are present **only when known**, and an absent field means "not known", never 0 or `false`.
+`markets_live.amm`, `amm_share`, `amm_pool`, `total_amm_share`) and are written `book`, `include` and NULL, so the AMM additions need no migration for them. When they come, they are present **only when known**, and an absent field means "not known", never 0 or `false`. [D2b](#d2b-the-amm-data-additions) is that.
 
 ## Consequences
 **Positive**
@@ -69,6 +70,71 @@ the rows of the set a sentinel points to with a newer set that is still being wr
 - **Merging the AMM branch** needs a recipe: the two branches meet in a few registration files and the docs, never in a migration. Every resolution keeps both sides:
   [the merge recipe](../superpowers/plans/2026-10-19-account-market-aggregates.merge-recipe.md).
 
-Where it is documented: [api-reference](../api-reference.md#account-analytics-get-v2accountsaddressanalytics) (the five routes, `interval`, the markets rules, the absent AMM keys), [data-model](../data-model.md#account-and-market-aggregates-migration-003) (the nine tables),
+Where it is documented: [api-reference](../api-reference.md#account-analytics-get-v2accountsaddressanalytics) (the five routes, `interval`, the markets rules, the AMM keys), [data-model](../data-model.md#account-and-market-aggregates-migration-003) (the nine tables),
 [clickhouse](../clickhouse.md#the-aggregate-families-and-their-reads), [syncer](../syncer.md#7-the-aggregator) (the jobs, the runners, the hooks, the back-fills), [configuration](../configuration.md#5-syncer-appssyncer) (`GH_ACCOUNT_ROLLUP_MIN_ROWS`),
-[observability](../observability.md#4-metrics-syncer) and [operations](../operations.md#account-and-market-aggregates).
+[observability](../observability.md#4-metrics-syncer) and [operations](../operations.md#account-and-market-aggregates) (D2b: [the AMM data additions](../operations.md#the-amm-data-additions)).
+
+## D2b: the AMM data additions
+
+**Status:** Accepted. Fills the absent-field contract of "The AMM boundary" above, after the owner merged the AMM work. Design: `docs/superpowers/specs/2026-10-19-account-market-aggregates-design.md`, section "D2b"
+(D2b.1 to D2b.6); the plan is `docs/superpowers/plans/2026-10-22-amm-aggregates-d2b.md`. The AMM work stores a swap against a pool as an `exchanges` row (and an `account_exchanges` row for each side) with `amm_account` set to the pool,
+written by parser version 2, and the pools' state in `amm_pools` and `amm_daily` ([ADR-0011](0011-amm-data-and-swaps-as-exchanges.md)). D2b reads that data; it changes no ingest and no parser version, and has one
+migration, `004_amm_fee_estimates.sql`.
+
+**1. The source split.** `pair_hourly` splits each pair by `source = if(amm_account != '', 'amm', 'book')` (the column exists since 003), so a pair with both kinds of trade in an hour has two rows, each the candle of its own trades;
+the hour's sentinel stays the empty pair with source `book`. `PAIR_HOURLY_CONFIG_VERSION` becomes 2, and the runner treats an hour whose newest set has another version as due, so the first run of the new syncer computes the 31 days
+again, newest first, in minutes. Until the hours a Markets window needs are done, its sets are skipped and the previous ones stay and age. The other aggregates need nothing: `analytics/exchanges` and the heavy accounts' `account_trades_daily`
+read `account_exchanges`, `rates_daily` and `pair_hourly` read `exchanges`, and the values follow the rates, which now count swaps. The tests prove it (swaps in the rollups and the raw reads agree byte for byte, `dailyNativeRatesOfDay`
+still equals `dailyNativeRates`, a `--reprocess` corrects rates, hours and heavy-account days); the answers carry no AMM-completeness field.
+
+**2. Three filter sets from one read.** A run of a period writes the sets `include` (the hour rows of both sources), `exclude` (`book`) and `only` (`amm`) from one read of the hour rows, as three inserts in the order
+`exclude`, `only`, `include` (the set the explorer reads first is the last to change), each under its own version; a missing hour skips all three (D6). The rate of an asset, which a pair's `native_volume` goes through, comes
+from the `include` rows in all three sets: a filter changes which trades are counted, not what an asset is worth. The API's parameter `amm` (`include`, `exclude`, `only`; the AMM work's message `invalid amm filter - use: include, exclude, only`)
+reads the set of its filter, is checked after the display currency (D7), and is **echoed** in every answer after `period`, the answer of no set too (D1), as `period` is echoed when it was defaulted.
+
+**3. The AMM fields, and the parser gate.** `amm_share` of a pair is the base volume of its swaps over the base volume of all its trades, text with 4 decimals, rounded half up, the same in every filter's set because it describes
+the pair; it is the share of the base **as stored** and does not change when a consumer shows the pair inverted (D2: whether a counter-side share is wanted is the owner's call). It is absent when the pair's base volume is not above 0, which
+a kept trade cannot make, and `"0.0000"` for a pair without swaps (D5). `amm_pool` is whether a pool of the pair has a newest `amm_pools` row that is not deleted. `total_amm_share` is the sum of each pair's `native_volume × amm_share`
+over the sum of the native volumes of the pairs that have one (each share exact, not the rounded text), from exact quotients (20 places) rounded once, `"0.0000"` without a native volume, the same on the three sentinels (D3). The three exist **only when known**: when every ledger
+that closed in a set's window was written by a parser that knows AMM, the lowest `parser_version` of those ledgers being at least `AMM_PARSER_VERSION` (2, beside `PARSER_VERSION`), and a window without a ledger passing; otherwise they are NULL and the API
+leaves them out. The gate is one rule on both networks (D4): Xahau has no swaps and no pools, so its data gives `"0.0000"` and `false`. While a window is incomplete, `exclude` is exact (an unparsed swap is no exchange) and `only` is partial.
+The gauge `syncer_markets_live_amm_share_known{period}` is 1 when the newest `include` set has `total_amm_share`; it gates the explorer's `AMM_DATA` switch with the gauges of the AMM rollout, and has no alert.
+
+**4. `fees_est` on the live day row of `amm_volume`.** The component rows of the rolling 24 h set get the estimated fees their pool charged on the swaps of the window, in the native currency, in `volume_live.fees_est_f Nullable(Float64)`
+(migration 004), written in the set's one insert; the API converts them like `converted_amount` (a display currency with its rate) and sums them on the row. The longer periods and the historical rows have none: reading up to 30 days of swaps at
+every tick is not affordable, and a pool's fees per day are `amm_daily`'s. The estimate counts **every swap** of the window, with the fee in force for it as `amm_daily` resolves it (`swapTotals`: the trading fee, or the auction
+slot's discounted fee for its holder and authorised accounts while the slot is in force), with the fee state carried in from before the window as `amm_daily` carries it into a day, and without the dust rule of `amount` (D8). The two
+sides' fees are put in the unit of the component's `amount` at the pool's own average price in the window and converted with the component's volumes. A side with a swap whose fee is not known makes the estimate unknown (the AMM work's
+Ruling R-A26: part of the fees is never shown as all of them), as does fees above 0 on a side with no volume; the component then has no `fees_est`, and the row has one only when it lists a component and every listed component has one (D9).
+**A known cost:** the window's carry walks a pool that never had an auction slot back through its state history to its first ledger on every tick, as `amm_daily` does for today's set at each of its runs (every fifth tick), because the slot columns are
+required in the carry. Narrowing the required carry to the trading fee (a slot lasts 24 hours, far less than the fill-forward window) would change `amm_daily`'s own rule, so it is parked as a follow-up for both jobs.
+
+**5. The range of computed AMM days.** `amm/pools/{pool}/history?interval=day` says which days of the request's window `amm_daily` has computed: `computed_end` is the newest day with a set of the current
+`AMM_DAILY_CONFIG_VERSION` (its newest sentinel, final or not), `computed_start` the oldest day from which every day up to it has one. The window is the request's, never narrowed by the marker, so every page of an answer has the same
+range (D10); a day inside it without a row is a quiet day, one outside it is not computed yet. Both keys are absent when no day of the window has a set, and are not in the CSV.
+
+**The decisions the build made where the design left a choice** (each is a ruling of the run):
+
+| | Decision |
+| --- | --- |
+| D1 | `amm` is echoed after `period` in every `network/markets` answer, `"include"` when the request has none, the no-set answer too |
+| D2 | `amm_share` is a share of the stored base volume and does not change when a consumer inverts the pair |
+| D3 | `total_amm_share` from exact quotients (20 places) rounded once to 4 decimals; `"0.0000"` without a native volume; the same on the three sentinels |
+| D4 | The parser gate is the same on both networks: the lowest `parser_version` of the window's ledgers is at least `AMM_PARSER_VERSION`; no ledger passes |
+| D5 | A pair's `amm_share` is absent when its base volume is not above 0, and `"0.0000"` without swaps |
+| D6 | One run, three sets: `exclude`, `only`, then `include`, each its own version; a missing hour skips all three |
+| D7 | The `amm` check comes after the display currency: `period`, `min_trades`, the display currency, `amm` |
+| D8 | `fees_est` counts every swap of the window and converts with the component's own volumes; fees above 0 on a side without volume make it unknown |
+| D9 | The row's `fees_est` exists only when the row lists a component and every listed component has one |
+| D10 | The computed range is that of the request's window and counts a day only when its newest sentinel has the current config version |
+
+**Consequences and trade-offs.**
+- **The gate is not the whole answer.** The parser gate opens as soon as every ledger of the window is parser 2, which after a `--reprocess` can be a tick before the reprocessed hours are recomputed (`markets_live` runs before `stats_dirty`,
+  whose hook recomputes them). The share is then understated for minutes. The design accepts this (aggregates are eventual after a re-ingest), and the docs ask that `AMM_DATA` is turned on only once `agg_dirty` has drained
+  ([operations](../operations.md#the-amm-data-additions)); no gauge shows that backlog.
+- **A deploy waits for the catch-up.** The first run of the syncer after D2b computes the 31 days again, and the Markets sets are skipped until the hours they need are done; the previous `include` sets stay and age for those minutes, and the filters
+  `exclude` and `only` answer the no-set answer until their first run. A database whose history is not ingested again has the AMM fields on its `30day` set only 30 days after parser 2 started writing.
+- **The order of the rollout is binding**: the API reads `fees_est_f` in every live volume read, so `migrate` (004), then the syncer, then the API; an API before 004 fails the live volume routes.
+- **No counter-side share.** `amm_share` is of the stored base; a consumer that shows a pair inverted shows the same number.
+- **A heavier live set.** The `amm_volume` day set reads the 24 h of swaps of its listed pools every tick (one day-read of `amm_daily`), on top of the walk-back cost above.
+

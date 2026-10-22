@@ -284,11 +284,11 @@ constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment
 
 | # | Job | Budget | What |
 | --- | --- | --- | --- |
-| 1 | `volume_live` | 5 s | The twelve live volume sets (trade volume and AMM volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version. **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
+| 1 | `volume_live` | 5 s | The twelve live volume sets (trade volume and AMM volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version; the `amm_volume` set of the period `day` also carries the pools' fee estimates ([the AMM jobs](#the-amm-jobs)). **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
 | 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), all three metrics, stalest first. |
 | 3 | `amm_pools` | 3 s | Rebuilds the `amm_pools` row of every AMM pool with state rows that its row has not seen yet, 200 pools at a time ([the AMM jobs](#the-amm-jobs)). |
 | 4 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
-| 5 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
+| 5 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
 | 6 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
 | 7 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, and runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)). |
 | 8 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
@@ -348,20 +348,30 @@ today is never final and yesterday only once the ingest has passed it; today, an
 Writes the hourly trade statistics of every pair for the last 31 days (`PAIR_HOURLY_DAYS`); the table's TTL drops what is older than 45 days.
 
 - **An hour is a set**: from `exchanges` in the ledger range of the hour, all pairs, each row once, the kept trades only (native legs of 0.0005 or less are
-  left out, as in candles and `reduce`), grouped by pair and source, with the candle expressions of the API (open and close by key, high and low by
-  rate with the key as tie-break) and the keys of the trades they name. Every row is `book` (the column `source` exists for the AMM work). The sentinel
-  (the empty pair) carries `is_final` (a ledger that closed at or after the hour's end was there), `config_version` (`PAIR_HOURLY_CONFIG_VERSION`, 1) and `through_time`.
+  left out, as in candles and `reduce`; swaps too), grouped by pair and **source**, with the candle expressions of the API (open and close by key, high and low by
+  rate with the key as tie-break) and the keys of the trades they name. The source is `amm` when the exchange has an `amm_account` (a swap against a pool) and
+  `book` otherwise (`if(amm_account != '', 'amm', 'book')`): a pair with both in an hour has a row of each, and each is the candle of its own trades. The sentinel
+  (the empty pair, source `book`) carries `is_final` (a ledger that closed at or after the hour's end was there), `config_version` (`PAIR_HOURLY_CONFIG_VERSION`, 2) and `through_time`.
 - **Per run**: the current hour (always) and the previous hour until its set is final, the stalest first; then the **back-fill**, the hours of the
   last 31 days that have no final set of the current config version, newest first. An hour whose set is not final is done again only once a **newer ledger
   closed after its end** (until then a new set would be the same). A run of consecutive hours inside one UTC day is one call, so a day without a set is one
   read of the trades and 24 inserts; **a multi-hour call that fails is retried hour by hour**, so one bad hour does not keep the day. No hour before the hour of
   the first ledger is computed. At first start the 31 days take minutes.
+- **The catch-up at config version 2.** Version 2 is the split by source: a set of version 1 has one row per pair, the order book and the pools together, which the
+  markets sets cannot take apart. The runner treats an hour whose newest set has another config version as due, final or not, so the first run of a syncer with the AMM
+  additions computes the live hours and then the 31 days again, newest first, in minutes. `syncer_pair_hourly_missing_hours` jumps to the hours of the last 31 days (745) and falls
+  back to 0, and the back-fill log lines come again. Until every hour a Markets set needs (its window and the 7 days of its sparkline: about a week for `day` and `7day`, 30 days
+  for `30day`) has a set of version 2, that set is skipped (7.3) and the previous one stays and ages. A re-ingest recomputes its hours through the hook (7.6), always at the current version.
 - Gauge `syncer_pair_hourly_missing_hours`: the hours of the last 31 days without a set of the current config version. Log lines `Pair-hourly back-fill: N hour(s) to compute, newest first`
   and `Pair-hourly back-fill is done: every hour of the last 31 days has its set`.
 
 ### 7.3 `markets_live`
 
 Writes the Markets sets from `pair_hourly` (`markets_live`; read by `GET /v2/network/markets`, [api-reference](api-reference.md#get-v2networkmarkets)).
+A period has **three sets, one per filter** of the `amm` parameter: `include` (the hour rows of both sources), `exclude` (those of `book`, the order-book trades) and `only` (those of `amm`,
+the swaps). One run of a period reads the hour sets once and computes the three; each is written whole in one insert, in the order `exclude`, `only`, `include` (the set the explorer reads first
+is the last to change), each under its own version (`nextSetVersion`, keyed by period and filter, so the numbers of two filters can coincide). A skip (below) skips all three. A pair is in a set
+only with a kept trade of its filter.
 
 - **Window** of a period P (24 h, 7 days or 30 days): the hours from `floorHour(t) - P` to `floorHour(t)`, where t is the `through_time` of the newest set of the
   current hour; `start_time = floorHour(t) - P`, `end_time = t`. The window is at least P and at most P + 59 min 59 s long. A set is written only when every hour of its
@@ -371,10 +381,25 @@ Writes the Markets sets from `pair_hourly` (`markets_live`; read by `GET /v2/net
   (first and last trade by key), `high` and `low` (by rate, key as tie-break), the two times, the native volume, and the 7 daily `closes`. The **native volume** of a pair is the
   volume of its native side; otherwise the base volume over the base's rate, else the counter volume over the counter's rate (an asset's rate is its volume over the native volume of
   its pair against the native currency in the same window, all trades; the quotient has 17 significant digits); without a rate on either side there is none. The sentinel carries the
-  window and the totals (`pairs_traded`, `total_count`, `total_native_volume`). `amm_share`, `amm_pool` and `total_amm_share` are NULL.
+  window and the totals (`pairs_traded`, `total_count`, `total_native_volume`) of the filter's trades. The rate of an asset comes from the `include` rows in all three sets (all trades of its
+  pair against the native currency, whatever the filter).
+- **The AMM fields.** `amm_share` of a pair is the base volume of its `amm` rows over the base volume of all its rows, 4 decimals rounded half up once, `"0.0000"` for a pair without swaps and NULL
+  when the base volume of all its trades is not above 0 (which a kept trade cannot make); `amm_pool` is 1 when a pool of the pair has a newest `amm_pools` row (the highest version, no `FINAL`) that
+  is not deleted, else 0. Both describe the pair, so they are the same on its row in every set. `total_amm_share`, on the sentinel, is the sum over the pairs of all trades that have a native
+  volume of `native_volume × amm_base ÷ base_volume` (exact quotients, 20 places) over the sum of their native volumes, rounded once to 4 decimals, `"0.0000"` when no pair has a native volume;
+  it is the same on the three sentinels.
+- **The parser gate.** The three AMM columns are written only when every ledger that closed in `[start_time, end_time]` was written by a parser that knows AMM: the lowest `parser_version`
+  of those ledgers is at least `AMM_PARSER_VERSION` (2, in `rows.ts` beside `PARSER_VERSION`), or no ledger closed in the window. The read is a range of the primary key of `ledgers` (from the first
+  ledger that closed at or after `start_time`, found by the order of the key, to the last that closed at or before `end_time`). Otherwise the columns are NULL on every row of the three sets
+  (the sets are still written, and the API leaves the fields out). The rule is the same on both networks: Xahau has no swaps and no pools, so its sets have `"0.0000"` and `0`. The gate opens
+  as soon as every ledger of the window is parser 2, which after a `--reprocess` can be one tick **before** the reprocessed hours have been recomputed (`markets_live` runs before
+  `stats_dirty`, whose hook recomputes the hours of an `agg_dirty` slice): until `agg_dirty` is drained the share can be understated ([operations](operations.md#the-amm-data-additions)).
 - **Cadence**: the `day` set at every run, the `7day` and `30day` sets on the 1st, 6th, 11th ... run (`MARKETS_LONG_EVERY_TICKS` = 5, **counted by the runner itself**). A long set that the budget kept
   from starting is **written on the next run**, after the `day` set.
 - Gauge `syncer_markets_live_age_seconds{period}`: now minus the `end_time` of the newest `include` set of the period (set after the sets of each run).
+- Gauge `syncer_markets_live_amm_share_known{period}`: 1 when the newest `include` set of the period has `total_amm_share`, else 0 (also for a period with no set). It is set after the age
+  gauge on every run, so the `7day` and `30day` values change only on the runs that write those sets (every fifth); a read that fails is counted as `markets_live`
+  (`syncer_aggregator_errors_total{job="markets_live"}`) and the gauge keeps its value. It gates the explorer's `AMM_DATA` switch ([observability](observability.md#4-metrics-syncer)).
 
 ### 7.4 `account_rollups`
 
@@ -438,7 +463,8 @@ because the range is not changed after it. Between the rewrite and the hook the 
 
 A fresh deployment (or a database recreated for a new baseline) fills the new tables by itself, each back-fill under the budget of its job and newest first: `pair_hourly` its 31 days in minutes (the Markets sets appear at once); `rates_daily` the closed days back to the first native trade, which for
 about 5,000 XRPL days takes some hours of query time, so about a day within its budget; `account_rollups` the heavy accounts (a third to half of all balance changes), one to two days. Each says once in the log that it is under way and once that it is done, and each has a gauge that reaches 0 (`syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`,
-`syncer_account_rollups_pending_accounts`). Until then the API is right and slower ([operations](operations.md#account-and-market-aggregates)).
+`syncer_account_rollups_pending_accounts`). Until then the API is right and slower ([operations](operations.md#account-and-market-aggregates)). The first start of a syncer with the AMM data
+additions goes through the `pair_hourly` back-fill once more (7.2).
 
 ### The AMM jobs
 
@@ -506,6 +532,15 @@ cannot lose a state after merges ([ADR-0011](adr/0011-amm-data-and-swaps-as-exch
 sentinel, `config_version` and `volumeDaysDone` of the other two metrics. Its components are the pools with swap volume in the window
 (`component` is the pool account), found from `amm_pool_touches` and `amm_pool_states` and read through the pair key, converted to the
 native currency like trade components. It is not limited to the configured markets.
+
+The **live `day` set** of `amm_volume` also carries the pools' **fee estimates** (`volume_live.fees_est_f`, migration 004; the API's `fees_est`): for each listed component, in the native
+currency, the fees its pool charged on the swaps of the window, which `ammComponents` reads one swap at a time (`ammWindowSwapTotals`, `amm-daily.job.ts`) for the listed pools only. Every swap of
+the pool in the committed ledgers of the window counts (no dust rule), charged as `amm_daily` charges a day (`swapTotals` and `feeOf`: the pool's trading fee, or the discounted fee of the auction
+slot for its holder and the accounts it authorises while the slot is in force), with the fee state carried in from before the window as `amm_daily` carries it into a day. The estimate of a
+component is `fees_S × converted ÷ amount` for the side S of its `amount` plus `fees_O × converted ÷ volume_O` for the other side O (priced in S by the pool's own volumes of the window, converted with
+the component's own volumes, which are the dust-filtered sums). It is NULL when a side's fee is not known (a swap with no known fee: part of the fees is never shown as all of them) and when a side's
+fee is above 0 while its volume is not; the sentinel and every row of the other sets have NULL (the longer periods would read up to 30 days of swaps every tick). The set is still one insert, with
+the column in it; a set written before migration 004 reads as not known until the next tick. The cost is the swaps of 24 hours once a tick, as `amm_daily` reads a day.
 
 ## 8. The validators worker
 

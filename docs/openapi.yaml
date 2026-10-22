@@ -2468,8 +2468,13 @@ paths:
         With them, a row per `interval` (day, week from Monday, month, UTC) for the
         days that were computed: a bucket is a row when it starts within `start` and
         `end`, whole. `exchange_currency` / `exchange_issuer` show the amounts in
-        another currency, as for the exchange volume. The trade volume (`exchange_volume`)
-        counts the swaps as well.'
+        another currency, as for the exchange volume. The live row of the rolling
+        day (`live=day`) also has `fees_est`, the estimated trading fees the pool
+        charged on the swaps of the 24 hours, per pool and as the sum of the row,
+        in the currency of `converted_amount`; a pool whose fees are not known has
+        none, and then the row has none. The other rows have no `fees_est`: the fees
+        of a pool per day are in `/v2/amm/pools/{pool}/history?interval=day`. The
+        trade volume (`exchange_volume`) counts the swaps as well.'
       parameters:
       - name: format
         required: false
@@ -2542,7 +2547,7 @@ paths:
     get:
       operationId: MarketsController_list
       summary: Get the trade statistics of every market in a live period
-      description: Every pair that traded in the period (not the markets config),
+      description: 'Every pair that traded in the period (not the markets config),
         in the canonical stored order of its currencies; a price is counter per base.
         The pairs with at least `min_trades` trades are listed, by `native_volume`,
         the largest first, the pairs without one last by `count`, then by the pair;
@@ -2561,8 +2566,17 @@ paths:
         pair that traded. With `exchange_currency` the answer has `exchange` and `exchange_rate`
         (units of it per native coin, at the rate of the latest trades) and a `converted_volume`
         (the native volume times the rate) on the totals and on every market that
-        has a native volume. The sets are written every minute (day) or five minutes
-        (7day, 30day); before the first one the answer has no markets.
+        has a native volume. With `amm` the pairs, volumes, prices and counts are
+        those of the trades it keeps (`exclude`: the order book; `only`: the swaps
+        against AMM pools), and the answer has `amm`. `amm_share` is the part of the
+        pair''s base volume that was swaps, over every trade of the pair in the window,
+        text with 4 decimals (the same in every filter; it does not change if a consumer
+        shows the pair inverted), `amm_pool` whether the pair has a pool that is not
+        deleted, and `totals.amm_share` the part of the native volume that was swaps.
+        They are left out unless every ledger of the window was parsed with AMM support:
+        an absent field means not known, never 0 or false. The sets are written every
+        minute (day) or five minutes (7day, 30day); before the first one the answer
+        has no markets.'
       parameters:
       - name: format
         required: false
@@ -2579,6 +2593,18 @@ paths:
         description: Default 1000, at most 5000.
         schema:
           type: number
+      - name: amm
+        required: false
+        in: query
+        description: 'From the AMM data: `include` (default) counts every trade, `exclude`
+          the order-book trades only, `only` the swaps. The AMM fields are there only
+          when every ledger of the window was parsed with AMM.'
+        schema:
+          enum:
+          - include
+          - exclude
+          - only
+          type: string
       - name: exchange_issuer
         required: false
         in: query
@@ -3278,7 +3304,15 @@ paths:
         with activity (`swap_count`, `volume_base` and `volume_counter` by side, `fees_*_est`,
         estimates, left out when a swap into the side had no known fee, liquidity
         in and out, and the closing state), a day when its start is within `start`
-        and `end`. `format=csv` gives the rows as a CSV file.'
+        and `end`. `format=csv` gives the rows as a CSV file. With `interval=day`
+        the answer also has `computed_start` and `computed_end` (`YYYY-MM-DD`, after
+        `result`, not in the CSV): the days of the request''s window that the daily
+        figures have been computed for. `computed_end` is the newest day of the window
+        that has been computed, and `computed_start` the oldest day from which every
+        day up to it has been. A day inside the range without a row of the pool is
+        a day it was quiet; a day outside it is not computed yet. Both are left out
+        when no day of the window has been computed, and they are the same on every
+        page of an answer.'
       parameters:
       - name: pool
         required: true

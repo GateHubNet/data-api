@@ -106,7 +106,7 @@ parameter is repeated (`?limit=5&limit=10`) the first value wins.
 | `strict` | False only when the text matches `/false/i`; anything else, or nothing, is true. |
 | `include_exchanges` | True for any non-empty text, `0` and `false` included. |
 | `limit` | The default and the maximum differ per endpoint (listed below). Missing or empty gives the default; more than the maximum gives the maximum; a decimal is cut to its whole part; below 1 gives the default. Text that is not a number gives the default, except on the routes that answer `invalid limit` (`/v2/accounts/{address}/balances`, `/orders`) or `invalid limit: NaN` (the exchanges routes). |
-| `amm` (the exchange lists) | `include` (default, also when missing or empty), `exclude` or `only`; case-sensitive. Anything else answers 400 `invalid amm filter - use: include, exclude, only`. See [Exchanges](#exchanges). |
+| `amm` (the exchange lists, `network/markets`) | `include` (default, also when missing or empty), `exclude` or `only`; case-sensitive. Anything else answers 400 `invalid amm filter - use: include, exclude, only`. See [Exchanges](#exchanges) and [`network/markets`](#get-v2networkmarkets). |
 | `marker` | An opaque token from the previous page (see [Pagination](#pagination)). A marker that is not one answers 400 `invalid marker`. |
 | `format` | `json` (default) or `csv`, in any letter case. See [CSV](#csv). |
 
@@ -200,7 +200,8 @@ Exchange-based endpoints also differ in what they count: **swaps against AMM poo
 More additions, from the account and market aggregates ([ADR-0013](adr/0013-account-and-market-aggregates.md)): the routes `GET /v2/accounts/{address}/analytics/{balances,
 balance_changes, counterparties, exchanges}` and `GET /v2/network/markets`, and the parameter `interval` on
 `GET /v2/accounts/{address}/stats/{family}` and `GET /v2/accounts/{address}/reports` (the original ignored it there: a client that sent
-one now gets buckets).
+one now gets buckets). Their AMM data additions add the parameter `amm` and the fields `amm_share` and `amm_pool` to `GET /v2/network/markets`, the
+fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, and `computed_start` and `computed_end` to `GET /v2/amm/pools/{pool}/history?interval=day`.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -1542,9 +1543,9 @@ Two modes, chosen by the parameters:
     "start_time": "2026-10-15T12:00:00Z", "end_time": "2026-10-16T12:00:00Z" }] }
 ```
 
-Row keys: `components, count, exchange, total, exchange_rate, start_time, end_time`. A **trade** component is `{count, rate, amount,
+Row keys: `components, count, exchange, total, exchange_rate, start_time, end_time` (and `fees_est?` last, on the live day row of `amm_volume`: see below). A **trade** component is `{count, rate, amount,
 base, counter, converted_amount}`, a **payment** component `{currency, issuer?, amount, count, rate, converted_amount}`
-(`issuer` absent for the native currency), an **AMM** component `{amm_account, base, counter, count, amount, rate, converted_amount}`. `amount` is the exact sum in the component's currency, `converted_amount` and
+(`issuer` absent for the native currency), an **AMM** component `{amm_account, base, counter, count, amount, rate, converted_amount, fees_est?}`. `amount` is the exact sum in the component's currency, `converted_amount` and
 `total` are the value in the native currency (or the display currency), `count` of a row is the number of trades or payments.
 Components are sorted by converted amount, the largest first. A component's `rate` is how many units of its currency one native
 coin buys (`amount / converted_amount`); a market or currency without a rate is left out of the components (but its payments
@@ -1562,6 +1563,30 @@ pools against the native currency in the same window. A pool without a rate on e
 can list a non-native pool twice**, once for each orientation: the days of the bucket that converted the pool through its base and the
 days that converted it through its counter are added up apart, because their amounts are of different currencies. On Xahau (no AMM) the
 rows have no components and zero totals.
+
+**`fees_est`** is on the **live day row of `amm_volume`** (`live=day`, the default: the rolling 24 hours, neither `start` nor `end`) and nowhere
+else: not on the other live periods (`hour`, `3day`, `7day`, `30day`), not on the historical rows and not on the trade and payment volumes. A
+pool's fees per day are `fees_base_est` and `fees_counter_est` of [its daily history](#get-v2ammpoolspoolhistory). Each component has the
+estimated trading fees its pool charged on the swaps of the 24 hours, and the row the sum over its listed components, converted as
+`converted_amount` and `total` are (into the native currency, or with `exchange_currency` into the display currency). It is formatted as
+`converted_amount` is, a number as text, and it is an **estimate**: each swap's input times the fee in force for it (the pool's trading fee, or
+the discounted fee of the auction slot for its holder and the accounts it authorises while the slot is in force; the fee state is carried in
+from before the window), as the pool days are computed. It counts **every swap** of the window: the rule that leaves the swaps with a native
+leg of 0.0005 or less out of `amount` and `count` does not apply to the fees. The fees of the pool's two sides are put into the unit of `amount`
+at the pool's own average price in the window, and converted with the component. A component has no `fees_est` when a side's fee is **not
+known** (a swap of the window whose fee was never shown, as for a pool first seen in the middle of its life; part of the fees is never shown as
+all of them), and the row has `fees_est` only when it lists at least one component and every listed component has one; `"0"` is a known fee of 0.
+In the CSV the columns are there when the answer has them: `components[i].fees_est` right after `components[i].converted_amount`, and `fees_est`
+after `end_time`.
+
+```json
+{ "result": "success", "count": 1,
+  "rows": [{
+    "components": [{ "amm_account": "r…", "base": { "currency": "USD", "issuer": "r…" }, "counter": { "currency": "XRP" },
+                     "count": 120, "amount": "5000", "rate": "0.11000000", "converted_amount": "45454.545", "fees_est": "22.727" }],
+    "count": 120, "exchange": { "currency": "XRP" }, "total": "45454.545", "exchange_rate": "1.0000000",
+    "start_time": "2026-10-15T12:00:00Z", "end_time": "2026-10-16T12:00:00Z", "fees_est": "22.727" }] }
+```
 
 Errors: 400 as above, `invalid start date format`, `invalid end date format`, `invalid marker`; 500 `error getting data`
 (also for all three routes).
@@ -1585,14 +1610,15 @@ one precomputed set, read in a few milliseconds.
 | `period` | `day` | `day`, `7day` or `30day`, the live periods of `exchange_volume` that the explorer uses. Anything else: 400 `invalid period - use: day, 7day, 30day`. An empty `period` is the default. |
 | `min_trades` | 10 | List the pairs with at least this many trades: a whole number (plain digits) from 1 to 1,000,000, else 400 `invalid min_trades`. An empty one is the default. |
 | `exchange_currency`, `exchange_issuer` | the native currency | Also show the volumes in this currency, at the live rate, as the live volume rows do. The errors of the volume routes: 400 `exchange currency must have an issuer`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid exchange issuer address`. The native currency (with no issuer) adds nothing. |
+| `amm` | `include` | Which trades the answer counts: `include` (all of them), `exclude` (the order-book trades only) or `only` (the swaps against AMM pools). Case-sensitive; an empty `amm` is the default; anything else: 400 `invalid amm filter - use: include, exclude, only`. The answer echoes it. |
 | `limit` | 1000 (max 5000) | How many markets. |
-| `format` | json | `csv`: file `markets.csv`, the `markets` (flattened: the sparkline is the columns `sparkline[0].date`, `sparkline[0].close`, ...). |
+| `format` | json | `csv`: file `markets.csv`, the `markets` (flattened: the sparkline is the columns `sparkline[0].date`, `sparkline[0].close`, ...; `amm_share` and `amm_pool` are columns where the markets have them, `amm_pool` as `true` or `false`). |
 
 - **Pairs.** Every pair traded in the window, not the markets config, in the canonical stored order of its currencies (as
   `/v2/exchanges` serves a pair); a price is **counter per base**. A trade counts when its native leg is above 0.0005 (the rule of the
   candles and of `reduce`: dust is left out), and `count` counts those. The pairs with at least `min_trades` trades are listed, sorted by
   `native_volume`, largest first (compared as numbers), the pairs without one last by `count`, then by the pair; at most `limit` are
-  served.
+  served. A swap against an AMM pool is a trade of its pair like an order-book trade (the `amm` parameter below picks which of them are counted).
 - **Window.** The periods start on the hour: a set is made of whole hours of trade statistics, so the 24 hours of `day` are 24 to 25
   hours (`start_time` is the hour that is 24 hours before the hour of `end_time`, and `end_time` is the close time of the newest
   ledger the set covers), and `7day` and `30day` the same on 7 and 30 days. The `day` set is rewritten every minute, `7day` and
@@ -1612,11 +1638,35 @@ one precomputed set, read in a few milliseconds.
   `{ "date", "close"? }`: a day without a trade carries the close before it, and `close` is left out for a day with none before it
   within the 7 days.
 - **Totals.** `pairs` is the number of listed pairs (with `count >= min_trades`), whatever the `limit`; `pairs_traded`, `count` and
-  `native_volume` are over every pair that traded in the window (the pairs without a native volume add none).
+  `native_volume` are over every pair that traded in the window (the pairs without a native volume add none), counting the trades the `amm`
+  filter keeps.
 - **Display currency.** With `exchange_currency` the answer adds `exchange` (`{currency, issuer?}`) and `exchange_rate` (units of it per
   native coin at the live rate, 8 significant digits) after `end_time`, and a `converted_volume` after `native_volume` in the totals
   and in each market that has one: the native volume times the unrounded rate, cut to 17 significant digits.
-- **No set yet** (a database whose aggregator has not written one): `{ "result": "success", "period": "day", "count": 0, "markets": [] }`.
+- **The `amm` filter.** `include` counts every trade of the window, `exclude` the order-book trades only (what this route counted before the
+  AMM data), `only` the swaps against pools. A filter changes what is counted, not how: the pairs, `count` (and so which pairs reach
+  `min_trades`: a pair with 6 order-book trades and 4 swaps has 10 trades under `include`, 6 under `exclude` and 4 under `only`), the volumes,
+  `native_volume`, `open`, `high`, `low`, `last` and their times, the `sparkline` and the totals `pairs_traded`, `count` and `native_volume` are
+  those of the trades the filter keeps; a pair with none of them is not in the answer. The rate of an asset, which `native_volume` goes through
+  for a pair without a native side, is the one of all the trades of the window whatever the filter. `amm` is in every answer, right after
+  `period`: the filter the answer is for, `"include"` when the request has none (as `period` is echoed when it was defaulted), also in the answer
+  of no set.
+- **The AMM fields.** `amm_share` of a market is the part of the pair's **base volume** that was swaps, over the base volume of all the trades
+  of the pair in the window: text with exactly 4 decimals, rounded half up (`"0.3400"`, `"1.0000"`, `"0.0000"` for a pair without swaps). It
+  describes the pair, so it is the same whichever `amm` filter the answer is for, and it is a share of the base **as stored** (the canonical
+  order of the pair): it does not change when a consumer shows the pair inverted. `amm_pool` is `true` when the pair has an AMM pool that is not
+  deleted, else `false`. `totals.amm_share` is the part of the native volume that was swaps, over every pair that traded with a native volume,
+  whatever `min_trades`, `limit` and `amm` (the sum of each pair's `native_volume` times its `amm_share`, exact, over the sum of the
+  `native_volume`s, rounded once to 4 decimals), `"0.0000"` when no pair has a native volume; it is last in the totals. On a market the two come after `last_time`.
+- **Present only when known.** A set has these fields only when every ledger that closed in its window (from `start_time` to `end_time`) was
+  written by a parser that knows AMM data (parser version 2): the ledgers ingested since the AMM release or ingested again with `range-ingest
+  --reprocess`. A window without a ledger counts as known. Otherwise `amm_share`, `amm_pool` and `totals.amm_share` are **left out**: an absent
+  field means "not known", never `0` or `false`, and the answer is otherwise as usual (on a database whose history was not ingested again, the
+  `day` set has them a day after the AMM release and the `30day` set 30 days after it). While the AMM data of a window is incomplete, `exclude` is exact (a swap that
+  was not parsed is no exchange at all) and `only` is partial. Xahau has no AMM: its sets have `"0.0000"` and `false` once its ledgers are of parser 2.
+- **No set yet** (a database whose aggregator has not written one): `{ "result": "success", "period": "day", "amm": "include", "count": 0, "markets": [] }`. The
+  three filters of a period are separate sets, written one after the other (`exclude`, `only`, then `include`) by each run of the aggregator, so a
+  filter that no run has written yet is this answer too.
 
 `GET /v2/network/markets?period=day&limit=1`
 
@@ -1720,18 +1770,17 @@ With a display currency:
 }
 ```
 
-Keys: answer `result, period, start_time, end_time, exchange?, exchange_rate?, totals, count, markets`; totals `pairs, pairs_traded,
-count, native_volume, converted_volume?`; market `base_currency, base_issuer?, counter_currency, counter_issuer?, count,
-base_volume, counter_volume, native_volume?, converted_volume?, open, high, low, last, change?, open_time, last_time, sparkline`.
-`count` is the number of markets served.
+Keys: answer `result, period, amm, start_time, end_time, exchange?, exchange_rate?, totals, count, markets` (of no set: `result, period, amm,
+count, markets`); totals `pairs, pairs_traded, count, native_volume, converted_volume?, amm_share?`; market `base_currency, base_issuer?,
+counter_currency, counter_issuer?, count, base_volume, counter_volume, native_volume?, converted_volume?, open, high, low, last, change?,
+open_time, last_time, amm_share?, amm_pool?, sparkline`. `count` is the number of markets served.
 
 Errors, in order: 400 `invalid period - use: day, 7day, 30day`, `invalid min_trades`, `exchange currency must have an issuer`, `XRP cannot
-have an issuer` (`XAH`), `invalid exchange issuer address`; 500 `unable to retrieve markets`.
+have an issuer` (`XAH`), `invalid exchange issuer address`, `invalid amm filter - use: include, exclude, only`; 500 `unable to retrieve markets`.
 
-**No AMM field is served.** The answer has no `amm` key, no `totals.amm_share`, and no `amm_share` or `amm_pool` on a market, and `amm` is not
-a parameter: it is ignored, like any unknown one. A later release that knows the AMM data will add them under one contract that is
-fixed now: they are present **only when known** (every ledger of the window was parsed with AMM support); an absent field means "not
-known", never 0 or `false`. The analytics routes above carry no AMM field either way.
+**The analytics routes carry no AMM field.** `analytics/exchanges` and the other account routes count the swaps against pools as trades like any
+other, without a filter and without an `amm` key (the values follow the rates and the trades, which include the swaps). Which swaps the data holds
+depends on the AMM re-ingest ([backfill](backfill.md#amm-data-re-ingest)); the answers say nothing of how complete it is.
 
 **Differences from `exchange_volume`** (which is unchanged: its components stay the markets config, for Ripple compatibility). For a
 market that both routes show, the numbers can differ: the markets window starts on the hour, where the live volume window is exact (the
@@ -1834,7 +1883,7 @@ The pool over time: every state it has been in, or with `interval=day` one row f
 | `pool` (path) | | The pool account. |
 | `start` | the first ledger | |
 | `end` | the newest ledger | |
-| `interval` | none | Empty or missing: every state. `day`: the days with activity. Anything else is 400 `invalid interval`. |
+| `interval` | none | Empty or missing: every state. `day`: the days with activity, and the range of the days that are computed (`computed_start`, `computed_end`). Anything else is 400 `invalid interval`. |
 | `descending` | false | Newest first. |
 | `limit` | 200 (max 1000) | |
 | `marker` | | |
@@ -1863,7 +1912,7 @@ marker holds `ledger_index` and `tx_index`.
 closing state of the pool.
 
 ```json
-{ "result": "success", "count": 1, "marker": "…",
+{ "result": "success", "computed_start": "2026-09-17", "computed_end": "2026-10-16", "count": 1, "marker": "…",
   "days": [{
     "amm_account": "r…", "date": "2026-10-16T00:00:00Z", "base_currency": "USD", "base_issuer": "r…", "counter_currency": "XRP",
     "swap_count": 120, "volume_base": "340.5", "volume_counter": "680.9", "fees_base_est": "0.85", "fees_counter_est": "1.7",
@@ -1885,13 +1934,24 @@ amounts deposited and withdrawn (a creation counts as a deposit, a clawback as a
 and `value_native` are those at the end of the day (a pool deleted during the day has none, and no value). The marker is the start of
 the last day, in unix seconds.
 
+**The days the figures are computed for** (`computed_start`, `computed_end`). With `interval=day` the answer also says which days of the
+request's window the daily figures have been computed for, as two dates (`YYYY-MM-DD`, UTC) right after `result`. `computed_end` is the newest
+day of the window that has a computed set (today's, which is refreshed, counts; so does a day whose set is not final yet), and
+`computed_start` the oldest day from which every day up to `computed_end` has one: a hole ends the range, and the days under it are not in it. A
+day inside the range without a row of this pool is a day it was quiet; a day outside the range is **not computed yet** (the daily figures of
+all pools are back-filled newest first, so while that runs `computed_start` moves back, to the first day with AMM activity at the end of it).
+A day counts as computed only with the current version of the computation; a day made with an older one is to be computed again, and is not
+counted. The window is the request's (`start` and `end` as below, the whole history without them), never narrowed by the `marker`, so every
+page of an answer has the same two dates. Both are **left out** when no day of the window has a computed set. They are not in the CSV and not in
+the list of states (no `interval`). The keys of the answer are `result, computed_start?, computed_end?, count, marker?, days`.
+
 **The window of the days.** A day is a row when its **start** (00:00 UTC) is within `start` and `end`: at or after `start`, and before
 the end of the period `end` names. So `start=2026-10-01&end=2026-10-03` gives up to three days, and a `start` with a time of day leaves out
 the day it falls in. The days are the ones the aggregator has computed (today is refreshed about every five minutes; see
 [syncer](syncer.md#the-amm-jobs)); a day without activity has no row.
 
 **Empty and 404.** A page with no rows is 200 with an empty list when the pool has a state in a committed ledger (a pool with states but
-no day yet answers an empty `days`), and 404 `pool not found` when it has none.
+no day yet answers an empty `days`, with the computed range when the window has one), and 404 `pool not found` when it has none.
 
 CSV: the same columns on every non-empty page, in the order of the keys, the slot as `auction_slot.holder, auction_slot.price,
 auction_slot.discounted_fee, auction_slot.expiration`; with `interval=day` the PoolDay columns.

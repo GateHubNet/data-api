@@ -137,8 +137,9 @@ Prefix `syncer_`.
 | `syncer_aggregator_errors_total` | Counter | `job` | Jobs (or slices, sets, pools) that failed; each is retried. `job` is one of `volume_live`, `volume_daily`, `volume_backfill`, `volume_dirty`, `stats_live`, `stats_dirty`, **`amm_pools`**, **`amm_pools_dirty`**, **`amm_daily`**, **`amm_daily_dirty`**, `pair_hourly`, `markets_live`, `rates_daily`, `account_rollups`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty` (the `*_dirty` labels are the sets, pools and hooks run for an `agg_dirty` slice; a failing hook of the account and market jobs fails its `stats_dirty` slice) |
 | **`syncer_aggregator_stats_lag_seconds`** | Gauge | | Seconds of ledger history the stats catch-up still has to cover; 0 when the stats are up to the last two hours |
 | **`syncer_rates_daily_missing_days`** | Gauge | | Closed final days without a valid rates set, from the first native trade to the newest final day. 0 once the back-fill is done, and normally 0 after it: the day that has just become final (an hour after its end) is the first the next run computes |
-| **`syncer_pair_hourly_missing_hours`** | Gauge | | Hours of the last 31 days without a set of the current config version. 0 once the back-fill is done |
+| **`syncer_pair_hourly_missing_hours`** | Gauge | | Hours of the last 31 days without a set of the current config version. 0 once the back-fill is done. The first run of a syncer with the AMM data additions starts it at the hours of the 31 days (745: the config version is 2, the split of each pair by source) and it falls to 0 within minutes; after an AMM `--reprocess` it follows `agg_dirty` |
 | **`syncer_markets_live_age_seconds`** | Gauge | `period` (`day`, `7day`, `30day`) | Now minus the `end_time` of the newest `include` set of the period, set after every run of the job. The `day` set is rewritten every minute (under about 120 s), the others every five minutes (`MARKETS_LONG_EVERY_TICKS`), so theirs climbs to about 240-300 s before each rewrite (360 s if a tick was skipped); a long set that failed waits 5 minutes and so usually misses its next turn, which takes its age to about 900 s once. A period that never had a set has no series |
+| **`syncer_markets_live_amm_share_known`** | Gauge | `period` (`day`, `7day`, `30day`) | 1 when the newest `include` set of the period has `total_amm_share`, else 0: the AMM share of the Markets table is known for it, which is when every ledger of its window was written by a parser that knows AMM (`AMM_PARSER_VERSION`, 2). 0 also for a period with no set. Set after the age gauge on every run of `markets_live`, so the `7day` and `30day` values change only when those sets are written (every fifth run); a read that fails counts under `syncer_aggregator_errors_total{job="markets_live"}` and the gauge keeps its value. A labelled gauge: a period has no series before the first run. **It has no alert**, it gates the explorer's `AMM_DATA` switch (below) |
 | `syncer_account_rollups_heavy_accounts` | Gauge | | Heavy accounts (those with `GH_ACCOUNT_ROLLUP_MIN_ROWS` balance changes or more) |
 | **`syncer_account_rollups_pending_accounts`** | Gauge | | Heavy accounts whose coverage does not yet reach from `first_day` to the newest final day. 0 once the promotion is done |
 | `syncer_validators_unl_fetches_total` | Counter | `publisher, outcome` | Validator list fetches: `ok`, `unchanged`, or the reason code of the failure |
@@ -170,6 +171,7 @@ increase(syncer_amm_unclassified_total[1h])                          # pools the
 syncer_aggregator_stats_lag_seconds > 3600
 syncer_markets_live_age_seconds{period="day"} > 600                 # the Markets table is stale
 syncer_markets_live_age_seconds{period=~"7day|30day"} > 600         # a long Markets period is stale (rewritten every 5 minutes)
+syncer_markets_live_amm_share_known                                 # 1 per period once its window is all parsed with AMM; a gate, no alert
 syncer_pair_hourly_missing_hours > 0                                # an hour of the last 31 days has no set
 syncer_rates_daily_missing_days > 2                                 # the daily rates are not being written (after the back-fill)
 syncer_account_rollups_pending_accounts > 0                         # a heavy account is not covered yet
@@ -227,7 +229,7 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | Aggregator far behind | `syncer_aggregator_stats_lag_seconds > 3600` for 1h | Sweep slower than the data |
 | **Markets stale** | `syncer_markets_live_age_seconds{period="day"} > 600` for 10m | The `markets_live` job has not written the `day` set for over ten minutes (it writes one a minute): `/v2/network/markets` serves an old set, and the explorer's Markets page with it. Look for `Markets set of period day not written` (a gap in `pair_hourly`) and for errors of the `markets_live` and `pair_hourly` jobs |
 | **Long Markets periods stale** | `syncer_markets_live_age_seconds{period=~"7day\|30day"} > 600` for 10m (one alert per period) | The `7day` or `30day` set has not been rewritten for over 20 minutes. They are rewritten every fifth run (about every 5 minutes), so their age climbs to about 300 s between rewrites, and one failure of a set (a 5-minute wait that misses its next turn) takes it to about 900 s for a few minutes: the 10 minutes above 600 s let that pass. 600 s is also what the explorer's `MARKETS` switch needs of all three periods ([operations](operations.md#rolling-it-out)): while this fires, `/v2/network/markets?period=7day` or `30day` serves an old set. Look for `markets_live` errors and `Markets set of period <p> not written` (a gap in `pair_hourly`); if the `day` set alone uses the job's 3 s budget every run, the long sets never start (the budget warning of `markets_live` says so) |
-| **Hours of pair statistics missing** | `syncer_pair_hourly_missing_hours > 0` for 30m | An hour of the last 31 days has no set of the current config version, so a Markets set that needs it is not written. The live hours are recomputed every tick; a gap that stays is a failing hour (see the `pair_hourly` errors, which wait 5 minutes and then more) |
+| **Hours of pair statistics missing** | `syncer_pair_hourly_missing_hours > 0` for 30m | An hour of the last 31 days has no set of the current config version, so a Markets set that needs it is not written. The live hours are recomputed every tick; a gap that stays is a failing hour (see the `pair_hourly` errors, which wait 5 minutes and then more). The first run of a syncer with the AMM data additions starts the gauge at the 31 days (config version 2) and brings it to 0 within minutes, and the Markets sets wait for it; the 30 minutes let that pass |
 | **Daily rates not written** | `syncer_rates_daily_missing_days > 2` for 6h, **once the back-fill has finished** | The `rates_daily` job is not writing the daily sets (normally the gauge is 0: the day that has just become final is computed by the next run, so more than two days pending for hours are days that cannot be computed). Alert only after the first back-fill: on a fresh deployment the gauge is the size of the history and falls over about a day. Until the sets exist the API values on read: right, and slow |
 | **Validator list expiring** | `syncer_validators_unl_expiry_seconds < 7 * 86400` | A publisher's list expires within a week (it already has when the value is negative; an expired list is still used, flagged `expired`): check the publisher |
 | Validator agreement behind | `syncer_validators_agreement_lag_seconds > 7200` for 30m | The agreement job has not finalised an hour for over two hours |
@@ -241,6 +243,13 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 
 Threshold numbers are starting points: tune to your traffic and SLOs.
 
+**`syncer_markets_live_amm_share_known` has no alert.** 0 is the right value of a window that still holds a ledger of the parser before AMM, and until the
+`markets_live` runs after the AMM data additions have written their sets. It is a gate, with the others, for the explorer's **`AMM_DATA`** switch: turn it on
+once the gauge is 1 for `day`, `7day` and `30day`, `syncer_pair_hourly_missing_hours` and `syncer_rates_daily_missing_days` are 0 again after the AMM
+`--reprocess`, **and `agg_dirty` has drained** (`SELECT count() FROM <db>.agg_dirty` is 0; no metric shows the backlog). The gauge cannot tell the last one: `markets_live`
+runs before `stats_dirty`, whose hook recomputes the hours of a reprocessed range, so the gate can open one tick before those hours are recomputed, and the share
+of the Markets table is understated until the queue is empty ([operations](operations.md#the-amm-data-additions)).
+
 ## 7. What to watch during a backfill
 
 A range ingest bulk-loads ClickHouse hard ([backfill](backfill.md)). Watch both sides:
@@ -251,7 +260,8 @@ A range ingest bulk-loads ClickHouse hard ([backfill](backfill.md)). Watch both 
   `syncer_aggregator_stats_lag_seconds`.
 - **Account and market aggregates:** `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days` and `syncer_account_rollups_pending_accounts` show the
   back-fills of a fresh deployment (and what a re-ingest re-marks: rate days and heavy accounts' days are recomputed as `agg_dirty` drains, its hours of the last 31 days at once); see
-  [operations](operations.md#account-and-market-aggregates).
+  [operations](operations.md#account-and-market-aggregates). After the AMM `--reprocess`, `syncer_markets_live_amm_share_known{period}` also shows when each Markets period has its AMM share;
+  wait for `agg_dirty` to drain as well before the explorer's `AMM_DATA` switch (see [operations](operations.md#the-amm-data-additions)).
 - **ClickHouse:** parts per partition and merge activity (`system.merges`): if parts pile up faster than merges drain them you risk
   `too many parts`; lower `--concurrency`. Memory and disk: bulk loads are the likeliest time to hit the memory limit or fill the volume.
 

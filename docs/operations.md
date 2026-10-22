@@ -24,7 +24,7 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
-| Account and market aggregates | `syncer_markets_live_age_seconds{period}`, `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`, `syncer_account_rollups_pending_accounts`; see [Account and market aggregates](#account-and-market-aggregates) |
+| Account and market aggregates | `syncer_markets_live_age_seconds{period}`, `syncer_markets_live_amm_share_known{period}`, `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`, `syncer_account_rollups_pending_accounts`; see [Account and market aggregates](#account-and-market-aggregates) and [the AMM data additions](#the-amm-data-additions) |
 
 Two services per network, never more than **one syncer**: `syncer-xrpl`, `syncer-xahau` are singletons (a fixed
 `container_name`, so compose refuses to scale them, and an application-level lease in ClickHouse that refuses a second writer).
@@ -230,7 +230,8 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_amm_unclassified_total` | a trickle at most | A burst: the parser met a pool shape it cannot place (a new kind of AMM transaction, an MPT asset); see [backfill](backfill.md#amm-data-re-ingest) |
 | `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
 | `syncer_markets_live_age_seconds{period=~"7day\|30day"}` | under about 300 s (a set every fifth run, about every 5 minutes); about 900 s for a few minutes after one failed set | Above 600 s for 10 minutes: that period of the Markets table is stale (the `MARKETS` switch needs all three periods under 600 s) |
-| `syncer_pair_hourly_missing_hours` | 0 | Above 0 for 30 minutes |
+| `syncer_pair_hourly_missing_hours` | 0 (745 for a few minutes after the first start of a syncer with the AMM data additions) | Above 0 for 30 minutes |
+| `syncer_markets_live_amm_share_known{period}` | 1 for `day`, `7day` and `30day` once the AMM data is complete in the window; 0 is right before | Not an alert, a gate of the explorer's `AMM_DATA` switch: see [the AMM data additions](#the-amm-data-additions) |
 | `syncer_rates_daily_missing_days` | 0 (the day that has just become final is computed by the next run) | Above 2 for 6 hours after the first back-fill; the size of the history on a fresh deployment, falling over about a day |
 | `syncer_account_rollups_pending_accounts` | 0 | Positive for days: a heavy account is not being promoted |
 | `rate(syncer_fee_stats_samples_total[5m])` | about 0.2/s | 0 (node unreachable) |
@@ -424,9 +425,9 @@ answer is the same and only slower, except for the `network/markets` table, whic
 | --- | --- | --- |
 | Markets | `MARKETS` | `syncer_pair_hourly_missing_hours` = 0, and `syncer_markets_live_age_seconds{period}` under 600 for `day`, `7day` and `30day` |
 | Account analytics | `ACCOUNT_ANALYTICS` | `syncer_rates_daily_missing_days` = 0 and `syncer_account_rollups_pending_accounts` = 0 |
-| The AMM parts of the explorer | `AMM_DATA` | Only once that data API has merged the AMM work, re-ingested history with the AMM parser and back-filled: `syncer_pair_hourly_missing_hours` = 0 and `syncer_rates_daily_missing_days` = 0 again after the reprocess (it marks hours and rate days for recompute). The AMM share of the Markets table comes with the AMM additions of the aggregates, which bring their own gauge |
+| The AMM parts of the explorer | `AMM_DATA` | Only once that data API has merged the AMM work, re-ingested history with the AMM parser and back-filled: `syncer_pair_hourly_missing_hours` = 0 and `syncer_rates_daily_missing_days` = 0 again after the reprocess (it marks hours and rate days for recompute); and, with the AMM data additions of the aggregates, `syncer_markets_live_amm_share_known{period}` = 1 for `day`, `7day` and `30day`, **and `agg_dirty` drained** after the reprocess (`SELECT count() FROM xrpl.agg_dirty` is 0): see [the AMM data additions](#the-amm-data-additions) |
 | Network dashboard | none | the network dashboard reads no route of these aggregates |
-| AMM pages | `AMM_PAGES` | no gauge of these aggregates: the AMM work's routes and its `amm_daily` back-fill gate it (the AMM additions of the aggregates are used when present) |
+| AMM pages | `AMM_PAGES` | no gauge of these aggregates: the AMM work's routes and its `amm_daily` back-fill gate it (the AMM additions of the aggregates, `fees_est` and the computed range, are used when present) |
 | Validators and amendments | `VALIDATORS` | no gauge of these aggregates: the validators work's own |
 
 ### The back-fills
@@ -438,7 +439,7 @@ While a back-fill runs, the API is **right and slower**. What that means:
   travel in the request to ClickHouse, whose URI limit is 1 MiB. It is the same class of failure as the guard above and disappears once `syncer_rates_daily_missing_days` is 0 (then only the rates of today and yesterday travel). It is not a reason to
   raise `GH_CLICKHOUSE_MAX_EXECUTION_TIME`; wait for the back-fill.
 - A heavy account that has not been promoted yet is read from its own rows: right, and as slow as the rows it holds (tens of seconds for years of an exchange's hot wallet, or the 500 of the guard).
-- `network/markets` is not affected by the rates back-fill; it waits for `pair_hourly` (minutes). An old or missing hour (`Markets set of period <p> not written ...` in the log, `syncer_pair_hourly_missing_hours` > 0) keeps the previous set, whose `end_time` ages.
+- `network/markets` is not affected by the rates back-fill; it waits for `pair_hourly` (minutes). An old or missing hour (`Markets set of period <p> not written ...` in the log, `syncer_pair_hourly_missing_hours` > 0) keeps the previous set, whose `end_time` ages. The first start of a syncer with the AMM data additions computes the 31 days again (config version 2) and so waits the same way, for minutes.
 
 Watch them with the gauges of [observability](observability.md#4-metrics-syncer); each job also logs once that its back-fill is under way and once that it is done. To follow one in SQL (the database `xrpl`; use `xahau` on the other network):
 
@@ -464,10 +465,54 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 - **Rates**: the days of the slice and the 14 after it that have a valid set are marked stale (a day's rate reads the trades of the 14 days before it). Until `rates_daily` has computed them again, newest first, the API values those days on read, so `syncer_rates_daily_missing_days` rises by up to the range plus 14 days and falls again; expect the
   slower path for the window of the range, and `api_rates_on_read_total` to show it. While ranges of the re-ingest wait in `agg_dirty`, `rates_daily` leaves the days they reach (the range and the 14 days after it) for after they are drained, so the gauge falls only as the queue empties. A range
   that keeps failing keeps its days waiting too: the "Daily rates not written" alert and `syncer_aggregator_errors_total` both show it.
-- **Hours**: the hours of the slice in the last 31 days are recomputed at once.
+- **Hours**: the hours of the slice in the last 31 days are recomputed at once (after an AMM `--reprocess` this is what puts the swaps into the `amm` rows of the Markets, see [the AMM data additions](#the-amm-data-additions)).
 - **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
 
 Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`) says which.
+
+### The AMM data additions
+
+The AMM data additions to the aggregates (sub-project D2b, [ADR-0013](adr/0013-account-and-market-aggregates.md#d2b-the-amm-data-additions)) fill the AMM fields of `network/markets` (the `amm`
+filter, `amm_share`, `amm_pool`, `totals.amm_share`), put `fees_est` on the live day row of `network/amm_volume` and `computed_start` / `computed_end` on the daily pool history. They read the AMM work's
+data (a swap against a pool is an `exchanges` row written by parser version 2) and are deployed **after the AMM rollout**: the databases recreated at the merge and the history ingested again with
+`range-ingest --reprocess` from the enablement ledger ([backfill](backfill.md#amm-data-re-ingest)).
+
+**Rolling it out**, in this order:
+
+1. **`migrate`** applies `004_amm_fee_estimates.sql`: one `ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS`, additive and safe to run again.
+2. **The syncer.** `pair_hourly` computes its 31 days again at config version 2 (each pair split by source): `syncer_pair_hourly_missing_hours` starts at 745 and falls to 0 in minutes, and the Markets
+   sets wait for it (`Markets set of period <p> not written ...` in the log, `syncer_markets_live_age_seconds` climbing): `day` and `7day` resume once the newest week of hours has its sets, `30day` after all 31
+   days. Until a period's first run after that, `amm=exclude` and `amm=only` answer the no-set answer (those sets do not exist yet) and the old `include` set has no AMM fields. The `agg_dirty` ranges of
+   the reprocess, while they drain, correct the rates and the heavy accounts' days and recompute the hours of the last 31 days ([syncer 7.6](syncer.md#76-the-agg_dirty-hooks)). The live day set of
+   `amm_volume` gets its fee estimates at its next recompute (a set written before the column reads as not known).
+3. **The API, last.** It reads `fees_est_f` in every live volume read, so an API that runs before `004` fails the live routes of `exchange_volume`, `payment_volume` and `amm_volume` (500 `error getting data`).
+   The compose files order it (`migrate` completes before the services start); a deploy that starts the API by hand runs `migrate` first.
+4. **The explorer's `AMM_DATA` switch** is the owner's, per environment (section 16 of the design). The gauges for it are in the table above; read the rest of this section first.
+
+**Turning on `AMM_DATA`.** `syncer_markets_live_amm_share_known{period}` is 1 when the newest `include` set of the period has its AMM share, which `markets_live` writes only when every ledger of the set's window was
+written by parser 2 (the parser gate). The gate opens as soon as the last ledger of the window is rewritten, which can be **one tick before the reprocessed hours are recomputed**: `markets_live`
+runs before `stats_dirty`, and the hook of `stats_dirty` recomputes the hours of an `agg_dirty` slice. In that window the gauge is 1 and the AMM share is understated (a window whose hours still hold the data of
+the parser before AMM shows a share near 0). So turn `AMM_DATA` on once, in this order:
+
+1. the reprocess has finished and **`agg_dirty` has drained**: `SELECT count() FROM xrpl.agg_dirty` is 0 (no metric shows the backlog; `stats_dirty` drains a day at a time, so a long reprocess takes a while);
+2. `syncer_pair_hourly_missing_hours` = 0 and `syncer_rates_daily_missing_days` = 0 again (the reprocess marks hours and rate days for recompute);
+3. `syncer_markets_live_amm_share_known` = 1 for `day`, `7day` and `30day`, read **after** the queue is empty: the `7day` and `30day` sets are rewritten every fifth run, so give them one more five-minute turn
+   to be made from the corrected hours.
+
+```sql
+-- the lowest and the highest parser version among the ledgers of the last 31 days (a little more than the 30day window): the AMM share needs every ledger of a window at 2 or more, so the gauge of 30day is 0 while one is older
+SELECT min(parser_version) AS lowest, max(parser_version) AS highest FROM xrpl.ledgers
+WHERE ledger_index >= (SELECT ledger_index FROM xrpl.ledgers WHERE close_time >= now() - INTERVAL 31 DAY ORDER BY ledger_index LIMIT 1);
+
+-- the newest include set of each period, and whether it has its AMM share (NULL: not known)
+SELECT period, end_time, total_amm_share FROM xrpl.markets_live
+WHERE amm = 'include' AND base_currency = '' AND base_issuer = '' AND counter_currency = '' AND counter_issuer = ''
+ORDER BY period, version DESC LIMIT 1 BY period;
+```
+
+**What the API shows meanwhile.** Without the AMM share the fields are absent (never `0` or `false`), `exclude` is exact and `only` partial ([api-reference](api-reference.md#get-v2networkmarkets)); the explorer does not show the filter
+then, even with `AMM_DATA` on. On a database whose history is not ingested again, the `30day` gauge turns 1 only 30 days after the release that writes parser 2. The other two additions need no gate: `fees_est` is absent for
+a pool whose fee is not known, and `computed_start` / `computed_end` show how far the `amm_daily` back-fill has come.
 
 ### Rollups of heavy accounts
 

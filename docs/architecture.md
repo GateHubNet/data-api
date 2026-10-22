@@ -151,7 +151,7 @@ views. See [clickhouse](clickhouse.md).
 | Ripple v2 wire compatibility and every deliberate deviation | [0010](adr/0010-ripple-v2-wire-compatibility.md) |
 | AMM data, and swaps against pools as exchanges | [0011](adr/0011-amm-data-and-swaps-as-exchanges.md) |
 | Validators and amendments data: a worker of its own, agreement over the indexed chain, the safe fetcher, migration 002 | [0012](adr/0012-validators-and-amendments-data.md) |
-| Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats, migration 003 | [0013](adr/0013-account-and-market-aggregates.md) |
+| Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats, migration 003; D2b, the AMM data additions, migration 004 | [0013](adr/0013-account-and-market-aggregates.md) |
 | CTID dedup (superseded by the commit marker and dedup tokens) | [0002](adr/0002-ctid-idempotent-ingest.md) |
 
 ## Cross-cutting concerns
