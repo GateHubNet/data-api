@@ -40,13 +40,16 @@ recorded in the D2b section of `docs/adr/0013-account-and-market-aggregates.md`.
   none, the answer without a set too"; and after the definition of `amm_share`: "It is the share of the stored base volume, so a
   consumer that shows the pair inverted shows the same share (the counter-side share differs only by the price gap between the pool's
   and the book's trades in the window)." Whether a counter-side share is wanted is the owner's call (P6).
-- **The reason for "migrate first" in the docs (F3).** `docs/deployment.md` (~:100), `docs/operations.md` (~:482-484), the D2b
-  section of ADR-0013 (~:137-138) and the 004 row of `docs/data-model.md` (~:402) say a D2b syncer before 004 fails its live volume
-  inserts. On the pinned ClickHouse 26.8 `input_format_skip_unknown_fields` defaults to 1, so it does not: the estimates of the ticks
-  before `migrate` are silently dropped. Corrected wording: run `migrate` (004) before the API (required: the live `amm_volume` day
-  read selects `fees_est_f`) and before the syncer (advisable: else the fee estimates written before the migration are lost);
-  `syncer_aggregator_errors_total{job="volume_live"}` does not show the missing column. Also `operations.md` (~:490): `live` defaults
-  to `day`, so the bare route reads the column too; (~:507) "the hook" is the `pair_hourly` hook.
+- **The reason for "migrate first" in the docs (F3). Done.** `docs/deployment.md` (~:100), `docs/operations.md` (~:482-484), the D2b
+  section of ADR-0013 (~:137-138) and the 004 row of `docs/data-model.md` (~:402) said a D2b syncer before 004 fails its live volume
+  inserts. On the pinned ClickHouse 26.8 `input_format_skip_unknown_fields` defaults to 1 (checked on a throwaway 26.8.14.3 container:
+  a JSONEachRow row with an extra field is inserted at the default and rejected only when the setting is forced to 0, and
+  `ClickHouseService.insert` does not change it), so it does not: the estimates of the ticks before `migrate` are silently dropped.
+  The four places now say: run `migrate` (004) before the API (required: the live `amm_volume` day read selects `fees_est_f`) and
+  before the syncer (advisable: else the fee estimates written before the migration are lost);
+  `syncer_aggregator_errors_total{job="volume_live"}` does not show the missing column. The order stays migrate, syncer, API. Also
+  `operations.md`: `live` defaults to `day`, so the bare route reads the column too (it said `?live=day`), and "the hook" is the
+  `pair_hourly` hook.
 - **Measure the live day set before `AMM_DATA` (final review I-1).** The live `amm_volume`/`day` set now estimates fees every tick
   inside the 5 s `volume_live` budget the twelve live sets share; measure its duration on the mainnet database (the spacing of the
   live sets' versions) before turning `AMM_DATA` on. Mitigations, cheapest first: raise `AGGREGATOR_VOLUME_LIVE_BUDGET_MS`; compute
