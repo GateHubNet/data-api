@@ -897,13 +897,16 @@ two API items marked "after the AMM merge" (D2b.3, D2b.4).
   decimals, rounded half up (`"0.3400"`); `amm_pool` = whether `amm_pools` (newest row per pool) has a pool of the pair that is not
   deleted; `total_amm_share` = Σ native_volume × amm_share ÷ Σ native_volume over the pairs with a native volume, in the same format.
   Per pair, the hours of both sources are combined as in section 3.3 (open and last by key, high and low by rate with the key as
-  tie-break, sums with the `sumOf` fallback).
+  tie-break, sums with the `sumOf` fallback). `amm_share` is the share of the stored base volume, so a consumer that shows the pair
+  inverted shows the same share (the counter-side share differs only by the price gap between the pool's and the book's trades in the
+  window); no counter-side share is served (owner decision, 2026-10-22).
 - **Present only when known (the parser gate).** A set has `amm_share`, `amm_pool` and `total_amm_share` only when every ledger of its
   window was written by a parser that knows AMM: `min(parser_version)` over the window's ledgers in `ledgers` is at least 2
   (`AMM_PARSER_VERSION`). They appear once the window's ledgers are all ingested or re-ingested by the new parser (the AMM rollout's
   `--reprocess`, or 30 days of live ingest). On Xahau they are `"0.0000"` and `false`.
 - **`amm`** becomes a parameter of `network/markets`: `include`, `exclude` or `only`, else 400 `invalid amm filter - use: include, exclude,
-  only` (the AMM work's message), served in the answer after `period`. `exclude` reads the `book` rows, `only` the `amm` rows; the
+  only` (the AMM work's message), served in the answer after `period` — always, `include` when the request has none, the answer
+  without a set too (owner decision, 2026-10-22). `exclude` reads the `book` rows, `only` the `amm` rows; the
   threshold, prices, volumes and closes are those of the filtered trades. While the AMM data of the window is incomplete, `exclude` is
   exact (unparsed swaps are no exchanges) and `only` is partial; the answer then has no `amm_share`, and the explorer, even with
   `AMM_DATA` on, does not show the filter.

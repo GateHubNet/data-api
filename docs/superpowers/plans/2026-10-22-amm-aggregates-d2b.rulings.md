@@ -35,7 +35,7 @@ recorded in the D2b section of `docs/adr/0013-account-and-market-aggregates.md`.
 
 ## Open for the owner
 
-- **Spec wording (P15).** Spec D2b.1 does not say whether an unfiltered `network/markets` answer echoes `amm`, nor how `amm_share`
+- **Spec wording (P15). Done (owner decision, 2026-10-22: both written into spec D2b.1; no counter-side share).** Spec D2b.1 did not say whether an unfiltered `network/markets` answer echoes `amm`, nor how `amm_share`
   behaves on an inverted row. Proposed text, after "served in the answer after `period`": "— always, `include` when the request has
   none, the answer without a set too"; and after the definition of `amm_share`: "It is the share of the stored base volume, so a
   consumer that shows the pair inverted shows the same share (the counter-side share differs only by the price gap between the pool's
