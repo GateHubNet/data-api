@@ -184,7 +184,7 @@ describe('PairHourlyJobRunner', () => {
       [iso(oldest), iso(oldest + HOUR)],
     ]);
     expect(fake.failures).toEqual([]);
-    // the hours were counted as missing until they were computed
+    // the run computed all of them, so none is left missing: the gauge ends at 0
     expect(fake.metrics.pairHourlyMissingHours.set).toHaveBeenLastCalledWith(0);
 
     // they are written at version 2 now: only the current hour is left

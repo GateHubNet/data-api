@@ -213,7 +213,8 @@ describe('MarketsLiveJobRunner', () => {
       ['day', true],
       ['7day', false],
     ]); // 30day has no set
-    await run(runner());
+    const r = runner();
+    await run(r);
     expect(fake.metrics.marketsLiveAmmShareKnown.set.mock.calls).toEqual([
       [{ period: 'day' }, 1],
       [{ period: '7day' }, 0],
@@ -222,14 +223,17 @@ describe('MarketsLiveJobRunner', () => {
     // read once, after the sets and the ages of the run
     expect(markets.order).toEqual(['day', '7day', '30day', 'ends', 'amm']);
 
-    // it is set on every run, also on one that wrote the day set only
+    // the same runner's second run writes the day set only (the 7day and 30day sets are every 5th run), and the gauge is set
+    // for all three periods all the same
     fake.metrics.marketsLiveAmmShareKnown.set.mockClear();
+    markets.calls = [];
     markets.ammKnown = new Map<MarketsPeriod, boolean>([
       ['day', true],
       ['7day', true],
       ['30day', true],
     ]);
-    await run(runner());
+    await run(r);
+    expect(markets.periods()).toEqual(['day']);
     expect(fake.metrics.marketsLiveAmmShareKnown.set.mock.calls).toEqual([
       [{ period: 'day' }, 1],
       [{ period: '7day' }, 1],
