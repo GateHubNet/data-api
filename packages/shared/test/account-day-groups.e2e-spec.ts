@@ -41,7 +41,9 @@ import { SAMPLE_ROWS } from './sample-rows';
  * ledgers of those days: an account of hand-worked edge cases (a line that crosses zero within a day, fee rows, a change
  * type of '', two changes in one ledger, a zero change, a self-trade, rows written twice), one with amounts the exact
  * sums cannot hold, and four "heavy" accounts of binary fractions, whose float sums are the same in any order (so a rollup
- * and a raw read of them agree to the last digit).
+ * and a raw read of them agree to the last digit). Their trades are the trades of offers (`amm_account` ''); the swaps
+ * against pools (D2b.2) are the rows of a taker and of two pools: a swap is a row of the taker and a row of the pool, and the
+ * groups count it as a trade of its pair, bought and sold by side.
  *
  * An oracle written from the rows (plain JavaScript and BigNumber, never the code under test) says what every group is.
  * Then the rollups: whatever the coverage of an account (the whole window, only the days after the start of it, only the
@@ -85,6 +87,12 @@ const EDGE = addr('DayGroupsEdge');
 const UNFIT = addr('DayGroupsUnfit');
 const OTHER = addr('DayGroupsOther');
 const HEAVY = [1, 2, 3, 4].map((n) => addr(`DayGroupsHeavy${n}`));
+/** The taker of the swaps of every day, and the two pools it swaps with (a pool is an account with a row for each swap). */
+const SWAPPER = addr('DayGroupsSwapper');
+const POOLS = [addr('DayGroupsPoolA'), addr('DayGroupsPoolB')];
+/** A taker and a pool of a few swaps worked out by hand. */
+const TAKER = addr('DayGroupsTaker');
+const POOL = addr('DayGroupsPool');
 const ISSUER_B = addr('IssuerB');
 const ISSUER_C = addr('IssuerC');
 
@@ -150,6 +158,10 @@ function txRow(
 }
 
 type Side = [currency: string, issuer: string];
+/**
+ * A row of `account_exchanges`. `SAMPLE_ROWS` is a swap against a pool, so the row says what it is: the trade of an offer
+ * unless `pool` names the pool account of a swap (then the row of the taker and the row of the pool differ in `account`).
+ */
 function exRow(
   account: string,
   at: Anchor,
@@ -161,9 +173,14 @@ function exRow(
   counterAmount: string,
   buyer: string,
   seller: string,
+  pool = '',
 ): AccountExchangesRow {
   return {
     ...SAMPLE_ROWS[Table.AccountExchanges],
+    ...(pool === ''
+      ? { taker: buyer, provider: seller, offer_sequence: 7, tx_type: 'OfferCreate' }
+      : { taker: buyer === pool ? seller : buyer, provider: pool, offer_sequence: 0, tx_type: 'Payment' }),
+    amm_account: pool,
     account,
     base_currency: base[0],
     base_issuer: base[1],
@@ -348,13 +365,85 @@ function heavyRows(account: string, a: number): Rows {
   return rows;
 }
 
+/**
+ * The swaps of the hand-worked taker and pool (see the expected groups in the test): on the first two ledgers of the big day
+ * and the first of the second. A swap is a row of the taker and a row of the pool, both with `amm_account` the pool; the
+ * buyer received the base, the pool when base flowed into it.
+ */
+function swapHandRows(): Rows {
+  const [a0, a1] = anchorsByDay.get(BIG_DAY) as Anchor[];
+  const [b0] = anchorsByDay.get(SECOND_DAY) as Anchor[];
+  const swap = (
+    at: Anchor,
+    tx: number,
+    base: Side,
+    counter: Side,
+    baseAmount: string,
+    counterAmount: string,
+    takerBuys: boolean,
+  ) => {
+    const [buyer, seller] = takerBuys ? [TAKER, POOL] : [POOL, TAKER];
+    return [TAKER, POOL].map((account) =>
+      exRow(account, at, tx, 0, base, counter, baseAmount, counterAmount, buyer, seller, POOL),
+    );
+  };
+  return {
+    bc: [],
+    tx: [],
+    ex: [
+      // the taker buys 100 XRP for 25 USD from the pool, then sells it 40 XRP for 10 USD; then buys 8 XRP for 2 USD from an offer
+      ...swap(a0, 1, XRP_SIDE, USD_B, '100', '25', true),
+      ...swap(a0, 2, XRP_SIDE, USD_B, '40', '10', false),
+      exRow(TAKER, a1, 1, 0, XRP_SIDE, USD_B, '8', '2', TAKER, OTHER),
+      // the next day, in another pair: the taker sells 2 EUR for 20 XRP to the pool
+      ...swap(b0, 1, EUR_C, XRP_SIDE, '2', '20', false),
+    ],
+  };
+}
+
+/**
+ * Swaps among the offers' trades, on every day of the mock, on two ledgers: in each, three swaps with the pools in turn (the
+ * taker buys from the pool and sells to it) and a trade of an offer, in the pairs of the heavy accounts. Binary fractions,
+ * so that the float sums are exact in any order.
+ */
+function swapperRows(): Rows {
+  const rows = noRows();
+  DAYS.forEach((day, d) => {
+    const anchors = anchorsByDay.get(day) as Anchor[];
+    [0, 1].forEach((s) => {
+      const at = anchors[Math.min(s, anchors.length - 1)];
+      for (let t = 0; t < 4; t++) {
+        const tx = s * 10 + t;
+        const [base, counter] = PAIRS[(d + s + t) % 3];
+        const baseAmount = String((t + 1) * 4);
+        const counterAmount = new BigNumber(baseAmount)
+          .times(0.25)
+          .times(d + s + 2)
+          .toString();
+        if (t === 3) {
+          rows.ex.push(exRow(SWAPPER, at, tx, 1, base, counter, baseAmount, counterAmount, SWAPPER, OTHER));
+          continue;
+        }
+        const pool = POOLS[(d + t) % 2];
+        const [buyer, seller] = (d + s + t) % 2 === 0 ? [pool, SWAPPER] : [SWAPPER, pool];
+        for (const account of [SWAPPER, pool]) {
+          rows.ex.push(exRow(account, at, tx, 3, base, counter, baseAmount, counterAmount, buyer, seller, pool));
+        }
+      }
+    });
+  });
+  return rows;
+}
+
 const edge = edgeRows();
 const unfit = unfitRows();
 const heavy = HEAVY.map((account, a) => heavyRows(account, a));
+const swapHand = swapHandRows();
+const swapper = swapperRows();
 /** What the oracle reads: the logical rows of the mock and the synthetic accounts, each once. */
-const logical = concat(mock, edge.rows, unfit, ...heavy);
+const logical = concat(mock, edge.rows, unfit, ...heavy, swapHand, swapper);
 /** What is written besides the mock: the synthetic rows, and then the ones of them that are written twice. */
-const synthetic = concat(edge.rows, unfit, ...heavy);
+const synthetic = concat(edge.rows, unfit, ...heavy, swapHand, swapper);
 
 const accountsOf = (rows: Array<{ account: string }>): string[] => [...new Set(rows.map((r) => r.account))].sort();
 const ALL_ACCOUNTS: Record<DayGroupFamily, string[]> = {
@@ -1002,6 +1091,159 @@ describe('account day groups and the rollup writer (e2e)', () => {
         ['payment_destination', 0, '-2'],
         ['payment_source', 0, '-2'],
         ['payment_source', 1, '-2'],
+      ]);
+    });
+
+    /** The trade group a swap account is expected to have: bought and sold by side, the floats the same as the exact sums. */
+    const tradeGroup = (
+      account: string,
+      day: string,
+      base: Side,
+      counter: Side,
+      count: number,
+      [baseSum, counterSum]: [string, string],
+      [bought, boughtCounter]: [string, string],
+      [sold, soldCounter]: [string, string],
+    ): Group => ({
+      account,
+      day,
+      base_currency: base[0],
+      base_issuer: base[1],
+      counter_currency: counter[0],
+      counter_issuer: counter[1],
+      count,
+      base_sum: baseSum,
+      counter_sum: counterSum,
+      bought_sum: bought,
+      sold_sum: sold,
+      bought_counter_sum: boughtCounter,
+      sold_counter_sum: soldCounter,
+      unfit: 0,
+      base_sum_f: Number(baseSum),
+      counter_sum_f: Number(counterSum),
+      bought_sum_f: Number(bought),
+      sold_sum_f: Number(sold),
+      bought_counter_sum_f: Number(boughtCounter),
+      sold_counter_sum_f: Number(soldCounter),
+    });
+
+    it('raw trade groups of swaps: a swap is a trade of its pair for the taker and for the pool, bought and sold by side', async () => {
+      // the taker: two swaps (it bought 100 XRP for 25 USD, it sold 40 XRP for 10 USD) and an offer's trade (it bought 8 for 2)
+      const taker = await raw('trades', TAKER);
+      expect(taker.source?.sources).toEqual(['raw']);
+      const takerGroups = [
+        tradeGroup(TAKER, BIG_DAY, XRP_SIDE, USD_B, 3, ['148', '37'], ['108', '27'], ['40', '10']),
+        tradeGroup(TAKER, SECOND_DAY, EUR_C, XRP_SIDE, 1, ['2', '20'], ['0', '0'], ['2', '20']),
+      ];
+      expect(taker.rows.map(normalized)).toEqual(takerGroups.map(normalized));
+      // the pool is on the other side of each swap, and has no offer's trade
+      const pool = await raw('trades', POOL);
+      const poolGroups = [
+        tradeGroup(POOL, BIG_DAY, XRP_SIDE, USD_B, 2, ['140', '35'], ['40', '10'], ['100', '25']),
+        tradeGroup(POOL, SECOND_DAY, EUR_C, XRP_SIDE, 1, ['2', '20'], ['2', '20'], ['0', '0']),
+      ];
+      expect(pool.rows.map(normalized)).toEqual(poolGroups.map(normalized));
+      // the oracle, which reads every row as a trade whatever its amm_account, says the same
+      expect(
+        expectGroups('trades', takerGroups, tradesOracle(swapHand.ex.filter((r) => r.account === TAKER)), 'taker'),
+      ).toBe(2);
+      expect(
+        expectGroups('trades', poolGroups, tradesOracle(swapHand.ex.filter((r) => r.account === POOL)), 'pool'),
+      ).toBe(2);
+
+      // the swapper: swaps of two pools among the offers' trades on every day. Its groups, and those of each pool, are what
+      // the rows make: the oracle counts every row, so a swap left out would show
+      let compared = 0;
+      for (const account of [SWAPPER, ...POOLS]) {
+        const { rows } = await raw('trades', account);
+        compared += expectGroups('trades', rows, ORACLE.trades(logical, [account]), account);
+        const mine = logical.ex.filter((r) => r.account === account);
+        expect(rows.reduce((sum, g) => sum + Number(g.count), 0)).toBe(mine.length);
+      }
+      expect(compared).toBeGreaterThan(40);
+      const swaps = swapper.ex.filter((r) => r.account === SWAPPER && r.amm_account !== '');
+      const offers = swapper.ex.filter((r) => r.account === SWAPPER && r.amm_account === '');
+      expect([swaps.length, offers.length]).toEqual([42, 14]);
+      // it bought from the pools and sold to them, on the same days as it traded by offers
+      expect(swaps.some((r) => r.buyer === SWAPPER) && swaps.some((r) => r.seller === SWAPPER)).toBe(true);
+      expect(new Set(swaps.map((r) => r.amm_account))).toEqual(new Set(POOLS));
+    });
+
+    it('swaps in the window: rolled-up groups equal raw groups, complete, partial before and partial after', async () => {
+      const rangeOf = rangesOf(ch);
+      // five accounts that trade against pools, five coverages of the window: all of it; only from the middle of it (the
+      // days before are raw); only up to the middle (the days after are raw); the middle only (raw on both sides); all of it
+      const rolled = [SWAPPER, POOLS[0], POOLS[1], TAKER, POOL];
+      const coverages: RollupCoverage[] = [
+        { from: WINDOW[0], through: WINDOW[1] },
+        { from: BIG_DAY, through: WINDOW[1] },
+        { from: WINDOW[0], through: SECOND_DAY },
+        { from: BIG_DAY, through: SECOND_DAY },
+        { from: WINDOW[0], through: WINDOW[1] },
+      ];
+      const expectedSources = [['rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['raw', 'rollup'], ['rollup']];
+      const states: RollupState[] = [];
+      for (const [i, account] of rolled.entries()) {
+        const written = await writeAccountRollups(ch, rangeOf, [account], coverages[i].from, coverages[i].through);
+        expect(written).toBeGreaterThan(0);
+        states.push({
+          account,
+          rows: logical.ex.filter((r) => r.account === account).length,
+          firstDay: DAYS[0],
+          rolledFrom: coverages[i].from,
+          rolledThrough: coverages[i].through,
+          configVersion: ACCOUNT_ROLLUP_CONFIG_VERSION,
+        });
+      }
+      await writeRollupStates(ch, states);
+
+      const windows: Array<[string, string]> = [
+        WINDOW,
+        ['2014-06-01', '2016-12-31'],
+        ['2015-01-01', '2015-12-31'],
+        [BIG_DAY, BIG_DAY],
+        [SECOND_DAY, SECOND_DAY],
+        ['2013-10-25', '2015-01-14'],
+        ['2015-02-09', '2016-03-28'],
+        ['2013-01-01', '2013-06-10'],
+      ];
+      let rolledGroups = 0;
+      let touchedBoth = 0;
+      for (const [i, account] of rolled.entries()) {
+        expect(await rollupCoverage(ch, account)).toEqual(coverages[i]);
+        for (const window of windows) {
+          const withRollups = await new AccountDayGroups(ch, rangeOf).source('trades', account, window[0], window[1]);
+          const rawOnly = await readGroups(ch, 'trades', account, window);
+          const fromRollups = withRollups
+            ? await ch.query<Group>(
+                `SELECT * FROM (${withRollups.sql}) ORDER BY ${ORDER_BY('trades')}`,
+                withRollups.params,
+              )
+            : [];
+          // the very same groups, as JSON
+          expect(JSON.stringify(fromRollups)).toBe(
+            JSON.stringify(rawOnly.rows.map(({ account: _account, ...group }) => group)),
+          );
+          if (withRollups?.sources.includes('rollup')) rolledGroups += fromRollups.length;
+          if (withRollups?.sources.length === 2) touchedBoth++;
+          if (window === WINDOW) expect(withRollups?.sources).toEqual(expectedSources[i]);
+        }
+      }
+      expect(rolledGroups).toBeGreaterThan(100);
+      expect(touchedBoth).toBeGreaterThan(8);
+
+      // the rollup alone gives the groups worked out by hand
+      const taker = await readGroups(ch, 'trades', TAKER, WINDOW, coverages[3]);
+      expect(taker.source?.sources).toEqual(['raw', 'rollup']);
+      expect(taker.rows.map(normalized)).toEqual([
+        normalized(tradeGroup(TAKER, BIG_DAY, XRP_SIDE, USD_B, 3, ['148', '37'], ['108', '27'], ['40', '10'])),
+        normalized(tradeGroup(TAKER, SECOND_DAY, EUR_C, XRP_SIDE, 1, ['2', '20'], ['0', '0'], ['2', '20'])),
+      ]);
+      const pool = await readGroups(ch, 'trades', POOL, WINDOW, coverages[4]);
+      expect(pool.source?.sources).toEqual(['rollup']);
+      expect(pool.rows.map(normalized)).toEqual([
+        normalized(tradeGroup(POOL, BIG_DAY, XRP_SIDE, USD_B, 2, ['140', '35'], ['40', '10'], ['100', '25'])),
+        normalized(tradeGroup(POOL, SECOND_DAY, EUR_C, XRP_SIDE, 1, ['2', '20'], ['2', '20'], ['0', '0'])),
       ]);
     });
 

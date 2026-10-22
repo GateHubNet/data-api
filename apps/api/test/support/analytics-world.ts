@@ -381,8 +381,10 @@ export async function seedAccountPayments(
 
 /**
  * A row of `account_exchanges` of an account, in the canonical order of its pair:
- * `[time, tx_index, base, counter, base amount, counter amount, buyer, seller]`. The buyer received the base and paid the
- * counter; a trade of the account with itself has it as both.
+ * `[time, tx_index, base, counter, base amount, counter amount, buyer, seller, amm_account]`. The buyer received the base and
+ * paid the counter; a trade of the account with itself has it as both. `amm_account` is the pool of a swap (a swap is a row of
+ * the taker and a row of the pool, each with the pool here, and the buyer is the pool when base flowed into it); left out, or
+ * `''`, it is a trade of an offer.
  */
 export type TradeSpec = [
   time: string,
@@ -393,6 +395,7 @@ export type TradeSpec = [
   counter_amount: string,
   buyer: string,
   seller: string,
+  amm_account?: string,
 ];
 
 /** Writes the rows of `account_exchanges` of `account`, each at a time the world has a ledger for. */
@@ -404,7 +407,7 @@ export async function seedAccountTrades(
 ): Promise<void> {
   await h.ch.insert(
     Table.AccountExchanges,
-    specs.map(([time, tx_index, base, counter, base_amount, counter_amount, buyer, seller]) => {
+    specs.map(([time, tx_index, base, counter, base_amount, counter_amount, buyer, seller, amm_account = '']) => {
       const b = assetOf(base);
       const c = assetOf(counter);
       const rate = Number(counter_amount) / Number(base_amount);
@@ -427,13 +430,14 @@ export async function seedAccountTrades(
         rate_f: rate,
         buyer,
         seller,
-        taker: buyer,
-        provider: seller,
-        offer_sequence: 1,
-        amm_account: '',
+        // a swap is taken by the account that is not the pool, which provides it, and has no offer sequence
+        taker: amm_account === '' ? buyer : buyer === amm_account ? seller : buyer,
+        provider: amm_account === '' ? seller : amm_account,
+        offer_sequence: amm_account === '' ? 1 : 0,
+        amm_account,
         autobridged_currency: null,
         autobridged_issuer: null,
-        tx_type: 'OfferCreate',
+        tx_type: amm_account === '' ? 'OfferCreate' : 'Payment',
         client: null,
       } satisfies AccountExchangesRow;
     }),

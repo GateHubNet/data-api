@@ -225,6 +225,38 @@ const A_CAD_GBP = pair(`CAD+${B}`, `GBP+${I2}`, 2, '7', '4', '5', '2', '3', '1')
 /** A's pairs by native volume: 37, 13.25, 5, then the two without one by count. */
 const A_PAIRS = [A_EUR_USD, A_USD_XRP, A_XRP_ZAR, A_AUD_NZD, A_CAD_GBP];
 
+// -- the swaps of a taker (W) and of the pool it swaps with (P) ---------------------------------------------------------
+//
+// A swap against a pool is a row of `account_exchanges` for the taker and one for the pool, each with `amm_account` the pool
+// (a swap is a trade of its pair, D2b.2); the buyer received the base, the pool when base flowed into it. W also trades by
+// offers with B in the same pair, on the days it swaps on. The rates of the world are those of the offers of `exchanges`
+// (the swaps are not among them): USD is worth 2 per XRP on 02-12.
+
+/** A taker, and a pool: addresses of the sample rows. */
+const W = 'rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn';
+const P = 'rJ8pBKtDeSyHAUhrjZGfUQJdE1MVxrZEXp';
+
+const SWAPS_W: TradeSpec[] = [
+  // USD / XRP: W buys 10 USD for 5 XRP from the pool, on the day it sells 1 USD for 0.5 XRP to B
+  ['2020-02-10T12:30:00Z', 1, USD, 'XRP', '10', '5', W, P, P],
+  ['2020-02-10T12:30:00Z', 3, USD, 'XRP', '1', '0.5', B, W],
+  // EUR / USD, no native side: W buys 30 EUR for 60 USD from the pool; the counter's rate of the day: 60 / 2
+  ['2020-02-12T09:00:00Z', 6, EUR, USD, '30', '60', W, P, P],
+  // W sells 4 USD to the pool for 3 XRP (the pool is the buyer), then buys 2 from B for 1
+  ['2020-03-05T10:00:00Z', 2, USD, 'XRP', '4', '3', P, W, P],
+  ['2020-03-10T10:00:00Z', 2, USD, 'XRP', '2', '1', W, B],
+  ['2020-05-06T09:00:00Z', 4, USD, 'XRP', '5', '4', P, W, P],
+];
+/** The pool's side of the swaps above: the other row of each. */
+const SWAPS_P: TradeSpec[] = SWAPS_W.filter((spec) => spec[8] === P);
+
+const W_USD_XRP = pair(USD, 'XRP', 5, '22', '13.5', '12', '10', '6', '7.5', '13.5');
+const W_EUR_USD = pair(EUR, USD, 1, '30', '60', '30', '0', '60', '0', '30');
+const W_PAIRS = [W_EUR_USD, W_USD_XRP];
+const P_USD_XRP = pair(USD, 'XRP', 3, '19', '12', '9', '10', '7', '5', '12');
+const P_EUR_USD = pair(EUR, USD, 1, '30', '60', '0', '30', '0', '60', '30');
+const P_PAIRS = [P_EUR_USD, P_USD_XRP];
+
 // -- the limits: an account with 1005 counterparties and 1005 pairs ------------------------------------------------------
 
 const MANY_COUNT = 1005;
@@ -285,6 +317,8 @@ describe('analytics/counterparties and analytics/exchanges, on the hand-worked w
       }),
     );
     await seedAccountTrades(h, world, A, TRADES_A);
+    await seedAccountTrades(h, world, W, SWAPS_W);
+    await seedAccountTrades(h, world, P, SWAPS_P);
     await seedAccountTrades(
       h,
       world,
@@ -673,6 +707,68 @@ describe('analytics/counterparties and analytics/exchanges, on the hand-worked w
       expect(Object.keys(body.pairs[2])).toEqual(expect.not.arrayContaining(['base_issuer']));
     });
 
+    it('analytics/exchanges counts a swap as a trade of its pair, bought and sold by side, and carries no AMM field', async () => {
+      // the taker: 5 trades of USD / XRP, 3 of them swaps, and the swap of EUR / USD; its native volume is that of the counter
+      // (13.5 XRP), and 60 USD at 2 (30) where the pair has no native side
+      const taker = await exchanges(W, 'end=2020-06-30');
+      expect(taker).toEqual({
+        result: 'success',
+        start: T('2013-01-01'),
+        end: T('2020-07-01'),
+        total: 2,
+        count: 2,
+        pairs: W_PAIRS,
+      });
+      // W bought 10 and 2 USD (the swap from the pool and the offer of B), sold 1 to B and 4 and 5 to the pool
+      expect(taker.pairs[1]).toMatchObject({ bought: '12', sold: '10', bought_counter: '6', sold_counter: '7.5' });
+      // the pool is on the other side of each swap: it sold 10 USD and bought 4 and 5, and it has no offer's trade
+      const pool = await exchanges(P, 'end=2020-06-30');
+      expect(pool.pairs).toEqual(P_PAIRS);
+      expect([pool.total, pool.count]).toEqual([2, 2]);
+      expect(pool.pairs[1]).toMatchObject({ bought: '9', sold: '10', bought_counter: '7', sold_counter: '5' });
+
+      // a window of whole days adds up the days in it: a swap with an offer's trade of the same day, and a swap alone
+      expect((await exchanges(W, 'start=2020-02-10&end=2020-02-10')).pairs).toEqual([
+        pair(USD, 'XRP', 2, '11', '5.5', '10', '1', '5', '0.5', '5.5'),
+      ]);
+      expect((await exchanges(W, 'start=2020-03-05&end=2020-03-05')).pairs).toEqual([
+        pair(USD, 'XRP', 1, '4', '3', '0', '4', '0', '3', '3'),
+      ]);
+
+      // no AMM field in the answers: not in the body, not in a pair, not in the CSV; the amm filter of the markets is none here
+      const keysOf = (value: unknown): string[] =>
+        value !== null && typeof value === 'object'
+          ? Object.entries(value).flatMap(([key, inner]) => [key, ...keysOf(inner)])
+          : [];
+      for (const body of [taker, pool]) {
+        expect(keysOf(body).filter((key) => /amm|pool|swap|source/i.test(key))).toEqual([]);
+        expect(Object.keys(body)).toEqual(['result', 'start', 'end', 'total', 'count', 'pairs']);
+        for (const p of body.pairs) {
+          expect(Object.keys(p)).toEqual([
+            'base_currency',
+            'base_issuer',
+            'counter_currency',
+            ...(p.counter_issuer === undefined ? [] : ['counter_issuer']),
+            'count',
+            'base_volume',
+            'counter_volume',
+            'bought',
+            'sold',
+            'bought_counter',
+            'sold_counter',
+            'native_volume',
+          ]);
+        }
+      }
+      const csv = await get(`${EXCHANGES(W)}?end=2020-06-30&format=csv`);
+      expect(csv.status).toBe(200);
+      expect(csv.text.split('\n')[0]).not.toMatch(/amm|pool|swap/i);
+      expect(csv.text.split('\n')).toHaveLength(1 + 2);
+      for (const amm of ['exclude', 'only', 'include']) {
+        expect((await get(`${EXCHANGES(W)}?end=2020-06-30&amm=${amm}`)).body).toEqual(taker);
+      }
+    });
+
     it('a window of whole days adds up the days in it', async () => {
       // March: USD / XRP twice (4.5 for 3 bought, and the self-trade), EUR / USD once, on a day USD has no rate
       const march = await exchanges(A, 'start=2020-03-01&end=2020-03-31');
@@ -867,6 +963,15 @@ describe('analytics/counterparties and analytics/exchanges, on the hand-worked w
         `${EXCHANGES(A)}?end=2020-06-30&limit=2`,
         `${EXCHANGES(A)}?start=2019-01-01`,
         `${EXCHANGES(world.many)}?limit=1000`,
+        // the taker and the pool of the swaps: the whole of it, a window that cuts the first day out, one day with a swap and an
+        // offer's trade, and the days of a swap alone
+        `${EXCHANGES(W)}?end=2020-06-30`,
+        `${EXCHANGES(W)}`,
+        `${EXCHANGES(W)}?start=2020-02-11&end=2020-05-06`,
+        `${EXCHANGES(W)}?start=2020-02-10&end=2020-02-10`,
+        `${EXCHANGES(W)}?start=2020-03-05&end=2020-03-05`,
+        `${EXCHANGES(P)}?end=2020-06-30`,
+        `${EXCHANGES(P)}?start=2020-03-01&end=2020-04-30`,
         // the counterparties are read on read from the payments, whatever the rollups hold
         `${COUNTERPARTIES(A)}?end=2020-06-30`,
         `${COUNTERPARTIES(A)}?end=2020-06-30&sort=count`,
@@ -882,8 +987,11 @@ describe('analytics/counterparties and analytics/exchanges, on the hand-worked w
       };
       const raw = await bodies();
       expect((raw[0] as ExchangesBody).pairs).toEqual(A_PAIRS);
+      // the swaps are in the raw answers: those of the taker and of the pool
+      expect((raw[urls.indexOf(`${EXCHANGES(W)}?end=2020-06-30`)] as ExchangesBody).pairs).toEqual(W_PAIRS);
+      expect((raw[urls.indexOf(`${EXCHANGES(P)}?end=2020-06-30`)] as ExchangesBody).pairs).toEqual(P_PAIRS);
 
-      const accounts = [A, world.many];
+      const accounts = [A, world.many, W, P];
       // complete coverage of the world: the groups come from the rollups, and the rest of the window from nothing
       for (const account of accounts) await rollUp(h, api, account, { from: '2020-01-01', through: '2020-07-31' });
       const complete = await queriesOf(h, async () => expect(await bodies()).toEqual(raw));

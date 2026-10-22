@@ -32,7 +32,9 @@ import { SAMPLE_ROWS } from './sample-rows';
  * the boundary of 10, native legs of 0.0005 and just above it, a pair whose trades are all before the day, 60 trades in
  * ONE ledger so that the cut at the newest 50 falls inside a ledger, amounts a decimal cannot hold, an issued currency
  * called XRP, a pair without the native currency, a day whose first ledger closes at 00:00:00, and the same on Xahau
- * (the XAH service of the same database must not see the XRP pairs, nor the other way round).
+ * (the XAH service of the same database must not see the XRP pairs, nor the other way round). Every trade of it is the trade
+ * of an offer (`amm_account` ''); a second world of swaps against pools, alone and among offers, is the proof that the rates
+ * count them (D2b.2).
  *
  * `dailyNativeRatesOfDay(D)` has to equal `dailyNativeRates([asset], D, D + 1)` for every asset and day: that is the proof
  * of the new method (and of the sets, which are made of it); an oracle written from the stored rows says which assets
@@ -74,8 +76,11 @@ const NON = issued('NON'); // never traded
 const XRP_ASSETS = [USD, ZZZ, QUT, NIN, YTE, TRL, TIE, DST, FAKE, EUR, FOO, NON];
 const XAH_ASSETS = [USD, ZZZ, FOO, QUT, EUR, NON];
 
-/** A trade: the close time in unix seconds, then the amounts of the left and the right asset of the market. */
-type Trade = [close: number, left: string, right: string];
+/**
+ * A trade: the close time in unix seconds, then the amounts of the left and the right asset of the market, then the pool
+ * when it is a swap against one (an offer's trade has none).
+ */
+type Trade = [close: number, left: string, right: string, pool?: string];
 interface Market {
   left: Asset;
   right: Asset;
@@ -169,12 +174,127 @@ function worldMarkets(): Market[] {
   ];
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// A world of swaps against pools (D2b.2): the rates are made of `exchanges`, and a swap is a row of it like an offer's trade.
+// ---------------------------------------------------------------------------------------------------------------------
+
+const POOL_A = 'rSwapPoolA'.padEnd(34, 'x');
+const POOL_B = 'rSwapPoolB'.padEnd(34, 'x');
+const SWP = issued('SWP'); // swaps only, at one price, with dust swaps among them; the native currency is the stored counter
+const YSW = issued('YSW'); // swaps of two pools; the native currency is the stored base
+const MIX = issued('MIX'); // offers and swaps in the same ledgers, 52 trades in 13 days
+const QSW = issued('QSW'); // 8 kept offers (and 2 of dust): the 2 swaps of day 18 make 10
+const DUS = issued('DUS'); // the newest 12 of the newest 50 are dust swaps
+const KEP = issued('KEP'); // swaps just above the dust limit, and swaps at it
+const NNA = issued('NNA'); // a pool without the native currency
+const NNB = issued('NNB');
+/** The assets the swap world is asked about. */
+const SWAP_ASSETS = [SWP, YSW, MIX, QSW, DUS, KEP, NON];
+/** The day the swaps of the world end on: the rates are asked for it and for the days around it. */
+const SWAP_DAY = 20;
+
+function swapMarkets(): Market[] {
+  // 3 swaps a day for 15 days at 0.4 SWP per XRP; the dust swaps (a native leg of 0.0005 or less) are at a price that would
+  // show in the rate if they counted
+  const swp: Trade[] = range(6, SWAP_DAY).flatMap((day) =>
+    [4, 12, 20].map((hour): Trade => [at(day, hour * HOUR), '10', '25', POOL_A]),
+  );
+  swp.push(
+    [at(10, 22 * HOUR), '1', '0.0005', POOL_A],
+    [at(SWAP_DAY, 21 * HOUR), '1', '0.0005', POOL_A],
+    [at(SWAP_DAY, 21 * HOUR + 60), '1', '0.0004', POOL_B],
+  );
+
+  // 40 YSW for 10 XRP, 2 swaps a day for 9 days, by the two pools in turn; the native leg is the right one of the trade
+  const ysw: Trade[] = range(12, SWAP_DAY).flatMap((day) =>
+    [2, 14].map((hour, i): Trade => [at(day, hour * HOUR), '40', '10', (day + i) % 2 ? POOL_A : POOL_B]),
+  );
+  ysw.push([at(SWAP_DAY, 23 * HOUR), '2', '0.0005', POOL_B], [at(SWAP_DAY, 23 * HOUR + 60), '3', '0.0004', POOL_A]);
+
+  // two offers and two swaps a day, a different price on every one, the trades of an offer and of a pool in one ledger
+  const mix: Trade[] = range(8, SWAP_DAY).flatMap((day): Trade[] => [
+    [at(day, 6 * HOUR), '10', String(10 * price(day, 0))],
+    [at(day, 6 * HOUR), '10', String(10 * price(day, 1)), POOL_A],
+    [at(day, 18 * HOUR), '10', String(10 * price(day, 2)), POOL_B],
+    [at(day, 18 * HOUR), '10', String(10 * price(day, 3))],
+  ]);
+
+  // 8 kept offers and 2 of dust on days 14 to 17: nothing until day 18, when two swaps make 10 kept trades
+  const qsw: Trade[] = [
+    ...[14, 15, 16, 17].flatMap((day) =>
+      [3, 15].map((hour, i): Trade => [at(day, hour * HOUR), '10', String(20 + day + i)]),
+    ),
+    [at(14, 20 * HOUR), '10', '0.0005'],
+    [at(15, 20 * HOUR), '10', '0.0005'],
+    [at(18, 5 * HOUR), '10', '22', POOL_A],
+    [at(18, 5 * HOUR + 1), '10', '23', POOL_B],
+  ];
+
+  // 40 offers at 0.5 DUS per XRP; on the day, 18 swaps at that price, then 12 dust swaps at 2000 per XRP and more
+  const dus: Trade[] = [
+    ...range(8, 15).flatMap((day) => [1, 5, 9, 13, 17].map((hour): Trade => [at(day, hour * HOUR), '10', '20'])),
+    ...range(0, 17).map((k): Trade => [at(SWAP_DAY, HOUR + k * 60), '10', '20', POOL_A]),
+    ...range(0, 11).map((k): Trade => [at(SWAP_DAY, 3 * HOUR + k * 60), '1', k % 2 ? '0.0004' : '0.0005', POOL_B]),
+  ];
+
+  // 1 KEP for 0.00051 XRP is kept (12 swaps), 1 for 0.0005 is not (12 more)
+  const kep: Trade[] = range(15, SWAP_DAY).flatMap((day): Trade[] => [
+    [at(day, 8 * HOUR), '1', '0.00051', POOL_A],
+    [at(day, 9 * HOUR), '1', '0.0005', POOL_B],
+    [at(day, 16 * HOUR), '1', '0.00051', POOL_B],
+    [at(day, 17 * HOUR), '1', '0.0005', POOL_A],
+  ]);
+
+  return [
+    { left: SWP, right: XRP, trades: swp },
+    { left: YSW, right: XRP, trades: ysw },
+    { left: MIX, right: XRP, trades: mix },
+    { left: QSW, right: XRP, trades: qsw },
+    { left: DUS, right: XRP, trades: dus },
+    { left: KEP, right: XRP, trades: kep },
+    // swaps in a pool of two issued currencies: no native pair, no rate
+    { left: NNA, right: NNB, trades: range(10, SWAP_DAY).map((day): Trade => [at(day, 11 * HOUR), '5', '6', POOL_A]) },
+  ];
+}
+
+const TAKER = 'rSwapTaker'.padEnd(34, 'x');
+const MAKER = 'rOfferMaker'.padEnd(34, 'x');
+
+/**
+ * Who is in a trade. `SAMPLE_ROWS[Table.Exchanges]` is a swap against a pool, so every row says it itself: an offer's trade
+ * has `amm_account` '' and a maker; a swap has the pool, which is the provider, and the buyer is the one that received the
+ * base (the pool on every other swap).
+ */
+function partiesOf(pool: string | undefined, i: number) {
+  if (pool === undefined) {
+    return {
+      buyer: TAKER,
+      seller: MAKER,
+      taker: TAKER,
+      provider: MAKER,
+      offer_sequence: 7,
+      amm_account: '',
+      tx_type: 'OfferCreate',
+    };
+  }
+  const poolReceivesBase = i % 2 === 0;
+  return {
+    buyer: poolReceivesBase ? pool : TAKER,
+    seller: poolReceivesBase ? TAKER : pool,
+    taker: TAKER,
+    provider: pool,
+    offer_sequence: 0,
+    amm_account: pool,
+    tx_type: 'Payment',
+  };
+}
+
 /** The `exchanges` row of every trade of the markets, in the stored orientation of the pair. */
 function exchangeRowsOf(markets: Market[], ledgerOf: Map<number, number>): ExchangesRow[] {
   const rows: ExchangesRow[] = [];
   for (const m of markets) {
     const stored = canonicalPair(m.left, m.right);
-    m.trades.forEach(([close, left, right], i) => {
+    m.trades.forEach(([close, left, right, pool], i) => {
       const [baseAmount, counterAmount] = stored.inverted ? [right, left] : [left, right];
       const rate = new Wide(counterAmount).dividedBy(baseAmount);
       rows.push({
@@ -194,6 +314,7 @@ function exchangeRowsOf(markets: Market[], ledgerOf: Map<number, number>): Excha
         counter_amount_f: Number(counterAmount),
         rate: rate.isFinite() ? rate.toString() : '0',
         rate_f: Number(rate),
+        ...partiesOf(pool, i),
       });
     });
   }
@@ -518,6 +639,168 @@ describe('daily native rates of a day and the rates_daily sets (e2e)', () => {
       spy.mockClear();
       await rates.dailyNativeRatesOfDay(dateOf(-3));
       expect(spy.mock.calls.filter(([sql]) => String(sql).includes('FROM exchanges'))).toHaveLength(1);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('with swaps among the trades', () => {
+    let ch: ClickHouseService;
+    let rates: RatesService;
+    let rows: ExchangesRow[];
+
+    /** Before the first swap, the days of the rates, all of the tails (the 14 days after the last swap), and past them. */
+    const DAYS = range(2, 40);
+    const swapsOf = (pair: { rows: ExchangesRow[]; nativeIsBase: boolean }) => ({
+      ...pair,
+      rows: pair.rows.filter((r) => r.amm_account !== ''),
+    });
+    const offersOf = (pair: { rows: ExchangesRow[]; nativeIsBase: boolean }) => ({
+      ...pair,
+      rows: pair.rows.filter((r) => r.amm_account === ''),
+    });
+
+    beforeAll(async () => {
+      ch = await freshService();
+      rows = await seedWorld(ch, swapMarkets());
+      rates = new RatesService(ch, 'XRP');
+    });
+
+    it('the world has swaps of two pools, the swaps of day D and of the 14 days before it, dust at the limit and just above it', () => {
+      const pair = (asset: Asset) => pairRows(rows, XRP, asset);
+      // an offer's trade has no pool, a swap has one; both are in the same pair and the same ledgers
+      expect(new Set(rows.map((r) => r.amm_account))).toEqual(new Set(['', POOL_A, POOL_B]));
+      expect(new Set(pair(MIX).rows.map((r) => r.amm_account !== ''))).toEqual(new Set([true, false]));
+      expect(new Set(pair(MIX).rows.map((r) => r.amm_account)).size).toBe(3);
+      expect(
+        new Set(
+          pair(MIX)
+            .rows.filter((r) => r.close_time === at(SWAP_DAY, 6 * HOUR))
+            .map((r) => r.ledger_index),
+        ).size,
+      ).toBe(1);
+      // the pool provides its swaps, with no offer sequence; the trade of an offer has its maker and a sequence
+      for (const r of rows) {
+        expect([r.amm_account, r.provider, r.offer_sequence]).toEqual(
+          r.amm_account === '' ? ['', MAKER, 7] : [r.amm_account, r.amm_account, 0],
+        );
+      }
+      expect(pair(SWP).nativeIsBase).toBe(false);
+      expect(pair(YSW).nativeIsBase).toBe(true);
+      // the swaps against the native currency: on day D and in the 14 days before it (those of DUS are all on D, those of QSW on day 18)
+      const swapsIn = (asset: Asset, from: number, to: number): number =>
+        swapsOf(pair(asset)).rows.filter((r) => r.close_time >= at(from) && r.close_time < at(to)).length;
+      for (const asset of [SWP, YSW, MIX, KEP]) {
+        expect([assetKey(asset), swapsIn(asset, SWAP_DAY, SWAP_DAY + 1) > 0]).toEqual([assetKey(asset), true]);
+        expect([assetKey(asset), swapsIn(asset, SWAP_DAY - 14, SWAP_DAY) > 0]).toEqual([assetKey(asset), true]);
+      }
+      expect(swapsIn(DUS, SWAP_DAY, SWAP_DAY + 1)).toBe(30);
+      expect(swapsIn(QSW, SWAP_DAY - 14, SWAP_DAY)).toBe(2);
+      // swaps only
+      for (const asset of [SWP, YSW, KEP]) expect(offersOf(pair(asset)).rows).toHaveLength(0);
+      // dust: a native leg of exactly 0.0005, below it, and just above it
+      const native = (asset: Asset): string[] =>
+        pair(asset).rows.map((r) => (pair(asset).nativeIsBase ? r.base_amount : r.counter_amount));
+      expect(
+        native(SWP)
+          .filter((a) => new BigNumber(a).lte(NOISE))
+          .sort(),
+      ).toEqual(['0.0004', '0.0005', '0.0005']);
+      expect(native(KEP).filter((a) => a === '0.00051')).toHaveLength(12);
+      expect(native(KEP).filter((a) => a === '0.0005')).toHaveLength(12);
+      // 52 trades of MIX in the 13 days, the dust swaps the newest of DUS
+      expect(pair(MIX).rows).toHaveLength(52);
+      expect(offersOf(pair(DUS)).rows).toHaveLength(40);
+      expect(swapsOf(pair(DUS)).rows).toHaveLength(30);
+      // a pool of two issued currencies has no native pair
+      expect(pairRows(rows, XRP, NNA).rows).toHaveLength(0);
+      expect(rows.filter((r) => r.base_currency === NNA.currency && r.amm_account !== '')).toHaveLength(11);
+    });
+
+    it('with swaps among the trades, dailyNativeRatesOfDay still equals dailyNativeRates for every asset', async () => {
+      const tally = await expectSameRates(rates, SWAP_ASSETS, DAYS.map(dateOf));
+      // a comparison of zeros would prove nothing, and neither would one without a zero
+      expect(tally.withRate).toBeGreaterThan(60);
+      expect(tally.without).toBeGreaterThan(60);
+    });
+
+    it('the swaps are counted: the rates, the counts and the days with a rate are those of the rows, swaps included', async () => {
+      // by hand: SWP trades by swaps alone, at 10 SWP for 25 XRP, and its dust swaps (a native leg of 0.0005, 0.0004) move nothing
+      const swp = (await rates.dailyNativeRatesOfDay(dateOf(SWAP_DAY))).get(assetKey(SWP));
+      expect(swp?.rate.toFixed()).toBe('0.4');
+      // 3 kept swaps on the day, and the newest 50 of 48 rows (3 on each of 15 days, 3 of dust) hold 45 kept ones
+      expect([swp?.dailyCount, swp?.latestCount]).toEqual([3, 45]);
+      expect((await rates.dailyNativeRatesOfDay(dateOf(SWAP_DAY))).get(assetKey(YSW))).toMatchObject({
+        dailyCount: 2,
+        latestCount: 18,
+      });
+      expect((await rates.dailyNativeRatesOfDay(dateOf(SWAP_DAY))).get(assetKey(YSW))?.rate.toFixed()).toBe('4');
+      // DUS: 18 kept swaps on the day (the 12 of dust, the newest, are in the newest 50 and in no sum), 20 offers before them
+      const dus = (await rates.dailyNativeRatesOfDay(dateOf(SWAP_DAY))).get(assetKey(DUS));
+      expect([dus?.rate.toFixed(), dus?.dailyCount, dus?.latestCount]).toEqual(['0.5', 18, 38]);
+      // KEP: the swaps just above the limit are kept, the ones at it are not
+      expect((await rates.dailyNativeRatesOfDay(dateOf(SWAP_DAY))).get(assetKey(KEP))).toMatchObject({
+        dailyCount: 2,
+        latestCount: 12,
+      });
+
+      // QSW has 8 kept offers: only the swaps of day 18 make 10, until the first of the offers leaves the 14 days
+      const qswDays: number[] = [];
+      for (const d of DAYS) if ((await rates.dailyNativeRatesOfDay(dateOf(d))).has(assetKey(QSW))) qswDays.push(d);
+      expect(qswDays).toEqual(range(18, 28));
+      for (const d of DAYS) expect(oracleCounts(offersOf(pairRows(rows, XRP, QSW)), d).latestCount).toBeLessThan(10);
+
+      // every count of every asset and day is that of the oracle, which reads the swaps as it reads the offers' trades
+      let checked = 0;
+      await inBatches(DAYS, async (d) => {
+        const got = await rates.dailyNativeRatesOfDay(dateOf(d));
+        for (const asset of SWAP_ASSETS) {
+          const counts = oracleCounts(pairRows(rows, XRP, asset), d);
+          const have = got.get(assetKey(asset));
+          if (have) {
+            expect([d, assetKey(asset), have.dailyCount, have.latestCount]).toEqual([
+              d,
+              assetKey(asset),
+              counts.dailyCount,
+              counts.latestCount,
+            ]);
+            checked++;
+          } else {
+            expect([d, assetKey(asset), counts.latestCount < 10]).toEqual([d, assetKey(asset), true]);
+          }
+        }
+      });
+      expect(checked).toBeGreaterThan(60);
+
+      // a pool without the native currency has no rate, however many swaps it has: only the assets of native pairs are there
+      const known = new Set([...SWAP_ASSETS, XRP].map(assetKey));
+      for (const d of [SWAP_DAY, SWAP_DAY + 3]) {
+        const got = [...(await rates.dailyNativeRatesOfDay(dateOf(d))).keys()];
+        expect(got.filter((key) => !known.has(key))).toEqual([]);
+        expect(got).not.toContain(assetKey(NNA));
+        expect(got).not.toContain(assetKey(NNB));
+      }
+    });
+
+    it('the swaps change the rate: the same trades without them give another set of rates', async () => {
+      // the world again, with the swaps left out
+      const offers = await freshService();
+      const markets = swapMarkets().map((m) => ({
+        ...m,
+        trades: m.trades.filter(([, , , pool]) => pool === undefined),
+      }));
+      await seedWorld(offers, markets);
+      const onlyOffers = new RatesService(offers, 'XRP');
+      const withSwaps = await rates.dailyNativeRatesOfDay(dateOf(SWAP_DAY));
+      const without = await onlyOffers.dailyNativeRatesOfDay(dateOf(SWAP_DAY));
+      expect([...withSwaps.keys()].sort()).toEqual([SWP, YSW, MIX, QSW, DUS, KEP].map(assetKey).sort());
+      // the pairs of swaps alone have no rate, nor has the pair whose offers are 8 kept trades; the others have that of their offers
+      expect([...without.keys()].sort()).toEqual([DUS, MIX].map(assetKey).sort());
+      // DUS is at one price whoever trades; MIX is not
+      expect(without.get(assetKey(DUS))?.rate.toFixed()).toBe('0.5');
+      expect(without.get(assetKey(MIX))?.rate.toFixed()).not.toBe(withSwaps.get(assetKey(MIX))?.rate.toFixed());
+      // and the two methods agree on that world too
+      const tally = await expectSameRates(onlyOffers, SWAP_ASSETS, [SWAP_DAY - 5, SWAP_DAY, SWAP_DAY + 5].map(dateOf));
+      expect(tally.withRate).toBeGreaterThan(0);
     });
   });
 
