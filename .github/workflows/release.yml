@@ -1,16 +1,24 @@
-# A release, on every pushed tag v* (v1.4.0, or a pre-release such as v1.4.0-rc.1):
-#   1. test     the whole CI workflow (build, unit tests, the three e2e suites);
-#   2. images   the API and syncer images for linux/amd64 and linux/arm64, pushed to GitHub Packages (ghcr.io) as the tag's
-#               version without its v (1.4.0) and as latest;
-#   3. release  the GitHub release of the tag: its body is the changelog since the previous tag (cliff.toml), which is also
+# A release, on every pushed version tag (v1.4.0, or a pre-release such as v1.4.0-rc.1):
+#   1. version  the tag must be a semantic version (vMAJOR.MINOR.PATCH, an optional -pre-release); anything else stops here;
+#   2. test     the whole CI workflow (build, unit tests, the three e2e suites);
+#   3. images   the API and syncer images for linux/amd64 and linux/arm64, pushed to GitHub Packages (ghcr.io) as the version
+#               without its v (1.4.0);
+#   4. latest   both images' latest pointed at the newest version tag (a pre-release included) whose images are published,
+#               worked out again by every run, one run at a time: a release that finishes after a newer one leaves latest on the
+#               newer one, and both images are always on the same version;
+#   5. release  the GitHub release of the tag: its body is the changelog since the previous tag (cliff.toml), which is also
 #               attached as CHANGELOG.md. A tag with a "-" is marked a pre-release.
-# A step that fails stops the ones after it, so a release exists only for a tag whose tests passed and whose images are out.
+# A release exists only for a tag that is a version, whose tests passed and whose images are out.
 
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    # Version-shaped tags only (filter patterns, not regular expressions: + is one or more, . is a dot); the version job checks
+    # the rest.
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
 
 permissions:
   contents: read
@@ -23,16 +31,37 @@ env:
   REGISTRY: ghcr.io
   # Image names on ghcr.io must be lower case.
   NAMESPACE: ghcr.io/gatehubnet
+  # A semantic version as a tag: v, then MAJOR.MINOR.PATCH without leading zeros, then an optional pre-release. No build
+  # metadata: a + cannot be part of an image tag.
+  SEMVER_TAG: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 
 jobs:
+  version:
+    name: Version of the tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ $SEMVER_TAG ]]; then
+            echo "::error::$TAG is not a version tag (v1.4.0, or v1.4.0-rc.1): nothing is built or published."
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: version
     uses: ./.github/workflows/ci.yml
     secrets:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   images:
     name: Image ${{ matrix.image }}
-    needs: test
+    needs: [version, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -59,15 +88,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The version tag only: latest is the latest job's.
       - id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.NAMESPACE }}/${{ matrix.image }}
-          # Every tag moves latest, a pre-release included.
           flavor: latest=false
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest
+          tags: type=raw,value=${{ needs.version.outputs.version }}
 
       # The npm token reaches the build as the BuildKit secret npm_token, as in docs/deployment.md: in no layer.
       - uses: docker/build-push-action@v7
@@ -83,8 +110,63 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
+  latest:
+    name: Move latest
+    needs: images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    # One run at a time, across all tags. A run that waits here is replaced by a newer one (GitHub cancels a pending job of the
+    # group), which loses nothing: every run points latest at the same answer, worked out when it runs.
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # latest is the newest version tag (a pre-release included) whose two images are both published, whichever tag started
+      # this run. The tags are read as they are now, so a run that finishes after a newer release points latest at the newer
+      # one, not back at its own, and a newer tag whose images are not out yet (or never will be) is passed over. Both images
+      # always move to the same version.
+      - name: Point latest at the newest published version
+        run: |
+          git fetch --force --tags origin
+          target=""
+          for tag in $(git -c versionsort.suffix=- tag -l 'v*' --sort=-v:refname | grep -E "$SEMVER_TAG"); do
+            version="${tag#v}"
+            if docker buildx imagetools inspect "$NAMESPACE/data-api:$version" > /dev/null 2>&1 \
+              && docker buildx imagetools inspect "$NAMESPACE/data-syncer:$version" > /dev/null 2>&1; then
+              target="$version"
+              break
+            fi
+            echo "$tag: its images are not both published, passed over"
+          done
+          if [ -z "$target" ]; then
+            echo "::error::No version tag has both images published."
+            exit 1
+          fi
+          if [ "v$target" != "$GITHUB_REF_NAME" ]; then
+            echo "::notice::latest goes to $target, the newest published version, not to this run's $GITHUB_REF_NAME."
+          fi
+          for image in data-api data-syncer; do
+            docker buildx imagetools create --tag "$NAMESPACE/$image:latest" "$NAMESPACE/$image:$target"
+          done
+
   release:
     name: GitHub release
+    # Not after latest: a latest job that a newer release replaced (see there) would otherwise skip this release.
     needs: images
     runs-on: ubuntu-24.04
     timeout-minutes: 10
