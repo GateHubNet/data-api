@@ -7,6 +7,7 @@ import { MarketAsset, MarketsConfig } from '../network/network-profile';
 import { Asset, assetKey } from '../query/asset';
 import { exactAmount, exactSum, floatSum, ratio, sumOf } from '../query/decimal';
 import { LedgerRange, RatesService } from '../query/rates.service';
+import { ammWindowSwapTotals, SwapTotals } from './amm-daily.job';
 import { AmmPoolVolume, ammPoolVolumes } from './amm-reads';
 
 /**
@@ -192,6 +193,8 @@ interface VolumeComponent {
   count: number;
   rate: BigNumber;
   converted: BigNumber;
+  /** A pool component of the live day set only: its estimated fees in the native currency, null when not known (D2b.3). */
+  feesEst?: BigNumber | null;
 }
 
 const ZERO = new BigNumber(0);
@@ -351,6 +354,44 @@ function poolLeg(p: AmmPoolVolume, native: string): Leg {
     : leg;
 }
 
+/** The estimate of one side of a pool in the native currency: `fees x converted / volume`, see `componentFeesEst`. */
+function sideFeesEst(fees: string | null, volume: BigNumber, converted: BigNumber): BigNumber | null {
+  if (fees === null) return null;
+  const sum = new BigNumber(fees);
+  // no fees add 0 whatever the volume: nothing is divided, so a side without volume gives no NaN
+  if (sum.isZero()) return ZERO;
+  return volume.gt(0) ? ratio(sum.times(converted), volume) : null;
+}
+
+/**
+ * The estimated fees of an AMM component in the native currency (D2b.3, D8): with S the asset of its `amount` (its `base`) and
+ * O the other asset of the pool, `fees_S x converted / amount + fees_O x converted / volume_O`. The fees of O are priced in S by
+ * the pool itself (times `amount / volume_O`, its own average price in the window) and both are converted like the component's
+ * volume (times `converted / amount`). `totals` are the fees of the pool's swaps by side (`swapTotals`: every swap of the
+ * window), `pool` is the pool as stored, before `poolLeg` turns it, with the volumes of its kept swaps (`ammPoolVolumes`: the
+ * native dust left out); the component's `base` says which of its sides is S (a pool turned round, or converted through its
+ * counter, has the sides swapped). Null when the fees of a side are not known (Ruling R-A26: part of the fees is never shown as
+ * all of them), or are above 0 while the volume of that side is not (nothing prices them); a side without fees adds 0.
+ */
+export function componentFeesEst(
+  component: { base: Asset; amount: BigNumber; converted: BigNumber },
+  pool: { base: Asset; counter: Asset; baseVolume: BigNumber; counterVolume: BigNumber },
+  totals: SwapTotals,
+): BigNumber | null {
+  const amountIsBase = assetKey(component.base) === assetKey(pool.base);
+  const own = sideFeesEst(
+    amountIsBase ? totals.fees_base_est : totals.fees_counter_est,
+    component.amount,
+    component.converted,
+  );
+  const other = sideFeesEst(
+    amountIsBase ? totals.fees_counter_est : totals.fees_base_est,
+    amountIsBase ? pool.counterVolume : pool.baseVolume,
+    component.converted,
+  );
+  return own === null || other === null ? null : own.plus(other);
+}
+
 /**
  * The AMM components of a window (Rulings R-A18 and R-A19): the swaps against the pools that closed in `[from, toExclusive)`,
  * a component per pool, whose `component` is the pool account and `amount` the volume of its base. The pools, their pairs and
@@ -365,6 +406,10 @@ function poolLeg(p: AmmPoolVolume, native: string): Leg {
  * A pool against the native currency is converted to its own native volume; the others through the rate of their base, else
  * of their counter; a pool with no rate for either asset is dropped. Only the pools that are not against the native currency
  * use a rate, so only the markets of their two assets are read, and none when there is no such pool.
+ *
+ * With `withFees` (the live day set, D2b.3) each component also gets `feesEst`, its fees in the window converted like its
+ * volume (`componentFeesEst`): the swaps of the listed pools are read one by one for it, with the fee state they came into the
+ * window with (`ammWindowSwapTotals`).
  */
 async function ammComponents(
   ch: ClickHouseService,
@@ -372,11 +417,13 @@ async function ammComponents(
   config: MarketsConfig,
   from: Date,
   toExclusive: Date,
+  withFees: boolean,
 ): Promise<VolumeComponent[]> {
   const native = rates.nativeCurrency;
   const range = await rates.ledgersClosedIn(from, toExclusive);
   if (!range) return [];
-  const pools = (await ammPoolVolumes(ch, range)).map((p) => poolLeg(p, native));
+  const stored = await ammPoolVolumes(ch, range);
+  const pools = stored.map((p) => poolLeg(p, native));
   if (pools.length === 0) return [];
 
   const needed = new Set<string>();
@@ -396,12 +443,32 @@ async function ammComponents(
   for (const [key, sums] of fromPools)
     if (!nativeRate.get(key)?.gt(0)) nativeRate.set(key, ratio(sums.base, sums.native));
 
-  return convertLegs(pools, nativeRate, native)
+  const components = convertLegs(pools, nativeRate, native)
     .filter((c) => c.converted.gt(0))
     .sort(byConverted);
+  if (!withFees || components.length === 0) return components;
+
+  // the pools as stored (the leg may be turned round), for the listed components only
+  const byAccount = new Map(stored.map((p) => [p.account, p]));
+  const listed = components.map((c) => byAccount.get(c.component) as AmmPoolVolume);
+  const totals = await ammWindowSwapTotals(
+    ch,
+    listed.map((p) => ({
+      account: p.account,
+      pair: [p.base.currency, p.base.issuer ?? '', p.counter.currency, p.counter.issuer ?? ''] as const,
+    })),
+    { first: range.min, last: range.max },
+  );
+  return components.map((c, i) => ({
+    ...c,
+    feesEst: componentFeesEst(c, listed[i], totals.get(c.component) as SwapTotals),
+  }));
 }
 
-/** The components of a metric in a window `[from, toExclusive)`; a payment is converted at the rate of `from`. */
+/**
+ * The components of a metric in a window `[from, toExclusive)`; a payment is converted at the rate of `from`. `withFees` gives
+ * the AMM components their fee estimates (the live day set); the other metrics have none.
+ */
 function componentsOf(
   ch: ClickHouseService,
   rates: RatesService,
@@ -409,6 +476,7 @@ function componentsOf(
   metric: VolumeMetric,
   from: Date,
   toExclusive: Date,
+  withFees = false,
 ): Promise<VolumeComponent[]> {
   switch (metric) {
     case 'trade_volume':
@@ -416,7 +484,7 @@ function componentsOf(
     case 'payment_volume':
       return paymentComponents(ch, rates, config, from, toExclusive, from);
     case 'amm_volume':
-      return ammComponents(ch, rates, config, from, toExclusive);
+      return ammComponents(ch, rates, config, from, toExclusive, withFees);
   }
 }
 
@@ -643,7 +711,9 @@ export async function computeDailyVolumeSet(
 
 /**
  * Recomputes the live set of a metric for a period and writes it: the window is `[now - period, now)`, whole seconds, and
- * every row carries its start and end. A payment is converted at the rate of the start of the window.
+ * every row carries its start and end. A payment is converted at the rate of the start of the window. The components of the
+ * AMM volume's day set carry their fee estimates (`fees_est_f`, D2b.3; NULL when not known); its sentinel and the rows of every
+ * other set have NULL there (the longer periods would read up to 30 days of swaps at every tick).
  */
 export async function computeLiveVolumeSet(
   ch: ClickHouseService,
@@ -663,14 +733,16 @@ export async function computeLiveVolumeSet(
   const end = Math.floor(now.getTime() / 1000);
   const start = end - LIVE_PERIOD_SECONDS[period];
   const [from, to] = [at(start), at(end)];
-  const components = await componentsOf(ch, rates, markets, metric, from, to);
+  const components = await componentsOf(ch, rates, markets, metric, from, to, period === 'day');
   const version = await nextVersion(ch, Table.VolumeLive, 'metric = {metric:String} AND period = {period:String}', {
     metric,
     period,
   });
   throwIfAborted(signal);
+  // the rows of the set are the sentinel and then the components, in their order
+  const fees = [null, ...components.map((c) => c.feesEst?.toNumber() ?? null)];
   const rows = setRows(metric, components, markets.version, version).map(
-    (r): VolumeLiveRow => ({ ...r, period, start_time: start, end_time: end }),
+    (r, i): VolumeLiveRow => ({ ...r, period, start_time: start, end_time: end, fees_est_f: fees[i] }),
   );
   await ch.insert(Table.VolumeLive, rows);
   return components.length;

@@ -1,5 +1,6 @@
 import BigNumber from 'bignumber.js';
 import { join } from 'node:path';
+import { DaySwap, FeeEvent, FeeState, swapTotals, SwapTotals } from '../src/aggregate/amm-daily.job';
 import {
   AMM_CHUNK,
   AMM_POOL_PAIRS_SQL,
@@ -8,19 +9,28 @@ import {
   ammPoolVolumes,
 } from '../src/aggregate/amm-reads';
 import {
+  componentFeesEst,
   computeDailyVolumeSet,
   computeLiveVolumes,
   computeLiveVolumeSet,
   LIVE_PERIOD_SECONDS,
   LivePeriod,
+  livePeriodsOf,
   TRADE_LIVE_PERIODS,
   VOLUME_DAY_SETTLE_MS,
+  VOLUME_METRICS,
   volumeDaysDone,
   VolumeRecomputeAborted,
 } from '../src/aggregate/volume.job';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations } from '../src/clickhouse/migrate';
-import { AmmPoolStatesRow, AmmPoolTouchesRow, ExchangesRow, LedgersRow } from '../src/clickhouse/rows';
+import {
+  AmmGovernanceRow,
+  AmmPoolStatesRow,
+  AmmPoolTouchesRow,
+  ExchangesRow,
+  LedgersRow,
+} from '../src/clickhouse/rows';
 import { Table } from '../src/clickhouse/tables';
 import { buildLedgerRows } from '../src/ingest/build-rows';
 import { FixtureLedgerSource } from '../src/ingest/fixture-ledger-source';
@@ -29,9 +39,10 @@ import { getNetworkProfile, MarketsConfig } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
 import { Asset, assetKey } from '../src/query/asset';
 import { RatesService } from '../src/query/rates.service';
+import { RIPPLE_EPOCH_MS } from '../src/util/time';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS } from './sample-rows';
-import { ammVolumeOracle, ExpectedAmm } from './volume-oracle';
+import { ammVolumeOracle, asset, DUST, ExpectedAmm } from './volume-oracle';
 
 /**
  * The `amm_volume` metric of the volume jobs on a real ClickHouse: the swaps of each pool in a window, converted like the
@@ -45,6 +56,10 @@ import { ammVolumeOracle, ExpectedAmm } from './volume-oracle';
  * window, ledgers that are not committed. Part 3 is what the readers rely on: the sets (one version, the sentinel, finality),
  * the periods, real duplicate rows, a database without a pool, the abort. Part 4 proves that no read crosses the pairs (Ruling
  * R-A3) on tables of several parts, and that pools are read in chunks.
+ *
+ * The fee estimates of the live day set (`fees_est_f`, D2b.3) are compared, on the fixtures, with `swapTotals` over the stored
+ * swaps and a fee state worked out from all the stored rows, converted by `componentFeesEst`; a world of their own has a vote
+ * and a bid inside the window, a slot that ends in it, a fee state carried into it and a pool whose fee is not known.
  */
 
 const SEC = 1000;
@@ -53,7 +68,8 @@ const HOUR = 3600;
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 const AMM_LEDGERS = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/amm')).list();
-const AMM_EXCHANGES: ExchangesRow[] = AMM_LEDGERS.map((raw) => buildLedgerRows(raw, ctx)).flatMap((b) => b.exchanges);
+const AMM_BUILT = AMM_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
+const AMM_EXCHANGES: ExchangesRow[] = AMM_BUILT.flatMap((b) => b.exchanges);
 
 const unix = (text: string): number => Date.parse(text) / SEC;
 const at = (seconds: number): Date => new Date(seconds * SEC);
@@ -164,6 +180,125 @@ function expectAmm(got: StoredRow[], want: ExpectedAmm[]): void {
     close(`${r.component} converted`, r.converted_f, w.converted.toNumber());
     close(`${r.component} rate`, r.rate_f, w.rate.toNumber());
   });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The fee estimates of the live day set (D2b.3): what a reader sees, and an oracle over the rows as stored
+// ---------------------------------------------------------------------------------------------------------------------
+
+const RIPPLE_EPOCH_S = RIPPLE_EPOCH_MS / SEC;
+
+/** `fees_est_f` of each row of the newest AMM set of a live period, by component (the sentinel is `''`). */
+async function liveFees(ch: ClickHouseService, period: LivePeriod): Promise<Map<string, number | null>> {
+  const rows = await ch.query<{ component: string; fees_est_f: number | null }>(
+    `SELECT component, fees_est_f FROM ${Table.VolumeLive}
+      WHERE metric = 'amm_volume' AND period = {period:String}
+        AND version = (SELECT max(version) FROM ${Table.VolumeLive} WHERE metric = 'amm_volume' AND period = {period:String})
+      ORDER BY component`,
+    { period },
+  );
+  return new Map(rows.map((r) => [r.component, r.fees_est_f === null ? null : Number(r.fees_est_f)]));
+}
+
+/** The swaps of a pool that closed in `[from, to)` as `swapTotals` takes them: every one of them (D8: no dust rule). */
+const swapsIn = (rows: ExchangesRow[], account: string, from: number, to: number): DaySwap[] =>
+  rows
+    .filter((r) => r.amm_account === account && r.close_time >= from && r.close_time < to)
+    .map((r) => ({
+      ledger_index: r.ledger_index,
+      tx_index: r.tx_index,
+      closed: r.close_time,
+      taker: r.taker,
+      buyer: r.buyer,
+      base_amount: r.base_amount,
+      counter_amount: r.counter_amount,
+    }));
+
+/**
+ * A pool as stored, with the volumes its fees are converted by: the sums of each side of its swaps in `[from, to)` whose native
+ * leg is above the dust (the rule of the volumes, as `ammVolumeOracle` has it).
+ */
+function storedPool(rows: ExchangesRow[], account: string, from: number, to: number) {
+  const kept = rows.filter(
+    (r) =>
+      r.amm_account === account &&
+      r.close_time >= from &&
+      r.close_time < to &&
+      !(r.base_issuer === '' && new BigNumber(r.base_amount).lte(DUST)) &&
+      !(r.counter_issuer === '' && new BigNumber(r.counter_amount).lte(DUST)),
+  );
+  return {
+    base: asset({ currency: kept[0].base_currency, issuer: kept[0].base_issuer }),
+    counter: asset({ currency: kept[0].counter_currency, issuer: kept[0].counter_issuer }),
+    baseVolume: kept.reduce((sum, r) => sum.plus(r.base_amount), new BigNumber(0)),
+    counterVolume: kept.reduce((sum, r) => sum.plus(r.counter_amount), new BigNumber(0)),
+  };
+}
+
+interface Keyed {
+  ledger_index: number;
+  tx_index: number;
+}
+const byKey = (a: Keyed, b: Keyed): number => a.ledger_index - b.ledger_index || a.tx_index - b.tx_index;
+
+/**
+ * The fee state of a pool carried into the ledger `first`, and its changes in the ledgers `[first, last]`, from the rows the
+ * parser made, by looking at all of them (as the oracle of `amm_daily` does): each value is the newest non-null one of the
+ * state rows before `first`, the authorised accounts are those of the newest bid before it; the state rows and the bids of the
+ * range are the changes.
+ */
+function feeHistory(
+  states: AmmPoolStatesRow[],
+  bids: AmmGovernanceRow[],
+  account: string,
+  first: number,
+  last: number,
+): { carry: FeeState; events: FeeEvent[] } {
+  const own = states.filter((s) => s.amm_account === account).sort(byKey);
+  const ownBids = bids.filter((b) => b.amm_account === account).sort(byKey);
+  const newest = <K extends 'trading_fee' | 'auction_holder' | 'auction_discounted_fee' | 'auction_expiration'>(
+    field: K,
+  ): AmmPoolStatesRow[K] | null => {
+    let found: AmmPoolStatesRow[K] | null = null;
+    for (const s of own) if (s.ledger_index < first && s[field] !== null) found = s[field];
+    return found;
+  };
+  const lastBid = ownBids.filter((b) => b.ledger_index < first).pop();
+  const inRange = (r: Keyed): boolean => r.ledger_index >= first && r.ledger_index <= last;
+  return {
+    carry: {
+      trading_fee: newest('trading_fee'),
+      auction_holder: newest('auction_holder'),
+      auction_discounted_fee: newest('auction_discounted_fee'),
+      auction_expiration: newest('auction_expiration'),
+      auth_holder: lastBid?.slot_holder ?? null,
+      auth_accounts: lastBid?.auth_accounts ?? [],
+    },
+    events: [
+      ...own.filter(inRange).map((s) => ({
+        ledger_index: s.ledger_index,
+        tx_index: s.tx_index,
+        trading_fee: s.trading_fee,
+        auction_holder: s.auction_holder,
+        auction_discounted_fee: s.auction_discounted_fee,
+        auction_expiration: s.auction_expiration,
+      })),
+      ...ownBids.filter(inRange).map((b) => ({
+        ledger_index: b.ledger_index,
+        tx_index: b.tx_index,
+        bid: { holder: b.slot_holder, auth_accounts: b.auth_accounts },
+      })),
+    ],
+  };
+}
+
+/** The estimates of a set against what was wanted: NULL where NULL is wanted, the others to 12 significant digits. */
+function expectFees(label: string, got: Map<string, number | null>, want: Map<string, number | null>): void {
+  expect([label, [...got.keys()].sort()]).toEqual([label, [...want.keys()].sort()]);
+  for (const [component, fees] of want) {
+    if (fees === null) expect([label, component, got.get(component)]).toEqual([label, component, null]);
+    else close(`${label} ${component} fees_est_f`, got.get(component) as number, fees);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -524,6 +659,34 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
       // 2026-10-16: USDV / WGTS: no rate for either side: dropped, though it swapped
       expect(swapsOf('2026-10-16').some((e) => e.amm_account === 'r9jBi69nTXhrxcZBFSkpa1WnioGt552mky')).toBe(true);
       expect(converted('2026-10-16').some((c) => c.component === 'r9jBi69nTXhrxcZBFSkpa1WnioGt552mky')).toBe(false);
+    });
+
+    it('fees_est_f of the live day set is the oracle: swapTotals over the stored swaps of each pool, converted by componentFeesEst', async () => {
+      const states = AMM_BUILT.flatMap((b) => b.ammPoolStates);
+      const bids = AMM_BUILT.flatMap((b) => b.ammGovernance).filter((g) => g.kind === 'bid');
+      const tally = { known: 0, unknown: 0 };
+      // the live day that ends at the end of each day of the fixtures: every swap is in one of them
+      for (const day of days) {
+        const end = unix(`${day}T00:00:00Z`) + DAY;
+        const start = end - DAY;
+        await computeLiveVolumeSet(ch, rates(ch), MARKETS, 'amm_volume', 'day', at(end));
+        const ledgers = AMM_LEDGERS.map((l) => l.header)
+          .filter((h) => h.close_time >= start && h.close_time < end)
+          .map((h) => h.ledger_index);
+        const want = new Map<string, number | null>([['', null]]);
+        for (const c of ammVolumeOracle(MARKETS, AMM_EXCHANGES, start, end)) {
+          const { carry, events } = feeHistory(states, bids, c.component, Math.min(...ledgers), Math.max(...ledgers));
+          const totals = swapTotals(c.component, swapsIn(AMM_EXCHANGES, c.component, start, end), carry, events);
+          const fees = componentFeesEst(c, storedPool(AMM_EXCHANGES, c.component, start, end), totals);
+          want.set(c.component, fees === null ? null : fees.toNumber());
+          tally[fees === null ? 'unknown' : 'known']++;
+        }
+        expectFees(day, await liveFees(ch, 'day'), want);
+      }
+      // the recordings are a few ledgers of pools in the middle of their lives: most pools were first seen there without their
+      // AMM node, so a fee of theirs is not known (NULL); two have an estimate, one from the fees of its base priced by the pool
+      // (2026-10-08), one from the fees of its native side (2026-10-17). The world made by hand below has the other cases.
+      expect(tally).toEqual({ known: 2, unknown: 52 });
     });
   });
 
@@ -1145,6 +1308,300 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
         rate_f: 0,
       });
       expectAmm(await dailySet(ch, D1_KEY), ammVolumeOracle(NO_MARKETS, rows(), D1, D2));
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('fees_est: the fee estimates of the live day set (D2b.3)', () => {
+    // the live day that ends at FN (2026-02-20 12:00): the ledgers 600-603 are in it, 590 and 595 before it, 610 after it
+    const FN = Date.UTC(2026, 1, 20, 12) / SEC;
+    const FEE_CLOSES = new Map<number, number>([
+      [590, FN - 3 * DAY],
+      [595, FN - 2 * DAY],
+      [600, FN - 20 * HOUR],
+      [601, FN - 15 * HOUR],
+      [602, FN - 10 * HOUR],
+      [603, FN - 5 * HOUR],
+      [610, FN + HOUR],
+    ]);
+    const TAKER = 'rTakerOfASwap00000000000000000000';
+    const HOLDER = 'rSlotHolder000000000000000000000';
+    const FRIEND = 'rSlotFriend000000000000000000000';
+    const HOLDER_2 = 'rSlotHolderTwo00000000000000000';
+    const FRIEND_2 = 'rSlotFriendTwo00000000000000000';
+    /** In ripple seconds: the slot of FB ends 12 hours before FN, inside the window; that of FC long after it. */
+    const SLOT_B_ENDS = FN - 12 * HOUR - RIPPLE_EPOCH_S;
+    const SLOT_C_ENDS = FN + 10 * DAY - RIPPLE_EPOCH_S;
+
+    const FA = pool('rFeePoolA', USD, XRP); // a fee carried into the window, a vote inside it, a dust swap
+    const FB = pool('rFeePoolB', XRP, ZED); // the native currency as its base (turned round): a slot that ends in the window
+    const FC = pool('rFeePoolC', EUR, USD); // converted through its counter: a slot bid inside the window
+    const FD = pool('rFeePoolD', GBP, XRP); // first seen inside the window without its AMM node: no fee is known
+    const POOLS_F = new Map([FA, FB, FC, FD].map((p) => [p.account, p]));
+
+    /** A state row with only the values given: the row of a swap says nothing of the fee or the slot. */
+    const feeState = (
+      p: PoolDef,
+      ledger: number,
+      tx: number,
+      over: Partial<AmmPoolStatesRow> = {},
+    ): AmmPoolStatesRow => ({
+      ...stateRow(p, ledger, tx),
+      close_time: FEE_CLOSES.get(ledger) as number,
+      reserve_base: null,
+      reserve_counter: null,
+      lp_supply: null,
+      lp_currency: null,
+      reserve_base_f: null,
+      reserve_counter_f: null,
+      lp_supply_f: null,
+      trading_fee: null,
+      auction_holder: null,
+      auction_price: null,
+      auction_price_f: null,
+      auction_discounted_fee: null,
+      auction_expiration: null,
+      ...over,
+    });
+    /** A swap; `into` is the side the pool received (the buyer received base: the pool when base flowed in). */
+    const feeSwap = (
+      p: PoolDef,
+      ledger: number,
+      tx: number,
+      taker: string,
+      into: 'base' | 'counter',
+      base: string,
+      counter: string,
+    ): ExchangesRow => ({
+      ...exchangeRow(p, ledger, tx, base, counter, p.account),
+      close_time: FEE_CLOSES.get(ledger) as number,
+      buyer: into === 'base' ? p.account : taker,
+      seller: into === 'base' ? taker : p.account,
+      taker,
+    });
+    const feeBid = (
+      p: PoolDef,
+      ledger: number,
+      tx: number,
+      holder: string,
+      auth: string[],
+      discounted: number,
+      expiration: number,
+    ): AmmGovernanceRow => ({
+      ...SAMPLE_ROWS[Table.AmmGovernance],
+      amm_account: p.account,
+      ledger_index: ledger,
+      tx_index: tx,
+      tx_hash: hash(ledger * 1000 + tx),
+      close_time: FEE_CLOSES.get(ledger) as number,
+      kind: 'bid',
+      account: holder,
+      fee_voted: null,
+      trading_fee_after: null,
+      slot_holder: holder,
+      slot_discounted_fee: discounted,
+      slot_expiration: expiration,
+      auth_accounts: auth,
+    });
+
+    /** The fees each swap pays, worked out on paper, are in its comment (the fee in units of 1/100000 of the input). */
+    const SWAPS_F: ExchangesRow[] = [
+      feeSwap(FA, 595, 0, TAKER, 'base', '1000', '2000'), // before the window: nothing
+      feeSwap(FA, 600, 0, TAKER, 'counter', '50', '100'), // the fee of 300 carried in: 0.3 XRP
+      feeSwap(FB, 600, 1, HOLDER, 'base', '100', '50'), // the holder of the slot carried in, 20: 0.02 XRP
+      feeSwap(FB, 600, 2, FRIEND, 'counter', '30', '15'), // an account of the holder's bid, 20: 0.003 ZED
+      feeSwap(FC, 600, 3, TAKER, 'base', '10', '12'), // the fee of 1000 carried in: 0.1 EUR
+      feeSwap(FD, 600, 4, TAKER, 'base', '4', '2'), // no fee known: the GBP fees are not known
+      feeSwap(FA, 602, 0, TAKER, 'base', '20', '40'), // the fee of 500 voted at 601: 0.1 USD
+      feeSwap(FB, 602, 1, HOLDER, 'base', '10', '5'), // the slot ended at FN - 12h: the fee of 200, 0.02 XRP
+      feeSwap(FC, 602, 2, FRIEND_2, 'counter', '5', '6'), // an account of the bid of 601, 100: 0.006 USD
+      feeSwap(FA, 603, 0, TAKER, 'counter', '10', '20'), // 500: 0.1 XRP
+      feeSwap(FA, 603, 1, TAKER, 'base', '1', '0.0004'), // native dust: in no volume, but 500 of it is 0.005 USD
+      feeSwap(FC, 603, 2, HOLDER_2, 'base', '5', '25'), // the holder of the slot of 601, 100: 0.005 EUR
+      feeSwap(FA, 610, 0, TAKER, 'counter', '7', '14'), // after the window: nothing
+    ];
+    const STATES_F: AmmPoolStatesRow[] = [
+      feeState(FA, 590, 0, { tx_type: 'AMMCreate', trading_fee: 300 }),
+      feeState(FB, 590, 1, { tx_type: 'AMMCreate', trading_fee: 200 }),
+      feeState(FB, 590, 2, {
+        tx_type: 'AMMBid',
+        trading_fee: 200,
+        auction_holder: HOLDER,
+        auction_discounted_fee: 20,
+        auction_expiration: SLOT_B_ENDS,
+      }),
+      feeState(FC, 590, 3, { tx_type: 'AMMCreate', trading_fee: 1000 }),
+      feeState(FA, 601, 0, { tx_type: 'AMMVote', trading_fee: 500 }),
+      feeState(FC, 601, 1, {
+        tx_type: 'AMMBid',
+        trading_fee: 1000,
+        auction_holder: HOLDER_2,
+        auction_discounted_fee: 100,
+        auction_expiration: SLOT_C_ENDS,
+      }),
+      // every swap changes the state of its pool
+      ...SWAPS_F.map((s) => feeState(POOLS_F.get(s.amm_account) as PoolDef, s.ledger_index, s.tx_index)),
+    ];
+    const BIDS_F: AmmGovernanceRow[] = [
+      feeBid(FB, 590, 2, HOLDER, [FRIEND], 20, SLOT_B_ENDS),
+      feeBid(FC, 601, 1, HOLDER_2, [FRIEND_2], 100, SLOT_C_ENDS),
+    ];
+    let ch: ClickHouseService;
+
+    beforeAll(async () => {
+      ch = await fresh();
+      await ch.insert(Table.Exchanges, SWAPS_F);
+      await ch.insert(Table.AmmPoolStates, STATES_F);
+      await ch.insert(
+        Table.AmmPoolTouches,
+        STATES_F.map((s) => ({ ledger_index: s.ledger_index, tx_index: s.tx_index, amm_account: s.amm_account })),
+      );
+      await ch.insert(Table.AmmGovernance, BIDS_F);
+      await ch.insert(
+        Table.Ledgers,
+        [...FEE_CLOSES].map(([ledger, close]) => ({
+          ...SAMPLE_ROWS[Table.Ledgers],
+          ledger_index: ledger,
+          ledger_hash: String(ledger).padStart(64, 'F'),
+          close_time: close,
+        })),
+      );
+    });
+
+    it('fees_est against swapTotals: the live day set carries, per pool, the fees of the window converted like converted_amount', async () => {
+      await computeLiveVolumeSet(ch, rates(ch), HAND_MARKETS, 'amm_volume', 'day', at(FN));
+      const [start, end] = [FN - DAY, FN];
+      // the components are those of the volumes: 160, 140, 86 and 2 XRP
+      expectAmm(await liveSet(ch, 'day'), ammVolumeOracle(HAND_MARKETS, SWAPS_F, start, end));
+      expect(parts(await liveSet(ch, 'day')).map((r) => r.component)).toEqual([FA, FB, FC, FD].map((p) => p.account));
+
+      // the swaps of the window charged by swapTotals, with the fee state each pool came in with and its changes in the window
+      const none: FeeState = {
+        trading_fee: null,
+        auction_holder: null,
+        auction_discounted_fee: null,
+        auction_expiration: null,
+        auth_holder: null,
+        auth_accounts: [],
+      };
+      const totals = new Map([
+        [
+          FA.account,
+          swapTotals(FA.account, swapsIn(SWAPS_F, FA.account, start, end), { ...none, trading_fee: 300 }, [
+            { ledger_index: 601, tx_index: 0, trading_fee: 500 },
+          ]),
+        ],
+        [
+          FB.account,
+          swapTotals(
+            FB.account,
+            swapsIn(SWAPS_F, FB.account, start, end),
+            {
+              trading_fee: 200,
+              auction_holder: HOLDER,
+              auction_discounted_fee: 20,
+              auction_expiration: SLOT_B_ENDS,
+              auth_holder: HOLDER,
+              auth_accounts: [FRIEND],
+            },
+            [],
+          ),
+        ],
+        [
+          FC.account,
+          swapTotals(FC.account, swapsIn(SWAPS_F, FC.account, start, end), { ...none, trading_fee: 1000 }, [
+            {
+              ledger_index: 601,
+              tx_index: 1,
+              trading_fee: 1000,
+              auction_holder: HOLDER_2,
+              auction_discounted_fee: 100,
+              auction_expiration: SLOT_C_ENDS,
+            },
+            { ledger_index: 601, tx_index: 1, bid: { holder: HOLDER_2, auth_accounts: [FRIEND_2] } },
+          ]),
+        ],
+        [FD.account, swapTotals(FD.account, swapsIn(SWAPS_F, FD.account, start, end), none, [])],
+      ]);
+      // the fees by side of the stored pool, as the comments of the swaps say
+      expect([...totals].map(([account, t]) => [account, t.fees_base_est, t.fees_counter_est])).toEqual([
+        [FA.account, '0.105', '0.4'],
+        [FB.account, '0.04', '0.003'],
+        [FC.account, '0.105', '0.006'],
+        [FD.account, null, '0'],
+      ]);
+
+      // converted like converted_amount: FA 0.105 USD x 160 / 80 + 0.4 XRP; FB (turned round: the amount is the 70 ZED) 0.04
+      // XRP + 0.003 ZED x 140 / 70; FC (through USD, swapped: the amount is the 43 USD, 86 XRP) 0.006 USD x 86 / 43 + 0.105 EUR
+      // x 86 / 20; FD not known; the sentinel has none
+      const got = await liveFees(ch, 'day');
+      expectFees(
+        'on paper',
+        got,
+        new Map([
+          ['', null],
+          [FA.account, 0.61],
+          [FB.account, 0.046],
+          [FC.account, 0.4635],
+          [FD.account, null],
+        ]),
+      );
+      // and componentFeesEst of the components of the oracle of the volumes, the pools as stored and those totals says the same
+      const want = new Map<string, number | null>([['', null]]);
+      for (const c of ammVolumeOracle(HAND_MARKETS, SWAPS_F, start, end)) {
+        const fees = componentFeesEst(
+          c,
+          storedPool(SWAPS_F, c.component, start, end),
+          totals.get(c.component) as SwapTotals,
+        );
+        want.set(c.component, fees === null ? null : fees.toNumber());
+      }
+      expectFees('oracle', got, want);
+    });
+
+    it('only the day live set has fees_est_f; the other periods, the daily sets and the other metrics have NULL', async () => {
+      // only the set with estimates reads the fee state: the bids are read for it and for no other set
+      const spy = jest.spyOn(ch, 'query');
+      const readBids = (): boolean =>
+        spy.mock.calls.some(([sql]) => String(sql).includes(`FROM ${Table.AmmGovernance}`));
+      for (const metric of VOLUME_METRICS) {
+        for (const period of livePeriodsOf(metric)) {
+          spy.mockClear();
+          await computeLiveVolumeSet(ch, rates(ch), HAND_MARKETS, metric, period, at(FN));
+          expect([metric, period, readBids()]).toEqual([metric, period, metric === 'amm_volume' && period === 'day']);
+        }
+      }
+      // the daily sets of the two days of the window: volume_daily has no column for an estimate, and none is computed
+      for (const day of [FN - DAY, FN]) {
+        spy.mockClear();
+        await computeDailyVolumeSet(ch, rates(ch), HAND_MARKETS, 'amm_volume', at(day));
+        expect(readBids()).toBe(false);
+      }
+      spy.mockRestore();
+
+      const sets = await ch.query<{ metric: string; period: string; components: number; estimates: number }>(
+        `SELECT metric, period, toUInt32(countIf(component != '')) AS components,
+                toUInt32(countIf(fees_est_f IS NOT NULL)) AS estimates
+           FROM ${Table.VolumeLive}
+          WHERE (metric, period, version) IN (SELECT metric, period, max(version) FROM ${Table.VolumeLive} GROUP BY metric, period)
+          GROUP BY metric, period
+          ORDER BY metric, period`,
+      );
+      expect(sets).toEqual([
+        { metric: 'amm_volume', period: '30day', components: 4, estimates: 0 },
+        { metric: 'amm_volume', period: '3day', components: 4, estimates: 0 },
+        { metric: 'amm_volume', period: '7day', components: 4, estimates: 0 },
+        { metric: 'amm_volume', period: 'day', components: 4, estimates: 3 },
+        { metric: 'amm_volume', period: 'hour', components: 0, estimates: 0 },
+        { metric: 'payment_volume', period: 'day', components: 0, estimates: 0 },
+        { metric: 'payment_volume', period: 'hour', components: 0, estimates: 0 },
+        // the swaps of FA are trades of the configured market USD/XRP
+        { metric: 'trade_volume', period: '30day', components: 1, estimates: 0 },
+        { metric: 'trade_volume', period: '3day', components: 1, estimates: 0 },
+        { metric: 'trade_volume', period: '7day', components: 1, estimates: 0 },
+        { metric: 'trade_volume', period: 'day', components: 1, estimates: 0 },
+        { metric: 'trade_volume', period: 'hour', components: 0, estimates: 0 },
+      ]);
     });
   });
 

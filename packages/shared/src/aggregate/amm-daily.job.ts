@@ -17,7 +17,7 @@ import {
   Valued,
   valueNative,
 } from './amm-pools.job';
-import { AMM_CHUNK, AMM_SWAPS_WHERE, AMM_TOUCHED_POOLS_SQL, ammChunks, ammSwapParams } from './amm-reads';
+import { AMM_CHUNK, AMM_SWAPS_WHERE, AMM_TOUCHED_POOLS_SQL, ammChunks, ammSwapParams, PairColumns } from './amm-reads';
 import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTLE_MS } from './volume.job';
 
 /**
@@ -53,7 +53,8 @@ import { at, DAY_SECONDS, dayKey, dayStartSeconds, nextVersion, VOLUME_DAY_SETTL
  *    once the slot ran out, and the slot stays in the AMM object after that). A swap with no fee known (the pool was first
  *    seen without its AMM node, so nothing says the fee yet) adds its volume, and makes the estimate of its side unknown: null,
  *    not 0, for a sum without it would understate the fees (Ruling R-A26, which amends R-A20). A side without swaps, and a side
- *    whose swaps all had a known fee (also of 0), has a number.
+ *    whose swaps all had a known fee (also of 0), has a number. The AMM volume's live day set charges the swaps of its window
+ *    the same way (`ammWindowSwapTotals`, D2b.3).
  *  - **Liquidity.** A create counts as a deposit and a clawback as a withdrawal; a delete counts as neither. The amounts are
  *    the pool's signed changes, the positive part of each side is "in" and the negative part "out".
  *  - **Closing state.** Each field is its newest non-null value over the pool's state rows up to the last ledger of the day,
@@ -431,16 +432,23 @@ async function swapsOf(
   closing: readonly ClosingRow[],
   ledgers: DayLedgers,
 ): Promise<Map<string, DaySwap[]>> {
-  const rows = await ch.query<SwapRow>(
-    AMM_DAILY_SWAPS_SQL,
-    ammSwapParams(
-      closing.map((c) => ({
-        account: c.amm_account,
-        pair: [c.asset_base_currency, c.asset_base_issuer, c.asset_counter_currency, c.asset_counter_issuer] as const,
-      })),
-      ledgers,
-    ),
+  return poolSwaps(
+    ch,
+    closing.map((c) => ({
+      account: c.amm_account,
+      pair: [c.asset_base_currency, c.asset_base_issuer, c.asset_counter_currency, c.asset_counter_issuer] as const,
+    })),
+    ledgers,
   );
+}
+
+/** The swaps of some pools in a range of ledgers, each read through the pair of its pool: one query for all the pairs. */
+async function poolSwaps(
+  ch: ClickHouseService,
+  pools: ReadonlyArray<{ account: string; pair: PairColumns }>,
+  ledgers: DayLedgers,
+): Promise<Map<string, DaySwap[]>> {
+  const rows = await ch.query<SwapRow>(AMM_DAILY_SWAPS_SQL, ammSwapParams(pools, ledgers));
   return byPool(
     rows,
     (r): DaySwap => ({
@@ -612,6 +620,54 @@ async function poolDays(
   await valueNative(rates, valued, undefined);
   rows.forEach((row, i) => (row.value_native = valued[i].row.value_native));
   return rows;
+}
+
+/**
+ * The volume and the estimated fees of the swaps of some pools in a range of ledgers, charged as the swaps of a day are
+ * (`swapTotals`): every swap of the pools in the ledgers (no dust rule), the fee state each pool was carried into the first
+ * ledger with (the fill-forward of the fee and of the auction slot over its state rows before that ledger, from a window and
+ * then further back if need be, and its newest bid before it) and the changes of that state in the range (its state rows that
+ * say something of the fee or the slot, and its bids). The AMM volume's live day set prices its fee estimates with it (D2b.3):
+ * `pools` are its pools, each with its pair as `exchanges` stores it, and `ledgers` the committed ledgers of its window. Every
+ * pool of `pools` is in the answer, with zeros when it has no swap. The pools are read in chunks of `AMM_DAILY_CHUNK`, each a
+ * few round trips (the swaps, the window of the states, the fee events and the bids) and one per step of the walk back, as the
+ * carry-in of a day costs (see Cost above).
+ */
+export async function ammWindowSwapTotals(
+  ch: ClickHouseService,
+  pools: readonly { account: string; pair: PairColumns }[],
+  ledgers: { first: number; last: number },
+): Promise<Map<string, SwapTotals>> {
+  const totals = new Map<string, SwapTotals>();
+  // the carry-in is the state before the first ledger, so the window ends just before it (the carry columns read only the
+  // rows before `first`: a range that starts at ledger 0 reads that ledger and takes nothing from it)
+  const upTo = Math.max(0, ledgers.first - 1);
+  const from = Math.max(0, ledgers.first - AMM_FILL_WINDOW_LEDGERS);
+  const query = dailyQuery(ledgers.first, CARRY_REQUIRED);
+  for (const chunk of ammChunks(pools, AMM_DAILY_CHUNK)) {
+    const accounts = chunk.map((p) => p.account);
+    const [swaps, windowed, { events, carried }] = await Promise.all([
+      poolSwaps(ch, chunk, ledgers),
+      readFill<ClosingRow>(ch, accounts, from, upTo, query),
+      feeEventsOf(ch, accounts, ledgers),
+    ]);
+    const filled = new Map(windowed.map((row) => [row.amm_account, row]));
+    await deepenFill(ch, filled, accounts, upTo, from, query);
+    for (const account of accounts) {
+      const c = filled.get(account);
+      const bid = carried.get(account);
+      const carry: FeeState = {
+        trading_fee: nullable(c?.carry_trading_fee),
+        auction_holder: c?.carry_auction_holder ?? null,
+        auction_discounted_fee: nullable(c?.carry_auction_discounted_fee),
+        auction_expiration: nullable(c?.carry_auction_expiration),
+        auth_holder: bid?.slot_holder ?? null,
+        auth_accounts: bid?.auth_accounts ?? [],
+      };
+      totals.set(account, swapTotals(account, swaps.get(account) ?? [], carry, events.get(account) ?? []));
+    }
+  }
+  return totals;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

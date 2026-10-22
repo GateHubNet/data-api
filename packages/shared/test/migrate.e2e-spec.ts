@@ -239,6 +239,9 @@ const MIGRATION_003_TABLES: Table[] = [
   Table.AccountTradesDaily,
 ];
 
+/** The fee estimates of the AMM volume's live day set (D2b): one column of `volume_live`. */
+const MIGRATION_004 = '004_amm_fee_estimates.sql';
+
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
   Table.Ledgers,
@@ -668,6 +671,20 @@ describe('migrations (e2e)', () => {
         });
       });
 
+      it('gives volume_live a fees_est_f Nullable(Float64) after its version (004), and volume_daily none', async () => {
+        const columnsOf = (table: Table) =>
+          svc.query<{ name: string; type: string }>(
+            `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position`,
+            { db: 'xahau', t: table },
+          );
+        expect((await columnsOf(Table.VolumeLive)).slice(-2)).toEqual([
+          { name: 'version', type: 'UInt64' },
+          { name: 'fees_est_f', type: 'Nullable(Float64)' },
+        ]);
+        // the fee estimates are those of the AMM volume's live day set: a daily set has none
+        expect((await columnsOf(Table.VolumeDaily)).map((c) => c.name)).not.toContain('fees_est_f');
+      });
+
       it('expires validations after 90 days of last_datetime', async () => {
         const row = await svc.queryOne<{ create_table_query: string }>(
           `SELECT create_table_query FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
@@ -1067,11 +1084,12 @@ describe('migrations (e2e)', () => {
         expect(await tableNames()).toContain(Table.UnlPublishers);
         expect(await tableNames()).not.toContain(Table.ValidatorDomains);
 
-        // The real directory: 002 runs again from its first statement and completes, and 003, which comes after it, is applied too.
+        // The real directory: 002 runs again from its first statement and completes, and 003 and 004, which come after it, are
+        // applied too.
         process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
         const result = await runMigrations({ config, log });
         expect(result).toEqual({
-          applied: ['002_validators_amendments.sql', MIGRATION_003],
+          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004],
           skipped: ['001_baseline.sql'],
         });
 
@@ -1164,6 +1182,71 @@ describe('migrations (e2e)', () => {
       const names = await tablesOf(config.database);
       for (const table of MIGRATION_003_TABLES) expect(names).toContain(table);
       expect(names).not.toContain(Table.ValidatorVotes);
+    });
+  });
+
+  describe('migration 004', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-004-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('is the one statement that adds the column', () => {
+      expect(statementsOf(readFileSync(join(REAL_SCHEMA_DIR, MIGRATION_004), 'utf8'))).toEqual([
+        'ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS fees_est_f Nullable(Float64)',
+      ]);
+    });
+
+    it('applies 004 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_004_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_004);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_004);
+      const feesColumn = async () =>
+        admin.query<{ type: string }>(
+          `SELECT type FROM system.columns WHERE database = {db:String} AND table = {t:String} AND name = 'fees_est_f'`,
+          { db: config.database, t: Table.VolumeLive },
+        );
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await feesColumn()).toEqual([]);
+      const svc = new ClickHouseService(config);
+      try {
+        // a live row written before the column was there
+        const { fees_est_f: _fees, ...older } = SAMPLE_ROWS[Table.VolumeLive];
+        await svc.insert(Table.VolumeLive, [older]);
+
+        copyReal([MIGRATION_004]);
+        expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_004], skipped: before });
+        expect(await feesColumn()).toEqual([{ type: 'Nullable(Float64)' }]);
+        // reads as not known
+        expect(await svc.query(`SELECT component, fees_est_f FROM ${Table.VolumeLive}`)).toEqual([
+          { component: older.component, fees_est_f: null },
+        ]);
+
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.onModuleDestroy();
+      }
     });
   });
 });

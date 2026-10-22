@@ -587,11 +587,16 @@ export interface VolumeDailyRow {
   version: UInt64Value;
 }
 
-/** The `volume_daily` columns with `period`, `start_time` and `end_time` in place of `day`. */
+/** The `volume_daily` columns with `period`, `start_time` and `end_time` in place of `day`, and the fee estimates. */
 export interface VolumeLiveRow extends Omit<VolumeDailyRow, 'day'> {
   period: string;
   start_time: UnixSeconds;
   end_time: UnixSeconds;
+  /**
+   * The estimated fees of the pool's swaps in the window, in the native currency: on the components of the `amm_volume` set of
+   * the period `day` only (D2b.3). NULL when they are not known, on the sentinel and on every row of the other sets.
+   */
+  fees_est_f: number | null;
 }
 
 /** The current state of a pool, rebuilt by the aggregator from `amm_pool_states`. The newest `version` wins. */

@@ -552,6 +552,7 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     converted_f: 500.25,
     config_version: 3,
     version: 1,
+    fees_est_f: 1.25,
   },
   [Table.AmmPools]: {
     amm_account: POOL,

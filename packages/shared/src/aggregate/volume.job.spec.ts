@@ -1,8 +1,11 @@
+import BigNumber from 'bignumber.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { MarketsConfig } from '../network/network-profile';
+import { SwapTotals } from './amm-daily.job';
 import {
   assertValidMarketsConfig,
+  componentFeesEst,
   computeDailyVolumeSet,
   computeLiveVolumeSet,
   LIVE_PERIOD_SECONDS,
@@ -268,5 +271,75 @@ describe('the set functions refuse before they read', () => {
     await expect(computeDailyVolumeSet(never, rates, config(), 'trade_volume', new Date(NaN))).rejects.toThrow(
       RangeError,
     );
+  });
+});
+
+describe('componentFeesEst', () => {
+  const GBP = { currency: 'GBP', issuer: ISSUER };
+  const ZED = { currency: 'ZED', issuer: ISSUER };
+  const ZRO = { currency: 'ZRO', issuer: ISSUER };
+  const n = (value: BigNumber.Value): BigNumber => new BigNumber(value);
+  /** The fees of the window by side of the stored pool; the counts and volumes of `swapTotals` play no part. */
+  const totals = (fees_base_est: string | null, fees_counter_est: string | null): SwapTotals => ({
+    count: 3,
+    volume_base: '1',
+    volume_counter: '1',
+    fees_base_est,
+    fees_counter_est,
+  });
+  // USD/XRP: 80 USD and 160 XRP went through the pool; the component is the 80 USD, converted to its 160 XRP
+  const usdXrp = { base: USD, counter: XRP, baseVolume: n(80), counterVolume: n(160) };
+  const usdComponent = { base: USD, amount: n(80), converted: n(160) };
+
+  it('a pool against the native currency: the fees of its base at the pool price, its native fees worth themselves', () => {
+    // 0.105 USD x 160 / 80 + 0.4 XRP
+    expect(componentFeesEst(usdComponent, usdXrp, totals('0.105', '0.4'))?.toFixed()).toBe('0.61');
+    // XRP/ZED is stored with the native currency as its base and turned round: the component is the 70 ZED, converted to the
+    // 140 XRP; the fees of the stored counter (ZED) are those of the side of the amount: 0.04 XRP + 0.003 ZED x 140 / 70
+    const xrpZed = { base: XRP, counter: ZED, baseVolume: n(140), counterVolume: n(70) };
+    expect(
+      componentFeesEst({ base: ZED, amount: n(70), converted: n(140) }, xrpZed, totals('0.04', '0.003'))?.toFixed(),
+    ).toBe('0.046');
+  });
+
+  it('a pool converted through its counter: the side of the amount is the stored counter, the other side is the stored base', () => {
+    // EUR/USD: 20 EUR and 43 USD; EUR has no rate, USD 0.5 a coin: the component is the 43 USD, converted to 86 XRP.
+    // 0.006 USD x 86 / 43 + 0.105 EUR x 86 / 20 (the EUR priced in USD by the pool, 43 / 20, then converted)
+    const eurUsd = { base: EUR, counter: USD, baseVolume: n(20), counterVolume: n(43) };
+    expect(
+      componentFeesEst({ base: USD, amount: n(43), converted: n(86) }, eurUsd, totals('0.105', '0.006'))?.toFixed(),
+    ).toBe('0.4635');
+    // the same pool converted through its base (a rate of EUR, 2 a coin): the component is the 20 EUR, converted to 10 XRP.
+    // 0.105 EUR x 10 / 20 + 0.006 USD x 10 / 43 = 0.0525 + 0.00139534883720930232558...
+    expect(
+      componentFeesEst({ base: EUR, amount: n(20), converted: n(10) }, eurUsd, totals('0.105', '0.006'))?.toFixed(18),
+    ).toBe('0.053895348837209302');
+  });
+
+  it('a side whose fees are not known (a swap with no known fee, Ruling R-A26) makes the estimate unknown, on either side', () => {
+    expect(componentFeesEst(usdComponent, usdXrp, totals(null, '0.4'))).toBeNull();
+    expect(componentFeesEst(usdComponent, usdXrp, totals('0.105', null))).toBeNull();
+    expect(componentFeesEst(usdComponent, usdXrp, totals(null, null))).toBeNull();
+  });
+
+  it('a side with fees and no volume to price them by has no estimate: the fees count every swap, the volumes only the kept ones (D8)', () => {
+    // GBP/USD through the rate of GBP: no USD went through the pool among the kept swaps, but a dust swap paid a USD fee
+    const gbpUsd = { base: GBP, counter: USD, baseVolume: n(60), counterVolume: n(0) };
+    const gbp = { base: GBP, amount: n(60), converted: n(12) };
+    expect(componentFeesEst(gbp, gbpUsd, totals('0.3', '0.001'))).toBeNull();
+    // XRP/ZRO, 1 XRP for no ZRO: the component is the 0 ZRO converted to its 1 XRP (a rate of 0), and a ZRO fee was paid
+    const xrpZro = { base: XRP, counter: ZRO, baseVolume: n(1), counterVolume: n(0) };
+    expect(
+      componentFeesEst({ base: ZRO, amount: n(0), converted: n(1) }, xrpZro, totals('0.003', '0.0001')),
+    ).toBeNull();
+  });
+
+  it('a side without fees adds 0, also when it has no volume (no division, no NaN), and no fees at all is an estimate of 0', () => {
+    expect(componentFeesEst(usdComponent, usdXrp, totals('0', '0'))?.toFixed()).toBe('0');
+    const xrpZro = { base: XRP, counter: ZRO, baseVolume: n(1), counterVolume: n(0) };
+    const zro = { base: ZRO, amount: n(0), converted: n(1) };
+    // 0 ZRO of fees on 0 ZRO of volume, and 0.003 XRP
+    expect(componentFeesEst(zro, xrpZro, totals('0.003', '0'))?.toFixed()).toBe('0.003');
+    expect(componentFeesEst(zro, xrpZro, totals('0', '0'))?.toFixed()).toBe('0');
   });
 });
