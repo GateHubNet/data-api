@@ -170,8 +170,14 @@ export class RoundsJob implements ComputeJob {
   }
 
   /**
-   * The first round of a database with none: the first voting ledger at or after the higher of the lowest ledger the oldest
-   * active partition of `validations` holds a validation of, and the lowest ledger of `ledgers`. None while either has nothing.
+   * The first round of a database with none: the first voting ledger at or after the higher of the lowest ledger of `validations`
+   * in the oldest active partition that holds a validation of a ledger (above 0), and the lowest ledger of `ledgers`. None while
+   * either has nothing.
+   *
+   * A partition that holds only records with no ledger index (0) says nothing about the ledgers and is passed over; were the
+   * oldest one such, the job would never start until the TTL dropped it. Each partition is found (`system.parts`) and read
+   * (`_partition_id`) on its own, oldest first: the common case is one cheap read, and the longest is one per partition held
+   * (about 90).
    */
   private async firstRound(): Promise<number | undefined> {
     // the ingest first: without a ledger there is nothing to look for in the partitions of `validations`
@@ -179,21 +185,27 @@ export class RoundsJob implements ComputeJob {
       `SELECT ledger_index FROM ${Table.Ledgers} ORDER BY ledger_index ASC LIMIT 1`,
     );
     if (ingested === undefined) return undefined;
-    const oldest = await this.ch.queryOne<{ oldest_partition: string }>(
-      `SELECT min(partition_id) AS oldest_partition
-         FROM system.parts
-        WHERE database = currentDatabase() AND table = {table:String} AND active`,
-      { table: Table.Validations },
-    );
-    if (!oldest?.oldest_partition) return undefined;
-    const voted = await this.ch.queryOne<{ lowest: number; validations: number | string }>(
-      `SELECT min(ledger_index) AS lowest, count() AS validations
-         FROM ${Table.Validations}
-        WHERE _partition_id = {partition:String} AND ledger_index > 0`,
-      { partition: oldest.oldest_partition },
-    );
-    if (voted === undefined || Number(voted.validations) === 0) return undefined;
-    return votingLedgerAtOrAfter(Math.max(Number(voted.lowest), Number(ingested.ledger_index)));
+    let after = '';
+    for (;;) {
+      const next = await this.ch.queryOne<{ next_partition: string }>(
+        `SELECT min(partition_id) AS next_partition
+           FROM system.parts
+          WHERE database = currentDatabase() AND table = {table:String} AND active AND partition_id > {after:String}`,
+        { table: Table.Validations, after },
+      );
+      // `min` of no partition is the empty string
+      if (!next?.next_partition) return undefined;
+      const voted = await this.ch.queryOne<{ lowest: number; validations: number | string }>(
+        `SELECT min(ledger_index) AS lowest, count() AS validations
+           FROM ${Table.Validations}
+          WHERE _partition_id = {partition:String} AND ledger_index > 0`,
+        { partition: next.next_partition },
+      );
+      if (voted !== undefined && Number(voted.validations) > 0) {
+        return votingLedgerAtOrAfter(Math.max(Number(voted.lowest), Number(ingested.ledger_index)));
+      }
+      after = next.next_partition;
+    }
   }
 
   /**
