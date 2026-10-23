@@ -92,8 +92,10 @@ GitHub Actions runs two workflows (`.github/workflows/`):
   A newer push to a pull request cancels its older run.
 - **`release.yml`**, on every pushed version tag: `v1.4.0`, or a pre-release such as `v1.4.0-rc.1`. It runs in order:
   1. **Version:** the tag must be a semantic version, `vMAJOR.MINOR.PATCH` with an optional `-pre-release` and no `+build`. As in
-     SemVer, numbers have no leading zeros, in the pre-release too. Anything else (`vtest`, `v1.4`, `v1.2.3-rc.01`) stops the run, and
-     nothing is published.
+     SemVer, numbers have no leading zeros, in the pre-release too. Any other tag releases nothing, and nothing is published:
+     - a tag that is not version-shaped, such as `vtest` or `v1.4`, starts no run at all, because the trigger only takes `v<n>.<n>.<n>`
+       and `v<n>.<n>.<n>-*`;
+     - a tag that has the shape but is not a semantic version, such as `v1.2.3-rc.01`, starts a run that stops at this step.
   2. **Test:** the whole of `ci.yml`.
   3. **Images:** both images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api` and
      `ghcr.io/gatehubnet/data-syncer`, tagged with the version without its `v` (`1.4.0`).
