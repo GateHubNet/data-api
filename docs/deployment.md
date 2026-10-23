@@ -101,7 +101,9 @@ GitHub Actions runs two workflows (`.github/workflows/`):
      published. Every release works this out again when it reaches this step, one release at a time. So:
      - a release that finishes after a newer one leaves `latest` on the newer one;
      - a late patch for an older line, such as `v1.3.5` after `v1.4.0`, publishes `1.3.5` and leaves `latest` alone;
-     - both images are always on the same version;
+     - both `latest` tags are pointed at the same version, one after the other. That is not atomic: if the second cannot be moved
+       (after three tries), the job fails and says which tag is on which version. Running the job again, or the next release, puts
+       both on the same version;
      - a registry error is retried, and if it persists the step fails and leaves `latest` alone. Only the registry's "not found"
        counts as not published.
   5. **Release:** the GitHub release of the tag. Its body is the changelog since the previous tag, made by [git-cliff](https://git-cliff.org)
@@ -121,8 +123,9 @@ no layer. The images are pushed with the workflow's own `GITHUB_TOKEN`.
 
 Pull requests from forks get no secrets, so their install fails. A new package on ghcr.io starts **private**: make it public under the
 organisation's Packages → the package → Package settings, if it should be pulled without a login. The compose files keep building their
-images from the checkout (`pull_policy: build`). To run a released image, use its ghcr.io name instead, for example
-`ghcr.io/gatehubnet/data-api:1.4.0`.
+images from the checkout (`pull_policy: build`). To run a released image, use its ghcr.io name instead. **Deploy by version, the
+same version for both images** (`ghcr.io/gatehubnet/data-api:1.4.0` with `ghcr.io/gatehubnet/data-syncer:1.4.0`), not by `latest`:
+the two `latest` tags move one after the other, and a deployment that pulls them at the wrong moment could get two versions.
 
 ## Schema migrations
 

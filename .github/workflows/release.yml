@@ -5,7 +5,8 @@
 #               without its v (1.4.0);
 #   4. latest   both images' latest pointed at the newest version tag (a pre-release included) whose images are published,
 #               worked out again by every run, one run at a time: a release that finishes after a newer one leaves latest on the
-#               newer one, and both images are always on the same version;
+#               newer one. The two latest tags are moved one after the other, not at once (deploy by version: see
+#               docs/deployment.md);
 #   5. release  the GitHub release of the tag: its body is the changelog since the previous tag (cliff.toml), which is also
 #               attached as CHANGELOG.md. A tag with a "-" is marked a pre-release.
 # A release exists only for a tag that is a version, whose tests passed and whose images are out.
@@ -139,7 +140,9 @@ jobs:
       # latest is the newest version tag (a pre-release included) whose two images are both published, whichever tag started
       # this run. The tags are read as they are now, so a run that finishes after a newer release points latest at the newer
       # one, not back at its own, and a newer tag whose images are not out yet (or never will be) is passed over. Both images
-      # always move to the same version. Only the registry's "not found" passes a tag over: any other failure to inspect is
+      # are pointed at the same version, one after the other: not at once, so if the second cannot be moved the job says which
+      # tag is where and fails, and running it again (or the next release) puts both on the same version. Only the registry's
+      # "not found" passes a tag over: any other failure to inspect is
       # retried, and if it persists the job fails and latest stays where it is, rather than going back to an older version
       # because the newest could not be seen.
       - name: Point latest at the newest published version
@@ -203,8 +206,28 @@ jobs:
           if [ "v$target" != "$GITHUB_REF_NAME" ]; then
             echo "::notice::latest goes to $target, the newest published version, not to this run's $GITHUB_REF_NAME."
           fi
+          # A command, up to three times.
+          retried() {
+            local attempt
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              echo "attempt $attempt of 3 failed: $*"
+              [ "$attempt" -eq 3 ] || sleep $((attempt * 10))
+            done
+            return 1
+          }
+
+          moved=""
           for image in data-api data-syncer; do
-            docker buildx imagetools create --tag "$NAMESPACE/$image:latest" "$NAMESPACE/$image:$target"
+            if ! retried docker buildx imagetools create --tag "$NAMESPACE/$image:latest" "$NAMESPACE/$image:$target"; then
+              if [ -n "$moved" ]; then
+                echo "::error::$NAMESPACE/$moved:latest is on $target, but $NAMESPACE/$image:latest could not be moved: the two latest tags are on different versions until this job is run again."
+              else
+                echo "::error::$NAMESPACE/$image:latest could not be moved to $target: neither latest tag changed."
+              fi
+              exit 1
+            fi
+            moved="$image"
           done
 
   release:
