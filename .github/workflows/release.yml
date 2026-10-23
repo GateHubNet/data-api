@@ -154,8 +154,9 @@ jobs:
               if error="$(docker buildx imagetools inspect "$ref" 2>&1 > /dev/null)"; then
                 return 0
               fi
+              # Buildx says a missing tag as "<ref>: not found" (v0.37) or "reference <ref> not found"; both name the image.
               case "$error" in
-                *"$ref: not found"*) return 1 ;;
+                *"$ref: not found"* | *"reference $ref not found"*) return 1 ;;
               esac
               echo "inspecting $ref failed (attempt $attempt of 3): $error"
               [ "$attempt" -eq 3 ] || sleep $((attempt * 10))
