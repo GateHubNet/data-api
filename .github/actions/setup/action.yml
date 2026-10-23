@@ -1,0 +1,36 @@
+name: Set up the workspace
+description: >-
+  Node, pnpm (the version package.json's packageManager names), the npm token the private @gatehub/toolbox needs, and a
+  frozen install of the workspace.
+
+inputs:
+  npm-token:
+    description: The npm token that can read @gatehub/toolbox (the NPM_TOKEN secret).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v6
+
+    # Node 22, as in the images (apps/*/Dockerfile: node:22.23.2-bookworm-slim).
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22.23.2
+        cache: pnpm
+
+    # The repo's .npmrc leaves the token out; the user .npmrc carries it, as in the Dockerfiles.
+    - name: Authenticate to npm
+      shell: bash
+      env:
+        NPM_TOKEN: ${{ inputs.npm-token }}
+      run: |
+        if [ -z "$NPM_TOKEN" ]; then
+          echo "::error::The NPM_TOKEN secret is not set: the install needs a token that can read @gatehub/toolbox."
+          exit 1
+        fi
+        printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$HOME/.npmrc"
+
+    - name: Install
+      shell: bash
+      run: pnpm install --frozen-lockfile

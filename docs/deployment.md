@@ -80,6 +80,55 @@ Notes:
 - Entry points of the syncer image (all relative to `/app`): `node dist/main.js` (default), the migration job below, and
   `node dist/cli/range-ingest.js --from <n> --to <m>`.
 
+## CI and releases
+
+GitHub Actions runs two workflows (`.github/workflows/`):
+
+- **`ci.yml`**, on every pull request to `master` and every push to `master`. It has three parts:
+  - one job runs `pnpm build` and `pnpm test`;
+  - three jobs run the e2e suites (shared, api, syncer) in parallel, each against its own testcontainers ClickHouse;
+  - a job summary shows the changelog of what is not released yet.
+
+  A newer push to a pull request cancels its older run.
+- **`release.yml`**, on every pushed version tag: `v1.4.0`, or a pre-release such as `v1.4.0-rc.1`. It runs in order:
+  1. **Version:** the tag must be a semantic version, `vMAJOR.MINOR.PATCH` with an optional `-pre-release` and no `+build`. As in
+     SemVer, numbers have no leading zeros, in the pre-release too. Any other tag releases nothing, and nothing is published:
+     - a tag that is not version-shaped, such as `vtest` or `v1.4`, starts no run at all, because the trigger only takes `v<n>.<n>.<n>`
+       and `v<n>.<n>.<n>-*`;
+     - a tag that has the shape but is not a semantic version, such as `v1.2.3-rc.01`, starts a run that stops at this step.
+  2. **Test:** the whole of `ci.yml`.
+  3. **Images:** both images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api` and
+     `ghcr.io/gatehubnet/data-syncer`, tagged with the version without its `v` (`1.4.0`).
+  4. **Latest:** `latest` on both images points at the newest version tag, a pre-release included, whose two images are both
+     published. Every release works this out again when it reaches this step, one release at a time. So:
+     - a release that finishes after a newer one leaves `latest` on the newer one;
+     - a late patch for an older line, such as `v1.3.5` after `v1.4.0`, publishes `1.3.5` and leaves `latest` alone;
+     - both `latest` tags are pointed at the same version, one after the other. That is not atomic: if the second cannot be moved
+       (after three tries), the job fails and says which tag is on which version. Running the job again, or the next release, puts
+       both on the same version;
+     - a registry error is retried, and if it persists the step fails and leaves `latest` alone. Only the registry's "not found"
+       counts as not published.
+  5. **Release:** the GitHub release of the tag. Its body is the changelog since the previous tag, made by [git-cliff](https://git-cliff.org)
+     from the Conventional Commits (`cliff.toml`) and attached as `CHANGELOG.md`. A tag with a `-` is a pre-release.
+
+  A failure in steps 1–3 stops the release. Step 5 does not wait for step 4.
+
+To release, tag a commit of `master` and push the tag:
+
+```bash
+git tag v1.4.0 && git push origin v1.4.0
+```
+
+**One secret** is needed in the repository's settings (Settings → Secrets and variables → Actions): `NPM_TOKEN`, an npm token that can
+read `@gatehub/toolbox`. Both workflows install with it. The image builds get it as the BuildKit secret `npm_token`, as above, so it is in
+no layer. The images are pushed with the workflow's own `GITHUB_TOKEN`.
+
+Pull requests from forks get no secrets, so their install fails. A new package on ghcr.io starts **private**: make it public under the
+organisation's Packages → the package → Package settings, if it should be pulled without a login. The compose files keep building their
+images from the checkout (`pull_policy: build`). To run a released image, use its ghcr.io name instead. **Deploy by version, the
+same version for both images** (`ghcr.io/gatehubnet/data-api:1.4.0` with `ghcr.io/gatehubnet/data-syncer:1.4.0`), not by `latest`:
+the two `latest` tags move one after the other, and a deployment that pulls them at the wrong moment could get two versions.
+
 ## Schema migrations
 
 Migrations are **owned by one-shot jobs**, not run on every replica at boot:
