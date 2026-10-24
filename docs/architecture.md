@@ -155,7 +155,8 @@ views. See [clickhouse](clickhouse.md).
    queries a key-ordered range (secondary table -> keys -> full rows) with `limit + 1`, builds the Ripple-shaped objects, emits
    `marker` and `Link`, and the CSV interceptor reformats on `format=csv`.
 3. Balances and orders are the exception: they read the **live node** (`account_info`, `account_lines`, `account_offers`) and cache the
-   answer briefly.
+   answer briefly. Balances at a historical ledger (a hash, a date or a ledger number) are not: they come from the account and trust
+   line state history in ClickHouse ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)).
 
 ## Key design decisions
 

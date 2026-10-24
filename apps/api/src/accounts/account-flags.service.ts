@@ -1,11 +1,4 @@
-import {
-  AccountFlag,
-  accountFlagsOf,
-  ClickHouseService,
-  namedAccountFlags,
-  NetworkProfile,
-  Table,
-} from '@gatehub/data-api-shared';
+import { AccountFlag, accountFlagsOf, namedAccountFlags, NetworkProfile } from '@gatehub/data-api-shared';
 import { Inject, Injectable } from '@nestjs/common';
 import { CacheService } from '../common/cache.service';
 import { notFound } from '../common/errors';
@@ -13,6 +6,7 @@ import { StateLedgerService } from '../common/state-ledger.service';
 import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
 import { XrplService } from '../xrpl/xrpl.service';
 import { LedgerSelector, liveCacheKey, liveNodeError } from './account-ledger';
+import { AccountStatesService } from './account-states.service';
 
 /** The account flags of an account at a ledger, and the ledger they were read at. */
 export interface AccountFlags {
@@ -47,7 +41,7 @@ export class AccountFlagsService {
   private readonly names: readonly AccountFlag[];
 
   constructor(
-    private readonly ch: ClickHouseService,
+    private readonly states: AccountStatesService,
     private readonly ledgers: StateLedgerService,
     private readonly xrpl: XrplService,
     private readonly cache: CacheService,
@@ -61,18 +55,12 @@ export class AccountFlagsService {
     const ledger = await this.ledgers.resolve(selector);
     if (ledger === undefined) return this.live(address, selector.index ?? 'validated');
 
-    const [row] = await this.ch.query<{ flags: number; deleted: number }>(
-      `SELECT flags, deleted FROM ${Table.AccountStates}
-        WHERE account = {address:String} AND ledger_index <= {ledgerIndex:UInt32}
-        ORDER BY ledger_index DESC, tx_index DESC, node_index DESC
-        LIMIT 1`,
-      { address, ledgerIndex: ledger.ledger_index },
-    );
-    if (!row || row.deleted) throw notFound('account not found');
+    const state = await this.states.stateAt(address, ledger.ledger_index);
+    if (state === undefined) throw notFound('account not found');
     return {
       ledgerIndex: ledger.ledger_index,
       closeTime: ledger.close_time,
-      flags: namedAccountFlags(row.flags, this.names),
+      flags: namedAccountFlags(state.flags, this.names),
       live: false,
     };
   }

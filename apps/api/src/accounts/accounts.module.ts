@@ -20,6 +20,7 @@ import { AccountPaymentsController } from './account-payments.controller';
 import { AccountPaymentsService } from './account-payments.service';
 import { AccountReportsController } from './account-reports.controller';
 import { AccountReportsService } from './account-reports.service';
+import { AccountStatesService } from './account-states.service';
 import { AccountStatsController } from './account-stats.controller';
 import { AccountStatsService } from './account-stats.service';
 import { AccountTransactionsController } from './account-transactions.controller';
@@ -36,11 +37,12 @@ import { TrustLinesService } from './trust-lines.service';
  * `GET /v2/accounts/:address/{payments,exchanges[/:base[/:counter]],balance_changes}`,
  * `GET /v2/accounts/:address/reports[/:date]` and `GET /v2/accounts/:address/stats/:family` (their values are in the
  * native currency, converted with the `RatesService` of `RatesModule`), the two routes that ask the live node
- * instead of the database, `GET /v2/accounts/:address/{balances,orders}`, and the AMM routes of an account,
+ * instead of the database, `GET /v2/accounts/:address/{balances,orders}` (`/balances` only for the current ledger: a
+ * historical one is read from the state history), and the AMM routes of an account,
  * `GET /v2/accounts/:address/{amm_liquidity,amm_positions}`, the path payments of an account,
  * `GET /v2/accounts/:address/path_payments` (read by the `PathPaymentsService` of `PathPaymentsModule`), and the trust
  * lines of an account at a ledger from the state history, `GET /v2/accounts/:address/trustlines` (its read,
- * `TrustLinesService`, is meant for `/balances` at a historical ledger too).
+ * `TrustLinesService`, gives `/balances` its trust lines at a historical ledger too).
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
@@ -66,6 +68,7 @@ import { TrustLinesService } from './trust-lines.service';
   providers: [
     AccountsService,
     AccountFlagsService,
+    AccountStatesService,
     AccountTransactionsService,
     AccountPaymentsService,
     AccountExchangesService,
