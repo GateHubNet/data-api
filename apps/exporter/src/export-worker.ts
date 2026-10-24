@@ -1,12 +1,16 @@
 import {
   appendExportJob,
   ClickHouseService,
+  EXPORT_MAX_ROWS,
   ExportFormat,
   exportJobsIn,
   ExportJobsRow,
   exportObjectKey,
+  exportRowCap,
+  ExportRowCaps,
   ExportStorage,
   nextExportState,
+  tooManyExportRows,
 } from '@gatehub/data-api-shared';
 import { Logger } from '@nestjs/common';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -51,6 +55,8 @@ export interface ExportWorkerOptions {
   apiUrl: string;
   /** The exporter's own API key, sent as `X-API-Key`; `''` sends none (an api without keys). */
   apiKey: string;
+  /** The most rows an export of each format holds; a longer list fails the job. Default: `EXPORT_MAX_ROWS`. */
+  maxRows?: ExportRowCaps;
   /** Default: `EXPORT_PAGE_SIZE`. */
   pageSize?: number;
   /** Default: `EXPORT_POLL_MS`. */
@@ -109,6 +115,7 @@ function nextMarker(link: string | null): string | undefined {
  */
 export class ExportWorker {
   private readonly pageSize: number;
+  private readonly maxRows: ExportRowCaps;
   private readonly pollMs: number;
   private readonly requestTimeoutMs: number;
   private readonly logger: Pick<Logger, 'log' | 'warn' | 'error'>;
@@ -117,6 +124,7 @@ export class ExportWorker {
 
   constructor(private readonly options: ExportWorkerOptions) {
     this.pageSize = options.pageSize ?? EXPORT_PAGE_SIZE;
+    this.maxRows = options.maxRows ?? EXPORT_MAX_ROWS;
     this.pollMs = options.pollMs ?? EXPORT_POLL_MS;
     this.requestTimeoutMs = options.requestTimeoutMs ?? EXPORT_REQUEST_TIMEOUT_MS;
     this.logger = options.logger ?? new Logger(ExportWorker.name);
@@ -195,7 +203,6 @@ export class ExportWorker {
     const dir = await mkdtemp(join(tmpdir(), 'export-'));
     try {
       const { file, disposition } = await this.walk(running, join(dir, 'rows'));
-      // the row cap of ticket #16 is checked on the pages of the walk and before the upload
       const render = EXPORT_RENDERERS[running.format as ExportFormat];
       if (!render) throw new ExportFailure(`the format ${running.format} cannot be made`);
       const output = render(file, disposition);
@@ -228,7 +235,10 @@ export class ExportWorker {
     }
   }
 
-  /** Walks every page of the job's list into a `CsvFile` spooled at `spool`. */
+  /**
+   * Walks every page of the job's list into a `CsvFile` spooled at `spool`. A list longer than the cap of the job's
+   * format (ticket #16) fails the job at the page that passes it: the rest is not read.
+   */
   private async walk(job: ExportJobsRow, spool: string): Promise<{ file: CsvFile; disposition: string | null }> {
     const url = new URL(job.path, this.options.apiUrl);
     // every format is made from the list's CSV form
@@ -236,6 +246,7 @@ export class ExportWorker {
     url.searchParams.set('limit', String(this.pageSize));
     url.searchParams.delete('marker');
     const file = new CsvFile(spool);
+    const cap = exportRowCap(this.maxRows, job.format);
     const seen = new Set<string>();
     let disposition: string | null = null;
     for (let page = 0; ; page++) {
@@ -248,6 +259,7 @@ export class ExportWorker {
       }
       if (page === 0) disposition = res.headers.get('content-disposition');
       await file.add(text);
+      if (cap !== undefined && file.rows > cap) throw new ExportFailure(tooManyExportRows(job.format, cap));
       const marker = nextMarker(res.headers.get('link'));
       if (marker === undefined) return { file, disposition };
       if (seen.has(marker)) throw new ExportFailure('the list gave the same page twice');

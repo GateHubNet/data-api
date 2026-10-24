@@ -72,6 +72,19 @@ export class ExporterConfig {
   @IntValue({ min: 1000 })
   exportRequestTimeoutMs: number = 60000;
 
+  /**
+   * `GH_EXPORT_MAX_ROWS_CSV`: the most rows a CSV export holds (ticket #16); a longer list fails the job. The same value
+   * as the api's, which refuses up front an export it can count.
+   */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxRowsCsv: number = 1_000_000;
+
+  /** `GH_EXPORT_MAX_ROWS_PDF`: the most rows a PDF export holds (ticket #16), as `GH_EXPORT_MAX_ROWS_CSV`. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxRowsPdf: number = 10_000;
+
   /** `GH_HTTP_API_PORT`: the liveliness probe. */
   @ConfigValue()
   @IntValue({ min: 1, max: 65535 })
