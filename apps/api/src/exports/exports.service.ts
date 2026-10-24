@@ -1,4 +1,5 @@
 import {
+  activeExportJobs,
   appendExportJob,
   ClickHouseService,
   EXPORT_FORMATS,
@@ -14,6 +15,7 @@ import {
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { badRequest, notFound, RippleHttpError } from '../common/errors';
 import { fmtTime } from '../common/format';
+import { ApiConfig } from '../config/api.config';
 import { ExportableRoutes } from './exportable-routes';
 
 /** The token of the `ExportStorage` of the api: `null` when exports are off (`GH_EXPORT_BUCKET` empty). */
@@ -46,12 +48,14 @@ export class ExportsService {
   constructor(
     private readonly ch: ClickHouseService,
     private readonly routes: ExportableRoutes,
+    private readonly config: ApiConfig,
     @Optional() @Inject(EXPORT_STORAGE) private readonly storage: ExportStorage | null = null,
   ) {}
 
   /**
    * Queues an export of `body.path` in `body.format` for the key whose hash is `keyHash`. The checks, in order: the path
-   * (a `/v2/` path of a list with a CSV form), its window (a list over time names `start` and `end`), the format.
+   * (a `/v2/` path of a list with a CSV form), its window (a list over time names `start` and `end`), the format, then
+   * the exports the key already has queued or running (ticket #16: at most `GH_EXPORT_MAX_JOBS_PER_KEY`, 429 beyond).
    */
   async create(body: unknown, keyHash: string): Promise<Pick<ExportBody, 'result' | 'id' | 'status'>> {
     this.available();
@@ -65,6 +69,10 @@ export class ExportsService {
     }
     if (typeof format !== 'string' || !(EXPORT_FORMATS as readonly string[]).includes(format)) {
       throw badRequest('invalid format');
+    }
+    const most = this.config.exportMaxJobsPerKey;
+    if ((await activeExportJobs(this.ch, keyHash)) >= most) {
+      throw new RippleHttpError(429, `too many exports in progress: at most ${most} per API key`);
     }
 
     const now = exportNow();

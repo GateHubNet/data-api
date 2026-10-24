@@ -22,7 +22,12 @@ describe('exports', () => {
     h = await startHarness({
       seed: 'ripple-mock',
       exportStorage: storage,
-      env: { ...NO_RATE_LIMIT, GH_API_KEYS: `${TEST_API_KEY},${OTHER_KEY},${EXPORTER_KEY}` },
+      // the jobs of these tests pile up queued: the limit per key has a spec of its own (export-limits.e2e-spec.ts)
+      env: {
+        ...NO_RATE_LIMIT,
+        GH_API_KEYS: `${TEST_API_KEY},${OTHER_KEY},${EXPORTER_KEY}`,
+        GH_EXPORT_MAX_JOBS_PER_KEY: '100',
+      },
     });
   });
 

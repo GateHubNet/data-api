@@ -76,6 +76,17 @@ export async function exportJobsIn(
   );
 }
 
+/** How many exports of the API key whose hash is `keyHash` are queued or running now. */
+export async function activeExportJobs(ch: ClickHouseService, keyHash: string): Promise<number> {
+  const row = await ch.queryOne<{ n: number | string }>(
+    `SELECT count() AS n FROM (
+       SELECT id, argMax(status, seq) AS status FROM ${Table.ExportJobs} WHERE key_hash = {key_hash:String} GROUP BY id
+     ) WHERE status IN ('queued', 'running')`,
+    { key_hash: keyHash },
+  );
+  return Number(row?.n ?? 0);
+}
+
 /** Appends a state of a job. */
 export async function appendExportJob(ch: ClickHouseService, row: ExportJobsRow): Promise<void> {
   await ch.insert(Table.ExportJobs, [row]);
