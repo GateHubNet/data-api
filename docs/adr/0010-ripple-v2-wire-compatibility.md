@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 60 and 65 to 70).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 60, 65 to 70 and 72).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -273,7 +273,7 @@ Kept from the original: the JSON answers of the routes it had, their parameters 
 The messages of `/v2/path_payments` and `/v2/accounts/{address}/path_payments` are those of `/v2/payments` (`invalid start date
 format`, `invalid end date format`, `invalid marker`), with the 500 `unable to retrieve path payments`.
 
-**Exports** (items 68 to 70). The wording is in [api-reference](../api-reference.md#exports).
+**Exports** (items 68 to 70 and 72). The wording is in [api-reference](../api-reference.md#exports).
 
 68. **Exports.** The original had no exports: a client walked the pages itself. Here `POST /v2/exports` with `{path, format}` queues
     an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`) and answers
@@ -281,10 +281,16 @@ format`, `invalid end date format`, `invalid marker`), with the 500 `unable to r
     rows?, error?, url?}`. Both are routes of their own: no route of the original changes.
 69. **An export is the list.** The file is made by the exporter of the network, which walks the list's own CSV pages through the
     api with its own API key, so the file is the CSV the route would give for the whole list in one page (one header, the columns
-    of every row, in the order they first appear). The format is `csv` (`pdf` is ticket #17).
+    of every row, in the order they first appear). The format is `csv`, or `pdf` (item 72).
 70. **An export belongs to its API key.** Only the key that created a job sees it: any other key gets 404 `export not found`, as
     for an id that does not exist. The job keeps the SHA-256 of the key, never the key. A done job's `url` is a Google Cloud
     Storage link signed at each request and valid for 15 minutes; the job and its file are kept 7 days.
+72. **PDF exports.** The original had no PDF. Here `format: "pdf"` makes a document of the same walked list, rendered by the
+    exporter with `pdfkit` (not GateHub's `pdf-generator`): landscape A4; a header with the list's file name, for an account's list
+    the address with its account name, account network name and labels (read from `/v2/accounts/{address}` through the api, like
+    the rows), then the network, the list's path, its window (or the ledger it is at), the ledgers its rows cover, the row count
+    and when it was made; then a table of the columns chosen for the list (the first 8 of a list without a choice; the CSV keeps
+    every column) and `Page n of m` on every page. Opening and closing balances are not in it.
 
 The messages of the export routes are new: 400 `invalid path`, `path is not exportable`, `start and end are required`,
 `invalid format`; 404 `export not found`; 503 `exports are not available` (no bucket configured); 500 `unable to create the

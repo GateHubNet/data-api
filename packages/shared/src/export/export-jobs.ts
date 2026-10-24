@@ -11,8 +11,8 @@ import { Table } from '../clickhouse/tables';
  * id is the job, and nothing is ever updated in place.
  */
 
-/** The formats an export can be made in. PDF (ticket #17) joins this list. */
-export const EXPORT_FORMATS = ['csv'] as const;
+/** The formats an export can be made in: the list's CSV, or a PDF document of it (ticket #17). */
+export const EXPORT_FORMATS = ['csv', 'pdf'] as const;
 export type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
 export type ExportStatus = ExportJobsRow['status'];

@@ -31,7 +31,7 @@ exporter and a shared library. This page explains the moving parts; the reasons 
 
  ┌───────────────────────────────────────────────────────────────────┐
  │ exporter (apps/exporter) — ONE per network                        │──▶ api: the list's CSV pages (HTTP, own key)
- │   takes queued export jobs (export_jobs), one at a time           │──▶ Google Cloud Storage: <network>/<id>.csv
+ │   takes queued export jobs (export_jobs), one at a time           │──▶ Google Cloud Storage: <network>/<id>.csv|.pdf
  └───────────────────────────────────────────────────────────────────┘    (the api signs the download links)
 ```
 
@@ -116,8 +116,11 @@ A NestJS worker with a probe/metrics HTTP surface, exactly one per network (spec
 [export](api-reference.md#exports) jobs of its database one at a time, oldest first, and makes each file by walking the list's own
 CSV pages (`format=csv`, `limit`, following `Link`) through the network's api with an API key of its own: every list has one
 implementation, and an export is always the list it names. `CsvFile` puts the pages together into the file the route would give
-for the whole list in one page (one header, the columns of every page; the rows wait in a spool file under `/tmp`), and it is
-uploaded to `<network>/<id>.csv` in the bucket of `GH_EXPORT_BUCKET`. The job's states are rows of `export_jobs` (`running`, then
+for the whole list in one page (one header, the columns of every page; the rows wait in a spool file under `/tmp`). A renderer
+per format (`EXPORT_RENDERERS`) turns it into the file: CSV as it is; PDF (ticket #17) as a landscape A4 document drawn with
+`pdfkit` (`renderPdf`), with a header that names the account of an account's list (read from `/v2/accounts/{address}` through
+the api) and a table of the columns chosen for the list (`PDF_COLUMNS`, in `apps/exporter/src/pdf-columns.ts`). The file is
+uploaded to `<network>/<id>.<format>` in the bucket of `GH_EXPORT_BUCKET`. The job's states are rows of `export_jobs` (`running`, then
 `done` or `failed` with why). A shutdown queues the job in hand again; a job a crashed exporter left `running` is failed when the
 next one starts. The api queues the jobs (`POST /v2/exports`) and signs the download links (`GET /v2/exports/{id}`).
 
