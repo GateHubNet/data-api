@@ -304,7 +304,7 @@ format`, `invalid end date format`, `invalid marker`), with the 500 `unable to r
 **Exports** (items 68 to 72). The wording is in [api-reference](../api-reference.md#exports).
 
 68. **Exports.** The original had no exports: a client walked the pages itself. Here `POST /v2/exports` with `{path, format}` queues
-    an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`) and answers
+    an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`, or `min_sequence` or `max_sequence` for the account transactions by sequence) and answers
     202 `{result, id, status: "queued"}`; `GET /v2/exports/{id}` answers `{result, id, status, format, path, created, finished?,
     rows?, error?, url?}`. Both are routes of their own: no route of the original changes.
 69. **An export is the list.** The file is made by the exporter of the network, which walks the list's own CSV pages through the

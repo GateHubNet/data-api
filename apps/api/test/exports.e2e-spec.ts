@@ -74,6 +74,18 @@ describe('exports', () => {
       }
     });
 
+    it('takes the account transactions by sequence without start and end: the sequences are the window', async () => {
+      for (const query of ['min_sequence=1', 'max_sequence=500', 'min_sequence=1&max_sequence=500']) {
+        const res = await post({ path: transactions(BUSY, query), format: 'csv' });
+        expect([query, res.status, res.body.status]).toEqual([query, 202, 'queued']);
+      }
+    });
+
+    it('still asks a list over time for start and end when the sequences are empty', async () => {
+      const res = await post({ path: transactions(BUSY, 'min_sequence=&max_sequence='), format: 'csv' });
+      expect([res.status, res.body]).toEqual([400, { result: 'error', message: 'start and end are required' }]);
+    });
+
     it.each([
       ['no path', { format: 'csv' }, 'invalid path'],
       ['a path that is not /v2/…', { path: 'https://example.com/v2/accounts', format: 'csv' }, 'invalid path'],

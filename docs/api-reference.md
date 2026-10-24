@@ -3238,7 +3238,8 @@ Asks for an export. The body is JSON:
 | `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list. |
 | `format` | `csv` or `pdf` (see [PDF](#pdf)). |
 
-A **list over time** (a route that takes `start` and `end`) must name both. A list at a point in time (`/balances`,
+A **list over time** (a route that takes `start` and `end`) must name both, unless it also takes a window of sequences and the path
+names `min_sequence` or `max_sequence` (the account transactions by sequence): those are its window. A list at a point in time (`/balances`,
 `/trustlines`, `/orders`) may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`)
 names none. The other parameters are not checked here: a list that refuses them makes a failed export, which says why.
 
