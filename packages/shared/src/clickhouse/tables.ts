@@ -22,6 +22,8 @@ export enum Table {
   AmmLiquidity = 'amm_liquidity',
   AccountAmmLiquidity = 'account_amm_liquidity',
   AmmGovernance = 'amm_governance',
+  // Account state history (migration 005): the state of an account root after each change, from parser version 3.
+  AccountStates = 'account_states',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',

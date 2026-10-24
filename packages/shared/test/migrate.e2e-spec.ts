@@ -85,6 +85,11 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, ledger_index, tx_index, amm_account',
   },
   [Table.AmmGovernance]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
+  [Table.AccountStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index, node_index',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -242,6 +247,9 @@ const MIGRATION_003_TABLES: Table[] = [
 /** The fee estimates of the AMM volume's live day set (D2b): one column of `volume_live`. */
 const MIGRATION_004 = '004_amm_fee_estimates.sql';
 
+/** The account state history (spec #4, ticket #9): one ledger-derived table. */
+const MIGRATION_005 = '005_account_states.sql';
+
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
   Table.Ledgers,
@@ -263,6 +271,7 @@ const DEDUP_TABLES: Table[] = [
   Table.AmmLiquidity,
   Table.AccountAmmLiquidity,
   Table.AmmGovernance,
+  Table.AccountStates,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1084,12 +1093,12 @@ describe('migrations (e2e)', () => {
         expect(await tableNames()).toContain(Table.UnlPublishers);
         expect(await tableNames()).not.toContain(Table.ValidatorDomains);
 
-        // The real directory: 002 runs again from its first statement and completes, and 003 and 004, which come after it, are
-        // applied too.
+        // The real directory: 002 runs again from its first statement and completes, and 003, 004 and 005, which come after
+        // it, are applied too.
         process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
         const result = await runMigrations({ config, log });
         expect(result).toEqual({
-          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004],
+          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004, MIGRATION_005],
           skipped: ['001_baseline.sql'],
         });
 
@@ -1247,6 +1256,50 @@ describe('migrations (e2e)', () => {
       } finally {
         await svc.onModuleDestroy();
       }
+    });
+  });
+  describe('migration 005', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-005-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 005 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_005_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_005);
+      expect(realFiles()).toContain(MIGRATION_005);
+      const exists = async () =>
+        admin.query<{ name: string }>(
+          `SELECT name FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
+          { db: config.database, t: Table.AccountStates },
+        );
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await exists()).toEqual([]);
+
+      copyReal([MIGRATION_005]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_005], skipped: before });
+      expect(await exists()).toEqual([{ name: Table.AccountStates }]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
     });
   });
 });
