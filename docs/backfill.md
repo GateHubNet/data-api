@@ -106,6 +106,8 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   reprocess from the AMM enablement ledger (86795265) on is needed for complete pool data: see
   [AMM data re-ingest](#amm-data-re-ingest). Pools or reserve lines the parser could not turn into rows
   are counted in `syncer_amm_unclassified_total` (and the range-ingest log names the total of its run).
+  Parser version 4 adds the path payments (`path_payments`): ledgers written by an older version have none, see
+  [Path payments re-ingest](#path-payments-re-ingest).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
@@ -164,6 +166,25 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
 
    `syncer_amm_unclassified_total` counts the pools the parser could not place, and the range-ingest log ends with a warning that names
    the total of the run. A pool whose creation is older than the first ledger you ingested has no `created_ledger` / `created_by`.
+
+### Path payments re-ingest
+
+`PARSER_VERSION` is 4 since the path payments parser (`PATH_PARSER_VERSION`, spec #4). A ledger written by an older version has no
+`path_payments` rows, so `/v2/path_payments` lists the path payments of the ledgers ingested since the deploy only. Nothing else
+changes for those ledgers: the payments, exchanges and AMM rows a reprocess rewrites come out the same.
+
+1. Apply migration `007_path_payments.sql` **before** the syncer of this release starts: the syncer writes `path_payments` with every
+   ledger, and a write to a missing table fails the batch, so the live runner would retry it for ever
+   ([operations](operations.md#apply-a-schema-migration)). Then deploy the syncer and the api.
+2. To fill the history, reprocess the range you want listed, the same way as the [AMM data re-ingest](#amm-data-re-ingest):
+   `range-ingest --from <A> --to <B> --reprocess`. It rewrites every table of each ledger. Path payments exist from the first ledgers
+   on (rippling through market makers is as old as the ledger), so there is no natural start; filling all of history is the history
+   spec's job (out of scope of spec #4).
+3. Check which parser wrote a range:
+
+   ```sql
+   SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index BETWEEN <A> AND <B> GROUP BY parser_version;
+   ```
 
 ### Public nodes and rate limits
 

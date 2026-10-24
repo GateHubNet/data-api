@@ -19,7 +19,7 @@ deployment per network.
 | --- | --- |
 | [Architecture](architecture.md) | Components, data flow, per-network deployments, design decisions |
 | [API reference](api-reference.md) | Every endpoint: params with defaults and maximums, response shape, exact errors, CSV, pagination, differences from data.ripple.com |
-| [Data model](data-model.md) | The 49 ClickHouse tables per network (23 of the baseline, 7 AMM tables in it, 10 of the validators and amendments migration, 9 of the account and market aggregates migration), the commit-marker model, migrations |
+| [Data model](data-model.md) | The 50 ClickHouse tables per network (23 of the baseline, 7 AMM tables in it, 10 of the validators and amendments migration, 9 of the account and market aggregates migration, the path payments of migration 007), the commit-marker model, migrations |
 | [Configuration](configuration.md) | Every environment variable of both services, checked against the config classes |
 | [Syncer](syncer.md) | The ingest, validations, fee_stats, aggregator (the AMM jobs included) and validators workers; recovery; the range-ingest CLI |
 | [ClickHouse](clickhouse.md) | The store: no-`FINAL` rule, inserts and deduplication, memory guards, HA, backups, retention |
@@ -39,7 +39,7 @@ deployment per network.
 ## The system in one paragraph
 
 The **syncer** (`@gatehub/data-syncer`) follows one network's validated ledgers through a resilient node client, parses every ledger into rows of
-19 ledger-derived tables (payments, exchanges including swaps against AMM pools, balance changes, per-account indexes, AMM pool states, ...) and writes them to **ClickHouse** atomically: child
+20 ledger-derived tables (payments, exchanges including swaps against AMM pools, balance changes, per-account indexes, AMM pool states, path payments, ...) and writes them to **ClickHouse** atomically: child
 tables first, the `ledgers` row last as the commit marker, with deduplication tokens so a crash recovers by deleting the uncommitted tail. Side workers
 collect validations and fee snapshots, keep hourly stats, volumes and the AMM pool tables up to date, precompute the account and market aggregates (daily rates, hourly pair stats, the Markets
 table, rollups of heavy accounts), and derive the validators and amendments data (validator lists, domain verification, voting rounds, agreement). The **api** (`@gatehub/data-api-service`) is a stateless NestJS

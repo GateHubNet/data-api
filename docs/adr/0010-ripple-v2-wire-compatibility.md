@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended three times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by spec #4 (account investigation data, with [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md)), the account investigation routes (the second amendment at the end of this record, from item 54 on).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -212,3 +212,23 @@ own crawler (`api/routes/network/getValidators.js`, `topology.js`); this API ser
 Kept from the original: the messages `Validator not found` and `unable to retrieve validator(s)` and the CSV name `validators.csv`. New 400s exist for the new parameters
 (`invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`, `invalid validator public key`). The endpoint-by-endpoint wording is in
 [api-reference](../api-reference.md#validators-and-amendments).
+
+## Amendment 4 (2026-10-24): account investigation data (spec #4)
+Spec #4 (GitHub issue GateHubNet/data-api#4) adds what investigators of an account ask for. Its routes are GateHub extras: the original
+had none of them, so each item says what the original did in its place and what this API does.
+
+### Path payments (items 65 and 66)
+
+65. **`GET /v2/path_payments`.** The original had no list of path payments (GLOSSARY.md: a successful payment whose delivery used
+    someone else's liquidity). Here the path payments of the network in a window: `start`, `end`, `descending`, `limit` (200, at most
+    1000), `marker` and a `Link` header, as every list, and `format=csv` with the file `path payments.csv`. The row is
+    `hash, ledger_index, executed_time, source, destination, delivered_amount, currency, issuer?, source_amount, source_currency,
+    source_issuer?, offers_crossed, amm_pools, rippled_through`, the issuers absent for the native currency. In the CSV, `amm_pools`
+    and `rippled_through` are one cell each with the accounts separated by a space, where the original's flattening would have made
+    one column per position (`amm_pools[0]`, ...) that changes from page to page.
+66. **Payments to oneself.** The original's payments left a payment to oneself out (a conversion, not a payment), and
+    `/v2/payments`, `/v2/accounts/{address}/payments` and the payment volumes still do. A path payment to oneself (an arbitrage loop,
+    or a conversion through an offer or a pool) is listed by `/v2/path_payments`.
+
+The messages are those of `/v2/payments` (`invalid start date format`, `invalid end date format`, `invalid marker`), with the 500
+`unable to retrieve path payments`. The wording is in [api-reference](../api-reference.md#path-payments).

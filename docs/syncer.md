@@ -16,7 +16,7 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    │              │               │                │ account rollups │                  │
    └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴─────────┬────────┘
           ▼               ▼               ▼                 ▼                  ▼
-   19 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
+   20 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
    (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
     marker)           manifests,                      volume_daily,      validator_manifests (rpc),
                       validator_                      amm_pools,         network_state,
@@ -71,16 +71,19 @@ The single writer of the ledger tables. It follows the validated chain, one ledg
 
 ### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 19
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 20
 **ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
 `balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
-`account_amm_liquidity`, `amm_governance`; see [data-model](data-model.md)). The parsers never mutate their input and take the
+`account_amm_liquidity`, `amm_governance`, and `path_payments`; see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
 copies), and a pool the parser touches gets a state row, plus a liquidity or governance row for the `AMM*` transactions. A pool or a
 reserve line it cannot turn into rows is counted in `syncer_amm_unclassified_total` (live ingest and range ingest, once per committed
 write; the range-ingest log names the total of its run).
+The path payments parser reads every successful Payment, a payment to oneself included (the payments parser drops those): a
+payment whose delivery crossed an offer, changed an AMM pool or rippled through a third account's trust lines becomes a
+`path_payments` row ([data-model](data-model.md#path_payments-p6-order-by-ledger_index-tx_index-migration-007)).
 `LedgerWriter.write()` then inserts, in this order:
 
 1. all child tables, in parallel (each insert is chunked at 50,000 rows),
