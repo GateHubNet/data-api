@@ -55,8 +55,21 @@ export enum Table {
   AccountLinesDaily = 'account_lines_daily',
   AccountTxDaily = 'account_tx_daily',
   AccountTradesDaily = 'account_trades_daily',
+  // Written by the operator with plain SQL inserts (ADR-0014).
+  /** Migration 009: the account network name of an address, append-only, the newest row of an address wins. */
+  AccountNetworkNames = 'account_network_names',
   // Internal bookkeeping.
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
   SyncerLease = 'syncer_lease',
+}
+
+/**
+ * The tables of the shared database (ADR-0014, `schema-shared/*.sql`), which the apis of every network read. They are
+ * not in `Table`: that enum is exactly the tables of a network database. A reader names them qualified with the shared
+ * database: `${sharedDatabase}.${SharedTable.AccountNames}`.
+ */
+export enum SharedTable {
+  /** Migration 001: the account name of an address, append-only, the newest row of an address wins. */
+  AccountNames = 'account_names',
 }

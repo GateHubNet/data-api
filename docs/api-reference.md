@@ -191,7 +191,8 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs), the [AMM](#amm) endpoints (`/v2/amm/pools...`,
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
 `GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
-`GET /v2/network/validators/{key}/validations`. `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+`GET /v2/network/validators/{key}/validations`, and `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
 `GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
@@ -204,6 +205,10 @@ balance_changes, counterparties, exchanges}` and `GET /v2/network/markets`, and 
 `GET /v2/accounts/{address}/stats/{family}` and `GET /v2/accounts/{address}/reports` (the original ignored it there: a client that sent
 one now gets buckets). Their AMM data additions add the parameter `amm` and the fields `amm_share` and `amm_pool` to `GET /v2/network/markets`, the
 fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, and `computed_start` and `computed_end` to `GET /v2/amm/pools/{pool}/history?interval=day`.
+
+From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields `account_name` of
+`GET /v2/accounts/{address}`, the name the operator gave the address, and `account_network_name`, the name the operator gave the account on
+this network only.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -646,8 +651,29 @@ accounts`.
 
 ### `GET /v2/accounts/{address}`
 
-`{ "result": "success", "account_data": { account, parent, initial_balance, inception, ledger_index, tx_hash } }`. 404
-`Account not found`; 500 `unable to get accounts`.
+The latest activation of the account, the name the operator gave its address and the name it gave the account on this network.
+
+```json
+{ "result": "success",
+  "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
+                    "ledger_index": 11119603, "tx_hash": "…", "account_name": "GateHub",
+                    "account_network_name": "USD Issuer" } }
+```
+
+Key order: `account, parent, initial_balance, inception, ledger_index, tx_hash, genesis_balance?, genesis_index?,
+account_name?, account_network_name?, flags?`.
+
+- `account_name`: the **account name** of the address ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
+  the same on every network. The operator writes it into the shared database by hand
+  ([operations](operations.md#name-an-address)); the api loads the names every 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a
+  new or removed name shows within that time. Left out when the address has none.
+- `account_network_name`: the **account network name** of the account, its name on this network only ("USD Issuer" for
+  GateHub's issuing address on the XRP Ledger, which Xahau does not show). The operator writes it into the network's own
+  database by hand ([operations](operations.md#name-an-account-on-one-network)); it is loaded and reloaded with the names (60 s).
+  It is served with or without an `account_name`, and left out when the account has none.
+
+The names do not make an account: an address with a name but no activation on this network still answers 404 `Account not
+found`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -691,7 +717,9 @@ the node does not have the account); 500 `unable to get accounts`.
 
 **Differences from data.ripple.com** (both routes): an address that was created more than once (deleted with `AccountDelete`
 and funded again) answers with its **latest** creation; the original answered with the earliest. A transaction that creates
-several accounts is listed once per account (the original kept the last).
+several accounts is listed once per account (the original kept the last). `GET /v2/accounts/{address}` adds `account_name` and
+`account_network_name`, and with `flags=true` the account flags, GateHub extras
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 55, 58, 59 and 60).
 
 ### `GET /v2/accounts/{address}/transactions`
 
@@ -708,9 +736,38 @@ transaction objects of `/v2/transactions` without `ledger_hash`: `{hash, ledger_
 | `descending` | false | |
 | `limit` | 20 (max 1000) | |
 | `marker` | | |
+| `format` | json | `csv`: one **summary row** per transaction instead of the transaction object, file `<address> - transactions.csv`. Every other parameter applies as in JSON, and the pages follow the same `marker` and `Link` header. `binary` does not change the CSV. |
 
 Errors: 400 `invalid start date format`, `invalid end date format`, `invalid min_sequence`, `invalid max_sequence`, `invalid
-transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. No CSV.
+transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. Errors stay JSON with
+`format=csv`.
+
+**The CSV summary row** says what the transaction was from the account's side, readable without opening `tx` and `meta`. The
+columns, the same on every page and in this order:
+
+| Column | Meaning |
+| --- | --- |
+| `hash`, `ledger_index` | The transaction and its ledger. |
+| `executed_time` | The close time of the ledger, as the `date` of the JSON list (`2015-01-14T18:27:10+00:00`). |
+| `tx_type`, `result` | `Payment`, `tesSUCCESS`, ... |
+| `initiator` | `true` when the account sent the transaction (its `Account`), `false` when the transaction only affected it. |
+| `counterparty`, `amount`, `currency`, `issuer` | From one mapping per transaction type, below. Empty where the type has none. |
+| `fee` | The fee in whole units of the native currency, on the transactions the account sent; empty on the others. |
+| `flags_changed` | The account flags the transaction set or cleared. Empty for now: it fills once the account state history is recorded. |
+
+| Type | `counterparty` | `amount`, `currency`, `issuer` |
+| --- | --- | --- |
+| `Payment` | The destination for the sender, the sender for the destination. | The delivered amount of a successful payment, as `/v2/accounts/{address}/payments` gives it (a partial payment from before the fix gives `Amount`; an `Amount.issuer` that names a party is resolved through the trust lines). A failed payment delivered nothing and leaves them empty. An account that is neither party (an issuer the payment rippled through, the owner of an offer it took) gets none of the four. |
+| `TrustSet` | The peer of the trust line: the `LimitAmount` issuer for the sender, the sender for that issuer. | The limit the sender set, with its currency and issuer. |
+| any other (`OfferCreate`, `AccountSet`, ...) | empty | empty |
+
+Amounts are exact decimal strings in whole units, as on the ledger; the native currency is `XRP` or `XAH` and has no issuer.
+A page with no transactions is an empty file.
+
+```csv
+"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"
+"91F79AC2…","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","r4L6Z…","2","EUR","rMwjY…","0.012",""
+```
 
 ### `GET /v2/accounts/{address}/transactions/{sequence}`
 
@@ -720,7 +777,8 @@ supported). A transaction that used a ticket has Sequence 0: the latest of them 
 
 **Differences from data.ripple.com** (both routes): `max_sequence` is inclusive (the HBase scan dropped its row); `type` and
 `result` are validated against the network definitions; a `min_sequence` above what a sequence can be gives an empty list and
-a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404.
+a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404. The original had no CSV for
+account transactions; `format=csv` with the summary row is a GateHub extra.
 
 ### `GET /v2/accounts/{address}/payments`
 

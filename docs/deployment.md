@@ -21,6 +21,7 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
                         (one server) ◀── syncer-xahau ──────▶ Xahau node(s)                xahau
                               ▲
                         migrate-xrpl, migrate-xahau   (one-shot: create the database, apply the schema)
+                        migrate-shared                (one-shot: the `shared` database both apis read, account names)
 ```
 
 - **api-xrpl / api-xahau** are stateless and scale horizontally.
@@ -139,6 +140,9 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   `schema_migrations`, then exits 0. The apis and syncers wait for their job (`depends_on: service_completed_successfully`).
 - The path is `node_modules/@gatehub/data-api-shared/...`, not `packages/shared/...`: inside the image the shared package is a
   deployed dependency (`pnpm deploy --legacy`), and `packages/shared` does not exist.
+- `migrate-shared` runs the same command with the argument `shared`: it creates the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`,
+  default `shared`) and applies `schema-shared/*.sql` with its own `schema_migrations`. It is one job for both networks, and both apis
+  wait for it ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)).
 - It is idempotent and checksummed. By hand: `docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl`.
 - `GH_RUN_MIGRATIONS_ON_BOOT` is `false` in the compose files (convenient only for a single dev process). See
   [data-model](data-model.md#5-migrations).
@@ -150,6 +154,8 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   and should come before the syncer (advisable: the syncer writes the column on every row of every live volume set, and on the pinned ClickHouse a row with a field the table lacks is inserted without it, with no error,
   so the fee estimates of the ticks before the migration are lost and the live `amm_volume` day set reads as not known until `migrate` has run and the next tick has written it; `syncer_aggregator_errors_total{job="volume_live"}` does not show it).
   The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last ([the AMM data additions](operations.md#the-amm-data-additions)).
+- `009_account_network_names.sql` (one `CREATE TABLE IF NOT EXISTS`, the operator's account network names) is additive and comes before the api: an api without it serves
+  every account without a network name and logs the failed load at every reload, but answers. The syncer never touches the table. The compose files make the api wait for `migrate`.
 
 ## Configuration and secrets
 
@@ -185,7 +191,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --b
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod ps
 ```
 
-Start order: Keeper (healthy) -> ClickHouse (healthy) -> `migrate-xrpl` / `migrate-xahau` (complete) -> syncers and apis ->
+Start order: Keeper (healthy) -> ClickHouse (healthy) -> `migrate-xrpl` / `migrate-xahau` / `migrate-shared` (complete) -> syncers and apis ->
 nginx. The syncer opens its probe port only once its node connection is up, and answers 503 while it is more than
 `GH_MAX_LAG_HEALTHY` ledgers behind for over a minute (catching up): `unhealthy` there is informational, compose restarts nothing
 on it.

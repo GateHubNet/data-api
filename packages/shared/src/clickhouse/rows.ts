@@ -912,3 +912,28 @@ export interface SyncerLeaseRow {
   holder: string;
   heartbeat: UnixSecondsMs;
 }
+
+/**
+ * A row of `account_network_names` (`Table.AccountNetworkNames`, migration 009): the name of an address on this network,
+ * with the columns of `account_names` of the shared database. `added_at` defaults to the insert time.
+ */
+export interface AccountNetworkNamesRow {
+  address: string;
+  name: string;
+  /** 1: the row removes the network name of the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
+}
+
+// -- The shared database (ADR-0014, schema-shared/*.sql) ---------------------------------------------------------
+
+/** A row of `account_names` (`SharedTable.AccountNames`): `added_at` defaults to the insert time. */
+export interface AccountNamesRow {
+  address: string;
+  name: string;
+  /** 1: the row removes the name of the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
+}

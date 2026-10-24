@@ -25,6 +25,7 @@ import { AccountTransactionsService } from './account-transactions.service';
 import { AccountsController } from './accounts.controller';
 import { AccountsService } from './accounts.service';
 import { LiveLedgerService } from './live-ledger.service';
+import { NamesAndLabelsService } from './names-and-labels.service';
 
 /**
  * `GET /v2/accounts` and `GET /v2/accounts/:address`, `GET /v2/accounts/:address/transactions[/:sequence]`,
@@ -68,6 +69,7 @@ import { LiveLedgerService } from './live-ledger.service';
     AccountDayGroupsService,
     AccountAnalyticsService,
     AccountAmmService,
+    NamesAndLabelsService,
   ],
 })
 export class AccountsModule {}

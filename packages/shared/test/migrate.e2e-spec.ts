@@ -215,6 +215,7 @@ const SHAPES: Record<Table, Shape> = {
     partition: 'toYear(day)',
     order: 'account, day, base_currency, base_issuer, counter_currency, counter_issuer, version',
   },
+  [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
   [Table.IngestLog]: {
     engine: 'ReplacingMergeTree',
     version: 'updated_at',
@@ -249,6 +250,9 @@ const MIGRATION_004 = '004_amm_fee_estimates.sql';
 
 /** The account state history (spec #4, ticket #9): one ledger-derived table. */
 const MIGRATION_005 = '005_account_states.sql';
+
+/** The account network names the operator writes (ADR-0014, spec #4 ticket #8). */
+const MIGRATION_009 = '009_account_network_names.sql';
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -1093,14 +1097,15 @@ describe('migrations (e2e)', () => {
         expect(await tableNames()).toContain(Table.UnlPublishers);
         expect(await tableNames()).not.toContain(Table.ValidatorDomains);
 
-        // The real directory: 002 runs again from its first statement and completes, and 003, 004 and 005, which come after
-        // it, are applied too.
+        // The real directory: 002 runs again from its first statement and completes, and every file after it (003, 004,
+        // 009, ...) is applied too.
         process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
         const result = await runMigrations({ config, log });
-        expect(result).toEqual({
-          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004, MIGRATION_005],
-          skipped: ['001_baseline.sql'],
-        });
+        const after001 = readdirSync(REAL_SCHEMA_DIR)
+          .filter((f) => f.endsWith('.sql') && f !== '001_baseline.sql')
+          .sort();
+        expect(after001.slice(0, 3)).toEqual(['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004]);
+        expect(result).toEqual({ applied: after001, skipped: ['001_baseline.sql'] });
 
         // Every statement took effect: the ten tables, and the columns the two ALTERs added.
         const names = await tableNames();
@@ -1256,6 +1261,53 @@ describe('migrations (e2e)', () => {
       } finally {
         await svc.onModuleDestroy();
       }
+    });
+  });
+
+  describe('migration 009', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-009-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 009 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_009_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_009);
+      expect(realFiles()).toContain(MIGRATION_009);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.AccountNetworkNames);
+
+      copyReal([MIGRATION_009]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_009], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.AccountNetworkNames);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
     });
   });
   describe('migration 005', () => {

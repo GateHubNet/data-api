@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md), [ADR-0015](0015-historical-account-state-from-clickhouse.md) and spec #4, the account investigation data (the amendment at the end of this record, items 54 to 60).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 60).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -213,10 +213,27 @@ Kept from the original: the messages `Validator not found` and `unable to retrie
 (`invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`, `invalid validator public key`). The endpoint-by-endpoint wording is in
 [api-reference](../api-reference.md#validators-and-amendments).
 
-## Amendment 4 (2026-10-24): the account investigation data
-Spec #4 (account investigation data) adds routes, parameters and fields to the account routes. The historical account state comes from
-the state tables in ClickHouse, never from a node ([ADR-0015](0015-historical-account-state-from-clickhouse.md)).
+## Amendment 4 (2026-10-24): account investigation data
+The account investigation data (spec #4: account transactions export, account names and labels, account state history, path
+payments, exports; the hard-to-reverse parts are [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and
+[ADR-0015](0015-historical-account-state-from-clickhouse.md)) adds routes, parameters and fields the original did not have. Each is an
+addition: what the original served is served as before. Names and labels are served inline on `GET /v2/accounts/{address}` only.
 
+54. **`format=csv` on `GET /v2/accounts/{address}/transactions`.** The original had no CSV for account transactions and ignored
+    `format`. Here `format=csv` answers one summary row per transaction from the account's side (`hash, ledger_index, executed_time,
+    tx_type, result, initiator, counterparty, amount, currency, issuer, fee, flags_changed`), in a file `<address> - transactions.csv`,
+    with every parameter and the paging of the JSON list. The raw `tx` and `meta` are not in it: flattened, they would give a column per
+    field of every type. The JSON answer is unchanged.
+55. **`account_name`.** The original's `account_data` was `{account, parent, initial_balance, inception, ledger_index, tx_hash}` (and the
+    genesis fields). Here the same keys in the same order, then `account_name`, the account name of the address, left out when it has
+    none. It is the same on every network.
+56. **Names are not activations.** A name is the operator's, not the ledger's: it is served from a copy the api loads every 60 s
+    (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a new or removed name shows within that time, and an address with a name but no activation
+    on the network still answers 404 `Account not found`, as in the original.
+58. **`account_network_name`.** After `account_name`, the account network name: the name the operator gave the account on this
+    network only ("USD Issuer" on the XRP Ledger), kept in the network's own database (`account_network_names`, migration 009) with
+    the rules of the account names and reloaded with them. It is served with or without an `account_name`, and left out when there is
+    none; the other network's api never shows it.
 59. **Account flags.** The original's `/v2/accounts/{address}` answered with the account's creation only. Here `flags=true` adds `flags` to
     `account_data`, after its other keys: one `true`/`false` per account flag the network names (the XRP Ledger's from its definitions,
     Xahau's from xahaud's source), named without the `lsf` prefix. With `date` (alias `close_time`), a numeric `ledger_index` (alias
@@ -228,5 +245,4 @@ the state tables in ClickHouse, never from a node ([ADR-0015](0015-historical-ac
     newest ledger an older parser wrote), answers 400 `the date provided is too old`, the original's message for a ledger its node did not
     have. An account with no state at that ledger, or one deleted at or before it, answers 404 `account not found`, as the node does.
 
-Kept from the original: `Account not found` and `unable to get accounts`. The 400s `invalid date format` and `invalid ledger hash` of
-`/balances` apply with `flags=true`. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddress).
+Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new message: with `flags=true` the 400s of `/balances` (`invalid date format`, `invalid ledger hash`, `the date provided is too old`) and its 404 `account not found` apply. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions) and [api-reference](../api-reference.md#get-v2accountsaddress).

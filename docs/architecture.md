@@ -105,7 +105,7 @@ The AMM routes are GateHub extras ([ADR-0011](adr/0011-amm-data-and-swaps-as-exc
 
 ### ClickHouse
 
-One server, one database per network, 50 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network, 51 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 

@@ -1,11 +1,14 @@
 # Local development stack. One ClickHouse server, one database per network (the database is named after the network:
-# `xrpl`, `xahau`), and per network a one-shot migrate job, a syncer and an api - the same images as production.
+# `xrpl`, `xahau`), and per network a one-shot migrate job, a syncer and an api - the same images as production. The
+# `shared` database (account names, ADR-0014), which the apis of both networks read, has its own one-shot job,
+# migrate-shared, in both profiles.
 #
 #   docker compose up -d clickhouse                      only ClickHouse; run the apps from source (pnpm start:syncer / start:api)
 #   docker compose --profile full up -d --build          + the XRPL stack: migrate-xrpl, syncer-xrpl, api-xrpl
 #   docker compose --profile xahau up -d --build         + the Xahau stack: migrate-xahau, syncer-xahau, api-xahau
 #   docker compose --profile full --profile xahau up -d --build    both networks
 #   docker compose run --rm migrate-xahau                apply the schema of one network on its own
+#   docker compose run --rm migrate-shared               apply the schema of the shared database on its own
 #
 # Building the images needs NPM_TOKEN (the private @gatehub/toolbox); it is passed as a BuildKit secret, not baked in:
 #   NPM_TOKEN=... docker compose --profile full build
@@ -84,6 +87,23 @@ services:
       timeout: 3s
       retries: 10
 
+  # ---------------------------------------------------------------- shared (profiles: full, xahau)
+
+  # One-shot: create the `shared` database and apply its own schema, then exit 0. One job for both networks: two runners on
+  # one schema_migrations would race. The apis wait for it.
+  migrate-shared:
+    profiles: ['full', 'xahau']
+    build: *syncer-build
+    image: gatehub/data-syncer:${IMAGE_TAG:-dev}
+    pull_policy: build
+    command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js', 'shared']
+    environment:
+      <<: *clickhouse-client
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: 'no'
+
   # ---------------------------------------------------------------- XRPL (profile: full)
 
   # One-shot: create the `xrpl` database and apply the schema, then exit 0.
@@ -153,6 +173,8 @@ services:
     #   - ./deploy/amendments-xrpl.json:/etc/gatehub/amendments.json:ro # and XRPL_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
     depends_on:
       migrate-xrpl:
+        condition: service_completed_successfully
+      migrate-shared:
         condition: service_completed_successfully
     healthcheck: *api-healthcheck
     stop_grace_period: 30s
@@ -227,6 +249,8 @@ services:
     #   - ./deploy/amendments-xahau.json:/etc/gatehub/amendments.json:ro # and XAHAU_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
     depends_on:
       migrate-xahau:
+        condition: service_completed_successfully
+      migrate-shared:
         condition: service_completed_successfully
     healthcheck: *api-healthcheck
     stop_grace_period: 30s

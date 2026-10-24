@@ -1,4 +1,9 @@
-import { clickHouseConfigFromEnv, getNetworkProfile, NetworkProfile } from '@gatehub/data-api-shared';
+import {
+  clickHouseConfigFromEnv,
+  getNetworkProfile,
+  NetworkProfile,
+  sharedDatabaseFromEnv,
+} from '@gatehub/data-api-shared';
 import {
   DynamicModule,
   Inject,
@@ -53,7 +58,12 @@ async function assemble(): Promise<DynamicModule> {
   apiKeysOf(config); // throws now, before anything is built, when production has no key
   rateLimitKeysOf(config); // and on an invalid GH_RATE_LIMIT_KEYS (the guard checks it again when it is built)
   const profile = getNetworkProfile(config.network);
-  return CommonModule.register({ config, profile, clickHouse: clickHouseConfigFromEnv(process.env, profile) });
+  return CommonModule.register({
+    config,
+    profile,
+    clickHouse: clickHouseConfigFromEnv(process.env, profile),
+    sharedDatabase: sharedDatabaseFromEnv(process.env),
+  });
 }
 
 const assembled = assemble();
