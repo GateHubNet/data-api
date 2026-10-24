@@ -175,7 +175,7 @@ name is the same, quoted (M12).
 
 Successful `/v2` answers carry `Cache-Control: private, max-age=60` (the `GH_CACHE_CONTROL` setting; empty sends no header):
 `private`, because an answer is for the holder of an API key and a shared cache that ignores the key would serve it to anybody. The
-live routes `/balances` and `/orders` send their own (see there), and so do the validator routes (see [Validators and amendments](#validators-and-amendments)).
+live answers of `/balances` (the current ledger) and `/orders` send their own (see there), and so do the validator routes (see [Validators and amendments](#validators-and-amendments)).
 Responses are gzip-compressed when the client asks for it. CORS headers are sent only for the origins in `GH_CORS_ORIGINS`.
 Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it (see [deployment](deployment.md)).
 
@@ -201,6 +201,8 @@ trusted-UNL scope, paging, a different order and row, agreement against the inde
 `GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
 ledger from the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), and
 `GET /v2/accounts/{address}/trustlines` lists an account's trust lines with all their settings at a ledger, from the same history.
+`GET /v2/accounts/{address}/balances` at a historical ledger reads that history too instead of the node, its trust lines then ordered
+by (counterparty, currency) ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 63).
 Exchange-based endpoints also differ in what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see
 [Exchanges](#exchanges) and [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
@@ -973,14 +975,17 @@ not served (the original computed it and never stored it).
 
 ### `GET /v2/accounts/{address}/balances`
 
-The balances of the account on a ledger of the **live node** (`GH_NODE_ENDPOINTS`): `account_info` for the native balance,
+The balances of the account at a ledger. A ledger named by `ledger_hash`, `date` or a numeric `ledger_index` is **historical**: the
+balances come from the **account and trust line state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), never from the node. With no ledger named, or with `validated`,
+`closed` or `current`, they come from the **live node** (`GH_NODE_ENDPOINTS`): `account_info` for the native balance,
 `account_lines` for the trust lines.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `ledger_index` (alias `ledger`) | newest validated | A number, or `validated`, `closed`, `current`. Anything else is ignored. |
-| `ledger_hash` | | 64 hex digits (400 `invalid ledger hash`). |
-| `date` (alias `close_time`) | | The last ledger **stored by this API** that closed at or before it; the answer then carries its `close_time`. |
+| `ledger_index` (alias `ledger`) | newest validated | A ledger number (historical), or `validated`, `closed`, `current` (the node). Anything else is ignored. |
+| `ledger_hash` | | 64 hex digits (400 `invalid ledger hash`): the ledger **stored by this API** with this hash. |
+| `date` (alias `close_time`) | | The last ledger **stored by this API** that closed at or before it. |
 | `currency` | all | Only balances in that currency (compared as written). The native currency alone gives just the native balance. |
 | `counterparty` (alias `issuer`) | all | Only the trust lines with that account (the native balance is not filtered). |
 | `limit` | 200 (max 400) or `all` | Counts the native balance. `all` reads every trust line and has no `limit` in the answer. |
@@ -993,29 +998,46 @@ Precedence: `ledger_hash` > `date` > `ledger_index`.
   "balances": [{ "currency": "XRP", "value": "1000.5" }, { "currency": "USD", "counterparty": "r…", "value": "12.25" }] }
 ```
 
-The native balance comes first and has no `counterparty`; trust lines follow in the node's order. Errors, in order: 400 `invalid
-ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, 400 `the date provided is too old` (no stored
-ledger that early, or the node no longer has the ledger), 404 `account not found`; 500 `unable to retrieve balances`.
+Key order: `result, ledger_index, close_time?, limit?, balances`; a balance is `currency, counterparty?, value`. The native balance
+comes first and has no `counterparty`. A historical answer always carries the `close_time` of its ledger; a live one has none.
 
-Responses are cached in memory for `GH_LIVE_CACHE_TTL_MS` (default 10 s) per resolved request, so a `validated` answer is at
-most that old; the body says which ledger it was read at. The answer says the same downstream: `Cache-Control: private,
-max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`private, max-age=10` by default), or `no-store` when the live cache is off
-(`GH_LIVE_CACHE_TTL_MS=0`), in place of the global `GH_CACHE_CONTROL`. `limit=all` pages the node for at most 30 s in all; an
-account that needs longer gets 500 `unable to retrieve balances`. The pages of trust lines after `account_info` are read from the
-ledger named by `ledger_hash` or a numeric `ledger_index` as given, and from the index the node answered with for
-`validated` / `closed` / `current` (a marker belongs to one ledger).
+**Historical ledgers.** The native balance is the account's state at its last change at or before the ledger; the trust lines are
+those of [`/trustlines`](#get-v2accountsaddresstrustlines) at that ledger (a line with a zero balance is listed, a deleted one is
+not), each as its balance from the account's side, **ordered by (`counterparty`, `currency`)**. The state history covers the ledgers
+above the newest ledger written by a parser older than parser version 3, as for `/trustlines` and the account flags (see
+[backfill](backfill.md#account-state-history-re-ingest)): a ledger this API does not hold, a date before the first stored ledger, or a
+ledger the state history does not cover answers 400 `the date provided is too old`, and an account with no state at that ledger (it
+has not changed since the coverage starts, or did not exist yet), or one deleted at or before it, answers 404 `account not found`. A
+historical answer is not cached in memory and carries the global `GH_CACHE_CONTROL`, like the other routes that read ClickHouse. The
+risk of a big issuer's read is that of [`/trustlines`](#get-v2accountsaddresstrustlines).
 
-**Differences from data.ripple.com**: the default ledger is the newest **validated** one (the original asked for the open
-ledger); `ledger_hash` is honored (it was ignored); trust lines are paged until the limit is filled with lines that pass the
-filters (the original cut the first page and filtered afterwards, so a `currency` could miss lines); `limit=all` pages to
-completion (within 30 s); a date older than the first stored ledger is 400 (the original answered 500); balances are exact decimal
-strings.
+**The current ledger.** Trust lines come in the node's order. Responses are cached in memory for `GH_LIVE_CACHE_TTL_MS` (default
+10 s) per resolved request, so a `validated` answer is at most that old; the body says which ledger it was read at. The answer says
+the same downstream: `Cache-Control: private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`private, max-age=10` by default), or
+`no-store` when the live cache is off (`GH_LIVE_CACHE_TTL_MS=0`), in place of the global `GH_CACHE_CONTROL`. `limit=all` pages the
+node for at most 30 s in all; an account that needs longer gets 500 `unable to retrieve balances`. The pages of trust lines after
+`account_info` are read from the index the node answered with (a marker belongs to one ledger).
+
+Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, 400 `the date provided
+is too old` (historical: see above; current: the node does not have the ledger), 404 `account not found` (no state of the account at
+the ledger, or the node does not know it); 500 `unable to retrieve balances`.
+
+**Differences from data.ripple.com**: a historical ledger is read from the state history, not from the node, so its trust lines are
+ordered by (counterparty, currency) rather than in the node's order, and its answer always has `close_time`
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) item 63); the default ledger
+is the newest **validated** one (the original asked for the open ledger); `ledger_hash` is honored (it was ignored); trust lines are
+paged until the limit is filled with lines that pass the filters (the original cut the first page and filtered afterwards, so a
+`currency` could miss lines); `limit=all` pages to completion (within 30 s); a date older than the first stored ledger is 400 (the
+original answered 500); balances are exact decimal strings.
 
 ### `GET /v2/accounts/{address}/orders`
 
 The open offers of the account on a ledger of the live node, with the same ledger selectors, `limit` (200, max 400, or `all`),
-error order, caching (the in-memory live cache and its `Cache-Control`), 30 s limit of `limit=all` and ledger of the pages after
-the first as `/balances` (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened).
+error order, caching (the in-memory live cache and its `Cache-Control`) and 30 s limit of `limit=all` as `/balances` at the current
+ledger (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened). Unlike `/balances`, every ledger is read from
+the node, a historical one too: a hash or a ledger number is forwarded to it, a date becomes the last stored ledger closed at or
+before it, and the pages after the first are read from the ledger named, or from the index the node answered with for `validated` /
+`closed` / `current`.
 
 ```json
 { "result": "success", "ledger_index": 107695660, "limit": 200,
