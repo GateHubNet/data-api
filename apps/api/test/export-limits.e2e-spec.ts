@@ -1,4 +1,4 @@
-import { MemoryExportStorage } from '@gatehub/data-api-shared';
+import { EXPORT_FORMATS, MemoryExportStorage } from '@gatehub/data-api-shared';
 import { ExportWorker } from '../../exporter/src/export-worker';
 import { Harness, NO_RATE_LIMIT, startHarness, TEST_API_KEY } from './harness';
 
@@ -9,6 +9,10 @@ import { Harness, NO_RATE_LIMIT, startHarness, TEST_API_KEY } from './harness';
  */
 
 const BUSY = 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q'; // 179 transactions in the mock ledgers, one of them in February 2015
+/** 42 transactions in the mock ledgers: 23 payments, 14 offers created and 5 cancelled. */
+const MIXED = 'rBQkEKFMnBjc19DRaY7ThLJ2woqQManbTt';
+/** 46 transactions in the mock ledgers, 45 of them sent by the account, 3 of those failed payments. */
+const SENDER = 'rJAeQMhtr89PvFPnAZXkdgJgScZ1YuB9UR';
 /** Accounts with 59, 23 and 21 payments in the mock ledgers. */
 const PAYING = [
   'rwvLbHQtU16BwQJyrQb9cfFKvx13Ksbkja',
@@ -21,6 +25,11 @@ const transactions = (address: string, query: string) => `/v2/accounts/${address
 const WINDOW = 'start=2013-01-01&end=2018-01-01';
 /** A list of one row. */
 const SHORT = transactions(BUSY, 'start=2015-02-01&end=2015-03-01');
+/**
+ * PDF exports come with ticket #17; until the api takes the format, the tests of its cap wait for it. The cap does not
+ * depend on the rendering: it is checked when the export is asked for and while the list is walked.
+ */
+const withPdf = (EXPORT_FORMATS as readonly string[]).includes('pdf') ? it : it.skip;
 const payments = (address: string) => `/v2/accounts/${address}/payments?${WINDOW}`;
 /** The caps of this harness, for the api and its exporter alike. */
 const CSV_CAP = 23;
@@ -35,7 +44,12 @@ describe('export limits', () => {
     h = await startHarness({
       seed: 'ripple-mock',
       exportStorage: storage,
-      env: { ...NO_RATE_LIMIT, GH_API_KEYS: `${TEST_API_KEY},${OTHER_KEY},${EXPORTER_KEY}` },
+      env: {
+        ...NO_RATE_LIMIT,
+        GH_API_KEYS: `${TEST_API_KEY},${OTHER_KEY},${EXPORTER_KEY}`,
+        GH_EXPORT_MAX_ROWS_CSV: String(CSV_CAP),
+        GH_EXPORT_MAX_ROWS_PDF: String(PDF_CAP),
+      },
     });
     worker = new ExportWorker({
       ch: h.ch,
@@ -133,6 +147,68 @@ describe('export limits', () => {
         expect([address, job.status, job.rows]).toEqual([address, 'done', rows]);
       }
       expect(await rowsOf(payments(PAYING[1]))).toBe(CSV_CAP);
+    });
+
+    it('refuses up front an export of account transactions above the cap of CSV, and says to narrow the window', async () => {
+      const path = transactions(BUSY, WINDOW);
+      expect(await rowsOf(path)).toBeGreaterThan(CSV_CAP);
+      const res = await post({ path, format: 'csv' });
+      expect([res.status, res.body]).toEqual([
+        400,
+        {
+          result: 'error',
+          message: `the list has more than ${CSV_CAP} rows, the most a CSV export holds: narrow the window`,
+        },
+      ]);
+    });
+
+    it.each([
+      ['every transaction of the account', MIXED, '', 42, 400],
+      ['its payments: as many as the cap', MIXED, '&type=Payment', 23, 202],
+      ['its offers', MIXED, '&type=OfferCreate', 14, 202],
+      ['its failed payments', SENDER, '&type=Payment&result=tecPATH_DRY', 3, 202],
+    ])(
+      'counts account transactions up front as the list serves them: %s',
+      async (_case, address, filter, rows, code) => {
+        const path = transactions(address, `${WINDOW}${filter}`);
+        expect(await rowsOf(path)).toBe(rows);
+        const res = await post({ path, format: 'csv' });
+        expect(res.status).toBe(code);
+        await drain();
+      },
+    );
+
+    it('does not count the list by sequence up front: the exporter holds it to the cap', async () => {
+      const path = transactions(SENDER, `${WINDOW}&min_sequence=1`);
+      expect(await rowsOf(path)).toBeGreaterThan(CSV_CAP);
+      const job = await made(path);
+      expect([job.status, job.error]).toEqual([
+        'failed',
+        `the list has more than ${CSV_CAP} rows, the most a CSV export holds: narrow the window`,
+      ]);
+    });
+
+    withPdf('refuses up front an export in PDF above its cap, and says to narrow the window or use CSV', async () => {
+      const path = transactions(MIXED, `${WINDOW}&type=OfferCreate`);
+      expect(await rowsOf(path)).toBeGreaterThan(PDF_CAP);
+      const res = await post({ path, format: 'pdf' });
+      expect([res.status, res.body]).toEqual([
+        400,
+        {
+          result: 'error',
+          message: `the list has more than ${PDF_CAP} rows, the most a PDF export holds: narrow the window or use CSV`,
+        },
+      ]);
+    });
+
+    withPdf('fails an export in PDF whose list turns out longer than its cap, and says to use CSV', async () => {
+      const path = payments(PAYING[2]);
+      expect(await rowsOf(path)).toBeGreaterThan(PDF_CAP);
+      const job = await made(path, 'pdf');
+      expect([job.status, job.error]).toEqual([
+        'failed',
+        `the list has more than ${PDF_CAP} rows, the most a PDF export holds: narrow the window or use CSV`,
+      ]);
     });
   });
 });

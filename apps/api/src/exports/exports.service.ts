@@ -7,10 +7,12 @@ import {
   ExportFormat,
   ExportJobsRow,
   exportNow,
+  exportRowCap,
   ExportStorage,
   isExportId,
   newExportId,
   readExportJob,
+  tooManyExportRows,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { badRequest, notFound, RippleHttpError } from '../common/errors';
@@ -55,7 +57,9 @@ export class ExportsService {
   /**
    * Queues an export of `body.path` in `body.format` for the key whose hash is `keyHash`. The checks, in order: the path
    * (a `/v2/` path of a list with a CSV form), its window (a list over time names `start` and `end`), the format, then
-   * the exports the key already has queued or running (ticket #16: at most `GH_EXPORT_MAX_JOBS_PER_KEY`, 429 beyond).
+   * the exports the key already has queued or running (ticket #16: at most `GH_EXPORT_MAX_JOBS_PER_KEY`, 429 beyond),
+   * and last the rows of the list where the list counts them up front (`@ExportCount`): above the cap of the format,
+   * 400. A list that does not count them is held to the cap by the exporter, as it walks the pages.
    */
   async create(body: unknown, keyHash: string): Promise<Pick<ExportBody, 'result' | 'id' | 'status'>> {
     this.available();
@@ -74,6 +78,9 @@ export class ExportsService {
     if ((await activeExportJobs(this.ch, keyHash)) >= most) {
       throw new RippleHttpError(429, `too many exports in progress: at most ${most} per API key`);
     }
+    const cap = exportRowCap({ csv: this.config.exportMaxRowsCsv, pdf: this.config.exportMaxRowsPdf }, format);
+    const rows = cap === undefined ? undefined : await this.routes.count(url);
+    if (cap !== undefined && rows !== undefined && rows > cap) throw badRequest(tooManyExportRows(format, cap));
 
     const now = exportNow();
     const job: ExportJobsRow = {
