@@ -123,6 +123,10 @@ x-api-env: &api-env
   # Exports (ticket #15): empty GH_EXPORT_BUCKET = off. The key file is mounted (see the volumes of the apis).
   GH_EXPORT_BUCKET:
   GOOGLE_APPLICATION_CREDENTIALS:
+  # Export limits (ticket #16): exports per key, and the row caps the exporters share.
+  GH_EXPORT_MAX_JOBS_PER_KEY:
+  GH_EXPORT_MAX_ROWS_CSV:
+  GH_EXPORT_MAX_ROWS_PDF:
   GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
   GH_HTTP_API_PORT: 3001
   GH_METRICZ_PORT: 3000
@@ -153,6 +157,8 @@ x-exporter-env: &exporter-env
   GH_EXPORT_PAGE_SIZE:
   GH_EXPORT_POLL_MS:
   GH_EXPORT_REQUEST_TIMEOUT_MS:
+  GH_EXPORT_MAX_ROWS_CSV:
+  GH_EXPORT_MAX_ROWS_PDF:
   GH_HTTP_API_PORT: 3005
   GH_METRICZ_PORT: 3000
 
