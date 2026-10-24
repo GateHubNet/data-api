@@ -27,7 +27,7 @@ export const RIPPLE_MOCK_DIR = join(FIXTURES, 'xrpl', 'ripple-mock');
 export const XRPL_RECORDED_DIR = join(FIXTURES, 'xrpl', 'recorded');
 /** Mainnet ledgers recorded around AMM transactions (swaps, deposits, withdrawals, votes, bids): see the fixtures README. */
 export const XRPL_AMM_DIR = join(FIXTURES, 'xrpl', 'amm');
-/** Mainnet ledgers around changes of account flags and an AccountDelete: see the fixtures README. */
+/** Mainnet ledgers around changes of account flags, trust line settings and an AccountDelete: see the fixtures README. */
 export const XRPL_ACCOUNT_STATE_DIR = join(FIXTURES, 'xrpl', 'account-state');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
 /** Xahau flag ledger 26570752: 22 UNLReport pseudo-transactions with `Account: ""`, and 15 Payments. */
