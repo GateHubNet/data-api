@@ -7,6 +7,7 @@
 #   docker compose --profile full up -d --build          + the XRPL stack: migrate-xrpl, syncer-xrpl, api-xrpl
 #   docker compose --profile xahau up -d --build         + the Xahau stack: migrate-xahau, syncer-xahau, api-xahau
 #   docker compose --profile full --profile xahau up -d --build    both networks
+#   docker compose --profile full --profile exports up -d --build  + exporter-xrpl (exports, ticket #15; xahau-exports for Xahau)
 #   docker compose run --rm migrate-xahau                apply the schema of one network on its own
 #   docker compose run --rm migrate-shared               apply the schema of the shared database on its own
 #
@@ -25,7 +26,12 @@
 # Next to another stack: no container has a fixed name (compose names them after the project), and every host port can be
 # moved with a variable (defaults in brackets): CLICKHOUSE_HTTP_PORT (8123), CLICKHOUSE_NATIVE_PORT (9000),
 # XRPL_API_PORT (3001), XRPL_API_METRICZ_PORT (3003), XRPL_SYNCER_PORT (3002), XRPL_SYNCER_METRICZ_PORT (3004),
-# XAHAU_API_PORT (3011), XAHAU_API_METRICZ_PORT (3013), XAHAU_SYNCER_PORT (3012), XAHAU_SYNCER_METRICZ_PORT (3014). E.g.
+# XAHAU_API_PORT (3011), XAHAU_API_METRICZ_PORT (3013), XAHAU_SYNCER_PORT (3012), XAHAU_SYNCER_METRICZ_PORT (3014),
+# XRPL_EXPORTER_PORT (3005), XRPL_EXPORTER_METRICZ_PORT (3006), XAHAU_EXPORTER_PORT (3015), XAHAU_EXPORTER_METRICZ_PORT (3016).
+#
+# Exports (POST /v2/exports) need a Google Cloud Storage bucket: GH_EXPORT_BUCKET for the apis and the exporters, and a
+# service account key mounted into them (the commented volumes below, with GOOGLE_APPLICATION_CREDENTIALS). Without a bucket
+# the apis answer 503 on /v2/exports and the exporters refuse to start. E.g.
 #   docker compose -p my-check up -d clickhouse                                        a second stack, default ports
 #   CLICKHOUSE_HTTP_PORT=18123 CLICKHOUSE_NATIVE_PORT=19000 docker compose -p my-check up -d clickhouse
 
@@ -37,6 +43,11 @@ x-syncer-build: &syncer-build
 x-api-build: &api-build
   context: .
   dockerfile: apps/api/Dockerfile
+  secrets: [npm_token]
+
+x-exporter-build: &exporter-build
+  context: .
+  dockerfile: apps/exporter/Dockerfile
   secrets: [npm_token]
 
 x-clickhouse-client: &clickhouse-client
@@ -60,6 +71,13 @@ x-syncer-healthcheck: &syncer-healthcheck
   timeout: 5s
   retries: 5
   start_period: 60s
+
+x-exporter-healthcheck: &exporter-healthcheck
+  test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3005/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
 
 services:
   clickhouse:
@@ -167,10 +185,14 @@ services:
       GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
       # Empty = the config/amendments/xrpl.json that ships in the image (the same file as the syncer's).
       GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
+      # Empty = exports off. The exporter's key (XRPL_EXPORTER_API_KEY, default dev-api-key) must be one of GH_API_KEYS.
+      GH_EXPORT_BUCKET: ${GH_EXPORT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER:-}
       GH_HTTP_API_PORT: 3001
       GH_METRICZ_PORT: 3000
     # volumes:
     #   - ./deploy/amendments-xrpl.json:/etc/gatehub/amendments.json:ro # and XRPL_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER=/etc/gatehub/gcs.json
     depends_on:
       migrate-xrpl:
         condition: service_completed_successfully
@@ -181,6 +203,34 @@ services:
     ports:
       - '127.0.0.1:${XRPL_API_PORT:-3001}:3001' # /v2/*, /liveliness/healthz, /internal/docs
       - '127.0.0.1:${XRPL_API_METRICZ_PORT:-3003}:3000' # /metricz
+
+  # The exports of XRPL (ticket #15): exactly one, it takes the queued jobs and walks the lists through api-xrpl.
+  exporter-xrpl:
+    profiles: ['exports']
+    build: *exporter-build
+    image: gatehub/data-exporter:${IMAGE_TAG:-dev}
+    pull_policy: build
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xrpl
+      GH_API_URL: http://api-xrpl:3001
+      GH_EXPORTER_API_KEY: ${XRPL_EXPORTER_API_KEY:-dev-api-key}
+      GH_EXPORT_BUCKET: ${GH_EXPORT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER:-}
+      GH_HTTP_API_PORT: 3005
+      GH_METRICZ_PORT: 3000
+    # volumes:
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER=/etc/gatehub/gcs.json
+    depends_on:
+      migrate-xrpl:
+        condition: service_completed_successfully
+      api-xrpl:
+        condition: service_healthy
+    healthcheck: *exporter-healthcheck
+    stop_grace_period: 30s
+    ports:
+      - '127.0.0.1:${XRPL_EXPORTER_PORT:-3005}:3005' # /liveliness/healthz
+      - '127.0.0.1:${XRPL_EXPORTER_METRICZ_PORT:-3006}:3000' # /metricz
 
   # ---------------------------------------------------------------- Xahau (profile: xahau)
 
@@ -243,10 +293,14 @@ services:
       GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
       # Empty = the config/amendments/xahau.json that ships in the image (the same file as the syncer's).
       GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
+      # Empty = exports off (see api-xrpl).
+      GH_EXPORT_BUCKET: ${GH_EXPORT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER:-}
       GH_HTTP_API_PORT: 3001
       GH_METRICZ_PORT: 3000
     # volumes:
     #   - ./deploy/amendments-xahau.json:/etc/gatehub/amendments.json:ro # and XAHAU_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER=/etc/gatehub/gcs.json
     depends_on:
       migrate-xahau:
         condition: service_completed_successfully
@@ -257,6 +311,34 @@ services:
     ports:
       - '127.0.0.1:${XAHAU_API_PORT:-3011}:3001' # /v2/*, /liveliness/healthz, /internal/docs
       - '127.0.0.1:${XAHAU_API_METRICZ_PORT:-3013}:3000' # /metricz
+
+  # The exports of Xahau: exactly one (see exporter-xrpl).
+  exporter-xahau:
+    profiles: ['xahau-exports']
+    build: *exporter-build
+    image: gatehub/data-exporter:${IMAGE_TAG:-dev}
+    pull_policy: build
+    environment:
+      <<: *clickhouse-client
+      GH_NETWORK: xahau
+      GH_API_URL: http://api-xahau:3001
+      GH_EXPORTER_API_KEY: ${XAHAU_EXPORTER_API_KEY:-dev-api-key}
+      GH_EXPORT_BUCKET: ${GH_EXPORT_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER:-}
+      GH_HTTP_API_PORT: 3005
+      GH_METRICZ_PORT: 3000
+    # volumes:
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS_IN_CONTAINER=/etc/gatehub/gcs.json
+    depends_on:
+      migrate-xahau:
+        condition: service_completed_successfully
+      api-xahau:
+        condition: service_healthy
+    healthcheck: *exporter-healthcheck
+    stop_grace_period: 30s
+    ports:
+      - '127.0.0.1:${XAHAU_EXPORTER_PORT:-3015}:3005' # /liveliness/healthz
+      - '127.0.0.1:${XAHAU_EXPORTER_METRICZ_PORT:-3016}:3000' # /metricz
 
 # The npm token for the private @gatehub/toolbox, read from the NPM_TOKEN environment variable at build time only.
 secrets:
