@@ -154,6 +154,8 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   and should come before the syncer (advisable: the syncer writes the column on every row of every live volume set, and on the pinned ClickHouse a row with a field the table lacks is inserted without it, with no error,
   so the fee estimates of the ticks before the migration are lost and the live `amm_volume` day set reads as not known until `migrate` has run and the next tick has written it; `syncer_aggregator_errors_total{job="volume_live"}` does not show it).
   The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last ([the AMM data additions](operations.md#the-amm-data-additions)).
+- `009_account_network_names.sql` (one `CREATE TABLE IF NOT EXISTS`, the operator's account network names) is additive and comes before the api: an api without it serves
+  every account without a network name and logs the failed load at every reload, but answers. The syncer never touches the table. The compose files make the api wait for `migrate`.
 
 ## Configuration and secrets
 

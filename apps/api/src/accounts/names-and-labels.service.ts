@@ -3,6 +3,7 @@ import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nest
 import { ApiConfig, SHARED_DATABASE } from '../config/api.config';
 import { ACCOUNT_LABELS, AccountLabels } from './account-labels';
 import { ACCOUNT_NAMES } from './account-names';
+import { ACCOUNT_NETWORK_NAMES } from './account-network-names';
 
 /**
  * What the operator's names and labels add to `account_data` of `GET /v2/accounts/{address}` (ADR-0014), each key left
@@ -11,6 +12,8 @@ import { ACCOUNT_NAMES } from './account-names';
 export interface NamesAndLabels {
   /** The account name of the address, the same on every network. */
   account_name?: string;
+  /** The account network name of the address: its name on this network only. */
+  account_network_name?: string;
   /** The labels of the address keyed by label (`scam`, `spam`, `advisory`), the same on every network. */
   account_labels?: AccountLabels;
 }
@@ -35,10 +38,14 @@ export interface NamesAndLabelsSet {
 }
 
 /**
- * The sets, in the order their keys come in `account_data`: account names (`account_name`), the account network names
- * when they are added, then the labels (`account_labels`).
+ * The sets, in the order their keys come in `account_data`: account names (`account_name`), account network names
+ * (`account_network_name`), then the labels (`account_labels`).
  */
-export const NAMES_AND_LABELS_SETS: readonly NamesAndLabelsSet[] = [ACCOUNT_NAMES, ACCOUNT_LABELS];
+export const NAMES_AND_LABELS_SETS: readonly NamesAndLabelsSet[] = [
+  ACCOUNT_NAMES,
+  ACCOUNT_NETWORK_NAMES,
+  ACCOUNT_LABELS,
+];
 
 /**
  * The names and labels the operator writes by hand (ADR-0014), held in memory: every set is loaded whole when the app

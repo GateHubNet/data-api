@@ -2,6 +2,7 @@ import {
   AccountAmmLiquidityRow,
   AccountExchangesRow,
   AccountLinesDailyRow,
+  AccountNetworkNamesRow,
   AccountPartitionRowsRow,
   AccountPaymentsRow,
   AccountRollupDaysRow,
@@ -100,6 +101,7 @@ export interface TableRows {
   [Table.AccountLinesDaily]: AccountLinesDailyRow;
   [Table.AccountTxDaily]: AccountTxDailyRow;
   [Table.AccountTradesDaily]: AccountTradesDailyRow;
+  [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
   [Table.AggDirty]: AggDirtyRow;
   [Table.SyncerLease]: SyncerLeaseRow;
@@ -738,6 +740,13 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     bought_counter_sum_f: 315.125,
     sold_counter_sum_f: 210.125,
     version: VERSION_MS,
+  },
+  [Table.AccountNetworkNames]: {
+    address: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh',
+    name: 'USD Issuer',
+    removed: 0,
+    added_by: 'ops@gatehub.net',
+    added_at: CLOSE_MS,
   },
   [Table.IngestLog]: { range_start: 100, range_end: 199, run_id: 'run-1', status: 'done', updated_at: CLOSE_MS },
   [Table.AggDirty]: { from_hour: 1_699_999_200, to_hour: 1_700_002_800, created_at: CLOSE_MS },

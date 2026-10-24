@@ -204,8 +204,9 @@ balance_changes, counterparties, exchanges}` and `GET /v2/network/markets`, and 
 one now gets buckets). Their AMM data additions add the parameter `amm` and the fields `amm_share` and `amm_pool` to `GET /v2/network/markets`, the
 fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, and `computed_start` and `computed_end` to `GET /v2/amm/pools/{pool}/history?interval=day`.
 
-From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields `account_name` and
-`account_labels` of `GET /v2/accounts/{address}`, the name the operator gave the address and the labels the operator put on it.
+From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields of
+`GET /v2/accounts/{address}` `account_name`, the name the operator gave the address, `account_network_name`, the name the operator gave
+the account on this network only, and `account_labels`, the labels the operator put on the address.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -648,37 +649,42 @@ accounts`.
 
 ### `GET /v2/accounts/{address}`
 
-The latest activation of the account, the name the operator gave its address and the labels the operator put on it.
+The latest activation of the account, the name the operator gave its address, the name it gave the account on this network and
+the labels it put on the address.
 
 ```json
 { "result": "success",
   "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
-                    "ledger_index": 11119603, "tx_hash": "…", "account_name": "…",
+                    "ledger_index": 11119603, "tx_hash": "…", "account_name": "…", "account_network_name": "…",
                     "account_labels": { "scam": { "description": "Fake giveaway", "url": "https://…" },
                                         "advisory": { "description": "…", "source": "…", "url": "https://…" } } } }
 ```
 
 Key order: `account, parent, initial_balance, inception, ledger_index, tx_hash, genesis_balance?, genesis_index?,
-account_name?, account_labels?`.
+account_name?, account_network_name?, account_labels?`.
 
 - `account_name`: the **account name** of the address ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
   the same on every network. The operator writes it into the shared database by hand
   ([operations](operations.md#name-an-address)); the api loads the names every 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a
   new or removed name shows within that time. Left out when the address has none.
+- `account_network_name`: the **account network name** of the account, its name on this network only ("USD Issuer" for
+  GateHub's issuing address on the XRP Ledger, which Xahau does not show). The operator writes it into the network's own
+  database by hand ([operations](operations.md#name-an-account-on-one-network)); it is loaded and reloaded with the names (60 s).
+  It is served with or without an `account_name`, and left out when the account has none.
 - `account_labels`: the **labels** of the address, the same on every network: an object keyed by label (`scam`, `spam`,
   `advisory`, in that order), each `{ description, source?, url? }` in that key order, where `source` says who says so and `url`
   links to where; each is left out when empty. The operator writes them into the shared database by hand
   ([operations](operations.md#label-an-address)), and they load and reload with the names, so a new or removed label shows
   within 60 s. Left out when the address has no label.
 
-The name and the labels do not make an account: an address with a name or a label but no activation on this network still
+The names and the labels do not make an account: an address with a name or a label but no activation on this network still
 answers 404. Errors: 404 `Account not found`; 500 `unable to get accounts`.
 
 **Differences from data.ripple.com** (both routes): an address that was created more than once (deleted with `AccountDelete`
 and funded again) answers with its **latest** creation; the original answered with the earliest. A transaction that creates
-several accounts is listed once per account (the original kept the last). `GET /v2/accounts/{address}` adds `account_name`
-and `account_labels`, GateHub extras ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data)
-items 55 and 57).
+several accounts is listed once per account (the original kept the last). `GET /v2/accounts/{address}` adds `account_name`,
+`account_network_name` and `account_labels`, GateHub extras
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 55, 58 and 57).
 
 ### `GET /v2/accounts/{address}/transactions`
 

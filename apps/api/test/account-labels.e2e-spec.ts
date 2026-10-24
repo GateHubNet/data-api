@@ -79,6 +79,14 @@ async function nameAddress(h: Harness, address: string, name: string): Promise<v
   );
 }
 
+/** The operator's insert of an account network name, in the network database of `h`. */
+async function nameAccountOnNetwork(h: Harness, address: string, name: string): Promise<void> {
+  await h.ch.command(
+    `INSERT INTO ${h.database}.account_network_names (address, name, added_by) VALUES ({address:String}, {name:String}, 'ops@gatehub.net')`,
+    { address, name },
+  );
+}
+
 /** `account_data` of an address on `h`. */
 async function accountData(h: Harness, address: string): Promise<Record<string, unknown>> {
   const res = await (await h.api()).get(`/v2/accounts/${address}`);
@@ -198,6 +206,12 @@ describe('labels on /v2/accounts/{address}', () => {
     await labelAddress(h, GATEHUB, 'advisory', { description: 'Test label on a known address' });
     const data = await eventually(h, GATEHUB, (d) => 'account_name' in d && 'account_labels' in d);
     expect(Object.keys(data)).toEqual([...RIPPLE_KEYS, 'account_name', 'account_labels']);
+  });
+
+  it('an account with a name, a network name and a label carries account_labels last', async () => {
+    await nameAccountOnNetwork(h, GATEHUB, 'USD Issuer');
+    const data = await eventually(h, GATEHUB, (d) => 'account_network_name' in d && 'account_labels' in d);
+    expect(Object.keys(data)).toEqual([...RIPPLE_KEYS, 'account_name', 'account_network_name', 'account_labels']);
   });
 
   it('an address with a label and no activation on the network is still not found', async () => {

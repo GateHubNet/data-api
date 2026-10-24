@@ -21,6 +21,7 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 | Swagger | `GET /internal/docs` (not exposed by nginx; reach the api container directly) |
 | Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` / `migrate-shared` (idempotent) |
 | Account names | `INSERT INTO shared.account_names ...`, shows within 60 s: [Name an address](#name-an-address) |
+| Account network names | `INSERT INTO xrpl.account_network_names ...` (or `xahau.`), shows within 60 s on that network only: [Name an account on one network](#name-an-account-on-one-network) |
 | Labels | `INSERT INTO shared.account_labels ...`, shows within 60 s: [Label an address](#label-an-address) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) |
@@ -109,6 +110,38 @@ SELECT * FROM shared.account_names WHERE address = '<address>' ORDER BY added_at
 
 Nothing checks the address or the name: a typo in either shows within a minute, and is fixed with a newer row. With
 `GH_CLICKHOUSE_SHARED_DATABASE` set, use that database in place of `shared`.
+
+### Name an account on one network
+
+The **account network name** of an account ("USD Issuer" for GateHub's issuing address on the XRP Ledger) is written by hand into
+`account_network_names` of **that network's database** (`xrpl` or `xahau`, migration `009`) and shows on `GET /v2/accounts/{address}`
+(`account_network_name`, after `account_name`) of **that network only**, within 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), with no restart. It
+needs no account name: an account can have either, both or neither. The table has the columns and rules of `shared.account_names`: append-only
+(never `UPDATE`, `DELETE` or `OPTIMIZE ... FINAL` it), the newest row of an address wins, removing is an insert with `removed = 1`, your own name or
+email goes in `added_by` and `added_at` is filled in. It shows only where the address has an activation.
+
+```sql
+-- give an account a name on the XRP Ledger, or a new one (the newest row wins)
+INSERT INTO xrpl.account_network_names (address, name, added_by)
+VALUES ('<address>', 'USD Issuer', 'ops@gatehub.net');
+
+-- remove it
+INSERT INTO xrpl.account_network_names (address, name, removed, added_by)
+VALUES ('<address>', '', 1, 'ops@gatehub.net');
+
+-- the network name each account has now, as the api reads it
+SELECT address, name, added_by, added_at
+FROM (SELECT * FROM xrpl.account_network_names ORDER BY address, added_at DESC, removed DESC LIMIT 1 BY address)
+WHERE removed = 0 AND name != '';
+
+-- the history of one address
+SELECT * FROM xrpl.account_network_names WHERE address = '<address>' ORDER BY added_at;
+```
+
+On Xahau write `xahau.account_network_names` (the network database is `GH_CLICKHOUSE_DATABASE` when it is set). A name inserted into the wrong
+network's database shows there, not on the network meant: remove it there with a `removed = 1` row and insert it into the right one. The table
+comes with `migrate-<network>` (migration `009`): an api started before it serves every account without a network name and logs
+`Could not load the account network names` at every reload, until the job has run.
 
 ### Label an address
 
