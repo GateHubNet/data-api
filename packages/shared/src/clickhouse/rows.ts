@@ -22,11 +22,19 @@
  *  - 1: the Ripple v2 data (payments, exchanges, balance changes, accounts created).
  *  - 2: AMM data (swaps as exchanges, pool states, liquidity, governance). Ledgers from the AMM enablement ledger
  *       (86795265 on mainnet) written with version 1 lack these rows; `--reprocess` rewrites them.
+ *  - 3: kept for the account and trust line states of spec #4, which ship with their own constant.
+ *  - 4: path payments (`path_payments`). Ledgers written with an older version have none; `--reprocess` rewrites them.
+ *
+ * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
+ * `PATH_PARSER_VERSION`), never with `PARSER_VERSION`.
  */
-export const PARSER_VERSION = 2;
+export const PARSER_VERSION = 4;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
+
+/** The first parser version that writes `path_payments`: a ledger written by an older one lacks them. */
+export const PATH_PARSER_VERSION = 4;
 
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;
@@ -328,6 +336,28 @@ export interface AmmGovernanceRow {
   slot_discounted_fee: number | null;
   slot_expiration: number | null;
   auth_accounts: string[];
+}
+
+/** A path payment (migration 007): one row per successful Payment whose delivery used someone else's liquidity. */
+export interface PathPaymentsRow {
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  source: string;
+  destination: string;
+  delivered_amount: string;
+  currency: string;
+  /** `''` for the native currency. */
+  issuer: string;
+  /** What left the source, the fee not included. */
+  source_amount: string;
+  source_currency: string;
+  /** `''` for the native currency. */
+  source_issuer: string;
+  offers_crossed: number;
+  amm_pools: string[];
+  rippled_through: string[];
 }
 
 // -- Node-sourced tables -----------------------------------------------------------------------------------------

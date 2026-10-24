@@ -85,6 +85,7 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, ledger_index, tx_index, amm_account',
   },
   [Table.AmmGovernance]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
+  [Table.PathPayments]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -242,6 +243,9 @@ const MIGRATION_003_TABLES: Table[] = [
 /** The fee estimates of the AMM volume's live day set (D2b): one column of `volume_live`. */
 const MIGRATION_004 = '004_amm_fee_estimates.sql';
 
+/** The path payments (spec #4, ticket #13): one ledger-derived table. */
+const MIGRATION_007 = '007_path_payments.sql';
+
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
   Table.Ledgers,
@@ -263,6 +267,7 @@ const DEDUP_TABLES: Table[] = [
   Table.AmmLiquidity,
   Table.AccountAmmLiquidity,
   Table.AmmGovernance,
+  Table.PathPayments,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1084,12 +1089,12 @@ describe('migrations (e2e)', () => {
         expect(await tableNames()).toContain(Table.UnlPublishers);
         expect(await tableNames()).not.toContain(Table.ValidatorDomains);
 
-        // The real directory: 002 runs again from its first statement and completes, and 003 and 004, which come after it, are
-        // applied too.
+        // The real directory: 002 runs again from its first statement and completes, and the files after it are applied
+        // too.
         process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
         const result = await runMigrations({ config, log });
         expect(result).toEqual({
-          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004],
+          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004, MIGRATION_007],
           skipped: ['001_baseline.sql'],
         });
 
@@ -1243,6 +1248,64 @@ describe('migrations (e2e)', () => {
           { component: older.component, fees_est_f: null },
         ]);
 
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.onModuleDestroy();
+      }
+    });
+  });
+  describe('migration 007', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-007-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 007 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_007_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_007);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_007);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.PathPayments);
+
+      copyReal([MIGRATION_007]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_007], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.PathPayments);
+
+      const svc = new ClickHouseService(config);
+      try {
+        await svc.insert(Table.PathPayments, [SAMPLE_ROWS[Table.PathPayments]]);
+        expect(
+          await svc.query(
+            `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${Table.PathPayments}`,
+          ),
+        ).toEqual([SAMPLE_ROWS[Table.PathPayments]]);
         expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
       } finally {
         await svc.onModuleDestroy();

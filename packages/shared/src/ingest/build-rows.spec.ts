@@ -1,6 +1,6 @@
 import BigNumber from 'bignumber.js';
 import { createHash } from 'crypto';
-import { readFileSync } from 'fs';
+import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
@@ -15,7 +15,12 @@ import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
 
 const PACKAGE_ROOT = join(__dirname, '..', '..');
 const FIXTURES = join(PACKAGE_ROOT, 'test', 'fixtures');
-const DDL = readFileSync(join(PACKAGE_ROOT, 'schema', '001_baseline.sql'), 'utf8');
+/** Every migration file of the network database, in the order the runner applies them. */
+const DDL = readdirSync(join(PACKAGE_ROOT, 'schema'))
+  .filter((f) => f.endsWith('.sql'))
+  .sort()
+  .map((f) => readFileSync(join(PACKAGE_ROOT, 'schema', f), 'utf8'))
+  .join('\n');
 
 const XRPL: ParseContext = parseContextFor(getNetworkProfile('xrpl'));
 const XAHAU: ParseContext = parseContextFor(getNetworkProfile('xahau'));
@@ -125,12 +130,13 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.AmmLiquidity, 'ammLiquidity'],
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
+  [Table.PathPayments, 'pathPayments'],
 ];
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
 function ddlColumns(table: Table): string[] {
   const match = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\n\\(\\n([\\s\\S]*?)\\n\\)\\s*\\nENGINE`).exec(DDL);
-  if (!match) throw new Error(`no CREATE TABLE found for ${table} in 001_baseline.sql`);
+  if (!match) throw new Error(`no CREATE TABLE found for ${table} in schema/*.sql`);
   return match[1]
     .split('\n')
     .map((line) => line.trim())
@@ -142,7 +148,7 @@ function orderByColumns(table: Table): string[] {
   const match = new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\n[\\s\\S]*?\\nORDER BY \\(?([^)\\n]+)\\)?`).exec(
     DDL,
   );
-  if (!match) throw new Error(`no ORDER BY found for ${table} in 001_baseline.sql`);
+  if (!match) throw new Error(`no ORDER BY found for ${table} in schema/*.sql`);
   return match[1].split(',').map((c) => c.trim());
 }
 
@@ -1303,10 +1309,10 @@ describe('AMM rows (parser version 2)', () => {
       }
     });
 
-    it('stores parser_version 2', () => {
-      expect(PARSER_VERSION).toBe(2);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(2);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(2);
+    it('stores parser_version 4 (path payments)', () => {
+      expect(PARSER_VERSION).toBe(4);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(4);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(4);
     });
   });
 
@@ -1360,7 +1366,7 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
 }
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data and the 5 AMM ones', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones and the path payments', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -1382,6 +1388,7 @@ describe('CHILD_TABLES', () => {
         Table.AmmLiquidity,
         Table.AccountAmmLiquidity,
         Table.AmmGovernance,
+        Table.PathPayments,
       ].sort(),
     );
   });

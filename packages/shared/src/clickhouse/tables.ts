@@ -22,6 +22,8 @@ export enum Table {
   AmmLiquidity = 'amm_liquidity',
   AccountAmmLiquidity = 'account_amm_liquidity',
   AmmGovernance = 'amm_governance',
+  // Path payments (migration 007, written by ingest).
+  PathPayments = 'path_payments',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',

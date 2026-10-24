@@ -31,6 +31,7 @@ import {
   NetworkStateRow,
   PairHourlyRow,
   PARSER_VERSION,
+  PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
   StatsHourlyRow,
@@ -73,6 +74,7 @@ export interface TableRows {
   [Table.AmmLiquidity]: AmmLiquidityRow;
   [Table.AccountAmmLiquidity]: AccountAmmLiquidityRow;
   [Table.AmmGovernance]: AmmGovernanceRow;
+  [Table.PathPayments]: PathPaymentsRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -350,6 +352,24 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     slot_discounted_fee: 50,
     slot_expiration: 750_086_400,
     auth_accounts: [ALICE, BOB],
+  },
+  // a payment from Alice to Bob through the pool above and one offer
+  [Table.PathPayments]: {
+    ledger_index: LEDGER,
+    tx_index: 5,
+    tx_hash: hash(15),
+    close_time: CLOSE,
+    source: ALICE,
+    destination: BOB,
+    delivered_amount: '10.5',
+    currency: 'USD',
+    issuer: CAROL,
+    source_amount: '7.25',
+    source_currency: 'XRP',
+    source_issuer: '',
+    offers_crossed: 1,
+    amm_pools: [POOL],
+    rippled_through: [],
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,

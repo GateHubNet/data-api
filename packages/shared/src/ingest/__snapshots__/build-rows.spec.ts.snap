@@ -1967,7 +1967,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "ledger_index": 26570752,
     "parent_close_time": 1792166061,
     "parent_hash": "9F2936DE8B5EE15ECD33A9B49E609CCFB2241DD7AAF00DF1E67CF34ADD065A56",
-    "parser_version": 2,
+    "parser_version": 4,
     "payments_count": 15,
     "result_counts": {
       "tesSUCCESS": 37,
@@ -1984,6 +1984,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "ledger_hash": "8DC84412FD250A59CC476DB756DF8F4A5753DF15CAA6C90740CC1B6F9E6762E1",
     "ledger_index": 26570752,
   },
+  "pathPayments": [],
   "payments": [
     {
       "amount": "0.000001",
@@ -3880,7 +3881,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "ledger_index": 26540188,
     "parent_close_time": 1792057530,
     "parent_hash": "C1BB45D8DD5C0E7791932423D7768C60442220D6C5785787FF716DE0D974D2C4",
-    "parser_version": 2,
+    "parser_version": 4,
     "payments_count": 2,
     "result_counts": {
       "tesSUCCESS": 4,
@@ -3898,6 +3899,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "ledger_hash": "CC657D821B26FF8B9B3A95FA460C1731AD4350C9A206503C1C32E0421D9E9845",
     "ledger_index": 26540188,
   },
+  "pathPayments": [],
   "payments": [
     {
       "amount": "0.000001",
@@ -4686,7 +4688,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "ledger_index": 11118827,
     "parent_close_time": 0,
     "parent_hash": "D18572CED3F13BA2AD7B951CB65A943181F1C0DB8FFB4B61F0C4797FBE65E1AC",
-    "parser_version": 2,
+    "parser_version": 4,
     "payments_count": 0,
     "result_counts": {
       "tesSUCCESS": 13,
@@ -4703,6 +4705,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "ledger_hash": "6C36469B9B95B84BB439713BC0D0E914728BE1DED8C19B640765E22D89D84A69",
     "ledger_index": 11118827,
   },
+  "pathPayments": [],
   "payments": [],
   "paymentsByCurrency": [],
   "transactions": [
@@ -6376,7 +6379,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     "ledger_index": 11119620,
     "parent_close_time": 0,
     "parent_hash": "53E8F8A9778B140571E12355244C8DFB832A8B2D5D450B594BD961E204957022",
-    "parser_version": 2,
+    "parser_version": 4,
     "payments_count": 3,
     "result_counts": {
       "tesSUCCESS": 11,
@@ -6394,6 +6397,25 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     "ledger_hash": "FEF54BF4198BD9248AE726552C45560D84B714217AF4B6A01733C3472FCEFD40",
     "ledger_index": 11119620,
   },
+  "pathPayments": [
+    {
+      "amm_pools": [],
+      "close_time": 1421260120,
+      "currency": "USD",
+      "delivered_amount": "2",
+      "destination": "rBHMbioz9znTCqgjZ6Nx43uWY43kToEPa9",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "ledger_index": 11119620,
+      "offers_crossed": 3,
+      "rippled_through": [],
+      "source": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
+      "source_amount": "12.501485927046",
+      "source_currency": "CNY",
+      "source_issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y",
+      "tx_hash": "50A0D86B609E46BB854921CC53D212FE025221A7304ECE9A321DC9656366BF7A",
+      "tx_index": 0,
+    },
+  ],
   "payments": [
     {
       "amount": "2",
@@ -7487,7 +7509,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "ledger_index": 11618225,
     "parent_close_time": 1423513790,
     "parent_hash": "EA9C0029FB0171BC7F26B91E952B792FDA634D30E030BA1CDF4E10309554ADB3",
-    "parser_version": 2,
+    "parser_version": 4,
     "payments_count": 4,
     "result_counts": {
       "tesSUCCESS": 5,
@@ -7504,6 +7526,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "ledger_hash": "113EF1CC2F4C3683AE2C551EB0C08B766292D0A426044AB3DDD5BFB0B264E283",
     "ledger_index": 11618225,
   },
+  "pathPayments": [],
   "payments": [
     {
       "amount": "0.0960072911184",

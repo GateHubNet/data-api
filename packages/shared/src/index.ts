@@ -15,6 +15,7 @@ export * from './parsers/balance-changes.parser';
 export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
 export * from './parsers/parser.interface';
+export * from './parsers/path-payments.parser';
 export * from './parsers/payment.parser';
 
 // Network
