@@ -39,6 +39,7 @@ import {
 } from './config/api.config';
 import { ExchangesModule } from './exchanges/exchanges.module';
 import { RatesModule } from './exchanges/rates.module';
+import { ExportsModule } from './exports/exports.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
@@ -91,6 +92,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ValidatorsModule,
   StatsModule,
   AmmModule,
+  ExportsModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

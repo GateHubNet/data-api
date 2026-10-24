@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@clickhouse/client": "^1.4.0",
+    "@google-cloud/storage": "^7.22.0",
     "@nestjs/common": "^10.3.10",
     "bignumber.js": "^9.1.2",
     "ripple-address-codec": "^5.0.0",

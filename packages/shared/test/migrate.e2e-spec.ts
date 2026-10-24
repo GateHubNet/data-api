@@ -235,6 +235,8 @@ const SHAPES: Record<Table, Shape> = {
     order: 'from_hour, to_hour',
   },
   [Table.SyncerLease]: { engine: 'ReplacingMergeTree', version: 'heartbeat', partition: '', order: 'network' },
+  // append-only: every state of a job is kept, the highest seq is the job (migration 010)
+  [Table.ExportJobs]: { engine: 'MergeTree', partition: '', order: 'id, seq' },
 };
 
 /** The aggregate tables of migration 003 (D2). */
@@ -1588,5 +1590,63 @@ describe('the shared database (e2e)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe('migration 010', () => {
+    const MIGRATION_010 = '010_export_jobs.sql';
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-010-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 010 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_010_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_010);
+      expect(realFiles()).toContain(MIGRATION_010);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      copyReal([MIGRATION_010]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_010], skipped: before });
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('keeps an export job for 7 days after it was created', async () => {
+      const config = { ...ch.config, database: 'ctl_010_ttl' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+      const svc = new ClickHouseService(config);
+      try {
+        const now = Date.now() / 1000;
+        const job = SAMPLE_ROWS[Table.ExportJobs];
+        const created = (days: number) => now - days * 86_400;
+        await svc.insert(Table.ExportJobs, [
+          { ...job, id: 'a'.repeat(32), created: created(8), at: created(8) },
+          { ...job, id: 'b'.repeat(32), created: created(6), at: created(6) },
+        ]);
+        await svc.command(`OPTIMIZE TABLE ${Table.ExportJobs} FINAL`);
+        expect(await svc.query(`SELECT id FROM ${Table.ExportJobs}`)).toEqual([{ id: 'b'.repeat(32) }]);
+      } finally {
+        await svc.onModuleDestroy();
+      }
+    });
   });
 });

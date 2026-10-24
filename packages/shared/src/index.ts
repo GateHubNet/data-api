@@ -29,6 +29,10 @@ export * from './validators';
 export * from './xrpl/node-client';
 export * from './xrpl/node-throttle';
 
+// Exports (export jobs and the storage of their files)
+export * from './export/export-jobs';
+export * from './export/export-storage';
+
 // Nest helpers
 export * from './nest/shutdown-signals';
 

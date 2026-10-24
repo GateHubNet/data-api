@@ -1,11 +1,11 @@
 # A release, on every pushed version tag (v1.4.0, or a pre-release such as v1.4.0-rc.1):
 #   1. version  the tag must be a semantic version (vMAJOR.MINOR.PATCH, an optional -pre-release); anything else stops here;
 #   2. test     the whole CI workflow (build, unit tests, the three e2e suites);
-#   3. images   the API and syncer images for linux/amd64 and linux/arm64, pushed to GitHub Packages (ghcr.io) as the version
+#   3. images   the API, syncer and exporter images for linux/amd64 and linux/arm64, pushed to GitHub Packages (ghcr.io) as the version
 #               without its v (1.4.0);
-#   4. latest   both images' latest pointed at the newest version tag (a pre-release included) whose images are published,
+#   4. latest   every image's latest pointed at the newest version tag (a pre-release included) whose images are published,
 #               worked out again by every run, one run at a time: a release that finishes after a newer one leaves latest on the
-#               newer one. The two latest tags are moved one after the other, not at once (deploy by version: see
+#               newer one. The latest tags are moved one after the other, not at once (deploy by version: see
 #               docs/deployment.md);
 #   5. release  the GitHub release of the tag: its body is the changelog since the previous tag (cliff.toml), which is also
 #               attached as CHANGELOG.md. A tag with a "-" is marked a pre-release.
@@ -76,6 +76,8 @@ jobs:
             dockerfile: apps/api/Dockerfile
           - image: data-syncer
             dockerfile: apps/syncer/Dockerfile
+          - image: data-exporter
+            dockerfile: apps/exporter/Dockerfile
     steps:
       - uses: actions/checkout@v7
 
@@ -137,11 +139,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # latest is the newest version tag (a pre-release included) whose two images are both published, whichever tag started
+      # latest is the newest version tag (a pre-release included) whose images are all published, whichever tag started
       # this run. The tags are read as they are now, so a run that finishes after a newer release points latest at the newer
-      # one, not back at its own, and a newer tag whose images are not out yet (or never will be) is passed over. Both images
-      # are pointed at the same version, one after the other: not at once, so if the second cannot be moved the job says which
-      # tag is where and fails, and running it again (or the next release) puts both on the same version. Only the registry's
+      # one, not back at its own, and a newer tag whose images are not out yet (or never will be) is passed over. All images
+      # are pointed at the same version, one after the other: not at once, so if one cannot be moved the job says which
+      # tag is where and fails, and running it again (or the next release) puts them all on the same version. Only the registry's
       # "not found" passes a tag over: any other failure to inspect is
       # retried, and if it persists the job fails and latest stays where it is, rather than going back to an older version
       # because the newest could not be seen.
@@ -185,7 +187,7 @@ jobs:
           for tag in $newest_first; do
             version="${tag#v}"
             both=true
-            for image in data-api data-syncer; do
+            for image in data-api data-syncer data-exporter; do
               status=0
               published "$NAMESPACE/$image:$version" || status=$?
               if [ "$status" -eq 2 ]; then
@@ -198,10 +200,10 @@ jobs:
               target="$version"
               break
             fi
-            echo "$tag: its images are not both published, passed over"
+            echo "$tag: its images are not all published, passed over"
           done
           if [ -z "$target" ]; then
-            echo "::error::No version tag has both images published."
+            echo "::error::No version tag has all its images published."
             exit 1
           fi
           if [ "v$target" != "$GITHUB_REF_NAME" ]; then
@@ -219,10 +221,10 @@ jobs:
           }
 
           moved=""
-          for image in data-api data-syncer; do
+          for image in data-api data-syncer data-exporter; do
             if ! retried docker buildx imagetools create --tag "$NAMESPACE/$image:latest" "$NAMESPACE/$image:$target"; then
               if [ -n "$moved" ]; then
-                echo "::error::$NAMESPACE/$moved:latest is on $target, but $NAMESPACE/$image:latest could not be moved: the two latest tags are on different versions until this job is run again."
+                echo "::error::$NAMESPACE/$moved:latest is on $target, but $NAMESPACE/$image:latest could not be moved: the latest tags are on different versions until this job is run again."
               else
                 echo "::error::$NAMESPACE/$image:latest could not be moved to $target: neither latest tag changed."
               fi

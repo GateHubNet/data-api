@@ -66,6 +66,8 @@ export enum Table {
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
   SyncerLease = 'syncer_lease',
+  // Export jobs (migration 010): written by the api (queued) and the exporter (running, done, failed).
+  ExportJobs = 'export_jobs',
 }
 
 /**

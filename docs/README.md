@@ -19,7 +19,7 @@ deployment per network.
 | --- | --- |
 | [Architecture](architecture.md) | Components, data flow, per-network deployments, design decisions |
 | [API reference](api-reference.md) | Every endpoint: params with defaults and maximums, response shape, exact errors, CSV, pagination, differences from data.ripple.com |
-| [Data model](data-model.md) | The 53 ClickHouse tables per network (23 of the baseline, 7 AMM tables in it, 10 of the validators and amendments migration, 9 of the account and market aggregates migration, 1 of the account network names migration, the account state history of migration 005, the path payments of migration 007 and their index by account of migration 008), the commit-marker model, migrations |
+| [Data model](data-model.md) | The 54 ClickHouse tables per network (23 of the baseline, 7 AMM tables in it, 10 of the validators and amendments migration, 9 of the account and market aggregates migration, 1 of the account network names migration, the account state history of migration 005, the path payments of migration 007 and their index by account of migration 008, 1 of the export jobs), the commit-marker model, migrations |
 | [Configuration](configuration.md) | Every environment variable of both services, checked against the config classes |
 | [Syncer](syncer.md) | The ingest, validations, fee_stats, aggregator (the AMM jobs included) and validators workers; recovery; the range-ingest CLI |
 | [ClickHouse](clickhouse.md) | The store: no-`FINAL` rule, inserts and deduplication, memory guards, HA, backups, retention |

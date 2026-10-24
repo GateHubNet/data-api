@@ -8,11 +8,14 @@ recommended PromQL and alerts built on it. Day-2 procedures are in [operations](
 Two long-running services per network, the **API** (`apps/api`) and the **syncer** (`apps/syncer`), backed by ClickHouse. Both run
 two HTTP listeners:
 
-| Surface | API | Syncer |
-| --- | --- | --- |
-| Health: `GET /liveliness/healthz` (main port, `GH_HTTP_API_PORT`) | `3001` | `3002` |
-| Metrics: `GET /metricz` (second app, `GH_METRICZ_PORT`) | `3000` | `3000` |
-| Logs | stdout | stdout |
+| Surface | API | Syncer | Exporter |
+| --- | --- | --- | --- |
+| Health: `GET /liveliness/healthz` (main port, `GH_HTTP_API_PORT`) | `3001` | `3002` | `3005` |
+| Metrics: `GET /metricz` (second app, `GH_METRICZ_PORT`) | `3000` | `3000` | `3000` |
+| Logs | stdout | stdout | stdout |
+
+The **exporter** (`apps/exporter`, one per network where exports are on) makes the export files. Its probe answers 503 only when
+ClickHouse does not answer.
 
 The metrics ports are reachable **inside the compose network only** (never publish them; the dev compose maps them to 127.0.0.1:
 api-xrpl 3003, syncer-xrpl 3004, api-xahau 3013, syncer-xahau 3014). In production scrape `api-xrpl:3000`, `syncer-xrpl:3000`, ... from a
@@ -183,6 +186,19 @@ rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0        # a rounds o
 ```
 
 The gauges describe what *this process* has done since boot: scrape each network's syncer separately.
+
+## 4a. Metrics: Exporter
+
+Prefix `exporter_`, plus the Node process defaults.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `exporter_jobs_total` | counter | `status` (`done`, `failed`) | Export jobs finished. The reason of a failure is the job's `error` (`GET /v2/exports/{id}`) and, for anything but an error answer of the list, a log line `Export <id> failed: …`. |
+| `exporter_rows_total` | counter | | Rows written to export files. |
+| `exporter_job_duration_seconds` | histogram | `status` | From `running` to `done` or `failed`. |
+
+A job waiting long in `queued` is not a metric yet: `SELECT count() FROM (SELECT id, argMax(status, seq) AS s FROM export_jobs GROUP BY id) WHERE s = 'queued'`
+in the network's database counts them.
 
 ## 5. Logging
 
