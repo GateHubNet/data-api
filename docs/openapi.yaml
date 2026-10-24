@@ -436,6 +436,58 @@ paths:
           description: ''
       tags:
       - payments
+  "/v2/path_payments":
+    get:
+      operationId: PathPaymentsController_list
+      summary: Get path payments
+      description: 'The path payments of the ledgers that closed between `start` and
+        `end`, oldest first: the successful payments whose delivery used someone else’s
+        liquidity (an order-book offer, an AMM pool, or an account other than the
+        delivered currency’s issuer rippling between its trust lines), payments to
+        oneself included. Each says what left the source, what reached the destination
+        and what it crossed. `format=csv` gives them as a CSV file.'
+      parameters:
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - path_payments
   "/v2/exchanges/{base}/{counter}":
     get:
       operationId: ExchangesController_pair
@@ -788,8 +840,16 @@ paths:
     get:
       operationId: AccountsController_lookup
       summary: Get an account
-      description: When and by whom an account was created. An address that was created
+      description: 'When and by whom an account was created. An address that was created
         more than once (deleted and funded again) answers with its latest creation.
+        `account_name` is the name the operator gave the address, the same on every
+        network, and `account_network_name` the name it gave the account on this network
+        only. `account_labels` are the labels the operator put on the address (`scam`,
+        `spam`, `advisory`), keyed by label, each with its `description` and, when
+        given, its `source` and `url`; the same on every network. Each is left out
+        when there is none. `flags=true` adds the account flags, named for the network:
+        at the ledger `ledger_index`, `ledger_hash` or `date` names, from the account
+        state history, else from the live node.'
       parameters:
       - name: address
         required: true
@@ -797,6 +857,28 @@ paths:
         description: The address of the account.
         schema:
           type: string
+      - name: date
+        required: false
+        in: query
+        description: 'With `flags`: the last ledger closed at or before this time.
+          Alias: `close_time`.'
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: 'With `flags`: the hash of the ledger.'
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: 'With `flags`: a ledger number. Alias: `ledger`.'
+        schema: {}
+      - name: flags
+        required: false
+        in: query
+        description: Add the account flags.
+        schema:
+          type: boolean
       responses:
         '200':
           description: ''
@@ -842,7 +924,8 @@ paths:
         `start` and `end`, oldest first. With `min_sequence` or `max_sequence` the
         list is instead the transactions the account sent, by their sequence number,
         and `start` and `end` are ignored. `type` and `result` are the names of the
-        network (`Payment`, `tesSUCCESS`).
+        network (`Payment`, `tesSUCCESS`). `format=csv` serves the same list as a
+        CSV of summary rows from the account's side.
       parameters:
       - name: address
         required: true
@@ -850,6 +933,11 @@ paths:
         description: The address of the account.
         schema:
           type: string
+      - name: format
+        required: false
+        in: query
+        description: "`csv`: one summary row per transaction, file `<address> - transactions.csv`."
+        schema: {}
       - name: marker
         required: false
         in: query
@@ -1344,13 +1432,16 @@ paths:
     get:
       operationId: AccountBalancesController_list
       summary: Get the balances of an account
-      description: The balances of the account on a ledger of the live node, the native
-        one first (it has no `counterparty`), then the trust lines in the order of
-        the node. The ledger is chosen by `ledger_index`, `ledger_hash` or `date`
-        (the last ledger closed at or before it, answered with its `close_time`);
-        without any of them it is the newest validated one. `currency` keeps the balances
-        of one currency, `counterparty` the trust lines with one account. `limit=all`
-        reads every trust line. `format=csv` gives the balances as a CSV file.
+      description: The balances of the account at a ledger, the native one first (it
+        has no `counterparty`), then the trust lines. A ledger named by `ledger_hash`,
+        `date` (the last ledger closed at or before it) or a numeric `ledger_index`
+        is read from the indexed state history, with the trust lines ordered by (counterparty,
+        currency), and answered with its `close_time`; without any of them (or with
+        `validated`, `closed`, `current`) the balances come from the live node, the
+        newest validated ledger by default, with the trust lines in the node's order.
+        `currency` keeps the balances of one currency, `counterparty` the trust lines
+        with one account. `limit=all` reads every trust line. `format=csv` gives the
+        balances as a CSV file.
       parameters:
       - name: address
         required: true
@@ -2103,6 +2194,130 @@ paths:
         required: false
         in: query
         description: 'The time the positions are of. Default: now.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/trustlines":
+    get:
+      operationId: AccountTrustlinesController_list
+      summary: Get the trust lines of an account
+      description: 'The trust lines of the account at a ledger, from the indexed state
+        history, with each line from the account''s side: its balance, its limit and
+        the peer''s, no-ripple, authorization and freeze on both sides, and its quality
+        in and out. Lines with a zero balance are listed; lines deleted at or before
+        the ledger are not. Ordered and paged by (counterparty, currency). The ledger
+        is chosen by `ledger_hash`, `date` (the last ledger closed at or before it)
+        or `ledger_index`; without any of them it is the newest indexed one. An issuer''s
+        lines are its holders. `format=csv` gives the lines as a CSV file.'
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: The `marker` of the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema: {}
+      - name: counterparty
+        required: false
+        in: query
+        description: Only the lines with this account.
+        schema: {}
+      - name: currency
+        required: false
+        in: query
+        description: Only the lines in this currency.
+        schema: {}
+      - name: date
+        required: false
+        in: query
+        description: 'The last ledger closed at or before this time. Alias: `close_time`.'
+        schema: {}
+      - name: ledger_hash
+        required: false
+        in: query
+        description: The hash of the ledger.
+        schema: {}
+      - name: ledger_index
+        required: false
+        in: query
+        description: 'A ledger number. Alias: `ledger`.'
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - accounts
+  "/v2/accounts/{address}/path_payments":
+    get:
+      operationId: AccountPathPaymentsController_list
+      summary: Get the path payments of an account
+      description: The path payments the account sent or received in the ledgers that
+        closed between `start` and `end`, oldest first, as `GET /v2/path_payments`
+        serves them; a payment to oneself is listed once. `format=csv` gives them
+        as a CSV file.
+      parameters:
+      - name: address
+        required: true
+        in: path
+        description: The address of the account.
+        schema:
+          type: string
+      - name: format
+        required: false
+        in: query
+        description: 'Default: json.'
+        schema:
+          enum:
+          - json
+          - csv
+          type: string
+      - name: marker
+        required: false
+        in: query
+        description: From the previous page.
+        schema: {}
+      - name: limit
+        required: false
+        in: query
+        description: Default 200, at most 1000.
+        schema:
+          type: number
+      - name: descending
+        required: false
+        in: query
+        description: Newest first.
+        schema:
+          type: boolean
+      - name: end
+        required: false
+        in: query
+        description: 'End time. Default: the newest ledger.'
+        schema: {}
+      - name: start
+        required: false
+        in: query
+        description: 'Start time. Default: the beginning.'
         schema: {}
       responses:
         '200':
@@ -3625,6 +3840,58 @@ paths:
           description: ''
       tags:
       - amm
+  "/v2/exports":
+    post:
+      operationId: ExportsController_create
+      summary: Ask for an export of a list
+      description: 'Queues an export of the list at `path` (any route with a CSV form,
+        with its parameters) in `format` (`csv`, or `pdf`: a landscape A4 document
+        with a header and the list''s chosen columns). A list over time must name
+        `start` and `end`. The exporter of the network makes the file in the background;
+        `GET /v2/exports/{id}` reports it.'
+      parameters: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - path
+              - format
+              properties:
+                path:
+                  type: string
+                  example: "/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01"
+                format:
+                  type: string
+                  enum:
+                  - csv
+                  - pdf
+      responses:
+        '202':
+          description: ''
+      tags:
+      - exports
+  "/v2/exports/{id}":
+    get:
+      operationId: ExportsController_find
+      summary: Get an export
+      description: The state of an export (`queued`, `running`, `done`, `failed`)
+        for the API key that asked for it; any other key gets 404. When it is done,
+        `url` downloads the file for 15 minutes; each request makes a new one.
+      parameters:
+      - name: id
+        required: true
+        in: path
+        description: The id `POST /v2/exports` answered.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - exports
 info:
   title: data-api
   description: Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.
