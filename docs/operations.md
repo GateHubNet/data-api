@@ -22,6 +22,7 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 | Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` / `migrate-shared` (idempotent) |
 | Account names | `INSERT INTO shared.account_names ...`, shows within 60 s: [Name an address](#name-an-address) |
 | Account network names | `INSERT INTO xrpl.account_network_names ...` (or `xahau.`), shows within 60 s on that network only: [Name an account on one network](#name-an-account-on-one-network) |
+| Labels | `INSERT INTO shared.account_labels ...`, shows within 60 s: [Label an address](#label-an-address) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
@@ -72,11 +73,12 @@ database without `002`: the message names the file and what is missing. Apply th
 The compose files order it for you (the syncer waits for its `migrate-<network>` job); with another orchestrator run the job first. The whole rollout
 (and the constraint with `feat/amm-data`) is [below](#roll-out-the-validators-and-amendments-data).
 
-**The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names,
+**The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
 [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
 for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
-that reads it**: the compose files make both apis wait for it. An api started without it serves every account without a name and logs
-`Could not load the account names` at every reload, until the job has run.
+that reads it**: the compose files make both apis wait for it. An api started without it serves every account without a name or label and logs
+`Could not load the account names` (and `the account labels`) at every reload, until the job has run. An api of this version on a shared
+database migrated before `002` serves the names and logs `Could not load the account labels` until the job has run again.
 
 ### Name an address
 
@@ -140,6 +142,41 @@ On Xahau write `xahau.account_network_names` (the network database is `GH_CLICKH
 network's database shows there, not on the network meant: remove it there with a `removed = 1` row and insert it into the right one. The table
 comes with `migrate-<network>` (migration `009`): an api started before it serves every account without a network name and logs
 `Could not load the account network names` at every reload, until the job has run.
+
+### Label an address
+
+A **label** (`scam`, `spam` or `advisory`) is written by hand into `shared.account_labels` and shows on `GET /v2/accounts/{address}`
+(`account_labels`) of **every network** within 60 s, with the names and on the same reload. Each label carries a `description` (why the
+address is marked), and optionally a `source` (who says so) and a `url` (where): leave them out, or empty, when there is none. An address
+can carry several labels; each (address, label) is its own key, and its newest row wins, so changing the description, source or url is
+another insert of the whole label, and removing it is an insert with `removed = 1`. The same append-only rules as for names hold: never
+`UPDATE`, `DELETE` or `OPTIMIZE ... FINAL`. The label is an `Enum8`: a misspelt one (`Scam`, `scma`) fails the insert with an error
+naming the value, and a new label needs a migration of `schema-shared/`.
+
+```sql
+-- put a label on an address, or replace what it says (the newest row of the address and label wins)
+INSERT INTO shared.account_labels (address, label, description, source, url, added_by)
+VALUES ('<address>', 'advisory', 'On the warning list of the regulator', '<who says so>', 'https://<where>', 'ops@gatehub.net');
+
+-- a label with a description only
+INSERT INTO shared.account_labels (address, label, description, added_by)
+VALUES ('<address>', 'scam', 'Fake giveaway, reported by customers', 'ops@gatehub.net');
+
+-- remove one label from an address (its other labels stay)
+INSERT INTO shared.account_labels (address, label, description, removed, added_by)
+VALUES ('<address>', 'scam', '', 1, 'ops@gatehub.net');
+
+-- the labels each address has now, as the api reads them
+SELECT address, label, description, source, url, added_by, added_at
+FROM (SELECT * FROM shared.account_labels ORDER BY address, label, added_at DESC, removed DESC LIMIT 1 BY address, label)
+WHERE removed = 0
+ORDER BY address, label;
+
+-- the history of one address
+SELECT * FROM shared.account_labels WHERE address = '<address>' ORDER BY label, added_at;
+```
+
+Nothing but the `Enum8` checks a row: a typo in the address or the description shows within a minute, and is fixed with a newer row.
 
 ### Roll out the validators and amendments data
 

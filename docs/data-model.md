@@ -21,7 +21,7 @@ enum: queries use `${Table.X}`, never string literals). **50 tables** per networ
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
 
 Plus `schema_migrations` (the migration runner's bookkeeping). Apart from the network databases, one **shared database** on the
-same server holds what belongs to an address on every network (account names, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
+same server holds what belongs to an address on every network (account names and labels, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
 with its own migrations: see [section 8](#8-the-shared-database). The previous design (CTID-keyed tables, insert-triggered materialized
 views, offers/issuers/escrows/paychannels tables) is gone: see [ADR-0002](adr/0002-ctid-idempotent-ingest.md) (superseded),
 [ADR-0007](adr/0007-ledger-index-axis-and-secondary-tables.md) and [ADR-0008](adr/0008-no-aggregate-materialized-views.md).
@@ -473,6 +473,7 @@ in it, and the syncers never touch it.
 | File | Contents |
 | --- | --- |
 | `001_account_names.sql` | `account_names`: one `CREATE TABLE IF NOT EXISTS` |
+| `002_account_labels.sql` | `account_labels`: one `CREATE TABLE IF NOT EXISTS` |
 
 ### `account_names` (no partition, `MergeTree ORDER BY (address, added_at)`)
 
@@ -480,3 +481,12 @@ One row per change of the **account name** of an address: `address`, `name`, `re
 `added_by` (who wrote the row) and `added_at DateTime64(3, 'UTC')` (default: the insert time). The newest row of an address wins; at the
 same `added_at` a removal wins. An address whose newest row is a removal, or names nothing (`name = ''`), has no name. Read by
 `/v2/accounts/{address}` (`account_name`).
+
+### `account_labels` (no partition, `MergeTree ORDER BY (address, label, added_at)`)
+
+One row per change of a **label** of an address: `address`, `label Enum8('scam' = 1, 'spam' = 2, 'advisory' = 3)`, `description`,
+`source` (who says so) and `url` (where), both `String` with `''` (default) for none, `removed UInt8` (default 0; 1 removes that label
+from the address), `added_by` and `added_at DateTime64(3, 'UTC')` (default: the insert time). The key is (address, label): an address
+has each label at most once, and the newest row of a key wins; at the same `added_at` a removal wins. The `Enum8` rejects a misspelt
+label at insert, so a new label is a migration that widens it. Read by `/v2/accounts/{address}` (`account_labels`, in the order of
+the `Enum8`).

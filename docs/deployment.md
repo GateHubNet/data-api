@@ -21,7 +21,7 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
                         (one server) ◀── syncer-xahau ──────▶ Xahau node(s)                xahau
                               ▲
                         migrate-xrpl, migrate-xahau   (one-shot: create the database, apply the schema)
-                        migrate-shared                (one-shot: the `shared` database both apis read, account names)
+                        migrate-shared                (one-shot: the `shared` database both apis read, names and labels)
 ```
 
 - **api-xrpl / api-xahau** are stateless and scale horizontally.
