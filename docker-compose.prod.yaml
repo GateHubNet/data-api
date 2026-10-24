@@ -245,7 +245,7 @@ services:
 
   # ------------------------------------------------------------------------------------------------ shared
 
-  # One-shot: create the `shared` database (account names, ADR-0014) and apply its own schema, then exit 0. One job for
+  # One-shot: create the `shared` database (account names and labels, ADR-0014) and apply its own schema, then exit 0. One job for
   # every network (two runners on one schema_migrations would race); the apis of both networks wait for it.
   migrate-shared:
     <<: *migrate

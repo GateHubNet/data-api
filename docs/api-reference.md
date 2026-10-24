@@ -197,6 +197,8 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
+`GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
+ledger from the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)).
 Exchange-based endpoints also differ in what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see
 [Exchanges](#exchanges) and [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
@@ -206,8 +208,9 @@ balance_changes, counterparties, exchanges}` and `GET /v2/network/markets`, and 
 one now gets buckets). Their AMM data additions add the parameter `amm` and the fields `amm_share` and `amm_pool` to `GET /v2/network/markets`, the
 fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, and `computed_start` and `computed_end` to `GET /v2/amm/pools/{pool}/history?interval=day`.
 
-From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the field `account_name` of
-`GET /v2/accounts/{address}`, the name the operator gave the address; and [exports](#exports), `POST /v2/exports` and
+From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields of
+`GET /v2/accounts/{address}` `account_name`, the name the operator gave the address, `account_network_name`, the name the operator gave
+the account on this network only, and `account_labels`, the labels the operator put on the address; and [exports](#exports), `POST /v2/exports` and
 `GET /v2/exports/{id}` ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 70).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
@@ -651,29 +654,82 @@ accounts`.
 
 ### `GET /v2/accounts/{address}`
 
-The latest activation of the account, and the name the operator gave its address.
+The latest activation of the account, the name the operator gave its address, the name it gave the account on this network and
+the labels it put on the address.
 
 ```json
 { "result": "success",
   "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
-                    "ledger_index": 11119603, "tx_hash": "…", "account_name": "GateHub" } }
+                    "ledger_index": 11119603, "tx_hash": "…", "account_name": "…", "account_network_name": "…",
+                    "account_labels": { "scam": { "description": "Fake giveaway", "url": "https://…" },
+                                        "advisory": { "description": "…", "source": "…", "url": "https://…" } } } }
 ```
 
 Key order: `account, parent, initial_balance, inception, ledger_index, tx_hash, genesis_balance?, genesis_index?,
-account_name?`.
+account_name?, account_network_name?, account_labels?, flags?`.
 
 - `account_name`: the **account name** of the address ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
   the same on every network. The operator writes it into the shared database by hand
   ([operations](operations.md#name-an-address)); the api loads the names every 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a
   new or removed name shows within that time. Left out when the address has none.
+- `account_network_name`: the **account network name** of the account, its name on this network only ("USD Issuer" for
+  GateHub's issuing address on the XRP Ledger, which Xahau does not show). The operator writes it into the network's own
+  database by hand ([operations](operations.md#name-an-account-on-one-network)); it is loaded and reloaded with the names (60 s).
+  It is served with or without an `account_name`, and left out when the account has none.
+- `account_labels`: the **labels** of the address, the same on every network: an object keyed by label (`scam`, `spam`,
+  `advisory`, in that order), each `{ description, source?, url? }` in that key order, where `source` says who says so and `url`
+  links to where; each is left out when empty. The operator writes them into the shared database by hand
+  ([operations](operations.md#label-an-address)), and they load and reload with the names, so a new or removed label shows
+  within 60 s. Left out when the address has no label.
 
-The name does not make an account: an address with a name but no activation on this network still answers 404. Errors: 404
-`Account not found`; 500 `unable to get accounts`.
+The names and the labels do not make an account: an address with a name or a label but no activation on this network still
+answers 404 `Account not found`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `flags` | false | `true` adds `flags` to `account_data`: the **account flags**, one `true`/`false` per flag the network names, named without the `lsf` prefix, in the order of their bits. |
+| `date` (alias `close_time`) | | With `flags`: the last ledger closed at or before it. |
+| `ledger_index` (alias `ledger`) | | With `flags`: a ledger number, or `validated`, `closed`, `current`. |
+| `ledger_hash` | | With `flags`: the ledger with this hash. |
+
+Without `flags=true` nothing else is read, and the ledger parameters are not looked at: the answer is the one above. With it, a
+`date`, a numeric `ledger_index` or a `ledger_hash` reads the flags from the **account state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), never from the node, with the precedence of `/balances`
+(`ledger_hash` > `date` > `ledger_index`), and the answer names the ledger it was read at and when it closed. Without one (or with
+`validated`, `closed`, `current`) the flags come from `account_info` on the live node, the validated ledger by default; the answer
+then has the node's `ledger_index` and no `close_time`, is cached and carries the `Cache-Control` of `/balances`.
+
+```json
+{ "result": "success", "ledger_index": 107695660, "close_time": "2026-10-17T08:01:12Z",
+  "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
+                    "ledger_index": 11119603, "tx_hash": "…",
+                    "flags": { "PasswordSpent": false, "RequireDestTag": true, "RequireAuth": false, "DisallowXRP": false,
+                               "DisableMaster": false, "…": false } } }
+```
+
+The flags are those the network's definitions name. On the XRP Ledger: `PasswordSpent`, `RequireDestTag`, `RequireAuth`,
+`DisallowXRP`, `DisableMaster`, `NoFreeze`, `GlobalFreeze`, `DefaultRipple`, `DepositAuth`, `DisallowIncomingNFTokenOffer`,
+`DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `AllowTrustLineLocking`, `AllowTrustLineClawback`
+(`LEDGER_ENTRY_FLAGS.AccountRoot` of the bundled definitions). On Xahau, whose definitions name none, a table kept from xahaud's
+`LedgerFormats.h`: `AllowTrustLineClawback` (0x1000), the XRP Ledger's nine from `PasswordSpent` to `DepositAuth`, `TshCollect`,
+`DisallowIncomingNFTokenOffer`, `DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `URITokenIssuer` and
+`DisallowIncomingRemit`. The same bit can have another name on each network (0x80000000 is `AllowTrustLineClawback` on the XRP
+Ledger and `DisallowIncomingRemit` on Xahau).
+
+The flags at a ledger are those of the account's last change at or before it. The state history covers the ledgers above the newest
+ledger written by a parser older than parser version 3 (gaps in the ledger numbers do not matter); see
+[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet.
+
+Errors, in order: 400 `invalid date format`, `invalid ledger hash` (only with `flags=true`); 404 `Account not found` (no activation);
+400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
+history does not cover); 404 `account not found` (no state of the account at that ledger, or the account was deleted; from the node:
+the node does not have the account); 500 `unable to get accounts`.
 
 **Differences from data.ripple.com** (both routes): an address that was created more than once (deleted with `AccountDelete`
 and funded again) answers with its **latest** creation; the original answered with the earliest. A transaction that creates
 several accounts is listed once per account (the original kept the last). `GET /v2/accounts/{address}` adds `account_name`,
-a GateHub extra ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) item 55).
+`account_network_name` and `account_labels`, and with `flags=true` the account flags, GateHub extras
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 55, 58, 57, 59 and 60).
 
 ### `GET /v2/accounts/{address}/transactions`
 

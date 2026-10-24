@@ -22,6 +22,8 @@ export enum Table {
   AmmLiquidity = 'amm_liquidity',
   AccountAmmLiquidity = 'account_amm_liquidity',
   AmmGovernance = 'amm_governance',
+  // Account state history (migration 005): the state of an account root after each change, from parser version 3.
+  AccountStates = 'account_states',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -53,6 +55,9 @@ export enum Table {
   AccountLinesDaily = 'account_lines_daily',
   AccountTxDaily = 'account_tx_daily',
   AccountTradesDaily = 'account_trades_daily',
+  // Written by the operator with plain SQL inserts (ADR-0014).
+  /** Migration 009: the account network name of an address, append-only, the newest row of an address wins. */
+  AccountNetworkNames = 'account_network_names',
   // Internal bookkeeping.
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
@@ -69,4 +74,6 @@ export enum Table {
 export enum SharedTable {
   /** Migration 001: the account name of an address, append-only, the newest row of an address wins. */
   AccountNames = 'account_names',
+  /** Migration 002: the labels of an address (`scam`, `spam`, `advisory`), append-only, the newest row of (address, label) wins. */
+  AccountLabels = 'account_labels',
 }

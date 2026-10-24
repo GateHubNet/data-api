@@ -13,6 +13,7 @@ import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { BinaryCodecService } from './binary-codec.service';
 import { CacheService } from './cache.service';
 import { LedgerRangeResolver } from './ledger-range.service';
+import { StateLedgerService } from './state-ledger.service';
 import { TxService } from './tx-object';
 
 /**
@@ -51,8 +52,9 @@ export interface CommonOptions {
 
 /**
  * Everything the endpoint modules share, global so that they need no imports to use it: `ApiConfig`,
- * `NETWORK_PROFILE`, `SHARED_DATABASE`, `ClickHouseService`, `CacheService`, `PrometheusService`, `ShutdownSignals`, and the services of
- * the API contract layer: `LedgerRangeResolver`, `TxService` and `BinaryCodecService`. (`BinaryCodecService` asks the
+ * `NETWORK_PROFILE`, `SHARED_DATABASE`, `ClickHouseService`, `CacheService`, `PrometheusService`, `ShutdownSignals`, and the
+ * services of the API contract layer: `LedgerRangeResolver`, `StateLedgerService` (the ledger of a read from the state
+ * tables), `TxService` and `BinaryCodecService`. (`BinaryCodecService` asks the
  * node for its definitions through the global `XrplService` of the `XrplModule`.)
  */
 @Global()
@@ -73,6 +75,7 @@ export class CommonModule {
         ShutdownSignals,
         ShutdownRegistrations,
         LedgerRangeResolver,
+        StateLedgerService,
         TxService,
         BinaryCodecService,
       ],
@@ -84,6 +87,7 @@ export class CommonModule {
         PrometheusService,
         ShutdownSignals,
         LedgerRangeResolver,
+        StateLedgerService,
         TxService,
         BinaryCodecService,
       ],

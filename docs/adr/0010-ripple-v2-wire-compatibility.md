@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 56 and 68 to 70).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 60 and 68 to 70).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -230,6 +230,25 @@ addition: what the original served is served as before. Names and labels are ser
 56. **Names are not activations.** A name is the operator's, not the ledger's: it is served from a copy the api loads every 60 s
     (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a new or removed name shows within that time, and an address with a name but no activation
     on the network still answers 404 `Account not found`, as in the original.
+57. **`account_labels`.** After `account_name` and `account_network_name` (item 58), `account_data` carries the labels the operator
+    put on the address (`scam`, `spam`, `advisory`) as an object keyed by label, in that order:
+    `{ "scam": { "description": "…", "source": "…", "url": "…" } }`, with `source` and `url` left out when empty, and the whole field
+    left out when the address has no label. The original had no labels. They are the same on every network, load and reload with the
+    names (60 s), and a label on an address without an activation on the network does not make it found (item 56).
+58. **`account_network_name`.** After `account_name`, the account network name: the name the operator gave the account on this
+    network only ("USD Issuer" on the XRP Ledger), kept in the network's own database (`account_network_names`, migration 009) with
+    the rules of the account names and reloaded with them. It is served with or without an `account_name`, and left out when there is
+    none; the other network's api never shows it.
+59. **Account flags.** The original's `/v2/accounts/{address}` answered with the account's creation only. Here `flags=true` adds `flags` to
+    `account_data`, after its other keys: one `true`/`false` per account flag the network names (the XRP Ledger's from its definitions,
+    Xahau's from xahaud's source), named without the `lsf` prefix. With `date` (alias `close_time`), a numeric `ledger_index` (alias
+    `ledger`) or `ledger_hash` they are read from the account state history, with the precedence of `/balances`, and `ledger_index` and
+    `close_time` come before `account_data`; without one (or with `validated`, `closed`, `current`) from `account_info` on the live node,
+    with its `ledger_index`. Without `flags=true` the route reads and answers exactly as before, whatever ledger parameters it is sent.
+60. **Historical ledgers from ClickHouse.** A ledger named by a date, a number or a hash is a ledger this API holds. One it does not hold
+    (a number or hash it has not stored, a date before its first ledger), and one the state history does not cover (at or below the
+    newest ledger an older parser wrote), answers 400 `the date provided is too old`, the original's message for a ledger its node did not
+    have. An account with no state at that ledger, or one deleted at or before it, answers 404 `account not found`, as the node does.
 68. **Exports.** The original had no exports: a client walked the pages itself. Here `POST /v2/exports` with `{path, format}` queues
     an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`) and answers
     202 `{result, id, status: "queued"}`; `GET /v2/exports/{id}` answers `{result, id, status, format, path, created, finished?,
@@ -241,4 +260,4 @@ addition: what the original served is served as before. Names and labels are ser
     for an id that does not exist. The job keeps the SHA-256 of the key, never the key. A done job's `url` is a Google Cloud
     Storage link signed at each request and valid for 15 minutes; the job and its file are kept 7 days.
 
-Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new 400 on those routes. The export routes are new, with their own messages: 400 `invalid path`, `path is not exportable`, `start and end are required`, `invalid format`; 404 `export not found`; 503 `exports are not available` (no bucket configured). The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions), [api-reference](../api-reference.md#get-v2accountsaddress) and [api-reference](../api-reference.md#exports).
+Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new message on those routes: with `flags=true` the 400s of `/balances` (`invalid date format`, `invalid ledger hash`, `the date provided is too old`) and its 404 `account not found` apply. The export routes are new, with their own messages: 400 `invalid path`, `path is not exportable`, `start and end are required`, `invalid format`; 404 `export not found`; 503 `exports are not available` (no bucket configured). The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions) [api-reference](../api-reference.md#get-v2accountsaddress) and [api-reference](../api-reference.md#exports).
