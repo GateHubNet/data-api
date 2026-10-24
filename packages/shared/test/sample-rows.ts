@@ -8,6 +8,7 @@ import {
   AccountRollupDaysRow,
   AccountRollupStateRow,
   AccountsCreatedRow,
+  AccountStatesRow,
   AccountTradesDailyRow,
   AccountTransactionsRow,
   AccountTxBySequenceRow,
@@ -74,6 +75,7 @@ export interface TableRows {
   [Table.AmmLiquidity]: AmmLiquidityRow;
   [Table.AccountAmmLiquidity]: AccountAmmLiquidityRow;
   [Table.AmmGovernance]: AmmGovernanceRow;
+  [Table.AccountStates]: AccountStatesRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -352,6 +354,20 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     slot_discounted_fee: 50,
     slot_expiration: 750_086_400,
     auth_accounts: [ALICE, BOB],
+  },
+  [Table.AccountStates]: {
+    account: ALICE,
+    ledger_index: LEDGER,
+    tx_index: 3,
+    node_index: 1,
+    tx_hash: hash(15),
+    close_time: CLOSE,
+    balance: '1234.5',
+    flags: 8_388_608,
+    sequence: 7,
+    owner_count: 2,
+    fields: JSON.stringify({ Account: ALICE, Balance: '1234500000', Flags: 8_388_608, OwnerCount: 2, Sequence: 7 }),
+    deleted: 0,
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,

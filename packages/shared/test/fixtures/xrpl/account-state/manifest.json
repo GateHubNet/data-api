@@ -1,0 +1,132 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-24T14:34:25.174Z",
+  "validated_head": 107873207,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "4DCBF02D75CF484B385F667B75A8871B843E6C9E8C8D483248693A5A6E75F0A2": {
+      "ledger": 93663329,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10": {
+      "ledger": 93663330,
+      "type": "AccountSet",
+      "result": "tesSUCCESS"
+    },
+    "DD0B4FC1AA4D8A4E0FBEDFD591828A932FE6111F87FD5DA71CC25214075FCF42": {
+      "ledger": 93663334,
+      "type": "SetRegularKey",
+      "result": "tesSUCCESS"
+    },
+    "F96ADF5D4D59B6BA82E9FA85EF266948FBE461A5220B2CB1C889A36F4837DBB4": {
+      "ledger": 107872956,
+      "type": "Batch",
+      "result": "tesSUCCESS"
+    },
+    "53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D": {
+      "ledger": 107872958,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C": {
+      "ledger": 107670694,
+      "type": "Payment",
+      "result": "tesSUCCESS"
+    },
+    "8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D": {
+      "ledger": 107671593,
+      "type": "AccountDelete",
+      "result": "tesSUCCESS"
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 93663329,
+      "bytes": 234389,
+      "gzipBytes": 45052
+    },
+    {
+      "ledger": 93663330,
+      "bytes": 308486,
+      "gzipBytes": 76508
+    },
+    {
+      "ledger": 93663334,
+      "bytes": 305706,
+      "gzipBytes": 71626
+    },
+    {
+      "ledger": 107670694,
+      "bytes": 256940,
+      "gzipBytes": 52723
+    },
+    {
+      "ledger": 107671593,
+      "bytes": 486638,
+      "gzipBytes": 99292
+    },
+    {
+      "ledger": 107872956,
+      "bytes": 1511726,
+      "gzipBytes": 312254
+    },
+    {
+      "ledger": 107872958,
+      "bytes": 1108795,
+      "gzipBytes": 231033
+    }
+  ],
+  "cases": {
+    "account_created": {
+      "ledger": 93663329,
+      "hash": "4DCBF02D75CF484B385F667B75A8871B843E6C9E8C8D483248693A5A6E75F0A2",
+      "type": "Payment",
+      "note": "Creates rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV with no flags: its state before the AccountSet below"
+    },
+    "accountset_sets_flag": {
+      "ledger": 93663330,
+      "hash": "25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10",
+      "type": "AccountSet",
+      "note": "rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV sets asfDefaultRipple (SetFlag 8): Flags 0 -> 0x800000"
+    },
+    "setregularkey_then_disable_master": {
+      "ledger": 93663334,
+      "hash": "DD0B4FC1AA4D8A4E0FBEDFD591828A932FE6111F87FD5DA71CC25214075FCF42",
+      "type": "SetRegularKey",
+      "note": "rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV: SetRegularKey sets lsfPasswordSpent (0x800000 -> 0x810000), then AccountSet 387FDEDC0589354E8E27D7312AC4C8D52118208F933C1A9FA95F93D56775FE1E sets asfDisableMaster (-> 0x910000) in the same ledger"
+    },
+    "password_spent_before": {
+      "ledger": 107872956,
+      "hash": "F96ADF5D4D59B6BA82E9FA85EF266948FBE461A5220B2CB1C889A36F4837DBB4",
+      "type": "Batch",
+      "note": "rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw sends a Batch; its Flags are lsfPasswordSpent (0x10000)"
+    },
+    "payment_clears_password_spent": {
+      "ledger": 107872958,
+      "hash": "53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D",
+      "type": "Payment",
+      "note": "A Payment of XRP to rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw clears its lsfPasswordSpent: Flags 0x10000 -> 0"
+    },
+    "before_account_delete": {
+      "ledger": 107670694,
+      "hash": "EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C",
+      "type": "Payment",
+      "note": "The last change of r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC before it deletes itself"
+    },
+    "account_delete": {
+      "ledger": 107671593,
+      "hash": "8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D",
+      "type": "AccountDelete",
+      "note": "r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC deletes its account (the same ledger as in xrpl/recorded)"
+    }
+  }
+}

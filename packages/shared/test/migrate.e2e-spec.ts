@@ -85,6 +85,11 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, ledger_index, tx_index, amm_account',
   },
   [Table.AmmGovernance]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
+  [Table.AccountStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index, node_index',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -243,6 +248,9 @@ const MIGRATION_003_TABLES: Table[] = [
 /** The fee estimates of the AMM volume's live day set (D2b): one column of `volume_live`. */
 const MIGRATION_004 = '004_amm_fee_estimates.sql';
 
+/** The account state history (spec #4, ticket #9): one ledger-derived table. */
+const MIGRATION_005 = '005_account_states.sql';
+
 /** The account network names the operator writes (ADR-0014, spec #4 ticket #8). */
 const MIGRATION_009 = '009_account_network_names.sql';
 
@@ -267,6 +275,7 @@ const DEDUP_TABLES: Table[] = [
   Table.AmmLiquidity,
   Table.AccountAmmLiquidity,
   Table.AmmGovernance,
+  Table.AccountStates,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1298,6 +1307,50 @@ describe('migrations (e2e)', () => {
       expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_009], skipped: before });
       expect(await tablesOf(config.database)).toContain(Table.AccountNetworkNames);
 
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+  describe('migration 005', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-005-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 005 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_005_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_005);
+      expect(realFiles()).toContain(MIGRATION_005);
+      const exists = async () =>
+        admin.query<{ name: string }>(
+          `SELECT name FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
+          { db: config.database, t: Table.AccountStates },
+        );
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await exists()).toEqual([]);
+
+      copyReal([MIGRATION_005]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_005], skipped: before });
+      expect(await exists()).toEqual([{ name: Table.AccountStates }]);
       expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
     });
   });

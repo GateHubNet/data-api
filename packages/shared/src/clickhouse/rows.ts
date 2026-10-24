@@ -22,11 +22,19 @@
  *  - 1: the Ripple v2 data (payments, exchanges, balance changes, accounts created).
  *  - 2: AMM data (swaps as exchanges, pool states, liquidity, governance). Ledgers from the AMM enablement ledger
  *       (86795265 on mainnet) written with version 1 lack these rows; `--reprocess` rewrites them.
+ *  - 3: account state history (`account_states`). Ledgers written with an older version lack these rows; the state
+ *       tables cover only the ledgers above the last one an older parser wrote (`STATE_PARSER_VERSION`).
  */
-export const PARSER_VERSION = 2;
+export const PARSER_VERSION = 3;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
+
+/**
+ * The first parser version that writes the account state history (`account_states`): a ledger written by an older one
+ * lacks its rows. Gates compare with this constant, never with `PARSER_VERSION`, which later features move on.
+ */
+export const STATE_PARSER_VERSION = 3;
 
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;
@@ -237,6 +245,26 @@ export interface AccountsCreatedRow {
  * it is not; a reader carries the last known value forward. The pair is in Ripple's canonical
  * (base, counter) order, like `exchanges`.
  */
+/**
+ * The state of an account root after a transaction that changed it (migration 005). `balance` is the native balance in
+ * whole units, `fields` the JSON of the node's final fields, `deleted` 1 for the node an AccountDelete removed.
+ */
+export interface AccountStatesRow {
+  account: string;
+  ledger_index: number;
+  tx_index: number;
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  balance: string;
+  flags: number;
+  sequence: number;
+  owner_count: number;
+  fields: string;
+  deleted: number;
+}
+
 export interface AmmPoolStatesRow {
   amm_account: string;
   ledger_index: number;
