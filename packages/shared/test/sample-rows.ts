@@ -4,6 +4,7 @@ import {
   AccountLinesDailyRow,
   AccountNetworkNamesRow,
   AccountPartitionRowsRow,
+  AccountPathPaymentsRow,
   AccountPaymentsRow,
   AccountRollupDaysRow,
   AccountRollupStateRow,
@@ -81,6 +82,7 @@ export interface TableRows {
   [Table.AccountStates]: AccountStatesRow;
   [Table.TrustLineStates]: TrustLineStatesRow;
   [Table.PathPayments]: PathPaymentsRow;
+  [Table.AccountPathPayments]: AccountPathPaymentsRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -416,6 +418,8 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     amm_pools: [POOL],
     rippled_through: [],
   },
+  // the source's row of that path payment
+  [Table.AccountPathPayments]: { account: ALICE, ledger_index: LEDGER, tx_index: 5 },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
     current_ledger_size: 12,

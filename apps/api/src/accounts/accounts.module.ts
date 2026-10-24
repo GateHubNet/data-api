@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { RatesModule } from '../exchanges/rates.module';
+import { PathPaymentsModule } from '../path-payments/path-payments.module';
 import { AccountAmmController } from './account-amm.controller';
 import { AccountAmmService } from './account-amm.service';
 import { AccountAnalyticsController } from './account-analytics.controller';
@@ -14,6 +15,7 @@ import { AccountExchangesService } from './account-exchanges.service';
 import { AccountFlagsService } from './account-flags.service';
 import { AccountOrdersController } from './account-orders.controller';
 import { AccountOrdersService } from './account-orders.service';
+import { AccountPathPaymentsController } from './account-path-payments.controller';
 import { AccountPaymentsController } from './account-payments.controller';
 import { AccountPaymentsService } from './account-payments.service';
 import { AccountReportsController } from './account-reports.controller';
@@ -35,16 +37,17 @@ import { TrustLinesService } from './trust-lines.service';
  * `GET /v2/accounts/:address/reports[/:date]` and `GET /v2/accounts/:address/stats/:family` (their values are in the
  * native currency, converted with the `RatesService` of `RatesModule`), the two routes that ask the live node
  * instead of the database, `GET /v2/accounts/:address/{balances,orders}`, and the AMM routes of an account,
- * `GET /v2/accounts/:address/{amm_liquidity,amm_positions}`, and the trust lines of an account at a ledger from the state
- * history, `GET /v2/accounts/:address/trustlines` (its read, `TrustLinesService`, is meant for `/balances` at a
- * historical ledger too).
+ * `GET /v2/accounts/:address/{amm_liquidity,amm_positions}`, the path payments of an account,
+ * `GET /v2/accounts/:address/path_payments` (read by the `PathPaymentsService` of `PathPaymentsModule`), and the trust
+ * lines of an account at a ledger from the state history, `GET /v2/accounts/:address/trustlines` (its read,
+ * `TrustLinesService`, is meant for `/balances` at a historical ledger too).
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
  * to `controllers` below. `:address` matches one segment only, so these never compete with the lookup.
  */
 @Module({
-  imports: [RatesModule],
+  imports: [RatesModule, PathPaymentsModule],
   controllers: [
     AccountsController,
     AccountTransactionsController,
@@ -58,6 +61,7 @@ import { TrustLinesService } from './trust-lines.service';
     AccountAnalyticsController,
     AccountAmmController,
     AccountTrustlinesController,
+    AccountPathPaymentsController,
   ],
   providers: [
     AccountsService,

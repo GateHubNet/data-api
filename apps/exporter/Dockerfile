@@ -37,6 +37,7 @@ RUN --mount=type=secret,id=npm_token,required=true \
   && pnpm --filter @gatehub/data-exporter --legacy deploy --prod /app/out \
   && test -f /app/out/node_modules/@gatehub/data-api-shared/dist/export/export-storage.js \
   && (cd /app/out/node_modules/@gatehub/data-api-shared && node -e "require.resolve('@google-cloud/storage')") \
+  && (cd /app/out && node -e "require.resolve('pdfkit')") \
   && test -f /app/out/dist/main.js
 
 FROM node:22.23.2-bookworm-slim

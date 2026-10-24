@@ -28,6 +28,8 @@ export enum Table {
   TrustLineStates = 'trust_line_states',
   // Path payments (migration 007, written by ingest).
   PathPayments = 'path_payments',
+  // The path payments of an account (migration 008): the index of path_payments by source and destination.
+  AccountPathPayments = 'account_path_payments',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',

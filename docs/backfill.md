@@ -106,7 +106,8 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   reprocess from the AMM enablement ledger (86795265) on is needed for complete pool data: see
   [AMM data re-ingest](#amm-data-re-ingest). Pools or reserve lines the parser could not turn into rows
   are counted in `syncer_amm_unclassified_total` (and the range-ingest log names the total of its run).
-  Parser version 4 adds the path payments (`path_payments`): ledgers written by an older version have none, see
+  Parser version 4 adds the path payments (`path_payments`, and their index by account `account_path_payments`): ledgers written by
+  an older version have none, see
   [Path payments re-ingest](#path-payments-re-ingest).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
@@ -191,11 +192,12 @@ The API keeps that answer for a minute (`STATE_COVERAGE_CACHE_MS`).
 ### Path payments re-ingest
 
 `PARSER_VERSION` is 4 since the path payments parser (`PATH_PARSER_VERSION`, spec #4). A ledger written by an older version has no
-`path_payments` rows, so `/v2/path_payments` lists the path payments of the ledgers ingested since the deploy only. Nothing else
+`path_payments` or `account_path_payments` rows, so `/v2/path_payments` and `/v2/accounts/{address}/path_payments` list the path
+payments of the ledgers ingested since the deploy only. Nothing else
 changes for those ledgers: the payments, exchanges and AMM rows a reprocess rewrites come out the same.
 
-1. Apply migration `007_path_payments.sql` **before** the syncer of this release starts: the syncer writes `path_payments` with every
-   ledger, and a write to a missing table fails the batch, so the live runner would retry it for ever
+1. Apply migrations `007_path_payments.sql` and `008_account_path_payments.sql` **before** the syncer of this release starts: the
+   syncer writes `path_payments` and `account_path_payments` with every ledger, and a write to a missing table fails the batch, so the live runner would retry it for ever
    ([operations](operations.md#apply-a-schema-migration)). Then deploy the syncer and the api.
 2. To fill the history, reprocess the range you want listed, the same way as the [AMM data re-ingest](#amm-data-re-ingest):
    `range-ingest --from <A> --to <B> --reprocess`. It rewrites every table of each ledger. Path payments exist from the first ledgers

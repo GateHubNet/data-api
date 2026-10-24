@@ -66,7 +66,10 @@ export class CsvFile {
     this.count += rows.length;
   }
 
-  /** The file: the header and every row, in the columns of the whole list. Read it once, after the last page. */
+  /**
+   * The file: the header and every row, in the columns of the whole list. Read it after the last page; each call reads
+   * the spool file anew, so the file can be read more than once (the PDF reads it twice).
+   */
   stream(): Readable {
     return Readable.from(this.lines());
   }
