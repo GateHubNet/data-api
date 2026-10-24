@@ -194,6 +194,8 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 `GET /v2/network/validators/{key}/validations`. `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
+`GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
+ledger from the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)).
 Exchange-based endpoints also differ in what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see
 [Exchanges](#exchanges) and [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
@@ -646,6 +648,46 @@ accounts`.
 
 `{ "result": "success", "account_data": { account, parent, initial_balance, inception, ledger_index, tx_hash } }`. 404
 `Account not found`; 500 `unable to get accounts`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `flags` | false | `true` adds `flags` to `account_data`: the **account flags**, one `true`/`false` per flag the network names, named without the `lsf` prefix, in the order of their bits. |
+| `date` (alias `close_time`) | | With `flags`: the last ledger closed at or before it. |
+| `ledger_index` (alias `ledger`) | | With `flags`: a ledger number, or `validated`, `closed`, `current`. |
+| `ledger_hash` | | With `flags`: the ledger with this hash. |
+
+Without `flags=true` nothing else is read, and the ledger parameters are not looked at: the answer is the one above. With it, a
+`date`, a numeric `ledger_index` or a `ledger_hash` reads the flags from the **account state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), never from the node, with the precedence of `/balances`
+(`ledger_hash` > `date` > `ledger_index`), and the answer names the ledger it was read at and when it closed. Without one (or with
+`validated`, `closed`, `current`) the flags come from `account_info` on the live node, the validated ledger by default; the answer
+then has the node's `ledger_index` and no `close_time`, is cached and carries the `Cache-Control` of `/balances`.
+
+```json
+{ "result": "success", "ledger_index": 107695660, "close_time": "2026-10-17T08:01:12Z",
+  "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
+                    "ledger_index": 11119603, "tx_hash": "…",
+                    "flags": { "PasswordSpent": false, "RequireDestTag": true, "RequireAuth": false, "DisallowXRP": false,
+                               "DisableMaster": false, "…": false } } }
+```
+
+The flags are those the network's definitions name. On the XRP Ledger: `PasswordSpent`, `RequireDestTag`, `RequireAuth`,
+`DisallowXRP`, `DisableMaster`, `NoFreeze`, `GlobalFreeze`, `DefaultRipple`, `DepositAuth`, `DisallowIncomingNFTokenOffer`,
+`DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `AllowTrustLineLocking`, `AllowTrustLineClawback`
+(`LEDGER_ENTRY_FLAGS.AccountRoot` of the bundled definitions). On Xahau, whose definitions name none, a table kept from xahaud's
+`LedgerFormats.h`: `AllowTrustLineClawback` (0x1000), the XRP Ledger's nine from `PasswordSpent` to `DepositAuth`, `TshCollect`,
+`DisallowIncomingNFTokenOffer`, `DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `URITokenIssuer` and
+`DisallowIncomingRemit`. The same bit can have another name on each network (0x80000000 is `AllowTrustLineClawback` on the XRP
+Ledger and `DisallowIncomingRemit` on Xahau).
+
+The flags at a ledger are those of the account's last change at or before it. The state history covers the ledgers above the newest
+ledger written by a parser older than parser version 3 (gaps in the ledger numbers do not matter); see
+[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet.
+
+Errors, in order: 400 `invalid date format`, `invalid ledger hash` (only with `flags=true`); 404 `Account not found` (no activation);
+400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
+history does not cover); 404 `account not found` (no state of the account at that ledger, or the account was deleted; from the node:
+the node does not have the account); 500 `unable to get accounts`.
 
 **Differences from data.ripple.com** (both routes): an address that was created more than once (deleted with `AccountDelete`
 and funded again) answers with its **latest** creation; the original answered with the earliest. A transaction that creates

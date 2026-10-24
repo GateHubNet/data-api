@@ -207,6 +207,8 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 3. For a ledger-derived table: have `buildLedgerRows` produce the rows and add the table to `CHILD_TABLES` (`build-rows.ts`), to
    `LEDGER_KEYED_TABLES` (`ingest-state.ts`, so recovery deletes it; keep its partitioning identical to the DDL) and give it
    `non_replicated_deduplication_window`. Bump `PARSER_VERSION` when the parsers' output changes, and re-ingest with `--reprocess`.
+   A feature that readers gate on the parser version gets a constant of its own (`AMM_PARSER_VERSION`, `STATE_PARSER_VERSION`) with
+   the first version that writes it, and its gate compares with that constant, never with `PARSER_VERSION`, which later features move.
 4. Read it from an API service with `${Table.X}`. Apply: `pnpm ch:migrate` locally; the migrate job in compose; the e2e suites apply
    `runMigrations()` themselves.
 

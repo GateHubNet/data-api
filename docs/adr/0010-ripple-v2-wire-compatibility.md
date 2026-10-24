@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended three times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md), [ADR-0015](0015-historical-account-state-from-clickhouse.md) and spec #4, the account investigation data (the amendment at the end of this record, items 54 to 60).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -212,3 +212,21 @@ own crawler (`api/routes/network/getValidators.js`, `topology.js`); this API ser
 Kept from the original: the messages `Validator not found` and `unable to retrieve validator(s)` and the CSV name `validators.csv`. New 400s exist for the new parameters
 (`invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`, `invalid validator public key`). The endpoint-by-endpoint wording is in
 [api-reference](../api-reference.md#validators-and-amendments).
+
+## Amendment 4 (2026-10-24): the account investigation data
+Spec #4 (account investigation data) adds routes, parameters and fields to the account routes. The historical account state comes from
+the state tables in ClickHouse, never from a node ([ADR-0015](0015-historical-account-state-from-clickhouse.md)).
+
+59. **Account flags.** The original's `/v2/accounts/{address}` answered with the account's creation only. Here `flags=true` adds `flags` to
+    `account_data`, after its other keys: one `true`/`false` per account flag the network names (the XRP Ledger's from its definitions,
+    Xahau's from xahaud's source), named without the `lsf` prefix. With `date` (alias `close_time`), a numeric `ledger_index` (alias
+    `ledger`) or `ledger_hash` they are read from the account state history, with the precedence of `/balances`, and `ledger_index` and
+    `close_time` come before `account_data`; without one (or with `validated`, `closed`, `current`) from `account_info` on the live node,
+    with its `ledger_index`. Without `flags=true` the route reads and answers exactly as before, whatever ledger parameters it is sent.
+60. **Historical ledgers from ClickHouse.** A ledger named by a date, a number or a hash is a ledger this API holds. One it does not hold
+    (a number or hash it has not stored, a date before its first ledger), and one the state history does not cover (at or below the
+    newest ledger an older parser wrote), answers 400 `the date provided is too old`, the original's message for a ledger its node did not
+    have. An account with no state at that ledger, or one deleted at or before it, answers 404 `account not found`, as the node does.
+
+Kept from the original: `Account not found` and `unable to get accounts`. The 400s `invalid date format` and `invalid ledger hash` of
+`/balances` apply with `flags=true`. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddress).
