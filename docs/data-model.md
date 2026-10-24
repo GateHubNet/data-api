@@ -201,8 +201,8 @@ the metadata). Amounts are exact `String`s in whole units; the issuers are `''` 
 `PARSER_VERSION` 4 on (`PATH_PARSER_VERSION`): an offer crossed is an Offer node whose `TakerPays` or `TakerGets` moved (an
 unfunded or expired offer removed on the way is not one); a pool crossed is a pool whose AccountRoot balance or reserve line moved;
 an account rippled through is one, other than the source, the destination, the delivered currency's issuer, a pool and the owner of
-an offer crossed, whose balance went up on one trust line and down on another of the same currency while it holds a balance on one
-of them (an issuer passing its own currency between two holders is not rippling). A payment with none of the three is not a path
+an offer crossed, whose balance went up on one trust line and down on another of the same currency (an issuer of another currency
+than the delivered one passing its own currency between two lines is rippling, as GLOSSARY.md has it). A payment with none of the three is not a path
 payment: rippling only through the issuer, or a `Paths` field that went unused. In `CHILD_TABLES` and `LEDGER_KEYED_TABLES`, with the
 dedup window; a ledger written by an older parser has no rows until it is re-ingested. Read by `/path_payments` and, through
 `account_path_payments`, by `/accounts/{a}/path_payments`.

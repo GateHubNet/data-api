@@ -466,7 +466,7 @@ The path payments of the ledgers that closed in the window, across the network, 
       "source": "rLD5…", "destination": "rGhs…",
       "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
       "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
-      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…", "rvYAf…"]
     }
   ]
 }
@@ -487,9 +487,10 @@ source_currency, source_issuer?, offers_crossed, amm_pools, rippled_through`.
   the way is not counted.
 - `amm_pools`: the AMM pools whose holdings it changed, by pool account, in the order of the metadata.
 - `rippled_through`: the accounts that rippled the payment between two of their trust lines in one currency (the balance went up on
-  one and down on the other) while holding a balance on one of them, in the order of the metadata: a market maker. The source, the
-  destination, the delivered currency's issuer, the pools and the owners of the offers crossed are never listed, and neither is
-  another issuer that only passed its own currency from one holder to another.
+  one and down on the other), in the order of the metadata: a market maker, or the issuer of another currency than the delivered
+  one passing its own currency from one line to the next (the source currency's issuer, or that of a currency on the way). The
+  source, the destination, the delivered currency's issuer, the pools and the owners of the offers crossed are never listed. So a
+  payment that ripples straight from one issuer to another, with no offer and no pool, is a path payment.
 
 In the CSV the columns are these keys; `amm_pools` and `rippled_through` are one cell each, their accounts separated by a space.
 
@@ -518,7 +519,7 @@ under an account: one that is none has no path payments.
       "source": "rLD5…", "destination": "rGhs…",
       "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
       "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
-      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…", "rvYAf…"]
     },
     "…"
   ]

@@ -7469,7 +7469,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
       "ledger_index": 11119620,
       "offers_crossed": 3,
-      "rippled_through": [],
+      "rippled_through": [
+        "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y",
+      ],
       "source": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
       "source_amount": "12.501485927046",
       "source_currency": "CNY",

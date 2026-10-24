@@ -47,8 +47,9 @@ const THROUGH_A_POOL = {
 
 /**
  * USD of Bitstamp (rvYAf...) in, USD of SnapSwap (rMwj...) out: the market maker rP7J... holds both and ripples 1 USD
- * from one line to the other. Bitstamp, which only passes its own USD from the source to the market maker (0.2%
- * transfer fee included), is an issuer, not a market maker, and is not listed.
+ * from one line to the other (the first line of the metadata), and Bitstamp ripples its own USD from the source to the
+ * market maker (0.2% transfer fee included): its side of the market maker's line goes down, of the source's line up.
+ * Bitstamp is the source currency's issuer, not the delivered currency's, so it is listed too; SnapSwap is not.
  */
 const THROUGH_A_MARKET_MAKER = {
   hash: 'E362675D8230B1A615C9BF53BC0B288F3AAA36CDF8D4D3E3EE8A681966BE8397',
@@ -64,13 +65,15 @@ const THROUGH_A_MARKET_MAKER = {
   source_issuer: 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B',
   offers_crossed: 0,
   amm_pools: [],
-  rippled_through: ['rP7JWWD4zgm3GX1szbghTi2NXUniitWAKV'],
+  rippled_through: ['rP7JWWD4zgm3GX1szbghTi2NXUniitWAKV', 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B'],
 };
 
 /**
  * An arbitrage round trip to oneself through the XRP/WLV pool rEXkm..., in two payments of one ledger: XRP to WLV, then WLV
- * back to XRP. Each is a payment to oneself through a pool, which /v2/payments leaves out. In the second the WLV issuer
- * rMhk9... only passes its own currency from the source to the pool, so it is not listed as rippled through.
+ * back to XRP. Each is a payment to oneself through a pool, which /v2/payments leaves out. In the first the WLV issuer
+ * rMhk9... is the delivered currency's issuer and is not listed. In the second it ripples its own WLV from the source to
+ * the pool (its side of the source's line goes up, of the pool's down) and is the issuer of the source currency, not of
+ * the delivered one (XRP): it is listed as rippled through.
  */
 const ROUND_TRIP_OUT = {
   hash: '4FA4CA051B7AADE70B5139570BEF9A7BE97659B6B6F670609E45AC11CD30F991',
@@ -100,13 +103,15 @@ const ROUND_TRIP_BACK = {
   source_issuer: 'rMhk9GPrsoWWAgWB4ai9QrELm8G1rMDySM',
   offers_crossed: 0,
   amm_pools: ['rEXkmSGLAEi26qzbWWU1tKxb9HCrFAXsYh'],
-  rippled_through: [],
+  rippled_through: ['rMhk9GPrsoWWAgWB4ai9QrELm8G1rMDySM'],
 };
 
 /**
  * XRP to CNY of one issuer, to oneself (a conversion): the XRP/CNY offer of rh2K... and an offer of raX1... that turns
  * CNY of rPT7... into CNY of razq.... The owner of that offer has one CNY line go up and another go down, but it
- * traded through its offer: it is an offer crossed, not an account rippled through.
+ * traded through its offer: it is an offer crossed, not an account rippled through. rPT7... ripples its own CNY from the
+ * first offer's owner to the second's (its side of rh2K...'s line goes up, of raX1...'s down): it is no issuer of the
+ * delivered CNY (razq...), so it is listed.
  */
 const TO_ONESELF_ACROSS_ISSUERS = {
   hash: '91F75EC97B9BD4AA72E5E45C75AEBDA3251839C85F0BAE5736FF88B4F8B134B7',
@@ -121,7 +126,7 @@ const TO_ONESELF_ACROSS_ISSUERS = {
   source_currency: 'XRP',
   offers_crossed: 2,
   amm_pools: [],
-  rippled_through: [],
+  rippled_through: ['rPT74sUcTBTQhkHVD54WGncoqXEAMYbmH7'],
 };
 
 /** $LYNX from one holder to another through its issuer only, without `Paths`: not a path payment. */
@@ -197,7 +202,7 @@ describe('GET /v2/path_payments', () => {
       expect(find(THROUGH_A_POOL.hash)).toEqual(THROUGH_A_POOL);
     });
 
-    it('a payment rippling through a market maker, which is listed; the issuers it passed are not', () => {
+    it("a payment rippling through a market maker and the source currency's issuer, both listed; not the delivered currency's", () => {
       expect(find(THROUGH_A_MARKET_MAKER.hash)).toEqual(THROUGH_A_MARKET_MAKER);
     });
 
@@ -206,7 +211,7 @@ describe('GET /v2/path_payments', () => {
       expect(find(ROUND_TRIP_BACK.hash)).toEqual(ROUND_TRIP_BACK);
     });
 
-    it('a payment to oneself, converting through offers; an offer between two issuers of a currency is no rippling', () => {
+    it('a payment to oneself through offers: an offer between two issuers of a currency is no rippling, its issuer is', () => {
       expect(find(TO_ONESELF_ACROSS_ISSUERS.hash)).toEqual(TO_ONESELF_ACROSS_ISSUERS);
     });
 
@@ -373,7 +378,7 @@ describe('GET /v2/path_payments', () => {
           'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B',
           '0',
           '',
-          'rP7JWWD4zgm3GX1szbghTi2NXUniitWAKV',
+          'rP7JWWD4zgm3GX1szbghTi2NXUniitWAKV rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B',
         ]
           .map((cell) => `"${cell}"`)
           .join(','),
