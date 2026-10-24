@@ -14,7 +14,8 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
 [Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [Validations](#validations) ·
-[Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Operational endpoints](#operational-endpoints)
+[Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
+[Operational endpoints](#operational-endpoints)
 
 ---
 
@@ -161,7 +162,8 @@ the unpaged list.
 Routes that list rows answer `format=csv` with `Content-Type: text/csv` and `Content-Disposition: attachment;
 filename="<name>.csv"; filename*=UTF-8''<name>.csv` (RFC 6266: the name quoted, `"` and `\` escaped and anything but printable
 ASCII as `_`, and the name itself in UTF-8, percent-encoded; clients show the latter). Nested objects are flattened to `a.b` and `c[0].d` columns, the columns are the union of the keys in the
-order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name.
+order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name. Every route with a
+CSV form can also be [exported](#exports): the whole list as one file, made in the background.
 
 **Differences from data.ripple.com**: flattening is applied on **every** route that has a CSV form. The original flattened nested objects with
 its `flattenJSON` helper on only some routes (9 of 29) and printed `[Object]` in the cells of the others, which made those CSVs unusable. The
@@ -205,7 +207,8 @@ one now gets buckets). Their AMM data additions add the parameter `amm` and the 
 fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, and `computed_start` and `computed_end` to `GET /v2/amm/pools/{pool}/history?interval=day`.
 
 From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the field `account_name` of
-`GET /v2/accounts/{address}`, the name the operator gave the address.
+`GET /v2/accounts/{address}`, the name the operator gave the address; and [exports](#exports), `POST /v2/exports` and
+`GET /v2/exports/{id}` ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 70).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -2964,6 +2967,72 @@ Errors, in the order they are checked: 400 `family is required`, `invalid start 
 the syncer's aggregator keeps (the last two hours every minute, plus any range ingest rewrote); right after a long outage or
 on a database with years of history the current hour can lag until the aggregator has caught up
 (`syncer_aggregator_stats_lag_seconds`).
+
+---
+
+## Exports
+
+An **export** is a file of a whole list, made in the background and downloaded once it is ready. Any route with a CSV form can be
+exported (the routes that say `format` … `csv` above): a route that gets a CSV form later can be exported with no other change. The
+exporter of the network makes the file by walking the list's own pages through this api, with an API key of its own, so the file
+is the list. Exports need the storage bucket of the deployment (`GH_EXPORT_BUCKET`, see [configuration](configuration.md)); without
+it both routes answer 503 `exports are not available`. Neither answer is cached (`Cache-Control: no-store`).
+
+### `POST /v2/exports`
+
+Asks for an export. The body is JSON:
+
+| Field | Meaning |
+| --- | --- |
+| `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list, as CSV. |
+| `format` | `csv`. |
+
+A **list over time** (a route that takes `start` and `end`) must name both. A list at a point in time (`/balances`, `/orders`)
+may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`) names none. The other
+parameters are not checked here: a list that refuses them makes a failed export, which says why.
+
+The answer is 202:
+
+```json
+{ "result": "success", "id": "6f1c0e9b2d4a4c1f8e3b5a7d9c2e4f60", "status": "queued" }
+```
+
+The `id` is 128 random bits (32 hex digits): only the API key that asked can read the export. The job keeps the SHA-256 of that
+key, never the key; with authentication off (no `GH_API_KEYS`, development only) a request without a key owns its exports.
+
+Errors, in the order they are checked: 503 `exports are not available`; 400 `invalid path` (no `path`, or not one starting
+with `/v2/`), `path is not exportable` (no route with a CSV form has this path), `start and end are required`, `invalid format`;
+500 `unable to create the export`.
+
+### `GET /v2/exports/{id}`
+
+The state of an export:
+
+```json
+{ "result": "success", "id": "6f1c0e9b2d4a4c1f8e3b5a7d9c2e4f60", "status": "done", "format": "csv",
+  "path": "/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01", "created": "2024-07-02T08:00:00Z",
+  "finished": "2024-07-02T08:00:41Z", "rows": 15230, "url": "https://storage.googleapis.com/…" }
+```
+
+Key order: `result, id, status, format, path, created, finished?, rows?, error?, url?`. `status` is `queued`, `running`, `done`
+or `failed`. `finished` is there when the export is done or has failed; `rows` (the data rows of the file) and `url` when it is
+done; `error` when it has failed, and says why: the list's own answer (`the list answered 400: invalid transaction type`), `the
+list did not answer a CSV`, `the list's CSV could not be read`, `the list could not be read`, `a page of the list took longer
+than 60 s`, `the file could not be stored`, or `the exporter stopped while it made this export: ask for it again`.
+
+`url` downloads the file for **15 minutes**; each request makes a new one. The file is the CSV the list's route would give for
+the whole list in one page: one header, the columns of every row in the order they first appear, a missing cell empty; an
+empty list is an empty file. It downloads under the list's own file name (`<address> - transactions.csv`). An export and its
+file are kept **7 days** after it was asked for; then the id is not found.
+
+Errors: 503 `exports are not available`; 404 `export not found` (an id that does not exist, or the export of another API
+key: the two are not told apart); 500 `unable to retrieve the export`.
+
+Exports run one at a time per network, in the order they were asked for. The row cap, the limit of exports per key and PDF are
+not there yet (tickets #16 and #17).
+
+**Differences from data.ripple.com**: the original has no exports; these routes are new
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 70).
 
 ---
 

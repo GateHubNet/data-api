@@ -1,8 +1,8 @@
 # Architecture
 
 The GateHub Data API is a **drop-in replacement for the Ripple Data API v2** (`data.ripple.com`, the
-`rippled-historical-database` project) for the **XRP Ledger and Xahau**, built as a ClickHouse-backed system with two services and a
-shared library. This page explains the moving parts; the reasons for the big choices are the [ADRs](adr/README.md).
+`rippled-historical-database` project) for the **XRP Ledger and Xahau**, built as a ClickHouse-backed system with two services, an
+exporter and a shared library. This page explains the moving parts; the reasons for the big choices are the [ADRs](adr/README.md).
 
 ## System diagram
 
@@ -28,9 +28,14 @@ shared library. This page explains the moving parts; the reasons for the big cho
  └──────────────────────────────▲────────────────────────────────────┘
                                 │ HTTP
               nginx (host routing: xrpl.data.* / xahau.data.*)  ◀── front proxy (TLS)  ◀── clients
+
+ ┌───────────────────────────────────────────────────────────────────┐
+ │ exporter (apps/exporter) — ONE per network                        │──▶ api: the list's CSV pages (HTTP, own key)
+ │   takes queued export jobs (export_jobs), one at a time           │──▶ Google Cloud Storage: <network>/<id>.csv
+ └───────────────────────────────────────────────────────────────────┘    (the api signs the download links)
 ```
 
-Both services run `GH_NETWORK=xrpl` or `xahau` (the same images). One deployment serves one network; the network profile selects
+Every service runs `GH_NETWORK=xrpl` or `xahau` (the same images). One deployment serves one network; the network profile selects
 the node URLs, the native currency (`XRP` / `XAH`), the CTID network id (0 / 21337), the markets config and the default database.
 See [ADR-0009](adr/0009-one-deployment-per-network.md).
 
@@ -51,6 +56,8 @@ Everything both services need, written once:
 - **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
 - **`query/`**: `RatesService` (exchange rates, vwap, used by the API *and* the aggregator), the daily-rate and account day-group reads of the
   account and market aggregates, and amount/decimal helpers.
+- **`export/`**: the export jobs (`export_jobs`: append, read the current state, the queue) and the storage of their files
+  (`ExportStorage`: `GcsExportStorage`, V4 signed links; `MemoryExportStorage` for tests), shared by the api and the exporter.
 - **`aggregate/`**: the `stats_hourly`, volume and AMM jobs (`amm_pools`, `amm_daily`) the aggregator runs, and the reads they share
   (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), and the jobs of the account and market aggregates
   (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`).
@@ -77,7 +84,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `amm`,
-  `validations`, `validators` with the amendments routes, `stats`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -103,9 +110,20 @@ The AMM routes are GateHub extras ([ADR-0011](adr/0011-amm-data-and-swaps-as-exc
 - **Existence of a pool.** The pool routes other than detail and pair share `AmmPoolsService.requirePool` (a state row in a committed
   ledger); detail and pair read `amm_pools`, which the aggregator rebuilds.
 
+### Exporter: `apps/exporter` (`@gatehub/data-exporter`)
+
+A NestJS worker with a probe/metrics HTTP surface, exactly one per network (spec #4, ticket #15). It takes the queued
+[export](api-reference.md#exports) jobs of its database one at a time, oldest first, and makes each file by walking the list's own
+CSV pages (`format=csv`, `limit`, following `Link`) through the network's api with an API key of its own: every list has one
+implementation, and an export is always the list it names. `CsvFile` puts the pages together into the file the route would give
+for the whole list in one page (one header, the columns of every page; the rows wait in a spool file under `/tmp`), and it is
+uploaded to `<network>/<id>.csv` in the bucket of `GH_EXPORT_BUCKET`. The job's states are rows of `export_jobs` (`running`, then
+`done` or `failed` with why). A shutdown queues the job in hand again; a job a crashed exporter left `running` is failed when the
+next one starts. The api queues the jobs (`POST /v2/exports`) and signs the download links (`GET /v2/exports/{id}`).
+
 ### ClickHouse
 
-One server, one database per network, 49 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network, 50 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 
