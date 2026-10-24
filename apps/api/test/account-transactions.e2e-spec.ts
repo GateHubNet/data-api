@@ -1,5 +1,6 @@
 import { AccountTransactionsRow, Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { csvDisposition } from './support/csv';
 import {
   FixtureTx,
   fixtureAccountTransactions,
@@ -31,7 +32,10 @@ import { expectBoundedInOrderRead, isPageRead } from './support/plans';
  * stale lists of the original, the order of the checks, both modes (time and sequence) with their markers, ordering,
  * limits, `binary`, the single lookup (`invalid sequence number`, tickets, 404s), the tables and the plan of the
  * queries, rows that were written twice, the failure paths and Xahau. The original has no CSV for account
- * transactions, so `format=csv` is ignored.
+ * transactions; `format=csv` here is one summary row per transaction from the account's side (spec #4, ticket #5),
+ * checked against rows worked out by hand from the recorded ledgers (a sent, a received, an issued currency and a failed
+ * payment, a TrustSet from both sides, an OfferCreate, transactions that only affected the account, XAH on Xahau), with
+ * the parameters and the paging of the JSON list.
  */
 
 const ACCOUNT = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B'; // only ever a recipient (offers and payments reach it)
@@ -40,6 +44,18 @@ const BUSY = 'rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q'; // 179 transactions
 const SEQUENCED = 'rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg'; // sends with sequences 11368825 … 13299878
 const RECIPIENT = 'rHTaDFHJng6YVtThvv522LmJfkocBVkK6Z'; // never sends; one payment reaches it
 const PAYMENT_TO_RECIPIENT = 'E011E6D20BE1FAC7C37F2FA0D36F0811C404B118D936963051600796FF2C0CBC';
+const SENDS_XRP = 'rJR7gjNe3DpJ7kpB4CHBxjDKfwVMpTKPpj'; // sent PAYMENT_TO_RECIPIENT: 1000 XRP, fee 10 drops
+/** A partial EUR payment (after the fix, so it delivered its `Amount`), issued by BUSY, through an offer of EUR_OFFER_OWNER. */
+const EUR_PAYMENT = '91F79AC2105EF90940FBE44F4B5C0EE5D1E5B113D24E42B53F856C3FEC848A6C';
+const EUR_SENDER = 'rwvLbHQtU16BwQJyrQb9cfFKvx13Ksbkja';
+const EUR_RECIPIENT = 'r4L6ZLHkTytPqDR81H1ysCr6qGv9oJJAKi';
+const EUR_OFFER_OWNER = 'rBQkEKFMnBjc19DRaY7ThLJ2woqQManbTt';
+/** The one TrustSet of the mock ledgers: TRUSTER trusts FCD_ISSUER for 100 FCD. */
+const TRUST_SET = '62D28D7391055118D4443DE112F7E5524A7E5BE55E6FFD81D0E59AD43B63B09E';
+const TRUSTER = 'ragqHYbK8v2pVSaJxXhgviJTctdJkL6cKp';
+const FCD_ISSUER = 'r3T1RGxkHmvsMtt4v7xc4CUs1UMvmC96JL';
+const SENDER_OFFER = 'C3A57DD56ECDA86B31472CD2921C233769E2AF98825470FD652179F8A217F03B'; // the first OfferCreate of SENDER
+const OFFER_AFFECTING_ACCOUNT = '1156821EE76B7CDFEBC57D86ED3C7E1F836CECFE6B0BE98FC8D584EC0C58AE5B'; // by rfCFLzNJ…
 
 interface Key {
   ledger_index: number;
@@ -720,16 +736,9 @@ describe('account transactions API endpoint', () => {
 
     it('unknown params ignored', async () => {
       const plain = await get(listPath(SENDER));
-      const res = await get(`${listPath(SENDER)}?foo=bar&offset=3&ledger_min=5&format=csv&api_key=x`);
+      const res = await get(`${listPath(SENDER)}?foo=bar&offset=3&ledger_min=5&api_key=x`);
       expect(res.status).toBe(200);
       expect(res.body).toEqual(plain.body);
-    });
-
-    it('format=csv is ignored: the original has no CSV for account transactions', async () => {
-      const res = await get(`${listPath(SENDER)}?format=csv&limit=2`);
-      expect(res.status).toBe(200);
-      expect(res.headers['content-type']).toMatch(/^application\/json/);
-      expect(res.body.count).toBe(2);
     });
 
     it('a window is the ledgers that closed in it, the end second included', async () => {
@@ -770,6 +779,156 @@ describe('account transactions API endpoint', () => {
         )
       ).flatMap(hashesIn);
       expect(walked).toEqual(hashesOfRows([...expected].reverse()));
+    });
+  });
+
+  // -- format=csv ---------------------------------------------------------------------------------------------------
+
+  describe("format=csv: one summary row per transaction, from the account's side", () => {
+    const HEADER =
+      '"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"';
+    const csvOf = async (path: string) => {
+      const res = await get(path);
+      expect([path, res.status, res.headers['content-type']]).toEqual([path, 200, expect.stringMatching(/^text\/csv/)]);
+      return res;
+    };
+    /** The first cell of every line but the header: the hashes, in the order of the file. */
+    const hashesInCsv = (text: string): string[] =>
+      text === ''
+        ? []
+        : text
+            .split('\n')
+            .slice(1)
+            .map((line) => JSON.parse(line.split(',')[0]) as string);
+    /** The line of a transaction in the CSV of an account's whole history. */
+    const lineOf = async (account: string, hash: string): Promise<string | undefined> => {
+      const res = await csvOf(`${listPath(account)}?format=csv&limit=1000`);
+      return res.text.split('\n').find((line: string) => line.startsWith(`"${hash}",`));
+    };
+
+    it('a received payment: the sender, the delivered amount, no fee; the file is `<address> - transactions.csv`', async () => {
+      const res = await csvOf(`${listPath(RECIPIENT)}?format=csv`);
+      expect(res.headers['content-disposition']).toBe(csvDisposition(`${RECIPIENT} - transactions`));
+      expect(res.text).toBe(
+        [
+          HEADER,
+          `"${PAYMENT_TO_RECIPIENT}","1021029","2013-06-11T20:01:20+00:00","Payment","tesSUCCESS","false","rJR7gjNe3DpJ7kpB4CHBxjDKfwVMpTKPpj","1000","XRP","","",""`,
+        ].join('\n'),
+      );
+    });
+
+    it('a sent payment: the destination, the delivered amount and the fee', async () => {
+      expect(await lineOf(SENDS_XRP, PAYMENT_TO_RECIPIENT)).toBe(
+        `"${PAYMENT_TO_RECIPIENT}","1021029","2013-06-11T20:01:20+00:00","Payment","tesSUCCESS","true","${RECIPIENT}","1000","XRP","","0.00001",""`,
+      );
+    });
+
+    it('an issued currency payment, from both parties: the amount, its currency and its issuer', async () => {
+      expect(await lineOf(EUR_SENDER, EUR_PAYMENT)).toBe(
+        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","${EUR_RECIPIENT}","2","EUR","${BUSY}","0.012",""`,
+      );
+      expect(await lineOf(EUR_RECIPIENT, EUR_PAYMENT)).toBe(
+        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","false","${EUR_SENDER}","2","EUR","${BUSY}","",""`,
+      );
+    });
+
+    it('a failed payment: the destination and the fee, but no amount, since it delivered nothing', async () => {
+      const failed = 'BE9FAA33175BBA52D4200ABFEF9A6BF8A9F977CE12B8B3E1FC6695E0F00C07FD';
+      expect(await lineOf('rUeXUxaMTH1pELvD2EkiHTRcM9FsH3v4d7', failed)).toBe(
+        `"${failed}","11616411","2015-02-09T18:15:20+00:00","Payment","tecNO_DST_INSUF_XRP","true","rPTFJDMfRnY8RBsvsiYDGp6Gmuguoxg3FB","","","","0.01",""`,
+      );
+    });
+
+    it('a TrustSet: the peer and the limit', async () => {
+      expect(await lineOf(TRUSTER, TRUST_SET)).toBe(
+        `"${TRUST_SET}","11119932","2015-01-14T18:51:40+00:00","TrustSet","tesSUCCESS","true","${FCD_ISSUER}","100","FCD","${FCD_ISSUER}","0.012",""`,
+      );
+    });
+
+    it('an OfferCreate: no counterparty and no amount, the fee', async () => {
+      expect(await lineOf(SENDER, SENDER_OFFER)).toBe(
+        `"${SENDER_OFFER}","11119603","2015-01-14T18:27:20+00:00","OfferCreate","tesSUCCESS","true","","","","","0.015",""`,
+      );
+    });
+
+    it('a transaction that only affected the account: not the initiator, no counterparty, amount or fee', async () => {
+      // an OfferCreate of someone else that touched the account
+      expect(await lineOf(ACCOUNT, OFFER_AFFECTING_ACCOUNT)).toBe(
+        `"${OFFER_AFFECTING_ACCOUNT}","11119015","2015-01-14T17:43:10+00:00","OfferCreate","tesSUCCESS","false","","","","","",""`,
+      );
+      // a payment between two others that took the account's offer: it is no party to the payment
+      expect(await lineOf(EUR_OFFER_OWNER, EUR_PAYMENT)).toBe(
+        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","false","","","","","",""`,
+      );
+    });
+
+    it('takes every parameter of the JSON list: the same transactions, in the same order, with the same marker', async () => {
+      const sent = sentBy(SEQUENCED);
+      const queries = [
+        `${listPath(BUSY)}?start=2015-01-14T18:27:00&end=2015-01-14T18:27:59&type=OfferCreate&descending=true&limit=3`,
+        `${listPath(SENDER)}?result=tecUNFUNDED_OFFER&limit=2`,
+        `${listPath(SENDER)}?type=OfferCreate&result=tesSUCCESS&limit=4&marker=${markerOf(historyOf(SENDER)[0])}`,
+        `${listPath(SEQUENCED)}${qs({ min_sequence: sent[2].sequence, max_sequence: sent[9].sequence, limit: 3 })}`,
+        `${listPath(SEQUENCED)}${qs({ max_sequence: sent[9].sequence, descending: true, limit: 2 })}`,
+      ];
+      for (const path of queries) {
+        const json = await api.ok<ListBody>(path, 'transactions');
+        expect(json.body.count).toBeGreaterThan(0);
+        expect(json.body.marker).toBeDefined();
+        const asked = `${path}&format=csv`;
+        const csv = await csvOf(asked);
+        expect([path, hashesInCsv(csv.text)]).toEqual([path, hashesIn(json.body)]);
+        // the marker of the next page goes in place of the one asked with, or last
+        const next = `marker=${json.body.marker}`;
+        const nextPath = asked.includes('&marker=') ? asked.replace(/marker=[^&]*/, next) : `${asked}&${next}`;
+        expect([path, csv.headers.link]).toEqual([path, `<${new URL(csv.request.url).origin}${nextPath}>; rel="next"`]);
+      }
+    });
+
+    it('following the Link header of the CSV walks the whole history, a header on every page', async () => {
+      const seen: string[] = [];
+      let path: string | undefined = `${listPath(BUSY)}?format=csv&limit=60&descending=true`;
+      for (let i = 0; path && i < 10; i++) {
+        const res = await csvOf(path);
+        expect(res.text.split('\n')[0]).toBe(HEADER);
+        seen.push(...hashesInCsv(res.text));
+        const link: string | undefined = res.headers.link;
+        path = link ? /^<[^/]+\/\/[^/]+(.*)>; rel="next"$/.exec(link)?.[1] : undefined;
+      }
+      expect(seen).toEqual(hashesOfRows([...historyOf(BUSY)].reverse()));
+    });
+
+    it('binary=true does not change the CSV; an empty list is an empty file', async () => {
+      const plain = await csvOf(`${listPath(SENDER)}?format=csv&limit=5`);
+      expect((await csvOf(`${listPath(SENDER)}?format=csv&limit=5&binary=true`)).text).toBe(plain.text);
+      const empty = await csvOf(`${listPath(SENDER)}?format=CSV&start=2030-01-01`);
+      expect(empty.headers['content-disposition']).toBe(csvDisposition(`${SENDER} - transactions`));
+      expect(empty.text).toBe('');
+    });
+
+    it('a mistake of the client is still the JSON error', async () => {
+      const res = await get(`${listPath(SENDER)}?format=csv&type=payment`);
+      expect([res.status, res.headers['content-type'], res.body]).toEqual([
+        400,
+        expect.stringMatching(/^application\/json/),
+        { result: 'error', message: 'invalid transaction type' },
+      ]);
+    });
+
+    it('any other format is the JSON answer, byte for byte', async () => {
+      for (const path of [listPath(SENDER), `${listPath(SEQUENCED)}?min_sequence=1&limit=3`]) {
+        const plain = await get(path);
+        expect(plain.headers['content-type']).toMatch(/^application\/json/);
+        for (const format of ['json', 'xml', '']) {
+          const res = await get(`${path}${path.includes('?') ? '&' : '?'}format=${format}`);
+          expect([path, format, res.headers['content-type'], res.text]).toEqual([
+            path,
+            format,
+            plain.headers['content-type'],
+            plain.text,
+          ]);
+        }
+      }
     });
   });
 
@@ -1373,6 +1532,33 @@ describe('account transactions API endpoint with tickets', () => {
   });
 });
 
+describe('account transactions API endpoint, format=csv on recorded mainnet ledgers', () => {
+  const USD_ISSUER = 'r9PfV3sQpKLWxccdg3HL2FXKxGW2orAcLE';
+  const USD_HOLDER = 'rXUMMaPpZqPutoRszR29jtC8amWq3APkx'; // sets its USD limit twice
+  let h: Harness;
+  let get: ApiClient['get'];
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-recorded' });
+    get = (await h.api()).get;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('a TrustSet seen by the peer: the account that set the limit, and the limit', async () => {
+    const res = await get(`${listPath(USD_ISSUER)}?format=csv`);
+    expect([res.status, res.headers['content-type']]).toEqual([200, expect.stringMatching(/^text\/csv/)]);
+    expect(res.text).toBe(
+      [
+        '"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"',
+        `"A3F259D074A8E2DE6BEA82E31E025E8EFD505032E6A335A335FF5949B50CCB5E","107671591","2026-10-15T11:19:20+00:00","TrustSet","tesSUCCESS","false","${USD_HOLDER}","1.308725","USD","${USD_ISSUER}","",""`,
+        `"622618838E6DD7EDC9D029183473EC76BFBF6F7BE05F0FE33DB6C7049C196CB6","107671607","2026-10-15T11:20:20+00:00","TrustSet","tesSUCCESS","false","${USD_HOLDER}","1.30729","USD","${USD_ISSUER}","",""`,
+      ].join('\n'),
+    );
+  });
+});
+
 describe('account transactions API endpoint on Xahau', () => {
   const seed = 'xahau-recorded';
   const transactions = fixtureTransactions(seed);
@@ -1414,6 +1600,14 @@ describe('account transactions API endpoint on Xahau', () => {
   });
   afterAll(async () => {
     await h?.close();
+  });
+
+  it('format=csv: a payment in the native currency is in XAH', async () => {
+    const res = await get(`${listPath(PAYEE)}?format=csv&limit=1`);
+    expect([res.status, res.headers['content-type']]).toEqual([200, expect.stringMatching(/^text\/csv/)]);
+    expect(res.text.split('\n')[1]).toBe(
+      '"4D048D82D05A2FEDAC0174DD1084C1F43D98F417BC5C09320441E902A41104A3","26540613","2026-10-15T10:10:41+00:00","Payment","tesSUCCESS","false","rn4BZ7XH3vLWzMWAVHYLJrRAH9jwJBGjet","0.000001","XAH","","",""',
+    );
   });
 
   it('every hook-heavy history is the transactions that affect the account, in JSON and in binary', async () => {

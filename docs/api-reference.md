@@ -191,7 +191,8 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs), the [AMM](#amm) endpoints (`/v2/amm/pools...`,
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
 `GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
-`GET /v2/network/validators/{key}/validations`. `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+`GET /v2/network/validators/{key}/validations`, and `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
 Exchange-based endpoints also differ in what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see
@@ -693,9 +694,38 @@ transaction objects of `/v2/transactions` without `ledger_hash`: `{hash, ledger_
 | `descending` | false | |
 | `limit` | 20 (max 1000) | |
 | `marker` | | |
+| `format` | json | `csv`: one **summary row** per transaction instead of the transaction object, file `<address> - transactions.csv`. Every other parameter applies as in JSON, and the pages follow the same `marker` and `Link` header. `binary` does not change the CSV. |
 
 Errors: 400 `invalid start date format`, `invalid end date format`, `invalid min_sequence`, `invalid max_sequence`, `invalid
-transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. No CSV.
+transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. Errors stay JSON with
+`format=csv`.
+
+**The CSV summary row** says what the transaction was from the account's side, readable without opening `tx` and `meta`. The
+columns, the same on every page and in this order:
+
+| Column | Meaning |
+| --- | --- |
+| `hash`, `ledger_index` | The transaction and its ledger. |
+| `executed_time` | The close time of the ledger, as the `date` of the JSON list (`2015-01-14T18:27:10+00:00`). |
+| `tx_type`, `result` | `Payment`, `tesSUCCESS`, ... |
+| `initiator` | `true` when the account sent the transaction (its `Account`), `false` when the transaction only affected it. |
+| `counterparty`, `amount`, `currency`, `issuer` | From one mapping per transaction type, below. Empty where the type has none. |
+| `fee` | The fee in whole units of the native currency, on the transactions the account sent; empty on the others. |
+| `flags_changed` | The account flags the transaction set or cleared. Empty for now: it fills once the account state history is recorded. |
+
+| Type | `counterparty` | `amount`, `currency`, `issuer` |
+| --- | --- | --- |
+| `Payment` | The destination for the sender, the sender for the destination. | The delivered amount of a successful payment, as `/v2/accounts/{address}/payments` gives it (a partial payment from before the fix gives `Amount`; an `Amount.issuer` that names a party is resolved through the trust lines). A failed payment delivered nothing and leaves them empty. An account that is neither party (an issuer the payment rippled through, the owner of an offer it took) gets none of the four. |
+| `TrustSet` | The peer of the trust line: the `LimitAmount` issuer for the sender, the sender for that issuer. | The limit the sender set, with its currency and issuer. |
+| any other (`OfferCreate`, `AccountSet`, ...) | empty | empty |
+
+Amounts are exact decimal strings in whole units, as on the ledger; the native currency is `XRP` or `XAH` and has no issuer.
+A page with no transactions is an empty file.
+
+```csv
+"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"
+"91F79AC2…","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","r4L6Z…","2","EUR","rMwjY…","0.012",""
+```
 
 ### `GET /v2/accounts/{address}/transactions/{sequence}`
 
@@ -705,7 +735,8 @@ supported). A transaction that used a ticket has Sequence 0: the latest of them 
 
 **Differences from data.ripple.com** (both routes): `max_sequence` is inclusive (the HBase scan dropped its row); `type` and
 `result` are validated against the network definitions; a `min_sequence` above what a sequence can be gives an empty list and
-a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404.
+a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404. The original had no CSV for
+account transactions; `format=csv` with the summary row is a GateHub extra.
 
 ### `GET /v2/accounts/{address}/payments`
 

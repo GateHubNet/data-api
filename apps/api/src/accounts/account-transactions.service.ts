@@ -1,8 +1,17 @@
-import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
-import { Injectable } from '@nestjs/common';
+import {
+  ClickHouseService,
+  NetworkProfile,
+  ParseContext,
+  parseContextFor,
+  readDistinctPage,
+  Table,
+} from '@gatehub/data-api-shared';
+import { Inject, Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { TxObject, TxService } from '../common/tx-object';
+import { NETWORK_PROFILE } from '../config/api.config';
+import { toTransactionSummary, TransactionSummary } from './transaction-summary';
 
 /** The highest `Sequence` a transaction can have: the column is a UInt32. */
 const MAX_SEQUENCE = 4_294_967_295;
@@ -30,6 +39,12 @@ const SEQUENCE_ORDER: KeysetKey[] = [
 /** What a marker of the sequence list holds: the ORDER BY without the account. */
 const SEQUENCE_KEYS: KeysetKey[] = SEQUENCE_ORDER.slice(1);
 
+/**
+ * How a page serves its transactions: as the Ripple API's objects with `tx` and `meta` as JSON or as hex (`binary=true`),
+ * or as summary rows from the account's side (`format=csv`).
+ */
+export type TransactionsForm = 'json' | 'binary' | 'summary';
+
 /** What both lists are asked for; the values are already validated. */
 interface ListQuery {
   account: string;
@@ -37,7 +52,7 @@ interface ListQuery {
   type?: string;
   /** A transaction result code of the network (`tesSUCCESS`). */
   result?: string;
-  binary: boolean;
+  form: TransactionsForm;
   descending: boolean;
   limit: number;
   /** As the client got it from the last page; `decodeMarker` checks it. */
@@ -64,9 +79,12 @@ export interface SequenceQuery extends ListQuery {
   maxSequence?: number;
 }
 
-/** A page: the transactions in the order asked for, and the marker of the next page when there is one. */
+/**
+ * A page: the transactions in the order asked for, as objects or as summary rows (the `form` asked for), and the marker
+ * of the next page when there is one.
+ */
 export interface TransactionsPage {
-  transactions: TxObject[];
+  transactions: TxObject[] | TransactionSummary[];
   marker?: string;
 }
 
@@ -94,11 +112,16 @@ interface SequenceKey extends TimeKey {
  */
 @Injectable()
 export class AccountTransactionsService {
+  private readonly ctx: ParseContext;
+
   constructor(
     private readonly ch: ClickHouseService,
     private readonly ranges: LedgerRangeResolver,
     private readonly txs: TxService,
-  ) {}
+    @Inject(NETWORK_PROFILE) profile: NetworkProfile,
+  ) {
+    this.ctx = parseContextFor(profile);
+  }
 
   /** One page of the transactions that affect the account in a time window. */
   async listByTime(q: TimeQuery): Promise<TransactionsPage> {
@@ -137,7 +160,7 @@ export class AccountTransactionsService {
     });
 
     const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
-    return this.page(page.rows, page.marker, q.binary);
+    return this.page(page.rows, page.marker, q);
   }
 
   /** One page of the transactions the account sent, by their `Sequence`. */
@@ -196,7 +219,7 @@ export class AccountTransactionsService {
     });
 
     const page = paginate(found, q.limit, (key) => [key.sequence, key.ledger_index, key.tx_index]);
-    return this.page(page.rows, page.marker, q.binary);
+    return this.page(page.rows, page.marker, q);
   }
 
   /**
@@ -222,12 +245,15 @@ export class AccountTransactionsService {
   }
 
   /**
-   * The transactions of a page of keys, in their order. An item carries no `ledger_hash`: the original never asked for
-   * it on these routes.
+   * The transactions of a page of keys, in their order, in the form asked for. An object carries no `ledger_hash`: the
+   * original never asked for it on these routes. A summary row is read from the stored transaction, without the codec.
    */
-  private async page(keys: TimeKey[], marker: string | undefined, binary: boolean): Promise<TransactionsPage> {
+  private async page(keys: TimeKey[], marker: string | undefined, q: ListQuery): Promise<TransactionsPage> {
     const rows = await this.txs.fetchByKeys(keys);
-    const transactions = await this.txs.toTxObjects(rows, { binary });
+    const transactions =
+      q.form === 'summary'
+        ? rows.map((row) => toTransactionSummary(row, q.account, this.ctx))
+        : await this.txs.toTxObjects(rows, { binary: q.form === 'binary' });
     return { transactions, ...(marker !== undefined && { marker }) };
   }
 }
