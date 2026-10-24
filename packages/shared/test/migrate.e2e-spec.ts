@@ -1,6 +1,7 @@
 import { appendFileSync, copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { clickHouseConfigFromEnv } from '../src/clickhouse/clickhouse.config';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { runMigrations, runSharedMigrations, SHARED_SCHEMA_DIR } from '../src/clickhouse/migrate';
 import { SharedTable, Table } from '../src/clickhouse/tables';
@@ -381,6 +382,29 @@ describe('migrations (e2e)', () => {
       const result = await runMigrations({ config: config(), log });
       expect(result.applied).toEqual([]);
       expect(result.skipped).toEqual(realFiles());
+    });
+
+    it('(g) GH_NETWORK=xrpl-testnet creates and migrates xrpl_testnet', async () => {
+      const testnet = clickHouseConfigFromEnv({
+        GH_CLICKHOUSE_URL: ch.config.url,
+        GH_CLICKHOUSE_USER: ch.config.username,
+        GH_CLICKHOUSE_PASSWORD: ch.config.password,
+        GH_NETWORK: 'xrpl-testnet',
+      });
+      expect(testnet.database).toBe('xrpl_testnet');
+      expect(await databases()).not.toContain('xrpl_testnet');
+
+      const result = await runMigrations({ config: testnet, log });
+
+      expect(result.applied).toEqual(realFiles());
+      expect(await databases()).toContain('xrpl_testnet');
+      const svc = new ClickHouseService(testnet);
+      try {
+        const tables = (await svc.query<{ name: string }>('SHOW TABLES FROM xrpl_testnet')).map((r) => r.name);
+        expect(tables).toEqual(expect.arrayContaining(['ledgers', 'transactions']));
+      } finally {
+        await svc.onModuleDestroy();
+      }
     });
 
     describe('baseline schema', () => {

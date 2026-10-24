@@ -71,6 +71,8 @@ const STREAM_EVENTS = [
 const ACCEPTED_NETWORK_IDS: Record<NetworkName, ReadonlyArray<number | undefined>> = {
   xrpl: [undefined, 0],
   xahau: [21337, 21338],
+  'xrpl-testnet': [1],
+  'xahau-testnet': [21338],
 };
 
 /**

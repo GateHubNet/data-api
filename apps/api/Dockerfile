@@ -36,6 +36,7 @@ RUN --mount=type=secret,id=npm_token,required=true \
   && pnpm --filter @gatehub/data-api-service build \
   && pnpm --filter @gatehub/data-api-service --legacy deploy --prod /app/out \
   && for f in dist/network/index.js config/markets/xrpl.json config/markets/xahau.json \
+    config/markets/xrpl-testnet.json config/markets/xahau-testnet.json \
     config/amendments/xrpl.json config/amendments/xahau.json config/definitions/xrpl.json config/definitions/xahau.json; do \
     test -f "/app/out/node_modules/@gatehub/data-api-shared/$f" || { echo "missing $f in the deployed shared package"; exit 1; }; \
   done
