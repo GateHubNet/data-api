@@ -324,6 +324,13 @@ describe('main.ts under the toolbox bootstrap()', () => {
     expect(output).toContain('Node network_id 21337 does not match GH_NETWORK=xrpl');
   });
 
+  it('exits with an error when a Xahau Testnet node serves GH_NETWORK=xahau (D10)', async () => {
+    await start(21338, { GH_NETWORK: 'xahau', GH_WORKERS: 'fee_stats' });
+    const [code] = (await once(child as ChildProcess, 'exit')) as [number | null];
+    expect(code).toBe(1);
+    expect(output).toContain('Node network_id 21338 does not match GH_NETWORK=xahau');
+  });
+
   it('runs the ingest worker to the node head, and on SIGTERM stops, releases the lease and exits 0', async () => {
     const chain = syntheticChain(81_000_001, 30);
     const head = chain[chain.length - 1];

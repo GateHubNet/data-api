@@ -2,13 +2,14 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { gunzipSync } from 'zlib';
-import { networkChoiceText, NetworkName } from '../src/network';
+import { getNetworkProfile, networkChoiceText, NetworkName } from '../src/network';
 import {
   AMENDMENTS_OBJECT_INDEX,
   FEE_SETTINGS_OBJECT_INDEX,
   NEGATIVE_UNL_OBJECT_INDEX,
 } from '../src/validators/ledger-objects';
 import {
+  networkIdProblem,
   Options,
   parseArgs,
   RecorderNode,
@@ -226,6 +227,19 @@ describe('record-fixtures arguments', () => {
       const ledgers = ['--network', 'xrpl', '--endpoint', 'wss://s2.ripple.com', '--out', 'o', '--ledgers', '1'];
       expect(parseArgs(ledgers)).toMatchObject({ networkState: false, unl: false });
     });
+  });
+});
+
+describe('networkIdProblem', () => {
+  it('refuses a mainnet rippled for --network xrpl-testnet, and takes the testnet', () => {
+    expect(networkIdProblem({}, getNetworkProfile('xrpl-testnet'))).toBe(
+      'reports network_id undefined, but --network xrpl-testnet is 1',
+    );
+    expect(networkIdProblem({ network_id: 1 }, getNetworkProfile('xrpl-testnet'))).toBeUndefined();
+    expect(networkIdProblem({}, getNetworkProfile('xrpl'))).toBeUndefined();
+    expect(networkIdProblem({ network_id: 21338 }, getNetworkProfile('xahau'))).toBe(
+      'reports network_id 21338, but --network xahau is 21337',
+    );
   });
 });
 

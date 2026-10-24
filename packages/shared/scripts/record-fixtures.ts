@@ -285,12 +285,15 @@ function errorText(err: unknown): string {
   }
 }
 
-/** XRPL mainnet reports network_id 0 or omits it; Xahau reports 21337. `undefined` when the node is of the network. */
-function networkIdProblem(
+/**
+ * The same rule as `assertNetwork`: the node's `network_id` (absent included) must be one the profile accepts, so a
+ * mainnet endpoint is never recorded into `fixtures/xrpl-testnet/`. `undefined` when the node is of the network.
+ */
+export function networkIdProblem(
   info: { network_id?: number },
-  profile: Pick<NetworkProfile, 'name' | 'networkId'>,
+  profile: Pick<NetworkProfile, 'name' | 'networkId' | 'acceptedNodeNetworkIds'>,
 ): string | undefined {
-  if (info.network_id === undefined || info.network_id === profile.networkId) return undefined;
+  if (profile.acceptedNodeNetworkIds.includes(info.network_id)) return undefined;
   return `reports network_id ${info.network_id}, but --network ${profile.name} is ${profile.networkId}`;
 }
 

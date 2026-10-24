@@ -1,7 +1,7 @@
 import { Logger } from '@nestjs/common';
 import { EventEmitter } from 'events';
 import { Client, DisconnectedError, NotConnectedError, Request, RippledError, TimeoutError } from 'xrpl';
-import { NetworkName, NetworkProfile } from '../network';
+import { NetworkProfile } from '../network';
 import { EndpointThrottle, nodeThrottle, NodeThrottledError, redactEndpoint, throttleHint } from './node-throttle';
 
 export interface NodeClientLogger {
@@ -66,14 +66,6 @@ const STREAM_EVENTS = [
   'peerStatusChange',
   'consensusPhase',
 ] as const;
-
-/** `network_id` values a node may report for each `GH_NETWORK`. Mainnet rippled omits the field. */
-const ACCEPTED_NETWORK_IDS: Record<NetworkName, ReadonlyArray<number | undefined>> = {
-  xrpl: [undefined, 0],
-  xahau: [21337, 21338],
-  'xrpl-testnet': [1],
-  'xahau-testnet': [21338],
-};
 
 /**
  * One resilient websocket connection to rippled / xahaud, shared by everything in a process that talks to a node.
@@ -483,12 +475,14 @@ export class NodeClient extends EventEmitter {
 }
 
 /**
- * Throw unless the node's `network_id` belongs to the configured network: `xrpl` accepts none or 0, `xahau` 21337
- * (mainnet) or 21338 (testnet).
+ * Throw unless the node's `network_id` (or its absence) is one the profile accepts, `profile.acceptedNodeNetworkIds`.
+ * Each network accepts exactly its own and no other: `xrpl` a node that reports no `network_id` (mainnet rippled omits
+ * the field) or 0, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338. So a Xahau Testnet node does not serve
+ * `GH_NETWORK=xahau`, and a mainnet rippled, which reports none, does not serve `xrpl-testnet`.
  */
 export function assertNetwork(info: { network_id?: number }, profile: NetworkProfile): void {
   const networkId = info.network_id ?? undefined;
-  if (!ACCEPTED_NETWORK_IDS[profile.name].includes(networkId)) {
+  if (!profile.acceptedNodeNetworkIds.includes(networkId)) {
     throw new Error(`Node network_id ${String(networkId)} does not match GH_NETWORK=${profile.name}`);
   }
 }

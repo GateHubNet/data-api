@@ -41,7 +41,7 @@ Then, in order:
    (`system.columns`): a database without it refuses the boot with a message that names the file and what is missing (a check
    that cannot reach ClickHouse is logged and the boot goes on).
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
-   (`server_info.network_id`: XRPL reports 0 or nothing, Xahau 21337/21338). A node of another network refuses the boot.
+   (`server_info.network_id` must be one of the profile's `acceptedNodeNetworkIds`: `xrpl` 0 or nothing, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338, and no other). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
    the node client stops) within 10 s; the compose `stop_grace_period` is 30 s.
 
