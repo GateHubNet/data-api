@@ -91,6 +91,11 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, ledger_index, tx_index, node_index',
   },
   [Table.PathPayments]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
+  [Table.AccountPathPayments]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -256,6 +261,8 @@ const MIGRATION_005 = '005_account_states.sql';
 const MIGRATION_009 = '009_account_network_names.sql';
 /** The path payments (spec #4, ticket #13): one ledger-derived table. */
 const MIGRATION_007 = '007_path_payments.sql';
+/** The path payments of an account (spec #4, ticket #14): the ledger-derived index of path_payments by account. */
+const MIGRATION_008 = '008_account_path_payments.sql';
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -280,6 +287,7 @@ const DEDUP_TABLES: Table[] = [
   Table.AmmGovernance,
   Table.AccountStates,
   Table.PathPayments,
+  Table.AccountPathPayments,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1410,6 +1418,62 @@ describe('migrations (e2e)', () => {
             `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${Table.PathPayments}`,
           ),
         ).toEqual([SAMPLE_ROWS[Table.PathPayments]]);
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.onModuleDestroy();
+      }
+    });
+  });
+  describe('migration 008', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-008-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 008 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_008_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_008);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_008);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.AccountPathPayments);
+
+      copyReal([MIGRATION_008]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_008], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.AccountPathPayments);
+
+      const svc = new ClickHouseService(config);
+      try {
+        await svc.insert(Table.AccountPathPayments, [SAMPLE_ROWS[Table.AccountPathPayments]]);
+        expect(await svc.query(`SELECT * FROM ${Table.AccountPathPayments}`)).toEqual([
+          SAMPLE_ROWS[Table.AccountPathPayments],
+        ]);
         expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
       } finally {
         await svc.onModuleDestroy();
