@@ -22,6 +22,7 @@ import {
   AmmPoolTouchesRow,
   BalanceChangesRow,
   ExchangesRow,
+  ExportJobsRow,
   FeeStatsRow,
   IngestLogRow,
   LedgerByHashRow,
@@ -103,6 +104,7 @@ export interface TableRows {
   [Table.IngestLog]: IngestLogRow;
   [Table.AggDirty]: AggDirtyRow;
   [Table.SyncerLease]: SyncerLeaseRow;
+  [Table.ExportJobs]: ExportJobsRow;
 }
 
 const hash = (n: number): string => n.toString(16).toUpperCase().padStart(64, '0');
@@ -742,4 +744,18 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
   [Table.IngestLog]: { range_start: 100, range_end: 199, run_id: 'run-1', status: 'done', updated_at: CLOSE_MS },
   [Table.AggDirty]: { from_hour: 1_699_999_200, to_hour: 1_700_002_800, created_at: CLOSE_MS },
   [Table.SyncerLease]: { network: 'xrpl', holder: 'syncer-1', heartbeat: CLOSE_MS },
+  // created recently: the table drops a job 7 days after it was created
+  [Table.ExportJobs]: {
+    id: '0123456789abcdef0123456789abcdef',
+    seq: 2,
+    key_hash: 'ab'.repeat(32),
+    path: '/v2/accounts/rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH/transactions?start=2015-01-01&end=2015-02-01',
+    format: 'csv',
+    status: 'done',
+    created: TODAY_NOON + 0.125,
+    at: TODAY_NOON + 2.125,
+    rows: 179,
+    object: 'xrpl/0123456789abcdef0123456789abcdef.csv',
+    error: '',
+  },
 };
