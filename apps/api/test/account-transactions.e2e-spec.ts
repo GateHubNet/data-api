@@ -1564,6 +1564,8 @@ describe('account transactions API endpoint, format=csv on recorded mainnet ledg
 describe('account transactions API endpoint, format=csv: the account flags a transaction set or cleared', () => {
   /** Created in 93663329; AccountSet sets DefaultRipple in 93663330; SetRegularKey, then AccountSet DisableMaster in 93663334. */
   const ISSUER = 'rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV';
+  /** Clears RequireAuth with an AccountSet in 107863820. */
+  const CLEARS = 'rU5nUwkBUPx3MFPQSHmMnr9S9yg4g8cKLc';
   /** PasswordSpent; a Payment of XRP to it (from PAYER) clears the flag in 107872958. */
   const SPENT = 'rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw';
   const PAYER = 'rEYLNoaQM5bCMUNhrsvMasTMQ1YgZz5hzT';
@@ -1597,6 +1599,14 @@ describe('account transactions API endpoint, format=csv: the account flags a tra
     const res = await get(`${listPath(ISSUER)}?format=csv&type=AccountSet&limit=1`);
     expect(res.text.split('\n')[1]).toBe(
       `"25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10","93663330","2025-01-24T00:36:50+00:00","AccountSet","tesSUCCESS","true","","","","","0.00001","+DefaultRipple"`,
+    );
+  });
+
+  it('an AccountSet that clears a flag: -RequireAuth, the flags it kept are not listed', async () => {
+    // ClearFlag 2 (asfRequireAuth): 0x408C0000 to 0x40880000; DisallowXRP, DefaultRipple and AllowTrustLineLocking stay set
+    const res = await get(`${listPath(CLEARS)}?format=csv&type=AccountSet&limit=1`);
+    expect(res.text.split('\n')[1]).toBe(
+      `"830AAB3C1759461BFBC1FB8203482940F1A8B771A43484EFD1CEA83ACED4DF0D","107863820","2026-10-24T04:23:12+00:00","AccountSet","tesSUCCESS","true","","","","","0.000012","-RequireAuth"`,
     );
   });
 

@@ -1,8 +1,8 @@
 {
   "network": "xrpl",
   "endpoint": "wss://s2.ripple.com",
-  "recorded_at": "2026-10-24T14:34:25.174Z",
-  "validated_head": 107873207,
+  "recorded_at": "2026-10-24T20:32:31.427Z",
+  "validated_head": 107878622,
   "scan_limit": 0,
   "scanned": 0,
   "skipped": [],
@@ -46,45 +46,13 @@
       "ledger": 107671593,
       "type": "AccountDelete",
       "result": "tesSUCCESS"
+    },
+    "830AAB3C1759461BFBC1FB8203482940F1A8B771A43484EFD1CEA83ACED4DF0D": {
+      "ledger": 107863820,
+      "type": "AccountSet",
+      "result": "tesSUCCESS"
     }
   },
-  "ledgers": [
-    {
-      "ledger": 93663329,
-      "bytes": 234389,
-      "gzipBytes": 45052
-    },
-    {
-      "ledger": 93663330,
-      "bytes": 308486,
-      "gzipBytes": 76508
-    },
-    {
-      "ledger": 93663334,
-      "bytes": 305706,
-      "gzipBytes": 71626
-    },
-    {
-      "ledger": 107670694,
-      "bytes": 256940,
-      "gzipBytes": 52723
-    },
-    {
-      "ledger": 107671593,
-      "bytes": 486638,
-      "gzipBytes": 99292
-    },
-    {
-      "ledger": 107872956,
-      "bytes": 1511726,
-      "gzipBytes": 312254
-    },
-    {
-      "ledger": 107872958,
-      "bytes": 1108795,
-      "gzipBytes": 231033
-    }
-  ],
   "cases": {
     "account_created": {
       "ledger": 93663329,
@@ -127,6 +95,54 @@
       "hash": "8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D",
       "type": "AccountDelete",
       "note": "r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC deletes its account (the same ledger as in xrpl/recorded)"
+    },
+    "accountset_clears_flag": {
+      "ledger": 107863820,
+      "hash": "830AAB3C1759461BFBC1FB8203482940F1A8B771A43484EFD1CEA83ACED4DF0D",
+      "type": "AccountSet",
+      "note": "rU5nUwkBUPx3MFPQSHmMnr9S9yg4g8cKLc clears RequireAuth with ClearFlag 2 (0x408C0000 to 0x40880000)"
     }
-  }
+  },
+  "ledgers": [
+    {
+      "ledger": 93663329,
+      "bytes": 234389,
+      "gzipBytes": 45052
+    },
+    {
+      "ledger": 93663330,
+      "bytes": 308486,
+      "gzipBytes": 76508
+    },
+    {
+      "ledger": 93663334,
+      "bytes": 305706,
+      "gzipBytes": 71626
+    },
+    {
+      "ledger": 107670694,
+      "bytes": 256940,
+      "gzipBytes": 52723
+    },
+    {
+      "ledger": 107671593,
+      "bytes": 486638,
+      "gzipBytes": 99292
+    },
+    {
+      "ledger": 107863820,
+      "bytes": 144032,
+      "gzipBytes": 28451
+    },
+    {
+      "ledger": 107872956,
+      "bytes": 1511726,
+      "gzipBytes": 312254
+    },
+    {
+      "ledger": 107872958,
+      "bytes": 1108795,
+      "gzipBytes": 231033
+    }
+  ]
 }
