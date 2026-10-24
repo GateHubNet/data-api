@@ -9,6 +9,7 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/ripple-mock/`    | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
 | `xrpl/recorded/`       | Mainnet ledgers recorded from a public node (see below).                                |
 | `xrpl/amm/`            | Mainnet AMM transactions, one ledger per named case (see below).                        |
+| `xrpl/account-state/`  | Mainnet changes of account flags and an AccountDelete, with the ledgers before them.    |
 | `xahau/recorded/`      | Xahau mainnet ledgers recorded from a public node (see below).                          |
 | `xrpl/unl/`            | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
 | `xahau/unl/`           | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
@@ -162,6 +163,31 @@ transaction `75F52BB86416717288999523063D54E24290EFEA2E99DF78E80A12BD1C8FAC99`; 
 `438E0988A35F030ED73C4F3F7C02981485599ABAA9913805EDD7D2B970FD4B33`. Found by bisecting `ledger_entry` on the `Amendments`
 object (`7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4`) at the flag-adjacent ledgers (sequence 256k + 1)
 between 2024-03-12 and 2024-03-30: 54 enabled amendments without AMM at ledger 86795009, 55 with it at 86795265. 20 requests.
+
+### XRPL account state cases (`xrpl/account-state/`)
+
+Recorded 2026-10-24 from `wss://s2.ripple.com` (validated head 107873207) with `--txs` and `--delay-ms 500`: 7 ledgers (893 KB
+gzipped, largest 305 KB). The API's account state history tests (`apps/api/test/account-flags.e2e-spec.ts`, seed
+`xrpl-account-state`) read them: each change comes with a ledger in which the same account changed before, so a test sees the
+flags before and after it. The hashes were found with `account_tx` on each account; the `cases` of `manifest.json` name them.
+
+| Case | Ledger | Transaction | What the account root does |
+| --- | --- | --- | --- |
+| `account_created` | 93663329 | `4DCBF02D75CF484B385F667B75A8871B843E6C9E8C8D483248693A5A6E75F0A2` | A Payment creates `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, no flags |
+| `accountset_sets_flag` | 93663330 | `25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10` | AccountSet `SetFlag` 8: DefaultRipple (0 to 0x800000) |
+| `setregularkey_then_disable_master` | 93663334 | `DD0B4FC1AA4D8A4E0FBEDFD591828A932FE6111F87FD5DA71CC25214075FCF42` | SetRegularKey sets PasswordSpent, then AccountSet `387FDEDC…` sets DisableMaster (0x910000) |
+| `password_spent_before` | 107872956 | `F96ADF5D4D59B6BA82E9FA85EF266948FBE461A5220B2CB1C889A36F4837DBB4` | A Batch of `rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw`, which has PasswordSpent (0x10000) |
+| `payment_clears_password_spent` | 107872958 | `53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D` | A Payment of XRP to it clears PasswordSpent (0x10000 to 0): a flag changed by another type |
+| `before_account_delete` | 107670694 | `EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C` | The last change of `r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC` before it is deleted |
+| `account_delete` | 107671593 | `8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D` | AccountDelete: the account root is a `DeletedNode` (the ledger is also in `xrpl/recorded/`) |
+
+Flag changes are rare: of the 1500 ledgers before the head (107871708 to 107873207), five Payments cleared PasswordSpent and one
+account made the only four AccountSets that changed flags. The AccountSet case comes instead from the history of `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, an
+issuer whose flags change in ledger 93663334 of `xrpl/amm/`, where its creation and its first AccountSet are a few ledgers apart.
+
+Xahau's account flags are tested on `xahau/recorded/`: its account roots carry flags only Xahau has (URITokenIssuer 0x40000000 on
+most of them, TshCollect on `rLqimfBcsc4x9Gy9jTfZUNktvJFLzTnv2n` in 26540711, DisallowIncomingRemit and DepositAuth on
+`rD74dUPRFNfgnY2NzrxxYRXN4BrfGSN6Mv` in 26540188), so no Xahau ledger was recorded for them.
 
 ### Xahau (`xahau/recorded/`)
 

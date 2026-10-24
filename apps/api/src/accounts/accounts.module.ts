@@ -11,6 +11,7 @@ import { AccountBalancesService } from './account-balances.service';
 import { AccountDayGroupsService } from './account-day-groups.service';
 import { AccountExchangesController } from './account-exchanges.controller';
 import { AccountExchangesService } from './account-exchanges.service';
+import { AccountFlagsService } from './account-flags.service';
 import { AccountOrdersController } from './account-orders.controller';
 import { AccountOrdersService } from './account-orders.service';
 import { AccountPaymentsController } from './account-payments.controller';
@@ -54,6 +55,7 @@ import { LiveLedgerService } from './live-ledger.service';
   ],
   providers: [
     AccountsService,
+    AccountFlagsService,
     AccountTransactionsService,
     AccountPaymentsService,
     AccountExchangesService,
