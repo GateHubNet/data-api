@@ -15,7 +15,7 @@ import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
 
 const PACKAGE_ROOT = join(__dirname, '..', '..');
 const FIXTURES = join(PACKAGE_ROOT, 'test', 'fixtures');
-/** Every schema file, in order: the ledger-derived tables are created in 001 and in later migrations (005). */
+/** Every schema file, in order: the ledger-derived tables are created in 001 and in later migrations (005, 007). */
 const DDL = readdirSync(join(PACKAGE_ROOT, 'schema'))
   .filter((f) => f.endsWith('.sql'))
   .sort()
@@ -131,6 +131,7 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
   [Table.AccountStates, 'accountStates'],
+  [Table.PathPayments, 'pathPayments'],
 ];
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
@@ -1310,10 +1311,10 @@ describe('AMM rows (parser version 2)', () => {
       }
     });
 
-    it('stores parser_version 3', () => {
-      expect(PARSER_VERSION).toBe(3);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(3);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(3);
+    it('stores parser_version 4 (path payments, after the account states of 3)', () => {
+      expect(PARSER_VERSION).toBe(4);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(4);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(4);
     });
   });
 
@@ -1367,7 +1368,7 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
 }
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones and the account states', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the account states and the path payments', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -1390,6 +1391,7 @@ describe('CHILD_TABLES', () => {
         Table.AccountAmmLiquidity,
         Table.AmmGovernance,
         Table.AccountStates,
+        Table.PathPayments,
       ].sort(),
     );
   });

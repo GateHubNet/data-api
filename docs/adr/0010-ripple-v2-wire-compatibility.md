@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 60).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 60, 65 and 66).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -251,3 +251,19 @@ addition: what the original served is served as before. Names and labels are ser
     have. An account with no state at that ledger, or one deleted at or before it, answers 404 `account not found`, as the node does.
 
 Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new message: with `flags=true` the 400s of `/balances` (`invalid date format`, `invalid ledger hash`, `the date provided is too old`) and its 404 `account not found` apply. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions) and [api-reference](../api-reference.md#get-v2accountsaddress).
+
+**Path payments** (items 65 and 66). The wording is in [api-reference](../api-reference.md#path-payments).
+
+65. **`GET /v2/path_payments`.** The original had no list of path payments (GLOSSARY.md: a successful payment whose delivery used
+    someone else's liquidity). Here the path payments of the network in a window: `start`, `end`, `descending`, `limit` (200, at most
+    1000), `marker` and a `Link` header, as every list, and `format=csv` with the file `path payments.csv`. The row is
+    `hash, ledger_index, executed_time, source, destination, delivered_amount, currency, issuer?, source_amount, source_currency,
+    source_issuer?, offers_crossed, amm_pools, rippled_through`, the issuers absent for the native currency. In the CSV, `amm_pools`
+    and `rippled_through` are one cell each with the accounts separated by a space, where the original's flattening would have made
+    one column per position (`amm_pools[0]`, ...) that changes from page to page.
+66. **Payments to oneself.** The original's payments left a payment to oneself out (a conversion, not a payment), and
+    `/v2/payments`, `/v2/accounts/{address}/payments` and the payment volumes still do. A path payment to oneself (an arbitrage loop,
+    or a conversion through an offer or a pool) is listed by `/v2/path_payments`.
+
+The messages of `/v2/path_payments` are those of `/v2/payments` (`invalid start date format`, `invalid end date format`,
+`invalid marker`), with the 500 `unable to retrieve path payments`.
