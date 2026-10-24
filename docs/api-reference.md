@@ -194,8 +194,8 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
 `GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
 `GET /v2/network/validators/{key}/validations`, `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
-[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), and `GET /v2/path_payments` (the [path payments](#path-payments) of the
-network, spec #4). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), `GET /v2/path_payments` (the [path payments](#path-payments) of the
+network, spec #4) and `GET /v2/accounts/{address}/path_payments` (those of an account). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
 `GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
@@ -493,6 +493,42 @@ In the CSV the columns are these keys; `amm_pools` and `rippled_through` are one
 Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
 `unable to retrieve path payments`.
 
+### `GET /v2/accounts/{address}/path_payments`
+
+The path payments the account sent or received (it is their `source` or their `destination`) in the ledgers that closed in the
+window, oldest first (by ledger and transaction). A payment to oneself is listed once. An account a payment only rippled through,
+a pool and the owner of an offer crossed are named in the row but do not list it. The address is not checked, as on the other lists
+under an account: one that is none has no path payments.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | As on [`/v2/path_payments`](#get-v2path_payments). |
+| `format` | json | `csv`: file `<address> - path payments.csv`. |
+
+```json
+{
+  "result": "success",
+  "count": 2,
+  "path_payments": [
+    {
+      "hash": "E362675D…", "ledger_index": 11999941, "executed_time": "2015-03-01T11:13:10Z",
+      "source": "rLD5…", "destination": "rGhs…",
+      "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
+      "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+    },
+    "…"
+  ]
+}
+```
+
+The rows, their key order and the CSV columns are those of [`/v2/path_payments`](#get-v2path_payments). The list is read from the
+account's index of path payments (`account_path_payments`), written with them from parser version 4 on
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 67).
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
+`unable to retrieve path payments`.
+
 ---
 
 ## Exchanges
@@ -695,7 +731,8 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
 (`/balances`, `/orders`): an address that does not exist simply has no rows. All account lists take the common window
-parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`.
+parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
+described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments).
 
 ### `GET /v2/accounts`
 
