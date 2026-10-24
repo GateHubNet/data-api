@@ -2,13 +2,12 @@ import {
   activeExportJobs,
   appendExportJob,
   ClickHouseService,
-  EXPORT_FORMATS,
   EXPORT_URL_TTL_MS,
-  ExportFormat,
   ExportJobsRow,
   exportNow,
   exportRowCap,
   ExportStorage,
+  isExportFormat,
   isExportId,
   newExportId,
   readExportJob,
@@ -75,16 +74,14 @@ export class ExportsService {
     if (route.overTime && !bySequence && (!q.get('start') || !q.get('end'))) {
       throw badRequest('start and end are required');
     }
-    if (typeof format !== 'string' || !(EXPORT_FORMATS as readonly string[]).includes(format)) {
-      throw badRequest('invalid format');
-    }
+    if (!isExportFormat(format)) throw badRequest('invalid format');
     const most = this.config.exportMaxJobsPerKey;
     if ((await activeExportJobs(this.ch, keyHash)) >= most) {
       throw new RippleHttpError(429, `too many exports in progress: at most ${most} per API key`);
     }
     const cap = exportRowCap({ csv: this.config.exportMaxRowsCsv, pdf: this.config.exportMaxRowsPdf }, format);
-    const rows = cap === undefined ? undefined : await this.routes.count(url);
-    if (cap !== undefined && rows !== undefined && rows > cap) throw badRequest(tooManyExportRows(format, cap));
+    const rows = await this.routes.count(url);
+    if (rows !== undefined && rows > cap) throw badRequest(tooManyExportRows(format, cap));
 
     const now = exportNow();
     const job: ExportJobsRow = {
@@ -92,7 +89,7 @@ export class ExportsService {
       seq: 0,
       key_hash: keyHash,
       path,
-      format: format as ExportFormat,
+      format,
       status: 'queued',
       created: now,
       at: now,

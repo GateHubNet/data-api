@@ -156,7 +156,8 @@ There is no root `test:e2e`: each package spins its own throwaway ClickHouse and
   DateTime. Resolve `start`/`end` to a ledger range with `LedgerRangeResolver`. See
   [clickhouse](clickhouse.md#reading-a-page-what-stops-the-read).
 - **Amounts** are exact decimal strings; sum with the shared decimal helpers, never with floats.
-- **Config** lives in `api.config.ts`, `syncer.config.ts`, `exporter.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `env-decorators.ts`);
+- **Config** lives in `api.config.ts`, `syncer.config.ts`, `exporter.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `packages/shared/src/nest/env-decorators.ts`, which the apps share with the liveliness probe and
+  the `/metricz` controller of `packages/shared/src/nest/`);
   do not read `process.env` ad hoc in services. Import the toolbox through `@gatehub/toolbox/lib/<module>`, never the package root (the
   root loads database/queue config and exits without `GH_DATABASE_*`).
 

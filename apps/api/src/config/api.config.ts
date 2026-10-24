@@ -1,10 +1,18 @@
 // Only the network profile, not the package root: the config is loaded (and its tests reload it) before anything else.
+import { EXPORT_MAX_ROWS, ExportRowCapValue } from '@gatehub/data-api-shared/dist/export/export-row-caps';
+import {
+  IntValue,
+  MaybeEmptyText,
+  rawValue,
+  splitList,
+  Text,
+  validator,
+} from '@gatehub/data-api-shared/dist/nest/env-decorators';
 import { getNetworkProfile } from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { Transform } from 'class-transformer';
 import { IsIn } from 'class-validator';
-import { IntValue, MaybeEmptyText, rawValue, splitList, Text, validator } from './env-decorators';
 
 /**
  * API configuration, read from `GH_*` environment variables by the toolbox ConfigService (`@ConfigValue()` maps the
@@ -186,13 +194,13 @@ export class ApiConfig {
    * and has more answers 400; the exporter, with the same setting, fails one whose list turns out longer.
    */
   @ConfigValue()
-  @IntValue({ min: 1 })
-  exportMaxRowsCsv: number = 1_000_000;
+  @ExportRowCapValue()
+  exportMaxRowsCsv: number = EXPORT_MAX_ROWS.csv;
 
   /** `GH_EXPORT_MAX_ROWS_PDF`: the most rows a PDF export holds (ticket #16), as `GH_EXPORT_MAX_ROWS_CSV`. */
   @ConfigValue()
-  @IntValue({ min: 1 })
-  exportMaxRowsPdf: number = 10_000;
+  @ExportRowCapValue()
+  exportMaxRowsPdf: number = EXPORT_MAX_ROWS.pdf;
 }
 
 /** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */

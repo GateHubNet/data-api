@@ -2,6 +2,7 @@ import { ClickHouseService, PathPaymentsRow, readDistinctPage, Table } from '@ga
 import { Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
+import { TxKey, txKeysIn, txKeyString } from '../common/tx-keys';
 import { PATH_PAYMENT_COLUMNS, PathPaymentObject, toPathPaymentObject } from './path-payment-object';
 
 /** The key of the list, which is the ORDER BY of `path_payments`. */
@@ -9,12 +10,6 @@ export const PATH_PAYMENT_KEYS: KeysetKey[] = [
   { column: 'ledger_index', type: 'UInt32' },
   { column: 'tx_index', type: 'UInt32' },
 ];
-
-/** The key of a path payment. */
-interface PathPaymentKey {
-  ledger_index: number;
-  tx_index: number;
-}
 
 /**
  * The ORDER BY of `account_path_payments`: its whole sorting key. `account` is fixed by the query but stays in it, so
@@ -88,7 +83,7 @@ export class PathPaymentsService {
     if (!range) return { pathPayments: [] };
 
     const cursor = keysetClause(PATH_PAYMENT_KEYS, q.descending, after);
-    const keys = await readDistinctPage<PathPaymentKey>(this.ch, {
+    const keys = await readDistinctPage<TxKey>(this.ch, {
       columns: 'ledger_index, tx_index',
       table: Table.AccountPathPayments,
       where: [
@@ -142,19 +137,15 @@ export class PathPaymentsService {
   }
 
   /** The path payments of these keys, in their order, each once; a key without a row is left out. */
-  private async byKeys(keys: PathPaymentKey[]): Promise<PathPaymentsRow[]> {
+  private async byKeys(keys: TxKey[]): Promise<PathPaymentsRow[]> {
     if (keys.length === 0) return [];
-    const ledgers = keys.map((k) => k.ledger_index);
+    const among = txKeysIn(keys);
     // a ledger written twice has the row twice until a merge (no FINAL is used): the map below keeps one
     const rows = await this.ch.query<PathPaymentsRow>(
-      `SELECT ${PATH_PAYMENT_COLUMNS} FROM ${Table.PathPayments}
-        WHERE ledger_index BETWEEN {lo:UInt32} AND {hi:UInt32}
-          AND (ledger_index, tx_index) IN (
-              SELECT tupleElement(key, 1), tupleElement(key, 2)
-                FROM (SELECT arrayJoin(arrayZip({ledgers:Array(UInt32)}, {indexes:Array(UInt32)})) AS key))`,
-      { lo: Math.min(...ledgers), hi: Math.max(...ledgers), ledgers, indexes: keys.map((k) => k.tx_index) },
+      `SELECT ${PATH_PAYMENT_COLUMNS} FROM ${Table.PathPayments} WHERE ${among.clause}`,
+      among.params,
     );
-    const byKey = new Map(rows.map((row) => [`${row.ledger_index}:${row.tx_index}`, row]));
-    return keys.flatMap((k) => byKey.get(`${k.ledger_index}:${k.tx_index}`) ?? []);
+    const byKey = new Map(rows.map((row) => [txKeyString(row), row]));
+    return keys.flatMap((k) => byKey.get(txKeyString(k)) ?? []);
   }
 }

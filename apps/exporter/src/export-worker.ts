@@ -9,6 +9,7 @@ import {
   exportRowCap,
   ExportRowCaps,
   ExportStorage,
+  isExportFormat,
   nextExportState,
   tooManyExportRows,
 } from '@gatehub/data-api-shared';
@@ -275,10 +276,10 @@ export class ExportWorker {
     await appendExportJob(ch, running);
     const dir = await mkdtemp(join(tmpdir(), 'export-'));
     try {
-      const { file, disposition, ledger } = await this.walk(running, join(dir, 'rows'));
-      const render = EXPORT_RENDERERS[running.format as ExportFormat];
-      if (!render) throw new ExportFailure(`the format ${running.format} cannot be made`);
-      const output = await render({
+      const format = running.format;
+      if (!isExportFormat(format)) throw new ExportFailure(`the format ${format} cannot be made`);
+      const { file, disposition, ledger } = await this.walk(running, format, join(dir, 'rows'));
+      const output = await EXPORT_RENDERERS[format]({
         job: running,
         file,
         disposition,
@@ -286,7 +287,7 @@ export class ExportWorker {
         network,
         read: (path) => this.read(path),
       });
-      const object = exportObjectKey(network, running.id, running.format);
+      const object = exportObjectKey(network, running.id, format);
       try {
         await storage.upload(object, output.body, {
           contentType: output.contentType,
@@ -322,6 +323,7 @@ export class ExportWorker {
    */
   private async walk(
     job: ExportJobsRow,
+    format: ExportFormat,
     spool: string,
   ): Promise<{ file: CsvFile; disposition: string | null; ledger?: number }> {
     const url = new URL(job.path, this.options.apiUrl);
@@ -335,7 +337,7 @@ export class ExportWorker {
     url.searchParams.set('format', 'csv');
     url.searchParams.set('limit', String(this.pageSize));
     const file = new CsvFile(spool);
-    const cap = exportRowCap(this.maxRows, job.format);
+    const cap = exportRowCap(this.maxRows, format);
     const seen = new Set<string>();
     let disposition: string | null = null;
     for (let page = 0; ; page++) {
@@ -348,7 +350,7 @@ export class ExportWorker {
       }
       if (page === 0) disposition = res.headers.get('content-disposition');
       await file.add(text);
-      if (cap !== undefined && file.rows > cap) throw new ExportFailure(tooManyExportRows(job.format, cap));
+      if (file.rows > cap) throw new ExportFailure(tooManyExportRows(format, cap));
       const marker = nextMarker(res.headers.get('link'));
       if (marker === undefined) return { file, disposition, ...(ledger !== undefined && { ledger }) };
       if (seen.has(marker)) throw new ExportFailure('the list gave the same page twice');
