@@ -954,6 +954,29 @@ export interface AccountNetworkNamesRow {
   added_at: UnixSecondsMs;
 }
 
+/** The state of an export job (`export_jobs`, migration 010): one row per state, the highest `seq` of an id is the job. */
+export interface ExportJobsRow {
+  /** Unguessable: 32 hex digits of a random number. */
+  id: string;
+  /** 0 for the `queued` row of the api, then one more for every state the exporter writes. */
+  seq: number;
+  /** The hex SHA-256 of the API key that asked for the export, `''` when the api ran without keys. */
+  key_hash: string;
+  /** The list as the client named it: `/v2/…?…`. */
+  path: string;
+  format: string;
+  status: 'queued' | 'running' | 'done' | 'failed';
+  created: UnixSecondsMs;
+  /** When the job entered this state. */
+  at: UnixSecondsMs;
+  /** The data rows of the file (done), else 0. */
+  rows: UInt64Value;
+  /** The storage key of the file (done), else `''`. */
+  object: string;
+  /** Why the job failed (failed), else `''`. */
+  error: string;
+}
+
 // -- The shared database (ADR-0014, schema-shared/*.sql) ---------------------------------------------------------
 
 /** A row of `account_names` (`SharedTable.AccountNames`): `added_at` defaults to the insert time. */

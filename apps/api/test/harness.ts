@@ -1,6 +1,7 @@
 import {
   clickHouseConfigFromEnv,
   ClickHouseService,
+  ExportStorage,
   getNetworkProfile,
   LedgerWriter,
   NetworkName,
@@ -66,6 +67,11 @@ export interface HarnessOptions {
    * with the shared migrations, dropped by `close()`.
    */
   sharedDatabase?: string;
+  /**
+   * Where the app keeps export files (ticket #15), in place of the Google Cloud Storage bucket of `GH_EXPORT_BUCKET`:
+   * a `MemoryExportStorage`, shared with the exporter the test runs. Without it (and without a bucket) exports are off.
+   */
+  exportStorage?: ExportStorage;
   /** Extra `GH_*` variables for this app (`GH_RATE_LIMIT`, `GH_CORS_ORIGINS`, ...); they win over the defaults. */
   env?: Record<string, string>;
   /**
@@ -193,12 +199,13 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       const { XrplService } = await import('../src/xrpl/xrpl.service');
       const { RippledError } = await import('xrpl');
       const { AppModule } = await import('../src/app.module');
+      const { EXPORT_STORAGE } = await import('../src/exports/exports.service');
       const controllers = (await options.controllers?.()) ?? [];
-      const moduleRef = await Test.createTestingModule({ imports: [AppModule], controllers })
+      let builder = Test.createTestingModule({ imports: [AppModule], controllers })
         .overrideProvider(XrplService)
-        .useValue(nodeStub(options.xrplStub, RippledError))
-        .setLogger(QUIET)
-        .compile();
+        .useValue(nodeStub(options.xrplStub, RippledError));
+      if (options.exportStorage) builder = builder.overrideProvider(EXPORT_STORAGE).useValue(options.exportStorage);
+      const moduleRef = await builder.setLogger(QUIET).compile();
       app = moduleRef.createNestApplication<NestExpressApplication>();
       app.useGlobalFilters(new HttpExceptionFilter());
       app.disable('x-powered-by');

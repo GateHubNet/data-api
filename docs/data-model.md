@@ -7,10 +7,11 @@ The source of truth is the migration files of [`packages/shared/schema/`](../pac
 [`004_amm_fee_estimates.sql`](../packages/shared/schema/004_amm_fee_estimates.sql) and
 [`005_account_states.sql`](../packages/shared/schema/005_account_states.sql) and
 [`007_path_payments.sql`](../packages/shared/schema/007_path_payments.sql) and
-[`009_account_network_names.sql`](../packages/shared/schema/009_account_network_names.sql) (applied in file-name order, per network
+[`009_account_network_names.sql`](../packages/shared/schema/009_account_network_names.sql) and
+[`010_export_jobs.sql`](../packages/shared/schema/010_export_jobs.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **52 tables** per network database, in seven groups:
+enum: queries use `${Table.X}`, never string literals). **53 tables** per network database, in eight groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
@@ -21,6 +22,7 @@ enum: queries use `${Table.X}`, never string literals). **52 tables** per networ
 | Account and market aggregates (9, migration 003) | `native_rates_daily`, `pair_hourly`, `markets_live`, `account_rollup_state`, `account_partition_rows`, `account_rollup_days`, `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the `aggregator` worker (jobs `rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) |
 | Operator-written (1, migration 009) | `account_network_names` | the operator, by hand, with plain SQL inserts ([operations](operations.md#name-an-account-on-one-network)) |
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
+| Exports (1, migration 010) | `export_jobs` | the api (`queued`) and the exporter (`running`, `done`, `failed`) |
 
 Plus `schema_migrations` (the migration runner's bookkeeping). Apart from the network databases, one **shared database** on the
 same server holds what belongs to an address on every network (account names and labels, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
@@ -344,6 +346,7 @@ The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM 
 | `agg_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_hour, to_hour)` | Hour ranges whose stats must be recomputed because ingest rewrote ledgers behind the aggregator | aggregator |
 | `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network: `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
 | `account_network_names` | `MergeTree`, `ORDER BY (address, added_at)`, no partition (migration 009) | One row per change of the **account network name** of an address on this network ("USD Issuer"): the columns of [`account_names`](#account_names-no-partition-mergetree-order-by-address-added_at) of the shared database (`address`, `name`, `removed UInt8`, `added_by`, `added_at DateTime64(3, 'UTC')`) and its rules: append-only, the newest row of an address wins (at the same `added_at` a removal wins), a newest row that is a removal or names nothing means no network name. Written by the operator ([operations](operations.md#name-an-account-on-one-network)); never `FINAL`, read whole with `LIMIT 1 BY address` and reloaded with the names every 60 s | `/v2/accounts/{address}` (`account_network_name`) |
+| `export_jobs` | `MergeTree`, `ORDER BY (id, seq)`, TTL 7 d on `created` | The states of an export job, append-only in the manner of `ingest_log`: `id` (32 random hex digits), `seq` (0 for the api's `queued` row, one more for every state the exporter writes), `key_hash` (the hex SHA-256 of the creating API key, never the key; `''` without one), `path`, `format`, `status Enum8('queued'=1,'running'=2,'done'=3,'failed'=4)`, `created` and `at` (`DateTime64(3,'UTC')`), `rows`, `object` (the storage key `<network>/<id>.csv`) and `error`. Every row repeats the job, so the row with the highest `seq` of an id is the job: `ORDER BY id, seq DESC LIMIT 1 BY id`, no `FINAL` | `/v2/exports`, the exporter |
 
 The three **version sets** (`validator_votes` with `amendment_tallies` for a voting ledger, `validator_agreement_hourly` for an hour)
 follow the pattern of `volume_daily`: a unit is written whole under one `version` (wall-clock milliseconds, greater than any version
@@ -445,6 +448,7 @@ The files so far:
 | `005_account_states.sql` | One `CREATE TABLE IF NOT EXISTS`: `account_states`, the account state history of ADR-0015 (a ledger-derived table, written from parser version 3). Additive and run again safely. Required before the syncer (its ledger writer inserts into the table on every ledger, and fails without it) and before the API (`?flags=true` with a ledger reads it) |
 | `007_path_payments.sql` | One `CREATE TABLE IF NOT EXISTS`: the ledger-derived `path_payments`. Additive: it depends on no other table, so it applies on a fresh and on a migrated database. It is required before a syncer with `PARSER_VERSION` 4 (that syncer's writes fail without the table) and before the API serves `/path_payments` (rollout: [backfill](backfill.md#path-payments-re-ingest)). |
 | `009_account_network_names.sql` | `account_network_names`, one `CREATE TABLE IF NOT EXISTS` ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)). Additive: it reads no other table. 005 to 008 are numbers reserved by other changes of spec #4; the runner applies whatever files there are in file-name order, so a gap is harmless and a later 005 applies after 009 on a database that already ran 009. Required before an api that reads it: without it the api serves every account without a network name and logs `Could not load the account network names` at every reload |
+| `010_export_jobs.sql` | One `CREATE TABLE IF NOT EXISTS`: `export_jobs`, the states of the export jobs (ticket #15). Additive: it reads no other table. Numbers 006 and 008 are kept for the other tables of spec #4. Required before the api serves `/v2/exports` and before the exporter starts |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -457,7 +461,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `007_path_payments.sql`, `009_account_network_names.sql`). A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `007_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
@@ -474,6 +478,7 @@ local volumes).
 - The tables of migration 003 are not ledger tables either, so no ledger retention touches them. Only `pair_hourly` expires, 45 days after its hour
   (about a day per part, whole parts are dropped); `native_rates_daily`, `markets_live` and the six account rollup tables are recomputable and kept.
 - Rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and `fee_stats` are small; keep them.
+- `export_jobs` expires by TTL 7 days after a job was created, as its file does (a lifecycle rule of the bucket).
 
 ## 7. Adding a table or column
 

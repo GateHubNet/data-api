@@ -12,13 +12,14 @@ XRP Ledger (pools and their history, swaps, liquidity events, votes and bids, LP
 One deployment serves one network; the same images run both. The API answers the same `/v2/...` paths on `xrpl.data.<domain>` (native
 currency `XRP`) and `xahau.data.<domain>` (`XAH`).
 
-This is a **pnpm workspace** with two services and a shared library:
+This is a **pnpm workspace** with two services, an exporter and a shared library:
 
 ```
 data-api-new/
 ├── apps/
 │   ├── api/        @gatehub/data-api-service — REST API (reads ClickHouse; live node for balances/orders)
-│   └── syncer/     @gatehub/data-syncer      — five workers (ingest, validations, fee_stats, aggregator, validators); range-ingest CLI
+│   ├── syncer/     @gatehub/data-syncer      — five workers (ingest, validations, fee_stats, aggregator, validators); range-ingest CLI
+│   └── exporter/   @gatehub/data-exporter    — makes the export files (POST /v2/exports) by walking the api's lists; GCS
 ├── packages/
 │   └── shared/     @gatehub/data-api-shared  — parsers, ledger writer, ClickHouse client + schema, node client, network profiles
 ├── deploy/         nginx template, ClickHouse/Keeper config, .env.prod.example

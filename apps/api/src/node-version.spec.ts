@@ -14,7 +14,7 @@ function hasRequireEsm(major: number, minor: number): boolean {
   return major > 22;
 }
 
-const DOCKERFILES = ['apps/api/Dockerfile', 'apps/syncer/Dockerfile'];
+const DOCKERFILES = ['apps/api/Dockerfile', 'apps/syncer/Dockerfile', 'apps/exporter/Dockerfile'];
 
 describe('the Node version the API needs', () => {
   it('is declared by the workspace and by the API: Node 20.19 or later', () => {
@@ -34,9 +34,10 @@ describe('the Node version the API needs', () => {
     expect(new Set(bases).size).toBe(1); // builder and runtime run the same Node
   });
 
-  it('is the same base in the API and the syncer image', () => {
+  it('is the same base in the API, the syncer and the exporter image', () => {
     const base = (dockerfile: string) => /^FROM\s+(\S+)/m.exec(read(dockerfile))![1];
     expect(base('apps/syncer/Dockerfile')).toBe(base('apps/api/Dockerfile'));
+    expect(base('apps/exporter/Dockerfile')).toBe(base('apps/api/Dockerfile'));
   });
 
   it('knows which Node versions have require(esm)', () => {
