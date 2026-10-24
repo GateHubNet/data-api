@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 60, 64 to 66 and 68 to 70).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 72).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -249,6 +249,28 @@ addition: what the original served is served as before. Names and labels are ser
     (a number or hash it has not stored, a date before its first ledger), and one the state history does not cover (at or below the
     newest ledger an older parser wrote), answers 400 `the date provided is too old`, the original's message for a ledger its node did not
     have. An account with no state at that ledger, or one deleted at or before it, answers 404 `account not found`, as the node does.
+61. **`GET /v2/accounts/{address}/trustlines`.** The original had no trust line route: its `/balances` listed each line's balance
+    only, from the node. Here the account's trust lines at a ledger, from the trust line state history, each from the account's side:
+    `{ result, ledger_index, close_time, count, marker?, trustlines: [ { currency, counterparty, balance, limit, limit_peer, no_ripple,
+    no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out } ] }`, ordered and paged by
+    (`counterparty`, `currency`) with `limit` (200, max 1000) and `marker`, filtered by `currency` and `counterparty`, and
+    `format=csv` (`<address> - trustlines.csv`). Lines with a zero balance are listed, lines deleted at or before the ledger are not;
+    an issuer's lines are its holders. The ledger parameters are those of `/balances`, with its precedence.
+62. **The newest indexed ledger, never the node.** Where `/balances` reads the node's validated ledger when no ledger is named,
+    `/trustlines` reads the newest ledger this API has indexed, and `validated`, `closed` and `current` name that ledger too: its
+    markers then always belong to this API's data, and its pages never mix two sources. The answer always carries that ledger's
+    `ledger_index` and `close_time`. A newest ledger the state history does not cover answers 400 `the date provided is too old`, like a
+    named one (item 60).
+63. **`/balances` at a historical ledger, from the state history.** The original (and this API before ADR-0015) asked the node for
+    the balances at any ledger, which needs a full-history node. Here a ledger named by `ledger_hash`, `date` or a numeric
+    `ledger_index` is read from the account and trust line state history, never from the node: the native balance is the account's
+    state at the ledger, the trust lines those of `/trustlines` at the ledger. The answer keeps its shape, precedence, `currency`,
+    `counterparty`, `limit` (200, max 400, or `all`), CSV and messages, with three differences: the trust lines are **ordered by
+    (`counterparty`, `currency`)**, not in the node's order; the answer always carries the ledger's `close_time` (before, only a
+    `date` gave one); and it is not in the live cache, so it carries the global `Cache-Control`, not the live one. The rules of
+    item 60 apply: a ledger this API does not hold or the state history does not cover is 400 `the date provided is too old`, an
+    account with no state at the ledger or deleted at or before it 404 `account not found`. No ledger named, `validated`, `closed`
+    and `current` still read the node, as does every ledger of `/orders`.
 64. **`flags_changed` in the account transactions CSV.** The original had no CSV (item 54) and no account state. Here the
     `flags_changed` cell of a summary row lists the account flags of the account that the transaction set (`+Name`) or cleared
     (`-Name`), with the network's names (item 59), the set ones first, then the cleared ones, each in the order of their bits, for
@@ -256,9 +278,9 @@ addition: what the original served is served as before. Names and labels are ser
     account's state that the transaction wrote, against its flags in that node's `PreviousFields`. A transaction that changed none, or
     whose ledger was written before the state history was recorded, leaves it empty. The JSON list is unchanged.
 
-Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new message: with `flags=true` the 400s of `/balances` (`invalid date format`, `invalid ledger hash`, `the date provided is too old`) and its 404 `account not found` apply. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions) and [api-reference](../api-reference.md#get-v2accountsaddress).
+Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new message: with `flags=true` the 400s of `/balances` (`invalid date format`, `invalid ledger hash`, `the date provided is too old`) and its 404 `account not found` apply, and `/balances` at a historical ledger keeps its own; `/trustlines` answers the 400s of `/balances` and of the paged lists (`invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`, `the date provided is too old`), and 500 `unable to retrieve trustlines`. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions), [api-reference](../api-reference.md#get-v2accountsaddress), [api-reference](../api-reference.md#get-v2accountsaddressbalances) and [api-reference](../api-reference.md#get-v2accountsaddresstrustlines).
 
-**Path payments** (items 65 and 66). The wording is in [api-reference](../api-reference.md#path-payments).
+**Path payments** (items 65 to 67). The wording is in [api-reference](../api-reference.md#path-payments).
 
 65. **`GET /v2/path_payments`.** The original had no list of path payments (GLOSSARY.md: a successful payment whose delivery used
     someone else's liquidity). Here the path payments of the network in a window: `start`, `end`, `descending`, `limit` (200, at most
@@ -269,12 +291,17 @@ Kept from the original: the JSON answers of the routes it had, their parameters 
     one column per position (`amm_pools[0]`, ...) that changes from page to page.
 66. **Payments to oneself.** The original's payments left a payment to oneself out (a conversion, not a payment), and
     `/v2/payments`, `/v2/accounts/{address}/payments` and the payment volumes still do. A path payment to oneself (an arbitrage loop,
-    or a conversion through an offer or a pool) is listed by `/v2/path_payments`.
+    or a conversion through an offer or a pool) is listed by `/v2/path_payments` and `/v2/accounts/{address}/path_payments`.
+67. **`GET /v2/accounts/{address}/path_payments`.** The original had no list of an account's path payments. Here the path payments
+    the account sent or received, with the parameters, the paging and the row of `/v2/path_payments` (item 65), and `format=csv` with
+    the file `<address> - path payments.csv`. A payment to oneself is listed once. An account a payment only rippled through, a pool
+    and the owner of an offer crossed do not list it: they are in the row, not its source or destination. As on the original's lists
+    under an account, the address is not checked: one that is none has an empty list.
 
-The messages of `/v2/path_payments` are those of `/v2/payments` (`invalid start date format`, `invalid end date format`,
-`invalid marker`), with the 500 `unable to retrieve path payments`.
+The messages of `/v2/path_payments` and `/v2/accounts/{address}/path_payments` are those of `/v2/payments` (`invalid start date
+format`, `invalid end date format`, `invalid marker`), with the 500 `unable to retrieve path payments`.
 
-**Exports** (items 68 to 70). The wording is in [api-reference](../api-reference.md#exports).
+**Exports** (items 68 to 72). The wording is in [api-reference](../api-reference.md#exports).
 
 68. **Exports.** The original had no exports: a client walked the pages itself. Here `POST /v2/exports` with `{path, format}` queues
     an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`) and answers
@@ -282,11 +309,25 @@ The messages of `/v2/path_payments` are those of `/v2/payments` (`invalid start 
     rows?, error?, url?}`. Both are routes of their own: no route of the original changes.
 69. **An export is the list.** The file is made by the exporter of the network, which walks the list's own CSV pages through the
     api with its own API key, so the file is the CSV the route would give for the whole list in one page (one header, the columns
-    of every row, in the order they first appear). The format is `csv` (`pdf` is ticket #17).
+    of every row, in the order they first appear). The format is `csv`, or `pdf` (item 72).
 70. **An export belongs to its API key.** Only the key that created a job sees it: any other key gets 404 `export not found`, as
     for an id that does not exist. The job keeps the SHA-256 of the key, never the key. A done job's `url` is a Google Cloud
     Storage link signed at each request and valid for 15 minutes; the job and its file are kept 7 days.
+71. **Export limits.** An API key has at most 3 exports queued or running (`GH_EXPORT_MAX_JOBS_PER_KEY`): one more answers 429
+    `{"result":"error","message":"too many exports in progress: at most 3 per API key"}`, the body of every error of these routes,
+    not the rate limit's `{"error":…}` (a different limit, with no time to wait for). An export holds at most 1,000,000 rows as CSV
+    and 10,000 as PDF (`GH_EXPORT_MAX_ROWS_CSV`, `_PDF`). Where the list counts its rows up front (the account transactions by
+    time) an export above the cap answers 400 at once; any other export fails when its list passes the cap, with the same message
+    as its `error`: `the list has more than <cap> rows, the most a CSV export holds: narrow the window` (for PDF, `... a PDF export
+    holds: narrow the window or use CSV`).
+72. **PDF exports.** The original had no PDF. Here `format: "pdf"` makes a document of the same walked list, rendered by the
+    exporter with `pdfkit` (not GateHub's `pdf-generator`): landscape A4; a header with the list's file name, for an account's list
+    the address with its account name, account network name and labels (read from `/v2/accounts/{address}` through the api, like
+    the rows), then the network, the list's path, its window (or the ledger it is at), the ledgers its rows cover, the row count
+    and when it was made; then a table of the columns chosen for the list (the first 8 of a list without a choice; the CSV keeps
+    every column) and `Page n of m` on every page. Opening and closing balances are not in it.
 
 The messages of the export routes are new: 400 `invalid path`, `path is not exportable`, `start and end are required`,
-`invalid format`; 404 `export not found`; 503 `exports are not available` (no bucket configured); 500 `unable to create the
-export` and `unable to retrieve the export`.
+`invalid format`, `the list has more than <cap> rows, ...`; 404 `export not found`; 429 `too many exports in progress: at most 3
+per API key`; 503 `exports are not available` (no bucket configured); 500 `unable to create the export` and `unable to retrieve
+the export`.

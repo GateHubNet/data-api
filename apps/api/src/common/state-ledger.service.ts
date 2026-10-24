@@ -62,6 +62,17 @@ export class StateLedgerService {
     return found;
   }
 
+  /**
+   * The newest stored ledger, for a read from the state tables that names no ledger (`/trustlines`). 400 `the date
+   * provided is too old` when there is none, or when the state tables do not cover it (an older parser wrote it).
+   */
+  async latest(): Promise<StateLedger> {
+    const index = await this.ranges.latest();
+    const found = index === undefined ? undefined : await this.byIndex(index);
+    if (found === undefined || !(await this.covers(found.ledger_index))) throw badRequest(DATE_TOO_OLD);
+    return found;
+  }
+
   /** Whether the state tables hold the state of `ledgerIndex`. */
   async covers(ledgerIndex: number): Promise<boolean> {
     const newestOlder = await this.cache.wrap(COVERAGE_KEY, STATE_COVERAGE_CACHE_MS, () => this.newestOlderLedger());

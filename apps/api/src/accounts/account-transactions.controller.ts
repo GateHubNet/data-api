@@ -6,6 +6,7 @@ import type { Request, Response } from 'express';
 import { BinaryCodecService } from '../common/binary-codec.service';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { badRequest, notFound } from '../common/errors';
+import { ExportCount } from '../common/export-count';
 import { setLinkHeader } from '../common/pagination';
 import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
@@ -76,6 +77,7 @@ export class AccountTransactionsController {
   @Get(':address/transactions')
   @RippleRoute(LIST_FAILURE)
   @Csv(transactionsFilename, 'transactions')
+  @ExportCount<AccountTransactionsController>((c, params, query) => c.exportRows(params.address, query))
   @ApiOperation({
     summary: 'Get the transactions of an account',
     description:
@@ -142,5 +144,21 @@ export class AccountTransactionsController {
       marker: page.marker,
       transactions: page.transactions,
     };
+  }
+
+  /**
+   * The rows an export of the list holds, counted before it is queued (ticket #16): the list by time, with its window,
+   * `type` and `result`, read as `list` reads them. `undefined` for the list by sequence, which is not counted up front.
+   */
+  async exportRows(address: string, query: QueryParams): Promise<number | undefined> {
+    if (first(query, 'min_sequence') || first(query, 'max_sequence')) return undefined;
+    const start = dateParam(query, 'start', 'invalid start date format', '1970-01-01');
+    const end = dateParam(query, 'end', 'invalid end date format');
+    return this.transactions.countByTime({
+      account: address,
+      ...transactionFilters(query, this.codec),
+      start: start.date,
+      ...(end && { endExclusive: endExclusive(end) }),
+    });
   }
 }

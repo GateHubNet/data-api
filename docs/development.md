@@ -46,7 +46,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 | --- | --- | --- |
 | `apps/api` | `@gatehub/data-api-service` | NestJS REST API: the `/v2` Ripple-compatible endpoints over ClickHouse, plus live-node lookups (balances, orders) |
 | `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the five workers `ingest`, `validations`, `fee_stats`, `aggregator` and `validators`, and the `range-ingest` CLI |
-| `apps/exporter` | `@gatehub/data-exporter` | NestJS worker, one per network: takes the queued export jobs and makes each file by walking the list's CSV pages through the api, then uploads it to Google Cloud Storage ([architecture](architecture.md#exporter-appsexporter-gatehubdata-exporter)); its e2e test is `apps/api/test/exports.e2e-spec.ts`, against the api harness |
+| `apps/exporter` | `@gatehub/data-exporter` | NestJS worker, one per network: takes the queued export jobs and makes each file (CSV, or PDF with `pdfkit`) by walking the list's CSV pages through the api, then uploads it to Google Cloud Storage ([architecture](architecture.md#exporter-appsexporter-gatehubdata-exporter)); its e2e test is `apps/api/test/exports.e2e-spec.ts`, against the api harness |
 | `packages/shared` | `@gatehub/data-api-shared` | ClickHouse client and migration runner, the `Table` enum and row types, parsers, `buildLedgerRows` / `LedgerWriter`, the `NodeClient`, `RatesService`, the aggregation jobs, the network profiles |
 
 `packages/shared` in more detail:
@@ -203,7 +203,7 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `009_account_network_names.sql`; 005 to 008 are reserved by other changes of spec #4;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `010_export_jobs.sql`; 008 is reserved by another change of spec #4;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.

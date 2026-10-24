@@ -24,8 +24,12 @@ export enum Table {
   AmmGovernance = 'amm_governance',
   // Account state history (migration 005): the state of an account root after each change, from parser version 3.
   AccountStates = 'account_states',
+  // Trust line state history (migration 006): the state of each side of a trust line after each change, from version 3.
+  TrustLineStates = 'trust_line_states',
   // Path payments (migration 007, written by ingest).
   PathPayments = 'path_payments',
+  // The path payments of an account (migration 008): the index of path_payments by source and destination.
+  AccountPathPayments = 'account_path_payments',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',

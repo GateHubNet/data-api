@@ -31,7 +31,7 @@ exporter and a shared library. This page explains the moving parts; the reasons 
 
  ┌───────────────────────────────────────────────────────────────────┐
  │ exporter (apps/exporter) — ONE per network                        │──▶ api: the list's CSV pages (HTTP, own key)
- │   takes queued export jobs (export_jobs), one at a time           │──▶ Google Cloud Storage: <network>/<id>.csv
+ │   takes queued export jobs (export_jobs), one at a time           │──▶ Google Cloud Storage: <network>/<id>.csv|.pdf
  └───────────────────────────────────────────────────────────────────┘    (the api signs the download links)
 ```
 
@@ -50,7 +50,7 @@ Everything both services need, written once:
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
 - **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments) and
-  `buildLedgerRows` (a raw ledger -> rows of the 21 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
+  `buildLedgerRows` (a raw ledger -> rows of the 23 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
 - **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
@@ -116,14 +116,17 @@ A NestJS worker with a probe/metrics HTTP surface, exactly one per network (spec
 [export](api-reference.md#exports) jobs of its database one at a time, oldest first, and makes each file by walking the list's own
 CSV pages (`format=csv`, `limit`, following `Link`) through the network's api with an API key of its own: every list has one
 implementation, and an export is always the list it names. `CsvFile` puts the pages together into the file the route would give
-for the whole list in one page (one header, the columns of every page; the rows wait in a spool file under `/tmp`), and it is
-uploaded to `<network>/<id>.csv` in the bucket of `GH_EXPORT_BUCKET`. The job's states are rows of `export_jobs` (`running`, then
+for the whole list in one page (one header, the columns of every page; the rows wait in a spool file under `/tmp`). A renderer
+per format (`EXPORT_RENDERERS`) turns it into the file: CSV as it is; PDF (ticket #17) as a landscape A4 document drawn with
+`pdfkit` (`renderPdf`), with a header that names the account of an account's list (read from `/v2/accounts/{address}` through
+the api) and a table of the columns chosen for the list (`PDF_COLUMNS`, in `apps/exporter/src/pdf-columns.ts`). The file is
+uploaded to `<network>/<id>.<format>` in the bucket of `GH_EXPORT_BUCKET`. The job's states are rows of `export_jobs` (`running`, then
 `done` or `failed` with why). A shutdown queues the job in hand again; a job a crashed exporter left `running` is failed when the
 next one starts. The api queues the jobs (`POST /v2/exports`) and signs the download links (`GET /v2/exports/{id}`).
 
 ### ClickHouse
 
-One server, one database per network, 53 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network, 55 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 
@@ -152,7 +155,8 @@ views. See [clickhouse](clickhouse.md).
    queries a key-ordered range (secondary table -> keys -> full rows) with `limit + 1`, builds the Ripple-shaped objects, emits
    `marker` and `Link`, and the CSV interceptor reformats on `format=csv`.
 3. Balances and orders are the exception: they read the **live node** (`account_info`, `account_lines`, `account_offers`) and cache the
-   answer briefly.
+   answer briefly. Balances at a historical ledger (a hash, a date or a ledger number) are not: they come from the account and trust
+   line state history in ClickHouse ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)).
 
 ## Key design decisions
 

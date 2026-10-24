@@ -8,13 +8,44 @@ import { setLinkHeader } from '../common/pagination';
 import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { PathPaymentObject, toPathPaymentCsvRow } from './path-payment-object';
-import { PathPaymentsService } from './path-payments.service';
+import { PathPaymentsQuery, PathPaymentsService } from './path-payments.service';
 
-interface PathPaymentsBody {
+/** The body of both path payment lists, the network's and an account's. */
+export interface PathPaymentsBody {
   result: 'success';
   count: number;
   marker?: string;
   path_payments: PathPaymentObject[] | Record<string, string | number>[];
+}
+
+/**
+ * The parameters of both path payment lists, in the order they are checked: `start` (none when missing or empty), then
+ * `end`, each 400 when it is not a date; `descending`, `limit` (200 by default, at most 1000) and `marker`.
+ */
+export function pathPaymentsQuery(query: QueryParams): PathPaymentsQuery {
+  // an empty start is no start, as on /v2/payments
+  const start = first(query, 'start') === '' ? undefined : dateParam(query, 'start', 'invalid start date format');
+  const end = dateParam(query, 'end', 'invalid end date format');
+  return {
+    ...(start && { start: start.date }),
+    ...(end && { endExclusive: endExclusive(end) }),
+    descending: bool(query, 'descending'),
+    limit: limitParam(query, { def: 200, max: 1000 }),
+    marker: first(query, 'marker'),
+  };
+}
+
+/** The answer of a page: `result`, `count`, `marker` and `path_payments`, CSV rows when the client asked for a CSV. */
+export function pathPaymentsBody(
+  query: QueryParams,
+  page: { pathPayments: PathPaymentObject[]; marker?: string },
+): PathPaymentsBody {
+  return {
+    result: 'success',
+    count: page.pathPayments.length,
+    marker: page.marker,
+    path_payments: wantsCsv(query) ? page.pathPayments.map(toPathPaymentCsvRow) : page.pathPayments,
+  };
 }
 
 /** `GET /v2/path_payments`: the path payments of the network in a window (spec #4 §4), a GateHub extra. */
@@ -44,24 +75,8 @@ export class PathPaymentsController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<PathPaymentsBody> {
-    // an empty start is no start, as on /v2/payments
-    const start = first(query, 'start') === '' ? undefined : dateParam(query, 'start', 'invalid start date format');
-    const end = dateParam(query, 'end', 'invalid end date format');
-
-    const page = await this.pathPayments.list({
-      ...(start && { start: start.date }),
-      ...(end && { endExclusive: endExclusive(end) }),
-      descending: bool(query, 'descending'),
-      limit: limitParam(query, { def: 200, max: 1000 }),
-      marker: first(query, 'marker'),
-    });
-
+    const page = await this.pathPayments.list(pathPaymentsQuery(query));
     setLinkHeader(req, res, page.marker);
-    return {
-      result: 'success',
-      count: page.pathPayments.length,
-      marker: page.marker,
-      path_payments: wantsCsv(query) ? page.pathPayments.map(toPathPaymentCsvRow) : page.pathPayments,
-    };
+    return pathPaymentsBody(query, page);
   }
 }

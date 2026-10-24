@@ -28,6 +28,7 @@ export class ExportWorkerService implements OnApplicationBootstrap, OnModuleDest
       pageSize: config.exportPageSize,
       pollMs: config.exportPollMs,
       requestTimeoutMs: config.exportRequestTimeoutMs,
+      maxRows: { csv: config.exportMaxRowsCsv, pdf: config.exportMaxRowsPdf },
       onFinished: (status, rows, seconds) => metrics.jobFinished(status, rows, seconds),
     });
   }

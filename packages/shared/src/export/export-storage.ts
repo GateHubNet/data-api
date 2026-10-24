@@ -64,7 +64,10 @@ export class GcsExportStorage implements ExportStorage {
 
 /** A file of the in-memory store, as a download of a link gives it. */
 export interface MemoryExportFile extends ExportFileMeta {
+  /** The file as UTF-8 text (a CSV). */
   body: string;
+  /** The file as it is (a PDF). */
+  bytes: Buffer;
 }
 
 /**
@@ -93,7 +96,7 @@ export class MemoryExportStorage implements ExportStorage {
     if (this.now() >= Number(match[2])) throw new Error(`The link has expired: ${url}`);
     const file = this.files.get(match[1]);
     if (!file) throw new Error(`No file at ${match[1]}`);
-    return { body: file.body.toString('utf8'), ...file.meta };
+    return { body: file.body.toString('utf8'), bytes: Buffer.from(file.body), ...file.meta };
   }
 
   /** The keys of the stored files. */

@@ -253,14 +253,17 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const tokens = calls.map((c) => c.token);
       expect(new Set(tokens).size).toBe(tokens.length);
 
-      // The child tables that have rows (the 12 of the Ripple data, the account states and the path payments: these ledgers have no AMM
-      // activity, so the 5 AMM tables get no insert) start together, before any of them has finished.
+      // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
+      // by account: these ledgers have no AMM activity, so the 5 AMM tables get no insert) start together, before any of
+      // them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
-      expect(childTables.size).toBe(14);
+      expect(childTables.size).toBe(16);
       expect(childTables).toContain(Table.AccountStates);
+      expect(childTables).toContain(Table.TrustLineStates);
       expect(childTables).toContain(Table.PathPayments);
+      expect(childTables).toContain(Table.AccountPathPayments);
       const firstStarts = events.slice(0, childTables.size);
       expect(new Set(firstStarts)).toEqual(new Set([...childTables].map((t) => `start:${t}`)));
       expect(events.filter((e) => e.startsWith('start:') && AMM_LEDGER_TABLES.includes(e.slice(6) as Table))).toEqual(
