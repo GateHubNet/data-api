@@ -77,8 +77,18 @@ export function exportNow(now: number = Date.now()): number {
 const COLUMNS = `id, seq, key_hash, path, format, status, toUnixTimestamp64Milli(created) / 1000 AS created,
   toUnixTimestamp64Milli(at) / 1000 AS at, toString(rows) AS rows, object, error`;
 
-/** The newest row of every job: the jobs as they are now. */
-const CURRENT = `SELECT ${COLUMNS} FROM ${Table.ExportJobs} ORDER BY id, seq DESC LIMIT 1 BY id`;
+// The columns of a job's state besides its id, in the order of the tuple `CURRENT` keeps of each job.
+const STATE = ['seq', 'key_hash', 'path', 'format', 'status', 'created', 'at', 'rows', 'object', 'error'];
+
+/**
+ * The newest row of every job, grouped by id (`argMax` by `seq`, ADR-0003; never `LIMIT 1 BY` in the select that reads
+ * the table, clickhouse.md R106). The table keeps 7 days of jobs (its TTL), which is what the grouping reads.
+ */
+const CURRENT = `SELECT id, ${STATE.map((c, i) => `j.${i + 1} AS ${c}`).join(', ')}
+  FROM (SELECT id, argMax((${STATE.join(', ')}), seq) AS j FROM ${Table.ExportJobs} GROUP BY id)`;
+
+/** The most jobs `exportJobsIn` returns at once. */
+export const EXPORT_JOBS_BATCH = 100;
 
 /** The job `id` as it is now, or `undefined` when there is none (or it is older than 7 days). */
 export async function readExportJob(ch: ClickHouseService, id: string): Promise<ExportJobsRow | undefined> {
@@ -88,16 +98,15 @@ export async function readExportJob(ch: ClickHouseService, id: string): Promise<
   );
 }
 
-/** The jobs whose current state is `status`, the oldest first. */
+/** The oldest jobs whose current state is `status`, the oldest first: at most `limit`, and never more than a batch. */
 export async function exportJobsIn(
   ch: ClickHouseService,
   status: ExportStatus,
-  limit?: number,
+  limit: number = EXPORT_JOBS_BATCH,
 ): Promise<ExportJobsRow[]> {
   return ch.query<ExportJobsRow>(
-    `SELECT * FROM (${CURRENT}) WHERE status = {status:String} ORDER BY created, id` +
-      (limit === undefined ? '' : ' LIMIT {limit:UInt32}'),
-    { status, ...(limit !== undefined && { limit }) },
+    `SELECT ${COLUMNS} FROM (${CURRENT}) WHERE status = {status:String} ORDER BY created, id LIMIT {limit:UInt32}`,
+    { status, limit: Math.min(limit, EXPORT_JOBS_BATCH) },
   );
 }
 

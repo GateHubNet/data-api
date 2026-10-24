@@ -242,17 +242,24 @@ export class ExportWorker {
     });
   }
 
-  /** The jobs a previous exporter left `running`: it stopped in the middle of them without a shutdown. */
+  /**
+   * The jobs a previous exporter left `running`: it stopped in the middle of them without a shutdown. They are read a
+   * batch at a time; a failed job is no longer running, so the next read has the next batch.
+   */
   private async failAbandoned(): Promise<void> {
-    for (const job of await exportJobsIn(this.options.ch, 'running')) {
-      this.logger.warn(`Export ${job.id} was left running by a previous exporter: failed`);
-      await appendExportJob(
-        this.options.ch,
-        nextExportState(job, {
-          status: 'failed',
-          error: 'the exporter stopped while it made this export: ask for it again',
-        }),
-      );
+    for (;;) {
+      const batch = await exportJobsIn(this.options.ch, 'running');
+      if (batch.length === 0) return;
+      for (const job of batch) {
+        this.logger.warn(`Export ${job.id} was left running by a previous exporter: failed`);
+        await appendExportJob(
+          this.options.ch,
+          nextExportState(job, {
+            status: 'failed',
+            error: 'the exporter stopped while it made this export: ask for it again',
+          }),
+        );
+      }
     }
   }
 

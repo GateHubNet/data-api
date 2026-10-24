@@ -1,4 +1,4 @@
-import { MemoryExportStorage, Table } from '@gatehub/data-api-shared';
+import { exportKeyHash, MemoryExportStorage, Table } from '@gatehub/data-api-shared';
 import { ExportWorker } from '../../exporter/src/export-worker';
 import { Harness, NO_RATE_LIMIT, startHarness, TEST_API_KEY } from './harness';
 import { accountAt, hashOf } from './support/amm';
@@ -391,6 +391,61 @@ describe('exports', () => {
       const res = await post({ path: transactions(BUSY, 'start=2013-01-01&end=2016-01-01'), format: 'csv' });
       expect((await h.http().get(`/v2/exports/${res.body.id}`)).status).toBe(401);
       expect((await h.http().post('/v2/exports').send({})).status).toBe(401);
+    });
+  });
+
+  describe('an exporter that starts', () => {
+    it('fails every job a previous exporter left running, however many: they are read a batch at a time', async () => {
+      const now = Date.now() / 1000;
+      const ids = Array.from({ length: 250 }, (_, i) =>
+        hashOf(1_000_000 + i)
+          .slice(-32)
+          .toLowerCase(),
+      );
+      const job = (id: string, seq: number, status: 'queued' | 'running') => ({
+        id,
+        seq,
+        key_hash: exportKeyHash(TEST_API_KEY),
+        path: transactions(BUSY, 'start=2013-01-01&end=2016-01-01'),
+        format: 'csv',
+        status,
+        created: now,
+        at: now + seq,
+        rows: 0,
+        object: '',
+        error: '',
+      });
+      await h.ch.insert(Table.ExportJobs, [
+        ...ids.map((id) => job(id, 0, 'queued')),
+        ...ids.map((id) => job(id, 1, 'running')),
+      ]);
+      const worker = new ExportWorker({
+        ch: h.ch,
+        storage,
+        network: 'xrpl',
+        apiUrl: await h.app.getUrl(),
+        apiKey: EXPORTER_KEY,
+        pollMs: 20,
+        logger: { log: () => undefined, warn: () => undefined, error: () => undefined },
+      });
+      worker.start();
+      try {
+        for (let i = 0; i < 500; i++) {
+          const states = await Promise.all(ids.map(async (id) => (await status(id)).body));
+          if (states.every((s) => s.status === 'failed')) break;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      } finally {
+        await worker.stop();
+      }
+      for (const id of ids) {
+        const res = await status(id);
+        expect([id, res.body.status, res.body.error]).toEqual([
+          id,
+          'failed',
+          'the exporter stopped while it made this export: ask for it again',
+        ]);
+      }
     });
   });
 });
