@@ -1086,8 +1086,8 @@ ordered and paged by (`counterparty`, `currency`). An issuer's lines are its hol
 Precedence: `ledger_hash` > `date` > `ledger_index`, as on `/balances`. With no ledger named the route reads the newest ledger this
 API has indexed (not the node's validated ledger), so a marker always belongs to this API's data and the pages never mix two sources;
 that ledger trails the network by the ingest delay. The marker is the (counterparty, currency) of the last line and does not hold the
-ledger: each page without a ledger named reads the newest ledger again, so a walk (or an [export](#exports)) that must be one ledger's
-names it with `ledger_index`, the `ledger_index` of the first page.
+ledger: each page without a ledger named reads the newest ledger again, so a walk that must be one ledger's names it with
+`ledger_index`, the `ledger_index` of the first page. An [export](#exports) does that itself.
 
 ```json
 { "result": "success", "ledger_index": 26926380, "close_time": "2017-01-12T18:49:31Z", "count": 1, "marker": "…",
@@ -3237,9 +3237,16 @@ Asks for an export. The body is JSON:
 | `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list. |
 | `format` | `csv` or `pdf` (see [PDF](#pdf)). |
 
-A **list over time** (a route that takes `start` and `end`) must name both. A list at a point in time (`/balances`, `/orders`)
-may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`) names none. The other
-parameters are not checked here: a list that refuses them makes a failed export, which says why.
+A **list over time** (a route that takes `start` and `end`) must name both. A list at a point in time (`/balances`,
+`/trustlines`, `/orders`) may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`)
+names none. The other parameters are not checked here: a list that refuses them makes a failed export, which says why.
+
+**One ledger.** When the path of a list at a point in time names no ledger (no `ledger_hash`, `date` or numeric `ledger_index`;
+a word such as `validated` names none), the exporter takes the newest ledger this API has indexed when it starts the export
+(`GET /v2/ledgers`) and names it as `ledger_index` on every page it walks, so the file is that one ledger even when newer ones
+are indexed meanwhile, and a PDF says which (`At: ledger <n>, the newest indexed when the export was made`). A list counts as one
+at a point in time when its answer at that ledger has that `ledger_index`. So an export of `/balances` without a ledger is read
+from the state history at that ledger, not from the node.
 
 **Limits.** An API key may have at most **3** exports queued or running at once (`GH_EXPORT_MAX_JOBS_PER_KEY`); one more
 answers 429, and an export that is done or has failed frees its place. An export holds at most **1,000,000 rows as CSV** and
@@ -3304,7 +3311,7 @@ header, one line each:
   it, read through the api like the rows (an address without an activation on the network has none);
 - `Network:` (`XRP Ledger` or `Xahau`), `List:` (the `path` as asked);
 - `Window: <start> to <end>` (`, newest first` with `descending=true`), or for a list at a point in time `At:` the ledger or date
-  it names;
+  it names, or else the ledger the exporter walked it at (see "One ledger" above);
 - `Ledgers: <lowest> to <highest>`: the ledgers of its rows (`ledger_index`); `none (no rows)`, or `not given by the list` for a
   list whose rows have no ledger;
 - `Rows:` and `Made:` (the time, UTC, to the second).

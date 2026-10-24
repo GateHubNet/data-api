@@ -21,6 +21,8 @@ export interface PdfInput {
   title: string;
   /** The network (`xrpl`, `xahau`). */
   network: string;
+  /** The ledger the exporter walked a list at a ledger at, when its path named none. */
+  ledger?: number;
   /** The account of an account's list, with its names and labels; `undefined` for any other list. */
   account?: PdfAccount;
   /** When the export was made. */
@@ -45,8 +47,11 @@ const printable = (text: string): string => text.replace(/[^\x20-\x7e\xa0-\xff]/
 /** The cells of one line of the exporter's CSV (`CsvFile`): every cell a JSON string. */
 const cellsOf = (line: string): string[] => JSON.parse(`[${line.replace(/^\n/, '')}]`) as string[];
 
-/** The `Window:` (or `At:`) line of the header: the window or the ledger the path names. */
-function windowOf(query: URLSearchParams): string {
+/**
+ * The `Window:` (or `At:`) line of the header: the window or the ledger the path names, or else the ledger the exporter
+ * walked the list at (`ledger`).
+ */
+function windowOf(query: URLSearchParams, ledger: number | undefined): string {
   const start = query.get('start');
   const end = query.get('end');
   if (start || end) {
@@ -58,6 +63,8 @@ function windowOf(query: URLSearchParams): string {
   const index = query.get('ledger_index') ?? query.get('ledger');
   if (hash) return `At: ledger ${hash}`;
   if (date) return `At: the last ledger closed at or before ${date}`;
+  if (index && /^\d+$/.test(index)) return `At: ledger ${index}`;
+  if (ledger !== undefined) return `At: ledger ${ledger}, the newest indexed when the export was made`;
   if (index) return `At: ledger ${index}`;
   return 'At: the time the export was made';
 }
@@ -132,7 +139,7 @@ export async function renderPdf(input: PdfInput): Promise<Readable> {
     ...(input.account ? accountLines(input.account) : []),
     `Network: ${NETWORK_NAMES[input.network] ?? input.network}`,
     `List: ${input.path}`,
-    windowOf(url.searchParams),
+    windowOf(url.searchParams, input.ledger),
     ledgers,
     `Rows: ${input.file.rows}`,
     `Made: ${isoSecond(input.made)}`,

@@ -45,6 +45,8 @@ export interface WalkedList {
   file: CsvFile;
   /** The list's own download name (`Content-Disposition` of its CSV), or `null` when it gave none. */
   disposition: string | null;
+  /** The ledger the exporter named on every page of a list at a ledger whose path named none (`pinnedLedger`). */
+  ledger?: number;
   /** The network (`xrpl`, `xahau`). */
   network: string;
   /** The JSON answer of another route of the api (`/v2/…`), read with the exporter's key; `undefined` for a 404. */
@@ -98,6 +100,7 @@ export const EXPORT_RENDERERS: Record<ExportFormat, (list: WalkedList) => Promis
       file: list.file,
       title: downloadName(list.disposition) ?? list.job.path,
       network: list.network,
+      ledger: list.ledger,
       account: await accountOf(list, pathname),
       made: new Date(),
     });
@@ -128,6 +131,8 @@ export interface ExportWorkerOptions {
   logger?: Pick<Logger, 'log' | 'warn' | 'error'>;
   /** Told about every job that ends (the metrics). */
   onFinished?: (status: 'done' | 'failed', rows: number, seconds: number) => void;
+  /** How the api is asked. Default: the global `fetch`. */
+  fetch?: typeof fetch;
 }
 
 /** A failure the client is told about, in these words: the message becomes the job's `error`. */
@@ -270,10 +275,17 @@ export class ExportWorker {
     await appendExportJob(ch, running);
     const dir = await mkdtemp(join(tmpdir(), 'export-'));
     try {
-      const { file, disposition } = await this.walk(running, join(dir, 'rows'));
+      const { file, disposition, ledger } = await this.walk(running, join(dir, 'rows'));
       const render = EXPORT_RENDERERS[running.format as ExportFormat];
       if (!render) throw new ExportFailure(`the format ${running.format} cannot be made`);
-      const output = await render({ job: running, file, disposition, network, read: (path) => this.read(path) });
+      const output = await render({
+        job: running,
+        file,
+        disposition,
+        ledger,
+        network,
+        read: (path) => this.read(path),
+      });
       const object = exportObjectKey(network, running.id, running.format);
       try {
         await storage.upload(object, output.body, {
@@ -305,14 +317,23 @@ export class ExportWorker {
 
   /**
    * Walks every page of the job's list into a `CsvFile` spooled at `spool`. A list longer than the cap of the job's
-   * format (ticket #16) fails the job at the page that passes it: the rest is not read.
+   * format (ticket #16) fails the job at the page that passes it: the rest is not read. A list at a ledger whose path
+   * names none is walked at one ledger, named on every page (`pinnedLedger`).
    */
-  private async walk(job: ExportJobsRow, spool: string): Promise<{ file: CsvFile; disposition: string | null }> {
+  private async walk(
+    job: ExportJobsRow,
+    spool: string,
+  ): Promise<{ file: CsvFile; disposition: string | null; ledger?: number }> {
     const url = new URL(job.path, this.options.apiUrl);
+    url.searchParams.delete('marker');
+    const ledger = await this.pinnedLedger(url);
+    if (ledger !== undefined) {
+      url.searchParams.delete('ledger');
+      url.searchParams.set('ledger_index', String(ledger));
+    }
     // every format is made from the list's CSV form
     url.searchParams.set('format', 'csv');
     url.searchParams.set('limit', String(this.pageSize));
-    url.searchParams.delete('marker');
     const file = new CsvFile(spool);
     const cap = exportRowCap(this.maxRows, job.format);
     const seen = new Set<string>();
@@ -329,10 +350,46 @@ export class ExportWorker {
       await file.add(text);
       if (cap !== undefined && file.rows > cap) throw new ExportFailure(tooManyExportRows(job.format, cap));
       const marker = nextMarker(res.headers.get('link'));
-      if (marker === undefined) return { file, disposition };
+      if (marker === undefined) return { file, disposition, ...(ledger !== undefined && { ledger }) };
       if (seen.has(marker)) throw new ExportFailure('the list gave the same page twice');
       seen.add(marker);
       url.searchParams.set('marker', marker);
+    }
+  }
+
+  /**
+   * The ledger to walk a list at, when the list is one at a ledger and its path names none (ADR-0015: `/balances`,
+   * `/trustlines`, `/orders`): the newest ledger the api has indexed when the export starts (`GET /v2/ledgers`), so that
+   * every page is of that one ledger, however many are indexed while the walk goes on. A list is one at a ledger when
+   * its JSON answer at that ledger says `ledger_index` is that ledger. `undefined` for a path that names a ledger (a
+   * number, a hash or a date; a word such as `validated` names none), for a list over time (`start`, `end`) and for any
+   * other list; also when the api cannot say, and the walk then reports what the list answers.
+   */
+  private async pinnedLedger(url: URL): Promise<number | undefined> {
+    const q = url.searchParams;
+    if (['ledger_hash', 'date', 'close_time', 'start', 'end'].some((name) => q.has(name))) return undefined;
+    if (['ledger_index', 'ledger'].some((name) => /^\d+$/.test(q.get(name) ?? ''))) return undefined;
+    const newest = await this.json<{ ledger?: { ledger_index?: unknown } }>(new URL('/v2/ledgers', url));
+    const ledger = Number(newest?.ledger?.ledger_index);
+    if (!Number.isSafeInteger(ledger) || ledger <= 0) return undefined;
+    const probe = new URL(url);
+    probe.searchParams.delete('format');
+    probe.searchParams.delete('ledger');
+    probe.searchParams.set('ledger_index', String(ledger));
+    probe.searchParams.set('limit', '1');
+    const answer = await this.json<{ ledger_index?: unknown }>(probe);
+    return answer !== undefined && Number(answer.ledger_index) === ledger ? ledger : undefined;
+  }
+
+  /** The JSON answer of `url`, or `undefined` when it answers anything but a 200 with JSON. */
+  private async json<T>(url: URL): Promise<T | undefined> {
+    const res = await this.fetchPage(url);
+    const text = await res.text();
+    if (!res.ok) return undefined;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      return undefined;
     }
   }
 
@@ -353,7 +410,7 @@ export class ExportWorker {
   private async fetchPage(url: URL): Promise<Response> {
     if (this.stopping.signal.aborted) throw new Stopped();
     try {
-      return await fetch(url, {
+      return await (this.options.fetch ?? fetch)(url, {
         headers: this.options.apiKey === '' ? {} : { 'X-API-Key': this.options.apiKey },
         signal: AbortSignal.any([this.stopping.signal, AbortSignal.timeout(this.requestTimeoutMs)]),
       });

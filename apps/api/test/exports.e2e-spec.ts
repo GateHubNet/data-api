@@ -3,7 +3,7 @@ import { ExportWorker } from '../../exporter/src/export-worker';
 import { Harness, NO_RATE_LIMIT, startHarness, TEST_API_KEY } from './harness';
 import { accountAt, hashOf } from './support/amm';
 import { csvDisposition } from './support/csv';
-import { pdfText, unwrapped } from './support/pdf';
+import { pdfLines, pdfText, unwrapped } from './support/pdf';
 
 /**
  * `POST /v2/exports` and `GET /v2/exports/{id}` (spec #4, ticket #15): an investigator asks for an export of a list and
@@ -447,5 +447,151 @@ describe('exports', () => {
         ]);
       }
     });
+  });
+});
+
+/**
+ * An export of a list at a ledger whose path names none (`/balances`, `/trustlines`): the exporter resolves the ledger once,
+ * the newest this api has indexed when it starts, and names it on every page it walks, so the file is that one ledger
+ * even when a newer one is indexed in the middle of the walk; the PDF header says which ledger it is.
+ *
+ * The recorded mainnet ledgers of `xrpl/account-state`: the TUJ issuer's nine lines, walked two at a time. When the first
+ * page of the walk has been served, a newer ledger is indexed that changes the issuer's last line.
+ */
+describe('exports of a list at a ledger that names none', () => {
+  const TUJ_ISSUER = 'rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV';
+  const LAST_LINE = 'rhbj4x2i7hiwoWb7vQZ16XmnAKPcLtepDX';
+  /** The newest recorded ledger: the newest indexed one when the exports below start. */
+  const NEWEST = 107872958;
+  const storage = new MemoryExportStorage();
+  let h: Harness;
+  let worker: ExportWorker;
+  /** Told about every request of the exporter once it is answered. */
+  let answered: ((url: string) => Promise<void>) | undefined;
+
+  beforeAll(async () => {
+    h = await startHarness({
+      seed: 'xrpl-account-state',
+      exportStorage: storage,
+      env: { ...NO_RATE_LIMIT, GH_API_KEYS: `${TEST_API_KEY},${EXPORTER_KEY}`, GH_EXPORT_MAX_JOBS_PER_KEY: '100' },
+    });
+    // the issuer's native balance at the newest ledger, for /balances (the recorded ledgers do not change its root)
+    await h.ch.insert(Table.AccountStates, [
+      {
+        account: TUJ_ISSUER,
+        ledger_index: NEWEST,
+        tx_index: 0,
+        node_index: 0,
+        tx_hash: hashOf(1),
+        close_time: 1_792_851_440,
+        balance: '42',
+        flags: 0,
+        sequence: 1,
+        owner_count: 0,
+        fields: '{}',
+        deleted: 0,
+      },
+    ]);
+    worker = new ExportWorker({
+      ch: h.ch,
+      storage,
+      network: 'xrpl',
+      apiUrl: await h.app.getUrl(),
+      apiKey: EXPORTER_KEY,
+      pageSize: 2,
+      pollMs: 20,
+      logger: { log: () => undefined, warn: () => undefined, error: (message: string) => console.error(message) },
+      fetch: async (input, init) => {
+        const res = await fetch(input, init);
+        await answered?.(String(input));
+        return res;
+      },
+    });
+    worker.start();
+  });
+
+  afterAll(async () => {
+    await worker?.stop();
+    await h?.close();
+  });
+
+  const get = (path: string) => h.http().get(path).set('X-API-Key', TEST_API_KEY);
+  const exportOf = async (path: string, format: string) => {
+    const res = await h.http().post('/v2/exports').set('X-API-Key', TEST_API_KEY).send({ path, format });
+    expect([path, res.status]).toEqual([path, 202]);
+    for (let i = 0; i < 500; i++) {
+      const job = await get(`/v2/exports/${res.body.id}`);
+      if (job.body.status === 'done' || job.body.status === 'failed') return job.body;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`export ${res.body.id} did not finish`);
+  };
+
+  /** Indexes ledger `NEWEST + 1`, in which the issuer's last line changes its balance. */
+  const indexNewerLedger = async () => {
+    await h.ch.command(
+      `INSERT INTO ${Table.Ledgers}
+       SELECT tpl.* REPLACE (toUInt32({ledger:UInt32}) AS ledger_index, {hash:String} AS ledger_hash)
+         FROM (SELECT * FROM ${Table.Ledgers} WHERE ledger_index = {newest:UInt32} LIMIT 1) AS tpl`,
+      { ledger: NEWEST + 1, newest: NEWEST, hash: hashOf(NEWEST + 1) },
+    );
+    await h.ch.command(
+      `INSERT INTO ${Table.TrustLineStates}
+       SELECT tpl.* REPLACE (toUInt32({ledger:UInt32}) AS ledger_index, '-1' AS balance)
+         FROM (SELECT * FROM ${Table.TrustLineStates}
+                WHERE account = {issuer:String} AND counterparty = {peer:String} AND currency = 'TUJ'
+                ORDER BY ledger_index DESC LIMIT 1) AS tpl`,
+      { ledger: NEWEST + 1, issuer: TUJ_ISSUER, peer: LAST_LINE },
+    );
+  };
+
+  it('a CSV of /trustlines is the lines at the ledger the walk started at, page after page', async () => {
+    const path = `/v2/accounts/${TUJ_ISSUER}/trustlines`;
+    // the newer ledger is indexed once the first page of the walk has been served
+    let indexed = false;
+    answered = async (url) => {
+      if (indexed || !url.includes(`${path}?`) || !url.includes('format=csv')) return;
+      indexed = true;
+      await indexNewerLedger();
+    };
+    let job;
+    try {
+      job = await exportOf(path, 'csv');
+    } finally {
+      answered = undefined;
+    }
+    expect(indexed).toBe(true);
+    expect([job.status, job.rows, job.error]).toEqual(['done', 9, undefined]);
+
+    const at = (ledger: number) => get(`${path}?ledger_index=${ledger}&format=csv&limit=1000`);
+    const [started, newer] = await Promise.all([at(NEWEST), at(NEWEST + 1)]);
+    // the newer ledger did change the list
+    expect(newer.text).not.toBe(started.text);
+    expect(storage.download(job.url).body).toBe(started.text);
+  });
+
+  it('a PDF of /trustlines says in its header the ledger it is at', async () => {
+    const job = await exportOf(`/v2/accounts/${TUJ_ISSUER}/trustlines`, 'pdf');
+    expect(job.status).toBe('done');
+    expect(pdfLines(storage.download(job.url).bytes)).toContain(
+      `At: ledger ${NEWEST + 1}, the newest indexed when the export was made`,
+    );
+  });
+
+  it('a CSV of /balances is the balances at the newest indexed ledger, from the state history and not the node', async () => {
+    const path = `/v2/accounts/${TUJ_ISSUER}/balances`;
+    const job = await exportOf(path, 'csv');
+    expect([job.status, job.error]).toEqual(['done', undefined]);
+    // the list has no marker: the export is its one page, of the exporter's page size (2 here)
+    const expected = await get(`${path}?ledger_index=${NEWEST + 1}&format=csv&limit=2`);
+    expect(expected.status).toBe(200);
+    expect(storage.download(job.url).body).toBe(expected.text);
+  });
+
+  it('a path that names a ledger, or a list over time, keeps what it names', async () => {
+    const path = `/v2/accounts/${TUJ_ISSUER}/trustlines?ledger_index=93663334`;
+    const job = await exportOf(path, 'pdf');
+    expect(job.status).toBe('done');
+    expect(pdfLines(storage.download(job.url).bytes)).toContain('At: ledger 93663334');
   });
 });
