@@ -18,6 +18,8 @@ consequences. They explain *why* the system is the way it is.
 | [0011](0011-amm-data-and-swaps-as-exchanges.md) | AMM data, and swaps as exchanges: the user's decisions and the rulings of the build | Accepted |
 | [0012](0012-validators-and-amendments-data.md) | Validators and amendments data: a worker of its own, agreement over the indexed chain, the safe fetcher, migration 002 and its deploy order | Accepted |
 | [0013](0013-account-and-market-aggregates.md) | Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats, self-contained runners; D2b: the AMM data additions (source split, filter sets, `fees_est`, computed range) | Accepted |
+| [0014](0014-address-names-and-labels-in-a-shared-database.md) | Address names and labels live in a shared database, written by hand; served on `/v2/accounts/{address}` | Accepted |
+| [0015](0015-historical-account-state-from-clickhouse.md) | Historical account state (balances, trust lines, flags) comes from ClickHouse state tables, never from a node | Accepted |
 
 ## Format
 Each ADR: **Context** (the forces), **Decision** (what we chose), **Consequences**
