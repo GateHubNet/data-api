@@ -40,6 +40,7 @@ describe('MemoryExportStorage', () => {
 
     expect(memory.download(url)).toEqual({
       body: '"a"\n"1"',
+      bytes: Buffer.from('"a"\n"1"'),
       contentType: 'text/csv',
       contentDisposition: 'attachment; filename="a.csv"',
     });
