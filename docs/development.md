@@ -87,6 +87,7 @@ cp apps/syncer/.env.example apps/syncer/.env
 #   default nodes wss://s2.ripple.com,wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
 
 pnpm ch:migrate                            # creates the database of GH_NETWORK (xrpl) and applies the schema
+pnpm ch:migrate:shared                     # creates the shared database (account names) and applies its own schema
 
 pnpm start:syncer                          # http://localhost:3002 (probe), starts at the validated head
 pnpm start:api                             # http://localhost:3001, Swagger at /internal/docs
@@ -124,6 +125,7 @@ From the repo root; `pnpm -r <script>` fans out in dependency order.
 | `pnpm --filter @gatehub/data-api-shared test:e2e` | Shared e2e tests (migrations, writer, build-rows, rates, aggregation). **Needs Docker.** |
 | `pnpm format` | Prettier write over `{apps,packages}/**/src/**/*.ts`. (`pnpm lint` runs `eslint --fix`, but the repo has no ESLint configuration yet, so it does not work.) |
 | `pnpm ch:migrate` | applies the schema to the database of `GH_NETWORK` (`ts-node` on `migrate.ts`) |
+| `pnpm ch:migrate:shared` | applies `schema-shared/` to the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`, default `shared`), which the api reads the account names from |
 | `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source: it runs `dist/`, so `pnpm build` first, and it needs the syncer's `GH_*` environment (`.env` or `GH_ENV=local`) ([backfill](backfill.md)) |
 | `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures. Two more modes record the inputs of the `validators` worker: `--unl --network xrpl\|xahau [--out <dir>]` the validator lists of the network's default publishers (needs no node), and `--network-state --network xrpl\|xahau --endpoint <wss> [--out <dir>] [--ledger <n>]` what the worker asks the node for (the Amendments, NegativeUNL and FeeSettings objects at the validated ledger, or at `--ledger`, which the node must still hold, `server_info` and `feature`) |
 | `pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl\|xahau [--clickhouse]` | compares the amendment metadata file with a node (and with the database) and exits 1 on a difference ([operations](operations.md#keep-the-amendment-metadata-current)) |
