@@ -1,6 +1,7 @@
 # Production-shaped topology: one deployment per network (XRPL and Xahau) on one ClickHouse server.
 #
 #   ClickHouse Keeper -> ClickHouse -> migrate-<network> (one-shot, creates the database of the network and applies the schema)
+#                                   -> migrate-shared (one-shot, the `shared` database every network's api reads, ADR-0014)
 #                                   -> syncer-<network> (ingest, exactly one) + api-<network> (read replicas)
 #   nginx routes by host to the apis: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau (deploy/nginx/nginx.conf.template)
 #
@@ -35,6 +36,7 @@
 #
 # Apply the migrations by hand (they also run on every `up`, as part of the start order; all DDL is idempotent):
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl
+#   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-shared
 #
 # Metrics: every api and syncer serves Prometheus metrics on port 3000 (GET /metricz) of the compose network. They are
 # exposed to that network only and not published; scrape them from a Prometheus container on the same network
@@ -96,6 +98,9 @@ x-api-env: &api-env
   GH_LIVE_CACHE_TTL_MS:
   GH_TX_CACHE_SIZE:
   GH_CACHE_CONTROL:
+  GH_NAMES_AND_LABELS_RELOAD_MS:
+  # The shared database (ADR-0014) both apis read; empty = `shared`. migrate-shared gets the same.
+  GH_CLICKHOUSE_SHARED_DATABASE:
   GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
   GH_HTTP_API_PORT: 3001
   GH_METRICZ_PORT: 3000
@@ -192,6 +197,17 @@ services:
       timeout: 5s
       retries: 10
 
+  # ------------------------------------------------------------------------------------------------ shared
+
+  # One-shot: create the `shared` database (account names and labels, ADR-0014) and apply its own schema, then exit 0. One job for
+  # every network (two runners on one schema_migrations would race); the apis of both networks wait for it.
+  migrate-shared:
+    <<: *migrate
+    command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js', 'shared']
+    environment:
+      <<: *clickhouse-client
+      GH_CLICKHOUSE_SHARED_DATABASE:
+
   # ------------------------------------------------------------------------------------------------ XRPL
 
   # One-shot: create the `xrpl` database and apply the schema, then exit 0. The xrpl services wait for it.
@@ -233,6 +249,8 @@ services:
     <<: *api
     depends_on:
       migrate-xrpl:
+        condition: service_completed_successfully
+      migrate-shared:
         condition: service_completed_successfully
     environment:
       <<: *api-env
@@ -284,6 +302,8 @@ services:
     <<: *api
     depends_on:
       migrate-xahau:
+        condition: service_completed_successfully
+      migrate-shared:
         condition: service_completed_successfully
     environment:
       <<: *api-env

@@ -3,6 +3,7 @@ import {
   AccountExchangesRow,
   AccountPaymentsRow,
   AccountsCreatedRow,
+  AccountStatesRow,
   AccountTransactionsRow,
   AccountTxBySequenceRow,
   AmmGovernanceRow,
@@ -23,6 +24,7 @@ import {
   TxByTypeRow,
 } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
+import { AccountStatesParser } from '../parsers/account-states.parser';
 import { AccountsCreatedParser } from '../parsers/accounts-created.parser';
 import { AffectedAccountsParser } from '../parsers/affected-accounts.parser';
 import { AmmParser } from '../parsers/amm.parser';
@@ -56,6 +58,8 @@ export interface LedgerRows {
   ammLiquidity: AmmLiquidityRow[];
   accountAmmLiquidity: AccountAmmLiquidityRow[];
   ammGovernance: AmmGovernanceRow[];
+  /** The state of every account root after each transaction that changed it (parser version 3, ADR-0015). */
+  accountStates: AccountStatesRow[];
   /** Every successful Payment whose delivery used someone else's liquidity, a payment to oneself included. */
   pathPayments: PathPaymentsRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
@@ -80,7 +84,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
 /**
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
- * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables and the path payments.
+ * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the account state history and the path payments.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -100,6 +104,7 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.AmmLiquidity, 'ammLiquidity'],
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
+  [Table.AccountStates, 'accountStates'],
   [Table.PathPayments, 'pathPayments'],
 ];
 
@@ -108,6 +113,7 @@ const pathPaymentParser = new PathPaymentParser();
 const exchangeParser = new ExchangeParser();
 const balanceChangesParser = new BalanceChangesParser();
 const accountsCreatedParser = new AccountsCreatedParser();
+const accountStatesParser = new AccountStatesParser();
 const ammParser = new AmmParser();
 const affectedAccountsParser = new AffectedAccountsParser();
 const fromClientParser = new FromClientParser();
@@ -214,6 +220,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     ammLiquidity: [],
     accountAmmLiquidity: [],
     ammGovernance: [],
+    accountStates: [],
     pathPayments: [],
     diagnostics: { ammUnclassified: 0 },
   };
@@ -538,6 +545,23 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         inception: closeTime,
         genesis_balance: null,
         genesis_index: null,
+      });
+    }
+
+    for (const state of accountStatesParser.parse(t, ctx)) {
+      rows.accountStates.push({
+        account: state.account,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: state.node_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        balance: state.balance,
+        flags: state.flags,
+        sequence: state.sequence,
+        owner_count: state.owner_count,
+        fields: JSON.stringify(state.fields),
+        deleted: state.deleted ? 1 : 0,
       });
     }
   }

@@ -40,7 +40,8 @@ truth are
 
 ## 3. ClickHouse client (API, syncer, `migrate`, `range-ingest`)
 
-Read by `clickHouseConfigFromEnv`. One ClickHouse server holds one database per network.
+Read by `clickHouseConfigFromEnv` (`GH_CLICKHOUSE_SHARED_DATABASE`: `sharedDatabaseFromEnv`). One ClickHouse server holds one database per
+network, and the shared database that the apis of every network read ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -48,6 +49,7 @@ Read by `clickHouseConfigFromEnv`. One ClickHouse server holds one database per 
 | `GH_CLICKHOUSE_USER` | `default` | |
 | `GH_CLICKHOUSE_PASSWORD` | empty | A secret. |
 | `GH_CLICKHOUSE_DATABASE` | the network's name (`xrpl` / `xahau`) | Plain lowercase identifier (`^[a-z_][a-z0-9_]*$`): it is written into DDL. |
+| `GH_CLICKHOUSE_SHARED_DATABASE` | `shared` (also when empty) | The shared database (account names and labels), on the same server: read by the api, created and migrated by `migrate.js shared` (the `migrate-shared` job). Give every api and the job the same name. A plain lowercase identifier, as above: it is written into the SQL. |
 | `GH_CLICKHOUSE_REQUEST_TIMEOUT` | `30000` | Client request timeout, ms. |
 | `GH_CLICKHOUSE_MAX_CONNECTIONS` | `10` | Connections in the client pool. |
 | `GH_CLICKHOUSE_MAX_EXECUTION_TIME` | `30` | `max_execution_time` of every SELECT, seconds; 0 = unlimited. Kills runaway queries. |
@@ -69,6 +71,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_LIVE_CACHE_TTL_MS` | `10000` | How long the live-node answers (balances, orders) are cached in memory; 0 disables the cache. Their `Cache-Control` follows it: `private, max-age=<it in whole seconds>`, `no-store` at 0. |
 | `GH_TX_CACHE_SIZE` | `20000` | Serialized transactions (decoded JSON and binary hex) kept in memory by hash, to spare the codec on repeated requests; a transaction never changes so nothing expires; each entry is a few KB. 0 disables. |
 | `GH_AMENDMENTS_CONFIG` | empty: the file shipped as `config/amendments/<network>.json` | Path of the amendment metadata file (names, descriptions, specifications) behind `/v2/network/amendments`. The syncer reads the same variable ([section 5](#5-syncer-appssyncer)): give both the same file, or the API and the syncer name an amendment differently. Empty counts as the shipped file. |
+| `GH_NAMES_AND_LABELS_RELOAD_MS` | `60000` | How often the api loads the account names and labels of the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`) and the account network names of its network database again, ms; a positive integer. A row the operator inserts shows on `/v2/accounts/{address}` within this time ([operations](operations.md#name-an-address)). Each load reads the whole tables, which are small. |
 | `GH_SERVICE_NAME`, `GH_SERVICE_DESCRIPTION`, `GH_SERVICE_VERSION` | `data-api`, `Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.`, the package version | The title of the Swagger document (read by the toolbox bootstrap; the API fills in the defaults). Optional. The syncer has no Swagger and ignores them. |
 
 ## 5. Syncer (`apps/syncer`)
@@ -133,8 +136,9 @@ variable that is unset in the file is not passed on and the application's own de
 | Service | Variables it gets |
 | --- | --- |
 | `migrate-xrpl`, `migrate-xahau` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_NETWORK` |
+| `migrate-shared` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_CLICKHOUSE_SHARED_DATABASE` |
 | `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG`, `GH_UNL_PUBLISHERS`, `GH_AMENDMENTS_CONFIG`, `GH_ACCOUNT_ROLLUP_MIN_ROWS` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`, `GH_UNL_THRESHOLD`, `GH_UNL_REFRESH_MS`, `GH_DOMAIN_VERIFICATION`, `GH_DOMAIN_RECHECK_MS`, `GH_DOMAIN_FETCH_TIMEOUT_MS`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
-| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`, `GH_AMENDMENTS_CONFIG` (from `XRPL_AMENDMENTS_CONFIG` / `XAHAU_AMENDMENTS_CONFIG`); `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
+| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`, `GH_AMENDMENTS_CONFIG` (from `XRPL_AMENDMENTS_CONFIG` / `XAHAU_AMENDMENTS_CONFIG`); `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`, `GH_NAMES_AND_LABELS_RELOAD_MS`, `GH_CLICKHOUSE_SHARED_DATABASE`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
 | `clickhouse` | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` (from `GH_CLICKHOUSE_USER` / `_PASSWORD`) |
 | `nginx` | `TRUSTED_PROXIES`, and the fixed `NGINX_ENVSUBST_*` of the template |
 

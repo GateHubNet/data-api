@@ -2,12 +2,13 @@
 export * from './clickhouse/clickhouse.config';
 export * from './clickhouse/clickhouse.module';
 export * from './clickhouse/clickhouse.service';
-export { runMigrations } from './clickhouse/migrate';
+export { SHARED_SCHEMA_DIR, runMigrations, runSharedMigrations } from './clickhouse/migrate';
 export type { MigrateOptions, MigrateResult } from './clickhouse/migrate';
 export * from './clickhouse/rows';
 export * from './clickhouse/tables';
 
 // Parsers
+export * from './parsers/account-states.parser';
 export * from './parsers/accounts-created.parser';
 export * from './parsers/affected-accounts.parser';
 export * from './parsers/amm.parser';

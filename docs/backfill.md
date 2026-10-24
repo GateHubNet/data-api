@@ -157,7 +157,7 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
 4. Check:
 
    ```sql
-   -- every ledger from the enablement on is written by parser version 2
+   -- every ledger from the enablement on is written by parser version 2 or later
    SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY parser_version;
    -- how many pools and days the aggregator has built so far
    SELECT uniqExact(amm_account) FROM xrpl.amm_pools;
@@ -167,6 +167,26 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
    `syncer_amm_unclassified_total` counts the pools the parser could not place, and the range-ingest log ends with a warning that names
    the total of the run. A pool whose creation is older than the first ledger you ingested has no `created_ledger` / `created_by`.
 
+### Account state history re-ingest
+
+`PARSER_VERSION` is 3 since the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)): every ledger
+written by version 3 has its `account_states` rows, and a ledger written by an older version has none. The API answers a historical
+read of the state tables (`/v2/accounts/{address}?flags=true` with a ledger named) only above the **newest ledger an older parser
+wrote** (`STATE_PARSER_VERSION`, `StateLedgerService`); a ledger at or below it answers 400 `the date provided is too old`. Gaps in the
+ledger numbers do not matter, only the versions of the stored ledgers do.
+
+So after the deploy, the coverage starts at the first ledger the live syncer writes, and **a single ledger of an older version left
+anywhere above an older range moves the start up to it**. To extend the coverage downwards, re-ingest from the start you want up to the
+live checkpoint with `--reprocess`, as for the AMM data above (the same command, another `--from`; a range that is not committed yet
+needs no `--reprocess`). The state of an account that has not changed since the coverage start is not known: the history spec fills
+the tables back to ledger 32570 with the state of that ledger. Check the coverage start:
+
+```sql
+-- the state tables cover the ledgers above this one (NULL: every stored ledger)
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3;
+```
+
+The API keeps that answer for a minute (`STATE_COVERAGE_CACHE_MS`).
 ### Path payments re-ingest
 
 `PARSER_VERSION` is 4 since the path payments parser (`PATH_PARSER_VERSION`, spec #4). A ledger written by an older version has no

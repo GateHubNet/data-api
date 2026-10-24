@@ -22,17 +22,23 @@
  *  - 1: the Ripple v2 data (payments, exchanges, balance changes, accounts created).
  *  - 2: AMM data (swaps as exchanges, pool states, liquidity, governance). Ledgers from the AMM enablement ledger
  *       (86795265 on mainnet) written with version 1 lack these rows; `--reprocess` rewrites them.
- *  - 3: kept for the account and trust line states of spec #4, which ship with their own constant.
+ *  - 3: account state history (`account_states`). Ledgers written with an older version lack these rows; the state
+ *       tables cover only the ledgers above the last one an older parser wrote (`STATE_PARSER_VERSION`).
  *  - 4: path payments (`path_payments`). Ledgers written with an older version have none; `--reprocess` rewrites them.
  *
  * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
- * `PATH_PARSER_VERSION`), never with `PARSER_VERSION`.
+ * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`), never with `PARSER_VERSION`.
  */
 export const PARSER_VERSION = 4;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
 
+/**
+ * The first parser version that writes the account state history (`account_states`): a ledger written by an older one
+ * lacks its rows. Gates compare with this constant, never with `PARSER_VERSION`, which later features move on.
+ */
+export const STATE_PARSER_VERSION = 3;
 /** The first parser version that writes `path_payments`: a ledger written by an older one lacks them. */
 export const PATH_PARSER_VERSION = 4;
 
@@ -245,6 +251,26 @@ export interface AccountsCreatedRow {
  * it is not; a reader carries the last known value forward. The pair is in Ripple's canonical
  * (base, counter) order, like `exchanges`.
  */
+/**
+ * The state of an account root after a transaction that changed it (migration 005). `balance` is the native balance in
+ * whole units, `fields` the JSON of the node's final fields, `deleted` 1 for the node an AccountDelete removed.
+ */
+export interface AccountStatesRow {
+  account: string;
+  ledger_index: number;
+  tx_index: number;
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  balance: string;
+  flags: number;
+  sequence: number;
+  owner_count: number;
+  fields: string;
+  deleted: number;
+}
+
 export interface AmmPoolStatesRow {
   amm_account: string;
   ledger_index: number;
@@ -913,4 +939,50 @@ export interface SyncerLeaseRow {
   network: string;
   holder: string;
   heartbeat: UnixSecondsMs;
+}
+
+/**
+ * A row of `account_network_names` (`Table.AccountNetworkNames`, migration 009): the name of an address on this network,
+ * with the columns of `account_names` of the shared database. `added_at` defaults to the insert time.
+ */
+export interface AccountNetworkNamesRow {
+  address: string;
+  name: string;
+  /** 1: the row removes the network name of the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
+}
+
+// -- The shared database (ADR-0014, schema-shared/*.sql) ---------------------------------------------------------
+
+/** A row of `account_names` (`SharedTable.AccountNames`): `added_at` defaults to the insert time. */
+export interface AccountNamesRow {
+  address: string;
+  name: string;
+  /** 1: the row removes the name of the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
+}
+
+/** The labels the operator can put on an address: the values of the `Enum8` of `account_labels.label`. */
+export type AccountLabel = 'scam' | 'spam' | 'advisory';
+
+/**
+ * A row of `account_labels` (`SharedTable.AccountLabels`): `source` and `url` default to `''` (none), `added_at` to the
+ * insert time.
+ */
+export interface AccountLabelsRow {
+  address: string;
+  label: AccountLabel;
+  description: string;
+  /** Who says so; `''` when nobody is named. */
+  source: string;
+  /** Where it is said; `''` when there is no link. */
+  url: string;
+  /** 1: the row removes this label from the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
 }

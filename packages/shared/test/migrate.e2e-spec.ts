@@ -2,8 +2,8 @@ import { appendFileSync, copyFileSync, mkdtempSync, readdirSync, readFileSync, r
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
-import { runMigrations } from '../src/clickhouse/migrate';
-import { Table } from '../src/clickhouse/tables';
+import { runMigrations, runSharedMigrations, SHARED_SCHEMA_DIR } from '../src/clickhouse/migrate';
+import { SharedTable, Table } from '../src/clickhouse/tables';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS, TODAY_NOON } from './sample-rows';
 
@@ -85,6 +85,11 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, ledger_index, tx_index, amm_account',
   },
   [Table.AmmGovernance]: { engine: 'ReplacingMergeTree', partition: P7, order: 'amm_account, ledger_index, tx_index' },
+  [Table.AccountStates]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index, node_index',
+  },
   [Table.PathPayments]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
@@ -211,6 +216,7 @@ const SHAPES: Record<Table, Shape> = {
     partition: 'toYear(day)',
     order: 'account, day, base_currency, base_issuer, counter_currency, counter_issuer, version',
   },
+  [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
   [Table.IngestLog]: {
     engine: 'ReplacingMergeTree',
     version: 'updated_at',
@@ -243,6 +249,11 @@ const MIGRATION_003_TABLES: Table[] = [
 /** The fee estimates of the AMM volume's live day set (D2b): one column of `volume_live`. */
 const MIGRATION_004 = '004_amm_fee_estimates.sql';
 
+/** The account state history (spec #4, ticket #9): one ledger-derived table. */
+const MIGRATION_005 = '005_account_states.sql';
+
+/** The account network names the operator writes (ADR-0014, spec #4 ticket #8). */
+const MIGRATION_009 = '009_account_network_names.sql';
 /** The path payments (spec #4, ticket #13): one ledger-derived table. */
 const MIGRATION_007 = '007_path_payments.sql';
 
@@ -267,6 +278,7 @@ const DEDUP_TABLES: Table[] = [
   Table.AmmLiquidity,
   Table.AccountAmmLiquidity,
   Table.AmmGovernance,
+  Table.AccountStates,
   Table.PathPayments,
 ];
 
@@ -1089,14 +1101,15 @@ describe('migrations (e2e)', () => {
         expect(await tableNames()).toContain(Table.UnlPublishers);
         expect(await tableNames()).not.toContain(Table.ValidatorDomains);
 
-        // The real directory: 002 runs again from its first statement and completes, and the files after it are applied
-        // too.
+        // The real directory: 002 runs again from its first statement and completes, and every file after it (003, 004,
+        // 009, ...) is applied too.
         process.env.GH_SCHEMA_DIR = REAL_SCHEMA_DIR;
         const result = await runMigrations({ config, log });
-        expect(result).toEqual({
-          applied: ['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004, MIGRATION_007],
-          skipped: ['001_baseline.sql'],
-        });
+        const after001 = readdirSync(REAL_SCHEMA_DIR)
+          .filter((f) => f.endsWith('.sql') && f !== '001_baseline.sql')
+          .sort();
+        expect(after001.slice(0, 3)).toEqual(['002_validators_amendments.sql', MIGRATION_003, MIGRATION_004]);
+        expect(result).toEqual({ applied: after001, skipped: ['001_baseline.sql'] });
 
         // Every statement took effect: the ten tables, and the columns the two ALTERs added.
         const names = await tableNames();
@@ -1254,6 +1267,97 @@ describe('migrations (e2e)', () => {
       }
     });
   });
+
+  describe('migration 009', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-009-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 009 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_009_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_009);
+      expect(realFiles()).toContain(MIGRATION_009);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.AccountNetworkNames);
+
+      copyReal([MIGRATION_009]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_009], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.AccountNetworkNames);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+  describe('migration 005', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-005-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 005 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_005_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_005);
+      expect(realFiles()).toContain(MIGRATION_005);
+      const exists = async () =>
+        admin.query<{ name: string }>(
+          `SELECT name FROM system.tables WHERE database = {db:String} AND name = {t:String}`,
+          { db: config.database, t: Table.AccountStates },
+        );
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await exists()).toEqual([]);
+
+      copyReal([MIGRATION_005]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_005], skipped: before });
+      expect(await exists()).toEqual([{ name: Table.AccountStates }]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
   describe('migration 007', () => {
     const realFiles = () =>
       readdirSync(REAL_SCHEMA_DIR)
@@ -1311,5 +1415,114 @@ describe('migrations (e2e)', () => {
         await svc.onModuleDestroy();
       }
     });
+  });
+});
+
+/** The migration set of the shared database (ADR-0014): what the operator writes about an address, on every network. */
+const sharedFiles = () =>
+  readdirSync(SHARED_SCHEMA_DIR)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+const SHARED_002 = '002_account_labels.sql';
+
+describe('the shared database (e2e)', () => {
+  let ch: StartedClickHouse;
+  let admin: ClickHouseService;
+  const log = () => undefined;
+
+  beforeAll(async () => {
+    ch = await startClickHouse();
+    admin = new ClickHouseService(ch.config);
+  });
+
+  afterAll(async () => {
+    await admin?.onModuleDestroy();
+    await ch?.container.stop();
+  });
+
+  const tablesOf = async (database: string): Promise<string[]> =>
+    (
+      await admin.query<{ name: string }>('SELECT name FROM system.tables WHERE database = {db:String} ORDER BY name', {
+        db: database,
+      })
+    ).map((r) => r.name);
+
+  it('creates the shared database with exactly the tables of SharedTable (plus schema_migrations)', async () => {
+    const config = { ...ch.config, database: 'shared' };
+    expect(await runSharedMigrations({ config, log })).toEqual({ applied: sharedFiles(), skipped: [] });
+    expect(await tablesOf('shared')).toEqual([...Object.values(SharedTable), 'schema_migrations'].sort());
+    expect(await runSharedMigrations({ config, log })).toEqual({ applied: [], skipped: sharedFiles() });
+  });
+
+  describe('account labels', () => {
+    let svc: ClickHouseService;
+    const labelRow = (address: string, label: string) => ({
+      address,
+      label,
+      description: 'Reported by victims',
+      source: '',
+      url: '',
+      removed: 0,
+      added_by: 'ops@gatehub.net',
+    });
+
+    beforeAll(async () => {
+      const config = { ...ch.config, database: 'shared_labels' };
+      await runSharedMigrations({ config, log });
+      svc = new ClickHouseService(config);
+    });
+
+    afterAll(async () => {
+      await svc?.onModuleDestroy();
+    });
+
+    it('takes the labels scam, spam and advisory', async () => {
+      await svc.insert(
+        SharedTable.AccountLabels,
+        ['scam', 'spam', 'advisory'].map((label) => labelRow('rLabelled', label)),
+      );
+      const rows = await svc.query<{ label: string }>(
+        `SELECT toString(label) AS label FROM ${SharedTable.AccountLabels} WHERE address = 'rLabelled'`,
+      );
+      expect(rows.map((r) => r.label).sort()).toEqual(['advisory', 'scam', 'spam']);
+    });
+
+    it('rejects a misspelt label, in a typed insert and in the operator SQL insert', async () => {
+      // The client logs the rejected insert; the rejection itself is what is under test.
+      const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        await expect(svc.insert(SharedTable.AccountLabels, [labelRow('rMisspelt', 'scma')])).rejects.toThrow();
+        await expect(
+          svc.command(
+            `INSERT INTO ${SharedTable.AccountLabels} (address, label, description, added_by)
+             VALUES ('rMisspelt', 'Scam', 'the wrong case', 'ops@gatehub.net')`,
+          ),
+        ).rejects.toThrow();
+      } finally {
+        logged.mockRestore();
+      }
+      expect(await svc.query(`SELECT address FROM ${SharedTable.AccountLabels} WHERE address = 'rMisspelt'`)).toEqual(
+        [],
+      );
+    });
+  });
+
+  it('applies 002 to a shared database migrated before it, and then nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-schema-shared-002-'));
+    const config = { ...ch.config, database: 'shared_002_after' };
+    try {
+      const before = sharedFiles().filter((f) => f < SHARED_002);
+      expect(before).toEqual(['001_account_names.sql']);
+      for (const f of before) copyFileSync(join(SHARED_SCHEMA_DIR, f), join(dir, f));
+      expect(await runMigrations({ config, log, schemaDir: dir })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(SharedTable.AccountLabels);
+
+      copyFileSync(join(SHARED_SCHEMA_DIR, SHARED_002), join(dir, SHARED_002));
+      expect(await runMigrations({ config, log, schemaDir: dir })).toEqual({ applied: [SHARED_002], skipped: before });
+      expect(await tablesOf(config.database)).toContain(SharedTable.AccountLabels);
+      expect(await runMigrations({ config, log, schemaDir: dir })).toEqual({ applied: [], skipped: sharedFiles() });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

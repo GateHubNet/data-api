@@ -24,13 +24,25 @@ export interface ClickHouseConfig {
 /** Database names are interpolated into DDL, so only plain lowercase identifiers are accepted. */
 const DATABASE_NAME = /^[a-z_][a-z0-9_]*$/;
 
-export function assertValidDatabaseName(database: string): string {
+export function assertValidDatabaseName(database: string, variable = 'GH_CLICKHOUSE_DATABASE'): string {
   if (!DATABASE_NAME.test(database)) {
-    throw new Error(
-      `Invalid ClickHouse database name "${database}" (GH_CLICKHOUSE_DATABASE must match ${DATABASE_NAME})`,
-    );
+    throw new Error(`Invalid ClickHouse database name "${database}" (${variable} must match ${DATABASE_NAME})`);
   }
   return database;
+}
+
+/** The name of the shared database when `GH_CLICKHOUSE_SHARED_DATABASE` is not set. */
+export const DEFAULT_SHARED_DATABASE = 'shared';
+
+/**
+ * The shared database (ADR-0014): the one database on the server that the apis of every network read, which holds what
+ * belongs to an address on every network (account names, labels). `GH_CLICKHOUSE_SHARED_DATABASE`, or `shared`.
+ */
+export function sharedDatabaseFromEnv(env: NodeJS.ProcessEnv = process.env): string {
+  return assertValidDatabaseName(
+    env.GH_CLICKHOUSE_SHARED_DATABASE || DEFAULT_SHARED_DATABASE,
+    'GH_CLICKHOUSE_SHARED_DATABASE',
+  );
 }
 
 /**
