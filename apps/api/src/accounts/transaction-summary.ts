@@ -1,4 +1,5 @@
 import {
+  AccountFlag,
   amountToValueString,
   deliveredAmount,
   dropsToNative,
@@ -19,8 +20,10 @@ import { fmtTxDate } from '../common/format';
  *  - `counterparty`, `amount`, `currency`, `issuer`: from the mapping of the transaction type (`SIDES`), from the
  *    account's side. Amounts are exact decimal strings in whole units; the native currency has no issuer;
  *  - `fee`: in whole units of the native currency, on the transactions the account sent only;
- *  - `flags_changed`: the account flags the transaction set or cleared. Empty: the account state history that tells it
- *    is not recorded yet.
+ *  - `flags_changed`: the account flags of the account that the transaction set (`+Name`) or cleared (`-Name`), with the
+ *    network's flag names, separated by a space: the set ones first, then the cleared ones, each in the order of their
+ *    bits. Empty when the transaction changed none, or when no account state of the account was recorded for it
+ *    (`AccountStateOfTx`).
  */
 export interface TransactionSummary {
   hash: string;
@@ -128,8 +131,55 @@ const SIDES: Record<string, (seen: Seen) => Side | undefined> = {
   TrustSet: trustSetSide,
 };
 
+/**
+ * The state of the account that a transaction wrote in the account state history (`account_states`): its account root
+ * after the transaction, and where that node is in the transaction's metadata.
+ */
+export interface AccountStateOfTx {
+  /** The position of the AccountRoot node in `meta.AffectedNodes`. */
+  node_index: number;
+  /** `Flags` after the transaction. */
+  flags: number;
+}
+
+/**
+ * The account flags before the transaction: the `PreviousFields` of the account's node in the stored metadata. A node
+ * modified without `Flags` there kept its flags; a created node had none (the account did not exist).
+ */
+function flagsBefore(meta: Json, state: AccountStateOfTx): number {
+  const entry: Json | undefined = meta.AffectedNodes?.[state.node_index];
+  if (entry?.CreatedNode) return 0;
+  const node: Json | undefined = entry?.ModifiedNode ?? entry?.DeletedNode;
+  const previous: unknown = node?.PreviousFields?.Flags;
+  return typeof previous === 'number' ? previous : state.flags;
+}
+
+/**
+ * `+Name` for each flag set from `before` to `after` and `-Name` for each one cleared, the set ones first, each in the
+ * order of the list; `null` when none changed. A bit the network does not name is left out.
+ */
+export function flagChanges(before: number, after: number, names: readonly AccountFlag[]): string | null {
+  const isSet = (flags: number, bit: number): boolean => ((flags >>> 0) & bit) >>> 0 === bit;
+  const set = names.filter(({ bit }) => !isSet(before, bit) && isSet(after, bit)).map(({ name }) => `+${name}`);
+  const cleared = names.filter(({ bit }) => isSet(before, bit) && !isSet(after, bit)).map(({ name }) => `-${name}`);
+  const changes = [...set, ...cleared];
+  return changes.length > 0 ? changes.join(' ') : null;
+}
+
+/** What a summary row needs besides the stored transaction: the account flags the network names, and the account's state. */
+export interface SummaryContext {
+  ctx: ParseContext;
+  flagNames: readonly AccountFlag[];
+  /** The account's state written by this transaction; none when it changed nothing of the account root. */
+  state?: AccountStateOfTx;
+}
+
 /** The summary row of a stored transaction, from the side of `account`. */
-export function toTransactionSummary(row: TransactionsRow, account: string, ctx: ParseContext): TransactionSummary {
+export function toTransactionSummary(
+  row: TransactionsRow,
+  account: string,
+  { ctx, flagNames, state }: SummaryContext,
+): TransactionSummary {
   const tx = JSON.parse(row.tx_json) as Json;
   const meta = JSON.parse(row.meta_json) as Json;
   const initiator = row.account === account;
@@ -146,6 +196,6 @@ export function toTransactionSummary(row: TransactionsRow, account: string, ctx:
     currency: side.currency ?? null,
     issuer: side.issuer ?? null,
     fee: initiator ? dropsToNative(row.fee) : null,
-    flags_changed: null,
+    flags_changed: state ? flagChanges(flagsBefore(meta, state), state.flags, flagNames) : null,
   };
 }

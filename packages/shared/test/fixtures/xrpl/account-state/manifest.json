@@ -1,8 +1,8 @@
 {
   "network": "xrpl",
   "endpoint": "wss://s2.ripple.com",
-  "recorded_at": "2026-10-24T15:00:11.899Z",
-  "validated_head": 107873595,
+  "recorded_at": "2026-10-24T20:32:31.427Z",
+  "validated_head": 107878622,
   "scan_limit": 0,
   "scanned": 0,
   "skipped": [],
@@ -85,6 +85,11 @@
     "49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5": {
       "ledger": 104566926,
       "type": "TrustSet",
+      "result": "tesSUCCESS"
+    },
+    "830AAB3C1759461BFBC1FB8203482940F1A8B771A43484EFD1CEA83ACED4DF0D": {
+      "ledger": 107863820,
+      "type": "AccountSet",
       "result": "tesSUCCESS"
     }
   },
@@ -178,6 +183,12 @@
       "hash": "49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5",
       "type": "TrustSet",
       "note": "rsMeJ5p6qzVARADTYhvZbHqwkfyN18U2XH sets the limit back to 0: the line is a DeletedNode"
+    },
+    "accountset_clears_flag": {
+      "ledger": 107863820,
+      "hash": "830AAB3C1759461BFBC1FB8203482940F1A8B771A43484EFD1CEA83ACED4DF0D",
+      "type": "AccountSet",
+      "note": "rU5nUwkBUPx3MFPQSHmMnr9S9yg4g8cKLc clears RequireAuth with ClearFlag 2 (0x408C0000 to 0x40880000)"
     }
   },
   "ledgers": [
@@ -245,6 +256,11 @@
       "ledger": 107671593,
       "bytes": 486638,
       "gzipBytes": 99292
+    },
+    {
+      "ledger": 107863820,
+      "bytes": 144032,
+      "gzipBytes": 28451
     },
     {
       "ledger": 107872956,

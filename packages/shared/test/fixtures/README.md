@@ -180,6 +180,12 @@ flags before and after it. The hashes were found with `account_tx` on each accou
 | `payment_clears_password_spent` | 107872958 | `53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D` | A Payment of XRP to it clears PasswordSpent (0x10000 to 0): a flag changed by another type |
 | `before_account_delete` | 107670694 | `EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C` | The last change of `r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC` before it is deleted |
 | `account_delete` | 107671593 | `8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D` | AccountDelete: the account root is a `DeletedNode` (the ledger is also in `xrpl/recorded/`) |
+| `accountset_clears_flag` | 107863820 | `830AAB3C1759461BFBC1FB8203482940F1A8B771A43484EFD1CEA83ACED4DF0D` | AccountSet `ClearFlag` 2: `rU5nUwkBUPx3MFPQSHmMnr9S9yg4g8cKLc` clears RequireAuth (0x408C0000 to 0x40880000) |
+
+`accountset_clears_flag` was added later (2026-10-24, head 107878622, `--txs` and `--delay-ms 500`, 28 KB gzipped) for the
+`flags_changed` column of the account transactions CSV (`apps/api/test/account-transactions.e2e-spec.ts`). It was found by walking
+expanded ledgers back from 107871300 for an AccountSet whose account root lost a flag bit; it was the first, 7480 ledgers back. The
+CSV takes the flags before it from the node's `PreviousFields`, so no earlier ledger of that account was recorded.
 
 Flag changes are rare: of the 1500 ledgers before the head (107871708 to 107873207), five Payments cleared PasswordSpent and one
 account made the only four AccountSets that changed flags. The AccountSet case comes instead from the history of `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV`, an

@@ -194,7 +194,7 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
 `GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
 `GET /v2/network/validators/{key}/validations`, `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
-[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), `GET /v2/path_payments` (the [path payments](#path-payments) of the
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54, whose `flags_changed` comes from the account state history, item 64), `GET /v2/path_payments` (the [path payments](#path-payments) of the
 network, spec #4) and `GET /v2/accounts/{address}/path_payments` (those of an account). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
@@ -869,7 +869,7 @@ columns, the same on every page and in this order:
 | `initiator` | `true` when the account sent the transaction (its `Account`), `false` when the transaction only affected it. |
 | `counterparty`, `amount`, `currency`, `issuer` | From one mapping per transaction type, below. Empty where the type has none. |
 | `fee` | The fee in whole units of the native currency, on the transactions the account sent; empty on the others. |
-| `flags_changed` | The account flags the transaction set or cleared. Empty for now: it fills once the account state history is recorded. |
+| `flags_changed` | The account flags of the account that the transaction set (`+Name`) or cleared (`-Name`), below. Empty when it changed none. |
 
 | Type | `counterparty` | `amount`, `currency`, `issuer` |
 | --- | --- | --- |
@@ -880,9 +880,21 @@ columns, the same on every page and in this order:
 Amounts are exact decimal strings in whole units, as on the ledger; the native currency is `XRP` or `XAH` and has no issuer.
 A page with no transactions is an empty file.
 
+`flags_changed` is filled for **every transaction type** that changed the account's flags, sent by the account or not: an
+`AccountSet`, but also a `SetRegularKey` that sets `PasswordSpent`, a `Payment` of the native currency that clears it, or the
+`AMMCreate` that creates an AMM account with its flags. It is read from the account state history
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)): the account's state that the transaction wrote, against its flags
+just before (the `PreviousFields` of the same account root in the metadata; an account the transaction created had none). The flags
+carry the network's names, as `flags=true` on [`/v2/accounts/{address}`](#get-v2accountsaddress) gives them (the XRP Ledger and
+Xahau differ), without the `lsf` prefix, separated by a space: the set ones first, then the cleared ones, each in the order of
+their bits (`+DisableMaster +DefaultRipple +DepositAuth`, `+RequireAuth -DisallowXRP`). A bit the network does not name is left out.
+A transaction in a ledger written by a parser that did not record the state history yet (before parser version 3) has no state
+row, so its `flags_changed` is empty until the ledger is re-ingested ([backfill](backfill.md)).
+
 ```csv
 "hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"
 "91F79AC2…","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","r4L6Z…","2","EUR","rMwjY…","0.012",""
+"25D5F48C…","93663330","2025-01-24T00:36:50+00:00","AccountSet","tesSUCCESS","true","","","","","0.00001","+DefaultRipple"
 ```
 
 ### `GET /v2/accounts/{address}/transactions/{sequence}`

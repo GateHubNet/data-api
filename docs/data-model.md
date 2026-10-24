@@ -330,7 +330,9 @@ account's prefix. **Coverage**: the table holds the state of ledger L when every
 later (gaps in the ledger numbers do not matter), so it starts above the newest ledger an older parser wrote, and an account that has
 not changed since then has no row yet; the history spec fills it back to ledger 32570. Read by `/accounts/{a}?flags=true` and
 `/accounts/{a}/balances` (the native balance) with a ledger named, through `AccountStatesService` (`StateLedgerService` resolves the
-ledger and checks the coverage).
+ledger and checks the coverage), and by the CSV of `/accounts/{a}/transactions`, whose `flags_changed` compares the row a
+transaction wrote for the account with the account's `Flags` in that node's `PreviousFields` (the node of `node_index` in the
+stored metadata), so it needs no earlier row.
 
 ### `trust_line_states` (P7, `ORDER BY (account, counterparty, currency, ledger_index, tx_index, node_index)`)
 The trust line state history (ADR-0015, migration 006): for every trust line a transaction changed, two rows, one per account of the

@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 72).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -271,6 +271,12 @@ addition: what the original served is served as before. Names and labels are ser
     item 60 apply: a ledger this API does not hold or the state history does not cover is 400 `the date provided is too old`, an
     account with no state at the ledger or deleted at or before it 404 `account not found`. No ledger named, `validated`, `closed`
     and `current` still read the node, as does every ledger of `/orders`.
+64. **`flags_changed` in the account transactions CSV.** The original had no CSV (item 54) and no account state. Here the
+    `flags_changed` cell of a summary row lists the account flags of the account that the transaction set (`+Name`) or cleared
+    (`-Name`), with the network's names (item 59), the set ones first, then the cleared ones, each in the order of their bits, for
+    every transaction type and whether the account sent the transaction or not. It is read from the account state history: the
+    account's state that the transaction wrote, against its flags in that node's `PreviousFields`. A transaction that changed none, or
+    whose ledger was written before the state history was recorded, leaves it empty. The JSON list is unchanged.
 
 Kept from the original: the JSON answers of the routes it had, their parameters and their messages (`Account not found` and `unable to get accounts`). No new message: with `flags=true` the 400s of `/balances` (`invalid date format`, `invalid ledger hash`, `the date provided is too old`) and its 404 `account not found` apply, and `/balances` at a historical ledger keeps its own; `/trustlines` answers the 400s of `/balances` and of the paged lists (`invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`, `the date provided is too old`), and 500 `unable to retrieve trustlines`. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#get-v2accountsaddresstransactions), [api-reference](../api-reference.md#get-v2accountsaddress), [api-reference](../api-reference.md#get-v2accountsaddressbalances) and [api-reference](../api-reference.md#get-v2accountsaddresstrustlines).
 

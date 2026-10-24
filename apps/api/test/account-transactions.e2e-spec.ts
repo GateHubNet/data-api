@@ -35,7 +35,9 @@ import { expectBoundedInOrderRead, isPageRead } from './support/plans';
  * transactions; `format=csv` here is one summary row per transaction from the account's side (spec #4, ticket #5),
  * checked against rows worked out by hand from the recorded ledgers (a sent, a received, an issued currency and a failed
  * payment, a TrustSet from both sides, an OfferCreate, transactions that only affected the account, XAH on Xahau), with
- * the parameters and the paging of the JSON list.
+ * the parameters and the paging of the JSON list. Its `flags_changed` (ticket #12) is checked on the account state
+ * ledgers (`xrpl-account-state`): AccountSets setting and clearing flags, flags changed by other types, and transactions
+ * that changed none.
  */
 
 const ACCOUNT = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B'; // only ever a recipient (offers and payments reach it)
@@ -1556,6 +1558,103 @@ describe('account transactions API endpoint, format=csv on recorded mainnet ledg
         `"622618838E6DD7EDC9D029183473EC76BFBF6F7BE05F0FE33DB6C7049C196CB6","107671607","2026-10-15T11:20:20+00:00","TrustSet","tesSUCCESS","false","${USD_HOLDER}","1.30729","USD","${USD_ISSUER}","",""`,
       ].join('\n'),
     );
+  });
+});
+
+describe('account transactions API endpoint, format=csv: the account flags a transaction set or cleared', () => {
+  /** Created in 93663329; AccountSet sets DefaultRipple in 93663330; SetRegularKey, then AccountSet DisableMaster in 93663334. */
+  const ISSUER = 'rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV';
+  /** Clears RequireAuth with an AccountSet in 107863820. */
+  const CLEARS = 'rU5nUwkBUPx3MFPQSHmMnr9S9yg4g8cKLc';
+  /** PasswordSpent; a Payment of XRP to it (from PAYER) clears the flag in 107872958. */
+  const SPENT = 'rheEvN3wAWbnPwnnsisiJzUqqKqoUC14tw';
+  const PAYER = 'rEYLNoaQM5bCMUNhrsvMasTMQ1YgZz5hzT';
+  /** Created by an AMMCreate in 93663330 with DisableMaster, DefaultRipple and DepositAuth (0x1900000). */
+  const AMM_ACCOUNT = 'rGuYK1v7kyrKEa86wPN2M9CHpT9LiWFr5m';
+  /** Changed in 107670694; deletes itself with AccountDelete in 107671593. */
+  const DELETED = 'r3CgerzsDtZhh3ejvDjZJUKqXqRVWQcnNC';
+  let h: Harness;
+  let get: ApiClient['get'];
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-account-state' });
+    get = (await h.api()).get;
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  /** `hash: flags_changed` of every line of the account's CSV, in the order of the file. */
+  const flagsChangedOf = async (account: string): Promise<Record<string, string>> => {
+    const res = await get(`${listPath(account)}?format=csv&limit=1000`);
+    expect([res.status, res.headers['content-type']]).toEqual([200, expect.stringMatching(/^text\/csv/)]);
+    const [header, ...rows] = (res.text as string).split('\n');
+    expect(header.split(',').at(-1)).toBe('"flags_changed"');
+    return Object.fromEntries(
+      rows.map((line) => [JSON.parse(line.split(',')[0]) as string, JSON.parse(line.split(',').at(-1) as string)]),
+    );
+  };
+
+  it('an AccountSet that sets a flag: +DefaultRipple, in the last cell of its row', async () => {
+    const res = await get(`${listPath(ISSUER)}?format=csv&type=AccountSet&limit=1`);
+    expect(res.text.split('\n')[1]).toBe(
+      `"25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10","93663330","2025-01-24T00:36:50+00:00","AccountSet","tesSUCCESS","true","","","","","0.00001","+DefaultRipple"`,
+    );
+  });
+
+  it('an AccountSet that clears a flag: -RequireAuth, the flags it kept are not listed', async () => {
+    // ClearFlag 2 (asfRequireAuth): 0x408C0000 to 0x40880000; DisallowXRP, DefaultRipple and AllowTrustLineLocking stay set
+    const res = await get(`${listPath(CLEARS)}?format=csv&type=AccountSet&limit=1`);
+    expect(res.text.split('\n')[1]).toBe(
+      `"830AAB3C1759461BFBC1FB8203482940F1A8B771A43484EFD1CEA83ACED4DF0D","107863820","2026-10-24T04:23:12+00:00","AccountSet","tesSUCCESS","true","","","","","0.000012","-RequireAuth"`,
+    );
+  });
+
+  it("the account's whole history: only the transactions that changed its flags say so, each the flags it changed", async () => {
+    const changed = await flagsChangedOf(ISSUER);
+    // a Payment creates the account, with no flags; the AMMCreate and the payments of its tokens change none
+    expect(Object.keys(changed).length).toBeGreaterThan(10);
+    expect(changed['4DCBF02D75CF484B385F667B75A8871B843E6C9E8C8D483248693A5A6E75F0A2']).toBe('');
+    expect(Object.fromEntries(Object.entries(changed).filter(([, flags]) => flags !== ''))).toEqual({
+      '25D5F48CFECC3987AC6402778D123E9955E4340E8FC30156657A0C4153AD1E10': '+DefaultRipple',
+      // SetRegularKey without a fee sets PasswordSpent: a flag changed by another transaction type
+      DD0B4FC1AA4D8A4E0FBEDFD591828A932FE6111F87FD5DA71CC25214075FCF42: '+PasswordSpent',
+      '387FDEDC0589354E8E27D7312AC4C8D52118208F933C1A9FA95F93D56775FE1E': '+DisableMaster',
+    });
+  });
+
+  it('a Payment the account only received clears a flag: -PasswordSpent', async () => {
+    expect(await flagsChangedOf(SPENT)).toEqual({
+      // a Batch it sent, which changed its balance and sequence but no flag
+      F96ADF5D4D59B6BA82E9FA85EF266948FBE461A5220B2CB1C889A36F4837DBB4: '',
+      '53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D': '-PasswordSpent',
+    });
+  });
+
+  it("a transaction that changed none of the account's flags: the sender of that Payment", async () => {
+    const changed = await flagsChangedOf(PAYER);
+    expect(changed['53E513967FF6114B8D7131E6E882D41A457692E7D05CB363270D55F30F385B2D']).toBe('');
+    expect(Object.values(changed).filter((flags) => flags !== '')).toEqual([]);
+  });
+
+  it('an account created with flags lists them as set: the AMM account of an AMMCreate', async () => {
+    const changed = await flagsChangedOf(AMM_ACCOUNT);
+    expect(changed['55557156B32B2B63B6BF558721FDD080B24F302EBE78AD7D60218FD5C2E493FA']).toBe(
+      '+DisableMaster +DefaultRipple +DepositAuth',
+    );
+  });
+
+  it('an AccountDelete: the deleted account root changed no flag', async () => {
+    expect(await flagsChangedOf(DELETED)).toEqual({
+      EE8547C7070DFB9C2249EAF693B77C1253858317F5132F058EEE267199F8828C: '',
+      '8F2DCA944394B29981E24DDD6C46192C404D90F7F5FC4EAB6813B0AFD7751A2D': '',
+    });
+  });
+
+  it('the JSON list is unchanged: no flags_changed there', async () => {
+    const res = await get(`${listPath(ISSUER)}?limit=1000`);
+    expect(res.status).toBe(200);
+    expect(res.text).not.toContain('flags_changed');
   });
 });
 

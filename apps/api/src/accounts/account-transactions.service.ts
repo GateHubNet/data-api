@@ -1,4 +1,6 @@
 import {
+  AccountFlag,
+  accountFlagsOf,
   ClickHouseService,
   NetworkProfile,
   ParseContext,
@@ -11,7 +13,7 @@ import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
 import { TxObject, TxService } from '../common/tx-object';
 import { NETWORK_PROFILE } from '../config/api.config';
-import { toTransactionSummary, TransactionSummary } from './transaction-summary';
+import { AccountStateOfTx, toTransactionSummary, TransactionSummary } from './transaction-summary';
 
 /** The highest `Sequence` a transaction can have: the column is a UInt32. */
 const MAX_SEQUENCE = 4_294_967_295;
@@ -116,6 +118,7 @@ interface SequenceKey extends TimeKey {
 @Injectable()
 export class AccountTransactionsService {
   private readonly ctx: ParseContext;
+  private readonly flagNames: readonly AccountFlag[];
 
   constructor(
     private readonly ch: ClickHouseService,
@@ -124,6 +127,7 @@ export class AccountTransactionsService {
     @Inject(NETWORK_PROFILE) profile: NetworkProfile,
   ) {
     this.ctx = parseContextFor(profile);
+    this.flagNames = accountFlagsOf(profile);
   }
 
   /** One page of the transactions that affect the account in a time window. */
@@ -275,14 +279,53 @@ export class AccountTransactionsService {
 
   /**
    * The transactions of a page of keys, in their order, in the form asked for. An object carries no `ledger_hash`: the
-   * original never asked for it on these routes. A summary row is read from the stored transaction, without the codec.
+   * original never asked for it on these routes. A summary row is read from the stored transaction, without the codec,
+   * and from the account's states that the page's transactions wrote (`statesOf`).
    */
   private async page(keys: TimeKey[], marker: string | undefined, q: ListQuery): Promise<TransactionsPage> {
+    if (q.form === 'summary') {
+      const [rows, states] = await Promise.all([this.txs.fetchByKeys(keys), this.statesOf(q.account, keys)]);
+      const transactions = rows.map((row) =>
+        toTransactionSummary(row, q.account, {
+          ctx: this.ctx,
+          flagNames: this.flagNames,
+          state: states.get(`${row.ledger_index}:${row.tx_index}`),
+        }),
+      );
+      return { transactions, ...(marker !== undefined && { marker }) };
+    }
     const rows = await this.txs.fetchByKeys(keys);
-    const transactions =
-      q.form === 'summary'
-        ? rows.map((row) => toTransactionSummary(row, q.account, this.ctx))
-        : await this.txs.toTxObjects(rows, { binary: q.form === 'binary' });
+    const transactions = await this.txs.toTxObjects(rows, { binary: q.form === 'binary' });
     return { transactions, ...(marker !== undefined && { marker }) };
+  }
+
+  /**
+   * The state of the account that each transaction of the page wrote in the account state history, by
+   * `ledger_index:tx_index`. A transaction that changed nothing of the account root, or that a parser older than
+   * `STATE_PARSER_VERSION` wrote, has none. The account prefix and the page's range of ledgers bound the read to the
+   * page; a row written twice is the same row.
+   */
+  private async statesOf(account: string, keys: TimeKey[]): Promise<Map<string, AccountStateOfTx>> {
+    if (keys.length === 0) return new Map();
+    const ledgers = keys.map((k) => k.ledger_index);
+    const rows = await this.ch.query<AccountStateOfTx & TimeKey>(
+      `SELECT ledger_index, tx_index, node_index, flags
+         FROM ${Table.AccountStates}
+        WHERE account = {account:String}
+          AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
+          AND (ledger_index, tx_index) IN (
+              SELECT tupleElement(key, 1), tupleElement(key, 2)
+                FROM (SELECT arrayJoin(arrayZip({ledgers:Array(UInt32)}, {indexes:Array(UInt32)})) AS key))`,
+      {
+        account,
+        min: Math.min(...ledgers),
+        max: Math.max(...ledgers),
+        ledgers,
+        indexes: keys.map((k) => k.tx_index),
+      },
+    );
+    return new Map(
+      rows.map((row) => [`${row.ledger_index}:${row.tx_index}`, { node_index: row.node_index, flags: row.flags }]),
+    );
   }
 }
