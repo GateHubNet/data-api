@@ -30,6 +30,16 @@ export const EXPORT_REQUEST_TIMEOUT_MS = 60_000;
 /** A list that has still a next page after this many is walked no further: the job fails. */
 export const EXPORT_MAX_PAGES = 100_000;
 
+/**
+ * The header of the api's CSV answers that says how the whole list is read (`marker`, `limit=all`, `whole`, `none`; see
+ * the api's `csv.interceptor.ts`). An answer without it (an older api) is walked by its markers.
+ */
+export const LIST_PAGING_HEADER = 'x-list-paging';
+
+/** Why an export of a list that has a limit but neither pages nor `limit=all` fails: it would be cut, silently. */
+const NOT_WHOLE =
+  'the list has no pages and cannot be read whole (no marker, no limit=all): an export would cut it at its limit';
+
 /** A file to upload: its bytes and how it is served. */
 export interface ExportOutput {
   body: Readable;
@@ -348,7 +358,18 @@ export class ExportWorker {
       if (!(res.headers.get('content-type') ?? '').startsWith('text/csv')) {
         throw new ExportFailure('the list did not answer a CSV');
       }
-      if (page === 0) disposition = res.headers.get('content-disposition');
+      if (page === 0) {
+        // how the list is read whole (`X-List-Paging` of the api's CSV answers)
+        const paging = res.headers.get(LIST_PAGING_HEADER);
+        if (paging === 'none') throw new ExportFailure(NOT_WHOLE);
+        if (paging === 'limit=all' && url.searchParams.get('limit') !== 'all') {
+          // a list without pages: its first answer was cut at the page size, so it is asked for whole
+          url.searchParams.set('limit', 'all');
+          page--;
+          continue;
+        }
+        disposition = res.headers.get('content-disposition');
+      }
       await file.add(text);
       if (file.rows > cap) throw new ExportFailure(tooManyExportRows(format, cap));
       const marker = nextMarker(res.headers.get('link'));

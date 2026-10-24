@@ -40,7 +40,7 @@ export class AccountBalancesController {
 
   @Get(':address/balances')
   @RippleRoute('unable to retrieve balances')
-  @Csv((req) => `${req.params.address} - balances`, 'balances')
+  @Csv((req) => `${req.params.address} - balances`, 'balances', { limitAll: true })
   @ApiOperation({
     summary: 'Get the balances of an account',
     description:

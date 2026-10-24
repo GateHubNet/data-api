@@ -593,11 +593,22 @@ describe('exports of a list at a ledger that names none', () => {
   it('a CSV of /balances is the balances at the newest indexed ledger, from the state history and not the node', async () => {
     const path = `/v2/accounts/${TUJ_ISSUER}/balances`;
     const job = await exportOf(path, 'csv');
-    expect([job.status, job.error]).toEqual(['done', undefined]);
-    // the list has no marker: the export is its one page, of the exporter's page size (2 here)
-    const expected = await get(`${path}?ledger_index=${NEWEST + 1}&format=csv&limit=2`);
+    // the list has no marker: the export reads it whole with limit=all, not one page of the exporter's size (2 here)
+    expect([job.status, job.error, job.rows]).toEqual(['done', undefined, 10]);
+    const expected = await get(`${path}?ledger_index=${NEWEST + 1}&format=csv&limit=all`);
     expect(expected.status).toBe(200);
+    expect(expected.text.split('\n')).toHaveLength(11);
     expect(storage.download(job.url).body).toBe(expected.text);
+  });
+
+  it('fails an export of a list that neither pages nor takes limit=all, rather than cut it at its limit', async () => {
+    const path = `/v2/accounts/${TUJ_ISSUER}/analytics/counterparties?start=2015-01-01&end=2027-01-01`;
+    const job = await exportOf(path, 'csv');
+    expect([job.status, job.error, job.url]).toEqual([
+      'failed',
+      'the list has no pages and cannot be read whole (no marker, no limit=all): an export would cut it at its limit',
+      undefined,
+    ]);
   });
 
   it('a path that names a ledger, or a list over time, keeps what it names', async () => {

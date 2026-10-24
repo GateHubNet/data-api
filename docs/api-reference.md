@@ -3250,6 +3250,12 @@ names `min_sequence` or `max_sequence` (the account transactions by sequence): t
 `/trustlines`, `/orders`) may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`)
 names none. The other parameters are not checked here: a list that refuses them makes a failed export, which says why.
 
+**The whole list.** Every CSV answer says in `X-List-Paging` how its whole list is read: `marker` (page by page), `limit=all`
+(`/balances` and `/orders`, which have no marker: the exporter asks for `limit=all`), `whole` (the route has no `limit`), or
+`none` (a `limit` and neither a marker nor `limit=all`, such as the account analytics and `/v2/network/markets`). An export of a
+`none` list fails with `the list has no pages and cannot be read whole (no marker, no limit=all): an export would cut it at its
+limit`, rather than hold only its first answer.
+
 **One ledger.** When the path of a list at a point in time names no ledger (no `ledger_hash`, `date` or numeric `ledger_index`;
 a word such as `validated` names none), the exporter takes the newest ledger this API has indexed when it starts the export
 (`GET /v2/ledgers`) and names it as `ledger_index` on every page it walks, so the file is that one ledger even when newer ones

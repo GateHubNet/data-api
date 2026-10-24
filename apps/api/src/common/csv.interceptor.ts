@@ -6,6 +6,7 @@ import {
   SetMetadata,
   UseInterceptors,
 } from '@nestjs/common';
+import { DECORATORS } from '@nestjs/swagger/dist/constants';
 import { Request, Response } from 'express';
 import { convert } from 'nice-json2csv';
 import { map, Observable } from 'rxjs';
@@ -79,9 +80,12 @@ export function csvContentDisposition(name: string): string {
  * found in any row, in the order of first appearance, every cell a quoted string. Any other `format` leaves the JSON body as it is. An error of the route is not touched.
  */
 export class CsvInterceptor implements NestInterceptor {
+  private paging?: ListPaging;
+
   constructor(
     private readonly filename: CsvFilename,
     private readonly rowsKey: string,
+    private readonly options: CsvOptions = {},
   ) {}
 
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
@@ -90,6 +94,8 @@ export class CsvInterceptor implements NestInterceptor {
     if (!wantsCsv(req.query)) return next.handle();
 
     const res = http.getResponse<Response>();
+    this.paging ??= listPaging(context.getHandler(), this.options);
+    res.set(LIST_PAGING_HEADER, this.paging);
     return next.handle().pipe(
       map((body: Json | null | undefined) => {
         const rows = body?.[this.rowsKey];
@@ -114,9 +120,35 @@ export const CSV_ROUTE = 'ripple:csv-route';
  * Lets a route answer `format=csv`: the array at `body[rowsKey]` becomes the CSV, downloaded as `<filename>.csv`.
  * Put it on the route next to `@RippleRoute`. It also makes the list exportable (`CSV_ROUTE`).
  */
-export function Csv(filename: CsvFilename, rowsKey: string): MethodDecorator {
+export function Csv(filename: CsvFilename, rowsKey: string, options: CsvOptions = {}): MethodDecorator {
   return applyDecorators(
     SetMetadata(CSV_ROUTE, true),
-    UseInterceptors(new CsvInterceptor(filename, rowsKey)),
+    UseInterceptors(new CsvInterceptor(filename, rowsKey, options)),
   ) as MethodDecorator;
+}
+
+/** What a route with a CSV form says about reading its whole list. */
+export interface CsvOptions {
+  /** `limit=all` reads the whole list in one answer (`/balances`, `/orders`: lists without a marker). */
+  limitAll?: boolean;
+}
+
+/**
+ * The header of every CSV answer that says how the whole list is read (the exporter, ticket #15, follows it):
+ *  - `marker`: page after page, by the marker of the `Link` header;
+ *  - `limit=all`: in one answer, with `limit=all`;
+ *  - `whole`: every answer is the whole list (the route has no `limit`);
+ *  - `none`: the route has a `limit` and neither a marker nor `limit=all`, so its whole list cannot be read when it is
+ *    longer than the limit.
+ */
+export const LIST_PAGING_HEADER = 'X-List-Paging';
+export type ListPaging = 'marker' | 'limit=all' | 'whole' | 'none';
+
+/** How the route's list is read whole, from its options and the query parameters it documents (`@ApiQuery`). */
+function listPaging(handler: object, options: CsvOptions): ListPaging {
+  if (options.limitAll) return 'limit=all';
+  const params = (Reflect.getMetadata(DECORATORS.API_PARAMETERS, handler) ?? []) as { name?: string; in?: string }[];
+  const query = new Set(params.filter((p) => p.in === 'query').map((p) => p.name));
+  if (query.has('marker')) return 'marker';
+  return query.has('limit') ? 'none' : 'whole';
 }
