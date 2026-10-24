@@ -1,5 +1,5 @@
 import { getNetworkProfile } from '../network';
-import { clickHouseConfigFromEnv } from './clickhouse.config';
+import { clickHouseConfigFromEnv, sharedDatabaseFromEnv } from './clickhouse.config';
 
 describe('clickHouseConfigFromEnv', () => {
   it('defaults the database to the network profile', () => {
@@ -55,5 +55,22 @@ describe('clickHouseConfigFromEnv', () => {
       maxExecutionTime: 7,
       maxQueryMemoryBytes: 1024,
     });
+  });
+});
+
+describe('sharedDatabaseFromEnv', () => {
+  it('is `shared` when GH_CLICKHOUSE_SHARED_DATABASE is unset or empty, on every network', () => {
+    expect(sharedDatabaseFromEnv({})).toBe('shared');
+    expect(sharedDatabaseFromEnv({ GH_CLICKHOUSE_SHARED_DATABASE: '', GH_NETWORK: 'xahau' })).toBe('shared');
+  });
+
+  it('is GH_CLICKHOUSE_SHARED_DATABASE when set', () => {
+    expect(sharedDatabaseFromEnv({ GH_CLICKHOUSE_SHARED_DATABASE: 'shared_test' })).toBe('shared_test');
+  });
+
+  it.each(['Bad-Name', '1abc', 'a;DROP'])('rejects the database name %j, naming the variable', (name) => {
+    expect(() => sharedDatabaseFromEnv({ GH_CLICKHOUSE_SHARED_DATABASE: name })).toThrow(
+      /GH_CLICKHOUSE_SHARED_DATABASE/,
+    );
   });
 });

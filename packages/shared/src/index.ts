@@ -2,7 +2,7 @@
 export * from './clickhouse/clickhouse.config';
 export * from './clickhouse/clickhouse.module';
 export * from './clickhouse/clickhouse.service';
-export { runMigrations } from './clickhouse/migrate';
+export { SHARED_SCHEMA_DIR, runMigrations, runSharedMigrations } from './clickhouse/migrate';
 export type { MigrateOptions, MigrateResult } from './clickhouse/migrate';
 export * from './clickhouse/rows';
 export * from './clickhouse/tables';

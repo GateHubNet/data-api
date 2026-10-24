@@ -8,7 +8,7 @@ import {
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { DynamicModule, Global, Injectable, Module, OnApplicationBootstrap } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
-import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
+import { ApiConfig, NETWORK_PROFILE, SHARED_DATABASE } from '../config/api.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { BinaryCodecService } from './binary-codec.service';
 import { CacheService } from './cache.service';
@@ -45,11 +45,13 @@ export interface CommonOptions {
   config: ApiConfig;
   profile: NetworkProfile;
   clickHouse: ClickHouseConfig;
+  /** The shared database (ADR-0014) on the same server. */
+  sharedDatabase: string;
 }
 
 /**
  * Everything the endpoint modules share, global so that they need no imports to use it: `ApiConfig`,
- * `NETWORK_PROFILE`, `ClickHouseService`, `CacheService`, `PrometheusService`, `ShutdownSignals`, and the services of
+ * `NETWORK_PROFILE`, `SHARED_DATABASE`, `ClickHouseService`, `CacheService`, `PrometheusService`, `ShutdownSignals`, and the services of
  * the API contract layer: `LedgerRangeResolver`, `TxService` and `BinaryCodecService`. (`BinaryCodecService` asks the
  * node for its definitions through the global `XrplService` of the `XrplModule`.)
  */
@@ -57,7 +59,7 @@ export interface CommonOptions {
 @Module({})
 export class CommonModule {
   static register(options: CommonOptions): DynamicModule {
-    const { config, profile, clickHouse } = options;
+    const { config, profile, clickHouse, sharedDatabase } = options;
     return {
       module: CommonModule,
       // GateHubConfigModule provides the ConfigService the toolbox swagger setup resolves.
@@ -65,6 +67,7 @@ export class CommonModule {
       providers: [
         { provide: ApiConfig, useValue: config },
         { provide: NETWORK_PROFILE, useValue: profile },
+        { provide: SHARED_DATABASE, useValue: sharedDatabase },
         CacheService,
         PrometheusService,
         ShutdownSignals,
@@ -76,6 +79,7 @@ export class CommonModule {
       exports: [
         ApiConfig,
         NETWORK_PROFILE,
+        SHARED_DATABASE,
         CacheService,
         PrometheusService,
         ShutdownSignals,

@@ -1,4 +1,4 @@
-import { Table } from '@gatehub/data-api-shared';
+import { SharedTable, Table } from '@gatehub/data-api-shared';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
@@ -12,8 +12,14 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-/** `FROM ledgers`, `JOIN transactions`, `INSERT INTO payments`: a table named by hand instead of by `Table`. */
-const NAMED_BY_HAND = new RegExp(`\\b(?:FROM|JOIN|INTO)\\s+(?:${Object.values(Table).join('|')})\\b`, 'i');
+/**
+ * `FROM ledgers`, `JOIN transactions`, `INSERT INTO payments`: a table named by hand instead of by `Table`. A table of
+ * the shared database written by hand (`FROM account_names`) would also read the network database, not the shared one.
+ */
+const NAMED_BY_HAND = new RegExp(
+  `\\b(?:FROM|JOIN|INTO)\\s+(?:${[...Object.values(Table), ...Object.values(SharedTable)].join('|')})\\b`,
+  'i',
+);
 
 describe('SQL in the API', () => {
   it('takes the table names from the Table enum: none is written by hand', () => {
@@ -38,5 +44,7 @@ describe('SQL in the API', () => {
     expect(NAMED_BY_HAND.test('SELECT 1 FROM ledgers')).toBe(true);
     expect(NAMED_BY_HAND.test('SELECT 1 FROM ${Table.Ledgers}')).toBe(false);
     expect(NAMED_BY_HAND.test('INSERT INTO tx_by_hash')).toBe(true);
+    expect(NAMED_BY_HAND.test('SELECT name FROM account_names')).toBe(true);
+    expect(NAMED_BY_HAND.test('SELECT name FROM ${shared}.${SharedTable.AccountNames}')).toBe(false);
   });
 });
