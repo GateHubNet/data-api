@@ -172,6 +172,27 @@ export class ApiConfig {
   @ConfigValue()
   @MaybeEmptyText()
   exportBucket: string = '';
+
+  /**
+   * `GH_EXPORT_MAX_JOBS_PER_KEY`: the most exports one API key may have queued or running at once (ticket #16); one more
+   * answers 429. The exporter makes one export at a time, so this bounds how far one key can queue ahead of the others.
+   */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxJobsPerKey: number = 3;
+
+  /**
+   * `GH_EXPORT_MAX_ROWS_CSV`: the most rows a CSV export holds (ticket #16). An export whose list counts its rows up front
+   * and has more answers 400; the exporter, with the same setting, fails one whose list turns out longer.
+   */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxRowsCsv: number = 1_000_000;
+
+  /** `GH_EXPORT_MAX_ROWS_PDF`: the most rows a PDF export holds (ticket #16), as `GH_EXPORT_MAX_ROWS_CSV`. */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  exportMaxRowsPdf: number = 10_000;
 }
 
 /** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */

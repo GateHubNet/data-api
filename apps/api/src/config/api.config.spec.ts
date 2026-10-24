@@ -60,6 +60,9 @@ describe('ApiConfig (GH_* environment)', () => {
       cacheControl: 'private, max-age=60',
       amendmentsConfig: '',
       namesAndLabelsReloadMs: 60000,
+      exportMaxJobsPerKey: 3,
+      exportMaxRowsCsv: 1_000_000,
+      exportMaxRowsPdf: 10_000,
     });
   });
 
@@ -80,6 +83,9 @@ describe('ApiConfig (GH_* environment)', () => {
       GH_CACHE_CONTROL: 'public, max-age=5',
       GH_AMENDMENTS_CONFIG: ' /etc/gatehub/amendments.json ',
       GH_NAMES_AND_LABELS_RELOAD_MS: '250',
+      GH_EXPORT_MAX_JOBS_PER_KEY: '5',
+      GH_EXPORT_MAX_ROWS_CSV: '500',
+      GH_EXPORT_MAX_ROWS_PDF: '50',
     });
     expect(exits).toEqual([]);
     expect(cfg).toMatchObject({
@@ -98,6 +104,9 @@ describe('ApiConfig (GH_* environment)', () => {
       cacheControl: 'public, max-age=5',
       amendmentsConfig: '/etc/gatehub/amendments.json',
       namesAndLabelsReloadMs: 250,
+      exportMaxJobsPerKey: 5,
+      exportMaxRowsCsv: 500,
+      exportMaxRowsPdf: 50,
     });
   });
 
