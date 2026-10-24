@@ -53,6 +53,9 @@ export enum Table {
   AccountLinesDaily = 'account_lines_daily',
   AccountTxDaily = 'account_tx_daily',
   AccountTradesDaily = 'account_trades_daily',
+  // Written by the operator with plain SQL inserts (ADR-0014).
+  /** Migration 009: the account network name of an address, append-only, the newest row of an address wins. */
+  AccountNetworkNames = 'account_network_names',
   // Internal bookkeeping.
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
