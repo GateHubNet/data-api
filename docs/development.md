@@ -58,7 +58,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
   `FixtureLedgerSource`, `raw-ledger.ts`.
 - `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, and account and market jobs), `src/util/`.
-- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`, `schema/009_account_network_names.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
+- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`, `schema/005_account_states.sql`, `schema/006_trust_line_states.sql`, `schema/007_path_payments.sql`, `schema/008_account_path_payments.sql`, `schema/009_account_network_names.sql`, `schema/010_export_jobs.sql`: the schema of a network's database (migration units, applied in file-name order; **not** under `src/`). `schema-shared/001_account_names.sql`, `schema-shared/002_account_labels.sql`: the migrations of the `shared` database (ADR-0014).
 - `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
 Everything the apps use is re-exported from `packages/shared/src/index.ts`: **export what you add there.**
@@ -156,7 +156,8 @@ There is no root `test:e2e`: each package spins its own throwaway ClickHouse and
   DateTime. Resolve `start`/`end` to a ledger range with `LedgerRangeResolver`. See
   [clickhouse](clickhouse.md#reading-a-page-what-stops-the-read).
 - **Amounts** are exact decimal strings; sum with the shared decimal helpers, never with floats.
-- **Config** lives in `api.config.ts`, `syncer.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `env-decorators.ts`);
+- **Config** lives in `api.config.ts`, `syncer.config.ts`, `exporter.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `packages/shared/src/nest/env-decorators.ts`, which the apps share with the liveliness probe and
+  the `/metricz` controller of `packages/shared/src/nest/`);
   do not read `process.env` ad hoc in services. Import the toolbox through `@gatehub/toolbox/lib/<module>`, never the package root (the
   root loads database/queue config and exits without `GH_DATABASE_*`).
 
@@ -203,7 +204,7 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `010_export_jobs.sql`; 008 is reserved by another change of spec #4;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `010_export_jobs.sql`;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.

@@ -39,7 +39,7 @@ export class AccountOrdersController {
 
   @Get(':address/orders')
   @RippleRoute('unable to retrieve orders')
-  @Csv((req) => `${req.params.address} - orders`, 'orders')
+  @Csv((req) => `${req.params.address} - orders`, 'orders', { limitAll: true })
   @ApiOperation({
     summary: 'Get the open orders of an account',
     description:

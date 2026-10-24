@@ -1,7 +1,9 @@
 import { STATE_PARSER_VERSION, Table, TrustLineStatesRow } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { accountAt } from './support/amm';
 import { csvDisposition } from './support/csv';
 import { liveNode } from './support/live-node';
+import { BULK_BASES, insertBulk, markerOf, readsOf } from './support/read-rows';
 
 /**
  * `GET /v2/accounts/:address/trustlines`: the trust lines of an account at a ledger, with all their settings, from the
@@ -564,5 +566,107 @@ describe('GET /v2/accounts/:address/trustlines', () => {
         await older.close();
       }
     });
+  });
+});
+
+/**
+ * What the reads of an account with many lines cost (clickhouse.md "Reading a page", Ruling R106): a page of `/trustlines`
+ * reads about the granules its lines need, not the account's whole line history, and `/balances?limit=all` at a historical
+ * ledger reads its lines page by page, each read bounded too, instead of in one read of the whole history.
+ *
+ * The bulk: `LINES` USD lines of one account, each changed once in each of four parts (`BULK_BASES`, merges stopped), so
+ * `4 x LINES` rows; the newest change of a line is in the last part (its balance is that part's base), and that change
+ * deletes every tenth line.
+ */
+describe('the reads of an account with many lines (read_rows over a bulk of four parts)', () => {
+  const ACCOUNT = accountAt(424_242);
+  const LINES = 200_000;
+  /**
+   * A quarter of the 800,000 rows of the account: a read takes a few granules (8,192 rows) of each of the four parts it
+   * reads in order, about 67,000 to 165,000 rows, while the one read of the whole history took all 800,000.
+   */
+  const READ_BOUND = 200_000;
+  const LAST = BULK_BASES[BULK_BASES.length - 1];
+  const counterparty = (i: number): string => `r${String(i).padStart(6, '0')}`;
+  /** The lines the account has at the newest ledger, in (counterparty, currency) order: every tenth is deleted. */
+  const LISTED = Array.from({ length: LINES }, (_, i) => i).filter((i) => i % 10 !== 9);
+  const lineOf = (i: number) => line('USD', counterparty(i), { balance: String(LAST), limit: '10' });
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-account-state', env: NO_RATE_LIMIT });
+    api = await h.api();
+    await insertBulk(
+      h,
+      Table.TrustLineStates,
+      `SELECT * FROM ${Table.TrustLineStates} ORDER BY account, counterparty, currency, ledger_index LIMIT 1`,
+      { account: ACCOUNT },
+      (base) =>
+        `{account:String} AS account, concat('r', leftPad(toString(n.number), 6, '0')) AS counterparty,
+         'USD' AS currency, toUInt32(${base}) AS ledger_index, toUInt32(0) AS tx_index, toUInt16(0) AS node_index,
+         '${base}' AS balance, '10' AS limit, '0' AS limit_peer, toUInt8(0) AS no_ripple, toUInt8(0) AS no_ripple_peer,
+         toUInt8(0) AS authorized, toUInt8(0) AS peer_authorized, toUInt8(0) AS freeze, toUInt8(0) AS peer_freeze,
+         toUInt32(0) AS quality_in, toUInt32(0) AS quality_out, toUInt32(0) AS flags,
+         toUInt8(${base === LAST ? 'n.number % 10 = 9' : '0'}) AS deleted`,
+      LINES,
+    );
+    await h.ch.insert(Table.AccountStates, [
+      {
+        account: ACCOUNT,
+        ledger_index: LAST,
+        tx_index: 0,
+        node_index: 0,
+        tx_hash: 'A'.repeat(64),
+        close_time: 1_700_000_000,
+        balance: '25',
+        flags: 0,
+        sequence: 1,
+        owner_count: 0,
+        fields: '{}',
+        deleted: 0,
+      },
+    ]);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('a page of /trustlines: its lines, each as of its newest change, in a few granules of each part', async () => {
+    let lines: unknown[] = [];
+    const reads = await readsOf(h, Table.TrustLineStates, async () => {
+      lines = (await api.ok(`/v2/accounts/${ACCOUNT}/trustlines?ledger_index=${NEWEST}&limit=5`, 'trustlines')).body
+        .trustlines;
+    });
+    expect(lines).toEqual(LISTED.slice(0, 5).map(lineOf));
+    expect(reads.length).toBeGreaterThan(0);
+    for (const read of reads) expect(read.read_rows).toBeLessThan(READ_BOUND);
+  });
+
+  it('a page of /trustlines after a marker in the middle: bounded the same way', async () => {
+    const at = LISTED.indexOf(50_000);
+    const marker = markerOf([counterparty(50_000), 'USD']);
+    let lines: unknown[] = [];
+    const reads = await readsOf(h, Table.TrustLineStates, async () => {
+      lines = (
+        await api.ok(`/v2/accounts/${ACCOUNT}/trustlines?ledger_index=${NEWEST}&limit=5&marker=${marker}`, 'trustlines')
+      ).body.trustlines;
+    });
+    expect(lines).toEqual(LISTED.slice(at + 1, at + 6).map(lineOf));
+    for (const read of reads) expect(read.read_rows).toBeLessThan(READ_BOUND);
+  });
+
+  it('/balances?limit=all at a historical ledger: every line, read page by page, each read bounded', async () => {
+    let balances: unknown[] = [];
+    const reads = await readsOf(h, Table.TrustLineStates, async () => {
+      balances = (await api.ok(`/v2/accounts/${ACCOUNT}/balances?ledger_index=${NEWEST}&limit=all`, 'balances')).body
+        .balances;
+    });
+    expect(balances).toEqual([
+      { currency: 'XRP', value: '25' },
+      ...LISTED.map((i) => ({ currency: 'USD', counterparty: counterparty(i), value: String(LAST) })),
+    ]);
+    expect(reads.length).toBeGreaterThan(1);
+    for (const read of reads) expect(read.read_rows).toBeLessThan(READ_BOUND);
   });
 });

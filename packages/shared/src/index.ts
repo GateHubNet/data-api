@@ -32,9 +32,15 @@ export * from './xrpl/node-throttle';
 
 // Exports (export jobs and the storage of their files)
 export * from './export/export-jobs';
+export * from './export/export-row-caps';
 export * from './export/export-storage';
 
-// Nest helpers
+// Nest helpers: shutdown, the config decorators, the health probe and /metricz the apps share
+export * from './nest/env-decorators';
+export * from './nest/liveliness/liveliness.controller';
+export * from './nest/liveliness/liveliness.module';
+export * from './nest/liveliness/liveliness.service';
+export * from './nest/prometheus.controller';
 export * from './nest/shutdown-signals';
 
 // Ingest

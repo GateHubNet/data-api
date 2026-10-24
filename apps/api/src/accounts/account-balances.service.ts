@@ -121,13 +121,17 @@ export class AccountBalancesService {
     const balances = q.currency === undefined ? [native] : [];
     const wanted = q.limit === undefined ? undefined : q.limit - balances.length;
     if (wanted === 0) return { ...at, balances };
-    const lines = await this.trustLines.linesAt({
+    const which = {
       address: q.address,
       ledgerIndex: ledger.ledger_index,
       currency: q.currency,
       counterparty: q.counterparty,
-      limit: wanted,
-    });
+    };
+    // `limit=all`: every line, page by page, never in one read of the account's whole line history
+    const lines =
+      wanted === undefined
+        ? await this.trustLines.linesAll(which)
+        : await this.trustLines.linesAt({ ...which, limit: wanted });
     for (const line of lines)
       balances.push({ currency: line.currency, counterparty: line.counterparty, value: line.balance });
     return { ...at, balances };

@@ -37,6 +37,8 @@ const COVERAGE_KEY = 'state-coverage';
  * original's message for a ledger the node did not have. The state tables cover ledger L when every stored ledger from L
  * up was written by a parser that records state (`STATE_PARSER_VERSION` or later); gaps in the ledger numbers do not
  * matter. So the coverage starts above the newest ledger an older parser wrote, or at the first ledger when there is none.
+ * It relies on the stored ledgers being complete above its start (a missing ledger's changes would be missing from the
+ * state, unseen here), which gap repair keeps (docs/backfill.md).
  */
 @Injectable()
 export class StateLedgerService {

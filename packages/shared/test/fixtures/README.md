@@ -246,6 +246,23 @@ therefore the round trip `round_trip_to_oneself_*`: the same account buys WLV wi
 payments of the same ledger. A loop in one payment would be detected the same way (its source is its destination, and the pools
 and offers it crosses are in the metadata); record one with `--txs` when it is found.
 
+Searched again on 2026-10-24 (`account_tx` from `wss://s2.ripple.com` and `wss://xrplcluster.com`, every successful Payment whose
+source is its destination and whose `SendMax` is the asset of its `Amount`, through an offer or a pool), with no such payment
+found: among the accounts that pay themselves most often in these fixtures and in `xrpl/amm`, the newest 2,400 to 6,000 rows of
+`rETH6…`, `rtaXv…`, `rNGUb…`, `rnJ1h…`, `r9jMe…`, `rBGkr…` and `rGuhZ…`, and the oldest 4,000 of `rtaXv…`, `rsiTX…`, `r4bek…` and
+`rKNRr…`; the newest 3,000
+rows of the XRP pools of USD (Bitstamp), USD and EUR (GateHub), CSC, USDC and BTC (`rHUpa…`, `rs9in…`, `rw3tW…`, `rf7g4…`,
+`rM7cH…`, `rnv4k…`); and the oldest 2,000 rows of eleven gateways of 2013 to 2015 (Bitstamp, SnapSwap, RippleCN, RippleChina,
+Ripple Fox, Dividend Rippler, Justcoin, WeExchange, The Rock Trading, WisePass, Mr. Ripple). So the same-asset branch of the
+parser (`sameAsset`, the `sourceIssuer` fix-up of a loop) still has no recorded case.
+
+**Not found: rippling straight between two issuers.** The same search looked for a payment with no offer and no pool in which an
+account other than the source, the destination and the delivered currency's issuer ripples while holding no balance on either
+line (an issuer of another currency, which `rippled_through` lists since GLOSSARY.md is read as written), also over the newest
+3,000 rows of GateHub's issuers, RLUSD, USDC and two other stablecoin issuers: none. The recorded cases where such an issuer ripples
+cross a pool, an offer or a market maker too (`through_a_market_maker`: Bitstamp; `round_trip_to_oneself_back`: the WLV issuer;
+`to_oneself_across_issuers`: `rPT74…`).
+
 ### Xahau (`xahau/recorded/`)
 
 Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337): validated head

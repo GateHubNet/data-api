@@ -1,6 +1,7 @@
 import {
   clickHouseConfigFromEnv,
   getNetworkProfile,
+  LivelinessModule,
   NetworkProfile,
   sharedDatabaseFromEnv,
 } from '@gatehub/data-api-shared';
@@ -41,7 +42,6 @@ import { ExchangesModule } from './exchanges/exchanges.module';
 import { RatesModule } from './exchanges/rates.module';
 import { ExportsModule } from './exports/exports.module';
 import { LedgersModule } from './ledgers/ledgers.module';
-import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
 import { PathPaymentsModule } from './path-payments/path-payments.module';
 import { PaymentsModule } from './payments/payments.module';

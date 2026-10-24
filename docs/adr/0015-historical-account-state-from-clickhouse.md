@@ -26,3 +26,6 @@ full-history node. GateHub will not run one. ClickHouse will hold the full histo
 - An answer is only as complete as the indexed history. Until the state tables are filled back to ledger 32570 (with that ledger's state,
   the work of the history spec), a date before their first ledger answers 400 `the date provided is too old`.
 - The tables hold a row for every change of every account and trust line, so they are among the largest, and the parser version moves.
+- The coverage (the ledgers above the newest one an older parser wrote) does not look at gaps in the ledger numbers: it relies on
+  the stored ledgers being complete above its start. A ledger missing there would leave its changes out of the state, unseen; gap
+  repair ([backfill](../backfill.md#resuming-gap-repair-reprocessing)) keeps the stored ledgers complete.

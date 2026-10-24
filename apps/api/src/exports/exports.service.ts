@@ -2,13 +2,12 @@ import {
   activeExportJobs,
   appendExportJob,
   ClickHouseService,
-  EXPORT_FORMATS,
   EXPORT_URL_TTL_MS,
-  ExportFormat,
   ExportJobsRow,
   exportNow,
   exportRowCap,
   ExportStorage,
+  isExportFormat,
   isExportId,
   newExportId,
   readExportJob,
@@ -18,7 +17,7 @@ import { Inject, Injectable, Optional } from '@nestjs/common';
 import { badRequest, notFound, RippleHttpError } from '../common/errors';
 import { fmtTime } from '../common/format';
 import { ApiConfig } from '../config/api.config';
-import { ExportableRoutes } from './exportable-routes';
+import { ExportableRoutes, SEQUENCE_WINDOW } from './exportable-routes';
 
 /** The token of the `ExportStorage` of the api: `null` when exports are off (`GH_EXPORT_BUCKET` empty). */
 export const EXPORT_STORAGE = Symbol('EXPORT_STORAGE');
@@ -56,7 +55,8 @@ export class ExportsService {
 
   /**
    * Queues an export of `body.path` in `body.format` for the key whose hash is `keyHash`. The checks, in order: the path
-   * (a `/v2/` path of a list with a CSV form), its window (a list over time names `start` and `end`), the format, then
+   * (a `/v2/` path of a list with a CSV form), its window (a list over time names `start` and `end`, or, for one that also takes
+   * sequences, `min_sequence` or `max_sequence`), the format, then
    * the exports the key already has queued or running (ticket #16: at most `GH_EXPORT_MAX_JOBS_PER_KEY`, 429 beyond),
    * and last the rows of the list where the list counts them up front (`@ExportCount`): above the cap of the format,
    * 400. A list that does not count them is held to the cap by the exporter, as it walks the pages.
@@ -68,19 +68,20 @@ export class ExportsService {
     const url = new URL(path, BASE);
     const route = this.routes.match(url.pathname);
     if (!route) throw badRequest('path is not exportable');
-    if (route.overTime && (!url.searchParams.get('start') || !url.searchParams.get('end'))) {
+    const q = url.searchParams;
+    // a list by sequence (`min_sequence`, `max_sequence`) has its window in the sequences instead
+    const bySequence = route.bySequence && SEQUENCE_WINDOW.some((name) => q.get(name));
+    if (route.overTime && !bySequence && (!q.get('start') || !q.get('end'))) {
       throw badRequest('start and end are required');
     }
-    if (typeof format !== 'string' || !(EXPORT_FORMATS as readonly string[]).includes(format)) {
-      throw badRequest('invalid format');
-    }
+    if (!isExportFormat(format)) throw badRequest('invalid format');
     const most = this.config.exportMaxJobsPerKey;
     if ((await activeExportJobs(this.ch, keyHash)) >= most) {
       throw new RippleHttpError(429, `too many exports in progress: at most ${most} per API key`);
     }
     const cap = exportRowCap({ csv: this.config.exportMaxRowsCsv, pdf: this.config.exportMaxRowsPdf }, format);
-    const rows = cap === undefined ? undefined : await this.routes.count(url);
-    if (cap !== undefined && rows !== undefined && rows > cap) throw badRequest(tooManyExportRows(format, cap));
+    const rows = await this.routes.count(url);
+    if (rows !== undefined && rows > cap) throw badRequest(tooManyExportRows(format, cap));
 
     const now = exportNow();
     const job: ExportJobsRow = {
@@ -88,7 +89,7 @@ export class ExportsService {
       seq: 0,
       key_hash: keyHash,
       path,
-      format: format as ExportFormat,
+      format,
       status: 'queued',
       created: now,
       at: now,

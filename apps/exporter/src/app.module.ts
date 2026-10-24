@@ -3,12 +3,12 @@ import {
   ClickHouseModule,
   ClickHouseService,
   getNetworkProfile,
+  LivelinessModule,
   ShutdownSignals,
 } from '@gatehub/data-api-shared';
 import { DynamicModule, Global, Injectable, Logger, MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ExporterConfig, loadExporterConfig, NETWORK_PROFILE } from './config/exporter.config';
 import { ExportWorkerService } from './export-worker.service';
-import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { PrometheusService } from './modules/prometheus/prometheus.service';
 
 /** Closes the ClickHouse client on SIGTERM / SIGINT: registered before the worker stop, so it runs after it. */

@@ -101,26 +101,26 @@ function poolsCrossed(nodes: readonly LedgerNode[]): string[] {
 }
 
 /**
- * The accounts that rippled between their trust lines: for one currency, the payment raised the account's balance on
- * one line and lowered it on another, and the account holds a balance on one of them (an issuer only passing its own
- * currency from one holder to another is not rippling through someone's liquidity). The source, the destination, the
- * delivered currency's issuer, the AMM pools and the owners of the offers crossed (an offer between two issuers of one
- * currency moves its owner's lines the same way) are left out.
+ * The accounts that rippled between their trust lines (GLOSSARY.md, read as written): for one currency, the payment
+ * raised the account's balance on one line and lowered it on another. That includes an issuer passing its own currency
+ * from one line to the next, as long as it is not the delivered currency's issuer: the issuer of the source currency, or
+ * of a currency on the way, rippling is someone else's liquidity. The source, the destination, the delivered currency's
+ * issuer, the AMM pools and the owners of the offers crossed (an offer between two issuers of one currency moves its
+ * owner's lines the same way) are left out.
  */
 function rippledThrough(sides: readonly LineSide[], excluded: ReadonlySet<string>): string[] {
-  const groups = new Map<string, { account: string; up: boolean; down: boolean; holds: boolean }>();
+  const groups = new Map<string, { account: string; up: boolean; down: boolean }>();
   for (const side of sides) {
     if (excluded.has(side.account)) continue;
     const key = `${side.account}\u0000${side.currency}`;
-    const group = groups.get(key) ?? { account: side.account, up: false, down: false, holds: false };
+    const group = groups.get(key) ?? { account: side.account, up: false, down: false };
     if (side.after.gt(side.before)) group.up = true;
     else group.down = true;
-    if (side.before.gt(0) || side.after.gt(0)) group.holds = true;
     groups.set(key, group);
   }
   const accounts: string[] = [];
   for (const group of groups.values()) {
-    if (group.up && group.down && group.holds && !accounts.includes(group.account)) accounts.push(group.account);
+    if (group.up && group.down && !accounts.includes(group.account)) accounts.push(group.account);
   }
   return accounts;
 }

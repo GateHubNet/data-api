@@ -1,7 +1,8 @@
+import { EXPORT_MAX_ROWS, ExportRowCapValue } from '@gatehub/data-api-shared/dist/export/export-row-caps';
+import { IntValue, MaybeEmptyText, Text, validator } from '@gatehub/data-api-shared/dist/nest/env-decorators';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { IsIn } from 'class-validator';
-import { IntValue, MaybeEmptyText, Text, validator } from './env-decorators';
 
 /**
  * Exporter configuration, read from `GH_*` environment variables by the toolbox ConfigService, the way the api reads
@@ -77,13 +78,13 @@ export class ExporterConfig {
    * as the api's, which refuses up front an export it can count.
    */
   @ConfigValue()
-  @IntValue({ min: 1 })
-  exportMaxRowsCsv: number = 1_000_000;
+  @ExportRowCapValue()
+  exportMaxRowsCsv: number = EXPORT_MAX_ROWS.csv;
 
   /** `GH_EXPORT_MAX_ROWS_PDF`: the most rows a PDF export holds (ticket #16), as `GH_EXPORT_MAX_ROWS_CSV`. */
   @ConfigValue()
-  @IntValue({ min: 1 })
-  exportMaxRowsPdf: number = 10_000;
+  @ExportRowCapValue()
+  exportMaxRowsPdf: number = EXPORT_MAX_ROWS.pdf;
 
   /** `GH_HTTP_API_PORT`: the liveliness probe. */
   @ConfigValue()

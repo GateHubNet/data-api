@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
 import { ExportJobsRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
+import { ExportFormat, ExportRowCaps } from './export-row-caps';
 
 /**
  * Export jobs (spec #4, ticket #15): the state the api and the exporter of a network share, in `export_jobs`.
@@ -11,10 +12,6 @@ import { Table } from '../clickhouse/tables';
  * id is the job, and nothing is ever updated in place.
  */
 
-/** The formats an export can be made in: the list's CSV, or a PDF document of it (ticket #17). */
-export const EXPORT_FORMATS = ['csv', 'pdf'] as const;
-export type ExportFormat = (typeof EXPORT_FORMATS)[number];
-
 export type ExportStatus = ExportJobsRow['status'];
 
 /** How long a download link of a done export is valid: 15 minutes, a new link at each request. */
@@ -23,25 +20,13 @@ export const EXPORT_URL_TTL_MS = 15 * 60 * 1000;
 /** How long an export is kept: 7 days (the TTL of `export_jobs`, and the lifecycle rule of the bucket). */
 export const EXPORT_RETENTION_DAYS = 7;
 
-/**
- * The most rows an export of each format may hold (ticket #16): beyond, the api refuses it when it knows the count up
- * front, and the exporter fails it when the list turns out longer.
- */
-export interface ExportRowCaps {
-  csv: number;
-  pdf: number;
-}
-
-/** The caps by default: 1,000,000 rows of CSV, 10,000 of PDF. `GH_EXPORT_MAX_ROWS_CSV` and `_PDF` change them. */
-export const EXPORT_MAX_ROWS: ExportRowCaps = { csv: 1_000_000, pdf: 10_000 };
-
-/** The cap of `format` among `caps`, `undefined` for a format that has none. */
-export function exportRowCap(caps: ExportRowCaps, format: string): number | undefined {
-  return Object.prototype.hasOwnProperty.call(caps, format) ? caps[format as keyof ExportRowCaps] : undefined;
+/** The cap of `format` among `caps`. */
+export function exportRowCap(caps: ExportRowCaps, format: ExportFormat): number {
+  return caps[format];
 }
 
 /** Why an export of `format` is refused or fails past its cap: what the client can do about it, too. */
-export function tooManyExportRows(format: string, cap: number): string {
+export function tooManyExportRows(format: ExportFormat, cap: number): string {
   return (
     `the list has more than ${cap} rows, the most a ${format.toUpperCase()} export holds: narrow the window` +
     (format === 'csv' ? '' : ' or use CSV')
@@ -64,7 +49,7 @@ export function exportKeyHash(key: string | undefined): string {
 }
 
 /** Where the file of a job is stored: under the network's prefix, `<network>/<id>.<format>`. */
-export function exportObjectKey(network: string, id: string, format: string): string {
+export function exportObjectKey(network: string, id: string, format: ExportFormat): string {
   return `${network}/${id}.${format}`;
 }
 
@@ -77,8 +62,18 @@ export function exportNow(now: number = Date.now()): number {
 const COLUMNS = `id, seq, key_hash, path, format, status, toUnixTimestamp64Milli(created) / 1000 AS created,
   toUnixTimestamp64Milli(at) / 1000 AS at, toString(rows) AS rows, object, error`;
 
-/** The newest row of every job: the jobs as they are now. */
-const CURRENT = `SELECT ${COLUMNS} FROM ${Table.ExportJobs} ORDER BY id, seq DESC LIMIT 1 BY id`;
+// The columns of a job's state besides its id, in the order of the tuple `CURRENT` keeps of each job.
+const STATE = ['seq', 'key_hash', 'path', 'format', 'status', 'created', 'at', 'rows', 'object', 'error'];
+
+/**
+ * The newest row of every job, grouped by id (`argMax` by `seq`, ADR-0003; never `LIMIT 1 BY` in the select that reads
+ * the table, clickhouse.md R106). The table keeps 7 days of jobs (its TTL), which is what the grouping reads.
+ */
+const CURRENT = `SELECT id, ${STATE.map((c, i) => `j.${i + 1} AS ${c}`).join(', ')}
+  FROM (SELECT id, argMax((${STATE.join(', ')}), seq) AS j FROM ${Table.ExportJobs} GROUP BY id)`;
+
+/** The most jobs `exportJobsIn` returns at once. */
+export const EXPORT_JOBS_BATCH = 100;
 
 /** The job `id` as it is now, or `undefined` when there is none (or it is older than 7 days). */
 export async function readExportJob(ch: ClickHouseService, id: string): Promise<ExportJobsRow | undefined> {
@@ -88,16 +83,15 @@ export async function readExportJob(ch: ClickHouseService, id: string): Promise<
   );
 }
 
-/** The jobs whose current state is `status`, the oldest first. */
+/** The oldest jobs whose current state is `status`, the oldest first: at most `limit`, and never more than a batch. */
 export async function exportJobsIn(
   ch: ClickHouseService,
   status: ExportStatus,
-  limit?: number,
+  limit: number = EXPORT_JOBS_BATCH,
 ): Promise<ExportJobsRow[]> {
   return ch.query<ExportJobsRow>(
-    `SELECT * FROM (${CURRENT}) WHERE status = {status:String} ORDER BY created, id` +
-      (limit === undefined ? '' : ' LIMIT {limit:UInt32}'),
-    { status, ...(limit !== undefined && { limit }) },
+    `SELECT ${COLUMNS} FROM (${CURRENT}) WHERE status = {status:String} ORDER BY created, id LIMIT {limit:UInt32}`,
+    { status, limit: Math.min(limit, EXPORT_JOBS_BATCH) },
   );
 }
 

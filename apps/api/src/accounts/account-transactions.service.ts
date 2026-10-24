@@ -11,6 +11,7 @@ import {
 import { Inject, Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
+import { TxKey, txKeysIn, txKeyString } from '../common/tx-keys';
 import { TxObject, TxService } from '../common/tx-object';
 import { NETWORK_PROFILE } from '../config/api.config';
 import { AccountStateOfTx, toTransactionSummary, TransactionSummary } from './transaction-summary';
@@ -93,12 +94,7 @@ export interface TransactionsPage {
   marker?: string;
 }
 
-interface TimeKey {
-  ledger_index: number;
-  tx_index: number;
-}
-
-interface SequenceKey extends TimeKey {
+interface SequenceKey extends TxKey {
   sequence: number;
 }
 
@@ -141,7 +137,7 @@ export class AccountTransactionsService {
     const cursor = keysetClause(TIME_KEYS, q.descending, after);
     // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
     // used), with one more than the page: it tells whether there is a next page
-    const found = await readDistinctPage<TimeKey>(this.ch, {
+    const found = await readDistinctPage<TxKey>(this.ch, {
       columns: 'ledger_index, tx_index',
       table: Table.AccountTransactions,
       where: [...window.conditions, ...(cursor.clause !== '' ? [cursor.clause] : [])],
@@ -265,7 +261,7 @@ export class AccountTransactionsService {
   async bySequence(account: string, sequence: number, binary: boolean): Promise<TxObject | undefined> {
     // above what a sequence can be: no transaction has it, and the database would refuse the parameter
     if (sequence > MAX_SEQUENCE) return undefined;
-    const [key] = await this.ch.query<TimeKey>(
+    const [key] = await this.ch.query<TxKey>(
       `SELECT ledger_index, tx_index FROM ${Table.AccountTxBySequence}
         WHERE account = {account:String} AND sequence = {sequence:UInt32}
         ORDER BY account DESC, sequence DESC, ledger_index DESC, tx_index DESC
@@ -282,14 +278,14 @@ export class AccountTransactionsService {
    * original never asked for it on these routes. A summary row is read from the stored transaction, without the codec,
    * and from the account's states that the page's transactions wrote (`statesOf`).
    */
-  private async page(keys: TimeKey[], marker: string | undefined, q: ListQuery): Promise<TransactionsPage> {
+  private async page(keys: TxKey[], marker: string | undefined, q: ListQuery): Promise<TransactionsPage> {
     if (q.form === 'summary') {
       const [rows, states] = await Promise.all([this.txs.fetchByKeys(keys), this.statesOf(q.account, keys)]);
       const transactions = rows.map((row) =>
         toTransactionSummary(row, q.account, {
           ctx: this.ctx,
           flagNames: this.flagNames,
-          state: states.get(`${row.ledger_index}:${row.tx_index}`),
+          state: states.get(txKeyString(row)),
         }),
       );
       return { transactions, ...(marker !== undefined && { marker }) };
@@ -305,27 +301,15 @@ export class AccountTransactionsService {
    * `STATE_PARSER_VERSION` wrote, has none. The account prefix and the page's range of ledgers bound the read to the
    * page; a row written twice is the same row.
    */
-  private async statesOf(account: string, keys: TimeKey[]): Promise<Map<string, AccountStateOfTx>> {
+  private async statesOf(account: string, keys: TxKey[]): Promise<Map<string, AccountStateOfTx>> {
     if (keys.length === 0) return new Map();
-    const ledgers = keys.map((k) => k.ledger_index);
-    const rows = await this.ch.query<AccountStateOfTx & TimeKey>(
+    const among = txKeysIn(keys);
+    const rows = await this.ch.query<AccountStateOfTx & TxKey>(
       `SELECT ledger_index, tx_index, node_index, flags
          FROM ${Table.AccountStates}
-        WHERE account = {account:String}
-          AND ledger_index BETWEEN {min:UInt32} AND {max:UInt32}
-          AND (ledger_index, tx_index) IN (
-              SELECT tupleElement(key, 1), tupleElement(key, 2)
-                FROM (SELECT arrayJoin(arrayZip({ledgers:Array(UInt32)}, {indexes:Array(UInt32)})) AS key))`,
-      {
-        account,
-        min: Math.min(...ledgers),
-        max: Math.max(...ledgers),
-        ledgers,
-        indexes: keys.map((k) => k.tx_index),
-      },
+        WHERE account = {account:String} AND ${among.clause}`,
+      { account, ...among.params },
     );
-    return new Map(
-      rows.map((row) => [`${row.ledger_index}:${row.tx_index}`, { node_index: row.node_index, flags: row.flags }]),
-    );
+    return new Map(rows.map((row) => [txKeyString(row), { node_index: row.node_index, flags: row.flags }]));
   }
 }

@@ -201,8 +201,8 @@ the metadata). Amounts are exact `String`s in whole units; the issuers are `''` 
 `PARSER_VERSION` 4 on (`PATH_PARSER_VERSION`): an offer crossed is an Offer node whose `TakerPays` or `TakerGets` moved (an
 unfunded or expired offer removed on the way is not one); a pool crossed is a pool whose AccountRoot balance or reserve line moved;
 an account rippled through is one, other than the source, the destination, the delivered currency's issuer, a pool and the owner of
-an offer crossed, whose balance went up on one trust line and down on another of the same currency while it holds a balance on one
-of them (an issuer passing its own currency between two holders is not rippling). A payment with none of the three is not a path
+an offer crossed, whose balance went up on one trust line and down on another of the same currency (an issuer of another currency
+than the delivered one passing its own currency between two lines is rippling, as GLOSSARY.md has it). A payment with none of the three is not a path
 payment: rippling only through the issuer, or a `Paths` field that went unused. In `CHILD_TABLES` and `LEDGER_KEYED_TABLES`, with the
 dedup window; a ledger written by an older parser has no rows until it is re-ingested. Read by `/path_payments` and, through
 `account_path_payments`, by `/accounts/{a}/path_payments`.
@@ -327,8 +327,8 @@ It is a child table like the others (`CHILD_TABLES`, `LEDGER_KEYED_TABLES`, the 
 `--reprocess`), written from `PARSER_VERSION` 3 (`STATE_PARSER_VERSION`). **The state of an account at ledger L is its newest row at or
 before L**, and none when that row is deleted: a read `ORDER BY ledger_index DESC, tx_index DESC, node_index DESC LIMIT 1` in the
 account's prefix. **Coverage**: the table holds the state of ledger L when every stored ledger from L up was written by version 3 or
-later (gaps in the ledger numbers do not matter), so it starts above the newest ledger an older parser wrote, and an account that has
-not changed since then has no row yet; the history spec fills it back to ledger 32570. Read by `/accounts/{a}?flags=true` and
+later (gaps in the ledger numbers do not matter: it relies on the stored ledgers being complete above its start, which gap repair
+keeps), so it starts above the newest ledger an older parser wrote, and an account that has not changed since then has no row yet; the history spec fills it back to ledger 32570. Read by `/accounts/{a}?flags=true` and
 `/accounts/{a}/balances` (the native balance) with a ledger named, through `AccountStatesService` (`StateLedgerService` resolves the
 ledger and checks the coverage), and by the CSV of `/accounts/{a}/transactions`, whose `flags_changed` compares the row a
 transaction wrote for the account with the account's `Flags` in that node's `PreviousFields` (the node of `node_index` in the
@@ -349,9 +349,11 @@ for the node that removed the line). An issuer's holders are the issuer's own ro
 
 It is a child table like `account_states`, written from `PARSER_VERSION` 3 and under the same gate (`STATE_PARSER_VERSION`), so the
 two tables share one coverage. **The lines of an account at ledger L** are, for each (counterparty, currency) of the account, its
-newest row at or before L, unless that row is deleted: `ORDER BY counterparty, currency, ledger_index DESC, tx_index DESC,
-node_index DESC LIMIT 1 BY counterparty, currency` in the account's prefix, then `deleted = 0`. That groups every row of the account up
-to L, so an issuer's read grows with its whole line history (see the risk in the
+newest row at or before L, unless that row is deleted. A read is bounded: an inner select reads the account's prefix in the order of
+the whole key, from the marker on, with a plain `LIMIT` of the rows wanted plus room, and an outer one groups them by line with
+`argMax(..., (ledger_index, tx_index, node_index))`; every line it read is whole but the last one of a read that stopped at its cap,
+which the next read (after the last whole line, sized by the rows a line took) reads again. A line still costs its whole history up
+to L, so a page of an issuer's lines grows with those lines' history (see the risk in the
 [API reference](api-reference.md#get-v2accountsaddresstrustlines)). Read by `/accounts/{a}/trustlines`, and by `/accounts/{a}/balances`
 with a ledger named (both through `TrustLinesService`).
 
@@ -381,7 +383,7 @@ The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM 
 | `agg_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_hour, to_hour)` | Hour ranges whose stats must be recomputed because ingest rewrote ledgers behind the aggregator | aggregator |
 | `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network: `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
 | `account_network_names` | `MergeTree`, `ORDER BY (address, added_at)`, no partition (migration 009) | One row per change of the **account network name** of an address on this network ("USD Issuer"): the columns of [`account_names`](#account_names-no-partition-mergetree-order-by-address-added_at) of the shared database (`address`, `name`, `removed UInt8`, `added_by`, `added_at DateTime64(3, 'UTC')`) and its rules: append-only, the newest row of an address wins (at the same `added_at` a removal wins), a newest row that is a removal or names nothing means no network name. Written by the operator ([operations](operations.md#name-an-account-on-one-network)); never `FINAL`, read whole with `LIMIT 1 BY address` and reloaded with the names every 60 s | `/v2/accounts/{address}` (`account_network_name`) |
-| `export_jobs` | `MergeTree`, `ORDER BY (id, seq)`, TTL 7 d on `created` | The states of an export job, append-only in the manner of `ingest_log`: `id` (32 random hex digits), `seq` (0 for the api's `queued` row, one more for every state the exporter writes), `key_hash` (the hex SHA-256 of the creating API key, never the key; `''` without one), `path`, `format` (`csv` or `pdf`), `status Enum8('queued'=1,'running'=2,'done'=3,'failed'=4)`, `created` and `at` (`DateTime64(3,'UTC')`), `rows`, `object` (the storage key `<network>/<id>.<format>`) and `error`. Every row repeats the job, so the row with the highest `seq` of an id is the job: `ORDER BY id, seq DESC LIMIT 1 BY id`, no `FINAL`. Each `POST /v2/exports` counts the jobs of its `key_hash` whose newest row is `queued` or `running` (the limit per key, ticket #16): a scan of 7 days of jobs, as the key is not in the `ORDER BY` | `/v2/exports`, the exporter |
+| `export_jobs` | `MergeTree`, `ORDER BY (id, seq)`, TTL 7 d on `created` | The states of an export job, append-only in the manner of `ingest_log`: `id` (32 random hex digits), `seq` (0 for the api's `queued` row, one more for every state the exporter writes), `key_hash` (the hex SHA-256 of the creating API key, never the key; `''` without one), `path`, `format` (`csv` or `pdf`), `status Enum8('queued'=1,'running'=2,'done'=3,'failed'=4)`, `created` and `at` (`DateTime64(3,'UTC')`), `rows`, `object` (the storage key `<network>/<id>.<format>`) and `error`. Every row repeats the job, so the row with the highest `seq` of an id is the job, no `FINAL`: one job is `WHERE id = … ORDER BY seq DESC LIMIT 1` (a key range), and the exporter's queue (the oldest jobs whose newest row is `queued`, or `running` on start) is `argMax` of the state by `seq` grouped by `id` (never `LIMIT 1 BY` in the select that reads the table, [clickhouse](clickhouse.md#reading-a-page-what-stops-the-read)), a scan of 7 days of jobs that answers a batch of at most 100. Each `POST /v2/exports` counts the jobs of its `key_hash` whose newest row is `queued` or `running` (the limit per key, ticket #16): a scan of 7 days of jobs, as the key is not in the `ORDER BY` | `/v2/exports`, the exporter |
 
 The three **version sets** (`validator_votes` with `amendment_tallies` for a voting ledger, `validator_agreement_hourly` for an hour)
 follow the pattern of `volume_daily`: a unit is written whole under one `version` (wall-clock milliseconds, greater than any version
@@ -484,8 +486,8 @@ The files so far:
 | `006_trust_line_states.sql` | One `CREATE TABLE IF NOT EXISTS`: `trust_line_states`, the trust line state history of ADR-0015 (a ledger-derived table, written from parser version 3, under the gate of `account_states`). Additive and run again safely. Required before the syncer (its ledger writer inserts into the table on every ledger, and fails without it) and before the API (`/trustlines`, and `/balances` with a ledger, read it) |
 | `007_path_payments.sql` | One `CREATE TABLE IF NOT EXISTS`: the ledger-derived `path_payments`. Additive: it depends on no other table, so it applies on a fresh and on a migrated database. It is required before a syncer with `PARSER_VERSION` 4 (that syncer's writes fail without the table) and before the API serves `/path_payments` (rollout: [backfill](backfill.md#path-payments-re-ingest)). |
 | `008_account_path_payments.sql` | One `CREATE TABLE IF NOT EXISTS`: the ledger-derived `account_path_payments`, the index of `path_payments` by account. Additive and run again safely; it depends on no other table. Required before a syncer with `PARSER_VERSION` 4 (that syncer's writes fail without the table) and before the API serves `/accounts/{a}/path_payments`; ship it with 007 (rollout: [backfill](backfill.md#path-payments-re-ingest)) |
-| `009_account_network_names.sql` | `account_network_names`, one `CREATE TABLE IF NOT EXISTS` ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)). Additive: it reads no other table. 005 to 008 are numbers reserved by other changes of spec #4; the runner applies whatever files there are in file-name order, so a gap is harmless and a later 005 applies after 009 on a database that already ran 009. Required before an api that reads it: without it the api serves every account without a network name and logs `Could not load the account network names` at every reload |
-| `010_export_jobs.sql` | One `CREATE TABLE IF NOT EXISTS`: `export_jobs`, the states of the export jobs (ticket #15). Additive: it reads no other table. Number 006 is kept for another table of spec #4. Required before the api serves `/v2/exports` and before the exporter starts |
+| `009_account_network_names.sql` | `account_network_names`, one `CREATE TABLE IF NOT EXISTS` ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)). Additive: it reads no other table. The runner applies the files it has not applied in file-name order, so a database that ran 009 before 005 to 008 existed applies those after it (each is additive). Required before an api that reads it: without it the api serves every account without a network name and logs `Could not load the account network names` at every reload |
+| `010_export_jobs.sql` | One `CREATE TABLE IF NOT EXISTS`: `export_jobs`, the states of the export jobs (ticket #15). Additive: it reads no other table. Required before the api serves `/v2/exports` and before the exporter starts |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are

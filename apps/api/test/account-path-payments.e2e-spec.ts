@@ -8,7 +8,10 @@ import { csvDisposition } from './support/csv';
  * suite checks them against the metadata), here the ones the account sent or received.
  */
 
-/** USD of Bitstamp to USD of SnapSwap, rippling through the market maker rP7J...; its ledger holds a second, equal one. */
+/**
+ * USD of Bitstamp to USD of SnapSwap, rippling through the market maker rP7J... and Bitstamp; its ledger holds a second,
+ * equal one.
+ */
 const THROUGH_A_MARKET_MAKER = {
   hash: 'E362675D8230B1A615C9BF53BC0B288F3AAA36CDF8D4D3E3EE8A681966BE8397',
   ledger_index: 11999941,
@@ -23,7 +26,7 @@ const THROUGH_A_MARKET_MAKER = {
   source_issuer: 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B',
   offers_crossed: 0,
   amm_pools: [],
-  rippled_through: ['rP7JWWD4zgm3GX1szbghTi2NXUniitWAKV'],
+  rippled_through: ['rP7JWWD4zgm3GX1szbghTi2NXUniitWAKV', 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B'],
 };
 const MARKET_MAKER_SOURCE = THROUGH_A_MARKET_MAKER.source;
 const MARKET_MAKER_DESTINATION = THROUGH_A_MARKET_MAKER.destination;

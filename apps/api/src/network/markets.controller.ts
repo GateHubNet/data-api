@@ -13,6 +13,8 @@ import { MarketsService } from './markets.service';
 /** `min_trades` when the request has none. */
 const DEFAULT_MIN_TRADES = 10;
 const MAX_MIN_TRADES = 1_000_000;
+/** The largest `limit`: the most markets of one answer (the list has no marker). */
+const MARKETS_MAX = 5000;
 
 /** The `period`: `day` when missing or empty, else 400 `invalid period - use: day, 7day, 30day`. */
 function periodParam(query: QueryParams): MarketsPeriod {
@@ -53,7 +55,7 @@ export class MarketsController {
 
   @Get('markets')
   @RippleRoute('unable to retrieve markets')
-  @Csv('markets', 'markets')
+  @Csv('markets', 'markets', { maxLimit: MARKETS_MAX })
   @ApiOperation({
     summary: 'Get the trade statistics of every market in a live period',
     description:
@@ -133,7 +135,7 @@ export class MarketsController {
       period,
       amm,
       minTrades,
-      limit: limitParam(query, { def: 1000, max: 5000 }),
+      limit: limitParam(query, { def: 1000, max: MARKETS_MAX }),
       ...(display && { display }),
     });
   }

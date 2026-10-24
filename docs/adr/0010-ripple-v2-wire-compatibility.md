@@ -267,7 +267,9 @@ addition: what the original served is served as before. Names and labels are ser
     state at the ledger, the trust lines those of `/trustlines` at the ledger. The answer keeps its shape, precedence, `currency`,
     `counterparty`, `limit` (200, max 400, or `all`), CSV and messages, with three differences: the trust lines are **ordered by
     (`counterparty`, `currency`)**, not in the node's order; the answer always carries the ledger's `close_time` (before, only a
-    `date` gave one); and it is not in the live cache, so it carries the global `Cache-Control`, not the live one. The rules of
+    `date` gave one); and it is not in the live cache, so it carries the global `Cache-Control` (`GH_CACHE_CONTROL`, `private,
+    max-age=60` by default), not the live one it had while read from the node (`private, max-age=<GH_LIVE_CACHE_TTL_MS in whole
+    seconds>`, or `no-store` with the live cache off). The rules of
     item 60 apply: a ledger this API does not hold or the state history does not cover is 400 `the date provided is too old`, an
     account with no state at the ledger or deleted at or before it 404 `account not found`. No ledger named, `validated`, `closed`
     and `current` still read the node, as does every ledger of `/orders`.
@@ -304,7 +306,7 @@ format`, `invalid end date format`, `invalid marker`), with the 500 `unable to r
 **Exports** (items 68 to 72). The wording is in [api-reference](../api-reference.md#exports).
 
 68. **Exports.** The original had no exports: a client walked the pages itself. Here `POST /v2/exports` with `{path, format}` queues
-    an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`) and answers
+    an export of any list with a CSV form (`path` is the list's `/v2/…?…` path, a list over time names `start` and `end`, or `min_sequence` or `max_sequence` for the account transactions by sequence) and answers
     202 `{result, id, status: "queued"}`; `GET /v2/exports/{id}` answers `{result, id, status, format, path, created, finished?,
     rows?, error?, url?}`. Both are routes of their own: no route of the original changes.
 69. **An export is the list.** The file is made by the exporter of the network, which walks the list's own CSV pages through the
@@ -317,7 +319,7 @@ format`, `invalid end date format`, `invalid marker`), with the 500 `unable to r
     `{"result":"error","message":"too many exports in progress: at most 3 per API key"}`, the body of every error of these routes,
     not the rate limit's `{"error":…}` (a different limit, with no time to wait for). An export holds at most 1,000,000 rows as CSV
     and 10,000 as PDF (`GH_EXPORT_MAX_ROWS_CSV`, `_PDF`). Where the list counts its rows up front (the account transactions by
-    time) an export above the cap answers 400 at once; any other export fails when its list passes the cap, with the same message
+    time, the path payments of the network or of an account by window) an export above the cap answers 400 at once; any other export fails when its list passes the cap, with the same message
     as its `error`: `the list has more than <cap> rows, the most a CSV export holds: narrow the window` (for PDF, `... a PDF export
     holds: narrow the window or use CSV`).
 72. **PDF exports.** The original had no PDF. Here `format: "pdf"` makes a document of the same walked list, rendered by the

@@ -1,5 +1,5 @@
+import { METRICS_SOURCE, PrometheusController } from '@gatehub/data-api-shared';
 import { Global, Module } from '@nestjs/common';
-import { PrometheusController } from './prometheus.controller';
 import { PrometheusService } from './prometheus.service';
 
 /**
@@ -10,7 +10,7 @@ import { PrometheusService } from './prometheus.service';
 @Global()
 @Module({
   controllers: [PrometheusController],
-  providers: [PrometheusService],
+  providers: [PrometheusService, { provide: METRICS_SOURCE, useExisting: PrometheusService }],
   exports: [PrometheusService],
 })
 export class PrometheusModule {}

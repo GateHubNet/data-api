@@ -15,7 +15,15 @@ export interface ExportableRoute {
    * has to name both. Any other list is one at a point in time (it may name a ledger) or has no window at all.
    */
   overTime: boolean;
+  /**
+   * A list over time that also takes a window of sequences: its parameters include `min_sequence` or `max_sequence`
+   * (the account transactions by sequence). A path that names one of them has a window without `start` and `end`.
+   */
+  bySequence: boolean;
 }
+
+/** The parameters of a list by sequence: one of them, not empty, is a window. */
+export const SEQUENCE_WINDOW = ['min_sequence', 'max_sequence'] as const;
 
 /** One segment of a route pattern: a literal, or the name of a `:param`, which matches any one segment. */
 type Segment = { literal: string } | { param: string };
@@ -70,13 +78,14 @@ export class ExportableRoutes implements OnModuleInit {
         }[];
         const query = new Set(params.filter((p) => p.in === 'query').map((p) => p.name));
         const overTime = query.has('start') && query.has('end');
+        const bySequence = SEQUENCE_WINDOW.some((name) => query.has(name));
         const counter = Reflect.getMetadata(EXPORT_COUNT, handler) as ExportCounter<unknown> | undefined;
         const instance: unknown = wrapper.instance;
         const count: BoundCounter | undefined = counter && ((params, q) => counter(instance, params, q));
         for (const prefix of prefixes) {
           for (const path of pathsOf(Reflect.getMetadata(PATH_METADATA, handler))) {
             const pattern = `/${[...segmentsOf(prefix), ...segmentsOf(path)].join('/')}`;
-            found.push({ route: { pattern, overTime }, ...(count && { count }) });
+            found.push({ route: { pattern, overTime, bySequence }, ...(count && { count }) });
           }
         }
       }

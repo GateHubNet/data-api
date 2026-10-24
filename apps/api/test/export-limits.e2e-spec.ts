@@ -173,6 +173,43 @@ describe('export limits', () => {
       },
     );
 
+    it.each([
+      ['the path payments of the network', `/v2/path_payments?${WINDOW}`, 'csv', 61, 400],
+      [
+        'the path payments of an account above the cap',
+        `/v2/accounts/${PAYING[0]}/path_payments?${WINDOW}`,
+        'csv',
+        57,
+        400,
+      ],
+      [
+        'the path payments of an account at the cap',
+        `/v2/accounts/${PAYING[1]}/path_payments?${WINDOW}`,
+        'csv',
+        23,
+        202,
+      ],
+      ['the same in PDF, above its cap', `/v2/accounts/${PAYING[1]}/path_payments?${WINDOW}`, 'pdf', 23, 400],
+      ['a window without ledgers', '/v2/path_payments?start=2030-01-01&end=2031-01-01', 'pdf', 0, 202],
+    ])(
+      'counts path payments up front by window, as the list serves them: %s',
+      async (_case, path, format, rows, code) => {
+        expect(await rowsOf(path)).toBe(rows);
+        const res = await post({ path, format });
+        expect([res.status, res.body.message]).toEqual([
+          code,
+          code === 400
+            ? `the list has more than ${format === 'csv' ? CSV_CAP : PDF_CAP} rows, ${
+                format === 'csv'
+                  ? 'the most a CSV export holds: narrow the window'
+                  : 'the most a PDF export holds: narrow the window or use CSV'
+              }`
+            : undefined,
+        ]);
+        await drain();
+      },
+    );
+
     it('does not count the list by sequence up front: the exporter holds it to the cap', async () => {
       const path = transactions(SENDER, `${WINDOW}&min_sequence=1`);
       expect(await rowsOf(path)).toBeGreaterThan(CSV_CAP);

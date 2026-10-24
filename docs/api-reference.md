@@ -466,7 +466,7 @@ The path payments of the ledgers that closed in the window, across the network, 
       "source": "rLD5…", "destination": "rGhs…",
       "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
       "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
-      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…", "rvYAf…"]
     }
   ]
 }
@@ -487,9 +487,10 @@ source_currency, source_issuer?, offers_crossed, amm_pools, rippled_through`.
   the way is not counted.
 - `amm_pools`: the AMM pools whose holdings it changed, by pool account, in the order of the metadata.
 - `rippled_through`: the accounts that rippled the payment between two of their trust lines in one currency (the balance went up on
-  one and down on the other) while holding a balance on one of them, in the order of the metadata: a market maker. The source, the
-  destination, the delivered currency's issuer, the pools and the owners of the offers crossed are never listed, and neither is
-  another issuer that only passed its own currency from one holder to another.
+  one and down on the other), in the order of the metadata: a market maker, or the issuer of another currency than the delivered
+  one passing its own currency from one line to the next (the source currency's issuer, or that of a currency on the way). The
+  source, the destination, the delivered currency's issuer, the pools and the owners of the offers crossed are never listed. So a
+  payment that ripples straight from one issuer to another, with no offer and no pool, is a path payment.
 
 In the CSV the columns are these keys; `amm_pools` and `rippled_through` are one cell each, their accounts separated by a space.
 
@@ -518,7 +519,7 @@ under an account: one that is none has no path payments.
       "source": "rLD5…", "destination": "rGhs…",
       "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
       "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
-      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…", "rvYAf…"]
     },
     "…"
   ]
@@ -824,7 +825,10 @@ Ledger and `DisallowIncomingRemit` on Xahau).
 
 The flags at a ledger are those of the account's last change at or before it. The state history covers the ledgers above the newest
 ledger written by a parser older than parser version 3 (gaps in the ledger numbers do not matter); see
-[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet.
+[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet. The
+coverage relies on the stored ledgers being complete above its start: a ledger missing there would leave out the changes it made,
+and nothing in the coverage would show it. Gap repair keeps them complete
+([backfill](backfill.md#resuming-gap-repair-reprocessing)).
 
 Errors, in order: 400 `invalid date format`, `invalid ledger hash` (only with `flags=true`); 404 `Account not found` (no activation);
 400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
@@ -1035,7 +1039,9 @@ is too old` (historical: see above; current: the node does not have the ledger),
 the ledger, or the node does not know it); 500 `unable to retrieve balances`.
 
 **Differences from data.ripple.com**: a historical ledger is read from the state history, not from the node, so its trust lines are
-ordered by (counterparty, currency) rather than in the node's order, and its answer always has `close_time`
+ordered by (counterparty, currency) rather than in the node's order, its answer always has `close_time`, and it is not in the
+live cache, so it carries the global `GH_CACHE_CONTROL` (`private, max-age=60` by default) instead of the live
+`private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` or `no-store` it had while it was read from the node
 ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) item 63); the default ledger
 is the newest **validated** one (the original asked for the open ledger); `ledger_hash` is honored (it was ignored); trust lines are
 paged until the limit is filled with lines that pass the filters (the original cut the first page and filtered afterwards, so a
@@ -1086,8 +1092,8 @@ ordered and paged by (`counterparty`, `currency`). An issuer's lines are its hol
 Precedence: `ledger_hash` > `date` > `ledger_index`, as on `/balances`. With no ledger named the route reads the newest ledger this
 API has indexed (not the node's validated ledger), so a marker always belongs to this API's data and the pages never mix two sources;
 that ledger trails the network by the ingest delay. The marker is the (counterparty, currency) of the last line and does not hold the
-ledger: each page without a ledger named reads the newest ledger again, so a walk (or an [export](#exports)) that must be one ledger's
-names it with `ledger_index`, the `ledger_index` of the first page.
+ledger: each page without a ledger named reads the newest ledger again, so a walk that must be one ledger's names it with
+`ledger_index`, the `ledger_index` of the first page. An [export](#exports) does that itself.
 
 ```json
 { "result": "success", "ledger_index": 26926380, "close_time": "2017-01-12T18:49:31Z", "count": 1, "marker": "…",
@@ -1108,16 +1114,21 @@ limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer
 
 The lines at a ledger are those of their last change at or before it. The state history covers the ledgers above the newest ledger
 written by a parser older than parser version 3, the same coverage as the account flags (see
-[backfill](backfill.md#account-state-history-re-ingest)); a line that has not changed since that start is not listed yet.
+[backfill](backfill.md#account-state-history-re-ingest)); a line that has not changed since that start is not listed yet. Gaps in
+the ledger numbers do not matter: the coverage relies on the stored ledgers being complete above its start, which gap repair keeps
+([backfill](backfill.md#resuming-gap-repair-reprocessing)).
 
 Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`;
 400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
 history does not cover, the newest one included when no ledger is named); 500 `unable to retrieve trustlines`.
 
-**Risk: an issuer's lines.** The read groups the account's whole line history up to the ledger, and every payment in an issuer's
-currencies changes its lines, so a big issuer's read may exceed the api's query guards (30 s, `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, and
-2 GiB, `API_CLICKHOUSE_MAX_QUERY_MEMORY` in production) and answer its 500. It can only be measured once
-the history spec has filled the tables; the remedy would be periodic state snapshots.
+**Risk: an issuer's lines.** A page reads the account's rows in the order of the table's key from the marker on, with a plain
+`LIMIT` (about the rows of the page's lines and a few granules of each part), and keeps each line's newest row up to the ledger
+(`argMax`); `/balances?limit=all` reads its lines that way, 1,000 at a time. A line's newest row is found by reading its whole
+history up to the ledger, and every payment in an issuer's currencies changes its lines, so a page of a big issuer's lines costs the
+history of those lines and may exceed the api's query guards (30 s, `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, and 2 GiB,
+`API_CLICKHOUSE_MAX_QUERY_MEMORY` in production) and answer its 500. It can only be measured once the history spec has filled the
+tables; the remedy would be periodic state snapshots.
 
 ### `GET /v2/accounts/{address}/reports[/{date}]`
 
@@ -3234,15 +3245,33 @@ Asks for an export. The body is JSON:
 | `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list. |
 | `format` | `csv` or `pdf` (see [PDF](#pdf)). |
 
-A **list over time** (a route that takes `start` and `end`) must name both. A list at a point in time (`/balances`, `/orders`)
-may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`) names none. The other
-parameters are not checked here: a list that refuses them makes a failed export, which says why.
+A **list over time** (a route that takes `start` and `end`) must name both, unless it also takes a window of sequences and the path
+names `min_sequence` or `max_sequence` (the account transactions by sequence): those are its window. A list at a point in time (`/balances`,
+`/trustlines`, `/orders`) may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`)
+names none. The other parameters are not checked here: a list that refuses them makes a failed export, which says why.
+
+**The whole list.** Every CSV answer says in `X-List-Paging` how its whole list is read: `marker` (page by page), `limit=all`
+(`/balances` and `/orders`, which have no marker: the exporter asks for `limit=all`), `whole` (the route has no `limit`),
+`max=<n>` (no marker and no `limit=all`, and `limit`, at most `n`, counts the rows: the account analytics counterparties and
+exchange pairs, 1000, and `/v2/network/markets`, 5000), or `none` (a `limit` that does not count rows, such as the lines of the
+account balance history). A `max=<n>` list is asked once with `limit=<n>`: an answer with fewer rows is the whole list, and one with
+`n` rows may be cut, so the export fails with `the list answered <n> rows, the most it serves at once, and has no pages: it may be
+longer, and an export would cut it`. An export of a `none` list fails with `the list has no pages and cannot be read whole (no
+marker, no limit=all): an export would cut it at its limit`. Neither is ever cut to its first answer.
+
+**One ledger.** When the path of a list at a point in time names no ledger (no `ledger_hash`, `date` or numeric `ledger_index`;
+a word such as `validated` names none), the exporter takes the newest ledger this API has indexed when it starts the export
+(`GET /v2/ledgers`) and names it as `ledger_index` on every page it walks, so the file is that one ledger even when newer ones
+are indexed meanwhile, and a PDF says which (`At: ledger <n>, the newest indexed when the export was made`). A list counts as one
+at a point in time when its answer at that ledger has that `ledger_index`. So an export of `/balances` without a ledger is read
+from the state history at that ledger, not from the node.
 
 **Limits.** An API key may have at most **3** exports queued or running at once (`GH_EXPORT_MAX_JOBS_PER_KEY`); one more
 answers 429, and an export that is done or has failed frees its place. An export holds at most **1,000,000 rows as CSV** and
 **10,000 as PDF** (`GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`). Where the list counts its rows up front, an export above
 the cap is refused at once with 400; today that is the account transactions by time (`/v2/accounts/{address}/transactions` with
-its window, `type` and `result`; not the list by sequence). Any other export is held to the cap as it is made: the exporter stops
+its window, `type` and `result`; not the list by sequence) and the path payments by window (`/v2/path_payments`,
+`/v2/accounts/{address}/path_payments`). Any other export is held to the cap as it is made: the exporter stops
 at the page that passes it, and the export fails with the same message.
 
 The answer is 202:
@@ -3301,7 +3330,7 @@ header, one line each:
   it, read through the api like the rows (an address without an activation on the network has none);
 - `Network:` (`XRP Ledger` or `Xahau`), `List:` (the `path` as asked);
 - `Window: <start> to <end>` (`, newest first` with `descending=true`), or for a list at a point in time `At:` the ledger or date
-  it names;
+  it names, or else the ledger the exporter walked it at (see "One ledger" above);
 - `Ledgers: <lowest> to <highest>`: the ledgers of its rows (`ledger_index`); `none (no rows)`, or `not given by the list` for a
   list whose rows have no ledger;
 - `Rows:` and `Made:` (the time, UTC, to the second).
