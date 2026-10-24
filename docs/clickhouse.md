@@ -9,7 +9,7 @@ The workload is append-only, ledger-ordered data read two ways: selective lookup
 and aggregates (candles, rates, volumes, stats). That is columnar-OLAP territory and what the previous design (a search engine
 used for aggregations) was weakest at ([ADR-0001](adr/0001-use-clickhouse.md)).
 
-One ClickHouse **server** holds one **database per network** (`xrpl`, `xahau`), each with the same 51 tables
+One ClickHouse **server** holds one **database per network** (`xrpl`, `xahau`), each with the same 52 tables
 ([ADR-0009](adr/0009-one-deployment-per-network.md)). The image is pinned to `clickhouse/clickhouse-server:26.8.14.3` (the schema
 and the syncer's recovery rely on partition-scoped lightweight `DELETE` and on `async_insert=0`, both verified on that version);
 `clickhouse-keeper` is pinned to the same version.
@@ -194,11 +194,11 @@ tables that must agree**, so retention is never per table:
   behind its checkpoint, so a half-dropped ledger is not repaired by re-ingesting its range.
 - A ledger with a `ledgers` row but fewer stored transactions than its `tx_count` answers **500** on `/v2/ledgers/{id}`; payments, exchanges and balance changes
   whose tables were dropped just vanish from lists.
-- Partition sizes differ: `ledgers`, `transactions`, `payments` and `amm_pool_touches` are partitioned per **1,000,000** ledgers (P6), the other fifteen ledger-keyed tables per **10,000,000** (P7),
+- Partition sizes differ: `ledgers`, `transactions`, `payments` and `amm_pool_touches` are partitioned per **1,000,000** ledgers (P6), the other sixteen ledger-keyed tables per **10,000,000** (P7),
   and `accounts_created` is not partitioned.
 
-The safe procedure drops **one 10,000,000-ledger block from all 20 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`
-(`ledgers` first, the commit marker), partition `k` of the fifteen P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`; the exact commands are in
+The safe procedure drops **one 10,000,000-ledger block from all 21 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`
+(`ledgers` first, the commit marker), partition `k` of the sixteen P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`; the exact commands are in
 [operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair
 a partial loss use `range-ingest --reprocess` over exactly the damaged range. Dropping a block makes lists in that window empty.
 
