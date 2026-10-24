@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended three times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by the account investigation data (spec #4, with [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md)), new routes, parameters and fields for investigating an account (the second amendment at the end of this record, items from 54).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -212,3 +212,18 @@ own crawler (`api/routes/network/getValidators.js`, `topology.js`); this API ser
 Kept from the original: the messages `Validator not found` and `unable to retrieve validator(s)` and the CSV name `validators.csv`. New 400s exist for the new parameters
 (`invalid scope`, `invalid publisher`, `invalid amendment`, `invalid search`, `invalid marker`, `invalid validator public key`). The endpoint-by-endpoint wording is in
 [api-reference](../api-reference.md#validators-and-amendments).
+
+## Amendment 4 (2026-10-24): account investigation data
+The account investigation data (spec #4: account transactions export, account names and labels, account state history, path
+payments, exports; the hard-to-reverse parts are [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and
+[ADR-0015](0015-historical-account-state-from-clickhouse.md)) adds routes, parameters and fields the original did not have. Each is an
+addition: what the original served is served as before.
+
+54. **`format=csv` on `GET /v2/accounts/{address}/transactions`.** The original had no CSV for account transactions and ignored
+    `format`. Here `format=csv` answers one summary row per transaction from the account's side (`hash, ledger_index, executed_time,
+    tx_type, result, initiator, counterparty, amount, currency, issuer, fee, flags_changed`), in a file `<address> - transactions.csv`,
+    with every parameter and the paging of the JSON list. The raw `tx` and `meta` are not in it: flattened, they would give a column per
+    field of every type. The JSON answer is unchanged.
+
+Kept from the original: the JSON answers of the routes it had, their parameters and their messages. The endpoint-by-endpoint wording is
+in [api-reference](../api-reference.md#get-v2accountsaddresstransactions).
