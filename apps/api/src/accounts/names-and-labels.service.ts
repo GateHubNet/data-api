@@ -1,6 +1,7 @@
 import { ClickHouseService } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ApiConfig, SHARED_DATABASE } from '../config/api.config';
+import { ACCOUNT_LABELS, AccountLabels } from './account-labels';
 import { ACCOUNT_NAMES } from './account-names';
 
 /**
@@ -10,6 +11,8 @@ import { ACCOUNT_NAMES } from './account-names';
 export interface NamesAndLabels {
   /** The account name of the address, the same on every network. */
   account_name?: string;
+  /** The labels of the address keyed by label (`scam`, `spam`, `advisory`), the same on every network. */
+  account_labels?: AccountLabels;
 }
 
 /** Where a set is read from: the app's own (network) database through `ch`, the shared one by its name. */
@@ -32,10 +35,10 @@ export interface NamesAndLabelsSet {
 }
 
 /**
- * The sets, in the order their keys come in `account_data`: account names (`account_name`), and after them the account
- * network names and the labels when those are added.
+ * The sets, in the order their keys come in `account_data`: account names (`account_name`), the account network names
+ * when they are added, then the labels (`account_labels`).
  */
-export const NAMES_AND_LABELS_SETS: readonly NamesAndLabelsSet[] = [ACCOUNT_NAMES];
+export const NAMES_AND_LABELS_SETS: readonly NamesAndLabelsSet[] = [ACCOUNT_NAMES, ACCOUNT_LABELS];
 
 /**
  * The names and labels the operator writes by hand (ADR-0014), held in memory: every set is loaded whole when the app

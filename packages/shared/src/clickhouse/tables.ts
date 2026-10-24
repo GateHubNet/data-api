@@ -67,4 +67,6 @@ export enum Table {
 export enum SharedTable {
   /** Migration 001: the account name of an address, append-only, the newest row of an address wins. */
   AccountNames = 'account_names',
+  /** Migration 002: the labels of an address (`scam`, `spam`, `advisory`), append-only, the newest row of (address, label) wins. */
+  AccountLabels = 'account_labels',
 }

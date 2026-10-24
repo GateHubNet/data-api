@@ -70,7 +70,9 @@ export class AccountsController {
     description:
       'When and by whom an account was created. An address that was created more than once (deleted and funded ' +
       'again) answers with its latest creation. `account_name` is the name the operator gave the address, the ' +
-      'same on every network, left out when it has none.',
+      'same on every network, left out when it has none. `account_labels` are the labels the operator put on the ' +
+      'address (`scam`, `spam`, `advisory`), keyed by label, each with its `description` and, when given, its ' +
+      '`source` and `url`; the same on every network, left out when it has none.',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
   async lookup(

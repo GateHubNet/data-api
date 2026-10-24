@@ -896,3 +896,24 @@ export interface AccountNamesRow {
   added_by: string;
   added_at: UnixSecondsMs;
 }
+
+/** The labels the operator can put on an address: the values of the `Enum8` of `account_labels.label`. */
+export type AccountLabel = 'scam' | 'spam' | 'advisory';
+
+/**
+ * A row of `account_labels` (`SharedTable.AccountLabels`): `source` and `url` default to `''` (none), `added_at` to the
+ * insert time.
+ */
+export interface AccountLabelsRow {
+  address: string;
+  label: AccountLabel;
+  description: string;
+  /** Who says so; `''` when nobody is named. */
+  source: string;
+  /** Where it is said; `''` when there is no link. */
+  url: string;
+  /** 1: the row removes this label from the address. */
+  removed: 0 | 1;
+  added_by: string;
+  added_at: UnixSecondsMs;
+}
