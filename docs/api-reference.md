@@ -3253,7 +3253,8 @@ from the state history at that ledger, not from the node.
 answers 429, and an export that is done or has failed frees its place. An export holds at most **1,000,000 rows as CSV** and
 **10,000 as PDF** (`GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`). Where the list counts its rows up front, an export above
 the cap is refused at once with 400; today that is the account transactions by time (`/v2/accounts/{address}/transactions` with
-its window, `type` and `result`; not the list by sequence). Any other export is held to the cap as it is made: the exporter stops
+its window, `type` and `result`; not the list by sequence) and the path payments by window (`/v2/path_payments`,
+`/v2/accounts/{address}/path_payments`). Any other export is held to the cap as it is made: the exporter stops
 at the page that passes it, and the export fails with the same message.
 
 The answer is 202:

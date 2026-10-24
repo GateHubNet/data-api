@@ -112,6 +112,35 @@ export class PathPaymentsService {
     };
   }
 
+  /** How many path payments the window of `q` holds, all its pages together (an export's count, ticket #16). */
+  async count(q: Pick<PathPaymentsQuery, 'start' | 'endExclusive'>): Promise<number> {
+    return this.countIn(Table.PathPayments, [], {}, q);
+  }
+
+  /** How many path payments `account` sent or received in the window of `q`, all its pages together. */
+  async countOfAccount(account: string, q: Pick<PathPaymentsQuery, 'start' | 'endExclusive'>): Promise<number> {
+    return this.countIn(Table.AccountPathPayments, ['account = {account:String}'], { account }, q);
+  }
+
+  /** The distinct keys of `table` in the ledgers of the window, under `conditions` (a ledger written twice counts once). */
+  private async countIn(
+    table: Table,
+    conditions: string[],
+    params: Record<string, string>,
+    q: Pick<PathPaymentsQuery, 'start' | 'endExclusive'>,
+  ): Promise<number> {
+    const range = await this.ranges.resolve(q.start, q.endExclusive);
+    if (!range) return 0;
+    const row = await this.ch.queryOne<{ n: number | string }>(
+      `SELECT count() AS n FROM (
+         SELECT DISTINCT ledger_index, tx_index FROM ${table}
+          WHERE ${[...conditions, 'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}'].join(' AND ')}
+       )`,
+      { ...params, min: range.min, max: range.max },
+    );
+    return Number(row?.n ?? 0);
+  }
+
   /** The path payments of these keys, in their order, each once; a key without a row is left out. */
   private async byKeys(keys: PathPaymentKey[]): Promise<PathPaymentsRow[]> {
     if (keys.length === 0) return [];

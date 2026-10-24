@@ -4,6 +4,7 @@ import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // not a dependency of this app (only its types are)
 import type { Request, Response } from 'express';
 import { Csv } from '../common/csv.interceptor';
+import { ExportCount } from '../common/export-count';
 import { setLinkHeader } from '../common/pagination';
 import { Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
@@ -22,11 +23,14 @@ function csvFilename(req: Request): string {
  */
 @RippleController('v2/accounts')
 export class AccountPathPaymentsController {
-  constructor(private readonly pathPayments: PathPaymentsService) {}
+  constructor(readonly pathPayments: PathPaymentsService) {}
 
   @Get(':address/path_payments')
   @RippleRoute('unable to retrieve path payments')
   @Csv(csvFilename, 'path_payments')
+  @ExportCount<AccountPathPaymentsController>((c, params, query) =>
+    c.pathPayments.countOfAccount(params.address, pathPaymentsQuery(query)),
+  )
   @ApiOperation({
     summary: 'Get the path payments of an account',
     description:

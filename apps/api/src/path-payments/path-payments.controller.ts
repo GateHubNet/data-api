@@ -4,6 +4,7 @@ import { ApiOperation, ApiQuery } from '@nestjs/swagger';
 // not a dependency of this app (only its types are)
 import type { Request, Response } from 'express';
 import { Csv, wantsCsv } from '../common/csv.interceptor';
+import { ExportCount } from '../common/export-count';
 import { setLinkHeader } from '../common/pagination';
 import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
@@ -51,11 +52,12 @@ export function pathPaymentsBody(
 /** `GET /v2/path_payments`: the path payments of the network in a window (spec #4 §4), a GateHub extra. */
 @RippleController('v2/path_payments')
 export class PathPaymentsController {
-  constructor(private readonly pathPayments: PathPaymentsService) {}
+  constructor(readonly pathPayments: PathPaymentsService) {}
 
   @Get()
   @RippleRoute('unable to retrieve path payments')
   @Csv('path payments', 'path_payments')
+  @ExportCount<PathPaymentsController>((c, _params, query) => c.pathPayments.count(pathPaymentsQuery(query)))
   @ApiOperation({
     summary: 'Get path payments',
     description:

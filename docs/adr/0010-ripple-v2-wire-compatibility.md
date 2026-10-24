@@ -317,7 +317,7 @@ format`, `invalid end date format`, `invalid marker`), with the 500 `unable to r
     `{"result":"error","message":"too many exports in progress: at most 3 per API key"}`, the body of every error of these routes,
     not the rate limit's `{"error":…}` (a different limit, with no time to wait for). An export holds at most 1,000,000 rows as CSV
     and 10,000 as PDF (`GH_EXPORT_MAX_ROWS_CSV`, `_PDF`). Where the list counts its rows up front (the account transactions by
-    time) an export above the cap answers 400 at once; any other export fails when its list passes the cap, with the same message
+    time, the path payments of the network or of an account by window) an export above the cap answers 400 at once; any other export fails when its list passes the cap, with the same message
     as its `error`: `the list has more than <cap> rows, the most a CSV export holds: narrow the window` (for PDF, `... a PDF export
     holds: narrow the window or use CSV`).
 72. **PDF exports.** The original had no PDF. Here `format: "pdf"` makes a document of the same walked list, rendered by the
