@@ -1,3 +1,4 @@
+import { NETWORK_NAMES, networkChoiceText } from '@gatehub/data-api-shared/dist/network';
 import { ApiConfig, apiKeysOf, corsOriginOf, endpointList, rateLimitKeysOf } from './api.config';
 
 interface Loaded {
@@ -147,10 +148,26 @@ describe('ApiConfig (GH_* environment)', () => {
     );
   });
 
-  it('reports an unknown network once, instead of failing on its endpoint default', async () => {
+  it("defaults GH_NODE_ENDPOINTS to the testnet's public servers", async () => {
+    const xrplTestnet = await loadConfig({ GH_NETWORK: 'xrpl-testnet' });
+    expect(xrplTestnet.exits).toEqual([]);
+    expect(xrplTestnet.cfg.nodeEndpoints).toBe('wss://s.altnet.rippletest.net:51233,wss://testnet.xrpl-labs.com');
+    const xahauTestnet = await loadConfig({ GH_NETWORK: 'xahau-testnet' });
+    expect(xahauTestnet.exits).toEqual([]);
+    expect(xahauTestnet.cfg.nodeEndpoints).toBe('wss://xahau-test.net');
+  });
+
+  it.each(NETWORK_NAMES)('takes GH_NETWORK=%s', async (name) => {
+    const { cfg, exits } = await loadConfig({ GH_NETWORK: name });
+    expect(exits).toEqual([]);
+    expect(cfg.network).toBe(name);
+  });
+
+  it('refuses another network, listing the four, once, instead of failing on its endpoint default', async () => {
     const { exits, errors } = await loadConfig({ GH_NETWORK: 'bitcoin' });
     expect(exits).toEqual([1]);
-    expect(errors).toContain('GH_NETWORK must be xrpl or xahau');
+    expect(errors).toContain(networkChoiceText('GH_NETWORK'));
+    expect(errors).toContain('GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet');
     expect(errors).not.toContain('GH_NODE_ENDPOINTS');
   });
 
@@ -161,7 +178,7 @@ describe('ApiConfig (GH_* environment)', () => {
   });
 
   it.each([
-    ['GH_NETWORK', 'bitcoin', 'GH_NETWORK must be xrpl or xahau'],
+    ['GH_NETWORK', 'bitcoin', networkChoiceText('GH_NETWORK')],
     [
       'GH_NODE_ENDPOINTS',
       'https://example.com',

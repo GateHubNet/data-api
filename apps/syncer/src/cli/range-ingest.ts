@@ -11,6 +11,8 @@ import {
   LedgerSource,
   LedgerWriter,
   LedgerWriteResult,
+  NETWORK_NAMES,
+  NetworkName,
   NodeClient,
   ParseContext,
   parseContextFor,
@@ -936,8 +938,8 @@ function closeWindowOf(ledgers: RawLedger[]): CloseWindow {
 }
 
 /** The network whose CTID network id is `ctx.networkId`: the `network` column of its `syncer_lease` row. */
-function networkOf(ctx: ParseContext): string {
-  for (const name of ['xrpl', 'xahau']) {
+export function networkOf(ctx: Pick<ParseContext, 'networkId'>): NetworkName {
+  for (const name of NETWORK_NAMES) {
     if (getNetworkProfile(name).networkId === ctx.networkId) return name;
   }
   throw new Error(`No network has the CTID network id ${ctx.networkId}: pass the network option`);

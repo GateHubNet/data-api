@@ -1,6 +1,7 @@
 import {
   clickHouseConfigFromEnv,
   getNetworkProfile,
+  networkLogText,
   NetworkProfile,
   sharedDatabaseFromEnv,
 } from '@gatehub/data-api-shared';
@@ -141,7 +142,7 @@ export class AppModule implements NestModule, OnModuleInit {
   }
 
   onModuleInit(): void {
-    new Logger('Api').log(`network=${this.profile.name} native=${this.profile.nativeCurrency}`);
+    new Logger('Api').log(`${networkLogText(this.profile)} native=${this.profile.nativeCurrency}`);
     // The service runs behind the GateHub reverse proxy (TLS termination + edge routing). Trust it so `req.ip` resolves
     // to the real client from X-Forwarded-For, which the rate limit and the logs need. `trustProxyHops` is how many
     // hops to trust (1 = the GateHub proxy).

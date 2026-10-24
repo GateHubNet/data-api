@@ -2,7 +2,7 @@
  * Record raw ledgers from a public rippled/xahaud node as gzipped test fixtures.
  *
  *   pnpm --filter @gatehub/data-api-shared record:fixtures -- \
- *     --network xrpl|xahau --endpoint <wss url> --out <dir> \
+ *     --network xrpl|xahau|xrpl-testnet|xahau-testnet --endpoint <wss url> --out <dir> \
  *     [--ledgers 1,2,3] [--txs HASH,HASH] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]
  *
  * Writes into `--out`:
@@ -25,7 +25,8 @@
  *
  * `--unl` records the validator lists of the network's default publishers instead of ledgers:
  *
- *   pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|xahau [--out <dir>]
+ *   pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl \
+ *     --network xrpl|xahau|xrpl-testnet|xahau-testnet [--out <dir>]
  *
  * It GETs each publisher URL of the network profile (Node `https`, at most 3 redirects) and writes the body exactly as
  * served to `<out>/<publisher id>.json`; `--out` defaults to `test/fixtures/<network>/unl`. It needs no node endpoint
@@ -33,8 +34,8 @@
  *
  * `--network-state` records what the validators worker asks the node for (spec 2.3) instead of ledgers:
  *
- *   pnpm --filter @gatehub/data-api-shared record:fixtures -- --network-state --network xrpl|xahau --endpoint <wss url>
- *     [--out <dir>] [--ledger <n>]
+ *   pnpm --filter @gatehub/data-api-shared record:fixtures -- --network-state \
+ *     --network xrpl|xahau|xrpl-testnet|xahau-testnet --endpoint <wss url> [--out <dir>] [--ledger <n>]
  *
  * It asks for the Amendments object at the validated ledger (or at ledger `--ledger`, which the node has to still hold:
  * the way to record a ledger with a disabled validator), then for the NegativeUNL and FeeSettings objects at that same
@@ -49,7 +50,15 @@ import { request as httpsRequest } from 'https';
 import { join, resolve } from 'path';
 import { Client } from 'xrpl';
 import { gzipSync } from 'zlib';
-import { getNetworkProfile, NetworkProfile, parseUnlPublishers, publisherIdOf } from '../src/network';
+import {
+  getNetworkProfile,
+  isNetworkName,
+  networkChoiceText,
+  NetworkName,
+  NetworkProfile,
+  parseUnlPublishers,
+  publisherIdOf,
+} from '../src/network';
 import {
   AMENDMENTS_OBJECT_INDEX,
   FEE_SETTINGS_OBJECT_INDEX,
@@ -57,7 +66,7 @@ import {
 } from '../src/validators/ledger-objects';
 
 export interface Options {
-  network: 'xrpl' | 'xahau';
+  network: NetworkName;
   /** Record the validator lists of the default publishers instead of ledgers. */
   unl: boolean;
   /** Record the ledger state the validators worker polls (Amendments, NegativeUNL, FeeSettings, `server_info`, `feature`). */
@@ -89,10 +98,10 @@ const MAX_GZ_BYTES = 2 * 1024 * 1024;
 
 /** What `main` prints after the error of a refused command line. */
 export const USAGE =
-  'usage: record-fixtures --network xrpl|xahau --endpoint <wss url> --out <dir>\n' +
+  'usage: record-fixtures --network xrpl|xahau|xrpl-testnet|xahau-testnet --endpoint <wss url> --out <dir>\n' +
   '         [--ledgers a,b,c] [--txs HASH,HASH] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]\n' +
-  '       record-fixtures --unl --network xrpl|xahau [--out <dir>]\n' +
-  '       record-fixtures --network-state --network xrpl|xahau --endpoint <wss url> [--out <dir>] [--ledger <n>]';
+  '       record-fixtures --unl --network xrpl|xahau|xrpl-testnet|xahau-testnet [--out <dir>]\n' +
+  '       record-fixtures --network-state --network xrpl|xahau|xrpl-testnet|xahau-testnet --endpoint <wss url> [--out <dir>] [--ledger <n>]';
 
 /** Bad command line. `main` prints it with the usage text and exits with status 2. */
 export class UsageError extends Error {}
@@ -126,7 +135,7 @@ export function parseArgs(argv: string[]): Options {
   for (const name of Object.keys(values)) if (!known.has(name)) usage(`unknown option --${name}`);
 
   const network = values.network;
-  if (network !== 'xrpl' && network !== 'xahau') usage('--network must be xrpl or xahau');
+  if (!isNetworkName(network)) usage(networkChoiceText('--network'));
   if (flags.has('unl') && flags.has('network-state')) usage('--unl and --network-state are separate modes');
   if ('ledger' in values && !flags.has('network-state')) usage('--ledger is only for --network-state');
   if (flags.has('network-state')) {
@@ -333,7 +342,7 @@ export interface NetworkStateRecording {
  * at L, `server_info` and `feature`. `request` gives a result or throws what the node answered (`RippledError`).
  */
 export async function recordNetworkState(o: {
-  network: 'xrpl' | 'xahau';
+  network: NetworkName;
   /** The ledger to record the state of. Default: the validated ledger. */
   ledger?: number;
   request: (command: Record<string, unknown>) => Promise<Record<string, unknown>>;

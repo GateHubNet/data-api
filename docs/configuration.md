@@ -14,8 +14,8 @@ truth are
 - Every variable is prefixed `GH_`. A class property `fooBar` is read from `GH_FOO_BAR` by the `@gatehub/toolbox`
   `ConfigService` (`@ConfigValue()`); the ClickHouse variables are read by `clickHouseConfigFromEnv`.
 - The values are validated at boot. An invalid value (a port that is not a number, an unknown worker name, a node URL that is not
-  `ws://` / `wss://`, `GH_NETWORK` other than `xrpl` / `xahau`) prints a message that **names the variable** and stops the
-  process with a non-zero exit status. Integers are plain decimal digits: `1.5`, `1e3` and `abc` are rejected.
+  `ws://` / `wss://`, `GH_NETWORK` other than `xrpl` / `xahau` / `xrpl-testnet` / `xahau-testnet`) prints a message that
+  **names the variable** and stops the process with a non-zero exit status. Integers are plain decimal digits: `1.5`, `1e3` and `abc` are rejected.
 - An unset or blank variable takes the default of the table. A variable that may be empty (`GH_API_KEYS`,
   `GH_RATE_LIMIT_KEYS`, `GH_CORS_ORIGINS`, `GH_CACHE_CONTROL`, `GH_WORKERS`, `GH_UNL_PUBLISHERS`, `GH_AMENDMENTS_CONFIG`) is
   empty when it is set to the empty string. For `GH_UNL_PUBLISHERS` that is not the default but a setting of its own: no validator
@@ -34,7 +34,7 @@ truth are
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GH_ENV` | unset | Any non-empty value: do not load an env file, the environment is the configuration. Set by both images. |
-| `GH_NETWORK` | `xrpl` | `xrpl` or `xahau`. Also read by `migrate` and `range-ingest`. |
+| `GH_NETWORK` | `xrpl` | `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`; any other value fails the boot with `GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet`. A testnet is a network of its own (its own database and files), and its boot line says `kind=testnet`. Also read by `migrate` and `range-ingest`. |
 | `GH_NODE_ENDPOINTS` | the public endpoints of the network (XRPL `wss://s2.ripple.com,wss://xrplcluster.com`, Xahau `wss://xahau.network`) | Comma separated `ws://` / `wss://` URLs of rippled / xahaud, tried in order with failover. A node that answers with a rate limit (`retry in ~<N>ms`, `slowDown`, `tooBusy`) gets nothing from the process, no request and no connection attempt, for as long as it asked (at most 20 min; 10 s without a hint); another endpoint of the list is used meanwhile. **API:** the live-state endpoints (balances, orders). **Syncer:** the ingest source (and the fee poller). A Xahau process never falls back to an XRPL node. For full-history ingest point it at your own node or at a full-history server such as `wss://s2.ripple.com`. Credentials in a URL are never logged: logs show only `scheme://host:port`. |
 | `GH_HTTP_API_PORT` | API `3001`, syncer `3002`, exporter `3005` | The main HTTP port: the REST API and the probe (API), the probe (syncer, exporter). 1-65535. |
 | `GH_METRICZ_PORT` | `3000` | Prometheus `GET /metricz` on a second HTTP app. 1-65535. |
@@ -105,8 +105,8 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 
 ## 5a. Exporter (`apps/exporter`)
 
-The exporter of a network ([architecture](architecture.md#exporter-appsexporter-gatehubdata-exporter)) reads `GH_NETWORK`,
-`GH_HTTP_API_PORT`, `GH_METRICZ_PORT` ([section 2](#2-variables-of-both-services)), the ClickHouse client variables
+The exporter of a network ([architecture](architecture.md#exporter-appsexporter-gatehubdata-exporter)) reads `GH_NETWORK`
+(any of the four names), `GH_HTTP_API_PORT`, `GH_METRICZ_PORT` ([section 2](#2-variables-of-both-services)), the ClickHouse client variables
 ([section 3](#3-clickhouse-client-api-syncer-migrate-range-ingest)) and these:
 
 | Variable | Default | Meaning |

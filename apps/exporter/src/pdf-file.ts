@@ -1,3 +1,4 @@
+import { getNetworkProfile, isNetworkName } from '@gatehub/data-api-shared';
 import { Readable } from 'node:stream';
 import PDFDocument from 'pdfkit';
 import { CsvFile } from './csv-file';
@@ -19,7 +20,7 @@ export interface PdfInput {
   file: CsvFile;
   /** The title: the name of the list's own download without `.csv` (`r… - transactions`), else the path. */
   title: string;
-  /** The network (`xrpl`, `xahau`). */
+  /** The network: its name (`xrpl`, `xahau`, `xrpl-testnet`, `xahau-testnet`). */
   network: string;
   /** The account of an account's list, with its names and labels; `undefined` for any other list. */
   account?: PdfAccount;
@@ -27,8 +28,10 @@ export interface PdfInput {
   made: Date;
 }
 
-/** How the header names a network. */
-const NETWORK_NAMES: Record<string, string> = { xrpl: 'XRP Ledger', xahau: 'Xahau' };
+/** The network line of the header: the network's display name, or the name itself when no profile has it. */
+export function networkLine(network: string): string {
+  return `Network: ${isNetworkName(network) ? getNetworkProfile(network).displayName : network}`;
+}
 
 const MARGIN = 28;
 const HEADER_SIZE = 9;
@@ -130,7 +133,7 @@ export async function renderPdf(input: PdfInput): Promise<Readable> {
   doc.moveDown(0.3).font('Helvetica').fontSize(HEADER_SIZE);
   const lines = [
     ...(input.account ? accountLines(input.account) : []),
-    `Network: ${NETWORK_NAMES[input.network] ?? input.network}`,
+    networkLine(input.network),
     `List: ${input.path}`,
     windowOf(url.searchParams),
     ledgers,

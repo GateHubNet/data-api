@@ -3,6 +3,7 @@ import {
   ClickHouseModule,
   ClickHouseService,
   getNetworkProfile,
+  networkLogText,
   ShutdownSignals,
 } from '@gatehub/data-api-shared';
 import { DynamicModule, Global, Injectable, Logger, MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
@@ -28,7 +29,7 @@ class ExporterCoreModule {
     const profile = getNetworkProfile(config.network);
     const clickHouse = clickHouseConfigFromEnv(process.env, profile);
     new Logger('Exporter').log(
-      `network=${profile.name} database=${clickHouse.database} api=${config.apiUrl} bucket=${config.exportBucket}`,
+      `${networkLogText(profile)} database=${clickHouse.database} api=${config.apiUrl} bucket=${config.exportBucket}`,
     );
     return {
       module: ExporterCoreModule,

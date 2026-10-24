@@ -2,6 +2,8 @@
 import {
   defaultUnlThreshold,
   getNetworkProfile,
+  NETWORK_NAMES,
+  networkChoiceText,
   NetworkProfile,
   parseUnlPublishers,
   UnlPublisherConfig,
@@ -218,10 +220,10 @@ function defaultUnlPublishersOf(obj: Record<string, unknown>): string {
 }
 
 export class SyncerConfig {
-  /** `GH_NETWORK`: `xrpl` or `xahau`. */
+  /** `GH_NETWORK`: `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`. */
   @ConfigValue()
   @Transform(({ obj, key }) => rawValue(obj, key) ?? defaultOf(key))
-  @IsIn(['xrpl', 'xahau'], { message: 'GH_NETWORK must be xrpl or xahau' })
+  @IsIn(NETWORK_NAMES, { message: networkChoiceText('GH_NETWORK') })
   network: string = 'xrpl';
 
   /**

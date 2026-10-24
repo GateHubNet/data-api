@@ -2,7 +2,8 @@
  * Check the amendment metadata file of a network (spec 2.6) against a public node, and optionally against what the
  * syncer indexed.
  *
- *   pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl|xahau [--endpoint <wss url>] [--clickhouse]
+ *   pnpm --filter @gatehub/data-api-shared amendments:check -- \
+ *     --network xrpl|xahau|xrpl-testnet|xahau-testnet [--endpoint <wss url>] [--clickhouse]
  *
  * It loads `config/amendments/<network>.json` (a file that does not pass the loader's checks fails the run), checks that the
  * node is of that network (`server_info.network_id`: a Xahau node for the XRPL file fails the run), asks the node for `feature`
@@ -20,7 +21,7 @@
 import { clickHouseConfigFromEnv } from '../src/clickhouse/clickhouse.config';
 import { ClickHouseService } from '../src/clickhouse/clickhouse.service';
 import { Table } from '../src/clickhouse/tables';
-import { getNetworkProfile, NetworkName, NetworkProfile } from '../src/network';
+import { getNetworkProfile, isNetworkName, networkChoiceText, NetworkName, NetworkProfile } from '../src/network';
 import {
   AMENDMENTS_OBJECT_INDEX,
   AmendmentsCheckFindings,
@@ -41,7 +42,9 @@ const CONNECT_TIMEOUT_MS = 60_000;
 
 function usage(message?: string): never {
   if (message) console.error(`error: ${message}\n`);
-  console.error('usage: amendments-check --network xrpl|xahau [--endpoint <wss url>] [--clickhouse]');
+  console.error(
+    'usage: amendments-check --network xrpl|xahau|xrpl-testnet|xahau-testnet [--endpoint <wss url>] [--clickhouse]',
+  );
   process.exit(2);
 }
 
@@ -63,7 +66,7 @@ export function parseArgs(argv: string[]): Options {
     values[name] = value;
   }
   const network = values.network;
-  if (network !== 'xrpl' && network !== 'xahau') usage('--network must be xrpl or xahau');
+  if (!isNetworkName(network)) usage(networkChoiceText('--network'));
   const endpoint = values.endpoint ?? getNetworkProfile(network).defaultNodeEndpoints[0];
   if (!/^wss?:\/\//.test(endpoint)) usage('--endpoint must be a ws:// or wss:// URL');
   return { network, endpoint, clickhouse };

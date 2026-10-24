@@ -54,7 +54,7 @@ and put the variables in the environment.
 
 ### A GH_* value rejected at boot
 **Symptom:** `GH_CATCHUP_CONCURRENCY must be a positive integer`, `GH_NODE_ENDPOINTS must be a comma separated list of ws:// or wss:// URLs`,
-`GH_NETWORK must be xrpl or xahau`, `Unknown worker "x"`. **Fix:** the message names the variable; see [configuration](configuration.md).
+`GH_NETWORK must be one of xrpl, xahau, xrpl-testnet, xahau-testnet`, `Unknown worker "x"`. **Fix:** the message names the variable; see [configuration](configuration.md).
 Integers are plain digits (`1.5`, `1e3` are rejected).
 
 ## Containers and compose

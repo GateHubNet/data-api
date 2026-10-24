@@ -1,4 +1,12 @@
-import { deleteSpans, main, parseRangeIngestArgs, uncommittedSpans, USAGE, UsageError } from './range-ingest';
+import {
+  deleteSpans,
+  main,
+  networkOf,
+  parseRangeIngestArgs,
+  uncommittedSpans,
+  USAGE,
+  UsageError,
+} from './range-ingest';
 
 describe('parseRangeIngestArgs', () => {
   it('reads the flags of the CLI', () => {
@@ -88,6 +96,18 @@ describe('main', () => {
     await expect(main(['--help'])).resolves.toBe(0);
 
     expect(log).toHaveBeenCalledWith(USAGE);
+  });
+});
+
+describe('networkOf', () => {
+  it('finds the network of each CTID id', () => {
+    expect([0, 21337, 1, 21338].map((networkId) => networkOf({ networkId }))).toEqual([
+      'xrpl',
+      'xahau',
+      'xrpl-testnet',
+      'xahau-testnet',
+    ]);
+    expect(() => networkOf({ networkId: 2 })).toThrow('No network has the CTID network id 2: pass the network option');
   });
 });
 

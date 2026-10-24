@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { gunzipSync } from 'zlib';
+import { networkChoiceText, NetworkName } from '../src/network';
 import {
   AMENDMENTS_OBJECT_INDEX,
   FEE_SETTINGS_OBJECT_INDEX,
@@ -63,10 +64,10 @@ describe('record-fixtures arguments', () => {
 
     it('needs a network and something to record', () => {
       expect(refusal(['--endpoint', 'wss://x', '--out', 'o', '--ledgers', '1'])).toContain(
-        '--network must be xrpl or xahau',
+        networkChoiceText('--network'),
       );
       expect(refusal(['--network', 'ripple', '--endpoint', 'wss://x', '--out', 'o', '--ledgers', '1'])).toContain(
-        '--network must be xrpl or xahau',
+        networkChoiceText('--network'),
       );
       expect(refusal(['--network', 'xahau', '--endpoint', 'wss://x', '--out', 'o'])).toContain(
         'give --ledgers and/or --want',
@@ -74,12 +75,14 @@ describe('record-fixtures arguments', () => {
     });
 
     it('lists the unl mode in its usage text', () => {
-      expect(refusal(['--network', 'xrpl'])).toContain('record-fixtures --unl --network xrpl|xahau [--out <dir>]');
+      expect(refusal(['--network', 'xrpl'])).toContain(
+        'record-fixtures --unl --network xrpl|xahau|xrpl-testnet|xahau-testnet [--out <dir>]',
+      );
     });
 
     it('lists the network state mode in its usage text', () => {
       expect(refusal(['--network', 'xrpl'])).toContain(
-        'record-fixtures --network-state --network xrpl|xahau --endpoint <wss url> [--out <dir>]',
+        'record-fixtures --network-state --network xrpl|xahau|xrpl-testnet|xahau-testnet --endpoint <wss url> [--out <dir>]',
       );
     });
   });
@@ -106,6 +109,14 @@ describe('record-fixtures arguments', () => {
       });
     });
 
+    it('records the lists of a testnet into its own directory', () => {
+      expect(parseArgs(['--unl', '--network', 'xrpl-testnet']).out).toBe(join(FIXTURES, 'xrpl-testnet', 'unl'));
+      expect(parseArgs(['--unl', '--network', 'xahau-testnet'])).toMatchObject({
+        network: 'xahau-testnet',
+        out: join(FIXTURES, 'xahau-testnet', 'unl'),
+      });
+    });
+
     it('takes the pnpm "--" separator', () => {
       expect(parseArgs(['--', '--unl', '--network', 'xrpl']).unl).toBe(true);
     });
@@ -117,8 +128,8 @@ describe('record-fixtures arguments', () => {
     });
 
     it('still needs a network', () => {
-      expect(refusal(['--unl'])).toContain('--network must be xrpl or xahau');
-      expect(refusal(['--unl', '--network', 'bitcoin'])).toContain('--network must be xrpl or xahau');
+      expect(refusal(['--unl'])).toContain(networkChoiceText('--network'));
+      expect(refusal(['--unl', '--network', 'bitcoin'])).toContain(networkChoiceText('--network'));
     });
 
     it('refuses the options that are for recording ledgers', () => {
@@ -185,9 +196,9 @@ describe('record-fixtures arguments', () => {
     });
 
     it('still needs a network, and now an endpoint', () => {
-      expect(refusal(['--network-state', '--endpoint', 'wss://x'])).toContain('--network must be xrpl or xahau');
+      expect(refusal(['--network-state', '--endpoint', 'wss://x'])).toContain(networkChoiceText('--network'));
       expect(refusal(['--network-state', '--network', 'bitcoin', '--endpoint', 'wss://x'])).toContain(
-        '--network must be xrpl or xahau',
+        networkChoiceText('--network'),
       );
       expect(refusal(['--network-state', '--network', 'xrpl'])).toContain('--endpoint is required');
     });
@@ -287,7 +298,7 @@ describe('recordNetworkState', () => {
       data: { error, error_code: 21, error_message: 'Entry not found.', status: 'error', type: 'response' },
     });
 
-  const record = async (n: ReturnType<typeof node>, network: 'xrpl' | 'xahau' = 'xrpl') => {
+  const record = async (n: ReturnType<typeof node>, network: NetworkName = 'xrpl') => {
     const written: Record<string, string> = {};
     const result = await recordNetworkState({
       network,

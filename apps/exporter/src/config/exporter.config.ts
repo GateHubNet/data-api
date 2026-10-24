@@ -1,3 +1,5 @@
+// Only the network profile, not the package root: the config is loaded (and its tests reload it) before anything else.
+import { NETWORK_NAMES, networkChoiceText } from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { IsIn } from 'class-validator';
@@ -27,10 +29,10 @@ const IsBucketName = validator(
 );
 
 export class ExporterConfig {
-  /** `GH_NETWORK`: `xrpl` or `xahau`. The exporter makes the exports of this network only. */
+  /** `GH_NETWORK`: `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`. The exporter makes this network's exports only. */
   @ConfigValue()
   @Text()
-  @IsIn(['xrpl', 'xahau'], { message: 'GH_NETWORK must be xrpl or xahau' })
+  @IsIn(NETWORK_NAMES, { message: networkChoiceText('GH_NETWORK') })
   network: string = 'xrpl';
 
   /** `GH_API_URL`: the base URL of this network's api, whose lists the exporter walks. */

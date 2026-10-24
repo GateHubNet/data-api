@@ -1,5 +1,5 @@
 // Only the network profile, not the package root: the config is loaded (and its tests reload it) before anything else.
-import { getNetworkProfile } from '@gatehub/data-api-shared/dist/network';
+import { getNetworkProfile, NETWORK_NAMES, networkChoiceText } from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
 import { GateHubConfigModule } from '@gatehub/toolbox/lib/config/config.module';
 import { Transform } from 'class-transformer';
@@ -60,10 +60,10 @@ function NodeEndpoints(): PropertyDecorator {
 }
 
 export class ApiConfig {
-  /** `GH_NETWORK`: `xrpl` or `xahau`. */
+  /** `GH_NETWORK`: `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`. */
   @ConfigValue()
   @Text()
-  @IsIn(['xrpl', 'xahau'], { message: 'GH_NETWORK must be xrpl or xahau' })
+  @IsIn(NETWORK_NAMES, { message: networkChoiceText('GH_NETWORK') })
   network: string = 'xrpl';
 
   /**
