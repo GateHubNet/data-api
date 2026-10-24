@@ -349,9 +349,11 @@ for the node that removed the line). An issuer's holders are the issuer's own ro
 
 It is a child table like `account_states`, written from `PARSER_VERSION` 3 and under the same gate (`STATE_PARSER_VERSION`), so the
 two tables share one coverage. **The lines of an account at ledger L** are, for each (counterparty, currency) of the account, its
-newest row at or before L, unless that row is deleted: `ORDER BY counterparty, currency, ledger_index DESC, tx_index DESC,
-node_index DESC LIMIT 1 BY counterparty, currency` in the account's prefix, then `deleted = 0`. That groups every row of the account up
-to L, so an issuer's read grows with its whole line history (see the risk in the
+newest row at or before L, unless that row is deleted. A read is bounded: an inner select reads the account's prefix in the order of
+the whole key, from the marker on, with a plain `LIMIT` of the rows wanted plus room, and an outer one groups them by line with
+`argMax(..., (ledger_index, tx_index, node_index))`; every line it read is whole but the last one of a read that stopped at its cap,
+which the next read (after the last whole line, sized by the rows a line took) reads again. A line still costs its whole history up
+to L, so a page of an issuer's lines grows with those lines' history (see the risk in the
 [API reference](api-reference.md#get-v2accountsaddresstrustlines)). Read by `/accounts/{a}/trustlines`, and by `/accounts/{a}/balances`
 with a ledger named (both through `TrustLinesService`).
 

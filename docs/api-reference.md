@@ -1114,10 +1114,13 @@ Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid 
 400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
 history does not cover, the newest one included when no ledger is named); 500 `unable to retrieve trustlines`.
 
-**Risk: an issuer's lines.** The read groups the account's whole line history up to the ledger, and every payment in an issuer's
-currencies changes its lines, so a big issuer's read may exceed the api's query guards (30 s, `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, and
-2 GiB, `API_CLICKHOUSE_MAX_QUERY_MEMORY` in production) and answer its 500. It can only be measured once
-the history spec has filled the tables; the remedy would be periodic state snapshots.
+**Risk: an issuer's lines.** A page reads the account's rows in the order of the table's key from the marker on, with a plain
+`LIMIT` (about the rows of the page's lines and a few granules of each part), and keeps each line's newest row up to the ledger
+(`argMax`); `/balances?limit=all` reads its lines that way, 1,000 at a time. A line's newest row is found by reading its whole
+history up to the ledger, and every payment in an issuer's currencies changes its lines, so a page of a big issuer's lines costs the
+history of those lines and may exceed the api's query guards (30 s, `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, and 2 GiB,
+`API_CLICKHOUSE_MAX_QUERY_MEMORY` in production) and answer its 500. It can only be measured once the history spec has filled the
+tables; the remedy would be periodic state snapshots.
 
 ### `GET /v2/accounts/{address}/reports[/{date}]`
 
