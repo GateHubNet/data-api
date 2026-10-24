@@ -49,7 +49,7 @@ network, and the shared database that the apis of every network read ([ADR-0014]
 | `GH_CLICKHOUSE_USER` | `default` | |
 | `GH_CLICKHOUSE_PASSWORD` | empty | A secret. |
 | `GH_CLICKHOUSE_DATABASE` | the network's name (`xrpl` / `xahau`) | Plain lowercase identifier (`^[a-z_][a-z0-9_]*$`): it is written into DDL. |
-| `GH_CLICKHOUSE_SHARED_DATABASE` | `shared` (also when empty) | The shared database (account names), on the same server: read by the api, created and migrated by `migrate.js shared` (the `migrate-shared` job). Give every api and the job the same name. A plain lowercase identifier, as above: it is written into the SQL. |
+| `GH_CLICKHOUSE_SHARED_DATABASE` | `shared` (also when empty) | The shared database (account names and labels), on the same server: read by the api, created and migrated by `migrate.js shared` (the `migrate-shared` job). Give every api and the job the same name. A plain lowercase identifier, as above: it is written into the SQL. |
 | `GH_CLICKHOUSE_REQUEST_TIMEOUT` | `30000` | Client request timeout, ms. |
 | `GH_CLICKHOUSE_MAX_CONNECTIONS` | `10` | Connections in the client pool. |
 | `GH_CLICKHOUSE_MAX_EXECUTION_TIME` | `30` | `max_execution_time` of every SELECT, seconds; 0 = unlimited. Kills runaway queries. |
@@ -71,7 +71,7 @@ The numeric ones are parsed with `Number()` and are not range-checked: a typo gi
 | `GH_LIVE_CACHE_TTL_MS` | `10000` | How long the live-node answers (balances, orders) are cached in memory; 0 disables the cache. Their `Cache-Control` follows it: `private, max-age=<it in whole seconds>`, `no-store` at 0. |
 | `GH_TX_CACHE_SIZE` | `20000` | Serialized transactions (decoded JSON and binary hex) kept in memory by hash, to spare the codec on repeated requests; a transaction never changes so nothing expires; each entry is a few KB. 0 disables. |
 | `GH_AMENDMENTS_CONFIG` | empty: the file shipped as `config/amendments/<network>.json` | Path of the amendment metadata file (names, descriptions, specifications) behind `/v2/network/amendments`. The syncer reads the same variable ([section 5](#5-syncer-appssyncer)): give both the same file, or the API and the syncer name an amendment differently. Empty counts as the shipped file. |
-| `GH_NAMES_AND_LABELS_RELOAD_MS` | `60000` | How often the api loads the account names of the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`) again, ms; a positive integer. A row the operator inserts shows on `/v2/accounts/{address}` within this time ([operations](operations.md#name-an-address)). Each load reads the whole table, which is small. |
+| `GH_NAMES_AND_LABELS_RELOAD_MS` | `60000` | How often the api loads the account names and labels of the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`) again, ms; a positive integer. A row the operator inserts shows on `/v2/accounts/{address}` within this time ([operations](operations.md#name-an-address)). Each load reads the whole tables, which are small. |
 | `GH_SERVICE_NAME`, `GH_SERVICE_DESCRIPTION`, `GH_SERVICE_VERSION` | `data-api`, `Ripple Data API v2 compatible API for XRPL and Xahau, served from ClickHouse.`, the package version | The title of the Swagger document (read by the toolbox bootstrap; the API fills in the defaults). Optional. The syncer has no Swagger and ignores them. |
 
 ## 5. Syncer (`apps/syncer`)

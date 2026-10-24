@@ -1,6 +1,6 @@
 # Local development stack. One ClickHouse server, one database per network (the database is named after the network:
 # `xrpl`, `xahau`), and per network a one-shot migrate job, a syncer and an api - the same images as production. The
-# `shared` database (account names, ADR-0014), which the apis of both networks read, has its own one-shot job,
+# `shared` database (account names and labels, ADR-0014), which the apis of both networks read, has its own one-shot job,
 # migrate-shared, in both profiles.
 #
 #   docker compose up -d clickhouse                      only ClickHouse; run the apps from source (pnpm start:syncer / start:api)
