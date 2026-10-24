@@ -131,6 +131,11 @@ export function Csv(filename: CsvFilename, rowsKey: string, options: CsvOptions 
 export interface CsvOptions {
   /** `limit=all` reads the whole list in one answer (`/balances`, `/orders`: lists without a marker). */
   limitAll?: boolean;
+  /**
+   * The largest `limit` of a list without a marker or `limit=all`, when `limit` counts its rows: an answer at that limit
+   * with fewer rows than it is the whole list.
+   */
+  maxLimit?: number;
 }
 
 /**
@@ -138,11 +143,13 @@ export interface CsvOptions {
  *  - `marker`: page after page, by the marker of the `Link` header;
  *  - `limit=all`: in one answer, with `limit=all`;
  *  - `whole`: every answer is the whole list (the route has no `limit`);
- *  - `none`: the route has a `limit` and neither a marker nor `limit=all`, so its whole list cannot be read when it is
- *    longer than the limit.
+ *  - `max=<n>`: neither a marker nor `limit=all`, and `limit` (at most `n`) counts the rows: the answer at `limit=n` is
+ *    the whole list when it has fewer than `n` rows, and may be cut when it has `n`;
+ *  - `none`: a `limit` and neither a marker nor `limit=all` nor a `maxLimit`: the whole list cannot be told apart from a
+ *    cut one.
  */
 export const LIST_PAGING_HEADER = 'X-List-Paging';
-export type ListPaging = 'marker' | 'limit=all' | 'whole' | 'none';
+export type ListPaging = 'marker' | 'limit=all' | 'whole' | `max=${number}` | 'none';
 
 /** How the route's list is read whole, from its options and the query parameters it documents (`@ApiQuery`). */
 function listPaging(handler: object, options: CsvOptions): ListPaging {
@@ -150,5 +157,6 @@ function listPaging(handler: object, options: CsvOptions): ListPaging {
   const params = (Reflect.getMetadata(DECORATORS.API_PARAMETERS, handler) ?? []) as { name?: string; in?: string }[];
   const query = new Set(params.filter((p) => p.in === 'query').map((p) => p.name));
   if (query.has('marker')) return 'marker';
-  return query.has('limit') ? 'none' : 'whole';
+  if (!query.has('limit')) return 'whole';
+  return options.maxLimit !== undefined ? `max=${options.maxLimit}` : 'none';
 }

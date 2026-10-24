@@ -601,14 +601,41 @@ describe('exports of a list at a ledger that names none', () => {
     expect(storage.download(job.url).body).toBe(expected.text);
   });
 
-  it('fails an export of a list that neither pages nor takes limit=all, rather than cut it at its limit', async () => {
-    const path = `/v2/accounts/${TUJ_ISSUER}/analytics/counterparties?start=2015-01-01&end=2027-01-01`;
-    const job = await exportOf(path, 'csv');
-    expect([job.status, job.error, job.url]).toEqual([
-      'failed',
-      'the list has no pages and cannot be read whole (no marker, no limit=all): an export would cut it at its limit',
-      undefined,
-    ]);
+  describe('a list that neither pages nor takes limit=all (the counterparties, at most 1000)', () => {
+    const counterparties = (address: string) =>
+      `/v2/accounts/${address}/analytics/counterparties?start=2015-01-01&end=2027-01-01`;
+
+    it('is read once at its largest limit: an answer shorter than that is the whole list', async () => {
+      const path = counterparties(TUJ_ISSUER);
+      const job = await exportOf(path, 'csv');
+      expect([job.status, job.error]).toEqual(['done', undefined]);
+      const whole = await get(`${path}&format=csv&limit=1000`);
+      expect(whole.text.split('\n').length - 1).toBeLessThan(1000);
+      expect(storage.download(job.url).body).toBe(whole.text);
+    });
+
+    it('fails when the answer is as long as that limit, rather than cut the list at it', async () => {
+      // an account paid by 1000 accounts in the newest ledger: as many counterparties as the route serves at once
+      const busy = accountAt(777_777);
+      await h.ch.command(
+        `INSERT INTO ${Table.AccountPayments}
+         SELECT {account:String} AS account, toUInt32({ledger:UInt32}) AS ledger_index, toUInt32(n.number) AS tx_index,
+                {hash:String} AS tx_hash, toDateTime({time:UInt32}, 'UTC') AS close_time, 'received' AS direction,
+                concat('r', leftPad(toString(n.number), 6, '0')) AS counterparty, 'XRP' AS currency, '' AS issuer,
+                '1' AS delivered_amount, 1 AS delivered_amount_f, NULL AS source_tag, NULL AS destination_tag
+           FROM numbers(1000) AS n`,
+        { account: busy, ledger: NEWEST, hash: hashOf(2), time: 1_792_851_440 },
+      );
+      const path = counterparties(busy);
+      expect((await get(`${path}&format=csv&limit=1000`)).text.split('\n')).toHaveLength(1001);
+      const job = await exportOf(path, 'csv');
+      expect([job.status, job.error, job.url]).toEqual([
+        'failed',
+        'the list answered 1000 rows, the most it serves at once, and has no pages: it may be longer, and an export ' +
+          'would cut it',
+        undefined,
+      ]);
+    });
   });
 
   it('a path that names a ledger, or a list over time, keeps what it names', async () => {

@@ -25,6 +25,9 @@ import {
 import { AccountAnalyticsService } from './account-analytics.service';
 import { ANALYTICS_INTERVALS, analyticsWindow, checkBucketLimit, MAX_ANALYTICS_BUCKETS } from './analytics-window';
 
+/** The largest `limit` of the counterparties and of the exchange pairs: the most rows of one answer (no marker). */
+const ROWS_MAX = 1000;
+
 /** The name of a CSV file: `<address> - <what>`. `@Csv` adds the `.csv`. */
 const csvName =
   (what: string) =>
@@ -154,7 +157,7 @@ export class AccountAnalyticsController {
 
   @Get(':address/analytics/counterparties')
   @RippleRoute('unable to retrieve counterparties')
-  @Csv(csvName('counterparties'), 'counterparties')
+  @Csv(csvName('counterparties'), 'counterparties', { maxLimit: ROWS_MAX })
   @ApiOperation({
     summary: 'Get the accounts an account paid and was paid by, with what the payments were worth',
     description:
@@ -188,7 +191,7 @@ export class AccountAnalyticsController {
     // the checks come in the order of the table of parameters: start, end (there is no interval), then the sort
     const window = analyticsWindow(query, Date.now(), 'none');
     const sort = sortParam(query);
-    const limit = limitParam(query, { def: 20, max: 1000 });
+    const limit = limitParam(query, { def: 20, max: ROWS_MAX });
     return counterpartiesAnswer(
       window,
       sort,
@@ -198,7 +201,7 @@ export class AccountAnalyticsController {
 
   @Get(':address/analytics/exchanges')
   @RippleRoute('unable to retrieve exchanges')
-  @Csv(csvName('exchange pairs'), 'pairs')
+  @Csv(csvName('exchange pairs'), 'pairs', { maxLimit: ROWS_MAX })
   @ApiOperation({
     summary: 'Get the summary of the trades of an account on the exchange, per pair',
     description:
@@ -219,7 +222,7 @@ export class AccountAnalyticsController {
   @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
   async exchanges(@Param('address') address: string, @Query() query: QueryParams): Promise<ExchangesAnswer> {
     const window = analyticsWindow(query, Date.now(), 'none');
-    const limit = limitParam(query, { def: 20, max: 1000 });
+    const limit = limitParam(query, { def: 20, max: ROWS_MAX });
     return exchangesAnswer(window, await this.analytics.exchanges({ account: address, window, limit }));
   }
 }

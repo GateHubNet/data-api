@@ -3251,10 +3251,13 @@ names `min_sequence` or `max_sequence` (the account transactions by sequence): t
 names none. The other parameters are not checked here: a list that refuses them makes a failed export, which says why.
 
 **The whole list.** Every CSV answer says in `X-List-Paging` how its whole list is read: `marker` (page by page), `limit=all`
-(`/balances` and `/orders`, which have no marker: the exporter asks for `limit=all`), `whole` (the route has no `limit`), or
-`none` (a `limit` and neither a marker nor `limit=all`, such as the account analytics and `/v2/network/markets`). An export of a
-`none` list fails with `the list has no pages and cannot be read whole (no marker, no limit=all): an export would cut it at its
-limit`, rather than hold only its first answer.
+(`/balances` and `/orders`, which have no marker: the exporter asks for `limit=all`), `whole` (the route has no `limit`),
+`max=<n>` (no marker and no `limit=all`, and `limit`, at most `n`, counts the rows: the account analytics counterparties and
+exchange pairs, 1000, and `/v2/network/markets`, 5000), or `none` (a `limit` that does not count rows, such as the lines of the
+account balance history). A `max=<n>` list is asked once with `limit=<n>`: an answer with fewer rows is the whole list, and one with
+`n` rows may be cut, so the export fails with `the list answered <n> rows, the most it serves at once, and has no pages: it may be
+longer, and an export would cut it`. An export of a `none` list fails with `the list has no pages and cannot be read whole (no
+marker, no limit=all): an export would cut it at its limit`. Neither is ever cut to its first answer.
 
 **One ledger.** When the path of a list at a point in time names no ledger (no `ledger_hash`, `date` or numeric `ledger_index`;
 a word such as `validated` names none), the exporter takes the newest ledger this API has indexed when it starts the export

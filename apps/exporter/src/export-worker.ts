@@ -36,7 +36,11 @@ export const EXPORT_MAX_PAGES = 100_000;
  */
 export const LIST_PAGING_HEADER = 'x-list-paging';
 
-/** Why an export of a list that has a limit but neither pages nor `limit=all` fails: it would be cut, silently. */
+/** Why an export of a list in one page of at most `max` rows fails when it answers `max`: it may have been cut. */
+const mayBeCut = (max: number): string =>
+  `the list answered ${max} rows, the most it serves at once, and has no pages: it may be longer, and an export would cut it`;
+
+/** Why an export of a list that has a limit but neither pages, `limit=all` nor a largest limit fails: it may be cut. */
 const NOT_WHOLE =
   'the list has no pages and cannot be read whole (no marker, no limit=all): an export would cut it at its limit';
 
@@ -350,6 +354,8 @@ export class ExportWorker {
     const cap = exportRowCap(this.maxRows, format);
     const seen = new Set<string>();
     let disposition: string | null = null;
+    /** The largest limit of a list that answers in one page of at most that many rows (`max=<n>`). */
+    let onePageOf: number | undefined;
     for (let page = 0; ; page++) {
       if (page >= EXPORT_MAX_PAGES) throw new ExportFailure(`the list has more than ${EXPORT_MAX_PAGES} pages`);
       const res = await this.fetchPage(url);
@@ -362,15 +368,20 @@ export class ExportWorker {
         // how the list is read whole (`X-List-Paging` of the api's CSV answers)
         const paging = res.headers.get(LIST_PAGING_HEADER);
         if (paging === 'none') throw new ExportFailure(NOT_WHOLE);
-        if (paging === 'limit=all' && url.searchParams.get('limit') !== 'all') {
-          // a list without pages: its first answer was cut at the page size, so it is asked for whole
-          url.searchParams.set('limit', 'all');
+        // a list without pages: its first answer was cut at the page size, so it is asked again, whole (`limit=all`)
+        // or at the largest limit it serves (`max=<n>`)
+        const largest = paging === 'limit=all' ? 'all' : /^max=(\d+)$/.exec(paging ?? '')?.[1];
+        if (largest !== undefined && url.searchParams.get('limit') !== largest) {
+          url.searchParams.set('limit', largest);
           page--;
           continue;
         }
         disposition = res.headers.get('content-disposition');
+        if (largest !== undefined && largest !== 'all') onePageOf = Number(largest);
       }
       await file.add(text);
+      // as many rows as the most it serves: the list may go on, and it cannot be asked for more
+      if (onePageOf !== undefined && file.rows >= onePageOf) throw new ExportFailure(mayBeCut(onePageOf));
       if (file.rows > cap) throw new ExportFailure(tooManyExportRows(format, cap));
       const marker = nextMarker(res.headers.get('link'));
       if (marker === undefined) return { file, disposition, ...(ledger !== undefined && { ledger }) };
