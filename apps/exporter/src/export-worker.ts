@@ -1,6 +1,7 @@
 import {
   appendExportJob,
   ClickHouseService,
+  ExportFormat,
   exportJobsIn,
   ExportJobsRow,
   exportObjectKey,
@@ -11,6 +12,7 @@ import { Logger } from '@nestjs/common';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { CsvFile, UnreadableCsv } from './csv-file';
 
 /** The largest page the lists serve (`limit`): the exporter asks for it, and a list with a smaller one serves that. */
@@ -21,6 +23,22 @@ export const EXPORT_POLL_MS = 2000;
 export const EXPORT_REQUEST_TIMEOUT_MS = 60_000;
 /** A list that has still a next page after this many is walked no further: the job fails. */
 export const EXPORT_MAX_PAGES = 100_000;
+
+/** A file to upload: its bytes and how it is served. */
+export interface ExportOutput {
+  body: Readable;
+  contentType: string;
+  /** The list's own download name (`Content-Disposition` of its CSV), or `null` when it gave none. */
+  contentDisposition: string | null;
+}
+
+/**
+ * How the walked list becomes the file of each format. Every format walks the list's CSV pages; CSV uploads them as one
+ * file. PDF (ticket #17) renders the same rows here.
+ */
+export const EXPORT_RENDERERS: Record<ExportFormat, (file: CsvFile, disposition: string | null) => ExportOutput> = {
+  csv: (file, disposition) => ({ body: file.stream(), contentType: 'text/csv', contentDisposition: disposition }),
+};
 
 export interface ExportWorkerOptions {
   /** The network's database, where the jobs are. */
@@ -81,9 +99,10 @@ function nextMarker(link: string | null): string | undefined {
  * key. So an export is always the list it names, made by the list's one implementation.
  *
  * For a job it writes `running`, asks for `<path>&format=csv&limit=<pageSize>` and follows the `Link` of each page,
- * puts the pages together into one CSV (`CsvFile`), uploads it to `<network>/<id>.csv` with the name the list gives
- * its download, and writes `done` with the row count. A list that answers an error, an unreadable page or a failed
- * upload writes `failed` with why. It never stops on a failure: the next job is taken.
+ * puts the pages together into one CSV (`CsvFile`), renders it in the job's format (`EXPORT_RENDERERS`: CSV as it is),
+ * uploads it to `<network>/<id>.<format>` with the name the list gives its download, and writes `done` with the row
+ * count. A list that answers an error, an unreadable page or a failed upload writes `failed` with why. It never stops
+ * on a failure: the next job is taken.
  *
  * It must be the only exporter of its database: two would take the same job. On start it fails the jobs a previous
  * exporter left `running` (it stopped without a shutdown); a shutdown stops the job in hand and queues it again.
@@ -176,11 +195,15 @@ export class ExportWorker {
     const dir = await mkdtemp(join(tmpdir(), 'export-'));
     try {
       const { file, disposition } = await this.walk(running, join(dir, 'rows'));
+      // the row cap of ticket #16 is checked on the pages of the walk and before the upload
+      const render = EXPORT_RENDERERS[running.format as ExportFormat];
+      if (!render) throw new ExportFailure(`the format ${running.format} cannot be made`);
+      const output = render(file, disposition);
       const object = exportObjectKey(network, running.id, running.format);
       try {
-        await storage.upload(object, file.stream(), {
-          contentType: 'text/csv',
-          ...(disposition !== null && { contentDisposition: disposition }),
+        await storage.upload(object, output.body, {
+          contentType: output.contentType,
+          ...(output.contentDisposition !== null && { contentDisposition: output.contentDisposition }),
         });
       } catch (err) {
         this.logger.error(`Export ${running.id}: the upload failed: ${describe(err)}`);
@@ -208,7 +231,8 @@ export class ExportWorker {
   /** Walks every page of the job's list into a `CsvFile` spooled at `spool`. */
   private async walk(job: ExportJobsRow, spool: string): Promise<{ file: CsvFile; disposition: string | null }> {
     const url = new URL(job.path, this.options.apiUrl);
-    url.searchParams.set('format', job.format);
+    // every format is made from the list's CSV form
+    url.searchParams.set('format', 'csv');
     url.searchParams.set('limit', String(this.pageSize));
     url.searchParams.delete('marker');
     const file = new CsvFile(spool);
