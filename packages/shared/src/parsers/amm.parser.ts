@@ -157,7 +157,7 @@ const LIQUIDITY_EVENTS: Readonly<Record<string, AmmLiquidityEvent>> = {
 };
 
 /** One entry of `meta.AffectedNodes`. */
-interface LedgerNode {
+export interface LedgerNode {
   index: number;
   op: 'CreatedNode' | 'ModifiedNode' | 'DeletedNode';
   type: string;
@@ -168,7 +168,7 @@ interface LedgerNode {
 }
 
 /** A pool and the nodes of the transaction that belong to it. */
-interface Pool {
+export interface Pool {
   account: string;
   /** The lowest index of its nodes: pools are listed in this order. */
   first: number;
@@ -190,7 +190,8 @@ interface Holding {
   after?: BigNumber;
 }
 
-function ledgerNodes(meta: Json): LedgerNode[] {
+/** The entries of `meta.AffectedNodes` that carry fields, with their position in the metadata. */
+export function ledgerNodes(meta: Json): LedgerNode[] {
   const nodes: LedgerNode[] = [];
   const entries: readonly Json[] = meta.AffectedNodes ?? [];
   entries.forEach((entry, index) => {
@@ -240,7 +241,7 @@ function reserveSide(line: LedgerNode, named: ReadonlySet<string>): string | und
  * lsfAMMNode lines whose pool could not be told. Trust lines without lsfAMMNode, the LP-token lines the pool issues,
  * belong to no pool: an LP-token transfer touches none.
  */
-function poolsOf(nodes: readonly LedgerNode[]): { pools: Pool[]; unresolved: number } {
+export function poolsOf(nodes: readonly LedgerNode[]): { pools: Pool[]; unresolved: number } {
   const pools = new Map<string, Pool>();
   const touch = (account: string, node: LedgerNode): Pool => {
     const pool = pools.get(account) ?? { account, first: node.index, lines: [] };

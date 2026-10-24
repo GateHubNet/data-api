@@ -26,6 +26,8 @@ export enum Table {
   AccountStates = 'account_states',
   // Trust line state history (migration 006): the state of each side of a trust line after each change, from version 3.
   TrustLineStates = 'trust_line_states',
+  // Path payments (migration 007, written by ingest).
+  PathPayments = 'path_payments',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -64,6 +66,8 @@ export enum Table {
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
   SyncerLease = 'syncer_lease',
+  // Export jobs (migration 010): written by the api (queued) and the exporter (running, done, failed).
+  ExportJobs = 'export_jobs',
 }
 
 /**

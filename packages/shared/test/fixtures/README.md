@@ -27,7 +27,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/` also has a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/` and `xrpl/path-payments/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -207,6 +207,38 @@ Freezes and authorizations were found with `account_lines` on issuers (`freeze`,
 | `trustset_authorizes` | 104479125 | `C36AC10B9FA6AD15E2254477DFEF057D08589E39CA0102871D93622191D03D96` | The USDV issuer authorizes the pool's line |
 | `trustline_created_at_zero` | 104566877 | `19B5C0FB6295872FCECCE7491806E3CE4A54067F4C43BC898BD1387EBC0D9DAB` | `rsMeJ5p6qzVARADTYhvZbHqwkfyN18U2XH` creates a USDV line with a zero balance |
 | `trustline_deleted` | 104566926 | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | It sets the limit back to 0: the line is a `DeletedNode` |
+
+### XRPL path payments (`xrpl/path-payments/`)
+
+Recorded 2026-10-24 from `wss://xrplcluster.com` (validated head 107873475) with `--txs`, for the path payments of spec #4
+(GLOSSARY.md: a successful payment whose delivery used someone else's liquidity): 7 ledgers, 0.5 MB gzipped (largest 254 KB).
+`manifest.json` names each case under `cases.<name>` as `{ledger, hash, type, note}`; the api e2e spec
+`apps/api/test/path-payments.e2e-spec.ts` (seed `xrpl-path-payments`) checks every one against values read off the metadata by
+hand. The hashes were found by walking validated ledgers of several eras with a throwaway script that looked at the Offer,
+AccountRoot (`AMMID`), lsfAMMNode and RippleState nodes of each successful Payment, and checked by hand.
+
+| Case                          | Ledger    | Transaction                                                        |
+| ----------------------------- | --------- | ------------------------------------------------------------------ |
+| `through_the_book`            | 107872476 | `2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3` |
+| `through_a_pool`              | 107873024 | `8AFED3CFAFC890BF399AC789450A0122BB01293F4982C4CA67A25F33A776B6C9` |
+| `through_a_market_maker`      | 11999941  | `E362675D8230B1A615C9BF53BC0B288F3AAA36CDF8D4D3E3EE8A681966BE8397` |
+| `round_trip_to_oneself_out`   | 107873048 | `4FA4CA051B7AADE70B5139570BEF9A7BE97659B6B6F670609E45AC11CD30F991` |
+| `round_trip_to_oneself_back`  | 107873048 | `04D90AD7ABB8FCED1FD5C6B4092EA534904BEEF2990D21A101DD6C661FD013B8` |
+| `to_oneself_across_issuers`   | 37999837  | `91F75EC97B9BD4AA72E5E45C75AEBDA3251839C85F0BAE5736FF88B4F8B134B7` |
+| `not_only_through_the_issuer` | 107873045 | `5EA84EE8462DCCE5FEB0D9ED59A0B7D3C7EE6D532307ED12865DB28F0D78D3D4` |
+| `not_unused_paths`            | 13999940  | `1761720BE5F12AE7E26992241E82A521AB3ED1B370C53C8971980E49501AEB10` |
+
+The ledgers hold 24 path payments in all, 20 of them payments to oneself (mostly conversions through pools); the spec lists them
+all and checks the named ones row by row.
+
+**Not found: a loop in one payment.** No successful Payment to oneself that spends and receives the same currency (for example
+USD through XRP back to USD) turned up in about 3,000 ledgers walked around ledgers 7,000,000 (2014), 12,000,000 and 14,000,000
+(2015), 38,000,000 (2018), 47,000,000 (2019), 60,000,000 (2021) and 107,870,000 (2026), nor in the last 6,000 `account_tx` rows of
+the XRP/RLUSD and XRP/USD (GateHub) pools and of the arbitrage account `rogue5HnPRSszD9CWGSUz8UGHMVwSSKF6`. A Payment cannot loop
+XRP to XRP (`temBAD_SEND_XRP_MAX`, `temBAD_SEND_XRP_PATHS`), and the payments to oneself seen were conversions. The arbitrage case is
+therefore the round trip `round_trip_to_oneself_*`: the same account buys WLV with XRP from a pool and sells it back in the next
+payments of the same ledger. A loop in one payment would be detected the same way (its source is its destination, and the pools
+and offers it crosses are in the metadata); record one with `--txs` when it is found.
 
 ### Xahau (`xahau/recorded/`)
 

@@ -95,6 +95,7 @@ const SHAPES: Record<Table, Shape> = {
     partition: P7,
     order: 'account, counterparty, currency, ledger_index, tx_index, node_index',
   },
+  [Table.PathPayments]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -234,6 +235,8 @@ const SHAPES: Record<Table, Shape> = {
     order: 'from_hour, to_hour',
   },
   [Table.SyncerLease]: { engine: 'ReplacingMergeTree', version: 'heartbeat', partition: '', order: 'network' },
+  // append-only: every state of a job is kept, the highest seq is the job (migration 010)
+  [Table.ExportJobs]: { engine: 'MergeTree', partition: '', order: 'id, seq' },
 };
 
 /** The aggregate tables of migration 003 (D2). */
@@ -261,6 +264,8 @@ const MIGRATION_006 = '006_trust_line_states.sql';
 
 /** The account network names the operator writes (ADR-0014, spec #4 ticket #8). */
 const MIGRATION_009 = '009_account_network_names.sql';
+/** The path payments (spec #4, ticket #13): one ledger-derived table. */
+const MIGRATION_007 = '007_path_payments.sql';
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -285,6 +290,7 @@ const DEDUP_TABLES: Table[] = [
   Table.AmmGovernance,
   Table.AccountStates,
   Table.TrustLineStates,
+  Table.PathPayments,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1407,6 +1413,64 @@ describe('migrations (e2e)', () => {
       expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
     });
   });
+  describe('migration 007', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-007-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 007 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_007_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_007);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_007);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      expect(await tablesOf(config.database)).not.toContain(Table.PathPayments);
+
+      copyReal([MIGRATION_007]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_007], skipped: before });
+      expect(await tablesOf(config.database)).toContain(Table.PathPayments);
+
+      const svc = new ClickHouseService(config);
+      try {
+        await svc.insert(Table.PathPayments, [SAMPLE_ROWS[Table.PathPayments]]);
+        expect(
+          await svc.query(
+            `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${Table.PathPayments}`,
+          ),
+        ).toEqual([SAMPLE_ROWS[Table.PathPayments]]);
+        expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+      } finally {
+        await svc.onModuleDestroy();
+      }
+    });
+  });
 });
 
 /** The migration set of the shared database (ADR-0014): what the operator writes about an address, on every network. */
@@ -1515,5 +1579,63 @@ describe('the shared database (e2e)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe('migration 010', () => {
+    const MIGRATION_010 = '010_export_jobs.sql';
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-010-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+
+    it('applies 010 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_010_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_010);
+      expect(realFiles()).toContain(MIGRATION_010);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      copyReal([MIGRATION_010]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_010], skipped: before });
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('keeps an export job for 7 days after it was created', async () => {
+      const config = { ...ch.config, database: 'ctl_010_ttl' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+      const svc = new ClickHouseService(config);
+      try {
+        const now = Date.now() / 1000;
+        const job = SAMPLE_ROWS[Table.ExportJobs];
+        const created = (days: number) => now - days * 86_400;
+        await svc.insert(Table.ExportJobs, [
+          { ...job, id: 'a'.repeat(32), created: created(8), at: created(8) },
+          { ...job, id: 'b'.repeat(32), created: created(6), at: created(6) },
+        ]);
+        await svc.command(`OPTIMIZE TABLE ${Table.ExportJobs} FINAL`);
+        expect(await svc.query(`SELECT id FROM ${Table.ExportJobs}`)).toEqual([{ id: 'b'.repeat(32) }]);
+      } finally {
+        await svc.onModuleDestroy();
+      }
+    });
   });
 });
