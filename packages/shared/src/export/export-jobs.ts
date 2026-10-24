@@ -23,6 +23,31 @@ export const EXPORT_URL_TTL_MS = 15 * 60 * 1000;
 /** How long an export is kept: 7 days (the TTL of `export_jobs`, and the lifecycle rule of the bucket). */
 export const EXPORT_RETENTION_DAYS = 7;
 
+/**
+ * The most rows an export of each format may hold (ticket #16): beyond, the api refuses it when it knows the count up
+ * front, and the exporter fails it when the list turns out longer.
+ */
+export interface ExportRowCaps {
+  csv: number;
+  pdf: number;
+}
+
+/** The caps by default: 1,000,000 rows of CSV, 10,000 of PDF. `GH_EXPORT_MAX_ROWS_CSV` and `_PDF` change them. */
+export const EXPORT_MAX_ROWS: ExportRowCaps = { csv: 1_000_000, pdf: 10_000 };
+
+/** The cap of `format` among `caps`, `undefined` for a format that has none. */
+export function exportRowCap(caps: ExportRowCaps, format: string): number | undefined {
+  return Object.prototype.hasOwnProperty.call(caps, format) ? caps[format as keyof ExportRowCaps] : undefined;
+}
+
+/** Why an export of `format` is refused or fails past its cap: what the client can do about it, too. */
+export function tooManyExportRows(format: string, cap: number): string {
+  return (
+    `the list has more than ${cap} rows, the most a ${format.toUpperCase()} export holds: narrow the window` +
+    (format === 'csv' ? '' : ' or use CSV')
+  );
+}
+
 /** An unguessable job id: 128 random bits as 32 hex digits. */
 export function newExportId(): string {
   return randomBytes(16).toString('hex');
@@ -74,6 +99,17 @@ export async function exportJobsIn(
       (limit === undefined ? '' : ' LIMIT {limit:UInt32}'),
     { status, ...(limit !== undefined && { limit }) },
   );
+}
+
+/** How many exports of the API key whose hash is `keyHash` are queued or running now. */
+export async function activeExportJobs(ch: ClickHouseService, keyHash: string): Promise<number> {
+  const row = await ch.queryOne<{ n: number | string }>(
+    `SELECT count() AS n FROM (
+       SELECT id, argMax(status, seq) AS status FROM ${Table.ExportJobs} WHERE key_hash = {key_hash:String} GROUP BY id
+     ) WHERE status IN ('queued', 'running')`,
+    { key_hash: keyHash },
+  );
+  return Number(row?.n ?? 0);
 }
 
 /** Appends a state of a job. */

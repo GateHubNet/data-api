@@ -212,7 +212,7 @@ fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, an
 From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields of
 `GET /v2/accounts/{address}` `account_name`, the name the operator gave the address, `account_network_name`, the name the operator gave
 the account on this network only, and `account_labels`, the labels the operator put on the address; and [exports](#exports), `POST /v2/exports` and
-`GET /v2/exports/{id}`, in CSV or PDF ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 70 and 72).
+`GET /v2/exports/{id}`, in CSV or PDF ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -3150,6 +3150,13 @@ A **list over time** (a route that takes `start` and `end`) must name both. A li
 may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`) names none. The other
 parameters are not checked here: a list that refuses them makes a failed export, which says why.
 
+**Limits.** An API key may have at most **3** exports queued or running at once (`GH_EXPORT_MAX_JOBS_PER_KEY`); one more
+answers 429, and an export that is done or has failed frees its place. An export holds at most **1,000,000 rows as CSV** and
+**10,000 as PDF** (`GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`). Where the list counts its rows up front, an export above
+the cap is refused at once with 400; today that is the account transactions by time (`/v2/accounts/{address}/transactions` with
+its window, `type` and `result`; not the list by sequence). Any other export is held to the cap as it is made: the exporter stops
+at the page that passes it, and the export fails with the same message.
+
 The answer is 202:
 
 ```json
@@ -3161,7 +3168,10 @@ key, never the key; with authentication off (no `GH_API_KEYS`, development only)
 
 Errors, in the order they are checked: 503 `exports are not available`; 400 `invalid path` (no `path`, or not one starting
 with `/v2/`), `path is not exportable` (no route with a CSV form has this path), `start and end are required`, `invalid format`;
-500 `unable to create the export`.
+429 `too many exports in progress: at most 3 per API key`; 400 `the list has more than 1000000 rows, the most a CSV export
+holds: narrow the window` (for a PDF: `the list has more than 10000 rows, the most a PDF export holds: narrow the window or use
+CSV`); 500 `unable to create the export`. The 429 is the body of every error (`{"result":"error","message":…}`), not the rate
+limit's `{"error":…}`.
 
 ### `GET /v2/exports/{id}`
 
@@ -3177,7 +3187,8 @@ Key order: `result, id, status, format, path, created, finished?, rows?, error?,
 or `failed`. `finished` is there when the export is done or has failed; `rows` (the data rows of the file) and `url` when it is
 done; `error` when it has failed, and says why: the list's own answer (`the list answered 400: invalid transaction type`), `the
 list did not answer a CSV`, `the list's CSV could not be read`, `the list could not be read`, `a page of the list took longer
-than 60 s`, `the file could not be stored`, or `the exporter stopped while it made this export: ask for it again`.
+than 60 s`, `the list has more than 1000000 rows, the most a CSV export holds: narrow the window` (the row cap, with the PDF
+wording for a PDF), `the file could not be stored`, or `the exporter stopped while it made this export: ask for it again`.
 
 `url` downloads the file for **15 minutes**; each request makes a new one. A `csv` file is the CSV the list's route would give for
 the whole list in one page: one header, the columns of every row in the order they first appear, a missing cell empty; an
@@ -3188,8 +3199,7 @@ file are kept **7 days** after it was asked for; then the id is not found.
 Errors: 503 `exports are not available`; 404 `export not found` (an id that does not exist, or the export of another API
 key: the two are not told apart); 500 `unable to retrieve the export`.
 
-Exports run one at a time per network, in the order they were asked for. The row cap and the limit of exports per key are not
-there yet (ticket #16).
+Exports run one at a time per network, in the order they were asked for.
 
 #### PDF
 
@@ -3227,7 +3237,7 @@ standard PDF fonts write Latin-1 only: any other character (in a name or a curre
 is. Opening and closing balances are not in the document.
 
 **Differences from data.ripple.com**: the original has no exports; these routes are new
-([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 70 and 72).
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
 
 ---
 

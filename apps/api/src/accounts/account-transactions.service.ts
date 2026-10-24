@@ -67,6 +67,9 @@ export interface TimeQuery extends ListQuery {
   endExclusive?: Date;
 }
 
+/** What the list by time holds, whatever its pages: the account, the window and the filters. */
+export type TimeWindow = Pick<TimeQuery, 'account' | 'type' | 'result' | 'start' | 'endExclusive'>;
+
 /**
  * The list by sequence: the transactions the account sent with a `Sequence` between the two bounds, both ends included.
  * With both bounds given, their order does not matter: the original's HBase scan swapped them (ruling R57), so
@@ -128,39 +131,65 @@ export class AccountTransactionsService {
     // before any query: a marker that is none of ours is the client's mistake, whatever the range holds
     const after = decodeMarker(q.marker, TIME_KEYS);
 
-    const range = await this.ranges.resolve(q.start, q.endExclusive);
-    if (!range) return { transactions: [] };
+    const window = await this.timeWindow(q);
+    if (!window) return { transactions: [] };
 
     const cursor = keysetClause(TIME_KEYS, q.descending, after);
-    const conditions = [
-      'account = {account:String}',
-      'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
-      ...(q.type !== undefined ? ['tx_type = {type:String}'] : []),
-      ...(q.result !== undefined ? ['result = {result:String}'] : []),
-      ...(cursor.clause !== '' ? [cursor.clause] : []),
-    ];
     // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
     // used), with one more than the page: it tells whether there is a next page
     const found = await readDistinctPage<TimeKey>(this.ch, {
       columns: 'ledger_index, tx_index',
       table: Table.AccountTransactions,
-      where: conditions,
+      where: [...window.conditions, ...(cursor.clause !== '' ? [cursor.clause] : [])],
       orderBy: columnsOf(TIME_ORDER),
       unique: columnsOf(TIME_KEYS),
       descending: q.descending,
+      params: { ...window.params, ...cursor.params },
+      limit: q.limit + 1,
+    });
+
+    const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
+    return this.page(page.rows, page.marker, q);
+  }
+
+  /**
+   * How many transactions the list by time holds, all its pages together, each once: what an export of it would hold
+   * (ticket #16 counts it before it queues the export).
+   */
+  async countByTime(q: TimeWindow): Promise<number> {
+    const window = await this.timeWindow(q);
+    if (!window) return 0;
+    const row = await this.ch.queryOne<{ n: number | string }>(
+      `SELECT count() AS n FROM (
+         SELECT DISTINCT ledger_index, tx_index FROM ${Table.AccountTransactions}
+          WHERE ${window.conditions.join(' AND ')}
+       )`,
+      window.params,
+    );
+    return Number(row?.n ?? 0);
+  }
+
+  /** The conditions on `account_transactions` of the list by time, without a page; `undefined` when no ledger is in it. */
+  private async timeWindow(
+    q: TimeWindow,
+  ): Promise<{ conditions: string[]; params: Record<string, string | number> } | undefined> {
+    const range = await this.ranges.resolve(q.start, q.endExclusive);
+    if (!range) return undefined;
+    return {
+      conditions: [
+        'account = {account:String}',
+        'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
+        ...(q.type !== undefined ? ['tx_type = {type:String}'] : []),
+        ...(q.result !== undefined ? ['result = {result:String}'] : []),
+      ],
       params: {
         account: q.account,
         ...(q.type !== undefined && { type: q.type }),
         ...(q.result !== undefined && { result: q.result }),
         min: range.min,
         max: range.max,
-        ...cursor.params,
       },
-      limit: q.limit + 1,
-    });
-
-    const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
-    return this.page(page.rows, page.marker, q);
+    };
   }
 
   /** One page of the transactions the account sent, by their `Sequence`. */
