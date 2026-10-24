@@ -24,7 +24,8 @@
  *       (86795265 on mainnet) written with version 1 lack these rows; `--reprocess` rewrites them.
  *  - 3: account state history (`account_states`). Ledgers written with an older version lack these rows; the state
  *       tables cover only the ledgers above the last one an older parser wrote (`STATE_PARSER_VERSION`).
- *  - 4: path payments (`path_payments`). Ledgers written with an older version have none; `--reprocess` rewrites them.
+ *  - 4: path payments (`path_payments`, and their index by account `account_path_payments`). Ledgers written with an
+ *       older version have none; `--reprocess` rewrites them.
  *
  * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
  * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`), never with `PARSER_VERSION`.
@@ -39,7 +40,10 @@ export const AMM_PARSER_VERSION = 2;
  * lacks its rows. Gates compare with this constant, never with `PARSER_VERSION`, which later features move on.
  */
 export const STATE_PARSER_VERSION = 3;
-/** The first parser version that writes `path_payments`: a ledger written by an older one lacks them. */
+/**
+ * The first parser version that writes `path_payments` and `account_path_payments`: a ledger written by an older one
+ * lacks them.
+ */
 export const PATH_PARSER_VERSION = 4;
 
 /** `UInt64` column: a string stays exact above 2^53. */
@@ -384,6 +388,16 @@ export interface PathPaymentsRow {
   offers_crossed: number;
   amm_pools: string[];
   rippled_through: string[];
+}
+
+/**
+ * The index of `path_payments` by account (migration 008): a row for the source and one for the destination of a path
+ * payment, one row for a payment to oneself. The path payment itself is read from `path_payments` by its key.
+ */
+export interface AccountPathPaymentsRow {
+  account: string;
+  ledger_index: number;
+  tx_index: number;
 }
 
 // -- Node-sourced tables -----------------------------------------------------------------------------------------

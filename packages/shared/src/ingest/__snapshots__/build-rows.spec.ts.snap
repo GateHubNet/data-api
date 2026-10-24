@@ -4,6 +4,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountPathPayments": [],
   "accountPayments": [
     {
       "account": "r9E2h5xmwoT5UNSBnv4EgwU4c6SNZwdUhd",
@@ -3732,6 +3733,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountPathPayments": [],
   "accountPayments": [
     {
       "account": "rNsFYK5ShM6GQLM6m56Wy5e9Fou98Rwz9p",
@@ -4689,6 +4691,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountPathPayments": [],
   "accountPayments": [],
   "accountStates": [
     {
@@ -6004,6 +6007,18 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_hash": "50A0D86B609E46BB854921CC53D212FE025221A7304ECE9A321DC9656366BF7A",
       "tx_index": 0,
       "tx_type": "Payment",
+    },
+  ],
+  "accountPathPayments": [
+    {
+      "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
+      "ledger_index": 11119620,
+      "tx_index": 0,
+    },
+    {
+      "account": "rBHMbioz9znTCqgjZ6Nx43uWY43kToEPa9",
+      "ledger_index": 11119620,
+      "tx_index": 0,
     },
   ],
   "accountPayments": [
@@ -7825,6 +7840,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountPathPayments": [],
   "accountPayments": [
     {
       "account": "r42HV71v2ZNkgqx7tML33G6CsK2HpB9qv2",

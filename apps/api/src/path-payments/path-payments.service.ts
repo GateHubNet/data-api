@@ -10,7 +10,19 @@ export const PATH_PAYMENT_KEYS: KeysetKey[] = [
   { column: 'tx_index', type: 'UInt32' },
 ];
 
-/** What `GET /v2/path_payments` is asked for; the values are already validated. */
+/** The key of a path payment. */
+interface PathPaymentKey {
+  ledger_index: number;
+  tx_index: number;
+}
+
+/**
+ * The ORDER BY of `account_path_payments`: its whole sorting key. `account` is fixed by the query but stays in it, so
+ * that ClickHouse reads the account's rows in the order of the key instead of sorting them.
+ */
+const ACCOUNT_PATH_PAYMENT_ORDER = ['account', ...columnsOf(PATH_PAYMENT_KEYS)];
+
+/** What `GET /v2/path_payments` and `GET /v2/accounts/:address/path_payments` are asked for; already validated. */
 export interface PathPaymentsQuery {
   /** Inclusive: the first ledger that closed at or after it starts the list. */
   start?: Date;
@@ -23,9 +35,10 @@ export interface PathPaymentsQuery {
 }
 
 /**
- * The path payments of the network in a window. The dates become a range of ledgers once, then one page of
- * `path_payments` is read in the order of its key, each row once (`readDistinctPage`: a ledger written twice is not
- * listed twice).
+ * The path payments of the network or of an account in a window. The dates become a range of ledgers once, then one
+ * page is read in the order of the key, each path payment once (`readDistinctPage`: a ledger written twice is not
+ * listed twice): from `path_payments` for the network, and for an account the keys from its index
+ * `account_path_payments`, whose path payments are then read from `path_payments`.
  */
 @Injectable()
 export class PathPaymentsService {
@@ -59,5 +72,60 @@ export class PathPaymentsService {
       pathPayments: page.rows.map(toPathPaymentObject),
       ...(page.marker !== undefined && { marker: page.marker }),
     };
+  }
+
+  /**
+   * One page of the path payments `account` sent or received, in the order asked for, with the marker of the next page
+   * when there is one. A payment to oneself has one row in the index, so it is listed once.
+   */
+  async listOfAccount(
+    account: string,
+    q: PathPaymentsQuery,
+  ): Promise<{ pathPayments: PathPaymentObject[]; marker?: string }> {
+    const after = decodeMarker(q.marker, PATH_PAYMENT_KEYS);
+
+    const range = await this.ranges.resolve(q.start, q.endExclusive);
+    if (!range) return { pathPayments: [] };
+
+    const cursor = keysetClause(PATH_PAYMENT_KEYS, q.descending, after);
+    const keys = await readDistinctPage<PathPaymentKey>(this.ch, {
+      columns: 'ledger_index, tx_index',
+      table: Table.AccountPathPayments,
+      where: [
+        'account = {account:String}',
+        'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
+        ...(cursor.clause !== '' ? [cursor.clause] : []),
+      ],
+      orderBy: ACCOUNT_PATH_PAYMENT_ORDER,
+      unique: columnsOf(PATH_PAYMENT_KEYS),
+      descending: q.descending,
+      params: { account, min: range.min, max: range.max, ...cursor.params },
+      limit: q.limit + 1,
+    });
+
+    // the page is cut from the keys, so a key whose path payment is missing cannot end the list early
+    const page = paginate(keys, q.limit, (key) => [key.ledger_index, key.tx_index]);
+    const rows = await this.byKeys(page.rows);
+    return {
+      pathPayments: rows.map(toPathPaymentObject),
+      ...(page.marker !== undefined && { marker: page.marker }),
+    };
+  }
+
+  /** The path payments of these keys, in their order, each once; a key without a row is left out. */
+  private async byKeys(keys: PathPaymentKey[]): Promise<PathPaymentsRow[]> {
+    if (keys.length === 0) return [];
+    const ledgers = keys.map((k) => k.ledger_index);
+    // a ledger written twice has the row twice until a merge (no FINAL is used): the map below keeps one
+    const rows = await this.ch.query<PathPaymentsRow>(
+      `SELECT ${PATH_PAYMENT_COLUMNS} FROM ${Table.PathPayments}
+        WHERE ledger_index BETWEEN {lo:UInt32} AND {hi:UInt32}
+          AND (ledger_index, tx_index) IN (
+              SELECT tupleElement(key, 1), tupleElement(key, 2)
+                FROM (SELECT arrayJoin(arrayZip({ledgers:Array(UInt32)}, {indexes:Array(UInt32)})) AS key))`,
+      { lo: Math.min(...ledgers), hi: Math.max(...ledgers), ledgers, indexes: keys.map((k) => k.tx_index) },
+    );
+    const byKey = new Map(rows.map((row) => [`${row.ledger_index}:${row.tx_index}`, row]));
+    return keys.flatMap((k) => byKey.get(`${k.ledger_index}:${k.tx_index}`) ?? []);
   }
 }

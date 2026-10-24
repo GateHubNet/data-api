@@ -132,6 +132,7 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.AmmGovernance, 'ammGovernance'],
   [Table.AccountStates, 'accountStates'],
   [Table.PathPayments, 'pathPayments'],
+  [Table.AccountPathPayments, 'accountPathPayments'],
 ];
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
@@ -1368,7 +1369,7 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
 }
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the account states and the path payments', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the account states, the path payments and their index by account', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -1392,6 +1393,7 @@ describe('CHILD_TABLES', () => {
         Table.AmmGovernance,
         Table.AccountStates,
         Table.PathPayments,
+        Table.AccountPathPayments,
       ].sort(),
     );
   });
