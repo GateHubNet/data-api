@@ -825,7 +825,10 @@ Ledger and `DisallowIncomingRemit` on Xahau).
 
 The flags at a ledger are those of the account's last change at or before it. The state history covers the ledgers above the newest
 ledger written by a parser older than parser version 3 (gaps in the ledger numbers do not matter); see
-[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet.
+[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet. The
+coverage relies on the stored ledgers being complete above its start: a ledger missing there would leave out the changes it made,
+and nothing in the coverage would show it. Gap repair keeps them complete
+([backfill](backfill.md#resuming-gap-repair-reprocessing)).
 
 Errors, in order: 400 `invalid date format`, `invalid ledger hash` (only with `flags=true`); 404 `Account not found` (no activation);
 400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
@@ -1109,7 +1112,9 @@ limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer
 
 The lines at a ledger are those of their last change at or before it. The state history covers the ledgers above the newest ledger
 written by a parser older than parser version 3, the same coverage as the account flags (see
-[backfill](backfill.md#account-state-history-re-ingest)); a line that has not changed since that start is not listed yet.
+[backfill](backfill.md#account-state-history-re-ingest)); a line that has not changed since that start is not listed yet. Gaps in
+the ledger numbers do not matter: the coverage relies on the stored ledgers being complete above its start, which gap repair keeps
+([backfill](backfill.md#resuming-gap-repair-reprocessing)).
 
 Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`;
 400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state

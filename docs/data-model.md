@@ -327,8 +327,8 @@ It is a child table like the others (`CHILD_TABLES`, `LEDGER_KEYED_TABLES`, the 
 `--reprocess`), written from `PARSER_VERSION` 3 (`STATE_PARSER_VERSION`). **The state of an account at ledger L is its newest row at or
 before L**, and none when that row is deleted: a read `ORDER BY ledger_index DESC, tx_index DESC, node_index DESC LIMIT 1` in the
 account's prefix. **Coverage**: the table holds the state of ledger L when every stored ledger from L up was written by version 3 or
-later (gaps in the ledger numbers do not matter), so it starts above the newest ledger an older parser wrote, and an account that has
-not changed since then has no row yet; the history spec fills it back to ledger 32570. Read by `/accounts/{a}?flags=true` and
+later (gaps in the ledger numbers do not matter: it relies on the stored ledgers being complete above its start, which gap repair
+keeps), so it starts above the newest ledger an older parser wrote, and an account that has not changed since then has no row yet; the history spec fills it back to ledger 32570. Read by `/accounts/{a}?flags=true` and
 `/accounts/{a}/balances` (the native balance) with a ledger named, through `AccountStatesService` (`StateLedgerService` resolves the
 ledger and checks the coverage), and by the CSV of `/accounts/{a}/transactions`, whose `flags_changed` compares the row a
 transaction wrote for the account with the account's `Flags` in that node's `PreviousFields` (the node of `node_index` in the
