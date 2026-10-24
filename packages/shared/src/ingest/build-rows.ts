@@ -21,6 +21,7 @@ import {
   PaymentsByCurrencyRow,
   PaymentsRow,
   TransactionsRow,
+  TrustLineStatesRow,
   TxByHashRow,
   TxByTypeRow,
 } from '../clickhouse/rows';
@@ -35,6 +36,7 @@ import { FromClientParser } from '../parsers/from-client.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
 import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
+import { TrustLineStatesParser } from '../parsers/trust-line-states.parser';
 import { RawLedger } from './raw-ledger';
 
 /** Every row one ledger writes, one array per table. `ledger` is the commit marker and is written last. */
@@ -61,6 +63,8 @@ export interface LedgerRows {
   ammGovernance: AmmGovernanceRow[];
   /** The state of every account root after each transaction that changed it (parser version 3, ADR-0015). */
   accountStates: AccountStatesRow[];
+  /** The state of each side of every trust line after each transaction that changed it (parser version 3, ADR-0015). */
+  trustLineStates: TrustLineStatesRow[];
   /** Every successful Payment whose delivery used someone else's liquidity, a payment to oneself included. */
   pathPayments: PathPaymentsRow[];
   /** The index of `pathPayments` by account: the source and the destination, one row for a payment to oneself. */
@@ -87,7 +91,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
 /**
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
- * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the account state history, the path payments
+ * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
  * and their index by account.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
@@ -109,6 +113,7 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
   [Table.AccountStates, 'accountStates'],
+  [Table.TrustLineStates, 'trustLineStates'],
   [Table.PathPayments, 'pathPayments'],
   [Table.AccountPathPayments, 'accountPathPayments'],
 ];
@@ -119,6 +124,7 @@ const exchangeParser = new ExchangeParser();
 const balanceChangesParser = new BalanceChangesParser();
 const accountsCreatedParser = new AccountsCreatedParser();
 const accountStatesParser = new AccountStatesParser();
+const trustLineStatesParser = new TrustLineStatesParser();
 const ammParser = new AmmParser();
 const affectedAccountsParser = new AffectedAccountsParser();
 const fromClientParser = new FromClientParser();
@@ -226,6 +232,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     accountAmmLiquidity: [],
     ammGovernance: [],
     accountStates: [],
+    trustLineStates: [],
     pathPayments: [],
     accountPathPayments: [],
     diagnostics: { ammUnclassified: 0 },
@@ -572,6 +579,32 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         owner_count: state.owner_count,
         fields: JSON.stringify(state.fields),
         deleted: state.deleted ? 1 : 0,
+      });
+    }
+
+    for (const line of trustLineStatesParser.parse(t, ctx)) {
+      rows.trustLineStates.push({
+        account: line.account,
+        counterparty: line.counterparty,
+        currency: line.currency,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: line.node_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        balance: line.balance,
+        limit: line.limit,
+        limit_peer: line.limit_peer,
+        no_ripple: line.no_ripple ? 1 : 0,
+        no_ripple_peer: line.no_ripple_peer ? 1 : 0,
+        authorized: line.authorized ? 1 : 0,
+        peer_authorized: line.peer_authorized ? 1 : 0,
+        freeze: line.freeze ? 1 : 0,
+        peer_freeze: line.peer_freeze ? 1 : 0,
+        quality_in: line.quality_in,
+        quality_out: line.quality_out,
+        flags: line.flags,
+        deleted: line.deleted ? 1 : 0,
       });
     }
   }

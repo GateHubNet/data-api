@@ -16,7 +16,7 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    │              │               │                │ account rollups │                  │
    └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴─────────┬────────┘
           ▼               ▼               ▼                 ▼                  ▼
-   22 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
+   23 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
    (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
     marker)           manifests,                      volume_daily,      validator_manifests (rpc),
                       validator_                      amm_pools,         network_state,
@@ -71,11 +71,11 @@ The single writer of the ledger tables. It follows the validated chain, one ledg
 
 ### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 22
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 23
 **ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
 `balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
-`account_amm_liquidity`, `amm_governance`, the account state history `account_states`, `path_payments` and its index by account `account_path_payments`; see [data-model](data-model.md)). The parsers never mutate their input and take the
+`account_amm_liquidity`, `amm_governance`, the state history `account_states` and `trust_line_states`, `path_payments` and its index by account `account_path_payments`; see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
 copies), and a pool the parser touches gets a state row, plus a liquidity or governance row for the `AMM*` transactions. A pool or a

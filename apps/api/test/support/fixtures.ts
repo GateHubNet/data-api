@@ -27,7 +27,7 @@ export const RIPPLE_MOCK_DIR = join(FIXTURES, 'xrpl', 'ripple-mock');
 export const XRPL_RECORDED_DIR = join(FIXTURES, 'xrpl', 'recorded');
 /** Mainnet ledgers recorded around AMM transactions (swaps, deposits, withdrawals, votes, bids): see the fixtures README. */
 export const XRPL_AMM_DIR = join(FIXTURES, 'xrpl', 'amm');
-/** Mainnet ledgers around changes of account flags and an AccountDelete: see the fixtures README. */
+/** Mainnet ledgers around changes of account flags, trust line settings and an AccountDelete: see the fixtures README. */
 export const XRPL_ACCOUNT_STATE_DIR = join(FIXTURES, 'xrpl', 'account-state');
 /** Mainnet ledgers recorded around path payments and the payments that are not ones: see the fixtures README. */
 export const XRPL_PATH_PAYMENTS_DIR = join(FIXTURES, 'xrpl', 'path-payments');

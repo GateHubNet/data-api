@@ -9,7 +9,7 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/ripple-mock/`    | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
 | `xrpl/recorded/`       | Mainnet ledgers recorded from a public node (see below).                                |
 | `xrpl/amm/`            | Mainnet AMM transactions, one ledger per named case (see below).                        |
-| `xrpl/account-state/`  | Mainnet changes of account flags and an AccountDelete, with the ledgers before them.    |
+| `xrpl/account-state/`  | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
 | `xahau/recorded/`      | Xahau mainnet ledgers recorded from a public node (see below).                          |
 | `xrpl/unl/`            | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
 | `xahau/unl/`           | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
@@ -188,6 +188,25 @@ issuer whose flags change in ledger 93663334 of `xrpl/amm/`, where its creation 
 Xahau's account flags are tested on `xahau/recorded/`: its account roots carry flags only Xahau has (URITokenIssuer 0x40000000 on
 most of them, TshCollect on `rLqimfBcsc4x9Gy9jTfZUNktvJFLzTnv2n` in 26540711, DisallowIncomingRemit and DepositAuth on
 `rD74dUPRFNfgnY2NzrxxYRXN4BrfGSN6Mv` in 26540188), so no Xahau ledger was recorded for them.
+
+#### Trust line cases
+
+Added 2026-10-24 from `wss://s2.ripple.com` (validated head 107873595) with `--txs` and `--delay-ms 500`: 8 more ledgers (454
+KB gzipped, largest 142 KB). The trust line tests (`apps/api/test/account-trustlines.e2e-spec.ts`, same seed) read them, together
+with the TUJ lines of `rKqSPjN6okYt7iPk3xzWvuW9oN1Nk7vSUV` that its holders and its AMM pool create in 93663330 and 93663334.
+Freezes and authorizations were found with `account_lines` on issuers (`freeze`, `freeze_peer`, `authorized` set) and then
+`account_tx` with `tx_type: TrustSet` on the holders; no recorded set had a quality, a freeze or an authorization before.
+
+| Case | Ledger | Transaction | What the trust line does |
+| --- | --- | --- | --- |
+| `trustset_qualities` | 26922216 | `7AC4B79B90CDC9510BEC38B451ABAF877577731D55C0E0BFDA488BEAD42F2914` | `rKQxxMQxm6jHV82bq4BCwyfcxcGG9GPWiU` raises its LBR limit to 10000000; its side has QualityIn and QualityOut 1 |
+| `trustset_freeze` | 26926380 | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The same holder freezes the line (HighFreeze) and clears its qualities |
+| `trustset_unfreeze` | 26926383 | `5F852D7E42E707A0F142EE525F4A427B3DDA8775BB724D6B9FA7E12A15CF25EC` | It clears the freeze again |
+| `trustset_preauthorizes` | 104477592 | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | The USDV issuer `rfffsukWALJB1PXYk7H8xkR6UJUDT8nMJE` creates a holder's line, authorized, at zero |
+| `ammcreate_unauthorized_line` | 104478769 | `93605E3991FED4AED241A9A0274975394332E552BD38C15D7050F262F49DC9C9` | AMMCreate gives the pool `rPZZja3wKFEmAGGteziXYLT9Ne6SnT7H66` a USDV line of 700000, not authorized |
+| `trustset_authorizes` | 104479125 | `C36AC10B9FA6AD15E2254477DFEF057D08589E39CA0102871D93622191D03D96` | The USDV issuer authorizes the pool's line |
+| `trustline_created_at_zero` | 104566877 | `19B5C0FB6295872FCECCE7491806E3CE4A54067F4C43BC898BD1387EBC0D9DAB` | `rsMeJ5p6qzVARADTYhvZbHqwkfyN18U2XH` creates a USDV line with a zero balance |
+| `trustline_deleted` | 104566926 | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | It sets the limit back to 0: the line is a `DeletedNode` |
 
 ### XRPL path payments (`xrpl/path-payments/`)
 

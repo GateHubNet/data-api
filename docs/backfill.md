@@ -170,10 +170,11 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
 
 ### Account state history re-ingest
 
-`PARSER_VERSION` is 3 since the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)): every ledger
-written by version 3 has its `account_states` rows, and a ledger written by an older version has none. The API answers a historical
-read of the state tables (`/v2/accounts/{address}?flags=true` with a ledger named) only above the **newest ledger an older parser
-wrote** (`STATE_PARSER_VERSION`, `StateLedgerService`); a ledger at or below it answers 400 `the date provided is too old`. Gaps in the
+`PARSER_VERSION` is 3 since the account and trust line state history
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)): every ledger written by version 3 has its `account_states` and
+`trust_line_states` rows, and a ledger written by an older version has none. The API answers a historical read of the state tables
+(`/v2/accounts/{address}?flags=true` with a ledger named, `/v2/accounts/{address}/trustlines`) only above the **newest ledger an older
+parser wrote** (`STATE_PARSER_VERSION`, `StateLedgerService`); a ledger at or below it answers 400 `the date provided is too old`. Gaps in the
 ledger numbers do not matter, only the versions of the stored ledgers do.
 
 So after the deploy, the coverage starts at the first ledger the live syncer writes, and **a single ledger of an older version left

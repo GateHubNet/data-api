@@ -22,8 +22,9 @@
  *  - 1: the Ripple v2 data (payments, exchanges, balance changes, accounts created).
  *  - 2: AMM data (swaps as exchanges, pool states, liquidity, governance). Ledgers from the AMM enablement ledger
  *       (86795265 on mainnet) written with version 1 lack these rows; `--reprocess` rewrites them.
- *  - 3: account state history (`account_states`). Ledgers written with an older version lack these rows; the state
- *       tables cover only the ledgers above the last one an older parser wrote (`STATE_PARSER_VERSION`).
+ *  - 3: account and trust line state history (`account_states`, `trust_line_states`). Ledgers written with an older
+ *       version lack these rows; the state tables cover only the ledgers above the last one an older parser wrote
+ *       (`STATE_PARSER_VERSION`).
  *  - 4: path payments (`path_payments`, and their index by account `account_path_payments`). Ledgers written with an
  *       older version have none; `--reprocess` rewrites them.
  *
@@ -36,8 +37,9 @@ export const PARSER_VERSION = 4;
 export const AMM_PARSER_VERSION = 2;
 
 /**
- * The first parser version that writes the account state history (`account_states`): a ledger written by an older one
- * lacks its rows. Gates compare with this constant, never with `PARSER_VERSION`, which later features move on.
+ * The first parser version that writes the state history (`account_states` and `trust_line_states`): a ledger written by
+ * an older one lacks their rows. The two tables share it, so one coverage answers for both. Gates compare with this
+ * constant, never with `PARSER_VERSION`, which later features move on.
  */
 export const STATE_PARSER_VERSION = 3;
 /**
@@ -272,6 +274,37 @@ export interface AccountStatesRow {
   sequence: number;
   owner_count: number;
   fields: string;
+  deleted: number;
+}
+
+/**
+ * The state of a trust line after a transaction that changed it, from one side (migration 006): two rows per changed
+ * line, one per account. `balance` is the account's (positive: the counterparty owes it), `limit` its own limit, the
+ * `_peer` / `peer_` columns are the counterparty's settings; `flags` is the RippleState `Flags` as stored. `deleted` is 1
+ * for the node that removed the line.
+ */
+export interface TrustLineStatesRow {
+  account: string;
+  counterparty: string;
+  currency: string;
+  ledger_index: number;
+  tx_index: number;
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  balance: string;
+  limit: string;
+  limit_peer: string;
+  no_ripple: number;
+  no_ripple_peer: number;
+  authorized: number;
+  peer_authorized: number;
+  freeze: number;
+  peer_freeze: number;
+  quality_in: number;
+  quality_out: number;
+  flags: number;
   deleted: number;
 }
 

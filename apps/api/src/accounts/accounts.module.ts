@@ -24,10 +24,12 @@ import { AccountStatsController } from './account-stats.controller';
 import { AccountStatsService } from './account-stats.service';
 import { AccountTransactionsController } from './account-transactions.controller';
 import { AccountTransactionsService } from './account-transactions.service';
+import { AccountTrustlinesController } from './account-trustlines.controller';
 import { AccountsController } from './accounts.controller';
 import { AccountsService } from './accounts.service';
 import { LiveLedgerService } from './live-ledger.service';
 import { NamesAndLabelsService } from './names-and-labels.service';
+import { TrustLinesService } from './trust-lines.service';
 
 /**
  * `GET /v2/accounts` and `GET /v2/accounts/:address`, `GET /v2/accounts/:address/transactions[/:sequence]`,
@@ -35,8 +37,10 @@ import { NamesAndLabelsService } from './names-and-labels.service';
  * `GET /v2/accounts/:address/reports[/:date]` and `GET /v2/accounts/:address/stats/:family` (their values are in the
  * native currency, converted with the `RatesService` of `RatesModule`), the two routes that ask the live node
  * instead of the database, `GET /v2/accounts/:address/{balances,orders}`, and the AMM routes of an account,
- * `GET /v2/accounts/:address/{amm_liquidity,amm_positions}`, and the path payments of an account,
- * `GET /v2/accounts/:address/path_payments` (read by the `PathPaymentsService` of `PathPaymentsModule`).
+ * `GET /v2/accounts/:address/{amm_liquidity,amm_positions}`, the path payments of an account,
+ * `GET /v2/accounts/:address/path_payments` (read by the `PathPaymentsService` of `PathPaymentsModule`), and the trust
+ * lines of an account at a ledger from the state history, `GET /v2/accounts/:address/trustlines` (its read,
+ * `TrustLinesService`, is meant for `/balances` at a historical ledger too).
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
@@ -56,6 +60,7 @@ import { NamesAndLabelsService } from './names-and-labels.service';
     AccountStatsController,
     AccountAnalyticsController,
     AccountAmmController,
+    AccountTrustlinesController,
     AccountPathPaymentsController,
   ],
   providers: [
@@ -74,6 +79,7 @@ import { NamesAndLabelsService } from './names-and-labels.service';
     AccountAnalyticsService,
     AccountAmmService,
     NamesAndLabelsService,
+    TrustLinesService,
   ],
 })
 export class AccountsModule {}

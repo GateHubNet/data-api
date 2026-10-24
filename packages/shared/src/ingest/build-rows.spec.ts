@@ -131,6 +131,7 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
   [Table.AccountStates, 'accountStates'],
+  [Table.TrustLineStates, 'trustLineStates'],
   [Table.PathPayments, 'pathPayments'],
   [Table.AccountPathPayments, 'accountPathPayments'],
 ];
@@ -1283,6 +1284,7 @@ describe('AMM rows (parser version 2)', () => {
       [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
       [Table.AmmGovernance, 'ammGovernance'],
       [Table.AccountStates, 'accountStates'],
+      [Table.TrustLineStates, 'trustLineStates'],
     ];
 
     it.each(tables)('%s', (table, key) => {
@@ -1369,7 +1371,7 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
 }
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the account states, the path payments and their index by account', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -1392,6 +1394,7 @@ describe('CHILD_TABLES', () => {
         Table.AccountAmmLiquidity,
         Table.AmmGovernance,
         Table.AccountStates,
+        Table.TrustLineStates,
         Table.PathPayments,
         Table.AccountPathPayments,
       ].sort(),

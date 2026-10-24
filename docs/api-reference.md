@@ -199,7 +199,8 @@ network, spec #4) and `GET /v2/accounts/{address}/path_payments` (those of an ac
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
 `GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
-ledger from the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)).
+ledger from the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), and
+`GET /v2/accounts/{address}/trustlines` lists an account's trust lines with all their settings at a ledger, from the same history.
 Exchange-based endpoints also differ in what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see
 [Exchanges](#exchanges) and [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
@@ -730,7 +731,7 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 ## Accounts
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
-(`/balances`, `/orders`): an address that does not exist simply has no rows. All account lists take the common window
+(`/balances`, `/orders`, `/trustlines`): an address that does not exist simply has no rows. All account lists take the common window
 parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
 described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments).
 
@@ -1030,6 +1031,59 @@ ripple address`.
 
 **Differences**: `direction` is `sell` when the offer has the sell flag (the original hard-coded `buy`); the address is
 validated (the original let the node fail with a 500); `limit=all` is honored; the default ledger is the validated one.
+
+### `GET /v2/accounts/{address}/trustlines`
+
+The **trust lines** of the account at a ledger, with all their settings, from the **trust line state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)); it never reads the node. Each line is from the account's side,
+ordered and paged by (`counterparty`, `currency`). An issuer's lines are its holders. A GateHub extra: the original had no such route
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 61 and 62).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `ledger_index` (alias `ledger`) | newest indexed | A ledger number. `validated`, `closed`, `current` and anything else read the newest indexed ledger too. |
+| `ledger_hash` | | The stored ledger with this hash (400 `invalid ledger hash` unless 64 hex digits). |
+| `date` (alias `close_time`) | | The last stored ledger closed at or before it. |
+| `currency` | all | Only the lines in that currency (compared as written: `USD`, or the 40 hex digits of a non-standard code). |
+| `counterparty` | all | Only the lines with that account. |
+| `limit`, `marker` | 200 (max 1000) | See [Pagination](#pagination). |
+| `format` | json | `csv`: file `<address> - trustlines.csv`, one row per line, paged like the JSON. |
+
+Precedence: `ledger_hash` > `date` > `ledger_index`, as on `/balances`. With no ledger named the route reads the newest ledger this
+API has indexed (not the node's validated ledger), so a marker always belongs to this API's data and the pages never mix two sources;
+that ledger trails the network by the ingest delay. The marker is the (counterparty, currency) of the last line and does not hold the
+ledger: each page without a ledger named reads the newest ledger again, so a walk (or an [export](#exports)) that must be one ledger's
+names it with `ledger_index`, the `ledger_index` of the first page.
+
+```json
+{ "result": "success", "ledger_index": 26926380, "close_time": "2017-01-12T18:49:31Z", "count": 1, "marker": "…",
+  "trustlines": [{ "currency": "LBR", "counterparty": "r…", "balance": "5.017529627551844", "limit": "10000000",
+                   "limit_peer": "1000000", "no_ripple": false, "no_ripple_peer": false, "authorized": false,
+                   "peer_authorized": false, "freeze": true, "peer_freeze": false, "quality_in": 0, "quality_out": 0 }] }
+```
+
+Key order: `result, ledger_index, close_time, count, marker?, trustlines`; a line is `currency, counterparty, balance, limit,
+limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out`.
+
+- `balance`: the account's balance on the line, exact; positive when the counterparty owes it (a holder of an issued currency),
+  negative when it owes the counterparty (the issuer's side of the same line).
+- `limit` is the account's own limit, `limit_peer` the counterparty's. `no_ripple`, `authorized` and `freeze` are the account's
+  own settings (it set no-ripple on its side, it authorized the line, it froze the line); the `_peer` / `peer_` fields are the
+  counterparty's. `quality_in` and `quality_out` are the account's, as the ledger stores them (0 when it has none).
+- A line with a zero balance is listed; a line deleted at or before the ledger is not.
+
+The lines at a ledger are those of their last change at or before it. The state history covers the ledgers above the newest ledger
+written by a parser older than parser version 3, the same coverage as the account flags (see
+[backfill](backfill.md#account-state-history-re-ingest)); a line that has not changed since that start is not listed yet.
+
+Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`;
+400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
+history does not cover, the newest one included when no ledger is named); 500 `unable to retrieve trustlines`.
+
+**Risk: an issuer's lines.** The read groups the account's whole line history up to the ledger, and every payment in an issuer's
+currencies changes its lines, so a big issuer's read may exceed the api's query guards (30 s, `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, and
+2 GiB, `API_CLICKHOUSE_MAX_QUERY_MEMORY` in production) and answer its 500. It can only be measured once
+the history spec has filled the tables; the remedy would be periodic state snapshots.
 
 ### `GET /v2/accounts/{address}/reports[/{date}]`
 
@@ -3228,6 +3282,7 @@ a value too wide for its column wraps (a transaction hash takes two lines). The 
 | `/v2/accounts/{address}/exchanges[/{base}[/{counter}]]` | `executed_time, ledger_index, base_amount, base_currency, base_issuer, counter_amount, counter_currency, counter_issuer, rate, buyer, seller, tx_hash` |
 | `/v2/accounts/{address}/balance_changes` | `executed_time, ledger_index, change_type, currency, counterparty, amount_change, final_balance, tx_hash` |
 | `/v2/accounts/{address}/balances` | `currency, counterparty, value` |
+| `/v2/accounts/{address}/trustlines` | every column: `currency, counterparty, balance, limit, limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out` |
 | `/v2/accounts` | `inception, ledger_index, account, parent, initial_balance, tx_hash` |
 | `/v2/path_payments`, `/v2/accounts/{address}/path_payments` | `executed_time, ledger_index, source, destination, delivered_amount, currency, issuer, source_amount, source_currency, offers_crossed, hash` |
 | any other list | its first 8 columns, of equal width |

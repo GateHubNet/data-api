@@ -91,6 +91,22 @@ export const PDF_COLUMNS: Record<string, PdfColumn[]> = {
     column('tx_hash', 136),
   ],
   '/v2/accounts/:address/balances': [column('currency', 36), column('counterparty', 140), column('value', 60)],
+  // every setting of a line: the fallback's first 8 columns would leave out the freezes and the qualities
+  '/v2/accounts/:address/trustlines': [
+    column('currency', 36),
+    column('counterparty', 140),
+    column('balance', 60),
+    column('limit', 60),
+    column('limit_peer', 60),
+    column('no_ripple', 34),
+    column('no_ripple_peer', 44),
+    column('authorized', 40),
+    column('peer_authorized', 48),
+    column('freeze', 30),
+    column('peer_freeze', 40),
+    column('quality_in', 40),
+    column('quality_out', 40),
+  ],
   '/v2/accounts': [
     column('inception', 104),
     column('ledger_index', 44),
