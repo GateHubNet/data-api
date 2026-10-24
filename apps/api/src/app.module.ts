@@ -1,4 +1,10 @@
-import { clickHouseConfigFromEnv, getNetworkProfile, NetworkProfile } from '@gatehub/data-api-shared';
+import {
+  clickHouseConfigFromEnv,
+  getNetworkProfile,
+  LivelinessModule,
+  NetworkProfile,
+  sharedDatabaseFromEnv,
+} from '@gatehub/data-api-shared';
 import {
   DynamicModule,
   Inject,
@@ -34,9 +40,10 @@ import {
 } from './config/api.config';
 import { ExchangesModule } from './exchanges/exchanges.module';
 import { RatesModule } from './exchanges/rates.module';
+import { ExportsModule } from './exports/exports.module';
 import { LedgersModule } from './ledgers/ledgers.module';
-import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
+import { PathPaymentsModule } from './path-payments/path-payments.module';
 import { PaymentsModule } from './payments/payments.module';
 import { StatsModule } from './stats/stats.module';
 import { TransactionsModule } from './transactions/transactions.module';
@@ -53,7 +60,12 @@ async function assemble(): Promise<DynamicModule> {
   apiKeysOf(config); // throws now, before anything is built, when production has no key
   rateLimitKeysOf(config); // and on an invalid GH_RATE_LIMIT_KEYS (the guard checks it again when it is built)
   const profile = getNetworkProfile(config.network);
-  return CommonModule.register({ config, profile, clickHouse: clickHouseConfigFromEnv(process.env, profile) });
+  return CommonModule.register({
+    config,
+    profile,
+    clickHouse: clickHouseConfigFromEnv(process.env, profile),
+    sharedDatabase: sharedDatabaseFromEnv(process.env),
+  });
 }
 
 const assembled = assemble();
@@ -70,6 +82,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   LedgersModule,
   TransactionsModule,
   PaymentsModule,
+  PathPaymentsModule,
   ExchangesModule,
   RatesModule,
   AccountsModule,
@@ -79,6 +92,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ValidatorsModule,
   StatsModule,
   AmmModule,
+  ExportsModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

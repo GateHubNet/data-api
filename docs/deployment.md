@@ -21,6 +21,9 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
                         (one server) ◀── syncer-xahau ──────▶ Xahau node(s)                xahau
                               ▲
                         migrate-xrpl, migrate-xahau   (one-shot: create the database, apply the schema)
+                        migrate-shared                (one-shot: the `shared` database both apis read, names and labels)
+                        exporter-xrpl, exporter-xahau (one per network, profile `exports`): queued export jobs ──▶ the
+                                                      network's api (the list's pages) ──▶ Google Cloud Storage bucket
 ```
 
 - **api-xrpl / api-xahau** are stateless and scale horizontally.
@@ -28,13 +31,26 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
   to scale it; keep the names, they are that mechanism) and by a lease in ClickHouse (a second syncer refuses to boot). The fixed
   names (`data-syncer-*`, `ch-keeper`, `ch-server`) also mean one prod stack per Docker host; the dev `docker-compose.yaml` fixes
   none and takes its host ports from variables, so it can run next to another stack. They expose only the probe and metrics.
+- **exporter-xrpl / exporter-xahau** make the [export](api-reference.md#exports) files (spec #4, ticket #15). Each is a singleton
+  like the syncer (`container_name` `data-exporter-*`): two exporters of one database would take the same job. It walks the lists
+  through its network's api (`GH_API_URL`, the `api-<network>` service) with its own API key (`EXPORTER_API_KEY`, which must be in
+  `GH_API_KEYS`, with a large budget in `GH_RATE_LIMIT_KEYS`), and uploads to the bucket of `GH_EXPORT_BUCKET` under
+  `<network>/`. They run with the compose profile `exports` (`--profile exports`); without a bucket they refuse to start and the
+  apis answer 503 on `/v2/exports`.
+- **The export bucket** (Google Cloud Storage) is one for every network. Give it a lifecycle rule that deletes an object 7 days
+  after it was created (the jobs expire from `export_jobs` at the same age). The apis and the exporters use the application default
+  credentials: mount a service account key and set `GOOGLE_APPLICATION_CREDENTIALS` to it (the commented volumes of the compose
+  files). The account needs `storage.objects.create` and `storage.objects.get` on the bucket (the exporters write, the apis sign
+  V4 links with the key; on GKE with Workload Identity, `iam.serviceAccounts.signBlob` on itself instead of a key).
 - **ClickHouse** and **Keeper** are internal: never publish them. **nginx** is the only service with a host port.
 - The API answers the same `/v2/...` paths on both hosts; the **host name** selects the network
   ([api-reference](api-reference.md#hosts-one-per-network)). Native currency per network: `XRP` / `XAH`.
 
 ## Outbound network access
 
-- **api-xrpl / api-xahau:** ClickHouse and the node(s) they forward live lookups to; nothing else.
+- **api-xrpl / api-xahau:** ClickHouse and the node(s) they forward live lookups to; nothing else (signing an export's link is
+  local, with the key).
+- **exporter-xrpl / exporter-xahau:** ClickHouse, their network's api, and `storage.googleapis.com` (HTTPS) for the uploads.
 - **syncer-xrpl / syncer-xahau:** ClickHouse and its node(s) (WSS/HTTP), plus, for the `validators` worker, **outbound HTTPS (port 443)
   to public hosts**:
   - the **UNL publishers** of `GH_UNL_PUBLISHERS` (by default `vl.ripple.com` and `unl.xrplf.org` on XRPL, `vl.xahau.org` on Xahau), and
@@ -49,7 +65,7 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
 
 ## Build
 
-Both images build from the **repo root** (the context is the whole workspace) on the public `node:22.23.2-bookworm-slim` base
+The three images (api, syncer, exporter) build from the **repo root** (the context is the whole workspace) on the public `node:22.23.2-bookworm-slim` base
 (Node >= 20.19 is required) and run as the non-root `node` user. The private `@gatehub/toolbox` needs your npm token at install
 time. The token is passed as a **BuildKit secret** read from the `NPM_TOKEN` environment variable: it is mounted for one `RUN` only,
 written to `~/.npmrc` inside it and removed before the layer is committed. It is never a build argument or environment variable and
@@ -64,6 +80,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod build
 # or one image by hand
 docker build --secret id=npm_token,env=NPM_TOKEN -f apps/api/Dockerfile    -t gatehub/data-api    .
 docker build --secret id=npm_token,env=NPM_TOKEN -f apps/syncer/Dockerfile -t gatehub/data-syncer .
+docker build --secret id=npm_token,env=NPM_TOKEN -f apps/exporter/Dockerfile -t gatehub/data-exporter .
 ```
 
 Without the secret the build stops with `secret npm_token: not found` (an empty secret: `the npm_token secret is empty`).
@@ -73,10 +90,11 @@ Notes:
   `IMAGE_TAG` (default `latest` in prod, `dev` in the dev compose).
 - Install, build and `pnpm deploy` run in a **single `RUN`** (pnpm workspace symlinks do not survive across BuildKit layers); the
   build then checks that the deployed shared package contains `dist`, `schema/001_baseline.sql`, `config/markets/*.json` and
-  `config/definitions/*.json`, and the syncer image `dist/cli/range-ingest.js`. `*.tsbuildinfo` is ignored by git and docker (a stale
+  `config/definitions/*.json`, the syncer image `dist/cli/range-ingest.js`, and the exporter image the shared `export/` module and
+  `@google-cloud/storage`. `*.tsbuildinfo` is ignored by git and docker (a stale
   one makes `tsc` skip emit).
 - The images set `NODE_ENV=production` and `GH_ENV=container` (no env file: the configuration is the environment).
-- `EXPOSE`: api `3001` + `3000` (metrics), syncer `3002` + `3000`. Never publish the metrics port.
+- `EXPOSE`: api `3001` + `3000` (metrics), syncer `3002` + `3000`, exporter `3005` + `3000`. Never publish the metrics port.
 - Entry points of the syncer image (all relative to `/app`): `node dist/main.js` (default), the migration job below, and
   `node dist/cli/range-ingest.js --from <n> --to <m>`.
 
@@ -86,7 +104,8 @@ GitHub Actions runs two workflows (`.github/workflows/`):
 
 - **`ci.yml`**, on every pull request to `master` and every push to `master`. It has three parts:
   - one job runs `pnpm build` and `pnpm test`;
-  - three jobs run the e2e suites (shared, api, syncer) in parallel, each against its own testcontainers ClickHouse;
+  - three jobs run the e2e suites (shared, api, syncer) in parallel, each against its own testcontainers ClickHouse (the api suite
+    also runs the exporter, against the harness's api and an in-memory store: `apps/api/test/exports.e2e-spec.ts`);
   - a job summary shows the changelog of what is not released yet.
 
   A newer push to a pull request cancels its older run.
@@ -97,15 +116,15 @@ GitHub Actions runs two workflows (`.github/workflows/`):
        and `v<n>.<n>.<n>-*`;
      - a tag that has the shape but is not a semantic version, such as `v1.2.3-rc.01`, starts a run that stops at this step.
   2. **Test:** the whole of `ci.yml`.
-  3. **Images:** both images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api` and
-     `ghcr.io/gatehubnet/data-syncer`, tagged with the version without its `v` (`1.4.0`).
-  4. **Latest:** `latest` on both images points at the newest version tag, a pre-release included, whose two images are both
+  3. **Images:** the three images for `linux/amd64` and `linux/arm64`, pushed to GitHub Packages as `ghcr.io/gatehubnet/data-api`,
+     `ghcr.io/gatehubnet/data-syncer` and `ghcr.io/gatehubnet/data-exporter`, tagged with the version without its `v` (`1.4.0`).
+  4. **Latest:** `latest` on every image points at the newest version tag, a pre-release included, whose images are all
      published. Every release works this out again when it reaches this step, one release at a time. So:
      - a release that finishes after a newer one leaves `latest` on the newer one;
      - a late patch for an older line, such as `v1.3.5` after `v1.4.0`, publishes `1.3.5` and leaves `latest` alone;
-     - both `latest` tags are pointed at the same version, one after the other. That is not atomic: if the second cannot be moved
+     - the `latest` tags are pointed at the same version, one after the other. That is not atomic: if one cannot be moved
        (after three tries), the job fails and says which tag is on which version. Running the job again, or the next release, puts
-       both on the same version;
+       them all on the same version;
      - a registry error is retried, and if it persists the step fails and leaves `latest` alone. Only the registry's "not found"
        counts as not published.
   5. **Release:** the GitHub release of the tag. Its body is the changelog since the previous tag, made by [git-cliff](https://git-cliff.org)
@@ -126,8 +145,9 @@ no layer. The images are pushed with the workflow's own `GITHUB_TOKEN`.
 Pull requests from forks get no secrets, so their install fails. A new package on ghcr.io starts **private**: make it public under the
 organisation's Packages → the package → Package settings, if it should be pulled without a login. The compose files keep building their
 images from the checkout (`pull_policy: build`). To run a released image, use its ghcr.io name instead. **Deploy by version, the
-same version for both images** (`ghcr.io/gatehubnet/data-api:1.4.0` with `ghcr.io/gatehubnet/data-syncer:1.4.0`), not by `latest`:
-the two `latest` tags move one after the other, and a deployment that pulls them at the wrong moment could get two versions.
+same version for every image** (`ghcr.io/gatehubnet/data-api:1.4.0` with `ghcr.io/gatehubnet/data-syncer:1.4.0` and
+`ghcr.io/gatehubnet/data-exporter:1.4.0`), not by `latest`: the `latest` tags move one after the other, and a deployment that pulls
+them at the wrong moment could get two versions.
 
 ## Schema migrations
 
@@ -139,6 +159,9 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   `schema_migrations`, then exits 0. The apis and syncers wait for their job (`depends_on: service_completed_successfully`).
 - The path is `node_modules/@gatehub/data-api-shared/...`, not `packages/shared/...`: inside the image the shared package is a
   deployed dependency (`pnpm deploy --legacy`), and `packages/shared` does not exist.
+- `migrate-shared` runs the same command with the argument `shared`: it creates the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`,
+  default `shared`) and applies `schema-shared/*.sql` with its own `schema_migrations`. It is one job for both networks, and both apis
+  wait for it ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)).
 - It is idempotent and checksummed. By hand: `docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl`.
 - `GH_RUN_MIGRATIONS_ON_BOOT` is `false` in the compose files (convenient only for a single dev process). See
   [data-model](data-model.md#5-migrations).
@@ -150,6 +173,8 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   and should come before the syncer (advisable: the syncer writes the column on every row of every live volume set, and on the pinned ClickHouse a row with a field the table lacks is inserted without it, with no error,
   so the fee estimates of the ticks before the migration are lost and the live `amm_volume` day set reads as not known until `migrate` has run and the next tick has written it; `syncer_aggregator_errors_total{job="volume_live"}` does not show it).
   The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last ([the AMM data additions](operations.md#the-amm-data-additions)).
+- `009_account_network_names.sql` (one `CREATE TABLE IF NOT EXISTS`, the operator's account network names) is additive and comes before the api: an api without it serves
+  every account without a network name and logs the failed load at every reload, but answers. The syncer never touches the table. The compose files make the api wait for `migrate`.
 
 ## Configuration and secrets
 
@@ -185,7 +210,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --b
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod ps
 ```
 
-Start order: Keeper (healthy) -> ClickHouse (healthy) -> `migrate-xrpl` / `migrate-xahau` (complete) -> syncers and apis ->
+Start order: Keeper (healthy) -> ClickHouse (healthy) -> `migrate-xrpl` / `migrate-xahau` / `migrate-shared` (complete) -> syncers and apis ->
 nginx. The syncer opens its probe port only once its node connection is up, and answers 503 while it is more than
 `GH_MAX_LAG_HEALTHY` ledgers behind for over a minute (catching up): `unhealthy` there is informational, compose restarts nothing
 on it.

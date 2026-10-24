@@ -7,6 +7,7 @@ import {
   LedgerWriter,
   pairHourSets,
   parseContextFor,
+  PARSER_VERSION,
   RatesService,
   rollupStates,
   runMigrations,
@@ -347,7 +348,11 @@ describe('AggregatorService after a range-ingest --reprocess from parser 1 to pa
     });
     expect(result.ledgers).toBe(CHAIN_LEDGERS);
     expect(
-      await count(ch, Table.Ledgers, `ledger_index BETWEEN ${CHAIN_FIRST} AND ${CHAIN_LAST} AND parser_version = 2`),
+      await count(
+        ch,
+        Table.Ledgers,
+        `ledger_index BETWEEN ${CHAIN_FIRST} AND ${CHAIN_LAST} AND parser_version = ${PARSER_VERSION}`,
+      ),
     ).toBe(CHAIN_LEDGERS);
     expect(await count(ch, Table.Exchanges, "amm_account != ''")).toBe(CHAIN_LEDGERS * SWAPS_PER_LEDGER);
     expect(await readDirtyRanges(ch, 10)).toHaveLength(1);

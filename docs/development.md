@@ -46,6 +46,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 | --- | --- | --- |
 | `apps/api` | `@gatehub/data-api-service` | NestJS REST API: the `/v2` Ripple-compatible endpoints over ClickHouse, plus live-node lookups (balances, orders) |
 | `apps/syncer` | `@gatehub/data-syncer` | NestJS worker: the five workers `ingest`, `validations`, `fee_stats`, `aggregator` and `validators`, and the `range-ingest` CLI |
+| `apps/exporter` | `@gatehub/data-exporter` | NestJS worker, one per network: takes the queued export jobs and makes each file (CSV, or PDF with `pdfkit`) by walking the list's CSV pages through the api, then uploads it to Google Cloud Storage ([architecture](architecture.md#exporter-appsexporter-gatehubdata-exporter)); its e2e test is `apps/api/test/exports.e2e-spec.ts`, against the api harness |
 | `packages/shared` | `@gatehub/data-api-shared` | ClickHouse client and migration runner, the `Table` enum and row types, parsers, `buildLedgerRows` / `LedgerWriter`, the `NodeClient`, `RatesService`, the aggregation jobs, the network profiles |
 
 `packages/shared` in more detail:
@@ -57,7 +58,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
   `FixtureLedgerSource`, `raw-ledger.ts`.
 - `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, and account and market jobs), `src/util/`.
-- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
+- `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`, `schema/005_account_states.sql`, `schema/006_trust_line_states.sql`, `schema/007_path_payments.sql`, `schema/008_account_path_payments.sql`, `schema/009_account_network_names.sql`, `schema/010_export_jobs.sql`: the schema of a network's database (migration units, applied in file-name order; **not** under `src/`). `schema-shared/001_account_names.sql`, `schema-shared/002_account_labels.sql`: the migrations of the `shared` database (ADR-0014).
 - `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
 Everything the apps use is re-exported from `packages/shared/src/index.ts`: **export what you add there.**
@@ -87,6 +88,7 @@ cp apps/syncer/.env.example apps/syncer/.env
 #   default nodes wss://s2.ripple.com,wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
 
 pnpm ch:migrate                            # creates the database of GH_NETWORK (xrpl) and applies the schema
+pnpm ch:migrate:shared                     # creates the shared database (account names, labels) and applies its own schema
 
 pnpm start:syncer                          # http://localhost:3002 (probe), starts at the validated head
 pnpm start:api                             # http://localhost:3001, Swagger at /internal/docs
@@ -124,10 +126,11 @@ From the repo root; `pnpm -r <script>` fans out in dependency order.
 | `pnpm --filter @gatehub/data-api-shared test:e2e` | Shared e2e tests (migrations, writer, build-rows, rates, aggregation). **Needs Docker.** |
 | `pnpm format` | Prettier write over `{apps,packages}/**/src/**/*.ts`. (`pnpm lint` runs `eslint --fix`, but the repo has no ESLint configuration yet, so it does not work.) |
 | `pnpm ch:migrate` | applies the schema to the database of `GH_NETWORK` (`ts-node` on `migrate.ts`) |
+| `pnpm ch:migrate:shared` | applies `schema-shared/` to the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`, default `shared`), which the api reads the account names and labels from |
 | `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source: it runs `dist/`, so `pnpm build` first, and it needs the syncer's `GH_*` environment (`.env` or `GH_ENV=local`) ([backfill](backfill.md)) |
 | `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures. Two more modes record the inputs of the `validators` worker: `--unl --network xrpl\|xahau [--out <dir>]` the validator lists of the network's default publishers (needs no node), and `--network-state --network xrpl\|xahau --endpoint <wss> [--out <dir>] [--ledger <n>]` what the worker asks the node for (the Amendments, NegativeUNL and FeeSettings objects at the validated ledger, or at `--ledger`, which the node must still hold, `server_info` and `feature`) |
 | `pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl\|xahau [--clickhouse]` | compares the amendment metadata file with a node (and with the database) and exits 1 on a difference ([operations](operations.md#keep-the-amendment-metadata-current)) |
-| `pnpm start:api` / `pnpm start:syncer` | `nest start --watch` |
+| `pnpm start:api` / `pnpm start:syncer` / `pnpm start:exporter` | `nest start --watch` |
 | `pnpm docker:up` / `pnpm docker:down` | start/stop the dev ClickHouse container |
 
 There is no root `test:e2e`: each package spins its own throwaway ClickHouse and runs `--runInBand`.
@@ -153,7 +156,8 @@ There is no root `test:e2e`: each package spins its own throwaway ClickHouse and
   DateTime. Resolve `start`/`end` to a ledger range with `LedgerRangeResolver`. See
   [clickhouse](clickhouse.md#reading-a-page-what-stops-the-read).
 - **Amounts** are exact decimal strings; sum with the shared decimal helpers, never with floats.
-- **Config** lives in `api.config.ts`, `syncer.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `env-decorators.ts`);
+- **Config** lives in `api.config.ts`, `syncer.config.ts`, `exporter.config.ts` and `clickhouse.config.ts` (`@ConfigValue()` + the helpers of `packages/shared/src/nest/env-decorators.ts`, which the apps share with the liveliness probe and
+  the `/metricz` controller of `packages/shared/src/nest/`);
   do not read `process.env` ad hoc in services. Import the toolbox through `@gatehub/toolbox/lib/<module>`, never the package root (the
   root loads database/queue config and exits without `GH_DATABASE_*`).
 
@@ -200,13 +204,15 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `004_amm_fee_estimates.sql`;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `010_export_jobs.sql`;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.
 3. For a ledger-derived table: have `buildLedgerRows` produce the rows and add the table to `CHILD_TABLES` (`build-rows.ts`), to
    `LEDGER_KEYED_TABLES` (`ingest-state.ts`, so recovery deletes it; keep its partitioning identical to the DDL) and give it
    `non_replicated_deduplication_window`. Bump `PARSER_VERSION` when the parsers' output changes, and re-ingest with `--reprocess`.
+   A feature that readers gate on the parser version gets a constant of its own (`AMM_PARSER_VERSION`, `STATE_PARSER_VERSION`) with
+   the first version that writes it, and its gate compares with that constant, never with `PARSER_VERSION`, which later features move.
 4. Read it from an API service with `${Table.X}`. Apply: `pnpm ch:migrate` locally; the migrate job in compose; the e2e suites apply
    `runMigrations()` themselves.
 

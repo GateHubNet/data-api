@@ -4,21 +4,31 @@ The source of truth is the migration files of [`packages/shared/schema/`](../pac
 [`001_baseline.sql`](../packages/shared/schema/001_baseline.sql) and
 [`002_validators_amendments.sql`](../packages/shared/schema/002_validators_amendments.sql) and
 [`003_account_market_aggregates.sql`](../packages/shared/schema/003_account_market_aggregates.sql) and
-[`004_amm_fee_estimates.sql`](../packages/shared/schema/004_amm_fee_estimates.sql) (applied in file-name order, per network
+[`004_amm_fee_estimates.sql`](../packages/shared/schema/004_amm_fee_estimates.sql) and
+[`005_account_states.sql`](../packages/shared/schema/005_account_states.sql) and
+[`006_trust_line_states.sql`](../packages/shared/schema/006_trust_line_states.sql) and
+[`007_path_payments.sql`](../packages/shared/schema/007_path_payments.sql) and
+[`008_account_path_payments.sql`](../packages/shared/schema/008_account_path_payments.sql) and
+[`009_account_network_names.sql`](../packages/shared/schema/009_account_network_names.sql) and
+[`010_export_jobs.sql`](../packages/shared/schema/010_export_jobs.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **49 tables** per network database, in six groups:
+enum: queries use `${Table.X}`, never string literals). **55 tables** per network database, in eight groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
-| Ledger-derived (19) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, and the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance` | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
+| Ledger-derived (23) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance`, the state history `account_states` (migration 005) and `trust_line_states` (migration 006), `path_payments` (migration 007) and its index by account `account_path_payments` (migration 008) | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
 | Node-sourced (3) | `fee_stats`, `validations`, `validator_manifests` | the `fee_stats` and `validations` workers |
 | Validators and amendments (10, migration 002) | `validator_validations`, `validator_seen`, `unl_lists`, `unl_publishers`, `validator_domains`, `network_state`, `amendment_features`, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly` | the `validations` worker (the first two) and the `validators` worker (the rest) |
 | Aggregates (5) | `stats_hourly`, `volume_daily`, `volume_live`, `amm_pools`, `amm_daily` | the `aggregator` worker |
 | Account and market aggregates (9, migration 003) | `native_rates_daily`, `pair_hourly`, `markets_live`, `account_rollup_state`, `account_partition_rows`, `account_rollup_days`, `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the `aggregator` worker (jobs `rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) |
+| Operator-written (1, migration 009) | `account_network_names` | the operator, by hand, with plain SQL inserts ([operations](operations.md#name-an-account-on-one-network)) |
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
+| Exports (1, migration 010) | `export_jobs` | the api (`queued`) and the exporter (`running`, `done`, `failed`) |
 
-Plus `schema_migrations` (the migration runner's bookkeeping). The previous design (CTID-keyed tables, insert-triggered materialized
+Plus `schema_migrations` (the migration runner's bookkeeping). Apart from the network databases, one **shared database** on the
+same server holds what belongs to an address on every network (account names and labels, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
+with its own migrations: see [section 8](#8-the-shared-database). The previous design (CTID-keyed tables, insert-triggered materialized
 views, offers/issuers/escrows/paychannels tables) is gone: see [ADR-0002](adr/0002-ctid-idempotent-ingest.md) (superseded),
 [ADR-0007](adr/0007-ledger-index-axis-and-secondary-tables.md) and [ADR-0008](adr/0008-no-aggregate-materialized-views.md).
 
@@ -34,10 +44,11 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 
 | Kind | Engine | Partition | Why |
 | --- | --- | --- | --- |
-| Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
-| Prefix-keyed secondary tables, `exchanges` and the AMM tables ordered by pool or account | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
+| Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
+| Prefix-keyed secondary tables, `exchanges`, the AMM tables ordered by pool or account, `account_states`, `trust_line_states` and `account_path_payments` | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
 | `accounts_created`, `volume_live`, `stats_hourly`, `amm_pools`, internal | `ReplacingMergeTree` | none (`volume_daily` and `amm_daily`: `toYYYYMM(day)`) | Small tables |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
+| `account_network_names` (migration 009) | `MergeTree` | none | Append-only, the operator's history; small |
 | The nine tables of migration 003 | `ReplacingMergeTree(version)` | `toYear(day)` for the rates and the account rollups, `toDate(hour)` for `pair_hourly` (TTL 45 days, `ttl_only_drop_parts = 1`), none for the others | Recomputable aggregates written as complete sets; a year of days is a small partition, an hour table expires by whole days |
 | `validations` | `AggregatingMergeTree` | `toYYYYMMDD(last_datetime)`, TTL 90 days | Partial sightings add up |
 | `validator_validations` | `AggregatingMergeTree` | `intDiv(ledger_index, 100000)`, TTL 7 days, `ttl_only_drop_parts = 1` | Sightings add up; a partition is about four days of ledgers, so expiry drops whole parts |
@@ -45,7 +56,7 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | The other validators and amendments tables | `ReplacingMergeTree` | none | Small tables, newest row (or newest `version`) wins |
 
 `ORDER BY` of a `ReplacingMergeTree` is its **natural unique key**. That is a safety net only: list queries never use `FINAL`, and
-recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 19 ledger-derived tables carry
+recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 23 ledger-derived tables carry
 `non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped; the
 two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason. The nine tables of
 migration 003 have no window: a set is written whole under a new `version`, so a retry is idempotent without one.
@@ -90,7 +101,7 @@ and [ADR-0003](adr/0003-no-final-on-list-queries.md).
 Header and summary of a ledger; **the commit marker**. Columns: `ledger_index UInt32`, `ledger_hash`, `parent_hash`, `account_hash`,
 `transaction_hash` (String), `total_coins UInt64`, `close_time`, `parent_close_time` (DateTime), `close_time_resolution UInt8`,
 `close_flags UInt8`, `tx_count UInt32`, `type_counts` / `result_counts Map(LowCardinality(String), UInt32)`, `payments_count`,
-`exchanges_count` (order-book exchanges and AMM swaps), `accounts_created UInt32`, `fee_total`, `fee_min`, `fee_max UInt64` (drops), `parser_version UInt16` (2 since the AMM parser: a ledger written by version 1 has no AMM rows, see [backfill](backfill.md#amm-data-re-ingest)),
+`exchanges_count` (order-book exchanges and AMM swaps), `accounts_created UInt32`, `fee_total`, `fee_min`, `fee_max UInt64` (drops), `parser_version UInt16` (2 since the AMM parser: a ledger written by version 1 has no AMM rows, see [backfill](backfill.md#amm-data-re-ingest); 3 since the state history: a ledger written by an older version has no `account_states` or `trust_line_states` rows, and the state tables cover only the ledgers above the newest one an older version wrote, see [`account_states`](#account_states-p7-order-by-account-ledger_index-tx_index-node_index); 4 since the path payments parser: a ledger written by an older version has no `path_payments` or `account_path_payments` rows, see [backfill](backfill.md#path-payments-re-ingest)),
 `ingested_at DateTime DEFAULT now()`; skip index `close_time_mm` (`minmax` on `close_time`, granularity 1). Read by `/ledgers`,
 `/last_validated`, `/network/fees`, the stats rollup, the date resolver of every list.
 
@@ -178,6 +189,31 @@ transaction is a row with `node_index = -1` (hidden in output). Read by `/accoun
 `account`, `parent`, `initial_balance`, `ledger_index`, `tx_index`, `tx_hash`, `inception`, `genesis_balance` / `genesis_index`
 (nullable, empty until a history import loads ledger 32570); bloom-filter index on `account`. The lookup returns the **latest**
 creation of an address. Read by `/accounts` and `/accounts/{a}`.
+
+### `path_payments` (P6, `ORDER BY (ledger_index, tx_index)`, migration 007)
+One row per **path payment** ([glossary](../GLOSSARY.md)): a successful `Payment` whose delivery used someone else's liquidity. A
+payment to oneself is a row too (an arbitrage loop, or a conversion through an offer or a pool), although `payments` leaves such
+payments out. Columns: `tx_hash`, `close_time`, `source`, `destination`, `delivered_amount`, `currency` (LowCardinality),
+`issuer` (what reached the destination), `source_amount`, `source_currency` (LowCardinality), `source_issuer` (what left the source,
+the fee not counted), `offers_crossed UInt32`, `amm_pools Array(String)`, `rippled_through Array(String)` (accounts, in the order of
+the metadata). Amounts are exact `String`s in whole units; the issuers are `''` for the native currency. Written by
+[`PathPaymentParser`](../packages/shared/src/parsers/path-payments.parser.ts) from the metadata of every successful Payment, from
+`PARSER_VERSION` 4 on (`PATH_PARSER_VERSION`): an offer crossed is an Offer node whose `TakerPays` or `TakerGets` moved (an
+unfunded or expired offer removed on the way is not one); a pool crossed is a pool whose AccountRoot balance or reserve line moved;
+an account rippled through is one, other than the source, the destination, the delivered currency's issuer, a pool and the owner of
+an offer crossed, whose balance went up on one trust line and down on another of the same currency (an issuer of another currency
+than the delivered one passing its own currency between two lines is rippling, as GLOSSARY.md has it). A payment with none of the three is not a path
+payment: rippling only through the issuer, or a `Paths` field that went unused. In `CHILD_TABLES` and `LEDGER_KEYED_TABLES`, with the
+dedup window; a ledger written by an older parser has no rows until it is re-ingested. Read by `/path_payments` and, through
+`account_path_payments`, by `/accounts/{a}/path_payments`.
+
+### `account_path_payments` (P7, `ORDER BY (account, ledger_index, tx_index)`, migration 008)
+The index of `path_payments` by account: one row for the source and one for the destination of each path payment, and **one** row
+for a payment to oneself (as `account_exchanges` has one row for a trade with oneself). The columns are the key alone, `account`,
+`ledger_index`, `tx_index`; the reader takes a page of keys from here and the path payments of the page from `path_payments`. An
+account a payment only rippled through, a pool and the owner of an offer crossed have no row. Written with `path_payments`, by the
+same parser and `PARSER_VERSION` 4 (`PATH_PARSER_VERSION`); in `CHILD_TABLES` and `LEDGER_KEYED_TABLES`, with the dedup window. Read
+by `/accounts/{a}/path_payments`.
 
 ### AMM tables (five ledger tables, two aggregates)
 
@@ -277,6 +313,50 @@ first). The version is the ClickHouse clock in milliseconds, never lower than on
 - **Pair key for swaps.** The swaps of a pool are read through the pair prefix of `exchanges` and the `amm_account_set` index; the
   exchanges are never scanned across pairs (Rulings R-A3 and R-A18).
 
+### `account_states` (P7, `ORDER BY (account, ledger_index, tx_index, node_index)`)
+The account state history (ADR-0015, migration 005): one row per account root a transaction changed, with the state after it. The
+parser takes every created, modified and deleted `AccountRoot` node of the transaction's metadata, whatever the transaction's result,
+with its final fields (`NewFields` of a created node, else `FinalFields`); a modified node without `PreviousFields` was only threaded
+and has no row. Columns: `tx_hash`, `close_time`, `node_index UInt16` (the node's position in `AffectedNodes`), `balance` (the native
+balance in whole units, exact `String`), `flags UInt32` (the AccountRoot `Flags`), `sequence`, `owner_count UInt32`, `fields` (the
+JSON of every field of the node: `Domain`, `RegularKey`, `TransferRate`, the hook fields of Xahau, ...) and `deleted UInt8` (1 for the
+node an AccountDelete removed). A created node lists only the fields that are not at their default, so an absent `Flags`,
+`Sequence` or `OwnerCount` is 0.
+
+It is a child table like the others (`CHILD_TABLES`, `LEDGER_KEYED_TABLES`, the deduplication window, deleted by recovery and
+`--reprocess`), written from `PARSER_VERSION` 3 (`STATE_PARSER_VERSION`). **The state of an account at ledger L is its newest row at or
+before L**, and none when that row is deleted: a read `ORDER BY ledger_index DESC, tx_index DESC, node_index DESC LIMIT 1` in the
+account's prefix. **Coverage**: the table holds the state of ledger L when every stored ledger from L up was written by version 3 or
+later (gaps in the ledger numbers do not matter: it relies on the stored ledgers being complete above its start, which gap repair
+keeps), so it starts above the newest ledger an older parser wrote, and an account that has not changed since then has no row yet; the history spec fills it back to ledger 32570. Read by `/accounts/{a}?flags=true` and
+`/accounts/{a}/balances` (the native balance) with a ledger named, through `AccountStatesService` (`StateLedgerService` resolves the
+ledger and checks the coverage), and by the CSV of `/accounts/{a}/transactions`, whose `flags_changed` compares the row a
+transaction wrote for the account with the account's `Flags` in that node's `PreviousFields` (the node of `node_index` in the
+stored metadata), so it needs no earlier row.
+
+### `trust_line_states` (P7, `ORDER BY (account, counterparty, currency, ledger_index, tx_index, node_index)`)
+The trust line state history (ADR-0015, migration 006): for every trust line a transaction changed, two rows, one per account of the
+line, each with the state after it **from that account's side**. The parser takes every created, modified and deleted `RippleState`
+node of the transaction's metadata, whatever the transaction's result, with its final fields (`NewFields` of a created node, else
+`FinalFields`); a modified node without `PreviousFields` has no rows. Columns: `account`, `counterparty`, `currency
+LowCardinality(String)` (as the ledger writes it: `USD` or 40 hex digits), `tx_hash`, `close_time`, `node_index UInt16`, `balance`
+(exact `String`: the node's `Balance` for the low account, negated for the high one, so positive means the counterparty owes the
+account), `limit` and `limit_peer` (the account's and the counterparty's limits, exact `String`, plain decimals even where the ledger
+writes `1e…`), `no_ripple`, `no_ripple_peer`, `authorized`, `peer_authorized`, `freeze`, `peer_freeze UInt8` (the `Low*` / `High*`
+flags of each side), `quality_in`, `quality_out UInt32` (the account's `LowQualityIn/Out` or `HighQualityIn/Out`, 0 when absent),
+`flags UInt32` (the RippleState `Flags` as stored, both sides: reserve, AMM node and deep freeze bits included) and `deleted UInt8` (1
+for the node that removed the line). An issuer's holders are the issuer's own rows (`account` = the issuer).
+
+It is a child table like `account_states`, written from `PARSER_VERSION` 3 and under the same gate (`STATE_PARSER_VERSION`), so the
+two tables share one coverage. **The lines of an account at ledger L** are, for each (counterparty, currency) of the account, its
+newest row at or before L, unless that row is deleted. A read is bounded: an inner select reads the account's prefix in the order of
+the whole key, from the marker on, with a plain `LIMIT` of the rows wanted plus room, and an outer one groups them by line with
+`argMax(..., (ledger_index, tx_index, node_index))`; every line it read is whole but the last one of a read that stopped at its cap,
+which the next read (after the last whole line, sized by the rows a line took) reads again. A line still costs its whole history up
+to L, so a page of an issuer's lines grows with those lines' history (see the risk in the
+[API reference](api-reference.md#get-v2accountsaddresstrustlines)). Read by `/accounts/{a}/trustlines`, and by `/accounts/{a}/balances`
+with a ledger named (both through `TrustLinesService`).
+
 ## 3. Node-sourced, aggregate and internal tables
 
 The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM tables above.
@@ -302,6 +382,8 @@ The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM 
 | `ingest_log` | `ReplacingMergeTree(updated_at)`, `ORDER BY (range_start, range_end)` | Range-ingest intent: `status Enum8('started'=1,'done'=2)`. Live first-write intents use `run_id live:<bootId>` and `range_end = 0` | range-ingest, ingest boot |
 | `agg_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_hour, to_hour)` | Hour ranges whose stats must be recomputed because ingest rewrote ledgers behind the aggregator | aggregator |
 | `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network: `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
+| `account_network_names` | `MergeTree`, `ORDER BY (address, added_at)`, no partition (migration 009) | One row per change of the **account network name** of an address on this network ("USD Issuer"): the columns of [`account_names`](#account_names-no-partition-mergetree-order-by-address-added_at) of the shared database (`address`, `name`, `removed UInt8`, `added_by`, `added_at DateTime64(3, 'UTC')`) and its rules: append-only, the newest row of an address wins (at the same `added_at` a removal wins), a newest row that is a removal or names nothing means no network name. Written by the operator ([operations](operations.md#name-an-account-on-one-network)); never `FINAL`, read whole with `LIMIT 1 BY address` and reloaded with the names every 60 s | `/v2/accounts/{address}` (`account_network_name`) |
+| `export_jobs` | `MergeTree`, `ORDER BY (id, seq)`, TTL 7 d on `created` | The states of an export job, append-only in the manner of `ingest_log`: `id` (32 random hex digits), `seq` (0 for the api's `queued` row, one more for every state the exporter writes), `key_hash` (the hex SHA-256 of the creating API key, never the key; `''` without one), `path`, `format` (`csv` or `pdf`), `status Enum8('queued'=1,'running'=2,'done'=3,'failed'=4)`, `created` and `at` (`DateTime64(3,'UTC')`), `rows`, `object` (the storage key `<network>/<id>.<format>`) and `error`. Every row repeats the job, so the row with the highest `seq` of an id is the job, no `FINAL`: one job is `WHERE id = … ORDER BY seq DESC LIMIT 1` (a key range), and the exporter's queue (the oldest jobs whose newest row is `queued`, or `running` on start) is `argMax` of the state by `seq` grouped by `id` (never `LIMIT 1 BY` in the select that reads the table, [clickhouse](clickhouse.md#reading-a-page-what-stops-the-read)), a scan of 7 days of jobs that answers a batch of at most 100. Each `POST /v2/exports` counts the jobs of its `key_hash` whose newest row is `queued` or `running` (the limit per key, ticket #16): a scan of 7 days of jobs, as the key is not in the `ORDER BY` | `/v2/exports`, the exporter |
 
 The three **version sets** (`validator_votes` with `amendment_tallies` for a voting ledger, `validator_agreement_hourly` for an hour)
 follow the pattern of `volume_daily`: a unit is written whole under one `version` (wall-clock milliseconds, greater than any version
@@ -400,6 +482,12 @@ The files so far:
 | `002_validators_amendments.sql` | Two `ALTER TABLE` statements (`validations.server_version`; `validator_manifests.domain`, `.manifest`, `.source`) and the ten validators and amendments tables. Additive: it reads nothing of 001 but those two tables, so it applies on a database that already ran 001, and a half-applied run is completed by running it again |
 | `003_account_market_aggregates.sql` | The nine tables of the account and market aggregates, nine `CREATE TABLE IF NOT EXISTS` statements and nothing else. Additive: it reads no table of 001 or 002 and none of its tables depends on them, so it applies after 001 alone or after 001 and 002, on a fresh and on a migrated database |
 | `004_amm_fee_estimates.sql` | One statement, `ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS fees_est_f Nullable(Float64)`: the 24 h fee estimates of the AMM volume. Additive and run again safely. A set written before it reads as "not known" until the next tick writes it with the column; the syncer writes the column on every live volume row and the API reads it on the live `amm_volume` read of the period `day`. The migration is required before the API (that read fails without the column) and advisable before the syncer (a syncer before it still inserts, ClickHouse skips the field the table lacks, but the estimates of those ticks are lost, and the error counter does not show it) (rollout: [operations](operations.md#the-amm-data-additions)) |
+| `005_account_states.sql` | One `CREATE TABLE IF NOT EXISTS`: `account_states`, the account state history of ADR-0015 (a ledger-derived table, written from parser version 3). Additive and run again safely. Required before the syncer (its ledger writer inserts into the table on every ledger, and fails without it) and before the API (`?flags=true` and `/balances` with a ledger read it) |
+| `006_trust_line_states.sql` | One `CREATE TABLE IF NOT EXISTS`: `trust_line_states`, the trust line state history of ADR-0015 (a ledger-derived table, written from parser version 3, under the gate of `account_states`). Additive and run again safely. Required before the syncer (its ledger writer inserts into the table on every ledger, and fails without it) and before the API (`/trustlines`, and `/balances` with a ledger, read it) |
+| `007_path_payments.sql` | One `CREATE TABLE IF NOT EXISTS`: the ledger-derived `path_payments`. Additive: it depends on no other table, so it applies on a fresh and on a migrated database. It is required before a syncer with `PARSER_VERSION` 4 (that syncer's writes fail without the table) and before the API serves `/path_payments` (rollout: [backfill](backfill.md#path-payments-re-ingest)). |
+| `008_account_path_payments.sql` | One `CREATE TABLE IF NOT EXISTS`: the ledger-derived `account_path_payments`, the index of `path_payments` by account. Additive and run again safely; it depends on no other table. Required before a syncer with `PARSER_VERSION` 4 (that syncer's writes fail without the table) and before the API serves `/accounts/{a}/path_payments`; ship it with 007 (rollout: [backfill](backfill.md#path-payments-re-ingest)) |
+| `009_account_network_names.sql` | `account_network_names`, one `CREATE TABLE IF NOT EXISTS` ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)). Additive: it reads no other table. The runner applies the files it has not applied in file-name order, so a database that ran 009 before 005 to 008 existed applies those after it (each is additive). Required before an api that reads it: without it the api serves every account without a network name and logs `Could not load the account network names` at every reload |
+| `010_export_jobs.sql` | One `CREATE TABLE IF NOT EXISTS`: `export_jobs`, the states of the export jobs (ticket #15). Additive: it reads no other table. Required before the api serves `/v2/exports` and before the exporter starts |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -412,7 +500,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm 
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`). A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
@@ -420,7 +508,7 @@ local volumes).
 
 - `transactions.tx_json` and `meta_json` dominate (full XRPL history is roughly 1-1.5 TB compressed). Everything else together is a
   fraction of it.
-- Retention is by partition, but always the same ledger block from all 19 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
+- Retention is by partition, but always the same ledger block from all 23 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
   expires by TTL after 90 days.
 - The tables of migration 002 are not ledger tables, so no ledger retention touches them. They expire by TTL: `validator_validations`
   after 7 days of `last_datetime` (about 1 GB on XRPL; whole parts are dropped), `network_state` after 100 days of `polled_at` and
@@ -429,6 +517,7 @@ local volumes).
 - The tables of migration 003 are not ledger tables either, so no ledger retention touches them. Only `pair_hourly` expires, 45 days after its hour
   (about a day per part, whole parts are dropped); `native_rates_daily`, `markets_live` and the six account rollup tables are recomputable and kept.
 - Rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and `fee_stats` are small; keep them.
+- `export_jobs` expires by TTL 7 days after a job was created, as its file does (a lifecycle rule of the bucket).
 
 ## 7. Adding a table or column
 
@@ -437,3 +526,49 @@ local volumes).
 3. If it is derived from a ledger: add it to `buildLedgerRows` / `CHILD_TABLES`, to `LEDGER_KEYED_TABLES` in `ingest-state.ts` (so
    recovery deletes it; the e2e suite compares that list with the schema's partitioning) and give it the dedup window.
 4. Read it with `${Table.X}`, bound parameters, a key-ordered scan and no `FINAL`.
+
+A table of the shared database instead gets a migration of `schema-shared/`, a member of the `SharedTable` enum (never of `Table`)
+and a row type in `rows.ts`, and is read qualified by the shared database ([section 8](#8-the-shared-database)).
+
+## 8. The shared database
+
+One database on the ClickHouse server, `shared` (`GH_CLICKHOUSE_SHARED_DATABASE`), next to the network databases: it holds what the
+operator writes about an **address**, which holds on every network ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md), the
+first exception to [ADR-0009](adr/0009-one-deployment-per-network.md)). The apis of every network read it; nothing derived from a ledger is
+in it, and the syncers never touch it.
+
+- **Migrations.** Its own set, [`packages/shared/schema-shared/`](../packages/shared/schema-shared/), numbered from 001, with its own
+  `schema_migrations` in the shared database. The same runner applies it (`runSharedMigrations`, the command
+  `migrate.js shared`, from source `pnpm ch:migrate:shared`), one job for every network: the `migrate-shared` service of both compose
+  files, which the apis wait for. It must run before an api that reads the shared database.
+- **Names.** The table names are the `SharedTable` enum of `tables.ts`, apart from `Table` (which is exactly the tables of a network
+  database). Queries qualify them: `${shared}.${SharedTable.AccountNames}`; the api's `sql-tables.spec.ts` refuses one written by hand.
+- **Not here: account network names.** A name that holds on one network only is in that network's own database,
+  `account_network_names` (migration 009, [section 3](#3-node-sourced-aggregate-and-internal-tables)), with the same columns and rules as
+  `account_names`, and loaded and reloaded with the names.
+- **Append-only.** Every table is written by the operator with plain SQL inserts ([operations](operations.md#name-an-address)) and is
+  never updated or deleted: the newest row of a key (largest `added_at`) wins, a row with `removed = 1` removes the key, and the rows
+  are the audit trail. A plain `MergeTree` keeps them all; readers take the newest row of each key with `LIMIT 1 BY`, never `FINAL`.
+- **Read.** The api loads every table whole when it starts and again every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s), and serves from
+  that copy (`NamesAndLabelsService`): a row shows within a reload. A load that fails is logged and keeps the previous copy.
+
+| File | Contents |
+| --- | --- |
+| `001_account_names.sql` | `account_names`: one `CREATE TABLE IF NOT EXISTS` |
+| `002_account_labels.sql` | `account_labels`: one `CREATE TABLE IF NOT EXISTS` |
+
+### `account_names` (no partition, `MergeTree ORDER BY (address, added_at)`)
+
+One row per change of the **account name** of an address: `address`, `name`, `removed UInt8` (default 0; 1 removes the name),
+`added_by` (who wrote the row) and `added_at DateTime64(3, 'UTC')` (default: the insert time). The newest row of an address wins; at the
+same `added_at` a removal wins. An address whose newest row is a removal, or names nothing (`name = ''`), has no name. Read by
+`/v2/accounts/{address}` (`account_name`).
+
+### `account_labels` (no partition, `MergeTree ORDER BY (address, label, added_at)`)
+
+One row per change of a **label** of an address: `address`, `label Enum8('scam' = 1, 'spam' = 2, 'advisory' = 3)`, `description`,
+`source` (who says so) and `url` (where), both `String` with `''` (default) for none, `removed UInt8` (default 0; 1 removes that label
+from the address), `added_by` and `added_at DateTime64(3, 'UTC')` (default: the insert time). The key is (address, label): an address
+has each label at most once, and the newest row of a key wins; at the same `added_at` a removal wins. The `Enum8` rejects a misspelt
+label at insert, so a new label is a migration that widens it. Read by `/v2/accounts/{address}` (`account_labels`, in the order of
+the `Enum8`).

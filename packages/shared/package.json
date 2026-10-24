@@ -10,7 +10,8 @@
   "files": [
     "dist",
     "config",
-    "schema"
+    "schema",
+    "schema-shared"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -23,8 +24,12 @@
   },
   "dependencies": {
     "@clickhouse/client": "^1.4.0",
+    "@google-cloud/storage": "^7.22.0",
     "@nestjs/common": "^10.3.10",
+    "@nestjs/terminus": "^10.2.3",
     "bignumber.js": "^9.1.2",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.1",
     "ripple-address-codec": "^5.0.0",
     "ripple-binary-codec": "^2.11.0",
     "ripple-keypairs": "^2.0.0",

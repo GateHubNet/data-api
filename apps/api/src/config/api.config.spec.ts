@@ -59,6 +59,10 @@ describe('ApiConfig (GH_* environment)', () => {
       // key-gated answers: private, so a shared cache does not serve one client's answer to another (R109)
       cacheControl: 'private, max-age=60',
       amendmentsConfig: '',
+      namesAndLabelsReloadMs: 60000,
+      exportMaxJobsPerKey: 3,
+      exportMaxRowsCsv: 1_000_000,
+      exportMaxRowsPdf: 10_000,
     });
   });
 
@@ -78,6 +82,10 @@ describe('ApiConfig (GH_* environment)', () => {
       GH_TRUST_PROXY_HOPS: '0',
       GH_CACHE_CONTROL: 'public, max-age=5',
       GH_AMENDMENTS_CONFIG: ' /etc/gatehub/amendments.json ',
+      GH_NAMES_AND_LABELS_RELOAD_MS: '250',
+      GH_EXPORT_MAX_JOBS_PER_KEY: '5',
+      GH_EXPORT_MAX_ROWS_CSV: '500',
+      GH_EXPORT_MAX_ROWS_PDF: '50',
     });
     expect(exits).toEqual([]);
     expect(cfg).toMatchObject({
@@ -95,6 +103,10 @@ describe('ApiConfig (GH_* environment)', () => {
       trustProxyHops: 0,
       cacheControl: 'public, max-age=5',
       amendmentsConfig: '/etc/gatehub/amendments.json',
+      namesAndLabelsReloadMs: 250,
+      exportMaxJobsPerKey: 5,
+      exportMaxRowsCsv: 500,
+      exportMaxRowsPdf: 50,
     });
   });
 
@@ -177,6 +189,7 @@ describe('ApiConfig (GH_* environment)', () => {
     ['GH_RATE_LIMIT', '0', 'GH_RATE_LIMIT must be a positive integer'],
     ['GH_RATE_LIMIT', '1e3', 'GH_RATE_LIMIT must be a positive integer'],
     ['GH_RATE_LIMIT_WINDOW', '-5', 'GH_RATE_LIMIT_WINDOW must be a positive integer'],
+    ['GH_NAMES_AND_LABELS_RELOAD_MS', '0', 'GH_NAMES_AND_LABELS_RELOAD_MS must be a positive integer'],
     ['GH_LIVE_CACHE_TTL_MS', '-1', 'GH_LIVE_CACHE_TTL_MS must be a non-negative integer'],
     ['GH_TX_CACHE_SIZE', '-1', 'GH_TX_CACHE_SIZE must be a non-negative integer'],
     ['GH_TX_CACHE_SIZE', 'lots', 'GH_TX_CACHE_SIZE must be a non-negative integer'],

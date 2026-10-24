@@ -1,7 +1,8 @@
 /**
  * Schema migration runner.
  *
- * Each `*.sql` file in `packages/shared/schema/` (or in `GH_SCHEMA_DIR`) is one migration unit. The runner:
+ * Each `*.sql` file in `packages/shared/schema/` (or in `GH_SCHEMA_DIR`) is one migration unit of a network database. The
+ * shared database (ADR-0014) has a set of its own in `packages/shared/schema-shared/` (`runSharedMigrations`). The runner:
  *   1. creates the target database (through a client bound to `default`, which always exists) and a
  *      `schema_migrations` bookkeeping table,
  *   2. reads which files have already been applied and verifies their sha256 checksum — an applied file that changed
@@ -14,16 +15,24 @@
  * Run as a one-shot, controlled step (CI job / the `migrate` service in the production
  * compose) — not concurrently from every syncer replica.
  *
- *   pnpm --filter @gatehub/data-api-shared ch:migrate
+ *   pnpm --filter @gatehub/data-api-shared ch:migrate           the network database (GH_CLICKHOUSE_DATABASE or GH_NETWORK)
+ *   pnpm --filter @gatehub/data-api-shared ch:migrate shared    the shared database (GH_CLICKHOUSE_SHARED_DATABASE, `shared`)
  */
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { assertValidDatabaseName, ClickHouseConfig, clickHouseConfigFromEnv } from './clickhouse.config';
+import {
+  assertValidDatabaseName,
+  ClickHouseConfig,
+  clickHouseConfigFromEnv,
+  sharedDatabaseFromEnv,
+} from './clickhouse.config';
 import { ClickHouseService } from './clickhouse.service';
 
 /** `src/clickhouse` and `dist/clickhouse` are both two levels below the package root, which ships `schema/`. */
 const DEFAULT_SCHEMA_DIR = join(__dirname, '..', '..', 'schema');
+/** The migration set of the shared database (ADR-0014), which the package ships next to `schema/`. */
+export const SHARED_SCHEMA_DIR = join(__dirname, '..', '..', 'schema-shared');
 const MIGRATIONS_TABLE = 'schema_migrations';
 
 export interface MigrateOptions {
@@ -31,6 +40,8 @@ export interface MigrateOptions {
   config?: ClickHouseConfig;
   /** Progress sink. Defaults to `console.log`. */
   log?: (message: string) => void;
+  /** The directory of the migration set. Defaults to `GH_SCHEMA_DIR`, else the network set `schema/`. */
+  schemaDir?: string;
 }
 
 export interface MigrateResult {
@@ -60,7 +71,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
   // eslint-disable-next-line no-console
   const log = opts.log ?? ((message: string) => console.log(message));
   const database = assertValidDatabaseName(config.database);
-  const schemaDir = process.env.GH_SCHEMA_DIR || DEFAULT_SCHEMA_DIR;
+  const schemaDir = opts.schemaDir ?? (process.env.GH_SCHEMA_DIR || DEFAULT_SCHEMA_DIR);
 
   // The target database may not exist yet, so create it through a connection bound to `default`.
   const bootstrap = new ClickHouseService({ ...config, database: 'default' });
@@ -124,8 +135,25 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
   }
 }
 
+/**
+ * Migrates the shared database (ADR-0014) with its own set, `schema-shared/`, and its own `schema_migrations`. The
+ * database is the one of `config` when given, else `GH_CLICKHOUSE_SHARED_DATABASE` (default `shared`) on the server of
+ * `clickHouseConfigFromEnv()`. One job runs it, before the apis of every network start: two runners on one
+ * `schema_migrations` would race.
+ */
+export function runSharedMigrations(opts: Omit<MigrateOptions, 'schemaDir'> = {}): Promise<MigrateResult> {
+  const config = opts.config ?? { ...clickHouseConfigFromEnv(), database: sharedDatabaseFromEnv() };
+  return runMigrations({ ...opts, config, schemaDir: SHARED_SCHEMA_DIR });
+}
+
 if (require.main === module) {
-  runMigrations().catch((err) => {
+  const set = process.argv[2];
+  if (set !== undefined && set !== 'shared') {
+    // eslint-disable-next-line no-console
+    console.error(`[migrate] unknown migration set "${set}": none (the network database) or "shared"`);
+    process.exit(1);
+  }
+  (set === 'shared' ? runSharedMigrations() : runMigrations()).catch((err) => {
     // eslint-disable-next-line no-console
     console.error('[migrate] failed:', err);
     process.exit(1);

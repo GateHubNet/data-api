@@ -1,10 +1,14 @@
 import { dropsToNative, NetworkProfile } from '@gatehub/data-api-shared';
 import { Inject, Injectable } from '@nestjs/common';
 import { CacheService } from '../common/cache.service';
+import { notFound } from '../common/errors';
+import { StateLedger, StateLedgerService } from '../common/state-ledger.service';
 import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
 import { XrplService } from '../xrpl/xrpl.service';
 import { LedgerSelector, LedgerSpec, liveCacheKey, LiveDeadline, liveNodeError, pagedLedger } from './account-ledger';
+import { AccountStatesService } from './account-states.service';
 import { LiveLedgerService } from './live-ledger.service';
+import { TrustLinesService } from './trust-lines.service';
 
 /** A balance of the account: the native one has no `counterparty`. Keys in the order of the original. */
 export interface Balance {
@@ -26,11 +30,13 @@ export interface BalancesQuery {
 }
 
 export interface BalancesResult {
-  /** The ledger the node answered for. */
+  /** The ledger the balances were read at: the one the node answered for, or the stored one. */
   ledgerIndex?: number;
-  /** Unix seconds, when a date chose the ledger. */
+  /** Unix seconds: the close time of a historical ledger, or of the ledger a date chose. */
   closeTime?: number;
   balances: Balance[];
+  /** Read from the live node (no historical ledger named), not from the state history. */
+  live: boolean;
 }
 
 /** Trust lines asked of the node per request (`rippled.js`). */
@@ -50,22 +56,31 @@ interface AccountLinesResult {
 }
 
 /**
- * The balances of an account on the live node (`rippled.getBalances` of the original): `account_info` for the native
- * balance and the ledger, then `account_lines` for the trust lines, paged, on the very ledger `account_info` answered
- * for, so that a validated ledger that moves on between the requests cannot mix two states.
+ * The balances of an account at a ledger: from the account state history in ClickHouse for a historical ledger, from the
+ * live node for the current one (ADR-0015).
+ *
+ * A ledger named by a hash, a date or a number (`StateLedgerService.resolve`) is historical. Its native balance is the
+ * account's state at that ledger (`AccountStatesService`), its trust lines those of `/trustlines` at that ledger
+ * (`TrustLinesService`), ordered by (counterparty, currency), with the same `currency`, `counterparty` and `limit` as
+ * below. No state of the account at that ledger, or a state that deleted it, is 404 `account not found`, as the node
+ * answers; a ledger the state tables do not cover is 400 `the date provided is too old`. The answer always carries the
+ * ledger's close time, and is not put in the live cache (the history of a ledger does not move with the node).
+ *
+ * Without one, or with `validated`, `closed` or `current`, the balances come from the live node (`rippled.getBalances` of
+ * the original): `account_info` for the native balance and the ledger, then `account_lines` for the trust lines, in the
+ * node's order, paged, on the very ledger `account_info` answered for, so that a validated ledger that moves on between
+ * the requests cannot mix two states.
  *
  * Differences from the original, each a bug fix:
- *  - the default ledger is `validated` (it asked for the open ledger), and a hash is forwarded (it was ignored);
+ *  - the default ledger is `validated` (it asked for the open ledger);
  *  - the lines are paged until the limit is filled with lines that pass the filters. The original cut the first page
  *    to the limit and filtered afterwards, so a `currency` could miss its lines on later pages (and, by subtracting
  *    the page size twice, never read a second page at all);
  *  - `limit=all` reads every page (R32), within an overall deadline of 30 s (R108: past it the route answers its 500);
- *  - the trust lines are read from the ledger the client named when it named one (a hash or a number, M3), else from
- *    the index `account_info` answered with.
+ *  - the trust lines are read from the index `account_info` answered with (a marker belongs to one ledger).
  *
- * A response is cached (`ApiConfig.liveCacheTtlMs`) under the whole resolved request: address, the ledger spec (a
- * date is already its ledger), filters and limit. A `validated` entry shows the ledger it was read at in `ledger_index`,
- * and is at most the TTL old.
+ * A live response is cached (`ApiConfig.liveCacheTtlMs`) under the whole resolved request: address, the ledger spec,
+ * filters and limit. A `validated` entry shows the ledger it was read at in `ledger_index`, and is at most the TTL old.
  */
 @Injectable()
 export class AccountBalancesService {
@@ -74,6 +89,9 @@ export class AccountBalancesService {
   constructor(
     private readonly xrpl: XrplService,
     private readonly ledgers: LiveLedgerService,
+    private readonly stateLedgers: StateLedgerService,
+    private readonly states: AccountStatesService,
+    private readonly trustLines: TrustLinesService,
     private readonly cache: CacheService,
     private readonly config: ApiConfig,
     @Inject(NETWORK_PROFILE) profile: NetworkProfile,
@@ -82,14 +100,44 @@ export class AccountBalancesService {
   }
 
   async balances(q: BalancesQuery): Promise<BalancesResult> {
+    const historical = await this.stateLedgers.resolve(q.selector);
+    if (historical !== undefined) return this.historical(q, historical);
+
     const { spec, closeTime } = await this.ledgers.resolve(q.selector);
     const key = liveCacheKey('balances', q.address, spec, q.currency, q.counterparty, q.limit);
     const found = await this.cache.wrap(key, this.config.liveCacheTtlMs, () => this.read(q, spec));
     // not part of the entry: the same ledger can be asked for with a date or without
-    return closeTime === undefined ? found : { ...found, closeTime };
+    return { ...found, ...(closeTime !== undefined && { closeTime }), live: true };
   }
 
-  private async read(q: BalancesQuery, spec: LedgerSpec): Promise<BalancesResult> {
+  /** The balances at a historical ledger, from the account and trust line state history. */
+  private async historical(q: BalancesQuery, ledger: StateLedger): Promise<BalancesResult> {
+    const state = await this.states.stateAt(q.address, ledger.ledger_index);
+    if (state === undefined) throw notFound('account not found');
+    const at = { ledgerIndex: ledger.ledger_index, closeTime: ledger.close_time, live: false };
+    const native: Balance = { currency: this.native, value: state.balance };
+    if (q.currency === this.native) return { ...at, balances: [native] };
+
+    const balances = q.currency === undefined ? [native] : [];
+    const wanted = q.limit === undefined ? undefined : q.limit - balances.length;
+    if (wanted === 0) return { ...at, balances };
+    const which = {
+      address: q.address,
+      ledgerIndex: ledger.ledger_index,
+      currency: q.currency,
+      counterparty: q.counterparty,
+    };
+    // `limit=all`: every line, page by page, never in one read of the account's whole line history
+    const lines =
+      wanted === undefined
+        ? await this.trustLines.linesAll(which)
+        : await this.trustLines.linesAt({ ...which, limit: wanted });
+    for (const line of lines)
+      balances.push({ currency: line.currency, counterparty: line.counterparty, value: line.balance });
+    return { ...at, balances };
+  }
+
+  private async read(q: BalancesQuery, spec: LedgerSpec): Promise<Omit<BalancesResult, 'live'>> {
     const deadline = LiveDeadline.for(q.limit);
     try {
       const info = await deadline.race(

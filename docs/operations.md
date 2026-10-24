@@ -19,11 +19,15 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 | Syncer health | `GET /liveliness/healthz` on the syncer (3002): 503 when ClickHouse is down, the ingest is `halted`, or the lag stays above `GH_MAX_LAG_HEALTHY` for more than 60 s. The body shows `state`, `lag`, `last_commit_age`. |
 | Metrics | `GET /metricz` on port 3000 of every api and syncer, inside the compose network only |
 | Swagger | `GET /internal/docs` (not exposed by nginx; reach the api container directly) |
-| Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` (idempotent) |
+| Apply the schema | `dc run --rm migrate-xrpl` / `migrate-xahau` / `migrate-shared` (idempotent) |
+| Account names | `INSERT INTO shared.account_names ...`, shows within 60 s: [Name an address](#name-an-address) |
+| Account network names | `INSERT INTO xrpl.account_network_names ...` (or `xahau.`), shows within 60 s on that network only: [Name an account on one network](#name-an-account-on-one-network) |
+| Labels | `INSERT INTO shared.account_labels ...`, shows within 60 s: [Label an address](#label-an-address) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
+| Exports | `exporter-xrpl` / `exporter-xahau` (profile `exports`, one each): `GET /liveliness/healthz` on 3005, `exporter_jobs_total{status}`; the jobs are rows of `export_jobs` ([deployment](deployment.md#topology)) |
 | Account and market aggregates | `syncer_markets_live_age_seconds{period}`, `syncer_markets_live_amm_share_known{period}`, `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`, `syncer_account_rollups_pending_accounts`; see [Account and market aggregates](#account-and-market-aggregates) and [the AMM data additions](#the-amm-data-additions) |
 
 Two services per network, never more than **one syncer**: `syncer-xrpl`, `syncer-xahau` are singletons (a fixed
@@ -69,6 +73,117 @@ refuses a row that has a field the table lacks, so a syncer of this version with
 database without `002`: the message names the file and what is missing. Apply the migration and start it again.
 The compose files order it for you (the syncer waits for its `migrate-<network>` job); with another orchestrator run the job first. The whole rollout
 (and the constraint with `feat/amm-data`) is [below](#roll-out-the-validators-and-amendments-data).
+
+**The ingest needs migrations `007_path_payments.sql` and `008_account_path_payments.sql` applied before a syncer with parser version 4
+starts.** That syncer writes `path_payments` and `account_path_payments` row sets with every ledger, and an insert into a missing table
+fails the batch, so the live runner retries the same ledgers without end. Nothing checks for the tables at boot: run the migrate job
+first (the compose files do). The api's `/v2/path_payments` and `/v2/accounts/{address}/path_payments` answer 500
+`unable to retrieve path payments` until the tables exist. Filling the history:
+[backfill](backfill.md#path-payments-re-ingest).
+**The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
+[ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
+for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
+that reads it**: the compose files make both apis wait for it. An api started without it serves every account without a name or label and logs
+`Could not load the account names` (and `the account labels`) at every reload, until the job has run. An api of this version on a shared
+database migrated before `002` serves the names and logs `Could not load the account labels` until the job has run again.
+
+### Name an address
+
+The **account name** of an address ("GateHub", "Bitstamp") is written by hand into `shared.account_names` and shows on
+`GET /v2/accounts/{address}` (`account_name`) of **every network** within 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), with no restart. The table is
+append-only: never `UPDATE`, `DELETE` or `OPTIMIZE ... FINAL` it, because its rows are the audit trail. The newest row of an address wins, so
+renaming is another insert and removing is an insert with `removed = 1`. Put your own name or email in `added_by`; `added_at` is filled in. A
+name shows only on a network where the address has an activation: elsewhere `/v2/accounts/{address}` answers 404 as before.
+
+In `clickhouse-client` (see [SQL health checks](#sql-health-checks) for how to open it):
+
+```sql
+-- give an address a name, or a new one (the newest row wins)
+INSERT INTO shared.account_names (address, name, added_by)
+VALUES ('<address>', 'GateHub', 'ops@gatehub.net');
+
+-- remove the name of an address
+INSERT INTO shared.account_names (address, name, removed, added_by)
+VALUES ('<address>', '', 1, 'ops@gatehub.net');
+
+-- the name each address has now, as the api reads it
+SELECT address, name, added_by, added_at
+FROM (SELECT * FROM shared.account_names ORDER BY address, added_at DESC, removed DESC LIMIT 1 BY address)
+WHERE removed = 0 AND name != '';
+
+-- the history of one address
+SELECT * FROM shared.account_names WHERE address = '<address>' ORDER BY added_at;
+```
+
+Nothing checks the address or the name: a typo in either shows within a minute, and is fixed with a newer row. With
+`GH_CLICKHOUSE_SHARED_DATABASE` set, use that database in place of `shared`.
+
+### Name an account on one network
+
+The **account network name** of an account ("USD Issuer" for GateHub's issuing address on the XRP Ledger) is written by hand into
+`account_network_names` of **that network's database** (`xrpl` or `xahau`, migration `009`) and shows on `GET /v2/accounts/{address}`
+(`account_network_name`, after `account_name`) of **that network only**, within 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), with no restart. It
+needs no account name: an account can have either, both or neither. The table has the columns and rules of `shared.account_names`: append-only
+(never `UPDATE`, `DELETE` or `OPTIMIZE ... FINAL` it), the newest row of an address wins, removing is an insert with `removed = 1`, your own name or
+email goes in `added_by` and `added_at` is filled in. It shows only where the address has an activation.
+
+```sql
+-- give an account a name on the XRP Ledger, or a new one (the newest row wins)
+INSERT INTO xrpl.account_network_names (address, name, added_by)
+VALUES ('<address>', 'USD Issuer', 'ops@gatehub.net');
+
+-- remove it
+INSERT INTO xrpl.account_network_names (address, name, removed, added_by)
+VALUES ('<address>', '', 1, 'ops@gatehub.net');
+
+-- the network name each account has now, as the api reads it
+SELECT address, name, added_by, added_at
+FROM (SELECT * FROM xrpl.account_network_names ORDER BY address, added_at DESC, removed DESC LIMIT 1 BY address)
+WHERE removed = 0 AND name != '';
+
+-- the history of one address
+SELECT * FROM xrpl.account_network_names WHERE address = '<address>' ORDER BY added_at;
+```
+
+On Xahau write `xahau.account_network_names` (the network database is `GH_CLICKHOUSE_DATABASE` when it is set). A name inserted into the wrong
+network's database shows there, not on the network meant: remove it there with a `removed = 1` row and insert it into the right one. The table
+comes with `migrate-<network>` (migration `009`): an api started before it serves every account without a network name and logs
+`Could not load the account network names` at every reload, until the job has run.
+
+### Label an address
+
+A **label** (`scam`, `spam` or `advisory`) is written by hand into `shared.account_labels` and shows on `GET /v2/accounts/{address}`
+(`account_labels`) of **every network** within 60 s, with the names and on the same reload. Each label carries a `description` (why the
+address is marked), and optionally a `source` (who says so) and a `url` (where): leave them out, or empty, when there is none. An address
+can carry several labels; each (address, label) is its own key, and its newest row wins, so changing the description, source or url is
+another insert of the whole label, and removing it is an insert with `removed = 1`. The same append-only rules as for names hold: never
+`UPDATE`, `DELETE` or `OPTIMIZE ... FINAL`. The label is an `Enum8`: a misspelt one (`Scam`, `scma`) fails the insert with an error
+naming the value, and a new label needs a migration of `schema-shared/`.
+
+```sql
+-- put a label on an address, or replace what it says (the newest row of the address and label wins)
+INSERT INTO shared.account_labels (address, label, description, source, url, added_by)
+VALUES ('<address>', 'advisory', 'On the warning list of the regulator', '<who says so>', 'https://<where>', 'ops@gatehub.net');
+
+-- a label with a description only
+INSERT INTO shared.account_labels (address, label, description, added_by)
+VALUES ('<address>', 'scam', 'Fake giveaway, reported by customers', 'ops@gatehub.net');
+
+-- remove one label from an address (its other labels stay)
+INSERT INTO shared.account_labels (address, label, description, removed, added_by)
+VALUES ('<address>', 'scam', '', 1, 'ops@gatehub.net');
+
+-- the labels each address has now, as the api reads them
+SELECT address, label, description, source, url, added_by, added_at
+FROM (SELECT * FROM shared.account_labels ORDER BY address, label, added_at DESC, removed DESC LIMIT 1 BY address, label)
+WHERE removed = 0
+ORDER BY address, label;
+
+-- the history of one address
+SELECT * FROM shared.account_labels WHERE address = '<address>' ORDER BY label, added_at;
+```
+
+Nothing but the `Enum8` checks a row: a typo in the address or the description shows within a minute, and is fixed with a newer row.
 
 ### Roll out the validators and amendments data
 
@@ -194,8 +309,8 @@ dropping whole partitions, **but a ledger exists only if all its tables agree**:
 - A ledger that has a `ledgers` row but fewer stored transactions than its `tx_count` is answered with **500** by `/v2/ledgers/{id}` (and its hash list); lists of
   payments, exchanges and balance changes silently lose the rows whose tables were dropped.
 
-So never drop the partitions of one table alone. Drop **the same ledger range from all 19 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
-partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
+So never drop the partitions of one table alone. Drop **the same ledger range from all 23 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
+partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
 is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledgers vanish from every list at once), then the children. For the block 80,000,000-89,999,999
 (P7 partition 8, P6 partitions 80-89) of the XRPL database:
 
@@ -203,9 +318,9 @@ is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledger
 # run from the repo root; clickhouse-client authenticates with the container's own environment (the secret never touches the host command line)
 ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -q "$0"' "$1"; }
 for p in 80 81 82 83 84 85 86 87 88 89; do ch "ALTER TABLE xrpl.ledgers DROP PARTITION $p"; done      # the commit marker first
-for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments amm_pool_touches; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
+for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments amm_pool_touches path_payments; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
 for t in ledger_by_hash tx_by_hash tx_by_type account_transactions account_tx_by_sequence payments_by_currency account_payments exchanges account_exchanges balance_changes \
-         amm_pool_states amm_liquidity account_amm_liquidity amm_governance; do
+         amm_pool_states amm_liquidity account_amm_liquidity amm_governance account_states trust_line_states account_path_payments; do
   ch "ALTER TABLE xrpl.$t DROP PARTITION 8"
 done
 ch "DELETE FROM xrpl.accounts_created WHERE ledger_index BETWEEN 80000000 AND 89999999"

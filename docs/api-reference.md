@@ -12,9 +12,10 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md).
 
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
-[Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
+[Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
 [Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [Validations](#validations) ·
-[Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Operational endpoints](#operational-endpoints)
+[Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
+[Operational endpoints](#operational-endpoints)
 
 ---
 
@@ -161,7 +162,8 @@ the unpaged list.
 Routes that list rows answer `format=csv` with `Content-Type: text/csv` and `Content-Disposition: attachment;
 filename="<name>.csv"; filename*=UTF-8''<name>.csv` (RFC 6266: the name quoted, `"` and `\` escaped and anything but printable
 ASCII as `_`, and the name itself in UTF-8, percent-encoded; clients show the latter). Nested objects are flattened to `a.b` and `c[0].d` columns, the columns are the union of the keys in the
-order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name.
+order of first appearance, and every cell is quoted. Routes with a CSV form say so below, with the file name. Every route with a
+CSV form can also be [exported](#exports): the whole list as one file, made in the background.
 
 **Differences from data.ripple.com**: flattening is applied on **every** route that has a CSV form. The original flattened nested objects with
 its `flattenJSON` helper on only some routes (9 of 29) and printed `[Object]` in the cells of the others, which made those CSVs unusable. The
@@ -173,7 +175,7 @@ name is the same, quoted (M12).
 
 Successful `/v2` answers carry `Cache-Control: private, max-age=60` (the `GH_CACHE_CONTROL` setting; empty sends no header):
 `private`, because an answer is for the holder of an API key and a shared cache that ignores the key would serve it to anybody. The
-live routes `/balances` and `/orders` send their own (see there), and so do the validator routes (see [Validators and amendments](#validators-and-amendments)).
+live answers of `/balances` (the current ledger) and `/orders` send their own (see there), and so do the validator routes (see [Validators and amendments](#validators-and-amendments)).
 Responses are gzip-compressed when the client asks for it. CORS headers are sent only for the origins in `GH_CORS_ORIGINS`.
 Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it (see [deployment](deployment.md)).
 
@@ -191,9 +193,16 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs), the [AMM](#amm) endpoints (`/v2/amm/pools...`,
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
 `GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
-`GET /v2/network/validators/{key}/validations`. `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+`GET /v2/network/validators/{key}/validations`, `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54, whose `flags_changed` comes from the account state history, item 64), `GET /v2/path_payments` (the [path payments](#path-payments) of the
+network, spec #4) and `GET /v2/accounts/{address}/path_payments` (those of an account). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
+`GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
+ledger from the account state history ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), and
+`GET /v2/accounts/{address}/trustlines` lists an account's trust lines with all their settings at a ledger, from the same history.
+`GET /v2/accounts/{address}/balances` at a historical ledger reads that history too instead of the node, its trust lines then ordered
+by (counterparty, currency) ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 63).
 Exchange-based endpoints also differ in what they count: **swaps against AMM pools are exchanges here** (the original predates AMMs), see
 [Exchanges](#exchanges) and [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#6-amm-swaps-are-exchanges-adr-0011).
 
@@ -202,6 +211,11 @@ balance_changes, counterparties, exchanges}` and `GET /v2/network/markets`, and 
 `GET /v2/accounts/{address}/stats/{family}` and `GET /v2/accounts/{address}/reports` (the original ignored it there: a client that sent
 one now gets buckets). Their AMM data additions add the parameter `amm` and the fields `amm_share` and `amm_pool` to `GET /v2/network/markets`, the
 fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, and `computed_start` and `computed_end` to `GET /v2/amm/pools/{pool}/history?interval=day`.
+
+From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields of
+`GET /v2/accounts/{address}` `account_name`, the name the operator gave the address, `account_network_name`, the name the operator gave
+the account on this network only, and `account_labels`, the labels the operator put on the address; and [exports](#exports), `POST /v2/exports` and
+`GET /v2/exports/{id}`, in CSV or PDF ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -419,6 +433,108 @@ then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on 
 
 ---
 
+## Path payments
+
+A GateHub extra (spec #4): the original had no such list. A **path payment** ([glossary](../GLOSSARY.md)) is a successful payment
+whose delivery used someone else's liquidity: it consumed or changed an order-book offer, changed an AMM pool, or rippled through
+the trust lines of an account other than the source, the destination and the delivered currency's issuer. Rippling only through
+that issuer is not a path payment, and neither is a payment whose `Paths` field went unused: only what the metadata shows counts. A
+payment to oneself through such liquidity (an arbitrage loop, a conversion) is a path payment, although
+[`/v2/payments`](#get-v2paymentscurrency) leaves payments to oneself out. `/v2/payments`, `/v2/accounts/{address}/payments` and the
+payment volumes are unchanged.
+
+The rows are written by the ingest from parser version 4 on (`PATH_PARSER_VERSION`). A ledger ingested by an older parser has no
+path payments until it is re-ingested ([backfill](backfill.md#path-payments-re-ingest)), so a window over such ledgers lists none.
+
+### `GET /v2/path_payments`
+
+The path payments of the ledgers that closed in the window, across the network, oldest first (by ledger and transaction).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | As on [`/v2/payments`](#get-v2paymentscurrency). |
+| `format` | json | `csv`: file `path payments.csv`. |
+
+```json
+{
+  "result": "success",
+  "count": 1,
+  "marker": "…",
+  "path_payments": [
+    {
+      "hash": "E362675D…", "ledger_index": 11999941, "executed_time": "2015-03-01T11:13:10Z",
+      "source": "rLD5…", "destination": "rGhs…",
+      "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
+      "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…", "rvYAf…"]
+    }
+  ]
+}
+```
+
+Key order: `hash, ledger_index, executed_time, source, destination, delivered_amount, currency, issuer?, source_amount,
+source_currency, source_issuer?, offers_crossed, amm_pools, rippled_through`.
+
+- `delivered_amount`, `currency`, `issuer`: what reached the destination (the delivered amount, as on `/v2/payments`). When the
+  payment's `Amount` names the destination as its issuer ("any issuer the destination trusts"), the issuer is the one whose line
+  the payment credited.
+- `source_amount`, `source_currency`, `source_issuer`: what left the source for the payment, the fee not included. The currency is
+  that of `SendMax` (without it, the delivered currency); when `SendMax` names the source as its issuer, the issuer is the one whose
+  line the payment debited. For a payment to oneself in the same asset, it is the delivered amount minus what the source's balance
+  gained.
+- The issuers are absent for the native currency.
+- `offers_crossed`: the number of order-book offers the payment consumed or changed. An unfunded or expired offer it removed on
+  the way is not counted.
+- `amm_pools`: the AMM pools whose holdings it changed, by pool account, in the order of the metadata.
+- `rippled_through`: the accounts that rippled the payment between two of their trust lines in one currency (the balance went up on
+  one and down on the other), in the order of the metadata: a market maker, or the issuer of another currency than the delivered
+  one passing its own currency from one line to the next (the source currency's issuer, or that of a currency on the way). The
+  source, the destination, the delivered currency's issuer, the pools and the owners of the offers crossed are never listed. So a
+  payment that ripples straight from one issuer to another, with no offer and no pool, is a path payment.
+
+In the CSV the columns are these keys; `amm_pools` and `rippled_through` are one cell each, their accounts separated by a space.
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
+`unable to retrieve path payments`.
+
+### `GET /v2/accounts/{address}/path_payments`
+
+The path payments the account sent or received (it is their `source` or their `destination`) in the ledgers that closed in the
+window, oldest first (by ledger and transaction). A payment to oneself is listed once. An account a payment only rippled through,
+a pool and the owner of an offer crossed are named in the row but do not list it. The address is not checked, as on the other lists
+under an account: one that is none has no path payments.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | As on [`/v2/path_payments`](#get-v2path_payments). |
+| `format` | json | `csv`: file `<address> - path payments.csv`. |
+
+```json
+{
+  "result": "success",
+  "count": 2,
+  "path_payments": [
+    {
+      "hash": "E362675D…", "ledger_index": 11999941, "executed_time": "2015-03-01T11:13:10Z",
+      "source": "rLD5…", "destination": "rGhs…",
+      "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
+      "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…", "rvYAf…"]
+    },
+    "…"
+  ]
+}
+```
+
+The rows, their key order and the CSV columns are those of [`/v2/path_payments`](#get-v2path_payments). The list is read from the
+account's index of path payments (`account_path_payments`), written with them from parser version 4 on
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 67).
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
+`unable to retrieve path payments`.
+
+---
+
 ## Exchanges
 
 ### `GET /v2/exchanges/{base}/{counter}`
@@ -618,8 +734,9 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 ## Accounts
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
-(`/balances`, `/orders`): an address that does not exist simply has no rows. All account lists take the common window
-parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`.
+(`/balances`, `/orders`, `/trustlines`): an address that does not exist simply has no rows. All account lists take the common window
+parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
+described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments).
 
 ### `GET /v2/accounts`
 
@@ -644,12 +761,85 @@ accounts`.
 
 ### `GET /v2/accounts/{address}`
 
-`{ "result": "success", "account_data": { account, parent, initial_balance, inception, ledger_index, tx_hash } }`. 404
-`Account not found`; 500 `unable to get accounts`.
+The latest activation of the account, the name the operator gave its address, the name it gave the account on this network and
+the labels it put on the address.
+
+```json
+{ "result": "success",
+  "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
+                    "ledger_index": 11119603, "tx_hash": "…", "account_name": "…", "account_network_name": "…",
+                    "account_labels": { "scam": { "description": "Fake giveaway", "url": "https://…" },
+                                        "advisory": { "description": "…", "source": "…", "url": "https://…" } } } }
+```
+
+Key order: `account, parent, initial_balance, inception, ledger_index, tx_hash, genesis_balance?, genesis_index?,
+account_name?, account_network_name?, account_labels?, flags?`.
+
+- `account_name`: the **account name** of the address ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
+  the same on every network. The operator writes it into the shared database by hand
+  ([operations](operations.md#name-an-address)); the api loads the names every 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), so a
+  new or removed name shows within that time. Left out when the address has none.
+- `account_network_name`: the **account network name** of the account, its name on this network only ("USD Issuer" for
+  GateHub's issuing address on the XRP Ledger, which Xahau does not show). The operator writes it into the network's own
+  database by hand ([operations](operations.md#name-an-account-on-one-network)); it is loaded and reloaded with the names (60 s).
+  It is served with or without an `account_name`, and left out when the account has none.
+- `account_labels`: the **labels** of the address, the same on every network: an object keyed by label (`scam`, `spam`,
+  `advisory`, in that order), each `{ description, source?, url? }` in that key order, where `source` says who says so and `url`
+  links to where; each is left out when empty. The operator writes them into the shared database by hand
+  ([operations](operations.md#label-an-address)), and they load and reload with the names, so a new or removed label shows
+  within 60 s. Left out when the address has no label.
+
+The names and the labels do not make an account: an address with a name or a label but no activation on this network still
+answers 404 `Account not found`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `flags` | false | `true` adds `flags` to `account_data`: the **account flags**, one `true`/`false` per flag the network names, named without the `lsf` prefix, in the order of their bits. |
+| `date` (alias `close_time`) | | With `flags`: the last ledger closed at or before it. |
+| `ledger_index` (alias `ledger`) | | With `flags`: a ledger number, or `validated`, `closed`, `current`. |
+| `ledger_hash` | | With `flags`: the ledger with this hash. |
+
+Without `flags=true` nothing else is read, and the ledger parameters are not looked at: the answer is the one above. With it, a
+`date`, a numeric `ledger_index` or a `ledger_hash` reads the flags from the **account state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), never from the node, with the precedence of `/balances`
+(`ledger_hash` > `date` > `ledger_index`), and the answer names the ledger it was read at and when it closed. Without one (or with
+`validated`, `closed`, `current`) the flags come from `account_info` on the live node, the validated ledger by default; the answer
+then has the node's `ledger_index` and no `close_time`, is cached and carries the `Cache-Control` of `/balances`.
+
+```json
+{ "result": "success", "ledger_index": 107695660, "close_time": "2026-10-17T08:01:12Z",
+  "account_data": { "account": "r…", "parent": "r…", "initial_balance": "100", "inception": "2015-01-14T18:27:20Z",
+                    "ledger_index": 11119603, "tx_hash": "…",
+                    "flags": { "PasswordSpent": false, "RequireDestTag": true, "RequireAuth": false, "DisallowXRP": false,
+                               "DisableMaster": false, "…": false } } }
+```
+
+The flags are those the network's definitions name. On the XRP Ledger: `PasswordSpent`, `RequireDestTag`, `RequireAuth`,
+`DisallowXRP`, `DisableMaster`, `NoFreeze`, `GlobalFreeze`, `DefaultRipple`, `DepositAuth`, `DisallowIncomingNFTokenOffer`,
+`DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `AllowTrustLineLocking`, `AllowTrustLineClawback`
+(`LEDGER_ENTRY_FLAGS.AccountRoot` of the bundled definitions). On Xahau, whose definitions name none, a table kept from xahaud's
+`LedgerFormats.h`: `AllowTrustLineClawback` (0x1000), the XRP Ledger's nine from `PasswordSpent` to `DepositAuth`, `TshCollect`,
+`DisallowIncomingNFTokenOffer`, `DisallowIncomingCheck`, `DisallowIncomingPayChan`, `DisallowIncomingTrustline`, `URITokenIssuer` and
+`DisallowIncomingRemit`. The same bit can have another name on each network (0x80000000 is `AllowTrustLineClawback` on the XRP
+Ledger and `DisallowIncomingRemit` on Xahau).
+
+The flags at a ledger are those of the account's last change at or before it. The state history covers the ledgers above the newest
+ledger written by a parser older than parser version 3 (gaps in the ledger numbers do not matter); see
+[backfill](backfill.md#account-state-history-re-ingest). An account that has not changed since that start has no state yet. The
+coverage relies on the stored ledgers being complete above its start: a ledger missing there would leave out the changes it made,
+and nothing in the coverage would show it. Gap repair keeps them complete
+([backfill](backfill.md#resuming-gap-repair-reprocessing)).
+
+Errors, in order: 400 `invalid date format`, `invalid ledger hash` (only with `flags=true`); 404 `Account not found` (no activation);
+400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
+history does not cover); 404 `account not found` (no state of the account at that ledger, or the account was deleted; from the node:
+the node does not have the account); 500 `unable to get accounts`.
 
 **Differences from data.ripple.com** (both routes): an address that was created more than once (deleted with `AccountDelete`
 and funded again) answers with its **latest** creation; the original answered with the earliest. A transaction that creates
-several accounts is listed once per account (the original kept the last).
+several accounts is listed once per account (the original kept the last). `GET /v2/accounts/{address}` adds `account_name`,
+`account_network_name` and `account_labels`, and with `flags=true` the account flags, GateHub extras
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 55, 58, 57, 59 and 60).
 
 ### `GET /v2/accounts/{address}/transactions`
 
@@ -666,9 +856,50 @@ transaction objects of `/v2/transactions` without `ledger_hash`: `{hash, ledger_
 | `descending` | false | |
 | `limit` | 20 (max 1000) | |
 | `marker` | | |
+| `format` | json | `csv`: one **summary row** per transaction instead of the transaction object, file `<address> - transactions.csv`. Every other parameter applies as in JSON, and the pages follow the same `marker` and `Link` header. `binary` does not change the CSV. |
 
 Errors: 400 `invalid start date format`, `invalid end date format`, `invalid min_sequence`, `invalid max_sequence`, `invalid
-transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. No CSV.
+transaction type`, `invalid transaction result`, `invalid marker`; 500 `unable to retrieve transactions`. Errors stay JSON with
+`format=csv`.
+
+**The CSV summary row** says what the transaction was from the account's side, readable without opening `tx` and `meta`. The
+columns, the same on every page and in this order:
+
+| Column | Meaning |
+| --- | --- |
+| `hash`, `ledger_index` | The transaction and its ledger. |
+| `executed_time` | The close time of the ledger, as the `date` of the JSON list (`2015-01-14T18:27:10+00:00`). |
+| `tx_type`, `result` | `Payment`, `tesSUCCESS`, ... |
+| `initiator` | `true` when the account sent the transaction (its `Account`), `false` when the transaction only affected it. |
+| `counterparty`, `amount`, `currency`, `issuer` | From one mapping per transaction type, below. Empty where the type has none. |
+| `fee` | The fee in whole units of the native currency, on the transactions the account sent; empty on the others. |
+| `flags_changed` | The account flags of the account that the transaction set (`+Name`) or cleared (`-Name`), below. Empty when it changed none. |
+
+| Type | `counterparty` | `amount`, `currency`, `issuer` |
+| --- | --- | --- |
+| `Payment` | The destination for the sender, the sender for the destination. | The delivered amount of a successful payment, as `/v2/accounts/{address}/payments` gives it (a partial payment from before the fix gives `Amount`; an `Amount.issuer` that names a party is resolved through the trust lines). A failed payment delivered nothing and leaves them empty. An account that is neither party (an issuer the payment rippled through, the owner of an offer it took) gets none of the four. |
+| `TrustSet` | The peer of the trust line: the `LimitAmount` issuer for the sender, the sender for that issuer. | The limit the sender set, with its currency and issuer. |
+| any other (`OfferCreate`, `AccountSet`, ...) | empty | empty |
+
+Amounts are exact decimal strings in whole units, as on the ledger; the native currency is `XRP` or `XAH` and has no issuer.
+A page with no transactions is an empty file.
+
+`flags_changed` is filled for **every transaction type** that changed the account's flags, sent by the account or not: an
+`AccountSet`, but also a `SetRegularKey` that sets `PasswordSpent`, a `Payment` of the native currency that clears it, or the
+`AMMCreate` that creates an AMM account with its flags. It is read from the account state history
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)): the account's state that the transaction wrote, against its flags
+just before (the `PreviousFields` of the same account root in the metadata; an account the transaction created had none). The flags
+carry the network's names, as `flags=true` on [`/v2/accounts/{address}`](#get-v2accountsaddress) gives them (the XRP Ledger and
+Xahau differ), without the `lsf` prefix, separated by a space: the set ones first, then the cleared ones, each in the order of
+their bits (`+DisableMaster +DefaultRipple +DepositAuth`, `+RequireAuth -DisallowXRP`). A bit the network does not name is left out.
+A transaction in a ledger written by a parser that did not record the state history yet (before parser version 3) has no state
+row, so its `flags_changed` is empty until the ledger is re-ingested ([backfill](backfill.md)).
+
+```csv
+"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"
+"91F79AC2…","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","r4L6Z…","2","EUR","rMwjY…","0.012",""
+"25D5F48C…","93663330","2025-01-24T00:36:50+00:00","AccountSet","tesSUCCESS","true","","","","","0.00001","+DefaultRipple"
+```
 
 ### `GET /v2/accounts/{address}/transactions/{sequence}`
 
@@ -678,7 +909,8 @@ supported). A transaction that used a ticket has Sequence 0: the latest of them 
 
 **Differences from data.ripple.com** (both routes): `max_sequence` is inclusive (the HBase scan dropped its row); `type` and
 `result` are validated against the network definitions; a `min_sequence` above what a sequence can be gives an empty list and
-a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404.
+a `max_sequence` above it is clamped, instead of a database error; `/{sequence}` above it is 404. The original had no CSV for
+account transactions; `format=csv` with the summary row is a GateHub extra.
 
 ### `GET /v2/accounts/{address}/payments`
 
@@ -759,14 +991,17 @@ not served (the original computed it and never stored it).
 
 ### `GET /v2/accounts/{address}/balances`
 
-The balances of the account on a ledger of the **live node** (`GH_NODE_ENDPOINTS`): `account_info` for the native balance,
+The balances of the account at a ledger. A ledger named by `ledger_hash`, `date` or a numeric `ledger_index` is **historical**: the
+balances come from the **account and trust line state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)), never from the node. With no ledger named, or with `validated`,
+`closed` or `current`, they come from the **live node** (`GH_NODE_ENDPOINTS`): `account_info` for the native balance,
 `account_lines` for the trust lines.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `ledger_index` (alias `ledger`) | newest validated | A number, or `validated`, `closed`, `current`. Anything else is ignored. |
-| `ledger_hash` | | 64 hex digits (400 `invalid ledger hash`). |
-| `date` (alias `close_time`) | | The last ledger **stored by this API** that closed at or before it; the answer then carries its `close_time`. |
+| `ledger_index` (alias `ledger`) | newest validated | A ledger number (historical), or `validated`, `closed`, `current` (the node). Anything else is ignored. |
+| `ledger_hash` | | 64 hex digits (400 `invalid ledger hash`): the ledger **stored by this API** with this hash. |
+| `date` (alias `close_time`) | | The last ledger **stored by this API** that closed at or before it. |
 | `currency` | all | Only balances in that currency (compared as written). The native currency alone gives just the native balance. |
 | `counterparty` (alias `issuer`) | all | Only the trust lines with that account (the native balance is not filtered). |
 | `limit` | 200 (max 400) or `all` | Counts the native balance. `all` reads every trust line and has no `limit` in the answer. |
@@ -779,29 +1014,48 @@ Precedence: `ledger_hash` > `date` > `ledger_index`.
   "balances": [{ "currency": "XRP", "value": "1000.5" }, { "currency": "USD", "counterparty": "r…", "value": "12.25" }] }
 ```
 
-The native balance comes first and has no `counterparty`; trust lines follow in the node's order. Errors, in order: 400 `invalid
-ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, 400 `the date provided is too old` (no stored
-ledger that early, or the node no longer has the ledger), 404 `account not found`; 500 `unable to retrieve balances`.
+Key order: `result, ledger_index, close_time?, limit?, balances`; a balance is `currency, counterparty?, value`. The native balance
+comes first and has no `counterparty`. A historical answer always carries the `close_time` of its ledger; a live one has none.
 
-Responses are cached in memory for `GH_LIVE_CACHE_TTL_MS` (default 10 s) per resolved request, so a `validated` answer is at
-most that old; the body says which ledger it was read at. The answer says the same downstream: `Cache-Control: private,
-max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`private, max-age=10` by default), or `no-store` when the live cache is off
-(`GH_LIVE_CACHE_TTL_MS=0`), in place of the global `GH_CACHE_CONTROL`. `limit=all` pages the node for at most 30 s in all; an
-account that needs longer gets 500 `unable to retrieve balances`. The pages of trust lines after `account_info` are read from the
-ledger named by `ledger_hash` or a numeric `ledger_index` as given, and from the index the node answered with for
-`validated` / `closed` / `current` (a marker belongs to one ledger).
+**Historical ledgers.** The native balance is the account's state at its last change at or before the ledger; the trust lines are
+those of [`/trustlines`](#get-v2accountsaddresstrustlines) at that ledger (a line with a zero balance is listed, a deleted one is
+not), each as its balance from the account's side, **ordered by (`counterparty`, `currency`)**. The state history covers the ledgers
+above the newest ledger written by a parser older than parser version 3, as for `/trustlines` and the account flags (see
+[backfill](backfill.md#account-state-history-re-ingest)): a ledger this API does not hold, a date before the first stored ledger, or a
+ledger the state history does not cover answers 400 `the date provided is too old`, and an account with no state at that ledger (it
+has not changed since the coverage starts, or did not exist yet), or one deleted at or before it, answers 404 `account not found`. A
+historical answer is not cached in memory and carries the global `GH_CACHE_CONTROL`, like the other routes that read ClickHouse. The
+risk of a big issuer's read is that of [`/trustlines`](#get-v2accountsaddresstrustlines).
 
-**Differences from data.ripple.com**: the default ledger is the newest **validated** one (the original asked for the open
-ledger); `ledger_hash` is honored (it was ignored); trust lines are paged until the limit is filled with lines that pass the
-filters (the original cut the first page and filtered afterwards, so a `currency` could miss lines); `limit=all` pages to
-completion (within 30 s); a date older than the first stored ledger is 400 (the original answered 500); balances are exact decimal
-strings.
+**The current ledger.** Trust lines come in the node's order. Responses are cached in memory for `GH_LIVE_CACHE_TTL_MS` (default
+10 s) per resolved request, so a `validated` answer is at most that old; the body says which ledger it was read at. The answer says
+the same downstream: `Cache-Control: private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` (`private, max-age=10` by default), or
+`no-store` when the live cache is off (`GH_LIVE_CACHE_TTL_MS=0`), in place of the global `GH_CACHE_CONTROL`. `limit=all` pages the
+node for at most 30 s in all; an account that needs longer gets 500 `unable to retrieve balances`. The pages of trust lines after
+`account_info` are read from the index the node answered with (a marker belongs to one ledger).
+
+Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, 400 `the date provided
+is too old` (historical: see above; current: the node does not have the ledger), 404 `account not found` (no state of the account at
+the ledger, or the node does not know it); 500 `unable to retrieve balances`.
+
+**Differences from data.ripple.com**: a historical ledger is read from the state history, not from the node, so its trust lines are
+ordered by (counterparty, currency) rather than in the node's order, its answer always has `close_time`, and it is not in the
+live cache, so it carries the global `GH_CACHE_CONTROL` (`private, max-age=60` by default) instead of the live
+`private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` or `no-store` it had while it was read from the node
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) item 63); the default ledger
+is the newest **validated** one (the original asked for the open ledger); `ledger_hash` is honored (it was ignored); trust lines are
+paged until the limit is filled with lines that pass the filters (the original cut the first page and filtered afterwards, so a
+`currency` could miss lines); `limit=all` pages to completion (within 30 s); a date older than the first stored ledger is 400 (the
+original answered 500); balances are exact decimal strings.
 
 ### `GET /v2/accounts/{address}/orders`
 
 The open offers of the account on a ledger of the live node, with the same ledger selectors, `limit` (200, max 400, or `all`),
-error order, caching (the in-memory live cache and its `Cache-Control`), 30 s limit of `limit=all` and ledger of the pages after
-the first as `/balances` (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened).
+error order, caching (the in-memory live cache and its `Cache-Control`) and 30 s limit of `limit=all` as `/balances` at the current
+ledger (`currency` is ignored; `format=csv`: file `<address> - orders.csv`, flattened). Unlike `/balances`, every ledger is read from
+the node, a historical one too: a hash or a ledger number is forwarded to it, a date becomes the last stored ledger closed at or
+before it, and the pages after the first are read from the ledger named, or from the index the node answered with for `validated` /
+`closed` / `current`.
 
 ```json
 { "result": "success", "ledger_index": 107695660, "limit": 200,
@@ -817,6 +1071,64 @@ ripple address`.
 
 **Differences**: `direction` is `sell` when the offer has the sell flag (the original hard-coded `buy`); the address is
 validated (the original let the node fail with a 500); `limit=all` is honored; the default ledger is the validated one.
+
+### `GET /v2/accounts/{address}/trustlines`
+
+The **trust lines** of the account at a ledger, with all their settings, from the **trust line state history** in ClickHouse
+([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)); it never reads the node. Each line is from the account's side,
+ordered and paged by (`counterparty`, `currency`). An issuer's lines are its holders. A GateHub extra: the original had no such route
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) items 61 and 62).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `ledger_index` (alias `ledger`) | newest indexed | A ledger number. `validated`, `closed`, `current` and anything else read the newest indexed ledger too. |
+| `ledger_hash` | | The stored ledger with this hash (400 `invalid ledger hash` unless 64 hex digits). |
+| `date` (alias `close_time`) | | The last stored ledger closed at or before it. |
+| `currency` | all | Only the lines in that currency (compared as written: `USD`, or the 40 hex digits of a non-standard code). |
+| `counterparty` | all | Only the lines with that account. |
+| `limit`, `marker` | 200 (max 1000) | See [Pagination](#pagination). |
+| `format` | json | `csv`: file `<address> - trustlines.csv`, one row per line, paged like the JSON. |
+
+Precedence: `ledger_hash` > `date` > `ledger_index`, as on `/balances`. With no ledger named the route reads the newest ledger this
+API has indexed (not the node's validated ledger), so a marker always belongs to this API's data and the pages never mix two sources;
+that ledger trails the network by the ingest delay. The marker is the (counterparty, currency) of the last line and does not hold the
+ledger: each page without a ledger named reads the newest ledger again, so a walk that must be one ledger's names it with
+`ledger_index`, the `ledger_index` of the first page. An [export](#exports) does that itself.
+
+```json
+{ "result": "success", "ledger_index": 26926380, "close_time": "2017-01-12T18:49:31Z", "count": 1, "marker": "…",
+  "trustlines": [{ "currency": "LBR", "counterparty": "r…", "balance": "5.017529627551844", "limit": "10000000",
+                   "limit_peer": "1000000", "no_ripple": false, "no_ripple_peer": false, "authorized": false,
+                   "peer_authorized": false, "freeze": true, "peer_freeze": false, "quality_in": 0, "quality_out": 0 }] }
+```
+
+Key order: `result, ledger_index, close_time, count, marker?, trustlines`; a line is `currency, counterparty, balance, limit,
+limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out`.
+
+- `balance`: the account's balance on the line, exact; positive when the counterparty owes it (a holder of an issued currency),
+  negative when it owes the counterparty (the issuer's side of the same line).
+- `limit` is the account's own limit, `limit_peer` the counterparty's. `no_ripple`, `authorized` and `freeze` are the account's
+  own settings (it set no-ripple on its side, it authorized the line, it froze the line); the `_peer` / `peer_` fields are the
+  counterparty's. `quality_in` and `quality_out` are the account's, as the ledger stores them (0 when it has none).
+- A line with a zero balance is listed; a line deleted at or before the ledger is not.
+
+The lines at a ledger are those of their last change at or before it. The state history covers the ledgers above the newest ledger
+written by a parser older than parser version 3, the same coverage as the account flags (see
+[backfill](backfill.md#account-state-history-re-ingest)); a line that has not changed since that start is not listed yet. Gaps in
+the ledger numbers do not matter: the coverage relies on the stored ledgers being complete above its start, which gap repair keeps
+([backfill](backfill.md#resuming-gap-repair-reprocessing)).
+
+Errors, in order: 400 `invalid ripple address`, `invalid date format`, `invalid ledger hash`, `invalid limit`, `invalid marker`;
+400 `the date provided is too old` (a ledger this API does not hold, a date before the first stored ledger, or a ledger the state
+history does not cover, the newest one included when no ledger is named); 500 `unable to retrieve trustlines`.
+
+**Risk: an issuer's lines.** A page reads the account's rows in the order of the table's key from the marker on, with a plain
+`LIMIT` (about the rows of the page's lines and a few granules of each part), and keeps each line's newest row up to the ledger
+(`argMax`); `/balances?limit=all` reads its lines that way, 1,000 at a time. A line's newest row is found by reading its whole
+history up to the ledger, and every payment in an issuer's currencies changes its lines, so a page of a big issuer's lines costs the
+history of those lines and may exceed the api's query guards (30 s, `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, and 2 GiB,
+`API_CLICKHOUSE_MAX_QUERY_MEMORY` in production) and answer its 500. It can only be measured once the history spec has filled the
+tables; the remedy would be periodic state snapshots.
 
 ### `GET /v2/accounts/{address}/reports[/{date}]`
 
@@ -2913,6 +3225,137 @@ Errors, in the order they are checked: 400 `family is required`, `invalid start 
 the syncer's aggregator keeps (the last two hours every minute, plus any range ingest rewrote); right after a long outage or
 on a database with years of history the current hour can lag until the aggregator has caught up
 (`syncer_aggregator_stats_lag_seconds`).
+
+---
+
+## Exports
+
+An **export** is a file of a whole list, made in the background and downloaded once it is ready. Any route with a CSV form can be
+exported (the routes that say `format` … `csv` above): a route that gets a CSV form later can be exported with no other change. The
+exporter of the network makes the file by walking the list's own pages through this api, with an API key of its own, so the file
+is the list. Exports need the storage bucket of the deployment (`GH_EXPORT_BUCKET`, see [configuration](configuration.md)); without
+it both routes answer 503 `exports are not available`. Neither answer is cached (`Cache-Control: no-store`).
+
+### `POST /v2/exports`
+
+Asks for an export. The body is JSON:
+
+| Field | Meaning |
+| --- | --- |
+| `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list. |
+| `format` | `csv` or `pdf` (see [PDF](#pdf)). |
+
+A **list over time** (a route that takes `start` and `end`) must name both, unless it also takes a window of sequences and the path
+names `min_sequence` or `max_sequence` (the account transactions by sequence): those are its window. A list at a point in time (`/balances`,
+`/trustlines`, `/orders`) may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`)
+names none. The other parameters are not checked here: a list that refuses them makes a failed export, which says why.
+
+**The whole list.** Every CSV answer says in `X-List-Paging` how its whole list is read: `marker` (page by page), `limit=all`
+(`/balances` and `/orders`, which have no marker: the exporter asks for `limit=all`), `whole` (the route has no `limit`),
+`max=<n>` (no marker and no `limit=all`, and `limit`, at most `n`, counts the rows: the account analytics counterparties and
+exchange pairs, 1000, and `/v2/network/markets`, 5000), or `none` (a `limit` that does not count rows, such as the lines of the
+account balance history). A `max=<n>` list is asked once with `limit=<n>`: an answer with fewer rows is the whole list, and one with
+`n` rows may be cut, so the export fails with `the list answered <n> rows, the most it serves at once, and has no pages: it may be
+longer, and an export would cut it`. An export of a `none` list fails with `the list has no pages and cannot be read whole (no
+marker, no limit=all): an export would cut it at its limit`. Neither is ever cut to its first answer.
+
+**One ledger.** When the path of a list at a point in time names no ledger (no `ledger_hash`, `date` or numeric `ledger_index`;
+a word such as `validated` names none), the exporter takes the newest ledger this API has indexed when it starts the export
+(`GET /v2/ledgers`) and names it as `ledger_index` on every page it walks, so the file is that one ledger even when newer ones
+are indexed meanwhile, and a PDF says which (`At: ledger <n>, the newest indexed when the export was made`). A list counts as one
+at a point in time when its answer at that ledger has that `ledger_index`. So an export of `/balances` without a ledger is read
+from the state history at that ledger, not from the node.
+
+**Limits.** An API key may have at most **3** exports queued or running at once (`GH_EXPORT_MAX_JOBS_PER_KEY`); one more
+answers 429, and an export that is done or has failed frees its place. An export holds at most **1,000,000 rows as CSV** and
+**10,000 as PDF** (`GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`). Where the list counts its rows up front, an export above
+the cap is refused at once with 400; today that is the account transactions by time (`/v2/accounts/{address}/transactions` with
+its window, `type` and `result`; not the list by sequence) and the path payments by window (`/v2/path_payments`,
+`/v2/accounts/{address}/path_payments`). Any other export is held to the cap as it is made: the exporter stops
+at the page that passes it, and the export fails with the same message.
+
+The answer is 202:
+
+```json
+{ "result": "success", "id": "6f1c0e9b2d4a4c1f8e3b5a7d9c2e4f60", "status": "queued" }
+```
+
+The `id` is 128 random bits (32 hex digits): only the API key that asked can read the export. The job keeps the SHA-256 of that
+key, never the key; with authentication off (no `GH_API_KEYS`, development only) a request without a key owns its exports.
+
+Errors, in the order they are checked: 503 `exports are not available`; 400 `invalid path` (no `path`, or not one starting
+with `/v2/`), `path is not exportable` (no route with a CSV form has this path), `start and end are required`, `invalid format`;
+429 `too many exports in progress: at most 3 per API key`; 400 `the list has more than 1000000 rows, the most a CSV export
+holds: narrow the window` (for a PDF: `the list has more than 10000 rows, the most a PDF export holds: narrow the window or use
+CSV`); 500 `unable to create the export`. The 429 is the body of every error (`{"result":"error","message":…}`), not the rate
+limit's `{"error":…}`.
+
+### `GET /v2/exports/{id}`
+
+The state of an export:
+
+```json
+{ "result": "success", "id": "6f1c0e9b2d4a4c1f8e3b5a7d9c2e4f60", "status": "done", "format": "csv",
+  "path": "/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01", "created": "2024-07-02T08:00:00Z",
+  "finished": "2024-07-02T08:00:41Z", "rows": 15230, "url": "https://storage.googleapis.com/…" }
+```
+
+Key order: `result, id, status, format, path, created, finished?, rows?, error?, url?`. `status` is `queued`, `running`, `done`
+or `failed`. `finished` is there when the export is done or has failed; `rows` (the data rows of the file) and `url` when it is
+done; `error` when it has failed, and says why: the list's own answer (`the list answered 400: invalid transaction type`), `the
+list did not answer a CSV`, `the list's CSV could not be read`, `the list could not be read`, `a page of the list took longer
+than 60 s`, `the list has more than 1000000 rows, the most a CSV export holds: narrow the window` (the row cap, with the PDF
+wording for a PDF), `the file could not be stored`, or `the exporter stopped while it made this export: ask for it again`.
+
+`url` downloads the file for **15 minutes**; each request makes a new one. A `csv` file is the CSV the list's route would give for
+the whole list in one page: one header, the columns of every row in the order they first appear, a missing cell empty; an
+empty list is an empty file. It downloads under the list's own file name (`<address> - transactions.csv`). A `pdf` file is a document of the same rows
+([PDF](#pdf)). An export and its
+file are kept **7 days** after it was asked for; then the id is not found.
+
+Errors: 503 `exports are not available`; 404 `export not found` (an id that does not exist, or the export of another API
+key: the two are not told apart); 500 `unable to retrieve the export`.
+
+Exports run one at a time per network, in the order they were asked for.
+
+#### PDF
+
+A `pdf` export is a document of the same list, laid out for paper: landscape A4, rendered by the exporter with `pdfkit`. It
+downloads as `application/pdf` under the list's own file name with `.pdf` (`<address> - transactions.pdf`). It starts with a
+header, one line each:
+
+- the list's file name (`<address> - transactions`) as the title;
+- for an account's list (`/v2/accounts/{address}/…`): `Address:`, and the `Account name:`, `Account network name:` and one
+  `Label <label>: <description> (<source>, <url>)` per label that [`/v2/accounts/{address}`](#get-v2accountsaddress) serves for
+  it, read through the api like the rows (an address without an activation on the network has none);
+- `Network:` (`XRP Ledger` or `Xahau`), `List:` (the `path` as asked);
+- `Window: <start> to <end>` (`, newest first` with `descending=true`), or for a list at a point in time `At:` the ledger or date
+  it names, or else the ledger the exporter walked it at (see "One ledger" above);
+- `Ledgers: <lowest> to <highest>`: the ledgers of its rows (`ledger_index`); `none (no rows)`, or `not given by the list` for a
+  list whose rows have no ledger;
+- `Rows:` and `Made:` (the time, UTC, to the second).
+
+Then a table of the columns chosen for the list, the CSV's column names with spaces for `_`, repeated at the top of every page;
+a value too wide for its column wraps (a transaction hash takes two lines). The CSV keeps every column. The chosen columns:
+
+| List | Columns |
+| --- | --- |
+| `/v2/accounts/{address}/transactions` | `ledger_index, executed_time, tx_type, result, counterparty, amount, currency, issuer, fee, flags_changed, hash` |
+| `/v2/payments[/{currency}]`, `/v2/accounts/{address}/payments` | `executed_time, ledger_index, source, destination, destination_tag, delivered_amount, currency, issuer, tx_hash` |
+| `/v2/accounts/{address}/exchanges[/{base}[/{counter}]]` | `executed_time, ledger_index, base_amount, base_currency, base_issuer, counter_amount, counter_currency, counter_issuer, rate, buyer, seller, tx_hash` |
+| `/v2/accounts/{address}/balance_changes` | `executed_time, ledger_index, change_type, currency, counterparty, amount_change, final_balance, tx_hash` |
+| `/v2/accounts/{address}/balances` | `currency, counterparty, value` |
+| `/v2/accounts/{address}/trustlines` | every column: `currency, counterparty, balance, limit, limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out` |
+| `/v2/accounts` | `inception, ledger_index, account, parent, initial_balance, tx_hash` |
+| `/v2/path_payments`, `/v2/accounts/{address}/path_payments` | `executed_time, ledger_index, source, destination, delivered_amount, currency, issuer, source_amount, source_currency, offers_crossed, hash` |
+| any other list | its first 8 columns, of equal width |
+
+Every page ends with `Page n of m`. An empty list makes a one-page document whose table says `The list has no rows.` The
+standard PDF fonts write Latin-1 only: any other character (in a name or a currency, say) is written `?`; the CSV has it as it
+is. Opening and closing balances are not in the document.
+
+**Differences from data.ripple.com**: the original has no exports; these routes are new
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
 
 ---
 

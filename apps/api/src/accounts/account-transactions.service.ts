@@ -1,8 +1,20 @@
-import { ClickHouseService, readDistinctPage, Table } from '@gatehub/data-api-shared';
-import { Injectable } from '@nestjs/common';
+import {
+  AccountFlag,
+  accountFlagsOf,
+  ClickHouseService,
+  NetworkProfile,
+  ParseContext,
+  parseContextFor,
+  readDistinctPage,
+  Table,
+} from '@gatehub/data-api-shared';
+import { Inject, Injectable } from '@nestjs/common';
 import { LedgerRangeResolver } from '../common/ledger-range.service';
 import { columnsOf, decodeMarker, keysetClause, KeysetKey, paginate } from '../common/pagination';
+import { TxKey, txKeysIn, txKeyString } from '../common/tx-keys';
 import { TxObject, TxService } from '../common/tx-object';
+import { NETWORK_PROFILE } from '../config/api.config';
+import { AccountStateOfTx, toTransactionSummary, TransactionSummary } from './transaction-summary';
 
 /** The highest `Sequence` a transaction can have: the column is a UInt32. */
 const MAX_SEQUENCE = 4_294_967_295;
@@ -30,6 +42,12 @@ const SEQUENCE_ORDER: KeysetKey[] = [
 /** What a marker of the sequence list holds: the ORDER BY without the account. */
 const SEQUENCE_KEYS: KeysetKey[] = SEQUENCE_ORDER.slice(1);
 
+/**
+ * How a page serves its transactions: as the Ripple API's objects with `tx` and `meta` as JSON or as hex (`binary=true`),
+ * or as summary rows from the account's side (`format=csv`).
+ */
+export type TransactionsForm = 'json' | 'binary' | 'summary';
+
 /** What both lists are asked for; the values are already validated. */
 interface ListQuery {
   account: string;
@@ -37,7 +55,7 @@ interface ListQuery {
   type?: string;
   /** A transaction result code of the network (`tesSUCCESS`). */
   result?: string;
-  binary: boolean;
+  form: TransactionsForm;
   descending: boolean;
   limit: number;
   /** As the client got it from the last page; `decodeMarker` checks it. */
@@ -52,6 +70,9 @@ export interface TimeQuery extends ListQuery {
   endExclusive?: Date;
 }
 
+/** What the list by time holds, whatever its pages: the account, the window and the filters. */
+export type TimeWindow = Pick<TimeQuery, 'account' | 'type' | 'result' | 'start' | 'endExclusive'>;
+
 /**
  * The list by sequence: the transactions the account sent with a `Sequence` between the two bounds, both ends included.
  * With both bounds given, their order does not matter: the original's HBase scan swapped them (ruling R57), so
@@ -64,18 +85,16 @@ export interface SequenceQuery extends ListQuery {
   maxSequence?: number;
 }
 
-/** A page: the transactions in the order asked for, and the marker of the next page when there is one. */
+/**
+ * A page: the transactions in the order asked for, as objects or as summary rows (the `form` asked for), and the marker
+ * of the next page when there is one.
+ */
 export interface TransactionsPage {
-  transactions: TxObject[];
+  transactions: TxObject[] | TransactionSummary[];
   marker?: string;
 }
 
-interface TimeKey {
-  ledger_index: number;
-  tx_index: number;
-}
-
-interface SequenceKey extends TimeKey {
+interface SequenceKey extends TxKey {
   sequence: number;
 }
 
@@ -94,50 +113,83 @@ interface SequenceKey extends TimeKey {
  */
 @Injectable()
 export class AccountTransactionsService {
+  private readonly ctx: ParseContext;
+  private readonly flagNames: readonly AccountFlag[];
+
   constructor(
     private readonly ch: ClickHouseService,
     private readonly ranges: LedgerRangeResolver,
     private readonly txs: TxService,
-  ) {}
+    @Inject(NETWORK_PROFILE) profile: NetworkProfile,
+  ) {
+    this.ctx = parseContextFor(profile);
+    this.flagNames = accountFlagsOf(profile);
+  }
 
   /** One page of the transactions that affect the account in a time window. */
   async listByTime(q: TimeQuery): Promise<TransactionsPage> {
     // before any query: a marker that is none of ours is the client's mistake, whatever the range holds
     const after = decodeMarker(q.marker, TIME_KEYS);
 
-    const range = await this.ranges.resolve(q.start, q.endExclusive);
-    if (!range) return { transactions: [] };
+    const window = await this.timeWindow(q);
+    if (!window) return { transactions: [] };
 
     const cursor = keysetClause(TIME_KEYS, q.descending, after);
-    const conditions = [
-      'account = {account:String}',
-      'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
-      ...(q.type !== undefined ? ['tx_type = {type:String}'] : []),
-      ...(q.result !== undefined ? ['result = {result:String}'] : []),
-      ...(cursor.clause !== '' ? [cursor.clause] : []),
-    ];
     // in the order of the whole key, each row once (a row written twice is there twice until a merge, and no FINAL is
     // used), with one more than the page: it tells whether there is a next page
-    const found = await readDistinctPage<TimeKey>(this.ch, {
+    const found = await readDistinctPage<TxKey>(this.ch, {
       columns: 'ledger_index, tx_index',
       table: Table.AccountTransactions,
-      where: conditions,
+      where: [...window.conditions, ...(cursor.clause !== '' ? [cursor.clause] : [])],
       orderBy: columnsOf(TIME_ORDER),
       unique: columnsOf(TIME_KEYS),
       descending: q.descending,
+      params: { ...window.params, ...cursor.params },
+      limit: q.limit + 1,
+    });
+
+    const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
+    return this.page(page.rows, page.marker, q);
+  }
+
+  /**
+   * How many transactions the list by time holds, all its pages together, each once: what an export of it would hold
+   * (ticket #16 counts it before it queues the export).
+   */
+  async countByTime(q: TimeWindow): Promise<number> {
+    const window = await this.timeWindow(q);
+    if (!window) return 0;
+    const row = await this.ch.queryOne<{ n: number | string }>(
+      `SELECT count() AS n FROM (
+         SELECT DISTINCT ledger_index, tx_index FROM ${Table.AccountTransactions}
+          WHERE ${window.conditions.join(' AND ')}
+       )`,
+      window.params,
+    );
+    return Number(row?.n ?? 0);
+  }
+
+  /** The conditions on `account_transactions` of the list by time, without a page; `undefined` when no ledger is in it. */
+  private async timeWindow(
+    q: TimeWindow,
+  ): Promise<{ conditions: string[]; params: Record<string, string | number> } | undefined> {
+    const range = await this.ranges.resolve(q.start, q.endExclusive);
+    if (!range) return undefined;
+    return {
+      conditions: [
+        'account = {account:String}',
+        'ledger_index BETWEEN {min:UInt32} AND {max:UInt32}',
+        ...(q.type !== undefined ? ['tx_type = {type:String}'] : []),
+        ...(q.result !== undefined ? ['result = {result:String}'] : []),
+      ],
       params: {
         account: q.account,
         ...(q.type !== undefined && { type: q.type }),
         ...(q.result !== undefined && { result: q.result }),
         min: range.min,
         max: range.max,
-        ...cursor.params,
       },
-      limit: q.limit + 1,
-    });
-
-    const page = paginate(found, q.limit, (key) => [key.ledger_index, key.tx_index]);
-    return this.page(page.rows, page.marker, q.binary);
+    };
   }
 
   /** One page of the transactions the account sent, by their `Sequence`. */
@@ -196,7 +248,7 @@ export class AccountTransactionsService {
     });
 
     const page = paginate(found, q.limit, (key) => [key.sequence, key.ledger_index, key.tx_index]);
-    return this.page(page.rows, page.marker, q.binary);
+    return this.page(page.rows, page.marker, q);
   }
 
   /**
@@ -209,7 +261,7 @@ export class AccountTransactionsService {
   async bySequence(account: string, sequence: number, binary: boolean): Promise<TxObject | undefined> {
     // above what a sequence can be: no transaction has it, and the database would refuse the parameter
     if (sequence > MAX_SEQUENCE) return undefined;
-    const [key] = await this.ch.query<TimeKey>(
+    const [key] = await this.ch.query<TxKey>(
       `SELECT ledger_index, tx_index FROM ${Table.AccountTxBySequence}
         WHERE account = {account:String} AND sequence = {sequence:UInt32}
         ORDER BY account DESC, sequence DESC, ledger_index DESC, tx_index DESC
@@ -222,12 +274,42 @@ export class AccountTransactionsService {
   }
 
   /**
-   * The transactions of a page of keys, in their order. An item carries no `ledger_hash`: the original never asked for
-   * it on these routes.
+   * The transactions of a page of keys, in their order, in the form asked for. An object carries no `ledger_hash`: the
+   * original never asked for it on these routes. A summary row is read from the stored transaction, without the codec,
+   * and from the account's states that the page's transactions wrote (`statesOf`).
    */
-  private async page(keys: TimeKey[], marker: string | undefined, binary: boolean): Promise<TransactionsPage> {
+  private async page(keys: TxKey[], marker: string | undefined, q: ListQuery): Promise<TransactionsPage> {
+    if (q.form === 'summary') {
+      const [rows, states] = await Promise.all([this.txs.fetchByKeys(keys), this.statesOf(q.account, keys)]);
+      const transactions = rows.map((row) =>
+        toTransactionSummary(row, q.account, {
+          ctx: this.ctx,
+          flagNames: this.flagNames,
+          state: states.get(txKeyString(row)),
+        }),
+      );
+      return { transactions, ...(marker !== undefined && { marker }) };
+    }
     const rows = await this.txs.fetchByKeys(keys);
-    const transactions = await this.txs.toTxObjects(rows, { binary });
+    const transactions = await this.txs.toTxObjects(rows, { binary: q.form === 'binary' });
     return { transactions, ...(marker !== undefined && { marker }) };
+  }
+
+  /**
+   * The state of the account that each transaction of the page wrote in the account state history, by
+   * `ledger_index:tx_index`. A transaction that changed nothing of the account root, or that a parser older than
+   * `STATE_PARSER_VERSION` wrote, has none. The account prefix and the page's range of ledgers bound the read to the
+   * page; a row written twice is the same row.
+   */
+  private async statesOf(account: string, keys: TxKey[]): Promise<Map<string, AccountStateOfTx>> {
+    if (keys.length === 0) return new Map();
+    const among = txKeysIn(keys);
+    const rows = await this.ch.query<AccountStateOfTx & TxKey>(
+      `SELECT ledger_index, tx_index, node_index, flags
+         FROM ${Table.AccountStates}
+        WHERE account = {account:String} AND ${among.clause}`,
+      { account, ...among.params },
+    );
+    return new Map(rows.map((row) => [txKeyString(row), { node_index: row.node_index, flags: row.flags }]));
   }
 }

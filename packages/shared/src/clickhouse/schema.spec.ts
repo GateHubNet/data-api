@@ -2,20 +2,25 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const SCHEMA_DIR = join(__dirname, '..', '..', 'schema');
+/** The migration set of the shared database (ADR-0014), run by the same runner. */
+const SHARED_SCHEMA_DIR = join(__dirname, '..', '..', 'schema-shared');
 
 /**
  * The migration runner splits a file on a semicolon at the end of a line and drops lines starting with two dashes
  * (see migrate.ts). These checks keep the schema files inside that contract without needing a ClickHouse server.
  */
-describe('schema files', () => {
-  const files = readdirSync(SCHEMA_DIR).filter((f) => f.endsWith('.sql'));
+describe.each([
+  ['schema', SCHEMA_DIR, '001_baseline.sql'],
+  ['schema-shared', SHARED_SCHEMA_DIR, '001_account_names.sql'],
+])('schema files of %s/', (_set, dir, first) => {
+  const files = readdirSync(dir).filter((f) => f.endsWith('.sql'));
 
-  it('has at least the baseline', () => {
-    expect(files).toContain('001_baseline.sql');
+  it(`has at least ${first}`, () => {
+    expect(files).toContain(first);
   });
 
   describe.each(files)('%s', (file) => {
-    const content = readFileSync(join(SCHEMA_DIR, file), 'utf8');
+    const content = readFileSync(join(dir, file), 'utf8');
     const lines = content.split('\n');
 
     it('uses LF line endings, so the checksum is the same on every checkout', () => {

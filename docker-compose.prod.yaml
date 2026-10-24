@@ -1,7 +1,9 @@
 # Production-shaped topology: one deployment per network (XRPL and Xahau) on one ClickHouse server.
 #
 #   ClickHouse Keeper -> ClickHouse -> migrate-<network> (one-shot, creates the database of the network and applies the schema)
+#                                   -> migrate-shared (one-shot, the `shared` database every network's api reads, ADR-0014)
 #                                   -> syncer-<network> (ingest, exactly one) + api-<network> (read replicas)
+#                                   -> exporter-<network> (exports, exactly one; profile `exports`) -> api-<network>
 #   nginx routes by host to the apis: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau (deploy/nginx/nginx.conf.template)
 #
 # Run (secrets and settings come from deploy/.env.prod - inject it from your secrets manager, never commit it; building needs the npm
@@ -18,7 +20,13 @@
 # Scale the read tier of a network (compose has no rolling update; `up` recreates the changed services):
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --scale api-xrpl=3 --scale api-xahau=2
 #
-# The syncers are singletons: replicas 1 and a fixed container_name (compose then refuses to scale them). Keep those names:
+# Exports (POST /v2/exports, ticket #15) are on when GH_EXPORT_BUCKET is set: the apis sign the download links and the
+# exporters upload the files, both with a service account key mounted into them (the commented volumes below, with
+# GOOGLE_APPLICATION_CREDENTIALS in the env file). The exporters run with the `exports` profile:
+#   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod --profile exports up -d --build
+# Their key, EXPORTER_API_KEY, must be in GH_API_KEYS and should have a large budget in GH_RATE_LIMIT_KEYS.
+#
+# The syncers and the exporters are singletons: replicas 1 and a fixed container_name (compose then refuses to scale them). Keep those names:
 # they are the "refuse to scale" mechanism (unlike the dev compose, which has none so it can run next to another stack). A
 # single writer per network and database is a rule of the application (it holds a lease in ClickHouse), and `up` recreates a
 # changed syncer by stopping the old container before starting the new one - compose has no rolling update, so the two never
@@ -35,10 +43,11 @@
 #
 # Apply the migrations by hand (they also run on every `up`, as part of the start order; all DDL is idempotent):
 #   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl
+#   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-shared
 #
-# Metrics: every api and syncer serves Prometheus metrics on port 3000 (GET /metricz) of the compose network. They are
+# Metrics: every api, syncer and exporter serves Prometheus metrics on port 3000 (GET /metricz) of the compose network. They are
 # exposed to that network only and not published; scrape them from a Prometheus container on the same network
-# (targets api-xrpl:3000, syncer-xrpl:3000, ... - with scaled replicas use Docker DNS service discovery).
+# (targets api-xrpl:3000, syncer-xrpl:3000, exporter-xrpl:3000, ... - with scaled replicas use Docker DNS service discovery).
 #
 # Migrations are owned by the migrate-* jobs (the apps wait for them to complete), so the syncers run with
 # GH_RUN_MIGRATIONS_ON_BOOT=false. Per network, the compose file sets GH_NETWORK, GH_CLICKHOUSE_DATABASE, the node endpoints
@@ -52,6 +61,11 @@ x-syncer-build: &syncer-build
 x-api-build: &api-build
   context: .
   dockerfile: apps/api/Dockerfile
+  secrets: [npm_token]
+
+x-exporter-build: &exporter-build
+  context: .
+  dockerfile: apps/exporter/Dockerfile
   secrets: [npm_token]
 
 # node:slim has no wget/curl, so the probes use Node's global fetch.
@@ -70,6 +84,13 @@ x-syncer-healthcheck: &syncer-healthcheck
   timeout: 5s
   retries: 5
   start_period: 60s
+
+x-exporter-healthcheck: &exporter-healthcheck
+  test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3005/liveliness/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
 
 # The ClickHouse login is deploy/.env.prod's GH_CLICKHOUSE_USER / GH_CLICKHOUSE_PASSWORD for every client.
 x-clickhouse-client: &clickhouse-client
@@ -96,6 +117,16 @@ x-api-env: &api-env
   GH_LIVE_CACHE_TTL_MS:
   GH_TX_CACHE_SIZE:
   GH_CACHE_CONTROL:
+  GH_NAMES_AND_LABELS_RELOAD_MS:
+  # The shared database (ADR-0014) both apis read; empty = `shared`. migrate-shared gets the same.
+  GH_CLICKHOUSE_SHARED_DATABASE:
+  # Exports (ticket #15): empty GH_EXPORT_BUCKET = off. The key file is mounted (see the volumes of the apis).
+  GH_EXPORT_BUCKET:
+  GOOGLE_APPLICATION_CREDENTIALS:
+  # Export limits (ticket #16): exports per key, and the row caps the exporters share.
+  GH_EXPORT_MAX_JOBS_PER_KEY:
+  GH_EXPORT_MAX_ROWS_CSV:
+  GH_EXPORT_MAX_ROWS_PDF:
   GH_API_KEYS: ${GH_API_KEYS:?set GH_API_KEYS - the API refuses to start in production without keys}
   GH_HTTP_API_PORT: 3001
   GH_METRICZ_PORT: 3000
@@ -116,6 +147,19 @@ x-syncer-env: &syncer-env
   GH_DOMAIN_FETCH_TIMEOUT_MS:
   GH_RUN_MIGRATIONS_ON_BOOT: 'false' # owned by the migrate-<network> job
   GH_HTTP_API_PORT: 3002
+  GH_METRICZ_PORT: 3000
+
+x-exporter-env: &exporter-env
+  <<: [*clickhouse-client, *clickhouse-tuning]
+  GH_EXPORTER_API_KEY: ${EXPORTER_API_KEY:-}
+  GH_EXPORT_BUCKET: ${GH_EXPORT_BUCKET:-}
+  GOOGLE_APPLICATION_CREDENTIALS:
+  GH_EXPORT_PAGE_SIZE:
+  GH_EXPORT_POLL_MS:
+  GH_EXPORT_REQUEST_TIMEOUT_MS:
+  GH_EXPORT_MAX_ROWS_CSV:
+  GH_EXPORT_MAX_ROWS_PDF:
+  GH_HTTP_API_PORT: 3005
   GH_METRICZ_PORT: 3000
 
 x-migrate: &migrate
@@ -141,6 +185,19 @@ x-syncer: &syncer
   healthcheck: *syncer-healthcheck
   # metricz (3000) and the probe (3002) are reachable inside the compose network only.
   expose: ['3000', '3002']
+
+x-exporter: &exporter
+  build: *exporter-build
+  image: gatehub/data-exporter:${IMAGE_TAG:-latest}
+  pull_policy: build
+  profiles: ['exports']
+  restart: unless-stopped
+  deploy:
+    replicas: 1
+  # A shutdown queues the job in hand again, within 10 s of SIGTERM.
+  stop_grace_period: 30s
+  healthcheck: *exporter-healthcheck
+  expose: ['3000', '3005']
 
 x-api: &api
   build: *api-build
@@ -192,6 +249,17 @@ services:
       timeout: 5s
       retries: 10
 
+  # ------------------------------------------------------------------------------------------------ shared
+
+  # One-shot: create the `shared` database (account names and labels, ADR-0014) and apply its own schema, then exit 0. One job for
+  # every network (two runners on one schema_migrations would race); the apis of both networks wait for it.
+  migrate-shared:
+    <<: *migrate
+    command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js', 'shared']
+    environment:
+      <<: *clickhouse-client
+      GH_CLICKHOUSE_SHARED_DATABASE:
+
   # ------------------------------------------------------------------------------------------------ XRPL
 
   # One-shot: create the `xrpl` database and apply the schema, then exit 0. The xrpl services wait for it.
@@ -234,6 +302,8 @@ services:
     depends_on:
       migrate-xrpl:
         condition: service_completed_successfully
+      migrate-shared:
+        condition: service_completed_successfully
     environment:
       <<: *api-env
       GH_NETWORK: xrpl
@@ -243,6 +313,24 @@ services:
       GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
     # volumes:
     #   - ./deploy/amendments-xrpl.json:/etc/gatehub/amendments.json:ro # and XRPL_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS=/etc/gatehub/gcs.json
+
+  # The exports of XRPL: exactly one exporter, which walks the lists through the api-xrpl replicas.
+  exporter-xrpl:
+    <<: *exporter
+    container_name: data-exporter-xrpl
+    depends_on:
+      migrate-xrpl:
+        condition: service_completed_successfully
+      api-xrpl:
+        condition: service_healthy
+    environment:
+      <<: *exporter-env
+      GH_NETWORK: xrpl
+      GH_CLICKHOUSE_DATABASE: xrpl
+      GH_API_URL: http://api-xrpl:3001
+    # volumes:
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS=/etc/gatehub/gcs.json
 
   # ------------------------------------------------------------------------------------------------ Xahau
 
@@ -285,6 +373,8 @@ services:
     depends_on:
       migrate-xahau:
         condition: service_completed_successfully
+      migrate-shared:
+        condition: service_completed_successfully
     environment:
       <<: *api-env
       GH_NETWORK: xahau
@@ -294,6 +384,24 @@ services:
       GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
     # volumes:
     #   - ./deploy/amendments-xahau.json:/etc/gatehub/amendments.json:ro # and XAHAU_AMENDMENTS_CONFIG=/etc/gatehub/amendments.json
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS=/etc/gatehub/gcs.json
+
+  # The exports of Xahau: exactly one exporter (see exporter-xrpl).
+  exporter-xahau:
+    <<: *exporter
+    container_name: data-exporter-xahau
+    depends_on:
+      migrate-xahau:
+        condition: service_completed_successfully
+      api-xahau:
+        condition: service_healthy
+    environment:
+      <<: *exporter-env
+      GH_NETWORK: xahau
+      GH_CLICKHOUSE_DATABASE: xahau
+      GH_API_URL: http://api-xahau:3001
+    # volumes:
+    #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS=/etc/gatehub/gcs.json
 
   # ------------------------------------------------------------------------------------------------ edge
 

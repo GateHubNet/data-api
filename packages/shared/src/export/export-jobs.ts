@@ -1,0 +1,129 @@
+import { createHash, randomBytes } from 'node:crypto';
+import { ClickHouseService } from '../clickhouse/clickhouse.service';
+import { ExportJobsRow } from '../clickhouse/rows';
+import { Table } from '../clickhouse/tables';
+import { ExportFormat, ExportRowCaps } from './export-row-caps';
+
+/**
+ * Export jobs (spec #4, ticket #15): the state the api and the exporter of a network share, in `export_jobs`.
+ *
+ * The table is append-only. The api writes the `queued` row (seq 0); the exporter writes `running` when it takes the
+ * job, then `done` or `failed`, each with the next seq. Every row repeats the job, so the row with the highest seq of an
+ * id is the job, and nothing is ever updated in place.
+ */
+
+export type ExportStatus = ExportJobsRow['status'];
+
+/** How long a download link of a done export is valid: 15 minutes, a new link at each request. */
+export const EXPORT_URL_TTL_MS = 15 * 60 * 1000;
+
+/** How long an export is kept: 7 days (the TTL of `export_jobs`, and the lifecycle rule of the bucket). */
+export const EXPORT_RETENTION_DAYS = 7;
+
+/** The cap of `format` among `caps`. */
+export function exportRowCap(caps: ExportRowCaps, format: ExportFormat): number {
+  return caps[format];
+}
+
+/** Why an export of `format` is refused or fails past its cap: what the client can do about it, too. */
+export function tooManyExportRows(format: ExportFormat, cap: number): string {
+  return (
+    `the list has more than ${cap} rows, the most a ${format.toUpperCase()} export holds: narrow the window` +
+    (format === 'csv' ? '' : ' or use CSV')
+  );
+}
+
+/** An unguessable job id: 128 random bits as 32 hex digits. */
+export function newExportId(): string {
+  return randomBytes(16).toString('hex');
+}
+
+/** Whether `id` has the shape of a job id, so that anything else is not found without asking ClickHouse. */
+export function isExportId(id: string): boolean {
+  return /^[0-9a-f]{32}$/.test(id);
+}
+
+/** What a job records of the API key that asked for it: the hex SHA-256 of the key, `''` without one. Never the key. */
+export function exportKeyHash(key: string | undefined): string {
+  return key === undefined || key === '' ? '' : createHash('sha256').update(key).digest('hex');
+}
+
+/** Where the file of a job is stored: under the network's prefix, `<network>/<id>.<format>`. */
+export function exportObjectKey(network: string, id: string, format: ExportFormat): string {
+  return `${network}/${id}.${format}`;
+}
+
+/** The current time as a `DateTime64(3)` value: unix seconds with the milliseconds as the fraction. */
+export function exportNow(now: number = Date.now()): number {
+  return now / 1000;
+}
+
+// The columns read back, with the times as unix seconds (with milliseconds) and the row count exact.
+const COLUMNS = `id, seq, key_hash, path, format, status, toUnixTimestamp64Milli(created) / 1000 AS created,
+  toUnixTimestamp64Milli(at) / 1000 AS at, toString(rows) AS rows, object, error`;
+
+// The columns of a job's state besides its id, in the order of the tuple `CURRENT` keeps of each job.
+const STATE = ['seq', 'key_hash', 'path', 'format', 'status', 'created', 'at', 'rows', 'object', 'error'];
+
+/**
+ * The newest row of every job, grouped by id (`argMax` by `seq`, ADR-0003; never `LIMIT 1 BY` in the select that reads
+ * the table, clickhouse.md R106). The table keeps 7 days of jobs (its TTL), which is what the grouping reads.
+ */
+const CURRENT = `SELECT id, ${STATE.map((c, i) => `j.${i + 1} AS ${c}`).join(', ')}
+  FROM (SELECT id, argMax((${STATE.join(', ')}), seq) AS j FROM ${Table.ExportJobs} GROUP BY id)`;
+
+/** The most jobs `exportJobsIn` returns at once. */
+export const EXPORT_JOBS_BATCH = 100;
+
+/** The job `id` as it is now, or `undefined` when there is none (or it is older than 7 days). */
+export async function readExportJob(ch: ClickHouseService, id: string): Promise<ExportJobsRow | undefined> {
+  return ch.queryOne<ExportJobsRow>(
+    `SELECT ${COLUMNS} FROM ${Table.ExportJobs} WHERE id = {id:String} ORDER BY seq DESC LIMIT 1`,
+    { id },
+  );
+}
+
+/** The oldest jobs whose current state is `status`, the oldest first: at most `limit`, and never more than a batch. */
+export async function exportJobsIn(
+  ch: ClickHouseService,
+  status: ExportStatus,
+  limit: number = EXPORT_JOBS_BATCH,
+): Promise<ExportJobsRow[]> {
+  return ch.query<ExportJobsRow>(
+    `SELECT ${COLUMNS} FROM (${CURRENT}) WHERE status = {status:String} ORDER BY created, id LIMIT {limit:UInt32}`,
+    { status, limit: Math.min(limit, EXPORT_JOBS_BATCH) },
+  );
+}
+
+/** How many exports of the API key whose hash is `keyHash` are queued or running now. */
+export async function activeExportJobs(ch: ClickHouseService, keyHash: string): Promise<number> {
+  const row = await ch.queryOne<{ n: number | string }>(
+    `SELECT count() AS n FROM (
+       SELECT id, argMax(status, seq) AS status FROM ${Table.ExportJobs} WHERE key_hash = {key_hash:String} GROUP BY id
+     ) WHERE status IN ('queued', 'running')`,
+    { key_hash: keyHash },
+  );
+  return Number(row?.n ?? 0);
+}
+
+/** Appends a state of a job. */
+export async function appendExportJob(ch: ClickHouseService, row: ExportJobsRow): Promise<void> {
+  await ch.insert(Table.ExportJobs, [row]);
+}
+
+/** The next state of `job`: the same job, one seq further, entered now. */
+export function nextExportState(
+  job: ExportJobsRow,
+  change: Pick<ExportJobsRow, 'status'> & Partial<Pick<ExportJobsRow, 'rows' | 'object' | 'error'>>,
+  now: number = Date.now(),
+): ExportJobsRow {
+  return {
+    ...job,
+    seq: Number(job.seq) + 1,
+    at: exportNow(now),
+    rows: 0,
+    object: '',
+    error: '',
+    ...change,
+  };
+}

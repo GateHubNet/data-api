@@ -177,9 +177,12 @@ parser_version`). Re-ingest them with `--reprocess` from the enablement ledger 8
 `amm_pools`, `amm_daily` and the AMM volume from `agg_dirty`.
 
 ### `/balances` or `/orders` answer 400 `the date provided is too old`, 404 `account not found` or 500
-They read the live node (`GH_NODE_ENDPOINTS` of the **api**): a date before the first stored ledger or a ledger the node no longer has is the
-400; an address the node does not know is the 404; an unreachable node is the 500 `unable to retrieve balances|orders`. Check the node and the
-api log (`XrplService`).
+`/orders`, and `/balances` for the current ledger (none named, `validated`, `closed`, `current`), read the live node (`GH_NODE_ENDPOINTS` of
+the **api**): a date before the first stored ledger or a ledger the node no longer has is the 400; an address the node does not know is the
+404; an unreachable node is the 500 `unable to retrieve balances|orders`. Check the node and the api log (`XrplService`). `/balances` at a
+historical ledger (a hash, a date or a ledger number) reads the state history in ClickHouse instead: the 400 is a ledger this API does not
+hold or one the state history does not cover (see [backfill](backfill.md#account-state-history-re-ingest)), the 404 an account with no
+state at that ledger or one deleted at or before it.
 
 ### Syncer: `Node network_id N does not match GH_NETWORK=...`
 The endpoint belongs to another network (an XRPL node for a Xahau syncer, or the reverse). Fix `GH_NODE_ENDPOINTS` / `XRPL_NODE_ENDPOINTS` /

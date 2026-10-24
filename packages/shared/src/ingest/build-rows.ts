@@ -1,8 +1,10 @@
 import {
   AccountAmmLiquidityRow,
   AccountExchangesRow,
+  AccountPathPaymentsRow,
   AccountPaymentsRow,
   AccountsCreatedRow,
+  AccountStatesRow,
   AccountTransactionsRow,
   AccountTxBySequenceRow,
   AmmGovernanceRow,
@@ -15,13 +17,16 @@ import {
   LedgerByHashRow,
   LedgersRow,
   PARSER_VERSION,
+  PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
   TransactionsRow,
+  TrustLineStatesRow,
   TxByHashRow,
   TxByTypeRow,
 } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
+import { AccountStatesParser } from '../parsers/account-states.parser';
 import { AccountsCreatedParser } from '../parsers/accounts-created.parser';
 import { AffectedAccountsParser } from '../parsers/affected-accounts.parser';
 import { AmmParser } from '../parsers/amm.parser';
@@ -29,7 +34,9 @@ import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
+import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
+import { TrustLineStatesParser } from '../parsers/trust-line-states.parser';
 import { RawLedger } from './raw-ledger';
 
 /** Every row one ledger writes, one array per table. `ledger` is the commit marker and is written last. */
@@ -54,6 +61,14 @@ export interface LedgerRows {
   ammLiquidity: AmmLiquidityRow[];
   accountAmmLiquidity: AccountAmmLiquidityRow[];
   ammGovernance: AmmGovernanceRow[];
+  /** The state of every account root after each transaction that changed it (parser version 3, ADR-0015). */
+  accountStates: AccountStatesRow[];
+  /** The state of each side of every trust line after each transaction that changed it (parser version 3, ADR-0015). */
+  trustLineStates: TrustLineStatesRow[];
+  /** Every successful Payment whose delivery used someone else's liquidity, a payment to oneself included. */
+  pathPayments: PathPaymentsRow[];
+  /** The index of `pathPayments` by account: the source and the destination, one row for a payment to oneself. */
+  accountPathPayments: AccountPathPaymentsRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -76,7 +91,8 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
 /**
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
- * They are the 12 tables of the Ripple v2 data and the 5 AMM ledger tables.
+ * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
+ * and their index by account.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -96,12 +112,19 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.AmmLiquidity, 'ammLiquidity'],
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
+  [Table.AccountStates, 'accountStates'],
+  [Table.TrustLineStates, 'trustLineStates'],
+  [Table.PathPayments, 'pathPayments'],
+  [Table.AccountPathPayments, 'accountPathPayments'],
 ];
 
 const paymentParser = new PaymentParser();
+const pathPaymentParser = new PathPaymentParser();
 const exchangeParser = new ExchangeParser();
 const balanceChangesParser = new BalanceChangesParser();
 const accountsCreatedParser = new AccountsCreatedParser();
+const accountStatesParser = new AccountStatesParser();
+const trustLineStatesParser = new TrustLineStatesParser();
 const ammParser = new AmmParser();
 const affectedAccountsParser = new AffectedAccountsParser();
 const fromClientParser = new FromClientParser();
@@ -208,6 +231,10 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     ammLiquidity: [],
     accountAmmLiquidity: [],
     ammGovernance: [],
+    accountStates: [],
+    trustLineStates: [],
+    pathPayments: [],
+    accountPathPayments: [],
     diagnostics: { ammUnclassified: 0 },
   };
 
@@ -322,6 +349,32 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         { account: payment.source, direction: 'sent', counterparty: payment.destination, ...shared },
         { account: payment.destination, direction: 'received', counterparty: payment.source, ...shared },
       );
+    }
+
+    // Every successful Payment, a payment to oneself too (an arbitrage loop), which `paymentParser` leaves out.
+    const path = pathPaymentParser.parse(t, ctx);
+    if (path) {
+      rows.pathPayments.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        source: path.source,
+        destination: path.destination,
+        delivered_amount: path.delivered_amount,
+        currency: path.currency,
+        issuer: path.issuer ?? '',
+        source_amount: path.source_amount,
+        source_currency: path.source_currency,
+        source_issuer: path.source_issuer ?? '',
+        offers_crossed: path.offers_crossed,
+        amm_pools: path.amm_pools,
+        rippled_through: path.rippled_through,
+      });
+      // The source and the destination each find it; a payment to oneself is one row for that account, not two.
+      const key = { ledger_index: header.ledger_index, tx_index: txIndex };
+      rows.accountPathPayments.push({ account: path.source, ...key });
+      if (path.destination !== path.source) rows.accountPathPayments.push({ account: path.destination, ...key });
     }
 
     // Both parties see the exchange; a trade with oneself is one row for that account, not two.
@@ -509,6 +562,49 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         inception: closeTime,
         genesis_balance: null,
         genesis_index: null,
+      });
+    }
+
+    for (const state of accountStatesParser.parse(t, ctx)) {
+      rows.accountStates.push({
+        account: state.account,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: state.node_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        balance: state.balance,
+        flags: state.flags,
+        sequence: state.sequence,
+        owner_count: state.owner_count,
+        fields: JSON.stringify(state.fields),
+        deleted: state.deleted ? 1 : 0,
+      });
+    }
+
+    for (const line of trustLineStatesParser.parse(t, ctx)) {
+      rows.trustLineStates.push({
+        account: line.account,
+        counterparty: line.counterparty,
+        currency: line.currency,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: line.node_index,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        balance: line.balance,
+        limit: line.limit,
+        limit_peer: line.limit_peer,
+        no_ripple: line.no_ripple ? 1 : 0,
+        no_ripple_peer: line.no_ripple_peer ? 1 : 0,
+        authorized: line.authorized ? 1 : 0,
+        peer_authorized: line.peer_authorized ? 1 : 0,
+        freeze: line.freeze ? 1 : 0,
+        peer_freeze: line.peer_freeze ? 1 : 0,
+        quality_in: line.quality_in,
+        quality_out: line.quality_out,
+        flags: line.flags,
+        deleted: line.deleted ? 1 : 0,
       });
     }
   }
