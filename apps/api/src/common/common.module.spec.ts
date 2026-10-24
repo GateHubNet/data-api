@@ -14,6 +14,7 @@ function register(): DynamicModule {
     config: new ApiConfig(),
     profile,
     clickHouse: { url: 'http://localhost:8123' } as never,
+    sharedDatabase: 'shared',
   });
 }
 

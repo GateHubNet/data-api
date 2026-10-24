@@ -18,7 +18,9 @@ enum: queries use `${Table.X}`, never string literals). **49 tables** per networ
 | Account and market aggregates (9, migration 003) | `native_rates_daily`, `pair_hourly`, `markets_live`, `account_rollup_state`, `account_partition_rows`, `account_rollup_days`, `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the `aggregator` worker (jobs `rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) |
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
 
-Plus `schema_migrations` (the migration runner's bookkeeping). The previous design (CTID-keyed tables, insert-triggered materialized
+Plus `schema_migrations` (the migration runner's bookkeeping). Apart from the network databases, one **shared database** on the
+same server holds what belongs to an address on every network (account names, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
+with its own migrations: see [section 8](#8-the-shared-database). The previous design (CTID-keyed tables, insert-triggered materialized
 views, offers/issuers/escrows/paychannels tables) is gone: see [ADR-0002](adr/0002-ctid-idempotent-ingest.md) (superseded),
 [ADR-0007](adr/0007-ledger-index-axis-and-secondary-tables.md) and [ADR-0008](adr/0008-no-aggregate-materialized-views.md).
 
@@ -437,3 +439,36 @@ local volumes).
 3. If it is derived from a ledger: add it to `buildLedgerRows` / `CHILD_TABLES`, to `LEDGER_KEYED_TABLES` in `ingest-state.ts` (so
    recovery deletes it; the e2e suite compares that list with the schema's partitioning) and give it the dedup window.
 4. Read it with `${Table.X}`, bound parameters, a key-ordered scan and no `FINAL`.
+
+A table of the shared database instead gets a migration of `schema-shared/`, a member of the `SharedTable` enum (never of `Table`)
+and a row type in `rows.ts`, and is read qualified by the shared database ([section 8](#8-the-shared-database)).
+
+## 8. The shared database
+
+One database on the ClickHouse server, `shared` (`GH_CLICKHOUSE_SHARED_DATABASE`), next to the network databases: it holds what the
+operator writes about an **address**, which holds on every network ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md), the
+first exception to [ADR-0009](adr/0009-one-deployment-per-network.md)). The apis of every network read it; nothing derived from a ledger is
+in it, and the syncers never touch it.
+
+- **Migrations.** Its own set, [`packages/shared/schema-shared/`](../packages/shared/schema-shared/), numbered from 001, with its own
+  `schema_migrations` in the shared database. The same runner applies it (`runSharedMigrations`, the command
+  `migrate.js shared`, from source `pnpm ch:migrate:shared`), one job for every network: the `migrate-shared` service of both compose
+  files, which the apis wait for. It must run before an api that reads the shared database.
+- **Names.** The table names are the `SharedTable` enum of `tables.ts`, apart from `Table` (which is exactly the tables of a network
+  database). Queries qualify them: `${shared}.${SharedTable.AccountNames}`; the api's `sql-tables.spec.ts` refuses one written by hand.
+- **Append-only.** Every table is written by the operator with plain SQL inserts ([operations](operations.md#name-an-address)) and is
+  never updated or deleted: the newest row of a key (largest `added_at`) wins, a row with `removed = 1` removes the key, and the rows
+  are the audit trail. A plain `MergeTree` keeps them all; readers take the newest row of each key with `LIMIT 1 BY`, never `FINAL`.
+- **Read.** The api loads every table whole when it starts and again every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s), and serves from
+  that copy (`NamesAndLabelsService`): a row shows within a reload. A load that fails is logged and keeps the previous copy.
+
+| File | Contents |
+| --- | --- |
+| `001_account_names.sql` | `account_names`: one `CREATE TABLE IF NOT EXISTS` |
+
+### `account_names` (no partition, `MergeTree ORDER BY (address, added_at)`)
+
+One row per change of the **account name** of an address: `address`, `name`, `removed UInt8` (default 0; 1 removes the name),
+`added_by` (who wrote the row) and `added_at DateTime64(3, 'UTC')` (default: the insert time). The newest row of an address wins; at the
+same `added_at` a removal wins. An address whose newest row is a removal, or names nothing (`name = ''`), has no name. Read by
+`/v2/accounts/{address}` (`account_name`).

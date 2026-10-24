@@ -7,6 +7,7 @@ import {
   parseContextFor,
   recomputeStatsHourly,
   runMigrations,
+  runSharedMigrations,
   Table,
 } from '@gatehub/data-api-shared';
 import type { INestApplication, Type } from '@nestjs/common';
@@ -57,6 +58,12 @@ export interface HarnessOptions {
    * that does not answer `server_definitions` (returns nothing, or throws) gets the same fallback.
    */
   xrplStub?: XrplStub;
+  /**
+   * The shared database (ADR-0014: account names, labels) to read, made by another harness, so that two apps (an xrpl and
+   * a xahau one) read the same rows: this harness neither migrates it nor drops it. Default: a random one of its own,
+   * with the shared migrations, dropped by `close()`.
+   */
+  sharedDatabase?: string;
   /** Extra `GH_*` variables for this app (`GH_RATE_LIMIT`, `GH_CORS_ORIGINS`, ...); they win over the defaults. */
   env?: Record<string, string>;
   /**
@@ -108,6 +115,11 @@ export interface Harness {
   ch: ClickHouseService;
   /** The database this harness created (random, dropped by `close()`). */
   database: string;
+  /**
+   * The shared database the app reads (`GH_CLICKHOUSE_SHARED_DATABASE`): the harness's own (random, dropped by `close()`)
+   * or the `sharedDatabase` it was given. Insert into it with the name qualified: `INSERT INTO ${h.sharedDatabase}.…`.
+   */
+  sharedDatabase: string;
   key: string;
   close(): Promise<void>;
 }
@@ -126,7 +138,8 @@ export function rippledError(error: string, message = error): Error {
 
 /**
  * Boots the AppModule the way `main.ts` does, against the shared ClickHouse container of `global-setup.ts`:
- * a fresh random database, the real schema (`runMigrations`), `GH_API_KEYS=test-key`, optionally seeded with ledgers
+ * a fresh random database, the real schema (`runMigrations`), a fresh random shared database with its own schema
+ * (`runSharedMigrations`, unless `sharedDatabase` names one), `GH_API_KEYS=test-key`, optionally seeded with ledgers
  * (`seed`) and with the live node replaced by a stub (`xrplStub`).
  *
  * The toolbox `bootstrap()` returns no app handle, so its app-level settings are repeated here: the global
@@ -138,6 +151,8 @@ export function rippledError(error: string, message = error): Error {
 export async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
   const seed = options.seed ?? 'none';
   const database = `api_e2e_${randomBytes(6).toString('hex')}`;
+  const ownShared = options.sharedDatabase === undefined;
+  const sharedDatabase = options.sharedDatabase ?? `api_e2e_shared_${randomBytes(6).toString('hex')}`;
   const env: Record<string, string> = {
     GH_NETWORK: options.network ?? (seed === 'none' ? 'xrpl' : SEED_NETWORK[seed]),
     GH_NODE_ENDPOINTS: 'ws://127.0.0.1:1',
@@ -146,6 +161,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     GH_CLICKHOUSE_USER: 'default',
     GH_CLICKHOUSE_PASSWORD: '',
     GH_CLICKHOUSE_DATABASE: database,
+    GH_CLICKHOUSE_SHARED_DATABASE: sharedDatabase,
     ...options.env,
   };
   const network = getNetworkProfile(env.GH_NETWORK).name;
@@ -156,6 +172,12 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   }
   const config = clickHouseConfigFromEnv({ ...env });
   await runMigrations({ config, log: () => undefined });
+  if (ownShared) await runSharedMigrations({ config: { ...config, database: sharedDatabase }, log: () => undefined });
+  /** Drops what this harness created. */
+  const dropDatabases = async (): Promise<void> => {
+    await dropDatabase(database, env);
+    if (ownShared) await dropDatabase(sharedDatabase, env);
+  };
 
   const saved = { ...process.env };
   Object.assign(process.env, env);
@@ -185,7 +207,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     });
   } catch (err) {
     await app?.close();
-    await dropDatabase(database, env);
+    await dropDatabases();
     // ts-jest diagnostics arrive as plain objects that jest cannot print (an empty failure), so make it an Error.
     throw err instanceof Error ? err : new Error(String((err as { message?: unknown })?.message ?? err));
   } finally {
@@ -204,10 +226,11 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     api: () => (client ??= Promise.resolve(clientOn(url, TEST_API_KEY))),
     ch: ch as unknown as ClickHouseService,
     database,
+    sharedDatabase,
     key: TEST_API_KEY,
     close: async () => {
       await running.close();
-      await dropDatabase(database, env);
+      await dropDatabases();
     },
   };
 }

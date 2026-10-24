@@ -154,10 +154,24 @@ export class ApiConfig {
   @ConfigValue()
   @MaybeEmptyText()
   amendmentsConfig: string = '';
+
+  /**
+   * `GH_NAMES_AND_LABELS_RELOAD_MS`: how often the account names (and the other sets of names and labels the operator
+   * writes, ADR-0014) are loaded again, in milliseconds. A row the operator inserts shows within this time.
+   */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  namesAndLabelsReloadMs: number = 60000;
 }
 
 /** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */
 export const NETWORK_PROFILE = Symbol('NETWORK_PROFILE');
+
+/**
+ * The name of the shared database (ADR-0014: `GH_CLICKHOUSE_SHARED_DATABASE`, default `shared`), provided by the
+ * CommonModule. It is on the server of the app's own database, and is read with the table names qualified by it.
+ */
+export const SHARED_DATABASE = Symbol('SHARED_DATABASE');
 
 /** The entries of a comma separated endpoint list, trimmed, without empty items. */
 export function endpointList(csv: string): string[] {

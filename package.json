@@ -15,6 +15,7 @@
     "test": "pnpm -r test",
     "format": "prettier --write \"{apps,packages}/**/src/**/*.ts\"",
     "ch:migrate": "pnpm --filter @gatehub/data-api-shared ch:migrate",
+    "ch:migrate:shared": "pnpm --filter @gatehub/data-api-shared ch:migrate shared",
     "start:api": "pnpm --filter @gatehub/data-api-service start:dev",
     "start:syncer": "pnpm --filter @gatehub/data-syncer start:dev",
     "docker:up": "docker compose up -d clickhouse",

@@ -10,6 +10,7 @@ import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams 
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { AccountObject } from './account-object';
 import { AccountsService } from './accounts.service';
+import { NamesAndLabels, NamesAndLabelsService } from './names-and-labels.service';
 
 /** The message of both routes when something other than a Ripple 4xx goes wrong (`accounts.js`, `getAccount.js`). */
 const FAILURE = 'unable to get accounts';
@@ -17,7 +18,10 @@ const FAILURE = 'unable to get accounts';
 /** `GET /v2/accounts` (`api/routes/accounts.js`) and `GET /v2/accounts/:address` (`api/routes/getAccount.js`). */
 @RippleController('v2/accounts')
 export class AccountsController {
-  constructor(private readonly accounts: AccountsService) {}
+  constructor(
+    private readonly accounts: AccountsService,
+    private readonly namesAndLabels: NamesAndLabelsService,
+  ) {}
 
   @Get()
   @RippleRoute(FAILURE)
@@ -65,13 +69,17 @@ export class AccountsController {
     summary: 'Get an account',
     description:
       'When and by whom an account was created. An address that was created more than once (deleted and funded ' +
-      'again) answers with its latest creation.',
+      'again) answers with its latest creation. `account_name` is the name the operator gave the address, the ' +
+      'same on every network, left out when it has none.',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
-  async lookup(@Param('address') address: string): Promise<{ result: 'success'; account_data: AccountObject }> {
+  async lookup(
+    @Param('address') address: string,
+  ): Promise<{ result: 'success'; account_data: AccountObject & NamesAndLabels }> {
     // not validated, as in the original: an address that is none has simply never been created
     const account = await this.accounts.latest(address);
+    // an address with a name but no activation on this network stays not found (spec #4, an open point)
     if (!account) throw notFound('Account not found');
-    return { result: 'success', account_data: account };
+    return { result: 'success', account_data: { ...account, ...this.namesAndLabels.of(account.account) } };
   }
 }

@@ -10,7 +10,8 @@
   "files": [
     "dist",
     "config",
-    "schema"
+    "schema",
+    "schema-shared"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
