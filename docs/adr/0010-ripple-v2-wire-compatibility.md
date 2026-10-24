@@ -267,7 +267,9 @@ addition: what the original served is served as before. Names and labels are ser
     state at the ledger, the trust lines those of `/trustlines` at the ledger. The answer keeps its shape, precedence, `currency`,
     `counterparty`, `limit` (200, max 400, or `all`), CSV and messages, with three differences: the trust lines are **ordered by
     (`counterparty`, `currency`)**, not in the node's order; the answer always carries the ledger's `close_time` (before, only a
-    `date` gave one); and it is not in the live cache, so it carries the global `Cache-Control`, not the live one. The rules of
+    `date` gave one); and it is not in the live cache, so it carries the global `Cache-Control` (`GH_CACHE_CONTROL`, `private,
+    max-age=60` by default), not the live one it had while read from the node (`private, max-age=<GH_LIVE_CACHE_TTL_MS in whole
+    seconds>`, or `no-store` with the live cache off). The rules of
     item 60 apply: a ledger this API does not hold or the state history does not cover is 400 `the date provided is too old`, an
     account with no state at the ledger or deleted at or before it 404 `account not found`. No ledger named, `validated`, `closed`
     and `current` still read the node, as does every ledger of `/orders`.

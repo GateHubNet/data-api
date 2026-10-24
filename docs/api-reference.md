@@ -1039,7 +1039,9 @@ is too old` (historical: see above; current: the node does not have the ledger),
 the ledger, or the node does not know it); 500 `unable to retrieve balances`.
 
 **Differences from data.ripple.com**: a historical ledger is read from the state history, not from the node, so its trust lines are
-ordered by (counterparty, currency) rather than in the node's order, and its answer always has `close_time`
+ordered by (counterparty, currency) rather than in the node's order, its answer always has `close_time`, and it is not in the
+live cache, so it carries the global `GH_CACHE_CONTROL` (`private, max-age=60` by default) instead of the live
+`private, max-age=<GH_LIVE_CACHE_TTL_MS in whole seconds>` or `no-store` it had while it was read from the node
 ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#amendment-4-2026-10-24-account-investigation-data) item 63); the default ledger
 is the newest **validated** one (the original asked for the open ledger); `ledger_hash` is honored (it was ignored); trust lines are
 paged until the limit is filled with lines that pass the filters (the original cut the first page and filtered afterwards, so a
