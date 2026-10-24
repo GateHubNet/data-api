@@ -49,8 +49,8 @@ Everything both services need, written once:
   for when the node cannot supply `server_definitions`) and the markets config (`config/markets/<network>.json`).
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
-- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM) and
-  `buildLedgerRows` (a raw ledger -> rows of the 20 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments) and
+  `buildLedgerRows` (a raw ledger -> rows of the 21 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
 - **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
@@ -123,7 +123,7 @@ next one starts. The api queues the jobs (`POST /v2/exports`) and signs the down
 
 ### ClickHouse
 
-One server, one database per network, 52 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network, 53 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 

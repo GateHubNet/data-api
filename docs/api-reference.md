@@ -12,7 +12,7 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md).
 
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
-[Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
+[Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
 [Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [Validations](#validations) ·
 [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
 [Operational endpoints](#operational-endpoints)
@@ -193,8 +193,9 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exchanges of all pairs), the [AMM](#amm) endpoints (`/v2/amm/pools...`,
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
 `GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
-`GET /v2/network/validators/{key}/validations`, and `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
-[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+`GET /v2/network/validators/{key}/validations`, `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), and `GET /v2/path_payments` (the [path payments](#path-payments) of the
+network, spec #4). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
 `GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
@@ -426,6 +427,71 @@ then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on 
   in practice produced `payments  .csv`.
 - Payments with MPT amounts are not payments of this API.
 - A missing `end` is open-ended (the original used the time of the request).
+
+---
+
+## Path payments
+
+A GateHub extra (spec #4): the original had no such list. A **path payment** ([glossary](../GLOSSARY.md)) is a successful payment
+whose delivery used someone else's liquidity: it consumed or changed an order-book offer, changed an AMM pool, or rippled through
+the trust lines of an account other than the source, the destination and the delivered currency's issuer. Rippling only through
+that issuer is not a path payment, and neither is a payment whose `Paths` field went unused: only what the metadata shows counts. A
+payment to oneself through such liquidity (an arbitrage loop, a conversion) is a path payment, although
+[`/v2/payments`](#get-v2paymentscurrency) leaves payments to oneself out. `/v2/payments`, `/v2/accounts/{address}/payments` and the
+payment volumes are unchanged.
+
+The rows are written by the ingest from parser version 4 on (`PATH_PARSER_VERSION`). A ledger ingested by an older parser has no
+path payments until it is re-ingested ([backfill](backfill.md#path-payments-re-ingest)), so a window over such ledgers lists none.
+
+### `GET /v2/path_payments`
+
+The path payments of the ledgers that closed in the window, across the network, oldest first (by ledger and transaction).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | As on [`/v2/payments`](#get-v2paymentscurrency). |
+| `format` | json | `csv`: file `path payments.csv`. |
+
+```json
+{
+  "result": "success",
+  "count": 1,
+  "marker": "…",
+  "path_payments": [
+    {
+      "hash": "E362675D…", "ledger_index": 11999941, "executed_time": "2015-03-01T11:13:10Z",
+      "source": "rLD5…", "destination": "rGhs…",
+      "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
+      "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+    }
+  ]
+}
+```
+
+Key order: `hash, ledger_index, executed_time, source, destination, delivered_amount, currency, issuer?, source_amount,
+source_currency, source_issuer?, offers_crossed, amm_pools, rippled_through`.
+
+- `delivered_amount`, `currency`, `issuer`: what reached the destination (the delivered amount, as on `/v2/payments`). When the
+  payment's `Amount` names the destination as its issuer ("any issuer the destination trusts"), the issuer is the one whose line
+  the payment credited.
+- `source_amount`, `source_currency`, `source_issuer`: what left the source for the payment, the fee not included. The currency is
+  that of `SendMax` (without it, the delivered currency); when `SendMax` names the source as its issuer, the issuer is the one whose
+  line the payment debited. For a payment to oneself in the same asset, it is the delivered amount minus what the source's balance
+  gained.
+- The issuers are absent for the native currency.
+- `offers_crossed`: the number of order-book offers the payment consumed or changed. An unfunded or expired offer it removed on
+  the way is not counted.
+- `amm_pools`: the AMM pools whose holdings it changed, by pool account, in the order of the metadata.
+- `rippled_through`: the accounts that rippled the payment between two of their trust lines in one currency (the balance went up on
+  one and down on the other) while holding a balance on one of them, in the order of the metadata: a market maker. The source, the
+  destination, the delivered currency's issuer, the pools and the owners of the offers crossed are never listed, and neither is
+  another issuer that only passed its own currency from one holder to another.
+
+In the CSV the columns are these keys; `amm_pools` and `rippled_through` are one cell each, their accounts separated by a space.
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
+`unable to retrieve path payments`.
 
 ---
 

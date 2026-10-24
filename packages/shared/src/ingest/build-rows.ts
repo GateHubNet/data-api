@@ -16,6 +16,7 @@ import {
   LedgerByHashRow,
   LedgersRow,
   PARSER_VERSION,
+  PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
   TransactionsRow,
@@ -31,6 +32,7 @@ import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
+import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
 import { RawLedger } from './raw-ledger';
 
@@ -58,6 +60,8 @@ export interface LedgerRows {
   ammGovernance: AmmGovernanceRow[];
   /** The state of every account root after each transaction that changed it (parser version 3, ADR-0015). */
   accountStates: AccountStatesRow[];
+  /** Every successful Payment whose delivery used someone else's liquidity, a payment to oneself included. */
+  pathPayments: PathPaymentsRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -80,7 +84,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
 /**
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
- * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables and the account state history.
+ * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the account state history and the path payments.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -101,9 +105,11 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.AccountAmmLiquidity, 'accountAmmLiquidity'],
   [Table.AmmGovernance, 'ammGovernance'],
   [Table.AccountStates, 'accountStates'],
+  [Table.PathPayments, 'pathPayments'],
 ];
 
 const paymentParser = new PaymentParser();
+const pathPaymentParser = new PathPaymentParser();
 const exchangeParser = new ExchangeParser();
 const balanceChangesParser = new BalanceChangesParser();
 const accountsCreatedParser = new AccountsCreatedParser();
@@ -215,6 +221,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     accountAmmLiquidity: [],
     ammGovernance: [],
     accountStates: [],
+    pathPayments: [],
     diagnostics: { ammUnclassified: 0 },
   };
 
@@ -329,6 +336,28 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         { account: payment.source, direction: 'sent', counterparty: payment.destination, ...shared },
         { account: payment.destination, direction: 'received', counterparty: payment.source, ...shared },
       );
+    }
+
+    // Every successful Payment, a payment to oneself too (an arbitrage loop), which `paymentParser` leaves out.
+    const path = pathPaymentParser.parse(t, ctx);
+    if (path) {
+      rows.pathPayments.push({
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        source: path.source,
+        destination: path.destination,
+        delivered_amount: path.delivered_amount,
+        currency: path.currency,
+        issuer: path.issuer ?? '',
+        source_amount: path.source_amount,
+        source_currency: path.source_currency,
+        source_issuer: path.source_issuer ?? '',
+        offers_crossed: path.offers_crossed,
+        amm_pools: path.amm_pools,
+        rippled_through: path.rippled_through,
+      });
     }
 
     // Both parties see the exchange; a trade with oneself is one row for that account, not two.

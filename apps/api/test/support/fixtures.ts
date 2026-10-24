@@ -29,6 +29,8 @@ export const XRPL_RECORDED_DIR = join(FIXTURES, 'xrpl', 'recorded');
 export const XRPL_AMM_DIR = join(FIXTURES, 'xrpl', 'amm');
 /** Mainnet ledgers around changes of account flags and an AccountDelete: see the fixtures README. */
 export const XRPL_ACCOUNT_STATE_DIR = join(FIXTURES, 'xrpl', 'account-state');
+/** Mainnet ledgers recorded around path payments and the payments that are not ones: see the fixtures README. */
+export const XRPL_PATH_PAYMENTS_DIR = join(FIXTURES, 'xrpl', 'path-payments');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
 /** Xahau flag ledger 26570752: 22 UNLReport pseudo-transactions with `Account: ""`, and 15 Payments. */
 export const XAHAU_FLAG_DIR = join(FIXTURES, 'xahau', 'flag');
@@ -45,6 +47,7 @@ export type SeedName =
   | 'xrpl-amm'
   | 'ripple-mock+amm'
   | 'xrpl-account-state'
+  | 'xrpl-path-payments'
   | 'xahau-recorded'
   | 'xahau-flag';
 
@@ -54,6 +57,7 @@ const DIRS: Record<SeedName, string[]> = {
   'xrpl-amm': [XRPL_AMM_DIR],
   'ripple-mock+amm': [RIPPLE_MOCK_DIR, XRPL_AMM_DIR],
   'xrpl-account-state': [XRPL_ACCOUNT_STATE_DIR],
+  'xrpl-path-payments': [XRPL_PATH_PAYMENTS_DIR],
   'xahau-recorded': [XAHAU_RECORDED_DIR],
   'xahau-flag': [XAHAU_FLAG_DIR],
 };
@@ -77,6 +81,7 @@ export const SEED_NETWORK: Record<SeedName, NetworkName> = {
   'xrpl-amm': 'xrpl',
   'ripple-mock+amm': 'xrpl',
   'xrpl-account-state': 'xrpl',
+  'xrpl-path-payments': 'xrpl',
   'xahau-recorded': 'xahau',
   'xahau-flag': 'xahau',
 };
