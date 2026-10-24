@@ -162,6 +162,16 @@ export class ApiConfig {
   @ConfigValue()
   @IntValue({ min: 1 })
   namesAndLabelsReloadMs: number = 60000;
+
+  /**
+   * `GH_EXPORT_BUCKET`: the Google Cloud Storage bucket of the export files (spec #4, ticket #15), the same bucket as the
+   * exporter's; the files of a network are under `<network>/`. The api signs the download links with the application
+   * default credentials (`GOOGLE_APPLICATION_CREDENTIALS`). Empty, the default, turns exports off:
+   * `/v2/exports` answers 503 `exports are not available`.
+   */
+  @ConfigValue()
+  @MaybeEmptyText()
+  exportBucket: string = '';
 }
 
 /** The network profile of the app (`getNetworkProfile(cfg.network)`), provided by the CommonModule. */

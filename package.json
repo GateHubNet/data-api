@@ -18,6 +18,7 @@
     "ch:migrate:shared": "pnpm --filter @gatehub/data-api-shared ch:migrate shared",
     "start:api": "pnpm --filter @gatehub/data-api-service start:dev",
     "start:syncer": "pnpm --filter @gatehub/data-syncer start:dev",
+    "start:exporter": "pnpm --filter @gatehub/data-exporter start:dev",
     "docker:up": "docker compose up -d clickhouse",
     "docker:down": "docker compose down"
   },

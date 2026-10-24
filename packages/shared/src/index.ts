@@ -16,6 +16,7 @@ export * from './parsers/balance-changes.parser';
 export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
 export * from './parsers/parser.interface';
+export * from './parsers/path-payments.parser';
 export * from './parsers/payment.parser';
 
 // Network
@@ -27,6 +28,10 @@ export * from './validators';
 // Node connection
 export * from './xrpl/node-client';
 export * from './xrpl/node-throttle';
+
+// Exports (export jobs and the storage of their files)
+export * from './export/export-jobs';
+export * from './export/export-storage';
 
 // Nest helpers
 export * from './nest/shutdown-signals';

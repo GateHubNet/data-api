@@ -24,6 +24,7 @@ import {
   AmmPoolTouchesRow,
   BalanceChangesRow,
   ExchangesRow,
+  ExportJobsRow,
   FeeStatsRow,
   IngestLogRow,
   LedgerByHashRow,
@@ -33,6 +34,7 @@ import {
   NetworkStateRow,
   PairHourlyRow,
   PARSER_VERSION,
+  PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
   StatsHourlyRow,
@@ -76,6 +78,7 @@ export interface TableRows {
   [Table.AccountAmmLiquidity]: AccountAmmLiquidityRow;
   [Table.AmmGovernance]: AmmGovernanceRow;
   [Table.AccountStates]: AccountStatesRow;
+  [Table.PathPayments]: PathPaymentsRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -107,6 +110,7 @@ export interface TableRows {
   [Table.IngestLog]: IngestLogRow;
   [Table.AggDirty]: AggDirtyRow;
   [Table.SyncerLease]: SyncerLeaseRow;
+  [Table.ExportJobs]: ExportJobsRow;
 }
 
 const hash = (n: number): string => n.toString(16).toUpperCase().padStart(64, '0');
@@ -368,6 +372,24 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     owner_count: 2,
     fields: JSON.stringify({ Account: ALICE, Balance: '1234500000', Flags: 8_388_608, OwnerCount: 2, Sequence: 7 }),
     deleted: 0,
+  },
+  // a payment from Alice to Bob through the pool above and one offer
+  [Table.PathPayments]: {
+    ledger_index: LEDGER,
+    tx_index: 5,
+    tx_hash: hash(15),
+    close_time: CLOSE,
+    source: ALICE,
+    destination: BOB,
+    delivered_amount: '10.5',
+    currency: 'USD',
+    issuer: CAROL,
+    source_amount: '7.25',
+    source_currency: 'XRP',
+    source_issuer: '',
+    offers_crossed: 1,
+    amm_pools: [POOL],
+    rippled_through: [],
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
@@ -767,4 +789,18 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
   [Table.IngestLog]: { range_start: 100, range_end: 199, run_id: 'run-1', status: 'done', updated_at: CLOSE_MS },
   [Table.AggDirty]: { from_hour: 1_699_999_200, to_hour: 1_700_002_800, created_at: CLOSE_MS },
   [Table.SyncerLease]: { network: 'xrpl', holder: 'syncer-1', heartbeat: CLOSE_MS },
+  // created recently: the table drops a job 7 days after it was created
+  [Table.ExportJobs]: {
+    id: '0123456789abcdef0123456789abcdef',
+    seq: 2,
+    key_hash: 'ab'.repeat(32),
+    path: '/v2/accounts/rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH/transactions?start=2015-01-01&end=2015-02-01',
+    format: 'csv',
+    status: 'done',
+    created: TODAY_NOON + 0.125,
+    at: TODAY_NOON + 2.125,
+    rows: 179,
+    object: 'xrpl/0123456789abcdef0123456789abcdef.csv',
+    error: '',
+  },
 };

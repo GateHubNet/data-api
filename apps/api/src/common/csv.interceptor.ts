@@ -1,4 +1,11 @@
-import { CallHandler, ExecutionContext, NestInterceptor, UseInterceptors } from '@nestjs/common';
+import {
+  applyDecorators,
+  CallHandler,
+  ExecutionContext,
+  NestInterceptor,
+  SetMetadata,
+  UseInterceptors,
+} from '@nestjs/common';
 import { Request, Response } from 'express';
 import { convert } from 'nice-json2csv';
 import { map, Observable } from 'rxjs';
@@ -98,9 +105,18 @@ export class CsvInterceptor implements NestInterceptor {
 }
 
 /**
+ * Metadata key that `@Csv` sets (to `true`) on its route: a route with a CSV form is a list that can be exported
+ * (`POST /v2/exports`, ticket #15), with nothing else to declare.
+ */
+export const CSV_ROUTE = 'ripple:csv-route';
+
+/**
  * Lets a route answer `format=csv`: the array at `body[rowsKey]` becomes the CSV, downloaded as `<filename>.csv`.
- * Put it on the route next to `@RippleRoute`.
+ * Put it on the route next to `@RippleRoute`. It also makes the list exportable (`CSV_ROUTE`).
  */
 export function Csv(filename: CsvFilename, rowsKey: string): MethodDecorator {
-  return UseInterceptors(new CsvInterceptor(filename, rowsKey)) as MethodDecorator;
+  return applyDecorators(
+    SetMetadata(CSV_ROUTE, true),
+    UseInterceptors(new CsvInterceptor(filename, rowsKey)),
+  ) as MethodDecorator;
 }

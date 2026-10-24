@@ -39,9 +39,11 @@ import {
 } from './config/api.config';
 import { ExchangesModule } from './exchanges/exchanges.module';
 import { RatesModule } from './exchanges/rates.module';
+import { ExportsModule } from './exports/exports.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
+import { PathPaymentsModule } from './path-payments/path-payments.module';
 import { PaymentsModule } from './payments/payments.module';
 import { StatsModule } from './stats/stats.module';
 import { TransactionsModule } from './transactions/transactions.module';
@@ -80,6 +82,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   LedgersModule,
   TransactionsModule,
   PaymentsModule,
+  PathPaymentsModule,
   ExchangesModule,
   RatesModule,
   AccountsModule,
@@ -89,6 +92,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ValidatorsModule,
   StatsModule,
   AmmModule,
+  ExportsModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

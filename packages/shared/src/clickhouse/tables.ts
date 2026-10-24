@@ -24,6 +24,8 @@ export enum Table {
   AmmGovernance = 'amm_governance',
   // Account state history (migration 005): the state of an account root after each change, from parser version 3.
   AccountStates = 'account_states',
+  // Path payments (migration 007, written by ingest).
+  PathPayments = 'path_payments',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -62,6 +64,8 @@ export enum Table {
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
   SyncerLease = 'syncer_lease',
+  // Export jobs (migration 010): written by the api (queued) and the exporter (running, done, failed).
+  ExportJobs = 'export_jobs',
 }
 
 /**
