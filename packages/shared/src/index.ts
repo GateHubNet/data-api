@@ -17,6 +17,7 @@ export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
 export * from './parsers/parser.interface';
 export * from './parsers/payment.parser';
+export * from './parsers/trust-line-states.parser';
 
 // Network
 export * from './network';

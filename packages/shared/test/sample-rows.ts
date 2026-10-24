@@ -38,6 +38,7 @@ import {
   StatsHourlyRow,
   SyncerLeaseRow,
   TransactionsRow,
+  TrustLineStatesRow,
   TxByHashRow,
   TxByTypeRow,
   UnlListsRow,
@@ -76,6 +77,7 @@ export interface TableRows {
   [Table.AccountAmmLiquidity]: AccountAmmLiquidityRow;
   [Table.AmmGovernance]: AmmGovernanceRow;
   [Table.AccountStates]: AccountStatesRow;
+  [Table.TrustLineStates]: TrustLineStatesRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -367,6 +369,29 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     sequence: 7,
     owner_count: 2,
     fields: JSON.stringify({ Account: ALICE, Balance: '1234500000', Flags: 8_388_608, OwnerCount: 2, Sequence: 7 }),
+    deleted: 0,
+  },
+  [Table.TrustLineStates]: {
+    account: ALICE,
+    counterparty: BOB,
+    currency: 'USD',
+    ledger_index: LEDGER,
+    tx_index: 3,
+    node_index: 2,
+    tx_hash: hash(16),
+    close_time: CLOSE,
+    balance: '-12.5',
+    limit: '1000',
+    limit_peer: '0',
+    no_ripple: 1,
+    no_ripple_peer: 0,
+    authorized: 0,
+    peer_authorized: 1,
+    freeze: 0,
+    peer_freeze: 0,
+    quality_in: 1_000_000_000,
+    quality_out: 0,
+    flags: 3_211_264,
     deleted: 0,
   },
   [Table.FeeStats]: {
