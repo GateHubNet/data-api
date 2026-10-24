@@ -11,8 +11,8 @@ import { Table } from '../clickhouse/tables';
  * id is the job, and nothing is ever updated in place.
  */
 
-/** The formats an export can be made in. PDF (ticket #17) joins this list. */
-export const EXPORT_FORMATS = ['csv'] as const;
+/** The formats an export can be made in: the list's CSV, or a PDF document of it (ticket #17). */
+export const EXPORT_FORMATS = ['csv', 'pdf'] as const;
 export type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
 export type ExportStatus = ExportJobsRow['status'];
@@ -25,8 +25,7 @@ export const EXPORT_RETENTION_DAYS = 7;
 
 /**
  * The most rows an export of each format may hold (ticket #16): beyond, the api refuses it when it knows the count up
- * front, and the exporter fails it when the list turns out longer. A cap is set per format, PDF included before PDF
- * exports exist (ticket #17), so that the format's cap holds from its first export.
+ * front, and the exporter fails it when the list turns out longer.
  */
 export interface ExportRowCaps {
   csv: number;

@@ -194,8 +194,8 @@ Endpoints that exist here and not in the original: `GET /v2/exchanges` (the exch
 `/v2/accounts/{address}/amm_liquidity`, `/v2/accounts/{address}/amm_positions`, `/v2/network/amm_volume`), `GET /v2/network/amendments` and
 `GET /v2/network/amendments/{name}` (the original had no amendment routes), `GET /v2/network/validators/summary` and
 `GET /v2/network/validators/{key}/validations`, `format=csv` on `GET /v2/accounts/{address}/transactions` (a summary row per transaction,
-[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), and `GET /v2/path_payments` (the [path payments](#path-payments) of the
-network, spec #4). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 54), `GET /v2/path_payments` (the [path payments](#path-payments) of the
+network, spec #4) and `GET /v2/accounts/{address}/path_payments` (those of an account). `GET /v2/network/validators[/{key}]` exists in the original and is served differently here: a
 trusted-UNL scope, paging, a different order and row, agreement against the indexed chain (see
 [Validators and amendments](#validators-and-amendments), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) and [ADR-0012](adr/0012-validators-and-amendments-data.md)).
 `GET /v2/accounts/{address}` takes `flags=true` (with `date`, `ledger_index` or `ledger_hash`), which adds the account flags at a
@@ -212,7 +212,7 @@ fee estimates `fees_est` to the live day row of `GET /v2/network/amm_volume`, an
 From the account investigation data ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)): the fields of
 `GET /v2/accounts/{address}` `account_name`, the name the operator gave the address, `account_network_name`, the name the operator gave
 the account on this network only, and `account_labels`, the labels the operator put on the address; and [exports](#exports), `POST /v2/exports` and
-`GET /v2/exports/{id}` ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 71).
+`GET /v2/exports/{id}`, in CSV or PDF ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -493,6 +493,42 @@ In the CSV the columns are these keys; `amm_pools` and `rippled_through` are one
 Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
 `unable to retrieve path payments`.
 
+### `GET /v2/accounts/{address}/path_payments`
+
+The path payments the account sent or received (it is their `source` or their `destination`) in the ledgers that closed in the
+window, oldest first (by ledger and transaction). A payment to oneself is listed once. An account a payment only rippled through,
+a pool and the owner of an offer crossed are named in the row but do not list it. The address is not checked, as on the other lists
+under an account: one that is none has no path payments.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end`, `descending`, `limit` (200, max 1000), `marker` | | As on [`/v2/path_payments`](#get-v2path_payments). |
+| `format` | json | `csv`: file `<address> - path payments.csv`. |
+
+```json
+{
+  "result": "success",
+  "count": 2,
+  "path_payments": [
+    {
+      "hash": "E362675D…", "ledger_index": 11999941, "executed_time": "2015-03-01T11:13:10Z",
+      "source": "rLD5…", "destination": "rGhs…",
+      "delivered_amount": "1", "currency": "USD", "issuer": "rMwj…",
+      "source_amount": "1.002", "source_currency": "USD", "source_issuer": "rvYAf…",
+      "offers_crossed": 0, "amm_pools": [], "rippled_through": ["rP7J…"]
+    },
+    "…"
+  ]
+}
+```
+
+The rows, their key order and the CSV columns are those of [`/v2/path_payments`](#get-v2path_payments). The list is read from the
+account's index of path payments (`account_path_payments`), written with them from parser version 4 on
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 67).
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid marker`; 500
+`unable to retrieve path payments`.
+
 ---
 
 ## Exchanges
@@ -695,7 +731,8 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
 (`/balances`, `/orders`): an address that does not exist simply has no rows. All account lists take the common window
-parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`.
+parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
+described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments).
 
 ### `GET /v2/accounts`
 
@@ -3106,8 +3143,8 @@ Asks for an export. The body is JSON:
 
 | Field | Meaning |
 | --- | --- |
-| `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list, as CSV. |
-| `format` | `csv`. |
+| `path` | The list, as its own `GET` would name it: `/v2/…` with its parameters (`/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01&type=Payment`). `format`, `limit` and `marker` in it make no difference: the export is the whole list. |
+| `format` | `csv` or `pdf` (see [PDF](#pdf)). |
 
 A **list over time** (a route that takes `start` and `end`) must name both. A list at a point in time (`/balances`, `/orders`)
 may name a ledger the way the route takes it, and a list with no window (`/v2/network/validators`) names none. The other
@@ -3153,18 +3190,54 @@ list did not answer a CSV`, `the list's CSV could not be read`, `the list could 
 than 60 s`, `the list has more than 1000000 rows, the most a CSV export holds: narrow the window` (the row cap, with the PDF
 wording for a PDF), `the file could not be stored`, or `the exporter stopped while it made this export: ask for it again`.
 
-`url` downloads the file for **15 minutes**; each request makes a new one. The file is the CSV the list's route would give for
+`url` downloads the file for **15 minutes**; each request makes a new one. A `csv` file is the CSV the list's route would give for
 the whole list in one page: one header, the columns of every row in the order they first appear, a missing cell empty; an
-empty list is an empty file. It downloads under the list's own file name (`<address> - transactions.csv`). An export and its
+empty list is an empty file. It downloads under the list's own file name (`<address> - transactions.csv`). A `pdf` file is a document of the same rows
+([PDF](#pdf)). An export and its
 file are kept **7 days** after it was asked for; then the id is not found.
 
 Errors: 503 `exports are not available`; 404 `export not found` (an id that does not exist, or the export of another API
 key: the two are not told apart); 500 `unable to retrieve the export`.
 
-Exports run one at a time per network, in the order they were asked for. PDF is not there yet (ticket #17).
+Exports run one at a time per network, in the order they were asked for.
+
+#### PDF
+
+A `pdf` export is a document of the same list, laid out for paper: landscape A4, rendered by the exporter with `pdfkit`. It
+downloads as `application/pdf` under the list's own file name with `.pdf` (`<address> - transactions.pdf`). It starts with a
+header, one line each:
+
+- the list's file name (`<address> - transactions`) as the title;
+- for an account's list (`/v2/accounts/{address}/…`): `Address:`, and the `Account name:`, `Account network name:` and one
+  `Label <label>: <description> (<source>, <url>)` per label that [`/v2/accounts/{address}`](#get-v2accountsaddress) serves for
+  it, read through the api like the rows (an address without an activation on the network has none);
+- `Network:` (`XRP Ledger` or `Xahau`), `List:` (the `path` as asked);
+- `Window: <start> to <end>` (`, newest first` with `descending=true`), or for a list at a point in time `At:` the ledger or date
+  it names;
+- `Ledgers: <lowest> to <highest>`: the ledgers of its rows (`ledger_index`); `none (no rows)`, or `not given by the list` for a
+  list whose rows have no ledger;
+- `Rows:` and `Made:` (the time, UTC, to the second).
+
+Then a table of the columns chosen for the list, the CSV's column names with spaces for `_`, repeated at the top of every page;
+a value too wide for its column wraps (a transaction hash takes two lines). The CSV keeps every column. The chosen columns:
+
+| List | Columns |
+| --- | --- |
+| `/v2/accounts/{address}/transactions` | `ledger_index, executed_time, tx_type, result, counterparty, amount, currency, issuer, fee, flags_changed, hash` |
+| `/v2/payments[/{currency}]`, `/v2/accounts/{address}/payments` | `executed_time, ledger_index, source, destination, destination_tag, delivered_amount, currency, issuer, tx_hash` |
+| `/v2/accounts/{address}/exchanges[/{base}[/{counter}]]` | `executed_time, ledger_index, base_amount, base_currency, base_issuer, counter_amount, counter_currency, counter_issuer, rate, buyer, seller, tx_hash` |
+| `/v2/accounts/{address}/balance_changes` | `executed_time, ledger_index, change_type, currency, counterparty, amount_change, final_balance, tx_hash` |
+| `/v2/accounts/{address}/balances` | `currency, counterparty, value` |
+| `/v2/accounts` | `inception, ledger_index, account, parent, initial_balance, tx_hash` |
+| `/v2/path_payments`, `/v2/accounts/{address}/path_payments` | `executed_time, ledger_index, source, destination, delivered_amount, currency, issuer, source_amount, source_currency, offers_crossed, hash` |
+| any other list | its first 8 columns, of equal width |
+
+Every page ends with `Page n of m`. An empty list makes a one-page document whose table says `The list has no rows.` The
+standard PDF fonts write Latin-1 only: any other character (in a name or a currency, say) is written `?`; the CSV has it as it
+is. Opening and closing balances are not in the document.
 
 **Differences from data.ripple.com**: the original has no exports; these routes are new
-([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 71).
+([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
 
 ---
 

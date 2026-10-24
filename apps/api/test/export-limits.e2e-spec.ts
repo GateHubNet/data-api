@@ -1,4 +1,4 @@
-import { EXPORT_FORMATS, MemoryExportStorage } from '@gatehub/data-api-shared';
+import { MemoryExportStorage } from '@gatehub/data-api-shared';
 import { ExportWorker } from '../../exporter/src/export-worker';
 import { Harness, NO_RATE_LIMIT, startHarness, TEST_API_KEY } from './harness';
 
@@ -25,11 +25,6 @@ const transactions = (address: string, query: string) => `/v2/accounts/${address
 const WINDOW = 'start=2013-01-01&end=2018-01-01';
 /** A list of one row. */
 const SHORT = transactions(BUSY, 'start=2015-02-01&end=2015-03-01');
-/**
- * PDF exports come with ticket #17; until the api takes the format, the tests of its cap wait for it. The cap does not
- * depend on the rendering: it is checked when the export is asked for and while the list is walked.
- */
-const withPdf = (EXPORT_FORMATS as readonly string[]).includes('pdf') ? it : it.skip;
 const payments = (address: string) => `/v2/accounts/${address}/payments?${WINDOW}`;
 /** The caps of this harness, for the api and its exporter alike. */
 const CSV_CAP = 23;
@@ -188,7 +183,7 @@ describe('export limits', () => {
       ]);
     });
 
-    withPdf('refuses up front an export in PDF above its cap, and says to narrow the window or use CSV', async () => {
+    it('refuses up front an export in PDF above its cap, and says to narrow the window or use CSV', async () => {
       const path = transactions(MIXED, `${WINDOW}&type=OfferCreate`);
       expect(await rowsOf(path)).toBeGreaterThan(PDF_CAP);
       const res = await post({ path, format: 'pdf' });
@@ -201,7 +196,7 @@ describe('export limits', () => {
       ]);
     });
 
-    withPdf('fails an export in PDF whose list turns out longer than its cap, and says to use CSV', async () => {
+    it('fails an export in PDF whose list turns out longer than its cap, and says to use CSV', async () => {
       const path = payments(PAYING[2]);
       expect(await rowsOf(path)).toBeGreaterThan(PDF_CAP);
       const job = await made(path, 'pdf');

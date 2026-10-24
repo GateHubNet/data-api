@@ -1,4 +1,4 @@
-import { exportKeyHash } from '@gatehub/data-api-shared';
+import { EXPORT_FORMATS, exportKeyHash } from '@gatehub/data-api-shared';
 import { Body, Get, Header, HttpCode, Param, Post, Req } from '@nestjs/common';
 import { ApiBody, ApiOperation, ApiParam } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is
@@ -24,7 +24,7 @@ export class ExportsController {
   @ApiOperation({
     summary: 'Ask for an export of a list',
     description:
-      'Queues an export of the list at `path` (any route with a CSV form, with its parameters) in `format` (`csv`). ' +
+      "Queues an export of the list at `path` (any route with a CSV form, with its parameters) in `format` (`csv`, or `pdf`: a landscape A4 document with a header and the list's chosen columns). " +
       'A list over time must name `start` and `end`. The exporter of the network makes the file in the background; ' +
       '`GET /v2/exports/{id}` reports it.',
   })
@@ -34,7 +34,7 @@ export class ExportsController {
       required: ['path', 'format'],
       properties: {
         path: { type: 'string', example: '/v2/accounts/r…/transactions?start=2024-01-01&end=2024-07-01' },
-        format: { type: 'string', enum: ['csv'] },
+        format: { type: 'string', enum: [...EXPORT_FORMATS] },
       },
     },
   })
