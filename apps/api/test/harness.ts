@@ -47,6 +47,7 @@ export interface HarnessOptions {
    *  - `xrpl-recorded`: XRPL mainnet ledgers recorded from a public node (`xrpl`);
    *  - `xrpl-amm`: the recorded ledgers around AMM transactions, swaps against pools among them (`xrpl`);
    *  - `ripple-mock+amm`: the mock ledgers and the AMM ledgers together (`xrpl`);
+   *  - `xrpl-path-payments`: the recorded ledgers around path payments of each kind and the payments that are not (`xrpl`);
    *  - `xahau-recorded`: the Xahau mainnet ledgers recorded from a public node (`xahau`);
    *  - `none` (default): an empty database.
    */

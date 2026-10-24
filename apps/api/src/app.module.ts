@@ -37,6 +37,7 @@ import { RatesModule } from './exchanges/rates.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
+import { PathPaymentsModule } from './path-payments/path-payments.module';
 import { PaymentsModule } from './payments/payments.module';
 import { StatsModule } from './stats/stats.module';
 import { TransactionsModule } from './transactions/transactions.module';
@@ -70,6 +71,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   LedgersModule,
   TransactionsModule,
   PaymentsModule,
+  PathPaymentsModule,
   ExchangesModule,
   RatesModule,
   AccountsModule,
