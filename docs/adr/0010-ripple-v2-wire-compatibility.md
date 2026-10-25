@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72).
+**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72). Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -199,7 +199,7 @@ own crawler (`api/routes/network/getValidators.js`, `topology.js`); this API ser
     order).
 43. **Row.** The original's row was `{validation_public_key, domain, chain, current_index, agreement_1h, agreement_24h, partial, unl}`. Here the same keys in the same order,
     without `chain` (one network per deployment), then the new ones. The agreement objects keep `{missed, total, score, incomplete}` and add `partial`; `agreement_30d` is new.
-44. **`unl`** was "on Ripple's main or altnet list". Here it is "on the trusted UNL of the configured publishers" (`GH_UNL_PUBLISHERS`), and `unl_lists` names the lists.
+44. **`unl`** was "on Ripple's main or altnet list". Here it is "on the trusted UNL of the configured publishers" (`GH_UNL_PUBLISHERS`), and `unl_lists` names the lists. `unl_lists` may name `local`, the fixed list of `GH_UNL_VALIDATORS`.
 45. **`domain`** came from the original's own domain check. Here it is the domain of the validator's manifest, and `domain_verification` says whether the validator's
     `/.well-known/xrp-ledger.toml` (Xahau: `xahau.toml`) confirms it.
 46. **Agreement** was counted against the ledgers the original's chain logic saw. Here it is counted against the indexed validated chain, over full validations only,

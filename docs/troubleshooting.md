@@ -185,8 +185,10 @@ hold or one the state history does not cover (see [backfill](backfill.md#account
 state at that ledger or one deleted at or before it.
 
 ### Syncer: `Node network_id N does not match GH_NETWORK=...`
-The endpoint belongs to another network (an XRPL node for a Xahau syncer, or the reverse). Fix `GH_NODE_ENDPOINTS` / `XRPL_NODE_ENDPOINTS` /
-`XAHAU_NODE_ENDPOINTS`.
+The endpoint belongs to another network: an XRPL node for a Xahau syncer or the reverse, a mainnet node for a testnet process (a mainnet rippled reports
+no `network_id`, which only `xrpl` accepts), or a testnet node for a mainnet one (`GH_NETWORK=xahau` refuses Xahau Testnet's node, `network_id` 21338). Each network
+accepts exactly its own ids ([syncer](syncer.md)). Fix `GH_NODE_ENDPOINTS` / `XRPL_NODE_ENDPOINTS` / `XAHAU_NODE_ENDPOINTS`, and for a sandbox leave them blank
+(the testnets' defaults) or give testnet nodes only.
 
 ### `rate limit: units quota ... exhausted, retry in ~<N>ms` / `It rate limits this client`
 A public node throttles this process. The node client pauses that endpoint for the time it named (logged once, counted in

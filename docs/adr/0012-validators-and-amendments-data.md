@@ -1,6 +1,9 @@
 # ADR-0012: Validators and amendments data
 
-**Status:** Accepted (2026-10-19). Design: [validators and amendments](../superpowers/specs/2026-10-19-validators-amendments-design.md).
+**Status:** Accepted (2026-10-19). Design: [validators and amendments](../superpowers/specs/2026-10-19-validators-amendments-design.md). Amended (2026-10-24): the
+testnets, in [the section at the end of this record](#amendment-2026-10-24-the-testnets) (the fixed validator list `local`, `retired` on XRPL, the family file on a testnet).
+Design: [testnet profiles](../superpowers/specs/2026-10-24-testnet-profiles-design.md); the "plan rulings" below are those of
+[its plan](../superpowers/plans/2026-10-24-testnet-profiles.md).
 
 ## Context
 The explorer's Validators and Amendments boards need, per network, every validator (domain, UNL membership, software version, agreement,
@@ -108,3 +111,101 @@ read).
   [deployment](../deployment.md#rolling-out-the-validators-and-amendments-data)).
 - The explorer's agreement differs from the validator history service's (full validations only, observed ledgers only), and the routes
   `/manifests`, `/reports`, `/validator_reports` and `/rippled_versions` of the original stay 404.
+
+## Amendment (2026-10-24): the testnets
+
+[ADR-0009](0009-one-deployment-per-network.md#amendment-2026-10-24-testnets) adds XRPL Testnet and Xahau Testnet as networks of their own. The validators and amendments
+data follow the profile of the network, with three additions: a validator list that is configuration, not a publisher's; `retired` on XRPL; and one metadata file per
+protocol family. They add no migration and no parser version.
+
+### Decision
+- **XRPL Testnet has one list publisher**, `https://vl.altnet.rippletest.net`, with the key
+  `ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860` (the profile's `defaultUnlPublishers`). The `validators` worker fetches, verifies and
+  stores its list as it does Ripple's. The recorded list (2026-10-25) is a version 1 list with one blob, sequence 59 and 6 validators.
+- **Xahau Testnet has no publisher, and trusts a fixed list.** Its nodes trust the four master keys of the `[validators]` section of their configuration, with no
+  `[validator_list_sites]`. The keys are the profile's `defaultUnlValidators`, and the profile's comment names where they come from: `store/etc/validators-xahau.txt` of
+  `Xahau/Xahau-Testnet-Docker`, last changed in commit `01ed74b5ebf34b27c8d5635b6d03972cc23346da` (2024-10-25) and unchanged at `87eeb5db5f81f0d0b526f6365e2aede14cd2559d`
+  (2025-12-18, the head when it was read):
+
+  ```
+  nHBoJCE3wPgkTcrNPMHyTJFQ2t77EyCAqcBRspFCpL6JhwCm94VZ
+  nHUVv4g47bFMySAZFUKVaXUYEmfiUExSoY4FzwXULNwJRzju4XnQ
+  nHBvr8avSFTz4TFxZvvi4rEJZZtyqE3J6KAAcVWVtifsE7edPM7q
+  nHUH3Z8TRU57zetHbEPr1ynyrJhxQCwrJvNjr4j1SMjYADyW1WWe
+  ```
+
+  Without a trusted set no Xahau Testnet validator would be on the UNL, and the amendment tallies and the validators pages of the sandbox would say nothing.
+- **`GH_UNL_VALIDATORS`** (syncer; comma separated validator master keys in base58, `n…`) holds such a list. Unset or `default` is the network's `defaultUnlValidators`
+  (the four keys on Xahau Testnet, none elsewhere); empty is none. Each entry is trimmed, must decode as a node public key and may not repeat; a bad entry fails the
+  boot with `GH_UNL_VALIDATORS entry <n>: must be a validator public key (n…)` or `GH_UNL_VALIDATORS entry <n>: repeats a key`. An entry in the `ED…` hex form is refused.
+  `GH_UNL_PUBLISHERS` gains the same spelling, `default` (trimmed, any case): the network's default publishers, as unset; empty still means no lists. A publisher URL whose id
+  is `local` is refused (`GH_UNL_PUBLISHERS entry <n>: the id "local" is reserved`).
+- **The fixed list is stored as the list of the publisher `local`**, so that the tally, the agreement, the directory and the API read it with no branch of their own.
+  At start the fetcher writes a `unl_publishers` row for `local` (no URL, no key, `configured` 1, the threshold in force, `status` `ok`) and a `unl_lists` row when the newest
+  stored `local` list differs from the configured keys, sorted, or none is stored: the next sequence (1 when none), `version` 1, `publisher_key` `''`, `effective` the time of
+  writing, `expiration` 4294967295 (2106-02-07T06:28:15Z, the `DateTime` maximum: a fixed list does not expire), the keys sorted, and as `blob_sha256` the upper-case hex SHA-256 of
+  the sorted keys joined by newlines (as a publisher's blob hash is written). A restart with the same keys writes nothing, so the history of the list stays what it was and
+  a round or an hour of the past reads the list that was in force; changed keys write sequence + 1; an emptied list marks a stored `local` `configured` 0. `local` is never
+  fetched: no timer, no metric of a fetch. The domain checker adds the fixed list's keys to the masters it checks, so a fixed-list validator no list has shown is checked as the
+  directory shows it.
+- **The threshold counts the lists.** `GH_UNL_THRESHOLD` counts lists that must name a validator: the publishers, plus one when the fixed list is not empty (rippled counts its
+  local list the same way). `0` is rippled's rule over that count (1 below three lists), and the boot bound is the number of lists (`GH_UNL_THRESHOLD must be between 0 and the
+  number of lists (<n>)`): XRPL 2, Xahau 1, XRPL Testnet 1, Xahau Testnet 1 by default, so a validator on the fixed list alone is trusted at threshold 1.
+- **The API shows `local`.** `/v2/network/validators/summary` lists `local` among `unl.publishers` in the directory's order (by id), with empty `url` and `public_key` and no
+  `expiration`; a validator on the fixed list has `unl: true` and `unl_lists: ["local"]` in `/v2/network/validators` and `/v2/network/validators/{key}`. On Xahau Testnet the
+  summary says `trusted` 4, `threshold` 1 ([api-reference](../api-reference.md#get-v2networkvalidatorssummary)). [ADR-0010](0010-ripple-v2-wire-compatibility.md) item 44 gains
+  the sentence about `local`.
+- **The amendment metadata is a hand-kept file per family**, not per network: `packages/shared/config/amendments/xrpl.json` and `xahau.json`. A testnet reads its family's file
+  (`loadAmendmentsConfig` reads `config/amendments/<family>.json`) and drops its `enabled` entries, which are mainnet's ledgers and dates, keeping the names, versions, XLS links,
+  descriptions, `obsolete` and `retired`. The file's `network` may be the profile's name or its family (`"xrpl"` for `xrpl-testnet`); anything else is refused as before
+  (`"xahau" is not the network of this deployment, "xrpl-testnet"`); the `enabled` entries are kept only when `network` is the profile's own name, so an operator can give a
+  testnet a file of its own (`GH_AMENDMENTS_CONFIG`, `"network": "xrpl-testnet"`). `AmendmentsConfig.network` is the profile's name, so the caches and gauges are unchanged. On a
+  testnet an amendment's `enabled` comes from the indexed `EnableAmendment` (`source: "ledger"`) or is absent: it is still `enabled` (it is in the ledger's `Amendments`), with no ledger
+  or date, and no testnet answer says `source: "metadata"`.
+- **`retired` is valid on XRPL.** rippled's `features.macro` marks 15 amendments `XRPL_RETIRE`: `MultiSign`, `TrustSetAuth`, `FeeEscalation`, `PayChan`, `CryptoConditions`,
+  `TickSize`, `fix1368`, `Escrow`, `fix1373`, `EnforceInvariants`, `SortedDirectories`, `fix1201`, `fix1512`, `fix1523` and `fix1528`. Their code is unconditional, and a ledger begun
+  after their retirement never lists them: XRPL Testnet's `Amendments` object lacks exactly these 15 of mainnet's (checked 2026-10-24), so without the mark they would read
+  `voting` there. The loader's rule that `retired` is for Xahau only is gone (the `introduced` patterns stay by software), and `xrpl.json` marks the 15 `"retired": true`, keeping their
+  `enabled`. `amendmentStatus` already read `inLedger || retired` as enabled and shows a retired amendment's `enabled` only when the ledger has it, so no mainnet status changes; XRPL
+  Testnet shows the 15 as `enabled` without a date.
+- **`amendments:check --network xrpl-testnet|xahau-testnet`** checks the family file against the testnet's node, with the testnet's default endpoint. With the `enabled` entries dropped, its
+  third list (enabled ledgers that differ from the indexed `EnableAmendment`) is always empty on a testnet.
+- **The majority hold of each testnet is its profile's `majorityHoldSeconds`**, which feeds `expected_activation`. Neither network publishes it, and the values were checked when the profiles were built:
+
+  | | Value | Where it came from |
+  | --- | --- | --- |
+  | XRPL Testnet | 1,800 s (30 minutes), **inferred** | Not the 14 days of mainnet. Seven amendments whose got-majority (`tfGotMajority`, flags 65536) and enabling `EnableAmendment` pseudo-transactions were read on `clio.altnet.rippletest.net` on 2026-10-24, by walking the `Amendments` object back through `PreviousTxnID` (the newest ones, back to ledger 14635521), were each enabled exactly 768 ledgers (three flag intervals, 39 to 43 minutes) after gaining a majority. The hold is tested at each flag ledger, which bounds it to 1711 s < hold <= 2359 s over the seven; 30 minutes is the round value in that range. An example: `0F48FF56…540B` gained its majority in ledger 21394177 (tx `F7077524E6D29D05EB8CAAA24B6B2F2623911D52D9D92F6C21088F914D404B63`) and was enabled in ledger 21394945 (tx `7A730EDFD2E4E248B1E0F0D30928172381E200D9BA543502B21F075CA1FD30E3`). The setting is not published: the owner may want to confirm it with Ripple. |
+  | Xahau Testnet | 432,000 s (5 days), the software default, **not verified on the chain** | `Xahau/Xahau-Testnet-Docker@87eeb5db…` sets no `[amendment_majority_time]` (`store/etc/xahaud.cfg`, commit `1dd22588ce2dd8826488e6da1b65e304776a95a1`), so xahaud's `defaultAmendmentMajorityTime`, `days{5}` in `include/xrpl/protocol/SystemParameters.h` of `Xahau/xahaud@5c05e107c0211dcedb7adcf73dab1f6012747fe7`, applies. No pair could be read: `xahau-test.net` holds about 5.7 days of ledgers, and its `Amendments` object last changed in ledger 13236737, before them. The real testnet's validators may configure otherwise. |
+
+  The design assumed 14 days and 5 days "as on mainnet, to verify"; the first was wrong. The majority hold of XRPL mainnet (1,209,600 s) and Xahau (432,000 s) are unchanged.
+- **Names the testnets have that mainnet lacks** (2026-10-24, `Amendments` of each validated ledger). XRPL Testnet: nothing (82 enabled, all on mainnet). Xahau Testnet: 14, of which
+  13 were already named in `xahau.json` (`AMMClawback`, `EscrowDestinationCancel`, `HookAPISerializedType240`, `HookOnV2`, `HookOnV2_1`, `HooksUpdate2`, `NamedHooks`, `OnChainManifests`,
+  `PWALoader`, `RNG`, `fixEnforceNFTokenTrustline`, `fixNFTokenPageLinks`, `fixNFTokenReserve`) and one, `AB6612F1B9C2EAB6F687512297D9960B13B869EFF97E77D85A0574DFF97FD1EE`, was
+  not. It is `fixXahauTestnetGenesis` (`amendmentId` of the name is that ID, and the node's `feature` names it), from `XRPL_FIX (XahauTestnetGenesis, …)` in `features.macro` of the
+  `testnet` and `tmp-dev` branches of `Xahau/xahaud` (commit `f70eaba37`, "testnet genesis fix", 2026-10-16; "Xahau testnet (NetworkID 21338) only"). It is **not on `dev`**, because the
+  testnet runs a build of its own (`2026.10.16-tmp-dev`), and no release carries it, so its entry has no `introduced`.
+
+### Decisions made while building it
+- **Mainnet's answers do change, by one additive key.** The design said the `retired` marks change no mainnet answer; they add `"retired": true` to the 15 rows of XRPL's
+  amendments (`amendment-status.ts` sets it whether or not the ledger lists the ID, and `amendment-object.ts` emits it). Statuses, `enabled` objects and every other key are as before.
+  Nothing to reprocess.
+- **The threshold's bound is the number of lists** (plan ruling 7), not of publishers: Xahau Testnet has 0 publishers and 1 list.
+- **The domain checker counts the fixed list** (plan ruling 8): its own loop takes the masters of the lists in use of the URL publishers, matched by key, which `local`'s `''` never matches;
+  it adds the fixed list's keys.
+- **Trust at threshold 1 is tested where it is decided** (plan ruling 11): `stored-lists.spec.ts`, over the `ListContext` that now includes `local`, not `tally.spec.ts` and
+  `agreement.spec.ts`, which receive the trusted UNL as a set.
+- **The local list's hash is upper-case hex** (plan ruling 12), as a publisher's `blob_sha256` is.
+
+### Consequences
+**Positive**
+- Xahau Testnet's validators, tallies and agreement work like any network's, with nothing but configuration; the tally, the agreement and the directory read `local` with no branch of their own.
+- The history of the fixed list is kept: a past round reads the list that was in force.
+- One file of names and descriptions per protocol; a testnet's enablement comes from its own ledger.
+
+**Negative / trade-offs**
+- The fixed list is configuration. If Xahau Testnet's operators change their `[validators]`, the profile's default or `GH_UNL_VALIDATORS` has to follow by hand, and the comment of the
+  profile names the file to compare.
+- The testnets' majority holds are an inference (XRPL Testnet) and a software default (Xahau Testnet); a wrong one shows `expected_activation` too early or too late, never a status.
+- Mainnet's XRPL rows gain a `retired` key, and the family file is shared: a name that only one network of the family has, such as `fixXahauTestnetGenesis`, is a row on the other too, as
+  every name of the file is (`voting`, or `obsolete` when the node reports it unsupported and no validator votes for it). On Xahau mainnet's board that is `fixXahauTestnetGenesis`.
+- An unnamed ID on a testnet is `unknown` until the file names it, as on mainnet; `amendments:check --network <testnet>` after a new build of a testnet's node finds the names to add ([operations](../operations.md#keep-the-amendment-metadata-current)).

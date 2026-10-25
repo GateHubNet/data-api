@@ -26,9 +26,10 @@ truth are
   (`cp apps/api/.env.example apps/api/.env`). In containers the variables come from the environment: the images set
   `NODE_ENV=production` and `GH_ENV=container`, and any non-empty `GH_ENV` skips the file. The `.env` files are git-ignored;
   only the `.env.example` files are committed.
-- **One network per process.** `GH_NETWORK` selects the node URLs, the native currency (`XRP` / `XAH`), the CTID network id (0 /
-  21337 / 1 / 21338), the markets config and the default ClickHouse database (all in the *network profile*). Run one API and one syncer per
-  network; a node whose `network_id` does not match refuses the boot.
+- **One network per process.** `GH_NETWORK` selects the node URLs, the native currency (`XRP` on the XRP Ledger and XRPL Testnet, `XAH`
+  on Xahau and Xahau Testnet), the CTID network id (0, 21337, 1 and 21338 for `xrpl`, `xahau`, `xrpl-testnet` and `xahau-testnet`), the
+  markets config and the default ClickHouse database (all in the *network profile*). Run one API and one syncer per network; a node
+  whose `network_id` is not the one its profile accepts refuses the boot.
 
 ## 2. Variables of both services
 
@@ -189,7 +190,7 @@ The dev compose ([development](development.md)) takes `GH_CLICKHOUSE_USER`, `GH_
 
 Treat these as secrets and inject them from a secrets manager (or the environment of the deployment tool), never commit them:
 `GH_API_KEYS`, `GH_RATE_LIMIT_KEYS` (it holds API keys), `GH_EXPORTER_API_KEY` (`EXPORTER_API_KEY`), the service account key file of
-`GOOGLE_APPLICATION_CREDENTIALS`, `GH_CLICKHOUSE_PASSWORD`, node endpoints that carry credentials, and `NPM_TOKEN`. The `.env.example` and `deploy/.env.prod.example` files hold placeholders only (`change-me-...`); the API refuses to
+`GOOGLE_APPLICATION_CREDENTIALS`, `GH_CLICKHOUSE_PASSWORD`, node endpoints that carry credentials, and `NPM_TOKEN`. The `.env.example`, `deploy/.env.prod.example` and `deploy/.env.sandbox.example` files hold placeholders only (`change-me-...`); the API refuses to
 start in production with a placeholder key, but there is no such guard for `GH_CLICKHOUSE_PASSWORD`. Rotation steps are in
 [operations](operations.md#routine-tasks).
 

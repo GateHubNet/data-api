@@ -1,7 +1,7 @@
 # GateHub Data API
 
 A drop-in replacement for the **Ripple Data API v2** (`data.ripple.com`, the `rippled-historical-database` project) for the **XRP Ledger**
-and for **Xahau**. It indexes a network's validated ledgers into ClickHouse (the *syncer*) and serves the Ripple v2 endpoints over REST
+and for **Xahau**, and for the testnet of each. It indexes a network's validated ledgers into ClickHouse (the *syncer*) and serves the Ripple v2 endpoints over REST
 (the *api*): ledgers, transactions, payments, exchanges and candles, rates, accounts (history, balances, orders, reports, stats), active
 accounts, network fees, volumes and markets, validations, validators and amendments, and stats. Paths, parameters, defaults, error messages and the shape and key order of the
 answers match what `data.ripple.com` served, so a client of the original works by changing its host and sending an API key. The deliberate
@@ -9,8 +9,17 @@ differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.
 XRP Ledger (pools and their history, swaps, liquidity events, votes and bids, LP positions, AMM volume): swaps against pools are exchanges
 ([ADR-0011](docs/adr/0011-amm-data-and-swaps-as-exchanges.md)).
 
-One deployment serves one network; the same images run both. The API answers the same `/v2/...` paths on `xrpl.data.<domain>` (native
-currency `XRP`) and `xahau.data.<domain>` (`XAH`).
+One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
+
+| Network | `GH_NETWORK` | Host | Native currency |
+| --- | --- | --- | --- |
+| XRP Ledger | `xrpl` | `xrpl.data.gatehub.net` (production) | `XRP` |
+| Xahau | `xahau` | `xahau.data.gatehub.net` (production) | `XAH` |
+| XRPL Testnet | `xrpl-testnet` | `xrpl.data.sandbox.gatehub.net` (sandbox) | `XRP` |
+| Xahau Testnet | `xahau-testnet` | `xahau.data.sandbox.gatehub.net` (sandbox) | `XAH` |
+
+The hosts are `xrpl.data.<domain>` and `xahau.data.<domain>` of the deployment. The sandbox is the production compose file on a host of
+its own, with `deploy/.env.sandbox` ([Environments](docs/deployment.md#environments)).
 
 This is a **pnpm workspace** with two services, an exporter and a shared library:
 
@@ -22,11 +31,11 @@ data-api-new/
 │   └── exporter/   @gatehub/data-exporter    — makes the export files (POST /v2/exports) by walking the api's lists; GCS
 ├── packages/
 │   └── shared/     @gatehub/data-api-shared  — parsers, ledger writer, ClickHouse client + schema, node client, network profiles
-├── deploy/         nginx template, ClickHouse/Keeper config, .env.prod.example
+├── deploy/         nginx template, ClickHouse/Keeper config, .env.prod.example, .env.sandbox.example
 ├── docs/           architecture, API reference, data model, operations, ADRs, OpenAPI
 ├── load/           k6 load test + synthetic seeder
 ├── docker-compose.yaml        local development stack (one ClickHouse, per-network profiles)
-└── docker-compose.prod.yaml   production-shaped stack (Keeper, ClickHouse, per-network migrate/syncer/api, nginx)
+└── docker-compose.prod.yaml   production-shaped stack (Keeper, ClickHouse, per-network migrate/syncer/api, nginx); the sandbox too
 ```
 
 ## Quickstart (local)
@@ -50,8 +59,8 @@ pnpm start:api                             # serves /v2/* on :3001, Swagger at /
 curl -s localhost:3001/v2/ledgers
 ```
 
-**Per network.** Everything is per network: `GH_NETWORK=xrpl|xahau` picks the node URLs, the native currency, the markets config and the
-default database. For Xahau run a second pair with `GH_NETWORK=xahau` (and its own ports): `GH_NETWORK=xahau pnpm ch:migrate`, then
+**Per network.** Everything is per network: `GH_NETWORK=xrpl|xahau|xrpl-testnet|xahau-testnet` picks the node URLs, the native currency, the markets
+config and the default database (`xrpl`, `xahau`, `xrpl_testnet`, `xahau_testnet`). For Xahau run a second pair with `GH_NETWORK=xahau` (and its own ports): `GH_NETWORK=xahau pnpm ch:migrate`, then
 start its syncer and api the same way. Or run both networks in containers:
 
 ```bash
@@ -79,7 +88,7 @@ On the XRP Ledger the AMM data (pools, swaps as exchanges, liquidity) needs the 
 pnpm build                                  # shared, then both apps
 pnpm test                                   # unit tests of every package
 pnpm --filter @gatehub/data-api-shared test:e2e    # e2e suites: need Docker (testcontainers starts a real ClickHouse)
-pnpm --filter @gatehub/data-api-service test:e2e   # per-endpoint contract tests, both networks
+pnpm --filter @gatehub/data-api-service test:e2e   # per-endpoint contract tests, on each network
 pnpm --filter @gatehub/data-syncer test:e2e        # recovery, workers, range ingest
 ```
 
@@ -139,6 +148,15 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --s
 Moving an existing host from the previous single-network stack: add `--remove-orphans` (the old `migrate` / `syncer` / `api` containers are orphans,
 and a still-running old syncer holds the writer lease), update `deploy/.env.prod` to the new format and recreate old local ClickHouse volumes with
 `docker compose down -v` ([docs/deployment.md](docs/deployment.md#cutover-on-an-existing-host)).
+
+**The sandbox** (XRPL Testnet and Xahau Testnet) is the same compose file on a host of its own, with its own ClickHouse server, and the env file
+`deploy/.env.sandbox` (copy `deploy/.env.sandbox.example`, which sets `XRPL_NETWORK=xrpl-testnet` and `XAHAU_NETWORK=xahau-testnet`). It indexes from the
+validated head of its first boot; [docs/deployment.md](docs/deployment.md#environments) has the certificates and the rest.
+
+```bash
+cp deploy/.env.sandbox.example deploy/.env.sandbox          # fill in the secrets and the sandbox explorer's key in GH_API_KEYS and GH_RATE_LIMIT_KEYS
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox up -d --build
+```
 
 Migrations are owned by the migrate jobs (the apps wait for them): each `schema/*.sql` is a checksummed, tracked migration applied at most once per
 network database. Set `TRUSTED_PROXIES` to your front proxy and bind nginx to an interface only it can reach ([docs/security.md](docs/security.md#4-transport-and-the-client-address)).

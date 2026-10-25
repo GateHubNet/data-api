@@ -251,7 +251,7 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | Validator agreement behind | `syncer_validators_agreement_lag_seconds > 7200` for 30m | The agreement job has not finalised an hour for over two hours |
 | Voting rounds behind | `syncer_validators_rounds_lag_ledgers > 1024` for 30m | The rounds job is more than four flag intervals behind the committed ledgers |
 | Validators jobs failing | `rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0` for 30m | Rounds or agreement not refreshing |
-| Amendment without metadata | `syncer_amendments_without_metadata > 0` for 1d | The node, the ledger or the votes name an amendment that the metadata file lacks: add its entry (`pnpm --filter @gatehub/data-api-shared amendments:check --network xrpl\|xahau` lists them) |
+| Amendment without metadata | `syncer_amendments_without_metadata > 0` for 1d | The node, the ledger or the votes name an amendment that the metadata file lacks: add its entry (`pnpm --filter @gatehub/data-api-shared amendments:check --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet` lists them) |
 | Validations flowing | `rate(syncer_validations_flushed_total[10m]) == 0` for 10m on XRPL | Collector or its nodes down |
 | Fee stats flowing | `rate(syncer_fee_stats_samples_total[10m]) == 0` | Node unreachable |
 | Codec fallback | `increase(api_tx_encode_fallback_total[1h]) > 0` | Definitions out of date for a new transaction type |

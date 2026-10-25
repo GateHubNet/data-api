@@ -1,7 +1,7 @@
 # GateHub Data API: documentation
 
 Documentation for the GateHub Data API: a **drop-in replacement for the Ripple Data API v2** (`data.ripple.com`) for the **XRP Ledger**
-and **Xahau**, backed by ClickHouse. The *syncer* indexes a network's validated ledgers; the *api* serves the Ripple v2 endpoints, one
+and **Xahau** (and the testnet of each), backed by ClickHouse. The *syncer* indexes a network's validated ledgers; the *api* serves the Ripple v2 endpoints, one
 deployment per network.
 
 ## Start here
@@ -35,6 +35,7 @@ deployment per network.
 | [AMM design spec](superpowers/specs/2026-10-17-amm-data-design.md), [plan](superpowers/plans/2026-10-17-amm-data.md), [rulings](superpowers/plans/2026-10-17-amm-data.rulings.md), [verification](superpowers/plans/2026-10-17-amm-data.verification.md), [roadmap](superpowers/specs/2026-10-17-amendments-roadmap.md) | The intent and the plan of the AMM data work, and the program of the post-2021 amendments it is the first family of |
 | [Validators and amendments design](superpowers/specs/2026-10-19-validators-amendments-design.md), [plan](superpowers/plans/2026-10-19-validators-amendments.md) | The intent and the implementation plan of the validators and amendments data (D1), decided in [ADR-0012](adr/0012-validators-and-amendments-data.md) |
 | [Account and market aggregates design](superpowers/specs/2026-10-19-account-market-aggregates-design.md), [plan](superpowers/plans/2026-10-19-account-market-aggregates.md) | The intent and the implementation plan of the account and market aggregates (D2), decided in [ADR-0013](adr/0013-account-and-market-aggregates.md); the plan of the AMM data additions (D2b) is [here](superpowers/plans/2026-10-22-amm-aggregates-d2b.md) |
+| [Testnet profiles design](superpowers/specs/2026-10-24-testnet-profiles-design.md), [plan](superpowers/plans/2026-10-24-testnet-profiles.md) | The intent and the implementation plan of XRPL Testnet and Xahau Testnet as networks of their own (D-env), decided in the amendments of [ADR-0009](adr/0009-one-deployment-per-network.md#amendment-2026-10-24-testnets) and [ADR-0012](adr/0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets) |
 
 ## The system in one paragraph
 

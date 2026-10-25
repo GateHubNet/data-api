@@ -26,8 +26,12 @@ enum: queries use `${Table.X}`, never string literals). **55 tables** per networ
 | Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
 | Exports (1, migration 010) | `export_jobs` | the api (`queued`) and the exporter (`running`, `done`, `failed`) |
 
-Plus `schema_migrations` (the migration runner's bookkeeping). Apart from the network databases, one **shared database** on the
-same server holds what belongs to an address on every network (account names and labels, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
+Plus `schema_migrations` (the migration runner's bookkeeping). **The network databases** are named by the network's profile
+(`defaultDatabase`): `xrpl`, `xahau`, `xrpl_testnet` and `xahau_testnet`, each with this schema and these migrations, created by the
+`migrate` job of the network's slot (`migrate-xrpl` runs with `GH_NETWORK=xrpl-testnet` in the sandbox). Production's ClickHouse server holds
+`xrpl` and `xahau`; the sandbox's, a server of its own, holds `xrpl_testnet` and `xahau_testnet`
+([ADR-0009](adr/0009-one-deployment-per-network.md#amendment-2026-10-24-testnets)). Apart from the network databases, one **shared database** on the
+same server (named `shared` on every server) holds what belongs to an address on every network (account names and labels, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)),
 with its own migrations: see [section 8](#8-the-shared-database). The previous design (CTID-keyed tables, insert-triggered materialized
 views, offers/issuers/escrows/paychannels tables) is gone: see [ADR-0002](adr/0002-ctid-idempotent-ingest.md) (superseded),
 [ADR-0007](adr/0007-ledger-index-axis-and-secondary-tables.md) and [ADR-0008](adr/0008-no-aggregate-materialized-views.md).
@@ -377,7 +381,7 @@ The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM 
 | `volume_live` | `ReplacingMergeTree(version)`, `ORDER BY (metric, period, component)` | The same for the rolling live periods, with `start_time`, `end_time`, and `fees_est_f Nullable(Float64)` (migration 004): the estimated fees the pool charged on the swaps of the window, in the native currency, on the component rows of the `amm_volume` set of the period `day` only; NULL when a side's fee is not known (a swap with no known fee, so part of the fees is never shown as all of them), on the sentinel and on every row of the other sets. Twelve sets: `trade_volume` and `amm_volume` for hour, day, 3day, 7day and 30day, `payment_volume` for hour and day | `/network/*_volume` (live) |
 | `ingest_log` | `ReplacingMergeTree(updated_at)`, `ORDER BY (range_start, range_end)` | Range-ingest intent: `status Enum8('started'=1,'done'=2)`. Live first-write intents use `run_id live:<bootId>` and `range_end = 0` | range-ingest, ingest boot |
 | `agg_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_hour, to_hour)` | Hour ranges whose stats must be recomputed because ingest rewrote ledgers behind the aggregator | aggregator |
-| `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network: `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
+| `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network (its name: `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`): `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
 | `account_network_names` | `MergeTree`, `ORDER BY (address, added_at)`, no partition (migration 009) | One row per change of the **account network name** of an address on this network ("USD Issuer"): the columns of [`account_names`](#account_names-no-partition-mergetree-order-by-address-added_at) of the shared database (`address`, `name`, `removed UInt8`, `added_by`, `added_at DateTime64(3, 'UTC')`) and its rules: append-only, the newest row of an address wins (at the same `added_at` a removal wins), a newest row that is a removal or names nothing means no network name. Written by the operator ([operations](operations.md#name-an-account-on-one-network)); never `FINAL`, read whole with `LIMIT 1 BY address` and reloaded with the names every 60 s | `/v2/accounts/{address}` (`account_network_name`) |
 | `export_jobs` | `MergeTree`, `ORDER BY (id, seq)`, TTL 7 d on `created` | The states of an export job, append-only in the manner of `ingest_log`: `id` (32 random hex digits), `seq` (0 for the api's `queued` row, one more for every state the exporter writes), `key_hash` (the hex SHA-256 of the creating API key, never the key; `''` without one), `path`, `format` (`csv` or `pdf`), `status Enum8('queued'=1,'running'=2,'done'=3,'failed'=4)`, `created` and `at` (`DateTime64(3,'UTC')`), `rows`, `object` (the storage key `<network>/<id>.<format>`) and `error`. Every row repeats the job, so the row with the highest `seq` of an id is the job: `ORDER BY id, seq DESC LIMIT 1 BY id`, no `FINAL`. Each `POST /v2/exports` counts the jobs of its `key_hash` whose newest row is `queued` or `running` (the limit per key, ticket #16): a scan of 7 days of jobs, as the key is not in the `ORDER BY` | `/v2/exports`, the exporter |
 
@@ -493,6 +497,7 @@ every statement ends with its semicolon on its last line and no other line (comm
 pnpm ch:migrate                                              # from source: GH_NETWORK / GH_CLICKHOUSE_* from the environment
 docker compose run --rm migrate-xrpl                         # dev compose, per network
 docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm migrate-xrpl   # prod compose
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox run --rm migrate-xrpl # sandbox: creates xrpl_testnet
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 

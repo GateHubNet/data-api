@@ -51,8 +51,12 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
 
 `packages/shared` in more detail:
 
-- `src/network/`: `NetworkProfile` for `xrpl` and `xahau`; `config/definitions/<network>.json` (binary-codec definitions, a fallback for when
-  the node cannot supply `server_definitions`) and `config/markets/<network>.json` (volume markets) ship next to `dist/`.
+- `src/network/`: `NetworkProfile` for the four networks, `xrpl`, `xahau`, `xrpl-testnet` and `xahau-testnet` (`NETWORK_NAMES`; each profile also
+  names its `family`, `xrpl` or `xahau`, and its `kind`, `mainnet` or `testnet`). Three kinds of files ship next to `dist/`: **per network**,
+  `config/definitions/<network>.json` (binary-codec definitions, a fallback for when the node cannot supply `server_definitions`) and
+  `config/markets/<network>.json` (volume markets; the testnets' are empty); **per family**, `config/amendments/<family>.json` (`xrpl.json`,
+  `xahau.json`: the amendment metadata, which a testnet reads without its `enabled` entries). A new network is a code change: one profile and
+  its files.
 - `src/clickhouse/`: `clickhouse.service.ts` (typed wrapper: bound parameters, per-query guards, synchronous inserts with dedup tokens),
   `clickhouse.config.ts`, `migrate.ts`, `tables.ts` (the `Table` enum), `rows.ts` (row types).
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
@@ -106,6 +110,10 @@ curl -s localhost:3001/liveliness/healthz
 `xahau`, the node to `wss://xahau.network`, the native currency to `XAH`. Run `GH_NETWORK=xahau pnpm ch:migrate` once, and give the second
 API and syncer different ports (`GH_HTTP_API_PORT`, `GH_METRICZ_PORT`).
 
+**A testnet.** The same with `GH_NETWORK=xrpl-testnet` or `xahau-testnet`: the database defaults to `xrpl_testnet` / `xahau_testnet`, the node to
+the public testnet servers, and a node of another network is refused at boot. Leave `GH_NODE_ENDPOINTS` at its default (a mainnet value fails
+the boot). In the compose stack set `XRPL_NETWORK=xrpl-testnet` (or `XAHAU_NETWORK=xahau-testnet`) for the slot ([deployment](deployment.md#option-2-local-development-stack)).
+
 **Everything in containers.** `NPM_TOKEN=... docker compose --profile full up -d --build` brings up ClickHouse, the XRPL migrate job,
 syncer and api (add `--profile xahau` for Xahau); see [deployment](deployment.md#option-2-local-development-stack). The ports are
 published on 127.0.0.1, the API key is `dev-api-key`, and **an old ClickHouse volume from the previous stack must be recreated**
@@ -128,8 +136,8 @@ From the repo root; `pnpm -r <script>` fans out in dependency order.
 | `pnpm ch:migrate` | applies the schema to the database of `GH_NETWORK` (`ts-node` on `migrate.ts`) |
 | `pnpm ch:migrate:shared` | applies `schema-shared/` to the shared database (`GH_CLICKHOUSE_SHARED_DATABASE`, default `shared`), which the api reads the account names and labels from |
 | `pnpm --filter @gatehub/data-syncer ingest:range --from N --to M` | the range-ingest CLI from source: it runs `dist/`, so `pnpm build` first, and it needs the syncer's `GH_*` environment (`.env` or `GH_ENV=local`) ([backfill](backfill.md)) |
-| `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures. Two more modes record the inputs of the `validators` worker: `--unl --network xrpl\|xahau [--out <dir>]` the validator lists of the network's default publishers (needs no node), and `--network-state --network xrpl\|xahau --endpoint <wss> [--out <dir>] [--ledger <n>]` what the worker asks the node for (the Amendments, NegativeUNL and FeeSettings objects at the validated ledger, or at `--ledger`, which the node must still hold, `server_info` and `feature`) |
-| `pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl\|xahau [--clickhouse]` | compares the amendment metadata file with a node (and with the database) and exits 1 on a difference ([operations](operations.md#keep-the-amendment-metadata-current)) |
+| `pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint <wss> --out <dir> ...` | records ledgers as gzipped fixtures (`--network` is one of `xrpl`, `xahau`, `xrpl-testnet`, `xahau-testnet`, and the node must be of that network: a mainnet rippled is refused as `xrpl-testnet`). Two more modes record the inputs of the `validators` worker: `--unl --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet [--out <dir>]` the validator lists of the network's default publishers (needs no node; Xahau Testnet has no publisher), and `--network-state --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet --endpoint <wss> [--out <dir>] [--ledger <n>]` what the worker asks the node for (the Amendments, NegativeUNL and FeeSettings objects at the validated ledger, or at `--ledger`, which the node must still hold, `server_info` and `feature`) |
+| `pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet [--clickhouse]` | compares the amendment metadata file of the network's family with a node (and with the database) and exits 1 on a difference ([operations](operations.md#keep-the-amendment-metadata-current)) |
 | `pnpm start:api` / `pnpm start:syncer` / `pnpm start:exporter` | `nest start --watch` |
 | `pnpm docker:up` / `pnpm docker:down` | start/stop the dev ClickHouse container |
 

@@ -1,7 +1,7 @@
 # Architecture
 
 The GateHub Data API is a **drop-in replacement for the Ripple Data API v2** (`data.ripple.com`, the
-`rippled-historical-database` project) for the **XRP Ledger and Xahau**, built as a ClickHouse-backed system with two services, an
+`rippled-historical-database` project) for the **XRP Ledger and Xahau** (and the testnet of each), built as a ClickHouse-backed system with two services, an
 exporter and a shared library. This page explains the moving parts; the reasons for the big choices are the [ADRs](adr/README.md).
 
 ## System diagram
@@ -19,7 +19,7 @@ exporter and a shared library. This page explains the moving parts; the reasons 
  └──────────────────────────────┬────────────────────────────────────┘
                                 │ bulk inserts (ledger tables: children first, `ledgers` row = commit)
                                 ▼
-                     ClickHouse  (one server, one database per network: xrpl, xahau)
+                     ClickHouse  (one server, one database per network: xrpl, xahau; xrpl_testnet, xahau_testnet)
                                 ▲
                                 │ parameterised SELECTs
  ┌──────────────────────────────┴────────────────────────────────────┐
@@ -35,9 +35,21 @@ exporter and a shared library. This page explains the moving parts; the reasons 
  └───────────────────────────────────────────────────────────────────┘    (the api signs the download links)
 ```
 
-Every service runs `GH_NETWORK=xrpl` or `xahau` (the same images). One deployment serves one network; the network profile selects
-the node URLs, the native currency (`XRP` / `XAH`), the CTID network id (0 / 21337), the markets config and the default database.
-See [ADR-0009](adr/0009-one-deployment-per-network.md).
+Every service runs `GH_NETWORK=` one of four names, `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet` (the same images). One
+deployment serves one network; the network profile selects the node URLs, the native currency (`XRP` / `XAH`), the CTID network id (0,
+21337, 1 and 21338), the `network_id` a node must report to be accepted, the markets config and the default database. A testnet is a network
+of its own, with a profile of its own; the profile also names its **family** (`xrpl` or `xahau`: the protocol and software) and its **kind**
+(`mainnet` or `testnet`), and the rest of the code branches on exactly one of the three:
+
+| Keyed by | Where |
+| --- | --- |
+| the **name** (`xrpl-testnet`) | the files of markets (`config/markets/<name>.json`) and binary-codec definitions (`config/definitions/<name>.json`), the ClickHouse database (`xrpl`, `xahau`, `xrpl_testnet`, `xahau_testnet`), `syncer_lease.network`, the export object keys (`<name>/<id>.csv`), the cache keys |
+| the **family** (`xrpl`) | the amendment metadata file (`config/amendments/<family>.json`: a testnet reads its family's), the source of the account flags (the XRPL definitions file, or Xahau's hand list) |
+| the **kind** (`testnet`) | the reset rule of the live runner (a head below the first indexed ledger halts a testnet only), the boot line (`network=xrpl-testnet kind=testnet`) |
+
+The parsers know no network: `parseContextFor(profile)` hands them the native currency, the CTID network id and the partial-payment cut-off, nothing else. The production stack runs `xrpl`
+and `xahau`; the **sandbox** is another stack of the same images on a host and ClickHouse server of its own, running `xrpl-testnet` and
+`xahau-testnet`. See [ADR-0009](adr/0009-one-deployment-per-network.md) and its [amendment](adr/0009-one-deployment-per-network.md#amendment-2026-10-24-testnets).
 
 ## Components
 
@@ -45,8 +57,10 @@ See [ADR-0009](adr/0009-one-deployment-per-network.md).
 
 Everything both services need, written once:
 
-- **`network/`**: `NetworkProfile` per network, the bundled binary-codec definitions (`config/definitions/<network>.json`, a fallback
-  for when the node cannot supply `server_definitions`) and the markets config (`config/markets/<network>.json`).
+- **`network/`**: `NetworkProfile` per network (four: `xrpl`, `xahau`, `xrpl-testnet`, `xahau-testnet`), the bundled binary-codec definitions
+  (`config/definitions/<network>.json`, a fallback for when the node cannot supply `server_definitions`) and the markets config
+  (`config/markets/<network>.json`, empty for the testnets). The amendment metadata is a file per **family**
+  (`config/amendments/<family>.json`), read by the testnet of the family without its `enabled` entries.
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
 - **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments) and
@@ -126,7 +140,7 @@ next one starts. The api queues the jobs (`POST /v2/exports`) and signs the down
 
 ### ClickHouse
 
-One server, one database per network, 55 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
+One server, one database per network (`xrpl`, `xahau` in production; `xrpl_testnet`, `xahau_testnet` on the sandbox's own server), 55 tables per database ([data-model](data-model.md)). Pinned to 26.8.14.3. Lists are key-ordered
 range reads without `FINAL`; the `ledgers` row is the commit marker; aggregates are tables the aggregator writes, not materialized
 views. See [clickhouse](clickhouse.md).
 
@@ -169,10 +183,10 @@ views. See [clickhouse](clickhouse.md).
 | TLS at the front proxy; the client address from `X-Forwarded-For` | [0006](adr/0006-reverse-proxy-tls.md) |
 | `ledger_index` axis and narrow secondary tables | [0007](adr/0007-ledger-index-axis-and-secondary-tables.md) |
 | No aggregate materialized views | [0008](adr/0008-no-aggregate-materialized-views.md) |
-| One deployment per network | [0009](adr/0009-one-deployment-per-network.md) |
+| One deployment per network, and the testnets as networks of their own (profiles with family and kind, the sandbox as a stack of its own, the reset rule) | [0009](adr/0009-one-deployment-per-network.md) |
 | Ripple v2 wire compatibility and every deliberate deviation | [0010](adr/0010-ripple-v2-wire-compatibility.md) |
 | AMM data, and swaps against pools as exchanges | [0011](adr/0011-amm-data-and-swaps-as-exchanges.md) |
-| Validators and amendments data: a worker of its own, agreement over the indexed chain, the safe fetcher, migration 002 | [0012](adr/0012-validators-and-amendments-data.md) |
+| Validators and amendments data: a worker of its own, agreement over the indexed chain, the safe fetcher, migration 002; the fixed validator list `local` of Xahau Testnet | [0012](adr/0012-validators-and-amendments-data.md) |
 | Account and market aggregates: precomputed daily rates, heavy-account rollups, markets from hourly pair stats, migration 003; D2b, the AMM data additions, migration 004 | [0013](adr/0013-account-and-market-aggregates.md) |
 | CTID dedup (superseded by the commit marker and dedup tokens) | [0002](adr/0002-ctid-idempotent-ingest.md) |
 

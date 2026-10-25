@@ -2,7 +2,7 @@
 
 The GateHub Data API is a drop-in replacement for the **Ripple Data API v2**
 ([rippled-historical-database](https://github.com/ripple/rippled-historical-database), served as
-`data.ripple.com`) for the **XRP Ledger** and for **Xahau**. Every endpoint of the Ripple API keeps its path, its parameters, its
+`data.ripple.com`) for the **XRP Ledger** and for **Xahau**, and for the testnet of each. Every endpoint of the Ripple API keeps its path, its parameters, its
 defaults and limits, its error messages and the shape and key order of its answers, so a client written for `data.ripple.com`
 works against it with two changes: it sends an API key, and it points at the host of the network it wants (see
 [Compatibility](#compatibility)).
@@ -23,17 +23,40 @@ Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#
 
 ### Hosts: one per network
 
-One deployment serves one network. The two deployments run the same images and answer the same paths:
+One deployment serves one network. The four deployments run the same images and answer the same paths:
 
 | Network | Host (behind the shipped nginx) | Native currency | Notes |
 | --- | --- | --- | --- |
-| XRP Ledger | `xrpl.data.<domain>` | `XRP` | CTID network id 0 |
-| Xahau | `xahau.data.<domain>` | `XAH` | CTID network id 21337 |
+| XRP Ledger | `xrpl.data.gatehub.net` (production) | `XRP` | CTID network id 0 |
+| Xahau | `xahau.data.gatehub.net` (production) | `XAH` | CTID network id 21337 |
+| XRPL Testnet | `xrpl.data.sandbox.gatehub.net` (sandbox) | `XRP` | CTID network id 1 |
+| Xahau Testnet | `xahau.data.sandbox.gatehub.net` (sandbox) | `XAH` | CTID network id 21338 |
 
-The paths are `/v2/...` on both hosts. The **native currency** of the network is the one that has no issuer: `XRP` on the XRP
-Ledger, `XAH` on Xahau. Wherever this page says "the native currency" it means that one; `XRP+rIssuer` on Xahau is an issued
+The hosts are `xrpl.data.<domain>` and `xahau.data.<domain>` of the deployment: GateHub's production domain is `gatehub.net`, its
+sandbox's `sandbox.gatehub.net`. The sandbox is a stack of its own on a host of its own, never a testnet on the production server
+([ADR-0009](adr/0009-one-deployment-per-network.md#amendment-2026-10-24-testnets)). A client knows the network by the host it calls;
+no route names a network.
+
+The paths are `/v2/...` on every host. The **native currency** of the network is the one that has no issuer: `XRP` on the XRP
+Ledger and XRPL Testnet, `XAH` on Xahau and Xahau Testnet. Wherever this page says "the native currency" it means that one; `XRP+rIssuer` on Xahau is an issued
 currency called `XRP`, and `XAH` on the XRP Ledger is an issued currency called `XAH`. Amounts of the native currency are
 always in whole units (drops divided by 1,000,000), as exact decimal text.
+
+**The testnets.** A testnet answers with the same routes, the same shapes and the same guarantees as the network it follows: wherever this
+page says "the XRP Ledger" or "Xahau" without a sentence about the testnets, XRPL Testnet answers as the XRP Ledger does and Xahau Testnet
+as Xahau does (XRPL Testnet has AMM pools, Xahau Testnet has none). Besides the host, the native currency and the CTID network id,
+four things differ in what the API serves:
+
+- **Data.** A testnet's index starts at the validated head of its deployment's first boot: the history before it is not in the index,
+  whatever its nodes hold. A testnet can be reset by its operators; its index is then dropped and starts again
+  ([operations](operations.md#a-testnet-was-reset)).
+- **Volumes.** A testnet ships an empty markets config, so `exchange_volume` has no market components, `payment_volume` has the native
+  currency's alone, and the rates of non-native assets are missing ([Network volume](#get-v2networkexchange_volume-payment_volume-and-amm_volume)).
+- **Validators.** XRPL Testnet has one list publisher (`vl.altnet.rippletest.net`). Xahau Testnet has none: its trusted validators are
+  a fixed list of four keys, served as the publisher `local` ([the summary](#get-v2networkvalidatorssummary)).
+- **Amendments.** A testnet shows no `enabled` day from the metadata file, which holds mainnet's: an amendment there has an `enabled`
+  object only from an indexed `EnableAmendment`. Its `majority_hold_seconds` is its own
+  ([amendments](#get-v2networkamendments)).
 
 ### Authentication
 
@@ -335,7 +358,7 @@ An extra of the original that its README never listed: the newest ledger this de
 
 The object is `{hash, ledger_index, date, tx, meta}` in that order. `meta.delivered_amount` is added to every successful
 `Payment`: the metadata's `DeliveredAmount`, else the transaction's `Amount`, except for a *partial* payment from before the
-ledger the XRP Ledger fixed this in (4,594,094), which has `"unavailable"`. Xahau has no such cut-off.
+ledger the XRP Ledger fixed this in (4,594,094), which has `"unavailable"`. Xahau and the two testnets have no such cut-off.
 
 Errors: 400 `invalid hash`; 404 `transaction not found`; 500 `unable to retrieve transaction(s)`. No CSV.
 
@@ -1796,7 +1819,7 @@ is accepted and means the same as none.
 ### `GET /v2/network/exchange_volume`, `payment_volume` and `amm_volume`
 
 The trade volume, the payment volume and the AMM volume of the network, converted to the native currency (or to a display currency). The
-trade and payment components come from the **markets config** of the network (`packages/shared/config/markets/{xrpl,xahau}.json`, or the file in
+trade and payment components come from the **markets config** of the network (`packages/shared/config/markets/<network>.json`, or the file in
 `GH_MARKETS_CONFIG`), a versioned list of trade markets and payment currencies that the syncer's aggregator works through; the
 list shipped for Xahau (version 3) was derived from a small sample of three days of Xahau history (one trade market, `EVR`/`XAH`, and
 three payment currencies; the `XXX` test token is left out): it is provisional and should be re-derived from a full-history node
@@ -2716,7 +2739,7 @@ Errors: 400 `invalid scope`, `invalid publisher`, `invalid amendment`, `invalid 
 | No paging | `limit` (200, max 1000), `marker`, `Link` |
 | Sorted by chain, UNL first, 24 h score, domain, key | Domain-first alphabetical, then key (the board's order) |
 | Row `{validation_public_key, domain, chain, current_index, agreement_1h, agreement_24h, partial, unl}` | The same keys in the same order, without `chain` (one network per deployment), then the new ones; agreement objects keep `{missed, total, score, incomplete}` and add `partial`; `agreement_30d` added |
-| `unl` = on Ripple's main or altnet list | `unl` = on the trusted UNL of the configured publishers; `unl_lists` names them |
+| `unl` = on Ripple's main or altnet list | `unl` = on the trusted UNL of the configured publishers (and of the fixed list `local`, `GH_UNL_VALIDATORS`); `unl_lists` names them |
 | `domain` from its own domain check | `domain` from the validator's manifest, `domain_verification` says whether the TOML confirms it |
 | Agreement against the ledgers its chain logic saw | Against the indexed validated chain, full validations only, unobserved ledgers left out |
 | Messages `Validator not found`, `unable to retrieve validator(s)`; CSV `validators.csv` | Kept; new 400s for the new parameters |
@@ -3056,7 +3079,7 @@ only when they have a value, and `ledger_index`, `round` and `next_flag_ledger` 
 | Key | Meaning |
 | --- | --- |
 | `ledger_index` | The newest committed ledger of the index: the summary's. |
-| `rules` | The rules of the network: `threshold_percent` (80: an amendment needs more than that share of the trusted validators), `majority_hold_seconds` (how long it must hold its majority before it is enabled: 1,209,600 on XRPL, 432,000 on Xahau) and `flag_interval` (256). |
+| `rules` | The rules of the network: `threshold_percent` (80: an amendment needs more than that share of the trusted validators), `majority_hold_seconds` (how long it must hold its majority before it is enabled: 1,209,600 on XRPL, 432,000 on Xahau, 1,800 on XRPL Testnet, inferred from seven amendments that the testnet enabled three flag ledgers after they gained a majority, and 432,000 on Xahau Testnet, the node software's default) and `flag_interval` (256). |
 | `round` | The newest voting round stored: its voting `ledger_index`, `date` (its close time), `unl_size` (the validators on the UNL), `trusted` (the ones of them with a vote record, the ones that count), `threshold` (the votes an amendment has to exceed: max(1, ⌊`trusted` × 80 / 100⌋)), `needed` (the votes that pass: `threshold` + 1, and 1 when `trusted` is 1 or less) and `observed` (the validators of the UNL whose full validation of the voting ledger was seen). Absent while no round is stored. |
 | `next_flag_ledger` | The summary's: the next multiple of 256 and the voting ledger before it, and when it is expected. |
 | `counts` | How many amendments there are of each status, all of them, whatever `status` asks for. |
@@ -3066,7 +3089,7 @@ only when they have a value, and `ledger_index`, `round` and `next_flag_ledger` 
 | `name` | The name of the amendment: the one in the metadata file, else the one the node gives (the node may not know a name: public nodes lack the one of an amendment that is new), else absent. |
 | `status` | One of the five below. |
 | `retired` | `true` for a name of the metadata file that is retired: behaviour that is always on (rippled's `XRPL_RETIRE` amendments and xahaud's retired list), which a ledger begun after the retirement no longer lists. On XRPL the ledger still lists the 15 retired names, so their rows are as they were with `retired: true` added; on Xahau, XRPL Testnet and Xahau Testnet the ledger lacks them, and the row is `enabled` with no `enabled` object. |
-| `introduced`, `xls`, `xls_url`, `description` | From the metadata file (names, descriptions and links of the standards: `GH_AMENDMENTS_CONFIG`, a file per network that ships with the API): the software version that introduced it (a rippled version on XRPL, a xahaud date version on Xahau), the standard (`XLS-30`) and its address, which always lies under `https://github.com/XRPLF/XRPL-Standards/`, and one line about it. Absent for an amendment the file does not have. |
+| `introduced`, `xls`, `xls_url`, `description` | From the metadata file (names, descriptions and links of the standards: `GH_AMENDMENTS_CONFIG`, a file per family that ships with the API: `xrpl.json` for the XRP Ledger and XRPL Testnet, `xahau.json` for Xahau and Xahau Testnet): the software version that introduced it (a rippled version on XRPL, a xahaud date version on Xahau), the standard (`XLS-30`) and its address, which always lies under `https://github.com/XRPLF/XRPL-Standards/`, and one line about it. Absent for an amendment the file does not have. |
 | `node_supported` | Whether the node says it supports the amendment, when it lists it. |
 | `votes` | For an amendment that is `majority`, `voting` or `unknown`, when a round is stored: what the newest round says. `ledger_index` is its voting ledger, `yes` the trusted validators with the amendment in their vote record (0 when the round has no tally of it), `trusted` and `needed` as in `round`, `pct` = `yes` / `trusted` × 100 to two decimals, rounded half up (0 when `trusted` is 0). |
 | `majority` | For an amendment that has a majority: `since`, the close time of the ledger that recorded it; `ledger_index` and `tx_hash`, of the newest indexed `EnableAmendment` that gave it the majority (absent when none is indexed: the majority was gained before the indexed history, or the index has not reached that ledger yet; and absent when a `lost_majority` or an enabling of the amendment is indexed after it: the majority it has now was regained and its transaction is not indexed yet); `expected_activation`, `since` plus the hold. It is enabled by the first flag ledger after that, in the ledger after the flag ledger. |
@@ -3301,7 +3324,7 @@ header, one line each:
 - for an account's list (`/v2/accounts/{address}/…`): `Address:`, and the `Account name:`, `Account network name:` and one
   `Label <label>: <description> (<source>, <url>)` per label that [`/v2/accounts/{address}`](#get-v2accountsaddress) serves for
   it, read through the api like the rows (an address without an activation on the network has none);
-- `Network:` (`XRP Ledger` or `Xahau`), `List:` (the `path` as asked);
+- `Network:` (`XRP Ledger`, `Xahau`, `XRPL Testnet` or `Xahau Testnet`), `List:` (the `path` as asked);
 - `Window: <start> to <end>` (`, newest first` with `descending=true`), or for a list at a point in time `At:` the ledger or date
   it names;
 - `Ledgers: <lowest> to <highest>`: the ledgers of its rows (`ledger_index`); `none (no rows)`, or `not given by the list` for a

@@ -13,7 +13,9 @@ dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$
 
 The sandbox is the same compose file on a host of its own ([deployment](deployment.md#environments)): there the env file is `deploy/.env.sandbox`, so define
 `dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox "$@"; }` and read the service names as the slots: `api-xrpl` serves XRPL Testnet and
-`api-xahau` Xahau Testnet (`XRPL_NETWORK` / `XAHAU_NETWORK` of the file), in the databases `xrpl_testnet` and `xahau_testnet`.
+`api-xahau` Xahau Testnet (`XRPL_NETWORK` / `XAHAU_NETWORK` of the file), in the databases `xrpl_testnet` and `xahau_testnet`. The SQL in this
+runbook names the production databases, `xrpl.` and `xahau.`: on the sandbox write `xrpl_testnet.` and `xahau_testnet.` in their place (compose sets
+no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile gives it).
 
 ## At a glance
 
@@ -125,7 +127,7 @@ Nothing checks the address or the name: a typo in either shows within a minute, 
 ### Name an account on one network
 
 The **account network name** of an account ("USD Issuer" for GateHub's issuing address on the XRP Ledger) is written by hand into
-`account_network_names` of **that network's database** (`xrpl` or `xahau`, migration `009`) and shows on `GET /v2/accounts/{address}`
+`account_network_names` of **that network's database** (`xrpl`, `xahau`, `xrpl_testnet` or `xahau_testnet`, migration `009`) and shows on `GET /v2/accounts/{address}`
 (`account_network_name`, after `account_name`) of **that network only**, within 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), with no restart. It
 needs no account name: an account can have either, both or neither. The table has the columns and rules of `shared.account_names`: append-only
 (never `UPDATE`, `DELETE` or `OPTIMIZE ... FINAL` it), the newest row of an address wins, removing is an insert with `removed = 1`, your own name or
@@ -149,7 +151,7 @@ WHERE removed = 0 AND name != '';
 SELECT * FROM xrpl.account_network_names WHERE address = '<address>' ORDER BY added_at;
 ```
 
-On Xahau write `xahau.account_network_names` (the network database is `GH_CLICKHOUSE_DATABASE` when it is set). A name inserted into the wrong
+On Xahau write `xahau.account_network_names`, on a testnet `xrpl_testnet.` or `xahau_testnet.` (the network's database is the one its profile names). A name inserted into the wrong
 network's database shows there, not on the network meant: remove it there with a `removed = 1` row and insert it into the right one. The table
 comes with `migrate-<network>` (migration `009`): an api started before it serves every account without a network name and logs
 `Could not load the account network names` at every reload, until the job has run.
@@ -489,9 +491,11 @@ production history.
 2. Drop the database. Open `clickhouse-client` as in [SQL health checks](#sql-health-checks), read the network the database belongs to, and drop it:
 
    ```sql
-   SELECT network, holder FROM xrpl_testnet.syncer_lease FINAL;   -- the network column must read xrpl-testnet
-   DROP DATABASE xrpl_testnet;
+   SELECT network, holder FROM <database>.syncer_lease FINAL;   -- the network column must read xrpl-testnet (xahau-testnet)
+   DROP DATABASE <database>;
    ```
+
+   `<database>` is `xrpl_testnet` for XRPL Testnet and `xahau_testnet` for Xahau Testnet.
 
 3. Create it again, with the schema:
 

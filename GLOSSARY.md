@@ -16,8 +16,12 @@ _Avoid_: altnet, devnet (another network)
 The protocol a network runs, XRPL or Xahau. A testnet belongs to its mainnet's family and shares its amendment names and its toml file.
 _Avoid_: chain, kind (that is mainnet or testnet)
 
+**Network kind**:
+Whether a network holds value (`mainnet`) or is for testing (`testnet`). A fact of the network's profile, never read from the environment; it decides the boot line (`kind=testnet`) and whether a head below the first indexed ledger halts the syncer.
+_Avoid_: family (that is XRPL or Xahau), environment
+
 **Network profile**:
-Everything that differs between the networks, in one record per network: its ids, native currency, default nodes and validator lists, files and database.
+Everything that differs between the networks, in one record per network: its name, family and kind, ids, native currency, default nodes and validator lists, files and database.
 _Avoid_: network config, chain config
 
 **Environment**:

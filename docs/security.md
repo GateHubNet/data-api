@@ -153,9 +153,9 @@ render another shape).
 Secrets: `GH_API_KEYS`, `GH_RATE_LIMIT_KEYS` (it holds API keys), `GH_CLICKHOUSE_PASSWORD`, node URLs with credentials, and the build-time
 `NPM_TOKEN`.
 
-- All runtime secrets are environment variables. `.env` and `.env.*` are git-ignored (only `*.env.example` and `deploy/.env.prod.example`
-  are committed) and excluded from the Docker build context (`.dockerignore` excludes all `**/.env*`). In production inject them from a
-  secrets manager; `deploy/.env.prod` should be rendered from it, not stored.
+- All runtime secrets are environment variables. `.env` and `.env.*` are git-ignored (only `*.env.example`, `deploy/.env.prod.example`
+  and `deploy/.env.sandbox.example` are committed) and excluded from the Docker build context (`.dockerignore` excludes all `**/.env*`). In production inject them from a
+  secrets manager; `deploy/.env.prod` (and the sandbox's `deploy/.env.sandbox`) should be rendered from it, not stored.
 - **Least privilege per service.** The production compose does not hand `deploy/.env.prod` to containers; each service lists the
   variables it needs, so the syncers never see `GH_API_KEYS` or the CORS and rate-limit settings
   ([which service gets what](configuration.md#which-service-gets-which-variables-production-compose)).

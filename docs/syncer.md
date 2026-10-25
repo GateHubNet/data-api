@@ -157,7 +157,9 @@ restart would retry the fetch of a checkpoint the node does not have). The runne
   `fetch(head)`) when that head is not the last one checked and `HEAD_BELOW_CHECK_MS` (60 s) have passed since the last check (the first
   at once): once per distinct head, at most once a minute. A fetch that fails is a warning, and the next due check tries again.
 - **At boot**, with a checkpoint, the runner asks for the validated head first and runs the same check when it is below the checkpoint,
-  before it fetches the checkpoint (which then waits for a node that is behind, as it always did).
+  before it fetches the checkpoint (which then waits for a node that is behind, as it always did). A head that cannot be read is a
+  warning for each failed try, as in the loop; a failure of the comparison itself (the stored hash, or the one `fetch(head)`) is an
+  error that the boot retries with backoff, with `recovering` in the probe details.
 - **Another hash** at that index: two hashes at one index can only be two chains, so the runner **halts** with
   `The node's validated ledger <head> has hash <h1>, but ledger <head> is stored with hash <h2>: the network was reset, or the node is of another chain`.
   This holds on **every network, mainnet included**, and changes mainnet behaviour on purpose: before it, a mainnet syncer
@@ -603,7 +605,17 @@ fetcher (HTTPS only, no private, loopback or reserved address, no redirect to on
 
 `UnlFetcher` fetches the validator list of every publisher of `GH_UNL_PUBLISHERS` (`url=publicKeyHex` pairs; a publisher's id is its
 URL without the scheme and the trailing slash, `vl.ripple.com`) and stores the ones that verify. `GH_UNL_THRESHOLD` (0 = rippled's
-rule: 1 below three publishers, else ⌊n / 2⌋ + 1) is how many current lists must name a validator for it to be trusted.
+rule: 1 below three lists, else ⌊n / 2⌋ + 1, over the publishers and the fixed list below) is how many current lists must name a validator for it to be trusted.
+
+- **The fixed list (`GH_UNL_VALIDATORS`).** Xahau Testnet has no publisher: its nodes trust four keys of their own configuration, which the profile
+  holds as `defaultUnlValidators`. `registerPublishers()` stores such a list as the list of the reserved publisher `local` (no URL, no key,
+  `configured` 1, `status` `ok`, the threshold in force): a `unl_lists` row with the next sequence (1 first), `version` 1,
+  `expiration` 4294967295 (it does not expire), the keys sorted and the upper-case hex SHA-256 of the sorted keys joined by newlines as
+  `blob_sha256`, written only when the keys differ from the newest stored `local` list (a restart with the same keys writes nothing, and a
+  past round reads the list that was in force). An emptied `GH_UNL_VALIDATORS` sets `configured = 0` on a stored `local`. `local` is never fetched: no
+  timer, no fetch, no metric, and `fetchOnce('local')` rejects like any unconfigured id. `loadListContext` reads it with the publishers, so
+  the tally, the agreement and the directory trust its keys at threshold 1 with no branch of their own
+  ([ADR-0012](adr/0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
 
 - **Schedule.** One timer per publisher, never two fetches of one publisher at a time. A fetch at start, then one after
   `GH_UNL_REFRESH_MS` (5 min), or after the `refresh_interval` of the last list (minutes) when the list gives one; either wait is
@@ -666,7 +678,8 @@ one ended, never two at a time) while `GH_DOMAIN_VERIFICATION` is `true`; a pass
 and the next one is made on time.
 
 - **Which validators.** The masters on the list in use of each configured publisher (only the lists stored under the key configured
-  for it: a list of an earlier key of the same URL counts for nothing), and those in `validator_seen` with `last_seen` in the last 30
+  for it: a list of an earlier key of the same URL counts for nothing), the keys of the fixed list (`GH_UNL_VALIDATORS`, from the
+  configuration: `local`'s empty key never matches a publisher's), and those in `validator_seen` with `last_seen` in the last 30
   days. A key seen under a signing key is mapped to its master through the manifest map first (per `ephemeral_key`, the
   `master_key` of the highest `seq`), as every read that aggregates by validator does: the map is computed inside the statement
   (`KEY_MAP_WITH` and `mappedKey` of `packages/shared`), never sent with it as parameters, which the client would put in the URL
