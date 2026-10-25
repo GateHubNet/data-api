@@ -1,4 +1,10 @@
-import { amendmentId, getNetworkProfile, NetworkName, parseAmendmentsConfig } from '@gatehub/data-api-shared';
+import {
+  amendmentId,
+  getNetworkProfile,
+  loadAmendmentsConfig,
+  NetworkName,
+  parseAmendmentsConfig,
+} from '@gatehub/data-api-shared';
 import {
   AMENDMENT_STATUSES,
   AmendmentSources,
@@ -624,6 +630,37 @@ describe('assembleAmendments', () => {
         { transactions: [{ amendment: MULTI_SIGN, flags: 0, ledgerIndex: 60, date: NOW_S - 100, txHash: 'H' }] },
       ).byId.get(MULTI_SIGN);
       expect(indexed?.enabled).toMatchObject({ ledgerIndex: 60, source: 'ledger' });
+    });
+  });
+
+  describe('a name that only Xahau Testnet has (fixXahauTestnetGenesis, read from the shipped family file)', () => {
+    const GENESIS = amendmentId('fixXahauTestnetGenesis');
+    const shipped = (network: 'xahau' | 'xahau-testnet', ledger: string[]) =>
+      assembleAmendments(
+        directoryOf({}, { amendments: ledger, majorities: [] }),
+        sources({
+          config: loadAmendmentsConfig(getNetworkProfile(network)),
+          features: new Map(),
+          voted: new Set(),
+          yes: new Map(),
+          transactions: [],
+        }),
+      ).byId.get(GENESIS);
+
+    it('is the ID that Xahau Testnet lists', () => {
+      expect(GENESIS).toBe('AB6612F1B9C2EAB6F687512297D9960B13B869EFF97E77D85A0574DFF97FD1EE');
+    });
+
+    it('is obsolete on Xahau mainnet, whose node does not know it: no permanent 0-vote voting row', () => {
+      const a = shipped('xahau', []);
+      expect(a).toMatchObject({ name: 'fixXahauTestnetGenesis', status: 'obsolete' });
+      expect(a?.votes).toBeUndefined();
+    });
+
+    it('is enabled on Xahau Testnet, whose ledger lists it: the ledger comes before the file', () => {
+      const a = shipped('xahau-testnet', [GENESIS]);
+      expect(a).toMatchObject({ name: 'fixXahauTestnetGenesis', status: 'enabled' });
+      expect(a?.enabled).toBeUndefined();
     });
   });
 

@@ -206,6 +206,8 @@ protocol family. They add no migration and no parser version.
 - The fixed list is configuration. If Xahau Testnet's operators change their `[validators]`, the profile's default or `GH_UNL_VALIDATORS` has to follow by hand, and the comment of the
   profile names the file to compare.
 - The testnets' majority holds are an inference (XRPL Testnet) and a software default (Xahau Testnet); a wrong one shows `expected_activation` too early or too late, never a status.
-- Mainnet's XRPL rows gain a `retired` key, and the family file is shared: a name that only one network of the family has, such as `fixXahauTestnetGenesis`, is a row on the other too, as
-  every name of the file is (`voting`, or `obsolete` when the node reports it unsupported and no validator votes for it). On Xahau mainnet's board that is `fixXahauTestnetGenesis`.
+- Mainnet's XRPL rows gain a `retired` key, and the family file is shared: every name of the file is a row on every network of the family, so a name that only one of them has, such as
+  `fixXahauTestnetGenesis`, is a row on the other too. Unmarked, it would be a permanent `voting` row with 0 votes on Xahau mainnet, whose node does not know it. The file therefore marks it
+  `obsolete: true`, as it does `AMMClawback` and `HookOnV2`: Xahau mainnet's board shows it `obsolete`, Xahau Testnet's `enabled` (its ledger lists the ID, and that rule comes first), and
+  `syncer_amendments_without_metadata` stays 0.
 - An unnamed ID on a testnet is `unknown` until the file names it, as on mainnet; `amendments:check --network <testnet>` after a new build of a testnet's node finds the names to add ([operations](../operations.md#keep-the-amendment-metadata-current)).

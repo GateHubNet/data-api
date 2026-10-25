@@ -148,7 +148,7 @@
     { "name": "fixTakerDryOfferRemoval" },
     { "name": "fixTrustLinesToSelf", "introduced": "2026.6.21" },
     { "name": "fixUniversalNumber" },
-    { "name": "fixXahauTestnetGenesis" },
+    { "name": "fixXahauTestnetGenesis", "obsolete": true },
     { "name": "fixXahauV1", "introduced": "2023.12.29", "enabled": { "ledger_index": 2060289, "date": "2024-01-10" } },
     { "name": "fixXahauV2", "introduced": "2024.1.25", "enabled": { "ledger_index": 2718721, "date": "2024-02-03" } },
     { "name": "fixXahauV3", "introduced": "2025.2.6", "enabled": { "ledger_index": 12125185, "date": "2025-02-16" } },

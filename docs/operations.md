@@ -244,8 +244,11 @@ indexed `EnableAmendment` transactions from the database the `GH_CLICKHOUSE_*` v
 
 On a testnet it checks the family file against the testnet's node (by default the first default endpoint of the testnet profile). A
 testnet runs newer builds than mainnet, so its node can know names the file lacks: on 2026-10-24 Xahau Testnet had 14 amendments that Xahau
-mainnet did not (`RNG`, `HookOnV2` and `fixXahauTestnetGenesis` among them), and each belongs in `xahau.json` like any other new name. The
-third list is always empty on a testnet, because the file's `enabled` entries are dropped there and none can contradict the index.
+mainnet did not (`RNG`, `HookOnV2` and `fixXahauTestnetGenesis` among them), and each belongs in `xahau.json` like any other new name. A name
+that only a testnet's own build has, and no release carries (`fixXahauTestnetGenesis`), is marked `obsolete: true` as well: the file is shared,
+and unmarked the name would be a `voting` row with no votes for ever on Xahau mainnet, whose node does not know it. Marked, mainnet shows it
+`obsolete` and the testnet, whose ledger lists it, `enabled`. The third list is always empty on a testnet, because the file's `enabled`
+entries are dropped there and none can contradict the index.
 
 | List | What to do |
 | --- | --- |
