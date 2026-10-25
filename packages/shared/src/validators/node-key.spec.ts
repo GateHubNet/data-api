@@ -4,7 +4,12 @@ import { encodeAccountPublic, encodeNodePublic } from 'ripple-address-codec';
 import { isNodePublicKey, nodePublicKeyFromHex, nodePublicKeyToHex } from './node-key';
 
 const UNL_DIR = join(__dirname, '..', '..', 'test', 'fixtures');
-const LISTS = ['xrpl/unl/vl.ripple.com.json', 'xrpl/unl/unl.xrplf.org.json', 'xahau/unl/vl.xahau.org.json'];
+const LISTS = [
+  'xrpl/unl/vl.ripple.com.json',
+  'xrpl/unl/unl.xrplf.org.json',
+  'xahau/unl/vl.xahau.org.json',
+  'xrpl-testnet/unl/vl.altnet.rippletest.net.json',
+];
 
 /** The master keys (66 upper hex digits) of every validator in the recorded lists, and the publishers' keys. */
 function recordedKeys(): string[] {
@@ -20,8 +25,8 @@ function recordedKeys(): string[] {
 describe('node public keys', () => {
   const keys = recordedKeys();
 
-  it('reads the recorded keys: 35 + 35 + 19 validators and 3 publishers', () => {
-    expect(keys).toHaveLength(35 + 35 + 19 + 3);
+  it('reads the recorded keys: 35 + 35 + 19 + 6 validators and 4 publishers', () => {
+    expect(keys).toHaveLength(35 + 35 + 19 + 6 + 4);
     expect(new Set(keys.map((key) => key.slice(0, 2)))).toEqual(new Set(['ED']));
   });
 

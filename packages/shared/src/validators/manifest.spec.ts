@@ -29,7 +29,12 @@ function recorded(file: string) {
   return { list, validators: blob.validators };
 }
 
-const RECORDED = ['xrpl/unl/vl.ripple.com.json', 'xrpl/unl/unl.xrplf.org.json', 'xahau/unl/vl.xahau.org.json'];
+const RECORDED = [
+  'xrpl/unl/vl.ripple.com.json',
+  'xrpl/unl/unl.xrplf.org.json',
+  'xahau/unl/vl.xahau.org.json',
+  'xrpl-testnet/unl/vl.altnet.rippletest.net.json',
+];
 
 const hexOf = (base64: string) => Buffer.from(base64, 'base64').toString('hex').toUpperCase();
 

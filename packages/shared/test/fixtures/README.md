@@ -274,8 +274,9 @@ ledgers kept (13 KB gzipped, largest 8 KB), 22 transactions. The ledgers were ch
    21799060; fewer than a third of them hold an XRP payment); 21799042 to 21799044 hold XRP payments, `OfferCreate`, `AMMDeposit`
    and `Batch`.
 
-`--ledgers 21799042,21799043,21799044 --delay-ms 500`. The Testnet is busy: a ledger holds 3 to 21 transactions, many of them
-`OracleSet` from the same few accounts, `Batch` and `OfferCreate`. The node answered every request, no throttling.
+`--ledgers 21799042,21799043,21799044 --delay-ms 500`. The Testnet is busy: the three recorded ledgers hold 3, 14 and 5
+transactions, many of them `OracleSet` from the same few accounts, `Batch` and `OfferCreate`. The node answered every request, no
+throttling.
 
 | TransactionType | Ledger   | Transaction                                                        |
 | --------------- | -------- | ------------------------------------------------------------------ |
@@ -345,22 +346,22 @@ Recorded 2026-10-19 (06:42 UTC) with `record:fixtures -- --unl` (below). All thr
 | ------------------------------------------------ | ---------------------------------- | -------- | ---------- | -------------------- | ----- |
 | `xrpl-testnet/unl/vl.altnet.rippletest.net.json` | `https://vl.altnet.rippletest.net` | 59       | 6          | 2027-08-07T17:31:06Z | 3790  |
 
-It verifies with the key of the `xrpl-testnet` profile (`ED264807…5860`); only `unl-list.spec.ts` reads it. Xahau Testnet has
-no publisher, so there is no list to record for it: its four validators are `defaultUnlValidators`.
+It verifies with the key of the `xrpl-testnet` profile (`ED264807…5860`), and the three specs above read it like the other lists.
+Xahau Testnet has no publisher, so there is no list to record for it: its four validators are `defaultUnlValidators`.
 
-Every validator entry in the three mainnet lists carries its manifest (35 + 35 + 19 manifests; the testnet list's 6 as
-well); each decodes, re-encodes identically and verifies. The specs assert these sequences and counts, so after
+Every validator entry in the four lists carries its manifest (35 + 35 + 19 + 6 manifests); each decodes, re-encodes identically
+and verifies. The specs assert these sequences and counts, so after
 re-recording they have to be updated to what the new lists say. The specs take the time from the data (expiration minus one second, and so on), never from the
 clock, so the lists expiring does not break them.
 
 #### Re-recording
 
 ```bash
-pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|xahau [--out <dir>]
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|xahau|xrpl-testnet [--out <dir>]
 ```
 
-`--unl` needs no `--endpoint` and takes none of the ledger options; `--out` defaults to `test/fixtures/<network>/unl`. It
-GETs the URL of each default publisher of the network profile (Node `https`, at most 3 redirects, 20 s, 1 MiB) and
+(`xahau-testnet` is accepted and records nothing: it has no publisher.) `--unl` needs no `--endpoint` and takes none of the
+ledger options; `--out` defaults to `test/fixtures/<network>/unl`. It GETs the URL of each default publisher of the network profile (Node `https`, at most 3 redirects, 20 s, 1 MiB) and
 writes the body unchanged. Do not run a formatter over these files.
 
 ### Network state (`xrpl/network-state/`, `xahau/network-state/`, `xahau-testnet/network-state/`)
