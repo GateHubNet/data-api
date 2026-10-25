@@ -25,7 +25,12 @@ async function build(network: 'xrpl' | 'xahau', amendmentsConfig: string): Promi
     providers: [
       {
         provide: SyncerConfig,
-        useValue: Object.assign(new SyncerConfig(), { network, unlPublishers: '', amendmentsConfig }),
+        useValue: Object.assign(new SyncerConfig(), {
+          network,
+          unlPublishers: '',
+          unlValidators: '',
+          amendmentsConfig,
+        }),
       },
       { provide: NETWORK_PROFILE, useValue: getNetworkProfile(network) },
       { provide: NODE_CLIENT, useValue: { request: jest.fn() } },

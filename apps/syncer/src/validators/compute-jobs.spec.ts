@@ -52,7 +52,7 @@ function recordingClickHouse(answer: (sql: string, params: Record<string, unknow
   return { ch, calls };
 }
 
-const config = () => Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS });
+const config = () => Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS, unlValidators: '' });
 const quiet = { log: () => undefined, warn: () => undefined, error: () => undefined };
 const tick = (): ComputeTick => ({ now: NOW_MS, deadline: NOW_MS + 60_000, signal: new AbortController().signal });
 

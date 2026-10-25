@@ -61,7 +61,7 @@ export interface ListContext {
 /** The `ListContext` of a run: the stored lists of the configured publishers, and the threshold. */
 export async function loadListContext(
   ch: Pick<ClickHouseService, 'query'>,
-  cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlThreshold'>,
+  cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'unlThreshold'>,
 ): Promise<ListContext> {
   const publishers = unlPublishersOf(cfg).map((publisher) => publisher.id);
   return { lists: await readStoredLists(ch, publishers), publishers, threshold: unlThresholdOf(cfg) };

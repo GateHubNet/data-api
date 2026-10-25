@@ -282,7 +282,7 @@ export interface ValidatorsAppOptions {
   clickhouse: ClickHouseConfig;
   node: FakeNode;
   web: TestWeb;
-  /** Over the defaults of `SyncerConfig`: an empty `unlPublishers` and the fake node as every endpoint. */
+  /** Over the defaults of `SyncerConfig`: an empty `unlPublishers` and `unlValidators` and the fake node as every endpoint. */
   config?: Partial<SyncerConfig>;
   /** Over the defaults: a quiet logger and the fetch options of `web`. */
   worker?: ValidatorsWorkerOptions;
@@ -307,6 +307,7 @@ export async function startValidatorsApp(o: ValidatorsAppOptions): Promise<Valid
     validationEndpoints: o.node.url,
     workers: [...workers].join(','),
     unlPublishers: '',
+    unlValidators: '',
     ...o.config,
   });
   const options: ValidatorsWorkerOptions = { logger: quietLogger(), fetch: o.web.fetchOptions(), ...o.worker };

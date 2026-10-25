@@ -6,6 +6,7 @@ import {
   networkChoiceText,
   NetworkProfile,
   parseUnlPublishers,
+  parseUnlValidators,
   UnlPublisherConfig,
 } from '@gatehub/data-api-shared/dist/network';
 import { ConfigService, ConfigValue } from '@gatehub/toolbox/lib/config';
@@ -103,41 +104,53 @@ const IsEndpointList = validator(
   (variable) => `${variable} must be a comma separated list of ws:// or wss:// URLs`,
 );
 
-/** The publishers of a `GH_UNL_PUBLISHERS` text, or the reason it cannot be read (the message names the variable). */
-function tryParsePublishers(text: unknown): { publishers: UnlPublisherConfig[] } | { reason: string } {
+/** Why `parse` refuses a list setting (the message names the variable), or `undefined` when it reads it. */
+function refusalOf(parse: (text: string) => unknown, text: unknown): string | undefined {
   try {
-    return { publishers: parseUnlPublishers(String(text)) };
+    parse(String(text));
+    return undefined;
   } catch (err) {
-    return { reason: (err as Error).message };
+    return (err as Error).message;
   }
 }
 
 /** Every entry of `GH_UNL_PUBLISHERS` must be a valid `url=key` pair; the message is the one `parseUnlPublishers` throws. */
 const IsUnlPublishers = validator(
   'isUnlPublishers',
-  (value) => 'publishers' in tryParsePublishers(value),
-  (variable, args) => {
-    const parsed = tryParsePublishers(args.value);
-    return 'reason' in parsed ? parsed.reason : `${variable} is invalid`;
-  },
+  (value) => refusalOf(parseUnlPublishers, value) === undefined,
+  (variable, args) => refusalOf(parseUnlPublishers, args.value) ?? `${variable} is invalid`,
 );
 
+/** Every entry of `GH_UNL_VALIDATORS` must be a validator public key; the message is the one `parseUnlValidators` throws. */
+const IsUnlValidators = validator(
+  'isUnlValidators',
+  (value) => refusalOf(parseUnlValidators, value) === undefined,
+  (variable, args) => refusalOf(parseUnlValidators, args.value) ?? `${variable} is invalid`,
+);
+
+/** `unlListCount` of the settings of `config`, or `undefined` when a list cannot be read. */
+function readableListCount(config: SyncerConfig): number | undefined {
+  try {
+    return unlListCount(config);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * The threshold may not exceed the number of publishers. Publishers that cannot be read, and a threshold that is not a
- * non-negative integer, are reported on their own (by `IsUnlPublishers` and `IntValue`), and not again here.
+ * The threshold may not exceed the number of lists (`unlListCount`). Lists that cannot be read, and a threshold that is not
+ * a non-negative integer, are reported on their own (by `IsUnlPublishers`, `IsUnlValidators` and `IntValue`), and not again
+ * here.
  */
 const IsWithinPublishers = validator(
   'isWithinPublishers',
   (value, args) => {
-    const parsed = tryParsePublishers((args.object as SyncerConfig).unlPublishers);
-    if (!('publishers' in parsed) || !Number.isSafeInteger(value) || (value as number) < 0) return true;
-    return (value as number) <= parsed.publishers.length;
+    const count = readableListCount(args.object as SyncerConfig);
+    if (count === undefined || !Number.isSafeInteger(value) || (value as number) < 0) return true;
+    return (value as number) <= count;
   },
-  (variable, args) => {
-    const parsed = tryParsePublishers((args.object as SyncerConfig).unlPublishers);
-    const count = 'publishers' in parsed ? parsed.publishers.length : 0;
-    return `${variable} must be between 0 and the number of publishers (${count})`;
-  },
+  (variable, args) =>
+    `${variable} must be between 0 and the number of lists (${readableListCount(args.object as SyncerConfig) ?? 0})`,
 );
 
 /** An integer between `min` and `max`, read from the env as plain decimal digits (so `1.5`, `1e3` and `abc` are invalid). */
@@ -168,13 +181,19 @@ function IntValue(options: { min: number; max?: number; optional?: boolean }): P
 
 /**
  * A string that may be empty (`GH_UNL_PUBLISHERS=`): an unset variable takes `fallback` (the initializer by default), a set
- * one is used as it is (trimmed), and an empty value skips the other validators of the property.
+ * one is used as it is (trimmed), and an empty value skips the other validators of the property. With `defaultWord`, a
+ * value that is `default` (in any case, once trimmed) takes the fallback as an unset one does.
  */
-function MaybeEmptyText(fallback?: (obj: Record<string, unknown>) => string): PropertyDecorator {
+function MaybeEmptyText(
+  fallback?: (obj: Record<string, unknown>) => string,
+  options: { defaultWord?: boolean } = {},
+): PropertyDecorator {
   return (target, key) => {
     Transform(({ obj }) => {
       const value = obj[key as string];
-      return typeof value === 'string' ? value.trim() : (fallback?.(obj) ?? defaultOf(key as string));
+      const text = typeof value === 'string' ? value.trim() : undefined;
+      if (text !== undefined && !(options.defaultWord && text.toLowerCase() === 'default')) return text;
+      return fallback?.(obj) ?? defaultOf(key as string);
     })(target, key);
     ValidateIf((config: Record<string, unknown>) => config[key as string] !== '')(target, key);
     IsString()(target, key);
@@ -217,6 +236,11 @@ function defaultNodeEndpoints(obj: Record<string, unknown>): string {
 /** The default validator list publishers of `GH_NETWORK` (a Xahau syncer must not fall back to the XRPL lists). */
 function defaultUnlPublishersOf(obj: Record<string, unknown>): string {
   return networkProfileOf(obj).defaultUnlPublishers;
+}
+
+/** The default fixed validator list of `GH_NETWORK` (Xahau Testnet's four keys; the other networks have none). */
+function defaultUnlValidatorsOf(obj: Record<string, unknown>): string {
+  return networkProfileOf(obj).defaultUnlValidators;
 }
 
 export class SyncerConfig {
@@ -305,12 +329,23 @@ export class SyncerConfig {
 
   /**
    * `GH_UNL_PUBLISHERS`: comma separated `url=publicKey` validator list publishers of the `validators` worker (see
-   * `parseUnlPublishers`). Unset: the default publishers of `network`. Set but empty: no lists, so every validator is untrusted.
+   * `parseUnlPublishers`). Unset or `default`: the default publishers of `network`. Set but empty: no publishers.
    */
   @ConfigValue()
-  @MaybeEmptyText(defaultUnlPublishersOf)
+  @MaybeEmptyText(defaultUnlPublishersOf, { defaultWord: true })
   @IsUnlPublishers()
   unlPublishers!: string;
+
+  /**
+   * `GH_UNL_VALIDATORS`: comma separated validator public keys (`n…`), a validator list fixed in the configuration, which
+   * counts as a list of its own beside the publishers' (see `parseUnlValidators`). Unset or `default`: the fixed list of
+   * `network` (Xahau Testnet's four keys, the other networks have none). Set but empty: none. With neither publishers nor
+   * validators, every validator is untrusted.
+   */
+  @ConfigValue()
+  @MaybeEmptyText(defaultUnlValidatorsOf, { defaultWord: true })
+  @IsUnlValidators()
+  unlValidators!: string;
 
   /** `GH_UNL_THRESHOLD`: lists that must name a validator for it to be trusted; 0 is rippled's rule (see `unlThresholdOf`). */
   @ConfigValue()
@@ -393,11 +428,24 @@ export function unlPublishersOf(cfg: Pick<SyncerConfig, 'unlPublishers'>): UnlPu
 }
 
 /**
- * The number of lists that must name a validator for it to be trusted: `GH_UNL_THRESHOLD`, or when that is 0 rippled's rule
- * for the number of publishers (`defaultUnlThreshold`).
+ * The validators of the list fixed in the configuration (`cfg.unlValidators`), parsed, in the order given. A syncer that
+ * booted holds a valid text, so this does not throw there; an invalid one throws `GH_UNL_VALIDATORS entry <n>: <why>`.
  */
-export function unlThresholdOf(cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlThreshold'>): number {
-  return cfg.unlThreshold > 0 ? cfg.unlThreshold : defaultUnlThreshold(unlPublishersOf(cfg).length);
+export function unlValidatorsOf(cfg: Pick<SyncerConfig, 'unlValidators'>): string[] {
+  return parseUnlValidators(cfg.unlValidators);
+}
+
+/** The publishers, plus one when the fixed list is not empty: what the threshold counts (rippled counts its local list so). */
+export function unlListCount(cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlValidators'>): number {
+  return unlPublishersOf(cfg).length + (unlValidatorsOf(cfg).length > 0 ? 1 : 0);
+}
+
+/**
+ * The number of lists that must name a validator for it to be trusted: `GH_UNL_THRESHOLD`, or when that is 0 rippled's rule
+ * for the number of lists (`defaultUnlThreshold` of `unlListCount`).
+ */
+export function unlThresholdOf(cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'unlThreshold'>): number {
+  return cfg.unlThreshold > 0 ? cfg.unlThreshold : defaultUnlThreshold(unlListCount(cfg));
 }
 
 /** The workers named by `cfg.workers`. An empty list enables none; an unknown name throws `Unknown worker "<name>"`. */

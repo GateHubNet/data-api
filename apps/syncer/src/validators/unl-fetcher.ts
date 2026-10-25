@@ -38,7 +38,7 @@ export type UnlOutcome = 'ok' | 'unchanged' | 'stale' | 'expired' | UnlFailure |
 /** The label of the fetch counter for a validator manifest of a stored list that was skipped. */
 const MANIFEST_INVALID = 'validator_manifest_invalid';
 
-type UnlConfig = Pick<SyncerConfig, 'unlPublishers' | 'unlThreshold' | 'unlRefreshMs'>;
+type UnlConfig = Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'unlThreshold' | 'unlRefreshMs'>;
 type UnlStore = Pick<ClickHouseService, 'query' | 'insert'>;
 type UnlMetrics = Pick<
   PrometheusService,

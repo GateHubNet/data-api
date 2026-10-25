@@ -15,6 +15,7 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
 | `xrpl/unl/`                    | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
 | `xahau/unl/`                   | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
+| `xrpl-testnet/unl/`            | The validator list of the XRPL Testnet default publisher, as served (see "UNL lists").  |
 | `xrpl/network-state/`          | Answers of an XRPL node for the validators worker's ledger state (see "Network state"). |
 | `xahau/network-state/`         | The same from a Xahau node (see "Network state").                                       |
 | `xahau-testnet/network-state/` | The same from a Xahau Testnet node (see "Network state").                               |
@@ -320,7 +321,7 @@ only in the amendment state of its `features` (votes, `enabled`) and so in its `
 xahaud's mainnet file it has no `LEDGER_ENTRY_FLAGS`, so Xahau Testnet's account flags are the hand list of Xahau
 (`src/network/account-flags.ts`).
 
-### UNL lists (`xrpl/unl/`, `xahau/unl/`)
+### UNL lists (`xrpl/unl/`, `xahau/unl/`, `xrpl-testnet/unl/`)
 
 Not ledgers: the validator lists the default publishers of each network profile serve (`defaultUnlPublishers`), saved
 byte for byte as served, one file per publisher (`<publisher id>.json`). `FixtureLedgerSource` does not read these
@@ -336,9 +337,20 @@ Recorded 2026-10-19 (06:42 UTC) with `record:fixtures -- --unl` (below). All thr
 | `xrpl/unl/unl.xrplf.org.json` | `https://unl.xrplf.org` | 2026070302 | 35         | 2027-07-03T00:00:00Z | 20255 |
 | `xahau/unl/vl.xahau.org.json` | `https://vl.xahau.org`  | 2026092401 | 19         | 2027-09-25T00:00:00Z | 11232 |
 
-Every validator entry in the three lists carries its manifest (35 + 35 + 19 manifests); each decodes, re-encodes
-identically and verifies. The specs assert these sequences and counts, so after re-recording they have to be updated to
-what the new lists say. The specs take the time from the data (expiration minus one second, and so on), never from the
+`xrpl-testnet/unl/vl.altnet.rippletest.net.json` was recorded 2026-10-25 (01:11 UTC) the same way
+(`record:fixtures -- --unl --network xrpl-testnet`): a version 1 list with one blob, no `effective` time and no
+`refresh_interval`, like the three above.
+
+| Publisher (file)                                 | Source URL                         | Sequence | Validators | Expires (blob)       | Bytes |
+| ------------------------------------------------ | ---------------------------------- | -------- | ---------- | -------------------- | ----- |
+| `xrpl-testnet/unl/vl.altnet.rippletest.net.json` | `https://vl.altnet.rippletest.net` | 59       | 6          | 2027-08-07T17:31:06Z | 3790  |
+
+It verifies with the key of the `xrpl-testnet` profile (`ED264807…5860`); only `unl-list.spec.ts` reads it. Xahau Testnet has
+no publisher, so there is no list to record for it: its four validators are `defaultUnlValidators`.
+
+Every validator entry in the three mainnet lists carries its manifest (35 + 35 + 19 manifests; the testnet list's 6 as
+well); each decodes, re-encodes identically and verifies. The specs assert these sequences and counts, so after
+re-recording they have to be updated to what the new lists say. The specs take the time from the data (expiration minus one second, and so on), never from the
 clock, so the lists expiring does not break them.
 
 #### Re-recording

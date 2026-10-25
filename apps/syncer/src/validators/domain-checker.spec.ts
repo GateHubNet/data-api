@@ -443,6 +443,7 @@ function setup(o: { profile?: NetworkProfile; publishers?: string; recheckMs?: n
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
   const cfg = {
     unlPublishers: o.publishers ?? PUBLISHERS,
+    unlValidators: '',
     domainRecheckMs: o.recheckMs ?? RECHECK_MS,
     domainFetchTimeoutMs: o.timeoutMs ?? 10_000,
   };

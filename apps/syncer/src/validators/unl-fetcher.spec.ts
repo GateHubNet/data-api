@@ -210,6 +210,7 @@ function setup(
   const fetcher = new UnlFetcher(
     {
       unlPublishers: o.publishers ?? `${URL1}=${PUBLISHER.publicKeyHex}`,
+      unlValidators: '',
       unlThreshold: o.threshold ?? 0,
       unlRefreshMs: o.refreshMs ?? 300_000,
     },

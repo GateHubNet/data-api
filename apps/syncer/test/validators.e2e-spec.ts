@@ -1857,7 +1857,7 @@ describe('the validators worker (e2e)', () => {
 
     /** A job of its own over the database of the test (a restart is another one). */
     function makeJob(now?: () => number): RoundsJob {
-      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS });
+      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS, unlValidators: '' });
       const logger = { log: () => undefined, warn: (line: string) => void warnings.push(line), error: () => undefined };
       return new RoundsJob(db.ch, cfg, new PrometheusService(), { now, logger });
     }
@@ -3445,7 +3445,7 @@ describe('the validators worker (e2e)', () => {
 
     /** A job of its own over the database of the test (a restart is another one). */
     function makeJob(now?: () => number): AgreementJob {
-      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS });
+      const cfg = Object.assign(new SyncerConfig(), { unlPublishers: PUBLISHERS, unlValidators: '' });
       const logger = {
         log: (line: string) => void lines.push(line),
         warn: (line: string) => void lines.push(line),

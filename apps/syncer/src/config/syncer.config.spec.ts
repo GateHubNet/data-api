@@ -1,5 +1,13 @@
 import { getNetworkProfile, NETWORK_NAMES, networkChoiceText } from '@gatehub/data-api-shared/dist/network';
-import { enabledWorkers, endpointHost, SyncerConfig, unlPublishersOf, unlThresholdOf } from './syncer.config';
+import {
+  enabledWorkers,
+  endpointHost,
+  SyncerConfig,
+  unlListCount,
+  unlPublishersOf,
+  unlThresholdOf,
+  unlValidatorsOf,
+} from './syncer.config';
 
 interface Loaded {
   cfg: SyncerConfig;
@@ -13,6 +21,10 @@ const MINIMAL_ENV = { GH_NODE_ENDPOINTS: 'wss://s2.ripple.com' };
 
 /** A syntactically valid publisher key (66 hex digits, `ED`...) that differs per `digit`. */
 const publisherKey = (digit: string) => `ED${digit.repeat(64)}`;
+
+/** The four validator keys of Xahau Testnet's fixed list: valid `n…` keys, in the order of its profile. */
+const VALIDATOR_KEYS = getNetworkProfile('xahau-testnet').defaultUnlValidators.split(',');
+const [K0, K1] = VALIDATOR_KEYS;
 
 /**
  * Runs the real toolbox ConfigService pipeline (env -> class-transformer -> class-validator) against `env` in an
@@ -73,6 +85,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       validationEndpoints: 'wss://s2.ripple.com',
       workers: 'ingest,validations,fee_stats,aggregator,validators',
       unlPublishers: getNetworkProfile('xrpl').defaultUnlPublishers,
+      unlValidators: '',
       unlThreshold: 0,
       unlRefreshMs: 300000,
       domainVerification: true,
@@ -351,6 +364,38 @@ describe('SyncerConfig (GH_* environment)', () => {
       }
     });
 
+    it.each(['default', 'DEFAULT', ' Default '])(
+      "takes GH_UNL_PUBLISHERS=%j as the network's default",
+      async (value) => {
+        for (const network of NETWORK_NAMES) {
+          const { cfg, exits } = await loadConfig({ GH_NETWORK: network, GH_UNL_PUBLISHERS: value });
+          expect({ network, exits }).toEqual({ network, exits: [] });
+          expect(cfg.unlPublishers).toBe(getNetworkProfile(network).defaultUnlPublishers);
+        }
+      },
+    );
+
+    it("gives XRPL Testnet its publisher and Xahau Testnet none, unset or as 'default'", async () => {
+      const envs: Record<string, string>[] = [{}, { GH_UNL_PUBLISHERS: 'default' }];
+      for (const env of envs) {
+        const xrplTestnet = await loadConfig({ ...env, GH_NETWORK: 'xrpl-testnet' });
+        expect(xrplTestnet.exits).toEqual([]);
+        expect(unlPublishersOf(xrplTestnet.cfg).map((p) => p.id)).toEqual(['vl.altnet.rippletest.net']);
+        const xahauTestnet = await loadConfig({ ...env, GH_NETWORK: 'xahau-testnet' });
+        expect(xahauTestnet.exits).toEqual([]);
+        expect(unlPublishersOf(xahauTestnet.cfg)).toEqual([]);
+      }
+    });
+
+    it('reads default only as the whole value, not as part of a list', async () => {
+      const { exits, errors } = await loadConfig({
+        ...MINIMAL_ENV,
+        GH_UNL_PUBLISHERS: `default,https://x.example=${publisherKey('1')}`,
+      });
+      expect(exits).toEqual([1]);
+      expect(errors).toContain('GH_UNL_PUBLISHERS entry 1: must be url=key');
+    });
+
     it('means no lists when set but empty (blank counts as empty here, not as unset)', async () => {
       for (const value of ['', '  ']) {
         const { cfg, exits } = await loadConfig({ ...MINIMAL_ENV, GH_UNL_PUBLISHERS: value });
@@ -394,6 +439,16 @@ describe('SyncerConfig (GH_* environment)', () => {
       expect(errors).toContain(`GH_UNL_PUBLISHERS ${why}`);
     });
 
+    it('refuses the id local, which names the fixed list', async () => {
+      const { exits, errors } = await loadConfig({
+        ...MINIMAL_ENV,
+        GH_UNL_PUBLISHERS: `https://local=${publisherKey('1')}`,
+      });
+      expect(exits).toEqual([1]);
+      // the ConfigService prints the failures as JSON, which escapes the quotes
+      expect(errors).toContain('GH_UNL_PUBLISHERS entry 1: the id \\"local\\" is reserved');
+    });
+
     it('is reported alone: the threshold is not checked against publishers that cannot be read', async () => {
       const { exits, errors } = await loadConfig({
         ...MINIMAL_ENV,
@@ -406,26 +461,130 @@ describe('SyncerConfig (GH_* environment)', () => {
     });
   });
 
+  describe('GH_UNL_VALIDATORS', () => {
+    it("is the network's fixed list when unset or default, none when empty, and itself when a list", async () => {
+      const unset = await loadConfig({ GH_NETWORK: 'xahau-testnet' });
+      expect(unset.exits).toEqual([]);
+      expect(unset.cfg.unlValidators).toBe(getNetworkProfile('xahau-testnet').defaultUnlValidators);
+      expect(unlValidatorsOf(unset.cfg)).toEqual(VALIDATOR_KEYS);
+
+      for (const value of ['default', 'DEFAULT', ' Default ']) {
+        const word = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_VALIDATORS: value });
+        expect({ value, exits: word.exits }).toEqual({ value, exits: [] });
+        expect(unlValidatorsOf(word.cfg)).toEqual(VALIDATOR_KEYS);
+      }
+
+      for (const value of ['', '  ']) {
+        const empty = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_VALIDATORS: value });
+        expect({ value, exits: empty.exits }).toEqual({ value, exits: [] });
+        expect(empty.cfg.unlValidators).toBe('');
+        expect(unlValidatorsOf(empty.cfg)).toEqual([]);
+      }
+
+      const list = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_VALIDATORS: ` ${K0}, ${K1} ` });
+      expect(list.exits).toEqual([]);
+      expect(list.cfg.unlValidators).toBe(`${K0}, ${K1}`);
+      expect(unlValidatorsOf(list.cfg)).toEqual([K0, K1]);
+
+      const xrpl = await loadConfig({ GH_NETWORK: 'xrpl' });
+      expect(xrpl.exits).toEqual([]);
+      expect(unlValidatorsOf(xrpl.cfg)).toEqual([]);
+    });
+
+    it('has no fixed list on the other networks, whether unset or default', async () => {
+      const envs: Record<string, string>[] = [{}, { GH_UNL_VALIDATORS: 'default' }];
+      for (const network of ['xrpl', 'xahau', 'xrpl-testnet']) {
+        for (const env of envs) {
+          const { cfg, exits } = await loadConfig({ ...env, GH_NETWORK: network });
+          expect({ network, exits }).toEqual({ network, exits: [] });
+          expect(unlValidatorsOf(cfg)).toEqual([]);
+        }
+      }
+    });
+
+    it('may be set on any network, beside its publishers', async () => {
+      const { cfg, exits } = await loadConfig({ GH_NETWORK: 'xrpl', GH_UNL_VALIDATORS: K0 });
+      expect(exits).toEqual([]);
+      expect(unlValidatorsOf(cfg)).toEqual([K0]);
+      expect(unlPublishersOf(cfg).map((p) => p.id)).toEqual(['vl.ripple.com', 'unl.xrplf.org']);
+    });
+
+    it.each([
+      ['an entry that is not a key', `${K0},nonsense`, 'entry 2: must be a validator public key (n…)'],
+      ['a publisher key', publisherKey('1'), 'entry 1: must be a validator public key (n…)'],
+      ['a key listed twice', `${K0}, ${K0}`, 'entry 2: repeats a key'],
+    ])('fails the boot, naming the variable, for %s', async (_what, value, why) => {
+      const { exits, errors } = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_VALIDATORS: value });
+      expect(exits).toEqual([1]);
+      expect(errors).toContain(`GH_UNL_VALIDATORS ${why}`);
+    });
+
+    it('reads default only as the whole value, not as part of a list', async () => {
+      const { exits, errors } = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_VALIDATORS: `default,${K0}` });
+      expect(exits).toEqual([1]);
+      expect(errors).toContain('GH_UNL_VALIDATORS entry 1: must be a validator public key (n…)');
+    });
+
+    it('is reported alone: the threshold is not checked against lists that cannot be read', async () => {
+      const { exits, errors } = await loadConfig({
+        ...MINIMAL_ENV,
+        GH_UNL_VALIDATORS: 'nonsense',
+        GH_UNL_THRESHOLD: '5',
+      });
+      expect(exits).toEqual([1]);
+      expect(errors).toContain('GH_UNL_VALIDATORS entry 1');
+      expect(errors).not.toContain('GH_UNL_THRESHOLD');
+    });
+  });
+
   describe('GH_UNL_THRESHOLD', () => {
-    it('may be as large as the number of publishers', async () => {
+    it('may be as large as the number of lists', async () => {
       const two = await loadConfig({ ...MINIMAL_ENV, GH_UNL_THRESHOLD: '2' }); // the two XRPL defaults
       expect(two.exits).toEqual([]);
       expect(two.cfg.unlThreshold).toBe(2);
       const none = await loadConfig({ ...MINIMAL_ENV, GH_UNL_PUBLISHERS: '', GH_UNL_THRESHOLD: '0' });
       expect(none.exits).toEqual([]);
+      const withFixed = await loadConfig({ ...MINIMAL_ENV, GH_UNL_VALIDATORS: K0, GH_UNL_THRESHOLD: '3' }); // 2 + local
+      expect(withFixed.exits).toEqual([]);
+      expect(withFixed.cfg.unlThreshold).toBe(3);
     });
 
-    it('fails the boot when it exceeds the number of publishers', async () => {
+    it('fails the boot when it exceeds the number of lists', async () => {
       const three = await loadConfig({ ...MINIMAL_ENV, GH_UNL_THRESHOLD: '3' });
       expect(three.exits).toEqual([1]);
-      expect(three.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of publishers (2)');
+      expect(three.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of lists (2)');
       const one = await loadConfig({ GH_NETWORK: 'xahau', GH_UNL_THRESHOLD: '2' });
       expect(one.exits).toEqual([1]);
-      expect(one.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of publishers (1)');
+      expect(one.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of lists (1)');
       const none = await loadConfig({ ...MINIMAL_ENV, GH_UNL_PUBLISHERS: '', GH_UNL_THRESHOLD: '1' });
       expect(none.exits).toEqual([1]);
-      expect(none.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of publishers (0)');
+      expect(none.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of lists (0)');
+      const four = await loadConfig({ ...MINIMAL_ENV, GH_UNL_VALIDATORS: K0, GH_UNL_THRESHOLD: '4' });
+      expect(four.exits).toEqual([1]);
+      expect(four.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of lists (3)');
     });
+
+    it('counts the fixed list of Xahau Testnet as its one list', async () => {
+      const fine = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_THRESHOLD: '1' });
+      expect(fine.exits).toEqual([]);
+      const two = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_THRESHOLD: '2' });
+      expect(two.exits).toEqual([1]);
+      expect(two.errors).toContain('GH_UNL_THRESHOLD must be between 0 and the number of lists (1)');
+    });
+  });
+
+  it('counts the fixed list among the lists', async () => {
+    const xahauTestnet = await loadConfig({ GH_NETWORK: 'xahau-testnet' });
+    expect(unlListCount(xahauTestnet.cfg)).toBe(1);
+    expect(unlThresholdOf(xahauTestnet.cfg)).toBe(1);
+    const xrpl = await loadConfig({ GH_NETWORK: 'xrpl' });
+    expect(unlListCount(xrpl.cfg)).toBe(2);
+    expect(unlThresholdOf(xrpl.cfg)).toBe(1);
+    const xrplWithFixed = await loadConfig({ GH_NETWORK: 'xrpl', GH_UNL_VALIDATORS: K0 });
+    expect(unlListCount(xrplWithFixed.cfg)).toBe(3);
+    expect(unlThresholdOf(xrplWithFixed.cfg)).toBe(2);
+    const emptied = await loadConfig({ GH_NETWORK: 'xahau-testnet', GH_UNL_VALIDATORS: '' });
+    expect(unlListCount(emptied.cfg)).toBe(0);
   });
 
   it('can be loaded twice (main.ts and the AppModule both load it)', async () => {
@@ -445,7 +604,7 @@ describe('SyncerConfig (GH_* environment)', () => {
   });
 });
 
-describe('unlPublishersOf and unlThresholdOf', () => {
+describe('unlPublishersOf, unlValidatorsOf, unlListCount and unlThresholdOf', () => {
   const list = (count: number) =>
     Array.from({ length: count }, (_, i) => `https://vl${i}.example=${publisherKey(String(i + 1))}`).join(',');
 
@@ -454,13 +613,40 @@ describe('unlPublishersOf and unlThresholdOf', () => {
     expect(unlPublishersOf({ unlPublishers: '' })).toEqual([]);
   });
 
+  it('parses the fixed validators of the setting, in the order given', () => {
+    expect(unlValidatorsOf({ unlValidators: `${K1}, ${K0}` })).toEqual([K1, K0]);
+    expect(unlValidatorsOf({ unlValidators: '' })).toEqual([]);
+    expect(() => unlValidatorsOf({ unlValidators: 'nonsense' })).toThrow(
+      'GH_UNL_VALIDATORS entry 1: must be a validator public key (n…)',
+    );
+  });
+
+  it('counts the publishers, plus one when the fixed list is not empty', () => {
+    expect(unlListCount({ unlPublishers: '', unlValidators: '' })).toBe(0);
+    expect(unlListCount({ unlPublishers: list(2), unlValidators: '' })).toBe(2);
+    expect(unlListCount({ unlPublishers: '', unlValidators: K0 })).toBe(1);
+    expect(unlListCount({ unlPublishers: list(2), unlValidators: VALIDATOR_KEYS.join(',') })).toBe(3);
+  });
+
   it("takes rippled's rule for the threshold when it is 0, and the setting otherwise", () => {
-    expect(unlThresholdOf({ unlPublishers: list(2), unlThreshold: 0 })).toBe(1);
-    expect(unlThresholdOf({ unlPublishers: list(1), unlThreshold: 0 })).toBe(1);
-    expect(unlThresholdOf({ unlPublishers: list(3), unlThreshold: 0 })).toBe(2);
-    expect(unlThresholdOf({ unlPublishers: list(5), unlThreshold: 0 })).toBe(3);
-    expect(unlThresholdOf({ unlPublishers: list(5), unlThreshold: 5 })).toBe(5);
-    expect(unlThresholdOf({ unlPublishers: list(2), unlThreshold: 2 })).toBe(2);
+    const of = (publishers: string, unlThreshold: number, unlValidators = '') =>
+      unlThresholdOf({ unlPublishers: publishers, unlValidators, unlThreshold });
+    expect(of(list(2), 0)).toBe(1);
+    expect(of(list(1), 0)).toBe(1);
+    expect(of(list(3), 0)).toBe(2);
+    expect(of(list(5), 0)).toBe(3);
+    expect(of(list(5), 5)).toBe(5);
+    expect(of(list(2), 2)).toBe(2);
+  });
+
+  it("counts the fixed list for rippled's rule, as rippled counts its local list", () => {
+    const of = (publishers: string, unlValidators: string) =>
+      unlThresholdOf({ unlPublishers: publishers, unlValidators, unlThreshold: 0 });
+    expect(of('', K0)).toBe(1); // Xahau Testnet: the fixed list alone
+    expect(of(list(1), K0)).toBe(1);
+    expect(of(list(2), K0)).toBe(2); // three lists: 2
+    expect(of(list(4), K0)).toBe(3); // five lists: 3
+    expect(unlThresholdOf({ unlPublishers: list(2), unlValidators: K0, unlThreshold: 3 })).toBe(3);
   });
 });
 

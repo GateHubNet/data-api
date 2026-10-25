@@ -17,7 +17,7 @@ function load(file: string): Body {
 }
 
 /** The configured key of a default publisher of a network profile. */
-function configuredKey(network: 'xrpl' | 'xahau', id: string): string {
+function configuredKey(network: 'xrpl' | 'xahau' | 'xrpl-testnet', id: string): string {
   const publisher = parseUnlPublishers(getNetworkProfile(network).defaultUnlPublishers).find((p) => p.id === id);
   if (!publisher) throw new Error(`no default publisher ${id} for ${network}`);
   return publisher.publicKey;
@@ -71,6 +71,15 @@ const RECORDED = [
     sequence: 2026092401,
     validators: 19,
     expiration: '2027-09-25T00:00:00.000Z',
+  },
+  {
+    network: 'xrpl-testnet' as const,
+    id: 'vl.altnet.rippletest.net',
+    file: 'xrpl-testnet/unl/vl.altnet.rippletest.net.json',
+    // Recorded 2026-10-25 (01:11 UTC).
+    sequence: 59,
+    validators: 6,
+    expiration: '2027-08-07T17:31:06.000Z',
   },
 ];
 
