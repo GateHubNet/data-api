@@ -1,0 +1,32 @@
+{
+  "network": "xahau-testnet",
+  "endpoint": "wss://xahau-test.net",
+  "recorded_at": "2026-10-25T00:01:50.567Z",
+  "validated_head": 13465283,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {},
+  "ledgers": [
+    {
+      "ledger": 13464678,
+      "bytes": 6423,
+      "gzipBytes": 2178
+    },
+    {
+      "ledger": 13464679,
+      "bytes": 4309,
+      "gzipBytes": 1428
+    },
+    {
+      "ledger": 13464680,
+      "bytes": 8679,
+      "gzipBytes": 2792
+    }
+  ]
+}

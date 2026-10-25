@@ -4,17 +4,19 @@ Raw ledgers used by parser, ledger-writer and API tests. Load a directory with `
 (`src/ingest/fixture-ledger-source.ts`); it reads `<index>.json`, `<index>-<label>.json` and `<index>.json.gz` files and
 ignores everything else in the directory (`manifest.json`, `server_info.json`, `README.md`, ...).
 
-| Directory              | Contents                                                                                |
-| ---------------------- | --------------------------------------------------------------------------------------- |
-| `xrpl/ripple-mock/`    | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
-| `xrpl/recorded/`       | Mainnet ledgers recorded from a public node (see below).                                |
-| `xrpl/amm/`            | Mainnet AMM transactions, one ledger per named case (see below).                        |
-| `xrpl/account-state/`  | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
-| `xahau/recorded/`      | Xahau mainnet ledgers recorded from a public node (see below).                          |
-| `xrpl/unl/`            | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
-| `xahau/unl/`           | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
-| `xrpl/network-state/`  | Answers of an XRPL node for the validators worker's ledger state (see "Network state"). |
-| `xahau/network-state/` | The same from a Xahau node (see "Network state").                                       |
+| Directory                 | Contents                                                                                |
+| ------------------------- | --------------------------------------------------------------------------------------- |
+| `xrpl/ripple-mock/`       | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
+| `xrpl/recorded/`          | Mainnet ledgers recorded from a public node (see below).                                |
+| `xrpl/amm/`               | Mainnet AMM transactions, one ledger per named case (see below).                        |
+| `xrpl/account-state/`     | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
+| `xahau/recorded/`         | Xahau mainnet ledgers recorded from a public node (see below).                          |
+| `xrpl-testnet/recorded/`  | XRPL Testnet ledgers recorded from a public testnet node (see below).                   |
+| `xahau-testnet/recorded/` | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
+| `xrpl/unl/`               | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
+| `xahau/unl/`              | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
+| `xrpl/network-state/`     | Answers of an XRPL node for the validators worker's ledger state (see "Network state"). |
+| `xahau/network-state/`    | The same from a Xahau node (see "Network state").                                       |
 
 ## Recorded fixtures
 
@@ -33,7 +35,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 
 ```bash
 pnpm --filter @gatehub/data-api-shared exec ts-node scripts/record-fixtures.ts \
-  --network xrpl|xahau --endpoint <wss url> --out test/fixtures/<network>/recorded \
+  --network xrpl|xahau|xrpl-testnet|xahau-testnet --endpoint <wss url> --out test/fixtures/<network>/recorded \
   [--ledgers 1,2,3] [--txs HASH,HASH] [--want TypeA,TypeB --scan N] [--delay-ms 75] [--any-result]
 ```
 
@@ -257,6 +259,65 @@ Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, 
 | URITokenMint    | 26541060 | `2EC9B35DA9FABDA4E375EBB158F7454E864FF24DDE4BD597F1EF6C04BC4EF4C3` |
 
 **Not found** within the 5000-ledger window (no successful transaction of that type): `Import`, `SetHook`.
+
+### XRPL Testnet (`xrpl-testnet/recorded/`)
+
+Recorded 2026-10-24 (23:52 UTC) from `wss://s.altnet.rippletest.net:51233` (rippled 3.4.1, network id 1): validated head 21799336, 3
+ledgers kept (13 KB gzipped, largest 8 KB), 22 transactions. The ledgers were chosen by hand, in two steps:
+
+1. The first search, `--want Payment,OfferCreate,AMMDeposit,AMMWithdraw --scan 400`, found `Payment` and `OfferCreate` in the head
+   (21799215), `AMMDeposit` in 21799045 and no `AMMWithdraw`. But every `Payment` of the head is of an issued currency, and the tests
+   need a payment of XRP (`payments.issuer` empty, booked in the network's native currency), so the ledgers around it were no use.
+2. A throwaway script listed the types of each ledger and its XRP payments for 150 ledgers (21799179 to 21799298 and 21799031 to
+   21799060; fewer than a third of them hold an XRP payment); 21799042 to 21799044 hold XRP payments, `OfferCreate`, `AMMDeposit`
+   and `Batch`.
+
+`--ledgers 21799042,21799043,21799044 --delay-ms 500`. The Testnet is busy: a ledger holds 3 to 21 transactions, many of them
+`OracleSet` from the same few accounts, `Batch` and `OfferCreate`. The node answered every request, no throttling.
+
+| TransactionType | Ledger   | Transaction                                                        |
+| --------------- | -------- | ------------------------------------------------------------------ |
+| Payment (XRP)   | 21799042 | `E6EA9BF9D0666C12195CB9D0966FE5696E26F5C6D6D371EFF22E8C22FC6D795F` |
+| Payment (USDT)  | 21799042 | `1980E646B5976831AC1F405626812C012D5DE368F64A5E204B1BE9BAFC318FB9` |
+| OfferCreate     | 21799042 | `CD5E0A6B9D0C5C888FB6B8EDAD4CFED0CF8579AD885297A722A6B050844A97B0` |
+| AMMDeposit      | 21799043 | `D568B878EA85F5361558EFD070EB46DB6E6D5C8598529CBBB6409EF87E523B44` |
+| Payment (XRP)   | 21799043 | `2C6BD91F52F2B113D96683F240F9BCAC0779D342DF6CF389F9D23A0818847E8B` |
+| Batch           | 21799043 | `95B889A7C00705E98172F8DC5EFBEC0BBC697D10C18A7FD2834CEC34BEB95F0F` |
+| Batch           | 21799044 | `38BCE4D22406D6C75FE537135E0D3C42ECFB7961D98A568400623D8C8BF99FC0` |
+
+The ledgers also hold 10 `OracleSet`, 4 more `OfferCreate` and 1 more `Payment` of an issued currency; every
+transaction is `tesSUCCESS`. **Not found** within the 400 ledgers of the search: `AMMWithdraw`.
+
+`server_definitions.json` is bundled as `config/definitions/xrpl-testnet.json`. Today it is byte for byte the file of
+`config/definitions/xrpl.json` (the same rippled 3.4.1 serves both), so XRPL Testnet reads the same account flags and transaction
+types as the XRP Ledger; the two files are separate because a testnet runs newer builds first and will differ when one does.
+
+### Xahau Testnet (`xahau-testnet/recorded/`)
+
+Recorded 2026-10-25 (00:01 UTC) from `wss://xahau-test.net` (xahaud 2026.10.16-tmp-dev, network id 21338): validated head 13465283, 3
+ledgers kept (6 KB gzipped, largest 3 KB), 14 transactions. `--ledgers 13464678,13464679,13464680 --delay-ms 500`, chosen after
+`--want Payment,SetHook,URITokenMint --scan 400` (run first) found only a `Payment` (in 13465104) and a second search
+of 3000 ledgers (it stopped after 658, with all three found: `Payment` 13465149, `SetHook` 13464573, `URITokenMint` 13464676) located
+the others. The testnet is quiet: most ledgers hold nothing but the 4 `Entropy` pseudo-transactions every ledger has, and a payment
+of XAH is rare (about one ledger in a hundred). No XAH payment is within three ledgers of the `URITokenMint` (the first payment after
+it is in 13464680) or of the `SetHook` (none within 8 ledgers of it), and a test needs a payment of XAH, so the three recorded hold
+the `Payment` and a `URITokenCreateSellOffer` two ledgers after the mint.
+
+| TransactionType         | Ledger   | Transaction                                                        |
+| ----------------------- | -------- | ------------------------------------------------------------------ |
+| URITokenCreateSellOffer | 13464678 | `1E3CAA1AE58D371A599119C225FDC39EFD1D47DF742A1890AF7F3914F4DD1FCE` |
+| Payment (XAH)           | 13464680 | `5183BEE4655CDC7E26866CD48A284D6DAA9CB5888B065AFF857E365EE3D9A38A` |
+
+Besides these, each ledger holds 4 `Entropy` transactions (12 in all): a pseudo-transaction of this build with `Account: ""`, `Fee`
+0, `LedgerSequence`, `PublicKey`, `RandomData` and `NextRandomDigest`, which `server_definitions` names (type 89, in `xahau.json` too). The API shows
+its `Account` as `""`, like the node. Every transaction is `tesSUCCESS`. **Not within the three ledgers** (the searches found them
+at): `URITokenMint` 13464676 (`B45A629E64C94E8BDAC8347CCE1B7B8B8C5005CC8070DD64A73A703B3D2A8D34`), `SetHook` 13464573
+(`5770024E6ADFA34AB3E3D6BC4FE88981C910BB03C51DACE7FC0271CE697F8D1F`); record them with `--ledgers` when a test needs them.
+
+`server_definitions.json` is bundled as `config/definitions/xahau-testnet.json`. It differs from `config/definitions/xahau.json`
+only in the amendment state of its `features` (votes, `enabled`) and so in its `hash`; its types, fields and result codes are the same, and like
+xahaud's mainnet file it has no `LEDGER_ENTRY_FLAGS`, so Xahau Testnet's account flags are the hand list of Xahau
+(`src/network/account-flags.ts`).
 
 ### UNL lists (`xrpl/unl/`, `xahau/unl/`)
 

@@ -7,8 +7,9 @@ export interface AccountFlag {
 }
 
 /**
- * The AccountRoot flags of Xahau. xahaud's `server_definitions` (and so `config/definitions/xahau.json`) has no
- * `LEDGER_ENTRY_FLAGS`, so they are kept here by hand, from `enum LedgerSpecificFlags` ("ltACCOUNT_ROOT") of
+ * The AccountRoot flags of Xahau. xahaud's `server_definitions` (and so `config/definitions/xahau.json` and
+ * `xahau-testnet.json`) has no `LEDGER_ENTRY_FLAGS`, so they are kept here by hand, from `enum LedgerSpecificFlags`
+ * ("ltACCOUNT_ROOT") of
  * https://github.com/Xahau/xahaud/blob/17a484ae4adc551ced360d715be8d27d62b7bb2b/include/xrpl/protocol/LedgerFormats.h
  * (branch `dev`, 2026-10-24). A new flag there is a new line here.
  */
@@ -43,16 +44,17 @@ function toFlags(named: Record<string, unknown>): AccountFlag[] {
 }
 
 /**
- * The account flags a network names, in the order of their bits. The XRP Ledger's come from its definitions
- * (`LEDGER_ENTRY_FLAGS.AccountRoot` of `config/definitions/xrpl.json`); Xahau's are kept by hand (see above). The two lists
- * differ: the same bit can have another name on each network (0x80000000 is AllowTrustLineClawback on the XRP Ledger and
- * DisallowIncomingRemit on Xahau), and a flag of one may not exist on the other.
+ * The account flags a network names, in the order of their bits. The source follows the family: an XRP Ledger network
+ * reads them from its own definitions (`LEDGER_ENTRY_FLAGS.AccountRoot` of `config/definitions/<network>.json`, so XRPL
+ * Testnet's come from the file of its node and not from mainnet's), a Xahau network takes the hand list above. The two
+ * lists differ: the same bit can have another name on each family (0x80000000 is AllowTrustLineClawback on the XRP Ledger
+ * and DisallowIncomingRemit on Xahau), and a flag of one may not exist on the other. The cache is keyed by network name.
  */
 export function accountFlagsOf(profile: NetworkProfile): readonly AccountFlag[] {
   const known = cache.get(profile.name);
   if (known) return known;
   let named: Record<string, unknown>;
-  if (profile.name === 'xahau') {
+  if (profile.family === 'xahau') {
     named = XAHAU_ACCOUNT_FLAGS;
   } else {
     const definitions = profile.definitionsFallback() as

@@ -32,6 +32,10 @@ export const XRPL_ACCOUNT_STATE_DIR = join(FIXTURES, 'xrpl', 'account-state');
 /** Mainnet ledgers recorded around path payments and the payments that are not ones: see the fixtures README. */
 export const XRPL_PATH_PAYMENTS_DIR = join(FIXTURES, 'xrpl', 'path-payments');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
+/** XRPL Testnet ledgers recorded from a public testnet node (network id 1): see the fixtures README. */
+export const XRPL_TESTNET_RECORDED_DIR = join(FIXTURES, 'xrpl-testnet', 'recorded');
+/** Xahau Testnet ledgers recorded from a public testnet node (network id 21338): see the fixtures README. */
+export const XAHAU_TESTNET_RECORDED_DIR = join(FIXTURES, 'xahau-testnet', 'recorded');
 /** Xahau flag ledger 26570752: 22 UNLReport pseudo-transactions with `Account: ""`, and 15 Payments. */
 export const XAHAU_FLAG_DIR = join(FIXTURES, 'xahau', 'flag');
 export const XAHAU_FLAG_LEDGER = 26570752;
@@ -49,7 +53,9 @@ export type SeedName =
   | 'xrpl-account-state'
   | 'xrpl-path-payments'
   | 'xahau-recorded'
-  | 'xahau-flag';
+  | 'xahau-flag'
+  | 'xrpl-testnet-recorded'
+  | 'xahau-testnet-recorded';
 
 const DIRS: Record<SeedName, string[]> = {
   'ripple-mock': [RIPPLE_MOCK_DIR],
@@ -60,6 +66,8 @@ const DIRS: Record<SeedName, string[]> = {
   'xrpl-path-payments': [XRPL_PATH_PAYMENTS_DIR],
   'xahau-recorded': [XAHAU_RECORDED_DIR],
   'xahau-flag': [XAHAU_FLAG_DIR],
+  'xrpl-testnet-recorded': [XRPL_TESTNET_RECORDED_DIR],
+  'xahau-testnet-recorded': [XAHAU_TESTNET_RECORDED_DIR],
 };
 
 const sources = new Map<SeedName, FixtureLedgerSource>();
@@ -84,6 +92,8 @@ export const SEED_NETWORK: Record<SeedName, NetworkName> = {
   'xrpl-path-payments': 'xrpl',
   'xahau-recorded': 'xahau',
   'xahau-flag': 'xahau',
+  'xrpl-testnet-recorded': 'xrpl-testnet',
+  'xahau-testnet-recorded': 'xahau-testnet',
 };
 
 /**

@@ -322,6 +322,34 @@ describe('network profiles', () => {
         expect.objectContaining({ Import: expect.any(Number), ClaimReward: expect.any(Number) }),
       );
     });
+
+    // A testnet runs newer builds first, so each one bundles the server_definitions of its own node, not mainnet's.
+    type Definitions = {
+      TRANSACTION_TYPES: Record<string, number>;
+      LEDGER_ENTRY_FLAGS?: { AccountRoot?: Record<string, number> };
+    };
+
+    it('bundles the definitions of XRPL Testnet: XRPL types with AMM, no ClaimReward', () => {
+      const d = getNetworkProfile('xrpl-testnet').definitionsFallback() as unknown as Definitions;
+      expect(d.TRANSACTION_TYPES).toEqual(
+        expect.objectContaining({ Payment: expect.any(Number), AMMCreate: expect.any(Number) }),
+      );
+      expect(d.TRANSACTION_TYPES).not.toHaveProperty('ClaimReward');
+      expect(d.LEDGER_ENTRY_FLAGS?.AccountRoot).toBeDefined();
+    });
+
+    it('bundles the definitions of Xahau Testnet: Import and ClaimReward', () => {
+      const d = getNetworkProfile('xahau-testnet').definitionsFallback() as unknown as Definitions;
+      expect(d.TRANSACTION_TYPES).toEqual(
+        expect.objectContaining({
+          Payment: expect.any(Number),
+          Import: expect.any(Number),
+          ClaimReward: expect.any(Number),
+        }),
+      );
+      // like xahaud's mainnet file, it names no ledger entry flags: Xahau's account flags are kept by hand
+      expect(d.LEDGER_ENTRY_FLAGS).toBeUndefined();
+    });
   });
 
   describe('loadMarketsConfig', () => {

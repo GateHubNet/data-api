@@ -43,7 +43,8 @@ RUN --mount=type=secret,id=npm_token,required=true \
   && pnpm --filter @gatehub/data-syncer --legacy deploy --prod /app/out \
   && for f in dist/clickhouse/migrate.js schema/001_baseline.sql schema-shared/001_account_names.sql config/markets/xrpl.json config/markets/xahau.json \
     config/markets/xrpl-testnet.json config/markets/xahau-testnet.json \
-    config/amendments/xrpl.json config/amendments/xahau.json config/definitions/xrpl.json config/definitions/xahau.json; do \
+    config/amendments/xrpl.json config/amendments/xahau.json config/definitions/xrpl.json config/definitions/xahau.json \
+    config/definitions/xrpl-testnet.json config/definitions/xahau-testnet.json; do \
     test -f "/app/out/node_modules/@gatehub/data-api-shared/$f" || { echo "missing $f in the deployed shared package"; exit 1; }; \
   done \
   && test -f /app/out/dist/cli/range-ingest.js

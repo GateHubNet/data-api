@@ -1,4 +1,4 @@
-import { getNetworkProfile, NetworkName, TransactionsRow } from '@gatehub/data-api-shared';
+import { getNetworkProfile, getTxCtid, NetworkName, parseContextFor, TransactionsRow } from '@gatehub/data-api-shared';
 import { Logger } from '@nestjs/common';
 import { BinaryCodecService } from '../src/common/binary-codec.service';
 import { TxService } from '../src/common/tx-object';
@@ -6,7 +6,14 @@ import { ApiConfig } from '../src/config/api.config';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
 import type { XrplService } from '../src/xrpl/xrpl.service';
 import { Harness, startHarness } from './harness';
-import { fixtureSource, fixtureTransactions, SeedName, transactionId, transactionTreeRoot } from './support/fixtures';
+import {
+  fixturePayments,
+  fixtureSource,
+  fixtureTransactions,
+  SeedName,
+  transactionId,
+  transactionTreeRoot,
+} from './support/fixtures';
 
 const MOCK_PAYMENT = '22F26CE4E2270CE3CF4EB61C609E7ADEDCD41D4C1BA2D96D680A9B016C4F47DA';
 
@@ -33,11 +40,7 @@ const keyOf = (row: Pick<TransactionsRow, 'ledger_index' | 'tx_index'>) => ({
   tx_index: row.tx_index,
 });
 
-describe.each<[SeedName, NetworkName]>([
-  ['ripple-mock', 'xrpl'],
-  ['xrpl-recorded', 'xrpl'],
-  ['xahau-recorded', 'xahau'],
-])('TxService on the %s ledgers', (seed, network) => {
+const txServiceTests = (seed: SeedName, network: NetworkName): void => {
   let h: Harness;
   let service: TxService;
   let codec: BinaryCodecService;
@@ -136,6 +139,17 @@ describe.each<[SeedName, NetworkName]>([
     });
   });
 
+  it('computes the CTIDs of its network and books native payments in its currency', () => {
+    const profile = getNetworkProfile(network);
+    const suffix = { xrpl: '0000', xahau: '5359', 'xrpl-testnet': '0001', 'xahau-testnet': '535A' }[network];
+    for (const { row } of all) {
+      expect(getTxCtid(row.ledger_index, row.tx_index, parseContextFor(profile).networkId).endsWith(suffix)).toBe(true);
+    }
+    const native = fixturePayments(seed).filter((p) => p.row.issuer === '');
+    if (seed.includes('testnet')) expect(native.length).toBeGreaterThan(0);
+    for (const { row } of native) expect(row.currency).toBe(profile.nativeCurrency);
+  });
+
   describe('binary form of what is stored', () => {
     it('is built with the bundled definitions of the network when the node does not answer', () => {
       expect(codec.definitionsSource).toBe('profile');
@@ -174,7 +188,8 @@ describe.each<[SeedName, NetworkName]>([
     const { values: before } = await prometheus.txEncodeFallback.get();
     for (const row of rows) {
       const json = service.toTxObject(row, { binary: false });
-      expect(json.tx).toEqual(codec.decode(codec.encode(JSON.parse(row.tx_json))));
+      // roundTrip keeps an Account "" as the node shows it (the Entropy pseudo-transactions of Xahau Testnet have one)
+      expect(json.tx).toEqual(codec.roundTrip(JSON.parse(row.tx_json)));
       expect(json.tx).not.toHaveProperty('DeliverMax');
       expect(typeof service.toTxObject(row, { binary: true }).tx).toBe('string');
     }
@@ -206,7 +221,19 @@ describe.each<[SeedName, NetworkName]>([
     });
     expect(obj.date).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$/);
   });
-});
+};
+
+describe.each<[SeedName, NetworkName]>([
+  ['ripple-mock', 'xrpl'],
+  ['xrpl-recorded', 'xrpl'],
+  ['xahau-recorded', 'xahau'],
+])('TxService on the %s ledgers', txServiceTests);
+
+// Skipped until Task 5: the API boots a testnet only once the amendments loader reads the family's file.
+describe.skip.each<[SeedName, NetworkName]>([
+  ['xrpl-testnet-recorded', 'xrpl-testnet'],
+  ['xahau-testnet-recorded', 'xahau-testnet'],
+])('TxService on the %s ledgers', txServiceTests);
 
 describe('TxService.toTxObject on a fetched mainnet Payment', () => {
   let h: Harness;
