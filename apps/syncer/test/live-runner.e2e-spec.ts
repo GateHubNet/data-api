@@ -921,6 +921,27 @@ describe('LiveRunner (e2e)', () => {
       return svc;
     }
 
+    it('reads the head at boot with a warning for each failed try, as the loop does: no error, not recovering', async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(12));
+      let failures = 2;
+      const validatedHead = source.validatedHead.bind(source);
+      source.validatedHead = async () => {
+        if (failures-- > 0) throw new Error('node unreachable');
+        return validatedHead();
+      };
+      const { runner, logger } = makeRunner(svc, source, { options: { backoffInitialMs: 20, backoffMaxMs: 40 } });
+
+      await within(runner.runOnce(), 15_000, 'the boot');
+
+      expect(logger.lines.filter((l) => l.level === 'error')).toEqual([]);
+      expect(
+        logger.lines.filter((l) => l.level === 'warn' && l.message.startsWith('Could not read the validated head')),
+      ).toHaveLength(2);
+      expect(runner.status().recovering).toBeUndefined();
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+    });
+
     it("halts at boot when the node's head is below the checkpoint under another hash: the network was reset", async () => {
       const svc = await committedTen();
       const metrics = new PrometheusService();

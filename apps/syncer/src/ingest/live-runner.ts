@@ -740,8 +740,13 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         );
       } else {
         // A node whose head is below the checkpoint has no checkpoint to fetch: it is behind or it was reset. Tell which
-        // before waiting for the checkpoint (which then waits for a node that is behind).
-        const head = await this.step(this.source.validatedHead());
+        // before waiting for the checkpoint (which then waits for a node that is behind). The head is read as the loop
+        // reads it, a warning for each failed try: a node that is unreachable or throttled at boot is no news (the
+        // checkpoint fetch below only warned too). Only the comparison's own failure is an error.
+        const head = await this.untilDone('read the validated head', 'warn', () =>
+          this.step(this.source.validatedHead()),
+        );
+        if (head === undefined) throw new StoppedError();
         if (head < checkpoint) await this.compareHeadBelow(head);
         const stored = await this.step(storedLedgerHash(this.ch, checkpoint));
         if (stored === undefined) throw new Error(`The checkpoint ${checkpoint} has no stored hash`);
