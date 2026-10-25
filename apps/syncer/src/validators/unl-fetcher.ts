@@ -3,6 +3,7 @@ import {
   ClickHouseService,
   decodeManifest,
   listInUse,
+  LOCAL_PUBLISHER_ID,
   Manifest,
   StoredUnlList,
   Table,
@@ -18,7 +19,8 @@ import {
   verifyUnlList,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import { SyncerConfig, unlPublishersOf, unlThresholdOf } from '../config/syncer.config';
+import { createHash } from 'crypto';
+import { SyncerConfig, unlPublishersOf, unlThresholdOf, unlValidatorsOf } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { describeError } from './describe-error';
 import { FetchFailure, SAFE_FETCHER, SafeFetcher, SafeFetchError, UNL_FETCH_LIMITS } from './safe-fetch';
@@ -34,6 +36,9 @@ export const UNL_RETRY_MAX_MS = 600_000;
 
 /** What one attempt came to: `ok` (a list was stored), `unchanged`, `stale`, `expired`, or the reason it failed. */
 export type UnlOutcome = 'ok' | 'unchanged' | 'stale' | 'expired' | UnlFailure | FetchFailure;
+
+/** The `expiration` of the list of the fixed validators: the `DateTime` maximum, 2106-02-07T06:28:15Z. It does not expire. */
+export const LOCAL_LIST_EXPIRATION = 4_294_967_295;
 
 /** The label of the fetch counter for a validator manifest of a stored list that was skipped. */
 const MANIFEST_INVALID = 'validator_manifest_invalid';
@@ -93,6 +98,28 @@ const backoff = (failures: number): number =>
   Math.min(UNL_RETRY_INITIAL_MS * 2 ** Math.max(failures - 1, 0), UNL_RETRY_MAX_MS);
 
 /**
+ * The `unl_lists` row of the list fixed in the configuration (`GH_UNL_VALIDATORS`), as the publisher `local` stores it: the
+ * keys sorted, `blob_sha256` the upper-case hex SHA-256 of the sorted keys joined by a line feed, `response` the JSON
+ * `{"validators":[…]}` of the sorted keys, in force from the second `nowSeconds` falls in (`effective`) and until
+ * `LOCAL_LIST_EXPIRATION`, format version 1, no publisher key.
+ */
+export function localListRow(keys: readonly string[], sequence: number, nowSeconds: number): UnlListsRow {
+  const validators = [...keys].sort();
+  return {
+    publisher: LOCAL_PUBLISHER_ID,
+    publisher_key: '',
+    sequence,
+    version: 1,
+    effective: Math.floor(nowSeconds),
+    expiration: LOCAL_LIST_EXPIRATION,
+    validators,
+    blob_sha256: createHash('sha256').update(validators.join('\n')).digest('hex').toUpperCase(),
+    fetched_at: nowSeconds,
+    response: JSON.stringify({ validators }),
+  };
+}
+
+/**
  * Fetches the validator lists (UNL) of the configured publishers and stores the ones that verify (spec 2.1).
  *
  * **Schedule.** Each publisher has its own timer: a fetch at start, then one after `GH_UNL_REFRESH_MS`, or the
@@ -125,6 +152,10 @@ const backoff = (failures: number): number =>
  * backoff, and no metric is set). What was inserted earlier in the same attempt can remain (the manifests, then the lists,
  * then the publisher row), and the retry then reports `unchanged` only if the lists had landed, else `ok`. `stop()` ends
  * the timers and waits for the attempts under way; one that has not yet written anything writes nothing.
+ *
+ * **The fixed list.** The validators of `GH_UNL_VALIDATORS` are stored by `registerPublishers` as the lists of the publisher
+ * `local` (`LOCAL_PUBLISHER_ID`), so that whatever reads the lists of the publishers reads them with no branch of its own. A
+ * new list is written only when the keys change, and `local` is never fetched: it has no timer, no attempt and no metric.
  */
 @Injectable()
 export class UnlFetcher {
@@ -159,10 +190,15 @@ export class UnlFetcher {
    * At start, writes a row for every configured publisher, and sets `configured = 0` on the stored publishers that are no
    * longer configured. The row of a publisher that has none is `ok` with no `last_ok_at`; the row of one that has keeps
    * its stored status, error and `last_ok_at`, so that the first attempt keeps the last time it was ok.
+   *
+   * **The fixed list.** When `GH_UNL_VALIDATORS` is not empty the publisher `local` gets a row too, `ok` as of now, and its
+   * list is stored when it is not the newest stored one (`storeFixedList`). When it is empty a stored `local` is a publisher
+   * no longer configured like any other. `local` is no `Publisher` of the map: nothing fetches it.
    */
   async registerPublishers(): Promise<void> {
     const stored = new Map((await this.storedPublishers()).map((row) => [row.publisher, row]));
     const checkedAt = this.now() / 1000;
+    const fixed = unlValidatorsOf(this.cfg);
     const rows: UnlPublishersRow[] = [];
     for (const p of this.publishers.values()) {
       const row = stored.get(p.config.id);
@@ -170,8 +206,15 @@ export class UnlFetcher {
       p.status = row?.status === 'error' ? 'error' : 'ok';
       rows.push(this.publisherRow(p, checkedAt, row?.status ?? 'ok', row?.error ?? '', p.lastOkAt));
     }
+    if (fixed.length > 0) {
+      // the list first, as an attempt writes its lists before the publisher row: a failure in between is finished by the retry
+      await this.storeFixedList(fixed, checkedAt);
+      rows.push(this.localPublisherRow(checkedAt));
+    }
     for (const [id, row] of stored) {
-      if (this.publishers.has(id) || Number(row.configured) === 0) continue;
+      if (this.publishers.has(id) || (id === LOCAL_PUBLISHER_ID && fixed.length > 0) || Number(row.configured) === 0) {
+        continue;
+      }
       const { last_ok_ms, ...kept } = row;
       rows.push({
         ...kept,
@@ -181,6 +224,39 @@ export class UnlFetcher {
       });
     }
     if (rows.length > 0) await this.ch.insert(Table.UnlPublishers, rows);
+  }
+
+  /**
+   * Stores the fixed list as the next list of the publisher `local` (the newest stored sequence + 1, else 1) when its keys,
+   * sorted, differ from those of the newest stored one, or none is stored. The same keys again write nothing, so that the
+   * lists of `local` stay the history of the keys: a round or an hour of the past reads the list that was in force then.
+   */
+  private async storeFixedList(keys: readonly string[], nowSeconds: number): Promise<void> {
+    const newest = (await readStoredLists(this.ch, [LOCAL_PUBLISHER_ID])).reduce<StoredUnlList | undefined>(
+      (high, list) => (high === undefined || list.sequence > high.sequence ? list : high),
+      undefined,
+    );
+    const sorted = [...keys].sort();
+    if (newest !== undefined) {
+      const held = [...newest.validators].sort();
+      if (held.length === sorted.length && held.every((key, i) => key === sorted[i])) return;
+    }
+    await this.ch.insert(Table.UnlLists, [localListRow(keys, (newest?.sequence ?? 0) + 1, nowSeconds)]);
+  }
+
+  /** The `unl_publishers` row of the fixed list: no URL and no key, the threshold in force, and always `ok` (nothing is fetched). */
+  private localPublisherRow(checkedAt: number): UnlPublishersRow {
+    return {
+      publisher: LOCAL_PUBLISHER_ID,
+      url: '',
+      publisher_key: '',
+      configured: 1,
+      threshold: unlThresholdOf(this.cfg),
+      checked_at: checkedAt,
+      status: 'ok',
+      error: '',
+      last_ok_at: checkedAt,
+    };
   }
 
   /** Starts the timer of every publisher: the first fetch is at once. */

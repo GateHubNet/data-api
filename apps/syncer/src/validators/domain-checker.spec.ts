@@ -430,7 +430,15 @@ async function until(what: string, probe: () => boolean): Promise<void> {
   throw new Error(`Timed out waiting for ${what}`);
 }
 
-function setup(o: { profile?: NetworkProfile; publishers?: string; recheckMs?: number; timeoutMs?: number } = {}) {
+function setup(
+  o: {
+    profile?: NetworkProfile;
+    publishers?: string;
+    validators?: string;
+    recheckMs?: number;
+    timeoutMs?: number;
+  } = {},
+) {
   const ch = new FakeClickHouse();
   const clock = { ms: NOW_MS };
   const fetcher = {
@@ -443,7 +451,7 @@ function setup(o: { profile?: NetworkProfile; publishers?: string; recheckMs?: n
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
   const cfg = {
     unlPublishers: o.publishers ?? PUBLISHERS,
-    unlValidators: '',
+    unlValidators: o.validators ?? '',
     domainRecheckMs: o.recheckMs ?? RECHECK_MS,
     domainFetchTimeoutMs: o.timeoutMs ?? 10_000,
   };
@@ -502,6 +510,52 @@ describe('DomainChecker', () => {
           [b.master.base58, 'verified'],
         ]),
       );
+    });
+
+    it('checks the validators of the fixed list as on a list in use', async () => {
+      const [a, b, c] = [validator(1), validator(2), validator(3)];
+      const t = setup({ validators: `${b.master.base58},${c.master.base58}` });
+      // `a` is on the list of a publisher, `b` and `c` on the fixed list; none of them was ever seen by this deployment
+      t.ch.lists.push(listRow({ sequence: 5, validators: [a.master.base58] }));
+      t.ch.manifests.push(
+        manifestRow(a, { domain: 'a.example' }),
+        manifestRow(b, { domain: 'b.example' }),
+        manifestRow(c, { domain: 'c.example' }),
+      );
+      t.serve({ [url('a.example')]: toml(a.master.base58), [url('b.example')]: toml(b.master.base58) });
+
+      expect(await t.checker.pass()).toBe(3);
+      expect(t.ch.seen).toEqual([]);
+      expect(t.fetched().sort()).toEqual([url('a.example'), url('b.example'), url('c.example')]);
+      expect(t.ch.written.map((r) => [r.validation_public_key, r.status])).toEqual(
+        expect.arrayContaining([
+          [a.master.base58, 'verified'],
+          [b.master.base58, 'verified'],
+          [c.master.base58, 'unverified'],
+        ]),
+      );
+    });
+
+    it('checks the validators of the fixed list when there is no publisher at all', async () => {
+      const [a, other] = [validator(1), validator(2)];
+      const t = setup({ publishers: '', validators: a.master.base58 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }), manifestRow(other, { domain: 'other.example' }));
+      t.serve({ [url('a.example')]: toml(a.master.base58) });
+
+      expect(await t.checker.pass()).toBe(1);
+      expect(t.fetched()).toEqual([url('a.example')]);
+    });
+
+    it('checks a validator once when the fixed list, a publisher and the validators seen all name it', async () => {
+      const a = validator(1);
+      const t = setup({ validators: a.master.base58 });
+      t.ch.lists.push(listRow({ sequence: 5, validators: [a.master.base58] }));
+      t.ch.seen.push({ key: a.master.base58, lastSeen: NOW - 60 });
+      t.ch.manifests.push(manifestRow(a, { domain: 'a.example' }));
+      t.serve({ [url('a.example')]: toml(a.master.base58) });
+
+      expect(await t.checker.pass()).toBe(1);
+      expect(t.fetched()).toEqual([url('a.example')]);
     });
 
     it('takes the validators of the list in use, not of a superseded one', async () => {

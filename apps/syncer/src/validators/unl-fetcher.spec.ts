@@ -6,6 +6,7 @@ import {
   UnlPublishersRow,
   ValidatorManifestsRow,
 } from '@gatehub/data-api-shared';
+import { createHash } from 'crypto';
 import {
   makeManifest,
   makeUnlBlob,
@@ -14,7 +15,7 @@ import {
   testKey,
 } from '../../../../packages/shared/src/test-utils/validator-keys';
 import { SafeFetchError, UNL_FETCH_LIMITS } from './safe-fetch';
-import { UnlFetcher, UnlOutcome } from './unl-fetcher';
+import { LOCAL_LIST_EXPIRATION, localListRow, UnlFetcher, UnlOutcome } from './unl-fetcher';
 
 const NOW_MS = Date.parse('2026-10-19T12:00:00.000Z');
 const NOW = NOW_MS / 1000;
@@ -185,6 +186,7 @@ class FakeClickHouse {
 function setup(
   o: {
     publishers?: string;
+    validators?: string;
     threshold?: number;
     refreshMs?: number;
     serve?: unknown;
@@ -210,7 +212,7 @@ function setup(
   const fetcher = new UnlFetcher(
     {
       unlPublishers: o.publishers ?? `${URL1}=${PUBLISHER.publicKeyHex}`,
-      unlValidators: '',
+      unlValidators: o.validators ?? '',
       unlThreshold: o.threshold ?? 0,
       unlRefreshMs: o.refreshMs ?? 300_000,
     },
@@ -973,6 +975,247 @@ describe('UnlFetcher', () => {
       await t.fetcher.registerPublishers();
       await t.fetcher.fetchOnce(ID1);
       expect(t.ch.publisherRows[1]).toMatchObject({ status: 'error', error: 'timeout', last_ok_at: NOW - 600 });
+    });
+  });
+
+  describe('the fixed list (GH_UNL_VALIDATORS)', () => {
+    const K = [0, 1, 2, 3].map((i) => testKey(`fixed-${i}`).base58);
+    const SORTED = [...K].sort();
+    const URL3 = 'https://c.example/vl';
+    const THREE_PUBLISHERS = `${TWO_PUBLISHERS},${URL3}=${testKey('third-publisher').publicKeyHex}`;
+    const sha256 = (text: string) => createHash('sha256').update(text).digest('hex').toUpperCase();
+
+    /** The `unl_publishers` row of the fixed list, as `registerPublishers` writes it. */
+    const localPublisher = (o: Partial<UnlPublishersRow> = {}): UnlPublishersRow => ({
+      publisher: 'local',
+      url: '',
+      publisher_key: '',
+      configured: 1,
+      threshold: 1,
+      checked_at: NOW,
+      status: 'ok',
+      error: '',
+      last_ok_at: NOW,
+      ...o,
+    });
+    const writtenLists = (t: ReturnType<typeof setup>) => t.ch.rowsOf<UnlListsRow>(Table.UnlLists);
+
+    it('writes the local publisher and its list at start', async () => {
+      const t = setup({ publishers: '', validators: K.join(',') });
+      await t.fetcher.registerPublishers();
+
+      expect(t.ch.publisherRows).toEqual([localPublisher()]);
+      expect(writtenLists(t)).toEqual([
+        {
+          publisher: 'local',
+          publisher_key: '',
+          sequence: 1,
+          version: 1,
+          effective: Math.floor(NOW),
+          expiration: 4_294_967_295,
+          validators: SORTED,
+          blob_sha256: sha256(SORTED.join('\n')),
+          fetched_at: NOW,
+          response: JSON.stringify({ validators: SORTED }),
+        },
+      ]);
+      expect(t.ch.reads).toEqual(['publishers', 'lists']);
+      await t.fetcher.stop();
+    });
+
+    it('writes the publisher row of local beside those of the configured publishers', async () => {
+      const t = setup({ validators: K.join(',') });
+      await t.fetcher.registerPublishers();
+
+      expect(t.ch.publisherRows.map((r) => [r.publisher, r.configured])).toEqual([
+        [ID1, 1],
+        ['local', 1],
+      ]);
+      expect(t.ch.publisherRows[0]).toMatchObject({
+        url: URL1,
+        publisher_key: PUBLISHER.publicKeyHex,
+        last_ok_at: null,
+      });
+      expect(t.ch.publisherRows[1]).toEqual(localPublisher());
+    });
+
+    it('writes no list when the stored local list has the same keys', async () => {
+      const t = setup({ publishers: '', validators: K.join(',') });
+      t.ch.lists.push(localListRow([K[2], K[0], K[3], K[1]], 3, NOW - 3600));
+      await t.fetcher.registerPublishers();
+
+      expect(writtenLists(t)).toEqual([]);
+      expect(t.ch.lists).toHaveLength(1);
+      // the row of the publisher is written all the same: its check time and its threshold are current
+      expect(t.ch.publisherRows).toEqual([localPublisher()]);
+    });
+
+    it('writes the next sequence when the keys changed', async () => {
+      const t = setup({ publishers: '', validators: K.join(',') });
+      t.ch.lists.push(localListRow(K.slice(0, 3), 3, NOW - 3600));
+      await t.fetcher.registerPublishers();
+
+      expect(writtenLists(t)).toEqual([
+        expect.objectContaining({
+          publisher: 'local',
+          sequence: 4,
+          validators: SORTED,
+          blob_sha256: sha256(SORTED.join('\n')),
+        }),
+      ]);
+      expect(t.ch.lists.map((l) => [l.sequence, l.validators.length])).toEqual([
+        [3, 3],
+        [4, 4],
+      ]);
+    });
+
+    it('compares the keys with the newest stored list, not with an older one', async () => {
+      const t = setup({ publishers: '', validators: K.join(',') });
+      // the keys were once these four, then three: back to four is a change
+      t.ch.lists.push(localListRow(K, 2, NOW - 7200), localListRow(K.slice(0, 3), 3, NOW - 3600));
+      await t.fetcher.registerPublishers();
+
+      expect(writtenLists(t)).toEqual([expect.objectContaining({ sequence: 4, validators: SORTED })]);
+    });
+
+    it('writes the next sequence when a key was replaced by another of the same number', async () => {
+      const t = setup({ publishers: '', validators: K.join(',') });
+      t.ch.lists.push(localListRow([...K.slice(0, 3), testKey('fixed-other').base58], 1, NOW - 3600));
+      await t.fetcher.registerPublishers();
+
+      expect(writtenLists(t).map((l) => l.sequence)).toEqual([2]);
+    });
+
+    it('sets configured = 0 on a stored local publisher when the fixed list is empty', async () => {
+      const t = setup({ validators: '' });
+      t.ch.publishers.push(localPublisher({ checked_at: NOW - 600, last_ok_at: NOW - 600, threshold: 2 }));
+      t.ch.lists.push(localListRow(K, 1, NOW - 3600));
+      await t.fetcher.registerPublishers();
+
+      expect(t.ch.publisherRows.map((r) => [r.publisher, r.configured])).toEqual([
+        [ID1, 1],
+        ['local', 0],
+      ]);
+      expect(t.ch.publisherRows[1]).toEqual(localPublisher({ configured: 0, threshold: 2, last_ok_at: NOW - 600 }));
+      // its list is history, and stays
+      expect(writtenLists(t)).toEqual([]);
+    });
+
+    it('writes nothing for local when the fixed list is empty and none is stored', async () => {
+      const t = setup({ publishers: '', validators: '' });
+      await t.fetcher.registerPublishers();
+
+      expect(t.ch.inserts).toEqual([]);
+    });
+
+    it('leaves a local publisher that is already not configured as it is', async () => {
+      const t = setup({ publishers: '', validators: '' });
+      t.ch.publishers.push(localPublisher({ configured: 0, checked_at: NOW - 600 }));
+      await t.fetcher.registerPublishers();
+
+      expect(t.ch.inserts).toEqual([]);
+    });
+
+    it('never fetches local: no timer, no fetch and no metric of it', async () => {
+      const t = setup({ validators: K.join(',') });
+      await t.fetcher.registerPublishers();
+      t.fetcher.start();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(t.fetches.map((f) => f.url)).toEqual([URL1]);
+      expect(jest.getTimerCount()).toBe(1); // the next fetch of the URL publisher
+      await expect(t.fetcher.fetchOnce('local')).rejects.toThrow('local is not a configured UNL publisher');
+      await jest.advanceTimersByTimeAsync(3_600_000);
+      expect(t.fetches.every((f) => f.url === URL1)).toBe(true);
+      const labels = t.metrics.validatorsUnlFetchesTotal.inc.mock.calls.map(
+        (c) => (c[0] as { publisher: string }).publisher,
+      );
+      expect(labels.length).toBeGreaterThan(0);
+      expect(labels).not.toContain('local');
+      expect(t.metrics.validatorsUnlExpirySeconds.set.mock.calls.map((c) => c[0])).not.toContainEqual({
+        publisher: 'local',
+      });
+      expect(t.metrics.validatorsUnlSize.set.mock.calls.map((c) => c[0])).not.toContainEqual({ publisher: 'local' });
+      await t.fetcher.stop();
+    });
+
+    it('sets no timer and fetches nothing when the fixed list is all there is', async () => {
+      const t = setup({ publishers: '', validators: K.join(',') });
+      await t.fetcher.registerPublishers();
+      t.fetcher.start();
+      await jest.advanceTimersByTimeAsync(3_600_000);
+
+      expect(jest.getTimerCount()).toBe(0);
+      expect(t.get).not.toHaveBeenCalled();
+      expect(t.metrics.validatorsUnlFetchesTotal.inc).not.toHaveBeenCalled();
+      await expect(t.fetcher.fetchOnce('local')).rejects.toThrow('local is not a configured UNL publisher');
+      await t.fetcher.stop();
+    });
+
+    it('writes the threshold in force counting the fixed list', async () => {
+      const one = setup({ validators: K.join(',') });
+      await one.fetcher.registerPublishers();
+      // one URL publisher and the fixed list: two lists, rippled's rule is 1 below three
+      expect(one.ch.publisherRows.map((r) => [r.publisher, r.threshold])).toEqual([
+        [ID1, 1],
+        ['local', 1],
+      ]);
+
+      const three = setup({ publishers: THREE_PUBLISHERS, validators: K.join(',') });
+      await three.fetcher.registerPublishers();
+      // three URL publishers and the fixed list: four lists, ⌊4 / 2⌋ + 1
+      expect(three.ch.publisherRows.map((r) => [r.publisher, r.threshold])).toEqual([
+        [ID1, 3],
+        [ID2, 3],
+        ['c.example/vl', 3],
+        ['local', 3],
+      ]);
+    });
+
+    it('writes the threshold of GH_UNL_THRESHOLD to the row of local too', async () => {
+      const t = setup({ publishers: TWO_PUBLISHERS, validators: K.join(','), threshold: 2 });
+      await t.fetcher.registerPublishers();
+
+      expect(t.ch.publisherRows.map((r) => r.threshold)).toEqual([2, 2, 2]);
+    });
+  });
+
+  describe('localListRow', () => {
+    const K = [3, 1, 0, 2].map((i) => testKey(`fixed-${i}`).base58);
+
+    it('is the DateTime maximum, 2106-02-07T06:28:15Z, that a list of the fixed keys expires at', () => {
+      expect(LOCAL_LIST_EXPIRATION).toBe(4_294_967_295);
+      expect(new Date(LOCAL_LIST_EXPIRATION * 1000).toISOString()).toBe('2106-02-07T06:28:15.000Z');
+    });
+
+    it('sorts the keys and hashes the sorted keys joined by a line feed, in upper-case hex', () => {
+      const sorted = [...K].sort();
+      const row = localListRow(K, 5, NOW + 0.75);
+      expect(row).toEqual({
+        publisher: 'local',
+        publisher_key: '',
+        sequence: 5,
+        version: 1,
+        effective: NOW,
+        expiration: LOCAL_LIST_EXPIRATION,
+        validators: sorted,
+        blob_sha256: createHash('sha256').update(sorted.join('\n')).digest('hex').toUpperCase(),
+        fetched_at: NOW + 0.75,
+        response: `{"validators":${JSON.stringify(sorted)}}`,
+      });
+      expect(row.blob_sha256).toMatch(/^[0-9A-F]{64}$/);
+    });
+
+    it('does not reorder the keys it was given', () => {
+      const given = [...K];
+      localListRow(given, 1, NOW);
+      expect(given).toEqual(K);
+    });
+
+    it('gives the same hash and response for the same keys in any order', () => {
+      const a = localListRow(K, 1, NOW);
+      const b = localListRow([...K].reverse(), 2, NOW + 60);
+      expect([b.blob_sha256, b.response, b.validators]).toEqual([a.blob_sha256, a.response, a.validators]);
     });
   });
 

@@ -1,5 +1,5 @@
-import { ClickHouseService, StoredUnlList, Table } from '@gatehub/data-api-shared';
-import { SyncerConfig, unlPublishersOf, unlThresholdOf } from '../config/syncer.config';
+import { ClickHouseService, LOCAL_PUBLISHER_ID, StoredUnlList, Table } from '@gatehub/data-api-shared';
+import { SyncerConfig, unlPublishersOf, unlThresholdOf, unlValidatorsOf } from '../config/syncer.config';
 
 interface StoredListRow {
   publisher: string;
@@ -50,19 +50,23 @@ export async function readStoredLists(
 
 /** What a run of a compute job (`rounds`, `agreement`) reads once, and the rounds or hours of the run share. */
 export interface ListContext {
-  /** Every list the configured publishers served, whatever key it was served under: a round or an hour reads the past. */
+  /** Every list of `publishers`, whatever key it was served under: a round or an hour reads the past. */
   lists: StoredUnlList[];
-  /** The ids of the configured publishers. */
+  /** The ids of the configured publishers, then `local` when the fixed list (`GH_UNL_VALIDATORS`) is not empty. */
   publishers: string[];
-  /** The number of lists that must name a validator for it to be trusted (`unlThresholdOf`). */
+  /** The number of lists that must name a validator for it to be trusted (`unlThresholdOf`, which counts the fixed list too). */
   threshold: number;
 }
 
-/** The `ListContext` of a run: the stored lists of the configured publishers, and the threshold. */
+/**
+ * The `ListContext` of a run: the stored lists of the configured publishers and, when the fixed list is not empty, of the
+ * publisher `local` that stores it, and the threshold.
+ */
 export async function loadListContext(
   ch: Pick<ClickHouseService, 'query'>,
   cfg: Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'unlThreshold'>,
 ): Promise<ListContext> {
   const publishers = unlPublishersOf(cfg).map((publisher) => publisher.id);
+  if (unlValidatorsOf(cfg).length > 0) publishers.push(LOCAL_PUBLISHER_ID);
   return { lists: await readStoredLists(ch, publishers), publishers, threshold: unlThresholdOf(cfg) };
 }

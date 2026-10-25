@@ -11,6 +11,7 @@ import {
   Table,
   ValidationsRow,
 } from '@gatehub/data-api-shared';
+import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { encodeAccountID } from 'ripple-address-codec';
@@ -424,6 +425,111 @@ describe('the validators worker (e2e)', () => {
     web.serveJson('unl.example', '/', list({ sequence: 3 }));
     expect(await app.fetcher.fetchOnce(ID)).toBe('ok');
     expect(await publisherRow(ID)).toMatchObject({ status: 'ok', error: '' });
+  });
+
+  describe('the fixed list (GH_UNL_VALIDATORS)', () => {
+    /** The four keys of Xahau Testnet's [validators] section (the profile's default fixed list). */
+    const FIXED = getNetworkProfile('xahau-testnet').defaultUnlValidators.split(',');
+    let testnetNode: FakeNode;
+
+    beforeAll(async () => {
+      testnetNode = await startFakeNode({
+        server_info: { info: { complete_ledgers: '1-100', validated_ledger: { seq: 100 }, network_id: 21338 } },
+      });
+    });
+
+    afterAll(async () => {
+      await testnetNode?.stop();
+    });
+
+    /** The worker of Xahau Testnet, which has no publisher: its trusted keys are the fixed list. */
+    async function bootTestnet(unlValidators: string): Promise<ValidatorsApp> {
+      const app = await startValidatorsApp({
+        clickhouse: db.config,
+        node: testnetNode,
+        web,
+        profile: getNetworkProfile('xahau-testnet'),
+        config: { unlPublishers: '', unlValidators },
+        // the domain loop would check the four keys, and the app is closed with that pass on its way
+        worker: { start: { state: false, domains: false } },
+      });
+      apps.push(app);
+      return app;
+    }
+
+    /** Stops the worker (a restart is another one). */
+    async function stopAll(): Promise<void> {
+      const running = apps;
+      apps = [];
+      for (const app of running) await app.stop();
+    }
+
+    it('Xahau Testnet: registers the fixed list as the publisher local, and a restart with the same keys writes no list', async () => {
+      expect(FIXED).toHaveLength(4);
+      const sorted = [...FIXED].sort();
+      const before = Date.now();
+      await bootTestnet(FIXED.join(','));
+      const after = Date.now();
+
+      expect(await publisherRows()).toEqual([
+        {
+          publisher: 'local',
+          url: '',
+          publisher_key: '',
+          configured: 1,
+          threshold: 1,
+          status: 'ok',
+          error: '',
+          last_ok_ms: expect.anything(),
+        },
+      ]);
+      expect(Number((await publisherRow('local'))?.last_ok_ms)).toBeGreaterThanOrEqual(before);
+      expect(Number((await publisherRow('local'))?.last_ok_ms)).toBeLessThanOrEqual(after);
+      const rows = await storedLists();
+      expect(rows).toEqual([
+        {
+          publisher: 'local',
+          publisher_key: '',
+          sequence: '1',
+          version: 1,
+          effective: expect.any(Number),
+          expiration: 4_294_967_295,
+          validators: sorted,
+          blob_sha256: createHash('sha256').update(sorted.join('\n')).digest('hex').toUpperCase(),
+          fetched_ms: expect.anything(),
+          response: JSON.stringify({ validators: sorted }),
+        },
+      ]);
+      expect(rows[0].effective).toBeGreaterThanOrEqual(Math.floor(before / 1000));
+      expect(rows[0].effective).toBeLessThanOrEqual(Math.floor(after / 1000));
+      // the list in use never expires, and it is read like a publisher's
+      const inUse = listInUse(await readStoredLists(db.ch, ['local']), 'local', nowSeconds());
+      expect(inUse?.expired).toBe(false);
+      expect(inUse?.list.validators).toEqual(sorted);
+      expect(web.requests).toEqual([]); // local is never fetched
+
+      // a restart with the keys in another order is the same list
+      await stopAll();
+      await bootTestnet([...FIXED].reverse().join(','));
+      expect(await storedLists()).toEqual(rows);
+      expect(await publisherRows()).toHaveLength(1);
+    });
+
+    it('Xahau Testnet: writes the next sequence when the keys changed, and marks local no longer configured when none is left', async () => {
+      await bootTestnet(FIXED.join(','));
+      await stopAll();
+      await bootTestnet(FIXED.slice(0, 3).join(','));
+      expect((await storedLists()).map((r) => [r.sequence, r.validators.length])).toEqual([
+        ['1', 4],
+        ['2', 3],
+      ]);
+
+      // the fixed list is emptied: its history stays, and local is no longer configured
+      await stopAll();
+      await bootTestnet('');
+      expect((await storedLists()).map((r) => r.sequence)).toEqual(['1', '2']);
+      expect(await publisherRow('local')).toMatchObject({ configured: 0, status: 'ok', error: '' });
+    });
   });
 
   describe('a replay of an older publisher manifest', () => {

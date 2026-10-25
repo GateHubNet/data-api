@@ -14,7 +14,7 @@ import {
   verifyManifest,
 } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import { NETWORK_PROFILE, NODE_CLIENT, SyncerConfig, unlPublishersOf } from '../config/syncer.config';
+import { NETWORK_PROFILE, NODE_CLIENT, SyncerConfig, unlPublishersOf, unlValidatorsOf } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { describeError, isRippledError, rippledCodeOf, SIMPLE_NAME } from './describe-error';
 import { SAFE_FETCHER, SafeFetcher, SafeFetchError, tomlFetchLimits } from './safe-fetch';
@@ -146,7 +146,7 @@ export function nextDomainRow(
 
 // -- the checker --------------------------------------------------------------------------------------------------------
 
-type CheckerConfig = Pick<SyncerConfig, 'unlPublishers' | 'domainRecheckMs' | 'domainFetchTimeoutMs'>;
+type CheckerConfig = Pick<SyncerConfig, 'unlPublishers' | 'unlValidators' | 'domainRecheckMs' | 'domainFetchTimeoutMs'>;
 type CheckerStore = Pick<ClickHouseService, 'query' | 'insert'>;
 
 /** The newest manifest of a master key, as stored: the highest `seq`, preferring a row with raw bytes among equals. */
@@ -228,7 +228,8 @@ function manifestRowOf(key: string, answer: unknown): ValidatorManifestsRow | un
  * Verifies the domains of the validators (spec 2.2). A pass (`pass()`, made every 60 s by the worker) takes
  *
  * 1. **the validators**: the masters on the list in use of each configured publisher (only the lists stored under the key
- *    configured for it), and those seen in the last 30 days (`validator_seen`);
+ *    configured for it), those of the list fixed in the configuration (`GH_UNL_VALIDATORS`, which is always in use), and
+ *    those seen in the last 30 days (`validator_seen`);
  * 2. **their newest manifest** (the highest `seq` per master key). A row with raw bytes is decoded and verified here, and
  *    must be the key's own: the stream's word is not enough (`manifest_unverified`). The domain is that of the verified
  *    manifest; a validator that has none is not checked and has no row. A row without raw bytes (from before migration 002)
@@ -328,7 +329,7 @@ export class DomainChecker {
 
   // -- which validators ---------------------------------------------------------------------------------------------
 
-  /** The masters on a list in use now, and those seen in the last 30 days: sorted, once each. */
+  /** The masters on a list in use now (the fixed list included), and those seen in the last 30 days: sorted, once each. */
   private async validatorKeys(now: number): Promise<string[]> {
     const keys = new Set<string>();
     const publishers = unlPublishersOf(this.cfg);
@@ -341,6 +342,9 @@ export class DomainChecker {
       const own = lists.filter((list) => list.publisher === p.id && list.publisherKey === p.publicKey);
       for (const key of listInUse(own, p.id, now)?.list.validators ?? []) keys.add(key);
     }
+    // the fixed list comes from the configuration, not from the lists of `local`: it is in force from the start, and the
+    // loop above matches a list to the key configured for its publisher, which `local` has none
+    for (const key of unlValidatorsOf(this.cfg)) keys.add(key);
     // a validator seen under its signing key is that of its master: the keys go through the manifest map first, which the
     // statement computes itself
     const seen = await this.ch.query<{ master: string }>(
