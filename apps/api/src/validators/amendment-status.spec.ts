@@ -40,7 +40,7 @@ describe('amendmentStatus: the first match wins', () => {
     );
   });
 
-  it('is enabled when the file calls it retired (Xahau), listed or not', () => {
+  it('is enabled when the file calls it retired (on either family), listed or not', () => {
     expect(amendmentStatus({ ...none, meta: meta({ retired: true }) })).toBe('enabled');
     expect(amendmentStatus({ ...none, meta: meta({ retired: true, obsolete: true }) })).toBe('enabled');
   });
@@ -555,6 +555,75 @@ describe('assembleAmendments', () => {
 
     it('is not retired when it is not (the key is left out)', () => {
       expect(view(ID.ledger).retired).toBeUndefined();
+    });
+  });
+
+  describe('a retired name (XRPL)', () => {
+    const MULTI_SIGN = amendmentId('MultiSign');
+    const xrpl = (state: Partial<NetworkStateInfo>, over: Partial<AmendmentSources> = {}) =>
+      assembleAmendments(
+        directoryOf({}, { majorities: [], ...state }),
+        sources({
+          config: config('xrpl', [
+            { name: 'MultiSign', retired: true, enabled: { ledger_index: 22178817, date: '2016-06-27' } },
+          ]),
+          features: new Map(),
+          voted: new Set(),
+          yes: new Map(),
+          transactions: [],
+          ...over,
+        }),
+      );
+
+    it('that the ledger does not list is enabled with no enabled object (XRPL Testnet: retired before its genesis)', () => {
+      const a = xrpl({ amendments: [] }).byId.get(MULTI_SIGN);
+      expect(a).toMatchObject({ status: 'enabled', retired: true });
+      expect(a?.enabled).toBeUndefined();
+      expect(a?.votes).toBeUndefined();
+    });
+
+    it('that the ledger lists has the enabled object of the file (mainnet: the answer apart from `retired` is unchanged)', () => {
+      const a = xrpl({ amendments: [MULTI_SIGN] }).byId.get(MULTI_SIGN);
+      expect(a).toMatchObject({
+        status: 'enabled',
+        retired: true,
+        enabled: { ledgerIndex: 22178817, date: '2016-06-27', source: 'metadata' },
+      });
+    });
+
+    it('that a testnet reads from the family file has no enabled object either way, and an indexed EnableAmendment wins', () => {
+      const testnet = (state: Partial<NetworkStateInfo>, over: Partial<AmendmentSources> = {}) =>
+        assembleAmendments(
+          directoryOf({}, { majorities: [], ...state }),
+          sources({
+            config: parseAmendmentsConfig(
+              {
+                network: 'xrpl',
+                updated: '2026-10-24',
+                amendments: [
+                  { name: 'MultiSign', retired: true, enabled: { ledger_index: 22178817, date: '2016-06-27' } },
+                ],
+              },
+              getNetworkProfile('xrpl-testnet'),
+            ),
+            features: new Map(),
+            voted: new Set(),
+            yes: new Map(),
+            transactions: [],
+            ...over,
+          }),
+        );
+      expect(testnet({ amendments: [MULTI_SIGN] }).byId.get(MULTI_SIGN)).toMatchObject({
+        status: 'enabled',
+        retired: true,
+      });
+      expect(testnet({ amendments: [MULTI_SIGN] }).byId.get(MULTI_SIGN)?.enabled).toBeUndefined();
+      expect(testnet({ amendments: [] }).byId.get(MULTI_SIGN)?.enabled).toBeUndefined();
+      const indexed = testnet(
+        { amendments: [MULTI_SIGN] },
+        { transactions: [{ amendment: MULTI_SIGN, flags: 0, ledgerIndex: 60, date: NOW_S - 100, txHash: 'H' }] },
+      ).byId.get(MULTI_SIGN);
+      expect(indexed?.enabled).toMatchObject({ ledgerIndex: 60, source: 'ledger' });
     });
   });
 

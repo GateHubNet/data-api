@@ -196,6 +196,16 @@ const txServiceTests = (seed: SeedName, network: NetworkName): void => {
     expect((await prometheus.txEncodeFallback.get()).values).toEqual(before);
   });
 
+  it('keeps an Account "" as the node shows it (the Entropy pseudo-transactions of Xahau Testnet)', async () => {
+    const entropy = all.filter((t) => JSON.parse(t.row.tx_json).Account === '');
+    if (seed === 'xahau-testnet-recorded') expect(entropy.length).toBeGreaterThan(0);
+    const rows = await service.fetchByKeys(entropy.map((t) => keyOf(t.row)));
+    expect(rows).toHaveLength(entropy.length);
+    for (const row of rows) {
+      expect(service.toTxObject(row, { binary: false }).tx).toMatchObject({ Account: '', TransactionType: 'Entropy' });
+    }
+  });
+
   it('converts a fetched page with the ledger hashes of its ledgers, as the list endpoints do', async () => {
     const keys = all.slice(0, 120).map((t) => keyOf(t.row));
     const rows = await service.fetchByKeys(keys);
@@ -229,8 +239,7 @@ describe.each<[SeedName, NetworkName]>([
   ['xahau-recorded', 'xahau'],
 ])('TxService on the %s ledgers', txServiceTests);
 
-// Skipped until Task 5: the API boots a testnet only once the amendments loader reads the family's file.
-describe.skip.each<[SeedName, NetworkName]>([
+describe.each<[SeedName, NetworkName]>([
   ['xrpl-testnet-recorded', 'xrpl-testnet'],
   ['xahau-testnet-recorded', 'xahau-testnet'],
 ])('TxService on the %s ledgers', txServiceTests);

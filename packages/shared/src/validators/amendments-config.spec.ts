@@ -6,6 +6,8 @@ import { amendmentId, loadAmendmentsConfig, parseAmendmentsConfig } from './amen
 
 const XRPL = getNetworkProfile('xrpl');
 const XAHAU = getNetworkProfile('xahau');
+const XRPL_TESTNET = getNetworkProfile('xrpl-testnet');
+const XAHAU_TESTNET = getNetworkProfile('xahau-testnet');
 
 const AMM_URL = 'https://github.com/XRPLF/XRPL-Standards/tree/master/XLS-0030-automated-market-maker';
 
@@ -135,6 +137,59 @@ describe('parseAmendmentsConfig (spec 2.6)', () => {
       expect(refusal(xrplFile(), XAHAU)).toMatch(/^Invalid amendments config: network: /);
     });
 
+    it("may also be its family's file for a testnet, and then drops the enabled entries", () => {
+      const config = parseAmendmentsConfig(xrplFile(), XRPL_TESTNET);
+      expect(config.network).toBe('xrpl-testnet');
+      expect(config.amendments.map((a) => a.name)).toEqual(['AMM', 'CryptoConditionsSuite']);
+      expect(config.byName.get('AMM')).toEqual({
+        name: 'AMM',
+        id: '8CC0774A3BF66D1D22E76BBDA8E8A232E6B6313834301B3B23E8601196AE6455',
+        introduced: '1.12.0',
+        xls: 'XLS-30',
+        xls_url: AMM_URL,
+        description: 'Automated market makers: pools that trade two assets against each other.',
+      });
+      expect(config.byName.get('CryptoConditionsSuite')).toMatchObject({ obsolete: true });
+      const xahau = parseAmendmentsConfig(
+        { ...xahauFile(), amendments: [{ name: 'Remit', enabled: { date: '2024-03-12' } }] },
+        XAHAU_TESTNET,
+      );
+      expect(xahau.network).toBe('xahau-testnet');
+      expect(xahau.byName.get('Remit')).toEqual({ name: 'Remit', id: amendmentId('Remit') });
+    });
+
+    it("keeps enabled in a file whose network is the testnet's own name", () => {
+      const own = {
+        network: 'xrpl-testnet',
+        updated: '2026-10-24',
+        amendments: [{ name: 'AMM', enabled: { ledger_index: 5, date: '2024-03-22' } }],
+      };
+      const config = parseAmendmentsConfig(own, XRPL_TESTNET);
+      expect(config.network).toBe('xrpl-testnet');
+      expect(config.byName.get('AMM')?.enabled).toEqual({ ledger_index: 5, date: '2024-03-22' });
+    });
+
+    it("refuses another family's file for a testnet, and a testnet's file for a mainnet", () => {
+      expect(refusal({ ...xrplFile(), network: 'xahau' }, XRPL_TESTNET)).toBe(
+        'Invalid amendments config: network: "xahau" is not the network of this deployment, "xrpl-testnet"',
+      );
+      expect(refusal(xahauFile(), XRPL_TESTNET)).toBe(
+        'Invalid amendments config: network: "xahau" is not the network of this deployment, "xrpl-testnet"',
+      );
+      expect(refusal(xrplFile(), XAHAU_TESTNET)).toBe(
+        'Invalid amendments config: network: "xrpl" is not the network of this deployment, "xahau-testnet"',
+      );
+      expect(refusal({ ...xrplFile(), network: 'xrpl-testnet' })).toBe(
+        'Invalid amendments config: network: "xrpl-testnet" is not the network of this deployment, "xrpl"',
+      );
+      expect(refusal({ ...xahauFile(), network: 'xahau-testnet' }, XAHAU)).toBe(
+        'Invalid amendments config: network: "xahau-testnet" is not the network of this deployment, "xahau"',
+      );
+      expect(refusal({ ...xrplFile(), network: 'xahau-testnet' }, XRPL_TESTNET)).toBe(
+        'Invalid amendments config: network: "xahau-testnet" is not the network of this deployment, "xrpl-testnet"',
+      );
+    });
+
     it('needs `updated` as a day', () => {
       for (const updated of ['2026-10-1', '19-10-2026', '2026-02-30', '2026-13-01', 20261019, '']) {
         expect(refusal({ ...xrplFile(), updated })).toMatch(/^Invalid amendments config: updated: /);
@@ -183,10 +238,11 @@ describe('parseAmendmentsConfig (spec 2.6)', () => {
       );
     });
 
-    it('refuse a retired entry on XRPL, and accept one on Xahau', () => {
+    it('accept a retired entry on both families', () => {
       const file = xrplFile();
       file.amendments[1].retired = true;
-      expect(refusal(file)).toMatch(/^Invalid amendments config: amendments\[1\] \(CryptoConditionsSuite\): retired: /);
+      expect(refusal(file)).toBeUndefined();
+      expect(parseAmendmentsConfig(file, XRPL).byName.get('CryptoConditionsSuite')).toMatchObject({ retired: true });
       const xahau = xahauFile();
       xahau.amendments[1].retired = true;
       expect(refusal(xahau, XAHAU)).toBeUndefined();
@@ -205,6 +261,9 @@ describe('parseAmendmentsConfig (spec 2.6)', () => {
           XAHAU,
         ),
       ).toMatch(/^Invalid amendments config: amendments\[0\] \(Remit\): retired: /);
+      expect(refusal(withEntry((e) => (e.retired = false)))).toMatch(
+        /^Invalid amendments config: amendments\[0\] \(AMM\): retired: can only be true/,
+      );
     });
   });
 
@@ -218,6 +277,28 @@ describe('parseAmendmentsConfig (spec 2.6)', () => {
           /^Invalid amendments config: amendments\[0\] \(AMM\): introduced: /,
         );
       }
+    });
+
+    it("follows the software of the testnet, which is its family's", () => {
+      expect(
+        refusal(
+          withEntry((e) => (e.introduced = '1.12.0')),
+          XRPL_TESTNET,
+        ),
+      ).toBeUndefined();
+      expect(
+        refusal(
+          withEntry((e) => (e.introduced = '2024.4.21')),
+          XRPL_TESTNET,
+        ),
+      ).toMatch(/^Invalid amendments config: amendments\[0\] \(AMM\): introduced: /);
+      const xahau = (introduced: string) =>
+        refusal(
+          withEntry((e) => (e.introduced = introduced), xahauFile()),
+          XAHAU_TESTNET,
+        );
+      expect(xahau('2024.4.21')).toBeUndefined();
+      expect(xahau('1.12.0')).toMatch(/^Invalid amendments config: amendments\[0\] \(Remit\): introduced: /);
     });
 
     it('is a date version on Xahau', () => {
@@ -368,6 +449,59 @@ describe('loadAmendmentsConfig', () => {
     expect(() => loadAmendmentsConfig(XRPL, join(dir, 'missing.json'))).toThrow(/missing\.json/);
   });
 
+  describe('a testnet (the family file without its enable ledgers)', () => {
+    it("reads its family's file and drops the enabled entries", () => {
+      const config = loadAmendmentsConfig(getNetworkProfile('xrpl-testnet'));
+      expect(config.network).toBe('xrpl-testnet');
+      expect(config.amendments).toHaveLength(loadAmendmentsConfig(getNetworkProfile('xrpl')).amendments.length);
+      expect(config.amendments.filter((a) => a.enabled !== undefined)).toEqual([]);
+      expect(config.byName.get('MultiSign')).toMatchObject({ retired: true, introduced: '0.31.0' });
+      expect(config.byName.get('AMM')).toMatchObject({ introduced: '1.12.0', xls: 'XLS-30', xls_url: AMM_URL });
+      expect(config.byName.get('CryptoConditionsSuite')).toMatchObject({ obsolete: true });
+      expect(loadAmendmentsConfig(getNetworkProfile('xahau-testnet')).amendments.filter((a) => a.enabled)).toEqual([]);
+    });
+
+    it('is the family file otherwise: the same names, the same IDs, the same marks', () => {
+      for (const [testnet, family] of [
+        [XRPL_TESTNET, XRPL],
+        [XAHAU_TESTNET, XAHAU],
+      ]) {
+        const shipped = loadAmendmentsConfig(family);
+        const config = loadAmendmentsConfig(testnet);
+        expect(config.updated).toBe(shipped.updated);
+        expect(config.amendments.map(({ name, id, obsolete, retired }) => ({ name, id, obsolete, retired }))).toEqual(
+          shipped.amendments.map(({ name, id, obsolete, retired }) => ({ name, id, obsolete, retired })),
+        );
+        expect(config.byId.size).toBe(shipped.amendments.length);
+        expect(loadAmendmentsConfig(testnet, '  ')).toEqual(config);
+      }
+    });
+
+    it('keeps enabled in a file of its own, given by path', () => {
+      const file = join(dir, 'xrpl-testnet.json');
+      writeFileSync(
+        file,
+        JSON.stringify({
+          network: 'xrpl-testnet',
+          updated: '2026-10-24',
+          amendments: [{ name: 'AMM', enabled: { ledger_index: 5, date: '2024-03-22' } }],
+        }),
+      );
+      expect(loadAmendmentsConfig(XRPL_TESTNET, file).byName.get('AMM')?.enabled).toEqual({
+        ledger_index: 5,
+        date: '2024-03-22',
+      });
+    });
+
+    it("refuses another family's file, naming the path", () => {
+      const file = join(dir, 'xahau-for-xrpl-testnet.json');
+      writeFileSync(file, JSON.stringify(xahauFile()));
+      expect(() => loadAmendmentsConfig(XRPL_TESTNET, file)).toThrow(
+        `Invalid amendments config: network: "xahau" is not the network of this deployment, "xrpl-testnet" (${file})`,
+      );
+    });
+  });
+
   describe('the shipped files', () => {
     for (const profile of [XRPL, XAHAU]) {
       describe(profile.name, () => {
@@ -410,43 +544,61 @@ describe('loadAmendmentsConfig', () => {
       });
     });
 
-    it('XRPL: the withdrawn amendments are obsolete, and none is retired', () => {
+    // rippled's `XRPL_RETIRE` list (features.macro): the amendments whose code is unconditional. xahaud retired the same 15.
+    const RETIRED = [
+      'MultiSign',
+      'TrustSetAuth',
+      'FeeEscalation',
+      'PayChan',
+      'CryptoConditions',
+      'TickSize',
+      'fix1368',
+      'Escrow',
+      'fix1373',
+      'EnforceInvariants',
+      'SortedDirectories',
+      'fix1201',
+      'fix1512',
+      'fix1523',
+      'fix1528',
+    ];
+
+    it('XRPL: the withdrawn amendments are obsolete, and none of them is retired or enabled', () => {
       const config = loadAmendmentsConfig(XRPL);
       for (const name of ['CryptoConditionsSuite', 'NonFungibleTokensV1', 'fixNFTokenDirV1', 'fixNFTokenNegOffer']) {
         expect(config.byName.get(name)).toMatchObject({ obsolete: true });
         expect(config.byName.get(name)?.enabled).toBeUndefined();
+        expect(config.byName.get(name)?.retired).toBeUndefined();
       }
-      expect(config.amendments.filter((a) => a.retired)).toEqual([]);
     });
 
-    it('Xahau: the amendments always on that the ledger does not list are retired', () => {
-      const config = loadAmendmentsConfig(XAHAU);
-      const retired = [
-        'MultiSign',
-        'TrustSetAuth',
-        'FeeEscalation',
-        'PayChan',
-        'CryptoConditions',
-        'TickSize',
-        'fix1368',
-        'Escrow',
-        'fix1373',
-        'EnforceInvariants',
-        'SortedDirectories',
-        'fix1201',
-        'fix1512',
-        'fix1523',
-        'fix1528',
-      ];
-      // exactly these 15: no other entry of the file is retired
-      expect(retired).toHaveLength(15);
+    it('XRPL: exactly the 15 XRPL_RETIRE amendments are retired, keeping their enabled', () => {
+      const config = loadAmendmentsConfig(XRPL);
+      expect(RETIRED).toHaveLength(15);
       expect(
         config.amendments
           .filter((a) => a.retired)
           .map((a) => a.name)
           .sort(),
-      ).toEqual([...retired].sort());
-      for (const name of retired) expect(config.byName.get(name)?.enabled).toBeUndefined();
+      ).toEqual([...RETIRED].sort());
+      for (const name of RETIRED) expect(config.byName.get(name)?.enabled).toBeDefined();
+      expect(config.byName.get('MultiSign')).toMatchObject({
+        retired: true,
+        introduced: '0.31.0',
+        enabled: { ledger_index: 22178817, date: '2016-06-27' },
+      });
+    });
+
+    it('Xahau: the amendments always on that the ledger does not list are retired', () => {
+      const config = loadAmendmentsConfig(XAHAU);
+      // exactly these 15: no other entry of the file is retired
+      expect(
+        config.amendments
+          .filter((a) => a.retired)
+          .map((a) => a.name)
+          .sort(),
+      ).toEqual([...RETIRED].sort());
+      for (const name of RETIRED) expect(config.byName.get(name)?.enabled).toBeUndefined();
     });
 
     it('Xahau: dates its own amendments by xahaud release', () => {

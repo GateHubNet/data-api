@@ -219,18 +219,27 @@ history before the first stored hour or round.
 
 No node or ledger serves an amendment's version, standard or description, so they are kept by hand in
 `packages/shared/config/amendments/xrpl.json` and `xahau.json` (shipped with the package; the shape is in the
-[design](superpowers/specs/2026-10-19-validators-amendments-design.md), 2.6). Do this after every rippled or xahaud release that adds or
-retires amendments, and before the deploy that needs it:
+[design](superpowers/specs/2026-10-19-validators-amendments-design.md), 2.6). A testnet reads the file of its family, so there are two
+files for four networks: XRPL Testnet reads `xrpl.json` and Xahau Testnet `xahau.json`, both without their `enabled` entries, which record
+mainnet's ledgers and dates (a testnet's own ledger says when an amendment was enabled there). Do this after every rippled or xahaud
+release that adds or retires amendments, and before the deploy that needs it:
 
 ```bash
 pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl
 pnpm --filter @gatehub/data-api-shared amendments:check -- --network xahau --clickhouse
+pnpm --filter @gatehub/data-api-shared amendments:check -- --network xrpl-testnet
+pnpm --filter @gatehub/data-api-shared amendments:check -- --network xahau-testnet
 ```
 
 It asks a public node (`--endpoint <wss url>`, by default the first default endpoint of the network) for `feature` and the `Amendments`
 ledger object, prints three lists and exits 1 when any is not empty. A node of the other network (its `server_info.network_id`) fails the
 run before anything is compared. With `--clickhouse` it also reads the newest round's votes and the
 indexed `EnableAmendment` transactions from the database the `GH_CLICKHOUSE_*` variables name.
+
+On a testnet it checks the family file against the testnet's node (by default the first default endpoint of the testnet profile). A
+testnet runs newer builds than mainnet, so its node can know names the file lacks: on 2026-10-24 Xahau Testnet had 14 amendments that Xahau
+mainnet did not (`RNG`, `HookOnV2` and `fixXahauTestnetGenesis` among them), and each belongs in `xahau.json` like any other new name. The
+third list is always empty on a testnet, because the file's `enabled` entries are dropped there and none can contradict the index.
 
 | List | What to do |
 | --- | --- |
@@ -239,8 +248,11 @@ indexed `EnableAmendment` transactions from the database the `GH_CLICKHOUSE_*` v
 | Entries whose `enabled.ledger_index` contradicts the index | The indexed `EnableAmendment` is right: correct or remove the `enabled` of the entry. |
 
 Mark an amendment `obsolete: true` when current software can no longer vote it in (rippled's `VoteBehavior::Obsolete`, a withdrawn one),
-and on Xahau `retired: true` for a name in xahaud's retired list that the `Amendments` object does not list. Set `updated`. An invalid
-file (a duplicate name, an unknown key, an `xls_url` outside the standards repository) fails the loader with the entry named.
+and `retired: true` for a name that rippled lists with `XRPL_RETIRE` (xahaud's retired list on Xahau): its code is unconditional, and a
+ledger begun after the retirement no longer lists it. The 15 retired names are marked on both families; keep their `enabled` on XRPL (mainnet's
+`Amendments` object still lists them, so the API shows their ledger and day, with `retired: true` beside them). XRPL Testnet's ledger lacks
+them, so the API shows them `enabled` with `retired: true` and no `enabled` object. Set `updated`. An invalid file (a duplicate name, an
+unknown key, an `xls_url` outside the standards repository) fails the loader with the entry named.
 
 ### Rotate an API key
 

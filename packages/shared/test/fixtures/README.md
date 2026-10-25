@@ -4,19 +4,20 @@ Raw ledgers used by parser, ledger-writer and API tests. Load a directory with `
 (`src/ingest/fixture-ledger-source.ts`); it reads `<index>.json`, `<index>-<label>.json` and `<index>.json.gz` files and
 ignores everything else in the directory (`manifest.json`, `server_info.json`, `README.md`, ...).
 
-| Directory                 | Contents                                                                                |
-| ------------------------- | --------------------------------------------------------------------------------------- |
-| `xrpl/ripple-mock/`       | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
-| `xrpl/recorded/`          | Mainnet ledgers recorded from a public node (see below).                                |
-| `xrpl/amm/`               | Mainnet AMM transactions, one ledger per named case (see below).                        |
-| `xrpl/account-state/`     | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
-| `xahau/recorded/`         | Xahau mainnet ledgers recorded from a public node (see below).                          |
-| `xrpl-testnet/recorded/`  | XRPL Testnet ledgers recorded from a public testnet node (see below).                   |
-| `xahau-testnet/recorded/` | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
-| `xrpl/unl/`               | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
-| `xahau/unl/`              | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
-| `xrpl/network-state/`     | Answers of an XRPL node for the validators worker's ledger state (see "Network state"). |
-| `xahau/network-state/`    | The same from a Xahau node (see "Network state").                                       |
+| Directory                      | Contents                                                                                |
+| ------------------------------ | --------------------------------------------------------------------------------------- |
+| `xrpl/ripple-mock/`            | The 54 mock ledgers of the original Ripple Data API (ISC); see its own `README.md`.     |
+| `xrpl/recorded/`               | Mainnet ledgers recorded from a public node (see below).                                |
+| `xrpl/amm/`                    | Mainnet AMM transactions, one ledger per named case (see below).                        |
+| `xrpl/account-state/`          | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
+| `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                          |
+| `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                   |
+| `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
+| `xrpl/unl/`                    | Validator lists of the XRPL default publishers, as served (see "UNL lists").            |
+| `xahau/unl/`                   | The validator list of the Xahau default publisher, as served (see "UNL lists").         |
+| `xrpl/network-state/`          | Answers of an XRPL node for the validators worker's ledger state (see "Network state"). |
+| `xahau/network-state/`         | The same from a Xahau node (see "Network state").                                       |
+| `xahau-testnet/network-state/` | The same from a Xahau Testnet node (see "Network state").                               |
 
 ## Recorded fixtures
 
@@ -350,7 +351,7 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --unl --network xrpl|x
 GETs the URL of each default publisher of the network profile (Node `https`, at most 3 redirects, 20 s, 1 MiB) and
 writes the body unchanged. Do not run a formatter over these files.
 
-### Network state (`xrpl/network-state/`, `xahau/network-state/`)
+### Network state (`xrpl/network-state/`, `xahau/network-state/`, `xahau-testnet/network-state/`)
 
 Not ledgers either: what the validators worker asks the node for (`NetworkStatePoller`), saved as the node answered, one file per
 request (the `result` of the answer; for an error, the error message the node served):
@@ -391,15 +392,32 @@ too, because the one validator that had been disabled was re-enabled between led
 - `server_info` and `feature` are of the time of recording, not of ledger 26633715: `validation_quorum` is 0 (xahaud reports 0), and
   `feature` has 114 amendments, all named and supported, two of which carry a `majority`.
 
-No recorded answer is in the legacy FeeSettings form (`BaseFee` in hex, `ReserveBase`, `ReserveIncrement`), none has a
-`ValidatorToDisable` or `ValidatorToReEnable`, and no `feature` entry lacks a name: the specs that cover those say that their input is
-hand-written.
+**Xahau Testnet**, recorded 2026-10-25 (00:34 UTC) from `wss://xahau-test.net` (xahaud 2026.10.16-tmp-dev, network id 21338) at
+validated ledger **13465944** (`86BE78CC…DEFA0`), with no `--ledger`:
+
+- 91 enabled amendments and no `Majorities` field. The ID `AB6612F1…FD1EE` is among them: `feature` names it `fixXahauTestnetGenesis` (its
+  SHA-512Half is the ID), and `config/amendments/xahau.json` carries it from the `XRPL_FIX (XahauTestnetGenesis, …)` line of `features.macro`
+  on the `testnet` and `tmp-dev` branches of `Xahau/xahaud` (added 2026-10-16 by "testnet genesis fix", commented "Xahau testnet
+  (NetworkID 21338) only"). The `dev` branch lacks the line because the testnet runs a build of its own, and no release carries it, so the
+  entry has no `introduced`.
+- **NegativeUNL with three disabled validators** (`FirstLedgerSequence` 1280, 1536 and 1792, as served); no `ValidatorToDisable` or
+  `ValidatorToReEnable`.
+- **FeeSettings in the legacy form**: `BaseFee` `"a"` (hex), `ReserveBase` 1000000, `ReserveIncrement` 200000 and `ReferenceFeeUnits` 10,
+  no `BaseFeeDrops`; the object also has `NetworkID` 21338 and `AccountCount`.
+- `server_info`: `validation_quorum` 2, `complete_ledgers` 13293254-13465945.
+- `feature`: 117 amendments, all named, 115 supported and 2 not (`HookOnV2` and `AMMClawback`, which the ledger lists as enabled all the
+  same), 91 of them enabled and none with a `majority`.
+
+Besides the Xahau Testnet answers, no recorded answer is in the legacy FeeSettings form, none has a `ValidatorToDisable` or
+`ValidatorToReEnable`, and no `feature` entry lacks a name: the specs that cover those say that their input is hand-written. The Xahau
+Testnet files are the data behind the Xahau Testnet case of `apps/api/test/amendments.e2e-spec.ts`, which seeds the ledger state with the
+IDs of `node.Amendments`.
 
 #### Re-recording
 
 ```bash
-pnpm --filter @gatehub/data-api-shared record:fixtures -- --network-state --network xrpl|xahau --endpoint <wss url> \
-  [--out <dir>] [--ledger <n>]
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network-state --network xrpl|xahau|xrpl-testnet|xahau-testnet \
+  --endpoint <wss url> [--out <dir>] [--ledger <n>]
 ```
 
 `--out` defaults to `test/fixtures/<network>/network-state`. The script asks for the Amendments object at the validated ledger (or at

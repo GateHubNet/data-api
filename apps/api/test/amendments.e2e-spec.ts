@@ -1,4 +1,5 @@
-import { getNetworkProfile, loadAmendmentsConfig, Table } from '@gatehub/data-api-shared';
+import { amendmentId, getNetworkProfile, loadAmendmentsConfig, Table } from '@gatehub/data-api-shared';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   AMENDMENT_DETAIL_KEYS,
@@ -1226,14 +1227,20 @@ describe('the metadata file of the network (GH_AMENDMENTS_CONFIG left empty)', (
     const config = loadAmendmentsConfig(getNetworkProfile('xrpl'));
     const withUrl = config.amendments.find((a) => a.xls_url !== undefined && a.enabled?.ledger_index !== undefined);
     const obsolete = config.amendments.find((a) => a.obsolete === true);
+    const retired = config.amendments.filter((a) => a.retired === true);
     let h: Harness;
     let list: Record<string, any>;
 
     beforeAll(async () => {
-      if (!withUrl || !obsolete)
-        throw new Error('the XRPL file has no entry with an xls_url and a ledger, or no obsolete one');
+      if (!withUrl || !obsolete || retired.length < 2)
+        throw new Error(
+          'the XRPL file has no entry with an xls_url and a ledger, no obsolete one, or fewer than two retired',
+        );
       h = await startHarness({ seed: 'none', network: 'xrpl', env: NO_RATE_LIMIT });
-      await insertState(h.ch, [{ ledger_index: HEAD_LEDGER, polled_at: Date.now() / 1000, amendments: [withUrl.id] }]);
+      // mainnet's ledger still lists the retired names; this one lists the first of them and not the second
+      await insertState(h.ch, [
+        { ledger_index: HEAD_LEDGER, polled_at: Date.now() / 1000, amendments: [withUrl.id, retired[0].id] },
+      ]);
       list = (await (await h.api()).ok(LIST)).body;
     });
     afterAll(async () => {
@@ -1249,6 +1256,26 @@ describe('the metadata file of the network (GH_AMENDMENTS_CONFIG left empty)', (
         enabled: { ledger_index: withUrl?.enabled?.ledger_index, source: 'metadata' },
       });
       expect(found.xls_url).toMatch(/^https:\/\/github\.com\/XRPLF\/XRPL-Standards\//);
+    });
+
+    it("marks a retired name retired and enabled: with the ledger's day of the file when the ledger lists it, without one when not", () => {
+      const [listed, unlisted] = retired;
+      expect(list.amendments.find((a: { id: string }) => a.id === listed.id)).toEqual({
+        id: listed.id,
+        name: listed.name,
+        status: 'enabled',
+        retired: true,
+        ...(listed.introduced && { introduced: listed.introduced }),
+        enabled: { ledger_index: listed.enabled?.ledger_index, date: listed.enabled?.date, source: 'metadata' },
+      });
+      expect(list.amendments.find((a: { id: string }) => a.id === unlisted.id)).toEqual({
+        id: unlisted.id,
+        name: unlisted.name,
+        status: 'enabled',
+        retired: true,
+        ...(unlisted.introduced && { introduced: unlisted.introduced }),
+      });
+      expect(list.amendments.filter((a: { retired?: true }) => a.retired === true)).toHaveLength(retired.length);
     });
 
     it('has every amendment of the file, the obsolete ones obsolete and the rest voting', () => {
@@ -1309,6 +1336,92 @@ describe('the metadata file of the network (GH_AMENDMENTS_CONFIG left empty)', (
       const d = (await (await h.api()).ok(detailOf(retired?.name ?? ''))).body;
       expect(d).toMatchObject({ id: retired?.id, status: 'enabled', retired: true, rounds: [], history: [] });
       expect(d.rules.majority_hold_seconds).toBe(HOLD_XAHAU);
+    });
+  });
+
+  describe('Xahau Testnet (the family file without its enable ledgers)', () => {
+    /** The `Amendments` object of the validated ledger of Xahau Testnet, as `record:fixtures --network-state` saved it. */
+    const recorded = JSON.parse(
+      readFileSync(
+        join(
+          __dirname,
+          '..',
+          '..',
+          '..',
+          'packages',
+          'shared',
+          'test',
+          'fixtures',
+          'xahau-testnet',
+          'network-state',
+          'amendments.json',
+        ),
+        'utf8',
+      ),
+    ) as { ledger_index: number; node: { Amendments: string[] } };
+    const ledgerIds = recorded.node.Amendments;
+    const family = loadAmendmentsConfig(getNetworkProfile('xahau'));
+    const retired = family.amendments.filter((a) => a.retired === true);
+    /** An amendment the family file dates, which the testnet's ledger lists too. */
+    const dated = family.amendments.find((a) => a.enabled !== undefined && ledgerIds.includes(a.id));
+    let started: Started;
+    let h: Harness;
+    let list: Record<string, any>;
+
+    const row = (id: string): Record<string, any> => {
+      const found = list.amendments.find((a: { id: string }) => a.id === id);
+      if (!found) throw new Error(`no row ${id}`);
+      return found;
+    };
+
+    beforeAll(async () => {
+      if (!dated || retired.length === 0)
+        throw new Error('the Xahau file has no dated entry that the testnet lists, or no retired one');
+      started = await startWithDirectory({ seed: 'none', network: 'xahau-testnet', env: NO_RATE_LIMIT });
+      h = started.h;
+      const now = Math.floor(Date.now() / 1000);
+      await insertLedgers(h.ch, recorded.ledger_index, now - 8, 10, 4);
+      await insertState(h.ch, [{ ledger_index: recorded.ledger_index, polled_at: now - 5, amendments: ledgerIds }]);
+      list = (await (await h.api()).ok(LIST)).body;
+    });
+    afterAll(async () => {
+      await h?.close();
+    });
+
+    it('builds the board from the recorded ledger, on the rules of Xahau', async () => {
+      expect((await started.directory()).state?.amendments).toHaveLength(ledgerIds.length);
+      expect(list.ledger_index).toBe(recorded.ledger_index);
+      expect(list.rules).toEqual({ threshold_percent: 80, majority_hold_seconds: HOLD_XAHAU, flag_interval: 256 });
+    });
+
+    it('has every amendment of the ledger enabled, and the retired names of the file with them', () => {
+      for (const id of ledgerIds) expect([id, row(id).status]).toEqual([id, 'enabled']);
+      const enabled = list.amendments.filter((a: { status: string }) => a.status === 'enabled');
+      expect(enabled.map((a: { id: string }) => a.id).sort()).toEqual(
+        [...new Set([...ledgerIds, ...retired.map((a) => a.id)])].sort(),
+      );
+      expect(list.counts.enabled).toBe(enabled.length);
+    });
+
+    it("has no enabled object: the file's are mainnet's and dropped, and no EnableAmendment is indexed", () => {
+      // the family file dates this one (a mainnet ledger and day), and the testnet's ledger lists it: enabled, with no date
+      expect(row(dated?.id ?? '')).toMatchObject({ name: dated?.name, status: 'enabled' });
+      expect(list.amendments.filter((a: object) => 'enabled' in a)).toEqual([]);
+      expect(JSON.stringify(list)).not.toContain('"source":"metadata"');
+    });
+
+    it('names the ones that Xahau mainnet lacks, the one no source named before included', () => {
+      for (const [id, name] of [
+        [amendmentId('AMMClawback'), 'AMMClawback'],
+        [amendmentId('HookOnV2'), 'HookOnV2'],
+        [amendmentId('RNG'), 'RNG'],
+        ['AB6612F1B9C2EAB6F687512297D9960B13B869EFF97E77D85A0574DFF97FD1EE', 'fixXahauTestnetGenesis'],
+      ]) {
+        expect(ledgerIds).toContain(id);
+        expect(row(id)).toMatchObject({ id, name, status: 'enabled' });
+      }
+      expect(ledgerIds.filter((id) => row(id).name === undefined)).toEqual([]);
+      expect(list.counts.unknown).toBe(0);
     });
   });
 });
