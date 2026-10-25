@@ -9,9 +9,8 @@ export interface AccountFlag {
 /**
  * The AccountRoot flags of Xahau. xahaud's `server_definitions` (and so `config/definitions/xahau.json` and
  * `xahau-testnet.json`) has no `LEDGER_ENTRY_FLAGS`, so they are kept here by hand, from `enum LedgerSpecificFlags`
- * ("ltACCOUNT_ROOT") of
+ * ("ltACCOUNT_ROOT") of the file below (branch `dev`, 2026-10-24). A new flag there is a new line here.
  * https://github.com/Xahau/xahaud/blob/17a484ae4adc551ced360d715be8d27d62b7bb2b/include/xrpl/protocol/LedgerFormats.h
- * (branch `dev`, 2026-10-24). A new flag there is a new line here.
  */
 const XAHAU_ACCOUNT_FLAGS: Record<string, number> = {
   lsfPasswordSpent: 0x00010000,

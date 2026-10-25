@@ -373,7 +373,7 @@ export class SyncerConfig {
   @IntValue({ min: 1 })
   domainFetchTimeoutMs: number = 10000;
 
-  /** `GH_AMENDMENTS_CONFIG`: path of the amendment metadata file; empty is the file shipped as `config/amendments/<network>.json`. */
+  /** `GH_AMENDMENTS_CONFIG`: path of the amendment metadata file; empty is the file shipped as `config/amendments/<family>.json`. */
   @ConfigValue()
   @MaybeEmptyText()
   amendmentsConfig: string = '';

@@ -88,8 +88,8 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123 / 9000
 
 cp apps/api/.env.example    apps/api/.env  # the .env files are git-ignored; the .env.example files are committed
 cp apps/syncer/.env.example apps/syncer/.env
-#   defaults: GH_NETWORK=xrpl; the syncer example reads from Ripple's full-history server wss://s2.ripple.com (the API example keeps the
-#   default nodes wss://s2.ripple.com,wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
+#   defaults: GH_NETWORK=xrpl; GH_NODE_ENDPOINTS is commented out in both examples, so the nodes are the public ones of the network (for
+#   xrpl wss://s2.ripple.com, Ripple's full-history server, then wss://xrplcluster.com); GH_API_KEYS is empty (no authentication)
 
 pnpm ch:migrate                            # creates the database of GH_NETWORK (xrpl) and applies the schema
 pnpm ch:migrate:shared                     # creates the shared database (account names, labels) and applies its own schema
