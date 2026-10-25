@@ -587,6 +587,39 @@ describe('SyncerConfig (GH_* environment)', () => {
     expect(unlListCount(emptied.cfg)).toBe(0);
   });
 
+  it('resolves the sandbox compose values', async () => {
+    // What the compose files pass a syncer with deploy/.env.sandbox.example: the testnet's name, every endpoint blank, both
+    // lists `default`, the example's threshold, and no GH_CLICKHOUSE_DATABASE (the profile's own).
+    const compose = {
+      GH_NODE_ENDPOINTS: '',
+      GH_VALIDATION_ENDPOINTS: '',
+      GH_UNL_PUBLISHERS: 'default',
+      GH_UNL_VALIDATORS: 'default',
+      GH_UNL_THRESHOLD: '0',
+    };
+    const xahauTestnet = await loadConfig({ ...compose, GH_NETWORK: 'xahau-testnet' });
+    expect(xahauTestnet.exits).toEqual([]);
+    expect(xahauTestnet.cfg).toMatchObject({
+      network: 'xahau-testnet',
+      nodeEndpoints: 'wss://xahau-test.net',
+      validationEndpoints: 'wss://xahau-test.net',
+    });
+    expect(unlPublishersOf(xahauTestnet.cfg)).toEqual([]);
+    expect(unlValidatorsOf(xahauTestnet.cfg)).toEqual(VALIDATOR_KEYS);
+    expect(unlThresholdOf(xahauTestnet.cfg)).toBe(1);
+
+    const xrplTestnet = await loadConfig({ ...compose, GH_NETWORK: 'xrpl-testnet' });
+    expect(xrplTestnet.exits).toEqual([]);
+    expect(xrplTestnet.cfg).toMatchObject({
+      network: 'xrpl-testnet',
+      nodeEndpoints: 'wss://s.altnet.rippletest.net:51233,wss://testnet.xrpl-labs.com',
+      validationEndpoints: 'wss://s.altnet.rippletest.net:51233,wss://testnet.xrpl-labs.com',
+    });
+    expect(unlPublishersOf(xrplTestnet.cfg).map((p) => p.id)).toEqual(['vl.altnet.rippletest.net']);
+    expect(unlValidatorsOf(xrplTestnet.cfg)).toEqual([]);
+    expect(unlThresholdOf(xrplTestnet.cfg)).toBe(1);
+  });
+
   it('can be loaded twice (main.ts and the AppModule both load it)', async () => {
     const saved = { ...process.env };
     Object.assign(process.env, MINIMAL_ENV);

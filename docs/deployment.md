@@ -1,8 +1,8 @@
 # Deployment
 
-How the GateHub Data API is packaged and deployed: **one deployment per network** (XRP Ledger and Xahau), the same images for
-both, on one ClickHouse server with one database per network. For day-2 work (scaling, backfill, incidents) see
-[operations](operations.md); every variable is in [configuration](configuration.md).
+How the GateHub Data API is packaged and deployed: **one deployment per network** (XRP Ledger and Xahau, and in the sandbox their
+testnets), the same images for all of them, on one ClickHouse server per environment with one database per network. For day-2 work
+(scaling, backfill, incidents) see [operations](operations.md); every variable is in [configuration](configuration.md).
 
 ## Topology
 
@@ -46,6 +46,63 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
 - The API answers the same `/v2/...` paths on both hosts; the **host name** selects the network
   ([api-reference](api-reference.md#hosts-one-per-network)). Native currency per network: `XRP` / `XAH`.
 
+The diagram is production's. The sandbox is the same stack with the testnets in the same two slots: `api-xrpl` serves XRPL Testnet (database
+`xrpl_testnet`) and `api-xahau` Xahau Testnet (`xahau_testnet`), under the sandbox hosts ([Environments](#environments)). A slot keeps its
+name because it names the family (nginx routes `xrpl.data.*` to it); the network it runs is `XRPL_NETWORK` / `XAHAU_NETWORK` of the env file.
+
+## Environments
+
+Two environments run these images. **Each is a stack of its own, on a host of its own, with a ClickHouse server of its own** (decision 3 of
+the [testnet design](superpowers/specs/2026-10-24-testnet-profiles-design.md)); they share nothing but the images and the compose file.
+
+| | Production | Sandbox |
+| --- | --- | --- |
+| Networks | XRP Ledger (`xrpl`), Xahau (`xahau`) | XRPL Testnet (`xrpl-testnet`), Xahau Testnet (`xahau-testnet`) |
+| Hosts | `xrpl.data.gatehub.net`, `xahau.data.gatehub.net` | `xrpl.data.sandbox.gatehub.net`, `xahau.data.sandbox.gatehub.net` |
+| Env file | `deploy/.env.prod`, from `deploy/.env.prod.example` | `deploy/.env.sandbox`, from `deploy/.env.sandbox.example` |
+| Compose file | `docker-compose.prod.yaml` | the same file |
+| Databases (on its own server) | `xrpl`, `xahau`, `shared` | `xrpl_testnet`, `xahau_testnet`, `shared` |
+| Exports | on, with a bucket (`exports` profile) | off: no bucket |
+
+Why a host and a server each: the fixed container names (`ch-keeper`, `ch-server`, `data-syncer-*`) already allow one stack per Docker host,
+and the `shared` database (account names and labels) has the same name on every server, so a testnet on the production server would show
+its names and labels on mainnet. A testnet process pointed at the production server by mistake still writes beside the mainnet data, never
+into it: its database is `xrpl_testnet` or `xahau_testnet` (the profile's, which the compose file never overrides).
+
+The env file picks the network of each slot, and the compose file does the rest: `XRPL_NETWORK=xrpl-testnet` and `XAHAU_NETWORK=xahau-testnet`
+in the sandbox file, neither in production's. Blank node endpoints and `default` validator lists leave the testnets' defaults to the
+profiles (the public testnet servers, XRPL Testnet's list publisher, Xahau Testnet's four fixed validators); the sandbox file leaves
+`XRPL_VALIDATION_ENDPOINTS` and `XAHAU_VALIDATION_ENDPOINTS` empty too, because a mainnet value there fails the boot. GateHub sets the
+sandbox's own node endpoints in `deploy/.env.sandbox`. Every app logs `network=… kind=testnet` at boot and refuses a node of another
+network ([syncer](syncer.md)). Production's env file gets exactly what it gets today.
+
+The sandbox, on its host:
+
+```bash
+cp deploy/.env.sandbox.example deploy/.env.sandbox          # then fill in the secrets; the file is git-ignored
+export NPM_TOKEN=...
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox up -d --build
+docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox ps
+```
+
+Everything else of Option 1 below holds with `--env-file deploy/.env.sandbox` in place of `--env-file deploy/.env.prod`: the start order, the
+`--scale` flags (repeat them on every `up`), the backfill and migrate commands, and the runbooks of [operations](operations.md) (its `dc`
+function takes the env file of the host). The sandbox needs its own values for `GH_CLICKHOUSE_PASSWORD`, `TRUSTED_PROXIES` and the API keys.
+
+- **API keys.** The sandbox explorer has a key of its own, in the sandbox's `GH_API_KEYS` and with a budget in `GH_RATE_LIMIT_KEYS`; the explorer
+  holds it as its sandbox secret `DATA_API_KEY`. Production's keys are not used there.
+- **From the validated head.** The sandbox indexes from its first boot (`XRPL_SYNC_START_LEDGER` and `XAHAU_SYNC_START_LEDGER` empty): the
+  public testnet servers hold under a year (XRPL Testnet) and a few days (Xahau Testnet), and no testnet history is backfilled. Every list shows
+  its coverage notice. A testnet reset starts the database again: [A testnet was reset](operations.md#a-testnet-was-reset).
+- **Exports are off** unless the sandbox is given a bucket of its own: `GH_EXPORT_BUCKET` stays empty and the `exports` profile is not started
+  (the exporters refuse to start without a bucket, and the apis answer 503 on `/v2/exports`). Never give the sandbox production's bucket.
+- **Certificates.** TLS ends at the front proxy ([ADR-0006](adr/0006-reverse-proxy-tls.md)), and its certificates must name the four hosts. A
+  wildcard covers one label: `*.gatehub.net` covers none of `xrpl.data.gatehub.net`, `xahau.data.gatehub.net`,
+  `xrpl.data.sandbox.gatehub.net` and `xahau.data.sandbox.gatehub.net`. `*.data.gatehub.net` and `*.data.sandbox.gatehub.net` do, and so do the
+  four names.
+- **nginx** is the same template in both: `xrpl.data.*` and `xahau.data.*` match the sandbox hosts, and route them to the slots
+  ([the edge](#the-edge-nginx)).
+
 ## Outbound network access
 
 - **api-xrpl / api-xahau:** ClickHouse and the node(s) they forward live lookups to; nothing else (signing an export's link is
@@ -53,7 +110,8 @@ both, on one ClickHouse server with one database per network. For day-2 work (sc
 - **exporter-xrpl / exporter-xahau:** ClickHouse, their network's api, and `storage.googleapis.com` (HTTPS) for the uploads.
 - **syncer-xrpl / syncer-xahau:** ClickHouse and its node(s) (WSS/HTTP), plus, for the `validators` worker, **outbound HTTPS (port 443)
   to public hosts**:
-  - the **UNL publishers** of `GH_UNL_PUBLISHERS` (by default `vl.ripple.com` and `unl.xrplf.org` on XRPL, `vl.xahau.org` on Xahau), and
+  - the **UNL publishers** of `GH_UNL_PUBLISHERS` (by default `vl.ripple.com` and `unl.xrplf.org` on XRPL, `vl.xahau.org` on Xahau,
+    `vl.altnet.rippletest.net` on XRPL Testnet, none on Xahau Testnet), and
   - the **domains validators claim**: `https://<domain>/.well-known/xrp-ledger.toml` (Xahau: `xahau.toml`) for every validator that names a
     domain in its manifest. These hosts are open-ended, so a hostname allowlist cannot cover them; a host that has no outbound HTTPS
     to arbitrary sites sets **`GH_DOMAIN_VERIFICATION=false`** (the domains then show `pending`) and keeps egress to the publishers only.
@@ -183,7 +241,7 @@ never commit them. `.env*` files are git-ignored (only `.env.example` files are 
 context. Secrets: `GH_API_KEYS`, `GH_RATE_LIMIT_KEYS` (it holds API keys), `GH_CLICKHOUSE_PASSWORD`, node URLs that carry credentials, and the
 build-time `NPM_TOKEN`.
 
-### `deploy/.env.prod`
+### `deploy/.env.prod` and `deploy/.env.sandbox`
 
 `deploy/.env.prod` is only the `--env-file` of `docker compose` (interpolation): **no container gets it as a whole**. Each service
 in `docker-compose.prod.yaml` lists the variables it needs ([which service gets what](configuration.md#which-service-gets-which-variables-production-compose)),
@@ -199,6 +257,9 @@ live-subscription switch, the fetch throttle, the `GH_LOGGER` pair). Nothing rea
 `XRPL_*` / `XAHAU_*` variables (`*_NODE_ENDPOINTS`, `*_VALIDATION_ENDPOINTS`, `*_SYNC_START_LEDGER`, `*_MARKETS_CONFIG`), plus `TRUSTED_PROXIES` / `NGINX_BIND`; the
 template lists every variable with a comment, diff your file against it. `GH_API_KEYS` and `GH_CLICKHOUSE_PASSWORD` are required (the compose file stops without
 them), and the API refuses placeholder keys (`dev-api-key`, `change-me...`).
+
+`deploy/.env.sandbox` is the same kind of file for the sandbox ([Environments](#environments)): `cp deploy/.env.sandbox.example deploy/.env.sandbox`.
+It has the production template's variables, with the testnets' values and the sandbox explorer's API key.
 
 ## Option 1: Docker Compose (reference / single host)
 
@@ -292,6 +353,10 @@ docker compose run --rm migrate-xahau                        # the schema of one
   placeholder is allowed. Never use it anywhere reachable.
 - The stack is configured from the environment of your shell (`GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD`, `GH_API_KEYS`,
   `XRPL_NODE_ENDPOINTS`, ...); `apps/*/.env` is not read.
+- **A testnet locally:** the slots take their network from `XRPL_NETWORK` and `XAHAU_NETWORK` here too, e.g.
+  `XRPL_NETWORK=xrpl-testnet docker compose --profile full up -d --build` runs XRPL Testnet in the `*-xrpl` services, in the database
+  `xrpl_testnet`, from the testnet's public servers (leave `XRPL_NODE_ENDPOINTS` unset, or a mainnet value fails the boot). Keep each variable
+  in its family (`xrpl` or `xrpl-testnet`; `xahau` or `xahau-testnet`).
 - ClickHouse has no `CLICKHOUSE_DB`: the migrate jobs create the databases. An existing volume from the old stack must be recreated
   (`docker compose down -v`).
 

@@ -1,5 +1,5 @@
-# Local development stack. One ClickHouse server, one database per network (the database is named after the network:
-# `xrpl`, `xahau`), and per network a one-shot migrate job, a syncer and an api - the same images as production. The
+# Local development stack. One ClickHouse server, one database per network (the profile of the network names it: `xrpl`, `xahau`,
+# `xrpl_testnet`, `xahau_testnet`), and per network a one-shot migrate job, a syncer and an api - the same images as production. The
 # `shared` database (account names and labels, ADR-0014), which the apis of both networks read, has its own one-shot job,
 # migrate-shared, in both profiles.
 #
@@ -10,6 +10,12 @@
 #   docker compose --profile full --profile exports up -d --build  + exporter-xrpl (exports, ticket #15; xahau-exports for Xahau)
 #   docker compose run --rm migrate-xahau                apply the schema of one network on its own
 #   docker compose run --rm migrate-shared               apply the schema of the shared database on its own
+#
+# A testnet locally: the xrpl slot serves the XRPL family and the xahau slot the Xahau family, whatever XRPL_NETWORK and XAHAU_NETWORK
+# name (xrpl or xrpl-testnet, xahau or xahau-testnet). A Xahau name in XRPL_NETWORK would serve Xahau in the xrpl slot. Blank endpoints
+# and `default` lists are the network's defaults, and the database is the network's own (xrpl_testnet), so a testnet never writes beside
+# mainnet data. Every app logs `network=...` at boot (and `kind=testnet` on a testnet). E.g. the XRPL Testnet stack:
+#   XRPL_NETWORK=xrpl-testnet docker compose --profile full up -d --build
 #
 # Building the images needs NPM_TOKEN (the private @gatehub/toolbox); it is passed as a BuildKit secret, not baked in:
 #   NPM_TOKEN=... docker compose --profile full build
@@ -124,7 +130,7 @@ services:
 
   # ---------------------------------------------------------------- XRPL (profile: full)
 
-  # One-shot: create the `xrpl` database and apply the schema, then exit 0.
+  # One-shot: create the database of the network (`xrpl`, `xrpl_testnet`) and apply the schema, then exit 0.
   migrate-xrpl:
     profiles: ['full']
     build: *syncer-build
@@ -133,7 +139,7 @@ services:
     command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xrpl
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -146,12 +152,16 @@ services:
     pull_policy: build
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xrpl
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
+      # Empty = the public endpoints of the network (XRPL: wss://s2.ripple.com,wss://xrplcluster.com).
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-}
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
-      # Empty = the validator list publishers of XRPL: an empty GH_UNL_PUBLISHERS would mean "no lists", so the default is spelled out.
-      GH_UNL_PUBLISHERS: ${XRPL_UNL_PUBLISHERS:-https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1}
+      # Empty = the validator list publishers of the network. An empty GH_UNL_PUBLISHERS would mean "no lists", so compose passes the word
+      # `default` (the network's publishers, whatever XRPL_NETWORK is).
+      GH_UNL_PUBLISHERS: ${XRPL_UNL_PUBLISHERS:-default}
+      # Empty = the validator list fixed for the network, if it has one (none on the XRPL networks); `default` for the same reason.
+      GH_UNL_VALIDATORS: ${XRPL_UNL_VALIDATORS:-default}
       # Empty = the config/amendments/xrpl.json that ships in the image (the syncer and the api read the same file).
       GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
       # Balance changes from which an account is heavy and gets rollups; empty = 1000000, 0 turns the account_rollups job off.
@@ -177,8 +187,9 @@ services:
     pull_policy: build
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xrpl
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
+      # Empty = the public endpoints of the network (XRPL: wss://s2.ripple.com,wss://xrplcluster.com).
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-}
       # Development mode, not the image's production one: the API refuses to start in production without real keys, and the
       # key below is a development default. Set GH_API_KEYS to use your own.
       NODE_ENV: development
@@ -212,7 +223,7 @@ services:
     pull_policy: build
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xrpl
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
       GH_API_URL: http://api-xrpl:3001
       GH_EXPORTER_API_KEY: ${XRPL_EXPORTER_API_KEY:-dev-api-key}
       GH_EXPORT_BUCKET: ${GH_EXPORT_BUCKET:-}
@@ -234,7 +245,7 @@ services:
 
   # ---------------------------------------------------------------- Xahau (profile: xahau)
 
-  # One-shot: create the `xahau` database and apply the schema, then exit 0.
+  # One-shot: create the database of the network (`xahau`, `xahau_testnet`) and apply the schema, then exit 0.
   migrate-xahau:
     profiles: ['xahau']
     build: *syncer-build
@@ -243,7 +254,7 @@ services:
     command: ['node', 'node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js']
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xahau
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -256,12 +267,16 @@ services:
     pull_policy: build
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xahau
-      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
+      # Empty = the public endpoint of the network (Xahau: wss://xahau.network).
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-}
       GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
       GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
-      # Empty = the validator list publishers of Xahau: an empty GH_UNL_PUBLISHERS would mean "no lists", so the default is spelled out.
-      GH_UNL_PUBLISHERS: ${XAHAU_UNL_PUBLISHERS:-https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8}
+      # Empty = the validator list publishers of the network (Xahau Testnet has none). An empty GH_UNL_PUBLISHERS would mean "no lists", so
+      # compose passes the word `default` (the network's publishers, whatever XAHAU_NETWORK is).
+      GH_UNL_PUBLISHERS: ${XAHAU_UNL_PUBLISHERS:-default}
+      # Empty = the validator list fixed for the network, if it has one (Xahau Testnet: its four validators); `default` for the same reason.
+      GH_UNL_VALIDATORS: ${XAHAU_UNL_VALIDATORS:-default}
       # Empty = the config/amendments/xahau.json that ships in the image (the syncer and the api read the same file).
       GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
       # Balance changes from which an account is heavy and gets rollups; empty = 1000000, 0 turns the account_rollups job off.
@@ -287,8 +302,9 @@ services:
     pull_policy: build
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xahau
-      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
+      # Empty = the public endpoint of the network (Xahau: wss://xahau.network).
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-}
       NODE_ENV: development # see api-xrpl
       GH_API_KEYS: ${GH_API_KEYS:-dev-api-key}
       # Empty = the config/amendments/xahau.json that ships in the image (the same file as the syncer's).
@@ -320,7 +336,7 @@ services:
     pull_policy: build
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xahau
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
       GH_API_URL: http://api-xahau:3001
       GH_EXPORTER_API_KEY: ${XAHAU_EXPORTER_API_KEY:-dev-api-key}
       GH_EXPORT_BUCKET: ${GH_EXPORT_BUCKET:-}

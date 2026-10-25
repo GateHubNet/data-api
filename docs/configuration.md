@@ -27,7 +27,7 @@ truth are
   `NODE_ENV=production` and `GH_ENV=container`, and any non-empty `GH_ENV` skips the file. The `.env` files are git-ignored;
   only the `.env.example` files are committed.
 - **One network per process.** `GH_NETWORK` selects the node URLs, the native currency (`XRP` / `XAH`), the CTID network id (0 /
-  21337), the markets config and the default ClickHouse database (all in the *network profile*). Run one API and one syncer per
+  21337 / 1 / 21338), the markets config and the default ClickHouse database (all in the *network profile*). Run one API and one syncer per
   network; a node whose `network_id` does not match refuses the boot.
 
 ## 2. Variables of both services
@@ -50,7 +50,7 @@ network, and the shared database that the apis of every network read ([ADR-0014]
 | `GH_CLICKHOUSE_URL` | `http://localhost:8123` | HTTP interface of the server. |
 | `GH_CLICKHOUSE_USER` | `default` | |
 | `GH_CLICKHOUSE_PASSWORD` | empty | A secret. |
-| `GH_CLICKHOUSE_DATABASE` | the network's name (`xrpl` / `xahau`) | Plain lowercase identifier (`^[a-z_][a-z0-9_]*$`): it is written into DDL. |
+| `GH_CLICKHOUSE_DATABASE` | the database of the network's profile: `xrpl`, `xahau`, `xrpl_testnet`, `xahau_testnet` | Plain lowercase identifier (`^[a-z_][a-z0-9_]*$`): it is written into DDL. |
 | `GH_CLICKHOUSE_SHARED_DATABASE` | `shared` (also when empty) | The shared database (account names and labels), on the same server: read by the api, created and migrated by `migrate.js shared` (the `migrate-shared` job). Give every api and the job the same name. A plain lowercase identifier, as above: it is written into the SQL. |
 | `GH_CLICKHOUSE_REQUEST_TIMEOUT` | `30000` | Client request timeout, ms. |
 | `GH_CLICKHOUSE_MAX_CONNECTIONS` | `10` | Connections in the client pool. |
@@ -140,11 +140,13 @@ variables above, per network.
 
 | Variable | Used in | Default | Becomes |
 | --- | --- | --- | --- |
-| `XRPL_NODE_ENDPOINTS`, `XAHAU_NODE_ENDPOINTS` | prod, dev | `wss://s2.ripple.com,wss://xrplcluster.com`, `wss://xahau.network` | `GH_NODE_ENDPOINTS` of the network's syncer **and** api |
-| `XRPL_VALIDATION_ENDPOINTS`, `XAHAU_VALIDATION_ENDPOINTS` | prod, dev | empty (= the node endpoints) | `GH_VALIDATION_ENDPOINTS` of the syncer |
+| `XRPL_NETWORK`, `XAHAU_NETWORK` | prod, dev | `xrpl`, `xahau` | `GH_NETWORK` of the slot's migrate job, syncer, api and exporter. `XRPL_NETWORK` is `xrpl` or `xrpl-testnet`, `XAHAU_NETWORK` is `xahau` or `xahau-testnet`: the slot serves its family (nginx routes `xrpl.data.*` to the `xrpl` slot and `xahau.data.*` to the `xahau` slot), so a name of the other family would serve Xahau on the XRPL host. Every app logs its network at boot (`network=xrpl-testnet kind=testnet`) and refuses a node of another network. Production's env file sets neither (`deploy/.env.prod.example` has them commented); `deploy/.env.sandbox.example` sets the testnets. |
+| `XRPL_NODE_ENDPOINTS`, `XAHAU_NODE_ENDPOINTS` | prod, dev | empty (= the public endpoints of the network: [`GH_NODE_ENDPOINTS`](#2-variables-of-both-services)) | `GH_NODE_ENDPOINTS` of the network's syncer **and** api. `deploy/.env.prod.example` sets `wss://s2.ripple.com,wss://xrplcluster.com` and `wss://xahau.network`; the sandbox leaves them empty (the testnets' public servers) until GateHub sets its own nodes. |
+| `XRPL_VALIDATION_ENDPOINTS`, `XAHAU_VALIDATION_ENDPOINTS` | prod, dev | empty (= the node endpoints) | `GH_VALIDATION_ENDPOINTS` of the syncer. `deploy/.env.prod.example` sets mainnet servers for XRPL; the sandbox file leaves both **empty**, because a mainnet value under a testnet name fails the boot. |
 | `XRPL_SYNC_START_LEDGER`, `XAHAU_SYNC_START_LEDGER` | prod, dev | empty (= the validated head) | `GH_SYNC_START_LEDGER` of the syncer |
 | `XRPL_MARKETS_CONFIG`, `XAHAU_MARKETS_CONFIG` | prod | empty (= the shipped file) | `GH_MARKETS_CONFIG` of the syncer; the file must be mounted into the container (a commented `volumes:` line shows how) |
-| `XRPL_UNL_PUBLISHERS`, `XAHAU_UNL_PUBLISHERS` | prod, dev | empty (= the default publishers of the network, spelled out in the compose file) | `GH_UNL_PUBLISHERS` of the syncer. An empty `GH_UNL_PUBLISHERS` would mean "no lists", so compose never passes an empty one on: this variable falls back to the default text. |
+| `XRPL_UNL_PUBLISHERS`, `XAHAU_UNL_PUBLISHERS` | prod, dev | empty (= `default`, the publishers of the network) | `GH_UNL_PUBLISHERS` of the syncer. An empty `GH_UNL_PUBLISHERS` would mean "no lists", so compose never passes an empty one on: an empty or unset variable becomes the word `default`, which the syncer reads as the default of its `GH_NETWORK` (the compose file no longer spells out the publishers of one network). |
+| `XRPL_UNL_VALIDATORS`, `XAHAU_UNL_VALIDATORS` | prod, dev | empty (= `default`, the network's fixed list) | `GH_UNL_VALIDATORS` of the syncer, by the same rule: empty or unset becomes `default` (Xahau Testnet's four validators; no list on the other networks). |
 | `XRPL_AMENDMENTS_CONFIG`, `XAHAU_AMENDMENTS_CONFIG` | prod, dev | empty (= the shipped file) | `GH_AMENDMENTS_CONFIG` of the network's syncer **and** api; the file must be mounted into both containers (a commented `volumes:` line in each shows how) |
 | `XRPL_ACCOUNT_ROLLUP_MIN_ROWS`, `XAHAU_ACCOUNT_ROLLUP_MIN_ROWS` | prod, dev | empty (= `1000000`) | `GH_ACCOUNT_ROLLUP_MIN_ROWS` of the network's syncer. Plain digits; empty is the default; `0` turns the `account_rollups` job off |
 | `GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD` | prod, dev | prod: `data_api` and **required**; dev: `default` and empty | The ClickHouse server's user (`CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`) and the login of every client |
@@ -166,13 +168,18 @@ variable that is unset in the file is not passed on and the application's own de
 
 | Service | Variables it gets |
 | --- | --- |
-| `migrate-xrpl`, `migrate-xahau` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_NETWORK` |
+| `migrate-xrpl`, `migrate-xahau` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_NETWORK` (from `XRPL_NETWORK` / `XAHAU_NETWORK`) |
 | `migrate-shared` | `GH_CLICKHOUSE_URL`, `_USER`, `_PASSWORD`, `GH_CLICKHOUSE_SHARED_DATABASE` |
-| `syncer-xrpl`, `syncer-xahau` | the ClickHouse login and `GH_CLICKHOUSE_DATABASE` (= the network), the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`; `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG`, `GH_UNL_PUBLISHERS`, `GH_AMENDMENTS_CONFIG`, `GH_ACCOUNT_ROLLUP_MIN_ROWS` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`, `GH_UNL_THRESHOLD`, `GH_UNL_REFRESH_MS`, `GH_DOMAIN_VERIFICATION`, `GH_DOMAIN_RECHECK_MS`, `GH_DOMAIN_FETCH_TIMEOUT_MS`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
-| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_NODE_ENDPOINTS`, `GH_AMENDMENTS_CONFIG` (from `XRPL_AMENDMENTS_CONFIG` / `XAHAU_AMENDMENTS_CONFIG`); `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`, `GH_NAMES_AND_LABELS_RELOAD_MS`, `GH_CLICKHOUSE_SHARED_DATABASE`, `GH_EXPORT_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS`, `GH_EXPORT_MAX_JOBS_PER_KEY`, `GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
-| `exporter-xrpl`, `exporter-xahau` (profile `exports`) | the ClickHouse login and tuning, `GH_CLICKHOUSE_DATABASE`, `GH_NETWORK`, `GH_API_URL` (= `http://api-<network>:3001`); `GH_EXPORTER_API_KEY` (from `EXPORTER_API_KEY`), `GH_EXPORT_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS`, `GH_EXPORT_PAGE_SIZE`, `GH_EXPORT_POLL_MS`, `GH_EXPORT_REQUEST_TIMEOUT_MS`, `GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`; fixed `GH_HTTP_API_PORT=3005`, `GH_METRICZ_PORT=3000`. **No** `GH_API_KEYS`. |
+| `syncer-xrpl`, `syncer-xahau` | the ClickHouse login, the optional `GH_CLICKHOUSE_MAX_EXECUTION_TIME`, `_MAX_QUERY_MEMORY`, `_REQUEST_TIMEOUT`, `_MAX_CONNECTIONS`; `GH_NETWORK`, `GH_NODE_ENDPOINTS`, `GH_VALIDATION_ENDPOINTS`, `GH_SYNC_START_LEDGER`, `GH_MARKETS_CONFIG`, `GH_UNL_PUBLISHERS`, `GH_UNL_VALIDATORS`, `GH_AMENDMENTS_CONFIG`, `GH_ACCOUNT_ROLLUP_MIN_ROWS` (from the `XRPL_*` / `XAHAU_*` variables); `GH_WORKERS`, `GH_LEDGER_FETCH_TIMEOUT_MS`, `GH_CATCHUP_*`, `GH_MAX_LAG_HEALTHY`, `GH_UNL_THRESHOLD`, `GH_UNL_REFRESH_MS`, `GH_DOMAIN_VERIFICATION`, `GH_DOMAIN_RECHECK_MS`, `GH_DOMAIN_FETCH_TIMEOUT_MS`; fixed `GH_RUN_MIGRATIONS_ON_BOOT=false`, `GH_HTTP_API_PORT=3002`, `GH_METRICZ_PORT=3000`. **No** API keys, CORS or rate-limit settings. |
+| `api-xrpl`, `api-xahau` | the ClickHouse login and tuning (`GH_CLICKHOUSE_MAX_QUERY_MEMORY` from `API_CLICKHOUSE_MAX_QUERY_MEMORY` when that is set), `GH_NETWORK`, `GH_NODE_ENDPOINTS`, `GH_AMENDMENTS_CONFIG` (from `XRPL_AMENDMENTS_CONFIG` / `XAHAU_AMENDMENTS_CONFIG`); `GH_API_KEYS` (required), `GH_CORS_ORIGINS`, `GH_RATE_LIMIT`, `GH_RATE_LIMIT_WINDOW`, `GH_RATE_LIMIT_KEYS`, `GH_TRUST_PROXY_HOPS`, `GH_LIVE_CACHE_TTL_MS`, `GH_TX_CACHE_SIZE`, `GH_CACHE_CONTROL`, `GH_NAMES_AND_LABELS_RELOAD_MS`, `GH_CLICKHOUSE_SHARED_DATABASE`, `GH_EXPORT_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS`, `GH_EXPORT_MAX_JOBS_PER_KEY`, `GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`; fixed `GH_HTTP_API_PORT=3001`, `GH_METRICZ_PORT=3000`. |
+| `exporter-xrpl`, `exporter-xahau` (profile `exports`) | the ClickHouse login and tuning, `GH_NETWORK`, `GH_API_URL` (= `http://api-<network>:3001`); `GH_EXPORTER_API_KEY` (from `EXPORTER_API_KEY`), `GH_EXPORT_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS`, `GH_EXPORT_PAGE_SIZE`, `GH_EXPORT_POLL_MS`, `GH_EXPORT_REQUEST_TIMEOUT_MS`, `GH_EXPORT_MAX_ROWS_CSV`, `GH_EXPORT_MAX_ROWS_PDF`; fixed `GH_HTTP_API_PORT=3005`, `GH_METRICZ_PORT=3000`. **No** `GH_API_KEYS`. |
 | `clickhouse` | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` (from `GH_CLICKHOUSE_USER` / `_PASSWORD`) |
 | `nginx` | `TRUSTED_PROXIES`, and the fixed `NGINX_ENVSUBST_*` of the template |
+
+**No service gets `GH_CLICKHOUSE_DATABASE`:** the database is the `defaultDatabase` of the network's profile (`xrpl`, `xahau`, `xrpl_testnet`,
+`xahau_testnet`), so a slot that runs a testnet writes to the testnet's database whatever else the env file says, and never beside mainnet data.
+`GH_NETWORK` is the one variable that picks it. A service takes the variables of its slot: `XRPL_*` for the `*-xrpl` services and `XAHAU_*` for the
+`*-xahau` ones. The same file serves the sandbox with `deploy/.env.sandbox` ([deployment](deployment.md#environments)).
 
 The dev compose ([development](development.md)) takes `GH_CLICKHOUSE_USER`, `GH_CLICKHOUSE_PASSWORD`, `GH_API_KEYS` and the
 `XRPL_*` / `XAHAU_*` variables from the environment of your shell, with the development defaults above; it does not read

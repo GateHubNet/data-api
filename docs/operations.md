@@ -11,6 +11,10 @@ it into tickets). Define it once per shell, in the repo root:
 dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod "$@"; }
 ```
 
+The sandbox is the same compose file on a host of its own ([deployment](deployment.md#environments)): there the env file is `deploy/.env.sandbox`, so define
+`dc() { docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox "$@"; }` and read the service names as the slots: `api-xrpl` serves XRPL Testnet and
+`api-xahau` Xahau Testnet (`XRPL_NETWORK` / `XAHAU_NETWORK` of the file), in the databases `xrpl_testnet` and `xahau_testnet`.
+
 ## At a glance
 
 | Thing | Where |
@@ -471,8 +475,9 @@ A node that is only **behind** (the same hash at `<head>`) does not halt the syn
 one in the message, the network was reset. If it is `<h2>`, the stored one, the endpoint in `GH_NODE_ENDPOINTS` is the odd one out (or the wrong network):
 fix it instead and restart the syncer. For the second message, a second endpoint's validated ledger is just as low.
 
-**Start again from an empty database.** `<slot>` is the service family of the testnet: `xrpl` for XRPL Testnet, `xahau` for Xahau Testnet (the sandbox runs the
-testnets in those services). The database is `xrpl_testnet` or `xahau_testnet`: **never a mainnet name**, because a dropped `xrpl` or `xahau` is the
+**Start again from an empty database.** Run it on the sandbox host, with the `dc` of `deploy/.env.sandbox` (above). `<slot>` is the service family of the testnet:
+`xrpl` for XRPL Testnet, `xahau` for Xahau Testnet (the sandbox runs the testnets in the `*-xrpl` and `*-xahau` services, `XRPL_NETWORK=xrpl-testnet` and
+`XAHAU_NETWORK=xahau-testnet`). The database is `xrpl_testnet` or `xahau_testnet`: **never a mainnet name**, because a dropped `xrpl` or `xahau` is the
 production history.
 
 1. Stop the services that use it (the exporter only runs with the `exports` profile):
@@ -494,10 +499,11 @@ production history.
    dc run --rm migrate-<slot>
    ```
 
-4. Start the syncer and the api (only these: a plain `dc up -d` would also scale the apis back to 1; start `exporter-<slot>` again after them if exports are on):
+4. Start the syncer and the api (only these: a plain `dc up -d` would also scale the apis back to 1, and so does naming `api-<slot>` without a `--scale`; start
+   `exporter-<slot>` again after them if exports are on, which the sandbox has only with a bucket of its own):
 
    ```bash
-   dc up -d syncer-<slot> api-<slot>
+   dc up -d --scale api-<slot>=<n> syncer-<slot> api-<slot>      # <n>: the replicas the api had (1 unless you scaled it)
    ```
 
 5. Insert the account network names again: they live in the network's database (`account_network_names`) and went with it

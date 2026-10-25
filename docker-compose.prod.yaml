@@ -6,8 +6,19 @@
 #                                   -> exporter-<network> (exports, exactly one; profile `exports`) -> api-<network>
 #   nginx routes by host to the apis: xrpl.data.* -> api-xrpl, xahau.data.* -> api-xahau (deploy/nginx/nginx.conf.template)
 #
-# Run (secrets and settings come from deploy/.env.prod - inject it from your secrets manager, never commit it; building needs the npm
-# token of the private @gatehub/toolbox, passed as a BuildKit secret from the NPM_TOKEN environment variable):
+# The two slots, xrpl and xahau, serve the network their env file names: XRPL_NETWORK is xrpl (the default) or xrpl-testnet,
+# XAHAU_NETWORK is xahau (the default) or xahau-testnet. Keep each in its family: nginx routes xrpl.data.* to the xrpl slot, so
+# xahau-testnet in XRPL_NETWORK would serve Xahau Testnet on the XRPL host. Every app logs `network=...` at boot (and `kind=testnet`
+# on a testnet), and refuses a node of another network. The database of a slot is its network's own (xrpl, xahau, xrpl_testnet,
+# xahau_testnet: GH_CLICKHOUSE_DATABASE is not set here), and a blank endpoint or `default` list is the network's default.
+#
+# The sandbox is this file on a host of its own, with its own ClickHouse server and deploy/.env.sandbox (docs/deployment.md,
+# "Environments"; never a testnet on the production server): the slots run XRPL Testnet and Xahau Testnet.
+#   cp deploy/.env.sandbox.example deploy/.env.sandbox
+#   NPM_TOKEN=... docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox up -d --build
+#
+# Run production (secrets and settings come from deploy/.env.prod - inject it from your secrets manager, never commit it; building
+# needs the npm token of the private @gatehub/toolbox, passed as a BuildKit secret from the NPM_TOKEN environment variable):
 #   NPM_TOKEN=... docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod up -d --build
 #
 # deploy/.env.prod is only read as the compose interpolation file (`--env-file`); no container gets it as a whole. Each service
@@ -50,8 +61,8 @@
 # (targets api-xrpl:3000, syncer-xrpl:3000, exporter-xrpl:3000, ... - with scaled replicas use Docker DNS service discovery).
 #
 # Migrations are owned by the migrate-* jobs (the apps wait for them to complete), so the syncers run with
-# GH_RUN_MIGRATIONS_ON_BOOT=false. Per network, the compose file sets GH_NETWORK, GH_CLICKHOUSE_DATABASE, the node endpoints
-# (XRPL_* / XAHAU_* in the env file), the start ledger and the ports.
+# GH_RUN_MIGRATIONS_ON_BOOT=false. Per slot, the compose file sets GH_NETWORK (XRPL_NETWORK / XAHAU_NETWORK in the env file), the node
+# endpoints (XRPL_* / XAHAU_* in the env file), the validator lists, the start ledger and the ports.
 
 x-syncer-build: &syncer-build
   context: .
@@ -232,7 +243,7 @@ services:
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     environment:
-      # No CLICKHOUSE_DB: the migrate-* jobs create the database of each network (xrpl, xahau).
+      # No CLICKHOUSE_DB: the migrate-* jobs create the database of each network (xrpl, xahau; the sandbox's: xrpl_testnet, xahau_testnet).
       CLICKHOUSE_USER: ${GH_CLICKHOUSE_USER:-data_api}
       CLICKHOUSE_PASSWORD: ${GH_CLICKHOUSE_PASSWORD:?set a ClickHouse password}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
@@ -262,12 +273,15 @@ services:
 
   # ------------------------------------------------------------------------------------------------ XRPL
 
-  # One-shot: create the `xrpl` database and apply the schema, then exit 0. The xrpl services wait for it.
+  # The xrpl slot serves the XRPL family: XRPL_NETWORK is xrpl (the default) or xrpl-testnet (the sandbox), and nginx routes xrpl.data.*
+  # to it. A Xahau name here would serve Xahau on the XRPL host. Every app of the slot logs its network at boot.
+
+  # One-shot: create the database of the network (`xrpl`, `xrpl_testnet`) and apply the schema, then exit 0. The xrpl services wait for it.
   migrate-xrpl:
     <<: *migrate
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xrpl
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
 
   syncer-xrpl:
     <<: *syncer
@@ -277,18 +291,21 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *syncer-env
-      GH_NETWORK: xrpl
-      GH_CLICKHOUSE_DATABASE: xrpl
-      # Point a full-history syncer at your own node or at Ripple's full history server (wss://s2.ripple.com).
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
+      # Empty = the public endpoints of the network (XRPL: wss://s2.ripple.com,wss://xrplcluster.com; XRPL Testnet: Ripple's and XRPL Labs' testnet
+      # servers). Point a full-history syncer at your own node or at Ripple's full history server (wss://s2.ripple.com).
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-}
       # Empty = the node endpoints.
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
       # Empty = the config/markets/xrpl.json that ships in the image. Another file must be mounted (volumes below).
       GH_MARKETS_CONFIG: ${XRPL_MARKETS_CONFIG:-}
-      # Empty = the validator list publishers of XRPL: an empty GH_UNL_PUBLISHERS would mean "no lists", so the default is spelled out.
-      GH_UNL_PUBLISHERS: ${XRPL_UNL_PUBLISHERS:-https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1}
+      # Empty = the validator list publishers of the network. An empty GH_UNL_PUBLISHERS would mean "no lists", so compose passes the word
+      # `default` (the network's publishers, whatever XRPL_NETWORK is).
+      GH_UNL_PUBLISHERS: ${XRPL_UNL_PUBLISHERS:-default}
+      # Empty = the validator list fixed for the network, if it has one (none on the XRPL networks); `default` for the same reason.
+      GH_UNL_VALIDATORS: ${XRPL_UNL_VALIDATORS:-default}
       # Empty = the config/amendments/xrpl.json that ships in the image. Another file must be mounted into the syncer and the api.
       GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
       # Balance changes from which an account is heavy and gets rollups; empty = 1000000, 0 turns the account_rollups job off.
@@ -306,9 +323,8 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *api-env
-      GH_NETWORK: xrpl
-      GH_CLICKHOUSE_DATABASE: xrpl
-      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-wss://s2.ripple.com,wss://xrplcluster.com}
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
+      GH_NODE_ENDPOINTS: ${XRPL_NODE_ENDPOINTS:-}
       # Empty = the config/amendments/xrpl.json that ships in the image (the same file as the syncer's).
       GH_AMENDMENTS_CONFIG: ${XRPL_AMENDMENTS_CONFIG:-}
     # volumes:
@@ -326,20 +342,22 @@ services:
         condition: service_healthy
     environment:
       <<: *exporter-env
-      GH_NETWORK: xrpl
-      GH_CLICKHOUSE_DATABASE: xrpl
+      GH_NETWORK: ${XRPL_NETWORK:-xrpl}
       GH_API_URL: http://api-xrpl:3001
     # volumes:
     #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS=/etc/gatehub/gcs.json
 
   # ------------------------------------------------------------------------------------------------ Xahau
 
-  # One-shot: create the `xahau` database and apply the schema, then exit 0. The xahau services wait for it.
+  # The xahau slot serves the Xahau family: XAHAU_NETWORK is xahau (the default) or xahau-testnet (the sandbox), and nginx routes
+  # xahau.data.* to it. An XRPL name here would serve XRPL on the Xahau host. Every app of the slot logs its network at boot.
+
+  # One-shot: create the database of the network (`xahau`, `xahau_testnet`) and apply the schema, then exit 0. The xahau services wait for it.
   migrate-xahau:
     <<: *migrate
     environment:
       <<: *clickhouse-client
-      GH_NETWORK: xahau
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
 
   syncer-xahau:
     <<: *syncer
@@ -349,17 +367,20 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *syncer-env
-      GH_NETWORK: xahau
-      GH_CLICKHOUSE_DATABASE: xahau
-      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
+      # Empty = the public endpoint of the network (Xahau: wss://xahau.network; Xahau Testnet: wss://xahau-test.net).
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-}
       # Empty = the node endpoints.
       GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
       # Empty = the config/markets/xahau.json that ships in the image. Another file must be mounted (volumes below).
       GH_MARKETS_CONFIG: ${XAHAU_MARKETS_CONFIG:-}
-      # Empty = the validator list publishers of Xahau: an empty GH_UNL_PUBLISHERS would mean "no lists", so the default is spelled out.
-      GH_UNL_PUBLISHERS: ${XAHAU_UNL_PUBLISHERS:-https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8}
+      # Empty = the validator list publishers of the network (Xahau Testnet has none). An empty GH_UNL_PUBLISHERS would mean "no lists", so
+      # compose passes the word `default` (the network's publishers, whatever XAHAU_NETWORK is).
+      GH_UNL_PUBLISHERS: ${XAHAU_UNL_PUBLISHERS:-default}
+      # Empty = the validator list fixed for the network, if it has one (Xahau Testnet: its four validators); `default` for the same reason.
+      GH_UNL_VALIDATORS: ${XAHAU_UNL_VALIDATORS:-default}
       # Empty = the config/amendments/xahau.json that ships in the image. Another file must be mounted into the syncer and the api.
       GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
       # Balance changes from which an account is heavy and gets rollups; empty = 1000000, 0 turns the account_rollups job off.
@@ -377,9 +398,8 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *api-env
-      GH_NETWORK: xahau
-      GH_CLICKHOUSE_DATABASE: xahau
-      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-wss://xahau.network}
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
+      GH_NODE_ENDPOINTS: ${XAHAU_NODE_ENDPOINTS:-}
       # Empty = the config/amendments/xahau.json that ships in the image (the same file as the syncer's).
       GH_AMENDMENTS_CONFIG: ${XAHAU_AMENDMENTS_CONFIG:-}
     # volumes:
@@ -397,8 +417,7 @@ services:
         condition: service_healthy
     environment:
       <<: *exporter-env
-      GH_NETWORK: xahau
-      GH_CLICKHOUSE_DATABASE: xahau
+      GH_NETWORK: ${XAHAU_NETWORK:-xahau}
       GH_API_URL: http://api-xahau:3001
     # volumes:
     #   - ./deploy/gcs-credentials.json:/etc/gatehub/gcs.json:ro # and GOOGLE_APPLICATION_CREDENTIALS=/etc/gatehub/gcs.json
