@@ -433,8 +433,12 @@ them with `range-ingest` (see [Backfill and repair](#backfill-and-repair)).
 
 - `parent_hash` break or a checkpoint hash the node does not confirm: the stored chain and the node disagree about history. Find
   out which is wrong (ask a second node: `ledger` at the stored index, compare `ledger_hash`). If the **node** is on another
-  chain (wrong network, a reset test net) fix `GH_NODE_ENDPOINTS`. If the **stored** ledgers are wrong, re-ingest from the last
+  chain (the wrong network) fix `GH_NODE_ENDPOINTS`. If the **stored** ledgers are wrong, re-ingest from the last
   good ledger: `range-ingest --reprocess --from <last good> --to <checkpoint>` from a stopped live syncer, then start it.
+- `The node's validated ledger <head> has hash <h1>, but ledger <head> is stored with hash <h2>: the network was reset, or the node is of
+  another chain` or `The node's validated head <head> is below the first indexed ledger <first>: the network was reset`: the node's head is
+  below the checkpoint and its chain is not the stored one. On a testnet that is a reset: [A testnet was reset](#a-testnet-was-reset). On
+  a mainnet the first message means the node is of another chain (fix `GH_NODE_ENDPOINTS`), and the second never halts it.
 - `Cannot parse ledger <index>: <reason>`: the parser rejects that ledger (a transaction type or field it does not handle). It
   fails the same way every time, so the runner committed the ledgers before it and stopped instead of retrying. Look at the
   ledger (`ledger` with `transactions` and `expand` on the node), fix the parser, deploy, restart: the runner carries on at that
@@ -448,6 +452,60 @@ reachable? `[NodeClient]` reconnect warnings), ClickHouse (writes failing? `reco
 stuck mutations in `system.mutations`), and disk. Live load is about one ledger per 3-4 s on XRPL; falling behind in live mode is
 a downstream problem, not throughput. In catch-up, throughput is bound by the node first: raise `GH_CATCHUP_CONCURRENCY` with
 your own node.
+
+### A testnet was reset
+
+A testnet is reset from time to time: its ledger indexes start again, under other hashes, so everything the network's database holds is of a chain
+that no longer exists. The syncer notices when the node's validated head is below its checkpoint ([syncer](syncer.md#a-head-below-the-checkpoint))
+and **halts** instead of waiting for ledgers the node will never have: `state=halted` and a 503 on its probe, with one of two messages:
+
+- `The node's validated ledger <head> has hash <h1>, but ledger <head> is stored with hash <h2>: the network was reset, or the node is of another chain`:
+  the node has a ledger at `<head>`, below the checkpoint, and it is not the one stored.
+- `The node's validated head <head> is below the first indexed ledger <first>: the network was reset`: the node's head is lower than the first ledger the
+  database holds, so there is nothing stored to compare it with. Only a testnet halts on this one.
+
+A node that is only **behind** (the same hash at `<head>`) does not halt the syncer: it logs one warning per head, `... is below the checkpoint
+<checkpoint>, with the stored hash: waiting for it to catch up`, and waits.
+
+**Make sure it is a reset** before you drop anything: ask a second endpoint of the same network for `ledger` at `<head>`. If its `ledger_hash` is `<h1>`, the
+one in the message, the network was reset. If it is `<h2>`, the stored one, the endpoint in `GH_NODE_ENDPOINTS` is the odd one out (or the wrong network):
+fix it instead and restart the syncer. For the second message, a second endpoint's validated ledger is just as low.
+
+**Start again from an empty database.** `<slot>` is the service family of the testnet: `xrpl` for XRPL Testnet, `xahau` for Xahau Testnet (the sandbox runs the
+testnets in those services). The database is `xrpl_testnet` or `xahau_testnet`: **never a mainnet name**, because a dropped `xrpl` or `xahau` is the
+production history.
+
+1. Stop the services that use it (the exporter only runs with the `exports` profile):
+
+   ```bash
+   dc stop syncer-<slot> api-<slot> exporter-<slot>
+   ```
+
+2. Drop the database. Open `clickhouse-client` as in [SQL health checks](#sql-health-checks), read the network the database belongs to, and drop it:
+
+   ```sql
+   SELECT network, holder FROM xrpl_testnet.syncer_lease FINAL;   -- the network column must read xrpl-testnet
+   DROP DATABASE xrpl_testnet;
+   ```
+
+3. Create it again, with the schema:
+
+   ```bash
+   dc run --rm migrate-<slot>
+   ```
+
+4. Start the syncer and the api (only these: a plain `dc up -d` would also scale the apis back to 1; start `exporter-<slot>` again after them if exports are on):
+
+   ```bash
+   dc up -d syncer-<slot> api-<slot>
+   ```
+
+5. Insert the account network names again: they live in the network's database (`account_network_names`) and went with it
+   ([Name an account on one network](#name-an-account-on-one-network)).
+
+The syncer finds an empty database and starts at `GH_SYNC_START_LEDGER` (default: the node's validated head). What goes with the database: its ledgers, the
+aggregates, the lease, the export jobs and the account network names. What stays: the **shared** database (`shared`: account names, labels), which belongs to no
+network. The explorer's side is its own: it deploys its sandbox with a new build id (the explorer's sandbox environment design, section 11).
 
 ## The AMM jobs
 

@@ -80,6 +80,14 @@ export async function committedCheckpoint(ch: ClickHouseService): Promise<number
   return row?.checkpoint == null ? undefined : Number(row.checkpoint);
 }
 
+/** The lowest ledger whose `ledgers` row exists; `undefined` when none is (`minOrNull(ledger_index)`). */
+export async function firstCommittedLedger(ch: ClickHouseService): Promise<number | undefined> {
+  const row = await ch.queryOne<{ first_ledger: number | string | null }>(
+    `SELECT minOrNull(ledger_index) AS first_ledger FROM ${Table.Ledgers}`,
+  );
+  return row?.first_ledger == null ? undefined : Number(row.first_ledger);
+}
+
 /** The hash stored for a committed ledger, or `undefined` when the ledger is not committed. */
 export async function storedLedgerHash(ch: ClickHouseService, index: number): Promise<string | undefined> {
   requireLedgerIndex(index);

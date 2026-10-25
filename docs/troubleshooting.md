@@ -199,6 +199,25 @@ See [operations](operations.md#after-an-outage): a node without the history (`co
 the probe's `recovering`/`error`), a chain break, a ledger the parser rejects (`error: Cannot parse ledger <index>: ...`) or a lost lease
 (`state=halted`, see [operations](operations.md#syncer-halted)).
 
+### Syncer halted: `The node's validated ledger <head> has hash <h1>, but ledger <head> is stored with hash <h2>: the network was reset, or the node is of another chain`
+**Symptom:** `state=halted`, a 503 on the syncer's probe, and this `error`.
+
+**Root cause:** the node's validated head is below the committed checkpoint, and the node's ledger at `<head>` has another hash than the one stored for
+that index. Two hashes at one index can only be two chains: a testnet that was reset (its indexes start again), or a node of another chain than the one
+stored. The check runs on every network. A node that is merely behind has the stored hash at `<head>`; the syncer only warns and waits then.
+
+**Fix:** on a testnet that was reset, [A testnet was reset](operations.md#a-testnet-was-reset) (drop the testnet's database and start again). If the
+network was not reset, the node is the wrong one: fix `GH_NODE_ENDPOINTS` ([Syncer halted](operations.md#syncer-halted)).
+
+### Syncer halted: `The node's validated head <head> is below the first indexed ledger <first>: the network was reset`
+**Symptom:** the same, with this `error`, on a testnet.
+
+**Root cause:** the node's validated head is below the checkpoint and below the lowest ledger the database holds, so there is no stored ledger to
+compare it with. On a testnet that means the same thing as the message above. A mainnet does not halt on this: it waits, as does a testnet whose head falls
+in a gap between stored ledgers.
+
+**Fix:** [A testnet was reset](operations.md#a-testnet-was-reset).
+
 ### `api_tx_encode_fallback_total` rises
 A transaction type or field is missing from the binary-codec definitions in use, so those transactions are served as their stored JSON. The
 definitions come from the node's `server_definitions` (at api boot) with the bundled `config/definitions/<network>.json` as fallback: restart

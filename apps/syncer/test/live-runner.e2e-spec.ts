@@ -28,12 +28,14 @@ import {
 } from '../src/ingest/live-runner';
 import { LedgerNotValidatedError } from '../src/ingest/rpc-ledger-source';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, range, syntheticChain, SyntheticLedger } from './synthetic-chain';
+import { ammTemplate, range, syntheticChain, syntheticHash, SyntheticLedger } from './synthetic-chain';
 
 /** `L(1)` .. `L(30)` = 9999986 .. 10000015: the chain crosses the partition boundary at ledger 10,000,000. */
 const BASE = 9_999_985;
 const L = (i: number): number => BASE + i;
 const CHAIN = syntheticChain(L(1), 30);
+/** The same indexes under other hashes: what a node serves after its network was reset. */
+const RESET_CHAIN = syntheticChain(L(1), 30, { salt: 'reset' });
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 
@@ -69,7 +71,7 @@ class TestSource implements LedgerSource {
   /** Index -> how many more fetches of it fail with `LedgerNotValidatedError`. */
   readonly notValidated = new Map<number, number>();
   available: number;
-  private readonly byIndex: Map<number, RawLedger>;
+  private byIndex: Map<number, RawLedger>;
 
   constructor(
     public head: number,
@@ -93,6 +95,11 @@ class TestSource implements LedgerSource {
     const ledger = this.byIndex.get(index);
     if (!ledger || index > this.available) throw new LedgerNotAvailableError(index);
     return ledger;
+  }
+
+  /** The node changes chain under a running runner: it serves `chain` from now on (set `head` and `available` too). */
+  useChain(chain: SyntheticLedger[]): void {
+    this.byIndex = new Map(chain.map((l) => [l.index, l.raw]));
   }
 
   /** How often `index` was fetched. */
@@ -896,6 +903,189 @@ describe('LiveRunner (e2e)', () => {
     expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(10) });
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
     expect(source.fetches).toEqual([L(10)]);
+  });
+
+  describe('a head below the checkpoint (a reset testnet, or a node that is behind)', () => {
+    /** The message of a head below the checkpoint whose ledger has another hash than the stored one. */
+    const resetMessage = (head: number): string =>
+      `The node's validated ledger ${head} has hash ${syntheticHash(head, 'reset')}, ` +
+      `but ledger ${head} is stored with hash ${syntheticHash(head)}: the network was reset, or the node is of another chain`;
+
+    /** Commits `L(1)`..`L(10)` of `CHAIN` (the checkpoint is `L(10)`), on the network `cfg` names. */
+    async function committedTen(cfg: Partial<SyncerConfig> = {}): Promise<ClickHouseService> {
+      const svc = await freshService();
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { cfg });
+      await runner.runOnce();
+      await runner.stop();
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      return svc;
+    }
+
+    it("halts at boot when the node's head is below the checkpoint under another hash: the network was reset", async () => {
+      const svc = await committedTen();
+      const metrics = new PrometheusService();
+      const before = await halts(metrics, 'chain_break');
+      const source = new TestSource(L(5), RESET_CHAIN);
+      const { runner } = makeRunner(svc, source, { metrics });
+
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message: resetMessage(L(5)),
+        ledgerIndex: L(5),
+      });
+
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(10), error: resetMessage(L(5)) });
+      // Only the node's ledger at its head was fetched: not the checkpoint, which the node does not have.
+      expect(source.fetches).toEqual([L(5)]);
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await halts(metrics, 'chain_break')).toBe(before + 1);
+    });
+
+    it("waits at boot when the node's head is below the checkpoint with the stored hash: the node is behind", async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(5));
+      const { runner, logger } = makeRunner(svc, source, {
+        options: { headSilenceMs: 50, backoffInitialMs: 50, backoffMaxMs: 100 },
+      });
+
+      await runner.onApplicationBootstrap();
+      await pause(500);
+
+      expect(runner.status().state).not.toBe('halted');
+      expect(source.fetchCount(L(5))).toBe(1); // the check
+      const warnings = logger.lines.filter((l) => l.level === 'warn' && l.message.includes('below the checkpoint'));
+      expect(warnings).toEqual([
+        {
+          level: 'warn',
+          message: `The node's validated head ${L(5)} is below the checkpoint ${L(10)}, with the stored hash: waiting for it to catch up`,
+        },
+      ]);
+
+      // The node catches up: the runner carries on after the checkpoint.
+      source.head = L(12);
+      source.available = L(12);
+      await waitFor(() => runner.status().checkpoint === L(12), 'the checkpoint to reach L(12)');
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(runner.status().state).not.toBe('halted');
+    });
+
+    it('halts while live when the head falls below the checkpoint under another hash', async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(10));
+      const { runner } = makeRunner(svc, source, { options: { headSilenceMs: 50, headBelowCheckMs: 300 } });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().state === 'live', 'the runner to be live at L(10)');
+
+      // The network is reset: the node serves another chain, and its head is low.
+      source.useChain(RESET_CHAIN);
+      source.head = L(3);
+      source.available = L(3);
+      await waitFor(() => runner.status().state === 'halted', 'the runner to halt');
+
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(10), error: resetMessage(L(3)) });
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message: resetMessage(L(3)),
+        ledgerIndex: L(3),
+      });
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+    });
+
+    it('checks a head below the checkpoint once per distinct head and at most once per headBelowCheckMs', async () => {
+      const svc = await committedTen();
+      const source = new TestSource(L(10));
+      const fetchedAt = new Map<number, number[]>();
+      const fetch = source.fetch.bind(source);
+      jest.spyOn(source, 'fetch').mockImplementation(async (index: number) => {
+        fetchedAt.set(index, [...(fetchedAt.get(index) ?? []), Date.now()]);
+        return fetch(index);
+      });
+      const { runner } = makeRunner(svc, source, { options: { headSilenceMs: 50, headBelowCheckMs: 300 } });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().state === 'live', 'the runner to be live at L(10)');
+      expect(source.fetches).toEqual([L(10)]); // the boot's fetch of the checkpoint, and nothing else
+
+      // The head drops to L(5), the node still on the same chain: one check of it, at once.
+      source.head = L(5);
+      await waitFor(() => source.fetchCount(L(5)) === 1, 'the check of L(5)');
+      const checkedL5 = (fetchedAt.get(L(5)) as number[])[0];
+
+      // The next head is another one, but the last check is younger than headBelowCheckMs: not yet.
+      source.head = L(6);
+      await pause(120);
+      expect(source.fetchCount(L(6))).toBe(0);
+      await waitFor(() => source.fetchCount(L(6)) === 1, 'the check of L(6)');
+      expect((fetchedAt.get(L(6)) as number[])[0] - checkedL5).toBeGreaterThanOrEqual(300);
+
+      // The same head, polled over and over, is not checked again.
+      await pause(700);
+      expect(source.fetchCount(L(5))).toBe(1);
+      expect(source.fetchCount(L(6))).toBe(1);
+      expect(source.fetches).toEqual([L(10), L(5), L(6)]);
+      expect(runner.status()).toMatchObject({ checkpoint: L(10), head: L(10) });
+      expect(runner.status().state).not.toBe('halted');
+    });
+
+    it('on a testnet, halts when the head is below the first indexed ledger', async () => {
+      const cfg = { network: 'xrpl-testnet', syncStartLedger: L(10) };
+      const svc = await freshService();
+      const { runner: first } = makeRunner(svc, new TestSource(L(20)), { cfg });
+      await first.runOnce();
+      await first.stop();
+      expect(await committedIndexes(svc)).toEqual(range(L(10), L(20)));
+
+      const source = new TestSource(L(3));
+      const { runner } = makeRunner(svc, source, { cfg });
+      const message = `The node's validated head ${L(3)} is below the first indexed ledger ${L(10)}: the network was reset`;
+
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message,
+        ledgerIndex: L(3),
+      });
+
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(20), error: message });
+      expect(source.fetches).toEqual([]); // no stored hash to compare with: nothing to fetch
+    });
+
+    it('on a mainnet, waits when the head is below the first indexed ledger', async () => {
+      const cfg = { network: 'xrpl', syncStartLedger: L(10) };
+      const svc = await freshService();
+      const { runner: first } = makeRunner(svc, new TestSource(L(20)), { cfg });
+      await first.runOnce();
+      await first.stop();
+
+      const source = new TestSource(L(3));
+      const { runner } = makeRunner(svc, source, {
+        cfg,
+        options: { headSilenceMs: 50, backoffInitialMs: 50, backoffMaxMs: 100 },
+      });
+      await runner.onApplicationBootstrap();
+      await pause(500);
+
+      expect(runner.status()).toMatchObject({ checkpoint: L(20) });
+      expect(runner.status().state).not.toBe('halted');
+      expect(source.fetchCount(L(3))).toBe(0);
+    });
+
+    it('on a testnet, waits when the head is below the checkpoint in a gap of the stored ledgers', async () => {
+      const svc = await freshService();
+      // L(10), L(11) and L(15) .. L(16) are stored; the node is at L(13), which is no stored ledger, above the first.
+      // (L(15) opens a new partition of `ledgers`, so two writes: a commit never spans two partitions.)
+      await new LedgerWriter(svc, ctx).write(chainRaw(L(10), L(11)));
+      await new LedgerWriter(svc, ctx).write(chainRaw(L(15), L(16)));
+      const source = new TestSource(L(13));
+      const { runner } = makeRunner(svc, source, {
+        cfg: { network: 'xrpl-testnet' },
+        options: { headSilenceMs: 50, backoffInitialMs: 50, backoffMaxMs: 100 },
+      });
+      await runner.onApplicationBootstrap();
+      await pause(500);
+
+      expect(runner.status()).toMatchObject({ checkpoint: L(16) });
+      expect(runner.status().state).not.toBe('halted');
+      expect(source.fetchCount(L(13))).toBe(0);
+    });
   });
 
   it('waits as long as a rate-limited node asks before it fetches again, without a warning per fetch (ruling R98)', async () => {

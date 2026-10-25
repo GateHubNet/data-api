@@ -108,7 +108,8 @@ half-written ledger is invisible; recovery removes it.
   (`lease lost to <holder>`), writes nothing more and the probe goes 503. Releasing the lease inserts a newer row with an empty
   holder.
 - **Verify.** The node must confirm the hash stored for the checkpoint, else the runner halts (data and node disagree about
-  history; only an operator can tell which is wrong).
+  history; only an operator can tell which is wrong). A node whose validated head is below the checkpoint has no checkpoint to
+  confirm, so that case is told apart first: [A head below the checkpoint](#a-head-below-the-checkpoint).
 - **Clean the tail.** Rows above the checkpoint are rows of ledgers that never committed. They are deleted with partition-scoped
   lightweight `DELETE`s (the `ledgers` row first) and the runner waits for the deletes (`lightweight_deletes_sync=2`).
 - **First boot** (no checkpoint): the start is `GH_SYNC_START_LEDGER` (default: the validated head). The start is recorded as a
@@ -131,6 +132,8 @@ half-written ledger is invisible; recovery removes it.
   it asks (see [Rate limits](#rate-limits)). A fetched ledger is accepted only if the node says it is `validated`.
   Accepted ledgers are reordered and chained in index order: each `parent_hash` must be the hash of the ledger before it. A break
   commits the verified prefix and **halts** the runner (probe 503).
+- **A head below the checkpoint** (a testnet that was reset, or a node that is behind) is compared with what is stored, and halts the
+  runner when it is another chain: [below](#a-head-below-the-checkpoint).
 - **A ledger the parser rejects** (`Cannot parse ledger <index>: <reason>`) is not retried: parsing is pure and would fail the
   same way after any recovery. The ledgers of the batch before it are committed, then the runner **halts** like on a chain break
   (probe 503 with the error, `syncer_ingest_halts_total{reason="parse_error"}`). It needs a parser fix; after the restart the
@@ -142,6 +145,31 @@ half-written ledger is invisible; recovery removes it.
 - **Shutdown.** A write in progress finishes, a partial batch is dropped and refetched next time, the lease is released.
 
 States (probe and `syncer_*` metrics): `starting`, `catching_up`, `live`, `halted`. Lag = validated head − committed checkpoint.
+
+### A head below the checkpoint
+
+A testnet can be reset: its ledger indexes start again, under other hashes. The head never goes down, so a node whose validated head
+falls below the committed checkpoint would leave the runner waiting for ledgers it will never get, healthy by every probe (and a
+restart would retry the fetch of a checkpoint the node does not have). The runner tells a reset from a node that is only behind.
+
+- **The head below.** A head the node reports (a hint or a poll) below the committed checkpoint is recorded apart; the runner's `head`
+  still never goes down. The loop compares the node's ledger at that head with the stored one (`storedLedgerHash(head)` against one
+  `fetch(head)`) when that head is not the last one checked and `HEAD_BELOW_CHECK_MS` (60 s) have passed since the last check (the first
+  at once): once per distinct head, at most once a minute. A fetch that fails is a warning, and the next due check tries again.
+- **At boot**, with a checkpoint, the runner asks for the validated head first and runs the same check when it is below the checkpoint,
+  before it fetches the checkpoint (which then waits for a node that is behind, as it always did).
+- **Another hash** at that index: two hashes at one index can only be two chains, so the runner **halts** with
+  `The node's validated ledger <head> has hash <h1>, but ledger <head> is stored with hash <h2>: the network was reset, or the node is of another chain`.
+  This holds on **every network, mainnet included**, and changes mainnet behaviour on purpose: before it, a mainnet syncer
+  pointed at a node of another chain, with a head below its checkpoint, waited forever too.
+- **The same hash**: the node is behind (a failover to a slower node). The runner logs one warning per head, `The node's validated head <head> is
+  below the checkpoint <checkpoint>, with the stored hash: waiting for it to catch up`, and waits.
+- **No stored ledger** at that head: on a **testnet**, when the head is below the first indexed ledger (`firstCommittedLedger`), the runner
+  halts with `The node's validated head <head> is below the first indexed ledger <first>: the network was reset`. On a mainnet, or when the
+  head falls in a gap between stored ledgers, it waits.
+
+Both halts are a `ChainBreakError`, so they halt as a chain break does: `state=halted`, the probe is 503 with the message,
+`syncer_ingest_halts_total{reason="chain_break"}`. What to do: [A testnet was reset](operations.md#a-testnet-was-reset).
 
 ### Rate limits
 
@@ -847,6 +875,8 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
 | Symptom | Cause | What happens |
 | --- | --- | --- |
 | Probe 503, `state=halted`, `error: ...parent_hash...` | Chain break: the node's history differs from what is stored | The verified prefix is committed, then nothing. Operator decision: see [operations](operations.md#syncer-halted). |
+| Probe 503, `state=halted`, `error: The node's validated ledger <head> has hash ...: the network was reset, or the node is of another chain` | The node's head is below the checkpoint and its ledger there has another hash than the stored one: a testnet was reset, or the node is of another chain | Nothing more is fetched or written. On a testnet: [A testnet was reset](operations.md#a-testnet-was-reset); otherwise fix `GH_NODE_ENDPOINTS`, see [operations](operations.md#syncer-halted). |
+| Probe 503, `state=halted`, `error: The node's validated head <head> is below the first indexed ledger <first>: the network was reset` | A testnet's head is below the lowest ledger stored, so there is nothing to compare it with | The same: [A testnet was reset](operations.md#a-testnet-was-reset). A mainnet waits instead. |
 | Probe 503, `state=halted`, `error: Cannot parse ledger <index>: ...` | The parser rejects a ledger (a transaction shape it does not know) | The ledgers before it are committed, then nothing; not retried. Needs a parser fix and a restart, see [operations](operations.md#syncer-halted). |
 | Probe 503, `lease lost to ...` | Another syncer took the lease | This one stopped writing. Find and stop the other one. |
 | Boot refuses: lease held | A previous syncer (or an old-stack container) is still running or died less than 30 s ago | Stop it; wait 30 s. |

@@ -9,6 +9,7 @@ import {
   committedCheckpoint,
   deleteLedgerRange,
   deleteLedgersAbove,
+  firstCommittedLedger,
   LEDGER_KEYED_TABLES,
   missingLedgers,
   storedLedgerHash,
@@ -418,6 +419,24 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await insertUncommitted(svc, [BUILT[0]]);
       expect(await committedCheckpoint(svc)).toBeUndefined();
       expect(await missingLedgers(svc, index(0), index(0))).toEqual([index(0)]);
+    });
+
+    it('firstCommittedLedger is undefined on an empty database and the lowest committed ledger after writes', async () => {
+      const svc = await freshService();
+      expect(await firstCommittedLedger(svc)).toBeUndefined();
+
+      // The child rows of an uncommitted ledger do not count: only a `ledgers` row does.
+      await insertUncommitted(svc, [BUILT[0]]);
+      expect(await firstCommittedLedger(svc)).toBeUndefined();
+
+      await new LedgerWriter(svc, ctx).write(LEDGERS.slice(10, 20));
+      expect(await firstCommittedLedger(svc)).toBe(index(10));
+      expect(await committedCheckpoint(svc)).toBe(index(19));
+
+      // A lower ledger committed later (a backfill) becomes the first; the checkpoint stays the highest.
+      await new LedgerWriter(svc, ctx).write(LEDGERS.slice(2, 4));
+      expect(await firstCommittedLedger(svc)).toBe(index(2));
+      expect(await committedCheckpoint(svc)).toBe(index(19));
     });
 
     it('rejects arguments that are not UInt32 integers', async () => {

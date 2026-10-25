@@ -3,6 +3,8 @@ import {
   ClickHouseService,
   committedCheckpoint,
   deleteLedgersAbove,
+  firstCommittedLedger,
+  getNetworkProfile,
   isLedgerParseError,
   LedgerParseError,
   LedgerSource,
@@ -44,9 +46,16 @@ export const LIVE_INTENT_PREFIX = 'live:';
 export const LIVE_INTENT_RANGE_END = 0;
 
 /**
- * A ledger whose `parent_hash` is not the hash of the ledger before it, or a stored checkpoint whose hash the node does
- * not confirm. The runner halts (status `halted`, liveliness 503): the data and the node disagree about history, and only
- * an operator can tell which one is wrong.
+ * How long the live runner leaves between two checks of a head below the committed checkpoint against the stored ledger
+ * (`LiveRunnerOptions.headBelowCheckMs`).
+ */
+export const HEAD_BELOW_CHECK_MS = 60_000;
+
+/**
+ * A ledger whose `parent_hash` is not the hash of the ledger before it, a stored checkpoint whose hash the node does not
+ * confirm, or a node whose validated head is below the checkpoint under another hash than the stored one, or (on a
+ * testnet) below the first indexed ledger: the network was reset. The runner halts (status `halted`, liveliness 503): the
+ * data and the node disagree about history, and only an operator can tell which one is wrong.
  */
 export class ChainBreakError extends Error {
   constructor(
@@ -91,6 +100,11 @@ export interface LiveRunnerOptions {
   heartbeatMs?: number;
   /** Poll `validatedHead()` when no `ledgerClosed` hint has arrived for this long. Default 15000. */
   headSilenceMs?: number;
+  /**
+   * The least time between two checks of a head below the committed checkpoint against the stored ledger (the first
+   * check is made at once). Default `HEAD_BELOW_CHECK_MS`.
+   */
+  headBelowCheckMs?: number;
   /** First retry delay of a fetch, the boot cleanup and a recovery; it doubles per attempt. Default 500. */
   backoffInitialMs?: number;
   /** Cap of the retry delay. Default 30000. */
@@ -112,6 +126,7 @@ const DEFAULTS = {
   leaseTtlMs: 30_000,
   heartbeatMs: 10_000,
   headSilenceMs: 15_000,
+  headBelowCheckMs: HEAD_BELOW_CHECK_MS,
   backoffInitialMs: 500,
   backoffMaxMs: 30_000,
   quiescenceTimeoutMs: 60_000,
@@ -134,7 +149,8 @@ class StoppedError extends Error {}
  *
  * **Boot** (`onApplicationBootstrap`): take the `syncer_lease` (refused while another holder's heartbeat is younger than
  * 30 s on the ClickHouse server's clock), then, in the background: verify that the node confirms the hash stored for the
- * committed checkpoint (else halt), delete the uncommitted tail above it, and continue at checkpoint + 1. With no
+ * committed checkpoint (else halt; a node whose head is below the checkpoint is told apart first, see **A head below the
+ * checkpoint**), delete the uncommitted tail above it, and continue at checkpoint + 1. With no
  * checkpoint the start is `GH_SYNC_START_LEDGER` (default: the validated head); the rows above
  * min(start, earliest unfinished first-write intent) - 1 are deleted first (what a crashed first write left), and the
  * start is recorded as an intent in `ingest_log` until the first commit.
@@ -152,6 +168,16 @@ class StoppedError extends Error {}
  * `catchupFlushLedgers` ledgers or `catchupFlushTxs` transactions, is `catchupFlushMs` old, reaches to within one ledger
  * of the head (live, every ledger is its own commit), or the next ledger starts a new `ledgers` partition (a commit never
  * spans two, so a half-applied commit cannot leave a marker above a gap).
+ *
+ * **A head below the checkpoint** (a testnet that was reset, or a node that is behind). A head the node reports below the
+ * committed checkpoint is recorded apart (`head` still never goes down). From the loop, when that head is not the last
+ * one checked and `headBelowCheckMs` has passed since the last check (the first at once), and at boot when the head the
+ * node reports is below the checkpoint, the runner compares the stored hash of the ledger at that head with the node's:
+ * another hash is another chain (two hashes at one index can only be), so it halts with a `ChainBreakError`; the same
+ * hash means a node that is behind, and the runner waits for it with one warning. This holds on **every network**,
+ * mainnet included, and changes mainnet behaviour on purpose (before it, a mainnet syncer behind a node of another chain
+ * waited forever too). A head with no stored ledger to compare (below the first indexed ledger, or in a gap) halts only
+ * on a testnet, and only below the first indexed ledger; on a mainnet, or in a gap, the runner waits.
  *
  * **A failed write** is recovered as `LedgerWriter` documents (ruling R16): wait until the failed run's queries are gone,
  * re-read the checkpoint, delete everything above it and wait for that too, carry on with a writer under a new runId and
@@ -190,6 +216,13 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
   private lastHintAt = 0;
   private lastPollAt = 0;
   private polling = false;
+  /** The newest head the node reported below the committed checkpoint; undefined once it reports one at or above. */
+  private headBelow?: number;
+  /** The head below that was last compared with the stored ledger (undefined: none, or the node has caught up since). */
+  private headBelowChecked?: number;
+  /** `Date.now()` when the last check of a head below ended, 0 before the first. */
+  private headBelowCheckedAt = 0;
+  private checkingHeadBelow = false;
 
   // --- committed position --------------------------------------------------------------------------------------------
   private prepared = false;
@@ -539,13 +572,94 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     });
   }
 
-  /** Raise the head (it never goes down). */
+  /** Raise the head (it never goes down), and note a head below the checkpoint. */
   private observeHead(index: number): void {
+    this.noteHeadBelow(index);
     if (this.head !== undefined && index <= this.head) return;
     this.head = index;
     this.metrics?.headLedger.set(index);
     this.updateStatus();
     this.notify();
+  }
+
+  /**
+   * Record a head the node reported below the committed checkpoint (the runner's `head` never goes down, so it cannot
+   * show it); forget it when the node reports one at or above the checkpoint again, so that a later dip is checked anew.
+   */
+  private noteHeadBelow(index: number): void {
+    if (this.committed === undefined) return;
+    if (index >= this.committed) {
+      this.headBelow = undefined;
+      this.headBelowChecked = undefined;
+    } else if (index !== this.headBelow) {
+      this.headBelow = index;
+      this.notify();
+    }
+  }
+
+  /** Check the head below the checkpoint in the background when one is due: a new head, and `headBelowCheckMs` since the last check. */
+  private checkHeadBelowIfDue(): void {
+    const head = this.headBelow;
+    if (head === undefined || head === this.headBelowChecked || this.checkingHeadBelow) return;
+    if (Date.now() - this.headBelowCheckedAt < this.opts.headBelowCheckMs) return;
+    this.checkingHeadBelow = true;
+    this.compareHeadBelow(head)
+      .catch((err: unknown) => {
+        if (this.stopping) return;
+        if (err instanceof ChainBreakError) this.halt(err);
+        else {
+          this.logger.warn(
+            `Could not compare the node's validated head ${head}, below the checkpoint ${this.committed}, with the stored ` +
+              `ledger (the next try is due in ${this.opts.headBelowCheckMs} ms): ${describe(err)}`,
+          );
+        }
+      })
+      .finally(() => {
+        this.checkingHeadBelow = false;
+        this.notify();
+      });
+  }
+
+  /**
+   * Tell a node that is behind from a network that was reset, for a validated `head` below the committed checkpoint.
+   * Resolves when the head was compared and the runner is to wait; throws `ChainBreakError` when the node's ledger at
+   * `head` has another hash than the stored one (on any network), or, for a testnet, when `head` is below the first
+   * indexed ledger (nothing stored to compare with). A failed read or fetch rejects: the head counts as unchecked.
+   */
+  private async compareHeadBelow(head: number): Promise<void> {
+    const checkpoint = this.committed;
+    if (checkpoint === undefined || head >= checkpoint) return;
+    try {
+      const stored = await this.step(storedLedgerHash(this.ch, head));
+      if (stored !== undefined) {
+        const ledger = await this.step(Promise.resolve().then(() => this.source.fetch(head)));
+        if (ledger.header.ledger_index !== head) {
+          throw new Error(`Ledger ${head} was requested but ledger ${ledger.header.ledger_index} came back`);
+        }
+        if (ledger.header.ledger_hash !== stored) {
+          throw new ChainBreakError(
+            `The node's validated ledger ${head} has hash ${ledger.header.ledger_hash}, ` +
+              `but ledger ${head} is stored with hash ${stored}: the network was reset, or the node is of another chain`,
+            head,
+          );
+        }
+        this.logger.warn(
+          `The node's validated head ${head} is below the checkpoint ${checkpoint}, with the stored hash: ` +
+            'waiting for it to catch up',
+        );
+      } else {
+        const first = await this.step(firstCommittedLedger(this.ch));
+        if (first !== undefined && head < first && getNetworkProfile(this.cfg.network).kind === 'testnet') {
+          throw new ChainBreakError(
+            `The node's validated head ${head} is below the first indexed ledger ${first}: the network was reset`,
+            head,
+          );
+        }
+      }
+      this.headBelowChecked = head;
+    } finally {
+      this.headBelowCheckedAt = Date.now();
+    }
   }
 
   /** Poll `validatedHead()` in the background when no hint (and no poll) has arrived for `headSilenceMs`. */
@@ -598,8 +712,9 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
 
   /**
    * Find where to continue, once: verify the checkpoint against the node and delete the uncommitted tail above it, or,
-   * with nothing committed, clean up after any crashed first write and record this one's intent. Transient failures are
-   * retried; throws `ChainBreakError`.
+   * with nothing committed, clean up after any crashed first write and record this one's intent. With a checkpoint, the
+   * node's validated head is asked for first, and compared with the stored ledger when it is below the checkpoint
+   * (`compareHeadBelow`). Transient failures are retried; throws `ChainBreakError`.
    */
   private async prepare(): Promise<void> {
     if (this.prepared) return;
@@ -624,6 +739,10 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
             (cleanFrom < start ? ` (cleaned up after an unfinished first write from ${cleanFrom})` : ''),
         );
       } else {
+        // A node whose head is below the checkpoint has no checkpoint to fetch: it is behind or it was reset. Tell which
+        // before waiting for the checkpoint (which then waits for a node that is behind).
+        const head = await this.step(this.source.validatedHead());
+        if (head < checkpoint) await this.compareHeadBelow(head);
         const stored = await this.step(storedLedgerHash(this.ch, checkpoint));
         if (stored === undefined) throw new Error(`The checkpoint ${checkpoint} has no stored hash`);
         const ledger = await this.fetchLedger(checkpoint, this.stopAbort.signal);
@@ -653,6 +772,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     while (!this.stopping && !this.haltError && this.prepared && !done()) {
       this.dirty = false;
       this.pollHeadIfSilent();
+      this.checkHeadBelowIfDue();
       const head = this.head;
       if (head !== undefined) {
         this.fill(head);
@@ -986,7 +1106,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
     else this.state = this.lag !== undefined && this.lag <= 1 ? 'live' : 'catching_up';
   }
 
-  /** How long the loop may sleep: until the batch is due, or the head is due for a poll. */
+  /** How long the loop may sleep: until the batch is due, the head is due for a poll, or a head below is due for its check. */
   private waitBudget(): number {
     const now = Date.now();
     // A poll in flight wakes the loop when it ends; until then the head needs no other attention.
@@ -994,6 +1114,10 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       ? this.opts.headSilenceMs
       : Math.max(this.lastHintAt, this.lastPollAt) + this.opts.headSilenceMs - now;
     if (this.batch.length > 0) ms = Math.min(ms, this.batchSince + this.cfg.catchupFlushMs - now);
+    // A head below the checkpoint waits for its check: wake when it is due (a check in flight wakes the loop when it ends).
+    if (this.headBelow !== undefined && this.headBelow !== this.headBelowChecked && !this.checkingHeadBelow) {
+      ms = Math.min(ms, this.headBelowCheckedAt + this.opts.headBelowCheckMs - now);
+    }
     return Math.max(ms, MIN_WAIT_MS);
   }
 
