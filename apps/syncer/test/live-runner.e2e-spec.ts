@@ -1069,6 +1069,43 @@ describe('LiveRunner (e2e)', () => {
       expect(source.fetches).toEqual([]); // no stored hash to compare with: nothing to fetch
     });
 
+    it('on a testnet, halts while live when the head falls below the first indexed ledger (the sandbox reset)', async () => {
+      const cfg = { network: 'xrpl-testnet', syncStartLedger: L(10) };
+      const svc = await freshService();
+      const { runner: first } = makeRunner(svc, new TestSource(L(20)), { cfg });
+      await first.runOnce();
+      await first.stop();
+      expect(await committedIndexes(svc)).toEqual(range(L(10), L(20)));
+
+      const metrics = new PrometheusService();
+      const before = await halts(metrics, 'chain_break');
+      const source = new TestSource(L(20));
+      const { runner } = makeRunner(svc, source, {
+        cfg,
+        metrics,
+        options: { headSilenceMs: 50, headBelowCheckMs: 300 },
+      });
+      await runner.onApplicationBootstrap();
+      await waitFor(() => runner.status().state === 'live', 'the runner to be live at L(20)');
+      expect(source.fetches).toEqual([L(20)]); // the boot's fetch of the checkpoint, and nothing else
+
+      // The sandbox is reset: the head hint jumps below the first indexed ledger. No stored ledger to compare it with.
+      source.head = L(3);
+      source.available = L(3);
+      await waitFor(() => runner.status().state === 'halted', 'the runner to halt');
+
+      const message = `The node's validated head ${L(3)} is below the first indexed ledger ${L(10)}: the network was reset`;
+      expect(runner.status()).toMatchObject({ state: 'halted', checkpoint: L(20), error: message });
+      await expect(runner.runOnce()).rejects.toMatchObject({
+        name: 'ChainBreakError',
+        message,
+        ledgerIndex: L(3),
+      });
+      expect(source.fetches).toEqual([L(20)]);
+      expect(await committedIndexes(svc)).toEqual(range(L(10), L(20)));
+      expect(await halts(metrics, 'chain_break')).toBe(before + 1);
+    });
+
     it('on a mainnet, waits when the head is below the first indexed ledger', async () => {
       const cfg = { network: 'xrpl', syncStartLedger: L(10) };
       const svc = await freshService();
