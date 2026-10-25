@@ -1,4 +1,4 @@
-import { compareVersions, nextFlagLedger, ServerVersion } from '@gatehub/data-api-shared';
+import { compareVersions, LOCAL_PUBLISHER_ID, nextFlagLedger, ServerVersion } from '@gatehub/data-api-shared';
 import BigNumber from 'bignumber.js';
 import { compact, fmtMillis, fmtTime } from '../common/format';
 import { Directory, DirectoryEntry, Drops, PublisherState } from './directory';
@@ -87,6 +87,10 @@ const feesOf = (drops: Drops): NonNullable<ValidatorsSummary['fees']> => ({
 /** An instant of receipt, `YYYY-MM-DDTHH:mm:ss.SSSZ`, from unix seconds with a fraction (cut to the millisecond, not floored). */
 export const instant = (seconds: number): string => fmtMillis(new Date(Math.round(seconds * 1000)));
 
+/**
+ * A publisher of the summary. The fixed list (`local`, `GH_UNL_VALIDATORS`) does not expire, so it has no `expiration`; its
+ * `url` and `public_key` are the empty strings it is stored with.
+ */
 function publisherOf(state: PublisherState): SummaryPublisher {
   const list = state.list;
   return compact({
@@ -96,7 +100,7 @@ function publisherOf(state: PublisherState): SummaryPublisher {
     status: state.status,
     sequence: list?.sequence,
     version: list?.version,
-    expiration: list === undefined ? undefined : fmtTime(list.expiration),
+    expiration: list === undefined || state.id === LOCAL_PUBLISHER_ID ? undefined : fmtTime(list.expiration),
     fetched: list === undefined ? undefined : instant(list.fetchedAt),
     validators: list === undefined ? undefined : new Set(list.validators).size,
     seen_24h: state.seen24h,

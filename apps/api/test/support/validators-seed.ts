@@ -722,6 +722,55 @@ export async function seedFleet(ch: ClickHouseService, options: FleetOptions = {
   };
 }
 
+// -- the fixed list ----------------------------------------------------------------------------------------------------
+
+/** The `expiration` of the list of the fixed validators (`GH_UNL_VALIDATORS`): the `DateTime` maximum, 2106-02-07T06:28:15Z. */
+const LOCAL_LIST_EXPIRATION = 4_294_967_295;
+
+/**
+ * Xahau Testnet with no publisher, as the syncer stores it when `GH_UNL_VALIDATORS` names four keys: the four validators of
+ * `fleet('xahau-testnet', 4)`, the publisher `local` (configured, threshold 1, `ok`, no URL and no key), one list of it
+ * (sequence 1, version 1, in force and fetched an hour before `now`, expiring at the `DateTime` maximum, the four master keys),
+ * the four seen a minute before `now`, and a head (1,000 ledgers ending 8 s before `now`, a ledger state 20 s old). Returns the
+ * four. `now` is in whole seconds, the clock of the seed.
+ */
+export async function seedFixedList(ch: Ch, now: number): Promise<FleetMember[]> {
+  const members = fleet('xahau-testnet', 4);
+  const keys = members.map((member) => member.key).sort();
+  await insertLedgers(ch, HEAD_LEDGER, now - 8, 1000, LEDGER_INTERVAL);
+  await insertState(ch, [{ ledger_index: HEAD_LEDGER - 3, polled_at: now - 20.5 }]);
+  await insertLists(ch, [
+    {
+      publisher: 'local',
+      publisher_key: '',
+      sequence: 1,
+      version: 1,
+      effective: now - HOUR,
+      expiration: LOCAL_LIST_EXPIRATION,
+      validators: keys,
+      blob_sha256: createHash('sha256').update(keys.join('\n')).digest('hex').toUpperCase(),
+      fetched_at: now - HOUR,
+      response: JSON.stringify({ validators: keys }),
+    },
+  ]);
+  await insertPublishers(ch, [
+    {
+      publisher: 'local',
+      url: '',
+      publisher_key: '',
+      configured: 1,
+      threshold: 1,
+      status: 'ok',
+      checked_at: now - HOUR,
+    },
+  ]);
+  await insertSeen(
+    ch,
+    members.map((member) => ({ key: member.key, first: now - DAY, last: now - 60 })),
+  );
+  return members;
+}
+
 // -- the amendment board ------------------------------------------------------------------------------------------------
 
 /**

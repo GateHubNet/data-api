@@ -357,6 +357,58 @@ describe('buildSummary', () => {
     });
   });
 
+  describe('the fixed list', () => {
+    const fixed = (): Directory => {
+      const keys = range(1, 4).map((n) => key('nHF', n));
+      return assembleDirectory(
+        reads({
+          publishers: [publisherRow('local', '', { url: '', checked: NOW_S - 30 })],
+          lists: [
+            listOf('local', '', keys, {
+              sequence: 1,
+              expiration: 4_294_967_295,
+              fetchedAt: Date.UTC(2026, 9, 19, 14, 42, 53, 250) / 1000,
+            }),
+          ],
+          seen: keys.map((k) => seen(k, 60)),
+        }),
+      );
+    };
+
+    it('gives the fixed list (local) no expiration, and its empty url and public_key', () => {
+      const summary = buildSummary(fixed());
+      expect(summary.unl).toEqual({
+        trusted: 4,
+        threshold: 1,
+        publishers: [
+          {
+            id: 'local',
+            url: '',
+            public_key: '',
+            status: 'ok',
+            sequence: 1,
+            version: 1,
+            fetched: '2026-10-19T14:42:53.250Z',
+            validators: 4,
+            seen_24h: 4,
+          },
+        ],
+      });
+      const [publisher] = summary.unl.publishers;
+      expect('expiration' in publisher).toBe(false);
+      expect(Object.keys(publisher)).toEqual(PUBLISHER_KEYS.filter((k) => k in publisher));
+    });
+
+    it('still gives a fetched publisher its expiration, whatever the date', () => {
+      const [publisher] = buildSummary(
+        listed(2, {
+          lists: [listOf('vl.ripple.com', PUBLISHER_A, ['nH01', 'nH02'], { expiration: 4_294_967_295 })],
+        }),
+      ).unl.publishers;
+      expect(publisher.expiration).toBe('2106-02-07T06:28:15Z');
+    });
+  });
+
   describe('validators', () => {
     it('counts all as the trusted validators together with those seen in 24 hours, once', () => {
       const summary = buildSummary(fleet());

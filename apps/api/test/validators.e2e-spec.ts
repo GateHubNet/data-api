@@ -26,6 +26,7 @@ import {
   BoardScenario,
   DAY,
   fleet,
+  FleetMember,
   FleetScenario,
   HEAD_LEDGER,
   HOUR,
@@ -43,6 +44,7 @@ import {
   PUBLISHER_KEY,
   RC1,
   seedAmendmentBoard,
+  seedFixedList,
   seedFleet,
   serverVersion,
   VOTING_LEDGER,
@@ -2049,6 +2051,75 @@ describe('GET /v2/network/validators and /{key}: on Xahau', () => {
   it('answers a hex key on Xahau too', async () => {
     const res = await api.get(detailOf(members[1].master.publicKeyHex.toLowerCase()));
     expect(res.body.validation_public_key).toBe(members[1].key);
+  });
+});
+
+// ===================================================================================================================
+// Xahau Testnet: the fixed list
+// ===================================================================================================================
+
+describe('Xahau Testnet: the fixed list', () => {
+  let h: Harness;
+  let api: ApiClient;
+  let members: FleetMember[];
+  let now: number;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', network: 'xahau-testnet', env: NO_RATE_LIMIT });
+    api = await h.api();
+    now = Math.floor(Date.now() / 1000);
+    members = await seedFixedList(h.ch, now);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the summary trusts the four at threshold 1 and lists local', async () => {
+    const res = await api.get(SUMMARY);
+    expect(res.status).toBe(200);
+    expect(res.body.unl).toEqual({
+      trusted: 4,
+      threshold: 1,
+      publishers: [
+        {
+          id: 'local',
+          url: '',
+          public_key: '',
+          status: 'ok',
+          sequence: 1,
+          version: 1,
+          fetched: instant(now - HOUR),
+          validators: 4,
+          seen_24h: 4,
+        },
+      ],
+    });
+    // a fixed list does not expire: no expiration, though the stored list carries the DateTime maximum
+    const [publisher] = res.body.unl.publishers;
+    expect(publisher).not.toHaveProperty('expiration');
+    expect(Object.keys(publisher)).toEqual(PUBLISHER_KEYS.filter((key) => key in publisher));
+    expect(res.body.validators).toEqual({ seen_24h: 4, unl_seen_24h: 4, others_seen_24h: 0, all: 4 });
+    expect(res.body.quorum).toEqual({ value: 4, unl_size: 4, negative_unl: 0 });
+  });
+
+  it('a listed validator is on the UNL by the list local', async () => {
+    const list = await api.get(`${LIST}?scope=unl`);
+    expect(list.status).toBe(200);
+    expect(list.body.count).toBe(4);
+    expect(list.body.validators.map((row: { validation_public_key: string }) => row.validation_public_key)).toEqual(
+      members.map((member) => member.key).sort(),
+    );
+    for (const row of list.body.validators) expect(row).toMatchObject({ unl: true, unl_lists: ['local'] });
+
+    const detail = await api.get(detailOf(members[2].key));
+    expect(detail.status).toBe(200);
+    expect(detail.body).toMatchObject({ validation_public_key: members[2].key, unl: true, unl_lists: ['local'] });
+  });
+
+  it('takes local as the publisher of a filter', async () => {
+    const list = await api.get(`${LIST}?publisher=local`);
+    expect(list.status).toBe(200);
+    expect(list.body.count).toBe(4);
   });
 });
 

@@ -2458,7 +2458,8 @@ one written here and is pinned by tests.
 
 - The syncer's `validations` collector writes the validations, the manifests (the signing key of every validator, its domain) and when each validator
   was first and last seen.
-- The syncer's `validators` worker fetches the validator lists of the publishers (`GH_UNL_PUBLISHERS`), checks the domains of the validators,
+- The syncer's `validators` worker fetches the validator lists of the publishers (`GH_UNL_PUBLISHERS`), stores the fixed list
+  (`GH_UNL_VALIDATORS`, the trusted set of Xahau Testnet, which has no publisher) as the list of the publisher `local`, checks the domains of the validators,
   polls the ledger state of the node (the enabled amendments and their majorities, the negative UNL, the fees) every minute, and computes the voting
   rounds (what each validator voted at each voting ledger, 256 ledgers apart) and the agreement of each validator per UTC hour.
 - A **validator directory** is built from those tables, one build at a time per replica, and kept for up to 10 seconds (counted from the start of the
@@ -2521,8 +2522,8 @@ Keys of a publisher, in order: `id, url, public_key, status, sequence, version, 
 | --- | --- |
 | `ledger_index`, `close_time` | The newest committed ledger of the index. Without one, the ledger of the newest ledger state and no `close_time`; without either, both are absent. |
 | `validators` | `seen_24h`: validators seen in the last 24 hours (a signing key counts for its master); `unl_seen_24h`: of those on the trusted UNL; `others_seen_24h`: the rest; `all`: the trusted UNL together with those seen in 24 hours. |
-| `unl` | `trusted`: validators named by at least `threshold` of the lists in use; `threshold`: how many lists must name one (absent while no publisher is known); `publishers`: one entry per configured publisher, by `id`. |
-| publisher | `id` is the URL without scheme (`vl.ripple.com`); `public_key` the key it is configured with (66 hex digits); `status`: `ok` (a current list), `expired` (only an expired list, which is still used: a flagged old UNL is better than none) or `unavailable` (no list in use: none was ever fetched, or all the stored ones were served under a key the publisher no longer uses). With a list: its `sequence`, `version` (1 or 2), `expiration`, when it was `fetched`, the number of `validators` on it and how many of them were seen in 24 hours (`seen_24h`). `last_error` (the reason code) and `last_error_at` are there when the newest attempt to fetch the list failed, whatever the status. |
+| `unl` | `trusted`: validators named by at least `threshold` of the lists in use; `threshold`: how many lists must name one (absent while no publisher is known); `publishers`: one entry per configured publisher, and `local` when the fixed list is not empty, by `id`. |
+| publisher | `id` is the URL without scheme (`vl.ripple.com`); `public_key` the key it is configured with (66 hex digits); `status`: `ok` (a current list), `expired` (only an expired list, which is still used: a flagged old UNL is better than none) or `unavailable` (no list in use: none was ever fetched, or all the stored ones were served under a key the publisher no longer uses). With a list: its `sequence`, `version` (1 or 2), `expiration`, when it was `fetched`, the number of `validators` on it and how many of them were seen in 24 hours (`seen_24h`). `last_error` (the reason code) and `last_error_at` are there when the newest attempt to fetch the list failed, whatever the status. `local` is the fixed list of `GH_UNL_VALIDATORS`: its `url` and `public_key` are empty text, it has no `expiration` (a fixed list does not expire) and no `last_error` (nothing fetches it), and its `version` is 1. |
 | `quorum` | `value`: the validations a ledger needs, derived with rippled's rule over the trusted UNL and the negative UNL, max(⌈0.8 × (`unl_size` − `negative_unl`)⌉, ⌈0.6 × `unl_size`⌉); `unl_size`: the trusted validators; `negative_unl`: how many of them are on the negative UNL. `node` is the quorum the node reports, only when it reports one above 0 (public nodes report 0). With no trusted validator `value` is 0. |
 | `negative_unl` | The validators disabled now, `{validation_public_key, first_ledger}`; an empty list when none. `negative_unl_pending` is there only when a validator is about to be disabled or re-enabled: `{to_disable?, to_reenable?}`. |
 | `fees` | `base_fee`, `reserve_base`, `reserve_inc` in whole units: those the node reported in the newest ledger state, else those in force at the newest voting round. |
@@ -2533,6 +2534,19 @@ Keys of a publisher, in order: `id, url, public_key, status, sequence, version, 
 | `agreement_through` | The end of the newest final hour of agreement. |
 | `votes_through_ledger` | The newest voting ledger whose votes are computed. |
 | `updated` | When the directory this answer comes from was built. |
+
+On Xahau Testnet, which has no publisher and trusts a fixed list of four validators, the `unl` of the summary is:
+
+```json
+"unl": {
+  "trusted": 4,
+  "threshold": 1,
+  "publishers": [
+    { "id": "local", "url": "", "public_key": "", "status": "ok", "sequence": 1, "version": 1,
+      "fetched": "2026-11-02T10:00:00.000Z", "validators": 4, "seen_24h": 4 }
+  ]
+}
+```
 
 An empty database answers 200 with `result`, `validators` (all 0), `unl` (`trusted` 0, no `publishers`), `quorum` (all 0), `negative_unl` (empty),
 `versions` (empty), `versions_unknown` (both 0) and `updated`.
@@ -2668,7 +2682,7 @@ Keys of a yes entry, in order: `id, name`.
 | `unl` | The validator is on the trusted UNL: named by at least `threshold` of the lists in use. |
 | `signing_key` | The signing key of the newest manifest. Absent without a manifest. |
 | `domain_verification` | Absent when the row has no `domain`. `status` is `verified`, `unverified` or `pending` (not checked yet). `reason` (the code) is there for `unverified` only, and `status_code` for its `http_status`. `toml_url` is the address the file is checked at (`/.well-known/xrp-ledger.toml`, on Xahau `/.well-known/xahau.toml`). `checked` is when the domain was last checked (absent while `pending`) and `verified` the last time it verified. `accounts` comes last, only for `verified`: the addresses of the `[[ACCOUNTS]]` of the file that verified, absent when it lists none. |
-| `unl_lists` | The ids of the publishers whose list in use names the validator, sorted. Empty off the UNL. `negative_unl` is true while it is on the negative UNL. |
+| `unl_lists` | The ids of the publishers whose list in use names the validator, sorted; `local` is the fixed list of `GH_UNL_VALIDATORS`. Empty off the UNL. `negative_unl` is true while it is on the negative UNL. |
 | `version`, `version_build`, `version_latest`, `server_version` | The software version in the newest `sfServerVersion` of the last 30 days (only a validation of a voting ledger carries one): `version` as the summary writes it (`3.4.1`, `-rcN`, `-bN`; on Xahau the year counts from 2023), `version_build` the build number after it (Xahau, when not 0), `version_latest` whether it is at least `latest_version` of the summary, `server_version` the number as reported, decimal text. All absent for a validator that reported none; an unrecognised number has `server_version` only. |
 | `fee_vote` | The fees the validator votes for, in whole units, in its vote record: the newest full vote within 24 hours before the newest stored voting round, whether the validator is trusted or not. A fee the validation left out is the fee in force at that round. `ledger_index` is that round's voting ledger. Absent without a record. |
 | `amendment_votes` | The amendments the record votes yes for, in the order of the record: `{id, name}`, `name` when the amendments know one. Absent without a record. |
