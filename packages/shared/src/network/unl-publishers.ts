@@ -100,7 +100,10 @@ export function parseUnlValidators(text: string): string[] {
   return keys;
 }
 
-/** rippled's rule for the number of lists that must name a validator: 1 below three publishers, else ⌊n / 2⌋ + 1. */
-export function defaultUnlThreshold(publishers: number): number {
-  return publishers < 3 ? 1 : Math.floor(publishers / 2) + 1;
+/**
+ * rippled's rule for the number of lists that must name a validator: 1 below three lists, else ⌊n / 2⌋ + 1. `lists` counts
+ * the publishers' lists and the fixed list of `GH_UNL_VALIDATORS` (rippled counts its own local list the same way).
+ */
+export function defaultUnlThreshold(lists: number): number {
+  return lists < 3 ? 1 : Math.floor(lists / 2) + 1;
 }

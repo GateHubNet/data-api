@@ -45,7 +45,7 @@ export interface WalkedList {
   file: CsvFile;
   /** The list's own download name (`Content-Disposition` of its CSV), or `null` when it gave none. */
   disposition: string | null;
-  /** The network (`xrpl`, `xahau`). */
+  /** The network's name (`xrpl`, `xahau`, `xrpl-testnet`, `xahau-testnet`). */
   network: string;
   /** The JSON answer of another route of the api (`/v2/…`), read with the exporter's key; `undefined` for a 404. */
   read: (path: string) => Promise<unknown>;
@@ -110,7 +110,7 @@ export interface ExportWorkerOptions {
   ch: ClickHouseService;
   /** Where the files go. */
   storage: ExportStorage;
-  /** The network (`xrpl`, `xahau`): the prefix of its files in the storage. */
+  /** The network's name (`xrpl`, `xahau`, `xrpl-testnet`, `xahau-testnet`): the prefix of its files in the storage. */
   network: string;
   /** The base URL of the network's api (`http://api-xrpl:3001`). */
   apiUrl: string;

@@ -5,14 +5,16 @@
  *   pnpm --filter @gatehub/data-api-shared amendments:check -- \
  *     --network xrpl|xahau|xrpl-testnet|xahau-testnet [--endpoint <wss url>] [--clickhouse]
  *
- * It loads `config/amendments/<network>.json` (a file that does not pass the loader's checks fails the run), checks that the
- * node is of that network (`server_info.network_id`: a Xahau node for the XRPL file fails the run), asks the node for `feature`
- * and for the `Amendments` ledger object (`ledger_entry`, the validated ledger), and prints:
+ * It loads `config/amendments/<family>.json` (`xrpl.json` for XRPL and XRPL Testnet, `xahau.json` for Xahau and Xahau
+ * Testnet; a file that does not pass the loader's checks fails the run), checks that the node is of that network
+ * (`server_info.network_id` is one the network's profile accepts: a node of another network fails the run), asks the node
+ * for `feature` and for the `Amendments` ledger object (`ledger_entry`, the validated ledger), and prints:
  *
  *   - the names the node knows that the file lacks (add an entry for each);
  *   - the IDs of the ledger (enabled, or with a majority) and of the current votes that neither the file nor the node
  *     names (the node may lack a name, F10: find it in the newest `features.macro` and add it);
- *   - the entries whose `enabled.ledger_index` differs from the indexed `EnableAmendment` (fix or drop the `enabled`).
+ *   - the entries whose `enabled.ledger_index` differs from the indexed `EnableAmendment` (fix or drop the `enabled`); always
+ *     empty on a testnet, whose loader drops the family file's `enabled` entries.
  *
  * `--endpoint` defaults to the first default endpoint of the network. `--clickhouse` adds the voted IDs of the newest
  * round (`amendment_tallies`) and the indexed `EnableAmendment` transactions with flags 0 (`tx_by_type`, then

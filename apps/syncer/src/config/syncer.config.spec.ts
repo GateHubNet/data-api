@@ -589,7 +589,8 @@ describe('SyncerConfig (GH_* environment)', () => {
 
   it('resolves the sandbox compose values', async () => {
     // What the compose files pass a syncer with deploy/.env.sandbox.example: the testnet's name, every endpoint blank, both
-    // lists `default`, the example's threshold, and no GH_CLICKHOUSE_DATABASE (the profile's own).
+    // lists `default` and the example's threshold. (They pass no GH_CLICKHOUSE_DATABASE either: the testnet's database is its
+    // profile's, pinned in network-profile.spec.ts and in the migrate e2e, case (g).)
     const compose = {
       GH_NODE_ENDPOINTS: '',
       GH_VALIDATION_ENDPOINTS: '',

@@ -26,7 +26,12 @@ export interface MarketsConfig {
   paymentCurrencies: MarketAsset[];
 }
 
-/** Everything that differs between the XRPL and Xahau deployments of the same images. */
+/**
+ * Everything that differs between the deployments of the same images: one record for each of the four networks (the
+ * XRP Ledger and Xahau, and the testnet of each). Files of markets and definitions, databases, lease rows, export keys
+ * and cache keys follow `name`; the amendment metadata file and the account flags follow `family`; the reset rule and
+ * the boot line follow `kind`.
+ */
 export interface NetworkProfile {
   name: NetworkName;
   family: NetworkFamily;

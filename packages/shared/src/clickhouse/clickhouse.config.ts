@@ -47,7 +47,8 @@ export function sharedDatabaseFromEnv(env: NodeJS.ProcessEnv = process.env): str
 
 /**
  * Build the connection config from `env`. The database is `GH_CLICKHOUSE_DATABASE` when set, otherwise the network
- * profile's default (`xrpl` / `xahau`); the profile defaults to the one selected by `GH_NETWORK` in `env`.
+ * profile's default (`xrpl`, `xahau`, `xrpl_testnet` or `xahau_testnet`); the profile defaults to the one selected by
+ * `GH_NETWORK` in `env`.
  */
 export function clickHouseConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,

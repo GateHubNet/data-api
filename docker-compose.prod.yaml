@@ -299,7 +299,8 @@ services:
       GH_VALIDATION_ENDPOINTS: ${XRPL_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XRPL_SYNC_START_LEDGER:-}
-      # Empty = the config/markets/xrpl.json that ships in the image. Another file must be mounted (volumes below).
+      # Empty = the config/markets/<network>.json that ships in the image (xrpl.json; xrpl-testnet.json, which is empty, in the sandbox).
+      # Another file must be mounted (volumes below).
       GH_MARKETS_CONFIG: ${XRPL_MARKETS_CONFIG:-}
       # Empty = the validator list publishers of the network. An empty GH_UNL_PUBLISHERS would mean "no lists", so compose passes the word
       # `default` (the network's publishers, whatever XRPL_NETWORK is).
@@ -374,7 +375,8 @@ services:
       GH_VALIDATION_ENDPOINTS: ${XAHAU_VALIDATION_ENDPOINTS:-}
       # Empty = the validated head at the first boot; ignored once ledgers exist.
       GH_SYNC_START_LEDGER: ${XAHAU_SYNC_START_LEDGER:-}
-      # Empty = the config/markets/xahau.json that ships in the image. Another file must be mounted (volumes below).
+      # Empty = the config/markets/<network>.json that ships in the image (xahau.json; xahau-testnet.json, which is empty, in the sandbox).
+      # Another file must be mounted (volumes below).
       GH_MARKETS_CONFIG: ${XAHAU_MARKETS_CONFIG:-}
       # Empty = the validator list publishers of the network (Xahau Testnet has none). An empty GH_UNL_PUBLISHERS would mean "no lists", so
       # compose passes the word `default` (the network's publishers, whatever XAHAU_NETWORK is).
