@@ -137,6 +137,21 @@ const metrics = {
     help: 'Heavy accounts whose coverage does not yet reach from first_day to the newest final day.',
     registers: [registry],
   }),
+  nftStateLagLedgers: new Gauge({
+    name: 'syncer_nft_state_lag_ledgers',
+    help: 'Ledgers between the newest committed ledger and the live cursor of the nft_state job.',
+    registers: [registry],
+  }),
+  nftDirtyLedgers: new Gauge({
+    name: 'syncer_nft_dirty_ledgers',
+    help: 'Ledgers in the ranges of nft_dirty that the nft_state job has still to rebuild the NFTs of.',
+    registers: [registry],
+  }),
+  nftCollectionsPending: new Gauge({
+    name: 'syncer_nft_collections_pending',
+    help: 'NFT collections queued for the nft_collections job to compute again.',
+    registers: [registry],
+  }),
   validatorsUnlFetchesTotal: new Counter({
     name: 'syncer_validators_unl_fetches_total',
     help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
@@ -233,6 +248,9 @@ export class PrometheusService implements OnModuleInit {
   readonly ratesDailyMissingDays = metrics.ratesDailyMissingDays;
   readonly accountRollupsHeavyAccounts = metrics.accountRollupsHeavyAccounts;
   readonly accountRollupsPendingAccounts = metrics.accountRollupsPendingAccounts;
+  readonly nftStateLagLedgers = metrics.nftStateLagLedgers;
+  readonly nftDirtyLedgers = metrics.nftDirtyLedgers;
+  readonly nftCollectionsPending = metrics.nftCollectionsPending;
   readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;

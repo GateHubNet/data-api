@@ -1,4 +1,5 @@
 import {
+  DailyRates,
   MarketsConfig,
   RatesService,
   StatsRecomputeAborted,
@@ -1147,6 +1148,34 @@ describe('AggregatorService volume jobs', () => {
       expect(liveSet).not.toHaveBeenCalled();
       expect(dailySet).not.toHaveBeenCalled();
       expect(daysDone).not.toHaveBeenCalled();
+    });
+
+    it('are, with the AMM pools and the NFT state as well, volume_live, volume_daily, amm_pools, nft_state, stats_live, stats_dirty, volume_backfill, in this order', async () => {
+      caughtUp();
+      await service({
+        ammPools: { rates: RATES },
+        ammPoolsFunctions: {
+          watermark: async () => 0,
+          changedSince: async (_c, ledger) => ({ accounts: [], upTo: ledger }),
+        },
+        nfts: { rates: RATES, dailyRates: {} as DailyRates },
+        nftStateFunctions: {
+          watermark: async () => 0,
+          changedSince: async (_c, ledger) => ({ nfts: [], upTo: ledger }),
+          oldestDirty: async () => undefined,
+          dirtyLedgers: async () => 0,
+          head: async () => 0,
+        },
+      }).tick();
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'volume_live',
+        'volume_daily',
+        'amm_pools',
+        'nft_state',
+        'stats_live',
+        'stats_dirty',
+        'volume_backfill',
+      ]);
     });
   });
 

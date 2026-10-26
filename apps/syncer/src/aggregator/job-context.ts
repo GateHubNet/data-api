@@ -17,6 +17,8 @@ export type AggregatorJobName =
   | 'volume_live'
   | 'volume_daily'
   | 'amm_pools'
+  | 'nft_state'
+  | 'nft_collections'
   | 'pair_hourly'
   | 'markets_live'
   | 'stats_live'
@@ -27,8 +29,8 @@ export type AggregatorJobName =
   | 'volume_backfill';
 
 /**
- * What the `AggregatorService` lends the runners of its jobs that live in files of their own (`amm_pools`, `amm_daily`): the
- * database, the log and the metrics, the clock, the budgets, whether the stop has begun, and the rules that every job of the
+ * What the `AggregatorService` lends the runners of its jobs that live in files of their own (`amm_pools`, `amm_daily`,
+ * `nft_state`): the database, the log and the metrics, the clock, the budgets, whether the stop has begun, and the rules that every job of the
  * tick shares (when a set may start, how a failure is logged and counted, the versions of the sets, the newest ledger, the
  * announcements of a back-fill). The state of a job (its cursor, its retries) is the runner's own.
  */

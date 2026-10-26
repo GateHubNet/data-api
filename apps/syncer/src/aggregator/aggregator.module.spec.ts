@@ -12,7 +12,7 @@ import { AggregatorService } from './aggregator.service';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 
-/** The metrics of the aggregator and of the account and market jobs, over fakes. */
+/** The metrics of the aggregator, of the account and market jobs and of the NFT jobs, over fakes. */
 const fakeMetrics = () => ({
   aggregatorRunsTotal: { inc: jest.fn() },
   aggregatorErrorsTotal: { inc: jest.fn() },
@@ -23,6 +23,9 @@ const fakeMetrics = () => ({
   ratesDailyMissingDays: { set: jest.fn() },
   accountRollupsHeavyAccounts: { set: jest.fn() },
   accountRollupsPendingAccounts: { set: jest.fn() },
+  nftStateLagLedgers: { set: jest.fn() },
+  nftDirtyLedgers: { set: jest.fn() },
+  nftCollectionsPending: { set: jest.fn() },
 });
 
 describe('AggregatorModule', () => {
@@ -90,6 +93,10 @@ describe('AggregatorModule', () => {
     }
     // and so is the AMM pools job, which has nothing to rebuild over an empty database
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_pools' });
+    // and the NFT state job, which has nothing to rebuild over an empty database, and sets its gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_state' });
+    expect(metrics.nftStateLagLedgers.set).toHaveBeenCalledWith(0);
+    expect(metrics.nftDirtyLedgers.set).toHaveBeenCalledWith(0);
     // and the AMM daily job, which runs at the first tick: today and yesterday, each a sentinel without any pool
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_daily' });
     // and so are the account and market jobs, which have nothing to do on a database without a ledger
@@ -152,6 +159,9 @@ describe('AggregatorModule', () => {
     expect(options.aggregates?.rates).toBe(options.volumes?.rates);
     expect(options.aggregates?.rates.nativeCurrency).toBe('XRP');
     expect(options.aggregates?.accountRollupMinRows).toBe(1234);
+    // and the NFT job the same rates, with the daily rates over them
+    expect(options.nfts?.rates).toBe(options.volumes?.rates);
+    expect(options.nfts?.dailyRates.nativeCurrency).toBe('XRP');
     expect(
       aggregatorOptions(ch, profile, { accountRollupMinRows: 0 } as SyncerConfig, { log: jest.fn() } as never)
         .aggregates?.accountRollupMinRows,

@@ -21,6 +21,9 @@ describe('PrometheusService', () => {
     service.aggregatorStatsLagSeconds.set(86_400);
     service.ammUnclassifiedTotal.inc(3);
     service.nftSkippedTotal.inc(2);
+    service.nftStateLagLedgers.set(12);
+    service.nftDirtyLedgers.set(34);
+    service.nftCollectionsPending.set(5);
 
     const text = await service.getMetrics();
     expect(text).toMatch(/^# TYPE syncer_checkpoint_ledger gauge$/m);
@@ -43,6 +46,12 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_amm_unclassified_total 3$/m);
     expect(text).toMatch(/^# TYPE syncer_nft_skipped_total counter$/m);
     expect(text).toMatch(/^syncer_nft_skipped_total 2$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_state_lag_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_nft_state_lag_ledgers 12$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_dirty_ledgers gauge$/m);
+    expect(text).toMatch(/^syncer_nft_dirty_ledgers 34$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_collections_pending gauge$/m);
+    expect(text).toMatch(/^syncer_nft_collections_pending 5$/m);
   });
 
   it('exposes the metrics of the validators worker, by name, type and label set', async () => {
