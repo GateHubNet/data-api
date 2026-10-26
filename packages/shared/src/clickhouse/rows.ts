@@ -16,6 +16,8 @@
  * and a `DateTime` as a `'YYYY-MM-DD HH:MM:SS'` string. Select `toString(col)` when the exact digits matter.
  */
 
+import type { NftEventName, NftKind } from '../parsers/nft.parser';
+
 /**
  * Version of the ledger parsers. Stored on every `ledgers` row so a later parser change can find stale rows.
  *
@@ -440,11 +442,6 @@ export interface AccountPathPaymentsRow {
   tx_index: number;
 }
 
-/** The `kind` of an NFT: `nftoken` on XRPL, `uritoken` on Xahau (an `Enum8` column). */
-type NftRowKind = 'nftoken' | 'uritoken';
-/** The `event` of an NFT event (an `Enum8` column). */
-type NftRowEvent = 'mint' | 'burn' | 'modify' | 'offer_create' | 'offer_cancel' | 'offer_removed' | 'sale' | 'transfer';
-
 /**
  * One event of an NFT or URIToken (`nft_events`, migration 011): the event's place in its transaction is
  * `(ledger_index, tx_index, event_index)`. Ids are 64 upper-case hex digits. `taxon_key` is the taxon on XRPL and 0 on
@@ -460,8 +457,8 @@ export interface NftEventsRow {
   tx_hash: string;
   tx_type: string;
   close_time: UnixSeconds;
-  kind: NftRowKind;
-  event: NftRowEvent;
+  kind: NftKind;
+  event: NftEventName;
   issuer: string;
   taxon: number | null;
   taxon_key: number;
@@ -511,8 +508,8 @@ export interface AccountNftEventsRow {
   tx_hash: string;
   tx_type: string;
   close_time: UnixSeconds;
-  kind: NftRowKind;
-  event: NftRowEvent;
+  kind: NftKind;
+  event: NftEventName;
   issuer: string;
   taxon: number | null;
   taxon_key: number;
@@ -1103,7 +1100,7 @@ export interface NftsRow {
   taxon_key: number;
   serial: number;
   nft_id: string;
-  kind: NftRowKind;
+  kind: NftKind;
   taxon: number | null;
   nft_flags: number;
   transfer_fee: number;
@@ -1157,7 +1154,7 @@ export interface AccountNftsRow {
 export interface NftCollectionsRow {
   issuer: string;
   taxon_key: number;
-  kind: NftRowKind;
+  kind: NftKind;
   taxon: number | null;
   supply: UInt64Value;
   holders: UInt64Value;
