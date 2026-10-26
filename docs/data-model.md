@@ -10,20 +10,22 @@ The source of truth is the migration files of [`packages/shared/schema/`](../pac
 [`007_path_payments.sql`](../packages/shared/schema/007_path_payments.sql) and
 [`008_account_path_payments.sql`](../packages/shared/schema/008_account_path_payments.sql) and
 [`009_account_network_names.sql`](../packages/shared/schema/009_account_network_names.sql) and
-[`010_export_jobs.sql`](../packages/shared/schema/010_export_jobs.sql) (applied in file-name order, per network
+[`010_export_jobs.sql`](../packages/shared/schema/010_export_jobs.sql) and
+[`011_nft_data.sql`](../packages/shared/schema/011_nft_data.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **55 tables** per network database, in eight groups:
+enum: queries use `${Table.X}`, never string literals). **65 tables** per network database, in nine groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
-| Ledger-derived (23) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance`, the state history `account_states` (migration 005) and `trust_line_states` (migration 006), `path_payments` (migration 007) and its index by account `account_path_payments` (migration 008) | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
+| Ledger-derived (28) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance`, the state history `account_states` (migration 005) and `trust_line_states` (migration 006), `path_payments` (migration 007) and its index by account `account_path_payments` (migration 008), the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011) | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
 | Node-sourced (3) | `fee_stats`, `validations`, `validator_manifests` | the `fee_stats` and `validations` workers |
 | Validators and amendments (10, migration 002) | `validator_validations`, `validator_seen`, `unl_lists`, `unl_publishers`, `validator_domains`, `network_state`, `amendment_features`, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly` | the `validations` worker (the first two) and the `validators` worker (the rest) |
 | Aggregates (5) | `stats_hourly`, `volume_daily`, `volume_live`, `amm_pools`, `amm_daily` | the `aggregator` worker |
 | Account and market aggregates (9, migration 003) | `native_rates_daily`, `pair_hourly`, `markets_live`, `account_rollup_state`, `account_partition_rows`, `account_rollup_days`, `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the `aggregator` worker (jobs `rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) |
+| NFT aggregates (4, migration 011) | `nfts`, `account_nfts`, `nft_collections`, `nft_collection_holders` | the `aggregator` worker (jobs `nft_state` and `nft_collections`) |
 | Operator-written (1, migration 009) | `account_network_names` | the operator, by hand, with plain SQL inserts ([operations](operations.md#name-an-account-on-one-network)) |
-| Internal (3) | `ingest_log`, `agg_dirty`, `syncer_lease` | the syncer |
+| Internal (4) | `ingest_log`, `agg_dirty`, `nft_dirty` (migration 011), `syncer_lease` | the syncer |
 | Exports (1, migration 010) | `export_jobs` | the api (`queued`) and the exporter (`running`, `done`, `failed`) |
 
 Plus `schema_migrations` (the migration runner's bookkeeping). **The network databases** are named by the network's profile
@@ -48,9 +50,9 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 
 | Kind | Engine | Partition | Why |
 | --- | --- | --- | --- |
-| Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
-| Prefix-keyed secondary tables, `exchanges`, the AMM tables ordered by pool or account, `account_states`, `trust_line_states` and `account_path_payments` | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
-| `accounts_created`, `volume_live`, `stats_hourly`, `amm_pools`, internal | `ReplacingMergeTree` | none (`volume_daily` and `amm_daily`: `toYYYYMM(day)`) | Small tables |
+| Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
+| Prefix-keyed secondary tables, `exchanges`, the AMM tables ordered by pool or account, `account_states`, `trust_line_states`, `account_path_payments` and the three NFT event tables | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
+| `accounts_created`, `volume_live`, `stats_hourly`, `amm_pools`, the four NFT aggregates, internal | `ReplacingMergeTree` | none (`volume_daily` and `amm_daily`: `toYYYYMM(day)`) | Small tables |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
 | `account_network_names` (migration 009) | `MergeTree` | none | Append-only, the operator's history; small |
 | The nine tables of migration 003 | `ReplacingMergeTree(version)` | `toYear(day)` for the rates and the account rollups, `toDate(hour)` for `pair_hourly` (TTL 45 days, `ttl_only_drop_parts = 1`), none for the others | Recomputable aggregates written as complete sets; a year of days is a small partition, an hour table expires by whole days |
@@ -60,7 +62,7 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | The other validators and amendments tables | `ReplacingMergeTree` | none | Small tables, newest row (or newest `version`) wins |
 
 `ORDER BY` of a `ReplacingMergeTree` is its **natural unique key**. That is a safety net only: list queries never use `FINAL`, and
-recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 23 ledger-derived tables carry
+recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 28 ledger-derived tables carry
 `non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped; the
 two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason. The nine tables of
 migration 003 have no window: a set is written whole under a new `version`, so a retry is idempotent without one.
@@ -357,6 +359,47 @@ to L, so an issuer's read grows with its whole line history (see the risk in the
 [API reference](api-reference.md#get-v2accountsaddresstrustlines)). Read by `/accounts/{a}/trustlines`, and by `/accounts/{a}/balances`
 with a ledger named (both through `TrustLinesService`).
 
+### NFT tables (five ledger tables, migration 011)
+The events of XRPL NFTokens and Xahau URITokens ([spec](superpowers/specs/2026-10-17-nft-data-design.md)): mints, burns, URI changes
+(`modify`), offers created, cancelled and removed, sales and transfers. All five are child tables like `account_states`
+(`CHILD_TABLES`, `LEDGER_KEYED_TABLES`, the deduplication window, deleted by recovery and `--reprocess`) and are written from parser
+version 5 (`NFT_PARSER_VERSION`): a ledger written by an older parser has no rows in them until it is re-ingested, so the NFT
+coverage starts at the first ledger the new parser wrote. Ids are 64 upper-case hex digits; `kind` is `nftoken` (XRPL) or `uritoken`
+(Xahau); `taxon_key` is the taxon on XRPL and 0 on Xahau, `serial` the id's sequence on XRPL and 0 on Xahau; an absent string is `''`
+and an absent number `NULL`; amounts are exact decimal text in whole units (`amount_f` is the `Float64` shadow), the native currency
+is `XRP` or `XAH` with an `amount_issuer` of `''`; `transfer_fee` is in 1/100000.
+
+#### `nft_events` (P7, `ORDER BY (nft_id, ledger_index, tx_index, event_index)`)
+One row per event. Columns: `nft_id`, `ledger_index`, `tx_index`, `event_index UInt16` (the event's place in its transaction),
+`tx_hash`, `tx_type` (LowCardinality), `close_time`, `kind Enum8('nftoken' = 1, 'uritoken' = 2)`, `event Enum8('mint' = 1, 'burn' = 2,
+'modify' = 3, 'offer_create' = 4, 'offer_cancel' = 5, 'offer_removed' = 6, 'sale' = 7, 'transfer' = 8)`, `issuer`, `taxon
+Nullable(UInt32)`, `taxon_key`, `serial`, `nft_flags UInt32`, `transfer_fee UInt16`, `uri` (hex as on the ledger: the new URI of a
+mint or a modify, else `''`), `digest` (URITokens), `account` (who did it: the offer's owner for an offer event, else the sender),
+`from_account` (the owner before: burn, sale, transfer), `to_account` (the owner after: mint, sale, transfer), `offer_id` (the
+`NFTokenOffer`'s `LedgerIndex`; on Xahau the URIToken id), `is_sell_offer UInt8`, `amount` (the offer's amount, or the sale's price),
+`amount_f`, `currency` (LowCardinality), `amount_issuer`, `destination`, `expiration Nullable(DateTime)`, `broker`, `broker_fee`,
+`royalty_est` and `removed_by` (LowCardinality; an `offer_removed` event: `sale`, `burn`, `transfer` or `other`). Read by an NFT's
+detail, history and offers: an NFT is a prefix of the key.
+
+#### `account_nft_events` (P7, `ORDER BY (account, ledger_index, tx_index, event_index)`)
+A full copy of each event for every account it involves (a copy, not narrow keys: `nft_events` is ordered by NFT, so the keys of an
+account's list would land in scattered granules, as for `account_exchanges`). Columns: `account` (the account the row is for),
+then every column of `nft_events` in its order with its `account` column renamed `actor`, then `roles Array(LowCardinality(String))`:
+the account's roles in the event (`issuer`, `minter`, `from`, `to`, `broker`, `offer_owner`, `destination`). An account with two roles
+in an event has one row.
+
+#### `collection_nft_events` (P7, `ORDER BY (issuer, taxon_key, ledger_index, tx_index, event_index)`)
+A full copy of every event, with the columns of `nft_events`, ordered by collection (an issuer and, on XRPL, a taxon). Read by a
+collection's sales and stats and by the collections job.
+
+#### `nft_sales` (P6, `ORDER BY (ledger_index, tx_index, event_index)`)
+A full copy of the `sale` events, with the columns of `nft_events`, in ledger order: the network's sales list and the volume metric
+read a ledger range of it.
+
+#### `nft_touches` (P6, `ORDER BY (ledger_index, tx_index, nft_id)`)
+Narrow: `ledger_index`, `tx_index`, `nft_id`, `issuer`, `taxon_key`, `serial`; one row per NFT a transaction had an event of. The
+aggregator's watermark and dirty scans read it by ledger, as they read `amm_pool_touches`.
+
 ## 3. Node-sourced, aggregate and internal tables
 
 The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM tables above.
@@ -381,6 +424,7 @@ The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM 
 | `volume_live` | `ReplacingMergeTree(version)`, `ORDER BY (metric, period, component)` | The same for the rolling live periods, with `start_time`, `end_time`, and `fees_est_f Nullable(Float64)` (migration 004): the estimated fees the pool charged on the swaps of the window, in the native currency, on the component rows of the `amm_volume` set of the period `day` only; NULL when a side's fee is not known (a swap with no known fee, so part of the fees is never shown as all of them), on the sentinel and on every row of the other sets. Twelve sets: `trade_volume` and `amm_volume` for hour, day, 3day, 7day and 30day, `payment_volume` for hour and day | `/network/*_volume` (live) |
 | `ingest_log` | `ReplacingMergeTree(updated_at)`, `ORDER BY (range_start, range_end)` | Range-ingest intent: `status Enum8('started'=1,'done'=2)`. Live first-write intents use `run_id live:<bootId>` and `range_end = 0` | range-ingest, ingest boot |
 | `agg_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_hour, to_hour)` | Hour ranges whose stats must be recomputed because ingest rewrote ledgers behind the aggregator | aggregator |
+| `nft_dirty` | `ReplacingMergeTree(created_at)`, `ORDER BY (from_ledger, to_ledger)` | Ledger ranges whose NFTs must be rebuilt because ingest rewrote ledgers behind the aggregator (migration 011): `from_ledger`, `to_ledger UInt32`, `created_at DateTime64(3, 'UTC')`. As `agg_dirty` is for hours | aggregator (`nft_state`) |
 | `syncer_lease` | `ReplacingMergeTree(heartbeat)`, `ORDER BY network` | One row per network (its name: `xrpl`, `xahau`, `xrpl-testnet` or `xahau-testnet`): `holder`, `heartbeat`. A release is a newer row with an empty holder | the single-writer lease |
 | `account_network_names` | `MergeTree`, `ORDER BY (address, added_at)`, no partition (migration 009) | One row per change of the **account network name** of an address on this network ("USD Issuer"): the columns of [`account_names`](#account_names-no-partition-mergetree-order-by-address-added_at) of the shared database (`address`, `name`, `removed UInt8`, `added_by`, `added_at DateTime64(3, 'UTC')`) and its rules: append-only, the newest row of an address wins (at the same `added_at` a removal wins), a newest row that is a removal or names nothing means no network name. Written by the operator ([operations](operations.md#name-an-account-on-one-network)); never `FINAL`, read whole with `LIMIT 1 BY address` and reloaded with the names every 60 s | `/v2/accounts/{address}` (`account_network_name`) |
 | `export_jobs` | `MergeTree`, `ORDER BY (id, seq)`, TTL 7 d on `created` | The states of an export job, append-only in the manner of `ingest_log`: `id` (32 random hex digits), `seq` (0 for the api's `queued` row, one more for every state the exporter writes), `key_hash` (the hex SHA-256 of the creating API key, never the key; `''` without one), `path`, `format` (`csv` or `pdf`), `status Enum8('queued'=1,'running'=2,'done'=3,'failed'=4)`, `created` and `at` (`DateTime64(3,'UTC')`), `rows`, `object` (the storage key `<network>/<id>.<format>`) and `error`. Every row repeats the job, so the row with the highest `seq` of an id is the job: `ORDER BY id, seq DESC LIMIT 1 BY id`, no `FINAL`. Each `POST /v2/exports` counts the jobs of its `key_hash` whose newest row is `queued` or `running` (the limit per key, ticket #16): a scan of 7 days of jobs, as the key is not in the `ORDER BY` | `/v2/exports`, the exporter |
@@ -445,6 +489,21 @@ next to the rollups themselves. Dropping them is a manual operation with a docum
 complete). `markets_live` holds a row per period, filter and pair ever seen (a few thousand); `native_rates_daily` some million rows over
 the history; the rollups of a few thousand heavy accounts some hundred million rows, mostly the lines of issuers.
 
+### NFT aggregates (migration 011)
+
+Four tables, all `ReplacingMergeTree(version)` with no partition, **recomputable** from the NFT ledger tables and written only by the
+aggregator ([spec](superpowers/specs/2026-10-17-nft-data-design.md)). None is a ledger table: none is in `CHILD_TABLES` or
+`LEDGER_KEYED_TABLES`, so ingest recovery never deletes from them; a re-ingest reaches them through `nft_dirty`. `version` is the
+ClickHouse clock in milliseconds, above the key's newest. **Readers keep the newest version of each key without `FINAL`**
+(`ORDER BY <key>, version DESC LIMIT 1 BY <key>`) and filter what a key can lose between versions (`burned`, `held`) after that.
+
+| Table | `ORDER BY` | Contents | Used by |
+| --- | --- | --- | --- |
+| `nfts` | `(issuer, taxon_key, serial, nft_id)` | The state of every NFT with an indexed event: `kind`, `taxon`, `nft_flags`, `transfer_fee`, `owner` (`''` when burned, or when no indexed event names it) with `owner_ledger`, `owner_tx`, `owner_time`; `uri`, `digest`; the mint (`minted_ledger`, `minted_tx`, `minted_time`, `minted_by`, `minted_to`), the burn (`burned UInt8`, `burned_ledger`, `burned_tx`, `burned_time`, `burned_by`) and the last sale (`sale_count`, `last_sale_ledger`, `last_sale_tx`, `last_sale_time`, `last_sale_amount`, `last_sale_currency`, `last_sale_amount_issuer`); `first_ledger` and `last_ledger`, the oldest and the newest indexed event the row has seen. A collection is a prefix of the key, ordered by serial on XRPL | the collection and holdings lists |
+| `account_nfts` | `(owner, issuer, taxon_key, serial, nft_id)` | One row for every account an NFT ever had as owner in the index: `held UInt8` (1 for the current owner), `version`. A holding is the newest row of a key with `held = 1`; holdings are grouped by collection | an account's NFTs |
+| `nft_collections` | `(issuer, taxon_key)` | One row per collection: `kind`, `taxon`, `supply` (its NFTs that are not burned), `holders` (the distinct non-empty owners of those), `minted` and `burned` (the indexed mint and burn events), `sales_count` (every sale), `volume_native` (exact text, the converted price of the sales with a rate) and `volume_native_f`, `first_mint_*` and `last_mint_*` (`ledger` and `time` are `Nullable`, `tx` is `''` when there is none), `last_ledger`, `version`. With complete coverage `supply = minted - burned` | the collections list and detail |
+| `nft_collection_holders` | `(issuer, taxon_key, owner)` | `held UInt32`, `version`. Each recompute of a collection writes every current holder and a `held = 0` row for each holder of its newest set that is gone; a reader keeps the newest row per owner with `held > 0`. Written before the collection's `nft_collections` row | a collection's holders |
+
 ## 4. Relationships
 
 ```
@@ -458,6 +517,8 @@ the history; the rollups of a few thousand heavy accounts some hundred million r
  amm_liquidity (pool prefix)    ──▶ account_amm_liquidity (copy per liquidity provider)
  exchanges (amm_account set) + amm_pool_touches + amm_pool_states ──▶ volume_* (metric amm_volume)
  balance_changes (LP-token lines of an account) + amm_pool_states ──▶ /accounts/{a}/amm_positions
+ nft_events (NFT prefix)  ──▶ account_nft_events, collection_nft_events (copies per account and per collection), nft_sales (sale events in ledger order)
+ nft_touches (ledger order: which NFTs, since when) + nft_events ──▶ nfts, account_nfts ──▶ nft_collections, nft_collection_holders;  nft_dirty (re-ingest ranges)
  exchanges ──▶ native_rates_daily, pair_hourly ──▶ markets_live;  balance_changes + account_transactions + account_exchanges ──▶
  account_lines_daily / account_tx_daily / account_trades_daily (heavy accounts only; sentinels in account_rollup_days)
 ```
@@ -488,6 +549,7 @@ The files so far:
 | `008_account_path_payments.sql` | One `CREATE TABLE IF NOT EXISTS`: the ledger-derived `account_path_payments`, the index of `path_payments` by account. Additive and run again safely; it depends on no other table. Required before a syncer with `PARSER_VERSION` 4 (that syncer's writes fail without the table) and before the API serves `/accounts/{a}/path_payments`; ship it with 007 (rollout: [backfill](backfill.md#path-payments-re-ingest)) |
 | `009_account_network_names.sql` | `account_network_names`, one `CREATE TABLE IF NOT EXISTS` ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)). Additive: it reads no other table. 005 to 008 are numbers reserved by other changes of spec #4; the runner applies whatever files there are in file-name order, so a gap is harmless and a later 005 applies after 009 on a database that already ran 009. Required before an api that reads it: without it the api serves every account without a network name and logs `Could not load the account network names` at every reload |
 | `010_export_jobs.sql` | One `CREATE TABLE IF NOT EXISTS`: `export_jobs`, the states of the export jobs (ticket #15). Additive: it reads no other table. Number 006 is kept for another table of spec #4. Required before the api serves `/v2/exports` and before the exporter starts |
+| `011_nft_data.sql` | Ten `CREATE TABLE IF NOT EXISTS` statements, nothing else: the five ledger-derived NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales`, `nft_touches`; written from parser version 5, `NFT_PARSER_VERSION`), the four aggregates (`nfts`, `account_nfts`, `nft_collections`, `nft_collection_holders`) and `nft_dirty`. Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 5 (that syncer's writes fail without the five ledger tables) and before the API serves the NFT routes |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -501,7 +563,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox run --
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`). A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`, `011_nft_data.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
@@ -509,7 +571,7 @@ local volumes).
 
 - `transactions.tx_json` and `meta_json` dominate (full XRPL history is roughly 1-1.5 TB compressed). Everything else together is a
   fraction of it.
-- Retention is by partition, but always the same ledger block from all 23 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
+- Retention is by partition, but always the same ledger block from all 28 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
   expires by TTL after 90 days.
 - The tables of migration 002 are not ledger tables, so no ledger retention touches them. They expire by TTL: `validator_validations`
   after 7 days of `last_datetime` (about 1 GB on XRPL; whole parts are dropped), `network_state` after 100 days of `polled_at` and

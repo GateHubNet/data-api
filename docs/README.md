@@ -40,7 +40,7 @@ deployment per network.
 ## The system in one paragraph
 
 The **syncer** (`@gatehub/data-syncer`) follows one network's validated ledgers through a resilient node client, parses every ledger into rows of
-23 ledger-derived tables (payments, exchanges including swaps against AMM pools, balance changes, per-account indexes, AMM pool states, account and trust line states, path payments and their index by account, ...) and writes them to **ClickHouse** atomically: child
+28 ledger-derived tables (payments, exchanges including swaps against AMM pools, balance changes, per-account indexes, AMM pool states, account and trust line states, path payments and their index by account, ...) and writes them to **ClickHouse** atomically: child
 tables first, the `ledgers` row last as the commit marker, with deduplication tokens so a crash recovers by deleting the uncommitted tail. Side workers
 collect validations and fee snapshots, keep hourly stats, volumes and the AMM pool tables up to date, precompute the account and market aggregates (daily rates, hourly pair stats, the Markets
 table, rollups of heavy accounts), and derive the validators and amendments data (validator lists, domain verification, voting rounds, agreement). The **api** (`@gatehub/data-api-service`) is a stateless NestJS

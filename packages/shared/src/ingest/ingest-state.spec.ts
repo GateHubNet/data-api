@@ -14,6 +14,14 @@ const AMM_LEDGER_TABLES = [
   Table.AmmGovernance,
 ];
 
+const NFT_LEDGER_TABLES = [
+  Table.NftEvents,
+  Table.AccountNftEvents,
+  Table.CollectionNftEvents,
+  Table.NftSales,
+  Table.NftTouches,
+];
+
 interface Delete {
   sql: string;
   params: Record<string, unknown>;
@@ -53,6 +61,26 @@ describe('LEDGER_KEYED_TABLES', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(tables).not.toContain(Table.AmmPools);
     expect(tables).not.toContain(Table.AmmDaily);
+  });
+
+  it('lists the five NFT ledger tables: the sales and the touches by a million, the three event tables by ten million', () => {
+    for (const table of NFT_LEDGER_TABLES) {
+      const partitionSize = table === Table.NftSales || table === Table.NftTouches ? P6 : P7;
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize }]);
+    }
+  });
+
+  it('does not list the NFT aggregates or nft_dirty: a ledger rewrite must not touch them', () => {
+    const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
+    for (const table of [
+      Table.Nfts,
+      Table.AccountNfts,
+      Table.NftCollections,
+      Table.NftCollectionHolders,
+      Table.NftDirty,
+    ]) {
+      expect(tables).not.toContain(table);
+    }
   });
 
   it('lists every table once and keeps the commit marker first', () => {

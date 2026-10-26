@@ -102,6 +102,24 @@ const SHAPES: Record<Table, Shape> = {
     partition: P7,
     order: 'account, ledger_index, tx_index',
   },
+  // the NFT ledger tables (migration 011): the events by NFT, by account and by collection, the sales and the touches
+  [Table.NftEvents]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'nft_id, ledger_index, tx_index, event_index',
+  },
+  [Table.AccountNftEvents]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, ledger_index, tx_index, event_index',
+  },
+  [Table.CollectionNftEvents]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'issuer, taxon_key, ledger_index, tx_index, event_index',
+  },
+  [Table.NftSales]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, event_index' },
+  [Table.NftTouches]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, nft_id' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -227,6 +245,31 @@ const SHAPES: Record<Table, Shape> = {
     partition: 'toYear(day)',
     order: 'account, day, base_currency, base_issuer, counter_currency, counter_issuer, version',
   },
+  // the NFT aggregates (migration 011): version sets of the aggregator, no partition
+  [Table.Nfts]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'issuer, taxon_key, serial, nft_id',
+  },
+  [Table.AccountNfts]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'owner, issuer, taxon_key, serial, nft_id',
+  },
+  [Table.NftCollections]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'issuer, taxon_key',
+  },
+  [Table.NftCollectionHolders]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: '',
+    order: 'issuer, taxon_key, owner',
+  },
   [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
   [Table.IngestLog]: {
     engine: 'ReplacingMergeTree',
@@ -239,6 +282,12 @@ const SHAPES: Record<Table, Shape> = {
     version: 'created_at',
     partition: '',
     order: 'from_hour, to_hour',
+  },
+  [Table.NftDirty]: {
+    engine: 'ReplacingMergeTree',
+    version: 'created_at',
+    partition: '',
+    order: 'from_ledger, to_ledger',
   },
   [Table.SyncerLease]: { engine: 'ReplacingMergeTree', version: 'heartbeat', partition: '', order: 'network' },
   // append-only: every state of a job is kept, the highest seq is the job (migration 010)
@@ -274,6 +323,21 @@ const MIGRATION_009 = '009_account_network_names.sql';
 const MIGRATION_007 = '007_path_payments.sql';
 /** The path payments of an account (spec #4, ticket #14): the ledger-derived index of path_payments by account. */
 const MIGRATION_008 = '008_account_path_payments.sql';
+/** The NFTs and URITokens (D3): five ledger-derived tables, four aggregates and the dirty ranges. */
+const MIGRATION_011 = '011_nft_data.sql';
+/** The tables of migration 011. */
+const MIGRATION_011_TABLES: Table[] = [
+  Table.NftEvents,
+  Table.AccountNftEvents,
+  Table.CollectionNftEvents,
+  Table.NftSales,
+  Table.NftTouches,
+  Table.Nfts,
+  Table.AccountNfts,
+  Table.NftCollections,
+  Table.NftCollectionHolders,
+  Table.NftDirty,
+];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -300,6 +364,11 @@ const DEDUP_TABLES: Table[] = [
   Table.TrustLineStates,
   Table.PathPayments,
   Table.AccountPathPayments,
+  Table.NftEvents,
+  Table.AccountNftEvents,
+  Table.CollectionNftEvents,
+  Table.NftSales,
+  Table.NftTouches,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1557,6 +1626,54 @@ describe('migrations (e2e)', () => {
       } finally {
         await svc.onModuleDestroy();
       }
+    });
+  });
+
+  describe('migration 011', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-011-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 011 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_011_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_011);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_011);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_011_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_011]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_011], skipped: before });
+      for (const table of MIGRATION_011_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
     });
   });
 });

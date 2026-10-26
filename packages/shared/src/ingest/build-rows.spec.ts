@@ -134,6 +134,11 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.TrustLineStates, 'trustLineStates'],
   [Table.PathPayments, 'pathPayments'],
   [Table.AccountPathPayments, 'accountPathPayments'],
+  [Table.NftEvents, 'nftEvents'],
+  [Table.AccountNftEvents, 'accountNftEvents'],
+  [Table.CollectionNftEvents, 'collectionNftEvents'],
+  [Table.NftSales, 'nftSales'],
+  [Table.NftTouches, 'nftTouches'],
 ];
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
@@ -1371,7 +1376,7 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
 }
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -1397,6 +1402,11 @@ describe('CHILD_TABLES', () => {
         Table.TrustLineStates,
         Table.PathPayments,
         Table.AccountPathPayments,
+        Table.NftEvents,
+        Table.AccountNftEvents,
+        Table.CollectionNftEvents,
+        Table.NftSales,
+        Table.NftTouches,
       ].sort(),
     );
   });

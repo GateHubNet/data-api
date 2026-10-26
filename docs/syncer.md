@@ -16,7 +16,7 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    │              │               │                │ account rollups │                  │
    └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴─────────┬────────┘
           ▼               ▼               ▼                 ▼                  ▼
-   23 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
+   28 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
    (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
     marker)           manifests,                      volume_daily,      validator_manifests (rpc),
                       validator_                      amm_pools,         network_state,

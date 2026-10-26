@@ -49,11 +49,29 @@ const AMM_LEDGER_TABLES: Table[] = [
   Table.AmmGovernance,
 ];
 
+/** The ledger tables of the NFT data: child tables like the others, with no rows from the parser yet. */
+const NFT_LEDGER_TABLES: Table[] = [
+  Table.NftEvents,
+  Table.AccountNftEvents,
+  Table.CollectionNftEvents,
+  Table.NftSales,
+  Table.NftTouches,
+];
+
+/**
+ * The tables the ripple-mock ledgers have no activity for: the delete tests put hand-made rows into them
+ * (`insertSeededRows`), to see what the deletes reach and what they leave.
+ */
+const SEEDED_LEDGER_TABLES: Table[] = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES];
+
+/** The seeded tables partitioned by a million ledgers (P6); the others by ten million (P7). */
+const SEEDED_P6_TABLES: Table[] = [Table.AmmPoolTouches, Table.NftSales, Table.NftTouches];
+
 type Counts = Record<string, number>;
 
 /**
  * What the tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows `buildLedgerRows`
- * made. `seeded` are ledgers that also got one hand-made row in each AMM table (`insertAmmRows`).
+ * made. `seeded` are ledgers that also got one hand-made row in each AMM and NFT table (`insertSeededRows`).
  */
 function countsOf(
   built: LedgerRows[],
@@ -68,12 +86,12 @@ function countsOf(
     for (const [table, key] of CHILD_TABLES) counts[table] += (rows[key] as unknown[]).length;
   }
   for (const rows of seeded) {
-    if (keep(rows.ledger.ledger_index)) for (const table of AMM_LEDGER_TABLES) counts[table] += 1;
+    if (keep(rows.ledger.ledger_index)) for (const table of SEEDED_LEDGER_TABLES) counts[table] += 1;
   }
   return counts;
 }
 
-/** The ripple-mock ledgers (no AMM activity), optionally with seeded AMM rows. */
+/** The ripple-mock ledgers (no AMM or NFT activity), optionally with seeded AMM and NFT rows. */
 const expectedCounts = (keep?: (ledgerIndex: number) => boolean, seeded?: readonly LedgerRows[]): Counts =>
   countsOf(BUILT, keep, seeded);
 
@@ -154,19 +172,19 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   }
 
   /**
-   * One row in each AMM ledger table for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no AMM
-   * activity, so the delete tests put these in by hand, over several partitions, to see what the deletes reach and what
-   * they leave. `expectedCounts` takes them as `seeded`.
+   * One row in each AMM and NFT ledger table for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no AMM
+   * or NFT activity, so the delete tests put these in by hand, over several partitions, to see what the deletes reach and
+   * what they leave. `expectedCounts` takes them as `seeded`.
    */
-  async function insertAmmRows(svc: ClickHouseService, rows: LedgerRows[]): Promise<void> {
-    for (const table of AMM_LEDGER_TABLES)
+  async function insertSeededRows(svc: ClickHouseService, rows: LedgerRows[]): Promise<void> {
+    for (const table of SEEDED_LEDGER_TABLES)
       await svc.insert(
         table,
         rows.map((r) => ({
           ...SAMPLE_ROWS[table],
           ledger_index: r.ledger.ledger_index,
-          // the touches of a pool are the three columns of its key, with no time
-          ...(table === Table.AmmPoolTouches ? {} : { close_time: r.ledger.close_time }),
+          // the touches of a pool and of an NFT are the columns of their key, with no time
+          ...(table === Table.AmmPoolTouches || table === Table.NftTouches ? {} : { close_time: r.ledger.close_time }),
         })),
       );
   }
@@ -455,8 +473,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const committed = 40;
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, committed));
       await insertUncommitted(svc, BUILT.slice(committed));
-      // AMM rows in the uncommitted ledgers (to go) and in the committed ones (to stay).
-      await insertAmmRows(svc, BUILT);
+      // AMM and NFT rows in the uncommitted ledgers (to go) and in the committed ones (to stay).
+      await insertSeededRows(svc, BUILT);
       // A table that is not keyed by ledger must survive.
       await svc.insert(Table.FeeStats, [
         {
@@ -475,7 +493,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const cp = await committedCheckpoint(svc);
       expect(cp).toBe(index(committed - 1));
       const before = await rowsAbove(svc, cp!);
-      // The uncommitted ledgers put rows into every child table, ledger_by_hash and the AMM tables, over several partitions.
+      // The uncommitted ledgers put rows into every child table, ledger_by_hash, the AMM and NFT tables, over several partitions.
       for (const table of ALL_TABLES) {
         if (table === Table.Ledgers) expect(before[table]).toBe(0);
         else expect([table, before[table] > 0]).toEqual([table, true]);
@@ -492,8 +510,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const after = await rowsAbove(svc, cp!);
       expect(after).toEqual(Object.fromEntries(ALL_TABLES.map((t) => [t, 0])));
       expect(await storedCounts(svc)).toEqual(expectedCounts((i) => i <= cp!, BUILT));
-      // The AMM rows of the committed ledgers are all still there: one per ledger in each table.
-      for (const table of AMM_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, committed]);
+      // The AMM and NFT rows of the committed ledgers are all still there: one per ledger in each table.
+      for (const table of SEEDED_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, committed]);
       expect(await count(svc, Table.FeeStats)).toBe(1);
 
       // The DELETEs hit exactly the ledger-keyed tables, partition by partition where the table is partitioned.
@@ -513,7 +531,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const committed = 40;
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, committed));
       await insertUncommitted(svc, BUILT.slice(committed));
-      await insertAmmRows(svc, BUILT);
+      await insertSeededRows(svc, BUILT);
 
       const params: unknown[] = [];
       const real = svc.command.bind(svc);
@@ -532,9 +550,10 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // Ledger 20,005,122 has transactions but no payment, so payments has no partition 20.
       expect(partitionsOf(Table.Payments)).toEqual([11, 29]);
       expect(partitionsOf(Table.TxByHash)).toEqual([1, 2]);
-      // The AMM ledger tables are P7 like tx_by_hash, but the touches of a pool, which are P6 like transactions.
-      for (const table of AMM_LEDGER_TABLES) {
-        const partitions = table === Table.AmmPoolTouches ? [11, 20, 29] : [1, 2];
+      // The AMM and NFT ledger tables are P7 like tx_by_hash, but the touches of a pool, the NFT sales and the NFT touches,
+      // which are P6 like transactions.
+      for (const table of SEEDED_LEDGER_TABLES) {
+        const partitions = SEEDED_P6_TABLES.includes(table) ? [11, 20, 29] : [1, 2];
         expect([table, partitionsOf(table)]).toEqual([table, partitions]);
       }
     });
@@ -636,7 +655,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
     it('deletes the ledgers in [from, to] from every ledger-keyed table, across partitions, and keeps the rest', async () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx).write(LEDGERS);
-      await insertAmmRows(svc, BUILT);
+      await insertSeededRows(svc, BUILT);
 
       // P6 partitions 2, 11 and 20 and P7 partitions 0, 1 and 2 are touched; the first and the last two ledgers stay.
       const from = index(1);
@@ -646,8 +665,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const kept = (i: number): boolean => i < from || i > to;
       expect(await storedCounts(svc)).toEqual(expectedCounts(kept, BUILT));
-      // The AMM tables lose the rows of the range and keep the three ledgers outside it.
-      for (const table of AMM_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, 3]);
+      // The AMM and NFT tables lose the rows of the range and keep the three ledgers outside it.
+      for (const table of SEEDED_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, 3]);
       expect(await committedCheckpoint(svc)).toBe(index(53));
     });
 
@@ -767,8 +786,10 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         expect(mine.every((c) => c.rows <= 40)).toBe(true);
         expect(mine.map((c) => c.token)).toEqual(mine.map((_, n) => `amm-order:${table}:${span}:${n}`));
       }
-      // The child tables, the AMM ones among them, start before the first of them has finished ...
-      const childStarts = CHILD_TABLES.map(([t]) => events.indexOf(`start:${t}`));
+      // The child tables that have rows, the AMM ones among them, start before the first of them has finished (a table with
+      // no row in these ledgers gets no insert: the NFT tables, until the NFT parser is wired in) ...
+      const withRows = CHILD_TABLES.filter(([, key]) => AMM_BUILT.some((rows) => rows[key].length > 0));
+      const childStarts = withRows.map(([t]) => events.indexOf(`start:${t}`));
       const firstEnd = events.findIndex((e) => e.startsWith('end:'));
       expect(childStarts.every((at) => at >= 0 && at < firstEnd)).toBe(true);
       // ... and all of them are done before ledger_by_hash and then the commit marker.
@@ -962,7 +983,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
     it('deleteLedgersAbove and deleteLedgerRange tag each statement and make the lightweight delete synchronous', async () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx).write(LEDGERS);
-      await insertAmmRows(svc, BUILT);
+      await insertSeededRows(svc, BUILT);
       const calls: Array<{ sql: string; queryId?: string; sync?: unknown }> = [];
       const real = svc.command.bind(svc);
       jest.spyOn(svc, 'command').mockImplementation(async (sql, params, opts) => {
@@ -1101,7 +1122,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // The ledgers table, ledger_by_hash and the child tables are exactly the ones LedgerWriter writes.
       const childTables = new Set(CHILD_TABLES.map(([t]) => t));
       expect(new Set(ALL_TABLES)).toEqual(new Set([Table.Ledgers, Table.LedgerByHash, ...childTables]));
-      for (const table of AMM_LEDGER_TABLES) expect(childTables.has(table)).toBe(true);
+      for (const table of [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES]) expect(childTables.has(table)).toBe(true);
 
       for (const { table, partitionSize } of LEDGER_KEYED_TABLES) {
         const stored = tables.find((t) => t.name === table)!.partition_key;

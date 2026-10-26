@@ -48,6 +48,13 @@ export const STATE_PARSER_VERSION = 3;
  */
 export const PATH_PARSER_VERSION = 4;
 
+/**
+ * The first parser version that writes the five NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`,
+ * `nft_sales` and `nft_touches`): a ledger written by an older one lacks their rows. Gates compare with this constant,
+ * never with `PARSER_VERSION`, which moves to it when `buildLedgerRows` starts writing those rows.
+ */
+export const NFT_PARSER_VERSION = 5;
+
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;
 /** `DateTime('UTC')` column: unix seconds. */
@@ -431,6 +438,124 @@ export interface AccountPathPaymentsRow {
   account: string;
   ledger_index: number;
   tx_index: number;
+}
+
+/** The `kind` of an NFT: `nftoken` on XRPL, `uritoken` on Xahau (an `Enum8` column). */
+type NftRowKind = 'nftoken' | 'uritoken';
+/** The `event` of an NFT event (an `Enum8` column). */
+type NftRowEvent = 'mint' | 'burn' | 'modify' | 'offer_create' | 'offer_cancel' | 'offer_removed' | 'sale' | 'transfer';
+
+/**
+ * One event of an NFT or URIToken (`nft_events`, migration 011): the event's place in its transaction is
+ * `(ledger_index, tx_index, event_index)`. Ids are 64 upper-case hex digits. `taxon_key` is the taxon on XRPL and 0 on
+ * Xahau, `serial` the id's sequence on XRPL and 0 on Xahau, `transfer_fee` is in 1/100000. An absent string is `''`, an
+ * absent number `null`. Amounts are exact decimal text in whole units (`amount_f` is the Float64 shadow); the native
+ * currency is `XRP` or `XAH` with an `amount_issuer` of `''`.
+ */
+export interface NftEventsRow {
+  nft_id: string;
+  ledger_index: number;
+  tx_index: number;
+  event_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: NftRowKind;
+  event: NftRowEvent;
+  issuer: string;
+  taxon: number | null;
+  taxon_key: number;
+  serial: number;
+  nft_flags: number;
+  transfer_fee: number;
+  /** Hex as on the ledger: the new URI of a mint or a modify, else `''`. */
+  uri: string;
+  /** URITokens. */
+  digest: string;
+  /** Who did it: the offer's owner for an offer event, else the sender. */
+  account: string;
+  /** The owner before (burn, sale, transfer). */
+  from_account: string;
+  /** The owner after (mint, sale, transfer). */
+  to_account: string;
+  /** The `NFTokenOffer`'s `LedgerIndex`; on Xahau the URIToken id. */
+  offer_id: string;
+  /** 1 for a sell offer, else 0. */
+  is_sell_offer: number;
+  /** The offer's amount, or the sale's price. */
+  amount: string;
+  amount_f: number;
+  currency: string;
+  amount_issuer: string;
+  destination: string;
+  /** Unix seconds, `null` when the offer has none. */
+  expiration: UnixSeconds | null;
+  broker: string;
+  broker_fee: string;
+  royalty_est: string;
+  /** `offer_removed` only: `sale`, `burn`, `transfer` or `other`. */
+  removed_by: string;
+}
+
+/**
+ * A copy of an `nft_events` row for each account the event involves (`account_nft_events`, migration 011): `account` is
+ * the account the row is for, `actor` the `account` of the event, `roles` the account's roles in it (`issuer`, `minter`,
+ * `from`, `to`, `broker`, `offer_owner`, `destination`); an account with two roles in an event has one row.
+ */
+export interface AccountNftEventsRow {
+  account: string;
+  nft_id: string;
+  ledger_index: number;
+  tx_index: number;
+  event_index: number;
+  tx_hash: string;
+  tx_type: string;
+  close_time: UnixSeconds;
+  kind: NftRowKind;
+  event: NftRowEvent;
+  issuer: string;
+  taxon: number | null;
+  taxon_key: number;
+  serial: number;
+  nft_flags: number;
+  transfer_fee: number;
+  uri: string;
+  digest: string;
+  actor: string;
+  from_account: string;
+  to_account: string;
+  offer_id: string;
+  is_sell_offer: number;
+  amount: string;
+  amount_f: number;
+  currency: string;
+  amount_issuer: string;
+  destination: string;
+  expiration: UnixSeconds | null;
+  broker: string;
+  broker_fee: string;
+  royalty_est: string;
+  removed_by: string;
+  roles: string[];
+}
+
+/** A copy of every event by collection (`collection_nft_events`, migration 011): the columns of `nft_events`. */
+export type CollectionNftEventsRow = NftEventsRow;
+
+/** A copy of the `sale` events in ledger order (`nft_sales`, migration 011): the columns of `nft_events`. */
+export type NftSalesRow = NftEventsRow;
+
+/**
+ * One row per NFT a transaction had an event of (`nft_touches`, migration 011): the narrow, ledger-ordered index the
+ * aggregator scans for the NFTs that changed.
+ */
+export interface NftTouchesRow {
+  ledger_index: number;
+  tx_index: number;
+  nft_id: string;
+  issuer: string;
+  taxon_key: number;
+  serial: number;
 }
 
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
@@ -966,6 +1091,103 @@ export interface AccountTradesDailyRow {
   version: UInt64Value;
 }
 
+// -- NFT aggregates (migration 011) ------------------------------------------------------------------------------
+
+/**
+ * The state of one NFT or URIToken (`nfts`), rebuilt from its events by the aggregator. `owner` is `''` when the NFT is
+ * burned or when no indexed event names it; `first_ledger` and `last_ledger` are the oldest and newest indexed event the
+ * row has seen. Readers keep the newest `version` of each key.
+ */
+export interface NftsRow {
+  issuer: string;
+  taxon_key: number;
+  serial: number;
+  nft_id: string;
+  kind: NftRowKind;
+  taxon: number | null;
+  nft_flags: number;
+  transfer_fee: number;
+  owner: string;
+  owner_ledger: number | null;
+  owner_tx: string;
+  owner_time: UnixSeconds | null;
+  uri: string;
+  digest: string;
+  minted_ledger: number | null;
+  minted_tx: string;
+  minted_time: UnixSeconds | null;
+  minted_by: string;
+  minted_to: string;
+  burned: number;
+  burned_ledger: number | null;
+  burned_tx: string;
+  burned_time: UnixSeconds | null;
+  burned_by: string;
+  sale_count: number;
+  last_sale_ledger: number | null;
+  last_sale_tx: string;
+  last_sale_time: UnixSeconds | null;
+  last_sale_amount: string;
+  last_sale_currency: string;
+  last_sale_amount_issuer: string;
+  first_ledger: number;
+  last_ledger: number;
+  version: UInt64Value;
+}
+
+/**
+ * One row for every account an NFT ever had as owner in the index (`account_nfts`): `held` is 1 for the current owner. A
+ * holding is the newest row of a key with `held = 1`.
+ */
+export interface AccountNftsRow {
+  owner: string;
+  issuer: string;
+  taxon_key: number;
+  serial: number;
+  nft_id: string;
+  held: number;
+  version: UInt64Value;
+}
+
+/**
+ * One collection (`nft_collections`): an issuer and, on XRPL, a taxon (`taxon_key` is 0 on Xahau). `supply` counts the
+ * NFTs not burned, `minted` and `burned` the indexed mint and burn events, `volume_native` the converted price (exact text,
+ * with its `Float64` shadow) of the sales with a rate.
+ */
+export interface NftCollectionsRow {
+  issuer: string;
+  taxon_key: number;
+  kind: NftRowKind;
+  taxon: number | null;
+  supply: UInt64Value;
+  holders: UInt64Value;
+  minted: UInt64Value;
+  burned: UInt64Value;
+  sales_count: UInt64Value;
+  volume_native: string;
+  volume_native_f: number;
+  first_mint_ledger: number | null;
+  first_mint_tx: string;
+  first_mint_time: UnixSeconds | null;
+  last_mint_ledger: number | null;
+  last_mint_tx: string;
+  last_mint_time: UnixSeconds | null;
+  last_ledger: number;
+  version: UInt64Value;
+}
+
+/**
+ * The holders of a collection (`nft_collection_holders`): `held` NFTs of it, 0 for a holder of the collection's newest set
+ * that is gone. A reader keeps the newest row per owner with `held > 0`.
+ */
+export interface NftCollectionHoldersRow {
+  issuer: string;
+  taxon_key: number;
+  owner: string;
+  held: number;
+  version: UInt64Value;
+}
+
 // -- Internal bookkeeping ----------------------------------------------------------------------------------------
 
 export interface IngestLogRow {
@@ -979,6 +1201,13 @@ export interface IngestLogRow {
 export interface AggDirtyRow {
   from_hour: UnixSeconds;
   to_hour: UnixSeconds;
+  created_at: UnixSecondsMs;
+}
+
+/** A ledger range whose NFTs must be rebuilt (`nft_dirty`, migration 011), as `agg_dirty` is for hours. */
+export interface NftDirtyRow {
+  from_ledger: number;
+  to_ledger: number;
   created_at: UnixSecondsMs;
 }
 

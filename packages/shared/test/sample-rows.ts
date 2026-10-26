@@ -3,6 +3,8 @@ import {
   AccountExchangesRow,
   AccountLinesDailyRow,
   AccountNetworkNamesRow,
+  AccountNftEventsRow,
+  AccountNftsRow,
   AccountPartitionRowsRow,
   AccountPathPaymentsRow,
   AccountPaymentsRow,
@@ -24,6 +26,7 @@ import {
   AmmPoolStatesRow,
   AmmPoolTouchesRow,
   BalanceChangesRow,
+  CollectionNftEventsRow,
   ExchangesRow,
   ExportJobsRow,
   FeeStatsRow,
@@ -33,6 +36,13 @@ import {
   MarketsLiveRow,
   NativeRatesDailyRow,
   NetworkStateRow,
+  NftCollectionHoldersRow,
+  NftCollectionsRow,
+  NftDirtyRow,
+  NftEventsRow,
+  NftSalesRow,
+  NftsRow,
+  NftTouchesRow,
   PairHourlyRow,
   PARSER_VERSION,
   PathPaymentsRow,
@@ -83,6 +93,11 @@ export interface TableRows {
   [Table.TrustLineStates]: TrustLineStatesRow;
   [Table.PathPayments]: PathPaymentsRow;
   [Table.AccountPathPayments]: AccountPathPaymentsRow;
+  [Table.NftEvents]: NftEventsRow;
+  [Table.AccountNftEvents]: AccountNftEventsRow;
+  [Table.CollectionNftEvents]: CollectionNftEventsRow;
+  [Table.NftSales]: NftSalesRow;
+  [Table.NftTouches]: NftTouchesRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -110,9 +125,14 @@ export interface TableRows {
   [Table.AccountLinesDaily]: AccountLinesDailyRow;
   [Table.AccountTxDaily]: AccountTxDailyRow;
   [Table.AccountTradesDaily]: AccountTradesDailyRow;
+  [Table.Nfts]: NftsRow;
+  [Table.AccountNfts]: AccountNftsRow;
+  [Table.NftCollections]: NftCollectionsRow;
+  [Table.NftCollectionHolders]: NftCollectionHoldersRow;
   [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
   [Table.AggDirty]: AggDirtyRow;
+  [Table.NftDirty]: NftDirtyRow;
   [Table.SyncerLease]: SyncerLeaseRow;
   [Table.ExportJobs]: ExportJobsRow;
 }
@@ -189,6 +209,45 @@ const ammLiquidity: AmmLiquidityRow = {
   base_amount_f: -50000000,
   counter_amount_f: -26.25,
   lp_tokens_f: -1144.5,
+};
+
+/**
+ * `collection_nft_events` and `nft_sales` have the columns of `nft_events`, so one row serves the three: a brokered sale
+ * of an XRPL NFT, whose price is 12.5 XRP with a broker's cut of 0.5 and a royalty of 5% of the rest.
+ */
+const nftSale: NftEventsRow = {
+  nft_id: hash(30),
+  ledger_index: LEDGER,
+  tx_index: 6,
+  event_index: 2,
+  tx_hash: hash(16),
+  tx_type: 'NFTokenAcceptOffer',
+  close_time: CLOSE,
+  kind: 'nftoken',
+  event: 'sale',
+  issuer: ISSUER,
+  taxon: 7,
+  taxon_key: 7,
+  serial: 42,
+  nft_flags: 8,
+  transfer_fee: 5000,
+  uri: '',
+  digest: '',
+  account: CAROL,
+  from_account: ALICE,
+  to_account: BOB,
+  offer_id: hash(31),
+  is_sell_offer: 1,
+  amount: '12.5',
+  amount_f: 12.5,
+  currency: 'XRP',
+  amount_issuer: '',
+  destination: CAROL,
+  expiration: CLOSE + 86_400,
+  broker: CAROL,
+  broker_fee: '0.5',
+  royalty_est: '0.6',
+  removed_by: '',
 };
 
 /** One distinct value per column of every table, in the shape the row interfaces describe. */
@@ -420,6 +479,54 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
   },
   // the source's row of that path payment
   [Table.AccountPathPayments]: { account: ALICE, ledger_index: LEDGER, tx_index: 5 },
+  [Table.NftEvents]: nftSale,
+  // the copy of a Xahau mint for its issuer, which is also the owner after it: no taxon, no expiration
+  [Table.AccountNftEvents]: {
+    account: ISSUER,
+    nft_id: hash(32),
+    ledger_index: LEDGER,
+    tx_index: 7,
+    event_index: 0,
+    tx_hash: hash(17),
+    tx_type: 'URITokenMint',
+    close_time: CLOSE,
+    kind: 'uritoken',
+    event: 'mint',
+    issuer: ISSUER,
+    taxon: null,
+    taxon_key: 0,
+    serial: 0,
+    nft_flags: 1,
+    transfer_fee: 0,
+    uri: '697066733A2F2F6578616D706C65',
+    digest: hash(33),
+    actor: ISSUER,
+    from_account: '',
+    to_account: ISSUER,
+    offer_id: hash(32),
+    is_sell_offer: 0,
+    amount: '',
+    amount_f: 0,
+    currency: '',
+    amount_issuer: '',
+    destination: '',
+    expiration: null,
+    broker: '',
+    broker_fee: '',
+    royalty_est: '',
+    removed_by: '',
+    roles: ['issuer', 'to'],
+  },
+  [Table.CollectionNftEvents]: nftSale,
+  [Table.NftSales]: nftSale,
+  [Table.NftTouches]: {
+    ledger_index: LEDGER,
+    tx_index: 6,
+    nft_id: hash(30),
+    issuer: ISSUER,
+    taxon_key: 7,
+    serial: 42,
+  },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
     current_ledger_size: 12,
@@ -808,6 +915,75 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     sold_counter_sum_f: 210.125,
     version: VERSION_MS,
   },
+  // sold once and held by Bob, not burned
+  [Table.Nfts]: {
+    issuer: ISSUER,
+    taxon_key: 7,
+    serial: 42,
+    nft_id: hash(30),
+    kind: 'nftoken',
+    taxon: 7,
+    nft_flags: 8,
+    transfer_fee: 5000,
+    owner: BOB,
+    owner_ledger: LEDGER,
+    owner_tx: hash(16),
+    owner_time: CLOSE,
+    uri: '697066733A2F2F6578616D706C65',
+    digest: '',
+    minted_ledger: LEDGER - 100,
+    minted_tx: hash(18),
+    minted_time: CLOSE - 400,
+    minted_by: ISSUER,
+    minted_to: ALICE,
+    burned: 0,
+    burned_ledger: null,
+    burned_tx: '',
+    burned_time: null,
+    burned_by: '',
+    sale_count: 1,
+    last_sale_ledger: LEDGER,
+    last_sale_tx: hash(16),
+    last_sale_time: CLOSE,
+    last_sale_amount: '12.5',
+    last_sale_currency: 'XRP',
+    last_sale_amount_issuer: '',
+    first_ledger: LEDGER - 100,
+    last_ledger: LEDGER,
+    version: VERSION_MS,
+  },
+  // Alice held it before Bob did: the newest row of the key says held 0
+  [Table.AccountNfts]: {
+    owner: ALICE,
+    issuer: ISSUER,
+    taxon_key: 7,
+    serial: 42,
+    nft_id: hash(30),
+    held: 0,
+    version: VERSION_MS,
+  },
+  [Table.NftCollections]: {
+    issuer: ISSUER,
+    taxon_key: 7,
+    kind: 'nftoken',
+    taxon: 7,
+    supply: 120,
+    holders: 45,
+    minted: 130,
+    burned: 10,
+    sales_count: 9,
+    volume_native: '1234.5',
+    volume_native_f: 1234.5,
+    first_mint_ledger: LEDGER - 5000,
+    first_mint_tx: hash(19),
+    first_mint_time: CLOSE - 20_000,
+    last_mint_ledger: LEDGER - 100,
+    last_mint_tx: hash(18),
+    last_mint_time: CLOSE - 400,
+    last_ledger: LEDGER,
+    version: VERSION_MS,
+  },
+  [Table.NftCollectionHolders]: { issuer: ISSUER, taxon_key: 7, owner: BOB, held: 3, version: VERSION_MS },
   [Table.AccountNetworkNames]: {
     address: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh',
     name: 'USD Issuer',
@@ -817,6 +993,7 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
   },
   [Table.IngestLog]: { range_start: 100, range_end: 199, run_id: 'run-1', status: 'done', updated_at: CLOSE_MS },
   [Table.AggDirty]: { from_hour: 1_699_999_200, to_hour: 1_700_002_800, created_at: CLOSE_MS },
+  [Table.NftDirty]: { from_ledger: LEDGER - 10_000, to_ledger: LEDGER, created_at: CLOSE_MS },
   [Table.SyncerLease]: { network: 'xrpl', holder: 'syncer-1', heartbeat: CLOSE_MS },
   // created recently: the table drops a job 7 days after it was created
   [Table.ExportJobs]: {

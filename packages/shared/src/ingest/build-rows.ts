@@ -1,6 +1,7 @@
 import {
   AccountAmmLiquidityRow,
   AccountExchangesRow,
+  AccountNftEventsRow,
   AccountPathPaymentsRow,
   AccountPaymentsRow,
   AccountsCreatedRow,
@@ -12,10 +13,14 @@ import {
   AmmPoolStatesRow,
   AmmPoolTouchesRow,
   BalanceChangesRow,
+  CollectionNftEventsRow,
   CountMap,
   ExchangesRow,
   LedgerByHashRow,
   LedgersRow,
+  NftEventsRow,
+  NftSalesRow,
+  NftTouchesRow,
   PARSER_VERSION,
   PathPaymentsRow,
   PaymentsByCurrencyRow,
@@ -69,6 +74,16 @@ export interface LedgerRows {
   pathPayments: PathPaymentsRow[];
   /** The index of `pathPayments` by account: the source and the destination, one row for a payment to oneself. */
   accountPathPayments: AccountPathPaymentsRow[];
+  /** Every NFT and URIToken event (migration 011). Empty until the NFT parser is wired in (`NFT_PARSER_VERSION`). */
+  nftEvents: NftEventsRow[];
+  /** A copy of each event per account it involves, with the account's roles in it. */
+  accountNftEvents: AccountNftEventsRow[];
+  /** A copy of every event by collection. */
+  collectionNftEvents: CollectionNftEventsRow[];
+  /** A copy of the sale events, in ledger order. */
+  nftSales: NftSalesRow[];
+  /** One per NFT a transaction had an event of: the ledger-ordered index the aggregator scans. */
+  nftTouches: NftTouchesRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -92,7 +107,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
  * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
- * and their index by account.
+ * and their index by account, and the 5 NFT tables.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -116,6 +131,11 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.TrustLineStates, 'trustLineStates'],
   [Table.PathPayments, 'pathPayments'],
   [Table.AccountPathPayments, 'accountPathPayments'],
+  [Table.NftEvents, 'nftEvents'],
+  [Table.AccountNftEvents, 'accountNftEvents'],
+  [Table.CollectionNftEvents, 'collectionNftEvents'],
+  [Table.NftSales, 'nftSales'],
+  [Table.NftTouches, 'nftTouches'],
 ];
 
 const paymentParser = new PaymentParser();
@@ -235,6 +255,11 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     trustLineStates: [],
     pathPayments: [],
     accountPathPayments: [],
+    nftEvents: [],
+    accountNftEvents: [],
+    collectionNftEvents: [],
+    nftSales: [],
+    nftTouches: [],
     diagnostics: { ammUnclassified: 0 },
   };
 

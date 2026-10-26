@@ -4,6 +4,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountNftEvents": [],
   "accountPathPayments": [],
   "accountPayments": [
     {
@@ -2372,6 +2373,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
       "tx_index": 36,
     },
   ],
+  "collectionNftEvents": [],
   "diagnostics": {
     "ammUnclassified": 0,
   },
@@ -2407,6 +2409,9 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "ledger_hash": "8DC84412FD250A59CC476DB756DF8F4A5753DF15CAA6C90740CC1B6F9E6762E1",
     "ledger_index": 26570752,
   },
+  "nftEvents": [],
+  "nftSales": [],
+  "nftTouches": [],
   "pathPayments": [],
   "payments": [
     {
@@ -3734,6 +3739,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountNftEvents": [],
   "accountPathPayments": [],
   "accountPayments": [
     {
@@ -4486,6 +4492,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
       "tx_index": 3,
     },
   ],
+  "collectionNftEvents": [],
   "diagnostics": {
     "ammUnclassified": 0,
   },
@@ -4522,6 +4529,9 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "ledger_hash": "CC657D821B26FF8B9B3A95FA460C1731AD4350C9A206503C1C32E0421D9E9845",
     "ledger_index": 26540188,
   },
+  "nftEvents": [],
+  "nftSales": [],
+  "nftTouches": [],
   "pathPayments": [],
   "payments": [
     {
@@ -4693,6 +4703,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountNftEvents": [],
   "accountPathPayments": [],
   "accountPayments": [],
   "accountStates": [
@@ -5479,6 +5490,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
       "tx_index": 12,
     },
   ],
+  "collectionNftEvents": [],
   "diagnostics": {
     "ammUnclassified": 0,
   },
@@ -5514,6 +5526,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "ledger_hash": "6C36469B9B95B84BB439713BC0D0E914728BE1DED8C19B640765E22D89D84A69",
     "ledger_index": 11118827,
   },
+  "nftEvents": [],
+  "nftSales": [],
+  "nftTouches": [],
   "pathPayments": [],
   "payments": [],
   "paymentsByCurrency": [],
@@ -6012,6 +6027,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_type": "Payment",
     },
   ],
+  "accountNftEvents": [],
   "accountPathPayments": [
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
@@ -7341,6 +7357,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_index": 10,
     },
   ],
+  "collectionNftEvents": [],
   "diagnostics": {
     "ammUnclassified": 0,
   },
@@ -7459,6 +7476,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     "ledger_hash": "FEF54BF4198BD9248AE726552C45560D84B714217AF4B6A01733C3472FCEFD40",
     "ledger_index": 11119620,
   },
+  "nftEvents": [],
+  "nftSales": [],
+  "nftTouches": [],
   "pathPayments": [
     {
       "amm_pools": [],
@@ -8121,6 +8141,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
 {
   "accountAmmLiquidity": [],
   "accountExchanges": [],
+  "accountNftEvents": [],
   "accountPathPayments": [],
   "accountPayments": [
     {
@@ -8918,6 +8939,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
       "tx_index": 4,
     },
   ],
+  "collectionNftEvents": [],
   "diagnostics": {
     "ammUnclassified": 0,
   },
@@ -8953,6 +8975,9 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "ledger_hash": "113EF1CC2F4C3683AE2C551EB0C08B766292D0A426044AB3DDD5BFB0B264E283",
     "ledger_index": 11618225,
   },
+  "nftEvents": [],
+  "nftSales": [],
+  "nftTouches": [],
   "pathPayments": [],
   "payments": [
     {

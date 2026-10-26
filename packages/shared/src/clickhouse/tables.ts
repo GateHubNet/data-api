@@ -30,6 +30,13 @@ export enum Table {
   PathPayments = 'path_payments',
   // The path payments of an account (migration 008): the index of path_payments by source and destination.
   AccountPathPayments = 'account_path_payments',
+  // NFTs and URITokens (migration 011, written by ingest from parser version 5, NFT_PARSER_VERSION): the events, their
+  // copies by account, by collection and for the sales, and the narrow index of the NFTs a transaction touched.
+  NftEvents = 'nft_events',
+  AccountNftEvents = 'account_nft_events',
+  CollectionNftEvents = 'collection_nft_events',
+  NftSales = 'nft_sales',
+  NftTouches = 'nft_touches',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -61,12 +68,20 @@ export enum Table {
   AccountLinesDaily = 'account_lines_daily',
   AccountTxDaily = 'account_tx_daily',
   AccountTradesDaily = 'account_trades_daily',
+  // NFT aggregates (migration 011), written by the aggregator: the state of every NFT, the holdings of an account, the
+  // collections and their holders.
+  Nfts = 'nfts',
+  AccountNfts = 'account_nfts',
+  NftCollections = 'nft_collections',
+  NftCollectionHolders = 'nft_collection_holders',
   // Written by the operator with plain SQL inserts (ADR-0014).
   /** Migration 009: the account network name of an address, append-only, the newest row of an address wins. */
   AccountNetworkNames = 'account_network_names',
   // Internal bookkeeping.
   IngestLog = 'ingest_log',
   AggDirty = 'agg_dirty',
+  /** Migration 011: the ledger ranges whose NFTs must be rebuilt after a re-ingest, as `agg_dirty` is for hours. */
+  NftDirty = 'nft_dirty',
   SyncerLease = 'syncer_lease',
   // Export jobs (migration 010): written by the api (queued) and the exporter (running, done, failed).
   ExportJobs = 'export_jobs',
