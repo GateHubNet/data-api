@@ -281,7 +281,7 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpo
 | `brokered_sale_royalty` | 107879497 | `0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C` | Both offers, broker fee 2.3835 XRP, fee 3%, issuer paid 4.428495 XRP |
 | `sale_issued_currency` | 107881530 | `2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7` | Sell offer priced 100 of a 40-hex currency (XRPlay) |
 | `transfer_zero_amount` | 107886163 | `4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A` | Accepted sell offer of `Amount` "0": the NFT moves, no payment |
-| `page_split_with_mint` | 107886233 | `33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2` | Mint on a full page: a created and a modified page of one owner, and a neighbour whose `NFTokens` did not change |
+| `page_split_with_mint` | 107886233 | `33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2` | Mint on a full page: a created and a modified page of one owner, and a neighbour whose `NFTokens` did not change; the mint also creates a gift sell `NFTokenOffer` (`Amount` "0", `Destination`) and deletes the Ticket it was sent with |
 
 **Not found** (within the 19,955 ledgers scanned, fewer than the 50,000 the plan names): `offer_removed_other`. No transaction of a type other than NFTokenAcceptOffer, NFTokenBurn and NFTokenCancelOffer deleted an `NFTokenOffer` in them (an AccountDelete of an offer's owner is the only other type expected to), and the 290 accounts that owned offers in the first part of the scan all still existed when checked with `account_info`. The scan was stopped there because the node answered "You are placing too much load on the server" to it. Task 4 needs a `synthetic-…` transaction for `offer_removed_other`.
 

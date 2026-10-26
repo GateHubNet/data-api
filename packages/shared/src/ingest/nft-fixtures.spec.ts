@@ -70,6 +70,8 @@ interface Node {
   after: Record<string, any>;
   /** The node's fields before it (`PreviousFields` over `FinalFields`). */
   before: Record<string, any>;
+  /** `PreviousFields` alone: only the fields the transaction changed or removed (an added field is not in it). */
+  previous: Record<string, any>;
 }
 
 function nodesOf(t: RawTransaction): Node[] {
@@ -82,6 +84,7 @@ function nodesOf(t: RawTransaction): Node[] {
       index: body.LedgerIndex as string,
       after: { ...body.FinalFields, ...body.NewFields },
       before: { ...body.FinalFields, ...body.PreviousFields },
+      previous: { ...body.PreviousFields },
     };
   });
 }
@@ -101,78 +104,181 @@ const pageOwner = (index: string): string => encodeAccountID(Buffer.from(index.s
 const idFee = (nftId: string): number => parseInt(nftId.slice(4, 8), 16);
 const idIssuer = (nftId: string): string => encodeAccountID(Buffer.from(nftId.slice(8, 48), 'hex'));
 
+/** The reason of the first check that fails, or null when every check holds. */
+const unless = (...checks: [ok: boolean, reason: string][]): string | null => checks.find(([ok]) => !ok)?.[1] ?? null;
+
+/** What the transaction of a case must show beyond its type: null when it does, else a short reason. */
+type Shows = (t: RawTransaction, c: Case, burn?: RawTransaction) => string | null;
+
 /** One accepted offer, of the named side and no other, with a non-zero native `Amount`. */
-function directSale(t: RawTransaction, side: string, other: string): boolean {
-  const [offer, ...rest] = accepted(t);
-  return (
-    field(t, side) !== undefined &&
-    field(t, other) === undefined &&
-    rest.length === 0 &&
-    typeof offer?.after.Amount === 'string' &&
-    offer.after.Amount !== '0'
+function directSale(t: RawTransaction, side: string, other: string): string | null {
+  const taken = accepted(t);
+  return unless(
+    [field(t, side) !== undefined, `has no ${side}`],
+    [field(t, other) === undefined, `also has ${other}`],
+    [taken.length === 1, `consumed ${taken.length} offers, not 1`],
+    [typeof taken[0]?.after.Amount === 'string', 'the accepted offer is not priced in the native currency'],
+    [taken[0]?.after.Amount !== '0', 'the accepted offer has Amount "0"'],
   );
 }
 
-/** What the transaction of a case must show beyond its type (the table of the plan's Task 1). */
-const XRPL_SHOWS: Record<string, (t: RawTransaction, c: Case, burn?: RawTransaction) => boolean> = {
-  mint: (t) => field(t, 'Issuer') === undefined && field(t, 'Amount') === undefined,
-  mint_with_offer: (t) => field(t, 'Amount') !== undefined && offers(t, 'CreatedNode').length === 1,
-  mint_on_behalf: (t) => field(t, 'Issuer') !== undefined && field(t, 'Issuer') !== field(t, 'Account'),
-  burn: (t) => offers(t, 'DeletedNode').length === 0,
-  burn_removes_offers: (t) => offers(t, 'DeletedNode').length > 0,
-  modify: () => true,
-  sell_offer_create: (t) => (flagsOf(t) & 1) === 1,
-  buy_offer_create: (t) => (flagsOf(t) & 1) === 0,
-  offer_cancel: () => true,
+/** The `NFTokens` entries of the one modified page that holds `nftId`, before and after, or undefined. */
+function modifiedPageOf(t: RawTransaction, nftId: string) {
+  return nodesOf(t).find(
+    (n) =>
+      n.type === 'NFTokenPage' &&
+      n.op === 'ModifiedNode' &&
+      Array.isArray(n.previous.NFTokens) &&
+      n.after.NFTokens?.some((e: any) => e.NFToken.NFTokenID === nftId),
+  );
+}
+
+/** The table of the plan's Task 1, XRPL half. */
+const XRPL_SHOWS: Record<string, Shows> = {
+  mint: (t) =>
+    unless([field(t, 'Issuer') === undefined, 'has an Issuer'], [field(t, 'Amount') === undefined, 'has an Amount']),
+  mint_with_offer: (t) =>
+    unless(
+      [field(t, 'Amount') !== undefined, 'has no Amount'],
+      [offers(t, 'CreatedNode').length === 1, `creates ${offers(t, 'CreatedNode').length} NFTokenOffers, not 1`],
+    ),
+  mint_on_behalf: (t) =>
+    unless(
+      [field(t, 'Issuer') !== undefined, 'has no Issuer'],
+      [field(t, 'Issuer') !== field(t, 'Account'), 'Issuer is the sender'],
+    ),
+  burn: (t) => unless([offers(t, 'DeletedNode').length === 0, 'deletes an NFTokenOffer']),
+  burn_removes_offers: (t) => unless([offers(t, 'DeletedNode').length > 0, 'deletes no NFTokenOffer']),
+  // The page that holds the NFT keeps its ids; one entry, the transaction's NFTokenID, changes its URI.
+  modify: (t) => {
+    const nftId = field(t, 'NFTokenID');
+    const page = modifiedPageOf(t, nftId);
+    if (!page) return 'no modified NFTokenPage with a previous NFTokens array holds the NFTokenID';
+    const before: any[] = page.previous.NFTokens;
+    const after: any[] = page.after.NFTokens;
+    const ids = (list: any[]) => list.map((e) => e.NFToken.NFTokenID).sort();
+    const changed = after.filter(
+      (e) => JSON.stringify(e) !== JSON.stringify(before.find((b) => b.NFToken.NFTokenID === e.NFToken.NFTokenID)),
+    );
+    return unless(
+      [JSON.stringify(ids(before)) === JSON.stringify(ids(after)), 'the page gained or lost an id'],
+      [changed.length === 1, `${changed.length} entries changed, not 1`],
+      [changed[0]?.NFToken.NFTokenID === nftId, 'the changed entry is not the NFTokenID'],
+      [
+        before.find((b) => b.NFToken.NFTokenID === nftId)?.NFToken.URI !== changed[0]?.NFToken.URI,
+        'the URI of the entry did not change',
+      ],
+    );
+  },
+  sell_offer_create: (t) => unless([(flagsOf(t) & 1) === 1, 'tfSellNFToken is clear']),
+  buy_offer_create: (t) => unless([(flagsOf(t) & 1) === 0, 'tfSellNFToken is set']),
+  offer_cancel: (t) =>
+    unless(
+      [offers(t, 'DeletedNode').length > 0, 'deletes no NFTokenOffer'],
+      [!nodesOf(t).some((n) => n.type === 'NFTokenPage'), 'changes an NFTokenPage'],
+    ),
   sale_by_sell_offer: (t) => directSale(t, 'NFTokenSellOffer', 'NFTokenBuyOffer'),
   sale_by_buy_offer: (t) => directSale(t, 'NFTokenBuyOffer', 'NFTokenSellOffer'),
   brokered_sale_royalty: (t) => {
     const [sell, buy] = [field(t, 'NFTokenSellOffer'), field(t, 'NFTokenBuyOffer')].map((id) =>
       accepted(t).find((n) => n.index === id),
     );
-    if (!sell || !buy || field(t, 'NFTokenBrokerFee') === undefined) return false;
+    if (!sell || !buy) return 'not both offers were consumed';
     const nftId = sell.after.NFTokenID as string;
-    return idFee(nftId) > 0 && ![sell.after.Owner, buy.after.Owner].includes(idIssuer(nftId));
+    return unless(
+      [field(t, 'NFTokenBrokerFee') !== undefined, 'has no NFTokenBrokerFee'],
+      [idFee(nftId) > 0, 'the NFT has no transfer fee'],
+      [![sell.after.Owner, buy.after.Owner].includes(idIssuer(nftId)), "the NFT's issuer is the seller or the buyer"],
+    );
   },
-  sale_issued_currency: (t) => accepted(t).length > 0 && accepted(t).every((n) => typeof n.after.Amount === 'object'),
-  transfer_zero_amount: (t) => accepted(t).length === 1 && accepted(t)[0].after.Amount === '0',
+  sale_issued_currency: (t) =>
+    unless(
+      [accepted(t).length > 0, 'consumed no offer'],
+      [
+        accepted(t).every((n) => typeof n.after.Amount === 'object'),
+        'a consumed offer is priced in the native currency',
+      ],
+    ),
+  transfer_zero_amount: (t) =>
+    unless(
+      [accepted(t).length === 1, `consumed ${accepted(t).length} offers, not 1`],
+      [accepted(t)[0]?.after.Amount === '0', 'the accepted offer is not of Amount "0"'],
+    ),
   page_split_with_mint: (t) => {
     const pages = nodesOf(t).filter((n) => n.type === 'NFTokenPage');
-    return pages
-      .filter((n) => n.op === 'CreatedNode')
-      .some((created) => pages.some((n) => n.op === 'ModifiedNode' && pageOwner(n.index) === pageOwner(created.index)));
+    return unless([
+      pages
+        .filter((n) => n.op === 'CreatedNode')
+        .some((created) =>
+          pages.some((n) => n.op === 'ModifiedNode' && pageOwner(n.index) === pageOwner(created.index)),
+        ),
+      'no created and modified NFTokenPage of one owner',
+    ]);
   },
   offer_removed_other: (t) =>
-    !['NFTokenAcceptOffer', 'NFTokenBurn', 'NFTokenCancelOffer'].includes(field(t, 'TransactionType')) &&
-    offers(t, 'DeletedNode').length > 0,
+    unless(
+      [
+        !['NFTokenAcceptOffer', 'NFTokenBurn', 'NFTokenCancelOffer'].includes(field(t, 'TransactionType')),
+        'is an accept, a burn or a cancel',
+      ],
+      [offers(t, 'DeletedNode').length > 0, 'deletes no NFTokenOffer'],
+    ),
 };
 
-/** What a Xahau case must show; the third argument is the case's `burn` transaction, when it has one. */
-const XAHAU_SHOWS: Record<string, (t: RawTransaction, c: Case, burn?: RawTransaction) => boolean> = {
-  uritoken_mint: (t) => field(t, 'Amount') === undefined,
-  uritoken_mint_with_offer: (t) => field(t, 'Amount') !== undefined && field(t, 'Destination') !== undefined,
-  uritoken_sell_offer_create: (t) => field(t, 'Amount') !== undefined,
-  uritoken_sell_offer_cancel: () => true,
-  // A buy that pays more than the ask, else (FINDINGS says so, and the note says "exactly the ask") any buy of an offer.
-  uritoken_buy_above_ask: (t, c) => {
-    const ask = uriTokens(t)[0]?.before.Amount;
-    const value = (amount: any): number => Number(typeof amount === 'string' ? amount : amount.value);
-    if (ask === undefined || value(field(t, 'Amount')) < value(ask)) return false;
-    return value(field(t, 'Amount')) > value(ask) === !/exactly the ask/.test(c.note);
+/** The price of a URIToken amount as a number, native (drops) or issued (value). */
+const amountValue = (amount: any): number => Number(typeof amount === 'string' ? amount : amount.value);
+
+/** The Xahau half; the third argument is the case's `burn` transaction, when it has one. */
+const XAHAU_SHOWS: Record<string, Shows> = {
+  uritoken_mint: (t) => unless([field(t, 'Amount') === undefined, 'has an Amount']),
+  uritoken_mint_with_offer: (t) =>
+    unless(
+      [field(t, 'Amount') !== undefined, 'has no Amount'],
+      [field(t, 'Destination') !== undefined, 'has no Destination'],
+    ),
+  uritoken_sell_offer_create: (t) => unless([field(t, 'Amount') !== undefined, 'has no Amount']),
+  // The entry loses the offer: its Amount is in PreviousFields and no longer in FinalFields.
+  uritoken_sell_offer_cancel: (t) =>
+    unless([
+      uriTokens(t).some(
+        (n) => n.op === 'ModifiedNode' && n.previous.Amount !== undefined && n.after.Amount === undefined,
+      ),
+      'no URIToken lost its Amount',
+    ]),
+  // The buyer pays at least the ask, and the seller (the entry's previous Owner) gains exactly the transaction's Amount.
+  uritoken_buy_above_ask: (t) => {
+    const entry = uriTokens(t)[0];
+    const ask = entry?.previous.Amount;
+    const paid = field(t, 'Amount');
+    if (paid === undefined) return 'has no Amount';
+    if (ask === undefined) return 'the entry had no Amount to ask';
+    const seller = nodesOf(t).find((n) => n.type === 'AccountRoot' && n.after.Account === entry.previous.Owner);
+    const gain = seller ? BigInt(seller.after.Balance) - BigInt(seller.before.Balance) : undefined;
+    const price = typeof paid === 'string' ? BigInt(paid) : undefined;
+    return unless(
+      [amountValue(paid) >= amountValue(ask), 'the Amount is below the ask'],
+      [price !== undefined, 'the price is not native, so the seller gain is not checked'],
+      [gain !== undefined && gain === price, `the seller gained ${gain} drops, not ${paid}`],
+    );
   },
-  uritoken_burn_with_offer: (t) => uriTokens(t).some((n) => n.op === 'DeletedNode' && n.after.Amount !== undefined),
-  remit_transfer: (t) => Array.isArray(field(t, 'URITokenIDs')) && field(t, 'URITokenIDs').length > 0,
-  remit_mint: (t) => field(t, 'MintURIToken') !== undefined,
+  uritoken_burn_with_offer: (t) =>
+    unless([
+      uriTokens(t).some((n) => n.op === 'DeletedNode' && n.after.Amount !== undefined),
+      'the deleted URIToken has no Amount',
+    ]),
+  remit_transfer: (t) =>
+    unless([Array.isArray(field(t, 'URITokenIDs')) && field(t, 'URITokenIDs').length > 0, 'has no URITokenIDs']),
+  remit_mint: (t) => unless([field(t, 'MintURIToken') !== undefined, 'has no MintURIToken']),
   // The mint creates an index that the earlier burn deleted: one id, two lives (decision 19).
   uritoken_remint: (t, _c, burn) => {
     const created = uriTokens(t).filter((n) => n.op === 'CreatedNode');
     const deleted = burn ? uriTokens(burn).filter((n) => n.op === 'DeletedNode') : [];
-    return (
-      created.length === 1 &&
-      deleted.length === 1 &&
-      created[0].index === deleted[0].index &&
-      created[0].after.URI === deleted[0].after.URI &&
-      created[0].after.Issuer === deleted[0].after.Issuer
+    return unless(
+      [created.length === 1, `creates ${created.length} URITokens, not 1`],
+      [deleted.length === 1, `the burn deletes ${deleted.length} URITokens, not 1`],
+      [created[0]?.index === deleted[0]?.index, 'the mint and the burn have different indexes'],
+      [created[0]?.after.URI === deleted[0]?.after.URI, 'the URIs differ'],
+      [created[0]?.after.Issuer === deleted[0]?.after.Issuer, 'the issuers differ'],
     );
   },
 };
@@ -247,7 +353,7 @@ describe.each([
       const c = manifest.cases[name];
       const burn = c.burn && (await transactionAt(c.burn.ledger, c.burn.hash));
       expect(shows[name]).toBeDefined();
-      expect(shows[name](await transactionOf(name), c, burn)).toBe(true);
+      expect(shows[name](await transactionOf(name), c, burn)).toBeNull();
       if (c.burn) {
         expect(burn?.tx.TransactionType).toBe('URITokenBurn');
         expect(burn?.meta.TransactionResult).toBe('tesSUCCESS');

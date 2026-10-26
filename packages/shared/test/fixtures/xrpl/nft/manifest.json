@@ -93,7 +93,7 @@
       "ledger": 107878781,
       "hash": "32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D",
       "type": "NFTokenMint",
-      "note": "NFTokenMint by rpvC5\u2026(ravC5cZreMZuKEWSrpra5nkWnfzPmrabec) for itself: taxon 0, Flags 25 (burnable, transferable, mutable), no Issuer, no Amount. The id appears as one more NFToken on the existing page of the minter (page 20 tokens, was 19); no offer, no new page."
+      "note": "NFTokenMint by ravC5cZreMZuKEWSrpra5nkWnfzPmrabec for itself: taxon 0, Flags 25 (burnable, transferable, mutable), no Issuer, no Amount. The id appears as one more NFToken on the existing page of the minter (page 20 tokens, was 19); no offer, no new page."
     },
     "mint_with_offer": {
       "ledger": 107886233,
@@ -177,7 +177,7 @@
       "ledger": 107886233,
       "hash": "33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2",
       "type": "NFTokenMint",
-      "note": "NFTokenMint by rKqqb5QZXVAL3VqXJL6obfRGeHou1DtyBV (for issuer rGxWAWXg8okZh29ojBRvEMpN5peQRV16Xu) on a full page: the page of 32 tokens is split into a CreatedNode page of 17 and a ModifiedNode page of 16, and its neighbour is a ModifiedNode page whose NFTokens did not change (only NextPageMin). One id is new."
+      "note": "NFTokenMint by rKqqb5QZXVAL3VqXJL6obfRGeHou1DtyBV (for issuer rGxWAWXg8okZh29ojBRvEMpN5peQRV16Xu) on a full page: the page of 32 tokens is split into a CreatedNode page of 17 and a ModifiedNode page of 16, and its neighbour is a ModifiedNode page whose NFTokens did not change (only NextPageMin). One id is new. The mint also carries Amount \"0\" and a Destination, so it creates a sell NFTokenOffer (a gift offer), and it was sent with a Ticket, which is deleted; besides directory and account nodes the metadata is a deleted Ticket, a created NFTokenOffer and three NFTokenPage nodes."
     }
   },
   "ledgers": [
