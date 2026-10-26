@@ -224,20 +224,19 @@ function offerNodesOf(meta: Json, nodes: readonly LedgerNode[]): OfferNode[] {
   return offers;
 }
 
-/** A blank event of an NFT, with the columns its id decodes to. */
-function blankEvent(nftId: string, event: NftEventName): ParsedNftEvent {
-  const decoded = decodeNFTokenId(nftId);
+/** A blank event of an NFT or a URIToken: every column at its absent value. */
+function bareEvent(nftId: string, event: NftEventName): ParsedNftEvent {
   return {
     nft_id: nftId,
     event_index: 0,
     kind: 'nftoken',
     event,
-    issuer: decoded.issuer,
-    taxon: decoded.taxon,
-    taxon_key: decoded.taxon,
-    serial: decoded.serial,
-    nft_flags: decoded.flags,
-    transfer_fee: decoded.transferFee,
+    issuer: '',
+    taxon: null,
+    taxon_key: 0,
+    serial: 0,
+    nft_flags: 0,
+    transfer_fee: 0,
     uri: '',
     digest: '',
     account: '',
@@ -257,15 +256,32 @@ function blankEvent(nftId: string, event: NftEventName): ParsedNftEvent {
   };
 }
 
+/** A blank event of an NFT, with the columns its id decodes to. */
+function blankEvent(nftId: string, event: NftEventName): ParsedNftEvent {
+  const decoded = decodeNFTokenId(nftId);
+  return {
+    ...bareEvent(nftId, event),
+    issuer: decoded.issuer,
+    taxon: decoded.taxon,
+    taxon_key: decoded.taxon,
+    serial: decoded.serial,
+    nft_flags: decoded.flags,
+    transfer_fee: decoded.transferFee,
+  };
+}
+
 const byNftId = (a: ParsedNftEvent, b: ParsedNftEvent): number =>
   a.nft_id < b.nft_id ? -1 : a.nft_id > b.nft_id ? 1 : 0;
 
-/** True when some node of the transaction is an `NFTokenPage` or an `NFTokenOffer`. */
+/** The ledger entries the parser reads: XRPL's NFTokens and their offers, Xahau's URITokens. */
+const NFT_ENTRY_TYPES: ReadonlySet<string> = new Set(['NFTokenPage', 'NFTokenOffer', 'URIToken']);
+
+/** True when some node of the transaction is an `NFTokenPage`, an `NFTokenOffer` or a `URIToken`. */
 function touchesNfts(meta: Json): boolean {
   const entries: readonly Json[] = meta.AffectedNodes ?? [];
   return entries.some((entry) => {
     const type = (entry?.CreatedNode ?? entry?.ModifiedNode ?? entry?.DeletedNode)?.LedgerEntryType;
-    return type === 'NFTokenPage' || type === 'NFTokenOffer';
+    return NFT_ENTRY_TYPES.has(type);
   });
 }
 
@@ -332,17 +348,138 @@ function settle(
   return sale;
 }
 
+/** A string field of a ledger entry, `''` when absent. */
+const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+
+/** The events of a transaction's `URIToken` nodes, by the lists `NftParser.parse` orders (spec §2.5). */
+interface UriTokenEvents {
+  /** Offers cancelled or removed, in the order of the nodes. */
+  removals: ParsedNftEvent[];
+  /** Mints, sales, transfers and burns. */
+  ownership: ParsedNftEvent[];
+  /** Offers created, in the order of the nodes. */
+  creations: ParsedNftEvent[];
+  skipped: number;
+}
+
 /**
- * The XRPL NFT events of a transaction (spec §2.1–2.3, §2.5): who has each NFT before and after (from the
- * `NFTokenPage` nodes of the transaction, over the union of them), and the `NFTokenOffer` nodes it created and deleted.
- * Successful transactions only; pure, and never writes to its input.
+ * The events of the `URIToken` nodes of a transaction (spec §2.4), from each node's diff and the transaction type:
+ * - created: a `mint` for the entry's `Owner`, and an `offer_create` when it has an `Amount`;
+ * - deleted: an `offer_removed` (`burn`) when it had an `Amount` (kept in its `FinalFields`), and a `burn` of its `Owner`;
+ * - `Owner` changed: in a `URITokenBuy`, the offer's `offer_removed` (`sale`) and a `sale` at the transaction's `Amount`;
+ *   otherwise (a `Remit`) a `transfer`, with an `offer_removed` (`transfer`) when its `Amount` was cleared with it;
+ * - same owner: the `Amount` cleared is an `offer_cancel`, and set or changed an `offer_create`.
+ * The entry's key is the id, and the offer's: a URIToken has one sell offer, in its own `Amount` and `Destination`, which
+ * the ledger drops from the entry when the offer ends, so a cleared offer is read from `PreviousFields`.
+ *
+ * An added field is not listed in `PreviousFields` (FINDINGS xahau 4): the `Amount` of a new sell offer is told only by
+ * the transaction type, since a `SetRemarks` of a token with an offer shows the same node. An `Amount` that was changed is
+ * listed with its old value, whatever the transaction. An MPT amount skips the event and counts it (spec §2.5).
+ */
+function uriTokenEvents(
+  meta: Json,
+  nodes: readonly LedgerNode[],
+  tx: Json,
+  sender: string,
+  ctx: ParseContext,
+): UriTokenEvents {
+  const out: UriTokenEvents = { removals: [], ownership: [], creations: [], skipped: 0 };
+  const isBuy = tx.TransactionType === 'URITokenBuy';
+  const setsOffer = tx.TransactionType === 'URITokenCreateSellOffer';
+
+  for (const node of nodes) {
+    if (node.type !== 'URIToken') continue;
+    const id = ledgerIndexOf(meta, node).toUpperCase();
+    const { fields, previous } = node;
+    const owner = text(fields.Owner);
+
+    /** The event of this token. */
+    const tokenEvent = (event: NftEventName): ParsedNftEvent => ({
+      ...bareEvent(id, event),
+      kind: 'uritoken',
+      issuer: text(fields.Issuer),
+      nft_flags: typeof fields.Flags === 'number' ? fields.Flags : 0,
+      digest: text(fields.Digest),
+    });
+    /** The offer event of its sell offer (`offered` holds the offer's `Amount` and `Destination`): `account` is the offer's owner. */
+    const offerEvent = (
+      event: NftEventName,
+      account: string,
+      offered: Json,
+      removedBy: OfferRemovedBy | '',
+    ): ParsedNftEvent | undefined => {
+      const priced = readAmount(offered.Amount, ctx);
+      if (!priced) {
+        out.skipped++;
+        return undefined;
+      }
+      return {
+        ...tokenEvent(event),
+        account,
+        offer_id: id,
+        is_sell_offer: 1,
+        ...priced,
+        destination: text(offered.Destination),
+        removed_by: removedBy,
+      };
+    };
+    const add = (list: ParsedNftEvent[], e: ParsedNftEvent | undefined): void => {
+      if (e) list.push(e);
+    };
+    // The offer the entry held before the transaction: what it still has, else what the transaction cleared.
+    const standing: Json = {
+      Amount: previous.Amount ?? fields.Amount,
+      Destination: previous.Destination ?? fields.Destination,
+    };
+
+    if (node.op === 'CreatedNode') {
+      out.ownership.push({ ...tokenEvent('mint'), account: sender, to_account: owner, uri: text(fields.URI) });
+      if (fields.Amount !== undefined) add(out.creations, offerEvent('offer_create', owner, fields, ''));
+    } else if (node.op === 'DeletedNode') {
+      if (fields.Amount !== undefined) add(out.removals, offerEvent('offer_removed', owner, standing, 'burn'));
+      out.ownership.push({ ...tokenEvent('burn'), account: sender, from_account: owner });
+    } else if (typeof previous.Owner === 'string' && previous.Owner !== owner) {
+      // The token changed hands: the offer it had (if its `Amount` was cleared) is the previous owner's.
+      if (previous.Amount !== undefined && fields.Amount === undefined) {
+        add(out.removals, offerEvent('offer_removed', previous.Owner, standing, isBuy ? 'sale' : 'transfer'));
+      }
+      const moved: ParsedNftEvent = {
+        ...tokenEvent(isBuy ? 'sale' : 'transfer'),
+        account: sender,
+        from_account: previous.Owner,
+        to_account: owner,
+      };
+      if (!isBuy) {
+        out.ownership.push(moved);
+      } else {
+        // The price is the transaction's Amount, paid to the seller; the sale is of the token's sell offer.
+        const price = readAmount(tx.Amount, ctx);
+        if (price) out.ownership.push({ ...moved, offer_id: id, is_sell_offer: 1, ...price });
+        else out.skipped++;
+      }
+    } else if (fields.Amount === undefined) {
+      if (previous.Amount !== undefined) add(out.removals, offerEvent('offer_cancel', owner, standing, ''));
+    } else if (previous.Amount !== undefined || setsOffer) {
+      add(out.creations, offerEvent('offer_create', owner, fields, ''));
+    }
+  }
+  return out;
+}
+
+/**
+ * The NFT events of a transaction: XRPL's (spec §2.1–2.3, §2.5), from who has each NFT before and after (the
+ * `NFTokenPage` nodes of the transaction, over the union of them) and the `NFTokenOffer` nodes it created and deleted,
+ * and Xahau's URIToken events (spec §2.4), from its `URIToken` nodes. No transaction has both. Successful transactions
+ * only; pure, and never writes to its input.
  */
 export class NftParser {
   parse(t: ParserTx, ctx: ParseContext): ParsedNft {
     if (t.meta.TransactionResult !== 'tesSUCCESS' || !touchesNfts(t.meta)) return { events: [], skipped: 0 };
     const nodes = ledgerNodes(t.meta);
     const sender = senderAccount(t.tx) ?? '';
-    let skipped = 0;
+    // A transaction has XRPL NFT nodes or URIToken nodes, never both: the lists below start with the URIToken events.
+    const uriTokens = uriTokenEvents(t.meta, nodes, t.tx, sender, ctx);
+    let skipped = uriTokens.skipped;
 
     const { before, after } = holdingsOf(t.meta, nodes);
     const offers = offerNodesOf(t.meta, nodes);
@@ -382,8 +519,8 @@ export class NftParser {
     };
 
     // The events that come first: offers cancelled or removed, in the order of the nodes.
-    const removals: ParsedNftEvent[] = [];
-    const creations: ParsedNftEvent[] = [];
+    const removals: ParsedNftEvent[] = uriTokens.removals;
+    const creations: ParsedNftEvent[] = uriTokens.creations;
     const removal = removalOf(t.tx.TransactionType);
     for (const offer of offers) {
       let e: ParsedNftEvent | undefined;
@@ -397,7 +534,7 @@ export class NftParser {
     }
 
     // The events of the NFTs themselves.
-    const ownership: ParsedNftEvent[] = [];
+    const ownership: ParsedNftEvent[] = uriTokens.ownership;
     for (const id of new Set([...before.keys(), ...after.keys()])) {
       const was = before.get(id);
       const now = after.get(id);

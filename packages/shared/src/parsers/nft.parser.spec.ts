@@ -1,8 +1,10 @@
 /**
- * NftParser (the XRPL half) over the recorded mainnet NFT cases (`test/fixtures/xrpl/nft`, README section "XRPL NFT
- * cases") and the synthetic cases below. A synthetic transaction is hand-made, never recorded: every one is named
- * `synthetic-…` and is a recorded transaction with a small, named edit of it, or (the first) built from the recorded
- * shapes of its nodes:
+ * NftParser over the recorded mainnet NFT cases (`test/fixtures/xrpl/nft`, README section "XRPL NFT cases"), the recorded
+ * Xahau URIToken cases (`test/fixtures/xahau/uritoken`, README section "Xahau URIToken cases") and the synthetic cases
+ * below. A synthetic transaction is hand-made, never recorded: every one is named `synthetic-…` and is a recorded
+ * transaction with a small, named edit of it, or (the first) built from the recorded shapes of its nodes.
+ *
+ * XRPL:
  *
  * - `synthetic-offer-removed-other` (not found on mainnet, FINDINGS "Not found"): an `AccountDelete` by the owner of the
  *   recorded `offer_cancel` offer, whose metadata deletes the account, its owner directory and that `NFTokenOffer`
@@ -33,13 +35,31 @@
  *   transfer fee of 49.999% on a price of 9999999999999999.
  * - `synthetic-brokered-issued`: `brokered_sale_royalty` priced in an issued currency, with the same fee and price and a
  *   broker fee of 1000000.
+ *
+ * Xahau (URITokens):
+ *
+ * - `synthetic-uritoken-mint-with-offer` (not found on Xahau, FINDINGS "Not found": no recorded `URITokenMint` carries an
+ *   `Amount` or a `Destination`): `uritoken_mint` whose transaction carries `Amount` 2.5 XAH and a `Destination`, and
+ *   whose created entry has both.
+ * - `synthetic-uritoken-cancel-with-destination`: `uritoken_sell_offer_cancel` whose entry also lost a `Destination`
+ *   (listed in its `PreviousFields`, as the cleared `Amount` is).
+ * - `synthetic-uritoken-relist`: `uritoken_sell_offer_create` over a standing offer: `PreviousFields` hold the old `Amount`
+ *   (1800 XAH) and the entry has a `Destination`.
+ * - `synthetic-uritoken-remit-two-tokens`: `remit_transfer` of a second URIToken, whose id sorts before the first and
+ *   whose node comes after it (the order of the removals is the node order, the transfers' is the id order).
+ * - `synthetic-uritoken-remit-no-offer`: `remit_transfer` of a token that had no sell offer (no `Amount` in `PreviousFields`).
+ * - `synthetic-uritoken-mpt-offer`, `synthetic-uritoken-mpt-buy`: a sell offer, and a buy of one, priced with an MPT amount.
+ * - `synthetic-uritoken-failed-mint`: `uritoken_mint` with a `tec` result and every node kept.
+ * - `synthetic-uritoken-lower-case-id`: `uritoken_mint` with the entry's key written in lower case.
  */
+import { BigNumber } from 'bignumber.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { decodeAccountID } from 'ripple-address-codec';
 import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { getNetworkProfile } from '../network';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import { dropsToNative } from '../util/amount';
 import {
   NFT_EVENTS,
   NFT_ROLES,
@@ -63,14 +83,39 @@ const XRPL: ParseContext = parseContextFor(getNetworkProfile('xrpl'));
 const parser = new NftParser();
 const parse = (t: ParserTx): ParsedNft => parser.parse(t, XRPL);
 
+const XAHAU_DIR = join(__dirname, '..', '..', 'test', 'fixtures', 'xahau', 'uritoken');
+const xahauManifest = JSON.parse(readFileSync(join(XAHAU_DIR, 'manifest.json'), 'utf8')) as {
+  cases: Record<string, { ledger: number; hash: string; burn?: { ledger: number; hash: string } }>;
+};
+const xahauSource = FixtureLedgerSource.fromDir(XAHAU_DIR);
+const XAHAU: ParseContext = parseContextFor(getNetworkProfile('xahau'));
+const parseXahau = (t: ParserTx): ParsedNft => parser.parse(t, XAHAU);
+
+/** The transaction `hash` of ledger `ledger` in `from`, deep-frozen. */
+async function transactionIn(
+  from: FixtureLedgerSource,
+  label: string,
+  ledger: number,
+  hash: string,
+): Promise<ParserTx> {
+  const l = await from.fetch(ledger);
+  const raw = l.transactions.find((t) => t.hash === hash);
+  if (!raw) throw new Error(`${label}: ${hash} is not in ledger ${ledger}`);
+  return deepFreeze(toParserTx(raw, l.header, null));
+}
+
 /** A recorded case by its manifest name, deep-frozen. */
 async function recorded(name: string): Promise<ParserTx> {
   const c = manifest.cases[name];
   if (!c) throw new Error(`no recorded case ${name}`);
-  const ledger = await source.fetch(c.ledger);
-  const raw = ledger.transactions.find((t) => t.hash === c.hash);
-  if (!raw) throw new Error(`${name}: ${c.hash} is not in ledger ${c.ledger}`);
-  return deepFreeze(toParserTx(raw, ledger.header, null));
+  return transactionIn(source, name, c.ledger, c.hash);
+}
+
+/** A recorded Xahau URIToken case by its manifest name, deep-frozen. */
+async function recordedUri(name: string): Promise<ParserTx> {
+  const c = xahauManifest.cases[name];
+  if (!c) throw new Error(`no recorded Xahau case ${name}`);
+  return transactionIn(xahauSource, name, c.ledger, c.hash);
 }
 
 /** A deep-frozen copy of `t` after `edit` changed (copies of) its transaction and metadata. */
@@ -853,13 +898,17 @@ const builders: Record<string, () => Promise<ParserTx>> = {
   },
 };
 
-/** The synthetic transactions, each with its name as its hash, so that none passes for the recorded one it came from. */
-const synthetic: Record<string, () => Promise<ParserTx>> = Object.fromEntries(
-  Object.entries(builders).map(([name, build]) => [
-    name,
-    async () => deepFreeze({ ...(await build()), hash: name.toUpperCase() }),
-  ]),
-);
+/** Each synthetic transaction with its name as its hash, so that none passes for the recorded one it came from. */
+const named = (made: Record<string, () => Promise<ParserTx>>): Record<string, () => Promise<ParserTx>> =>
+  Object.fromEntries(
+    Object.entries(made).map(([name, build]) => [
+      name,
+      async () => deepFreeze({ ...(await build()), hash: name.toUpperCase() }),
+    ]),
+  );
+
+/** The synthetic transactions of XRPL. */
+const synthetic = named(builders);
 
 describe('NftParser: synthetic cases', () => {
   it('every one is named synthetic-…', () => {
@@ -1270,5 +1319,693 @@ describe('NftParser: the event names', () => {
       'sale',
       'transfer',
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// URITokens (Xahau)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** What a URIToken's columns are, written down from the recorded transactions, not from the parser. */
+interface KnownUri {
+  id: string;
+  issuer: string;
+  flags: number;
+  digest: string;
+}
+
+const RODIN = 'rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb';
+const SELLER = 'r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS';
+const EVR = { currency: 'EVR', issuer: 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8' };
+const MPT_AMOUNT = { mpt_issuance_id: '0000012FFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47', value: '100' };
+
+const URI_TOKENS = {
+  minted: {
+    id: 'E87FD7E7FDACFA2CE1DC37AD805A7295F84459D4911EAC79160F0D9E34BB6520',
+    issuer: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+    flags: 1,
+    digest: '',
+  },
+  listed: {
+    id: '35B8D52858E0463C0F0FCCC73EFBE1D308F0AF71112035C4D45777EB9115E93D',
+    issuer: RODIN,
+    flags: 0,
+    digest: 'A2C481BA71113364B53DA2C523047F18E97CEBD68D6E487D6F3801AB46075307',
+  },
+  cancelled: {
+    id: '335AD14EDA481A2B0BB89F792EF6D137A48010DF29D4F90B8BD9B18DF6994FC8',
+    issuer: RODIN,
+    flags: 0,
+    digest: '696795A3F27CBB294F55C43BDBB2DC43B02E386E5325DED66A6EEE8E7D29CBDD',
+  },
+  bought: {
+    id: '9613336614047483F3AEC00173139D88FE9BA70720CAC2B46E12711A71A9AAE9',
+    issuer: RODIN,
+    flags: 0,
+    digest: '772B38763E8E603AEE9BBB2026B8E9B97537ECC8867E46D042630C0B326B8736',
+  },
+  boughtForEvr: {
+    id: '494E26BE7766A7DB12912C51055C0106DA39401BF2E60E86611FD00E48CDE99F',
+    issuer: 'rNk6oeGA4BKsCraCEMg2g5YkbegcXFtPGV',
+    flags: 1,
+    digest: '',
+  },
+  burned: {
+    id: 'F636CA189EF358200F80EE78744EB5876224B2F0A8F3DC97BC36A325DA4D3C46',
+    issuer: 'r4gUH2cjAfXGFTBUXBnspYWpj4nprzgQgH',
+    flags: 1,
+    digest: '',
+  },
+  burnedByIssuer: {
+    id: 'AB9EB74AAAF6437F3E368A312E3432D8D7BF548A997D1378186FB371178E40DF',
+    issuer: 'rKXEKqg6V3rtiZZiJ97zHkm9Due5xrtRhW',
+    flags: 1,
+    digest: '',
+  },
+  remitted: {
+    id: 'D615854CB2571F4F2EB1F0B23944996187519BCC5CA4CB700C692917A76200A9',
+    issuer: RODIN,
+    flags: 0,
+    digest: '41544176331C26CE3F6BCCED2AD05EF61FCCC89D35A150DAB6E16648DFE882A3',
+  },
+  remitMinted: {
+    id: '099E410166351A8C94AE6D76154CBF301C609282EAE659C1BF08AF46936867BF',
+    issuer: RODIN,
+    flags: 0,
+    digest: 'DEFF6B5B0509266F4730849715FD58A84FA258C08A93E5C3D6E060710FD1BE44',
+  },
+  reminted: {
+    id: 'E5ECD96D609E8E7C29C967D3D2FA542AE58FC9A05B9C4EAE7BFF608A7D0306A2',
+    issuer: 'r4k1jdyThSDbPwbNrpiuqNCoRJ61y9N4Wj',
+    flags: 1,
+    digest: '',
+  },
+} satisfies Record<string, KnownUri>;
+
+/** A URIToken event with every column at its absent value, the token's columns and `fields` on top. */
+function uev(
+  token: KnownUri,
+  event_index: number,
+  event: NftEventName,
+  fields: Partial<ParsedNftEvent>,
+): ParsedNftEvent {
+  return {
+    nft_id: token.id,
+    event_index,
+    kind: 'uritoken',
+    event,
+    issuer: token.issuer,
+    taxon: null,
+    taxon_key: 0,
+    serial: 0,
+    nft_flags: token.flags,
+    transfer_fee: 0,
+    uri: '',
+    digest: token.digest,
+    account: '',
+    from_account: '',
+    to_account: '',
+    offer_id: '',
+    is_sell_offer: 0,
+    amount: '',
+    currency: '',
+    amount_issuer: '',
+    destination: '',
+    expiration: null,
+    broker: '',
+    broker_fee: '',
+    royalty_est: '',
+    removed_by: '',
+    ...fields,
+  };
+}
+
+/** The events of a Xahau transaction. */
+const xahauEventsOf = (t: ParserTx): ParsedNftEvent[] => parseXahau(t).events;
+
+/** The body of the `n`th `URIToken` node of the metadata. */
+function uriBody(meta: Json, n = 0): Json {
+  const bodies = (meta.AffectedNodes as Json[]).map((wrapper) => wrapper[Object.keys(wrapper)[0]]);
+  return bodies.filter((b) => b.LedgerEntryType === 'URIToken')[n];
+}
+
+/** What a recorded amount is as event text: drops of XAH in whole units, or an issued amount's value. */
+const amountText = (amount: unknown): string =>
+  typeof amount === 'string' ? dropsToNative(amount) : new BigNumber((amount as Json).value).toFixed();
+
+describe('NftParser: recorded Xahau URIToken cases', () => {
+  it('uritoken_mint: one mint, by the issuer to itself, with the URI and the entry’s flags', async () => {
+    const t = await recordedUri('uritoken_mint');
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.minted, 0, 'mint', {
+          account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          to_account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          uri: t.tx.URI,
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('uritoken_sell_offer_create: an offer_create of the owner at the transaction’s price, naming the URIToken', async () => {
+    expect(parseXahau(await recordedUri('uritoken_sell_offer_create'))).toEqual({
+      events: [
+        uev(URI_TOKENS.listed, 0, 'offer_create', {
+          account: SELLER,
+          offer_id: URI_TOKENS.listed.id,
+          is_sell_offer: 1,
+          amount: '2200',
+          currency: 'XAH',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('uritoken_sell_offer_cancel: an offer_cancel of the owner, at the amount the entry lost', async () => {
+    expect(parseXahau(await recordedUri('uritoken_sell_offer_cancel'))).toEqual({
+      events: [
+        uev(URI_TOKENS.cancelled, 0, 'offer_cancel', {
+          account: SELLER,
+          offer_id: URI_TOKENS.cancelled.id,
+          is_sell_offer: 1,
+          amount: '1800',
+          currency: 'XAH',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('uritoken_buy_above_ask: the offer removed by the sale, then the sale at the transaction’s Amount, which the seller received', async () => {
+    const t = await recordedUri('uritoken_buy_above_ask');
+    const { events, skipped } = parseXahau(t);
+    expect({ events, skipped }).toEqual({
+      events: [
+        uev(URI_TOKENS.bought, 0, 'offer_removed', {
+          account: SELLER,
+          offer_id: URI_TOKENS.bought.id,
+          is_sell_offer: 1,
+          amount: '4200',
+          currency: 'XAH',
+          removed_by: 'sale',
+        }),
+        uev(URI_TOKENS.bought, 1, 'sale', {
+          account: 'rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg',
+          from_account: SELLER,
+          to_account: 'rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg',
+          offer_id: URI_TOKENS.bought.id,
+          is_sell_offer: 1,
+          amount: '4200',
+          currency: 'XAH',
+        }),
+      ],
+      skipped: 0,
+    });
+    // FINDINGS 2: the price is the transaction's Amount, and it is what the seller's balance rose by.
+    expect(events[1].amount).toBe(amountText(t.tx.Amount));
+    const seller = (t.meta.AffectedNodes as Json[])
+      .map((wrapper) => wrapper[Object.keys(wrapper)[0]])
+      .find((b) => b.LedgerEntryType === 'AccountRoot' && b.FinalFields.Account === SELLER);
+    const gained = new BigNumber(seller.FinalFields.Balance).minus(seller.PreviousFields.Balance);
+    expect(events[1].amount).toBe(dropsToNative(gained.toFixed()));
+  });
+
+  it('uritoken_burn_with_offer: the standing offer removed by the burn, in its own currency, then the burn', async () => {
+    expect(parseXahau(await recordedUri('uritoken_burn_with_offer'))).toEqual({
+      events: [
+        uev(URI_TOKENS.burned, 0, 'offer_removed', {
+          account: 'r4gUH2cjAfXGFTBUXBnspYWpj4nprzgQgH',
+          offer_id: URI_TOKENS.burned.id,
+          is_sell_offer: 1,
+          amount: '0.0001',
+          currency: EVR.currency,
+          amount_issuer: EVR.issuer,
+          removed_by: 'burn',
+        }),
+        uev(URI_TOKENS.burned, 1, 'burn', {
+          account: 'r4gUH2cjAfXGFTBUXBnspYWpj4nprzgQgH',
+          from_account: 'r4gUH2cjAfXGFTBUXBnspYWpj4nprzgQgH',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('remit_transfer: a transfer per id of URITokenIDs, and the offer the Remit cleared removed by transfer first', async () => {
+    const t = await recordedUri('remit_transfer');
+    const { events, skipped } = parseXahau(t);
+    expect({ events, skipped }).toEqual({
+      events: [
+        uev(URI_TOKENS.remitted, 0, 'offer_removed', {
+          account: SELLER,
+          offer_id: URI_TOKENS.remitted.id,
+          is_sell_offer: 1,
+          amount: '3350',
+          currency: 'XAH',
+          removed_by: 'transfer',
+        }),
+        uev(URI_TOKENS.remitted, 1, 'transfer', {
+          account: SELLER,
+          from_account: SELLER,
+          to_account: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp',
+        }),
+      ],
+      skipped: 0,
+    });
+    expect(events.filter((e) => e.event === 'transfer').map((e) => e.nft_id)).toEqual(t.tx.URITokenIDs);
+    // A Remit's Destination is the new owner, and its payments (Amounts) are not the price of anything.
+    expect(t.tx.Destination).toBe(events[1].to_account);
+    expect(events.some((e) => e.event === 'sale')).toBe(false);
+  });
+
+  it('remit_mint: the Remit’s MintURIToken is a mint for the destination, by the sender who issues it', async () => {
+    const t = await recordedUri('remit_mint');
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.remitMinted, 0, 'mint', {
+          account: RODIN,
+          to_account: SELLER,
+          uri: t.tx.MintURIToken.URI,
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('a burn and a re-mint of the same id are two lives of one URIToken', async () => {
+    const mint = await recordedUri('uritoken_remint');
+    const link = xahauManifest.cases.uritoken_remint.burn;
+    if (!link) throw new Error('uritoken_remint has no burn in the manifest');
+    const burn = await transactionIn(xahauSource, 'uritoken_remint burn', link.ledger, link.hash);
+    const owner = 'r4k1jdyThSDbPwbNrpiuqNCoRJ61y9N4Wj';
+    expect(burn.ledger_index).toBeLessThan(mint.ledger_index);
+    expect(parseXahau(burn)).toEqual({
+      events: [uev(URI_TOKENS.reminted, 0, 'burn', { account: owner, from_account: owner })],
+      skipped: 0,
+    });
+    expect(parseXahau(mint)).toEqual({
+      events: [uev(URI_TOKENS.reminted, 0, 'mint', { account: owner, to_account: owner, uri: mint.tx.URI })],
+      skipped: 0,
+    });
+    expect(xahauEventsOf(burn)[0].nft_id).toBe(xahauEventsOf(mint)[0].nft_id);
+  });
+
+  it('a buy in an issued currency (Evernode, ledger 26763618, the burn’s of uritoken_remint): the price is that amount, and the seller is the issuer', async () => {
+    const t = await transactionIn(
+      xahauSource,
+      'evernode buy',
+      26763618,
+      '30B0FE015F9CE2BACE93D95385CD8EA70AD68EB4B6380655C6352FBF1B5897D6',
+    );
+    const buyer = 'r9fT9gsDG4Zyodz9E2U6RG4Z3e4RD7tBa';
+    const priced = { amount: '0.0011', currency: EVR.currency, amount_issuer: EVR.issuer };
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.boughtForEvr, 0, 'offer_removed', {
+          account: URI_TOKENS.boughtForEvr.issuer,
+          offer_id: URI_TOKENS.boughtForEvr.id,
+          is_sell_offer: 1,
+          removed_by: 'sale',
+          ...priced,
+        }),
+        uev(URI_TOKENS.boughtForEvr, 1, 'sale', {
+          account: buyer,
+          from_account: URI_TOKENS.boughtForEvr.issuer,
+          to_account: buyer,
+          offer_id: URI_TOKENS.boughtForEvr.id,
+          is_sell_offer: 1,
+          ...priced,
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('a burn by the issuer of a token another account owns: from_account is the owner, account the sender (ledger 26763618)', async () => {
+    const t = await transactionIn(
+      xahauSource,
+      'burn by the issuer',
+      26763618,
+      '82BF1D1E762335802A0552A13414904B3350FA2CD1404D10A64763BF6B183BBA',
+    );
+    const { events } = parseXahau(t);
+    expect(events).toEqual([
+      uev(URI_TOKENS.burnedByIssuer, 0, 'burn', {
+        account: 'rKXEKqg6V3rtiZZiJ97zHkm9Due5xrtRhW',
+        from_account: 'rLn3CeVysKVcrW1VSaiK5GCwxRm1FDXTN3',
+      }),
+    ]);
+    expect([...rolesOf(events[0])]).toEqual([
+      ['rKXEKqg6V3rtiZZiJ97zHkm9Due5xrtRhW', ['issuer']],
+      ['rLn3CeVysKVcrW1VSaiK5GCwxRm1FDXTN3', ['from']],
+    ]);
+  });
+
+  it('a SetRemarks that touches a URIToken changes neither its owner nor its offer, and gives no event (recorded in the ledger of remit_mint)', async () => {
+    const ledger = await xahauSource.fetch(xahauManifest.cases.remit_mint.ledger);
+    const raw = ledger.transactions.find((t) => t.tx.TransactionType === 'SetRemarks');
+    if (!raw) throw new Error('no SetRemarks in the ledger of remit_mint');
+    const t = deepFreeze(toParserTx(raw, ledger.header, null));
+    // It does touch a URIToken that has an owner and no offer.
+    expect(uriBody(t.meta as Json).FinalFields).toMatchObject({ Owner: SELLER });
+    expect(uriBody(t.meta as Json).FinalFields.Amount).toBeUndefined();
+    expect(parseXahau(t)).toEqual({ events: [], skipped: 0 });
+    // The same entry with a standing offer (Amount in its FinalFields, none in its PreviousFields) is no offer_create either.
+    const offered = variant(t, (_tx, meta) => {
+      uriBody(meta).FinalFields.Amount = '2200000000';
+    });
+    expect(parseXahau(offered)).toEqual({ events: [], skipped: 0 });
+  });
+});
+
+/** The builders of the synthetic Xahau transactions of the header, by name. */
+const uriBuilders: Record<string, () => Promise<ParserTx>> = {
+  'synthetic-uritoken-mint-with-offer': async () =>
+    variant(await recordedUri('uritoken_mint'), (tx, meta) => {
+      tx.Amount = '2500000';
+      tx.Destination = 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp';
+      Object.assign(uriBody(meta).NewFields, { Amount: '2500000', Destination: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp' });
+    }),
+  'synthetic-uritoken-cancel-with-destination': async () =>
+    variant(await recordedUri('uritoken_sell_offer_cancel'), (_tx, meta) => {
+      uriBody(meta).PreviousFields.Destination = 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp';
+    }),
+  'synthetic-uritoken-relist': async () =>
+    variant(await recordedUri('uritoken_sell_offer_create'), (_tx, meta) => {
+      const node = uriBody(meta);
+      node.PreviousFields.Amount = '1800000000';
+      node.FinalFields.Destination = 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp';
+    }),
+  'synthetic-uritoken-remit-two-tokens': async () =>
+    variant(await recordedUri('remit_transfer'), (tx, meta) => {
+      const first = (meta.AffectedNodes as Json[]).find((w) => w.ModifiedNode?.LedgerEntryType === 'URIToken') as Json;
+      const second = structuredClone(first);
+      // The second token's id sorts before the first's, and its node comes after the first's.
+      second.ModifiedNode.LedgerIndex = `${'0'.repeat(63)}1`;
+      second.ModifiedNode.PreviousFields.Amount = '1000000';
+      meta.AffectedNodes.push(second);
+      tx.URITokenIDs.push(second.ModifiedNode.LedgerIndex);
+    }),
+  'synthetic-uritoken-remit-no-offer': async () =>
+    variant(await recordedUri('remit_transfer'), (_tx, meta) => {
+      delete uriBody(meta).PreviousFields.Amount;
+    }),
+  'synthetic-uritoken-mpt-offer': async () =>
+    variant(await recordedUri('uritoken_sell_offer_create'), (tx, meta) => {
+      tx.Amount = MPT_AMOUNT;
+      uriBody(meta).FinalFields.Amount = MPT_AMOUNT;
+    }),
+  'synthetic-uritoken-mpt-buy': async () =>
+    variant(await recordedUri('uritoken_buy_above_ask'), (tx, meta) => {
+      tx.Amount = MPT_AMOUNT;
+      uriBody(meta).PreviousFields.Amount = MPT_AMOUNT;
+    }),
+  'synthetic-uritoken-failed-mint': async () =>
+    variant(await recordedUri('uritoken_mint'), (_tx, meta) => {
+      meta.TransactionResult = 'tecINSUFFICIENT_RESERVE';
+    }),
+  'synthetic-uritoken-lower-case-id': async () =>
+    replaced(await recordedUri('uritoken_mint'), URI_TOKENS.minted.id, URI_TOKENS.minted.id.toLowerCase()),
+};
+
+/** The synthetic transactions of Xahau. */
+const uriSynthetic = named(uriBuilders);
+
+describe('NftParser: synthetic Xahau URIToken cases', () => {
+  it('every one is named synthetic-…', () => {
+    expect(Object.keys(uriSynthetic).length).toBeGreaterThan(0);
+    for (const name of Object.keys(uriSynthetic)) expect(name).toMatch(/^synthetic-/);
+  });
+
+  it('synthetic-uritoken-mint-with-offer: the mint, then its offer with the amount and the destination (none is recorded on Xahau)', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-mint-with-offer']();
+    expect(t.tx.Amount).toBe('2500000');
+    expect(t.hash).toBe('SYNTHETIC-URITOKEN-MINT-WITH-OFFER');
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.minted, 0, 'mint', {
+          account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          to_account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          uri: t.tx.URI,
+        }),
+        uev(URI_TOKENS.minted, 1, 'offer_create', {
+          account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          offer_id: URI_TOKENS.minted.id,
+          is_sell_offer: 1,
+          amount: '2.5',
+          currency: 'XAH',
+          destination: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('synthetic-uritoken-cancel-with-destination: the cancelled offer keeps the destination the entry lost with its Amount', async () => {
+    const [cancel] = xahauEventsOf(await uriSynthetic['synthetic-uritoken-cancel-with-destination']());
+    expect(cancel).toEqual(
+      uev(URI_TOKENS.cancelled, 0, 'offer_cancel', {
+        account: SELLER,
+        offer_id: URI_TOKENS.cancelled.id,
+        is_sell_offer: 1,
+        amount: '1800',
+        currency: 'XAH',
+        destination: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp',
+      }),
+    );
+  });
+
+  it('synthetic-uritoken-relist: an Amount that changed on the same owner is an offer_create at the new amount, with its destination', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-relist']();
+    expect(uriBody(t.meta as Json).PreviousFields).toEqual({ Amount: '1800000000' });
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.listed, 0, 'offer_create', {
+          account: SELLER,
+          offer_id: URI_TOKENS.listed.id,
+          is_sell_offer: 1,
+          amount: '2200',
+          currency: 'XAH',
+          destination: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('synthetic-uritoken-remit-two-tokens: removals in node order, then a transfer per token by id', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-remit-two-tokens']();
+    const second = { ...URI_TOKENS.remitted, id: `${'0'.repeat(63)}1` };
+    expect(t.tx.URITokenIDs).toEqual([URI_TOKENS.remitted.id, second.id]);
+    const move = { account: SELLER, from_account: SELLER, to_account: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp' };
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.remitted, 0, 'offer_removed', {
+          account: SELLER,
+          offer_id: URI_TOKENS.remitted.id,
+          is_sell_offer: 1,
+          amount: '3350',
+          currency: 'XAH',
+          removed_by: 'transfer',
+        }),
+        uev(second, 1, 'offer_removed', {
+          account: SELLER,
+          offer_id: second.id,
+          is_sell_offer: 1,
+          amount: '1',
+          currency: 'XAH',
+          removed_by: 'transfer',
+        }),
+        uev(second, 2, 'transfer', move),
+        uev(URI_TOKENS.remitted, 3, 'transfer', move),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('synthetic-uritoken-remit-no-offer: a token that had no offer is only transferred, and nothing is removed or skipped', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-remit-no-offer']();
+    expect(uriBody(t.meta as Json).PreviousFields).toEqual({ Owner: SELLER });
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.remitted, 0, 'transfer', {
+          account: SELLER,
+          from_account: SELLER,
+          to_account: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('an MPT amount skips the event and counts it (synthetic-uritoken-mpt-offer, synthetic-uritoken-mpt-buy)', async () => {
+    // A sell offer priced in an MPT: no event, one skipped.
+    expect(parseXahau(await uriSynthetic['synthetic-uritoken-mpt-offer']())).toEqual({ events: [], skipped: 1 });
+    // A buy priced in an MPT: the offer's removal and the sale are each skipped, and the token's move is no event.
+    expect(parseXahau(await uriSynthetic['synthetic-uritoken-mpt-buy']())).toEqual({ events: [], skipped: 2 });
+  });
+
+  it('a transaction that failed gives no event (synthetic-uritoken-failed-mint)', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-failed-mint']();
+    expect(t.meta.TransactionResult).toBe('tecINSUFFICIENT_RESERVE');
+    expect(uriBody(t.meta as Json).LedgerEntryType).toBe('URIToken');
+    expect(parseXahau(t)).toEqual({ events: [], skipped: 0 });
+  });
+
+  it('writes an id as 64 upper-case hex digits, whatever case the ledger had it in (synthetic-uritoken-lower-case-id)', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-lower-case-id']();
+    expect(JSON.stringify(t.meta)).toContain(URI_TOKENS.minted.id.toLowerCase());
+    expect(parseXahau(t).events.map((e) => e.nft_id)).toEqual([URI_TOKENS.minted.id]);
+  });
+});
+
+describe('NftParser: URITokens, rules over all cases', () => {
+  /** Every recorded Xahau case, its burn, and every synthetic one, loaded fresh and deep-frozen. */
+  async function everyUriCase(): Promise<[string, ParserTx][]> {
+    const link = xahauManifest.cases.uritoken_remint.burn as { ledger: number; hash: string };
+    return [
+      ...(await Promise.all(
+        Object.keys(xahauManifest.cases).map(
+          async (name): Promise<[string, ParserTx]> => [name, await recordedUri(name)],
+        ),
+      )),
+      ['uritoken_remint burn', await transactionIn(xahauSource, 'uritoken_remint burn', link.ledger, link.hash)],
+      ...(await Promise.all(
+        Object.entries(uriSynthetic).map(async ([name, build]): Promise<[string, ParserTx]> => [name, await build()]),
+      )),
+    ];
+  }
+
+  it('never writes to its input', async () => {
+    for (const [name, t] of await everyUriCase()) {
+      const snapshot = structuredClone(t);
+      expect(Object.isFrozen(t.meta)).toBe(true);
+      expect(() => parseXahau(t)).not.toThrow();
+      expect({ name, t }).toEqual({ name, t: snapshot });
+    }
+  });
+
+  it('numbers the events of a transaction from 0, each once', async () => {
+    let checked = 0;
+    for (const [, t] of await everyUriCase()) {
+      const { events } = parseXahau(t);
+      expect(events.map((e) => e.event_index)).toEqual(events.map((_, i) => i));
+      checked += events.length;
+    }
+    expect(checked).toBeGreaterThan(20);
+  });
+
+  it('gives a URIToken no taxon, serial or transfer fee, its issuer, flags and digest, and the id of its entry', async () => {
+    for (const [, t] of await everyUriCase()) {
+      for (const e of parseXahau(t).events) {
+        expect(e.nft_id).toMatch(/^[0-9A-F]{64}$/);
+        expect(NFT_EVENTS).toContain(e.event);
+        expect(e).toMatchObject({ kind: 'uritoken', taxon: null, taxon_key: 0, serial: 0, transfer_fee: 0 });
+        expect(e.royalty_est).toBe('');
+        expect(e.expiration).toBeNull();
+        expect(e.broker).toBe('');
+        // The offers of a URIToken are its sell offer: they name the token's id.
+        if (['offer_create', 'offer_cancel', 'offer_removed', 'sale'].includes(e.event)) {
+          expect(e.offer_id).toBe(e.nft_id);
+          expect(e.is_sell_offer).toBe(1);
+        } else {
+          expect(e.offer_id).toBe('');
+          expect(e.is_sell_offer).toBe(0);
+        }
+        expect(e.uri === '' || e.event === 'mint').toBe(true);
+        expect(e.removed_by === '' || e.event === 'offer_removed').toBe(true);
+      }
+    }
+  });
+
+  it('gives each URIToken and Remit transaction of the recorded ledgers its events, and every other transaction none', async () => {
+    const counts: Record<string, number> = {};
+    for (const ledger of xahauSource.list()) {
+      for (const raw of ledger.transactions) {
+        const t = deepFreeze(toParserTx(raw, ledger.header, null));
+        const type = t.tx.TransactionType as string;
+        const { events, skipped } = parseXahau(t);
+        const names = events.map((e) => e.event);
+        const of = (name: string) => events.filter((e) => e.event === name);
+        expect(skipped).toBe(0);
+        counts[type] = (counts[type] ?? 0) + (t.meta.TransactionResult === 'tesSUCCESS' ? 1 : 0);
+        if (t.meta.TransactionResult !== 'tesSUCCESS' || !(type.startsWith('URIToken') || type === 'Remit')) {
+          expect(names).toEqual([]);
+        } else if (type === 'URITokenMint') {
+          expect(names.filter((n) => n !== 'offer_create')).toEqual(['mint']);
+          expect(of('offer_create')).toHaveLength(t.tx.Amount === undefined ? 0 : 1);
+          expect(names[0]).toBe('mint');
+          expect(events[0]).toMatchObject({ account: t.tx.Account, issuer: t.tx.Account, to_account: t.tx.Account });
+        } else if (type === 'URITokenBurn') {
+          expect(of('burn').map((e) => e.nft_id)).toEqual([t.tx.URITokenID]);
+          expect(of('offer_removed').every((e) => e.removed_by === 'burn')).toBe(true);
+          expect(last(names)).toBe('burn');
+          expect(last(events).account).toBe(t.tx.Account);
+        } else if (type === 'URITokenBuy') {
+          expect(names).toEqual(['offer_removed', 'sale']);
+          expect(of('offer_removed')[0].removed_by).toBe('sale');
+          expect(of('sale')[0]).toMatchObject({
+            nft_id: t.tx.URITokenID,
+            account: t.tx.Account,
+            to_account: t.tx.Account,
+          });
+          expect(of('sale')[0].amount).toBe(amountText(t.tx.Amount));
+        } else if (type === 'URITokenCreateSellOffer') {
+          expect(names).toEqual(['offer_create']);
+          expect(events[0]).toMatchObject({ nft_id: t.tx.URITokenID, account: t.tx.Account });
+          expect(events[0].amount).toBe(amountText(t.tx.Amount));
+        } else if (type === 'URITokenCancelSellOffer') {
+          expect(names).toEqual(['offer_cancel']);
+          expect(events[0]).toMatchObject({ nft_id: t.tx.URITokenID, account: t.tx.Account });
+        } else if (type === 'Remit') {
+          expect(of('transfer').map((e) => e.nft_id)).toEqual([...(t.tx.URITokenIDs ?? [])].sort());
+          expect(of('mint')).toHaveLength(t.tx.MintURIToken === undefined ? 0 : 1);
+          expect(of('offer_removed').every((e) => e.removed_by === 'transfer')).toBe(true);
+          expect(of('sale')).toEqual([]);
+        }
+      }
+    }
+    // The recorded ledgers' successful URIToken transactions are all seen, and a Remit that moves no URIToken gives none.
+    expect(counts).toMatchObject({
+      URITokenMint: 7,
+      URITokenBurn: 8,
+      URITokenBuy: 2,
+      URITokenCreateSellOffer: 2,
+      URITokenCancelSellOffer: 1,
+      Remit: 3,
+      SetRemarks: 1,
+    });
+  });
+});
+
+describe('rolesOf: URITokens', () => {
+  const entries = (e: ParsedNftEvent) => [...rolesOf(e)];
+
+  it('a sale: the issuer, the seller and the buyer; a Remit’s mint: the issuer and the new owner', async () => {
+    const sale = xahauEventsOf(await recordedUri('uritoken_buy_above_ask')).find(
+      (e) => e.event === 'sale',
+    ) as ParsedNftEvent;
+    expect(entries(sale)).toEqual([
+      [RODIN, ['issuer']],
+      [SELLER, ['from']],
+      ['rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg', ['to']],
+    ]);
+    const [mint] = xahauEventsOf(await recordedUri('remit_mint'));
+    expect(entries(mint)).toEqual([
+      [RODIN, ['issuer']],
+      [SELLER, ['to']],
+    ]);
+  });
+
+  it('an offer of a URIToken: its owner, and the destination of an offer that has one (synthetic-uritoken-mint-with-offer)', async () => {
+    const [, offer] = xahauEventsOf(await uriSynthetic['synthetic-uritoken-mint-with-offer']());
+    expect(entries(offer)).toEqual([
+      ['rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E', ['offer_owner']],
+      ['rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp', ['destination']],
+    ]);
+    const [cancel] = xahauEventsOf(await recordedUri('uritoken_sell_offer_cancel'));
+    expect(entries(cancel)).toEqual([[SELLER, ['offer_owner']]]);
   });
 });
