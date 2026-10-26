@@ -9,8 +9,8 @@ finding), the implementer and reviewer instructions, the helper script and the p
 
 | Repository | Branch | Base | State |
 |---|---|---|---|
-| GateHubNet/data-api | `feat/explorer-data-2` (pushed) | `feat/account-investigation-data` (the owner's PR #20) | D-env done (8a0f648..5294876); D3 started |
-| GateHubNet/explorer | `feat/explorer-pages-2` (NOT pushed yet: needs a token with `workflow` scope, see below) | `master` | E7 done (6ed915b..49634e6) |
+| GateHubNet/data-api | `feat/explorer-data-2` (pushed) | `feat/account-investigation-data` (the owner's PR #20) | D-env done (8a0f648..5294876); D3 Task 1 at ed8edd3 |
+| GateHubNet/explorer | `feat/explorer-pages-2` (pushed) | `master` | E7 done (6ed915b..49634e6) |
 
 Specs and plans:
 - Overview: explorer `docs/superpowers/specs/2026-10-24-explorer-program-2-overview.md` (sub-projects, build order, cross-cutting decisions).
@@ -24,13 +24,17 @@ Specs and plans:
 
 ## Where the run stopped (2026-10-26)
 
-- Data API: D3 (NFTs) Task 1 "NFT fixtures and findings" is committed (a82875a, pushed); its task review was dispatched just
-  before the move. Re-run that review in the cloud (BASE 5294876, HEAD a82875a) if its result is not in the ledger, then continue
-  with Task 2. The pre-flight rulings C1 to C11 in ledgers/data-api/2026-10-17-nft-data/progress.md apply.
-- Subagents can no longer write report files (the harness refuses them): implementers and reviewers return their report as text
-  and the controller saves it as task-N-report.md (kit/IMPLEMENTER.md says so). The two FINDINGS.md fixture files were written by
-  the controller from the implementer text, with the owner approval.
-- Explorer: waiting. E8 (NFT pages) starts when D3 is complete: its Task 1 runs DATA_API_REPO=<data-api checkout> pnpm api:sync.
+- Data API: D3 (NFTs) Task 1 "NFT fixtures and findings" is committed (a82875a) and its review came back "needs fixes".
+  The controller ruled on the one Important finding: `offer_removed_other` stays Not found after 19,955 ledgers, and Task 4 builds
+  the synthetic transaction. Fix round 1 (the minors) is committed as ed8edd3 and pushed. Its scoped re-review (a82875a..ed8edd3,
+  `kit/REVIEWER.md` re-review mode, against `task-1-review.md`) has NOT run yet: run it first. When it is clean, write
+  `Task 1: complete (commits a82875a..ed8edd3, review clean)` and continue with Task 2. The pre-flight rulings C1 to C11 and the
+  Task 1 rulings in ledgers/data-api/2026-10-17-nft-data/progress.md apply. Carry the ledger's "Note for Tasks 3/4 dispatch" into
+  those dispatches.
+- Subagents can no longer write report files (the harness refuses them, FINDINGS.md included). Implementers and reviewers return
+  their report as text, and the controller saves it as task-N-report.md (kit/IMPLEMENTER.md says so). The controller writes or
+  corrects FINDINGS.md files itself (owner approval, 2026-10-26).
+- Explorer: waiting. E8 (NFT pages) starts when D3 is complete; its Task 1 runs DATA_API_REPO=<data-api checkout> pnpm api:sync.
 - Next, in order: data API D3, D4, D5, D6, D7, D8, D9; explorer E8 to E14, each En after its Dn.
 - Then: a whole-branch review per plan (done for D-env and E7), and at the end PRs (one per sub-project, stacked) for the owner.
 
