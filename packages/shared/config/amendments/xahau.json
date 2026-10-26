@@ -1,6 +1,6 @@
 {
   "network": "xahau",
-  "updated": "2026-10-25",
+  "updated": "2026-10-26",
   "amendments": [
     { "name": "AMM", "obsolete": true },
     { "name": "AMMClawback", "obsolete": true },
@@ -206,7 +206,7 @@
     { "name": "TickSize", "retired": true },
     { "name": "Touch", "introduced": "2025.5.1", "enabled": { "ledger_index": 14259201, "date": "2025-05-18" } },
     { "name": "TrustSetAuth", "retired": true },
-    { "name": "URIToken" },
+    { "name": "URIToken", "enabled": { "ledger_index": 1, "date": "2023-10-30" } },
     { "name": "XahauGenesis", "enabled": { "ledger_index": 3, "date": "2023-10-30" } },
     { "name": "XChainBridge", "obsolete": true },
     { "name": "XRPFees" },

@@ -601,6 +601,14 @@ describe('loadAmendmentsConfig', () => {
       for (const name of RETIRED) expect(config.byName.get(name)?.enabled).toBeUndefined();
     });
 
+    it('the shipped xahau.json has URIToken enabled at ledger 1', () => {
+      // Task 1's FINDINGS (xahau/uritoken): ledger 1 is the first ledger of xahau.network and its Amendments object lists URIToken
+      expect(loadAmendmentsConfig(XAHAU).byName.get('URIToken')?.enabled).toEqual({
+        ledger_index: 1,
+        date: '2023-10-30',
+      });
+    });
+
     it('Xahau: dates its own amendments by xahaud release', () => {
       expect(loadAmendmentsConfig(XAHAU).byName.get('Remit')).toMatchObject({
         introduced: '2024.3.12',

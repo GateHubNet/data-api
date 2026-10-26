@@ -39,6 +39,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultDatabase: 'xrpl',
       defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
       partialPaymentFixLedger: 4594094,
+      firstLedger: 32570,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       defaultUnlPublishers: XRPL_PUBLISHERS,
@@ -61,6 +62,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultDatabase: 'xahau',
       defaultNodeEndpoints: ['wss://xahau.network'],
       partialPaymentFixLedger: 0,
+      firstLedger: 1,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       defaultUnlPublishers: XAHAU_PUBLISHERS,
@@ -83,6 +85,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultDatabase: 'xrpl_testnet',
       defaultNodeEndpoints: ['wss://s.altnet.rippletest.net:51233', 'wss://testnet.xrpl-labs.com'],
       partialPaymentFixLedger: 0,
+      firstLedger: undefined,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       defaultUnlPublishers: XRPL_TESTNET_PUBLISHERS,
@@ -105,6 +108,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultDatabase: 'xahau_testnet',
       defaultNodeEndpoints: ['wss://xahau-test.net'],
       partialPaymentFixLedger: 0,
+      firstLedger: undefined,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       defaultUnlPublishers: '',
@@ -192,6 +196,20 @@ describe('network profiles', () => {
         amendmentThresholdPercent: 80,
         flagInterval: 256,
       });
+    });
+
+    it('firstLedger is 32570 on xrpl, 1 on xahau and undefined on both testnets', () => {
+      expect(getNetworkProfile('xrpl').firstLedger).toBe(32570);
+      expect(getNetworkProfile('xahau').firstLedger).toBe(1);
+      expect(getNetworkProfile('xrpl-testnet').firstLedger).toBeUndefined();
+      expect(getNetworkProfile('xahau-testnet').firstLedger).toBeUndefined();
+    });
+
+    it('has the firstLedger key on all four profiles, undefined or not', () => {
+      for (const name of NETWORK_NAMES) {
+        // `Object.hasOwn` is ES2022, past the ES2021 library of the repo's TypeScript
+        expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), 'firstLedger')).toBe(true);
+      }
     });
 
     it('defaults to xrpl when GH_NETWORK is unset', () => {

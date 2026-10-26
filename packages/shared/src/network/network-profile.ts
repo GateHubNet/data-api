@@ -53,6 +53,14 @@ export interface NetworkProfile {
   defaultNodeEndpoints: string[];
   /** First ledger from which a partial payment's delivered amount is taken from `delivered_amount` metadata. */
   partialPaymentFixLedger: number;
+  /**
+   * The first ledger of the network's history: a feature without an amendment starts here (`FeatureCoverageService`).
+   * XRPL 32570, where its history begins (ADR-0015); Xahau 1, its genesis ledger (the first of `complete_ledgers` on
+   * `https://xahau.network`, fact 1 of `packages/shared/test/fixtures/xahau/uritoken/FINDINGS.md`). `undefined` on both
+   * testnets: the history before the first boot of a sandbox is not indexed, so no feature is complete there. The key
+   * is in every profile, with that value written out.
+   */
+  readonly firstLedger: number | undefined;
   /** The node software of the network: it decides how `server_version` is decoded. */
   software: 'rippled' | 'xahaud';
   /** Where a validator's domain publishes its TOML file. */
@@ -102,6 +110,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultDatabase: 'xrpl',
     defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
     partialPaymentFixLedger: 4594094,
+    firstLedger: 32570,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     defaultUnlPublishers:
@@ -124,6 +133,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultDatabase: 'xahau',
     defaultNodeEndpoints: ['wss://xahau.network'],
     partialPaymentFixLedger: 0,
+    firstLedger: 1,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     defaultUnlPublishers: 'https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8',
@@ -146,6 +156,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     // (clio.altnet.rippletest.net) throttles bursts and is a backfill source, not a live one.
     defaultNodeEndpoints: ['wss://s.altnet.rippletest.net:51233', 'wss://testnet.xrpl-labs.com'],
     partialPaymentFixLedger: 0,
+    firstLedger: undefined,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     // The list `https://vl.altnet.rippletest.net` serves (version 1, signed by this key), read 2026-10-24.
@@ -178,6 +189,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultDatabase: 'xahau_testnet',
     defaultNodeEndpoints: ['wss://xahau-test.net'],
     partialPaymentFixLedger: 0,
+    firstLedger: undefined,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     // The testnet has no validator list site: its trusted validators are the fixed list below.

@@ -1,4 +1,4 @@
-import { ClickHouseService, STATE_PARSER_VERSION, Table } from '@gatehub/data-api-shared';
+import { ClickHouseService, newestLedgerBelowVersion, STATE_PARSER_VERSION, Table } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { DATE_TOO_OLD, LedgerSelector } from '../accounts/account-ledger';
 import { CacheService } from './cache.service';
@@ -75,17 +75,11 @@ export class StateLedgerService {
 
   /** Whether the state tables hold the state of `ledgerIndex`. */
   async covers(ledgerIndex: number): Promise<boolean> {
-    const newestOlder = await this.cache.wrap(COVERAGE_KEY, STATE_COVERAGE_CACHE_MS, () => this.newestOlderLedger());
-    return newestOlder === null || ledgerIndex > newestOlder;
-  }
-
-  /** The newest stored ledger a parser older than `STATE_PARSER_VERSION` wrote, `null` when there is none. */
-  private async newestOlderLedger(): Promise<number | null> {
-    const [row] = await this.ch.query<{ ledger_index: number | null }>(
-      `SELECT maxOrNull(ledger_index) AS ledger_index FROM ${Table.Ledgers} WHERE parser_version < {version:UInt16}`,
-      { version: STATE_PARSER_VERSION },
+    // the newest stored ledger a parser older than `STATE_PARSER_VERSION` wrote, `null` when there is none
+    const newestOlder = await this.cache.wrap(COVERAGE_KEY, STATE_COVERAGE_CACHE_MS, () =>
+      newestLedgerBelowVersion(this.ch, STATE_PARSER_VERSION),
     );
-    return row?.ledger_index ?? null;
+    return newestOlder === null || ledgerIndex > newestOlder;
   }
 
   private async byHash(hash: string): Promise<StateLedger | undefined> {

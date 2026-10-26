@@ -27,6 +27,7 @@ import { AmmModule } from './amm/amm.module';
 import { ApiKeyGuard } from './auth/api-key.guard';
 import { ApiThrottlerGuard } from './common/api-throttler.guard';
 import { CommonModule } from './common/common.module';
+import { FeatureCoverageModule } from './common/feature-coverage.module';
 import { MetricsInterceptor } from './common/metrics.interceptor';
 import { NotFoundModule } from './common/not-found.controller';
 import { pathDecodeErrors } from './common/path-decode-errors';
@@ -113,6 +114,7 @@ function cacheControl(value: string) {
     }),
     XrplModule,
     LivelinessModule,
+    FeatureCoverageModule,
     ...ENDPOINT_MODULES,
     NotFoundModule, // last: it answers every /v2 route nothing above serves
   ],
