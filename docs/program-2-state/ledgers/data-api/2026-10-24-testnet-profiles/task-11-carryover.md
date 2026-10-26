@@ -1,0 +1,16 @@
+# Doc and comment fixes deferred to Task 11 by earlier task reviews (controller ruling: fix them in Task 11)
+
+Only comments and docs (no behaviour change). Verify each against the code before editing.
+
+1. `packages/shared/src/network/network-profile.ts` NetworkProfile doc ("Everything that differs between the XRPL and Xahau deployments…") — now four networks; same staleness in `packages/shared/src/clickhouse/clickhouse.config.ts:~49-51` ("(`xrpl` / `xahau`)").
+2. `apps/exporter/src/export-worker.ts:~48` and `:~113` comments "The network (`xrpl`, `xahau`)".
+3. `docs/configuration.md` §1 "One network per process" (~line 28 and ~751-753: XRP/XAH, CTID 0/21337 only) and the `GH_NODE_ENDPOINTS` row (~762) listing only mainnet defaults (check what Task 10 already fixed).
+4. Stale "`<network>.json`" for amendments (the loader reads the family's file): `packages/shared/scripts/amendments-check.ts:~8`, `apps/api/.env.example:~40`, `apps/syncer/.env.example:~86`, `deploy/.env.prod.example:~54`, `docs/api-reference.md:~3058` ("a file per network").
+5. `packages/shared/test/fixtures/README.md`: it overclaims that the testnet UNL list's 6 validator manifests are asserted by specs (only `unl-list.spec.ts` covers the testnet list; manifest/node-key specs list only mainnet files) — either add the testnet file to the RECORDED lists of `manifest.spec.ts` and `node-key.spec.ts` (preferred if trivial) or reword; README:~359 `record:fixtures -- --unl --network xrpl|xahau` → include the testnets; the "a ledger holds 3 to 21 transactions" wording (~275) → the recorded range or "of the surveyed ledgers".
+6. `packages/shared/src/network/unl-publishers.ts` `defaultUnlThreshold(publishers)` parameter and comment now take a list count → name/say "lists".
+7. `docs/api-reference.md:~2719` "Differences from data.ripple.com" row: `unl` is "on the trusted UNL of the configured publishers" → add "(and the fixed list `local`)".
+8. `docs/operations.md`: the reset runbook's SQL hard-codes `xrpl_testnet` (~488) → `<database>` or both names; the intro (~14-16) tells sandbox readers the service names are slots but the SQL examples use `xrpl.`/`xahau.` throughout (~145, ~152, ~403) → one clause saying the sandbox databases are `xrpl_testnet`/`xahau_testnet`; line ~152 "the network database is `GH_CLICKHOUSE_DATABASE` when it is set" is never true under compose now.
+9. `docker-compose.prod.yaml:~302,~377` "Empty = the config/markets/xrpl.json (xahau.json)" → `config/markets/<network>.json` (xrpl-testnet.json in the sandbox).
+10. Sibling statements naming only `deploy/.env.prod.example` as the env template: `docs/security.md:~156`, `docs/configuration.md:~192` (§8), `README.md:~25` and `~129-133` → add `deploy/.env.sandbox.example`.
+11. `apps/syncer/src/config/syncer.config.spec.ts:~591-592` comment claims the case covers "no GH_CLICKHOUSE_DATABASE" but asserts nothing about it → drop the clause or point to where it's pinned.
+12. Task 9's live-runner: consider reading the boot head with `untilDone(..., 'warn', …)` so an unreachable/throttled node at boot logs a warning on mainnet as before (only the comparison's own failure propagates) — this one IS a small behaviour change; do it only if it's a few lines and keep its tests green; otherwise document the error-level log in docs/syncer.md.
