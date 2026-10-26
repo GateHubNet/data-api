@@ -53,6 +53,8 @@ export * from './aggregate/amm-daily.job';
 export * from './aggregate/amm-pools.job';
 export * from './aggregate/amm-reads';
 export * from './aggregate/markets-live.job';
+export * from './aggregate/nft-state';
+export * from './aggregate/nft-state.job';
 export * from './aggregate/pair-hourly.job';
 export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
