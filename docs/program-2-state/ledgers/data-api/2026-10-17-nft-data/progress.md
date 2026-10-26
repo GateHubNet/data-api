@@ -129,3 +129,6 @@ Ruling: C9 (T14/T15) T14's Files gain VolumeService (sentinel count); T15 adds N
 Ruling: C10 (T15) create the missing docs/observability.md section/file references the plan names or point to where metrics are documented; fix the data-model §3/§5 references — cost if wrong: docs only.
 Ruling: C11 trailer stays 'Co-Authored-By: Claude Opus 5.5' (session ruling) — cost if wrong: attribution.
 Task 1: dispatched implementer (sonnet) BASE 5294876 (after D-env fix wave), with ruling C8
+Task 1: implementer BLOCKED before commit — the harness refused its Write of FINDINGS.md ('Subagents should return findings as text, not write report files'); it returned both texts. OWNER approved (2026-10-26): the controller wrote both FINDINGS.md verbatim; implementer resumed to test and commit.
+Ruling: from now on implementers return their full report as text (subagent report files are blocked by the harness); the controller saves it as task-N-report.md — cost if wrong: none (bookkeeping).
+Task 1: implementer DONE_WITH_CONCERNS a82875a (nft-fixtures 53/53; shared unit 1736; build ok). Review dispatched (sonnet).

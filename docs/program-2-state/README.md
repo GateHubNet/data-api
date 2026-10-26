@@ -24,11 +24,14 @@ Specs and plans:
 
 ## Where the run stopped (2026-10-26)
 
-- Data API: D3 (NFTs) Task 1 "NFT fixtures and findings" was being implemented. If `git log feat/explorer-data-2` shows no commit
-  for it after 5294876, redo Task 1 from its brief (the pre-flight rulings C1–C11 in `ledgers/data-api/2026-10-17-nft-data/progress.md`
-  apply; C8: find the conditioned cases with a throwaway scan script, then record them with `record-fixtures --txs`).
-- Explorer: waiting. E8 (NFT pages) starts when D3 is complete: its Task 1 runs `DATA_API_REPO=<data-api checkout> pnpm api:sync`.
-- Next, in order: data API D3 → D4 → D5 → D6 → D7 → D8 → D9; explorer E8 → E9 → … → E14, each En after its Dn.
+- Data API: D3 (NFTs) Task 1 "NFT fixtures and findings" is committed (a82875a, pushed); its task review was dispatched just
+  before the move. Re-run that review in the cloud (BASE 5294876, HEAD a82875a) if its result is not in the ledger, then continue
+  with Task 2. The pre-flight rulings C1 to C11 in ledgers/data-api/2026-10-17-nft-data/progress.md apply.
+- Subagents can no longer write report files (the harness refuses them): implementers and reviewers return their report as text
+  and the controller saves it as task-N-report.md (kit/IMPLEMENTER.md says so). The two FINDINGS.md fixture files were written by
+  the controller from the implementer text, with the owner approval.
+- Explorer: waiting. E8 (NFT pages) starts when D3 is complete: its Task 1 runs DATA_API_REPO=<data-api checkout> pnpm api:sync.
+- Next, in order: data API D3, D4, D5, D6, D7, D8, D9; explorer E8 to E14, each En after its Dn.
 - Then: a whole-branch review per plan (done for D-env and E7), and at the end PRs (one per sub-project, stacked) for the owner.
 
 ## The owner's standing decisions

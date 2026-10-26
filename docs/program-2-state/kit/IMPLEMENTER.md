@@ -2,7 +2,7 @@
 
 Your dispatch message names: the task, the **brief file** (the task's full text from the plan — your requirements, with the exact
 values to use verbatim), the **global constraints file** (the plan's Global Constraints: commands, commit rules, exact names,
-budgets — they bind you too), the **report file** to write, the worktree to work in, and any controller rulings for this task
+budgets — they bind you too), the worktree to work in, and any controller rulings for this task
 (binding).
 
 ## Before you begin
@@ -34,11 +34,11 @@ Known environment facts:
   formatting of files outside your task.
 
 ## Report
-Write the full report to the report file: what you implemented; tests and results; TDD evidence (RED: command + failing output +
+The harness does not let you write report files. Put the full report in your final message (the controller saves it): what you implemented; tests and results; TDD evidence (RED: command + failing output +
 why expected; GREEN: command + passing output); files changed; self-review findings; concerns.
-Then reply with ONLY (under 15 lines): **Status** (DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT), commits (short SHA +
-subject), one-line test summary, concerns, the report path. If BLOCKED/NEEDS_CONTEXT, put the specifics in the reply.
+End with (under 15 lines): **Status** (DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT), commits (short SHA +
+subject), one-line test summary, concerns. If BLOCKED/NEEDS_CONTEXT, put the specifics in the reply.
 
 ## After review findings
-You may be resumed with findings: fix them, re-run the tests covering the amended code, append a fix report (what changed, the
-covering tests, the command, the output) to the same report file, commit (new commit, no amend), reply with the same short contract.
+You may be resumed with findings: fix them, re-run the tests covering the amended code, include a fix report (what changed, the
+covering tests, the command, the output) in your reply, commit (new commit, no amend), reply with the same short contract.
