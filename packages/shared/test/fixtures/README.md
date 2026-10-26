@@ -10,6 +10,8 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/recorded/`               | Mainnet ledgers recorded from a public node (see below).                                |
 | `xrpl/amm/`                    | Mainnet AMM transactions, one ledger per named case (see below).                        |
 | `xrpl/account-state/`          | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
+| `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                    |
+| `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).           |
 | `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                          |
 | `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                   |
 | `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
@@ -31,7 +33,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/` and `xrpl/path-payments/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/` and `xahau/uritoken/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -244,6 +246,45 @@ therefore the round trip `round_trip_to_oneself_*`: the same account buys WLV wi
 payments of the same ledger. A loop in one payment would be detected the same way (its source is its destination, and the pools
 and offers it crosses are in the metadata); record one with `--txs` when it is found.
 
+### XRPL NFT cases (`xrpl/nft/`)
+
+Recorded 2026-10-26 from `wss://s2.ripple.com` (rippled mainnet, network id 0; validated head 107918450) with `--txs` and
+`--delay-ms 75`, one request at a time: 11 ledgers, 0.90 MB gzipped (largest 218 KB, ledger 107874617). `manifest.json` has the cases
+under `cases.<name>` as `{ledger, hash, type, note}` (the note says what the metadata shows); `FINDINGS.md` has the facts the NFT parser tasks rely
+on, each with how it was checked. `src/ingest/nft-fixtures.spec.ts` pins what every case is for.
+
+`record-fixtures --want` keeps only the first hit of each type, so it cannot find a transaction that has to meet a condition (a `mint_on_behalf`,
+a brokered sale with a royalty, a burn that removes offers, ...). The hashes were found with a throwaway script (not in the repository) that walked
+validated ledgers back from the head (head 107886448 of 2026-10-25 down to 107866493: 19,955 ledgers, about 20 hours, 4.1 million transactions) with `ledger { transactions: true, expand: true }`, two requests in flight, kept
+every successful NFToken transaction and every transaction that touches an `NFTokenOffer` or `NFTokenPage` node, and tested the condition of each
+case on what it kept. The ledgers were then recorded with the command below, in two runs (the manifest merges them): the second run swapped the first run's
+`sale_by_sell_offer`, a sale by the NFT's own issuer that paid no royalty, for one with a third-party issuer, and the first run's ledger file was removed before it.
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/nft --delay-ms 75 --txs 32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D,350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1,C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92,12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1,9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427,910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D,BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9,AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034,D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3,BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56,695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9,0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C,2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7,4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A,33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2
+```
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `mint` | 107878781 | `32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D` | Own mint, no `Issuer`, no `Amount`; one id added to an existing page |
+| `mint_with_offer` | 107886233 | `350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1` | Mint with `Amount` "0" and `Destination`: a created sell `NFTokenOffer` |
+| `mint_on_behalf` | 107883082 | `C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92` | `Issuer` is not the sender; the id lands on the minter's page |
+| `burn` | 107883610 | `12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1` | Burn with no `NFTokenOffer` deleted |
+| `burn_removes_offers` | 107879890 | `9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427` | Burn that deletes the NFT's sell offer |
+| `modify` | 107886001 | `910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D` | `URI` of one NFT changed; same ids, same page |
+| `sell_offer_create` | 107886233 | `BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9` | `Flags` 1: a sell offer of 19.98 XRP with `Destination` |
+| `buy_offer_create` | 107886233 | `AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034` | No `Flags`: a buy offer of 8.11 XRP with `Destination` and `Expiration` |
+| `offer_cancel` | 107886163 | `D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3` | Cancels one buy offer (146.25 XRP) |
+| `sale_by_sell_offer` | 107874617 | `BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56` | One sell offer accepted, 10 XRP, fee 5%: the issuer, neither party, is paid 0.5 XRP |
+| `sale_by_buy_offer` | 107878775 | `695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9` | One buy offer accepted, 1 drop; the seller is the issuer |
+| `brokered_sale_royalty` | 107879497 | `0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C` | Both offers, broker fee 2.3835 XRP, fee 3%, issuer paid 4.428495 XRP |
+| `sale_issued_currency` | 107881530 | `2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7` | Sell offer priced 100 of a 40-hex currency (XRPlay) |
+| `transfer_zero_amount` | 107886163 | `4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A` | Accepted sell offer of `Amount` "0": the NFT moves, no payment |
+| `page_split_with_mint` | 107886233 | `33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2` | Mint on a full page: a created and a modified page of one owner, and a neighbour whose `NFTokens` did not change |
+
+**Not found** (within the 19,955 ledgers scanned, fewer than the 50,000 the plan names): `offer_removed_other`. No transaction of a type other than NFTokenAcceptOffer, NFTokenBurn and NFTokenCancelOffer deleted an `NFTokenOffer` in them (an AccountDelete of an offer's owner is the only other type expected to), and the 290 accounts that owned offers in the first part of the scan all still existed when checked with `account_info`. The scan was stopped there because the node answered "You are placing too much load on the server" to it. Task 4 needs a `synthetic-…` transaction for `offer_removed_other`.
+
 ### Xahau (`xahau/recorded/`)
 
 Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337): validated head
@@ -261,6 +302,39 @@ Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, 
 | URITokenMint    | 26541060 | `2EC9B35DA9FABDA4E375EBB158F7454E864FF24DDE4BD597F1EF6C04BC4EF4C3` |
 
 **Not found** within the 5000-ledger window (no successful transaction of that type): `Import`, `SetHook`.
+
+### Xahau URIToken cases (`xahau/uritoken/`)
+
+Recorded 2026-10-26 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337; validated head 26811706) with `--txs`
+and `--delay-ms 75`, in three runs (the manifest merges them): 9 ledgers, 93 KB gzipped (largest 26 KB, ledger 26765431). `manifest.json` has the
+cases as `{ledger, hash, type, note}`; `uritoken_remint` also has `burn: {ledger, hash}`, the earlier burn of the same id (its ledger is recorded too).
+`FINDINGS.md` has the facts checked (the `URITokenBuy` price against the seller's balance change, `Remit`'s owner change, Xahau's first ledger).
+
+Almost all URIToken traffic on Xahau is Evernode's lease tokens (mint, sell offer in EVR, buy, burn, in bursts of 150 to 200 transactions per ledger), so
+the cases with a condition were found two ways: a throwaway script (not in the repository) walked validated ledgers back from the head
+(26777346 of 2026-10-25) down to 26727347: 49,999 ledgers, of which the 17,072 with more than 60 transactions (the Evernode bursts) were counted from their transaction hashes only and not read, and `account_tx` on the accounts of the non-Evernode marketplaces it met (`r9gvUQxtV98nRAM26aknj4h6RXKyXCLMVS`, whose tokens are issued by
+`rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb`, and a few others) found the cancel and more `Remit` cases (the scan met 251 `Remit`s with URIToken nodes and no `URITokenCancelSellOffer`). The node throttles by units (10,000,000 per hour), which an expanded ledger of
+a burst costs most of; the script therefore skipped the ledgers of more than 60 transactions after a hashes-only request. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endpoint wss://xahau.network \
+  --out test/fixtures/xahau/uritoken --delay-ms 75 --txs 8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B,CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169,1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D,01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C,9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E,B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01,3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426,4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B,A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B
+```
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `uritoken_mint` | 26774724 | `8115C50443BA8A5AE18C98130F502A598A5567CB9896F6B823C600A9BCCDC87B` | Mint without `Amount` (an Evernode lease token), Flags 1 |
+| `uritoken_sell_offer_create` | 26765431 | `CE862AB800C66DA948EF97FDF7675F045699F90067B0CDC508C9BA82917A4169` | Sell offer of 2200 XAH; the entry gains `Amount` |
+| `uritoken_sell_offer_cancel` | 26533927 | `1D11FD01906EE85D38B05ADF1160C0BD1228C70A8E89120CAAD8BFB6E3A03D1D` | Cancel: the entry loses `Amount` (1800 XAH) |
+| `uritoken_buy_above_ask` | 26763778 | `01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C` | A buy at exactly the ask (4200 XAH); the seller gains the `Amount` |
+| `uritoken_burn_with_offer` | 26768773 | `9FC8217D7E62089B94CE58275989417D760C1969C033C99E127953CF5618E38E` | Burn of a token with a standing 0.0001 EVR sell offer |
+| `remit_transfer` | 26771798 | `B8BCA413A8324F2DB7BF29BEA1995A6E7BF3C50D3468DBD4F29C4C12305EDE01` | `Remit` with one `URITokenIDs`: the owner changes, the sell offer is cleared |
+| `remit_mint` | 26689211 | `3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426` | `Remit` with `MintURIToken`: a token for the destination |
+| `uritoken_remint` | 26763629 | `4B53D75736A4FB2A1197357E2278F8BC5E4CA85C3E61522EBFEB42FA86F54F3B` | Mint of an id that an earlier burn deleted (the burn is in `burn`) |
+| (its burn) | 26763618 | `A6F805E9631B6ADB145597618463D7E4A7EA4040014248CD29E87AB00D00E73B` | The `URITokenBurn` that deleted the id |
+
+**Not found** (within those ledgers and the account histories): `uritoken_mint_with_offer`. No `URITokenMint` carries an `Amount` (or a `Destination`) among the 14,211 mints seen in the 32,927 ledgers read, nor among the mints in the `account_tx` of the marketplace accounts looked at. Task 5 needs a `synthetic-…` transaction for `uritoken_mint_with_offer`.
+**`uritoken_buy_above_ask` is the fallback the plan allows**: no `URITokenBuy` paid more than the ask in any buy met, so the case is a buy at exactly the ask (its note says so).
 
 ### XRPL Testnet (`xrpl-testnet/recorded/`)
 

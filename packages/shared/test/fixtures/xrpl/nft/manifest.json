@@ -1,0 +1,240 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-26T16:05:15.469Z",
+  "validated_head": 107918450,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2": {
+      "ledger": 107886233,
+      "type": "NFTokenMint",
+      "result": "tesSUCCESS"
+    },
+    "350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1": {
+      "ledger": 107886233,
+      "type": "NFTokenMint",
+      "result": "tesSUCCESS"
+    },
+    "AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034": {
+      "ledger": 107886233,
+      "type": "NFTokenCreateOffer",
+      "result": "tesSUCCESS"
+    },
+    "BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9": {
+      "ledger": 107886233,
+      "type": "NFTokenCreateOffer",
+      "result": "tesSUCCESS"
+    },
+    "4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A": {
+      "ledger": 107886163,
+      "type": "NFTokenAcceptOffer",
+      "result": "tesSUCCESS"
+    },
+    "D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3": {
+      "ledger": 107886163,
+      "type": "NFTokenCancelOffer",
+      "result": "tesSUCCESS"
+    },
+    "910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D": {
+      "ledger": 107886001,
+      "type": "NFTokenModify",
+      "result": "tesSUCCESS"
+    },
+    "12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1": {
+      "ledger": 107883610,
+      "type": "NFTokenBurn",
+      "result": "tesSUCCESS"
+    },
+    "C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92": {
+      "ledger": 107883082,
+      "type": "NFTokenMint",
+      "result": "tesSUCCESS"
+    },
+    "2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7": {
+      "ledger": 107881530,
+      "type": "NFTokenAcceptOffer",
+      "result": "tesSUCCESS"
+    },
+    "9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427": {
+      "ledger": 107879890,
+      "type": "NFTokenBurn",
+      "result": "tesSUCCESS"
+    },
+    "0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C": {
+      "ledger": 107879497,
+      "type": "NFTokenAcceptOffer",
+      "result": "tesSUCCESS"
+    },
+    "32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D": {
+      "ledger": 107878781,
+      "type": "NFTokenMint",
+      "result": "tesSUCCESS"
+    },
+    "695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9": {
+      "ledger": 107878775,
+      "type": "NFTokenAcceptOffer",
+      "result": "tesSUCCESS"
+    },
+    "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56": {
+      "ledger": 107874617,
+      "type": "NFTokenAcceptOffer",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "mint": {
+      "ledger": 107878781,
+      "hash": "32EA8E9E6663D9EF2FBC1FB575295A56BF5F60CE863082572DEC38E8447C824D",
+      "type": "NFTokenMint",
+      "note": "NFTokenMint by rpvC5\u2026(ravC5cZreMZuKEWSrpra5nkWnfzPmrabec) for itself: taxon 0, Flags 25 (burnable, transferable, mutable), no Issuer, no Amount. The id appears as one more NFToken on the existing page of the minter (page 20 tokens, was 19); no offer, no new page."
+    },
+    "mint_with_offer": {
+      "ledger": 107886233,
+      "hash": "350D491502D3F3A166D83AADA70454F0C8FEADE1F1AD77870C0A38423C7D68B1",
+      "type": "NFTokenMint",
+      "note": "NFTokenMint by rKqqb5QZXVAL3VqXJL6obfRGeHou1DtyBV for issuer rGxWAWXg8okZh29ojBRvEMpN5peQRV16Xu with Amount \"0\" and Destination rfin4yze7ZEygheDjknACfNFHYCLG43W7R (a gift): one created NFTokenOffer (sell, Flags 1, Expiration) next to the page that gains the id. The Amount is zero: no mint with a priced offer was seen."
+    },
+    "mint_on_behalf": {
+      "ledger": 107883082,
+      "hash": "C3644343A6CCD9F713B917C4ABF0DCB0EBBD6EACB42E237E26758BDC27C45F92",
+      "type": "NFTokenMint",
+      "note": "NFTokenMint by riMCiWg8QBej6Y3osDVt3u8FJWo2ephuN with Issuer rwxH6YD51ygruAtDWixsgH5UUu6hmUi3AC (not the sender), taxon 1, fee 25000, Flags 24, no Amount: the id lands on the page of the sender (the minter), not on one of the issuer. No offer."
+    },
+    "burn": {
+      "ledger": 107883610,
+      "hash": "12FE6B5DF2CC2E269A188BACDFCA9A71BC5483A6AB5CACF254569E375569D7A1",
+      "type": "NFTokenBurn",
+      "note": "NFTokenBurn by the owner ravC5cZreMZuKEWSrpra5nkWnfzPmrabec of one NFT on its page (23 tokens to 22); no NFTokenOffer in the metadata, so no offer is deleted."
+    },
+    "burn_removes_offers": {
+      "ledger": 107879890,
+      "hash": "9003760D32A26BE64AF07D39D0F53898A8ADF3EBAA683762D0EE9F524EA1A427",
+      "type": "NFTokenBurn",
+      "note": "NFTokenBurn by rKxWWCEDrwTWn9A8QxgKDW4VhwuCcd8W7f: the NFT's one sell offer (4000000 drops, Destination rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC) is a DeletedNode in the same transaction; the page goes from 16 to 15 tokens."
+    },
+    "modify": {
+      "ledger": 107886001,
+      "hash": "910FE30699392FDFD6A8B5935C0914AEB6E94978F67154665558A4C070DF156D",
+      "type": "NFTokenModify",
+      "note": "NFTokenModify by the owner rB7UyKs9SwS4pX87tqtMjq4XRiEhkBfmuH of its own mutable NFT (no Owner field): the page keeps 18 tokens and one NFToken entry changes its URI (PreviousFields.NFTokens differs from FinalFields.NFTokens by that URI only)."
+    },
+    "sell_offer_create": {
+      "ledger": 107886233,
+      "hash": "BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9",
+      "type": "NFTokenCreateOffer",
+      "note": "NFTokenCreateOffer with Flags 1 (tfSellNFToken) by rHhvUexKKSJZG9vuZKX2kNendG2TXoavG9: Amount 19980000 drops, Destination rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC (a broker); one created NFTokenOffer with Flags 1, no Expiration."
+    },
+    "buy_offer_create": {
+      "ledger": 107886233,
+      "hash": "AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034",
+      "type": "NFTokenCreateOffer",
+      "note": "NFTokenCreateOffer without Flags (a buy offer) by rB1q8i6QaAJgSQdvbxGsP4pxsUv6QeTEWm for an NFT owned by rDWK4LBHxkbzGCXdUHQwFBNnvLUMNc5Ntd: Amount 8110000 drops, Destination rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC, Expiration; one created NFTokenOffer with no Flags."
+    },
+    "offer_cancel": {
+      "ledger": 107886163,
+      "hash": "D35AE9A13225E693AB02307F6A8C9918D62CF813536FB50A392A09E85CA4D2D3",
+      "type": "NFTokenCancelOffer",
+      "note": "NFTokenCancelOffer by rf7Db55CXcWgqmHnb1Pjx1WVGNCqMNsyZ of its one buy offer (146250000 drops, Destination rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC): the NFTokenOffer is a DeletedNode, no page changes."
+    },
+    "sale_by_sell_offer": {
+      "ledger": 107874617,
+      "hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "type": "NFTokenAcceptOffer",
+      "note": "NFTokenAcceptOffer of one sell offer (NFTokenSellOffer only) of rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz, Amount 10000000 drops with Destination rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx, who accepts: the NFT moves between their pages. Its issuer r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3 is neither party (fee 5000) and is paid 500000 drops; the seller receives 9500000."
+    },
+    "sale_by_buy_offer": {
+      "ledger": 107878775,
+      "hash": "695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9",
+      "type": "NFTokenAcceptOffer",
+      "note": "NFTokenAcceptOffer of one buy offer (NFTokenBuyOffer only) of r47kUrvGHkHgxLi1KedaHzdUvbR9GTreEe, Amount 1 drop, accepted by the NFT's owner and issuer rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB (fee 1000): the NFT moves from the sender's page to the buyer's. Every direct buy-offer sale seen was 1 drop."
+    },
+    "brokered_sale_royalty": {
+      "ledger": 107879497,
+      "hash": "0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C",
+      "type": "NFTokenAcceptOffer",
+      "note": "Brokered NFTokenAcceptOffer by broker rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC: sell offer 147616500 drops (rfivr3BK17R28wnVwpQQhSDvo2A2fmnEje), buy offer 150000000 drops (rLCscV9iDJpvje4ZCKxGjYAMNtBA1Ltauk), NFTokenBrokerFee 2383500, transfer fee 3000 (3%); the issuer is neither party and is paid 4428495 drops, which FINDINGS.md checks."
+    },
+    "sale_issued_currency": {
+      "ledger": 107881530,
+      "hash": "2A7673223CF85AE016B4E9683CFB258DDA9A569876B0C64826CD70E17D5374F7",
+      "type": "NFTokenAcceptOffer",
+      "note": "NFTokenAcceptOffer of one sell offer of rRamaNFTdhr1q7gjsDK1Q4baffxHUQfQ9 priced 100 of currency 5852506C61790000000000000000000000000000 (XRPlay) issued by rfUefeHzBZQGEs66znmX9rV6S9viGbxv9v, accepted by rLTavNLNKhA1kf8KMfW5U4Q1TNGSUNdint; the NFT moves between the two pages, and the issuer (transfer fee 5000) is the seller."
+    },
+    "transfer_zero_amount": {
+      "ledger": 107886163,
+      "hash": "4559733030C4B8B8534FC620B46BCEBCDF318A94DAF1A3390C5B3CB3BB9F532A",
+      "type": "NFTokenAcceptOffer",
+      "note": "NFTokenAcceptOffer by r4Xgqy68ykjLEJAkFQ7EaFs8VEdSiWkSeX of a sell offer of riMCiWg8QBej6Y3osDVt3u8FJWo2ephuN whose Amount is \"0\" and whose Destination is the accepter: the NFT moves between two pages with no payment (a transfer, not a sale)."
+    },
+    "page_split_with_mint": {
+      "ledger": 107886233,
+      "hash": "33F8D8D5664AED1F0267C7D531EDA71DD0B32E139423FE97050C2D9B6440DBF2",
+      "type": "NFTokenMint",
+      "note": "NFTokenMint by rKqqb5QZXVAL3VqXJL6obfRGeHou1DtyBV (for issuer rGxWAWXg8okZh29ojBRvEMpN5peQRV16Xu) on a full page: the page of 32 tokens is split into a CreatedNode page of 17 and a ModifiedNode page of 16, and its neighbour is a ModifiedNode page whose NFTokens did not change (only NextPageMin). One id is new."
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 107874617,
+      "bytes": 1095844,
+      "gzipBytes": 218004
+    },
+    {
+      "ledger": 107878775,
+      "bytes": 356010,
+      "gzipBytes": 77905
+    },
+    {
+      "ledger": 107878781,
+      "bytes": 241002,
+      "gzipBytes": 55660
+    },
+    {
+      "ledger": 107879497,
+      "bytes": 235705,
+      "gzipBytes": 51048
+    },
+    {
+      "ledger": 107879890,
+      "bytes": 387545,
+      "gzipBytes": 80269
+    },
+    {
+      "ledger": 107881530,
+      "bytes": 406483,
+      "gzipBytes": 90707
+    },
+    {
+      "ledger": 107883082,
+      "bytes": 339535,
+      "gzipBytes": 82990
+    },
+    {
+      "ledger": 107883610,
+      "bytes": 269361,
+      "gzipBytes": 51979
+    },
+    {
+      "ledger": 107886001,
+      "bytes": 324688,
+      "gzipBytes": 72569
+    },
+    {
+      "ledger": 107886163,
+      "bytes": 233004,
+      "gzipBytes": 48583
+    },
+    {
+      "ledger": 107886233,
+      "bytes": 389076,
+      "gzipBytes": 65379
+    }
+  ]
+}
