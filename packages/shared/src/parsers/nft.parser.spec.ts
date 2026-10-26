@@ -63,6 +63,7 @@ import { BigNumber } from 'bignumber.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { decodeAccountID } from 'ripple-address-codec';
+import { nftOracle, nftOracleRoles } from '../../test/nft-oracle';
 import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { getNetworkProfile } from '../network';
 import { deepFreeze } from '../test-utils/deep-freeze';
@@ -2101,5 +2102,250 @@ describe('rolesOf: URITokens', () => {
     ]);
     const [cancel] = xahauEventsOf(await recordedUri('uritoken_sell_offer_cancel'));
     expect(entries(cancel)).toEqual([[SELLER, ['offer_owner']]]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The invariants over every transaction of every set, and the oracle
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** One transaction of one set, with the parse context of its network. */
+interface AnyCase {
+  /** The set and the case or the transaction hash. */
+  name: string;
+  network: 'xrpl' | 'xahau';
+  t: ParserTx;
+  ctx: ParseContext;
+}
+
+const FIXTURES = join(__dirname, '..', '..', 'test', 'fixtures');
+
+/** Every transaction of every ledger of a recorded set, deep-frozen. */
+function transactionsOf(
+  set: string,
+  dir: string,
+  network: 'xrpl' | 'xahau',
+  ctx: ParseContext,
+  ledgers = FixtureLedgerSource.fromDir(dir).list(),
+): AnyCase[] {
+  return ledgers.flatMap((ledger) =>
+    ledger.transactions.map((raw) => ({
+      name: `${set} ${ledger.header.ledger_index} ${raw.hash}`,
+      network,
+      t: deepFreeze(toParserTx(raw, ledger.header, null)),
+      ctx,
+    })),
+  );
+}
+
+/** The sets that hold NFT transactions (the cases of Tasks 1, 4 and 5 and every other transaction of their ledgers). */
+async function nftSets(): Promise<AnyCase[]> {
+  const syntheticOf = async (
+    made: Record<string, () => Promise<ParserTx>>,
+    network: 'xrpl' | 'xahau',
+    ctx: ParseContext,
+  ) =>
+    Promise.all(
+      Object.entries(made).map(async ([name, build]): Promise<AnyCase> => ({ name, network, t: await build(), ctx })),
+    );
+  return [
+    ...transactionsOf('xrpl/nft', DIR, 'xrpl', XRPL, source.list()),
+    ...(await syntheticOf(synthetic, 'xrpl', XRPL)),
+    ...transactionsOf('xahau/uritoken', XAHAU_DIR, 'xahau', XAHAU, xahauSource.list()),
+    ...(await syntheticOf(uriSynthetic, 'xahau', XAHAU)),
+  ];
+}
+
+/** The sets that no NFT transaction was picked for: whatever their transactions are. */
+function otherSets(): AnyCase[] {
+  return [
+    ...transactionsOf('xrpl/recorded', join(FIXTURES, 'xrpl', 'recorded'), 'xrpl', XRPL),
+    ...transactionsOf('xahau/recorded', join(FIXTURES, 'xahau', 'recorded'), 'xahau', XAHAU),
+    ...transactionsOf('xrpl/ripple-mock', join(FIXTURES, 'xrpl', 'ripple-mock'), 'xrpl', XRPL),
+  ];
+}
+
+const NFT_ENTRY_TYPES = new Set(['NFTokenPage', 'NFTokenOffer', 'URIToken']);
+
+/** The nodes of the metadata, as `[operation, body]`. */
+const nodesOf = (meta: Json): [string, Json][] =>
+  ((meta.AffectedNodes ?? []) as Json[]).map((wrapper) => {
+    const op = Object.keys(wrapper)[0];
+    return [op, wrapper[op]];
+  });
+
+/** The ids a transaction's pages held before and after, over the union of its pages (never page by page). */
+function pageIds(meta: Json): { before: Set<string>; after: Set<string> } {
+  const before = new Set<string>();
+  const after = new Set<string>();
+  const ids = (tokens: Json[] | undefined) => (tokens ?? []).map((e) => (e.NFToken.NFTokenID as string).toUpperCase());
+  for (const [op, node] of nodesOf(meta)) {
+    if (node.LedgerEntryType !== 'NFTokenPage') continue;
+    if (op !== 'CreatedNode') {
+      for (const id of ids(node.PreviousFields?.NFTokens ?? node.FinalFields?.NFTokens)) before.add(id);
+    }
+    if (op !== 'DeletedNode') {
+      for (const id of ids(node.FinalFields?.NFTokens ?? node.NewFields?.NFTokens)) after.add(id);
+    }
+  }
+  return { before, after };
+}
+
+describe('every recorded and synthetic case', () => {
+  let loaded: Promise<{ nft: AnyCase[]; other: AnyCase[] }> | undefined;
+  /** Every transaction of every set, loaded once for the tests below. */
+  const sets = () => (loaded ??= nftSets().then((nft) => ({ nft, other: otherSets() })));
+  const every = async (): Promise<AnyCase[]> => {
+    const { nft, other } = await sets();
+    return [...nft, ...other];
+  };
+
+  it('has the recorded and the synthetic cases and the other sets to run over', async () => {
+    const { nft, other } = await sets();
+    expect(nft.length).toBeGreaterThan(100);
+    expect(nft.filter((c) => c.name.startsWith('synthetic-')).length).toBe(
+      Object.keys(synthetic).length + Object.keys(uriSynthetic).length,
+    );
+    expect(other.length).toBeGreaterThan(1000);
+    for (const set of ['xrpl/recorded', 'xahau/recorded', 'xrpl/ripple-mock']) {
+      expect(other.some((c) => c.name.startsWith(`${set} `))).toBe(true);
+    }
+  });
+
+  it('the parser and the oracle give the same events', async () => {
+    let withEvents = 0;
+    for (const { name, t, ctx } of await every()) {
+      const got = new NftParser().parse(t, ctx);
+      const want = nftOracle(t, ctx.nativeCurrency);
+      if (got.events.length > 0 || got.skipped > 0) withEvents += 1;
+      // Cheap for the common case (nothing, or the same text); the matcher names the difference when there is one.
+      if (JSON.stringify(got) !== JSON.stringify(want)) expect({ name, ...got }).toEqual({ name, ...want });
+    }
+    expect(withEvents).toBeGreaterThan(100);
+  });
+
+  it('the parser and the oracle give the same roles for every event', async () => {
+    let checked = 0;
+    for (const { name, t, ctx } of await every()) {
+      for (const e of new NftParser().parse(t, ctx).events) {
+        expect({ name, event: e.event, roles: [...rolesOf(e)] }).toEqual({
+          name,
+          event: e.event,
+          roles: nftOracleRoles(e),
+        });
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThan(150);
+  });
+
+  it('the ids of the events are the union of the page diffs', async () => {
+    let diffs = 0;
+    for (const { name, t, ctx, network } of await every()) {
+      if (network !== 'xrpl') continue;
+      const { before, after } = pageIds(t.meta);
+      const events = new NftParser().parse(t, ctx).events;
+      const ids = (names: string[]) => [...new Set(events.filter((e) => names.includes(e.event)).map((e) => e.nft_id))];
+      const failed = t.meta.TransactionResult !== 'tesSUCCESS';
+      // Gained over the union of the pages is minted, lost is burned, and what is on pages before and after is only ever
+      // sold, transferred or modified: a page split or merge makes none of them.
+      const minted = failed ? [] : [...after].filter((id) => !before.has(id));
+      const burned = failed ? [] : [...before].filter((id) => !after.has(id));
+      expect({ name, mint: ids(['mint']).sort(), burn: ids(['burn']).sort() }).toEqual({
+        name,
+        mint: minted.sort(),
+        burn: burned.sort(),
+      });
+      for (const id of ids(['sale', 'transfer', 'modify'])) {
+        expect({ name, id, held: before.has(id) && after.has(id) }).toEqual({ name, id, held: true });
+      }
+      if (minted.length + burned.length > 0) diffs += 1;
+    }
+    // The 12 mints and 2 burns recorded, and the hand-made ones.
+    expect(diffs).toBeGreaterThanOrEqual(14);
+  });
+
+  it('each NFT has at most one owner after each transaction', async () => {
+    let moved = 0;
+    for (const { name, t, ctx } of await every()) {
+      const byNft = new Map<string, ParsedNftEvent[]>();
+      for (const e of new NftParser().parse(t, ctx).events) {
+        if (e.event === 'mint' || e.event === 'burn' || e.event === 'sale' || e.event === 'transfer') {
+          byNft.set(e.nft_id, [...(byNft.get(e.nft_id) ?? []), e]);
+        }
+      }
+      for (const [id, events] of byNft) {
+        // One event moves an NFT in a transaction (a mint, a burn, a sale or a transfer), never two: it has no two owners
+        // after it, and none after a burn.
+        expect({ name, id, events: events.map((e) => e.event) }).toEqual({ name, id, events: [events[0].event] });
+        const [e] = events;
+        const owners = (account: string) => ({ name, id, event: e.event, named: account !== '' });
+        expect(owners(e.to_account)).toEqual({ ...owners(''), named: e.event !== 'burn' });
+        expect(owners(e.from_account)).toEqual({ ...owners(''), named: e.event !== 'mint' });
+        if (e.event === 'sale' || e.event === 'transfer') expect(e.from_account).not.toBe(e.to_account);
+        moved += 1;
+      }
+    }
+    expect(moved).toBeGreaterThan(30);
+  });
+
+  it('(nft_id, event_index) is unique within a transaction', async () => {
+    let checked = 0;
+    for (const { name, t, ctx } of await every()) {
+      const { events } = new NftParser().parse(t, ctx);
+      const keys = events.map((e) => `${e.nft_id} ${e.event_index}`);
+      expect({ name, keys: new Set(keys).size }).toEqual({ name, keys: keys.length });
+      // The index alone is unique too: it numbers the transaction's events from 0.
+      expect(events.map((e) => e.event_index)).toEqual(events.map((_, i) => i));
+      checked += events.length;
+    }
+    expect(checked).toBeGreaterThan(150);
+  });
+
+  it("the decoded fields of a mint equal the transaction's NFTokenTaxon and TransferFee", async () => {
+    let checked = 0;
+    for (const { name, t, ctx, network } of await every()) {
+      if (network !== 'xrpl' || t.tx.TransactionType !== 'NFTokenMint') continue;
+      const mints = new NftParser().parse(t, ctx).events.filter((e) => e.event === 'mint');
+      if (t.meta.TransactionResult !== 'tesSUCCESS') {
+        expect({ name, mints }).toEqual({ name, mints: [] });
+        continue;
+      }
+      // synthetic-mixed-order adds two hand-made ids to the one of the recorded mint: only the recorded one decodes to the
+      // transaction's fields.
+      if (name === 'synthetic-mixed-order') {
+        expect(mints).toHaveLength(3);
+        continue;
+      }
+      expect({ name, mints: mints.length }).toEqual({ name, mints: 1 });
+      expect({
+        name,
+        taxon: mints[0].taxon,
+        taxon_key: mints[0].taxon_key,
+        transfer_fee: mints[0].transfer_fee,
+        issuer: mints[0].issuer,
+        nft_flags: mints[0].nft_flags,
+      }).toEqual({
+        name,
+        taxon: t.tx.NFTokenTaxon,
+        taxon_key: t.tx.NFTokenTaxon,
+        transfer_fee: t.tx.TransferFee ?? 0,
+        issuer: t.tx.Issuer ?? t.tx.Account,
+        nft_flags: (t.tx.Flags ?? 0) & 0xffff,
+      });
+      checked += 1;
+    }
+    // The 12 recorded mints and the synthetic ones.
+    expect(checked).toBeGreaterThanOrEqual(12);
+  });
+
+  it('a transaction without an NFT node gives nothing', async () => {
+    let checked = 0;
+    for (const { name, t, ctx } of (await sets()).other) {
+      if (nodesOf(t.meta).some(([, node]) => NFT_ENTRY_TYPES.has(node.LedgerEntryType))) continue;
+      expect({ name, ...new NftParser().parse(t, ctx) }).toEqual({ name, events: [], skipped: 0 });
+      checked += 1;
+    }
+    expect(checked).toBeGreaterThan(1000);
   });
 });
