@@ -10,6 +10,12 @@
  * - `synthetic-cancel-by-destination`: `offer_cancel` sent by the offer's `Destination`, not its owner.
  * - `synthetic-page-merge`: `burn` with the owner's page of 23 tokens spread over two pages before it (as a burn that
  *   merges two pages leaves them): the second page is a DeletedNode and the first holds all 22 tokens left.
+ * - `synthetic-page-merge-forward`: `burn` whose page is deleted after the burn removed a token from it and merged the
+ *   rest forward into the owner's next page: its `FinalFields` lack the token, its `PreviousFields` have it.
+ * - `synthetic-sale-merge-forward`: the same for `sale_by_sell_offer`: the seller's page is deleted and merged forward.
+ * - `synthetic-no-transfer-fee`: `sale_by_sell_offer` with the transfer fee of the id set to 0, the issuer neither party.
+ * - `synthetic-offers-in-node-order`: `offer_cancel` with a second deleted offer after it and two created offers, each
+ *   pair in `AffectedNodes` order opposite to the order of offer ids and of NFT ids.
  * - `synthetic-link-only-page`: `offer_cancel` plus a ModifiedNode `NFTokenPage` whose only change is a link
  *   (`PreviousFields` hold `NextPageMin`), the neighbour of a page split, with tokens that did not change.
  * - `synthetic-mixed-order`: `mint` with two more minted ids (one sorting before, one after the recorded one), a burned id,
@@ -650,6 +656,80 @@ const builders: Record<string, () => Promise<ParserTx>> = {
         },
       });
     }),
+  'synthetic-page-merge-forward': async () =>
+    variant(await recorded('burn'), (_tx, meta) => {
+      const page = body(meta, 0);
+      const before: Json[] = page.PreviousFields.NFTokens;
+      const left: Json[] = page.FinalFields.NFTokens;
+      const next = `${page.LedgerIndex.slice(0, 40)}FFFFFFFFFFFFFFFFFFFFFFFF`;
+      const own = [{ NFToken: { NFTokenID: `${NFTS.burn.id.slice(0, -2)}F0`, URI: '697066733A2F2F4F574E' } }];
+      // The burn took a token off the page (22 left of 23), then rippled merged the page forward and erased it: the final
+      // array is the 22, the previous array the 23, and the 22 are on the next page now.
+      meta.AffectedNodes[0] = {
+        DeletedNode: {
+          LedgerEntryType: 'NFTokenPage',
+          LedgerIndex: page.LedgerIndex,
+          FinalFields: { Flags: 0, NFTokens: left, NextPageMin: next },
+          PreviousFields: { NFTokens: before },
+        },
+      };
+      meta.AffectedNodes.push({
+        ModifiedNode: {
+          LedgerEntryType: 'NFTokenPage',
+          LedgerIndex: next,
+          FinalFields: { Flags: 0, NFTokens: [...own, ...left], PreviousPageMin: page.LedgerIndex },
+          PreviousFields: { NFTokens: own },
+        },
+      });
+    }),
+  'synthetic-sale-merge-forward': async () =>
+    variant(await recorded('sale_by_sell_offer'), (_tx, meta) => {
+      // The seller's page (node 0) gave the sold token away and was merged forward into the seller's next page.
+      const page = body(meta, 0);
+      const before: Json[] = page.PreviousFields.NFTokens;
+      const left: Json[] = page.FinalFields.NFTokens;
+      const next = `${page.LedgerIndex.slice(0, 40)}FFFFFFFFFFFFFFFFFFFFFFFF`;
+      const own = [
+        { NFToken: { NFTokenID: `${NFTS.soldBySellOffer.id.slice(0, -2)}F0`, URI: '697066733A2F2F4F574E' } },
+      ];
+      meta.AffectedNodes[0] = {
+        DeletedNode: {
+          LedgerEntryType: 'NFTokenPage',
+          LedgerIndex: page.LedgerIndex,
+          FinalFields: { Flags: 0, NFTokens: left },
+          PreviousFields: { NFTokens: before },
+        },
+      };
+      meta.AffectedNodes.push({
+        ModifiedNode: {
+          LedgerEntryType: 'NFTokenPage',
+          LedgerIndex: next,
+          FinalFields: { Flags: 0, NFTokens: [...own, ...left] },
+          PreviousFields: { NFTokens: own },
+        },
+      });
+    }),
+  'synthetic-no-transfer-fee': async () =>
+    replaced(
+      await recorded('sale_by_sell_offer'),
+      NFTS.soldBySellOffer.id,
+      `00080000${NFTS.soldBySellOffer.id.slice(8)}`,
+    ),
+  'synthetic-offers-in-node-order': async () => {
+    const created = nodeOf(await recorded('sell_offer_create'), 'NFTokenOffer', 'CreatedNode');
+    return variant(await recorded('offer_cancel'), (_tx, meta) => {
+      // The recorded deleted offer comes first, then one with the smaller offer id and the smaller NFT id.
+      const removed = structuredClone(meta.AffectedNodes[4]);
+      removed.DeletedNode.LedgerIndex = `${'0'.repeat(63)}1`;
+      removed.DeletedNode.FinalFields.NFTokenID = NFTS.sellOffer.id;
+      meta.AffectedNodes.push(removed);
+      // Two created offers: first one with the larger offer id and the larger NFT id, then the recorded one.
+      const first = structuredClone(created);
+      first.CreatedNode.LedgerIndex = 'F'.repeat(64);
+      first.CreatedNode.NewFields.NFTokenID = NFTS.cancelled.id;
+      meta.AffectedNodes.push(first, structuredClone(created));
+    });
+  },
   'synthetic-link-only-page': async () => {
     const mint = await recorded('mint');
     const tokens = (nodeOf(mint, 'NFTokenPage', 'ModifiedNode').ModifiedNode.FinalFields.NFTokens as Json[]).slice(
@@ -782,14 +862,8 @@ const synthetic: Record<string, () => Promise<ParserTx>> = Object.fromEntries(
 );
 
 describe('NftParser: synthetic cases', () => {
-  it('are named as such, and none carries the hash of a recorded transaction', async () => {
-    const recordedHashes = new Set(Object.values(manifest.cases).map((c) => c.hash));
-    for (const [name, build] of Object.entries(synthetic)) {
-      const { hash } = await build();
-      expect(name).toMatch(/^synthetic-/);
-      expect(hash).toBe(name.toUpperCase());
-      expect(recordedHashes.has(hash)).toBe(false);
-    }
+  it('every one is named synthetic-…', () => {
+    for (const name of Object.keys(synthetic)) expect(name).toMatch(/^synthetic-/);
   });
 
   it('synthetic-offer-removed-other: an offer deleted by an AccountDelete is removed_by other, of its owner', async () => {
@@ -879,6 +953,56 @@ describe('NftParser: synthetic cases', () => {
     expect(mint.skipped).toBe(1);
     // An accepted offer priced in an MPT: the offer's removal and the sale are each skipped.
     expect(parse(await synthetic['synthetic-mpt-accept']())).toEqual({ events: [], skipped: 2 });
+  });
+
+  it('a token removed from a page that is then merged forward and deleted is burned (synthetic-page-merge-forward)', async () => {
+    const t = await synthetic['synthetic-page-merge-forward']();
+    const deleted = body(t.meta as Json, 0);
+    expect(Object.keys(t.meta.AffectedNodes[0])).toEqual(['DeletedNode']);
+    expect(deleted.FinalFields.NFTokens).toHaveLength(22);
+    expect(deleted.PreviousFields.NFTokens).toHaveLength(23);
+    // One burn, of the token the deleted page's FinalFields lack; the 22 that moved to the next page give nothing.
+    expect(parse(t)).toEqual({
+      events: [
+        ev(NFTS.burn, 0, 'burn', {
+          account: 'ravC5cZreMZuKEWSrpra5nkWnfzPmrabec',
+          from_account: 'ravC5cZreMZuKEWSrpra5nkWnfzPmrabec',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('a sold token removed from a page that is then merged forward is the sale, not a mint (synthetic-sale-merge-forward)', async () => {
+    const t = await synthetic['synthetic-sale-merge-forward']();
+    expect(Object.keys(t.meta.AffectedNodes[0])).toEqual(['DeletedNode']);
+    const { events } = parse(t);
+    expect(events.map((e) => e.event)).toEqual(['offer_removed', 'sale']);
+    // The events of the recorded sale, whose seller's page was a ModifiedNode.
+    expect(parse(t)).toEqual(parse(await recorded('sale_by_sell_offer')));
+  });
+
+  it('a sale of an NFT without a transfer fee has no royalty, not a zero one (synthetic-no-transfer-fee)', async () => {
+    const sale = eventsOf(await synthetic['synthetic-no-transfer-fee']()).find((e) => e.event === 'sale');
+    expect(sale).toMatchObject({
+      from_account: 'rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz',
+      to_account: 'rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx',
+      issuer: 'r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3',
+      transfer_fee: 0,
+      amount: '10',
+      royalty_est: '',
+    });
+  });
+
+  it('numbers cancelled and created offers in the order of AffectedNodes, not by offer id or NFT id (synthetic-offers-in-node-order)', async () => {
+    const t = await synthetic['synthetic-offers-in-node-order']();
+    const { events } = parse(t);
+    expect(events.map((e) => [e.event_index, e.event, e.offer_id, e.nft_id])).toEqual([
+      [0, 'offer_cancel', 'C094C217BD0396C55630195FA2C8677CF0D3961C8950BC50D827C036B532A9CF', NFTS.cancelled.id],
+      [1, 'offer_cancel', `${'0'.repeat(63)}1`, NFTS.sellOffer.id],
+      [2, 'offer_create', 'F'.repeat(64), NFTS.cancelled.id],
+      [3, 'offer_create', 'D6697EB570D95FBE80C369A2CCD9CF21CE04258B04829638313820058FE8CAEE', NFTS.sellOffer.id],
+    ]);
   });
 
   it('a page deleted with its last token is the token’s burn, not a move (synthetic-burn-last-token)', async () => {

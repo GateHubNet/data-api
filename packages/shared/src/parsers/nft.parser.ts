@@ -184,10 +184,11 @@ interface OfferNode {
 
 /**
  * Who has each NFT (and with what `URI`) before the transaction and after it, from the transaction's `NFTokenPage` nodes
- * and the page keys. The ids of all pages are compared, never page by page: pages split and merge. A modified page held
- * its previous array before; a page whose tokens did not change (the neighbour of a split changes only a link) has no
- * previous array and held what it holds. A deleted page held its final array, and holds nothing; a created one held
- * nothing.
+ * and the page keys. The ids of all pages are compared, never page by page: pages split and merge. A modified or deleted
+ * page held its previous array before; a page whose tokens did not change (the neighbour of a split changes only a link)
+ * has no previous array and held what it holds. A deleted page can have one: a token removed in the transaction and the
+ * page then merged forward and deleted, which leaves the removed token only in `PreviousFields`. A deleted page holds
+ * nothing afterwards; a created one held nothing before.
  */
 function holdingsOf(
   meta: Json,
@@ -202,8 +203,7 @@ function holdingsOf(
       for (const { id, uri } of tokensOf(node.fields.NFTokens)) after.set(id, { owner, uri });
     }
     if (node.op === 'CreatedNode') continue;
-    const previous =
-      node.op === 'ModifiedNode' ? (node.previous.NFTokens ?? node.fields.NFTokens) : node.fields.NFTokens;
+    const previous = node.previous.NFTokens ?? node.fields.NFTokens;
     for (const { id, uri } of tokensOf(previous)) before.set(id, { owner, uri });
   }
   return { before, after };
