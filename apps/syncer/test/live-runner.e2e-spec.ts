@@ -28,7 +28,7 @@ import {
 } from '../src/ingest/live-runner';
 import { LedgerNotValidatedError } from '../src/ingest/rpc-ledger-source';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, range, syntheticChain, syntheticHash, SyntheticLedger } from './synthetic-chain';
+import { ammTemplate, nftTemplate, range, syntheticChain, syntheticHash, SyntheticLedger } from './synthetic-chain';
 
 /** `L(1)` .. `L(30)` = 9999986 .. 10000015: the chain crosses the partition boundary at ledger 10,000,000. */
 const BASE = 9_999_985;
@@ -682,6 +682,68 @@ describe('LiveRunner (e2e)', () => {
 
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(9)));
       expect(await unclassified(metrics)).toBe(before + 9 * UNCLASSIFIED_PER_LEDGER);
+    });
+  });
+
+  describe('NFT rows and syncer_nft_skipped_total', () => {
+    /** Offers per ledger with an MPT amount, which the parser skips (see `nftTemplate`). */
+    const SKIPPED_PER_LEDGER = 2;
+    // Every ledger: the transactions of a recorded mainnet ledger (mints and offers: rows in the NFT tables) and 2 offers
+    // that give no row.
+    const NFT_CHAIN = syntheticChain(L(1), 12, { template: nftTemplate(SKIPPED_PER_LEDGER) });
+
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const skipped = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.nftSkippedTotal.get()).values[0]?.value ?? 0;
+
+    it('the chain has rows for the NFT tables and two skipped events per ledger', () => {
+      const total = NFT_CHAIN.reduce((sum, l) => sum + buildLedgerRows(l.raw, ctx).diagnostics.nftSkipped, 0);
+      expect(total).toBe(12 * SKIPPED_PER_LEDGER);
+      const counts = expectedCounts(L(12), NFT_CHAIN);
+      for (const table of [Table.NftEvents, Table.AccountNftEvents, Table.CollectionNftEvents, Table.NftTouches]) {
+        expect([table, counts[table] > 0]).toEqual([table, true]);
+      }
+    });
+
+    it('writes the NFT rows with the ledgers and adds the events it skipped to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), NFT_CHAIN), { metrics });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 NFT ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), NFT_CHAIN));
+      expect(await skipped(metrics)).toBe(before + 12 * SKIPPED_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without NFT skips', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await skipped(metrics)).toBe(before);
+    });
+
+    it('counts a batch once: not for a write that failed and was recovered, only for the one that committed', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+      // The second batch fails after its child rows went in; recovery deletes them and writes the batch again.
+      const writer = new FailOnSecondWrite(svc);
+      const { runner } = makeRunner(svc, new TestSource(L(12), NFT_CHAIN), { metrics, writer });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 NFT ledgers through a failed write');
+
+      expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), NFT_CHAIN));
+      expect(await skipped(metrics)).toBe(before + 12 * SKIPPED_PER_LEDGER);
     });
   });
 

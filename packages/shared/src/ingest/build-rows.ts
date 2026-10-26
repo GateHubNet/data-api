@@ -38,6 +38,7 @@ import { AmmParser } from '../parsers/amm.parser';
 import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
+import { NftParser, rolesOf } from '../parsers/nft.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
 import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
@@ -74,7 +75,7 @@ export interface LedgerRows {
   pathPayments: PathPaymentsRow[];
   /** The index of `pathPayments` by account: the source and the destination, one row for a payment to oneself. */
   accountPathPayments: AccountPathPaymentsRow[];
-  /** Every NFT and URIToken event (migration 011). Empty until the NFT parser is wired in (`NFT_PARSER_VERSION`). */
+  /** Every NFT and URIToken event (migration 011, parser version 5: `NFT_PARSER_VERSION`). */
   nftEvents: NftEventsRow[];
   /** A copy of each event per account it involves, with the account's roles in it. */
   accountNftEvents: AccountNftEventsRow[];
@@ -95,6 +96,11 @@ export interface LedgerDiagnostics {
    * could not tell (spec §2.3), summed over the ledger's transactions: `syncer_amm_unclassified_total`.
    */
   ammUnclassified: number;
+  /**
+   * NFT events the NFT parser dropped because their amount is an MPT (or is not an amount at all), summed over the ledger's
+   * transactions (spec §2.5): `syncer_nft_skipped_total`.
+   */
+  nftSkipped: number;
 }
 
 /**
@@ -146,6 +152,7 @@ const accountsCreatedParser = new AccountsCreatedParser();
 const accountStatesParser = new AccountStatesParser();
 const trustLineStatesParser = new TrustLineStatesParser();
 const ammParser = new AmmParser();
+const nftParser = new NftParser();
 const affectedAccountsParser = new AffectedAccountsParser();
 const fromClientParser = new FromClientParser();
 
@@ -260,7 +267,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     collectionNftEvents: [],
     nftSales: [],
     nftTouches: [],
-    diagnostics: { ammUnclassified: 0 },
+    diagnostics: { ammUnclassified: 0, nftSkipped: 0 },
   };
 
   const typeCounts = new Map<string, number>();
@@ -549,6 +556,104 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         slot_expiration: vote.slot_expiration ?? null,
         auth_accounts: [...(vote.auth_accounts ?? [])],
       });
+    }
+
+    const nft = nftParser.parse(t, ctx);
+    rows.diagnostics.nftSkipped += nft.skipped;
+    // One touch per NFT of the transaction, whatever its number of events.
+    const touched = new Set<string>();
+    for (const event of nft.events) {
+      const row: NftEventsRow = {
+        nft_id: event.nft_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        event_index: event.event_index,
+        tx_hash: t.hash,
+        tx_type: txType,
+        close_time: closeTime,
+        kind: event.kind,
+        event: event.event,
+        issuer: event.issuer,
+        taxon: event.taxon,
+        taxon_key: event.taxon_key,
+        serial: event.serial,
+        nft_flags: event.nft_flags,
+        transfer_fee: event.transfer_fee,
+        uri: event.uri,
+        digest: event.digest,
+        account: event.account,
+        from_account: event.from_account,
+        to_account: event.to_account,
+        offer_id: event.offer_id,
+        is_sell_offer: event.is_sell_offer,
+        amount: event.amount,
+        // An event without an amount has the empty string for it, and 0 for its shadow.
+        amount_f: event.amount === '' ? 0 : float(event.amount),
+        currency: event.currency,
+        amount_issuer: event.amount_issuer,
+        destination: event.destination,
+        expiration: event.expiration,
+        broker: event.broker,
+        broker_fee: event.broker_fee,
+        royalty_est: event.royalty_est,
+        removed_by: event.removed_by,
+      };
+      rows.nftEvents.push(row);
+      // The copies hold the same columns in objects of their own.
+      rows.collectionNftEvents.push({ ...row });
+      if (event.event === 'sale') rows.nftSales.push({ ...row });
+
+      // Each account the event involves finds it, once, with its roles; `actor` is the account that did it.
+      for (const [holder, roles] of rolesOf(event)) {
+        rows.accountNftEvents.push({
+          account: holder,
+          nft_id: row.nft_id,
+          ledger_index: row.ledger_index,
+          tx_index: row.tx_index,
+          event_index: row.event_index,
+          tx_hash: row.tx_hash,
+          tx_type: row.tx_type,
+          close_time: row.close_time,
+          kind: row.kind,
+          event: row.event,
+          issuer: row.issuer,
+          taxon: row.taxon,
+          taxon_key: row.taxon_key,
+          serial: row.serial,
+          nft_flags: row.nft_flags,
+          transfer_fee: row.transfer_fee,
+          uri: row.uri,
+          digest: row.digest,
+          actor: row.account,
+          from_account: row.from_account,
+          to_account: row.to_account,
+          offer_id: row.offer_id,
+          is_sell_offer: row.is_sell_offer,
+          amount: row.amount,
+          amount_f: row.amount_f,
+          currency: row.currency,
+          amount_issuer: row.amount_issuer,
+          destination: row.destination,
+          expiration: row.expiration,
+          broker: row.broker,
+          broker_fee: row.broker_fee,
+          royalty_est: row.royalty_est,
+          removed_by: row.removed_by,
+          roles: [...roles],
+        });
+      }
+
+      if (!touched.has(event.nft_id)) {
+        touched.add(event.nft_id);
+        rows.nftTouches.push({
+          ledger_index: header.ledger_index,
+          tx_index: txIndex,
+          nft_id: event.nft_id,
+          issuer: event.issuer,
+          taxon_key: event.taxon_key,
+          serial: event.serial,
+        });
+      }
     }
 
     for (const change of balanceChangesParser.parse(t, ctx)) {

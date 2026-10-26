@@ -87,11 +87,12 @@ export interface RangeIngestOptions {
   /** Default: a Nest `Logger` with context `RangeIngest`. */
   logger?: RangeLogger;
   /**
-   * Where `syncer_amm_unclassified_total` is counted: the pools of AMM transactions the parser could make no row for, in
-   * the ledgers this run wrote (once per write that committed; a ledger found committed and skipped adds nothing).
+   * Where `syncer_amm_unclassified_total` (the pools of AMM transactions the parser could make no row for) and
+   * `syncer_nft_skipped_total` (the NFT events it dropped for an MPT amount) are counted, for the ledgers this run wrote
+   * (once per write that committed; a ledger found committed and skipped adds nothing).
    * Default: a `PrometheusService`, whose counters are the process-wide ones. Tests pass their own.
    */
-  metrics?: Pick<PrometheusService, 'ammUnclassifiedTotal'>;
+  metrics?: Pick<PrometheusService, 'ammUnclassifiedTotal' | 'nftSkippedTotal'>;
 }
 
 export interface RangeLogger {
@@ -310,9 +311,11 @@ class RangeRunner {
   private readonly outOfTime = new WeakMap<object, string>();
   /** The ledgers the redo of the unfinished intents wrote in this run (and marked in agg_dirty). */
   private readonly redone = new Set<number>();
-  private readonly metrics: Pick<PrometheusService, 'ammUnclassifiedTotal'>;
+  private readonly metrics: Pick<PrometheusService, 'ammUnclassifiedTotal' | 'nftSkippedTotal'>;
   /** Pools of AMM transactions the parser made no row for, in what this run wrote: for the log at the end. */
   private ammUnclassified = 0;
+  /** NFT events the parser dropped for an MPT amount, in what this run wrote: for the log at the end. */
+  private nftSkipped = 0;
 
   private chunksDone = 0;
   /** Of `chunksDone`, the chunks that needed no write. */
@@ -417,12 +420,19 @@ class RangeRunner {
           'classified (no swap, liquidity or governance row, or an unknown pair): see syncer_amm_unclassified_total',
       );
     }
+    if (this.nftSkipped > 0) {
+      this.logger.warn(
+        `${this.nftSkipped} NFT event${this.nftSkipped === 1 ? '' : 's'} in the ledgers written ` +
+          `${this.nftSkipped === 1 ? 'was' : 'were'} skipped (an amount that is an MPT amount): see syncer_nft_skipped_total`,
+      );
+    }
     if (failure !== undefined) throw failure;
-    // the count of the pools it could not classify is always said, 0 too: the absence of the warning above is no proof
+    // the counts of the pools it could not classify and the NFT events it skipped are always said, 0 too: the absence of a
+    // warning above is no proof
     this.logger.log(
       `Range [${this.from},${this.to}] ingested: ${this.chunksDone} chunks complete ` +
         `(${this.chunksSkipped} had nothing to write), ${this.ledgersWritten} ledgers written, ` +
-        `${this.ammUnclassified} unclassified AMM pools`,
+        `${this.ammUnclassified} unclassified AMM pools, ${this.nftSkipped} skipped NFT events`,
     );
     return { chunksDone: this.chunksDone, ledgers: this.ledgersWritten };
   }
@@ -562,6 +572,10 @@ class RangeRunner {
         if (written.ammUnclassified > 0) {
           this.ammUnclassified += written.ammUnclassified;
           this.metrics.ammUnclassifiedTotal.inc(written.ammUnclassified);
+        }
+        if (written.nftSkipped > 0) {
+          this.nftSkipped += written.nftSkipped;
+          this.metrics.nftSkippedTotal.inc(written.nftSkipped);
         }
         return ledgers;
       } catch (err) {

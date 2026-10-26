@@ -22,7 +22,7 @@ import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { rangeIngest, RangeIngestOptions } from '../src/cli/range-ingest';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, range, syntheticChain } from './synthetic-chain';
+import { ammTemplate, nftTemplate, range, syntheticChain } from './synthetic-chain';
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 
@@ -47,6 +47,14 @@ const UNCLASSIFIED_PER_LEDGER = 2;
  * mainnet ledgers (rows in all five AMM tables), and `UNCLASSIFIED_PER_LEDGER` pools that give no row.
  */
 const AMM_RAW = syntheticChain(L(1), 30, { template: ammTemplate(UNCLASSIFIED_PER_LEDGER) }).map((l) => l.raw);
+
+/** Transactions per ledger of `NFT_RAW` whose offer has an MPT amount: the parser skips the event (see `nftTemplate`). */
+const SKIPPED_PER_LEDGER = 2;
+/**
+ * The same 30 ledgers with NFT activity: each holds the transactions of a recorded mainnet ledger (mints, one of them with
+ * an offer, and offers: rows in all five NFT tables) and `SKIPPED_PER_LEDGER` offers that give no row.
+ */
+const NFT_RAW = syntheticChain(L(1), 30, { template: nftTemplate(SKIPPED_PER_LEDGER) }).map((l) => l.raw);
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 /**
@@ -783,7 +791,9 @@ describe('rangeIngest (e2e)', () => {
       await rangeIngest(new TestSource(AMM_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, logger: amm });
       const done = (lines: LogLine[]): string | undefined =>
         lines.find((l) => l.message.includes('ingested:'))?.message;
-      expect(done(amm.lines)).toMatch(new RegExp(`, ${14 * UNCLASSIFIED_PER_LEDGER} unclassified AMM pools$`));
+      expect(done(amm.lines)).toMatch(
+        new RegExp(`, ${14 * UNCLASSIFIED_PER_LEDGER} unclassified AMM pools, 0 skipped NFT events$`),
+      );
       // a range without AMM activity says 0: the absence of a warning is not the proof
       const plain = captureLogger();
       await rangeIngest(new TestSource(CHAIN_RAW), await freshService(), ctx, {
@@ -792,7 +802,7 @@ describe('rangeIngest (e2e)', () => {
         ...FAST,
         logger: plain,
       });
-      expect(done(plain.lines)).toMatch(/, 0 unclassified AMM pools$/);
+      expect(done(plain.lines)).toMatch(/, 0 unclassified AMM pools, 0 skipped NFT events$/);
     });
 
     it('counts only what it wrote: ledgers it finds committed add nothing, and a parse before a delete adds nothing', async () => {
@@ -887,6 +897,120 @@ describe('rangeIngest (e2e)', () => {
       expect(result.ledgers).toBe(14);
       expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(AMM_RAW.slice(0, 14), CHAIN_TABLES));
       await expectNoDuplicateAmmRows(svc);
+    });
+  });
+
+  describe('NFT ledgers (parser version 5)', () => {
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const skipped = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.nftSkippedTotal.get()).values[0]?.value ?? 0;
+
+    const NFT_TABLES = [
+      Table.NftEvents,
+      Table.AccountNftEvents,
+      Table.CollectionNftEvents,
+      Table.NftSales,
+      Table.NftTouches,
+    ];
+    /** The tables of the NFT rows the ledgers have: the sales are in none of them (no sale in the recorded ledger). */
+    const NFT_TABLES_WITH_ROWS = NFT_TABLES.filter((t) => t !== Table.NftSales);
+
+    /** `count() == uniqExact(<sorting key>)` in each NFT table that has rows: no row is there twice. */
+    async function expectNoDuplicateNftRows(svc: ClickHouseService): Promise<void> {
+      for (const table of NFT_TABLES_WITH_ROWS) {
+        const key = (
+          await svc.queryOne<{ sorting_key: string }>(
+            'SELECT sorting_key FROM system.tables WHERE database = currentDatabase() AND name = {t:String}',
+            { t: table },
+          )
+        )?.sorting_key;
+        const row = await svc.queryOne<{ n: string | number; u: string | number }>(
+          `SELECT count() AS n, uniqExact(${key}) AS u FROM ${table}`,
+        );
+        expect([table, Number(row?.n) > 0, Number(row?.n)]).toEqual([table, true, Number(row?.u)]);
+      }
+    }
+
+    it('the ledgers have rows for the NFT tables, and two events per ledger that the parser skips', () => {
+      const counts = expectedCounts(NFT_RAW, CHAIN_TABLES);
+      for (const table of NFT_TABLES_WITH_ROWS) expect([table, counts[table] > 0]).toEqual([table, true]);
+      const total = NFT_RAW.reduce((sum, raw) => sum + buildLedgerRows(raw, ctx).diagnostics.nftSkipped, 0);
+      expect(total).toBe(30 * SKIPPED_PER_LEDGER);
+    });
+
+    it('writes the NFT tables, and adds the events it skipped to syncer_nft_skipped_total', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+
+      const result = await rangeIngest(new TestSource(NFT_RAW), svc, ctx, { from: L(1), to: L(30), ...FAST, metrics });
+
+      expect(result).toEqual({ chunksDone: 2, ledgers: 30 });
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(NFT_RAW, CHAIN_TABLES));
+      await expectNoDuplicateNftRows(svc);
+      expect(await skipped(metrics)).toBe(before + 30 * SKIPPED_PER_LEDGER);
+    });
+
+    it('names syncer_nft_skipped_total in a warning at the end, and says the count in its final line, 0 too', async () => {
+      const svc = await freshService();
+      const nft = captureLogger();
+      await rangeIngest(new TestSource(NFT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, logger: nft });
+      const total = 14 * SKIPPED_PER_LEDGER;
+      expect(nft.lines.filter((l) => l.level === 'warn').map((l) => l.message)).toEqual([
+        `${total} NFT events in the ledgers written were skipped (an amount that is an MPT amount): see syncer_nft_skipped_total`,
+      ]);
+      expect(nft.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(
+        new RegExp(`, ${total} skipped NFT events$`),
+      );
+
+      // a range without NFT skips says 0 and has no warning: the absence of the warning is not the proof
+      const plain = captureLogger();
+      await rangeIngest(new TestSource(CHAIN_RAW), await freshService(), ctx, {
+        from: L(1),
+        to: L(5),
+        ...FAST,
+        logger: plain,
+      });
+      expect(plain.lines.some((l) => l.message.includes('syncer_nft_skipped_total'))).toBe(false);
+      expect(plain.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(/, 0 skipped NFT events$/);
+    });
+
+    it('counts only what it wrote: ledgers it finds committed add nothing, and a reprocess counts the ledgers it rewrites once', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(NFT_RAW.slice(0, 5)); // L(1)..L(5)
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+
+      await rangeIngest(new TestSource(NFT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, metrics });
+      expect(await skipped(metrics)).toBe(before + 9 * SKIPPED_PER_LEDGER);
+
+      await rangeIngest(new TestSource(NFT_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+        metrics,
+      });
+      expect(await skipped(metrics)).toBe(before + (9 + 14) * SKIPPED_PER_LEDGER);
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(NFT_RAW.slice(0, 14), CHAIN_TABLES));
+      await expectNoDuplicateNftRows(svc);
+    });
+
+    it('redo of an unfinished intent over NFT ledgers removes the orphans in the NFT tables and leaves no duplicates', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await skipped(metrics);
+      // A write that died after its child rows, before the commit marker: NFT rows, no ledgers rows.
+      await insertUncommitted(svc, NFT_RAW.slice(0, 14));
+      await seedIntent(svc, L(1), 9_999_999, 'crashed-run');
+      for (const table of NFT_TABLES_WITH_ROWS) expect([table, (await count(svc, table)) > 0]).toEqual([table, true]);
+
+      const result = await rangeIngest(new TestSource(NFT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, metrics });
+
+      expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
+      expect(await tableCounts(svc, CHAIN_TABLES)).toEqual(expectedCounts(NFT_RAW.slice(0, 14), CHAIN_TABLES));
+      await expectNoDuplicateNftRows(svc);
+      expect(await skipped(metrics)).toBe(before + 14 * SKIPPED_PER_LEDGER);
     });
   });
 

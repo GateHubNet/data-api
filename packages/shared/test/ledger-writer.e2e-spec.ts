@@ -20,6 +20,7 @@ import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS } from './sample-rows';
+import { withMptOffers } from './synthetic-mpt-offers';
 
 const LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/ripple-mock')).list();
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
@@ -28,6 +29,10 @@ const BUILT = LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
 /** Whole mainnet ledgers around the recorded AMM cases: swaps, liquidity events, votes and bids, 16 ledgers. */
 const AMM_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/amm')).list();
 const AMM_BUILT = AMM_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
+
+/** Whole mainnet ledgers around the recorded NFT cases: mints, offers, sales, burns and a modify, 11 ledgers. */
+const NFT_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/nft')).list();
+const NFT_BUILT = NFT_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
 
 /** The fixture ledgers are sparse and spread over several partitions: P6 1, 2, 11, 20, 29 and P7 0, 1, 2. */
 const index = (i: number): number => LEDGERS[i].header.ledger_index;
@@ -49,7 +54,7 @@ const AMM_LEDGER_TABLES: Table[] = [
   Table.AmmGovernance,
 ];
 
-/** The ledger tables of the NFT data: child tables like the others, with no rows from the parser yet. */
+/** The ledger tables of the NFT data: child tables like the others, with rows from the NFT parser. */
 const NFT_LEDGER_TABLES: Table[] = [
   Table.NftEvents,
   Table.AccountNftEvents,
@@ -60,7 +65,8 @@ const NFT_LEDGER_TABLES: Table[] = [
 
 /**
  * The tables the ripple-mock ledgers have no activity for: the delete tests put hand-made rows into them
- * (`insertSeededRows`), to see what the deletes reach and what they leave.
+ * (`insertSeededRows`), to see what the deletes reach and what they leave. The recorded AMM and NFT ledgers give real
+ * rows to these tables, but they all sit in one partition of each, and the delete tests need the rows over several.
  */
 const SEEDED_LEDGER_TABLES: Table[] = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES];
 
@@ -68,6 +74,17 @@ const SEEDED_LEDGER_TABLES: Table[] = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLE
 const SEEDED_P6_TABLES: Table[] = [Table.AmmPoolTouches, Table.NftSales, Table.NftTouches];
 
 type Counts = Record<string, number>;
+type Json = Record<string, unknown>;
+
+/** `rows` ordered by the columns `keys`, as ClickHouse orders them by that key (numbers and ASCII text). */
+const sortedBy = (rows: Json[], keys: string[]): Json[] =>
+  [...rows].sort((a, b) => {
+    for (const k of keys) {
+      if (a[k] === b[k]) continue;
+      return (a[k] as number | string) < (b[k] as number | string) ? -1 : 1;
+    }
+    return 0;
+  });
 
 /**
  * What the tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows `buildLedgerRows`
@@ -98,7 +115,11 @@ const expectedCounts = (keep?: (ledgerIndex: number) => boolean, seeded?: readon
 /** The AMM fixture ledgers. */
 const expectedAmmCounts = (keep?: (ledgerIndex: number) => boolean): Counts => countsOf(AMM_BUILT, keep);
 
+/** The NFT fixture ledgers. */
+const expectedNftCounts = (keep?: (ledgerIndex: number) => boolean): Counts => countsOf(NFT_BUILT, keep);
+
 const aIndex = (i: number): number => AMM_LEDGERS[i].header.ledger_index;
+const nIndex = (i: number): number => NFT_LEDGERS[i].header.ledger_index;
 
 describe('LedgerWriter and ingest state (e2e)', () => {
   let ch: StartedClickHouse;
@@ -714,8 +735,6 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       );
     }
 
-    type Json = Record<string, unknown>;
-
     const AMM_KEYS: Array<[Table, ChildRowsKey, string]> = [
       [Table.AmmPoolStates, 'ammPoolStates', 'amm_account, ledger_index, tx_index'],
       [Table.AmmPoolTouches, 'ammPoolTouches', 'ledger_index, tx_index, amm_account'],
@@ -723,15 +742,6 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       [Table.AccountAmmLiquidity, 'accountAmmLiquidity', 'account, ledger_index, tx_index, amm_account'],
       [Table.AmmGovernance, 'ammGovernance', 'amm_account, ledger_index, tx_index'],
     ];
-
-    const sortedBy = (rows: Json[], keys: string[]): Json[] =>
-      [...rows].sort((a, b) => {
-        for (const k of keys) {
-          if (a[k] === b[k]) continue;
-          return (a[k] as number | string) < (b[k] as number | string) ? -1 : 1;
-        }
-        return 0;
-      });
 
     it('the fixtures put rows into all five AMM tables, and AMM swaps into exchanges', () => {
       const expected = expectedAmmCounts();
@@ -747,6 +757,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
       expect(result).toEqual({
         ammUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
+        nftSkipped: 0,
       });
       for (const [table, key, orderBy] of AMM_KEYS) {
         const built = AMM_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -785,9 +796,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         expect(mine.every((c) => c.rows <= 40)).toBe(true);
         expect(mine.map((c) => c.token)).toEqual(mine.map((_, n) => `amm-order:${table}:${span}:${n}`));
       }
-      // The child tables, the AMM ones among them, start before the first of them has finished (the NFT tables are left out:
-      // these ledgers have no NFT row, so they get no insert, until the NFT parser is wired in) ...
-      const withInsert = CHILD_TABLES.filter(([table]) => !NFT_LEDGER_TABLES.includes(table));
+      // The child tables that have rows, the AMM ones among them, start before the first of them has finished (these ledgers
+      // have NFT events, but no sale: `nft_sales` gets no insert) ...
+      const withInsert = CHILD_TABLES.filter(([, key]) => AMM_BUILT.some((rows) => rows[key].length > 0));
       const childStarts = withInsert.map(([t]) => events.indexOf(`start:${t}`));
       const firstEnd = events.findIndex((e) => e.startsWith('end:'));
       expect(childStarts.every((at) => at >= 0 && at < firstEnd)).toBe(true);
@@ -802,8 +813,11 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
     it('reports nothing unclassified for a batch without AMM activity', async () => {
       const svc = await freshService();
-      expect(await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, 5))).toEqual({ ammUnclassified: 0 });
-      expect(await new LedgerWriter(svc, ctx).write([])).toEqual({ ammUnclassified: 0 });
+      expect(await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, 5))).toEqual({
+        ammUnclassified: 0,
+        nftSkipped: 0,
+      });
+      expect(await new LedgerWriter(svc, ctx).write([])).toEqual({ ammUnclassified: 0, nftSkipped: 0 });
     });
 
     it('a retry of the same batch under the same runId is collapsed by the dedup token, a new runId is not', async () => {
@@ -926,6 +940,121 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // And the range can be written again without duplicates.
       await new LedgerWriter(svc, ctx).write(AMM_LEDGERS.slice(2, 13));
       expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+    });
+  });
+
+  describe('NFT ledgers (whole mainnet ledgers around the recorded NFT cases)', () => {
+    /** The rows of an NFT table as ClickHouse returns them, times as unix seconds (`expiration` stays NULL), in the order of `orderBy`. */
+    async function readBack(svc: ClickHouseService, table: Table, orderBy: string): Promise<Array<Json>> {
+      // the touches of an NFT have no time
+      if (table === Table.NftTouches) return svc.query<Json>(`SELECT * FROM ${table} ORDER BY ${orderBy}`);
+      return svc.query<Json>(
+        `SELECT * EXCEPT (close_time, expiration), toUnixTimestamp(close_time) AS close_time,
+                toUnixTimestamp(expiration) AS expiration FROM ${table} ORDER BY ${orderBy}`,
+      );
+    }
+
+    const NFT_KEYS: Array<[Table, ChildRowsKey, string]> = [
+      [Table.NftEvents, 'nftEvents', 'nft_id, ledger_index, tx_index, event_index'],
+      [Table.AccountNftEvents, 'accountNftEvents', 'account, ledger_index, tx_index, event_index'],
+      [Table.CollectionNftEvents, 'collectionNftEvents', 'issuer, taxon_key, ledger_index, tx_index, event_index'],
+      [Table.NftSales, 'nftSales', 'ledger_index, tx_index, event_index'],
+      [Table.NftTouches, 'nftTouches', 'ledger_index, tx_index, nft_id'],
+    ];
+
+    /** The recorded sell offer and buy offer of ledger 107886233, the last of the NFT ledgers. */
+    const OFFERS_OF_LAST = [
+      'BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9',
+      'AD1F852CF41E0AB3CB234950F2679B96931D3FCC62E17DC264695681DA5B7034',
+    ];
+
+    it('the fixtures put rows into all five NFT tables', () => {
+      const expected = expectedNftCounts();
+      for (const table of NFT_LEDGER_TABLES) expect([table, expected[table] > 0]).toEqual([table, true]);
+    });
+
+    it('an NFT ledger lands in all five tables: counts and every row as built, and nothing is reported skipped', async () => {
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, ctx).write(NFT_LEDGERS);
+
+      expect(await storedCounts(svc)).toEqual(expectedNftCounts());
+      expect(result).toEqual({
+        ammUnclassified: NFT_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
+        nftSkipped: 0,
+      });
+      for (const [table, key, orderBy] of NFT_KEYS) {
+        const built = NFT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
+        expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
+      }
+    });
+
+    it('reports the events the parser skipped, summed over the batch, and writes no row for them', async () => {
+      const svc = await freshService();
+      const last = NFT_LEDGERS[NFT_LEDGERS.length - 1];
+      const batch = [...NFT_LEDGERS.slice(0, -1), withMptOffers(last, OFFERS_OF_LAST)];
+
+      const result = await new LedgerWriter(svc, ctx).write(batch);
+
+      // Two offers of the last ledger have an MPT amount: no event for either, and the transactions are all there.
+      expect(result.nftSkipped).toBe(2);
+      const expected = expectedNftCounts();
+      expect(await count(svc, Table.NftEvents)).toBe(expected[Table.NftEvents] - 2);
+      expect(await count(svc, Table.NftTouches)).toBe(expected[Table.NftTouches] - 2);
+      expect(await count(svc, Table.Transactions)).toBe(expected[Table.Transactions]);
+      const hashes = OFFERS_OF_LAST.map((hash) => `'${hash}'`).join(', ');
+      expect(await count(svc, Table.NftEvents, `tx_hash IN (${hashes})`)).toBe(0);
+    });
+
+    it('a ripple-mock ledger writes no NFT row', async () => {
+      const svc = await freshService();
+      const spy = jest.spyOn(svc, 'insert');
+
+      const result = await new LedgerWriter(svc, ctx).write(LEDGERS);
+
+      // The ripple-mock ledgers (2021) have no NFT activity: the five tables get no insert and hold no row.
+      expect(result.nftSkipped).toBe(0);
+      expect(spy.mock.calls.filter((call) => NFT_LEDGER_TABLES.includes(call[0] as Table))).toEqual([]);
+      for (const table of NFT_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, 0]);
+      expect(await count(svc, Table.Ledgers)).toBe(LEDGERS.length);
+    });
+
+    it('deleteLedgersAbove keeps the NFT rows of committed ledgers and removes those of uncommitted ones, table by table', async () => {
+      const svc = await freshService();
+      const committed = 6;
+      await new LedgerWriter(svc, ctx).write(NFT_LEDGERS.slice(0, committed));
+      const before = await Promise.all(NFT_KEYS.map(([table, , orderBy]) => readBack(svc, table, orderBy)));
+      for (const rows of before) expect(rows.length).toBeGreaterThan(0);
+      await insertUncommitted(svc, NFT_BUILT.slice(committed));
+
+      await deleteLedgersAbove(svc, nIndex(committed - 1));
+
+      const after = await Promise.all(NFT_KEYS.map(([table, , orderBy]) => readBack(svc, table, orderBy)));
+      expect(after).toEqual(before);
+      expect(await storedCounts(svc)).toEqual(expectedNftCounts((i) => i <= nIndex(committed - 1)));
+    });
+
+    it('deleteLedgerRange removes the NFT rows of the range and keeps those outside it, table by table', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(NFT_LEDGERS);
+
+      const from = nIndex(2);
+      const to = nIndex(8);
+      await deleteLedgerRange(svc, from, to);
+
+      const kept = (i: number): boolean => i < from || i > to;
+      expect(await storedCounts(svc)).toEqual(expectedNftCounts(kept));
+      for (const [table, key, orderBy] of NFT_KEYS) {
+        const built = NFT_BUILT.filter((r) => kept(r.ledger.ledger_index)).flatMap((r) => r[key] as unknown as Json[]);
+        expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
+        expect([table, await count(svc, table, `ledger_index >= ${from} AND ledger_index <= ${to}`)]).toEqual([
+          table,
+          0,
+        ]);
+      }
+
+      // And the range can be written again without duplicates.
+      await new LedgerWriter(svc, ctx).write(NFT_LEDGERS.slice(2, 9));
+      expect(await storedCounts(svc)).toEqual(expectedNftCounts());
     });
   });
 

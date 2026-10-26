@@ -29,11 +29,12 @@ import type { NftEventName, NftKind } from '../parsers/nft.parser';
  *       (`STATE_PARSER_VERSION`).
  *  - 4: path payments (`path_payments`, and their index by account `account_path_payments`). Ledgers written with an
  *       older version have none; `--reprocess` rewrites them.
+ *  - 5: NFT and URIToken events (the five NFT tables); `NFT_PARSER_VERSION`
  *
  * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
- * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`), never with `PARSER_VERSION`.
+ * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`, `NFT_PARSER_VERSION`), never with `PARSER_VERSION`.
  */
-export const PARSER_VERSION = 4;
+export const PARSER_VERSION = 5;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
@@ -53,7 +54,7 @@ export const PATH_PARSER_VERSION = 4;
 /**
  * The first parser version that writes the five NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`,
  * `nft_sales` and `nft_touches`): a ledger written by an older one lacks their rows. Gates compare with this constant,
- * never with `PARSER_VERSION`, which moves to it when `buildLedgerRows` starts writing those rows.
+ * never with `PARSER_VERSION`, which later features move on.
  */
 export const NFT_PARSER_VERSION = 5;
 

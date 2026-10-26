@@ -920,7 +920,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
       this.batch = [];
       this.batchTxs = 0;
       this.batchSince = 0;
-      this.countUnclassified(written);
+      this.countDiagnostics(written);
       await this.committedBatch(first, last);
     }
     if (this.pendingBreak) throw this.pendingBreak;
@@ -928,11 +928,12 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
 
   /**
    * `syncer_amm_unclassified_total`: the pools of AMM transactions the parser made no swap, liquidity or governance row
-   * for, in a batch that is committed. Only a batch that is, so that a write that failed and was recovered is counted
-   * once, when its rewrite commits.
+   * for, and `syncer_nft_skipped_total`: the NFT events it dropped for an MPT amount, in a batch that is committed. Only a
+   * batch that is, so that a write that failed and was recovered is counted once, when its rewrite commits.
    */
-  private countUnclassified(written: LedgerWriteResult): void {
+  private countDiagnostics(written: LedgerWriteResult): void {
     if (written.ammUnclassified > 0) this.metrics?.ammUnclassifiedTotal.inc(written.ammUnclassified);
+    if (written.nftSkipped > 0) this.metrics?.nftSkippedTotal.inc(written.nftSkipped);
   }
 
   /** The bookkeeping after the ledgers `first`..`last` were committed. */
@@ -978,7 +979,7 @@ export class LiveRunner implements OnApplicationBootstrap, OnModuleDestroy {
         await this.recover(prefixErr);
         return;
       }
-      this.countUnclassified(written);
+      this.countDiagnostics(written);
       await this.committedBatch(first, last);
     }
     this.batch = [];

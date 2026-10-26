@@ -17,6 +17,15 @@ export const AMM_TEMPLATE_FILES = ['107612573', '107644916'].map((index) =>
   join(__dirname, `../../../packages/shared/test/fixtures/xrpl/amm/${index}.json.gz`),
 );
 
+/**
+ * The recorded mainnet ledger 107886233: 10 NFTokenMints (one with an offer, one on a page that splits) and 3
+ * NFTokenCreateOffers among its 102 transactions, so that a ledger made of it has rows in all five NFT tables.
+ */
+export const NFT_TEMPLATE_FILE = join(__dirname, '../../../packages/shared/test/fixtures/xrpl/nft/107886233.json.gz');
+
+/** The recorded NFTokenCreateOffer (a sell offer of 19.98 XRP) of `NFT_TEMPLATE_FILE` that `nftTemplate` copies. */
+const NFT_SELL_OFFER_HASH = 'BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9';
+
 type Json = Record<string, any>;
 
 /**
@@ -67,6 +76,31 @@ export function ammTemplate(unclassified = 0): Record<string, unknown> {
     });
   }
   return { ...first, transactions };
+}
+
+/**
+ * The template of a chain with NFT activity: the transactions of the recorded ledger in `NFT_TEMPLATE_FILE`, plus `skipped`
+ * transactions `synthetic-mpt-offer-<k>` that each create a sell offer priced with an MPT amount, which the NFT parser
+ * drops and counts (no row, +1 on `syncer_nft_skipped_total`; no NFT offer on mainnet is priced so). They are the recorded
+ * sell offer with its amount replaced, with a hash and an index of their own. The recorded transactions alone skip nothing.
+ */
+export function nftTemplate(skipped = 0): Record<string, unknown> {
+  const ledger = JSON.parse(gunzipSync(readFileSync(NFT_TEMPLATE_FILE)).toString('utf8')).ledger as Json;
+  const transactions: Json[] = [...ledger.transactions];
+  const recorded = transactions.find((tx) => tx.hash === NFT_SELL_OFFER_HASH);
+  if (!recorded) throw new Error(`transaction ${NFT_SELL_OFFER_HASH} is not in ${NFT_TEMPLATE_FILE}`);
+  const amount = { mpt_issuance_id: '0000012FFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47', value: '100' };
+  for (let k = 0; k < skipped; k++) {
+    const copy = structuredClone(recorded);
+    copy.Amount = amount;
+    copy.hash = `D${k.toString(16).toUpperCase()}`.padEnd(64, 'D');
+    copy.metaData.TransactionIndex = transactions.length;
+    for (const node of copy.metaData.AffectedNodes as Json[]) {
+      if (node.CreatedNode?.LedgerEntryType === 'NFTokenOffer') node.CreatedNode.NewFields.Amount = amount;
+    }
+    transactions.push(copy);
+  }
+  return { ...ledger, transactions };
 }
 
 /** A ledger hash (64 upper-case hex digits) that depends only on the index and the salt. */

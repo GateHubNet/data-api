@@ -20,6 +20,7 @@ describe('PrometheusService', () => {
     service.aggregatorErrorsTotal.inc({ job: 'stats_dirty' }, 4);
     service.aggregatorStatsLagSeconds.set(86_400);
     service.ammUnclassifiedTotal.inc(3);
+    service.nftSkippedTotal.inc(2);
 
     const text = await service.getMetrics();
     expect(text).toMatch(/^# TYPE syncer_checkpoint_ledger gauge$/m);
@@ -40,6 +41,8 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_aggregator_stats_lag_seconds 86400$/m);
     expect(text).toMatch(/^# TYPE syncer_amm_unclassified_total counter$/m);
     expect(text).toMatch(/^syncer_amm_unclassified_total 3$/m);
+    expect(text).toMatch(/^# TYPE syncer_nft_skipped_total counter$/m);
+    expect(text).toMatch(/^syncer_nft_skipped_total 2$/m);
   });
 
   it('exposes the metrics of the validators worker, by name, type and label set', async () => {

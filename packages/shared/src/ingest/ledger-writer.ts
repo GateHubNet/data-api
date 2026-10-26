@@ -17,6 +17,11 @@ export interface LedgerWriteResult {
    * `syncer_amm_unclassified_total`.
    */
   ammUnclassified: number;
+  /**
+   * NFT and URIToken events the parser dropped because their amount is an MPT amount or not an amount at all
+   * (`LedgerRows.diagnostics`). Counted like `ammUnclassified`: the caller adds it to `syncer_nft_skipped_total`.
+   */
+  nftSkipped: number;
 }
 
 export interface LedgerWriterOptions {
@@ -90,7 +95,7 @@ export class LedgerWriter {
    * Resolves to the diagnostics of the batch once it is committed; a failure throws and reports nothing.
    */
   async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
-    if (ledgers.length === 0) return { ammUnclassified: 0 };
+    if (ledgers.length === 0) return { ammUnclassified: 0, nftSkipped: 0 };
 
     // Parsing is pure and throws before anything has been written.
     const built = ledgers.map((raw) => buildLedgerRows(raw, this.ctx));
@@ -118,7 +123,10 @@ export class LedgerWriter {
       span,
       byIndex.map((rows) => rows.ledger),
     );
-    return { ammUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.ammUnclassified, 0) };
+    return {
+      ammUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.ammUnclassified, 0),
+      nftSkipped: byIndex.reduce((sum, rows) => sum + rows.diagnostics.nftSkipped, 0),
+    };
   }
 
   /** Insert `rows` in chunks of at most `maxRowsPerInsert`, one after the other; no rows, no insert. */

@@ -2,10 +2,12 @@ import BigNumber from 'bignumber.js';
 import { createHash } from 'crypto';
 import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { PARSER_VERSION } from '../clickhouse/rows';
+import { withMptOffers } from '../../test/synthetic-mpt-offers';
+import { NFT_PARSER_VERSION, PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
 import { AmmParser } from '../parsers/amm.parser';
+import { NftParser, ParsedNft, rolesOf } from '../parsers/nft.parser';
 import { ParseContext, parseContextFor, toParserTx } from '../parsers/parser.interface';
 import { PaymentParser } from '../parsers/payment.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
@@ -76,6 +78,26 @@ const SETS: FixtureSet[] = [
 const RIPPLE_MOCK = SETS[0];
 const AMM_SET = SETS[2];
 const XAHAU_SET = SETS[3];
+
+/**
+ * The recorded NFT cases (`test/fixtures/xrpl/nft`) and URIToken cases (`xahau/uritoken`): whole mainnet ledgers around
+ * each case. They are no `SETS` entry, which hold the invariants of the older tables (the conservation of balances), but
+ * the NFT tests below use them.
+ */
+const NFT_SET: FixtureSet = {
+  name: 'recorded NFT cases (xrpl)',
+  ctx: XRPL,
+  dir: join(FIXTURES, 'xrpl', 'nft'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+const URITOKEN_SET: FixtureSet = {
+  name: 'recorded URIToken cases (xahau)',
+  ctx: XAHAU,
+  dir: join(FIXTURES, 'xahau', 'uritoken'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
 
 interface Built {
   raw: RawLedger;
@@ -1290,11 +1312,19 @@ describe('AMM rows (parser version 2)', () => {
       [Table.AmmGovernance, 'ammGovernance'],
       [Table.AccountStates, 'accountStates'],
       [Table.TrustLineStates, 'trustLineStates'],
+      [Table.NftEvents, 'nftEvents'],
+      [Table.AccountNftEvents, 'accountNftEvents'],
+      [Table.CollectionNftEvents, 'collectionNftEvents'],
+      [Table.NftSales, 'nftSales'],
+      [Table.NftTouches, 'nftTouches'],
     ];
+
+    // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter.
+    const recorded = (): Built[] => [...builtOf(AMM_SET), ...builtOf(NFT_SET), ...builtOf(URITOKEN_SET)];
 
     it.each(tables)('%s', (table, key) => {
       const columns = ddlColumns(table);
-      const rows = collect(builtOf(AMM_SET), key);
+      const rows = collect(recorded(), key);
       expect(rows.length).toBeGreaterThan(0);
       for (const row of rows) expect(Object.keys(row)).toEqual(columns);
     });
@@ -1314,15 +1344,15 @@ describe('AMM rows (parser version 2)', () => {
         expect(rows.ammLiquidity).toEqual([]);
         expect(rows.accountAmmLiquidity).toEqual([]);
         expect(rows.ammGovernance).toEqual([]);
-        expect(rows.diagnostics).toEqual({ ammUnclassified: 0 });
+        expect(rows.diagnostics).toEqual({ ammUnclassified: 0, nftSkipped: 0 });
         for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
       }
     });
 
-    it('stores parser_version 4 (path payments, after the account states of 3)', () => {
-      expect(PARSER_VERSION).toBe(4);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(4);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(4);
+    it('stores parser_version 5 (NFT events, after the path payments of 4)', () => {
+      expect(PARSER_VERSION).toBe(5);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(5);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(5);
     });
   });
 
@@ -1336,7 +1366,7 @@ describe('AMM rows (parser version 2)', () => {
           (sum, t) => sum + ammParser.parse(toParserTx(t, raw.header, null), XRPL).unclassified,
           0,
         );
-        expect(rows.diagnostics).toEqual({ ammUnclassified: expected });
+        expect(rows.diagnostics).toEqual({ ammUnclassified: expected, nftSkipped: 0 });
         total += expected;
       }
       expect(total).toBeGreaterThanOrEqual(0);
@@ -1363,9 +1393,337 @@ describe('AMM rows (parser version 2)', () => {
           poolLine(index),
         ]);
       const rows = buildLedgerRows(ledgerOf([offer(0, 'A'.repeat(64)), offer(1, 'B'.repeat(64))]), XRPL);
-      expect(rows.diagnostics).toEqual({ ammUnclassified: 2 });
+      expect(rows.diagnostics).toEqual({ ammUnclassified: 2, nftSkipped: 0 });
       expect(rows.ammPoolStates).toEqual([]);
       expect(rows.exchanges).toEqual([]);
+    });
+  });
+});
+
+// -- NFT rows ---------------------------------------------------------------------------------------------------
+
+describe('NFT rows (parser version 5)', () => {
+  const nftParser = new NftParser();
+
+  interface Cases {
+    cases: Record<string, { ledger: number; hash: string }>;
+  }
+  const xrplCases = JSON.parse(readFileSync(join(NFT_SET.dir, 'manifest.json'), 'utf8')) as Cases;
+  const uriCases = JSON.parse(readFileSync(join(URITOKEN_SET.dir, 'manifest.json'), 'utf8')) as Cases;
+
+  /** What the NFT parser makes of one transaction of a ledger. */
+  const parsedOf = (set: FixtureSet, raw: RawLedger, hash: string): ParsedNft => {
+    const t = raw.transactions.find((r) => r.hash === hash);
+    if (!t) throw new Error(`${hash} is not in ledger ${raw.header.ledger_index}`);
+    return nftParser.parse(toParserTx(t, raw.header, null), set.ctx);
+  };
+
+  /** A recorded case: the rows of its ledger, a filter for those of the case's own transaction, and what the parser says. */
+  function nftCase(set: FixtureSet, manifest: Cases, name: string) {
+    const c = manifest.cases[name];
+    const { raw, rows } = ledgerNamed(set, c.ledger);
+    const tx = rows.transactions.find((r) => r.hash === c.hash);
+    if (!tx) throw new Error(`${name}: ${c.hash} is not in ledger ${c.ledger}`);
+    const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === tx.tx_index);
+    return { raw, rows, mine, tx, parsed: parsedOf(set, raw, c.hash) };
+  }
+  const xrpl = (name: string) => nftCase(NFT_SET, xrplCases, name);
+  const uritoken = (name: string) => nftCase(URITOKEN_SET, uriCases, name);
+
+  // The recorded brokered sale (107879497): the broker lists the sell offer of SELLER and the buy offer of BUYER together.
+  const BROKER = 'rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC';
+  const SELLER = 'rfivr3BK17R28wnVwpQQhSDvo2A2fmnEje';
+  const BUYER = 'rLCscV9iDJpvje4ZCKxGjYAMNtBA1Ltauk';
+  const ISSUER_OF_SALE = 'rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy';
+  const SOLD = '00190BB8DAEF366CB05EE8DCC919EF9A1AA24DD22B3D62C9D848920A0669E96F';
+  const SELL_OFFER = '05BC61CFB58ABA8969C852FBF907CC687A442AD3ED64FB30EA41149ECD0F6780';
+
+  describe('the five tables', () => {
+    it('writes the five NFT tables for a recorded brokered sale', () => {
+      const { raw, rows, mine, tx, parsed } = xrpl('brokered_sale_royalty');
+      // The two offers it consumed (offer_removed) and the sale: three events of one NFT, by four accounts in the sale.
+      expect(parsed.events.map((e) => e.event)).toEqual(['offer_removed', 'offer_removed', 'sale']);
+      const accounts = parsed.events.reduce((sum, e) => sum + rolesOf(e).size, 0);
+      expect(accounts).toBe(2 + 2 + 4);
+
+      expect(mine(rows.nftEvents)).toHaveLength(parsed.events.length);
+      expect(mine(rows.accountNftEvents)).toHaveLength(accounts);
+      expect(mine(rows.collectionNftEvents)).toHaveLength(parsed.events.length);
+      expect(mine(rows.nftSales)).toHaveLength(1);
+      expect(mine(rows.nftTouches)).toHaveLength(1);
+
+      const sale = {
+        nft_id: SOLD,
+        ledger_index: 107879497,
+        tx_index: tx.tx_index,
+        event_index: 2,
+        tx_hash: tx.hash,
+        tx_type: 'NFTokenAcceptOffer',
+        close_time: raw.header.close_time,
+        kind: 'nftoken',
+        event: 'sale',
+        issuer: ISSUER_OF_SALE,
+        taxon: 0,
+        taxon_key: 0,
+        serial: 107604335,
+        nft_flags: 25,
+        transfer_fee: 3000,
+        uri: '',
+        digest: '',
+        account: BROKER,
+        from_account: SELLER,
+        to_account: BUYER,
+        offer_id: SELL_OFFER,
+        is_sell_offer: 1,
+        amount: '150',
+        amount_f: 150,
+        currency: 'XRP',
+        amount_issuer: '',
+        destination: '',
+        expiration: null,
+        broker: BROKER,
+        broker_fee: '2.3835',
+        royalty_est: '4.428495',
+        removed_by: '',
+      };
+      expect(mine(rows.nftEvents).find((r) => r.event === 'sale')).toEqual(sale);
+      expect(mine(rows.nftSales)).toEqual([sale]);
+      expect(mine(rows.collectionNftEvents).find((r) => r.event === 'sale')).toEqual(sale);
+      expect(mine(rows.nftTouches)).toEqual([
+        {
+          ledger_index: 107879497,
+          tx_index: tx.tx_index,
+          nft_id: SOLD,
+          issuer: ISSUER_OF_SALE,
+          taxon_key: 0,
+          serial: 107604335,
+        },
+      ]);
+    });
+
+    it("gives each account of a sale its roles, and the broker's row holds roles: ['broker']", () => {
+      const { rows, mine } = xrpl('brokered_sale_royalty');
+      const sale = mine(rows.accountNftEvents).filter((r) => r.event === 'sale');
+      expect(sale.map((r) => [r.account, r.roles])).toEqual([
+        [ISSUER_OF_SALE, ['issuer']],
+        [SELLER, ['from']],
+        [BUYER, ['to']],
+        [BROKER, ['broker']],
+      ]);
+      // The copy of an event for an account is the event's row with `actor` for its `account`, and the roles.
+      const { account: eventAccount, ...event } = mine(rows.nftEvents).find((r) => r.event === 'sale')!;
+      for (const row of sale) {
+        const { actor, roles, ...copy } = row;
+        expect(actor).toBe(eventAccount);
+        expect(roles.length).toBeGreaterThan(0);
+        expect(copy).toEqual({ ...event, account: row.account });
+      }
+      // The broker is also the destination of both offers it consumed.
+      const asDestination = mine(rows.accountNftEvents).filter(
+        (r) => r.account === BROKER && r.event === 'offer_removed',
+      );
+      expect(asDestination.map((r) => r.roles)).toEqual([['destination'], ['destination']]);
+    });
+
+    it('keeps the copies of an event in objects of their own', () => {
+      const { rows, mine } = xrpl('brokered_sale_royalty');
+      const [event] = mine(rows.nftEvents).filter((r) => r.event === 'sale');
+      const [collection] = mine(rows.collectionNftEvents).filter((r) => r.event === 'sale');
+      const [sale] = mine(rows.nftSales);
+      expect(collection).toEqual(event);
+      expect(sale).toEqual(event);
+      expect(collection).not.toBe(event);
+      expect(sale).not.toBe(event);
+      expect(sale).not.toBe(collection);
+    });
+
+    it('gives an account with two roles in one event one row', () => {
+      // `mint_on_behalf`: the minter is also the account that gets the NFT (`minter` and `to`); the issuer is another account.
+      const behalf = xrpl('mint_on_behalf');
+      const minted = behalf.mine(behalf.rows.accountNftEvents);
+      expect(behalf.parsed.events).toHaveLength(1);
+      expect(minted.map((r) => [r.account, r.roles])).toEqual([
+        ['rwxH6YD51ygruAtDWixsgH5UUu6hmUi3AC', ['issuer']],
+        ['riMCiWg8QBej6Y3osDVt3u8FJWo2ephuN', ['minter', 'to']],
+      ]);
+      // A mint by the issuer itself: the issuer is also `to`, and there is no `minter`.
+      const own = xrpl('mint');
+      expect(own.mine(own.rows.accountNftEvents).map((r) => [r.account, r.roles])).toEqual([
+        ['ravC5cZreMZuKEWSrpra5nkWnfzPmrabec', ['issuer', 'to']],
+      ]);
+    });
+
+    it('writes one row per NFT and transaction in nft_touches, whatever the events of the NFT', () => {
+      // A mint with an offer: two events of one NFT, one touch.
+      const { rows, mine, parsed } = xrpl('mint_with_offer');
+      expect(parsed.events.map((e) => e.event)).toEqual(['mint', 'offer_create']);
+      expect(mine(rows.nftEvents)).toHaveLength(2);
+      expect(mine(rows.nftTouches)).toEqual([
+        {
+          ledger_index: 107886233,
+          tx_index: mine(rows.nftEvents)[0].tx_index,
+          nft_id: '00181F40AF09C1D4B4D1E8031467F3508DFFADABEA73255FBE9F0F960655EBFA',
+          issuer: 'rGxWAWXg8okZh29ojBRvEMpN5peQRV16Xu',
+          taxon_key: 3,
+          serial: 106294266,
+        },
+      ]);
+      // Several NFTs in one transaction: one touch for each.
+      const ledgerTouches = ledgerNamed(NFT_SET, 107874617).rows.nftTouches;
+      const byTx = new Map<number, number>();
+      for (const touch of ledgerTouches) byTx.set(touch.tx_index, (byTx.get(touch.tx_index) ?? 0) + 1);
+      expect(Math.max(...byTx.values())).toBeGreaterThan(1);
+    });
+
+    it('stores a URIToken as an NFT of the issuer with taxon_key 0 and serial 0, and the amount in the native XAH', () => {
+      const { rows, mine, parsed } = uritoken('uritoken_buy_above_ask');
+      expect(parsed.events.map((e) => e.event)).toEqual(['offer_removed', 'sale']);
+      expect(
+        mine(rows.nftEvents).map((r) => [r.kind, r.event, r.taxon, r.taxon_key, r.serial, r.amount, r.currency]),
+      ).toEqual([
+        ['uritoken', 'offer_removed', null, 0, 0, '4200', 'XAH'],
+        ['uritoken', 'sale', null, 0, 0, '4200', 'XAH'],
+      ]);
+      expect(mine(rows.nftSales)).toHaveLength(1);
+      expect(mine(rows.nftSales)[0]).toMatchObject({ amount_f: 4200, amount_issuer: '', royalty_est: '' });
+      const touches = mine(rows.nftTouches);
+      expect(touches).toHaveLength(1);
+      expect(touches[0]).toMatchObject({
+        nft_id: '9613336614047483F3AEC00173139D88FE9BA70720CAC2B46E12711A71A9AAE9',
+        issuer: 'rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb',
+        taxon_key: 0,
+        serial: 0,
+      });
+      // By collection: the issuer's, under taxon_key 0.
+      expect(mine(rows.collectionNftEvents).map((r) => [r.issuer, r.taxon_key])).toEqual([
+        ['rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb', 0],
+        ['rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb', 0],
+      ]);
+    });
+
+    it('writes an absent amount as the empty string and 0, and an absent expiration as null', () => {
+      const { rows, mine } = xrpl('burn');
+      const [burn] = mine(rows.nftEvents);
+      expect(burn).toMatchObject({ event: 'burn', amount: '', amount_f: 0, currency: '', expiration: null });
+      const gift = xrpl('mint_with_offer');
+      const [, offer] = gift.mine(gift.rows.nftEvents);
+      // The offer's expiration is in unix seconds, as the parser has it.
+      expect(offer).toMatchObject({ event: 'offer_create', amount: '0', amount_f: 0, currency: 'XRP' });
+      expect(typeof offer.expiration).toBe('number');
+    });
+
+    it.each([
+      ['XRPL', NFT_SET],
+      ['Xahau URITokens', URITOKEN_SET],
+      ['Xahau', XAHAU_SET],
+      ['the AMM cases', AMM_SET],
+    ])(
+      'every NFT row of the recorded ledgers (%s) holds the columns of its event, its transaction and its roles',
+      (_name, set) => {
+        let events = 0;
+        for (const { raw, rows } of builtOf(set)) {
+          const header = raw.header;
+          const expectedEvents: Json[] = [];
+          const expectedAccounts: Json[] = [];
+          const expectedTouches: Json[] = [];
+          const byHash = new Map(rows.transactions.map((r) => [r.hash, r]));
+          for (const t of raw.transactions) {
+            const tx = byHash.get(t.hash)!;
+            const seen = new Set<string>();
+            for (const e of parsedOf(set, raw, t.hash).events) {
+              const { event_index, ...columns } = e;
+              const row = {
+                ...columns,
+                event_index,
+                ledger_index: header.ledger_index,
+                tx_index: tx.tx_index,
+                tx_hash: t.hash,
+                tx_type: tx.tx_type,
+                close_time: header.close_time,
+                amount_f: e.amount === '' ? 0 : Number(e.amount),
+              };
+              expectedEvents.push(row);
+              for (const [holder, roles] of rolesOf(e)) {
+                const { account, ...others } = row;
+                expectedAccounts.push({ ...others, account: holder, actor: account, roles });
+              }
+              if (!seen.has(e.nft_id)) {
+                seen.add(e.nft_id);
+                expectedTouches.push({
+                  ledger_index: header.ledger_index,
+                  tx_index: tx.tx_index,
+                  nft_id: e.nft_id,
+                  issuer: e.issuer,
+                  taxon_key: e.taxon_key,
+                  serial: e.serial,
+                });
+              }
+            }
+          }
+          events += expectedEvents.length;
+          expect(rows.nftEvents).toEqual(expectedEvents);
+          expect(rows.collectionNftEvents).toEqual(expectedEvents);
+          expect(rows.nftSales).toEqual(expectedEvents.filter((e) => e.event === 'sale'));
+          expect(rows.accountNftEvents).toEqual(expectedAccounts);
+          expect(rows.nftTouches).toEqual(expectedTouches);
+        }
+        expect(events).toBeGreaterThan(20);
+      },
+    );
+
+    it('writes nothing for a ledger without NFT activity', () => {
+      for (const { rows } of builtOf(RIPPLE_MOCK)) {
+        expect(rows.nftEvents).toEqual([]);
+        expect(rows.accountNftEvents).toEqual([]);
+        expect(rows.collectionNftEvents).toEqual([]);
+        expect(rows.nftSales).toEqual([]);
+        expect(rows.nftTouches).toEqual([]);
+        expect(rows.diagnostics.nftSkipped).toBe(0);
+      }
+    });
+  });
+
+  describe('parser_version', () => {
+    it('stamps parser_version 5 on the ledger row', () => {
+      expect(PARSER_VERSION).toBe(5);
+      expect(NFT_PARSER_VERSION).toBe(5);
+      for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(5);
+      }
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(5);
+    });
+  });
+
+  describe('diagnostics.nftSkipped', () => {
+    it('counts skipped NFT events in diagnostics.nftSkipped', () => {
+      const sell = xrpl('sell_offer_create');
+      const buy = xrpl('buy_offer_create');
+      expect(sell.rows.ledger.ledger_index).toBe(buy.rows.ledger.ledger_index);
+      expect(sell.rows.diagnostics.nftSkipped).toBe(0);
+
+      const one = buildLedgerRows(withMptOffers(sell.raw, [sell.tx.hash]), XRPL);
+      expect(one.diagnostics.nftSkipped).toBe(1);
+      expect(one.nftEvents).toHaveLength(sell.rows.nftEvents.length - 1);
+      expect(one.nftEvents.some((r) => r.tx_hash === sell.tx.hash)).toBe(false);
+      expect(one.nftTouches.some((r) => r.tx_index === sell.tx.tx_index)).toBe(false);
+
+      // Summed over the transactions of the ledger.
+      const two = buildLedgerRows(withMptOffers(sell.raw, [sell.tx.hash, buy.tx.hash]), XRPL);
+      expect(two.diagnostics.nftSkipped).toBe(2);
+      expect(two.nftEvents).toHaveLength(sell.rows.nftEvents.length - 2);
+      // The transactions are all there, and the other tables are as without the edit.
+      expect(two.transactions).toHaveLength(sell.rows.transactions.length);
+      expect(two.diagnostics.ammUnclassified).toBe(sell.rows.diagnostics.ammUnclassified);
+    });
+
+    it('is the sum of what the parser skips, over the transactions of every recorded ledger, which is nothing', () => {
+      for (const set of [NFT_SET, URITOKEN_SET, XAHAU_SET, AMM_SET]) {
+        for (const { raw, rows } of builtOf(set)) {
+          const skipped = raw.transactions.reduce((sum, t) => sum + parsedOf(set, raw, t.hash).skipped, 0);
+          expect(rows.diagnostics.nftSkipped).toBe(skipped);
+          expect(skipped).toBe(0);
+        }
+      }
     });
   });
 });
@@ -1461,6 +1819,17 @@ const AMOUNT_FIELDS = new Set([
   'bid_min',
   'bid_max',
   'price_paid',
+  'broker_fee',
+  'royalty_est',
+]);
+
+/** The `LedgerRows` properties of the NFT tables: an amount they do not have is `''`, not a number. */
+const NFT_ROW_KEYS: ReadonlySet<string> = new Set([
+  'nftEvents',
+  'accountNftEvents',
+  'collectionNftEvents',
+  'nftSales',
+  'nftTouches',
 ]);
 
 /** Row fields that hold drops as an unsigned integer string. */
@@ -1519,6 +1888,8 @@ describe.each(SETS)('invariants over $name', (set) => {
       for (const row of collect(built(), key)) {
         for (const [field, value] of Object.entries(row)) {
           if (value === null) continue;
+          // An NFT event with no price, no broker fee or no royalty has the empty string for it.
+          if (value === '' && NFT_ROW_KEYS.has(key)) continue;
           if (AMOUNT_FIELDS.has(field)) {
             if (typeof value !== 'string' || !new BigNumber(value).isFinite())
               problems.push(`${key}.${field}=${value}`);

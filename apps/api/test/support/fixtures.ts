@@ -31,7 +31,11 @@ export const XRPL_AMM_DIR = join(FIXTURES, 'xrpl', 'amm');
 export const XRPL_ACCOUNT_STATE_DIR = join(FIXTURES, 'xrpl', 'account-state');
 /** Mainnet ledgers recorded around path payments and the payments that are not ones: see the fixtures README. */
 export const XRPL_PATH_PAYMENTS_DIR = join(FIXTURES, 'xrpl', 'path-payments');
+/** Mainnet ledgers recorded around NFToken transactions (mints, offers, sales, burns, a modify): see the fixtures README. */
+export const XRPL_NFT_DIR = join(FIXTURES, 'xrpl', 'nft');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
+/** Xahau ledgers recorded around URIToken transactions (mints, sell offers, a buy, a burn, a Remit): see the fixtures README. */
+export const XAHAU_URITOKEN_DIR = join(FIXTURES, 'xahau', 'uritoken');
 /** XRPL Testnet ledgers recorded from a public testnet node (network id 1): see the fixtures README. */
 export const XRPL_TESTNET_RECORDED_DIR = join(FIXTURES, 'xrpl-testnet', 'recorded');
 /** Xahau Testnet ledgers recorded from a public testnet node (network id 21338): see the fixtures README. */
@@ -52,7 +56,9 @@ export type SeedName =
   | 'ripple-mock+amm'
   | 'xrpl-account-state'
   | 'xrpl-path-payments'
+  | 'xrpl-nft'
   | 'xahau-recorded'
+  | 'xahau-uritoken'
   | 'xahau-flag'
   | 'xrpl-testnet-recorded'
   | 'xahau-testnet-recorded';
@@ -64,7 +70,9 @@ const DIRS: Record<SeedName, string[]> = {
   'ripple-mock+amm': [RIPPLE_MOCK_DIR, XRPL_AMM_DIR],
   'xrpl-account-state': [XRPL_ACCOUNT_STATE_DIR],
   'xrpl-path-payments': [XRPL_PATH_PAYMENTS_DIR],
+  'xrpl-nft': [XRPL_NFT_DIR],
   'xahau-recorded': [XAHAU_RECORDED_DIR],
+  'xahau-uritoken': [XAHAU_URITOKEN_DIR],
   'xahau-flag': [XAHAU_FLAG_DIR],
   'xrpl-testnet-recorded': [XRPL_TESTNET_RECORDED_DIR],
   'xahau-testnet-recorded': [XAHAU_TESTNET_RECORDED_DIR],
@@ -90,7 +98,9 @@ export const SEED_NETWORK: Record<SeedName, NetworkName> = {
   'ripple-mock+amm': 'xrpl',
   'xrpl-account-state': 'xrpl',
   'xrpl-path-payments': 'xrpl',
+  'xrpl-nft': 'xrpl',
   'xahau-recorded': 'xahau',
+  'xahau-uritoken': 'xahau',
   'xahau-flag': 'xahau',
   'xrpl-testnet-recorded': 'xrpl-testnet',
   'xahau-testnet-recorded': 'xahau-testnet',
