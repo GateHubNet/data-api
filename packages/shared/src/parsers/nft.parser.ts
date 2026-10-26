@@ -364,7 +364,8 @@ interface UriTokenEvents {
 
 /**
  * The events of the `URIToken` nodes of a transaction (spec §2.4), from each node's diff and the transaction type:
- * - created: a `mint` for the entry's `Owner`, and an `offer_create` when it has an `Amount`;
+ * - created: a `mint` for the entry's `Owner`, and an `offer_create` when it has an `Amount` (or its `URITokenMint` names
+ *   one that the entry lacks: a native zero is not stored);
  * - deleted: an `offer_removed` (`burn`) when it had an `Amount` (kept in its `FinalFields`), and a `burn` of its `Owner`;
  * - `Owner` changed: in a `URITokenBuy`, the offer's `offer_removed` (`sale`) and a `sale` at the transaction's `Amount`;
  *   otherwise (a `Remit`) a `transfer`, with an `offer_removed` (`transfer`) when its `Amount` was cleared with it;
@@ -384,6 +385,7 @@ function uriTokenEvents(
   ctx: ParseContext,
 ): UriTokenEvents {
   const out: UriTokenEvents = { removals: [], ownership: [], creations: [], skipped: 0 };
+  const isMint = tx.TransactionType === 'URITokenMint';
   const isBuy = tx.TransactionType === 'URITokenBuy';
   const setsOffer = tx.TransactionType === 'URITokenCreateSellOffer';
 
@@ -434,7 +436,11 @@ function uriTokenEvents(
 
     if (node.op === 'CreatedNode') {
       out.ownership.push({ ...tokenEvent('mint'), account: sender, to_account: owner, uri: text(fields.URI) });
-      if (fields.Amount !== undefined) add(out.creations, offerEvent('offer_create', owner, fields, ''));
+      // A native zero is left out of a created entry (FINDINGS xrpl 6, an STAmount's only default value): a mint whose
+      // transaction names an Amount that its entry lacks is offered at the transaction's.
+      const offered: Json =
+        fields.Amount === undefined && isMint && tx.Amount !== undefined ? { ...fields, Amount: tx.Amount } : fields;
+      if (offered.Amount !== undefined) add(out.creations, offerEvent('offer_create', owner, offered, ''));
     } else if (node.op === 'DeletedNode') {
       if (fields.Amount !== undefined) add(out.removals, offerEvent('offer_removed', owner, standing, 'burn'));
       out.ownership.push({ ...tokenEvent('burn'), account: sender, from_account: owner });

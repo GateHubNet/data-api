@@ -41,6 +41,13 @@
  * - `synthetic-uritoken-mint-with-offer` (not found on Xahau, FINDINGS "Not found": no recorded `URITokenMint` carries an
  *   `Amount` or a `Destination`): `uritoken_mint` whose transaction carries `Amount` 2.5 XAH and a `Destination`, and
  *   whose created entry has both.
+ * - `synthetic-uritoken-free-mint-with-offer`: the same at an `Amount` of "0", which the created entry leaves out (a native
+ *   zero is not stored, as on XRPL), so the offer's amount is the transaction's.
+ * - `synthetic-uritoken-mpt-mint-offer`: the same with an MPT `Amount` on the transaction and the entry.
+ * - `synthetic-uritoken-buy-above-ask`: `uritoken_buy_above_ask` whose transaction `Amount` is raised to 4300 XAH, above the
+ *   ask of 4200 XAH that the entry's `PreviousFields` hold (no buy above an ask was found, FINDINGS 2).
+ * - `synthetic-uritoken-setremarks-with-offer`: the recorded `SetRemarks` of a URIToken that has no offer, with an `Amount`
+ *   (an offer that stands) added to the entry's `FinalFields`, none to its `PreviousFields`.
  * - `synthetic-uritoken-cancel-with-destination`: `uritoken_sell_offer_cancel` whose entry also lost a `Destination`
  *   (listed in its `PreviousFields`, as the cleared `Amount` is).
  * - `synthetic-uritoken-relist`: `uritoken_sell_offer_create` over a standing offer: `PreviousFields` hold the old `Amount`
@@ -116,6 +123,14 @@ async function recordedUri(name: string): Promise<ParserTx> {
   const c = xahauManifest.cases[name];
   if (!c) throw new Error(`no recorded Xahau case ${name}`);
   return transactionIn(xahauSource, name, c.ledger, c.hash);
+}
+
+/** The recorded `SetRemarks` of the ledger of `remit_mint` (it touches that Remit's URIToken), deep-frozen. */
+async function recordedSetRemarks(): Promise<ParserTx> {
+  const ledger = await xahauSource.fetch(xahauManifest.cases.remit_mint.ledger);
+  const raw = ledger.transactions.find((t) => t.tx.TransactionType === 'SetRemarks');
+  if (!raw) throw new Error('no SetRemarks in the ledger of remit_mint');
+  return deepFreeze(toParserTx(raw, ledger.header, null));
 }
 
 /** A deep-frozen copy of `t` after `edit` changed (copies of) its transaction and metadata. */
@@ -1664,19 +1679,11 @@ describe('NftParser: recorded Xahau URIToken cases', () => {
   });
 
   it('a SetRemarks that touches a URIToken changes neither its owner nor its offer, and gives no event (recorded in the ledger of remit_mint)', async () => {
-    const ledger = await xahauSource.fetch(xahauManifest.cases.remit_mint.ledger);
-    const raw = ledger.transactions.find((t) => t.tx.TransactionType === 'SetRemarks');
-    if (!raw) throw new Error('no SetRemarks in the ledger of remit_mint');
-    const t = deepFreeze(toParserTx(raw, ledger.header, null));
+    const t = await recordedSetRemarks();
     // It does touch a URIToken that has an owner and no offer.
     expect(uriBody(t.meta as Json).FinalFields).toMatchObject({ Owner: SELLER });
     expect(uriBody(t.meta as Json).FinalFields.Amount).toBeUndefined();
     expect(parseXahau(t)).toEqual({ events: [], skipped: 0 });
-    // The same entry with a standing offer (Amount in its FinalFields, none in its PreviousFields) is no offer_create either.
-    const offered = variant(t, (_tx, meta) => {
-      uriBody(meta).FinalFields.Amount = '2200000000';
-    });
-    expect(parseXahau(offered)).toEqual({ events: [], skipped: 0 });
   });
 });
 
@@ -1687,6 +1694,27 @@ const uriBuilders: Record<string, () => Promise<ParserTx>> = {
       tx.Amount = '2500000';
       tx.Destination = 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp';
       Object.assign(uriBody(meta).NewFields, { Amount: '2500000', Destination: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp' });
+    }),
+  'synthetic-uritoken-free-mint-with-offer': async () =>
+    variant(await recordedUri('uritoken_mint'), (tx, meta) => {
+      // The transaction offers the token for nothing; the created entry has the Destination but no Amount.
+      tx.Amount = '0';
+      tx.Destination = 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp';
+      Object.assign(uriBody(meta).NewFields, { Destination: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp' });
+    }),
+  'synthetic-uritoken-mpt-mint-offer': async () =>
+    variant(await recordedUri('uritoken_mint'), (tx, meta) => {
+      tx.Amount = MPT_AMOUNT;
+      uriBody(meta).NewFields.Amount = MPT_AMOUNT;
+    }),
+  'synthetic-uritoken-buy-above-ask': async () =>
+    variant(await recordedUri('uritoken_buy_above_ask'), (tx) => {
+      // The buyer pays 4300 XAH for a token asked at 4200 XAH (the entry's PreviousFields.Amount).
+      tx.Amount = '4300000000';
+    }),
+  'synthetic-uritoken-setremarks-with-offer': async () =>
+    variant(await recordedSetRemarks(), (_tx, meta) => {
+      uriBody(meta).FinalFields.Amount = '2200000000';
     }),
   'synthetic-uritoken-cancel-with-destination': async () =>
     variant(await recordedUri('uritoken_sell_offer_cancel'), (_tx, meta) => {
@@ -1825,6 +1853,68 @@ describe('NftParser: synthetic Xahau URIToken cases', () => {
     });
   });
 
+  it('synthetic-uritoken-free-mint-with-offer: a mint offered at 0 has its offer, at the transaction’s amount', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-free-mint-with-offer']();
+    expect(uriBody(t.meta as Json).NewFields.Amount).toBeUndefined();
+    expect(t.tx.Amount).toBe('0');
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.minted, 0, 'mint', {
+          account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          to_account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          uri: t.tx.URI,
+        }),
+        uev(URI_TOKENS.minted, 1, 'offer_create', {
+          account: 'rPSpGgNCgSzfvyW1PveBL62Ph5VZFcQt6E',
+          offer_id: URI_TOKENS.minted.id,
+          is_sell_offer: 1,
+          amount: '0',
+          currency: 'XAH',
+          destination: 'rAucmWmE8yiueemhmrGh5MyD2mNjXfpQp',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('synthetic-uritoken-buy-above-ask: the offer removed is at the ask, the sale at what the transaction paid', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-buy-above-ask']();
+    expect(uriBody(t.meta as Json).PreviousFields.Amount).toBe('4200000000');
+    expect(t.tx.Amount).toBe('4300000000');
+    const buyer = 'rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg';
+    expect(parseXahau(t)).toEqual({
+      events: [
+        uev(URI_TOKENS.bought, 0, 'offer_removed', {
+          account: SELLER,
+          offer_id: URI_TOKENS.bought.id,
+          is_sell_offer: 1,
+          amount: '4200',
+          currency: 'XAH',
+          removed_by: 'sale',
+        }),
+        uev(URI_TOKENS.bought, 1, 'sale', {
+          account: buyer,
+          from_account: SELLER,
+          to_account: buyer,
+          offer_id: URI_TOKENS.bought.id,
+          is_sell_offer: 1,
+          amount: '4300',
+          currency: 'XAH',
+        }),
+      ],
+      skipped: 0,
+    });
+  });
+
+  it('synthetic-uritoken-setremarks-with-offer: a SetRemarks of a token with a standing offer is no offer_create', async () => {
+    const t = await uriSynthetic['synthetic-uritoken-setremarks-with-offer']();
+    expect(t.tx.TransactionType).toBe('SetRemarks');
+    // The offer stands in the entry's FinalFields, and nothing changed it: PreviousFields do not list an Amount.
+    expect(uriBody(t.meta as Json).FinalFields.Amount).toBe('2200000000');
+    expect(uriBody(t.meta as Json).PreviousFields.Amount).toBeUndefined();
+    expect(parseXahau(t)).toEqual({ events: [], skipped: 0 });
+  });
+
   it('synthetic-uritoken-remit-no-offer: a token that had no offer is only transferred, and nothing is removed or skipped', async () => {
     const t = await uriSynthetic['synthetic-uritoken-remit-no-offer']();
     expect(uriBody(t.meta as Json).PreviousFields).toEqual({ Owner: SELLER });
@@ -1840,11 +1930,15 @@ describe('NftParser: synthetic Xahau URIToken cases', () => {
     });
   });
 
-  it('an MPT amount skips the event and counts it (synthetic-uritoken-mpt-offer, synthetic-uritoken-mpt-buy)', async () => {
+  it('an MPT amount skips the event and counts it (synthetic-uritoken-mpt-offer, -mpt-buy, -mpt-mint-offer)', async () => {
     // A sell offer priced in an MPT: no event, one skipped.
     expect(parseXahau(await uriSynthetic['synthetic-uritoken-mpt-offer']())).toEqual({ events: [], skipped: 1 });
     // A buy priced in an MPT: the offer's removal and the sale are each skipped, and the token's move is no event.
     expect(parseXahau(await uriSynthetic['synthetic-uritoken-mpt-buy']())).toEqual({ events: [], skipped: 2 });
+    // A mint with an MPT-priced offer (synthetic-uritoken-mpt-mint-offer): the mint stays, its offer is skipped.
+    const mint = parseXahau(await uriSynthetic['synthetic-uritoken-mpt-mint-offer']());
+    expect(mint.events.map((e) => e.event)).toEqual(['mint']);
+    expect(mint.skipped).toBe(1);
   });
 
   it('a transaction that failed gives no event (synthetic-uritoken-failed-mint)', async () => {
