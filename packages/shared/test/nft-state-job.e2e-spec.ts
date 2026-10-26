@@ -825,6 +825,77 @@ describe('the nft_state job (e2e)', () => {
       expect(await ids(400, 2)).toEqual({ nfts: [crowd[0], crowd[1], crowd[3], crowd[4]], upTo: 500 });
     });
 
+    it('nftsChangedSince with a cap reads only the window after the cursor, and says it is complete up to the end of it', async () => {
+      const ch = await fresh();
+      const [a, b, c] = [idOf(70), idOf(71), idOf(72)];
+      await insertEvents(ch, [mint(a, 100, ALICE), mint(b, 200, ALICE), mint(c, 300, ALICE)]);
+      await commitLedgers(ch, [400]);
+      const ids = async (ledger: number, limit: number, to?: number) => {
+        const changed = await nftsChangedSince(ch, ledger, limit, to);
+        return { nfts: changed.nfts.map((k) => k.nft_id), upTo: changed.upTo };
+      };
+
+      // the window (0, 150]: a, and the cursor may go to 150 (the NFTs after it are for the next window)
+      expect(await ids(0, 10, 150)).toEqual({ nfts: [a], upTo: 150 });
+      expect(await ids(150, 10, 250)).toEqual({ nfts: [b], upTo: 250 });
+      expect(await ids(250, 10, 350)).toEqual({ nfts: [c], upTo: 350 });
+      // a window with nothing stale in it is complete up to its end: the cursor crosses it
+      expect(await ids(0, 10, 50)).toEqual({ nfts: [], upTo: 50 });
+      expect(await ids(100, 10, 199)).toEqual({ nfts: [], upTo: 199 });
+      // the touches of the ledgers above the cap are not looked at, stale as they are; the end of the window is inclusive
+      expect(await ids(0, 10, 200)).toEqual({ nfts: [a, b], upTo: 200 });
+      expect(await ids(0, 10, 299)).toEqual({ nfts: [a, b], upTo: 299 });
+      // a cap at or above the head is the head, and no cap is the same
+      expect(await ids(0, 10, 400)).toEqual({ nfts: [a, b, c], upTo: 400 });
+      expect(await ids(0, 10, 1_000_000)).toEqual({ nfts: [a, b, c], upTo: 400 });
+      expect(await ids(0, 10)).toEqual({ nfts: [a, b, c], upTo: 400 });
+      // nothing, and the cursor where it was, while the end of the window is not past it
+      expect(await ids(150, 10, 150)).toEqual({ nfts: [], upTo: 150 });
+      expect(await ids(150, 10, 100)).toEqual({ nfts: [], upTo: 150 });
+      expect(await ids(400, 10, 500)).toEqual({ nfts: [], upTo: 400 });
+      // a rebuilt NFT is not stale in its window either
+      await rebuildNfts(ch, [keyOf(b)]);
+      expect(await ids(0, 10, 250)).toEqual({ nfts: [a], upTo: 250 });
+
+      // the cursor crosses the history one window at a time and meets every NFT once
+      const met: string[] = [];
+      let cursor = 0;
+      for (let i = 0; i < 100 && cursor < 400; i++) {
+        const changed = await ids(cursor, 10, cursor + 60);
+        met.push(...changed.nfts);
+        expect(changed.upTo).toBeGreaterThan(cursor);
+        cursor = changed.upTo;
+      }
+      expect([cursor, met]).toEqual([400, [a, c]]);
+    });
+
+    it('nftsChangedSince with a cap cuts before the first NFT left out of the window, and takes all of a first ledger with more than limit', async () => {
+      const ch = await fresh();
+      const [a, b, c, d, e] = [idOf(80), idOf(81), idOf(82), idOf(83), idOf(84)];
+      await insertEvents(ch, [
+        mint(a, 100, ALICE),
+        mint(b, 100, ALICE, { tx_index: 1 }),
+        mint(c, 120, ALICE),
+        mint(d, 130, ALICE),
+        mint(e, 500, ALICE),
+      ]);
+      const ids = async (ledger: number, limit: number, to?: number) => {
+        const changed = await nftsChangedSince(ch, ledger, limit, to);
+        return { nfts: changed.nfts.map((k) => k.nft_id), upTo: changed.upTo };
+      };
+      // the window (0, 140] holds a, b, c, d: with a limit of 3 the first left out is d (130), and the cursor is complete up to 129
+      expect(await ids(0, 3, 140)).toEqual({ nfts: [a, b, c], upTo: 129 });
+      // with a limit of 4 they all fit, and the window is complete to its end, not to the head (e is above it)
+      expect(await ids(0, 4, 140)).toEqual({ nfts: [a, b, c, d], upTo: 140 });
+      // a limit of 1: the first left out is b, whose first touch is the one of a: all of ledger 100
+      expect(await ids(0, 1, 140)).toEqual({ nfts: [a, b], upTo: 100 });
+      // the window (100, 130] holds c and d (the touches of ledger 100 are before it): both fit a limit of 2, one a limit of 1
+      expect(await ids(100, 2, 130)).toEqual({ nfts: [c, d], upTo: 130 });
+      expect(await ids(100, 1, 130)).toEqual({ nfts: [c], upTo: 129 });
+      // and a window that ends before d does not see it
+      expect(await ids(100, 2, 129)).toEqual({ nfts: [c], upTo: 129 });
+    });
+
     it('nftStateWatermark is the ledger before the oldest touch its NFT has not seen', async () => {
       const ch = await fresh();
       // no ledger: 0

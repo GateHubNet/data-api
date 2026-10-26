@@ -34,6 +34,12 @@ export const NFT_STATE_BATCH = 500;
 /** How many ledgers of an `nft_dirty` range one step of the job rebuilds. */
 export const NFT_DIRTY_STEP_LEDGERS = 10_000;
 
+/**
+ * How many ledgers one live read of the job looks at (`nftsChangedSince` with `to`): a cursor far behind the head would otherwise
+ * group every touch after it in one query. The cursor crosses a stretch of ledgers with nothing stale one window per read.
+ */
+export const NFT_LIVE_STEP_LEDGERS = 10_000;
+
 type Counted = number | string;
 
 /** The key of an NFT in `nfts` (`ORDER BY (issuer, taxon_key, serial, nft_id)`). */
@@ -114,11 +120,12 @@ const IS_STALE = 't.ledger_index > ifNull(p.reflected, 0)';
 const onlyTouched = (condition: string): string =>
   `WHERE (${KEY_COLUMNS}) IN (SELECT ${KEY_COLUMNS} FROM ${Table.NftTouches} WHERE ${condition})`;
 
+/** The ledgers `(ledger, head]`: `head` is the end of the window of the read (the committed head, or the cap below it). */
 const RANGE_AFTER = 'ledger_index > {ledger:UInt32} AND ledger_index <= {head:UInt32}';
 
 /**
- * The stale NFTs after `ledger` (up to the head), with the first stale ledger of each: a range of the primary key of the
- * touches, which are ordered by ledger, and the rows of `nfts` of the NFTs they name only.
+ * The stale NFTs after `ledger` (up to the end of the window), with the first stale ledger of each: a range of the primary key
+ * of the touches, which are ordered by ledger, and the rows of `nfts` of the NFTs they name only.
  */
 const NFTS_CHANGED_SINCE_SQL = `SELECT t.issuer AS issuer, t.taxon_key AS taxon_key, t.serial AS serial, t.nft_id AS nft_id,
        min(t.ledger_index) AS first_ledger
@@ -143,30 +150,40 @@ export interface NftsChanged {
   nfts: NftKey[];
   /**
    * The ledger up to which `nfts` is everything there is: every NFT with a stale touch in `(ledger, upTo]` is in it. Equal to
-   * the ledger when the committed head is not past it; higher than it otherwise, also with no NFT to rebuild.
+   * the ledger when the end of the window (the committed head, or the cap `to`) is not past it; higher than it otherwise, also
+   * with no NFT to rebuild.
    */
   upTo: number;
 }
 
 /**
  * The NFTs to rebuild after `ledger`: those with a touch above what their newest `nfts` row has seen, in a committed ledger
- * (`committedHead`), oldest such touch first, at most `limit` of them, and the ledger the answer is complete up to. A caller that has
- * rebuilt `nfts` goes on from `upTo`, and nothing is missed or waits for ever.
+ * (`committedHead`), oldest such touch first, at most `limit` of them, and the ledger the answer is complete up to. A caller that
+ * has rebuilt `nfts` goes on from `upTo`, and nothing is missed or waits for ever.
  *
- *  - When there are no more than `limit` such NFTs they are all returned and `upTo` is the head (the ledgers between their
- *    touches and the head have no stale touch, so the cursor may skip them: also when no NFT is returned).
- *  - Otherwise the NFTs whose first stale touch is before that of the first one left out are returned, and `upTo` is the
- *    ledger before it.
+ * The read looks at the window `(ledger, end]`, where `end` is the committed head, or `to` when that is lower (a cap on how far
+ * one read goes, so that a cursor far behind the head does not group every touch after it: see `NFT_LIVE_STEP_LEDGERS`).
+ *
+ *  - When there are no more than `limit` such NFTs in the window they are all returned and `upTo` is its end (the ledgers between
+ *    their touches and the end have no stale touch, so the cursor may skip them: also when no NFT is returned).
+ *  - Otherwise the NFTs whose first stale touch is before that of the first one left out are returned, and `upTo` is the ledger
+ *    before it.
  *  - When more than `limit` NFTs have their first stale touch in the very first ledger there is, the cut would never move on,
  *    so all the NFTs of that ledger are returned (more than `limit` of them) and `upTo` is that ledger.
- *  - Nothing is returned, and `upTo` is `ledger`, while the head is not past it.
+ *  - Nothing is returned, and `upTo` is `ledger`, while the end of the window is not past it.
  */
-export async function nftsChangedSince(ch: ClickHouseService, ledger: number, limit: number): Promise<NftsChanged> {
+export async function nftsChangedSince(
+  ch: ClickHouseService,
+  ledger: number,
+  limit: number,
+  to?: number,
+): Promise<NftsChanged> {
   const n = Math.max(1, Math.floor(limit));
   const head = await committedHead(ch);
-  if (head <= ledger) return { nfts: [], upTo: ledger };
-  const rows = await ch.query<ChangedNft>(NFTS_CHANGED_SINCE_SQL, { ledger, head, n: n + 1 });
-  if (rows.length <= n) return { nfts: rows.map(keyOf), upTo: head };
+  const end = to === undefined ? head : Math.min(head, to);
+  if (end <= ledger) return { nfts: [], upTo: ledger };
+  const rows = await ch.query<ChangedNft>(NFTS_CHANGED_SINCE_SQL, { ledger, head: end, n: n + 1 });
+  if (rows.length <= n) return { nfts: rows.map(keyOf), upTo: end };
   const edge = Number(rows[n].first_ledger);
   const before = rows.slice(0, n).filter((r) => Number(r.first_ledger) < edge);
   if (before.length > 0) return { nfts: before.map(keyOf), upTo: edge - 1 };

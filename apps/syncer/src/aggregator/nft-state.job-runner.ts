@@ -6,6 +6,7 @@ import {
   markNftDirty,
   narrowNftDirty,
   NFT_DIRTY_STEP_LEDGERS,
+  NFT_LIVE_STEP_LEDGERS,
   NFT_STATE_BATCH,
   nftDirtyLedgers,
   NftDirtyRange,
@@ -47,7 +48,7 @@ export interface AggregatorNfts {
 export interface NftStateFunctions {
   /** Where the live job goes on from after a start: see `nftStateWatermark`. */
   watermark: typeof nftStateWatermark;
-  /** The stale NFTs after a ledger, and the ledger the answer is complete up to. */
+  /** The stale NFTs in a window of ledgers after a ledger (up to a cap), and the ledger the answer is complete up to. */
   changedSince: typeof nftsChangedSince;
   /** The NFTs of a ledger range (the step of an `nft_dirty` range). */
   inLedgers: typeof nftsInLedgers;
@@ -106,6 +107,12 @@ interface NftBatch {
   counted?: boolean;
 }
 
+/**
+ * How many turns of the microtask queue a read of the cursor is given to settle before the live part looks for it: enough for a
+ * function that already has its answer, never for a query, which is waited for by no one (see `NftStateJobRunner.run`).
+ */
+const QUICK_READ_TURNS = 8;
+
 /** The two sweeps that rebuild NFTs in batches: the live one, and the steps of the oldest `nft_dirty` range. */
 type BatchKind = 'live' | 'dirty';
 
@@ -123,6 +130,8 @@ interface DirtyStep {
   /** The batch whose halving is under way, and how many of the NFTs at the front of `rest` it was made of. */
   batch?: NftBatch;
   taken: number;
+  /** Whether a batch of the step set an NFT aside: the range of the step is marked again when the step is done. */
+  markAgain: boolean;
 }
 
 /**
@@ -134,10 +143,15 @@ interface DirtyStep {
  */
 export class NftStateJobRunner {
   /**
-   * The cursor of `nft_state`: every NFT with a touch up to this ledger has been rebuilt. Unknown until the first tick reads it
-   * from the tables (`nftStateWatermark`); it only moves past a batch that was written.
+   * The cursor of `nft_state`: every NFT with a touch up to this ledger has been rebuilt. Unknown until a read of it from the
+   * tables (`nftStateWatermark`) has answered (`run`); it only moves past a batch that was written.
    */
   private watermark?: number;
+  /** Whether a read of the cursor is in flight: it is not awaited by the run that starts it. */
+  private reading = false;
+  /** When the next read of the cursor may start after one that failed, and the wait after the next failure (0: none failed). */
+  private readRetryAt = 0;
+  private readDelayMs = 0;
   /** The newest committed ledger as of the end of the last run, for `lag`. */
   private head?: number;
   /** The NFTs that failed on their own: when to try each again, and the wait after the next failure. */
@@ -150,6 +164,8 @@ export class NftStateJobRunner {
   private pending?: NftBatch;
   /** The step of the oldest dirty range that is under way. */
   private step?: DirtyStep;
+  /** The dirty ranges (`<from>-<to>`) this run marked again: they wait for the next run, so that one that keeps failing is not done over and over in a run. */
+  private readonly remarked = new Set<string>();
   /**
    * The batches (their NFTs) in which every list failed, by sweep: in the run in progress, and in the run just before. The same
    * batch coming again in the next run of its sweep is a repeat: a key older than that, or of the other sweep, is not.
@@ -167,22 +183,34 @@ export class NftStateJobRunner {
     private readonly onRebuilt: (keys: CollectionKey[]) => void,
   ) {}
 
-  /** How many ledgers the live cursor is behind the newest committed one; none until both are known. */
+  /**
+   * How many ledgers the live cursor is behind the newest committed one; none until the head is known. While the cursor is not
+   * known (its read has not answered) every ledger is behind it.
+   */
   get lag(): number | undefined {
-    if (this.watermark === undefined || this.head === undefined) return undefined;
-    return Math.max(0, this.head - this.watermark);
+    if (this.head === undefined) return undefined;
+    return Math.max(0, this.head - (this.watermark ?? 0));
   }
 
   /**
    * One run of the job: the live sweep, then the retries of the NFTs set aside, then the steps of the dirty ranges, each until
    * nothing is left, the budget of the job is spent, or the shutdown begins. Each part runs although the one before it failed
-   * (a watermark that cannot be read, a batch that fails as a whole): the first failure is the error of the job, which is
-   * logged and counted as `nft_state` (and the jobs after this one still run); the others are logged and counted here. The
-   * gauges are set at the end of every run.
+   * (a batch that fails as a whole): the first failure is the error of the job, which is logged and counted as `nft_state` (and
+   * the jobs after this one still run); the others are logged and counted here. The gauges are set at the end of every run.
+   *
+   * The cursor is read at the first run, and again at a later one while it is not known, **without waiting for the read**: on a
+   * mainnet-sized table it may take as long as the time limit of a query (30 s), which is as long as a tick, and a run that waited
+   * for it would leave nothing of the tick to the jobs after it, every tick. The live part starts at the first run after the
+   * read has answered (one that answers at once, as a function with its answer in hand does, in the same run); the retries and
+   * the dirty part do not need the cursor, and go on. A read that fails is counted and logged, and is started again only after a
+   * wait (`NFT_RETRY_MS`, doubling up to `NFT_MAX_RETRY_MS`).
    */
   async run(tick: AggregatorTick): Promise<void> {
     this.nextRun('live');
     this.nextRun('dirty');
+    this.remarked.clear();
+    this.startRead();
+    await this.letQuickReadSettle();
     const failures: unknown[] = [];
     const part = async (work: () => Promise<void>): Promise<void> => {
       try {
@@ -191,12 +219,7 @@ export class NftStateJobRunner {
         failures.push(error);
       }
     };
-    await part(async () => {
-      // the first read of a mainnet-sized table may not fit the time limit of a query: it is a failure of this run, and the
-      // next one reads it again (the cursor stays unknown until it works)
-      this.watermark ??= await this.fns.watermark(this.ctx.ch);
-      await this.live(tick);
-    });
+    if (this.watermark !== undefined) await part(() => this.live(tick));
     await part(() => this.retries(tick));
     await part(() => this.dirty(tick));
     await this.report();
@@ -206,6 +229,44 @@ export class NftStateJobRunner {
     }
   }
 
+  /** Starts a read of the cursor, not awaited, unless it is known, one is in flight, the wait after a failure is not over, or the stop has begun. */
+  private startRead(): void {
+    if (this.watermark !== undefined || this.reading || this.ctx.closing() || this.ctx.clock() < this.readRetryAt)
+      return;
+    // `readWatermark` handles what goes wrong with it; the catch only keeps a failure of the reporting from being unhandled
+    void this.readWatermark().catch(() => undefined);
+  }
+
+  /**
+   * Reads the cursor from the tables (`nftStateWatermark`) and keeps it. A failure is counted and logged as `nft_state`, and sets
+   * the time before which no new read starts. Once the shutdown has begun the result, or the failure, is of no use and is dropped.
+   */
+  private async readWatermark(): Promise<void> {
+    this.reading = true;
+    try {
+      const watermark = await this.fns.watermark(this.ctx.ch);
+      if (this.ctx.closing()) return;
+      this.watermark = watermark;
+    } catch (err) {
+      if (this.ctx.closing()) return;
+      const delayMs = this.readDelayMs === 0 ? NFT_RETRY_MS : Math.min(this.readDelayMs * 2, NFT_MAX_RETRY_MS);
+      this.readDelayMs = delayMs;
+      this.readRetryAt = this.ctx.clock() + delayMs;
+      this.ctx.failed(
+        'nft_state',
+        err,
+        ` reading where the job goes on from, tried again in ${Math.round(delayMs / 60_000)} min`,
+      );
+    } finally {
+      this.reading = false;
+    }
+  }
+
+  /** Gives a read of the cursor that is answered at once a few turns of the microtask queue to settle; a query is not waited for. */
+  private async letQuickReadSettle(): Promise<void> {
+    for (let turn = 0; turn < QUICK_READ_TURNS && this.reading; turn++) await Promise.resolve();
+  }
+
   /** The stale NFTs after the cursor, a batch at a time; the cursor moves past a batch once it is done. */
   private async live(tick: AggregatorTick): Promise<void> {
     for (;;) {
@@ -213,15 +274,18 @@ export class NftStateJobRunner {
       const ledger = this.watermark as number;
       let batch = this.pending;
       if (!batch) {
-        const { nfts, upTo } = await this.fns.changedSince(this.ctx.ch, ledger, NFT_STATE_BATCH);
+        // one window of ledgers at a time: a cursor far behind the head does not group every touch after it in one query
+        const cap = ledger + NFT_LIVE_STEP_LEDGERS;
+        const { nfts, upTo } = await this.fns.changedSince(this.ctx.ch, ledger, NFT_STATE_BATCH, cap);
         if (this.ctx.closing()) return;
         batch = this.newBatch('live', nfts, upTo);
         if (!batch) {
-          // nothing to rebuild up to `upTo` (no stale NFT, or those waiting for a retry): the cursor goes there, and that is all
-          // there is when the answer has no NFT; with NFTs set aside there may be more
+          // nothing to rebuild up to `upTo` (no stale NFT, or those waiting for a retry): the cursor goes there. An answer with
+          // no NFT that stopped short of the cap is complete up to the head, and that is all there is; one that reached the end
+          // of its window (or has NFTs set aside) may have more behind it, which the next read looks at while the budget lasts
           if (upTo <= ledger) return;
           this.watermark = upTo;
-          if (nfts.length === 0) return;
+          if (nfts.length === 0 && upTo < cap) return;
           continue;
         }
         this.pending = batch;
@@ -279,7 +343,9 @@ export class NftStateJobRunner {
    *  - When the batch is done, its suspects are set aside for a retry (`NFT_RETRY_MS`), each counted as an error of `nft_state`
    *    ... but only if something in the batch worked, or if it is a repeat of a batch in which everything failed: a batch where
    *    everything fails (the database is down) is the failure of the job, thrown, and the same batch coming again with the same
-   *    NFTs failing alone is the one that proves them guilty.
+   *    NFTs failing alone is the one that proves them guilty. The suspects of a live batch are retried from memory (a restart
+   *    finds them again: they are stale in the tables); those of a batch of a dirty step are not (nothing in the tables says they
+   *    are stale), so the step is marked again instead (`dirty`), and they are tried again when it comes round.
    *  - A list that failed and yet whose halves worked, with no NFT found below it, is warned about and counted: it fails as a
    *    whole for its size, and would otherwise leave no trace.
    *
@@ -326,8 +392,12 @@ export class NftStateJobRunner {
     for (const { node, error } of batch.suspects) {
       for (let up: NftNode | undefined = node; up; up = up.parent) up.leadsToNft = true;
       const nft = node.nfts[0];
-      this.retry.set(nft.nft_id, { key: nft, until: this.ctx.clock() + NFT_RETRY_MS, delayMs: NFT_RETRY_MS });
-      this.ctx.failed('nft_state', error, ` for NFT ${nft.nft_id}, set aside to be tried again`);
+      if (kind === 'live') {
+        this.retry.set(nft.nft_id, { key: nft, until: this.ctx.clock() + NFT_RETRY_MS, delayMs: NFT_RETRY_MS });
+        this.ctx.failed('nft_state', error, ` for NFT ${nft.nft_id}, set aside to be tried again`);
+      } else {
+        this.ctx.failed('nft_state', error, ` for NFT ${nft.nft_id}, its dirty range is marked again`);
+      }
     }
     // a failure from which nothing led to an NFT: the topmost of each such tree (the whole batch is not counted again when its
     // failure was counted at the tick of it)
@@ -376,6 +446,12 @@ export class NftStateJobRunner {
    * deleted when it is done, so that progress survives a restart. It runs in what the live sweep left of the budget; a step that
    * does not fit in it goes on at the next tick where it stopped. A step that fails keeps the NFTs it has not rebuilt, and the
    * range stays as it was.
+   *
+   * An NFT of a step that fails on its own is counted, and the range of the step is **marked again** before it is narrowed or
+   * deleted: nothing in the tables says the NFT is stale (a re-ingest changed its events behind the cursor, and left no touch
+   * above what its row has seen), so a restart could not find it again, as it does the NFTs the live part sets aside. The new
+   * mark is the newest, so the step comes round again at the back of the queue, and an NFT that keeps failing keeps it
+   * circulating, once a run at most (a range marked again in a run waits for the next one).
    */
   private async dirty(tick: AggregatorTick): Promise<void> {
     for (;;) {
@@ -384,15 +460,20 @@ export class NftStateJobRunner {
       if (!step) {
         const range = await this.fns.oldestDirty(this.ctx.ch);
         if (this.ctx.closing() || !range) return;
+        if (this.remarked.has(`${range.from}-${range.to}`)) return;
         const to = Math.min(range.to, range.from + NFT_DIRTY_STEP_LEDGERS - 1);
         const nfts = await this.fns.inLedgers(this.ctx.ch, range.from, to);
         if (this.ctx.closing()) return;
-        step = { range, to, rest: nfts, taken: 0 };
+        step = { range, to, rest: nfts, taken: 0, markAgain: false };
         this.step = step;
       }
       if (!(await this.rebuildStep(step, tick))) return;
       // nothing is written to `nft_dirty` once the shutdown has begun: the range stays, and is done again
       if (this.ctx.closing()) return;
+      if (step.markAgain) {
+        await this.fns.markDirty(this.ctx.ch, step.range.from, step.to);
+        this.remarked.add(`${step.range.from}-${step.to}`);
+      }
       if (step.to >= step.range.to) await this.fns.deleteDirty(this.ctx.ch, step.range);
       else await this.fns.narrowDirty(this.ctx.ch, step.range, step.to + 1);
       this.ctx.logger.debug(`nft_state: ledgers ${step.range.from} - ${step.to} of a dirty range are rebuilt`);
@@ -422,6 +503,7 @@ export class NftStateJobRunner {
         throw err;
       }
       if (!finished) return false;
+      if (step.batch.suspects.length > 0) step.markAgain = true;
       step.batch = undefined;
       step.rest.splice(0, step.taken);
     }

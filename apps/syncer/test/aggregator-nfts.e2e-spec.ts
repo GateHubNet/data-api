@@ -9,6 +9,7 @@ import {
   markNftDirty,
   narrowNftDirty,
   NFT_DIRTY_STEP_LEDGERS,
+  NFT_LIVE_STEP_LEDGERS,
   NFT_STATE_BATCH,
   nftDirtyLedgers,
   NftEventsRow,
@@ -141,6 +142,22 @@ describe('AggregatorService nft_state job (e2e)', () => {
     return { svc, metrics, errors };
   }
 
+  /**
+   * Ticks until the lag of the live cursor is 0, and says how many it took: the first tick starts the read of the cursor and does
+   * not wait for it (a query may take as long as the tick), so the live part begins at the next.
+   */
+  async function catchUp(
+    { svc, metrics }: { svc: AggregatorService; metrics: FakeMetrics },
+    most = 5,
+  ): Promise<number> {
+    let ticks = 0;
+    do {
+      await svc.tick(NOW);
+      ticks++;
+    } while (valuesOf(metrics.nftStateLagLedgers).at(-1) !== 0 && ticks < most);
+    return ticks;
+  }
+
   /** The newest version of each NFT, without its version. */
   async function nftsOf(ch: ClickHouseService): Promise<StoredNft[]> {
     const rows = await ch.query<NftsRow>(`SELECT * FROM ${Table.Nfts} ORDER BY ${KEY}, version DESC LIMIT 1 BY ${KEY}`);
@@ -175,11 +192,10 @@ describe('AggregatorService nft_state job (e2e)', () => {
 
     expect(await count(ch, Table.Nfts)).toBe(0);
     const { svc, metrics, errors } = aggregator(ch);
-    let ticks = 0;
-    do {
-      await svc.tick(NOW);
-      ticks++;
-    } while (valuesOf(metrics.nftStateLagLedgers).at(-1) !== 0 && ticks < 5);
+    // the first tick starts the read of the cursor, and everything is behind it until it is known
+    await svc.tick(NOW);
+    expect(valuesOf(metrics.nftStateLagLedgers)[0]).toBeGreaterThan(0);
+    await catchUp({ svc, metrics });
     expect(valuesOf(metrics.nftStateLagLedgers).at(-1)).toBe(0);
     expect(errors).not.toHaveBeenCalled();
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
@@ -206,9 +222,36 @@ describe('AggregatorService nft_state job (e2e)', () => {
     await svc.tick(NOW);
     expect(await count(ch, Table.Nfts)).toBe(rows);
     const restarted = aggregator(ch);
-    await restarted.svc.tick(NOW);
+    await catchUp(restarted);
     expect(await count(ch, Table.Nfts)).toBe(rows);
     expect(restarted.errors).not.toHaveBeenCalled();
+  });
+
+  it('crosses a long stretch of ledgers with nothing in it one window at a time', async () => {
+    const ch = await fresh();
+    // the newest committed ledger is far past the recorded ones: the cursor has 40,000 ledgers to go over after them
+    const head = LAST_LEDGER + 4 * NFT_LIVE_STEP_LEDGERS + 123;
+    await ch.insert(Table.Ledgers, [{ ledger_index: head, ledger_hash: 'F'.repeat(64), close_time: NEWEST_CLOSE + 1 }]);
+
+    const reads: Array<[number, number | undefined]> = [];
+    const { svc, metrics, errors } = aggregator(ch, {
+      nftStateFunctions: {
+        changedSince: async (db, ledger, limit, to) => {
+          reads.push([ledger, to]);
+          return nftsChangedSince(db, ledger, limit, to);
+        },
+      },
+    });
+    expect(await catchUp({ svc, metrics })).toBeLessThanOrEqual(3);
+    expect(valuesOf(metrics.nftStateLagLedgers).at(-1)).toBe(0);
+    expect(errors).not.toHaveBeenCalled();
+
+    // from the ledger before the oldest NFT, a window of NFT_LIVE_STEP_LEDGERS at a time, up to the head
+    expect(reads.map(([ledger]) => ledger)).toEqual(
+      [0, 1, 2, 3, 4, 5].map((window) => FIRST_LEDGER - 1 + window * NFT_LIVE_STEP_LEDGERS),
+    );
+    for (const [ledger, to] of reads) expect(to).toBe(ledger + NFT_LIVE_STEP_LEDGERS);
+    expect((await nftsOf(ch)).map((n) => n.nft_id).sort()).toEqual(NFT_IDS);
   });
 
   describe('120,000 NFTs of one owner', () => {
@@ -293,7 +336,8 @@ describe('AggregatorService nft_state job (e2e)', () => {
         // the whole tick: the budget, the longest batch, and the reads and the stats around it
         expect([i, tick.ms < AGGREGATOR_NFT_STATE_BUDGET_MS + Math.max(...took) + 2000]).toEqual([i, true]);
       }
-      expect(ticks.slice(0, -1).every((t) => t.batches >= 1)).toBe(true);
+      // (the first tick only starts the read of the cursor, and the last one has what is left)
+      expect(ticks.slice(1, -1).every((t) => t.batches >= 1)).toBe(true);
 
       // every NFT has its row, and its owner holds it: 120,000 rows and one holding each
       const stored = await ch.queryOne<{ n: number | string; rows: number | string }>(
@@ -338,7 +382,7 @@ describe('AggregatorService nft_state job (e2e)', () => {
       const ch = await parserFourWorld();
       const { svc, metrics, errors } = aggregator(ch);
       // the job has run on the world of parser 4: nothing to rebuild, and its cursor is at the head
-      await svc.tick(NOW);
+      await catchUp({ svc, metrics });
       expect(await count(ch, Table.Nfts)).toBe(0);
       expect(await count(ch, Table.NftEvents)).toBe(0);
 
@@ -383,7 +427,7 @@ describe('AggregatorService nft_state job (e2e)', () => {
       const ch = await fresh();
       // the job has built every NFT
       const first = aggregator(ch);
-      await first.svc.tick(NOW);
+      await catchUp(first);
       expect(await count(ch, Table.Nfts)).toBe(NFT_IDS.length);
 
       // a re-ingest drops the events of two NFTs: one in the first step of ledgers of the range, one in the second

@@ -319,11 +319,17 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     its `account_nfts` rows (one per account that ever held it, `held` 1 for the owner), `NFT_STATE_BATCH` NFTs at a time,
  *     oldest change first, for at most `AGGREGATOR_NFT_STATE_BUDGET_MS`; the cursor, the halving of a batch that fails (at
  *     most `MAX_ISOLATED_NFTS_PER_BATCH` NFTs are set aside, retried after `NFT_RETRY_MS`, doubling up to an hour) and the
- *     retries are those of `amm_pools`, and the cursor is found again from the tables when the process starts
- *     (`nftStateWatermark`); a read of it that fails is the failure of the run, tried again at the next one. Then, in what is
- *     left of the budget, the oldest range of `nft_dirty` (ledgers that a re-ingest rewrote behind the job): the NFTs of its
- *     first `NFT_DIRTY_STEP_LEDGERS` ledgers are rebuilt in batches, and the range is replaced by its remainder (or deleted
- *     when done), so that progress survives a restart. Only committed ledgers are read.
+ *     retries are those of `amm_pools`. Each read of what changed looks at a window of `NFT_LIVE_STEP_LEDGERS` ledgers after
+ *     the cursor, so that a cursor far behind the head crosses a stretch with nothing in it window by window, while the budget
+ *     lasts. The cursor is found again from the tables when the process starts (`nftStateWatermark`: a join of every touch with
+ *     the NFTs, which may take as long as the time limit of a query), by a read that the run does not wait for: the live part
+ *     starts at the first run after it has answered, the retries and the dirty part do not need it, and the jobs after this one
+ *     keep their share of the tick; a read that fails is counted and logged, and tried again after `NFT_RETRY_MS`, doubling up to
+ *     an hour. Then, in what is left of the budget, the oldest range of `nft_dirty` (ledgers that a re-ingest rewrote behind the
+ *     job): the NFTs of its first `NFT_DIRTY_STEP_LEDGERS` ledgers are rebuilt in batches, and the range is replaced by its
+ *     remainder (or deleted when done), so that progress survives a restart; an NFT that fails on its own in a step is counted,
+ *     and the range of the step is marked again, so that it is tried again when the step comes round (a restart could not
+ *     find it from the tables). Only committed ledgers are read.
  *  4. **pair_hourly** (with the `aggregates` option): the candle of every pair in each hour of the last 31 days, the live hours
  *     first, then the back-fill (`PairHourlyJobRunner`).
  *  5. **markets_live** (with `aggregates`): the Markets set of each period, made of the hours of `pair_hourly`; the `day` set at

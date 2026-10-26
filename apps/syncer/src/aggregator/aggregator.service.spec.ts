@@ -2207,6 +2207,11 @@ describe('AggregatorService volume jobs', () => {
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('stats_dirty'));
     });
 
+    // `nft_state` is not registered in this test, on purpose: its job (3 s of its budget here) would move the stats slices and the
+    // volume sets of the dirty slices against the empirical bound on the length of a tick below (the budget of the tick, a stats
+    // slice, a set of each metric and the one closed day of `amm_daily`), which is a count of where the slices fall and not a
+    // property of the order of the jobs. That `nft_state` does not starve the live volumes, nor is starved, with every job
+    // registered and busy is shown in `aggregator.schedule.spec.ts`, whose bound is the budget of the tick plus one slice.
     it('a long stats sweep and a dirty backlog cannot starve the live volumes: they are refreshed first, at every tick, with every AMM job registered', async () => {
       // 60 days of stats to catch up, 4 s a slice; 30 dirty ranges of a day, 4 s a slice; 300 closed days of volumes (three
       // metrics, amm_volume the third) to back-fill, 3 s a set; the AMM pools (3 s a batch, always one more to do) and 225 closed days of amm_daily, 3 s a day,

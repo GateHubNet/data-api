@@ -3,6 +3,7 @@ import {
   DailyRates,
   MarketsConfig,
   NFT_DIRTY_STEP_LEDGERS,
+  NFT_LIVE_STEP_LEDGERS,
   NFT_STATE_BATCH,
   NftDirtyRange,
   NftKey,
@@ -88,6 +89,11 @@ describe('AggregatorService nft_state job', () => {
   let sliceLedgers: Map<string, { min: number; max: number }>;
   /** How long (fake milliseconds) the rebuild of a list of NFTs takes. */
   let rebuildMs: number;
+  /**
+   * The least a rebuild takes: the fake clock moves on at every call, so that a loop that does not progress runs out of its
+   * budget and fails an assertion instead of hanging the suite. The tests that count on exact times set it to 0.
+   */
+  let minMs: number;
   /** The NFTs the fake rebuild fails on, whatever list they are in. */
   let failing: Set<number>;
   /** The NFTs of the lists that the fake rebuild did write, in order. */
@@ -131,6 +137,7 @@ describe('AggregatorService nft_state job', () => {
     touched = new Map();
     sliceLedgers = new Map();
     rebuildMs = 0;
+    minMs = 1;
     failing = new Set();
     done = [];
     statsRecompute = jest.fn(async (_ch: unknown, from: Date) => {
@@ -152,7 +159,7 @@ describe('AggregatorService nft_state job', () => {
     });
     rebuild = jest.fn(async (_ch: unknown, nfts: NftKey[]) => {
       events.push(`rebuild ${serials(nfts).join(',')}`);
-      if (rebuildMs > 0) jest.setSystemTime(Date.now() + rebuildMs);
+      jest.setSystemTime(Date.now() + Math.max(rebuildMs, minMs));
       const bad = nfts.filter((k) => failing.has(k.serial));
       if (bad.length > 0) throw new Error(`DB::Exception: memory limit on NFT ${bad[0].serial}`);
       done.push(...serials(nfts));
@@ -279,10 +286,12 @@ describe('AggregatorService nft_state job', () => {
       await svc.tick();
       expect(watermark).toHaveBeenCalledTimes(1);
       expect(watermark).toHaveBeenCalledWith(ch);
-      expect(changedSince.mock.calls.map(([, ledger, limit]) => [ledger, limit])).toEqual([
-        [500, NFT_STATE_BATCH],
-        [700, NFT_STATE_BATCH],
-        [900, NFT_STATE_BATCH],
+      // each read is of one window of ledgers after the cursor: the last argument is the end of it
+      expect(NFT_LIVE_STEP_LEDGERS).toBe(10_000);
+      expect(changedSince.mock.calls.map(([, ledger, limit, to]) => [ledger, limit, to])).toEqual([
+        [500, NFT_STATE_BATCH, 500 + NFT_LIVE_STEP_LEDGERS],
+        [700, NFT_STATE_BATCH, 700 + NFT_LIVE_STEP_LEDGERS],
+        [900, NFT_STATE_BATCH, 900 + NFT_LIVE_STEP_LEDGERS],
       ]);
       // never before: a batch is rebuilt, and then the cursor moves
       expect(events.filter((e) => !e.startsWith('stats'))).toEqual([
@@ -330,6 +339,71 @@ describe('AggregatorService nft_state job', () => {
       expect(rebuilt()).toEqual([[1]]);
     });
 
+    describe('a cursor far behind the head', () => {
+      /** What `nftsChangedSince` answers with a cap: the stale NFTs of the window `(ledger, min(head, to)]`, and its end. Each read takes a second. */
+      function windowed(staleAt: Map<number, NftKey[]>): void {
+        changedSince.mockImplementation(async (_ch: unknown, ledger: number, _limit: number, to?: number) => {
+          events.push(`changed ${ledger}`);
+          jest.setSystemTime(Date.now() + 1000);
+          const end = Math.min(committed, to ?? committed);
+          if (end <= ledger) return { nfts: [], upTo: ledger };
+          const nfts = [...staleAt].filter(([at]) => at > ledger && at <= end).flatMap(([, list]) => list);
+          return { nfts, upTo: end };
+        });
+      }
+
+      it('crosses a stretch with nothing stale one window of NFT_LIVE_STEP_LEDGERS at a time, while the budget lasts, and goes on at the next tick', async () => {
+        committed = 50_000;
+        windowed(new Map([[32_000, [nft(7)]]]));
+        const svc = service({ budgetsMs: { nft_state: 2500 } });
+        await svc.tick();
+        // a read at 0, 1 and 2 s; the budget of 2.5 s is spent for a fourth
+        const reads = (): Array<[number, number | undefined]> =>
+          changedSince.mock.calls.map(([, ledger, , to]) => [ledger, to]);
+        expect(reads()).toEqual([
+          [500, 10_500],
+          [10_500, 20_500],
+          [20_500, 30_500],
+        ]);
+        expect(rebuild).not.toHaveBeenCalled();
+        expect(lastLag()).toBe(50_000 - 30_500);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('nft_state reached its budget'));
+
+        // the next tick goes on from the cursor, without reading the watermark again: the window with the NFT, which is rebuilt,
+        // and the last one, which ends at the head, short of its cap
+        await tickAt(svc, 1);
+        expect(watermark).toHaveBeenCalledTimes(1);
+        expect(reads().slice(3)).toEqual([
+          [30_500, 40_500],
+          [40_500, 50_500],
+        ]);
+        expect(rebuilt()).toEqual([[7]]);
+        expect(lastLag()).toBe(0);
+        // nothing is asked for beyond the head
+        await tickAt(svc, 2);
+        expect(reads().slice(5)).toEqual([[50_000, 60_000]]);
+        expect(lastLag()).toBe(0);
+      });
+
+      it('does not cross a window that has NFTs before their batch is written: a batch that fails as a whole keeps the cursor at the start of its window', async () => {
+        committed = 30_000;
+        const four = [1, 2, 3, 4].map(nft);
+        windowed(new Map([[5000, four]]));
+        for (const n of [1, 2, 3, 4]) failing.add(n);
+        const svc = service();
+        await svc.tick();
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500]);
+        expect(errors()).toBe(1);
+
+        failing.clear();
+        await tickAt(svc, 1);
+        // the same window again, now written, and then the stretch after it up to the head
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 500, 10_500, 20_500]);
+        expect(rebuilt().at(-1)).toEqual([1, 2, 3, 4]);
+        expect(lastLag()).toBe(0);
+      });
+    });
+
     it('a batch of more NFTs than the limit (all the NFTs of one ledger) is rebuilt whole', async () => {
       const many = Array.from({ length: NFT_STATE_BATCH + 100 }, (_, i) => nft(i + 1));
       pages.set(500, { nfts: many, upTo: 501 });
@@ -337,37 +411,162 @@ describe('AggregatorService nft_state job', () => {
       expect(rebuilt()).toEqual([serials(many)]);
     });
 
-    it('a failing read of the watermark is counted and logged as nft_state, the other jobs still run, and the next tick reads it again', async () => {
-      watermark.mockRejectedValueOnce(new Error('DB::Exception: Timeout exceeded: elapsed 30.001 seconds'));
+    it('a read of the watermark that fails is counted and logged as nft_state, the jobs after it still run, and the next read waits (5 minutes, then twice as long)', async () => {
+      const timeout = 'DB::Exception: Timeout exceeded: elapsed 30.001 seconds';
+      watermark.mockRejectedValueOnce(new Error(timeout)).mockRejectedValueOnce(new Error(timeout));
       pages.set(500, { nfts: [nft(1)], upTo: 700 });
       const after = jest.fn(async () => undefined);
       const svc = service({ extraJobs: [{ name: 'after_nft_state', run: after }] });
       await svc.tick();
       expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_state' }]]);
       expect(logger.error).toHaveBeenCalledWith(
-        'Aggregator job nft_state failed: DB::Exception: Timeout exceeded: elapsed 30.001 seconds',
+        `Aggregator job nft_state failed reading where the job goes on from, tried again in 5 min: ${timeout}`,
       );
-      // the loop goes on: the jobs after it ran (a run is counted only when the job did not throw)
-      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty', 'after_nft_state']);
+      // the loop goes on: the jobs after it ran, and the job itself did not fail (a failed read is not the error of its run)
+      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'after_nft_state']);
       expect(after).toHaveBeenCalledTimes(1);
       expect(changedSince).not.toHaveBeenCalled();
       expect(rebuild).not.toHaveBeenCalled();
-      // the cursor is not known, so the gauge of the lag is not set; the dirty ranges are still counted
-      expect(metrics.nftStateLagLedgers.set).not.toHaveBeenCalled();
+      // the cursor is not known: every ledger is behind it
+      expect(lastLag()).toBe(committed);
       expect(metrics.nftDirtyLedgers.set).toHaveBeenCalledWith(0);
 
-      // it fails again: counted again, still nothing stops
-      watermark.mockRejectedValueOnce(new Error('DB::Exception: Timeout exceeded: elapsed 30.001 seconds'));
-      await tickAt(svc, 1);
-      expect(errors()).toBe(2);
+      // not read again before the wait is over
+      await tickAt(svc, 4);
+      expect(watermark).toHaveBeenCalledTimes(1);
+      expect(errors()).toBe(1);
+      // and then it is, and fails again: counted again, and the wait is twice as long
+      await tickAt(svc, 5);
       expect(watermark).toHaveBeenCalledTimes(2);
+      expect(errors()).toBe(2);
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('tried again in 10 min'));
+      await tickAt(svc, 14);
+      expect(watermark).toHaveBeenCalledTimes(2);
+      expect(rebuild).not.toHaveBeenCalled();
 
-      // and a later tick reads it and goes on from there
-      await tickAt(svc, 2);
+      // the third read answers, and the live part goes on from it in the same run
+      await tickAt(svc, 15);
       expect(watermark).toHaveBeenCalledTimes(3);
       expect(rebuilt()).toEqual([[1]]);
-      expect(jobsRun()).toContain('nft_state');
       expect(errors()).toBe(2);
+      expect(jobsRun().filter((job) => job === 'nft_state')).toHaveLength(5);
+    });
+
+    describe('a read of the watermark that takes as long as the time limit of a query', () => {
+      /** The reads of the watermark that are out, which the test answers when it says. */
+      function pendingReads(): Array<{ resolve: (ledger: number) => void; reject: (error: Error) => void }> {
+        const reads: Array<{ resolve: (ledger: number) => void; reject: (error: Error) => void }> = [];
+        watermark.mockImplementation(() => new Promise<number>((resolve, reject) => reads.push({ resolve, reject })));
+        return reads;
+      }
+      /** Lets what a settled promise woke up run. */
+      const flush = (): Promise<void> => jest.advanceTimersByTimeAsync(0);
+      const timeout = new Error('DB::Exception: Timeout exceeded: elapsed 30.001 seconds');
+
+      it('does not hold the tick: the jobs after it run their slices, and so do the dirty part and the retries, while the live part waits for the cursor', async () => {
+        const reads = pendingReads();
+        dirty = [mark(100, 200)];
+        touched.set(150, [nft(7)]);
+        ch.dirty = [aggMark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+        const after = jest.fn(async () => undefined);
+        pages.set(500, { nfts: [nft(1)], upTo: 700 });
+        const svc = service({ extraJobs: [{ name: 'after_nft_state', run: after }] });
+        await svc.tick();
+
+        // the read is out, and nothing waited for it
+        expect(watermark).toHaveBeenCalledTimes(1);
+        expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'after_nft_state']);
+        expect(events).toContain('stats 2026-10-16T10:00:00Z'); // the slice of stats_live
+        expect(events).toContain('stats 2026-05-01T00:00:00Z'); // the slice of stats_dirty
+        expect(after).toHaveBeenCalledTimes(1);
+        expect(ch.dirty).toEqual([]);
+        // the dirty part of the job ran, the live part did not (it has no cursor)
+        expect(rebuilt()).toEqual([[7]]);
+        expect(dirty).toEqual([]);
+        expect(changedSince).not.toHaveBeenCalled();
+        expect(errors()).toBe(0);
+        // everything is behind a cursor that is not known
+        expect(lastLag()).toBe(committed);
+
+        // another tick does not start a second read while one is out
+        await tickAt(svc, 1);
+        expect(watermark).toHaveBeenCalledTimes(1);
+        expect(changedSince).not.toHaveBeenCalled();
+        expect(jobsRun().filter((job) => job === 'stats_live')).toHaveLength(2);
+
+        // it answers, and the next tick has the cursor
+        reads[0].resolve(500);
+        await flush();
+        await tickAt(svc, 2);
+        expect(watermark).toHaveBeenCalledTimes(1);
+        expect(rebuilt()).toEqual([[7], [1]]);
+        expect(errors()).toBe(0);
+      });
+
+      it('that fails once the tick is over is counted and logged as nft_state, and is read again only after 5 minutes, then after twice as long up to an hour', async () => {
+        const reads = pendingReads();
+        const svc = service();
+        await svc.tick();
+        expect(errors()).toBe(0);
+
+        // the query ran out of its 30 s while the tick went on
+        jest.setSystemTime(Date.now() + 30_000);
+        reads[0].reject(timeout);
+        await flush();
+        expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_state' }]]);
+        expect(logger.error).toHaveBeenCalledWith(
+          `Aggregator job nft_state failed reading where the job goes on from, tried again in 5 min: ${timeout.message}`,
+        );
+
+        let calls = 1;
+        for (const waitMinutes of [5, 10, 20, 40, 60, 60]) {
+          const failedAt = Date.now();
+          // not a second before the wait is over ...
+          jest.setSystemTime(failedAt + waitMinutes * 60_000 - 1000);
+          await svc.tick();
+          expect(watermark).toHaveBeenCalledTimes(calls);
+          // ... and at the end of it a new read starts, which fails again: counted, and the wait doubles (at most an hour)
+          jest.setSystemTime(failedAt + waitMinutes * 60_000);
+          await svc.tick();
+          expect(watermark).toHaveBeenCalledTimes(++calls);
+          reads[calls - 1].reject(timeout);
+          await flush();
+          expect(errors()).toBe(calls);
+        }
+        expect(logger.error).toHaveBeenLastCalledWith(expect.stringContaining('tried again in 60 min'));
+
+        // a read that answers ends it: the live part goes on from there at the next tick, and nothing is read again
+        const failedAt = Date.now();
+        jest.setSystemTime(failedAt + 60 * 60_000);
+        await svc.tick();
+        reads[calls].resolve(500);
+        await flush();
+        pages.set(500, { nfts: [nft(1)], upTo: 700 });
+        await svc.tick();
+        expect(watermark).toHaveBeenCalledTimes(calls + 1);
+        expect(rebuilt()).toEqual([[1]]);
+        expect(errors()).toBe(calls);
+      });
+
+      it('that fails once the shutdown has begun is dropped: no error, and no unhandled rejection', async () => {
+        const reads = pendingReads();
+        const unhandled = jest.fn();
+        process.on('unhandledRejection', unhandled);
+        try {
+          const svc = service();
+          await svc.tick();
+          void svc.stop();
+          reads[0].reject(timeout);
+          await flush();
+          // the process gets to report an unhandled rejection after the microtasks, on a real turn of the event loop
+          await new Promise((resolve) => jest.requireActual('timers').setImmediate(resolve));
+          expect(unhandled).not.toHaveBeenCalled();
+          expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+          expect(logger.error).not.toHaveBeenCalled();
+        } finally {
+          process.off('unhandledRejection', unhandled);
+        }
+      });
     });
 
     it('a failing watermark does not keep the dirty ranges from being worked on', async () => {
@@ -466,6 +665,7 @@ describe('AggregatorService nft_state job', () => {
       });
 
       it('is tried again after five minutes, then after twice as long each time up to an hour, and forgotten once it works', async () => {
+        minMs = 0; // the wait of a retry is counted from the failure: the ticks of the test are on the minute
         pages.set(500, { nfts: [nft(1), nft(3)], upTo: 700 });
         failing.add(3);
         const svc = service();
@@ -504,6 +704,7 @@ describe('AggregatorService nft_state job', () => {
       });
 
       it('is left out of the batches that come while it waits, and rebuilt by its retry with everything it has by then', async () => {
+        minMs = 0; // the wait of a retry is counted from the failure: the ticks of the test are on the minute
         pages.set(500, { nfts: [nft(2), nft(3)], upTo: 700 });
         pages.set(700, { nfts: [nft(3), nft(4)], upTo: 900 }); // it changed again
         failing.add(3);
@@ -519,6 +720,7 @@ describe('AggregatorService nft_state job', () => {
       });
 
       it('has its retry after the new work of the tick', async () => {
+        minMs = 0; // the wait of a retry is counted from the failure: the ticks of the test are on the minute
         pages.set(500, { nfts: [nft(2), nft(3)], upTo: 700 });
         failing.add(3);
         const svc = service();
@@ -550,6 +752,7 @@ describe('AggregatorService nft_state job', () => {
       });
 
       it('the retries are under the budget of the job: a slow one uses it up, and the next waits for the next tick', async () => {
+        minMs = 0; // the wait of a retry is counted from the failure: the ticks of the test are on the minute
         pages.set(500, { nfts: [nft(1), nft(3), nft(5)], upTo: 700 });
         failing.add(3);
         failing.add(5);
@@ -805,6 +1008,7 @@ describe('AggregatorService nft_state job', () => {
       expect(rebuilt()).toEqual([[4, 5]]);
       expect(inLedgers.mock.calls.map(([, from, to]) => [from, to])).toEqual([[100, 200]]);
       expect(narrowDirty).not.toHaveBeenCalled();
+      expect(markDirty).not.toHaveBeenCalled();
       expect(deleteDirty).toHaveBeenCalledWith(ch, mark(100, 200, 7000));
       expect(dirty).toEqual([]);
     });
@@ -871,14 +1075,86 @@ describe('AggregatorService nft_state job', () => {
       expect(dirty).toEqual([]);
     });
 
-    it('an NFT of a step that fails on its own is set aside, counted, and the range is done', async () => {
-      dirty = [mark(100, 200)];
+    it('an NFT of a step that fails on its own is counted, and the range of the step is marked again before it is deleted, once a run, until the NFT works', async () => {
+      dirty = [mark(100, 200, 7000)];
       touched.set(150, [1, 2, 3].map(nft));
       failing.add(2);
-      await service().tick();
+      const svc = service();
+      await svc.tick();
       expect(done).toEqual([1, 3]);
       expect(errors()).toBe(1);
-      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining(`NFT ${nft(2).nft_id}, set aside`));
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining(`NFT ${nft(2).nft_id}, its dirty range is marked again`),
+      );
+      // marked again, and only then deleted: a restart cannot find the NFT from the tables (no touch above what its row has
+      // seen), so the range is what keeps it from being lost
+      expect(markDirty).toHaveBeenCalledWith(ch, 100, 200);
+      expect(events.filter((e) => /^(mark|delete|narrow)/.test(e))).toEqual(['mark 100-200', 'delete 100-200']);
+      expect(dirty).toEqual([{ from: 100, to: 200, created: expect.any(Number) }]);
+      expect(dirty[0].created).toBeGreaterThan(7000);
+      // the new mark waits for the next run: a step that keeps failing is not done over and over in one
+      expect(inLedgers).toHaveBeenCalledTimes(1);
+
+      // the next run does the step again: the NFT fails again, and the range is marked again
+      await tickAt(svc, 1);
+      expect(inLedgers).toHaveBeenCalledTimes(2);
+      expect(errors()).toBe(2);
+      expect(markDirty).toHaveBeenCalledTimes(2);
+      expect(dirty).toHaveLength(1);
+
+      // it works at last: the step is done and the range is deleted, with no mark
+      failing.clear();
+      await tickAt(svc, 2);
+      expect(done.slice(4)).toEqual([1, 2, 3]);
+      expect(markDirty).toHaveBeenCalledTimes(2);
+      expect(dirty).toEqual([]);
+      expect(errors()).toBe(2);
+    });
+
+    it('marks the range of a step again before narrowing the range: the remainder keeps its place, and the step goes to the back of the queue', async () => {
+      dirty = [mark(1000, 25_999, 5000), mark(60_000, 60_010, 6000)];
+      touched.set(1500, [nft(1)]);
+      touched.set(12_000, [nft(2)]);
+      touched.set(13_000, [nft(5)]);
+      touched.set(22_000, [nft(3)]);
+      touched.set(60_005, [nft(4)]);
+      failing.add(2);
+      const svc = service();
+      await svc.tick();
+      expect(events.filter((e) => /^(in|rebuild|mark|narrow|delete)/.test(e))).toEqual([
+        'in 1000-10999',
+        'rebuild 1',
+        'narrow 11000-25999',
+        // the second step: 2 fails on its own, 5 works
+        'in 11000-20999',
+        'rebuild 2,5',
+        'rebuild 2',
+        'rebuild 5',
+        'mark 11000-20999',
+        'narrow 21000-25999',
+        'in 21000-25999',
+        'rebuild 3',
+        'delete 21000-25999',
+        // the next range; the step marked again is behind it, and waits for the next run
+        'in 60000-60010',
+        'rebuild 4',
+        'delete 60000-60010',
+      ]);
+      expect(dirty).toEqual([{ from: 11_000, to: 20_999, created: expect.any(Number) }]);
+      expect(dirty[0].created).toBeGreaterThan(6000);
+
+      failing.clear();
+      await tickAt(svc, 1);
+      expect(done).toEqual([1, 5, 3, 4, 2, 5]);
+      expect(dirty).toEqual([]);
+    });
+
+    it('the NFTs a live batch sets aside are retried from memory and not marked in nft_dirty: the tables say they are stale', async () => {
+      pages.set(500, { nfts: [nft(1), nft(2)], upTo: 700 });
+      failing.add(2);
+      await service().tick();
+      expect(errors()).toBe(1);
+      expect(markDirty).not.toHaveBeenCalled();
       expect(dirty).toEqual([]);
     });
 
@@ -1177,6 +1453,19 @@ describe('AggregatorService nft_state job', () => {
       failing.add(1);
       await expect(job.run(tick())).rejects.toThrow('memory limit');
       expect(handed).toEqual([]);
+    });
+
+    it('while its cursor is not known every ledger is behind it: the lag is the head', async () => {
+      watermark.mockImplementation(() => new Promise<number>(() => undefined)); // a read that never answers
+      const { runner: job } = runner(() => undefined);
+      expect(job.lag).toBeUndefined();
+      committed = 1200;
+      await job.run(tick());
+      expect(job.lag).toBe(1200);
+      // it is not read again while that one is out
+      await job.run(tick());
+      expect(watermark).toHaveBeenCalledTimes(1);
+      expect(job.lag).toBe(1200);
     });
 
     it('knows its lag only once it has a cursor and a head, and the lag is never below 0', async () => {
