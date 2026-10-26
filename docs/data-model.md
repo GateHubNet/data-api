@@ -378,7 +378,7 @@ mint or a modify, else `''`), `digest` (URITokens), `account` (who did it: the o
 `from_account` (the owner before: burn, sale, transfer), `to_account` (the owner after: mint, sale, transfer), `offer_id` (the
 `NFTokenOffer`'s `LedgerIndex`; on Xahau the URIToken id), `is_sell_offer UInt8`, `amount` (the offer's amount, or the sale's price),
 `amount_f`, `currency` (LowCardinality), `amount_issuer`, `destination`, `expiration Nullable(DateTime)`, `broker`, `broker_fee`,
-`royalty_est` and `removed_by` (LowCardinality; an `offer_removed` event: `sale`, `burn`, `transfer` or `other`). Read by an NFT's
+`royalty_est` (a plain `String`) and `removed_by` (LowCardinality, set only for an `offer_removed` event: `sale`, `burn`, `transfer` or `other`). Read by an NFT's
 detail, history and offers: an NFT is a prefix of the key.
 
 #### `account_nft_events` (P7, `ORDER BY (account, ledger_index, tx_index, event_index)`)
@@ -539,7 +539,7 @@ The files so far:
 
 | File | Contents |
 | --- | --- |
-| `001_baseline.sql` | The 23 tables of the baseline |
+| `001_baseline.sql` | The 30 tables of the baseline |
 | `002_validators_amendments.sql` | Two `ALTER TABLE` statements (`validations.server_version`; `validator_manifests.domain`, `.manifest`, `.source`) and the ten validators and amendments tables. Additive: it reads nothing of 001 but those two tables, so it applies on a database that already ran 001, and a half-applied run is completed by running it again |
 | `003_account_market_aggregates.sql` | The nine tables of the account and market aggregates, nine `CREATE TABLE IF NOT EXISTS` statements and nothing else. Additive: it reads no table of 001 or 002 and none of its tables depends on them, so it applies after 001 alone or after 001 and 002, on a fresh and on a migrated database |
 | `004_amm_fee_estimates.sql` | One statement, `ALTER TABLE volume_live ADD COLUMN IF NOT EXISTS fees_est_f Nullable(Float64)`: the 24 h fee estimates of the AMM volume. Additive and run again safely. A set written before it reads as "not known" until the next tick writes it with the column; the syncer writes the column on every live volume row and the API reads it on the live `amm_volume` read of the period `day`. The migration is required before the API (that read fails without the column) and advisable before the syncer (a syncer before it still inserts, ClickHouse skips the field the table lacks, but the estimates of those ticks are lost, and the error counter does not show it) (rollout: [operations](operations.md#the-amm-data-additions)) |

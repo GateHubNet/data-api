@@ -161,7 +161,7 @@ The production compose already runs **ClickHouse Keeper** and wires the server t
 defines `<zookeeper>`, `<macros>` and a one-shard cluster). To make it highly available:
 
 1. Switch the engines to `ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}'[, version])` in a **new
-   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 14 ledger-derived tables
+   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 28 ledger-derived tables
    **and** on `validator_validations` and `validator_seen` (migration 002: the collector's retried inserts carry a deduplication token, and
    those two tables have a window of 100; the nine tables of migration 003 have none, a set of theirs is idempotent by its `version`).
    `{shard}` and `{replica}` come from the `<macros>`.
@@ -190,7 +190,7 @@ Do not run production without a tested restore:
 
 ## Retention and TTL
 
-`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap, but **a ledger lives in 19
+`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap, but **a ledger lives in 28
 tables that must agree**, so retention is never per table:
 
 - The `ledgers` row is the commit marker. `range-ingest` **skips every ledger that has one** (it believes the ledger is complete), and the live syncer does not look

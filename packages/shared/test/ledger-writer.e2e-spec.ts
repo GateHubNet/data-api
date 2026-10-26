@@ -273,8 +273,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(new Set(tokens).size).toBe(tokens.length);
 
       // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
-      // by account: these ledgers have no AMM activity, so the 5 AMM tables get no insert) start together, before any of
-      // them has finished.
+      // by account: these ledgers have no AMM or NFT activity, so the 5 AMM tables and the 5 NFT tables get no insert)
+      // start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
@@ -285,9 +285,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(childTables).toContain(Table.AccountPathPayments);
       const firstStarts = events.slice(0, childTables.size);
       expect(new Set(firstStarts)).toEqual(new Set([...childTables].map((t) => `start:${t}`)));
-      expect(events.filter((e) => e.startsWith('start:') && AMM_LEDGER_TABLES.includes(e.slice(6) as Table))).toEqual(
-        [],
-      );
+      const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES];
+      expect(events.filter((e) => e.startsWith('start:') && noInsert.includes(e.slice(6) as Table))).toEqual([]);
 
       const lastChildEnd = Math.max(
         ...events.map((e, i) => (e.startsWith('end:') && childTables.has(e.slice(4)) ? i : -1)),
@@ -786,10 +785,10 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         expect(mine.every((c) => c.rows <= 40)).toBe(true);
         expect(mine.map((c) => c.token)).toEqual(mine.map((_, n) => `amm-order:${table}:${span}:${n}`));
       }
-      // The child tables that have rows, the AMM ones among them, start before the first of them has finished (a table with
-      // no row in these ledgers gets no insert: the NFT tables, until the NFT parser is wired in) ...
-      const withRows = CHILD_TABLES.filter(([, key]) => AMM_BUILT.some((rows) => rows[key].length > 0));
-      const childStarts = withRows.map(([t]) => events.indexOf(`start:${t}`));
+      // The child tables, the AMM ones among them, start before the first of them has finished (the NFT tables are left out:
+      // these ledgers have no NFT row, so they get no insert, until the NFT parser is wired in) ...
+      const withInsert = CHILD_TABLES.filter(([table]) => !NFT_LEDGER_TABLES.includes(table));
+      const childStarts = withInsert.map(([t]) => events.indexOf(`start:${t}`));
       const firstEnd = events.findIndex((e) => e.startsWith('end:'));
       expect(childStarts.every((at) => at >= 0 && at < firstEnd)).toBe(true);
       // ... and all of them are done before ledger_by_hash and then the commit marker.
