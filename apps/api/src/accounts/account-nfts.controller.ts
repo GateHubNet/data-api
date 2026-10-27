@@ -75,12 +75,13 @@ export class AccountNftsController {
   @ApiOperation({
     summary: 'Get the NFT history of an account',
     description:
-      'The events of NFTs and URITokens the account is named in, in the ledgers that closed between `start` and `end`, oldest ' +
-      'first, or newest first with `descending=true`: each as `GET /v2/nfts/{nft_id}/history` gives it, with `account` the ' +
-      'account that did it. An event is listed once, whatever number of roles the account has in it. `event` keeps the events ' +
-      'of those kinds, `role` those in which the account is any of the roles named (the issuer of a mint, burn or sale, the ' +
-      'minter when it is not the issuer, the seller or the new owner, the broker, the owner of an offer, the destination of ' +
-      'an offer). `format=csv` gives the events as a CSV file (without `coverage`).',
+      'The events of NFTs and URITokens in which the account has a role, in the ledgers that closed between `start` and ' +
+      '`end`, oldest first, or newest first with `descending=true`: each as `GET /v2/nfts/{nft_id}/history` gives it, with ' +
+      '`account` the account that did it. An event is listed once, whatever number of roles the account has in it. A ' +
+      '`modify` names no account, so it is in no account history. `event` keeps the events of those kinds, `role` those in ' +
+      'which the account is any of the roles named (the issuer of a mint, burn or sale, the minter when it is not the ' +
+      'issuer, the owner before or after, the broker, the owner of an offer, the destination of an offer). `format=csv` ' +
+      'gives the events as a CSV file (without `coverage`).',
   })
   @ApiParam({ name: 'address', description: 'The address of the account.' })
   @ApiQuery({ name: 'start', required: false, description: 'Start time. Default: the first ledger.' })
@@ -88,7 +89,9 @@ export class AccountNftsController {
   @ApiQuery({
     name: 'event',
     required: false,
-    description: `A comma list of ${NFT_EVENTS.join(', ')}. Default: all.`,
+    description:
+      `A comma list of ${NFT_EVENTS.join(', ')}. Default: all. ` +
+      '`modify` is accepted and always gives nothing here: a modify names no account.',
   })
   @ApiQuery({
     name: 'role',

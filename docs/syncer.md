@@ -596,18 +596,28 @@ write version sets (a version is the ClickHouse clock in milliseconds, above the
 
 **`nft_state`** (budget 3 s, every tick, right after `amm_pools`; `nft_state` of [data-model](data-model.md#nft-aggregates-migration-011)):
 - **Cursor.** A ledger index kept in memory and found again when the process starts (`nftStateWatermark`: the ledger before the oldest
-  `nft_touches` row that its NFT's newest `nfts` row has not seen; the committed head when there is none; **0 for a database with no ledger
-  yet**). The read is a join of every touch with the NFTs: it may take as long as the time limit of a query, so it **starts at the first run
+  `nft_touches` row that its NFT's newest `nfts` row has not seen; the committed head when there is none; 0 for a database with no ledger
+  yet). The read is a join of every touch with the NFTs: it may take as long as the time limit of a query, so it **starts at the first run
   without being waited for**, and the live part starts at the first run after it answered (the retries and the dirty part do not need it, and
   the jobs after this one keep their share of the tick). A read that fails is counted and logged as `nft_state` and tried again after 5
   minutes, doubling up to an hour; a stop does not cancel it. So a restart delays the live part by at least one tick, **and by at least five
   minutes when that read fails**; a watermark that never fits `GH_CLICKHOUSE_MAX_EXECUTION_TIME` keeps the live cursor from starting at all,
   counted each time it is tried again (every 5 to 60 minutes).
+- **Placing the cursor.** In the same read, after the watermark: when it is more than `NFT_LIVE_STEP_LEDGERS` (10,000) ledgers behind the
+  committed head (a restart while a re-ingest is being digested: the NFTs it wrote that have no row yet are stale, back to the oldest of them),
+  it is lifted to the ledger before the first committed one (`firstCommittedLedger`; a watermark read just before the first ledgers came is 0),
+  and if it is still that far behind, the ledgers after it up to the head are marked in `nft_dirty` (`markNftDirty`), and only then is the
+  cursor set, at the head: the dirty sweep, which digests a re-ingest anyway, carries that backlog, and the live part keeps following the
+  chain instead of crossing the backlog with the whole budget. A crash between the mark and the cursor finds the same stale touches at the
+  next start and marks them again; a mark that fails fails the read (counted, tried again after the wait). A cursor read from a database with
+  no ledger (0) is placed at the ledger before the first committed one once there is one: the live window never starts below it.
 - **Each tick** `nftsChangedSince` returns at most 500 NFTs (`NFT_STATE_BATCH`) that have a touch above what their newest `nfts` row has
   seen, oldest first, in a window of `NFT_LIVE_STEP_LEDGERS` (10,000) ledgers after the cursor, so that a cursor far behind the head crosses a
   stretch with nothing in it window by window, while the budget lasts. Each NFT is rebuilt whole from its own `nft_events` (a prefix read) by
   `foldNftEvents` and written under one version: its `nfts` row, and an `account_nfts` row for every account that ever owned it (`held` 1 for
-  the current owner). The cursor moves past a batch once it is written.
+  the current owner). The cursor moves past a batch once it is written. An answer of more than 500 (all the stale NFTs of one ledger, which
+  `nftsChangedSince` returns whole) is rebuilt 500 at a time, the budget checked between the batches; the cursor passes the ledger once the last
+  batch is written, and a tick that ran out of budget goes on with the next batch at the next tick.
 - **A batch that fails is halved**, as in `amm_pools`: at most three NFTs of a batch may fail on their own (`MAX_ISOLATED_NFTS_PER_BATCH`);
   they are set aside in memory, each counted as an error, and tried again after 5 minutes, doubling up to an hour (`NFT_RETRY_MS`,
   `NFT_MAX_RETRY_MS`), while the cursor and the other NFTs go on. More than three means the cause is not the NFTs (the database, a limit) and
@@ -616,19 +626,25 @@ write version sets (a version is the ClickHouse clock in milliseconds, above the
   the hook below): the NFTs with a touch in its first `NFT_DIRTY_STEP_LEDGERS` (10,000) ledgers, and those whose `nfts` row's `first_ledger` or
   `last_ledger` lies there, are rebuilt in batches, an NFT with no event left is removed from `nfts` with a lightweight `DELETE` (and its
   `account_nfts` rows get `held = 0`), and the range is replaced by its remainder (inserted first, then the old row deleted), so progress
-  survives a restart. An NFT that fails on its own in a step is counted and the range of the step is marked again.
+  survives a restart. An NFT that fails on its own in a step is counted and its ledgers of the step are marked again (from its first to its
+  last touch there, one read of `nft_touches`: `nftTouchLedgers`; the whole step for an NFT found by its row, with no touch there), before the
+  range is narrowed or deleted. A range marked again waits, in memory, before it is taken again (`NFT_RETRY_MS`, doubling up to
+  `NFT_MAX_RETRY_MS` each time it is marked again): `oldestNftDirty` skips it meanwhile, so the ranges marked after it are worked on, and an NFT
+  that keeps failing (a query that runs into the time limit takes a tick) does not take the tick from the jobs after `nft_state` run after run.
+  A restart forgets the waits (the marks are in the table).
 - **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), error label `nft_state_dirty`. Dirty-sweep and gauge-read failures count
   as `nft_state`; only the hook is `nft_state_dirty`.
 - **Collections due.** The collection keys (issuer, taxon) of every rebuilt NFT are handed to the queue of `nft_collections`.
-- **Gauges.** `syncer_nft_state_lag_ledgers` is the newest committed ledger minus the live cursor, set at the end of every run; **while the
-  cursor is not known (after every start, until its read has answered) every ledger is behind it, so the gauge reads the whole head for at
-  least a tick**: an alert on it needs a `for:` longer than a tick plus that read ([observability](observability.md#4-metrics-syncer)).
+- **Gauges.** `syncer_nft_state_lag_ledgers` is the newest committed ledger minus the live cursor, set at the end of every run (0 while no
+  ledger is stored); **while the cursor is being placed (after every start, until its read has answered and placed it; after the first
+  ledgers of a new database, until it is placed at the first one) its lag is not known and the gauge is not set**: it keeps its value (0 in a
+  new process) and never reads the whole head ([observability](observability.md#4-metrics-syncer)). A read that keeps failing shows as
+  errors of `nft_state`, not in the gauge.
   `syncer_nft_dirty_ledgers` is the ledgers the ranges of `nft_dirty` hold (the sum over the newest row of each range): 0 when no re-ingest is
   being digested.
-- **A first boot** (no ledger at the first read) gives the cursor 0, and the job crosses the empty history from there in windows of 10,000
-  ledgers, the budget of a tick covering a few million of them (about 3.4 million per tick on a laptop, so about half an hour for XRPL's
-  108 million ledgers; the lag gauge falls by that much a minute). NFTs show up in the aggregates only once the cursor reaches them. A restart
-  after the first ledgers are committed finds the cursor from the tables instead ([operations](operations.md#the-nft-data)).
+- **A first boot** (no ledger at the first read) places the cursor at the ledger before the first committed one, once there is one, so the
+  job never crosses the empty history before it. A restart while a re-ingest is digested (the cursor read far behind the head) leaves the
+  stretch to `nft_dirty` (above): `syncer_nft_dirty_ledgers` rises by it, and each such restart adds it once more ([operations](operations.md#the-nft-data)).
 
 **`nft_collections`** (budget 3 s, **at the first tick and then every 5th tick**, `NFT_COLLECTIONS_EVERY_TICKS`; `nft_collections` and
 `nft_collection_holders` of [data-model](data-model.md#nft-aggregates-migration-011)):

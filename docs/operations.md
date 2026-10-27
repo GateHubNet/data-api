@@ -371,7 +371,7 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
 | `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs), for `nft_state` / `nft_state_dirty` / `nft_collections` [the NFT data](#the-nft-data) |
 | `syncer_amm_unclassified_total` | a trickle at most | A burst: the parser met a pool shape it cannot place (a new kind of AMM transaction, an MPT asset); see [backfill](backfill.md#amm-data-re-ingest) |
-| `syncer_nft_state_lag_ledgers` | 0-2 once caught up (more for a tick or two after every start: the job does not know its cursor until it has read it, and the gauge is the whole head till then) | Above 100 for more than 10 minutes after a start (alert with a `for:` longer than a tick plus the read of the cursor); large and falling is a first fill or a catch-up, see [The NFT data](#the-nft-data) |
+| `syncer_nft_state_lag_ledgers` | 0-2 once caught up (not set after a start until the job has placed its cursor: it keeps its value, 0 in a new process, and never reads the whole head) | Above 100 for more than 10 minutes (alert with a `for:` longer than a tick); large and falling is a catch-up, see [The NFT data](#the-nft-data). A read of the cursor that keeps failing shows as `{job="nft_state"}` errors, not here |
 | `syncer_nft_dirty_ledgers` | 0 | Positive and not falling for an hour: a re-ingest is waiting for `nft_state` and the job is failing (`syncer_aggregator_errors_total{job="nft_state"}`); falling is the digest of a re-ingest |
 | `syncer_nft_collections_pending` | 0 or small | Large after a rollout, falling by 150 or more every five minutes: see the first fill in [The NFT data](#the-nft-data); not falling at all for hours with `{job="nft_collections"}` errors rising: a collection that fails |
 | `syncer_nft_skipped_total` | flat (no MPT-priced NFT offer exists today) | Rising: NFT events with an MPT amount are dropped (the parser warns in the range-ingest log), the NFT history is missing them |
@@ -605,7 +605,9 @@ design in [ADR-0016](adr/0016-nft-and-uritoken-data.md); what an operator needs:
    cheaper than one pass per feature ([backfill](backfill.md#nft-re-ingest)). Watch **`syncer_nft_dirty_ledgers` fall to 0**; `volume_backfill`
    fills `nft_volume`'s daily sets. Xahau's `--from 1` stores ledger 1 with the close time 0, so `volume_backfill` then starts at 1970-01-01 and
    walks about 19,000 empty days for each of the four metrics, newest first: the real days are done first, and the empty ones are cheap but many.
-3. **Coverage turns `complete`** once no ledger at or above the enable ledger was written by an older parser ([the check](#is-the-nft-data-complete)).
+3. **Coverage turns `complete`** once no ledger at or above the enable ledger was written by an older parser ([the check](#is-the-nft-data-complete)),
+   and once the enable ledger is known: the API reads it from the amendments data, which needs the validators worker of the syncer to have polled
+   `network_state` (until then every answer says `complete: false`; `GET /v2/network/amendments` shows the amendment with its `enabled` ledger).
    The testnets stay `complete: false`: they get no backfill.
 4. **Hand the explorer this commit** for its API sync (`pnpm api:sync`). The explorer turns its `NFTS` switch on per environment once that
    environment's API serves these routes on both networks and the lag gauges are near 0.
@@ -615,25 +617,33 @@ design in [ADR-0016](adr/0016-nft-and-uritoken-data.md); what an operator needs:
   a second), while small ones go thousands to a run (the Xahau live check cleared 2,089 in one). A collection that changes meanwhile waits behind the fill. So after a rollout the collection
   pages update slowly until `syncer_nft_collections_pending` is 0 (days on XRPL), and `GET /v2/nft_collections` lists only the collections counted
   so far (its `total` grows); an NFT's own routes, an account's holdings and a collection's sales do not wait for it.
-- **A database with no ledger starts the cursor of `nft_state` at ledger 0.** Its first read of the cursor (`nftStateWatermark`) finds no ledger and
-  answers 0, and the job then crosses the history from 0 to the head in windows of 10,000 ledgers, a few million ledgers a minute (about 3.4
-  million a tick on a laptop: 32 minutes for XRPL's 108 million ledgers in the live check, under ten for Xahau's 27 million). `syncer_nft_state_lag_ledgers`
-  starts at the head and falls by that much a minute, and no NFT is in the aggregates before the cursor reaches it. Nothing is wrong. To skip the
-  crossing, start the syncer with `GH_WORKERS=ingest` until the first ledgers are committed, or restart the syncer once they are (the cursor is then
-  found from the tables). It does not happen on a database that has ledgers: there the cursor is the ledger before the oldest NFT touch the aggregate
-  has not seen.
-- **The cursor is read at every start, and the read can be slow.** `nftStateWatermark` joins every touch to its NFT, which on a mainnet-sized `nfts`
+- **The cursor of `nft_state` is placed at every start, and the read can be slow.** It is found from the tables (`nftStateWatermark`: the ledger
+  before the oldest NFT touch the aggregate has not seen, else the newest ledger), a join of every touch with its NFT, which on a mainnet-sized `nfts`
   may take as long as the time limit of a query (`GH_CLICKHOUSE_MAX_EXECUTION_TIME`, 30 s). The job does not wait for it: the live part starts at the
-  first tick after the read answered, so **`syncer_nft_state_lag_ledgers` reads the whole head for at least one tick after every start** (an alert
-  needs a `for:` of more than a tick plus the read; ten minutes is safe), and a read that fails is counted (`{job="nft_state"}`) and tried again after
-  5 minutes, doubling to an hour. So a failed read at boot delays the live part by at least five minutes, and **a read that never fits the time limit
-  keeps the live part from ever starting** while the retries and the dirty ranges go on: raise `GH_CLICKHOUSE_MAX_EXECUTION_TIME` for the syncer, or
-  rebuild the NFTs with a re-ingest. A stop of the syncer does not cancel a read in flight.
+  first tick after the read answered, and until then **`syncer_nft_state_lag_ledgers` is not set** (it keeps its value: 0 in a new process), so it
+  never reads the whole head. A read that fails is counted (`{job="nft_state"}`) and tried again after 5 minutes, doubling to an hour: a failed read
+  at boot delays the live part by at least five minutes, and **a read that never fits the time limit keeps the live part from ever starting** while
+  the retries and the dirty ranges go on. The lag gauge does not show that (it is not set): watch the errors of `nft_state`, raise
+  `GH_CLICKHOUSE_MAX_EXECUTION_TIME` for the syncer, or rebuild the NFTs with a re-ingest. A stop of the syncer does not cancel a read in flight.
+- **A restart while the history is being filled leaves the stretch to the dirty ranges.** During the fill (step 2) the NFTs that the re-ingest
+  wrote and the dirty sweep has not rebuilt yet are behind the head, so the cursor read at a restart is far back. When it is more than 10,000 ledgers
+  (`NFT_LIVE_STEP_LEDGERS`) behind the newest ledger, the ledgers after it, up to the newest, are marked in `nft_dirty` (first) and the live cursor
+  starts at the newest ledger (the log says `nft_state: the stale NFTs of ledgers A - B are left to the dirty ranges; the live cursor starts at B`):
+  the holdings of new ledgers keep following the chain, and the dirty sweep, which digests the fill anyway, rebuilds the stretch. So
+  `syncer_nft_dirty_ledgers` jumps by the stretch, and **each restart during the fill adds the stretch once more** (the NFTs of its ledgers are
+  rebuilt again): do not restart the syncer during the fill without need. The same holds after the aggregator was off while the ingest wrote
+  more than 10,000 ledgers (a syncer run with `GH_WORKERS` without `aggregator` for half a day or more).
+- **A database with no ledger** at the first read of the cursor (a first start) places the cursor at the ledger before the first ledger stored, once
+  one is: the job never crosses the empty history before it.
 - **An NFT or a collection that fails is set aside, not stuck.** `nft_state` halves a failing batch of up to 500 NFTs to find the NFTs that fail on their
   own (at most three per batch), counts each as an error, and retries each after 5 minutes, doubling up to an hour; `nft_collections` does the same with
   batches of 50 collections. The log names it: `Aggregator job nft_state failed for NFT <id>, set aside to be tried again`, `... nft_collections failed for
   collection <issuer>/<taxon>, ...`. The warning `a batch of N NFT(s) failed as a whole, but its halves were rebuilt: <cause>` is one error and loses
-  nothing (the batch failed for its size). The sets are in memory: a restart finds the NFT or collection again from the tables.
+  nothing (the batch failed for its size). The sets are in memory: a restart finds the NFT or collection again from the tables. An NFT of a dirty range
+  that fails on its own (`... failed for NFT <id>, its ledgers of the dirty range are marked again`) has its ledgers of the step marked in `nft_dirty`
+  again (from its first to its last touch there), and those ledgers wait 5 minutes, doubling up to an hour, before they are taken again (`nft_state:
+  ledgers A - B are marked dirty again, taken again in N min`), while the ranges marked after them are worked on; a restart forgets the waits, not the
+  marks.
 - **After a re-ingest** (`range-ingest --reprocess` over NFT ledgers, see [backfill](backfill.md#nft-re-ingest)) the written ledgers mark `agg_dirty`, and each
   slice's hook (error label `nft_state_dirty`; it fails the slice if it fails) appends the ledgers to `nft_dirty`; `nft_state` works through the oldest range in
   steps of 10,000 ledgers, rebuilding the NFTs with a touch in the step and removing an NFT that has no event left, and the range shrinks until it is
@@ -644,8 +654,10 @@ design in [ADR-0016](adr/0016-nft-and-uritoken-data.md); what an operator needs:
 - **A collection that is missing.** `GET /v2/nft_collections/{issuer}/{taxon}` and its sub-routes answer 404 for a collection the job has not counted yet
   (up to about five minutes after its first NFT, or a long wait in the first fill above). A 404 that lasts: no event of the NFTs was ingested, or
   `nft_collections` is failing for it (the log names the collection).
-- **Disk.** An event is stored up to four times (by NFT, by collection, for each account it involves, and a sale again in ledger order), and the four
-  aggregates grow with each rebuild until merges drop the older versions ([data-model](data-model.md#nft-aggregates-migration-011)).
+- **Disk.** An event is stored in up to four tables (by NFT, by collection, once for each account it involves, and a sale again in ledger order): a
+  brokered sale is up to seven rows (`nft_events` 1, `collection_nft_events` 1, `account_nft_events` 4: the issuer, the seller, the buyer and the broker,
+  `nft_sales` 1). The four aggregates grow with each rebuild until merges drop the older versions
+  ([data-model](data-model.md#nft-aggregates-migration-011)).
 
 ### Is the NFT data complete?
 

@@ -207,7 +207,8 @@ those NFTs. `sales_count` counts every sale, `volume_native` the converted price
 
 One pure parser, `packages/shared/src/parsers/nft.parser.ts` (`NftParser.parse(t, ctx): { events: ParsedNftEvent[]; skipped: number }`),
 and `packages/shared/src/util/nftoken-id.ts` (`decodeNFTokenId(id)`: flags, transfer fee, issuer, taxon, serial; `pageOwner(index)`). It
-runs on successful transactions only, takes deep-frozen input, and is wired into `buildLedgerRows` with the five tables. A new parser version
+reads successful transactions, and of a failed one only the offers it deletes (section 2.5), takes deep-frozen input, and is wired into
+`buildLedgerRows` with the five tables. A new parser version
 (`NFT_PARSER_VERSION` in `rows.ts`, the first version that writes them; gates compare with it, never with `PARSER_VERSION`). A ledger written
 by an older version has no NFT rows.
 
@@ -224,8 +225,9 @@ by an older version has no NFT rows.
 ### 2.2 XRPL offers
 - A created `NFTokenOffer` is `offer_create` (`offer_id` its index, `account` its `Owner`, amount, destination, expiration), including the one
   an `NFTokenMint` makes.
-- A deleted one is `offer_cancel` in an `NFTokenCancelOffer`; `offer_removed` otherwise, with `removed_by` `sale` (an
-  `NFTokenAcceptOffer`), `burn` (an `NFTokenBurn`) or `other` (removed by another transaction, such as an expired offer cleaned up).
+- A deleted one is `offer_cancel` in an `NFTokenCancelOffer` (expired or not); `offer_removed` otherwise, with `removed_by` `sale` (an
+  `NFTokenAcceptOffer`), `burn` (an `NFTokenBurn`) or `other` (deleted by another transaction: an `AccountDelete` of its owner, or a failed
+  transaction that deleted it, section 2.5).
 
 ### 2.3 XRPL sales
 - Direct: price the accepted offer's `Amount`; seller and buyer as in "How it looks". Brokered: the buy offer's `Amount`, the broker the
@@ -247,7 +249,12 @@ by an older version has no NFT rows.
 
 URITokens have no taxon, serial or transfer fee (`royalty_est` `''`); `issuer` is the entry's `Issuer`.
 
-### 2.5 Event order, amounts, skips
+### 2.5 Which transactions, event order, amounts, skips
+- **Which transactions** (amended by the final fix wave, ruling I5(a); it said "successful ones only"): every event of a successful
+  transaction (`meta.TransactionResult` `tesSUCCESS`); of a failed one (a `tec` result), only an `offer_removed` with `removed_by` `other` for
+  each `NFTokenOffer` its metadata deletes, in `AffectedNodes` order, and nothing else. A failed transaction changes nothing of its own, but
+  rippled deletes in it the expired offers a failed `NFTokenAcceptOffer` met (`tecEXPIRED`, amendment `fixExpiredNFTokenOfferRemoval`): such an
+  offer is gone, and without the event `/offers` would list it for ever.
 - `event_index` counts the transaction's events in this order: offer cancels and removals (in `AffectedNodes` order), then mints, sales,
   transfers, burns and modifies (by `nft_id`), then offer creations (in `AffectedNodes` order). Newest-first lists so show a sale above the
   offers it removed, and a mint's offer above the mint.
@@ -274,11 +281,21 @@ sets, R86 finality, budgets (R83), failed-last ordering (R87), runners in files 
   `nfts.last_ledger`, else the committed head) and `nftsChangedSince(cursor, head, NFT_STATE_BATCH = 500)`: NFTs with a touch above
   what their newest `nfts` row has seen, oldest first. Each is rebuilt from its `nft_events` (a prefix read) and written under one new
   version: its `nfts` row and one `account_nfts` row per owner it ever had (`held` 1 for the current one). A failed batch is halved, as
-  `amm_pools` does; the cursor moves past a batch once it is written.
+  `amm_pools` does; the cursor moves past a batch once it is written (an answer of more than 500, all of one ledger, is rebuilt 500 at a
+  time under the budget, and the cursor passes the ledger after the last batch).
+- **Placing the cursor at a start** (final fix wave, rulings I1 and I3). The found cursor is placed before the live part starts: when it is
+  more than `NFT_LIVE_STEP_LEDGERS` (10,000) behind the committed head (a restart during a re-ingest's digest: its NFTs without a row are
+  stale), `(cursor, head]` is marked in `nft_dirty` first and the cursor starts at the head, so the dirty sweep carries that backlog and the
+  live part keeps following the chain; a cursor found on a database with no ledger (0) goes to the ledger before the first one stored once
+  there is one, so the live window never starts below it. Until the cursor is placed its lag is not known: `syncer_nft_state_lag_ledgers`
+  is not set.
 - **Dirty.** Then, in what is left of the budget, the oldest `nft_dirty` range: the NFTs with a touch in its first
   `NFT_DIRTY_STEP_LEDGERS` (10,000) ledgers, and those whose `nfts` row's `first_ledger` or `last_ledger` lies there, are rebuilt in
   batches; an NFT with no event left is removed from `nfts` with a lightweight `DELETE` (and its `account_nfts` rows get `held = 0`). The
-  range is then replaced by its remainder (insert the remainder, delete the old row), so progress survives a restart.
+  range is then replaced by its remainder (insert the remainder, delete the old row), so progress survives a restart. An NFT of a step that
+  fails on its own (the halving finds it) has its own ledgers of the step marked again (its first to its last touch there; the whole step
+  for one found by its row), and a range marked again waits in memory before it is taken again (`NFT_RETRY_MS` doubling to
+  `NFT_MAX_RETRY_MS`; `oldestNftDirty` skips it), so the ranges marked after it are worked on (final fix wave, ruling I4).
 - **Collections due.** The collection keys of every rebuilt NFT go to an in-memory queue for 3.2.
 
 ### 3.2 `nft_collections` (budget `AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS` = 3000, every 5th tick: `NFT_COLLECTIONS_EVERY_TICKS`)
@@ -577,7 +594,8 @@ and `xahau/uritoken/`, each with `manifest.json` and `FINDINGS.md`:
 **Unit and golden.** `nftoken-id.spec` (decode, unscramble, page owner); `nft.parser.spec` per case and these invariants over every fixture:
 ids equal the union of page diffs; at most one owner per NFT after each transaction; `(nft_id, event_index)` unique per transaction;
 decoded fields equal the mint's fields; an independent oracle (`packages/shared/test/nft-oracle.ts`) gives the same events; deep-frozen input;
-`tec` results give none. `foldNftEvents` spec (re-mint, burn, offers only, out-of-coverage first event). At least 10 hand-made mutants killed.
+`tec` results give none but the offers they delete (`synthetic-tec-expired-accept`: one `offer_removed`, `other`). `foldNftEvents` spec (re-mint, burn,
+offers only, out-of-coverage first event). At least 10 hand-made mutants killed.
 
 **Ingest e2e.** The fixtures land in all five tables; fault injection and recovery leave no orphans; range-ingest redo leaves no duplicates;
 a ripple-mock ledger gives none; `LEDGER_KEYED_TABLES` matches the schema's partitioning.

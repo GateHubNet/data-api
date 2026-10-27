@@ -2079,8 +2079,10 @@ Historical rows of `GET /v2/network/nft_volume?start=2026-10-24&end=2026-10-25&i
 }
 ```
 
-Errors: 400 as for the other volumes, `invalid period - use: day, 7day, 30day`, `invalid start date format`, `invalid end date format`,
-`invalid interval - use: day, week, month`, `invalid marker`; 500 `error getting data`.
+Errors, in the order they are checked: 400 the exchange currency's, as for the other volumes (`exchange currency must have an issuer`,
+`XRP cannot have an issuer` (`XAH` on Xahau), `invalid exchange issuer address`), then `invalid start date format`, `invalid end date format`,
+`invalid interval - use: day, week, month`, then `invalid marker` (with `start` or `end`) or `invalid period - use: day, 7day, 30day` (without);
+500 `error getting data`.
 
 ### `GET /v2/network/markets`
 
@@ -2694,7 +2696,9 @@ What the fields say:
   offer's owner, else the sender), `from` and `to` the owners before and after. `offer_id` names the offer (an XRPL `NFTokenOffer`; on Xahau the
   URIToken id, since the offer is the entry's one sell offer), `is_sell_offer` is a boolean and is there on every event that names an offer (the
   offer's own and the sale or transfer that accepted it). `offer_removed` has `removed_by`: `sale` (an accepted offer), `burn` (the NFT was
-  burned), `transfer` (a Xahau `Remit` moved the token) or `other` (removed by a later transaction, such as an expired offer cleaned up).
+  burned), `transfer` (a Xahau `Remit` moved the token) or `other` (deleted by another transaction: an `AccountDelete` of the offer's owner,
+  or a transaction that failed and still deleted it, as a `tecEXPIRED` `NFTokenAcceptOffer` deletes the expired offer it met; an offer its
+  owner or destination cancels with `NFTokenCancelOffer`, expired or not, is an `offer_cancel`).
   `destination` and `expiration` are an offer's. In a transaction the events come in this order (`event_index`): the offers cancelled or
   removed, then the mints, sales, transfers, burns and modifies, then the offers created, so a list newest first shows a sale above the offers
   it removed and a mint's offer above the mint.
@@ -2846,8 +2850,8 @@ Errors, in the order they are checked: 400 `invalid nft id`, `invalid start date
 
 ### `GET /v2/nfts/{nft_id}/offers`
 
-The offers of the NFT that are open: created, and not since cancelled, accepted or removed (the NFT burned, or an expired offer cleaned up),
-worked out from its offer events, **newest first**. An offer that has expired is listed until a transaction removes it. A URIToken has
+The offers of the NFT that are open: created, and not since cancelled, accepted or removed (the NFT burned, its owner's account deleted, or
+an expired offer deleted by an accept that failed on it), worked out from its offer events, **newest first**. An offer that has expired is listed until a transaction removes it. A URIToken has
 at most one, the entry's.
 
 | Parameter | Default | Meaning |
@@ -2949,14 +2953,16 @@ Errors, in the order they are checked: 400 `invalid issuer address`, `invalid ta
 
 ### `GET /v2/accounts/{address}/nft_history`
 
-The events the account is named in, oldest first: every event of the NFTs it minted, holds, sold, bought, brokered, or made or received an offer
-for. An event is listed once however many roles the account has in it; `account` in it is the account that did the event, not necessarily this one.
+The events in which the account has a role (`role` below), oldest first: the mints it made or received, and as issuer, the mints, sales and burns
+of its NFTs; the sales and transfers it was a party to or brokered; the burns of what it held; and the offers it made or is the destination of
+(created, cancelled or removed). A `modify` names no account, so it is in no account's history (an NFT's own history has it). An event is
+listed once however many roles the account has in it; `account` in it is the account that did the event, not necessarily this one.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `address` (path) | | Not checked. |
 | `start`, `end` | | As for the history of an NFT. |
-| `event` | all | A comma list of events, as for the history of an NFT. |
+| `event` | all | A comma list of events, as for the history of an NFT; `modify` is accepted and always gives nothing here (a modify names no account). |
 | `role` | any | A comma list of the roles the account has in an event: `issuer` (the issuer of a mint, burn or sale; not of an offer, so an issuer's history is not every offer on its NFTs), `minter` (the sender of a mint that is not the issuer), `from` and `to` (the owner before and after), `broker`, `offer_owner` (the owner of an offer created, cancelled or removed), `destination` (of an offer). |
 | `descending`, `limit`, `marker` | false, 200 (max 1000) | The marker is `(ledger_index, tx_index, event_index)`. |
 | `format` | json | `csv`: file `<address> - nft history.csv`, the columns of the NFT event. |
@@ -3115,9 +3121,9 @@ collection the aggregator has not counted yet); 500 `unable to retrieve collecti
 ### The lists of a collection: `…/nfts`, `…/holders`, `…/sales`, `…/stats`
 
 Each is on both forms of the path (`/v2/nft_collections/{issuer}/{taxon}/nfts` on XRPL, `/v2/nft_collections/{issuer}/nfts` on Xahau), and the literal
-words are matched before the taxon, so `nfts`, `holders`, `sales` and `stats` can never be read as one. They check the collection first: the same
-404 `collection not found` as the collection itself, **after the rest of the request is checked** (a bad marker is a 400 even for a collection
-that does not exist). The checks of the path are 400 `invalid issuer address` and, on XRPL, `invalid taxon`.
+words are matched before the taxon, so `nfts`, `holders`, `sales` and `stats` can never be read as one. They check the collection **last**,
+after the path and the rest of the request (a bad marker is a 400 even for a collection that does not exist): then the same 404
+`collection not found` as the collection itself. The checks of the path are 400 `invalid issuer address` and, on XRPL, `invalid taxon`.
 
 **`…/nfts`**: the NFTs of the collection by serial (on Xahau by id), burned ones left out.
 
@@ -3180,7 +3186,7 @@ recompute. `limit`, `marker` (`held` and `owner` of the last holder), `format` (
 }
 ```
 
-500 `unable to retrieve holders`.
+500 `unable to retrieve holders`; the checks in order: the path, `invalid marker`, 404.
 
 **`…/sales`**: the sales of the collection's NFTs in the window, as the NFT sales of the network, oldest first. `start`, `end`, `descending`,
 `limit`, `marker` (`(ledger_index, tx_index, event_index)`), `format` (`csv`: `<issuer>[ <taxon>] - sales.csv`).

@@ -187,12 +187,14 @@ are computed by the aggregator some minutes after their NFTs change, and after a
 [operations](operations.md#the-nft-data)); the NFT's own routes and an account's holdings are served meanwhile. (3) `nft_collections` fails for it: the log names the
 collection (`Aggregator job nft_collections failed for collection <issuer>/<taxon>, set aside to be tried again`) and `syncer_aggregator_errors_total{job="nft_collections"}` rises.
 
-### `syncer_nft_state_lag_ledgers` is huge after a start, or the NFT lists stay empty
-The job does not know its cursor until it has read it (a join of every touch with the NFTs, which may take as long as a query may), and the gauge is the whole head till
-then: wait a few minutes. On a database that had no ledger at the first read the cursor is 0 and the job crosses the empty history 10,000 ledgers at a time, a few
-million a minute (half an hour for XRPL): the lag falls by itself, or restart the syncer once ledgers are committed. A read of the cursor that fails is logged and counted
-(`syncer_aggregator_errors_total{job="nft_state"}`) and tried again after 5 minutes, doubling to an hour; if it never fits `GH_CLICKHOUSE_MAX_EXECUTION_TIME` the live part
-never starts ([operations](operations.md#the-nft-data)).
+### `syncer_nft_state_lag_ledgers` stays 0 after a start while the NFT lists do not move, or `syncer_nft_dirty_ledgers` jumped after a restart
+The job does not know its cursor until it has read it (a join of every touch with the NFTs, which may take as long as a query may), and the lag gauge is not
+set until then (it keeps its value, 0 in a new process): wait a few minutes. A read of the cursor that fails is logged and counted
+(`syncer_aggregator_errors_total{job="nft_state"}`, `Aggregator job nft_state failed reading where the job goes on from, tried again in N min`) and tried
+again after 5 minutes, doubling to an hour; if it never fits `GH_CLICKHOUSE_MAX_EXECUTION_TIME` the live part never starts and the gauge never moves
+([operations](operations.md#the-nft-data)). A restart during a history fill (or after the aggregator was off while the ingest wrote more than 10,000
+ledgers) finds the cursor far behind the head and leaves that stretch to `nft_dirty` (`nft_state: the stale NFTs of ledgers A - B are left to the dirty
+ranges`): `syncer_nft_dirty_ledgers` jumps by it and falls as the dirty sweep rebuilds it, while the live part follows the chain. Nothing is wrong.
 
 ### AMM swaps, pools or days are missing before a date
 The ledgers were written by parser version 1, which has no AMM rows (`SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY

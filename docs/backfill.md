@@ -255,7 +255,8 @@ days come first and an empty day is cheap, but `volume_backfill` stays busy with
 3. **The aggregates follow by themselves, in three queues.** Every written chunk marks its hours in `agg_dirty`, and its slice's hook appends
    the ledger range to `nft_dirty` (the hook rebuilds no NFT). The `nft_state` job works through the oldest range of `nft_dirty` in steps of
    10,000 ledgers within its 3 s a tick: **watch `syncer_nft_dirty_ledgers` fall to 0** (`SELECT * FROM xrpl.nft_dirty` shows the ranges), and
-   `syncer_nft_state_lag_ledgers` stay near 0. The collections it rebuilt are queued for `nft_collections`: **its first fill is
+   `syncer_nft_state_lag_ledgers` stay near 0. A restart of the syncer while this runs adds the stretch from the oldest NFT not rebuilt yet to the
+   head to `nft_dirty` once more ([operations](operations.md#the-nft-data)): avoid restarts until it is 0. The collections it rebuilt are queued for `nft_collections`: **its first fill is
    first in, first out, one 3 s run every five minutes**: plan on about 150 collections every five minutes for XRPL's large ones (batches of 50 that
    take a second; small collections go thousands to a run, as on Xahau), and `syncer_nft_collections_pending` falls. A collection that changes
    meanwhile waits behind the fill, so after a rollout collection pages update slowly until it has drained (days on XRPL). The daily

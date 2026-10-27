@@ -66,13 +66,30 @@ much of the past it holds.
 - **The history needs a reprocess.** Complete coverage means every ledger from the enable ledger written by parser version 5: on XRPL from ledger
   75,443,457, on Xahau from ledger 1. It is one `range-ingest --reprocess` of each network, best done once with the program's other parser
   versions ([backfill](../backfill.md#nft-re-ingest)). The testnets are not backfilled and stay `complete: false`.
-- **Storage.** An event is stored up to four times (by NFT, by collection, once for each account it involves, a sale again in ledger order), and
-  the aggregates are version sets that grow until merged.
+- **Storage.** An event is stored in up to four tables (by NFT, by collection, once for each account it involves, a sale again in ledger order):
+  a brokered sale is up to seven rows (`nft_events` 1, `collection_nft_events` 1, `account_nft_events` 4 for the issuer, the seller, the buyer and
+  the broker, `nft_sales` 1). The aggregates are version sets that grow until merged.
 - **The aggregates lag the ledgers**: holdings by up to a tick, collections and holders by up to five minutes (and, after a rollout, until the
   first fill of `nft_collections` has drained: first in first out, one 3 s run every five minutes, about 150 collections for XRPL's large ones). A collection's `volume_native` uses the
   rates known at its last recompute; the daily `nft_volume` sets are the settled figures. A fresh collection is 404 on its own routes until its
   first recompute.
-- **A first boot** of a syncer on a database with no ledger starts `nft_state`'s cursor at ledger 0, and it crosses the empty history in steps of
-  10,000 ledgers a read ([operations](../operations.md#the-nft-data)).
+- **The cursor of `nft_state` is in memory and placed at each start** from the tables, without a table of its own: a cursor read from a database
+  with no ledger goes to the ledger before the first one stored, and one more than 10,000 ledgers behind the head (a restart while a re-ingest
+  is digested) hands the ledgers after it to `nft_dirty` and starts at the head, so the dirty sweep, not the live path, carries that backlog. Each
+  such restart hands the stretch over once more ([operations](../operations.md#the-nft-data)); persisting the cursor would avoid that, at the cost
+  of a table and a migration.
+- **Decisions owed to the owner before the backfill.** These rulings of the build follow the spec's letter; changing one after the NFT history is
+  filled needs a reprocess of the NFT ledgers, before it a small change of the parser and its oracle:
+  1. An offer consumed by any `NFTokenAcceptOffer` is `removed_by: sale`, a zero-amount accept (a `transfer`, no sale) included; `transfer`, as
+     for a Xahau `Remit`, is the alternative.
+  2. A `modify` has no roles (spec §2.6: the issuer only on a mint, a burn or a sale), so it is in no account's NFT history; the owner, or the
+     issuer, could be given a role in it.
+  3. An `NFTokenAcceptOffer` priced with an MPT amount (impossible in the ledger today) skips its `offer_removed` and its `sale` and counts them
+     (`syncer_nft_skipped_total`); no `transfer` takes the sale's place, so the stored owner would not follow such a sale.
+  4. A Xahau `URITokenBuy` at an `Amount` of 0 is a `sale` at 0 (spec §2.4), counted in `sales_count`; on XRPL a zero-amount accept is a
+     `transfer`.
+- **A failed transaction is read for the offers it deletes.** A `tec` transaction changes nothing of its own, but rippled deletes the expired
+  offers a failed `NFTokenAcceptOffer` met (`tecEXPIRED`); the parser reads each `NFTokenOffer` a failed transaction deletes as an
+  `offer_removed` with `removed_by: other`, and nothing else of it, so `/offers` does not list a deleted offer.
 - Rejected: one version set per owner (a holder of 120,000 NFTs would rewrite them all when one moves); a daily statistics job now; reading the
   node's `account_nfts`.
