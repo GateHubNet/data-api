@@ -2,6 +2,8 @@ import {
   AccountNftsRow,
   buildLedgerRows,
   ClickHouseService,
+  CollectionKey,
+  collectionsBehind,
   DailyRates,
   FixtureLedgerSource,
   getNetworkProfile,
@@ -11,6 +13,8 @@ import {
   NFT_DIRTY_STEP_LEDGERS,
   NFT_LIVE_STEP_LEDGERS,
   NFT_STATE_BATCH,
+  NftCollectionHoldersRow,
+  NftCollectionsRow,
   nftDirtyLedgers,
   NftEventsRow,
   nftsChangedSince,
@@ -19,17 +23,22 @@ import {
   PARSER_VERSION,
   RatesService,
   rebuildNfts,
+  recomputeCollections,
   runMigrations,
   Table,
 } from '@gatehub/data-api-shared';
 import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { readDirtyRanges } from '../src/aggregator/agg-dirty';
-import { AGGREGATOR_NFT_STATE_BUDGET_MS, AggregatorService } from '../src/aggregator/aggregator.service';
+import {
+  AGGREGATOR_NFT_STATE_BUDGET_MS,
+  AggregatorService,
+  NFT_COLLECTIONS_EVERY_TICKS,
+} from '../src/aggregator/aggregator.service';
 import { rangeIngest } from '../src/cli/range-ingest';
 
 /**
- * The `nft_state` job of the `AggregatorService` against a real ClickHouse: the 11 whole mainnet ledgers of the NFT fixtures
+ * The `nft_state` and `nft_collections` jobs of the `AggregatorService` against a real ClickHouse: the 11 whole mainnet ledgers of the NFT fixtures
  * (`fixtures/xrpl/nft`: mints, offers, sales, a burn, a modify), written by the real `LedgerWriter`, and a world of 120,000 NFTs
  * of one owner made by hand (their transactions are `synthetic-…`). What an NFT holds is checked against an oracle in
  * `packages/shared/test/nft-state-job.e2e-spec.ts`; here it is the job that is on trial: what ticks write, that they stay within
@@ -42,6 +51,14 @@ const ctx = parseContextFor(getNetworkProfile('xrpl'));
 const LEDGERS = FixtureLedgerSource.fromDir(join(SHARED_TEST, 'fixtures/xrpl/nft')).list();
 const EVENTS: NftEventsRow[] = LEDGERS.flatMap((raw) => buildLedgerRows(raw, ctx).nftEvents);
 const NFT_IDS = [...new Set(EVENTS.map((e) => e.nft_id))].sort();
+const byCollection = (a: CollectionKey, b: CollectionKey): number =>
+  a.issuer < b.issuer ? -1 : a.issuer > b.issuer ? 1 : a.taxon_key - b.taxon_key;
+/** The collections of the recorded events (an issuer and, on XRPL, a taxon), in key order. */
+const COLLECTIONS: CollectionKey[] = [
+  ...new Map(
+    EVENTS.map(({ issuer, taxon_key }) => [`${issuer}/${taxon_key}`, { issuer, taxon_key } as CollectionKey]),
+  ).values(),
+].sort(byCollection);
 const FIRST_LEDGER = Math.min(...LEDGERS.map((l) => l.header.ledger_index));
 const LAST_LEDGER = Math.max(...LEDGERS.map((l) => l.header.ledger_index));
 const NEWEST_CLOSE = Math.max(...LEDGERS.map((l) => l.header.close_time));
@@ -84,6 +101,8 @@ const KEY = 'issuer, taxon_key, serial, nft_id';
 
 type StoredNft = Omit<NftsRow, 'version'>;
 type StoredHolding = Omit<AccountNftsRow, 'version'>;
+type StoredCollection = Omit<NftCollectionsRow, 'version'> & { version: number };
+type StoredCollectionHolder = Omit<NftCollectionHoldersRow, 'version'>;
 
 /** The fake metrics of the aggregator and of the NFT job: what is set and counted is read from the mocks. */
 const fakeMetrics = () => ({
@@ -92,13 +111,14 @@ const fakeMetrics = () => ({
   aggregatorStatsLagSeconds: { set: jest.fn() },
   nftStateLagLedgers: { set: jest.fn() },
   nftDirtyLedgers: { set: jest.fn() },
+  nftCollectionsPending: { set: jest.fn() },
 });
 type FakeMetrics = ReturnType<typeof fakeMetrics>;
 
 /** The values a gauge was set to, in order. */
 const valuesOf = (gauge: { set: jest.Mock }): number[] => gauge.set.mock.calls.map(([value]) => value);
 
-describe('AggregatorService nft_state job (e2e)', () => {
+describe('AggregatorService NFT jobs (e2e)', () => {
   let container: StartedClickHouse;
   const services: ClickHouseService[] = [];
   const aggregators: AggregatorService[] = [];
@@ -170,6 +190,38 @@ describe('AggregatorService nft_state job (e2e)', () => {
       `SELECT * FROM ${Table.AccountNfts} ORDER BY owner, ${KEY}, version DESC LIMIT 1 BY owner, ${KEY}`,
     );
     return rows.map(({ version: _version, ...row }) => row);
+  }
+
+  /** The newest version of each collection. */
+  async function collectionsOf(ch: ClickHouseService): Promise<StoredCollection[]> {
+    const rows = await ch.query<NftCollectionsRow>(
+      `SELECT * FROM ${Table.NftCollections} ORDER BY issuer, taxon_key, version DESC LIMIT 1 BY issuer, taxon_key`,
+    );
+    return rows.map((row) => ({ ...row, version: Number(row.version) }));
+  }
+
+  /** The newest version of each (collection, owner), without its version: the holders a reader lists are the ones with `held` above 0. */
+  async function collectionHoldersOf(ch: ClickHouseService): Promise<StoredCollectionHolder[]> {
+    const rows = await ch.query<NftCollectionHoldersRow>(
+      `SELECT * FROM ${Table.NftCollectionHolders}
+        ORDER BY issuer, taxon_key, owner, version DESC LIMIT 1 BY issuer, taxon_key, owner`,
+    );
+    return rows.map(({ version: _version, ...row }) => row);
+  }
+
+  const withoutVersion = (rows: StoredCollection[]): Array<Omit<StoredCollection, 'version'>> =>
+    rows.map(({ version: _version, ...row }) => row);
+
+  /**
+   * Ticks until the NFT state is caught up and the collections job has had its turn after that: it runs at the first tick and
+   * every `NFT_COLLECTIONS_EVERY_TICKS` ticks, and the collections of the NFTs rebuilt in between are for its next run.
+   */
+  async function computeCollections(running: { svc: AggregatorService; metrics: FakeMetrics }): Promise<void> {
+    let ticks = await catchUp(running);
+    while (ticks <= NFT_COLLECTIONS_EVERY_TICKS) {
+      await running.svc.tick(NOW);
+      ticks++;
+    }
   }
 
   const count = async (ch: ClickHouseService, table: Table, where = '1'): Promise<number> =>
@@ -252,6 +304,94 @@ describe('AggregatorService nft_state job (e2e)', () => {
     );
     for (const [ledger, to] of reads) expect(to).toBe(ledger + NFT_LIVE_STEP_LEDGERS);
     expect((await nftsOf(ch)).map((n) => n.nft_id).sort()).toEqual(NFT_IDS);
+  });
+
+  describe('the nft_collections job', () => {
+    it('fills nft_collections and nft_collection_holders for every recorded collection', async () => {
+      expect(COLLECTIONS.length).toBeGreaterThan(2);
+      const ch = await fresh();
+      // the same ledgers in a world of their own, in which the NFTs and then the collections are made by the functions the jobs call
+      const reference = await fresh();
+      await rebuildNfts(reference, (await nftsChangedSince(reference, 0, 10_000)).nfts);
+      await recomputeCollections(reference, new DailyRates(reference, new RatesService(reference, 'XRP')), COLLECTIONS);
+
+      expect(await count(ch, Table.NftCollections)).toBe(0);
+      const running = aggregator(ch);
+      await computeCollections(running);
+      expect(running.errors).not.toHaveBeenCalled();
+      expect(running.metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(running.metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_collections' });
+      // the queue is empty at the end of every run that had something to do
+      expect(valuesOf(running.metrics.nftCollectionsPending).at(-1)).toBe(0);
+
+      // every collection has its row, and what the job wrote is what a direct recompute of the same collections writes
+      const collections = await collectionsOf(ch);
+      expect(collections.map((c) => [c.issuer, c.taxon_key])).toEqual(COLLECTIONS.map((c) => [c.issuer, c.taxon_key]));
+      expect(withoutVersion(collections)).toEqual(withoutVersion(await collectionsOf(reference)));
+      const holders = await collectionHoldersOf(ch);
+      expect(holders.length).toBeGreaterThan(0);
+      expect(holders).toEqual(await collectionHoldersOf(reference));
+
+      // and what the rows say is what the events and the NFTs say
+      const nfts = await nftsOf(ch);
+      for (const c of collections) {
+        const events = EVENTS.filter((e) => e.issuer === c.issuer && e.taxon_key === c.taxon_key);
+        const kinds = (event: string): number => events.filter((e) => e.event === event).length;
+        expect([Number(c.minted), Number(c.burned), Number(c.sales_count)]).toEqual([
+          kinds('mint'),
+          kinds('burn'),
+          kinds('sale'),
+        ]);
+        const held = nfts.filter((n) => n.issuer === c.issuer && n.taxon_key === c.taxon_key && !n.burned);
+        expect(Number(c.supply)).toBe(held.length);
+        const owners = holders.filter((h) => h.issuer === c.issuer && h.taxon_key === c.taxon_key && h.held > 0);
+        expect(Number(c.holders)).toBe(owners.length);
+        expect(owners.reduce((sum, h) => sum + h.held, 0)).toBe(held.filter((n) => n.owner !== '').length);
+      }
+      // the collection of the NFT that was sold for 10 XRP has the sale in its volume
+      const sold = EVENTS.find((e) => e.nft_id === SOLD) as NftEventsRow;
+      const soldCollection = collections.find((c) => c.issuer === sold.issuer && c.taxon_key === sold.taxon_key);
+      expect(Number(soldCollection?.sales_count)).toBeGreaterThanOrEqual(1);
+      expect(Number(soldCollection?.volume_native_f)).toBeGreaterThanOrEqual(10);
+      expect(soldCollection?.volume_native).toMatch(/^\d+(\.\d*[1-9])?$/);
+    });
+
+    it('refills the queue at start', async () => {
+      const ch = await fresh();
+      await computeCollections(aggregator(ch));
+      const before = await collectionsOf(ch);
+      expect(before.length).toBe(COLLECTIONS.length);
+      expect(await collectionsBehind(ch)).toEqual([]);
+
+      // one collection goes stale (one of its NFTs is rebuilt: a newer version in `nfts`), another loses its row
+      const sold = EVENTS.find((e) => e.nft_id === SOLD) as NftEventsRow;
+      const stale: CollectionKey = { issuer: sold.issuer, taxon_key: sold.taxon_key };
+      const lost = COLLECTIONS.find((c) => byCollection(c, stale) !== 0) as CollectionKey;
+      await rebuildNfts(ch, [{ issuer: sold.issuer, taxon_key: sold.taxon_key, serial: sold.serial, nft_id: SOLD }]);
+      await ch.command(
+        `DELETE FROM ${Table.NftCollections} WHERE issuer = {issuer:String} AND taxon_key = {taxon_key:UInt32}`,
+        { ...lost },
+        SYNC_DELETE,
+      );
+      expect(await collectionsBehind(ch)).toEqual([stale, lost].sort(byCollection));
+
+      // a new process: nothing is in its queue but what the tables say is behind, which it computes at its first run
+      const restarted = aggregator(ch);
+      await restarted.svc.tick(NOW);
+      expect(restarted.errors).not.toHaveBeenCalled();
+      expect(restarted.metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(valuesOf(restarted.metrics.nftCollectionsPending)).toEqual([0]);
+      expect(await collectionsBehind(ch)).toEqual([]);
+      const after = await collectionsOf(ch);
+      expect(after.map((c) => [c.issuer, c.taxon_key])).toEqual(before.map((c) => [c.issuer, c.taxon_key]));
+      for (const [i, row] of after.entries()) {
+        const was = before[i];
+        const redone = [stale, lost].some((c) => byCollection(c, row) === 0);
+        // the two that were behind are written again, to what they were; the others are not touched
+        expect(redone ? row.version > was.version : row.version === was.version).toBe(true);
+        expect(withoutVersion([row])).toEqual(withoutVersion([was]));
+      }
+    });
   });
 
   describe('120,000 NFTs of one owner', () => {

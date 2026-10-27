@@ -104,6 +104,9 @@ describe('AggregatorModule', () => {
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_state' });
     expect(metrics.nftStateLagLedgers.set).toHaveBeenCalledWith(0);
     expect(metrics.nftDirtyLedgers.set).toHaveBeenCalledWith(0);
+    // and the NFT collections job, which finds no collection behind in an empty database and sets its gauge
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_collections' });
+    expect(metrics.nftCollectionsPending.set).toHaveBeenCalledWith(0);
     // and the AMM daily job, which runs at the first tick: today and yesterday, each a sentinel without any pool
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'amm_daily' });
     // and so are the account and market jobs, which have nothing to do on a database without a ledger

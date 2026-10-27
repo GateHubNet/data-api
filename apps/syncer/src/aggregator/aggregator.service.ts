@@ -11,6 +11,7 @@ import {
   livePeriodsOf,
   liveSetVersions,
   MarketsConfig,
+  NftCollectionsRecomputeAborted,
   NftRebuildAborted,
   RatesService,
   recomputeStatsHourly,
@@ -44,6 +45,11 @@ import {
   utcDayStart,
 } from './job-context';
 import { MarketsLiveJobRunner } from './markets-live.job-runner';
+import {
+  NFT_COLLECTIONS_FUNCTIONS,
+  NftCollectionsFunctions,
+  NftCollectionsJobRunner,
+} from './nft-collections.job-runner';
 import { AggregatorNfts, NFT_STATE_FUNCTIONS, NftStateFunctions, NftStateJobRunner } from './nft-state.job-runner';
 import { PairHourlyJobRunner } from './pair-hourly.job-runner';
 import { RatesDailyJobRunner } from './rates-daily.job-runner';
@@ -60,6 +66,8 @@ export {
 export type { AggregatorAmmPools, AmmPoolsFunctions } from './amm-pools.job-runner';
 export { MAX_FAILED_VOLUME_SETS_PER_TICK } from './job-context';
 export type { AggregatorJobName, AggregatorTick } from './job-context';
+export { NFT_COLLECTIONS_EVERY_TICKS } from './nft-collections.job-runner';
+export type { NftCollectionsFunctions } from './nft-collections.job-runner';
 export { MAX_ISOLATED_NFTS_PER_BATCH, NFT_MAX_RETRY_MS, NFT_RETRY_MS } from './nft-state.job-runner';
 export type { AggregatorNfts, NftStateFunctions } from './nft-state.job-runner';
 
@@ -139,9 +147,6 @@ export const AGGREGATOR_NFT_STATE_BUDGET_MS = 3000;
 
 /** How much of the tick `nft_collections` (the collections whose NFTs were rebuilt) may use; it runs every `NFT_COLLECTIONS_EVERY_TICKS` ticks. */
 export const AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS = 3000;
-
-/** `nft_collections` runs at the first tick and then every this many ticks: the collections change slowly, and the tick is shared. */
-export const NFT_COLLECTIONS_EVERY_TICKS = 5;
 
 /**
  * How much of the tick `amm_daily` may use for today, yesterday and the back-fill of the closed days together. It runs after
@@ -251,11 +256,13 @@ export interface AggregatorOptions {
   /**
    * With it the `nft_state` job runs (the state of every NFT and the holdings of the accounts, and the NFTs of the ledger ranges
    * of `nft_dirty`) and the slices of `agg_dirty` mark their ledgers in `nft_dirty`, with or without the `aggregates` option;
-   * without it they do not.
+   * without it they do not. So does the `nft_collections` job (the row and the holders of the collections whose NFTs it rebuilt).
    */
   nfts?: AggregatorNfts;
   /** Replaces the NFT functions of the shared package; for tests. */
   nftStateFunctions?: Partial<NftStateFunctions>;
+  /** Replaces the `nft_collections` functions of the shared package; for tests. */
+  nftCollectionsFunctions?: Partial<NftCollectionsFunctions>;
   /**
    * With it the `amm_daily` job runs (today and yesterday, the back-fill of the closed days, and the days of `agg_dirty`);
    * without it it does not.
@@ -367,6 +374,13 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     records the same test in its sentinel, so a day computed too early is computed again). The back-fill starts at the day of
  *     the first pool activity. A closed day that fails waits (5 minutes, doubling) while the older days go on. The days of an
  *     `agg_dirty` slice are recomputed with the slice.
+ *  8a. **nft_collections** (with the `nfts` option; at the first tick and then every `NFT_COLLECTIONS_EVERY_TICKS`): the
+ *     `nft_collections` row of a collection (supply, holders, mints, burns, sales, volume in the native currency) and the
+ *     `nft_collection_holders` rows, for the collections whose NFTs `nft_state` rebuilt, `NFT_COLLECTIONS_BATCH` at a time, oldest
+ *     first, under one version per batch and for at most `AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS`. The queue of collections is in
+ *     memory: the first run fills it from the tables (`collectionsBehind`: the collections whose newest NFT version is above their
+ *     row's), and `nft_state` adds to it. A batch that fails goes back to the end of the queue and is the error of the run. A
+ *     collection with no NFT left is deleted from both tables.
  *  9. **rates_daily** (with `aggregates`): the rates of the closed final days, newest first (`RatesDailyJobRunner`).
  * 10. **account_rollups** (with `aggregates`): the discovery of heavy accounts and their day rollups, the increment of each new
  *     day and the promotion of the days before (`AccountRollupsJobRunner`).
@@ -377,9 +391,9 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
  *     doubling, until the config version changes) and the older days go on.
  *
- * The AMM jobs (3 and 8) and `nft_state` (3a) are runners in files of their own (`AmmPoolsJobRunner`, `AmmDailyJobRunner`,
- * `NftStateJobRunner`), with their own state; the service lends them the database, the clock, the budgets and the rules of the
- * tick (`AggregatorJobContext`).
+ * The AMM jobs (3 and 8), `nft_state` (3a) and `nft_collections` (8a) are runners in files of their own (`AmmPoolsJobRunner`,
+ * `AmmDailyJobRunner`, `NftStateJobRunner`, `NftCollectionsJobRunner`), with their own state; the service lends them the
+ * database, the clock, the budgets and the rules of the tick (`AggregatorJobContext`).
  *
  * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set or a set of the account and market jobs is a
  * complete set under a new version), which is what lets this retry, resume and crash anywhere:
@@ -398,8 +412,8 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *  - **No overlap.** A tick that finds the previous one still running is skipped and logged.
  *  - **Shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it; the signal of the slice or set
  *    in flight is aborted, so that its rows are not written (the abort, `StatsRecomputeAborted`, `VolumeRecomputeAborted`,
- *    `AggregateSetAborted`, `AmmPoolsRecomputeAborted`, `AmmDailyRecomputeAborted` or `NftRebuildAborted`, is neither logged as an
- *    error nor counted); no change to `agg_dirty` is started after it (a
+ *    `AggregateSetAborted`, `AmmPoolsRecomputeAborted`, `AmmDailyRecomputeAborted`, `NftRebuildAborted` or
+ *    `NftCollectionsRecomputeAborted`, is neither logged as an error nor counted); no change to `agg_dirty` is started after it (a
  *    narrowing that has inserted its row finishes its delete, so as not to leave the old row beside the new one). The stop
  *    waits for the tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`, then abandons it and says so.
  */
@@ -421,6 +435,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly ammPools?: AmmPoolsJobRunner;
   /** The `nft_state` job and its hook in the slices of `agg_dirty` (with the `nfts` option). */
   private readonly nftState?: NftStateJobRunner;
+  /** The `nft_collections` job, which `nftState` queues the collections of its rebuilds for (with the `nfts` option). */
+  private readonly nftCollections?: NftCollectionsJobRunner;
   /** The `amm_daily` job and its hook in the slices of `agg_dirty` (with the `ammDaily` option). */
   private readonly ammDaily?: AmmDailyJobRunner;
   /** How many ticks have run their jobs: the cadence of the jobs that do not run at every tick. */
@@ -506,15 +522,20 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     this.ammPools = options.ammPools
       ? new AmmPoolsJobRunner(context, options.ammPools, { ...AMM_POOLS_FUNCTIONS, ...options.ammPoolsFunctions })
       : undefined;
-    this.nftState = options.nfts
-      ? new NftStateJobRunner(
-          context,
-          options.nfts,
-          { ...NFT_STATE_FUNCTIONS, ...options.nftStateFunctions },
-          // the collections of the rebuilt NFTs are for the `nft_collections` job
-          () => undefined,
-        )
-      : undefined;
+    if (options.nfts) {
+      const collections = new NftCollectionsJobRunner(context, options.nfts, {
+        ...NFT_COLLECTIONS_FUNCTIONS,
+        ...options.nftCollectionsFunctions,
+      });
+      this.nftCollections = collections;
+      this.nftState = new NftStateJobRunner(
+        context,
+        options.nfts,
+        { ...NFT_STATE_FUNCTIONS, ...options.nftStateFunctions },
+        // the collections of the rebuilt NFTs are for the `nft_collections` job
+        (keys) => collections.enqueue(keys),
+      );
+    }
     this.ammDaily = options.ammDaily
       ? new AmmDailyJobRunner(context, options.ammDaily, { ...AMM_DAILY_FUNCTIONS, ...options.ammDailyFunctions })
       : undefined;
@@ -568,6 +589,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
             },
           ]
         : []),
+      ...(this.nftCollections ? [this.nftCollections.job()] : []),
       ...(this.aggregateRunners
         ? [this.aggregateRunners.ratesDaily.job(), this.aggregateRunners.accountRollups.job()]
         : []),
@@ -591,7 +613,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     }
   }
 
-  /** What the runners of the jobs in files of their own (`amm_pools`, `amm_daily`, `nft_state`) are lent of the service. */
+  /** What the runners of the jobs in files of their own (`amm_pools`, `amm_daily`, `nft_state`, `nft_collections`) are lent of the service. */
   private jobContext(): AggregatorJobContext {
     return {
       ch: this.ch,
@@ -682,7 +704,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         err instanceof AggregateSetAborted ||
         err instanceof AmmPoolsRecomputeAborted ||
         err instanceof AmmDailyRecomputeAborted ||
-        err instanceof NftRebuildAborted)
+        err instanceof NftRebuildAborted ||
+        err instanceof NftCollectionsRecomputeAborted)
     ) {
       this.logger.log(`Dropped the ${job} slice in flight at shutdown`);
       return;

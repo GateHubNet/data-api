@@ -965,6 +965,9 @@ describe('AggregatorService volume jobs', () => {
     aggregatorRunsTotal: { inc: jest.Mock };
     aggregatorErrorsTotal: { inc: jest.Mock };
     aggregatorStatsLagSeconds: { set: jest.Mock };
+    nftStateLagLedgers: { set: jest.Mock };
+    nftDirtyLedgers: { set: jest.Mock };
+    nftCollectionsPending: { set: jest.Mock };
   };
   const created: AggregatorService[] = [];
 
@@ -1017,6 +1020,9 @@ describe('AggregatorService volume jobs', () => {
       aggregatorRunsTotal: { inc: jest.fn() },
       aggregatorErrorsTotal: { inc: jest.fn() },
       aggregatorStatsLagSeconds: { set: jest.fn() },
+      nftStateLagLedgers: { set: jest.fn() },
+      nftDirtyLedgers: { set: jest.fn() },
+      nftCollectionsPending: { set: jest.fn() },
     };
     events = [];
     liveCalls = [];
@@ -1154,7 +1160,7 @@ describe('AggregatorService volume jobs', () => {
       expect(daysDone).not.toHaveBeenCalled();
     });
 
-    it('are, with the AMM pools and the NFT state as well, volume_live, volume_daily, amm_pools, nft_state, stats_live, stats_dirty, volume_backfill, in this order', async () => {
+    it('are, with the AMM pools and the NFT jobs as well, volume_live, volume_daily, amm_pools, nft_state, stats_live, stats_dirty, nft_collections, volume_backfill, in this order', async () => {
       caughtUp();
       await service({
         ammPools: { rates: RATES },
@@ -1170,6 +1176,7 @@ describe('AggregatorService volume jobs', () => {
           dirtyLedgers: async () => 0,
           head: async () => 0,
         },
+        nftCollectionsFunctions: { behind: async () => [] },
       }).tick();
       expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
         'volume_live',
@@ -1178,8 +1185,10 @@ describe('AggregatorService volume jobs', () => {
         'nft_state',
         'stats_live',
         'stats_dirty',
+        'nft_collections',
         'volume_backfill',
       ]);
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     });
   });
 

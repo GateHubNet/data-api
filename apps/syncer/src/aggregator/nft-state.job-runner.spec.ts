@@ -61,6 +61,7 @@ describe('AggregatorService nft_state job', () => {
     aggregatorStatsLagSeconds: { set: jest.Mock };
     nftStateLagLedgers: { set: jest.Mock };
     nftDirtyLedgers: { set: jest.Mock };
+    nftCollectionsPending: { set: jest.Mock };
   };
   const created: AggregatorService[] = [];
   /** What happened, in order. */
@@ -129,6 +130,7 @@ describe('AggregatorService nft_state job', () => {
       aggregatorStatsLagSeconds: { set: jest.fn() },
       nftStateLagLedgers: { set: jest.fn() },
       nftDirtyLedgers: { set: jest.fn() },
+      nftCollectionsPending: { set: jest.fn() },
     };
     events = [];
     pages = new Map();
@@ -217,6 +219,8 @@ describe('AggregatorService nft_state job', () => {
       recompute: statsRecompute,
       nfts: { rates: { ...RATES, ledgersClosedIn } as unknown as RatesService, dailyRates: {} as DailyRates },
       nftStateFunctions: functions(),
+      // the collections job has its own spec: here it finds nothing to do
+      nftCollectionsFunctions: { behind: async () => [], recompute: async () => ({ written: 0, removed: 0 }) },
       ...options,
     });
     created.push(svc);
@@ -251,12 +255,13 @@ describe('AggregatorService nft_state job', () => {
         'nft_state',
         'stats_live',
         'stats_dirty',
+        'nft_collections',
         'volume_backfill',
       ]);
 
       metrics.aggregatorRunsTotal.inc.mockClear();
       await service().tick();
-      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty']);
+      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections']);
     });
 
     it('is off without the option: nothing is asked of the NFT functions, and a dirty range is only the stats', async () => {
@@ -423,7 +428,7 @@ describe('AggregatorService nft_state job', () => {
         `Aggregator job nft_state failed reading where the job goes on from, tried again in 5 min: ${timeout}`,
       );
       // the loop goes on: the jobs after it ran, and the job itself did not fail (a failed read is not the error of its run)
-      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'after_nft_state']);
+      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections', 'after_nft_state']);
       expect(after).toHaveBeenCalledTimes(1);
       expect(changedSince).not.toHaveBeenCalled();
       expect(rebuild).not.toHaveBeenCalled();
@@ -475,7 +480,7 @@ describe('AggregatorService nft_state job', () => {
 
         // the read is out, and nothing waited for it
         expect(watermark).toHaveBeenCalledTimes(1);
-        expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'after_nft_state']);
+        expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections', 'after_nft_state']);
         expect(events).toContain('stats 2026-10-16T10:00:00Z'); // the slice of stats_live
         expect(events).toContain('stats 2026-05-01T00:00:00Z'); // the slice of stats_dirty
         expect(after).toHaveBeenCalledTimes(1);
@@ -603,7 +608,7 @@ describe('AggregatorService nft_state job', () => {
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('nft_state'));
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('memory limit'));
       // the jobs after it still ran
-      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
+      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty', 'nft_collections']);
       expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500]);
       expect(done).toEqual([]);
 
@@ -627,7 +632,7 @@ describe('AggregatorService nft_state job', () => {
         expect(done).toEqual([1, 2, 4, 5, 6]);
         // the cursor passed the batch, and the job ran to the end
         expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 700, 900]);
-        expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty']);
+        expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections']);
         // one error, for the NFT, and not one for the batch
         expect(errors()).toBe(1);
         expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'nft_state' });
@@ -917,7 +922,7 @@ describe('AggregatorService nft_state job', () => {
       expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 510, 520]);
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('nft_state reached its budget'));
       // the other jobs of the tick were not held up
-      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty']);
+      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections']);
 
       await tickAt(svc, 1);
       expect(rebuilt().slice(3)).toEqual([[3], [4], [5]]);
@@ -1064,7 +1069,7 @@ describe('AggregatorService nft_state job', () => {
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'nft_state' });
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('memory limit'));
       expect(dirty).toEqual([mark(100, 200)]);
-      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
+      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty', 'nft_collections']);
 
       failing.clear();
       await tickAt(svc, 1);
@@ -1298,7 +1303,7 @@ describe('AggregatorService nft_state job', () => {
       );
       expect(ch.dirty).toEqual([aggMark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')]);
       expect(dirty).toEqual([]);
-      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty']);
+      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections']);
 
       await tickAt(svc, 1);
       expect(ch.dirty).toEqual([]);
@@ -1372,7 +1377,7 @@ describe('AggregatorService nft_state job', () => {
       expect(rebuilt()).toEqual([[1]]);
       expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_state' }]]);
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('reading the gauges'));
-      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty']);
+      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections']);
     });
 
     it('sets nothing, and reads nothing, once the shutdown has begun', async () => {
