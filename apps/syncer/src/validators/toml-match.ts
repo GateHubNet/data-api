@@ -1,18 +1,11 @@
+import { parseTomlText } from '@gatehub/data-api-shared';
 import { isValidClassicAddress } from 'ripple-address-codec';
-import { parse } from 'smol-toml';
+
+// the parse moved to the shared package with `readToml`; `domain-checker.ts` and the spec keep importing the error from here
+export { TomlInvalidError } from '@gatehub/data-api-shared';
 
 /** The most account addresses kept from a file (spec 2.2, G1). */
 export const MAX_ACCOUNTS = 10;
-
-const BYTE_ORDER_MARK = 0xfeff;
-
-/** The text is not TOML. The message says nothing of the file: a parser's own message quotes the line that failed. */
-export class TomlInvalidError extends Error {
-  constructor() {
-    super('the file is not valid TOML');
-    this.name = 'TomlInvalidError';
-  }
-}
 
 export interface TomlMatch {
   /** Whether a `[[VALIDATORS]]` entry names the master key. */
@@ -47,14 +40,7 @@ function textOf(entry: Record<string, unknown>, field: string): string | undefin
  * Throws `TomlInvalidError` when the text is not TOML.
  */
 export function matchToml(text: string, masterKey: string): TomlMatch {
-  let document: Record<string, unknown>;
-  try {
-    // an editor may have put a byte order mark at the start of the file (U+FEFF once decoded); the parser would refuse it
-    document = parse(text.charCodeAt(0) === BYTE_ORDER_MARK ? text.slice(1) : text);
-  } catch {
-    // whatever the parser met (a syntax error, a structure nested too deep): no word of the file goes into the error
-    throw new TomlInvalidError();
-  }
+  const document = parseTomlText(text);
 
   const listed = entriesOf(document, 'VALIDATORS').some((entry) => textOf(entry, 'public_key') === masterKey);
   if (!listed) return { listed, accounts: [] };
