@@ -1050,6 +1050,12 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
   /** An account that holds 200 NFTs spread over the whole collection (every 601st serial, so over all four parts). */
   const SCATTERED = accountAt(0x54);
   const SCATTERED_SERIALS = Array.from({ length: 200 }, (_, i) => 1 + 601 * i);
+  /** An account that holds 100 NFTs of the collection before the collection and 100 of the collection, far from one another. */
+  const SPANNING = accountAt(0x55);
+  const SPANNING_HOLDINGS = [
+    ...Array.from({ length: 100 }, (_, i) => ({ issuer: BEFORE, serial: 1 + 2000 * i })),
+    ...Array.from({ length: 100 }, (_, i) => ({ issuer: ISSUER, serial: 1 + 1100 * i })),
+  ];
   const TEMPLATE = '3'.repeat(64);
   const collection = `/v2/nft_collections/${ISSUER}/${TAXON}`;
   /**
@@ -1131,6 +1137,20 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
       })),
     );
 
+    // and an account that holds 100 NFTs of the collection before it and 100 of it, which lie far from one another
+    await h.ch.insert(
+      Table.AccountNfts,
+      SPANNING_HOLDINGS.map(({ issuer, serial }) => ({
+        ...SAMPLE_ROWS[Table.AccountNfts],
+        owner: SPANNING,
+        issuer,
+        taxon_key: TAXON,
+        serial,
+        nft_id: serial.toString(16).toUpperCase().padStart(64, '0'),
+        held: 1,
+      })),
+    );
+
     // the holders: 40,000 of the collection, between 80,000 of the collections around it
     await h.ch.insert(Table.NftCollectionHolders, [
       { ...SAMPLE_ROWS[Table.NftCollectionHolders], owner: 'rTemplateHolder' },
@@ -1186,8 +1206,12 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
   it('the seed is as assumed: the NFTs, the holdings and the holders of the collection among those of two others', async () => {
     const lots = PARTS * (NFTS_PER_PART + 2 * OTHER_NFTS_PER_PART) + 1;
     expect(await count(Table.Nfts)).toEqual({ rows: lots, parts: PARTS * 3 + 1 });
-    // (and the 200 holdings of the account whose NFTs are spread over the collection, a part of their own)
-    expect(await count(Table.AccountNfts)).toEqual({ rows: lots + SCATTERED_SERIALS.length, parts: PARTS * 3 + 2 });
+    // (and the 200 holdings of the account whose NFTs are spread over the collection, a part of their own, and the 200 of the one
+    // that holds NFTs of two collections)
+    expect(await count(Table.AccountNfts)).toEqual({
+      rows: lots + SCATTERED_SERIALS.length + SPANNING_HOLDINGS.length,
+      parts: PARTS * 3 + 3,
+    });
     expect(await count(Table.NftCollectionHolders)).toEqual({
       rows: PARTS * (HOLDERS_PER_PART + 2 * OTHER_HOLDERS_PER_PART) + 1,
       parts: PARTS * 3 + 1,
@@ -1288,6 +1312,119 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
       expect([path, read.read_rows <= bound ? 'within the collection' : read.read_rows]).toEqual([
         path,
         'within the collection',
+      ]);
+    }
+  });
+
+  // -- the NFTs of an account (`/v2/accounts/{address}/nfts`), the same tables ---------------------------------------------------------
+  //  - the holdings are the owner's prefix of `account_nfts` (all of them when no collection is named: here the 120,000 of the one
+  //    collection), paged by `readNewestPage` as a collection's holdings are: a page stops after the cap, a granule or two of each part;
+  //  - the NFTs of the page are the newest `nfts` rows of its keys, by the WHOLE key of each (the holdings of an account lie in
+  //    collections of their own): about a granule of each part for each NFT that lies in a granule of its own. Holdings that lie
+  //    together read a few granules; 200 that are far from one another read up to the `nfts` rows of the collections the page names,
+  //    which is the bound, and never the rows of another collection.
+
+  describe.each(pages)('the NFTs of the account that holds the 120,000: %s', (_name, marker) => {
+    const account = `/v2/accounts/${OWNER}/nfts`;
+    const path = `${account}?limit=200${marker === undefined ? '' : `&marker=${markerOf([ISSUER, TAXON, ...marker])}`}`;
+    const first = marker === undefined ? 1 : marker[0] + 1;
+    const serials = (body: Record<string, unknown>): number[] =>
+      (body.nfts as { serial: number }[]).map((n) => n.serial);
+
+    it('a page of 200 NFTs reads about a granule of each part of the holdings and of the NFTs, and is whole', async () => {
+      const holdings = await served(h, api, Table.AccountNfts, path, 'nfts');
+      expect(holdings.reads.length).toBeGreaterThanOrEqual(1);
+      for (const read of holdings.reads)
+        expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      const want = Array.from({ length: Math.min(200, 120_000 - first + 1) }, (_, i) => first + i);
+      expect(serials(holdings.body)).toEqual(want);
+      expect(holdings.body.marker === undefined).toBe(first + 200 > 120_000);
+      // the NFTs themselves, by their keys: they lie together, so a few granules
+      const nfts = await served(h, api, Table.Nfts, path, 'nfts');
+      expect(nfts.reads.length).toBeGreaterThanOrEqual(1);
+      for (const read of nfts.reads)
+        expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+    });
+
+    it('the page read is a read of the newest page, in the order of the key, narrowed by the owner and the marker', async () => {
+      const { statements } = await served(h, api, Table.AccountNfts, path, 'nfts');
+      const page = statements.filter(([sql]) => isNewestPageRead(sql));
+      expect(page).toHaveLength(1);
+      const [sql, params] = page[0];
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      expect(sql).toContain('held = 1');
+      // a few granules out of those of the table: the owner's, and after the marker
+      const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerNewestRead(sql), params));
+      expect(primary.keys[0]).toBe('owner');
+      expect(primary.condition).toContain(`owner in ['${OWNER}'`);
+      expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+      // the lookup of the NFTs is by the whole key of each, in one read
+      const lookups = (await served(h, api, Table.Nfts, path, 'nfts')).statements.filter(([text]) =>
+        text.includes('(issuer, taxon_key, serial, nft_id) IN'),
+      );
+      expect(lookups).toHaveLength(1);
+      const [lookup, lookupParams] = lookups[0];
+      const [byKey] = primaryKeys(await explain(h, 'indexes = 1', lookup, lookupParams));
+      expect(byKey.keys).toEqual(['issuer', 'taxon_key', 'serial', 'nft_id']);
+      expect(byKey.granules[0]).toBeLessThan(byKey.granules[1] / 4);
+    });
+  });
+
+  it('issuer and taxon narrow the holdings to the collection: the owner, the issuer and the taxon are the prefix of the read', async () => {
+    const path = `/v2/accounts/${OWNER}/nfts?limit=200&issuer=${ISSUER}&taxon=${TAXON}`;
+    const { reads, statements, body } = await served(h, api, Table.AccountNfts, path, 'nfts');
+    for (const read of reads) expect(read.read_rows).toBeLessThanOrEqual(READ_BOUND);
+    expect((body.nfts as { serial: number }[]).map((n) => n.serial)).toEqual(
+      Array.from({ length: 200 }, (_, i) => i + 1),
+    );
+    const page = statements.filter(([sql]) => isNewestPageRead(sql));
+    expect(page).toHaveLength(1);
+    const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerNewestRead(page[0][0]), page[0][1]));
+    expect(primary.keys.slice(0, 3)).toEqual(['owner', 'issuer', 'taxon_key']);
+    expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+  });
+
+  it("the NFTs of an account whose holdings are spread over one collection: the lookup reads the collection's nfts at most, not the table", async () => {
+    // the 200 holdings are one part of the account's own (a granule); each NFT lies in a granule of its own in the collection's
+    // `nfts`, so the lookup of the page reads about every granule of it (its 120,000 rows) and none of the collections around it
+    const path = `/v2/accounts/${SCATTERED}/nfts?limit=200`;
+    const holdings = await served(h, api, Table.AccountNfts, path, 'nfts');
+    expect((holdings.body.nfts as { serial: number }[]).map((n) => n.serial)).toEqual(SCATTERED_SERIALS);
+    expect(holdings.body.marker).toBeUndefined();
+    for (const read of holdings.reads) expect(read.read_rows).toBeLessThanOrEqual(GRANULE);
+    const nfts = await served(h, api, Table.Nfts, path, 'nfts');
+    expect(nfts.reads.length).toBeGreaterThanOrEqual(1);
+    const bound = NFTS_PREFIX + PARTS * GRANULE;
+    const table = (await count(Table.Nfts)).rows;
+    expect(bound).toBeLessThan(table / 3);
+    for (const read of nfts.reads) {
+      expect([path, read.read_rows <= bound ? 'within the collection' : read.read_rows]).toEqual([
+        path,
+        'within the collection',
+      ]);
+    }
+  });
+
+  it('the NFTs of an account that holds NFTs of two collections: the lookup reads the nfts of those collections at most, not the one beside them', async () => {
+    // 100 NFTs of the collection before the collection and 100 of it, none of the collection after it: the bound is the nfts of the
+    // two collections (240,000 and 120,000 rows) and a granule of each part at each end, and the 240,000 of the third are not read
+    const path = `/v2/accounts/${SPANNING}/nfts?limit=200`;
+    const holdings = await served(h, api, Table.AccountNfts, path, 'nfts');
+    const served200 = holdings.body.nfts as { issuer: string; serial: number }[];
+    // by collection, then serial: the 100 of the collection before it first
+    expect(served200.map((n) => [n.issuer, n.serial])).toEqual(
+      SPANNING_HOLDINGS.map(({ issuer, serial }) => [issuer, serial]),
+    );
+    for (const read of holdings.reads) expect(read.read_rows).toBeLessThanOrEqual(GRANULE);
+    const nfts = await served(h, api, Table.Nfts, path, 'nfts');
+    expect(nfts.reads.length).toBeGreaterThanOrEqual(1);
+    const bound = PARTS * OTHER_NFTS_PER_PART + NFTS_PREFIX + 2 * PARTS * GRANULE;
+    const table = (await count(Table.Nfts)).rows;
+    expect(table - bound).toBeGreaterThan((PARTS * OTHER_NFTS_PER_PART) / 2);
+    for (const read of nfts.reads) {
+      expect([path, read.read_rows <= bound ? 'within the two collections' : read.read_rows]).toEqual([
+        path,
+        'within the two collections',
       ]);
     }
   });
@@ -1496,6 +1633,268 @@ describe('the sales of a collection read the granules of a page, not the 400,000
       expect(primary.condition).toContain(`issuer in ['${ISSUER}'`);
       expect(primary.granules[0]).toBeLessThanOrEqual(Math.ceil((PARTS * EVENTS_PER_PART) / GRANULE) + 2 * PARTS);
       expect(primary.granules[0]).toBeLessThan(primary.granules[1] * 0.6);
+    });
+  });
+});
+
+describe('the sales of the network and the history of an account read the granules of a page, not the range (read_rows over a bulk of four parts)', () => {
+  // `nft_sales` is a range of the ledgers (the network's sales), and `account_nft_events` a range of the primary key (the account,
+  // then its ledgers); both are read in the order of the key a page at a time by `readDistinctPage`, the filters (the currency of
+  // a sale, the event and the roles of an event) being conditions of the read that is capped.
+  //  - the sales: 100,000 in each of four parts, four to a ledger, every fourth priced in USD and the rest in the native currency;
+  //    a read that did not stop after the page would read the rest of the range, hundreds of thousands of rows;
+  //  - the events of the account: 100,000 in each of four parts, four to a ledger, every fourth a sale with the broker among its
+  //    roles and the rest mints; two other accounts, one that sorts before and one that sorts after, have 100,000 each in the same
+  //    parts: a read that did not use the key would read all 1,200,000.
+  const PARTS = BULK_BASES.length;
+  const GRANULE = 8192;
+  const SALES_PER_PART = 100_000;
+  const EVENTS_PER_PART = 100_000;
+  const [BEFORE, ACCOUNT, AFTER] = [accountAt(0x72), accountAt(0x73), accountAt(0x74)].sort();
+  const USD_ISSUER = accountAt(0x71);
+  const TEMPLATE = '3'.repeat(64);
+  /**
+   * Two granules of each part at most (the one the read starts in and the next) and one more: a page starts in one part and goes
+   * on into the next, and the measured read is far below this. The rest of the range after a deep marker is larger than it.
+   */
+  const READ_BOUND = PARTS * 2 * GRANULE + GRANULE;
+  /** A marker 5,000 ledgers (20,000 sales) into the second part: the page starts inside the bulk. */
+  const MID_LEDGER = BULK_BASES[1] + 5_000;
+  /** The same for the events of the account. */
+  const MID_EVENT_LEDGER = MID_LEDGER;
+  const LEDGERS_PER_PART_EVENTS = EVENTS_PER_PART / 4;
+  /** The last ledger of the bulks. */
+  const BULK_END = BULK_BASES[3] + LEDGERS_PER_PART_EVENTS;
+  /** The ledger of the template of the bulks: above the newest ledger (the mock ledger 29136413), so that no window holds it. */
+  const TEMPLATE_LEDGER = 29_999_000;
+
+  let h: Harness;
+  let api: ApiClient;
+
+  /** The key of a row, as a marker holds it. */
+  type Key = [ledger: number, tx: number, event: number];
+  /** The row after `key` in the order of the key (four to a ledger: the transactions 0 to 3), and the one before it. */
+  const after = ([ledger, tx]: Key): Key => (tx < 3 ? [ledger, tx + 1, 0] : [ledger + 1, 0, 0]);
+  const before = ([ledger, tx]: Key): Key => (tx > 0 ? [ledger, tx - 1, 0] : [ledger - 1, 3, 0]);
+  /** The `n` keys after the marker (or from the start of the range) in the direction of the read, `step` apart. */
+  function wantKeys(
+    marker: Key | undefined,
+    descending: boolean,
+    n: number,
+    start: Key,
+    end: Key,
+    keep: (key: Key) => boolean = () => true,
+  ): Key[] {
+    const step = descending ? before : after;
+    const keys: Key[] = [];
+    let next: Key = marker === undefined ? (descending ? end : start) : step(marker);
+    while (keys.length < n) {
+      if (keep(next)) keys.push(next);
+      next = step(next);
+    }
+    return keys;
+  }
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    // one real sale is the template of the bulks: a sale of a made-up NFT in a ledger above the mock ledgers (and the copies of it
+    // an ingest writes: the row of each account it names)
+    await insertNftEvents(h, [
+      nftEventRow({
+        nft_id: TEMPLATE,
+        issuer: 'rTemplateIssuer',
+        ledger_index: TEMPLATE_LEDGER,
+        tx_index: 1,
+        event: 'sale',
+        amount: '1',
+        amount_f: 1,
+        currency: 'XRP',
+      }),
+    ]);
+    await insertBulk(
+      h,
+      Table.NftSales,
+      `SELECT * FROM ${Table.NftSales} WHERE nft_id = {template:String} LIMIT 1`,
+      { template: TEMPLATE, usd_issuer: USD_ISSUER },
+      (base) =>
+        `${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index, if(${BULK_TX_INDEX} = 3, 'USD', 'XRP') AS currency, if(${BULK_TX_INDEX} = 3, {usd_issuer:String}, '') AS amount_issuer`,
+      SALES_PER_PART,
+    );
+    const events = async (account: string): Promise<void> =>
+      insertBulk(
+        h,
+        Table.AccountNftEvents,
+        `SELECT * FROM ${Table.AccountNftEvents} WHERE nft_id = {template:String} AND account = 'rSyntheticOwner' LIMIT 1`,
+        { template: TEMPLATE, account },
+        (base) =>
+          `{account:String} AS account, ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index, if(${BULK_TX_INDEX} = 3, 'sale', 'mint') AS event, if(${BULK_TX_INDEX} = 3, ['broker', 'to'], ['to']) AS roles`,
+        EVENTS_PER_PART,
+      );
+    await events(BEFORE);
+    await events(ACCOUNT);
+    await events(AFTER);
+  }, 900_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the seed is as assumed: 400,000 sales in four parts, and 400,000 events of the account among 1,200,000', async () => {
+    const [sales] = await h.ch.query<{ n: string; parts: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts FROM ${Table.NftSales} WHERE ledger_index BETWEEN {from:UInt32} AND {to:UInt32}`,
+      { from: BULK_BASES[0], to: BULK_END },
+    );
+    expect([Number(sales.n), Number(sales.parts)]).toEqual([PARTS * SALES_PER_PART, PARTS]);
+    const [mine] = await h.ch.query<{ n: string; parts: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts FROM ${Table.AccountNftEvents} WHERE account = {account:String} AND ledger_index BETWEEN {from:UInt32} AND {to:UInt32}`,
+      { account: ACCOUNT, from: BULK_BASES[0], to: BULK_END },
+    );
+    expect([Number(mine.n), Number(mine.parts)]).toEqual([PARTS * EVENTS_PER_PART, PARTS]);
+    const [all] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM ${Table.AccountNftEvents} WHERE ledger_index BETWEEN {from:UInt32} AND {to:UInt32}`,
+      { from: BULK_BASES[0], to: BULK_END },
+    );
+    expect(Number(all.n)).toBe(3 * PARTS * EVENTS_PER_PART);
+    // the bounds are far below what a read that did not stop would read, and what is left of the range after the deep markers is more
+    expect(READ_BOUND).toBeLessThan((PARTS * SALES_PER_PART) / 4);
+    expect(READ_BOUND).toBeLessThan((PARTS * EVENTS_PER_PART) / 4);
+    expect((MID_LEDGER - BULK_BASES[1]) * 4 + SALES_PER_PART).toBeGreaterThan(READ_BOUND);
+    expect((BULK_BASES[1] + SALES_PER_PART / 4 - MID_LEDGER) * 4 + 2 * SALES_PER_PART).toBeGreaterThan(READ_BOUND);
+    expect((MID_EVENT_LEDGER - BULK_BASES[1]) * 4 + EVENTS_PER_PART).toBeGreaterThan(READ_BOUND);
+    expect((BULK_BASES[1] + LEDGERS_PER_PART_EVENTS - MID_EVENT_LEDGER) * 4 + 2 * EVENTS_PER_PART).toBeGreaterThan(
+      READ_BOUND,
+    );
+  });
+
+  describe.each([false, true])('descending=%s', (descending) => {
+    const direction = `descending=${descending}`;
+    const pageOf = (path: string, limit: number, marker?: Key, extra = ''): string =>
+      `${path}?limit=${limit}&${direction}${extra}${marker === undefined ? '' : `&marker=${markerOf(marker)}`}`;
+
+    describe('GET /v2/nft_sales', () => {
+      const salesStart: Key = [BULK_BASES[0], 0, 0];
+      const salesEnd: Key = [BULK_BASES[3] + SALES_PER_PART / 4 - 1, 3, 0];
+
+      it.each([
+        ['the first page', undefined],
+        ['a page that starts inside the bulk', [MID_LEDGER, 1, 0]],
+        ['a page near the start of the range', [BULK_BASES[0] + 100, 2, 0]],
+      ] as const)(
+        'a page of 200 sales (%s) reads about a granule of each part, and is whole',
+        async (_name, marker) => {
+          const path = pageOf('/v2/nft_sales', 200, marker as Key | undefined);
+          const { reads, body } = await served(h, api, Table.NftSales, path, 'sales');
+          expect(reads.length).toBeGreaterThanOrEqual(1);
+          for (const read of reads) {
+            expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+          }
+          const keys = (body.sales as { ledger_index: number; tx_index: number; event_index: number }[]).map(
+            (s) => [s.ledger_index, s.tx_index, s.event_index] as Key,
+          );
+          const want = wantKeys(marker as Key | undefined, descending, 200, salesStart, salesEnd);
+          expect([path, keys]).toEqual([path, want]);
+          expect(body.marker).toBe(markerOf(want[199]));
+        },
+      );
+
+      it('the page read is read in the order of the key, stops after its rows, and reads no table but the sales', async () => {
+        const path = pageOf('/v2/nft_sales', 200, [MID_LEDGER, 1, 0]);
+        const { statements } = await served(h, api, Table.NftSales, path, 'sales');
+        const page = statements.filter(([sql]) => isPageRead(sql));
+        expect(page).toHaveLength(1);
+        const [sql, params] = page[0];
+        await expectBoundedInOrderRead(h, sql, params, descending, path);
+        expect(sql).toContain(`FROM ${Table.NftSales}`);
+        expect(sql).not.toMatch(/\bFINAL\b/i);
+        const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
+        expect(primary.keys[0]).toBe('ledger_index');
+        expect(primary.parts[0]).toBeGreaterThanOrEqual(1);
+      });
+
+      it('a page of the sales priced in one currency (every fourth) reads about a granule of each part too: the filter is inside the capped read', async () => {
+        const path = pageOf('/v2/nft_sales', 200, [MID_LEDGER, 1, 0], `&currency=USD%2B${USD_ISSUER}`);
+        const { reads, body, statements } = await served(h, api, Table.NftSales, path, 'sales');
+        for (const read of reads) {
+          expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+        }
+        const keys = (body.sales as { ledger_index: number; tx_index: number; event_index: number }[]).map(
+          (s) => [s.ledger_index, s.tx_index, s.event_index] as Key,
+        );
+        expect([path, keys]).toEqual([
+          path,
+          wantKeys([MID_LEDGER, 1, 0], descending, 200, salesStart, salesEnd, ([, tx]) => tx === 3),
+        ]);
+        const page = statements.filter(([sql]) => isPageRead(sql));
+        expect(page).toHaveLength(1);
+        expect(innerRead(page[0][0])).toContain(
+          'currency = {currency:String} AND amount_issuer = {amount_issuer:String}',
+        );
+        await expectBoundedInOrderRead(h, page[0][0], page[0][1], descending, path);
+      });
+    });
+
+    describe('GET /v2/accounts/{address}/nft_history', () => {
+      const historyPath = `/v2/accounts/${ACCOUNT}/nft_history`;
+      const eventsStart: Key = [BULK_BASES[0], 0, 0];
+      const eventsEnd: Key = [BULK_BASES[3] + LEDGERS_PER_PART_EVENTS - 1, 3, 0];
+      const keysOf = (body: Record<string, unknown>): Key[] =>
+        (body.events as { ledger_index: number; tx_index: number; event_index: number }[]).map(
+          (e) => [e.ledger_index, e.tx_index, e.event_index] as Key,
+        );
+
+      it.each([
+        ['the first page', undefined],
+        ['a page that starts inside the bulk', [MID_EVENT_LEDGER, 1, 0]],
+        ['a page near the start of the range', [BULK_BASES[0] + 100, 2, 0]],
+      ] as const)(
+        'a page of 200 events (%s) reads about a granule of each part, and is whole',
+        async (_name, marker) => {
+          const path = pageOf(historyPath, 200, marker as Key | undefined);
+          const { reads, body } = await served(h, api, Table.AccountNftEvents, path, 'events');
+          expect(reads.length).toBeGreaterThanOrEqual(1);
+          for (const read of reads) {
+            expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+          }
+          const want = wantKeys(marker as Key | undefined, descending, 200, eventsStart, eventsEnd);
+          expect([path, keysOf(body)]).toEqual([path, want]);
+          expect(body.marker).toBe(markerOf(want[199]));
+        },
+      );
+
+      it('the page read is read in the order of the key, stops after its rows, and holds the filters inside', async () => {
+        const path = pageOf(historyPath, 200, [MID_EVENT_LEDGER, 1, 0], '&event=sale&role=broker');
+        const { statements, body } = await served(h, api, Table.AccountNftEvents, path, 'events');
+        // every fourth event is a sale with the broker among its roles: the page of them is whole
+        expect([path, keysOf(body)]).toEqual([
+          path,
+          wantKeys([MID_EVENT_LEDGER, 1, 0], descending, 200, eventsStart, eventsEnd, ([, tx]) => tx === 3),
+        ]);
+        const page = statements.filter(([sql]) => isPageRead(sql));
+        expect(page).toHaveLength(1);
+        const [sql, params] = page[0];
+        await expectBoundedInOrderRead(h, sql, params, descending, path);
+        // the event and the roles are conditions of the inner read, which the cap counts: never a step after the page
+        expect(innerRead(sql)).toContain('event IN {events:Array(String)}');
+        expect(innerRead(sql)).toContain('hasAny(roles, {roles:Array(String)})');
+        expect(sql).not.toMatch(/\bFINAL\b/i);
+        // the primary key narrows the read to the account's rows: its 400,000 of the 1,200,000 of the bulk
+        const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
+        expect(primary.keys[0]).toBe('account');
+        expect(primary.condition).toContain(`account in ['${ACCOUNT}'`);
+        expect(primary.granules[0]).toBeLessThan(primary.granules[1] * 0.6);
+      });
+
+      it('a page of the events in which the account has one role (every fourth) reads about a granule of each part too', async () => {
+        const path = pageOf(historyPath, 200, [MID_EVENT_LEDGER, 1, 0], '&role=broker');
+        const { reads, body } = await served(h, api, Table.AccountNftEvents, path, 'events');
+        for (const read of reads) {
+          expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+        }
+        expect(keysOf(body)).toEqual(
+          wantKeys([MID_EVENT_LEDGER, 1, 0], descending, 200, eventsStart, eventsEnd, ([, tx]) => tx === 3),
+        );
+      });
     });
   });
 });

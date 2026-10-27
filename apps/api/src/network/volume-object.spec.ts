@@ -1,6 +1,10 @@
 import BigNumber from 'bignumber.js';
 import {
   AmmComponent,
+  NFT_VOLUME_BODY_KEYS,
+  NFT_VOLUME_COMPONENT_KEYS,
+  NftVolumeComponent,
+  sentinelCountOf,
   StoredVolumeRow,
   sumParts,
   toVolumeRow,
@@ -686,5 +690,219 @@ describe('the AMM volume row', () => {
     expect(parts).toHaveLength(2);
     expect(parts[0]).toMatchObject({ component: POOL, count: 3, converted: 45 });
     expect(parts[0].amount.toString()).toBe('15');
+  });
+});
+
+describe('the NFT volume row', () => {
+  const ISSUER = 'rLULtFk9Wi6BURPLNsGkoQrBSLoY8F5Cgz';
+  const ISSUER2 = 'rHciXfNWUjkgAMPr1GoQmphHzMCZSYFwNW';
+  /** A collection of the NFT volume: the volume in the native currency, with `converted` its Float64 shadow, over `count` sales. */
+  const collection = (over: Partial<VolumePart> = {}): VolumePart => ({
+    component: `${ISSUER}/1`,
+    base: { currency: 'XRP' },
+    amount: bn('181200.5'),
+    count: 412,
+    converted: 181_200.5,
+    ...over,
+  });
+
+  it('an nft_volume row counts the sentinel, and its components are issuer, taxon?, count, amount, rate, converted_amount', () => {
+    const row = toVolumeRow(
+      'nft_volume',
+      bucket(
+        [collection(), collection({ component: `${ISSUER2}/7`, amount: bn('99.75'), count: 3, converted: 99.75 })],
+        {
+          end: T0 + 86_400,
+          sentinelCount: 1290,
+        },
+      ),
+      'XRP',
+    );
+    expect(Object.keys(row)).toEqual([
+      'components',
+      'count',
+      'exchange',
+      'total',
+      'exchange_rate',
+      'start_time',
+      'end_time',
+    ]);
+    // every sale of the window (the sentinel's), not the 415 that have a price in the native currency
+    expect(row.count).toBe(1290);
+    expect(row.components).toEqual([
+      { issuer: ISSUER, taxon: 1, count: 412, amount: '181200.5', rate: '1.0000000', converted_amount: '181200.5' },
+      { issuer: ISSUER2, taxon: 7, count: 3, amount: '99.75', rate: '1.0000000', converted_amount: '99.75' },
+    ]);
+    for (const component of row.components as NftVolumeComponent[]) {
+      expect(Object.keys(component)).toEqual([...NFT_VOLUME_COMPONENT_KEYS]);
+      expect([
+        typeof component.issuer,
+        typeof component.taxon,
+        typeof component.count,
+        typeof component.amount,
+        typeof component.rate,
+        typeof component.converted_amount,
+      ]).toEqual(['string', 'number', 'number', 'string', 'string', 'string']);
+    }
+    expect(row).toMatchObject({ exchange: { currency: 'XRP' }, total: '181300.25', exchange_rate: '1.0000000' });
+    expect(row.start_time).toBe('2015-01-14T00:00:00Z');
+    expect(row.end_time).toBe('2015-01-15T00:00:00Z');
+  });
+
+  it('a Xahau component has no taxon: the collection is the issuer alone', () => {
+    const row = toVolumeRow(
+      'nft_volume',
+      bucket([collection({ component: ISSUER, base: { currency: 'XAH' } })], { sentinelCount: 5 }),
+      'XAH',
+    );
+    const [component] = row.components as NftVolumeComponent[];
+    expect(component).toEqual({
+      issuer: ISSUER,
+      count: 412,
+      amount: '181200.5',
+      rate: '1.0000000',
+      converted_amount: '181200.5',
+    });
+    expect(Object.keys(component)).toEqual(['issuer', 'count', 'amount', 'rate', 'converted_amount']);
+    expect(row.exchange).toEqual({ currency: 'XAH' });
+  });
+
+  it('the taxon 0 is a taxon: an XRPL collection of the taxon 0 has the key', () => {
+    const [component] = toVolumeRow('nft_volume', bucket([collection({ component: `${ISSUER}/0` })]), 'XRP')
+      .components as NftVolumeComponent[];
+    expect(component.taxon).toBe(0);
+  });
+
+  it('the keys of the component and of the answer are pinned once, for the reference of the API', () => {
+    expect([...NFT_VOLUME_COMPONENT_KEYS]).toEqual(['issuer', 'taxon', 'count', 'amount', 'rate', 'converted_amount']);
+    expect([...NFT_VOLUME_BODY_KEYS]).toEqual(['result', 'coverage', 'count', 'marker', 'rows']);
+  });
+
+  it('a bucket with no sale is a row with no component: count 0, total "0"', () => {
+    const row = toVolumeRow('nft_volume', bucket([], { sentinelCount: 0 }), 'XRP');
+    expect(row).toMatchObject({ components: [], count: 0, total: '0', exchange_rate: '1.0000000' });
+  });
+
+  it('a bucket with no sentinel count counts 0, whatever its parts count: the row of this metric is not the sum of its components', () => {
+    expect(toVolumeRow('nft_volume', bucket([collection()]), 'XRP').count).toBe(0);
+    // ... and the other metrics are the sum of theirs, whatever the sentinel counts
+    expect(toVolumeRow('trade_volume', bucket([trade()], { sentinelCount: 99 }), 'XRP').count).toBe(3);
+    expect(toVolumeRow('payment_volume', bucket([payment()], { sentinelCount: 99 }), 'XRP').count).toBe(4);
+  });
+
+  it('is sorted by converted amount, largest first, the same amount by collection; a collection with nothing converted is not listed', () => {
+    const row = toVolumeRow(
+      'nft_volume',
+      bucket(
+        [
+          collection({ component: `${ISSUER2}/2`, amount: bn('10'), converted: 10 }),
+          collection({ component: `${ISSUER}/9`, amount: bn('500'), converted: 500 }),
+          collection({ component: `${ISSUER}/3`, amount: bn('10'), converted: 10 }),
+          collection({ component: `${ISSUER}/4`, amount: bn('0'), converted: 0, count: 2 }),
+        ],
+        { sentinelCount: 20 },
+      ),
+      'XRP',
+    );
+    expect((row.components as NftVolumeComponent[]).map((c) => [c.issuer, c.taxon])).toEqual([
+      [ISSUER, 9],
+      // (the same amount: by the id of the collection, `rHci…/2` before `rLUL…/3`)
+      [ISSUER2, 2],
+      [ISSUER, 3],
+    ]);
+    expect(row.total).toBe('520');
+    expect(row.count).toBe(20);
+  });
+
+  it('the amounts are exact: the sum of two days does not carry the Float64 noise of 0.1 + 0.2', () => {
+    const parts = sumParts([
+      { ...stored(), amount: '0.1', count: 1, converted_f: 0.1 },
+      { ...stored(), amount: '0.2', count: 2, converted_f: 0.2 },
+    ]);
+    expect(parts[0].converted).toBe(0.1 + 0.2);
+    expect(String(parts[0].converted)).toBe('0.30000000000000004');
+    const row = toVolumeRow('nft_volume', bucket(parts, { sentinelCount: 3 }), 'XRP');
+    expect(row.components[0]).toMatchObject({ amount: '0.3', converted_amount: '0.3', count: 3 });
+    expect(row.total).toBe('0.3');
+    // an amount that a double cannot hold, in plain digits
+    const big = toVolumeRow(
+      'nft_volume',
+      bucket([collection({ amount: bn('99999999999.123456'), converted: 99_999_999_999.123456 })]),
+      'XRP',
+    );
+    expect(big.components[0]).toMatchObject({ amount: '99999999999.123456', converted_amount: '99999999999.123456' });
+    expect(big.total).toBe('99999999999.123456');
+    const huge = toVolumeRow('nft_volume', bucket([collection({ amount: bn('1e21'), converted: 1e21 })]), 'XRP');
+    expect(huge.components[0]).toMatchObject({ amount: '1000000000000000000000' });
+  });
+
+  it('a display currency converts as it does a trade row: total, exchange_rate, rate / X, converted_amount * X, the amount stays', () => {
+    const row = toVolumeRow(
+      'nft_volume',
+      bucket([collection({ amount: bn('100'), converted: 100, count: 4 })], { sentinelCount: 9 }),
+      'XRP',
+      { asset: { currency: 'USD', issuer: I1 }, rate: bn('0.5') },
+    );
+    expect(row.exchange).toEqual({ currency: 'USD', issuer: I1 });
+    expect(row.exchange_rate).toBe('0.50000000');
+    expect(row.total).toBe('50');
+    expect(row.count).toBe(9);
+    expect(row.components).toEqual([
+      { issuer: ISSUER, taxon: 1, count: 4, amount: '100', rate: '2.0000000', converted_amount: '50' },
+    ]);
+    // with no rate (X is 0) the row is zeros, as for the other metrics
+    const zeros = toVolumeRow('nft_volume', bucket([collection({ amount: bn('100'), converted: 100 })]), 'XRP', {
+      asset: { currency: 'USD', issuer: I1 },
+      rate: bn(0),
+    });
+    expect(zeros).toMatchObject({ total: '0', exchange_rate: '0.0000000' });
+    expect(zeros.components[0]).toMatchObject({ rate: '0', converted_amount: '0' });
+  });
+
+  it('does not change what it is given', () => {
+    const given = deepFreeze(bucket([collection()], { sentinelCount: 4 }));
+    expect(() =>
+      toVolumeRow('nft_volume', given, 'XRP', { asset: { currency: 'USD', issuer: I1 }, rate: bn(2) }),
+    ).not.toThrow();
+  });
+
+  /** A stored row of a collection's set. */
+  function stored(over: Partial<StoredVolumeRow> = {}): StoredVolumeRow {
+    return {
+      component: `${ISSUER}/1`,
+      base_currency: 'XRP',
+      base_issuer: '',
+      counter_currency: '',
+      counter_issuer: '',
+      amount: '1',
+      count: 1,
+      converted_f: 1,
+      ...over,
+    };
+  }
+
+  describe('sentinelCountOf (the count of the sentinel rows of a bucket, the days added up)', () => {
+    const sentinel = (count: number | string): StoredVolumeRow =>
+      stored({ component: '', base_currency: '', amount: '0', count, converted_f: 0 });
+
+    it('is the count of the sentinel, which the components do not add to', () => {
+      expect(sentinelCountOf([sentinel(1290), stored({ count: 412 })])).toBe(1290);
+    });
+
+    it("adds the days: a week of sentinels is the week's sales", () => {
+      expect(
+        sentinelCountOf([sentinel(5), stored({ count: 2 }), sentinel('7'), sentinel(0), stored({ count: 1 })]),
+      ).toBe(12);
+    });
+
+    it("is 0 for rows with no sentinel and for no row; the other metrics' sentinels count 0", () => {
+      expect(sentinelCountOf([])).toBe(0);
+      expect(sentinelCountOf([stored({ count: 9 })])).toBe(0);
+      expect(sentinelCountOf([sentinel(0), sentinel(0)])).toBe(0);
+    });
+
+    it('is no part: sumParts leaves the sentinel out', () => {
+      expect(sumParts([sentinel(1290), stored({ count: 412 })])).toHaveLength(1);
+    });
   });
 });

@@ -1,4 +1,5 @@
 import {
+  AccountNftEventsRow,
   buildLedgerRows,
   clickHouseConfigFromEnv,
   ClickHouseService,
@@ -13,9 +14,11 @@ import {
   nftsChangedSince,
   NftTouchesRow,
   parseContextFor,
+  ParsedNftEvent,
   RatesService,
   rebuildNfts,
   recomputeCollections,
+  rolesOf,
   Table,
 } from '@gatehub/data-api-shared';
 import { clickHouseUrl } from '../e2e-env';
@@ -79,13 +82,29 @@ export function nftEventRow(over: Partial<NftEventsRow> = {}): NftEventsRow {
 }
 
 /**
- * Writes events made by hand to the ledger tables an ingest writes them to (`nft_events`, its copy by collection, the sales in
- * ledger order and the touches the aggregator scans). The ledgers they are in have to be committed (`ledgers`) to be read:
- * put them in ledgers of the seed. Rows of one call with the same key are collapsed on insert; a row written twice, as a
- * re-ingest can leave it, is two calls.
+ * The copy of an event for each account it involves, as the ingest writes them (`account_nft_events`): the columns of the event,
+ * `actor` the account that did it, `account` the account the row is for, and its `roles` (spec 2.6, in `NFT_ROLES` order; an
+ * account with two roles in an event has one row).
+ */
+function accountNftEventRows(r: NftEventsRow): AccountNftEventsRow[] {
+  const { account: actor, ...columns } = r;
+  return [...rolesOf(r as ParsedNftEvent)].map(([account, roles]) => ({
+    ...columns,
+    account,
+    actor,
+    roles: [...roles],
+  }));
+}
+
+/**
+ * Writes events made by hand to the ledger tables an ingest writes them to (`nft_events`, its copies by account, by collection
+ * and, for the sales, in ledger order, and the touches the aggregator scans). The ledgers they are in have to be committed
+ * (`ledgers`) to be read: put them in ledgers of the seed. Rows of one call with the same key are collapsed on insert; a row
+ * written twice, as a re-ingest can leave it, is two calls.
  */
 export async function insertNftEvents(h: Harness, rows: NftEventsRow[]): Promise<void> {
   await h.ch.insert(Table.NftEvents, rows);
+  await h.ch.insert(Table.AccountNftEvents, rows.flatMap(accountNftEventRows));
   await h.ch.insert(
     Table.CollectionNftEvents,
     rows.map((r) => ({ ...r })),

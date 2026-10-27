@@ -1,12 +1,16 @@
 import {
+  checkSaleCurrencyIssuer,
   collectionDescendingParam,
   collectionKeyParam,
   collectionSortParam,
   eventsParam,
+  holdingsCollectionParam,
   issuerParam,
   nftIdParam,
   offerTypeParam,
   rolesParam,
+  saleAssetParam,
+  saleCurrencyParam,
   STATS_MAX_DAYS,
   statsWindowParam,
   taxonParam,
@@ -229,5 +233,80 @@ describe('collectionKeyParam', () => {
     expect(message(() => collectionKeyParam('xahau', 'xyz', '7'))).toBe('invalid issuer address');
     expect(message(() => collectionKeyParam('xrpl', ISSUER, 'nope'))).toBe('invalid taxon');
     expect(message(() => collectionKeyParam('xrpl', ISSUER, '4294967296'))).toBe('invalid taxon');
+  });
+});
+
+describe('holdingsCollectionParam', () => {
+  const ISSUER = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+
+  it('is none without an issuer or a taxon, and an empty one is none too', () => {
+    expect(holdingsCollectionParam({})).toEqual({});
+    expect(holdingsCollectionParam({ issuer: '', taxon: '' })).toEqual({});
+  });
+
+  it('is the issuer alone, or the issuer and its taxon (a decimal, 0 too)', () => {
+    expect(holdingsCollectionParam({ issuer: ISSUER })).toEqual({ issuer: ISSUER });
+    expect(holdingsCollectionParam({ issuer: ISSUER, taxon: '7' })).toEqual({ issuer: ISSUER, taxon_key: 7 });
+    expect(holdingsCollectionParam({ issuer: ISSUER, taxon: '0' })).toEqual({ issuer: ISSUER, taxon_key: 0 });
+    expect(holdingsCollectionParam({ issuer: ISSUER, taxon: '' })).toEqual({ issuer: ISSUER });
+  });
+
+  it('answers 400 invalid taxon for a taxon without an issuer, a taxon that is none, and a taxon that is too large', () => {
+    expect(message(() => holdingsCollectionParam({ taxon: '7' }))).toBe('invalid taxon');
+    expect(message(() => holdingsCollectionParam({ issuer: '', taxon: '7' }))).toBe('invalid taxon');
+    expect(message(() => holdingsCollectionParam({ issuer: ISSUER, taxon: 'x' }))).toBe('invalid taxon');
+    expect(message(() => holdingsCollectionParam({ issuer: ISSUER, taxon: '-1' }))).toBe('invalid taxon');
+    expect(message(() => holdingsCollectionParam({ issuer: ISSUER, taxon: '4294967296' }))).toBe('invalid taxon');
+  });
+
+  it('checks the issuer first: 400 invalid issuer address, whatever the taxon says', () => {
+    expect(message(() => holdingsCollectionParam({ issuer: 'xyz' }))).toBe('invalid issuer address');
+    expect(message(() => holdingsCollectionParam({ issuer: 'xyz', taxon: 'x' }))).toBe('invalid issuer address');
+  });
+});
+
+describe('the currency of the sales', () => {
+  const ISSUER = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+
+  it('is none when missing or empty, and a space is the + that arrived as one (Ruling 8)', () => {
+    expect(saleCurrencyParam({})).toBeUndefined();
+    expect(saleCurrencyParam({ currency: '' })).toBeUndefined();
+    expect(saleCurrencyParam({ currency: 'XRP' })).toBe('XRP');
+    expect(saleCurrencyParam({ currency: `USD+${ISSUER}` })).toBe(`USD+${ISSUER}`);
+    expect(saleCurrencyParam({ currency: `USD ${ISSUER}` })).toBe(`USD+${ISSUER}`);
+    expect(saleCurrencyParam({ currency: ['USD rA', 'EUR rB'] })).toBe('USD+rA');
+  });
+
+  it('is the native currency or CUR+issuer as /v2/payments/{currency} reads it: split at +, | and ., upper-cased', () => {
+    expect(saleAssetParam(undefined, 'XRP')).toBeUndefined();
+    expect(saleAssetParam('XRP', 'XRP')).toEqual({ currency: 'XRP' });
+    expect(saleAssetParam('xrp', 'XRP')).toEqual({ currency: 'XRP' });
+    for (const separator of ['+', '|', '.']) {
+      expect(saleAssetParam(`usd${separator}${ISSUER}`, 'XRP')).toEqual({ currency: 'USD', issuer: ISSUER });
+    }
+  });
+
+  it('is the native currency of the network: XAH on Xahau, where XRP is an issued currency that needs an issuer', () => {
+    expect(saleAssetParam('XAH', 'XAH')).toEqual({ currency: 'XAH' });
+    expect(saleAssetParam(`XRP+${ISSUER}`, 'XAH')).toEqual({ currency: 'XRP', issuer: ISSUER });
+    expect(message(() => saleAssetParam('XRP', 'XAH'))).toBe('issuer is required');
+    expect(message(() => saleAssetParam(`XAH+${ISSUER}`, 'XAH'))).toBe('XAH cannot have an issuer');
+    expect(message(() => saleAssetParam('XAH', 'XRP'))).toBe('issuer is required');
+  });
+
+  it('answers the errors of parseAsset: XRP cannot have an issuer, issuer is required, invalid issuer address, currency is required', () => {
+    expect(message(() => saleAssetParam(`XRP+${ISSUER}`, 'XRP'))).toBe('XRP cannot have an issuer');
+    expect(message(() => saleAssetParam('USD', 'XRP'))).toBe('issuer is required');
+    expect(message(() => saleAssetParam('USD+xyz', 'XRP'))).toBe('invalid issuer address');
+    expect(message(() => saleAssetParam(`+${ISSUER}`, 'XRP'))).toBe('currency is required');
+  });
+
+  it('checks the issuer first, before the dates, as /v2/payments/{currency} does: 400 invalid issuer address', () => {
+    expect(message(() => checkSaleCurrencyIssuer(undefined))).toBe('no error');
+    expect(message(() => checkSaleCurrencyIssuer('USD'))).toBe('no error');
+    expect(message(() => checkSaleCurrencyIssuer(`USD+${ISSUER}`))).toBe('no error');
+    expect(message(() => checkSaleCurrencyIssuer('USD+xyz'))).toBe('invalid issuer address');
+    // (the other mistakes of the currency come after the dates)
+    expect(message(() => checkSaleCurrencyIssuer(`XRP+${ISSUER}`))).toBe('no error');
   });
 });

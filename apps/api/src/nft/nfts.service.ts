@@ -36,9 +36,10 @@ const EVENT_ORDER = ['nft_id', ...columnsOf(NFT_EVENT_POSITION)];
 
 /**
  * The columns of `nft_events` that an event object is made of (a row of `NftEventsRow`): the times as unix seconds, an
- * expiration that is `NULL` for an offer that has none.
+ * expiration that is `NULL` for an offer that has none. A list, for the read of `account_nft_events` that takes `actor` for
+ * `account` (see `NftAccountsService`).
  */
-export const EVENT_COLUMNS = [
+export const EVENT_COLUMN_LIST = [
   'nft_id',
   'ledger_index',
   'tx_index',
@@ -71,7 +72,10 @@ export const EVENT_COLUMNS = [
   'broker_fee',
   'royalty_est',
   'removed_by',
-].join(', ');
+];
+
+/** The columns of an event object, as one text for a SELECT. */
+export const EVENT_COLUMNS = EVENT_COLUMN_LIST.join(', ');
 
 /** The columns the fold reads (`NftEventRead`). */
 const FOLD_COLUMNS = [

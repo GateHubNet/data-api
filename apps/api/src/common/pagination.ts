@@ -115,6 +115,39 @@ export function keysetClause(
   return { clause: keys.length > 1 ? `${bound} AND ${tuple}` : tuple, params };
 }
 
+/**
+ * The same rows as `keysetClause` selects (the ones after the marker), written as the branches of the tuple comparison:
+ * `a > A OR (a = A AND b > B) OR (a = A AND b = B AND c > C)`, with `<` when descending. The params are those of `keysetClause`
+ * (`k0`, `k1`, ... or `<prefix>0`, ...), each used in several branches.
+ *
+ * A list whose key has several columns that the query does not fix (the NFTs of an account across collections: the issuer, the
+ * taxon, the serial and the id) cannot be narrowed by `keysetClause`: ClickHouse (26.8) reads the primary key through plain
+ * comparisons only, so the bound on the first column starts the read at the first row of that value's range, however far into it
+ * the marker is, and the rows before the marker are read and thrown away. Every branch here is a conjunction of plain comparisons
+ * on a prefix of the key, which narrows: the branch of the last column that varies starts the read at the marker.
+ */
+export function keysetBranches(
+  keys: KeysetKey[],
+  descending: boolean,
+  values?: KeyValue[],
+  prefix = 'k',
+): { clause: string; params: Record<string, unknown> } {
+  if (values === undefined) return { clause: '', params: {} };
+  if (values.length !== keys.length) {
+    // paging from the start instead would make a client loop on the same page for ever
+    throw new Error(`the key has ${keys.length} columns but ${values.length} value(s) were given`);
+  }
+  if (values.includes(null)) throw new Error('a keyset condition cannot compare a null: the list writes its own');
+  const placeholder = (i: number): string => `{${prefix}${i}:${keys[i].type}}`;
+  const params: Record<string, unknown> = {};
+  values.forEach((v, i) => (params[`${prefix}${i}`] = v));
+  const branches = keys.map((key, i) => {
+    const equal = keys.slice(0, i).map((k, j) => `${k.column} = ${placeholder(j)}`);
+    return [...equal, `${key.column} ${descending ? '<' : '>'} ${placeholder(i)}`].join(' AND ');
+  });
+  return { clause: `(${branches.map((branch) => `(${branch})`).join(' OR ')})`, params };
+}
+
 /** The column names of a key, in its order (what `readDistinctPage` takes as `orderBy` and `unique`). */
 export function columnsOf(keys: KeysetKey[]): string[] {
   return keys.map((k) => k.column);

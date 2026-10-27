@@ -22,9 +22,14 @@ import {
   paymentOracle,
   tradeOracle,
 } from '../../../packages/shared/test/volume-oracle';
+import { NFT_VOLUME_BODY_KEYS, NFT_VOLUME_COMPONENT_KEYS } from '../src/network/volume-object';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { accountAt } from './support/amm';
 import { csvDisposition } from './support/csv';
-import { fixtureExchanges, fixturePayments } from './support/fixtures';
+import { fixtureExchanges, fixturePayments, fixtureSource } from './support/fixtures';
+import { rateRows, ratesOf, syntheticCollections, volumeOf } from './support/nft-collections-oracle';
+import { buildNftAggregates, fixtureNftEvents, insertNftEvents, nftEventRow } from './support/nfts';
+import { compareKeys, Ev, Slot, syntheticEvents, WORLDS } from './support/nfts-oracle';
 
 /**
  * `GET /v2/network/exchange_volume` and `GET /v2/network/payment_volume` on a real ClickHouse.
@@ -2649,3 +2654,578 @@ describe('GET /v2/network/amm_volume', () => {
 /** The count and the total of `exchange_volume?live=30day` of the describe above, before the metric `amm_volume` was added. */
 const RECORDED_TRADE_COUNT = 21;
 const RECORDED_TRADE_TOTAL = '2133.232058';
+
+// =====================================================================================================================
+// the NFT volume
+
+/** The keys of the answer, of a row and of a component of `/v2/network/nft_volume`, written out here once more. */
+const NFT_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'rows'];
+const NFT_COMPONENT_KEYS = ['issuer', 'taxon', 'count', 'amount', 'rate', 'converted_amount'];
+
+/** The Monday of the week of a time, and the first of its month, as unix seconds (UTC). */
+const mondayOf = (t: number): number => {
+  const day = Math.floor(t / DAY) * DAY;
+  return day - ((new Date(day * SEC).getUTCDay() + 6) % 7) * DAY;
+};
+const monthStartOf = (t: number): number => {
+  const d = new Date(t * SEC);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / SEC;
+};
+const monthAfter = (t: number): number => {
+  const d = new Date(t * SEC);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / SEC;
+};
+const dateOf = (t: number): string => iso(t).slice(0, 10);
+
+describe.each(WORLDS)('GET /v2/network/nft_volume over the recorded $seed ledgers', (world) => {
+  // The sales of the recorded NFT ledgers and of the collections made by hand (their transactions say `synthetic-…`): in the
+  // native currency, in USD with a rate (40 USD at 4 a coin are 10 coins), in JPY and in the recorded issued currency with none
+  // (counted in the row and in no component), brokered, in several collections of one issuer. The sets are the ones the
+  // syncer's volume jobs write (`buildNftAggregates`: the live sets as of a second after the newest ledger, the daily sets of each
+  // UTC day of the seed); the rows are checked against `volumeOf`, an oracle in plain JavaScript over the events.
+  const xrpl = world.kind === 'nftoken';
+  const recorded = fixtureNftEvents(world.seed);
+  const slots: Slot[] = fixtureSource(world.seed)
+    .list()
+    .map((l) => ({ index: l.header.ledger_index, close: l.header.close_time }))
+    .sort((a, b) => a.index - b.index);
+  const FIRST = slots[0].index;
+  const HEAD = slots[slots.length - 1].index;
+  const made = syntheticEvents(world, slots, HEAD);
+  const hand = syntheticCollections(world, slots);
+  const rates = ratesOf(hand.rates);
+  const events: Ev[] = [...recorded, ...made.rows, ...hand.first, ...hand.second].sort(compareKeys);
+  const NOW = slots[slots.length - 1].close + 1;
+  const FIRST_DAY = Math.floor(slots[0].close / DAY) * DAY;
+  const LAST_DAY = Math.floor(slots[slots.length - 1].close / DAY) * DAY;
+  const DISPLAY = `exchange_currency=XYZ&exchange_issuer=${I2}`;
+  const XYZ_ASSET = { currency: 'XYZ', issuer: I2 };
+  const COVERAGE = { from_ledger_index: FIRST, complete: false };
+  const PERIODS = { day: DAY, '7day': 7 * DAY, '30day': 30 * DAY };
+
+  /** The Xahau seed spans ten days, the XRPL one half a day: the live windows differ only on Xahau. */
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+  interface NftBody {
+    result: string;
+    coverage: { from_ledger_index?: number; complete: boolean };
+    count: number;
+    marker?: string;
+    rows: Json[];
+  }
+  const ok = async (path: string): Promise<NftBody> => (await api.ok<NftBody>(path, 'rows')).body;
+
+  /** The row the API serves for the sales that closed in `[from, to)`; with a display currency, converted by `rate` (units of it a coin). */
+  function rowOf(from: number, to: number, display?: BigNumber): Json {
+    const v = volumeOf(events, rates, from, to);
+    const x = display ?? bn(1);
+    return {
+      components: v.components.map((c) =>
+        display === undefined
+          ? c
+          : {
+              ...c,
+              rate: x.isZero() ? '0' : p8(bn(1).dividedBy(x)),
+              converted_amount: bn(c.amount as string)
+                .times(x)
+                .toFixed(),
+            },
+      ),
+      count: v.count,
+      exchange: display === undefined ? { currency: world.native } : XYZ_ASSET,
+      total: bn(v.total).times(x).toFixed(),
+      exchange_rate: p8(x),
+      start_time: iso(from),
+      end_time: iso(to),
+    };
+  }
+
+  async function insertTrades(
+    trades: { close: number; native: string; xyz: string }[],
+    firstIndex: number,
+  ): Promise<void> {
+    const stored = canonicalPair({ currency: world.native }, XYZ_ASSET);
+    const sorted = [...trades].sort((a, b) => a.close - b.close);
+    await h.ch.insert(
+      Table.Ledgers,
+      sorted.map((t, i) => ({
+        ...SAMPLE_ROWS[Table.Ledgers],
+        ledger_index: firstIndex + i,
+        ledger_hash: String(firstIndex + i).padStart(64, 'F'),
+        close_time: t.close,
+      })),
+    );
+    await h.ch.insert(
+      Table.Exchanges,
+      sorted.map((t, i) => ({
+        ...SAMPLE_ROWS[Table.Exchanges],
+        base_currency: stored.base.currency,
+        base_issuer: stored.base.issuer ?? '',
+        counter_currency: stored.counter.currency,
+        counter_issuer: stored.counter.issuer ?? '',
+        ledger_index: firstIndex + i,
+        tx_index: 0,
+        node_index: 0,
+        close_time: t.close,
+        base_amount: stored.inverted ? t.xyz : t.native,
+        counter_amount: stored.inverted ? t.native : t.xyz,
+        base_amount_f: Number(stored.inverted ? t.xyz : t.native),
+        counter_amount_f: Number(stored.inverted ? t.native : t.xyz),
+      })),
+    );
+  }
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: world.seed, env: NO_RATE_LIMIT });
+    api = await h.api();
+    get = api.get;
+    await h.ch.insert(Table.NativeRatesDaily, rateRows(hand.rates));
+    await insertNftEvents(h, made.rows);
+    await insertNftEvents(h, made.above);
+    await insertNftEvents(h, hand.first);
+    await insertNftEvents(h, hand.second);
+    // a sale in a ledger above the committed head: no ledger row, so it is in no window
+    await insertNftEvents(h, [
+      nftEventRow({
+        nft_id: '5'.repeat(64),
+        ledger_index: HEAD + 7,
+        close_time: NOW + 300,
+        tx_index: 1,
+        event: 'sale',
+        from_account: accountAt(0xa1),
+        to_account: accountAt(0xa2),
+        amount: '777',
+        amount_f: 777,
+        currency: world.native,
+      }),
+    ]);
+    await buildNftAggregates(h, world.native);
+    // the trades that rate the display currency, after the sets are built (their ledgers close after the seed's): 5 trades on the
+    // last day of the seed, and 12 in the hour before now (the latest rate of the live rows), all of 10 XYZ for 40 of the native
+    // currency (0.25 XYZ a coin: the latest rate is a volume weighted price over the last days, which the first group is in)
+    const nowSeconds = Math.floor(Date.now() / SEC);
+    await insertTrades(
+      [
+        ...Array.from({ length: 5 }, (_, i) => ({ close: LAST_DAY + 12 * 3600 + i, native: '40', xyz: '10' })),
+        ...Array.from({ length: 12 }, (_, i) => ({ close: nowSeconds - 3600 + i, native: '40', xyz: '10' })),
+      ],
+      HEAD + 1000,
+    );
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the data is as the tests assume', () => {
+    const sales = events.filter((e) => e.event === 'sale');
+    expect(sales.length).toBeGreaterThanOrEqual(8);
+    // sales with no rate: counted by the row, listed in no component
+    const unrated = sales.filter((e) => e.amount_issuer !== '' && e.currency !== 'USD');
+    expect(unrated.length).toBeGreaterThanOrEqual(2);
+    const all = volumeOf(events, rates, 0, NOW);
+    expect(all.count).toBe(sales.length);
+    expect(all.components.reduce((n, c) => n + (c.count as number), 0)).toBe(sales.length - unrated.length);
+    // collections of one issuer, and several issuers
+    expect(new Set(all.components.map((c) => c.issuer)).size).toBeGreaterThanOrEqual(3);
+    expect(
+      xrpl ? all.components.every((c) => typeof c.taxon === 'number') : all.components.every((c) => !('taxon' in c)),
+    ).toBe(true);
+    // the seed spans half a day (XRPL) or ten (Xahau)
+    expect((LAST_DAY - FIRST_DAY) / DAY).toBe(xrpl ? 1 : 10);
+  });
+
+  describe('live mode', () => {
+    it.each(Object.entries(PERIODS))(
+      'live=%s: the sales of the rolling period, in the keys of the contract',
+      async (period, seconds) => {
+        const res = await ok(`/v2/network/nft_volume?live=${period}`);
+        expect(Object.keys(res)).toEqual(['result', 'coverage', 'count', 'rows']);
+        // the keys written out here are the exported ones, and they are the keys of the answer and of its components
+        expect(NFT_BODY_KEYS).toEqual([...NFT_VOLUME_BODY_KEYS]);
+        expect(NFT_COMPONENT_KEYS).toEqual([...NFT_VOLUME_COMPONENT_KEYS]);
+        expect(Object.keys(res)).toEqual(NFT_VOLUME_BODY_KEYS.filter((key) => key in res));
+        expect(res.result).toBe('success');
+        expect(res.coverage).toEqual(COVERAGE);
+        expect(Object.keys(res.coverage)).toEqual(['from_ledger_index', 'complete']);
+        expect(res.count).toBe(1);
+        const want = rowOf(NOW - seconds, NOW);
+        expect(res.rows).toEqual([want]);
+        expect(Object.keys(res.rows[0])).toEqual(ROW_KEYS);
+        expect(res.rows[0].count).toBe(want.count);
+        for (const component of res.rows[0].components as Json[]) {
+          expect(Object.keys(component)).toEqual(NFT_COMPONENT_KEYS.filter((k) => xrpl || k !== 'taxon'));
+          expect([
+            typeof component.count,
+            typeof component.amount,
+            typeof component.rate,
+            typeof component.converted_amount,
+          ]).toEqual(['number', 'string', 'string', 'string']);
+        }
+      },
+    );
+
+    it('live defaults to day; the components go by converted amount, the largest first; the total is their sum', async () => {
+      const day = await ok('/v2/network/nft_volume');
+      expect(day.rows).toEqual([rowOf(NOW - DAY, NOW)]);
+      const row = day.rows[0];
+      expect(row.components.length).toBeGreaterThanOrEqual(3);
+      const converted = (row.components as Json[]).map((c) => Number(c.converted_amount));
+      expect(converted).toEqual([...converted].sort((a, b) => b - a));
+      expect((row.components as Json[]).reduce((sum, c) => sum.plus(c.converted_amount), bn(0)).toFixed()).toBe(
+        row.total,
+      );
+      // converted_amount = amount (the amount is in the native currency), and the rate is 1
+      for (const c of row.components as Json[]) expect([c.rate, c.converted_amount]).toEqual(['1.0000000', c.amount]);
+    });
+
+    it('the periods differ where the seed spans days: 7day and 30day have the sales of the earlier days too', async () => {
+      const [day, week, month] = await Promise.all(
+        ['day', '7day', '30day'].map(async (live) => (await ok(`/v2/network/nft_volume?live=${live}`)).rows[0]),
+      );
+      expect(week.count).toBeGreaterThanOrEqual(day.count);
+      expect(month.count).toBeGreaterThanOrEqual(week.count);
+      if (!xrpl) {
+        expect(month.count).toBeGreaterThan(day.count);
+        expect(volumeOf(events, rates, 0, NOW).count).toBe(month.count);
+      }
+    });
+
+    it('the row counts every sale of the window, those with no rate too: more than its components do', async () => {
+      const row = (await ok('/v2/network/nft_volume?live=30day')).rows[0];
+      const priced = (row.components as Json[]).reduce((n, c) => n + (c.count as number), 0);
+      expect(row.count).toBeGreaterThan(priced);
+      expect(row.count).toBe(events.filter((e) => e.event === 'sale' && e.close_time < NOW).length);
+    });
+
+    it('live=hour and the periods of the other metrics are 400 invalid period - use: day, 7day, 30day', async () => {
+      for (const live of ['hour', '3day', 'minute', 'week', 'DAY', 'x']) {
+        const res = await get(`/v2/network/nft_volume?live=${live}`);
+        expect([live, res.status, res.body]).toEqual([
+          live,
+          400,
+          { result: 'error', message: 'invalid period - use: day, 7day, 30day' },
+        ]);
+      }
+      // (and the others keep theirs)
+      expect((await get('/v2/network/payment_volume?live=7day')).body.message).toBe('invalid period - use: hour, day');
+      expect((await get('/v2/network/exchange_volume?live=x')).body.message).toBe(
+        'invalid period - use: hour, day, 3day, 7day, 30day',
+      );
+      // an empty live is the default
+      expect((await ok('/v2/network/nft_volume?live=')).rows).toEqual([rowOf(NOW - DAY, NOW)]);
+    });
+
+    it('an exchange currency converts the total, the rates and the components: the latest rate of the native currency against it', async () => {
+      // 17 trades in the last days, all at 0.25 XYZ a coin
+      const plain = (await ok('/v2/network/nft_volume?live=day')).rows[0];
+      const res = await ok(`/v2/network/nft_volume?live=day&${DISPLAY}`);
+      const row = res.rows[0];
+      expect(res.coverage).toEqual(COVERAGE);
+      expect(Object.keys(row)).toEqual(ROW_KEYS);
+      expect(row).toEqual(rowOf(NOW - DAY, NOW, bn('0.25')));
+      expect(row.exchange).toEqual({ currency: 'XYZ', issuer: I2 });
+      expect(row.exchange_rate).toBe('0.25000000');
+      expect(row.total).toBe(bn(plain.total).times('0.25').toFixed());
+      expect(row.count).toBe(plain.count);
+      row.components.forEach((c: Json, i: number) => {
+        const p = plain.components[i];
+        expect(Object.keys(c)).toEqual(Object.keys(p));
+        expect([c.amount, c.count, c.issuer]).toEqual([p.amount, p.count, p.issuer]);
+        expect(c.converted_amount).toBe(bn(p.converted_amount).times('0.25').toFixed());
+        expect(c.rate).toBe('4.0000000');
+      });
+      // the native currency as the exchange currency is no conversion; the currency is upper-cased
+      expect(await ok(`/v2/network/nft_volume?live=day&exchange_currency=${world.native.toLowerCase()}`)).toEqual(
+        await ok('/v2/network/nft_volume?live=day'),
+      );
+      const lower = await ok(`/v2/network/nft_volume?live=day&exchange_currency=xyz&exchange_issuer=${I2}`);
+      expect(lower.rows[0].exchange).toEqual({ currency: 'XYZ', issuer: I2 });
+      // a currency with no rate (no trade within 14 days) makes the row zeros, as for the other metrics
+      const none = (await ok(`/v2/network/nft_volume?live=day&exchange_currency=BTC&exchange_issuer=${I2}`)).rows[0];
+      expect(none).toMatchObject({ total: '0', exchange_rate: '0.0000000', count: plain.count });
+      for (const c of none.components as Json[]) expect([c.rate, c.converted_amount]).toEqual(['0', '0']);
+    });
+
+    it('sets nothing in the Link header, and ignores the parameters of the historical mode that mean nothing live', async () => {
+      const res = await get('/v2/network/nft_volume?live=7day&descending=true&marker=x&limit=1&interval=month');
+      expect(res.status).toBe(200);
+      expect(res.headers.link).toBeUndefined();
+      expect(res.body.rows).toEqual([rowOf(NOW - 7 * DAY, NOW)]);
+    });
+  });
+
+  describe('historical mode', () => {
+    const days = Array.from({ length: (LAST_DAY - FIRST_DAY) / DAY + 1 }, (_, i) => FIRST_DAY + i * DAY);
+    const range = `start=${dateOf(FIRST_DAY)}&end=${dateOf(LAST_DAY)}&limit=1000`;
+
+    it('interval=day: a row for each day of the seed, a day with no sale one with no component, end_time the next midnight', async () => {
+      const res = await ok(`/v2/network/nft_volume?${range}`);
+      expect(Object.keys(res)).toEqual(['result', 'coverage', 'count', 'rows']);
+      expect(res.coverage).toEqual(COVERAGE);
+      expect(res.rows).toEqual(days.map((d) => rowOf(d, d + DAY)));
+      expect(res.count).toBe(days.length);
+      for (const row of res.rows) expect(Object.keys(row)).toEqual(ROW_KEYS);
+      // days with sales and days without
+      const busy = res.rows.filter((r) => r.components.length > 0);
+      expect(busy.length).toBeGreaterThanOrEqual(1);
+      if (!xrpl) {
+        const quiet = res.rows.filter((r) => r.count === 0);
+        expect(quiet.length).toBeGreaterThanOrEqual(3);
+        for (const row of quiet) expect(row).toMatchObject({ components: [], count: 0, total: '0' });
+      }
+      // the days add up to the live window of the whole seed
+      expect(res.rows.reduce((n, r) => n + (r.count as number), 0)).toBe(volumeOf(events, rates, 0, NOW).count);
+    });
+
+    it('interval=day sums to the sentinel counts of the days: the unpriced sales are in the count of the day and in no component', async () => {
+      const res = await ok(`/v2/network/nft_volume?${range}`);
+      const unpriced = events.filter((e) => e.event === 'sale' && e.amount_issuer !== '' && e.currency !== 'USD');
+      for (const sale of unpriced) {
+        const day = res.rows.find((r) => r.start_time === iso(Math.floor(sale.close_time / DAY) * DAY)) as Json;
+        const priced = (day.components as Json[]).reduce((n, c) => n + (c.count as number), 0);
+        expect(day.count).toBeGreaterThan(priced);
+      }
+    });
+
+    it('interval=week sums the days of a week from Monday: the amounts, the counts of the components and the sentinel counts', async () => {
+      const start = mondayOf(FIRST_DAY);
+      const res = await ok(
+        `/v2/network/nft_volume?start=${dateOf(start)}&end=${dateOf(LAST_DAY)}&interval=week&limit=1000`,
+      );
+      const weeks = Array.from(
+        { length: Math.floor((LAST_DAY - start) / (7 * DAY)) + 1 },
+        (_, i) => start + i * 7 * DAY,
+      );
+      expect(res.rows).toEqual(weeks.map((w) => rowOf(w, w + 7 * DAY)));
+      // the count of a week is the sum of the counts of its days, from the days' own rows
+      const dayRows = (await ok(`/v2/network/nft_volume?${range}`)).rows;
+      for (const row of res.rows) {
+        const inWeek = dayRows.filter(
+          (d) =>
+            Date.parse(d.start_time) / SEC >= Date.parse(row.start_time) / SEC &&
+            Date.parse(d.start_time) < Date.parse(row.end_time),
+        );
+        expect(row.count).toBe(inWeek.reduce((n, d) => n + (d.count as number), 0));
+        expect(bn(row.total).toFixed()).toBe(inWeek.reduce((sum, d) => sum.plus(d.total), bn(0)).toFixed());
+      }
+      expect(new Date(Date.parse(res.rows[0].start_time)).getUTCDay()).toBe(1);
+      if (!xrpl) expect(res.rows.length).toBe(2);
+    });
+
+    it('interval=month sums the days of the calendar month', async () => {
+      const start = monthStartOf(FIRST_DAY);
+      const res = await ok(
+        `/v2/network/nft_volume?start=${dateOf(start)}&end=${dateOf(LAST_DAY)}&interval=month&limit=1000`,
+      );
+      expect(res.rows).toEqual([rowOf(start, monthAfter(start))]);
+      expect(res.rows[0].count).toBe(volumeOf(events, rates, 0, NOW).count);
+    });
+
+    it('exchange_currency converts the total with the vwap of the bucket: a day with no trade is zeros', async () => {
+      const res = await ok(`/v2/network/nft_volume?${range}&${DISPLAY}`);
+      // 5 trades on the last day, 10 XYZ for 40 coins: 0.25 XYZ a coin; no trade on the other days
+      const last = res.rows[res.rows.length - 1];
+      expect(last).toEqual(rowOf(LAST_DAY, LAST_DAY + DAY, bn('0.25')));
+      expect(last.exchange_rate).toBe('0.25000000');
+      expect(last.total).toBe(
+        bn(rowOf(LAST_DAY, LAST_DAY + DAY).total)
+          .times('0.25')
+          .toFixed(),
+      );
+      for (const row of res.rows.slice(0, -1)) {
+        expect(row).toEqual(rowOf(Date.parse(row.start_time) / SEC, Date.parse(row.end_time) / SEC, bn(0)));
+        expect([row.exchange_rate, row.total]).toEqual(['0.0000000', '0']);
+        expect(row.exchange).toEqual({ currency: 'XYZ', issuer: I2 });
+      }
+      // a week is converted by the vwap of the whole week
+      const week = await ok(`/v2/network/nft_volume?start=${dateOf(mondayOf(LAST_DAY))}&interval=week&${DISPLAY}`);
+      expect(week.rows[0].exchange_rate).toBe('0.25000000');
+    });
+
+    it('pages by the bucket: the marker is the start of the last row, the pages concatenate, and Link follows it', async () => {
+      const all = (await ok(`/v2/network/nft_volume?${range}`)).rows;
+      const walked = await api.pages<NftBody>(
+        `/v2/network/nft_volume?start=${dateOf(FIRST_DAY)}&end=${dateOf(LAST_DAY)}`,
+        1,
+        'rows',
+      );
+      expect(walked.flatMap((p) => p.rows)).toEqual(all);
+      walked.forEach((page) =>
+        expect(Object.keys(page)).toEqual(
+          page.marker === undefined
+            ? ['result', 'coverage', 'count', 'rows']
+            : ['result', 'coverage', 'count', 'marker', 'rows'],
+        ),
+      );
+      const page = await get(`/v2/network/nft_volume?start=${dateOf(FIRST_DAY)}&end=${dateOf(LAST_DAY)}&limit=1`);
+      expect(Buffer.from(page.body.marker, 'base64url').toString('utf8')).toBe(JSON.stringify([FIRST_DAY]));
+      expect(page.headers.link).toMatch(/rel="next"/);
+      expect((await get(`/v2/network/nft_volume?${range}`)).headers.link).toBeUndefined();
+    });
+
+    it('a window with no set is an empty list with the coverage; the day above the seed has none', async () => {
+      const res = await get('/v2/network/nft_volume?start=2030-01-01&end=2030-02-01');
+      expect([res.status, res.body]).toEqual([200, { result: 'success', coverage: COVERAGE, count: 0, rows: [] }]);
+      const before = await get(`/v2/network/nft_volume?start=2001-01-01&end=2001-01-31`);
+      expect(before.body.rows).toEqual([]);
+    });
+  });
+
+  describe('errors and the contract', () => {
+    const answer = async (query: string): Promise<[number, string]> => {
+      const res = await get(`/v2/network/nft_volume?${query}`);
+      return [res.status, res.body.message];
+    };
+
+    it('the checks come in the order of the other volumes: exchange currency, start, end, interval, live', async () => {
+      expect(await answer('exchange_currency=USD&start=x&end=x&interval=x&live=x')).toEqual([
+        400,
+        'exchange currency must have an issuer',
+      ]);
+      expect(await answer(`exchange_currency=${world.native}&exchange_issuer=${I2}`)).toEqual([
+        400,
+        `${world.native} cannot have an issuer`,
+      ]);
+      expect(await answer('exchange_currency=USD&exchange_issuer=xyz')).toEqual([
+        400,
+        'invalid exchange issuer address',
+      ]);
+      expect(await answer('start=x&end=x&interval=x&live=x')).toEqual([400, 'invalid start date format']);
+      expect(await answer('end=x&interval=x&live=x')).toEqual([400, 'invalid end date format']);
+      expect(await answer('interval=x&live=x')).toEqual([400, 'invalid interval - use: day, week, month']);
+      expect(await answer('live=x')).toEqual([400, 'invalid period - use: day, 7day, 30day']);
+      // live is not checked when start or end is given
+      expect((await get('/v2/network/nft_volume?live=hour&start=2030-01-01')).status).toBe(200);
+      // a mistake of the client is answered before any read, the coverage included
+      const spy = jest.spyOn(h.ch, 'query');
+      await answer('live=x');
+      await answer('start=x');
+      expect(spy).not.toHaveBeenCalled();
+      expect((await get(`/v2/network/nft_volume?start=2026-10-01&marker=${'!!!'}`)).body.message).toBe(
+        'invalid marker',
+      );
+    });
+
+    it('needs an API key, and answers a 500 error getting data when the database fails, and leaks nothing', async () => {
+      expect((await h.http().get('/v2/network/nft_volume')).status).toBe(401);
+      jest.spyOn(h.ch, 'query').mockRejectedValue(new Error('boom'));
+      const res = await get('/v2/network/nft_volume');
+      expect([res.status, res.body]).toEqual([500, { result: 'error', message: 'error getting data' }]);
+    });
+
+    it('format=csv is the rows flattened, a file named nft_volume.csv, without the coverage; the others are as they were', async () => {
+      const res = await get('/v2/network/nft_volume?live=30day&format=csv');
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toMatch(/^text\/csv/);
+      expect(res.headers['content-disposition']).toBe(csvDisposition('nft_volume'));
+      const header = res.text.split('\n')[0].split(',');
+      const keys = NFT_COMPONENT_KEYS.filter((k) => xrpl || k !== 'taxon');
+      expect(header.slice(0, keys.length)).toEqual(keys.map((k) => `"components[0].${k}"`));
+      expect(header.slice(-6)).toEqual([
+        '"count"',
+        '"exchange.currency"',
+        '"total"',
+        '"exchange_rate"',
+        '"start_time"',
+        '"end_time"',
+      ]);
+      expect(res.text).not.toContain('coverage');
+      expect(res.text).not.toContain('from_ledger_index');
+      const paged = await get(
+        `/v2/network/nft_volume?start=${dateOf(FIRST_DAY)}&end=${dateOf(LAST_DAY)}&limit=1&format=csv`,
+      );
+      expect(paged.headers.link).toMatch(/rel="next"/);
+      expect(paged.text.trim().split('\n')).toHaveLength(2);
+      const bad = await get('/v2/network/nft_volume?live=x&format=csv');
+      expect([bad.status, bad.body.message]).toEqual([400, 'invalid period - use: day, 7day, 30day']);
+      // the answers of the other metrics have no coverage: unchanged
+      for (const metric of ['exchange_volume', 'payment_volume', 'amm_volume']) {
+        const other = await get(`/v2/network/${metric}`);
+        expect([metric, other.status, Object.keys(other.body)]).toEqual([metric, 200, ['result', 'count', 'rows']]);
+      }
+    });
+  });
+});
+
+describe.each([
+  { seed: 'xahau-flag', native: 'XAH', what: 'a ledger with no NFT' },
+  {
+    seed: 'xrpl-recorded',
+    native: 'XRP',
+    what: 'ledgers with NFTs that were minted, offered and moved, and never sold',
+  },
+] as const)('GET /v2/network/nft_volume on $seed: $what', ({ seed, native }) => {
+  // No sale: the sets are only their sentinels, and the rows have no component.
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed, env: NO_RATE_LIMIT });
+    api = await h.api();
+    await buildNftAggregates(h, native);
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('live: a row with no component, count 0, total "0", the exchange is the native currency, and the coverage after result', async () => {
+    for (const live of ['day', '7day', '30day']) {
+      const res = (await api.ok(`/v2/network/nft_volume?live=${live}`, 'rows')).body;
+      expect(Object.keys(res)).toEqual(['result', 'coverage', 'count', 'rows']);
+      expect(res.rows).toHaveLength(1);
+      expect(res.rows[0]).toMatchObject({
+        components: [],
+        count: 0,
+        exchange: { currency: native },
+        total: '0',
+        exchange_rate: '1.0000000',
+      });
+      expect(Object.keys(res.rows[0])).toEqual(ROW_KEYS);
+      expect(typeof res.coverage.complete).toBe('boolean');
+      expect(Object.keys(res.coverage)).toEqual(['from_ledger_index', 'complete']);
+    }
+  });
+
+  it('historical: the day of the ledgers is a row with no component; the days around it are no row', async () => {
+    const days = (await api.ok('/v2/network/nft_volume?start=2000-01-01', 'rows')).body.rows as Json[];
+    expect(days).toHaveLength(1);
+    expect(days[0]).toMatchObject({ components: [], count: 0, total: '0' });
+    expect(Object.keys(days[0])).toEqual(ROW_KEYS);
+  });
+});
+
+describe('GET /v2/network/nft_volume on xahau-recorded: sales that none has a rate for', () => {
+  // The recorded Xahau ledgers of one day hold 45 URIToken sales, all of them priced in an issued currency that has no rate: the
+  // row counts every one of them (the sentinel's count) and lists no collection.
+  const sales = fixtureNftEvents('xahau-recorded').filter((e) => e.event === 'sale');
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xahau-recorded', env: NO_RATE_LIMIT });
+    api = await h.api();
+    await buildNftAggregates(h, 'XAH');
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the data is as the tests assume: 45 sales, every one priced in an issued currency', () => {
+    expect(sales).toHaveLength(45);
+    expect(sales.every((e) => e.amount_issuer !== '')).toBe(true);
+  });
+
+  it('the row counts every sale and has no component: live, a day and a month', async () => {
+    const live = (await api.ok('/v2/network/nft_volume?live=30day', 'rows')).body.rows as Json[];
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ components: [], count: 45, total: '0', exchange: { currency: 'XAH' } });
+    const days = (await api.ok('/v2/network/nft_volume?start=2000-01-01', 'rows')).body.rows as Json[];
+    expect(days).toHaveLength(1);
+    expect(days[0]).toMatchObject({ components: [], count: 45, total: '0' });
+    const months = (await api.ok('/v2/network/nft_volume?start=2000-01-01&interval=month', 'rows')).body.rows as Json[];
+    expect(months).toHaveLength(1);
+    expect(months[0]).toMatchObject({ components: [], count: 45 });
+  });
+});

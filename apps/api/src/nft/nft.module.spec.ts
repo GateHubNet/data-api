@@ -1,4 +1,6 @@
+import { NftAccountsService } from './nft-accounts.service';
 import { NftCollectionListsController, NftCollectionsController } from './nft-collections.controller';
+import { NftSalesController } from './nft-sales.controller';
 import { NftModule } from './nft.module';
 import { NftsController } from './nfts.controller';
 
@@ -17,7 +19,14 @@ describe('NftModule', () => {
     expect(controllers.filter((c) => c === NftCollectionsController)).toHaveLength(1);
   });
 
-  it('registers the NFT routes too', () => {
+  it('registers the NFT routes too, and the sales of the network', () => {
     expect(Reflect.getMetadata('controllers', NftModule)).toContain(NftsController);
+    expect(Reflect.getMetadata('controllers', NftModule)).toContain(NftSalesController);
+  });
+
+  // the routes of an account are a controller of `AccountsModule`, which reads through this module's service
+  it('provides and exports the NFT service of the accounts', () => {
+    expect(Reflect.getMetadata('providers', NftModule)).toContain(NftAccountsService);
+    expect(Reflect.getMetadata('exports', NftModule)).toEqual([NftAccountsService]);
   });
 });

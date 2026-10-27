@@ -61,7 +61,7 @@ export const HOLDER_POSITION: KeysetKey[] = [
 ];
 
 /** The columns of a row of `nfts` as `nftFoldOfRow` takes it: the times as unix seconds. */
-const NFT_COLUMNS = [
+export const NFT_COLUMNS = [
   'issuer',
   'taxon_key',
   'serial',

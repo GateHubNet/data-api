@@ -1,5 +1,14 @@
-import { CollectionKey, NetworkFamily, NFT_EVENTS, NFT_ROLES, NftEventName, NftRole } from '@gatehub/data-api-shared';
+import {
+  Asset,
+  CollectionKey,
+  NetworkFamily,
+  NFT_EVENTS,
+  NFT_ROLES,
+  NftEventName,
+  NftRole,
+} from '@gatehub/data-api-shared';
 import { isValidClassicAddress } from 'ripple-address-codec';
+import { parseAsset, splitAsset } from '../common/asset-param';
 import { badRequest } from '../common/errors';
 import { dateParam, endExclusive, first, Query } from '../common/params';
 
@@ -49,6 +58,49 @@ export function collectionKeyParam(
   const xrpl = family === 'xrpl';
   if (xrpl !== (taxonRaw !== undefined)) return undefined;
   return { issuer, taxon_key: taxonRaw === undefined ? 0 : taxonParam(taxonRaw) };
+}
+
+/**
+ * The collection an account's NFTs are narrowed to (spec 5.5): `issuer`, and with it `taxon`. Either one missing or empty is
+ * none. The checks come in the order of the spec's common checks: 400 `invalid issuer address`, then `invalid taxon` for a
+ * taxon that is none and for a taxon without an issuer (a taxon names a collection only with the issuer).
+ */
+export function holdingsCollectionParam(q: Query): { issuer?: string; taxon_key?: number } {
+  const issuerRaw = first(q, 'issuer');
+  const taxonRaw = first(q, 'taxon');
+  const issuer = issuerRaw === undefined || issuerRaw === '' ? undefined : issuerParam(issuerRaw);
+  const taxon = taxonRaw === undefined || taxonRaw === '' ? undefined : taxonParam(taxonRaw);
+  if (taxon !== undefined && issuer === undefined) throw badRequest('invalid taxon');
+  return { ...(issuer !== undefined && { issuer }), ...(taxon !== undefined && { taxon_key: taxon }) };
+}
+
+/**
+ * The text of `currency` of the network's sales, `undefined` when it is missing or empty. A `+` in a query string arrives as a
+ * space (a client that does not encode it), and the sales read it as the `+` it stands for: `splitAsset` splits at `+`, `|`
+ * and `.` and not at a space (Ruling 8).
+ */
+export function saleCurrencyParam(q: Query): string | undefined {
+  const raw = first(q, 'currency');
+  return raw === undefined || raw === '' ? undefined : raw.replace(/ /g, '+');
+}
+
+/**
+ * The first check of `currency`, as `/v2/payments/{currency}` makes it before the dates: the issuer, when the text has one,
+ * is an address (400 `invalid issuer address`).
+ */
+export function checkSaleCurrencyIssuer(currency: string | undefined): void {
+  if (currency === undefined) return;
+  const { issuer } = splitAsset(currency);
+  if (issuer !== undefined && !isValidClassicAddress(issuer)) throw badRequest('invalid issuer address');
+}
+
+/**
+ * The asset `currency` names, `XRP` (the network's native currency, which has no issuer) or `CUR+issuer`, with the errors of
+ * `parseAsset` (`currency is required`, `XRP cannot have an issuer`, `issuer is required`, `invalid issuer address`). On
+ * Xahau `XAH` is the native currency and `XRP` an issued one, which needs an issuer like any other.
+ */
+export function saleAssetParam(currency: string | undefined, native: string): Asset | undefined {
+  return currency === undefined ? undefined : parseAsset(currency, native);
 }
 
 /**

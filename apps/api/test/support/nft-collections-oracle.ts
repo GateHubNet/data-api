@@ -418,3 +418,58 @@ export function daysOf(events: Ev[], rates: Rates): Obj[] {
       });
     });
 }
+
+// =====================================================================================================================
+// The NFT volume
+
+/**
+ * The row of `/v2/network/nft_volume` for the sales that closed in `[from, toExclusive)` (unix seconds): a component for each
+ * collection with a sale that has a price in the native currency (its issuer and, on XRPL, its taxon; `count` those sales and
+ * `amount` their exact volume, the rate 1), the largest first and the same volume by collection; the row's `count` is every
+ * sale of the window, those with no rate too, and its `total` the sum of the components. The parts of the row that depend on the
+ * window (its times and its exchange) are the test's.
+ */
+export function volumeOf(
+  events: Ev[],
+  rates: Rates,
+  from: number,
+  toExclusive: number,
+): { count: number; components: Obj[]; total: string } {
+  const sales = events.filter((e) => e.event === 'sale' && e.close_time >= from && e.close_time < toExclusive);
+  const collections = new Map<string, { sample: Ev; count: number; amount: BigNumber }>();
+  for (const sale of sales) {
+    const price = priceOf(sale, rates);
+    if (price === undefined) continue;
+    const id = `${sale.issuer}/${sale.taxon_key}`;
+    const found = collections.get(id) ?? { sample: sale, count: 0, amount: new BigNumber(0) };
+    collections.set(id, { sample: found.sample, count: found.count + 1, amount: found.amount.plus(price) });
+  }
+  const listed = [...collections.values()]
+    .filter((c) => c.amount.gt(0))
+    .sort(
+      (a, b) =>
+        b.amount.comparedTo(a.amount) ||
+        (componentName(a.sample) < componentName(b.sample)
+          ? -1
+          : componentName(a.sample) > componentName(b.sample)
+            ? 1
+            : 0),
+    );
+  return {
+    count: sales.length,
+    components: listed.map((c) =>
+      present({
+        issuer: c.sample.issuer,
+        taxon: c.sample.kind === 'nftoken' ? (c.sample.taxon ?? undefined) : undefined,
+        count: c.count,
+        amount: c.amount.toFixed(),
+        rate: '1.0000000',
+        converted_amount: c.amount.toFixed(),
+      }),
+    ),
+    total: listed.reduce((sum, c) => sum.plus(c.amount), new BigNumber(0)).toFixed(),
+  };
+}
+
+/** The name of a collection among the components of a volume set: `<issuer>/<taxon>` on XRPL, `<issuer>` on Xahau. */
+const componentName = (e: Ev): string => (e.kind === 'nftoken' ? `${e.issuer}/${e.taxon}` : e.issuer);
