@@ -1,5 +1,6 @@
 import {
   AccountAmmLiquidityRow,
+  AccountDomainsRow,
   AccountExchangesRow,
   AccountLinesDailyRow,
   AccountNetworkNamesRow,
@@ -27,6 +28,7 @@ import {
   AmmPoolTouchesRow,
   BalanceChangesRow,
   CollectionNftEventsRow,
+  DomainTomlsRow,
   ExchangesRow,
   ExportJobsRow,
   FeeStatsRow,
@@ -98,6 +100,7 @@ export interface TableRows {
   [Table.CollectionNftEvents]: CollectionNftEventsRow;
   [Table.NftSales]: NftSalesRow;
   [Table.NftTouches]: NftTouchesRow;
+  [Table.AccountDomains]: AccountDomainsRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -129,6 +132,7 @@ export interface TableRows {
   [Table.AccountNfts]: AccountNftsRow;
   [Table.NftCollections]: NftCollectionsRow;
   [Table.NftCollectionHolders]: NftCollectionHoldersRow;
+  [Table.DomainTomls]: DomainTomlsRow;
   [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
   [Table.AggDirty]: AggDirtyRow;
@@ -526,6 +530,17 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     issuer: ISSUER,
     taxon_key: 7,
     serial: 42,
+  },
+  [Table.AccountDomains]: {
+    account: ALICE,
+    ledger_index: LEDGER,
+    tx_index: 3,
+    node_index: 1,
+    // LEDGER * 2^32 + 3 * 2^16 + 1: above 2^53, so text
+    version: '343597387975163905',
+    // northpeak.example
+    domain_hex: '6E6F7274687065616B2E6578616D706C65',
+    deleted: 0,
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
@@ -984,6 +999,23 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     version: VERSION_MS,
   },
   [Table.NftCollectionHolders]: { issuer: ISSUER, taxon_key: 7, owner: BOB, held: 3, version: VERSION_MS },
+  [Table.DomainTomls]: {
+    domain: 'sample.example',
+    toml_url: 'https://sample.example/.well-known/xrp-ledger.toml',
+    status: 'ok',
+    reason: '',
+    status_code: 0,
+    checked_at: CLOSE_MS,
+    fetched_at: CLOSE_MS,
+    next_check_at: CLOSE + 86_400,
+    failures: 0,
+    modified: CLOSE - 3_600,
+    expires: CLOSE + 86_400 * 30,
+    accounts: [{ address: ALICE, network: 'main', desc: 'Operations' }],
+    currencies: [{ code: 'USD', issuer: ISSUER, network: 'main', fields: '{"display_decimals":2}' }],
+    validators: [{ public_key: 'nHsamplevalidator', network: 'main', fields: '{}' }],
+    principals: ['Sample Holdings'],
+  },
   [Table.AccountNetworkNames]: {
     address: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh',
     name: 'USD Issuer',

@@ -336,7 +336,7 @@ dropping whole partitions, **but a ledger exists only if all its tables agree**:
 - A ledger that has a `ledgers` row but fewer stored transactions than its `tx_count` is answered with **500** by `/v2/ledgers/{id}` (and its hash list); lists of
   payments, exchanges and balance changes silently lose the rows whose tables were dropped.
 
-So never drop the partitions of one table alone. Drop **the same ledger range from all 28 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
+So never drop the partitions of one table alone. Drop **the same ledger range from all 29 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
 partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
 is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledgers vanish from every list at once), then the children. For the block 80,000,000-89,999,999
 (P7 partition 8, P6 partitions 80-89) of the XRPL database:
@@ -348,7 +348,7 @@ for p in 80 81 82 83 84 85 86 87 88 89; do ch "ALTER TABLE xrpl.ledgers DROP PAR
 for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments amm_pool_touches path_payments nft_sales nft_touches; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
 for t in ledger_by_hash tx_by_hash tx_by_type account_transactions account_tx_by_sequence payments_by_currency account_payments exchanges account_exchanges balance_changes \
          amm_pool_states amm_liquidity account_amm_liquidity amm_governance account_states trust_line_states account_path_payments \
-         nft_events account_nft_events collection_nft_events; do
+         nft_events account_nft_events collection_nft_events account_domains; do
   ch "ALTER TABLE xrpl.$t DROP PARTITION 8"
 done
 ch "DELETE FROM xrpl.accounts_created WHERE ledger_index BETWEEN 80000000 AND 89999999"

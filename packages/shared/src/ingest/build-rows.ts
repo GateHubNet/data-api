@@ -1,5 +1,6 @@
 import {
   AccountAmmLiquidityRow,
+  AccountDomainsRow,
   AccountExchangesRow,
   AccountNftEventsRow,
   AccountPathPaymentsRow,
@@ -85,6 +86,11 @@ export interface LedgerRows {
   nftSales: NftSalesRow[];
   /** One per NFT a transaction had an event of: the ledger-ordered index the aggregator scans. */
   nftTouches: NftTouchesRow[];
+  /**
+   * The Domain of each account root a transaction changed that has or had one (migration 012, parser version 6). Ordered
+   * by account in the table, so unlike every other list it can repeat a key.
+   */
+  accountDomains: AccountDomainsRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -113,7 +119,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
  * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
- * and their index by account, and the 5 NFT tables.
+ * and their index by account, the 5 NFT tables and the account domains.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -142,6 +148,7 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.CollectionNftEvents, 'collectionNftEvents'],
   [Table.NftSales, 'nftSales'],
   [Table.NftTouches, 'nftTouches'],
+  [Table.AccountDomains, 'accountDomains'],
 ];
 
 const paymentParser = new PaymentParser();
@@ -267,6 +274,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     collectionNftEvents: [],
     nftSales: [],
     nftTouches: [],
+    accountDomains: [],
     diagnostics: { ammUnclassified: 0, nftSkipped: 0 },
   };
 

@@ -11,19 +11,21 @@ The source of truth is the migration files of [`packages/shared/schema/`](../pac
 [`008_account_path_payments.sql`](../packages/shared/schema/008_account_path_payments.sql) and
 [`009_account_network_names.sql`](../packages/shared/schema/009_account_network_names.sql) and
 [`010_export_jobs.sql`](../packages/shared/schema/010_export_jobs.sql) and
-[`011_nft_data.sql`](../packages/shared/schema/011_nft_data.sql) (applied in file-name order, per network
+[`011_nft_data.sql`](../packages/shared/schema/011_nft_data.sql) and
+[`012_display_names.sql`](../packages/shared/schema/012_display_names.sql) (applied in file-name order, per network
 database, by the `migrate` job); the row types are in
 [`packages/shared/src/clickhouse/rows.ts`](../packages/shared/src/clickhouse/rows.ts) and the table names in `tables.ts` (the `Table`
-enum: queries use `${Table.X}`, never string literals). **65 tables** per network database, in nine groups:
+enum: queries use `${Table.X}`, never string literals). **67 tables** per network database, in ten groups:
 
 | Group | Tables | Written by |
 | --- | --- | --- |
-| Ledger-derived (28) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance`, the state history `account_states` (migration 005) and `trust_line_states` (migration 006), `path_payments` (migration 007) and its index by account `account_path_payments` (migration 008), the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011) | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
+| Ledger-derived (29) | `ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`, `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`, `balance_changes`, `accounts_created`, the five AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`, `account_amm_liquidity`, `amm_governance`, the state history `account_states` (migration 005) and `trust_line_states` (migration 006), `path_payments` (migration 007) and its index by account `account_path_payments` (migration 008), the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011), and the Domain of an account `account_domains` (migration 012) | the `ingest` worker and `range-ingest` (one `LedgerWriter`) |
 | Node-sourced (3) | `fee_stats`, `validations`, `validator_manifests` | the `fee_stats` and `validations` workers |
 | Validators and amendments (10, migration 002) | `validator_validations`, `validator_seen`, `unl_lists`, `unl_publishers`, `validator_domains`, `network_state`, `amendment_features`, `validator_votes`, `amendment_tallies`, `validator_agreement_hourly` | the `validations` worker (the first two) and the `validators` worker (the rest) |
 | Aggregates (5) | `stats_hourly`, `volume_daily`, `volume_live`, `amm_pools`, `amm_daily` | the `aggregator` worker |
 | Account and market aggregates (9, migration 003) | `native_rates_daily`, `pair_hourly`, `markets_live`, `account_rollup_state`, `account_partition_rows`, `account_rollup_days`, `account_lines_daily`, `account_tx_daily`, `account_trades_daily` | the `aggregator` worker (jobs `rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) |
 | NFT aggregates (4, migration 011) | `nfts`, `account_nfts`, `nft_collections`, `nft_collection_holders` | the `aggregator` worker (jobs `nft_state` and `nft_collections`) |
+| Domain tomls (1, migration 012) | `domain_tomls` | the `tomls` worker |
 | Operator-written (1, migration 009) | `account_network_names` | the operator, by hand, with plain SQL inserts ([operations](operations.md#name-an-account-on-one-network)) |
 | Internal (4) | `ingest_log`, `agg_dirty`, `nft_dirty` (migration 011), `syncer_lease` | the syncer |
 | Exports (1, migration 010) | `export_jobs` | the api (`queued`) and the exporter (`running`, `done`, `failed`) |
@@ -52,6 +54,7 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | --- | --- | --- | --- |
 | Ledger-prefixed (`ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`) | `ReplacingMergeTree` | **P6**: `intDiv(ledger_index, 1000000)` | A commit and a recovery delete never span two partitions; deletes are partition-scoped |
 | Prefix-keyed secondary tables, `exchanges`, the AMM tables ordered by pool or account, `account_states`, `trust_line_states`, `account_path_payments` and the three NFT event tables | `ReplacingMergeTree` | **P7**: `intDiv(ledger_index, 10000000)` | Fewer, larger partitions for tables ordered by something other than the ledger |
+| `account_domains` (migration 012) | `ReplacingMergeTree(version)` | **P7**: `intDiv(ledger_index, 10000000)` | Ordered by `account`, **not** by the unique key (below); `index_granularity = 1024`, as `transactions` |
 | `accounts_created`, `volume_live`, `stats_hourly`, `amm_pools`, the four NFT aggregates, internal | `ReplacingMergeTree` | none (`volume_daily` and `amm_daily`: `toYYYYMM(day)`) | Small tables |
 | `fee_stats` | `MergeTree` | `toYYYYMM(ts)` | Append-only samples |
 | `account_network_names` (migration 009) | `MergeTree` | none | Append-only, the operator's history; small |
@@ -60,9 +63,13 @@ key of the last row (`ledger_index, tx_index[, node_index]`) and never a DateTim
 | `validator_validations` | `AggregatingMergeTree` | `intDiv(ledger_index, 100000)`, TTL 7 days, `ttl_only_drop_parts = 1` | Sightings add up; a partition is about four days of ledgers, so expiry drops whole parts |
 | `validator_seen` | `AggregatingMergeTree` | none, no TTL | One row per validator: min / max / max |
 | The other validators and amendments tables | `ReplacingMergeTree` | none | Small tables, newest row (or newest `version`) wins |
+| `domain_tomls` (migration 012) | `ReplacingMergeTree(checked_at)` | none | One row per check of a domain's toml, the newest `checked_at` wins; not ledger-derived: no dedup window |
 
 `ORDER BY` of a `ReplacingMergeTree` is its **natural unique key**. That is a safety net only: list queries never use `FINAL`, and
-recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The 28 ledger-derived tables carry
+recovery deletes before it rewrites ([clickhouse](clickhouse.md#the-final-rule)). The one exception is `account_domains`
+(migration 012), which is ordered by `account` on purpose, so that merges keep about one row per account and partition: see
+[its section](#account_domains-p7-order-by-account-migration-012), and [ADR-0007](adr/0007-ledger-index-axis-and-secondary-tables.md)
+for the rule it departs from. The 29 ledger-derived tables carry
 `non_replicated_deduplication_window = 1000` so that a retried insert with the same `insert_deduplication_token` is dropped; the
 two collector tables `validator_validations` and `validator_seen` (not ledger tables) carry a window of 100 for the same reason. The nine tables of
 migration 003 have no window: a set is written whole under a new `version`, so a retry is idempotent without one.
@@ -101,7 +108,7 @@ and [ADR-0003](adr/0003-no-final-on-list-queries.md).
 
 ## 2. Ledger-derived tables
 
-`ORDER BY` is the key; `Partition` is P6 or P7 above; "read by" lists the endpoints ([api-reference](api-reference.md)).
+`ORDER BY` is the key (`account_domains` is the one exception); `Partition` is P6 or P7 above; "read by" lists the endpoints ([api-reference](api-reference.md)).
 
 ### `ledgers` (P6, `ORDER BY ledger_index`)
 Header and summary of a ledger; **the commit marker**. Columns: `ledger_index UInt32`, `ledger_hash`, `parent_hash`, `account_hash`,
@@ -400,6 +407,26 @@ read a ledger range of it.
 Narrow: `ledger_index`, `tx_index`, `nft_id`, `issuer`, `taxon_key`, `serial`; one row per NFT a transaction had an event of. The
 aggregator's watermark and dirty scans read it by ledger, as they read `amm_pool_touches`.
 
+### `account_domains` (P7, `ORDER BY account`, migration 012)
+The Domain of an account, for the display names ([spec](superpowers/specs/2026-10-24-display-names-design.md)). One row for each
+`AccountRoot` node of a transaction's metadata that has or had a `Domain` (the Domain after the transaction, whatever the
+transaction's result), so that an account whose Domain was set before the indexed history is learnt at its next change (a payment
+received is enough). Columns: `account`, `ledger_index`, `tx_index`, `node_index UInt16` (the node's position in `AffectedNodes`),
+`version UInt64`, `domain_hex` (the Domain as the ledger holds it, upper-case hex; `''` when the node has none) and `deleted UInt8`
+(1 for a deleted node). `version` is `ledger_index * 2^32 + tx_index * 2^16 + node_index` (a ledger has fewer than 65,536
+transactions), written as decimal text because it passes 2^53. **The current domain of an account is its row with the largest
+`version`**: readers take `argMax(domain_hex, version)`, never `FINAL`.
+
+**The exception to ADR-0007.** Every other ledger-derived table is ordered by its unique key. This one is ordered by `account`, with
+`ReplacingMergeTree(version)`: kept whole, a row for every change of an account that has a domain would be a sizeable share of
+`account_states` (billions of rows over the full history), and the tomls worker reads the current domain of every account. Merges
+keep one row per account and partition, about the number of accounts with a domain times the partitions they were active in. That
+is safe because recovery and `--reprocess` delete by `ledger_index` and always write the deleted ledgers again, and the parser is
+deterministic: a row merged away under a deleted one comes back with it. The table is in `CHILD_TABLES` and `LEDGER_KEYED_TABLES` (P7)
+and carries the deduplication window of 1000; its `index_granularity` of 1024 keeps the read of up to 100 accounts by key of the
+names batch under about 100 thousand rows. Because the key is not unique, counts of its rows after a merge are not counts of what the
+parser wrote; compare accounts, not rows.
+
 ## 3. Node-sourced, aggregate and internal tables
 
 The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM tables above.
@@ -414,6 +441,7 @@ The AMM aggregates `amm_pools` and `amm_daily` are described with the other AMM 
 | `unl_lists` | `ReplacingMergeTree(fetched_at)`, `ORDER BY (publisher, sequence)` | Every UNL list a publisher served: `publisher_key` (hex), `version` (1 or 2), `effective` (nullable), `expiration`, `validators` (master keys, sorted), `blob_sha256`, `response` (the JSON as served, `ZSTD(3)`) | validators worker, validators endpoints |
 | `unl_publishers` | `ReplacingMergeTree(checked_at)`, `ORDER BY publisher` | State of each configured publisher: `url`, `publisher_key`, `configured`, `threshold`, `status` (`ok` / `error`), `error` (reason code), `last_ok_at` | validators worker, validators endpoints |
 | `validator_domains` | `ReplacingMergeTree(checked_at)`, `ORDER BY (validation_public_key, domain)` | Domain verification: `status` (`verified` / `unverified`), `reason`, `status_code`, `toml_url`, `verified_at` (last success), `next_check_at`, `accounts` (the `[[ACCOUNTS]]` addresses of the last TOML that verified) | validators worker, validators endpoints |
+| `domain_tomls` | `ReplacingMergeTree(checked_at)`, `ORDER BY domain`, no partition (migration 012) | One row per check of the toml of a domain an account names (the `tomls` worker): `domain` (lower case), `toml_url`, `status` (`ok` / `failed`), `reason` (`''` for `ok`, else `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid` or `toml_invalid`), `status_code` (the HTTP status of an `http_status`, else 0), `checked_at` and `fetched_at` (`Nullable`) `DateTime64(3, 'UTC')`, `next_check_at DateTime`, `failures` (consecutive failed checks) and the **content**, what the toml says in effect: `modified` and `expires` (`Nullable(DateTime)`), `accounts Array(Tuple(address, network, desc))`, `currencies Array(Tuple(code, issuer, network, fields))`, `validators Array(Tuple(public_key, network, fields))` and `principals Array(String)` (`fields` is the JSON object text of the entry's other scalar keys, `network` the entry's `network` as written). The newest row of a domain (the largest `checked_at`) is its current word: `ORDER BY domain, checked_at DESC LIMIT 1 BY domain` or `argMax`, never `FINAL`. Not ledger-derived: no partition, no dedup window, not in `CHILD_TABLES` or `LEDGER_KEYED_TABLES`, so ingest recovery never deletes from it | the tomls worker, the names and toml endpoints |
 | `network_state` | `ReplacingMergeTree(polled_at)`, `ORDER BY ledger_index`, TTL 100 d | The ledger state read from the node at `ledger_index`: `amendments` (enabled IDs), `majorities` (`Array(Tuple(amendment, since))`), `negative_unl` (`Array(Tuple(validation_public_key, first_ledger))`), `to_disable`, `to_reenable`, the fees in force (`base_fee`, `reserve_base`, `reserve_inc`, drops) and `node_quorum` (0 = none reported) | validators worker, amendments endpoints |
 | `amendment_features` | `ReplacingMergeTree(polled_at)`, `ORDER BY amendment_id` | The `name` and `supported` flag the node reports per amendment ID | validators worker, amendments endpoints |
 | `validator_votes` | `ReplacingMergeTree(version)`, `ORDER BY (ledger_index, validation_public_key)` | Each validator's vote in a voting ledger (`ledger_index` = 256k - 1): `amendments`, the fee votes (`Nullable`, drops) and `server_version`. A **version set** | validators worker, amendments endpoints |
@@ -552,6 +580,7 @@ The files so far:
 | `009_account_network_names.sql` | `account_network_names`, one `CREATE TABLE IF NOT EXISTS` ([ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)). Additive: it reads no other table. 005 to 008 are numbers reserved by other changes of spec #4; the runner applies whatever files there are in file-name order, so a gap is harmless and a later 005 applies after 009 on a database that already ran 009. Required before an api that reads it: without it the api serves every account without a network name and logs `Could not load the account network names` at every reload |
 | `010_export_jobs.sql` | One `CREATE TABLE IF NOT EXISTS`: `export_jobs`, the states of the export jobs (ticket #15). Additive: it reads no other table. Number 006 is kept for another table of spec #4. Required before the api serves `/v2/exports` and before the exporter starts |
 | `011_nft_data.sql` | Ten `CREATE TABLE IF NOT EXISTS` statements, nothing else: the five ledger-derived NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales`, `nft_touches`; written from parser version 5, `NFT_PARSER_VERSION`), the four aggregates (`nfts`, `account_nfts`, `nft_collections`, `nft_collection_holders`) and `nft_dirty`. Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 5 (that syncer's writes fail without the five ledger tables) and before the API serves the NFT routes |
+| `012_display_names.sql` | Two `CREATE TABLE IF NOT EXISTS` statements, nothing else: the ledger-derived `account_domains` (ordered by account, `index_granularity = 1024`, written from parser version 6) and `domain_tomls` (written by the `tomls` worker). Additive and run again safely: it reads no other table, so it applies on a fresh and on a migrated database. Required before a syncer with parser version 6 (that syncer's writes fail without `account_domains`) and before the `tomls` worker and the API serve the names |
 
 Constraints on the SQL files: the splitter cuts on a semicolon at the **end of a line**, and drops lines that start with `--`, so
 every statement ends with its semicolon on its last line and no other line (comment lines included) may end with one. The files are
@@ -565,7 +594,7 @@ docker compose -f docker-compose.prod.yaml --env-file deploy/.env.sandbox run --
 node node_modules/@gatehub/data-api-shared/dist/clickhouse/migrate.js   # the command inside the image
 ```
 
-To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`, `011_nft_data.sql`). A database created by the
+To change the schema, add the next `NNN_*.sql`; never edit an applied file (`001_baseline.sql`, `002_validators_amendments.sql`, `003_account_market_aggregates.sql`, `004_amm_fee_estimates.sql`, `005_account_states.sql`, `006_trust_line_states.sql`, `007_path_payments.sql`, `008_account_path_payments.sql`, `009_account_network_names.sql`, `010_export_jobs.sql`, `011_nft_data.sql`, `012_display_names.sql`). A database created by the
 earlier stack (`001_tables.sql` / `002_materialized_views.sql`) cannot be migrated: recreate it (`docker compose down -v` for
 local volumes).
 
@@ -573,7 +602,7 @@ local volumes).
 
 - `transactions.tx_json` and `meta_json` dominate (full XRPL history is roughly 1-1.5 TB compressed). Everything else together is a
   fraction of it.
-- Retention is by partition, but always the same ledger block from all 28 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
+- Retention is by partition, but always the same ledger block from all 29 ledger-derived tables, never one table alone ([clickhouse](clickhouse.md#retention-and-ttl), [operations](operations.md#retention)). `validations`
   expires by TTL after 90 days.
 - The tables of migration 002 are not ledger tables, so no ledger retention touches them. They expire by TTL: `validator_validations`
   after 7 days of `last_datetime` (about 1 GB on XRPL; whole parts are dropped), `network_state` after 100 days of `polled_at` and

@@ -83,6 +83,13 @@ describe('LEDGER_KEYED_TABLES', () => {
     }
   });
 
+  it('lists account_domains by ten million, and not domain_tomls: a ledger rewrite must not touch the tomls', () => {
+    expect(LEDGER_KEYED_TABLES.filter((t) => t.table === Table.AccountDomains)).toEqual([
+      { table: Table.AccountDomains, partitionSize: P7 },
+    ]);
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.DomainTomls);
+  });
+
   it('lists every table once and keeps the commit marker first', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(new Set(tables).size).toBe(tables.length);

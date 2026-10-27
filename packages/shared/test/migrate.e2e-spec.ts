@@ -120,6 +120,8 @@ const SHAPES: Record<Table, Shape> = {
   },
   [Table.NftSales]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, event_index' },
   [Table.NftTouches]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, nft_id' },
+  // the domain of an account (migration 012): ordered by account, not by the unique key (ADR-0007's exception, spec 1.1)
+  [Table.AccountDomains]: { engine: 'ReplacingMergeTree', version: 'version', partition: P7, order: 'account' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -270,6 +272,8 @@ const SHAPES: Record<Table, Shape> = {
     partition: '',
     order: 'issuer, taxon_key, owner',
   },
+  // what the tomls worker read of a domain (migration 012): one row per check, the newest wins
+  [Table.DomainTomls]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'domain' },
   [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
   [Table.IngestLog]: {
     engine: 'ReplacingMergeTree',
@@ -369,6 +373,7 @@ const DEDUP_TABLES: Table[] = [
   Table.CollectionNftEvents,
   Table.NftSales,
   Table.NftTouches,
+  Table.AccountDomains,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -539,11 +544,13 @@ describe('migrations (e2e)', () => {
         expect(full.get(Table.ValidatorValidations)).toContain('ttl_only_drop_parts = 1');
       });
 
-      it('keeps transactions on a finer index granularity', async () => {
+      it('keeps transactions and account_domains on a finer index granularity', async () => {
         const rows = await systemTables();
         const grain = (name: string) =>
           /index_granularity = (\d+)/.exec(rows.find((t) => t.name === name)!.engine_full)?.[1];
         expect(grain(Table.Transactions)).toBe('1024');
+        // The names batch reads up to 100 accounts by key: a granule of 1024 rows keeps that read small (spec 1.1).
+        expect(grain(Table.AccountDomains)).toBe('1024');
         expect(grain(Table.Ledgers)).toBe('8192');
       });
 
@@ -1031,6 +1038,45 @@ describe('migrations (e2e)', () => {
 
         const rows = await svc.query(`SELECT master_key, seq FROM validator_manifests WHERE ephemeral_key = 'n9race'`);
         expect(rows).toEqual([{ master_key: 'nHnew', seq: 9 }]);
+      });
+
+      it('account_domains: a merge keeps the newest row of an account in a partition', async () => {
+        // version = ledger_index * 2^32 + tx_index * 2^16 + node_index, as text (it passes 2^53). The newer row goes in
+        // first: the version decides, not the order of the inserts.
+        const row = SAMPLE_ROWS[Table.AccountDomains];
+        const account = 'rMergedDomainAccountxxxxxxxxxxxxx';
+        const base = { ...row, account, ledger_index: 107_671_593, tx_index: 3 };
+        await svc.insert(Table.AccountDomains, [
+          { ...base, node_index: 6, version: '462445970643419142', domain_hex: '6E65772E6578616D706C65' },
+        ]);
+        await svc.insert(Table.AccountDomains, [
+          { ...base, node_index: 5, version: '462445970643419141', domain_hex: '6F6C642E6578616D706C65' },
+        ]);
+        await svc.command(`OPTIMIZE TABLE ${Table.AccountDomains} FINAL`);
+
+        const rows = await svc.query(
+          `SELECT domain_hex, toString(version) AS version FROM ${Table.AccountDomains} WHERE account = {account:String}`,
+          { account },
+        );
+        expect(rows).toEqual([{ domain_hex: '6E65772E6578616D706C65', version: '462445970643419142' }]);
+      });
+
+      it('domain_tomls: a merge keeps the newest check of a domain with its tuples', async () => {
+        const row = SAMPLE_ROWS[Table.DomainTomls];
+        const domain = 'northpeak.example';
+        const entry = { network: 'main', desc: 'Operations' };
+        const older = { ...row, domain, checked_at: 1_761_300_000.123, accounts: [{ address: 'rOlder', ...entry }] };
+        const newer = { ...row, domain, checked_at: 1_761_300_060.456, accounts: [{ address: 'rNewer', ...entry }] };
+        await svc.insert(Table.DomainTomls, [newer]);
+        await svc.insert(Table.DomainTomls, [older]);
+        await svc.command(`OPTIMIZE TABLE ${Table.DomainTomls} FINAL`);
+
+        const rows = await svc.query(
+          `SELECT checked_at, accounts FROM ${Table.DomainTomls} WHERE domain = {domain:String}`,
+          { domain },
+          { date_time_output_format: 'unix_timestamp' },
+        );
+        expect(rows).toEqual([{ checked_at: '1761300060.456', accounts: [{ address: 'rNewer', ...entry }] }]);
       });
 
       it('fills the added columns for a row written without them', async () => {

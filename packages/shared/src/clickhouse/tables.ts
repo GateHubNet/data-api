@@ -37,6 +37,9 @@ export enum Table {
   CollectionNftEvents = 'collection_nft_events',
   NftSales = 'nft_sales',
   NftTouches = 'nft_touches',
+  // The domain of an account (migration 012, written by ingest from parser version 6): ordered by account, not by the
+  // unique key (ADR-0007's exception, spec 1.1).
+  AccountDomains = 'account_domains',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -74,6 +77,8 @@ export enum Table {
   AccountNfts = 'account_nfts',
   NftCollections = 'nft_collections',
   NftCollectionHolders = 'nft_collection_holders',
+  // Migration 012, written by the syncer's tomls worker: one row per check of a domain's toml, the newest wins.
+  DomainTomls = 'domain_tomls',
   // Written by the operator with plain SQL inserts (ADR-0014).
   /** Migration 009: the account network name of an address, append-only, the newest row of an address wins. */
   AccountNetworkNames = 'account_network_names',

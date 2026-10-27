@@ -17,6 +17,7 @@
  */
 
 import type { NftEventName, NftKind } from '../parsers/nft.parser';
+import type { TomlAccount, TomlCurrency, TomlValidator } from '../tomls/toml-read';
 
 /**
  * Version of the ledger parsers. Stored on every `ledgers` row so a later parser change can find stale rows.
@@ -554,6 +555,25 @@ export interface NftTouchesRow {
   issuer: string;
   taxon_key: number;
   serial: number;
+}
+
+/**
+ * The Domain of an account root after a transaction that changed an account that has or had one (`account_domains`,
+ * migration 012): one row per AccountRoot node of the transaction's metadata. `domain_hex` is the Domain as the ledger
+ * holds it (upper-case hex), `''` when the node has none; `deleted` is 1 for a deleted node. Unlike the other ledger
+ * tables it is ordered by `account`, so merges keep about one row per account and partition: the row with the largest
+ * `version` is the current domain.
+ */
+export interface AccountDomainsRow {
+  account: string;
+  ledger_index: number;
+  tx_index: number;
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  /** `ledger_index * 2^32 + tx_index * 2^16 + node_index` as decimal text: it passes 2^53. */
+  version: string;
+  domain_hex: string;
+  deleted: number;
 }
 
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
@@ -1184,6 +1204,51 @@ export interface NftCollectionHoldersRow {
   owner: string;
   held: number;
   version: UInt64Value;
+}
+
+// -- Domain tomls (migration 012) --------------------------------------------------------------------------------
+
+/**
+ * Why a check of a domain's toml failed: the safe fetcher's reasons, `domain_invalid` and `toml_invalid` (the text was
+ * fetched but is not TOML). `''` for a check that succeeded.
+ */
+export type TomlReason =
+  | ''
+  | 'dns_error'
+  | 'connect_error'
+  | 'tls_error'
+  | 'timeout'
+  | 'http_status'
+  | 'too_large'
+  | 'redirect_rejected'
+  | 'blocked_address'
+  | 'domain_invalid'
+  | 'toml_invalid';
+
+/**
+ * One check of a domain's toml (`domain_tomls`, written by the tomls worker): the newest row of a domain, the largest
+ * `checked_at`, is its current word. `modified` to `principals` are what the toml says in effect: read at `fetched_at`,
+ * carried over by a transient failure within the grace, empty (and `fetched_at` null) otherwise.
+ */
+export interface DomainTomlsRow {
+  /** Lower case. */
+  domain: string;
+  toml_url: string;
+  status: 'ok' | 'failed';
+  reason: TomlReason;
+  /** The HTTP status when `reason` is `http_status`, else 0. */
+  status_code: number;
+  checked_at: UnixSecondsMs;
+  fetched_at: UnixSecondsMs | null;
+  next_check_at: UnixSeconds;
+  /** Consecutive failed checks. */
+  failures: number;
+  modified: UnixSeconds | null;
+  expires: UnixSeconds | null;
+  accounts: TomlAccount[];
+  currencies: TomlCurrency[];
+  validators: TomlValidator[];
+  principals: string[];
 }
 
 // -- Internal bookkeeping ----------------------------------------------------------------------------------------

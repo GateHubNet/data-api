@@ -3,6 +3,7 @@
 exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches the golden rows of the flag ledger 1`] = `
 {
   "accountAmmLiquidity": [],
+  "accountDomains": [],
   "accountExchanges": [],
   "accountNftEvents": [],
   "accountPathPayments": [],
@@ -3739,6 +3740,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
 exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, URITokenCreateSellOffer, Payment) 1`] = `
 {
   "accountAmmLiquidity": [],
+  "accountDomains": [],
   "accountExchanges": [],
   "accountNftEvents": [
     {
@@ -4822,6 +4824,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
 exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
 {
   "accountAmmLiquidity": [],
+  "accountDomains": [],
   "accountExchanges": [],
   "accountNftEvents": [],
   "accountPathPayments": [],
@@ -5978,6 +5981,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
 exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchanges and issued currencies) 1`] = `
 {
   "accountAmmLiquidity": [],
+  "accountDomains": [],
   "accountExchanges": [
     {
       "account": "rN5nsAc5Kb3NKtuSrvuWWBfoP5FPrseD2i",
@@ -8262,6 +8266,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
 exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that creates an account) 1`] = `
 {
   "accountAmmLiquidity": [],
+  "accountDomains": [],
   "accountExchanges": [],
   "accountNftEvents": [],
   "accountPathPayments": [],
