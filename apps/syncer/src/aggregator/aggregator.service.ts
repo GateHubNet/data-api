@@ -5,6 +5,7 @@ import {
   ClickHouseService,
   computeDailyVolumeSet,
   computeLiveVolumeSet,
+  configVersionOf,
   dailySetVersions,
   HOUR_SECONDS,
   livePeriodsOf,
@@ -86,13 +87,13 @@ export const AGGREGATOR_LIVE_BUDGET_MS = 20_000;
 export const AGGREGATOR_DIRTY_BUDGET_MS = 10_000;
 
 /**
- * How much of the tick `volume_live` (the twelve live sets) may use. It runs first, so that the live volumes are refreshed at
+ * How much of the tick `volume_live` (the fifteen live sets) may use. It runs first, so that the live volumes are refreshed at
  * every tick whatever the sweeps after it are doing; its sets are a handful of queries each, so this is a bound for a
  * database that has gone slow, not a share it needs.
  */
 export const AGGREGATOR_VOLUME_LIVE_BUDGET_MS = 5000;
 
-/** How much of the tick `volume_daily` (the sets of today and of yesterday: six) may use; it runs second, for the same reason. */
+/** How much of the tick `volume_daily` (the sets of today and of yesterday: eight) may use; it runs second, for the same reason. */
 export const AGGREGATOR_VOLUME_DAILY_BUDGET_MS = 4000;
 
 /**
@@ -298,10 +299,10 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  * jobs before it left of the tick, so what has to be fresh at every tick goes first and what can run long goes last, each
  * with a budget of its own),
  *
- *  1. **volume_live** (with the `volumes` option): the twelve live volume sets (trade volume and AMM volume for hour, day, 3day,
- *     7day and 30day, payment volume for hour and day), each recomputed whole under one version, the stalest first: when the
- *     budget is too short for all of them every set is refreshed in turn.
- *  2. **volume_daily**: the daily volume sets of today and of yesterday (UTC), the three metrics, the stalest first (yesterday's are
+ *  1. **volume_live** (with the `volumes` option): the fifteen live volume sets (trade volume and AMM volume for hour, day, 3day,
+ *     7day and 30day, payment volume for hour and day, NFT volume for day, 7day and 30day), each recomputed whole under one
+ *     version, the stalest first: when the budget is too short for all of them every set is refreshed in turn.
+ *  2. **volume_daily**: the daily volume sets of today and of yesterday (UTC), the four metrics, the stalest first (yesterday's are
  *     the ones that are finalised after the midnight).
  *  3. **amm_pools** (with the `ammPools` option): rebuilds the `amm_pools` row of every AMM pool whose state rows changed
  *     since the cursor of the job, `AMM_POOLS_BATCH` pools at a time, oldest change first, for at most
@@ -369,9 +370,10 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *  9. **rates_daily** (with `aggregates`): the rates of the closed final days, newest first (`RatesDailyJobRunner`).
  * 10. **account_rollups** (with `aggregates`): the discovery of heavy accounts and their day rollups, the increment of each new
  *     day and the promotion of the days before (`AccountRollupsJobRunner`).
- * 11. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config,
- *     newest first, under its own budget. A day is closed when it is before yesterday AND the ingest has passed it (the newest
- *     ledger closed an hour after its end): the wall clock alone would call a day final while its ledgers are still to come.
+ * 11. **volume_backfill**: the closed days whose daily sets do not exist, final, for the current `version` of the markets config
+ *     (the NFT volume's is its own, `NFT_VOLUME_CONFIG_VERSION`), newest first, under its own budget. A day is closed when it
+ *     is before yesterday AND the ingest has passed it (the newest ledger closed an hour after its end): the wall clock alone
+ *     would call a day final while its ledgers are still to come.
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
  *     doubling, until the config version changes) and the older days go on.
  *
@@ -897,7 +899,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   }
 
   /**
-   * The daily volume sets of the days a slice `[start, end)` covers, the three metrics, after its stats. A day is done once per
+   * The daily volume sets of the days a slice `[start, end)` covers, the four metrics, after its stats. A day is done once per
    * tick (`done` maps a day to the clock reading at which its recompute began), unless the range was marked after that: the
    * ingest wrote more ledgers into the day meanwhile, which that recompute may not have seen. A failure fails the slice, so
    * that the range stays in the queue and the day is done again next tick.
@@ -1008,7 +1010,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   // -------------------------------------------------------------------------------------------------------------------
 
   /**
-   * The live sets of the three metrics, every period, with the time of the tick, the STALEST first (the one written longest ago;
+   * The live sets of the four metrics, every period, with the time of the tick, the STALEST first (the one written longest ago;
    * a set with no row at all is the stalest of all), so that with a budget that is too short for them all every set is
    * refreshed in turn, none always last. A set whose last attempt failed is started after the ones that did not fail (R87): it is the
    * stalest for as long as it fails, and would otherwise start first at every tick and keep the healthy ones from running.
@@ -1038,7 +1040,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   }
 
   /**
-   * The daily sets of today and of yesterday (UTC), the three metrics, the stalest first (as `volumeLive`): the day is not over,
+   * The daily sets of today and of yesterday (UTC), the four metrics, the stalest first (as `volumeLive`): the day is not over,
    * or only just, so they change; and yesterday's are the ones that must be finalised after the midnight.
    */
   private async volumeDaily(tick: AggregatorTick): Promise<void> {
@@ -1078,7 +1080,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   }
 
   /**
-   * The closed days that have no final daily set of the current config version, newest first, the three metrics, for as long as
+   * The closed days that have no final daily set of the current config version, newest first, the four metrics, for as long as
    * the budget of the job and of the tick last. A day is closed (a day to back-fill) when it is before yesterday AND the ingest
    * has passed it: the newest ingested ledger closed at least `VOLUME_DAY_SETTLE_MS` after the end of the day. By wall clock
    * alone a day would be taken for final while its ledgers are still to come (after an outage, or when the ingest started at an
@@ -1099,20 +1101,27 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     const until = closedUntil(Math.floor(tick.now.getTime() / 1000), newestClose);
     if (utcDayStart(firstClose) >= until) return;
     const first = utcDayStart(firstClose);
-    const version = volumes.markets.version;
+    // the config version of a metric: the markets config's, but the NFT volume's own (it does not read the markets config)
+    const versionOf = (metric: VolumeMetric): number => configVersionOf(metric, volumes.markets);
 
     const done = new Map<VolumeMetric, Set<string>>();
     for (const metric of VOLUME_METRICS) {
       done.set(
         metric,
-        await this.volumeFns.daysDone(this.ch, metric, new Date(first * 1000), new Date(until * 1000), version),
+        await this.volumeFns.daysDone(
+          this.ch,
+          metric,
+          new Date(first * 1000),
+          new Date(until * 1000),
+          versionOf(metric),
+        ),
       );
     }
     const missing: Array<{ metric: VolumeMetric; dayStart: number; key: string }> = [];
     for (let dayStart = until - DAY_SECONDS; dayStart >= first; dayStart -= DAY_SECONDS) {
       for (const metric of VOLUME_METRICS) {
         if (!done.get(metric)?.has(dayKey(dayStart)))
-          missing.push({ metric, dayStart, key: `${metric}/${dayKey(dayStart)}@${version}` });
+          missing.push({ metric, dayStart, key: `${metric}/${dayKey(dayStart)}@${versionOf(metric)}` });
       }
     }
     // a set that is done (or is no longer wanted) has no failure to remember

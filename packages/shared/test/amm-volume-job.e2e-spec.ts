@@ -928,7 +928,7 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
       const metrics = await ch.query<{ metric: string }>(
         `SELECT DISTINCT metric FROM ${Table.VolumeLive} ORDER BY metric`,
       );
-      expect(metrics.map((m) => m.metric)).toEqual(['amm_volume', 'payment_volume', 'trade_volume']);
+      expect(metrics.map((m) => m.metric)).toEqual(['amm_volume', 'nft_volume', 'payment_volume', 'trade_volume']);
     });
 
     it('an aborted signal writes nothing and throws VolumeRecomputeAborted', async () => {
@@ -1593,6 +1593,9 @@ describe('the amm_volume metric of the volume jobs (e2e)', () => {
         { metric: 'amm_volume', period: '7day', components: 4, estimates: 0 },
         { metric: 'amm_volume', period: 'day', components: 4, estimates: 3 },
         { metric: 'amm_volume', period: 'hour', components: 0, estimates: 0 },
+        { metric: 'nft_volume', period: '30day', components: 0, estimates: 0 },
+        { metric: 'nft_volume', period: '7day', components: 0, estimates: 0 },
+        { metric: 'nft_volume', period: 'day', components: 0, estimates: 0 },
         { metric: 'payment_volume', period: 'day', components: 0, estimates: 0 },
         { metric: 'payment_volume', period: 'hour', components: 0, estimates: 0 },
         // the swaps of FA are trades of the configured market USD/XRP

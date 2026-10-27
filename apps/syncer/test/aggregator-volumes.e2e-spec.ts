@@ -5,6 +5,7 @@ import {
   getNetworkProfile,
   LedgerWriter,
   MarketsConfig,
+  NFT_VOLUME_CONFIG_VERSION,
   parseContextFor,
   RatesService,
   runMigrations,
@@ -136,7 +137,7 @@ describe('AggregatorService volume jobs (e2e)', () => {
 
   const days = (sets: SetInfo[]): string[] => sets.map((s) => s.day);
 
-  it('a tick writes the twelve live sets for its time and the daily sets of today and of yesterday', async () => {
+  it('a tick writes the fifteen live sets for its time and the daily sets of today and of yesterday', async () => {
     const ch = await fresh();
     const now = new Date('2015-01-14T19:30:00Z');
     await aggregator(ch).tick(now);
@@ -154,6 +155,9 @@ describe('AggregatorService volume jobs (e2e)', () => {
       'amm_volume 7day',
       'amm_volume day',
       'amm_volume hour',
+      'nft_volume 30day',
+      'nft_volume 7day',
+      'nft_volume day',
       'payment_volume day',
       'payment_volume hour',
       'trade_volume 30day',
@@ -177,14 +181,20 @@ describe('AggregatorService volume jobs (e2e)', () => {
     expect(days(amm).filter((d) => d >= '2015-01-13')).toEqual(['2015-01-13', '2015-01-14']);
     expect(amm.every((s) => s.components === 0)).toBe(true);
     expect(live.filter((s) => s.metric === 'amm_volume').every((s) => Number(s.components) === 0)).toBe(true);
+    // nor does it hold a sale of an NFT: the NFT volume is the sentinel only, in every set, with the version of its own
+    const nft = await daily(ch, 'nft_volume');
+    expect(days(nft).filter((d) => d >= '2015-01-13')).toEqual(['2015-01-13', '2015-01-14']);
+    expect(nft.every((s) => s.components === 0 && s.config_version === NFT_VOLUME_CONFIG_VERSION)).toBe(true);
+    expect(live.filter((s) => s.metric === 'nft_volume').every((s) => Number(s.components) === 0)).toBe(true);
+    expect(MARKETS.version).not.toBe(NFT_VOLUME_CONFIG_VERSION);
   });
 
-  it('back-fills the closed days from the first ledger, both metrics, and a second tick leaves them alone', async () => {
+  it('back-fills the closed days from the first ledger, every metric, and a second tick leaves them alone', async () => {
     const ch = await fresh();
     const svc = aggregator(ch);
     await svc.tick(new Date('2015-01-14T19:30:00Z'));
     // closed days: before yesterday (the 13th), from the day of the first ledger (the 8th)
-    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume']) {
+    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume', 'nft_volume']) {
       expect(days(await daily(ch, metric))).toEqual([
         '2015-01-08',
         '2015-01-09',
@@ -220,16 +230,25 @@ describe('AggregatorService volume jobs (e2e)', () => {
     }
   });
 
-  it('computes the closed days again when the version of the config changes, and only then', async () => {
+  it('computes the closed days again when the version of the config changes, and only then (not the NFT volume, whose version is its own)', async () => {
     const ch = await fresh();
     await aggregator(ch).tick(new Date('2015-01-14T19:30:00Z'));
     const first = await daily(ch, 'trade_volume');
+    const firstNft = await daily(ch, 'nft_volume');
     expect(new Set(first.map((s) => s.config_version))).toEqual(new Set([MARKETS.version]));
+    expect(new Set(firstNft.map((s) => s.config_version))).toEqual(new Set([NFT_VOLUME_CONFIG_VERSION]));
 
     await aggregator(ch, {}, { ...MARKETS, version: MARKETS.version + 1 }).tick(new Date('2015-01-14T19:32:00Z'));
     const second = await daily(ch, 'trade_volume');
     expect(new Set(second.map((s) => s.config_version))).toEqual(new Set([MARKETS.version + 1]));
     for (const s of second) expect(s.version).toBeGreaterThan(first.find((f) => f.day === s.day)?.version ?? 0);
+
+    // the NFT volume's closed days are done for its version: the tick writes today and yesterday again, and no closed day
+    const secondNft = await daily(ch, 'nft_volume');
+    expect(new Set(secondNft.map((s) => s.config_version))).toEqual(new Set([NFT_VOLUME_CONFIG_VERSION]));
+    for (const s of secondNft.filter((n) => n.day < '2015-01-13')) {
+      expect(s.version).toBe(firstNft.find((f) => f.day === s.day)?.version);
+    }
   });
 
   it('works through the back-fill under its budget, newest day first, across ticks', async () => {
@@ -247,16 +266,17 @@ describe('AggregatorService volume jobs (e2e)', () => {
       },
     });
     await svc.tick(new Date(clock));
-    // 4 s a set: sets start at 0, 4 and 8 s; at 12 s the 10 s are spent. The three metrics of the 12th
+    // 4 s a set: sets start at 0, 4 and 8 s; at 12 s the 10 s are spent. The first three metrics of the 12th, not the NFT volume
     for (const metric of ['trade_volume', 'payment_volume', 'amm_volume']) {
       expect(days(await daily(ch, metric)).filter((d) => d < '2015-01-13')).toEqual(['2015-01-12']);
     }
+    expect(days(await daily(ch, 'nft_volume')).filter((d) => d < '2015-01-13')).toEqual([]);
 
     for (let i = 0; i < 10; i++) {
       clock += 60_000;
       await svc.tick(new Date(clock));
     }
-    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume']) {
+    for (const metric of ['trade_volume', 'payment_volume', 'amm_volume', 'nft_volume']) {
       expect(days(await daily(ch, metric)).filter((d) => d < '2015-01-13')).toEqual([
         '2015-01-08',
         '2015-01-09',
@@ -288,14 +308,18 @@ describe('AggregatorService volume jobs (e2e)', () => {
       { from: unix('2015-01-14T17:00:00Z'), to: unix('2015-01-14T20:00:00Z'), created: Date.now() - 5000 },
     );
     const beforeDirty = await daily(ch, 'trade_volume');
+    const beforeNft = await daily(ch, 'nft_volume');
     await svc.tick(later);
     const afterDirty = await daily(ch, 'trade_volume');
     const of = (list: SetInfo[], d: string): SetInfo => list.find((s) => s.day === d) as SetInfo;
     expect(of(afterDirty, '2015-01-14').version).toBeGreaterThan(of(beforeDirty, '2015-01-14').version);
     expect(of(afterDirty, '2015-01-14').components).toBe(sets.components);
-    // both metrics, and no other closed day was touched
+    // every metric, and no other closed day was touched
     expect((await daily(ch, 'payment_volume')).find((s) => s.day === '2015-01-14')?.version).toBeGreaterThan(
       sets.version,
+    );
+    expect((await daily(ch, 'nft_volume')).find((s) => s.day === '2015-01-14')?.version).toBeGreaterThan(
+      beforeNft.find((s) => s.day === '2015-01-14')?.version ?? 0,
     );
     for (const d of ['2015-01-08', '2015-01-10', '2015-01-12', '2015-01-13']) {
       expect(of(afterDirty, d).version).toBe(of(beforeDirty, d).version);
@@ -313,7 +337,7 @@ describe('AggregatorService volume jobs (e2e)', () => {
     // the native currency is always there
     expect((await daily(ch, 'payment_volume')).find((s) => s.day === '2015-01-14')?.components).toBe(1);
     const live = await ch.query<{ n: string }>(`SELECT countIf(component = '') AS n FROM ${Table.VolumeLive}`);
-    expect(Number(live[0].n)).toBe(12);
+    expect(Number(live[0].n)).toBe(15);
   });
 
   describe('the ingest decides which days are closed and final, not the clock', () => {

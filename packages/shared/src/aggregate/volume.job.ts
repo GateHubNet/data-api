@@ -5,7 +5,9 @@ import { VolumeDailyRow, VolumeLiveRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { MarketAsset, MarketsConfig } from '../network/network-profile';
 import { Asset, assetKey } from '../query/asset';
+import { DailyRates } from '../query/daily-rates';
 import { exactAmount, exactSum, floatSum, ratio, sumOf } from '../query/decimal';
+import { nftSalesNativeSql } from '../query/nft-prices';
 import { LedgerRange, RatesService } from '../query/rates.service';
 // amm-daily.job imports this module too: neither may use the other's exports at load time, only inside functions
 import { ammWindowSwapTotals, SwapTotals } from './amm-daily.job';
@@ -17,23 +19,25 @@ import { AmmPoolVolume, ammPoolVolumes } from './amm-reads';
  * ledgers instead of from HBase's top markets and top currencies: the markets and the currencies are the ones of the
  * versioned markets config. A third metric, the AMM volume (`/v2/network/amm_volume`), is the swaps against the AMM pools, a
  * component per pool, converted like the trade components; it is not limited to the configured markets (every pool with swaps
- * counts) and needs no table or job of its own.
+ * counts) and needs no table or job of its own. A fourth, the NFT volume (`nft_volume`), is the sales of the NFT collections,
+ * a component per collection, in the native currency (`nftSalesNativeSql`); it does not depend on the markets config either.
  *
  * Two kinds of sets are written. A **live set** is a rolling window ending now (`volume_live`: trade volume and AMM volume for
- * the periods hour, day, 3day, 7day and 30day, payment volume for hour and day); a **daily set** is a UTC day
- * (`volume_daily`). The API sums daily sets into weeks and months.
+ * the periods hour, day, 3day, 7day and 30day, payment volume for hour and day, NFT volume for day, 7day and 30day); a
+ * **daily set** is a UTC day (`volume_daily`). The API sums daily sets into weeks and months.
  *
  * Both tables are ReplacingMergeTree(version) keyed by the component, which would let a component that disappears (a market
  * removed from the config, a currency whose rate is gone) linger for ever. So **a recompute writes the complete set of a
  * (metric, day) or (metric, period) with one version, in one insert, and a reader keeps the rows whose version is the
- * newest of the set** (no FINAL, and nothing depends on a merge). Every set holds a **sentinel** row (component '', count 0):
- * a day without any volume still has a set, which is how a day is known to be computed.
+ * newest of the set** (no FINAL, and nothing depends on a merge). Every set holds a **sentinel** row (component ''): a day
+ * without any volume still has a set, which is how a day is known to be computed. Its `count` is 0, except for the NFT volume,
+ * whose sentinel counts every sale of the window, those with a converted price or not.
  *
  * The version is the time of the write in milliseconds on the ClickHouse clock, and never lower than one more than the
  * newest version the set has now, so that it only goes up.
  */
 
-export const VOLUME_METRICS = ['trade_volume', 'payment_volume', 'amm_volume'] as const;
+export const VOLUME_METRICS = ['trade_volume', 'payment_volume', 'amm_volume', 'nft_volume'] as const;
 export type VolumeMetric = (typeof VOLUME_METRICS)[number];
 
 /** The rolling windows of the live sets. */
@@ -43,9 +47,31 @@ export const TRADE_LIVE_PERIODS: readonly LivePeriod[] = ['hour', 'day', '3day',
 /** The periods of the payment volume. The original's develop branch also had `minute`; it is not supported here. */
 export const PAYMENT_LIVE_PERIODS: readonly LivePeriod[] = ['hour', 'day'];
 
+/** The periods of the NFT volume. */
+export const NFT_LIVE_PERIODS: readonly LivePeriod[] = ['day', '7day', '30day'];
+
 /** The periods a metric has live sets for: the AMM volume has the periods of the trade volume. */
 export function livePeriodsOf(metric: VolumeMetric): readonly LivePeriod[] {
-  return metric === 'payment_volume' ? PAYMENT_LIVE_PERIODS : TRADE_LIVE_PERIODS;
+  switch (metric) {
+    case 'payment_volume':
+      return PAYMENT_LIVE_PERIODS;
+    case 'nft_volume':
+      return NFT_LIVE_PERIODS;
+    default:
+      return TRADE_LIVE_PERIODS;
+  }
+}
+
+/**
+ * The `config_version` of the sets of the NFT volume: what they mean (the sales of a collection, converted by the rates of the
+ * day), not the markets config, which it does not read, so that a new markets config does not compute them again. A change of
+ * how the NFT volume is made is a new value, and every day is computed again.
+ */
+export const NFT_VOLUME_CONFIG_VERSION = 1;
+
+/** The `config_version` the sets of a metric carry: `NFT_VOLUME_CONFIG_VERSION` for the NFT volume, else the markets config's. */
+export function configVersionOf(metric: VolumeMetric, markets: MarketsConfig): number {
+  return metric === 'nft_volume' ? NFT_VOLUME_CONFIG_VERSION : markets.version;
 }
 
 /** The length of each period, in seconds. */
@@ -466,11 +492,17 @@ async function ammComponents(
   }));
 }
 
+/** What a window of a metric is made of: its components, and the `count` of the set's sentinel (0 for every metric but `nft_volume`). */
+interface WindowComponents {
+  components: VolumeComponent[];
+  count: number;
+}
+
 /**
  * The components of a metric in a window `[from, toExclusive)`; a payment is converted at the rate of `from`. `withFees` gives
  * the AMM components their fee estimates (the live day set); the other metrics have none.
  */
-function componentsOf(
+async function componentsOf(
   ch: ClickHouseService,
   rates: RatesService,
   config: MarketsConfig,
@@ -478,14 +510,16 @@ function componentsOf(
   from: Date,
   toExclusive: Date,
   withFees = false,
-): Promise<VolumeComponent[]> {
+): Promise<WindowComponents> {
   switch (metric) {
     case 'trade_volume':
-      return tradeComponents(rates, config, from, toExclusive);
+      return { components: await tradeComponents(rates, config, from, toExclusive), count: 0 };
     case 'payment_volume':
-      return paymentComponents(ch, rates, config, from, toExclusive, from);
+      return { components: await paymentComponents(ch, rates, config, from, toExclusive, from), count: 0 };
     case 'amm_volume':
-      return ammComponents(ch, rates, config, from, toExclusive, withFees);
+      return { components: await ammComponents(ch, rates, config, from, toExclusive, withFees), count: 0 };
+    case 'nft_volume':
+      return nftComponents(ch, rates, from, toExclusive);
   }
 }
 
@@ -594,6 +628,68 @@ async function paymentComponents(
   return components.sort(byConverted);
 }
 
+/** The sales of a range of ledgers `{nv_min}` to `{nv_max}`, each once (`LIMIT 1 BY` its key: a table that was written twice is not collapsed before a merge). */
+const NFT_SALES_OF_RANGE = `SELECT ledger_index, tx_index, event_index, issuer, taxon, currency, amount_issuer, close_time, amount, amount_f
+    FROM ${Table.NftSales}
+   WHERE ledger_index BETWEEN {nv_min:UInt32} AND {nv_max:UInt32}
+   ORDER BY ledger_index, tx_index, event_index
+   LIMIT 1 BY ledger_index, tx_index, event_index`;
+
+interface NftCollectionRow {
+  issuer: string;
+  taxon: number | string | null;
+  sales: number | string;
+  converted_sales: number | string;
+  converted_sum: string | null;
+}
+
+/**
+ * The NFT components of a window (spec 3.3): the sales of the NFTs in the committed ledgers that closed in `[from, toExclusive)`,
+ * converted to the native currency by `nftSalesNativeSql` (the sale's own price if it is in the native currency, else at the
+ * rate of its asset on the sale's UTC day, none if there is no rate), a component per collection that has a converted sale. A
+ * collection is its issuer and taxon (`<issuer>/<taxon>`; the taxon of a URIToken is none: `<issuer>`), `amount` and `converted`
+ * are the exact sum of the converted prices (a `Decimal256`, so that nothing is lost or wrapped), `rate` is 1 and `count` the sales
+ * with a converted price. The window's `count` is every sale of it, those that were left out for want of a rate too.
+ */
+async function nftComponents(
+  ch: ClickHouseService,
+  rates: RatesService,
+  from: Date,
+  toExclusive: Date,
+): Promise<WindowComponents> {
+  const range = await rates.ledgersClosedIn(from, toExclusive);
+  if (!range) return { components: [], count: 0 };
+  const native = await nftSalesNativeSql(ch, new DailyRates(ch, rates), {
+    sql: NFT_SALES_OF_RANGE,
+    params: { nv_min: range.min, nv_max: range.max },
+  });
+  const rows = await ch.query<NftCollectionRow>(
+    `SELECT issuer, taxon,
+            toUInt32(count()) AS sales,
+            toUInt32(countIf(converted_native IS NOT NULL)) AS converted_sales,
+            toString(sum(toDecimal256(converted_native, 6))) AS converted_sum
+       FROM (${native.sql})
+      GROUP BY issuer, taxon`,
+    native.params,
+  );
+  const base: Asset = { currency: rates.nativeCurrency };
+  const components = rows
+    .filter((r) => Number(r.converted_sales) > 0 && r.converted_sum !== null)
+    .map((r): VolumeComponent => {
+      const amount = new BigNumber(r.converted_sum as string);
+      return {
+        component: r.taxon === null ? r.issuer : `${r.issuer}/${r.taxon}`,
+        base,
+        amount,
+        count: Number(r.converted_sales),
+        rate: new BigNumber(1),
+        converted: amount,
+      };
+    })
+    .sort(byConverted);
+  return { components, count: rows.reduce((total, r) => total + Number(r.sales), 0) };
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Writing a set
 // ---------------------------------------------------------------------------------------------------------------------
@@ -605,7 +701,8 @@ type LiveSetRow = SetRow & Pick<VolumeLiveRow, 'fees_est_f'>;
 
 /**
  * The rows of a set: the sentinel first, then the components. The `rate_f` of a daily sentinel is 1 when the set is the final
- * one of its day (`final`, see `computeDailyVolumeSet`), else 0; a live set's is 0. With `withFees` (a live set) each row also
+ * one of its day (`final`, see `computeDailyVolumeSet`), else 0; a live set's is 0. The sentinel's `count` is `sentinelCount`
+ * (0 unless the metric says otherwise: the NFT volume's is every sale of the window). With `withFees` (a live set) each row also
  * has `fees_est_f`, taken from its own component (`feesEst`; NULL on the sentinel and where it is not known); a daily row has no
  * such column.
  */
@@ -615,6 +712,8 @@ function setRows(
   configVersion: number,
   version: number,
   final?: boolean,
+  withFees?: false,
+  sentinelCount?: number,
 ): SetRow[];
 function setRows(
   metric: VolumeMetric,
@@ -623,6 +722,7 @@ function setRows(
   version: number,
   final: boolean,
   withFees: true,
+  sentinelCount?: number,
 ): LiveSetRow[];
 function setRows(
   metric: VolumeMetric,
@@ -631,6 +731,7 @@ function setRows(
   version: number,
   final = false,
   withFees = false,
+  sentinelCount = 0,
 ): SetRow[] {
   const row = (c: VolumeComponent | undefined): SetRow => ({
     metric,
@@ -641,7 +742,7 @@ function setRows(
     counter_issuer: c?.counter?.issuer ?? '',
     amount: c ? c.amount.toString() : '0',
     amount_f: c ? c.amount.toNumber() : 0,
-    count: c?.count ?? 0,
+    count: c ? c.count : sentinelCount,
     rate_f: c ? c.rate.toNumber() : final ? 1 : 0,
     converted_f: c ? c.converted.toNumber() : 0,
     config_version: configVersion,
@@ -698,8 +799,8 @@ async function newestLedgerClose(ch: ClickHouseService): Promise<number | undefi
 
 /**
  * Recomputes the daily set of a metric for the UTC day of `day`, and writes it: the sentinel and the components, one version,
- * one insert. Returns how many components it wrote. Trades and payments that closed in `[00:00, 24:00)` count, and a
- * payment is converted at the rate of the start of the day.
+ * one insert. Returns how many components it wrote. Trades, payments and sales that closed in `[00:00, 24:00)` count, and a
+ * payment is converted at the rate of the start of the day. The rows carry `configVersionOf(metric, markets)`.
  *
  * The `rate_f` of the sentinel says whether the set is the final one of its day: 1 when the newest ledger had closed
  * `VOLUME_DAY_SETTLE_MS` after the end of the day when the set was read (read BEFORE the trades and payments, so that all
@@ -719,13 +820,13 @@ export async function computeDailyVolumeSet(
   const [from, to] = [at(start), at(start + DAY_SECONDS)];
   const newest = await newestLedgerClose(ch);
   const final = newest !== undefined && newest >= start + DAY_SECONDS + VOLUME_DAY_SETTLE_MS / 1000;
-  const components = await componentsOf(ch, rates, markets, metric, from, to);
+  const { components, count } = await componentsOf(ch, rates, markets, metric, from, to);
   const version = await nextVersion(ch, Table.VolumeDaily, 'metric = {metric:String} AND day = {day:Date}', {
     metric,
     day: dayKey(start),
   });
   throwIfAborted(signal);
-  const rows = setRows(metric, components, markets.version, version, final).map(
+  const rows = setRows(metric, components, configVersionOf(metric, markets), version, final, false, count).map(
     (r): VolumeDailyRow => ({ ...r, day: dayKey(start) }),
   );
   await ch.insert(Table.VolumeDaily, rows);
@@ -736,7 +837,8 @@ export async function computeDailyVolumeSet(
  * Recomputes the live set of a metric for a period and writes it: the window is `[now - period, now)`, whole seconds, and
  * every row carries its start and end. A payment is converted at the rate of the start of the window. The components of the
  * AMM volume's day set carry their fee estimates (`fees_est_f`, D2b.3; NULL when not known); its sentinel and the rows of every
- * other set have NULL there (the longer periods would read up to 30 days of swaps at every tick).
+ * other set have NULL there (the longer periods would read up to 30 days of swaps at every tick). The rows carry
+ * `configVersionOf(metric, markets)`.
  */
 export async function computeLiveVolumeSet(
   ch: ClickHouseService,
@@ -756,13 +858,13 @@ export async function computeLiveVolumeSet(
   const end = Math.floor(now.getTime() / 1000);
   const start = end - LIVE_PERIOD_SECONDS[period];
   const [from, to] = [at(start), at(end)];
-  const components = await componentsOf(ch, rates, markets, metric, from, to, period === 'day');
+  const { components, count } = await componentsOf(ch, rates, markets, metric, from, to, period === 'day');
   const version = await nextVersion(ch, Table.VolumeLive, 'metric = {metric:String} AND period = {period:String}', {
     metric,
     period,
   });
   throwIfAborted(signal);
-  const rows = setRows(metric, components, markets.version, version, false, true).map(
+  const rows = setRows(metric, components, configVersionOf(metric, markets), version, false, true, count).map(
     (r): VolumeLiveRow => ({ ...r, period, start_time: start, end_time: end }),
   );
   await ch.insert(Table.VolumeLive, rows);
@@ -770,8 +872,8 @@ export async function computeLiveVolumeSet(
 }
 
 /**
- * The live sets of every metric, every period (trade and AMM: hour, day, 3day, 7day, 30day; payment: hour, day), one after the
- * other.
+ * The live sets of every metric, every period (trade and AMM: hour, day, 3day, 7day, 30day; payment: hour, day; NFT: day, 7day,
+ * 30day), one after the other.
  */
 export async function computeLiveVolumes(
   ch: ClickHouseService,
@@ -802,8 +904,9 @@ export async function computeDailyVolumes(
 
 /**
  * The days of `[from, toExclusive)` (UTC days: both are cut to their midnight) that are done for `metric`: the newest daily
- * set of the day was made with `configVersion` AND is a final set (its sentinel says the ingest had passed the day, see
- * `computeDailyVolumeSet`). A day whose set has another version is not in it, so it is computed again after a config change;
+ * set of the day was made with `configVersion` (`configVersionOf(metric, markets)`) AND is a final set (its sentinel says the
+ * ingest had passed the day, see `computeDailyVolumeSet`). A day whose set has another version is not in it, so it is computed
+ * again after a config change (not the NFT volume's, which does not read the markets config);
  * neither is a day whose newest set was made while its ledgers were not all in (the aggregator ran during the day, the
  * ingest was behind after an outage, the ingest started at an old ledger). A day with only a sentinel (no volume) is. Each day
  * counts by its newest sentinel, and a set that was stored twice counts once. Returns the days as `YYYY-MM-DD`.

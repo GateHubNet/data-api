@@ -29,9 +29,10 @@ describe('VolumeService', () => {
       }
     });
 
-    it('covers the twelve live sets', () => {
-      expect(cases).toHaveLength(12);
+    it('covers the fifteen live sets', () => {
+      expect(cases).toHaveLength(15);
       expect(cases).toContainEqual(['amm_volume', 'day']);
+      expect(cases).toContainEqual(['nft_volume', '30day']);
     });
   });
 });

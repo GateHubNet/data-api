@@ -990,14 +990,15 @@ describe('AggregatorService amm_daily job', () => {
       failing.add(MIDDLE);
       await service(withEverything()).tick();
       for (const d of ['2026-05-01', '2026-05-02', '2026-05-03']) {
-        // every slice, in order: its stats, its volumes (three metrics), its pools, its day
+        // every slice, in order: its stats, its volumes (four metrics), its pools, its day
         const at = events.indexOf(`stats ${d}T00:00:00Z`);
         expect(at).toBeGreaterThan(-1);
-        expect(events.slice(at, at + 6)).toEqual([
+        expect(events.slice(at, at + 7)).toEqual([
           `stats ${d}T00:00:00Z`,
           `volume trade_volume ${d}`,
           `volume payment_volume ${d}`,
           `volume amm_volume ${d}`,
+          `volume nft_volume ${d}`,
           'pools rA',
           `amm_daily ${d}`,
         ]);

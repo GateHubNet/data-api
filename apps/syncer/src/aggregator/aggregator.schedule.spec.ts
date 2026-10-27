@@ -543,11 +543,12 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       metrics.aggregatorRunsTotal.inc.mockClear();
       await svc.tick();
 
-      // the twelve live sets and the six daily ones (amm_volume among them) are the first things the tick does, at its very start
-      const first = log.slice(0, 18);
+      // the fifteen live sets and the eight daily ones (amm_volume and nft_volume among them) are the first things the tick does,
+      // at its very start
+      const first = log.slice(0, 23);
       expect(first.map((entry) => entry.event.split(' ')[0])).toEqual([
-        ...Array(12).fill('live'),
-        ...Array(6).fill('daily'),
+        ...Array(15).fill('live'),
+        ...Array(8).fill('daily'),
       ]);
       expect(first.every((entry) => entry.at === tickStart)).toBe(true);
       // they finished (a run is counted when the job ends without throwing), and so did every job after them
@@ -583,11 +584,12 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       const at = events().indexOf(`stats ${DIRTY_FROM}`);
       // the volume sets of the slice's day, then the hooks of the AMM jobs (amm_pools finds no pool in the slice; the day's
       // amm_daily set), then D2's, then the mark of the ledgers of the slice in nft_dirty
-      expect(events().slice(at, at + 9)).toEqual([
+      expect(events().slice(at, at + 10)).toEqual([
         `stats ${DIRTY_FROM}`,
         'daily trade_volume 2026-10-14',
         'daily payment_volume 2026-10-14',
         'daily amm_volume 2026-10-14',
+        'daily nft_volume 2026-10-14',
         'amm_daily 2026-10-14',
         HOOKS.rates_daily,
         HOOKS.pair_hourly,

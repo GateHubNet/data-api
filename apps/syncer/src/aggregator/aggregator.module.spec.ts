@@ -1,4 +1,11 @@
-import { ClickHouseService, getNetworkProfile, RatesService, ShutdownSignals, Table } from '@gatehub/data-api-shared';
+import {
+  ClickHouseService,
+  getNetworkProfile,
+  NFT_VOLUME_CONFIG_VERSION,
+  RatesService,
+  ShutdownSignals,
+  Table,
+} from '@gatehub/data-api-shared';
 import { Global, Module } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -105,9 +112,9 @@ describe('AggregatorModule', () => {
     }
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     const written = insert.mock.calls.map(([table]) => table);
-    // the three metrics: 5 + 2 + 5 live sets, and today and yesterday of each
-    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(12);
-    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(6);
+    // the four metrics: 5 + 2 + 5 + 3 live sets, and today and yesterday of each
+    expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(15);
+    expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(8);
     expect(written).not.toContain(Table.AmmPools);
     const days = insert.mock.calls.filter(([table]) => table === Table.AmmDaily);
     expect(
@@ -119,7 +126,7 @@ describe('AggregatorModule', () => {
     expect(query.mock.calls.length).toBe(queries);
   });
 
-  it('reads the markets config from GH_MARKETS_CONFIG, and its version is the version of the sets', async () => {
+  it('reads the markets config from GH_MARKETS_CONFIG, and its version is the version of the sets (the NFT volume has its own)', async () => {
     jest.useFakeTimers({ now: new Date('2026-10-16T12:34:56Z') });
     const dir = mkdtempSync(join(tmpdir(), 'markets-'));
     try {
@@ -136,10 +143,14 @@ describe('AggregatorModule', () => {
       await app.init();
       await jest.advanceTimersByTimeAsync(0);
       const sets = insert.mock.calls.filter(([table]) => table === Table.VolumeLive);
-      expect(sets).toHaveLength(12);
+      expect(sets).toHaveLength(15);
       for (const [, rows] of sets) {
-        expect((rows as Array<{ config_version: number }>).every((row) => row.config_version === 42)).toBe(true);
+        const set = rows as Array<{ metric: string; config_version: number }>;
+        // the markets config does not move the NFT volume: its sets carry the version of the metric
+        const expected = set[0].metric === 'nft_volume' ? NFT_VOLUME_CONFIG_VERSION : 42;
+        expect(set.every((row) => row.metric === set[0].metric && row.config_version === expected)).toBe(true);
       }
+      expect(sets.filter(([, rows]) => (rows as Array<{ metric: string }>)[0].metric === 'nft_volume')).toHaveLength(3);
       await app.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -67,6 +67,7 @@ export * from './query/candle-columns';
 export * from './query/daily-rates';
 export * from './query/decimal';
 export * from './query/distinct-page';
+export * from './query/nft-prices';
 export * from './query/parser-coverage';
 export * from './query/rates.service';
 export * from './query/valuation';

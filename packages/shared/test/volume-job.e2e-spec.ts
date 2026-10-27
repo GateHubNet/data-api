@@ -414,7 +414,7 @@ describe('volume jobs (e2e)', () => {
         expect(await liveSet(ch, 'payment_volume', '3day')).toEqual([]);
       });
 
-      it('writes the sets of the three metrics and nothing else: 5 + 2 + 5 sets', async () => {
+      it('writes the sets of the four metrics and nothing else: 5 + 2 + 5 + 3 sets', async () => {
         const ch2 = await freshService();
         await new LedgerWriter(ch2, ctx).write(ledgers);
         await computeLiveVolumes(ch2, new RatesService(ch2, 'XRP'), MARKETS, NOW);
@@ -427,6 +427,9 @@ describe('volume jobs (e2e)', () => {
           { metric: 'amm_volume', period: '7day' },
           { metric: 'amm_volume', period: 'day' },
           { metric: 'amm_volume', period: 'hour' },
+          { metric: 'nft_volume', period: '30day' },
+          { metric: 'nft_volume', period: '7day' },
+          { metric: 'nft_volume', period: 'day' },
           { metric: 'payment_volume', period: 'day' },
           { metric: 'payment_volume', period: 'hour' },
           { metric: 'trade_volume', period: '30day' },
@@ -1013,6 +1016,9 @@ describe('volume jobs (e2e)', () => {
           'amm_volume/7day',
           'amm_volume/day',
           'amm_volume/hour',
+          'nft_volume/30day',
+          'nft_volume/7day',
+          'nft_volume/day',
           'payment_volume/day',
           'payment_volume/hour',
           'trade_volume/30day',
