@@ -109,8 +109,9 @@ const NFT_KEYS = [
   'last_sale',
 ];
 
-/** The key of a collection in a path, as the first mistake of a request is reported. */
+/** A marker that is none of ours: not even base64url. */
 const BAD_MARKER = '!!!';
+/** The marker of a key, written by hand: its values as JSON, in base64url. */
 const base64 = (values: unknown[]): string => Buffer.from(JSON.stringify(values), 'utf8').toString('base64url');
 
 describe.each(WORLDS)('the NFT collection routes over the recorded $seed ledgers', (world) => {
