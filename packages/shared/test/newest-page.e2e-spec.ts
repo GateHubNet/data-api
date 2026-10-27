@@ -246,49 +246,61 @@ describe('readNewestPage (e2e)', () => {
     expect(serialsOf(down)).toEqual([12, 11, 10, 9, 8, 7, 6, 4]);
   });
 
-  it('reads a granule or so per part for a 200-row page of 120,000 keys', async () => {
-    const { ch, database } = await freshDb();
+  describe('a 200-row page of 120,000 keys of one owner (read_rows over a bulk of five parts)', () => {
     // 120,000 keys of one owner in four parts of 30,000 each, the parts' keys interleaved (as the NFTs of a collection were written
-    // over time); every fourth key given up in a fifth part. Two other owners, one that sorts before it and one after it, have
-    // 240,000 keys each in the same parts: the table is 780,000 rows, and a read that did not use the key would read them all
+    // over time); every fourth key given up in a fifth part, so the owner's range is 150,000 rows. Two other owners, one that
+    // sorts before it and one after it, have 240,000 keys each in the same parts: the table is 780,000 rows, and a read that did
+    // not use the key would read them all.
     const PARTS = 4;
     const PER_PART = 30_000;
     const OTHER_PER_PART = 60_000;
+    const KEYS = PARTS * PER_PART;
     const BEFORE = 'rBeforeTheHolder';
     const AFTER = 'rZAfterTheHolder';
-    /** `per` keys of `owner` as `version`, the serials `number * step + offset + 1`: one part. */
-    const bulk = (
-      owner: string,
-      per: number,
-      step: number,
-      offset: number,
-      held: number,
-      version: number,
-    ): Promise<void> =>
-      ch.command(
-        `INSERT INTO ${Table.AccountNfts}
-         SELECT {owner:String}, {issuer:String}, 7, toUInt32(number * {step:UInt32} + {offset:UInt32} + 1),
-                lpad(hex(toUInt32(number * {step:UInt32} + {offset:UInt32} + 1)), 64, '0'), {held:UInt8}, {version:UInt64}
-           FROM numbers({per:UInt32})`,
-        { owner, issuer: ISSUER, step, offset, held, version, per },
-        { settings: { insert_deduplicate: 0 } },
-      );
-    for (let part = 0; part < PARTS; part++) {
-      await bulk(BEFORE, OTHER_PER_PART, PARTS, part, 1, 1);
-      await bulk(OWNER, PER_PART, PARTS, part, 1, 1);
-      await bulk(AFTER, OTHER_PER_PART, PARTS, part, 1, 1);
-    }
-    // the fourth key of every four given up: the keys 4, 8, ... at a newer version
-    await bulk(OWNER, PER_PART, PARTS, PARTS - 1, 0, 2);
-    const [{ n, parts }] = await ch.query<{ n: string; parts: string }>(
-      `SELECT count() AS n, uniqExact(_part) AS parts FROM ${Table.AccountNfts}`,
-    );
+    const OWNER_ROWS = KEYS + PER_PART;
     const TABLE_ROWS = PARTS * (PER_PART + 2 * OTHER_PER_PART) + PER_PART;
-    // a part for each owner of each of the four ranges, and the one of the given-up keys
-    expect([Number(n), Number(parts)]).toEqual([TABLE_ROWS, PARTS * 3 + 1]);
+    /**
+     * Two granules of each of the five parts of the owner (the one the read starts in and the next), and one more: the measured
+     * read is 81,920 rows. It is less than the 150,000 rows of the owner's range, and than what a read that went on to the end
+     * of the range would read from a marker 10,000 keys in (about 137,000), so only the pages that leave more than this to
+     * read can tell a read that stops after the cap from one that does not.
+     */
+    const READ_BOUND = (PARTS + 1) * 2 * GRANULE + GRANULE;
+
+    let db: { ch: ClickHouseService; database: string };
+
+    beforeAll(async () => {
+      db = await freshDb();
+      const { ch } = db;
+      /** `per` keys of `owner` as `version`, the serials `number * step + offset + 1`: one part. */
+      const bulk = (
+        owner: string,
+        per: number,
+        step: number,
+        offset: number,
+        held: number,
+        version: number,
+      ): Promise<void> =>
+        ch.command(
+          `INSERT INTO ${Table.AccountNfts}
+           SELECT {owner:String}, {issuer:String}, 7, toUInt32(number * {step:UInt32} + {offset:UInt32} + 1),
+                  lpad(hex(toUInt32(number * {step:UInt32} + {offset:UInt32} + 1)), 64, '0'), {held:UInt8}, {version:UInt64}
+             FROM numbers({per:UInt32})`,
+          { owner, issuer: ISSUER, step, offset, held, version, per },
+          { settings: { insert_deduplicate: 0 } },
+        );
+      for (let part = 0; part < PARTS; part++) {
+        await bulk(BEFORE, OTHER_PER_PART, PARTS, part, 1, 1);
+        await bulk(OWNER, PER_PART, PARTS, part, 1, 1);
+        await bulk(AFTER, OTHER_PER_PART, PARTS, part, 1, 1);
+      }
+      // the fourth key of every four given up: the keys 4, 8, ... at a newer version
+      await bulk(OWNER, PER_PART, PARTS, PARTS - 1, 0, 2);
+    }, 300_000);
 
     /** The rows the SELECTs of `run` on `account_nfts` read. */
     async function readsOf(run: () => Promise<unknown>): Promise<number[]> {
+      const { ch, database } = db;
       const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
       await run();
       await ch.command('SYSTEM FLUSH LOGS');
@@ -301,36 +313,55 @@ describe('readNewestPage (e2e)', () => {
       return reads.map((r) => Number(r.read_rows));
     }
 
-    // two granules of each of the five parts at most (the one the read starts in and the next), and a few more for what the
-    // sort of the read asks of its parts: far below the 120,000 keys of the owner and the 780,000 rows of the table
-    const READ_BOUND = (PARTS + 1) * 3 * GRANULE;
-    expect(READ_BOUND).toBeLessThan(TABLE_ROWS / 5);
-    for (const [name, after] of [
-      ['the first page', undefined],
-      ['a page deep in the range', 54_321],
-      ['a page near the end', 119_000],
-    ] as const) {
+    /** The 201 held serials after `after` in the direction of the read (the 200 of the page and the one that says there is more). */
+    function expectedPage(after: number | undefined, descending: boolean): number[] {
+      const serials: number[] = [];
+      for (
+        let serial = descending ? (after ?? KEYS + 1) - 1 : (after ?? 0) + 1;
+        serials.length < 201 && serial >= 1 && serial <= KEYS;
+        serial += descending ? -1 : 1
+      ) {
+        // (every fourth key is given up)
+        if (serial % 4 !== 0) serials.push(serial);
+      }
+      return serials;
+    }
+
+    /** The rows of the owner's range after the marker, in the direction of the read: what a read to the end of it would read. */
+    const restOf = (after: number | undefined, descending: boolean): number =>
+      Math.round(((descending ? (after ?? KEYS + 1) - 1 : KEYS - (after ?? 0)) * OWNER_ROWS) / KEYS);
+
+    const pages = [
+      ['the first page', undefined, false],
+      ['a page deep in the range', 10_000, false],
+      ['a page in the middle of the range', 54_321, false],
+      ['a page near the end', 119_000, false],
+      ['the first page backwards', undefined, true],
+      ['a page deep in the range backwards', 110_000, true],
+      ['a page in the middle of the range backwards', 54_321, true],
+    ] as const;
+
+    it('the seed is as assumed, and the bound is below what a read to the end of the range would read from the deep pages', async () => {
+      const [{ n, parts }] = await db.ch.query<{ n: string; parts: string }>(
+        `SELECT count() AS n, uniqExact(_part) AS parts FROM ${Table.AccountNfts}`,
+      );
+      // a part for each owner of each of the four ranges, and the one of the given-up keys
+      expect([Number(n), Number(parts)]).toEqual([TABLE_ROWS, PARTS * 3 + 1]);
+      expect(READ_BOUND).toBeLessThan(OWNER_ROWS);
+      expect(READ_BOUND).toBeLessThan(TABLE_ROWS / 5);
+      for (const [name, after, descending] of pages.filter(([name]) => !/middle|end/.test(name))) {
+        expect([name, restOf(after, descending) > READ_BOUND]).toEqual([name, true]);
+      }
+    });
+
+    it.each(pages)('%s reads about a granule of each part, and is whole', async (name, after, descending) => {
       let page: Page[] = [];
       const reads = await readsOf(async () => {
-        page = await readNewestPage<Page>(ch, pageOf({ limit: 201, after }));
+        page = await readNewestPage<Page>(db.ch, pageOf({ limit: 201, after, descending }));
       });
-      // the 200 held keys after the marker and the one that tells there is a next page; every fourth key is not held
-      const expected: number[] = [];
-      for (let serial = (after ?? 0) + 1; expected.length < 201 && serial <= 120_000; serial++) {
-        if (serial % 4 !== 0) expected.push(serial);
-      }
-      expect([name, serialsOf(page)]).toEqual([name, expected]);
+      expect([name, serialsOf(page)]).toEqual([name, expectedPage(after, descending)]);
       expect([name, reads.length]).toEqual([name, 1]);
       expect([name, reads[0] <= READ_BOUND ? 'bounded' : reads[0]]).toEqual([name, 'bounded']);
-    }
-    // the same page backwards
-    let down: Page[] = [];
-    const reads = await readsOf(async () => {
-      down = await readNewestPage<Page>(ch, pageOf({ limit: 201, after: 54_321, descending: true }));
     });
-    const expectedDown: number[] = [];
-    for (let serial = 54_320; expectedDown.length < 201; serial--) if (serial % 4 !== 0) expectedDown.push(serial);
-    expect(serialsOf(down)).toEqual(expectedDown);
-    expect([reads.length, reads[0] <= READ_BOUND]).toEqual([1, true]);
   });
 });

@@ -1047,10 +1047,19 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
   const TAXON = 7;
   const [BEFORE, ISSUER, AFTER] = [accountAt(0x41), accountAt(0x42), accountAt(0x43)].sort();
   const [OWNER_BEFORE, OWNER, OWNER_AFTER] = [accountAt(0x51), accountAt(0x52), accountAt(0x53)].sort();
+  /** An account that holds 200 NFTs spread over the whole collection (every 601st serial, so over all four parts). */
+  const SCATTERED = accountAt(0x54);
+  const SCATTERED_SERIALS = Array.from({ length: 200 }, (_, i) => 1 + 601 * i);
   const TEMPLATE = '3'.repeat(64);
   const collection = `/v2/nft_collections/${ISSUER}/${TAXON}`;
-  /** A page touches about a granule of each part that holds the keys it reads, and a few more for what the read of a sorted part asks. */
-  const READ_BOUND = PARTS * 3 * GRANULE;
+  /**
+   * A page of the collection reads two granules of each part at most (the one the read starts in and the next) and one more: the
+   * measured reads are 65,536 rows for the holdings and 32,769 for the NFTs of the page, in a collection of 120,000 NFTs, so a read
+   * that went on to the end of the range, from a page 10,000 NFTs in, would not fit.
+   */
+  const READ_BOUND = PARTS * 2 * GRANULE + GRANULE;
+  /** The NFTs of the collection: what a lookup of NFTs spread over it reads at most (and a granule at each end of each part). */
+  const NFTS_PREFIX = PARTS * NFTS_PER_PART;
   /** The holders of the collection: figures 1 to 7 by the order of the bulk (the owner `rHolder…` of the n-th holds 1 + n % 7). */
   const HOLDERS = PARTS * HOLDERS_PER_PART;
   const holderName = (n: number): string => `rHolder${String(n).padStart(8, '0')}`;
@@ -1108,6 +1117,19 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
     await holdings(OWNER_BEFORE, BEFORE, OTHER_NFTS_PER_PART);
     await holdings(OWNER, ISSUER, NFTS_PER_PART);
     await holdings(OWNER_AFTER, AFTER, OTHER_NFTS_PER_PART);
+    // and an account that holds 200 NFTs of the collection which lie far from one another
+    await h.ch.insert(
+      Table.AccountNfts,
+      SCATTERED_SERIALS.map((serial) => ({
+        ...SAMPLE_ROWS[Table.AccountNfts],
+        owner: SCATTERED,
+        issuer: ISSUER,
+        taxon_key: TAXON,
+        serial,
+        nft_id: serial.toString(16).toUpperCase().padStart(64, '0'),
+        held: 1,
+      })),
+    );
 
     // the holders: 40,000 of the collection, between 80,000 of the collections around it
     await h.ch.insert(Table.NftCollectionHolders, [
@@ -1164,7 +1186,8 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
   it('the seed is as assumed: the NFTs, the holdings and the holders of the collection among those of two others', async () => {
     const lots = PARTS * (NFTS_PER_PART + 2 * OTHER_NFTS_PER_PART) + 1;
     expect(await count(Table.Nfts)).toEqual({ rows: lots, parts: PARTS * 3 + 1 });
-    expect(await count(Table.AccountNfts)).toEqual({ rows: lots, parts: PARTS * 3 + 1 });
+    // (and the 200 holdings of the account whose NFTs are spread over the collection, a part of their own)
+    expect(await count(Table.AccountNfts)).toEqual({ rows: lots + SCATTERED_SERIALS.length, parts: PARTS * 3 + 2 });
     expect(await count(Table.NftCollectionHolders)).toEqual({
       rows: PARTS * (HOLDERS_PER_PART + 2 * OTHER_HOLDERS_PER_PART) + 1,
       parts: PARTS * 3 + 1,
@@ -1183,9 +1206,17 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
   const idOfSerial = (serial: number): string => serial.toString(16).toUpperCase().padStart(64, '0');
   const pages = [
     ['the first page', undefined],
+    ['a page deep in the collection', [10_000, idOfSerial(10_000)]],
     ['a page in the middle of the collection', [60_000, idOfSerial(60_000)]],
     ['a page near the end', [119_000, idOfSerial(119_000)]],
   ] as const;
+
+  it('the first page and the deep one leave more than the bound to read: a read that went on to the end of the range would fail it', () => {
+    for (const [, marker] of [pages[0], pages[1]]) {
+      const rest = NFTS_PREFIX - (marker === undefined ? 0 : marker[0]);
+      expect(rest).toBeGreaterThan(READ_BOUND);
+    }
+  });
 
   describe.each(pages)('the NFTs of the collection: %s', (_name, marker) => {
     const path = `${collection}/nfts?limit=200${marker === undefined ? '' : `&marker=${markerOf([...marker])}`}`;
@@ -1237,6 +1268,28 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
     expect(nfts.reads.length).toBeGreaterThanOrEqual(1);
     for (const read of nfts.reads)
       expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+  });
+
+  it("the NFTs of an account whose holdings are spread over the collection: the lookup reads the collection's nfts at most, not the table", async () => {
+    // 200 NFTs, one in 600 or so, over all four parts: each lies in a granule of its own, so the lookup of the page reads about
+    // every granule of the collection's `nfts` (its 120,000 rows) and no row of the collections around it
+    const path = `${collection}/nfts?limit=200&owner=${SCATTERED}`;
+    const holdings = await served(h, api, Table.AccountNfts, path, 'nfts');
+    expect((holdings.body.nfts as { serial: number }[]).map((n) => n.serial)).toEqual(SCATTERED_SERIALS);
+    expect(holdings.body.marker).toBeUndefined();
+    // (the 200 holdings are one part of the account's own: a granule)
+    for (const read of holdings.reads) expect(read.read_rows).toBeLessThanOrEqual(GRANULE);
+    const nfts = await served(h, api, Table.Nfts, path, 'nfts');
+    expect(nfts.reads.length).toBeGreaterThanOrEqual(1);
+    const bound = NFTS_PREFIX + PARTS * GRANULE;
+    const table = (await count(Table.Nfts)).rows;
+    expect(bound).toBeLessThan(table / 3);
+    for (const read of nfts.reads) {
+      expect([path, read.read_rows <= bound ? 'within the collection' : read.read_rows]).toEqual([
+        path,
+        'within the collection',
+      ]);
+    }
   });
 
   it("the holders of a collection: a page reads the collection's whole holders prefix, and no other collection's, whichever page it is", async () => {
@@ -1298,5 +1351,151 @@ describe("a collection's NFTs and holders read the granules of a page, not the 1
     const year = new Date(Date.now() - 300 * 86_400_000).toISOString().slice(0, 10);
     const ok = await api.get(`${collection}/stats?start=${year}`);
     expect([ok.status, ok.body.days]).toEqual([200, []]);
+  });
+});
+
+describe('the sales of a collection read the granules of a page, not the 400,000 events of the collection (read_rows over a bulk of four parts)', () => {
+  // The sales of a collection are a range of the primary key of `collection_nft_events` (the collection, then its ledgers), read in
+  // the order of the key a page at a time by `readDistinctPage`: the `sale` filter is a condition of the read that is capped. The
+  // collection has 400,000 events, 100,000 in each of the four parts (every fourth a mint, the rest sales), and the collections
+  // around it, one that sorts before and one that sorts after, have 200,000 each in the same parts: a read that did not stop after
+  // the page would read the rest of the range, hundreds of thousands of rows, and one that did not use the key all 1,200,000.
+  const PARTS = BULK_BASES.length;
+  const GRANULE = 8192;
+  const EVENTS_PER_PART = 100_000;
+  const OTHERS_PER_PART = 50_000;
+  const TAXON = 7;
+  const [BEFORE, ISSUER, AFTER] = [accountAt(0x61), accountAt(0x62), accountAt(0x63)].sort();
+  const TEMPLATE = '3'.repeat(64);
+  const collection = `/v2/nft_collections/${ISSUER}/${TAXON}`;
+  /**
+   * Two granules of each part at most (the one the read starts in and the next) and one more: a page starts in one part and goes
+   * on into the next, and the measured read is far below this. The rest of the range after a deep marker is larger than it.
+   */
+  const READ_BOUND = PARTS * 2 * GRANULE + GRANULE;
+  /** A marker 5,000 ledgers (20,000 events) into the second part: the page starts inside the bulk. */
+  const MID_LEDGER = BULK_BASES[1] + 5_000;
+
+  let h: Harness;
+  let api: ApiClient;
+
+  /** The key of a sale, as a marker holds it. */
+  type Sale = [ledger: number, tx: number, event: number];
+  /** The sale after `sale` in the order of the key (three sales a ledger: the transactions 0 to 2, the 3rd is a mint). */
+  const after = ([ledger, tx]: Sale): Sale => (tx < 2 ? [ledger, tx + 1, 0] : [ledger + 1, 0, 0]);
+  const before = ([ledger, tx]: Sale): Sale => (tx > 0 ? [ledger, tx - 1, 0] : [ledger - 1, 2, 0]);
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    // the template of the bulk: a sale of a made-up NFT in a ledger between the mock ledgers
+    await h.ch.insert(Table.CollectionNftEvents, [
+      nftEventRow({
+        nft_id: TEMPLATE,
+        issuer: 'rTemplateIssuer',
+        ledger_index: 20_999_000,
+        tx_index: 1,
+        event: 'sale',
+        amount: '1',
+        amount_f: 1,
+        currency: 'XRP',
+      }),
+    ]);
+    const events = async (issuer: string, perPart: number): Promise<void> =>
+      insertBulk(
+        h,
+        Table.CollectionNftEvents,
+        `SELECT * FROM ${Table.CollectionNftEvents} WHERE nft_id = {template:String} LIMIT 1`,
+        { template: TEMPLATE, issuer },
+        (base) =>
+          `{issuer:String} AS issuer, toUInt32(${TAXON}) AS taxon_key, ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index, if(${BULK_TX_INDEX} = 3, 'mint', 'sale') AS event`,
+        perPart,
+      );
+    await events(BEFORE, OTHERS_PER_PART);
+    await events(ISSUER, EVENTS_PER_PART);
+    await events(AFTER, OTHERS_PER_PART);
+    // the collection has a row: its routes are served
+    await h.ch.insert(Table.NftCollections, [
+      { ...SAMPLE_ROWS[Table.NftCollections], issuer: ISSUER, taxon_key: TAXON, taxon: TAXON },
+    ]);
+  }, 900_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the seed is as assumed: 400,000 events of the collection in four parts, 300,000 of them sales, among 1,200,001 rows', async () => {
+    const [mine] = await h.ch.query<{ n: string; sales: string; parts: string }>(
+      `SELECT count() AS n, countIf(event = 'sale') AS sales, uniqExact(_part) AS parts FROM ${Table.CollectionNftEvents}
+        WHERE issuer = {issuer:String} AND taxon_key = {taxon:UInt32}`,
+      { issuer: ISSUER, taxon: TAXON },
+    );
+    expect([Number(mine.n), Number(mine.sales), Number(mine.parts)]).toEqual([
+      PARTS * EVENTS_PER_PART,
+      PARTS * EVENTS_PER_PART * 0.75,
+      PARTS,
+    ]);
+    const [all] = await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${Table.CollectionNftEvents}`);
+    expect(Number(all.n)).toBe(PARTS * (EVENTS_PER_PART + 2 * OTHERS_PER_PART) + 1);
+    // the bound is far below the collection, and what is left of the range after the deep marker is more than the bound
+    expect(READ_BOUND).toBeLessThan((PARTS * EVENTS_PER_PART) / 4);
+    expect((BULK_BASES[1] + 25_000 - MID_LEDGER) * 4 + 2 * EVENTS_PER_PART).toBeGreaterThan(READ_BOUND);
+    expect((MID_LEDGER - BULK_BASES[1]) * 4 + EVENTS_PER_PART).toBeGreaterThan(READ_BOUND);
+  });
+
+  describe.each([false, true])('descending=%s', (descending) => {
+    const direction = `descending=${descending}`;
+    const pageOf = (limit: number, marker?: Sale): string =>
+      `${collection}/sales?limit=${limit}&${direction}${marker === undefined ? '' : `&marker=${markerOf(marker)}`}`;
+    /** The 201 sales (the page and the one that says there is more) after the marker in the direction of the read. */
+    const wantKeys = (marker: Sale | undefined): Sale[] => {
+      const step = descending ? before : after;
+      const keys: Sale[] = [];
+      let next: Sale =
+        marker === undefined ? (descending ? [BULK_BASES[3] + 24_999, 2, 0] : [BULK_BASES[0], 0, 0]) : step(marker);
+      while (keys.length < 200) {
+        keys.push(next);
+        next = step(next);
+      }
+      return keys;
+    };
+
+    it.each([
+      ['the first page', undefined],
+      ['a page that starts inside the bulk', [MID_LEDGER, 1, 0]],
+      ['a page near the start of the range', [BULK_BASES[0] + 100, 2, 0]],
+    ] as const)('a page of 200 sales (%s) reads about a granule of each part, and is whole', async (_name, marker) => {
+      const path = pageOf(200, marker as Sale | undefined);
+      const { reads, body } = await served(h, api, Table.CollectionNftEvents, path, 'sales');
+      expect(reads.length).toBeGreaterThanOrEqual(1);
+      for (const read of reads) {
+        expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      }
+      const sales = body.sales as { ledger_index: number; tx_index: number; event_index: number }[];
+      expect([path, sales.map((s) => [s.ledger_index, s.tx_index, s.event_index])]).toEqual([
+        path,
+        wantKeys(marker as Sale | undefined),
+      ]);
+      expect(body.marker).toBe(markerOf(wantKeys(marker as Sale | undefined)[199]));
+    });
+
+    it('the page read is read in the order of the key, stops after its rows, and holds the filter inside', async () => {
+      const path = pageOf(200, [MID_LEDGER, 1, 0]);
+      const { statements } = await served(h, api, Table.CollectionNftEvents, path, 'sales');
+      const page = statements.filter(([sql]) => isPageRead(sql));
+      expect(page).toHaveLength(1);
+      const [sql, params] = page[0];
+      await expectBoundedInOrderRead(h, sql, params, descending, path);
+      // the kind of event is a condition of the inner read, which the cap counts: never a step after the page
+      expect(innerRead(sql)).toContain("event = 'sale'");
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      // the primary key narrows the read to the collection, from the marker on: the granules of the collection (and one at each end
+      // of each part) out of those of the table, not the collections around it. The read itself stops after the cap
+      const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
+      expect(primary.keys).toEqual(['issuer', 'taxon_key', 'ledger_index']);
+      expect(primary.condition).toContain(`issuer in ['${ISSUER}'`);
+      expect(primary.granules[0]).toBeLessThanOrEqual(Math.ceil((PARTS * EVENTS_PER_PART) / GRANULE) + 2 * PARTS);
+      expect(primary.granules[0]).toBeLessThan(primary.granules[1] * 0.6);
+    });
   });
 });

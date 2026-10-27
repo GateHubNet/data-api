@@ -134,7 +134,13 @@ const COLLECTION_SQL = `SELECT ${COLLECTION_COLUMNS}
  ORDER BY version DESC
  LIMIT 1`;
 
-/** The newest `nfts` row of some NFTs of a collection, by the whole key of each: what a page of holdings is made into NFTs with. */
+/**
+ * The newest `nfts` row of some NFTs of a collection, by the whole key of each: what a page of holdings is made into NFTs with.
+ * The read costs about a granule of `nfts` for each NFT of the page that lies in a granule of its own, so up to the granules of
+ * the collection's whole `nfts` prefix for an account that holds NFTs spread over the collection (200 of 120,000: about all of
+ * them), and about one granule per part for holdings that lie together. The bound is the collection's NFTs and not the table;
+ * `paged-reads.e2e-spec.ts` pins both cases.
+ */
 const NFTS_OF_SQL = `SELECT ${NFT_COLUMNS}
   FROM ${Table.Nfts}
  WHERE issuer = {issuer:String} AND taxon_key = {taxon_key:UInt32}
@@ -320,13 +326,13 @@ export class NftCollectionsService {
       (a.value < b.value ? -direction : a.value > b.value ? direction : 0) ||
       (a.issuer < b.issuer ? -1 : a.issuer > b.issuer ? 1 : 0) ||
       a.taxon - b.taxon;
-    // (a copy: the rows of the cache are shared by the requests)
-    const sorted = [...listed].sort(compare);
+    // (`stored` may be the rows of the cache, which the requests share: it is not changed, `listed` is this request's own array)
+    listed.sort(compare);
     const marker =
       after === undefined
         ? undefined
         : { value: after[0] as number, issuer: after[1] as string, taxon: after[2] as number };
-    const rest = marker === undefined ? sorted : sorted.filter((l) => compare(l, marker) > 0);
+    const rest = marker === undefined ? listed : listed.filter((l) => compare(l, marker) > 0);
 
     // one more than the page: it only tells whether there is a next page
     const page = paginate(rest.slice(0, q.limit + 1), q.limit, (l) => [l.value, l.issuer, l.taxon]);

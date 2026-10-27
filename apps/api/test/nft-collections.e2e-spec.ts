@@ -776,15 +776,22 @@ describe.each(WORLDS)('the NFT collection routes over the recorded $seed ledgers
       expect((await get(pathOf(WRITTEN_TWICE, '/sales'))).body.sales).toEqual(want);
       await expectWalk(pathOf(WRITTEN_TWICE, '/sales'), 'sales', want, [1, 2]);
       await expectWalk(`${pathOf(WRITTEN_TWICE, '/sales')}?descending=true`, 'sales', [...want].reverse(), [1, 2]);
-      // and neither the stats nor the collection count them twice
-      expect(objectOf(WRITTEN_TWICE)).toMatchObject({ sales_count: 3, volume_native: '253.5' });
-      const list = (await get('/v2/nft_collections?limit=1000')).body.collections as Obj[];
-      expect(
-        list.find((c) => c.issuer === WRITTEN_TWICE.issuer && (c.taxon ?? 0) === (xrpl ? WRITTEN_TWICE.taxon_key : 0)),
-      ).toMatchObject({
+      // and neither the stats nor the collection count them twice: its mint and its three sales are written twice, in the tables
+      // the stats read, and the days (and what the collection says of itself) count each once
+      const days = (await get(`${pathOf(WRITTEN_TWICE, '/stats')}?${WINDOW}`)).body.days as Obj[];
+      expect(days).toEqual(daysOf(factsOf(WRITTEN_TWICE).events, rates));
+      expect(days.reduce((n, d) => n + (d.sales_count as number), 0)).toBe(3);
+      expect(days.reduce((n, d) => n + (d.mints as number), 0)).toBe(1);
+      expect(days.reduce((v, d) => v.plus(d.volume_native as string), new BigNumber(0)).toFixed()).toBe('253.5');
+      expect((await get(pathOf(WRITTEN_TWICE))).body.collection).toMatchObject({
+        minted: 1,
         sales_count: 3,
         volume_native: '253.5',
       });
+      const list = (await get('/v2/nft_collections?limit=1000')).body.collections as Obj[];
+      expect(
+        list.find((c) => c.issuer === WRITTEN_TWICE.issuer && (c.taxon ?? 0) === (xrpl ? WRITTEN_TWICE.taxon_key : 0)),
+      ).toMatchObject({ minted: 1, sales_count: 3, volume_native: '253.5' });
     });
 
     it('start and end are dates: the sales of the ledgers that closed in the window, the second each names included', async () => {
