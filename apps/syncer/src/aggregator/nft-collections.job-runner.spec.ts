@@ -124,7 +124,9 @@ describe('AggregatorService nft_collections job', () => {
     rebuild: async (_c, nfts) => ({ written: nfts.length, removed: 0, collections: rebuilt }),
     oldestDirty: async () => undefined,
     dirtyLedgers: async () => 0,
-    head: async () => 0,
+    // a database with ledgers, the cursor within a window of the head: it is placed where the watermark is
+    head: async () => 1000,
+    firstLedger: async () => 1,
   });
 
   function service(options: AggregatorOptions = {}): AggregatorService {

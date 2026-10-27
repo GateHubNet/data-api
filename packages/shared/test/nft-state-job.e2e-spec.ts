@@ -11,6 +11,7 @@ import {
   nftsChangedSince,
   nftsInLedgers,
   nftStateWatermark,
+  nftTouchLedgers,
   oldestNftDirty,
   rebuildNfts,
 } from '../src/aggregate/nft-state.job';
@@ -969,6 +970,28 @@ describe('the nft_state job (e2e)', () => {
       // nothing for a range that ends before it starts
       expect(await nftsInLedgers(ch, 200, 100)).toEqual([]);
     });
+    it('nftTouchLedgers gives the first and the last touch of each NFT asked for in the range, and nothing for one without a touch there', async () => {
+      const ch = await fresh();
+      const [a, b, c, d] = [80, 81, 82, 83].map(idOf);
+      await insertEvents(ch, [
+        mint(a, 100, ALICE),
+        sale(a, 150, ALICE, BOB),
+        sale(a, 300, BOB, CAROL),
+        mint(b, 120, ALICE, { tx_index: 1 }),
+        mint(c, 500, ALICE),
+        mint(d, 130, ALICE, { tx_index: 2 }),
+      ]);
+      const of = async (ids: string[], from: number, to: number) =>
+        Object.fromEntries(await nftTouchLedgers(ch, ids, from, to));
+      // `d` has a touch in the range but is not asked for; `c` is asked for and has none there
+      expect(await of([a, b, c], 100, 200)).toEqual({ [a]: { from: 100, to: 150 }, [b]: { from: 120, to: 120 } });
+      expect(await of([a], 1, 1000)).toEqual({ [a]: { from: 100, to: 300 } });
+      // both ends inclusive
+      expect(await of([a], 150, 300)).toEqual({ [a]: { from: 150, to: 300 } });
+      expect(await of([c], 100, 499)).toEqual({});
+      expect(await of([], 1, 1000)).toEqual({});
+      expect(await of([a], 200, 100)).toEqual({});
+    });
   });
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -1050,6 +1073,46 @@ describe('the nft_state job (e2e)', () => {
       await narrowNftDirty(ch, (await oldestNftDirty(ch)) as NftDirtyRange, 200);
       expect(await oldestNftDirty(ch)).toEqual({ from: 300, to: 399, created: 1_700_000_001_000 });
       expect(await nftDirtyLedgers(ch)).toBe(100);
+    });
+
+    it('oldestNftDirty leaves out the ranges it is told to skip, by both ends, and gives the oldest of the others', async () => {
+      const ch = await fresh();
+      await mark(ch, 100, 199, 1_700_000_001);
+      await mark(ch, 300, 399, 1_700_000_002);
+      await mark(ch, 500, 599, 1_700_000_003);
+      expect(await oldestNftDirty(ch, [])).toEqual({ from: 100, to: 199, created: 1_700_000_001_000 });
+      expect(await oldestNftDirty(ch, [{ from: 100, to: 199 }])).toEqual({
+        from: 300,
+        to: 399,
+        created: 1_700_000_002_000,
+      });
+      expect(
+        await oldestNftDirty(ch, [
+          { from: 300, to: 399 },
+          { from: 100, to: 199 },
+        ]),
+      ).toEqual({ from: 500, to: 599, created: 1_700_000_003_000 });
+      // a range that shares one end only with a skipped one is not skipped
+      expect(
+        await oldestNftDirty(ch, [
+          { from: 100, to: 599 },
+          { from: 0, to: 199 },
+        ]),
+      ).toEqual({ from: 100, to: 199, created: 1_700_000_001_000 });
+      expect(
+        await oldestNftDirty(ch, [
+          { from: 100, to: 199 },
+          { from: 300, to: 399 },
+          { from: 500, to: 599 },
+        ]),
+      ).toBeUndefined();
+      // a range marked again after it was skipped is still skipped (by its ends, whatever its mark)
+      await mark(ch, 100, 199, 1_700_000_009);
+      expect(await oldestNftDirty(ch, [{ from: 100, to: 199 }])).toEqual({
+        from: 300,
+        to: 399,
+        created: 1_700_000_002_000,
+      });
     });
 
     it('a crash between the narrowed row and the delete leaves both, which is worked on twice and nothing more', async () => {

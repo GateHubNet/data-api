@@ -5,6 +5,7 @@ import {
   CollectionKey,
   collectionsBehind,
   DailyRates,
+  firstCommittedLedger,
   FixtureLedgerSource,
   getNetworkProfile,
   LedgerWriter,
@@ -163,8 +164,9 @@ describe('AggregatorService NFT jobs (e2e)', () => {
   }
 
   /**
-   * Ticks until the lag of the live cursor is 0, and says how many it took: the first tick starts the read of the cursor and does
-   * not wait for it (a query may take as long as the tick), so the live part begins at the next.
+   * Ticks until the lag of the live cursor is 0 and no dirty range is left, and says how many it took: the first tick starts the
+   * read of the cursor and does not wait for it (a query may take as long as the tick), so the live part begins at the next, and
+   * a cursor placed far behind the head leaves the ledgers after it to the dirty ranges.
    */
   async function catchUp(
     { svc, metrics }: { svc: AggregatorService; metrics: FakeMetrics },
@@ -174,7 +176,10 @@ describe('AggregatorService NFT jobs (e2e)', () => {
     do {
       await svc.tick(NOW);
       ticks++;
-    } while (valuesOf(metrics.nftStateLagLedgers).at(-1) !== 0 && ticks < most);
+    } while (
+      (valuesOf(metrics.nftStateLagLedgers).at(-1) !== 0 || valuesOf(metrics.nftDirtyLedgers).at(-1) !== 0) &&
+      ticks < most
+    );
     return ticks;
   }
 
@@ -244,11 +249,10 @@ describe('AggregatorService NFT jobs (e2e)', () => {
 
     expect(await count(ch, Table.Nfts)).toBe(0);
     const { svc, metrics, errors } = aggregator(ch);
-    // the first tick starts the read of the cursor, and everything is behind it until it is known
-    await svc.tick(NOW);
-    expect(valuesOf(metrics.nftStateLagLedgers)[0]).toBeGreaterThan(0);
+    // the first tick starts the read of the cursor; the lag is not reported until the cursor is placed, and never the whole head
     await catchUp({ svc, metrics });
     expect(valuesOf(metrics.nftStateLagLedgers).at(-1)).toBe(0);
+    for (const lag of valuesOf(metrics.nftStateLagLedgers)) expect(lag).toBeLessThan(NFT_LIVE_STEP_LEDGERS);
     expect(errors).not.toHaveBeenCalled();
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_state' });
@@ -279,31 +283,105 @@ describe('AggregatorService NFT jobs (e2e)', () => {
     expect(restarted.errors).not.toHaveBeenCalled();
   });
 
-  it('crosses a long stretch of ledgers with nothing in it one window at a time', async () => {
-    const ch = await fresh();
-    // the newest committed ledger is far past the recorded ones: the cursor has 40,000 ledgers to go over after them
-    const head = LAST_LEDGER + 4 * NFT_LIVE_STEP_LEDGERS + 123;
-    await ch.insert(Table.Ledgers, [{ ledger_index: head, ledger_hash: 'F'.repeat(64), close_time: NEWEST_CLOSE + 1 }]);
+  /** Ticks (at most `most`) until `done` says so. */
+  async function tickUntil(svc: AggregatorService, done: () => boolean, most = 20): Promise<void> {
+    for (let ticks = 0; ticks < most && !done(); ticks++) {
+      await svc.tick(NOW);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(done()).toBe(true);
+  }
 
+  it('a fresh database: the first window starts at the ledger before the first one stored, and a long stretch with nothing in it is crossed one window at a time', async () => {
+    const ch = await fresh(false);
     const reads: Array<[number, number | undefined]> = [];
+    const firstAsked = jest.fn(firstCommittedLedger);
     const { svc, metrics, errors } = aggregator(ch, {
       nftStateFunctions: {
         changedSince: async (db, ledger, limit, to) => {
           reads.push([ledger, to]);
           return nftsChangedSince(db, ledger, limit, to);
         },
+        firstLedger: firstAsked,
       },
     });
+    // the cursor is read from a database with no ledger (0), and the job then waits for the first ledger
+    await tickUntil(svc, () => firstAsked.mock.calls.length > 0);
+    expect(reads).toEqual([]);
+    for (const lag of valuesOf(metrics.nftStateLagLedgers)) expect(lag).toBe(0);
+
+    // the ledgers come, and the newest committed ledger is far past the recorded ones: 40,000 ledgers to go over after them
+    await new LedgerWriter(ch, ctx).write(LEDGERS);
+    const head = LAST_LEDGER + 4 * NFT_LIVE_STEP_LEDGERS + 123;
+    await ch.insert(Table.Ledgers, [{ ledger_index: head, ledger_hash: 'F'.repeat(64), close_time: NEWEST_CLOSE + 1 }]);
     expect(await catchUp({ svc, metrics })).toBeLessThanOrEqual(3);
     expect(valuesOf(metrics.nftStateLagLedgers).at(-1)).toBe(0);
     expect(errors).not.toHaveBeenCalled();
 
-    // from the ledger before the oldest NFT, a window of NFT_LIVE_STEP_LEDGERS at a time, up to the head
+    // from the ledger before the oldest stored ledger (not from 0), a window of NFT_LIVE_STEP_LEDGERS at a time, up to the head
     expect(reads.map(([ledger]) => ledger)).toEqual(
       [0, 1, 2, 3, 4, 5].map((window) => FIRST_LEDGER - 1 + window * NFT_LIVE_STEP_LEDGERS),
     );
     for (const [ledger, to] of reads) expect(to).toBe(ledger + NFT_LIVE_STEP_LEDGERS);
+    // the lag was never the whole head
+    for (const lag of valuesOf(metrics.nftStateLagLedgers)) expect(lag).toBeLessThan(head - FIRST_LEDGER + 1);
     expect((await nftsOf(ch)).map((n) => n.nft_id).sort()).toEqual(NFT_IDS);
+    expect(await dirtyRanges(ch)).toEqual([]);
+  });
+
+  it('a restart over NFTs that a backfill wrote and that have no row yet: the live cursor starts near the head, and the stretch is left to nft_dirty', async () => {
+    const ch = await fresh(false);
+    // the live sync is at `head`, and the job has caught up with it
+    const head = LAST_LEDGER + 4 * NFT_LIVE_STEP_LEDGERS + 123;
+    await ch.insert(Table.Ledgers, [{ ledger_index: head, ledger_hash: 'F'.repeat(64), close_time: NEWEST_CLOSE + 1 }]);
+    const first = aggregator(ch);
+    await catchUp(first);
+    expect(await count(ch, Table.Nfts)).toBe(0);
+
+    // a backfill writes the recorded ledgers below the cursor: their NFTs have no row yet, so they are stale (not yet marked)
+    await new LedgerWriter(ch, ctx).write(LEDGERS);
+    expect(await nftDirtyLedgers(ch)).toBe(0);
+
+    // a restart: the oldest stale touch is far below the head
+    const reads: number[] = [];
+    const marks: Array<[number, number]> = [];
+    const restarted = aggregator(ch, {
+      nftStateFunctions: {
+        changedSince: async (db, ledger, limit, to) => {
+          reads.push(ledger);
+          return nftsChangedSince(db, ledger, limit, to);
+        },
+        markDirty: async (db, from, to) => {
+          marks.push([from, to]);
+          return markNftDirty(db, from, to);
+        },
+      },
+    });
+    await tickUntil(restarted.svc, () => reads.length > 0);
+    // (watermark, head] is marked before the live cursor is set, and the live part starts at the head: it does not cross the backfill
+    expect(marks).toEqual([[FIRST_LEDGER, head]]);
+    expect(reads.every((ledger) => ledger >= head)).toBe(true);
+    // the lag is that of the live cursor, never the whole head nor the backfill
+    for (const lag of valuesOf(restarted.metrics.nftStateLagLedgers)) expect(lag).toBeLessThan(NFT_LIVE_STEP_LEDGERS);
+
+    // the dirty sweep carries the backlog: every recorded NFT is built, and nft_dirty empties
+    await catchUp(restarted, 10);
+    expect(restarted.errors).not.toHaveBeenCalled();
+    expect(await dirtyRanges(ch)).toEqual([]);
+    expect(valuesOf(restarted.metrics.nftDirtyLedgers).at(-1)).toBe(0);
+    expect((await nftsOf(ch)).map((n) => n.nft_id).sort()).toEqual(NFT_IDS);
+    expect(reads.every((ledger) => ledger >= head)).toBe(true);
+    // and a restart after that finds nothing behind the head: nothing is marked again
+    const again = aggregator(ch, {
+      nftStateFunctions: {
+        markDirty: async (db, from, to) => {
+          marks.push([from, to]);
+          return markNftDirty(db, from, to);
+        },
+      },
+    });
+    await catchUp(again);
+    expect(marks).toEqual([[FIRST_LEDGER, head]]);
   });
 
   describe('the nft_collections job', () => {

@@ -19,8 +19,11 @@ import { foldNftEvents, NftEventRead, NftFold } from './nft-state';
  *    touches of its range name only, a lookup of the key of `nfts` (`issuer, taxon_key, serial, nft_id`, which the touches
  *    carry for this); only the watermark, once at the start, reads the whole table.
  *  - **Idempotent, versioned.** An NFT's rows are a function of its events. A batch is written under one version: the
- *    ClickHouse clock in milliseconds, but above the newest version of every key the batch rewrites, so the newest row of a key
- *    is the newest write even when the clock steps back. Readers keep the newest version of a key (`LIMIT 1 BY`, no `FINAL`).
+ *    ClickHouse clock in milliseconds, but above the newest version of the `nfts` row of each NFT of the batch, and, for an NFT
+ *    with no event left, of the `account_nfts` rows it sets to `held = 0`, so that those keys keep the newest write as their
+ *    newest row even when the clock steps back. The `account_nfts` rows of an NFT that has events are not read (by `nft_id`
+ *    that is a read of the whole table): they are lifted only through the version of the NFT's `nfts` row, under which the
+ *    batch that rebuilt it last wrote them as well. Readers keep the newest version of a key (`LIMIT 1 BY`, no `FINAL`).
  *    The `account_nfts` rows go first and the `nfts` rows last, as the `ledgers` row is the commit marker of a ledger: an NFT
  *    whose `nfts` row says it has seen a ledger has its holdings written for it.
  *  - **An NFT with no event left is removed**: a re-ingest dropped its events. Its `nfts` rows are deleted (a lightweight
@@ -255,6 +258,28 @@ export async function nftsInLedgers(ch: ClickHouseService, from: number, to: num
   const found = new Map<string, NftKey>();
   for (const row of [...touched, ...seen]) found.set(row.nft_id, keyOf(row));
   return [...found.values()].sort(compareKeys);
+}
+
+/**
+ * The first and the last ledger of `[from, to]` (both inclusive) at which each of some NFTs (`nftIds`) has a touch: one read
+ * of a range of the primary key of the touches. An NFT with no touch there is not in the answer. The job marks these ledgers
+ * dirty again for an NFT of a dirty step that failed on its own, instead of the whole step.
+ */
+export async function nftTouchLedgers(
+  ch: ClickHouseService,
+  nftIds: readonly string[],
+  from: number,
+  to: number,
+): Promise<Map<string, { from: number; to: number }>> {
+  if (nftIds.length === 0 || to < from) return new Map();
+  const rows = await ch.query<{ nft_id: string; first_touch: Counted; last_touch: Counted }>(
+    `SELECT nft_id, min(ledger_index) AS first_touch, max(ledger_index) AS last_touch
+       FROM ${Table.NftTouches}
+      WHERE ledger_index BETWEEN {from:UInt32} AND {to:UInt32} AND nft_id IN {ids:Array(String)}
+      GROUP BY nft_id`,
+    { from, to, ids: [...nftIds] },
+  );
+  return new Map(rows.map((r) => [r.nft_id, { from: Number(r.first_touch), to: Number(r.last_touch) }]));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -505,15 +530,25 @@ const NEWEST_MARKS = `SELECT from_ledger, to_ledger, created_at
              ORDER BY from_ledger ASC, to_ledger ASC, created_at DESC
              LIMIT 1 BY from_ledger, to_ledger`;
 
-/** The range to work on first: the one marked longest ago (ties by range), `undefined` when there is none. */
-export async function oldestNftDirty(ch: ClickHouseService): Promise<NftDirtyRange | undefined> {
+/**
+ * The range to work on first: the one marked longest ago (ties by range), `undefined` when there is none. The ranges of `skip`
+ * (by `from` and `to`, whatever their mark) are left out: the job's ranges that wait before they are tried again, so that the
+ * ranges marked after them are not held behind them.
+ */
+export async function oldestNftDirty(
+  ch: ClickHouseService,
+  skip: ReadonlyArray<Pick<NftDirtyRange, 'from' | 'to'>> = [],
+): Promise<NftDirtyRange | undefined> {
+  const skipped = skip.length > 0 ? 'WHERE (from_ledger, to_ledger) NOT IN {skip:Array(Tuple(UInt32, UInt32))}' : '';
   const row = await ch.queryOne<{ from_ledger: Counted; to_ledger: Counted; created_ms: Counted }>(
     `SELECT from_ledger, to_ledger, toUnixTimestamp64Milli(created_at) AS created_ms
        FROM (
             ${NEWEST_MARKS}
             )
+      ${skipped}
       ORDER BY created_at ASC, from_ledger ASC, to_ledger ASC
       LIMIT 1`,
+    skip.length > 0 ? { skip: skip.map((r) => new TupleParam([r.from, r.to])) } : {},
   );
   return row === undefined
     ? undefined

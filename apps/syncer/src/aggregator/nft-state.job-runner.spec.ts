@@ -70,6 +70,7 @@ describe('AggregatorService nft_state job', () => {
   let watermark: jest.Mock;
   let changedSince: jest.Mock;
   let inLedgers: jest.Mock;
+  let touchLedgers: jest.Mock;
   let rebuild: jest.Mock;
   let markDirty: jest.Mock;
   let oldestDirty: jest.Mock;
@@ -77,11 +78,14 @@ describe('AggregatorService nft_state job', () => {
   let deleteDirty: jest.Mock;
   let dirtyLedgers: jest.Mock;
   let head: jest.Mock;
+  let firstLedger: jest.Mock;
   let ledgersClosedIn: jest.Mock;
   /** What `nftsChangedSince` answers for the ledger it is asked from (nothing, and the same ledger, for any other). */
   let pages: Map<number, { nfts: NftKey[]; upTo: number }>;
   /** The newest committed ledger. */
   let committed: number;
+  /** The oldest committed ledger (none in a database with no ledger). */
+  let oldest: number | undefined;
   /** The `nft_dirty` table: the newest mark of each range. */
   let dirty: NftDirtyRange[];
   /** The NFTs with a touch in a ledger, for `nftsInLedgers`. */
@@ -135,6 +139,7 @@ describe('AggregatorService nft_state job', () => {
     events = [];
     pages = new Map();
     committed = 1000;
+    oldest = 100;
     dirty = [];
     touched = new Map();
     sliceLedgers = new Map();
@@ -159,6 +164,19 @@ describe('AggregatorService nft_state job', () => {
       }
       return [...found.values()].sort((a, b) => a.serial - b.serial);
     });
+    touchLedgers = jest.fn(async (_ch: unknown, ids: string[], from: number, to: number) => {
+      events.push(`touches ${from}-${to}`);
+      const found = new Map<string, { from: number; to: number }>();
+      for (const [ledger, list] of [...touched].sort(([a], [b]) => a - b)) {
+        if (ledger < from || ledger > to) continue;
+        for (const k of list) {
+          if (!ids.includes(k.nft_id)) continue;
+          const seen = found.get(k.nft_id);
+          found.set(k.nft_id, { from: seen?.from ?? ledger, to: ledger });
+        }
+      }
+      return found;
+    });
     rebuild = jest.fn(async (_ch: unknown, nfts: NftKey[]) => {
       events.push(`rebuild ${serials(nfts).join(',')}`);
       jest.setSystemTime(Date.now() + Math.max(rebuildMs, minMs));
@@ -172,7 +190,10 @@ describe('AggregatorService nft_state job', () => {
       const row = mark(from, to, Date.now());
       dirty = [...dirty.filter((r) => !sameKey(r, row)), row];
     });
-    oldestDirty = jest.fn(async () => queue()[0]);
+    // the oldest range that is not one of `skip` (the ranges the job leaves to wait)
+    oldestDirty = jest.fn(async (_ch: unknown, skip: Array<{ from: number; to: number }> = []) =>
+      queue().find((r) => !skip.some((s) => s.from === r.from && s.to === r.to)),
+    );
     deleteDirty = jest.fn(async (_ch: unknown, range: NftDirtyRange) => {
       events.push(`delete ${range.from}-${range.to}`);
       dirty = dirty.filter((r) => !(sameKey(r, range) && r.created <= range.created));
@@ -187,6 +208,7 @@ describe('AggregatorService nft_state job', () => {
     });
     dirtyLedgers = jest.fn(async () => dirty.reduce((sum, r) => sum + r.to - r.from + 1, 0));
     head = jest.fn(async () => committed);
+    firstLedger = jest.fn(async () => (committed === 0 ? undefined : oldest));
     ledgersClosedIn = jest.fn(async (from: Date) => sliceLedgers.get(iso(from.getTime() / 1000)) ?? null);
     // the stats are up to date: the live window is the last slice only
     ch.watermark = unix('2026-10-16T12:00:00Z');
@@ -204,6 +226,7 @@ describe('AggregatorService nft_state job', () => {
     watermark,
     changedSince,
     inLedgers,
+    touchLedgers,
     rebuild,
     markDirty,
     oldestDirty,
@@ -211,6 +234,7 @@ describe('AggregatorService nft_state job', () => {
     deleteDirty,
     dirtyLedgers,
     head,
+    firstLedger,
   });
 
   function service(options: AggregatorOptions = {}): AggregatorService {
@@ -344,6 +368,147 @@ describe('AggregatorService nft_state job', () => {
       expect(rebuilt()).toEqual([[1]]);
     });
 
+    describe('placing the cursor at a start', () => {
+      it('a fresh database: a cursor read before any ledger is placed at the ledger before the first one stored, not at 0', async () => {
+        committed = 0;
+        watermark.mockResolvedValue(0); // what nftStateWatermark answers for a database with no ledger
+        const svc = service();
+        await svc.tick();
+
+        // the first ledgers are committed (the live sync starts at the network's ledger of the day)
+        oldest = 107_930_960;
+        committed = 107_930_975;
+        pages.set(107_930_959, { nfts: [nft(1)], upTo: 107_930_975 });
+        await tickAt(svc, 1);
+        // no window was read while no ledger was stored, and the first one starts at the ledger before the first one stored
+        expect(changedSince.mock.calls.map(([, ledger, , to]) => [ledger, to])).toEqual([
+          [107_930_959, 107_930_959 + NFT_LIVE_STEP_LEDGERS],
+          [107_930_975, 107_930_975 + NFT_LIVE_STEP_LEDGERS],
+        ]);
+        expect(rebuilt()).toEqual([[1]]);
+        // no ledger, no lag; and never the whole head after the first ledgers
+        expect(metrics.nftStateLagLedgers.set.mock.calls).toEqual([[0], [0]]);
+        expect(watermark).toHaveBeenCalledTimes(1);
+        expect(markDirty).not.toHaveBeenCalled();
+        // asked for at each run until a ledger is stored, and not after the cursor is placed
+        await tickAt(svc, 2);
+        expect(firstLedger).toHaveBeenCalledTimes(2);
+      });
+
+      it('after the first ledgers of a fresh database, a run with no budget left to place the cursor reports no lag, not the whole head', async () => {
+        committed = 0;
+        watermark.mockResolvedValue(0);
+        const svc = service({ budgetsMs: { nft_state: 0 } });
+        await svc.tick();
+        oldest = 107_930_960;
+        committed = 107_930_975;
+        await tickAt(svc, 1);
+        expect(firstLedger).not.toHaveBeenCalled();
+        // 0 while no ledger was stored, and nothing once there were ledgers and the cursor was not placed at them
+        expect(metrics.nftStateLagLedgers.set.mock.calls).toEqual([[0]]);
+      });
+
+      it('a watermark read just before the first ledgers came (0) marks nothing below the first one stored: the cursor starts at the ledger before it', async () => {
+        watermark.mockResolvedValue(0);
+        // the head, read after the watermark, finds the ledgers of the first minutes of a live sync
+        oldest = 107_930_960;
+        committed = 107_930_975;
+        pages.set(107_930_959, { nfts: [nft(1)], upTo: 107_930_975 });
+        await service().tick();
+        expect(markDirty).not.toHaveBeenCalled();
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([107_930_959, 107_930_975]);
+        expect(rebuilt()).toEqual([[1]]);
+      });
+
+      it('a database with ledgers is not asked for its first one: the watermark is at or above the ledger before it', async () => {
+        await service().tick();
+        expect(firstLedger).not.toHaveBeenCalled();
+        expect(changedSince.mock.calls[0][1]).toBe(START_LEDGER);
+      });
+
+      it('a restart while a re-ingest is digested: a watermark more than NFT_LIVE_STEP_LEDGERS behind the head leaves the ledgers after it to nft_dirty, and the live cursor starts at the head', async () => {
+        // the re-ingested NFTs that have no row yet are stale: the watermark is the ledger before the oldest of them
+        watermark.mockResolvedValue(500);
+        committed = 60_000;
+        touched.set(600, [nft(1)]);
+        touched.set(12_000, [nft(2)]);
+        pages.set(500, { nfts: [nft(1)], upTo: 10_500 }); // what the live part would have started with
+        const svc = service();
+        await svc.tick();
+        // the stretch is marked before the cursor is set, and the live part starts at the head
+        expect(events.filter((e) => !e.startsWith('stats'))).toEqual([
+          'mark 501-60000',
+          'changed 60000',
+          // the dirty part works the backlog, a step at a time
+          'in 501-10500',
+          'rebuild 1',
+          'narrow 10501-60000',
+          'in 10501-20500',
+          'rebuild 2',
+          'narrow 20501-60000',
+          'in 20501-30500',
+          'narrow 30501-60000',
+          'in 30501-40500',
+          'narrow 40501-60000',
+          'in 40501-50500',
+          'narrow 50501-60000',
+          'in 50501-60000',
+          'delete 50501-60000',
+        ]);
+        expect(logger.log).toHaveBeenCalledWith(
+          'nft_state: the stale NFTs of ledgers 501 - 60000 are left to the dirty ranges; the live cursor starts at 60000',
+        );
+        expect(dirty).toEqual([]);
+        // the lag is that of the live cursor, at the head, not of the backlog
+        expect(metrics.nftStateLagLedgers.set.mock.calls).toEqual([[0]]);
+        expect(errors()).toBe(0);
+      });
+
+      it('a watermark NFT_LIVE_STEP_LEDGERS behind the head, or less, is the cursor: nothing is marked', async () => {
+        watermark.mockResolvedValue(500);
+        committed = 500 + NFT_LIVE_STEP_LEDGERS;
+        await service().tick();
+        expect(markDirty).not.toHaveBeenCalled();
+        expect(changedSince.mock.calls[0][1]).toBe(500);
+      });
+
+      it('the mark does not hold the tick, the live part waits for it, and one that fails leaves the cursor unknown: counted, and the read is tried again after 5 minutes', async () => {
+        watermark.mockResolvedValue(500);
+        committed = 60_000;
+        let release!: () => void;
+        markDirty.mockImplementationOnce(() => new Promise<void>((resolve) => (release = resolve)));
+        const after = jest.fn(async () => undefined);
+        const svc = service({ extraJobs: [{ name: 'after_nft_state', run: after }] });
+        await svc.tick();
+        // the mark is out: the tick went on, the live part did not start, and no lag is reported
+        expect(markDirty).toHaveBeenCalledTimes(1);
+        expect(after).toHaveBeenCalledTimes(1);
+        expect(changedSince).not.toHaveBeenCalled();
+        expect(metrics.nftStateLagLedgers.set).not.toHaveBeenCalled();
+        release();
+        await jest.advanceTimersByTimeAsync(0);
+        await tickAt(svc, 1);
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([60_000]);
+
+        // another process, whose mark fails: no cursor, an error of the read, and a new read (and mark) 5 minutes later
+        changedSince.mockClear();
+        markDirty.mockRejectedValueOnce(new Error('DB::Exception: too many parts'));
+        metrics.aggregatorErrorsTotal.inc.mockClear();
+        const other = service();
+        await tickAt(other, 2);
+        expect(changedSince).not.toHaveBeenCalled();
+        expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_state' }]]);
+        expect(logger.error).toHaveBeenCalledWith(
+          'Aggregator job nft_state failed reading where the job goes on from, tried again in 5 min: DB::Exception: too many parts',
+        );
+        await tickAt(other, 6);
+        expect(changedSince).not.toHaveBeenCalled();
+        await tickAt(other, 7);
+        expect(markDirty.mock.calls.slice(-1).map(([, from, to]) => [from, to])).toEqual([[501, 60_000]]);
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([60_000]);
+      });
+    });
+
     describe('a cursor far behind the head', () => {
       /** What `nftsChangedSince` answers with a cap: the stale NFTs of the window `(ledger, min(head, to)]`, and its end. Each read takes a second. */
       function windowed(staleAt: Map<number, NftKey[]>): void {
@@ -358,6 +523,8 @@ describe('AggregatorService nft_state job', () => {
       }
 
       it('crosses a stretch with nothing stale one window of NFT_LIVE_STEP_LEDGERS at a time, while the budget lasts, and goes on at the next tick', async () => {
+        // the head was 1000 when the cursor was placed (within NFT_LIVE_STEP_LEDGERS of it), and ran on to 50,000 since
+        head.mockImplementationOnce(async () => 1000);
         committed = 50_000;
         windowed(new Map([[32_000, [nft(7)]]]));
         const svc = service({ budgetsMs: { nft_state: 2500 } });
@@ -388,9 +555,12 @@ describe('AggregatorService nft_state job', () => {
         await tickAt(svc, 2);
         expect(reads().slice(5)).toEqual([[50_000, 60_000]]);
         expect(lastLag()).toBe(0);
+        // the cursor fell behind while the job ran: nothing of it was left to the dirty ranges
+        expect(markDirty).not.toHaveBeenCalled();
       });
 
       it('does not cross a window that has NFTs before their batch is written: a batch that fails as a whole keeps the cursor at the start of its window', async () => {
+        head.mockImplementationOnce(async () => 1000); // the head when the cursor was placed
         committed = 30_000;
         const four = [1, 2, 3, 4].map(nft);
         windowed(new Map([[5000, four]]));
@@ -409,11 +579,60 @@ describe('AggregatorService nft_state job', () => {
       });
     });
 
-    it('a batch of more NFTs than the limit (all the NFTs of one ledger) is rebuilt whole', async () => {
-      const many = Array.from({ length: NFT_STATE_BATCH + 100 }, (_, i) => nft(i + 1));
-      pages.set(500, { nfts: many, upTo: 501 });
-      await service().tick();
-      expect(rebuilt()).toEqual([serials(many)]);
+    describe('an answer of more NFTs than a batch (all the NFTs of one ledger)', () => {
+      const MANY = Array.from({ length: 2 * NFT_STATE_BATCH + 100 }, (_, i) => nft(i + 1));
+      const lists = [
+        MANY.slice(0, NFT_STATE_BATCH),
+        MANY.slice(NFT_STATE_BATCH, 2 * NFT_STATE_BATCH),
+        MANY.slice(-100),
+      ];
+
+      it('is rebuilt NFT_STATE_BATCH at a time, and the cursor passes the ledger once the last batch is written', async () => {
+        pages.set(500, { nfts: MANY, upTo: 501 });
+        pages.set(501, { nfts: [nft(9999)], upTo: 600 });
+        await service().tick();
+        expect(rebuilt()).toEqual([...lists.map(serials), [9999]]);
+        // asked for once, and then from the ledger after it
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 501, 600]);
+      });
+
+      it('checks the budget between its batches, keeps the cursor until the last one is written, and goes on with the next batch at the next tick', async () => {
+        committed = 5000;
+        pages.set(500, { nfts: MANY, upTo: 501 });
+        rebuildMs = 2000; // batches at 0 and 2 s of the 3 s budget, and not at 4 s
+        const svc = service();
+        await svc.tick();
+        expect(rebuilt()).toEqual(lists.slice(0, 2).map(serials));
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('nft_state reached its budget'));
+        // the cursor is where it was: the NFTs of the ledger are not all written
+        expect(lastLag()).toBe(5000 - 500);
+
+        // the next tick goes on with the third batch, without asking for the NFTs again, and then passes the ledger
+        await tickAt(svc, 1);
+        expect(rebuilt()).toEqual(lists.map(serials));
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 501]);
+        expect(lastLag()).toBe(5000 - 501);
+      });
+
+      it('a batch of it that fails as a whole keeps the cursor: the next tick asks again, and gets the NFTs that are still stale', async () => {
+        pages.set(500, { nfts: MANY, upTo: 501 });
+        // four NFTs of the second batch: more than the isolation takes for a cause of its own
+        for (const n of [NFT_STATE_BATCH + 1, NFT_STATE_BATCH + 2, NFT_STATE_BATCH + 3, NFT_STATE_BATCH + 4])
+          failing.add(n);
+        const svc = service();
+        await svc.tick();
+        expect(errors()).toBe(1);
+        expect(done).toEqual(serials(lists[0]));
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500]);
+
+        // the first batch is not stale any more: the answer is the rest
+        failing.clear();
+        pages.set(500, { nfts: MANY.slice(NFT_STATE_BATCH), upTo: 501 });
+        await tickAt(svc, 1);
+        expect(rebuilt().slice(-2)).toEqual(lists.slice(1).map(serials));
+        expect(changedSince.mock.calls.map(([, ledger]) => ledger)).toEqual([500, 500, 501]);
+        expect(done).toEqual(serials(MANY));
+      });
     });
 
     it('a read of the watermark that fails is counted and logged as nft_state, the jobs after it still run, and the next read waits (5 minutes, then twice as long)', async () => {
@@ -432,8 +651,8 @@ describe('AggregatorService nft_state job', () => {
       expect(after).toHaveBeenCalledTimes(1);
       expect(changedSince).not.toHaveBeenCalled();
       expect(rebuild).not.toHaveBeenCalled();
-      // the cursor is not known: every ledger is behind it
-      expect(lastLag()).toBe(committed);
+      // the cursor is not known, and nor is its lag: the gauge is not set (it is not the whole head)
+      expect(metrics.nftStateLagLedgers.set).not.toHaveBeenCalled();
       expect(metrics.nftDirtyLedgers.set).toHaveBeenCalledWith(0);
 
       // not read again before the wait is over
@@ -490,8 +709,8 @@ describe('AggregatorService nft_state job', () => {
         expect(dirty).toEqual([]);
         expect(changedSince).not.toHaveBeenCalled();
         expect(errors()).toBe(0);
-        // everything is behind a cursor that is not known
-        expect(lastLag()).toBe(committed);
+        // the lag of a cursor that is not known is not known: the gauge is not set, rather than to the whole head
+        expect(metrics.nftStateLagLedgers.set).not.toHaveBeenCalled();
 
         // another tick does not start a second read while one is out
         await tickAt(svc, 1);
@@ -1080,43 +1299,66 @@ describe('AggregatorService nft_state job', () => {
       expect(dirty).toEqual([]);
     });
 
-    it('an NFT of a step that fails on its own is counted, and the range of the step is marked again before it is deleted, once a run, until the NFT works', async () => {
+    it('an NFT of a step that fails on its own is counted, and its ledgers of the step are marked again before the range is deleted; they wait 5 minutes, then twice as long, until the NFT works', async () => {
+      minMs = 0; // the wait is counted from the mark: the ticks of the test are on the minute
       dirty = [mark(100, 200, 7000)];
       touched.set(150, [1, 2, 3].map(nft));
+      touched.set(170, [nft(2)]);
+      touched.set(190, [nft(3)]);
       failing.add(2);
       const svc = service();
       await svc.tick();
       expect(done).toEqual([1, 3]);
       expect(errors()).toBe(1);
       expect(logger.error).toHaveBeenCalledWith(
-        expect.stringContaining(`NFT ${nft(2).nft_id}, its dirty range is marked again`),
+        expect.stringContaining(`NFT ${nft(2).nft_id}, its ledgers of the dirty range are marked again`),
       );
-      // marked again, and only then deleted: a restart cannot find the NFT from the tables (no touch above what its row has
-      // seen), so the range is what keeps it from being lost
-      expect(markDirty).toHaveBeenCalledWith(ch, 100, 200);
-      expect(events.filter((e) => /^(mark|delete|narrow)/.test(e))).toEqual(['mark 100-200', 'delete 100-200']);
-      expect(dirty).toEqual([{ from: 100, to: 200, created: expect.any(Number) }]);
+      // its own touches of the step (one read), marked again, and only then the range deleted: a restart cannot find the NFT
+      // from the tables (no touch above what its row has seen), so the mark is what keeps it from being lost
+      expect(events.filter((e) => /^(touches|mark|delete|narrow)/.test(e))).toEqual([
+        'touches 100-200',
+        'mark 150-170',
+        'delete 100-200',
+      ]);
+      expect(touchLedgers).toHaveBeenCalledWith(ch, [nft(2).nft_id], 100, 200);
+      expect(dirty).toEqual([{ from: 150, to: 170, created: expect.any(Number) }]);
       expect(dirty[0].created).toBeGreaterThan(7000);
-      // the new mark waits for the next run: a step that keeps failing is not done over and over in one
+      expect(logger.log).toHaveBeenCalledWith(
+        'nft_state: ledgers 150 - 170 are marked dirty again, taken again in 5 min',
+      );
       expect(inLedgers).toHaveBeenCalledTimes(1);
 
-      // the next run does the step again: the NFT fails again, and the range is marked again
-      await tickAt(svc, 1);
-      expect(inLedgers).toHaveBeenCalledTimes(2);
+      // not taken again before its wait is over ...
+      await tickAt(svc, 4);
+      expect(inLedgers).toHaveBeenCalledTimes(1);
+      expect(oldestDirty).toHaveBeenLastCalledWith(ch, [{ from: 150, to: 170 }]);
+      // ... and then it is: the NFT fails again, and the range waits twice as long
+      await tickAt(svc, 5);
+      expect(inLedgers.mock.calls.map(([, from, to]) => [from, to])).toEqual([
+        [100, 200],
+        [150, 170],
+      ]);
       expect(errors()).toBe(2);
-      expect(markDirty).toHaveBeenCalledTimes(2);
-      expect(dirty).toHaveLength(1);
+      expect(logger.log).toHaveBeenCalledWith(
+        'nft_state: ledgers 150 - 170 are marked dirty again, taken again in 10 min',
+      );
+      await tickAt(svc, 14);
+      expect(inLedgers).toHaveBeenCalledTimes(2);
 
-      // it works at last: the step is done and the range is deleted, with no mark
+      // it works at last: the range is deleted, with no mark, and nothing waits any more
       failing.clear();
-      await tickAt(svc, 2);
-      expect(done.slice(4)).toEqual([1, 2, 3]);
+      await tickAt(svc, 15);
+      expect(inLedgers).toHaveBeenCalledTimes(3);
+      expect(done.slice(-3)).toEqual([1, 2, 3]);
       expect(markDirty).toHaveBeenCalledTimes(2);
       expect(dirty).toEqual([]);
       expect(errors()).toBe(2);
+      await tickAt(svc, 16);
+      expect(oldestDirty).toHaveBeenLastCalledWith(ch, []);
     });
 
-    it('marks the range of a step again before narrowing the range: the remainder keeps its place, and the step goes to the back of the queue', async () => {
+    it('marks again only the ledgers of the step the failing NFT has a touch in, before narrowing the range: the remainder keeps its place, and the ranges after it are worked while those ledgers wait', async () => {
+      minMs = 0;
       dirty = [mark(1000, 25_999, 5000), mark(60_000, 60_010, 6000)];
       touched.set(1500, [nft(1)]);
       touched.set(12_000, [nft(2)]);
@@ -1126,32 +1368,97 @@ describe('AggregatorService nft_state job', () => {
       failing.add(2);
       const svc = service();
       await svc.tick();
-      expect(events.filter((e) => /^(in|rebuild|mark|narrow|delete)/.test(e))).toEqual([
+      expect(events.filter((e) => /^(in|rebuild|touches|mark|narrow|delete)/.test(e))).toEqual([
         'in 1000-10999',
         'rebuild 1',
         'narrow 11000-25999',
-        // the second step: 2 fails on its own, 5 works
+        // the second step: 2 fails on its own, 5 works; the ledger of 2's touch is marked again, not the step
         'in 11000-20999',
         'rebuild 2,5',
         'rebuild 2',
         'rebuild 5',
-        'mark 11000-20999',
+        'touches 11000-20999',
+        'mark 12000-12000',
         'narrow 21000-25999',
         'in 21000-25999',
         'rebuild 3',
         'delete 21000-25999',
-        // the next range; the step marked again is behind it, and waits for the next run
+        // the next range; the ledger marked again waits
         'in 60000-60010',
         'rebuild 4',
         'delete 60000-60010',
       ]);
-      expect(dirty).toEqual([{ from: 11_000, to: 20_999, created: expect.any(Number) }]);
+      expect(dirty).toEqual([{ from: 12_000, to: 12_000, created: expect.any(Number) }]);
       expect(dirty[0].created).toBeGreaterThan(6000);
 
       failing.clear();
       await tickAt(svc, 1);
-      expect(done).toEqual([1, 5, 3, 4, 2, 5]);
+      expect(done).toEqual([1, 5, 3, 4]);
+      await tickAt(svc, 5);
+      expect(done).toEqual([1, 5, 3, 4, 2]);
       expect(dirty).toEqual([]);
+    });
+
+    it('marks the whole step again for a failing NFT that has no touch in it (found by its row)', async () => {
+      minMs = 0;
+      dirty = [mark(100, 200, 7000)];
+      // nft(2) is in the step for its row (a re-ingest dropped its events), not for a touch: `inLedgers` finds it, `nftTouchLedgers` does not
+      inLedgers.mockImplementationOnce(async (_c: unknown, from: number, to: number) => {
+        events.push(`in ${from}-${to}`);
+        return [nft(1), nft(2)];
+      });
+      touched.set(150, [nft(1)]);
+      failing.add(2);
+      await service().tick();
+      expect(events.filter((e) => /^(touches|mark|delete)/.test(e))).toEqual([
+        'touches 100-200',
+        'mark 100-200',
+        'delete 100-200',
+      ]);
+      expect(dirty).toEqual([{ from: 100, to: 200, created: expect.any(Number) }]);
+    });
+
+    it('an NFT that keeps failing slowly (30 s a rebuild) does not starve the jobs after nft_state: its ledgers wait, are not taken again before the wait is over, and a range marked later is worked meanwhile', async () => {
+      // every rebuild takes 30 s (a query that runs into the time limit, as long as a tick), and NFT 2 always fails
+      rebuildMs = 30_000;
+      dirty = [mark(100, 200, 1000)];
+      touched.set(150, [nft(1), nft(2)]);
+      touched.set(160, [nft(3)]);
+      failing.add(2);
+      // the minutes whose tick had time left for the jobs after nft_state: stats_live computed a slice, and an extra job had time
+      const statsTicks: number[] = [];
+      const afterTicks: number[] = [];
+      let minute = 0;
+      const after = jest.fn(async (tick: { deadline: number }) => {
+        if (Date.now() < tick.deadline) afterTicks.push(minute);
+      });
+      const svc = service({ extraJobs: [{ name: 'after_nft_state', run: after }] });
+      const takenAt = new Map<string, number[]>();
+      for (; minute < 120; minute++) {
+        const stats = events.filter((e) => e.startsWith('stats')).length;
+        const ins = inLedgers.mock.calls.length;
+        await tickAt(svc, minute);
+        if (events.filter((e) => e.startsWith('stats')).length > stats) statsTicks.push(minute);
+        for (const [, from, to] of inLedgers.mock.calls.slice(ins)) {
+          takenAt.set(`${from}-${to}`, [...(takenAt.get(`${from}-${to}`) ?? []), minute]);
+        }
+        // a re-ingest marks another range while NFT 2's ledger waits
+        if (minute === 6) {
+          dirty.push(mark(300, 400, Date.now()));
+          touched.set(350, [nft(9)]);
+        }
+      }
+      // the step: [1, 2, 3] fails, [1, 2] fails, [1], [2] fails, [3]: a rebuild a tick; then NFT 2's ledger (150) is marked again
+      expect(takenAt.get('100-200')).toEqual([0]);
+      // and taken again only after each wait: 5 minutes after the mark (at 4.5), then 10, 20, 40, 60
+      expect(takenAt.get('150-150')).toEqual([10, 23, 46, 89]);
+      // the range marked later is worked at once, not behind the waiting one
+      expect(takenAt.get('300-400')).toEqual([7]);
+      expect(done).toContain(9);
+      // a tick with a rebuild in it has no time left; the others do: most ticks run the jobs after nft_state
+      expect(statsTicks.length).toBeGreaterThan(90);
+      expect(afterTicks).toEqual(statsTicks);
+      expect(rebuild.mock.calls.length).toBeLessThan(30);
     });
 
     it('the NFTs a live batch sets aside are retried from memory and not marked in nft_dirty: the tables say they are stale', async () => {
@@ -1380,7 +1687,7 @@ describe('AggregatorService nft_state job', () => {
       expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections']);
     });
 
-    it('sets nothing, and reads nothing, once the shutdown has begun', async () => {
+    it('sets nothing, and reads nothing for them, once the shutdown has begun', async () => {
       const svc = service();
       rebuild.mockImplementation(async () => {
         void svc.stop();
@@ -1388,7 +1695,9 @@ describe('AggregatorService nft_state job', () => {
       });
       pages.set(500, { nfts: [nft(1)], upTo: 700 });
       await svc.tick();
-      expect(head).not.toHaveBeenCalled();
+      // the head was read once, to place the cursor, and not again for the gauges
+      expect(head).toHaveBeenCalledTimes(1);
+      expect(dirtyLedgers).not.toHaveBeenCalled();
       expect(metrics.nftStateLagLedgers.set).not.toHaveBeenCalled();
       expect(metrics.nftDirtyLedgers.set).not.toHaveBeenCalled();
     });
@@ -1460,17 +1769,18 @@ describe('AggregatorService nft_state job', () => {
       expect(handed).toEqual([]);
     });
 
-    it('while its cursor is not known every ledger is behind it: the lag is the head', async () => {
+    it('while its cursor is not known its lag is not known either: not the whole head', async () => {
       watermark.mockImplementation(() => new Promise<number>(() => undefined)); // a read that never answers
       const { runner: job } = runner(() => undefined);
       expect(job.lag).toBeUndefined();
       committed = 1200;
       await job.run(tick());
-      expect(job.lag).toBe(1200);
+      expect(head).toHaveBeenCalled(); // the head is known ...
+      expect(job.lag).toBeUndefined(); // ... and the lag is not
       // it is not read again while that one is out
       await job.run(tick());
       expect(watermark).toHaveBeenCalledTimes(1);
-      expect(job.lag).toBe(1200);
+      expect(job.lag).toBeUndefined();
     });
 
     it('knows its lag only once it has a cursor and a head, and the lag is never below 0', async () => {
