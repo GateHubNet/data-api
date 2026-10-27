@@ -7,7 +7,9 @@ accounts, network fees, volumes and markets, validations, validators and amendme
 answers match what `data.ripple.com` served, so a client of the original works by changing its host and sending an API key. The deliberate
 differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.md). On top of the Ripple API it serves **AMM data** on the
 XRP Ledger (pools and their history, swaps, liquidity events, votes and bids, LP positions, AMM volume): swaps against pools are exchanges
-([ADR-0011](docs/adr/0011-amm-data-and-swaps-as-exchanges.md)).
+([ADR-0011](docs/adr/0011-amm-data-and-swaps-as-exchanges.md)); and **NFT data** on both networks (XRPL NFTokens and Xahau URITokens: events, owners,
+open offers, an account's NFTs, collections with supply and holders, sales with prices, NFT sales volume), each answer stating how much of the history
+it holds in `coverage` ([ADR-0016](docs/adr/0016-nft-and-uritoken-data.md)).
 
 One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
 
@@ -52,7 +54,7 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123
 cp apps/syncer/.env.example apps/syncer/.env
 cp apps/api/.env.example    apps/api/.env  # GH_NETWORK=xrpl by default; GH_API_KEYS empty = no authentication (development only)
 
-pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline, 002_validators_amendments, 003_account_market_aggregates, 004_amm_fee_estimates)
+pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 011_nft_data)
 
 pnpm start:syncer                          # ingests the XRP Ledger from the validated head  (probe on :3002)
 pnpm start:api                             # serves /v2/* on :3001, Swagger at /internal/docs
@@ -80,7 +82,8 @@ pnpm --filter @gatehub/data-syncer ingest:range --from 90000000 --to 90100000   
 ```
 
 On the XRP Ledger the AMM data (pools, swaps as exchanges, liquidity) needs the history re-ingested from the AMM enablement ledger,
-86795265, with `--reprocess`: see [AMM data re-ingest](docs/backfill.md#amm-data-re-ingest).
+86795265, with `--reprocess`: see [AMM data re-ingest](docs/backfill.md#amm-data-re-ingest). The NFT data needs it from the enablement of the
+NFT amendment (XRPL 75443457) and, on Xahau, from ledger 1: see [NFT re-ingest](docs/backfill.md#nft-re-ingest).
 
 ## Build and test
 
@@ -121,8 +124,9 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Rates | `/v2/exchange_rates/{base}/{counter}`, `/v2/normalize` |
 | Accounts | `/v2/accounts`, `/v2/accounts/{address}`, `.../transactions[/{sequence}]`, `.../payments`, `.../exchanges[/{base}[/{counter}]]`, `.../balance_changes`, `.../balances`, `.../orders`, `.../reports[/{date}]` (`interval`), `.../stats/{transactions\|value}` (`interval`), `.../analytics/{balances\|balance_changes\|counterparties\|exchanges}` (extra), `.../amm_liquidity`, `.../amm_positions` (AMM, extras) |
 | Markets | `/v2/active_accounts/{base}/{counter}` |
-| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra), `/v2/network/amm_volume` (AMM, extra) |
+| Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra), `/v2/network/amm_volume` (AMM, extra), `/v2/network/nft_volume` (NFTs, extra) |
 | AMM (extras) | `/v2/amm/pools`, `/v2/amm/pools/{pool}`, `/v2/amm/pools/{base}/{counter}`, `/v2/amm/pools/{pool}/{history,swaps,liquidity,governance}` |
+| NFTs (extras, both networks) | `/v2/nfts/{nft_id}`, `/v2/nfts/{nft_id}/{history,offers}`, `/v2/accounts/{address}/{nfts,nft_history}`, `/v2/nft_collections`, `/v2/nft_collections/{issuer}/{taxon}` (XRPL) or `/{issuer}` (Xahau) with `/{nfts,holders,sales,stats}`, `/v2/nft_sales`; each answer has `coverage` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
 | Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |

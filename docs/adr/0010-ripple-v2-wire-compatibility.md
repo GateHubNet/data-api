@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended four times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72). Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
+**Status:** Accepted. Amended five times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72); Amendment 5 (2026-10-24), by [ADR-0016](0016-nft-and-uritoken-data.md), the NFT and URIToken routes, the `coverage` field and `nft_volume` (the amendment at the end of this record, items 73 to 78). Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -325,3 +325,45 @@ The messages of the export routes are new: 400 `invalid path`, `path is not expo
 `invalid format`, `the list has more than <cap> rows, ...`; 404 `export not found`; 429 `too many exports in progress: at most 3
 per API key`; 503 `exports are not available` (no bucket configured); 500 `unable to create the export` and `unable to retrieve
 the export`.
+
+## Amendment 5 (2026-10-24): NFTs and URITokens
+The NFT and URIToken data (program 2, sub-project D3: [ADR-0016](0016-nft-and-uritoken-data.md), the wording in
+[api-reference](../api-reference.md#nfts)) adds routes, a field and a volume metric the original did not have. Each is an addition: what the
+original served is served as before.
+
+73. **The NFT routes, as extras.** The original predates NFTs. Here `GET /v2/nfts/{nft_id}`, `GET /v2/nfts/{nft_id}/history`,
+    `GET /v2/nfts/{nft_id}/offers`, `GET /v2/accounts/{address}/nfts`, `GET /v2/accounts/{address}/nft_history`, `GET /v2/nft_collections`,
+    `GET /v2/nft_collections/{issuer}/{taxon}` (XRPL) and `GET /v2/nft_collections/{issuer}` (Xahau) with their sub-routes `/nfts`, `/holders`,
+    `/sales` and `/stats`, and `GET /v2/nft_sales`. They serve the NFTokens of the XRP Ledger and the URITokens of Xahau (`kind` is `nftoken` or
+    `uritoken`) with the contract of every list: `limit` (200, at most 1000), `marker` and a `Link` header, `format=csv`, absent keys left out.
+    A key that does not exist for a kind is left out (`taxon`, `serial` and `transfer_fee` of a URIToken). The other network's id, or the other
+    form of a collection's path, is 404 `nft not found` or `collection not found`.
+74. **`coverage`.** Every answer of these routes carries `"coverage": { "from_ledger_index": N, "complete": bool }`, the key right after `result`
+    (`from_ledger_index` is left out when no ledger is stored), and it is not in the CSV. It says whether the NFT history the answer is read
+    from is whole: it starts at the first ledger written by the NFT parser (version 5) and is complete when that is at or before the ledger the
+    feature starts at, the enable ledger of `NonFungibleTokensV1_1` (XRPL) or `URIToken` (Xahau, ledger 1). The detail, history and offers of an NFT
+    state their own: complete when its mint is indexed. The rule is the program's one coverage rule ([api-reference](../api-reference.md#coverage),
+    [ADR-0016](0016-nft-and-uritoken-data.md)); no existing route gained the field.
+75. **`GET /v2/network/nft_volume`.** The route of `exchange_volume` (live and historical modes, `interval`, `exchange_currency` and
+    `exchange_issuer`, `limit`, `marker`) for the sales of NFTs, in the native currency, a component per collection:
+    `{issuer, taxon?, count, amount, rate, converted_amount}`. The live periods are `day`, `7day` and `30day` only (400 `invalid period - use:
+    day, 7day, 30day`), so the live sets are fifteen in all. `amount` is the volume of the collection's sales that have a price in the native
+    currency at that day's rate and `count` those sales; **the `count` of the row is every sale of the window**, those with no rate included. The
+    amounts of this metric are exact decimals, and so are their sums (the other metrics add Float64 values). `coverage` follows `result`.
+    CSV: `nft_volume.csv`. Its daily sets carry a config version of their own, so a change of the markets config does not recompute them.
+76. **The CSV names.** `<nft_id> - nft history.csv`, `<address> - nfts.csv`, `<address> - nft history.csv`, `nft collections.csv`,
+    `<issuer>[ <taxon>] - nfts.csv`, `<issuer>[ <taxon>] - holders.csv`, `<issuer>[ <taxon>] - sales.csv`, `<issuer>[ <taxon>] - stats.csv`,
+    `nft sales.csv` and `nft_volume.csv`. The columns are the keys of the object in order, a nested object as `a.b`, an absent key an empty cell.
+    Each route with a CSV form can be exported ([Exports](../api-reference.md#exports)); those over time (`history`, `nft_history`, a
+    collection's `sales` and `stats`, `nft_sales`, `nft_volume`) name `start` and `end` in the export.
+77. **Messages and checks.** The messages are new: 400 `invalid nft id`, `invalid taxon`, `invalid event`, `invalid role`, `invalid type`,
+    `invalid sort`, `start is required` (the stats of a collection), `invalid window - use at most 366 days`; 404 `nft not found`, `collection
+    not found`; 500 `unable to retrieve nft`, `unable to retrieve nft history`, `unable to retrieve offers`, `unable to retrieve nfts`,
+    `unable to retrieve collections`, `unable to retrieve collection`, `unable to retrieve holders`, `unable to retrieve sales`, `unable to
+    retrieve stats` and, for the volume, `error getting data`. The checks run in the order the parameters are listed, a bad marker is a 400
+    before a 404, and **an empty `start=` or `end=` is 400** on the NFT routes (the volume keeps the contract of the other volumes: empty is none).
+    A failed coverage read fails the route with its own 500, no `complete: false` is invented.
+78. **Caching.** The NFT routes send the global `Cache-Control` (`private, max-age=60`); the list of all collections is kept 60 s in the api.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#nfts) and
+[api-reference](../api-reference.md#get-v2networknft_volume).

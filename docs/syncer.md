@@ -11,7 +11,7 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    ┌──────────────┬───────────────┼────────────────┬─────────────────┬──────────────────┐
    │ ingest       │ validations   │ fee_stats      │ aggregator      │ validators       │   <- GH_WORKERS
    │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats, volumes, │ lists, domains,  │
-   │              │               │                │ AMM pools,      │ state, rounds,   │
+   │              │               │                │ AMM pools, NFTs,│ state, rounds,   │
    │              │               │                │ rates, markets, │ agreement        │
    │              │               │                │ account rollups │                  │
    └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴─────────┬────────┘
@@ -19,11 +19,11 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    28 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
    (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
     marker)           manifests,                      volume_daily,      validator_manifests (rpc),
-                      validator_                      amm_pools,         network_state,
-                      validations,                    amm_daily,         amendment_features,
-                      validator_seen                  + 9 tables of 003  validator_votes,
-                                                      (read the ledger   amendment_tallies,
-                                                      tables)            validator_agreement_hourly
+                      validator_                      amm_pools, nfts,   network_state,
+                      validations,                    nft_collections,   amendment_features,
+                      validator_seen                  amm_daily, + 9 of  validator_votes,
+                                                      003 (read the      amendment_tallies,
+                                                      ledger tables)     validator_agreement_hourly
                           ClickHouse, database = the network name
 ```
 
@@ -315,23 +315,25 @@ most 2 s for the sample in flight.
 
 ## 7. The aggregator
 
-Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs eleven jobs **in priority order**; a job
+Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs thirteen jobs **in priority order**; a job
 gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work. The budgets are
-constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment variables, and so is the cadence of `amm_daily`:
+constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment variables, and so are the cadences of `amm_daily` and `nft_collections`:
 
 | # | Job | Budget | What |
 | --- | --- | --- | --- |
-| 1 | `volume_live` | 5 s | The twelve live volume sets (trade volume and AMM volume for hour, day, 3day, 7day, 30day; payment volume for hour, day), each recomputed whole under one version; the `amm_volume` set of the period `day` also carries the pools' fee estimates ([the AMM jobs](#the-amm-jobs)). **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
-| 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), all three metrics, stalest first. |
+| 1 | `volume_live` | 5 s | The fifteen live volume sets (trade volume and AMM volume for hour, day, 3day, 7day, 30day; payment volume for hour, day; NFT volume for day, 7day, 30day), each recomputed whole under one version; the `amm_volume` set of the period `day` also carries the pools' fee estimates ([the AMM jobs](#the-amm-jobs)). **Stalest set first**, and sets that failed on their last attempt go behind the healthy ones (one bad set cannot starve the others). |
+| 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), all four metrics (eight sets), stalest first. |
 | 3 | `amm_pools` | 3 s | Rebuilds the `amm_pools` row of every AMM pool with state rows that its row has not seen yet, 200 pools at a time ([the AMM jobs](#the-amm-jobs)). |
-| 4 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
-| 5 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
-| 6 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
-| 7 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, and runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)). |
-| 8 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
-| 9 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
-| 10 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
-| 11 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config, **newest first**, all three metrics. |
+| 4 | `nft_state` | 3 s | Rebuilds the `nfts` row and the `account_nfts` rows of every NFT with an event its row has not seen yet, 500 NFTs at a time, and then the NFTs of the oldest range of `nft_dirty` that a re-ingest marked ([the NFT jobs](#the-nft-jobs)). |
+| 5 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
+| 6 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
+| 7 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
+| 8 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)), and marks the slice's ledgers in `nft_dirty` for `nft_state` ([the NFT jobs](#the-nft-jobs)). |
+| 9 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
+| 10 | `nft_collections` | 3 s, **every 5th tick** | Computes the `nft_collections` row and the holders of every collection whose NFTs `nft_state` rebuilt, 50 collections at a time, oldest first ([the NFT jobs](#the-nft-jobs)). |
+| 11 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
+| 12 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
+| 13 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config (the NFT volume's is its own), **newest first**, all four metrics. |
 
 Properties that matter operationally:
 
@@ -352,6 +354,8 @@ Properties that matter operationally:
 - **No overlap, graceful stop** (a tick still running is skipped; shutdown aborts the slice in flight and waits at most 2 s).
 - The AMM jobs run on both networks, whenever the aggregator does. Xahau has no AMM: `amm_pools` finds no pool, and the AMM sets
   (`amm_daily`, the `amm_volume` volume sets) hold only their sentinel.
+- The NFT jobs (`nft_state`, `nft_collections`) run on both networks too: XRPL NFTokens and Xahau URITokens are the same job and the same tables.
+  An aggregator started on a database with no NFT events finds nothing to do.
 - Volume jobs need the **markets config** (`config/markets/<network>.json` or `GH_MARKETS_CONFIG`): without markets there is
   nothing to compute. (The shipped Xahau list, version 3, was derived from a small sample, about 3,800 ledgers spread over three days,
   and is short: one trade market (`EVR`/`XAH`) and three payment currencies; `XXX`, a test token whose ISO code means "no
@@ -485,7 +489,7 @@ in a tick; a shutdown aborts the set in flight before it writes (`AggregateSetAb
 
 ### 7.6 The `agg_dirty` hooks
 
-A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order**:
+A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order** (and then the fourth, of `nft_state`, which does not depend on the other three):
 
 1. `rates_daily`: a slice that touches the days X..Y marks the days X..Y+14 **stale** (the rate of a day reads the trades of the 14 days before it): for each of them that has a valid set, a new sentinel with `stale = 1` and no rows. The back-fill then computes them again, newest first; until it has, the readers value those days on read.
 2. `pair_hourly`: the hours of the slice that lie in the last 31 days are recomputed, a call for each UTC day.
@@ -493,7 +497,9 @@ A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `sta
    marked for the next discovery to recount. With `GH_ACCOUNT_ROLLUP_MIN_ROWS=0` the job is off but the slice **still recomputes the covered days** (the API still uses that coverage, so a re-ingest must not leave it stale) and marks no partition.
    A re-ingested day comes as many ranges (one per chunk of ledgers, about an hour), so the hook is given the mark of the range (`agg_dirty.created_at`) and remembers in memory, across ticks, which days it rolled and when each roll began (at most 1000 days). A day that was rolled by a roll that began at or after the mark is not rolled again, as the daily volume sets are not; a range marked after the roll began rolls the day again, and a roll that failed is not remembered.
 
-A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
+4. `nft_state`: the ledgers that closed in the slice are appended to `nft_dirty` as one range (a new row, idempotent: the same range twice is one), for the dirty sweep of `nft_state` to rebuild. The hook rebuilds nothing itself, so a day of 2022's busiest NFT ledgers cannot hold a tick. It runs **with or without** the `aggregates` option (an aggregator without the account and market jobs still marks the ledgers). The slice's daily `nft_volume` sets are recomputed with the other metrics as always.
+
+A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
 because the range is not changed after it. Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`).
 
 ### 7.7 The back-fills
@@ -578,6 +584,89 @@ component is `fees_S × converted ÷ amount` for the side S of its `amount` plus
 the component's own volumes, which are the dust-filtered sums). It is NULL when a side's fee is not known (a swap with no known fee: part of the fees is never shown as all of them) and when a side's
 fee is above 0 while its volume is not; the sentinel and every row of the other sets have NULL (the longer periods would read up to 30 days of swaps every tick). The set is still one insert, with
 the column in it; a set written before migration 004 reads as not known until the next tick. The cost is the swaps of 24 hours once a tick, as `amm_daily` reads a day.
+
+### The NFT jobs
+
+The NFT aggregates (`nfts`, `account_nfts`, `nft_collections`, `nft_collection_holders`: [data-model](data-model.md#nft-aggregates-migration-011)) are
+rebuilt from the append-only NFT ledger tables and never written by ingest, so a recovery delete cannot lose a state
+([ADR-0016](adr/0016-nft-and-uritoken-data.md)). Both jobs read **committed ledgers only** (every scan is capped at the newest `ledgers` row),
+write version sets (a version is the ClickHouse clock in milliseconds, above the key's newest), and are runners in files of their own
+(`nft-state.job-runner.ts`, `nft-collections.job-runner.ts`) behind `AggregatorJobContext`, registered with the `nfts` option, which
+`aggregator.module.ts` builds from the one `RatesService` the volume jobs share. `nft_collections` also needs the daily rates (`DailyRates`).
+
+**`nft_state`** (budget 3 s, every tick, right after `amm_pools`; `nft_state` of [data-model](data-model.md#nft-aggregates-migration-011)):
+- **Cursor.** A ledger index kept in memory and found again when the process starts (`nftStateWatermark`: the ledger before the oldest
+  `nft_touches` row that its NFT's newest `nfts` row has not seen; the committed head when there is none; **0 for a database with no ledger
+  yet**). The read is a join of every touch with the NFTs: it may take as long as the time limit of a query, so it **starts at the first run
+  without being waited for**, and the live part starts at the first run after it answered (the retries and the dirty part do not need it, and
+  the jobs after this one keep their share of the tick). A read that fails is counted and logged as `nft_state` and tried again after 5
+  minutes, doubling up to an hour; a stop does not cancel it. So a restart delays the live part by at least one tick, **and by at least five
+  minutes when that read fails**; a watermark that never fits `GH_CLICKHOUSE_MAX_EXECUTION_TIME` keeps the live cursor from starting at all,
+  counted each time it is tried again (every 5 to 60 minutes).
+- **Each tick** `nftsChangedSince` returns at most 500 NFTs (`NFT_STATE_BATCH`) that have a touch above what their newest `nfts` row has
+  seen, oldest first, in a window of `NFT_LIVE_STEP_LEDGERS` (10,000) ledgers after the cursor, so that a cursor far behind the head crosses a
+  stretch with nothing in it window by window, while the budget lasts. Each NFT is rebuilt whole from its own `nft_events` (a prefix read) by
+  `foldNftEvents` and written under one version: its `nfts` row, and an `account_nfts` row for every account that ever owned it (`held` 1 for
+  the current owner). The cursor moves past a batch once it is written.
+- **A batch that fails is halved**, as in `amm_pools`: at most three NFTs of a batch may fail on their own (`MAX_ISOLATED_NFTS_PER_BATCH`);
+  they are set aside in memory, each counted as an error, and tried again after 5 minutes, doubling up to an hour (`NFT_RETRY_MS`,
+  `NFT_MAX_RETRY_MS`), while the cursor and the other NFTs go on. More than three means the cause is not the NFTs (the database, a limit) and
+  the batch is the failure of the job. A restart forgets the set; the NFT is stale in the tables, so the new process finds it again.
+- **Dirty ranges.** In what is left of the budget the oldest range of `nft_dirty` (ledgers that a re-ingest rewrote behind the job, marked by
+  the hook below): the NFTs with a touch in its first `NFT_DIRTY_STEP_LEDGERS` (10,000) ledgers, and those whose `nfts` row's `first_ledger` or
+  `last_ledger` lies there, are rebuilt in batches, an NFT with no event left is removed from `nfts` with a lightweight `DELETE` (and its
+  `account_nfts` rows get `held = 0`), and the range is replaced by its remainder (inserted first, then the old row deleted), so progress
+  survives a restart. An NFT that fails on its own in a step is counted and the range of the step is marked again.
+- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), error label `nft_state_dirty`. Dirty-sweep and gauge-read failures count
+  as `nft_state`; only the hook is `nft_state_dirty`.
+- **Collections due.** The collection keys (issuer, taxon) of every rebuilt NFT are handed to the queue of `nft_collections`.
+- **Gauges.** `syncer_nft_state_lag_ledgers` is the newest committed ledger minus the live cursor, set at the end of every run; **while the
+  cursor is not known (after every start, until its read has answered) every ledger is behind it, so the gauge reads the whole head for at
+  least a tick**: an alert on it needs a `for:` longer than a tick plus that read ([observability](observability.md#4-metrics-syncer)).
+  `syncer_nft_dirty_ledgers` is the ledgers the ranges of `nft_dirty` hold (the sum over the newest row of each range): 0 when no re-ingest is
+  being digested.
+- **A first boot** (no ledger at the first read) gives the cursor 0, and the job crosses the empty history from there in windows of 10,000
+  ledgers, the budget of a tick covering a few million of them (about 3.4 million per tick on a laptop, so about half an hour for XRPL's
+  108 million ledgers; the lag gauge falls by that much a minute). NFTs show up in the aggregates only once the cursor reaches them. A restart
+  after the first ledgers are committed finds the cursor from the tables instead ([operations](operations.md#the-nft-data)).
+
+**`nft_collections`** (budget 3 s, **at the first tick and then every 5th tick**, `NFT_COLLECTIONS_EVERY_TICKS`; `nft_collections` and
+`nft_collection_holders` of [data-model](data-model.md#nft-aggregates-migration-011)):
+- **Queue.** In memory, each collection once, oldest first: `nft_state` adds the collections of the NFTs it rebuilt, and at the first run a read of
+  the tables (`collectionsBehind`: the collections whose newest NFT version is above their row's, and the rows of collections with no NFT left;
+  one grouped read of `nfts`, not waited for, tried again after 5 minutes, doubling up to an hour, when it fails) adds what they say is behind.
+  `syncer_nft_collections_pending` is the queue, the batch under way and the collections set aside (a collection can be counted twice for a while
+  when it is both in the batch and queued again: gauge noise).
+- **A run** takes 50 collections at a time (`NFT_COLLECTIONS_BATCH`) while the budget lasts, then the collections whose wait after a failure is
+  over. A recompute reads the collection's `nfts` prefix (the newest row of each NFT: supply, holders and each holder's count) and its
+  `collection_nft_events` (the mints and burns, the first and last mint, and the sales with their converted prices), and writes the
+  `nft_collection_holders` rows (a `held = 0` row for each holder of the newest set who is gone) and the `nft_collections` row under one
+  version. A collection with no NFT left is deleted from both tables. A batch that fails is halved, and a collection that fails on its own is
+  counted, set aside and retried exactly as an NFT of `nft_state` is.
+- **Prices.** The sales are converted once, by `nftSalesNativeSql`, at the rate of the sale's UTC day ([ADR-0016](adr/0016-nft-and-uritoken-data.md)).
+  A collection's `volume_native` is as of its last recompute: it uses the rates known then (the partial rate of today's issued-currency sales) and
+  is refreshed whenever the collection changes, so a quiet collection's figure does not follow a rate settling; the daily `nft_volume` sets are
+  the settled figures.
+- **The first fill is slow.** After a rollout the queue holds every collection of the history, and it is worked first in, first out, one 3 s run
+  every fifth tick in batches of 50: the planning figure is about 150 collections every five minutes for XRPL's large collections (a batch of 50
+  that takes a second), and small ones go thousands to a run (a live check on Xahau cleared 2,089 in one). Collections that change meanwhile wait
+  behind it, so the collection pages of the API update slowly until the fill has drained, days on XRPL
+  ([backfill](backfill.md#nft-re-ingest)).
+
+**`nft_volume`** is a fourth metric of `volume_live` (the sets for `day`, `7day` and `30day`), `volume_daily` and `volume_backfill`, not a job
+of its own. A component is a collection (`<issuer>` on Xahau, `<issuer>/<taxon>` on XRPL), read from `nft_sales` by the committed ledger range of
+the window and priced by `nftSalesNativeSql`; its `amount` is the converted volume of the sales with a rate and its `count` those sales, and the
+set's sentinel counts every sale of the window. Its sets carry `NFT_VOLUME_CONFIG_VERSION` (1), not the markets config's version: a change of the
+markets list does not recompute them. The fifteen live sets are scheduled as before, stalest first, and `aggregator.schedule.spec.ts` shows they
+are not starved with `nft_state` and `nft_collections` registered.
+
+**Metrics.** `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending` (above), the counter
+`syncer_nft_skipped_total` (the NFT events the parser dropped for an amount that is an MPT amount, in a batch that was committed; the live ingest
+and the range-ingest runs of the process count them, the latter log a warning when it is not 0 and always end with `J skipped NFT events`), and
+`syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the labels `nft_state`, `nft_state_dirty` and `nft_collections`
+([observability](observability.md#4-metrics-syncer)). A job that keeps failing logs `Aggregator job nft_state: ...` / `Aggregator job
+nft_collections: ...` warnings and errors, and `nft_state: NFT <id> is rebuilt again` / `nft_collections: collection <id> is computed again` when a
+set-aside one works again.
 
 ## 8. The validators worker
 
@@ -923,9 +1012,11 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
 | `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `compute-loop`, `rounds.job` and `tally` (the compute loop, the voting rounds and the pure tally), `agreement.job` and `agreement` (the hourly agreement and its pure counting), `seen-seed`, `stored-lists`, `safe-fetch` (the only outbound HTTP) |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
-| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM |
+| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`) |
 | `packages/shared/src/aggregate/{stats,volume,amm-pools,amm-daily}.job.ts`, `aggregate/amm-reads.ts`, `query/rates.service.ts` | Aggregation and rates (`amm-reads.ts` holds the reads the AMM jobs share) |
 | `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
+| `apps/syncer/src/aggregator/{nft-state,nft-collections}.job-runner.ts` | The two NFT jobs ([the NFT jobs](#the-nft-jobs)) |
+| `packages/shared/src/aggregate/{nft-state,nft-state.job,nft-collections.job}.ts`, `query/nft-prices.ts` | The fold of an NFT, what the NFT jobs read and write, and the one conversion of a price |
 | `packages/shared/src/aggregate/{rates-daily,pair-hourly,markets-live,account-rollups}.job.ts`, `aggregate-sets.ts` | What the runners write: the sets, their versions and their readers |
 | `packages/shared/src/query/{daily-rates,account-day-groups,valuation}.ts` | What the API reads them with: `DailyRates`, the day groups (raw or rollup), the valuation rule |
 | `packages/shared/src/xrpl/node-client.ts` | The node client |

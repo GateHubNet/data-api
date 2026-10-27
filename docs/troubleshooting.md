@@ -160,7 +160,7 @@ boot). Check `SELECT min(ledger_index), max(ledger_index) FROM xrpl.ledgers` and
 ### Volumes are empty / stats are stale
 `/v2/network/exchange_volume` and `payment_volume` need markets in the markets config (`GH_MARKETS_CONFIG` or `config/markets/<network>.json`); the Xahau
 file ships empty. `/v2/network/amm_volume` does not depend on the markets for its components (every pool with swaps counts), but converts them with the rates of the
-markets against the native currency and of the pools, and Xahau has no AMM, so it is empty there. `/v2/stats` and the volumes (all three metrics, twelve live sets) are
+markets against the native currency and of the pools, and Xahau has no AMM, so it is empty there. `/v2/stats` and the volumes (all four metrics, fifteen live sets) are
 written by the aggregator once a minute; after an outage or on a database with years of history the current hour lags until it has caught up
 (`syncer_aggregator_stats_lag_seconds`).
 
@@ -170,6 +170,29 @@ pool is 404 there for up to about a minute after its ledger committed while its 
 are not ingested: the syncer started after them and the history was not re-ingested ([backfill](backfill.md#amm-data-re-ingest)); `SELECT count() FROM xrpl.amm_pool_states
 WHERE amm_account = '<pool>'`. (3) `amm_pools` fails for this pool: the aggregator log names it (`Aggregator job amm_pools failed for pool ..., set aside to be tried
 again`) and `syncer_aggregator_errors_total{job="amm_pools"}` rises ([operations](operations.md#the-amm-jobs)).
+
+### NFT answers say `"complete": false`, or an NFT has no `minted`
+`coverage` says how much of the history the index holds ([api-reference](api-reference.md#coverage)): the NFT data start at the first ledger written by parser
+version 5, and `complete` is true only when that is at or before the ledger the amendment was enabled in (XRPL 75443457, Xahau 1). Before the history is
+re-ingested, or on a testnet (never backfilled), it is false and an NFT minted earlier has no `minted` and perhaps no `owner`. `SELECT maxOrNull(ledger_index)
+FROM xrpl.ledgers WHERE parser_version < 5` is the last ledger the NFT data lack ([backfill](backfill.md#nft-re-ingest)). With the history in and the answer still
+`complete: false` on a mainnet, the enable ledger is not known to the API: check `GET /v2/network/amendments/NonFungibleTokensV1_1` (or `URIToken`) has an
+`enabled.ledger_index`. It reports one only for an amendment that the node's ledger state lists as enabled, which the `validators` worker polls into `network_state` (the ledger is
+then the indexed `EnableAmendment` transaction or, on a mainnet, the metadata file): a syncer with only the `ingest` and `aggregator` workers never does, and every
+NFT answer then says `complete: false`.
+
+### `GET /v2/nft_collections/...` is 404 `collection not found` for a collection that exists
+(1) The other network's form of the path: XRPL is `/{issuer}/{taxon}`, Xahau `/{issuer}`. (2) The collection is new, or the first fill is still under way: collections
+are computed by the aggregator some minutes after their NFTs change, and after a rollout first in, first out (`syncer_nft_collections_pending`,
+[operations](operations.md#the-nft-data)); the NFT's own routes and an account's holdings are served meanwhile. (3) `nft_collections` fails for it: the log names the
+collection (`Aggregator job nft_collections failed for collection <issuer>/<taxon>, set aside to be tried again`) and `syncer_aggregator_errors_total{job="nft_collections"}` rises.
+
+### `syncer_nft_state_lag_ledgers` is huge after a start, or the NFT lists stay empty
+The job does not know its cursor until it has read it (a join of every touch with the NFTs, which may take as long as a query may), and the gauge is the whole head till
+then: wait a few minutes. On a database that had no ledger at the first read the cursor is 0 and the job crosses the empty history 10,000 ledgers at a time, a few
+million a minute (half an hour for XRPL): the lag falls by itself, or restart the syncer once ledgers are committed. A read of the cursor that fails is logged and counted
+(`syncer_aggregator_errors_total{job="nft_state"}`) and tried again after 5 minutes, doubling to an hour; if it never fits `GH_CLICKHOUSE_MAX_EXECUTION_TIME` the live part
+never starts ([operations](operations.md#the-nft-data)).
 
 ### AMM swaps, pools or days are missing before a date
 The ledgers were written by parser version 1, which has no AMM rows (`SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY

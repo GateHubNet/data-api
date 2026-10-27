@@ -30,8 +30,9 @@ no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile 
 | Account network names | `INSERT INTO xrpl.account_network_names ...` (or `xahau.`), shows within 60 s on that network only: [Name an account on one network](#name-an-account-on-one-network) |
 | Labels | `INSERT INTO shared.account_labels ...`, shows within 60 s: [Label an address](#label-an-address) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
-| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`) |
+| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
+| NFT data | `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending`, `syncer_nft_skipped_total`, the `nft_state` / `nft_state_dirty` / `nft_collections` error labels, [the NFT data](#the-nft-data) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
 | Exports | `exporter-xrpl` / `exporter-xahau` (profile `exports`, one each): `GET /liveliness/healthz` on 3005, `exporter_jobs_total{status}`; the jobs are rows of `export_jobs` ([deployment](deployment.md#topology)) |
 | Account and market aggregates | `syncer_markets_live_age_seconds{period}`, `syncer_markets_live_amm_share_known{period}`, `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`, `syncer_account_rollups_pending_accounts`; see [Account and market aggregates](#account-and-market-aggregates) and [the AMM data additions](#the-amm-data-additions) |
@@ -86,6 +87,11 @@ fails the batch, so the live runner retries the same ledgers without end. Nothin
 first (the compose files do). The api's `/v2/path_payments` and `/v2/accounts/{address}/path_payments` answer 500
 `unable to retrieve path payments` until the tables exist. Filling the history:
 [backfill](backfill.md#path-payments-re-ingest).
+**The ingest needs migration `011_nft_data.sql` applied before a syncer with parser version 5 starts, and the api after it.** That syncer writes the
+five NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales`, `nft_touches`) with every ledger, and an insert into a
+missing table fails the batch, so the live runner retries the same ledgers without end; the NFT aggregator jobs read the other tables of the file.
+Nothing checks for the tables at boot: run the migrate job first (the compose files do), then deploy the syncer, then the api (the NFT routes answer
+500 until the tables exist). The rollout and the history: [The NFT data](#the-nft-data), [backfill](backfill.md#nft-re-ingest).
 **The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
 [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
 for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
@@ -363,8 +369,12 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_last_commit_age_seconds` | under ~10 s live (a ledger closes every 3-4 s on XRPL) | Above 60 s with a lag of 0 means the chain is not closing ledgers or the head hint is stuck |
 | syncer probe `state` | `live` (`catching_up` while behind) | `halted` (chain break, a ledger the parser rejects, or lost lease) |
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
-| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs) |
+| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs), for `nft_state` / `nft_state_dirty` / `nft_collections` [the NFT data](#the-nft-data) |
 | `syncer_amm_unclassified_total` | a trickle at most | A burst: the parser met a pool shape it cannot place (a new kind of AMM transaction, an MPT asset); see [backfill](backfill.md#amm-data-re-ingest) |
+| `syncer_nft_state_lag_ledgers` | 0-2 once caught up (more for a tick or two after every start: the job does not know its cursor until it has read it, and the gauge is the whole head till then) | Above 100 for more than 10 minutes after a start (alert with a `for:` longer than a tick plus the read of the cursor); large and falling is a first fill or a catch-up, see [The NFT data](#the-nft-data) |
+| `syncer_nft_dirty_ledgers` | 0 | Positive and not falling for an hour: a re-ingest is waiting for `nft_state` and the job is failing (`syncer_aggregator_errors_total{job="nft_state"}`); falling is the digest of a re-ingest |
+| `syncer_nft_collections_pending` | 0 or small | Large after a rollout, falling by 150 or more every five minutes: see the first fill in [The NFT data](#the-nft-data); not falling at all for hours with `{job="nft_collections"}` errors rising: a collection that fails |
+| `syncer_nft_skipped_total` | flat (no MPT-priced NFT offer exists today) | Rising: NFT events with an MPT amount are dropped (the parser warns in the range-ingest log), the NFT history is missing them |
 | `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
 | `syncer_markets_live_age_seconds{period=~"7day\|30day"}` | under about 300 s (a set every fifth run, about every 5 minutes); about 900 s for a few minutes after one failed set | Above 600 s for 10 minutes: that period of the Markets table is stale (the `MARKETS` switch needs all three periods under 600 s) |
 | `syncer_pair_hourly_missing_hours` | 0 (745 for a few minutes after the first start of a syncer with the AMM data additions) | Above 0 for 30 minutes |
@@ -530,11 +540,11 @@ operator needs:
 | Job | Budget and cadence | Healthy | Watch |
 | --- | --- | --- | --- |
 | `amm_pools` | 3 s, every tick, third in the tick (after `volume_daily`) | A new pool is in `GET /v2/amm/pools/{pool}` within about a minute of its first ledger | `syncer_aggregator_errors_total{job="amm_pools"}` and `{job="amm_pools_dirty"}`; log lines `Aggregator job amm_pools ...` |
-| `amm_daily` | 4 s, at the first tick and then every 5th tick (about five minutes), sixth in the tick (after `stats_dirty`) | Today's row follows the pool within five minutes; the back-fill says `AMM daily back-fill: N days to compute` and then `is done` | `{job="amm_daily"}` and `{job="amm_daily_dirty"}` |
+| `amm_daily` | 4 s, at the first tick and then every 5th tick (about five minutes), ninth in the tick (after `stats_dirty`) | Today's row follows the pool within five minutes; the back-fill says `AMM daily back-fill: N days to compute` and then `is done` | `{job="amm_daily"}` and `{job="amm_daily_dirty"}` |
 | `amm_volume` | inside `volume_live` (5 s), `volume_daily` (4 s) and `volume_backfill` (10 s) | `GET /v2/network/amm_volume` has components | the volume jobs' errors, `volume_live` and `volume_daily` |
 
-- **The tick shares its budget.** `volume_live` (twelve live sets) and `volume_daily` (six daily sets of today and yesterday) go first,
-  then `amm_pools`, so the pool list is as fresh as the volumes; `amm_daily` goes after `stats_dirty` and only gets what is left.
+- **The tick shares its budget.** `volume_live` (fifteen live sets) and `volume_daily` (eight daily sets of today and yesterday) go first,
+  then `amm_pools` and `nft_state`, so the pool list is as fresh as the volumes; `amm_daily` goes after `stats_dirty` and only gets what is left.
   Each job has its own budget, so a long `amm_daily` back-fill cannot starve the live jobs. If a job logs `reached its budget`, it goes
   on at the next tick or run (said once until a run finishes in time).
 - **What a recompute costs.** A pool's state is the newest non-null value of each column over its state rows (a swap carries no fee, LP
@@ -574,6 +584,83 @@ operator needs:
   `--reprocess`), or `amm_pools` is failing for it (the log names the pool).
 - **Is the AMM data complete?** `SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY parser_version`:
   ledgers written by version 1 have no AMM rows. A pool whose creation was not ingested has no `created_ledger` / `created_by`.
+
+## The NFT data
+
+The aggregator keeps four NFT tables up to date with two jobs, `nft_state` (`nfts`, `account_nfts`) and `nft_collections` (`nft_collections`,
+`nft_collection_holders`), and a fourth volume metric, `nft_volume`, in the volume sets. How they work is in [syncer](syncer.md#the-nft-jobs); the
+design in [ADR-0016](adr/0016-nft-and-uritoken-data.md); what an operator needs:
+
+| Job | Budget and cadence | Healthy | Watch |
+| --- | --- | --- | --- |
+| `nft_state` | 3 s, every tick, fourth in the tick (after `amm_pools`) | An account's holdings and its NFTs in a collection's list follow the ledger within about a minute; the detail, history and offers of an NFT are read from its events and are there at once | `syncer_aggregator_errors_total{job="nft_state"}` and `{job="nft_state_dirty"}`; `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`; log lines `Aggregator job nft_state ...` |
+| `nft_collections` | 3 s, at the first tick and then every 5th tick (about five minutes), tenth in the tick (after `amm_daily`) | A collection's row and holders follow its NFTs within about five minutes | `{job="nft_collections"}`; `syncer_nft_collections_pending`; log lines `Aggregator job nft_collections ...` |
+| `nft_volume` | inside `volume_live` (5 s; the sets for `day`, `7day`, `30day`), `volume_daily` (4 s) and `volume_backfill` (10 s) | `GET /v2/network/nft_volume` has components | the volume jobs' errors, `volume_live` and `volume_daily` |
+
+**What the owner does to deploy** (the order matters):
+1. **Apply migration `011_nft_data.sql`** (`dc run --rm migrate-xrpl` / `migrate-xahau`) **before this release's syncer**; then deploy the syncer, then the
+   api. The writer inserts into the five NFT ledger tables with every ledger ([above](#apply-a-schema-migration)).
+2. **Fill the history.** `range-ingest --from 75443457 --to <checkpoint> --reprocess` on XRPL and `--from 1` on Xahau (Xahau's coverage needs
+   ledger 1: the amendment `URIToken` is enabled in its genesis), or as part of the program's one reprocess after its last parser version, which is far
+   cheaper than one pass per feature ([backfill](backfill.md#nft-re-ingest)). Watch **`syncer_nft_dirty_ledgers` fall to 0**; `volume_backfill`
+   fills `nft_volume`'s daily sets. Xahau's `--from 1` stores ledger 1 with the close time 0, so `volume_backfill` then starts at 1970-01-01 and
+   walks about 19,000 empty days for each of the four metrics, newest first: the real days are done first, and the empty ones are cheap but many.
+3. **Coverage turns `complete`** once no ledger at or above the enable ledger was written by an older parser ([the check](#is-the-nft-data-complete)).
+   The testnets stay `complete: false`: they get no backfill.
+4. **Hand the explorer this commit** for its API sync (`pnpm api:sync`). The explorer turns its `NFTS` switch on per environment once that
+   environment's API serves these routes on both networks and the lag gauges are near 0.
+
+- **A first fill is slow, by design.** After the re-ingest the queue of `nft_collections` holds every collection, and it is worked first in, first
+  out, **one 3 s run every five minutes**: plan on about **150 collections every five minutes** for XRPL's large collections (a batch of 50 takes about
+  a second), while small ones go thousands to a run (the Xahau live check cleared 2,089 in one). A collection that changes meanwhile waits behind the fill. So after a rollout the collection
+  pages update slowly until `syncer_nft_collections_pending` is 0 (days on XRPL), and `GET /v2/nft_collections` lists only the collections counted
+  so far (its `total` grows); an NFT's own routes, an account's holdings and a collection's sales do not wait for it.
+- **A database with no ledger starts the cursor of `nft_state` at ledger 0.** Its first read of the cursor (`nftStateWatermark`) finds no ledger and
+  answers 0, and the job then crosses the history from 0 to the head in windows of 10,000 ledgers, a few million ledgers a minute (about 3.4
+  million a tick on a laptop: 32 minutes for XRPL's 108 million ledgers in the live check, under ten for Xahau's 27 million). `syncer_nft_state_lag_ledgers`
+  starts at the head and falls by that much a minute, and no NFT is in the aggregates before the cursor reaches it. Nothing is wrong. To skip the
+  crossing, start the syncer with `GH_WORKERS=ingest` until the first ledgers are committed, or restart the syncer once they are (the cursor is then
+  found from the tables). It does not happen on a database that has ledgers: there the cursor is the ledger before the oldest NFT touch the aggregate
+  has not seen.
+- **The cursor is read at every start, and the read can be slow.** `nftStateWatermark` joins every touch to its NFT, which on a mainnet-sized `nfts`
+  may take as long as the time limit of a query (`GH_CLICKHOUSE_MAX_EXECUTION_TIME`, 30 s). The job does not wait for it: the live part starts at the
+  first tick after the read answered, so **`syncer_nft_state_lag_ledgers` reads the whole head for at least one tick after every start** (an alert
+  needs a `for:` of more than a tick plus the read; ten minutes is safe), and a read that fails is counted (`{job="nft_state"}`) and tried again after
+  5 minutes, doubling to an hour. So a failed read at boot delays the live part by at least five minutes, and **a read that never fits the time limit
+  keeps the live part from ever starting** while the retries and the dirty ranges go on: raise `GH_CLICKHOUSE_MAX_EXECUTION_TIME` for the syncer, or
+  rebuild the NFTs with a re-ingest. A stop of the syncer does not cancel a read in flight.
+- **An NFT or a collection that fails is set aside, not stuck.** `nft_state` halves a failing batch of up to 500 NFTs to find the NFTs that fail on their
+  own (at most three per batch), counts each as an error, and retries each after 5 minutes, doubling up to an hour; `nft_collections` does the same with
+  batches of 50 collections. The log names it: `Aggregator job nft_state failed for NFT <id>, set aside to be tried again`, `... nft_collections failed for
+  collection <issuer>/<taxon>, ...`. The warning `a batch of N NFT(s) failed as a whole, but its halves were rebuilt: <cause>` is one error and loses
+  nothing (the batch failed for its size). The sets are in memory: a restart finds the NFT or collection again from the tables.
+- **After a re-ingest** (`range-ingest --reprocess` over NFT ledgers, see [backfill](backfill.md#nft-re-ingest)) the written ledgers mark `agg_dirty`, and each
+  slice's hook (error label `nft_state_dirty`; it fails the slice if it fails) appends the ledgers to `nft_dirty`; `nft_state` works through the oldest range in
+  steps of 10,000 ledgers, rebuilding the NFTs with a touch in the step and removing an NFT that has no event left, and the range shrinks until it is
+  gone (`SELECT * FROM xrpl.nft_dirty` shows them). Until then the aggregates (holdings, collection lists) show the old data; an NFT's detail, history
+  and offers show the new data at once.
+- **`syncer_nft_skipped_total`** counts the NFT events the parser dropped because their amount is an MPT amount (none is possible in the ledger today).
+  A rise means the NFT history is missing those events: the range-ingest log warns with the total of its run and always ends with `J skipped NFT events`.
+- **A collection that is missing.** `GET /v2/nft_collections/{issuer}/{taxon}` and its sub-routes answer 404 for a collection the job has not counted yet
+  (up to about five minutes after its first NFT, or a long wait in the first fill above). A 404 that lasts: no event of the NFTs was ingested, or
+  `nft_collections` is failing for it (the log names the collection).
+- **Disk.** An event is stored up to four times (by NFT, by collection, for each account it involves, and a sale again in ledger order), and the four
+  aggregates grow with each rebuild until merges drop the older versions ([data-model](data-model.md#nft-aggregates-migration-011)).
+
+### Is the NFT data complete?
+
+```sql
+-- the NFT data cover the ledgers above this one (NULL: every stored ledger); the answers say `complete` when it is below the enable ledger
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 5;
+-- every ledger from the enable ledger on is written by parser version 5 (Xahau: xahau.ledgers, from ledger 1)
+SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 75443457 GROUP BY parser_version;
+-- the NFTs and collections the aggregator has built so far, and the ranges it still has to rebuild
+SELECT (SELECT uniqExact(nft_id) FROM xrpl.nfts) AS nfts, (SELECT uniqExact(issuer, taxon_key) FROM xrpl.nft_collections) AS collections;
+SELECT from_ledger, to_ledger FROM xrpl.nft_dirty ORDER BY from_ledger;
+```
+
+The coverage the API states is `GET /v2/nfts/{id}` or any list's `coverage` ([api-reference](api-reference.md#coverage)): `from_ledger_index` is that first query's
+answer plus one. On a testnet (`xrpl_testnet.`, `xahau_testnet.`) it is `complete: false` for ever: there is no backfill.
 
 ## Backfill and repair
 
@@ -659,7 +746,7 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 
 ### What a re-ingest does to them
 
-`range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)):
+`range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)), and a fourth, of `nft_state`, marks the slice's ledgers in `nft_dirty` ([The NFT data](#the-nft-data)):
 
 - **Rates**: the days of the slice and the 14 after it that have a valid set are marked stale (a day's rate reads the trades of the 14 days before it). Until `rates_daily` has computed them again, newest first, the API values those days on read, so `syncer_rates_daily_missing_days` rises by up to the range plus 14 days and falls again; expect the
   slower path for the window of the range, and `api_rates_on_read_total` to show it. While ranges of the re-ingest wait in `agg_dirty`, `rates_daily` leaves the days they reach (the range and the 14 days after it) for after they are drained, so the gauge falls only as the queue empties. A range
@@ -667,7 +754,7 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 - **Hours**: the hours of the slice in the last 31 days are recomputed at once (after an AMM `--reprocess` this is what puts the swaps into the `amm` rows of the Markets, see [the AMM data additions](#the-amm-data-additions)).
 - **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
 
-Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`) says which.
+Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`) says which.
 
 ### The AMM data additions
 
@@ -692,7 +779,7 @@ data (a swap against a pool is an `exchanges` row written by parser version 2) a
 4. **The explorer's `AMM_DATA` switch** is the owner's, per environment (section 16 of the design). The gauges for it are in the table above; read the rest of this section first.
 
 **What to watch: the cost of the live day set.** The live `amm_volume`/`day` set now estimates the fees of its pools at every tick (the swaps of 24 hours of the listed pools, one day-read of `amm_daily`), inside the
-5 s budget of `volume_live` that the twelve live sets share (`AGGREGATOR_VOLUME_LIVE_BUDGET_MS` in `aggregator.service.ts`, a constant, not a setting). After the deploy check that the live sets keep refreshing: the
+5 s budget of `volume_live` that the fifteen live sets share (`AGGREGATOR_VOLUME_LIVE_BUDGET_MS` in `aggregator.service.ts`, a constant, not a setting). After the deploy check that the live sets keep refreshing: the
 spacing of the `version`s (the write time in milliseconds) of the live `amm_volume`/`day` and `trade_volume`/`day` sets in `volume_live`, about a minute apart; `syncer_aggregator_errors_total{job="volume_live"}`; and the warning
 `Aggregator job volume_live reached its budget; the sets left go on next tick` in the log (said once until a tick finishes in time). Measure the duration of the `amm_volume`/`day` set on the mainnet database before turning
 `AMM_DATA` on. If it crowds the budget, the options are raising `AGGREGATOR_VOLUME_LIVE_BUDGET_MS`, computing the estimate only every Nth tick, or narrowing the carry it requires to the trading fee (a slot lasts 24 h, far less

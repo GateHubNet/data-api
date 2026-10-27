@@ -69,7 +69,7 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   divide 1,000,000: 500, 250, 100, ...) if memory is tight.
 - Budget disk for `transactions` (`tx_json` and `meta_json` are ZSTD-compressed text and by far the largest columns): roughly
   1-1.5 TB compressed for full XRPL history.
-- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools`) and, in ClickHouse,
+- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools, J skipped NFT events`) and, in ClickHouse,
   `SELECT count(), max(ledger_index) FROM xrpl.ledgers`. The aggregator follows by itself (see below).
 
 ### Resuming, gap repair, reprocessing
@@ -109,13 +109,17 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   Parser version 4 adds the path payments (`path_payments`, and their index by account `account_path_payments`): ledgers written by
   an older version have none, see
   [Path payments re-ingest](#path-payments-re-ingest).
+  Parser version 5 (the current one) adds the NFT and URIToken events (`nft_events`, `account_nft_events`, `collection_nft_events`,
+  `nft_sales`, `nft_touches`): ledgers written by an older version have none, see [NFT re-ingest](#nft-re-ingest). NFT events the parser
+  dropped for an amount that is an MPT amount are counted in `syncer_nft_skipped_total`, and the range-ingest log names the total of its run
+  (a warning when it is not 0, and the last line says `J skipped NFT events` always).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
 
 ### AMM data re-ingest
 
-`PARSER_VERSION` is 2 since the AMM parser ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)). A ledger written by version 1 has no
+`PARSER_VERSION` became 2 with the AMM parser ([ADR-0011](adr/0011-amm-data-and-swaps-as-exchanges.md)). A ledger written by version 1 has no
 AMM rows, and what the live syncer writes from the deploy on is version 2 only: **a database that ingested the XRP Ledger before this
 release is missing every swap, liquidity event and pool state before it**, and `ledgers.exchanges_count` and `/v2/stats` lack the swaps.
 A pool appears in the API when its first transaction is ingested, so until the history is re-ingested the pool list has the pools that were
@@ -170,7 +174,7 @@ How it was found (bisecting `ledger_entry` on the `Amendments` object: 54 enable
 
 ### Account state history re-ingest
 
-`PARSER_VERSION` is 3 since the account and trust line state history
+`PARSER_VERSION` became 3 with the account and trust line state history
 ([ADR-0015](adr/0015-historical-account-state-from-clickhouse.md)): every ledger written by version 3 has its `account_states` and
 `trust_line_states` rows, and a ledger written by an older version has none. The API answers a historical read of the state tables
 (`/v2/accounts/{address}?flags=true` with a ledger named, `/v2/accounts/{address}/trustlines`) only above the **newest ledger an older
@@ -191,7 +195,7 @@ SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3;
 The API keeps that answer for a minute (`STATE_COVERAGE_CACHE_MS`).
 ### Path payments re-ingest
 
-`PARSER_VERSION` is 4 since the path payments parser (`PATH_PARSER_VERSION`, spec #4). A ledger written by an older version has no
+`PARSER_VERSION` became 4 with the path payments parser (`PATH_PARSER_VERSION`, spec #4). A ledger written by an older version has no
 `path_payments` or `account_path_payments` rows, so `/v2/path_payments` and `/v2/accounts/{address}/path_payments` list the path
 payments of the ledgers ingested since the deploy only. Nothing else
 changes for those ledgers: the payments, exchanges and AMM rows a reprocess rewrites come out the same.
@@ -208,6 +212,72 @@ changes for those ledgers: the payments, exchanges and AMM rows a reprocess rewr
    ```sql
    SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index BETWEEN <A> AND <B> GROUP BY parser_version;
    ```
+
+### NFT re-ingest
+
+`PARSER_VERSION` is 5 since the NFT parser (`NFT_PARSER_VERSION`, [ADR-0016](adr/0016-nft-and-uritoken-data.md)). A ledger written by an
+older version has no rows in the five NFT tables, and what the live syncer writes from the deploy on is version 5 only: **a database that
+ingested a network before this release lists the NFTs of the ledgers since the deploy and nothing earlier**, and every NFT answer says so in its
+`coverage` (`from_ledger_index`, and `complete: false` until the history is re-ingested). Both networks have the data: XRPL NFTokens and
+Xahau URITokens.
+
+**Where to start.** No NFT exists before the ledger that enabled the amendment (`packages/shared/config/amendments/<family>.json`):
+
+| | XRPL | Xahau |
+| --- | --- | --- |
+| Amendment | `NonFungibleTokensV1_1` | `URIToken` |
+| Enable ledger | **75,443,457** (2022-10-31) | **1**, the genesis: `complete_ledgers` of `xahau.network` starts at 1 and ledger 1 has `URIToken` in its `Amendments` |
+| Re-ingest | `--from 75443457` | `--from 1` |
+
+Complete coverage needs **every** ledger from the enable ledger to the checkpoint written by version 5, so on Xahau it needs ledger 1 itself. Ledger
+1 is the genesis: its close time is 0 (the file gives the date of ledger 2, the first closed ledger), so the daily volume back-fill that
+follows starts at 1970-01-01 and walks about 19,000 days with no ledger in them, for each of the four volume metrics, newest first (the real
+days come first and an empty day is cheap, but `volume_backfill` stays busy with them for a long time). Nothing is wrong with it.
+
+**Procedure.**
+1. Apply migration `011_nft_data.sql` **before** the syncer of this release starts: the syncer writes the five NFT tables with every ledger, and
+   a write to a missing table fails the batch, so the live runner would retry it for ever
+   ([operations](operations.md#apply-a-schema-migration)). Then deploy the syncer, then the api.
+2. Re-ingest the committed history from the enable ledger up to the live checkpoint with `--reprocess`:
+
+   ```bash
+   # the checkpoint: SELECT max(ledger_index) FROM xrpl.ledgers
+   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+     node dist/cli/range-ingest.js --from 75443457 --to <checkpoint> --reprocess --concurrency 16
+   # Xahau: --from 1, on syncer-xahau, with --concurrency 1 on the public node
+   ```
+
+   That is 32 million ledgers on XRPL and the whole history on Xahau. **Do it once, as part of the program's one reprocess after its last
+   parser version**: a reprocess rewrites every table of each ledger, and one pass serves every parser version, which is far cheaper than one
+   per feature. Read [Which node?](#2-which-node) and use a node of your own. After a failure do
+   not rerun the same command (see [Resuming](#resuming-gap-repair-reprocessing)). Ledgers that are not committed yet (a new database filled
+   below the live start) need no `--reprocess`.
+3. **The aggregates follow by themselves, in three queues.** Every written chunk marks its hours in `agg_dirty`, and its slice's hook appends
+   the ledger range to `nft_dirty` (the hook rebuilds no NFT). The `nft_state` job works through the oldest range of `nft_dirty` in steps of
+   10,000 ledgers within its 3 s a tick: **watch `syncer_nft_dirty_ledgers` fall to 0** (`SELECT * FROM xrpl.nft_dirty` shows the ranges), and
+   `syncer_nft_state_lag_ledgers` stay near 0. The collections it rebuilt are queued for `nft_collections`: **its first fill is
+   first in, first out, one 3 s run every five minutes**: plan on about 150 collections every five minutes for XRPL's large ones (batches of 50 that
+   take a second; small collections go thousands to a run, as on Xahau), and `syncer_nft_collections_pending` falls. A collection that changes
+   meanwhile waits behind the fill, so after a rollout collection pages update slowly until it has drained (days on XRPL). The daily
+   `nft_volume` sets are filled by `volume_backfill` (the stats and the other volumes' sets are recomputed with the slices as always).
+4. Check the coverage:
+
+   ```sql
+   -- the NFT data cover the ledgers above this one (NULL: every stored ledger); `complete` once this is below the enable ledger
+   SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 5;
+   -- which parser wrote a range
+   SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 75443457 GROUP BY parser_version;
+   -- the ranges the aggregator has still to rebuild the NFTs of (syncer_nft_dirty_ledgers is their size)
+   SELECT from_ledger, to_ledger FROM xrpl.nft_dirty ORDER BY from_ledger;
+   ```
+
+   (Xahau: `xahau.ledgers`, `WHERE ledger_index >= 1`; on the sandbox the databases are `xrpl_testnet.` and `xahau_testnet.`.) The API keeps the
+   coverage for a minute (`FEATURE_COVERAGE_CACHE_MS`). It also needs the enable ledger of the amendment, which the API reports only for an amendment that the node's
+   ledger state lists as enabled: the `validators` worker polls that state into `network_state` (the ledger itself is the indexed `EnableAmendment` transaction,
+   which the re-ingest brings in, or, on a mainnet, the amendment metadata file). A deployment without that worker reads its amendments as `voting` and never says
+   `complete`.
+5. **The testnets** (XRPL Testnet, Xahau Testnet) get no backfill: their index starts at the validated head of their deployment's first boot, and
+   their NFT answers stay `complete: false`.
 
 ### Public nodes and rate limits
 

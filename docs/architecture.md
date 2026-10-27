@@ -63,7 +63,7 @@ Everything both services need, written once:
   (`config/amendments/<family>.json`), read by the testnet of the family without its `enabled` entries.
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
-- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments) and
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens) and
   `buildLedgerRows` (a raw ledger -> rows of the 28 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
@@ -73,8 +73,9 @@ Everything both services need, written once:
 - **`export/`**: the export jobs (`export_jobs`: append, read the current state, the queue) and the storage of their files
   (`ExportStorage`: `GcsExportStorage`, V4 signed links; `MemoryExportStorage` for tests), shared by the api and the exporter.
 - **`aggregate/`**: the `stats_hourly`, volume and AMM jobs (`amm_pools`, `amm_daily`) the aggregator runs, and the reads they share
-  (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), and the jobs of the account and market aggregates
-  (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`).
+  (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), the jobs of the account and market aggregates
+  (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) and the NFT jobs (`nft_state`, `nft_collections`, with `foldNftEvents`, the one
+  fold of an NFT's events that the job and the API's detail route share, and the prices of sales in `query/nft-prices.ts`).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
@@ -93,12 +94,12 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   becomes the route's message, the cause is logged), hand-written parameter parsers (`params.ts`: booleans, dates, limits;
   `asset-param.ts`: `CUR+issuer`), `pagination.ts` (markers, `Link`), `csv.interceptor.ts`, `format.ts`, and a catch-all `/v2/*` 404
   controller registered last.
-- **Cross-cutting services:** `LedgerRangeResolver` (a date -> a ledger range, cached), `TxService` (a stored transaction ->
+- **Cross-cutting services:** `FeatureCoverageService` (`coverage(feature)`: how much of a feature's history the index holds, the program's one coverage rule, [api-reference](api-reference.md#coverage)), `LedgerRangeResolver` (a date -> a ledger range, cached), `TxService` (a stored transaction ->
   the Ripple object, binary codec with the node's definitions, an LRU of serialized forms), `XrplService` (the shared `NodeClient` with
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `amm`,
-  `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `nft`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -123,6 +124,26 @@ The AMM routes are GateHub extras ([ADR-0011](adr/0011-amm-data-and-swaps-as-exc
   `AccountAmmController` in `AccountsModule`.
 - **Existence of a pool.** The pool routes other than detail and pair share `AmmPoolsService.requirePool` (a state row in a committed
   ledger); detail and pair read `amm_pools`, which the aggregator rebuilds.
+
+#### The NFT module (`apps/api/src/nft`)
+
+The NFT routes are GateHub extras ([ADR-0016](adr/0016-nft-and-uritoken-data.md)); the module follows the AMM module's pattern.
+
+- **Controllers and route order.** `NftModule` lists `NftsController` (`v2/nfts/:nft_id`, `/history`, `/offers`), **`NftCollectionListsController`**
+  (`:issuer/nfts`, `:issuer/:taxon/nfts`, and the same for `holders`, `sales` and `stats`), then **`NftCollectionsController`** (the list, and
+  `:issuer`, `:issuer/:taxon`) and `NftSalesController`. The lists of a collection come before the collection itself: the detail's
+  `/:issuer/:taxon` matches every path of two segments, so `/{issuer}/nfts` would be read as a collection of the taxon `nfts`. Nest registers routes in the
+  order of `controllers`, and `nft.module.spec.ts` pins the order. `AccountNftsController` (`nfts`, `nft_history`) is in `AccountsModule`, and `nft_volume`
+  in the volume controller of `network`.
+- **Object shapes in one file.** `nft/nft-objects.ts` holds every object, its key order (the `*_KEYS` constants the tests and
+  `nft/api-reference.spec.ts` pin), its CSV columns and the builders; `nft/nft-params.ts` the parameters with their messages in the order of the checks.
+- **Coverage.** Every service asks `FeatureCoverageService` for `coverage('nfts')` (`common/coverage-features.ts` registers the feature: its parser
+  version and where it starts), or for an NFT's own coverage (`itemCoverage`). A later feature adds an entry there.
+- **One fold, one conversion.** The detail route folds the NFT's events with the shared `foldNftEvents`; every price in an answer is converted by
+  `convertedSalePrices` (`nftSalesNativeSql`).
+- **Reads.** The events are read by `readDistinctPage` (a range of the primary key, the filters inside the capped read), the lists of the aggregates by
+  `readNewestPage` (the newest version of each key, again with more room while a filter leaves a page short); both are bounded by `read_rows` tests
+  (`paged-reads.e2e-spec.ts`).
 
 ### Exporter: `apps/exporter` (`@gatehub/data-exporter`)
 
@@ -155,7 +176,8 @@ views. See [clickhouse](clickhouse.md).
    dedup tokens.
 4. Workers on the side: validations stream -> `validations`/`validator_manifests` (and `validator_validations`, `validator_seen`); `fee` every 5 s
    -> `fee_stats`; the aggregator rolls `ledgers` into `stats_hourly`, computes `volume_*` from `exchanges`/`payments` and rates, rebuilds the AMM
-   aggregates (`amm_pools`, `amm_daily`) from the append-only AMM ledger tables, and keeps the account and market
+   aggregates (`amm_pools`, `amm_daily`) from the append-only AMM ledger tables and the NFT aggregates (`nfts`, `account_nfts`, `nft_collections`,
+   `nft_collection_holders`) from the append-only NFT ledger tables, and keeps the account and market
    aggregates (daily native rates, `pair_hourly` and `markets_live` from `exchanges`, rollups of heavy accounts from `balance_changes`,
    `account_transactions` and `account_exchanges`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
    rounds and the hourly agreement from `validations` and `ledgers`.

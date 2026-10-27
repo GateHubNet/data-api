@@ -62,8 +62,10 @@ recordings it adds and writes `FINDINGS.md`.
 **XRPL NFTokens**
 - **No NFT ids in the `ledger` metadata.** The ledger stream's metadata has no `nftoken_id` / `offer_id` (those are added by `tx` only). Ids
   come from `NFTokenPage` diffs: a page's `NFTokens` lists `{NFToken: {NFTokenID, URI?}}`. Previous arrays are in `PreviousFields`
-  (modified), final ones in `FinalFields` / `NewFields`, a deleted page's in `FinalFields`. Pages split and merge, so ids are compared over
-  the union of all page nodes of the transaction, never page by page.
+  (modified), final ones in `FinalFields` / `NewFields`, a deleted page's previous ones in `PreviousFields.NFTokens` when present, else in
+  `FinalFields` (amended during the build, 2026-10-27, controller ruling of Task 4: a token removed in the transaction and the page then
+  merged forward and deleted leaves the removed token only in `PreviousFields`). Pages split and merge, so ids are compared over the union
+  of all page nodes of the transaction, never page by page.
 - **The page key names the owner:** the first 20 bytes of an `NFTokenPage` `LedgerIndex` are the owner's AccountID.
 - **The id encodes the NFT:** `Flags (2) | TransferFee (2) | Issuer (20) | scrambled Taxon (4) | Sequence (4)`. The sequence is the
   **serial**; `taxon = scrambled XOR ((384160001 × serial + 2459) mod 2^32)`. Flags: `lsfBurnable` 0x0001, `lsfOnlyXRP` 0x0002,

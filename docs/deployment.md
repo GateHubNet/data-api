@@ -233,6 +233,11 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last ([the AMM data additions](operations.md#the-amm-data-additions)).
 - `009_account_network_names.sql` (one `CREATE TABLE IF NOT EXISTS`, the operator's account network names) is additive and comes before the api: an api without it serves
   every account without a network name and logs the failed load at every reload, but answers. The syncer never touches the table. The compose files make the api wait for `migrate`.
+- `011_nft_data.sql` (ten `CREATE TABLE IF NOT EXISTS`: the five NFT ledger tables, the four NFT aggregates and `nft_dirty`) is additive but **sets an order**: `migrate`
+  first, then the syncer, then the api. A syncer of this version (parser version 5) writes the five NFT ledger tables with every ledger, and an insert into a missing table
+  fails the batch, so the live runner would retry the same ledgers without end; the NFT routes of the api answer 500 until the tables exist. The compose files make both wait
+  for `migrate`; by hand, run `migrate`, start the syncer, and the api last. The history is filled afterwards ([the NFT data](operations.md#the-nft-data),
+  [backfill](backfill.md#nft-re-ingest)).
 
 ## Configuration and secrets
 

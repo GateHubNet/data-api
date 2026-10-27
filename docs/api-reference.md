@@ -13,7 +13,7 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
-[Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [Validations](#validations) ·
+[Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [NFTs](#nfts) · [Validations](#validations) ·
 [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
 [Operational endpoints](#operational-endpoints)
 
@@ -202,6 +202,47 @@ live answers of `/balances` (the current ledger) and `/orders` send their own (s
 Responses are gzip-compressed when the client asks for it. CORS headers are sent only for the origins in `GH_CORS_ORIGINS`.
 Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it (see [deployment](deployment.md)).
 
+### Coverage
+
+A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (today the
+[NFTs](#nfts); later features of the same program register with the same service and add no rule of their own) put
+
+```json
+"coverage": { "from_ledger_index": 107874617, "complete": false }
+```
+
+right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is not in the CSV.
+
+- **`from_ledger_index`** is where the feature's rows start: **one above the newest stored ledger that a parser older than the feature's wrote**,
+  or the oldest stored ledger when there is none (a database that was filled from its first ledger by the new parser). Gaps in the stored
+  ledgers do not matter (they are an operational fault with their own checks, [operations](operations.md)). It is left out, and `complete` is
+  false, when no ledger is stored at all.
+- **`complete`** is true when `from_ledger_index` is at or before **the ledger the feature starts at**, so that no row can be missing:
+  - A feature **that an amendment enabled** starts at the ledger the amendment was enabled in, as
+    [`GET /v2/network/amendments/{name}`](#get-v2networkamendmentsname) reports it (`enabled.ledger_index`): the `EnableAmendment` transaction
+    the index holds, and on a mainnet the amendment metadata file when it holds none. The API reports an enabling ledger only for an amendment that the
+    node's ledger state lists as enabled, which the syncer's `validators` worker polls. The ledger is never a constant of the code. NFTs are
+    `NonFungibleTokensV1_1` on the XRP Ledger (ledger 75,443,457) and `URIToken` on Xahau (ledger 1, its genesis). Where no enabling ledger is
+    known, `complete` is false.
+  - A feature **as old as the network**, with no amendment, starts at the network's first ledger: **32,570** on the XRP
+    Ledger and **1** on Xahau, its genesis, so complete coverage on Xahau needs ledger 1 indexed (`range-ingest --from 1`).
+  - **The testnets** have no first ledger (their index starts at the validated head of their deployment's first boot and is dropped when the
+    network is reset) and ignore the enable ledgers of the metadata file, which are mainnet's: a feature as old as the network is always
+    `complete: false` there, and a feature of an amendment only when the index holds the amendment's `EnableAmendment`. They are not
+    backfilled.
+  - A feature **a network cannot have** is `complete: true` (nothing can be missing) and its routes read no table.
+- **One item.** The detail of one item (an NFT, with its history and offers) states its own coverage: the feature's, and complete also when the
+  item's creation is indexed (its mint is at or above `from_ledger_index`), whatever came before it.
+- **Freshness.** A feature's coverage is kept for 60 seconds. A read of it that fails fails the route with the route's own 500 message, and no
+  `complete: false` is invented in its place.
+- **Placement.** `coverage` is the key after `result` on every answer derived from ledger history, lists, aggregates and details alike. An
+  answer made of parts that have coverages of their own puts each part's `coverage` as the last key of that part, and a part that needs no
+  history has none. A lookup that lists nothing (a batch of names, a ledger object by id) and an answer that is not derived from ledger history
+  carry none.
+
+Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5.
+
 ### Compatibility
 
 | | `data.ripple.com` | This API |
@@ -239,6 +280,11 @@ From the account investigation data ([ADR-0014](adr/0014-address-names-and-label
 `GET /v2/accounts/{address}` `account_name`, the name the operator gave the address, `account_network_name`, the name the operator gave
 the account on this network only, and `account_labels`, the labels the operator put on the address; and [exports](#exports), `POST /v2/exports` and
 `GET /v2/exports/{id}`, in CSV or PDF ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 68 to 72).
+
+From the NFT data ([ADR-0016](adr/0016-nft-and-uritoken-data.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 73 to 78): the
+[NFT endpoints](#nfts) (`/v2/nfts/{nft_id}` with `/history` and `/offers`, `/v2/accounts/{address}/nfts` and `/nft_history`,
+`/v2/nft_collections` with its collection and their `/nfts`, `/holders`, `/sales` and `/stats`, `/v2/nft_sales`), `GET /v2/network/nft_volume`,
+and the `coverage` field ([Coverage](#coverage)) that their answers carry.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -1750,7 +1796,7 @@ Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 
 
 ## Network
 
-`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`. `marker` is present only when there is a next page. `markets` has an object of its own, described with the route.
+`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` has an object of its own, described with the route.
 
 ### `GET /v2/network/fees`
 
@@ -1829,8 +1875,8 @@ Two modes, chosen by the parameters:
 
 - **Live** (neither `start` nor `end`): one row for a rolling period ending now. `live` is `hour`, `day`, `3day`, `7day` or
   `30day` for trades and for AMM volume, and `hour` or `day` for payments (default `day`; anything else is 400 `invalid period - use:
-  <list>`). The aggregator refreshes these every minute: twelve live sets in all (five periods for each of the trade volume and the AMM
-  volume, two for the payments).
+  <list>`). The aggregator refreshes these every minute: fifteen live sets in all (five periods for each of the trade volume and the AMM
+  volume, two for the payments, three for the [NFT volume](#get-v2networknft_volume)).
 - **Historical** (`start` or `end` given): one row per `interval` (`day`, `week` from Monday, `month`, UTC) for the days the
   aggregator has computed. A missing `start` is the epoch, a missing `end` is now. A bucket is a row when it starts within
   `start` and `end`, whole.
@@ -1908,6 +1954,133 @@ Errors: 400 as above, `invalid start date format`, `invalid end date format`, `i
 not reproduce `converted_amount`); `converted_amount` is always a string; historical rows carry `end_time` (the start of the
 next bucket, exclusive); the historical display currency uses each bucket's own native-to-display price. A day counts as final
 only once the ingest has passed it by an hour, so volumes follow the ingest rather than the wall clock.
+
+### `GET /v2/network/nft_volume`
+
+The volume of the sales of NFTs (XRPL) and URITokens (Xahau) on the network, **per collection**, in the native currency. GateHub extra
+(see [NFTs](#nfts) for the sales themselves). It is the contract of [`exchange_volume`](#get-v2networkexchange_volume-payment_volume-and-amm_volume)
+(the two modes, `interval`, `exchange_currency` and `exchange_issuer`, `limit`, `marker`, `format`, the errors and their order) with these differences:
+
+- **Live periods** are `day`, `7day` and `30day` (default `day`; anything else is 400 `invalid period - use: day, 7day, 30day`). The aggregator
+  refreshes the three sets every minute, with the others', and fills the daily sets of the closed days with `volume_backfill`, newest first.
+  An empty `start=` or `end=` is none, as for the other volumes.
+- **A component is a collection**: `{ issuer, taxon?, count, amount, rate, converted_amount }`, `taxon` the XRPL taxon (a URIToken's
+  collection is an issuer, so it has none). `amount` is the volume in the native currency of the collection's sales **that have a price in it**
+  that day (a native price is itself, an issued one is converted at the rate of the sale's UTC day, the rates of the other volumes), and `count`
+  those sales. `rate` is `"1.0000000"` and `converted_amount` equals `amount`, until `exchange_currency` shows them in another currency (then
+  `rate` and `converted_amount` follow the other metrics). Components are sorted by converted amount, the largest first. A sale priced in an
+  asset that has no rate that day is in no component.
+- **The `count` of the row is every sale of the window**, those with no rate included, so it can be more than the sum of the components'
+  counts. The row's `total` is the sum of the components' converted amounts.
+- **Exact sums.** The amounts, converted amounts and `total` of this metric are exact decimals, and so are their sums over days; the other
+  volumes add Float64 values.
+- Week and month rows add up the converted days, collection by collection. On a network with no sales the rows have no components.
+- `coverage` follows `result` ([Coverage](#coverage), as on every NFT answer), and is not in the CSV (`nft_volume.csv`). Its daily sets carry a
+  config version of their own, so a change of the markets config does not recompute them.
+
+Live row of `GET /v2/network/nft_volume?live=day`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "rows": [
+    {
+      "components": [
+        {
+          "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+          "taxon": 0,
+          "count": 1,
+          "amount": "150",
+          "rate": "1.0000000",
+          "converted_amount": "150"
+        },
+        {
+          "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+          "taxon": 10,
+          "count": 1,
+          "amount": "10",
+          "rate": "1.0000000",
+          "converted_amount": "10"
+        },
+        {
+          "issuer": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+          "taxon": 26,
+          "count": 1,
+          "amount": "0.000001",
+          "rate": "1.0000000",
+          "converted_amount": "0.000001"
+        }
+      ],
+      "count": 4,
+      "exchange": { "currency": "XRP" },
+      "total": "160.000001",
+      "exchange_rate": "1.0000000",
+      "start_time": "2026-10-24T04:52:12Z",
+      "end_time": "2026-10-25T04:52:12Z"
+    }
+  ]
+}
+```
+
+Historical rows of `GET /v2/network/nft_volume?start=2026-10-24&end=2026-10-25&interval=day` (the second day has no sale in the recorded ledgers):
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 2,
+  "rows": [
+    {
+      "components": [
+        {
+          "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+          "taxon": 0,
+          "count": 1,
+          "amount": "150",
+          "rate": "1.0000000",
+          "converted_amount": "150"
+        },
+        {
+          "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+          "taxon": 10,
+          "count": 1,
+          "amount": "10",
+          "rate": "1.0000000",
+          "converted_amount": "10"
+        },
+        {
+          "issuer": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+          "taxon": 26,
+          "count": 1,
+          "amount": "0.000001",
+          "rate": "1.0000000",
+          "converted_amount": "0.000001"
+        }
+      ],
+      "count": 4,
+      "exchange": { "currency": "XRP" },
+      "total": "160.000001",
+      "exchange_rate": "1.0000000",
+      "start_time": "2026-10-24T00:00:00Z",
+      "end_time": "2026-10-25T00:00:00Z"
+    },
+    {
+      "components": [],
+      "count": 0,
+      "exchange": { "currency": "XRP" },
+      "total": "0",
+      "exchange_rate": "1.0000000",
+      "start_time": "2026-10-25T00:00:00Z",
+      "end_time": "2026-10-26T00:00:00Z"
+    }
+  ]
+}
+```
+
+Errors: 400 as for the other volumes, `invalid period - use: day, 7day, 30day`, `invalid start date format`, `invalid end date format`,
+`invalid interval - use: day, week, month`, `invalid marker`; 500 `error getting data`.
 
 ### `GET /v2/network/markets`
 
@@ -2407,6 +2580,749 @@ whose supply is 0 or unknown, an account that is not a pool, and a line whose cu
 not paged (no `count`, `marker` or CSV).
 
 Errors: 400 `invalid date format`; 500 `unable to retrieve positions`.
+
+---
+
+## NFTs
+
+GateHub extras: the original predates NFTs, so none of these endpoints has a Ripple original. They serve the **NFTokens** of the XRP Ledger and
+the **URITokens** of Xahau, called NFTs below where the two behave alike: every event of one (mint, burn, modify, offers, sales, transfers),
+the offers that are still open, the NFTs an account holds and its history of them, the collections with their supply and holders, the sales with
+their prices, and the network's NFT sales volume. The design is in the
+[spec](superpowers/specs/2026-10-17-nft-data-design.md) and [ADR-0016](adr/0016-nft-and-uritoken-data.md); the rows are in
+[data-model](data-model.md#nft-tables-five-ledger-tables-migration-011).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these
+rules for the objects, whose shape and key order are ours and are pinned by tests:
+
+- **Coverage.** Every answer carries `coverage`, the key right after `result`, and it is not in the CSV: whether the NFT history the answer is read
+  from is whole ([Coverage](#coverage)). The detail, the history and the offers of one NFT state their own: complete when the NFT's mint is
+  indexed. The data of a network are the ledgers its parser version 5 wrote: **an NFT minted before the first of them has a history that
+  starts in the middle**, and `complete` says so.
+- **Two networks, one shape.** `kind` is `nftoken` (XRPL) or `uritoken` (Xahau). A key that does not exist for a kind is left out, never `null`:
+  `taxon`, `serial` and `transfer_fee` are decoded from an XRPL id, which a URIToken's (a hash of its issuer and URI) does not encode. An XRPL
+  id asked for on Xahau, and a URIToken id on XRPL, is `nft not found`. A collection is an issuer and a taxon on XRPL and an issuer alone on
+  Xahau, in the path (`/{issuer}/{taxon}`, `/{issuer}`) and in the objects (`taxon` is left out for Xahau); the other network's form is 404
+  `collection not found`.
+- **Ids and addresses.** An NFT id is 64 hexadecimal digits, upper-case in every answer; the routes accept any case. An address in a path
+  under `/v2/accounts` is not checked: one that is none holds nothing and has no events.
+- **Amounts** are exact decimal strings in whole units; `currency` and `amount_issuer` name the asset (the native currency has no issuer).
+  **`converted_amount`** and every `*_native` value are the price in the native currency (`XRP` or `XAH`) at the rate of the sale's UTC day
+  ([the daily rates](#get-v2networknft_volume)): text with at most 6 decimals, no trailing zeros and no exponent. A sale priced
+  in an asset that has no rate that day has no converted value, and counts in the sales counts and not in any volume. Times are
+  `YYYY-MM-DDTHH:mm:ssZ`, days `YYYY-MM-DDT00:00:00Z`. `flags` is the number the ledger holds (an XRPL NFT: `lsfBurnable` 1, `lsfOnlyXRP` 2,
+  `lsfTrustLine` 4, `lsfTransferable` 8, `lsfMutable` 16; a URIToken: `lsfBurnable` 1), `transfer_fee` the number in units of 1/100000
+  (`5000` is 5%), `uri` hex as on the ledger.
+- **Lists.** `limit` is 200 (maximum 1000), `marker` and `Link` are the usual ones, an unknown parameter is ignored, `format=csv` gives the
+  same columns on every page in the order of the keys (a nested object as `a.b`, a key the row has no value for as an empty cell). The
+  filters of a list are conditions of the read, not of the page: a page is as full as the list allows. **An empty `start=` or `end=` is 400**
+  here, unlike `/v2/payments` (`invalid start date format`).
+- **Reads** are of the committed ledgers only. The events of an NFT, its detail, its history and its offers are there when their ledger is
+  committed; **the aggregates** (an account's holdings, a collection's NFTs, holders and figures) are rebuilt by the syncer's aggregator
+  ([syncer](syncer.md#the-nft-jobs)): holdings within about a minute, collections and holders within about five. A freshly minted NFT is in
+  its history before it is in its collection's list.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`.
+
+**The examples** are real answers over the recorded mainnet ledgers that the end-to-end suites seed (XRPL 107,874,617 to 107,886,233 and Xahau
+26,533,927 to 26,774,724; a few hours of each network), so their lists are short and their `coverage` is `complete: false`: nothing before the first
+of those ledgers is indexed, and no `EnableAmendment` is.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer. Each line is checked against the
+constant the route is served by (`apps/api/src/nft/api-reference.spec.ts`).
+
+Keys of the coverage, in order: `from_ledger_index?, complete`.
+
+Keys of an NFT, in order: `nft_id, kind, issuer, taxon?, serial?, flags, transfer_fee?, owner?, owner_since?, uri?, digest?, minted?, burned, burned_at?, sale_count, last_sale?`.
+
+Keys of a point, in order: `ledger_index, tx_hash, executed_time`.
+
+Keys of minted, in order: `ledger_index, tx_hash, executed_time, by, to`.
+
+Keys of burned_at, in order: `ledger_index, tx_hash, executed_time, by`.
+
+Keys of last_sale, in order: `amount, currency, amount_issuer?, converted_amount?, ledger_index, tx_hash, executed_time`.
+
+Keys of an NFT event, in order: `nft_id, kind, issuer, taxon?, serial?, ledger_index, tx_index, event_index, tx_hash, tx_type, executed_time, event, account?, from?, to?, offer_id?, is_sell_offer?, amount?, currency?, amount_issuer?, converted_amount?, destination?, expiration?, broker?, broker_fee?, royalty_est?, removed_by?, uri?`.
+
+Keys of an NFT sale, in order: `nft_id, kind, issuer, taxon?, serial?, ledger_index, tx_index, event_index, tx_hash, executed_time, seller, buyer, mode, amount, currency, amount_issuer?, converted_amount?, broker?, broker_fee?, royalty_est?`.
+
+Keys of an NFT offer, in order: `offer_id, is_sell_offer, owner, amount, currency, amount_issuer?, destination?, expiration?, created_ledger, created_tx_hash, created_time`.
+
+Keys of a collection, in order: `issuer, taxon?, kind, supply, holders, minted, burned, sales_count, volume_native, first_mint?, last_mint?, last_ledger`.
+
+Keys of a collection day, in order: `date, sales_count, volume_native, avg_price_native?, min_price_native?, mints, burns`.
+
+Keys of a holder, in order: `owner, held`.
+
+The answers: the key after `result` is `coverage`, and `marker` is there only when there is a next page.
+
+Keys of the NFT answer, in order: `result, coverage, nft`.
+
+Keys of the NFT history answer, in order: `result, coverage, count, marker?, events`.
+
+Keys of the NFT offers answer, in order: `result, coverage, count, marker?, offers`.
+
+Keys of the collections answer, in order: `result, coverage, total, count, marker?, collections`.
+
+Keys of the collection answer, in order: `result, coverage, collection`.
+
+Keys of the collection NFTs answer, in order: `result, coverage, count, marker?, nfts`.
+
+Keys of the holders answer, in order: `result, coverage, count, marker?, holders`.
+
+Keys of the sales answer, in order: `result, coverage, count, marker?, sales`.
+
+Keys of the stats answer, in order: `result, coverage, count, days`.
+
+Keys of an NFT volume component, in order: `issuer, taxon?, count, amount, rate, converted_amount`.
+
+Keys of the NFT volume answer, in order: `result, coverage, count, marker?, rows`.
+
+(The last two belong to [`GET /v2/network/nft_volume`](#get-v2networknft_volume), the NFT volume beside the other volumes; its row is the row of
+the other volumes.)
+
+What the fields say:
+
+- **NFT.** `owner` is the holder after the newest mint, sale or transfer, and is left out for a burned NFT and when no indexed event names one
+  (an NFT whose history starts after its mint, only offers seen); `owner_since` is where that happened. `minted` is the mint (`by` the account
+  that sent it, which is the issuer or a minter the issuer authorised; `to` the first owner) and is left out when the mint is not in the index;
+  `burned_at` is the burn (`by` the account that sent it). `uri` is the newest mint's or modify's, `digest` a URIToken's. `last_sale` is the
+  newest sale and `sale_count` all of them. A URIToken burned and minted again by the same issuer with the same URI is the same id (xahaud keys
+  it on both): its state follows the newest events, so it is `burned: false` again with the new owner.
+- **Event.** `event` is one of `mint`, `burn`, `modify` (an `NFTokenModify`: the new `uri`), `offer_create`, `offer_cancel`, `offer_removed`,
+  `sale` and `transfer` (an owner change with no price: a zero-amount accept, a Xahau `Remit`). `account` is who did it (for an offer event the
+  offer's owner, else the sender), `from` and `to` the owners before and after. `offer_id` names the offer (an XRPL `NFTokenOffer`; on Xahau the
+  URIToken id, since the offer is the entry's one sell offer), `is_sell_offer` is a boolean and is there on every event that names an offer (the
+  offer's own and the sale or transfer that accepted it). `offer_removed` has `removed_by`: `sale` (an accepted offer), `burn` (the NFT was
+  burned), `transfer` (a Xahau `Remit` moved the token) or `other` (removed by a later transaction, such as an expired offer cleaned up).
+  `destination` and `expiration` are an offer's. In a transaction the events come in this order (`event_index`): the offers cancelled or
+  removed, then the mints, sales, transfers, burns and modifies, then the offers created, so a list newest first shows a sale above the offers
+  it removed and a mint's offer above the mint.
+- **Price of a sale.** The price is the accepted offer's amount; of a brokered sale (XRPL, a broker matched a buy and a sell offer) the buy
+  offer's, with the `broker` and its `broker_fee`; of a Xahau `URITokenBuy` what the buyer sent, which can be more than the asked amount.
+  **`royalty_est` is an estimate** of the issuer's cut: the price (less the broker fee) times the `transfer_fee`, in drops rounded down for the
+  native currency and to 16 significant digits for another. It is **left out when no royalty applies** (a fee of 0, the issuer is the seller
+  or the buyer, a URIToken has none) and is `"0"` when one applies and rounds to nothing.
+- **Collection.** `supply` is the NFTs of the collection that are not burned, `holders` the distinct accounts holding one, `minted` and
+  `burned` the mints and burns in the index (a collection minted before the coverage starts has supply but fewer mints), `sales_count` the
+  sales, `volume_native` their converted prices summed (exact text). `volume_native` uses the rates known when the collection was last
+  recomputed (a sale in an issued currency of today at the rate of the day so far) and is refreshed whenever the collection changes; the daily
+  figures of [`nft_volume`](#get-v2networknft_volume) are the settled ones. `first_mint` and `last_mint` are left out for a collection whose mints
+  all came before the coverage starts. `last_ledger` is the newest ledger that changed one of its NFTs. A collection row is written by the
+  aggregator some minutes after its NFTs change ([syncer](syncer.md#the-nft-jobs)): **a collection younger than that is 404 on its own route
+  and on its sub-routes**, as a new AMM pool is for a minute.
+
+### `GET /v2/nfts/{nft_id}`
+
+One NFT or URIToken, folded from its indexed events when asked (so it is fresh at the commit of its ledger, before the aggregates catch up).
+
+Errors, in the order they are checked: 400 `invalid nft id` (not 64 hexadecimal digits); 404 `nft not found` (the index has no event of it in a
+committed ledger); 500 `unable to retrieve nft`. No CSV.
+
+An XRPL NFT (`GET /v2/nfts/00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91`):
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "nft": {
+    "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+    "kind": "nftoken",
+    "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+    "taxon": 10,
+    "serial": 95234705,
+    "flags": 8,
+    "transfer_fee": 5000,
+    "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+    "owner_since": {
+      "ledger_index": 107874617,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z"
+    },
+    "burned": false,
+    "sale_count": 1,
+    "last_sale": {
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "ledger_index": 107874617,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z"
+    }
+  }
+}
+```
+
+A URIToken on Xahau (`GET /v2/nfts/9613336614047483F3AEC00173139D88FE9BA70720CAC2B46E12711A71A9AAE9`): no `taxon`, `serial` or `transfer_fee`, and a `digest`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 26533927, "complete": false },
+  "nft": {
+    "nft_id": "9613336614047483F3AEC00173139D88FE9BA70720CAC2B46E12711A71A9AAE9",
+    "kind": "uritoken",
+    "issuer": "rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb",
+    "flags": 0,
+    "owner": "rBkEp8W1yhBGLrvHFKKyrmSvniMFVJbPPg",
+    "owner_since": {
+      "ledger_index": 26763778,
+      "tx_hash": "01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C",
+      "executed_time": "2026-10-24T15:36:02Z"
+    },
+    "digest": "772B38763E8E603AEE9BBB2026B8E9B97537ECC8867E46D042630C0B326B8736",
+    "burned": false,
+    "sale_count": 1,
+    "last_sale": {
+      "amount": "4200",
+      "currency": "XAH",
+      "converted_amount": "4200",
+      "ledger_index": 26763778,
+      "tx_hash": "01772F1C2E379A2213EDDFF939ABB3FE59C2B309244EC442EA1515761605C20C",
+      "executed_time": "2026-10-24T15:36:02Z"
+    }
+  }
+}
+```
+
+`coverage` is the NFT's own: `complete` is true when the NFT's first indexed event is its mint (in the example above the mint is before the
+first indexed ledger, so there is no `minted`, and the history of the NFT is not whole).
+
+### `GET /v2/nfts/{nft_id}/history`
+
+The events of one NFT, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `nft_id` (path) | | The 64 hex digits, in any case. |
+| `start` | the first ledger | Inclusive. |
+| `end` | the newest ledger | Inclusive at the precision written. |
+| `event` | all | A comma list of `mint`, `burn`, `modify`, `offer_create`, `offer_cancel`, `offer_removed`, `sale`, `transfer`; each member exactly as spelt, an empty one (`sale,`) is an error. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index, event_index)` of the last event. |
+| `format` | json | `csv`: file `<nft_id> - nft history.csv` (the id upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "events": [NftEvent, …] }`. The filters are conditions of the read, not of the
+page. The read is a range of the NFT's own rows, so its cost does not grow with the history of the network. A sale carries `converted_amount`. `GET /v2/nfts/00190BB8DAEF366CB05EE8DCC919EF9A1AA24DD22B3D62C9D848920A0669E96F/history?event=sale`, a brokered sale:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "events": [
+    {
+      "nft_id": "00190BB8DAEF366CB05EE8DCC919EF9A1AA24DD22B3D62C9D848920A0669E96F",
+      "kind": "nftoken",
+      "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+      "taxon": 0,
+      "serial": 107604335,
+      "ledger_index": 107879497,
+      "tx_index": 49,
+      "event_index": 2,
+      "tx_hash": "0FD0FDC75F37C1B1CCA1DE4517785B35422E3C81D6543ADA094B04A5DBC7E56C",
+      "tx_type": "NFTokenAcceptOffer",
+      "executed_time": "2026-10-24T21:30:41Z",
+      "event": "sale",
+      "account": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "from": "rfivr3BK17R28wnVwpQQhSDvo2A2fmnEje",
+      "to": "rLCscV9iDJpvje4ZCKxGjYAMNtBA1Ltauk",
+      "offer_id": "05BC61CFB58ABA8969C852FBF907CC687A442AD3ED64FB30EA41149ECD0F6780",
+      "is_sell_offer": true,
+      "amount": "150",
+      "currency": "XRP",
+      "converted_amount": "150",
+      "broker": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "broker_fee": "2.3835",
+      "royalty_est": "4.428495"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid nft id`, `invalid start date format`, `invalid end date format`, `invalid event`,
+`invalid marker`; 404 `nft not found`; 500 `unable to retrieve nft history`.
+
+### `GET /v2/nfts/{nft_id}/offers`
+
+The offers of the NFT that are open: created, and not since cancelled, accepted or removed (the NFT burned, or an expired offer cleaned up),
+worked out from its offer events, **newest first**. An offer that has expired is listed until a transaction removes it. A URIToken has
+at most one, the entry's.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `type` | both | `sell` (offers to sell the NFT) or `buy` (bids for it); empty is both. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(created_ledger, tx_index, event_index)` of the event that created the last offer. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "offers": [NftOffer, …] }`; no CSV. `GET /v2/nfts/000813886E50B2960CF48DCB644E85B412C660B4E1B01A87C283F9E6066AB54B/offers`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 2,
+  "offers": [
+    {
+      "offer_id": "3CD49EC73A6F77B3D365B97FEAC58825EE08F1342C25BBD53A6B34062E242A2E",
+      "is_sell_offer": false,
+      "owner": "rMTaAGVd77vAbzDv8qhoMgnZR1T5R3w6Wq",
+      "amount": "6.29",
+      "currency": "XRP",
+      "destination": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "expiration": "2026-10-25T05:22:08Z",
+      "created_ledger": 107886233,
+      "created_tx_hash": "8909E8347369B44ABBF43928670913097FC97C946D695F5DC17939759DBDD03E",
+      "created_time": "2026-10-25T04:52:11Z"
+    },
+    {
+      "offer_id": "D6697EB570D95FBE80C369A2CCD9CF21CE04258B04829638313820058FE8CAEE",
+      "is_sell_offer": true,
+      "owner": "rHhvUexKKSJZG9vuZKX2kNendG2TXoavG9",
+      "amount": "19.98",
+      "currency": "XRP",
+      "destination": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+      "created_ledger": 107886233,
+      "created_tx_hash": "BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9",
+      "created_time": "2026-10-25T04:52:11Z"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid nft id`, `invalid type`, `invalid marker`; 404 `nft not found`; 500 `unable to retrieve offers`.
+
+### `GET /v2/accounts/{address}/nfts`
+
+The NFTs the account holds now, grouped by collection (the issuer, then the taxon) and then by serial (on Xahau by id). Each is an NFT as the
+detail gives it, except that `last_sale` has no `converted_amount` in a list. An NFT the account sold or gave away, and a burned one, are not
+listed.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | The holder; not checked. |
+| `issuer` | all | Only the NFTs of that issuer. |
+| `taxon` | all | Only the NFTs of that taxon of the issuer; **needs `issuer`**. On Xahau every URIToken has the taxon 0 of its key, so `taxon=0` is all of an issuer's URITokens and any other taxon none. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(issuer, taxon, serial, nft_id)` of the last NFT. |
+| `format` | json | `csv`: file `<address> - nfts.csv`, every key of the NFT, a nested object as `a.b` (`owner_since.ledger_index`). |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "nfts": [Nft, …] }`. `GET /v2/accounts/rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx/nfts?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "nfts": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "flags": 8,
+      "transfer_fee": 5000,
+      "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "owner_since": {
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      },
+      "burned": false,
+      "sale_count": 1,
+      "last_sale": {
+        "amount": "10",
+        "currency": "XRP",
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      }
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid issuer address`, `invalid taxon` (not a decimal number up to 4294967295, or a taxon with no
+`issuer`), `invalid marker`; 500 `unable to retrieve nfts`.
+
+### `GET /v2/accounts/{address}/nft_history`
+
+The events the account is named in, oldest first: every event of the NFTs it minted, holds, sold, bought, brokered, or made or received an offer
+for. An event is listed once however many roles the account has in it; `account` in it is the account that did the event, not necessarily this one.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | Not checked. |
+| `start`, `end` | | As for the history of an NFT. |
+| `event` | all | A comma list of events, as for the history of an NFT. |
+| `role` | any | A comma list of the roles the account has in an event: `issuer` (the issuer of a mint, burn or sale; not of an offer, so an issuer's history is not every offer on its NFTs), `minter` (the sender of a mint that is not the issuer), `from` and `to` (the owner before and after), `broker`, `offer_owner` (the owner of an offer created, cancelled or removed), `destination` (of an offer). |
+| `descending`, `limit`, `marker` | false, 200 (max 1000) | The marker is `(ledger_index, tx_index, event_index)`. |
+| `format` | json | `csv`: file `<address> - nft history.csv`, the columns of the NFT event. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "events": [NftEvent, …] }`. `GET /v2/accounts/rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx/nft_history?role=to&event=sale,transfer&limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "events": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "ledger_index": 107874617,
+      "tx_index": 299,
+      "event_index": 1,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "tx_type": "NFTokenAcceptOffer",
+      "executed_time": "2026-10-24T16:08:12Z",
+      "event": "sale",
+      "account": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "from": "rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz",
+      "to": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "offer_id": "D6DBB6452D44459FDA013C79708D2E699EA2340D5444AC1695FF621A80FDFBDE",
+      "is_sell_offer": true,
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "royalty_est": "0.5"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid start date format`, `invalid end date format`, `invalid event`, `invalid role`, `invalid marker`;
+500 `unable to retrieve nft history`.
+
+### `GET /v2/nft_collections`
+
+The collections in their current state, the biggest first. The newest row of every collection (some 40,000 on XRPL) is read and sorted for each
+request, so **those rows are kept for 60 seconds** in the API (the list of one issuer, a few rows, is read every time), and they are the rows the
+aggregator wrote ([above](#nfts)).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `issuer` | all | Only the collections of that issuer. |
+| `sort` | `volume` | `volume` (`volume_native`), `supply` or `holders`. |
+| `descending` | true | `false` for the smallest first; off only for `false`, in any case. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | The sort value, the issuer and the taxon of the last collection. |
+| `format` | json | `csv`: file `nft collections.csv`, every key of the collection, a nested one as `first_mint.ledger_index`. |
+
+`{ "result": "success", "coverage": …, "total": n, "count": n, "marker": "…", "collections": [Collection, …] }`. `total` is how many collections the
+filter matches, whatever the page. Ties are ordered by issuer and then taxon, ascending. `GET /v2/nft_collections?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "total": 25,
+  "count": 2,
+  "marker": "WzEwLCJyNFBQN2d3dVZmeHpMUFdGaUpYakxVdHZ6QTdGOTdDelQzIiwxMF0",
+  "collections": [
+    {
+      "issuer": "rLxc1bt5defiLJ9gaZEJqQWnNKYNawrwMy",
+      "taxon": 0,
+      "kind": "nftoken",
+      "supply": 9,
+      "holders": 1,
+      "minted": 0,
+      "burned": 0,
+      "sales_count": 1,
+      "volume_native": "150",
+      "last_ledger": 107879497
+    },
+    {
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "kind": "nftoken",
+      "supply": 1,
+      "holders": 1,
+      "minted": 0,
+      "burned": 0,
+      "sales_count": 1,
+      "volume_native": "10",
+      "last_ledger": 107874617
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: 400 `invalid issuer address`, `invalid sort`, `invalid marker`; 500 `unable to retrieve collections`.
+
+### `GET /v2/nft_collections/{issuer}/{taxon}` (XRPL) and `GET /v2/nft_collections/{issuer}` (Xahau)
+
+One collection, `{ "result": "success", "coverage": …, "collection": Collection }`; no CSV. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "collection": {
+    "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+    "taxon": 10,
+    "kind": "nftoken",
+    "supply": 1,
+    "holders": 1,
+    "minted": 0,
+    "burned": 0,
+    "sales_count": 1,
+    "volume_native": "10",
+    "last_ledger": 107874617
+  }
+}
+```
+
+On Xahau (`GET /v2/nft_collections/rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb`) a collection is an issuer, so there is no `taxon`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 26533927, "complete": false },
+  "collection": {
+    "issuer": "rodinGM9xiKq7rDDnLPyieREkqGJ6zKyb",
+    "kind": "uritoken",
+    "supply": 5,
+    "holders": 3,
+    "minted": 1,
+    "burned": 0,
+    "sales_count": 1,
+    "volume_native": "4200",
+    "first_mint": {
+      "ledger_index": 26689211,
+      "tx_hash": "3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426",
+      "executed_time": "2026-10-21T13:29:11Z"
+    },
+    "last_mint": {
+      "ledger_index": 26689211,
+      "tx_hash": "3D9B20E130D7498E98FB3499BD4C2AC4CCDB3D11FFBFEA8F9B7FB844DDF33426",
+      "executed_time": "2026-10-21T13:29:11Z"
+    },
+    "last_ledger": 26771798
+  }
+}
+```
+
+Errors, in the order they are checked: 400 `invalid issuer address`, then on XRPL `invalid taxon` (not a decimal number up to 4294967295);
+404 `collection not found` (no such collection, **the other network's form of the path** (`/{issuer}` on XRPL, `/{issuer}/{taxon}` on Xahau), or a
+collection the aggregator has not counted yet); 500 `unable to retrieve collection`.
+
+### The lists of a collection: `…/nfts`, `…/holders`, `…/sales`, `…/stats`
+
+Each is on both forms of the path (`/v2/nft_collections/{issuer}/{taxon}/nfts` on XRPL, `/v2/nft_collections/{issuer}/nfts` on Xahau), and the literal
+words are matched before the taxon, so `nfts`, `holders`, `sales` and `stats` can never be read as one. They check the collection first: the same
+404 `collection not found` as the collection itself, **after the rest of the request is checked** (a bad marker is a 400 even for a collection
+that does not exist). The checks of the path are 400 `invalid issuer address` and, on XRPL, `invalid taxon`.
+
+**`…/nfts`**: the NFTs of the collection by serial (on Xahau by id), burned ones left out.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `owner` | all | Only the NFTs of the collection this account holds (the address is not checked). |
+| `include_burned` | false | Boolean: also the burned NFTs. |
+| `limit`, `marker` | 200 (max 1000) | The marker is `(serial, nft_id)`. |
+| `format` | json | `csv`: file `<issuer>[ <taxon>] - nfts.csv`, the columns of the NFT. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "nfts": [Nft, …] }`, each NFT as in the holdings of an account (no
+`converted_amount` in `last_sale`). `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/nfts?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "nfts": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "flags": 8,
+      "transfer_fee": 5000,
+      "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "owner_since": {
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      },
+      "burned": false,
+      "sale_count": 1,
+      "last_sale": {
+        "amount": "10",
+        "currency": "XRP",
+        "ledger_index": 107874617,
+        "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+        "executed_time": "2026-10-24T16:08:12Z"
+      }
+    }
+  ]
+}
+```
+
+500 `unable to retrieve nfts`; the checks in order: the path, `invalid marker`, 404.
+
+**`…/holders`**: the accounts that hold NFTs of the collection and how many, **the most first, then by address**, as of the collection's last
+recompute. `limit`, `marker` (`held` and `owner` of the last holder), `format` (`csv`: `<issuer>[ <taxon>] - holders.csv`).
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "holders": [Holder, …] }`. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/holders?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "holders": [{ "owner": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx", "held": 1 }]
+}
+```
+
+500 `unable to retrieve holders`.
+
+**`…/sales`**: the sales of the collection's NFTs in the window, as the NFT sales of the network, oldest first. `start`, `end`, `descending`,
+`limit`, `marker` (`(ledger_index, tx_index, event_index)`), `format` (`csv`: `<issuer>[ <taxon>] - sales.csv`).
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "sales": [NftSale, …] }`; checks: the path, `invalid start date format`,
+`invalid end date format`, `invalid marker`, 404; 500 `unable to retrieve sales`. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/sales?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "sales": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "ledger_index": 107874617,
+      "tx_index": 299,
+      "event_index": 1,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z",
+      "seller": "rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz",
+      "buyer": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "mode": "direct",
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "royalty_est": "0.5"
+    }
+  ]
+}
+```
+
+**`…/stats`**: one row per UTC day of the window on which the collection had a sale, a mint or a burn; a day with no row had no activity. The
+sales are converted as everywhere ([above](#nfts)); `avg_price_native` (the volume over the sales that have a converted price) and
+`min_price_native` are left out on a day with no such sale.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start` | **required** | Inclusive. Missing is 400 `start is required` (as `issuer is required`, `family is required`), empty is `invalid start date format`. |
+| `end` | now | Inclusive at the precision written. |
+| `descending` | false | Newest day first. |
+| `format` | json | `csv`: file `<issuer>[ <taxon>] - stats.csv`. |
+
+The window is **at most 366 days** (400 `invalid window - use at most 366 days`, checked before any read), so there is no `marker`: a year is at
+most 366 rows. `{ "result": "success", "coverage": …, "count": n, "days": [CollectionDay, …] }`. `GET /v2/nft_collections/r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3/10/stats?start=2026-10-20&end=2026-10-27`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 1,
+  "days": [
+    {
+      "date": "2026-10-24T00:00:00Z",
+      "sales_count": 1,
+      "volume_native": "10",
+      "avg_price_native": "10",
+      "min_price_native": "10",
+      "mints": 0,
+      "burns": 0
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked: the path, 400 `invalid start date format`, `start is required`, `invalid end date format`, `invalid window - use at most 366 days`;
+404 `collection not found`; 500 `unable to retrieve stats`.
+
+### `GET /v2/nft_sales`
+
+The sales of the network, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `start`, `end` | all | As for the history of an NFT. |
+| `currency` | all | Only the sales priced in that currency: the native currency alone, or `CUR+issuer` as in [`/v2/payments/{currency}`](#get-v2paymentscurrency). In a query string a raw `+` arrives as a space, so `%2B` and a space both separate the currency from its issuer. |
+| `descending`, `limit`, `marker` | false, 200 (max 1000) | The marker is `(ledger_index, tx_index, event_index)`. |
+| `format` | json | `csv`: file `nft sales.csv`, every column of the NFT sale. |
+
+`{ "result": "success", "coverage": …, "count": n, "marker": "…", "sales": [NftSale, …] }`. A page is a range of the sales of the window, a few
+granules; **a `currency` that few sales are priced in is found by reading through the window until the page is full**, so the cost of its
+page grows with the sales of the window that are not in it, up to the whole window. Narrow such a request with `start` and `end`.
+`GET /v2/nft_sales?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 107874617, "complete": false },
+  "count": 2,
+  "marker": "WzEwNzg3ODc3NSwxMDQsMV0",
+  "sales": [
+    {
+      "nft_id": "00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91",
+      "kind": "nftoken",
+      "issuer": "r4PP7gwuVfxzLPWFiJXjLUtvzA7F97CzT3",
+      "taxon": 10,
+      "serial": 95234705,
+      "ledger_index": 107874617,
+      "tx_index": 299,
+      "event_index": 1,
+      "tx_hash": "BADF36AA20CD32067693C83EE5755BEFB8D1A1E82DEE83E1E67FFD6100712E56",
+      "executed_time": "2026-10-24T16:08:12Z",
+      "seller": "rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz",
+      "buyer": "rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx",
+      "mode": "direct",
+      "amount": "10",
+      "currency": "XRP",
+      "converted_amount": "10",
+      "royalty_est": "0.5"
+    },
+    {
+      "nft_id": "000803E88ACAA32313BB87F729EF7DA56BD13C57BE46E3C8B0730F290481ED98",
+      "kind": "nftoken",
+      "issuer": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+      "taxon": 26,
+      "serial": 75623832,
+      "ledger_index": 107878775,
+      "tx_index": 104,
+      "event_index": 1,
+      "tx_hash": "695AC77970D720F644D8ED7EBB4C97DCC4093DC7EBFFE7A3984C87AC9D9E6DF9",
+      "executed_time": "2026-10-24T20:42:30Z",
+      "seller": "rDeizxSRo6JHjKnih9ivpPkyD2EgXQvhSB",
+      "buyer": "r47kUrvGHkHgxLi1KedaHzdUvbR9GTreEe",
+      "mode": "direct",
+      "amount": "0.000001",
+      "currency": "XRP",
+      "converted_amount": "0.000001"
+    }
+  ]
+}
+```
+
+Errors, in the order they are checked (those of `/v2/payments/{currency}`): 400 `invalid issuer address` (the issuer of `currency`), `invalid start date format`,
+`invalid end date format`, `currency is required`, `XRP cannot have an issuer` (`XAH` on Xahau), `issuer is required`, `invalid marker`;
+500 `unable to retrieve sales`.
+
+For `GET /v2/network/nft_volume` see [Network](#get-v2networknft_volume).
+
+**Differences from data.ripple.com**: none, the endpoints are new.
 
 ---
 

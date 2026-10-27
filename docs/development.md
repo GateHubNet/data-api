@@ -61,7 +61,7 @@ A **pnpm workspace** (`pnpm-workspace.yaml`: `apps/*`, `packages/*`):
   `clickhouse.config.ts`, `migrate.ts`, `tables.ts` (the `Table` enum), `rows.ts` (row types).
 - `src/parsers/`, `src/ingest/`: the pure parsers, `build-rows.ts`, `ledger-writer.ts`, `ingest-state.ts`, the `LedgerSource` interface with
   `FixtureLedgerSource`, `raw-ledger.ts`.
-- `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, and account and market jobs), `src/util/`.
+- `src/xrpl/node-client.ts`, `src/query/` (rates, decimals, the daily-rate and account day-group reads), `src/aggregate/` (the stats, volume, AMM, NFT, and account and market jobs), `src/util/`.
 - `schema/001_baseline.sql`, `schema/002_validators_amendments.sql`, `schema/003_account_market_aggregates.sql`, `schema/004_amm_fee_estimates.sql`, `schema/009_account_network_names.sql`: the schema (migration units, applied in file-name order; **not** under `src/`).
 - `test/` (e2e suites, the shared ClickHouse container helper, fixtures), `scripts/record-fixtures.ts`.
 
@@ -211,14 +211,14 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `010_export_jobs.sql`; 008 is reserved by another change of spec #4;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `011_nft_data.sql`; 008 is reserved by another change of spec #4;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.
 3. For a ledger-derived table: have `buildLedgerRows` produce the rows and add the table to `CHILD_TABLES` (`build-rows.ts`), to
    `LEDGER_KEYED_TABLES` (`ingest-state.ts`, so recovery deletes it; keep its partitioning identical to the DDL) and give it
    `non_replicated_deduplication_window`. Bump `PARSER_VERSION` when the parsers' output changes, and re-ingest with `--reprocess`.
-   A feature that readers gate on the parser version gets a constant of its own (`AMM_PARSER_VERSION`, `STATE_PARSER_VERSION`) with
+   A feature that readers gate on the parser version gets a constant of its own (`AMM_PARSER_VERSION`, `STATE_PARSER_VERSION`, `NFT_PARSER_VERSION`) with
    the first version that writes it, and its gate compares with that constant, never with `PARSER_VERSION`, which later features move.
 4. Read it from an API service with `${Table.X}`. Apply: `pnpm ch:migrate` locally; the migrate job in compose; the e2e suites apply
    `runMigrations()` themselves.
@@ -238,7 +238,7 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 There are no materialized views ([ADR-0008](adr/0008-no-aggregate-materialized-views.md)). Query-time aggregates are plain `GROUP BY`
 queries over a bounded, key-ordered range (guard them with a window). A precomputed aggregate is a table the **aggregator** writes: a
 `ReplacingMergeTree(version)`, recomputed idempotently (a complete set under one new version; readers keep the highest version), added as a
-job in `aggregator.service.ts` with its own budget (a job with state of its own, such as `amm_pools` and `amm_daily`, is a runner in a
+job in `aggregator.service.ts` with its own budget (a job with state of its own, such as `amm_pools`, `amm_daily`, `nft_state` and `nft_collections`, is a runner in a
 file of its own, `*.job-runner.ts`, behind the `AggregatorJobContext` of `job-context.ts`), and marked via `agg_dirty` when ingest
 rewrites its inputs.
 
@@ -288,6 +288,10 @@ env -i PATH="$PATH" NODE_ENV=development GH_ENV=container GH_API_KEYS=any GH_CLI
 curl -s http://127.0.0.1:23001/internal/docs-json | ruby -ryaml -rjson -e 'puts JSON.parse(STDIN.read).to_yaml' > /tmp/openapi.yaml
 kill %1                                                                           # then keep the header comment of docs/openapi.yaml on top of /tmp/openapi.yaml
 ```
+
+If `ruby` stops with `Encoding::InvalidByteSequenceError` its default external encoding is not UTF-8 (a description holds a non-ASCII character): write
+`ruby -E UTF-8:UTF-8 -ryaml ...`. The file lists the paths in the order the controllers register, so adding a controller can move other blocks of the file; compare two
+generated files by their parsed paths (`YAML.load_file`) and not by `git diff` alone.
 
 At runtime the API serves Swagger UI at `/internal/docs` and the JSON at `/internal/docs-json` (the shipped nginx does not expose them).
 
