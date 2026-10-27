@@ -189,6 +189,80 @@ describe('NFT prices in the native currency (e2e)', () => {
     ]);
   });
 
+  it('rounds the quotient to the nearest 6th decimal, not down to it', async () => {
+    const { ch, daily } = await freshWorld();
+    await ch.insert(Table.NativeRatesDaily, ratesSet(0, [[USD, '1000']]));
+    // a Float64 that is a hair under k / 1e6 is cut to the place below by a conversion that truncates (0.000497, 65.477875)
+    await ch.insert(Table.NftSales, [priced(1, '0.498', USD), priced(2, '65477.876', USD)]);
+
+    const rows = await convertedOf(ch, daily);
+
+    expect(textsOf(rows)).toEqual(['0.000498', '65.477876']);
+    expect(rows.map((r) => r.float)).toEqual([0.000498, 65.477876]);
+    const keys = [1, 2].map((ledger_index): SaleKey => ({ ledger_index, tx_index: 1, event_index: 0 }));
+    expect([...(await convertedSalePrices(ch, daily, keys))]).toEqual([
+      ['1:1:0', '0.000498'],
+      ['2:1:0', '65.477876'],
+    ]);
+  });
+
+  it('is the quotient to 6 decimals for every price of a sweep: amounts of 3 decimals at a rate of 1000', async () => {
+    const { ch, daily } = await freshWorld();
+    await ch.insert(Table.NativeRatesDaily, ratesSet(0, [[USD, '1000']]));
+    // k / 1000 USD at 1000 USD per coin is exactly k / 1e6, which the conversion must give back, whichever k
+    const ks = [
+      ...Array.from({ length: 60 }, (_, i) => 1 + i), // the smallest prices, 0.000001 to 0.00006
+      ...Array.from({ length: 3000 }, (_, i) => 1 + ((i * 104_729 + 12_345) % 99_999_989)),
+    ];
+    await ch.insert(
+      Table.NftSales,
+      ks.map((k, i) => priced(1 + i, new BigNumber(k).dividedBy(1000).toFixed(), USD)),
+    );
+
+    const rows = await convertedOf(ch, daily);
+
+    const wrong = rows
+      .map((r, i) => ({
+        k: ks[i],
+        got: r.text === null ? null : new BigNumber(r.text).toFixed(),
+        want: new BigNumber(ks[i]).dividedBy(1e6).toFixed(),
+      }))
+      .filter((r) => r.got !== r.want);
+    expect(rows).toHaveLength(ks.length);
+    expect(wrong).toEqual([]);
+  });
+
+  it('keeps no digit that the quotient does not have, in a converted value above 1e12', async () => {
+    const { ch, daily } = await freshWorld();
+    await ch.insert(
+      Table.NativeRatesDaily,
+      ratesSet(0, [
+        [USD, '2.5'],
+        [EUR, '0.7'],
+        [HEX, '1'],
+      ]),
+    );
+    await ch.insert(Table.NftSales, [
+      priced(1, '1e20', USD), // 4e19
+      priced(2, '3e29', EUR), // 4.285714285714286e29, the digits of the Float64 and then zeros
+      priced(3, '9.99e29', HEX), // below the limit of 1e30
+      priced(4, '1e25', HEX),
+      priced(5, '12345678901234.5', HEX), // more than 1e12 with places
+    ]);
+
+    const rows = await convertedOf(ch, daily);
+
+    expect(textsOf(rows)).toEqual([
+      '40000000000000000000',
+      '428571428571428600000000000000',
+      '999000000000000000000000000000',
+      '10000000000000000000000000',
+      '12345678901234.5',
+    ]);
+    const keys = [1, 2, 3, 4, 5].map((ledger_index): SaleKey => ({ ledger_index, tx_index: 1, event_index: 0 }));
+    expect([...(await convertedSalePrices(ch, daily, keys)).values()]).toEqual(textsOf(rows));
+  });
+
   it('an issued price on a day whose set is stale or of another config version is converted on read, like any other', async () => {
     const { ch, rates, daily } = await freshWorld();
     // the set of day 0 is stale, the set of day 1 is of another config version: neither is read, both are computed

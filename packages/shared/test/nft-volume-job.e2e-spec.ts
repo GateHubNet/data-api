@@ -359,6 +359,27 @@ describe('the nft_volume metric (e2e)', () => {
     ]);
   });
 
+  it('writes the amount of a component as plain decimal text, with no exponent, from 1e21 up', async () => {
+    const { ch, rates } = await world([
+      xrp(100, NOW - 5 * HOUR, ISSUER_A, 1, '1000000000000000000000'),
+      xrp(101, NOW - 4 * HOUR, ISSUER_A, 1, '0.5'),
+      xrp(102, NOW - 3 * HOUR, ISSUER_B, 2, '25000000000000000000000'),
+      xrp(103, NOW - 2 * HOUR, ISSUER_C, 3, '0.000001'),
+    ]);
+
+    await computeLiveVolumeSet(ch, rates, config(), 'nft_volume', 'day', at(NOW));
+    await computeDailyVolumeSet(ch, rates, config(), 'nft_volume', at(midnight(NOW)));
+
+    for (const rows of [await liveSet(ch, 'day'), await dailySet(ch, midnight(NOW))]) {
+      expect(rows.filter((r) => r.component !== '').map((r) => [r.component, r.amount])).toEqual([
+        [`${ISSUER_B}/2`, '25000000000000000000000'],
+        [`${ISSUER_A}/1`, '1000000000000000000000.5'],
+        [`${ISSUER_C}/3`, '0.000001'],
+      ]);
+      expect(rows.some((r) => /e/i.test(r.amount))).toBe(false);
+    }
+  });
+
   it('reads the sales of the window, by the committed ledgers that closed in it, and only those', async () => {
     const sales: Sale[] = [
       xrp(100, NOW - 40 * DAY, ISSUER_A, 1, '1000'), // before every window

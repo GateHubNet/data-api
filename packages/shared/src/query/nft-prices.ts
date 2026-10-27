@@ -43,6 +43,11 @@ async function assetDaysOf(ch: ClickHouseService, sales: SqlPart): Promise<Asset
  * `converted_native` `Nullable(Decimal(38, 6))` and `converted_native_f` `Nullable(Float64)`, and the parameters of `sales`
  * with those of the rates (prefixed `dr_`).
  *
+ * The quotient is rounded to 6 places as a Float64, and the Decimal is read from the shortest round-trip text of that
+ * (`toString`): ClickHouse converts a Float64 to a Decimal by truncating `x * 10^6`, which for 1.3 % of the multiples of 1e-6
+ * lands just under the integer and gives the place below (0.498 / 1000 is 0.000497, 65.477876 is 65.477875), and in a
+ * large value gives the digits of the binary fraction (4e19 is 40000000000000003625.904556).
+ *
  * This is a call, not a constant: it first reads the asset-days of the issued prices of `sales`, then their rates through
  * `DailyRates.rateRowsSql`, whose rows the SQL it returns joins. A price in the native currency (an empty `amount_issuer`)
  * is `amount` as it is.
@@ -52,7 +57,7 @@ export async function nftSalesNativeSql(ch: ClickHouseService, rates: DailyRates
   return {
     sql: `SELECT s.*,
        if(s.amount_issuer = '', toDecimal128OrNull(s.amount, 6),
-          if(r.rate_f > 0 AND s.amount_f / r.rate_f < ${NATIVE_PRICE_LIMIT}, toDecimal128(round(s.amount_f / r.rate_f, 6), 6), NULL)) AS converted_native,
+          if(r.rate_f > 0 AND s.amount_f / r.rate_f < ${NATIVE_PRICE_LIMIT}, toDecimal128(toString(round(s.amount_f / r.rate_f, 6)), 6), NULL)) AS converted_native,
        toFloat64OrNull(toString(converted_native)) AS converted_native_f
   FROM (${sales.sql}) AS s
   LEFT ANY JOIN (${rateRows.sql}) AS r

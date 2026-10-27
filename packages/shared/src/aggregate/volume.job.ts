@@ -740,7 +740,8 @@ function setRows(
     base_issuer: c?.base.issuer ?? '',
     counter_currency: c?.counter?.currency ?? '',
     counter_issuer: c?.counter?.issuer ?? '',
-    amount: c ? c.amount.toString() : '0',
+    // the NFT volume's amounts are native-currency text, plain digits at any size (BigNumber's own text has an exponent from 1e21 up)
+    amount: c ? (metric === 'nft_volume' ? c.amount.toFixed() : c.amount.toString()) : '0',
     amount_f: c ? c.amount.toNumber() : 0,
     count: c ? c.count : sentinelCount,
     rate_f: c ? c.rate.toNumber() : final ? 1 : 0,

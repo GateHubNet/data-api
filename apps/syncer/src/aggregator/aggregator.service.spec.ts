@@ -2163,50 +2163,50 @@ describe('AggregatorService volume jobs', () => {
       expect(await tickAt(svc, VOLUME_BACKFILL_RETRY_MS + 60_000)).toEqual([]);
     });
 
-    it('the wait is for the config version it failed under: a new version retries the set at once', async () => {
+    it('the wait is for the config version it failed under: a new version retries the set at once, except the NFT volume, whose version is its own', async () => {
       caughtUp();
       failing.add('trade_volume:2026-10-14');
       failing.add('payment_volume:2026-10-14');
+      failing.add('nft_volume:2026-10-14');
       const markets = { ...MARKETS };
       const svc = service({}, markets);
+      // three sets of the 14th fail, and the tick gives up with the older days not started
       expect(await tickAt(svc, 0)).toEqual([
         'trade_volume 2026-10-14',
         'payment_volume 2026-10-14',
         'amm_volume 2026-10-14',
         'nft_volume 2026-10-14',
-        'trade_volume 2026-10-13',
-        'payment_volume 2026-10-13',
-        'amm_volume 2026-10-13',
-        'nft_volume 2026-10-13',
-        'trade_volume 2026-10-12',
-        'payment_volume 2026-10-12',
-        'amm_volume 2026-10-12',
-        'nft_volume 2026-10-12',
-        'trade_volume 2026-10-11',
-        'payment_volume 2026-10-11',
-        'amm_volume 2026-10-11',
-        'nft_volume 2026-10-11',
-        'trade_volume 2026-10-10',
-        'payment_volume 2026-10-10',
-        'amm_volume 2026-10-10',
-        'nft_volume 2026-10-10',
       ]);
-      // the two sets of the 14th that failed wait: a minute later they are skipped
-      expect((await tickAt(svc, 60_000)).filter((e) => e.endsWith('2026-10-14'))).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
+      // the three that failed wait: a minute later they are skipped, and the older days go on
+      const second = await tickAt(svc, 60_000);
+      expect(second.filter((e) => e.endsWith('2026-10-14'))).toEqual([]);
+      expect(second).toHaveLength(16);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
       // the operator changes the config, and the reason of the failure with it: the version is new, the wait does not apply
       failing.clear();
       markets.version = 5;
       const retried = await tickAt(svc, 120_000);
-      // (not the NFT volume of the 14th: its set is done, for a version of its own that the markets config does not move)
-      expect(retried.slice(0, 4)).toEqual([
+      // (not the NFT volume of the 14th: its wait is for version 1, the version of its own that the markets config does not
+      // move, and the NFT volume of the other days is done for it)
+      expect(retried).toEqual([
         'trade_volume 2026-10-14',
         'payment_volume 2026-10-14',
         'amm_volume 2026-10-14',
-        'trade_volume 2026-10-13',
+        ...[13, 12, 11, 10].flatMap((d) => [
+          `trade_volume 2026-10-${d}`,
+          `payment_volume 2026-10-${d}`,
+          `amm_volume 2026-10-${d}`,
+        ]),
       ]);
       expect(computed.has('trade_volume:2026-10-14:5')).toBe(true);
       expect(computed.has('payment_volume:2026-10-14:5')).toBe(true);
       expect(computed.has('amm_volume:2026-10-14:5')).toBe(true);
+      expect(computed.has(`nft_volume:2026-10-14:${NFT_VOLUME_CONFIG_VERSION}`)).toBe(false);
+      // it is tried again when its own wait is over, and then it is the only set left to do
+      expect(await tickAt(svc, VOLUME_BACKFILL_RETRY_MS)).toEqual(['nft_volume 2026-10-14']);
+      expect(computed.has(`nft_volume:2026-10-14:${NFT_VOLUME_CONFIG_VERSION}`)).toBe(true);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(3);
     });
 
     it('does not wait on a set that failed because of the shutdown', async () => {
