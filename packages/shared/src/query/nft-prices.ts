@@ -74,10 +74,21 @@ export interface SaleKey {
 }
 
 /**
- * The converted price of each sale of `nft_sales` asked for, keyed `${ledger_index}:${tx_index}:${event_index}`, as text in
- * the native currency: at most 6 decimals, no trailing zeros and no exponent (`1250`, `61.25`, `0.000001`). A sale without a
- * converted price (no rate that day), and a key that is no sale, are absent. Each sale is read once, though its row was
- * written twice.
+ * The `${ledger_index}:${tx_index}:${event_index}` text that `convertedSalePrices` answers by. The parts may be numbers or the
+ * text of one (ClickHouse writes a UInt32 either way).
+ */
+export function saleKey(sale: {
+  ledger_index: number | string;
+  tx_index: number | string;
+  event_index: number | string;
+}): string {
+  return `${Number(sale.ledger_index)}:${Number(sale.tx_index)}:${Number(sale.event_index)}`;
+}
+
+/**
+ * The converted price of each sale of `nft_sales` asked for, keyed by `saleKey`, as text in the native currency: at most 6
+ * decimals, no trailing zeros and no exponent (`1250`, `61.25`, `0.000001`). A sale without a converted price (no rate that
+ * day), and a key that is no sale, are absent. Each sale is read once, though its row was written twice.
  */
 export async function convertedSalePrices(
   ch: ClickHouseService,
@@ -114,12 +125,7 @@ export async function convertedSalePrices(
       ORDER BY ledger_index, tx_index, event_index`,
     native.params,
   );
-  return new Map(
-    rows.map((r) => [
-      `${Number(r.ledger_index)}:${Number(r.tx_index)}:${Number(r.event_index)}`,
-      nativeText(r.converted),
-    ]),
-  );
+  return new Map(rows.map((r) => [saleKey(r), nativeText(r.converted)]));
 }
 
 /** A converted price as the readers show it, whatever the text ClickHouse gives a Decimal: no trailing zeros and no exponent. */

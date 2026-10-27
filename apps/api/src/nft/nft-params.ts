@@ -1,7 +1,7 @@
-import { NFT_EVENTS, NFT_ROLES, NftEventName, NftRole } from '@gatehub/data-api-shared';
+import { CollectionKey, NetworkFamily, NFT_EVENTS, NFT_ROLES, NftEventName, NftRole } from '@gatehub/data-api-shared';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { badRequest } from '../common/errors';
-import { first, Query } from '../common/params';
+import { dateParam, endExclusive, first, Query } from '../common/params';
 
 /**
  * The parameters of the NFT routes (spec section 5): each function reads one parameter and answers 400 with the message of
@@ -32,6 +32,23 @@ export function taxonParam(raw: string): number {
   const taxon = Number(raw);
   if (taxon > MAX_UINT32) throw badRequest('invalid taxon');
   return taxon;
+}
+
+/**
+ * The collection a path names (spec 5.8): `/{issuer}/{taxon}` on XRPL, `/{issuer}` on Xahau, whose NFTs have no taxon (its
+ * `taxon_key` is 0). The other family's form names no collection here: `undefined`, which the route answers with a 404
+ * `collection not found` once the rest of the request is checked. The issuer is checked first (400 `invalid issuer address`),
+ * then the taxon of an XRPL path (400 `invalid taxon`); the taxon of a Xahau path is not read.
+ */
+export function collectionKeyParam(
+  family: NetworkFamily,
+  issuerRaw: string,
+  taxonRaw?: string,
+): CollectionKey | undefined {
+  const issuer = issuerParam(issuerRaw);
+  const xrpl = family === 'xrpl';
+  if (xrpl !== (taxonRaw !== undefined)) return undefined;
+  return { issuer, taxon_key: taxonRaw === undefined ? 0 : taxonParam(taxonRaw) };
 }
 
 /**
@@ -67,4 +84,42 @@ export function offerTypeParam(q: Query): NftOfferType | undefined {
   if (raw === undefined || raw === '') return undefined;
   if (!(OFFER_TYPES as readonly string[]).includes(raw)) throw badRequest('invalid type');
   return raw as NftOfferType;
+}
+
+/** The sorts of the list of collections. */
+export const COLLECTION_SORTS = ['volume', 'supply', 'holders'] as const;
+export type CollectionSort = (typeof COLLECTION_SORTS)[number];
+
+/** `sort`: `volume`, `supply` or `holders`; missing or empty is `volume`. 400 `invalid sort` for anything else. */
+export function collectionSortParam(q: Query): CollectionSort {
+  const raw = first(q, 'sort');
+  if (raw === undefined || raw === '') return 'volume';
+  if (!(COLLECTION_SORTS as readonly string[]).includes(raw)) throw badRequest('invalid sort');
+  return raw as CollectionSort;
+}
+
+/** `descending` of the list of collections, which is on by default (the biggest first): off only for `false`, in any case. */
+export function collectionDescendingParam(q: Query): boolean {
+  return !/false/i.test(first(q, 'descending') ?? '');
+}
+
+/** The longest window of the daily stats of a collection: a year, and the day of a leap year. */
+export const STATS_MAX_DAYS = 366;
+
+/**
+ * The window of the daily stats of a collection (spec 5.10): `start` is required, `end` (the end of the period the text names) is
+ * now when it is missing, and the window is at most `STATS_MAX_DAYS` days. The checks come in the order of the parameters, and
+ * before any read: 400 `invalid start date format`, `start is required` (the wording the API has for a parameter that is missing),
+ * `invalid end date format`, `invalid window - use at most 366 days`. `endExclusive` is left out when there is no `end`: the
+ * window then reaches the newest ledger.
+ */
+export function statsWindowParam(q: Query, now: Date = new Date()): { start: Date; endExclusive?: Date } {
+  const start = dateParam(q, 'start', 'invalid start date format');
+  if (start === undefined) throw badRequest('start is required');
+  const end = dateParam(q, 'end', 'invalid end date format');
+  const endsAt = end === undefined ? undefined : endExclusive(end);
+  if ((endsAt ?? now).getTime() - start.date.getTime() > STATS_MAX_DAYS * 86_400_000) {
+    throw badRequest('invalid window - use at most 366 days');
+  }
+  return { start: start.date, ...(endsAt !== undefined && { endExclusive: endsAt }) };
 }

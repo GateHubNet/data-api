@@ -1,4 +1,16 @@
-import { eventsParam, issuerParam, nftIdParam, offerTypeParam, rolesParam, taxonParam } from './nft-params';
+import {
+  collectionDescendingParam,
+  collectionKeyParam,
+  collectionSortParam,
+  eventsParam,
+  issuerParam,
+  nftIdParam,
+  offerTypeParam,
+  rolesParam,
+  STATS_MAX_DAYS,
+  statsWindowParam,
+  taxonParam,
+} from './nft-params';
 
 /** The message of the 400 a call answers, `'no error'` when it returns, `'not a 400'` for any other failure. */
 const message = (fn: () => unknown): unknown => {
@@ -116,5 +128,106 @@ describe('offerTypeParam', () => {
     for (const type of ['both', 'Sell', 'sell,buy', 'sells', '1']) {
       expect([type, message(() => offerTypeParam({ type }))]).toEqual([type, 'invalid type']);
     }
+  });
+});
+
+describe('collectionSortParam', () => {
+  it('is volume, supply or holders, and volume for a missing or empty param', () => {
+    expect(collectionSortParam({})).toBe('volume');
+    expect(collectionSortParam({ sort: '' })).toBe('volume');
+    expect(collectionSortParam({ sort: 'volume' })).toBe('volume');
+    expect(collectionSortParam({ sort: 'supply' })).toBe('supply');
+    expect(collectionSortParam({ sort: ['holders', 'supply'] })).toBe('holders');
+  });
+
+  it('answers 400 invalid sort for anything else, also another case or a list', () => {
+    for (const sort of ['sales', 'Volume', 'supply,holders', ' supply', 'volume_native', '1']) {
+      expect([sort, message(() => collectionSortParam({ sort }))]).toEqual([sort, 'invalid sort']);
+    }
+  });
+});
+
+describe('collectionDescendingParam', () => {
+  it('is on by default and for anything but false, which turns it off in any case', () => {
+    for (const q of [{}, { descending: '' }, { descending: 'true' }, { descending: '1' }, { descending: 'yes' }]) {
+      expect([q, collectionDescendingParam(q)]).toEqual([q, true]);
+    }
+    for (const descending of ['false', 'FALSE', 'False', ['false', 'true']]) {
+      expect([descending, collectionDescendingParam({ descending })]).toEqual([descending, false]);
+    }
+  });
+});
+
+describe('statsWindowParam', () => {
+  const NOW = new Date('2026-10-27T12:00:00Z');
+  const DAY = 86_400_000;
+
+  it('is the start and, when the request has an end, the end of the period it names (exclusive)', () => {
+    const window = statsWindowParam({ start: '2026-10-01', end: '2026-10-05' }, NOW);
+    expect(window.start.toISOString()).toBe('2026-10-01T00:00:00.000Z');
+    expect(window.endExclusive?.toISOString()).toBe('2026-10-06T00:00:00.000Z');
+    expect(Object.keys(statsWindowParam({ start: '2026-10-01' }, NOW))).toEqual(['start']);
+  });
+
+  it('answers 400 start is required for a request with no start', () => {
+    expect(message(() => statsWindowParam({}, NOW))).toBe('start is required');
+    expect(message(() => statsWindowParam({ end: '2026-10-05' }, NOW))).toBe('start is required');
+  });
+
+  it('checks the start, then that there is one, then the end: the first mistake is the one reported', () => {
+    expect(message(() => statsWindowParam({ start: 'x', end: 'y' }, NOW))).toBe('invalid start date format');
+    expect(message(() => statsWindowParam({ start: '', end: 'y' }, NOW))).toBe('invalid start date format');
+    expect(message(() => statsWindowParam({ end: 'y' }, NOW))).toBe('start is required');
+    expect(message(() => statsWindowParam({ start: '2026-10-01', end: 'y' }, NOW))).toBe('invalid end date format');
+  });
+
+  it('allows a window of 366 days and answers 400 invalid window - use at most 366 days for more', () => {
+    expect(STATS_MAX_DAYS).toBe(366);
+    const start = new Date(NOW.getTime() - STATS_MAX_DAYS * DAY).toISOString();
+    expect(statsWindowParam({ start }, NOW).start.toISOString()).toBe(start);
+    const tooEarly = new Date(NOW.getTime() - STATS_MAX_DAYS * DAY - 1000).toISOString().slice(0, 19) + 'Z';
+    expect(message(() => statsWindowParam({ start: tooEarly }, NOW))).toBe('invalid window - use at most 366 days');
+    // the leap year 2024 has 366 days; the end names the end of its last day
+    expect(statsWindowParam({ start: '2024-01-01', end: '2024-12-31' }, NOW).endExclusive?.toISOString()).toBe(
+      '2025-01-01T00:00:00.000Z',
+    );
+    expect(message(() => statsWindowParam({ start: '2024-01-01', end: '2025-01-01' }, NOW))).toBe(
+      'invalid window - use at most 366 days',
+    );
+    expect(message(() => statsWindowParam({ start: '2020', end: '2021' }, NOW))).toBe(
+      'invalid window - use at most 366 days',
+    );
+  });
+
+  it('an end before the start, or a start in the future, is a window of no days and not a mistake', () => {
+    expect(statsWindowParam({ start: '2026-10-05', end: '2026-10-01' }, NOW).start.toISOString()).toBe(
+      '2026-10-05T00:00:00.000Z',
+    );
+    expect(statsWindowParam({ start: '2030-01-01' }, NOW).start.getUTCFullYear()).toBe(2030);
+  });
+});
+
+describe('collectionKeyParam', () => {
+  const ISSUER = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
+
+  it('is the issuer and the taxon on XRPL, and the issuer alone, taxon_key 0, on Xahau', () => {
+    expect(collectionKeyParam('xrpl', ISSUER, '7')).toEqual({ issuer: ISSUER, taxon_key: 7 });
+    expect(collectionKeyParam('xrpl', ISSUER, '0')).toEqual({ issuer: ISSUER, taxon_key: 0 });
+    expect(collectionKeyParam('xrpl', ISSUER, '0042')).toEqual({ issuer: ISSUER, taxon_key: 42 });
+    expect(collectionKeyParam('xahau', ISSUER)).toEqual({ issuer: ISSUER, taxon_key: 0 });
+  });
+
+  it("is none for the other family's form: an XRPL path with no taxon, a Xahau path with one (whatever it says)", () => {
+    expect(collectionKeyParam('xrpl', ISSUER)).toBeUndefined();
+    expect(collectionKeyParam('xahau', ISSUER, '7')).toBeUndefined();
+    expect(collectionKeyParam('xahau', ISSUER, 'nope')).toBeUndefined();
+  });
+
+  it('answers 400 invalid issuer address first, then invalid taxon on XRPL, in either form', () => {
+    expect(message(() => collectionKeyParam('xrpl', 'xyz', 'nope'))).toBe('invalid issuer address');
+    expect(message(() => collectionKeyParam('xrpl', 'xyz'))).toBe('invalid issuer address');
+    expect(message(() => collectionKeyParam('xahau', 'xyz', '7'))).toBe('invalid issuer address');
+    expect(message(() => collectionKeyParam('xrpl', ISSUER, 'nope'))).toBe('invalid taxon');
+    expect(message(() => collectionKeyParam('xrpl', ISSUER, '4294967296'))).toBe('invalid taxon');
   });
 });

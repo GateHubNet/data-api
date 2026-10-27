@@ -1,4 +1,14 @@
-import { NftEventName, NftEventsRow, NftFold, NftKind } from '@gatehub/data-api-shared';
+import {
+  NftCollectionsRow,
+  NftEventName,
+  NftEventsRow,
+  NftFold,
+  NftKind,
+  NftPoint,
+  NftsRow,
+} from '@gatehub/data-api-shared';
+import BigNumber from 'bignumber.js';
+import { flattenJSON } from '../common/csv.interceptor';
 import { Coverage } from '../common/feature-coverage.service';
 import { fmtTime } from '../common/format';
 
@@ -31,11 +41,22 @@ import { fmtTime } from '../common/format';
  *   offer_id, is_sell_offer, owner, amount, currency, amount_issuer?, destination?, expiration?, created_ledger,
  *   created_tx_hash, created_time
  *
+ * Collection (`nft_collections`; `taxon` is the XRPL taxon, `first_mint` and `last_mint` are left out for a collection with no
+ * indexed mint, `volume_native` is the exact text of the sum of the converted prices of its sales), in this order:
+ *   issuer, taxon?, kind, supply, holders, minted, burned, sales_count, volume_native, first_mint?, last_mint?, last_ledger
+ *
+ * CollectionDay (one UTC day of a collection with a sale, a mint or a burn; `avg_price_native` is the volume over the sales that
+ * have a converted price and `min_price_native` the lowest, both left out on a day with no such sale), in this order:
+ *   date, sales_count, volume_native, avg_price_native?, min_price_native?, mints, burns
+ *
+ * Holder, in this order: owner, held
+ *
  * `royalty_est` is the parser's value: `''` (left out) when no royalty applies, and `'0'` when one applies and rounds to nothing.
  *
  * A CSV has the same columns on every page whatever the objects of the page hold (a CSV takes its columns from the keys of the
  * rows, and a key that is left out would move them): `toNftEventCsvRow` gives every column, `null` (an empty cell) where the
- * event has none.
+ * event has none, and `toCsvRow` does the same for the other objects (a nested object's keys are joined with a dot, as the CSV of
+ * every route writes them: `owner_since.ledger_index`).
  */
 
 // -- the keys ------------------------------------------------------------------------------------------------------------
@@ -141,10 +162,55 @@ export const NFT_OFFER_KEYS = [
   'created_time',
 ] as const;
 
+export const COLLECTION_KEYS = [
+  'issuer',
+  'taxon',
+  'kind',
+  'supply',
+  'holders',
+  'minted',
+  'burned',
+  'sales_count',
+  'volume_native',
+  'first_mint',
+  'last_mint',
+  'last_ledger',
+] as const;
+
+export const COLLECTION_DAY_KEYS = [
+  'date',
+  'sales_count',
+  'volume_native',
+  'avg_price_native',
+  'min_price_native',
+  'mints',
+  'burns',
+] as const;
+
+export const HOLDER_KEYS = ['owner', 'held'] as const;
+
 /** The keys of the answers, in order: `coverage` is the key right after `result`. */
 export const NFT_BODY_KEYS = ['result', 'coverage', 'nft'] as const;
 export const NFT_EVENTS_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'events'] as const;
 export const NFT_OFFERS_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'offers'] as const;
+export const COLLECTIONS_BODY_KEYS = ['result', 'coverage', 'total', 'count', 'marker', 'collections'] as const;
+export const COLLECTION_BODY_KEYS = ['result', 'coverage', 'collection'] as const;
+export const NFTS_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'nfts'] as const;
+export const HOLDERS_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'holders'] as const;
+export const SALES_BODY_KEYS = ['result', 'coverage', 'count', 'marker', 'sales'] as const;
+export const STATS_BODY_KEYS = ['result', 'coverage', 'count', 'days'] as const;
+
+/** The columns of the CSV of each list whose objects have optional keys or nested objects: every key, a nested one after a dot. */
+const flat = (keys: readonly string[], nested: Record<string, readonly string[]> = {}): string[] =>
+  keys.flatMap((key) => (key in nested ? nested[key].map((inner) => `${key}.${inner}`) : [key]));
+
+export const NFT_CSV_COLUMNS = flat(NFT_KEYS, {
+  owner_since: POINT_KEYS,
+  minted: MINTED_KEYS,
+  burned_at: BURNED_AT_KEYS,
+  last_sale: LAST_SALE_KEYS,
+});
+export const COLLECTION_CSV_COLUMNS = flat(COLLECTION_KEYS, { first_mint: POINT_KEYS, last_mint: POINT_KEYS });
 
 // -- the objects ---------------------------------------------------------------------------------------------------------
 
@@ -264,6 +330,39 @@ export interface NftOfferObject {
   created_time: string;
 }
 
+export interface CollectionObject {
+  issuer: string;
+  taxon?: number;
+  kind: NftKind;
+  supply: number;
+  holders: number;
+  minted: number;
+  burned: number;
+  sales_count: number;
+  volume_native: string;
+  first_mint?: PointObject;
+  last_mint?: PointObject;
+  last_ledger: number;
+}
+
+export interface CollectionDayObject {
+  date: string;
+  sales_count: number;
+  volume_native: string;
+  avg_price_native?: string;
+  min_price_native?: string;
+  mints: number;
+  burns: number;
+}
+
+export interface HolderObject {
+  owner: string;
+  held: number;
+}
+
+/** An object as a CSV row: every column of its list, `null` where the object has none. */
+export type CsvRow = Record<string, string | number | boolean | null>;
+
 /** The answer of the detail route. */
 export interface NftBody {
   result: 'success';
@@ -286,6 +385,52 @@ export interface NftOffersBody {
   count: number;
   marker?: string;
   offers: NftOfferObject[];
+}
+
+export interface CollectionsBody {
+  result: 'success';
+  coverage: Coverage;
+  total: number;
+  count: number;
+  marker?: string;
+  collections: CollectionObject[] | CsvRow[];
+}
+
+export interface CollectionBody {
+  result: 'success';
+  coverage: Coverage;
+  collection: CollectionObject;
+}
+
+export interface NftsBody {
+  result: 'success';
+  coverage: Coverage;
+  count: number;
+  marker?: string;
+  nfts: NftObject[] | CsvRow[];
+}
+
+export interface HoldersBody {
+  result: 'success';
+  coverage: Coverage;
+  count: number;
+  marker?: string;
+  holders: HolderObject[];
+}
+
+export interface SalesBody {
+  result: 'success';
+  coverage: Coverage;
+  count: number;
+  marker?: string;
+  sales: NftSaleObject[] | CsvRow[];
+}
+
+export interface StatsBody {
+  result: 'success';
+  coverage: Coverage;
+  count: number;
+  days: CollectionDayObject[] | CsvRow[];
 }
 
 // -- the builders --------------------------------------------------------------------------------------------------------
@@ -426,4 +571,129 @@ export function toNftOfferObject(created: NftEventsRow): NftOfferObject {
     created_tx_hash: created.tx_hash,
     created_time: fmtTime(created.close_time),
   };
+}
+
+/**
+ * An `nfts` row as `toNftObject` takes an NFT: the fold of the list routes, which read the aggregate and fold nothing. The row has
+ * the facts of the fold but `owners` (`[]`: the list does not name the owners an NFT had), `created_ledger` (left out, the lists
+ * carry no per-item coverage) and the `tx_index` and `event_index` of the last sale. Those two are 0 here, unknown, and nothing
+ * reads them: a list does not join the price of a sale, so `last_sale` of the list routes has no `converted_amount` (the detail
+ * folds the events and has it). The times are unix seconds (`toUnixTimestamp(...) AS ...` in the read); the numbers may be text
+ * (ClickHouse writes a UInt64 as one).
+ */
+export function nftFoldOfRow(row: NftsRow): NftFold {
+  /** The place of a fact: all of ledger, hash and time are set when the fact is, as the aggregator writes them. */
+  const at = (ledger: number | null, tx: string, time: number | null): NftPoint | undefined =>
+    ledger !== null && time !== null
+      ? { ledger_index: Number(ledger), tx_hash: tx, close_time: Number(time) }
+      : undefined;
+  const since = row.owner !== '' ? at(row.owner_ledger, row.owner_tx, row.owner_time) : undefined;
+  const minted = at(row.minted_ledger, row.minted_tx, row.minted_time);
+  const burned = Number(row.burned) === 1 ? at(row.burned_ledger, row.burned_tx, row.burned_time) : undefined;
+  const sold = at(row.last_sale_ledger, row.last_sale_tx, row.last_sale_time);
+  return {
+    nft_id: row.nft_id,
+    kind: row.kind,
+    issuer: row.issuer,
+    taxon: row.taxon === null ? null : Number(row.taxon),
+    taxon_key: Number(row.taxon_key),
+    serial: Number(row.serial),
+    nft_flags: Number(row.nft_flags),
+    transfer_fee: Number(row.transfer_fee),
+    owner: row.owner,
+    ...(since && { owner_since: since }),
+    uri: row.uri,
+    digest: row.digest,
+    ...(minted && { minted: { ...minted, by: row.minted_by, to: row.minted_to } }),
+    burned: Number(row.burned) === 1,
+    ...(burned && { burned_at: { ...burned, by: row.burned_by } }),
+    sale_count: Number(row.sale_count),
+    ...(sold && {
+      last_sale: {
+        ...sold,
+        tx_index: 0,
+        event_index: 0,
+        amount: row.last_sale_amount,
+        currency: row.last_sale_currency,
+        amount_issuer: row.last_sale_amount_issuer,
+      },
+    }),
+    first_ledger: Number(row.first_ledger),
+    last_ledger: Number(row.last_ledger),
+    owners: [],
+  };
+}
+
+/** A collection from its `nft_collections` row (the newest version), the times as unix seconds. */
+export function toCollectionObject(r: Omit<NftCollectionsRow, 'version'>): CollectionObject {
+  const mint = (ledger: number | null, tx: string, time: number | null): PointObject | undefined =>
+    ledger !== null && time !== null
+      ? point({ ledger_index: Number(ledger), tx_hash: tx, close_time: Number(time) })
+      : undefined;
+  const first = mint(r.first_mint_ledger, r.first_mint_tx, r.first_mint_time);
+  const last = mint(r.last_mint_ledger, r.last_mint_tx, r.last_mint_time);
+  return {
+    issuer: r.issuer,
+    ...(r.kind === 'nftoken' && r.taxon !== null && { taxon: Number(r.taxon) }),
+    kind: r.kind,
+    supply: Number(r.supply),
+    holders: Number(r.holders),
+    minted: Number(r.minted),
+    burned: Number(r.burned),
+    sales_count: Number(r.sales_count),
+    volume_native: new BigNumber(r.volume_native).toFixed(),
+    ...(first && { first_mint: first }),
+    ...(last && { last_mint: last }),
+    last_ledger: Number(r.last_ledger),
+  };
+}
+
+/** What the stats read gives for one UTC day (text for what ClickHouse writes as UInt64 or Decimal). */
+export interface CollectionDayRow {
+  /** `YYYY-MM-DD` of the day, UTC. */
+  day: string;
+  sales_count: number | string;
+  mints: number | string;
+  burns: number | string;
+  /** How many of the day's sales have a converted price. */
+  priced: number | string;
+  /** The sum of the converted prices (a Decimal's text), `null` when no sale of the day has one. */
+  volume: string | null;
+  /** The lowest converted price, `null` when no sale of the day has one. */
+  min_price: string | null;
+}
+
+/** The decimals of the average price: those of every price in the native currency. */
+const PRICE_DECIMALS = 6;
+
+/**
+ * A day of a collection. The average is the exact volume over the number of converted sales, rounded to the 6th decimal (half
+ * up), as the prices are; with no converted sale the day has `volume_native` `0` and neither price field.
+ */
+export function toCollectionDayObject(r: CollectionDayRow): CollectionDayObject {
+  const priced = Number(r.priced);
+  const volume = new BigNumber(r.volume ?? 0);
+  return {
+    date: `${r.day}T00:00:00Z`,
+    sales_count: Number(r.sales_count),
+    volume_native: volume.toFixed(),
+    ...(priced > 0 &&
+      r.min_price !== null && {
+        avg_price_native: volume.dividedBy(priced).decimalPlaces(PRICE_DECIMALS, BigNumber.ROUND_HALF_UP).toFixed(),
+        min_price_native: new BigNumber(r.min_price).toFixed(),
+      }),
+    mints: Number(r.mints),
+    burns: Number(r.burns),
+  };
+}
+
+/** A holder from its `nft_collection_holders` row. */
+export function toHolderObject(r: { owner: string; held: number | string }): HolderObject {
+  return { owner: r.owner, held: Number(r.held) };
+}
+
+/** The CSV row of an object: every column of `columns`, in its order, `null` where the object has none. */
+export function toCsvRow(object: object, columns: readonly string[]): CsvRow {
+  const values = flattenJSON(object) as Record<string, string | number | boolean | undefined>;
+  return Object.fromEntries(columns.map((column) => [column, values[column] ?? null]));
 }

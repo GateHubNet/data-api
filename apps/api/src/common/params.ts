@@ -199,6 +199,16 @@ export function endExclusive(p: ParsedDate): Date {
 }
 
 /**
+ * The dates of a list of events: `start` (inclusive) and `end` (the end of the period the text names), each missing when the
+ * param is. 400 `invalid start date format` / `invalid end date format` for a text that is no date.
+ */
+export function ledgerDates(query: Query): { start?: Date; endExclusive?: Date } {
+  const start = dateParam(query, 'start', 'invalid start date format');
+  const end = dateParam(query, 'end', 'invalid end date format');
+  return { ...(start && { start: start.date }), ...(end && { endExclusive: endExclusive(end) }) };
+}
+
+/**
  * A whole number such as a ledger or sequence: missing or empty gives `undefined`, anything but digits (or more than a
  * double holds exactly) answers 400 `error`.
  */

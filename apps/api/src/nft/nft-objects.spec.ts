@@ -1,16 +1,32 @@
-import { NftEventsRow, NftFold } from '@gatehub/data-api-shared';
+import { NftCollectionsRow, NftEventsRow, NftFold, NftsRow } from '@gatehub/data-api-shared';
 import {
   BURNED_AT_KEYS,
+  COLLECTION_BODY_KEYS,
+  COLLECTION_CSV_COLUMNS,
+  COLLECTION_DAY_KEYS,
+  COLLECTION_KEYS,
+  COLLECTIONS_BODY_KEYS,
+  HOLDER_KEYS,
+  HOLDERS_BODY_KEYS,
   LAST_SALE_KEYS,
   MINTED_KEYS,
   NFT_BODY_KEYS,
+  NFT_CSV_COLUMNS,
   NFT_EVENT_KEYS,
   NFT_EVENTS_BODY_KEYS,
   NFT_KEYS,
   NFT_OFFER_KEYS,
   NFT_OFFERS_BODY_KEYS,
   NFT_SALE_KEYS,
+  nftFoldOfRow,
+  NFTS_BODY_KEYS,
   POINT_KEYS,
+  SALES_BODY_KEYS,
+  STATS_BODY_KEYS,
+  toCollectionDayObject,
+  toCollectionObject,
+  toCsvRow,
+  toHolderObject,
   toNftEventCsvRow,
   toNftEventObject,
   toNftObject,
@@ -325,6 +341,93 @@ describe('the key constants', () => {
     expect(NFT_BODY_KEYS).toEqual(['result', 'coverage', 'nft']);
     expect(NFT_EVENTS_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'marker', 'events']);
     expect(NFT_OFFERS_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'marker', 'offers']);
+  });
+
+  it('are, for the collections, the pinned lists of the spec (5.1, 5.7 to 5.10), in order', () => {
+    expect(COLLECTION_KEYS).toEqual([
+      'issuer',
+      'taxon',
+      'kind',
+      'supply',
+      'holders',
+      'minted',
+      'burned',
+      'sales_count',
+      'volume_native',
+      'first_mint',
+      'last_mint',
+      'last_ledger',
+    ]);
+    expect(COLLECTION_DAY_KEYS).toEqual([
+      'date',
+      'sales_count',
+      'volume_native',
+      'avg_price_native',
+      'min_price_native',
+      'mints',
+      'burns',
+    ]);
+    expect(HOLDER_KEYS).toEqual(['owner', 'held']);
+    expect(COLLECTIONS_BODY_KEYS).toEqual(['result', 'coverage', 'total', 'count', 'marker', 'collections']);
+    expect(COLLECTION_BODY_KEYS).toEqual(['result', 'coverage', 'collection']);
+    expect(NFTS_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'marker', 'nfts']);
+    expect(HOLDERS_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'marker', 'holders']);
+    expect(SALES_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'marker', 'sales']);
+    expect(STATS_BODY_KEYS).toEqual(['result', 'coverage', 'count', 'days']);
+  });
+
+  it('give the CSV of an NFT and of a collection one column for each key, a nested object after a dot', () => {
+    expect(NFT_CSV_COLUMNS).toEqual([
+      'nft_id',
+      'kind',
+      'issuer',
+      'taxon',
+      'serial',
+      'flags',
+      'transfer_fee',
+      'owner',
+      'owner_since.ledger_index',
+      'owner_since.tx_hash',
+      'owner_since.executed_time',
+      'uri',
+      'digest',
+      'minted.ledger_index',
+      'minted.tx_hash',
+      'minted.executed_time',
+      'minted.by',
+      'minted.to',
+      'burned',
+      'burned_at.ledger_index',
+      'burned_at.tx_hash',
+      'burned_at.executed_time',
+      'burned_at.by',
+      'sale_count',
+      'last_sale.amount',
+      'last_sale.currency',
+      'last_sale.amount_issuer',
+      'last_sale.converted_amount',
+      'last_sale.ledger_index',
+      'last_sale.tx_hash',
+      'last_sale.executed_time',
+    ]);
+    expect(COLLECTION_CSV_COLUMNS).toEqual([
+      'issuer',
+      'taxon',
+      'kind',
+      'supply',
+      'holders',
+      'minted',
+      'burned',
+      'sales_count',
+      'volume_native',
+      'first_mint.ledger_index',
+      'first_mint.tx_hash',
+      'first_mint.executed_time',
+      'last_mint.ledger_index',
+      'last_mint.tx_hash',
+      'last_mint.executed_time',
+      'last_ledger',
+    ]);
   });
 });
 
@@ -725,5 +828,386 @@ describe('toNftOfferObject', () => {
       'created_tx_hash',
       'created_time',
     ]);
+  });
+});
+
+/** An `nfts` row as the lists read it (the times in unix seconds): the NFT of `FOLD`, sold and held by Bob. */
+const ROW: NftsRow = deepFreeze({
+  issuer: ISSUER,
+  taxon_key: 1,
+  serial: 4127,
+  nft_id: NFT_ID,
+  kind: 'nftoken',
+  taxon: 1,
+  nft_flags: 8,
+  transfer_fee: 5000,
+  owner: BOB,
+  owner_ledger: 107701201,
+  owner_tx: HASH(0x67f9),
+  owner_time: CLOSE,
+  uri: '697066733A2F2F',
+  digest: '',
+  minted_ledger: 86201334,
+  minted_tx: HASH(0x1e6b),
+  minted_time: CLOSE - 86_400 * 365,
+  minted_by: ISSUER,
+  minted_to: ALICE,
+  burned: 0,
+  burned_ledger: null,
+  burned_tx: '',
+  burned_time: null,
+  burned_by: '',
+  sale_count: 7,
+  last_sale_ledger: 107701201,
+  last_sale_tx: HASH(0x67f9),
+  last_sale_time: CLOSE,
+  last_sale_amount: '1250',
+  last_sale_currency: 'XRP',
+  last_sale_amount_issuer: '',
+  first_ledger: 86201334,
+  last_ledger: 107701201,
+  version: 1_792_000_000_000,
+});
+
+describe('nftFoldOfRow', () => {
+  it('is the fold of the NFT without the owners it had, the ledger it was created in and the place of its last sale in the ledger', () => {
+    const fold = nftFoldOfRow(ROW);
+    expect(fold).toEqual({
+      ...FOLD,
+      created_ledger: undefined,
+      owners: [],
+      last_sale: { ...FOLD.last_sale, tx_index: 0, event_index: 0 },
+    });
+    expect(fold).not.toHaveProperty('created_ledger');
+  });
+
+  it('gives toNftObject the NFT of the detail, but for the price of its last sale: a list does not join prices', () => {
+    const fromRow = toNftObject(nftFoldOfRow(ROW));
+    const detail = toNftObject(FOLD, '1250');
+    expect(fromRow.last_sale).not.toHaveProperty('converted_amount');
+    expect(detail.last_sale).toHaveProperty('converted_amount', '1250');
+    expect({ ...fromRow, last_sale: undefined }).toEqual({ ...detail, last_sale: undefined });
+    expect(fromRow.last_sale).toEqual({ ...detail.last_sale, converted_amount: undefined });
+    expectOrdered(fromRow as unknown as Obj, NFT_KEYS);
+  });
+
+  it('a burned NFT has no owner and no owner_since, and its burn', () => {
+    const burned: NftsRow = deepFreeze({
+      ...ROW,
+      owner: '',
+      owner_ledger: null,
+      owner_tx: '',
+      owner_time: null,
+      burned: 1,
+      burned_ledger: 107800000,
+      burned_tx: HASH(0xb0),
+      burned_time: CLOSE + 100,
+      burned_by: ISSUER,
+      last_ledger: 107800000,
+    });
+    expect(nftFoldOfRow(burned)).toEqual({
+      ...BURNED,
+      created_ledger: undefined,
+      owners: [],
+      last_sale: { ...FOLD.last_sale, tx_index: 0, event_index: 0 },
+    });
+    const nft = toNftObject(nftFoldOfRow(burned));
+    expect(nft).not.toHaveProperty('owner');
+    expect(nft).not.toHaveProperty('owner_since');
+    expect(nft.burned_at).toEqual({
+      ledger_index: 107800000,
+      tx_hash: HASH(0xb0),
+      executed_time: '2026-10-20T17:02:52Z',
+      by: ISSUER,
+    });
+  });
+
+  it("owner_since is the owner's: a row with no owner has none, whatever its point columns say", () => {
+    const noOwner: NftsRow = deepFreeze({ ...ROW, owner: '' });
+    expect(nftFoldOfRow(noOwner)).not.toHaveProperty('owner_since');
+    expect(toNftObject(nftFoldOfRow(noOwner))).not.toHaveProperty('owner_since');
+    expect(toNftObject(nftFoldOfRow(ROW))).toHaveProperty('owner_since');
+  });
+
+  it('an NFT that no event names an owner or a mint of, and that never sold, has only its identity', () => {
+    const bare: NftsRow = deepFreeze({
+      ...ROW,
+      taxon: 0,
+      taxon_key: 0,
+      serial: 0,
+      nft_flags: 0,
+      transfer_fee: 0,
+      owner: '',
+      owner_ledger: null,
+      owner_tx: '',
+      owner_time: null,
+      uri: '',
+      minted_ledger: null,
+      minted_tx: '',
+      minted_time: null,
+      minted_by: '',
+      minted_to: '',
+      sale_count: 0,
+      last_sale_ledger: null,
+      last_sale_tx: '',
+      last_sale_time: null,
+      last_sale_amount: '',
+      last_sale_currency: '',
+      last_sale_amount_issuer: '',
+      first_ledger: 107_000_000,
+      last_ledger: 107_000_000,
+    });
+    expect(nftFoldOfRow(bare)).toEqual(BARE);
+    expect(Object.keys(toNftObject(nftFoldOfRow(bare)))).toEqual([
+      'nft_id',
+      'kind',
+      'issuer',
+      'taxon',
+      'serial',
+      'flags',
+      'transfer_fee',
+      'burned',
+      'sale_count',
+    ]);
+  });
+
+  it('a URIToken has no taxon, and the numbers and times of a row may come as text', () => {
+    const token: NftsRow = deepFreeze({
+      ...ROW,
+      nft_id: URI_TOKEN,
+      kind: 'uritoken',
+      taxon: null,
+      taxon_key: 0,
+      serial: 0,
+      nft_flags: 1,
+      transfer_fee: 0,
+      digest: 'AB'.repeat(32),
+      sale_count: '0' as unknown as number,
+      owner_ledger: '26774724' as unknown as number,
+      owner_time: String(CLOSE) as unknown as number,
+      minted_ledger: null,
+      minted_tx: '',
+      minted_time: null,
+      minted_by: '',
+      minted_to: '',
+      last_sale_ledger: null,
+      last_sale_tx: '',
+      last_sale_time: null,
+      last_sale_amount: '',
+      last_sale_currency: '',
+      last_sale_amount_issuer: '',
+    });
+    const nft = toNftObject(nftFoldOfRow(token));
+    for (const key of ['taxon', 'serial', 'transfer_fee', 'minted', 'last_sale']) expect(nft).not.toHaveProperty(key);
+    expect(nft).toMatchObject({ kind: 'uritoken', digest: 'AB'.repeat(32), sale_count: 0 });
+    expect(nft.owner_since).toEqual({
+      ledger_index: 26774724,
+      tx_hash: HASH(0x67f9),
+      executed_time: '2026-10-20T17:01:12Z',
+    });
+  });
+
+  it('does not change the row', () => {
+    const copy = JSON.stringify(ROW);
+    nftFoldOfRow(ROW);
+    expect(JSON.stringify(ROW)).toBe(copy);
+  });
+});
+
+/** A row of `nft_collections` as the readers have it (the times in unix seconds): the collection of the spec's example. */
+const COLLECTION: Omit<NftCollectionsRow, 'version'> = deepFreeze({
+  issuer: ISSUER,
+  taxon_key: 1,
+  kind: 'nftoken',
+  taxon: 1,
+  supply: '10000',
+  holders: 3812,
+  minted: '10000',
+  burned: 0,
+  sales_count: '41208',
+  volume_native: '18400000.5',
+  volume_native_f: 18400000.5,
+  first_mint_ledger: 86201334,
+  first_mint_tx: HASH(0x1e6b),
+  first_mint_time: CLOSE - 86_400 * 365,
+  last_mint_ledger: 107120044,
+  last_mint_tx: HASH(0x9a10),
+  last_mint_time: CLOSE - 86_400,
+  last_ledger: 107701201,
+});
+
+describe('toCollectionObject', () => {
+  it('writes the keys of a collection in the order of COLLECTION_KEYS, counts as numbers and the volume as the exact text', () => {
+    const collection = toCollectionObject(COLLECTION);
+    expect(collection).toEqual({
+      issuer: ISSUER,
+      taxon: 1,
+      kind: 'nftoken',
+      supply: 10000,
+      holders: 3812,
+      minted: 10000,
+      burned: 0,
+      sales_count: 41208,
+      volume_native: '18400000.5',
+      first_mint: { ledger_index: 86201334, tx_hash: HASH(0x1e6b), executed_time: '2025-10-20T17:01:12Z' },
+      last_mint: { ledger_index: 107120044, tx_hash: HASH(0x9a10), executed_time: '2026-10-19T17:01:12Z' },
+      last_ledger: 107701201,
+    });
+    expect(Object.keys(collection)).toEqual([...COLLECTION_KEYS]);
+    expect(Object.keys(collection.first_mint as object)).toEqual([...POINT_KEYS]);
+  });
+
+  it('a collection with no indexed mint has no first_mint and last_mint, and one of Xahau has no taxon', () => {
+    const none = toCollectionObject({
+      ...COLLECTION,
+      kind: 'uritoken',
+      taxon: null,
+      taxon_key: 0,
+      minted: 0,
+      first_mint_ledger: null,
+      first_mint_tx: '',
+      first_mint_time: null,
+      last_mint_ledger: null,
+      last_mint_tx: '',
+      last_mint_time: null,
+    });
+    expect(Object.keys(none)).toEqual(COLLECTION_KEYS.filter((k) => !['taxon', 'first_mint', 'last_mint'].includes(k)));
+    expect(none.minted).toBe(0);
+  });
+
+  it('a taxon of 0 is a value, and a volume of 0 is the text 0', () => {
+    const zero = toCollectionObject({ ...COLLECTION, taxon: 0, taxon_key: 0, volume_native: '0', volume_native_f: 0 });
+    expect(zero.taxon).toBe(0);
+    expect(zero.volume_native).toBe('0');
+  });
+
+  it('writes the volume as plain decimal text: no exponent, no trailing zeros', () => {
+    for (const [stored, shown] of [
+      ['1E+21', '1000000000000000000000'],
+      ['12.500000', '12.5'],
+      ['0.000001', '0.000001'],
+      ['100', '100'],
+    ]) {
+      expect(toCollectionObject({ ...COLLECTION, volume_native: stored }).volume_native).toBe(shown);
+    }
+  });
+
+  it('does not change the row', () => {
+    const copy = JSON.stringify(COLLECTION);
+    toCollectionObject(COLLECTION);
+    expect(JSON.stringify(COLLECTION)).toBe(copy);
+  });
+});
+
+describe('toCollectionDayObject', () => {
+  const DAY = {
+    day: '2026-10-19',
+    sales_count: '46',
+    mints: 0,
+    burns: '0',
+    priced: '46',
+    volume: '20240.46',
+    min_price: '180',
+  };
+
+  it('writes the keys of a day in the order of COLLECTION_DAY_KEYS: the date as a day, the average over the converted sales', () => {
+    const day = toCollectionDayObject(DAY);
+    expect(day).toEqual({
+      date: '2026-10-19T00:00:00Z',
+      sales_count: 46,
+      volume_native: '20240.46',
+      avg_price_native: '440.01',
+      min_price_native: '180',
+      mints: 0,
+      burns: 0,
+    });
+    expect(Object.keys(day)).toEqual([...COLLECTION_DAY_KEYS]);
+  });
+
+  it('rounds the average to the 6th decimal, half up', () => {
+    const avg = (volume: string, priced: number): string | undefined =>
+      toCollectionDayObject({ ...DAY, volume, priced, sales_count: priced }).avg_price_native;
+    expect(avg('1', 3)).toBe('0.333333');
+    expect(avg('2', 3)).toBe('0.666667');
+    expect(avg('0.000001', 2)).toBe('0.000001');
+    expect(avg('0.000001', 4)).toBe('0');
+    expect(avg('100', 4)).toBe('25');
+    expect(avg('1250.5', 1)).toBe('1250.5');
+  });
+
+  it('a day with sales and none of them converted has volume_native 0, its count, and neither price field', () => {
+    const day = toCollectionDayObject({ ...DAY, sales_count: 1, priced: 0, volume: null, min_price: null });
+    expect(day).toEqual({ date: '2026-10-19T00:00:00Z', sales_count: 1, volume_native: '0', mints: 0, burns: 0 });
+    expect(Object.keys(day)).toEqual(['date', 'sales_count', 'volume_native', 'mints', 'burns']);
+  });
+
+  it('a day of mints and burns only has no sales, and a price of 0 is a price', () => {
+    const quiet = toCollectionDayObject({
+      ...DAY,
+      sales_count: 0,
+      mints: 5,
+      burns: 2,
+      priced: 0,
+      volume: null,
+      min_price: null,
+    });
+    expect(quiet).toEqual({ date: '2026-10-19T00:00:00Z', sales_count: 0, volume_native: '0', mints: 5, burns: 2 });
+    const free = toCollectionDayObject({ ...DAY, sales_count: 2, priced: 2, volume: '0', min_price: '0' });
+    expect(free.avg_price_native).toBe('0');
+    expect(free.min_price_native).toBe('0');
+  });
+
+  it('writes the amounts as plain decimal text', () => {
+    const day = toCollectionDayObject({ ...DAY, volume: '1E+21', min_price: '0.500000', priced: 1, sales_count: 1 });
+    expect(day.volume_native).toBe('1000000000000000000000');
+    expect(day.min_price_native).toBe('0.5');
+    expect(day.avg_price_native).toBe('1000000000000000000000');
+  });
+});
+
+describe('toHolderObject', () => {
+  it('is the owner and how many NFTs of the collection it holds, as a number', () => {
+    expect(toHolderObject({ owner: ALICE, held: '120000' })).toEqual({ owner: ALICE, held: 120000 });
+    expect(Object.keys(toHolderObject({ owner: BOB, held: 3 }))).toEqual([...HOLDER_KEYS]);
+  });
+});
+
+describe('toCsvRow', () => {
+  it('has every column of the list in its order, whatever the object holds, a nested key after a dot and null for what is missing', () => {
+    const full = toCsvRow(toNftObject(nftFoldOfRow(ROW)), NFT_CSV_COLUMNS);
+    expect(Object.keys(full)).toEqual(NFT_CSV_COLUMNS);
+    expect(full['minted.by']).toBe(ISSUER);
+    expect(full['last_sale.amount']).toBe('1250');
+    expect(full['last_sale.converted_amount']).toBeNull();
+    expect(full.burned).toBe(false);
+    expect(full.digest).toBeNull();
+    const bare = toCsvRow(toNftObject(BARE), NFT_CSV_COLUMNS);
+    expect(Object.keys(bare)).toEqual(NFT_CSV_COLUMNS);
+    expect(bare.owner).toBeNull();
+    expect(bare['owner_since.ledger_index']).toBeNull();
+    expect(bare.taxon).toBe(0);
+  });
+
+  it('does the same for a collection, whether it has mints or not', () => {
+    const minted = toCsvRow(toCollectionObject(COLLECTION), COLLECTION_CSV_COLUMNS);
+    expect(Object.keys(minted)).toEqual(COLLECTION_CSV_COLUMNS);
+    expect(minted['first_mint.tx_hash']).toBe(HASH(0x1e6b));
+    const none = toCsvRow(
+      toCollectionObject({
+        ...COLLECTION,
+        first_mint_ledger: null,
+        first_mint_time: null,
+        last_mint_ledger: null,
+        last_mint_time: null,
+      }),
+      COLLECTION_CSV_COLUMNS,
+    );
+    expect(Object.keys(none)).toEqual(COLLECTION_CSV_COLUMNS);
+    expect(none['first_mint.ledger_index']).toBeNull();
+    expect(none.volume_native).toBe('18400000.5');
+  });
+
+  it('a plain list gives its keys as they are', () => {
+    expect(toCsvRow(toHolderObject({ owner: ALICE, held: 4 }), HOLDER_KEYS)).toEqual({ owner: ALICE, held: 4 });
   });
 });

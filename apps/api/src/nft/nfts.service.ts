@@ -7,6 +7,7 @@ import {
   NftEventRead,
   NftEventsRow,
   readDistinctPage,
+  saleKey,
   Table,
 } from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
@@ -115,15 +116,6 @@ const FIRST_EVENT_SQL = `SELECT ledger_index, event
 /** The key of an open offer, the key of the `offer_create` that made it: what the marker of the offers holds. */
 const OFFER_POSITION = NFT_EVENT_POSITION;
 
-interface Counted {
-  ledger_index: number | string;
-  tx_index: number | string;
-  event_index: number | string;
-}
-
-/** The `${ledger_index}:${tx_index}:${event_index}` key that `convertedSalePrices` answers by. */
-const saleKeyOf = (r: Counted): string => `${Number(r.ledger_index)}:${Number(r.tx_index)}:${Number(r.event_index)}`;
-
 /** The window and the page of the history of an NFT. The values are already validated. */
 export interface HistoryQuery {
   /** Inclusive; without it from the first ledger. */
@@ -167,7 +159,7 @@ export interface OffersAnswer {
  *
  *  - **The detail** folds the NFT's events (`foldNftEvents`, the function of the `nft_state` job: the same facts, fresh at the
  *    commit of a ledger and not when the aggregator gets to it), a range of the primary key of `nft_events`, and joins the
- *    converted price of its last sale (`convertedSalePrices`, on `${ledger_index}:${tx_index}:${event_index}`).
+ *    converted price of its last sale (`convertedSalePrices`, by `saleKey`).
  *  - **The history** is a range of the same key, read in the order of the key a page at a time by `readDistinctPage`. The
  *    filters (the dates as a range of ledgers, the events) are conditions of the inner read that is capped: a filter after the
  *    page would leave a page short or empty while there is a next one.
@@ -203,7 +195,7 @@ export class NftsService {
             { ledger_index: sale.ledger_index, tx_index: sale.tx_index, event_index: sale.event_index },
           ]),
     ]);
-    const price = sale === undefined ? undefined : converted?.get(saleKeyOf(sale));
+    const price = sale === undefined ? undefined : converted?.get(saleKey(sale));
     return { coverage, nft: toNftObject(fold, price) };
   }
 
@@ -251,7 +243,7 @@ export class NftsService {
     );
     return {
       coverage,
-      events: page.rows.map((r) => toNftEventObject(r, converted.get(saleKeyOf(r)))),
+      events: page.rows.map((r) => toNftEventObject(r, converted.get(saleKey(r)))),
       ...(page.marker !== undefined && { marker: page.marker }),
     };
   }

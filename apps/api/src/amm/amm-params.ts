@@ -2,7 +2,10 @@ import { AMM_LIQUIDITY_EVENTS } from '@gatehub/data-api-shared';
 import { applyDecorators } from '@nestjs/common';
 import { ApiQuery } from '@nestjs/swagger';
 import { badRequest } from '../common/errors';
-import { dateParam, endExclusive, first, Query } from '../common/params';
+import { first, ledgerDates, Query } from '../common/params';
+
+// `ledgerDates` lives in `common/params` (the NFT routes read the same window); the AMM routes keep importing it from here
+export { ledgerDates };
 
 /** The kinds of the governance list: the `type` filter is one of them. */
 export const GOVERNANCE_TYPES = ['vote', 'bid'] as const;
@@ -25,16 +28,6 @@ export function typeParam(query: Query): GovernanceType | undefined {
   if (raw === undefined || raw === '') return undefined;
   if (!(GOVERNANCE_TYPES as readonly string[]).includes(raw)) throw badRequest('invalid type');
   return raw as GovernanceType;
-}
-
-/**
- * The dates of a list of events: `start` (inclusive) and `end` (the end of the period the text names), each missing when the
- * param is. 400 `invalid start date format` / `invalid end date format` for a text that is no date.
- */
-export function ledgerDates(query: Query): { start?: Date; endExclusive?: Date } {
-  const start = dateParam(query, 'start', 'invalid start date format');
-  const end = dateParam(query, 'end', 'invalid end date format');
-  return { ...(start && { start: start.date }), ...(end && { endExclusive: endExclusive(end) }) };
 }
 
 /** The params every list of the AMM routes has beside its own: the order, the page and the format. */

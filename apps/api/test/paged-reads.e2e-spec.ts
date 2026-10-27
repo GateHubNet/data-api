@@ -1,6 +1,7 @@
 import { Table } from '@gatehub/data-api-shared';
+import { SAMPLE_ROWS } from '../../../packages/shared/test/sample-rows';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
-import { primaryKeys, served } from './support/amm';
+import { accountAt, primaryKeys, served } from './support/amm';
 import { fixtureTransactions } from './support/fixtures';
 import { insertNftEvents, nftEventRow } from './support/nfts';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead, tableReads } from './support/plans';
@@ -1023,5 +1024,279 @@ describe('the history of an NFT reads the granules of a page, not its 10,000 eve
         );
       }
     }
+  });
+});
+
+describe("a collection's NFTs and holders read the granules of a page, not the 120,000 NFTs of one owner, and the list reads its rows once (read_rows over a bulk of four parts)", () => {
+  // One collection of 120,000 NFTs, all held by one owner, in four parts of 30,000 (the NFTs of a collection written over time:
+  // the keys of the parts are interleaved). Two other collections and two other owners, one that sorts before and one after,
+  // have 240,000 each in the same parts: the tables are 600,000 rows, and a read that did not use the key would read them all.
+  //  - `nfts` and `account_nfts` are paged by `readNewestPage`: the prefix (the collection, or the owner and the collection) and the
+  //    keyset narrow the read, and it stops after the cap, about a granule of each part;
+  //  - the holders are paged by `held` and then the owner, which is not the order of their key (`issuer, taxon_key, owner`), so a
+  //    page reads the collection's WHOLE holders prefix: 40,000 holders here, in four parts. That is the bound (the holders of one
+  //    collection, not the table), and it is the same for every page of the list;
+  //  - the list of collections is one read of the rows of `nft_collections`, kept for the next 60 s.
+  const PARTS = BULK_BASES.length;
+  const GRANULE = 8192;
+  const NFTS_PER_PART = 30_000;
+  const OTHER_NFTS_PER_PART = 60_000;
+  const HOLDERS_PER_PART = 10_000;
+  const OTHER_HOLDERS_PER_PART = 20_000;
+  const COLLECTIONS_PER_PART = 12_500;
+  const TAXON = 7;
+  const [BEFORE, ISSUER, AFTER] = [accountAt(0x41), accountAt(0x42), accountAt(0x43)].sort();
+  const [OWNER_BEFORE, OWNER, OWNER_AFTER] = [accountAt(0x51), accountAt(0x52), accountAt(0x53)].sort();
+  const TEMPLATE = '3'.repeat(64);
+  const collection = `/v2/nft_collections/${ISSUER}/${TAXON}`;
+  /** A page touches about a granule of each part that holds the keys it reads, and a few more for what the read of a sorted part asks. */
+  const READ_BOUND = PARTS * 3 * GRANULE;
+  /** The holders of the collection: figures 1 to 7 by the order of the bulk (the owner `rHolder…` of the n-th holds 1 + n % 7). */
+  const HOLDERS = PARTS * HOLDERS_PER_PART;
+  const holderName = (n: number): string => `rHolder${String(n).padStart(8, '0')}`;
+  const heldBy = (n: number): number => 1 + (n % 7);
+
+  let h: Harness;
+  let api: ApiClient;
+
+  const serialOf = (part: number): string => `toUInt32(n.number * ${PARTS} + ${part} + 1)`;
+  const idOf = (part: number): string => `lpad(hex(${serialOf(part)}), 64, '0')`;
+  const partOf = (base: number): number => BULK_BASES.indexOf(base);
+
+  /** The inner read of a page of `readNewestPage`: the SELECT with the plain `LIMIT {newest_page_cap}`, which is the read itself. */
+  const innerNewestRead = (sql: string): string => {
+    const inner = /FROM \((SELECT (?:(?!FROM \()[\s\S])*?LIMIT \{newest_page_cap:UInt32\})\)/.exec(sql)?.[1];
+    if (inner === undefined) throw new Error(`not a page read of readNewestPage: ${sql}`);
+    return inner;
+  };
+  const isNewestPageRead = (sql: string): boolean => sql.includes('{newest_page_cap:UInt32}');
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+
+    // NFTs: the collection (120,000) between two others (240,000 each)
+    await h.ch.insert(Table.Nfts, [{ ...SAMPLE_ROWS[Table.Nfts], nft_id: TEMPLATE, issuer: 'rTemplateIssuer' }]);
+    const nfts = async (issuer: string, perPart: number): Promise<void> =>
+      insertBulk(
+        h,
+        Table.Nfts,
+        `SELECT * FROM ${Table.Nfts} WHERE nft_id = {template:String} LIMIT 1`,
+        { template: TEMPLATE, issuer },
+        (base) =>
+          `{issuer:String} AS issuer, toUInt32(${TAXON}) AS taxon_key, ${serialOf(partOf(base))} AS serial, ${idOf(partOf(base))} AS nft_id`,
+        perPart,
+      );
+    await nfts(BEFORE, OTHER_NFTS_PER_PART);
+    await nfts(ISSUER, NFTS_PER_PART);
+    await nfts(AFTER, OTHER_NFTS_PER_PART);
+
+    // the holdings: the owner of the 120,000 between two other owners (of the collections around it)
+    await h.ch.insert(Table.AccountNfts, [
+      { ...SAMPLE_ROWS[Table.AccountNfts], nft_id: TEMPLATE, owner: 'rTemplateOwner' },
+    ]);
+    const holdings = async (owner: string, issuer: string, perPart: number): Promise<void> =>
+      insertBulk(
+        h,
+        Table.AccountNfts,
+        `SELECT * FROM ${Table.AccountNfts} WHERE nft_id = {template:String} LIMIT 1`,
+        { template: TEMPLATE, owner, issuer },
+        (base) =>
+          `{owner:String} AS owner, {issuer:String} AS issuer, toUInt32(${TAXON}) AS taxon_key, ${serialOf(partOf(base))} AS serial, ${idOf(partOf(base))} AS nft_id, toUInt8(1) AS held`,
+        perPart,
+      );
+    await holdings(OWNER_BEFORE, BEFORE, OTHER_NFTS_PER_PART);
+    await holdings(OWNER, ISSUER, NFTS_PER_PART);
+    await holdings(OWNER_AFTER, AFTER, OTHER_NFTS_PER_PART);
+
+    // the holders: 40,000 of the collection, between 80,000 of the collections around it
+    await h.ch.insert(Table.NftCollectionHolders, [
+      { ...SAMPLE_ROWS[Table.NftCollectionHolders], owner: 'rTemplateHolder' },
+    ]);
+    const holders = async (issuer: string, perPart: number): Promise<void> =>
+      insertBulk(
+        h,
+        Table.NftCollectionHolders,
+        `SELECT * FROM ${Table.NftCollectionHolders} WHERE owner = {template:String} LIMIT 1`,
+        { template: 'rTemplateHolder', issuer },
+        (base) =>
+          `{issuer:String} AS issuer, toUInt32(${TAXON}) AS taxon_key, concat('rHolder', lpad(toString(n.number * ${PARTS} + ${partOf(base)}), 8, '0')) AS owner, toUInt32(1 + (n.number * ${PARTS} + ${partOf(base)}) % 7) AS held`,
+        perPart,
+      );
+    await holders(BEFORE, OTHER_HOLDERS_PER_PART);
+    await holders(ISSUER, HOLDERS_PER_PART);
+    await holders(AFTER, OTHER_HOLDERS_PER_PART);
+
+    // the collections: the one of the NFTs, and 50,000 more
+    await h.ch.insert(Table.NftCollections, [
+      { ...SAMPLE_ROWS[Table.NftCollections], issuer: 'rTemplateCollection' },
+      {
+        ...SAMPLE_ROWS[Table.NftCollections],
+        issuer: ISSUER,
+        taxon_key: TAXON,
+        taxon: TAXON,
+        supply: 120_000,
+        holders: HOLDERS,
+      },
+    ]);
+    await insertBulk(
+      h,
+      Table.NftCollections,
+      `SELECT * FROM ${Table.NftCollections} WHERE issuer = {template:String} LIMIT 1`,
+      { template: 'rTemplateCollection' },
+      (base) =>
+        `concat('rCollection', lpad(toString(n.number * ${PARTS} + ${partOf(base)}), 8, '0')) AS issuer, toUInt32(1) AS taxon_key, toUInt64(n.number % 1000) AS supply, toFloat64(n.number % 777) AS volume_native_f`,
+      COLLECTIONS_PER_PART,
+    );
+  }, 900_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const count = async (table: Table): Promise<{ rows: number; parts: number }> => {
+    const [row] = await h.ch.query<{ n: string; parts: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts FROM ${table}`,
+    );
+    return { rows: Number(row.n), parts: Number(row.parts) };
+  };
+
+  it('the seed is as assumed: the NFTs, the holdings and the holders of the collection among those of two others', async () => {
+    const lots = PARTS * (NFTS_PER_PART + 2 * OTHER_NFTS_PER_PART) + 1;
+    expect(await count(Table.Nfts)).toEqual({ rows: lots, parts: PARTS * 3 + 1 });
+    expect(await count(Table.AccountNfts)).toEqual({ rows: lots, parts: PARTS * 3 + 1 });
+    expect(await count(Table.NftCollectionHolders)).toEqual({
+      rows: PARTS * (HOLDERS_PER_PART + 2 * OTHER_HOLDERS_PER_PART) + 1,
+      parts: PARTS * 3 + 1,
+    });
+    expect(await count(Table.NftCollections)).toEqual({ rows: PARTS * COLLECTIONS_PER_PART + 2, parts: PARTS + 1 });
+    // the bound is far below the table, and the collection has the NFTs of the one owner
+    expect(READ_BOUND).toBeLessThan(lots / 5);
+    const [mine] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM ${Table.AccountNfts} WHERE owner = {owner:String} AND issuer = {issuer:String}`,
+      { owner: OWNER, issuer: ISSUER },
+    );
+    expect(Number(mine.n)).toBe(PARTS * NFTS_PER_PART);
+  });
+
+  /** The id of the NFT with this serial in the bulk: the serial in 64 upper-case hex digits. */
+  const idOfSerial = (serial: number): string => serial.toString(16).toUpperCase().padStart(64, '0');
+  const pages = [
+    ['the first page', undefined],
+    ['a page in the middle of the collection', [60_000, idOfSerial(60_000)]],
+    ['a page near the end', [119_000, idOfSerial(119_000)]],
+  ] as const;
+
+  describe.each(pages)('the NFTs of the collection: %s', (_name, marker) => {
+    const path = `${collection}/nfts?limit=200${marker === undefined ? '' : `&marker=${markerOf([...marker])}`}`;
+    const first = marker === undefined ? 1 : marker[0] + 1;
+    const serials = (body: Record<string, unknown>): number[] =>
+      (body.nfts as { serial: number }[]).map((n) => n.serial);
+
+    it('a page of 200 NFTs reads about a granule of each part, and is whole', async () => {
+      const { reads, body } = await served(h, api, Table.Nfts, path, 'nfts');
+      expect(reads.length).toBeGreaterThanOrEqual(1);
+      for (const read of reads)
+        expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      const want = Array.from({ length: Math.min(200, 120_000 - first + 1) }, (_, i) => first + i);
+      expect(serials(body)).toEqual(want);
+      expect(body.marker === undefined).toBe(first + 200 > 120_000);
+    });
+
+    it('the page read is a read of the newest page, in the order of the key, narrowed by the collection and the marker', async () => {
+      const { statements } = await served(h, api, Table.Nfts, path, 'nfts');
+      const page = statements.filter(([sql]) => isNewestPageRead(sql));
+      expect(page).toHaveLength(1);
+      const [sql, params] = page[0];
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      expect(sql).toContain('burned = 0');
+      // a few granules out of those of the table
+      const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerNewestRead(sql), params));
+      // (the collection, and after it the serial of the marker: the first page has none)
+      expect(primary.keys.slice(0, 3)).toEqual(
+        marker === undefined ? ['issuer', 'taxon_key'] : ['issuer', 'taxon_key', 'serial'],
+      );
+      expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+    });
+  });
+
+  it('the NFTs of the owner: a page of the holdings reads about a granule of each part, and the NFTs of the page a few more', async () => {
+    const path = `${collection}/nfts?limit=200&owner=${OWNER}`;
+    const holdings = await served(h, api, Table.AccountNfts, path, 'nfts');
+    for (const read of holdings.reads) expect(read.read_rows).toBeLessThanOrEqual(READ_BOUND);
+    expect((holdings.body.nfts as { serial: number }[]).map((n) => n.serial)).toEqual(
+      Array.from({ length: 200 }, (_, i) => i + 1),
+    );
+    const page = holdings.statements.filter(([sql]) => isNewestPageRead(sql));
+    expect(page).toHaveLength(1);
+    const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerNewestRead(page[0][0]), page[0][1]));
+    expect(primary.keys.slice(0, 4)).toEqual(['owner', 'issuer', 'taxon_key']);
+    expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+    // the NFTs themselves, by their keys
+    const nfts = await served(h, api, Table.Nfts, path, 'nfts');
+    expect(nfts.reads.length).toBeGreaterThanOrEqual(1);
+    for (const read of nfts.reads)
+      expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+  });
+
+  it("the holders of a collection: a page reads the collection's whole holders prefix, and no other collection's, whichever page it is", async () => {
+    // by the figure held, the most first, and then by owner: the order of the bulk is the order of the owners
+    const order = Array.from({ length: HOLDERS }, (_, n) => n).sort((a, b) => heldBy(b) - heldBy(a) || a - b);
+    const want = (from: number): unknown[] =>
+      order.slice(from, from + 200).map((n) => ({ owner: holderName(n), held: heldBy(n) }));
+    // the prefix is read whole (more than the 200 rows of the page, the 40,000 of the collection) and not a row of any other
+    const bound = HOLDERS + PARTS * GRANULE;
+    const total = PARTS * (HOLDERS_PER_PART + 2 * OTHER_HOLDERS_PER_PART);
+    expect(bound).toBeLessThan(total / 2);
+    for (const [name, marker, from] of [
+      ['the first page', undefined, 0],
+      ['a page far down', [order.length > 0 ? heldBy(order[10_000]) : 0, holderName(order[10_000])], 10_001],
+      ['the last figure', [1, holderName(order[order.length - 201])], order.length - 200],
+    ] as const) {
+      const path = `${collection}/holders?limit=200${marker === undefined ? '' : `&marker=${markerOf([...marker])}`}`;
+      const { reads, body } = await served(h, api, Table.NftCollectionHolders, path, 'holders');
+      expect([name, body.holders]).toEqual([name, want(from)]);
+      expect(reads).toHaveLength(1);
+      expect([name, reads[0].read_rows >= HOLDERS, reads[0].read_rows <= bound]).toEqual([name, true, true]);
+    }
+  });
+
+  it('the list reads the rows of nft_collections once, the next request none, and the list of an issuer a few granules', async () => {
+    const all = await count(Table.NftCollections);
+    const first = await served(h, api, Table.NftCollections, '/v2/nft_collections?limit=200', 'collections');
+    expect(first.reads).toHaveLength(1);
+    expect(first.reads[0].read_rows).toBeLessThanOrEqual(all.rows);
+    expect(first.body.total).toBe(all.rows);
+    // the next request is served from what was kept: the sort and the page are made again, the table is not read
+    const second = await served(
+      h,
+      api,
+      Table.NftCollections,
+      '/v2/nft_collections?limit=200&sort=holders',
+      'collections',
+    );
+    expect(second.reads).toHaveLength(0);
+    expect(second.statements).toHaveLength(0);
+    // the list of an issuer is a prefix of the key
+    const mine = await served(h, api, Table.NftCollections, `/v2/nft_collections?issuer=${ISSUER}`, 'collections');
+    expect(mine.reads).toHaveLength(1);
+    expect(mine.reads[0].read_rows).toBeLessThanOrEqual((PARTS + 1) * GRANULE);
+    expect(mine.body.total).toBe(1);
+  });
+
+  it('a start 400 days back is a 400 before any read', async () => {
+    const spy = jest.spyOn(h.ch, 'query');
+    const start = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10);
+    const res = await api.get(`${collection}/stats?start=${start}`);
+    expect([res.status, res.body]).toEqual([
+      400,
+      { result: 'error', message: 'invalid window - use at most 366 days' },
+    ]);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    // and a year is read: the collection's row, and then its events in the ledgers of the window
+    const year = new Date(Date.now() - 300 * 86_400_000).toISOString().slice(0, 10);
+    const ok = await api.get(`${collection}/stats?start=${year}`);
+    expect([ok.status, ok.body.days]).toEqual([200, []]);
   });
 });
