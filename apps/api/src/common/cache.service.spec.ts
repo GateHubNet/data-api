@@ -177,5 +177,89 @@ describe('CacheService', () => {
       await cache.wrap('k', 0, producer);
       expect(producer).toHaveBeenCalledTimes(2);
     });
+
+    /** A producer whose answer the test gives when it says. */
+    function deferred(): { producer: jest.Mock; resolve: (value: string) => void; reject: (error: Error) => void } {
+      const settle: { resolve?: (value: string) => void; reject?: (error: Error) => void } = {};
+      const producer = jest.fn(
+        () =>
+          new Promise<string>((resolve, reject) => {
+            settle.resolve = resolve;
+            settle.reject = reject;
+          }),
+      );
+      return {
+        producer,
+        resolve: (value) => settle.resolve?.(value),
+        reject: (error) => settle.reject?.(error),
+      };
+    }
+
+    it('shares one producer call between the misses of a key that come while it runs', async () => {
+      const cache = new CacheService();
+      const { producer, resolve } = deferred();
+      const calls = [cache.wrap('k', 1000, producer), cache.wrap('k', 1000, producer), cache.wrap('k', 1000, producer)];
+      expect(producer).toHaveBeenCalledTimes(1);
+      // another key has a producer of its own
+      const other = jest.fn(async () => 'o');
+      expect(await cache.wrap('other', 1000, other)).toBe('o');
+      expect(other).toHaveBeenCalledTimes(1);
+
+      resolve('v');
+      expect(await Promise.all(calls)).toEqual(['v', 'v', 'v']);
+      // and the value is kept for the ttl, counted from the first call
+      expect(cache.get('k')).toBe('v');
+      expect(await cache.wrap('k', 1000, producer)).toBe('v');
+      expect(producer).toHaveBeenCalledTimes(1);
+      now += 1000;
+      const again = jest.fn(async () => 'w');
+      expect(await cache.wrap('k', 1000, again)).toBe('w');
+      expect(again).toHaveBeenCalledTimes(1);
+    });
+
+    it('never keeps a rejection: the misses that shared the call all get it, and the next call runs the producer again', async () => {
+      const cache = new CacheService();
+      const { producer, reject } = deferred();
+      const calls = [cache.wrap('k', 1000, producer), cache.wrap('k', 1000, producer)];
+      expect(producer).toHaveBeenCalledTimes(1);
+      reject(new Error('DB::Exception: Timeout exceeded'));
+      await Promise.all(calls.map((call) => expect(call).rejects.toThrow('Timeout exceeded')));
+      expect(cache.get('k')).toBeUndefined();
+
+      const next = jest.fn(async () => 'v');
+      expect(await cache.wrap('k', 1000, next)).toBe('v');
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(cache.get('k')).toBe('v');
+    });
+
+    it('a producer that throws before it returns a promise is a rejection like any other, never kept', async () => {
+      const cache = new CacheService();
+      const throwing = jest.fn((): Promise<string> => {
+        throw new Error('no connection');
+      });
+      await expect(cache.wrap('k', 1000, throwing)).rejects.toThrow('no connection');
+      await expect(cache.wrap('k', 1000, throwing)).rejects.toThrow('no connection');
+      expect(throwing).toHaveBeenCalledTimes(2);
+    });
+
+    it('a ttl of 0 or less shares nothing: each call runs the producer, also while another runs', async () => {
+      const cache = new CacheService();
+      const producer = jest.fn(async () => 'v');
+      expect(await Promise.all([cache.wrap('k', 0, producer), cache.wrap('k', 0, producer)])).toEqual(['v', 'v']);
+      expect(producer).toHaveBeenCalledTimes(2);
+    });
+
+    it('clear forgets a producer that is running: its value is not kept, and a call after the clear runs its own', async () => {
+      const cache = new CacheService();
+      const { producer, resolve } = deferred();
+      const before = cache.wrap('k', 1000, producer);
+      cache.clear();
+      const after = jest.fn(async () => 'after');
+      expect(await cache.wrap('k', 1000, after)).toBe('after');
+      resolve('before');
+      expect(await before).toBe('before');
+      // what the producer from before the clear gave is not what is kept
+      expect(cache.get('k')).toBe('after');
+    });
   });
 });

@@ -17,18 +17,34 @@ interface Entry<T> {
 @Injectable()
 export class CacheService {
   private readonly store = new Map<string, Entry<unknown>>();
+  /** The producers of `wrap` that are running, by key: the misses that come while one runs wait for it. */
+  private readonly inFlight = new Map<string, Promise<unknown>>();
   private readonly maxEntries = 10_000;
 
+  /**
+   * The value kept under `key`, or else what `producer` gives, kept for `ttlMs` (counted from the call). Misses of one key that
+   * come while its producer runs share that run: the producer is called once, and they all get its value, or its rejection. A
+   * rejection is never kept: the next call after it runs the producer again. A ttl of 0 or less keeps nothing and shares nothing.
+   */
   async wrap<T>(key: string, ttlMs: number, producer: () => Promise<T>): Promise<T> {
     if (ttlMs <= 0) return producer();
 
     const now = Date.now();
     const hit = this.store.get(key);
     if (hit && hit.expiresAt > now) return hit.value as T;
+    const running = this.inFlight.get(key);
+    if (running) return running as Promise<T>;
 
-    const value = await producer();
-    this.put(key, value, now + ttlMs);
-    return value;
+    const produced = (async () => producer())();
+    this.inFlight.set(key, produced);
+    try {
+      const value = await produced;
+      // a `clear` while it ran drops it: the value is of the time before
+      if (this.inFlight.get(key) === produced) this.put(key, value, now + ttlMs);
+      return value;
+    } finally {
+      if (this.inFlight.get(key) === produced) this.inFlight.delete(key);
+    }
   }
 
   /** The value kept under `key`, `undefined` when there is none or its ttl is over. */
@@ -43,9 +59,13 @@ export class CacheService {
     this.put(key, value, Date.now() + ttlMs);
   }
 
-  /** Drops everything. Only the e2e suites call it, so that one test does not see what another cached. */
+  /**
+   * Drops everything, and forgets the producers that are running (their values are not kept, and a new call runs its own). Only
+   * the e2e suites call it, so that one test does not see what another cached.
+   */
   clear(): void {
     this.store.clear();
+    this.inFlight.clear();
   }
 
   private put<T>(key: string, value: T, expiresAt: number): void {
