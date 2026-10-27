@@ -27,6 +27,9 @@ export * from './network';
 // Validators
 export * from './validators';
 
+// Tomls (the rules for reading a domain's toml)
+export * from './tomls';
+
 // Node connection
 export * from './xrpl/node-client';
 export * from './xrpl/node-throttle';

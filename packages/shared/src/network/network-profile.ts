@@ -66,6 +66,11 @@ export interface NetworkProfile {
   /** Where a validator's domain publishes its TOML file. */
   tomlPath: '/.well-known/xrp-ledger.toml' | '/.well-known/xahau.toml';
   /**
+   * The `network` values of a toml entry that name this network (spec 3.4), lower case. An entry with none counts on every
+   * network (`countsOn`).
+   */
+  tomlNetworkNames: readonly string[];
+  /**
    * The `GH_UNL_PUBLISHERS` text used when that variable is not set: comma separated `url=publicKey` pairs of the
    * network's default validator list publishers (see `parseUnlPublishers`).
    */
@@ -113,6 +118,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     firstLedger: 32570,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
+    tomlNetworkNames: ['main', 'mainnet'],
     defaultUnlPublishers:
       'https://vl.ripple.com=ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734,' +
       'https://unl.xrplf.org=ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1',
@@ -136,6 +142,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     firstLedger: 1,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
+    tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
     defaultUnlPublishers: 'https://vl.xahau.org=EDA46E9C39B1389894E690E58914DC1029602870370A0993E5B87C4A24EAF4A8E8',
     defaultUnlValidators: '',
     majorityHoldSeconds: 432_000,
@@ -159,6 +166,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     firstLedger: undefined,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
+    tomlNetworkNames: ['testnet'],
     // The list `https://vl.altnet.rippletest.net` serves (version 1, signed by this key), read 2026-10-24.
     defaultUnlPublishers:
       'https://vl.altnet.rippletest.net=ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860',
@@ -192,6 +200,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     firstLedger: undefined,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
+    tomlNetworkNames: ['testnet', '21338'],
     // The testnet has no validator list site: its trusted validators are the fixed list below.
     defaultUnlPublishers: '',
     // The `[validators]` of `store/etc/validators-xahau.txt` in Xahau/Xahau-Testnet-Docker, last changed in commit

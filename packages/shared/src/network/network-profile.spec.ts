@@ -42,6 +42,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       firstLedger: 32570,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
+      tomlNetworkNames: ['main', 'mainnet'],
       defaultUnlPublishers: XRPL_PUBLISHERS,
       defaultUnlValidators: '',
       majorityHoldSeconds: 1_209_600,
@@ -65,6 +66,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       firstLedger: 1,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
+      tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
       defaultUnlPublishers: XAHAU_PUBLISHERS,
       defaultUnlValidators: '',
       majorityHoldSeconds: 432_000,
@@ -88,6 +90,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       firstLedger: undefined,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
+      tomlNetworkNames: ['testnet'],
       defaultUnlPublishers: XRPL_TESTNET_PUBLISHERS,
       defaultUnlValidators: '',
       majorityHoldSeconds: 1_800,
@@ -111,6 +114,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       firstLedger: undefined,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
+      tomlNetworkNames: ['testnet', '21338'],
       defaultUnlPublishers: '',
       defaultUnlValidators: XAHAU_TESTNET_VALIDATORS,
       majorityHoldSeconds: 432_000,
@@ -161,6 +165,14 @@ describe('network profiles', () => {
       expect(profile).toMatchObject(values);
       expect(profile.acceptedNodeNetworkIds).toEqual(values.acceptedNodeNetworkIds);
     });
+
+    it('names the toml `network` values that count on each network (spec 3.4), in lower case', () =>
+      expect(Object.fromEntries(NETWORK_NAMES.map((n) => [n, getNetworkProfile(n).tomlNetworkNames]))).toEqual({
+        xrpl: ['main', 'mainnet'],
+        xahau: ['main', 'mainnet', 'xahau', '21337'],
+        'xrpl-testnet': ['testnet'],
+        'xahau-testnet': ['testnet', '21338'],
+      }));
 
     it('gives every network a CTID id of its own', () =>
       expect(new Set(NETWORK_NAMES.map((n) => getNetworkProfile(n).networkId)).size).toBe(4));
