@@ -66,7 +66,7 @@ export {
 export type { AggregatorAmmPools, AmmPoolsFunctions } from './amm-pools.job-runner';
 export { MAX_FAILED_VOLUME_SETS_PER_TICK } from './job-context';
 export type { AggregatorJobName, AggregatorTick } from './job-context';
-export { NFT_COLLECTIONS_EVERY_TICKS } from './nft-collections.job-runner';
+export { MAX_ISOLATED_COLLECTIONS_PER_BATCH, NFT_COLLECTIONS_EVERY_TICKS } from './nft-collections.job-runner';
 export type { NftCollectionsFunctions } from './nft-collections.job-runner';
 export { MAX_ISOLATED_NFTS_PER_BATCH, NFT_MAX_RETRY_MS, NFT_RETRY_MS } from './nft-state.job-runner';
 export type { AggregatorNfts, NftStateFunctions } from './nft-state.job-runner';
@@ -378,9 +378,13 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     `nft_collections` row of a collection (supply, holders, mints, burns, sales, volume in the native currency) and the
  *     `nft_collection_holders` rows, for the collections whose NFTs `nft_state` rebuilt, `NFT_COLLECTIONS_BATCH` at a time, oldest
  *     first, under one version per batch and for at most `AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS`. The queue of collections is in
- *     memory: the first run fills it from the tables (`collectionsBehind`: the collections whose newest NFT version is above their
- *     row's), and `nft_state` adds to it. A batch that fails goes back to the end of the queue and is the error of the run. A
- *     collection with no NFT left is deleted from both tables.
+ *     memory: `nft_state` adds to it, and the first run starts a read of the tables that adds to it what they say is behind
+ *     (`collectionsBehind`: the collections whose newest NFT version is above their row's, and the rows of collections with no NFT
+ *     left), which the run does not wait for and which is tried again after `NFT_RETRY_MS` (doubling up to an hour) when it fails.
+ *     A batch that fails is halved to find the collections that fail on their own (at most `MAX_ISOLATED_COLLECTIONS_PER_BATCH`):
+ *     those are set aside in memory, each counted as an error, and tried again after `NFT_RETRY_MS`, doubling up to an hour, while
+ *     the other collections go on; a batch that fails as a whole (the database) is the failure of the job, and its collections go
+ *     back to the end of the queue. A collection with no NFT left is deleted from both tables.
  *  9. **rates_daily** (with `aggregates`): the rates of the closed final days, newest first (`RatesDailyJobRunner`).
  * 10. **account_rollups** (with `aggregates`): the discovery of heavy accounts and their day rollups, the increment of each new
  *     day and the promotion of the days before (`AccountRollupsJobRunner`).

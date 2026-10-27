@@ -331,6 +331,16 @@ describe('the nft_collections job (e2e)', () => {
     await ch.command(`SYSTEM STOP MERGES ${db?.db}.${table}`);
   }
 
+  /** Drops every event of an issuer, as a re-ingest that no longer finds them does. */
+  async function forgetEvents(ch: ClickHouseService, issuer: string): Promise<void> {
+    for (const table of [Table.NftEvents, Table.CollectionNftEvents, Table.NftSales, Table.NftTouches]) {
+      await ch.command(`DELETE FROM ${table} WHERE issuer = {issuer:String}`, { issuer }, { settings: SYNC_DELETE });
+    }
+  }
+
+  /** The keys of the NFTs of `BASIC`, as `rebuildNfts` is asked for them. */
+  const BASIC_NFTS = [1, 2, 3, 4].map((n) => ({ issuer: ISSUER, taxon_key: 7, serial: n, nft_id: idOf(n) }));
+
   /** A collection of four NFTs: three held (Alice 1, Bob 2), one burned, one sale of 5 XRP, and an offer. */
   const BASIC: NftEventsRow[] = [
     mint(1, 100, ALICE),
@@ -581,17 +591,8 @@ describe('the nft_collections job (e2e)', () => {
     expect(await count(ch, Table.NftCollectionHolders, `issuer = '${ISSUER}'`)).toBe(2);
 
     // a re-ingest drops every event of the collection: its NFTs are removed, and then the collection
-    for (const table of [Table.NftEvents, Table.CollectionNftEvents, Table.NftSales, Table.NftTouches]) {
-      await ch.command(
-        `DELETE FROM ${table} WHERE issuer = {issuer:String}`,
-        { issuer: ISSUER },
-        { settings: SYNC_DELETE },
-      );
-    }
-    const touched = await rebuildNfts(
-      ch,
-      [1, 2, 3, 4].map((n) => ({ issuer: ISSUER, taxon_key: 7, serial: n, nft_id: idOf(n) })),
-    );
+    await forgetEvents(ch, ISSUER);
+    const touched = await rebuildNfts(ch, BASIC_NFTS);
     expect(touched.removed).toBe(4);
     expect(touched.collections).toEqual([COLLECTION]);
 
@@ -636,6 +637,73 @@ describe('the nft_collections job (e2e)', () => {
     await rebuildStale(ch);
     expect(await collectionsBehind(ch)).toEqual([COLLECTION]);
     await recomputeCollections(ch, daily, [COLLECTION]);
+    expect(await collectionsBehind(ch)).toEqual([]);
+  });
+
+  it('collectionsBehind names a collection whose last NFTs were removed, which a restart lost from the queue of the job', async () => {
+    const { ch, daily } = await fresh();
+    await insertEvents(ch, [...BASIC, mint(9, 150, BOB, inCollection(OTHER))]);
+    await rebuildStale(ch);
+    await recomputeCollections(ch, daily, [COLLECTION, OTHER]);
+    expect(await collectionsBehind(ch)).toEqual([]);
+
+    // a re-ingest drops the events of one collection and nft_state removes its NFTs; the process stops before the job has
+    // computed the collection (what is queued is in memory)
+    await forgetEvents(ch, ISSUER);
+    expect((await rebuildNfts(ch, BASIC_NFTS)).collections).toEqual([COLLECTION]);
+    expect(await count(ch, Table.Nfts, `issuer = '${ISSUER}'`)).toBe(0);
+
+    // the rows of the collection are still there, with no NFT: the collection is one to compute, and only that one
+    expect(await count(ch, Table.NftCollections, `issuer = '${ISSUER}'`)).toBe(1);
+    expect(await collectionsBehind(ch)).toEqual([COLLECTION]);
+    expect(await recomputeCollections(ch, daily, [COLLECTION])).toEqual({ written: 0, removed: 1 });
+    expect(await count(ch, Table.NftCollections, `issuer = '${ISSUER}'`)).toBe(0);
+    expect(await count(ch, Table.NftCollectionHolders, `issuer = '${ISSUER}'`)).toBe(0);
+    expect(await collectionsBehind(ch)).toEqual([]);
+    expect((await collectionsOf(ch)).map((c) => c.issuer)).toEqual([OTHER_ISSUER]);
+  });
+
+  it('collectionsBehind names holders left alone by a crash between the two deletes of a collection', async () => {
+    const { ch, daily } = await fresh();
+    await insertEvents(ch, [...BASIC, mint(9, 150, BOB, inCollection(OTHER))]);
+    await rebuildStale(ch);
+    await recomputeCollections(ch, daily, [COLLECTION, OTHER]);
+
+    // the NFTs are removed and the `nft_collections` row is deleted; the process dies before the holders are
+    await forgetEvents(ch, ISSUER);
+    await rebuildNfts(ch, BASIC_NFTS);
+    await ch.command(
+      `DELETE FROM ${Table.NftCollections} WHERE issuer = {issuer:String}`,
+      { issuer: ISSUER },
+      { settings: SYNC_DELETE },
+    );
+    expect(await count(ch, Table.NftCollections, `issuer = '${ISSUER}'`)).toBe(0);
+    expect(await count(ch, Table.NftCollectionHolders, `issuer = '${ISSUER}'`)).toBe(2);
+
+    expect(await collectionsBehind(ch)).toEqual([COLLECTION]);
+    expect(await recomputeCollections(ch, daily, [COLLECTION])).toEqual({ written: 0, removed: 1 });
+    expect(await count(ch, Table.NftCollectionHolders, `issuer = '${ISSUER}'`)).toBe(0);
+    expect(await collectionsBehind(ch)).toEqual([]);
+    // the other collection and its holder were not touched
+    expect(await holdersOf(ch, OTHER)).toEqual([[BOB, 1]]);
+  });
+
+  it('collectionsBehind is empty after a recompute even when an nfts row it counted is dated in the future', async () => {
+    const { ch, daily } = await fresh();
+    await insertEvents(ch, BASIC);
+    await rebuildStale(ch);
+    // an NFT whose newest row is from a future clock (a version lifted over a row of a clock that had stepped back)
+    const future = Date.now() + 10 * 365 * DAY * 1000;
+    await ch.command(
+      `INSERT INTO ${Table.Nfts} SELECT * EXCEPT (version), toUInt64({version:UInt64}) AS version
+         FROM ${Table.Nfts} WHERE nft_id = {id:String}`,
+      { version: future, id: idOf(1) },
+    );
+    expect(await collectionsBehind(ch)).toEqual([COLLECTION]);
+
+    await recomputeCollections(ch, daily, [COLLECTION]);
+    // the collection is written under a version above the NFT's, so it is not behind for rows it has counted
+    expect((await collectionOf(ch, COLLECTION)).version).toBe(future + 1);
     expect(await collectionsBehind(ch)).toEqual([]);
   });
 

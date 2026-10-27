@@ -85,22 +85,47 @@ function groupByCollection<T extends { issuer: string; taxon_key: Counted }>(row
 /**
  * The collections whose newest NFT version is above their `nft_collections` version, or which have none: one grouped read of
  * each table. Every row of a version older than the collection's is counted in it already, since a collection is computed under
- * a version above the newest `nfts` version it read. In key order.
+ * a version above the newest `nfts` version it read.
  */
 const BEHIND_SQL = `SELECT n.issuer AS issuer, n.taxon_key AS taxon_key
   FROM (SELECT issuer, taxon_key, max(version) AS version FROM ${Table.Nfts} GROUP BY issuer, taxon_key) AS n
   LEFT JOIN (SELECT issuer, taxon_key, max(version) AS version FROM ${Table.NftCollections} GROUP BY issuer, taxon_key) AS c
     ON n.issuer = c.issuer AND n.taxon_key = c.taxon_key
- WHERE n.version > ifNull(c.version, 0)
- ORDER BY issuer, taxon_key`;
+ WHERE n.version > ifNull(c.version, 0)`;
 
 /**
- * The collections whose newest NFT version is above their `nft_collections` version (or which have none), in key order: what
- * the job computes at its start, since the queue of the collections that `nft_state` rebuilt is in memory and a restart loses it.
+ * The collections that have a row in `nft_collections` or in `nft_collection_holders` and no row in `nfts`: their NFTs were
+ * removed, and the rows are to be deleted (`recomputeCollections`). The rows are read first, and only the NFTs of those
+ * collections after that (a read by the prefix of the key of `nfts`).
+ */
+const WITHOUT_NFTS_SQL = `WITH stored AS (
+       SELECT issuer, taxon_key FROM ${Table.NftCollections}
+        UNION ALL
+       SELECT issuer, taxon_key FROM ${Table.NftCollectionHolders}
+       )
+SELECT issuer, taxon_key
+  FROM stored
+ WHERE (issuer, taxon_key) NOT IN (
+       SELECT issuer, taxon_key FROM ${Table.Nfts} WHERE (issuer, taxon_key) IN (SELECT issuer, taxon_key FROM stored)
+       )
+ GROUP BY issuer, taxon_key`;
+
+/**
+ * The collections to compute, in key order: those whose newest NFT version is above their `nft_collections` version (or which
+ * have none), and those that have a row in `nft_collections` or `nft_collection_holders` and no NFT left (a recompute deletes
+ * them). It is what the job computes at its start, since the queue of the collections that `nft_state` rebuilt is in memory and a
+ * restart loses it: the removal of the last NFTs of a collection, or the deletes of a recompute that was cut short (the
+ * `nft_collections` row goes first, so the holders may be left alone), are not lost with it.
  */
 export async function collectionsBehind(ch: ClickHouseService): Promise<CollectionKey[]> {
-  const rows = await ch.query<{ issuer: string; taxon_key: Counted }>(BEHIND_SQL);
-  return rows.map((r) => ({ issuer: r.issuer, taxon_key: Number(r.taxon_key) }));
+  const [behind, withoutNfts] = await Promise.all([
+    ch.query<{ issuer: string; taxon_key: Counted }>(BEHIND_SQL),
+    ch.query<{ issuer: string; taxon_key: Counted }>(WITHOUT_NFTS_SQL),
+  ]);
+  // (the two lists have no collection in common: one has NFTs and the other has none)
+  return [...behind, ...withoutNfts]
+    .map((r) => ({ issuer: r.issuer, taxon_key: Number(r.taxon_key) }))
+    .sort(compareKeys);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -250,6 +275,11 @@ async function salesOf(
  * and newest mint, `sales_count` counts every sale and `volume_native` sums the converted prices of those that have one, and
  * `last_ledger` is the newest event of the collection (the newest ledger its NFTs have seen when it has no event). `kind` and
  * `taxon` come from the NFTs.
+ *
+ * `volume_native` is the sum of the prices as the rates known when the collection was computed convert them: the sales in an
+ * issued currency of a day that is not over (today's) are converted at the rate of the day so far, and the rate of a day that is
+ * over is its final one. It is computed again, with whatever rates there are then, whenever the collection changes (an NFT of it is
+ * rebuilt by `nft_state`), and only then.
  *
  * Returns how many `nft_collections` rows it wrote and how many collections it deleted. It is idempotent: running it again leaves
  * the same newest values under newer versions. `signal` is checked before each read and each write: an aborted recompute throws

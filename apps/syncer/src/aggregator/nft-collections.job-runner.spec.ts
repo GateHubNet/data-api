@@ -12,9 +12,11 @@ import {
   AGGREGATOR_SHUTDOWN_WAIT_MS,
   AggregatorOptions,
   AggregatorService,
+  MAX_ISOLATED_COLLECTIONS_PER_BATCH,
   NFT_COLLECTIONS_EVERY_TICKS,
+  NFT_RETRY_MS,
 } from './aggregator.service';
-import { AggregatorJobContext } from './job-context';
+import { AggregatorJobContext, AggregatorTick } from './job-context';
 import { NftCollectionsFunctions, NftCollectionsJobRunner } from './nft-collections.job-runner';
 
 /**
@@ -59,6 +61,8 @@ describe('AggregatorService nft_collections job', () => {
   let batchMs: number;
   /** The collections (by taxon) the fake recompute fails on, whatever batch they are in. */
   let failing: Set<number>;
+  /** The most collections the fake recompute does at once: a longer list fails (a limit of the database), whatever is in it. */
+  let tooLong: number | undefined;
   /** The batches (by taxon) that the fake recompute did write, in order. */
   let done: number[][];
   /** The NFTs the live part of `nft_state` finds at its next read (it takes them), and the collections its rebuild answers. */
@@ -85,12 +89,16 @@ describe('AggregatorService nft_collections job', () => {
     behindKeys = [];
     batchMs = 0;
     failing = new Set();
+    tooLong = undefined;
     done = [];
     found = [];
     rebuilt = [];
     behind = jest.fn(async () => behindKeys);
     recompute = jest.fn(async (_ch: unknown, _rates: unknown, keys: CollectionKey[]) => {
       if (batchMs > 0) jest.setSystemTime(Date.now() + batchMs);
+      if (tooLong !== undefined && keys.length > tooLong) {
+        throw new Error(`DB::Exception: memory limit for ${keys.length} collection(s)`);
+      }
       const bad = keys.filter((k) => failing.has(k.taxon_key));
       if (bad.length > 0) throw new Error(`DB::Exception: memory limit on collection ${bad[0].taxon_key}`);
       done.push(taxa(keys));
@@ -141,6 +149,43 @@ describe('AggregatorService nft_collections job', () => {
   const ticksUpTo = async (svc: AggregatorService, from: number, to: number): Promise<void> => {
     for (let n = from; n <= to; n++) await tickNo(svc, n);
   };
+
+  /** A run of the job (every fifth tick) at the instant `ms`: the ticks before it, which skip the job, are at that instant too. */
+  const runAt = async (svc: AggregatorService, ms: number): Promise<void> => {
+    jest.setSystemTime(ms);
+    for (let i = 0; i < NFT_COLLECTIONS_EVERY_TICKS; i++) await svc.tick();
+  };
+
+  /** The tick a runner on its own is given: the budget of 3 s. */
+  const tick = (): AggregatorTick => ({ now: NOW, deadline: Date.now() + 3000, signal: new AbortController().signal });
+
+  /** A runner over a hand-made context: the clock is the fake one, the budget is the deadline of the tick. */
+  function runner(): { job: NftCollectionsJobRunner; stop: () => void } {
+    let closing = false;
+    const ctx: AggregatorJobContext = {
+      ch: ch.asService(),
+      logger,
+      metrics: metrics as never,
+      budgets: { nft_collections: 3000 } as AggregatorJobContext['budgets'],
+      clock: () => Date.now(),
+      closing: () => closing,
+      mayStartSet: (t) => !closing && Date.now() < t.deadline,
+      failed: (job, err, where = '') => {
+        metrics.aggregatorErrorsTotal.inc({ job });
+        logger.error(`Aggregator job ${job} failed${where}: ${String(err)}`);
+      },
+      versionsOf: async () => new Map(),
+      latestCloseTime: async () => undefined,
+      announceBackfill: () => undefined,
+    };
+    const functions = { behind, recompute } as unknown as NftCollectionsFunctions;
+    return {
+      job: new NftCollectionsJobRunner(ctx, { rates: RATES, dailyRates: DAILY }, functions),
+      stop: () => {
+        closing = true;
+      },
+    };
+  }
 
   describe('the job in the tick', () => {
     it('comes after nft_state and the stats, at the first tick and then every fifth, with a budget of 3 s of its own', async () => {
@@ -260,11 +305,7 @@ describe('AggregatorService nft_collections job', () => {
     });
 
     it('enqueues each key once', () => {
-      const job = new NftCollectionsJobRunner(
-        { ch: ch.asService(), logger, budgets: { nft_collections: 3000 } } as unknown as AggregatorJobContext,
-        { rates: RATES, dailyRates: DAILY },
-        { behind, recompute } as unknown as NftCollectionsFunctions,
-      );
+      const { job } = runner();
       expect(job.pending).toBe(0);
       job.enqueue([collection(1), collection(2)]);
       job.enqueue([collection(2), collection(3), collection(1)]);
@@ -313,48 +354,323 @@ describe('AggregatorService nft_collections job', () => {
     });
   });
 
-  describe('a failing batch', () => {
-    it('puts a failed batch back at the end', async () => {
-      behindKeys = collections(0, 119);
+  describe('a failing collection', () => {
+    /** The calls of the fake recompute with the collection of this taxon alone. */
+    const alone = (taxon: number): number => batches().filter((b) => b.length === 1 && b[0] === taxon).length;
+
+    it('is found by halving its batch and set aside, and the others of the batch are computed: [P, A, B] with P always failing still computes A and B', async () => {
+      behindKeys = collections(0, 2);
       failing.add(0);
       const svc = service();
       await tickNo(svc, 0);
-      // the first batch failed: the batches after it were not started, the run threw, and the tick counted it once
-      expect(batches()).toEqual([taxa(collections(0, 49))]);
-      expect(done).toEqual([]);
-      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
-      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('Aggregator job nft_collections failed'));
-      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('memory limit on collection 0'));
-      expect(jobsRun()).not.toContain('nft_collections');
-      // and the gauge says all of them are still due
-      expect(gauge()).toEqual([120]);
 
-      // the next run takes the batches that were waiting first, and the failed one last: 50, 50 (20 of them and 30 of the failed), 20
-      failing.clear();
-      await ticksUpTo(svc, 1, 5);
-      expect(done).toEqual([
-        taxa(collections(50, 99)),
-        [...taxa(collections(100, 119)), ...taxa(collections(0, 29))],
-        taxa(collections(30, 49)),
-      ]);
-      expect(gauge()).toEqual([120, 0]);
+      // [P, A, B] fails, its halves [P, A] and [B], and then P and A alone
+      expect(batches()).toEqual([[0, 1, 2], [0, 1], [0], [1], [2]]);
+      expect(done).toEqual([[1], [2]]);
+      // P is counted and logged once, as the collection that fails, and the run did not fail
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
+      expect(logger.error).toHaveBeenCalledWith(
+        `Aggregator job nft_collections failed for collection ${ISSUER}/0, set aside to be tried again: DB::Exception: memory limit on collection 0`,
+      );
+      expect(logger.warn).not.toHaveBeenCalled();
       expect(jobsRun()).toContain('nft_collections');
+      // P still waits to be computed
+      expect(gauge()).toEqual([1]);
     });
 
-    it('a read of collectionsBehind that fails is the error of the run, and is made again at the next run', async () => {
-      behind.mockRejectedValueOnce(new Error('DB::Exception: timeout reading nfts'));
-      behindKeys = collections(1, 2);
+    it('goes on with the rest of the queue in the same run', async () => {
+      behindKeys = collections(0, 119);
+      failing.add(0);
+      await tickNo(service(), 0);
+      expect(done.flat().sort((a, b) => a - b)).toEqual(taxa(collections(1, 119)));
+      expect(errors()).toBe(1);
+      expect(gauge()).toEqual([1]);
+    });
+
+    it('is tried again after 5 minutes, then after twice as long each time up to an hour, and forgotten once it works', async () => {
+      behindKeys = collections(0, 2);
+      failing.add(0);
+      const svc = service();
+      await tickNo(svc, 0);
+      expect(alone(0)).toBe(1);
+      expect(errors()).toBe(1);
+
+      let calls = 1;
+      let failedAt = Date.now();
+      for (const waitMinutes of [5, 10, 20, 40, 60, 60]) {
+        // not a minute before the wait is over ...
+        await runAt(svc, failedAt + waitMinutes * 60_000 - 60_000);
+        expect(alone(0)).toBe(calls);
+        // ... and at the end of it P is computed again, fails again: counted, and the wait doubles (at most an hour)
+        await runAt(svc, failedAt + waitMinutes * 60_000);
+        expect(alone(0)).toBe(++calls);
+        expect(errors()).toBe(calls);
+        expect(logger.error).toHaveBeenLastCalledWith(
+          `Aggregator job nft_collections failed for collection ${ISSUER}/0, tried again in ${Math.min(waitMinutes * 2, 60)} min: DB::Exception: memory limit on collection 0`,
+        );
+        failedAt = Date.now();
+      }
+      // it works at last: it is computed, forgotten, and not asked for again
+      failing.clear();
+      await runAt(svc, failedAt + 60 * 60_000);
+      expect(done).toEqual([[1], [2], [0]]);
+      expect(logger.log).toHaveBeenCalledWith(`nft_collections: collection ${ISSUER}/0 is computed again`);
+      expect(gauge().at(-1)).toBe(0);
+      await runAt(svc, failedAt + 120 * 60_000);
+      expect(alone(0)).toBe(calls + 1);
+      expect(errors()).toBe(calls);
+    });
+
+    it('is not queued again while it is set aside: its retry computes it', async () => {
+      const { job } = runner();
+      behindKeys = collections(0, 1);
+      failing.add(0);
+      await job.run(tick());
+      expect(job.pending).toBe(1);
+      job.enqueue([collection(0), collection(5)]);
+      expect(job.pending).toBe(2);
+      failing.clear();
+      await job.run(tick());
+      // 5 was computed, 0 waits for its retry
+      expect(done).toEqual([[1], [5]]);
+      expect(job.pending).toBe(1);
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS);
+      await job.run(tick());
+      expect(done).toEqual([[1], [5], [0]]);
+      expect(job.pending).toBe(0);
+    });
+
+    it('a batch that fails as a whole beyond the cap fails the job but keeps its keys', async () => {
+      expect(MAX_ISOLATED_COLLECTIONS_PER_BATCH).toBe(3);
+      behindKeys = collections(0, 9);
+      for (const taxon of [0, 1, 2, 3]) failing.add(taxon);
+      const svc = service();
+      await tickNo(svc, 0);
+
+      // four collections of the batch fail alone: the cause is not the collections, so the batch is the failure of the job
+      expect(done).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
+      expect(logger.error).toHaveBeenCalledWith(
+        'Aggregator job nft_collections failed: DB::Exception: memory limit on collection 0',
+      );
+      expect(jobsRun()).not.toContain('nft_collections');
+      // none of them is set aside, and none is lost: all ten wait
+      expect(gauge()).toEqual([10]);
+
+      // the next run does them again, in order, in one batch
+      failing.clear();
+      await runAt(svc, NOW_SECONDS * 1000 + 5 * 60_000);
+      expect(done).toEqual([taxa(collections(0, 9))]);
+      expect(gauge()).toEqual([10, 0]);
+      expect(errors()).toBe(1);
+    });
+
+    it('a batch in which everything fails (the database) is the failure of the job, not a reason to set its collections aside: they are, if they fail alone again next time', async () => {
+      behindKeys = collections(0, 1);
+      failing.add(0).add(1);
+      const svc = service();
+      await tickNo(svc, 0);
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('Aggregator job nft_collections failed: '));
+      expect(jobsRun()).not.toContain('nft_collections');
+      expect(gauge()).toEqual([2]);
+
+      // the same batch, and the same collections failing alone again: now they are the ones
+      await runAt(svc, NOW_SECONDS * 1000 + 5 * 60_000);
+      expect(batches().slice(3)).toEqual([[0, 1], [0], [1]]);
+      expect(errors()).toBe(3);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('for collection rSyntheticIssuer/1, set aside'),
+      );
+      expect(jobsRun()).toContain('nft_collections');
+      expect(gauge()).toEqual([2, 2]);
+    });
+
+    it('when the database comes back the next run does the batch, and nothing waits for a retry', async () => {
+      behindKeys = collections(0, 1);
+      failing.add(0).add(1);
+      const svc = service();
+      await tickNo(svc, 0);
+      failing.clear();
+      await runAt(svc, NOW_SECONDS * 1000 + 5 * 60_000);
+      expect(done).toEqual([[0, 1]]);
+      expect(errors()).toBe(1);
+      expect(gauge()).toEqual([2, 0]);
+    });
+
+    it('a list that fails as a whole although each half works is warned about and counted once', async () => {
+      behindKeys = collections(0, 5);
+      tooLong = 3;
+      await tickNo(service(), 0);
+      expect(batches()).toEqual([
+        [0, 1, 2, 3, 4, 5],
+        [0, 1, 2],
+        [3, 4, 5],
+      ]);
+      expect(done).toEqual([
+        [0, 1, 2],
+        [3, 4, 5],
+      ]);
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Aggregator job nft_collections: a batch of 6 collection(s) failed as a whole, but its halves were computed: DB::Exception: memory limit for 6 collection(s)',
+      );
+      // nothing is set aside
+      expect(gauge()).toEqual([0]);
+    });
+
+    it('a halving that does not fit in the budget goes back to the front of the queue, is counted, and starts again at the next run', async () => {
+      behindKeys = collections(0, 59);
+      failing.add(0);
+      batchMs = 600;
+      const svc = service({ budgetsMs: { nft_collections: 1000 } });
+      await tickNo(svc, 0);
+      // [0..49] fails at 0 ms, its half [0..24] at 600 ms, and the third try would start at 1200 ms
+      expect(batches()).toEqual([taxa(collections(0, 49)), taxa(collections(0, 24))]);
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('a batch is being halved to find the collections that fail on their own'),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('nft_collections reached its budget'));
+      // nothing was set aside or lost, and the batch is still at the head of the queue, before 50 to 59
+      expect(gauge()).toEqual([60]);
+
+      batchMs = 0;
+      await runAt(svc, NOW_SECONDS * 1000 + 5 * 60_000);
+      expect(batches()[2]).toEqual(taxa(collections(0, 49)));
+      expect(done.flat().sort((a, b) => a - b)).toEqual(taxa(collections(1, 59)));
+      expect(gauge()).toEqual([60, 1]);
+    });
+  });
+
+  describe('the read of the collections that are behind', () => {
+    /** The reads of `collectionsBehind` that are out, which the test answers when it says. */
+    function pendingReads(): Array<{ resolve: (keys: CollectionKey[]) => void; reject: (error: Error) => void }> {
+      const reads: Array<{ resolve: (keys: CollectionKey[]) => void; reject: (error: Error) => void }> = [];
+      behind.mockImplementation(
+        () => new Promise<CollectionKey[]>((resolve, reject) => reads.push({ resolve, reject })),
+      );
+      return reads;
+    }
+    /** Lets what a settled promise woke up run. */
+    const flush = (): Promise<void> => jest.advanceTimersByTimeAsync(0);
+    const timeout = new Error('DB::Exception: Timeout exceeded: elapsed 30.001 seconds');
+
+    it('does not hold the tick: the jobs after it run, and the queue is worked while the read is out', async () => {
+      const reads = pendingReads();
+      found = [nft(1)];
+      rebuilt = [collection(9)];
+      const after = jest.fn(async () => undefined);
+      const svc = service({ extraJobs: [{ name: 'after_nft_collections', run: after }] });
+      await svc.tick();
+
+      // the read is out, and nothing waited for it: the collection nft_state rebuilt was computed, the jobs after went on
+      expect(behind).toHaveBeenCalledTimes(1);
+      expect(batches()).toEqual([[9]]);
+      expect(jobsRun()).toEqual(['nft_state', 'stats_live', 'stats_dirty', 'nft_collections', 'after_nft_collections']);
+      expect(after).toHaveBeenCalledTimes(1);
+      expect(errors()).toBe(0);
+
+      // and it is not started again while it is out
+      await ticksUpTo(svc, 1, 10);
+      expect(behind).toHaveBeenCalledTimes(1);
+      expect(reads).toHaveLength(1);
+    });
+
+    it('is queued when it answers, and computed at the next run', async () => {
+      const reads = pendingReads();
       const svc = service();
       await tickNo(svc, 0);
       expect(recompute).not.toHaveBeenCalled();
-      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
-      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('timeout reading nfts'));
-      expect(gauge()).toEqual([0]);
 
+      reads[0].resolve(collections(1, 2));
+      await flush();
       await ticksUpTo(svc, 1, 5);
+      expect(batches()).toEqual([[1, 2]]);
+      expect(behind).toHaveBeenCalledTimes(1);
+      expect(gauge()).toEqual([0, 0]);
+    });
+
+    it('that fails once the tick is over is counted and logged as nft_collections, and is read again only after 5 minutes, then after twice as long up to an hour', async () => {
+      const reads = pendingReads();
+      const svc = service();
+      await tickNo(svc, 0);
+      expect(errors()).toBe(0);
+
+      // the query ran out of its 30 s while the tick went on
+      jest.setSystemTime(Date.now() + 30_000);
+      reads[0].reject(timeout);
+      await flush();
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
+      expect(logger.error).toHaveBeenCalledWith(
+        `Aggregator job nft_collections failed reading the collections that are behind, tried again in 5 min: ${timeout.message}`,
+      );
+
+      let calls = 1;
+      for (const waitMinutes of [5, 10, 20, 40, 60, 60]) {
+        const failedAt = Date.now();
+        // not a second before the wait is over ...
+        await runAt(svc, failedAt + waitMinutes * 60_000 - 1000);
+        expect(behind).toHaveBeenCalledTimes(calls);
+        // ... and at the end of it a new read starts, which fails again: counted, and the wait doubles (at most an hour)
+        await runAt(svc, failedAt + waitMinutes * 60_000);
+        expect(behind).toHaveBeenCalledTimes(++calls);
+        reads[calls - 1].reject(timeout);
+        await flush();
+        expect(errors()).toBe(calls);
+        expect(logger.error).toHaveBeenLastCalledWith(
+          `Aggregator job nft_collections failed reading the collections that are behind, tried again in ${Math.min(waitMinutes * 2, 60)} min: ${timeout.message}`,
+        );
+      }
+      // the job itself did not fail: a failed read is not the error of its run
+      expect(jobsRun().filter((job) => job === 'nft_collections').length).toBeGreaterThan(0);
+    });
+
+    it('that answers after a failure is queued, and not read again', async () => {
+      behind.mockRejectedValueOnce(timeout);
+      behindKeys = collections(1, 2);
+      const svc = service();
+      await tickNo(svc, 0);
+      expect(errors()).toBe(1);
+      expect(recompute).not.toHaveBeenCalled();
+
+      await runAt(svc, NOW_SECONDS * 1000 + 5 * 60_000);
       expect(behind).toHaveBeenCalledTimes(2);
       expect(batches()).toEqual([[1, 2]]);
+      await runAt(svc, NOW_SECONDS * 1000 + 15 * 60_000);
+      expect(behind).toHaveBeenCalledTimes(2);
       expect(errors()).toBe(1);
+    });
+
+    it('that fails once the shutdown has begun is dropped: no error, and no unhandled rejection', async () => {
+      const reads = pendingReads();
+      const unhandled = jest.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        const svc = service();
+        await svc.tick();
+        void svc.stop();
+        reads[0].reject(timeout);
+        await flush();
+        // the process gets to report an unhandled rejection after the microtasks, on a real turn of the event loop
+        await new Promise((resolve) => jest.requireActual('timers').setImmediate(resolve));
+        expect(unhandled).not.toHaveBeenCalled();
+        expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+        expect(logger.error).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+
+    it('that answers once the shutdown has begun is dropped: nothing is queued', async () => {
+      const reads = pendingReads();
+      const { job, stop } = runner();
+      await job.run(tick());
+      stop();
+      reads[0].resolve(collections(1, 3));
+      await flush();
+      expect(job.pending).toBe(0);
     });
   });
 
@@ -415,6 +731,17 @@ describe('AggregatorService nft_collections job', () => {
       await svc.tick();
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'nft_collections' });
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('read-only'));
+    });
+
+    it('a batch that was aborted at shutdown keeps its collections in the queue', async () => {
+      const { job, stop } = runner();
+      behindKeys = collections(0, 2);
+      recompute.mockImplementation(async () => {
+        stop();
+        throw new NftCollectionsRecomputeAborted();
+      });
+      await expect(job.run(tick())).rejects.toThrow(NftCollectionsRecomputeAborted);
+      expect(job.pending).toBe(3);
     });
 
     it('starts no batch after the shutdown began, in the middle of a run', async () => {

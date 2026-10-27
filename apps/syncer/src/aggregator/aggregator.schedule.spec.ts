@@ -259,6 +259,7 @@ class NftWorld {
   collectionsMs = 0;
   private active = false;
   private collectionsActive = false;
+  private collectionsRead: 'quiet' | 'slow' = 'quiet';
   private ledger = 0;
   markFails?: Error;
   readonly key: NftKey = { issuer: 'rSyntheticIssuer', taxon_key: 1, serial: 1, nft_id: '1'.padStart(64, '0') };
@@ -268,6 +269,11 @@ class NftWorld {
   busy(rebuildMs: number): void {
     this.active = true;
     this.rebuildMs = rebuildMs;
+  }
+
+  /** The read of the collections that are behind (`collectionsBehind`) never answers: a query that takes longer than the tick. */
+  collectionsReadNeverAnswers(): void {
+    this.collectionsRead = 'slow';
   }
 
   busyCollections(collectionsMs: number): void {
@@ -305,10 +311,14 @@ class NftWorld {
 
   collectionsFns(): Partial<NftCollectionsFunctions> {
     return {
-      behind: async () =>
-        this.collectionsActive
-          ? Array.from({ length: 1000 }, (_, taxon_key) => ({ issuer: 'rSyntheticIssuer', taxon_key }))
-          : [],
+      behind: () =>
+        this.collectionsRead === 'slow'
+          ? new Promise(() => undefined)
+          : Promise.resolve(
+              this.collectionsActive
+                ? Array.from({ length: 1000 }, (_, taxon_key) => ({ issuer: 'rSyntheticIssuer', taxon_key }))
+                : [],
+            ),
       recompute: async (_ch, _rates, keys) => {
         this.note('nft_collections_recompute');
         if (this.collectionsMs > 0) jest.setSystemTime(Date.now() + this.collectionsMs);
@@ -643,6 +653,20 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     // the queue of collections was not drained: 3 batches of 50 at the first tick and at the fifth
     expect(metrics.nftCollectionsPending.set.mock.calls.map(([value]) => value)).toEqual([850, 700]);
+  });
+
+  it('a read of the collections that are behind that does not answer does not keep the jobs after nft_collections from running in that tick', async () => {
+    caughtUp();
+    world.busy(1000);
+    nftWorld.collectionsReadNeverAnswers();
+    await service().tick();
+
+    // nft_collections did not wait for the read, and rates_daily, account_rollups and volume_backfill after it had their sets
+    expect(runs()).toEqual(EVERY_JOB);
+    expect(count('nft_collections')).toBe(0);
+    expect(count('rates_daily ')).toBeGreaterThanOrEqual(1);
+    expect(count('account_rollups_recount')).toBeGreaterThanOrEqual(1);
+    expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
   });
 
   describe('a slice of agg_dirty runs the hooks of rates_daily, pair_hourly, account_rollups and nft_state after its volume sets; a failing hook is failed("<job>_dirty", …), fails the slice and keeps the range', () => {

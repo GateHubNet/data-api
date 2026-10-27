@@ -373,15 +373,45 @@ describe('AggregatorService NFT jobs (e2e)', () => {
         { ...lost },
         SYNC_DELETE,
       );
-      expect(await collectionsBehind(ch)).toEqual([stale, lost].sort(byCollection));
+      // and rows are left of a collection that has no NFT any more (its NFTs were removed, and the process stopped)
+      const ghost: CollectionKey = { issuer: 'rSyntheticGhostIssuer', taxon_key: 3 };
+      const ghostRow: NftCollectionsRow = {
+        ...ghost,
+        kind: 'nftoken',
+        taxon: 3,
+        supply: 5,
+        holders: 1,
+        minted: 5,
+        burned: 0,
+        sales_count: 0,
+        volume_native: '0',
+        volume_native_f: 0,
+        first_mint_ledger: null,
+        first_mint_tx: '',
+        first_mint_time: null,
+        last_mint_ledger: null,
+        last_mint_tx: '',
+        last_mint_time: null,
+        last_ledger: 1,
+        version: Date.now(),
+      };
+      await ch.insert(Table.NftCollections, [ghostRow]);
+      await ch.insert(Table.NftCollectionHolders, [
+        { ...ghost, owner: 'rSyntheticGhostOwner', held: 5, version: Date.now() },
+      ]);
+      expect(await collectionsBehind(ch)).toEqual([stale, lost, ghost].sort(byCollection));
 
-      // a new process: nothing is in its queue but what the tables say is behind, which it computes at its first run
+      // a new process: nothing is in its queue but what the tables say is behind. The read of that is started by its first run,
+      // which does not wait for it, and the collections are computed at the next run of the job (the fifth tick)
       const restarted = aggregator(ch);
-      await restarted.svc.tick(NOW);
+      for (let ticks = 0; ticks <= NFT_COLLECTIONS_EVERY_TICKS; ticks++) await restarted.svc.tick(NOW);
       expect(restarted.errors).not.toHaveBeenCalled();
       expect(restarted.metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
-      expect(valuesOf(restarted.metrics.nftCollectionsPending)).toEqual([0]);
+      expect(valuesOf(restarted.metrics.nftCollectionsPending)).toEqual([0, 0]);
       expect(await collectionsBehind(ch)).toEqual([]);
+      // the rows of the collection with no NFT are gone
+      expect(await count(ch, Table.NftCollections, `issuer = '${ghost.issuer}'`)).toBe(0);
+      expect(await count(ch, Table.NftCollectionHolders, `issuer = '${ghost.issuer}'`)).toBe(0);
       const after = await collectionsOf(ch);
       expect(after.map((c) => [c.issuer, c.taxon_key])).toEqual(before.map((c) => [c.issuer, c.taxon_key]));
       for (const [i, row] of after.entries()) {
