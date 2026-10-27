@@ -45,6 +45,7 @@ import { ExportsModule } from './exports/exports.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NetworkModule } from './network/network.module';
+import { NftModule } from './nft/nft.module';
 import { PathPaymentsModule } from './path-payments/path-payments.module';
 import { PaymentsModule } from './payments/payments.module';
 import { StatsModule } from './stats/stats.module';
@@ -94,6 +95,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   ValidatorsModule,
   StatsModule,
   AmmModule,
+  NftModule,
   ExportsModule,
 ];
 

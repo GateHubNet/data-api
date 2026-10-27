@@ -1,6 +1,8 @@
 import { Table } from '@gatehub/data-api-shared';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
+import { primaryKeys, served } from './support/amm';
 import { fixtureTransactions } from './support/fixtures';
+import { insertNftEvents, nftEventRow } from './support/nfts';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead, tableReads } from './support/plans';
 import {
   BULK_BASES,
@@ -904,5 +906,122 @@ describe('amm=only reads the granules that hold swaps, not the range (read_rows 
       await h.ch.query(sql, params);
     });
     expect(read_rows).toBeLessThanOrEqual(boundOf(Table.Exchanges));
+  });
+});
+
+describe('the history of an NFT reads the granules of a page, not its 10,000 events (read_rows over a bulk of four parts)', () => {
+  // The events of an NFT are a range of the primary key of `nft_events` (the NFT, then its ledgers): `readDistinctPage` reads
+  // that range in the order of the key and stops after the page. The NFT has 10,000 events, 2,500 in each of four parts, and
+  // every part holds 100,000 events of two other NFTs, one that sorts before it and one after it: a read that did not use
+  // the key (or the limit) would read the 410,000 rows of the table.
+  const NFT = `${'5'.repeat(8)}${'0'.repeat(48)}0000A001`;
+  const BEFORE = '4'.repeat(64);
+  const AFTER = '6'.repeat(64);
+  const TEMPLATE = '3'.repeat(64);
+  const EVENTS_PER_PART = 2_500;
+  const OTHERS_PER_PART = 50_000;
+  const GRANULE = 8192;
+  /**
+   * A page touches about a granule of each part that holds the NFT (a part of 2,500 events is one granule), and one more for the
+   * template row: the rows of the other two NFTs, which share the parts' ledgers, are not read.
+   */
+  const READ_BOUND = (BULK_BASES.length + 1) * GRANULE;
+  /** The middle of the NFT's events in the second part: a marker there makes the page start inside the bulk. */
+  const MID_LEDGER = BULK_BASES[1] + Math.floor(EVENTS_PER_PART / 8);
+
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    // one real event is the template of the bulk: a mint of a made-up NFT, in a ledger between the mock ledgers
+    await insertNftEvents(h, [nftEventRow({ nft_id: TEMPLATE, ledger_index: 20_999_000, tx_index: 1 })]);
+    const template = `SELECT * FROM ${Table.NftEvents} WHERE nft_id = {template:String} LIMIT 1`;
+    for (const [id, perPart] of [
+      [BEFORE, OTHERS_PER_PART],
+      [NFT, EVENTS_PER_PART],
+      [AFTER, OTHERS_PER_PART],
+    ] as const) {
+      await insertBulk(
+        h,
+        Table.NftEvents,
+        template,
+        { template: TEMPLATE, nft: id },
+        (base) => `{nft:String} AS nft_id, ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index`,
+        perPart,
+      );
+    }
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the seed is as assumed: 10,000 events of the NFT in four parts, among 410,000 rows of the table', async () => {
+    const [mine] = await h.ch.query<{ n: string; parts: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts FROM ${Table.NftEvents} WHERE nft_id = {nft:String}`,
+      { nft: NFT },
+    );
+    expect([Number(mine.n), Number(mine.parts)]).toEqual([BULK_BASES.length * EVENTS_PER_PART, BULK_BASES.length]);
+    const [all] = await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${Table.NftEvents}`);
+    expect(Number(all.n)).toBe(BULK_BASES.length * (EVENTS_PER_PART + 2 * OTHERS_PER_PART) + 1);
+    // the bound is far below the table
+    expect(READ_BOUND).toBeLessThan((BULK_BASES.length * (EVENTS_PER_PART + 2 * OTHERS_PER_PART)) / 8);
+  });
+
+  describe.each([false, true])('descending=%s', (descending) => {
+    const direction = `descending=${descending}`;
+    const pageOf = (limit: number, marker?: (string | number)[]): string =>
+      `/v2/nfts/${NFT}/history?limit=${limit}&${direction}${marker === undefined ? '' : `&marker=${markerOf(marker)}`}`;
+
+    it.each([
+      ['the first page', undefined],
+      ['a page that starts inside the bulk', [MID_LEDGER, 1, 0]],
+      ['a page near the start of the range', [BULK_BASES[0] + 100, 2, 0]],
+    ] as const)('a page of 200 events (%s) reads about a granule of each part, and is whole', async (_name, marker) => {
+      const path = pageOf(200, marker as (string | number)[] | undefined);
+      const { reads, body } = await served(h, api, Table.NftEvents, path, 'events');
+      expect(reads.length).toBeGreaterThanOrEqual(1);
+      for (const read of reads) {
+        expect([path, read.read_rows <= READ_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      }
+      expect([path, (body.events as unknown[]).length, body.marker === undefined]).toEqual([path, 200, false]);
+    });
+
+    it('the page read is read in the order of the key, stops after its rows, and holds the filter inside', async () => {
+      const path = `${pageOf(200, [MID_LEDGER, 1, 0])}&event=mint,sale`;
+      const { statements } = await served(h, api, Table.NftEvents, path, 'events');
+      const page = statements.filter(([sql]) => isPageRead(sql));
+      expect(page).toHaveLength(1);
+      const [sql, params] = page[0];
+      await expectBoundedInOrderRead(h, sql, params, descending, path);
+      // the filter is a condition of the inner read, which the cap counts: never a step after the page
+      expect(innerRead(sql)).toContain('event IN {events:Array(String)}');
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      // the primary key narrows the read to the NFT and its ledgers: a few granules out of those of the table
+      const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
+      expect(primary.keys).toEqual(['nft_id', 'ledger_index']);
+      expect(primary.condition).toContain(`nft_id in ['${NFT}'`);
+      expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+    });
+  });
+
+  it('the first event of the NFT, which says whether it is known and whether its mint is indexed, is a read of one granule per part', async () => {
+    const { reads } = await served(h, api, Table.NftEvents, `/v2/nfts/${NFT}/history?limit=1`, 'events');
+    expect(reads.length).toBeGreaterThanOrEqual(2);
+    for (const read of reads) expect(read.read_rows).toBeLessThanOrEqual(READ_BOUND);
+  });
+
+  it('the open offers and the detail read the events of the NFT only: its 10,000 and not the table', async () => {
+    for (const path of [`/v2/nfts/${NFT}/offers`, `/v2/nfts/${NFT}`]) {
+      const { reads } = await served(h, api, Table.NftEvents, path, 'result');
+      for (const read of reads) {
+        // the 10,000 events of the NFT, in granules
+        expect([path, read.read_rows <= BULK_BASES.length * EVENTS_PER_PART + 2 * BULK_BASES.length * GRANULE]).toEqual(
+          [path, true],
+        );
+      }
+    }
   });
 });
