@@ -66,6 +66,9 @@ export const MODIFIED_FLOOR_S = 1_325_376_000;
 /** A `modified` more than this many seconds after the fetch is no date of a toml (a clock a day ahead is forgiven). */
 const MODIFIED_AHEAD_S = 86_400;
 
+/** The last second a `DateTime('UTC')` column holds (UInt32: 2106-02-07T06:28:15Z); the first is 0 (1970-01-01T00:00:00Z). */
+const DATE_TIME_MAX_S = 4_294_967_295;
+
 /** The most code points of each text a file gives. */
 const MAX_TEXT = { desc: 256, code: 40, publicKey: 128, principal: 100, network: 64, field: 256 } as const;
 
@@ -112,7 +115,10 @@ function classicAddressOf(value: unknown): string | undefined {
   return isValidClassicAddress(address) ? address : undefined;
 }
 
-/** The `network` of an entry: text cleaned and lower-cased, an integer as its decimal text, else `''` (spec 3.3). */
+/**
+ * The `network` of an entry: text cleaned and lower-cased, an integer as its decimal text, else `''` (spec 3.3). The parser
+ * gives a float with no fraction (`21337.0`) the same number as the integer `21337`, so it reads as `'21337'` too.
+ */
 function networkOf(entry: Record<string, unknown>): string {
   const value = own(entry, 'network');
   if (typeof value === 'string') return cleanTomlText(value, MAX_TEXT.network)?.toLowerCase() ?? '';
@@ -123,6 +129,8 @@ function networkOf(entry: Record<string, unknown>): string {
 /**
  * The keys of an entry other than `kept`, as JSON object text: the first `TOML_LIMITS.fieldKeys` whose name matches
  * `FIELD_KEY` and whose value is a string (cleaned), a finite number or a boolean. A date, a list or a table is no field.
+ * The keys come in the parsed object's order, not the file's (the parser keeps no file order): a key that reads as an array
+ * index (`1`, `42`) comes first, in ascending order, and so may take the place of a later key within the sixteen.
  */
 function fieldsOf(entry: Record<string, unknown>, kept: readonly string[]): string {
   const fields: [string, string | number | boolean][] = [];
@@ -143,12 +151,14 @@ function fieldsOf(entry: Record<string, unknown>, kept: readonly string[]): stri
 
 /**
  * The unix second a `[METADATA]` date names, or `null`: a TOML date, or text one reads as. An offset date-time is its
- * instant, a local date-time is read as UTC, a local date is 00:00 UTC; a local time alone is no date.
+ * instant, a local date-time is read as UTC, a local date is 00:00 UTC; a local time alone is no date. A second a
+ * `DateTime('UTC')` column cannot hold (before 1970, after 2106) is no date either: any file may write `0000-01-01`.
  */
 function unixSecondsOf(value: unknown): UnixSeconds | null {
   const date = value instanceof TomlDate ? value : typeof value === 'string' ? new TomlDate(value.trim()) : undefined;
   if (date === undefined || !date.isValid() || date.isTime()) return null;
-  return Math.floor(date.getTime() / 1_000);
+  const seconds = Math.floor(date.getTime() / 1_000);
+  return seconds >= 0 && seconds <= DATE_TIME_MAX_S ? seconds : null;
 }
 
 /**

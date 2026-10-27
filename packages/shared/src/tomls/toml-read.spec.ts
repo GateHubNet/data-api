@@ -187,6 +187,11 @@ describe('readToml', () => {
       expect(read(text).accounts.map((a) => a.network)).toEqual(['21337', 'main', '', '', '', '', '', 'xahau', '']);
     });
 
+    it('reads a float with no fraction as the integer: the parser gives both the same number', () => {
+      const text = account(address(1), 'network = 21337.0\n') + account(address(2), 'network = 2.1337e4\n');
+      expect(read(text).accounts.map((a) => a.network)).toEqual(['21337', '21337']);
+    });
+
     it('is read the same way in currencies and validators', () => {
       const text =
         '[[CURRENCIES]]\ncode = "NPD"\nnetwork = 21338\n[[VALIDATORS]]\npublic_key = "nHk1"\nnetwork = "TestNet"\n';
@@ -290,6 +295,19 @@ describe('readToml', () => {
       const fields = JSON.parse(read(text).currencies[0]?.fields ?? '') as Record<string, number>;
       expect(Object.keys(fields)).toEqual(['k'.repeat(32), ...keys.slice(0, 15).map((line) => line.split(' ')[0])]);
       expect(Object.keys(fields)).toHaveLength(TOML_LIMITS.fieldKeys);
+    });
+
+    it('puts a key that reads as an array index first, in ascending order, not where the file wrote it', () => {
+      const letters = Array.from({ length: 18 }, (_, i) => `k${String(i).padStart(2, '0')} = ${i}`);
+      const text = ['[[CURRENCIES]]', 'code = "NPD"', ...letters, '42 = 1', '1 = 2'].join('\n');
+      const fields = read(text).currencies[0]?.fields ?? '';
+      // the parser keeps no file order: both numeric keys come first and push k14 and k15 out of the sixteen
+      expect(Object.keys(JSON.parse(fields))).toEqual([
+        '1',
+        '42',
+        ...Array.from({ length: 14 }, (_, i) => `k${String(i).padStart(2, '0')}`),
+      ]);
+      expect(fields.startsWith('{"1":2,"42":1,"k00":0,')).toBe(true);
     });
 
     it('keeps the first 16 of 20 scalar keys', () => {
@@ -431,6 +449,30 @@ describe('readToml', () => {
       expect(expires('2026-10-02T00:00:00')).toBe(OCTOBER_SECOND);
       expect(expires('12:00:00')).toBeNull();
       expect(expires('"never"')).toBeNull();
+    });
+
+    it('keeps `expires` from 1970-01-01 to 2106-02-07T06:28:15Z, the seconds a DateTime column holds, and null outside', () => {
+      const expires = (line: string) => read(metadata(`expires = ${line}`)).expires;
+      expect(Date.UTC(2106, 1, 7, 6, 28, 15) / 1_000).toBe(4_294_967_295);
+      expect(expires('1970-01-01T00:00:00Z')).toBe(0);
+      expect(expires('1970-01-01')).toBe(0);
+      expect(expires('2106-02-07T06:28:15Z')).toBe(4_294_967_295);
+      expect(expires('"2106-02-07T06:28:15Z"')).toBe(4_294_967_295);
+      expect(expires('1969-12-31T23:59:59Z')).toBeNull();
+      expect(expires('1969-12-31T23:59:59.999Z')).toBeNull();
+      expect(expires('2106-02-07T06:28:16Z')).toBeNull();
+      expect(expires('"2106-02-07T06:28:16Z"')).toBeNull();
+      expect(expires('0000-01-01')).toBeNull();
+      expect(expires('"0000-01-01T00:00:00Z"')).toBeNull();
+      expect(expires('9999-12-31T23:59:59Z')).toBeNull();
+      expect(expires('"9999-12-31"')).toBeNull();
+    });
+
+    it('is null for a `modified` the column cannot hold, even one within a day of the fetch', () => {
+      const modifiedAt = (line: string) => readToml(metadata(`modified = ${line}`), PROFILE, 4_294_967_295).modified;
+      expect(modifiedAt('2106-02-07T06:28:15Z')).toBe(4_294_967_295);
+      expect(modifiedAt('2106-02-07T06:28:16Z')).toBeNull();
+      expect(modifiedAt('9999-12-31T23:59:59Z')).toBeNull();
     });
 
     it('reads both keys of a section', () => {
