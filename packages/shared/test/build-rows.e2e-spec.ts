@@ -21,6 +21,27 @@ const TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
 
 type Row = Record<string, unknown>;
 
+/**
+ * `account_domains` is ordered by account (spec 1.1, decision 7), so the rows of one account collapse: within one insert
+ * (`optimize_on_insert`) and across inserts at the merges, whenever they run. Its row count is neither the number of rows
+ * written nor stable, so the comparisons by count and by row leave it out and compare the newest row of each account
+ * instead (`newestPerAccount`).
+ */
+const MERGED_TABLES: ReadonlySet<Table> = new Set([Table.AccountDomains]);
+/** The tables whose stored rows are the rows written. */
+const EXACT_TABLES: Table[] = TABLES.map(([table]) => table).filter((table) => !MERGED_TABLES.has(table));
+
+/** The row with the largest `version` (decimal text: compared as a BigInt) of each account. */
+function newestPerAccount(rows: Row[]): Row[] {
+  const newest = new Map<string, Row>();
+  for (const row of rows) {
+    const known = newest.get(row.account as string);
+    if (!known || BigInt(row.version as string) > BigInt(known.version as string))
+      newest.set(row.account as string, row);
+  }
+  return [...newest.values()];
+}
+
 /** Reads give back what was written when UInt64 is quoted (exact) and DateTime is a unix timestamp. */
 const READ_SETTINGS = {
   output_format_json_quote_64bit_integers: 1,
@@ -144,7 +165,7 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
       Number((await svc.queryOne<{ n: string }>(`SELECT count() AS n FROM ${table}`, {}, READ_SETTINGS))?.n);
 
     it('inserts every row into a migrated schema: count() equals the rows written, in every table', async () => {
-      for (const [table] of TABLES) {
+      for (const table of EXACT_TABLES) {
         expect([table, await count(table)]).toEqual([table, inserted.get(table)!.length]);
       }
       expect(await count(Table.Ledgers)).toBe(scenario.ledgers);
@@ -159,7 +180,7 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
         )
       ).map((c) => c.name);
 
-    it.each(TABLES.map(([table]) => table))('%s: every row reads back exactly as written', async (table) => {
+    it.each(EXACT_TABLES)('%s: every row reads back exactly as written', async (table) => {
       // `ingested_at` is the server default, not part of the rows.
       const columns = table === Table.Ledgers ? '* EXCEPT ingested_at' : '*';
       const stored = await svc.query<Row>(`SELECT ${columns} FROM ${table}`, {}, READ_SETTINGS);
@@ -169,6 +190,20 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
       }
 
       expect(firstDifference(stored, inserted.get(table)!)).toBeUndefined();
+    });
+
+    it('account_domains: the newest row of each account is stored, whatever the merges kept of its older ones', async () => {
+      const written = inserted.get(Table.AccountDomains)!;
+      // Every fixture set has account roots with a Domain.
+      expect(written.length).toBeGreaterThan(0);
+
+      const stored = await svc.query<Row>(`SELECT * FROM ${Table.AccountDomains}`, {}, READ_SETTINGS);
+      // Never fewer rows than accounts, never more rows than written; which of the older rows of an account remain is up to
+      // the merges.
+      const newest = newestPerAccount(written);
+      expect(stored.length).toBeGreaterThanOrEqual(newest.length);
+      expect(stored.length).toBeLessThanOrEqual(written.length);
+      expect(firstDifference(newestPerAccount(stored), newest)).toBeUndefined();
     });
 
     if (scenario.nft) {

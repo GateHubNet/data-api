@@ -109,10 +109,13 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   Parser version 4 adds the path payments (`path_payments`, and their index by account `account_path_payments`): ledgers written by
   an older version have none, see
   [Path payments re-ingest](#path-payments-re-ingest).
-  Parser version 5 (the current one) adds the NFT and URIToken events (`nft_events`, `account_nft_events`, `collection_nft_events`,
+  Parser version 5 adds the NFT and URIToken events (`nft_events`, `account_nft_events`, `collection_nft_events`,
   `nft_sales`, `nft_touches`): ledgers written by an older version have none, see [NFT re-ingest](#nft-re-ingest). NFT events the parser
   dropped for an amount that is an MPT amount are counted in `syncer_nft_skipped_total`, and the range-ingest log names the total of its run
   (a warning when it is not 0, and the last line says `J skipped NFT events` always).
+  Parser version 6 (the current one) adds the Domain of every account root that has or had one (`account_domains`, a row for each change
+  of such an account): ledgers written by an older version have none. A reprocess gives them theirs; an account whose Domain was set before
+  the history that is ingested is learnt at its next change.
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
@@ -215,8 +218,8 @@ changes for those ledgers: the payments, exchanges and AMM rows a reprocess rewr
 
 ### NFT re-ingest
 
-`PARSER_VERSION` is 5 since the NFT parser (`NFT_PARSER_VERSION`, [ADR-0016](adr/0016-nft-and-uritoken-data.md)). A ledger written by an
-older version has no rows in the five NFT tables, and what the live syncer writes from the deploy on is version 5 only: **a database that
+`PARSER_VERSION` became 5 with the NFT parser (`NFT_PARSER_VERSION`, [ADR-0016](adr/0016-nft-and-uritoken-data.md)). A ledger written by an
+older version has no rows in the five NFT tables, and what the live syncer writes from the deploy on is version 5 or later: **a database that
 ingested a network before this release lists the NFTs of the ledgers since the deploy and nothing earlier**, and every NFT answer says so in its
 `coverage` (`from_ledger_index`, and `complete: false` until the history is re-ingested). Both networks have the data: XRPL NFTokens and
 Xahau URITokens.
@@ -229,7 +232,7 @@ Xahau URITokens.
 | Enable ledger | **75,443,457** (2022-10-31) | **1**, the genesis: `complete_ledgers` of `xahau.network` starts at 1 and ledger 1 has `URIToken` in its `Amendments` |
 | Re-ingest | `--from 75443457` | `--from 1` |
 
-Complete coverage needs **every** ledger from the enable ledger to the checkpoint written by version 5, so on Xahau it needs ledger 1 itself. Ledger
+Complete coverage needs **every** ledger from the enable ledger to the checkpoint written by version 5 or later, so on Xahau it needs ledger 1 itself. Ledger
 1 is the genesis: its close time is 0 (the file gives the date of ledger 2, the first closed ledger), so the daily volume back-fill that
 follows starts at 1970-01-01 and walks about 19,000 days with no ledger in them, for each of the four volume metrics, newest first (the real
 days come first and an empty day is cheap, but `volume_backfill` stays busy with them for a long time). Nothing is wrong with it.

@@ -76,8 +76,9 @@ For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node'
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
 `balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
 `account_amm_liquidity`, `amm_governance`, the state history `account_states` and `trust_line_states`, `path_payments` and its index by account `account_path_payments`,
-and the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011, filled from
-parser version 5: a ledger written by an older parser has no rows in them), and the Domain of an account `account_domains` (migration 012, ordered by account);
+the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011, filled from
+parser version 5: a ledger written by an older parser has no rows in them), and the Domain of an account `account_domains` (migration 012, filled from
+parser version 6 and ordered by account);
 see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`

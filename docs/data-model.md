@@ -114,7 +114,7 @@ and [ADR-0003](adr/0003-no-final-on-list-queries.md).
 Header and summary of a ledger; **the commit marker**. Columns: `ledger_index UInt32`, `ledger_hash`, `parent_hash`, `account_hash`,
 `transaction_hash` (String), `total_coins UInt64`, `close_time`, `parent_close_time` (DateTime), `close_time_resolution UInt8`,
 `close_flags UInt8`, `tx_count UInt32`, `type_counts` / `result_counts Map(LowCardinality(String), UInt32)`, `payments_count`,
-`exchanges_count` (order-book exchanges and AMM swaps), `accounts_created UInt32`, `fee_total`, `fee_min`, `fee_max UInt64` (drops), `parser_version UInt16` (2 since the AMM parser: a ledger written by version 1 has no AMM rows, see [backfill](backfill.md#amm-data-re-ingest); 3 since the state history: a ledger written by an older version has no `account_states` or `trust_line_states` rows, and the state tables cover only the ledgers above the newest one an older version wrote, see [`account_states`](#account_states-p7-order-by-account-ledger_index-tx_index-node_index); 4 since the path payments parser: a ledger written by an older version has no `path_payments` or `account_path_payments` rows, see [backfill](backfill.md#path-payments-re-ingest); 5 since the NFT parser (`NFT_PARSER_VERSION`, the current one): a ledger written by an older version has no rows in the five NFT tables, see [backfill](backfill.md#nft-re-ingest)),
+`exchanges_count` (order-book exchanges and AMM swaps), `accounts_created UInt32`, `fee_total`, `fee_min`, `fee_max UInt64` (drops), `parser_version UInt16` (2 since the AMM parser: a ledger written by version 1 has no AMM rows, see [backfill](backfill.md#amm-data-re-ingest); 3 since the state history: a ledger written by an older version has no `account_states` or `trust_line_states` rows, and the state tables cover only the ledgers above the newest one an older version wrote, see [`account_states`](#account_states-p7-order-by-account-ledger_index-tx_index-node_index); 4 since the path payments parser: a ledger written by an older version has no `path_payments` or `account_path_payments` rows, see [backfill](backfill.md#path-payments-re-ingest); 5 since the NFT parser (`NFT_PARSER_VERSION`): a ledger written by an older version has no rows in the five NFT tables, see [backfill](backfill.md#nft-re-ingest); 6 since the account domains (`DOMAIN_PARSER_VERSION`, the current one): a ledger written by an older version has no `account_domains` rows, see [`account_domains`](#account_domains-p7-order-by-account-migration-012)),
 `ingested_at DateTime DEFAULT now()`; skip index `close_time_mm` (`minmax` on `close_time`, granularity 1). Read by `/ledgers`,
 `/last_validated`, `/network/fees`, the stats rollup, the date resolver of every list.
 
@@ -415,7 +415,9 @@ received is enough). Columns: `account`, `ledger_index`, `tx_index`, `node_index
 `version UInt64`, `domain_hex` (the Domain as the ledger holds it, upper-case hex; `''` when the node has none) and `deleted UInt8`
 (1 for a deleted node). `version` is `ledger_index * 2^32 + tx_index * 2^16 + node_index` (a ledger has fewer than 65,536
 transactions), written as decimal text because it passes 2^53. **The current domain of an account is its row with the largest
-`version`**: readers take `argMax(domain_hex, version)`, never `FINAL`.
+`version`**: readers take `argMax(domain_hex, version)`, never `FINAL`. It is written from parser version 6
+(`DOMAIN_PARSER_VERSION`): a ledger written by an older parser has no rows in it. A node whose `Domain` is not a string of hex
+digits (a ledger cannot hold one) is written with `domain_hex` `''`, and the build counts it in `LedgerDiagnostics.invalidDomains`.
 
 **The exception to ADR-0007.** Every other ledger-derived table is ordered by its unique key. This one is ordered by `account`, with
 `ReplacingMergeTree(version)`: kept whole, a row for every change of an account that has a domain would be a sizeable share of

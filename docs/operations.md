@@ -87,7 +87,7 @@ fails the batch, so the live runner retries the same ledgers without end. Nothin
 first (the compose files do). The api's `/v2/path_payments` and `/v2/accounts/{address}/path_payments` answer 500
 `unable to retrieve path payments` until the tables exist. Filling the history:
 [backfill](backfill.md#path-payments-re-ingest).
-**The ingest needs migration `011_nft_data.sql` applied before a syncer with parser version 5 starts, and the api after it.** That syncer writes the
+**The ingest needs migration `011_nft_data.sql` applied before a syncer with parser version 5 or later starts, and the api after it.** That syncer writes the
 five NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales`, `nft_touches`) with every ledger, and an insert into a
 missing table fails the batch, so the live runner retries the same ledgers without end; the NFT aggregator jobs read the other tables of the file.
 Nothing checks for the tables at boot: run the migrate job first (the compose files do), then deploy the syncer, then the api (the NFT routes answer
@@ -664,7 +664,7 @@ design in [ADR-0016](adr/0016-nft-and-uritoken-data.md); what an operator needs:
 ```sql
 -- the NFT data cover the ledgers above this one (NULL: every stored ledger); the answers say `complete` when it is below the enable ledger
 SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 5;
--- every ledger from the enable ledger on is written by parser version 5 (Xahau: xahau.ledgers, from ledger 1)
+-- every ledger from the enable ledger on is written by parser version 5 or later (Xahau: xahau.ledgers, from ledger 1)
 SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 75443457 GROUP BY parser_version;
 -- the NFTs and collections the aggregator has built so far, and the ranges it still has to rebuild
 SELECT (SELECT uniqExact(nft_id) FROM xrpl.nfts) AS nfts, (SELECT uniqExact(issuer, taxon_key) FROM xrpl.nft_collections) AS collections;

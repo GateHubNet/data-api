@@ -2599,7 +2599,7 @@ rules for the objects, whose shape and key order are ours and are pinned by test
 
 - **Coverage.** Every answer carries `coverage`, the key right after `result`, and it is not in the CSV: whether the NFT history the answer is read
   from is whole ([Coverage](#coverage)). The detail, the history and the offers of one NFT state their own: complete when the NFT's mint is
-  indexed. The data of a network are the ledgers its parser version 5 wrote: **an NFT minted before the first of them has a history that
+  indexed. The data of a network are the ledgers written by parser version 5 or later: **an NFT minted before the first of them has a history that
   starts in the middle**, and `complete` says so.
 - **Two networks, one shape.** `kind` is `nftoken` (XRPL) or `uritoken` (Xahau). A key that does not exist for a kind is left out, never `null`:
   `taxon`, `serial` and `transfer_fee` are decoded from an XRPL id, which a URIToken's (a hash of its issuer and URI) does not encode. An XRPL

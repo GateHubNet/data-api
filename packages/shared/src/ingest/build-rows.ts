@@ -32,6 +32,7 @@ import {
   TxByTypeRow,
 } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
+import { AccountDomainsParser, accountDomainVersion } from '../parsers/account-domains.parser';
 import { AccountStatesParser } from '../parsers/account-states.parser';
 import { AccountsCreatedParser } from '../parsers/accounts-created.parser';
 import { AffectedAccountsParser } from '../parsers/affected-accounts.parser';
@@ -87,8 +88,9 @@ export interface LedgerRows {
   /** One per NFT a transaction had an event of: the ledger-ordered index the aggregator scans. */
   nftTouches: NftTouchesRow[];
   /**
-   * The Domain of each account root a transaction changed that has or had one (migration 012, parser version 6). Ordered
-   * by account in the table, so unlike every other list it can repeat a key.
+   * The Domain of each account root a transaction changed that has or had one (migration 012, parser version 6:
+   * `DOMAIN_PARSER_VERSION`). Ordered by account in the table, so unlike every other list it can repeat an account (the
+   * `version` is unique).
    */
   accountDomains: AccountDomainsRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
@@ -107,6 +109,12 @@ export interface LedgerDiagnostics {
    * transactions (spec §2.5): `syncer_nft_skipped_total`.
    */
   nftSkipped: number;
+  /**
+   * Account roots whose Domain is not a string of hex digits (written as `''`), summed over the ledger's transactions
+   * (display names spec 3.1). A ledger cannot hold one, so a count above 0 means a parser bug or a node that serves
+   * something else; the build only counts it and never throws.
+   */
+  invalidDomains: number;
 }
 
 /**
@@ -157,6 +165,7 @@ const exchangeParser = new ExchangeParser();
 const balanceChangesParser = new BalanceChangesParser();
 const accountsCreatedParser = new AccountsCreatedParser();
 const accountStatesParser = new AccountStatesParser();
+const accountDomainsParser = new AccountDomainsParser();
 const trustLineStatesParser = new TrustLineStatesParser();
 const ammParser = new AmmParser();
 const nftParser = new NftParser();
@@ -275,7 +284,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     nftSales: [],
     nftTouches: [],
     accountDomains: [],
-    diagnostics: { ammUnclassified: 0, nftSkipped: 0 },
+    diagnostics: { ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0 },
   };
 
   const typeCounts = new Map<string, number>();
@@ -717,6 +726,19 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         owner_count: state.owner_count,
         fields: JSON.stringify(state.fields),
         deleted: state.deleted ? 1 : 0,
+      });
+    }
+
+    for (const domain of accountDomainsParser.parse(t, ctx)) {
+      if (domain.invalid) rows.diagnostics.invalidDomains += 1;
+      rows.accountDomains.push({
+        account: domain.account,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        node_index: domain.node_index,
+        version: accountDomainVersion(header.ledger_index, txIndex, domain.node_index),
+        domain_hex: domain.domain_hex,
+        deleted: domain.deleted ? 1 : 0,
       });
     }
 

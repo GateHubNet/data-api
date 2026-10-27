@@ -21,6 +21,36 @@ type Json = Readonly<Record<string, any>>;
 
 const OPS = ['CreatedNode', 'ModifiedNode', 'DeletedNode'] as const;
 
+/** An `AccountRoot` node of a transaction's metadata that the transaction changed. */
+export interface ChangedAccountRoot {
+  op: 'CreatedNode' | 'ModifiedNode' | 'DeletedNode';
+  /** The node's position in `meta.AffectedNodes`. */
+  node_index: number;
+  /** The node under its `op` key: `NewFields` (created) or `FinalFields` and `PreviousFields`. */
+  node: Readonly<Record<string, any>>;
+}
+
+/**
+ * The `AccountRoot` nodes of `meta.AffectedNodes` that the transaction changed, in order. A `ModifiedNode` without
+ * `PreviousFields` is left out: it was only threaded (its `PreviousTxnID` moved) and changed nothing of the account.
+ * The walk of `AccountStatesParser` and `AccountDomainsParser`, so that both count a node the same way.
+ *
+ * Pure: the nodes in the result are the transaction's own, never copied or written to.
+ */
+export function changedAccountRoots(t: ParserTx): ChangedAccountRoot[] {
+  const roots: ChangedAccountRoot[] = [];
+  const nodes: readonly Json[] = t.meta.AffectedNodes ?? [];
+  nodes.forEach((entry, index) => {
+    const op = OPS.find((o) => entry?.[o]);
+    if (!op) return;
+    const node: Json = entry[op];
+    if (node.LedgerEntryType !== 'AccountRoot') return;
+    if (op === 'ModifiedNode' && !node.PreviousFields) return;
+    roots.push({ op, node_index: index, node });
+  });
+  return roots;
+}
+
 function uint(value: unknown): number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0;
 }
@@ -41,18 +71,12 @@ export class AccountStatesParser {
    */
   parse(t: ParserTx, _ctx: ParseContext): ParsedAccountState[] {
     const states: ParsedAccountState[] = [];
-    const nodes: readonly Json[] = t.meta.AffectedNodes ?? [];
-    nodes.forEach((entry, index) => {
-      const op = OPS.find((o) => entry?.[o]);
-      if (!op) return;
-      const node: Json = entry[op];
-      if (node.LedgerEntryType !== 'AccountRoot') return;
-      if (op === 'ModifiedNode' && !node.PreviousFields) return;
+    for (const { op, node_index, node } of changedAccountRoots(t)) {
       const fields: Json | undefined = op === 'CreatedNode' ? node.NewFields : node.FinalFields;
-      if (!fields || typeof fields.Account !== 'string') return;
+      if (!fields || typeof fields.Account !== 'string') continue;
       states.push({
         account: fields.Account,
-        node_index: index,
+        node_index,
         balance: dropsToNative(typeof fields.Balance === 'string' ? fields.Balance : '0'),
         flags: uint(fields.Flags),
         sequence: uint(fields.Sequence),
@@ -60,7 +84,7 @@ export class AccountStatesParser {
         fields: structuredClone(fields),
         deleted: op === 'DeletedNode',
       });
-    });
+    }
     return states;
   }
 }

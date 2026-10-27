@@ -342,6 +342,10 @@ const MIGRATION_011_TABLES: Table[] = [
   Table.NftCollectionHolders,
   Table.NftDirty,
 ];
+/** The display names (D4): the ledger-derived domain of an account and the toml store of the tomls worker. */
+const MIGRATION_012 = '012_display_names.sql';
+/** The tables of migration 012. */
+const MIGRATION_012_TABLES: Table[] = [Table.AccountDomains, Table.DomainTomls];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -1718,6 +1722,54 @@ describe('migrations (e2e)', () => {
       copyReal([MIGRATION_011]);
       expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_011], skipped: before });
       for (const table of MIGRATION_011_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+
+  describe('migration 012', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-012-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 012 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_012_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_012);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_012);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_012_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_012]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_012], skipped: before });
+      for (const table of MIGRATION_012_TABLES) expect(await tablesOf(config.database)).toContain(table);
 
       expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
     });

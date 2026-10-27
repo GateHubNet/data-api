@@ -1321,10 +1321,17 @@ describe('AMM rows (parser version 2)', () => {
       [Table.CollectionNftEvents, 'collectionNftEvents'],
       [Table.NftSales, 'nftSales'],
       [Table.NftTouches, 'nftTouches'],
+      [Table.AccountDomains, 'accountDomains'],
     ];
 
-    // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter.
-    const recorded = (): Built[] => [...builtOf(AMM_SET), ...builtOf(NFT_SET), ...builtOf(URITOKEN_SET)];
+    // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter. The Domain rows are in
+    // the recorded Xahau and XRPL ledgers: the Xahau flag ledger and 26540188 hold account roots with a Domain.
+    const recorded = (): Built[] => [
+      ...builtOf(AMM_SET),
+      ...builtOf(NFT_SET),
+      ...builtOf(URITOKEN_SET),
+      ...builtOf(XAHAU_SET),
+    ];
 
     it.each(tables)('%s', (table, key) => {
       const columns = ddlColumns(table);
@@ -1348,15 +1355,15 @@ describe('AMM rows (parser version 2)', () => {
         expect(rows.ammLiquidity).toEqual([]);
         expect(rows.accountAmmLiquidity).toEqual([]);
         expect(rows.ammGovernance).toEqual([]);
-        expect(rows.diagnostics).toEqual({ ammUnclassified: 0, nftSkipped: 0 });
+        expect(rows.diagnostics).toEqual({ ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0 });
         for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
       }
     });
 
-    it('stores parser_version 5 (NFT events, after the path payments of 4)', () => {
-      expect(PARSER_VERSION).toBe(5);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(5);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(5);
+    it('stores parser_version 6 (account domains, after the NFT events of 5)', () => {
+      expect(PARSER_VERSION).toBe(6);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(6);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(6);
     });
   });
 
@@ -1370,7 +1377,7 @@ describe('AMM rows (parser version 2)', () => {
           (sum, t) => sum + ammParser.parse(toParserTx(t, raw.header, null), XRPL).unclassified,
           0,
         );
-        expect(rows.diagnostics).toEqual({ ammUnclassified: expected, nftSkipped: 0 });
+        expect(rows.diagnostics).toEqual({ ammUnclassified: expected, nftSkipped: 0, invalidDomains: 0 });
         total += expected;
       }
       expect(total).toBeGreaterThanOrEqual(0);
@@ -1397,7 +1404,7 @@ describe('AMM rows (parser version 2)', () => {
           poolLine(index),
         ]);
       const rows = buildLedgerRows(ledgerOf([offer(0, 'A'.repeat(64)), offer(1, 'B'.repeat(64))]), XRPL);
-      expect(rows.diagnostics).toEqual({ ammUnclassified: 2, nftSkipped: 0 });
+      expect(rows.diagnostics).toEqual({ ammUnclassified: 2, nftSkipped: 0, invalidDomains: 0 });
       expect(rows.ammPoolStates).toEqual([]);
       expect(rows.exchanges).toEqual([]);
     });
@@ -1751,13 +1758,13 @@ describe('NFT rows (parser version 5)', () => {
   });
 
   describe('parser_version', () => {
-    it('stamps parser_version 5 on the ledger row', () => {
-      expect(PARSER_VERSION).toBe(5);
+    it('stamps the parser version of the build on the ledger row: 6, with the NFT parser still at 5', () => {
+      expect(PARSER_VERSION).toBe(6);
       expect(NFT_PARSER_VERSION).toBe(5);
       for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
-        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(5);
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(6);
       }
-      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(5);
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(6);
     });
   });
 
@@ -1797,6 +1804,198 @@ describe('NFT rows (parser version 5)', () => {
         }
       }
     });
+  });
+});
+
+// -- Account domain rows ----------------------------------------------------------------------------------------
+
+describe('account_domains (parser version 6)', () => {
+  const NORTHPEAK = '6E6F7274687065616B2E6578616D706C65'; // northpeak.example
+  const HARBOR = '686172626F722E6578616D706C65'; // harbor.example
+  const DOMAIN_ACCOUNT = 'rDomainDomainDomainDomainDomainxx';
+  const DORMANT = 'rDormantDormantDormantDormantDormxx';
+
+  const root = (fields: Json, previous: Json): Json => ({
+    ModifiedNode: { LedgerEntryType: 'AccountRoot', FinalFields: fields, PreviousFields: previous },
+  });
+
+  /**
+   * Seven transactions: a payment, a payment that creates an account, a payment received by a dormant account with a Domain,
+   * the AccountSet that sets one (the account root is its node 1), a failed payment of that account, the AccountSet that clears
+   * the Domain, and the AccountDelete of the dormant account.
+   */
+  function domainLedger(): RawLedger {
+    const hash = (letter: string) => letter.repeat(64);
+    return ledgerOf([
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: RECEIVER, Amount: '10' }, 0, hash('A'), [
+        account(SENDER, '100', '88'),
+        account(RECEIVER, '10', '20'),
+      ]),
+      // a payment that creates an account without a Domain: no row
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: NEWBIE, Amount: '25000000' }, 1, hash('B'), [
+        account(SENDER, '88', '76'),
+        { CreatedNode: { LedgerEntryType: 'AccountRoot', NewFields: { Account: NEWBIE, Balance: '25000000' } } },
+      ]),
+      // a payment received by a dormant account that has a Domain
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: DORMANT, Amount: '10' }, 2, hash('C'), [
+        account(SENDER, '76', '64'),
+        root({ Account: DORMANT, Balance: '30', Domain: HARBOR }, { Balance: '20' }),
+      ]),
+      // the AccountSet that sets a Domain: the account root is the second node
+      rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK, Sequence: 5 }, 3, hash('D'), [
+        { ModifiedNode: { LedgerEntryType: 'DirectoryNode', FinalFields: {}, PreviousFields: {} } },
+        root(
+          { Account: DOMAIN_ACCOUNT, Balance: '90', Domain: NORTHPEAK, Sequence: 6 },
+          { Balance: '102', Sequence: 5 },
+        ),
+      ]),
+      // a failed transaction of the same account
+      rawTx(
+        { TransactionType: 'Payment', Account: DOMAIN_ACCOUNT, Destination: RECEIVER, Amount: '10', Sequence: 6 },
+        4,
+        hash('E'),
+        [
+          root(
+            { Account: DOMAIN_ACCOUNT, Balance: '78', Domain: NORTHPEAK, Sequence: 7 },
+            { Balance: '90', Sequence: 6 },
+          ),
+        ],
+        'tecPATH_DRY',
+      ),
+      // the account clears its Domain, then is deleted
+      rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT, Domain: '', Sequence: 7 }, 5, hash('F'), [
+        root(
+          { Account: DOMAIN_ACCOUNT, Balance: '66', Sequence: 8 },
+          { Balance: '78', Domain: NORTHPEAK, Sequence: 7 },
+        ),
+      ]),
+      rawTx({ TransactionType: 'AccountDelete', Account: DORMANT, Destination: RECEIVER, Sequence: 3 }, 6, hash('G'), [
+        {
+          DeletedNode: {
+            LedgerEntryType: 'AccountRoot',
+            FinalFields: { Account: DORMANT, Balance: '0', Domain: HARBOR },
+          },
+        },
+        account(RECEIVER, '20', '50'),
+      ]),
+    ]);
+  }
+
+  it('writes a row for every change of an account that has or had a Domain, with the version of its place in the ledger', () => {
+    const { accountDomains, diagnostics } = buildLedgerRows(domainLedger(), XRPL);
+
+    const at = (tx_index: number, node_index: number) => ({
+      ledger_index: 5000000,
+      tx_index,
+      node_index,
+      version: String(BigInt(5000000) * 2n ** 32n + BigInt(tx_index) * 2n ** 16n + BigInt(node_index)),
+    });
+    expect(accountDomains).toEqual([
+      { account: DORMANT, ...at(2, 1), domain_hex: HARBOR, deleted: 0 },
+      { account: DOMAIN_ACCOUNT, ...at(3, 1), domain_hex: NORTHPEAK, deleted: 0 },
+      { account: DOMAIN_ACCOUNT, ...at(4, 0), domain_hex: NORTHPEAK, deleted: 0 },
+      { account: DOMAIN_ACCOUNT, ...at(5, 0), domain_hex: '', deleted: 0 },
+      { account: DORMANT, ...at(6, 0), domain_hex: '', deleted: 1 },
+    ]);
+    expect(diagnostics.invalidDomains).toBe(0);
+  });
+
+  it('keys a row by the AffectedNodes index and the transaction index, and takes the version of them', () => {
+    const [row] = buildLedgerRows(
+      ledgerOf(
+        [
+          rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK }, 3, 'D'.repeat(64), [
+            { ModifiedNode: { LedgerEntryType: 'DirectoryNode', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            { ModifiedNode: { LedgerEntryType: 'Offer', FinalFields: {}, PreviousFields: {} } },
+            root({ Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK }, { Sequence: 5 }),
+          ]),
+        ],
+        { ledger_index: '107671593' },
+      ),
+      XRPL,
+    ).accountDomains;
+
+    expect(row).toEqual({
+      account: DOMAIN_ACCOUNT,
+      ledger_index: 107671593,
+      tx_index: 3,
+      node_index: 5,
+      version: '462445970643419141',
+      domain_hex: NORTHPEAK,
+      deleted: 0,
+    });
+  });
+
+  it('counts the Domains that are not hex in diagnostics.invalidDomains and writes them empty, never throws', () => {
+    const bad = (domain: unknown, index: number): Json =>
+      rawTx({ TransactionType: 'AccountSet', Account: DOMAIN_ACCOUNT }, index, String(index).repeat(64), [
+        root({ Account: `rBad${index}`, Domain: domain }, { Sequence: 5 }),
+      ]);
+    const { accountDomains, diagnostics } = buildLedgerRows(ledgerOf([bad(42, 0), bad('ZZ', 1), bad(HARBOR, 2)]), XRPL);
+
+    expect(accountDomains.map((r) => [r.account, r.domain_hex])).toEqual([
+      ['rBad0', ''],
+      ['rBad1', ''],
+      ['rBad2', HARBOR],
+    ]);
+    expect(diagnostics.invalidDomains).toBe(2);
+  });
+
+  it('reads the Xahau transactions that change an account root like any other', () => {
+    const { accountDomains } = buildLedgerRows(
+      ledgerOf([
+        rawTx({ TransactionType: 'SetHook', Account: DOMAIN_ACCOUNT }, 0, '1'.repeat(64), [
+          root({ Account: DOMAIN_ACCOUNT, Domain: NORTHPEAK }, { Balance: '5' }),
+        ]),
+      ]),
+      XAHAU,
+    );
+
+    expect(accountDomains.map((r) => [r.account, r.domain_hex])).toEqual([[DOMAIN_ACCOUNT, NORTHPEAK]]);
+  });
+
+  it('writes nothing for a ledger in which no account has a Domain', () => {
+    const rows = buildLedgerRows(sampleLedger(), XRPL);
+    expect(rows.accountDomains).toEqual([]);
+    expect(rows.diagnostics.invalidDomains).toBe(0);
+  });
+
+  // The same nodes, counted the same way: a row of account_domains sits on a row of account_states (the seed of
+  // docs/backfill.md puts the state's own place in the domain row), and its node_index is the AffectedNodes index.
+  it.each([...SETS, NFT_SET, URITOKEN_SET])(
+    'sits on the account_states row of the same node, over $name, and holds its Domain',
+    (set) => {
+      let checked = 0;
+      const place = (r: { account: string; tx_index: number; node_index: number }): string =>
+        `${r.account}/${r.tx_index}/${r.node_index}`;
+      for (const { rows } of builtOf(set)) {
+        const states = new Map(rows.accountStates.map((r) => [place(r), r] as const));
+        const domains = new Set(rows.accountDomains.map(place));
+        // an account root that ends with a Domain always has its row
+        for (const state of rows.accountStates.filter((r) => 'Domain' in JSON.parse(r.fields))) {
+          expect([place(state), domains.has(place(state))]).toEqual([place(state), true]);
+        }
+        for (const domain of rows.accountDomains) {
+          const state = states.get(place(domain));
+          expect(state).toBeDefined();
+          expect(domain.deleted).toBe(state!.deleted);
+          expect(domain.domain_hex).toBe(state!.deleted ? '' : (JSON.parse(state!.fields).Domain ?? ''));
+          checked++;
+        }
+      }
+      // every fixture set holds account roots with a Domain: the check is not vacuous
+      expect(checked).toBeGreaterThan(0);
+    },
+  );
+
+  it('is deterministic and leaves the ledger unchanged: the version is the place of the node, nothing else', () => {
+    const raw = domainLedger();
+    const before = JSON.stringify(raw);
+    expect(buildLedgerRows(raw, XRPL).accountDomains).toEqual(buildLedgerRows(raw, XRPL).accountDomains);
+    expect(JSON.stringify(raw)).toBe(before);
   });
 });
 
@@ -1926,7 +2125,9 @@ describe.each(SETS)('invariants over $name', (set) => {
 
   describe('(a) the ORDER BY key of every table is unique', () => {
     it.each(ROW_KEY)('%s', (table, key) => {
-      const columns = orderByColumns(table);
+      // account_domains is ordered by account alone (spec 1.1): rows of one account merge into the newest, so what must
+      // be unique is the (account, version) the ReplacingMergeTree and the delete-and-write recovery rely on.
+      const columns = table === Table.AccountDomains ? ['account', 'version'] : orderByColumns(table);
       expect(columns.length).toBeGreaterThan(0);
 
       const rows = collect(built(), key);

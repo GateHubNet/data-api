@@ -42,10 +42,27 @@ const ctx = parseContextFor(getNetworkProfile('xrpl'));
 /**
  * Tables whose sorting key holds the ledger index, so that their row count is exact until a merge. Every synthetic
  * ledger carries the template's transactions, so `tx_by_hash` (ORDER BY hash) collapses them at any merge: it is left out.
+ * So is `account_domains` (ORDER BY account): the rows of one account collapse within an insert (`optimize_on_insert`)
+ * and at the merges, and the ledgers repeat the template's accounts (spec decision 7). `domainsUpTo` and `expectRows`
+ * compare the newest row of each account instead.
  */
-const COUNTED_TABLES = LEDGER_KEYED_TABLES.map((t) => t.table).filter((t) => t !== Table.TxByHash);
+const COUNTED_TABLES = LEDGER_KEYED_TABLES.map((t) => t.table).filter(
+  (t) => t !== Table.TxByHash && t !== Table.AccountDomains,
+);
 
 type Counts = Record<string, number>;
+
+/** The newest `account_domains` row (its `version`, decimal text) of each account the ledgers `L(1)` .. `last` of `chain` write. */
+function domainsUpTo(last: number, chain: SyntheticLedger[] = CHAIN): Map<string, string> {
+  const newest = new Map<string, bigint>();
+  for (const { index, raw } of chain) {
+    if (index > last) continue;
+    for (const { account, version } of buildLedgerRows(raw, ctx).accountDomains) {
+      if (BigInt(version) > (newest.get(account) ?? -1n)) newest.set(account, BigInt(version));
+    }
+  }
+  return new Map([...newest].map(([account, version]) => [account, version.toString()]));
+}
 
 /** What the counted tables hold when exactly the ledgers `L(1)` .. `last` of `chain` are committed. */
 function expectedCounts(last: number, chain: SyntheticLedger[] = CHAIN): Counts {
@@ -234,6 +251,20 @@ describe('LiveRunner (e2e)', () => {
     return Object.fromEntries(await Promise.all(COUNTED_TABLES.map(async (t) => [t, await count(svc, t)] as const)));
   }
 
+  /** The newest `account_domains` row of each account the table holds. */
+  async function storedDomains(svc: ClickHouseService): Promise<Map<string, string>> {
+    const rows = await svc.query<{ account: string; version: string }>(
+      `SELECT account, toString(max(version)) AS version FROM ${Table.AccountDomains} GROUP BY account`,
+    );
+    return new Map(rows.map((r) => [r.account, r.version]));
+  }
+
+  /** The counted tables hold exactly the rows of the ledgers `L(1)` .. `last`, and `account_domains` its newest row per account. */
+  async function expectRows(svc: ClickHouseService, last: number, chain: SyntheticLedger[] = CHAIN): Promise<void> {
+    expect(await tableCounts(svc)).toEqual(expectedCounts(last, chain));
+    expect(await storedDomains(svc)).toEqual(domainsUpTo(last, chain));
+  }
+
   /** `count() == uniqExact(ledger_index, tx_index)` on `transactions`: no transaction row is there twice. */
   async function expectNoDuplicateTransactions(svc: ClickHouseService): Promise<void> {
     const row = await svc.queryOne<{ n: string; u: string }>(
@@ -379,7 +410,7 @@ describe('LiveRunner (e2e)', () => {
     ]);
 
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
     await expectNoDuplicateTransactions(svc);
     // Every ledger was fetched exactly once, and nothing below the start or above the head.
     expect([...source.fetches].sort((a, b) => a - b)).toEqual(range(L(1), L(30)));
@@ -586,7 +617,7 @@ describe('LiveRunner (e2e)', () => {
     expect(writer.calls).toBe(2); // the failed writer is never used again: a new runId carries on
     await expectNoDuplicateTransactions(svc);
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
     expect(runner.status()).toMatchObject({ state: 'live', checkpoint: L(30), lag: 0 });
     expect(runner.status().recovering).toBeUndefined();
     expect(logger.lines).toContainEqual(
@@ -627,6 +658,8 @@ describe('LiveRunner (e2e)', () => {
       ]) {
         expect([table, counts[table] > 0]).toEqual([table, true]);
       }
+      // and the accounts of the pools' transactions with a Domain: account_domains has rows to compare
+      expect(domainsUpTo(L(12), AMM_CHAIN).size).toBeGreaterThan(0);
     });
 
     it('writes the AMM rows with the ledgers and adds the pools it could not classify to the counter', async () => {
@@ -638,7 +671,7 @@ describe('LiveRunner (e2e)', () => {
       await within(runner.runOnce(), 20_000, 'Catching up 12 AMM ledgers');
 
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
-      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), AMM_CHAIN));
+      await expectRows(svc, L(12), AMM_CHAIN);
       expect(await unclassified(metrics)).toBe(before + 12 * UNCLASSIFIED_PER_LEDGER);
     });
 
@@ -666,7 +699,7 @@ describe('LiveRunner (e2e)', () => {
 
       expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
-      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), AMM_CHAIN));
+      await expectRows(svc, L(12), AMM_CHAIN);
       expect(await unclassified(metrics)).toBe(before + 12 * UNCLASSIFIED_PER_LEDGER);
     });
 
@@ -703,6 +736,7 @@ describe('LiveRunner (e2e)', () => {
       for (const table of [Table.NftEvents, Table.AccountNftEvents, Table.CollectionNftEvents, Table.NftTouches]) {
         expect([table, counts[table] > 0]).toEqual([table, true]);
       }
+      expect(domainsUpTo(L(12), NFT_CHAIN).size).toBeGreaterThan(0);
     });
 
     it('writes the NFT rows with the ledgers and adds the events it skipped to the counter', async () => {
@@ -714,7 +748,7 @@ describe('LiveRunner (e2e)', () => {
       await within(runner.runOnce(), 20_000, 'Catching up 12 NFT ledgers');
 
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
-      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), NFT_CHAIN));
+      await expectRows(svc, L(12), NFT_CHAIN);
       expect(await skipped(metrics)).toBe(before + 12 * SKIPPED_PER_LEDGER);
     });
 
@@ -742,7 +776,7 @@ describe('LiveRunner (e2e)', () => {
 
       expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
-      expect(await tableCounts(svc)).toEqual(expectedCounts(L(12), NFT_CHAIN));
+      await expectRows(svc, L(12), NFT_CHAIN);
       expect(await skipped(metrics)).toBe(before + 12 * SKIPPED_PER_LEDGER);
     });
   });
@@ -814,7 +848,7 @@ describe('LiveRunner (e2e)', () => {
     expect(await rowsAbove(svc, L(30))).toEqual(noRows()); // no orphans
     await expectNoDuplicateTransactions(svc); // no duplicates
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
   });
 
   it('deletes the orphans of a crashed first write before writing into an empty database', async () => {
@@ -826,7 +860,7 @@ describe('LiveRunner (e2e)', () => {
 
     await expectNoDuplicateTransactions(svc);
     expect(await committedIndexes(svc)).toEqual(range(L(1), L(30)));
-    expect(await tableCounts(svc)).toEqual(expectedCounts(L(30)));
+    await expectRows(svc, L(30));
   });
 
   it('cleans up after a crashed first write that started below the current head (no GH_SYNC_START_LEDGER)', async () => {

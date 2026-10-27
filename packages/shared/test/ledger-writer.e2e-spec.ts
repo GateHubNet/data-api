@@ -40,6 +40,17 @@ const index = (i: number): number => LEDGERS[i].header.ledger_index;
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 
 /**
+ * `account_domains` is ordered by account (spec 1.1, decision 7), so the rows of one account collapse: within one insert
+ * (`optimize_on_insert`) and across inserts at the merges, whenever they run (the ripple-mock fixtures give the last ledger
+ * two rows of one account). Like `tx_by_hash` in the live runner's tests it is left out of the per-table counts, and
+ * `expectDomains` compares what it holds instead: the newest row of each account.
+ */
+const MERGED_TABLES: Table[] = [Table.AccountDomains];
+
+/** The tables whose rows are counted: every ledger-keyed table but the merged ones. */
+const COUNTED_TABLES: Table[] = ALL_TABLES.filter((t) => !MERGED_TABLES.includes(t));
+
+/**
  * The tables with a dedup window that are not ledger tables: the validations collector's `validator_validations` and
  * `validator_seen` (window 100). Ingest recovery never touches them, so they are not in `LEDGER_KEYED_TABLES`.
  */
@@ -67,7 +78,8 @@ const NFT_LEDGER_TABLES: Table[] = [
  * The tables the ripple-mock ledgers have no activity for: the delete tests put hand-made rows into them
  * (`insertSeededRows`), to see what the deletes reach and what they leave. The recorded AMM and NFT ledgers give real
  * rows to these tables, but they all sit in one partition of each, and the delete tests need the rows over several.
- * `account_domains` (migration 012) is one of them: no ledger gives it rows yet.
+ * `account_domains` (migration 012) is one of them: the last ripple-mock ledger gives it two rows of one account, but the
+ * delete tests need a row in every ledger, and each of an account of its own (`seededDomainRow`).
  */
 const SEEDED_LEDGER_TABLES: Table[] = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES, Table.AccountDomains];
 
@@ -76,6 +88,24 @@ const SEEDED_P6_TABLES: Table[] = [Table.AmmPoolTouches, Table.NftSales, Table.N
 
 type Counts = Record<string, number>;
 type Json = Record<string, unknown>;
+
+/** The columns of an `account_domains` row that the comparisons read. */
+interface DomainKey {
+  account: string;
+  ledger_index: number;
+  version: string;
+}
+
+/**
+ * The hand-made `account_domains` row of a ledger (`insertSeededRows`): its sample row, moved to the ledger. The table has
+ * no time and is ordered by account, so rows of one account in a partition would merge into one: every ledger gets an
+ * account (and so a version) of its own.
+ */
+function seededDomainRow(ledgerIndex: number): Json & DomainKey {
+  const sample = SAMPLE_ROWS[Table.AccountDomains];
+  const version = BigInt(ledgerIndex) * 2n ** 32n + BigInt(sample.tx_index) * 2n ** 16n + BigInt(sample.node_index);
+  return { ...sample, ledger_index: ledgerIndex, account: `rSeeded${ledgerIndex}`, version: version.toString() };
+}
 
 /** `rows` ordered by the columns `keys`, as ClickHouse orders them by that key (numbers and ASCII text). */
 const sortedBy = (rows: Json[], keys: string[]): Json[] =>
@@ -88,24 +118,27 @@ const sortedBy = (rows: Json[], keys: string[]): Json[] =>
   });
 
 /**
- * What the tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows `buildLedgerRows`
- * made. `seeded` are ledgers that also got one hand-made row in each AMM and NFT table and in `account_domains`
- * (`insertSeededRows`).
+ * What the counted tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows
+ * `buildLedgerRows` made (`account_domains` is not counted: `MERGED_TABLES`). `seeded` are ledgers that also got one
+ * hand-made row in each AMM and NFT table (`insertSeededRows`).
  */
 function countsOf(
   built: LedgerRows[],
   keep: (ledgerIndex: number) => boolean = () => true,
   seeded: readonly LedgerRows[] = [],
 ): Counts {
-  const counts: Counts = Object.fromEntries(ALL_TABLES.map((t) => [t, 0]));
+  const counts: Counts = Object.fromEntries(COUNTED_TABLES.map((t) => [t, 0]));
   for (const rows of built) {
     if (!keep(rows.ledger.ledger_index)) continue;
     counts[Table.Ledgers] += 1;
     counts[Table.LedgerByHash] += 1;
-    for (const [table, key] of CHILD_TABLES) counts[table] += (rows[key] as unknown[]).length;
+    for (const [table, key] of CHILD_TABLES)
+      if (!MERGED_TABLES.includes(table)) counts[table] += (rows[key] as unknown[]).length;
   }
   for (const rows of seeded) {
-    if (keep(rows.ledger.ledger_index)) for (const table of SEEDED_LEDGER_TABLES) counts[table] += 1;
+    if (keep(rows.ledger.ledger_index)) {
+      for (const table of SEEDED_LEDGER_TABLES) if (!MERGED_TABLES.includes(table)) counts[table] += 1;
+    }
   }
   return counts;
 }
@@ -173,13 +206,66 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   }
 
   async function storedCounts(svc: ClickHouseService): Promise<Counts> {
-    return Object.fromEntries(await Promise.all(ALL_TABLES.map(async (t) => [t, await count(svc, t)] as const)));
+    return Object.fromEntries(await Promise.all(COUNTED_TABLES.map(async (t) => [t, await count(svc, t)] as const)));
   }
+
+  /** The hand-made rows of a seeded table (`insertSeededRows`): in `account_domains` the ones of the `rSeeded…` accounts. */
+  const countSeeded = (svc: ClickHouseService, table: Table): Promise<number> =>
+    count(svc, table, table === Table.AccountDomains ? "startsWith(account, 'rSeeded')" : '1');
 
   const rowsAbove = async (svc: ClickHouseService, cp: number): Promise<Counts> =>
     Object.fromEntries(
       await Promise.all(ALL_TABLES.map(async (t) => [t, await count(svc, t, `ledger_index > ${cp}`)] as const)),
     );
+
+  /**
+   * What `account_domains` holds when exactly the ledgers of `built` matching `keep` were written (and the `seeded`
+   * ledgers got their hand-made row), as far as the merges leave it deterministic:
+   *  - every stored row is a row of a kept ledger, so nothing of a deleted ledger is left and nothing was invented;
+   *  - an account that has no row in a deleted ledger has, as its newest stored row, its newest built row. (One that
+   *    has lost its newest rows to a delete may or may not have kept an older one: a merge may have dropped it already.)
+   */
+  async function expectDomains(
+    svc: ClickHouseService,
+    built: readonly LedgerRows[],
+    keep: (ledgerIndex: number) => boolean = () => true,
+    seeded: readonly LedgerRows[] = [],
+  ): Promise<void> {
+    const all: DomainKey[] = [
+      ...built.flatMap((r) => r.accountDomains),
+      ...seeded.map((r) => seededDomainRow(r.ledger.ledger_index)),
+    ];
+    const kept = all.filter((r) => keep(r.ledger_index));
+    const hurt = new Set(all.filter((r) => !keep(r.ledger_index)).map((r) => r.account));
+    const stored = await svc.query<{ account: string; version: string }>(
+      `SELECT account, toString(version) AS version FROM ${Table.AccountDomains}`,
+    );
+
+    const keptKeys = new Set(kept.map((r) => `${r.account}/${r.version}`));
+    expect(stored.filter((r) => !keptKeys.has(`${r.account}/${r.version}`))).toEqual([]);
+    const newest = (rows: Array<{ account: string; version: string }>): Map<string, string> => {
+      const latest = new Map<string, bigint>();
+      for (const { account, version } of rows) {
+        if (BigInt(version) > (latest.get(account) ?? -1n)) latest.set(account, BigInt(version));
+      }
+      return new Map([...latest].map(([account, version]) => [account, version.toString()]));
+    };
+    const storedNewest = newest(stored);
+    for (const [account, version] of newest(kept.filter((r) => !hurt.has(r.account)))) {
+      expect([account, storedNewest.get(account)]).toEqual([account, version]);
+    }
+  }
+
+  /** The counted tables and `account_domains` hold what writing the ledgers of `built` matching `keep` gives. */
+  async function expectStored(
+    svc: ClickHouseService,
+    built: readonly LedgerRows[],
+    keep?: (ledgerIndex: number) => boolean,
+    seeded?: readonly LedgerRows[],
+  ): Promise<void> {
+    expect(await storedCounts(svc)).toEqual(countsOf([...built], keep, seeded));
+    await expectDomains(svc, built, keep, seeded);
+  }
 
   /** Insert the child rows and `ledger_by_hash` of ledgers, but not their `ledgers` row: a write that died before it. */
   async function insertUncommitted(svc: ClickHouseService, rows: LedgerRows[]): Promise<void> {
@@ -196,23 +282,20 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
   /**
    * The hand-made row of `table` for a ledger: the table's sample row, moved to the ledger. The touches of a pool and
-   * of an NFT are the columns of their key, with no time. `account_domains` has no time either, and is ordered by
-   * account, so rows of one account in a partition would merge into one: every ledger gets an account (and so a
-   * version) of its own.
+   * of an NFT are the columns of their key, with no time, and `account_domains` has none either.
    */
   function seededRow(table: Table, ledger: LedgerRows['ledger']): Json {
+    if (table === Table.AccountDomains) return seededDomainRow(ledger.ledger_index);
     const row: Json = { ...SAMPLE_ROWS[table], ledger_index: ledger.ledger_index };
     if (table === Table.AmmPoolTouches || table === Table.NftTouches) return row;
-    if (table !== Table.AccountDomains) return { ...row, close_time: ledger.close_time };
-    const { tx_index, node_index } = SAMPLE_ROWS[Table.AccountDomains];
-    const version = BigInt(ledger.ledger_index) * 2n ** 32n + BigInt(tx_index) * 2n ** 16n + BigInt(node_index);
-    return { ...row, account: `rSeeded${ledger.ledger_index}`, version: version.toString() };
+    return { ...row, close_time: ledger.close_time };
   }
 
   /**
    * One row in each AMM and NFT ledger table, and in `account_domains`, for every one of `rows`' ledgers. The
-   * ripple-mock ledgers (2021) have no such activity, so the delete tests put these in by hand, over several
-   * partitions, to see what the deletes reach and what they leave. `expectedCounts` takes them as `seeded`.
+   * ripple-mock ledgers (2021) have no such activity (but for two rows of `account_domains` in the last one), so the delete
+   * tests put these in by hand, over several partitions, to see what the deletes reach and what they leave. `expectedCounts`
+   * and `expectStored` take them as `seeded`.
    */
   async function insertSeededRows(svc: ClickHouseService, rows: LedgerRows[]): Promise<void> {
     for (const table of SEEDED_LEDGER_TABLES)
@@ -229,7 +312,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       expect(await count(svc, Table.Ledgers)).toBe(54);
       expect(await count(svc, Table.Payments)).toBe(182);
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
       expect(await committedCheckpoint(svc)).toBe(index(53));
       expect(await storedLedgerHash(svc, index(7))).toBe(LEDGERS[7].header.ledger_hash);
       expect(await storedLedgerHash(svc, 1)).toBeUndefined();
@@ -240,7 +323,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const writer = new LedgerWriter(svc, ctx);
       for (let i = 0; i < LEDGERS.length; i += 10) await writer.write(LEDGERS.slice(i, i + 10));
 
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
     });
 
     it('re-writing the same ledgers with a new runId duplicates rows until a merge: recovery must delete, not rely on dedup', async () => {
@@ -252,7 +335,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(await count(svc, Table.Ledgers)).toBe(108);
 
       const expected = expectedCounts();
-      for (const table of ALL_TABLES) {
+      for (const table of COUNTED_TABLES) {
         await svc.command(`OPTIMIZE TABLE ${table} FINAL`);
         const key = (
           await svc.queryOne<{ sorting_key: string }>(
@@ -265,6 +348,15 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         );
         expect([table, Number(row?.n), Number(row?.u)]).toEqual([table, expected[table], expected[table]]);
       }
+
+      // Ordered by account, account_domains is left with one row per account and partition, the newest.
+      await svc.command(`OPTIMIZE TABLE ${Table.AccountDomains} FINAL`);
+      const domains = await svc.queryOne<{ n: string | number; u: string | number }>(
+        `SELECT count() AS n, uniqExact(account, intDiv(ledger_index, 10000000)) AS u FROM ${Table.AccountDomains}`,
+      );
+      expect(Number(domains?.n)).toBeGreaterThan(0);
+      expect(Number(domains?.n)).toBe(Number(domains?.u));
+      await expectDomains(svc, BUILT);
     });
 
     it('same runId retry is deduplicated', async () => {
@@ -273,7 +365,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await new LedgerWriter(svc, ctx, { runId: 'retry-run' }).write(LEDGERS);
 
       expect(await count(svc, Table.Payments)).toBe(182);
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
     });
 
     it('chunks inserts above maxRowsPerInsert, with a token per chunk, children first and the commit marker last', async () => {
@@ -306,16 +398,17 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(new Set(tokens).size).toBe(tokens.length);
 
       // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
-      // by account: these ledgers have no AMM or NFT activity, so the 5 AMM tables and the 5 NFT tables get no insert)
-      // start together, before any of them has finished.
+      // by account, and account_domains, which the last ledger has two rows for: these ledgers have no AMM or NFT activity,
+      // so the 5 AMM tables and the 5 NFT tables get no insert) start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
-      expect(childTables.size).toBe(16);
+      expect(childTables.size).toBe(17);
       expect(childTables).toContain(Table.AccountStates);
       expect(childTables).toContain(Table.TrustLineStates);
       expect(childTables).toContain(Table.PathPayments);
       expect(childTables).toContain(Table.AccountPathPayments);
+      expect(childTables).toContain(Table.AccountDomains);
       const firstStarts = events.slice(0, childTables.size);
       expect(new Set(firstStarts)).toEqual(new Set([...childTables].map((t) => `start:${t}`)));
       const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES];
@@ -332,7 +425,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(events[events.length - 1]).toBe(`end:${Table.Ledgers}`);
       expect(events.filter((e) => e === `start:${Table.Ledgers}`)).toHaveLength(1);
 
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
     });
 
     it('skips tables that have no rows, but still commits the ledger', async () => {
@@ -542,9 +635,10 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const after = await rowsAbove(svc, cp!);
       expect(after).toEqual(Object.fromEntries(ALL_TABLES.map((t) => [t, 0])));
-      expect(await storedCounts(svc)).toEqual(expectedCounts((i) => i <= cp!, BUILT));
+      await expectStored(svc, BUILT, (i) => i <= cp!, BUILT);
       // The seeded rows of the committed ledgers are all still there: one per ledger in each table.
-      for (const table of SEEDED_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, committed]);
+      for (const table of SEEDED_LEDGER_TABLES)
+        expect([table, await countSeeded(svc, table)]).toEqual([table, committed]);
       expect(await count(svc, Table.FeeStats)).toBe(1);
 
       // The DELETEs hit exactly the ledger-keyed tables, partition by partition where the table is partitioned.
@@ -595,7 +689,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const svc = await freshService();
       await new LedgerWriter(svc, ctx).write(LEDGERS);
       await deleteLedgersAbove(svc, index(53));
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
     });
 
     it('cleans up a failed write so a new LedgerWriter can redo it without duplicates', async () => {
@@ -620,7 +714,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await deleteLedgersAbove(svc, cp!);
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(committed));
 
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
       expect(await committedCheckpoint(svc)).toBe(index(53));
     });
 
@@ -679,7 +773,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       await failedWriter.withNewRunId().write(LEDGERS);
 
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
       expect(await count(svc, Table.Payments)).toBe(182);
     });
   });
@@ -697,9 +791,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await deleteLedgerRange(svc, from, to);
 
       const kept = (i: number): boolean => i < from || i > to;
-      expect(await storedCounts(svc)).toEqual(expectedCounts(kept, BUILT));
+      await expectStored(svc, BUILT, kept, BUILT);
       // The seeded tables lose the rows of the range and keep the three ledgers outside it.
-      for (const table of SEEDED_LEDGER_TABLES) expect([table, await count(svc, table)]).toEqual([table, 3]);
+      for (const table of SEEDED_LEDGER_TABLES) expect([table, await countSeeded(svc, table)]).toEqual([table, 3]);
       expect(await committedCheckpoint(svc)).toBe(index(53));
     });
 
@@ -709,7 +803,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       await deleteLedgerRange(svc, 11_119_600, 11_119_604);
 
-      expect(await storedCounts(svc)).toEqual(expectedCounts((i) => i < 11_119_600 || i > 11_119_604));
+      await expectStored(svc, BUILT, (i) => i < 11_119_600 || i > 11_119_604);
     });
 
     it('lets a ledger range be rewritten by a new writer without duplicates', async () => {
@@ -719,7 +813,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await deleteLedgerRange(svc, index(10), index(20));
       await new LedgerWriter(svc, ctx).write(LEDGERS.slice(10, 21));
 
-      expect(await storedCounts(svc)).toEqual(expectedCounts());
+      await expectStored(svc, BUILT);
     });
 
     it('removes the commit marker first: a range delete never leaves a ledgers row without its rows', async () => {
@@ -767,7 +861,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const svc = await freshService();
       const result = await new LedgerWriter(svc, ctx).write(AMM_LEDGERS);
 
-      expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+      await expectStored(svc, AMM_BUILT);
       expect(result).toEqual({
         ammUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
         nftSkipped: 0,
@@ -840,7 +934,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       try {
         await new LedgerWriter(svc, ctx, { runId: 'amm-retry' }).write(AMM_LEDGERS);
         await new LedgerWriter(svc, ctx, { runId: 'amm-retry' }).write(AMM_LEDGERS);
-        expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+        await expectStored(svc, AMM_BUILT);
         for (const table of AMM_LEDGER_TABLES) expect([table, (await count(svc, table)) > 0]).toEqual([table, true]);
 
         // Without the token the same rows are real duplicates: stored twice, until a merge.
@@ -906,10 +1000,10 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
         expect(await rowsAbove(svc, checkpoint)).toEqual(Object.fromEntries(ALL_TABLES.map((t) => [t, 0])));
         // The AMM rows of the committed ledgers were not touched.
-        expect(await storedCounts(svc)).toEqual(survivors);
+        await expectStored(svc, AMM_BUILT, (i) => i <= checkpoint);
 
         await failed.withNewRunId().write(AMM_LEDGERS.slice(committed));
-        expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+        await expectStored(svc, AMM_BUILT);
         expect(await committedCheckpoint(svc)).toBe(aIndex(AMM_LEDGERS.length - 1));
       },
     );
@@ -926,7 +1020,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const after = await Promise.all(AMM_KEYS.map(([table, , orderBy]) => readBack(svc, table, orderBy)));
       expect(after).toEqual(before);
-      expect(await storedCounts(svc)).toEqual(expectedAmmCounts((i) => i <= aIndex(committed - 1)));
+      await expectStored(svc, AMM_BUILT, (i) => i <= aIndex(committed - 1));
     });
 
     it('deleteLedgerRange removes the AMM rows of the range and keeps those outside it, table by table', async () => {
@@ -938,8 +1032,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await deleteLedgerRange(svc, from, to);
 
       const kept = (i: number): boolean => i < from || i > to;
-      const expected = expectedAmmCounts(kept);
-      expect(await storedCounts(svc)).toEqual(expected);
+      await expectStored(svc, AMM_BUILT, kept);
       // Rows are gone from the range and are all there outside it, as built.
       for (const [table, key, orderBy] of AMM_KEYS) {
         const built = AMM_BUILT.filter((r) => kept(r.ledger.ledger_index)).flatMap((r) => r[key] as unknown as Json[]);
@@ -952,7 +1045,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       // And the range can be written again without duplicates.
       await new LedgerWriter(svc, ctx).write(AMM_LEDGERS.slice(2, 13));
-      expect(await storedCounts(svc)).toEqual(expectedAmmCounts());
+      await expectStored(svc, AMM_BUILT);
     });
   });
 
@@ -990,7 +1083,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       const svc = await freshService();
       const result = await new LedgerWriter(svc, ctx).write(NFT_LEDGERS);
 
-      expect(await storedCounts(svc)).toEqual(expectedNftCounts());
+      await expectStored(svc, NFT_BUILT);
       expect(result).toEqual({
         ammUnclassified: NFT_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
         nftSkipped: 0,
@@ -1048,7 +1141,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       const after = await Promise.all(NFT_KEYS.map(([table, , orderBy]) => readBack(svc, table, orderBy)));
       expect(after).toEqual(before);
-      expect(await storedCounts(svc)).toEqual(expectedNftCounts((i) => i <= nIndex(committed - 1)));
+      await expectStored(svc, NFT_BUILT, (i) => i <= nIndex(committed - 1));
     });
 
     it('deleteLedgerRange removes the NFT rows of the range and keeps those outside it, table by table', async () => {
@@ -1060,7 +1153,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       await deleteLedgerRange(svc, from, to);
 
       const kept = (i: number): boolean => i < from || i > to;
-      expect(await storedCounts(svc)).toEqual(expectedNftCounts(kept));
+      await expectStored(svc, NFT_BUILT, kept);
       for (const [table, key, orderBy] of NFT_KEYS) {
         const built = NFT_BUILT.filter((r) => kept(r.ledger.ledger_index)).flatMap((r) => r[key] as unknown as Json[]);
         expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
@@ -1072,7 +1165,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
       // And the range can be written again without duplicates.
       await new LedgerWriter(svc, ctx).write(NFT_LEDGERS.slice(2, 9));
-      expect(await storedCounts(svc)).toEqual(expectedNftCounts());
+      await expectStored(svc, NFT_BUILT);
     });
   });
 

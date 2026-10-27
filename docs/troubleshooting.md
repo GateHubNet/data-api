@@ -173,7 +173,7 @@ again`) and `syncer_aggregator_errors_total{job="amm_pools"}` rises ([operations
 
 ### NFT answers say `"complete": false`, or an NFT has no `minted`
 `coverage` says how much of the history the index holds ([api-reference](api-reference.md#coverage)): the NFT data start at the first ledger written by parser
-version 5, and `complete` is true only when that is at or before the ledger the amendment was enabled in (XRPL 75443457, Xahau 1). Before the history is
+version 5 or later, and `complete` is true only when that is at or before the ledger the amendment was enabled in (XRPL 75443457, Xahau 1). Before the history is
 re-ingested, or on a testnet (never backfilled), it is false and an NFT minted earlier has no `minted` and perhaps no `owner`. `SELECT maxOrNull(ledger_index)
 FROM xrpl.ledgers WHERE parser_version < 5` is the last ledger the NFT data lack ([backfill](backfill.md#nft-re-ingest)). With the history in and the answer still
 `complete: false` on a mainnet, the enable ledger is not known to the API: check `GET /v2/network/amendments/NonFungibleTokensV1_1` (or `URIToken`) has an
