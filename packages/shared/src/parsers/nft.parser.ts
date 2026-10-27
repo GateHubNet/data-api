@@ -24,7 +24,11 @@ export type NftEventName = (typeof NFT_EVENTS)[number];
 /** `nftoken` on XRPL, `uritoken` on Xahau. */
 export type NftKind = 'nftoken' | 'uritoken';
 
-/** What deleted an offer (`offer_removed`): an accepted offer, a burn of its NFT, a transfer of it, or anything else. */
+/**
+ * What deleted an offer (`offer_removed`): an accepted offer, a burn of its NFT, a transfer of it, or anything else
+ * (`other`: an `AccountDelete` of its owner, or a transaction that failed and deleted it, such as the expired offer of a
+ * `tecEXPIRED` `NFTokenAcceptOffer`).
+ */
 export type OfferRemovedBy = 'sale' | 'burn' | 'transfer' | 'other';
 
 /**
@@ -285,6 +289,51 @@ function touchesNfts(meta: Json): boolean {
   });
 }
 
+/**
+ * The event of an XRPL `NFTokenOffer` node (spec §2.2), or undefined when its amount is an MPT (the caller counts it as
+ * skipped): `account` is the offer's owner.
+ */
+function xrplOfferEvent(
+  offer: OfferNode,
+  event: NftEventName,
+  removedBy: OfferRemovedBy | '',
+  ctx: ParseContext,
+): ParsedNftEvent | undefined {
+  const fields = offer.node.fields;
+  // The ledger leaves a native zero out of a created node (FINDINGS xrpl 6, an STAmount's only default value): an absent
+  // `Amount` is zero.
+  const priced = readAmount(fields.Amount ?? '0', ctx);
+  if (!priced) return undefined;
+  return {
+    ...blankEvent(offer.nftId, event),
+    account: typeof fields.Owner === 'string' ? fields.Owner : '',
+    offer_id: offer.id,
+    is_sell_offer: offer.isSell ? 1 : 0,
+    ...priced,
+    destination: typeof fields.Destination === 'string' ? fields.Destination : '',
+    expiration: typeof fields.Expiration === 'number' ? fields.Expiration + RIPPLE_EPOCH_S : null,
+    removed_by: removedBy,
+  };
+}
+
+/**
+ * The events of a transaction that failed (a `tec` result): one `offer_removed` (`removed_by` `other`) for each
+ * `NFTokenOffer` its metadata deletes, in the order of the nodes, and nothing else. A failed transaction changes nothing of
+ * its own, but rippled may still delete offers in it (the expired offers a failed `NFTokenAcceptOffer` met, `tecEXPIRED`),
+ * and such an offer is gone from the ledger. An MPT amount skips the event and counts it, as for a successful one.
+ */
+function offersRemovedInFailure(meta: Json, nodes: readonly LedgerNode[], ctx: ParseContext): ParsedNft {
+  const events: ParsedNftEvent[] = [];
+  let skipped = 0;
+  for (const offer of offerNodesOf(meta, nodes)) {
+    if (offer.node.op !== 'DeletedNode') continue;
+    const e = xrplOfferEvent(offer, 'offer_removed', 'other', ctx);
+    if (e) events.push({ ...e, event_index: events.length });
+    else skipped++;
+  }
+  return { events, skipped };
+}
+
 /** What a transaction's deleted offers are: cancelled (an event of its own), or removed by an accept, a burn or another. */
 function removalOf(type: unknown): OfferRemovedBy | 'cancel' {
   switch (type) {
@@ -475,13 +524,19 @@ function uriTokenEvents(
 /**
  * The NFT events of a transaction: XRPL's (spec §2.1–2.3, §2.5), from who has each NFT before and after (the
  * `NFTokenPage` nodes of the transaction, over the union of them) and the `NFTokenOffer` nodes it created and deleted,
- * and Xahau's URIToken events (spec §2.4), from its `URIToken` nodes. No transaction has both. Successful transactions
- * only; pure, and never writes to its input.
+ * and Xahau's URIToken events (spec §2.4), from its `URIToken` nodes. No transaction has both. Pure, and never writes to
+ * its input.
+ *
+ * A transaction that failed (a `tec` result) changed nothing of its own, and gives no event but one: an `NFTokenOffer` that
+ * its metadata deletes is gone from the ledger all the same (rippled removes the expired offers an `NFTokenAcceptOffer` met
+ * when it fails with `tecEXPIRED`, amendment `fixExpiredNFTokenOfferRemoval`), so each is an `offer_removed` with `removed_by`
+ * `other`, in the order of the nodes (spec §2.5).
  */
 export class NftParser {
   parse(t: ParserTx, ctx: ParseContext): ParsedNft {
-    if (t.meta.TransactionResult !== 'tesSUCCESS' || !touchesNfts(t.meta)) return { events: [], skipped: 0 };
+    if (!touchesNfts(t.meta)) return { events: [], skipped: 0 };
     const nodes = ledgerNodes(t.meta);
+    if (t.meta.TransactionResult !== 'tesSUCCESS') return offersRemovedInFailure(t.meta, nodes, ctx);
     const sender = senderAccount(t.tx) ?? '';
     // A transaction has XRPL NFT nodes or URIToken nodes, never both: the lists below start with the URIToken events.
     const uriTokens = uriTokenEvents(t.meta, nodes, t.tx, sender, ctx);
@@ -503,25 +558,9 @@ export class NftParser {
       event: NftEventName,
       removedBy: OfferRemovedBy | '',
     ): ParsedNftEvent | undefined => {
-      const fields = offer.node.fields;
-      // The ledger leaves a native zero out of a created node (FINDINGS xrpl 6, an STAmount's only default value): an
-      // absent `Amount` is zero.
-      const raw = fields.Amount ?? '0';
-      const priced = readAmount(raw, ctx);
-      if (!priced) {
-        skipped++;
-        return undefined;
-      }
-      return {
-        ...blankEvent(offer.nftId, event),
-        account: typeof fields.Owner === 'string' ? fields.Owner : '',
-        offer_id: offer.id,
-        is_sell_offer: offer.isSell ? 1 : 0,
-        ...priced,
-        destination: typeof fields.Destination === 'string' ? fields.Destination : '',
-        expiration: typeof fields.Expiration === 'number' ? fields.Expiration + RIPPLE_EPOCH_S : null,
-        removed_by: removedBy,
-      };
+      const e = xrplOfferEvent(offer, event, removedBy, ctx);
+      if (!e) skipped++;
+      return e;
     };
 
     // The events that come first: offers cancelled or removed, in the order of the nodes.

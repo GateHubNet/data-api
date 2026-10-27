@@ -20,7 +20,7 @@ import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS } from './sample-rows';
-import { withMptOffers } from './synthetic-mpt-offers';
+import { mptOfferHash, withMptOffers } from './synthetic-mpt-offers';
 
 const LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/ripple-mock')).list();
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
@@ -988,21 +988,26 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       }
     });
 
-    it('reports the events the parser skipped, summed over the batch, and writes no row for them', async () => {
+    it('reports the events the parser skipped, summed over the batch, and writes no row for them (synthetic-mpt-offer: the two recorded offers of the last ledger priced with an MPT amount)', async () => {
       const svc = await freshService();
       const last = NFT_LEDGERS[NFT_LEDGERS.length - 1];
+      // synthetic-mpt-offer: hand-made from the two recorded offers (test/synthetic-mpt-offers.ts), each under a hash of its own
       const batch = [...NFT_LEDGERS.slice(0, -1), withMptOffers(last, OFFERS_OF_LAST)];
 
       const result = await new LedgerWriter(svc, ctx).write(batch);
 
-      // Two offers of the last ledger have an MPT amount: no event for either, and the transactions are all there.
+      // Two offers of the last ledger have an MPT amount: no event for either, and the transactions are all there, under the
+      // hashes of the synthetic ones and not the recorded ones.
       expect(result.nftSkipped).toBe(2);
       const expected = expectedNftCounts();
       expect(await count(svc, Table.NftEvents)).toBe(expected[Table.NftEvents] - 2);
       expect(await count(svc, Table.NftTouches)).toBe(expected[Table.NftTouches] - 2);
       expect(await count(svc, Table.Transactions)).toBe(expected[Table.Transactions]);
-      const hashes = OFFERS_OF_LAST.map((hash) => `'${hash}'`).join(', ');
-      expect(await count(svc, Table.NftEvents, `tx_hash IN (${hashes})`)).toBe(0);
+      const list = (hashes: string[]) => hashes.map((hash) => `'${hash}'`).join(', ');
+      const altered = OFFERS_OF_LAST.map(mptOfferHash);
+      expect(await count(svc, Table.Transactions, `hash IN (${list(altered)})`)).toBe(2);
+      expect(await count(svc, Table.Transactions, `hash IN (${list(OFFERS_OF_LAST)})`)).toBe(0);
+      expect(await count(svc, Table.NftEvents, `tx_hash IN (${list(altered)})`)).toBe(0);
     });
 
     it('a ripple-mock ledger writes no NFT row', async () => {

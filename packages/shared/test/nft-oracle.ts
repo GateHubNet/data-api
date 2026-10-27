@@ -147,11 +147,14 @@ export function nftOracle(t: ParserTx, native: string): NftOracleResult {
   const result: NftOracleResult = { events: [], skipped: 0 };
   const tx = t.tx as Json;
   const meta = t.meta as Json;
-  if (meta.TransactionResult !== 'tesSUCCESS') return result;
+  // Ruling (final fix wave, I5(a)): a transaction that failed gives one event for each NFTokenOffer its metadata deletes,
+  // an offer_removed with removed_by 'other' (rippled deletes the expired offers a tecEXPIRED NFTokenAcceptOffer met), and
+  // nothing else: of its nodes only those are read.
+  const failed = meta.TransactionResult !== 'tesSUCCESS';
 
   const type: string = tx.TransactionType;
   const sender: string = tx.Account;
-  const nodes: Node[] = ((meta.AffectedNodes ?? []) as Json[]).map((wrapper, pos) => {
+  const affected: Node[] = ((meta.AffectedNodes ?? []) as Json[]).map((wrapper, pos) => {
     const op = Object.keys(wrapper)[0];
     const body = wrapper[op];
     return {
@@ -165,6 +168,7 @@ export function nftOracle(t: ParserTx, native: string): NftOracleResult {
       was: body.PreviousFields,
     };
   });
+  const nodes = failed ? affected.filter((n) => n.type === 'NFTokenOffer' && n.op === 'DeletedNode') : affected;
 
   const pending: Pending[] = [];
   let skipped = 0;
@@ -234,8 +238,8 @@ export function nftOracle(t: ParserTx, native: string): NftOracleResult {
       const row = offerRow(n, 'offer_create', '');
       if (row) push(2, n.pos, row);
     } else if (n.op === 'DeletedNode') {
-      const cancel = type === 'NFTokenCancelOffer';
-      const by = type === 'NFTokenAcceptOffer' ? 'sale' : type === 'NFTokenBurn' ? 'burn' : 'other';
+      const cancel = !failed && type === 'NFTokenCancelOffer';
+      const by = failed ? 'other' : type === 'NFTokenAcceptOffer' ? 'sale' : type === 'NFTokenBurn' ? 'burn' : 'other';
       const row = offerRow(n, cancel ? 'offer_cancel' : 'offer_removed', cancel ? '' : by);
       if (row) push(0, n.pos, row);
     }

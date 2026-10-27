@@ -22,7 +22,14 @@
  *   (`PreviousFields` hold `NextPageMin`), the neighbour of a page split, with tokens that did not change.
  * - `synthetic-mixed-order`: `mint` with two more minted ids (one sorting before, one after the recorded one), a burned id,
  *   a modified URI, a created offer first and a deleted offer last in `AffectedNodes`: every kind of the order rule.
- * - `synthetic-failed-mint`, `synthetic-failed-accept`: recorded transactions with a `tec` result and every node kept.
+ * - `synthetic-failed-mint`, `synthetic-failed-offer-create`: the recorded `mint` and `sell_offer_create` with a `tec` result
+ *   and every node kept (a page that gains a token, a created offer).
+ * - `synthetic-failed-accept`: the recorded `brokered_sale_royalty` with a `tec` result and every node kept but the two offers it
+ *   deletes (its pages still move the NFT).
+ * - `synthetic-tec-expired-accept` (none in the recorded ledgers): the recorded `sale_by_sell_offer` as rippled writes it when
+ *   the sell offer had expired (`fixExpiredNFTokenOfferRemoval`): `tecEXPIRED`, the offer's `Expiration` before the ledger,
+ *   and the nodes such a failure changes: the fee, and the expired offer deleted with its directories and its owner's
+ *   reserve; no page (`test/synthetic-tec-expired-accept.ts`).
  * - `synthetic-mpt-offer`, `synthetic-mpt-mint-offer`, `synthetic-mpt-accept`: an offer, a mint's offer and an
  *   accepted offer priced with an MPT amount.
  * - `synthetic-burn-last-token`: `burn` of the only token of its page, which is deleted with that token in its
@@ -64,6 +71,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { decodeAccountID } from 'ripple-address-codec';
 import { nftOracle, nftOracleRoles } from '../../test/nft-oracle';
+import { expireAcceptedOffer, EXPIRED_ACCEPT_BASE, EXPIRED_AT } from '../../test/synthetic-tec-expired-accept';
 import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { getNetworkProfile } from '../network';
 import { deepFreeze } from '../test-utils/deep-freeze';
@@ -832,10 +840,20 @@ const builders: Record<string, () => Promise<ParserTx>> = {
     variant(await recorded('mint'), (_tx, meta) => {
       meta.TransactionResult = 'tecINSUFFICIENT_RESERVE';
     }),
+  'synthetic-failed-offer-create': async () =>
+    variant(await recorded('sell_offer_create'), (_tx, meta) => {
+      meta.TransactionResult = 'tecINSUFFICIENT_RESERVE';
+    }),
   'synthetic-failed-accept': async () =>
     variant(await recorded('brokered_sale_royalty'), (_tx, meta) => {
       meta.TransactionResult = 'tecOBJECT_NOT_FOUND';
+      // the offers it would have consumed are not deleted: a failed transaction deletes an offer only as rippled's clean-up
+      meta.AffectedNodes = (meta.AffectedNodes as Json[]).filter(
+        (w) => w.DeletedNode?.LedgerEntryType !== 'NFTokenOffer',
+      );
     }),
+  'synthetic-tec-expired-accept': async () =>
+    variant(await recorded(EXPIRED_ACCEPT_BASE), (_tx, meta) => expireAcceptedOffer(meta)),
   'synthetic-mpt-offer': async () =>
     variant(await recorded('sell_offer_create'), (tx, meta) => {
       const amount = { mpt_issuance_id: '0000012FFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47', value: '100' };
@@ -999,13 +1017,51 @@ describe('NftParser: synthetic cases', () => {
     expect(events[5].uri).toBe('697066733A2F2F4E4557');
   });
 
-  it('a transaction that failed gives no event', async () => {
-    // synthetic-failed-mint and synthetic-failed-accept: recorded transactions given a tec result.
-    for (const name of ['synthetic-failed-mint', 'synthetic-failed-accept']) {
+  it('a transaction that failed gives no event of its pages or of an offer it creates (no offer deleted in it)', async () => {
+    // synthetic-failed-mint, synthetic-failed-offer-create and synthetic-failed-accept: recorded transactions given a tec result.
+    for (const name of ['synthetic-failed-mint', 'synthetic-failed-offer-create', 'synthetic-failed-accept']) {
       const t = await synthetic[name]();
       expect(t.meta.TransactionResult).toMatch(/^tec/);
+      const types = nodesOf(t.meta as Json).map(([op, node]) => `${op} ${node.LedgerEntryType}`);
+      expect(types.some((type) => type.endsWith('NFTokenPage') || type === 'CreatedNode NFTokenOffer')).toBe(true);
+      expect(types).not.toContain('DeletedNode NFTokenOffer');
       expect(parse(t)).toEqual({ events: [], skipped: 0 });
     }
+  });
+
+  it('synthetic-tec-expired-accept: the expired offer a tecEXPIRED NFTokenAcceptOffer deletes is removed_by other, and is its only event', async () => {
+    const t = await synthetic['synthetic-tec-expired-accept']();
+    expect(t.meta.TransactionResult).toBe('tecEXPIRED');
+    expect(t.hash).toBe('SYNTHETIC-TEC-EXPIRED-ACCEPT');
+    expect(parse(t)).toEqual({
+      events: [
+        ev(NFTS.soldBySellOffer, 0, 'offer_removed', {
+          account: 'rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz',
+          offer_id: 'D6DBB6452D44459FDA013C79708D2E699EA2340D5444AC1695FF621A80FDFBDE',
+          is_sell_offer: 1,
+          amount: '10',
+          currency: 'XRP',
+          destination: 'rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx',
+          expiration: EXPIRED_AT + 946684800,
+          removed_by: 'other',
+        }),
+      ],
+      skipped: 0,
+    });
+    // the same metadata read as a success is an offer the accept consumed: the result alone makes the removal `other`
+    const succeeded = variant(t, (_tx, meta) => (meta.TransactionResult = 'tesSUCCESS'));
+    expect(eventsOf(succeeded).map((e) => [e.event, e.removed_by])).toEqual([['offer_removed', 'sale']]);
+    // an expired offer priced with an MPT amount is skipped and counted, as in a successful transaction
+    const mpt = variant(t, (_tx, meta) => {
+      const offer = (meta.AffectedNodes as Json[]).find(
+        (w) => w.DeletedNode?.LedgerEntryType === 'NFTokenOffer',
+      ) as Json;
+      offer.DeletedNode.FinalFields.Amount = {
+        mpt_issuance_id: '0000012FFD9EE5DA93AC614B4DB94D7E0FCE415CA51BED47',
+        value: '1',
+      };
+    });
+    expect(parse(mpt)).toEqual({ events: [], skipped: 1 });
   });
 
   it('an MPT amount skips the event and counts it', async () => {

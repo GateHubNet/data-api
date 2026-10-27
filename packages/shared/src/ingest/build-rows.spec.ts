@@ -2,7 +2,10 @@ import BigNumber from 'bignumber.js';
 import { createHash } from 'crypto';
 import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { withMptOffers } from '../../test/synthetic-mpt-offers';
+import { syntheticHash } from '../../test/synthetic-hash';
+import { mptOfferHash, withMptOffers } from '../../test/synthetic-mpt-offers';
+import { EXPIRED_ACCEPT_BASE, withTecExpiredAccept } from '../../test/synthetic-tec-expired-accept';
+import { foldNftEvents } from '../aggregate/nft-state';
 import { NFT_PARSER_VERSION, PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
@@ -1671,6 +1674,69 @@ describe('NFT rows (parser version 5)', () => {
       },
     );
 
+    it('writes the offer a failed transaction deletes (synthetic-tec-expired-accept): one event, its touch and its accounts, no sale, and a fold that only moves its ledgers', () => {
+      // synthetic-tec-expired-accept: hand-made from the recorded sale_by_sell_offer (test/synthetic-tec-expired-accept.ts),
+      // under a hash of its own
+      const base = xrpl(EXPIRED_ACCEPT_BASE);
+      const rows = buildLedgerRows(withTecExpiredAccept(base.raw, base.tx.hash), XRPL);
+      const hash = syntheticHash('synthetic-tec-expired-accept', base.tx.hash);
+      const mine = <T extends { tx_index: number }>(list: T[]): T[] =>
+        list.filter((r) => r.tx_index === base.tx.tx_index);
+      expect(mine(rows.transactions)).toEqual([expect.objectContaining({ hash, result: 'tecEXPIRED' })]);
+
+      const seller = 'rhv9jFwfWfH4Cd1uX4b3ACkdgDKASFz7Dz';
+      const buyer = 'rnKd8CYrXwMoGn4R48onJGLShh1PcrFrTx';
+      const nftId = '00081388EA968E3C54EE59C8FFBAF0944A3B8AD4797AB032EF22952605AD2A91';
+      const events = mine(rows.nftEvents);
+      expect(events).toEqual([
+        expect.objectContaining({
+          nft_id: nftId,
+          tx_hash: hash,
+          tx_type: 'NFTokenAcceptOffer',
+          event_index: 0,
+          event: 'offer_removed',
+          removed_by: 'other',
+          account: seller,
+          offer_id: 'D6DBB6452D44459FDA013C79708D2E699EA2340D5444AC1695FF621A80FDFBDE',
+          amount: '10',
+          amount_f: 10,
+          destination: buyer,
+        }),
+      ]);
+      expect(mine(rows.collectionNftEvents)).toEqual(events);
+      expect(mine(rows.nftSales)).toEqual([]);
+      // the offer's owner and its destination find it; nobody is the issuer of an offer event
+      expect(mine(rows.accountNftEvents).map((r) => [r.account, r.roles, r.actor])).toEqual([
+        [seller, ['offer_owner'], seller],
+        [buyer, ['destination'], seller],
+      ]);
+      expect(mine(rows.nftTouches)).toEqual([
+        {
+          ledger_index: base.raw.header.ledger_index,
+          tx_index: base.tx.tx_index,
+          nft_id: nftId,
+          issuer: events[0].issuer,
+          taxon_key: events[0].taxon_key,
+          serial: events[0].serial,
+        },
+      ]);
+      // what the job folds of it: the NFT's first and last ledger, and no owner, sale or mint
+      const fold = foldNftEvents(events);
+      expect(fold).toMatchObject({
+        first_ledger: base.raw.header.ledger_index,
+        last_ledger: base.raw.header.ledger_index,
+        owner: '',
+        owners: [],
+        sale_count: 0,
+      });
+      expect(fold.minted).toBeUndefined();
+      expect(fold.last_sale).toBeUndefined();
+      // the other transactions of the ledger are as recorded
+      const others = <T extends { tx_index: number }>(list: T[]): T[] =>
+        list.filter((r) => r.tx_index !== base.tx.tx_index);
+      expect(others(rows.nftEvents)).toEqual(others(base.rows.nftEvents));
+    });
+
     it('writes nothing for a ledger without NFT activity', () => {
       for (const { rows } of builtOf(RIPPLE_MOCK)) {
         expect(rows.nftEvents).toEqual([]);
@@ -1695,19 +1761,24 @@ describe('NFT rows (parser version 5)', () => {
   });
 
   describe('diagnostics.nftSkipped', () => {
-    it('counts skipped NFT events in diagnostics.nftSkipped', () => {
+    it('counts skipped NFT events in diagnostics.nftSkipped (synthetic-mpt-offer: the recorded sell and buy offers priced with an MPT amount)', () => {
       const sell = xrpl('sell_offer_create');
       const buy = xrpl('buy_offer_create');
       expect(sell.rows.ledger.ledger_index).toBe(buy.rows.ledger.ledger_index);
       expect(sell.rows.diagnostics.nftSkipped).toBe(0);
 
+      // synthetic-mpt-offer: hand-made from the recorded sell_offer_create (test/synthetic-mpt-offers.ts), under a hash of its own
       const one = buildLedgerRows(withMptOffers(sell.raw, [sell.tx.hash]), XRPL);
+      const altered = mptOfferHash(sell.tx.hash);
+      expect(altered).toMatch(/^[0-9A-F]{64}$/);
+      expect(one.transactions.map((r) => r.hash)).toContain(altered);
+      expect(one.transactions.map((r) => r.hash)).not.toContain(sell.tx.hash);
       expect(one.diagnostics.nftSkipped).toBe(1);
       expect(one.nftEvents).toHaveLength(sell.rows.nftEvents.length - 1);
-      expect(one.nftEvents.some((r) => r.tx_hash === sell.tx.hash)).toBe(false);
+      expect(one.nftEvents.some((r) => r.tx_hash === altered)).toBe(false);
       expect(one.nftTouches.some((r) => r.tx_index === sell.tx.tx_index)).toBe(false);
 
-      // Summed over the transactions of the ledger.
+      // Summed over the transactions of the ledger (synthetic-mpt-offer: the recorded buy_offer_create altered the same way).
       const two = buildLedgerRows(withMptOffers(sell.raw, [sell.tx.hash, buy.tx.hash]), XRPL);
       expect(two.diagnostics.nftSkipped).toBe(2);
       expect(two.nftEvents).toHaveLength(sell.rows.nftEvents.length - 2);
