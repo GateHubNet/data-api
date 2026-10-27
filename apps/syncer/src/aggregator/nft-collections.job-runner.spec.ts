@@ -150,10 +150,34 @@ describe('AggregatorService nft_collections job', () => {
     for (let n = from; n <= to; n++) await tickNo(svc, n);
   };
 
+  /** Lets what a settled promise woke up run. */
+  const flush = (): Promise<void> => jest.advanceTimersByTimeAsync(0);
+
+  /**
+   * Waits for work that must settle although the read of `collectionsBehind` is out and unanswered: when it does not, the test
+   * fails here, by this assertion, and not by the time limit of the test.
+   */
+  async function mustSettle(work: Promise<unknown>): Promise<void> {
+    let settled = false;
+    void work.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    await flush();
+    expect(settled).toBe(true);
+    await work;
+  }
+
   /** A run of the job (every fifth tick) at the instant `ms`: the ticks before it, which skip the job, are at that instant too. */
   const runAt = async (svc: AggregatorService, ms: number): Promise<void> => {
     jest.setSystemTime(ms);
     for (let i = 0; i < NFT_COLLECTIONS_EVERY_TICKS; i++) await svc.tick();
+  };
+
+  /** `runAt`, for a read that is out: each tick must settle without it. */
+  const runAtSettling = async (svc: AggregatorService, ms: number): Promise<void> => {
+    jest.setSystemTime(ms);
+    for (let i = 0; i < NFT_COLLECTIONS_EVERY_TICKS; i++) await mustSettle(svc.tick());
   };
 
   /** The tick a runner on its own is given: the budget of 3 s. */
@@ -520,9 +544,10 @@ describe('AggregatorService nft_collections job', () => {
       expect(gauge()).toEqual([0]);
     });
 
-    it('a halving that does not fit in the budget goes back to the front of the queue, is counted, and starts again at the next run', async () => {
+    it('a halving that does not fit in the budget goes on at the next run where it stopped, and is counted once', async () => {
       behindKeys = collections(0, 59);
       failing.add(0);
+      // every call takes 600 ms, a failing one too: the budget of 1000 ms is two calls, and P is seven levels of halving down
       batchMs = 600;
       const svc = service({ budgetsMs: { nft_collections: 1000 } });
       await tickNo(svc, 0);
@@ -530,17 +555,63 @@ describe('AggregatorService nft_collections job', () => {
       expect(batches()).toEqual([taxa(collections(0, 49)), taxa(collections(0, 24))]);
       expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'nft_collections' }]]);
       expect(logger.error).toHaveBeenCalledWith(
-        expect.stringContaining('a batch is being halved to find the collections that fail on their own'),
+        expect.stringContaining('a batch of 50 collection(s) is halved to find the collections that fail on their own'),
       );
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('nft_collections reached its budget'));
-      // nothing was set aside or lost, and the batch is still at the head of the queue, before 50 to 59
+      // nothing was set aside or lost
       expect(gauge()).toEqual([60]);
 
-      batchMs = 0;
+      // the next run goes on with the next half, not with the whole batch again
       await runAt(svc, NOW_SECONDS * 1000 + 5 * 60_000);
-      expect(batches()[2]).toEqual(taxa(collections(0, 49)));
+      expect(batches().slice(2)).toEqual([taxa(collections(0, 12)), taxa(collections(0, 6))]);
+      expect(errors()).toBe(1);
+    });
+
+    it('finds a collection that fails slowly in a few runs, computes the others, and counts the failure once per halving, not once per run', async () => {
+      behindKeys = collections(0, 59);
+      failing.add(0);
+      batchMs = 600;
+      const svc = service({ budgetsMs: { nft_collections: 1000 } });
+      await tickNo(svc, 0);
+      const counted = [errors()];
+      for (let run = 1; run < 7; run++) {
+        await runAt(svc, NOW_SECONDS * 1000 + run * 5 * 60_000);
+        counted.push(errors());
+      }
+
+      // 14 calls of two a run: the other 59 collections are all computed by the seventh run
       expect(done.flat().sort((a, b) => a - b)).toEqual(taxa(collections(1, 59)));
-      expect(gauge()).toEqual([60, 1]);
+      expect(batches()).toHaveLength(14);
+      // the failure of the batch was counted at the first run only, and P when it was set aside, at the end of the halving
+      expect(counted).toEqual([1, 1, 1, 1, 1, 1, 2]);
+      expect(logger.error).toHaveBeenLastCalledWith(
+        `Aggregator job nft_collections failed for collection ${ISSUER}/0, set aside to be tried again: DB::Exception: memory limit on collection 0`,
+      );
+      // the gauge fell as the halving went on: the batch under way is counted
+      expect(gauge()).toEqual([60, 60, 60, 59, 54, 36, 1]);
+    });
+
+    it('does not take again a collection that the batch it was queued during set aside', async () => {
+      const { job } = runner();
+      behindKeys = collections(0, 2);
+      failing.add(0);
+      // the read of the collections that are behind answers while the batch is in flight, and queues P again
+      const compute = recompute.getMockImplementation() as (...args: unknown[]) => Promise<unknown>;
+      let first = true;
+      recompute.mockImplementation(async (...args: unknown[]) => {
+        if (first) {
+          first = false;
+          job.enqueue([collection(0)]);
+        }
+        return compute(...args);
+      });
+      await job.run(tick());
+
+      // P failed alone once, was set aside, and was not taken again in the same run: the run did not fail
+      expect(batches().filter((b) => b.length === 1 && b[0] === 0)).toHaveLength(1);
+      expect(done).toEqual([[1], [2]]);
+      expect(errors()).toBe(1);
+      expect(job.pending).toBe(1);
     });
   });
 
@@ -553,8 +624,6 @@ describe('AggregatorService nft_collections job', () => {
       );
       return reads;
     }
-    /** Lets what a settled promise woke up run. */
-    const flush = (): Promise<void> => jest.advanceTimersByTimeAsync(0);
     const timeout = new Error('DB::Exception: Timeout exceeded: elapsed 30.001 seconds');
 
     it('does not hold the tick: the jobs after it run, and the queue is worked while the read is out', async () => {
@@ -563,7 +632,7 @@ describe('AggregatorService nft_collections job', () => {
       rebuilt = [collection(9)];
       const after = jest.fn(async () => undefined);
       const svc = service({ extraJobs: [{ name: 'after_nft_collections', run: after }] });
-      await svc.tick();
+      await mustSettle(svc.tick());
 
       // the read is out, and nothing waited for it: the collection nft_state rebuilt was computed, the jobs after went on
       expect(behind).toHaveBeenCalledTimes(1);
@@ -573,7 +642,10 @@ describe('AggregatorService nft_collections job', () => {
       expect(errors()).toBe(0);
 
       // and it is not started again while it is out
-      await ticksUpTo(svc, 1, 10);
+      for (let n = 1; n <= 10; n++) {
+        jest.setSystemTime(NOW_SECONDS * 1000 + n * 60_000);
+        await mustSettle(svc.tick());
+      }
       expect(behind).toHaveBeenCalledTimes(1);
       expect(reads).toHaveLength(1);
     });
@@ -581,7 +653,7 @@ describe('AggregatorService nft_collections job', () => {
     it('is queued when it answers, and computed at the next run', async () => {
       const reads = pendingReads();
       const svc = service();
-      await tickNo(svc, 0);
+      await mustSettle(svc.tick());
       expect(recompute).not.toHaveBeenCalled();
 
       reads[0].resolve(collections(1, 2));
@@ -595,7 +667,7 @@ describe('AggregatorService nft_collections job', () => {
     it('that fails once the tick is over is counted and logged as nft_collections, and is read again only after 5 minutes, then after twice as long up to an hour', async () => {
       const reads = pendingReads();
       const svc = service();
-      await tickNo(svc, 0);
+      await mustSettle(svc.tick());
       expect(errors()).toBe(0);
 
       // the query ran out of its 30 s while the tick went on
@@ -611,10 +683,10 @@ describe('AggregatorService nft_collections job', () => {
       for (const waitMinutes of [5, 10, 20, 40, 60, 60]) {
         const failedAt = Date.now();
         // not a second before the wait is over ...
-        await runAt(svc, failedAt + waitMinutes * 60_000 - 1000);
+        await runAtSettling(svc, failedAt + waitMinutes * 60_000 - 1000);
         expect(behind).toHaveBeenCalledTimes(calls);
         // ... and at the end of it a new read starts, which fails again: counted, and the wait doubles (at most an hour)
-        await runAt(svc, failedAt + waitMinutes * 60_000);
+        await runAtSettling(svc, failedAt + waitMinutes * 60_000);
         expect(behind).toHaveBeenCalledTimes(++calls);
         reads[calls - 1].reject(timeout);
         await flush();
@@ -649,7 +721,7 @@ describe('AggregatorService nft_collections job', () => {
       process.on('unhandledRejection', unhandled);
       try {
         const svc = service();
-        await svc.tick();
+        await mustSettle(svc.tick());
         void svc.stop();
         reads[0].reject(timeout);
         await flush();
@@ -666,7 +738,7 @@ describe('AggregatorService nft_collections job', () => {
     it('that answers once the shutdown has begun is dropped: nothing is queued', async () => {
       const reads = pendingReads();
       const { job, stop } = runner();
-      await job.run(tick());
+      await mustSettle(job.run(tick()));
       stop();
       reads[0].resolve(collections(1, 3));
       await flush();

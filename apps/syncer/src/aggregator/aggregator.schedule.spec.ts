@@ -659,7 +659,13 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     caughtUp();
     world.busy(1000);
     nftWorld.collectionsReadNeverAnswers();
-    await service().tick();
+    let settled = false;
+    const ticking = service().tick();
+    void ticking.then(() => (settled = true));
+    await jest.advanceTimersByTimeAsync(0);
+    // the tick is over although the read has not answered (a tick that waited for it would never be)
+    expect(settled).toBe(true);
+    await ticking;
 
     // nft_collections did not wait for the read, and rates_daily, account_rollups and volume_backfill after it had their sets
     expect(runs()).toEqual(EVERY_JOB);

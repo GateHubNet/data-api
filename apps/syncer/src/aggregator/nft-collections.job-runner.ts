@@ -51,8 +51,24 @@ interface CollectionNode {
   error?: unknown;
   /** Whether a collection that failed alone is found below it. */
   leadsToCollection?: boolean;
-  /** Whether a list below it was not tried (the budget ran out): it is not known yet that it failed for its size. */
-  unfinished?: boolean;
+}
+
+/** The batch of collections the job is computing, and where the halving of a batch that fails has got to. */
+interface CollectionBatch {
+  /** The collections, to tell the same batch when it comes again. */
+  id: string;
+  /** The lists still to compute, the first one next. */
+  todo: CollectionNode[];
+  /** Every list that failed. */
+  failed: CollectionNode[];
+  /** The collections that failed alone: set aside when the batch is done, if the rest of it worked. */
+  suspects: Array<{ node: CollectionNode; error: unknown }>;
+  /** Whether any list of the batch was computed. */
+  succeeded: boolean;
+  /** Whether this is the same batch coming again after every one of its lists failed in the run just before. */
+  repeated: boolean;
+  /** Whether its failure has been counted and logged already (at the end of the run of its first failure). */
+  counted?: boolean;
 }
 
 /**
@@ -86,6 +102,12 @@ export class NftCollectionsJobRunner {
   /** The collections that failed on their own: when to try each again, and the wait after the next failure. */
   private readonly retry = new Map<string, { key: CollectionKey; until: number; delayMs: number }>();
   /**
+   * The batch whose halving did not fit in the budget of a run: the next run goes on with it, from the list it stopped at,
+   * instead of taking its collections again and halving from the whole batch (which, for a failure that takes longer than a
+   * share of the budget, would never get further).
+   */
+  private current?: CollectionBatch;
+  /**
    * The batches (their collections) that failed whole with nothing in them computed, in the run in progress and in the run just
    * before. The same batch coming again in the next run is a repeat: then its collections are the ones that fail.
    */
@@ -97,9 +119,11 @@ export class NftCollectionsJobRunner {
     private readonly fns: NftCollectionsFunctions,
   ) {}
 
-  /** How many collections wait to be computed: the queue and the collections set aside. */
+  /** How many collections wait to be computed: the queue, the batch under way and the collections set aside. */
   get pending(): number {
-    return this.queue.size + this.retry.size;
+    const batch = this.current;
+    const inBatch = batch ? batch.todo.reduce((n, node) => n + node.keys.length, 0) + batch.suspects.length : 0;
+    return this.queue.size + this.retry.size + inBatch;
   }
 
   /**
@@ -196,31 +220,47 @@ export class NftCollectionsJobRunner {
     for (let turn = 0; turn < QUICK_READ_TURNS && this.reading; turn++) await Promise.resolve();
   }
 
-  /** The queue, a batch at a time, until it is empty or a batch could not be finished (the budget, the shutdown). */
+  /**
+   * The batch under way if there is one, then the queue, a batch at a time, until the queue is empty or a batch could not be
+   * finished (the budget, the shutdown).
+   */
   private async drain(tick: AggregatorTick): Promise<void> {
-    while (this.queue.size > 0) {
-      if (!(await this.runBatch(this.take(), tick))) return;
+    for (;;) {
+      let batch = this.current;
+      if (!batch) {
+        const keys = this.take();
+        if (keys.length === 0) return;
+        batch = this.newBatch(keys);
+        this.current = batch;
+      }
+      if (!(await this.runBatch(batch, tick))) return;
     }
   }
 
-  /** Takes the oldest `NFT_COLLECTIONS_BATCH` collections out of the queue. */
+  /**
+   * Takes the oldest `NFT_COLLECTIONS_BATCH` collections out of the queue. One that is set aside is dropped: it was queued again
+   * (an answer of the read, or a rebuild) while it was in a batch that set it aside, and its retry computes it.
+   */
   private take(): CollectionKey[] {
     const batch: CollectionKey[] = [];
     for (const [id, key] of this.queue) {
       if (batch.length >= NFT_COLLECTIONS_BATCH) break;
-      batch.push(key);
       this.queue.delete(id);
+      if (!this.retry.has(id)) batch.push(key);
     }
     return batch;
   }
 
-  /** Puts collections back at the front of the queue, in their order: they were taken for a batch and not tried. */
-  private requeueFirst(keys: readonly CollectionKey[]): void {
-    if (keys.length === 0) return;
-    const rest = [...this.queue.values()];
-    this.queue = new Map();
-    this.enqueue(keys);
-    this.enqueue(rest);
+  private newBatch(keys: CollectionKey[]): CollectionBatch {
+    const id = keys.map(idOf).join(',');
+    return {
+      id,
+      todo: [{ keys }],
+      failed: [],
+      suspects: [],
+      succeeded: false,
+      repeated: this.allFailed.previous.has(id),
+    };
   }
 
   /** Computes a list of collections and writes them (or deletes the ones with no NFT left). */
@@ -245,30 +285,26 @@ export class NftCollectionsJobRunner {
    *  - A list that failed and yet whose halves worked, with no collection found below it, is warned about and counted: it fails
    *    as a whole for its size, and would otherwise leave no trace.
    *
-   * It stops, returning false, when the budget of the job is spent or the shutdown begins: the lists not tried go back to the
-   * front of the queue.
+   * It stops, returning false, when the budget of the job is spent or the shutdown begins: the batch stays as it is (`current`),
+   * and the next run goes on with it from the list it stopped at. A batch that has failed by then is counted and logged once, at
+   * that run (a halving can take many runs, and the failure must not wait for its end to be seen); its end counts the
+   * collections it sets aside, and does not count that failure again.
    */
-  private async runBatch(keys: CollectionKey[], tick: AggregatorTick): Promise<boolean> {
-    const batchId = keys.map(idOf).join(',');
-    const todo: CollectionNode[] = [{ keys }];
-    const failed: CollectionNode[] = [];
-    const suspects: Array<{ node: CollectionNode; error: unknown }> = [];
-    const untried = (): CollectionKey[] => todo.flatMap((node) => node.keys);
-    const aside = (): CollectionKey[] => suspects.map(({ node }) => node.keys[0]);
-    let succeeded = false;
-
+  private async runBatch(batch: CollectionBatch, tick: AggregatorTick): Promise<boolean> {
+    const { todo, failed, suspects } = batch;
     while (todo.length > 0) {
-      if (!this.ctx.mayStartSet(tick, JOB)) break;
+      if (!this.ctx.mayStartSet(tick, JOB)) {
+        this.countDeferred(batch);
+        return false;
+      }
       const node = todo[0];
       try {
         await this.compute(tick, node.keys);
         todo.shift();
-        succeeded = true;
+        batch.succeeded = true;
       } catch (error) {
-        if (this.ctx.closing()) {
-          this.enqueue([...aside(), ...untried()]);
-          throw error;
-        }
+        // (the batch stays as it is: it is the shutdown that stops it)
+        if (this.ctx.closing()) throw error;
         node.error = error;
         failed.push(node);
         todo.shift();
@@ -280,19 +316,15 @@ export class NftCollectionsJobRunner {
           );
         } else {
           suspects.push({ node, error });
-          if (suspects.length > MAX_ISOLATED_COLLECTIONS_PER_BATCH) {
-            this.enqueue([...aside(), ...untried()]);
-            throw failed[0].error;
-          }
+          if (suspects.length > MAX_ISOLATED_COLLECTIONS_PER_BATCH) this.giveUp(batch);
         }
       }
     }
 
-    if (suspects.length > 0 && !succeeded && !this.allFailed.previous.has(batchId)) {
+    if (suspects.length > 0 && !batch.succeeded && !batch.repeated) {
       // the same batch comes again at the next run: then it is a repeat
-      this.allFailed.current.add(batchId);
-      this.enqueue([...aside(), ...untried()]);
-      throw failed[0].error;
+      this.allFailed.current.add(batch.id);
+      this.giveUp(batch);
     }
     for (const { node, error } of suspects) {
       for (let up: CollectionNode | undefined = node; up; up = up.parent) up.leadsToCollection = true;
@@ -300,27 +332,38 @@ export class NftCollectionsJobRunner {
       this.retry.set(idOf(key), { key, until: this.ctx.clock() + NFT_RETRY_MS, delayMs: NFT_RETRY_MS });
       this.ctx.failed(JOB, error, ` for collection ${idOf(key)}, set aside to be tried again`);
     }
-    // a halving cut short by the budget, before it found a collection that fails alone: the failure is counted now, and the batch
-    // is halved again from the start at the next run
-    if (todo.length > 0 && suspects.length === 0 && failed.length > 0) {
-      this.ctx.failed(
-        JOB,
-        failed[0].error,
-        ' (a batch is being halved to find the collections that fail on their own)',
-      );
-    }
-    // the halves of a list that were not tried (the budget ran out) have not shown that it failed for its size
-    for (const node of todo) for (let up = node.parent; up; up = up.parent) up.unfinished = true;
-    // a failure from which nothing led to a collection: the topmost of each such tree
+    // a failure from which nothing led to a collection: the topmost of each such tree (the whole batch is not counted again when
+    // its failure was counted at the run of it)
     for (const node of failed) {
-      if (node.leadsToCollection || node.unfinished || (node.parent && !node.parent.leadsToCollection)) continue;
-      this.ctx.metrics?.aggregatorErrorsTotal.inc({ job: JOB });
+      if (node.leadsToCollection || (node.parent && !node.parent.leadsToCollection)) continue;
+      if (!(batch.counted && node.parent === undefined)) this.ctx.metrics?.aggregatorErrorsTotal.inc({ job: JOB });
       this.ctx.logger.warn(
         `Aggregator job nft_collections: a batch of ${node.keys.length} collection(s) failed as a whole, but its halves were computed: ${describe(node.error)}`,
       );
     }
-    this.requeueFirst(untried());
-    return todo.length === 0;
+    this.current = undefined;
+    return true;
+  }
+
+  /**
+   * Gives up a batch whose failure is not its collections' (see `runBatch`): the collections set aside so far and the ones not
+   * tried go back to the end of the queue, and the error of the batch is the failure of the job.
+   */
+  private giveUp(batch: CollectionBatch): never {
+    this.current = undefined;
+    this.enqueue([...batch.suspects.map(({ node }) => node.keys[0]), ...batch.todo.flatMap((node) => node.keys)]);
+    throw batch.failed[0].error;
+  }
+
+  /** Counts and logs, once, the failure of a batch whose halving goes on at the next run. */
+  private countDeferred(batch: CollectionBatch): void {
+    if (batch.counted || batch.failed.length === 0) return;
+    batch.counted = true;
+    this.ctx.failed(
+      JOB,
+      batch.failed[0].error,
+      ` (a batch of ${batch.failed[0].keys.length} collection(s) is halved to find the collections that fail on their own, it goes on at the next run)`,
+    );
   }
 
   /** The collections that were set aside and whose wait is over, one at a time, under the budget of the job. */
