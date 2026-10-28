@@ -4,6 +4,7 @@ import { Test } from '@nestjs/testing';
 import { CacheService } from '../common/cache.service';
 import { ApiConfig, NETWORK_PROFILE, SHARED_DATABASE } from '../config/api.config';
 import { AccountDomainsService } from './account-domains.service';
+import { DisplayNamesService } from './display-names.service';
 import { DomainTomlsService } from './domain-tomls.service';
 import { NamesAndLabelsService } from './names-and-labels.service';
 import { NAMES_CACHE } from './names-cache';
@@ -32,6 +33,7 @@ class Consumer {
     readonly names: NamesAndLabelsService,
     readonly domains: AccountDomainsService,
     readonly tomls: DomainTomlsService,
+    readonly displayNames: DisplayNamesService,
   ) {}
 }
 
@@ -45,12 +47,13 @@ describe('NamesModule', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
-  it('exports the names and labels, the account domains and the toml directory, and keeps what they read on request in a CacheService of its own', async () => {
+  it('exports the names and labels, the account domains, the toml directory and the display names, and keeps what they read on request in a CacheService of its own', async () => {
     const moduleRef = await Test.createTestingModule({ imports: [FakeCommonModule, ConsumerModule] }).compile();
     const consumer = moduleRef.get(Consumer);
     expect(consumer.names).toBeInstanceOf(NamesAndLabelsService);
     expect(consumer.domains).toBeInstanceOf(AccountDomainsService);
     expect(consumer.tomls).toBeInstanceOf(DomainTomlsService);
+    expect(consumer.displayNames).toBeInstanceOf(DisplayNamesService);
 
     // NAMES_CACHE is not the shared one: the account domains and the toml rows go to it, and nothing of them to the shared cache
     const shared = moduleRef.get(CacheService);
