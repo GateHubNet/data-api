@@ -44,6 +44,7 @@ import { RatesModule } from './exchanges/rates.module';
 import { ExportsModule } from './exports/exports.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
+import { NamesModule } from './names/names.module';
 import { NetworkModule } from './network/network.module';
 import { NftModule } from './nft/nft.module';
 import { PathPaymentsModule } from './path-payments/path-payments.module';
@@ -97,6 +98,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   AmmModule,
   NftModule,
   ExportsModule,
+  NamesModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

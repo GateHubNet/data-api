@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { RatesModule } from '../exchanges/rates.module';
+import { NamesModule } from '../names/names.module';
 import { NftModule } from '../nft/nft.module';
 import { PathPaymentsModule } from '../path-payments/path-payments.module';
 import { AccountAmmController } from './account-amm.controller';
@@ -31,7 +32,6 @@ import { AccountTrustlinesController } from './account-trustlines.controller';
 import { AccountsController } from './accounts.controller';
 import { AccountsService } from './accounts.service';
 import { LiveLedgerService } from './live-ledger.service';
-import { NamesAndLabelsService } from './names-and-labels.service';
 import { TrustLinesService } from './trust-lines.service';
 
 /**
@@ -52,7 +52,7 @@ import { TrustLinesService } from './trust-lines.service';
  * to `controllers` below. `:address` matches one segment only, so these never compete with the lookup.
  */
 @Module({
-  imports: [RatesModule, PathPaymentsModule, NftModule],
+  imports: [RatesModule, PathPaymentsModule, NftModule, NamesModule],
   controllers: [
     AccountsController,
     AccountTransactionsController,
@@ -85,7 +85,6 @@ import { TrustLinesService } from './trust-lines.service';
     AccountDayGroupsService,
     AccountAnalyticsService,
     AccountAmmService,
-    NamesAndLabelsService,
     TrustLinesService,
   ],
 })

@@ -10,11 +10,11 @@ import { setLinkHeader } from '../common/pagination';
 import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { ApiConfig } from '../config/api.config';
+import { NamesAndLabels, NamesAndLabelsService } from '../names/names-and-labels.service';
 import { AccountFlagsService } from './account-flags.service';
 import { ledgerSelector, liveCacheControl } from './account-ledger';
 import { AccountObject } from './account-object';
 import { AccountsService } from './accounts.service';
-import { NamesAndLabels, NamesAndLabelsService } from './names-and-labels.service';
 
 /** The message of both routes when something other than a Ripple 4xx goes wrong (`accounts.js`, `getAccount.js`). */
 const FAILURE = 'unable to get accounts';

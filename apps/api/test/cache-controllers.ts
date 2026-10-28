@@ -3,11 +3,13 @@ import { ModuleRef } from '@nestjs/core';
 import { CacheService } from '../src/common/cache.service';
 import { RippleController } from '../src/common/ripple-controller';
 import { RATES_CACHE } from '../src/exchanges/rates.module';
+import { NAMES_CACHE } from '../src/names/names-cache';
 
 /**
- * A test-only route that empties the app's `CacheService` and the one of the rates computed on read (`RATES_CACHE`, found
- * in the `RatesModule` through the `ModuleRef`), for a suite that changes what the app caches behind its back (the rollup
- * coverage of an account is kept for 60 s; the rates computed on read as well). Like `test-controllers.ts`
+ * A test-only route that empties the app's `CacheService`, the one of the rates computed on read (`RATES_CACHE`, found in the
+ * `RatesModule` through the `ModuleRef`) and the one of the names read on request (`NAMES_CACHE`, of the `NamesModule`), for a
+ * suite that changes what the app caches behind its back (the rollup coverage of an account is kept for 60 s; the rates computed
+ * on read, the account domains and the toml rows as well). Like `test-controllers.ts`
  * this file is imported through the `controllers` callback of `startHarness`, so that its `CacheService` is the one of
  * the app's module registry:
  *
@@ -24,6 +26,7 @@ export class CacheController {
   clear(): { result: string } {
     this.cache.clear();
     this.moduleRef.get<CacheService>(RATES_CACHE, { strict: false }).clear();
+    this.moduleRef.get<CacheService>(NAMES_CACHE, { strict: false }).clear();
     return { result: 'success' };
   }
 }
