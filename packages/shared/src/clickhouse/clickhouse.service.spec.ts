@@ -129,4 +129,20 @@ describe('ClickHouseService', () => {
       clickhouse_settings: { wait_end_of_query: 1 },
     });
   });
+
+  describe('closing the client', () => {
+    it('close() closes the client of the service', async () => {
+      await service.close();
+      expect(client.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes the client when the application shuts down, after every module has been destroyed', async () => {
+      await service.onApplicationShutdown();
+      expect(client.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('has no onModuleDestroy hook: Nest runs that one for the modules in the order they were scanned, so a worker that writes while it stops would find the client closed', () => {
+      expect(service).not.toHaveProperty('onModuleDestroy');
+    });
+  });
 });

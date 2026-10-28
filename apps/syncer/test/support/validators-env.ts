@@ -110,7 +110,7 @@ export async function startMigratedClickHouse(database: string): Promise<Migrate
     config,
     ch,
     stop: async () => {
-      await ch.onModuleDestroy();
+      await ch.close();
       await started.container.stop();
     },
   };

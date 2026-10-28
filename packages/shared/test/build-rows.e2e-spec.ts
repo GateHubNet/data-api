@@ -158,7 +158,7 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     const count = async (table: Table): Promise<number> =>
@@ -286,7 +286,7 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     it('commits the ledger, with the UNLReport sender as the zero account and its tx_json as the node sent it', async () => {

@@ -210,7 +210,7 @@ describe('account_domains from recorded ledgers (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     async function newest(account: string): Promise<Newest | undefined> {

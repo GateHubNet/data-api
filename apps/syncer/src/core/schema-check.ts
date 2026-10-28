@@ -74,3 +74,51 @@ export async function assertValidatorsSchema(
       '(pnpm --filter @gatehub/data-api-shared ch:migrate, or GH_RUN_MIGRATIONS_ON_BOOT=true) and start the syncer again',
   );
 }
+
+/** The migration that adds what the tomls worker reads and writes. */
+export const TOMLS_MIGRATION = '012_display_names.sql';
+
+/** The workers that read and write the tables of `TOMLS_MIGRATION`. */
+export const TOMLS_SCHEMA_WORKERS: ReadonlySet<WorkerName> = new Set<WorkerName>(['tomls']);
+
+/** The tables `TOMLS_MIGRATION` creates. */
+const TOMLS_TABLES: readonly Table[] = [Table.AccountDomains, Table.DomainTomls];
+
+/**
+ * Fails the boot when the tomls worker is enabled and the database lacks the tables of `012_display_names.sql`: without them
+ * its discovery and every pass fail, and a worker that fails at once looks idle, so the failure is said at the start instead.
+ * It runs after the boot-time migrations. A check that cannot be made (ClickHouse unreachable) does not fail the boot: it is
+ * said, and the worker reports the failures of its reads as it always does.
+ */
+export async function assertTomlsSchema(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+): Promise<void> {
+  if (![...enabled].some((name) => TOMLS_SCHEMA_WORKERS.has(name))) return;
+  let rows: { table_name: string }[];
+  try {
+    rows = await ch.query<{ table_name: string }>(
+      `SELECT name AS table_name
+         FROM system.tables
+        WHERE database = currentDatabase() AND name IN {tables:Array(String)}
+        ORDER BY name`,
+      { tables: [...TOMLS_TABLES] },
+    );
+  } catch (err) {
+    logger.warn(
+      `Could not check that ${TOMLS_MIGRATION} is applied (${err instanceof Error ? err.message : String(err)}); ` +
+        'the tomls worker starts without the check',
+    );
+    return;
+  }
+  const present = new Set(rows.map((row) => row.table_name));
+  const missing = TOMLS_TABLES.filter((table) => !present.has(table)).map((table) => `table ${table}`);
+  if (missing.length === 0) return;
+  throw new Error(
+    `The ClickHouse database "${database}" lacks the schema of ${TOMLS_MIGRATION} (${missing.join(', ')}), which ` +
+      'the tomls worker reads and writes: apply the migrations (pnpm --filter @gatehub/data-api-shared ch:migrate, or ' +
+      'GH_RUN_MIGRATIONS_ON_BOOT=true) and start the syncer again',
+  );
+}

@@ -39,6 +39,8 @@ import { quietLogger, TestWeb } from './validators-env';
 
 export interface TomlsApp {
   app: INestApplication;
+  /** The options the worker was given: `options.start` is the live object, so that a test can switch a loop on and call `worker.onApplicationBootstrap()` again. */
+  options: TomlsWorkerOptions;
   discovery: DomainDiscovery;
   checker: TomlChecker;
   worker: TomlsWorker;
@@ -108,6 +110,7 @@ export async function startTomlsApp(o: TomlsAppOptions): Promise<TomlsApp> {
   let closing: Promise<void> | undefined;
   return {
     app,
+    options,
     discovery: app.get(DomainDiscovery),
     checker: app.get(TomlChecker),
     worker: app.get(TomlsWorker),

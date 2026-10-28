@@ -18,7 +18,7 @@ async function onServer<T>(fn: (ch: ClickHouseService) => Promise<T>): Promise<T
   try {
     return await fn(ch);
   } finally {
-    await ch.onModuleDestroy();
+    await ch.close();
   }
 }
 

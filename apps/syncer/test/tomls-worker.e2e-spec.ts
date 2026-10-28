@@ -3,11 +3,14 @@ import {
   ACCOUNT_DOMAINS_SEED_SQL,
   AccountDomainsRow,
   accountDomainVersion,
+  ClickHouseService,
   DOMAIN_PARSER_VERSION,
   STORED_TOMLS_SQL,
   Table,
 } from '@gatehub/data-api-shared';
 import { encodeAccountID } from 'ripple-address-codec';
+import { WorkerName } from '../src/config/syncer.config';
+import { assertTomlsSchema, TOMLS_MIGRATION } from '../src/core/schema-check';
 import { TOML_SCHEDULE_SQL } from '../src/tomls/toml-checker';
 import { TomlsWorkerOptions } from '../src/tomls/tomls.options';
 import { readsOf, resetTomlsMetrics, startTomlsApp, TomlsApp, TomlsAppOptions } from './support/tomls-env';
@@ -477,6 +480,62 @@ describe('the tomls worker (e2e)', () => {
       expect(web.requests).toEqual([]);
     });
 
+    it('puts each of many accounts in exactly one of its 16 buckets: one row for every account with a Domain, none twice', async () => {
+      // 100 more accounts with a Domain, over three domains, each on a state row at or below X; and some that name none
+      const named = Array.from({ length: 100 }, (_, i) => addressOf(5_000 + i));
+      const domainOf = (i: number) => ['seed.example', 'seed-b.example', 'seed-c.example'][i % 3];
+      await db.ch.insert(Table.AccountStates, [
+        ...named.map((account, i) => ({ ...state(account, 100 + (i % 20), hexOf(domainOf(i))), node_index: i % 5 })),
+        ...Array.from({ length: 20 }, (_, i) => state(addressOf(6_000 + i), 101 + i, i % 2 === 0 ? '' : undefined)),
+        ...Array.from({ length: 10 }, (_, i) => state(addressOf(7_000 + i), 101 + i, hexOf('gone.example'), 1)),
+      ]);
+      // the accounts the seed must write (the current Domain of each, in one pass over all of them), by the bucket each falls in
+      const expected = await db.ch.query<{ bucket: number; accounts: string }>(
+        `SELECT bucket, count() AS accounts
+           FROM (SELECT toUInt8(cityHash64(account) % ${ACCOUNT_DOMAINS_SEED_BUCKETS}) AS bucket,
+                        argMax(JSONExtractString(fields, 'Domain'), (ledger_index, tx_index, node_index)) AS current_domain,
+                        argMax(deleted, (ledger_index, tx_index, node_index)) AS gone
+                   FROM ${Table.AccountStates}
+                  WHERE ledger_index <= {X:UInt32}
+                  GROUP BY account, bucket)
+          WHERE current_domain != '' AND gone = 0
+          GROUP BY bucket ORDER BY bucket`,
+        { X },
+      );
+      const total = expected.reduce((sum, row) => sum + Number(row.accounts), 0);
+      expect(total).toBe(101); // the 100 and NAMED
+      // the premise: the accounts fall in many buckets, so that a statement that misses or repeats a bucket shows
+      expect(expected.length).toBeGreaterThanOrEqual(12);
+
+      await db.ch.command(`SYSTEM STOP MERGES ${Table.AccountDomains}`);
+      try {
+        let written = 0;
+        for (let bucket = 0; bucket < ACCOUNT_DOMAINS_SEED_BUCKETS; bucket++) {
+          await db.ch.command(ACCOUNT_DOMAINS_SEED_SQL, { X, bucket });
+          written += Number(expected.find((row) => row.bucket === bucket)?.accounts ?? 0);
+          const [{ rows }] = await db.ch.query<{ rows: string }>(`SELECT count() AS rows FROM ${Table.AccountDomains}`);
+          expect(Number(rows)).toBe(written); // this bucket wrote its accounts and no other bucket's
+        }
+        const [{ rows, accounts }] = await db.ch.query<{ rows: string; accounts: string }>(
+          `SELECT count() AS rows, uniqExact(account) AS accounts FROM ${Table.AccountDomains}`,
+        );
+        expect([Number(rows), Number(accounts)]).toEqual([101, 101]);
+      } finally {
+        await db.ch.command(`SYSTEM START MERGES ${Table.AccountDomains}`);
+      }
+
+      const app = await boot();
+      await app.discovery.discover();
+      // 34, 33 and 33 of the hundred, and NAMED, who names seed.example
+      expect(app.discovery.current).toEqual(
+        new Map([
+          [SEED, 35],
+          ['seed-b.example', 33],
+          ['seed-c.example', 33],
+        ]),
+      );
+    });
+
     it('changes nothing discovery sees when it runs twice, and names nothing anew', async () => {
       const app = await boot();
       await seedAll();
@@ -605,6 +664,40 @@ describe('the tomls worker (e2e)', () => {
     });
   });
 
+  describe('a database without the tables of 012', () => {
+    /** Runs `run` with `table` renamed away, as a database that never had it. */
+    async function without(table: Table, run: () => Promise<void>): Promise<void> {
+      await db.ch.command(`RENAME TABLE ${table} TO ${table}_away`);
+      try {
+        await run();
+      } finally {
+        await db.ch.command(`RENAME TABLE ${table}_away TO ${table}`);
+      }
+    }
+
+    it('is seen by the schema check on the real system.tables, naming the table that is missing', async () => {
+      const warn = jest.fn();
+      await assertTomlsSchema(db.ch, new Set<WorkerName>(['tomls']), db.config.database, { warn });
+
+      await without(Table.DomainTomls, async () => {
+        await expect(
+          assertTomlsSchema(db.ch, new Set<WorkerName>(['tomls']), db.config.database, { warn }),
+        ).rejects.toThrow(`lacks the schema of ${TOMLS_MIGRATION} (table ${Table.DomainTomls})`);
+        // a syncer without the tomls worker is not concerned
+        await assertTomlsSchema(db.ch, new Set<WorkerName>(['ingest']), db.config.database, { warn });
+      });
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('fails the boot of the application, instead of a worker that fails at once and looks idle', async () => {
+      await without(Table.AccountDomains, async () => {
+        await expect(startTomlsApp({ clickhouse: db.config, web })).rejects.toThrow(
+          `lacks the schema of ${TOMLS_MIGRATION} (table ${Table.AccountDomains})`,
+        );
+      });
+    });
+  });
+
   describe('a discovery that fails from the start', () => {
     it('is logged by the name and type of the error, never its message, and no pass claims an empty store', async () => {
       web.serveToml(OK, TOML_PATH, tomlOf([TREASURY]));
@@ -613,14 +706,28 @@ describe('the tomls worker (e2e)', () => {
       const clientErrors = jest.spyOn(console, 'error').mockImplementation(() => undefined);
       const warnings: string[] = [];
       const logger = { log: () => undefined, warn: (line: string) => void warnings.push(line), error: () => undefined };
-      await db.ch.command(`RENAME TABLE ${Table.AccountDomains} TO account_domains_away`);
+      // booted with its loops off (the tables are there, or the boot would fail), so that the table can be taken away
+      // before the first discovery and the check loop watched from its first pass
+      const app = await boot({ worker: { logger } });
       let renamedBack = false;
+      await db.ch.command(`RENAME TABLE ${Table.AccountDomains} TO account_domains_away`);
       try {
-        const app = await boot({ worker: { logger, start: { discovery: true, checks: true } } });
+        // a pass of the check loop reads `ready` once, before it decides whether to run
+        const ready = app.discovery.ready;
+        let checkPasses = 0;
+        Object.defineProperty(app.discovery, 'ready', {
+          get: () => {
+            checkPasses++;
+            return ready;
+          },
+        });
+        app.options.start = Object.assign(app.options.start ?? {}, { discovery: true, checks: true });
+        await app.worker.onApplicationBootstrap();
 
         await waitFor('the failed discovery to be logged', async () => warnings.length > 0 && warnings);
-        // the check loop has made its first pass too (it waited for the discovery): give it the turns it needs
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await waitFor('the first pass of the check loop', async () => checkPasses > 0);
+        // what the pass did with the failed discovery is over by the next turn of the event loop
+        await new Promise((resolve) => setImmediate(resolve));
 
         expect(warnings).toEqual(['Toml discovery: the pass failed: Error (UNKNOWN_TABLE)']);
         expect(warnings.join('\n')).not.toContain('account_domains');
@@ -682,17 +789,38 @@ describe('the tomls worker (e2e)', () => {
       expect(app.discovery.loaded).toBe(false);
     });
 
-    // a stop starts nothing more, waits for the fetches under way and writes what is done: ClickHouse must still be open then
+    // A stop starts nothing more, waits for the fetches under way and writes what is done, so the client of ClickHouse must be
+    // open for that last insert. On a signal nothing closes it (the process exits); when the application is closed, Nest runs the
+    // `onModuleDestroy` hooks of every module first (the worker's stop is one) and the `onApplicationShutdown` hooks after
+    // them (ClickHouseService closes its client in one): the events say which came last.
     it.each([
-      ['on the shutdown signal (the cleanup registered with ShutdownSignals)', (app: TomlsApp) => app.worker.stop()],
-      ['when the application is closed (module destroy)', (app: TomlsApp) => app.stop()],
-    ])('writes what the pass under way has done when it is stopped %s', async (_when, stop) => {
+      [
+        'on the shutdown signal (the cleanup registered with ShutdownSignals)',
+        (app: TomlsApp) => app.worker.stop(),
+        ['insert'],
+      ],
+      ['when the application is closed (module destroy)', (app: TomlsApp) => app.stop(), ['insert', 'close']],
+    ])('writes what the pass under way has done when it is stopped %s', async (_when, stop, events) => {
       web.serveToml(OK, TOML_PATH, tomlOf([TREASURY]));
       web.serve(SLOW, TOML_PATH, WEB_SILENCE);
       await nameDomain(OK);
       await nameDomain(SLOW);
       const app = await boot({ worker: { start: { discovery: false, checks: true } } });
       await app.discovery.discover();
+
+      // when the app writes and when it closes its client of ClickHouse
+      const happened: string[] = [];
+      const service = app.app.get(ClickHouseService);
+      const insert = service.insert.bind(service);
+      jest.spyOn(service, 'insert').mockImplementation(async (table, rows, opts) => {
+        await insert(table, rows, opts);
+        happened.push('insert');
+      });
+      const closeClient = service.raw.close.bind(service.raw);
+      jest.spyOn(service.raw, 'close').mockImplementation(async () => {
+        happened.push('close');
+        await closeClient();
+      });
 
       // the loop's first pass is under way: ok.example is read, slow.example waits for its 500 ms
       await waitFor('the pass to ask for slow.example', async () => fetches(SLOW) > 0);
@@ -705,6 +833,8 @@ describe('the tomls worker (e2e)', () => {
         [OK, 'ok', ''],
         [SLOW, 'failed', 'timeout'],
       ]);
+      // the one insert of the pass (two rows, one batch) is done before the client is closed
+      expect(happened).toEqual(events);
     });
   });
 });

@@ -185,6 +185,6 @@ export async function buildNftAggregates(h: Harness, native = 'XRP'): Promise<vo
       await computeDailyVolumeSet(ch, rates, NO_MARKETS, 'nft_volume', new Date(day * DAY_SECONDS * 1000));
     }
   } finally {
-    await ch.onModuleDestroy();
+    await ch.close();
   }
 }

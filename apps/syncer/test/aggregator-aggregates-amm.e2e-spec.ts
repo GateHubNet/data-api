@@ -116,7 +116,7 @@ describe('AggregatorService after a range-ingest --reprocess from parser 1 to pa
 
   afterAll(async () => {
     await stopAggregators();
-    for (const svc of services) await svc.onModuleDestroy();
+    for (const svc of services) await svc.close();
     await container?.container.stop();
   });
 

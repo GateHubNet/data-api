@@ -1,6 +1,6 @@
 import { ClickHouseService, Table } from '@gatehub/data-api-shared';
 import { WorkerName } from '../config/syncer.config';
-import { assertValidatorsSchema, VALIDATORS_MIGRATION } from './schema-check';
+import { assertTomlsSchema, assertValidatorsSchema, TOMLS_MIGRATION, VALIDATORS_MIGRATION } from './schema-check';
 
 /** The columns of `system.columns` a database has, as `table.column`. */
 const ALL_OF_002 = [
@@ -89,6 +89,61 @@ describe('assertValidatorsSchema', () => {
     const warn = jest.fn();
     await expect(assertValidatorsSchema(ch, workers('validators'), 'xrpl', { warn })).resolves.toBe(undefined);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(VALIDATORS_MIGRATION));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
+  });
+});
+
+/** A database that has the tables, as `system.tables` would list the ones asked for. */
+function tablesOf(...have: string[]) {
+  const query = jest.fn(async (_sql: string, params?: Record<string, unknown>) =>
+    have.filter((table) => (params?.tables as string[]).includes(table)).map((table) => ({ table_name: table })),
+  );
+  return { query, ch: { query } as unknown as Pick<ClickHouseService, 'query'> };
+}
+
+describe('assertTomlsSchema', () => {
+  it('checks nothing when the tomls worker is not enabled', async () => {
+    const db = tablesOf();
+    const warn = jest.fn();
+    await assertTomlsSchema(db.ch, workers('ingest', 'validators', 'aggregator'), 'xrpl', { warn });
+    await assertTomlsSchema(db.ch, workers(), 'xrpl', { warn });
+    expect(db.query).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('passes a database with the two tables of 012, reading system.tables of the database with bound values', async () => {
+    const db = tablesOf(Table.AccountDomains, Table.DomainTomls);
+    await expect(assertTomlsSchema(db.ch, workers('tomls'), 'xrpl', { warn: jest.fn() })).resolves.toBe(undefined);
+    expect(db.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toContain('FROM system.tables');
+    expect(sql).toContain('database = currentDatabase()');
+    expect(params).toEqual({ tables: [Table.AccountDomains, Table.DomainTomls] });
+  });
+
+  it('fails the boot of the tomls worker on a database without 012, naming the migration and both tables', async () => {
+    const check = assertTomlsSchema(tablesOf(Table.Ledgers).ch, workers('tomls', 'ingest'), 'xahau', {
+      warn: jest.fn(),
+    });
+    await expect(check).rejects.toThrow(TOMLS_MIGRATION);
+    expect(TOMLS_MIGRATION).toBe('012_display_names.sql');
+    await expect(check).rejects.toThrow(`table ${Table.AccountDomains}, table ${Table.DomainTomls}`);
+    await expect(check).rejects.toThrow('the tomls worker reads and writes');
+    await expect(check).rejects.toThrow('database "xahau"');
+  });
+
+  it('names exactly the table that is missing', async () => {
+    const check = assertTomlsSchema(tablesOf(Table.AccountDomains).ch, workers('tomls'), 'xrpl', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(`(table ${Table.DomainTomls})`);
+  });
+
+  it('does not fail the boot when the check cannot be made, and says so', async () => {
+    const ch = {
+      query: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:8123')),
+    } as unknown as Pick<ClickHouseService, 'query'>;
+    const warn = jest.fn();
+    await expect(assertTomlsSchema(ch, workers('tomls'), 'xrpl', { warn })).resolves.toBe(undefined);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(TOMLS_MIGRATION));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
   });
 });

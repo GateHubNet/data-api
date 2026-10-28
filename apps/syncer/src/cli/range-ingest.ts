@@ -1113,7 +1113,7 @@ export async function main(argv: string[]): Promise<number> {
     return 1;
   } finally {
     await client?.stop().catch((err: unknown) => logger.warn(`Stopping the node client failed: ${describe(err)}`));
-    await ch.onModuleDestroy().catch((err: unknown) => logger.warn(`Closing ClickHouse failed: ${describe(err)}`));
+    await ch.close().catch((err: unknown) => logger.warn(`Closing ClickHouse failed: ${describe(err)}`));
   }
 }
 

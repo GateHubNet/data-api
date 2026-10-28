@@ -63,7 +63,7 @@ describe('AggregatorService account and market jobs (e2e)', () => {
 
   afterAll(async () => {
     await stopAggregators();
-    for (const svc of services) await svc.onModuleDestroy();
+    for (const svc of services) await svc.close();
     await container?.container.stop();
   });
 

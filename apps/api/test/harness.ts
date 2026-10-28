@@ -321,6 +321,6 @@ async function dropDatabase(database: string, env: Record<string, string>): Prom
   try {
     await service.command('DROP DATABASE IF EXISTS {database:Identifier} SYNC', { database });
   } finally {
-    await service.onModuleDestroy();
+    await service.close();
   }
 }

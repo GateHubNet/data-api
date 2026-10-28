@@ -78,7 +78,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
   try {
     await bootstrap.command('CREATE DATABASE IF NOT EXISTS {database:Identifier}', { database });
   } finally {
-    await bootstrap.onModuleDestroy();
+    await bootstrap.close();
   }
 
   const service = new ClickHouseService({ ...config, database });
@@ -131,7 +131,7 @@ export async function runMigrations(opts: MigrateOptions = {}): Promise<MigrateR
     log(`[migrate] db="${database}" applied=${applied.length} skipped=${skipped.length}`);
     return { applied, skipped };
   } finally {
-    await service.onModuleDestroy();
+    await service.close();
   }
 }
 

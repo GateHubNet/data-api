@@ -390,7 +390,7 @@ async function main() {
       `Done in ${((Date.now() - started) / 1000).toFixed(1)}s: ${written.toLocaleString()} rows in ${LEDGERS.toLocaleString()} ledgers, ${hours.size} hourly stat rows, ${fees.length.toLocaleString()} fee snapshots.`,
     );
   } finally {
-    await ch.onModuleDestroy();
+    await ch.close();
   }
 }
 

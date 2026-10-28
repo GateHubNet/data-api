@@ -74,7 +74,7 @@ describe('the toml store (e2e)', () => {
   });
 
   afterEach(async () => {
-    await ch?.onModuleDestroy();
+    await ch?.close();
   });
 
   const count = async (): Promise<number> =>

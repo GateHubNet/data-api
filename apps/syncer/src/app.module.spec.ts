@@ -68,7 +68,7 @@ async function boot(
       const { FeeStatsPoller } = await import('./fees/fee-stats-poller');
       const { ShutdownSignals } = await import('@gatehub/data-api-shared');
       const { AppModule } = await import('./app.module');
-      const clickhouse = { ping: jest.fn(async () => pingOk), onModuleDestroy: jest.fn() };
+      const clickhouse = { ping: jest.fn(async () => pingOk), onApplicationShutdown: jest.fn() };
       const node = {
         start: jest.fn(),
         stop: jest.fn(async () => undefined),

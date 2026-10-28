@@ -422,7 +422,7 @@ describe('migrations (e2e)', () => {
 
   afterAll(async () => {
     delete process.env.GH_SCHEMA_DIR;
-    await admin?.onModuleDestroy();
+    await admin?.close();
     await ch?.container.stop();
     if (tempSchemaDir) rmSync(tempSchemaDir, { recursive: true, force: true });
   });
@@ -452,7 +452,7 @@ describe('migrations (e2e)', () => {
         expect(tracked.map((r) => r.filename)).toEqual(realFiles());
         tracked.forEach((r) => expect(r.checksum).toMatch(/^[0-9a-f]{64}$/));
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
 
@@ -481,7 +481,7 @@ describe('migrations (e2e)', () => {
         const tables = (await svc.query<{ name: string }>('SHOW TABLES FROM xrpl_testnet')).map((r) => r.name);
         expect(tables).toEqual(expect.arrayContaining(['ledgers', 'transactions']));
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
 
@@ -494,7 +494,7 @@ describe('migrations (e2e)', () => {
       });
 
       afterAll(async () => {
-        await svc?.onModuleDestroy();
+        await svc?.close();
       });
 
       const systemTables = () =>
@@ -894,7 +894,7 @@ describe('migrations (e2e)', () => {
       });
 
       afterAll(async () => {
-        await svc?.onModuleDestroy();
+        await svc?.close();
       });
 
       it.each(tables)('%s: a typed sample row round-trips through the table', async (table) => {
@@ -1171,7 +1171,7 @@ describe('migrations (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     it('(c) refuses to run once an applied file was modified', async () => {
@@ -1298,7 +1298,7 @@ describe('migrations (e2e)', () => {
       } finally {
         if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
         else process.env.GH_SCHEMA_DIR = previousDir;
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
   });
@@ -1425,7 +1425,7 @@ describe('migrations (e2e)', () => {
 
         expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
   });
@@ -1618,7 +1618,7 @@ describe('migrations (e2e)', () => {
         ).toEqual([SAMPLE_ROWS[Table.PathPayments]]);
         expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
   });
@@ -1674,7 +1674,7 @@ describe('migrations (e2e)', () => {
         ]);
         expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
   });
@@ -1794,7 +1794,7 @@ describe('the shared database (e2e)', () => {
   });
 
   afterAll(async () => {
-    await admin?.onModuleDestroy();
+    await admin?.close();
     await ch?.container.stop();
   });
 
@@ -1831,7 +1831,7 @@ describe('the shared database (e2e)', () => {
     });
 
     afterAll(async () => {
-      await svc?.onModuleDestroy();
+      await svc?.close();
     });
 
     it('takes the labels scam, spam and advisory', async () => {
@@ -1937,7 +1937,7 @@ describe('the shared database (e2e)', () => {
         await svc.command(`OPTIMIZE TABLE ${Table.ExportJobs} FINAL`);
         expect(await svc.query(`SELECT id FROM ${Table.ExportJobs}`)).toEqual([{ id: 'b'.repeat(32) }]);
       } finally {
-        await svc.onModuleDestroy();
+        await svc.close();
       }
     });
   });

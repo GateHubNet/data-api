@@ -189,7 +189,7 @@ async function main(): Promise<void> {
       votes = await votedIds(clickhouse);
       events = await enabledEvents(clickhouse);
     } finally {
-      await clickhouse.onModuleDestroy();
+      await clickhouse.close();
     }
   }
 

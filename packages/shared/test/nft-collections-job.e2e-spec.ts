@@ -201,7 +201,7 @@ describe('the nft_collections job (e2e)', () => {
   });
 
   afterAll(async () => {
-    for (const svc of services) await svc.onModuleDestroy();
+    for (const svc of services) await svc.close();
     await container?.container.stop();
   });
 
