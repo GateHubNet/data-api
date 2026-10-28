@@ -95,18 +95,20 @@ export class DomainDiscovery {
   }
 
   /**
-   * One read of `account_domains`. It replaces `current`, adds the domains whose count grew to the named-anew set and sets
-   * `syncer_tomls_discovery_seconds` to the seconds the read took. Rejects when the read fails, and then nothing changes (the
-   * gauge keeps the last read that worked). The number of values that name no domain is logged when above 0.
+   * One read of `account_domains`. It replaces `current` and adds the domains whose count grew to the named-anew set, which
+   * it prunes of the domains no account names any more. The number of values that name no domain is logged when above 0.
+   *
+   * `syncer_tomls_discovery_seconds` is set to the seconds the read took whatever it came to: a read that outgrows its
+   * limits does not get slow, it fails (the time limit, the memory cap, the request timeout), and the alert on the gauge
+   * must see that. Rejects when the read fails, and then `current` and the named-anew set stay as they were.
    */
   async discover(): Promise<void> {
     try {
-      const started = this.now();
-      const rows = await this.ch.query<{ domain_hex: string; accounts: number | string }>(DISCOVERY_SQL);
-      this.prometheus.tomlsDiscoverySeconds.set((this.now() - started) / 1000);
+      const rows = await this.read();
 
       const { domains, dropped } = domainsOf(rows);
       for (const domain of grownDomains(this.domains, domains)) this.anew.add(domain);
+      for (const domain of this.anew) if (!domains.has(domain)) this.anew.delete(domain);
       this.domains = domains;
       if (dropped > 0) this.logger.log(`Discovery dropped ${dropped} Domain value(s) that name no domain`);
     } finally {
@@ -114,7 +116,20 @@ export class DomainDiscovery {
     }
   }
 
-  /** True while more accounts name the domain than at an earlier discovery and it was not `checked()` since. */
+  /** The read of `DISCOVERY_SQL`, its duration in the gauge even when it fails. */
+  private async read(): Promise<{ domain_hex: string; accounts: number | string }[]> {
+    const started = this.now();
+    try {
+      return await this.ch.query<{ domain_hex: string; accounts: number | string }>(DISCOVERY_SQL);
+    } finally {
+      this.prometheus.tomlsDiscoverySeconds.set((this.now() - started) / 1000);
+    }
+  }
+
+  /**
+   * True while more accounts name the domain than at an earlier discovery, it was not `checked()` since and some account
+   * still names it.
+   */
   namedAnew(domain: string): boolean {
     return this.anew.has(domain);
   }

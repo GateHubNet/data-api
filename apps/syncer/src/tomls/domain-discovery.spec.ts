@@ -234,11 +234,23 @@ describe('DomainDiscovery', () => {
     expect(await prometheus.getMetrics()).toMatch(/^syncer_tomls_discovery_seconds 1\.25$/m);
   });
 
-  it('rejects when the read fails, and keeps the domains, the named-anew set and the gauge as they were', async () => {
-    const { ch } = fakeClickHouse(DOMAINS_A, DOMAINS_B, new Error('read failed'), DOMAINS_B);
+  it('records the seconds a read took even when it fails, so that a read that outgrows its limits shows', async () => {
+    const { ch } = fakeClickHouse(DOMAINS_A, new Error('read failed'));
     const prometheus = new PrometheusService();
-    // the reads take 0.5 s, 2 s, then the one that fails
-    const discovery = new DomainDiscovery(ch, prometheus, { now: clockOf(0, 500, 10_000, 12_000, 20_000, 99_000) });
+    // the reads take 2 s, then 79 s before they fail
+    const discovery = new DomainDiscovery(ch, prometheus, { now: clockOf(10_000, 12_000, 20_000, 99_000) });
+    await discovery.discover();
+    expect(await gaugeSeconds(prometheus)).toBe(2);
+
+    await expect(discovery.discover()).rejects.toThrow('read failed');
+
+    expect(await gaugeSeconds(prometheus)).toBe(79);
+  });
+
+  it('rejects when the read fails, and keeps the domains, the named-anew set and the previous map as they were', async () => {
+    const grown = [{ domain_hex: hex('a.example'), accounts: 4 }, ...DOMAINS_B.slice(1)];
+    const { ch } = fakeClickHouse(DOMAINS_A, DOMAINS_B, new Error('read failed'), grown);
+    const discovery = new DomainDiscovery(ch, new PrometheusService());
     await discovery.discover();
     await discovery.discover();
     const before = discovery.current;
@@ -247,14 +259,40 @@ describe('DomainDiscovery', () => {
 
     expect(discovery.current).toBe(before);
     expect(discovery.namedAnew('a.example')).toBe(true);
-    expect(await gaugeSeconds(prometheus)).toBe(2);
+    expect(discovery.namedAnew('c.example')).toBe(true);
 
-    // the previous map is the one before the failure: the same counts name nothing anew
+    // the previous map is the one before the failure (a: 3, b: 1, c: 1), neither gone nor empty: only a grows over it
     discovery.checked('a.example');
     discovery.checked('c.example');
     await discovery.discover();
-    expect(discovery.namedAnew('a.example')).toBe(false);
+    expect(discovery.namedAnew('a.example')).toBe(true);
+    expect(discovery.namedAnew('b.example')).toBe(false);
     expect(discovery.namedAnew('c.example')).toBe(false);
+  });
+
+  it('stops naming a domain anew once no account names it, and names it anew again when one does', async () => {
+    const { ch } = fakeClickHouse(
+      DOMAINS_A,
+      DOMAINS_B,
+      [
+        { domain_hex: hex('b.example'), accounts: 1 },
+        { domain_hex: hex('c.example'), accounts: 1 },
+      ],
+      DOMAINS_B,
+    );
+    const discovery = new DomainDiscovery(ch, new PrometheusService());
+    await discovery.discover();
+    await discovery.discover();
+    expect(discovery.namedAnew('a.example')).toBe(true);
+    expect(discovery.namedAnew('c.example')).toBe(true);
+
+    await discovery.discover(); // nobody names a.example now
+    expect(discovery.namedAnew('a.example')).toBe(false);
+    expect(discovery.namedAnew('c.example')).toBe(true); // still named, not checked
+
+    await discovery.discover(); // a.example is back, with 3 accounts
+    expect(discovery.namedAnew('a.example')).toBe(true);
+    expect(discovery.namedAnew('b.example')).toBe(false);
   });
 
   it('names nothing anew at the first read that works after a start whose first read failed (no previous map yet)', async () => {
