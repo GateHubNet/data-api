@@ -373,6 +373,11 @@ export class SyncerConfig {
   @IntValue({ min: 1 })
   domainFetchTimeoutMs: number = 10000;
 
+  /** `GH_TOML_RECHECK_MS`: when the toml of a domain that was read OK is read again (a failure is checked on its own schedule). */
+  @ConfigValue()
+  @IntValue({ min: 1 })
+  tomlRecheckMs: number = 86_400_000;
+
   /** `GH_AMENDMENTS_CONFIG`: path of the amendment metadata file; empty is the file shipped as `config/amendments/<family>.json`. */
   @ConfigValue()
   @MaybeEmptyText()

@@ -91,6 +91,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       domainVerification: true,
       domainRecheckMs: 21600000,
       domainFetchTimeoutMs: 10000,
+      tomlRecheckMs: 86400000,
       amendmentsConfig: '',
       ledgerFetchTimeoutMs: 120000,
       catchupConcurrency: 4,
@@ -118,6 +119,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       GH_DOMAIN_VERIFICATION: 'false',
       GH_DOMAIN_RECHECK_MS: '3600000',
       GH_DOMAIN_FETCH_TIMEOUT_MS: '5000',
+      GH_TOML_RECHECK_MS: '7200000',
       GH_AMENDMENTS_CONFIG: ' /etc/gatehub/amendments.json ',
       GH_SYNC_START_LEDGER: '1234567',
       GH_LEDGER_FETCH_TIMEOUT_MS: '45000',
@@ -142,6 +144,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       domainVerification: false,
       domainRecheckMs: 3600000,
       domainFetchTimeoutMs: 5000,
+      tomlRecheckMs: 7200000,
       amendmentsConfig: '/etc/gatehub/amendments.json',
       syncStartLedger: 1234567,
       ledgerFetchTimeoutMs: 45000,
@@ -174,6 +177,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       GH_DOMAIN_VERIFICATION: '',
       GH_DOMAIN_RECHECK_MS: ' ',
       GH_DOMAIN_FETCH_TIMEOUT_MS: '',
+      GH_TOML_RECHECK_MS: ' ',
       GH_AMENDMENTS_CONFIG: '',
       GH_ACCOUNT_ROLLUP_MIN_ROWS: '', // what the compose files pass when XRPL_ACCOUNT_ROLLUP_MIN_ROWS is empty
     });
@@ -188,6 +192,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       domainVerification: true,
       domainRecheckMs: 21600000,
       domainFetchTimeoutMs: 10000,
+      tomlRecheckMs: 86400000,
       amendmentsConfig: '',
       accountRollupMinRows: 1000000,
     });
@@ -209,6 +214,7 @@ describe('SyncerConfig (GH_* environment)', () => {
     'GH_UNL_REFRESH_MS',
     'GH_DOMAIN_RECHECK_MS',
     'GH_DOMAIN_FETCH_TIMEOUT_MS',
+    'GH_TOML_RECHECK_MS',
     'GH_HTTP_API_PORT',
     'GH_METRICZ_PORT',
     'GH_SYNC_START_LEDGER',

@@ -191,19 +191,19 @@ interface ManifestAnswer {
 
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 /** The name of whatever was thrown (`TypeError`; `string` for a thrown text), `Error` when it is not a plain name. */
-function errorNameOf(err: unknown): string {
+export function errorNameOf(err: unknown): string {
   const name = err instanceof Error ? err.name : typeof err;
   return SIMPLE_NAME.test(name) ? name : 'Error';
 }
 /** `a x2, b` for the counts of a map: the keys sorted, a count above 1 shown. */
-const countsText = (counts: Map<string, number>): string =>
+export const countsText = (counts: Map<string, number>): string =>
   [...counts]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([name, n]) => (n > 1 ? `${name} x${n}` : name))
     .join(', ');
 const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
-/** A text from a manifest, safe for a log line: quoted, control characters escaped, cut short. */
-const quoted = (text: string): string => JSON.stringify(text.length > 128 ? `${text.slice(0, 128)}...` : text);
+/** A text from a manifest or the ledger, safe for a log line: quoted, control characters escaped, cut short. */
+export const quoted = (text: string): string => JSON.stringify(text.length > 128 ? `${text.slice(0, 128)}...` : text);
 const pairOf = (key: string, domain: string): string => `${key}\u0000${domain}`;
 
 /** The row to store for the answer of the node to `manifest` for `key`, `undefined` for an answer that cannot be used. */

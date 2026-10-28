@@ -222,6 +222,18 @@ describe('nextTomlRow', () => {
       expect(afterS(row)).toBe(TOML_BACKOFF_MAX_S);
     });
 
+    it('stops counting at 65,535, the most the failures column holds, instead of wrapping to 0 (which would read as ok)', () => {
+      const atTheTop = stored({ status: 'failed', reason: 'too_large', failures: 65_534 });
+      expect(nextTomlRow(atTheTop, failure('too_large'), NOW, RECHECK_MS).failures).toBe(65_535);
+
+      const full = stored({ status: 'failed', reason: 'timeout', failures: 65_535 });
+      for (const check of [failure('timeout'), failure('http_status', 404), failure('toml_invalid')]) {
+        const row = nextTomlRow(full, check, NOW, RECHECK_MS);
+        expect(row.failures).toBe(65_535);
+        expect(row.status).toBe('failed');
+      }
+    });
+
     it('counts the transient failures before it', () => {
       const prev = stored({ status: 'failed', reason: 'timeout', failures: 2 });
       const row = nextTomlRow(prev, failure('toml_invalid'), NOW, RECHECK_MS);
@@ -234,6 +246,13 @@ describe('nextTomlRow', () => {
       const row = nextTomlRow(undefined, failure('domain_invalid'), NOW, 1_000);
       expect(afterS(row)).toBe(DAY);
     });
+  });
+
+  it('stores the domain of a failed row in lower case', () => {
+    for (const reason of ['timeout', 'too_large'] as const) {
+      const row = nextTomlRow(undefined, { ...failure(reason), domain: 'NorthPeak.Example' }, NOW, RECHECK_MS);
+      expect(row.domain).toBe(DOMAIN);
+    }
   });
 
   it('gives a whole second to next_check_at', () => {

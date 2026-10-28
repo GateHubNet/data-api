@@ -7,6 +7,8 @@ export const TOML_TRANSIENT_RECHECK_S = 3_600;
 /** A definite failure is checked again after a day, then twice as long after each one in a row, up to this: 7 days. */
 export const TOML_BACKOFF_MAX_S = 604_800;
 const TOML_BACKOFF_FIRST_S = 86_400;
+/** The most `failures` counts: the column holds a UInt16. */
+const TOML_FAILURES_MAX = 65_535;
 
 /** Why a check of a domain's toml failed: the safe fetcher's reasons, or a file that arrived and is not TOML. */
 export type TomlFailure = FetchFailure | 'toml_invalid';
@@ -29,7 +31,7 @@ export type TomlCheck = { domain: string; tomlUrl: string } & (
  * - **a definite failure** (anything else, `toml_invalid` too): empty content, `fetched_at` null, the next check after 1, 2,
  *   4, then 7 days of failures in a row.
  *
- * `failures` counts the failed checks in a row, 0 exactly when the newest row is `ok`.
+ * `failures` counts the failed checks in a row (up to 65,535, the most its column holds), 0 exactly when the newest row is `ok`.
  */
 export function nextTomlRow(
   prev: DomainTomlsRow | undefined,
@@ -41,7 +43,8 @@ export function nextTomlRow(
     return okTomlRow({ domain: check.domain, tomlUrl: check.tomlUrl, content: check.content, now, recheckMs });
   }
 
-  const failures = (prev?.failures ?? 0) + 1;
+  // the column is a UInt16: 65,536 would wrap to 0, which reads as ok (`failures` is 0 exactly when the newest row is `ok`)
+  const failures = Math.min((prev?.failures ?? 0) + 1, TOML_FAILURES_MAX);
   // a whole second: `next_check_at` is a `DateTime`
   const after = (seconds: number) => Math.ceil(now + seconds);
   const failed = {
