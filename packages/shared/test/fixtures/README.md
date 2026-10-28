@@ -10,6 +10,7 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/recorded/`               | Mainnet ledgers recorded from a public node (see below).                                |
 | `xrpl/amm/`                    | Mainnet AMM transactions, one ledger per named case (see below).                        |
 | `xrpl/account-state/`          | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
+| `xrpl/account-domains/`        | Mainnet AccountSets that set and change a Domain (see "Account domains").               |
 | `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                    |
 | `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).           |
 | `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                          |
@@ -33,7 +34,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/` and `xahau/uritoken/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/` and `xrpl/account-domains/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -335,6 +336,54 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endp
 
 **Not found** (within those ledgers and the account histories): `uritoken_mint_with_offer`. No `URITokenMint` carries an `Amount` (or a `Destination`) among the 14,211 mints seen in the 32,927 ledgers read, nor among the mints in the `account_tx` of the marketplace accounts looked at. Task 5 needs a `synthetic-…` transaction for `uritoken_mint_with_offer`.
 **`uritoken_buy_above_ask` is the fallback the plan allows**: no `URITokenBuy` paid more than the ask in any buy met, so the case is a buy at exactly the ask (its note says so).
+
+### Account domains (`xrpl/account-domains/`)
+
+For the display names: the `account_domains` rows the parser writes (version 6) are checked against what the networks wrote
+(`test/account-domains.e2e-spec.ts`). Recorded 2026-10-27 from `wss://s2.ripple.com` (validated head 107943170) with `--txs`: 2 ledgers
+(329 KB gzipped, largest 281 KB), each whole. `manifest.json` has the cases as `{ledger, hash, type, note}`; the note names the account and
+the Domain before and after.
+
+The hashes came from a throwaway scan (not in the repository). It walked back from the validated head one expanded `ledger` request at a time
+(one request in flight, 75 ms between requests, a throttle answer waited out), at most 5,000 ledgers per network, and kept the first transaction
+that fitted each case. `failed_tx_with_domain` was not searched: it and the two Payments below are read in place.
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `accountset_sets_domain` | 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `rM8kmmnz5qPMg7V3r7SHYXgDGvm8PhzLvM` sets `lumitrades.io` (none before) |
+| `accountset_changes_domain` | 107938710 | `894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98` | `rPo76joT4HVuvyomAqnapVcX3tYvmAxhHT` changes a Domain of 32 bytes to another one of 32 bytes |
+
+**Read in place** (the ledgers are in other directories and not copied; the test loads them by index):
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `payment_to_account_with_domain` (`xrpl/recorded/`) | 107671317 | `B244AF0904E22964D1AF89FD213AA8502ADF65FEED95185C6B62961DB9DC2571` | A `Payment` to `rf82s1CDagppvM6ATqc1nSrL6GackzHJrm`, Domain `test.com` (its root is node 0, only `Balance` changes) |
+| `failed_tx_with_domain` (`xrpl/amm/`) | 106084525 | `1531CDE5DA5E231C54B7A697FD7C1C51151E8AB2AD3D1FB5174A571E63C2E280` | `Payment` `tecPATH_PARTIAL` by `r428GGG2F1vgn9BUtuiCiEmzrh5oAnhyj7`, Domain `https://www.smartplaystudio.com/`: the fee and `Sequence` change the root |
+| `failed_tx_with_domain` (`xrpl/path-payments/`) | 37999837 | `B28614B78D1D90B34081F74B6EC5A76C6898800A51B69ED19280F918B743A50E` | `OfferCreate` `tecUNFUNDED_OFFER` by `r9Gps6fB9YLuZ87rWx7M9TgLAGK2zsz5s6`, Domain `mduo13.com`; the last of three transactions of the ledger that change its root |
+| `payment_by_account_with_domain` (`xahau/recorded/`) | 26540187 | `00F5098EB67BB5E4E177D02F5B492DD5BF215DFF1677EFBD8542394387EBC866` | A `Payment` **sent by** `rGsbGtyrXoPSocAWcngrQZqm6AaQmocw5B` (the sender's root: `Sequence` is in its `PreviousFields`), Domain `n1737.bisdaknode1701-1750.ovh`; the recipient `rHktfGUbjqzU4GsYCMc1pDjdHXb5CJamto` has no Domain |
+| (14 AccountSets) (`xahau/recorded/`) | 26540711 | | 14 successful `AccountSet`s (Evernode hosts) whose sender's root has a Domain before and another one after; each of the 14 accounts has one root node with a Domain in the ledger |
+
+**Not found** within the 5,000 ledgers of the scan, so not recorded (the hand-made unit cases of `account-domains.parser.spec.ts` stay their only test):
+
+- XRPL, ledgers 107942518 down to 107937519: `accountset_clears_domain`, `account_delete_with_domain`. `failed_tx_with_domain` was not searched (read in place).
+- Xahau, `wss://xahau.network`, ledgers 26839869 down to 26834870: `accountset_sets_domain` (an `AccountSet` that gives a root its first Domain) and `import`.
+  Nothing of Xahau was recorded, so there is no `xahau/account-domains/`. In those ledgers the scan met about 11,000 `AccountSet`s that change a Domain
+  and none that gives a root its first one. The node answers `tooBusy` above 50,000 units per 10 s and above 10,000,000 per 3,600 s, and an expanded ledger
+  of a busy stretch (150 to 200 transactions, 1.5 MB of JSON and more) used 10,000 units or more, so the scan took about a day; it was resumed from its saved
+  position after lost connections, and the ledgers it read are contiguous. The earlier scan of `xahau/recorded` (5,000 ledgers, 2026-10-15) found no `Import` either.
+
+Facts the ledgers show:
+
+- A Domain set for the first time and one set again to the same value look alike in the metadata (`FinalFields.Domain`, no `Domain` in `PreviousFields`).
+  `accountset_sets_domain` was therefore checked with `account_info` at ledger 107939674: the root has no `Domain` there.
+- `meta.TransactionIndex` is not the position of a transaction in the expanded `ledger.transactions` (the sets case is at position 235 of the list and has
+  `TransactionIndex` 27). The `version` of a row uses `meta.TransactionIndex`.
+- A Domain is whatever bytes the account wrote: a name (`lumitrades.io`), a URL, 32 bytes that are not text, or, from Evernode hosts, 86 ASCII characters that start with
+  `ED` (a public key spelled in hex, with a suffix). The row holds the hex as served.
+- Ledger 107938710 also holds a failed transaction of a sender with a Domain: `Payment` `tecUNFUNDED_PAYMENT`, `08F632249F15DD5E93003EC0EE2BDE1BAFC670E8478732C8956A1C5833A33E2A`, by `rhygvDyyaNSfPdsN8UzGTENBYXJyxy4eKw`, Domain `ladycafe.io`.
+
+The e2e test writes the ledgers of each network through `LedgerWriter` (the new directory and the read-in-place ledgers) into a real ClickHouse and compares the newest row of
+each account (`argMax(…, version)`, never row counts: the table collapses by account) with the Domain in the metadata and the `version` of its transaction. It deletes the newest case ledger (`deleteLedgerRange`) and writes it again: the rows come back the same.
 
 ### XRPL Testnet (`xrpl-testnet/recorded/`)
 
