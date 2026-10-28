@@ -74,6 +74,8 @@ class FakeStore {
   failInserts?: Error;
   failFrom = 1;
   private inserts = 0;
+  /** While set, the read of the stored rows of the domains to check waits for it. */
+  holdStoredRead?: Promise<void>;
 
   readonly query = jest.fn(async (sql: string, params?: Record<string, unknown>): Promise<unknown[]> => {
     if (sql === TOML_SCHEDULE_SQL) {
@@ -86,6 +88,7 @@ class FakeStore {
       }));
     }
     if (sql === STORED_TOMLS_SQL) {
+      await this.holdStoredRead;
       const wanted = (params as { domains: string[] }).domains;
       return wanted.flatMap((domain) => {
         const row = this.rows.get(domain);
@@ -417,6 +420,38 @@ describe('TomlChecker', () => {
       expect(t.discovery.namedAnew('a.example')).toBe(true);
     });
 
+    it('leaves the mark of a domain named anew after its fetch started, whether the row waits or the fetch is under way', async () => {
+      const t = setup({ domains: ['c.example', 'a.example', 'b.example'] });
+      // c.example is named anew when the pass starts; a.example and b.example are not (yet)
+      t.discovery.anew.add('c.example');
+      const gates = new Map<string, ReturnType<typeof deferred<{ url: string; body: Buffer }>>>();
+      t.fetcher.get.mockImplementation((u: string) => {
+        const gate = deferred<{ url: string; body: Buffer }>();
+        gates.set(u, gate);
+        return gate.promise;
+      });
+
+      const pass = t.checker.pass();
+      await until('three fetches', () => gates.size === 3);
+      // a.example is answered and its row waits in the buffer; b.example is still under way
+      gates.get(url('a.example'))?.resolve(served(FILE));
+      await settle();
+      // a discovery now finds more accounts naming a.example and b.example
+      t.discovery.anew.add('a.example');
+      t.discovery.anew.add('b.example');
+      gates.get(url('b.example'))?.resolve(served(FILE));
+      gates.get(url('c.example'))?.resolve(served(FILE));
+
+      expect(await pass).toBe(3);
+
+      // the marks of the checks that began after them stay; the one that was there at the start goes
+      expect(t.discovery.checked).toHaveBeenCalledTimes(1);
+      expect(t.discovery.checked).toHaveBeenCalledWith('c.example');
+      expect(t.discovery.namedAnew('c.example')).toBe(false);
+      expect(t.discovery.namedAnew('a.example')).toBe(true);
+      expect(t.discovery.namedAnew('b.example')).toBe(true);
+    });
+
     it('reads the newest row of the domains it checks only, by one bound array', async () => {
       const t = setup({ domains: names(450) });
       t.ch.seed('stored.example', { ageS: 5 * DAY });
@@ -429,7 +464,7 @@ describe('TomlChecker', () => {
       expect((reads[1][1] as { domains: string[] }).domains).toEqual(names(300));
     });
 
-    it('reads no row when nothing is due, and logs and counts the pass all the same', async () => {
+    it('reads no row when nothing is due, logs no line for the idle pass, and sets the gauges all the same', async () => {
       const t = setup({ domains: ['a.example'] });
       t.ch.seed('a.example');
 
@@ -438,9 +473,26 @@ describe('TomlChecker', () => {
       expect(t.ch.query.mock.calls.map((c) => c[0])).toEqual([TOML_SCHEDULE_SQL]);
       expect(t.fetcher.get).not.toHaveBeenCalled();
       expect(t.ch.insert).not.toHaveBeenCalled();
-      expect(t.logger.log).toHaveBeenCalledWith('Tomls: 0 checked (0 ok, 0 failed), 0 still due');
+      // nothing checked and nothing still due: an idle minute is not logged
+      expect(t.logger.log).not.toHaveBeenCalled();
       expect(t.gauge()).toEqual({ ok: 1, failed: 0, unchecked: 0 });
       expect(t.metrics.tomlsDue.set).toHaveBeenLastCalledWith(0);
+    });
+
+    it('logs the line again as soon as a domain is due, and again when the pass checked it', async () => {
+      const t = setup({ domains: ['a.example'] });
+      t.ch.seed('a.example');
+      await t.checker.pass();
+      expect(t.logger.log).not.toHaveBeenCalled();
+
+      t.clock.ms += 2 * DAY * 1000;
+      t.serveAll();
+      await t.checker.pass();
+      expect(t.logger.log).toHaveBeenCalledTimes(1);
+      expect(t.logger.log).toHaveBeenLastCalledWith('Tomls: 1 checked (1 ok, 0 failed), 0 still due');
+
+      await t.checker.pass();
+      expect(t.logger.log).toHaveBeenCalledTimes(1);
     });
 
     it('checks nothing before a discovery has found a domain', async () => {
@@ -876,7 +928,9 @@ describe('TomlChecker', () => {
 
     it('logs no body, principal or email', async () => {
       const t = setup({ domains: ['file.example', 'down.example', 'blocked.example', 'odd.example'] });
-      const withPrincipal = `${FILE}\n[[PRINCIPALS]]\nname = "Mara"\nemail = "mara@northpeak.example"\n`;
+      const withPrincipal =
+        `${FILE}\n[[PRINCIPALS]]\nname = "Mara"\nemail = "mara@northpeak.example"\n` +
+        'twitter = "@maranorthpeak"\ngithub = "maranorthpeak"\n';
       t.serve({
         [url('file.example')]: withPrincipal,
         [url('down.example')]: new SafeFetchError('http_status', 'HTTP 503: secret-body', {
@@ -902,11 +956,14 @@ describe('TomlChecker', () => {
         expect(line).not.toContain('secret-body');
         expect(line).not.toContain('@');
       }
-      // the principal's name is stored, and nothing of the email
+      // the principal's name is stored, and nothing of the email or the social handles
       const stored = JSON.stringify(t.ch.written);
       expect(stored).toContain('Mara');
       expect(stored.toLowerCase()).not.toContain('mara@');
       expect(stored.toLowerCase()).not.toContain('email');
+      expect(stored.toLowerCase()).not.toContain('twitter');
+      expect(stored.toLowerCase()).not.toContain('github');
+      expect(stored.toLowerCase()).not.toContain('maranorthpeak');
       expect(stored).not.toContain('secret-body');
     });
   });
@@ -948,6 +1005,62 @@ describe('TomlChecker', () => {
 
       // the 21 that were not started are still due
       expect(t.gauge()).toEqual({ ok: 19, failed: 0, unchecked: 21 });
+    });
+
+    it('writes a batch of 50 and then the rest when the fetches under way fill the buffer after it', async () => {
+      const t = setup({ domains: names(100) });
+      const gates: ReturnType<typeof deferred<{ url: string; body: Buffer }>>[] = [];
+      t.fetcher.get.mockImplementation(() => {
+        const gate = deferred<{ url: string; body: Buffer }>();
+        gates.push(gate);
+        return gate.promise;
+      });
+      const pass = t.checker.pass();
+      // 40 are answered one by one, each lane starting another: 56 fetches started, 40 rows waiting, 16 under way
+      let done = 0;
+      while (done < 40) {
+        await until('a fetch under way', () => gates.length > done);
+        gates[done++].resolve(served(FILE));
+        await settle();
+      }
+      expect(gates.length).toBe(56);
+      expect(t.ch.insert).not.toHaveBeenCalled();
+
+      const stopping = t.checker.stop();
+      // the 16 under way finish: the tenth makes the 50, the other six wait for the end
+      gates.slice(40).forEach((g) => g.resolve(served(FILE)));
+      await stopping;
+
+      expect(await pass).toBe(56);
+      expect(t.fetcher.get).toHaveBeenCalledTimes(56);
+      expect(t.ch.batches.map((batch) => batch.length)).toEqual([50, 6]);
+      expect(t.outcomes()).toHaveLength(56);
+      expect(t.logger.log).toHaveBeenCalledWith('Tomls: 56 checked (56 ok, 0 failed), 44 still due');
+    });
+
+    it('starts no fetch when it is called while the stored rows are being read, and logs what is still due', async () => {
+      const t = setup({ domains: names(5) });
+      const read = deferred<void>();
+      t.ch.holdStoredRead = read.promise;
+      t.serveAll();
+
+      const pass = t.checker.pass();
+      await until('the read of the stored rows', () => t.ch.query.mock.calls.length === 2);
+      let stopped = false;
+      const stopping = t.checker.stop().then(() => (stopped = true));
+      await settle();
+      expect(stopped).toBe(false);
+
+      read.resolve();
+      await stopping;
+
+      expect(await pass).toBe(0);
+      expect(t.fetcher.get).not.toHaveBeenCalled();
+      expect(t.ch.insert).not.toHaveBeenCalled();
+      // nothing was checked and five are still due: the line is logged, the gauges show them
+      expect(t.logger.log).toHaveBeenCalledWith('Tomls: 0 checked (0 ok, 0 failed), 5 still due');
+      expect(t.gauge()).toEqual({ ok: 0, failed: 0, unchecked: 5 });
+      expect(t.metrics.tomlsDue.set).toHaveBeenLastCalledWith(5);
     });
 
     it('makes no pass once stopped', async () => {

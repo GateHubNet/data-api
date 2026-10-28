@@ -13,7 +13,7 @@ import {
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { NETWORK_PROFILE, SyncerConfig } from '../config/syncer.config';
 import { PrometheusService } from '../modules/prometheus/prometheus.service';
-import { countsText, errorNameOf, quoted } from '../validators/domain-checker';
+import { countsText, errorNameOf, inLanes, quoted } from '../validators/domain-checker';
 import { SafeFetcher, SafeFetchError, tomlFetchLimits } from '../validators/safe-fetch';
 import { DomainDiscovery } from './domain-discovery';
 import { nextTomlRow, TomlCheck, TomlFailure } from './toml-row';
@@ -108,6 +108,8 @@ interface PassState {
   /** Rows written, and how many of them are `ok`. */
   written: number;
   ok: number;
+  /** The domains that were named anew when their fetch started: only these are `checked()` when their row is written. */
+  namedAnew: Set<string>;
   /** The domains whose fetch was blocked by the address policy. */
   blocked: string[];
   /** The checks that failed with an error neither the fetcher's nor the parser's, by the name of the error. */
@@ -125,12 +127,14 @@ interface PassState {
  *    and status code; anything else that is thrown is a `connect_error`;
  * 4. makes the row with `nextTomlRow` and writes the rows in batches of 50 and at the end of the pass.
  *
- * A row is stamped with the time its file arrived. It is counted (`syncer_tomls_checks_total{outcome}`) and its domain is
- * `checked()` for the discovery when it is written, so a check that could not be written is still due and still named anew.
+ * A row is stamped with the time its file arrived. It is counted (`syncer_tomls_checks_total{outcome}`) when it is written,
+ * and so is the discovery told its domain is `checked()` if the domain was named anew when its fetch started: a check that
+ * could not be written is still due and still named anew, and so is a domain named anew since its fetch started.
  *
  * **Logs** name a domain (quoted and cut like D1's: it comes from the ledger), a reason and a status code; never a body, an error
- * object, a principal or a desc. One `log` line ends every pass. The fetches blocked by the address policy are one `warn` a
- * pass, with the count and at most five domains; the errors that are not the fetcher's are one `warn` a pass, with their names.
+ * object, a principal or a desc. One `log` line ends a pass that checked something or has something still due (an idle pass
+ * logs none). The fetches blocked by the address policy are one `warn` a pass, with the count and at most five domains; the
+ * errors that are not the fetcher's are one `warn` a pass, with their names.
  *
  * `stop()` starts no fetch, waits for the fetches under way and writes what is done. A pass that fails to write rejects: the
  * rows not written are due again next time.
@@ -182,6 +186,7 @@ export class TomlChecker {
       buffer: [],
       written: 0,
       ok: 0,
+      namedAnew: new Set(),
       blocked: [],
       unexpected: new Map(),
     };
@@ -202,10 +207,12 @@ export class TomlChecker {
       this.reportUnexpected(state.unexpected);
       this.setGauges(discovered, state, due.length);
     }
-    const failed = state.written - state.ok;
-    this.logger.log(
-      `Tomls: ${state.written} checked (${state.ok} ok, ${failed} failed), ${due.length - state.written} still due`,
-    );
+    // a pass that checked nothing with nothing due is a minute of an idle worker: no line
+    const stillDue = due.length - state.written;
+    if (state.written > 0 || stillDue > 0) {
+      const failed = state.written - state.ok;
+      this.logger.log(`Tomls: ${state.written} checked (${state.ok} ok, ${failed} failed), ${stillDue} still due`);
+    }
     return state.written;
   }
 
@@ -226,10 +233,17 @@ export class TomlChecker {
   private async check(due: string[], state: PassState): Promise<void> {
     if (due.length === 0 || this.stopped) return;
     state.stored = await readStoredTomls(this.ch, due);
-    await this.inLanes(due, async (domain) => {
-      state.buffer.push(await this.checkDomain(domain, state));
-      if (state.buffer.length >= TOML_WRITE_BATCH) await this.write(state.buffer.splice(0, TOML_WRITE_BATCH), state);
-    });
+    await inLanes(
+      due,
+      TOML_FETCH_CONCURRENCY,
+      () => this.stopped,
+      async (domain) => {
+        // as of the start of the fetch: an account that names the domain after it must find the mark still there
+        if (this.discovery.namedAnew(domain)) state.namedAnew.add(domain);
+        state.buffer.push(await this.checkDomain(domain, state));
+        if (state.buffer.length >= TOML_WRITE_BATCH) await this.write(state.buffer.splice(0, TOML_WRITE_BATCH), state);
+      },
+    );
     // also after stop(): what is done is written
     if (state.buffer.length > 0) await this.write(state.buffer.splice(0), state);
   }
@@ -263,7 +277,10 @@ export class TomlChecker {
     return { reason: 'connect_error' };
   }
 
-  /** Inserts the rows, then counts them, brings the schedule up to date and tells the discovery they are checked. */
+  /**
+   * Inserts the rows, then counts them, brings the schedule up to date and tells the discovery that the domains it had named
+   * anew when their fetch started are checked (a domain named anew since is still to be checked).
+   */
   private async write(rows: DomainTomlsRow[], state: PassState): Promise<void> {
     await this.ch.insert(Table.DomainTomls, rows);
     for (const row of rows) {
@@ -273,31 +290,10 @@ export class TomlChecker {
         failures: row.failures,
       });
       this.metrics.tomlsChecksTotal.inc({ outcome: row.status === 'ok' ? 'ok' : row.reason });
-      this.discovery.checked(row.domain);
+      if (state.namedAnew.delete(row.domain)) this.discovery.checked(row.domain);
     }
     state.written += rows.length;
     state.ok += rows.filter((row) => row.status === 'ok').length;
-  }
-
-  /**
-   * Runs `fn` over the items, at most 16 at a time, none started once the checker is stopped. When one fails the others that
-   * are on their way are waited for, no more are started, and the first failure is thrown.
-   */
-  private async inLanes<T>(items: readonly T[], fn: (item: T) => Promise<void>): Promise<void> {
-    let next = 0;
-    let failure: { error: unknown } | undefined;
-    const lane = async (): Promise<void> => {
-      while (!this.stopped && failure === undefined && next < items.length) {
-        const item = items[next++];
-        try {
-          await fn(item);
-        } catch (error) {
-          failure ??= { error };
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(TOML_FETCH_CONCURRENCY, items.length) }, lane));
-    if (failure !== undefined) throw failure.error;
   }
 
   // -- what is shown --------------------------------------------------------------------------------------------------

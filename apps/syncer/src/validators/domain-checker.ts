@@ -398,25 +398,30 @@ export class DomainChecker {
     let failures = 0;
     let firstFailure = '';
     const answeredWithError = new Map<string, number>();
-    await this.inLanes(keys, async (key) => {
-      try {
-        const answer = await this.node.request<ManifestAnswer>(
-          { command: 'manifest', public_key: key },
-          { timeoutMs: MANIFEST_LOOKUP_TIMEOUT_MS, retries: 0 },
-        );
-        const row = manifestRowOf(key, answer);
-        if (row !== undefined) rows.push(row);
-      } catch (err) {
-        if (isRippledError(err)) {
-          // the node's own answer (it does not know the key, it is busy): counted by its error code
-          const code = rippledCodeOf(err);
-          answeredWithError.set(code, (answeredWithError.get(code) ?? 0) + 1);
-          return;
+    await inLanes(
+      keys,
+      DOMAIN_FETCH_CONCURRENCY,
+      () => this.stopped,
+      async (key) => {
+        try {
+          const answer = await this.node.request<ManifestAnswer>(
+            { command: 'manifest', public_key: key },
+            { timeoutMs: MANIFEST_LOOKUP_TIMEOUT_MS, retries: 0 },
+          );
+          const row = manifestRowOf(key, answer);
+          if (row !== undefined) rows.push(row);
+        } catch (err) {
+          if (isRippledError(err)) {
+            // the node's own answer (it does not know the key, it is busy): counted by its error code
+            const code = rippledCodeOf(err);
+            answeredWithError.set(code, (answeredWithError.get(code) ?? 0) + 1);
+            return;
+          }
+          failures += 1;
+          firstFailure ||= describeError(err);
         }
-        failures += 1;
-        firstFailure ||= describeError(err);
-      }
-    });
+      },
+    );
     if (this.stopped) return;
     if (rows.length > 0) await this.ch.insert(Table.ValidatorManifests, rows);
     const problems: string[] = [];
@@ -535,10 +540,15 @@ export class DomainChecker {
       if (group === undefined) byDomain.set(c.domain.toLowerCase(), [c]);
       else group.push(c);
     }
-    await this.inLanes([...byDomain.values()], async (group) => {
-      const written = await this.checkDomain(group, stored);
-      checked += written;
-    });
+    await inLanes(
+      [...byDomain.values()],
+      DOMAIN_FETCH_CONCURRENCY,
+      () => this.stopped,
+      async (group) => {
+        const written = await this.checkDomain(group, stored);
+        checked += written;
+      },
+    );
     return checked;
   }
 
@@ -607,27 +617,33 @@ export class DomainChecker {
     const why = row.reason === '' ? '' : ` (${row.reason}${row.status_code === 0 ? '' : ` ${row.status_code}`})`;
     this.logger.log(`Validator ${row.validation_public_key}: domain ${quoted(row.domain)} is ${row.status}${why}`);
   }
+}
 
-  /**
-   * Runs `fn` over the items, at most 4 at a time, none started once the checker is stopped. When one fails the others that
-   * are on their way are waited for, no more are started, and the first failure is thrown.
-   */
-  private async inLanes<T>(items: readonly T[], fn: (item: T) => Promise<void>): Promise<void> {
-    let next = 0;
-    let failure: { error: unknown } | undefined;
-    const lane = async (): Promise<void> => {
-      while (!this.stopped && failure === undefined && next < items.length) {
-        const item = items[next++];
-        try {
-          await fn(item);
-        } catch (error) {
-          failure ??= { error };
-        }
+/**
+ * Runs `fn` over the items, at most `lanes` at a time, none started once `stopped()` is true. When one fails the others that
+ * are on their way are waited for, no more are started, and the first failure is thrown. Shared by the checkers of the
+ * validators' domains and of the tomls, so that the stop and first-failure rules are one.
+ */
+export async function inLanes<T>(
+  items: readonly T[],
+  lanes: number,
+  stopped: () => boolean,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let failure: { error: unknown } | undefined;
+  const lane = async (): Promise<void> => {
+    while (!stopped() && failure === undefined && next < items.length) {
+      const item = items[next++];
+      try {
+        await fn(item);
+      } catch (error) {
+        failure ??= { error };
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(DOMAIN_FETCH_CONCURRENCY, items.length) }, lane));
-    if (failure !== undefined) throw failure.error;
-  }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(lanes, items.length) }, lane));
+  if (failure !== undefined) throw failure.error;
 }
 
 /** Whether the raw manifest (hex) verifies and is the key's own, and the domain it names. */
