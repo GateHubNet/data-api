@@ -226,6 +226,62 @@ describe('PrometheusService', () => {
     });
   });
 
+  it('exposes the metrics of the tomls worker, by name, type and label set', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    // A labelled metric shows no series until a label set was observed, so each is observed once.
+    service.tomlsChecksTotal.inc({ outcome: 'ok' });
+    service.tomlsChecksTotal.inc({ outcome: 'timeout' }, 2);
+    service.tomlsDomains.set({ status: 'ok' }, 120);
+    service.tomlsDomains.set({ status: 'failed' }, 8);
+    service.tomlsDomains.set({ status: 'unchecked' }, 300);
+    service.tomlsDue.set(250);
+    service.tomlsDiscoverySeconds.set(1.5);
+
+    const text = await service.getMetrics();
+    expect(text).toMatch(/^# TYPE syncer_tomls_checks_total counter$/m);
+    expect(text).toMatch(/^syncer_tomls_checks_total\{outcome="ok"\} 1$/m);
+    expect(text).toMatch(/^syncer_tomls_checks_total\{outcome="timeout"\} 2$/m);
+    expect(text).toMatch(/^# TYPE syncer_tomls_domains gauge$/m);
+    expect(text).toMatch(/^syncer_tomls_domains\{status="ok"\} 120$/m);
+    expect(text).toMatch(/^syncer_tomls_domains\{status="failed"\} 8$/m);
+    expect(text).toMatch(/^syncer_tomls_domains\{status="unchecked"\} 300$/m);
+    expect(text).toMatch(/^# TYPE syncer_tomls_due gauge$/m);
+    expect(text).toMatch(/^syncer_tomls_due 250$/m);
+    expect(text).toMatch(/^# TYPE syncer_tomls_discovery_seconds gauge$/m);
+    expect(text).toMatch(/^syncer_tomls_discovery_seconds 1\.5$/m);
+  });
+
+  describe('the declaration of the tomls metrics', () => {
+    // [name, type, declared label names (exactly), HELP text (spec section 4.5)]
+    const declared: [string, string, string[], string][] = [
+      [
+        'syncer_tomls_checks_total',
+        'counter',
+        ['outcome'],
+        'Checks of the toml of a domain, by outcome (ok, or the reason code of the failure).',
+      ],
+      [
+        'syncer_tomls_domains',
+        'gauge',
+        ['status'],
+        'Domains accounts name, by the status of their toml after the last pass (ok, failed, unchecked).',
+      ],
+      ['syncer_tomls_due', 'gauge', [], 'Domains due and not checked yet at the end of the last pass.'],
+      ['syncer_tomls_discovery_seconds', 'gauge', [], 'Duration of the last discovery read, in seconds.'],
+    ];
+
+    it.each(declared)('%s is a %s with the labels %j and its help text', async (name, type, labelNames, help) => {
+      const service = new PrometheusService();
+      // prom-client types `labelNames` only on the constructor options; the metric object keeps it.
+      const metric = service.registry.getSingleMetric(name) as unknown as { labelNames: string[] } | undefined;
+      expect(metric?.labelNames).toEqual(labelNames);
+      const exposed = (await service.registry.getMetricsAsJSON()).find((m) => m.name === name);
+      expect(exposed).toMatchObject({ type, help });
+      expect(await service.getMetrics()).toContain(`# HELP ${name} ${help}\n# TYPE ${name} ${type}\n`);
+    });
+  });
+
   it('shares one registry between instances, as the main app and the metricz app each create one', async () => {
     const worker = new PrometheusService();
     const scraper = new PrometheusService();

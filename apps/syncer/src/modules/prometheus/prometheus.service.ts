@@ -209,6 +209,28 @@ const metrics = {
     labelNames: ['table'],
     registers: [registry],
   }),
+  tomlsChecksTotal: new Counter({
+    name: 'syncer_tomls_checks_total',
+    help: 'Checks of the toml of a domain, by outcome (ok, or the reason code of the failure).',
+    labelNames: ['outcome'],
+    registers: [registry],
+  }),
+  tomlsDomains: new Gauge({
+    name: 'syncer_tomls_domains',
+    help: 'Domains accounts name, by the status of their toml after the last pass (ok, failed, unchecked).',
+    labelNames: ['status'],
+    registers: [registry],
+  }),
+  tomlsDue: new Gauge({
+    name: 'syncer_tomls_due',
+    help: 'Domains due and not checked yet at the end of the last pass.',
+    registers: [registry],
+  }),
+  tomlsDiscoverySeconds: new Gauge({
+    name: 'syncer_tomls_discovery_seconds',
+    help: 'Duration of the last discovery read, in seconds.',
+    registers: [registry],
+  }),
 };
 
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
@@ -261,6 +283,10 @@ export class PrometheusService implements OnModuleInit {
   readonly validatorsRoundsLagLedgers = metrics.validatorsRoundsLagLedgers;
   readonly amendmentsWithoutMetadata = metrics.amendmentsWithoutMetadata;
   readonly validatorValidationsFlushedTotal = metrics.validatorValidationsFlushedTotal;
+  readonly tomlsChecksTotal = metrics.tomlsChecksTotal;
+  readonly tomlsDomains = metrics.tomlsDomains;
+  readonly tomlsDue = metrics.tomlsDue;
+  readonly tomlsDiscoverySeconds = metrics.tomlsDiscoverySeconds;
 
   onModuleInit(): void {
     // Registering the same default metrics twice throws, and both apps initialise a service.
