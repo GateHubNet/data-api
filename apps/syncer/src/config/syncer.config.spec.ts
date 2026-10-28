@@ -64,6 +64,9 @@ describe('enabledWorkers', () => {
     expect(enabledWorkers(cfg('ingest,validations,fee_stats,aggregator,validators'))).toEqual(
       new Set(['ingest', 'validations', 'fee_stats', 'aggregator', 'validators']),
     );
+    expect(enabledWorkers(cfg('ingest,validations,fee_stats,aggregator,validators,tomls'))).toEqual(
+      new Set(['ingest', 'validations', 'fee_stats', 'aggregator', 'validators', 'tomls']),
+    );
     expect(enabledWorkers(cfg(' ingest , fee_stats,,ingest '))).toEqual(new Set(['ingest', 'fee_stats']));
     expect(() => enabledWorkers(cfg('ingest,x'))).toThrow('Unknown worker "x"');
     expect(() => enabledWorkers(cfg('INGEST'))).toThrow('Unknown worker "INGEST"');
@@ -83,7 +86,7 @@ describe('SyncerConfig (GH_* environment)', () => {
       network: 'xrpl',
       nodeEndpoints: 'wss://s2.ripple.com',
       validationEndpoints: 'wss://s2.ripple.com',
-      workers: 'ingest,validations,fee_stats,aggregator,validators',
+      workers: 'ingest,validations,fee_stats,aggregator,validators,tomls',
       unlPublishers: getNetworkProfile('xrpl').defaultUnlPublishers,
       unlValidators: '',
       unlThreshold: 0,

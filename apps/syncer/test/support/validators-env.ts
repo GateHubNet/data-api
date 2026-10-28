@@ -36,7 +36,9 @@ import { TEST_TLS } from './tls';
  *                                      lists and (for the domain checks) the `.well-known` TOML files of validators are
  *                                      routes of it: `web.serveJson('unl.example', '/', body)`,
  *                                      `web.serveToml('a.example', '/.well-known/xrp-ledger.toml', text)`. Serving the
- *                                      same host and path again swaps the answer; a route no one serves is a 404.
+ *                                      same host and path again swaps the answer; a route no one serves is a 404; a route
+ *                                      that answers `WEB_SILENCE` (or a function that gives it) never answers: the
+ *                                      request stays open until the client gives up, `web.stop()` ends it.
  *                                      `web.requests` logs what was asked, `web.fetchOptions()` is the
  *                                      `SafeFetchTestOptions` that send every `*.example` host to it (the certificate is
  *                                      still verified, against `TEST_TLS.cert`, for the host asked: only the hosts in the
@@ -123,6 +125,9 @@ export interface WebReply {
   body: string;
 }
 
+/** What a route answers to send no reply at all: the request stays open until the client gives up (its timeout). */
+export const WEB_SILENCE = Symbol('WEB_SILENCE');
+
 export interface WebRequest {
   host: string;
   path: string;
@@ -134,8 +139,15 @@ export interface TestWeb {
   readonly port: number;
   /** Every request received, in order. */
   readonly requests: WebRequest[];
-  /** `GET https://<host><path>` answers `reply` (a function is called for each request). Replaces an earlier answer of the same host and path. */
-  serve(host: string, path: string, reply: WebReply | ((request: WebRequest) => WebReply)): void;
+  /**
+   * `GET https://<host><path>` answers `reply` (a function is called for each request); `WEB_SILENCE`, or a function that gives it,
+   * is no answer at all. Replaces an earlier answer of the same host and path.
+   */
+  serve(
+    host: string,
+    path: string,
+    reply: WebReply | typeof WEB_SILENCE | ((request: WebRequest) => WebReply | typeof WEB_SILENCE),
+  ): void;
   /** `serve` with a JSON body. */
   serveJson(host: string, path: string, body: unknown): void;
   /** `serve` with a TOML text (`content-type: application/toml`), by default status 200. */
@@ -148,7 +160,10 @@ export interface TestWeb {
 }
 
 export async function startTestWeb(): Promise<TestWeb> {
-  const routes = new Map<string, WebReply | ((request: WebRequest) => WebReply)>();
+  const routes = new Map<
+    string,
+    WebReply | typeof WEB_SILENCE | ((request: WebRequest) => WebReply | typeof WEB_SILENCE)
+  >();
   const requests: WebRequest[] = [];
   const server: Server = createServer({ key: TEST_TLS.key, cert: TEST_TLS.cert }, (req, res) => {
     const request: WebRequest = {
@@ -158,8 +173,10 @@ export async function startTestWeb(): Promise<TestWeb> {
     };
     requests.push(request);
     const route = routes.get(`${request.host}${request.path}`);
-    const reply: WebReply =
+    const reply =
       route === undefined ? { status: 404, body: 'not found' } : typeof route === 'function' ? route(request) : route;
+    // no reply: the socket stays open, and the fetcher's own timeout ends the request
+    if (reply === WEB_SILENCE) return;
     res.writeHead(reply.status ?? 200, { 'content-type': 'application/json', ...reply.headers });
     res.end(reply.body);
   });

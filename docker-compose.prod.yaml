@@ -156,6 +156,7 @@ x-syncer-env: &syncer-env
   GH_DOMAIN_VERIFICATION:
   GH_DOMAIN_RECHECK_MS:
   GH_DOMAIN_FETCH_TIMEOUT_MS:
+  GH_TOML_RECHECK_MS:
   GH_RUN_MIGRATIONS_ON_BOOT: 'false' # owned by the migrate-<network> job
   GH_HTTP_API_PORT: 3002
   GH_METRICZ_PORT: 3000

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
-import { WORKER_NAMES, WorkerName } from './config/syncer.config';
+import { enabledWorkers, SyncerConfig, WORKER_NAMES, WorkerName } from './config/syncer.config';
+import { TomlsModule } from './tomls/tomls.module';
 import { ValidatorsModule } from './validators/validators.module';
 import {
   needsNodeClient,
@@ -25,6 +26,23 @@ describe('the worker registry', () => {
     ]);
   });
 
+  it('registers the tomls worker, the last one', () => {
+    expect(WORKER_MODULES.tomls).toBe(TomlsModule);
+    expect(WORKER_NAMES[WORKER_NAMES.length - 1]).toBe('tomls');
+    expect(selectWorkerModules(new Set<WorkerName>(['tomls']), WORKER_MODULES, logger())).toEqual([TomlsModule]);
+    // after the validators, in worker order whatever the order of the set
+    expect(selectWorkerModules(new Set<WorkerName>(['tomls', 'validators']), WORKER_MODULES, logger())).toEqual([
+      ValidatorsModule,
+      TomlsModule,
+    ]);
+  });
+
+  it('runs all six workers by default: GH_WORKERS defaults to the names in order, tomls last', () => {
+    expect(WORKER_NAMES.join(',')).toBe('ingest,validations,fee_stats,aggregator,validators,tomls');
+    expect(new SyncerConfig().workers).toBe('ingest,validations,fee_stats,aggregator,validators,tomls');
+    expect(enabledWorkers(new SyncerConfig())).toEqual(new Set(WORKER_NAMES));
+  });
+
   it('has a module for every worker', () => {
     for (const name of WORKER_NAMES) expect(WORKER_MODULES[name]).toBeDefined();
   });
@@ -33,6 +51,14 @@ describe('the worker registry', () => {
     expect(NODE_CLIENT_WORKERS.has('validators')).toBe(true);
     expect(needsNodeClient(new Set<WorkerName>(['validators']))).toBe(true);
     expect(needsNodeClient(new Set<WorkerName>(['aggregator', 'validations']))).toBe(false);
+  });
+
+  it('makes no node client for a syncer of only the tomls worker: it reads ClickHouse and the web', () => {
+    expect(NODE_CLIENT_WORKERS.has('tomls')).toBe(false);
+    expect(needsNodeClient(new Set<WorkerName>(['tomls']))).toBe(false);
+    expect(needsNodeClient(new Set<WorkerName>(['tomls', 'aggregator']))).toBe(false);
+    // the set of the workers that read from the node is the same as before the tomls worker
+    expect([...NODE_CLIENT_WORKERS].sort()).toEqual(['fee_stats', 'ingest', 'validators']);
   });
 });
 

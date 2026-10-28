@@ -95,6 +95,15 @@ export class DomainDiscovery {
   }
 
   /**
+   * Whether a read has worked since the start. `current` is empty both before that and when no account names a domain, and
+   * only the second is a store that is known to be empty: a worker whose reads all fail must not report the first as
+   * the second.
+   */
+  get loaded(): boolean {
+    return this.domains !== undefined;
+  }
+
+  /**
    * One read of `account_domains`. It replaces `current` and adds the domains whose count grew to the named-anew set, which
    * it prunes of the domains no account names any more. The number of values that name no domain is logged when above 0.
    *

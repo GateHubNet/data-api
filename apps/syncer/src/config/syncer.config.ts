@@ -30,7 +30,7 @@ import { IsIn, IsString, registerDecorator, ValidateIf, ValidationArguments } fr
  * that file is missing, so containers (NODE_ENV=production) must set `GH_ENV` to any value.
  */
 
-export const WORKER_NAMES = ['ingest', 'validations', 'fee_stats', 'aggregator', 'validators'] as const;
+export const WORKER_NAMES = ['ingest', 'validations', 'fee_stats', 'aggregator', 'validators', 'tomls'] as const;
 export type WorkerName = (typeof WORKER_NAMES)[number];
 
 /** `ledgerFetchTimeoutMs` -> `GH_LEDGER_FETCH_TIMEOUT_MS`: the name the ConfigService reads. */
@@ -265,7 +265,7 @@ export class SyncerConfig {
   @IsEndpointList()
   validationEndpoints!: string;
 
-  /** `GH_WORKERS`: comma separated subset of `ingest,validations,fee_stats,aggregator,validators`; empty runs none of them. */
+  /** `GH_WORKERS`: comma separated subset of `ingest,validations,fee_stats,aggregator,validators,tomls`; empty runs none of them. */
   @ConfigValue()
   @Transform(({ obj, key }) => (typeof obj[key] === 'string' ? obj[key].trim() : defaultOf(key)))
   @ValidateIf((config: SyncerConfig) => config.workers !== '')
@@ -358,7 +358,7 @@ export class SyncerConfig {
   @IntValue({ min: 1 })
   unlRefreshMs: number = 300000;
 
-  /** `GH_DOMAIN_VERIFICATION`: `false` skips the checks of validator domains (a host without outbound HTTPS). */
+  /** `GH_DOMAIN_VERIFICATION`: `false` skips the checks of validator domains and the reading of the tomls of account domains (a host without outbound HTTPS). */
   @ConfigValue()
   @BoolValue()
   domainVerification: boolean = true;
@@ -368,7 +368,7 @@ export class SyncerConfig {
   @IntValue({ min: 1 })
   domainRecheckMs: number = 21600000;
 
-  /** `GH_DOMAIN_FETCH_TIMEOUT_MS`: overall timeout of one TOML fetch, redirects included. */
+  /** `GH_DOMAIN_FETCH_TIMEOUT_MS`: overall timeout of one TOML fetch, redirects included (the validators and the tomls worker). */
   @ConfigValue()
   @IntValue({ min: 1 })
   domainFetchTimeoutMs: number = 10000;

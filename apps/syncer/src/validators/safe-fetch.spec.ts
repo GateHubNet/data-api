@@ -14,6 +14,7 @@ import {
   SafeFetchError,
   SafeFetchTestOptions,
   tomlFetchLimits,
+  tomlsUserAgent,
   UNL_FETCH_LIMITS,
   validatorsUserAgent,
 } from './safe-fetch';
@@ -381,6 +382,11 @@ describe('the limits and tokens', () => {
     expect(typeof SAFE_FETCHER).toBe('symbol');
     expect(String(SAFE_FETCHER)).toBe('Symbol(SAFE_FETCHER)');
     expect(validatorsUserAgent()).toBe(`gatehub-data-api/${SYNCER_VERSION} (validators)`);
+  });
+
+  it('has a user agent of the tomls worker of its own, of the same version', () => {
+    expect(tomlsUserAgent()).toBe(`gatehub-data-api/${SYNCER_VERSION} (tomls)`);
+    expect(tomlsUserAgent()).not.toBe(validatorsUserAgent());
   });
 
   it('describes a failure by its reason', () => {

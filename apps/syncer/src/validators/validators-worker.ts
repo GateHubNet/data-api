@@ -1,6 +1,7 @@
 import { ClickHouseService, ShutdownSignals } from '@gatehub/data-api-shared';
 import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import { SyncerConfig } from '../config/syncer.config';
+import { Loop, PassLoop } from '../core/pass-loop';
 import { ComputeLoop } from './compute-loop';
 import { describeError } from './describe-error';
 import { DomainChecker } from './domain-checker';
@@ -20,61 +21,6 @@ export const STATE_POLL_INTERVAL_MS = 60_000;
 
 /** The wait between the end of a feature poll (and the gauge update after it) and the start of the next (spec 2.3). */
 export const FEATURE_POLL_INTERVAL_MS = 600_000;
-
-/** A loop of the worker: it ends its timers on `stop()` and resolves when what it had under way is over. */
-interface Loop {
-  stop(): Promise<void>;
-}
-
-/**
- * Calls `pass` at once, and again `everyMs` after each call ended, never two at a time. A pass that rejects is logged (its
- * message only) and the next one is made on time. `stop()` ends the timer, stops what `pass` runs (`end`) and waits for
- * the pass under way.
- */
-class PassLoop implements Loop {
-  private timer?: NodeJS.Timeout;
-  private running?: Promise<void>;
-  private stopped = false;
-
-  constructor(
-    private readonly name: string,
-    private readonly pass: () => Promise<unknown>,
-    private readonly end: () => Promise<void>,
-    private readonly everyMs: number,
-    private readonly logger: Pick<Logger, 'warn'>,
-  ) {}
-
-  start(): void {
-    this.schedule(0);
-  }
-
-  async stop(): Promise<void> {
-    this.stopped = true;
-    if (this.timer !== undefined) clearTimeout(this.timer);
-    this.timer = undefined;
-    await Promise.all([this.end(), this.running]);
-  }
-
-  private schedule(delayMs: number): void {
-    if (this.stopped) return;
-    this.timer = setTimeout(() => {
-      this.timer = undefined;
-      this.running = this.run().finally(() => {
-        this.running = undefined;
-      });
-    }, delayMs);
-  }
-
-  private async run(): Promise<void> {
-    try {
-      await this.pass();
-    } catch (err) {
-      if (!this.stopped)
-        this.logger.warn(`${this.name}: the pass failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    this.schedule(this.everyMs);
-  }
-}
 
 /**
  * The `validators` worker (spec 2): the loops that keep the validators and amendments data current. It does the work in

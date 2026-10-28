@@ -307,6 +307,32 @@ describe('DomainDiscovery', () => {
     for (const domain of ['a.example', 'b.example', 'c.example']) expect(discovery.namedAnew(domain)).toBe(false);
   });
 
+  describe('loaded', () => {
+    it('is false before a read that worked, whatever came of the reads that did not', async () => {
+      const { ch } = fakeClickHouse(new Error('read failed'), new Error('read failed again'));
+      const discovery = new DomainDiscovery(ch, new PrometheusService());
+      expect(discovery.loaded).toBe(false);
+
+      await expect(discovery.discover()).rejects.toThrow('read failed');
+      await expect(discovery.discover()).rejects.toThrow('read failed again');
+
+      expect(discovery.loaded).toBe(false);
+      await expect(discovery.ready).resolves.toBeUndefined();
+    });
+
+    it('is true after a read that worked, an empty one included, and stays true through a read that fails', async () => {
+      const { ch } = fakeClickHouse([], new Error('read failed'));
+      const discovery = new DomainDiscovery(ch, new PrometheusService());
+
+      await discovery.discover();
+      expect(discovery.loaded).toBe(true);
+      expect(discovery.current.size).toBe(0);
+
+      await expect(discovery.discover()).rejects.toThrow('read failed');
+      expect(discovery.loaded).toBe(true);
+    });
+  });
+
   describe('ready', () => {
     it('settles after the first discover(), and not before', async () => {
       let answer!: (rows: Row[]) => void;
