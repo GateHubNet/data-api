@@ -2050,6 +2050,33 @@ describe('the detail and the history of an escrow read the granules of a page an
     await expectCreationFromTheStart(statements, path);
   });
 
+  it('the lookup by ID is one read of the newest row, in the reverse order of the key: a granule of each part, not the 10,001 rows', async () => {
+    const path = `/v2/ledger_objects/${ESCROW}`;
+    const { reads, statements, body } = await served(h, api, Table.ObjectChanges, path, 'ledger_object');
+    // the escrow's rows are in five parts of a partition that holds 810,000 rows: a granule of each part and a few more
+    expect(reads).toHaveLength(1);
+    expect([path, reads[0].read_rows <= PAGE_BOUND ? 'bounded' : reads[0].read_rows]).toEqual([path, 'bounded']);
+    // and the answer is the escrow's newest row: the last event of the last part
+    expect(body.ledger_object).toEqual({
+      object_id: ESCROW,
+      object_type: 'Escrow',
+      account: OWNER,
+      deleted: false,
+      ledger_index: BULK_BASES[3] + Math.floor((EVENTS_PER_PART - 1) / 4),
+    });
+    // the read is the newest row of the object by the whole key backwards, which stops after its row
+    expect(statements).toHaveLength(1);
+    const [sql, params] = statements[0];
+    expect(sql).not.toMatch(/\bFINAL\b/i);
+    expect(await explain(h, 'PIPELINE', sql, params)).toContain('InReverseOrder');
+    expect(await tableReads(h, sql, params)).toEqual([expect.objectContaining({ readType: 'InReverseOrder' })]);
+    // the type and the id narrow the read to the escrow's rows: a few granules of the table's
+    const [primary] = primaryKeys(await explain(h, 'indexes = 1', sql, params));
+    expect(primary.keys.slice(0, 3)).toEqual(['object_type', 'object_id', 'ledger_index']);
+    expect(primary.condition).toContain(`object_id in ['${ESCROW}'`);
+    expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+  });
+
   describe.each([false, true])('descending=%s', (descending) => {
     const pageOf = (limit: number, marker?: (string | number)[]): string =>
       `/v2/escrows/${ESCROW}/history?limit=${limit}&descending=${descending}${marker === undefined ? '' : `&marker=${markerOf(marker)}`}`;
@@ -2294,4 +2321,228 @@ describe('the detail of a payment channel reads the granules of a page, its crea
       await expectBoundedInOrderRead(h, page[0][0], page[0][1], descending, path);
     },
   );
+});
+
+describe("the delegations of an account read the account's prefix of account_object_changes and the rows of its IDs, not the millions of rows beside them (read_rows over a bulk of four parts)", () => {
+  // The IDs of the delegations an account gave are the `(account, 'Delegate', role)` prefix of `account_object_changes`, a range of its
+  // primary key, and the rows of those IDs are `(object_type, object_id)` ranges of `object_changes`. The account has 20 delegations of 20
+  // rows each, 5 of each in each of four parts. Beside them, in the same partition: the delegations of two other accounts, one that
+  // sorts before it and one after it (200,000 index rows a part each), the account's own rows as the one that holds a delegation
+  // (50,000 a part, after its own in the key), and in `object_changes` the 200,000 rows a part of two other IDs, one before its IDs and
+  // one after them. A read that did not use the account, the type, the role or the IDs would read the 1.8 million rows of the index
+  // or the 1.6 million of the objects.
+  const ACCOUNT = accountAt(0xd660);
+  /** The owner of the template rows of the index, an account no test reads (the rows are copied from it). */
+  const TEMPLATE_OWNER = 'zTemplateOwner';
+  const BEFORE_ACCOUNT = 'qBefore';
+  const AFTER_ACCOUNT = 'sAfter';
+  const TEMPLATE = '3'.repeat(64);
+  const BEFORE = '4'.repeat(64);
+  const AFTER = '6'.repeat(64);
+  const IDS = 20;
+  const ROWS_PER_PART = 100;
+  const HELD_PER_PART = 50_000;
+  const GRANULE = 8192;
+  /** The parts that hold rows of the account's delegations. */
+  const PARTS = BULK_BASES.length;
+  const ACCOUNT_ROWS = PARTS * ROWS_PER_PART;
+  /** Its own rows and two granules a part: the prefix of the index, or the ranges of the IDs. */
+  const PREFIX_BOUND = ACCOUNT_ROWS + 2 * GRANULE * PARTS;
+  const idOf = (k: number): string => '5'.repeat(60) + k.toString(16).toUpperCase().padStart(4, '0');
+  const ids = Array.from({ length: IDS }, (_, k) => idOf(k));
+
+  let h: Harness;
+  let api: ApiClient;
+  /** The rows of the tables before the bulks: what the mock ledgers and the templates hold. */
+  let indexSeeded: number;
+  let objectsSeeded: number;
+
+  const countOf = async (table: Table): Promise<number> =>
+    Number((await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${table}`))[0].n);
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    // one real row of each table is the template of its bulks: a Delegate of the account (a made-up ID, in a ledger between the mock
+    // ledgers), and the two rows of the index of an account no test reads
+    await h.ch.insert(Table.ObjectChanges, [
+      objectRow({
+        object_type: 'Delegate',
+        object_id: TEMPLATE,
+        ledger_index: 20_999_000,
+        tx_index: 1,
+        tx_type: 'DelegateSet',
+        action: 'modified',
+        event: 'set',
+        owner: ACCOUNT,
+        counterparty: COUNTERPARTY,
+        fields: jsonOf({
+          Account: ACCOUNT,
+          Authorize: COUNTERPARTY,
+          Permissions: [{ Permission: { PermissionValue: 'Payment' } }],
+        }),
+      }),
+    ]);
+    await h.ch.insert(
+      Table.AccountObjectChanges,
+      (['owner', 'counterparty'] as const).map((role) => ({
+        account: TEMPLATE_OWNER,
+        object_type: 'Delegate',
+        role,
+        ledger_index: 20_999_000,
+        tx_index: 1,
+        object_id: TEMPLATE,
+        action: 'modified' as const,
+      })),
+    );
+    indexSeeded = await countOf(Table.AccountObjectChanges);
+    objectsSeeded = await countOf(Table.ObjectChanges);
+
+    const objectTemplate = `SELECT * FROM ${Table.ObjectChanges} WHERE object_id = {template:String} LIMIT 1`;
+    const indexTemplate = (role: string): string =>
+      `SELECT * FROM ${Table.AccountObjectChanges} WHERE account = {template_owner:String} AND role = '${role}' LIMIT 1`;
+    // the n-th row of a part: the IDs take turns, and the first row of each ID in a part is a creation
+    const own = `concat(repeat('5', 60), lpad(hex(n.number % ${IDS}), 4, '0'))`;
+    const ownAction = `if(n.number < ${IDS}, 'created', 'modified')`;
+    const place = (base: number): string => `${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index`;
+    const owned = { template: TEMPLATE, template_owner: TEMPLATE_OWNER, account: ACCOUNT };
+
+    // the account's delegations: the same rows in both tables
+    await insertBulk(
+      h,
+      Table.AccountObjectChanges,
+      indexTemplate('owner'),
+      owned,
+      (base) => `{account:String} AS account, ${own} AS object_id, ${place(base)}, ${ownAction} AS action`,
+      ROWS_PER_PART,
+    );
+    await insertBulk(
+      h,
+      Table.ObjectChanges,
+      objectTemplate,
+      owned,
+      (base) => `${own} AS object_id, ${place(base)}, ${ownAction} AS action`,
+      ROWS_PER_PART,
+    );
+    // beside them: the delegations of two other accounts in the index, the account's own rows as the holder of one, and the objects
+    // of two other IDs (creations, so that a read of `action = 'created'` that the IDs do not bound reads them all)
+    for (const account of [BEFORE_ACCOUNT, AFTER_ACCOUNT]) {
+      await insertBulk(
+        h,
+        Table.AccountObjectChanges,
+        indexTemplate('owner'),
+        { ...owned, account },
+        (base) => `{account:String} AS account, ${place(base)}`,
+        BULK_PER_PART,
+      );
+    }
+    await insertBulk(
+      h,
+      Table.AccountObjectChanges,
+      indexTemplate('counterparty'),
+      owned,
+      (base) => `{account:String} AS account, ${place(base)}`,
+      HELD_PER_PART,
+    );
+    for (const id of [BEFORE, AFTER]) {
+      await insertBulk(
+        h,
+        Table.ObjectChanges,
+        objectTemplate,
+        { ...owned, id },
+        (base) => `{id:String} AS object_id, ${place(base)}, 'created' AS action`,
+        BULK_PER_PART,
+      );
+    }
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  /** The SELECTs of a request on a table: what each read, and the SQL with its params. */
+  const through = (table: Table, path: string) => served(h, api, table, path, 'delegations');
+
+  it('the seed is as assumed: 400 rows of the account in the index and in the objects, among millions of other rows', async () => {
+    const [mine] = await h.ch.query<{ n: string; parts: string; ids: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts, uniqExact(object_id) AS ids FROM ${Table.AccountObjectChanges}
+        WHERE account = {account:String} AND role = 'owner'`,
+      { account: ACCOUNT },
+    );
+    expect([Number(mine.n), Number(mine.parts), Number(mine.ids)]).toEqual([ACCOUNT_ROWS, PARTS, IDS]);
+    const [objects] = await h.ch.query<{ n: string; parts: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts FROM ${Table.ObjectChanges} WHERE object_id IN ({ids:Array(String)})`,
+      { ids },
+    );
+    expect([Number(objects.n), Number(objects.parts)]).toEqual([ACCOUNT_ROWS, PARTS]);
+    // the bulks: 2 x 800,000 index rows of other accounts, 200,000 of the account as a holder, and 2 x 800,000 object rows
+    expect(await countOf(Table.AccountObjectChanges)).toBe(
+      indexSeeded + ACCOUNT_ROWS + 2 * BULK_ROWS + BULK_BASES.length * HELD_PER_PART,
+    );
+    expect(await countOf(Table.ObjectChanges)).toBe(objectsSeeded + ACCOUNT_ROWS + 2 * BULK_ROWS);
+    // the bound is far below the table, and below one part of a bulk
+    expect(PREFIX_BOUND).toBeLessThan(BULK_PER_PART / 2);
+  });
+
+  it("the IDs are the account's prefix of the index and the rows of the IDs are read twice, each bounded by the rows they name", async () => {
+    const path = `/v2/accounts/${ACCOUNT}/delegations`;
+    const index = await through(Table.AccountObjectChanges, path);
+    expect(index.reads).toHaveLength(1);
+    expect([path, index.reads[0].read_rows <= PREFIX_BOUND ? 'bounded' : index.reads[0].read_rows]).toEqual([
+      path,
+      'bounded',
+    ]);
+    const objects = await through(Table.ObjectChanges, path);
+    // the newest row of each ID, and the newest creation of each
+    expect(objects.reads).toHaveLength(2);
+    for (const read of objects.reads) {
+      expect([path, read.read_rows <= PREFIX_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      expect(read.read_rows).toBeGreaterThanOrEqual(ACCOUNT_ROWS);
+    }
+    expect(objects.statements.map(([sql]) => sql.includes("action = 'created'"))).toEqual([false, true]);
+    // and the answer is whole: the 20 delegations, from the newest part
+    const body = objects.body;
+    expect([body.count, body.marker]).toEqual([IDS, undefined]);
+    const listed = body.delegations as {
+      delegation_id: string;
+      updated: { ledger_index: number };
+      created: { ledger_index: number };
+    }[];
+    expect(new Set(listed.map((d) => d.delegation_id))).toEqual(new Set(ids));
+    for (const d of listed) {
+      expect([d.updated.ledger_index >= BULK_BASES[3], d.created.ledger_index >= BULK_BASES[3]]).toEqual([true, true]);
+    }
+  });
+
+  it('the plans narrow by the account, the type and the role in the index, and by the type and the IDs in the objects', async () => {
+    const path = `/v2/accounts/${ACCOUNT}/delegations`;
+    const index = await through(Table.AccountObjectChanges, path);
+    expect(index.statements).toHaveLength(1);
+    const [indexSql, indexParams] = index.statements[0];
+    expect(indexSql).not.toMatch(/\bFINAL\b/i);
+    const [byAccount] = primaryKeys(await explain(h, 'indexes = 1', indexSql, indexParams));
+    expect(byAccount.keys.slice(0, 4)).toEqual(['account', 'object_type', 'role', 'ledger_index']);
+    expect(byAccount.condition).toContain(`account in ['${ACCOUNT}'`);
+    expect(byAccount.condition).toContain('role in [');
+    expect(byAccount.granules[0]).toBeLessThan(byAccount.granules[1] / 8);
+
+    const objects = await through(Table.ObjectChanges, path);
+    for (const [sql, params] of objects.statements) {
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      const [byIds] = primaryKeys(await explain(h, 'indexes = 1', sql, params));
+      expect(byIds.keys.slice(0, 2)).toEqual(['object_type', 'object_id']);
+      expect(byIds.condition).toContain('object_id in');
+      expect(byIds.granules[0]).toBeLessThan(byIds.granules[1] / 8);
+    }
+  });
+
+  it('the account as the holder is the other prefix of the index: its 200,000 rows, bounded by the key and not by the owner rows', async () => {
+    // the account holds one delegation, changed 200,000 times: the distinct ID read stops at the end of that prefix, and it is the one
+    // read of the index; the owner direction above did not read these rows
+    const path = `/v2/accounts/${ACCOUNT}/delegations?direction=held`;
+    const index = await through(Table.AccountObjectChanges, path);
+    expect(index.reads).toHaveLength(1);
+    expect(index.reads[0].read_rows).toBeLessThanOrEqual(BULK_BASES.length * HELD_PER_PART);
+    expect(index.body.count).toBe(1);
+  });
 });

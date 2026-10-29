@@ -9,6 +9,7 @@ import {
   EVENT_EXTRA_KEYS,
   EVENT_KEYS,
   HISTORY_BODY_KEYS,
+  LEDGER_OBJECT_KEYS,
   OBJECT_REF_KEYS,
   PAYMENT_CHANNEL_KEYS,
   REMOVED_KEYS,
@@ -672,6 +673,9 @@ describe('the status of an escrow is the one at the close time of the newest led
       const res = await api.get(path);
       expect([path, res.status, res.body]).toEqual([path, 404, { result: 'error', message: 'escrow not found' }]);
     }
+    // and the lookup of the same object
+    const lookup = await api.get(`/v2/ledger_objects/${ID}`);
+    expect([lookup.status, lookup.body]).toEqual([404, { result: 'error', message: 'ledger object not found' }]);
   });
 
   it('evaluates status at the close time of H', async () => {
@@ -821,6 +825,28 @@ describe('the escrow routes over the recorded xahau ledgers', () => {
     expect(older.coverage).toEqual({ from_ledger_index: FIRST, complete: false });
     expect((older.escrow as Obj).created).toBeUndefined();
     expect((older.escrow as Obj).status).toBe('finished');
+  });
+
+  it('looks up a Xahau escrow by its ID', async () => {
+    const found = await api.ok(`/v2/ledger_objects/${XAH.toLowerCase()}`, 'ledger_object');
+    expect(found.body).toEqual({
+      result: 'success',
+      ledger_object: {
+        object_id: XAH,
+        object_type: 'Escrow',
+        account: XAH_OWNER,
+        deleted: false,
+        ledger_index: 14_634_228,
+      },
+    });
+    // an escrow of Xahau finished before the index is there with its finish
+    const finished = (await api.ok(`/v2/ledger_objects/${OLDER}`, 'ledger_object')).body as Obj;
+    expect(finished.ledger_object).toMatchObject({
+      object_id: OLDER,
+      object_type: 'Escrow',
+      deleted: true,
+      ledger_index: 20_555_633,
+    });
   });
 
   it('serves the escrow of an account by its sequence on Xahau, and its history as CSV with the XAH amount', async () => {
@@ -1950,5 +1976,172 @@ describe('the check and payment channel routes over the recorded xahau ledgers',
       delivered: { currency: 'EVR', issuer: 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8', value: '0.001' },
       status: 'cashed',
     });
+  });
+});
+
+// =====================================================================================================================
+// GET /v2/ledger_objects/{id}: which kind of object an ID is
+// =====================================================================================================================
+
+describe('GET /v2/ledger_objects/{id} over the recorded xrpl ledgers', () => {
+  const HEAD = 107_972_102;
+
+  // recorded (xrpl-objects)
+  const OPEN_ESCROW = 'B95064B1A92F02EE009E6BDFB369CF476FB925BB8615456970E38774034A5D30';
+  const OPEN_ESCROW_OWNER = 'rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V';
+  const FINISHED_ESCROW = 'FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4';
+  const FINISHED_ESCROW_OWNER = 'rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm';
+  const OPEN_CHECK = 'DA6BE1644276D17524D4C5645D322D4A0249B444C0A3C320EA941597243F30EA';
+  const OPEN_CHECK_OWNER = 'rfv3Z8pqTzWdB6L6EV6bRpgsUGeSfCjS1N';
+  const CANCELLED_CHECK = '2C0D06B6A0D7FC898B4761E20220ECBC68515725AECC982BA9238B3BBA735341';
+  const CANCELLED_CHECK_OWNER = 'rPP3R33zpehB5hTy2jSYZek5ntq3HQym68';
+  const OPEN_CHANNEL = 'E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA';
+  const OPEN_CHANNEL_OWNER = 'rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM';
+  const CLOSED_CHANNEL = 'BA23FAA9CBFBCFF6DBDD19CFA3F91BA59500C5C34763C750B7813EB4FFAC37ED';
+  const CLOSED_CHANNEL_OWNER = 'rBJmvoyhs9Z7tmXTuViYvpPBDTw9hGJGfz';
+  /** The DelegateSet of ledger 107558036: rnt8Pb… authorizing rw2X2G…, still in the ledger. */
+  const DELEGATE = 'E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851';
+  const DELEGATOR = 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL';
+
+  // made by hand
+  /** A Delegate made, emptied and made again, and one emptied for good (synthetic: no ledger recorded an emptied list). */
+  const REMADE = hashOf(0xde0301);
+  const EMPTIED = hashOf(0xde0302);
+  const ABOVE = hashOf(0xde0303);
+  const ABOVE_DELETED = hashOf(0xde0304);
+  const delegateRow = (id: string, ledger: number, action: ObjectChangesRow['action']): ObjectChangesRow =>
+    objectRow({
+      object_type: 'Delegate',
+      object_id: id,
+      ledger_index: ledger,
+      tx_index: 1,
+      tx_type: 'DelegateSet',
+      action,
+      event: action === 'deleted' ? 'delete' : 'set',
+      fields: jsonOf({ Account: OWNER, Authorize: COUNTERPARTY, Permissions: [] }),
+    });
+
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-objects', env: NO_RATE_LIMIT, controllers: CACHE_ROUTE });
+    api = await h.api();
+    get = api.get;
+    await insertObjects(h, [
+      delegateRow(REMADE, 107_900_000, 'created'),
+      delegateRow(REMADE, 107_910_000, 'deleted'),
+      delegateRow(REMADE, 107_920_000, 'created'),
+      delegateRow(EMPTIED, 107_900_000, 'created'),
+      delegateRow(EMPTIED, 107_910_000, 'deleted'),
+      // above the committed head: not there
+      delegateRow(ABOVE, HEAD + 1, 'created'),
+      delegateRow(ABOVE_DELETED, 107_930_000, 'created'),
+      delegateRow(ABOVE_DELETED, HEAD + 1, 'deleted'),
+    ]);
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('looks up an escrow, a check, a channel and a Delegate by ID, a removed one with deleted true', async () => {
+    const cases: [string, string, string, boolean, number][] = [
+      [OPEN_ESCROW, 'Escrow', OPEN_ESCROW_OWNER, false, 107_897_249],
+      [FINISHED_ESCROW, 'Escrow', FINISHED_ESCROW_OWNER, true, 107_967_068],
+      [OPEN_CHECK, 'Check', OPEN_CHECK_OWNER, false, HEAD],
+      [CANCELLED_CHECK, 'Check', CANCELLED_CHECK_OWNER, true, 107_968_411],
+      // the newest row of the channel is its claim
+      [OPEN_CHANNEL, 'PayChannel', OPEN_CHANNEL_OWNER, false, 107_641_123],
+      [CLOSED_CHANNEL, 'PayChannel', CLOSED_CHANNEL_OWNER, true, 102_145_584],
+      [DELEGATE, 'Delegate', DELEGATOR, false, 107_558_036],
+    ];
+    for (const [id, type, account, deleted, ledger] of cases) {
+      const res = await api.ok(`/v2/ledger_objects/${id}`, 'ledger_object');
+      expect(res.headers['cache-control']).toBe('private, max-age=60');
+      expect([id, res.body]).toEqual([
+        id,
+        {
+          result: 'success',
+          ledger_object: { object_id: id, object_type: type, account, deleted, ledger_index: ledger },
+        },
+      ]);
+      expect(Object.keys((res.body as Obj).ledger_object as Obj)).toEqual([...LEDGER_OBJECT_KEYS]);
+    }
+  });
+
+  it("is the newest row's: an entry made again after it was deleted is not deleted, an emptied one is", async () => {
+    const remade = (await api.ok(`/v2/ledger_objects/${REMADE}`, 'ledger_object')).body as Obj;
+    expect(remade.ledger_object).toEqual({
+      object_id: REMADE,
+      object_type: 'Delegate',
+      account: OWNER,
+      deleted: false,
+      ledger_index: 107_920_000,
+    });
+    const emptied = (await api.ok(`/v2/ledger_objects/${EMPTIED}`, 'ledger_object')).body as Obj;
+    expect(emptied.ledger_object).toEqual({
+      object_id: EMPTIED,
+      object_type: 'Delegate',
+      account: OWNER,
+      deleted: true,
+      ledger_index: 107_910_000,
+    });
+  });
+
+  it('serves nothing above the committed head: an object made above it is unknown, one deleted above it is not yet', async () => {
+    const above = await get(`/v2/ledger_objects/${ABOVE}`);
+    expect([above.status, above.body]).toEqual([404, { result: 'error', message: 'ledger object not found' }]);
+    const deleted = (await api.ok(`/v2/ledger_objects/${ABOVE_DELETED}`, 'ledger_object')).body as Obj;
+    expect(deleted.ledger_object).toMatchObject({ deleted: false, ledger_index: 107_930_000 });
+  });
+
+  it('answers ledger_objects with no coverage key', async () => {
+    const body = (await api.ok(`/v2/ledger_objects/${OPEN_ESCROW}`, 'ledger_object')).body as Obj;
+    // `result` and the object: no coverage, no ledger_index and no close_time beside it (the object's own ledger_index is inside)
+    expect(Object.keys(body)).toEqual(['result', 'ledger_object']);
+    expect(JSON.stringify(body)).not.toContain('coverage');
+    expect(JSON.stringify(body)).not.toContain('close_time');
+  });
+
+  it('answers an ID in lower case in upper case', async () => {
+    const body = (await api.ok(`/v2/ledger_objects/${OPEN_ESCROW.toLowerCase()}`, 'ledger_object')).body as Obj;
+    expect((body.ledger_object as Obj).object_id).toBe(OPEN_ESCROW);
+  });
+
+  it.each([
+    ['/v2/ledger_objects/abc', 400, 'invalid ledger object id'],
+    [`/v2/ledger_objects/${'A'.repeat(63)}`, 400, 'invalid ledger object id'],
+    [`/v2/ledger_objects/${'A'.repeat(65)}`, 400, 'invalid ledger object id'],
+    [`/v2/ledger_objects/${'G'.repeat(64)}`, 400, 'invalid ledger object id'],
+    [`/v2/ledger_objects/${UNKNOWN}`, 404, 'ledger object not found'],
+    [`/v2/ledger_objects/${'f'.repeat(64)}`, 404, 'ledger object not found'],
+  ])('%s → %i %s', async (path, status, message) => {
+    const res = await get(path);
+    expect([res.status, res.body]).toEqual([status, { result: 'error', message }]);
+    // an error is not kept by a cache
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('reads once, and the rows of the four types by one condition on the type', async () => {
+    const spy = jest.spyOn(h.ch, 'query');
+    await api.ok(`/v2/ledger_objects/${OPEN_CHECK}`, 'ledger_object');
+    const reads = spy.mock.calls.filter(([sql]) => String(sql).includes(`FROM ${Table.ObjectChanges}`));
+    expect(reads).toHaveLength(1);
+    const [sql, params] = reads[0];
+    expect(String(sql)).toContain('object_type IN {types:Array(String)}');
+    expect(params).toMatchObject({ types: ['Escrow', 'Check', 'PayChannel', 'Delegate'], id: OPEN_CHECK, H: HEAD });
+  });
+
+  it('answers 500 with the message of the route when a read fails', async () => {
+    jest.spyOn(h.ch, 'query').mockRejectedValue(new Error('clickhouse is down'));
+    const res = await get(`/v2/ledger_objects/${OPEN_ESCROW}`);
+    expect([res.status, res.body]).toEqual([500, { result: 'error', message: 'unable to retrieve ledger object' }]);
+  });
+
+  it('answers 401 without a key', async () => {
+    const res = await h.http().get(`/v2/ledger_objects/${OPEN_ESCROW}`);
+    expect([res.status, res.body]).toEqual([401, { result: 'error', message: 'Missing or invalid API key.' }]);
   });
 });

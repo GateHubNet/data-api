@@ -13,6 +13,7 @@ import { AccountBalanceChangesService } from './account-balance-changes.service'
 import { AccountBalancesController } from './account-balances.controller';
 import { AccountBalancesService } from './account-balances.service';
 import { AccountDayGroupsService } from './account-day-groups.service';
+import { AccountDelegationsController } from './account-delegations.controller';
 import { AccountEscrowController } from './account-escrow.controller';
 import { AccountExchangesController } from './account-exchanges.controller';
 import { AccountExchangesService } from './account-exchanges.service';
@@ -33,6 +34,7 @@ import { AccountTransactionsService } from './account-transactions.service';
 import { AccountTrustlinesController } from './account-trustlines.controller';
 import { AccountsController } from './accounts.controller';
 import { AccountsService } from './accounts.service';
+import { DelegationsService } from './delegations.service';
 import { LiveLedgerService } from './live-ledger.service';
 import { TrustLinesService } from './trust-lines.service';
 
@@ -47,8 +49,9 @@ import { TrustLinesService } from './trust-lines.service';
  * `GET /v2/accounts/:address/path_payments` (read by the `PathPaymentsService` of `PathPaymentsModule`), and the trust
  * lines of an account at a ledger from the state history, `GET /v2/accounts/:address/trustlines` (its read,
  * `TrustLinesService`, gives `/balances` its trust lines at a historical ledger too), and the NFT routes of an account,
- * `GET /v2/accounts/:address/{nfts,nft_history}` (read by the `NftAccountsService` of `NftModule`), and the escrow of an account by its
- * sequence, `GET /v2/accounts/:address/escrows/:sequence` (answered by the `ObjectAnswers` of `LedgerObjectsModule`).
+ * `GET /v2/accounts/:address/{nfts,nft_history}` (read by the `NftAccountsService` of `NftModule`), the escrow of an account by its
+ * sequence, `GET /v2/accounts/:address/escrows/:sequence` (answered by the `ObjectAnswers` of `LedgerObjectsModule`), and the
+ * delegations of an account, `GET /v2/accounts/:address/delegations` (read by the `DelegationsService` of this module).
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
@@ -72,6 +75,7 @@ import { TrustLinesService } from './trust-lines.service';
     AccountPathPaymentsController,
     AccountNftsController,
     AccountEscrowController,
+    AccountDelegationsController,
   ],
   providers: [
     AccountsService,
@@ -90,6 +94,7 @@ import { TrustLinesService } from './trust-lines.service';
     AccountAnalyticsService,
     AccountAmmService,
     TrustLinesService,
+    DelegationsService,
   ],
 })
 export class AccountsModule {}

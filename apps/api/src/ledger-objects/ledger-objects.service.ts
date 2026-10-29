@@ -1,4 +1,10 @@
-import { ClickHouseService, readDistinctPage, Table, TrackedObjectType } from '@gatehub/data-api-shared';
+import {
+  ClickHouseService,
+  readDistinctPage,
+  Table,
+  TRACKED_OBJECT_TYPES,
+  TrackedObjectType,
+} from '@gatehub/data-api-shared';
 import { Injectable } from '@nestjs/common';
 import { CoverageFeatureName } from '../common/coverage-features';
 import { notFound } from '../common/errors';
@@ -32,6 +38,21 @@ export const NOT_FOUND_OF: Record<ObjectKind, string> = {
 
 /** How many events the detail of an object embeds; it reads one more to know whether there are more. */
 export const DETAIL_EVENTS = 50;
+
+/** The 404 of `GET /v2/ledger_objects/{id}`. */
+export const LEDGER_OBJECT_NOT_FOUND = 'ledger object not found';
+
+/** What `GET /v2/ledger_objects/{id}` answers about an ID (`LEDGER_OBJECT_KEYS`, in this order). */
+export interface LedgerObjectLookup {
+  object_id: string;
+  object_type: TrackedObjectType;
+  /** The owner: the account of the object. */
+  account: string;
+  /** Whether the object's newest row deleted it. */
+  deleted: boolean;
+  /** The ledger of that row. */
+  ledger_index: number;
+}
 
 /** The newest committed ledger and when it closed (unix seconds): the point an answer is as of, and the cap of every read of it. */
 export interface AsOf {
@@ -74,7 +95,7 @@ export const OBJECT_POSITION: KeysetKey[] = [
 const OBJECT_ORDER = ['object_type', 'object_id', ...columnsOf(OBJECT_POSITION)];
 
 /** The columns of a row of `ObjectRead`: the close time in unix seconds, the JSON columns as the text they are stored in. */
-const COLUMNS = [
+export const OBJECT_COLUMNS = [
   'object_type',
   'object_id',
   'ledger_index',
@@ -95,13 +116,14 @@ const COLUMNS = [
 ].join(', ');
 
 /** A row as ClickHouse gives it: `ObjectRead` with its three JSON columns still text. */
-type StoredRow = Omit<ObjectRead, 'fields' | 'previous' | 'event_fields'> & {
+export type StoredRow = Omit<ObjectRead, 'fields' | 'previous' | 'event_fields'> & {
   fields: string;
   previous: string;
   event_fields: string;
 };
 
-const readOf = (row: StoredRow): ObjectRead => ({
+/** A stored row as an `ObjectRead`: the numbers as numbers and the three JSON columns parsed. */
+export const readOf = (row: StoredRow): ObjectRead => ({
   ...row,
   ledger_index: Number(row.ledger_index),
   tx_index: Number(row.tx_index),
@@ -115,9 +137,9 @@ const readOf = (row: StoredRow): ObjectRead => ({
 const OBJECT_PREFIX = 'object_type = {type:String} AND object_id = {id:String} AND ledger_index <= {H:UInt32}';
 
 /**
- * The history of the escrows, checks and payment channels (spec 3), read at query time from `object_changes`. Every read is
- * capped at the newest committed ledger `H` (the `ledgers` commit marker), whose index and close time the answer carries and
- * its `status` is evaluated at; with no committed ledger the answer is the 404 of the kind.
+ * The history of the escrows, checks and payment channels (spec 3) and the lookup of an ID, read at query time from
+ * `object_changes`. Every read is capped at the newest committed ledger `H` (the `ledgers` commit marker), whose index and close
+ * time the answer carries and its `status` is evaluated at; with no committed ledger the answer is the 404 of the kind.
  *
  *  - **The detail** reads the newest `DETAIL_EVENTS + 1` rows of the object (a page of `readDistinctPage`, newest first). No
  *    row is the 404. The creation is the page's row of `created`, else, when the page is full (the object has older events),
@@ -127,6 +149,7 @@ const OBJECT_PREFIX = 'object_type = {type:String} AND object_id = {id:String} A
  *  - **The history** reads, side by side, the page (limit + 1 rows in the order asked for, after the marker), the creation
  *    and, with a marker, one row of the object's prefix: no row at all is the 404, while a page past the end of an object
  *    that has rows is `count: 0`. Without a marker an empty page is already the 404.
+ *  - **The lookup** (`GET /v2/ledger_objects/{id}`) reads the newest row of an ID under any of the four tracked types.
  *
  * A marker is `(ledger_index, tx_index)` of the last row of a page; it belongs to one route and one direction.
  */
@@ -184,6 +207,39 @@ export class LedgerObjectsService {
     };
   }
 
+  /**
+   * Which kind of object an ID is (spec 5.7): the newest row, up to the head, of the ID under any tracked type, in one read. An
+   * ID is one object's, so only one of the types has rows for it; the read asks for the whole key backwards (type, ID, ledger,
+   * transaction), which ClickHouse serves in the order of the key and stops after its row: a granule of each part, whatever
+   * the object's history. Throws `ledger object not found` for an ID with no row, and with no committed ledger.
+   */
+  async lookup(id: string): Promise<LedgerObjectLookup> {
+    const head = await this.ranges.latest();
+    if (head === undefined) throw notFound(LEDGER_OBJECT_NOT_FOUND);
+    const [row] = await this.ch.query<{
+      object_type: TrackedObjectType;
+      object_id: string;
+      ledger_index: number | string;
+      owner: string;
+      action: string;
+    }>(
+      `SELECT object_type, object_id, ledger_index, owner, action
+         FROM ${Table.ObjectChanges}
+        WHERE object_type IN {types:Array(String)} AND object_id = {id:String} AND ledger_index <= {H:UInt32}
+        ORDER BY ${OBJECT_ORDER.map((column) => `${column} DESC`).join(', ')}
+        LIMIT 1`,
+      { types: [...TRACKED_OBJECT_TYPES], id, H: head },
+    );
+    if (row === undefined) throw notFound(LEDGER_OBJECT_NOT_FOUND);
+    return {
+      object_id: row.object_id,
+      object_type: row.object_type,
+      account: row.owner,
+      deleted: row.action === 'deleted',
+      ledger_index: Number(row.ledger_index),
+    };
+  }
+
   /** The newest committed ledger, or the 404 of the kind when none is committed. */
   private async head(kind: ObjectKind): Promise<AsOf> {
     const asOf = await this.ranges.latestWithTime();
@@ -202,7 +258,7 @@ export class LedgerObjectsService {
     // ClickHouse narrows the read with
     const cursor = keysetClause(OBJECT_POSITION, o.descending, o.after);
     const rows = await readDistinctPage<StoredRow>(this.ch, {
-      columns: COLUMNS,
+      columns: OBJECT_COLUMNS,
       table: Table.ObjectChanges,
       where: [OBJECT_PREFIX, ...(cursor.clause !== '' ? [cursor.clause] : [])],
       orderBy: OBJECT_ORDER,
@@ -222,7 +278,7 @@ export class LedgerObjectsService {
    */
   private async creation(type: TrackedObjectType, id: string, asOf: AsOf): Promise<ObjectRead | undefined> {
     const [row] = await this.ch.query<StoredRow>(
-      `SELECT ${COLUMNS}
+      `SELECT ${OBJECT_COLUMNS}
          FROM ${Table.ObjectChanges}
         WHERE ${OBJECT_PREFIX} AND action = 'created'
         ORDER BY ${OBJECT_ORDER.join(', ')}

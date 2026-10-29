@@ -817,10 +817,11 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 ## Accounts
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
-(`/balances`, `/orders`, `/trustlines`, `/escrows/{sequence}`): an address that does not exist simply has no rows. All account lists take the common window
+(`/balances`, `/orders`, `/trustlines`, `/escrows/{sequence}`, `/delegations`): an address that does not exist simply has no rows. All account lists take the common window
 parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
-described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments), and the escrow of an account by its
-sequence with the other escrow routes, under [`GET /v2/accounts/{address}/escrows/{sequence}`](#get-v2accountsaddressescrowssequence).
+described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments), the escrow of an account by its
+sequence with the other escrow routes, under [`GET /v2/accounts/{address}/escrows/{sequence}`](#get-v2accountsaddressescrowssequence), and the
+delegations an account gave or holds under [`GET /v2/accounts/{address}/delegations`](#get-v2accountsaddressdelegations), in [Ledger objects](#ledger-objects).
 
 ### `GET /v2/accounts`
 
@@ -3616,8 +3617,9 @@ What the fields say:
 ## Ledger objects
 
 GateHub extras: the original served no object of the ledger by its ID. These endpoints serve **escrows**, **checks**, **payment channels** and the
-**delegations** of an account, each with the history of the transactions that changed it: what it was when it was created, what every
-transaction since did to it, and what it is now (its `status`). The design is in the
+**delegations** of an account. An escrow, a check and a payment channel come with the history of the transactions that changed it: what it was
+when it was created, what every transaction since did to it, and what it is now (its `status`); a delegation is listed as it is now, with the
+transaction that made it and the one that changed it last. The design is in the
 [spec](superpowers/specs/2026-10-24-ledger-objects-delegation-design.md) and [ADR-0018](adr/0018-ledger-object-history.md); the rows are in
 [data-model](data-model.md).
 
@@ -3688,7 +3690,15 @@ Keys of the extras of a payment channel event, in order: `amount, balance, amoun
 
 Keys of created, in order: `ledger_index, time, tx_hash`.
 
+Keys of updated, in order: `ledger_index, time, tx_hash`.
+
 Keys of removed, in order: `ledger_index, time, tx_hash, tx_type`.
+
+Keys of a permission, in order: `permission, kind, transaction_type?`.
+
+Keys of a delegation, in order: `delegation_id, account, authorize, permissions, updated, created?`.
+
+Keys of a ledger object, in order: `object_id, object_type, account, deleted, ledger_index`.
 
 Keys of an escrow, in order: `escrow_id, account, sequence?, destination, amount, finish_after?, cancel_after?, condition?, fulfillment?, destination_tag?, source_tag?, transfer_rate?, status, created?, removed?`.
 
@@ -3703,6 +3713,10 @@ Keys of the check answer, in order: `result, coverage, ledger_index, close_time,
 Keys of the payment channel answer, in order: `result, coverage, ledger_index, close_time, payment_channel, history, history_marker?`.
 
 Keys of the history answer, in order: `result, coverage, ledger_index, close_time, count, marker?, history`.
+
+Keys of the delegations answer, in order: `result, coverage, ledger_index, close_time, count, marker?, delegations`.
+
+Keys of the ledger object answer, in order: `result, ledger_object`.
 
 ### `GET /v2/escrows/{escrow_id}`
 
@@ -4271,6 +4285,150 @@ whether it holds claims, funds or a creation:
 
 Errors, in the order they are checked: 400 `invalid channel id`, `invalid marker`; 404 `payment channel not found` (a channel with no event, also
 for a `marker`); 500 `unable to retrieve payment channel history`.
+
+### `GET /v2/accounts/{address}/delegations`
+
+The delegations an account gave or holds, as of the newest committed ledger. A delegation (permission delegation, XLS-75) is an entry of the
+ledger by which an account (`account`) lets another (`authorize`, the delegate) send some transactions for it: the list of the transactions and
+of the granular permissions the delegate may use. Only the entries that are in the ledger are listed: an entry whose list was emptied (a
+`DelegateSet` with no permissions) is deleted and is gone from both sides, and one whose list was replaced shows the newest list.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | The account: a classic address (an X-address is no address here). |
+| `direction` | `given` | `given`: the delegations the account gave (it is the `account` of the entry); `held`: those it holds (it is the `authorize`). Missing or empty is `given`. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index, delegation_id)` of the last delegation of the page. |
+| `format` | json | `csv`: file `<address> - delegations given.csv` / `<address> - delegations held.csv`, `permissions` one cell of names separated by a space. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "delegations": [Delegation, …] }`. A delegation:
+
+- `delegation_id` is the ID of the entry, which [`GET /v2/ledger_objects/{object_id}`](#get-v2ledger_objectsobject_id) says what it is. `account` is the
+  delegating account and `authorize` the delegate.
+- `permissions` are what the delegate may do, in the order the entry lists them: `{ "permission", "kind", "transaction_type"? }`. `kind` is
+  `transaction` when `permission` is the name of a transaction type (`Payment`), `granular` when it is one of the 12 granular permissions
+  (`TrustlineAuthorize`, which also gives the `transaction_type` it narrows, `TrustSet`), and `unknown` for a value that is neither, which is
+  written as its number.
+- `updated` is `{ ledger_index, time, tx_hash }` of the transaction that changed the entry last (the one that made it, when none changed it
+  since). `created` is the same for the transaction that made the entry as it is now, and is left out when that transaction is not indexed. An
+  entry that was deleted and made again under the same ID (the same two accounts) has the creation of the newest.
+- The list is ordered by `updated`, the entry changed last first, and then by `delegation_id`; there is no `descending`. The `marker` holds the
+  place and ID of the last delegation of the page, and the page after it starts with the next in that order. The `Link` header is sent.
+
+The `coverage` is that of the delegations ([Coverage](#coverage)): complete when the first ledger of the index is not after the ledger the
+amendment was enabled in. An entry is listed whether or not its creation is indexed.
+
+**The size of an account.** The delegations are read from the index of the account (an account with 10,000 or fewer in the direction is
+served), and an account that has more is answered 500 `unable to retrieve delegations` and logged: the list is a guard, not a page.
+
+`GET /v2/accounts/rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL/delegations`, an account that authorized one other for its offers (`OfferCreate` and `OfferCancel`):
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "count": 1,
+  "delegations": [
+    {
+      "delegation_id": "E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851",
+      "account": "rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL",
+      "authorize": "rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK",
+      "permissions": [
+        { "permission": "OfferCreate", "kind": "transaction" },
+        { "permission": "OfferCancel", "kind": "transaction" }
+      ],
+      "updated": {
+        "ledger_index": 107558036,
+        "time": "2026-10-10T09:03:20Z",
+        "tx_hash": "4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66"
+      },
+      "created": {
+        "ledger_index": 107558036,
+        "time": "2026-10-10T09:03:20Z",
+        "tx_hash": "4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66"
+      }
+    }
+  ]
+}
+```
+
+With `direction=held` the delegate sees the same entry (`GET /v2/accounts/rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK/delegations?direction=held&format=csv`).
+The permission names are in one cell, and a delegation that has no `created` has its three columns empty:
+
+```text
+"delegation_id","account","authorize","permissions","updated.ledger_index","updated.time","updated.tx_hash","created.ledger_index","created.time","created.tx_hash"
+"E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851","rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL","rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK","OfferCreate OfferCancel","107558036","2026-10-10T09:03:20Z","4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66","107558036","2026-10-10T09:03:20Z","4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66"
+```
+
+**Xahau has no delegation**: its answer is the empty list with the `coverage` of a feature the network cannot have (`complete: true`), and no table is
+read. `GET /v2/accounts/rKqZCLrHu8dMPj444xPrDQCXUpZr6U2VWi/delegations` on Xahau:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 8852809, "complete": true },
+  "ledger_index": 26399329,
+  "close_time": "2026-10-09T12:49:32Z",
+  "count": 0,
+  "delegations": []
+}
+```
+
+Errors, in the order they are checked: 400 `invalid ripple address`, `invalid direction`, `invalid marker`; 500 `unable to retrieve delegations` (also for
+an account with more than 10,000 delegations in the direction, and when no ledger is committed).
+
+### `GET /v2/ledger_objects/{object_id}`
+
+Which kind of object an ID is: of the objects this section serves, the type, the owner, and whether the newest row of the object deleted it.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `object_id` (path) | | The 64 hex digits of the ID, in any case. |
+
+`{ "result": "success", "ledger_object": { "object_id", "object_type", "account", "deleted", "ledger_index" } }`. This is a lookup, not an object: it
+has no `coverage`, and no `ledger_index` or `close_time` of the answer beside `result` and `ledger_object`.
+
+- `object_type` is the entry type of the ledger: `Escrow`, `Check`, `PayChannel` (a payment channel) or `Delegate` (a delegation). The ID is the
+  one the route of that type takes: [`/v2/escrows/{escrow_id}`](#get-v2escrowsescrow_id), [`/v2/checks/{check_id}`](#get-v2checkscheck_id),
+  [`/v2/payment_channels/{channel_id}`](#get-v2payment_channelschannel_id), and a delegation's `delegation_id` in [the list above](#get-v2accountsaddressdelegations).
+- `account` is the owner of the object (for a delegation, the account that gave it), `deleted` is `true` when the newest row of the object, up
+  to the newest committed ledger, deleted it, and `ledger_index` is the ledger of that row.
+- An object that was created before the index starts and has not been touched since is not known: its ID is 404 like any ID that is none.
+
+`GET /v2/ledger_objects/E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851`, the delegation above:
+
+```json
+{
+  "result": "success",
+  "ledger_object": {
+    "object_id": "E63226B764F4D7C198DBF8E4DE0F5DA4F9C1AC449C2927F2150C0B731E020851",
+    "object_type": "Delegate",
+    "account": "rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL",
+    "deleted": false,
+    "ledger_index": 107558036
+  }
+}
+```
+
+`GET /v2/ledger_objects/FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4`, an escrow that was finished:
+
+```json
+{
+  "result": "success",
+  "ledger_object": {
+    "object_id": "FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4",
+    "object_type": "Escrow",
+    "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+    "deleted": true,
+    "ledger_index": 107967068
+  }
+}
+```
+
+Errors, in the order they are checked: 400 `invalid ledger object id`; 404 `ledger object not found` (an ID with no row in a committed ledger, and
+every ID when no ledger is committed); 500 `unable to retrieve ledger object`.
 
 **Differences from data.ripple.com**: none, the endpoints are new. The original's `GET /v2/accounts/{address}/escrows` (the list of an account) is
 not served and answers 404 ([Compatibility](#compatibility)).
