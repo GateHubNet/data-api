@@ -11,18 +11,21 @@ import { committedHead } from './amm-pools.job';
  * The `escrows` job's functions (spec sections 1.3, 4.1 and 4.3): the current state of every escrow the index has seen, rebuilt
  * from its `object_changes` rows, and the **sentinel** row that holds the escrowed total. The runner that calls them is Task 8's.
  *
- *  - **A step is a window.** `runEscrowsStep` works on `(W, U]`: `W` is the sentinel's `through_ledger` (without a sentinel, the
- *    ledger before the first committed one: no escrow row can be older, so a first run does not walk the empty ledgers below it),
+ *  - **A step is a window.** `runEscrowsStep` works on `(W, U]`: `W` is the sentinel's `through_ledger`, or the ledger before the
+ *    first committed one while that is 0 (no sentinel, or one a step on an empty database wrote: no escrow row can be older, so
+ *    the job never walks the empty ledgers below the first one, nor writes a `through_ledger` the `ledgers` table does not have),
  *    `U = max(W, min(head, W + step))` and the head is the newest committed ledger (`committedHead`), so a ledger whose rows are
  *    not all readable is never passed. A first run over all history proceeds in steps of `ESCROWS_STEP_LEDGERS`.
  *  - **What is read, and how each read is bounded.**
  *      - the sentinel: its key, one row (`readEscrowed`); the first committed ledger: a `min` of the one column the table is
- *        partitioned and ordered by, only without a sentinel, so once, as the same step writes it;
+ *        partitioned and ordered by, only while the watermark is 0, so once the first ledger is committed;
  *      - the touched escrows (`escrowsTouchedIn`): `object_changes` by the partitions that hold the window (`PARTITION BY
  *        intDiv(ledger_index, 10000000)`) and the `object_type = 'Escrow'` prefix of its key, so no more than the escrow rows of
  *        those partitions (a bound the tests pin over a bulk of other rows); the answer is the escrows touched in the window;
- *      - the recompute (`recomputeEscrows`): the rows of the escrows named, in chunks of `ESCROWS_CHUNK`, by the prefix
- *        `(object_type, object_id)` of the key of `object_changes` and by the key of `escrows`;
+ *      - the recompute (`recomputeEscrows`): in chunks of `ESCROWS_CHUNK`, two reads of the `Escrow` rows of the escrows named up
+ *        to `upTo` (the prefix `(object_type, object_id)` of the key of `object_changes`, then the ledger range inside it: the
+ *        rows of other types under the same IDs, and the rows above `upTo`, are not read; a test pins it), and the `escrows` rows
+ *        of the same IDs by the key of `escrows`;
  *      - the total: one narrow row per escrow ever seen, only after a step that wrote or removed an escrow, or that finds no
  *        sentinel (spec 4.2).
  *  - **Idempotent, versioned.** An escrow's row is a function of its `object_changes` rows up to `U`. A chunk is written under
@@ -32,6 +35,9 @@ import { committedHead } from './amm-pools.job';
  *  - **The sentinel is the commit marker of a step** (as `ledgers` is of an ingest): it is written last, on every step, whether
  *    or not an escrow changed. A step that fails before it leaves the old sentinel, whose total and watermark agree with each
  *    other, and the next step does `(W, U]` again, which rewrites the same rows.
+ *  - **An escrow that cannot be mapped is set aside**, not allowed to stall the job: its row is not written (a row it had stays as
+ *    it was) and its ID is returned (`setAside`), and the step commits. The total is not affected: it counts native drops, and an
+ *    `Amount` the code does not know is a token's. Mapping is a pure function of the rows, so there is nothing to retry.
  *  - **An escrow with no row left is removed**: a re-ingest dropped its `object_changes` rows. Its `escrows` rows are deleted
  *    (a lightweight DELETE, as for `amm_pools`).
  *  - **Nothing is written once the shutdown has begun**: `signal` is checked before each read and each write.
@@ -64,6 +70,8 @@ export interface EscrowsStep {
   touched: number;
   written: number;
   removed: number;
+  /** The escrows of the window that could not be mapped (see `recomputeEscrows`), in the order of their IDs. */
+  setAside: string[];
   /** The sentinel the step wrote. */
   escrowed: Escrowed;
 }
@@ -124,11 +132,10 @@ type EscrowAmount = Pick<EscrowsRow, 'currency' | 'issuer' | 'amount' | 'amount_
  * The amount columns of an escrow from the node's `Amount`: drops as text (the native currency), an issued-token object, or an
  * MPT object. Any other shape is not one the ledger has, and is refused, so that no row is written that counts for nothing.
  */
-function amountOf(id: string, amount: unknown, native: string): EscrowAmount {
+function amountOf(amount: unknown, native: string): EscrowAmount {
   if (typeof amount === 'string' || typeof amount === 'number') {
     const drops = String(amount);
-    if (!/^[0-9]+$/.test(drops))
-      throw new Error(`The escrow ${id} has an Amount of ${drops} drops, not a whole number`);
+    if (!/^[0-9]+$/.test(drops)) throw new Error(`an Amount of ${drops} drops is not a whole number`);
     return { currency: native, issuer: '', amount: dropsToNative(drops), amount_drops: drops };
   }
   if (isRecord(amount) && typeof amount.value === 'string') {
@@ -140,7 +147,7 @@ function amountOf(id: string, amount: unknown, native: string): EscrowAmount {
       return { currency: amount.currency, issuer: amount.issuer, amount: amount.value, amount_drops: 0 };
     }
   }
-  throw new Error(`The escrow ${id} has an Amount of a shape the ledger does not have`);
+  throw new Error('the Amount is of a shape the ledger does not have');
 }
 
 /**
@@ -150,8 +157,26 @@ function amountOf(id: string, amount: unknown, native: string): EscrowAmount {
  * `sequence` is the object's own `Sequence`, else the one the created row's event took from the transaction (a ticketed
  * escrow, an XRPL escrow older than the field, a Xahau one), else `null` (a Hook-emitted Xahau escrow has neither; a 0 is no
  * sequence, as in the parser). `open_count` and `through_ledger` are the sentinel's, 0 here.
+ *
+ * Throws an `Error` that names the escrow when its rows cannot be mapped (a text that is not JSON, an `Amount` of a shape the
+ * ledger does not have, an MPT ID that is not one): the job sets such an escrow aside.
  */
 export function escrowRowOf(
+  newest: EscrowSource,
+  created: EscrowSource | undefined,
+  native: string,
+  version: number,
+): EscrowsRow {
+  try {
+    return mapEscrow(newest, created, native, version);
+  } catch (error) {
+    throw new Error(
+      `The escrow ${newest.object_id} cannot be mapped: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function mapEscrow(
   newest: EscrowSource,
   created: EscrowSource | undefined,
   native: string,
@@ -169,7 +194,7 @@ export function escrowRowOf(
     owner: typeof fields.Account === 'string' ? fields.Account : '',
     destination: typeof fields.Destination === 'string' ? fields.Destination : '',
     sequence,
-    ...amountOf(newest.object_id, fields.Amount, native),
+    ...amountOf(fields.Amount, native),
     finish_after: unixTime(fields.FinishAfter),
     cancel_after: unixTime(fields.CancelAfter),
     has_condition: typeof fields.Condition === 'string' && fields.Condition !== '' ? 1 : 0,
@@ -304,7 +329,7 @@ async function recomputeChunk(
   ch: ClickHouseService,
   ids: string[],
   opts: { upTo: number; native: string; signal?: AbortSignal },
-): Promise<{ written: number; removed: number }> {
+): Promise<{ written: number; removed: number; setAside: string[] }> {
   const { upTo, native, signal } = opts;
   throwIfAborted(signal);
   const params = { ids, upTo };
@@ -321,10 +346,18 @@ async function recomputeChunk(
   let version = Number(clock?.now_ms ?? Date.now());
   for (const { newest: latest } of versions) version = Math.max(version, Number(latest) + 1);
 
-  const rows = ids.flatMap((id) => {
+  const rows: EscrowsRow[] = [];
+  const setAside: string[] = [];
+  for (const id of ids) {
     const row = newestOf.get(id);
-    return row === undefined ? [] : [escrowRowOf(row, createdOf.get(id), native, version)];
-  });
+    if (row === undefined) continue;
+    try {
+      rows.push(escrowRowOf(row, createdOf.get(id), native, version));
+    } catch {
+      // its rows cannot be mapped: the others are written and the job goes on
+      setAside.push(id);
+    }
+  }
   throwIfAborted(signal);
   await ch.insert(Table.Escrows, rows);
 
@@ -335,7 +368,7 @@ async function recomputeChunk(
     throwIfAborted(signal);
     await ch.command(DELETE_ESCROWS_SQL, { gone }, { settings: SYNC_DELETE });
   }
-  return { written: rows.length, removed: gone.length };
+  return { written: rows.length, removed: gone.length, setAside };
 }
 
 /**
@@ -346,19 +379,23 @@ async function recomputeChunk(
  * versions. `signal` is checked before each read and each write: an aborted recompute throws `EscrowsAborted` and writes nothing
  * more.
  *
- * Returns how many rows it wrote and how many escrows it removed.
+ * An escrow whose rows cannot be mapped (`escrowRowOf` throws: an `Amount` of a shape the ledger does not have, a text that is
+ * not JSON) is set aside: the others of its chunk are written, and its ID is returned. A row it had stays as it was.
+ *
+ * Returns how many rows it wrote, how many escrows it removed, and the IDs set aside, in order.
  */
 export async function recomputeEscrows(
   ch: ClickHouseService,
   ids: readonly string[],
   opts: { upTo: number; native: string; signal?: AbortSignal },
-): Promise<{ written: number; removed: number }> {
+): Promise<{ written: number; removed: number; setAside: string[] }> {
   throwIfAborted(opts.signal);
-  const result = { written: 0, removed: 0 };
+  const result = { written: 0, removed: 0, setAside: [] as string[] };
   for (const chunk of chunksOf([...new Set(ids)].sort(), ESCROWS_CHUNK)) {
     const done = await recomputeChunk(ch, chunk, opts);
     result.written += done.written;
     result.removed += done.removed;
+    result.setAside.push(...done.setAside);
   }
   return result;
 }
@@ -423,17 +460,19 @@ async function writeSentinel(
 // The steps
 // ---------------------------------------------------------------------------------------------------------------------
 
-/** Where a job without a sentinel starts: the ledger before the first committed one (0 without a ledger). */
+/** Where a job with a watermark of 0 starts: the ledger before the first committed one (0 without a ledger). */
 async function startOfHistory(ch: ClickHouseService): Promise<number> {
   const first = await firstCommittedLedger(ch);
   return first === undefined ? 0 : Math.max(0, first - 1);
 }
 
 /**
- * One step of the job (spec 4.1): the window `(W, U]`, `U = max(W, min(head, W + step))`; the escrows touched in it are
- * recomputed as of `U`; the total is read again when the step wrote or removed something (or there was no sentinel), else
- * it is the previous sentinel's; and the sentinel (`through_ledger = U`) is written last, on every step. A step does not loop:
- * the runner calls it again while `to` is below `head`.
+ * One step of the job (spec 4.1): the window `(W, U]`, `U = max(W, min(head, W + step))`, `W` being the sentinel's
+ * `through_ledger` and, while that is 0, the ledger before the first committed one (so a step on an empty database writes 0, and
+ * the first step once there is a ledger starts at it); the escrows touched in it are recomputed as of `U`, those that cannot be
+ * mapped set aside (`setAside`); the total is read again when the step wrote or removed something (or there was no sentinel),
+ * else it is the previous sentinel's; and the sentinel (`through_ledger = U`) is written last, on every step, set-asides or not.
+ * A step does not loop: the runner calls it again while `to` is below `head`.
  */
 export async function runEscrowsStep(
   ch: ClickHouseService,
@@ -444,12 +483,13 @@ export async function runEscrowsStep(
   throwIfAborted(signal);
   const head = await committedHead(ch);
   const previous = await readEscrowed(ch);
-  const from = previous === undefined ? await startOfHistory(ch) : previous.through_ledger;
+  const watermark = previous?.through_ledger ?? 0;
+  const from = watermark > 0 ? watermark : await startOfHistory(ch);
   const to = Math.max(from, Math.min(head, from + step));
 
   throwIfAborted(signal);
   const ids = await escrowsTouchedIn(ch, from, to);
-  const { written, removed } = await recomputeEscrows(ch, ids, { upTo: to, native, signal });
+  const { written, removed, setAside } = await recomputeEscrows(ch, ids, { upTo: to, native, signal });
 
   throwIfAborted(signal);
   const total =
@@ -458,7 +498,7 @@ export async function runEscrowsStep(
       : { drops: previous.drops, open: previous.open };
   const escrowed: Escrowed = { ...total, through_ledger: to };
   await writeSentinel(ch, escrowed, signal);
-  return { from, to, head, touched: ids.length, written, removed, escrowed };
+  return { from, to, head, touched: ids.length, written, removed, setAside, escrowed };
 }
 
 /**

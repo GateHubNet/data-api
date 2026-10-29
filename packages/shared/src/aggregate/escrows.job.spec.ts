@@ -163,9 +163,16 @@ describe('escrowRowOf', () => {
     });
   });
 
-  it('refuses an amount of a shape the ledger does not have, instead of a row that counts for nothing', () => {
-    expect(() => escrowRowOf(source({ fields: { Amount: { value: '1' } } }), undefined, 'XRP', 1)).toThrow(ID);
-    expect(() => escrowRowOf(source({ fields: { Amount: undefined } }), undefined, 'XRP', 1)).toThrow(ID);
-    expect(() => escrowRowOf(source({ fields: { Amount: '1.5' } }), undefined, 'XRP', 1)).toThrow();
+  it('refuses what cannot be mapped, in an error that names the escrow (the job sets such an escrow aside)', () => {
+    const refused = (row: EscrowSource, created?: EscrowSource) => () => escrowRowOf(row, created, 'XRP', 1);
+    // an Amount of a shape the ledger does not have
+    expect(refused(source({ fields: { Amount: { value: '1' } } }))).toThrow(ID);
+    expect(refused(source({ fields: { Amount: undefined } }))).toThrow(ID);
+    expect(refused(source({ fields: { Amount: '1.5' } }))).toThrow(ID);
+    // an MPT amount whose issuance ID is not one: the error of `mptIssuerOf` is named after the escrow too
+    expect(refused(source({ fields: { Amount: { mpt_issuance_id: 'ZZ', value: '1' } } }))).toThrow(ID);
+    // text that is not JSON, in the newest row and in the created one: the error of `JSON.parse` as well
+    expect(refused({ ...source(), fields: '{' })).toThrow(ID);
+    expect(refused(source(), { ...source(), event_fields: 'not json' })).toThrow(ID);
   });
 });

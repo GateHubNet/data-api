@@ -268,6 +268,43 @@ describe('the escrows job (e2e)', () => {
   const commitLedgers = (ch: ClickHouseService, ledgers: number[]): Promise<void> =>
     ch.insert(Table.Ledgers, [...new Set(ledgers)].map(ledgerRow));
 
+  // Bulk rows for the read-bound tests (the shape of apps/api/test/support/read-rows.ts: copies of one row, a part each, merges
+  // stopped by the caller, four rows a ledger from the base) and what `system.query_log` says the SELECTs on a table read.
+  const PER_PART = 200_000;
+  const GRANULE = 8192;
+
+  /** One part of `PER_PART` rows of one object, from the ledger `base`; `action` is the row's, `Amount` is 1 XRP. */
+  async function insertBulk(ch: ClickHouseService, objectType: string, objectId: string, base: number): Promise<void> {
+    await ch.command(
+      `INSERT INTO ${Table.ObjectChanges}
+       SELECT {type:String}, {id:String}, toUInt32({base:UInt32} + intDiv(n.number, 4)), toUInt32(n.number % 4),
+              'synthetic-bulk', toDateTime(1700000000, 'UTC'), 'EscrowCreate', 'tesSUCCESS', 'rSyntheticBulk', '',
+              'created', 'create', 'rSyntheticBulk', 'rSyntheticBulk',
+              '{"Account":"rSyntheticBulk","Amount":"1000000","Destination":"rSyntheticBulk"}', '{}', '{}'
+         FROM numbers({n:UInt32}) AS n`,
+      { type: objectType, id: objectId, base, n: PER_PART },
+      { settings: { insert_deduplicate: 0 } },
+    );
+  }
+
+  /** The `read_rows` of each SELECT on a table while `run` ran, in the order they started. */
+  async function reads(ch: ClickHouseService, table: Table, run: () => Promise<unknown>): Promise<number[]> {
+    const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
+    await run();
+    await ch.command('SYSTEM FLUSH LOGS');
+    const rows = await ch.query<{ read_rows: string }>(
+      `SELECT read_rows FROM system.query_log
+        WHERE current_database = currentDatabase() AND type = 'QueryFinish' AND query_kind = 'Select'
+          AND query_start_time_microseconds >= {t:DateTime64(6)} AND has(tables, concat(currentDatabase(), '.', {table:String}))
+        ORDER BY query_start_time_microseconds`,
+      { t, table },
+    );
+    return rows.map((r) => Number(r.read_rows));
+  }
+
+  const countOf = async (ch: ClickHouseService, sql: string, params: Record<string, unknown> = {}): Promise<number> =>
+    Number((await ch.queryOne<{ n: string }>(sql, params))?.n);
+
   // -------------------------------------------------------------------------------------------------------------------
   describe('the recorded XRPL ledgers and escrows made by hand, in steps of 2,000,000 ledgers', () => {
     // Made by hand. Ledgers are between the recorded ones, and each has a `ledgers` row.
@@ -500,9 +537,9 @@ describe('the escrows job (e2e)', () => {
       const newest = async () => [...(await latestEscrows(ch)).values()];
       const first = await newest();
       const run = () => recomputeEscrows(ch, ids, { upTo: RECORDED_HEAD + 6, native: 'XRP' });
-      expect(await run()).toEqual({ written: ids.length, removed: 0 });
+      expect(await run()).toEqual({ written: ids.length, removed: 0, setAside: [] });
       const second = await newest();
-      expect(await run()).toEqual({ written: ids.length, removed: 0 });
+      expect(await run()).toEqual({ written: ids.length, removed: 0, setAside: [] });
       const third = await newest();
       const withoutVersion = (rows: StoredEscrow[]) => rows.map(({ version: _version, ...row }) => row);
       expect(withoutVersion(second)).toEqual(withoutVersion(first));
@@ -583,38 +620,75 @@ describe('the escrows job (e2e)', () => {
     });
   });
 
-  describe('a step that fails, and one that is stopped', () => {
-    const GOOD = idOf(0xb1);
-    const BAD = idOf(0xb2);
+  describe('an escrow that cannot be mapped, and a step that is stopped', () => {
+    const GOOD = idOf(0xb1); // stored by the first step, then given a row whose Amount cannot be mapped
+    const SHAPE = idOf(0xb2); // an Amount of a shape the ledger does not have
+    const FINE = idOf(0xb3);
+    const MPT_BAD = idOf(0xb4); // an MPT amount whose issuance ID is not one
+    const NOT_JSON = idOf(0xb5); // fields that are not JSON
+    const LAST = idOf(0xb6);
     let ch: ClickHouseService;
 
     beforeAll(async () => {
       ch = await fresh();
-      await commitLedgers(ch, [100, 101, 102, 103, 104]);
+      await commitLedgers(ch, [100, 101, 102, 103, 104, 105]);
       await ch.insert(Table.ObjectChanges, [
         create(GOOD, 101, nativeFields(1_000_000, { Sequence: 1 }), { sequence: 1 }),
       ]);
     });
 
-    it('leaves the old sentinel when the recompute fails, and does the window again at the next run', async () => {
-      expect(await runEscrowsStep(ch, { native: 'XRP', step: 2 })).toMatchObject({ from: 99, to: 101 });
-      const sentinel = await readEscrowed(ch);
-      expect(sentinel).toEqual({ drops: '1000000', open: 1, through_ledger: 101 });
-      // an Amount of a shape the ledger does not have, with a good escrow beside it
+    it('commits the step and reports the escrows it set aside, the others of the chunk written', async () => {
+      expect(await runEscrowsStep(ch, { native: 'XRP', step: 2 })).toMatchObject({ from: 99, to: 101, setAside: [] });
+      expect(await readEscrowed(ch)).toEqual({ drops: '1000000', open: 1, through_ledger: 101 });
       await ch.insert(Table.ObjectChanges, [
-        create(BAD, 102, { Account: ALICE, Destination: BOB, Amount: { value: '1' } }),
-        create(idOf(0xb3), 103, nativeFields(2_000_000, { Sequence: 3 }), { sequence: 3 }),
+        change({
+          id: GOOD,
+          ledger: 102,
+          action: 'modified',
+          event: 'update',
+          fields: { Account: ALICE, Destination: BOB, Amount: { currency: 'USD' } },
+        }),
+        create(SHAPE, 102, { Account: ALICE, Destination: BOB, Amount: { value: '1' } }),
+        create(FINE, 103, nativeFields(2_000_000, { Sequence: 3 }), { sequence: 3 }),
+        create(MPT_BAD, 103, {
+          Account: ALICE,
+          Destination: BOB,
+          Amount: { mpt_issuance_id: 'ZZ', value: '1' },
+        }),
+        { ...create(NOT_JSON, 104, nativeFields(9_000_000)), fields: '{' },
+        create(LAST, 104, nativeFields(4_000_000, { Sequence: 6 }), { sequence: 6 }),
       ]);
-      await expect(runEscrowsStep(ch, { native: 'XRP', step: 3 })).rejects.toThrow(BAD);
-      expect(await readEscrowed(ch)).toEqual(sentinel);
-      await ch.command(
-        `DELETE FROM ${Table.ObjectChanges} WHERE object_id = {id:String}`,
-        { id: BAD },
-        { settings: SYNC_DELETE },
-      );
-      // the window (101, 104] is done again from the old watermark
-      expect(await runEscrowsStep(ch, { native: 'XRP', step: 3 })).toMatchObject({ from: 101, to: 104, written: 1 });
-      expect(await readEscrowed(ch)).toEqual({ drops: '3000000', open: 2, through_ledger: 104 });
+      // all six in one chunk: the bad ones sit before, between and after the good ones
+      const done = await runEscrowsStep(ch, { native: 'XRP', step: 3 });
+      expect(done).toMatchObject({ from: 101, to: 104, touched: 6, written: 2, removed: 0 });
+      expect(done.setAside).toEqual([GOOD, SHAPE, MPT_BAD, NOT_JSON]);
+      // the sentinel committed: the window is done, the total counts what was written and the row GOOD had
+      expect(await readEscrowed(ch)).toEqual({ drops: '7000000', open: 3, through_ledger: 104 });
+      expect(done.escrowed).toEqual({ drops: '7000000', open: 3, through_ledger: 104 });
+      const escrows = await latestEscrows(ch);
+      expect([...escrows.keys()].sort()).toEqual([GOOD, FINE, LAST].sort());
+      expect(escrows.get(GOOD)).toMatchObject({ amount: '1', last_ledger: 101 }); // as it was
+      expect(escrows.get(FINE)).toMatchObject({ amount_drops: '2000000', last_ledger: 103 });
+      expect(escrows.get(LAST)).toMatchObject({ amount_drops: '4000000', last_ledger: 104 });
+      // and the next step does not take the window again
+      expect(await runEscrowsStep(ch, { native: 'XRP', step: 3 })).toMatchObject({
+        from: 104,
+        to: 105,
+        touched: 0,
+        setAside: [],
+        escrowed: { drops: '7000000', open: 3, through_ledger: 105 },
+      });
+    });
+
+    it('names each escrow it sets aside to a recompute of its own, and writes the others', async () => {
+      const done = await recomputeEscrows(ch, [SHAPE, FINE, NOT_JSON], { upTo: 105, native: 'XRP' });
+      expect(done).toEqual({ written: 1, removed: 0, setAside: [SHAPE, NOT_JSON] });
+      // the total and the watermark of a hook's refresh agree with the step's
+      expect(await refreshEscrowsTotal(ch, { native: 'XRP' })).toEqual({
+        drops: '7000000',
+        open: 3,
+        through_ledger: 105,
+      });
     });
 
     it('writes nothing once stopped', async () => {
@@ -631,6 +705,125 @@ describe('the escrows job (e2e)', () => {
         EscrowsAborted,
       );
       expect(await count()).toBe(rows);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('a database with no ledger yet', () => {
+    it('writes a watermark of 0, and starts at the ledger before the first one when ledgers arrive', async () => {
+      const ch = await fresh();
+      const empty = { from: 0, to: 0, head: 0, touched: 0, written: 0, removed: 0, setAside: [] };
+      expect(await runEscrowsStep(ch, { native: 'XRP', step: 10 })).toMatchObject({
+        ...empty,
+        escrowed: { drops: '0', open: 0, through_ledger: 0 },
+      });
+      expect(await readEscrowed(ch)).toEqual({ drops: '0', open: 0, through_ledger: 0 });
+      expect(await runEscrowsStep(ch, { native: 'XRP', step: 10 })).toMatchObject(empty);
+
+      // the ingest commits its first ledgers: the job does not walk up from 0, and writes no ledger the table does not have
+      await commitLedgers(
+        ch,
+        Array.from({ length: 26 }, (_, i) => 5000 + i),
+      );
+      await ch.insert(Table.ObjectChanges, [create(idOf(0xd1), 5012, nativeFields(2_000_000, { Sequence: 1 }))]);
+      const steps = await runToHead(ch, 'XRP', 10);
+      expect(steps.map((s) => [s.from, s.to, s.head])).toEqual([
+        [4999, 5009, 5025],
+        [5009, 5019, 5025],
+        [5019, 5025, 5025],
+      ]);
+      expect(await readEscrowed(ch)).toEqual({ drops: '2000000', open: 1, through_ledger: 5025 });
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('what a recompute reads', () => {
+    // 4 × 200,000 Check rows under the IDs asked for, and 4 × 200,000 Escrow rows under the same IDs above `upTo`, in the
+    // partition of the recorded rows (merges stopped): the read is the Escrow rows of the IDs up to `upTo`.
+    const UP_TO = 107_980_000;
+    const CHECK_BASES = [107_850_000, 107_860_000, 107_870_000, 107_880_000];
+    const ABOVE_BASES = [108_000_000, 108_010_000, 108_020_000, 108_030_000];
+    const TOKEN = XRPL_CHANGES.find((r) => r.object_type === 'Escrow' && r.object_id.startsWith(TOKEN_ESCROW))
+      ?.object_id as string;
+    let ch: ClickHouseService;
+
+    beforeAll(async () => {
+      ch = await fresh();
+      await ch.insert(Table.ObjectChanges, XRPL_CHANGES);
+      await stopMerges(ch, Table.ObjectChanges);
+      for (const id of [TIMED, TOKEN]) {
+        for (const base of CHECK_BASES) await insertBulk(ch, 'Check', id, base);
+        for (const base of ABOVE_BASES) await insertBulk(ch, 'Escrow', id, base);
+      }
+    });
+
+    it('reads the Escrow rows of the IDs up to upTo: not other types under the same IDs, nor the rows above', async () => {
+      const ids = [TIMED, TOKEN];
+      const rowsOfIds = await countOf(
+        ch,
+        `SELECT count() AS n FROM ${Table.ObjectChanges}
+          WHERE object_type = 'Escrow' AND object_id IN {ids:Array(String)} AND ledger_index <= {upTo:UInt32}`,
+        { ids, upTo: UP_TO },
+      );
+      const parts = await countOf(
+        ch,
+        `SELECT count() AS n FROM system.parts WHERE database = currentDatabase() AND table = {table:String} AND active`,
+        { table: Table.ObjectChanges },
+      );
+      const total = await countOf(ch, `SELECT count() AS n FROM ${Table.ObjectChanges}`);
+
+      let done: Awaited<ReturnType<typeof recomputeEscrows>> | undefined;
+      const read = await reads(ch, Table.ObjectChanges, async () => {
+        done = await recomputeEscrows(ch, ids, { upTo: UP_TO, native: 'XRP' });
+      });
+      // the newest row and the created row: two reads, each within the rows of the IDs and two granules for each part
+      const bound = rowsOfIds + 2 * GRANULE * parts;
+      expect(parts).toBe(1 + 2 * CHECK_BASES.length * 2); // the recorded rows, and the bulk of each ID: Check and Escrow
+      expect(read).toHaveLength(2);
+      for (const rows of read) expect(rows).toBeLessThanOrEqual(bound);
+      // the answer is the escrows as of upTo, not the rows above it
+      expect(done).toEqual({ written: 2, removed: 0, setAside: [] });
+      const escrows = await latestEscrows(ch);
+      expect(escrows.get(TIMED)).toMatchObject({
+        last_ledger: 107_897_249,
+        created_ledger: 107_897_249,
+        owner: TIMED_OWNER,
+      });
+      expect(escrows.get(TOKEN)).toMatchObject({ last_ledger: 107_967_068, deleted: 1 });
+      // and the bound can fail: it is below the rows of one bulk, which a read without the type or without upTo would read
+      expect(bound).toBeLessThan(CHECK_BASES.length * PER_PART);
+      expect(total).toBeGreaterThan(2 * (CHECK_BASES.length + ABOVE_BASES.length) * PER_PART);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('a clock behind the stored versions', () => {
+    it('writes an escrow row above the version of the one it replaces, and the new row is the newest', async () => {
+      const ch = await fresh();
+      await stopMerges(ch, Table.Escrows);
+      const X = idOf(0xf1);
+      await insertChanges(ch, [create(X, 300, nativeFields(1_000_000, { Sequence: 1 }), { sequence: 1 })]);
+      // a row written by a clock that was ahead: its version is a minute above this machine's
+      const ahead = Date.now() + 60_000;
+      await ch.insert(Table.Escrows, [
+        {
+          ...sentinelOf({ amount_drops: '9000000', open_count: 0, through_ledger: 0, version: ahead }),
+          escrow_id: X,
+          owner: ALICE,
+          destination: BOB,
+          currency: 'XRP',
+          amount: '9',
+          last_ledger: 1,
+        },
+      ]);
+      expect(await recomputeEscrows(ch, [X], { upTo: 300, native: 'XRP' })).toEqual({
+        written: 1,
+        removed: 0,
+        setAside: [],
+      });
+      const row = (await latestEscrows(ch)).get(X);
+      expect(row).toMatchObject({ amount: '1', amount_drops: '1000000', last_ledger: 300 });
+      expect(row?.version).toBeGreaterThan(ahead);
     });
   });
 
@@ -668,7 +861,11 @@ describe('the escrows job (e2e)', () => {
       );
       // no row names it any more: it is found by the ledger its newest escrows row saw
       expect(await escrowsOfLedgers(ch, 205, 215)).toEqual([VANISHED]);
-      expect(await recomputeEscrows(ch, [VANISHED], { upTo: 250, native: 'XRP' })).toEqual({ written: 0, removed: 1 });
+      expect(await recomputeEscrows(ch, [VANISHED], { upTo: 250, native: 'XRP' })).toEqual({
+        written: 0,
+        removed: 1,
+        setAside: [],
+      });
       expect((await latestEscrows(ch)).has(VANISHED)).toBe(false);
       expect(
         Number(
@@ -690,7 +887,11 @@ describe('the escrows job (e2e)', () => {
       expect(await readEscrowed(ch)).toEqual({ drops: '1000000', open: 1, through_ledger: 250 });
       expect((await sentinelRows(ch)).pop()?.version).toBeGreaterThan(sentinel?.version ?? 0);
       // removing it again is nothing to do
-      expect(await recomputeEscrows(ch, [VANISHED], { upTo: 250, native: 'XRP' })).toEqual({ written: 0, removed: 0 });
+      expect(await recomputeEscrows(ch, [VANISHED], { upTo: 250, native: 'XRP' })).toEqual({
+        written: 0,
+        removed: 0,
+        setAside: [],
+      });
     });
 
     it('goes back to the older row of an escrow whose newest row a re-ingest removed', async () => {
@@ -702,7 +903,11 @@ describe('the escrows job (e2e)', () => {
       );
       // the ledger of the removed row names nothing in object_changes: only the escrow's last_ledger finds it
       expect(await escrowsOfLedgers(ch, 240, 240)).toEqual([REOPENED]);
-      expect(await recomputeEscrows(ch, [REOPENED], { upTo: 250, native: 'XRP' })).toEqual({ written: 1, removed: 0 });
+      expect(await recomputeEscrows(ch, [REOPENED], { upTo: 250, native: 'XRP' })).toEqual({
+        written: 1,
+        removed: 0,
+        setAside: [],
+      });
       expect((await latestEscrows(ch)).get(REOPENED)).toMatchObject({
         deleted: 0,
         last_ledger: 220,
@@ -726,70 +931,38 @@ describe('the escrows job (e2e)', () => {
   describe('what the job reads', () => {
     // 4 × 200,000 rows of other objects in the partition of the window, and of escrows in another partition: the rows are
     // copies of one row, in four parts (merges stopped), the shape of apps/api/test/support/read-rows.ts' bulk.
-    const PER_PART = 200_000;
-    const GRANULE = 8192;
     const CHECK_BASES = [107_850_000, 107_860_000, 107_870_000, 107_880_000]; // in the window below
     const ESCROW_BASES = [21_000_000, 22_000_000, 23_000_000, 24_000_000]; // another partition (partitions of 10,000,000)
     const WINDOW = { from: 107_800_000, to: 107_980_000 };
     let ch: ClickHouseService;
-
-    /** One part of `PER_PART` rows of an object: four rows a ledger from `base`. */
-    async function insertBulk(objectType: string, objectId: string, base: number): Promise<void> {
-      await ch.command(
-        `INSERT INTO ${Table.ObjectChanges}
-         SELECT {type:String}, {id:String}, toUInt32({base:UInt32} + intDiv(n.number, 4)), toUInt32(n.number % 4),
-                'synthetic-bulk', toDateTime(1700000000, 'UTC'), 'EscrowCreate', 'tesSUCCESS', 'rSyntheticBulk', '',
-                'created', 'create', 'rSyntheticBulk', 'rSyntheticBulk',
-                '{"Account":"rSyntheticBulk","Amount":"1000000","Destination":"rSyntheticBulk"}', '{}', '{}'
-           FROM numbers({n:UInt32}) AS n`,
-        { type: objectType, id: objectId, base, n: PER_PART },
-        { settings: { insert_deduplicate: 0 } },
-      );
-    }
-
-    /** What `system.query_log` says the SELECTs on a table read while `run` ran. */
-    async function reads(table: Table, run: () => Promise<unknown>): Promise<number[]> {
-      const [{ t }] = await ch.query<{ t: string }>('SELECT now64(6) AS t');
-      await run();
-      await ch.command('SYSTEM FLUSH LOGS');
-      const rows = await ch.query<{ read_rows: string }>(
-        `SELECT read_rows FROM system.query_log
-          WHERE current_database = currentDatabase() AND type = 'QueryFinish' AND query_kind = 'Select'
-            AND query_start_time_microseconds >= {t:DateTime64(6)} AND has(tables, concat(currentDatabase(), '.', {table:String}))
-          ORDER BY query_start_time_microseconds`,
-        { t, table },
-      );
-      return rows.map((r) => Number(r.read_rows));
-    }
-
-    const count = async (sql: string, params: Record<string, unknown> = {}): Promise<number> =>
-      Number((await ch.queryOne<{ n: string }>(sql, params))?.n);
 
     beforeAll(async () => {
       ch = await fresh();
       // the recorded rows in one part (partition 10: ledgers 100,000,000 to 109,999,999)
       await ch.insert(Table.ObjectChanges, XRPL_CHANGES);
       await stopMerges(ch, Table.ObjectChanges);
-      for (const base of CHECK_BASES) await insertBulk('Check', idOf(0xc0ffee), base);
-      for (const base of ESCROW_BASES) await insertBulk('Escrow', idOf(0xe5c0), base);
+      for (const base of CHECK_BASES) await insertBulk(ch, 'Check', idOf(0xc0ffee), base);
+      for (const base of ESCROW_BASES) await insertBulk(ch, 'Escrow', idOf(0xe5c0), base);
     });
 
     it('reads the escrow rows of the partitions holding the window, and a granule or two of each part, not the other rows', async () => {
-      const escrowRows = await count(
+      const escrowRows = await countOf(
+        ch,
         `SELECT count() AS n FROM ${Table.ObjectChanges}
           WHERE object_type = 'Escrow' AND intDiv(ledger_index, 10000000) = intDiv({to:UInt32}, 10000000)`,
         { to: WINDOW.to },
       );
-      const parts = await count(
+      const parts = await countOf(
+        ch,
         `SELECT count() AS n FROM system.parts
           WHERE database = currentDatabase() AND table = {table:String} AND active
             AND partition = toString(intDiv({to:UInt32}, 10000000))`,
         { table: Table.ObjectChanges, to: WINDOW.to },
       );
-      const total = await count(`SELECT count() AS n FROM ${Table.ObjectChanges}`);
+      const total = await countOf(ch, `SELECT count() AS n FROM ${Table.ObjectChanges}`);
 
       let touched: string[] = [];
-      const read = await reads(Table.ObjectChanges, async () => {
+      const read = await reads(ch, Table.ObjectChanges, async () => {
         touched = await escrowsTouchedIn(ch, WINDOW.from, WINDOW.to);
       });
       // the bound: its escrow rows plus two granules for each part (the tail of a part's last granule is read as well)
@@ -825,14 +998,14 @@ describe('the escrows job (e2e)', () => {
         sentinelOf({ amount_drops: '123', open_count: 4, through_ledger: 77, version: 5 }),
       ]);
       let sentinel: Escrowed | undefined;
-      const read = await reads(Table.Escrows, async () => {
+      const read = await reads(ch, Table.Escrows, async () => {
         sentinel = await readEscrowed(ch);
       });
       expect(sentinel).toEqual({ drops: '123', open: 4, through_ledger: 77 });
       expect(read).toHaveLength(1);
       // the sentinel part has one row; the others start above the empty key and are not read at all
       expect(read[0]).toBeLessThanOrEqual(1 + 2 * GRANULE);
-      expect(await count(`SELECT count() AS n FROM ${Table.Escrows}`)).toBe(4 * PER_PART + 1);
+      expect(await countOf(ch, `SELECT count() AS n FROM ${Table.Escrows}`)).toBe(4 * PER_PART + 1);
     });
   });
 
