@@ -958,7 +958,7 @@ columns, the same on every page and in this order:
 | `tx_type`, `result` | `Payment`, `tesSUCCESS`, ... |
 | `initiator` | `true` when the account sent the transaction (its `Account`), `false` when the transaction only affected it. |
 | `counterparty`, `amount`, `currency`, `issuer` | From one mapping per transaction type, below. Empty where the type has none. |
-| `fee` | The fee in whole units of the native currency, on the row of the account that paid it: the transaction's `Delegate` when it names one, else its sender (a delegated transaction's fee is the delegate's, not the sender's). Empty on every other row. |
+| `fee` | The fee in whole units of the native currency, on the row of the account that paid it: the transaction's `Delegate` when it names one, else its sender (a delegated transaction's fee is the delegate's, not the sender's). An inner transaction of a Batch pays none (the outer one pays for all): its fee is `0` on that row. Empty on every other row. |
 | `flags_changed` | The account flags the transaction set or cleared. Empty for now: it fills once the account state history is recorded. |
 | `delegate` | The transaction's `Delegate`, the account that signed it for its sender and paid its fee, on the row of every account the transaction affected. Empty when the transaction has no delegate. Always the last column. |
 

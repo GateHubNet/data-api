@@ -1,5 +1,6 @@
 import {
   amountToValueString,
+  delegateOf,
   deliveredAmount,
   dropsToNative,
   feePayer,
@@ -152,6 +153,6 @@ export function toTransactionSummary(row: TransactionsRow, account: string, ctx:
     issuer: side.issuer ?? null,
     fee: feePayer(tx) === account ? dropsToNative(row.fee) : null,
     flags_changed: null,
-    delegate: typeof tx.Delegate === 'string' && tx.Delegate !== '' ? tx.Delegate : null,
+    delegate: delegateOf(tx) ?? null,
   };
 }
