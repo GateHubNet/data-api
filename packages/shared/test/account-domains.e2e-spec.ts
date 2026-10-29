@@ -10,6 +10,7 @@ import { RawLedger, RawTransaction } from '../src/ingest/raw-ledger';
 import { getNetworkProfile } from '../src/network';
 import { accountDomainVersion } from '../src/parsers/account-domains.parser';
 import { parseContextFor } from '../src/parsers/parser.interface';
+import { ACCOUNT_DOMAINS_SEED_BUCKETS, ACCOUNT_DOMAINS_SEED_SQL } from '../src/tomls/account-domains-seed';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 
 const FIXTURES = join(__dirname, 'fixtures');
@@ -66,12 +67,20 @@ function refOf(c: DomainCase): CaseRef {
   return ref;
 }
 
+/** An account a written ledger touches (a root changed by a transaction) that has no Domain before or after: it gets no row. */
+interface NoDomainCase {
+  account: string;
+  ledger: number;
+  hash: string;
+}
+
 interface Network {
   name: 'xrpl' | 'xahau';
   database: string;
   /** The ledgers to write: every ledger of the network's `account-domains` directory (Xahau has none), and the ones read in place. */
   ledgers: () => RawLedger[];
   cases: DomainCase[];
+  noDomain: NoDomainCase[];
 }
 
 const NETWORKS: Network[] = [
@@ -152,6 +161,14 @@ const NETWORKS: Network[] = [
         node_index: 0,
       },
     ],
+    // the sender of the Payment of 107671317 that pays rf82s1… (the account with test.com)
+    noDomain: [
+      {
+        account: 'r4D1JmzMJLqe4oXk4LhukfAQN8f2fcSDhv',
+        ledger: 107671317,
+        hash: 'B244AF0904E22964D1AF89FD213AA8502ADF65FEED95185C6B62961DB9DC2571',
+      },
+    ],
   },
   {
     name: 'xahau',
@@ -173,6 +190,14 @@ const NETWORKS: Network[] = [
         account: 'rGsbGtyrXoPSocAWcngrQZqm6AaQmocw5B',
         domain_hex: '6E313733372E62697364616B6E6F6465313730312D313735302E6F7668',
         node_index: 2,
+      },
+    ],
+    // the recipient of that Payment
+    noDomain: [
+      {
+        account: 'rHktfGUbjqzU4GsYCMc1pDjdHXb5CJamto',
+        ledger: 26540187,
+        hash: '00F5098EB67BB5E4E177D02F5B492DD5BF215DFF1677EFBD8542394387EBC866',
       },
     ],
   },
@@ -309,6 +334,23 @@ describe('account_domains from recorded ledgers (e2e)', () => {
       });
     }
 
+    it.each(network.noDomain.map((c) => [c.account, c] as const))(
+      'writes no row for %s, whose root a transaction changed and which has no Domain',
+      async (_account, c) => {
+        const tx = transactionOf({ ledger: c.ledger, hash: c.hash, type: 'Payment' });
+        // the fixture holds the case: a root of the account changed by the transaction, with no Domain on either side
+        const roots = (tx.meta.AffectedNodes as Json[])
+          .map((node) => node.ModifiedNode as Json | undefined)
+          .filter((body) => body?.LedgerEntryType === 'AccountRoot' && body.FinalFields?.Account === c.account);
+        expect(roots).toHaveLength(1);
+        expect(roots[0]?.PreviousFields).toBeDefined();
+        expect(roots[0]?.FinalFields?.Domain).toBeUndefined();
+        expect(roots[0]?.PreviousFields?.Domain).toBeUndefined();
+
+        expect(await newest(c.account)).toBeUndefined();
+      },
+    );
+
     it('comes back the same after a ledger is deleted and written again', async () => {
       const before = await currentDomains();
       expect(before.length).toBeGreaterThan(0);
@@ -332,6 +374,78 @@ describe('account_domains from recorded ledgers (e2e)', () => {
 
       await new LedgerWriter(svc, ctx).write(ledgers.filter((l) => l.header.ledger_index === ledger));
       expect(await currentDomains()).toEqual(before);
+    });
+  });
+});
+
+/**
+ * The seed (spec 10, `ACCOUNT_DOMAINS_SEED_SQL`) against the parser on recorded ledgers: the current domain of every account
+ * that the seed copies from `account_states` is the row the parser wrote, on the same (ledger, tx, node), so a later
+ * `--reprocess` of the ledger writes an identical row.
+ */
+describe('the seed of account_domains against the parser, on recorded ledgers (e2e)', () => {
+  let ch: StartedClickHouse;
+
+  beforeAll(async () => {
+    ch = await startClickHouse();
+  });
+
+  afterAll(async () => {
+    await ch?.container.stop();
+  });
+
+  /** The newest row of every account, in account order, as every reader takes it. */
+  interface Current {
+    account: string;
+    newest_hex: string;
+    newest_deleted: number;
+    newest_version: string;
+  }
+
+  describe.each([
+    { name: 'xrpl' as const, dir: 'xrpl/recorded', ledger: 107671317 },
+    { name: 'xahau' as const, dir: 'xahau/recorded', ledger: 26540711 },
+  ])('$name, ledger $ledger', ({ name, dir, ledger }) => {
+    let svc: ClickHouseService;
+
+    beforeAll(async () => {
+      const config = { ...ch.config, database: `domains_seed_${name}` };
+      await runMigrations({ config, log: () => undefined });
+      svc = new ClickHouseService(config);
+      await new LedgerWriter(svc, parseContextFor(getNetworkProfile(name))).write(ledgersOf(dir, [ledger]));
+    });
+
+    afterAll(async () => {
+      await svc?.close();
+    });
+
+    const current = (): Promise<Current[]> =>
+      svc.query<Current>(
+        `SELECT account, argMax(domain_hex, version) AS newest_hex, argMax(deleted, version) AS newest_deleted,
+                max(version) AS newest_version
+           FROM ${Table.AccountDomains} GROUP BY account ORDER BY account`,
+        {},
+        READ_SETTINGS,
+      );
+
+    it('writes for every account with a Domain the newest row the parser wrote, and none for the others', async () => {
+      const parsed = await current();
+      const withDomain = parsed.filter((row) => row.newest_hex !== '' && Number(row.newest_deleted) === 0);
+      expect(withDomain.length).toBeGreaterThan(0);
+      // the ledger has accounts with a state row and no Domain: the seed must leave them out
+      const [{ states }] = await svc.query<{ states: string }>(
+        `SELECT uniqExact(account) AS states FROM ${Table.AccountStates}`,
+        {},
+        READ_SETTINGS,
+      );
+      expect(Number(states)).toBeGreaterThan(withDomain.length);
+
+      await svc.command(`TRUNCATE TABLE ${Table.AccountDomains}`);
+      for (let bucket = 0; bucket < ACCOUNT_DOMAINS_SEED_BUCKETS; bucket++) {
+        await svc.command(ACCOUNT_DOMAINS_SEED_SQL, { X: ledger, bucket });
+      }
+
+      expect(await current()).toEqual(withDomain);
     });
   });
 });
