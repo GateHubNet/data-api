@@ -129,13 +129,38 @@ describe('readToml', () => {
       expect(read(text).accounts.map((a) => a.address)).toEqual([good]);
     });
 
-    it('keeps the first entry of a repeated address', () => {
+    it('keeps the first entry of a repeated address on one network', () => {
       const text =
-        account(address(1), 'desc = "first"\n') + account(address(2)) + account(address(1), 'desc = "second"\n');
+        account(address(1), 'desc = "first"\n') +
+        account(address(2)) +
+        account(address(1), 'desc = "second"\n') +
+        account(address(2), 'network = "Main"\ndesc = "on main"\n') +
+        account(address(2), 'network = "main"\ndesc = "on main again"\n');
       expect(read(text).accounts).toEqual([
         { address: address(1), network: '', desc: 'first' },
         { address: address(2), network: '', desc: '' },
+        { address: address(2), network: 'main', desc: 'on main' },
       ]);
+    });
+
+    it('keeps an address of each network: one listed for testnet before main keeps its main entry', () => {
+      const text =
+        account(address(1), 'network = "testnet"\ndesc = "Northpeak Test"\n') +
+        account(address(1), 'network = "main"\ndesc = "Northpeak Treasury"\n');
+      expect(read(text).accounts).toEqual([
+        { address: address(1), network: 'testnet', desc: 'Northpeak Test' },
+        { address: address(1), network: 'main', desc: 'Northpeak Treasury' },
+      ]);
+    });
+
+    it('reads a desc that holds an @ as none, so that no email is a name', () => {
+      const text =
+        account(address(1), 'desc = "write to ops@northpeak.example"\n') +
+        account(address(2), 'desc = "ops\\u200B@northpeak.example"\n') +
+        account(address(3), 'desc = "Northpeak Treasury"\n');
+      const result = read(text);
+      expect(result.accounts.map((a) => a.desc)).toEqual(['', '', 'Northpeak Treasury']);
+      expect(JSON.stringify(result)).not.toContain('@');
     });
 
     it('keeps a desc of 256 code points and reads 257 as none, cutting nothing', () => {
@@ -308,6 +333,73 @@ describe('readToml', () => {
         ...Array.from({ length: 14 }, (_, i) => `k${String(i).padStart(2, '0')}`),
       ]);
       expect(fields.startsWith('{"1":2,"42":1,"k00":0,')).toBe(true);
+    });
+
+    it('never keeps a key that names an email or a social account, or a text that holds an @, and gives them no slot of the 16', () => {
+      const personal = [
+        'contact_email = "dollar@northpeak.example"',
+        'Email = "desk@northpeak.example"',
+        'mailbox = "box-17"',
+        'twitter = "northpeak_fx"',
+        'X = "northpeak_x"',
+        'telegram = "northpeak_tg"',
+        'support_handle = "np_support"',
+        'GitHub_org = "northpeak-labs"',
+        'discord = "np#1234"',
+        'facebook = "northpeak.fx"',
+        'linkedin_url = "https://linkedin.example/company/northpeak"',
+        'instagram = "northpeak.ig"',
+        'reddit = "u_northpeak"',
+        'keybase = "northpeak_kb"',
+        'youtube = "northpeak-tube"',
+        'tiktok = "northpeak.tt"',
+        'contact = "the desk"',
+        'telegram_id = 4242',
+        'note = "write to ops@x.example"',
+      ];
+      const keep = Array.from({ length: 16 }, (_, i) => `k${String(i).padStart(2, '0')} = ${i}`);
+      for (const [section, own] of [
+        ['CURRENCIES', 'code = "NPD"'],
+        ['VALIDATORS', 'public_key = "nHk1"'],
+      ]) {
+        const text = [`[[${section}]]`, own, 'name = "Northpeak Dollar"', ...personal, ...keep].join('\n');
+        const result = read(text);
+        const [entry] = section === 'CURRENCIES' ? result.currencies : result.validators;
+        const fields = JSON.parse(entry?.fields ?? '') as Record<string, unknown>;
+        // the skipped keys take no slot: `name` and fifteen of the sixteen others fill it
+        expect([section, Object.keys(fields)]).toEqual([
+          section,
+          ['name', ...Array.from({ length: 15 }, (_, i) => `k${String(i).padStart(2, '0')}`)],
+        ]);
+        const json = JSON.stringify(result);
+        for (const value of [
+          '@',
+          'box-17',
+          'northpeak_fx',
+          'northpeak_x',
+          'northpeak_tg',
+          'np_support',
+          'northpeak-labs',
+          'np#1234',
+          'northpeak.fx',
+          'linkedin',
+          'northpeak.ig',
+          'u_northpeak',
+          'northpeak_kb',
+          'northpeak-tube',
+          'northpeak.tt',
+          'the desk',
+          '4242',
+          'write to',
+        ]) {
+          expect([section, value, json.includes(value)]).toEqual([section, value, false]);
+        }
+      }
+    });
+
+    it('keeps the name of a key that only looks like one of them: index, max, exchange', () => {
+      const text = ['[[CURRENCIES]]', 'code = "NPD"', 'index = 1', 'max = 2', 'exchange = "Northpeak FX"'].join('\n');
+      expect(read(text).currencies[0]?.fields).toBe('{"index":1,"max":2,"exchange":"Northpeak FX"}');
     });
 
     it('keeps the first 16 of 20 scalar keys', () => {

@@ -18,6 +18,13 @@ describe('cleanTomlText', () => {
     expect(cleanTomlText(decomposed, 1)).toBe('\u00E9');
   });
 
+  it('removes a format character before it composes: e, a zero-width space and an acute accent are one code point', () => {
+    const split = 'e\u200B\u0301';
+    const cleaned = cleanTomlText(split, 1);
+    expect(cleaned).toBe('\u00E9');
+    expect(cleaned?.normalize('NFC')).toBe(cleaned);
+  });
+
   it('keeps a text of exactly max code points and refuses one code point more, cutting nothing', () =>
     expect([cleanTomlText('x'.repeat(64), 64), cleanTomlText('x'.repeat(65), 64)]).toEqual([
       'x'.repeat(64),

@@ -73,6 +73,9 @@ const DATE_TIME_MAX_S = 4_294_967_295;
 const MAX_TEXT = { desc: 256, code: 40, publicKey: 128, principal: 100, network: 64, field: 256 } as const;
 
 const FIELD_KEY = /^[A-Za-z0-9_]{1,32}$/;
+/** A part of the name of a key that names an email or a social account (spec 12); the key `x` alone is one too. */
+const PERSONAL_KEY =
+  /email|mail|twitter|github|telegram|discord|facebook|linkedin|instagram|reddit|keybase|youtube|tiktok|contact|handle/;
 const BYTE_ORDER_MARK = 0xfeff;
 
 /** The text is not TOML. The message says nothing of the file: a parser's own message quotes the line that failed. */
@@ -126,9 +129,23 @@ function networkOf(entry: Record<string, unknown>): string {
   return typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : '';
 }
 
+/** Whether a key names an email or a social account: `x`, or a name that holds one of `PERSONAL_KEY`'s words, in any case. */
+function isPersonalKey(key: string): boolean {
+  const name = key.toLowerCase();
+  return name === 'x' || PERSONAL_KEY.test(name);
+}
+
+/** A cleaned text that holds no `@`: an email, or a handle written with one, is no text a toml gives (spec 12). */
+function textOf(value: unknown, max: number): string | undefined {
+  const text = cleanTomlText(value, max);
+  return text === undefined || text.includes('@') ? undefined : text;
+}
+
 /**
  * The keys of an entry other than `kept`, as JSON object text: the first `TOML_LIMITS.fieldKeys` whose name matches
  * `FIELD_KEY` and whose value is a string (cleaned), a finite number or a boolean. A date, a list or a table is no field.
+ * A key that names an email or a social account (`isPersonalKey`) and a text that holds an `@` are never kept, whatever
+ * else they hold, and take no place within the sixteen (spec 12).
  * The keys come in the parsed object's order, not the file's (the parser keeps no file order): a key that reads as an array
  * index (`1`, `42`) comes first, in ascending order, and so may take the place of a later key within the sixteen.
  */
@@ -136,10 +153,10 @@ function fieldsOf(entry: Record<string, unknown>, kept: readonly string[]): stri
   const fields: [string, string | number | boolean][] = [];
   for (const [key, value] of Object.entries(entry)) {
     if (fields.length === TOML_LIMITS.fieldKeys) break;
-    if (kept.includes(key) || !FIELD_KEY.test(key)) continue;
+    if (kept.includes(key) || !FIELD_KEY.test(key) || isPersonalKey(key)) continue;
     const scalar =
       typeof value === 'string'
-        ? cleanTomlText(value, MAX_TEXT.field)
+        ? textOf(value, MAX_TEXT.field)
         : typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))
           ? value
           : undefined;
@@ -166,8 +183,11 @@ function unixSecondsOf(value: unknown): UnixSeconds | null {
  * entries of every network are kept: a reader filters them with `countsOn`. The text is parsed, never evaluated, never kept.
  * `profile` is read by no rule (the writer keeps every network's entries); it is the signature D6 and D8 call.
  *
- * - `[[ACCOUNTS]]`: `address` (a classic address with a valid checksum, once: the first entry of a repeat is kept), `desc`.
- * - `[[CURRENCIES]]`: `code`, `issuer`, and the other scalar keys as `fields`; `[[VALIDATORS]]`: `public_key` and `fields`.
+ * - `[[ACCOUNTS]]`: `address` (a classic address with a valid checksum, once a network: the first entry of an address and a
+ *   `network` is kept, so that an address listed for a test network first keeps its entry for this one), `desc` (none when it
+ *   holds an `@`).
+ * - `[[CURRENCIES]]`: `code`, `issuer`, and the other scalar keys as `fields`; `[[VALIDATORS]]`: `public_key` and `fields`. No
+ *   key of `fields` names an email or a social account, and no text of it holds an `@`.
  * - `[[PRINCIPALS]]`: the `name` alone, without an `@`, once. An email or a social handle is never read.
  * - `[METADATA]`: `modified` (dropped before 2012 or more than a day after `fetchedAt`) and `expires`. Both are `null` outside what a
  *   `DateTime('UTC')` column holds (1970 to 2106); `expires` is otherwise kept whatever its value against now, an expired date included.
@@ -179,17 +199,16 @@ export function readToml(text: string, profile: Pick<NetworkProfile, 'name'>, fe
   const document = parseTomlText(text);
 
   const accounts: TomlAccount[] = [];
+  // an address holds no space, so the first one ends it
   const seen = new Set<string>();
   for (const entry of entriesOf(document, 'ACCOUNTS')) {
     if (accounts.length === TOML_LIMITS.accounts) break;
     const address = classicAddressOf(own(entry, 'address'));
-    if (address === undefined || seen.has(address)) continue;
-    seen.add(address);
-    accounts.push({
-      address,
-      network: networkOf(entry),
-      desc: cleanTomlText(own(entry, 'desc'), MAX_TEXT.desc) ?? '',
-    });
+    if (address === undefined) continue;
+    const network = networkOf(entry);
+    if (seen.has(`${address} ${network}`)) continue;
+    seen.add(`${address} ${network}`);
+    accounts.push({ address, network, desc: textOf(own(entry, 'desc'), MAX_TEXT.desc) ?? '' });
   }
 
   const currencies: TomlCurrency[] = [];

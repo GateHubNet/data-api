@@ -70,6 +70,7 @@ const TREASURY = accountAt(0x7f01);
 const PAYROLL = accountAt(0x7f02);
 const TESTNET_RESERVE = accountAt(0x7f03); // listed for the test network only
 const RESERVE = accountAt(0x7f04);
+const MAILBOX = accountAt(0x7f05); // its desc is an email: no name
 const VALIDATOR_KEY = encodeNodePublic(Buffer.from(`ED${'ab'.repeat(32)}`, 'hex'));
 const OTHER_VALIDATOR_KEY = encodeNodePublic(Buffer.from(`ED${'cd'.repeat(32)}`, 'hex'));
 
@@ -149,12 +150,17 @@ const EXAMPLE: Body = {
 
 /**
  * A toml with the personal data a file may hold: a principal with an email and the handles of the networks, a principal
- * named by an email, an organization, servers, and keys of the entries that are not the ones served.
+ * named by an email, an account described by an email, an organization, servers, and keys of the entries that name an email or
+ * a handle, or hold one.
  */
 const QUILLFEATHER_TOML = `
 [[ACCOUNTS]]
 address = "${RESERVE}"
 desc = "Quillfeather Reserve"
+
+[[ACCOUNTS]]
+address = "${MAILBOX}"
+desc = "write to mailbox@quillfeather.example"
 
 [[PRINCIPALS]]
 name = "Ingrid Vasquez"
@@ -174,12 +180,16 @@ name = "Omar Haddad"
 code = "QFD"
 name = "Quill Dollar"
 contact_email = "dollar@quillfeather.example"
+telegram = "quilldollar"
+support_handle = "qf_desk"
+note = "write to desk@quillfeather.example"
 
 [[VALIDATORS]]
 public_key = "${VALIDATOR_KEY}"
 owner_country = "US"
 contact = "validator@quillfeather.example"
 twitter = "@qfvalidator"
+x = "qfvalidator_x"
 
 [[SERVERS]]
 url = "wss://ws.quillfeather.example"
@@ -261,25 +271,45 @@ describe('GET /v2/toml/{domain}', () => {
       status: 'ok',
       checked: expect.any(String),
       fetched: expect.any(String),
-      accounts: [{ address: RESERVE, desc: 'Quillfeather Reserve' }],
+      // the account described by an email is listed with no desc
+      accounts: [{ address: RESERVE, desc: 'Quillfeather Reserve' }, { address: MAILBOX }],
       currencies: [{ code: 'QFD', name: 'Quill Dollar' }],
       // the principal named by an email is no name
       principals: ['Ingrid Vasquez', 'Omar Haddad'],
       validators: [{ public_key: VALIDATOR_KEY, owner_country: 'US' }],
     });
-    expect(res.text).not.toContain('@');
-    for (const word of [
-      'email',
-      'twitter',
-      'github',
-      'linkedin',
-      'contact',
-      'ingridv',
-      'wss://',
-      'Holdings',
-      'ORGANIZATION',
+    // and none of it is stored either: the row holds no word of it, the `fields` the answer leaves out included
+    const [stored] = await h.ch.query<Record<string, unknown>>(
+      `SELECT accounts, currencies, validators, principals FROM ${Table.DomainTomls} WHERE domain = 'quillfeather.example'`,
+    );
+    const row = JSON.stringify(stored);
+    expect(JSON.parse(row).currencies).toEqual([
+      { code: 'QFD', issuer: '', network: '', fields: '{"name":"Quill Dollar"}' },
+    ]);
+    for (const [where, text] of [
+      ['answer', res.text],
+      ['row', row],
     ]) {
-      expect([word, res.text.includes(word)]).toEqual([word, false]);
+      expect([where, text.includes('@')]).toEqual([where, false]);
+      for (const word of [
+        'email',
+        'twitter',
+        'github',
+        'linkedin',
+        'contact',
+        'telegram',
+        'handle',
+        'ingridv',
+        'quilldollar',
+        'qf_desk',
+        'qfvalidator',
+        'write to',
+        'wss://',
+        'Holdings',
+        'ORGANIZATION',
+      ]) {
+        expect([where, word, text.includes(word)]).toEqual([where, word, false]);
+      }
     }
   });
 
