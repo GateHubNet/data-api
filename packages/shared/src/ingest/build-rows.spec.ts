@@ -6,14 +6,16 @@ import { syntheticHash } from '../../test/synthetic-hash';
 import { mptOfferHash, withMptOffers } from '../../test/synthetic-mpt-offers';
 import { EXPIRED_ACCEPT_BASE, withTecExpiredAccept } from '../../test/synthetic-tec-expired-accept';
 import { foldNftEvents } from '../aggregate/nft-state';
-import { NFT_PARSER_VERSION, PARSER_VERSION } from '../clickhouse/rows';
+import { DOMAIN_PARSER_VERSION, NFT_PARSER_VERSION, OBJECT_PARSER_VERSION, PARSER_VERSION } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
 import { AmmParser } from '../parsers/amm.parser';
 import { NftParser, ParsedNft, rolesOf } from '../parsers/nft.parser';
+import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, parseContextFor, toParserTx } from '../parsers/parser.interface';
 import { PaymentParser } from '../parsers/payment.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import { objectCase, objectFixturesDir } from '../test-utils/object-cases';
 import { buildLedgerRows, CHILD_TABLES, ChildRowsKey, LedgerParseError, LedgerRows } from './build-rows';
 import { FixtureLedgerSource } from './fixture-ledger-source';
 import { normalizeLedgerResponse, RawLedger } from './raw-ledger';
@@ -98,6 +100,25 @@ const URITOKEN_SET: FixtureSet = {
   name: 'recorded URIToken cases (xahau)',
   ctx: XAHAU,
   dir: join(FIXTURES, 'xahau', 'uritoken'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The recorded escrow, check, payment channel and delegation cases (`test/fixtures/{xrpl,xahau}/objects`, D5 Task 1):
+ * whole ledgers around each case. Like the NFT sets they are no `SETS` entry; the object tests below use them.
+ */
+const OBJECTS_XRPL: FixtureSet = {
+  name: 'recorded object cases (xrpl)',
+  ctx: XRPL,
+  dir: objectFixturesDir('xrpl'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+const OBJECTS_XAHAU: FixtureSet = {
+  name: 'recorded object cases (xahau)',
+  ctx: XAHAU,
+  dir: objectFixturesDir('xahau'),
   minNativeChecked: 0,
   minTrustlinesChecked: 0,
 };
@@ -1356,15 +1377,20 @@ describe('AMM rows (parser version 2)', () => {
       [Table.NftSales, 'nftSales'],
       [Table.NftTouches, 'nftTouches'],
       [Table.AccountDomains, 'accountDomains'],
+      [Table.ObjectChanges, 'objectChanges'],
+      [Table.AccountObjectChanges, 'accountObjectChanges'],
     ];
 
     // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter. The Domain rows are in
-    // the recorded Xahau and XRPL ledgers: the Xahau flag ledger and 26540188 hold account roots with a Domain.
+    // the recorded Xahau and XRPL ledgers: the Xahau flag ledger and 26540188 hold account roots with a Domain. The object
+    // rows are in the recorded escrow, check, channel and delegation ledgers.
     const recorded = (): Built[] => [
       ...builtOf(AMM_SET),
       ...builtOf(NFT_SET),
       ...builtOf(URITOKEN_SET),
       ...builtOf(XAHAU_SET),
+      ...builtOf(OBJECTS_XRPL),
+      ...builtOf(OBJECTS_XAHAU),
     ];
 
     it.each(tables)('%s', (table, key) => {
@@ -1389,15 +1415,20 @@ describe('AMM rows (parser version 2)', () => {
         expect(rows.ammLiquidity).toEqual([]);
         expect(rows.accountAmmLiquidity).toEqual([]);
         expect(rows.ammGovernance).toEqual([]);
-        expect(rows.diagnostics).toEqual({ ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0 });
+        expect(rows.diagnostics).toEqual({
+          ammUnclassified: 0,
+          nftSkipped: 0,
+          invalidDomains: 0,
+          objectsUnclassified: 0,
+        });
         for (const row of [...rows.exchanges, ...rows.accountExchanges]) expect(row.amm_account).toBe('');
       }
     });
 
-    it('stores parser_version 6 (account domains, after the NFT events of 5)', () => {
-      expect(PARSER_VERSION).toBe(6);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(6);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(6);
+    it('stores parser_version 7 (the object history, after the account domains of 6)', () => {
+      expect(PARSER_VERSION).toBe(7);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(7);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(7);
     });
   });
 
@@ -1411,7 +1442,12 @@ describe('AMM rows (parser version 2)', () => {
           (sum, t) => sum + ammParser.parse(toParserTx(t, raw.header, null), XRPL).unclassified,
           0,
         );
-        expect(rows.diagnostics).toEqual({ ammUnclassified: expected, nftSkipped: 0, invalidDomains: 0 });
+        expect(rows.diagnostics).toEqual({
+          ammUnclassified: expected,
+          nftSkipped: 0,
+          invalidDomains: 0,
+          objectsUnclassified: 0,
+        });
         total += expected;
       }
       expect(total).toBeGreaterThanOrEqual(0);
@@ -1438,7 +1474,12 @@ describe('AMM rows (parser version 2)', () => {
           poolLine(index),
         ]);
       const rows = buildLedgerRows(ledgerOf([offer(0, 'A'.repeat(64)), offer(1, 'B'.repeat(64))]), XRPL);
-      expect(rows.diagnostics).toEqual({ ammUnclassified: 2, nftSkipped: 0, invalidDomains: 0 });
+      expect(rows.diagnostics).toEqual({
+        ammUnclassified: 2,
+        nftSkipped: 0,
+        invalidDomains: 0,
+        objectsUnclassified: 0,
+      });
       expect(rows.ammPoolStates).toEqual([]);
       expect(rows.exchanges).toEqual([]);
     });
@@ -1792,13 +1833,14 @@ describe('NFT rows (parser version 5)', () => {
   });
 
   describe('parser_version', () => {
-    it('stamps the parser version of the build on the ledger row: 6, with the NFT parser still at 5', () => {
-      expect(PARSER_VERSION).toBe(6);
+    it('stamps the parser version of the build on the ledger row: 7, with the NFT parser still at 5 and the domain parser at 6', () => {
+      expect(PARSER_VERSION).toBe(7);
       expect(NFT_PARSER_VERSION).toBe(5);
+      expect(DOMAIN_PARSER_VERSION).toBe(6);
       for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
-        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(6);
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(7);
       }
-      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(6);
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(7);
     });
   });
 
@@ -2030,6 +2072,262 @@ describe('account_domains (parser version 6)', () => {
     const before = JSON.stringify(raw);
     expect(buildLedgerRows(raw, XRPL).accountDomains).toEqual(buildLedgerRows(raw, XRPL).accountDomains);
     expect(JSON.stringify(raw)).toBe(before);
+  });
+});
+
+// -- Ledger object rows -----------------------------------------------------------------------------------------
+
+describe('ledger objects (parser version 7)', () => {
+  const objectParser = new ObjectChangesParser();
+
+  /** The recorded case `name`, with the rows of its ledger and the ones that belong to its transaction. */
+  function recorded(net: 'xrpl' | 'xahau', name: string) {
+    const found = objectCase(net, name);
+    if (!found) throw new Error(`${net}/objects has no recorded ${name}`);
+    const rows = buildLedgerRows(found.ledger, net === 'xrpl' ? XRPL : XAHAU);
+    const txIndex = found.tx.meta.TransactionIndex as number;
+    const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === txIndex);
+    return { ...found, rows, txIndex, mine };
+  }
+
+  /** A copy of the ledger (the recorded one is frozen) with `change` applied to the transaction `hash`. */
+  function withTx(ledger: RawLedger, hash: string, change: (tx: Json, meta: Json) => void): RawLedger {
+    const copy = structuredClone(ledger) as RawLedger;
+    const t = copy.transactions.find((r) => r.hash === hash);
+    if (!t) throw new Error(`${hash} is not in ledger ${ledger.header.ledger_index}`);
+    change(t.tx, t.meta);
+    return copy;
+  }
+
+  const ESCROW_ID = 'B95064B1A92F02EE009E6BDFB369CF476FB925BB8615456970E38774034A5D30';
+  const ESCROW_OWNER = 'rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V';
+  const ESCROW_DESTINATION = 'rGtW2dWHmHQ3f65pfbjYF5PbFbdZwgwuqW';
+
+  it('writes an EscrowCreate as one object_changes row and an owner and a counterparty account row', () => {
+    // Recorded: mainnet ledger 107897249 closed at Ripple time 846262160.
+    const { rows, tx, txIndex, ledger, mine } = recorded('xrpl', 'escrow_create_timed');
+    expect(ledger.header.close_time).toBe(846_262_160 + 946_684_800);
+    expect(mine(rows.objectChanges)).toEqual([
+      {
+        object_type: 'Escrow',
+        object_id: ESCROW_ID,
+        ledger_index: 107897249,
+        tx_index: txIndex,
+        tx_hash: tx.hash,
+        close_time: 846_262_160 + 946_684_800,
+        tx_type: 'EscrowCreate',
+        result: 'tesSUCCESS',
+        sender: ESCROW_OWNER,
+        delegate: '',
+        action: 'created',
+        event: 'create',
+        owner: ESCROW_OWNER,
+        counterparty: ESCROW_DESTINATION,
+        fields:
+          `{"Account":"${ESCROW_OWNER}","Amount":"500000","CancelAfter":846265741,"Destination":"${ESCROW_DESTINATION}",` +
+          '"FinishAfter":846262201,"Sequence":107896555,"SourceTag":2610250016}',
+        previous: '{}',
+        event_fields: '{"sequence":107896555}',
+      },
+    ]);
+    const key = { object_type: 'Escrow', ledger_index: 107897249, tx_index: txIndex, object_id: ESCROW_ID };
+    expect(mine(rows.accountObjectChanges)).toEqual([
+      { account: ESCROW_OWNER, role: 'owner', action: 'created', ...key },
+      { account: ESCROW_DESTINATION, role: 'counterparty', action: 'created', ...key },
+    ]);
+  });
+
+  it('writes one account row per role when owner and counterparty are the same account', () => {
+    // Recorded: ripple-mock ledger 29136413, an EscrowCreate whose Destination is its own Account.
+    const { rows } = ledgerNamed(RIPPLE_MOCK, 29136413);
+    const account = 'rGhDCgik9CwiNpcNnYHkEHcMgw2dkLgtNB';
+    const id = 'DBA5231FDE231A51F94640F890BF8FFDA45586EDBBD0ECCEAF532ADB8AC01A6F';
+    expect(rows.objectChanges.map((r) => [r.object_id, r.owner, r.counterparty, r.sender])).toEqual([
+      [id, account, account, account],
+    ]);
+    expect(rows.accountObjectChanges.map((r) => [r.account, r.role, r.object_id, r.tx_index])).toEqual([
+      [account, 'owner', id, 9],
+      [account, 'counterparty', id, 9],
+    ]);
+  });
+
+  it('writes a row for each transaction that changes an object, in the order of the transactions', () => {
+    // Recorded: ripple-mock ledger 29709909, two claims on one channel.
+    const { rows } = ledgerNamed(RIPPLE_MOCK, 29709909);
+    const channel = '9366A220FD4448B0BB199474DA87DCE498CB6926D244C53371574C7DF2586A57';
+    expect(rows.objectChanges.map((r) => [r.object_type, r.object_id, r.tx_index, r.event, r.action])).toEqual([
+      ['PayChannel', channel, 37, 'claim', 'modified'],
+      ['PayChannel', channel, 38, 'claim', 'modified'],
+    ]);
+    expect(rows.accountObjectChanges.map((r) => [r.account, r.role, r.tx_index])).toEqual([
+      ['rMwWvk2A87HeaDQ4yPNqptk1NdgHBAZV9d', 'owner', 37],
+      ['rnNzy3iPc7gPEAJbAdXwxY1UTBamBqTYhR', 'counterparty', 37],
+      ['rMwWvk2A87HeaDQ4yPNqptk1NdgHBAZV9d', 'owner', 38],
+      ['rnNzy3iPc7gPEAJbAdXwxY1UTBamBqTYhR', 'counterparty', 38],
+    ]);
+  });
+
+  it("fills delegate from the transaction's Delegate", () => {
+    const base = recorded('xrpl', 'escrow_create_timed');
+    expect(base.mine(base.rows.objectChanges).map((r) => r.delegate)).toEqual(['']);
+
+    // synthetic-delegated-escrow-create: the recorded EscrowCreate with a Delegate field added (test-built, not recorded)
+    const delegate = 'rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK';
+    const raw = withTx(base.ledger, base.tx.hash, (tx) => (tx.Delegate = delegate));
+    const rows = buildLedgerRows(raw, XRPL);
+    const mine = rows.objectChanges.filter((r) => r.tx_hash === base.tx.hash);
+    expect(mine.map((r) => [r.sender, r.delegate, r.owner])).toEqual([[ESCROW_OWNER, delegate, ESCROW_OWNER]]);
+    // nothing else of the ledger changes but the delegate's own account_transactions row (Task 5)
+    expect(rows.objectChanges.map((r) => ({ ...r, delegate: '' }))).toEqual(
+      base.rows.objectChanges.map((r) => ({ ...r, delegate: '' })),
+    );
+    expect(rows.accountObjectChanges).toEqual(base.rows.accountObjectChanges);
+
+    // Recorded: a DelegateSet is no delegated transaction, and its Delegate node has no Delegate column
+    const set = recorded('xrpl', 'delegate_set_create');
+    const [created] = set.mine(set.rows.objectChanges);
+    expect(created).toMatchObject({
+      object_type: 'Delegate',
+      action: 'created',
+      event: 'set',
+      sender: 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL',
+      delegate: '',
+      owner: 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL',
+      counterparty: 'rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK',
+    });
+    expect(set.mine(set.rows.accountObjectChanges).map((r) => [r.account, r.role, r.object_type])).toEqual([
+      ['rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL', 'owner', 'Delegate'],
+      ['rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK', 'counterparty', 'Delegate'],
+    ]);
+  });
+
+  it('writes no counterparty row for an object that has none', () => {
+    // synthetic-escrow-create-no-destination: the recorded EscrowCreate without its Destination (an escrow to oneself has none)
+    const base = recorded('xrpl', 'escrow_create_timed');
+    const raw = withTx(base.ledger, base.tx.hash, (tx, meta) => {
+      delete tx.Destination;
+      for (const node of meta.AffectedNodes as Json[]) {
+        if (node.CreatedNode?.LedgerEntryType === 'Escrow') delete node.CreatedNode.NewFields.Destination;
+      }
+    });
+    const rows = buildLedgerRows(raw, XRPL);
+    const mine = <T extends { tx_index: number }>(list: T[]): T[] => list.filter((r) => r.tx_index === base.txIndex);
+    expect(mine(rows.objectChanges).map((r) => [r.owner, r.counterparty])).toEqual([[ESCROW_OWNER, '']]);
+    expect(mine(rows.accountObjectChanges).map((r) => [r.account, r.role])).toEqual([[ESCROW_OWNER, 'owner']]);
+  });
+
+  it('counts update rows in diagnostics.objectsUnclassified', () => {
+    // synthetic-object-update: a Payment whose metadata modifies an Escrow and a Check, and a second one that modifies a
+    // PayChannel, which no row of the event table expects (test-built, not recorded)
+    const node = (type: string, id: string, owner: string, destination: string): Json => ({
+      ModifiedNode: {
+        LedgerEntryType: type,
+        LedgerIndex: id,
+        FinalFields: { Account: owner, Destination: destination, Amount: '10' },
+        PreviousFields: { Amount: '20' },
+      },
+    });
+    const ids = ['1', '2', '3'].map((digit) => digit.repeat(64));
+    const raw = ledgerOf([
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: RECEIVER, Amount: '1' }, 0, 'A'.repeat(64), [
+        node('Escrow', ids[0], SENDER, RECEIVER),
+        node('Check', ids[1], RECEIVER, SENDER),
+      ]),
+      rawTx({ TransactionType: 'Payment', Account: SENDER, Destination: RECEIVER, Amount: '1' }, 1, 'B'.repeat(64), [
+        node('PayChannel', ids[2], SENDER, RECEIVER),
+      ]),
+    ]);
+    const rows = buildLedgerRows(raw, XRPL);
+    expect(rows.objectChanges.map((r) => [r.object_type, r.event, r.action])).toEqual([
+      ['Escrow', 'update', 'modified'],
+      ['Check', 'update', 'modified'],
+      ['PayChannel', 'update', 'modified'],
+    ]);
+    expect(rows.accountObjectChanges).toHaveLength(6);
+    expect(rows.diagnostics.objectsUnclassified).toBe(3);
+
+    // a ledger of events the table expects counts none, and a ledger without objects none either
+    expect(recorded('xrpl', 'escrow_create_timed').rows.diagnostics.objectsUnclassified).toBe(0);
+    expect(buildLedgerRows(sampleLedger(), XRPL).diagnostics.objectsUnclassified).toBe(0);
+  });
+
+  it('writes nothing for a ledger without object activity', () => {
+    const rows = buildLedgerRows(sampleLedger(), XRPL);
+    expect(rows.objectChanges).toEqual([]);
+    expect(rows.accountObjectChanges).toEqual([]);
+    expect(rows.diagnostics.objectsUnclassified).toBe(0);
+    // the first ripple-mock ledgers hold no escrow, check, channel or delegation (the later ones hold two, tested above)
+    for (const { rows: built } of builtOf(RIPPLE_MOCK).slice(0, 5)) {
+      expect(built.objectChanges).toEqual([]);
+      expect(built.accountObjectChanges).toEqual([]);
+    }
+  });
+
+  it.each([OBJECTS_XRPL, OBJECTS_XAHAU, RIPPLE_MOCK])(
+    'is what the parser says, row for row, with an index row per role, over $name',
+    (set) => {
+      const types = new Set<string>();
+      let changes = 0;
+      for (const { raw, rows } of builtOf(set)) {
+        const parsed = raw.transactions.flatMap((t) =>
+          objectParser.parse(toParserTx(t, raw.header, null), set.ctx).map((change) => ({ t, change })),
+        );
+        expect(rows.objectChanges.map((r) => [r.tx_index, r.object_type, r.object_id, r.action, r.event])).toEqual(
+          parsed.map(({ t, change }) => [
+            t.meta.TransactionIndex,
+            change.object_type,
+            change.object_id,
+            change.action,
+            change.event,
+          ]),
+        );
+
+        const index = rows.accountObjectChanges;
+        let at = 0;
+        for (const row of rows.objectChanges) {
+          // the transaction's columns
+          const t = raw.transactions.find((r) => r.hash === row.tx_hash)!;
+          expect(row.sender).toBe(t.tx.Account);
+          expect(row.delegate).toBe(typeof t.tx.Delegate === 'string' ? t.tx.Delegate : '');
+          expect(row.tx_type).toBe(t.tx.TransactionType);
+          expect(row.result).toBe(t.meta.TransactionResult);
+          // the index: the owner, then the counterparty unless there is none, in the order of the object rows
+          const wanted = [
+            ['owner', row.owner],
+            ...(row.counterparty === '' ? [] : [['counterparty', row.counterparty]]),
+          ];
+          for (const [role, account] of wanted) {
+            expect(index[at]).toEqual({
+              account,
+              object_type: row.object_type,
+              role,
+              ledger_index: row.ledger_index,
+              tx_index: row.tx_index,
+              object_id: row.object_id,
+              action: row.action,
+            });
+            at++;
+          }
+          types.add(row.object_type);
+          changes++;
+        }
+        expect(index).toHaveLength(at);
+        expect(rows.diagnostics.objectsUnclassified).toBe(
+          rows.objectChanges.filter((r) => r.event === 'update').length,
+        );
+      }
+      // the check is not vacuous: the sets hold rows, the recorded object sets of every tracked type
+      expect(changes).toBeGreaterThan(0);
+      if (set === OBJECTS_XRPL) expect([...types].sort()).toEqual(['Check', 'Delegate', 'Escrow', 'PayChannel']);
+    },
+  );
+
+  it('stamps parser_version 7, the first version that has object rows', () => {
+    expect(OBJECT_PARSER_VERSION).toBe(7);
+    expect(PARSER_VERSION).toBe(7);
+    for (const set of [OBJECTS_XRPL, OBJECTS_XAHAU]) {
+      for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(OBJECT_PARSER_VERSION);
+    }
   });
 });
 

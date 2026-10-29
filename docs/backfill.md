@@ -69,7 +69,7 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   divide 1,000,000: 500, 250, 100, ...) if memory is tight.
 - Budget disk for `transactions` (`tx_json` and `meta_json` are ZSTD-compressed text and by far the largest columns): roughly
   1-1.5 TB compressed for full XRPL history.
-- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools, J skipped NFT events`) and, in ClickHouse,
+- Watch the CLI's log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools, J skipped NFT events, L unclassified object changes`) and, in ClickHouse,
   `SELECT count(), max(ledger_index) FROM xrpl.ledgers`. The aggregator follows by itself (see below).
 
 ### Resuming, gap repair, reprocessing
@@ -112,11 +112,16 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   Parser version 5 adds the NFT and URIToken events (`nft_events`, `account_nft_events`, `collection_nft_events`,
   `nft_sales`, `nft_touches`): ledgers written by an older version have none, see [NFT re-ingest](#nft-re-ingest). NFT events the parser
   dropped for an amount that is an MPT amount are counted in `syncer_nft_skipped_total`, and the range-ingest log names the total of its run
-  (a warning when it is not 0, and the last line says `J skipped NFT events` always).
-  Parser version 6 (the current one) adds the Domain of every account root that has or had one (`account_domains`, a row for each change
+  (a warning when it is not 0, and the last line always says `J skipped NFT events` and, after it, `L unclassified object changes`).
+  Parser version 6 adds the Domain of every account root that has or had one (`account_domains`, a row for each change
   of such an account): ledgers written by an older version have none. **No reprocess is needed for them**: a one-off SQL seed gives every
   account its current Domain from the state history ([Account domains seed](#account-domains-seed)), and an account whose Domain was set
   before that history is learnt at its next change. A `--reprocess` of a range writes the rows of its ledgers, as for every table.
+  Parser version 7 (the current one) adds the history of escrows, checks, payment channels and delegations (`object_changes` and its index by
+  account `account_object_changes`), gives a delegate its `account_transactions` row, books the fee of a delegated transaction to its delegate and
+  types the balance changes of issued-token payment channels: ledgers written by an older version have none of these, and `--reprocess` writes them.
+  Changes of these objects that no event of the table expects are counted in `syncer_objects_unclassified_total`, and the range-ingest log names the
+  total of its run (a warning when it is not 0, and `L unclassified object changes` in the last line).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
@@ -294,7 +299,7 @@ seed copies the newest state row of every account that has a Domain, in 16 bucke
 of one statement stays within memory. **No reprocess is needed for D4**, and `domain_tomls` needs no backfill: the `tomls` worker's first sweep fills it.
 
 **When.** After migration `012_display_names.sql` is applied and the syncer of this release is running ([the rollout](operations.md#the-display-names)): from
-then on every new ledger is written by parser version 6, so `X` stops moving, and no change falls between the seed and the live rows. Before it, the old
+then on every new ledger is written by parser version 6 or later, so `X` stops moving, and no change falls between the seed and the live rows. Before it, the old
 parser would go on writing ledgers that have no `account_domains` rows.
 
 **`X`** is the last ledger an older parser wrote: the seed reads the state history up to it, and the ledgers above it are the parser's own.
@@ -303,7 +308,7 @@ parser would go on writing ledgers that have no `account_domains` rows.
 SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 6;
 ```
 
-(NULL, `\N` in the client: every stored ledger was written by parser version 6, and there is nothing to seed.)
+(NULL, `\N` in the client: every stored ledger was written by parser version 6 or later, and there is nothing to seed.)
 
 **The statement**, run once for each `bucket` from 0 to 15, with `X` and `bucket` as query parameters:
 
@@ -327,7 +332,7 @@ own environment authenticates, the password stays off the host command line):
 ```bash
 ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" "$@"' sh "$@"; }
 X=$(ch -q "SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 6")
-if [ "$X" = '\N' ] || [ -z "$X" ]; then echo 'nothing to seed: every ledger was written by parser version 6'; else
+if [ "$X" = '\N' ] || [ -z "$X" ]; then echo 'nothing to seed: every ledger was written by parser version 6 or later'; else
   for bucket in $(seq 0 15); do ch --database xrpl --param_X="$X" --param_bucket="$bucket" < account-domains-seed.sql || break; done
 fi
 ```
@@ -362,7 +367,7 @@ How the seed behaves:
 - **Coverage.** The seed is as good as `account_states`: the state tables start at the first ledger parser version 3 wrote
   ([Account state history re-ingest](#account-state-history-re-ingest)), and an account whose Domain was set before that and whose root has not changed since has no
   row. It has **no domain, and so no verified name, until its next change** (a payment received is enough), or until the history is filled from ledger 32570
-  and ingested again with parser version 6. The names answer carries no `coverage` for this ([api-reference](api-reference.md#account-names-and-tomls)).
+  and ingested again with parser version 6 or later. The names answer carries no `coverage` for this ([api-reference](api-reference.md#account-names-and-tomls)).
 
 ### Public nodes and rate limits
 

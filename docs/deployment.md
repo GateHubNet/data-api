@@ -245,7 +245,7 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   for `migrate`; by hand, run `migrate`, start the syncer, and the api last. The history is filled afterwards ([the NFT data](operations.md#the-nft-data),
   [backfill](backfill.md#nft-re-ingest)).
 - `012_display_names.sql` (two `CREATE TABLE IF NOT EXISTS`: the ledger-derived `account_domains` and `domain_tomls`) is additive but **sets an order**: `migrate` first, then the syncer, then
-  the api. A syncer of this version (parser version 6) writes `account_domains` with every ledger, and an insert into a missing table fails the batch, so the live runner would retry the same
+  the api. A syncer of this version (parser version 6 or later) writes `account_domains` with every ledger, and an insert into a missing table fails the batch, so the live runner would retry the same
   ledgers without end; the `tomls` worker refuses to boot without the two tables, and `GET /v2/account_names` and `GET /v2/toml/{domain}` answer 500 until they exist. The compose files make
   both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. Then the account domains are seeded once per network ([operations](operations.md#the-display-names),
   [backfill](backfill.md#account-domains-seed)).

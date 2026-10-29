@@ -22,7 +22,7 @@ import { join } from 'node:path';
 import { startClickHouse, StartedClickHouse } from '../../../packages/shared/test/clickhouse-container';
 import { rangeIngest, RangeIngestOptions } from '../src/cli/range-ingest';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, nftTemplate, range, syntheticChain } from './synthetic-chain';
+import { ammTemplate, nftTemplate, objectTemplate, range, syntheticChain } from './synthetic-chain';
 
 const ctx = parseContextFor(getNetworkProfile('xrpl'));
 
@@ -55,6 +55,14 @@ const SKIPPED_PER_LEDGER = 2;
  * an offer, and offers: rows in all five NFT tables) and `SKIPPED_PER_LEDGER` offers that give no row.
  */
 const NFT_RAW = syntheticChain(L(1), 30, { template: nftTemplate(SKIPPED_PER_LEDGER) }).map((l) => l.raw);
+
+/** Transactions per ledger of `OBJECT_RAW` that change an Escrow in a way no event expects: the row has the event `update` (see `objectTemplate`). */
+const UPDATES_PER_LEDGER = 2;
+/**
+ * The same 30 ledgers with escrow, check, channel and delegation activity: each holds a recorded EscrowCreate, CheckCreate,
+ * PaymentChannelCreate and DelegateSet (rows in both object tables) and `UPDATES_PER_LEDGER` changes that no event expects.
+ */
+const OBJECT_RAW = syntheticChain(L(1), 30, { template: objectTemplate(UPDATES_PER_LEDGER) }).map((l) => l.raw);
 
 const ALL_TABLES: Table[] = LEDGER_KEYED_TABLES.map((t) => t.table);
 /**
@@ -826,7 +834,9 @@ describe('rangeIngest (e2e)', () => {
       const done = (lines: LogLine[]): string | undefined =>
         lines.find((l) => l.message.includes('ingested:'))?.message;
       expect(done(amm.lines)).toMatch(
-        new RegExp(`, ${14 * UNCLASSIFIED_PER_LEDGER} unclassified AMM pools, 0 skipped NFT events$`),
+        new RegExp(
+          `, ${14 * UNCLASSIFIED_PER_LEDGER} unclassified AMM pools, 0 skipped NFT events, 0 unclassified object changes$`,
+        ),
       );
       // a range without AMM activity says 0: the absence of a warning is not the proof
       const plain = captureLogger();
@@ -836,7 +846,9 @@ describe('rangeIngest (e2e)', () => {
         ...FAST,
         logger: plain,
       });
-      expect(done(plain.lines)).toMatch(/, 0 unclassified AMM pools, 0 skipped NFT events$/);
+      expect(done(plain.lines)).toMatch(
+        /, 0 unclassified AMM pools, 0 skipped NFT events, 0 unclassified object changes$/,
+      );
     });
 
     it('counts only what it wrote: ledgers it finds committed add nothing, and a parse before a delete adds nothing', async () => {
@@ -995,7 +1007,7 @@ describe('rangeIngest (e2e)', () => {
         `${total} NFT events in the ledgers written were skipped (an amount that is an MPT amount): see syncer_nft_skipped_total`,
       ]);
       expect(nft.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(
-        new RegExp(`, ${total} skipped NFT events$`),
+        new RegExp(`, ${total} skipped NFT events, 0 unclassified object changes$`),
       );
 
       // a range without NFT skips says 0 and has no warning: the absence of the warning is not the proof
@@ -1007,7 +1019,9 @@ describe('rangeIngest (e2e)', () => {
         logger: plain,
       });
       expect(plain.lines.some((l) => l.message.includes('syncer_nft_skipped_total'))).toBe(false);
-      expect(plain.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(/, 0 skipped NFT events$/);
+      expect(plain.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(
+        /, 0 skipped NFT events, 0 unclassified object changes$/,
+      );
     });
 
     it('counts only what it wrote: ledgers it finds committed add nothing, and a reprocess counts the ledgers it rewrites once', async () => {
@@ -1046,6 +1060,154 @@ describe('rangeIngest (e2e)', () => {
       await expectRows(svc, NFT_RAW.slice(0, 14), CHAIN_TABLES);
       await expectNoDuplicateNftRows(svc);
       expect(await skipped(metrics)).toBe(before + 14 * SKIPPED_PER_LEDGER);
+    });
+  });
+
+  describe('object ledgers (parser version 7)', () => {
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const unclassifiedObjects = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.objectsUnclassifiedTotal.get()).values[0]?.value ?? 0;
+
+    const OBJECT_TABLES = [Table.ObjectChanges, Table.AccountObjectChanges];
+
+    /** `count() == uniqExact(<sorting key>)` in each object table: no row is there twice, and there are rows. */
+    async function expectNoDuplicateObjectRows(svc: ClickHouseService): Promise<void> {
+      for (const table of OBJECT_TABLES) {
+        const key = (
+          await svc.queryOne<{ sorting_key: string }>(
+            'SELECT sorting_key FROM system.tables WHERE database = currentDatabase() AND name = {t:String}',
+            { t: table },
+          )
+        )?.sorting_key;
+        const row = await svc.queryOne<{ n: string | number; u: string | number }>(
+          `SELECT count() AS n, uniqExact(${key}) AS u FROM ${table}`,
+        );
+        expect([table, Number(row?.n) > 0, Number(row?.n)]).toEqual([table, true, Number(row?.u)]);
+      }
+    }
+
+    it('the ledgers have rows for both object tables, and two changes per ledger that no event expects', () => {
+      const counts = expectedCounts(OBJECT_RAW, CHAIN_TABLES);
+      // 4 recorded changes and 2 unclassified ones per ledger; the owner and the counterparty of each in the index
+      expect(counts[Table.ObjectChanges]).toBe(30 * (4 + UPDATES_PER_LEDGER));
+      expect(counts[Table.AccountObjectChanges]).toBe(30 * 2 * (4 + UPDATES_PER_LEDGER));
+      const total = OBJECT_RAW.reduce((sum, raw) => sum + buildLedgerRows(raw, ctx).diagnostics.objectsUnclassified, 0);
+      expect(total).toBe(30 * UPDATES_PER_LEDGER);
+    });
+
+    it('writes the object tables, and adds the changes it could give no event to syncer_objects_unclassified_total', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+
+      const result = await rangeIngest(new TestSource(OBJECT_RAW), svc, ctx, {
+        from: L(1),
+        to: L(30),
+        ...FAST,
+        metrics,
+      });
+
+      expect(result).toEqual({ chunksDone: 2, ledgers: 30 });
+      await expectRows(svc, OBJECT_RAW, CHAIN_TABLES);
+      await expectNoDuplicateObjectRows(svc);
+      expect(await unclassifiedObjects(metrics)).toBe(before + 30 * UPDATES_PER_LEDGER);
+    });
+
+    it('names syncer_objects_unclassified_total in a warning at the end, and says the count in its final line, 0 too', async () => {
+      const svc = await freshService();
+      const objects = captureLogger();
+      await rangeIngest(new TestSource(OBJECT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, logger: objects });
+      const total = 14 * UPDATES_PER_LEDGER;
+      expect(objects.lines.filter((l) => l.level === 'warn').map((l) => l.message)).toEqual([
+        `${total} object changes in the ledgers written were given no event (a change by a transaction type the object history does not expect): see syncer_objects_unclassified_total`,
+      ]);
+      expect(objects.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(
+        new RegExp(`, 0 unclassified AMM pools, 0 skipped NFT events, ${total} unclassified object changes$`),
+      );
+
+      // a range without any says 0 and has no warning: the absence of the warning is not the proof
+      const plain = captureLogger();
+      await rangeIngest(new TestSource(CHAIN_RAW), await freshService(), ctx, {
+        from: L(1),
+        to: L(5),
+        ...FAST,
+        logger: plain,
+      });
+      expect(plain.lines.some((l) => l.message.includes('syncer_objects_unclassified_total'))).toBe(false);
+      expect(plain.lines.find((l) => l.message.includes('ingested:'))?.message).toMatch(
+        /, 0 unclassified object changes$/,
+      );
+    });
+
+    it('counts only what it wrote: ledgers it finds committed add nothing, and a reprocess rewrites the object rows without duplicates, counting them once', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(OBJECT_RAW.slice(0, 5)); // L(1)..L(5)
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+
+      await rangeIngest(new TestSource(OBJECT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST, metrics });
+      expect(await unclassifiedObjects(metrics)).toBe(before + 9 * UPDATES_PER_LEDGER);
+      const written = await tableCounts(svc, OBJECT_TABLES);
+      expect(written).toEqual({
+        [Table.ObjectChanges]: 14 * (4 + UPDATES_PER_LEDGER),
+        [Table.AccountObjectChanges]: 14 * 2 * (4 + UPDATES_PER_LEDGER),
+      });
+
+      await rangeIngest(new TestSource(OBJECT_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+        metrics,
+      });
+      expect(await unclassifiedObjects(metrics)).toBe(before + (9 + 14) * UPDATES_PER_LEDGER);
+      // the same row count in both tables as before: the rewrite deleted what it replaced
+      expect(await tableCounts(svc, OBJECT_TABLES)).toEqual(written);
+      await expectRows(svc, OBJECT_RAW.slice(0, 14), CHAIN_TABLES);
+      await expectNoDuplicateObjectRows(svc);
+    });
+
+    it('reprocess gives ledgers written without object rows (parser version 6) their object rows, without duplicates', async () => {
+      const svc = await freshService();
+      await rangeIngest(new TestSource(OBJECT_RAW), svc, ctx, { from: L(1), to: L(14), ...FAST });
+      // What parser version 6 wrote: no rows in the object tables.
+      for (const table of OBJECT_TABLES) {
+        await svc.command(`DELETE FROM ${table} WHERE 1`, {}, { settings: { lightweight_deletes_sync: '2' } });
+        expect(await count(svc, table)).toBe(0);
+      }
+
+      const result = await rangeIngest(new TestSource(OBJECT_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        reprocess: true,
+        ...FAST,
+      });
+
+      expect(result.ledgers).toBe(14);
+      await expectRows(svc, OBJECT_RAW.slice(0, 14), CHAIN_TABLES);
+      await expectNoDuplicateObjectRows(svc);
+    });
+
+    it('redo of an unfinished intent over object ledgers removes the orphans in the object tables and leaves no duplicates', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+      // A write that died after its child rows, before the commit marker: object rows, no ledgers rows.
+      await insertUncommitted(svc, OBJECT_RAW.slice(0, 14));
+      await seedIntent(svc, L(1), 9_999_999, 'crashed-run');
+      for (const table of OBJECT_TABLES) expect([table, (await count(svc, table)) > 0]).toEqual([table, true]);
+
+      const result = await rangeIngest(new TestSource(OBJECT_RAW), svc, ctx, {
+        from: L(1),
+        to: L(14),
+        ...FAST,
+        metrics,
+      });
+
+      expect(result).toEqual({ chunksDone: 1, ledgers: 14 });
+      await expectRows(svc, OBJECT_RAW.slice(0, 14), CHAIN_TABLES);
+      await expectNoDuplicateObjectRows(svc);
+      expect(await unclassifiedObjects(metrics)).toBe(before + 14 * UPDATES_PER_LEDGER);
     });
   });
 

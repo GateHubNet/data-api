@@ -18,6 +18,7 @@ import { LedgerWriter } from '../src/ingest/ledger-writer';
 import { RawLedger } from '../src/ingest/raw-ledger';
 import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
+import { objectCase } from '../src/test-utils/object-cases';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS } from './sample-rows';
 import { mptOfferHash, withMptOffers } from './synthetic-mpt-offers';
@@ -33,6 +34,13 @@ const AMM_BUILT = AMM_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
 /** Whole mainnet ledgers around the recorded NFT cases: mints, offers, sales, burns and a modify, 11 ledgers. */
 const NFT_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/nft')).list();
 const NFT_BUILT = NFT_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
+
+/**
+ * Whole mainnet ledgers around the recorded escrow, check, payment channel and delegation cases (D5 Task 1), 22 ledgers:
+ * escrows created, finished and cancelled, checks created, cashed and cancelled, channels and delegations.
+ */
+const OBJECT_LEDGERS: RawLedger[] = FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xrpl/objects')).list();
+const OBJECT_BUILT = OBJECT_LEDGERS.map((raw) => buildLedgerRows(raw, ctx));
 
 /** The fixture ledgers are sparse and spread over several partitions: P6 1, 2, 11, 20, 29 and P7 0, 1, 2. */
 const index = (i: number): number => LEDGERS[i].header.ledger_index;
@@ -75,18 +83,18 @@ const NFT_LEDGER_TABLES: Table[] = [
 ];
 
 /**
- * The ledger tables of the ledger objects (migration 013): child tables like the others. No parser fills them yet, so
- * `buildLedgerRows` gives them empty lists and the writer does not insert into them.
+ * The ledger tables of the ledger objects (migration 013): child tables like the others, with rows from the object parser.
+ * Of the ripple-mock ledgers two have rows (a recorded EscrowCreate and two claims on a channel), in one partition.
  */
 const OBJECT_LEDGER_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectChanges];
 
 /**
- * The tables the ripple-mock ledgers have no activity for: the delete tests put hand-made rows into them
- * (`insertSeededRows`), to see what the deletes reach and what they leave. The recorded AMM and NFT ledgers give real
- * rows to these tables, but they all sit in one partition of each, and the delete tests need the rows over several.
+ * The tables the ripple-mock ledgers have (almost) no activity for: the delete tests put hand-made rows into them
+ * (`insertSeededRows`), to see what the deletes reach and what they leave. The recorded AMM, NFT and object ledgers give
+ * real rows to these tables, but they all sit in one partition of each, and the delete tests need the rows over several.
  * `account_domains` (migration 012) is one of them: the last ripple-mock ledger gives it two rows of one account, but the
  * delete tests need a row in every ledger, and each of an account of its own (`seededDomainRow`). The two object tables
- * (migration 013) are the others.
+ * (migration 013) are the others: two ripple-mock ledgers give them rows, in one partition.
  */
 const SEEDED_LEDGER_TABLES: Table[] = [
   ...AMM_LEDGER_TABLES,
@@ -167,6 +175,10 @@ const expectedNftCounts = (keep?: (ledgerIndex: number) => boolean): Counts => c
 
 const aIndex = (i: number): number => AMM_LEDGERS[i].header.ledger_index;
 const nIndex = (i: number): number => NFT_LEDGERS[i].header.ledger_index;
+const oIndex = (i: number): number => OBJECT_LEDGERS[i].header.ledger_index;
+
+/** The object fixture ledgers. */
+const expectedObjectCounts = (keep?: (ledgerIndex: number) => boolean): Counts => countsOf(OBJECT_BUILT, keep);
 
 describe('LedgerWriter and ingest state (e2e)', () => {
   let ch: StartedClickHouse;
@@ -221,9 +233,20 @@ describe('LedgerWriter and ingest state (e2e)', () => {
     return Object.fromEntries(await Promise.all(COUNTED_TABLES.map(async (t) => [t, await count(svc, t)] as const)));
   }
 
-  /** The hand-made rows of a seeded table (`insertSeededRows`): in `account_domains` the ones of the `rSeeded…` accounts. */
+  /**
+   * The hand-made rows of a seeded table (`insertSeededRows`): in `account_domains` the ones of the `rSeeded…` accounts, in
+   * the object tables the ones of the sample's object (two ripple-mock ledgers have real rows in them).
+   */
   const countSeeded = (svc: ClickHouseService, table: Table): Promise<number> =>
-    count(svc, table, table === Table.AccountDomains ? "startsWith(account, 'rSeeded')" : '1');
+    count(
+      svc,
+      table,
+      table === Table.AccountDomains
+        ? "startsWith(account, 'rSeeded')"
+        : OBJECT_LEDGER_TABLES.includes(table)
+          ? `object_id = '${SAMPLE_ROWS[Table.ObjectChanges].object_id}'`
+          : '1',
+    );
 
   const rowsAbove = async (svc: ClickHouseService, cp: number): Promise<Counts> =>
     Object.fromEntries(
@@ -412,13 +435,15 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(new Set(tokens).size).toBe(tokens.length);
 
       // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
-      // by account, and account_domains, which the last ledger has two rows for: these ledgers have no AMM or NFT activity
-      // and no parser fills the 2 object tables yet, so the 5 AMM tables, the 5 NFT tables and the 2 object tables get no
-      // insert) start together, before any of them has finished.
+      // by account, account_domains, which the last ledger has two rows for, and the 2 object tables, which the ledgers of
+      // a recorded EscrowCreate and of two channel claims have rows for: these ledgers have no AMM or NFT activity, so the
+      // 5 AMM tables and the 5 NFT tables get no insert) start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
-      expect(childTables.size).toBe(17);
+      expect(childTables.size).toBe(19);
+      expect(childTables).toContain(Table.ObjectChanges);
+      expect(childTables).toContain(Table.AccountObjectChanges);
       expect(childTables).toContain(Table.AccountStates);
       expect(childTables).toContain(Table.TrustLineStates);
       expect(childTables).toContain(Table.PathPayments);
@@ -426,7 +451,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(childTables).toContain(Table.AccountDomains);
       const firstStarts = events.slice(0, childTables.size);
       expect(new Set(firstStarts)).toEqual(new Set([...childTables].map((t) => `start:${t}`)));
-      const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES, ...OBJECT_LEDGER_TABLES];
+      const noInsert = [...AMM_LEDGER_TABLES, ...NFT_LEDGER_TABLES];
       expect(events.filter((e) => e.startsWith('start:') && noInsert.includes(e.slice(6) as Table))).toEqual([]);
 
       const lastChildEnd = Math.max(
@@ -880,6 +905,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(result).toEqual({
         ammUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
         nftSkipped: 0,
+        objectsUnclassified: AMM_BUILT.reduce((sum, r) => sum + r.diagnostics.objectsUnclassified, 0),
       });
       for (const [table, key, orderBy] of AMM_KEYS) {
         const built = AMM_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -938,8 +964,13 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(await new LedgerWriter(svc, ctx).write(LEDGERS.slice(0, 5))).toEqual({
         ammUnclassified: 0,
         nftSkipped: 0,
+        objectsUnclassified: 0,
       });
-      expect(await new LedgerWriter(svc, ctx).write([])).toEqual({ ammUnclassified: 0, nftSkipped: 0 });
+      expect(await new LedgerWriter(svc, ctx).write([])).toEqual({
+        ammUnclassified: 0,
+        nftSkipped: 0,
+        objectsUnclassified: 0,
+      });
     });
 
     it('a retry of the same batch under the same runId is collapsed by the dedup token, a new runId is not', async () => {
@@ -1102,6 +1133,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(result).toEqual({
         ammUnclassified: NFT_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
         nftSkipped: 0,
+        objectsUnclassified: NFT_BUILT.reduce((sum, r) => sum + r.diagnostics.objectsUnclassified, 0),
       });
       for (const [table, key, orderBy] of NFT_KEYS) {
         const built = NFT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
@@ -1181,6 +1213,172 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       // And the range can be written again without duplicates.
       await new LedgerWriter(svc, ctx).write(NFT_LEDGERS.slice(2, 9));
       await expectStored(svc, NFT_BUILT);
+    });
+  });
+
+  describe('Object ledgers (whole mainnet ledgers around the recorded escrow, check, channel and delegation cases)', () => {
+    /** The rows of an object table as ClickHouse returns them, `close_time` as unix seconds, in the order of `orderBy`. */
+    async function readBack(svc: ClickHouseService, table: Table, orderBy: string): Promise<Array<Json>> {
+      // the index by account has no time
+      if (table === Table.AccountObjectChanges) return svc.query<Json>(`SELECT * FROM ${table} ORDER BY ${orderBy}`);
+      return svc.query<Json>(
+        `SELECT * EXCEPT close_time, toUnixTimestamp(close_time) AS close_time FROM ${table} ORDER BY ${orderBy}`,
+      );
+    }
+
+    const OBJECT_KEYS: Array<[Table, ChildRowsKey, string]> = [
+      [Table.ObjectChanges, 'objectChanges', 'object_type, object_id, ledger_index, tx_index'],
+      [
+        Table.AccountObjectChanges,
+        'accountObjectChanges',
+        'account, object_type, role, ledger_index, tx_index, object_id',
+      ],
+    ];
+
+    it('the fixtures put rows into both object tables, and nothing is unclassified', () => {
+      const expected = expectedObjectCounts();
+      for (const table of OBJECT_LEDGER_TABLES) expect([table, expected[table] > 0]).toEqual([table, true]);
+      expect(OBJECT_BUILT.reduce((sum, r) => sum + r.diagnostics.objectsUnclassified, 0)).toBe(0);
+    });
+
+    it('an object ledger lands in both tables: counts and every row as built, and nothing is reported unclassified', async () => {
+      const svc = await freshService();
+      const result = await new LedgerWriter(svc, ctx).write(OBJECT_LEDGERS);
+
+      await expectStored(svc, OBJECT_BUILT);
+      expect(result).toEqual({
+        ammUnclassified: OBJECT_BUILT.reduce((sum, r) => sum + r.diagnostics.ammUnclassified, 0),
+        nftSkipped: 0,
+        objectsUnclassified: 0,
+      });
+      for (const [table, key, orderBy] of OBJECT_KEYS) {
+        const built = OBJECT_BUILT.flatMap((r) => r[key] as unknown as Json[]);
+        expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
+      }
+    });
+
+    it('reports the changes the parser could give no event, summed over the batch, and still writes their rows (synthetic-object-update: a recorded EscrowCreate and CheckCreate sent as AccountSet)', async () => {
+      const svc = await freshService();
+      // synthetic-object-update: hand-made from the recorded escrow_create_timed and check_create_xrp, the transaction type
+      // of each replaced by one the object history does not expect to create or change an escrow or a check
+      const batch = structuredClone(OBJECT_LEDGERS);
+      const altered = ['escrow_create_timed', 'check_create_xrp'].map((name) => {
+        const { ledger, tx } = objectCase('xrpl', name)!;
+        const copy = batch
+          .find((l) => l.header.ledger_index === ledger.header.ledger_index)!
+          .transactions.find((r) => r.hash === tx.hash)!;
+        copy.tx.TransactionType = 'AccountSet';
+        return tx.hash;
+      });
+
+      const result = await new LedgerWriter(svc, ctx).write(batch);
+
+      expect(result.objectsUnclassified).toBe(2);
+      // the rows are there as for the recorded transactions, but for the event
+      const expected = expectedObjectCounts();
+      expect(await count(svc, Table.ObjectChanges)).toBe(expected[Table.ObjectChanges]);
+      expect(await count(svc, Table.AccountObjectChanges)).toBe(expected[Table.AccountObjectChanges]);
+      expect(await count(svc, Table.ObjectChanges, "event = 'update'")).toBe(2);
+      const list = altered.map((hash) => `'${hash}'`).join(', ');
+      expect(await count(svc, Table.ObjectChanges, `event = 'update' AND tx_hash IN (${list})`)).toBe(2);
+    });
+
+    it('a retry of the same batch under the same runId is collapsed by the dedup token, a new runId is not', async () => {
+      const svc = await freshService();
+      // Merges are stopped, so it is the insert dedup token and not a merge that keeps the count.
+      for (const table of OBJECT_LEDGER_TABLES) await svc.command(`SYSTEM STOP MERGES ${table}`);
+      try {
+        await new LedgerWriter(svc, ctx, { runId: 'object-retry' }).write(OBJECT_LEDGERS);
+        await new LedgerWriter(svc, ctx, { runId: 'object-retry' }).write(OBJECT_LEDGERS);
+        await expectStored(svc, OBJECT_BUILT);
+
+        // Without the token the same rows are real duplicates: stored twice, until a merge.
+        const expected = expectedObjectCounts();
+        for (const table of OBJECT_LEDGER_TABLES) {
+          await svc.command(`INSERT INTO ${table} SELECT * FROM ${table}`, {}, { settings: { insert_deduplicate: 0 } });
+          expect([table, await count(svc, table)]).toEqual([table, 2 * expected[table]]);
+        }
+      } finally {
+        for (const table of OBJECT_LEDGER_TABLES) await svc.command(`SYSTEM START MERGES ${table}`);
+      }
+      for (const table of OBJECT_LEDGER_TABLES) {
+        await svc.command(`OPTIMIZE TABLE ${table} FINAL`);
+        expect([table, await count(svc, table)]).toEqual([table, expectedObjectCounts()[table]]);
+      }
+    });
+
+    it.each([Table.LedgerByHash, Table.Ledgers])(
+      'a failure of the %s insert, after the child inserts, leaves no object row above the checkpoint once recovery is through',
+      async (failingTable) => {
+        const svc = await freshService();
+        // Committed ledgers with object rows, then a batch with object rows whose last inserts fail.
+        const committed = 10;
+        await new LedgerWriter(svc, ctx).write(OBJECT_LEDGERS.slice(0, committed));
+        const checkpoint = oIndex(committed - 1);
+        const survivors = expectedObjectCounts((i) => i <= checkpoint);
+        const all = expectedObjectCounts();
+        for (const table of OBJECT_LEDGER_TABLES) {
+          expect([table, survivors[table] > 0, all[table] > survivors[table]]).toEqual([table, true, true]);
+        }
+
+        const failed = new LedgerWriter(svc, ctx, { runId: 'object-fail' });
+        const real = svc.insert.bind(svc);
+        const failing = jest.spyOn(svc, 'insert').mockImplementation(async (table, rows, opts) => {
+          if (table === failingTable) throw new Error('injected failure after the child rows');
+          await real(table, rows, opts);
+        });
+        await expect(failed.write(OBJECT_LEDGERS.slice(committed))).rejects.toThrow('injected failure');
+        failing.mockRestore();
+
+        // The child rows are in, the ledgers are not committed.
+        expect(await committedCheckpoint(svc)).toBe(checkpoint);
+        for (const table of OBJECT_LEDGER_TABLES) {
+          expect([table, (await rowsAbove(svc, checkpoint))[table] > 0]).toEqual([table, true]);
+        }
+
+        // The recovery contract of LedgerWriter.
+        await awaitQuiescence(svc, failed.runId);
+        const cp = await committedCheckpoint(svc);
+        expect(cp).toBe(checkpoint);
+        await deleteLedgersAbove(svc, cp!, { queryIdPrefix: 'object-recover' });
+        await awaitQuiescence(svc, 'object-recover');
+
+        expect(await rowsAbove(svc, checkpoint)).toEqual(Object.fromEntries(ALL_TABLES.map((t) => [t, 0])));
+        for (const table of OBJECT_LEDGER_TABLES)
+          expect([table, (await rowsAbove(svc, checkpoint))[table]]).toEqual([table, 0]);
+        // The object rows of the committed ledgers were not touched.
+        await expectStored(svc, OBJECT_BUILT, (i) => i <= checkpoint);
+
+        await failed.withNewRunId().write(OBJECT_LEDGERS.slice(committed));
+        await expectStored(svc, OBJECT_BUILT);
+        expect(await committedCheckpoint(svc)).toBe(oIndex(OBJECT_LEDGERS.length - 1));
+      },
+    );
+
+    it('deleteLedgerRange removes the object rows of the range and keeps those outside it, table by table', async () => {
+      const svc = await freshService();
+      await new LedgerWriter(svc, ctx).write(OBJECT_LEDGERS);
+
+      const from = oIndex(4);
+      const to = oIndex(15);
+      await deleteLedgerRange(svc, from, to);
+
+      const kept = (i: number): boolean => i < from || i > to;
+      await expectStored(svc, OBJECT_BUILT, kept);
+      for (const [table, key, orderBy] of OBJECT_KEYS) {
+        const built = OBJECT_BUILT.filter((r) => kept(r.ledger.ledger_index)).flatMap(
+          (r) => r[key] as unknown as Json[],
+        );
+        expect([table, await readBack(svc, table, orderBy)]).toEqual([table, sortedBy(built, orderBy.split(', '))]);
+        expect([table, await count(svc, table, `ledger_index >= ${from} AND ledger_index <= ${to}`)]).toEqual([
+          table,
+          0,
+        ]);
+      }
+
+      // And the range can be written again without duplicates.
+      await new LedgerWriter(svc, ctx).write(OBJECT_LEDGERS.slice(4, 16));
+      await expectStored(svc, OBJECT_BUILT);
     });
   });
 

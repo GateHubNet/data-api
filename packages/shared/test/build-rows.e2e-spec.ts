@@ -83,6 +83,8 @@ interface Scenario {
   payments?: number;
   /** The ledgers are the recorded NFT or URIToken cases: every NFT table gets rows. */
   nft?: boolean;
+  /** The ledgers are the recorded escrow, check, channel and delegation cases: both object tables get rows. */
+  objects?: boolean;
 }
 
 const SCENARIOS: Scenario[] = [
@@ -103,6 +105,23 @@ const SCENARIOS: Scenario[] = [
     ledgers: 9,
     nft: true,
   },
+  // Whole ledgers around the recorded escrow, check, payment channel and delegation cases of both networks.
+  {
+    name: 'recorded objects xrpl',
+    database: 'rows_objects_xrpl',
+    network: 'xrpl',
+    dir: 'xrpl/objects',
+    ledgers: 22,
+    objects: true,
+  },
+  {
+    name: 'recorded objects xahau',
+    database: 'rows_objects_xahau',
+    network: 'xahau',
+    dir: 'xahau/objects',
+    ledgers: 12,
+    objects: true,
+  },
 ];
 
 /** The five NFT tables, with the property of `LedgerRows` that holds their rows. */
@@ -112,6 +131,12 @@ const NFT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.CollectionNftEvents, 'collectionNftEvents'],
   [Table.NftSales, 'nftSales'],
   [Table.NftTouches, 'nftTouches'],
+];
+
+/** The two object tables, with the property of `LedgerRows` that holds their rows. */
+const OBJECT_TABLES: ReadonlyArray<[Table, keyof LedgerRows]> = [
+  [Table.ObjectChanges, 'objectChanges'],
+  [Table.AccountObjectChanges, 'accountObjectChanges'],
 ];
 
 describe('buildLedgerRows into ClickHouse (e2e)', () => {
@@ -212,6 +237,21 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
           const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
           expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
         }
+      });
+    }
+
+    if (scenario.objects) {
+      it('the object fixtures land in both tables, and every change has an owner row in the index', async () => {
+        for (const [table, key] of OBJECT_TABLES) {
+          const expected = built.reduce((sum, rows) => sum + (rows[key] as unknown[]).length, 0);
+          expect([table, expected > 0, await count(table)]).toEqual([table, true, expected]);
+        }
+        const owners = await svc.queryOne<{ n: string }>(
+          `SELECT count() AS n FROM ${Table.AccountObjectChanges} WHERE role = 'owner'`,
+          {},
+          READ_SETTINGS,
+        );
+        expect(Number(owners?.n)).toBe(await count(Table.ObjectChanges));
       });
     }
 

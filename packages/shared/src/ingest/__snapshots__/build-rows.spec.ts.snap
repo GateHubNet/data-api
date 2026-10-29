@@ -2516,6 +2516,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "ammUnclassified": 0,
     "invalidDomains": 0,
     "nftSkipped": 0,
+    "objectsUnclassified": 0,
   },
   "exchanges": [],
   "ledger": {
@@ -2532,7 +2533,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
     "ledger_index": 26570752,
     "parent_close_time": 1792166061,
     "parent_hash": "9F2936DE8B5EE15ECD33A9B49E609CCFB2241DD7AAF00DF1E67CF34ADD065A56",
-    "parser_version": 6,
+    "parser_version": 7,
     "payments_count": 15,
     "result_counts": {
       "tesSUCCESS": 37,
@@ -4751,6 +4752,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "ammUnclassified": 0,
     "invalidDomains": 0,
     "nftSkipped": 0,
+    "objectsUnclassified": 0,
   },
   "exchanges": [],
   "ledger": {
@@ -4767,7 +4769,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
     "ledger_index": 26540188,
     "parent_close_time": 1792057530,
     "parent_hash": "C1BB45D8DD5C0E7791932423D7768C60442220D6C5785787FF716DE0D974D2C4",
-    "parser_version": 6,
+    "parser_version": 7,
     "payments_count": 2,
     "result_counts": {
       "tesSUCCESS": 4,
@@ -5798,6 +5800,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "ammUnclassified": 0,
     "invalidDomains": 0,
     "nftSkipped": 0,
+    "objectsUnclassified": 0,
   },
   "exchanges": [],
   "ledger": {
@@ -5814,7 +5817,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
     "ledger_index": 11118827,
     "parent_close_time": 0,
     "parent_hash": "D18572CED3F13BA2AD7B951CB65A943181F1C0DB8FFB4B61F0C4797FBE65E1AC",
-    "parser_version": 6,
+    "parser_version": 7,
     "payments_count": 0,
     "result_counts": {
       "tesSUCCESS": 13,
@@ -7670,6 +7673,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     "ammUnclassified": 0,
     "invalidDomains": 0,
     "nftSkipped": 0,
+    "objectsUnclassified": 0,
   },
   "exchanges": [
     {
@@ -7768,7 +7772,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     "ledger_index": 11119620,
     "parent_close_time": 0,
     "parent_hash": "53E8F8A9778B140571E12355244C8DFB832A8B2D5D450B594BD961E204957022",
-    "parser_version": 6,
+    "parser_version": 7,
     "payments_count": 3,
     "result_counts": {
       "tesSUCCESS": 11,
@@ -9257,6 +9261,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "ammUnclassified": 0,
     "invalidDomains": 0,
     "nftSkipped": 0,
+    "objectsUnclassified": 0,
   },
   "exchanges": [],
   "ledger": {
@@ -9273,7 +9278,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
     "ledger_index": 11618225,
     "parent_close_time": 1423513790,
     "parent_hash": "EA9C0029FB0171BC7F26B91E952B792FDA634D30E030BA1CDF4E10309554ADB3",
-    "parser_version": 6,
+    "parser_version": 7,
     "payments_count": 4,
     "result_counts": {
       "tesSUCCESS": 5,

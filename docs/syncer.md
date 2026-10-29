@@ -690,7 +690,7 @@ are not starved with `nft_state` and `nft_collections` registered.
 
 **Metrics.** `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending` (above), the counter
 `syncer_nft_skipped_total` (the NFT events the parser dropped for an amount that is an MPT amount, in a batch that was committed; the live ingest
-and the range-ingest runs of the process count them, the latter log a warning when it is not 0 and always end with `J skipped NFT events`), and
+and the range-ingest runs of the process count them, the latter log a warning when it is not 0 and always say `J skipped NFT events` in their last line, which ends with `L unclassified object changes`), and
 `syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the labels `nft_state`, `nft_state_dirty` and `nft_collections`
 ([observability](observability.md#4-metrics-syncer)). A job that keeps failing logs `Aggregator job nft_state: ...` / `Aggregator job
 nft_collections: ...` warnings and errors, and `nft_state: NFT <id> is rebuilt again` / `nft_collections: collection <id> is computed again` when a

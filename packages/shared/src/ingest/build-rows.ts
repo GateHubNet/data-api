@@ -43,6 +43,7 @@ import { BalanceChangesParser } from '../parsers/balance-changes.parser';
 import { ExchangeParser } from '../parsers/exchanges.parser';
 import { FromClientParser } from '../parsers/from-client.parser';
 import { NftParser, rolesOf } from '../parsers/nft.parser';
+import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
 import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
@@ -124,6 +125,11 @@ export interface LedgerDiagnostics {
    * something else; the build only counts it and never throws.
    */
   invalidDomains: number;
+  /**
+   * Created, modified or deleted escrow, check, payment channel and delegation nodes that no event of the object history
+   * expects (the rows of event `update`, spec §2.2), summed over the ledger's transactions: `syncer_objects_unclassified_total`.
+   */
+  objectsUnclassified: number;
 }
 
 /**
@@ -180,6 +186,7 @@ const accountDomainsParser = new AccountDomainsParser();
 const trustLineStatesParser = new TrustLineStatesParser();
 const ammParser = new AmmParser();
 const nftParser = new NftParser();
+const objectChangesParser = new ObjectChangesParser();
 const affectedAccountsParser = new AffectedAccountsParser();
 const fromClientParser = new FromClientParser();
 
@@ -297,7 +304,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     accountDomains: [],
     objectChanges: [],
     accountObjectChanges: [],
-    diagnostics: { ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0 },
+    diagnostics: { ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0, objectsUnclassified: 0 },
   };
 
   const typeCounts = new Map<string, number>();
@@ -753,6 +760,43 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         domain_hex: domain.domain_hex,
         deleted: domain.deleted ? 1 : 0,
       });
+    }
+
+    // The object and the account index rows of each change: the owner's, and the counterparty's unless it has none (two
+    // rows, one per role, when they are the same account).
+    const delegate = typeof t.tx.Delegate === 'string' ? t.tx.Delegate : '';
+    for (const change of objectChangesParser.parse(t, ctx)) {
+      if (change.event === 'update') rows.diagnostics.objectsUnclassified += 1;
+      rows.objectChanges.push({
+        object_type: change.object_type,
+        object_id: change.object_id,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        tx_hash: t.hash,
+        close_time: closeTime,
+        tx_type: txType,
+        result,
+        sender,
+        delegate,
+        action: change.action,
+        event: change.event,
+        owner: change.owner,
+        counterparty: change.counterparty,
+        fields: change.fields,
+        previous: change.previous,
+        event_fields: change.event_fields,
+      });
+      const indexRow = (account: string, role: AccountObjectChangesRow['role']): AccountObjectChangesRow => ({
+        account,
+        object_type: change.object_type,
+        role,
+        ledger_index: header.ledger_index,
+        tx_index: txIndex,
+        object_id: change.object_id,
+        action: change.action,
+      });
+      rows.accountObjectChanges.push(indexRow(change.owner, 'owner'));
+      if (change.counterparty !== '') rows.accountObjectChanges.push(indexRow(change.counterparty, 'counterparty'));
     }
 
     for (const line of trustLineStatesParser.parse(t, ctx)) {

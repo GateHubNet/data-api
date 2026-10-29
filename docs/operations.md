@@ -658,7 +658,7 @@ design in [ADR-0016](adr/0016-nft-and-uritoken-data.md); what an operator needs:
   gone (`SELECT * FROM xrpl.nft_dirty` shows them). Until then the aggregates (holdings, collection lists) show the old data; an NFT's detail, history
   and offers show the new data at once.
 - **`syncer_nft_skipped_total`** counts the NFT events the parser dropped because their amount is an MPT amount (none is possible in the ledger today).
-  A rise means the NFT history is missing those events: the range-ingest log warns with the total of its run and always ends with `J skipped NFT events`.
+  A rise means the NFT history is missing those events: the range-ingest log warns with the total of its run, and its last line always says `J skipped NFT events` (and ends with `L unclassified object changes`).
 - **A collection that is missing.** `GET /v2/nft_collections/{issuer}/{taxon}` and its sub-routes answer 404 for a collection the job has not counted yet
   (up to about five minutes after its first NFT, or a long wait in the first fill above). A 404 that lasts: no event of the NFTs was ingested, or
   `nft_collections` is failing for it (the log names the collection).
@@ -690,7 +690,7 @@ labels of [above](#name-an-address), and a **verified name** where an account's 
 
 | Piece | Cadence | Healthy | Watch |
 | --- | --- | --- | --- |
-| `account_domains`, written by the ingest (parser version 6) | with every ledger | a row for each change of an account that has a Domain | the [seed](backfill.md#account-domains-seed) fills it for the ledgers before the deploy |
+| `account_domains`, written by the ingest (parser version 6 or later) | with every ledger | a row for each change of an account that has a Domain | the [seed](backfill.md#account-domains-seed) fills it for the ledgers before the deploy |
 | The `tomls` worker of the syncer ([syncer](syncer.md#8a-the-tomls-worker)) | discovery every 5 minutes; a pass 60 s after the previous one, at most 300 domains, 16 at a time | a toml `ok` every 24 hours; `syncer_tomls_due` near 0 | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the `Tomls: ...` log lines |
 | The api's names and labels | loaded at start and every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s) | a row the operator inserts shows within a minute | `Could not load the ...` (a `warn`) |
 | What the toml of an account's domain says of it | read by key at each call, for the distinct domains of the batch, kept 60 s per address | a toml read by the worker shows within a minute | `Could not read the tomls of the account domains, no domain is a name in this answer` (a `warn`: that answer has no `verified` and no `domain` kind) |
@@ -700,7 +700,7 @@ labels of [above](#name-an-address), and a **verified name** where an account's 
 1. **Apply migration `012_display_names.sql`** (`dc run --rm migrate-xrpl` / `migrate-xahau`) **before this release's syncer starts**: the ingest writes
    `account_domains` with every ledger, and a write to a missing table fails the batch ([above](#apply-a-schema-migration)). The `tomls` worker refuses to boot
    without it.
-2. **Deploy the syncer** (parser version 6; the `tomls` worker is in the default `GH_WORKERS`, and **where `GH_WORKERS` is set explicitly add `tomls`**) **and the api.**
+2. **Deploy the syncer** (parser version 6 or later; the `tomls` worker is in the default `GH_WORKERS`, and **where `GH_WORKERS` is set explicitly add `tomls`**) **and the api.**
    The syncer needs **outbound HTTPS to every domain accounts name** ([deployment](deployment.md#outbound-network-access)): open the egress, or set
    `GH_DOMAIN_VERIFICATION=false` (no toml is read; on a store that is still empty no name is verified and every domain shows as an unverified one).
 3. **Run the seed once per network** ([backfill](backfill.md#account-domains-seed), 16 buckets): it gives every account its current Domain from the state

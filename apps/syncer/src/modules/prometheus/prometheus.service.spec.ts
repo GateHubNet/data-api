@@ -21,6 +21,7 @@ describe('PrometheusService', () => {
     service.aggregatorStatsLagSeconds.set(86_400);
     service.ammUnclassifiedTotal.inc(3);
     service.nftSkippedTotal.inc(2);
+    service.objectsUnclassifiedTotal.inc(4);
     service.nftStateLagLedgers.set(12);
     service.nftDirtyLedgers.set(34);
     service.nftCollectionsPending.set(5);
@@ -46,6 +47,13 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_amm_unclassified_total 3$/m);
     expect(text).toMatch(/^# TYPE syncer_nft_skipped_total counter$/m);
     expect(text).toMatch(/^syncer_nft_skipped_total 2$/m);
+    expect(text).toMatch(/^# TYPE syncer_objects_unclassified_total counter$/m);
+    expect(text).toContain(
+      '# HELP syncer_objects_unclassified_total Changes of an escrow, check, payment channel or delegation that no event of ' +
+        'the object history expects (the event update, spec section 2.2), over the ledgers written by the live ingest and ' +
+        'by range-ingest runs of this process.\n# TYPE syncer_objects_unclassified_total counter\n',
+    );
+    expect(text).toMatch(/^syncer_objects_unclassified_total 4$/m);
     expect(text).toMatch(/^# TYPE syncer_nft_state_lag_ledgers gauge$/m);
     expect(text).toMatch(/^syncer_nft_state_lag_ledgers 12$/m);
     expect(text).toMatch(/^# TYPE syncer_nft_dirty_ledgers gauge$/m);

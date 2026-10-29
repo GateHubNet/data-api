@@ -61,6 +61,11 @@ const metrics = {
     help: 'NFT and URIToken events the parser dropped because their amount is an MPT amount or not an amount at all (spec §2.5), over the ledgers written by the live ingest and by range-ingest runs of this process.',
     registers: [registry],
   }),
+  objectsUnclassifiedTotal: new Counter({
+    name: 'syncer_objects_unclassified_total',
+    help: 'Changes of an escrow, check, payment channel or delegation that no event of the object history expects (the event update, spec section 2.2), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    registers: [registry],
+  }),
   validationsFlushedTotal: new Counter({
     name: 'syncer_validations_flushed_total',
     help: 'Validation rows flushed to ClickHouse.',
@@ -256,6 +261,7 @@ export class PrometheusService implements OnModuleInit {
   readonly nodeRateLimitedTotal = metrics.nodeRateLimitedTotal;
   readonly ammUnclassifiedTotal = metrics.ammUnclassifiedTotal;
   readonly nftSkippedTotal = metrics.nftSkippedTotal;
+  readonly objectsUnclassifiedTotal = metrics.objectsUnclassifiedTotal;
   readonly validationsFlushedTotal = metrics.validationsFlushedTotal;
   readonly validationsErrorsTotal = metrics.validationsErrorsTotal;
   readonly validationsDroppedTotal = metrics.validationsDroppedTotal;

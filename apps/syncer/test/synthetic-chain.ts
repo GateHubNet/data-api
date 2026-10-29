@@ -26,6 +26,21 @@ export const NFT_TEMPLATE_FILE = join(__dirname, '../../../packages/shared/test/
 /** The recorded NFTokenCreateOffer (a sell offer of 19.98 XRP) of `NFT_TEMPLATE_FILE` that `nftTemplate` copies. */
 const NFT_SELL_OFFER_HASH = 'BB9BE0C948CB66FB19AD53AA77C6C4FA664D825AA3B7C3CA2397DC2D091B5BD9';
 
+/** The recorded mainnet ledgers of the escrow, check, payment channel and delegation cases (D5, Task 1). */
+const OBJECT_FIXTURES_DIR = join(__dirname, '../../../packages/shared/test/fixtures/xrpl/objects');
+
+/**
+ * The four recorded transactions `objectTemplate` copies, each `[ledger, hash]`: an EscrowCreate (the first one's ledger
+ * gives the template its header), a CheckCreate, a PaymentChannelCreate and a DelegateSet, so that a ledger made of them
+ * has rows in both object tables, one change of each type.
+ */
+const OBJECT_TEMPLATE_TRANSACTIONS: ReadonlyArray<readonly [ledger: number, hash: string]> = [
+  [107897249, 'BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53'],
+  [107972102, 'DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E'],
+  [106970128, '04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7'],
+  [107558036, '4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66'],
+];
+
 type Json = Record<string, any>;
 
 /**
@@ -101,6 +116,57 @@ export function nftTemplate(skipped = 0): Record<string, unknown> {
     transactions.push(copy);
   }
   return { ...ledger, transactions };
+}
+
+/**
+ * The template of a chain with escrow, check, channel and delegation activity: the four recorded transactions of
+ * `OBJECT_TEMPLATE_TRANSACTIONS` (one change of each tracked type: 4 `object_changes` rows and 8 `account_object_changes`
+ * rows per ledger), plus `unclassified` transactions `synthetic-object-update-<k>` that each modify an Escrow node in a
+ * transaction type the object history does not expect it of (an AccountSet: the row has the event `update`, +1 on
+ * `syncer_objects_unclassified_total`). The recorded transactions alone have none. Like `ammTemplate` for the AMM pools,
+ * the synthetic ones are built here and say so; the header is the first recorded ledger's.
+ */
+export function objectTemplate(unclassified = 0): Record<string, unknown> {
+  const ledgers = new Map<number, Json>();
+  const ledgerOf = (index: number): Json => {
+    let ledger = ledgers.get(index);
+    if (!ledger) {
+      const file = join(OBJECT_FIXTURES_DIR, `${index}.json.gz`);
+      ledger = JSON.parse(gunzipSync(readFileSync(file)).toString('utf8')).ledger as Json;
+      ledgers.set(index, ledger);
+    }
+    return ledger;
+  };
+  const transactions: Json[] = OBJECT_TEMPLATE_TRANSACTIONS.map(([index, hash], at) => {
+    const recorded = (ledgerOf(index).transactions as Json[]).find((tx) => tx.hash === hash);
+    if (!recorded) throw new Error(`transaction ${hash} is not in ledger ${index} of ${OBJECT_FIXTURES_DIR}`);
+    return { ...structuredClone(recorded), metaData: { ...recorded.metaData, TransactionIndex: at } };
+  });
+  const owner = 'rUnclassifiedObjectOwnerxxxxxxx';
+  for (let k = 0; k < unclassified; k++) {
+    transactions.push({
+      Account: owner,
+      TransactionType: 'AccountSet',
+      Fee: '10',
+      Sequence: 1 + k,
+      hash: `E${k.toString(16).toUpperCase()}`.padEnd(64, 'E'),
+      metaData: {
+        TransactionIndex: transactions.length,
+        TransactionResult: 'tesSUCCESS',
+        AffectedNodes: [
+          {
+            ModifiedNode: {
+              LedgerEntryType: 'Escrow',
+              LedgerIndex: `5${k.toString(16).toUpperCase()}`.padEnd(64, '5'),
+              FinalFields: { Account: owner, Amount: '10', Destination: 'rUnclassifiedObjectTargetxxxxxx' },
+              PreviousFields: { Amount: '20' },
+            },
+          },
+        ],
+      },
+    });
+  }
+  return { ...ledgerOf(OBJECT_TEMPLATE_TRANSACTIONS[0][0]), transactions };
 }
 
 /** A ledger hash (64 upper-case hex digits) that depends only on the index and the salt. */

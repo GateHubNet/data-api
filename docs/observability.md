@@ -296,7 +296,7 @@ of the Markets table is understated until the queue is empty (on a large reproce
 
 A range ingest bulk-loads ClickHouse hard ([backfill](backfill.md)). Watch both sides:
 
-- **CLI:** its log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools, J skipped NFT events`), and in SQL `SELECT count(), max(ledger_index) FROM
+- **CLI:** its log (`Range [...] ingested: N chunks complete ... M ledgers written, K unclassified AMM pools, J skipped NFT events, L unclassified object changes`), and in SQL `SELECT count(), max(ledger_index) FROM
   <db>.ledgers`. The CLI is a separate process and has no metrics endpoint; the live syncer's gauges describe the live runner only.
 - **Aggregator:** `SELECT count() FROM <db>.agg_dirty` shrinks as the aggregator digests the new hours;
   `syncer_aggregator_stats_lag_seconds`. After an NFT re-ingest `syncer_nft_dirty_ledgers` falls to 0 and `syncer_nft_collections_pending` follows

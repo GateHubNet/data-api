@@ -28,7 +28,15 @@ import {
 } from '../src/ingest/live-runner';
 import { LedgerNotValidatedError } from '../src/ingest/rpc-ledger-source';
 import { PrometheusService } from '../src/modules/prometheus/prometheus.service';
-import { ammTemplate, nftTemplate, range, syntheticChain, syntheticHash, SyntheticLedger } from './synthetic-chain';
+import {
+  ammTemplate,
+  nftTemplate,
+  objectTemplate,
+  range,
+  syntheticChain,
+  syntheticHash,
+  SyntheticLedger,
+} from './synthetic-chain';
 
 /** `L(1)` .. `L(30)` = 9999986 .. 10000015: the chain crosses the partition boundary at ledger 10,000,000. */
 const BASE = 9_999_985;
@@ -778,6 +786,71 @@ describe('LiveRunner (e2e)', () => {
       expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
       await expectRows(svc, L(12), NFT_CHAIN);
       expect(await skipped(metrics)).toBe(before + 12 * SKIPPED_PER_LEDGER);
+    });
+  });
+
+  describe('object rows and syncer_objects_unclassified_total', () => {
+    /** Changes per ledger that no event expects: the rows have the event `update` (see `objectTemplate`). */
+    const UPDATES_PER_LEDGER = 2;
+    // Every ledger: a recorded EscrowCreate, CheckCreate, PaymentChannelCreate and DelegateSet (rows in both object tables)
+    // and 2 escrow changes that no event expects.
+    const OBJECT_CHAIN = syntheticChain(L(1), 12, { template: objectTemplate(UPDATES_PER_LEDGER) });
+
+    /** The counter now. It is process-wide, so a test compares it with its value before. */
+    const unclassifiedObjects = async (metrics: PrometheusService): Promise<number> =>
+      (await metrics.objectsUnclassifiedTotal.get()).values[0]?.value ?? 0;
+
+    it('the chain has rows for both object tables and two unclassified changes per ledger', () => {
+      const total = OBJECT_CHAIN.reduce(
+        (sum, l) => sum + buildLedgerRows(l.raw, ctx).diagnostics.objectsUnclassified,
+        0,
+      );
+      expect(total).toBe(12 * UPDATES_PER_LEDGER);
+      const counts = expectedCounts(L(12), OBJECT_CHAIN);
+      for (const table of [Table.ObjectChanges, Table.AccountObjectChanges]) {
+        expect([table, counts[table] > 0]).toEqual([table, true]);
+      }
+    });
+
+    it('writes the object rows with the ledgers and adds the changes it could give no event to the counter', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(12), OBJECT_CHAIN), { metrics });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 object ledgers');
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      await expectRows(svc, L(12), OBJECT_CHAIN);
+      expect(await unclassifiedObjects(metrics)).toBe(before + 12 * UPDATES_PER_LEDGER);
+    });
+
+    it('adds nothing for a chain without object changes that no event expects', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+      const { runner } = makeRunner(svc, new TestSource(L(10)), { metrics });
+
+      await runner.runOnce();
+
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(10)));
+      expect(await unclassifiedObjects(metrics)).toBe(before);
+    });
+
+    it('counts a batch once: not for a write that failed and was recovered, only for the one that committed', async () => {
+      const svc = await freshService();
+      const metrics = new PrometheusService();
+      const before = await unclassifiedObjects(metrics);
+      // The second batch fails after its child rows went in; recovery deletes them and writes the batch again.
+      const writer = new FailOnSecondWrite(svc);
+      const { runner } = makeRunner(svc, new TestSource(L(12), OBJECT_CHAIN), { metrics, writer });
+
+      await within(runner.runOnce(), 20_000, 'Catching up 12 object ledgers through a failed write');
+
+      expect(writer.orphanTransactions).toBeGreaterThan(0); // the failure really left rows behind
+      expect(await committedIndexes(svc)).toEqual(range(L(1), L(12)));
+      await expectRows(svc, L(12), OBJECT_CHAIN);
+      expect(await unclassifiedObjects(metrics)).toBe(before + 12 * UPDATES_PER_LEDGER);
     });
   });
 

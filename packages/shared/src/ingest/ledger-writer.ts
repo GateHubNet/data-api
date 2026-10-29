@@ -22,6 +22,12 @@ export interface LedgerWriteResult {
    * (`LedgerRows.diagnostics`). Counted like `ammUnclassified`: the caller adds it to `syncer_nft_skipped_total`.
    */
   nftSkipped: number;
+  /**
+   * Escrow, check, payment channel and delegation changes the object parser could not give an event (the rows of event
+   * `update`; `LedgerRows.diagnostics`). Counted like `ammUnclassified`: the caller adds it to
+   * `syncer_objects_unclassified_total`.
+   */
+  objectsUnclassified: number;
 }
 
 export interface LedgerWriterOptions {
@@ -95,7 +101,7 @@ export class LedgerWriter {
    * Resolves to the diagnostics of the batch once it is committed; a failure throws and reports nothing.
    */
   async write(ledgers: RawLedger[]): Promise<LedgerWriteResult> {
-    if (ledgers.length === 0) return { ammUnclassified: 0, nftSkipped: 0 };
+    if (ledgers.length === 0) return { ammUnclassified: 0, nftSkipped: 0, objectsUnclassified: 0 };
 
     // Parsing is pure and throws before anything has been written.
     const built = ledgers.map((raw) => buildLedgerRows(raw, this.ctx));
@@ -126,6 +132,7 @@ export class LedgerWriter {
     return {
       ammUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.ammUnclassified, 0),
       nftSkipped: byIndex.reduce((sum, rows) => sum + rows.diagnostics.nftSkipped, 0),
+      objectsUnclassified: byIndex.reduce((sum, rows) => sum + rows.diagnostics.objectsUnclassified, 0),
     };
   }
 
