@@ -11,14 +11,15 @@ import { TomlController } from './toml.controller';
 /**
  * What the api knows of the names of accounts (ADR-0014, spec 5.3): the names and labels the operator writes by hand
  * (`NamesAndLabelsService`, in memory, one instance and one reload timer for the whole app), the account domain of an address
- * read from the ledger-derived `account_domains` (`AccountDomainsService`), and the toml store (`DomainTomlsService`: the
- * directory of what each toml says of its accounts, and the row of one domain), and the display names those make together
- * (`DisplayNamesService`), which `AccountNamesController` answers on `GET /v2/account_names`; `TomlController` answers what the
- * store says of one domain on `GET /v2/toml/{domain}`. `AccountsModule` imports it for the names of `GET /v2/accounts/{address}`,
- * and the modules that read the tomls import it for `DomainTomlsService`.
+ * read from the ledger-derived `account_domains` (`AccountDomainsService`), and the toml store (`DomainTomlsService`: what the
+ * toml of an account's domain says of the account, and the row of one domain, both read by key on request), and the display
+ * names those make together (`DisplayNamesService`), which `AccountNamesController` answers on `GET /v2/account_names`;
+ * `TomlController` answers what the store says of one domain on `GET /v2/toml/{domain}`. `AccountsModule` imports it for the
+ * names of `GET /v2/accounts/{address}`, and the modules that read the tomls import it for `DomainTomlsService`.
  *
- * The answers read on request (the domain of each address asked, the row of each domain asked) are kept in a `CacheService` of
- * their own (`NAMES_CACHE`), so that the many keys they make cannot push the answers of the shared one out.
+ * The answers read on request (the domain of each address asked, what its domain's toml says of it, the row of each domain
+ * asked) are kept in a `CacheService` of their own (`NAMES_CACHE`), so that the many keys they make cannot push the answers of
+ * the shared one out.
  */
 @Module({
   controllers: [AccountNamesController, TomlController],

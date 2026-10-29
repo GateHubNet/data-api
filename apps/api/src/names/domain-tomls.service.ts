@@ -7,81 +7,87 @@ import {
   Table,
   TomlAccount,
 } from '@gatehub/data-api-shared';
-import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { CacheService } from '../common/cache.service';
-import { ApiConfig, NETWORK_PROFILE } from '../config/api.config';
+import { NETWORK_PROFILE } from '../config/api.config';
+import { TomlListing } from './display-name';
 import { NAMES_CACHE } from './names-cache';
 
 /**
- * The newest row of each domain (the largest `checked_at`, `LIMIT 1 BY` over the sort key, never `FINAL`) that has accounts, with
- * the accounts and nothing else of it: the whole table is read, three columns of it, once per reload.
+ * What the newest row of each of `domains` says of `addresses`, by key (`domain` is the sort key; the largest `checked_at` of a
+ * domain is its current word, `LIMIT 1 BY` over the sort key, never `FINAL`): the `[[ACCOUNTS]]` entries of those addresses
+ * and nothing else of the row, in file order. A domain without a row is not in the answer; one whose row lists none of them
+ * has an empty `listed`. The alias is not a column name.
  */
-export const TOML_DIRECTORY_SQL = `SELECT domain, accounts FROM (
-  SELECT domain, accounts FROM ${Table.DomainTomls}
-   ORDER BY domain, checked_at DESC
-   LIMIT 1 BY domain)
- WHERE notEmpty(accounts)`;
+export const TOML_LISTINGS_SQL = `SELECT domain, arrayFilter(a -> has({addresses:Array(String)}, tupleElement(a, 'address')), accounts) AS listed
+  FROM (SELECT domain, accounts FROM ${Table.DomainTomls}
+         WHERE domain IN {domains:Array(String)}
+         ORDER BY domain, checked_at DESC
+         LIMIT 1 BY domain)`;
 
 /** How long the row of a domain is kept (`DomainTomlsService.get`), in milliseconds. */
 export const DOMAIN_TOML_TTL_MS = 60_000;
 
-/** A row of `TOML_DIRECTORY_SQL`. */
-interface DirectoryRow {
+/** How long what a domain's toml says of an address is kept (`DomainTomlsService.listings`), in milliseconds. */
+export const TOML_LISTING_TTL_MS = 60_000;
+
+/** A row of `TOML_LISTINGS_SQL`. */
+interface ListingsRow {
   domain: string;
-  accounts: TomlAccount[];
+  listed: TomlAccount[];
 }
 
-/** What a domain's toml says of its accounts on this network: address to `desc`. */
-type Listed = ReadonlyMap<string, string>;
+/** The key what the toml of `domain` says of `address` is kept under; an address it does not list is kept as `null`. */
+const keyOf = (domain: string, address: string): string => `toml-listing:${domain}:${address}`;
 
 /**
- * The toml store as the api reads it (spec 5.3, 8): the **directory** of what each toml says of its accounts, held whole in memory,
- * and the newest row of one domain, by key.
- *
- * The directory is loaded when the app starts and again every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s), like the names. A load that
- * fails is a `warn`: the last directory stays (none before the first load, `loaded` false) and the next reload tries again. It
- * never fails a request or the boot.
+ * The toml store as the api reads it (spec 5.3, 8), by key and on request, never whole: what the toml of an account's
+ * domain says of the account, for the display names, and the newest row of one domain, for `GET /v2/toml/{domain}` (and D6,
+ * D8). Each answer is kept 60 s in the cache of the names (`NAMES_CACHE`), so a call reads only what it has not got: what
+ * the api holds is bounded by the requests and the size of that cache, never by the store.
  */
 @Injectable()
-export class DomainTomlsService implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(DomainTomlsService.name);
-  private directory = new Map<string, Listed>();
-  private hasLoaded = false;
-  private timer?: NodeJS.Timeout;
-  private reloading?: Promise<void>;
-
+export class DomainTomlsService {
   constructor(
     private readonly ch: ClickHouseService,
-    private readonly config: ApiConfig,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
     @Inject(NAMES_CACHE) private readonly cache: CacheService,
   ) {}
 
-  async onModuleInit(): Promise<void> {
-    await this.reload();
-    this.timer = setInterval(() => void this.reload(), this.config.namesAndLabelsReloadMs);
-    // a timer alone never keeps the process alive
-    this.timer.unref();
-  }
-
-  async onModuleDestroy(): Promise<void> {
-    clearInterval(this.timer);
-    this.timer = undefined;
-    await this.reloading;
-  }
-
-  /** False until the first load of the directory succeeded: no domain is listed before it. */
-  get loaded(): boolean {
-    return this.hasLoaded;
-  }
-
   /**
-   * What the toml of `domain` (lower case) says of its accounts: address to `desc`, of the entries that count on this network
-   * (`countsOn`), the first entry of an address. `undefined` for a domain the directory does not hold (no row, no account that
-   * counts here), and for every domain before the first load.
+   * What the toml of each account's domain says of the account (`accounts`: address to its account domain, lower case), for
+   * each address of `accounts`: the `desc` of the address's first entry that counts on this network (`countsOn`) in the
+   * domain's newest row, or `null` when there is none (no such entry, no row, a row with no content). Only the account's own
+   * domain vouches for it: what the toml of another domain says of the address is not read. One read by key, for the distinct
+   * domains of the addresses that are not kept, and none when every one is (or there is none); each answer is kept 60 s.
+   * Rejects when the read fails, and keeps nothing of it.
    */
-  listed(domain: string): Listed | undefined {
-    return this.directory.get(domain);
+  async listings(accounts: ReadonlyMap<string, string>): Promise<Map<string, TomlListing | null>> {
+    const answers = new Map<string, TomlListing | null>();
+    const misses = new Map<string, string>();
+    for (const [address, domain] of accounts) {
+      // `get` gives `undefined` for a key it does not keep, so an address the toml does not list is kept as `null`
+      const kept = this.cache.get<TomlListing | null>(keyOf(domain, address));
+      if (kept === undefined) misses.set(address, domain);
+      else answers.set(address, kept);
+    }
+
+    if (misses.size > 0) {
+      const rows = await this.ch.query<ListingsRow>(TOML_LISTINGS_SQL, {
+        domains: [...new Set(misses.values())],
+        addresses: [...misses.keys()],
+      });
+      const listedBy = new Map(rows.map((row) => [row.domain, row.listed]));
+      for (const [address, domain] of misses) {
+        const entry = listedBy
+          .get(domain)
+          ?.find((account) => account.address === address && countsOn(account.network, this.profile));
+        const listing = entry === undefined ? null : { desc: entry.desc };
+        this.cache.set(keyOf(domain, address), listing, TOML_LISTING_TTL_MS);
+        answers.set(address, listing);
+      }
+    }
+    return new Map([...accounts.keys()].map((address) => [address, answers.get(address) ?? null]));
   }
 
   /**
@@ -92,37 +98,5 @@ export class DomainTomlsService implements OnModuleInit, OnModuleDestroy {
     return this.cache.wrap(`domain-toml:${domain}`, DOMAIN_TOML_TTL_MS, async () =>
       (await readStoredTomls(this.ch, [domain])).get(domain),
     );
-  }
-
-  /** Loads the directory again; a reload still running when the timer fires again is not doubled. */
-  private reload(): Promise<void> {
-    this.reloading ??= this.load().finally(() => {
-      this.reloading = undefined;
-    });
-    return this.reloading;
-  }
-
-  private async load(): Promise<void> {
-    try {
-      const rows = await this.ch.query<DirectoryRow>(TOML_DIRECTORY_SQL);
-      this.directory = this.directoryOf(rows);
-      this.hasLoaded = true;
-    } catch (err) {
-      this.logger.warn(`Could not load the toml directory, keeping the last one: ${(err as Error).message}`);
-    }
-  }
-
-  /** The directory of the rows: the entries that count here, the first per address; a domain without one is left out. */
-  private directoryOf(rows: readonly DirectoryRow[]): Map<string, Listed> {
-    const directory = new Map<string, Listed>();
-    for (const row of rows) {
-      const listed = new Map<string, string>();
-      for (const account of row.accounts) {
-        if (!countsOn(account.network, this.profile) || listed.has(account.address)) continue;
-        listed.set(account.address, account.desc);
-      }
-      if (listed.size > 0) directory.set(row.domain, listed);
-    }
-    return directory;
   }
 }

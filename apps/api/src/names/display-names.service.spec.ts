@@ -1,5 +1,9 @@
+import { getNetworkProfile, TomlAccount } from '@gatehub/data-api-shared';
+import { Logger } from '@nestjs/common';
+import { CacheService } from '../common/cache.service';
 import { AccountLabels } from './account-labels';
 import { DisplayNamesService } from './display-names.service';
+import { DomainTomlsService, TOML_LISTINGS_SQL } from './domain-tomls.service';
 import type { NamesAndLabels } from './names-and-labels.service';
 
 const TREASURY = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
@@ -18,33 +22,37 @@ const ADVISORY: AccountLabels = {
 interface World {
   /** The account domain of each address (an address missing from it has none). */
   domains?: Record<string, string>;
-  /** What each toml in the directory says of its accounts, address to `desc`. */
-  directory?: Record<string, Record<string, string>>;
-  /** False until the directory has loaded. */
-  loaded?: boolean;
+  /** What the newest row of each domain's toml says of its accounts, address to `desc` (no network: it counts everywhere). */
+  tomls?: Record<string, Record<string, string>>;
   /** What the operator's names and labels add to each address. */
   names?: Record<string, NamesAndLabels>;
 }
 
-/** The three services `DisplayNamesService` composes, from what a test sets; each call is recorded. */
+/**
+ * `DisplayNamesService` over the real `DomainTomlsService`, whose ClickHouse answers `TOML_LISTINGS_SQL` as the statement does
+ * (the newest row of each domain asked, the entries of the addresses asked), and the two other services it composes, from what
+ * a test sets; each call is recorded.
+ */
 function setup(world: World = {}) {
   const current = jest.fn(
     async (addresses: readonly string[]): Promise<Map<string, string | undefined>> =>
       new Map(addresses.map((address) => [address, world.domains?.[address]])),
   );
-  const listed = jest.fn((domain: string) => {
-    const entries = world.directory?.[domain];
-    return entries === undefined ? undefined : new Map(Object.entries(entries));
+  const query = jest.fn(async (sql: string, params: { domains: string[]; addresses: string[] }) => {
+    if (sql !== TOML_LISTINGS_SQL) throw new Error(`unexpected statement: ${sql}`);
+    return params.domains.flatMap((domain) => {
+      const entries = world.tomls?.[domain];
+      if (entries === undefined) return [];
+      const listed: TomlAccount[] = Object.entries(entries)
+        .filter(([address]) => params.addresses.includes(address))
+        .map(([address, desc]) => ({ address, network: '', desc }));
+      return [{ domain, listed }];
+    });
   });
-  const tomls = {
-    get loaded() {
-      return world.loaded ?? true;
-    },
-    listed,
-  };
+  const tomls = new DomainTomlsService({ query } as never, getNetworkProfile('xrpl'), new CacheService());
   const of = jest.fn((address: string): NamesAndLabels => world.names?.[address] ?? {});
-  const svc = new DisplayNamesService({ current } as never, tomls as never, { of } as never);
-  return { svc, current, listed, of };
+  const svc = new DisplayNamesService({ current } as never, tomls, { of } as never);
+  return { svc, current, query, of };
 }
 
 describe('DisplayNamesService.of', () => {
@@ -67,20 +75,49 @@ describe('DisplayNamesService.of', () => {
   });
 
   it('gives the listed desc as the verified name, and the domain with it', async () => {
-    const { svc, listed } = setup({
+    const { svc } = setup({
       domains: { [TREASURY]: NORTHPEAK },
-      directory: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury', [PAYROLL]: 'Northpeak Payroll' } },
+      tomls: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury', [PAYROLL]: 'Northpeak Payroll' } },
     });
     expect(await svc.of([TREASURY])).toEqual([
       { address: TREASURY, display_name: { text: 'Northpeak Treasury', kind: 'verified' }, domain: NORTHPEAK },
     ]);
-    expect(listed).toHaveBeenCalledWith(NORTHPEAK);
+  });
+
+  it('reads the tomls once for the batch, by key: the distinct domains of the addresses that have one, and those addresses', async () => {
+    const { svc, query } = setup({
+      domains: { [TREASURY]: NORTHPEAK, [PAYROLL]: NORTHPEAK, [LOWTIDE]: LOWTIDE_DOMAIN },
+      tomls: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury' } },
+    });
+
+    await svc.of([TREASURY, NONE, PAYROLL, LOWTIDE, TREASURY]);
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledWith(TOML_LISTINGS_SQL, {
+      domains: [NORTHPEAK, LOWTIDE_DOMAIN],
+      addresses: [TREASURY, PAYROLL, LOWTIDE],
+    });
+  });
+
+  it('does not let the toml of another domain vouch for an address: only its own domain verifies it', async () => {
+    const { svc } = setup({
+      domains: { [TREASURY]: LOWTIDE_DOMAIN, [PAYROLL]: NORTHPEAK },
+      // northpeak.example lists TREASURY, whose domain is lowtide.example
+      tomls: {
+        [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury', [PAYROLL]: 'Northpeak Payroll' },
+        [LOWTIDE_DOMAIN]: {},
+      },
+    });
+    expect(await svc.of([TREASURY, PAYROLL])).toEqual([
+      { address: TREASURY, display_name: { text: LOWTIDE_DOMAIN, kind: 'domain' }, domain: LOWTIDE_DOMAIN },
+      { address: PAYROLL, display_name: { text: 'Northpeak Payroll', kind: 'verified' }, domain: NORTHPEAK },
+    ]);
   });
 
   it('keeps the domain of an account whatever its display name: verified, account name, unverified or none', async () => {
     const { svc } = setup({
       domains: { [TREASURY]: NORTHPEAK, [PAYROLL]: NORTHPEAK, [LOWTIDE]: LOWTIDE_DOMAIN, [HARBOR]: LOWTIDE_DOMAIN },
-      directory: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury' } },
+      tomls: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury' } },
       names: { [PAYROLL]: { account_name: 'Payroll Desk' } },
     });
 
@@ -103,7 +140,7 @@ describe('DisplayNamesService.of', () => {
   it('serves the account name, the network name and the labels whatever the display name is, and the labels as they are', async () => {
     const { svc } = setup({
       domains: { [TREASURY]: NORTHPEAK },
-      directory: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury' } },
+      tomls: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury' } },
       names: {
         [TREASURY]: { account_name: 'Treasury', account_network_name: 'cold wallet', account_labels: ADVISORY },
         [HARBOR]: { account_network_name: 'hot wallet', account_labels: ADVISORY },
@@ -166,43 +203,75 @@ describe('DisplayNamesService.of', () => {
   });
 
   it('rejects when the account domains cannot be read: no answer without domains', async () => {
-    const { svc, current } = setup({ names: { [TREASURY]: { account_name: 'Treasury' } } });
+    const { svc, current, query } = setup({ names: { [TREASURY]: { account_name: 'Treasury' } } });
     current.mockRejectedValue(new Error('read failed'));
 
     await expect(svc.of([TREASURY])).rejects.toThrow('read failed');
+    expect(query).not.toHaveBeenCalled();
   });
 
-  it('serves names and labels but no verified or domain kind while the directory has not loaded', async () => {
-    const { svc, listed } = setup({
-      loaded: false,
+  describe('when the tomls cannot be read', () => {
+    let warn: jest.SpyInstance;
+    beforeEach(() => {
+      warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    });
+    afterEach(() => jest.restoreAllMocks());
+
+    const world: World = {
       domains: { [TREASURY]: NORTHPEAK, [LOWTIDE]: LOWTIDE_DOMAIN },
-      // the directory would list the account; before the first load nothing is vouched for
-      directory: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury' } },
+      // the toml lists the account, but it cannot be read: nothing is vouched for
+      tomls: { [NORTHPEAK]: { [TREASURY]: 'Northpeak Treasury' } },
       names: {
         [TREASURY]: { account_name: 'Treasury', account_labels: ADVISORY },
         [LOWTIDE]: { account_labels: ADVISORY },
       },
+    };
+
+    it('serves the names, the labels and the domains, but no verified or domain kind in that answer, and warns', async () => {
+      const { svc, query } = setup(world);
+      query.mockRejectedValueOnce(new Error('connection refused'));
+
+      const answers = await svc.of([TREASURY, LOWTIDE, NONE]);
+
+      expect(answers).toEqual([
+        {
+          address: TREASURY,
+          display_name: { text: 'Treasury', kind: 'account' },
+          domain: NORTHPEAK,
+          account_name: 'Treasury',
+          labels: ADVISORY,
+        },
+        { address: LOWTIDE, domain: LOWTIDE_DOMAIN, labels: ADVISORY },
+        { address: NONE },
+      ]);
+      expect(Object.keys(answers[1])).not.toContain('display_name');
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        'Could not read the tomls of the account domains, no domain is a name in this answer: connection refused',
+      );
     });
 
-    const answers = await svc.of([TREASURY, LOWTIDE]);
+    it('keeps nothing of the failure: the next call reads the tomls again and verifies', async () => {
+      const { svc, query } = setup(world);
+      query.mockRejectedValueOnce(new Error('connection refused'));
+      await svc.of([TREASURY, LOWTIDE]);
 
-    expect(answers).toEqual([
-      {
-        address: TREASURY,
-        display_name: { text: 'Treasury', kind: 'account' },
-        domain: NORTHPEAK,
-        account_name: 'Treasury',
-        labels: ADVISORY,
-      },
-      { address: LOWTIDE, domain: LOWTIDE_DOMAIN, labels: ADVISORY },
-    ]);
-    expect(Object.keys(answers[1])).not.toContain('display_name');
-    expect(listed).not.toHaveBeenCalled();
+      const answers = await svc.of([TREASURY, LOWTIDE]);
+
+      expect(query).toHaveBeenCalledTimes(2);
+      expect(answers.map((a) => a.display_name)).toEqual([
+        { text: 'Northpeak Treasury', kind: 'verified' },
+        { text: LOWTIDE_DOMAIN, kind: 'domain' },
+      ]);
+    });
   });
 
-  it('does not look an address up in the directory when it has no domain', async () => {
-    const { svc, listed } = setup({ names: { [TREASURY]: { account_name: 'Treasury' } } });
-    await svc.of([TREASURY, PAYROLL]);
-    expect(listed).not.toHaveBeenCalled();
+  it('reads no toml when no address has a domain', async () => {
+    const { svc, query } = setup({ names: { [TREASURY]: { account_name: 'Treasury' } } });
+    expect(await svc.of([TREASURY, PAYROLL])).toEqual([
+      { address: TREASURY, display_name: { text: 'Treasury', kind: 'account' }, account_name: 'Treasury' },
+      { address: PAYROLL },
+    ]);
+    expect(query).not.toHaveBeenCalled();
   });
 });

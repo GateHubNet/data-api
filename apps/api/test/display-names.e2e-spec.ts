@@ -8,12 +8,14 @@ import {
   DISPLAY_NAME_KEYS,
   LABEL_KEYS,
 } from '../src/names/account-names-object';
+import { TOML_LISTINGS_SQL } from '../src/names/domain-tomls.service';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { accountAt } from './support/amm';
 import {
   failToml,
   hexOf,
   holds,
+  insertTomlsBulk,
   nameAddress,
   nameOnNetwork,
   putToml,
@@ -26,14 +28,15 @@ import { BULK_BASES, BULK_PER_PART, BULK_ROWS, insertBulk, readsOf } from './sup
 /**
  * `GET /v2/account_names` (D4, spec 5.2): the display names of up to 100 addresses in one call. The suite is also the real
  * ClickHouse test of what the api reads for it: the account domain by key from `account_domains` (the newest row of an account
- * by `version`, never `FINAL`) and the toml directory from `domain_tomls` (the newest row of each domain, the entries that
- * count on the network).
+ * by `version`, never `FINAL`) and what the toml of each account's domain says of it, by key from `domain_tomls` (the newest
+ * row of each domain of the batch, the entries of the addresses asked that count on the network).
  *
  * The rows are written with plain inserts, the way their writers do: `account_domains` as the ingest does (one insert, so one
  * part, a row), `domain_tomls` through `recordToml` as the tomls worker does, and the operator's names and labels with SQL. The
- * api reloads the names and the toml directory every `GH_NAMES_AND_LABELS_RELOAD_MS` (a fraction of a second here) and keeps
- * the account domain of each address 60 s, so a step that changes `account_domains` clears the caches first (the test route of
- * `cache-controllers.ts`) and a step that changes the others waits for the next reload (`eventually`).
+ * api reloads the names every `GH_NAMES_AND_LABELS_RELOAD_MS` (a fraction of a second here) and keeps the account domain of
+ * each address and what its domain's toml says of it 60 s, so a step that changes `account_domains` or `domain_tomls` clears
+ * the caches first (the test route of `cache-controllers.ts`) and a step that changes the names waits for the next reload
+ * (`eventually`).
  *
  * Every domain is a `*.example` name, every name fictional.
  */
@@ -63,8 +66,8 @@ async function entriesOf(api: ApiClient, addresses: readonly string[]): Promise<
 }
 
 /**
- * The entries for `addresses` once `until` holds for them, asked again and again for up to `timeoutMs`: a row of the names or of
- * the tomls shows at the next reload. Throws with the last answer when it never does.
+ * The entries for `addresses` once `until` holds for them, asked again and again for up to `timeoutMs`: a row of the names shows
+ * at the next reload. Throws with the last answer when it never does.
  */
 async function eventually(
   api: ApiClient,
@@ -82,7 +85,7 @@ async function eventually(
   return entries;
 }
 
-/** Empties the caches of the app (the shared one and the one of the names): the next call reads `account_domains` again. */
+/** Empties the caches of the app (the shared one and the one of the names): the next call reads `account_domains` and `domain_tomls` again. */
 const clearCaches = (api: ApiClient): Promise<unknown> => api.ok('/v2/test-cache/clear', 'result');
 
 /** The kind of the display name of each entry (`undefined` for none). */
@@ -176,7 +179,7 @@ describe('GET /v2/account_names', () => {
     });
 
     await clearCaches(api);
-    // the first reload after the inserts has loaded the directory and the names
+    // the first reload after the inserts has loaded the names
     await eventually(
       api,
       [TREASURY, PAYROLL, HARBOR, WATCHED],
@@ -399,7 +402,7 @@ describe('the account domain of an address, read from account_domains', () => {
     expect(await domainsOf(REBORN)).toEqual(['after.example']);
   });
 
-  it('gives the domain in lower case, which is how the toml directory holds it', async () => {
+  it('gives the domain in lower case, which is how the toml store holds it', async () => {
     const MIXED = accountAt(0x231);
     await setAccountDomain(h, MIXED, 100, hexOf('Harbor-Line.Example'));
     await putToml(h, XRPL, 'harbor-line.example', tomlOf({ address: MIXED, desc: 'Harbor Line' }));
@@ -424,10 +427,10 @@ describe('the account domain of an address, read from account_domains', () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// domain_tomls: the directory
+// domain_tomls: what the toml of an account's domain says of it
 // ---------------------------------------------------------------------------------------------------------------------
 
-describe('the toml directory, read from domain_tomls', () => {
+describe('what the toml of the account domain says, read from domain_tomls', () => {
   let h: Harness;
   let api: ApiClient;
 
@@ -486,30 +489,38 @@ describe('the toml directory, read from domain_tomls', () => {
 
     // the older row still lists the account (merges are stopped); the newer one, a definite failure, lists nobody
     await failToml(h, 'tidal.example');
-    expect(await eventually(api, [ACCOUNT], (entries) => kinds(entries)[0] === 'domain')).toEqual([unverified]);
+    // within the 60 s it keeps what it read
+    expect(await entriesOf(api, [ACCOUNT])).toEqual([verified]);
+    await clearCaches(api);
+    expect(await entriesOf(api, [ACCOUNT])).toEqual([unverified]);
 
     await putToml(h, XRPL, 'tidal.example', tomlOf({ address: ACCOUNT, desc: 'Tidal Treasury Ltd' }));
-    expect(await eventually(api, [ACCOUNT], (entries) => kinds(entries)[0] === 'verified')).toEqual([
+    await clearCaches(api);
+    expect(await entriesOf(api, [ACCOUNT])).toEqual([
       { ...verified, display_name: { text: 'Tidal Treasury Ltd', kind: 'verified' } },
     ]);
   });
 
   it('lists an account under the domain of its Domain field only: a toml of another domain does not vouch for it', async () => {
     const ACCOUNT = accountAt(0x331);
+    const LOUD = accountAt(0x332);
     await holds(h, ACCOUNT, 'quiet.example');
-    await putToml(h, XRPL, 'loud.example', tomlOf({ address: ACCOUNT, desc: 'Loud Treasury' }));
-    // the directory has loaded loud.example by the time the toml written after it shows
-    const MARKER = accountAt(0x332);
-    await holds(h, MARKER, 'marker.example');
-    await putToml(h, XRPL, 'marker.example', tomlOf({ address: MARKER, desc: 'Marker' }));
+    await holds(h, LOUD, 'loud.example');
+    // loud.example lists both; quiet.example lists nobody
+    await putToml(
+      h,
+      XRPL,
+      'loud.example',
+      tomlOf({ address: ACCOUNT, desc: 'Loud Treasury' }, { address: LOUD, desc: 'Loud Desk' }),
+    );
+    await putToml(h, XRPL, 'quiet.example', tomlOf());
 
     await clearCaches(api);
-    const entries = await eventually(api, [ACCOUNT, MARKER], (list) => kinds(list)[1] === 'verified');
-    expect(entries[0]).toEqual({
-      address: ACCOUNT,
-      display_name: { text: 'quiet.example', kind: 'domain' },
-      domain: 'quiet.example',
-    });
+    // asked in one batch, so the one read holds the row of loud.example that lists ACCOUNT
+    expect(await entriesOf(api, [ACCOUNT, LOUD])).toEqual([
+      { address: ACCOUNT, display_name: { text: 'quiet.example', kind: 'domain' }, domain: 'quiet.example' },
+      { address: LOUD, display_name: { text: 'Loud Desk', kind: 'verified' }, domain: 'loud.example' },
+    ]);
   });
 });
 
@@ -633,52 +644,49 @@ describe('when the tables the names are read from cannot be read', () => {
   const rename = (from: Table | string, to: string): Promise<void> =>
     h.ch.command(`RENAME TABLE ${h.database}.${from} TO ${h.database}.${to}`);
 
-  /** The reads of the toml directory that failed so far: the statements of the app on `domain_tomls` that raised. */
-  async function failedDirectoryReads(): Promise<number> {
-    await h.ch.command('SYSTEM FLUSH LOGS');
-    const [{ n }] = await h.ch.query<{ n: string }>(
-      `SELECT count() AS n FROM system.query_log
-        WHERE current_database = {db:String} AND type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing')
-          AND query LIKE {pattern:String}`,
-      { db: h.database, pattern: `%FROM ${Table.DomainTomls}%` },
-    );
-    return Number(n);
-  }
-
-  it('keeps the last directory when a reload fails', async () => {
-    await holds(h, TREASURY, 'northpeak.example');
-    await putToml(h, XRPL, 'northpeak.example', tomlOf({ address: TREASURY, desc: 'Northpeak Treasury' }));
-    const verified = [
-      {
-        address: TREASURY,
-        display_name: { text: 'Northpeak Treasury', kind: 'verified' },
-        domain: 'northpeak.example',
-      },
-    ];
+  it('answers 200 with the names, the labels and the domains but no verified or domain kind when domain_tomls cannot be read, and keeps nothing of the failure', async () => {
+    const LISTED = accountAt(0xf101);
+    const UNLISTED = accountAt(0xf102);
+    const NAMED = accountAt(0xf103);
+    await holds(h, LISTED, 'northpeak.example');
+    await holds(h, UNLISTED, 'northpeak.example');
+    await holds(h, NAMED, 'northpeak.example');
+    await putToml(h, XRPL, 'northpeak.example', tomlOf({ address: LISTED, desc: 'Northpeak Treasury' }));
+    await nameAddress(h, NAMED, 'Northpeak Desk');
+    await labelAddress(h, UNLISTED, 'advisory', 'Under review');
+    // the names and labels are in memory once a reload has loaded them
     await clearCaches(api);
-    expect(await eventually(api, [TREASURY], (entries) => kinds(entries)[0] === 'verified')).toEqual(verified);
+    const before = await eventually(
+      api,
+      [LISTED, UNLISTED, NAMED],
+      (entries) => entries[1].labels !== undefined && entries[2].account_name === 'Northpeak Desk',
+    );
+    expect(kinds(before)).toEqual(['verified', 'domain', 'account']);
+    // what was read for an address asked is kept 60 s and would be answered from there
+    await clearCaches(api);
 
-    const failedBefore = await failedDirectoryReads();
     await rename(Table.DomainTomls, 'domain_tomls_away');
     try {
-      // two reloads have failed: the test could not tell a kept directory from one that never reloaded otherwise
-      const deadline = Date.now() + 15_000;
-      while ((await failedDirectoryReads()) < failedBefore + 2) {
-        if (Date.now() > deadline) throw new Error('the directory was not reloaded while domain_tomls was away');
-        await sleep(50);
-      }
-      expect(await entriesOf(api, [TREASURY])).toEqual(verified);
+      const res = await api.get(pathOf([LISTED, UNLISTED, NAMED]));
+
+      expect(res.status).toBe(200);
+      expect(res.headers['cache-control']).toBe('private, max-age=60');
+      expect(res.body.account_names).toEqual([
+        { address: LISTED, domain: 'northpeak.example' },
+        { address: UNLISTED, domain: 'northpeak.example', labels: { advisory: { description: 'Under review' } } },
+        {
+          address: NAMED,
+          display_name: { text: 'Northpeak Desk', kind: 'account' },
+          domain: 'northpeak.example',
+          account_name: 'Northpeak Desk',
+        },
+      ]);
     } finally {
       await rename('domain_tomls_away', Table.DomainTomls);
     }
 
-    // the next reload reads the table again: a toml written now shows, and the first one is still there
-    await holds(h, PAYROLL, 'tidal.example');
-    await putToml(h, XRPL, 'tidal.example', tomlOf({ address: PAYROLL, desc: 'Tidal Payroll' }));
-    await clearCaches(api);
-    const entries = await eventually(api, [TREASURY, PAYROLL], (list) => kinds(list)[1] === 'verified');
-    expect(kinds(entries)).toEqual(['verified', 'verified']);
-    expect(entries[1].display_name).toEqual({ text: 'Tidal Payroll', kind: 'verified' });
+    // nothing was kept of the failure: the next call reads the toml and vouches
+    expect(kinds(await entriesOf(api, [LISTED, UNLISTED, NAMED]))).toEqual(['verified', 'domain', 'account']);
   });
 
   it('answers 500 when account_domains cannot be read', async () => {
@@ -786,6 +794,95 @@ describe('a batch of 100 accounts reads account_domains by key', () => {
     expect(plan).toContain('PrimaryKey');
     expect(plan).toMatch(/Keys:\s*\n?\s*account/);
     expect(plan).toMatch(/Condition: .*account in/);
+    // the key narrows the read to a part of the granules of every part
+    const granules = /Granules: (\d+)\/(\d+)/.exec(plan.slice(plan.indexOf('PrimaryKey')));
+    expect(granules).not.toBeNull();
+    expect(Number(granules?.[1])).toBeLessThan(Number(granules?.[2]));
+  });
+});
+
+describe('a batch reads domain_tomls by key, for the domains of its accounts only', () => {
+  /** The rows ClickHouse reads for a granule of the primary index of domain_tomls (`index_granularity` is the default). */
+  const GRANULE = 8192;
+  /**
+   * Three whole granules a part: a read of a part, or of two granules of it, is more than the bound allows. Whole, because
+   * ClickHouse folds a tail of less than half a granule into the granule before it (a key in it would read more than one).
+   */
+  const PER_PART = 3 * GRANULE;
+  const PARTS = BULK_BASES.length;
+  /** The two domains of the batch, in every part: at most one granule of each per part. */
+  const DOMAINS = ['bulk-east.example', 'bulk-west.example'];
+  const BOUND = DOMAINS.length * GRANULE * PARTS;
+  const ROWS = PARTS * PER_PART;
+  /** The instant of the check stored in each part: the newest is not the part inserted last. */
+  const CHECKED_S = [1_792_800_020, 1_792_800_040, 1_792_800_030, 1_792_800_010];
+  const NEWEST_S = Math.max(...CHECKED_S);
+
+  /** Three accounts of each domain; the toml of each domain lists all six, so only the account's own domain may vouch. */
+  const ACCOUNTS = Array.from({ length: 6 }, (_, i) => accountAt(0x9100 + i));
+  const domainOf = (i: number): string => DOMAINS[i % 2];
+
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ env: FAST_RELOAD, controllers: CACHE_ROUTE });
+    api = await h.api();
+    for (const [i, account] of ACCOUNTS.entries()) await holds(h, account, domainOf(i));
+    // four parts of 24,576 domains each, merges stopped: 98,304 rows. Every part holds a check of both domains of the batch
+    await insertTomlsBulk(h, { domains: DOMAINS, checkedS: CHECKED_S, perPart: PER_PART, listed: ACCOUNTS });
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('reads no toml at the boot, nor in two reload intervals after it: nothing of the store is read but on request', async () => {
+    await sleep(3 * Number(FAST_RELOAD.GH_NAMES_AND_LABELS_RELOAD_MS));
+    await h.ch.command('SYSTEM FLUSH LOGS');
+    const [{ n }] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM system.query_log
+        WHERE current_database = {db:String} AND query_kind = 'Select' AND has(tables, {table:String})`,
+      { db: h.database, table: `${h.database}.${Table.DomainTomls}` },
+    );
+    expect(Number(n)).toBe(0);
+  });
+
+  it('holds more rows than the bound, in four parts of more than two granules each, so a scan would break it', async () => {
+    const parts = await h.ch.query<{ rows: string }>(
+      `SELECT count() AS rows FROM ${Table.DomainTomls} GROUP BY _part ORDER BY _part`,
+    );
+    expect(parts.map((part) => Number(part.rows))).toEqual(Array(PARTS).fill(PER_PART));
+    expect(ROWS).toBeGreaterThan(BOUND);
+  });
+
+  it('reads at most one granule per domain per part, in one statement, and answers from the newest check of each domain', async () => {
+    await clearCaches(api);
+    let entries: Entry[] = [];
+    const reads = await readsOf(h, Table.DomainTomls, async () => {
+      entries = await entriesOf(api, ACCOUNTS);
+    });
+
+    expect(reads).toHaveLength(1);
+    expect(reads[0].query).toContain(`FROM ${Table.DomainTomls}`);
+    expect(reads[0].query).toContain('domain IN');
+    expect(reads[0].read_rows).toBeGreaterThan(0);
+    expect(reads[0].read_rows).toBeLessThanOrEqual(BOUND);
+
+    expect(entries).toEqual(
+      ACCOUNTS.map((address, i) => ({
+        address,
+        display_name: { text: `Checked ${NEWEST_S}`, kind: 'verified' },
+        domain: domainOf(i),
+      })),
+    );
+  });
+
+  it('shows the primary key condition on domain in the plan of the read', async () => {
+    const plan = await explain(h, 'indexes = 1', TOML_LISTINGS_SQL, { domains: DOMAINS, addresses: ACCOUNTS });
+
+    expect(plan).toContain('PrimaryKey');
+    expect(plan).toMatch(/Keys:\s*\n?\s*domain/);
+    expect(plan).toMatch(/Condition: .*domain in/);
     // the key narrows the read to a part of the granules of every part
     const granules = /Granules: (\d+)\/(\d+)/.exec(plan.slice(plan.indexOf('PrimaryKey')));
     expect(granules).not.toBeNull();

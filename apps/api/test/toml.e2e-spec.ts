@@ -11,9 +11,9 @@ import { encodeNodePublic } from 'ripple-address-codec';
 import { TOML_ACCOUNT_KEYS, TOML_CURRENCY_KEYS, TOML_KEYS, TOML_VALIDATOR_KEYS } from '../src/names/toml-object';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { accountAt } from './support/amm';
-import { putToml } from './support/names-seed';
+import { insertTomlsBulk, putToml } from './support/names-seed';
 import { explain } from './support/plans';
-import { BULK_BASES, insertBulk, readsOf } from './support/read-rows';
+import { BULK_BASES, readsOf } from './support/read-rows';
 
 /**
  * `GET /v2/toml/{domain}` (D4, spec 6): what the store says of one domain. The suite is also the real ClickHouse test of what
@@ -594,35 +594,11 @@ describe('a request for a domain reads domain_tomls by key', () => {
   let api: ApiClient;
 
   beforeAll(async () => {
-    // the directory is read again every hour only: a reload of the whole table must not fall into the reads counted below
-    h = await startHarness({
-      env: { ...NO_RATE_LIMIT, GH_NAMES_AND_LABELS_RELOAD_MS: '3600000' },
-      controllers: CACHE_ROUTE,
-    });
+    h = await startHarness({ env: NO_RATE_LIMIT, controllers: CACHE_ROUTE });
     api = await h.api();
     // four parts of 24,576 domains each, merges stopped: 98,304 rows. Every part has a check of the domain asked, the others
-    // are domains made of a hash, spread over the key space like the one asked. The template is a row of constants: the table
-    // starts empty.
-    await insertBulk(
-      h,
-      Table.DomainTomls,
-      `SELECT '' AS domain, '' AS toml_url, 'ok' AS status, '' AS reason, toUInt16(0) AS status_code,
-              toDateTime64(0, 3, 'UTC') AS checked_at, CAST(NULL AS Nullable(DateTime64(3, 'UTC'))) AS fetched_at,
-              toDateTime(0, 'UTC') AS next_check_at, toUInt16(0) AS failures,
-              CAST(NULL AS Nullable(DateTime('UTC'))) AS modified, CAST(NULL AS Nullable(DateTime('UTC'))) AS expires,
-              CAST([], 'Array(Tuple(address String, network String, desc String))') AS accounts,
-              CAST([], 'Array(Tuple(code String, issuer String, network String, fields String))') AS currencies,
-              CAST([], 'Array(Tuple(public_key String, network String, fields String))') AS validators,
-              CAST([], 'Array(String)') AS principals`,
-      {},
-      (base) =>
-        `if(n.number = 0, '${DOMAIN}', concat(lower(base58Encode(reinterpretAsString(cityHash64(n.number, ${base})))), '.example')) AS domain,
-         '${tomlUrlOf(DOMAIN, XRPL)}' AS toml_url,
-         toDateTime64(${CHECKED_S[BULK_BASES.indexOf(base)]}, 3, 'UTC') AS checked_at,
-         toDateTime64(${CHECKED_S[BULK_BASES.indexOf(base)]}, 3, 'UTC') AS fetched_at,
-         toDateTime(${CHECKED_S[BULK_BASES.indexOf(base)]} + 86400, 'UTC') AS next_check_at`,
-      PER_PART,
-    );
+    // are domains made of a hash, spread over the key space like the one asked.
+    await insertTomlsBulk(h, { domains: [DOMAIN], checkedS: CHECKED_S, perPart: PER_PART });
   }, 600_000);
   afterAll(async () => {
     await h?.close();

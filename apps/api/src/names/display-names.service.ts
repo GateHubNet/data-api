@@ -1,7 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { AccountDomainsService } from './account-domains.service';
 import { AccountLabels } from './account-labels';
-import { DisplayName, displayNameOf } from './display-name';
+import { DisplayName, displayNameOf, TomlListing } from './display-name';
 import { DomainTomlsService } from './domain-tomls.service';
 import { NamesAndLabelsService } from './names-and-labels.service';
 
@@ -22,11 +22,14 @@ export interface AccountNameData {
 }
 
 /**
- * The display names of addresses (spec 5.3): the account domains (`AccountDomainsService`), the toml directory
- * (`DomainTomlsService`) and the operator's names and labels (`NamesAndLabelsService`) put together with `displayNameOf`.
+ * The display names of addresses (spec 5.3): the account domains (`AccountDomainsService`), what the toml of each domain says
+ * of its account (`DomainTomlsService.listings`, read by key) and the operator's names and labels (`NamesAndLabelsService`)
+ * put together with `displayNameOf`.
  */
 @Injectable()
 export class DisplayNamesService {
+  private readonly logger = new Logger(DisplayNamesService.name);
+
   constructor(
     private readonly domains: AccountDomainsService,
     private readonly tomls: DomainTomlsService,
@@ -35,22 +38,23 @@ export class DisplayNamesService {
 
   /**
    * One entry per address asked, in the order asked (a repeated address is answered at each place), from one read of the account
-   * domains of the distinct addresses. Rejects when that read fails: there is no answer without the domains.
+   * domains of the distinct addresses and one read of the tomls of their distinct domains (of what is not kept from an earlier
+   * call). Rejects when the account domains cannot be read: there is no answer without the domains.
    *
-   * Until the toml directory has loaded the names and labels are served all the same, but no address is verified and no domain is
-   * a name (spec decision 14).
+   * When the tomls cannot be read the names and labels are served all the same, but in that answer no address is verified and
+   * no domain is a name (spec decision 14: unknown is not "not verified"); nothing of the failure is kept, so the next call reads
+   * them again.
    */
   async of(addresses: readonly string[]): Promise<AccountNameData[]> {
     const domains = await this.domains.current([...new Set(addresses)]);
-    const directoryLoaded = this.tomls.loaded;
+    const listings = await this.listingsOf(domains);
     return addresses.map((address) => {
       const domain = domains.get(address);
       const { account_name, account_network_name, account_labels } = this.names.of(address);
       const displayName = displayNameOf({
         address,
         domain,
-        listed: domain !== undefined && directoryLoaded ? this.tomls.listed(domain) : undefined,
-        directoryLoaded,
+        listing: domain === undefined ? undefined : listings?.get(address),
         accountName: account_name,
         accountNetworkName: account_network_name,
       });
@@ -63,5 +67,24 @@ export class DisplayNamesService {
       if (account_labels !== undefined) data.labels = account_labels;
       return data;
     });
+  }
+
+  /**
+   * What the tomls say of the addresses that have a domain (none is read when no address has one), or `undefined` when they
+   * could not be read, with a `warn`.
+   */
+  private async listingsOf(
+    domains: ReadonlyMap<string, string | undefined>,
+  ): Promise<Map<string, TomlListing | null> | undefined> {
+    const accounts = new Map<string, string>();
+    for (const [address, domain] of domains) if (domain !== undefined) accounts.set(address, domain);
+    try {
+      return await this.tomls.listings(accounts);
+    } catch (err) {
+      this.logger.warn(
+        `Could not read the tomls of the account domains, no domain is a name in this answer: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
   }
 }

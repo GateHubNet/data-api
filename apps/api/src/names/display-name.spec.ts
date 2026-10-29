@@ -4,12 +4,11 @@ const TREASURY = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
 const PAYROLL = 'rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn';
 const DOMAIN = 'northpeak.example';
 
-/** An account whose domain lists it (with `desc`) in a toml the directory has loaded; `over` changes what a test needs. */
+/** An account whose domain's toml lists it (with `desc`); `over` changes what a test needs. */
 const listedWith = (desc: string, over: Partial<DisplayNameInput> = {}): DisplayNameInput => ({
   address: TREASURY,
   domain: DOMAIN,
-  listed: new Map([[TREASURY, desc]]),
-  directoryLoaded: true,
+  listing: { desc },
   ...over,
 });
 
@@ -45,12 +44,12 @@ describe('displayNameOf', () => {
       expect(displayNameOf(input)).toEqual({ text: 'Northpeak Treasury', kind: 'verified' });
     });
 
-    it('needs the domain: a list without one vouches for nothing', () => {
+    it('needs the domain: a listing without one vouches for nothing', () => {
       expect(displayNameOf(listedWith('Northpeak Treasury', { domain: undefined }))).toBeUndefined();
     });
 
-    it('needs the address in the list of the domain: another address of the toml is not verified', () => {
-      expect(displayNameOf(listedWith('Northpeak Treasury', { address: PAYROLL }))).toEqual({
+    it('needs a listing of the address: a toml that does not list it does not verify it', () => {
+      expect(displayNameOf(listedWith('Northpeak Treasury', { address: PAYROLL, listing: null }))).toEqual({
         text: DOMAIN,
         kind: 'domain',
       });
@@ -59,14 +58,13 @@ describe('displayNameOf', () => {
 
   describe('account', () => {
     it('is the account name when the domain does not list the address', () => {
-      const input: DisplayNameInput = { address: TREASURY, directoryLoaded: true, accountName: 'Harborline Exchange' };
+      const input: DisplayNameInput = { address: TREASURY, accountName: 'Harborline Exchange' };
       expect(displayNameOf(input)).toEqual({ text: 'Harborline Exchange', kind: 'account' });
     });
 
     it('is the account name before the account network name', () => {
       const input: DisplayNameInput = {
         address: TREASURY,
-        directoryLoaded: true,
         accountName: 'Harborline Exchange',
         accountNetworkName: 'hot wallet',
       };
@@ -74,47 +72,39 @@ describe('displayNameOf', () => {
     });
 
     it('is the account network name when there is no account name', () => {
-      const input: DisplayNameInput = { address: TREASURY, directoryLoaded: true, accountNetworkName: 'hot wallet' };
+      const input: DisplayNameInput = { address: TREASURY, accountNetworkName: 'hot wallet' };
       expect(displayNameOf(input)).toEqual({ text: 'hot wallet', kind: 'account' });
     });
 
-    it('beats an unverified domain', () => {
-      const input: DisplayNameInput = {
-        address: TREASURY,
-        domain: DOMAIN,
-        listed: new Map([[PAYROLL, 'Northpeak Payroll']]),
-        directoryLoaded: true,
-        accountName: 'Harborline Exchange',
-      };
-      expect(displayNameOf(input)).toEqual({ text: 'Harborline Exchange', kind: 'account' });
+    it('beats an unverified domain, and a domain whose toml could not be read', () => {
+      for (const listing of [null, undefined]) {
+        const input: DisplayNameInput = {
+          address: TREASURY,
+          domain: DOMAIN,
+          listing,
+          accountName: 'Harborline Exchange',
+        };
+        expect([listing, displayNameOf(input)]).toEqual([listing, { text: 'Harborline Exchange', kind: 'account' }]);
+      }
     });
   });
 
   describe('domain', () => {
-    it('is the unverified domain when the directory has loaded and nothing else names the address', () => {
-      expect(displayNameOf({ address: TREASURY, domain: DOMAIN, directoryLoaded: true })).toEqual({
+    it('is the unverified domain when its toml does not list the address and nothing else names it', () => {
+      expect(displayNameOf({ address: TREASURY, domain: DOMAIN, listing: null })).toEqual({
         text: DOMAIN,
         kind: 'domain',
       });
     });
 
-    it('is the unverified domain when the toml of the domain lists other accounts only', () => {
-      const input: DisplayNameInput = {
-        address: TREASURY,
-        domain: DOMAIN,
-        listed: new Map([[PAYROLL, 'Northpeak Payroll']]),
-        directoryLoaded: true,
-      };
-      expect(displayNameOf(input)).toEqual({ text: DOMAIN, kind: 'domain' });
-    });
-
-    it('gives no domain kind before the directory has loaded', () => {
-      expect(displayNameOf({ address: TREASURY, domain: DOMAIN, directoryLoaded: false })).toBeUndefined();
+    it('gives no domain kind when the toml of the domain could not be read: unknown is not "not verified"', () => {
+      expect(displayNameOf({ address: TREASURY, domain: DOMAIN })).toBeUndefined();
+      expect(displayNameOf({ address: TREASURY, domain: DOMAIN, listing: undefined })).toBeUndefined();
     });
   });
 
   it('gives no name to an address with no domain and no names', () => {
-    expect(displayNameOf({ address: TREASURY, directoryLoaded: true })).toBeUndefined();
-    expect(displayNameOf({ address: TREASURY, directoryLoaded: false })).toBeUndefined();
+    expect(displayNameOf({ address: TREASURY, listing: null })).toBeUndefined();
+    expect(displayNameOf({ address: TREASURY })).toBeUndefined();
   });
 });

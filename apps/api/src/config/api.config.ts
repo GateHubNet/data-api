@@ -157,9 +157,8 @@ export class ApiConfig {
 
   /**
    * `GH_NAMES_AND_LABELS_RELOAD_MS`: how often the account names (and the other sets of names and labels the operator
-   * writes, ADR-0014) are loaded again, in milliseconds. A row the operator inserts shows within this time. The toml directory
-   * (what every stored toml says of its accounts, ADR-0017) is loaded again at the same interval, so a toml the `tomls` worker
-   * has read shows in the verified names within it too.
+   * writes, ADR-0014) are loaded again, in milliseconds. A row the operator inserts shows within this time. The tomls are not
+   * loaded (ADR-0017): a call of the display names reads the tomls of its accounts' domains by key, and keeps each answer 60 s.
    */
   @ConfigValue()
   @IntValue({ min: 1 })

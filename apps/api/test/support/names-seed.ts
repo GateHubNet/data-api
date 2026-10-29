@@ -8,6 +8,7 @@ import {
   tomlUrlOf,
 } from '@gatehub/data-api-shared';
 import type { Harness } from '../harness';
+import { BULK_BASES, insertBulk } from './read-rows';
 
 /**
  * What the e2e suites of the display names write into the tables the api reads them from (`display-names.e2e-spec.ts`,
@@ -119,5 +120,48 @@ export async function nameOnNetwork(h: Harness, address: string, name: string): 
   await h.ch.command(
     `INSERT INTO ${h.database}.account_network_names (address, name, added_by) VALUES ({address:String}, {name:String}, 'ops@gatehub.net')`,
     { address, name },
+  );
+}
+
+/** A row of constants of `domain_tomls` (an `ok` row with no content), the template of a bulk: the table starts empty. */
+const TOMLS_BULK_TEMPLATE = `SELECT '' AS domain, '' AS toml_url, 'ok' AS status, '' AS reason, toUInt16(0) AS status_code,
+        toDateTime64(0, 3, 'UTC') AS checked_at, CAST(NULL AS Nullable(DateTime64(3, 'UTC'))) AS fetched_at,
+        toDateTime(0, 'UTC') AS next_check_at, toUInt16(0) AS failures,
+        CAST(NULL AS Nullable(DateTime('UTC'))) AS modified, CAST(NULL AS Nullable(DateTime('UTC'))) AS expires,
+        CAST([], 'Array(Tuple(address String, network String, desc String))') AS accounts,
+        CAST([], 'Array(Tuple(code String, issuer String, network String, fields String))') AS currencies,
+        CAST([], 'Array(Tuple(public_key String, network String, fields String))') AS validators,
+        CAST([], 'Array(String)') AS principals`;
+
+/**
+ * The bulk of `domain_tomls` of a `read_rows` test (Ruling C8): a part of `perPart` rows for each of `BULK_BASES`, inserted
+ * apart, the merges stopped. Every part holds one `ok` check of each of `domains`, checked (and fetched) at the second of
+ * `checkedS` of its part, so the newest check of a domain is not the one of the part inserted last; it lists each of `listed`
+ * with the desc `Checked <second>`. The other rows are domains made of a hash, spread over the key space like the ones asked.
+ */
+export async function insertTomlsBulk(
+  h: Harness,
+  o: { domains: readonly string[]; checkedS: readonly number[]; perPart: number; listed?: readonly string[] },
+): Promise<void> {
+  const own = o.domains.length;
+  await insertBulk(
+    h,
+    Table.DomainTomls,
+    TOMLS_BULK_TEMPLATE,
+    { domains: [...o.domains], listed: [...(o.listed ?? [])] },
+    (base) => {
+      const checked = o.checkedS[BULK_BASES.indexOf(base)];
+      const domain = `if(n.number < ${own}, arrayElement({domains:Array(String)}, toUInt32(n.number) + 1),
+            concat(lower(base58Encode(reinterpretAsString(cityHash64(n.number, ${base})))), '.example'))`;
+      const accounts = `'Array(Tuple(address String, network String, desc String))'`;
+      return `${domain} AS domain,
+         concat('https://', ${domain}, '${XRPL.tomlPath}') AS toml_url,
+         toDateTime64(${checked}, 3, 'UTC') AS checked_at,
+         toDateTime64(${checked}, 3, 'UTC') AS fetched_at,
+         toDateTime(${checked} + 86400, 'UTC') AS next_check_at,
+         if(n.number < ${own}, CAST(arrayMap(a -> tuple(a, '', 'Checked ${checked}'), {listed:Array(String)}), ${accounts}),
+            CAST([], ${accounts})) AS accounts`;
+    },
+    o.perPart,
   );
 }

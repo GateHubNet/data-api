@@ -1,20 +1,13 @@
-import { getNetworkProfile, STORED_TOMLS_SQL, Table } from '@gatehub/data-api-shared';
-import { Logger } from '@nestjs/common';
+import { getNetworkProfile, STORED_TOMLS_SQL, Table, TomlAccount } from '@gatehub/data-api-shared';
 import { CacheService } from '../common/cache.service';
-import { ApiConfig } from '../config/api.config';
-import { DOMAIN_TOML_TTL_MS, DomainTomlsService, TOML_DIRECTORY_SQL } from './domain-tomls.service';
+import { DOMAIN_TOML_TTL_MS, DomainTomlsService, TOML_LISTING_TTL_MS, TOML_LISTINGS_SQL } from './domain-tomls.service';
 
 const NORTHPEAK = 'northpeak.example';
 const HARBOR = 'harbor.example';
 const TREASURY = 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh';
 const PAYROLL = 'rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn';
 const TESTNET_ONLY = 'rPEPPER7kfTD9w2To4CQk6UCfuHM9c6GDY';
-const RELOAD_MS = 60_000;
-
-interface DirectoryRow {
-  domain: string;
-  accounts: { address: string; network: string; desc: string }[];
-}
+const UNLISTED = 'rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B';
 
 /** A row of `STORED_TOMLS_SQL` as ClickHouse gives it: the milliseconds of a `DateTime64` quoted, a NULL as `null`. */
 const storedRow = (domain: string, over: Record<string, unknown> = {}) => ({
@@ -36,179 +29,206 @@ const storedRow = (domain: string, over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-/** A ClickHouse with the directory statement and the stored-toml statement, each answered from what a test sets. */
+/**
+ * A ClickHouse with the listings statement and the stored-toml statement, each answered from what a test sets. The listings
+ * are answered as the statement does: the newest row of each domain asked that has one, with the entries of the addresses
+ * asked only, in the order of the row.
+ */
 function fakeClickHouse() {
   const state = {
-    directory: [] as DirectoryRow[],
+    /** The `accounts` of the newest row of each domain. */
+    tomls: new Map<string, TomlAccount[]>(),
     stored: new Map<string, ReturnType<typeof storedRow>>(),
-    failDirectory: undefined as Error | undefined,
   };
-  const query = jest.fn(async (sql: string, params?: { domains?: string[] }) => {
-    if (sql === TOML_DIRECTORY_SQL) {
-      if (state.failDirectory) throw state.failDirectory;
-      return state.directory;
+  const query = jest.fn(async (sql: string, params?: { domains?: string[]; addresses?: string[] }) => {
+    if (sql === TOML_LISTINGS_SQL) {
+      return (params?.domains ?? []).flatMap((domain) => {
+        const accounts = state.tomls.get(domain);
+        return accounts === undefined
+          ? []
+          : [{ domain, listed: accounts.filter((a) => (params?.addresses ?? []).includes(a.address)) }];
+      });
     }
     if (sql === STORED_TOMLS_SQL) return (params?.domains ?? []).flatMap((d) => state.stored.get(d) ?? []);
     throw new Error(`unexpected statement: ${sql}`);
   });
   const reads = (sql: string): number => query.mock.calls.filter(([s]) => s === sql).length;
-  return { query, state, directoryReads: () => reads(TOML_DIRECTORY_SQL), storedReads: () => reads(STORED_TOMLS_SQL) };
+  return { query, state, listingReads: () => reads(TOML_LISTINGS_SQL), storedReads: () => reads(STORED_TOMLS_SQL) };
 }
 
 function setup(profile = getNetworkProfile('xrpl')) {
   const ch = fakeClickHouse();
   const cache = new CacheService();
-  const config = { namesAndLabelsReloadMs: RELOAD_MS } as ApiConfig;
-  const svc = new DomainTomlsService(ch as never, config, profile, cache);
+  const svc = new DomainTomlsService(ch as never, profile, cache);
   return { ch, cache, svc };
 }
 
-const NORTHPEAK_DIRECTORY: DirectoryRow[] = [
-  {
-    domain: NORTHPEAK,
-    accounts: [
-      { address: TREASURY, network: '', desc: 'Northpeak Treasury' },
-      { address: PAYROLL, network: 'main', desc: 'Northpeak Payroll' },
-      { address: TESTNET_ONLY, network: 'testnet', desc: 'Northpeak Test' },
-    ],
-  },
+const NORTHPEAK_ACCOUNTS: TomlAccount[] = [
+  { address: TREASURY, network: '', desc: 'Northpeak Treasury' },
+  { address: PAYROLL, network: 'main', desc: 'Northpeak Payroll' },
+  { address: TESTNET_ONLY, network: 'testnet', desc: 'Northpeak Test' },
 ];
 
 describe('DomainTomlsService', () => {
-  let warn: jest.SpyInstance;
-  let services: DomainTomlsService[];
+  afterEach(() => jest.restoreAllMocks());
 
-  beforeEach(() => {
-    warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    services = [];
-  });
-  afterEach(async () => {
-    await Promise.all(services.map((svc) => svc.onModuleDestroy()));
-    jest.useRealTimers();
-    jest.restoreAllMocks();
-  });
-  const started = (s: ReturnType<typeof setup>) => {
-    services.push(s.svc);
-    return s;
-  };
-
-  describe('the directory', () => {
-    it('reads the newest row of each domain with accounts, from the table of the store, as a statement with no value in it', () => {
-      expect(TOML_DIRECTORY_SQL).toContain(`FROM ${Table.DomainTomls}`);
-      expect(TOML_DIRECTORY_SQL).toContain('ORDER BY domain, checked_at DESC');
-      expect(TOML_DIRECTORY_SQL).toContain('LIMIT 1 BY domain');
-      expect(TOML_DIRECTORY_SQL).toContain('WHERE notEmpty(accounts)');
-      expect(TOML_DIRECTORY_SQL).not.toMatch(/\bFINAL\b/);
+  describe('listings', () => {
+    it('reads the newest row of the domains asked, by key, and only the entries of the addresses asked, with no value in the statement', () => {
+      expect(TOML_LISTINGS_SQL).toContain(`FROM ${Table.DomainTomls}`);
+      expect(TOML_LISTINGS_SQL).toContain('WHERE domain IN {domains:Array(String)}');
+      expect(TOML_LISTINGS_SQL).toContain('ORDER BY domain, checked_at DESC');
+      expect(TOML_LISTINGS_SQL).toContain('LIMIT 1 BY domain');
+      expect(TOML_LISTINGS_SQL).toContain(
+        "arrayFilter(a -> has({addresses:Array(String)}, tupleElement(a, 'address')), accounts) AS listed",
+      );
+      expect(TOML_LISTINGS_SQL).not.toMatch(/\bFINAL\b/);
     });
 
-    it('is not loaded before the init: loaded is false and no domain is listed', () => {
-      const { svc } = started(setup());
-      expect(svc.loaded).toBe(false);
-      expect(svc.listed(NORTHPEAK)).toBeUndefined();
-    });
+    it('gives each address the entry of its own domain that counts on the network, in one read of the distinct domains', async () => {
+      const { ch, svc } = setup();
+      ch.state.tomls.set(NORTHPEAK, NORTHPEAK_ACCOUNTS);
+      ch.state.tomls.set(HARBOR, [{ address: UNLISTED, network: '', desc: 'Harbor Desk' }]);
 
-    it('lists, for a domain, the entries that count on the network: no network or a name of it, not another', async () => {
-      const s = started(setup());
-      s.ch.state.directory = NORTHPEAK_DIRECTORY;
-      await s.svc.onModuleInit();
-      expect(s.svc.loaded).toBe(true);
-      const listed = s.svc.listed(NORTHPEAK);
-      expect([...(listed ?? [])]).toEqual([
-        [TREASURY, 'Northpeak Treasury'],
-        [PAYROLL, 'Northpeak Payroll'],
+      const listings = await svc.listings(
+        new Map([
+          [TREASURY, NORTHPEAK],
+          [PAYROLL, NORTHPEAK],
+          [TESTNET_ONLY, NORTHPEAK],
+          [UNLISTED, HARBOR],
+        ]),
+      );
+
+      expect([...listings]).toEqual([
+        [TREASURY, { desc: 'Northpeak Treasury' }],
+        [PAYROLL, { desc: 'Northpeak Payroll' }],
+        // listed for the test network only: not here
+        [TESTNET_ONLY, null],
+        [UNLISTED, { desc: 'Harbor Desk' }],
       ]);
-      // not a domain of the directory
-      expect(s.svc.listed(HARBOR)).toBeUndefined();
-      expect(s.ch.directoryReads()).toBe(1);
+      expect(ch.query).toHaveBeenCalledTimes(1);
+      expect(ch.query).toHaveBeenCalledWith(TOML_LISTINGS_SQL, {
+        domains: [NORTHPEAK, HARBOR],
+        addresses: [TREASURY, PAYROLL, TESTNET_ONLY, UNLISTED],
+      });
     });
 
     it('counts the names of the network of the profile: testnet entries on a testnet', async () => {
-      const s = started(setup(getNetworkProfile('xrpl-testnet')));
-      s.ch.state.directory = NORTHPEAK_DIRECTORY;
-      await s.svc.onModuleInit();
-      expect([...(s.svc.listed(NORTHPEAK) ?? [])]).toEqual([
-        [TREASURY, 'Northpeak Treasury'],
-        [TESTNET_ONLY, 'Northpeak Test'],
+      const { ch, svc } = setup(getNetworkProfile('xrpl-testnet'));
+      ch.state.tomls.set(NORTHPEAK, NORTHPEAK_ACCOUNTS);
+      const listings = await svc.listings(
+        new Map([
+          [TREASURY, NORTHPEAK],
+          [PAYROLL, NORTHPEAK],
+          [TESTNET_ONLY, NORTHPEAK],
+        ]),
+      );
+      expect([...listings.values()]).toEqual([{ desc: 'Northpeak Treasury' }, null, { desc: 'Northpeak Test' }]);
+    });
+
+    it('takes the first entry of an address that counts, and its desc as it is, an empty one too', async () => {
+      const { ch, svc } = setup();
+      ch.state.tomls.set(NORTHPEAK, [
+        { address: TREASURY, network: 'testnet', desc: 'Not on this network' },
+        { address: TREASURY, network: '', desc: 'First that counts' },
+        { address: TREASURY, network: 'main', desc: 'Second that counts' },
+        { address: PAYROLL, network: 'mainnet', desc: '' },
       ]);
+      const listings = await svc.listings(
+        new Map([
+          [TREASURY, NORTHPEAK],
+          [PAYROLL, NORTHPEAK],
+        ]),
+      );
+      expect([...listings.values()]).toEqual([{ desc: 'First that counts' }, { desc: '' }]);
     });
 
-    it('keeps the first desc of a repeated address, and no domain whose entries all count elsewhere', async () => {
-      const s = started(setup());
-      s.ch.state.directory = [
-        {
-          domain: NORTHPEAK,
-          accounts: [
-            { address: TREASURY, network: 'testnet', desc: 'Not on this network' },
-            { address: TREASURY, network: '', desc: 'First that counts' },
-            { address: TREASURY, network: 'main', desc: 'Second that counts' },
-          ],
-        },
-        { domain: HARBOR, accounts: [{ address: TESTNET_ONLY, network: 'testnet', desc: 'Harbor Test' }] },
-      ];
-      await s.svc.onModuleInit();
-      expect([...(s.svc.listed(NORTHPEAK) ?? [])]).toEqual([[TREASURY, 'First that counts']]);
-      expect(s.svc.listed(HARBOR)).toBeUndefined();
-      expect(s.svc.loaded).toBe(true);
+    it('does not let the toml of another domain vouch for an address', async () => {
+      const { ch, svc } = setup();
+      // harbor.example lists TREASURY, whose domain is northpeak.example; northpeak.example lists only PAYROLL
+      ch.state.tomls.set(HARBOR, [{ address: TREASURY, network: '', desc: 'Harbor says Treasury' }]);
+      ch.state.tomls.set(NORTHPEAK, [{ address: PAYROLL, network: '', desc: 'Northpeak Payroll' }]);
+      const listings = await svc.listings(
+        new Map([
+          [TREASURY, NORTHPEAK],
+          [PAYROLL, HARBOR],
+        ]),
+      );
+      expect([...listings.values()]).toEqual([null, null]);
     });
 
-    it('does not reject the init when the first load fails: it warns, and the directory is not loaded', async () => {
-      const s = started(setup());
-      s.ch.state.failDirectory = new Error('connection refused');
-      await expect(s.svc.onModuleInit()).resolves.toBeUndefined();
-      expect(s.svc.loaded).toBe(false);
-      expect(s.svc.listed(NORTHPEAK)).toBeUndefined();
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenCalledWith('Could not load the toml directory, keeping the last one: connection refused');
+    it('lists no address of a domain without a row', async () => {
+      const { svc } = setup();
+      expect([...(await svc.listings(new Map([[TREASURY, NORTHPEAK]])))]).toEqual([[TREASURY, null]]);
     });
 
-    it('loads again every reload interval: the first load that failed is made up, a later one replaces the directory', async () => {
-      jest.useFakeTimers();
-      const s = started(setup());
-      s.ch.state.failDirectory = new Error('connection refused');
-      await s.svc.onModuleInit();
-      expect(s.svc.loaded).toBe(false);
-
-      // the next reload succeeds
-      s.ch.state.failDirectory = undefined;
-      s.ch.state.directory = NORTHPEAK_DIRECTORY;
-      await jest.advanceTimersByTimeAsync(RELOAD_MS);
-      expect(s.svc.loaded).toBe(true);
-      expect(s.svc.listed(NORTHPEAK)?.get(TREASURY)).toBe('Northpeak Treasury');
-      expect(warn).toHaveBeenCalledTimes(1);
-
-      // and the one after it replaces what was loaded: the domain that left is gone, the new one is listed
-      s.ch.state.directory = [
-        { domain: HARBOR, accounts: [{ address: PAYROLL, network: '', desc: 'Harbor Payroll' }] },
-      ];
-      await jest.advanceTimersByTimeAsync(RELOAD_MS);
-      expect(s.svc.listed(NORTHPEAK)).toBeUndefined();
-      expect(s.svc.listed(HARBOR)?.get(PAYROLL)).toBe('Harbor Payroll');
-      expect(s.ch.directoryReads()).toBe(3);
+    it('reads nothing for no address', async () => {
+      const { ch, svc } = setup();
+      expect((await svc.listings(new Map())).size).toBe(0);
+      expect(ch.query).not.toHaveBeenCalled();
     });
 
-    it('keeps the directory when a later reload fails, and warns once for it', async () => {
-      jest.useFakeTimers();
-      const s = started(setup());
-      s.ch.state.directory = NORTHPEAK_DIRECTORY;
-      await s.svc.onModuleInit();
-      expect(warn).not.toHaveBeenCalled();
+    it('keeps each answer 60 s by domain and address, a null one too, and reads only what it does not keep', async () => {
+      expect(TOML_LISTING_TTL_MS).toBe(60_000);
+      const start = Date.now();
+      const now = jest.spyOn(Date, 'now').mockReturnValue(start);
+      const { ch, cache, svc } = setup();
+      ch.state.tomls.set(NORTHPEAK, NORTHPEAK_ACCOUNTS);
+      await svc.listings(
+        new Map([
+          [TREASURY, NORTHPEAK],
+          [UNLISTED, NORTHPEAK],
+        ]),
+      );
+      expect(cache.get(`toml-listing:${NORTHPEAK}:${TREASURY}`)).toEqual({ desc: 'Northpeak Treasury' });
+      expect(cache.get(`toml-listing:${NORTHPEAK}:${UNLISTED}`)).toBeNull();
 
-      s.ch.state.failDirectory = new Error('timeout');
-      await jest.advanceTimersByTimeAsync(RELOAD_MS);
-      expect(s.ch.directoryReads()).toBe(2);
-      expect(s.svc.loaded).toBe(true);
-      expect(s.svc.listed(NORTHPEAK)?.get(PAYROLL)).toBe('Northpeak Payroll');
-      expect(warn).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenCalledWith('Could not load the toml directory, keeping the last one: timeout');
+      // a later change of the toml is not seen within the 60 s; an address not kept is read alone
+      ch.state.tomls.set(NORTHPEAK, [{ address: UNLISTED, network: '', desc: 'Now listed' }, ...NORTHPEAK_ACCOUNTS]);
+      now.mockReturnValue(start + TOML_LISTING_TTL_MS - 1);
+      const kept = await svc.listings(
+        new Map([
+          [TREASURY, NORTHPEAK],
+          [UNLISTED, NORTHPEAK],
+          [PAYROLL, NORTHPEAK],
+        ]),
+      );
+      expect([...kept.values()]).toEqual([{ desc: 'Northpeak Treasury' }, null, { desc: 'Northpeak Payroll' }]);
+      expect(ch.query).toHaveBeenCalledTimes(2);
+      expect(ch.query).toHaveBeenLastCalledWith(TOML_LISTINGS_SQL, { domains: [NORTHPEAK], addresses: [PAYROLL] });
+
+      // after it, read again
+      now.mockReturnValue(start + TOML_LISTING_TTL_MS + 1);
+      expect((await svc.listings(new Map([[UNLISTED, NORTHPEAK]]))).get(UNLISTED)).toEqual({ desc: 'Now listed' });
+      expect(ch.listingReads()).toBe(3);
     });
 
-    it('stops reloading when it is destroyed', async () => {
-      jest.useFakeTimers();
-      const s = started(setup());
-      await s.svc.onModuleInit();
-      await s.svc.onModuleDestroy();
-      await jest.advanceTimersByTimeAsync(RELOAD_MS * 3);
-      expect(s.ch.directoryReads()).toBe(1);
+    it('reads an address again under another domain: a kept answer is of the domain it was read for', async () => {
+      const { ch, svc } = setup();
+      ch.state.tomls.set(NORTHPEAK, NORTHPEAK_ACCOUNTS);
+      ch.state.tomls.set(HARBOR, [{ address: TREASURY, network: '', desc: 'Harbor Treasury' }]);
+      expect((await svc.listings(new Map([[TREASURY, NORTHPEAK]]))).get(TREASURY)).toEqual({
+        desc: 'Northpeak Treasury',
+      });
+      expect((await svc.listings(new Map([[TREASURY, HARBOR]]))).get(TREASURY)).toEqual({ desc: 'Harbor Treasury' });
+      expect(ch.listingReads()).toBe(2);
+    });
+
+    it('rejects when the read fails, and keeps nothing of it', async () => {
+      const { ch, svc } = setup();
+      ch.state.tomls.set(NORTHPEAK, NORTHPEAK_ACCOUNTS);
+      ch.query.mockRejectedValueOnce(new Error('connection refused'));
+      await expect(svc.listings(new Map([[TREASURY, NORTHPEAK]]))).rejects.toThrow('connection refused');
+      expect((await svc.listings(new Map([[TREASURY, NORTHPEAK]]))).get(TREASURY)).toEqual({
+        desc: 'Northpeak Treasury',
+      });
+      expect(ch.listingReads()).toBe(2);
+    });
+
+    it('keeps the answers apart from the shared cache entries: in the cache it was given', async () => {
+      const { ch, cache, svc } = setup();
+      ch.state.tomls.set(NORTHPEAK, NORTHPEAK_ACCOUNTS);
+      await svc.listings(new Map([[TREASURY, NORTHPEAK]]));
+      expect(cache.get(`toml-listing:${NORTHPEAK}:${TREASURY}`)).toEqual({ desc: 'Northpeak Treasury' });
     });
   });
 
