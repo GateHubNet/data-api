@@ -154,7 +154,7 @@ interface StoredEscrow {
 }
 
 const STORED_COLUMNS = `escrow_id, owner, destination, sequence, currency, issuer, amount, toString(amount_drops) AS drops_text,
-       toUnixTimestamp(finish_after) AS finish_unix, toUnixTimestamp(cancel_after) AS cancel_unix, has_condition,
+       toUnixTimestamp64Second(finish_after) AS finish_unix, toUnixTimestamp64Second(cancel_after) AS cancel_unix, has_condition,
        created_ledger, last_ledger, deleted, toUInt64(version) AS version_n`;
 
 interface StoredRow extends Omit<StoredEscrow, 'amount_drops' | 'finish_after' | 'cancel_after' | 'version'> {
@@ -1042,6 +1042,28 @@ describe('the escrows job (e2e)', () => {
       );
       expect(Number(versions.n)).toBeLessThanOrEqual(3);
       expect((await latestEscrows(ch)).size).toBe(count);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('the times of an escrow', () => {
+    // Synthetic, built here: the ledger allows a FinishAfter and a CancelAfter up to the largest UInt32 of Ripple seconds,
+    // 2136-02-07T06:28:15Z, which is past the last second a DateTime holds (2106-02-07T06:28:15Z).
+    it('keeps a FinishAfter after 2106', async () => {
+      const ch = await fresh();
+      const LATE = idOf(0x2136);
+      await insertChanges(ch, [
+        create(
+          LATE,
+          400,
+          nativeFields(1_000_000, { Sequence: 1, FinishAfter: 4_294_967_295, CancelAfter: 4_294_967_294 }),
+        ),
+      ]);
+      await runToHead(ch, 'XRP');
+      expect((await latestEscrows(ch)).get(LATE)).toMatchObject({
+        finish_after: 5_241_652_095,
+        cancel_after: 5_241_652_094,
+      });
     });
   });
 

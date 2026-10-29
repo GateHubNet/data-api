@@ -564,9 +564,12 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     event: 'create',
     owner: ALICE,
     counterparty: BOB,
+    // a timed and conditional escrow whose CancelAfter is the latest a ledger time can be (2^32 - 1 Ripple seconds, in 2136)
     fields: JSON.stringify({
       Account: ALICE,
       Amount: '25000000',
+      CancelAfter: 4_294_967_295,
+      Condition: 'A0258020E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855810100',
       Destination: BOB,
       FinishAfter: 782_000_000,
       Flags: 0,
@@ -1041,7 +1044,7 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     version: VERSION_MS,
   },
   [Table.NftCollectionHolders]: { issuer: ISSUER, taxon_key: 7, owner: BOB, held: 3, version: VERSION_MS },
-  // the escrow of the created node above, still open
+  // the escrow of the created node above, still open: its times in unix seconds (the cancel time after 2106)
   [Table.Escrows]: {
     escrow_id: hash(40),
     owner: ALICE,
@@ -1051,8 +1054,8 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     issuer: '',
     amount: '25',
     amount_drops: 25_000_000,
-    finish_after: CLOSE + 86_400,
-    cancel_after: CLOSE + 172_800,
+    finish_after: 782_000_000 + 946_684_800,
+    cancel_after: 4_294_967_295 + 946_684_800,
     has_condition: 1,
     created_ledger: LEDGER,
     last_ledger: LEDGER,

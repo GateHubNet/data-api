@@ -1304,7 +1304,9 @@ export interface EscrowsRow {
   issuer: string;
   amount: string;
   amount_drops: UInt64Value;
+  /** `Nullable(DateTime64(0, 'UTC'))`, unix seconds: a ledger time can be as late as 2136, past the last second of a `DateTime`. */
   finish_after: UnixSeconds | null;
+  /** As `finish_after`. */
   cancel_after: UnixSeconds | null;
   has_condition: number;
   created_ledger: number | null;

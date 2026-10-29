@@ -182,8 +182,8 @@ CREATE TABLE IF NOT EXISTS escrows
   issuer          String,
   amount          String,
   amount_drops    UInt64,
-  finish_after    Nullable(DateTime('UTC')),
-  cancel_after    Nullable(DateTime('UTC')),
+  finish_after    Nullable(DateTime64(0, 'UTC')),
+  cancel_after    Nullable(DateTime64(0, 'UTC')),
   has_condition   UInt8,
   created_ledger  Nullable(UInt32),
   last_ledger     UInt32,
@@ -199,7 +199,9 @@ ORDER BY escrow_id;
 - An escrow row: `currency` is `XRP`/`XAH` with `issuer = ''` for the native currency, the 3-letter or 40-hex code for an issued token, the
   48-hex issuance ID for an MPT (with its issuer); `amount` in whole units (an MPT's raw integer units); `amount_drops` the drops of a native
   escrow, 0 for a token; `last_ledger` the ledger of its newest `object_changes` row; `deleted` 1 once finished, cancelled or removed;
-  `open_count` and `through_ledger` 0.
+  `open_count` and `through_ledger` 0. `finish_after` and `cancel_after` are unix seconds in a `DateTime64(0)`: a ledger time can be as
+  late as 2136 (Ripple seconds up to 2^32 − 1), and a `DateTime` saturates at 2106 without an error. *Amended by the final review
+  (2026-10-30):* they were `DateTime('UTC')`.
 - **The sentinel** (`escrow_id = ''`): `open_count` = escrows with `deleted = 0`, `amount_drops` = the sum of their native drops,
   `through_ledger` = the ledger the job has processed up to (its watermark); the other columns empty or 0.
 - Readers take the newest version per key without `FINAL`: `ORDER BY escrow_id, version DESC LIMIT 1 BY escrow_id`, then filter

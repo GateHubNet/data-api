@@ -579,7 +579,8 @@ ledger table: it is not in `CHILD_TABLES` or `LEDGER_KEYED_TABLES`, so ingest re
 escrow row holds the current state of an escrow the index has seen: `escrow_id`, `owner`, `destination`, `sequence` (`Nullable`),
 `currency` (`XRP` or `XAH` with an `issuer` of `''` for the native currency, the 3-letter or 40-hex code of an issued token, the 48-hex
 issuance ID of an MPT), `amount` (whole units, an MPT's raw integer units), `amount_drops` (the drops of a native escrow, 0 for a token),
-`finish_after` and `cancel_after` (`Nullable`), `has_condition`, `created_ledger` (`Nullable`), `last_ledger` (the ledger of its newest
+`finish_after` and `cancel_after` (`Nullable(DateTime64(0, 'UTC'))`, unix seconds: a ledger time can be as late as 2136, past the last
+second of a `DateTime`), `has_condition`, `created_ledger` (`Nullable`), `last_ledger` (the ledger of its newest
 `object_changes` row), `deleted UInt8` (1 once it was finished, cancelled or removed) and `version`; `open_count` and `through_ledger` are 0.
 **One sentinel row** (`escrow_id = ''`) holds the escrowed total: `open_count` (the escrows with `deleted = 0`), `amount_drops` (the sum of
 their native drops) and `through_ledger`, the ledger the job has processed up to (its watermark); its other columns are empty or 0.

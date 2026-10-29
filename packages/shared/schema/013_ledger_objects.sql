@@ -73,7 +73,9 @@ SETTINGS non_replicated_deduplication_window = 1000;
 -- currency is XRP or XAH with an empty issuer for the native currency, the 3-letter or 40-hex code for an issued token,
 -- the 48-hex issuance ID for an MPT. amount is in whole units (an MPT's raw integer units), amount_drops the drops of a
 -- native escrow and 0 for a token. last_ledger is the ledger of the escrow's newest object_changes row, deleted is 1
--- once it was finished, cancelled or removed. open_count and through_ledger are 0 in an escrow row.
+-- once it was finished, cancelled or removed. open_count and through_ledger are 0 in an escrow row. finish_after and
+-- cancel_after are DateTime64(0), unix seconds: a ledger time can be as late as 2136 (Ripple seconds up to 2^32 - 1),
+-- past the last second a DateTime holds (2106), at which an insert would silently saturate.
 CREATE TABLE IF NOT EXISTS escrows
 (
   escrow_id       String,
@@ -84,8 +86,8 @@ CREATE TABLE IF NOT EXISTS escrows
   issuer          String,
   amount          String,
   amount_drops    UInt64,
-  finish_after    Nullable(DateTime('UTC')),
-  cancel_after    Nullable(DateTime('UTC')),
+  finish_after    Nullable(DateTime64(0, 'UTC')),
+  cancel_after    Nullable(DateTime64(0, 'UTC')),
   has_condition   UInt8,
   created_ledger  Nullable(UInt32),
   last_ledger     UInt32,
