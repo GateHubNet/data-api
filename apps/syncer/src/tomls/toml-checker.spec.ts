@@ -355,7 +355,7 @@ describe('TomlChecker', () => {
 
       await t.checker.pass();
 
-      // a transient failure within the 24 h of the read: the content stays, the read time too
+      // a transient failure within the grace of the read (the recheck and 24 h): the content stays, the read time too
       const [row] = t.ch.written;
       expect(row).toMatchObject({
         domain: 'a.example',
@@ -644,7 +644,8 @@ describe('TomlChecker', () => {
       await t.checker.pass();
 
       const byDomain = Object.fromEntries(t.ch.written.map((row) => [row.domain, row]));
-      expect(byDomain['a.example']).toMatchObject({ reason: 'timeout', status_code: 0, next_check_at: NOW + HOUR });
+      // a timeout is transient, but a domain never read has no content to carry: it waits a day, as a definite failure
+      expect(byDomain['a.example']).toMatchObject({ reason: 'timeout', status_code: 0, next_check_at: NOW + DAY });
       expect(byDomain['b.example']).toMatchObject({ reason: 'too_large', status_code: 0, next_check_at: NOW + DAY });
       expect(byDomain['c.example']).toMatchObject({ reason: 'blocked_address', status_code: 0 });
       expect(byDomain['d.example']).toMatchObject({ reason: 'http_status', status_code: 404, failures: 1 });
@@ -674,10 +675,11 @@ describe('TomlChecker', () => {
 
       await t.checker.pass();
 
+      // transient, with no content to carry: a day
       expect(t.ch.written.map((row) => [row.reason, row.failures, row.next_check_at - NOW])).toEqual([
-        ['connect_error', 1, HOUR],
-        ['connect_error', 1, HOUR],
-        ['connect_error', 1, HOUR],
+        ['connect_error', 1, DAY],
+        ['connect_error', 1, DAY],
+        ['connect_error', 1, DAY],
       ]);
       expect(t.outcomes()).toEqual(['connect_error', 'connect_error', 'connect_error']);
       // one line for the pass, with the names and counts, nothing else of the errors

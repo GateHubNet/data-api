@@ -8,6 +8,9 @@ import { nextTomlRow, TOML_BACKOFF_MAX_S, TOML_TRANSIENT_RECHECK_S, TomlCheck, T
 const NOW = 1_761_300_000.5;
 const RECHECK_MS = 86_400_000;
 const DAY = 86_400;
+const HOUR = 3_600;
+/** The default recheck of an ok row, in seconds: the content is carried this long and 24 h more. */
+const RECHECK_S = RECHECK_MS / 1000;
 const DOMAIN = 'northpeak.example';
 const URL = `https://${DOMAIN}/.well-known/xrp-ledger.toml`;
 
@@ -100,9 +103,10 @@ describe('nextTomlRow', () => {
 
   describe('a transient failure', () => {
     it.each(TRANSIENT)(
-      'carries the content through a transient failure within 24 h of fetched_at (%s)',
+      'carries the content through a transient failure up to 24 h after the missed re-read of an ok row (%s)',
       (_name, reason, statusCode) => {
-        const prev = stored({}, DAY);
+        // the ok row was due again RECHECK_S after its read; the grace runs 24 h from there
+        const prev = stored({}, RECHECK_S + DAY);
         const row = nextTomlRow(prev, failure(reason, statusCode), NOW, RECHECK_MS);
         expect(row).toEqual({
           domain: DOMAIN,
@@ -112,7 +116,7 @@ describe('nextTomlRow', () => {
           status_code: reason === 'http_status' ? statusCode : 0,
           checked_at: NOW,
           // the time of the content in effect stays that of the file read, not of this check
-          fetched_at: NOW - DAY,
+          fetched_at: NOW - RECHECK_S - DAY,
           // 1_761_300_000.5 + 3_600 = 1_761_303_600.5, a whole second up
           next_check_at: 1_761_303_601,
           failures: prev.failures + 1,
@@ -122,51 +126,109 @@ describe('nextTomlRow', () => {
       },
     );
 
-    it.each(TRANSIENT)('drops it a second later (%s)', (_name, reason, statusCode) => {
-      const prev = stored({}, DAY + 1);
-      const row = nextTomlRow(prev, failure(reason, statusCode), NOW, RECHECK_MS);
-      expect(row).toEqual({
-        domain: DOMAIN,
-        toml_url: URL,
+    it.each(TRANSIENT)(
+      'drops it a second later, and backs off a day: nothing is carried (%s)',
+      (_name, reason, statusCode) => {
+        const prev = stored({}, RECHECK_S + DAY + 1);
+        const row = nextTomlRow(prev, failure(reason, statusCode), NOW, RECHECK_MS);
+        expect(row).toEqual({
+          domain: DOMAIN,
+          toml_url: URL,
+          status: 'failed',
+          reason,
+          status_code: reason === 'http_status' ? statusCode : 0,
+          checked_at: NOW,
+          fetched_at: null,
+          // 1_761_300_000.5 + 86_400 = 1_761_386_400.5, a whole second up
+          next_check_at: 1_761_386_401,
+          failures: prev.failures + 1,
+          ...EMPTY_TOML_CONTENT,
+        });
+        expect(afterS(row)).toBe(DAY);
+      },
+    );
+
+    it('carries the content through a transient failure at the daily re-read', () => {
+      // read at T0, re-read due at T0 + 24 h; the check runs 90 s after that and meets a 503
+      const t0 = NOW - DAY - 90;
+      const prev = stored({}, DAY + 90);
+      expect(prev.next_check_at).toBe(Math.ceil(t0 + RECHECK_S));
+      const row = nextTomlRow(prev, failure('http_status', 503), NOW, RECHECK_MS);
+      expect(row).toMatchObject({
         status: 'failed',
-        reason,
-        status_code: reason === 'http_status' ? statusCode : 0,
-        checked_at: NOW,
-        fetched_at: null,
-        next_check_at: 1_761_303_601,
-        failures: prev.failures + 1,
-        ...EMPTY_TOML_CONTENT,
+        reason: 'http_status',
+        status_code: 503,
+        fetched_at: t0,
+        ...CONTENT,
       });
+      expect(afterS(row)).toBe(HOUR);
+    });
+
+    it('drops it 24 h after the missed re-read, whatever the recheck', () => {
+      for (const recheckMs of [RECHECK_MS, 6 * HOUR * 1000, 3 * DAY * 1000]) {
+        const graceEnd = recheckMs / 1000 + DAY;
+        const at = (ageS: number) => nextTomlRow(stored({}, ageS), failure('timeout'), NOW, recheckMs);
+        expect([recheckMs, at(graceEnd).fetched_at]).toEqual([recheckMs, NOW - graceEnd]);
+        expect([recheckMs, at(graceEnd + 1).fetched_at]).toEqual([recheckMs, null]);
+        expect(at(graceEnd + 1).accounts).toEqual([]);
+      }
     });
   });
 
   describe('a transient failure after another', () => {
     it('keeps the fetched_at of the file, so the grace runs from the last read and not from the last failure', () => {
-      // read 24 h and 300 s before NOW: still within the grace 600 s before NOW
-      const first = nextTomlRow(stored({}, DAY + 300), failure('timeout'), NOW - 600, RECHECK_MS);
-      expect(first).toMatchObject({ failures: 1, fetched_at: NOW - DAY - 300, ...CONTENT });
-      // at NOW the file is 24 h and 300 s old: the content goes, though the row before still held it
+      // read 48 h and 300 s before NOW: still within the grace 600 s before NOW
+      const first = nextTomlRow(stored({}, RECHECK_S + DAY + 300), failure('timeout'), NOW - 600, RECHECK_MS);
+      expect(first).toMatchObject({ failures: 1, fetched_at: NOW - RECHECK_S - DAY - 300, ...CONTENT });
+      // at NOW the file is 48 h and 300 s old: the content goes, though the row before still held it
       const second = nextTomlRow(first, failure('timeout'), NOW, RECHECK_MS);
       expect(second).toMatchObject({ failures: 2, fetched_at: null, ...EMPTY_TOML_CONTENT });
     });
 
-    it('has nothing to carry when the row before holds no content', () => {
-      const prev = stored({
-        status: 'failed',
-        reason: 'toml_invalid',
-        failures: 1,
-        fetched_at: null,
-        ...EMPTY_TOML_CONTENT,
-      });
+    it('has nothing to carry when the row before holds no content, and goes on with its backoff: 2 days after a day', () => {
+      // a definite failure a day ago, checked again a day after it
+      const prev = nextTomlRow(stored({}, 3 * DAY), failure('toml_invalid'), NOW - DAY, RECHECK_MS);
+      expect(prev).toMatchObject({ failures: 1, fetched_at: null, next_check_at: Math.ceil(NOW) });
       const row = nextTomlRow(prev, failure('dns_error'), NOW, RECHECK_MS);
       expect(row).toMatchObject({ failures: 2, fetched_at: null, ...EMPTY_TOML_CONTENT });
-      expect(afterS(row)).toBe(TOML_TRANSIENT_RECHECK_S);
+      expect(afterS(row)).toBe(2 * DAY);
     });
 
-    it('with no row before, is a failed row with no content and one failure', () => {
+    it('with no row before, is a failed row with no content and one failure, checked again after a day', () => {
       const row = nextTomlRow(undefined, failure('connect_error'), NOW, RECHECK_MS);
       expect(row).toMatchObject({ status: 'failed', reason: 'connect_error', failures: 1, fetched_at: null });
       expect(row).toMatchObject(EMPTY_TOML_CONTENT);
+      expect(afterS(row)).toBe(DAY);
+    });
+
+    it('backs a transient failure off once its content is no longer carried: hourly, then 1, 2, 4, then 7 days', () => {
+      // an ok row read at NOW, then a host that times out at every check from its daily re-read on
+      let row = stored();
+      const waits: number[] = [];
+      const carried: boolean[] = [];
+      for (let check = 0; check < 29; check++) {
+        const at = row.next_check_at;
+        row = nextTomlRow(row, failure('timeout'), at, RECHECK_MS);
+        waits.push(row.next_check_at - at);
+        carried.push(row.fetched_at !== null);
+      }
+      // carried up to 48 h after the read: the re-read at +24 h and 23 hourly checks after it
+      expect(carried).toEqual([...Array(24).fill(true), ...Array(5).fill(false)]);
+      expect(waits).toEqual([...Array(24).fill(HOUR), DAY, 2 * DAY, 4 * DAY, TOML_BACKOFF_MAX_S, TOML_BACKOFF_MAX_S]);
+      expect(row.failures).toBe(29);
+    });
+
+    it('starts the backoff at a day after a row with no content that waited less', () => {
+      const prev = stored({
+        status: 'failed',
+        reason: 'timeout',
+        failures: 3,
+        fetched_at: null,
+        next_check_at: Math.ceil(NOW - HOUR),
+        checked_at: NOW - 2 * HOUR,
+        ...EMPTY_TOML_CONTENT,
+      });
+      expect(afterS(nextTomlRow(prev, failure('timeout'), NOW, RECHECK_MS))).toBe(DAY);
     });
 
     it('does not share the lists of the row before', () => {

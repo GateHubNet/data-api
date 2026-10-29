@@ -236,9 +236,10 @@ describe('the tomls worker (e2e)', () => {
         expect(failed.fetched_ms).toBeNull();
         expect(failed.addresses).toEqual([]);
       }
-      // a 503 is transient (an hour), the rest are definite (a day)
-      expect((await rowOf(DOWN)).next_check).toBe(seconds() + HOUR);
-      expect((await rowOf(SLOW)).next_check).toBe(seconds() + HOUR);
+      // a 503 and a timeout are transient, but a domain never read has no content to carry: they wait a day, as the
+      // definite ones do
+      expect((await rowOf(DOWN)).next_check).toBe(seconds() + DAY);
+      expect((await rowOf(SLOW)).next_check).toBe(seconds() + DAY);
       expect((await rowOf(MISSING)).next_check).toBe(seconds() + DAY);
       expect((await rowOf(BAD)).next_check).toBe(seconds() + DAY);
     });
@@ -318,13 +319,56 @@ describe('the tomls worker (e2e)', () => {
       expect(Number(within.fetched_ms)).toBe(t0);
       expect(within.last_failures).toBe(1);
 
-      clock.ms = t0 + (DAY + 1) * 1000;
+      // the grace is the recheck (the suite's 1 h) and 24 h after it, counted from the read
+      clock.ms = t0 + (HOUR + DAY) * 1000;
+      expect(await app.checker.pass()).toBe(1);
+      expect((await rowOf(OK)).addresses).toEqual([TREASURY]);
+
+      clock.ms = t0 + (HOUR + DAY + HOUR + 1) * 1000;
       expect(await app.checker.pass()).toBe(1);
       const after = await rowOf(OK);
       expect([after.last_status, after.last_reason, after.last_code]).toEqual(['failed', 'http_status', 503]);
       expect(after.addresses).toEqual([]);
       expect(after.principals).toEqual([]);
       expect(after.fetched_ms).toBeNull();
+      // nothing is carried any more: it backs off a day
+      expect(after.next_check).toBe(seconds() + DAY);
+    });
+
+    it('with the default recheck, keeps a verified name through a 503 at the daily re-read, and backs off once it is lost', async () => {
+      web.serveToml(OK, TOML_PATH, tomlOf([TREASURY]));
+      await nameDomain(OK);
+      const app = await boot({ config: { tomlRecheckMs: DAY * 1000 } });
+      await app.discovery.discover();
+      const t0 = clock.ms;
+
+      await app.checker.pass();
+      const ok = await rowOf(OK);
+      expect(ok.next_check).toBe(seconds() + DAY);
+
+      web.serve(OK, TOML_PATH, { status: 503, body: 'down for maintenance' });
+
+      // the daily re-read, a second after it is due, meets a 503: the name stays, checked again within the hour
+      clock.ms = (ok.next_check + 1) * 1000;
+      expect(await app.checker.pass()).toBe(1);
+      const blip = await rowOf(OK);
+      expect([blip.last_status, blip.last_reason, blip.last_code]).toEqual(['failed', 'http_status', 503]);
+      expect(blip.addresses).toEqual([TREASURY]);
+      expect(Number(blip.fetched_ms)).toBe(t0);
+      expect(blip.next_check).toBe(seconds() + HOUR);
+
+      // 24 h after the missed re-read the name goes, and the host is asked again a day later, then two
+      clock.ms = t0 + (2 * DAY + 1) * 1000;
+      expect(await app.checker.pass()).toBe(1);
+      const lost = await rowOf(OK);
+      expect(lost.addresses).toEqual([]);
+      expect(lost.fetched_ms).toBeNull();
+      expect(lost.next_check).toBe(seconds() + DAY);
+
+      clock.ms = lost.next_check * 1000;
+      expect(await app.checker.pass()).toBe(1);
+      expect((await rowOf(OK)).next_check).toBe(seconds() + 2 * DAY);
+      expect(fetches(OK)).toBe(4);
     });
 
     it('checks a domain named anew within the hour, although its next check is a day away, and not before', async () => {

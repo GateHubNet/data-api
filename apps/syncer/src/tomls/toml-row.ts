@@ -2,9 +2,12 @@ import { DomainTomlsRow, EMPTY_TOML_CONTENT, okTomlRow, TomlContent } from '@gat
 import { DOMAIN_VERIFIED_GRACE_S, isTransientReason } from '../validators/domain-checker';
 import { FetchFailure } from '../validators/safe-fetch';
 
-/** A transient failure is checked again after an hour. */
+/** A transient failure that carries the content is checked again after an hour. */
 export const TOML_TRANSIENT_RECHECK_S = 3_600;
-/** A definite failure is checked again after a day, then twice as long after each one in a row, up to this: 7 days. */
+/**
+ * A failure that carries no content is checked again after a day, then twice as long after each one in a row, up to this:
+ * 7 days.
+ */
 export const TOML_BACKOFF_MAX_S = 604_800;
 const TOML_BACKOFF_FIRST_S = 86_400;
 /** The most `failures` counts: the column holds a UInt16. */
@@ -25,9 +28,12 @@ export type TomlCheck = { domain: string; tomlUrl: string } & (
  *
  * - **read as TOML**: `okTomlRow`, the row `recordToml` writes: the content, fetched now, no failures, the next check after
  *   `recheckMs`.
- * - **a transient failure** (`isTransientReason`): the next check after an hour. The content and `fetched_at` of `prev` stay
- *   while `prev` was fetched at most 24 h ago, so that a website that blips keeps its names; otherwise the content is empty
- *   and `fetched_at` null.
+ * - **a transient failure** (`isTransientReason`): the content and `fetched_at` of `prev` stay while `prev` was fetched at
+ *   most `recheckMs` and 24 h ago (`DOMAIN_VERIFIED_GRACE_S`): the grace runs from the re-read the failure missed, so that a
+ *   website that blips at its daily re-read keeps its names. While the content stays, the next check is after an hour. Once
+ *   it is gone (the content is empty and `fetched_at` null), the failure backs off as a definite one does, counted from the
+ *   first failure that carried nothing: 1, 2, 4, then 7 days (`waitWithoutContent`), so that a dead host is not asked
+ *   every hour for ever.
  * - **a definite failure** (anything else, `toml_invalid` too): empty content, `fetched_at` null, the next check after 1, 2,
  *   4, then 7 days of failures in a row.
  *
@@ -66,13 +72,32 @@ export function nextTomlRow(
     };
   }
 
-  const carried = prev !== undefined && prev.fetched_at !== null && now - prev.fetched_at <= DOMAIN_VERIFIED_GRACE_S;
-  return {
-    ...failed,
-    fetched_at: carried ? prev.fetched_at : null,
-    next_check_at: after(TOML_TRANSIENT_RECHECK_S),
-    ...(carried ? contentOf(prev) : EMPTY_TOML_CONTENT),
-  };
+  const carried =
+    prev !== undefined &&
+    prev.fetched_at !== null &&
+    now - prev.fetched_at <= recheckMs / 1000 + DOMAIN_VERIFIED_GRACE_S;
+  if (carried) {
+    return {
+      ...failed,
+      fetched_at: prev.fetched_at,
+      next_check_at: after(TOML_TRANSIENT_RECHECK_S),
+      ...contentOf(prev),
+    };
+  }
+  return { ...failed, fetched_at: null, next_check_at: after(waitWithoutContent(prev)), ...EMPTY_TOML_CONTENT };
+}
+
+/**
+ * The wait of a transient failure that carries no content, in seconds: a day after a row that held content (an `ok` one, or a
+ * failure that carried it) or after none, else twice the days the row before waited (its `next_check_at` after its
+ * `checked_at`, rounded: the whole second of `next_check_at` adds less than one), at least one and at most 7. A run of such
+ * failures, whatever their reasons, so waits 1, 2, 4, then 7 days, as definite failures do; the row before tells which step it
+ * was, as `failures` cannot (it counts the hourly checks that carried the content too).
+ */
+function waitWithoutContent(prev: DomainTomlsRow | undefined): number {
+  if (prev === undefined || prev.status !== 'failed' || prev.fetched_at !== null) return TOML_BACKOFF_FIRST_S;
+  const waitedDays = Math.round((prev.next_check_at - prev.checked_at) / TOML_BACKOFF_FIRST_S);
+  return Math.min(Math.max(2 * waitedDays, 1) * TOML_BACKOFF_FIRST_S, TOML_BACKOFF_MAX_S);
 }
 
 /** The content of a stored row, with lists of its own. */
