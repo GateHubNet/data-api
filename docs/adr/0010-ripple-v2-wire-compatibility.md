@@ -441,11 +441,12 @@ books. **No route of the original is removed or changes the shape of its answer*
 91. **The fee of a delegated transaction is the delegate's (a fix).** Until parser version 7 the `transaction_cost` row of a delegated transaction was put on its
     `Account`, but the delegate signs it and pays its fee (the original predates permission delegation). From parser version 7 on the row is the delegate's and the sender's native row is its whole change, so the
     rule that, per currency, the changes of a transaction sum to zero but the fee burned holds for a delegated transaction. The same rule is applied to two columns that
-    added the fee back to the source whoever paid it: `payments.source_balance_changes` and `path_payments.source_amount`. Everything derived from `balance_changes`
-    (`/accounts/{address}/balance_changes`, the `stats` and `reports`, the analytics, the rollups) follows from a re-ingest of the ledgers (`range-ingest --reprocess` from
+    added the fee back to the source whoever paid it, `payments.source_balance_changes` and `path_payments.source_amount`, and to `payments.destination_balance_changes`
+    when the delegate is the Payment's `Destination` (a sweep to itself): the delegate's native change there is what arrived, the fee added back, and none when that is
+    0 (a token payment to its delegate). Everything derived from `balance_changes` (`/accounts/{address}/balance_changes`, the `stats` and `reports`, the analytics,
+    the rollups) follows from a re-ingest of the ledgers (`range-ingest --reprocess` from
     ledger 107,524,865, [backfill](../backfill.md#ledger-objects-and-delegation-re-ingest)); ledgers before it keep the old rows, and a delegated transaction before the
-    reprocess has no fee row on the delegate. A delegate that is also the destination of a delegated Payment (a sweep to itself) still has the fee taken out of its
-    destination change in `payments.destination_balance_changes`; that column is corrected by a later fix of the program, and the re-ingest rewrites it.
+    reprocess has no fee row on the delegate.
 92. **Issued-token payment channels are typed (a fix).** On Xahau (`PaychanAndEscrowForTokens`) a payment channel can hold an issued token, and the parser read every
     channel amount as drops: `dropsToNative` of a token's amount object throws a `LedgerParseError`, which halts the live syncer and fails a range chunk at the first such
     ledger. Channels are now typed in the currency they hold, as escrows are, and **a Xahau syncer halted on such a ledger resumes after the deploy**. One thing means

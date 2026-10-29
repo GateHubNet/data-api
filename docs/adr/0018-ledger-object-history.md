@@ -52,9 +52,10 @@ what every transaction since did to it, and why it is in the state it is in. The
    inner transaction, where the metadata names no account of the delegate), not by a new column or filter; the account-transactions CSV gains a last column
    `delegate`. **The fee of a delegated transaction is fixed:** `feePayer(tx)` (the `Delegate` when there is one, else the `Account`) puts the `transaction_cost`
    row on the payer, and the same rule is applied to `payments.source_balance_changes` and `path_payments.source_amount`, which added the fee back to the source
-   whoever paid it. It needs **a re-ingest** from the delegation amendment (`range-ingest --from 107524865 --to <deploy ledger> --reprocess`, about 415,000
-   ledgers on 2026-10-28 and about 25,000 more a day): the delegate rows, the corrected fee rows and the rollups follow (`agg_dirty`), and the `delegations`
-   coverage then starts at 107,524,865: `complete: true`.
+   whoever paid it, and to `payments.destination_balance_changes` when the delegate is the Payment's `Destination` (a sweep to itself), whose native change had
+   the fee taken out (it is what arrived, and none for a token payment to its delegate). It needs **a re-ingest** from the delegation amendment
+   (`range-ingest --from 107524865 --to <deploy ledger> --reprocess`, about 415,000 ledgers on 2026-10-28 and about 25,000 more a day): the delegate rows, the
+   corrected fee rows and the rollups follow (`agg_dirty`), and the `delegations` coverage then starts at 107,524,865: `complete: true`.
 7. **Issued-token payment channels are typed with token amounts** (Xahau, `PaychanAndEscrowForTokens`). `BalanceChangesParser.channel()` read every amount as
    drops and called `dropsToNative` on a token's amount object, which throws: a `LedgerParseError` that halts the live runner (and fails a range chunk) at the first
    token channel ledger. It reads the amounts through the same `escrowValue` an escrow does, so a Xahau syncer halted on such a ledger resumes after the deploy.
@@ -92,10 +93,9 @@ what every transaction since did to it, and why it is in the state it is in. The
 - **The status is a function of the time of the answer**, so a cached answer (`private, max-age=60`) can be a minute stale in it; the explorer mirrors the rules
   (`object-status.ts`) for objects it reads from the node.
 - **The fee fix changes history.** A re-ingested ledger's delegated transaction has a different `transaction_cost` row (on the delegate), different
-  `source_balance_changes` and `source_amount`, and a new row for the delegate in `account_transactions`; the balance changes of an account that acted through a
-  delegate are different before and after the reprocess of their ledgers, and the account-transactions CSV puts `fee` on the row of the account that paid it
-  (the delegate's, not the sender's). One case is left to a later fix of the program: a delegate that is also the `Destination` of a delegated Payment (a sweep
-  to itself) has its destination change reduced by the fee in `payments.destination_balance_changes`.
+  `source_balance_changes` and `source_amount` (and `destination_balance_changes` when the delegate is the Payment's `Destination`), and a new row for the
+  delegate in `account_transactions`; the balance changes of an account that acted through a delegate are different before and after the reprocess of their
+  ledgers, and the account-transactions CSV puts `fee` on the row of the account that paid it (the delegate's, not the sender's).
 - **Deploy order:** migration 013 first (the writer inserts into the two new tables on every ledger, and a write to a missing table fails the batch), then the
   syncer, then the api, then the re-ingest ([operations](../operations.md#ledger-objects-and-delegation), [backfill](../backfill.md#ledger-objects-and-delegation-re-ingest)).
   The explorer turns its `LEDGER_OBJECTS` switch on in an environment once its API serves the routes on both networks, and `DELEGATION` once the re-ingest is

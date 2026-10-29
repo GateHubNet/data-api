@@ -121,6 +121,57 @@ describe('PaymentParser', () => {
     expect(payment.fee_drops).toBe('12');
   });
 
+  // Synthetic, built here: no Payment of a delegate was found on the network. The delegate sweeps the delegator's XRP to
+  // itself, so it is the Destination and pays the 12 drop fee out of what arrives.
+  it("a delegate that is the Payment's Destination keeps its whole amount as its destination change", () => {
+    const payment = parser.parse(
+      parserTx(
+        { Delegate: DEST },
+        {
+          AffectedNodes: [
+            accountRoot(SENDER, '1000000000', '900000000'), // -100: the amount alone
+            accountRoot(DEST, '50000000', '149999988'), // +100 - 0.000012: the amount less the fee it paid
+          ],
+        },
+      ),
+      XRPL,
+    )!;
+
+    expect(payment.source_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '-100' }]);
+    expect(payment.destination_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '100' }]);
+  });
+
+  // Synthetic, built here: the delegate is the Destination of a token Payment, so its only native change is the fee.
+  it('a token payment to its delegate leaves no native destination change', () => {
+    const payment = parser.parse(
+      parserTx(
+        { Delegate: DEST, Amount: { currency: 'USD', issuer: ISSUER, value: '5' } },
+        {
+          AffectedNodes: [
+            rippleState(SENDER, ISSUER, 'USD', '10', '5'),
+            rippleState(DEST, ISSUER, 'USD', '0', '5'),
+            accountRoot(DEST, '50000000', '49999988'), // -0.000012: the fee
+          ],
+        },
+      ),
+      XRPL,
+    )!;
+
+    expect(payment.source_balance_changes).toEqual([{ counterparty: ISSUER, currency: 'USD', value: '-5' }]);
+    expect(payment.destination_balance_changes).toEqual([{ counterparty: ISSUER, currency: 'USD', value: '5' }]);
+  });
+
+  // Synthetic, built here: the delegate sweeps exactly its fee to itself, so its balance does not move and the library
+  // reports no native change for it at all; what it received is still the amount.
+  it('a delegate that receives exactly its fee has the amount as its destination change', () => {
+    const payment = parser.parse(
+      parserTx({ Delegate: DEST, Amount: '12' }, { AffectedNodes: [accountRoot(SENDER, '1000000000', '999999988')] }),
+      XRPL,
+    )!;
+
+    expect(payment.destination_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '0.000012' }]);
+  });
+
   it('payment to self is ignored', () => {
     expect(parser.parse(parserTx({ Account: SENDER, Destination: SENDER }), XRPL)).toBeUndefined();
   });

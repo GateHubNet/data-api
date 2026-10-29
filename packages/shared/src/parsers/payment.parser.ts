@@ -98,7 +98,25 @@ export class PaymentParser {
       const value = isNative(change) && sourcePaysFee ? new BigNumber(change.value).plus(fee).toString() : change.value;
       if (value !== '0') sourceChanges.push(remap(value, change));
     }
-    const destinationChanges = (changes[tx.Destination] ?? []).map((change) => remap(change.value, change));
+    // A delegate that is the Payment's Destination (it sweeps the delegator's funds to itself) pays the fee out of what
+    // arrives: the library reports its native change as what arrived less the fee (-fee for a token payment, nothing when
+    // the two cancel). The fee goes back on, and a native change that is then 0 is none. Any other destination is as the
+    // library reports it.
+    const destinationPaysFee = feePayer(tx) === tx.Destination;
+    const destinationChanges: BalanceChangeAmount[] = [];
+    let feeAddedBack = false;
+    for (const change of changes[tx.Destination] ?? []) {
+      if (!(isNative(change) && destinationPaysFee)) {
+        destinationChanges.push(remap(change.value, change));
+        continue;
+      }
+      feeAddedBack = true;
+      const value = new BigNumber(change.value).plus(fee).toFixed();
+      if (value !== '0') destinationChanges.push(remap(value, change));
+    }
+    if (destinationPaysFee && !feeAddedBack && !new BigNumber(fee).isZero()) {
+      destinationChanges.push({ counterparty: '', currency: ctx.nativeCurrency, value: fee });
+    }
 
     const issued = typeof tx.Amount === 'object';
     const delivered = deliveredAmount(tx, meta, t.ledger_index, ctx);

@@ -515,7 +515,9 @@ then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on 
 - Payments with MPT amounts are not payments of this API.
 - A missing `end` is open-ended (the original used the time of the request).
 - A **delegated** Payment (a `Delegate` signs it for the sender and pays its fee) has its fee booked to the delegate: the native `source_balance_changes` of the sender are the
-  amount alone, from the re-ingest of its ledger on (parser version 7, [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 91). The original predates delegation.
+  amount alone, and a delegate that is the `destination` (a sweep to itself) has what arrived as its native `destination_balance_changes`, the fee not taken out (none
+  for a token payment to it), from the re-ingest of its ledger on (parser version 7, [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 91). The original
+  predates delegation.
 
 ---
 

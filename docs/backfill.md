@@ -439,8 +439,9 @@ history that starts in the middle, with no `created`, and says `complete: false`
 How it behaves:
 
 - **What a reprocess changes in the books.** A delegated transaction in the range gets its `transaction_cost` row on the delegate (and none on the sender), the source
-  columns of `payments` and `path_payments` stop adding the fee back to a sender who did not pay it, and the delegate lists the transaction. The balance changes, stats,
-  reports and analytics of the accounts concerned are different from before for those ledgers, and the rollups follow through `agg_dirty` ([operations](operations.md#what-a-re-ingest-does-to-them)).
+  columns of `payments` and `path_payments` stop adding the fee back to a sender who did not pay it, `payments.destination_balance_changes` adds it back to a delegate
+  that is the Payment's `Destination` (a sweep to itself: what arrived, with no native change for a token payment to it), and the delegate lists the transaction. The
+  balance changes, stats, reports and analytics of the accounts concerned are different from before for those ledgers, and the rollups follow through `agg_dirty` ([operations](operations.md#what-a-re-ingest-does-to-them)).
 - **Changes the table does not expect** (an object of a tracked type changed by a transaction no event of its type covers) are written as event `update` and counted
   in `syncer_objects_unclassified_total`; the range-ingest log warns with the total of its run and its last line ends with `L unclassified object changes`.
 - **The reprocess of a range that is already version 7** deletes and writes its rows again, in both tables, like every child table; the `escrows` hook then recomputes
