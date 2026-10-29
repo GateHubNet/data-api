@@ -29,7 +29,7 @@ Date: 2026-10-24. Status: proposed (2026-10-24), program 2, sub-project D5. Repo
 | 11 | The route is `/v2/accounts/{address}/delegations?direction=given\|held` (the brief), not the ledger-features spec's `/delegates?role=delegator\|delegate`. Rows keep the ledger's names `account` and `authorize`. | Accept |
 | 12 | `GET /v2/ledger_objects/{id}`, a type lookup of any tracked object, so the explorer's search can send a pasted object ID to its page. | Accept |
 | 13 | Rollout re-ingests (`--reprocess`) from 107,524,865 (PermissionDelegationV1_1) to the deploy ledger: delegation is then complete. Escrows, checks and channels stay incomplete (their `coverage` says so) until the history backfill reaches 28,685,313; no extra backfill in D5. | Accept |
-| 14 | Coverage is D3's `FeatureCoverageService` (D3 §4), with four features keyed by `OBJECT_PARSER_VERSION` and the amendments Escrow, PayChan, Checks and PermissionDelegationV1_1; one object's history is complete when the feature's is or when its creation is indexed (D3's per-NFT rule). Xahau's amendments file gains the genesis ledger for Escrow, PayChan and Checks, as D3 does for URIToken. | Accept |
+| 14 | Coverage is D3's `FeatureCoverageService` (D3 §4), with four features keyed by `OBJECT_PARSER_VERSION` and the amendments Escrow, PayChan, Checks and PermissionDelegationV1_1; one object's history is complete when the feature's is or when its creation is indexed (D3's per-NFT rule). Xahau's amendments file gains the genesis ledger for Escrow, PayChan and Checks, as D3 does for URIToken. *Amended by the final review (2026-10-30); owner note: the mechanism of this decision changed, its E did not:* on Xahau the three features are D3's features without an amendment and start at `NetworkProfile.firstLedger` (ledger 1, the genesis ledger this decision meant); `xahau.json` is not edited. `Escrow` and `PayChan` are retired there and Xahau's `Amendments` object does not list them, so the amendments data never reports them enabled and a genesis entry in `xahau.json` would have left the features `complete: false` for ever (1.4). | Accept |
 | 15 | Issued-token payment channels (Xahau, `PaychanAndEscrowForTokens`) are typed in `balance_changes` with token amounts; today `channel()` reads every amount as drops. | Accept |
 | 16 | **Consistency pass:** D5 defines the MPT amount object of the data API's answers (section 5.1); D9, built later, serves MPT amounts in this shape and adds the scale and ticker through its `?ids=` batch, without changing it. | Accept: D5 serves MPT escrow amounts before D9 exists. |
 
@@ -219,13 +219,17 @@ amendments data, never a constant; on a testnet only an indexed `EnableAmendment
 
 | Feature | Amendment | XRPL E | Xahau E |
 |---|---|---|---|
-| `escrows` | Escrow | 28,685,313 | genesis (retired) |
-| `payment_channels` | PayChan | 28,685,313 | genesis (retired) |
-| `checks` | Checks | 56,219,905 | genesis |
+| `escrows` | Escrow | 28,685,313 | `NetworkProfile.firstLedger` (1), no amendment (Escrow is retired) |
+| `payment_channels` | PayChan | 28,685,313 | `NetworkProfile.firstLedger` (1), no amendment (PayChan is retired) |
+| `checks` | Checks | 56,219,905 | `NetworkProfile.firstLedger` (1), no amendment |
 | `delegations` | PermissionDelegationV1_1 | 107,524,865 | none: a feature the network cannot have (D3 §4, see 5.6) |
 
-Xahau's `config/amendments/xahau.json` gains the genesis ledger as `enabled.ledger_index` of Escrow, PayChan and Checks (read from the node
-in Task 1), as D3's decision 18 does for URIToken; without it D3's rule answers `complete: false`. **Per object** (detail and history),
+On Xahau the three object features take no amendment: they are D3's features without an amendment, which start at
+`NetworkProfile.firstLedger` (Xahau's first ledger, 1), and `config/amendments/xahau.json` is not edited. `Escrow` and `PayChan` are retired
+there, and the amendments data reports a retired name enabled only when the ledger's `Amendments` object lists it, which Xahau's does not
+(`xahau/objects/FINDINGS.md` finding 5), so an `enabled.ledger_index` added to `xahau.json` would never reach D3's rule and the features would
+answer `complete: false` for ever. (Decision 14 first said `xahau.json` gains the genesis ledger, as D3's decision 18 does for URIToken; the
+start is the same ledger, by a different mechanism.) **Per object** (detail and history),
 D3's per-NFT rule: `complete` is true when the feature's is, or when the object's creation is indexed (its `created` ledger is at or above
 `from_ledger_index`). The shape is D3's, right after `result`: `"coverage": { "from_ledger_index": 107524865, "complete": false }`.
 
@@ -534,7 +538,7 @@ with `object_type IN (TRACKED_OBJECT_TYPES)`): `account` is the owner, `ledger_i
 | Escrows | XRP; issued tokens and MPTs with TokenEscrow (102,204,929) | XAH; issued tokens (PaychanAndEscrowForTokens); `EscrowFinish` may carry `EscrowID` (the parser reads nodes, so nothing changes) |
 | Checks, payment channels | yes | yes (issued-token channels with PaychanAndEscrowForTokens) |
 | Delegation | from 107,524,865 | none: empty list, `complete: true`; `NetworkProfile.hasDelegation` (new, `false`) skips the read |
-| Coverage (D3 §4) | E from the amendments table of 1.4 | E = genesis, added to `xahau.json` (1.4) |
+| Coverage (D3 §4) | E from the amendments table of 1.4 | escrows, channels and checks: E = `NetworkProfile.firstLedger`, no amendment; `xahau.json` untouched (1.4) |
 
 Hooks may emit escrow, check and channel transactions on Xahau; they are rows like any other (the sender is the emitting account).
 
@@ -542,9 +546,9 @@ Hooks may emit escrow, check and channel transactions on Xahau; they are rows li
 
 1. Apply the migration before the syncer and the api of this release (the writer fails without the tables; the api's routes read them).
 2. Deploy the syncer and the api. From the deploy ledger every ledger has object rows and the fixed fee rows.
-3. **Delegation**: `range-ingest --from 107524865 --to <deploy ledger> --reprocess` on XRPL (about 200,000 ledgers, hours on Ripple's
-   full-history node). It writes the `Delegate` rows, the delegates' `account_transactions` rows and the corrected fee rows; `agg_dirty`
-   carries the rewrite into the rollups. Coverage then starts at 107,524,865: delegation `complete: true`.
+3. **Delegation**: `range-ingest --from 107524865 --to <deploy ledger> --reprocess` on XRPL (about 415,000 ledgers on 2026-10-28, about
+   20,800 more a day; hours on Ripple's full-history node). It writes the `Delegate` rows, the delegates' `account_transactions` rows and
+   the corrected fee rows; `agg_dirty` carries the rewrite into the rollups. Coverage then starts at 107,524,865: delegation `complete: true`.
 4. **Escrows, checks, channels**: `complete` stays `false` until the history backfill writes every ledger from 28,685,313 (XRPL) or from
    genesis (Xahau) with this parser or a later one. An object untouched since the coverage start is 404 here and shown from the node by
    E10. Not part of D5.
@@ -588,7 +592,7 @@ Hooks may emit escrow, check and channel transactions on Xahau; they are rows li
   delegated `Payment` and a delegated `tec`; a delegated Batch inner transaction if one exists. Xahau: `EscrowCreate`, `EscrowFinish` (with
   `EscrowID` if found), `EscrowCancel`, `CheckCreate`, `CheckCash`, `PaymentChannelCreate`, `PaymentChannelClaim`, an issued-token escrow and an issued-token
   channel. `FINDINGS.md` confirms: `DeliveredAmount` on XRP and issued-token cashes; the issued-token escrow trust-line behaviour; which transactions delete a
-  `Delegate`; Xahau's escrow fields; Xahau's genesis ledger (for `xahau.json`, 1.4).
+  `Delegate`; Xahau's escrow fields; Xahau's first ledger and why its object features take no amendment (1.4).
 - **Unit**: parser golden tests and the invariants of 2.2 with an oracle reimplementation, deep-frozen input, at least 10 mutants killed;
   the fee-payer change (every existing snapshot unchanged for non-delegated transactions); `escrowId` against every recorded `EscrowCreate`;
   `permissionOf` (names, numbers, unknown); `object-views` key order per type; `object-status` truth table; the CSV summary row with and
