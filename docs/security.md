@@ -37,7 +37,7 @@ thousands of hosts, and whoever sets a Domain picks the host. Those requests are
 | Client-address spoofing (rate-limit evasion) | nginx trusts `X-Forwarded-For` only from `TRUSTED_PROXIES` and sets exactly one address (§4) |
 | Secret leakage | Env-only secrets, git/docker-ignored env files, BuildKit secret for the npm token, per-service env (§8) |
 | Server-side request forgery through a fetched URL (a validator's domain, a domain an account names, a publisher, a redirect, a DNS name that points inward) | Every outbound HTTP request of the syncer goes through `SafeFetcher`: HTTPS on port 443 to public addresses only, every resolved address checked and the connection pinned to it, redirects checked again, bounded time and size (§9) |
-| Personal data in a toml (a principal's email, social handles, servers, the organization) | The `tomls` worker reads a principal's **name only**; emails and handles, `[[SERVERS]]` and `[ORGANIZATION]` are never read, stored, logged or served (a test feeds a file with them and looks for their text in the row, the logs and the answer) |
+| Personal data in a toml (a principal's email, social handles, servers, the organization, an entry's contact keys) | The `tomls` worker reads a principal's **name only**; emails and handles, `[[SERVERS]]` and `[ORGANIZATION]` are never read, stored, logged or served. Of a currency or validator entry, a key that names an email or a social account (`contact_email`, `twitter`, `x`, `telegram`, `support_handle`, ...) and a text that holds an `@` are never stored in its `fields`, and an `[[ACCOUNTS]]` `desc` with an `@` is no name (tests feed files with them and look for their text in the row, the logs and the answer) |
 | Impersonation through a toml (a `desc` that claims a name; a name that renders as another's) | A `verified` name is whatever the domain's owner wrote, so the answer always pairs it with the `domain`, which the explorer shows; a `desc` over 64 characters is not a name; every text of a toml loses its control and bidirectional characters (§9) |
 | Direct ClickHouse access | Not published (§9) |
 | Exposure of internals | `/internal/` and `/liveliness/` blocked at the edge for the public (§9) |
@@ -225,8 +225,10 @@ domain), so the rules of
 
 Residual: the syncer can be made to send a `GET` to any public host on port 443 (the path is the fixed TOML path, or the configured
 publisher URL), and its address is the source of that request. For the `tomls` worker that is **tens of thousands of hosts and no allowlist**: anyone can
-set a Domain on an account they own, and the worker then sends that host one `GET` of the fixed path a day (a failed one on its own schedule: an hour, or
-1, 2, 4, 7 days), 16 at a time at most. It can be made to send more only by setting more Domains. [Deployment](deployment.md#outbound-network-access) says what egress
+set a Domain on an account they own, and the worker then sends that host one `GET` of the fixed path a day (a failed one on its own schedule: an hour while
+its last content is carried, else 1, 2, 4, 7 days), 16 at a time at most. It can be made to send more only by setting more Domains. What a fetched toml says is
+stored per domain and outlives the Domain that brought it in (the store keeps every domain ever checked, so it grows with Domain churn on disk); the api reads
+it by key for the domains of each request only, so no amount of stored tomls grows the api's memory. [Deployment](deployment.md#outbound-network-access) says what egress
 to allow and recommends blocking the private ranges at the network as well.
 
 ## 10. Security checklist

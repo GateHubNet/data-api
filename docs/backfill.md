@@ -327,10 +327,17 @@ own environment authenticates, the password stays off the host command line):
 ```bash
 ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" "$@"' sh "$@"; }
 X=$(ch -q "SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 6")
-for bucket in $(seq 0 15); do ch --database xrpl --param_X="$X" --param_bucket="$bucket" < account-domains-seed.sql; done
+if [ "$X" = '\N' ] || [ -z "$X" ]; then echo 'nothing to seed: every ledger was written by parser version 6'; else
+  for bucket in $(seq 0 15); do ch --database xrpl --param_X="$X" --param_bucket="$bucket" < account-domains-seed.sql || break; done
+fi
 ```
 
-On Xahau use `xahau.ledgers` and `--database xahau`; on the sandbox `xrpl_testnet` and `xahau_testnet`.
+The guard matters: with `X` NULL (`\N`) every statement would fail on its `UInt32` parameter, sixteen times. On Xahau use `xahau.ledgers` and
+`--database xahau`; on the sandbox `xrpl_testnet` and `xahau_testnet`.
+
+**What it costs.** Each bucket reads the whole of `account_states` up to `X` (the bucket is a condition on a hash of the account, not a range of the key),
+the `fields` column included, so the seed reads that table **16 times**; only the `GROUP BY` of one bucket's accounts is held in memory. **Time one bucket on
+the sandbox first** (and watch its memory in `system.query_log`) to know how long the sixteen take on a mainnet.
 
 **Checking it.** The accounts that have a domain now (a deleted account and an empty Domain are not one), which is what the discovery of the `tomls` worker finds:
 
@@ -348,6 +355,10 @@ How the seed behaves:
   gives that row. So a later `--reprocess` of that ledger deletes it and the parser writes the same row back.
 - **It is safe to run twice**, or again for one bucket after a failure: the same rows are inserted again, and the row with the largest `version` of an
   account is its current Domain either way (readers take `argMax(domain_hex, version)`, never `FINAL`). An account without a Domain and a deleted account get no row.
+- **Run it again after a rollback.** A syncer of an older release writes no `account_domains`: when this release is deployed again after one ran, the
+  ledgers it wrote have no rows, and `X` has moved to the last of them. The seed with the new `X` fills them (the newest row of an account wins).
+- **It agrees with the parser.** The shared e2e writes recorded ledgers, sets the parser's rows aside, seeds from `account_states` and compares the newest
+  row of every account: the same Domain on the same (ledger, tx, node), and no row for an account without a Domain.
 - **Coverage.** The seed is as good as `account_states`: the state tables start at the first ledger parser version 3 wrote
   ([Account state history re-ingest](#account-state-history-re-ingest)), and an account whose Domain was set before that and whose root has not changed since has no
   row. It has **no domain, and so no verified name, until its next change** (a payment received is enough), or until the history is filled from ledger 32570

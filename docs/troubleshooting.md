@@ -200,10 +200,19 @@ ranges`): `syncer_nft_dirty_ledgers` jumps by it and falls as the dirty sweep re
 (1) The account has no `domain` in the answer: its Domain was set before the state history starts and has not changed since, or the seed was not run
 ([backfill](backfill.md#account-domains-seed)). (2) The toml was not read yet: a new domain waits for the `tomls` worker (a 404 `toml not found`; `syncer_tomls_due`),
 and everything waits for the first sweep after a deploy. (3) The check failed: `GET /v2/toml/{domain}` says why in `reason` (a host that is down, a 404 on the file, a
-file that is not TOML, an integer above 2^53 anywhere in it) and a transient failure is tried again in an hour. (4) The toml does not list the address, or lists it for
-another network (an entry's `network` must be absent or one of the network's names), or its `desc` is over 64 characters (the domain is then the name). (5) The worker is
-off: `GH_DOMAIN_VERIFICATION=false`, `tomls` out of `GH_WORKERS`, or no outbound HTTPS (`syncer_tomls_checks_total` full of `dns_error`, `connect_error` or `timeout`). (6) The api
-has not loaded the toml directory (`Could not load the toml directory, keeping the last one`): no domain is a name until it has ([operations](operations.md#the-display-names)).
+file that is not TOML, an integer above 2^53 anywhere in it); a transient failure keeps the names and is tried again hourly up to 24 hours after the re-read it
+missed, then backs off 1, 2, 4 and 7 days, as a definite one does. (4) The toml does not list the address, or lists it for another network (an entry's `network` must
+be absent or one of the network's names), or its `desc` is over 64 characters or holds an `@` (the domain is then the name). (5) The worker never filled the store:
+`GH_DOMAIN_VERIFICATION=false` or `tomls` out of `GH_WORKERS` from the start, or no outbound HTTPS (`syncer_tomls_checks_total` full of `dns_error`, `connect_error` or
+`timeout`). A worker turned off **after** it ran does not do this: its rows keep verifying names (below). (6) An answer with **no** `display_name` for an account with a
+domain (not even `kind: "domain"`) is one whose read of `domain_tomls` failed (`Could not read the tomls of the account domains, no domain is a name in this answer`, a
+`warn` of the api): the next call reads it again ([operations](operations.md#the-display-names)).
+
+### A verified name stays although the `tomls` worker is off, or the domain dropped the account
+The api uses what the store holds as it is: with the worker off (`GH_DOMAIN_VERIFICATION=false`, `tomls` out of `GH_WORKERS`) the rows of its last checks stay, and
+the names they verify stay, **without limit**, also for a domain whose toml has dropped the account since. To withdraw them, `TRUNCATE TABLE <network>.domain_tomls`
+(the worker fills it again when it is switched back on; the api keeps an answer at most 60 s). `GET /v2/toml/{domain}` likewise answers the last row of a domain no
+account names any more: the store keeps every domain it checked ([operations](operations.md#the-display-names)).
 
 ### Syncer refuses to boot: `lacks the schema of 012_display_names.sql`
 The `tomls` worker is enabled and the database does not have `account_domains` and `domain_tomls`. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer

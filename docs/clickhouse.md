@@ -201,9 +201,10 @@ tables that must agree**, so retention is never per table:
 - Partition sizes differ: `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales` and `nft_touches` are partitioned per **1,000,000** ledgers (P6), the other twenty-one ledger-keyed tables per **10,000,000** (P7),
   and `accounts_created` is not partitioned.
 
-The safe procedure drops **one 10,000,000-ledger block from all 29 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`
-(`ledgers` first, the commit marker), partition `k` of the twenty-one P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`; the exact commands are in
-[operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair
+The safe procedure drops **one 10,000,000-ledger block from 28 of the 29 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`
+(`ledgers` first, the commit marker), partition `k` of twenty of the twenty-one P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`. `account_domains` is kept:
+it holds about one row per account and partition, and dropping a partition would forget the domain of every account unchanged since that block, which the seed
+cannot bring back (its block of `account_states` is dropped too). The exact commands are in [operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair
 a partial loss use `range-ingest --reprocess` over exactly the damaged range. Dropping a block makes lists in that window empty.
 
 Five tables expire by TTL, none of them a ledger table, so no ledger retention touches them:

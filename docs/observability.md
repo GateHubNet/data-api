@@ -161,7 +161,7 @@ Prefix `syncer_`.
 | `syncer_validator_validations_flushed_total` | Counter | `table` | Rows written to `validator_validations` and `validator_seen` |
 | `syncer_tomls_checks_total` | Counter | `outcome` | Checks of the toml of a domain an account names, `ok` or the reason code of the failure (`dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid`, `toml_invalid`), counted when the check's row is written |
 | **`syncer_tomls_domains`** | Gauge | `status` | After each pass of the `tomls` worker, the domains accounts name by the state of their toml: `ok` (the last check read it), `failed` (the last check did not) and `unchecked` (never checked) |
-| **`syncer_tomls_due`** | Gauge | | Domains due and not checked yet at the end of the last pass: the backlog (about 300 a minute are checked). Falls to 0 after the first sweep of a deployment |
+| **`syncer_tomls_due`** | Gauge | | Domains due and not checked yet at the end of the last pass: the backlog (about 300 a minute are checked, about 72 when every host times out). Falls to 0 after the first sweep of a deployment, which on a mainnet (tens of thousands of domains) takes hours |
 | **`syncer_tomls_discovery_seconds`** | Gauge | | Seconds the last read of the domains accounts name took (the whole of `account_domains`, every five minutes). Set when the read fails too |
 | `syncer_process_*`, `syncer_nodejs_*` | | | Default process metrics |
 
@@ -196,7 +196,7 @@ rate(api_rates_on_read_total[5m])                                   # rates work
 rate(syncer_validations_flushed_total[5m]) == 0                     # XRPL: validators validate every ledger
 syncer_validators_unl_expiry_seconds < 7 * 86400                    # a validator list expires within a week
 rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0        # a rounds or agreement run failed
-syncer_tomls_due                                                    # the backlog of tomls to read: falls to 0 after the first sweep; alert above 2000 for 2h
+syncer_tomls_due                                                    # the backlog of tomls to read: falls to 0 after the first sweep (hours on a mainnet); alert above 2000 for 2h
 syncer_tomls_discovery_seconds > 10                                 # the read of the domains accounts name outgrew its budget (alert for 30m)
 absent(syncer_tomls_domains)                                        # a tomls worker that never discovered a domain (alert where the worker runs)
 sum by (outcome) (rate(syncer_tomls_checks_total[1h]))              # what the checks come to: ok, or the reasons of the failures
@@ -273,7 +273,7 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | **Validator list expiring** | `syncer_validators_unl_expiry_seconds < 7 * 86400` | A publisher's list expires within a week (it already has when the value is negative; an expired list is still used, flagged `expired`): check the publisher |
 | Validator agreement behind | `syncer_validators_agreement_lag_seconds > 7200` for 30m | The agreement job has not finalised an hour for over two hours |
 | Voting rounds behind | `syncer_validators_rounds_lag_ledgers > 1024` for 30m | The rounds job is more than four flag intervals behind the committed ledgers |
-| **Tomls backlog** | `syncer_tomls_due > 2000` for 2h | The `tomls` worker cannot keep up with the domains accounts name, or is stuck: it checks at most 300 a minute, fewer when many hosts time out (16 lanes of up to 10 s). Look at `syncer_tomls_checks_total` (a rise of `timeout` or `dns_error`) and the `Toml checks: the pass failed` lines. Expected, and below the threshold in time, during the first sweep of a deployment |
+| **Tomls backlog** | `syncer_tomls_due > 2000` for 2h | The `tomls` worker cannot keep up with the domains accounts name, or is stuck: it checks at most 300 a minute, fewer when many hosts time out (a pass of 300 that all time out takes 16 lanes of 10 s, about 190 s, and the next starts 60 s later: about 72 a minute). Look at `syncer_tomls_checks_total` (a rise of `timeout` or `dns_error`) and the `Toml checks: the pass failed` lines. **It fires during the first sweep of a mainnet deployment** (tens of thousands of domains at 72 to 300 a minute take hours): silence it until `syncer_tomls_due` has fallen near 0 once |
 | **Tomls discovery slow** | `syncer_tomls_discovery_seconds > 10` for 30m | The read of the domains accounts name outgrew its budget (it reads the whole of `account_domains` every five minutes: under 2 s on a healthy table): the table has outgrown the read, or ClickHouse is loaded. Raise `TOML_DISCOVERY_INTERVAL_MS` in code or narrow the read; a read that keeps failing shows as `Toml discovery: the pass failed` |
 | Tomls never discovered | `absent(syncer_tomls_domains)` for 15m, on a syncer that runs the `tomls` worker with `GH_DOMAIN_VERIFICATION=true` | The worker never completed a discovery (ClickHouse refused the read, the table is missing): no pass is made until one works. The labelled gauge has no series before the first pass. Not to be alerted on a syncer without the worker or with `GH_DOMAIN_VERIFICATION=false` |
 | Validators jobs failing | `rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0` for 30m | Rounds or agreement not refreshing |

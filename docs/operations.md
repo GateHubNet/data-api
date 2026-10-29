@@ -338,8 +338,8 @@ dropping whole partitions, **but a ledger exists only if all its tables agree**:
 - A ledger that has a `ledgers` row but fewer stored transactions than its `tx_count` is answered with **500** by `/v2/ledgers/{id}` (and its hash list); lists of
   payments, exchanges and balance changes silently lose the rows whose tables were dropped.
 
-So never drop the partitions of one table alone. Drop **the same ledger range from all 29 ledger-derived tables**, in blocks aligned to the **10,000,000-ledger
-partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
+So never drop the partitions of one table alone. Drop **the same ledger range from 28 of the 29 ledger-derived tables, all but `account_domains`**, in blocks
+aligned to the **10,000,000-ledger partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
 is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledgers vanish from every list at once), then the children. For the block 80,000,000-89,999,999
 (P7 partition 8, P6 partitions 80-89) of the XRPL database:
 
@@ -350,11 +350,17 @@ for p in 80 81 82 83 84 85 86 87 88 89; do ch "ALTER TABLE xrpl.ledgers DROP PAR
 for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments amm_pool_touches path_payments nft_sales nft_touches; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
 for t in ledger_by_hash tx_by_hash tx_by_type account_transactions account_tx_by_sequence payments_by_currency account_payments exchanges account_exchanges balance_changes \
          amm_pool_states amm_liquidity account_amm_liquidity amm_governance account_states trust_line_states account_path_payments \
-         nft_events account_nft_events collection_nft_events account_domains; do
+         nft_events account_nft_events collection_nft_events; do
   ch "ALTER TABLE xrpl.$t DROP PARTITION 8"
 done
 ch "DELETE FROM xrpl.accounts_created WHERE ledger_index BETWEEN 80000000 AND 89999999"
 ```
+
+**`account_domains` is kept** (it is not in the loop). It holds the current Domain of an account in the row of the account's last change, and merges keep
+about one row per account and partition, so a partition is small and no route reads it per ledger. Dropping one would forget the domain of every account that
+has not changed since that block, until its next change, and nothing can bring it back: the [seed](backfill.md#account-domains-seed) reads `account_states`,
+whose rows of the block are dropped too. A `range-ingest` of the block later writes the same rows again (the same `version`), and `--reprocess` deletes and
+rewrites them as it does in every table.
 
 The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations`, the tables of the validators and amendments data (migration 002) and the account and market aggregates (migration 003) are independent: a dropped block reaches the aggregates only through `agg_dirty` when it is ingested again. A block dropped from the AMM tables and
 brought back by `range-ingest` marks `agg_dirty`, and the aggregator rebuilds the pools and days it covers.
@@ -686,7 +692,8 @@ labels of [above](#name-an-address), and a **verified name** where an account's 
 | --- | --- | --- | --- |
 | `account_domains`, written by the ingest (parser version 6) | with every ledger | a row for each change of an account that has a Domain | the [seed](backfill.md#account-domains-seed) fills it for the ledgers before the deploy |
 | The `tomls` worker of the syncer ([syncer](syncer.md#8a-the-tomls-worker)) | discovery every 5 minutes; a pass 60 s after the previous one, at most 300 domains, 16 at a time | a toml `ok` every 24 hours; `syncer_tomls_due` near 0 | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the `Tomls: ...` log lines |
-| The api's toml directory and names | loaded at start and every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s) | a toml read by the worker shows within a minute | `Could not load the toml directory, keeping the last one` (a `warn`) |
+| The api's names and labels | loaded at start and every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s) | a row the operator inserts shows within a minute | `Could not load the ...` (a `warn`) |
+| What the toml of an account's domain says of it | read by key at each call, for the distinct domains of the batch, kept 60 s per address | a toml read by the worker shows within a minute | `Could not read the tomls of the account domains, no domain is a name in this answer` (a `warn`: that answer has no `verified` and no `domain` kind) |
 | The account domain of an address | read at each call, kept 60 s per address | | a 500 `unable to retrieve account names` is a failed read of `account_domains` |
 
 **What the owner does to deploy** (per network, the sandbox first, then production; the order matters):
@@ -695,7 +702,7 @@ labels of [above](#name-an-address), and a **verified name** where an account's 
    without it.
 2. **Deploy the syncer** (parser version 6; the `tomls` worker is in the default `GH_WORKERS`, and **where `GH_WORKERS` is set explicitly add `tomls`**) **and the api.**
    The syncer needs **outbound HTTPS to every domain accounts name** ([deployment](deployment.md#outbound-network-access)): open the egress, or set
-   `GH_DOMAIN_VERIFICATION=false` (no toml is read, no name is verified, every domain shows as an unverified one).
+   `GH_DOMAIN_VERIFICATION=false` (no toml is read; on a store that is still empty no name is verified and every domain shows as an unverified one).
 3. **Run the seed once per network** ([backfill](backfill.md#account-domains-seed), 16 buckets): it gives every account its current Domain from the state
    history, which no reprocess does faster.
 4. **Wait for the first sweep**: `syncer_tomls_due` falls to near 0 (about 300 domains a minute, slower when many hosts time out; the number of domains is
@@ -708,17 +715,26 @@ labels of [above](#name-an-address), and a **verified name** where an account's 
 **No reprocess.** The ledgers written before the deploy get their domains from the seed. **Coverage:** an account whose Domain was set before the state
 history starts and whose root has not changed since has no domain, so no verified name, until it changes (a payment received is enough) or the history is filled
 and ingested again ([backfill](backfill.md#account-domains-seed)). To roll back, remove the routes or take `tomls` out of `GH_WORKERS`; `012` needs no undo.
+**After a rollback to the previous syncer, run the seed again when this one is deployed again**: the previous syncer (parser version 5) writes no
+`account_domains`, so the ledgers it wrote meanwhile have no rows, and `X` (the last ledger of an older parser) has moved to the last of them.
 
 - **A first sweep is slow, by design.** A mainnet names tens of thousands of domains; 300 a pass is about 300 a minute while the hosts answer. A host that is
-  down or slow keeps a lane for up to 10 s, 16 lanes at a time, so a sweep over many dead hosts is closer to 100 a minute.
-- **A domain is read once a day** (`GH_TOML_RECHECK_MS`), a failed one on its own schedule (an hour for a transient failure, 1, 2, 4 and 7 days for a definite one),
-  and **at once** (at most hourly) when more accounts name it than at the last discovery: an account that sets its Domain is verified within minutes. A host
-  that blips keeps its names for 24 hours.
+  down or slow keeps a lane for up to 10 s, 16 lanes at a time, and the next pass starts 60 s after one ends, so a sweep over many dead hosts is about 72 a
+  minute. The backlog alert fires during it on a mainnet ([observability](observability.md#recommended-alerts)): silence it until `syncer_tomls_due` is near 0 once.
+- **A domain is read once a day** (`GH_TOML_RECHECK_MS`), a failed one on its own schedule, and **at once** (at most hourly) when more accounts name it than at
+  the last discovery: an account that sets its Domain is verified within minutes. A transient failure (a name that does not resolve, a timeout, a 5xx) keeps
+  the content and is retried hourly **up to 24 hours after the re-read it missed** (48 hours after the read at the default recheck): a host that blips at its
+  daily re-read keeps its names. Once nothing is carried, it backs off 1, 2, 4, then 7 days, as a definite failure (a 404, a file that is not TOML) does from
+  the start: a dead host is asked once a week, and one that comes back after a long outage is read again up to 7 days later.
 - **A name does not appear.** Check, in order: the account's domain (`GET /v2/account_names` has a `domain` key); the toml (`GET /v2/toml/{domain}`: 404 means it was
   never checked, `status: "failed"` says why); that the toml lists the address under `[[ACCOUNTS]]` with no `network` or one of this network's names; that the `desc`
-  is at most 64 characters (a longer one gives the domain as the name). A toml with an integer above 2^53 anywhere in it fails whole (`toml_invalid`).
-- **Everything shows as an unverified domain.** The worker is off (`GH_DOMAIN_VERIFICATION=false`, or `tomls` out of `GH_WORKERS`), has no egress (`syncer_tomls_checks_total`
-  full of `dns_error`, `connect_error` and `timeout`), or the api has not loaded the toml directory (the `warn` above, and then no domain is a name at all).
+  is at most 64 characters and holds no `@` (else the domain is the name). A toml with an integer above 2^53 anywhere in it fails whole (`toml_invalid`).
+- **Everything shows as an unverified domain.** The store is empty and the worker is off (`GH_DOMAIN_VERIFICATION=false`, or `tomls` out of `GH_WORKERS`), or it
+  has no egress (`syncer_tomls_checks_total` full of `dns_error`, `connect_error` and `timeout`: the names go 24 hours after each missed re-read). When the api
+  cannot read `domain_tomls` at all (the `warn` above), no domain is a name, verified or not, and the names and labels are served all the same.
+- **The worker is off, and names are still verified.** Turning the worker off after it has run does not withdraw anything: the stored rows stay, and the api
+  verifies names from them **without limit**, as they were at the last read, a domain that has dropped an account since included. To withdraw the verified
+  names, `TRUNCATE TABLE xrpl.domain_tomls` (per network; the worker fills it again when it is switched back on).
 - **A host to block.** The worker fetches any host an account names: nothing is configurable per host. `GH_DOMAIN_VERIFICATION=false` is the switch, and egress filtering at the
   network is the second line ([security](security.md#outbound-https-to-arbitrary-public-hosts-syncer)).
 
@@ -733,7 +749,10 @@ SELECT checked_at, status, reason, status_code, failures, next_check_at FROM xrp
 SELECT count() FROM (SELECT account, argMax(domain_hex, version) AS h, argMax(deleted, version) AS gone FROM xrpl.account_domains GROUP BY account) WHERE h != '' AND gone = 0;
 ```
 
-`domain_tomls` has one row per check, and merges keep the newest row of a domain; it is small (rows of the domains accounts name). `account_domains` is ordered by
+`domain_tomls` has one row per check, and merges keep the newest row of a domain. **It keeps the row of every domain ever checked**, also of a domain no account
+names any more: the worker does not check it again, and `GET /v2/toml/{domain}` answers its last row. So it grows with the churn of Domains (anyone can set one),
+by at most about 300 checks a minute, and nothing removes those rows yet (left to the validator toml details, D8, or a follow-up). The api reads it by key only,
+per request: its size costs disk and the worker's schedule read, not the api's memory. `account_domains` is ordered by
 account, so merges keep about one row per account and partition ([data-model](data-model.md#account_domains-p7-order-by-account-migration-012)).
 
 ## Backfill and repair

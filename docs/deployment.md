@@ -118,8 +118,9 @@ function takes the env file of the host). The sandbox needs its own values for `
   - the **domains accounts name** (the `tomls` worker): `https://<domain>/.well-known/xrp-ledger.toml` (Xahau and its testnet: `xahau.toml`) for every domain
     an account's `Domain` field names, once a day, 16 at a time at most. That is **tens of thousands of hosts** on a mainnet, chosen by whoever sets a Domain,
     so a hostname allowlist is impossible here too. A host that cannot reach arbitrary sites sets **`GH_DOMAIN_VERIFICATION=false`**, which switches this worker
-    off as well as the validators' checks: no toml is read, no account is `verified`, and every account that names a domain shows it as an unverified domain
-    (`kind: "domain"`). Keeping the worker on needs the egress above and nothing else (it needs no node).
+    off as well as the validators' checks: no toml is read, and on a store still empty no account is `verified` and every account that names a domain shows it
+    as an unverified domain (`kind: "domain"`); a store the worker filled before keeps verifying names from its rows until it is emptied
+    ([operations](operations.md#the-display-names)). Keeping the worker on needs the egress above and nothing else (it needs no node).
   - A DNS resolver that answers A and AAAA queries (the fetch resolves names itself; `/etc/hosts` is not consulted).
 - The fetches ignore `HTTP_PROXY` / `HTTPS_PROXY`: reach the internet by NAT or a transparent egress, not through a proxy variable.
 - The syncer refuses, by itself, every host that resolves to a private, loopback, link-local, reserved or metadata address

@@ -65,7 +65,7 @@ The settings the ledger keeps on an account, such as RequireAuth, DisallowXRP or
 _Avoid_: labels, tags
 
 **Display name**:
-The name shown for an account instead of its address: its verified name, else its account name, else its unverified domain.
+The name shown for an account instead of its address: its verified name, else its account name, else its account network name, else its unverified domain.
 _Avoid_: label, alias, tag
 
 **Verified name**:

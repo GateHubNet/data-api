@@ -1000,7 +1000,9 @@ domain vouches for (`verified` names, [api-reference](api-reference.md#account-n
 Its design is in the [display names spec](superpowers/specs/2026-10-24-display-names-design.md), section 4, and the decision in
 [ADR-0017](adr/0017-display-names.md). It needs ClickHouse and outbound HTTPS, **not the node** (`NODE_CLIENT_WORKERS` does not list it), and is switched on
 and off with `GH_WORKERS` (the default has it). With `GH_DOMAIN_VERIFICATION=false` it starts and logs once `Toml checks are off (GH_DOMAIN_VERIFICATION=false):
-no toml is read`; it reads nothing, and `domain_tomls` stays as it is (empty on a new deployment, where every domain then shows as kind `domain`). A boot without migration `012_display_names.sql`
+no toml is read`; it reads nothing, and `domain_tomls` stays as it is. On a new deployment it is empty, and every domain shows as kind `domain`; **after the
+worker has run, the stored rows stay and the api keeps verifying names from them, without limit** (a reader uses the content as it is): to withdraw the
+verified names, `TRUNCATE TABLE domain_tomls` ([operations](operations.md#the-display-names)). A boot without migration `012_display_names.sql`
 fails with a message that names the file ([section 1](#1-boot)).
 
 **Two loops**, each a `PassLoop` that waits for a pass to end before it starts the next:
@@ -1051,8 +1053,9 @@ when it fails** (a read that outgrows its limits fails rather than slows).
 4. **Write** the rows in batches of `TOML_WRITE_BATCH` = **50** and at the end of the pass (300 tiny inserts a minute would make parts). A check whose row was
    not written is still due.
 
-A **first sweep** after the deploy is the backlog: about 300 domains a minute, 16 lanes of up to 10 s each at the worst (96 a minute when every host times out).
-`syncer_tomls_due` shows it.
+A **first sweep** after the deploy is the backlog: about 300 domains a minute, slower when many hosts time out (when every one does, a pass of 300 takes
+16 lanes of 10 s, about 190 s, and the next starts 60 s after it: about **72 a minute**). `syncer_tomls_due` shows it; on a mainnet, with tens of thousands of
+domains, it stays above the alert's 2,000 for hours ([observability](observability.md#recommended-alerts)): silence that alert during the first sweep.
 
 ### The row of a check
 
@@ -1061,12 +1064,16 @@ One row per check (`ReplacingMergeTree(checked_at)`): the newest row of a domain
 | Check | `status`, `reason` | Content, `fetched_at` | `failures` | `next_check_at` |
 | --- | --- | --- | --- | --- |
 | Read as TOML | `ok`, `''` | from the file, now | 0 | now + `GH_TOML_RECHECK_MS` (24 h) |
-| **Transient**: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | `failed`, the reason (and the status code) | the previous row's, when it was fetched at most 24 h ago (`DOMAIN_VERIFIED_GRACE_S`), else none and `fetched_at` NULL | previous + 1 | now + 1 h |
+| **Transient**: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | `failed`, the reason (and the status code) | the previous row's, when it was fetched at most `GH_TOML_RECHECK_MS` and 24 h ago (`DOMAIN_VERIFIED_GRACE_S`), else none and `fetched_at` NULL | previous + 1 | while the content is carried, now + 1 h; else as a definite failure, 1, 2, 4, then 7 days, counted from the first failure that carried none |
 | **Definite**: any other `http_status` (4xx), `toml_invalid`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid` | `failed`, the reason (and the status code) | none, `fetched_at` NULL | previous + 1 | now + min(24 h x 2^(failures - 1), 7 days): 1, 2, 4, then 7 days |
 
 `failures` counts the failed checks in a row, up to 65,535 (a UInt16), and is 0 exactly when the newest row is `ok`: it is how `syncer_tomls_domains` tells `ok`
-from `failed` without another column. The 24 hours are the grace of the validators' domain checks: a website that blips keeps its names. **A transient failure never
-backs off**: a host that never resolves or never answers is asked again every hour, for ever; only a definite failure backs off to 7 days.
+from `failed` without another column. The 24 hours are the grace of the validators' domain checks, counted **from the re-read the failure missed**: an `ok`
+row is read again `GH_TOML_RECHECK_MS` after its read, so a website that blips at that re-read keeps its names for 24 hours more (48 hours after the read
+at the default recheck). **A transient failure backs off once it carries nothing**: hourly while the content is carried, then 1, 2, 4 and 7 days, as a
+definite failure (the wait of the row before tells the step, since `failures` also counts the hourly checks); a domain never read that fails waits a day
+too. A host that never resolves or never answers so costs a lane of the 16 once a week, not once an hour; a domain named anew is still checked at most
+hourly, and one that comes back after a long outage is read again up to 7 days later.
 
 ### What is never done
 
@@ -1147,7 +1154,7 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `apps/syncer/src/tomls/*` | The tomls worker: `domain-discovery` (which domains accounts name), `toml-checker` (the pass: due order, the fetches, the batched writes), `toml-row` (`nextTomlRow`, the row of a check), `tomls-worker` (the two loops), `tomls.module` |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
-| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`) |, the Domain of an account (`account-domains.parser.ts`)
+| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`), the Domain of an account (`account-domains.parser.ts`) |
 | `packages/shared/src/aggregate/{stats,volume,amm-pools,amm-daily}.job.ts`, `aggregate/amm-reads.ts`, `query/rates.service.ts` | Aggregation and rates (`amm-reads.ts` holds the reads the AMM jobs share) |
 | `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
 | `apps/syncer/src/aggregator/{nft-state,nft-collections}.job-runner.ts` | The two NFT jobs ([the NFT jobs](#the-nft-jobs)) |

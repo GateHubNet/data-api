@@ -3371,10 +3371,11 @@ objects, whose shape and key order are ours and are pinned by tests:
   it, once a day (a failed one on its own schedule, [syncer](syncer.md#8a-the-tomls-worker)), and a toml's text is parsed, never evaluated, and
   nothing a toml holds (an icon, an attestation link, a `unl` URL) is ever followed. A **new** domain shows `domain`, not `verified`, until the
   worker has read its toml (minutes after the account first names it, hours when the worker has a backlog).
-- **Freshness.** The names and labels are the sets of ADR-0014, reloaded every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s); so is the *toml
-  directory*, what every stored toml says of its accounts, which the api loads when it starts and with the names. The account domain is read
-  from `account_domains` at each call and kept 60 s per address. Until the api has loaded the directory once, no address is `verified` and no
-  domain is a name (unknown is not "not verified"): the names and labels are served as always.
+- **Freshness.** The names and labels are the sets of ADR-0014, reloaded every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s). The account domain is read
+  from `account_domains` at each call, and what the toml of that domain says of the address from `domain_tomls` (the newest row of each distinct
+  domain of the call, by key, only the entries of the addresses asked); each is kept 60 s per address, so a toml the worker reads shows within a
+  minute. When `domain_tomls` cannot be read, that answer has no `verified` and no `domain` name (unknown is not "not verified"): the names, the
+  labels and `domain` are served as always, and the next call reads it again. When `account_domains` cannot be read, the call is a 500.
 - **Coverage.** Neither route carries a `coverage` key (a lookup that lists nothing: [Coverage](#coverage)). The domains come from the account
   history the parsers wrote, so **an account whose `Domain` was set before the state history starts and whose root has not changed since has no
   account domain**, and so no verified name, until it changes (a payment received is enough) or the history is filled and ingested again
@@ -3482,8 +3483,10 @@ the `tomls` worker stored (kept 60 s in the api, a domain with no row too).
 | `domain` (path) | required | A domain as an account names it, `northpeak.example`. The case does not matter: it is lower-cased, and then must be a properly formed domain. |
 
 Errors, in the order they are checked: 400 `invalid domain` (not properly formed once lower-cased: a URL, a path, a port, an IP address, a single
-label such as `localhost`, an underscore, more than 128 characters); 404 `toml not found` (the store has no row for the domain: no account names it,
-or it has not been checked yet); 500 `unable to retrieve toml`. A domain whose last check failed is **not** a 404: it answers with `status: "failed"`.
+label such as `localhost`, an underscore, more than 128 characters); 404 `toml not found` (the store has no row for the domain: it was never checked,
+because no account named it while the worker ran, or its first check has not run yet); 500 `unable to retrieve toml`. A domain whose last check failed is
+**not** a 404: it answers with `status: "failed"`. Nor is a domain no account names any more: the store keeps the row of every domain it checked, and
+the answer is its last check, however old (`checked` says when).
 
 A domain whose toml was read (`GET /v2/toml/northpeak.example`):
 
@@ -3517,7 +3520,7 @@ A domain whose toml was read (`GET /v2/toml/northpeak.example`):
 }
 ```
 
-A check that failed, an hour after the toml of `blip.example` was read (a transient failure, within the 24 hours of grace): the answer says what failed
+A check that failed, an hour after the toml of `blip.example` was read (a transient failure, within its grace): the answer says what failed
 and still carries what the last read said (`GET /v2/toml/blip.example`):
 
 ```json
@@ -3570,23 +3573,27 @@ What the fields say:
   `redirect_rejected`, `blocked_address` (the host resolves to a private address), `domain_invalid`, or `toml_invalid` (the file is not TOML).
 - **`checked`** is when the domain was last checked and **`fetched`** when the content was read (an instant of receipt,
   `YYYY-MM-DDTHH:mm:ss.SSSZ`); `fetched` is left out when the toml has no content in effect. The content is what the last *good* read said, **in
-  effect for 24 hours** after a transient failure; after a definite failure (a 404, a file that is not TOML, a file that is too large, a redirect to
-  a bad place, a private address) or after the 24 hours it is gone, and the lists are left out.
+  effect after a transient failure until 24 hours after the re-read it missed** (a toml read OK is read again a day later, so up to 48 hours after
+  `fetched`); after a definite failure (a 404, a file that is not TOML, a file that is too large, a redirect to a bad place, a private address) or
+  after that grace it is gone, and the lists are left out.
 - **`modified`** and **`expires`** are wall times (`YYYY-MM-DDTHH:mm:ssZ`) from `[METADATA]`, in any form TOML or ISO writes a date (an offset
   date-time, a local date-time read as UTC, a local date). `modified` is left out when the file gives none, a date before 2012-01-01 or more than a day
   after the fetch. `expires` is kept whatever its value (an expired date is served as it is, and nothing is done with it), and a date outside 1970 to
   2106 is no date.
-- **`accounts`** are the `[[ACCOUNTS]]` entries that count on this network, in file order: classic addresses with a valid checksum, a repeated address
-  once, at most 1,000. `desc` is the entry's description cleaned (below) and left out when there is none or it is over 256 characters.
+- **`accounts`** are the `[[ACCOUNTS]]` entries that count on this network, in file order: classic addresses with a valid checksum, an address once per
+  `network` (its first entry; so an address listed for a test network first keeps its entry for this one), at most 1,000. `desc` is the entry's
+  description cleaned (below) and left out when there is none, it is over 256 characters, or it holds an `@` (an email is no name).
 - **`currencies`** are the `[[CURRENCIES]]` entries that count, at most 200: `code` (1 to 40 characters), `issuer` when it is a classic address,
   `display_decimals` when the file gives an integer from 0 to 30, and the text of `symbol`, `name` and `desc`. The other keys of an entry (an icon, an
-  attestation link, a custom key) stay in the store and are not served.
+  attestation link, a custom key) stay in the store and are not served; a key that names an email or a social account (`contact_email`, `twitter`, `x`,
+  `telegram`, `support_handle`, ...) and a text that holds an `@` are not even stored.
 - **`principals`** are the names of the `[[PRINCIPALS]]` (at most 100 characters each, ten of them, no repeat), and **nothing else of a principal**: an
   email and the social handles are never read, and a principal whose name holds an `@` is dropped.
 - **`validators`** are the `[[VALIDATORS]]` entries that count, at most 100: `public_key`, and the text of `owner_country`, `server_country` and `unl`
   (the URL of a list, text and never followed). **`[[SERVERS]]` and `[ORGANIZATION]` are never read.**
-- **Text is cleaned.** Every text of a toml is put in Unicode normal form C, loses its control characters and its bidirectional overrides and
-  isolates (so that a name cannot render as another), has each run of white space made one space, and is trimmed; a text over its cap is dropped, not cut.
+- **Text is cleaned.** Every text of a toml loses its control and format characters, its bidirectional overrides and isolates among them (so that a
+  name cannot render as another), is then put in Unicode normal form C, has each run of white space made one space, and is trimmed; a text over its cap is
+  dropped, not cut.
 - **A file that is not valid TOML is `toml_invalid`, and one custom key can make it so**: the parser (`smol-toml`) refuses an integer it cannot hold
   exactly (above 2^53 - 1 or below its negative), so `max_supply = 100000000000000000` anywhere in the file fails the whole file, and the domain shows
   `failed` with no content. Write such a number as text or as a float.

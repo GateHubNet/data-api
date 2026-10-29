@@ -32,10 +32,11 @@ export class TomlController {
     description:
       "What the toml file of a domain says, as the last check of it stored: the accounts it lists, the currencies, the principals' " +
       'names and the validators, only the entries that count on this network (no network, or a name of it). `status` is `ok` ' +
-      '(the file was read) or `failed`, with the `reason` and, for `http_status`, the `status_code`; a failed toml within 24 hours of ' +
-      'its last read still carries what that read said, one after a definite failure carries nothing but the check. `checked` is ' +
-      'when the domain was last checked, `fetched` when the content was read. Emails and social handles are never served. A key ' +
-      'without a value is left out. 404 when the domain has not been checked (no account names it, or the check has not run yet).',
+      '(the file was read) or `failed`, with the `reason` and, for `http_status`, the `status_code`; a toml that failed transiently ' +
+      'still carries what its last read said until 24 hours after the re-read it missed, one after a definite failure carries nothing ' +
+      'but the check. `checked` is when the domain was last checked, `fetched` when the content was read. Emails and social handles ' +
+      'are never served. A key without a value is left out. 404 when the domain was never checked (no account named it while the ' +
+      'worker ran, or its first check has not run yet); a domain no account names any more answers its last check.',
   })
   @ApiParam({
     name: 'domain',

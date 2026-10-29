@@ -21,7 +21,7 @@ PR #20, `feat/account-investigation-data`).
 | 3 | An `[[ACCOUNTS]]` entry counts on a network when its `network` is absent or one of the network's names (XRPL `main`, `mainnet`; Xahau `main`, `mainnet`, `xahau`, `21337`; the testnets' from D-env). | Accept |
 | 4 | The verified name is the entry's `desc` cleaned (`cleanTomlText`); a `desc` longer than 64 characters is not a name and the domain is used instead (nothing is cut). A `desc` can claim any name, so `domain` is always in the answer and the explorer shows it on hover. | Accept |
 | 5 | An account network name without an account name is the display name (kind `account`); the settled order has no slot for it otherwise. | Accept |
-| 6 | Re-checks: a toml read OK, after 24 h; a domain more accounts name than at its last check, at once (at most hourly); a transient failure (DNS, connect, TLS, timeout, 5xx, 429), after 1 h, the last good content kept 24 h; a definite failure, after 1, 2, 4, then 7 days. | Accept |
+| 6 | Re-checks: a toml read OK, after 24 h; a domain more accounts name than at its last check, at once (at most hourly); a transient failure (DNS, connect, TLS, timeout, 5xx, 429), after 1 h, the last good content kept 24 h; a definite failure, after 1, 2, 4, then 7 days. *Amended by the final review (2026-10-29):* the 24 h of content run from the re-read the failure missed (while `now − fetched_at ≤ GH_TOML_RECHECK_MS + 24 h`), and a transient failure is hourly only while it carries content, then backs off 1, 2, 4, then 7 days like a definite one (4.4). | Accept |
 | 7 | Current domains come from a new ledger-derived table, `account_domains`, that keeps the newest row of each account (`ReplacingMergeTree(version)` ordered by account): a deliberate exception to ADR-0007's unique-key rule, safe because every deleted ledger is rewritten. A one-off SQL seed from `account_states` fills it for the ledgers PR #20's parsers wrote: no re-ingest. | Accept |
 | 8 | Coverage: an account whose Domain was set before the state history starts and whose root has not changed since has no domain (so no verified name) until it changes or the history is complete (ADR-0015). The names answer carries no `coverage`. | Accept |
 | 9 | The toml store keeps `[[ACCOUNTS]]`, `[[CURRENCIES]]`, `[[VALIDATORS]]`, `[[PRINCIPALS]]` names and `[METADATA]` `modified`/`expires`; never a principal's email or social handle, never `[[SERVERS]]` or `[ORGANIZATION]`; `expires` is kept, not acted on. Nothing in a toml is ever fetched. | Accept |
@@ -29,7 +29,7 @@ PR #20, `feat/account-investigation-data`).
 | 11 | The batch answers each requested address at its place: a repeated address is answered twice and counts towards the 100; an X-address is refused (400 `invalid ripple address`). | Accept |
 | 12 | The batch's key is `labels` (the program's contract) where `/v2/accounts/{address}` says `account_labels`; the object is the same. | Accept |
 | 13 | One new ADR for D4 (number by the plan) that amends ADR-0014 (a lookup endpoint after all) and gives ADR-0012's safe fetcher its second user; ADR-0014's status line says so. | Accept |
-| 14 | Until an api has loaded the toml directory once, a domain gives no display name (unknown is not "not verified"); a failed `account_domains` read fails the batch (500) rather than answer without domains. | Accept |
+| 14 | Until an api has loaded the toml directory once, a domain gives no display name (unknown is not "not verified"); a failed `account_domains` read fails the batch (500) rather than answer without domains. *Amended by the final review (2026-10-29):* there is no directory (an in-memory copy of every stored toml let anyone grow every replica's memory); the batch reads the tomls of its domains by key, and an answer whose `domain_tomls` read failed gives no `verified` and no `domain` kind (5.3). | Accept |
 
 ## Goal
 
@@ -129,7 +129,8 @@ ORDER BY domain;
   `connect_error`, `tls_error`, `timeout`, `http_status`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid`) or
   `toml_invalid`; `status_code` the HTTP status of an `http_status`, else 0. `failures` counts consecutive failed checks.
 - **The content** (`modified` to `principals`) is what the domain's toml says **in effect**: read at `fetched_at`; carried over by a
-  transient failure within 24 h of `fetched_at`; empty, with `fetched_at` NULL, otherwise (4.4). A reader uses the content as it is.
+  transient failure while `fetched_at` is at most `GH_TOML_RECHECK_MS` and 24 h old (24 h after the missed re-read); empty, with `fetched_at` NULL,
+  otherwise (4.4). A reader uses the content as it is: a row stays in effect, and keeps verifying names, until a later check replaces it (11).
 - `fields` is the JSON object text of an entry's other scalar keys (3.3), for D6 and D8; `network` is the entry's `network` as
   written (a string trimmed and lower-cased, or an integer as its decimal text: Xahau files may write `network = 21337` bare), `''`
   when absent or of another type. Entries of every network are kept; readers filter (3.4).
@@ -143,7 +144,7 @@ ORDER BY domain;
   `GH_TOML_RECHECK_MS` (default `86400000`, 24 h, at least 1): when a toml read OK is read again. Shared with D1:
   `GH_DOMAIN_VERIFICATION` (`false`: the worker starts, logs once that it is off, and checks nothing) and
   `GH_DOMAIN_FETCH_TIMEOUT_MS` (10 s). Fixed in code: the cadences and limits of section 4.
-- API: nothing new. `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s) also reloads the toml directory (5.3).
+- API: nothing new. `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s) reloads the names and labels only: the tomls are read by key per request (5.3).
 
 ## 3. Parsing
 
@@ -188,26 +189,29 @@ only these keys and returns the row's content:
 
 | Section | Kept | Rule |
 |---|---|---|
-| `[[ACCOUNTS]]` | `address`, `network`, `desc` | `address` a classic address with a valid checksum (X-address, bad checksum, non-text: skipped); `desc` through `cleanTomlText(desc, 256)`, `''` when absent or longer; a repeated address keeps its first entry; at most 1,000 entries, in file order |
+| `[[ACCOUNTS]]` | `address`, `network`, `desc` | `address` a classic address with a valid checksum (X-address, bad checksum, non-text: skipped); `desc` through `cleanTomlText(desc, 256)`, `''` when absent, longer, or holding an `@` (an email is no name); a repeated (address, `network`) keeps its first entry, so an address listed for a test network before this one keeps both; at most 1,000 entries, in file order |
 | `[[CURRENCIES]]` | `code`, `issuer`, `network`, `fields` | `code` through `cleanTomlText(code, 40)`, entry skipped without one; `issuer` when a classic address with a valid checksum, else `''`; at most 200 |
 | `[[VALIDATORS]]` | `public_key`, `network`, `fields` | `public_key` through `cleanTomlText(value, 128)`, entry skipped without one; at most 100 |
 | `[[PRINCIPALS]]` | `name` only | `cleanTomlText(name, 100)`, dropped when it contains `@`, without repeats, in file order, at most 10. `email`, `social_*` and every other key are never read |
 | `[METADATA]` | `modified`, `expires` | an offset date-time (its instant), a local date-time (read as UTC), a local date (00:00 UTC), or text in one of those ISO forms; `modified` dropped when before 2012-01-01 or more than a day after the fetch (D8's rule) |
 
-- `fields`: the entry's other keys whose value is a string (through `cleanTomlText(value, 256)`), a finite number or a boolean, at most
-  16 keys matching `^[A-Za-z0-9_]{1,32}$`, in file order, as JSON text (`{}` when none). For currencies these are `display_decimals`,
+- `fields`: the entry's other keys whose value is a string (through `cleanTomlText(value, 256)`, and none that holds an `@`), a finite number or a
+  boolean, at most 16 keys matching `^[A-Za-z0-9_]{1,32}$`, in the parsed object's order, as JSON text (`{}` when none). A key whose lower-cased name is
+  `x`, or holds `email`, `mail`, `twitter`, `github`, `telegram`, `discord`, `facebook`, `linkedin`, `instagram`, `reddit`, `keybase`, `youtube`,
+  `tiktok`, `contact` or `handle`, is never kept, whatever its value (12); a skipped key takes no place of the 16. For currencies these are `display_decimals`,
   `symbol` and the custom keys issuers use (`name`, `desc`, `asset_class`, `attestation`, `icon`, ...); for validators
   `owner_country`, `server_country`, `server_location`, `server_cloud`, `network_asn`, `unl`, `attestation`. They are text, never
   followed.
 - `cleanTomlText(value: unknown, max: number): string | undefined` (`packages/shared/src/tomls/toml-text.ts`, D8's §1.4 rule, made
-  here because D4 is built first): a string, NFC, characters of the categories Cc and Cf removed (controls, bidirectional overrides and
-  isolates), runs of white space one space, trimmed; `undefined` when empty or longer than `max` code points. Nothing is cut.
+  here because D4 is built first): a string, characters of the categories Cc and Cf removed (controls, bidirectional overrides and
+  isolates), then NFC (a format character between a letter and its accent would keep them from composing), runs of white space one space, trimmed;
+  `undefined` when empty or longer than `max` code points. Nothing is cut.
 - An unknown section, a key of another type, a nested table inside an entry: ignored. Custom keys never fail a file.
 
 ### 3.4 Which entries count on a network
 
 `countsOn(entryNetwork, profile)`: true when `entryNetwork` is `''` or in `profile.tomlNetworkNames`. Applied by every reader (the
-directory, `/v2/toml/{domain}`, D6, D8), never by the writer.
+display names, `/v2/toml/{domain}`, D6, D8), never by the writer.
 
 ## 4. The `tomls` worker
 
@@ -249,8 +253,9 @@ A pass every 60 s after the previous one ended (D1's `PassLoop`):
 4. **Writes**: rows are buffered and inserted in batches of 50 and at the end of the pass (300 tiny inserts a minute would make parts).
    `stop()` starts nothing more, waits for the fetches under way, and writes what is done; a check not written is still due.
 
-The first sweep after the deploy is the backlog: about 300 domains a minute, slower when many hosts time out (16 lanes × 6 a minute
-when every fetch takes the full 10 s). `syncer_tomls_due` shows it.
+The first sweep after the deploy is the backlog: about 300 domains a minute, slower when many hosts time out (a pass of 300 whose fetches all take
+the full 10 s lasts 16 lanes × 10 s, about 190 s, and the next starts 60 s later: about 72 a minute). `syncer_tomls_due` shows it; on a mainnet it
+stays above the 4.5 alert's threshold for hours, so that alert is silenced during the first sweep.
 
 ### 4.3 What is never done
 
@@ -264,10 +269,16 @@ principal. A blocked fetch (`blocked_address`) is one `warn` line per pass with 
 | Check | `status`, `reason`, `status_code` | Content, `fetched_at` | `failures` | `next_check_at` |
 |---|---|---|---|---|
 | Read as TOML | `ok`, `''`, 0 | from the file, now | 0 | now + `GH_TOML_RECHECK_MS` (24 h) |
-| Transient: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | `failed`, the reason, its code | `prev`'s when `prev.fetched_at` is at most 24 h old, else empty and NULL | `prev + 1` | now + 1 h |
+| Transient: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | `failed`, the reason, its code | `prev`'s when `now − prev.fetched_at ≤ recheckMs / 1000 + 24 h`, else empty and NULL | `prev + 1` | carried: now + 1 h; not: as a definite failure, 1, 2, 4, then 7 days, counted from the first failure that carried nothing (after a failure with no content, twice the days `prev` waited, `prev.next_check_at − prev.checked_at` rounded, at most 7; else a day) |
 | Definite: anything else (4xx but 429, `toml_invalid`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid`) | `failed`, the reason, its code | empty, NULL | `prev + 1` | now + min(24 h × 2^(failures − 1), 7 days): 1, 2, 4, then 7 days |
 
-The 24-hour grace is D1's (`DOMAIN_VERIFIED_GRACE_S`): a website that blips keeps its names. `recordToml(ch, { domain, tomlUrl,
+The 24-hour grace is D1's (`DOMAIN_VERIFIED_GRACE_S`), counted from the re-read the failure missed: an `ok` row is next checked `recheckMs`
+after its read, so with a grace counted from the read a blip at the daily re-read would always lose the names (D1 re-checks every 6 h against the
+same grace and does not have the problem). A website that blips keeps its names; a dead one keeps them up to 48 h at the default recheck. A
+transient failure is hourly only while it carries content: a host that never resolves or always times out would otherwise be asked every hour for
+ever, and about 5,000 of them, each holding a lane for 10 s, would take the 16 lanes. Once nothing is carried (and for a domain never read) it backs
+off as a definite failure; `failures` cannot tell the step, since it counts the hourly checks too, so the wait of `prev` does. A domain named anew is
+still checked at most hourly (4.2), and a host back after a long outage is read again up to 7 days late. `recordToml(ch, { domain, tomlUrl,
 text, fetchedAt, recheckMs, profile })` (`packages/shared/src/tomls/toml-store.ts`) is the `ok` row of a file in hand, read and
 inserted; it throws `TomlInvalidError` and writes nothing for a text that is not TOML. The worker uses it for its `ok` rows, and D8's
 validators checker calls it for the files it fetched (D8 §2.2).
@@ -288,14 +299,14 @@ Alerts (`docs/observability.md`): `syncer_tomls_due > 2000` for 2 h (the worker 
 
 ### 5.1 The rule: `displayNameOf` (`apps/api/src/names/display-name.ts`, pure)
 
-Given the account domain `D` (3.2 of the current `account_domains` row, if any), the toml directory's entry of `D` (5.3), the account
-name and the account network name:
+Given the account domain `D` (3.2 of the current `account_domains` row, if any), what the toml of `D` says of the address (its newest row,
+read by key, 5.3), the account name and the account network name:
 
 1. **`verified`**: `D` is set and its toml in effect lists the address under `[[ACCOUNTS]]` in an entry that counts on this network
    (3.4). `text` is the first such entry's `desc` when it is non-empty and at most 64 characters (decision 4), else `D`.
 2. **`account`**: the account name; else the account network name (decision 5).
-3. **`domain`**: `D` is set and the directory has loaded at least once (decision 14). Not listed, a failed toml, a toml not read yet:
-   all are "not verified", because nothing vouches for the domain.
+3. **`domain`**: `D` is set and the store was read for this answer (decision 14, as amended). Not listed, a failed toml, a toml not read yet:
+   all are "not verified", because nothing vouches for the domain. When the read of `domain_tomls` failed, `D` gives no display name.
 4. Otherwise none.
 
 The account names and labels are ADR-0014's in-memory sets, as served on `/v2/accounts/{address}`.
@@ -344,11 +355,18 @@ instance and one reload timer; `AccountsModule` imports it) and:
 - `AccountDomainsService.current(addresses)`: one read of `account_domains` for the distinct addresses,
   `SELECT account, argMax(domain_hex, version), argMax(deleted, version) … WHERE account IN {addresses:Array(String)} GROUP BY account`,
   each answer kept 60 s per address in `CacheService` so that only the misses are read.
-- `DomainTomlsService`: the **directory**, loaded at start and every 60 s with the names: the newest row of each domain
-  (`ORDER BY domain, checked_at DESC LIMIT 1 BY domain`) whose `accounts` is not empty, kept as `domain → Map<address, desc>` of the
-  entries that count on this network (first entry per address). A failed reload keeps the last directory (logged at `warn`); before the
-  first load `loaded` is false. And `get(domain)`: the newest row of one domain, read by key and kept 60 s (6.2, D6, D8).
-- `DisplayNamesService.of(addresses)`: the two reads above and the in-memory names, put together with `displayNameOf`.
+- `DomainTomlsService.listings(accounts)` (address → its account domain): after the account domains, one read by key of the newest row of the
+  batch's distinct account domains, keeping only the entries of the addresses asked:
+  `SELECT domain, arrayFilter(a -> has({addresses:Array(String)}, tupleElement(a, 'address')), accounts) AS listed FROM (SELECT domain, accounts FROM
+  domain_tomls WHERE domain IN {domains:Array(String)} ORDER BY domain, checked_at DESC LIMIT 1 BY domain)`; then `countsOn` and the first entry per
+  address, the address's own domain only (another domain's toml never vouches). Each answer is kept 60 s per (domain, address) in the names' cache, so
+  only the misses are read, and nothing when no address has a domain. A failed read rejects and keeps nothing. And `get(domain)`: the newest row of one
+  domain, read by key and kept 60 s (6.2, D6, D8). The api holds no copy of the store (as first designed it loaded a **directory** of every stored toml
+  every 60 s: stored content outlives the Domain that brought it in, so anyone could grow every replica's memory, and that read, for a few drops; final
+  review, 2026-10-29).
+- `DisplayNamesService.of(addresses)`: the two reads above and the in-memory names, put together with `displayNameOf`. A failed `account_domains` read
+  rejects (500); a failed `domain_tomls` read is logged at `warn` and gives that answer no `verified` and no `domain` kind (decision 14), the names,
+  labels and domains served as always.
 - `AccountNamesController` (`@RippleController('v2/account_names')`, `@RippleRoute('unable to retrieve account names')`) parses and
   answers; `account-names-object.ts` holds the key orders.
 
@@ -358,7 +376,8 @@ What the store says of one domain. The explorer's account page reads it for "How
 D6's token page may read it or the store directly (section 8).
 
 - `{domain}` is lower-cased; 400 `invalid domain` when it is not a properly formed domain then. 404 `toml not found` when the store has
-  no row (no account names it, or it has not been checked yet). 500 `unable to retrieve toml`.
+  no row (it was never checked: no account named it while the worker ran, or it has not been checked yet); a domain no account names any more still
+  answers 200 with its last row, since the store keeps every domain it checked. 500 `unable to retrieve toml`.
 - Only entries that count on this network are served, and only the fields below; `fields` stays in the store.
 
 ```json
@@ -390,14 +409,15 @@ D6's token page may read it or the store directly (section 8).
 
 | Read | Bound | Pinned by |
 |---|---|---|
-| Batch: `account_domains` by key, up to 100 accounts | at most one granule (1,024 rows) per address per part, plus one | `read_rows` e2e: 50,000 seeded accounts in four parts, 100 asked: `read_rows ≤ 100 × 4 × 1,024`; `EXPLAIN indexes = 1` shows the primary key condition |
-| `/v2/toml/{domain}`, `DomainTomlsService.get` | one granule per part | `read_rows` ≤ `index_granularity` × parts; EXPLAIN shows the key |
-| Directory reload (60 s per replica) | the whole of `domain_tomls`, three columns | `read_rows` = rows of the table; one read per reload |
+| Batch: `account_domains` by key, up to 100 accounts | at most one granule (1,024 rows) per address per part; ClickHouse folds a tail shorter than half a granule into the one before, so a key can read about 1.5 granules of a part | `read_rows` e2e: 800,000 rows in four parts (4 × 200,000, merges stopped), 100 asked: `read_rows ≤ 100 × 4 × 1,024 = 409,600` (measured 226,560); `EXPLAIN indexes = 1` shows the primary key condition |
+| Batch: `domain_tomls` by key, the distinct domains of the batch | one granule (8,192 rows) per domain per part (the same fold) | `read_rows` e2e: four parts of exactly 3 granules, two domains asked: `read_rows ≤ 2 × 4 × 8,192 = 65,536` (measured 32,768; a scan reads 98,304); EXPLAIN shows the key; no SELECT on `domain_tomls` at boot or in the reload intervals after it |
+| `/v2/toml/{domain}`, `DomainTomlsService.get` | one granule per part | `read_rows` ≤ `index_granularity` × parts over parts of exactly 3 granules; EXPLAIN shows the key |
 | Discovery (5 min, syncer) | the whole of `account_domains`, four columns | `read_rows` = rows of the table |
 | Pass: the schedule (60 s, syncer) | the whole of `domain_tomls`, four columns | `read_rows` = rows of the table |
 | Pass: the full rows of the domains checked | at most 300 domains by key | EXPLAIN shows the key |
 
-The batch's latency is that one keyed read (milliseconds) plus memory; the in-memory sets are ADR-0014's.
+The batch's latency is those two keyed reads (milliseconds) plus memory; the in-memory sets are ADR-0014's, and nothing of the toml store is held in
+memory but the 60 s answers of the requests.
 
 ## 8. What D6 and D8 read from the store
 
@@ -456,12 +476,13 @@ per network). The testnets (D-env) use the same files with `network = "testnet"`
 
 | Failure | Effect | Shows as |
 |---|---|---|
-| A domain's host is down or slow | Transient: re-checked hourly; names kept 24 h, then the domain is "not verified" | `domain_tomls.reason`; `syncer_tomls_checks_total` |
-| The `tomls` worker off, `GH_DOMAIN_VERIFICATION=false` or no egress | No toml is read: no verified names; domains show as kind `domain` | `syncer_tomls_due` growing (worker on), `/v2/toml` 404 |
+| A domain's host is down or slow | Transient: re-checked hourly; names kept until 24 h after the missed re-read, then the domain is "not verified" and it is re-checked after 1, 2, 4, then 7 days | `domain_tomls.reason`; `syncer_tomls_checks_total` |
+| The `tomls` worker off, `GH_DOMAIN_VERIFICATION=false` or no egress, on an empty store | No toml is read: no verified names; domains show as kind `domain` | `syncer_tomls_due` growing (worker on), `/v2/toml` 404 |
+| The worker turned off after it ran | The stored rows stay in effect: the names they verify stay, without limit, a domain that dropped an account since included. To withdraw them, `TRUNCATE TABLE domain_tomls` (no reader-side age bound; the owner may ask for one) | `checked` of `/v2/toml/{domain}` grows old |
 | The worker behind (first sweep) | New domains show "not verified" until checked | `syncer_tomls_due` |
-| The directory fails to load at boot | No `verified` and no `domain` kinds (decision 14); names and labels unchanged | api `warn` log |
-| A directory reload fails later | The last directory stays | api `warn` log |
+| `domain_tomls` read fails (api) | That answer has no `verified` and no `domain` kinds (decision 14); names, labels and domains unchanged; nothing is kept, the next call reads again | api `warn` log |
 | `account_domains` read fails | The batch answers 500 `unable to retrieve account names` | API 5xx; the explorer shows addresses |
+| Domains churn (an account changes its Domain often) | Every domain checked keeps its row for ever, also when no account names it any more (`/v2/toml` answers it): disk grows, by at most ~300 checks a minute; the api reads by key, so its memory does not. Store hygiene is left to D8 or a follow-up (blanking undiscovered domains would erase D8's validator-only ones, 4.1) | `domain_tomls` row count |
 | A domain changes its toml to drop an account | Not verified at the next check (≤ 24 h; at once if another account names it anew) | |
 | A hostile toml (huge, deep, many entries, control characters) | Capped by the fetcher (256 KiB), the parser (`toml_invalid`), the caps and `cleanTomlText` | |
 
@@ -471,8 +492,13 @@ per network). The testnets (D-env) use the same files with `network = "testnet"`
   pinned DNS, https and 443, 3 checked redirects, 256 KiB, 10 s, no cookies, fixed `User-Agent`). Anyone can set a Domain, so anyone
   can make the worker fetch one URL of a fixed shape on a host of their choice, once a day: the same exposure as validators' manifests,
   at larger scale. `docs/security.md` and `docs/deployment.md` say so; restricting egress means `GH_DOMAIN_VERIFICATION=false`.
-- **Personal data**: a principal's name only; emails and social handles are never read, stored, logged or served (a test feeds a file
-  with them and asserts their text is nowhere in the row, the logs or the answer).
+- **Stored content outlives the Domain** (final review, 2026-10-29): what a fetched toml says is kept per domain for ever, so anyone who changes
+  a Domain often grows the store (on disk, at most ~300 checks a minute). Nothing reads the store whole on request or holds it in memory: the api
+  reads the domains of each batch by key (5.3, 7), so its memory is bounded by the requests, not by the store.
+- **Personal data**: a principal's name only; emails and social handles are never read, stored, logged or served, and neither are the
+  entries' keys that name one (`contact_email`, `twitter`, `x`, `telegram`, `support_handle`, ... of `fields`, 3.3), a text with an `@` among the
+  `fields`, nor an `[[ACCOUNTS]]` `desc` with an `@` (a test feeds files with them and asserts their text is nowhere in the row, the logs or the
+  answer).
 - **Impersonation**: a verified name is whatever the domain's owner wrote; the answer always pairs it with `domain`, and the explorer
   shows the domain (E9). Labels are GateHub's and are served beside any name.
 - **Spoofing in text**: `cleanTomlText` removes controls and bidirectional overrides, so a name cannot render as another's.
@@ -501,12 +527,14 @@ per network). The testnets (D-env) use the same files with `network = "testnet"`
 - `toml-read.spec.ts`, `toml-text.spec.ts`: each section and cap; BOM; not TOML; X-address and bad checksum skipped; repeated
   addresses; `network` as a string, as a bare integer (`21337`) and of another type; `desc` over 256 dropped; principals with `@` and the email/social keys never present anywhere in the output; `modified`
   forms and bounds; `fields` types, key pattern and the 16-key cap; NFC, Cc/Cf removal, bidi overrides.
-- `toml-row.spec.ts`: `nextTomlRow` for ok, each transient reason inside and outside the grace, each definite reason, the backoff
-  1/2/4/7 days, `failures`.
+- `toml-row.spec.ts`: `nextTomlRow` for ok, each transient reason inside and outside the grace (both edges, counted from the missed re-read,
+  at the default recheck and others), each definite reason, the backoff 1/2/4/7 days of a definite failure and of a transient one once it carries
+  nothing (hourly before), `failures`.
 - `domain-discovery.spec.ts`, `toml-checker.spec.ts` (with a fake fetcher and store, as D1's `domain-checker.spec.ts`): due order,
   named anew (and its hourly limit), the 300 limit, 16 lanes, one fetch per domain, batched writes, stop, `GH_DOMAIN_VERIFICATION=false`.
-- `display-name.spec.ts`: the order of 5.1, the network rule, `desc` of 64 and 65 characters, the network name alone, the directory not
-  loaded.
+- `display-name.spec.ts`: the order of 5.1, the network rule, `desc` of 64 and 65 characters, the network name alone, a toml read that failed.
+- `domain-tomls.service.spec.ts`, `display-names.service.spec.ts`: one keyed toml read per batch for its distinct domains (statement and params),
+  none without domains, another domain's toml does not vouch, the 60 s keeping, a failed read (no `verified`, no `domain`, nothing kept).
 - `account-names.controller.spec.ts`, `toml-object.spec.ts`: parameters and messages in order, key orders, duplicates, request order.
 
 **E2e** (Docker, real ClickHouse):
@@ -520,7 +548,7 @@ per network). The testnets (D-env) use the same files with `network = "testnet"`
   discovery.
 - `apps/api/test/display-names.e2e-spec.ts`: seeded `account_domains`, `domain_tomls` and the names/labels tables; the exact answers of
   5.2 for every kind, labels, an X-address, 101 addresses, duplicates, order, `Cache-Control`, 401, unknown parameters; the `read_rows`
-  bound and EXPLAIN of section 7; a directory that failed to load. `apps/api/test/toml.e2e-spec.ts`: 6's answers, 400, 404,
+  bounds and EXPLAINs of section 7 (both keyed reads); a `domain_tomls` that cannot be read; no SELECT on `domain_tomls` at boot. `apps/api/test/toml.e2e-spec.ts`: 6's answers, 400, 404,
   the network rule, a failed toml inside and outside its grace.
 
 ## 15. Rollout
