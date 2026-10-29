@@ -1,45 +1,54 @@
 # The syncer (ingestion service)
 
 `apps/syncer` (`@gatehub/data-syncer`) fills the ClickHouse database of **one network** with everything the
-[API](api-reference.md) serves. It is a NestJS process that runs up to five **workers** and exposes a liveliness probe
+[API](api-reference.md) serves. It is a NestJS process that runs up to six **workers** and exposes a liveliness probe
 (`GET /liveliness/healthz`, port 3002) and Prometheus metrics (`GET /metricz`, port 3000). Run **exactly one syncer per network
 and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer); metrics: [observability](observability.md).
 
 ```
                       GH_NODE_ENDPOINTS (rippled / xahaud, websocket)
                                   │  NodeClient: failover, watchdog, re-subscribe
-   ┌──────────────┬───────────────┼────────────────┬─────────────────┬──────────────────┐
-   │ ingest       │ validations   │ fee_stats      │ aggregator      │ validators       │   <- GH_WORKERS
-   │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats, volumes, │ lists, domains,  │
-   │              │               │                │ AMM pools, NFTs,│ state, rounds,   │
-   │              │               │                │ rates, markets, │ agreement        │
-   │              │               │                │ account rollups │                  │
-   └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴─────────┬────────┘
-          ▼               ▼               ▼                 ▼                  ▼
-   29 ledger tables   validations    fee_stats        stats_hourly,      unl_lists, unl_publishers,
-   (ledgers = commit  validator_     (every 5 s)      volume_live,       validator_domains,
-    marker)           manifests,                      volume_daily,      validator_manifests (rpc),
-                      validator_                      amm_pools, nfts,   network_state,
-                      validations,                    nft_collections,   amendment_features,
-                      validator_seen                  amm_daily, + 9 of  validator_votes,
-                                                      003 (read the      amendment_tallies,
-                                                      ledger tables)     validator_agreement_hourly
+   ┌──────────────┬───────────────┼────────────────┬─────────────────┬──────────────────┬──────────────────┐
+   │ ingest       │ validations   │ fee_stats      │ aggregator      │ validators       │ tomls            │   <- GH_WORKERS
+   │ LiveRunner   │ Collector     │ FeeStatsPoller │ stats, volumes, │ lists, domains,  │ account domains, │
+   │              │               │                │ AMM pools, NFTs,│ state, rounds,   │ tomls over HTTPS │
+   │              │               │                │ rates, markets, │ agreement        │ (no node)        │
+   │              │               │                │ account rollups │                  │                  │
+   └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴────────┬─────────┴────────┬─────────┘
+          ▼               ▼               ▼                 ▼                 ▼                  ▼
+   29 ledger      validations,    fee_stats        stats_hourly,     unl_lists,         domain_tomls
+   tables         validator_      (every 5 s)      volume_live,      unl_publishers,    (reads
+   (ledgers =     manifests,                       volume_daily,     validator_         account_
+   commit         validator_                       amm_pools, nfts,  domains,           domains)
+   marker)        validations,                     nft_collections,  validator_
+                  validator_seen                   amm_daily, + 9    manifests (rpc),
+                                                   of 003 (read the  network_state,
+                                                   ledger tables)    amendment_
+                                                                     features,
+                                                                     validator_votes,
+                                                                     amendment_
+                                                                     tallies,
+                                                                     validator_
+                                                                     agreement_hourly
                           ClickHouse, database = the network name
 ```
 
 Besides the node, the fifth worker, `validators` ([section 8](#8-the-validators-worker)), fetches the validator lists of the UNL publishers and
 the TOML files of the validators' domains over HTTPS, and reads the ledgers and validations the other workers stored.
+The sixth, `tomls` ([section 8a](#8a-the-tomls-worker)), needs no node: it reads which domains accounts name from `account_domains` and fetches
+their tomls over HTTPS.
 
 ## 1. Boot
 
 `main.ts` loads and validates the configuration (the process exits with a message naming the bad variable), builds the app from
-the **enabled workers** only (`GH_WORKERS`, default all five), and starts the toolbox bootstrap (probe + metrics ports).
+the **enabled workers** only (`GH_WORKERS`, default all six), and starts the toolbox bootstrap (probe + metrics ports).
 Then, in order:
 
 1. If `GH_RUN_MIGRATIONS_ON_BOOT=true`, the schema is applied (the compose stacks leave this off: the `migrate-<network>` job
    owns it). Then, with the `validations` or `validators` worker enabled, the schema of `002_validators_amendments.sql` is checked
    (`system.columns`): a database without it refuses the boot with a message that names the file and what is missing (a check
-   that cannot reach ClickHouse is logged and the boot goes on).
+   that cannot reach ClickHouse is logged and the boot goes on). With the `tomls` worker enabled, the two tables of
+   `012_display_names.sql` (`account_domains`, `domain_tomls`) are checked the same way, and a database without them refuses the boot.
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
    (`server_info.network_id` must be one of the profile's `acceptedNodeNetworkIds`: `xrpl` 0 or nothing, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338, and no other). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
@@ -984,6 +993,107 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
   hour stored back, 720 hours (a range of the key) at a time, the next range only when one has none, and no further than the 400 days
   the table keeps: a run reads the sentinels of one range, not of the table.
 
+## 8a. The tomls worker
+
+The `tomls` worker (`apps/syncer/src/tomls/`) reads the toml of every domain an account names into `domain_tomls`, so that the API can say which accounts a
+domain vouches for (`verified` names, [api-reference](api-reference.md#account-names-and-tomls)) and what it says of itself (`GET /v2/toml/{domain}`).
+Its design is in the [display names spec](superpowers/specs/2026-10-24-display-names-design.md), section 4, and the decision in
+[ADR-0017](adr/0017-display-names.md). It needs ClickHouse and outbound HTTPS, **not the node** (`NODE_CLIENT_WORKERS` does not list it), and is switched on
+and off with `GH_WORKERS` (the default has it). With `GH_DOMAIN_VERIFICATION=false` it starts and logs once `Toml checks are off (GH_DOMAIN_VERIFICATION=false):
+no toml is read`; it reads nothing, and `domain_tomls` stays as it is (empty on a new deployment, where every domain then shows as kind `domain`). A boot without migration `012_display_names.sql`
+fails with a message that names the file ([section 1](#1-boot)).
+
+**Two loops**, each a `PassLoop` that waits for a pass to end before it starts the next:
+
+- **Discovery**, at start and then every `TOML_DISCOVERY_INTERVAL_MS` (5 minutes) after the previous one ended: one read of the current domain of every
+  account.
+- **Checks**, a pass at start and then 60 s after the previous one ended. A pass waits for the first discovery, and none is made while no discovery has
+  worked: a worker that cannot read `account_domains` shows its failure (a `warn` per discovery) and not an empty store that looks up to date.
+
+A stop (SIGTERM, SIGINT, shutdown of the app) ends both loops and waits for them for at most 2 s (`TOMLS_STOP_WAIT_MS`); the check loop's stop starts no fetch,
+waits for the fetches under way and writes the rows that are done. **That budget is shorter than a fetch's 10 s timeout**, so a stop during slow fetches may
+leave the pass's finished rows unwritten (the domains are checked again, which costs a fetch and no data); ClickHouse is closed after the workers, so the
+final write has a client.
+
+### Discovery: which domains
+
+```sql
+SELECT top_hex AS domain_hex, count() AS accounts
+  FROM (SELECT account, argMax(domain_hex, version) AS top_hex, argMax(deleted, version) AS gone
+          FROM account_domains GROUP BY account)
+ WHERE top_hex != '' AND gone = 0
+ GROUP BY top_hex
+```
+
+The newest row of an account is its current domain (`argMax` by `version`, never `FINAL`: rows collapse only when parts merge); a deleted account and an
+account without a Domain name none. Each `domain_hex` goes through `accountDomainOf` ([api-reference](api-reference.md#account-names-and-tomls)): a value that
+is no domain is dropped and counted (`Discovery dropped N Domain value(s) that name no domain`, logged only when above 0, never the values), and the spellings of
+one domain (`Example.com`, `example.com`) add up. The result is `domain -> accounts`, **the domains the worker checks and no others**: a stored domain no account
+names any more, or one the validators' checker stored, is not fetched by this worker.
+
+A domain named by **more accounts than at the previous discovery** is **named anew** until it is checked: it is re-checked soon, at most hourly, since an
+account that has just set its Domain should not wait a day to be verified. The first discovery after a start has nothing to compare with, so no domain is named
+anew then (counting them all would re-check every domain at each restart). The set is in memory, and loses the domains no account names any more.
+The read is bounded (the whole of `account_domains`, four columns, under 2 s and 1 GiB), and `syncer_tomls_discovery_seconds` records its duration, **also
+when it fails** (a read that outgrows its limits fails rather than slows).
+
+### The pass
+
+1. Read the **schedule** of every stored domain: `domain`, the `next_check_at` and `failures` of its newest row (the largest `checked_at`) and when it was
+   last checked. Take the discovered domains that are **due**: no row at all; or named anew and last checked more than an hour ago; or `next_check_at`
+   passed. Order: never checked, then named anew, then the oldest `next_check_at`, then the domain. At most `TOML_PASS_LIMIT` = **300** a pass.
+2. Read the newest row in full of those domains (a bound array, by key), which the new row carries its content over from.
+3. **Fetch** `https://{domain}{tomlPath}` of each (`/.well-known/xrp-ledger.toml`, on Xahau and Xahau Testnet `/.well-known/xahau.toml`; no fall-back to the other
+   name), **16 at a time** (`TOML_FETCH_CONCURRENCY`), one fetch per domain, through the safe fetcher with `GH_DOMAIN_FETCH_TIMEOUT_MS` (10 s) overall, 256 KiB, 3
+   redirects each checked again, https and port 443 only, and its own `User-Agent`, `gatehub-data-api/<version> (tomls)`. A file that arrives is read with
+   `readToml` ([the reference](api-reference.md#get-v2tomldomain) says what is kept). An error of the fetcher is its reason; a file that is not TOML is
+   `toml_invalid`; anything else that is thrown counts as `connect_error`.
+4. **Write** the rows in batches of `TOML_WRITE_BATCH` = **50** and at the end of the pass (300 tiny inserts a minute would make parts). A check whose row was
+   not written is still due.
+
+A **first sweep** after the deploy is the backlog: about 300 domains a minute, 16 lanes of up to 10 s each at the worst (96 a minute when every host times out).
+`syncer_tomls_due` shows it.
+
+### The row of a check
+
+One row per check (`ReplacingMergeTree(checked_at)`): the newest row of a domain is its current word, and what its toml says *in effect* is in that row.
+
+| Check | `status`, `reason` | Content, `fetched_at` | `failures` | `next_check_at` |
+| --- | --- | --- | --- | --- |
+| Read as TOML | `ok`, `''` | from the file, now | 0 | now + `GH_TOML_RECHECK_MS` (24 h) |
+| **Transient**: `dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status` 5xx or 429 | `failed`, the reason (and the status code) | the previous row's, when it was fetched at most 24 h ago (`DOMAIN_VERIFIED_GRACE_S`), else none and `fetched_at` NULL | previous + 1 | now + 1 h |
+| **Definite**: any other `http_status` (4xx), `toml_invalid`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid` | `failed`, the reason (and the status code) | none, `fetched_at` NULL | previous + 1 | now + min(24 h x 2^(failures - 1), 7 days): 1, 2, 4, then 7 days |
+
+`failures` counts the failed checks in a row, up to 65,535 (a UInt16), and is 0 exactly when the newest row is `ok`: it is how `syncer_tomls_domains` tells `ok`
+from `failed` without another column. The 24 hours are the grace of the validators' domain checks: a website that blips keeps its names. **A transient failure never
+backs off**: a host that never resolves or never answers is asked again every hour, for ever; only a definite failure backs off to 7 days.
+
+### What is never done
+
+- A domain is fetched only because an account's ledger Domain names it, never because a request asked (the API never fetches). Nothing a file holds is fetched
+  or followed (an icon, an attestation link, a `unl` URL), and a file is parsed, never evaluated, and never stored: only the content the reference lists.
+- A principal's email and social handles, `[[SERVERS]]` and `[ORGANIZATION]` are never read. A log line names a domain (quoted and cut at 128 characters, since
+  it comes from the ledger), a reason and a status code; **never a body, an error object, a principal or a description**. An error that stops a loop is logged by its
+  **name** (and, for ClickHouse, its type, `Error (UNKNOWN_TABLE)`), never its message: an insert's error can quote the row it could not write.
+- The worker writes `domain_tomls` and nothing else, and it reads only `account_domains` and `domain_tomls`.
+
+### Observability
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `syncer_tomls_checks_total` | Counter | `outcome` | `ok` or the reason of every check, counted when its row is written |
+| `syncer_tomls_domains` | Gauge | `status` | After each pass, the discovered domains that are `ok`, `failed` or `unchecked` |
+| `syncer_tomls_due` | Gauge | | Domains due and not checked yet at the end of a pass |
+| `syncer_tomls_discovery_seconds` | Gauge | | Duration of the last discovery read |
+
+The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `TomlsWorker`): `Tomls: <n> checked (<ok> ok, <failed> failed), <due> still due`
+(`log`, once per pass that checked something or has something still due; **an idle pass logs no line** and the gauges show it);
+`Tomls: <n> fetches blocked (blocked_address): "<domain>", ...` (`warn`, once per pass, the count and at most five domains in order);
+`Tomls: <n> checks failed with an error that is not the fetcher's or the parser's own (<name> x<count>, ...)` (`warn`, the names only);
+`Discovery dropped <n> Domain value(s) that name no domain`; and `Toml discovery: the pass failed: <name>` / `Toml checks: the pass failed: <name>`
+(`warn`; the check loop's pass failed to read or write, and what was not written is due again). The alerts are in
+[observability](observability.md#recommended-alerts).
+
 ## 9. What the syncer does not do
 
 - It does not fill history before `GH_SYNC_START_LEDGER`: use [range ingest](#4-range-ingest-cli).
@@ -1018,6 +1128,12 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
 | `Seeding validator_seen failed: <message>; it is tried again at the next start` | ClickHouse refused a statement of the one-off seeding of `validator_seen` | The worker is booted and the compute loop runs. The partitions done stay; the next start seeds again until the oldest partition of `validations` is covered. |
 | `Skipping a compute tick: ...`, `Abandoning the compute tick in flight: ...` | A tick took longer than a minute, or did not end within 2 s of the shutdown | The tick was skipped, or was left to finish by itself (it was told to write nothing more). |
 | `amendment <ID> has no metadata entry` | The node, the ledger or the votes name an amendment that the amendment metadata lacks | Warned once per ID; `syncer_amendments_without_metadata` counts them. Add the entry (`amendments:check` lists them). |
+| `Tomls: <n> checked (<ok> ok, <failed> failed), <due> still due` | Information: a pass of the `tomls` worker wrote its checks | Nothing to do. `syncer_tomls_due` is the backlog and falls to 0 after the first sweep. |
+| `Tomls: <n> fetches blocked (blocked_address): "<domain>", ...` | A domain an account names resolves to a private, loopback or reserved address | Nothing is requested; the domain is `failed` with `blocked_address` and is checked again after 1, 2, 4, then 7 days. Anyone can set such a Domain; nothing is wrong. |
+| `Tomls: <n> checks failed with an error that is not the fetcher's or the parser's own (<name>, ...)` | A check threw something neither the safe fetcher nor the TOML parser throws | Each is stored as `connect_error`; the line names the errors, which are a bug to report. |
+| `Toml discovery: the pass failed: <name>` | ClickHouse refused the read of `account_domains` (the time limit, the memory cap, a missing table) | The domains of the last discovery stay in use, and `syncer_tomls_discovery_seconds` shows the time it took. No pass is made while no discovery has ever worked. Retried after 5 minutes. |
+| `Toml checks: the pass failed: <name> (<type>)` | ClickHouse refused the read of the schedule or the insert of the rows | The rows not written are due again at the next pass (a minute later). |
+| Boot refuses: `lacks the schema of 012_display_names.sql` | The migration was not applied before a syncer with the `tomls` worker | Apply it (`migrate-<network>`) and start the syncer again. |
 
 ## 11. Source map
 
@@ -1028,13 +1144,15 @@ UTC hour, how many of the ledgers of the indexed validated chain each tracked va
 | `apps/syncer/src/cli/range-ingest.ts` | The range-ingest CLI and runner |
 | `apps/syncer/src/validations/*`, `fees/*`, `aggregator/*` | Three more workers |
 | `apps/syncer/src/validators/*` | The validators worker: `unl-fetcher` (UNL lists), `domain-checker` and `toml-match` (domain verification), `network-state-poller` (ledger state, amendment names, the metadata gauge), `compute-loop`, `rounds.job` and `tally` (the compute loop, the voting rounds and the pure tally), `agreement.job` and `agreement` (the hourly agreement and its pure counting), `seen-seed`, `stored-lists`, `safe-fetch` (the only outbound HTTP) |
+| `apps/syncer/src/tomls/*` | The tomls worker: `domain-discovery` (which domains accounts name), `toml-checker` (the pass: due order, the fetches, the batched writes), `toml-row` (`nextTomlRow`, the row of a check), `tomls-worker` (the two loops), `tomls.module` |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
-| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`) |
+| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`) |, the Domain of an account (`account-domains.parser.ts`)
 | `packages/shared/src/aggregate/{stats,volume,amm-pools,amm-daily}.job.ts`, `aggregate/amm-reads.ts`, `query/rates.service.ts` | Aggregation and rates (`amm-reads.ts` holds the reads the AMM jobs share) |
 | `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
 | `apps/syncer/src/aggregator/{nft-state,nft-collections}.job-runner.ts` | The two NFT jobs ([the NFT jobs](#the-nft-jobs)) |
 | `packages/shared/src/aggregate/{nft-state,nft-state.job,nft-collections.job}.ts`, `query/nft-prices.ts` | The fold of an NFT, what the NFT jobs read and write, and the one conversion of a price |
 | `packages/shared/src/aggregate/{rates-daily,pair-hourly,markets-live,account-rollups}.job.ts`, `aggregate-sets.ts` | What the runners write: the sets, their versions and their readers |
 | `packages/shared/src/query/{daily-rates,account-day-groups,valuation}.ts` | What the API reads them with: `DailyRates`, the day groups (raw or rollup), the valuation rule |
+| `packages/shared/src/tomls/*` | What the API and the workers share about tomls: `readToml` (what is kept of a file), `cleanTomlText`, `accountDomainOf`, `countsOn`, the store (`recordToml`, `readStoredTomls`) and `ACCOUNT_DOMAINS_SEED_SQL` |
 | `packages/shared/src/xrpl/node-client.ts` | The node client |

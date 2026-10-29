@@ -426,7 +426,9 @@ keep one row per account and partition, about the number of accounts with a doma
 is safe because recovery and `--reprocess` delete by `ledger_index` and always write the deleted ledgers again, and the parser is
 deterministic: a row merged away under a deleted one comes back with it. The table is in `CHILD_TABLES` and `LEDGER_KEYED_TABLES` (P7)
 and carries the deduplication window of 1000; its `index_granularity` of 1024 keeps the read of up to 100 accounts by key of the
-names batch under about 100 thousand rows. Because the key is not unique, counts of its rows after a merge are not counts of what the
+names batch to about one granule of rows per account and part (under about 100 thousand rows a part; ClickHouse folds a tail shorter than half a
+granule into the previous one, so a keyed read can reach about one and a half granules a part). The api e2e pins it with `read_rows` over 800,000 rows in four
+parts: 226,560 read for 100 accounts, bound 409,600. Because the key is not unique, counts of its rows after a merge are not counts of what the
 parser wrote; compare accounts, not rows.
 
 ## 3. Node-sourced, aggregate and internal tables
@@ -551,6 +553,7 @@ ClickHouse clock in milliseconds, above the key's newest. **Readers keep the new
  nft_touches (ledger order: which NFTs, since when) + nft_events ──▶ nfts, account_nfts ──▶ nft_collections, nft_collection_holders;  nft_dirty (re-ingest ranges)
  nft_sales (a ledger range) + native_rates_daily ──▶ volume_* (metric nft_volume);  the same prices (nftSalesNativeSql) ──▶ nft_collections.volume_native and /nft_collections/{c}/stats
  (/stats reads collection_nft_events at request time, no daily table;  GET /nfts/{id} folds nft_events at request time, `nfts` is for the lists)
+ account_domains (account prefix) ──▶ GET /v2/account_names (one keyed read for a page of addresses);  account_domains ──▶ (tomls worker: discovery, then the fetches) ──▶ domain_tomls (domain prefix) ──▶ the api's toml directory and GET /v2/toml/{domain}
  exchanges ──▶ native_rates_daily, pair_hourly ──▶ markets_live;  balance_changes + account_transactions + account_exchanges ──▶
  account_lines_daily / account_tx_daily / account_trades_daily (heavy accounts only; sentinels in account_rollup_days)
 ```

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Table } from '../clickhouse/tables';
 import { ACCOUNT_DOMAINS_SEED_BUCKETS, ACCOUNT_DOMAINS_SEED_SQL } from './account-domains-seed';
 
@@ -24,5 +26,13 @@ describe('the account_domains seed', () => {
     );
     expect(ACCOUNT_DOMAINS_SEED_SQL).toContain("WHERE hex != '' AND gone = 0");
     expect(ACCOUNT_DOMAINS_SEED_SQL).not.toMatch(/\bFINAL\b/i);
+  });
+
+  it('is written verbatim in docs/backfill.md, where the operator copies it from', () => {
+    const backfill = readFileSync(join(__dirname, '..', '..', '..', '..', 'docs', 'backfill.md'), 'utf8');
+
+    // a fenced block of its own, at the first column: a statement indented under a list item is no copy of it
+    expect(backfill).toContain(`\n\`\`\`sql\n${ACCOUNT_DOMAINS_SEED_SQL}\n\`\`\`\n`);
+    expect(backfill).toContain('### Account domains seed');
   });
 });

@@ -1,5 +1,15 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  bodyOrderOf,
+  exampleProblems,
+  examplesOf,
+  examplesProblemsOf,
+  hasOwn,
+  Json,
+  partOf,
+  REFERENCE,
+  referenceChecks,
+} from '../../test/support/api-reference-check';
 import * as featureCoverage from '../common/feature-coverage.service';
 import { COVERAGE_KEYS } from '../common/feature-coverage.service';
 import * as volumeObject from '../network/volume-object';
@@ -43,16 +53,9 @@ import {
  * answer) stand in this section with the other objects, and its examples are read with it.
  */
 
-const REFERENCE = join(__dirname, '..', '..', '..', '..', 'docs', 'api-reference.md');
 const SECTION = 'NFTs';
 /** The heading of the route of the NFT volume, whose examples belong to this reference too. */
 const VOLUME_HEADING = '### `GET /v2/network/nft_volume`';
-
-/**
- * Whether `key` is an own key of `object`: `in` would take a key of the prototype (`constructor`, `toString`) for one of the
- * map. (`Object.hasOwn` is ES2022, past the ES2021 library of the repo's TypeScript.)
- */
-const hasOwn = (object: object, key: string): boolean => Object.prototype.hasOwnProperty.call(object, key);
 
 /** The object as the reference names it on its line, and the constant that holds its keys. One entry for each constant of the routes. */
 const OBJECTS: Record<string, readonly string[]> = {
@@ -89,63 +92,9 @@ const OBJECTS: Record<string, readonly string[]> = {
   'the NFT volume answer': NFT_VOLUME_BODY_KEYS,
 };
 
-/** The text of the reference from `heading` to the next heading of the same or a higher level. */
-function partOf(markdown: string, heading: string): string {
-  const level = /^#+/.exec(heading)?.[0].length ?? 2;
-  const start = markdown.indexOf(`\n${heading}\n`);
-  if (start < 0) throw new Error(`docs/api-reference.md has no "${heading}" heading`);
-  const rest = markdown.slice(start + 1);
-  const next = new RegExp(`\\n#{1,${level}} `).exec(rest.slice(heading.length));
-  return next === null ? rest : rest.slice(0, heading.length + next.index);
-}
-
-/** The section of the reference, from its `##` heading to the next one. */
-const sectionOf = (markdown: string): string => partOf(markdown, `## ${SECTION}`);
-
-interface KeysLine {
-  object: string;
-  /** The keys as written, with the `?` of an optional one stripped. */
-  keys: string[];
-}
-
-/** Every `Keys of <object>, in order: ...` line of the section, in the order they stand. */
-function keyLines(markdown: string): KeysLine[] {
-  return [...sectionOf(markdown).matchAll(/^Keys of (.+?), in order: (.+)$/gm)].map(([, object, list]) => ({
-    object,
-    keys: list
-      .replace(/`/g, '')
-      .replace(/\.\s*$/, '')
-      .split(',')
-      .map((key) => key.trim().replace(/\?$/, '')),
-  }));
-}
-
-/** What is wrong with the lines of a reference, as sentences: a line that drifted, one that is missing, one nothing owns, one written twice. */
-function problemsOf(markdown: string): string[] {
-  const lines = keyLines(markdown);
-  const problems: string[] = [];
-  for (const [object, constant] of Object.entries(OBJECTS)) {
-    const own = lines.filter((line) => line.object === object);
-    if (own.length === 0) problems.push(`missing: no line for ${object}`);
-    else if (own.length > 1) problems.push(`twice: ${own.length} lines for ${object}`);
-    else if (JSON.stringify(own[0].keys) !== JSON.stringify(constant)) {
-      problems.push(`drifted: ${object} is written ${own[0].keys.join(', ')}; the code serves ${constant.join(', ')}`);
-    }
-  }
-  for (const { object } of lines) {
-    if (!hasOwn(OBJECTS, object)) problems.push(`unknown: a line for "${object}", which the map does not name`);
-  }
-  return problems;
-}
+const { sectionOf, keyLines, problemsOf, lineOf: lineIn } = referenceChecks(`## ${SECTION}`, OBJECTS);
 
 // -- the examples ----------------------------------------------------------------------------------------------------------
-
-type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
-
-/** The fenced `json` blocks of a text, parsed. A block that is not JSON is an error (the examples are answers, whole). */
-function examplesOf(text: string): Json[] {
-  return [...text.matchAll(/^```json\n([\s\S]*?)^```$/gm)].map(([, body]) => JSON.parse(body) as Json);
-}
 
 /**
  * The keys of a row of the NFT volume, as the reference writes them for the volume routes ("Row keys: ..."): the row is the one
@@ -183,24 +132,6 @@ const KEYS_UNDER: Record<string, readonly string[]> = {
   components: NFT_VOLUME_COMPONENT_KEYS,
 };
 
-/** Whether `keys` come in the order of `order` (each one is there, and no key stands before one that must come first). */
-function inOrder(keys: string[], order: readonly string[]): boolean {
-  const places = keys.map((key) => order.indexOf(key));
-  return places.every((place, i) => place >= 0 && (i === 0 || place > places[i - 1]));
-}
-
-/** What is wrong with the keys of an example: an object whose keys are not in the order of its constant, or one it has no key of. */
-function exampleProblems(value: Json, order: readonly string[], where: string): string[] {
-  if (Array.isArray(value)) return value.flatMap((item, i) => exampleProblems(item, order, `${where}[${i}]`));
-  if (value === null || typeof value !== 'object') return [];
-  const keys = Object.keys(value);
-  const problems = inOrder(keys, order) ? [] : [`${where}: ${keys.join(', ')} is not in the order ${order.join(', ')}`];
-  for (const [key, inner] of Object.entries(value)) {
-    if (hasOwn(KEYS_UNDER, key)) problems.push(...exampleProblems(inner, KEYS_UNDER[key], `${where}.${key}`));
-  }
-  return problems;
-}
-
 /** The answers of the routes: each ends with the list or the object that tells it from the others. */
 const BODIES: readonly (readonly string[])[] = [
   NFT_BODY_KEYS,
@@ -215,28 +146,11 @@ const BODIES: readonly (readonly string[])[] = [
   NFT_VOLUME_BODY_KEYS,
 ];
 
-/** The answer an example is, told by the list or object it ends with and by every key being one of the answer's. */
-function bodyOrderOf(example: Json): readonly string[] | undefined {
-  if (example === null || typeof example !== 'object' || Array.isArray(example)) return undefined;
-  const keys = Object.keys(example);
-  return BODIES.find(
-    (body) => keys.every((key) => body.includes(key)) && keys[keys.length - 1] === body[body.length - 1],
-  );
-}
-
-/** Every problem of the examples of the NFTs section and of the NFT volume route. */
-function examplesProblemsOf(markdown: string): string[] {
-  const examples = [...examplesOf(sectionOf(markdown)), ...examplesOf(partOf(markdown, VOLUME_HEADING))];
-  return examples.flatMap((example, i) => {
-    const order = bodyOrderOf(example);
-    if (order === undefined) {
-      return [
-        `example ${i + 1}: no answer of the NFT routes has the keys ${Object.keys(example as object).join(', ')}`,
-      ];
-    }
-    return exampleProblems(example, order, `example ${i + 1}`);
-  });
-}
+/** The examples of the NFTs section and of the NFT volume route. */
+const examplesIn = (markdown: string): Json[] => [
+  ...examplesOf(sectionOf(markdown)),
+  ...examplesOf(partOf(markdown, VOLUME_HEADING)),
+];
 
 describe('the "NFTs" section of docs/api-reference.md', () => {
   const markdown = readFileSync(REFERENCE, 'utf8');
@@ -273,12 +187,12 @@ describe('the "NFTs" section of docs/api-reference.md', () => {
 
   describe('its examples', () => {
     it('are answers of the NFT routes with their keys in the order of the code', () => {
-      expect(examplesProblemsOf(markdown)).toEqual([]);
+      expect(examplesProblemsOf(examplesIn(markdown), BODIES, KEYS_UNDER)).toEqual([]);
     });
 
     it('include an answer of every kind of the routes, on both networks', () => {
-      const examples = [...examplesOf(sectionOf(markdown)), ...examplesOf(partOf(markdown, VOLUME_HEADING))];
-      const bodies = examples.map(bodyOrderOf);
+      const examples = examplesIn(markdown);
+      const bodies = examples.map((example) => bodyOrderOf(example, BODIES));
       for (const body of BODIES) expect(bodies).toContain(body);
       const kinds = JSON.stringify(examples);
       expect(kinds).toContain('"kind":"nftoken"');
@@ -293,26 +207,20 @@ describe('the "NFTs" section of docs/api-reference.md', () => {
         result: 'success',
         nft: (first as { nft: Json }).nft,
       };
-      expect(exampleProblems(swapped, NFT_BODY_KEYS, 'x')).toEqual([
+      expect(exampleProblems(swapped, NFT_BODY_KEYS, 'x', KEYS_UNDER)).toEqual([
         expect.stringMatching(/^x: coverage, result, nft is not in the order/),
       ]);
       const { nft_id: id, ...rest } = (first as unknown as { nft: { nft_id: string } }).nft;
       const moved = { ...rest, nft_id: id };
-      expect(exampleProblems({ result: 'success', coverage: {}, nft: moved }, NFT_BODY_KEYS, 'x')).toEqual([
+      expect(exampleProblems({ result: 'success', coverage: {}, nft: moved }, NFT_BODY_KEYS, 'x', KEYS_UNDER)).toEqual([
         expect.stringMatching(/^x\.nft: kind, .*, nft_id is not in the order/),
       ]);
-      expect(bodyOrderOf({ result: 'success', rows: [], extra: 1 })).toBeUndefined();
+      expect(bodyOrderOf({ result: 'success', rows: [], extra: 1 }, BODIES)).toBeUndefined();
     });
   });
 
   describe('the check itself', () => {
-    const lineOf = (object: string): string => {
-      const found = /^Keys of .+?, in order: .+$/gm;
-      for (const [line] of sectionOf(markdown).matchAll(found)) {
-        if (line.startsWith(`Keys of ${object}, in order:`)) return line;
-      }
-      throw new Error(`no line for ${object}`);
-    };
+    const lineOf = (object: string): string => lineIn(markdown, object);
 
     it('finds a line whose keys swapped places', () => {
       const line = lineOf('a holder');

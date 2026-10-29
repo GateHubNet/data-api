@@ -108,13 +108,18 @@ function takes the env file of the host). The sandbox needs its own values for `
 - **api-xrpl / api-xahau:** ClickHouse and the node(s) they forward live lookups to; nothing else (signing an export's link is
   local, with the key).
 - **exporter-xrpl / exporter-xahau:** ClickHouse, their network's api, and `storage.googleapis.com` (HTTPS) for the uploads.
-- **syncer-xrpl / syncer-xahau:** ClickHouse and its node(s) (WSS/HTTP), plus, for the `validators` worker, **outbound HTTPS (port 443)
+- **syncer-xrpl / syncer-xahau:** ClickHouse and its node(s) (WSS/HTTP), plus, for the `validators` and `tomls` workers, **outbound HTTPS (port 443)
   to public hosts**:
   - the **UNL publishers** of `GH_UNL_PUBLISHERS` (by default `vl.ripple.com` and `unl.xrplf.org` on XRPL, `vl.xahau.org` on Xahau,
     `vl.altnet.rippletest.net` on XRPL Testnet, none on Xahau Testnet), and
   - the **domains validators claim**: `https://<domain>/.well-known/xrp-ledger.toml` (Xahau: `xahau.toml`) for every validator that names a
     domain in its manifest. These hosts are open-ended, so a hostname allowlist cannot cover them; a host that has no outbound HTTPS
     to arbitrary sites sets **`GH_DOMAIN_VERIFICATION=false`** (the domains then show `pending`) and keeps egress to the publishers only.
+  - the **domains accounts name** (the `tomls` worker): `https://<domain>/.well-known/xrp-ledger.toml` (Xahau and its testnet: `xahau.toml`) for every domain
+    an account's `Domain` field names, once a day, 16 at a time at most. That is **tens of thousands of hosts** on a mainnet, chosen by whoever sets a Domain,
+    so a hostname allowlist is impossible here too. A host that cannot reach arbitrary sites sets **`GH_DOMAIN_VERIFICATION=false`**, which switches this worker
+    off as well as the validators' checks: no toml is read, no account is `verified`, and every account that names a domain shows it as an unverified domain
+    (`kind: "domain"`). Keeping the worker on needs the egress above and nothing else (it needs no node).
   - A DNS resolver that answers A and AAAA queries (the fetch resolves names itself; `/etc/hosts` is not consulted).
 - The fetches ignore `HTTP_PROXY` / `HTTPS_PROXY`: reach the internet by NAT or a transparent egress, not through a proxy variable.
 - The syncer refuses, by itself, every host that resolves to a private, loopback, link-local, reserved or metadata address
@@ -238,6 +243,11 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   fails the batch, so the live runner would retry the same ledgers without end; the NFT routes of the api answer 500 until the tables exist. The compose files make both wait
   for `migrate`; by hand, run `migrate`, start the syncer, and the api last. The history is filled afterwards ([the NFT data](operations.md#the-nft-data),
   [backfill](backfill.md#nft-re-ingest)).
+- `012_display_names.sql` (two `CREATE TABLE IF NOT EXISTS`: the ledger-derived `account_domains` and `domain_tomls`) is additive but **sets an order**: `migrate` first, then the syncer, then
+  the api. A syncer of this version (parser version 6) writes `account_domains` with every ledger, and an insert into a missing table fails the batch, so the live runner would retry the same
+  ledgers without end; the `tomls` worker refuses to boot without the two tables, and `GET /v2/account_names` and `GET /v2/toml/{domain}` answer 500 until they exist. The compose files make
+  both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. Then the account domains are seeded once per network ([operations](operations.md#the-display-names),
+  [backfill](backfill.md#account-domains-seed)).
 
 ## Configuration and secrets
 

@@ -196,6 +196,19 @@ again after 5 minutes, doubling to an hour; if it never fits `GH_CLICKHOUSE_MAX_
 ledgers) finds the cursor far behind the head and leaves that stretch to `nft_dirty` (`nft_state: the stale NFTs of ledgers A - B are left to the dirty
 ranges`): `syncer_nft_dirty_ledgers` jumps by it and falls as the dirty sweep rebuilds it, while the live part follows the chain. Nothing is wrong.
 
+### `GET /v2/account_names` shows `kind: "domain"` for an account that should be verified, or `GET /v2/toml/{domain}` is 404 `toml not found`
+(1) The account has no `domain` in the answer: its Domain was set before the state history starts and has not changed since, or the seed was not run
+([backfill](backfill.md#account-domains-seed)). (2) The toml was not read yet: a new domain waits for the `tomls` worker (a 404 `toml not found`; `syncer_tomls_due`),
+and everything waits for the first sweep after a deploy. (3) The check failed: `GET /v2/toml/{domain}` says why in `reason` (a host that is down, a 404 on the file, a
+file that is not TOML, an integer above 2^53 anywhere in it) and a transient failure is tried again in an hour. (4) The toml does not list the address, or lists it for
+another network (an entry's `network` must be absent or one of the network's names), or its `desc` is over 64 characters (the domain is then the name). (5) The worker is
+off: `GH_DOMAIN_VERIFICATION=false`, `tomls` out of `GH_WORKERS`, or no outbound HTTPS (`syncer_tomls_checks_total` full of `dns_error`, `connect_error` or `timeout`). (6) The api
+has not loaded the toml directory (`Could not load the toml directory, keeping the last one`): no domain is a name until it has ([operations](operations.md#the-display-names)).
+
+### Syncer refuses to boot: `lacks the schema of 012_display_names.sql`
+The `tomls` worker is enabled and the database does not have `account_domains` and `domain_tomls`. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer
+again. A syncer of this release without the tables could not write a ledger either, so migrate before it starts ([deployment](deployment.md#schema-migrations)).
+
 ### AMM swaps, pools or days are missing before a date
 The ledgers were written by parser version 1, which has no AMM rows (`SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY
 parser_version`). Re-ingest them with `--reprocess` from the enablement ledger 86795265 ([backfill](backfill.md#amm-data-re-ingest)); the aggregator then rebuilds

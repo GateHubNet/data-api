@@ -169,7 +169,8 @@ function unixSecondsOf(value: unknown): UnixSeconds | null {
  * - `[[ACCOUNTS]]`: `address` (a classic address with a valid checksum, once: the first entry of a repeat is kept), `desc`.
  * - `[[CURRENCIES]]`: `code`, `issuer`, and the other scalar keys as `fields`; `[[VALIDATORS]]`: `public_key` and `fields`.
  * - `[[PRINCIPALS]]`: the `name` alone, without an `@`, once. An email or a social handle is never read.
- * - `[METADATA]`: `modified` (dropped before 2012 or more than a day after `fetchedAt`) and `expires`.
+ * - `[METADATA]`: `modified` (dropped before 2012 or more than a day after `fetchedAt`) and `expires`. Both are `null` outside what a
+ *   `DateTime('UTC')` column holds (1970 to 2106); `expires` is otherwise kept whatever its value against now, an expired date included.
  *
  * An unknown section, a key of another type and a nested table inside an entry are ignored; none fails a file.
  * Throws `TomlInvalidError` when the text is not TOML.

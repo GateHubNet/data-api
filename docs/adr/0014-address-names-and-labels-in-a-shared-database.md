@@ -1,7 +1,7 @@
 # ADR-0014: Address names and labels live in a shared database, written by hand
 
 **Status:** Accepted. The first exception to [ADR-0009](0009-one-deployment-per-network.md) (a database per network). Adds fields to
-`GET /v2/accounts/{address}` of the contract of [ADR-0010](0010-ripple-v2-wire-compatibility.md).
+`GET /v2/accounts/{address}` of the contract of [ADR-0010](0010-ripple-v2-wire-compatibility.md). Amended by [ADR-0017](0017-display-names.md): a batch lookup of names after all.
 
 ## Context
 The operator of the API wants to name addresses ("GateHub", "Bitstamp") and to mark them with labels (`scam`, `spam`, `advisory`). One key

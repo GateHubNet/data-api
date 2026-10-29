@@ -16,6 +16,7 @@ exporter and a shared library. This page explains the moving parts; the reasons 
  │   validations ─ collector      fee_stats ─ poller                 │
  │   aggregator ─ stats, volumes, AMM pools, rates, markets, rollups │
  │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
+ │   tomls ─ the toml of every domain accounts name (HTTPS)          │
  └──────────────────────────────┬────────────────────────────────────┘
                                 │ bulk inserts (ledger tables: children first, `ledgers` row = commit)
                                 ▼
@@ -70,6 +71,9 @@ Everything both services need, written once:
 - **`xrpl/node-client.ts`**: the resilient websocket `NodeClient` (failover, watchdog, re-subscribe), used by the syncer and the API.
 - **`query/`**: `RatesService` (exchange rates, vwap, used by the API *and* the aggregator), the daily-rate and account day-group reads of the
   account and market aggregates, and amount/decimal helpers.
+- **`tomls/`**: what the display names need of tomls, shared by the syncer's `tomls` worker, the validators checks and the api: `readToml` (what is kept of a
+  file), `cleanTomlText`, `accountDomainOf` (the one rule for an account's domain), `countsOn` (which entries count on a network), the store of tomls
+  (`recordToml`, `readStoredTomls`) and `ACCOUNT_DOMAINS_SEED_SQL`.
 - **`export/`**: the export jobs (`export_jobs`: append, read the current state, the queue) and the storage of their files
   (`ExportStorage`: `GcsExportStorage`, V4 signed links; `MemoryExportStorage` for tests), shared by the api and the exporter.
 - **`aggregate/`**: the `stats_hourly`, volume and AMM jobs (`amm_pools`, `amm_daily`) the aggregator runs, and the reads they share
@@ -79,11 +83,12 @@ Everything both services need, written once:
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
-A NestJS process with five optional **workers** (`GH_WORKERS`) and a probe/metrics HTTP surface: `ingest` (the single writer of the
-ledger tables, atomic per ledger), `validations`, `fee_stats`, `aggregator` and `validators` (the validator lists of the UNL publishers,
+A NestJS process with six optional **workers** (`GH_WORKERS`) and a probe/metrics HTTP surface: `ingest` (the single writer of the
+ledger tables, atomic per ledger), `validations`, `fee_stats`, `aggregator`, `validators` (the validator lists of the UNL publishers,
 domain verification, the node's amendment state, voting rounds and validator agreement; it makes outbound HTTPS requests to the
-publishers and to the validators' domains, [ADR-0012](adr/0012-validators-and-amendments-data.md)), plus the `range-ingest` CLI in the same image. Exactly one per
-network. Details: [syncer](syncer.md).
+publishers and to the validators' domains, [ADR-0012](adr/0012-validators-and-amendments-data.md)) and `tomls` (reads the toml of every domain that an account's
+`Domain` field names into `domain_tomls`, over HTTPS and through the same safe fetcher; it needs no node, [ADR-0017](adr/0017-display-names.md)), plus the
+`range-ingest` CLI in the same image. Exactly one per network. Details: [syncer](syncer.md).
 
 ### API: `apps/api` (`@gatehub/data-api-service`)
 
@@ -99,7 +104,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `amm`,
-  `nft`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `nft`, `names`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -144,6 +149,22 @@ The NFT routes are GateHub extras ([ADR-0016](adr/0016-nft-and-uritoken-data.md)
 - **Reads.** The events are read by `readDistinctPage` (a range of the primary key, the filters inside the capped read), the lists of the aggregates by
   `readNewestPage` (the newest version of each key, again with more room while a filter leaves a page short); both are bounded by `read_rows` tests
   (`paged-reads.e2e-spec.ts`).
+
+#### The names module (`apps/api/src/names`)
+
+`GET /v2/account_names` and `GET /v2/toml/{domain}` are GateHub extras ([ADR-0017](adr/0017-display-names.md)). `NamesModule` is in `ENDPOINT_MODULES`
+before `NotFoundModule` and owns:
+
+- **`NamesAndLabelsService`**, moved here from `accounts/` (ADR-0014's in-memory sets of names, network names and labels): one instance and one reload
+  timer, which `AccountsModule` imports.
+- **`AccountDomainsService`**: the current domain of the addresses a call asks, one keyed read of `account_domains` for the distinct addresses
+  (`argMax(domain_hex, version)`, never `FINAL`), each answer kept 60 s per address.
+- **`DomainTomlsService`**: the *directory* (`domain -> address -> desc` of the entries that count on this network, loaded at start and with the names; a failed
+  reload keeps the last one) and `get(domain)`, the newest row of one domain by key, kept 60 s. Before the first load `loaded` is false and no domain is a name.
+- **`DisplayNamesService`** puts them together with the pure `displayNameOf` (`display-name.ts`: `verified`, else `account`, else `domain`), and the two
+  controllers parse and answer; `account-names-object.ts` and `toml-object.ts` hold the key orders (the `*_KEYS` constants that
+  `names/api-reference.spec.ts` pins against the reference). The request-driven keys (the account domain of an address, the row of a domain) live in a cache of
+  their own (`NAMES_CACHE`), so that they cannot evict the coverage or amendments keys of the shared one.
 
 ### Exporter: `apps/exporter` (`@gatehub/data-exporter`)
 

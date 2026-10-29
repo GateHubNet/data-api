@@ -13,8 +13,8 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
-[Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [NFTs](#nfts) · [Validations](#validations) ·
-[Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
+[Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [NFTs](#nfts) · [Account names and tomls](#account-names-and-tomls) ·
+[Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
 [Operational endpoints](#operational-endpoints)
 
 ---
@@ -285,6 +285,11 @@ From the NFT data ([ADR-0016](adr/0016-nft-and-uritoken-data.md), [ADR-0010](adr
 [NFT endpoints](#nfts) (`/v2/nfts/{nft_id}` with `/history` and `/offers`, `/v2/accounts/{address}/nfts` and `/nft_history`,
 `/v2/nft_collections` with its collection and their `/nfts`, `/holders`, `/sales` and `/stats`, `/v2/nft_sales`), `GET /v2/network/nft_volume`,
 and the `coverage` field ([Coverage](#coverage)) that their answers carry.
+
+From the display names ([ADR-0017](adr/0017-display-names.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 79 to 83): the two routes of
+[Account names and tomls](#account-names-and-tomls), `GET /v2/account_names` (the display names of up to 100 addresses in one call, with their domains and
+labels; the key of the labels is `labels` where `GET /v2/accounts/{address}` says `account_labels`) and `GET /v2/toml/{domain}` (what the toml of a domain says,
+as the syncer last read it). No route of the original changes.
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -3329,6 +3334,264 @@ Errors, in the order they are checked (those of `/v2/payments/{currency}`): 400 
 For `GET /v2/network/nft_volume` see [Network](#get-v2networknft_volume).
 
 **Differences from data.ripple.com**: none, the endpoints are new.
+
+---
+
+## Account names and tomls
+
+GateHub extras: the original has neither. They serve the names the explorer shows in place of addresses. `GET /v2/account_names` gives the
+**display name** of up to 100 addresses in one call, with the account's domain and the labels the operator put on the address;
+`GET /v2/toml/{domain}` gives what a domain's toml says, as the syncer's `tomls` worker last read it (the "How we know" of the explorer's
+account page). The design is in the [spec](superpowers/specs/2026-10-24-display-names-design.md) and
+[ADR-0017](adr/0017-display-names.md); the worker that reads the tomls is in [syncer](syncer.md#8a-the-tomls-worker), the tables in
+[data-model](data-model.md#account_domains-p7-order-by-account-migration-012).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `Cache-Control`), with these rules for the
+objects, whose shape and key order are ours and are pinned by tests:
+
+- **The display name** of an address is the first of these that applies:
+  1. **`verified`**: the address has an *account domain* and that domain's toml, as last read, lists the address under `[[ACCOUNTS]]` in
+     an entry that counts on this network. `text` is the entry's `desc` when it is 1 to 64 characters, else the domain (a longer `desc` is
+     not a name, and nothing is cut).
+  2. **`account`**: the name the operator gave the address (`account_name`, [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md));
+     else the name the operator gave it on this network (`account_network_name`).
+  3. **`domain`**: the address has an account domain that nothing vouches for: its toml does not list the address, or could not be read, or has
+     not been read yet. `text` is the domain.
+  4. Otherwise there is no `display_name`.
+- **A `desc` can claim any name**, so `domain` is always in the answer beside a `verified` name, and a client shows it. `verified` says the
+  account names the domain and the domain lists the account; it does not say who runs either.
+- **The account domain** is the text of the account's `Domain` field when every byte is printable ASCII (0x21 to 0x7E, so no space), lower-cased
+  and well formed as rippled's `isProperlyFormedTomlDomain` reads it (4 to 128 characters, two or more labels of letters, digits and hyphens that
+  neither start nor end with a hyphen, and an alphabetic last label). A URL (`https://x.com`), a path, an IP address or an IPFS hash names no domain: the account has none, and so no `verified` or
+  `domain` name. It comes from the ledger's `AccountRoot` changes; a *deleted* account has none.
+- **A toml counts on a network** by its `network` keys. An `[[ACCOUNTS]]`, `[[CURRENCIES]]` or `[[VALIDATORS]]` entry counts when it has no
+  `network` or one of the network's names: XRPL `main`, `mainnet`; Xahau `main`, `mainnet`, `xahau`, `21337`; XRPL Testnet `testnet`; Xahau Testnet
+  `testnet`, `21338` (text, upper or lower case, or a bare integer). An entry for another network is stored and never served.
+- **Nothing is fetched on request.** Both routes read what the `tomls` worker stored: a domain is fetched only when an account's `Domain` names
+  it, once a day (a failed one on its own schedule, [syncer](syncer.md#8a-the-tomls-worker)), and a toml's text is parsed, never evaluated, and
+  nothing a toml holds (an icon, an attestation link, a `unl` URL) is ever followed. A **new** domain shows `domain`, not `verified`, until the
+  worker has read its toml (minutes after the account first names it, hours when the worker has a backlog).
+- **Freshness.** The names and labels are the sets of ADR-0014, reloaded every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s); so is the *toml
+  directory*, what every stored toml says of its accounts, which the api loads when it starts and with the names. The account domain is read
+  from `account_domains` at each call and kept 60 s per address. Until the api has loaded the directory once, no address is `verified` and no
+  domain is a name (unknown is not "not verified"): the names and labels are served as always.
+- **Coverage.** Neither route carries a `coverage` key (a lookup that lists nothing: [Coverage](#coverage)). The domains come from the account
+  history the parsers wrote, so **an account whose `Domain` was set before the state history starts and whose root has not changed since has no
+  account domain**, and so no verified name, until it changes (a payment received is enough) or the history is filled and ingested again
+  ([backfill](backfill.md#account-domains-seed)).
+- **Unknown parameters are ignored**, and neither route has `limit`, `marker`, `Link` or a CSV form: `format=csv` gives the JSON answer.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`. 401 and 429 are the usual ones.
+
+### `GET /v2/account_names`
+
+The display names of up to 100 addresses, for a page of the explorer: one call for every address on it.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `addresses` | required | 1 to 100 classic addresses separated by `,` (no spaces: nothing is trimmed). Each is checked, and the case matters (base58). A repeated parameter: the first wins. A repeated **address is answered at each place** and counts towards the 100. |
+
+Errors, in the order they are checked: 400 `addresses is required` (missing or empty); 400 `too many addresses - at most 100` (101 or more
+elements, valid or not); 400 `invalid ripple address` (an empty element, an X-address, a bad checksum, anything else); 500
+`unable to retrieve account names` (the read of the account domains failed: there is no answer without them, and the explorer shows addresses).
+No other check, and no 404: any address is answered, **one that is no account on this network still has its name and labels** (they belong to
+the address) and no domain.
+
+Four addresses (`GET /v2/account_names?addresses=rrrrrrrrrrrrrrrrrrrpnkLzyT5b,rrrrrrrrrrrrrrrrrrrpnkW55rwD,rrrrrrrrrrrrrrrrrrrpnkjf2SSq,rrrrrrrrrrrrrrrrrrrpnkmG5Qdx`):
+a verified name with its domain, an operator's name with a network name and an advisory label, an unverified domain, and an address nothing names.
+
+```json
+{
+  "result": "success",
+  "count": 4,
+  "account_names": [
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkLzyT5b",
+      "display_name": { "text": "Northpeak Treasury", "kind": "verified" },
+      "domain": "northpeak.example"
+    },
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkW55rwD",
+      "display_name": { "text": "Harborline Exchange", "kind": "account" },
+      "account_name": "Harborline Exchange",
+      "account_network_name": "hot wallet",
+      "labels": {
+        "advisory": { "description": "Withdrawals paused since 2026-10-01", "url": "https://harborline.example/status" }
+      }
+    },
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkjf2SSq",
+      "display_name": { "text": "lowtide.example", "kind": "domain" },
+      "domain": "lowtide.example"
+    },
+    { "address": "rrrrrrrrrrrrrrrrrrrpnkmG5Qdx" }
+  ]
+}
+```
+
+An address with labels only, with all three labels, each with the keys the operator gave (`GET /v2/account_names?addresses=rrrrrrrrrrrrrrrrrrrpnkAqFzdM`):
+
+```json
+{
+  "result": "success",
+  "count": 1,
+  "account_names": [
+    {
+      "address": "rrrrrrrrrrrrrrrrrrrpnkAqFzdM",
+      "labels": {
+        "scam": {
+          "description": "Fake giveaway",
+          "source": "Harbor compliance desk",
+          "url": "https://harborline.example/reports/1"
+        },
+        "spam": { "description": "Dust payments", "source": "Harbor compliance desk" },
+        "advisory": { "description": "Named in a warning" }
+      }
+    }
+  ]
+}
+```
+
+Keys of the answer, in order: `result, count, account_names`.
+
+Keys of an entry, in order: `address, display_name?, domain?, account_name?, account_network_name?, labels?`.
+
+Keys of display_name, in order: `text, kind`.
+
+Keys of a label, in order: `description, source?, url?`.
+
+What the fields say:
+
+- **`account_names`** has one entry per address asked, **in the order asked**; `count` is their number. A key without a value is left out, never `null`:
+  an address nothing names is its `address` alone.
+- **`domain`** is the account domain whatever its state: the toml of the domain was read and lists the address exactly when `display_name.kind`
+  is `verified`. `account_name`, `account_network_name` and `labels` are served whenever they exist, whatever the display name is (a verified
+  account that the operator also named has both).
+- **`labels`** is the object of `account_labels` on [`GET /v2/accounts/{address}`](#get-v2accountsaddress) (the key is `labels` here, where the
+  account says `account_labels`): keyed by label in the order `scam`, `spam`, `advisory`, each with the keys `description`, `source` and `url` that the
+  operator gave. `source` and `url` are left out when there is none.
+
+**Differences from data.ripple.com**: none, the endpoint is new ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 79 to 83).
+
+### `GET /v2/toml/{domain}`
+
+What the store says of one domain's toml: the explorer's account page reads it for "How we know". The api never fetches: the row is the newest one
+the `tomls` worker stored (kept 60 s in the api, a domain with no row too).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `domain` (path) | required | A domain as an account names it, `northpeak.example`. The case does not matter: it is lower-cased, and then must be a properly formed domain. |
+
+Errors, in the order they are checked: 400 `invalid domain` (not properly formed once lower-cased: a URL, a path, a port, an IP address, a single
+label such as `localhost`, an underscore, more than 128 characters); 404 `toml not found` (the store has no row for the domain: no account names it,
+or it has not been checked yet); 500 `unable to retrieve toml`. A domain whose last check failed is **not** a 404: it answers with `status: "failed"`.
+
+A domain whose toml was read (`GET /v2/toml/northpeak.example`):
+
+```json
+{
+  "result": "success",
+  "toml": {
+    "domain": "northpeak.example",
+    "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
+    "status": "ok",
+    "checked": "2026-10-24T07:12:09.410Z",
+    "fetched": "2026-10-24T07:12:09.410Z",
+    "modified": "2026-10-02T00:00:00Z",
+    "accounts": [
+      { "address": "rrrrrrrrrrrrrrrrrrrpaEDEVjEj", "desc": "Northpeak Treasury" },
+      { "address": "rrrrrrrrrrrrrrrrrrrpaEPPn7z7", "desc": "Northpeak Payroll" }
+    ],
+    "currencies": [
+      { "code": "NPUSD", "issuer": "rrrrrrrrrrrrrrrrrrrpaEDEVjEj", "display_decimals": 2, "name": "Northpeak Dollar" }
+    ],
+    "principals": ["Mara Lindqvist", "Tomas Okafor"],
+    "validators": [
+      {
+        "public_key": "nHUCsRY4GY2nvLSb1kv8AL8Rt36c9icCuZmBUKwzmoATeRcFkVMu",
+        "owner_country": "NO",
+        "server_country": "DE",
+        "unl": "https://vl.ripple.com"
+      }
+    ]
+  }
+}
+```
+
+A check that failed, an hour after the toml of `blip.example` was read (a transient failure, within the 24 hours of grace): the answer says what failed
+and still carries what the last read said (`GET /v2/toml/blip.example`):
+
+```json
+{
+  "result": "success",
+  "toml": {
+    "domain": "blip.example",
+    "toml_url": "https://blip.example/.well-known/xrp-ledger.toml",
+    "status": "failed",
+    "reason": "http_status",
+    "status_code": 503,
+    "checked": "2026-10-20T11:00:00.250Z",
+    "fetched": "2026-10-20T10:00:00.250Z",
+    "modified": "2026-10-01T00:00:00Z",
+    "accounts": [{ "address": "rrrrrrrrrrrrrrrrrrrpaEDEVjEj", "desc": "Tidewater Treasury" }],
+    "principals": ["Ines Brandt"]
+  }
+}
+```
+
+A definite failure (here a 404 on the file) carries nothing but the check (`GET /v2/toml/gone.example`):
+
+```json
+{
+  "result": "success",
+  "toml": {
+    "domain": "gone.example",
+    "toml_url": "https://gone.example/.well-known/xrp-ledger.toml",
+    "status": "failed",
+    "reason": "http_status",
+    "status_code": 404,
+    "checked": "2026-10-20T11:00:00.250Z"
+  }
+}
+```
+
+Keys of toml, in order: `domain, toml_url, status, reason?, status_code?, checked, fetched?, modified?, expires?, accounts?, currencies?, principals?, validators?`.
+
+Keys of a toml account, in order: `address, desc?`.
+
+Keys of a toml currency, in order: `code, issuer?, display_decimals?, symbol?, name?, desc?`.
+
+Keys of a toml validator, in order: `public_key, owner_country?, server_country?, unl?`.
+
+What the fields say:
+
+- **`toml_url`** is `https://{domain}/.well-known/xrp-ledger.toml`, on Xahau and Xahau Testnet `/.well-known/xahau.toml`. **`status`** is `ok` (the file was
+  fetched and read as TOML) or `failed`, and then **`reason`** is the safe fetcher's: `dns_error`, `connect_error`, `tls_error`, `timeout`,
+  `http_status` (with `status_code`, the HTTP status: a 5xx or a 429 is transient, any other 4xx is not), `too_large` (over 256 KiB),
+  `redirect_rejected`, `blocked_address` (the host resolves to a private address), `domain_invalid`, or `toml_invalid` (the file is not TOML).
+- **`checked`** is when the domain was last checked and **`fetched`** when the content was read (an instant of receipt,
+  `YYYY-MM-DDTHH:mm:ss.SSSZ`); `fetched` is left out when the toml has no content in effect. The content is what the last *good* read said, **in
+  effect for 24 hours** after a transient failure; after a definite failure (a 404, a file that is not TOML, a file that is too large, a redirect to
+  a bad place, a private address) or after the 24 hours it is gone, and the lists are left out.
+- **`modified`** and **`expires`** are wall times (`YYYY-MM-DDTHH:mm:ssZ`) from `[METADATA]`, in any form TOML or ISO writes a date (an offset
+  date-time, a local date-time read as UTC, a local date). `modified` is left out when the file gives none, a date before 2012-01-01 or more than a day
+  after the fetch. `expires` is kept whatever its value (an expired date is served as it is, and nothing is done with it), and a date outside 1970 to
+  2106 is no date.
+- **`accounts`** are the `[[ACCOUNTS]]` entries that count on this network, in file order: classic addresses with a valid checksum, a repeated address
+  once, at most 1,000. `desc` is the entry's description cleaned (below) and left out when there is none or it is over 256 characters.
+- **`currencies`** are the `[[CURRENCIES]]` entries that count, at most 200: `code` (1 to 40 characters), `issuer` when it is a classic address,
+  `display_decimals` when the file gives an integer from 0 to 30, and the text of `symbol`, `name` and `desc`. The other keys of an entry (an icon, an
+  attestation link, a custom key) stay in the store and are not served.
+- **`principals`** are the names of the `[[PRINCIPALS]]` (at most 100 characters each, ten of them, no repeat), and **nothing else of a principal**: an
+  email and the social handles are never read, and a principal whose name holds an `@` is dropped.
+- **`validators`** are the `[[VALIDATORS]]` entries that count, at most 100: `public_key`, and the text of `owner_country`, `server_country` and `unl`
+  (the URL of a list, text and never followed). **`[[SERVERS]]` and `[ORGANIZATION]` are never read.**
+- **Text is cleaned.** Every text of a toml is put in Unicode normal form C, loses its control characters and its bidirectional overrides and
+  isolates (so that a name cannot render as another), has each run of white space made one space, and is trimmed; a text over its cap is dropped, not cut.
+- **A file that is not valid TOML is `toml_invalid`, and one custom key can make it so**: the parser (`smol-toml`) refuses an integer it cannot hold
+  exactly (above 2^53 - 1 or below its negative), so `max_supply = 100000000000000000` anywhere in the file fails the whole file, and the domain shows
+  `failed` with no content. Write such a number as text or as a float.
+
+**Differences from data.ripple.com**: none, the endpoint is new ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 79 to 83).
 
 ---
 

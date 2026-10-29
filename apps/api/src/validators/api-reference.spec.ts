@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { hasOwn, REFERENCE, referenceChecks } from '../../test/support/api-reference-check';
 import * as amendmentObject from './amendment-object';
 import {
   AMENDMENT_DETAIL_KEYS,
@@ -45,14 +45,7 @@ import {
  * fit a line.
  */
 
-const REFERENCE = join(__dirname, '..', '..', '..', '..', 'docs', 'api-reference.md');
-const SECTION = 'Validators and amendments';
-
-/**
- * Whether `key` is an own key of `object`: `in` would take a key of the prototype (`constructor`, `toString`) for one of the
- * map. (`Object.hasOwn` is ES2022, past the ES2021 library of the repo's TypeScript.)
- */
-const hasOwn = (object: object, key: string): boolean => Object.prototype.hasOwnProperty.call(object, key);
+const HEADING = '## Validators and amendments';
 
 /** The object as the reference names it on its line, and the constant that holds its keys. One entry for each constant of the routes. */
 const OBJECTS: Record<string, readonly string[]> = {
@@ -88,51 +81,7 @@ const OBJECTS: Record<string, readonly string[]> = {
   'a history event': HISTORY_KEYS,
 };
 
-/** The section of the reference, from its `##` heading to the next one. */
-function sectionOf(markdown: string): string {
-  const heading = `\n## ${SECTION}\n`;
-  const start = markdown.indexOf(heading);
-  if (start < 0) throw new Error(`docs/api-reference.md has no "${SECTION}" section`);
-  const rest = markdown.slice(start + 1);
-  const end = rest.indexOf('\n## ', 1);
-  return end < 0 ? rest : rest.slice(0, end);
-}
-
-interface KeysLine {
-  object: string;
-  /** The keys as written, with the `?` of an optional one stripped. */
-  keys: string[];
-}
-
-/** Every `Keys of <object>, in order: ...` line of the section, in the order they stand. */
-function keyLines(markdown: string): KeysLine[] {
-  return [...sectionOf(markdown).matchAll(/^Keys of (.+?), in order: (.+)$/gm)].map(([, object, list]) => ({
-    object,
-    keys: list
-      .replace(/`/g, '')
-      .replace(/\.\s*$/, '')
-      .split(',')
-      .map((key) => key.trim().replace(/\?$/, '')),
-  }));
-}
-
-/** What is wrong with the lines of a reference, as sentences: a line that drifted, one that is missing, one nothing owns, one written twice. */
-function problemsOf(markdown: string): string[] {
-  const lines = keyLines(markdown);
-  const problems: string[] = [];
-  for (const [object, constant] of Object.entries(OBJECTS)) {
-    const own = lines.filter((line) => line.object === object);
-    if (own.length === 0) problems.push(`missing: no line for ${object}`);
-    else if (own.length > 1) problems.push(`twice: ${own.length} lines for ${object}`);
-    else if (JSON.stringify(own[0].keys) !== JSON.stringify(constant)) {
-      problems.push(`drifted: ${object} is written ${own[0].keys.join(', ')}; the code serves ${constant.join(', ')}`);
-    }
-  }
-  for (const { object } of lines) {
-    if (!hasOwn(OBJECTS, object)) problems.push(`unknown: a line for "${object}", which the map does not name`);
-  }
-  return problems;
-}
+const { keyLines, problemsOf, lineOf: lineIn } = referenceChecks(HEADING, OBJECTS);
 
 describe('the "Validators and amendments" section of docs/api-reference.md', () => {
   const markdown = readFileSync(REFERENCE, 'utf8');
@@ -166,13 +115,7 @@ describe('the "Validators and amendments" section of docs/api-reference.md', () 
   });
 
   describe('the check itself', () => {
-    const lineOf = (object: string): string => {
-      const found = /^Keys of .+?, in order: .+$/gm;
-      for (const [line] of sectionOf(markdown).matchAll(found)) {
-        if (line.startsWith(`Keys of ${object}, in order:`)) return line;
-      }
-      throw new Error(`no line for ${object}`);
-    };
+    const lineOf = (object: string): string => lineIn(markdown, object);
 
     it('finds a line whose keys swapped places', () => {
       const line = lineOf('a publisher');
@@ -212,7 +155,7 @@ describe('the "Validators and amendments" section of docs/api-reference.md', () 
 
     it('does not read a line of another section', () => {
       expect(() => keyLines(markdown.replace('\n## Validators and amendments\n', '\n## Other\n'))).toThrow(
-        'has no "Validators and amendments" section',
+        'has no "## Validators and amendments" heading',
       );
       const outside = markdown.replace('\n## Stats\n', '\n## Stats\n\nKeys of a ghost, in order: `a, b`.\n');
       expect(outside).not.toBe(markdown);

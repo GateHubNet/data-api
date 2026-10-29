@@ -9,7 +9,9 @@ differences are listed in [ADR-0010](docs/adr/0010-ripple-v2-wire-compatibility.
 XRP Ledger (pools and their history, swaps, liquidity events, votes and bids, LP positions, AMM volume): swaps against pools are exchanges
 ([ADR-0011](docs/adr/0011-amm-data-and-swaps-as-exchanges.md)); and **NFT data** on both networks (XRPL NFTokens and Xahau URITokens: events, owners,
 open offers, an account's NFTs, collections with supply and holders, sales with prices, NFT sales volume), each answer stating how much of the history
-it holds in `coverage` ([ADR-0016](docs/adr/0016-nft-and-uritoken-data.md)).
+it holds in `coverage` ([ADR-0016](docs/adr/0016-nft-and-uritoken-data.md)); and **display names**: the name to show for up to 100 addresses in one call
+(a verified name from the toml of the account's domain, else the name the operator gave the address, else its unverified domain), with the labels, and what a domain's
+toml says ([ADR-0017](docs/adr/0017-display-names.md)).
 
 One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
 
@@ -29,7 +31,7 @@ This is a **pnpm workspace** with two services, an exporter and a shared library
 data-api-new/
 ├── apps/
 │   ├── api/        @gatehub/data-api-service — REST API (reads ClickHouse; live node for balances/orders)
-│   ├── syncer/     @gatehub/data-syncer      — five workers (ingest, validations, fee_stats, aggregator, validators); range-ingest CLI
+│   ├── syncer/     @gatehub/data-syncer      — six workers (ingest, validations, fee_stats, aggregator, validators, tomls); range-ingest CLI
 │   └── exporter/   @gatehub/data-exporter    — makes the export files (POST /v2/exports) by walking the api's lists; GCS
 ├── packages/
 │   └── shared/     @gatehub/data-api-shared  — parsers, ledger writer, ClickHouse client + schema, node client, network profiles
@@ -54,7 +56,7 @@ docker compose up -d clickhouse            # ClickHouse on 127.0.0.1:8123
 cp apps/syncer/.env.example apps/syncer/.env
 cp apps/api/.env.example    apps/api/.env  # GH_NETWORK=xrpl by default; GH_API_KEYS empty = no authentication (development only)
 
-pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 011_nft_data)
+pnpm ch:migrate                            # creates the `xrpl` database and applies packages/shared/schema/*.sql (001_baseline ... 012_display_names)
 
 pnpm start:syncer                          # ingests the XRP Ledger from the validated head  (probe on :3002)
 pnpm start:api                             # serves /v2/* on :3001, Swagger at /internal/docs
@@ -127,6 +129,7 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | Network | `/v2/network/fees`, `/v2/network/fee_stats`, `/v2/network/exchange_volume`, `/v2/network/payment_volume`, `/v2/network/markets` (extra), `/v2/network/amm_volume` (AMM, extra), `/v2/network/nft_volume` (NFTs, extra) |
 | AMM (extras) | `/v2/amm/pools`, `/v2/amm/pools/{pool}`, `/v2/amm/pools/{base}/{counter}`, `/v2/amm/pools/{pool}/{history,swaps,liquidity,governance}` |
 | NFTs (extras, both networks) | `/v2/nfts/{nft_id}`, `/v2/nfts/{nft_id}/{history,offers}`, `/v2/accounts/{address}/{nfts,nft_history}`, `/v2/nft_collections`, `/v2/nft_collections/{issuer}/{taxon}` (XRPL) or `/{issuer}` (Xahau) with `/{nfts,holders,sales,stats}`, `/v2/nft_sales`; each answer has `coverage` |
+| Names (extras) | `/v2/account_names?addresses=` (the display names, domains and labels of up to 100 addresses), `/v2/toml/{domain}` (what a domain's toml says, as the syncer last read it) |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
 | Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |
@@ -167,6 +170,8 @@ network database. Set `TRUSTED_PROXIES` to your front proxy and bind nginx to an
 
 The `validators` worker needs outbound HTTPS to public hosts, and its migration (`002`) has a deploy order and a constraint with the AMM branch:
 read [Rolling out the validators and amendments data](docs/deployment.md#rolling-out-the-validators-and-amendments-data) before deploying it to a persistent environment.
+The `tomls` worker needs it to **every domain an account names** (tens of thousands of hosts), or `GH_DOMAIN_VERIFICATION=false`, and its migration (`012`) must be applied
+before the syncer of its release: [Display names rollout](docs/operations.md#the-display-names).
 
 ## Load and capacity testing
 

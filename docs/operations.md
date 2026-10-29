@@ -33,6 +33,7 @@ no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile 
 | Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 | NFT data | `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending`, `syncer_nft_skipped_total`, the `nft_state` / `nft_state_dirty` / `nft_collections` error labels, [the NFT data](#the-nft-data) |
+| Display names | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the rollout and the seed: [The display names](#the-display-names) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
 | Exports | `exporter-xrpl` / `exporter-xahau` (profile `exports`, one each): `GET /liveliness/healthz` on 3005, `exporter_jobs_total{status}`; the jobs are rows of `export_jobs` ([deployment](deployment.md#topology)) |
 | Account and market aggregates | `syncer_markets_live_age_seconds{period}`, `syncer_markets_live_amm_share_known{period}`, `syncer_pair_hourly_missing_hours`, `syncer_rates_daily_missing_days`, `syncer_account_rollups_pending_accounts`; see [Account and market aggregates](#account-and-market-aggregates) and [the AMM data additions](#the-amm-data-additions) |
@@ -105,7 +106,8 @@ The **account name** of an address ("GateHub", "Bitstamp") is written by hand in
 `GET /v2/accounts/{address}` (`account_name`) of **every network** within 60 s (`GH_NAMES_AND_LABELS_RELOAD_MS`), with no restart. The table is
 append-only: never `UPDATE`, `DELETE` or `OPTIMIZE ... FINAL` it, because its rows are the audit trail. The newest row of an address wins, so
 renaming is another insert and removing is an insert with `removed = 1`. Put your own name or email in `added_by`; `added_at` is filled in. A
-name shows only on a network where the address has an activation: elsewhere `/v2/accounts/{address}` answers 404 as before.
+name shows only on a network where the address has an activation: elsewhere `/v2/accounts/{address}` answers 404 as before. (`GET /v2/account_names`
+answers the name and the labels of any address, an account on that network or not, on the same reload.)
 
 In `clickhouse-client` (see [SQL health checks](#sql-health-checks) for how to open it):
 
@@ -673,6 +675,66 @@ SELECT from_ledger, to_ledger FROM xrpl.nft_dirty ORDER BY from_ledger;
 
 The coverage the API states is `GET /v2/nfts/{id}` or any list's `coverage` ([api-reference](api-reference.md#coverage)): `from_ledger_index` is that first query's
 answer plus one. On a testnet (`xrpl_testnet.`, `xahau_testnet.`) it is `complete: false` for ever: there is no backfill.
+
+## The display names
+
+The explorer shows an address by name wherever it shows one, and gets a page's names in one call: `GET /v2/account_names` (the operator's names and
+labels of [above](#name-an-address), and a **verified name** where an account's domain lists it in its toml) and `GET /v2/toml/{domain}`
+([api-reference](api-reference.md#account-names-and-tomls), [ADR-0017](adr/0017-display-names.md)). The pieces, all per network:
+
+| Piece | Cadence | Healthy | Watch |
+| --- | --- | --- | --- |
+| `account_domains`, written by the ingest (parser version 6) | with every ledger | a row for each change of an account that has a Domain | the [seed](backfill.md#account-domains-seed) fills it for the ledgers before the deploy |
+| The `tomls` worker of the syncer ([syncer](syncer.md#8a-the-tomls-worker)) | discovery every 5 minutes; a pass 60 s after the previous one, at most 300 domains, 16 at a time | a toml `ok` every 24 hours; `syncer_tomls_due` near 0 | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the `Tomls: ...` log lines |
+| The api's toml directory and names | loaded at start and every `GH_NAMES_AND_LABELS_RELOAD_MS` (60 s) | a toml read by the worker shows within a minute | `Could not load the toml directory, keeping the last one` (a `warn`) |
+| The account domain of an address | read at each call, kept 60 s per address | | a 500 `unable to retrieve account names` is a failed read of `account_domains` |
+
+**What the owner does to deploy** (per network, the sandbox first, then production; the order matters):
+1. **Apply migration `012_display_names.sql`** (`dc run --rm migrate-xrpl` / `migrate-xahau`) **before this release's syncer starts**: the ingest writes
+   `account_domains` with every ledger, and a write to a missing table fails the batch ([above](#apply-a-schema-migration)). The `tomls` worker refuses to boot
+   without it.
+2. **Deploy the syncer** (parser version 6; the `tomls` worker is in the default `GH_WORKERS`, and **where `GH_WORKERS` is set explicitly add `tomls`**) **and the api.**
+   The syncer needs **outbound HTTPS to every domain accounts name** ([deployment](deployment.md#outbound-network-access)): open the egress, or set
+   `GH_DOMAIN_VERIFICATION=false` (no toml is read, no name is verified, every domain shows as an unverified one).
+3. **Run the seed once per network** ([backfill](backfill.md#account-domains-seed), 16 buckets): it gives every account its current Domain from the state
+   history, which no reprocess does faster.
+4. **Wait for the first sweep**: `syncer_tomls_due` falls to near 0 (about 300 domains a minute, slower when many hosts time out; the number of domains is
+   `syncer_tomls_domains`). Until a domain is checked its accounts show it as an unverified domain.
+5. **Raise the explorer key's limit** in `GH_RATE_LIMIT_KEYS` if its 429s rise: the explorer makes one names call for most page renders (two on an account
+   page), and a key's limit is counted per key and route (`/v2/account_names` has a bucket of its own, [security](security.md#5-rate-limiting)).
+6. **Hand the explorer this commit** for its API sync. The explorer turns its `NAMES` switch on per environment once that environment's API serves both routes
+   and the sweep is done.
+
+**No reprocess.** The ledgers written before the deploy get their domains from the seed. **Coverage:** an account whose Domain was set before the state
+history starts and whose root has not changed since has no domain, so no verified name, until it changes (a payment received is enough) or the history is filled
+and ingested again ([backfill](backfill.md#account-domains-seed)). To roll back, remove the routes or take `tomls` out of `GH_WORKERS`; `012` needs no undo.
+
+- **A first sweep is slow, by design.** A mainnet names tens of thousands of domains; 300 a pass is about 300 a minute while the hosts answer. A host that is
+  down or slow keeps a lane for up to 10 s, 16 lanes at a time, so a sweep over many dead hosts is closer to 100 a minute.
+- **A domain is read once a day** (`GH_TOML_RECHECK_MS`), a failed one on its own schedule (an hour for a transient failure, 1, 2, 4 and 7 days for a definite one),
+  and **at once** (at most hourly) when more accounts name it than at the last discovery: an account that sets its Domain is verified within minutes. A host
+  that blips keeps its names for 24 hours.
+- **A name does not appear.** Check, in order: the account's domain (`GET /v2/account_names` has a `domain` key); the toml (`GET /v2/toml/{domain}`: 404 means it was
+  never checked, `status: "failed"` says why); that the toml lists the address under `[[ACCOUNTS]]` with no `network` or one of this network's names; that the `desc`
+  is at most 64 characters (a longer one gives the domain as the name). A toml with an integer above 2^53 anywhere in it fails whole (`toml_invalid`).
+- **Everything shows as an unverified domain.** The worker is off (`GH_DOMAIN_VERIFICATION=false`, or `tomls` out of `GH_WORKERS`), has no egress (`syncer_tomls_checks_total`
+  full of `dns_error`, `connect_error` and `timeout`), or the api has not loaded the toml directory (the `warn` above, and then no domain is a name at all).
+- **A host to block.** The worker fetches any host an account names: nothing is configurable per host. `GH_DOMAIN_VERIFICATION=false` is the switch, and egress filtering at the
+  network is the second line ([security](security.md#outbound-https-to-arbitrary-public-hosts-syncer)).
+
+```sql
+-- the state of the store: the newest check of each domain, counted by outcome
+SELECT s AS status, r AS reason, count() AS domains
+FROM (SELECT domain, argMax(status, checked_at) AS s, argMax(reason, checked_at) AS r FROM xrpl.domain_tomls GROUP BY domain)
+GROUP BY s, r ORDER BY domains DESC;
+-- one domain: its checks, newest first
+SELECT checked_at, status, reason, status_code, failures, next_check_at FROM xrpl.domain_tomls WHERE domain = '<domain>' ORDER BY checked_at DESC LIMIT 20;
+-- the accounts that name a domain now (what the worker discovers is these, grouped by domain)
+SELECT count() FROM (SELECT account, argMax(domain_hex, version) AS h, argMax(deleted, version) AS gone FROM xrpl.account_domains GROUP BY account) WHERE h != '' AND gone = 0;
+```
+
+`domain_tomls` has one row per check, and merges keep the newest row of a domain; it is small (rows of the domains accounts name). `account_domains` is ordered by
+account, so merges keep about one row per account and partition ([data-model](data-model.md#account_domains-p7-order-by-account-migration-012)).
 
 ## Backfill and repair
 

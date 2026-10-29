@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended five times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72); Amendment 5 (2026-10-24), by [ADR-0016](0016-nft-and-uritoken-data.md), the NFT and URIToken routes, the `coverage` field and `nft_volume` (the amendment at the end of this record, items 73 to 78). Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
+**Status:** Accepted. Amended six times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72); Amendment 5 (2026-10-24), by [ADR-0016](0016-nft-and-uritoken-data.md), the NFT and URIToken routes, the `coverage` field and `nft_volume` (the amendment at the end of this record, items 73 to 78); Amendment 6 (2026-10-24), by [ADR-0017](0017-display-names.md), the account names and toml routes (the amendment at the end of this record, items 79 to 83). Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -367,3 +367,29 @@ original served is served as before.
 
 Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#nfts) and
 [api-reference](../api-reference.md#get-v2networknft_volume).
+
+## Amendment 6 (2026-10-24): display names
+The display names (program 2, sub-project D4: [ADR-0017](0017-display-names.md), the wording in
+[api-reference](../api-reference.md#account-names-and-tomls)) add two routes the original did not have. Each is an addition: **no route of the original
+changes**, and the fields `account_name`, `account_network_name` and `account_labels` of `GET /v2/accounts/{address}` are as before.
+
+79. **`GET /v2/account_names`, as an extra.** The original predates names. Here `GET /v2/account_names?addresses=` answers `{result, count, account_names}`
+    with one entry per address asked, **in the order asked**: `{address, display_name?, domain?, account_name?, account_network_name?, labels?}`, a key
+    without a value left out and never `null`. `display_name` is `{text, kind}`, `kind` being `verified` (the toml of the account's domain lists the
+    address), `account` (the operator's name, else its name on this network) or `domain` (a domain nothing vouches for); `domain` is the account's domain
+    whatever its state. The parameter is 1 to 100 classic addresses separated by `,`, with no spaces and no trimming; a repeated address is answered at each
+    place and counts towards the 100; an X-address is refused; the first of a repeated `addresses` wins. Any address is answered: one that is no account on
+    the network keeps its name and labels and has no domain.
+80. **`GET /v2/toml/{domain}`, as an extra.** What the toml of a domain says, as the `tomls` worker last stored it: `{result, toml}` with `domain, toml_url,
+    status, reason?, status_code?, checked, fetched?, modified?, expires?, accounts?, currencies?, principals?, validators?`, only the entries that count on the
+    network and only the keys the reference lists (a principal's email and social handles are never read; `[[SERVERS]]` and `[ORGANIZATION]` neither). The
+    domain is lower-cased first. A failed check is a 200 with `status: "failed"`, not a 404. The api never fetches on a request.
+81. **The key of the labels is `labels`.** The batch's entry says `labels` where `GET /v2/accounts/{address}` says `account_labels`; the object is the
+    same (keyed `scam`, `spam`, `advisory`, each `description`, `source?`, `url?`).
+82. **Messages and checks.** The messages are new: 400 `addresses is required`, `too many addresses - at most 100`, `invalid ripple address`, `invalid domain`;
+    404 `toml not found`; 500 `unable to retrieve account names`, `unable to retrieve toml`. The checks run in this order: `addresses is required`, then
+    `too many addresses - at most 100`, then `invalid ripple address`; a failed read of the account domains fails the batch with its 500, and no answer is
+    made without them. Unknown parameters are ignored.
+83. **No `coverage`, no CSV, the default cache.** Neither answer carries `coverage` (a lookup that lists nothing: [Coverage](../api-reference.md#coverage));
+    neither has `limit`, `marker`, `Link` or a CSV form; both send the global `Cache-Control` (`private, max-age=60`) and errors `no-store`. An account
+    whose Domain was set before the state history starts and has not changed since has no domain until it does ([backfill](../backfill.md#account-domains-seed)).

@@ -120,7 +120,8 @@ const SHAPES: Record<Table, Shape> = {
   },
   [Table.NftSales]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, event_index' },
   [Table.NftTouches]: { engine: 'ReplacingMergeTree', partition: P6, order: 'ledger_index, tx_index, nft_id' },
-  // the domain of an account (migration 012): ordered by account, not by the unique key (ADR-0007's exception, spec 1.1)
+  // the domain of an account (migration 012): ordered by account, not by the unique key
+  // (the exception to ADR-0007, spec 1.1)
   [Table.AccountDomains]: { engine: 'ReplacingMergeTree', version: 'version', partition: P7, order: 'account' },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {

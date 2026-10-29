@@ -159,10 +159,14 @@ Prefix `syncer_`.
 | **`syncer_validators_rounds_lag_ledgers`** | Gauge | | Newest committed voting ledger minus the newest stored amendment voting round |
 | **`syncer_amendments_without_metadata`** | Gauge | | Amendments seen (node, ledger, votes) without an entry in the amendment metadata file |
 | `syncer_validator_validations_flushed_total` | Counter | `table` | Rows written to `validator_validations` and `validator_seen` |
+| `syncer_tomls_checks_total` | Counter | `outcome` | Checks of the toml of a domain an account names, `ok` or the reason code of the failure (`dns_error`, `connect_error`, `tls_error`, `timeout`, `http_status`, `too_large`, `redirect_rejected`, `blocked_address`, `domain_invalid`, `toml_invalid`), counted when the check's row is written |
+| **`syncer_tomls_domains`** | Gauge | `status` | After each pass of the `tomls` worker, the domains accounts name by the state of their toml: `ok` (the last check read it), `failed` (the last check did not) and `unchecked` (never checked) |
+| **`syncer_tomls_due`** | Gauge | | Domains due and not checked yet at the end of the last pass: the backlog (about 300 a minute are checked). Falls to 0 after the first sweep of a deployment |
+| **`syncer_tomls_discovery_seconds`** | Gauge | | Seconds the last read of the domains accounts name took (the whole of `account_domains`, every five minutes). Set when the read fails too |
 | `syncer_process_*`, `syncer_nodejs_*` | | | Default process metrics |
 
 The `syncer_validators_*` and `syncer_amendments_*` metrics are set by the `validators` worker, `syncer_validator_validations_flushed_total`
-by the validations collector. A labelled metric has no series until its first observation: a publisher that was never fetched has no
+by the validations collector and the `syncer_tomls_*` metrics by the `tomls` worker. A labelled metric has no series until its first observation: a publisher that was never fetched has no
 `syncer_validators_unl_*` series. The three unlabelled gauges (`syncer_validators_agreement_lag_seconds`,
 `syncer_validators_rounds_lag_ledgers`, `syncer_amendments_without_metadata`) read 0 until the `validators` worker first sets them,
 so alert on them only once the worker runs.
@@ -192,6 +196,10 @@ rate(api_rates_on_read_total[5m])                                   # rates work
 rate(syncer_validations_flushed_total[5m]) == 0                     # XRPL: validators validate every ledger
 syncer_validators_unl_expiry_seconds < 7 * 86400                    # a validator list expires within a week
 rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0        # a rounds or agreement run failed
+syncer_tomls_due                                                    # the backlog of tomls to read: falls to 0 after the first sweep; alert above 2000 for 2h
+syncer_tomls_discovery_seconds > 10                                 # the read of the domains accounts name outgrew its budget (alert for 30m)
+absent(syncer_tomls_domains)                                        # a tomls worker that never discovered a domain (alert where the worker runs)
+sum by (outcome) (rate(syncer_tomls_checks_total[1h]))              # what the checks come to: ok, or the reasons of the failures
 ```
 
 The gauges describe what *this process* has done since boot: scrape each network's syncer separately.
@@ -214,7 +222,7 @@ in the network's database counts them.
 Both services log through the NestJS `Logger` via the toolbox logger (stdout/stderr; capture it with your container log pipeline).
 There are **no `GH_LOGGER_*` variables**: the toolbox logger decides the format (colour is switched off outside dev/test). Contexts to
 grep for: `Syncer` (boot line with network, workers and node hosts), `NodeClient` (connects, reconnects, silence), `LiveRunner`
-(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `AggregatorService` (including the AMM lines:
+(state changes, recovery, halts), `RangeIngest`, `ValidationsCollector`, `FeeStatsPoller`, `TomlChecker` / `DomainDiscovery` / `TomlsWorker` (the `Tomls: ...` lines, [syncer](syncer.md#8a-the-tomls-worker)), `AggregatorService` (including the AMM lines:
 `Aggregator job amm_pools failed for pool ..., set aside to be tried again`, and the warning `Aggregator job amm_pools: a batch of N pool(s)
 failed as a whole, but its halves were rebuilt: ...`, which is counted as one error and means the batch failed for its size, not that a pool is
 bad; the same lines for the NFT jobs: `Aggregator job nft_state failed for NFT <id>, set aside to be tried again`, `... nft_collections failed for
@@ -265,6 +273,9 @@ The probe only tells you the app can *reach* ClickHouse. Scrape ClickHouse direc
 | **Validator list expiring** | `syncer_validators_unl_expiry_seconds < 7 * 86400` | A publisher's list expires within a week (it already has when the value is negative; an expired list is still used, flagged `expired`): check the publisher |
 | Validator agreement behind | `syncer_validators_agreement_lag_seconds > 7200` for 30m | The agreement job has not finalised an hour for over two hours |
 | Voting rounds behind | `syncer_validators_rounds_lag_ledgers > 1024` for 30m | The rounds job is more than four flag intervals behind the committed ledgers |
+| **Tomls backlog** | `syncer_tomls_due > 2000` for 2h | The `tomls` worker cannot keep up with the domains accounts name, or is stuck: it checks at most 300 a minute, fewer when many hosts time out (16 lanes of up to 10 s). Look at `syncer_tomls_checks_total` (a rise of `timeout` or `dns_error`) and the `Toml checks: the pass failed` lines. Expected, and below the threshold in time, during the first sweep of a deployment |
+| **Tomls discovery slow** | `syncer_tomls_discovery_seconds > 10` for 30m | The read of the domains accounts name outgrew its budget (it reads the whole of `account_domains` every five minutes: under 2 s on a healthy table): the table has outgrown the read, or ClickHouse is loaded. Raise `TOML_DISCOVERY_INTERVAL_MS` in code or narrow the read; a read that keeps failing shows as `Toml discovery: the pass failed` |
+| Tomls never discovered | `absent(syncer_tomls_domains)` for 15m, on a syncer that runs the `tomls` worker with `GH_DOMAIN_VERIFICATION=true` | The worker never completed a discovery (ClickHouse refused the read, the table is missing): no pass is made until one works. The labelled gauge has no series before the first pass. Not to be alerted on a syncer without the worker or with `GH_DOMAIN_VERIFICATION=false` |
 | Validators jobs failing | `rate(syncer_validators_jobs_total{outcome="error"}[15m]) > 0` for 30m | Rounds or agreement not refreshing |
 | Amendment without metadata | `syncer_amendments_without_metadata > 0` for 1d | The node, the ledger or the votes name an amendment that the metadata file lacks: add its entry (`pnpm --filter @gatehub/data-api-shared amendments:check --network xrpl\|xahau\|xrpl-testnet\|xahau-testnet` lists them) |
 | Validations flowing | `rate(syncer_validations_flushed_total[10m]) == 0` for 10m on XRPL | Collector or its nodes down |

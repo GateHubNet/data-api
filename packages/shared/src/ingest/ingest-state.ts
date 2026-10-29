@@ -18,10 +18,10 @@ export interface LedgerKeyedTable {
 /**
  * Every table whose rows belong to one ledger: the 19 ledger-derived tables of the baseline schema (the 14 of the
  * Ripple v2 data and the 5 AMM ledger tables), `account_states` (migration 005), `trust_line_states` (006),
- * `path_payments` (007), `account_path_payments` (008), the 5 NFT ledger tables (011) and `account_domains` (012), the
- * ones that carry a `ledger_index` column and a dedup window. Fee stats, validations, manifests, aggregates (`amm_pools`,
- * `amm_daily` and the NFT aggregates among them), `domain_tomls` and the bookkeeping tables are not in the list, because
- * a ledger's rewrite must not touch them.
+ * `path_payments` (007), `account_path_payments` (008), the 5 NFT ledger tables (011) and `account_domains` (012),
+ * the ones that carry a `ledger_index` column and a dedup window. Fee stats, validations, manifests, aggregates
+ * (`amm_pools`, `amm_daily` and the NFT aggregates among them), `domain_tomls` and the bookkeeping tables are not in
+ * the list, because a ledger's rewrite must not touch them.
  *
  * The first entry is the commit marker (`ledgers`): a ledger is deleted by removing that row first, so a delete that
  * dies halfway leaves uncommitted rows behind, which recovery removes, and never a committed ledger with missing rows.

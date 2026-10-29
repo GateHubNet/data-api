@@ -3388,6 +3388,58 @@ paths:
           description: ''
       tags:
       - nft_sales
+  "/v2/account_names":
+    get:
+      operationId: AccountNamesController_list
+      summary: Get the display names of up to 100 addresses
+      description: 'One entry per address asked, in the order asked (an address asked
+        twice is answered at each place). `display_name` is the name to show and what
+        stands behind it: `verified` (the toml of the account domain lists the address;
+        the text is its description, else the domain), `account` (the name the operator
+        gave the address) or `domain` (the account domain, which nothing vouches for).
+        `domain` is the account domain whatever its state; `account_name`, `account_network_name`
+        and `labels` are served whenever they exist. Any address is answered: one
+        that is no account on this network still has its name and labels and no domain.
+        A key without a value is left out.'
+      parameters:
+      - name: addresses
+        required: true
+        in: query
+        description: 1 to 100 classic addresses separated by `,` (no spaces). A repeated
+          address is answered at each place and counts towards the 100. Case matters.
+        schema: {}
+      responses:
+        '200':
+          description: ''
+      tags:
+      - account_names
+  "/v2/toml/{domain}":
+    get:
+      operationId: TomlController_get
+      summary: Get what the toml of a domain says
+      description: 'What the toml file of a domain says, as the last check of it stored:
+        the accounts it lists, the currencies, the principals'' names and the validators,
+        only the entries that count on this network (no network, or a name of it).
+        `status` is `ok` (the file was read) or `failed`, with the `reason` and, for
+        `http_status`, the `status_code`; a failed toml within 24 hours of its last
+        read still carries what that read said, one after a definite failure carries
+        nothing but the check. `checked` is when the domain was last checked, `fetched`
+        when the content was read. Emails and social handles are never served. A key
+        without a value is left out. 404 when the domain has not been checked (no
+        account names it, or the check has not run yet).'
+      parameters:
+      - name: domain
+        required: true
+        in: path
+        description: A domain as an account names it (`northpeak.example`); the case
+          does not matter.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+      tags:
+      - toml
   "/v2/active_accounts/{base}/{counter}":
     get:
       operationId: ActiveAccountsController_activeAccounts

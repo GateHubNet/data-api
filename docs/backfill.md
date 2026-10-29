@@ -114,8 +114,9 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   dropped for an amount that is an MPT amount are counted in `syncer_nft_skipped_total`, and the range-ingest log names the total of its run
   (a warning when it is not 0, and the last line says `J skipped NFT events` always).
   Parser version 6 (the current one) adds the Domain of every account root that has or had one (`account_domains`, a row for each change
-  of such an account): ledgers written by an older version have none. A reprocess gives them theirs; an account whose Domain was set before
-  the history that is ingested is learnt at its next change.
+  of such an account): ledgers written by an older version have none. **No reprocess is needed for them**: a one-off SQL seed gives every
+  account its current Domain from the state history ([Account domains seed](#account-domains-seed)), and an account whose Domain was set
+  before that history is learnt at its next change. A `--reprocess` of a range writes the rows of its ledgers, as for every table.
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.
@@ -282,6 +283,75 @@ days come first and an empty day is cheap, but `volume_backfill` stays busy with
    `complete`.
 5. **The testnets** (XRPL Testnet, Xahau Testnet) get no backfill: their index starts at the validated head of their deployment's first boot, and
    their NFT answers stay `complete: false`.
+
+### Account domains seed
+
+`PARSER_VERSION` became 6 with the Domain of accounts (`DOMAIN_PARSER_VERSION`, [ADR-0017](adr/0017-display-names.md)): from the deploy on, the
+live syncer writes an `account_domains` row for every change of an account that has a Domain. The ledgers written before it have none, and
+without more **no account would have an account domain, and so no verified name, until it next changed**. The state history already holds each
+account's Domain (`account_states.fields`), so the operator **seeds** the table from it, once per network, instead of reprocessing the history: the
+seed copies the newest state row of every account that has a Domain, in 16 buckets of accounts (`cityHash64(account) % 16`) so that the `GROUP BY account`
+of one statement stays within memory. **No reprocess is needed for D4**, and `domain_tomls` needs no backfill: the `tomls` worker's first sweep fills it.
+
+**When.** After migration `012_display_names.sql` is applied and the syncer of this release is running ([the rollout](operations.md#the-display-names)): from
+then on every new ledger is written by parser version 6, so `X` stops moving, and no change falls between the seed and the live rows. Before it, the old
+parser would go on writing ledgers that have no `account_domains` rows.
+
+**`X`** is the last ledger an older parser wrote: the seed reads the state history up to it, and the ledgers above it are the parser's own.
+
+```sql
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 6;
+```
+
+(NULL, `\N` in the client: every stored ledger was written by parser version 6, and there is nothing to seed.)
+
+**The statement**, run once for each `bucket` from 0 to 15, with `X` and `bucket` as query parameters:
+
+```sql
+INSERT INTO account_domains (account, ledger_index, tx_index, node_index, version, domain_hex, deleted)
+SELECT account, top.1, top.2, top.3,
+       bitOr(bitShiftLeft(toUInt64(top.1), 32), bitOr(bitShiftLeft(toUInt64(top.2), 16), toUInt64(top.3))), hex, 0
+  FROM (SELECT account,
+               argMax((ledger_index, tx_index, node_index), (ledger_index, tx_index, node_index)) AS top,
+               argMax(JSONExtractString(fields, 'Domain'), (ledger_index, tx_index, node_index)) AS hex,
+               argMax(deleted, (ledger_index, tx_index, node_index)) AS gone
+          FROM account_states
+         WHERE ledger_index <= {X:UInt32} AND cityHash64(account) % 16 = {bucket:UInt8}
+         GROUP BY account)
+ WHERE hex != '' AND gone = 0
+```
+
+**Running it.** For example, with the statement saved as `account-domains-seed.sql`, from the repo root, `dc` as in [operations](operations.md) (the container's
+own environment authenticates, the password stays off the host command line):
+
+```bash
+ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" "$@"' sh "$@"; }
+X=$(ch -q "SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 6")
+for bucket in $(seq 0 15); do ch --database xrpl --param_X="$X" --param_bucket="$bucket" < account-domains-seed.sql; done
+```
+
+On Xahau use `xahau.ledgers` and `--database xahau`; on the sandbox `xrpl_testnet` and `xahau_testnet`.
+
+**Checking it.** The accounts that have a domain now (a deleted account and an empty Domain are not one), which is what the discovery of the `tomls` worker finds:
+
+```sql
+SELECT count() FROM (SELECT account, argMax(domain_hex, version) AS hex, argMax(deleted, version) AS gone FROM xrpl.account_domains GROUP BY account)
+ WHERE hex != '' AND gone = 0;
+```
+
+Then watch `syncer_tomls_domains` and `syncer_tomls_due` ([observability](observability.md#4-metrics-syncer)): the worker discovers the seeded domains within five
+minutes, and its first sweep reads their tomls at about 300 domains a minute.
+
+How the seed behaves:
+
+- **The seed's row sits on the account's newest state row at or below `X`**: its `ledger_index`, `tx_index` and `node_index`, and the `version` the parser
+  gives that row. So a later `--reprocess` of that ledger deletes it and the parser writes the same row back.
+- **It is safe to run twice**, or again for one bucket after a failure: the same rows are inserted again, and the row with the largest `version` of an
+  account is its current Domain either way (readers take `argMax(domain_hex, version)`, never `FINAL`). An account without a Domain and a deleted account get no row.
+- **Coverage.** The seed is as good as `account_states`: the state tables start at the first ledger parser version 3 wrote
+  ([Account state history re-ingest](#account-state-history-re-ingest)), and an account whose Domain was set before that and whose root has not changed since has no
+  row. It has **no domain, and so no verified name, until its next change** (a payment received is enough), or until the history is filled from ledger 32570
+  and ingested again with parser version 6. The names answer carries no `coverage` for this ([api-reference](api-reference.md#account-names-and-tomls)).
 
 ### Public nodes and rate limits
 
