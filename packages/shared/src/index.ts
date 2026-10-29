@@ -20,6 +20,7 @@ export * from './parsers/nft.parser';
 export * from './parsers/parser.interface';
 export * from './parsers/path-payments.parser';
 export * from './parsers/payment.parser';
+export * from './parsers/permissions';
 export * from './parsers/trust-line-states.parser';
 
 // Network
@@ -82,6 +83,9 @@ export * from './query/valuation';
 export * from './util/amount';
 export * from './util/ctid';
 export * from './util/helpers';
+export * from './util/keylets';
+export * from './util/mpt';
 export * from './util/nftoken-id';
 export * from './util/quality';
+export * from './util/stable-json';
 export * from './util/time';

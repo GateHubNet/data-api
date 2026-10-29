@@ -61,6 +61,11 @@ export interface NetworkProfile {
    * is in every profile, with that value written out.
    */
   readonly firstLedger: number | undefined;
+  /**
+   * Whether the network has permission delegation (the `Delegate` field, `DelegateSet` and the `Delegate` ledger object):
+   * the XRP Ledger and its testnet do; Xahau has no such amendment. The key is in every profile.
+   */
+  readonly hasDelegation: boolean;
   /** The node software of the network: it decides how `server_version` is decoded. */
   software: 'rippled' | 'xahaud';
   /** Where a validator's domain publishes its TOML file. */
@@ -116,6 +121,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
     partialPaymentFixLedger: 4594094,
     firstLedger: 32570,
+    hasDelegation: true,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     tomlNetworkNames: ['main', 'mainnet'],
@@ -140,6 +146,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultNodeEndpoints: ['wss://xahau.network'],
     partialPaymentFixLedger: 0,
     firstLedger: 1,
+    hasDelegation: false,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
@@ -164,6 +171,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultNodeEndpoints: ['wss://s.altnet.rippletest.net:51233', 'wss://testnet.xrpl-labs.com'],
     partialPaymentFixLedger: 0,
     firstLedger: undefined,
+    hasDelegation: true,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     tomlNetworkNames: ['testnet'],
@@ -198,6 +206,7 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     defaultNodeEndpoints: ['wss://xahau-test.net'],
     partialPaymentFixLedger: 0,
     firstLedger: undefined,
+    hasDelegation: false,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     tomlNetworkNames: ['testnet', '21338'],

@@ -60,6 +60,15 @@ export function senderAccount(tx: Readonly<Record<string, unknown>>): string | u
   return account === '' ? ACCOUNT_ZERO : account;
 }
 
+/**
+ * Who pays the transaction's fee: its `Delegate` when it names one (a non-empty string), else `senderAccount(tx)`. An
+ * account that sends a transaction for a delegator pays the fee, not the delegator whose `Account` it is.
+ */
+export function feePayer(tx: Readonly<Record<string, unknown>>): string | undefined {
+  const delegate = tx.Delegate;
+  return typeof delegate === 'string' && delegate !== '' ? delegate : senderAccount(tx);
+}
+
 export function toParserTx(raw: RawTransaction, header: LedgerHeader, client: string | null): ParserTx {
   return {
     hash: raw.hash,

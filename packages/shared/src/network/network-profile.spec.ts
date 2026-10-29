@@ -40,6 +40,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultNodeEndpoints: ['wss://s2.ripple.com', 'wss://xrplcluster.com'],
       partialPaymentFixLedger: 4594094,
       firstLedger: 32570,
+      hasDelegation: true,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       tomlNetworkNames: ['main', 'mainnet'],
@@ -64,6 +65,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultNodeEndpoints: ['wss://xahau.network'],
       partialPaymentFixLedger: 0,
       firstLedger: 1,
+      hasDelegation: false,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
@@ -88,6 +90,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultNodeEndpoints: ['wss://s.altnet.rippletest.net:51233', 'wss://testnet.xrpl-labs.com'],
       partialPaymentFixLedger: 0,
       firstLedger: undefined,
+      hasDelegation: true,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       tomlNetworkNames: ['testnet'],
@@ -112,6 +115,7 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       defaultNodeEndpoints: ['wss://xahau-test.net'],
       partialPaymentFixLedger: 0,
       firstLedger: undefined,
+      hasDelegation: false,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       tomlNetworkNames: ['testnet', '21338'],
@@ -222,6 +226,10 @@ describe('network profiles', () => {
         // `Object.hasOwn` is ES2022, past the ES2021 library of the repo's TypeScript
         expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), 'firstLedger')).toBe(true);
       }
+    });
+
+    it('hasDelegation is true on xrpl and its testnet and false on Xahau and its testnet', () => {
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasDelegation)).toEqual([true, false, true, false]);
     });
 
     it('defaults to xrpl when GH_NETWORK is unset', () => {
