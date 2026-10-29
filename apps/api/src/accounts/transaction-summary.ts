@@ -2,6 +2,7 @@ import {
   amountToValueString,
   deliveredAmount,
   dropsToNative,
+  feePayer,
   ParseContext,
   PaymentParser,
   TransactionsRow,
@@ -13,14 +14,17 @@ import { fmtTxDate } from '../common/format';
  * opening the raw transaction. Every column is there on every row, `null` (an empty cell) where the transaction has
  * nothing for it, so that the header is the same on every page. In this order:
  *   hash, ledger_index, executed_time, tx_type, result, initiator, counterparty, amount, currency, issuer, fee,
- *   flags_changed
+ *   flags_changed, delegate
  *
  *  - `initiator`: the account sent the transaction (its `Account`), rather than being only affected by it;
  *  - `counterparty`, `amount`, `currency`, `issuer`: from the mapping of the transaction type (`SIDES`), from the
  *    account's side. Amounts are exact decimal strings in whole units; the native currency has no issuer;
- *  - `fee`: in whole units of the native currency, on the transactions the account sent only;
+ *  - `fee`: in whole units of the native currency, on the row of the account that paid it (`feePayer`: the transaction's
+ *    `Delegate` when it names one, else its sender) and on no other: a delegated transaction's fee is the delegate's,
+ *    whose row is not the initiator's;
  *  - `flags_changed`: the account flags the transaction set or cleared. Empty: the account state history that tells it
- *    is not recorded yet.
+ *    is not recorded yet;
+ *  - `delegate`: the transaction's `Delegate`, on the row of every account it affected; empty when it has none.
  */
 export interface TransactionSummary {
   hash: string;
@@ -36,6 +40,7 @@ export interface TransactionSummary {
   issuer: string | null;
   fee: string | null;
   flags_changed: string | null;
+  delegate: string | null;
 }
 
 type Json = Readonly<Record<string, any>>;
@@ -145,7 +150,8 @@ export function toTransactionSummary(row: TransactionsRow, account: string, ctx:
     amount: side.amount ?? null,
     currency: side.currency ?? null,
     issuer: side.issuer ?? null,
-    fee: initiator ? dropsToNative(row.fee) : null,
+    fee: feePayer(tx) === account ? dropsToNative(row.fee) : null,
     flags_changed: null,
+    delegate: typeof tx.Delegate === 'string' && tx.Delegate !== '' ? tx.Delegate : null,
   };
 }

@@ -1,11 +1,22 @@
-import { AccountTransactionsRow, Table } from '@gatehub/data-api-shared';
+import {
+  AccountTransactionsRow,
+  getNetworkProfile,
+  LedgerWriter,
+  parseContextFor,
+  RawLedger,
+  Table,
+} from '@gatehub/data-api-shared';
+import { delegatedFrom, SYNTHETIC_DELEGATE } from '../../../packages/shared/test/synthetic-delegated';
+import { syntheticHash } from '../../../packages/shared/test/synthetic-hash';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { csvDisposition } from './support/csv';
 import {
-  FixtureTx,
   fixtureAccountTransactions,
   fixtureAccountTxBySequence,
+  fixtureSource,
+  fixtureTransaction,
   fixtureTransactions,
+  FixtureTx,
 } from './support/fixtures';
 import { expectBoundedInOrderRead, isPageRead } from './support/plans';
 
@@ -786,7 +797,7 @@ describe('account transactions API endpoint', () => {
 
   describe("format=csv: one summary row per transaction, from the account's side", () => {
     const HEADER =
-      '"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"';
+      '"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed","delegate"';
     const csvOf = async (path: string) => {
       const res = await get(path);
       expect([path, res.status, res.headers['content-type']]).toEqual([path, 200, expect.stringMatching(/^text\/csv/)]);
@@ -812,53 +823,53 @@ describe('account transactions API endpoint', () => {
       expect(res.text).toBe(
         [
           HEADER,
-          `"${PAYMENT_TO_RECIPIENT}","1021029","2013-06-11T20:01:20+00:00","Payment","tesSUCCESS","false","rJR7gjNe3DpJ7kpB4CHBxjDKfwVMpTKPpj","1000","XRP","","",""`,
+          `"${PAYMENT_TO_RECIPIENT}","1021029","2013-06-11T20:01:20+00:00","Payment","tesSUCCESS","false","rJR7gjNe3DpJ7kpB4CHBxjDKfwVMpTKPpj","1000","XRP","","","",""`,
         ].join('\n'),
       );
     });
 
     it('a sent payment: the destination, the delivered amount and the fee', async () => {
       expect(await lineOf(SENDS_XRP, PAYMENT_TO_RECIPIENT)).toBe(
-        `"${PAYMENT_TO_RECIPIENT}","1021029","2013-06-11T20:01:20+00:00","Payment","tesSUCCESS","true","${RECIPIENT}","1000","XRP","","0.00001",""`,
+        `"${PAYMENT_TO_RECIPIENT}","1021029","2013-06-11T20:01:20+00:00","Payment","tesSUCCESS","true","${RECIPIENT}","1000","XRP","","0.00001","",""`,
       );
     });
 
     it('an issued currency payment, from both parties: the amount, its currency and its issuer', async () => {
       expect(await lineOf(EUR_SENDER, EUR_PAYMENT)).toBe(
-        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","${EUR_RECIPIENT}","2","EUR","${BUSY}","0.012",""`,
+        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","true","${EUR_RECIPIENT}","2","EUR","${BUSY}","0.012","",""`,
       );
       expect(await lineOf(EUR_RECIPIENT, EUR_PAYMENT)).toBe(
-        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","false","${EUR_SENDER}","2","EUR","${BUSY}","",""`,
+        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","false","${EUR_SENDER}","2","EUR","${BUSY}","","",""`,
       );
     });
 
     it('a failed payment: the destination and the fee, but no amount, since it delivered nothing', async () => {
       const failed = 'BE9FAA33175BBA52D4200ABFEF9A6BF8A9F977CE12B8B3E1FC6695E0F00C07FD';
       expect(await lineOf('rUeXUxaMTH1pELvD2EkiHTRcM9FsH3v4d7', failed)).toBe(
-        `"${failed}","11616411","2015-02-09T18:15:20+00:00","Payment","tecNO_DST_INSUF_XRP","true","rPTFJDMfRnY8RBsvsiYDGp6Gmuguoxg3FB","","","","0.01",""`,
+        `"${failed}","11616411","2015-02-09T18:15:20+00:00","Payment","tecNO_DST_INSUF_XRP","true","rPTFJDMfRnY8RBsvsiYDGp6Gmuguoxg3FB","","","","0.01","",""`,
       );
     });
 
     it('a TrustSet: the peer and the limit', async () => {
       expect(await lineOf(TRUSTER, TRUST_SET)).toBe(
-        `"${TRUST_SET}","11119932","2015-01-14T18:51:40+00:00","TrustSet","tesSUCCESS","true","${FCD_ISSUER}","100","FCD","${FCD_ISSUER}","0.012",""`,
+        `"${TRUST_SET}","11119932","2015-01-14T18:51:40+00:00","TrustSet","tesSUCCESS","true","${FCD_ISSUER}","100","FCD","${FCD_ISSUER}","0.012","",""`,
       );
     });
 
     it('an OfferCreate: no counterparty and no amount, the fee', async () => {
       expect(await lineOf(SENDER, SENDER_OFFER)).toBe(
-        `"${SENDER_OFFER}","11119603","2015-01-14T18:27:20+00:00","OfferCreate","tesSUCCESS","true","","","","","0.015",""`,
+        `"${SENDER_OFFER}","11119603","2015-01-14T18:27:20+00:00","OfferCreate","tesSUCCESS","true","","","","","0.015","",""`,
       );
     });
 
     it('a transaction that only affected the account: not the initiator, no counterparty, amount or fee', async () => {
       // an OfferCreate of someone else that touched the account
       expect(await lineOf(ACCOUNT, OFFER_AFFECTING_ACCOUNT)).toBe(
-        `"${OFFER_AFFECTING_ACCOUNT}","11119015","2015-01-14T17:43:10+00:00","OfferCreate","tesSUCCESS","false","","","","","",""`,
+        `"${OFFER_AFFECTING_ACCOUNT}","11119015","2015-01-14T17:43:10+00:00","OfferCreate","tesSUCCESS","false","","","","","","",""`,
       );
       // a payment between two others that took the account's offer: it is no party to the payment
       expect(await lineOf(EUR_OFFER_OWNER, EUR_PAYMENT)).toBe(
-        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","false","","","","","",""`,
+        `"${EUR_PAYMENT}","11119601","2015-01-14T18:27:10+00:00","Payment","tesSUCCESS","false","","","","","","",""`,
       );
     });
 
@@ -1551,11 +1562,165 @@ describe('account transactions API endpoint, format=csv on recorded mainnet ledg
     expect([res.status, res.headers['content-type']]).toEqual([200, expect.stringMatching(/^text\/csv/)]);
     expect(res.text).toBe(
       [
-        '"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed"',
-        `"A3F259D074A8E2DE6BEA82E31E025E8EFD505032E6A335A335FF5949B50CCB5E","107671591","2026-10-15T11:19:20+00:00","TrustSet","tesSUCCESS","false","${USD_HOLDER}","1.308725","USD","${USD_ISSUER}","",""`,
-        `"622618838E6DD7EDC9D029183473EC76BFBF6F7BE05F0FE33DB6C7049C196CB6","107671607","2026-10-15T11:20:20+00:00","TrustSet","tesSUCCESS","false","${USD_HOLDER}","1.30729","USD","${USD_ISSUER}","",""`,
+        '"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed","delegate"',
+        `"A3F259D074A8E2DE6BEA82E31E025E8EFD505032E6A335A335FF5949B50CCB5E","107671591","2026-10-15T11:19:20+00:00","TrustSet","tesSUCCESS","false","${USD_HOLDER}","1.308725","USD","${USD_ISSUER}","","",""`,
+        `"622618838E6DD7EDC9D029183473EC76BFBF6F7BE05F0FE33DB6C7049C196CB6","107671607","2026-10-15T11:20:20+00:00","TrustSet","tesSUCCESS","false","${USD_HOLDER}","1.30729","USD","${USD_ISSUER}","","",""`,
       ].join('\n'),
     );
+  });
+});
+
+describe('account transactions API endpoint, format=csv on delegated transactions', () => {
+  const HEADER =
+    '"hash","ledger_index","executed_time","tx_type","result","initiator","counterparty","amount","currency","issuer","fee","flags_changed","delegate"';
+  // recorded (xrpl-objects, from xrpl/amm 107699656): a Batch inner OfferCreate that `DELEGATOR` sent through `DELEGATE`, `Fee` "0"
+  const BATCH_INNER = '8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8';
+  const BATCH_INNER_LEDGER = '107699656';
+  const BATCH_INNER_TIME = '2026-10-16T17:34:11+00:00';
+  const DELEGATOR = 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL';
+  const DELEGATE = 'rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK';
+  const OFFER_ISSUER = 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De'; // the issuer of what the offer sells: affected, no party
+
+  // `synthetic-delegated-payment`: the recorded native Payment BAF0C2EC… (xrpl-objects, ledger 107670360: 15.151515 XRP, a 5000
+  // drop fee) as if its sender had delegated it to SYNTHETIC_DELEGATE, which paid the fee. Hand-made, never recorded: the
+  // delegated transactions recorded are Batch inner transactions, which pay no fee, so a fee on the delegate needs one made by
+  // hand. Written through the ledger writer as a ledger of its own, the newest of the database.
+  const PAYMENT = 'BAF0C2EC22CFC229C9AABC02413EB6433A820F5689B69FD4AD83565A38EF77ED';
+  const NAME = 'synthetic-delegated-payment';
+  const HEAD = 107_972_102;
+  const SYNTHETIC_LEDGER = HEAD + 1;
+  const SYNTHETIC_TIME = '2026-10-29T03:50:45+00:00'; // the head closed at 1793245841: 4 seconds later
+  const original = fixtureTransaction('xrpl-objects', PAYMENT);
+  const SENDER = String(original.tx.tx.Account);
+  const DESTINATION = String(original.tx.tx.Destination);
+  const delegated = delegatedFrom(original.tx, NAME);
+  const SYNTHETIC_HASH = delegated.hash;
+
+  let h: Harness;
+  let get: ApiClient['get'];
+
+  const csvOf = async (path: string) => {
+    const res = await get(path);
+    expect([path, res.status, res.headers['content-type']]).toEqual([path, 200, expect.stringMatching(/^text\/csv/)]);
+    return res;
+  };
+  /** The line of a transaction in the CSV of an account's whole history. */
+  const lineOf = async (account: string, hash: string): Promise<string | undefined> => {
+    const res = await csvOf(`${listPath(account)}?format=csv&limit=1000`);
+    return res.text.split('\n').find((line: string) => line.startsWith(`"${hash}",`));
+  };
+  /** The cells of every line but the header, in the order of the file. */
+  const cellsOf = (text: string): string[][] =>
+    text
+      .split('\n')
+      .slice(1)
+      .map((line) => JSON.parse(`[${line}]`) as string[]);
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-objects', env: NO_RATE_LIMIT });
+    get = (await h.api()).get;
+    const head = fixtureSource('xrpl-objects')
+      .list()
+      .reduce((a, b) => (b.header.ledger_index > a.header.ledger_index ? b : a)).header;
+    expect(head.ledger_index).toBe(HEAD);
+    const ledger: RawLedger = {
+      header: {
+        ...original.ledger.header,
+        ledger_index: SYNTHETIC_LEDGER,
+        ledger_hash: syntheticHash(NAME, head.ledger_hash),
+        parent_hash: head.ledger_hash,
+        close_time: head.close_time + 4,
+        parent_close_time: head.close_time,
+      },
+      transactions: [delegated],
+    };
+    await new LedgerWriter(h.ch, parseContextFor(getNetworkProfile('xrpl'))).write([ledger]);
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('the data is as the tests assume', async () => {
+    const newest = await h.ch.queryOne<{ ledger_index: number; t: number }>(
+      `SELECT ledger_index, toUnixTimestamp(close_time) AS t FROM ${Table.Ledgers} ORDER BY ledger_index DESC LIMIT 1`,
+    );
+    expect([newest?.ledger_index, Number(newest?.t)]).toEqual([SYNTHETIC_LEDGER, 1_793_245_845]);
+    expect(delegated.tx).toMatchObject({ Account: SENDER, Delegate: SYNTHETIC_DELEGATE, Fee: '5000' });
+    expect(SYNTHETIC_HASH).not.toBe(PAYMENT);
+  });
+
+  // -- recorded: the delegate paid a fee of 0 ---------------------------------------------------------------------------
+
+  it('a recorded delegated transaction: the fee is on the delegate, the delegator has none, both name the delegate', async () => {
+    const row = (initiator: string, counterparty: string, fee: string) =>
+      `"${BATCH_INNER}","${BATCH_INNER_LEDGER}","${BATCH_INNER_TIME}","OfferCreate","tesSUCCESS","${initiator}","${counterparty}","","","","${fee}","","${DELEGATE}"`;
+    expect(await lineOf(DELEGATOR, BATCH_INNER)).toBe(row('true', '', ''));
+    expect(await lineOf(DELEGATE, BATCH_INNER)).toBe(row('false', '', '0'));
+    // an account that was only affected has no fee, but the transaction's delegate is named on its row too
+    expect(await lineOf(OFFER_ISSUER, BATCH_INNER)).toBe(row('false', '', ''));
+  });
+
+  it('every recorded delegated transaction names its delegate on both rows, and the fee (0) is on the delegate only', async () => {
+    const delegatedTxs = fixtureTransactions('xrpl-objects').filter((t) => t.tx.tx.Delegate === DELEGATE);
+    expect(delegatedTxs.length).toBeGreaterThan(1);
+    const byHash = new Map(delegatedTxs.map((t) => [t.tx.hash, t]));
+    const seen = new Map<string, Record<string, string[]>>();
+    for (const account of [DELEGATOR, DELEGATE]) {
+      const cells = cellsOf((await csvOf(`${listPath(account)}?format=csv&limit=1000`)).text);
+      for (const row of cells.filter((c) => byHash.has(c[0]))) {
+        seen.set(row[0], { ...seen.get(row[0]), [account]: row });
+      }
+    }
+    expect(new Set(seen.keys())).toEqual(new Set(byHash.keys()));
+    for (const [hash, rows] of seen) {
+      const [delegatorRow, delegateRow] = [rows[DELEGATOR], rows[DELEGATE]];
+      // columns: initiator 5, fee 10, delegate 12
+      expect([hash, delegatorRow[5], delegatorRow[10], delegatorRow[12]]).toEqual([hash, 'true', '', DELEGATE]);
+      expect([hash, delegateRow[5], delegateRow[10], delegateRow[12]]).toEqual([hash, 'false', '0', DELEGATE]);
+    }
+  });
+
+  it('what the delegate sent itself keeps its fee and has no delegate', async () => {
+    const own = cellsOf((await csvOf(`${listPath(DELEGATE)}?format=csv&limit=1000`)).text).filter(
+      (c) => c[5] === 'true',
+    );
+    expect(own.length).toBeGreaterThan(0);
+    for (const cells of own) {
+      expect(Number(cells[10])).toBeGreaterThan(0);
+      expect(cells[12]).toBe('');
+    }
+  });
+
+  // -- synthetic: the delegate paid a fee of 5000 drops -----------------------------------------------------------------
+
+  it('synthetic-delegated-payment: the fee is on the delegate (0.005), not on the sender, and the delegate is named last', async () => {
+    const line = (initiator: string, counterparty: string, amount: string, currency: string, fee: string) =>
+      `"${SYNTHETIC_HASH}","${SYNTHETIC_LEDGER}","${SYNTHETIC_TIME}","Payment","tesSUCCESS","${initiator}","${counterparty}","${amount}","${currency}","","${fee}","","${SYNTHETIC_DELEGATE}"`;
+    expect(await lineOf(SENDER, SYNTHETIC_HASH)).toBe(line('true', DESTINATION, '15.151515', 'XRP', ''));
+    expect(await lineOf(DESTINATION, SYNTHETIC_HASH)).toBe(line('false', SENDER, '15.151515', 'XRP', ''));
+    // the delegate is neither party: it has nothing of the payment but the fee it paid
+    expect(await lineOf(SYNTHETIC_DELEGATE, SYNTHETIC_HASH)).toBe(line('false', '', '', '', '0.005'));
+    const file = await csvOf(`${listPath(SYNTHETIC_DELEGATE)}?format=csv`);
+    expect(file.headers['content-disposition']).toBe(csvDisposition(`${SYNTHETIC_DELEGATE} - transactions`));
+    expect(file.text).toBe([HEADER, line('false', '', '', '', '0.005')].join('\n'));
+  });
+
+  it('the recorded payment it is made from is as it was: the sender pays, no delegate', async () => {
+    expect(await lineOf(SENDER, PAYMENT)).toBe(
+      `"${PAYMENT}","107670360","2026-10-15T10:00:02+00:00","Payment","tesSUCCESS","true","${DESTINATION}","15.151515","XRP","","0.005","",""`,
+    );
+    expect(await lineOf(DESTINATION, PAYMENT)).toBe(
+      `"${PAYMENT}","107670360","2026-10-15T10:00:02+00:00","Payment","tesSUCCESS","false","${SENDER}","15.151515","XRP","","","",""`,
+    );
+  });
+
+  it('the JSON list is unchanged: the transaction carries its Delegate and no summary column is added', async () => {
+    const json = await get(`${listPath(SYNTHETIC_DELEGATE)}`);
+    expect(json.status).toBe(200);
+    expect(json.body.count).toBe(1);
+    const [item] = json.body.transactions;
+    expect([item.hash, item.tx.Delegate, item.tx.Fee]).toEqual([SYNTHETIC_HASH, SYNTHETIC_DELEGATE, '5000']);
+    expect(Object.keys(item)).toEqual(['hash', 'ledger_index', 'date', 'tx', 'meta']);
   });
 });
 
@@ -1606,7 +1771,7 @@ describe('account transactions API endpoint on Xahau', () => {
     const res = await get(`${listPath(PAYEE)}?format=csv&limit=1`);
     expect([res.status, res.headers['content-type']]).toEqual([200, expect.stringMatching(/^text\/csv/)]);
     expect(res.text.split('\n')[1]).toBe(
-      '"4D048D82D05A2FEDAC0174DD1084C1F43D98F417BC5C09320441E902A41104A3","26540613","2026-10-15T10:10:41+00:00","Payment","tesSUCCESS","false","rn4BZ7XH3vLWzMWAVHYLJrRAH9jwJBGjet","0.000001","XAH","","",""',
+      '"4D048D82D05A2FEDAC0174DD1084C1F43D98F417BC5C09320441E902A41104A3","26540613","2026-10-15T10:10:41+00:00","Payment","tesSUCCESS","false","rn4BZ7XH3vLWzMWAVHYLJrRAH9jwJBGjet","0.000001","XAH","","","",""',
     );
   });
 
