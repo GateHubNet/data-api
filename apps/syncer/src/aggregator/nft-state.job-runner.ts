@@ -174,7 +174,7 @@ function chunksOf<T>(items: readonly T[], size: number): T[][] {
 }
 
 /**
- * The `nft_state` job of the aggregator (see `AggregatorService`, job 3a), and its hook in the slices of `agg_dirty`: it rebuilds
+ * The `nft_state` job of the aggregator (see `AggregatorService`, job 4), and its hook in the slices of `agg_dirty`: it rebuilds
  * the `nfts` row (and the `account_nfts` rows) of every NFT with an event above what its row has seen, `NFT_STATE_BATCH` NFTs at
  * a time, oldest change first, and then, in what is left of the budget, the NFTs of the oldest range of `nft_dirty`, which a
  * re-ingest marked. Its state (the cursor, the batches whose halving is under way, the NFTs set aside, the step of the dirty

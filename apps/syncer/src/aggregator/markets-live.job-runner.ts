@@ -14,7 +14,7 @@ import type { AggregatorJob, AggregatorTick } from './aggregator.service';
 export const MARKETS_LONG_EVERY_TICKS = 5;
 
 /**
- * The `markets_live` job of the aggregator (job 5 of a tick, see spec 3 and 3.3): the Markets set of each period, made from the
+ * The `markets_live` job of the aggregator (job 7 of a tick, see spec 3 and 3.3): the Markets set of each period, made from the
  * hour sets of `pair_hourly`. The `day` set is written on every run, the `7day` and `30day` sets on the 1st, 6th, 11th ... run
  * (`MARKETS_LONG_EVERY_TICKS`, counted here: the sets are heavier and their windows change by an hour at a time). A long
  * set that the budget kept from starting is the next run's, after the `day` set. The state of the job (the run counter, the

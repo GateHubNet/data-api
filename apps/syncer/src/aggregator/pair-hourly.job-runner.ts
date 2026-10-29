@@ -17,7 +17,7 @@ const ceilHour = (seconds: number): number => Math.ceil(seconds / HOUR_SECONDS) 
 const floorDay = (seconds: number): number => Math.floor(seconds / DAY_SECONDS) * DAY_SECONDS;
 
 /**
- * The `pair_hourly` job of the aggregator (job 4 of a tick, see spec 3 and 3.2): the hour sets of `pair_hourly`, the candle of
+ * The `pair_hourly` job of the aggregator (job 6 of a tick, see spec 3 and 3.2): the hour sets of `pair_hourly`, the candle of
  * every pair in each hour, for the last `PAIR_HOURLY_DAYS` days, and the hook of the slices of `agg_dirty` (`ofSlice`). The
  * state of the job (the waits of the sets that failed, the warnings and the announcements it has made, the hour of the first
  * ledger) is its own; the database, the clock, the budget and the rule of failure are the deps'.

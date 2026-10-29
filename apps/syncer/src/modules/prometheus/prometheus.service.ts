@@ -157,6 +157,16 @@ const metrics = {
     help: 'NFT collections queued for the nft_collections job to compute again.',
     registers: [registry],
   }),
+  escrowsLagLedgers: new Gauge({
+    name: 'syncer_escrows_lag_ledgers',
+    help: 'Ledgers between the newest committed ledger and the watermark of the escrows job (the through_ledger of its sentinel).',
+    registers: [registry],
+  }),
+  escrowsOpen: new Gauge({
+    name: 'syncer_escrows_open',
+    help: 'Open native escrows, as the sentinel of the escrows job counts them.',
+    registers: [registry],
+  }),
   validatorsUnlFetchesTotal: new Counter({
     name: 'syncer_validators_unl_fetches_total',
     help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
@@ -279,6 +289,8 @@ export class PrometheusService implements OnModuleInit {
   readonly nftStateLagLedgers = metrics.nftStateLagLedgers;
   readonly nftDirtyLedgers = metrics.nftDirtyLedgers;
   readonly nftCollectionsPending = metrics.nftCollectionsPending;
+  readonly escrowsLagLedgers = metrics.escrowsLagLedgers;
+  readonly escrowsOpen = metrics.escrowsOpen;
   readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;

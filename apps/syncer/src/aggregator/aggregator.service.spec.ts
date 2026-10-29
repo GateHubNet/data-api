@@ -1,6 +1,7 @@
 import {
   configVersionOf,
   DailyRates,
+  EscrowsStep,
   MarketsConfig,
   NFT_VOLUME_CONFIG_VERSION,
   RatesService,
@@ -968,6 +969,8 @@ describe('AggregatorService volume jobs', () => {
     nftStateLagLedgers: { set: jest.Mock };
     nftDirtyLedgers: { set: jest.Mock };
     nftCollectionsPending: { set: jest.Mock };
+    escrowsLagLedgers: { set: jest.Mock };
+    escrowsOpen: { set: jest.Mock };
   };
   const created: AggregatorService[] = [];
 
@@ -1023,6 +1026,8 @@ describe('AggregatorService volume jobs', () => {
       nftStateLagLedgers: { set: jest.fn() },
       nftDirtyLedgers: { set: jest.fn() },
       nftCollectionsPending: { set: jest.fn() },
+      escrowsLagLedgers: { set: jest.fn() },
+      escrowsOpen: { set: jest.fn() },
     };
     events = [];
     liveCalls = [];
@@ -1124,6 +1129,17 @@ describe('AggregatorService volume jobs', () => {
     ch.watermark = unix('2026-10-16T12:00:00Z');
     ch.closes = [unix('2026-10-10T08:00:00Z'), NOW_SECONDS - 3];
   };
+  /** A step of the escrows job that has nothing to do: the watermark is at the head. */
+  const quietEscrowsStep: EscrowsStep = {
+    from: 100,
+    to: 100,
+    head: 100,
+    touched: 0,
+    written: 0,
+    removed: 0,
+    setAside: [],
+    escrowed: { drops: '0', open: 0, through_ledger: 100 },
+  };
   const volumeEvents = (kind: 'live' | 'daily'): string[] => events.filter((e) => e.startsWith(kind));
   const dailyOf = (list: string[]): string[] => list.filter((e) => e.startsWith('daily')).map((e) => e.slice(6));
 
@@ -1160,7 +1176,7 @@ describe('AggregatorService volume jobs', () => {
       expect(daysDone).not.toHaveBeenCalled();
     });
 
-    it('are, with the AMM pools and the NFT jobs as well, volume_live, volume_daily, amm_pools, nft_state, stats_live, stats_dirty, nft_collections, volume_backfill, in this order', async () => {
+    it('are, with the AMM pools, the NFT jobs and the escrows as well, volume_live, volume_daily, amm_pools, nft_state, escrows, stats_live, stats_dirty, nft_collections, volume_backfill, in this order', async () => {
       caughtUp();
       await service({
         ammPools: { rates: RATES },
@@ -1177,12 +1193,15 @@ describe('AggregatorService volume jobs', () => {
           head: async () => 0,
         },
         nftCollectionsFunctions: { behind: async () => [] },
+        escrows: { rates: RATES, nativeCurrency: 'XRP' },
+        escrowsFunctions: { step: async () => quietEscrowsStep },
       }).tick();
       expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
         'volume_live',
         'volume_daily',
         'amm_pools',
         'nft_state',
+        'escrows',
         'stats_live',
         'stats_dirty',
         'nft_collections',
@@ -1694,6 +1713,51 @@ describe('AggregatorService volume jobs', () => {
       await svc.tick();
       expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
       expect(ch.dirty).toHaveLength(1);
+    });
+  });
+
+  describe('the escrows of agg_dirty ranges (the hook of stats_dirty)', () => {
+    it('fails the slice and keeps the range when the escrows hook fails (escrows_dirty)', async () => {
+      caughtUp();
+      ch.dirty = [mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')];
+      const recomputeEscrows = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('DB::Exception: memory limit'))
+        .mockResolvedValue({ written: 0, removed: 0, setAside: [] });
+      const svc = service({
+        escrows: {
+          rates: { nativeCurrency: 'XRP', ledgersClosedIn: async () => ({ min: 100, max: 200 }) } as never,
+          nativeCurrency: 'XRP',
+        },
+        escrowsFunctions: {
+          step: async () => quietEscrowsStep,
+          read: async () => ({ drops: '0', open: 0, through_ledger: 100 }),
+          ofLedgers: async () => ['AA'.repeat(32)],
+          recompute: recomputeEscrows,
+        },
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc.mock.calls).toEqual([[{ job: 'escrows_dirty' }]]);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        'Aggregator job escrows_dirty failed in 2026-05-01T00:00:00Z - 2026-05-01T03:00:00Z: DB::Exception: memory limit',
+      );
+      // the slice failed: the range is still there, and the jobs after stats_dirty were not kept from running
+      expect(ch.dirty).toEqual([mark('2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z')]);
+      expect(metrics.aggregatorRunsTotal.inc.mock.calls.map(([labels]) => labels.job)).toEqual([
+        'volume_live',
+        'volume_daily',
+        'escrows',
+        'stats_live',
+        'stats_dirty',
+        'volume_backfill',
+      ]);
+
+      // and the next tick does it again, and removes the range
+      await svc.tick();
+      expect(recomputeEscrows).toHaveBeenCalledTimes(2);
+      expect(ch.dirty).toEqual([]);
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
     });
   });
 

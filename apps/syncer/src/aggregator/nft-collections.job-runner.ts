@@ -72,7 +72,7 @@ interface CollectionBatch {
 }
 
 /**
- * The `nft_collections` job of the aggregator (see `AggregatorService`, job 8a): the `nft_collections` row of a collection (its
+ * The `nft_collections` job of the aggregator (see `AggregatorService`, job 11): the `nft_collections` row of a collection (its
  * supply, holders, mints, burns, sales and volume) and the set of its holders, computed again for the collections whose NFTs
  * `nft_state` rebuilt. Its state (the queue of the collections due, the collections set aside, the read that fills the queue) is
  * its own; the database, the clock, the budget and the rules of the tick are the service's (`AggregatorJobContext`).

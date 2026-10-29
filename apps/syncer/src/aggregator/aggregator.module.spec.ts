@@ -19,7 +19,7 @@ import { AggregatorService } from './aggregator.service';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 
-/** The metrics of the aggregator, of the account and market jobs and of the NFT jobs, over fakes. */
+/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs and of the escrows job, over fakes. */
 const fakeMetrics = () => ({
   aggregatorRunsTotal: { inc: jest.fn() },
   aggregatorErrorsTotal: { inc: jest.fn() },
@@ -33,6 +33,8 @@ const fakeMetrics = () => ({
   nftStateLagLedgers: { set: jest.fn() },
   nftDirtyLedgers: { set: jest.fn() },
   nftCollectionsPending: { set: jest.fn() },
+  escrowsLagLedgers: { set: jest.fn() },
+  escrowsOpen: { set: jest.fn() },
 });
 
 describe('AggregatorModule', () => {
@@ -104,6 +106,11 @@ describe('AggregatorModule', () => {
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_state' });
     expect(metrics.nftStateLagLedgers.set).toHaveBeenCalledWith(0);
     expect(metrics.nftDirtyLedgers.set).toHaveBeenCalledWith(0);
+    // and the escrows job, which has nothing to rebuild over an empty database, writes the sentinel of its first step (the
+    // watermark at 0, nothing escrowed) and sets its gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'escrows' });
+    expect(metrics.escrowsLagLedgers.set).toHaveBeenCalledWith(0);
+    expect(metrics.escrowsOpen.set).toHaveBeenCalledWith(0);
     // and the NFT collections job, which finds no collection behind in an empty database and sets its gauge
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_collections' });
     expect(metrics.nftCollectionsPending.set).toHaveBeenCalledWith(0);
@@ -119,6 +126,10 @@ describe('AggregatorModule', () => {
     expect(written.filter((table) => table === Table.VolumeLive)).toHaveLength(15);
     expect(written.filter((table) => table === Table.VolumeDaily)).toHaveLength(8);
     expect(written).not.toContain(Table.AmmPools);
+    const sentinels = insert.mock.calls.filter(([table]) => table === Table.Escrows);
+    expect(sentinels.map(([, rows]) => rows)).toEqual([
+      [expect.objectContaining({ escrow_id: '', amount_drops: '0', open_count: 0, through_ledger: 0 })],
+    ]);
     const days = insert.mock.calls.filter(([table]) => table === Table.AmmDaily);
     expect(
       days.map(([, rows]) => (rows as Array<{ day: string; amm_account: string }>).map((r) => [r.day, r.amm_account])),
@@ -163,12 +174,8 @@ describe('AggregatorModule', () => {
   it('gives the volume jobs and the account and market jobs one RatesService, and the minimum of the config', () => {
     const ch = {} as ClickHouseService;
     const profile = getNetworkProfile('xrpl');
-    const options = aggregatorOptions(
-      ch,
-      profile,
-      { accountRollupMinRows: 1234 } as SyncerConfig,
-      { log: jest.fn() } as never,
-    );
+    const log = jest.fn();
+    const options = aggregatorOptions(ch, profile, { accountRollupMinRows: 1234 } as SyncerConfig, { log } as never);
     expect(options.volumes?.rates).toBeInstanceOf(RatesService);
     expect(options.aggregates?.rates).toBe(options.volumes?.rates);
     expect(options.aggregates?.rates.nativeCurrency).toBe('XRP');
@@ -176,6 +183,22 @@ describe('AggregatorModule', () => {
     // and the NFT job the same rates, with the daily rates over them
     expect(options.nfts?.rates).toBe(options.volumes?.rates);
     expect(options.nfts?.dailyRates.nativeCurrency).toBe('XRP');
+    // and the escrows job the same rates, with the native currency of the network
+    expect(options.escrows?.rates).toBe(options.volumes?.rates);
+    expect(options.escrows?.nativeCurrency).toBe('XRP');
+    expect(log).toHaveBeenCalledWith(
+      'Escrows job on: the current state of every escrow and the escrowed total, from object_changes',
+    );
+    expect(
+      aggregatorOptions(
+        ch,
+        getNetworkProfile('xahau'),
+        { accountRollupMinRows: 1 } as SyncerConfig,
+        {
+          log: jest.fn(),
+        } as never,
+      ).escrows?.nativeCurrency,
+    ).toBe('XAH');
     expect(
       aggregatorOptions(ch, profile, { accountRollupMinRows: 0 } as SyncerConfig, { log: jest.fn() } as never)
         .aggregates?.accountRollupMinRows,
