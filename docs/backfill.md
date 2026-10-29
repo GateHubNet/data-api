@@ -119,7 +119,8 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   before that history is learnt at its next change. A `--reprocess` of a range writes the rows of its ledgers, as for every table.
   Parser version 7 (the current one) adds the history of escrows, checks, payment channels and delegations (`object_changes` and its index by
   account `account_object_changes`), gives a delegate its `account_transactions` row, books the fee of a delegated transaction to its delegate and
-  types the balance changes of issued-token payment channels: ledgers written by an older version have none of these, and `--reprocess` writes them.
+  types the balance changes of issued-token payment channels: ledgers written by an older version have none of these, and `--reprocess` writes them (see
+  [Ledger objects and delegation re-ingest](#ledger-objects-and-delegation-re-ingest)).
   Changes of these objects that no event of the table expects are counted in `syncer_objects_unclassified_total`, and the range-ingest log names the
   total of its run (a warning when it is not 0, and `L unclassified object changes` in the last line).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
@@ -368,6 +369,82 @@ How the seed behaves:
   ([Account state history re-ingest](#account-state-history-re-ingest)), and an account whose Domain was set before that and whose root has not changed since has no
   row. It has **no domain, and so no verified name, until its next change** (a payment received is enough), or until the history is filled from ledger 32570
   and ingested again with parser version 6 or later. The names answer carries no `coverage` for this ([api-reference](api-reference.md#account-names-and-tomls)).
+
+### Ledger objects and delegation re-ingest
+
+`PARSER_VERSION` became 7 with the ledger objects (`OBJECT_PARSER_VERSION`, [ADR-0018](adr/0018-ledger-object-history.md)). From the deploy on, the live syncer writes
+the history of every escrow, check, payment channel and delegation (`object_changes` and its index by account `account_object_changes`), lists a delegate in its
+own `account_transactions`, books the fee of a delegated transaction to its delegate, and types the balance changes of issued-token payment channels. The ledgers written
+before it have none of that, so **the objects they created are not in the index, and the fee rows of the delegated transactions in them are the sender's**. Both
+networks have escrows, checks and payment channels; only the XRP Ledger has delegation.
+
+**Where to start.** Each feature has the ledger from which no object can be missing, and its `coverage` is `complete` when the index is whole from there
+([Coverage](api-reference.md#coverage)):
+
+| Feature | XRPL | Xahau |
+| --- | --- | --- |
+| Delegations (`PermissionDelegationV1_1`) | **107,524,865** (2026-10-08) | none: the network cannot have it, `complete: true` with no table read |
+| Escrows (`Escrow`) and payment channels (`PayChan`) | 28,685,313 | **1**, the first ledger of the network (no amendment: `Escrow` and `PayChan` are retired there) |
+| Checks (`Checks`) | 56,219,905 | **1**, as above |
+
+**Delegation is the re-ingest this release asks for.** It is short because the amendment is recent: `--from 107524865` is about 415,000 ledgers on 2026-10-28, and about
+25,000 more a day. **Escrows, checks and channels are not part of it**: their coverage stays `complete: false` until every ledger from 28,685,313 (checks:
+56,219,905; Xahau: 1) is written by parser version 7 or later, which is **the program's one reprocess after its last parser version**, or the history load from ledger
+32,570 ([Account state history re-ingest](#account-state-history-re-ingest)), and no part of D5 does it. Until then **an object created before the first ledger the new
+parser wrote and untouched since is not in the index**: its route answers 404 and the explorer shows it from the node; one created before it and changed after it has a
+history that starts in the middle, with no `created`, and says `complete: false`.
+
+**Procedure.**
+1. Apply migration `013_ledger_objects.sql` **before** the syncer of this release starts: the syncer writes the two ledger tables with every ledger, and a write to a
+   missing table fails the batch, so the live runner would retry it for ever ([operations](operations.md#apply-a-schema-migration)). Then deploy the syncer, then the api.
+   A Xahau syncer that is **halted on a ledger with an issued-token payment channel** (the old parser threw on it: `Cannot parse ledger <n>`, `state=halted`) goes on from
+   its checkpoint when this release is deployed (a restart), because the ledger parses now: no other step is needed for it.
+2. On the XRP Ledger, re-ingest the committed history from the amendment's enable ledger up to the ledger the syncer started writing parser version 7 at (the deploy
+   ledger) with `--reprocess`:
+
+   ```bash
+   # the deploy ledger, the first one the new syncer wrote: SELECT min(ledger_index) FROM xrpl.ledgers WHERE parser_version >= 7
+   docker compose -f docker-compose.prod.yaml --env-file deploy/.env.prod run --rm --no-deps syncer-xrpl \
+     node dist/cli/range-ingest.js --from 107524865 --to <deploy ledger> --reprocess --concurrency 16
+   ```
+
+   `--to` is inclusive, and rewriting the deploy ledger writes the rows its version-7 parser wrote already. It is hours on Ripple's full-history node
+   ([Which node?](#2-which-node)). After a failure do **not** rerun the same command (see [Resuming](#resuming-gap-repair-reprocessing)). If the program's full reprocess is
+   about to run, it covers this range, and running both writes these ledgers twice, which does no harm.
+   It writes the `Delegate` rows, the delegates' `account_transactions` rows, the fee rows of the delegated transactions on their delegates and the object rows of
+   escrows, checks and channels for these ledgers. Xahau has no delegation: nothing is re-ingested there for it.
+3. **The aggregates follow by themselves.** Every written chunk marks its hours in `agg_dirty`; the slice's hooks recompute what they touch (the rollups of heavy accounts,
+   the pair statistics, the rates) and, last, **the `escrows` hook**, which recomputes the escrows of the slice's ledgers as of the job's watermark and reads the total
+   again if one changed ([syncer](syncer.md#the-escrows-job)). The `escrows` job itself builds its table from the rows there are, in steps of 1,000,000 ledgers, until
+   **`syncer_escrows_lag_ledgers` is a few ledgers** ([operations](operations.md#ledger-objects-and-delegation)).
+4. Check the coverage:
+
+   ```sql
+   -- the object data cover the ledgers above this one (NULL: every stored ledger); delegations are `complete` once this is below 107,524,865
+   SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 7;
+   -- which parser wrote a range
+   SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 107524865 GROUP BY parser_version;
+   -- the rows the new parser has written so far, by type
+   SELECT object_type, count() FROM xrpl.object_changes GROUP BY object_type;
+   -- the sentinel of the escrows job: the open escrows, their native drops and the ledger it is as of
+   SELECT open_count, amount_drops, through_ledger FROM xrpl.escrows WHERE escrow_id = '' ORDER BY version DESC LIMIT 1;
+   ```
+
+   (Xahau: `xahau.ledgers`, from ledger 1; on the sandbox the databases are `xrpl_testnet.` and `xahau_testnet.`.) The API keeps the coverage for a minute
+   (`FEATURE_COVERAGE_CACHE_MS`). It also needs the enable ledger of the amendment, which it reports only for an amendment that the node's ledger state lists as
+   enabled (`PermissionDelegationV1_1`: the `validators` worker polls that state into `network_state`); a deployment without that worker never says `complete`.
+5. **The testnets** (XRPL Testnet, Xahau Testnet) get no backfill: their index starts at the validated head of their deployment's first boot, and their object answers stay
+   `complete: false` (the delegations of Xahau Testnet are `complete: true`, as on Xahau).
+
+How it behaves:
+
+- **What a reprocess changes in the books.** A delegated transaction in the range gets its `transaction_cost` row on the delegate (and none on the sender), the source
+  columns of `payments` and `path_payments` stop adding the fee back to a sender who did not pay it, and the delegate lists the transaction. The balance changes, stats,
+  reports and analytics of the accounts concerned are different from before for those ledgers, and the rollups follow through `agg_dirty` ([operations](operations.md#what-a-re-ingest-does-to-them)).
+- **Changes the table does not expect** (an object of a tracked type changed by a transaction no event of its type covers) are written as event `update` and counted
+  in `syncer_objects_unclassified_total`; the range-ingest log warns with the total of its run and its last line ends with `L unclassified object changes`.
+- **The reprocess of a range that is already version 7** deletes and writes its rows again, in both tables, like every child table; the `escrows` hook then recomputes
+  the escrows of the range, so an escrow whose rows a reprocess made vanish is removed from the aggregate.
 
 ### Public nodes and rate limits
 

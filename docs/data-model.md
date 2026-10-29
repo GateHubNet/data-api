@@ -446,8 +446,9 @@ The history of four types of ledger object, which the object routes read: `Escro
 the first ledger the new parser wrote. Ids are 64 upper-case hex digits.
 
 #### `object_changes` (P7, `ORDER BY (object_type, object_id, ledger_index, tx_index)`)
-One row per created, modified or deleted node of a tracked type in a transaction's metadata, whatever the transaction's result (a `tec`
-can delete an expired channel, and `result` keeps it): the object's state after the transaction, what changed, and the event it was. A
+One row per created, modified or deleted node of a tracked type in a transaction's metadata, whatever the transaction's result (`result`
+keeps it; the metadata of a `tec` transaction can carry a changed node too, though no recorded one does, and the recorded close of an
+expired channel is `tesSUCCESS`): the object's state after the transaction, what changed, and the event it was. A
 modified node without `PreviousFields` was only threaded and has no row. The key is unique, a transaction has one node per object.
 Columns: `object_type` (the `LedgerEntryType`: `Escrow`, `Check`, `PayChannel`, `Delegate`), `object_id` (the node's `LedgerIndex`),
 `ledger_index`, `tx_index`, `tx_hash`, `close_time`, `tx_type`, `result`, `sender` (the transaction's `Account`), `delegate` (its

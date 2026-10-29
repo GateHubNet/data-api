@@ -24,8 +24,8 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
                   validator_seen                   amm_daily, + 9    manifests (rpc),
                                                    of 003 (read the  network_state,
                                                    ledger tables)    amendment_
-                                                                     features,
-                                                                     validator_votes,
+                                                   + escrows (reads  features,
+                                                   object_changes)   validator_votes,
                                                                      amendment_
                                                                      tallies,
                                                                      validator_
@@ -100,6 +100,15 @@ payment whose delivery crossed an offer, changed an AMM pool or rippled through 
 `path_payments` row ([data-model](data-model.md#path_payments-p6-order-by-ledger_index-tx_index-migration-007)), and an
 `account_path_payments` row for its source and one for its destination, one for a payment to oneself
 ([data-model](data-model.md#account_path_payments-p7-order-by-account-ledger_index-tx_index-migration-008)).
+The object changes parser reads the metadata of every transaction for the nodes of four types, `Escrow`, `Check`, `PayChannel` and `Delegate`
+(`TRACKED_OBJECT_TYPES`), whatever the transaction's result: a created, modified or deleted node is one `object_changes` row with the object's fields after the transaction, what
+changed (`PreviousFields`) and the event it was (`create`, `finish`, `cancel`, `cash`, `fund`, `claim`, `close_request`, `renew`, `close`, `set`, `delete`, or `removed` when a
+transaction of another type deleted it), and its owner and its counterparty get one `account_object_changes` row each; a node that was only threaded has none. A change that no event
+expects is event `update` and is counted in `syncer_objects_unclassified_total` (once per committed write; the range-ingest log names the total of its run). Three more things
+come with parser version 7: the transaction's `Delegate` is listed in `account_transactions` (`is_initiator = 0`, also when the metadata names none of its accounts), the fee of a
+delegated transaction is booked to the delegate (`feePayer`: the `transaction_cost` row of `balance_changes`, and the source columns of `payments` and `path_payments`), and the
+payment channels that hold an issued token (Xahau) are typed with token amounts instead of throwing ([ADR-0018](adr/0018-ledger-object-history.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md)
+items 90 to 92).
 `LedgerWriter.write()` then inserts, in this order:
 
 1. all child tables, in parallel (each insert is chunked at 50,000 rows),
@@ -327,7 +336,7 @@ most 2 s for the sample in flight.
 
 ## 7. The aggregator
 
-Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs thirteen jobs **in priority order**; a job
+Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs fourteen jobs **in priority order**; a job
 gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work. The budgets are
 constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment variables, and so are the cadences of `amm_daily` and `nft_collections`:
 
@@ -337,15 +346,16 @@ constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment
 | 2 | `volume_daily` | 4 s | The daily volume sets of today and yesterday (UTC), all four metrics (eight sets), stalest first. |
 | 3 | `amm_pools` | 3 s | Rebuilds the `amm_pools` row of every AMM pool with state rows that its row has not seen yet, 200 pools at a time ([the AMM jobs](#the-amm-jobs)). |
 | 4 | `nft_state` | 3 s | Rebuilds the `nfts` row and the `account_nfts` rows of every NFT with an event its row has not seen yet, 500 NFTs at a time, and then the NFTs of the oldest range of `nft_dirty` that a re-ingest marked ([the NFT jobs](#the-nft-jobs)). |
-| 5 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
-| 6 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
-| 7 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
-| 8 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)), and marks the slice's ledgers in `nft_dirty` for `nft_state` ([the NFT jobs](#the-nft-jobs)). |
-| 9 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
-| 10 | `nft_collections` | 3 s, **every 5th tick** | Computes the `nft_collections` row and the holders of every collection whose NFTs `nft_state` rebuilt, 50 collections at a time, oldest first ([the NFT jobs](#the-nft-jobs)). |
-| 11 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
-| 12 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
-| 13 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config (the NFT volume's is its own), **newest first**, all four metrics. |
+| 5 | `escrows` | 2 s | The current state of every escrow (`escrows`) and the **sentinel** row that holds the escrowed total and the ledger it is as of, which D7's supply reads. **At every tick**, the watermark of the sentinel follows the head; the first fill goes in steps of 1,000,000 ledgers, and a step is never cut by the budget ([the escrows job](#the-escrows-job)). |
+| 6 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
+| 7 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
+| 8 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
+| 9 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)), marks the slice's ledgers in `nft_dirty` for `nft_state` ([the NFT jobs](#the-nft-jobs)), and recomputes the escrows of the slice's ledgers ([the escrows job](#the-escrows-job)). |
+| 10 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
+| 11 | `nft_collections` | 3 s, **every 5th tick** | Computes the `nft_collections` row and the holders of every collection whose NFTs `nft_state` rebuilt, 50 collections at a time, oldest first ([the NFT jobs](#the-nft-jobs)). |
+| 12 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
+| 13 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
+| 14 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config (the NFT volume's is its own), **newest first**, all four metrics. |
 
 Properties that matter operationally:
 
@@ -368,6 +378,9 @@ Properties that matter operationally:
   (`amm_daily`, the `amm_volume` volume sets) hold only their sentinel.
 - The NFT jobs (`nft_state`, `nft_collections`) run on both networks too: XRPL NFTokens and Xahau URITokens are the same job and the same tables.
   An aggregator started on a database with no NFT events finds nothing to do.
+- The `escrows` job runs on both networks too (XAH escrows on Xahau), and **at every tick**: an aggregator started on a database with no escrow rows writes a sentinel with a
+  total of 0 and keeps its watermark at the head. The jobs before `stats_live` have 23 of the 30 s of a tick when each uses its whole budget, so `stats_live` gets the 7 s that are
+  left in the worst tick (`aggregator.schedule.spec.ts` pins it).
 - Volume jobs need the **markets config** (`config/markets/<network>.json` or `GH_MARKETS_CONFIG`): without markets there is
   nothing to compute. (The shipped Xahau list, version 3, was derived from a small sample, about 3,800 ledgers spread over three days,
   and is short: one trade market (`EVR`/`XAH`) and three payment currencies; `XXX`, a test token whose ISO code means "no
@@ -501,7 +514,7 @@ in a tick; a shutdown aborts the set in flight before it writes (`AggregateSetAb
 
 ### 7.6 The `agg_dirty` hooks
 
-A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order** (and then the fourth, of `nft_state`, which does not depend on the other three):
+A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `stats_dirty` in slices of at most a day. After a slice's `stats_hourly` and volume sets, `hooksOfSlice` runs three hooks **in this order** (and then the fourth, of `nft_state`, and the fifth, of `escrows`, which do not depend on the other three):
 
 1. `rates_daily`: a slice that touches the days X..Y marks the days X..Y+14 **stale** (the rate of a day reads the trades of the 14 days before it): for each of them that has a valid set, a new sentinel with `stale = 1` and no rows. The back-fill then computes them again, newest first; until it has, the readers value those days on read.
 2. `pair_hourly`: the hours of the slice that lie in the last 31 days are recomputed, a call for each UTC day.
@@ -511,7 +524,9 @@ A range that `range-ingest` rewrote is queued in `agg_dirty` and drained by `sta
 
 4. `nft_state`: the ledgers that closed in the slice are appended to `nft_dirty` as one range (a new row, idempotent: the same range twice is one), for the dirty sweep of `nft_state` to rebuild. The hook rebuilds nothing itself, so a day of 2022's busiest NFT ledgers cannot hold a tick. It runs **with or without** the `aggregates` option (an aggregator without the account and market jobs still marks the ledgers). The slice's daily `nft_volume` sets are recomputed with the other metrics as always.
 
-A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
+5. `escrows`: the escrows of the ledgers that closed in the slice are recomputed **as of the watermark of the `escrows` job** (the `through_ledger` of its sentinel: a slice above it is the live steps' to read, and a job that has written no sentinel yet has its first steps read the rows the slice rewrote, so the hook does nothing), and the total is read again, with the sentinel rewritten at the same watermark, if an escrow was written or removed. It runs with the `escrows` option, with or without the others. It is the last hook, so when it fails the slice stays in `agg_dirty` and the earlier hooks of the slice run again at the next tick, with no backoff ([the escrows job](#the-escrows-job)).
+
+A hook that fails is logged and counted as `<job>_dirty` (`rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`) and **fails the slice**, which keeps its range in `agg_dirty` for the next tick (a mark is never lost), as the failure of a volume set does. A hook does nothing once the shutdown has begun, which is safe
 because the range is not changed after it. Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`).
 
 ### 7.7 The back-fills
@@ -695,6 +710,42 @@ and the range-ingest runs of the process count them, the latter log a warning wh
 ([observability](observability.md#4-metrics-syncer)). A job that keeps failing logs `Aggregator job nft_state: ...` / `Aggregator job
 nft_collections: ...` warnings and errors, and `nft_state: NFT <id> is rebuilt again` / `nft_collections: collection <id> is computed again` when a
 set-aside one works again.
+
+### The escrows job
+
+The aggregate `escrows` ([data-model](data-model.md#escrows-migration-013)) keeps the current state of every escrow the index has seen and one **sentinel** row (`escrow_id = ''`)
+that holds the escrowed total: the open count, the sum of the native drops in them and `through_ledger`, the ledger the job has processed up to (its watermark). D7's supply reads
+it with `readEscrowed`; it is the only aggregate of the ledger objects ([ADR-0018](adr/0018-ledger-object-history.md): everything else about an object is read from `object_changes`
+at query time). Like the NFT jobs it reads **committed ledgers only**, is a runner in a file of its own (`escrows.job-runner.ts`, behind `AggregatorJobContext`, registered with the
+`escrows` option that `aggregator.module.ts` builds from the one `RatesService` the volume jobs share and the network's native currency), and writes version sets (a version is the
+ClickHouse clock in milliseconds, above the key's newest).
+
+**`escrows`** (budget 2 s, **every tick**, fifth in the tick, right after `nft_state`; `runEscrowsStep` in `packages/shared/src/aggregate/escrows.job.ts`):
+- **A step.** The watermark `W` is the sentinel's `through_ledger` (with no sentinel, the ledger before the first committed one) and `H` the newest committed ledger; a step takes
+  the window `(W, U]`, `U = min(H, W + ESCROWS_STEP_LEDGERS)` with `ESCROWS_STEP_LEDGERS = 1,000,000`. It reads the distinct escrow IDs with an `object_changes` row in the window
+  (partition pruning on `ledger_index` and the `object_type = 'Escrow'` prefix of the key), recomputes them `ESCROWS_CHUNK = 500` at a time (the newest row of each at or before
+  `U` and its creation, mapped to an `escrows` row and written under one version per chunk; an ID with no row left gets a lightweight `DELETE`), reads the total again if anything
+  was written or removed, and writes the sentinel **last**: `through_ledger = U` and the total (the new one, or the previous one when nothing changed).
+- **The sentinel is the commit marker, at every run.** It is written after every step, whether or not an escrow changed, so that its watermark follows the head (D7 takes the ledger of
+  its snapshot from it). A step that fails before it leaves the old sentinel, whose total and watermark agree, and the next run does the same window again, which rewrites the same rows.
+- **The budget is checked before a step and never inside one.** The first step of a run is always taken (unless the shutdown has begun); more follow while the watermark is below the
+  head and the 2 s last. A step cannot resume partway (its sentinel is its last write), so it is not given a signal that the budget aborts, only the shutdown's (`EscrowsAborted`, neither
+  logged nor counted). A first fill over all history (about 80 steps on the XRP Ledger) therefore goes on where it stopped at each tick, and a heavy step runs past the budget.
+- **An escrow that cannot be mapped is set aside** (its rows have an amount shape the job does not know): the step commits without it, and it is counted and logged as a failure of
+  `escrows` by its ID. The total of the native drops stays exact because an amount of an unknown shape is a token, worth 0 to it.
+- **A step that fails is the failure of the job** (counted as `escrows`, logged, the jobs after it still run). The gauges are then set from the head and the sentinel, read outside the
+  job's budget, so a watermark that is stuck shows as a lag that grows with the head.
+- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), item 5, error label `escrows_dirty`. It recomputes the escrows touched in the slice's ledgers, and those whose
+  `last_ledger` falls in them (an escrow whose rows a reprocess made vanish), as of the watermark, then rewrites the sentinel with the same `through_ledger`.
+- **Gauges.** `syncer_escrows_lag_ledgers` is the newest committed ledger the step saw less the watermark it wrote, `syncer_escrows_open` the sentinel's open count
+  ([observability](observability.md#4-metrics-syncer)). The alert is `syncer_escrows_lag_ledgers > 1000` for 15 minutes, paired with `rate(syncer_aggregator_errors_total{job="escrows"}[15m])`
+  ([observability](observability.md#recommended-alerts)).
+- **The cost** is one narrow row per escrow ever seen, read only by a run that changed something (a few hundred thousand on the XRP Ledger: tens of milliseconds).
+
+**Metrics.** `syncer_escrows_lag_ledgers`, `syncer_escrows_open` (above), the counter `syncer_objects_unclassified_total` (the changes of a tracked object that no event of its type
+expects, stored as event `update`; counted by the live ingest and the range-ingest runs of the process, once per committed write), and `syncer_aggregator_runs_total` /
+`syncer_aggregator_errors_total` with the labels `escrows` and `escrows_dirty`. A job that keeps failing logs `Aggregator job escrows failed...: ...` and, for an escrow set aside,
+`Aggregator job escrows failed for escrow <id>, set aside: ...`.
 
 ## 8. The validators worker
 
@@ -1142,6 +1193,10 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `Toml discovery: the pass failed: <name>` | ClickHouse refused the read of `account_domains` (the time limit, the memory cap, a missing table) | The domains of the last discovery stay in use, and `syncer_tomls_discovery_seconds` shows the time it took. No pass is made while no discovery has ever worked. Retried after 5 minutes. |
 | `Toml checks: the pass failed: <name> (<type>)` | ClickHouse refused the read of the schedule or the insert of the rows | The rows not written are due again at the next pass (a minute later). |
 | Boot refuses: `lacks the schema of 012_display_names.sql` | The migration was not applied before a syncer with the `tomls` worker | Apply it (`migrate-<network>`) and start the syncer again. |
+| `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
+| `Aggregator job escrows failed for escrow <id>, set aside: ...` | The rows of one escrow cannot be mapped to an `escrows` row | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
+| `Aggregator job escrows_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed | The slice stays queued and its earlier hooks run again at each tick, until it works ([7.6](#76-the-agg_dirty-hooks)). |
+| `Cannot parse ledger <n>: ... dropsToNative: invalid value '[object Object]'` on a Xahau payment channel | A syncer older than parser version 7 met a payment channel that holds an issued token | Halted until a restart on this release, which types the channel's amounts ([troubleshooting](troubleshooting.md#the-xahau-syncer-is-halted-on-a-payment-channel-that-holds-an-issued-token)). |
 
 ## 11. Source map
 
@@ -1155,10 +1210,11 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `apps/syncer/src/tomls/*` | The tomls worker: `domain-discovery` (which domains accounts name), `toml-checker` (the pass: due order, the fetches, the batched writes), `toml-row` (`nextTomlRow`, the row of a check), `tomls-worker` (the two loops), `tomls.module` |
 | `apps/syncer/src/modules/{liveliness,prometheus}/*` | Probe and metrics |
 | `packages/shared/src/ingest/*` | `buildLedgerRows`, `LedgerWriter`, ingest-state (checkpoint, deletes, quiescence), `LedgerSource` |
-| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`), the Domain of an account (`account-domains.parser.ts`) |
+| `packages/shared/src/parsers/*` | Payment, exchanges, balance changes, accounts created, affected accounts, AMM, NFTs (`nft.parser.ts`, with `util/nftoken-id.ts`), the Domain of an account (`account-domains.parser.ts`), the history of escrows, checks, payment channels and delegations (`object-changes.parser.ts`, with `permissions.ts` and `util/keylets.ts`) |
 | `packages/shared/src/aggregate/{stats,volume,amm-pools,amm-daily}.job.ts`, `aggregate/amm-reads.ts`, `query/rates.service.ts` | Aggregation and rates (`amm-reads.ts` holds the reads the AMM jobs share) |
 | `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
 | `apps/syncer/src/aggregator/{nft-state,nft-collections}.job-runner.ts` | The two NFT jobs ([the NFT jobs](#the-nft-jobs)) |
+| `apps/syncer/src/aggregator/escrows.job-runner.ts`, `packages/shared/src/aggregate/escrows.job.ts` | The `escrows` job: the runner (steps, gauges, the `agg_dirty` hook) and what it reads and writes (`runEscrowsStep`, `recomputeEscrows`, `readEscrowed`) ([the escrows job](#the-escrows-job)) |
 | `packages/shared/src/aggregate/{nft-state,nft-state.job,nft-collections.job}.ts`, `query/nft-prices.ts` | The fold of an NFT, what the NFT jobs read and write, and the one conversion of a price |
 | `packages/shared/src/aggregate/{rates-daily,pair-hourly,markets-live,account-rollups}.job.ts`, `aggregate-sets.ts` | What the runners write: the sets, their versions and their readers |
 | `packages/shared/src/query/{daily-rates,account-day-groups,valuation}.ts` | What the API reads them with: `DailyRates`, the day groups (raw or rollup), the valuation rule |

@@ -172,8 +172,8 @@ function eventOf(
 export class ObjectChangesParser {
   /**
    * A row for every created, modified or deleted node of a tracked type in `meta.AffectedNodes`, in that order, whatever the
-   * transaction's result (a `tec` can delete an expired channel, and its metadata says so; the row keeps the result in the
-   * columns the writer adds). A modified node without `PreviousFields` was only threaded (its `PreviousTxnID` moved) and
+   * transaction's result (the metadata of a `tec` transaction can carry a changed node too, though no recorded one does and the
+   * recorded close of an expired channel is `tesSUCCESS`; the row keeps the result in the columns the writer adds). A modified node without `PreviousFields` was only threaded (its `PreviousTxnID` moved) and
    * changed nothing of the object: no row. A node of another type is skipped.
    *
    * The object is read from the node and nothing else: Xahau's `EscrowFinish` and `EscrowCancel` may name the escrow by

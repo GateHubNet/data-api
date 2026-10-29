@@ -64,7 +64,7 @@ Everything both services need, written once:
   (`config/amendments/<family>.json`), read by the testnet of the family without its `enabled` entries.
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
-- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens) and
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, and the history of escrows, checks, payment channels and delegations) and
   `buildLedgerRows` (a raw ledger -> rows of the 31 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
@@ -78,8 +78,9 @@ Everything both services need, written once:
   (`ExportStorage`: `GcsExportStorage`, V4 signed links; `MemoryExportStorage` for tests), shared by the api and the exporter.
 - **`aggregate/`**: the `stats_hourly`, volume and AMM jobs (`amm_pools`, `amm_daily`) the aggregator runs, and the reads they share
   (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), the jobs of the account and market aggregates
-  (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`) and the NFT jobs (`nft_state`, `nft_collections`, with `foldNftEvents`, the one
-  fold of an NFT's events that the job and the API's detail route share, and the prices of sales in `query/nft-prices.ts`).
+  (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`), the NFT jobs (`nft_state`, `nft_collections`, with `foldNftEvents`, the one
+  fold of an NFT's events that the job and the API's detail route share, and the prices of sales in `query/nft-prices.ts`) and the `escrows` job (the
+  current state of every escrow and the sentinel that holds the escrowed total for D7).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
@@ -104,7 +105,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `amm`,
-  `nft`, `names`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `nft`, `names`, `ledger-objects`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -149,6 +150,26 @@ The NFT routes are GateHub extras ([ADR-0016](adr/0016-nft-and-uritoken-data.md)
 - **Reads.** The events are read by `readDistinctPage` (a range of the primary key, the filters inside the capped read), the lists of the aggregates by
   `readNewestPage` (the newest version of each key, again with more room while a filter leaves a page short); both are bounded by `read_rows` tests
   (`paged-reads.e2e-spec.ts`).
+
+#### The ledger objects module (`apps/api/src/ledger-objects`)
+
+The escrow, check, payment channel and delegation routes are GateHub extras ([ADR-0018](adr/0018-ledger-object-history.md)); the module follows the AMM and NFT modules' pattern.
+
+- **Controllers.** `LedgerObjectsModule` lists `EscrowsController` (`v2/escrows/:escrow_id`, `/history`), `ChecksController`, `PaymentChannelsController` and
+  `LedgerObjectsController` (`v2/ledger_objects/:object_id`). Every path has the object's segment first and one id after it, so no route shadows another and the order of the
+  controllers does not matter. The two routes under `/v2/accounts` are in `AccountsModule`: `AccountEscrowController` (`:address/escrows/:sequence`, which computes the escrow's ID
+  from its owner and sequence and answers as the escrow route does) and `AccountDelegationsController` with `DelegationsService`. `app.module.spec.ts` pins the module's place
+  before `NotFoundModule`.
+- **State at query time.** `LedgerObjectsService` reads `object_changes` by the object's prefix `(object_type, object_id)` with `ledger_index <= H`, `H` being the newest committed
+  ledger (`LedgerRangeResolver`, whose close time the answer carries): one page of 51 rows, the creation by a prefix read when it is older than the page, and, for a payment channel, its
+  counts. `ObjectAnswers` builds the answers of the three kinds from those reads (the escrow route and the owner-and-sequence route share it), `object-views.ts` maps a row's JSON to the
+  response objects (the `*_KEYS` constants that the tests and `ledger-objects/api-reference.spec.ts` pin, and the CSV columns), `object-status.ts` holds the status rules, and
+  `object-params.ts` the parsing of an ID. No object is cached.
+- **Coverage.** Every service asks `FeatureCoverageService` for the coverage of its feature (`escrows`, `payment_channels`, `checks`, `delegations`; `common/coverage-features.ts`
+  registers them: Xahau's start at the network's first ledger, delegation is `unavailable` where `NetworkProfile.hasDelegation` is false) or for an object's own (`itemCoverage`).
+- **Delegations** read the account's prefix of `account_object_changes` for `Delegate` and the role (at most 10,000 IDs), then their newest `object_changes` rows 1,000 IDs at a time,
+  drop the deleted ones and sort and page the rest in memory.
+- **Reads** are bounded by `read_rows` tests (`paged-reads.e2e-spec.ts`, over a bulk of other objects' rows): the object's prefix and `H` on every read.
 
 #### The names module (`apps/api/src/names`)
 

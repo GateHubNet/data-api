@@ -46,6 +46,46 @@ export function partOf(markdown: string, heading: string): string {
   return lines.slice(start, end).join('\n');
 }
 
+/**
+ * What is wrong with the fenced code blocks of a text, as sentences with the line number: a block that is never closed, a closing
+ * fence that is glued to the last line of the block (a row that ends in three backticks closes nothing), and a fence with a language that opens inside a
+ * block (the sign that the block above it was not closed). A count of the fence lines is not enough: two glued fences leave an even
+ * count, so each line of a block is looked at. The rules are CommonMark's: a fence is three backticks or tildes at the start of a
+ * line (up to three spaces before it), an opening fence of backticks has no backtick in its info string, and a block is closed by a
+ * line of at least as many of the same character and nothing else after them.
+ */
+export function fenceProblems(markdown: string): string[] {
+  const problems: string[] = [];
+  let open: { line: number; char: string; length: number } | undefined;
+  const lines = markdown.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i];
+    const line = i + 1;
+    if (open === undefined) {
+      const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(text);
+      if (fence && !(fence[1][0] === '`' && fence[2].includes('`'))) {
+        open = { line, char: fence[1][0], length: fence[1].length };
+      }
+      continue;
+    }
+    const char = open.char;
+    const length = open.length;
+    if (new RegExp(`^ {0,3}${char}{${length},}\\s*$`).test(text)) {
+      open = undefined;
+    } else if (new RegExp(`^ {0,3}${char}{${length},}`).test(text)) {
+      problems.push(
+        `line ${line}: a fence opens inside the block opened at line ${open.line} (the block above it was not closed)`,
+      );
+    } else if (new RegExp(`\\S\\s*${char}{${length},}\\s*$`).test(text)) {
+      problems.push(
+        `line ${line}: a fence at the end of a line of the block opened at line ${open.line} (it closes nothing, put it on a line of its own)`,
+      );
+    }
+  }
+  if (open !== undefined) problems.push(`line ${open.line}: the block opened here is never closed`);
+  return problems;
+}
+
 export interface KeysLine {
   object: string;
   /** The keys as written, with the `?` of an optional one stripped. */

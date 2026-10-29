@@ -514,6 +514,8 @@ then for the path `currency is required`, `XRP cannot have an issuer` (`XAH` on 
   in practice produced `payments  .csv`.
 - Payments with MPT amounts are not payments of this API.
 - A missing `end` is open-ended (the original used the time of the request).
+- A **delegated** Payment (a `Delegate` signs it for the sender and pays its fee) has its fee booked to the delegate: the native `source_balance_changes` of the sender are the
+  amount alone, from the re-ingest of its ledger on (parser version 7, [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 91). The original predates delegation.
 
 ---
 
@@ -1059,6 +1061,12 @@ them and the original rejected them, so no client could filter on a type it was 
 every transaction type that moves a balance (RippleState changes of all transaction types, AMM pools included), where the
 original's parser covered only some; no row is made for a fee of 0 (Batch inner transactions); `paychannel_balance_change` is
 not served (the original computed it and never stored it).
+
+The fee row (`transaction_cost`) of a **delegated** transaction is the delegate's, the account that signed it and paid the fee, and the sender's own native row is its whole
+change; the delegate's list has it, and so have the stats, reports and analytics built from these rows, from the re-ingest of the transaction's ledger on (parser version 7,
+[ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 91). The `paychannel_*` and `escrow_*` fields of a payment channel or escrow that holds an issued token (Xahau) carry
+token amounts, not drops; on Xahau the creator's trust line moves at each claim of a token channel, so a claim's creator row is typed `paychannel_fund` with the claimed
+delta (item 92).
 
 ### `GET /v2/accounts/{address}/balances`
 

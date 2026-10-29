@@ -218,6 +218,40 @@ account names any more: the store keeps every domain it checked ([operations](op
 The `tomls` worker is enabled and the database does not have `account_domains` and `domain_tomls`. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer
 again. A syncer of this release without the tables could not write a ledger either, so migrate before it starts ([deployment](deployment.md#schema-migrations)).
 
+### An escrow, check, payment channel or delegation answers 404, has no `created`, or says `"complete": false`
+`coverage` says how much of the history the index holds ([api-reference](api-reference.md#coverage)): the object data start at the first ledger written by parser version 7 or
+later, and `complete` is true only when that is at or before the ledger the feature starts at (XRPL: 28,685,313 for escrows and payment channels, 56,219,905 for checks, 107,524,865
+for delegations; Xahau: its first ledger, ledger 1). (1) **404 `escrow not found`** (`check not found`, `payment channel not found`, `ledger object not found`) for an object that
+exists on the ledger: it was created before the first version-7 ledger and has not changed since, so the index has no row of it; the API never asks a node, and the explorer reads
+it from the node. `SELECT count() FROM xrpl.object_changes WHERE object_type = 'Escrow' AND object_id = '<ID>'` is 0. (2) **No `created`, `complete: false`**: it was created before
+that ledger and changed after it, so its history starts in the middle. Both end when the history is written by parser version 7 or later (the program's one reprocess, or the history
+load: [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)); `SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 7` is the last ledger the object data
+lack. (3) **Delegations say `complete: false` after the re-ingest**: the enable ledger of `PermissionDelegationV1_1` is not known to the API (`GET
+/v2/network/amendments/PermissionDelegationV1_1` has no `enabled.ledger_index`: it reports one only for an amendment the node's ledger state lists as enabled, which the `validators`
+worker polls into `network_state`), or a ledger from 107,524,865 on was written by an older parser. On Xahau the delegations are `complete: true` and an empty list, always.
+(4) **A 500** (`unable to retrieve escrow`, `... delegations`): the tables of migration 013 are missing, or ClickHouse refused the read (the api logs the cause); an account with
+more than 10,000 delegations in one direction is a 500 too, by design.
+
+### `syncer_escrows_lag_ledgers` is high or stays still, or `escrows_dirty` errors rise
+The lag is the newest committed ledger less the watermark of the `escrows` job (the `through_ledger` of the sentinel: `SELECT through_ledger FROM xrpl.escrows WHERE escrow_id = ''
+ORDER BY version DESC LIMIT 1`). (1) **A first fill** (a rollout, or a rebuild after the history load) starts at the size of the history and falls in jumps of up to 1,000,000 ledgers,
+one step or more a tick: nothing is wrong ([operations](operations.md#ledger-objects-and-delegation)). (2) **The job fails**: `syncer_aggregator_errors_total{job="escrows"}` rises and the
+log says `Aggregator job escrows failed: ...`; the gauge keeps growing with the head because it is read from the table after a failed step. A database that is down for the step and
+for the gauge reads freezes the gauge: the errors rate is the signal. (3) **One escrow cannot be mapped**: `Aggregator job escrows failed for escrow <ID>, set aside: ...`; the step
+commits without it and the lag is not affected. (4) **The hook fails** (`Aggregator job escrows_dirty failed in <from> - <to>: ...`): the slice stays in `agg_dirty`, so
+`SELECT count() FROM xrpl.agg_dirty` does not fall, and the earlier hooks of the slice (rates, pairs, rollups, `nft_dirty`) run again at every tick until it works; fix the cause and the
+next tick drains the queue. (5) `SYSTEM STOP MERGES` on `xrpl.escrows` stops the lightweight `DELETE` a step may wait for: start merges again.
+
+### The Xahau syncer is halted on a payment channel that holds an issued token
+**Symptom:** `state=halted` and `error: Cannot parse ledger <index>: ... dropsToNative: invalid value '[object Object]' ...`. Before parser version 7, `BalanceChangesParser` read the amounts of a payment channel as drops, and a channel that holds an issued token (Xahau, `PaychanAndEscrowForTokens`) made it
+throw, so the live syncer stopped at its ledger (`state=halted`, [operations](operations.md#syncer-halted)) and a range-ingest chunk with it failed. This release types the amounts, and
+the syncer goes on from its checkpoint when it is deployed ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) item 92). Apply migration 013 first, as for the rest of the release.
+
+### A delegated transaction's fee is on the sender, or the delegate's list lacks it
+The ledger was written by a parser older than version 7. From version 7 on the `transaction_cost` row of a delegated transaction is the delegate's, and the delegate has the
+transaction in its own list (`account_transactions`), also when the metadata names none of its accounts. Re-ingest the ledger: `range-ingest --from 107524865 --to <deploy ledger>
+--reprocess` ([backfill](backfill.md#ledger-objects-and-delegation-re-ingest)).
+
 ### AMM swaps, pools or days are missing before a date
 The ledgers were written by parser version 1, which has no AMM rows (`SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 86795265 GROUP BY
 parser_version`). Re-ingest them with `--reprocess` from the enablement ledger 86795265 ([backfill](backfill.md#amm-data-re-ingest)); the aggregator then rebuilds

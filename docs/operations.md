@@ -30,9 +30,10 @@ no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile 
 | Account network names | `INSERT INTO xrpl.account_network_names ...` (or `xahau.`), shows within 60 s on that network only: [Name an account on one network](#name-an-account-on-one-network) |
 | Labels | `INSERT INTO shared.account_labels ...`, shows within 60 s: [Label an address](#label-an-address) |
 | Ingest progress | `syncer_checkpoint_ledger`, `syncer_head_ledger`, **`syncer_lag_ledgers`**, `syncer_last_commit_age_seconds` |
-| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`) |
+| Aggregator progress | `syncer_aggregator_stats_lag_seconds`, `rate(syncer_aggregator_runs_total[5m])`, `syncer_aggregator_errors_total{job}` (jobs `volume_live`, `volume_daily`, `amm_pools`, `nft_state`, `escrows`, `pair_hourly`, `markets_live`, `stats_live`, `stats_dirty`, `amm_daily`, `nft_collections`, `rates_daily`, `account_rollups`, `volume_backfill`, and the dirty hooks `volume_dirty`, `amm_pools_dirty`, `amm_daily_dirty`, `rates_daily_dirty`, `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`) |
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 | NFT data | `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending`, `syncer_nft_skipped_total`, the `nft_state` / `nft_state_dirty` / `nft_collections` error labels, [the NFT data](#the-nft-data) |
+| Ledger objects | `syncer_escrows_lag_ledgers`, `syncer_escrows_open`, `syncer_objects_unclassified_total`, the `escrows` / `escrows_dirty` error labels; the rollout and the re-ingest: [Ledger objects and delegation](#ledger-objects-and-delegation) |
 | Display names | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the rollout and the seed: [The display names](#the-display-names) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
 | Exports | `exporter-xrpl` / `exporter-xahau` (profile `exports`, one each): `GET /liveliness/healthz` on 3005, `exporter_jobs_total{status}`; the jobs are rows of `export_jobs` ([deployment](deployment.md#topology)) |
@@ -93,6 +94,11 @@ five NFT tables (`nft_events`, `account_nft_events`, `collection_nft_events`, `n
 missing table fails the batch, so the live runner retries the same ledgers without end; the NFT aggregator jobs read the other tables of the file.
 Nothing checks for the tables at boot: run the migrate job first (the compose files do), then deploy the syncer, then the api (the NFT routes answer
 500 until the tables exist). The rollout and the history: [The NFT data](#the-nft-data), [backfill](backfill.md#nft-re-ingest).
+**The ingest needs migration `013_ledger_objects.sql` applied before a syncer with parser version 7 starts, and the api after it.** That syncer writes `object_changes` and
+`account_object_changes` with every ledger, and an insert into a missing table fails the batch, so the live runner retries the same ledgers without end; the `escrows` job reads
+and writes the third table of the file. Nothing checks for the tables at boot: run the migrate job first (the compose files do), then deploy the syncer, then the api (the
+object routes answer 500 until the tables exist). The rollout and the history: [Ledger objects and delegation](#ledger-objects-and-delegation),
+[backfill](backfill.md#ledger-objects-and-delegation-re-ingest).
 **The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
 [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
 for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
@@ -377,12 +383,15 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_last_commit_age_seconds` | under ~10 s live (a ledger closes every 3-4 s on XRPL) | Above 60 s with a lag of 0 means the chain is not closing ledgers or the head hint is stuck |
 | syncer probe `state` | `live` (`catching_up` while behind) | `halted` (chain break, a ledger the parser rejects, or lost lease) |
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
-| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs), for `nft_state` / `nft_state_dirty` / `nft_collections` [the NFT data](#the-nft-data) |
+| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs), for `nft_state` / `nft_state_dirty` / `nft_collections` [the NFT data](#the-nft-data), for `escrows` / `escrows_dirty` [Ledger objects and delegation](#ledger-objects-and-delegation) |
 | `syncer_amm_unclassified_total` | a trickle at most | A burst: the parser met a pool shape it cannot place (a new kind of AMM transaction, an MPT asset); see [backfill](backfill.md#amm-data-re-ingest) |
 | `syncer_nft_state_lag_ledgers` | 0-2 once caught up (not set after a start until the job has placed its cursor: it keeps its value, 0 in a new process, and never reads the whole head) | Above 100 for more than 10 minutes (alert with a `for:` longer than a tick); large and falling is a catch-up, see [The NFT data](#the-nft-data). A read of the cursor that keeps failing shows as `{job="nft_state"}` errors, not here |
 | `syncer_nft_dirty_ledgers` | 0 | Positive and not falling for an hour: a re-ingest is waiting for `nft_state` and the job is failing (`syncer_aggregator_errors_total{job="nft_state"}`); falling is the digest of a re-ingest |
 | `syncer_nft_collections_pending` | 0 or small | Large after a rollout, falling by 150 or more every five minutes: see the first fill in [The NFT data](#the-nft-data); not falling at all for hours with `{job="nft_collections"}` errors rising: a collection that fails |
 | `syncer_nft_skipped_total` | flat (no MPT-priced NFT offer exists today) | Rising: NFT events with an MPT amount are dropped (the parser warns in the range-ingest log), the NFT history is missing them |
+| `syncer_escrows_lag_ledgers` | 0 to a few ledgers once caught up (the `escrows` job writes its watermark at every tick); large and falling is the first fill, see [Ledger objects and delegation](#ledger-objects-and-delegation) | Above 1,000 for 15 minutes (alert, paired with `rate(syncer_aggregator_errors_total{job="escrows"}[15m])`): the watermark is stuck or the job is failing. It follows the head also while steps fail |
+| `syncer_escrows_open` | the open native escrows the sentinel counts (0 until the first step has run) | Not an alert; it is D7's open count |
+| `syncer_objects_unclassified_total` | flat | Rising: a transaction changed an escrow, check, channel or delegation in a way the history has no event for (stored as event `update`), a shape the parser does not know; see [Ledger objects and delegation](#ledger-objects-and-delegation) |
 | `syncer_markets_live_age_seconds{period="day"}` | under 120 s (a set a minute) | Above 600 s for 10 minutes: the Markets table is stale, see [below](#account-and-market-aggregates) |
 | `syncer_markets_live_age_seconds{period=~"7day\|30day"}` | under about 300 s (a set every fifth run, about every 5 minutes); about 900 s for a few minutes after one failed set | Above 600 s for 10 minutes: that period of the Markets table is stale (the `MARKETS` switch needs all three periods under 600 s) |
 | `syncer_pair_hourly_missing_hours` | 0 (745 for a few minutes after the first start of a syncer with the AMM data additions) | Above 0 for 30 minutes |
@@ -755,6 +764,82 @@ by at most about 300 checks a minute, and nothing removes those rows yet (left t
 per request: its size costs disk and the worker's schedule read, not the api's memory. `account_domains` is ordered by
 account, so merges keep about one row per account and partition ([data-model](data-model.md#account_domains-p7-order-by-account-migration-012)).
 
+## Ledger objects and delegation
+
+The explorer shows an escrow, a check, a payment channel and a delegation with the history of the transactions that changed it. The history is a ledger table
+the ingest writes, read at query time; one aggregate, `escrows`, keeps the escrowed total for D7's supply ([syncer](syncer.md#the-escrows-job),
+[ADR-0018](adr/0018-ledger-object-history.md), [api-reference](api-reference.md#ledger-objects)). The pieces, all per network:
+
+| Piece | Cadence | Healthy | Watch |
+| --- | --- | --- | --- |
+| `object_changes` and `account_object_changes`, written by the ingest (parser version 7) | with every ledger | a row for each change of an escrow, check, payment channel and delegation, and the owner's and the counterparty's index rows | `syncer_objects_unclassified_total`; the range-ingest log (`L unclassified object changes`) |
+| The `escrows` job of the aggregator ([syncer](syncer.md#the-escrows-job)) | every tick, fifth in the tick (after `nft_state`), budget 2 s; the first fill in steps of 1,000,000 ledgers; a hook on the `agg_dirty` slices | `syncer_escrows_lag_ledgers` 0 to a few ledgers, `syncer_escrows_open` the open native escrows | `syncer_aggregator_errors_total{job="escrows"}` and `{job="escrows_dirty"}`; `syncer_escrows_lag_ledgers`, `syncer_escrows_open`; log lines `Aggregator job escrows ...` |
+| The routes of the api | read at each call, each read bounded by the object and the newest committed ledger; the coverage of a feature kept 60 s | an object answers as of the newest ledger, with no lag | a 500 `unable to retrieve escrow` (check, payment channel, delegations, ledger object) is a failed read, which the api logs with its cause |
+
+**What the owner does to deploy** (per network, the sandbox first, then production; the order matters):
+1. **Apply migration `013`** on each network database (`dc run --rm migrate-xrpl` / `migrate-xahau`; from source `pnpm ch:migrate`) **before the syncer and the API of this release**:
+   the writer inserts into the two new tables on every ledger, and a write to a missing table fails the batch ([above](#apply-a-schema-migration)).
+2. **Deploy the syncer, then the API.** From the deploy ledger every ledger has object rows, the delegate's account rows and the fixed fee rows; the `escrows` job builds its
+   table in steps of 1,000,000 ledgers until `syncer_escrows_lag_ledgers` is a few ledgers. **A Xahau syncer that is halted on a ledger with an issued-token payment channel
+   resumes after the deploy**: the old parser threw on its amounts (`Cannot parse ledger <n>`, [Syncer halted](#syncer-halted)), the new one types them.
+3. **On the XRP Ledger, re-ingest the delegation amendment's ledgers:** `range-ingest --from 107524865 --to <deploy ledger> --reprocess` (about 415,000 ledgers on
+   2026-10-28, about 25,000 more a day; hours on Ripple's full-history node, [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)). `agg_dirty` carries the rewrite into
+   the rollups and the escrows. Delegation coverage is then `complete: true`.
+4. **Escrows, checks and channels stay `complete: false`** until the history backfill (ADR-0015's load from ledger 32,570, or one reprocess after the program's last parser
+   version) writes every ledger from 28,685,313 on the XRP Ledger (checks: 56,219,905) and from Xahau's first ledger with parser version 7 or later. D5 does not do it. An
+   object created before the first ledger of version 7 and untouched since is a 404 until then, and the explorer reads it from the node.
+5. **Hand the explorer this commit** for its API sync (`pnpm api:sync`). The explorer's `LEDGER_OBJECTS` switch goes on in an environment once this API serves the routes there on
+   both networks; `DELEGATION` once step 3 is done there (in the sandbox once the routes answer: its coverage is never complete).
+
+**No new setting.** The job and its budget are in the aggregator (`GH_WORKERS` with `aggregator`, as for the NFT jobs); the api needs nothing of its own. To roll back, remove the
+routes or the `escrows` option: `013` needs no undo, and a syncer of the previous release writes no object rows (the ledgers it writes meanwhile have none, and their
+objects are 404 or start in the middle until they are re-ingested).
+
+- **The first fill of `escrows` holds ticks, by design.** With no sentinel the job starts at the ledger before the first committed one and walks to the head in steps of
+  1,000,000 ledgers, each a handful of narrow reads and the writes of the escrows it touched; on a full parser-7 history of the XRP Ledger that is about 80 steps. The
+  budget is checked before a step and **never inside one** (a step cannot resume partway: its sentinel is its last write), so a heavy step runs past the 2 s, the rest of the
+  tick waits for it (see the 23 of 30 s below), and the job goes on at the next tick where it stopped: expect `syncer_escrows_lag_ledgers` to fall in jumps of up to a million, and the
+  later jobs of those ticks (`stats_live` among them) to be short of time until it is at the head. The watermark is in the table (`through_ledger` of the sentinel), so a restart
+  goes on where it was.
+- **The budget of a tick.** The jobs before `stats_live` have 23 of the 30 s of a tick when each uses its whole budget (`volume_live` 5, `volume_daily` 4, `amm_pools` 3, `nft_state` 3, `escrows` 2,
+  `pair_hourly` 3, `markets_live` 3), so `stats_live` gets the 7 s that are left in the worst tick; in the steady state the escrows step is a few narrow reads.
+- **A failing `escrows` hook re-runs its slice's hooks.** The hook is the last of a slice's hooks. When it fails, the slice fails and stays in `agg_dirty`, and at the next tick the
+  earlier hooks of the slice run again (they are idempotent; the hook of `nft_state` marks its `nft_dirty` range once more, and at most three failing ranges are tried in a tick),
+  with no backoff. `syncer_aggregator_errors_total{job="escrows_dirty"}` rises each tick and `SELECT count() FROM xrpl.agg_dirty` does not fall: look for
+  `Aggregator job escrows_dirty failed in <from> - <to>: ...` in the log, fix the cause, and the next tick drains the queue.
+- **Pair the lag alert with the errors rate.** `syncer_escrows_lag_ledgers` is set from the step; after a step that failed it is set from the head and the sentinel, read outside
+  the job's budget (a head read that is slow can wait up to the request timeout once), so a watermark that is stuck shows as a lag that grows with the head. A database that is down
+  for the step and for those reads freezes the gauge: `rate(syncer_aggregator_errors_total{job="escrows"}[15m]) > 0` says it. The alert is
+  `syncer_escrows_lag_ledgers > 1000` for 15 minutes ([observability](observability.md#recommended-alerts)).
+- **An escrow that cannot be mapped is set aside, not stuck.** A step maps each touched escrow to its row; one whose rows cannot be read (an amount shape the job does not know) is left
+  as it was, counted as an error of `escrows` by its ID (`Aggregator job escrows failed for escrow <ID>, set aside: its rows cannot be mapped to an escrows row`) and the step commits without it: the sentinel's total and its watermark stay in agreement. It is
+  a parser or data bug to report; the next rebuild of that escrow tries it again.
+- **An escrow with no row left is deleted.** After a re-ingest that removes an escrow's rows the job removes its row with a lightweight `DELETE` that it waits for
+  (`lightweight_deletes_sync = 2`). A lightweight `DELETE` is a mutation, and `SYSTEM STOP MERGES` on `escrows` stops it too: do not leave merges stopped on the table.
+- **`syncer_objects_unclassified_total`** counts the changes of a tracked object that no event of its type covers (event `update`), over the ledgers written by the live ingest and
+  by the range-ingest runs of the process. None is expected; a rise is a transaction type or a field combination the parser has no event for. The range-ingest log warns with the
+  total of its run, and its last line ends with `L unclassified object changes`.
+- **After a re-ingest** (`range-ingest --reprocess` over ledgers with objects, [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)) the written ledgers mark `agg_dirty`, and
+  each slice's hook recomputes the escrows of the slice's ledgers as of the job's watermark (a slice above the watermark is the live steps' to read) and reads the total again if one
+  was written or removed. Until then `escrows` shows the old rows; an object's own routes read `object_changes` and show the new rows at once.
+- **A delegated transaction's fee moved.** After the reprocess of its ledger the fee row is the delegate's and the delegate lists the transaction; the balances, stats and reports
+  of the accounts concerned are recomputed through `agg_dirty` like any re-ingest ([above](#what-a-re-ingest-does-to-them)).
+- **Disk.** One row for every change of every tracked object on every network, with its fields and previous fields compressed (`ZSTD(3)`), and a narrow index row for each of its two
+  accounts. A payment channel claimed every day for years is thousands of rows; an escrow, a check or a delegation a few. The retention loop drops both tables with the others
+  ([Retention](#retention)); `escrows` is an aggregate and is not dropped (the aggregator rebuilds it from the rows that are left).
+
+```sql
+-- the object data cover the ledgers above this one (NULL: every stored ledger); delegations are `complete` once it is below 107,524,865
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 7;
+-- the sentinel of the escrows job: the open native escrows, their drops and the ledger it is as of; the lag is the head less through_ledger
+SELECT open_count, amount_drops, through_ledger FROM xrpl.escrows WHERE escrow_id = '' ORDER BY version DESC LIMIT 1;
+SELECT max(ledger_index) AS head FROM xrpl.ledgers;
+-- the objects the index has seen, by type and by the event that last changed them
+SELECT object_type, count() AS rows, uniqExact(object_id) AS objects FROM xrpl.object_changes GROUP BY object_type;
+-- changes no event expects (the counter's rows): what the parser could not name
+SELECT object_type, tx_type, count() FROM xrpl.object_changes WHERE event = 'update' GROUP BY object_type, tx_type ORDER BY count() DESC LIMIT 20;
+```
+
 ## Backfill and repair
 
 The live syncer never fills history. History, gaps and parser changes go through the range-ingest CLI, which runs next to the live
@@ -839,7 +924,7 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 
 ### What a re-ingest does to them
 
-`range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)), and a fourth, of `nft_state`, marks the slice's ledgers in `nft_dirty` ([The NFT data](#the-nft-data)):
+`range-ingest` (and `--reprocess`) marks the hours it rewrote in `agg_dirty`, and `stats_dirty` drains them in slices of at most a day. After each slice the hooks of the three jobs run ([syncer](syncer.md#76-the-agg_dirty-hooks)), and a fourth, of `nft_state`, marks the slice's ledgers in `nft_dirty` ([The NFT data](#the-nft-data)), and a fifth, of `escrows`, recomputes the escrows of the slice's ledgers ([Ledger objects and delegation](#ledger-objects-and-delegation)):
 
 - **Rates**: the days of the slice and the 14 after it that have a valid set are marked stale (a day's rate reads the trades of the 14 days before it). Until `rates_daily` has computed them again, newest first, the API values those days on read, so `syncer_rates_daily_missing_days` rises by up to the range plus 14 days and falls again; expect the
   slower path for the window of the range, and `api_rates_on_read_total` to show it. While ranges of the re-ingest wait in `agg_dirty`, `rates_daily` leaves the days they reach (the range and the 14 days after it) for after they are drained, so the gauge falls only as the queue empties. A range
@@ -847,7 +932,7 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
 - **Hours**: the hours of the slice in the last 31 days are recomputed at once (after an AMM `--reprocess` this is what puts the swaps into the `amm` rows of the Markets, see [the AMM data additions](#the-amm-data-additions)).
 - **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
 
-Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`) says which.
+Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`) says which.
 
 ### The AMM data additions
 

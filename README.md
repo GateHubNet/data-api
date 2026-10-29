@@ -11,7 +11,9 @@ XRP Ledger (pools and their history, swaps, liquidity events, votes and bids, LP
 open offers, an account's NFTs, collections with supply and holders, sales with prices, NFT sales volume), each answer stating how much of the history
 it holds in `coverage` ([ADR-0016](docs/adr/0016-nft-and-uritoken-data.md)); and **display names**: the name to show for up to 100 addresses in one call
 (a verified name from the toml of the account's domain, else the name the operator gave the address, else its unverified domain), with the labels, and what a domain's
-toml says ([ADR-0017](docs/adr/0017-display-names.md)).
+toml says ([ADR-0017](docs/adr/0017-display-names.md)); and **ledger objects** on both networks: an escrow, a check, a payment channel by its object ID with the
+history of the transactions that changed it, the permission delegations of an account (XRP Ledger), and which kind of object an ID is, each stating its `coverage`
+([ADR-0018](docs/adr/0018-ledger-object-history.md)).
 
 One deployment serves one network; the same images run all four. The API answers the same `/v2/...` paths on a host per network:
 
@@ -130,6 +132,7 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | AMM (extras) | `/v2/amm/pools`, `/v2/amm/pools/{pool}`, `/v2/amm/pools/{base}/{counter}`, `/v2/amm/pools/{pool}/{history,swaps,liquidity,governance}` |
 | NFTs (extras, both networks) | `/v2/nfts/{nft_id}`, `/v2/nfts/{nft_id}/{history,offers}`, `/v2/accounts/{address}/{nfts,nft_history}`, `/v2/nft_collections`, `/v2/nft_collections/{issuer}/{taxon}` (XRPL) or `/{issuer}` (Xahau) with `/{nfts,holders,sales,stats}`, `/v2/nft_sales`; each answer has `coverage` |
 | Names (extras) | `/v2/account_names?addresses=` (the display names, domains and labels of up to 100 addresses), `/v2/toml/{domain}` (what a domain's toml says, as the syncer last read it) |
+| Ledger objects (extras, both networks) | `/v2/escrows/{id}`, `/v2/checks/{id}`, `/v2/payment_channels/{id}`, each with `/history` (an object's state and the transactions that changed it, with `status` and `coverage`), `/v2/accounts/{address}/escrows/{sequence}` (an escrow by owner and sequence), `/v2/accounts/{address}/delegations` (`direction=given\|held`; empty on Xahau), `/v2/ledger_objects/{id}` (which kind of object an ID is) |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
 | Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |

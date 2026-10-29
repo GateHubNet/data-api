@@ -1,6 +1,6 @@
 # ADR-0010: Ripple Data API v2 wire compatibility, and every deliberate deviation
 
-**Status:** Accepted. Amended six times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72); Amendment 5 (2026-10-24), by [ADR-0016](0016-nft-and-uritoken-data.md), the NFT and URIToken routes, the `coverage` field and `nft_volume` (the amendment at the end of this record, items 73 to 78); Amendment 6 (2026-10-24), by [ADR-0017](0017-display-names.md), the account names and toml routes (the amendment at the end of this record, items 79 to 83). Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
+**Status:** Accepted. Amended seven times: Amendment 1 (2026-10-19), by [ADR-0012](0012-validators-and-amendments-data.md), the validators routes and the amendments routes (the amendment at the end of this record, items 40 to 48); Amendment 2 (2026-10-19), by [ADR-0013](0013-account-and-market-aggregates.md), the routes and parameters of the account and market aggregates (section 2, items 10a to 10g); Amendment 3, by [ADR-0011](0011-amm-data-and-swaps-as-exchanges.md), AMM swaps are exchanges (section 6, items 49 to 53); Amendment 4 (2026-10-24), by [ADR-0014](0014-address-names-and-labels-in-a-shared-database.md) and [ADR-0015](0015-historical-account-state-from-clickhouse.md), the account investigation data of spec #4 (the amendment at the end of this record, items 54 to 63, 65 to 72); Amendment 5 (2026-10-24), by [ADR-0016](0016-nft-and-uritoken-data.md), the NFT and URIToken routes, the `coverage` field and `nft_volume` (the amendment at the end of this record, items 73 to 78); Amendment 6 (2026-10-24), by [ADR-0017](0017-display-names.md), the account names and toml routes (the amendment at the end of this record, items 79 to 83); Amendment 7 (2026-10-24), by [ADR-0018](0018-ledger-object-history.md), the routes of the ledger objects and delegations, the `delegate` column of the account transactions CSV and the fee of a delegated transaction (the amendment at the end of this record, items 84 to 93). Items 7 and 10 were edited in place on 2026-10-29, each to point at Amendment 7 (the routes and the table it adds are not the ones those items dropped), and item 54 gained the column `delegate` on the same day. Item 44 gained one sentence on 2026-10-24, for the fixed validator list of Xahau Testnet ([ADR-0012](0012-validators-and-amendments-data.md#amendment-2026-10-24-the-testnets)).
 
 ## Context
 The goal of this service is to be a **drop-in replacement for `data.ripple.com`** (the `rippled-historical-database` project, Ripple Data
@@ -48,12 +48,12 @@ below. Where a ruling made during implementation changed served behaviour it is 
    validators[/{pubkey}[/manifests|/reports]], validator_reports, rippled_versions}`; `/v2/accounts/{address}/{escrows, payment_channels}`; `/v2/reports[/{date}]`;
    `/v2/maintenance/{domain}`; `/v2/estimate`; and the API map at `/` and `/v2`, whose index also appeared as the `api-map` key of the original's 404 body (here the
    404 body is `{result, message}` only). The old GateHub `/v2/ledgers` time-range list is dropped as well (it collided with Ripple's "latest ledger": `/v2/ledgers`
-   without an identifier is the latest ledger). Dropping the escrows and payment-channels *routes* goes with dropping their tables (item 10).
+   without an identifier is the latest ledger). Dropping the escrows and payment-channels *routes* goes with dropping their tables (item 10). Amendment 7 (items 84 to 93) serves the escrows, checks and payment channels *by object ID* from a table of another kind; these two account lists stay 404.
 8. **`/v2/ledger/{hash}/validations[/{pubkey}]`** (singular) is registered as an alias of `/v2/ledgers/{hash}/validations[/{pubkey}]`. It appears only in the
    original's README, not in the route table of either branch's `server.js`; it is provided because the README documented it and it was asked for.
 9. **`minute` live period of the volume routes is not supported** (the original's develop branch had it); `hour, day` (payments) and `hour, day,
    3day, 7day, 30day` (trades) are. The historical mode (`start`/`end`/`interval=day|week|month`) of the develop branch is implemented.
-10. **Data dropped:** the offers, issuers, escrows and paychannels tables and parsers. Escrow and payment-channel *typing* stays in `balance_changes`.
+10. **Data dropped:** the offers, issuers, escrows and paychannels tables and parsers. Escrow and payment-channel *typing* stays in `balance_changes`. (Amendment 7 adds the history of escrows, checks, payment channels and delegations in `object_changes`, a ledger table of its own, and `escrows`, an aggregate for D7's total: neither is the original's table.)
     `accounts_created.genesis_*` stays empty until a history import loads ledger 32570.
 
 **Amendment 2 (2026-10-19), added by the account and market aggregates ([ADR-0013](0013-account-and-market-aggregates.md)); the wording is in [api-reference](../api-reference.md#account-analytics-get-v2accountsaddressanalytics):**
@@ -221,7 +221,7 @@ addition: what the original served is served as before. Names and labels are ser
 
 54. **`format=csv` on `GET /v2/accounts/{address}/transactions`.** The original had no CSV for account transactions and ignored
     `format`. Here `format=csv` answers one summary row per transaction from the account's side (`hash, ledger_index, executed_time,
-    tx_type, result, initiator, counterparty, amount, currency, issuer, fee, flags_changed`), in a file `<address> - transactions.csv`,
+    tx_type, result, initiator, counterparty, amount, currency, issuer, fee, flags_changed, delegate`; the last column came with Amendment 7, item 90), in a file `<address> - transactions.csv`,
     with every parameter and the paging of the JSON list. The raw `tx` and `meta` are not in it: flattened, they would give a column per
     field of every type. The JSON answer is unchanged.
 55. **`account_name`.** The original's `account_data` was `{account, parent, initial_balance, inception, ledger_index, tx_hash}` (and the
@@ -393,3 +393,65 @@ changes**, and the fields `account_name`, `account_network_name` and `account_la
 83. **No `coverage`, no CSV, the default cache.** Neither answer carries `coverage` (a lookup that lists nothing: [Coverage](../api-reference.md#coverage));
     neither has `limit`, `marker`, `Link` or a CSV form; both send the global `Cache-Control` (`private, max-age=60`) and errors `no-store`. An account
     whose Domain was set before the state history starts and has not changed since has no domain until it does ([backfill](../backfill.md#account-domains-seed)).
+
+## Amendment 7 (2026-10-24): ledger objects and delegation
+The ledger objects (program 2, sub-project D5: [ADR-0018](0018-ledger-object-history.md), the wording in
+[api-reference](../api-reference.md#ledger-objects)) add nine routes the original did not have, change one column of an export and fix two bugs of the account
+books. **No route of the original is removed or changes the shape of its answer**: the JSON list of account transactions is as before, and its CSV gains a column.
+
+84. **Nine routes, as extras.** The original served no object of the ledger by its ID. Here `GET /v2/escrows/{escrow_id}`, `GET /v2/checks/{check_id}` and
+    `GET /v2/payment_channels/{channel_id}`, each with `/history`; `GET /v2/accounts/{address}/escrows/{sequence}` (an escrow by its owner and the sequence of
+    the transaction that created it, answered exactly as its ID is: the ID is worked out from the two, so no table is read first); `GET /v2/accounts/{address}/delegations`
+    (the permission delegations an account gave or holds); and `GET /v2/ledger_objects/{object_id}` (which kind of object an ID is, so that a pasted ID finds its page).
+    They are served on both networks.
+85. **Shape.** Every answer but the lookup of an ID starts `result, coverage, ledger_index, close_time`: the `coverage` of its feature ([Coverage](../api-reference.md#coverage);
+    an object's own is complete also when its creation is indexed), then the newest committed ledger and when it closed, which is the point the state and the `status` are
+    as of. The key orders (`escrow_id, account, sequence?, destination, amount, ...`) are ours and are pinned by tests and by the reference's "Keys of" lines; a key with
+    no value is left out, never `null`. IDs are 64 hex digits, accepted in any case and answered in upper case; times are `YYYY-MM-DDTHH:mm:ssZ`; the permission of a
+    delegation is `{permission, kind, transaction_type?}`. An **amount** is `{currency, issuer?, value}`: the native currency's code without an issuer and the value in
+    whole units, an issued token as on the ledger, and a multi-purpose token as `{currency: <48 hex digits of the issuance ID>, issuer, value: <raw integer units>,
+    mpt_issuance_id}` (**the data API's MPT amount object**, which the later MPT routes serve every MPT amount in). The `status` is worked out at the close time of the
+    answer: an escrow is `pending`, `can_be_finished` or `can_be_cancelled` and, once deleted, `finished`, `cancelled` or `removed`; a check `open`, `expired`, `cashed`,
+    `cancelled` or `removed`; a payment channel `open`, `closing` (it has an `expiration`, or a `cancel_after` that has been reached, and any transaction on it closes it)
+    or, once deleted, `closed` or `removed`.
+86. **History and paging.** The detail of an object embeds its newest 50 events (newest first) and a `history_marker` when there are more, which continues at
+    `/{id}/history?descending=true&marker=...`. The history routes take `descending` (default false: oldest first), `limit` (200, at most 1000), `marker`, `format=csv`
+    (files `<id> - escrow history.csv`, `<id> - check history.csv`, `<id> - payment channel history.csv`; the same columns on every page, an amount's keys joined to its name
+    with a dot) and send `Link`. An unknown parameter is ignored. A page past the end of an object that has events is `count: 0`; an object with none is 404.
+87. **Delegations.** `direction` is `given` (default; the account is the delegating `account`) or `held` (it is the `authorize`); an empty `direction=` is `given`. Only the
+    entries that are in the ledger are listed, ordered by `updated` (newest first) and then `delegation_id`, with `limit` (200, at most 1000), `marker`, `Link` and
+    `format=csv` (files `<address> - delegations given.csv` and `<address> - delegations held.csv`; the permission names in one cell, separated by a space). An account with
+    more than 10,000 delegations in the direction is a 500 `unable to retrieve delegations` that is logged: the list is a guard, not a page. **On Xahau, which has no
+    permission delegation, the answer is an empty list with `complete: true`**, not a 404, and no table is read.
+88. **Messages and checks.** The messages are new: 400 `invalid escrow id`, `invalid check id`, `invalid channel id`, `invalid ledger object id`, `invalid ripple address`
+    and `invalid sequence number` (the messages of `GET /v2/accounts/{address}/transactions/{sequence}`; **the owner of an escrow by sequence is checked**, as it is part
+    of the ID), `invalid direction`, `invalid marker`; 404 `escrow not found`, `check not found`, `payment channel not found`, `ledger object not found`; 500 `unable to retrieve
+    escrow`, `escrow history`, `check`, `check history`, `payment channel`, `payment channel history`, `delegations`, `ledger object`. The checks run in the order the
+    reference lists them (a bad marker is a 400 before a 404). A failed read of the coverage fails the route with its own 500, and no `complete: false` is invented. With no
+    committed ledger the object routes answer their 404 and the delegations 500.
+89. **No node fallback, and what 404 means.** The API serves what the index holds and never asks a node for an object. An object the index has no row of answers 404, which is
+    also what an object created before the first ledger written by parser version 7 and untouched since gets; the `coverage` of the other routes says where the history starts
+    ([backfill](../backfill.md#ledger-objects-and-delegation-re-ingest)). Escrows, checks and channels stay `complete: false` until the history backfill; delegation is complete
+    after its re-ingest. The routes send the global `Cache-Control` (`private, max-age=60`) and errors `no-store`.
+90. **`delegate` in the account transactions CSV.** The summary row of `GET /v2/accounts/{address}/transactions?format=csv` (item 54) gains `delegate` as its **last**
+    column: the transaction's `Delegate`, empty when it has none, on the row of every account the transaction affected. `fee` is on the row of the account that paid it: the
+    delegate's when the transaction names one, else the sender's. The JSON list is unchanged (its `tx` already carries `Delegate`), and so are the PDF columns of an
+    export. A delegate always has the transaction in its own list, with `is_initiator` 0, also when the metadata names none of its accounts (a fee-free inner transaction of
+    a Batch); `account_tx_by_sequence` stays the sender's.
+91. **The fee of a delegated transaction is the delegate's (a fix).** Until parser version 7 the `transaction_cost` row of a delegated transaction was put on its
+    `Account`, but the delegate signs it and pays its fee (the original predates permission delegation). From parser version 7 on the row is the delegate's and the sender's native row is its whole change, so the
+    rule that, per currency, the changes of a transaction sum to zero but the fee burned holds for a delegated transaction. The same rule is applied to two columns that
+    added the fee back to the source whoever paid it: `payments.source_balance_changes` and `path_payments.source_amount`. Everything derived from `balance_changes`
+    (`/accounts/{address}/balance_changes`, the `stats` and `reports`, the analytics, the rollups) follows from a re-ingest of the ledgers (`range-ingest --reprocess` from
+    ledger 107,524,865, [backfill](../backfill.md#ledger-objects-and-delegation-re-ingest)); ledgers before it keep the old rows, and a delegated transaction before the
+    reprocess has no fee row on the delegate. A delegate that is also the destination of a delegated Payment (a sweep to itself) still has the fee taken out of its
+    destination change in `payments.destination_balance_changes`; that column is corrected by a later fix of the program, and the re-ingest rewrites it.
+92. **Issued-token payment channels are typed (a fix).** On Xahau (`PaychanAndEscrowForTokens`) a payment channel can hold an issued token, and the parser read every
+    channel amount as drops: `dropsToNative` of a token's amount object throws a `LedgerParseError`, which halts the live syncer and fails a range chunk at the first such
+    ledger. Channels are now typed in the currency they hold, as escrows are, and **a Xahau syncer halted on such a ledger resumes after the deploy**. One thing means
+    something else than for a native channel: on Xahau the creator's line moves at each claim, so a claim's creator row is typed `paychannel_fund` with the claimed delta
+    (the values match the ledger; the label does not say "funded").
+93. **Kept: item 7.** `/v2/accounts/{address}/escrows` and `/v2/accounts/{address}/payment_channels`, the lists of the original, still answer 404 (the explorer's Objects
+    tab reads an account's objects from the node). Items 7 and 10 stand, and say so, in place.
+
+Kept: every route and message of the original. The endpoint-by-endpoint wording is in [api-reference](../api-reference.md#ledger-objects).

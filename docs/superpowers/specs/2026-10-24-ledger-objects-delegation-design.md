@@ -135,8 +135,9 @@ SETTINGS non_replicated_deduplication_window = 1000;
 | `previous` | JSON of `PreviousFields` (keys sorted, same exclusions), `'{}'` when the node has none |
 | `event_fields` | JSON of the facts the event takes from the transaction (section 2.2), keys sorted, `'{}'` when none |
 
-The key is unique: a transaction has one node per object. A row is written whatever the transaction's result (a `tec` can delete an
-expired channel; its metadata says so), and `result` keeps it. A modified node without `PreviousFields` was only threaded and has no row,
+The key is unique: a transaction has one node per object. A row is written whatever the transaction's result (a `tec`
+transaction's metadata can carry a changed node too, and `result` keeps it; the recorded close of an expired channel is `tesSUCCESS`,
+and no recorded `tec` transaction has a tracked node, so for a `tec` the rule is a defensive one, pinned by a synthetic case). A modified node without `PreviousFields` was only threaded and has no row,
 as in `account_states`. It is a child table like the others: in `CHILD_TABLES`, in `LEDGER_KEYED_TABLES` with P7, with the dedup window,
 deleted by recovery and `--reprocess`.
 
@@ -275,7 +276,7 @@ unexpected type) and is counted in `diagnostics.objectsUnclassified` (`syncer_ob
 Edge cases the tests pin: an escrow created with a ticket (sequence = `TicketSequence`); a token escrow (`Amount` an issued-token object or
 `{mpt_issuance_id, value}`, `TransferRate`); a check cashed with `DeliverMin` (delivered < `SendMax`); a check cancelled by a third party
 after its expiration; a channel funded with a new `Expiration`; a claim by the source with `tfClose` that closes at once (balance equals
-amount: `close`) and one that sets `Expiration` (`close_request`); a claim on an expired channel (`close`, which a `tec` can carry); a
+amount: `close`) and one that sets `Expiration` (`close_request`); a claim on an expired channel (`close`; the recorded one is `tesSUCCESS`, and a `tec` one is a synthetic pin); a
 `DelegateSet` that replaces a list and one that empties it; a Batch inner transaction (its own metadata, its own rows); Xahau's
 `EscrowFinish` with `EscrowID`.
 
@@ -318,8 +319,9 @@ keys; untracked types give no rows.
 2. **State**: the newest row's `fields`; removed when its `action` is `deleted`.
 3. **Creation**: the row with `action = 'created'` when it is in the page, else one prefix read `... AND action = 'created' LIMIT 1`
    (a payment channel older than its newest 50 events).
-4. **Counts** (payment channels only): `SELECT event, count() FROM (… LIMIT 1 BY ledger_index, tx_index) GROUP BY event` over the
-   object's prefix, for `funds` and `claims`.
+4. **Counts** (payment channels only): one read of the object's prefix, `SELECT countIf(event = 'fund') AS funds,
+   countIf(JSONHas(previous, 'Balance')) AS claims FROM (… LIMIT 1 BY ledger_index, tx_index)`: `funds` are the `fund` events and
+   `claims` the events that moved the `Balance` (a channel's first claim is one, its previous balance being `"0"`).
 
 `object-views.ts` maps a row's JSON to the response objects (key order pinned by tests); `object-status.ts` holds the status rules of
 section 5.2, which E10 mirrors for objects it reads from the node.
