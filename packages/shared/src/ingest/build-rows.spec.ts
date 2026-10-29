@@ -165,6 +165,8 @@ const ROW_KEY: ReadonlyArray<[Table, keyof LedgerRows]> = [
   [Table.NftSales, 'nftSales'],
   [Table.NftTouches, 'nftTouches'],
   [Table.AccountDomains, 'accountDomains'],
+  [Table.ObjectChanges, 'objectChanges'],
+  [Table.AccountObjectChanges, 'accountObjectChanges'],
 ];
 
 /** The columns of a table in the order of its CREATE TABLE statement. */
@@ -2005,7 +2007,7 @@ function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]
 }
 
 describe('CHILD_TABLES', () => {
-  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains', () => {
+  it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains, the object changes and their index by account', () => {
     const tables = CHILD_TABLES.map(([table]) => table);
     expect(new Set(tables).size).toBe(tables.length);
     expect([...tables].sort()).toEqual(
@@ -2037,6 +2039,8 @@ describe('CHILD_TABLES', () => {
         Table.NftSales,
         Table.NftTouches,
         Table.AccountDomains,
+        Table.ObjectChanges,
+        Table.AccountObjectChanges,
       ].sort(),
     );
   });

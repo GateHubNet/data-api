@@ -90,6 +90,13 @@ describe('LEDGER_KEYED_TABLES', () => {
     expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.DomainTomls);
   });
 
+  it('lists object_changes and account_object_changes by ten million, and not escrows: a ledger rewrite must not touch the aggregate', () => {
+    for (const table of [Table.ObjectChanges, Table.AccountObjectChanges]) {
+      expect(LEDGER_KEYED_TABLES.filter((t) => t.table === table)).toEqual([{ table, partitionSize: P7 }]);
+    }
+    expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.Escrows);
+  });
+
   it('lists every table once and keeps the commit marker first', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(new Set(tables).size).toBe(tables.length);

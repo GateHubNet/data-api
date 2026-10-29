@@ -586,6 +586,59 @@ export interface AccountDomainsRow {
   deleted: number;
 }
 
+/**
+ * One created, modified or deleted node of a tracked type (`Escrow`, `Check`, `PayChannel`, `Delegate`) in a
+ * transaction's metadata (`object_changes`, migration 013): the object's state after the transaction, what changed, and
+ * the event it was. `(object_type, object_id, ledger_index, tx_index)` is unique, a transaction has one node per object.
+ * A row is written whatever the transaction's result. `fields`, `previous` and `event_fields` are JSON text with sorted
+ * keys and the ledger's raw values (drops as text, amount objects, Ripple-epoch times), `'{}'` when there is nothing.
+ */
+export interface ObjectChangesRow {
+  /** The node's `LedgerEntryType`: `Escrow`, `Check`, `PayChannel` or `Delegate`. */
+  object_type: string;
+  /** The node's `LedgerIndex`: 64 digits, upper case. */
+  object_id: string;
+  ledger_index: number;
+  tx_index: number;
+  tx_hash: string;
+  close_time: UnixSeconds;
+  tx_type: string;
+  result: string;
+  /** The transaction's `Account`. */
+  sender: string;
+  /** The transaction's `Delegate`, `''` when it has none. */
+  delegate: string;
+  action: 'created' | 'modified' | 'deleted';
+  /** Per type: `create`, `finish`, `cancel`, `removed`, `cash`, `close`, `fund`, `claim`, `set`, ... (spec 2.2). */
+  event: string;
+  /** The object's `Account`. */
+  owner: string;
+  /** Its `Destination` (`Escrow`, `Check`, `PayChannel`) or `Authorize` (`Delegate`). */
+  counterparty: string;
+  /** The node's fields after the transaction (`NewFields` of a created node, else `FinalFields`), without the thread fields. */
+  fields: string;
+  /** The node's `PreviousFields`, with the same exclusions. */
+  previous: string;
+  /** The facts the event takes from the transaction: `sequence`, `fulfillment`, `delivered`. */
+  event_fields: string;
+}
+
+/**
+ * The index of `object_changes` by account (`account_object_changes`, migration 013): a row for the owner and one for the
+ * counterparty of each of its rows, two rows when they are the same account. `role` is in the key, so the delegations an
+ * account gave (`owner`) and holds (`counterparty`) are each a prefix. The row itself is read from `object_changes` by
+ * its key.
+ */
+export interface AccountObjectChangesRow {
+  account: string;
+  object_type: string;
+  role: 'owner' | 'counterparty';
+  ledger_index: number;
+  tx_index: number;
+  object_id: string;
+  action: 'created' | 'modified' | 'deleted';
+}
+
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
 
 export interface FeeStatsRow {
@@ -1213,6 +1266,41 @@ export interface NftCollectionHoldersRow {
   taxon_key: number;
   owner: string;
   held: number;
+  version: UInt64Value;
+}
+
+// -- Escrows (migration 013) -------------------------------------------------------------------------------------
+
+/**
+ * One row of `escrows`, rebuilt from `object_changes` by the aggregator: the newest `version` of an `escrow_id` is the
+ * escrow, and the row with `escrow_id = ''` is the **sentinel** that holds the escrowed total. An escrow row has
+ * `open_count` and `through_ledger` 0.
+ *
+ * `currency` is `XRP` or `XAH` with an `issuer` of `''` for the native currency, the 3-letter or 40-hex code of an issued
+ * token, the 48-hex issuance ID for an MPT (with its issuer). `amount` is in whole units, an MPT's raw integer units;
+ * `amount_drops` the drops of a native escrow, 0 for a token. `last_ledger` is the ledger of the escrow's newest
+ * `object_changes` row, `deleted` is 1 once it was finished, cancelled or removed.
+ *
+ * The sentinel: `open_count` is the number of escrows with `deleted = 0`, `amount_drops` the sum of their native drops,
+ * `through_ledger` the ledger the job has processed up to; its other columns are empty or 0.
+ */
+export interface EscrowsRow {
+  escrow_id: string;
+  owner: string;
+  destination: string;
+  sequence: number | null;
+  currency: string;
+  issuer: string;
+  amount: string;
+  amount_drops: UInt64Value;
+  finish_after: UnixSeconds | null;
+  cancel_after: UnixSeconds | null;
+  has_condition: number;
+  created_ledger: number | null;
+  last_ledger: number;
+  deleted: number;
+  open_count: UInt64Value;
+  through_ledger: number;
   version: UInt64Value;
 }
 

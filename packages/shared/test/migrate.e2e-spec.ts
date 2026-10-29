@@ -123,6 +123,18 @@ const SHAPES: Record<Table, Shape> = {
   // the domain of an account (migration 012): ordered by account, not by the unique key
   // (the exception to ADR-0007, spec 1.1)
   [Table.AccountDomains]: { engine: 'ReplacingMergeTree', version: 'version', partition: P7, order: 'account' },
+  // the history of the tracked ledger objects (migration 013) and its narrow index by account: `role` is in the key, so the
+  // delegations an account gave (owner) and holds (counterparty) are each a prefix
+  [Table.ObjectChanges]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'object_type, object_id, ledger_index, tx_index',
+  },
+  [Table.AccountObjectChanges]: {
+    engine: 'ReplacingMergeTree',
+    partition: P7,
+    order: 'account, object_type, role, ledger_index, tx_index, object_id',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -273,6 +285,8 @@ const SHAPES: Record<Table, Shape> = {
     partition: '',
     order: 'issuer, taxon_key, owner',
   },
+  // the aggregator's escrows and their sentinel row (migration 013): no partition, the newest version of an escrow wins
+  [Table.Escrows]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'escrow_id' },
   // what the tomls worker read of a domain (migration 012): one row per check, the newest wins
   [Table.DomainTomls]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'domain' },
   [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
@@ -347,6 +361,10 @@ const MIGRATION_011_TABLES: Table[] = [
 const MIGRATION_012 = '012_display_names.sql';
 /** The tables of migration 012. */
 const MIGRATION_012_TABLES: Table[] = [Table.AccountDomains, Table.DomainTomls];
+/** The ledger objects and delegation (D5): the object history of the ledger, its index by account and the escrows aggregate. */
+const MIGRATION_013 = '013_ledger_objects.sql';
+/** The tables of migration 013. */
+const MIGRATION_013_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectChanges, Table.Escrows];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -379,6 +397,8 @@ const DEDUP_TABLES: Table[] = [
   Table.NftSales,
   Table.NftTouches,
   Table.AccountDomains,
+  Table.ObjectChanges,
+  Table.AccountObjectChanges,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1771,6 +1791,54 @@ describe('migrations (e2e)', () => {
       copyReal([MIGRATION_012]);
       expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_012], skipped: before });
       for (const table of MIGRATION_012_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+
+  describe('migration 013', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-013-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 013 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_013_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_013);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_013);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_013_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_013]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_013], skipped: before });
+      for (const table of MIGRATION_013_TABLES) expect(await tablesOf(config.database)).toContain(table);
 
       expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
     });

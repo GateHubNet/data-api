@@ -142,6 +142,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
   ],
   "accountExchanges": [],
   "accountNftEvents": [],
+  "accountObjectChanges": [],
   "accountPathPayments": [],
   "accountPayments": [
     {
@@ -2551,6 +2552,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
   "nftEvents": [],
   "nftSales": [],
   "nftTouches": [],
+  "objectChanges": [],
   "pathPayments": [],
   "payments": [
     {
@@ -3956,6 +3958,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
       "uri": "",
     },
   ],
+  "accountObjectChanges": [],
   "accountPathPayments": [],
   "accountPayments": [
     {
@@ -4829,6 +4832,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
       "tx_index": 2,
     },
   ],
+  "objectChanges": [],
   "pathPayments": [],
   "payments": [
     {
@@ -5002,6 +5006,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
   "accountDomains": [],
   "accountExchanges": [],
   "accountNftEvents": [],
+  "accountObjectChanges": [],
   "accountPathPayments": [],
   "accountPayments": [],
   "accountStates": [
@@ -5829,6 +5834,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
   "nftEvents": [],
   "nftSales": [],
   "nftTouches": [],
+  "objectChanges": [],
   "pathPayments": [],
   "payments": [],
   "paymentsByCurrency": [],
@@ -6329,6 +6335,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
     },
   ],
   "accountNftEvents": [],
+  "accountObjectChanges": [],
   "accountPathPayments": [
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
@@ -7782,6 +7789,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
   "nftEvents": [],
   "nftSales": [],
   "nftTouches": [],
+  "objectChanges": [],
   "pathPayments": [
     {
       "amm_pools": [],
@@ -8446,6 +8454,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
   "accountDomains": [],
   "accountExchanges": [],
   "accountNftEvents": [],
+  "accountObjectChanges": [],
   "accountPathPayments": [],
   "accountPayments": [
     {
@@ -9284,6 +9293,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
   "nftEvents": [],
   "nftSales": [],
   "nftTouches": [],
+  "objectChanges": [],
   "pathPayments": [],
   "payments": [
     {

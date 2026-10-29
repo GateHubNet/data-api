@@ -3,6 +3,7 @@ import {
   AccountDomainsRow,
   AccountExchangesRow,
   AccountNftEventsRow,
+  AccountObjectChangesRow,
   AccountPathPaymentsRow,
   AccountPaymentsRow,
   AccountsCreatedRow,
@@ -22,6 +23,7 @@ import {
   NftEventsRow,
   NftSalesRow,
   NftTouchesRow,
+  ObjectChangesRow,
   PARSER_VERSION,
   PathPaymentsRow,
   PaymentsByCurrencyRow,
@@ -93,6 +95,13 @@ export interface LedgerRows {
    * `version` is unique).
    */
   accountDomains: AccountDomainsRow[];
+  /**
+   * Each created, modified or deleted Escrow, Check, PayChannel or Delegate node of a transaction (migration 013): the
+   * object's state after it and the event it was.
+   */
+  objectChanges: ObjectChangesRow[];
+  /** The index of `objectChanges` by account: a row for the owner and one for the counterparty of each. */
+  accountObjectChanges: AccountObjectChangesRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -127,7 +136,7 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
  * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
- * and their index by account, the 5 NFT tables and the account domains.
+ * and their index by account, the 5 NFT tables, the account domains, and the object changes and their index by account.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -157,6 +166,8 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.NftSales, 'nftSales'],
   [Table.NftTouches, 'nftTouches'],
   [Table.AccountDomains, 'accountDomains'],
+  [Table.ObjectChanges, 'objectChanges'],
+  [Table.AccountObjectChanges, 'accountObjectChanges'],
 ];
 
 const paymentParser = new PaymentParser();
@@ -284,6 +295,8 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     nftSales: [],
     nftTouches: [],
     accountDomains: [],
+    objectChanges: [],
+    accountObjectChanges: [],
     diagnostics: { ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0 },
   };
 

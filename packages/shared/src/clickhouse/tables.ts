@@ -40,6 +40,11 @@ export enum Table {
   // The domain of an account (migration 012, written by ingest from parser version 6): ordered by account, not by the
   // unique key (ADR-0007's exception, spec 1.1).
   AccountDomains = 'account_domains',
+  // The history of the tracked ledger objects (migration 013, written by ingest from parser version 7,
+  // OBJECT_PARSER_VERSION): one row per created, modified or deleted Escrow, Check, PayChannel or Delegate node, and its
+  // narrow index by account.
+  ObjectChanges = 'object_changes',
+  AccountObjectChanges = 'account_object_changes',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -77,6 +82,8 @@ export enum Table {
   AccountNfts = 'account_nfts',
   NftCollections = 'nft_collections',
   NftCollectionHolders = 'nft_collection_holders',
+  // Migration 013, written by the aggregator: the state of every escrow, plus a sentinel row that holds the escrowed total.
+  Escrows = 'escrows',
   // Migration 012, written by the syncer's tomls worker: one row per check of a domain's toml, the newest wins.
   DomainTomls = 'domain_tomls',
   // Written by the operator with plain SQL inserts (ADR-0014).

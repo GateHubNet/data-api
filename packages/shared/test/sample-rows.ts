@@ -6,6 +6,7 @@ import {
   AccountNetworkNamesRow,
   AccountNftEventsRow,
   AccountNftsRow,
+  AccountObjectChangesRow,
   AccountPartitionRowsRow,
   AccountPathPaymentsRow,
   AccountPaymentsRow,
@@ -29,6 +30,7 @@ import {
   BalanceChangesRow,
   CollectionNftEventsRow,
   DomainTomlsRow,
+  EscrowsRow,
   ExchangesRow,
   ExportJobsRow,
   FeeStatsRow,
@@ -45,6 +47,7 @@ import {
   NftSalesRow,
   NftsRow,
   NftTouchesRow,
+  ObjectChangesRow,
   PairHourlyRow,
   PARSER_VERSION,
   PathPaymentsRow,
@@ -101,6 +104,8 @@ export interface TableRows {
   [Table.NftSales]: NftSalesRow;
   [Table.NftTouches]: NftTouchesRow;
   [Table.AccountDomains]: AccountDomainsRow;
+  [Table.ObjectChanges]: ObjectChangesRow;
+  [Table.AccountObjectChanges]: AccountObjectChangesRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -132,6 +137,7 @@ export interface TableRows {
   [Table.AccountNfts]: AccountNftsRow;
   [Table.NftCollections]: NftCollectionsRow;
   [Table.NftCollectionHolders]: NftCollectionHoldersRow;
+  [Table.Escrows]: EscrowsRow;
   [Table.DomainTomls]: DomainTomlsRow;
   [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
@@ -541,6 +547,42 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     // northpeak.example
     domain_hex: '6E6F7274687065616B2E6578616D706C65',
     deleted: 0,
+  },
+  // the created node of an EscrowCreate that Alice sent through her delegate Carol, to Bob (the row of account_object_changes is Bob's)
+  [Table.ObjectChanges]: {
+    object_type: 'Escrow',
+    object_id: hash(40),
+    ledger_index: LEDGER,
+    tx_index: 8,
+    tx_hash: hash(20),
+    close_time: CLOSE,
+    tx_type: 'EscrowCreate',
+    result: 'tesSUCCESS',
+    sender: ALICE,
+    delegate: CAROL,
+    action: 'created',
+    event: 'create',
+    owner: ALICE,
+    counterparty: BOB,
+    fields: JSON.stringify({
+      Account: ALICE,
+      Amount: '25000000',
+      Destination: BOB,
+      FinishAfter: 782_000_000,
+      Flags: 0,
+      LedgerEntryType: 'Escrow',
+    }),
+    previous: '{}',
+    event_fields: JSON.stringify({ sequence: 37 }),
+  },
+  [Table.AccountObjectChanges]: {
+    account: BOB,
+    object_type: 'Escrow',
+    role: 'counterparty',
+    ledger_index: LEDGER,
+    tx_index: 8,
+    object_id: hash(40),
+    action: 'created',
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
@@ -999,6 +1041,26 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     version: VERSION_MS,
   },
   [Table.NftCollectionHolders]: { issuer: ISSUER, taxon_key: 7, owner: BOB, held: 3, version: VERSION_MS },
+  // the escrow of the created node above, still open
+  [Table.Escrows]: {
+    escrow_id: hash(40),
+    owner: ALICE,
+    destination: BOB,
+    sequence: 37,
+    currency: 'XRP',
+    issuer: '',
+    amount: '25',
+    amount_drops: 25_000_000,
+    finish_after: CLOSE + 86_400,
+    cancel_after: CLOSE + 172_800,
+    has_condition: 1,
+    created_ledger: LEDGER,
+    last_ledger: LEDGER,
+    deleted: 0,
+    open_count: 0,
+    through_ledger: 0,
+    version: VERSION_MS,
+  },
   [Table.DomainTomls]: {
     domain: 'sample.example',
     toml_url: 'https://sample.example/.well-known/xrp-ledger.toml',

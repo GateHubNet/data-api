@@ -16,7 +16,7 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
    │              │               │                │ account rollups │                  │                  │
    └──────┬───────┴───────┬───────┴───────┬────────┴────────┬────────┴────────┬─────────┴────────┬─────────┘
           ▼               ▼               ▼                 ▼                 ▼                  ▼
-   29 ledger      validations,    fee_stats        stats_hourly,     unl_lists,         domain_tomls
+   31 ledger      validations,    fee_stats        stats_hourly,     unl_lists,         domain_tomls
    tables         validator_      (every 5 s)      volume_live,      unl_publishers,    (reads
    (ledgers =     manifests,                       volume_daily,     validator_         account_
    commit         validator_                       amm_pools, nfts,  domains,           domains)
@@ -80,14 +80,15 @@ The single writer of the ledger tables. It follows the validated chain, one ledg
 
 ### Writing a ledger: `buildLedgerRows` and `LedgerWriter`
 
-For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 29
+For each ledger, `buildLedgerRows` (pure, in the shared package) turns the node's expanded ledger into rows of the 31
 **ledger-derived tables** (`ledgers`, `ledger_by_hash`, `transactions`, `tx_by_hash`, `tx_by_type`, `account_transactions`,
 `account_tx_by_sequence`, `payments`, `payments_by_currency`, `account_payments`, `exchanges`, `account_exchanges`,
 `balance_changes`, `accounts_created`, and the AMM tables `amm_pool_states`, `amm_pool_touches`, `amm_liquidity`,
 `account_amm_liquidity`, `amm_governance`, the state history `account_states` and `trust_line_states`, `path_payments` and its index by account `account_path_payments`,
 the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`, `nft_sales` and `nft_touches` (migration 011, filled from
-parser version 5: a ledger written by an older parser has no rows in them), and the Domain of an account `account_domains` (migration 012, filled from
-parser version 6 and ordered by account);
+parser version 5: a ledger written by an older parser has no rows in them), the Domain of an account `account_domains` (migration 012, filled from
+parser version 6 and ordered by account), and the history of the tracked ledger objects `object_changes` and its index by account
+`account_object_changes` (migration 013, filled from parser version 7: a ledger written by an older parser has no rows in them);
 see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
