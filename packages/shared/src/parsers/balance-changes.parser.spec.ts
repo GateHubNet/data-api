@@ -1156,6 +1156,35 @@ describe('BalanceChangesParser', () => {
           paychannel_final_balance: '2000000000000000000000',
         });
       });
+
+      // Synthetic, built here: a claim of 1e-10 DHA, which moves the creator's line and the destination's (as Xahau's claims
+      // do). A BigNumber below 1e-7 writes itself with an exponent; the two change columns are plain decimals.
+      it('writes the channel changes of a token as plain decimals, also below 1e-7', () => {
+        const rows = parser.parse(
+          parserTx({ TransactionType: 'PaymentChannelClaim', Account: 'rDst', Channel: 'AB' }, [
+            {
+              ModifiedNode: {
+                LedgerEntryType: 'PayChannel',
+                FinalFields: { Account: 'rSrc', Destination: 'rDst', Amount: token('1'), Balance: token('1e-10') },
+              },
+            },
+            root('rDst', '100000000', '99999988'),
+            line('rIssuer', 'rDst', 'DHA', '-3', '-3.0000000001'),
+            line('rIssuer', 'rSrc', 'DHA', '-5', '-4.9999999999'),
+          ]),
+          XAHAU,
+        );
+
+        expect(rowOf(rows, 'rDst', 2)).toMatchObject({
+          change_type: 'paychannel_payout',
+          paychannel_balance_change: '-0.0000000001',
+          paychannel_final_balance: '0.0000000001',
+        });
+        expect(rowOf(rows, 'rSrc', 3)).toMatchObject({
+          change_type: 'paychannel_fund',
+          paychannel_fund_change: '0.0000000001',
+        });
+      });
     });
   });
 

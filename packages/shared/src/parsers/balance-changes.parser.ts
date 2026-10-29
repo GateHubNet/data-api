@@ -271,8 +271,9 @@ export class BalanceChangesParser {
 
   /**
    * An untyped change of a party to a payment channel is the channel being funded or paid out. Whole units of the
-   * channel's currency: drops converted, and on Xahau (`PaychanAndEscrowForTokens`) a token as it is, written as a plain
-   * decimal, where the ledger writes a very large or very small one with an exponent.
+   * channel's currency: drops converted, and on Xahau (`PaychanAndEscrowForTokens`) a token as it is. The four channel
+   * columns are written as plain decimals, where the ledger writes a very large or very small token amount with an exponent
+   * (a change below 1e-7 too: the text of a native change, drops being at least 1e-6, is the same either way).
    */
   private channel(row: ParsedBalanceChange, channel: Json): void {
     const fund = escrowValue(channel.Amount ?? '0').toFixed();
@@ -281,11 +282,11 @@ export class BalanceChangesParser {
     if (row.account === channel.Account) {
       row.change_type = 'paychannel_fund';
       row.paychannel_counterparty = channel.Destination;
-      row.paychannel_fund_change = ZERO.minus(row.amount_change).toString();
+      row.paychannel_fund_change = ZERO.minus(row.amount_change).toFixed();
     } else {
       row.change_type = 'paychannel_payout';
       row.paychannel_counterparty = channel.Account;
-      row.paychannel_balance_change = ZERO.minus(row.amount_change).toString();
+      row.paychannel_balance_change = ZERO.minus(row.amount_change).toFixed();
     }
     row.paychannel_fund_final_balance = fund;
     row.paychannel_final_balance = paid;
