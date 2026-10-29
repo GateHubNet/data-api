@@ -419,7 +419,7 @@ history that starts in the middle, with no `created`, and says `complete: false`
    the slice and the `amm_daily` sets of its days, the rates of its days and of the 14 days after them (marked stale, then computed again), its hours of
    `pair_hourly`, the day rollups of the heavy accounts, the ledgers marked in `nft_dirty` (the dirty sweep of `nft_state` then rebuilds every NFT touched in those
    days) and, last, **the `escrows` hook**, which recomputes the escrows of the slice's ledgers as of the job's watermark and reads the total again if one changed
-   ([syncer](syncer.md#the-escrows-job)). Until a slice is drained its hours show the old numbers. Watch the queue fall back to the few ranges live ingest leaves:
+   ([syncer](syncer.md#the-escrows-job)). Until a slice is drained its hours show the old numbers. Watch the queue drain (only `range-ingest` adds to it):
 
    ```sql
    SELECT count() FROM xrpl.agg_dirty;
