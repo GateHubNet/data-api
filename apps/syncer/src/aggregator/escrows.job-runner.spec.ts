@@ -708,6 +708,32 @@ describe('AggregatorService escrows job', () => {
       },
     );
 
+    // A step that failed after some of its chunks were written leaves rows as of its window beside a sentinel that is still
+    // at the old watermark: a recompute and a total then would write a sentinel whose total is not the state at its watermark.
+    it('after a step that failed in this tick, a slice is left in agg_dirty and no sentinel is written', async () => {
+      step.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      const svc = service();
+      await svc.tick();
+      expect(ledgersClosedIn).not.toHaveBeenCalled();
+      expect(ofLedgers).not.toHaveBeenCalled();
+      expect(recomputeIds).not.toHaveBeenCalled();
+      expect(refreshTotal).not.toHaveBeenCalled();
+      expect(errors()).toEqual([{ job: 'escrows' }, { job: 'escrows_dirty' }]);
+      expect(logger.error.mock.calls.map(([line]) => line)).toEqual([
+        'Aggregator job escrows failed: DB::Exception: memory limit',
+        `Aggregator job escrows_dirty failed${SLICE_WHERE}: the escrows step of this tick failed`,
+      ]);
+      expect(ch.dirty).toEqual([aggMark(...SLICE)]);
+      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
+
+      // the next tick's step commits, and its slice is recomputed as of the new watermark
+      await tickAt(svc, 1);
+      expect(recomputeIds).toHaveBeenCalledTimes(1);
+      expect(refreshTotal).toHaveBeenCalledTimes(1);
+      expect(ch.dirty).toEqual([]);
+      expect(errors()).toHaveLength(2);
+    });
+
     it('does nothing once the shutdown has begun, and the range stays', async () => {
       const svc = service();
       ledgersClosedIn.mockImplementationOnce(async () => {

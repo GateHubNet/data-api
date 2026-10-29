@@ -54,6 +54,14 @@ export const ESCROWS_FUNCTIONS: EscrowsFunctions = {
  * database, the clock, the budgets and the rules of the tick are the service's (`AggregatorJobContext`).
  */
 export class EscrowsJobRunner {
+  /**
+   * Whether the last step the job took failed. Such a step may have written some of its chunks (rows as of its window) beside
+   * a sentinel that is still at the old watermark, so until a step commits the hook of a slice does not recompute or total: a
+   * sentinel it wrote would hold a total that is not the state of the escrows at its watermark. The steps of a tick come before
+   * the slices of `agg_dirty` (job 5 before `stats_dirty`), so this is a step of the same tick.
+   */
+  private lastStepFailed = false;
+
   constructor(
     private readonly ctx: AggregatorJobContext,
     private readonly escrows: AggregatorEscrows,
@@ -85,9 +93,11 @@ export class EscrowsJobRunner {
       try {
         step = await this.fns.step(this.ctx.ch, { native: this.escrows.nativeCurrency, signal: tick.signal });
       } catch (error) {
+        this.lastStepFailed = true;
         await this.reportAfterFailure();
         throw error;
       }
+      this.lastStepFailed = false;
       this.ctx.logger.debug(
         `escrows: ledgers after ${step.from} up to ${step.to} (head ${step.head}): ${step.touched} escrow(s) touched, ` +
           `${step.written} row(s) written, ${step.removed} removed, ${this.ctx.clock() - began} ms`,
@@ -127,10 +137,13 @@ export class EscrowsJobRunner {
    * of the slice (the live steps cover it) does nothing. The recompute is up to the watermark and not the head: the rows above it
    * are the live steps' to read, and the sentinel's total must stay the state of the escrows at its own watermark. The total is
    * read again (a narrow row per escrow ever seen) only after a change. An escrow that cannot be mapped is set aside as in a step.
-   * Once the shutdown has begun it does nothing, and the range of `agg_dirty` is left as it is.
+   * After a step of the tick that failed it throws before it reads anything (`lastStepFailed`), so that the slice fails and its
+   * range stays in `agg_dirty` for the next tick, and no sentinel is written whose total is not the state at its watermark. Once
+   * the shutdown has begun it does nothing, and the range of `agg_dirty` is left as it is.
    */
   async ofSlice(start: number, end: number, tick: AggregatorTick): Promise<void> {
     if (this.ctx.closing()) return;
+    if (this.lastStepFailed) throw new Error('the escrows step of this tick failed');
     const ledgers = await this.escrows.rates.ledgersClosedIn(new Date(start * 1000), new Date(end * 1000));
     if (ledgers === null || this.ctx.closing()) return;
     const sentinel = await this.fns.read(this.ctx.ch);

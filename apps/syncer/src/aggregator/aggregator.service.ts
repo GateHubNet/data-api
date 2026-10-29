@@ -408,7 +408,7 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     `nft_dirty`, for the dirty sweep of `nft_state` to rebuild (the hook rebuilds nothing); and last, with the `escrows` option
  *     (also without the others), the escrows of the ledgers that closed in the slice are recomputed as of the watermark of the
  *     `escrows` job (a slice above it is the live steps' to read), and the total is read again, with the sentinel rewritten at
- *     the same watermark, if an escrow was written or removed.
+ *     the same watermark, if an escrow was written or removed (not after a step of the tick that failed: the slice fails then).
  * 10. **amm_daily** (with the `ammDaily` option; at the first tick and then every `AMM_DAILY_EVERY_TICKS`): one set per UTC day with
  *     the stats of every AMM pool (swap volume, estimated fees, liquidity, closing state, value): today and yesterday, the
  *     stalest first and a day that failed last time behind the others (R87), then the closed days, newest first, that have no

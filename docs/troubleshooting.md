@@ -238,7 +238,8 @@ ORDER BY version DESC LIMIT 1`). (1) **A first fill** (a rollout, or a rebuild a
 one step or more a tick: nothing is wrong ([operations](operations.md#ledger-objects-and-delegation)). (2) **The job fails**: `syncer_aggregator_errors_total{job="escrows"}` rises and the
 log says `Aggregator job escrows failed: ...`; the gauge keeps growing with the head because it is read from the table after a failed step. A database that is down for the step and
 for the gauge reads freezes the gauge: the errors rate is the signal. (3) **One escrow cannot be mapped**: `Aggregator job escrows failed for escrow <ID>, set aside: ...`; the step
-commits without it and the lag is not affected. (4) **The hook fails** (`Aggregator job escrows_dirty failed in <from> - <to>: ...`): the slice stays in `agg_dirty`, so
+commits without it and the lag is not affected. (4) **The hook fails** (`Aggregator job escrows_dirty failed in <from> - <to>: ...`; with the reason `the escrows step of this tick
+failed` the cause is (2), and the slice waits for a step that commits): the slice stays in `agg_dirty`, so
 `SELECT count() FROM xrpl.agg_dirty` does not fall, and the earlier hooks of the slice (rates, pairs, rollups, `nft_dirty`) run again at every tick until it works; fix the cause and the
 next tick drains the queue. (5) `SYSTEM STOP MERGES` on `xrpl.escrows` stops the lightweight `DELETE` a step may wait for: start merges again.
 
