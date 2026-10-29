@@ -661,7 +661,13 @@ describe('the escrows job (e2e)', () => {
       // all six in one chunk: the bad ones sit before, between and after the good ones
       const done = await runEscrowsStep(ch, { native: 'XRP', step: 3 });
       expect(done).toMatchObject({ from: 101, to: 104, touched: 6, written: 2, removed: 0 });
-      expect(done.setAside).toEqual([GOOD, SHAPE, MPT_BAD, NOT_JSON]);
+      // each with why: the ID and the reason go to the runner's log
+      expect(done.setAside).toEqual([
+        { id: GOOD, reason: 'the Amount is of a shape the ledger does not have' },
+        { id: SHAPE, reason: 'the Amount is of a shape the ledger does not have' },
+        { id: MPT_BAD, reason: "an MPTokenIssuanceID must be 48 hex digits: 'ZZ'" },
+        { id: NOT_JSON, reason: expect.stringContaining('JSON') },
+      ]);
       // the sentinel committed: the window is done, the total counts what was written and the row GOOD had
       expect(await readEscrowed(ch)).toEqual({ drops: '7000000', open: 3, through_ledger: 104 });
       expect(done.escrowed).toEqual({ drops: '7000000', open: 3, through_ledger: 104 });
@@ -682,7 +688,14 @@ describe('the escrows job (e2e)', () => {
 
     it('names each escrow it sets aside to a recompute of its own, and writes the others', async () => {
       const done = await recomputeEscrows(ch, [SHAPE, FINE, NOT_JSON], { upTo: 105, native: 'XRP' });
-      expect(done).toEqual({ written: 1, removed: 0, setAside: [SHAPE, NOT_JSON] });
+      expect(done).toEqual({
+        written: 1,
+        removed: 0,
+        setAside: [
+          { id: SHAPE, reason: 'the Amount is of a shape the ledger does not have' },
+          { id: NOT_JSON, reason: expect.stringContaining('JSON') },
+        ],
+      });
       // the total and the watermark of a hook's refresh agree with the step's
       expect(await refreshEscrowsTotal(ch, { native: 'XRP' })).toEqual({
         drops: '7000000',

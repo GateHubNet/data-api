@@ -376,7 +376,7 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     watermark is in the table, so a restart goes on where the job was; with no sentinel it starts at the ledger before the first
  *     committed one. A step that fails is the failure of the job, and the next tick does the same window again; an escrow whose rows
  *     cannot be mapped is set aside by the step, which commits without it, and is counted and logged as a failure of `escrows` by its
- *     ID. `syncer_escrows_lag_ledgers` is the newest committed ledger the step saw less the watermark it wrote, and
+ *     ID, with the reason. `syncer_escrows_lag_ledgers` is the newest committed ledger the step saw less the watermark it wrote, and
  *     `syncer_escrows_open` the count of the sentinel. Only committed ledgers are read.
  *  6. **pair_hourly** (with the `aggregates` option): the candle of every pair in each hour of the last 31 days, the live hours
  *     first, then the back-fill (`PairHourlyJobRunner`).

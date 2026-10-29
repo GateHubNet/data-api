@@ -234,8 +234,8 @@ grep for: `Syncer` (boot line with network, workers and node hosts), `NodeClient
 failed as a whole, but its halves were rebuilt: ...`, which is counted as one error and means the batch failed for its size, not that a pool is
 bad; the same lines for the NFT jobs: `Aggregator job nft_state failed for NFT <id>, set aside to be tried again`, `... nft_collections failed for
 collection <issuer>/<taxon>, ...`, the warnings `a batch of N NFT(s) failed as a whole, but its halves were rebuilt: ...` and `... N collection(s) ...`, and
-`nft_state: NFT <id> is rebuilt again` / `nft_collections: collection <id> is computed again` when a set-aside one works; the escrows job's `Aggregator job escrows failed for escrow <ID>, set aside: ...`
-(an escrow whose rows cannot be mapped) and `Aggregator job escrows_dirty failed in <from> - <to>: ...` (a hook); also the log of the four account and market jobs: `Rates back-fill ...`, `Pair-hourly back-fill ...`, `Account-rollups back-fill ...`,
+`nft_state: NFT <id> is rebuilt again` / `nft_collections: collection <id> is computed again` when a set-aside one works; the escrows job's `Aggregator job escrows failed for escrow <ID>, set aside: <reason>`
+(an escrow whose rows cannot be mapped, and why) and `Aggregator job escrows_dirty failed in <from> - <to>: ...` (a hook); also the log of the four account and market jobs: `Rates back-fill ...`, `Pair-hourly back-fill ...`, `Account-rollups back-fill ...`,
 `Markets set of period ... not written`, and the shared `reached its budget` warning), `Api` (boot line with
 network and native currency), `RippleRoute` / `RippleError` (the cause of every 5xx, with the stack; the response body never carries
 it), `ApiKeyGuard`.

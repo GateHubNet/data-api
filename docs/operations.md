@@ -811,9 +811,10 @@ objects are 404 or start in the middle until they are re-ingested).
   the job's budget (a head read that is slow can wait up to the request timeout once), so a watermark that is stuck shows as a lag that grows with the head. A database that is down
   for the step and for those reads freezes the gauge: `rate(syncer_aggregator_errors_total{job="escrows"}[15m]) > 0` says it. The alert is
   `syncer_escrows_lag_ledgers > 1000` for 15 minutes ([observability](observability.md#recommended-alerts)).
-- **An escrow that cannot be mapped is set aside, not stuck.** A step maps each touched escrow to its row; one whose rows cannot be read (an amount shape the job does not know) is left
-  as it was, counted as an error of `escrows` by its ID (`Aggregator job escrows failed for escrow <ID>, set aside: its rows cannot be mapped to an escrows row`) and the step commits without it: the sentinel's total and its watermark stay in agreement. It is
-  a parser or data bug to report; the next rebuild of that escrow tries it again.
+- **An escrow that cannot be mapped is set aside, not stuck.** A step maps each touched escrow to its row; one whose rows cannot be read (a text that is not JSON, an amount of no shape
+  the ledger has, drops that are not a whole number, an MPT ID that is not one: unreachable from ledger data) is left as it was, counted as an error of `escrows` by its ID with the
+  reason (`Aggregator job escrows failed for escrow <ID>, set aside: the Amount is of a shape the ledger does not have`, for one) and the step commits without it: the sentinel's total
+  and its watermark stay in agreement. It is a parser or data bug to report; the next rebuild of that escrow tries it again.
 - **An escrow with no row left is deleted.** After a re-ingest that removes an escrow's rows the job removes its row with a lightweight `DELETE` that it waits for
   (`lightweight_deletes_sync = 2`). A lightweight `DELETE` is a mutation, and `SYSTEM STOP MERGES` on `escrows` stops it too: do not leave merges stopped on the table.
 - **`syncer_objects_unclassified_total`** counts the changes of a tracked object that no event of its type covers (event `update`), over the ledgers written by the live ingest and

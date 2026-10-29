@@ -731,8 +731,9 @@ ClickHouse clock in milliseconds, above the key's newest).
 - **The budget is checked before a step and never inside one.** The first step of a run is always taken (unless the shutdown has begun); more follow while the watermark is below the
   head and the 2 s last. A step cannot resume partway (its sentinel is its last write), so it is not given a signal that the budget aborts, only the shutdown's (`EscrowsAborted`, neither
   logged nor counted). A first fill over all history (about 80 steps on the XRP Ledger) therefore goes on where it stopped at each tick, and a heavy step runs past the budget.
-- **An escrow that cannot be mapped is set aside** (its rows have an amount shape the job does not know): the step commits without it, and it is counted and logged as a failure of
-  `escrows` by its ID. The total of the native drops stays exact because an amount of an unknown shape is a token, worth 0 to it.
+- **An escrow that cannot be mapped is set aside** (a text that is not JSON, an amount of no shape the ledger has, drops that are not a whole number, an MPT ID that is not one:
+  unreachable from ledger data): the step commits without it, its old row stays (and the total counts that row), and it is counted and logged as a failure of `escrows` by its ID,
+  with the reason.
 - **A step that fails is the failure of the job** (counted as `escrows`, logged, the jobs after it still run). The gauges are then set from the head and the sentinel, read outside the
   job's budget, so a watermark that is stuck shows as a lag that grows with the head.
 - **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), item 5, error label `escrows_dirty`. It recomputes the escrows touched in the slice's ledgers, and those whose
@@ -1196,7 +1197,7 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `Toml checks: the pass failed: <name> (<type>)` | ClickHouse refused the read of the schedule or the insert of the rows | The rows not written are due again at the next pass (a minute later). |
 | Boot refuses: `lacks the schema of 012_display_names.sql` | The migration was not applied before a syncer with the `tomls` worker | Apply it (`migrate-<network>`) and start the syncer again. |
 | `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
-| `Aggregator job escrows failed for escrow <id>, set aside: ...` | The rows of one escrow cannot be mapped to an `escrows` row | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
+| `Aggregator job escrows failed for escrow <id>, set aside: <reason>` | The rows of one escrow cannot be mapped to an `escrows` row, for the reason given | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
 | `Aggregator job escrows_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed | The slice stays queued and its earlier hooks run again at each tick, until it works ([7.6](#76-the-agg_dirty-hooks)). |
 | `Cannot parse ledger <n>: ... dropsToNative: invalid value '[object Object]'` on a Xahau payment channel | A syncer older than parser version 7 met a payment channel that holds an issued token | Halted until a restart on this release, which types the channel's amounts ([troubleshooting](troubleshooting.md#the-xahau-syncer-is-halted-on-a-payment-channel-that-holds-an-issued-token)). |
 

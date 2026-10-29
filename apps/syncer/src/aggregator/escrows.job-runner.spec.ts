@@ -1,4 +1,4 @@
-import { Escrowed, EscrowsAborted, EscrowsStep, RatesService } from '@gatehub/data-api-shared';
+import { Escrowed, EscrowsAborted, EscrowsStep, RatesService, SetAsideEscrow } from '@gatehub/data-api-shared';
 import { FakeClickHouse, iso, NOW, NOW_SECONDS, QUIET, unix } from '../../test/aggregator-fakes';
 import {
   AGGREGATOR_ESCROWS_BUDGET_MS,
@@ -28,6 +28,11 @@ describe('AggregatorService escrows job', () => {
   /** The ID of an escrow made by hand. */
   const idOf = (n: number): string => n.toString(16).toUpperCase().padStart(64, '0');
   const IDS = [idOf(1), idOf(2)];
+  /** An escrow set aside for `reason`, a reason `escrowRowOf` gives. */
+  const setAside = (n: number, reason = 'the Amount is of a shape the ledger does not have'): SetAsideEscrow => ({
+    id: idOf(n),
+    reason,
+  });
   const SLICE = ['2026-05-01T00:00:00Z', '2026-05-01T03:00:00Z'] as const;
   const SLICE_WHERE = ' in 2026-05-01T00:00:00Z - 2026-05-01T03:00:00Z';
 
@@ -61,9 +66,9 @@ describe('AggregatorService escrows job', () => {
   /** How long (fake milliseconds) a step takes, at least one: a loop that does not progress runs out of its budget. */
   let stepMs: number;
   /** The escrows the fake steps set aside. */
-  let stepSetAside: string[];
+  let stepSetAside: SetAsideEscrow[];
   /** What the fake recompute of a slice did. */
-  let recomputed: { written: number; removed: number; setAside: string[] };
+  let recomputed: { written: number; removed: number; setAside: SetAsideEscrow[] };
   /** The signal of each step the fake was given. */
   let signals: AbortSignal[];
 
@@ -484,12 +489,12 @@ describe('AggregatorService escrows job', () => {
 
   describe('the escrows a step sets aside', () => {
     it('are each counted and logged as a failure of escrows, by ID, and the step still counts as done', async () => {
-      stepSetAside = [idOf(0xa1), idOf(0xa2)];
+      stepSetAside = [setAside(0xa1), setAside(0xa2)];
       await service().tick();
       expect(errors()).toEqual([{ job: 'escrows' }, { job: 'escrows' }]);
       expect(logger.error.mock.calls.map(([line]) => line)).toEqual([
-        `Aggregator job escrows failed for escrow ${idOf(0xa1)}, set aside: its rows cannot be mapped to an escrows row`,
-        `Aggregator job escrows failed for escrow ${idOf(0xa2)}, set aside: its rows cannot be mapped to an escrows row`,
+        `Aggregator job escrows failed for escrow ${idOf(0xa1)}, set aside: the Amount is of a shape the ledger does not have`,
+        `Aggregator job escrows failed for escrow ${idOf(0xa2)}, set aside: the Amount is of a shape the ledger does not have`,
       ]);
       // the sentinel was written: the job ran, and its gauges were set
       expect(jobsRun()).toEqual(['escrows', 'stats_live', 'stats_dirty']);
@@ -505,12 +510,24 @@ describe('AggregatorService escrows job', () => {
       step.mockImplementationOnce(working);
       step.mockImplementationOnce(async (...args: unknown[]) => ({
         ...(await working(...args)),
-        setAside: [idOf(0xb1)],
+        setAside: [setAside(0xb1)],
       }));
       await service().tick();
       expect(step).toHaveBeenCalledTimes(3);
       expect(errors()).toEqual([{ job: 'escrows' }]);
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining(idOf(0xb1)));
+    });
+
+    it('logs the reason of a set-aside escrow, as the step gives it', async () => {
+      stepSetAside = [
+        setAside(0xd1, 'an Amount of 1.5 drops is not a whole number'),
+        setAside(0xd2, "an MPTokenIssuanceID must be 48 hex digits: 'ZZ'"),
+      ];
+      await service().tick();
+      expect(logger.error.mock.calls.map(([line]) => line)).toEqual([
+        `Aggregator job escrows failed for escrow ${idOf(0xd1)}, set aside: an Amount of 1.5 drops is not a whole number`,
+        `Aggregator job escrows failed for escrow ${idOf(0xd2)}, set aside: an MPTokenIssuanceID must be 48 hex digits: 'ZZ'`,
+      ]);
     });
   });
 
@@ -662,12 +679,16 @@ describe('AggregatorService escrows job', () => {
     });
 
     it('counts and logs each escrow the hook sets aside as a failure of escrows, and the slice goes on', async () => {
-      recomputed = { written: 1, removed: 0, setAside: [idOf(0xc1), idOf(0xc2)] };
+      recomputed = {
+        written: 1,
+        removed: 0,
+        setAside: [setAside(0xc1), setAside(0xc2, 'Unexpected end of JSON input')],
+      };
       await service().tick();
       expect(errors()).toEqual([{ job: 'escrows' }, { job: 'escrows' }]);
       expect(logger.error.mock.calls.map(([line]) => line)).toEqual([
-        `Aggregator job escrows failed for escrow ${idOf(0xc1)}${SLICE_WHERE}, set aside: its rows cannot be mapped to an escrows row`,
-        `Aggregator job escrows failed for escrow ${idOf(0xc2)}${SLICE_WHERE}, set aside: its rows cannot be mapped to an escrows row`,
+        `Aggregator job escrows failed for escrow ${idOf(0xc1)}${SLICE_WHERE}, set aside: the Amount is of a shape the ledger does not have`,
+        `Aggregator job escrows failed for escrow ${idOf(0xc2)}${SLICE_WHERE}, set aside: Unexpected end of JSON input`,
       ]);
       // mapping is a function of the rows, so there is nothing to try again: the slice is done, and the range is removed
       expect(refreshTotal).toHaveBeenCalledTimes(1);
@@ -675,7 +696,7 @@ describe('AggregatorService escrows job', () => {
     });
 
     it('a set aside escrow alone writes nothing, so the total is not refreshed', async () => {
-      recomputed = { written: 0, removed: 0, setAside: [idOf(0xc1)] };
+      recomputed = { written: 0, removed: 0, setAside: [setAside(0xc1)] };
       await service().tick();
       expect(errors()).toEqual([{ job: 'escrows' }]);
       expect(refreshTotal).not.toHaveBeenCalled();

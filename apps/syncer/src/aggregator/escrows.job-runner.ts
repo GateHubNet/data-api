@@ -7,6 +7,7 @@ import {
   recomputeEscrows,
   refreshEscrowsTotal,
   runEscrowsStep,
+  SetAsideEscrow,
 } from '@gatehub/data-api-shared';
 import { iso } from './aggregate-job-deps';
 import { AggregatorJobContext, AggregatorTick } from './job-context';
@@ -82,8 +83,8 @@ export class EscrowsJobRunner {
    * (`syncer_escrows_open`) are set after every step without another read. After a step that **failed** they are set from the
    * head and the sentinel, read then (`reportAfterFailure`), so that a watermark that is stuck shows as a lag that grows with the
    * head and not as the value the gauge had before, or 0 after a restart. An escrow a step set aside (its rows cannot be
-   * mapped) is counted and logged as a failure of `escrows`, by its ID: nothing is to be retried, as mapping is a function of the
-   * rows, and the step commits without it.
+   * mapped) is counted and logged as a failure of `escrows`, by its ID and with the reason: nothing is to be retried, as mapping
+   * is a function of the rows, and the step commits without it.
    */
   async run(tick: AggregatorTick): Promise<void> {
     if (this.ctx.closing()) return;
@@ -160,14 +161,10 @@ export class EscrowsJobRunner {
     if (done.written + done.removed > 0) await this.fns.refreshTotal(this.ctx.ch, { native, signal: tick.signal });
   }
 
-  /** Counts and logs each escrow that was set aside as a failure of `escrows`; the reason is not carried, only the ID. */
-  private reportSetAside(ids: readonly string[], where = ''): void {
-    for (const id of ids) {
-      this.ctx.failed(
-        'escrows',
-        new Error('its rows cannot be mapped to an escrows row'),
-        ` for escrow ${id}${where}, set aside`,
-      );
+  /** Counts and logs each escrow that was set aside as a failure of `escrows`, by its ID and with why it cannot be mapped. */
+  private reportSetAside(escrows: readonly SetAsideEscrow[], where = ''): void {
+    for (const { id, reason } of escrows) {
+      this.ctx.failed('escrows', new Error(reason), ` for escrow ${id}${where}, set aside`);
     }
   }
 }

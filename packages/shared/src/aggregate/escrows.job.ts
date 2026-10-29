@@ -36,8 +36,10 @@ import { committedHead } from './amm-pools.job';
  *    or not an escrow changed. A step that fails before it leaves the old sentinel, whose total and watermark agree with each
  *    other, and the next step does `(W, U]` again, which rewrites the same rows.
  *  - **An escrow that cannot be mapped is set aside**, not allowed to stall the job: its row is not written (a row it had stays as
- *    it was) and its ID is returned (`setAside`), and the step commits. The total is not affected: it counts native drops, and an
- *    `Amount` the code does not know is a token's. Mapping is a pure function of the rows, so there is nothing to retry.
+ *    it was, and the total counts that row) and its ID is returned with the reason (`setAside`), and the step commits. Mapping
+ *    fails only on rows the ledger cannot produce (a text that is not JSON, an `Amount` of no shape the ledger has, drops that are
+ *    not a whole number, an MPT ID that is not one), so it is unreachable from ledger data. Mapping is a pure function of the
+ *    rows, so there is nothing to retry.
  *  - **An escrow with no row left is removed**: a re-ingest dropped its `object_changes` rows. Its `escrows` rows are deleted
  *    (a lightweight DELETE, as for `amm_pools`).
  *  - **Nothing is written once the shutdown has begun**: `signal` is checked before each read and each write.
@@ -71,9 +73,15 @@ export interface EscrowsStep {
   written: number;
   removed: number;
   /** The escrows of the window that could not be mapped (see `recomputeEscrows`), in the order of their IDs. */
-  setAside: string[];
+  setAside: SetAsideEscrow[];
   /** The sentinel the step wrote. */
   escrowed: Escrowed;
+}
+
+/** An escrow whose rows cannot be mapped to an `escrows` row, and why (what `escrowRowOf` refuses them for). */
+export interface SetAsideEscrow {
+  id: string;
+  reason: string;
 }
 
 /** The columns of an `object_changes` row that make an `escrows` row. */
@@ -167,12 +175,22 @@ export function escrowRowOf(
   native: string,
   version: number,
 ): EscrowsRow {
+  const mapped = mappedEscrow(newest, created, native, version);
+  if ('reason' in mapped) throw new Error(`The escrow ${newest.object_id} cannot be mapped: ${mapped.reason}`);
+  return mapped.row;
+}
+
+/** The `escrows` row of an escrow (`escrowRowOf`), or why its rows cannot be mapped. */
+function mappedEscrow(
+  newest: EscrowSource,
+  created: EscrowSource | undefined,
+  native: string,
+  version: number,
+): { row: EscrowsRow } | { reason: string } {
   try {
-    return mapEscrow(newest, created, native, version);
+    return { row: mapEscrow(newest, created, native, version) };
   } catch (error) {
-    throw new Error(
-      `The escrow ${newest.object_id} cannot be mapped: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    return { reason: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -329,7 +347,7 @@ async function recomputeChunk(
   ch: ClickHouseService,
   ids: string[],
   opts: { upTo: number; native: string; signal?: AbortSignal },
-): Promise<{ written: number; removed: number; setAside: string[] }> {
+): Promise<{ written: number; removed: number; setAside: SetAsideEscrow[] }> {
   const { upTo, native, signal } = opts;
   throwIfAborted(signal);
   const params = { ids, upTo };
@@ -347,16 +365,14 @@ async function recomputeChunk(
   for (const { newest: latest } of versions) version = Math.max(version, Number(latest) + 1);
 
   const rows: EscrowsRow[] = [];
-  const setAside: string[] = [];
+  const setAside: SetAsideEscrow[] = [];
   for (const id of ids) {
     const row = newestOf.get(id);
     if (row === undefined) continue;
-    try {
-      rows.push(escrowRowOf(row, createdOf.get(id), native, version));
-    } catch {
-      // its rows cannot be mapped: the others are written and the job goes on
-      setAside.push(id);
-    }
+    const mapped = mappedEscrow(row, createdOf.get(id), native, version);
+    // rows that cannot be mapped: the others are written and the job goes on
+    if ('reason' in mapped) setAside.push({ id, reason: mapped.reason });
+    else rows.push(mapped.row);
   }
   throwIfAborted(signal);
   await ch.insert(Table.Escrows, rows);
@@ -379,18 +395,19 @@ async function recomputeChunk(
  * versions. `signal` is checked before each read and each write: an aborted recompute throws `EscrowsAborted` and writes nothing
  * more.
  *
- * An escrow whose rows cannot be mapped (`escrowRowOf` throws: an `Amount` of a shape the ledger does not have, a text that is
- * not JSON) is set aside: the others of its chunk are written, and its ID is returned. A row it had stays as it was.
+ * An escrow whose rows cannot be mapped (`escrowRowOf` refuses them: an `Amount` of a shape the ledger does not have, a text that
+ * is not JSON) is set aside: the others of its chunk are written, and its ID is returned with the reason. A row it had stays as it
+ * was.
  *
- * Returns how many rows it wrote, how many escrows it removed, and the IDs set aside, in order.
+ * Returns how many rows it wrote, how many escrows it removed, and the escrows set aside, in the order of their IDs.
  */
 export async function recomputeEscrows(
   ch: ClickHouseService,
   ids: readonly string[],
   opts: { upTo: number; native: string; signal?: AbortSignal },
-): Promise<{ written: number; removed: number; setAside: string[] }> {
+): Promise<{ written: number; removed: number; setAside: SetAsideEscrow[] }> {
   throwIfAborted(opts.signal);
-  const result = { written: 0, removed: 0, setAside: [] as string[] };
+  const result = { written: 0, removed: 0, setAside: [] as SetAsideEscrow[] };
   for (const chunk of chunksOf([...new Set(ids)].sort(), ESCROWS_CHUNK)) {
     const done = await recomputeChunk(ch, chunk, opts);
     result.written += done.written;
