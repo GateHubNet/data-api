@@ -167,8 +167,8 @@ The escrow, check, payment channel and delegation routes are GateHub extras ([AD
   `object-params.ts` the parsing of an ID. No object is cached.
 - **Coverage.** Every service asks `FeatureCoverageService` for the coverage of its feature (`escrows`, `payment_channels`, `checks`, `delegations`; `common/coverage-features.ts`
   registers them: Xahau's start at the network's first ledger, delegation is `unavailable` where `NetworkProfile.hasDelegation` is false) or for an object's own (`itemCoverage`).
-- **Delegations** read the account's prefix of `account_object_changes` for `Delegate` and the role (at most 10,000 IDs), then their newest `object_changes` rows 1,000 IDs at a time,
-  drop the deleted ones and sort and page the rest in memory.
+- **Delegations** read the account's prefix of `account_object_changes` for `Delegate` and the role, the newest row of each ID and those that are not deleted (at most 10,000
+  IDs), then their newest `object_changes` rows 1,000 IDs at a time, and sort and page them in memory.
 - **Reads** are bounded by `read_rows` tests (`paged-reads.e2e-spec.ts`, over a bulk of other objects' rows): the object's prefix and `H` on every read.
 
 #### The names module (`apps/api/src/names`)

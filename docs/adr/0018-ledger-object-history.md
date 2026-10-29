@@ -79,8 +79,8 @@ what every transaction since did to it, and why it is in the state it is in. The
   an answer carries is the only statement of this; D5 does no backfill of its own.
 - **The cost of a read is the object's, not the network's.** An object is a prefix of the key; the detail reads one page of 51 rows, one prefix read for the
   creation when it is older than the page, and, for a channel, one for its counts (`funds`, `claims`). Delegations read the account's prefix of
-  `account_object_changes` (at most 10,000 IDs: more is a 500 and a log line, a guard and not a page), then their newest rows 1,000 IDs at a time. Every read is capped
-  at `H` and pinned by `read_rows` tests over a bulk of other objects' rows. The price is storage: one row for every change of every tracked object, with its fields
+  `account_object_changes` (the IDs whose newest row there is not a deletion, at most 10,000: more is a 500 and a log line, a guard and not a page), then their
+  newest rows 1,000 IDs at a time. Every read is capped at `H` and pinned by `read_rows` tests over a bulk of other objects' rows. The price is storage: one row for every change of every tracked object, with its fields
   and previous fields (`ZSTD(3)`), on every network, from the deploy on; the retention procedure drops the two tables with the other ledger tables.
 - **A history is what the metadata said, so a failed attempt that changed nothing is not in it**, and a `tec` transaction that did change a tracked node is (none
   is recorded in the fixtures, and the recorded close of an expired channel is `tesSUCCESS`). An unclassified change is `update`, counted, and shown as such.

@@ -4330,7 +4330,8 @@ The `coverage` is that of the delegations ([Coverage](#coverage)): complete when
 amendment was enabled in. An entry is listed whether or not its creation is indexed.
 
 **The size of an account.** The delegations are read from the index of the account (an account with 10,000 or fewer in the direction is
-served), and an account that has more is answered 500 `unable to retrieve delegations` and logged: the list is a guard, not a page.
+served; a deleted entry is not counted), and an account that has more is answered 500 `unable to retrieve delegations` and logged: the
+list is a guard, not a page.
 
 `GET /v2/accounts/rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL/delegations`, an account that authorized one other for its offers (`OfferCreate` and `OfferCancel`):
 
@@ -4388,7 +4389,7 @@ read. `GET /v2/accounts/rKqZCLrHu8dMPj444xPrDQCXUpZr6U2VWi/delegations` on Xahau
 ```
 
 Errors, in the order they are checked: 400 `invalid ripple address`, `invalid direction`, `invalid marker`; 500 `unable to retrieve delegations` (also for
-an account with more than 10,000 delegations in the direction, and when no ledger is committed).
+an account with more than 10,000 delegations in the ledger in the direction, and when no ledger is committed).
 
 ### `GET /v2/ledger_objects/{object_id}`
 

@@ -500,7 +500,8 @@ channel history`; CSV `<id> - payment channel history.csv`.
 
 Only delegations in the ledger at `H` are listed. Order: `updated` newest first, then `delegation_id`; the marker holds the last row's
 `(ledger_index, tx_index, delegation_id)`. Read (section 6): the account's prefix of `account_object_changes` for (`Delegate`, role) gives
-the IDs, at most `DELEGATION_IDS_CAP = 10,000` (more answers 500 and logs: a guard, not a page), then their newest `object_changes` rows;
+the IDs, at most `DELEGATION_IDS_CAP = 10,000` (more answers 500 and logs: a guard, not a page; *amended by the final review (2026-10-30):*
+the IDs whose newest index row is not a deletion, so deleted entries do not count), then their newest `object_changes` rows;
 the deleted ones are dropped and the rest sorted and paged in memory. On a network without delegation (`NetworkProfile.hasDelegation`,
 new: `true` on XRPL and XRPL Testnet, `false` on Xahau and Xahau Testnet) the answer is the empty list, without a read of the tables,
 and its `coverage` is D3's rule for a feature the network cannot have: the service's `from_ledger_index` with `complete: true` (there is

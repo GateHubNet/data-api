@@ -10,8 +10,8 @@ import { delegationCsvRow, DelegationObject, delegationObject, ObjectRead } from
 import { CsvRow } from '../nft/nft-objects';
 
 /**
- * How many delegations, given or held, an account can have for `GET /v2/accounts/{address}/delegations` to list them: a guard,
- * not a page. An account that has more is answered 500, and the account is logged (in the message of the failure), so that the
+ * How many delegations, given or held, an account can have in the ledger at the head for `GET /v2/accounts/{address}/delegations`
+ * to list them (deleted ones are not counted): a guard, not a page. An account that has more is answered 500, and the account is logged (in the message of the failure), so that the
  * limit can be looked at for it.
  */
 export const DELEGATION_IDS_CAP = 10_000;
@@ -72,8 +72,9 @@ function comesAfter(row: ObjectRead, [ledger, tx, id]: KeyValue[]): boolean {
 /**
  * The delegations an account gave or holds (spec 5.6), as of the newest committed ledger `H`, read in the two steps of spec 6:
  *
- *  1. the IDs: the account's prefix of `account_object_changes` for (`Delegate`, role), up to `H`, distinct, at most
- *     `DELEGATION_IDS_CAP + 1` (more is a guard: 500, and the account is logged);
+ *  1. the IDs: the account's prefix of `account_object_changes` for (`Delegate`, role), up to `H`, the newest row of each ID, and
+ *     those whose newest row is no deletion (the entries in the ledger at `H`), at most `DELEGATION_IDS_CAP + 1` (more is a guard:
+ *     500, and the account is logged);
  *  2. their rows: from `object_changes`, by `object_type = 'Delegate' AND object_id IN ids` (`IDS_PER_READ` IDs a read), the newest
  *     row of each (its state, and `updated`) and the newest `created` row of each (`created`, the creation of the entry it is now:
  *     an entry deleted and made again under the same ID has the newest). A deleted entry is not listed. The rest is sorted and
@@ -141,12 +142,26 @@ export class DelegationsService {
     };
   }
 
-  /** The IDs of the delegations of the account in the direction, up to `H`: one read of the account's prefix of the index. */
+  /**
+   * The IDs of the delegations of the account in the direction that are in the ledger at `H`: one read of the account's prefix of
+   * the index, the newest row of each ID, and those whose newest row is not a deletion, in the order of the IDs. An entry deleted
+   * and made again under the same ID is in it; one deleted is not, so that the cap counts what is listed and not every ID the prefix
+   * ever named (entries made and deleted again by other accounts, at the cost of their fees, cannot make the list a 500 for ever).
+   * The owner and the authorized account of a `Delegate` are fixed by its ID, so its newest row in the index is its newest row.
+   */
   private async idsOf(address: string, direction: DelegationDirection, asOf: AsOf): Promise<string[]> {
     const rows = await this.ch.query<{ object_id: string }>(
-      `SELECT DISTINCT object_id
-         FROM ${Table.AccountObjectChanges}
-        WHERE account = {account:String} AND object_type = {type:String} AND role = {role:String} AND ledger_index <= {H:UInt32}
+      `SELECT object_id
+         FROM (
+              SELECT object_id, action
+                FROM ${Table.AccountObjectChanges}
+               WHERE account = {account:String} AND object_type = {type:String} AND role = {role:String}
+                 AND ledger_index <= {H:UInt32}
+               ORDER BY object_id, ledger_index DESC, tx_index DESC
+               LIMIT 1 BY object_id
+              )
+        WHERE action != 'deleted'
+        ORDER BY object_id
         LIMIT {cap:UInt32}`,
       { account: address, type: DELEGATE, role: ROLE_OF[direction], H: asOf.ledger_index, cap: DELEGATION_IDS_CAP + 1 },
     );

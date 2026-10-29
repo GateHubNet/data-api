@@ -718,6 +718,54 @@ describe('the delegations of an account at and past DELEGATION_IDS_CAP', () => {
     ).flat();
   }
 
+  /**
+   * The holder of `DELEGATION_IDS_CAP + 1` delegations that were each made and deleted again (by as many accounts: what anyone can
+   * do to an account at the cost of the fees), and of one that is live.
+   */
+  const CHURNED = accountAt(0xd653);
+  const CHURN_BASE = 0xce000000;
+  const CHURN_LIVE = idOf(CHURN_BASE, DELEGATION_IDS_CAP + 1);
+  const CHURN_LIVE_STEP: Step = { ledger: 107_850_000, tx: 0, action: 'created', permissions: ['Payment'] };
+  function churned(): ObjectChangesRow[] {
+    return [
+      ...Array.from({ length: DELEGATION_IDS_CAP + 1 }, (_, n) =>
+        delegation(idOf(CHURN_BASE, n), accountAt(0x200000 + n), CHURNED, [
+          { ledger: ledgerOf(n), tx: 1, action: 'created', permissions: ['Payment'] },
+          { ledger: ledgerOf(n) + 20_000, tx: 1, action: 'deleted', permissions: ['Payment'] },
+        ]),
+      ).flat(),
+      ...delegation(CHURN_LIVE, accountAt(0x200000 + DELEGATION_IDS_CAP + 1), CHURNED, [CHURN_LIVE_STEP]),
+    ];
+  }
+
+  /**
+   * An account that gave 1,500 delegations, more than one read of the objects names (`IDS_PER_READ`): in the second read, one
+   * that was deleted and made again under the same ID, and one that was deleted.
+   */
+  const MULTI = accountAt(0xd654);
+  const MULTI_BASE = 0xcf000000;
+  const MULTI_COUNT = 1_500;
+  const REMADE = idOf(MULTI_BASE, 1_200);
+  const REMADE_STEPS: Step[] = [
+    { ledger: ledgerOf(1_200), tx: 2, action: 'created', permissions: ['Payment'] },
+    { ledger: 107_860_000, tx: 2, action: 'deleted', permissions: ['Payment'] },
+    { ledger: 107_870_000, tx: 2, action: 'created', permissions: ['AccountSet'] },
+  ];
+  const GONE = idOf(MULTI_BASE, 1_300);
+  function multi(): ObjectChangesRow[] {
+    return Array.from({ length: MULTI_COUNT }, (_, n) => {
+      const id = idOf(MULTI_BASE, n);
+      const made: Step = { ledger: ledgerOf(n), tx: 2, action: 'created', permissions: ['Payment'] };
+      const steps =
+        id === REMADE
+          ? REMADE_STEPS
+          : id === GONE
+            ? [made, { ledger: 107_860_000, tx: 3, action: 'deleted' as const, permissions: ['Payment'] }]
+            : [made];
+      return delegation(id, MULTI, accountAt(0x300000 + n), steps);
+    }).flat();
+  }
+
   let h: Harness;
   let api: ApiClient;
 
@@ -730,6 +778,8 @@ describe('the delegations of an account at and past DELEGATION_IDS_CAP', () => {
         ...delegations(0xca000000, DELEGATION_IDS_CAP, { owner: AT_CAP }),
         ...delegations(0xcb000000, DELEGATION_IDS_CAP + 1, { owner: PAST_CAP }),
         ...delegations(0xcc000000, DELEGATION_IDS_CAP + 1, { holder: HELD_PAST_CAP }),
+        ...churned(),
+        ...multi(),
       ],
       { ledger_index: HEAD, close_time: closeOf(HEAD) },
     );
@@ -751,6 +801,19 @@ describe('the delegations of an account at and past DELEGATION_IDS_CAP', () => {
       DELEGATION_IDS_CAP,
       DELEGATION_IDS_CAP + 1,
       DELEGATION_IDS_CAP + 1,
+    ]);
+    // the churned holder has more IDs than the cap, all but one deleted; the account of two reads has 1,500
+    const [more] = await h.ch.query<{ churned: string; deleted: string; multi: string }>(
+      `SELECT uniqExactIf(object_id, account = {churned:String} AND role = 'counterparty') AS churned,
+              uniqExactIf(object_id, account = {churned:String} AND role = 'counterparty' AND action = 'deleted') AS deleted,
+              uniqExactIf(object_id, account = {multi:String} AND role = 'owner') AS multi
+         FROM ${Table.AccountObjectChanges} WHERE object_type = 'Delegate'`,
+      { churned: CHURNED, multi: MULTI },
+    );
+    expect([Number(more.churned), Number(more.deleted), Number(more.multi)]).toEqual([
+      DELEGATION_IDS_CAP + 2,
+      DELEGATION_IDS_CAP + 1,
+      MULTI_COUNT,
     ]);
   });
 
@@ -808,5 +871,42 @@ describe('the delegations of an account at and past DELEGATION_IDS_CAP', () => {
     // the same accounts the other way round have nothing, and are served
     const none = (await api.ok(`/v2/accounts/${PAST_CAP}/delegations?direction=held`, 'delegations')).body as Obj;
     expect([none.count, none.delegations]).toEqual([0, []]);
+  });
+
+  // The cap counts the delegations in the ledger at H, not every ID the account's prefix ever named: deleted entries cannot make
+  // an account's list a 500 for ever.
+  it('an account with 10,001 deleted delegations and one live lists the live one', async () => {
+    const body = (await api.ok(`/v2/accounts/${CHURNED}/delegations?direction=held`, 'delegations')).body as Obj;
+    expect([body.count, body.marker]).toEqual([1, undefined]);
+    expect(body.delegations).toEqual([
+      {
+        delegation_id: CHURN_LIVE,
+        account: accountAt(0x200000 + DELEGATION_IDS_CAP + 1),
+        authorize: CHURNED,
+        permissions: [{ permission: 'Payment', kind: 'transaction' }],
+        updated: refOf(CHURN_LIVE, CHURN_LIVE_STEP),
+        created: refOf(CHURN_LIVE, CHURN_LIVE_STEP),
+      },
+    ]);
+  });
+
+  it('lists the delegations of the second read of the objects: one deleted and made again with its new creation, a deleted one not', async () => {
+    const path = `/v2/accounts/${MULTI}/delegations`;
+    const first = (await api.ok(`${path}?limit=1000`, 'delegations')).body as Obj;
+    const rest = (await api.ok(`${path}?limit=1000&marker=${first.marker as string}`, 'delegations')).body as Obj;
+    expect([first.count, rest.count, rest.marker]).toEqual([1000, MULTI_COUNT - 1 - 1000, undefined]);
+    const listed = [...(first.delegations as Obj[]), ...(rest.delegations as Obj[])];
+    const ids = listed.map((d) => d.delegation_id);
+    expect(new Set(ids).size).toBe(MULTI_COUNT - 1);
+    expect(ids).not.toContain(GONE);
+    // made again last, so the newest; its creation is the one after the delete
+    expect(listed[0]).toEqual({
+      delegation_id: REMADE,
+      account: MULTI,
+      authorize: accountAt(0x300000 + 1_200),
+      permissions: [{ permission: 'AccountSet', kind: 'transaction' }],
+      updated: refOf(REMADE, REMADE_STEPS[2]),
+      created: refOf(REMADE, REMADE_STEPS[2]),
+    });
   });
 });
