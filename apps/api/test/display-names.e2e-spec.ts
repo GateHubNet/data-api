@@ -1,12 +1,4 @@
-import {
-  DomainTomlsRow,
-  EMPTY_TOML_CONTENT,
-  getNetworkProfile,
-  NetworkProfile,
-  recordToml,
-  Table,
-  tomlUrlOf,
-} from '@gatehub/data-api-shared';
+import { getNetworkProfile, Table } from '@gatehub/data-api-shared';
 import { createHash } from 'node:crypto';
 import { classicAddressToXAddress, encodeAccountID } from 'ripple-address-codec';
 import { ACCOUNT_DOMAINS_SQL } from '../src/names/account-domains.service';
@@ -18,6 +10,16 @@ import {
 } from '../src/names/account-names-object';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { accountAt } from './support/amm';
+import {
+  failToml,
+  hexOf,
+  holds,
+  nameAddress,
+  nameOnNetwork,
+  putToml,
+  setAccountDomain,
+  tomlOf,
+} from './support/names-seed';
 import { explain } from './support/plans';
 import { BULK_BASES, BULK_PER_PART, BULK_ROWS, insertBulk, readsOf } from './support/read-rows';
 
@@ -90,100 +92,6 @@ const kinds = (entries: Entry[]): (string | undefined)[] =>
 // ---------------------------------------------------------------------------------------------------------------------
 // What the suite writes
 // ---------------------------------------------------------------------------------------------------------------------
-
-/** The Domain field of an account as the ledger holds it: the upper-case hex of the text. */
-const hexOf = (text: string): string => Buffer.from(text, 'latin1').toString('hex').toUpperCase();
-
-/** `ledger_index * 2^32 + tx_index * 2^16 + node_index` as decimal text, as the parser writes it. */
-const versionOf = (ledger: number, tx = 0, node = 0): string =>
-  ((BigInt(ledger) << 32n) | (BigInt(tx) << 16n) | BigInt(node)).toString();
-
-/**
- * The Domain of `account` after a transaction of ledger `ledger`, as one insert, so as a part of its own: of two rows of an
- * account the newer is the one of the larger ledger, whatever was inserted last. `hex` is the Domain as the ledger holds it.
- */
-async function setAccountDomain(
-  h: Harness,
-  account: string,
-  ledger: number,
-  hex: string,
-  deleted: 0 | 1 = 0,
-): Promise<void> {
-  await h.ch.insert(Table.AccountDomains, [
-    { account, ledger_index: ledger, tx_index: 0, node_index: 0, version: versionOf(ledger), domain_hex: hex, deleted },
-  ]);
-}
-
-/** The account holds `domain` from ledger `ledger` on. */
-const holds = (h: Harness, account: string, domain: string, ledger = 1000): Promise<void> =>
-  setAccountDomain(h, account, ledger, hexOf(domain));
-
-/** Every instant a toml is checked at is later than the one before it. */
-let checkedAt = Math.floor(Date.now() / 1000) - 100_000;
-const nextCheck = (): number => (checkedAt += 10);
-
-/** The accounts a toml lists, as a toml text: the entries of `[[ACCOUNTS]]`, with the network as a string or a number. */
-function tomlOf(...entries: { address: string; network?: string | number; desc?: string }[]): string {
-  return entries
-    .map((e) =>
-      [
-        '[[ACCOUNTS]]',
-        `address = "${e.address}"`,
-        ...(e.network === undefined
-          ? []
-          : [`network = ${typeof e.network === 'number' ? e.network : `"${e.network}"`}`]),
-        ...(e.desc === undefined ? [] : [`desc = "${e.desc}"`]),
-        '',
-      ].join('\n'),
-    )
-    .join('\n');
-}
-
-/** The toml of `domain` read as the tomls worker reads it, an `ok` row checked now (later than the one before). */
-async function putToml(h: Harness, profile: Pick<NetworkProfile, 'name' | 'tomlPath'>, domain: string, text: string) {
-  await recordToml(h.ch, {
-    domain,
-    tomlUrl: tomlUrlOf(domain, profile),
-    text,
-    fetchedAt: nextCheck(),
-    recheckMs: 86_400_000,
-    profile,
-  });
-}
-
-/** A definite failure of the check of `domain`, as the worker stores it: no content in effect. */
-async function failToml(h: Harness, domain: string): Promise<void> {
-  const at = nextCheck();
-  const row: DomainTomlsRow = {
-    domain,
-    toml_url: tomlUrlOf(domain, XRPL),
-    status: 'failed',
-    reason: 'http_status',
-    status_code: 404,
-    checked_at: at,
-    fetched_at: null,
-    next_check_at: at + 86_400,
-    failures: 1,
-    ...EMPTY_TOML_CONTENT,
-  };
-  await h.ch.insert(Table.DomainTomls, [row]);
-}
-
-/** The operator's insert of an account name (the shared database, the same on every network). */
-async function nameAddress(h: Harness, address: string, name: string): Promise<void> {
-  await h.ch.command(
-    `INSERT INTO ${h.sharedDatabase}.account_names (address, name, added_by) VALUES ({address:String}, {name:String}, 'ops@gatehub.net')`,
-    { address, name },
-  );
-}
-
-/** The operator's insert of an account network name (the network database of `h`). */
-async function nameOnNetwork(h: Harness, address: string, name: string): Promise<void> {
-  await h.ch.command(
-    `INSERT INTO ${h.database}.account_network_names (address, name, added_by) VALUES ({address:String}, {name:String}, 'ops@gatehub.net')`,
-    { address, name },
-  );
-}
 
 /** The operator's insert of a label (the shared database); `source` and `url` are left empty when not given. */
 async function labelAddress(
