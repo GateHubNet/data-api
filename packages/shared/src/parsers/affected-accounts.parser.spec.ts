@@ -1,6 +1,8 @@
 import { join } from 'path';
+import { delegatedFrom, SYNTHETIC_DELEGATE } from '../../test/synthetic-delegated';
 import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import { objectCase } from '../test-utils/object-cases';
 import { AffectedAccountsParser } from './affected-accounts.parser';
 import { ParserTx, toParserTx } from './parser.interface';
 
@@ -125,6 +127,50 @@ describe('AffectedAccountsParser', () => {
     const first = parser.parse(t);
     expect(JSON.stringify(t)).toBe(before);
     expect(parser.parse(t)).toEqual(first);
+  });
+
+  describe('the Delegate of a delegated transaction', () => {
+    it('lists the delegate of a delegated Payment once (synthetic-delegated-payment, made from the recorded Payment BAF0C2EC…)', () => {
+      const ledger = FixtureLedgerSource.fromDir(join(FIXTURES, 'xrpl', 'recorded'))
+        .list()
+        .find((l) => l.header.ledger_index === 107670360)!;
+      const original = ledger.transactions.find(
+        (t) => t.hash === 'BAF0C2EC22CFC229C9AABC02413EB6433A820F5689B69FD4AD83565A38EF77ED',
+      )!;
+      const t = toParserTx(delegatedFrom(original, 'synthetic-delegated-payment'), ledger.header, null);
+
+      // The delegate paid the fee, so the metadata names it (its AccountRoot changed), after the accounts of the original.
+      expect(parser.parse(toParserTx(original, ledger.header, null))).toEqual([
+        'rMEPguA5x5bnbph4pBfwXYuiZV8wTTS2yE',
+        'rnFTEUYXc4DNroJ9KkrWZvEFhFxYK3vd3a',
+      ]);
+      expect(parser.parse(t)).toEqual([
+        'rMEPguA5x5bnbph4pBfwXYuiZV8wTTS2yE',
+        'rnFTEUYXc4DNroJ9KkrWZvEFhFxYK3vd3a',
+        SYNTHETIC_DELEGATE,
+      ]);
+    });
+
+    it('appends the delegate a fee-free inner transaction does not name: delegated_batch_inner', () => {
+      const { ledger, tx } = objectCase('xrpl', 'delegated_batch_inner')!;
+      const t = toParserTx(tx, ledger.header, null);
+      const { Delegate: delegate, ...withoutDelegate } = tx.tx;
+      const named = parser.parse(toParserTx({ ...tx, tx: withoutDelegate }, ledger.header, null));
+
+      expect(delegate).toBe('rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK');
+      // The metadata does not name the delegate: it comes last, after every account the metadata does name.
+      expect(named).not.toContain(delegate);
+      expect(named).toContain(tx.tx.Account);
+      expect(parser.parse(t)).toEqual([...named, delegate]);
+    });
+
+    it('appends nothing for a Delegate that is absent, empty or not an address', () => {
+      const nodes = [modified('AccountRoot', { Account: 'rSender' }, { Balance: '2' })];
+
+      for (const Delegate of [undefined, '', 7, null, 'xNotAnAddress']) {
+        expect(parser.parse(parserTx(nodes, {}, { Delegate }))).toEqual(['rSender']);
+      }
+    });
   });
 
   describe.each([

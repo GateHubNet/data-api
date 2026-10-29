@@ -562,6 +562,38 @@ describe('buildLedgerRows mapping', () => {
         { account: SENDER, sequence: 8, ledger_index: 5_000_000, tx_index: 4 },
       ]);
     });
+
+    it("gives the delegate an account_transactions row with is_initiator 0 and leaves account_tx_by_sequence the sender's", () => {
+      // xrpl/amm 107699656: the delegate signed the Batch (tx_index 33) and its six inner transactions, each an OfferCreate of
+      // the delegator `rnt8Pb…` with Fee 0 (idx 34 to 39). The metadata of an inner transaction never names the delegate.
+      const DELEGATE = 'rw2X2GFePFiLDdcQw6iELFfUEw1hPqAGcK';
+      const DELEGATOR = 'rnt8PbBFT7idcLyj9PNgxjZi9Z1RiRX3QL';
+      const { raw: ledger, rows: built } = ledgerNamed(AMM_SET, 107699656);
+      const inner = ledger.transactions.filter((t) => t.tx.Delegate === DELEGATE);
+
+      expect(inner.map((t) => t.meta.TransactionIndex)).toEqual([34, 35, 36, 37, 38, 39]);
+      for (const t of inner) {
+        const index = t.meta.TransactionIndex as number;
+        const listed = built.accountTransactions.filter((r) => r.tx_index === index);
+
+        expect(JSON.stringify(t.meta)).not.toContain(DELEGATE);
+        expect(listed.filter((r) => r.account === DELEGATE)).toEqual([
+          {
+            account: DELEGATE,
+            ledger_index: 107699656,
+            tx_index: index,
+            tx_type: 'OfferCreate',
+            result: 'tesSUCCESS',
+            is_initiator: 0,
+            close_time: built.ledger.close_time,
+          },
+        ]);
+        expect(listed.filter((r) => r.is_initiator === 1).map((r) => r.account)).toEqual([DELEGATOR]);
+        expect(built.accountTxBySequence.filter((r) => r.tx_index === index)).toEqual([
+          { account: DELEGATOR, sequence: t.tx.Sequence ?? 0, ledger_index: 107699656, tx_index: index },
+        ]);
+      }
+    });
   });
 
   describe('payments, payments_by_currency, account_payments', () => {

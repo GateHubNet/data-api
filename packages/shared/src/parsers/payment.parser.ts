@@ -1,7 +1,7 @@
 import { BigNumber } from 'bignumber.js';
 import { parseBalanceChanges } from 'ripple-lib-transactionparser';
 import { dropsToNative } from '../util/amount';
-import { ParseContext, ParserTx } from './parser.interface';
+import { feePayer, ParseContext, ParserTx } from './parser.interface';
 
 /** A balance change as `ripple-lib-transactionparser` reports it, but with the native currency remapped. */
 export interface BalanceChangeAmount {
@@ -90,10 +90,12 @@ export class PaymentParser {
       value,
     });
 
-    // The library reports the source's native change as -(amount + fee); the payment amount itself excludes the fee.
+    // The library reports the source's native change as -(amount + fee); the payment amount itself excludes the fee. A
+    // delegate pays the fee of a delegated Payment, so the source's change is the amount alone and there is no fee to add.
+    const sourcePaysFee = feePayer(tx) === tx.Account;
     const sourceChanges: BalanceChangeAmount[] = [];
     for (const change of changes[tx.Account] ?? []) {
-      const value = isNative(change) ? new BigNumber(change.value).plus(fee).toString() : change.value;
+      const value = isNative(change) && sourcePaysFee ? new BigNumber(change.value).plus(fee).toString() : change.value;
       if (value !== '0') sourceChanges.push(remap(value, change));
     }
     const destinationChanges = (changes[tx.Destination] ?? []).map((change) => remap(change.value, change));

@@ -1,4 +1,5 @@
 import { join } from 'path';
+import { delegatedFrom, SYNTHETIC_DELEGATE } from '../../test/synthetic-delegated';
 import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { LedgerHeader, RawLedger, RawTransaction } from '../ingest/raw-ledger';
 import { getNetworkProfile } from '../network';
@@ -97,6 +98,27 @@ describe('PaymentParser', () => {
     expect(payment.source_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '-100' }]);
     expect(payment.destination_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '100' }]);
     expect(payment.source_currency).toBe('XRP');
+  });
+
+  it('adds no fee back when the delegate paid it: the source of a delegated Payment moves by the amount alone', () => {
+    // The source AccountRoot drops by the amount only (100); the 12 drops of fee left the delegate's.
+    const payment = parser.parse(
+      parserTx(
+        { Delegate: SYNTHETIC_DELEGATE },
+        {
+          AffectedNodes: [
+            accountRoot(SENDER, '1000000000', '900000000'),
+            accountRoot(DEST, '0', '100000000'),
+            accountRoot(SYNTHETIC_DELEGATE, '50000012', '50000000'),
+          ],
+        },
+      ),
+      XRPL,
+    )!;
+
+    expect(payment.source_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '-100' }]);
+    expect(payment.destination_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '100' }]);
+    expect(payment.fee_drops).toBe('12');
   });
 
   it('payment to self is ignored', () => {
@@ -595,6 +617,26 @@ describe('PaymentParser golden', () => {
     it('keeps the delivered amount of the partial payments that report one', () => {
       expect(parsed.filter(({ payment }) => payment.delivered_amount !== payment.amount)).toHaveLength(3);
     });
+  });
+
+  // `synthetic-delegated-payment`, made from the recorded native Payment BAF0C2EC… (ledger 107670360, 15.151515 XRP, a 5000
+  // drop fee) with a `Delegate` that paid the fee: hand-made, never recorded (none was found on the network). The payment it
+  // makes is the original's: who paid the fee does not change what the source sent.
+  it('gives a synthetic delegated Payment the row of the recorded Payment it is made from: the source sent the amount, not the amount less the fee', () => {
+    const ledger = FixtureLedgerSource.fromDir(join(FIXTURES, 'xrpl', 'recorded'))
+      .list()
+      .find((l) => l.header.ledger_index === 107670360)!;
+    const original = ledger.transactions.find(
+      (t) => t.hash === 'BAF0C2EC22CFC229C9AABC02413EB6433A820F5689B69FD4AD83565A38EF77ED',
+    )!;
+    const delegated = delegatedFrom(original, 'synthetic-delegated-payment');
+
+    const expected = parser.parse(toParserTx(original, ledger.header, null), XRPL)!;
+    const payment = parser.parse(toParserTx(delegated, ledger.header, null), XRPL)!;
+
+    expect(delegated.tx.Delegate).toBe(SYNTHETIC_DELEGATE);
+    expect(expected.source_balance_changes).toEqual([{ counterparty: '', currency: 'XRP', value: '-15.151515' }]);
+    expect(payment).toEqual(expected);
   });
 
   describe.each([

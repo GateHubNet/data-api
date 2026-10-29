@@ -1,7 +1,7 @@
 import { BigNumber } from 'bignumber.js';
 import { dropsToNative } from '../util/amount';
 import { LedgerNode, ledgerNodes, poolsOf } from './amm.parser';
-import { ParseContext, ParserTx } from './parser.interface';
+import { feePayer, ParseContext, ParserTx } from './parser.interface';
 import { deliveredAmount } from './payment.parser';
 
 /**
@@ -189,13 +189,15 @@ export class PathPaymentParser {
       }
     }
 
-    // What the source's balance moved by, the fee not counted.
+    // What the source's balance moved by, the fee not counted. A delegate pays the fee of a delegated Payment: the
+    // source's balance did not move by it, so there is no fee to take out.
     let net: BigNumber;
     if (sourceNative) {
       const root = nodes.find((n) => n.type === 'AccountRoot' && n.fields.Account === source);
       const after = new BigNumber(root?.fields.Balance ?? 0);
       const before = root?.previous.Balance !== undefined ? new BigNumber(root.previous.Balance) : after;
-      net = new BigNumber(dropsToNative(after.minus(before).plus(tx.Fee ?? '0')));
+      const fee = feePayer(tx) === source ? (tx.Fee ?? '0') : '0';
+      net = new BigNumber(dropsToNative(after.minus(before).plus(fee)));
     } else {
       net = sides
         .filter(

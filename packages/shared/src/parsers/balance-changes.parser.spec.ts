@@ -1,10 +1,13 @@
 import { BigNumber } from 'bignumber.js';
-import { readFileSync } from 'fs';
+import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { delegatedFrom, SYNTHETIC_DELEGATE } from '../../test/synthetic-delegated';
 import { FixtureLedgerSource } from '../ingest/fixture-ledger-source';
 import { RawLedger } from '../ingest/raw-ledger';
 import { getNetworkProfile } from '../network';
 import { deepFreeze } from '../test-utils/deep-freeze';
+import { objectCase } from '../test-utils/object-cases';
+import { dropsToNative } from '../util/amount';
 import { BalanceChangesParser, ParsedBalanceChange } from './balance-changes.parser';
 import { ParseContext, parseContextFor, ParserTx, toParserTx } from './parser.interface';
 
@@ -74,6 +77,23 @@ function ledgersOf(...parts: string[]): RawLedger[] {
 /** Every transaction of the ledgers as a parser input. */
 function txsOf(ledgers: RawLedger[]): ParserTx[] {
   return ledgers.flatMap((ledger) => ledger.transactions.map((raw) => toParserTx(raw, ledger.header, null)));
+}
+
+/** The recorded native Payment `synthetic-delegated-payment` is made from: 15.151515 XRP, a 5000 drop fee (ledger 107670360). */
+const DELEGATED_PAYMENT_BASE = 'BAF0C2EC22CFC229C9AABC02413EB6433A820F5689B69FD4AD83565A38EF77ED';
+/** The recorded `tecPATH_DRY` Payment `synthetic-delegated-tec` is made from: only its fee and its sequence moved (ledger 107670360). */
+const DELEGATED_TEC_BASE = '5AA87418BCF36929DBA2638FE6B83A27A6F77FDFF42F25EDB82929F0BADF9D8B';
+
+/**
+ * `synthetic-delegated-payment` or `synthetic-delegated-tec`: a Payment of `xrpl/recorded` as if its `Account` had delegated
+ * it and the delegate had paid the fee (`delegatedFrom`). Hand-made, never recorded: none was found on the network.
+ */
+function syntheticDelegated(name: 'synthetic-delegated-payment' | 'synthetic-delegated-tec', base: string): ParserTx {
+  for (const ledger of ledgersOf('xrpl', 'recorded')) {
+    const raw = ledger.transactions.find((t) => t.hash === base);
+    if (raw) return deepFreeze(toParserTx(delegatedFrom(raw, name), ledger.header, null));
+  }
+  throw new Error(`xrpl/recorded has no transaction ${base}`);
 }
 
 /** The transaction types the recorder found in a network's recorded ledgers. */
@@ -871,6 +891,66 @@ describe('BalanceChangesParser', () => {
       expect(rows.map((r) => r.change_type)).toEqual(['transaction_cost', 'payment_source', 'payment_destination']);
       expect(rows.every((r) => r.escrow_counterparty === undefined)).toBe(true);
     });
+
+    describe("an issued-token escrow on the XRP Ledger moves the sender's line at create and the destination's at finish", () => {
+      const ISSUER_OF_XRB = 'rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa';
+      const SENDER_OF_XRB = 'rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm';
+      const RECEIVER_OF_XRB = 'rHiwfnKJCwNePaTj8HmEYCx8G5NCsSEJSt';
+
+      it("types the sender's line at create and leaves the issuer's mirrored row untyped: escrow_create_token", () => {
+        const { ledger, tx } = objectCase('xrpl', 'escrow_create_token')!;
+        const rows = parser.parse(toParserTx(tx, ledger.header, null), XRPL);
+
+        expect(rows).toStrictEqual([
+          {
+            account: SENDER_OF_XRB,
+            counterparty: '',
+            currency: 'XRP',
+            amount_change: '-0.000012',
+            final_balance: '153.91386',
+            node_index: -1,
+            change_type: 'transaction_cost',
+          },
+          {
+            account: SENDER_OF_XRB,
+            counterparty: ISSUER_OF_XRB,
+            currency: 'XRB',
+            amount_change: '-75000',
+            final_balance: '9925000',
+            node_index: 2,
+            change_type: 'escrow_create',
+            escrow_counterparty: RECEIVER_OF_XRB,
+            escrow_balance_change: '75000',
+          },
+          {
+            account: ISSUER_OF_XRB,
+            counterparty: SENDER_OF_XRB,
+            currency: 'XRB',
+            amount_change: '75000',
+            final_balance: '-9925000',
+            node_index: 2,
+            change_type: '',
+          },
+        ]);
+      });
+
+      it("types the destination's line at finish, whoever sent the finish, and leaves the issuer's row untyped: escrow_finish_token", () => {
+        const { ledger, tx } = objectCase('xrpl', 'escrow_finish_token')!;
+        const rows = parser.parse(toParserTx(tx, ledger.header, null), XRPL);
+
+        // A third party (a finisher bot) sent it and paid the fee; the escrow's owner only has its reserve released, no balance.
+        expect(rows.map((r) => [r.account, r.currency, r.amount_change, r.change_type])).toEqual([
+          [tx.tx.Account, 'XRP', '-0.000012', 'transaction_cost'],
+          [ISSUER_OF_XRB, 'XRB', '-75000', ''],
+          [RECEIVER_OF_XRB, 'XRB', '75000', 'escrow_finish'],
+        ]);
+        expect(rows[2]).toMatchObject({
+          counterparty: ISSUER_OF_XRB,
+          escrow_counterparty: RECEIVER_OF_XRB,
+          escrow_balance_change: '-75000',
+        });
+      });
+    });
   });
 
   describe('payment channels', () => {
@@ -961,6 +1041,189 @@ describe('BalanceChangesParser', () => {
         paychannel_fund_final_balance: '30',
         paychannel_final_balance: '0',
       });
+    });
+
+    describe('issued-token channels (Xahau, PaychanAndEscrowForTokens)', () => {
+      const token = (value: string): Json => iou('DHA', 'rIssuer', value);
+
+      it("types an issued-token channel's claim with token amounts: channel_claim_token", () => {
+        const { ledger, tx } = objectCase('xahau', 'channel_claim_token')!;
+        const rows = parser.parse(toParserTx(tx, ledger.header, null), XAHAU);
+
+        // The destination claims 0.023506 DHA of the 1 DHA the creator funded. Both trust lines move (Xahau's first claim
+        // moves the creator's line and the destination's): the issuer's side of each line stays untyped.
+        expect(rows).toStrictEqual([
+          {
+            account: 'rDyz9rX7eGJRdVDC8NGxMxqh9U14qduqzS',
+            counterparty: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+            currency: 'DHA',
+            amount_change: '-0.023506',
+            final_balance: '-0.023506',
+            node_index: 1,
+            change_type: '',
+          },
+          {
+            account: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+            counterparty: 'rDyz9rX7eGJRdVDC8NGxMxqh9U14qduqzS',
+            currency: 'DHA',
+            amount_change: '0.023506',
+            final_balance: '0.023506',
+            node_index: 1,
+            change_type: 'paychannel_payout',
+            paychannel_counterparty: 'rL6rwNe6puyoN5X1BUy8pEQb6Un23m2f1m',
+            paychannel_balance_change: '-0.023506',
+            // The channel's Amount and Balance are token values, in whole units, not drops.
+            paychannel_fund_final_balance: '1',
+            paychannel_final_balance: '0.023506',
+          },
+          {
+            account: 'rDyz9rX7eGJRdVDC8NGxMxqh9U14qduqzS',
+            counterparty: 'rL6rwNe6puyoN5X1BUy8pEQb6Un23m2f1m',
+            currency: 'DHA',
+            amount_change: '0.023506',
+            final_balance: '-9997.975617',
+            node_index: 2,
+            change_type: '',
+          },
+          {
+            account: 'rL6rwNe6puyoN5X1BUy8pEQb6Un23m2f1m',
+            counterparty: 'rDyz9rX7eGJRdVDC8NGxMxqh9U14qduqzS',
+            currency: 'DHA',
+            amount_change: '-0.023506',
+            final_balance: '9997.975617',
+            node_index: 2,
+            change_type: 'paychannel_fund',
+            paychannel_counterparty: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+            paychannel_fund_change: '0.023506',
+            paychannel_fund_final_balance: '1',
+            paychannel_final_balance: '0.023506',
+          },
+          {
+            account: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+            counterparty: '',
+            currency: 'XAH',
+            amount_change: '-0.005037',
+            final_balance: '1.986054',
+            node_index: -1,
+            change_type: 'transaction_cost',
+          },
+        ]);
+      });
+
+      // Crash fix (plan conflict C3): `channel()` called `dropsToNative` on every Amount and Balance, which throws on a token
+      // amount object ("invalid value '[object Object]'"), a LedgerParseError that halted ingest on such a ledger.
+      it.each(['channel_create_token', 'channel_claim_token'])(
+        'parses the recorded Xahau token channel %s without throwing',
+        (name) => {
+          const { ledger, tx } = objectCase('xahau', name)!;
+
+          expect(() => parser.parse(toParserTx(tx, ledger.header, null), XAHAU)).not.toThrow();
+        },
+      );
+
+      it('books a token channel create as the fee only: the tokens are locked on the line, its Balance does not move (channel_create_token)', () => {
+        const { ledger, tx } = objectCase('xahau', 'channel_create_token')!;
+        const rows = parser.parse(toParserTx(tx, ledger.header, null), XAHAU);
+
+        expect(rows.map((r) => [r.account, r.currency, r.amount_change, r.change_type])).toEqual([
+          ['rL6rwNe6puyoN5X1BUy8pEQb6Un23m2f1m', 'XAH', '-0.000012', 'transaction_cost'],
+        ]);
+      });
+
+      it('writes the channel balances of a token as plain decimals, where the ledger writes an exponent', () => {
+        const rows = parser.parse(
+          parserTx({ TransactionType: 'PaymentChannelClaim', Account: 'rDst', Channel: 'AB' }, [
+            {
+              ModifiedNode: {
+                LedgerEntryType: 'PayChannel',
+                FinalFields: {
+                  Account: 'rSrc',
+                  Destination: 'rDst',
+                  Amount: token('5e21'),
+                  Balance: token('2e21'),
+                },
+              },
+            },
+            root('rDst', '100000000', '99999988'),
+            line('rIssuer', 'rDst', 'DHA', '-3', '-4'),
+          ]),
+          XAHAU,
+        );
+
+        expect(rowOf(rows, 'rDst', 2)).toMatchObject({
+          change_type: 'paychannel_payout',
+          paychannel_fund_final_balance: '5000000000000000000000',
+          paychannel_final_balance: '2000000000000000000000',
+        });
+      });
+    });
+  });
+
+  describe('delegated transactions (the delegate signs and pays the fee, spec 2.3)', () => {
+    it('charges the fee of a delegated Payment to the delegate (synthetic-delegated-payment, made from the recorded Payment BAF0C2EC…)', () => {
+      const t = syntheticDelegated('synthetic-delegated-payment', DELEGATED_PAYMENT_BASE);
+      const rows = parser.parse(t, XRPL);
+
+      expect(t.tx.Delegate).toBe(SYNTHETIC_DELEGATE);
+      expect(t.tx.Fee).toBe('5000');
+      // The transaction_cost row is the delegate's, for the whole Fee, and it is the only one.
+      expect(rows.filter((r) => r.change_type === 'transaction_cost')).toStrictEqual([
+        {
+          account: SYNTHETIC_DELEGATE,
+          counterparty: '',
+          currency: 'XRP',
+          amount_change: '-0.005',
+          final_balance: '100',
+          node_index: -1,
+          change_type: 'transaction_cost',
+        },
+      ]);
+      // The sender's native row is its whole change: the Amount exactly, with no row for a fee it did not pay.
+      expect(rows.filter((r) => r.account === t.tx.Account)).toStrictEqual([
+        {
+          account: t.tx.Account,
+          counterparty: '',
+          currency: 'XRP',
+          amount_change: `-${dropsToNative(t.tx.Amount)}`,
+          final_balance: '38.672822',
+          node_index: 1,
+          change_type: 'payment_source',
+        },
+      ]);
+      expect(rowOf(rows, t.tx.Destination)).toMatchObject({
+        amount_change: dropsToNative(t.tx.Amount),
+        change_type: 'payment_destination',
+      });
+    });
+
+    it('charges the fee of a delegated tec to the delegate (synthetic-delegated-tec, made from the recorded tecPATH_DRY Payment 5AA87418…)', () => {
+      const t = syntheticDelegated('synthetic-delegated-tec', DELEGATED_TEC_BASE);
+
+      expect(t.meta.TransactionResult).toBe('tecPATH_DRY');
+      expect(t.tx.Delegate).toBe(SYNTHETIC_DELEGATE);
+      // A tec still burns the fee, and the delegate pays it. The sender only spent a sequence number: no row at all.
+      expect(parser.parse(t, XRPL)).toStrictEqual([
+        {
+          account: SYNTHETIC_DELEGATE,
+          counterparty: '',
+          currency: 'XRP',
+          amount_change: '-0.000012',
+          final_balance: '100',
+          node_index: -1,
+          change_type: 'transaction_cost',
+        },
+      ]);
+    });
+
+    it('books no fee for a delegated Batch inner transaction, which pays none: delegated_batch_inner', () => {
+      const { ledger, tx } = objectCase('xrpl', 'delegated_batch_inner')!;
+      const t = toParserTx(tx, ledger.header, null);
+      const rows = parser.parse(t, XRPL);
+
+      expect(t.tx.Delegate).toBeDefined();
+      expect(t.tx.Fee).toBe('0');
+      expect(rows.filter((r) => r.change_type === 'transaction_cost')).toEqual([]);
+      expect(rows.some((r) => r.account === t.tx.Delegate)).toBe(false);
     });
   });
 
@@ -1139,14 +1402,47 @@ describe('BalanceChangesParser', () => {
       expect(checked).toBeGreaterThan(2000);
     });
 
+    // Hooks mint (GenesisMint), spend (Cron, Invoke, emitted transactions) and import XAH.
+    const ordinary = (t: ParserTx) =>
+      ['Payment', 'AccountSet', 'URITokenMint', 'URITokenBurn', 'ClaimReward'].includes(t.tx.TransactionType) &&
+      t.tx.EmitDetails === undefined;
+
     it('on Xahau every issued change has its mirror, and ordinary transactions burn exactly the fee', () => {
-      // Hooks mint (GenesisMint), spend (Cron, Invoke, emitted transactions) and import XAH.
-      const ordinary = (t: ParserTx) =>
-        ['Payment', 'AccountSet', 'URITokenMint', 'URITokenBurn', 'ClaimReward'].includes(t.tx.TransactionType) &&
-        t.tx.EmitDetails === undefined;
       const checked = checkConservation(txsOf(ledgersOf('xahau', 'recorded')), XAHAU, ordinary);
 
       expect(checked).toBeGreaterThan(0);
+    });
+
+    // Fee payer or not, the burn is the Fee: it holds for a delegated transaction by the sum alone, so only the 'charges …
+    // to the delegate' tests above catch a fee booked to the wrong account. What this run adds is every other recorded set
+    // (the token channel claim of `xahau/objects` made it throw, plan conflict C3) and the two synthetic delegated ones.
+    it('sums every currency to zero but the fee burn, delegated transactions included', () => {
+      const delegated = new Set<string>();
+      let checked = 0;
+      const run = (txs: ParserTx[], ctx: ParseContext) => {
+        for (const t of txs) if (t.tx.Delegate !== undefined) delegated.add(t.hash);
+        checked += checkConservation(txs, ctx, ctx.nativeCurrency === 'XAH' ? ordinary : () => true);
+      };
+
+      for (const network of ['xrpl', 'xahau', 'xrpl-testnet', 'xahau-testnet']) {
+        const ctx = parseContextFor(getNetworkProfile(network));
+        for (const dir of readdirSync(join(FIXTURES, network), { withFileTypes: true })) {
+          if (dir.isDirectory()) run(txsOf(ledgersOf(network, dir.name)), ctx);
+        }
+      }
+      run(
+        [
+          syntheticDelegated('synthetic-delegated-payment', DELEGATED_PAYMENT_BASE),
+          syntheticDelegated('synthetic-delegated-tec', DELEGATED_TEC_BASE),
+        ],
+        XRPL,
+      );
+
+      // The native check ran for 13,903 of the 14,500 or so transactions recorded: Xahau's hooks, and the escrows and channels
+      // of both networks, are left out. Below 13,500 a set has been lost.
+      expect(checked).toBeGreaterThan(13_500);
+      // The Batch inner transactions of xrpl/amm (the same six are in xrpl/objects) and the two synthetic ones.
+      expect(delegated.size).toBe(8);
     });
   });
 

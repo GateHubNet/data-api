@@ -1,6 +1,6 @@
 import { BigNumber } from 'bignumber.js';
 import { dropsToNative } from '../util/amount';
-import { ParseContext, ParserTx } from './parser.interface';
+import { feePayer, ParseContext, ParserTx } from './parser.interface';
 
 export interface ParsedBalanceChange {
   account: string;
@@ -42,9 +42,10 @@ export class BalanceChangesParser {
   /**
    * Every balance change a transaction made, in the order of `meta.AffectedNodes`. Matches
    * `ledgerParser/balanceChanges.js` of the Ripple Data API, so a `tesSUCCESS` or `tec` transaction gives:
-   * - for each changed `AccountRoot`, in the native currency: if it is the sender's, a `transaction_cost` row at node
-   *   -1 whose `final_balance` is the balance after the fee and before the transaction's other effect on it; then a
-   *   row for that other effect if there is one;
+   * - for each changed `AccountRoot`, in the native currency: if it is the fee payer's (`feePayer`: the transaction's
+   *   `Delegate` when it has one, else its sender), a `transaction_cost` row at node -1 whose `final_balance` is the
+   *   balance after the fee and before the transaction's other effect on it; then a row for that other effect if there
+   *   is one. A delegated transaction's sender did not pay the fee, so its row is its whole change;
    * - for each trustline whose balance changed, one row for the low and one for the high side, from each side's point
    *   of view.
    * `change_type` is the reference's `findType` for a Payment or OfferCreate, `''` for every other transaction type;
@@ -54,7 +55,7 @@ export class BalanceChangesParser {
    *   because its currency is called `XRP`;
    * - trustline rows come from every transaction type, not only Payment and OfferCreate (AMM, check, Remit, ... also
    *   move tokens);
-   * - amounts are exact decimal strings with no Number in between, and escrow amounts may be tokens;
+   * - amounts are exact decimal strings with no Number in between, and escrow and payment channel amounts may be tokens;
    * - a fee of 0 (an inner transaction of a Batch) leaves no `transaction_cost` row, and a created account without a
    *   `Balance` (an AMM pseudo-account that holds no XRP) leaves no row at all, instead of a `NaN` change. A created
    *   AMM account that does hold XRP gets its row, so native changes still add up.
@@ -135,7 +136,7 @@ export class BalanceChangesParser {
     const change = balance.minus(previous);
     let amount: BigNumber;
 
-    if (t.tx.Account === account) {
+    if (feePayer(t.tx) === account) {
       const fee = new BigNumber(t.tx.Fee ?? 0).negated();
       amount = change.minus(fee);
       if (!fee.isZero()) {
@@ -268,10 +269,14 @@ export class BalanceChangesParser {
     }
   }
 
-  /** An untyped change of a party to a payment channel is the channel being funded or paid out. Native units. */
+  /**
+   * An untyped change of a party to a payment channel is the channel being funded or paid out. Whole units of the
+   * channel's currency: drops converted, and on Xahau (`PaychanAndEscrowForTokens`) a token as it is, written as a plain
+   * decimal, where the ledger writes a very large or very small one with an exponent.
+   */
   private channel(row: ParsedBalanceChange, channel: Json): void {
-    const fund = dropsToNative(channel.Amount ?? 0);
-    const paid = dropsToNative(channel.Balance ?? 0);
+    const fund = escrowValue(channel.Amount ?? '0').toFixed();
+    const paid = escrowValue(channel.Balance ?? '0').toFixed();
 
     if (row.account === channel.Account) {
       row.change_type = 'paychannel_fund';
