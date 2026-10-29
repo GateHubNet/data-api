@@ -2537,12 +2537,12 @@ describe("the delegations of an account read the account's prefix of account_obj
   });
 
   it('the account as the holder is the other prefix of the index: its 200,000 rows, bounded by the key and not by the owner rows', async () => {
-    // the account holds one delegation, changed 200,000 times: the distinct ID read stops at the end of that prefix, and it is the one
-    // read of the index; the owner direction above did not read these rows
+    // the account holds one delegation, changed 200,000 times: the ID read stops at the end of that prefix (its rows, and two granules
+    // a part of the tail), and it is the one read of the index; the owner direction above did not read these rows
     const path = `/v2/accounts/${ACCOUNT}/delegations?direction=held`;
     const index = await through(Table.AccountObjectChanges, path);
     expect(index.reads).toHaveLength(1);
-    expect(index.reads[0].read_rows).toBeLessThanOrEqual(BULK_BASES.length * HELD_PER_PART);
+    expect(index.reads[0].read_rows).toBeLessThanOrEqual(BULK_BASES.length * HELD_PER_PART + 2 * GRANULE * PARTS);
     expect(index.body.count).toBe(1);
   });
 });
