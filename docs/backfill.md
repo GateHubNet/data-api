@@ -426,7 +426,7 @@ history that starts in the middle, with no `created`, and says `complete: false`
    SELECT parser_version, count() FROM xrpl.ledgers WHERE ledger_index >= 107524865 GROUP BY parser_version;
    -- the rows the new parser has written so far, by type
    SELECT object_type, count() FROM xrpl.object_changes GROUP BY object_type;
-   -- the sentinel of the escrows job: the open escrows, their native drops and the ledger it is as of
+   -- the sentinel of the escrows job: the open native escrows, their drops and the ledger it is as of
    SELECT open_count, amount_drops, through_ledger FROM xrpl.escrows WHERE escrow_id = '' ORDER BY version DESC LIMIT 1;
    ```
 

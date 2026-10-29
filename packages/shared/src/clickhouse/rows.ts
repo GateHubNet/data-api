@@ -1292,8 +1292,8 @@ export interface NftCollectionHoldersRow {
  * `amount_drops` the drops of a native escrow, 0 for a token. `last_ledger` is the ledger of the escrow's newest
  * `object_changes` row, `deleted` is 1 once it was finished, cancelled or removed.
  *
- * The sentinel: `open_count` is the number of escrows with `deleted = 0`, `amount_drops` the sum of their native drops,
- * `through_ledger` the ledger the job has processed up to; its other columns are empty or 0.
+ * The sentinel: `open_count` is the number of open native escrows (`deleted = 0`, in the native currency), `amount_drops` the
+ * sum of their drops, `through_ledger` the ledger the job has processed up to; its other columns are empty or 0.
  */
 export interface EscrowsRow {
   escrow_id: string;

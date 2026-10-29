@@ -202,8 +202,9 @@ ORDER BY escrow_id;
   `open_count` and `through_ledger` 0. `finish_after` and `cancel_after` are unix seconds in a `DateTime64(0)`: a ledger time can be as
   late as 2136 (Ripple seconds up to 2^32 − 1), and a `DateTime` saturates at 2106 without an error. *Amended by the final review
   (2026-10-30):* they were `DateTime('UTC')`.
-- **The sentinel** (`escrow_id = ''`): `open_count` = escrows with `deleted = 0`, `amount_drops` = the sum of their native drops,
-  `through_ledger` = the ledger the job has processed up to (its watermark); the other columns empty or 0.
+- **The sentinel** (`escrow_id = ''`): `open_count` = the open native escrows (`deleted = 0`, in the native currency; a token or MPT
+  escrow is not counted), `amount_drops` = the sum of their drops, `through_ledger` = the ledger the job has processed up to (its
+  watermark); the other columns empty or 0.
 - Readers take the newest version per key without `FINAL`: `ORDER BY escrow_id, version DESC LIMIT 1 BY escrow_id`, then filter
   `deleted`; the sentinel is `WHERE escrow_id = '' ORDER BY version DESC LIMIT 1`.
 

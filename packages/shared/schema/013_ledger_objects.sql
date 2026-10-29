@@ -17,7 +17,7 @@
 -- escrows is an aggregate, written by the syncer's aggregator only (ReplacingMergeTree(version), no partition and no
 -- dedup window, and never deleted by recovery): the current state of every escrow the index has seen, rebuilt from
 -- object_changes, plus one sentinel row (escrow_id = empty) that holds the escrowed total: open_count and amount_drops
--- are the open escrows and the sum of their native drops, through_ledger is the ledger the job has processed up to.
+-- are the open native escrows and the sum of their drops, through_ledger is the ledger the job has processed up to.
 -- Readers keep the newest version of each escrow_id without FINAL.
 --
 -- Every statement is IF NOT EXISTS, so the file can simply be run again.
