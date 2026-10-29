@@ -783,7 +783,7 @@ the ingest writes, read at query time; one aggregate, `escrows`, keeps the escro
    table in steps of 1,000,000 ledgers until `syncer_escrows_lag_ledgers` is a few ledgers. **A Xahau syncer that is halted on a ledger with an issued-token payment channel
    resumes after the deploy**: the old parser threw on its amounts (`Cannot parse ledger <n>`, [Syncer halted](#syncer-halted)), the new one types them.
 3. **On the XRP Ledger, re-ingest the delegation amendment's ledgers:** `range-ingest --from 107524865 --to <deploy ledger> --reprocess` (about 415,000 ledgers on
-   2026-10-28, about 25,000 more a day; hours on Ripple's full-history node, [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)). `agg_dirty` carries the rewrite into
+   2026-10-28, about 20,800 more a day; hours on Ripple's full-history node, [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)). `agg_dirty` carries the rewrite into
    the rollups and the escrows. Delegation coverage is then `complete: true`.
 4. **Escrows, checks and channels stay `complete: false`** until the history backfill (ADR-0015's load from ledger 32,570, or one reprocess after the program's last parser
    version) writes every ledger from 28,685,313 on the XRP Ledger (checks: 56,219,905) and from Xahau's first ledger with parser version 7 or later. D5 does not do it. An
@@ -826,7 +826,9 @@ objects are 404 or start in the middle until they are re-ingested).
   of the accounts concerned are recomputed through `agg_dirty` like any re-ingest ([above](#what-a-re-ingest-does-to-them)).
 - **Disk.** One row for every change of every tracked object on every network, with its fields and previous fields compressed (`ZSTD(3)`), and a narrow index row for each of its two
   accounts. A payment channel claimed every day for years is thousands of rows; an escrow, a check or a delegation a few. The retention loop drops both tables with the others
-  ([Retention](#retention)); `escrows` is an aggregate and is not dropped (the aggregator rebuilds it from the rows that are left).
+  ([Retention](#retention)); `escrows` is an aggregate and is not dropped: it keeps its rows, and nothing rebuilds it after a drop. A manual rebuild (the aggregator
+  stopped, `TRUNCATE TABLE xrpl.escrows`, then started: with no sentinel the job starts again below the first committed ledger) is exact only for the escrows created
+  above the oldest kept ledger: an escrow created in a dropped block and still open has no row left to rebuild it from, and drops out of the table and its total.
 
 ```sql
 -- the object data cover the ledgers above this one (NULL: every stored ledger); delegations are `complete` once it is below 107,524,865

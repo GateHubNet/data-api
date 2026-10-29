@@ -54,7 +54,7 @@ what every transaction since did to it, and why it is in the state it is in. The
    row on the payer, and the same rule is applied to `payments.source_balance_changes` and `path_payments.source_amount`, which added the fee back to the source
    whoever paid it, and to `payments.destination_balance_changes` when the delegate is the Payment's `Destination` (a sweep to itself), whose native change had
    the fee taken out (it is what arrived, and none for a token payment to its delegate). It needs **a re-ingest** from the delegation amendment
-   (`range-ingest --from 107524865 --to <deploy ledger> --reprocess`, about 415,000 ledgers on 2026-10-28 and about 25,000 more a day): the delegate rows, the
+   (`range-ingest --from 107524865 --to <deploy ledger> --reprocess`, about 415,000 ledgers on 2026-10-28 and about 20,800 more a day): the delegate rows, the
    corrected fee rows and the rollups follow (`agg_dirty`), and the `delegations` coverage then starts at 107,524,865: `complete: true`.
 7. **Issued-token payment channels are typed with token amounts** (Xahau, `PaychanAndEscrowForTokens`). `BalanceChangesParser.channel()` read every amount as
    drops and called `dropsToNative` on a token's amount object, which throws: a `LedgerParseError` that halts the live runner (and fails a range chunk) at the first

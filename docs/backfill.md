@@ -388,7 +388,7 @@ networks have escrows, checks and payment channels; only the XRP Ledger has dele
 | Checks (`Checks`) | 56,219,905 | **1**, as above |
 
 **Delegation is the re-ingest this release asks for.** It is short because the amendment is recent: `--from 107524865` is about 415,000 ledgers on 2026-10-28, and about
-25,000 more a day. **Escrows, checks and channels are not part of it**: their coverage stays `complete: false` until every ledger from 28,685,313 (checks:
+20,800 more a day. **Escrows, checks and channels are not part of it**: their coverage stays `complete: false` until every ledger from 28,685,313 (checks:
 56,219,905; Xahau: 1) is written by parser version 7 or later, which is **the program's one reprocess after its last parser version**, or the history load from ledger
 32,570 ([Account state history re-ingest](#account-state-history-re-ingest)), and no part of D5 does it. Until then **an object created before the first ledger the new
 parser wrote and untouched since is not in the index**: its route answers 404 and the explorer shows it from the node; one created before it and changed after it has a
