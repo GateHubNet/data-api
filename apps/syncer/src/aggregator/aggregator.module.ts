@@ -54,8 +54,8 @@ export function aggregatorOptions(
  * The `aggregator` worker: the `AggregatorService`, which keeps `stats_hourly`, the volume tables (`volume_live`,
  * `volume_daily`), `amm_pools`, `nfts`, `escrows` (and the sentinel of its total), `amm_daily` and `nft_collections` (the last
  * two every fifth tick of a minute) and the account and market tables (`pair_hourly`, `markets_live`, `native_rates_daily`, the
- * account rollups) up to date once a minute. It needs what the global core module provides (`ClickHouseService`, `PrometheusService`, `ShutdownSignals`, `NETWORK_PROFILE`,
- * `SyncerConfig`), so it imports nothing.
+ * account rollups) up to date once a minute. It needs what the global core module provides (`ClickHouseService`,
+ * `PrometheusService`, `ShutdownSignals`, `NETWORK_PROFILE`, `SyncerConfig`), so it imports nothing.
  */
 @Module({
   providers: [

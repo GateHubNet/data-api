@@ -48,6 +48,8 @@ describe('AggregatorService escrows job', () => {
   let recomputeIds: jest.Mock;
   let refreshTotal: jest.Mock;
   let read: jest.Mock;
+  /** The read of the newest committed ledger, which the runner makes only after a step that failed. */
+  let readHead: jest.Mock;
   /** The newest committed ledger. */
   let head: number;
   /** The `through_ledger` of the sentinel the fake steps move on. */
@@ -128,6 +130,7 @@ describe('AggregatorService escrows job', () => {
       events.push('read');
       return { drops: '0', open, through_ledger: through };
     });
+    readHead = jest.fn(async () => head);
     ofLedgers = jest.fn(async (_ch: unknown, min: number, max: number) => {
       events.push(`of ${min}-${max}`);
       return IDS;
@@ -162,7 +165,7 @@ describe('AggregatorService escrows job', () => {
           return 0;
         }),
         escrows: { rates: RATES, nativeCurrency: 'XRP' },
-        escrowsFunctions: { step, ofLedgers, recompute: recomputeIds, refreshTotal, read } as never,
+        escrowsFunctions: { step, ofLedgers, recompute: recomputeIds, refreshTotal, read, head: readHead } as never,
         ...options,
       },
     );
@@ -181,8 +184,21 @@ describe('AggregatorService escrows job', () => {
       expect(jobsRun()).toEqual(['escrows', 'stats_live', 'stats_dirty']);
       expect(errors()).toEqual([]);
       expect(logger.error).not.toHaveBeenCalled();
-      // the live run is all there is: no hook, no read of the sentinel
+      // the live run is all there is: no hook, no read of the sentinel, and no read of the head (the step carries it)
       expect(asked()).toEqual(['step']);
+      expect(readHead).not.toHaveBeenCalled();
+    });
+
+    it('logs a debug line for every step: the window, what it touched and wrote, and how long it took', async () => {
+      head = 10_000;
+      through = 0;
+      stepLedgers = 1000;
+      stepMs = 250;
+      await service({ budgetsMs: { escrows: 400 } }).tick();
+      expect(logger.debug.mock.calls.map(([line]) => line).filter((line) => line.startsWith('escrows:'))).toEqual([
+        'escrows: ledgers after 0 up to 1000 (head 10000): 0 escrow(s) touched, 0 row(s) written, 0 removed, 250 ms',
+        'escrows: ledgers after 1000 up to 2000 (head 10000): 0 escrow(s) touched, 0 row(s) written, 0 removed, 250 ms',
+      ]);
     });
 
     it('takes the native currency of the network to the step', async () => {
@@ -365,8 +381,9 @@ describe('AggregatorService escrows job', () => {
       expect(logger.error).toHaveBeenCalledTimes(1);
       expect(logger.error).toHaveBeenCalledWith('Aggregator job escrows failed: DB::Exception: memory limit');
       expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
-      expect(lags()).toEqual([]);
-      expect(opens()).toEqual([]);
+      // the gauges say where the watermark is: the sentinel is at 900 and the head at 1000
+      expect(lags()).toEqual([100]);
+      expect(opens()).toEqual([3]);
 
       // and the next tick does the step again
       await tickAt(svc, 1);
@@ -375,7 +392,7 @@ describe('AggregatorService escrows job', () => {
       expect(through).toBe(1000);
     });
 
-    it('keeps the gauges of the steps that worked, and ends the tick there', async () => {
+    it('ends the tick there and sets the gauges to where the steps that worked left the watermark', async () => {
       head = 10_000;
       through = 0;
       stepLedgers = 1000;
@@ -384,8 +401,84 @@ describe('AggregatorService escrows job', () => {
       step.mockRejectedValueOnce(new Error('DB::Exception: timeout'));
       await service().tick();
       expect(step).toHaveBeenCalledTimes(3);
-      expect(lags()).toEqual([9000, 8000]);
+      // the two steps that worked, and the sentinel they wrote (2000) read after the one that did not
+      expect(lags()).toEqual([9000, 8000, 8000]);
       expect(errors()).toEqual([{ job: 'escrows' }]);
+    });
+
+    it('a step that fails at every tick lets the lag grow with the head', async () => {
+      step.mockRejectedValue(new Error('DB::Exception: table is read-only'));
+      const svc = service();
+      await svc.tick();
+      head = 1500;
+      await tickAt(svc, 1);
+      head = 2000;
+      await tickAt(svc, 2);
+      // the watermark stays at 900 (the step writes nothing), and the head moves on
+      expect(lags()).toEqual([100, 600, 1100]);
+      expect(opens()).toEqual([3, 3, 3]);
+      expect(through).toBe(900);
+      expect(errors()).toEqual([{ job: 'escrows' }, { job: 'escrows' }, { job: 'escrows' }]);
+      expect(readHead).toHaveBeenCalledTimes(3);
+    });
+
+    it('after a restart, a failing step does not report 0: the gauge is never set by a step that worked', async () => {
+      head = 5000;
+      through = 1200;
+      step.mockRejectedValue(new Error('DB::Exception: memory limit'));
+      // a process that has not set a gauge yet: the first value it sets is the lag, not a 0 from the default
+      await service().tick();
+      expect(lags()).toEqual([3800]);
+      expect(opens()).toEqual([3]);
+    });
+
+    it('without a sentinel the lag is the head, and the open count is left alone', async () => {
+      head = 700;
+      read.mockResolvedValue(undefined);
+      step.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      await service().tick();
+      expect(lags()).toEqual([700]);
+      expect(opens()).toEqual([]);
+    });
+
+    it('never goes below 0 for a watermark above the head', async () => {
+      head = 500;
+      through = 900;
+      step.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      await service().tick();
+      expect(lags()).toEqual([0]);
+    });
+
+    it('a failure to read the gauges is counted and logged on its own, and the error of the step is thrown all the same', async () => {
+      readHead.mockRejectedValueOnce(new Error('DB::Exception: no such table'));
+      step.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      await service().tick();
+      expect(errors()).toEqual([{ job: 'escrows' }, { job: 'escrows' }]);
+      expect(logger.error.mock.calls.map(([line]) => line)).toEqual([
+        'Aggregator job escrows failed reading the gauges: DB::Exception: no such table',
+        'Aggregator job escrows failed: DB::Exception: memory limit',
+      ]);
+      expect(lags()).toEqual([]);
+      expect(jobsRun()).toEqual(['stats_live', 'stats_dirty']);
+    });
+
+    it('a failure to read the sentinel for the gauges is handled the same way', async () => {
+      read.mockRejectedValueOnce(new Error('DB::Exception: timeout'));
+      step.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      await service().tick();
+      expect(logger.error.mock.calls.map(([line]) => line)).toEqual([
+        'Aggregator job escrows failed reading the gauges: DB::Exception: timeout',
+        'Aggregator job escrows failed: DB::Exception: memory limit',
+      ]);
+      expect(lags()).toEqual([]);
+    });
+
+    it('reads nothing for the gauges without the metrics', async () => {
+      step.mockRejectedValueOnce(new Error('DB::Exception: memory limit'));
+      await service({}, false).tick();
+      expect(readHead).not.toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -454,13 +547,17 @@ describe('AggregatorService escrows job', () => {
       expect(errors()).toEqual([]);
       expect(logger.error).not.toHaveBeenCalled();
       expect(logger.log).toHaveBeenCalledWith('Dropped the escrows slice in flight at shutdown');
+      // the failure is the shutdown's: the gauges are not read
       expect(lags()).toEqual([]);
+      expect(readHead).not.toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
     });
 
     it('counts an EscrowsAborted that the shutdown did not cause, as any failure', async () => {
       step.mockRejectedValueOnce(new EscrowsAborted());
       await service().tick();
       expect(errors()).toEqual([{ job: 'escrows' }]);
+      expect(lags()).toEqual([100]);
     });
   });
 

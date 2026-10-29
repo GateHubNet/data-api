@@ -1,4 +1,5 @@
 import {
+  committedHead,
   escrowsOfLedgers,
   EscrowsStep,
   RatesService,
@@ -10,7 +11,10 @@ import {
 import { iso } from './aggregate-job-deps';
 import { AggregatorJobContext, AggregatorTick } from './job-context';
 
-/** What the `escrows` job works with: the rates of the network, which the hook of `agg_dirty` finds the ledgers of a slice with, and its native currency. */
+/**
+ * What the `escrows` job works with: the rates of the network, which the hook of `agg_dirty` finds the ledgers of a slice with,
+ * and its native currency.
+ */
 export interface AggregatorEscrows {
   rates: RatesService;
   /** The native currency of the network: the escrows counted in the total are the ones in it. */
@@ -28,6 +32,8 @@ export interface EscrowsFunctions {
   refreshTotal: typeof refreshEscrowsTotal;
   /** The sentinel: the watermark of the job and the total as of it. */
   read: typeof readEscrowed;
+  /** The newest committed ledger: read only after a step failed, for the lag gauge (a step that worked carries its head). */
+  head: typeof committedHead;
 }
 
 /** The functions of the shared package, for what the options do not replace. */
@@ -37,6 +43,7 @@ export const ESCROWS_FUNCTIONS: EscrowsFunctions = {
   recompute: recomputeEscrows,
   refreshTotal: refreshEscrowsTotal,
   read: readEscrowed,
+  head: committedHead,
 };
 
 /**
@@ -64,7 +71,9 @@ export class EscrowsJobRunner {
    * run), and the next tick does the same window again.
    *
    * The head is the one the step saw, so the lag gauge (`syncer_escrows_lag_ledgers`: head less watermark) and the open count
-   * (`syncer_escrows_open`) are set after every step without another read. An escrow a step set aside (its rows cannot be
+   * (`syncer_escrows_open`) are set after every step without another read. After a step that **failed** they are set from the
+   * head and the sentinel, read then (`reportAfterFailure`), so that a watermark that is stuck shows as a lag that grows with the
+   * head and not as the value the gauge had before, or 0 after a restart. An escrow a step set aside (its rows cannot be
    * mapped) is counted and logged as a failure of `escrows`, by its ID: nothing is to be retried, as mapping is a function of the
    * rows, and the step commits without it.
    */
@@ -72,11 +81,43 @@ export class EscrowsJobRunner {
     if (this.ctx.closing()) return;
     let step: EscrowsStep;
     do {
-      step = await this.fns.step(this.ctx.ch, { native: this.escrows.nativeCurrency, signal: tick.signal });
+      const began = this.ctx.clock();
+      try {
+        step = await this.fns.step(this.ctx.ch, { native: this.escrows.nativeCurrency, signal: tick.signal });
+      } catch (error) {
+        await this.reportAfterFailure();
+        throw error;
+      }
+      this.ctx.logger.debug(
+        `escrows: ledgers after ${step.from} up to ${step.to} (head ${step.head}): ${step.touched} escrow(s) touched, ` +
+          `${step.written} row(s) written, ${step.removed} removed, ${this.ctx.clock() - began} ms`,
+      );
       this.reportSetAside(step.setAside);
       this.ctx.metrics?.escrowsLagLedgers.set(Math.max(0, step.head - step.to));
       this.ctx.metrics?.escrowsOpen.set(step.escrowed.open);
+      // defensive: the real step moves the watermark while the head is above it, so only a fake ends the run here
     } while (step.to > step.from && step.to < step.head && this.ctx.mayStartSet(tick, 'escrows'));
+  }
+
+  /**
+   * Sets the gauges after a step that failed, from the newest committed ledger and the sentinel (`through_ledger` 0 without
+   * one, as the job counts it), which is what the next step starts from: a step that fails at every tick leaves the watermark
+   * where it is, and the lag then grows with the head. Nothing is read without the metrics, or once the shutdown has begun (the
+   * failure is then the shutdown's). A read that fails is counted and logged as `escrows` on its own; the error of the step is
+   * the caller's to throw all the same.
+   */
+  private async reportAfterFailure(): Promise<void> {
+    const metrics = this.ctx.metrics;
+    if (!metrics || this.ctx.closing()) return;
+    try {
+      const head = await this.fns.head(this.ctx.ch);
+      const sentinel = await this.fns.read(this.ctx.ch);
+      if (this.ctx.closing()) return;
+      metrics.escrowsLagLedgers.set(Math.max(0, head - (sentinel?.through_ledger ?? 0)));
+      if (sentinel !== undefined) metrics.escrowsOpen.set(sentinel.open);
+    } catch (err) {
+      this.ctx.failed('escrows', err, ' reading the gauges');
+    }
   }
 
   /**
