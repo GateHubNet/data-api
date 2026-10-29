@@ -1,13 +1,10 @@
-import { escrowId, NetworkProfile } from '@gatehub/data-api-shared';
-import { Get, Inject, Param } from '@nestjs/common';
+import { escrowId } from '@gatehub/data-api-shared';
+import { Get, Param } from '@nestjs/common';
 import { ApiOperation, ApiParam } from '@nestjs/swagger';
 import { isValidClassicAddress } from 'ripple-address-codec';
 import { badRequest } from '../common/errors';
-import { FeatureCoverageService } from '../common/feature-coverage.service';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
-import { NETWORK_PROFILE } from '../config/api.config';
-import { EscrowBody, escrowBody } from '../ledger-objects/escrows.controller';
-import { FEATURE_OF, LedgerObjectsService } from '../ledger-objects/ledger-objects.service';
+import { EscrowBody, ObjectAnswers } from '../ledger-objects/object-answers';
 
 const DIGITS = /^\d+$/;
 const MAX_UINT32 = 4_294_967_295;
@@ -21,11 +18,7 @@ const MAX_UINT32 = 4_294_967_295;
  */
 @RippleController('v2/accounts')
 export class AccountEscrowController {
-  constructor(
-    private readonly objects: LedgerObjectsService,
-    private readonly coverage: FeatureCoverageService,
-    @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
-  ) {}
+  constructor(private readonly answers: ObjectAnswers) {}
 
   @Get(':address/escrows/:sequence')
   @RippleRoute('unable to retrieve escrow')
@@ -40,12 +33,10 @@ export class AccountEscrowController {
     name: 'sequence',
     description: 'The `Sequence` (or `TicketSequence`) of the `EscrowCreate`: digits, at most 4294967295.',
   })
-  async escrow(@Param('address') address: string, @Param('sequence') sequence: string): Promise<EscrowBody> {
+  escrow(@Param('address') address: string, @Param('sequence') sequence: string): Promise<EscrowBody> {
     if (!isValidClassicAddress(address)) throw badRequest('invalid ripple address');
     if (!DIGITS.test(sequence) || Number(sequence) > MAX_UINT32) throw badRequest('invalid sequence number');
 
-    const detail = await this.objects.detail('escrow', escrowId(address, Number(sequence)));
-    const coverage = await this.coverage.itemCoverage(FEATURE_OF.escrow, detail.created?.ledger_index);
-    return escrowBody(detail, coverage, this.profile.nativeCurrency);
+    return this.answers.escrow(escrowId(address, Number(sequence)));
   }
 }

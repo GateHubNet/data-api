@@ -1973,10 +1973,14 @@ describe('the detail and the history of an escrow read the granules of a page an
         Table.ObjectChanges,
         template,
         { template: TEMPLATE, id },
-        // the first digit of the escrow in its transaction hash: a page of another escrow's rows would show
+        // the first digit of the escrow in its transaction hash: a page of another escrow's rows would show. The rows of the
+        // other escrows are creations (`action`), so a read of `action = 'created'` that is not bound by the escrow's key reads
+        // them all: with only `modified` rows ClickHouse prunes the parts by the column's min and max before the key looks at
+        // the read, and the creation read touched about four rows whatever its WHERE said
         (base) =>
           `{id:String} AS object_id, ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index, ` +
-          `concat('bulk-', substring({id:String}, 1, 1)) AS tx_hash`,
+          `concat('bulk-', substring({id:String}, 1, 1)) AS tx_hash` +
+          (id === ESCROW ? '' : ", 'created' AS action"),
         perPart,
       );
     }
@@ -1989,6 +1993,20 @@ describe('the detail and the history of an escrow read the granules of a page an
   /** The transactions of the events of an answer that are the bulk's: all of them are the escrow's. */
   const bulkHashes = (events: unknown): string[] =>
     (events as { tx_hash: string }[]).map((e) => e.tx_hash).filter((hash) => hash.startsWith('bulk-'));
+
+  /**
+   * The creation read goes through the prefix of the escrow from its start (the creation is the first row of an object): its
+   * pipeline reads the table in the order of the key. A read in the reverse order (`algorithm: InReverseOrder`) walks from the
+   * newest row back to the creation, the object's whole prefix on every call of a long-lived object, which the bound of rows alone
+   * cannot tell here: the escrow has 10,000 rows and the bound allows more.
+   */
+  async function expectCreationFromTheStart(statements: [string, Record<string, unknown>][], label: string) {
+    const creation = statements.filter(([sql]) => sql.includes("action = 'created'"));
+    expect(creation).toHaveLength(1);
+    const [sql, params] = creation[0];
+    const pipeline = await explain(h, 'PIPELINE', sql, params);
+    expect([label, pipeline.includes('algorithm: InOrder')]).toEqual([label, true]);
+  }
 
   it('the seed is as assumed: 10,001 rows of the escrow in five parts, among the 800,000 rows of two other escrows', async () => {
     const [mine] = await h.ch.query<{ n: string; parts: string }>(
@@ -2023,6 +2041,15 @@ describe('the detail and the history of an escrow read the granules of a page an
     expect(bulkHashes(body.history)).toHaveLength(50);
   });
 
+  it('the page of the detail is read in the reverse order of the key and stops after its rows, the creation from the start of the key', async () => {
+    const path = `/v2/escrows/${ESCROW}`;
+    const { statements } = await served(h, api, Table.ObjectChanges, path, 'escrow');
+    const page = statements.filter(([sql]) => isPageRead(sql));
+    expect(page).toHaveLength(1);
+    await expectBoundedInOrderRead(h, page[0][0], page[0][1], true, path);
+    await expectCreationFromTheStart(statements, path);
+  });
+
   describe.each([false, true])('descending=%s', (descending) => {
     const pageOf = (limit: number, marker?: (string | number)[]): string =>
       `/v2/escrows/${ESCROW}/history?limit=${limit}&descending=${descending}${marker === undefined ? '' : `&marker=${markerOf(marker)}`}`;
@@ -2052,29 +2079,219 @@ describe('the detail and the history of an escrow read the granules of a page an
       expect(bulkHashes(body.history).length).toBeGreaterThanOrEqual(199);
     });
 
-    it('the page read is read in the order of the key, stops after its rows, and the other reads are the prefix of the escrow', async () => {
-      const path = pageOf(200, [MID_LEDGER, 1]);
-      const { statements } = await served(h, api, Table.ObjectChanges, path, 'history');
+    it.each([
+      ['the first page', undefined],
+      ['a page that starts inside the bulk', [MID_LEDGER, 1]],
+    ] as const)(
+      'the page read of %s is read in the order of the key, stops after its rows, and the other reads are the prefix of the escrow',
+      async (_name, marker) => {
+        const path = pageOf(200, marker as (string | number)[] | undefined);
+        const { statements } = await served(h, api, Table.ObjectChanges, path, 'history');
+        const page = statements.filter(([sql]) => isPageRead(sql));
+        expect(page).toHaveLength(1);
+        const [sql, params] = page[0];
+        await expectBoundedInOrderRead(h, sql, params, descending, path);
+        expect(sql).not.toMatch(/\bFINAL\b/i);
+        // the primary key narrows the read to the escrow and its ledgers: a few granules out of those of the table
+        const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
+        expect(primary.keys).toEqual(['object_type', 'object_id', 'ledger_index']);
+        expect(primary.condition).toContain(`object_id in ['${ESCROW}'`);
+        expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+        // the creation (and with a marker the existence read) narrow by the type and the id the same way: the prefix of the escrow
+        const others = statements.filter(([text]) => !isPageRead(text));
+        expect(others).toHaveLength(marker === undefined ? 1 : 2);
+        for (const [other, otherParams] of others) {
+          const [narrowed] = primaryKeys(await explain(h, 'indexes = 1', other, otherParams));
+          expect(narrowed.keys.slice(0, 2)).toEqual(['object_type', 'object_id']);
+          expect(narrowed.condition).toContain(`object_id in ['${ESCROW}'`);
+          // the parts of the two other escrows hold creations, so the creation read cannot skip them by the column's range:
+          // the key is what keeps it off their 800,000 rows
+          expect(narrowed.granules[0]).toBeLessThan(narrowed.granules[1] / 4);
+        }
+        // and the creation is read from the start of the escrow's rows
+        await expectCreationFromTheStart(statements, path);
+      },
+    );
+  });
+});
+
+describe('the detail of a payment channel reads the granules of a page, its creation and the rows of the channel for its counts, not the 810,000 rows of the table (read_rows over a bulk of four parts)', () => {
+  // The same shape as the escrow's above: the rows of an object are a range of the primary key of `object_changes` (its type and
+  // id, then its ledgers). The channel has 10,000 events, 2,500 in each of four parts (one in 500 a `fund`, the others claims
+  // that moved the balance), and its creation in a part of its own. Two other channels, one that sorts before it and one after
+  // it, have 100,000 creations in each of four parts of their own, in the same partition: the counts, which read the channel's
+  // whole prefix, and the creation read are bound by its key, and a read that did not use the object would read the 810,000 rows
+  // of the table.
+  const CHANNEL = '5'.repeat(64);
+  const BEFORE = '4'.repeat(64);
+  const AFTER = '6'.repeat(64);
+  const TEMPLATE = '3'.repeat(64);
+  const EVENTS_PER_PART = 2_500;
+  const FUND_EVERY = 500;
+  const OTHERS_PER_PART = 100_000;
+  const GRANULE = 8192;
+  /** The parts that hold rows of the channel: the four of the bulk and the one with its creation. */
+  const PARTS = BULK_BASES.length + 1;
+  const CHANNEL_ROWS = BULK_BASES.length * EVENTS_PER_PART + 1;
+  /** What the counts must say: five funds a part, every other event of the bulk a claim. */
+  const FUNDS = (BULK_BASES.length * EVENTS_PER_PART) / FUND_EVERY;
+  const CLAIMS = BULK_BASES.length * EVENTS_PER_PART - FUNDS;
+  const ADDED_ROWS = BULK_BASES.length * (EVENTS_PER_PART + 2 * OTHERS_PER_PART) + 2;
+  /** A page touches about a granule of each part that holds the channel, and one more for the part's partial granule. */
+  const PAGE_BOUND = (PARTS + 1) * GRANULE;
+  /** The counts and the creation read the prefix of the channel and nothing else: its rows and two granules a part. */
+  const PREFIX_BOUND = CHANNEL_ROWS + 2 * GRANULE * PARTS;
+  const CREATED_LEDGER = 20_999_500;
+
+  let h: Harness;
+  let api: ApiClient;
+  let seeded: number;
+
+  /** The reads of a request on `object_changes`, told apart by what they read. */
+  function readsByKind(reads: LoggedRead[]) {
+    return {
+      page: reads.filter((r) => r.query.includes('AS distinct_page_read')),
+      creation: reads.filter((r) => r.query.includes("action = 'created'")),
+      counts: reads.filter((r) => r.query.includes('countIf')),
+    };
+  }
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    const [before] = await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${Table.ObjectChanges}`);
+    seeded = Number(before.n);
+    const fields = jsonOf({
+      Account: OWNER,
+      Amount: '1000000',
+      Balance: '1',
+      Destination: COUNTERPARTY,
+      PublicKey: `ED${'7'.repeat(64)}`,
+      SettleDelay: 86_400,
+      Sequence: 1,
+    });
+    await insertObjects(h, [
+      objectRow({
+        object_type: 'PayChannel',
+        object_id: TEMPLATE,
+        ledger_index: 20_999_000,
+        tx_index: 1,
+        tx_type: 'PaymentChannelClaim',
+        action: 'modified',
+        event: 'claim',
+        fields,
+        previous: jsonOf({ Balance: '0' }),
+      }),
+      objectRow({
+        object_type: 'PayChannel',
+        object_id: CHANNEL,
+        ledger_index: CREATED_LEDGER,
+        tx_index: 0,
+        tx_type: 'PaymentChannelCreate',
+        fields,
+      }),
+    ]);
+    const template = `SELECT * FROM ${Table.ObjectChanges} WHERE object_id = {template:String} LIMIT 1`;
+    for (const [id, perPart] of [
+      [BEFORE, OTHERS_PER_PART],
+      [CHANNEL, EVENTS_PER_PART],
+      [AFTER, OTHERS_PER_PART],
+    ] as const) {
+      await insertBulk(
+        h,
+        Table.ObjectChanges,
+        template,
+        { template: TEMPLATE, id },
+        // the other channels' rows are creations (see the escrow's bulk above); the channel's are funds and claims
+        (base) =>
+          `{id:String} AS object_id, ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index, ` +
+          `concat('bulk-', substring({id:String}, 1, 1)) AS tx_hash` +
+          (id === CHANNEL
+            ? `, if(n.number % ${FUND_EVERY} = 0, 'fund', 'claim') AS event` +
+              `, if(n.number % ${FUND_EVERY} = 0, '{"Amount":"999999"}', '{"Balance":"0"}') AS previous`
+            : ", 'created' AS action"),
+        perPart,
+      );
+    }
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the seed is as assumed: 10,001 rows of the channel in five parts, among the 800,000 rows of two other channels', async () => {
+    const [mine] = await h.ch.query<{ n: string; parts: string; funds: string; claims: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts, countIf(event = 'fund') AS funds,
+              countIf(JSONHas(previous, 'Balance')) AS claims
+         FROM ${Table.ObjectChanges} WHERE object_id = {id:String}`,
+      { id: CHANNEL },
+    );
+    expect([Number(mine.n), Number(mine.parts), Number(mine.funds), Number(mine.claims)]).toEqual([
+      CHANNEL_ROWS,
+      PARTS,
+      FUNDS,
+      CLAIMS,
+    ]);
+    const [all] = await h.ch.query<{ n: string; partitions: string }>(
+      `SELECT count() AS n, uniqExact(_partition_id) AS partitions FROM ${Table.ObjectChanges}`,
+    );
+    expect([Number(all.n), Number(all.partitions)]).toEqual([seeded + ADDED_ROWS, 1]);
+    // the bounds are far below the table: a read of the table, or of the type, fails them
+    expect(PAGE_BOUND).toBeLessThan((seeded + ADDED_ROWS) / 8);
+    expect(PREFIX_BOUND).toBeLessThan((seeded + ADDED_ROWS) / 8);
+  });
+
+  it('the detail reads the newest 51 rows, the creation and the counts, none of them more than the prefix of the channel', async () => {
+    const path = `/v2/payment_channels/${CHANNEL}`;
+    const { reads, statements, body } = await served(h, api, Table.ObjectChanges, path, 'payment_channel');
+    const kinds = readsByKind(reads);
+    expect([kinds.page.length, kinds.creation.length, kinds.counts.length]).toEqual([1, 1, 1]);
+    for (const read of kinds.page)
+      expect([path, read.read_rows <= PAGE_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+    // the counts read the whole prefix of the channel (its rows and two granules a part), and nothing of the other channels
+    for (const read of [...kinds.creation, ...kinds.counts])
+      expect([path, read.read_rows <= PREFIX_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+    expect(kinds.counts[0].read_rows).toBeGreaterThanOrEqual(CHANNEL_ROWS);
+    // and the answer is whole: the counts are of the 10,001 events, the creation was found, the page is the newest 50
+    const channel = body.payment_channel as Record<string, unknown>;
+    expect([channel.funds, channel.claims]).toEqual([FUNDS, CLAIMS]);
+    expect(channel.created).toMatchObject({ ledger_index: CREATED_LEDGER });
+    expect([(body.history as unknown[]).length, body.history_marker === undefined]).toEqual([50, false]);
+
+    // the page is read in the reverse order of the key; the creation from the start of it (an object's first row)
+    const page = statements.filter(([sql]) => isPageRead(sql));
+    expect(page).toHaveLength(1);
+    await expectBoundedInOrderRead(h, page[0][0], page[0][1], true, path);
+    const [creationSql, creationParams] = statements.filter(([sql]) => sql.includes("action = 'created'"))[0];
+    expect(await explain(h, 'PIPELINE', creationSql, creationParams)).toContain('algorithm: InOrder');
+    // the counts and the creation narrow by the type and the id: the prefix of the channel, a few granules of the table's
+    for (const [sql, params] of statements.filter(([text]) => !isPageRead(text))) {
+      const [narrowed] = primaryKeys(await explain(h, 'indexes = 1', sql, params));
+      expect(narrowed.keys.slice(0, 2)).toEqual(['object_type', 'object_id']);
+      expect(narrowed.condition).toContain(`object_id in ['${CHANNEL}'`);
+      expect(narrowed.granules[0]).toBeLessThan(narrowed.granules[1] / 4);
+    }
+    const counts = statements.filter(([sql]) => sql.includes('countIf'));
+    expect(counts).toHaveLength(1);
+    expect(counts[0][0]).not.toMatch(/\bFINAL\b/i);
+  });
+
+  it.each([false, true])(
+    'the first page of the history (descending=%s) is read in the order of the key',
+    async (descending) => {
+      const path = `/v2/payment_channels/${CHANNEL}/history?limit=200&descending=${descending}`;
+      const { reads, statements, body } = await served(h, api, Table.ObjectChanges, path, 'history');
+      const kinds = readsByKind(reads);
+      // the history reads no counts: the page and the creation
+      expect([kinds.page.length, kinds.creation.length, kinds.counts.length]).toEqual([1, 1, 0]);
+      for (const read of kinds.page)
+        expect([path, read.read_rows <= PAGE_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      for (const read of kinds.creation)
+        expect([path, read.read_rows <= PREFIX_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      expect([(body.history as unknown[]).length, body.marker === undefined]).toEqual([200, false]);
       const page = statements.filter(([sql]) => isPageRead(sql));
       expect(page).toHaveLength(1);
-      const [sql, params] = page[0];
-      await expectBoundedInOrderRead(h, sql, params, descending, path);
-      expect(sql).not.toMatch(/\bFINAL\b/i);
-      // the primary key narrows the read to the escrow and its ledgers: a few granules out of those of the table
-      const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
-      expect(primary.keys).toEqual(['object_type', 'object_id', 'ledger_index']);
-      expect(primary.condition).toContain(`object_id in ['${ESCROW}'`);
-      expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
-      // the creation and the existence read narrow by the type and the id the same way: the prefix of the escrow
-      const others = statements.filter(([text]) => !isPageRead(text));
-      expect(others).toHaveLength(2);
-      for (const [other, otherParams] of others) {
-        const [narrowed] = primaryKeys(await explain(h, 'indexes = 1', other, otherParams));
-        expect(narrowed.keys.slice(0, 2)).toEqual(['object_type', 'object_id']);
-        expect(narrowed.condition).toContain(`object_id in ['${ESCROW}'`);
-        // (ClickHouse prunes the parts that hold no created row before the primary key looks at a read of the creation)
-        if (!other.includes("action = 'created'")) expect(narrowed.granules[0]).toBeLessThan(narrowed.granules[1] / 4);
-      }
-    });
-  });
+      await expectBoundedInOrderRead(h, page[0][0], page[0][1], descending, path);
+    },
+  );
 });

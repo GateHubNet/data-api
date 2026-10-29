@@ -3681,13 +3681,25 @@ Keys of an event, in order: `event, ledger_index, time, tx_hash, tx_type, accoun
 
 Keys of the extras of an escrow event, in order: `amount?, fulfillment?`.
 
+Keys of the extras of a check event, in order: `send_max?, expiration?, delivered?`.
+
+Keys of the extras of a payment channel event, in order: `amount, balance, amount_change?, balance_change?, expiration?, settle_delay?`.
+
 Keys of created, in order: `ledger_index, time, tx_hash`.
 
 Keys of removed, in order: `ledger_index, time, tx_hash, tx_type`.
 
-Keys of an escrow, in order: `escrow_id, account, sequence?, destination, amount?, finish_after?, cancel_after?, condition?, fulfillment?, destination_tag?, source_tag?, transfer_rate?, status, created?, removed?`.
+Keys of an escrow, in order: `escrow_id, account, sequence?, destination, amount, finish_after?, cancel_after?, condition?, fulfillment?, destination_tag?, source_tag?, transfer_rate?, status, created?, removed?`.
+
+Keys of a check, in order: `check_id, account, sequence?, destination, send_max, expiration?, invoice_id?, destination_tag?, source_tag?, delivered?, status, created?, removed?`.
+
+Keys of a payment channel, in order: `channel_id, account, sequence?, destination, amount, balance, remaining, settle_delay, public_key, expiration?, cancel_after?, destination_tag?, source_tag?, status, opened_with?, funds, claims, created?, removed?`.
 
 Keys of the escrow answer, in order: `result, coverage, ledger_index, close_time, escrow, history, history_marker?`.
+
+Keys of the check answer, in order: `result, coverage, ledger_index, close_time, check, history, history_marker?`.
+
+Keys of the payment channel answer, in order: `result, coverage, ledger_index, close_time, payment_channel, history, history_marker?`.
 
 Keys of the history answer, in order: `result, coverage, ledger_index, close_time, count, marker?, history`.
 
@@ -3881,6 +3893,378 @@ with a ticket, its `TicketSequence`.
 Unlike the other routes under an account, the address is checked, as it is part of the ID. Errors, in the order they are checked: 400 `invalid ripple
 address`, `invalid sequence number` (the messages of [`GET /v2/accounts/{address}/transactions/{sequence}`](#get-v2accountsaddresstransactionssequence));
 404 `escrow not found`; 500 `unable to retrieve escrow`.
+
+### `GET /v2/checks/{check_id}`
+
+One check as of the newest committed ledger, with its newest 50 events.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `check_id` (path) | | The 64 hex digits of the check's ID, in any case. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "check": {…}, "history": [Event, …], "history_marker": "…" }`.
+The check:
+
+- `account` is the owner (the account that wrote the check and that the money is drawn from) and `destination` the account that can cash it.
+  `sequence` is the check's own `Sequence`, else the sequence of the transaction that created it; it is left out when no indexed row says it.
+- `send_max` is the most the check can be cashed for, as an [amount](#ledger-objects): XRP or XAH, or an issued token. `expiration`,
+  `invoice_id` (the `InvoiceID` of the creating transaction), `destination_tag` and `source_tag` are left out when the check has none.
+- `delivered` is what the cash delivered, once the check is cashed: the `DeliveredAmount` of the metadata of the `CheckCash` (an issued-token
+  cash and a cash with `DeliverMin` have one), else the amount the node served as delivered, else the `Amount` of the cash. It is never the
+  `DeliverMin`, which is only the least the casher accepts.
+- `status` is one of `open`, `expired`, `cashed`, `cancelled`, `removed` (the table above). A check is `expired` while it is still in the ledger
+  after its `expiration` (it stays there until a transaction deletes it); one that a third party cancelled after its expiration is `cancelled`.
+- `created` is `{ ledger_index, time, tx_hash }` of the transaction that wrote it, when that transaction is indexed, and `removed` is
+  `{ ledger_index, time, tx_hash, tx_type }` of the `CheckCash`, `CheckCancel` or other transaction that deleted it, once it is deleted.
+
+An event of a check has `event`: `create`, `cash`, `cancel`, `removed` (deleted by another transaction) or `update`, and adds `send_max` and
+`expiration` to a `create` and `delivered` to a `cash`. The `account` of a `cash` is the sender of the `CheckCash` (the destination), and of a
+`cancel` the sender of the `CheckCancel`: the source, the destination, or anyone once the check has expired.
+`GET /v2/checks/60FCB1E8C72A695CBB6BDF718D30AF2310A9BED6D3F6D92F54C0E429186D1A42`, a check for 1 RLUSD that nobody cashed before it expired:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "check": {
+    "check_id": "60FCB1E8C72A695CBB6BDF718D30AF2310A9BED6D3F6D92F54C0E429186D1A42",
+    "account": "r9CaVb4X1JVQoi6Q8Gw5cznAMRFARJDWyN",
+    "sequence": 106635339,
+    "destination": "rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ",
+    "send_max": {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+      "value": "1"
+    },
+    "expiration": "2026-10-16T17:49:51Z",
+    "invoice_id": "AB9E9A322F4A89059C5402523B218CA53745DE3672A109BD14BB1A186640AD36",
+    "source_tag": 804681468,
+    "status": "expired",
+    "created": {
+      "ledger_index": 107698980,
+      "time": "2026-10-16T16:50:02Z",
+      "tx_hash": "CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326"
+    }
+  },
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107698980,
+      "time": "2026-10-16T16:50:02Z",
+      "tx_hash": "CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326",
+      "tx_type": "CheckCreate",
+      "account": "r9CaVb4X1JVQoi6Q8Gw5cznAMRFARJDWyN",
+      "result": "tesSUCCESS",
+      "send_max": {
+        "currency": "524C555344000000000000000000000000000000",
+        "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+        "value": "1"
+      },
+      "expiration": "2026-10-16T17:49:51Z"
+    }
+  ]
+}
+```
+
+A cashed check keeps its last state, its `removed`, and `delivered`. This check was written before the index starts, so it has no `created`
+and its `coverage` says the history is not whole:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": false },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "check": {
+    "check_id": "AEE1BCC3B4C8EA870EF61879D9BCA66C07F6E717F8F80F6C93DEB7533C01A822",
+    "account": "r3f6bMRipu5zneH4k7ieERt4PGhXCJkVDH",
+    "sequence": 106641443,
+    "destination": "rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ",
+    "send_max": {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+      "value": "1"
+    },
+    "expiration": "2026-10-16T22:55:21Z",
+    "invoice_id": "CAFA37B4E24B58A46C1E5FCADF76C5E6429F4B793473EA582C186DF795E38107",
+    "source_tag": 804681468,
+    "delivered": {
+      "currency": "524C555344000000000000000000000000000000",
+      "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+      "value": "0.438027"
+    },
+    "status": "cashed",
+    "removed": {
+      "ledger_index": 107703707,
+      "time": "2026-10-16T21:57:22Z",
+      "tx_hash": "3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330",
+      "tx_type": "CheckCash"
+    }
+  },
+  "history": [
+    {
+      "event": "cash",
+      "ledger_index": 107703707,
+      "time": "2026-10-16T21:57:22Z",
+      "tx_hash": "3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330",
+      "tx_type": "CheckCash",
+      "account": "rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ",
+      "result": "tesSUCCESS",
+      "delivered": {
+        "currency": "524C555344000000000000000000000000000000",
+        "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+        "value": "0.438027"
+      }
+    }
+  ]
+}
+```
+
+**Coverage.** The `coverage` of a check is the feature's `checks` ([Coverage](#coverage)): the Checks amendment's enable ledger (56,219,905 on the
+XRP Ledger, **when the ledger state lists the amendment**, as for escrows) or, on Xahau, its first ledger. It is the check's own when the check's
+creation is indexed, as for an escrow: a check written before the index starts and cashed or cancelled after it has `"complete": false` and no
+`created`, and one written before it and not touched since is a 404.
+
+Errors, in the order they are checked: 400 `invalid check id`; 404 `check not found`; 500 `unable to retrieve check`.
+
+### `GET /v2/checks/{check_id}/history`
+
+The events of one check, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `check_id` (path) | | The 64 hex digits, in any case. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index)` of the last event. |
+| `format` | json | `csv`: file `<check_id> - check history.csv` (the ID upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "history": [Event, …] }`, as the history of
+an escrow, with the events of a check and the `coverage` of the check. With `format=csv` the cashed check above is:
+
+```text
+"event","ledger_index","time","tx_hash","tx_type","account","delegate","result","send_max.currency","send_max.issuer","send_max.value","send_max.mpt_issuance_id","expiration","delivered.currency","delivered.issuer","delivered.value","delivered.mpt_issuance_id"
+"cash","107703707","2026-10-16T21:57:22Z","3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330","CheckCash","rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ","","tesSUCCESS","","","","","","524C555344000000000000000000000000000000","rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De","0.438027",""```
+
+Errors, in the order they are checked: 400 `invalid check id`, `invalid marker`; 404 `check not found` (a check with no event, also for a
+`marker`); 500 `unable to retrieve check history`.
+
+### `GET /v2/payment_channels/{channel_id}`
+
+One payment channel as of the newest committed ledger, with its newest 50 events.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `channel_id` (path) | | The 64 hex digits of the channel's ID, in any case. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "payment_channel": {…}, "history": [Event, …], "history_marker": "…" }`.
+The channel:
+
+- `account` is the owner (the source, which funds the channel) and `destination` the account that claims from it. `sequence` is the channel's own
+  `Sequence`, else the sequence of the transaction that created it; it is left out when no indexed row says it.
+- `amount` is what was deposited in all (the channel's funds, with every `PaymentChannelFund`), `balance` what was paid out to the destination so
+  far, and `remaining` their difference: what is left in the channel, or, once it is closed, what went back to the source. All three are
+  [amounts](#ledger-objects) in the channel's currency: XRP or XAH, or on Xahau an issued token (a token channel; its amounts are token amounts).
+  A channel whose node has no `Balance` (a new one on the XRP Ledger) has a `balance` of zero.
+- `settle_delay` is the seconds the source has to wait, after it asks to close the channel, before the channel closes while it holds unclaimed
+  funds: the time the destination has to claim. `public_key` is the hex of the key that signs the claims. `expiration` is set when the source
+  has asked to close the channel (or a fund set one); `cancel_after` is a fixed time after which the next transaction that touches the channel
+  closes it; `destination_tag` and `source_tag` are the tags of the creating transaction. A key is left out when the channel has none.
+- `status` is one of `open`, `closing`, `closed`, `removed` (the table above): a channel is `closing` from the moment it has an `expiration`, or
+  when the close time of the answer has reached its `cancel_after`, and `closed` once a claim or a fund deleted it.
+- `opened_with` is the deposit of the creating transaction, when that transaction is indexed. `funds` and `claims` count the events of the whole
+  history: the `fund` events, and the events that moved `balance` (the claims, a closing claim among them), each transaction once. They are not
+  the length of the embedded `history`, which holds 50 events at most.
+- `created` is `{ ledger_index, time, tx_hash }` of the transaction that opened it, when that transaction is indexed, and `removed` is
+  `{ ledger_index, time, tx_hash, tx_type }` of the transaction that deleted it, once it is deleted.
+
+An event of a channel has `event`: `create`, `fund`, `claim`, `close_request` (the source asked to close it: it has an `expiration` now),
+`renew` (the source took the `expiration` away), `close` (deleted by a claim or a fund), `removed` (deleted by another transaction) or `update`.
+Every event adds `amount` and `balance`, the channel's after the transaction, `amount_change` and `balance_change` when the transaction changed
+them (the difference after less before, in the channel's currency; a claim has a `balance_change`, a fund an `amount_change`), `expiration`
+when the channel has one after the transaction, and `settle_delay` to a `create`. `GET /v2/payment_channels/E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA`,
+a channel of 1 XRP claimed from once:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "payment_channel": {
+    "channel_id": "E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA",
+    "account": "rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM",
+    "sequence": 61531741,
+    "destination": "rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR",
+    "amount": { "currency": "XRP", "value": "1" },
+    "balance": { "currency": "XRP", "value": "0.032185" },
+    "remaining": { "currency": "XRP", "value": "0.967815" },
+    "settle_delay": 1209600,
+    "public_key": "03D63CA73239D94AAF52574A20E3BC26CBDB811CA55A5914FAA28836F079CE0DC3",
+    "status": "open",
+    "opened_with": { "currency": "XRP", "value": "1" },
+    "funds": 0,
+    "claims": 1,
+    "created": {
+      "ledger_index": 107624182,
+      "time": "2026-10-13T08:05:31Z",
+      "tx_hash": "E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127"
+    }
+  },
+  "history": [
+    {
+      "event": "claim",
+      "ledger_index": 107641123,
+      "time": "2026-10-14T02:25:30Z",
+      "tx_hash": "886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790",
+      "tx_type": "PaymentChannelClaim",
+      "account": "rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "1" },
+      "balance": { "currency": "XRP", "value": "0.032185" },
+      "balance_change": { "currency": "XRP", "value": "0.032185" }
+    },
+    {
+      "event": "create",
+      "ledger_index": 107624182,
+      "time": "2026-10-13T08:05:31Z",
+      "tx_hash": "E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127",
+      "tx_type": "PaymentChannelCreate",
+      "account": "rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "1" },
+      "balance": { "currency": "XRP", "value": "0" },
+      "settle_delay": 1209600
+    }
+  ]
+}
+```
+
+This channel was funded and asked to close before the index starts, so only three of its events are indexed and the `coverage` is not complete
+(and there is no `created`, `opened_with` or `sequence`). Its `expiration` makes it `closing`; a `renew` took the expiration away for a while,
+and the fund set a new one:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": false },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "payment_channel": {
+    "channel_id": "494E75E70AAFD8E655C4EBEA9541991367C038EC2251BEB4ABEBAC2AED8B0B7F",
+    "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+    "destination": "rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR",
+    "amount": { "currency": "XRP", "value": "5.000002" },
+    "balance": { "currency": "XRP", "value": "5" },
+    "remaining": { "currency": "XRP", "value": "0.000002" },
+    "settle_delay": 1209600,
+    "public_key": "03A6C6BED4F26E1EBD97A7A4AE82560D3BA21C465F95A350FEAFC1BF17574CD306",
+    "expiration": "2026-10-09T06:04:58Z",
+    "status": "closing",
+    "funds": 1,
+    "claims": 0
+  },
+  "history": [
+    {
+      "event": "fund",
+      "ledger_index": 107220098,
+      "time": "2026-09-25T06:03:01Z",
+      "tx_hash": "0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE",
+      "tx_type": "PaymentChannelFund",
+      "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "5.000002" },
+      "balance": { "currency": "XRP", "value": "5" },
+      "amount_change": { "currency": "XRP", "value": "0.000001" },
+      "expiration": "2026-10-09T06:04:58Z"
+    },
+    {
+      "event": "renew",
+      "ledger_index": 107218583,
+      "time": "2026-09-25T04:25:22Z",
+      "tx_hash": "FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8",
+      "tx_type": "PaymentChannelClaim",
+      "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "5" },
+      "balance": { "currency": "XRP", "value": "0.002469" }
+    },
+    {
+      "event": "close_request",
+      "ledger_index": 107107437,
+      "time": "2026-09-20T05:20:31Z",
+      "tx_hash": "29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB",
+      "tx_type": "PaymentChannelClaim",
+      "account": "rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "5" },
+      "balance": { "currency": "XRP", "value": "0.002469" },
+      "expiration": "2026-10-04T05:20:30Z"
+    }
+  ]
+}
+```
+
+**Coverage.** The `coverage` of a channel is the feature's `payment_channels` ([Coverage](#coverage)): the PayChan amendment's enable ledger
+(28,685,313 on the XRP Ledger, **when the ledger state lists the amendment**, as for escrows) or, on Xahau, its first ledger. It is the
+channel's own when its creation is indexed, as for an escrow; the `funds` and `claims` of a channel without its creation count the events that
+are indexed.
+
+Errors, in the order they are checked: 400 `invalid channel id`; 404 `payment channel not found`; 500 `unable to retrieve payment channel`.
+
+### `GET /v2/payment_channels/{channel_id}/history`
+
+The events of one payment channel, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `channel_id` (path) | | The 64 hex digits, in any case. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index)` of the last event. |
+| `format` | json | `csv`: file `<channel_id> - payment channel history.csv` (the ID upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "history": [Event, …] }`, as the history of
+an escrow, with the events of a channel and the `coverage` of the channel; it has no `funds` and `claims`, which are the channel's.
+`GET /v2/payment_channels/E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA/history?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "count": 1,
+  "marker": "WzEwNzYyNDE4Miw0NF0",
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107624182,
+      "time": "2026-10-13T08:05:31Z",
+      "tx_hash": "E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127",
+      "tx_type": "PaymentChannelCreate",
+      "account": "rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "1" },
+      "balance": { "currency": "XRP", "value": "0" },
+      "settle_delay": 1209600
+    }
+  ]
+}
+```
+
+With `format=csv` the same channel, newest first, is (`descending=true`): the amounts are flattened, and the columns are the same on every page,
+whether it holds claims, funds or a creation:
+
+```text
+"event","ledger_index","time","tx_hash","tx_type","account","delegate","result","amount.currency","amount.issuer","amount.value","amount.mpt_issuance_id","balance.currency","balance.issuer","balance.value","balance.mpt_issuance_id","amount_change.currency","amount_change.issuer","amount_change.value","amount_change.mpt_issuance_id","balance_change.currency","balance_change.issuer","balance_change.value","balance_change.mpt_issuance_id","expiration","settle_delay"
+"claim","107641123","2026-10-14T02:25:30Z","886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790","PaymentChannelClaim","rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR","","tesSUCCESS","XRP","","1","","XRP","","0.032185","","","","","","XRP","","0.032185","","",""
+"create","107624182","2026-10-13T08:05:31Z","E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127","PaymentChannelCreate","rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM","","tesSUCCESS","XRP","","1","","XRP","","0","","","","","","","","","","","1209600"```
+
+Errors, in the order they are checked: 400 `invalid channel id`, `invalid marker`; 404 `payment channel not found` (a channel with no event, also
+for a `marker`); 500 `unable to retrieve payment channel history`.
 
 **Differences from data.ripple.com**: none, the endpoints are new. The original's `GET /v2/accounts/{address}/escrows` (the list of an account) is
 not served and answers 404 ([Compatibility](#compatibility)).

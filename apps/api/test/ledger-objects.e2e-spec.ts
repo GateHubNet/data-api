@@ -1,7 +1,8 @@
-import { amendmentId, escrowId, OBJECT_PARSER_VERSION, Table } from '@gatehub/data-api-shared';
+import { amendmentId, escrowId, OBJECT_PARSER_VERSION, ObjectChangesRow, Table } from '@gatehub/data-api-shared';
 import { classicAddressToXAddress } from 'ripple-address-codec';
 import { COVERAGE_KEYS } from '../src/common/feature-coverage.service';
 import {
+  CHECK_KEYS,
   DETAIL_BODY_KEYS,
   ESCROW_KEYS,
   EVENT_CSV_COLUMNS,
@@ -9,6 +10,7 @@ import {
   EVENT_KEYS,
   HISTORY_BODY_KEYS,
   OBJECT_REF_KEYS,
+  PAYMENT_CHANNEL_KEYS,
   REMOVED_KEYS,
 } from '../src/ledger-objects/object-views';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
@@ -19,12 +21,15 @@ import { markerOf } from './support/read-rows';
 import { insertState, ledgerRow } from './support/validators-seed';
 
 /**
- * `GET /v2/escrows/{id}`, `/v2/escrows/{id}/history` and `/v2/accounts/{address}/escrows/{sequence}` (D5, spec 5.3) on a real
- * ClickHouse: the recorded ledgers of the objects fixtures (`xrpl-objects`: escrows created, finished and cancelled;
- * `xahau-objects`: XAH and issued-token escrows), written by the ledger writer as the syncer writes them, and the escrows made
- * by hand (their transactions say `synthetic-…`) for what the recordings do not hold: a conditional escrow with a fulfillment,
- * an escrow created with a ticket, an escrow with 120 events to page through (a real escrow has two; the paging code reads the
- * rows of any object), a row written twice, and rows above the committed head.
+ * `GET /v2/escrows/{id}`, `/v2/escrows/{id}/history` and `/v2/accounts/{address}/escrows/{sequence}` (D5, spec 5.3), and the
+ * check and payment channel routes `GET /v2/checks/{id}`, `/v2/payment_channels/{id}` and their `/history` (spec 5.4, 5.5), on a
+ * real ClickHouse: the recorded ledgers of the objects fixtures (`xrpl-objects`: escrows created, finished and cancelled, checks
+ * created, cashed and cancelled, channels created, funded, claimed from and closed; `xahau-objects`: XAH and issued-token escrows
+ * and channels, checks), written by the ledger writer as the syncer writes them, and the objects made by hand (their
+ * transactions say `synthetic-…`) for what the recordings do not hold: a conditional escrow with a fulfillment, an escrow created
+ * with a ticket, a check cancelled by a third party after its expiration, escrows and a payment channel with 120 to 1,200 events
+ * to page through (a real one has two to a few; the paging code reads the rows of any object), rows written twice, and rows above
+ * the committed head.
  *
  * Coverage depends on the amendments the api knows: Escrow, PayChan and Checks are retired or old, so the ledger state has to
  * list them (`network_state`) before the api gives them an enable ledger, and the api keeps both for seconds: the suites that
@@ -831,5 +836,1119 @@ describe('the escrow routes over the recorded xahau ledgers', () => {
     expect(table[0]).toEqual(header);
     expect(table[1][header.indexOf('"amount.currency"')]).toBe('"XAH"');
     expect(table[1][header.indexOf('"amount.value"')]).toBe('"200"');
+  });
+});
+
+// =====================================================================================================================
+// the recorded XRPL ledgers: checks and payment channels
+// =====================================================================================================================
+
+/** The key of every stored row of an object and its transaction, oldest first, as the table has them. */
+async function storedKeys(h: Harness, id: string): Promise<{ key: [number, number]; tx_hash: string }[]> {
+  const stored = await h.ch.query<{ ledger_index: number; tx_index: number; tx_hash: string }>(
+    `SELECT ledger_index, tx_index, tx_hash FROM ${Table.ObjectChanges}
+      WHERE object_id = {id:String} ORDER BY ledger_index, tx_index`,
+    { id },
+  );
+  return stored.map((r) => ({ key: [Number(r.ledger_index), Number(r.tx_index)], tx_hash: r.tx_hash }));
+}
+
+/** The keys of an event of a check and of a payment channel: the keys every event has, then what the type's event adds. */
+const CHECK_EVENT_KEYS = [...EVENT_KEYS, ...EVENT_EXTRA_KEYS.check];
+const CHANNEL_EVENT_KEYS = [...EVENT_KEYS, ...EVENT_EXTRA_KEYS.payment_channel];
+
+describe('the check and payment channel routes over the recorded xrpl ledgers', () => {
+  const HEAD = 107_972_102;
+  const HEAD_CLOSE = 1_793_245_841;
+  /** The oldest recorded ledger: where the coverage of the objects starts. */
+  const FIRST = 102_145_584;
+
+  // recorded checks (xrpl-objects)
+  /** 1,000 XRP, created in the head ledger itself; no expiration. */
+  const OPEN_CHECK = 'DA6BE1644276D17524D4C5645D322D4A0249B444C0A3C320EA941597243F30EA';
+  /** 1 RLUSD with an invoice and an expiration (845,488,191) that the close time of the head has passed; created in 107698980. */
+  const EXPIRED_CHECK = '60FCB1E8C72A695CBB6BDF718D30AF2310A9BED6D3F6D92F54C0E429186D1A42';
+  /** A check for 1 RLUSD cashed for 0.438027 in 107703707 whose creation is older than the index. */
+  const CASHED_TOKEN = 'AEE1BCC3B4C8EA870EF61879D9BCA66C07F6E717F8F80F6C93DEB7533C01A822';
+  /** A check for 51 XRP cashed for 50 XRP in 107671568 whose creation is older than the index. */
+  const CASHED_XRP = 'A13EFD941DB3E97F09C1985099A0CF89767CC34F56DB1A06595720F13B743923';
+  /** A check cancelled by its own source in 107968411. */
+  const CANCELLED_CHECK = '2C0D06B6A0D7FC898B4761E20220ECBC68515725AECC982BA9238B3BBA735341';
+
+  // recorded channels
+  /** 1 XRP from rQQQrU… to rLggTE…, created in 107624182 and claimed from once (32,185 drops). */
+  const OPEN_CHANNEL = 'E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA';
+  /** 0.01 XRP with a CancelAfter (843,879,905) that the close time of the head has passed; only its creation is indexed. */
+  const CANCEL_AFTER_CHANNEL = '416E3F2B081C7ABBA0774A8AEE81B5577CBF707A1D1D5B26F55DC15201EC35BA';
+  /** 5 XRP: a close request, a renew and a fund with an Expiration (844,841,098) are indexed; its creation is older than the index. */
+  const EXPIRING_CHANNEL = '494E75E70AAFD8E655C4EBEA9541991367C038EC2251BEB4ABEBAC2AED8B0B7F';
+  /** Closed by a claim that moved nothing (balance 0 of 5 XRP) in 102145584, the first recorded ledger. */
+  const CLOSED_CHANNEL = 'BA23FAA9CBFBCFF6DBDD19CFA3F91BA59500C5C34763C750B7813EB4FFAC37ED';
+  /** 10 XRP closed by its destination with a last claim (154,373 to 154,393 drops) in 107296498. */
+  const CLAIMED_CLOSE_CHANNEL = 'FF3614BED282162CD5A8D2DDDA8C6672C519DF4F674ECF6E8EC457C820092FAF';
+  /** A channel of 118 XRP whose only indexed event is a claim (107,573,214 to 111,494,161 drops). */
+  const CLAIMED_CHANNEL = '6627244AA2ADD455670B38A43256DA3856B53FDBD1A92BA72D11293F34F53F02';
+
+  // made by hand
+  const THIRD_PARTY = accountAt(0xd504);
+  const BY_THIRD_PARTY = hashOf(0xc4ec01);
+  const CHECK_EXPIRATION = 846_000_000;
+  const ABOVE_CHECK = hashOf(0xc4ec02);
+  const BIG = hashOf(0xc4a001);
+  const BIG_EVENTS = 1200;
+  /** The events (counted from the creation, 0) that fund the big channel; every other event after the creation is a claim. */
+  const BIG_FUNDS = [300, 600, 900];
+  const BIG_SEQUENCE = 5001;
+  const BIG_PUBLIC_KEY = `ED${'7'.repeat(64)}`;
+  const TWICE_CHANNEL = hashOf(0xc4a002);
+  const ABOVE_CHANNEL = hashOf(0xc4a003);
+
+  /** The 1,200 events of the big channel: a creation (10 XRP), three funds (1 XRP each) and 1,196 claims (0.001 XRP each), two to a ledger. */
+  function bigChannelRows(): ObjectChangesRow[] {
+    let amount = 10_000_000;
+    let balance = 0;
+    return Array.from({ length: BIG_EVENTS }, (_, e) => {
+      const at = { ledger_index: 107_800_000 + Math.floor(e / 2) * 10, tx_index: (e % 2) + 1 };
+      const node = (): string =>
+        jsonOf({
+          Account: OWNER,
+          Amount: String(amount),
+          ...(balance > 0 && { Balance: String(balance) }),
+          Destination: COUNTERPARTY,
+          PublicKey: BIG_PUBLIC_KEY,
+          Sequence: BIG_SEQUENCE,
+          SettleDelay: 86_400,
+        });
+      if (e === 0) {
+        return objectRow({
+          object_type: 'PayChannel',
+          object_id: BIG,
+          ...at,
+          tx_type: 'PaymentChannelCreate',
+          fields: node(),
+          event_fields: jsonOf({ sequence: BIG_SEQUENCE }),
+        });
+      }
+      if (BIG_FUNDS.includes(e)) {
+        const before = amount;
+        amount += 1_000_000;
+        return objectRow({
+          object_type: 'PayChannel',
+          object_id: BIG,
+          ...at,
+          tx_type: 'PaymentChannelFund',
+          action: 'modified',
+          event: 'fund',
+          fields: node(),
+          previous: jsonOf({ Amount: String(before) }),
+        });
+      }
+      const before = balance;
+      balance += 1_000;
+      return objectRow({
+        object_type: 'PayChannel',
+        object_id: BIG,
+        ...at,
+        tx_type: 'PaymentChannelClaim',
+        sender: COUNTERPARTY,
+        action: 'modified',
+        event: 'claim',
+        fields: node(),
+        previous: jsonOf({ Balance: String(before) }),
+      });
+    });
+  }
+
+  const checkFields = (extra: Obj = {}): string =>
+    jsonOf({ Account: OWNER, Destination: COUNTERPARTY, SendMax: '5000000', Sequence: 777, ...extra });
+
+  /** The node of a small channel of the small channels made by hand: `balance` '' is a node with no Balance (a created one, on the XRP Ledger). */
+  const smallChannelNode = (amount: string, balance: string): string =>
+    jsonOf({
+      Account: OWNER,
+      Amount: amount,
+      ...(balance !== '' && { Balance: balance }),
+      Destination: COUNTERPARTY,
+      PublicKey: BIG_PUBLIC_KEY,
+      SettleDelay: 86_400,
+    });
+
+  const rows = [
+    // a check cancelled by a third party after its expiration: the expiration passed a day before the cancel
+    objectRow({
+      object_type: 'Check',
+      object_id: BY_THIRD_PARTY,
+      ledger_index: 107_930_000,
+      tx_index: 3,
+      tx_type: 'CheckCreate',
+      close_time: CHECK_EXPIRATION + RIPPLE_EPOCH - 86_400,
+      fields: checkFields({ Expiration: CHECK_EXPIRATION }),
+      event_fields: jsonOf({ sequence: 777 }),
+    }),
+    objectRow({
+      object_type: 'Check',
+      object_id: BY_THIRD_PARTY,
+      ledger_index: 107_960_000,
+      tx_index: 9,
+      tx_type: 'CheckCancel',
+      sender: THIRD_PARTY,
+      action: 'deleted',
+      event: 'cancel',
+      close_time: CHECK_EXPIRATION + RIPPLE_EPOCH + 3_600,
+      fields: checkFields({ Expiration: CHECK_EXPIRATION }),
+    }),
+    // a check with its only row above the committed head, and a channel claimed from only above it
+    objectRow({ object_type: 'Check', object_id: ABOVE_CHECK, ledger_index: HEAD + 1, tx_index: 1 }),
+    objectRow({
+      object_type: 'PayChannel',
+      object_id: ABOVE_CHANNEL,
+      ledger_index: 107_958_000,
+      tx_index: 1,
+      tx_type: 'PaymentChannelCreate',
+      fields: smallChannelNode('2000000', ''),
+    }),
+    objectRow({
+      object_type: 'PayChannel',
+      object_id: ABOVE_CHANNEL,
+      ledger_index: HEAD + 1,
+      tx_index: 1,
+      tx_type: 'PaymentChannelClaim',
+      action: 'modified',
+      event: 'claim',
+      fields: smallChannelNode('2000000', '500000'),
+      previous: jsonOf({ Balance: '0' }),
+    }),
+    // a channel whose fund and claim are in the table twice, as a re-ingest can leave them
+    objectRow({
+      object_type: 'PayChannel',
+      object_id: TWICE_CHANNEL,
+      ledger_index: 107_810_000,
+      tx_index: 1,
+      tx_type: 'PaymentChannelCreate',
+      fields: smallChannelNode('1000000', ''),
+    }),
+    objectRow({
+      object_type: 'PayChannel',
+      object_id: TWICE_CHANNEL,
+      ledger_index: 107_810_010,
+      tx_index: 1,
+      tx_type: 'PaymentChannelFund',
+      action: 'modified',
+      event: 'fund',
+      fields: smallChannelNode('2000000', ''),
+      previous: jsonOf({ Amount: '1000000' }),
+    }),
+    objectRow({
+      object_type: 'PayChannel',
+      object_id: TWICE_CHANNEL,
+      ledger_index: 107_810_020,
+      tx_index: 1,
+      tx_type: 'PaymentChannelClaim',
+      sender: COUNTERPARTY,
+      action: 'modified',
+      event: 'claim',
+      fields: smallChannelNode('2000000', '250000'),
+      previous: jsonOf({ Balance: '0' }),
+    }),
+    ...bigChannelRows(),
+  ];
+
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-objects', env: NO_RATE_LIMIT, controllers: CACHE_ROUTE });
+    api = await h.api();
+    get = api.get;
+    await listAmendments(h, ['Escrow', 'PayChan', 'Checks'], HEAD);
+    await insertObjects(h, rows);
+    // the fund and the claim of TWICE_CHANNEL are written twice, each time as a part of its own
+    await h.ch.command(`SYSTEM STOP MERGES ${h.database}.${Table.ObjectChanges}`);
+    await h.ch.command(
+      `INSERT INTO ${Table.ObjectChanges} SELECT * FROM ${Table.ObjectChanges}
+        WHERE object_id = {id:String} AND event != 'create'`,
+      { id: TWICE_CHANNEL },
+      { settings: { insert_deduplicate: 0 } },
+    );
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('the data is as the tests assume', async () => {
+    const head = await h.ch.queryOne<{ ledger_index: number; t: number }>(
+      `SELECT ledger_index, toUnixTimestamp(close_time) AS t FROM ${Table.Ledgers} ORDER BY ledger_index DESC LIMIT 1`,
+    );
+    expect([head?.ledger_index, Number(head?.t)]).toEqual([HEAD, HEAD_CLOSE]);
+    // the recorded objects: the rows each has, one per event
+    const recorded: [string, number][] = [
+      [OPEN_CHECK, 1],
+      [EXPIRED_CHECK, 1],
+      [CASHED_TOKEN, 1],
+      [CASHED_XRP, 1],
+      [CANCELLED_CHECK, 1],
+      [OPEN_CHANNEL, 2],
+      [CANCEL_AFTER_CHANNEL, 1],
+      [EXPIRING_CHANNEL, 3],
+      [CLOSED_CHANNEL, 1],
+      [CLAIMED_CLOSE_CHANNEL, 1],
+      [CLAIMED_CHANNEL, 1],
+    ];
+    for (const [id, n] of recorded) expect([id, (await storedKeys(h, id)).length]).toEqual([id, n]);
+    // the made channels
+    expect((await storedKeys(h, BIG)).length).toBe(BIG_EVENTS);
+    expect((await storedKeys(h, TWICE_CHANNEL)).length).toBe(5);
+  });
+
+  // -- checks ----------------------------------------------------------------------------------------------------------
+
+  it('serves an open check, a cashed one with delivered from DeliveredAmount, and an expired one still in the ledger', async () => {
+    // open: 1,000 XRP, created in the head ledger, no expiration
+    const open = (await api.ok(`/v2/checks/${OPEN_CHECK}`, 'check')).body as Obj;
+    expect(open.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    expect(Object.keys(open)).toEqual(DETAIL_BODY_KEYS.check.filter((k) => k !== 'history_marker'));
+    expect([open.ledger_index, open.close_time]).toEqual([HEAD, iso(HEAD_CLOSE)]);
+    expect(open.check).toEqual({
+      check_id: OPEN_CHECK,
+      account: 'rfv3Z8pqTzWdB6L6EV6bRpgsUGeSfCjS1N',
+      sequence: 106_663_196,
+      destination: 'rNWDKX2qk6ZiFvJD3aTkLDmqE681PVvMAM',
+      send_max: { currency: 'XRP', value: '1000' },
+      status: 'open',
+      created: {
+        ledger_index: HEAD,
+        time: iso(HEAD_CLOSE),
+        tx_hash: 'DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E',
+      },
+    });
+    expectKeysInOrder(open.check as Obj, CHECK_KEYS);
+    expect(Object.keys((open.check as Obj).created as Obj)).toEqual([...OBJECT_REF_KEYS]);
+    expect(open.history).toEqual([
+      {
+        event: 'create',
+        ledger_index: HEAD,
+        time: iso(HEAD_CLOSE),
+        tx_hash: 'DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E',
+        tx_type: 'CheckCreate',
+        account: 'rfv3Z8pqTzWdB6L6EV6bRpgsUGeSfCjS1N',
+        result: 'tesSUCCESS',
+        send_max: { currency: 'XRP', value: '1000' },
+      },
+    ]);
+    expect(open.history_marker).toBeUndefined();
+
+    // expired: 1 RLUSD with an invoice, an expiration the close time of the head has passed, and the check is still in the ledger
+    const expired = (await api.ok(`/v2/checks/${EXPIRED_CHECK}`, 'check')).body as Obj;
+    expect(expired.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    expectKeysInOrder(expired.check as Obj, CHECK_KEYS);
+    expect(expired.check).toEqual({
+      check_id: EXPIRED_CHECK,
+      account: 'r9CaVb4X1JVQoi6Q8Gw5cznAMRFARJDWyN',
+      sequence: 106_635_339,
+      destination: 'rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ',
+      send_max: {
+        currency: '524C555344000000000000000000000000000000',
+        issuer: 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De',
+        value: '1',
+      },
+      expiration: rippleIso(845_488_191),
+      invoice_id: 'AB9E9A322F4A89059C5402523B218CA53745DE3672A109BD14BB1A186640AD36',
+      source_tag: 804_681_468,
+      status: 'expired',
+      created: {
+        ledger_index: 107_698_980,
+        time: iso(1_792_169_402),
+        tx_hash: 'CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326',
+      },
+    });
+    const create = (expired.history as Obj[])[0];
+    expectKeysInOrder(create, CHECK_EVENT_KEYS);
+    expect(create).toMatchObject({
+      event: 'create',
+      send_max: { currency: '524C555344000000000000000000000000000000', value: '1' },
+      expiration: rippleIso(845_488_191),
+    });
+
+    // cashed: the delivered amount is the DeliveredAmount of the metadata (0.438027 of the 1 RLUSD it could take), on the
+    // check and on the cash event; the creation is older than the index, so the check has no created and its coverage is incomplete
+    const cashed = (await api.ok(`/v2/checks/${CASHED_TOKEN}`, 'check')).body as Obj;
+    expect(cashed.coverage).toEqual({ from_ledger_index: FIRST, complete: false });
+    expectKeysInOrder(cashed.check as Obj, CHECK_KEYS);
+    const delivered = {
+      currency: '524C555344000000000000000000000000000000',
+      issuer: 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De',
+      value: '0.438027',
+    };
+    expect(cashed.check).toEqual({
+      check_id: CASHED_TOKEN,
+      account: 'r3f6bMRipu5zneH4k7ieERt4PGhXCJkVDH',
+      sequence: 106_641_443,
+      destination: 'rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ',
+      send_max: { currency: '524C555344000000000000000000000000000000', issuer: delivered.issuer, value: '1' },
+      expiration: rippleIso(845_506_521),
+      invoice_id: 'CAFA37B4E24B58A46C1E5FCADF76C5E6429F4B793473EA582C186DF795E38107',
+      source_tag: 804_681_468,
+      delivered,
+      status: 'cashed',
+      removed: {
+        ledger_index: 107_703_707,
+        time: iso(1_792_187_842),
+        tx_hash: '3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330',
+        tx_type: 'CheckCash',
+      },
+    });
+    expect(Object.keys((cashed.check as Obj).removed as Obj)).toEqual([...REMOVED_KEYS]);
+    expect(cashed.history).toEqual([
+      {
+        event: 'cash',
+        ledger_index: 107_703_707,
+        time: iso(1_792_187_842),
+        tx_hash: '3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330',
+        tx_type: 'CheckCash',
+        // the destination cashed it
+        account: 'rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ',
+        result: 'tesSUCCESS',
+        delivered,
+      },
+    ]);
+
+    // cashed in drops: 50 of the 51 XRP, in whole units
+    const xrp = (await api.ok(`/v2/checks/${CASHED_XRP}`, 'check')).body as Obj;
+    expect(xrp.check).toMatchObject({
+      send_max: { currency: 'XRP', value: '51' },
+      delivered: { currency: 'XRP', value: '50' },
+      status: 'cashed',
+    });
+    expect(((xrp.history as Obj[])[0] as Obj).delivered).toEqual({ currency: 'XRP', value: '50' });
+
+    // cancelled by its source: no delivered
+    const cancelled = (await api.ok(`/v2/checks/${CANCELLED_CHECK}`, 'check')).body as Obj;
+    expectKeysInOrder(cancelled.check as Obj, CHECK_KEYS);
+    expect(cancelled.check).toMatchObject({
+      account: 'rPP3R33zpehB5hTy2jSYZek5ntq3HQym68',
+      status: 'cancelled',
+      removed: { ledger_index: 107_968_411, tx_type: 'CheckCancel' },
+    });
+    expect((cancelled.check as Obj).delivered).toBeUndefined();
+    expect((cancelled.history as Obj[]).map((e) => [e.event, e.account])).toEqual([
+      ['cancel', 'rPP3R33zpehB5hTy2jSYZek5ntq3HQym68'],
+    ]);
+  });
+
+  it('serves a check cancelled by a third party after its expiration', async () => {
+    const body = (await api.ok(`/v2/checks/${BY_THIRD_PARTY}`, 'check')).body as Obj;
+    // the expiration had passed when it was cancelled and the check is not in the ledger: it was cancelled, not expired
+    expectKeysInOrder(body.check as Obj, CHECK_KEYS);
+    expect(body.check).toEqual({
+      check_id: BY_THIRD_PARTY,
+      account: OWNER,
+      sequence: 777,
+      destination: COUNTERPARTY,
+      send_max: { currency: 'XRP', value: '5' },
+      expiration: rippleIso(CHECK_EXPIRATION),
+      status: 'cancelled',
+      created: {
+        ledger_index: 107_930_000,
+        time: iso(CHECK_EXPIRATION + RIPPLE_EPOCH - 86_400),
+        tx_hash: expect.any(String),
+      },
+      removed: {
+        ledger_index: 107_960_000,
+        time: iso(CHECK_EXPIRATION + RIPPLE_EPOCH + 3_600),
+        tx_hash: expect.any(String),
+        tx_type: 'CheckCancel',
+      },
+    });
+    expect(body.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    // the cancel is the sender's own: the account that cancelled it, not the owner
+    const history = body.history as Obj[];
+    expect(history.map((e) => [e.event, e.tx_type, e.account])).toEqual([
+      ['cancel', 'CheckCancel', THIRD_PARTY],
+      ['create', 'CheckCreate', OWNER],
+    ]);
+    for (const event of history) expectKeysInOrder(event, CHECK_EVENT_KEYS);
+    expect(history[1]).toMatchObject({
+      send_max: { currency: 'XRP', value: '5' },
+      expiration: rippleIso(CHECK_EXPIRATION),
+    });
+    expect(history[0].delivered).toBeUndefined();
+  });
+
+  // -- payment channels -------------------------------------------------------------------------------------------------
+
+  it('serves an open channel, a closing one (expiration set; CancelAfter passed) and a closed one', async () => {
+    // open: created and claimed from once, with the first claim of a channel carrying a previous balance of "0"
+    const open = (await api.ok(`/v2/payment_channels/${OPEN_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(Object.keys(open)).toEqual(DETAIL_BODY_KEYS.payment_channel.filter((k) => k !== 'history_marker'));
+    expect(open.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    expect([open.ledger_index, open.close_time]).toEqual([HEAD, iso(HEAD_CLOSE)]);
+    expectKeysInOrder(open.payment_channel as Obj, PAYMENT_CHANNEL_KEYS);
+    expect(open.payment_channel).toEqual({
+      channel_id: OPEN_CHANNEL,
+      account: 'rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM',
+      sequence: 61_531_741,
+      destination: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+      amount: { currency: 'XRP', value: '1' },
+      balance: { currency: 'XRP', value: '0.032185' },
+      remaining: { currency: 'XRP', value: '0.967815' },
+      settle_delay: 1_209_600,
+      public_key: '03D63CA73239D94AAF52574A20E3BC26CBDB811CA55A5914FAA28836F079CE0DC3',
+      status: 'open',
+      opened_with: { currency: 'XRP', value: '1' },
+      funds: 0,
+      claims: 1,
+      created: {
+        ledger_index: 107_624_182,
+        time: iso(1_791_878_731),
+        tx_hash: 'E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127',
+      },
+    });
+    const events = open.history as Obj[];
+    // newest first: the claim, then the creation, whose node has no Balance (zero in the channel's currency)
+    expect(events).toEqual([
+      {
+        event: 'claim',
+        ledger_index: 107_641_123,
+        time: iso(1_791_944_730),
+        tx_hash: '886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790',
+        tx_type: 'PaymentChannelClaim',
+        account: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+        result: 'tesSUCCESS',
+        amount: { currency: 'XRP', value: '1' },
+        balance: { currency: 'XRP', value: '0.032185' },
+        balance_change: { currency: 'XRP', value: '0.032185' },
+      },
+      {
+        event: 'create',
+        ledger_index: 107_624_182,
+        time: iso(1_791_878_731),
+        tx_hash: 'E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127',
+        tx_type: 'PaymentChannelCreate',
+        account: 'rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM',
+        result: 'tesSUCCESS',
+        amount: { currency: 'XRP', value: '1' },
+        balance: { currency: 'XRP', value: '0' },
+        settle_delay: 1_209_600,
+      },
+    ]);
+    for (const event of events) expectKeysInOrder(event, CHANNEL_EVENT_KEYS);
+
+    // closing by its expiration (a fund set 844,841,098): a close request, a renew and a fund are indexed, not its creation
+    const expiring = (await api.ok(`/v2/payment_channels/${EXPIRING_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(expiring.coverage).toEqual({ from_ledger_index: FIRST, complete: false });
+    expectKeysInOrder(expiring.payment_channel as Obj, PAYMENT_CHANNEL_KEYS);
+    expect(expiring.payment_channel).toEqual({
+      channel_id: EXPIRING_CHANNEL,
+      account: 'rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu',
+      destination: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+      amount: { currency: 'XRP', value: '5.000002' },
+      balance: { currency: 'XRP', value: '5' },
+      remaining: { currency: 'XRP', value: '0.000002' },
+      settle_delay: 1_209_600,
+      public_key: '03A6C6BED4F26E1EBD97A7A4AE82560D3BA21C465F95A350FEAFC1BF17574CD306',
+      expiration: rippleIso(844_841_098),
+      status: 'closing',
+      funds: 1,
+      claims: 0,
+    });
+    const expiringEvents = expiring.history as Obj[];
+    expect(expiringEvents.map((e) => e.event)).toEqual(['fund', 'renew', 'close_request']);
+    for (const event of expiringEvents) expectKeysInOrder(event, CHANNEL_EVENT_KEYS);
+    // the fund added 1 drop (and has the expiration after it); the renew removed the expiration: it has none after it
+    expect(expiringEvents[0]).toMatchObject({
+      amount: { currency: 'XRP', value: '5.000002' },
+      balance: { currency: 'XRP', value: '5' },
+      amount_change: { currency: 'XRP', value: '0.000001' },
+      expiration: rippleIso(844_841_098),
+    });
+    expect(expiringEvents[0].balance_change).toBeUndefined();
+    expect(expiringEvents[1].expiration).toBeUndefined();
+    expect(expiringEvents[2]).toMatchObject({ expiration: rippleIso(844_406_430), balance: { value: '0.002469' } });
+
+    // closing by its CancelAfter (the close time of the head is after it), nothing else indexed than its creation
+    const cancelAfter = (await api.ok(`/v2/payment_channels/${CANCEL_AFTER_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(cancelAfter.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    expect(cancelAfter.payment_channel).toEqual({
+      channel_id: CANCEL_AFTER_CHANNEL,
+      account: 'rUQqjyFbrzwaEFyKywS1xeWWWseJMch4jm',
+      sequence: 106_562_599,
+      destination: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+      amount: { currency: 'XRP', value: '0.01' },
+      balance: { currency: 'XRP', value: '0' },
+      remaining: { currency: 'XRP', value: '0.01' },
+      settle_delay: 1_209_600,
+      public_key: 'EDD572DC0C52BE99DE671A585FBBD0840B953C9765A5B50873B27DF930AA3BC144',
+      cancel_after: rippleIso(843_879_905),
+      status: 'closing',
+      opened_with: { currency: 'XRP', value: '0.01' },
+      funds: 0,
+      claims: 0,
+      created: {
+        ledger_index: 106_970_128,
+        time: iso(1_789_351_510),
+        tx_hash: '04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7',
+      },
+    });
+
+    // closed by a claim that moved nothing: what was deposited is returned, remaining is all of it
+    const closed = (await api.ok(`/v2/payment_channels/${CLOSED_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(closed.coverage).toEqual({ from_ledger_index: FIRST, complete: false });
+    expect(closed.payment_channel).toEqual({
+      channel_id: CLOSED_CHANNEL,
+      account: 'rBJmvoyhs9Z7tmXTuViYvpPBDTw9hGJGfz',
+      destination: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+      amount: { currency: 'XRP', value: '5' },
+      balance: { currency: 'XRP', value: '0' },
+      remaining: { currency: 'XRP', value: '5' },
+      settle_delay: 1_209_600,
+      public_key: 'ED8C2FE733BB415BB51C470344905E12965CE1429A6586AF345A8953980B33E02F',
+      expiration: rippleIso(823_998_390),
+      status: 'closed',
+      funds: 0,
+      claims: 0,
+      removed: {
+        ledger_index: 102_145_584,
+        time: iso(1_770_699_681),
+        tx_hash: '9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9',
+        tx_type: 'PaymentChannelClaim',
+      },
+    });
+    expectKeysInOrder(closed.payment_channel as Obj, PAYMENT_CHANNEL_KEYS);
+
+    // closed by its destination with a last claim: the claim is an event that moved the balance, and the channel counts it
+    const claimedClose = (await api.ok(`/v2/payment_channels/${CLAIMED_CLOSE_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(claimedClose.payment_channel).toMatchObject({
+      amount: { currency: 'XRP', value: '10' },
+      balance: { currency: 'XRP', value: '0.154393' },
+      remaining: { currency: 'XRP', value: '9.845607' },
+      status: 'closed',
+      funds: 0,
+      claims: 1,
+      removed: { ledger_index: 107_296_498, tx_type: 'PaymentChannelClaim' },
+    });
+    expect((claimedClose.history as Obj[])[0]).toMatchObject({
+      event: 'close',
+      account: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+      balance_change: { currency: 'XRP', value: '0.00002' },
+    });
+
+    // a channel whose creation is older than the index and whose first indexed event is a claim: no creation to open with
+    const claimed = (await api.ok(`/v2/payment_channels/${CLAIMED_CHANNEL}`, 'payment_channel')).body as Obj;
+    const claimedChannel = claimed.payment_channel as Obj;
+    expect(claimedChannel).toMatchObject({
+      sequence: 93_214_305,
+      amount: { currency: 'XRP', value: '118' },
+      balance: { currency: 'XRP', value: '111.494161' },
+      remaining: { currency: 'XRP', value: '6.505839' },
+      status: 'open',
+      funds: 0,
+      claims: 1,
+    });
+    expect(claimedChannel.opened_with).toBeUndefined();
+    expect(claimedChannel.created).toBeUndefined();
+    expect((claimed.history as Obj[])[0].balance_change).toEqual({ currency: 'XRP', value: '3.920947' });
+  });
+
+  it('counts the funds and the claims, each transaction once and none above the committed head', async () => {
+    // a fund and a claim that are in the table twice count once; the events are each once too
+    const twice = (await api.ok(`/v2/payment_channels/${TWICE_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(twice.payment_channel).toMatchObject({
+      amount: { currency: 'XRP', value: '2' },
+      balance: { currency: 'XRP', value: '0.25' },
+      funds: 1,
+      claims: 1,
+    });
+    expect((twice.history as Obj[]).map((e) => e.event)).toEqual(['claim', 'fund', 'create']);
+    // the claim above the head is not counted, and the channel is as it was at the head
+    const above = (await api.ok(`/v2/payment_channels/${ABOVE_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(above.payment_channel).toMatchObject({
+      balance: { currency: 'XRP', value: '0' },
+      funds: 0,
+      claims: 0,
+    });
+    expect((above.history as Obj[]).map((e) => e.event)).toEqual(['create']);
+  });
+
+  it('a channel with 1,200 events: detail, marker, counts and creation', async () => {
+    const stored = await storedKeys(h, BIG);
+    const newest = [...stored].reverse();
+    const body = (await api.ok(`/v2/payment_channels/${BIG}`, 'payment_channel')).body as Obj;
+    expect(Object.keys(body)).toEqual([...DETAIL_BODY_KEYS.payment_channel]);
+    expect(body.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    const channel = body.payment_channel as Obj;
+    expectKeysInOrder(channel, PAYMENT_CHANNEL_KEYS);
+    // 1 creation of 10 XRP, 3 funds of 1 XRP, 1,196 claims of 0.001 XRP: the counts are of all 1,200 events though the page holds 50
+    expect(channel).toEqual({
+      channel_id: BIG,
+      account: OWNER,
+      sequence: BIG_SEQUENCE,
+      destination: COUNTERPARTY,
+      amount: { currency: 'XRP', value: '13' },
+      balance: { currency: 'XRP', value: '1.196' },
+      remaining: { currency: 'XRP', value: '11.804' },
+      settle_delay: 86_400,
+      public_key: BIG_PUBLIC_KEY,
+      status: 'open',
+      // the creation is older than the newest 50 events: found by its own read, with the 10 XRP it opened with
+      opened_with: { currency: 'XRP', value: '10' },
+      funds: 3,
+      claims: 1196,
+      created: { ledger_index: 107_800_000, time: iso(1_793_226_600), tx_hash: stored[0].tx_hash },
+    });
+    const embedded = body.history as Obj[];
+    expect(embedded).toHaveLength(50);
+    expect(embedded.map((e) => e.tx_hash)).toEqual(newest.slice(0, 50).map((r) => r.tx_hash));
+    for (const event of embedded) expectKeysInOrder(event, CHANNEL_EVENT_KEYS);
+    // the newest event is the last claim: the balance after it and what it added
+    expect(embedded[0]).toMatchObject({
+      event: 'claim',
+      account: COUNTERPARTY,
+      amount: { currency: 'XRP', value: '13' },
+      balance: { currency: 'XRP', value: '1.196' },
+      balance_change: { currency: 'XRP', value: '0.001' },
+    });
+    // the marker is the key of the 50th event and continues the history newest first, to the creation
+    expect(decodeMarker(body.history_marker as string)).toEqual(newest[49].key);
+    const rest: HistoryPage[] = [];
+    for (let marker = body.history_marker as string | undefined; marker !== undefined; ) {
+      const page = (
+        await api.ok(`/v2/payment_channels/${BIG}/history?descending=true&limit=500&marker=${marker}`, 'history')
+      ).body as HistoryPage;
+      rest.push(page);
+      marker = page.marker;
+    }
+    expect(rest.map((p) => p.count)).toEqual([500, 500, 150]);
+    expect([...embedded, ...rest.flatMap((p) => p.history)].map((e) => e.tx_hash)).toEqual(
+      newest.map((r) => r.tx_hash),
+    );
+    // a fund and the creation, as they are in the history
+    const events = rest.flatMap((p) => p.history);
+    expect(events.find((e) => e.event === 'fund')).toMatchObject({
+      tx_type: 'PaymentChannelFund',
+      account: OWNER,
+      amount_change: { currency: 'XRP', value: '1' },
+    });
+    expect(events[events.length - 1]).toMatchObject({
+      event: 'create',
+      amount: { currency: 'XRP', value: '10' },
+      balance: { currency: 'XRP', value: '0' },
+      settle_delay: 86_400,
+    });
+  });
+
+  it('pages of a 1,200-event history concatenate both ways', async () => {
+    const all = await storedKeys(h, BIG);
+    expect(all).toHaveLength(BIG_EVENTS);
+    for (const descending of [false, true]) {
+      const want = descending ? [...all].reverse() : all;
+      const path = `/v2/payment_channels/${BIG}/history?descending=${descending}`;
+      for (const limit of [37, 200, 599, 600, 601, 1000]) {
+        const pages = await api.pages<HistoryPage>(path, limit, 'history');
+        expect([path, limit, pages.flatMap((p) => p.history.map((e) => e.tx_hash))]).toEqual([
+          path,
+          limit,
+          want.map((r) => r.tx_hash),
+        ]);
+        expect(pages.map((p) => p.count)).toEqual(
+          Array.from({ length: Math.ceil(BIG_EVENTS / limit) }, (_, i) => Math.min(limit, BIG_EVENTS - i * limit)),
+        );
+        // only the last page has no marker
+        expect(pages.map((p) => p.marker === undefined)).toEqual(pages.map((_, i) => i === pages.length - 1));
+      }
+      // the marker is the key of the last row of its page
+      const first = (await api.ok(`${path}&limit=3`)).body as HistoryPage;
+      expect(decodeMarker(first.marker as string)).toEqual(want[2].key);
+    }
+    // the answer of a page has the keys of the history answer and the coverage of the channel
+    const body = (await api.ok(`/v2/payment_channels/${BIG}/history?limit=7`, 'history')).body as Obj;
+    expect(Object.keys(body)).toEqual([...HISTORY_BODY_KEYS]);
+    expect(body.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    expect([body.ledger_index, body.close_time, body.count]).toEqual([HEAD, iso(HEAD_CLOSE), 7]);
+    // the creation first, with the channel's currency in every amount
+    expect((body.history as Obj[])[0]).toMatchObject({ event: 'create', amount: { currency: 'XRP', value: '10' } });
+  });
+
+  // -- the history as CSV ------------------------------------------------------------------------------------------------
+
+  it('serves the history of a channel as CSV with Link, the same columns on every page', async () => {
+    const path = `/v2/payment_channels/${BIG.toLowerCase()}/history`;
+    const csv = await get(`${path}?format=csv&limit=50`);
+    expect(csv.status).toBe(200);
+    expect(csv.headers['content-type']).toMatch(/^text\/csv/);
+    expect(csv.headers['content-disposition']).toBe(csvDisposition(`${BIG} - payment channel history`));
+    const header = EVENT_CSV_COLUMNS.payment_channel.map((c) => `"${c}"`);
+    const table = lines(csv.text).map(cells);
+    expect(table).toHaveLength(1 + 50);
+    expect(table[0]).toEqual(header);
+    expect(csv.text).not.toContain('coverage');
+    const column = (row: string[], name: string): string => row[header.indexOf(`"${name}"`)];
+    // the creation: its amount and balance flattened, no change
+    expect(column(table[1], 'event')).toBe('"create"');
+    expect(column(table[1], 'amount.currency')).toBe('"XRP"');
+    expect(column(table[1], 'amount.value')).toBe('"10"');
+    expect(column(table[1], 'balance.value')).toBe('"0"');
+    expect(column(table[1], 'settle_delay')).toBe('"86400"');
+    expect(column(table[1], 'balance_change.value')).toBe('""');
+    // a claim
+    expect(column(table[2], 'event')).toBe('"claim"');
+    expect(column(table[2], 'balance_change.value')).toBe('"0.001"');
+    expect(column(table[2], 'settle_delay')).toBe('""');
+    // the Link header carries the marker of the page, with the query as it was asked
+    const json = (await api.ok(`${path}?limit=50`, 'history')).body as HistoryPage;
+    const origin = new URL(csv.request.url).origin;
+    expect(csv.headers.link).toBe(`<${origin}${path}?format=csv&limit=50&marker=${json.marker}>; rel="next"`);
+    // a page of claims alone has the header of a page with a creation in it; so does the page of a fund
+    const claims = await get(`${path}?format=csv&limit=5&descending=true`);
+    expect(lines(claims.text)[0].split(',')).toEqual(header);
+    expect(cells(lines(claims.text)[1])[header.indexOf('"event"')]).toBe('"claim"');
+    const fund = await get(`${path}?format=csv&limit=1&marker=${markerOf([107_801_490, 2])}`);
+    expect(lines(fund.text)[0].split(',')).toEqual(header);
+    const fundRow = cells(lines(fund.text)[1]);
+    expect(column(fundRow, 'event')).toBe('"fund"');
+    expect(column(fundRow, 'amount_change.value')).toBe('"1"');
+    expect(column(fundRow, 'balance_change.value')).toBe('""');
+  });
+
+  it('serves the history of a check as CSV with the delivered amount in its columns', async () => {
+    const csv = await get(`/v2/checks/${CASHED_TOKEN}/history?format=csv`);
+    expect(csv.status).toBe(200);
+    expect(csv.headers['content-disposition']).toBe(csvDisposition(`${CASHED_TOKEN} - check history`));
+    const header = EVENT_CSV_COLUMNS.check.map((c) => `"${c}"`);
+    const table = lines(csv.text).map(cells);
+    expect(table).toHaveLength(2);
+    expect(table[0]).toEqual(header);
+    const row = table[1];
+    expect(row[header.indexOf('"event"')]).toBe('"cash"');
+    expect(row[header.indexOf('"delivered.currency"')]).toBe('"524C555344000000000000000000000000000000"');
+    expect(row[header.indexOf('"delivered.issuer"')]).toBe('"rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"');
+    expect(row[header.indexOf('"delivered.value"')]).toBe('"0.438027"');
+    expect(row[header.indexOf('"send_max.value"')]).toBe('""');
+    expect(csv.headers.link).toBeUndefined();
+    // the creation of a check has its send_max and expiration and no delivered
+    const created = lines((await get(`/v2/checks/${EXPIRED_CHECK}/history?format=csv`)).text).map(cells);
+    expect(created[0]).toEqual(header);
+    expect(created[1][header.indexOf('"send_max.value"')]).toBe('"1"');
+    expect(created[1][header.indexOf('"expiration"')]).toBe(`"${rippleIso(845_488_191)}"`);
+    expect(created[1][header.indexOf('"delivered.value"')]).toBe('""');
+  });
+
+  // -- ids, heads and errors ---------------------------------------------------------------------------------------------
+
+  it('answers a lower-case id in upper case', async () => {
+    const check = (await api.ok(`/v2/checks/${OPEN_CHECK.toLowerCase()}`, 'check')).body as Obj;
+    expect((check.check as Obj).check_id).toBe(OPEN_CHECK);
+    const channel = (await api.ok(`/v2/payment_channels/${OPEN_CHANNEL.toLowerCase()}`, 'payment_channel')).body as Obj;
+    expect((channel.payment_channel as Obj).channel_id).toBe(OPEN_CHANNEL);
+    expect(((await api.ok(`/v2/checks/${OPEN_CHECK.toLowerCase()}/history`, 'history')).body as Obj).count).toBe(1);
+    expect(
+      ((await api.ok(`/v2/payment_channels/${OPEN_CHANNEL.toLowerCase()}/history`, 'history')).body as Obj).count,
+    ).toBe(2);
+  });
+
+  it('serves nothing above the committed head', async () => {
+    for (const path of [`/v2/checks/${ABOVE_CHECK}`, `/v2/checks/${ABOVE_CHECK}/history`]) {
+      const res = await get(path);
+      expect([path, res.status, res.body]).toEqual([path, 404, { result: 'error', message: 'check not found' }]);
+    }
+  });
+
+  it.each([
+    ['checks', OPEN_CHECK, 'check not found'],
+    ['payment_channels', OPEN_CHANNEL, 'payment channel not found'],
+  ])(
+    '/v2/%s: a page past the end is count 0, a marker for an object that is not there is 404',
+    async (route, id, message) => {
+      // (the key after every row of the object, whatever its transaction index)
+      const end = markerOf([HEAD, 1_000_000]);
+      const past = (await api.ok(`/v2/${route}/${id}/history?marker=${end}`, 'history')).body as Obj;
+      expect(past).toMatchObject({ count: 0, history: [], coverage: { complete: true } });
+      expect(Object.keys(past)).toEqual(HISTORY_BODY_KEYS.filter((k) => k !== 'marker'));
+      const unknown = await get(`/v2/${route}/${UNKNOWN}/history?marker=${end}`);
+      expect([unknown.status, unknown.body]).toEqual([404, { result: 'error', message }]);
+    },
+  );
+
+  it.each([
+    ['/v2/checks/XYZ', 400, 'invalid check id'],
+    [`/v2/checks/${'A'.repeat(63)}`, 400, 'invalid check id'],
+    [`/v2/checks/${'A'.repeat(65)}`, 400, 'invalid check id'],
+    [`/v2/checks/${'G'.repeat(64)}`, 400, 'invalid check id'],
+    [`/v2/checks/${UNKNOWN}`, 404, 'check not found'],
+    ['/v2/checks/XYZ/history', 400, 'invalid check id'],
+    [`/v2/checks/${UNKNOWN}/history`, 404, 'check not found'],
+    [`/v2/checks/${OPEN_CHECK}/history?marker=%%`, 400, 'invalid marker'],
+    [`/v2/checks/${OPEN_CHECK}/history?marker=e30`, 400, 'invalid marker'],
+    [`/v2/checks/${UNKNOWN}/history?marker=%%`, 400, 'invalid marker'],
+    ['/v2/payment_channels/XYZ', 400, 'invalid channel id'],
+    [`/v2/payment_channels/${'A'.repeat(63)}`, 400, 'invalid channel id'],
+    [`/v2/payment_channels/${'A'.repeat(65)}`, 400, 'invalid channel id'],
+    [`/v2/payment_channels/${'G'.repeat(64)}`, 400, 'invalid channel id'],
+    [`/v2/payment_channels/${UNKNOWN}`, 404, 'payment channel not found'],
+    ['/v2/payment_channels/XYZ/history', 400, 'invalid channel id'],
+    [`/v2/payment_channels/${UNKNOWN}/history`, 404, 'payment channel not found'],
+    [`/v2/payment_channels/${OPEN_CHANNEL}/history?marker=%%`, 400, 'invalid marker'],
+    [`/v2/payment_channels/${OPEN_CHANNEL}/history?marker=e30`, 400, 'invalid marker'],
+    [`/v2/payment_channels/${UNKNOWN}/history?marker=%%`, 400, 'invalid marker'],
+    // a check id is no channel: each route reads its own type
+    [`/v2/payment_channels/${OPEN_CHECK}`, 404, 'payment channel not found'],
+    [`/v2/checks/${OPEN_CHANNEL}`, 404, 'check not found'],
+    [`/v2/checks/${EXPIRING_CHANNEL}/history`, 404, 'check not found'],
+  ])('%s → %i %s', async (path, status, message) => {
+    const res = await get(path);
+    expect([res.status, res.body]).toEqual([status, { result: 'error', message }]);
+    // an error is not kept by a cache
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('answers 500 with the message of the route when a read fails', async () => {
+    jest.spyOn(h.ch, 'query').mockRejectedValue(new Error('clickhouse is down'));
+    for (const [path, message] of [
+      [`/v2/checks/${OPEN_CHECK}`, 'unable to retrieve check'],
+      [`/v2/checks/${OPEN_CHECK}/history`, 'unable to retrieve check history'],
+      [`/v2/payment_channels/${OPEN_CHANNEL}`, 'unable to retrieve payment channel'],
+      [`/v2/payment_channels/${OPEN_CHANNEL}/history`, 'unable to retrieve payment channel history'],
+    ]) {
+      const res = await get(path);
+      expect([path, res.status, res.body]).toEqual([path, 500, { result: 'error', message }]);
+    }
+  });
+
+  it('answers 401 without a key', async () => {
+    for (const path of [
+      `/v2/checks/${OPEN_CHECK}`,
+      `/v2/checks/${OPEN_CHECK}/history`,
+      `/v2/payment_channels/${OPEN_CHANNEL}`,
+      `/v2/payment_channels/${OPEN_CHANNEL}/history`,
+    ]) {
+      const res = await h.http().get(path);
+      expect([path, res.status, res.body]).toEqual([
+        path,
+        401,
+        { result: 'error', message: 'Missing or invalid API key.' },
+      ]);
+    }
+  });
+});
+
+// =====================================================================================================================
+// the close time of the newest ledger: the status of a check and of a channel
+// =====================================================================================================================
+
+describe('the status of a check and of a payment channel is the one at the close time of the newest ledger', () => {
+  const CHECK = hashOf(0xc4ec10);
+  const CHANNEL = hashOf(0xc4a010);
+  const EXPIRING = hashOf(0xc4a011);
+  /** The `Expiration` of the check and the `CancelAfter` of the channel (Ripple-epoch seconds), and the unix seconds they are. */
+  const EXPIRATION = 800_000_000;
+  const CANCEL_AFTER = 800_000_500;
+  const EXPIRATION_UNIX = EXPIRATION + RIPPLE_EPOCH;
+  const CANCEL_UNIX = CANCEL_AFTER + RIPPLE_EPOCH;
+  const FIRST = 1000;
+
+  let h: Harness;
+  let api: ApiClient;
+  let ledger = FIRST - 1;
+
+  /** The statuses after a ledger that closed at `closeTime`: the check, the channel and the channel that has an Expiration. */
+  async function statusesAt(closeTime: number): Promise<unknown[]> {
+    ledger += 1;
+    await seedObjects(h, [], { ledger_index: ledger, close_time: closeTime });
+    const check = (await api.ok(`/v2/checks/${CHECK}`, 'check')).body as Obj;
+    const channel = (await api.ok(`/v2/payment_channels/${CHANNEL}`, 'payment_channel')).body as Obj;
+    const expiring = (await api.ok(`/v2/payment_channels/${EXPIRING}`, 'payment_channel')).body as Obj;
+    expect([check.ledger_index, channel.close_time]).toEqual([ledger, iso(closeTime)]);
+    return [
+      (check.check as Obj).status,
+      (channel.payment_channel as Obj).status,
+      (expiring.payment_channel as Obj).status,
+    ];
+  }
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'none', env: NO_RATE_LIMIT, controllers: CACHE_ROUTE });
+    api = await h.api();
+    const channelFields = (extra: Obj = {}): string =>
+      jsonOf({
+        Account: OWNER,
+        Amount: '1000000',
+        Destination: COUNTERPARTY,
+        PublicKey: `ED${'7'.repeat(64)}`,
+        SettleDelay: 86_400,
+        ...extra,
+      });
+    await insertObjects(h, [
+      objectRow({
+        object_type: 'Check',
+        object_id: CHECK,
+        ledger_index: FIRST,
+        tx_type: 'CheckCreate',
+        fields: jsonOf({ Account: OWNER, Destination: COUNTERPARTY, Expiration: EXPIRATION, SendMax: '1000000' }),
+      }),
+      objectRow({
+        object_type: 'PayChannel',
+        object_id: CHANNEL,
+        ledger_index: FIRST,
+        tx_type: 'PaymentChannelCreate',
+        fields: channelFields({ CancelAfter: CANCEL_AFTER }),
+      }),
+      // a channel with an Expiration is closing whatever the time is, as long as it is in the ledger
+      objectRow({
+        object_type: 'PayChannel',
+        object_id: EXPIRING,
+        ledger_index: FIRST,
+        tx_type: 'PaymentChannelClaim',
+        action: 'modified',
+        event: 'close_request',
+        fields: channelFields({ Expiration: CANCEL_AFTER + 10_000_000 }),
+      }),
+    ]);
+  }, 120_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('answers 404 before a ledger is committed, whatever the rows say', async () => {
+    for (const [path, message] of [
+      [`/v2/checks/${CHECK}`, 'check not found'],
+      [`/v2/checks/${CHECK}/history`, 'check not found'],
+      [`/v2/payment_channels/${CHANNEL}`, 'payment channel not found'],
+      [`/v2/payment_channels/${CHANNEL}/history`, 'payment channel not found'],
+    ]) {
+      const res = await api.get(path);
+      expect([path, res.status, res.body]).toEqual([path, 404, { result: 'error', message }]);
+    }
+  });
+
+  it('evaluates a check at its expiration and a channel at its CancelAfter against the close time of H', async () => {
+    // the check expires at its expiration (a cash needs a time before it), the channel is closing from its CancelAfter on
+    expect(await statusesAt(EXPIRATION_UNIX - 1)).toEqual(['open', 'open', 'closing']);
+    expect(await statusesAt(EXPIRATION_UNIX)).toEqual(['expired', 'open', 'closing']);
+    expect(await statusesAt(CANCEL_UNIX - 1)).toEqual(['expired', 'open', 'closing']);
+    expect(await statusesAt(CANCEL_UNIX)).toEqual(['expired', 'closing', 'closing']);
+    expect(await statusesAt(CANCEL_UNIX + 1)).toEqual(['expired', 'closing', 'closing']);
+  });
+});
+
+// =====================================================================================================================
+// the recorded Xahau ledgers: checks and payment channels
+// =====================================================================================================================
+
+describe('the check and payment channel routes over the recorded xahau ledgers', () => {
+  const HEAD = 26_399_329;
+  const FIRST = 8_852_809;
+  /** 1 DHA of rDyz9r… in a channel from rL6rwN… to rLggTE…, created in 11056548 and claimed from once (0.023506 DHA). */
+  const TOKEN_CHANNEL = '29FE7315A85998E7039B0E97AEEB0C1ACA4CE72D6D0DD25C79CCC26466988AF0';
+  /** 0.3 XAH in a channel of the same pair, created in 8852809 (its node has a Balance "0") and claimed from once (15,838 drops). */
+  const XAH_CHANNEL = '760841CB48554EC05365E201E3C1E50001701835BA3E71384DEFC7055BE79F04';
+  /** 1 XAH, created in 12064511 and cashed with a DeliverMin and no Amount in 12064524. */
+  const XAH_CHECK = 'F3B54B771F9269A2381A227CC01386C651C3A5AE7EE2234BD2A958EFDAE81716';
+  /** A check of 0.001 EVR cashed in 26399329. */
+  const TOKEN_CHECK = '789B10B1CB6CC875D569AC6FF17B4AB7F60EBA180305665AB6AC5FF4A321139E';
+  const DHA = { currency: 'DHA', issuer: 'rDyz9rX7eGJRdVDC8NGxMxqh9U14qduqzS' };
+
+  let h: Harness;
+  let api: ApiClient;
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xahau-objects', env: NO_RATE_LIMIT, controllers: CACHE_ROUTE });
+    api = await h.api();
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  it('serves a Xahau issued-token channel in token amounts', async () => {
+    const body = (await api.ok(`/v2/payment_channels/${TOKEN_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(Object.keys(body)).toEqual(DETAIL_BODY_KEYS.payment_channel.filter((k) => k !== 'history_marker'));
+    // Xahau starts its features at its first ledger, and the creation of this channel is indexed
+    expect(body.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    expect([body.ledger_index, body.close_time]).toEqual([HEAD, iso(1_791_550_172)]);
+    expectKeysInOrder(body.payment_channel as Obj, PAYMENT_CHANNEL_KEYS);
+    expect(body.payment_channel).toEqual({
+      channel_id: TOKEN_CHANNEL,
+      account: 'rL6rwNe6puyoN5X1BUy8pEQb6Un23m2f1m',
+      sequence: 777_987_460,
+      destination: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+      amount: { ...DHA, value: '1' },
+      balance: { ...DHA, value: '0.023506' },
+      remaining: { ...DHA, value: '0.976494' },
+      settle_delay: 1_209_600,
+      public_key: 'ED3E65C66F452D4C5029F4B338213FC6691C43ED04FCBC5AB88850471C9979F425',
+      status: 'open',
+      opened_with: { ...DHA, value: '1' },
+      funds: 0,
+      claims: 1,
+      created: {
+        ledger_index: 11_056_548,
+        time: iso(1_735_850_951),
+        tx_hash: '658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC',
+      },
+    });
+    const events = body.history as Obj[];
+    for (const event of events) expectKeysInOrder(event, CHANNEL_EVENT_KEYS);
+    // the first claim: the previous balance is a token amount of zero, and the change is in the token
+    expect(events[0]).toMatchObject({
+      event: 'claim',
+      ledger_index: 11_083_603,
+      account: 'rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR',
+      amount: { ...DHA, value: '1' },
+      balance: { ...DHA, value: '0.023506' },
+      balance_change: { ...DHA, value: '0.023506' },
+    });
+    // the creation's node has a Balance of zero tokens
+    expect(events[1]).toMatchObject({
+      event: 'create',
+      amount: { ...DHA, value: '1' },
+      balance: { ...DHA, value: '0' },
+      settle_delay: 1_209_600,
+    });
+    // and the CSV flattens the token amounts
+    const csv = await api.get(`/v2/payment_channels/${TOKEN_CHANNEL}/history?format=csv`);
+    const header = EVENT_CSV_COLUMNS.payment_channel.map((c) => `"${c}"`);
+    const table = lines(csv.text).map(cells);
+    expect(table[0]).toEqual(header);
+    expect(table[2][header.indexOf('"balance_change.currency"')]).toBe('"DHA"');
+    expect(table[2][header.indexOf('"balance_change.issuer"')]).toBe(`"${DHA.issuer}"`);
+    expect(table[2][header.indexOf('"balance_change.value"')]).toBe('"0.023506"');
+  });
+
+  it('serves a Xahau XAH channel, whose created node has a Balance of "0", and its checks in XAH and in a token', async () => {
+    const xah = (await api.ok(`/v2/payment_channels/${XAH_CHANNEL}`, 'payment_channel')).body as Obj;
+    expect(xah.payment_channel).toMatchObject({
+      amount: { currency: 'XAH', value: '0.3' },
+      balance: { currency: 'XAH', value: '0.015838' },
+      remaining: { currency: 'XAH', value: '0.284162' },
+      opened_with: { currency: 'XAH', value: '0.3' },
+      funds: 0,
+      claims: 1,
+    });
+    expect((xah.history as Obj[]).map((e) => [e.event, e.balance])).toEqual([
+      ['claim', { currency: 'XAH', value: '0.015838' }],
+      ['create', { currency: 'XAH', value: '0' }],
+    ]);
+    expect((xah.history as Obj[])[0].balance_change).toEqual({ currency: 'XAH', value: '0.015838' });
+
+    // a check cashed with a DeliverMin: the cash delivered what the metadata says
+    const check = (await api.ok(`/v2/checks/${XAH_CHECK}`, 'check')).body as Obj;
+    expect(check.coverage).toEqual({ from_ledger_index: FIRST, complete: true });
+    expectKeysInOrder(check.check as Obj, CHECK_KEYS);
+    expect(check.check).toMatchObject({
+      send_max: { currency: 'XAH', value: '1' },
+      delivered: { currency: 'XAH', value: '1' },
+      status: 'cashed',
+      created: { ledger_index: 12_064_511 },
+      removed: { ledger_index: 12_064_524, tx_type: 'CheckCash' },
+    });
+    expect((check.history as Obj[]).map((e) => e.event)).toEqual(['cash', 'create']);
+    // a token check whose creation is older than the index
+    const token = (await api.ok(`/v2/checks/${TOKEN_CHECK}`, 'check')).body as Obj;
+    expect(token.coverage).toEqual({ from_ledger_index: FIRST, complete: false });
+    expect(token.check).toMatchObject({
+      send_max: { currency: 'EVR', issuer: 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8', value: '0.001' },
+      delivered: { currency: 'EVR', issuer: 'rEvernodee8dJLaFsujS6q1EiXvZYmHXr8', value: '0.001' },
+      status: 'cashed',
+    });
   });
 });

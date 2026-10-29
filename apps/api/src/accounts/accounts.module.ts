@@ -48,7 +48,7 @@ import { TrustLinesService } from './trust-lines.service';
  * lines of an account at a ledger from the state history, `GET /v2/accounts/:address/trustlines` (its read,
  * `TrustLinesService`, gives `/balances` its trust lines at a historical ledger too), and the NFT routes of an account,
  * `GET /v2/accounts/:address/{nfts,nft_history}` (read by the `NftAccountsService` of `NftModule`), and the escrow of an account by its
- * sequence, `GET /v2/accounts/:address/escrows/:sequence` (read by the `LedgerObjectsService` of `LedgerObjectsModule`).
+ * sequence, `GET /v2/accounts/:address/escrows/:sequence` (answered by the `ObjectAnswers` of `LedgerObjectsModule`).
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added

@@ -47,7 +47,13 @@ export interface ObjectDetail {
   asOf: AsOf;
   rows: ObjectRead[];
   created?: ObjectRead;
-  counts?: { funds: number; claims: number };
+  counts?: ChannelCounts;
+}
+
+/** The `funds` and `claims` of a payment channel: the events that added to it, and the events that moved its `Balance`. */
+export interface ChannelCounts {
+  funds: number;
+  claims: number;
 }
 
 /** One page of the history of an object, in the order asked for, with the row that created it when the index has it. */
@@ -115,8 +121,9 @@ const OBJECT_PREFIX = 'object_type = {type:String} AND object_id = {id:String} A
  *
  *  - **The detail** reads the newest `DETAIL_EVENTS + 1` rows of the object (a page of `readDistinctPage`, newest first). No
  *    row is the 404. The creation is the page's row of `created`, else, when the page is full (the object has older events),
- *    the newest row of the object's prefix with `action = 'created'`; a page that is not full holds the whole history, so
- *    there is no creation to look for.
+ *    the first row of the object's prefix with `action = 'created'`; a page that is not full holds the whole history, so
+ *    there is no creation to look for. A payment channel's detail also reads its counts (`funds`, `claims`): one read of
+ *    the channel's prefix beside the page.
  *  - **The history** reads, side by side, the page (limit + 1 rows in the order asked for, after the marker), the creation
  *    and, with a marker, one row of the object's prefix: no row at all is the 404, while a page past the end of an object
  *    that has rows is `count: 0`. Without a marker an empty page is already the 404.
@@ -130,16 +137,25 @@ export class LedgerObjectsService {
     private readonly ranges: LedgerRangeResolver,
   ) {}
 
-  /** The newest rows of the object and its creation. Throws the 404 of the kind when the object has no row up to the head. */
+  /**
+   * The newest rows of the object and its creation, and for a payment channel its counts. Throws the 404 of the kind when the
+   * object has no row up to the head.
+   */
+  detail(kind: 'payment_channel', id: string): Promise<ObjectDetail & { counts: ChannelCounts }>;
+  detail(kind: ObjectKind, id: string): Promise<ObjectDetail>;
   async detail(kind: ObjectKind, id: string): Promise<ObjectDetail> {
     const asOf = await this.head(kind);
     const type = OBJECT_TYPE_OF[kind];
-    const rows = await this.page(type, id, asOf, { descending: true, limit: DETAIL_EVENTS + 1 });
+    // the counts read runs beside the page: both are the object's prefix, and an object with no row is the 404 whatever they say
+    const [rows, counts] = await Promise.all([
+      this.page(type, id, asOf, { descending: true, limit: DETAIL_EVENTS + 1 }),
+      kind === 'payment_channel' ? this.counts(id, asOf) : undefined,
+    ]);
     if (rows.length === 0) throw notFound(NOT_FOUND_OF[kind]);
     const created =
       rows.find((row) => row.action === 'created') ??
       (rows.length > DETAIL_EVENTS ? await this.creation(type, id, asOf) : undefined);
-    return { asOf, rows, ...(created !== undefined && { created }) };
+    return { asOf, rows, ...(created !== undefined && { created }), ...(counts !== undefined && { counts }) };
   }
 
   /** One page of the history. Throws 400 `invalid marker` for a marker that is none of ours, and the 404 of the kind for an object with no row. */
@@ -199,19 +215,38 @@ export class LedgerObjectsService {
   }
 
   /**
-   * The newest row of the object's prefix that created it: an object has one creation (its id is made of a sequence nobody
-   * uses twice), so this is the oldest too. The read is the prefix of the object and nothing else.
+   * The row that created the object: an object has one creation (its id is made of a sequence nobody uses twice), and it is
+   * the first row the index holds of it. The read therefore goes from the start of the object's prefix and stops at the first
+   * `created` row, which a long-lived channel has in its first granule; the other way round it would walk the whole prefix (every
+   * event of the object up to the head) on every call. The read is the prefix of the object and nothing else.
    */
   private async creation(type: TrackedObjectType, id: string, asOf: AsOf): Promise<ObjectRead | undefined> {
     const [row] = await this.ch.query<StoredRow>(
       `SELECT ${COLUMNS}
          FROM ${Table.ObjectChanges}
         WHERE ${OBJECT_PREFIX} AND action = 'created'
-        ORDER BY ${OBJECT_ORDER.map((c) => `${c} DESC`).join(', ')}
+        ORDER BY ${OBJECT_ORDER.join(', ')}
         LIMIT 1`,
       { type, id, H: asOf.ledger_index },
     );
     return row === undefined ? undefined : readOf(row);
+  }
+
+  /**
+   * The counts of a payment channel, one read of the channel's prefix with each transaction once (a row stored twice counts once):
+   * `funds` are the `fund` events and `claims` the events whose `previous` holds a `Balance`, that is the events that moved it.
+   * A channel's first claim is one, as its previous balance is "0" on both networks, while a created node may have no `Balance`.
+   */
+  private async counts(id: string, asOf: AsOf): Promise<ChannelCounts> {
+    const [row] = await this.ch.query<{ funds: string; claims: string }>(
+      `SELECT countIf(event = 'fund') AS funds, countIf(JSONHas(previous, 'Balance')) AS claims
+         FROM (SELECT event, previous FROM ${Table.ObjectChanges}
+                WHERE ${OBJECT_PREFIX}
+                ORDER BY ${OBJECT_ORDER.join(', ')}
+                LIMIT 1 BY ledger_index, tx_index)`,
+      { type: OBJECT_TYPE_OF.payment_channel, id, H: asOf.ledger_index },
+    );
+    return { funds: Number(row?.funds ?? 0), claims: Number(row?.claims ?? 0) };
   }
 
   /** Whether the object has a row up to the head: one row of its prefix. */
