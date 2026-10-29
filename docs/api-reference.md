@@ -14,7 +14,7 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
 [Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [NFTs](#nfts) · [Account names and tomls](#account-names-and-tomls) ·
-[Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
+[Ledger objects](#ledger-objects) · [Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
 [Operational endpoints](#operational-endpoints)
 
 ---
@@ -204,8 +204,8 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 
 ### Coverage
 
-A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (today the
-[NFTs](#nfts); later features of the same program register with the same service and add no rule of their own) put
+A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (the
+[NFTs](#nfts) and the [ledger objects](#ledger-objects); later features of the same program register with the same service and add no rule of their own) put
 
 ```json
 "coverage": { "from_ledger_index": 107874617, "complete": false }
@@ -222,16 +222,20 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
     [`GET /v2/network/amendments/{name}`](#get-v2networkamendmentsname) reports it (`enabled.ledger_index`): the `EnableAmendment` transaction
     the index holds, and on a mainnet the amendment metadata file when it holds none. The API reports an enabling ledger only for an amendment that the
     node's ledger state lists as enabled, which the syncer's `validators` worker polls. The ledger is never a constant of the code. NFTs are
-    `NonFungibleTokensV1_1` on the XRP Ledger (ledger 75,443,457) and `URIToken` on Xahau (ledger 1, its genesis). Where no enabling ledger is
-    known, `complete` is false.
+    `NonFungibleTokensV1_1` on the XRP Ledger (ledger 75,443,457) and `URIToken` on Xahau (ledger 1, its genesis). Escrows, payment channels and
+    checks are `Escrow`, `PayChan` and `Checks` on the XRP Ledger (ledger 28,685,313 for the first two, 56,219,905 for the checks) and delegations
+    are `PermissionDelegationV1_1` (ledger 107,524,865); `Escrow` and `PayChan` are retired amendments, so the API knows their enabling ledger only
+    while the node's ledger state lists them. Where no enabling ledger is known, `complete` is false.
   - A feature **as old as the network**, with no amendment, starts at the network's first ledger: **32,570** on the XRP
-    Ledger and **1** on Xahau, its genesis, so complete coverage on Xahau needs ledger 1 indexed (`range-ingest --from 1`).
+    Ledger and **1** on Xahau, its genesis, so complete coverage on Xahau needs ledger 1 indexed (`range-ingest --from 1`). The escrows, payment
+    channels and checks of Xahau are such features: it has had them since its genesis, and its coverage starts at ledger 1.
   - **The testnets** have no first ledger (their index starts at the validated head of their deployment's first boot and is dropped when the
     network is reset) and ignore the enable ledgers of the metadata file, which are mainnet's: a feature as old as the network is always
     `complete: false` there, and a feature of an amendment only when the index holds the amendment's `EnableAmendment`. They are not
     backfilled.
-  - A feature **a network cannot have** is `complete: true` (nothing can be missing) and its routes read no table.
-- **One item.** The detail of one item (an NFT, with its history and offers) states its own coverage: the feature's, and complete also when the
+  - A feature **a network cannot have** is `complete: true` (nothing can be missing) and its routes read no table: the delegations of Xahau and
+    Xahau Testnet, which have no permission delegation.
+- **One item.** The detail of one item (an NFT, with its history and offers; an escrow, with its history) states its own coverage: the feature's, and complete also when the
   item's creation is indexed (its mint is at or above `from_ledger_index`), whatever came before it.
 - **Freshness.** A feature's coverage is kept for 60 seconds. A read of it that fails fails the route with the route's own 500 message, and no
   `complete: false` is invented in its place.
@@ -241,7 +245,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
   carry none.
 
 Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
-does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5.
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, and the parser of the ledger objects is version 7.
 
 ### Compatibility
 
@@ -290,6 +294,11 @@ From the display names ([ADR-0017](adr/0017-display-names.md), [ADR-0010](adr/00
 [Account names and tomls](#account-names-and-tomls), `GET /v2/account_names` (the display names of up to 100 addresses in one call, with their domains and
 labels; the key of the labels is `labels` where `GET /v2/accounts/{address}` says `account_labels`) and `GET /v2/toml/{domain}` (what the toml of a domain says,
 as the syncer last read it). No route of the original changes.
+
+From the ledger objects ([ADR-0018](adr/0018-ledger-object-history.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 7): the nine routes of
+[Ledger objects](#ledger-objects), `GET /v2/escrows/{id}`, `/v2/checks/{id}` and `/v2/payment_channels/{id}`, each with its `/history`,
+`GET /v2/ledger_objects/{id}`, `GET /v2/accounts/{address}/escrows/{sequence}` and `GET /v2/accounts/{address}/delegations`, and the `coverage`
+field that their answers carry (all but `GET /v2/ledger_objects/{id}`, a lookup). The original's lists of an account's escrows and channels are still out of scope (below).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -807,9 +816,10 @@ address errors, `invalid date format`, `must not be a future date`; 500 `unable 
 ## Accounts
 
 The `{address}` of the account routes is **not validated** (as in the original) except where a route says otherwise
-(`/balances`, `/orders`, `/trustlines`): an address that does not exist simply has no rows. All account lists take the common window
+(`/balances`, `/orders`, `/trustlines`, `/escrows/{sequence}`): an address that does not exist simply has no rows. All account lists take the common window
 parameters `start` (`2013-01-01` unless stated), `end`, `descending`, `limit` and `marker`. The path payments of an account are
-described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments).
+described with the others, under [`GET /v2/accounts/{address}/path_payments`](#get-v2accountsaddresspath_payments), and the escrow of an account by its
+sequence with the other escrow routes, under [`GET /v2/accounts/{address}/escrows/{sequence}`](#get-v2accountsaddressescrowssequence).
 
 ### `GET /v2/accounts`
 
@@ -3599,6 +3609,281 @@ What the fields say:
   `failed` with no content. Write such a number as text or as a float.
 
 **Differences from data.ripple.com**: none, the endpoint is new ([ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) items 79 to 83).
+
+---
+
+## Ledger objects
+
+GateHub extras: the original served no object of the ledger by its ID. These endpoints serve **escrows**, **checks**, **payment channels** and the
+**delegations** of an account, each with the history of the transactions that changed it: what it was when it was created, what every
+transaction since did to it, and what it is now (its `status`). The design is in the
+[spec](superpowers/specs/2026-10-24-ledger-objects-delegation-design.md) and [ADR-0018](adr/0018-ledger-object-history.md); the rows are in
+[data-model](data-model.md).
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these
+rules for the objects, whose shape and key order are ours and are pinned by tests:
+
+- **Coverage.** Every answer carries `coverage`, the key right after `result`, and it is not in the CSV: whether the history the answer is
+  read from is whole ([Coverage](#coverage)). The detail and the history of one object state its own: complete when the object's creation is
+  indexed. The data of a network are the ledgers written by parser version 7 or later: **an object created before the first of them has a
+  history that starts in the middle**, no `created`, and `complete` says so. An object that was created before that and has not been touched
+  since is not in the index at all: its route answers 404.
+- **As of.** After `coverage`, every answer has `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`): the newest committed ledger and when it
+  closed. The state of the object, its `history` and its `status` are as of that ledger, and `status` is worked out at that close time `T`
+  (rippled tests a transaction against the close time of the ledger before it, which is `T` for the next ledger). With no committed ledger the
+  answer is the 404 of the route.
+- **IDs and times.** An object ID is 64 hexadecimal digits, upper-case in every answer; the routes accept any case. Times (`finish_after`,
+  `cancel_after`, `expiration`, `time`) are `YYYY-MM-DDTHH:mm:ssZ`, converted from the ledger's own seconds.
+- **Amounts** are objects `{ "currency", "issuer"?, "value" }`: the native currency's code (`XRP`, `XAH`) with no issuer and its value in whole
+  units (drops divided by 1,000,000, exact decimal text); an issued token as on the ledger (the currency code as written there, 3 letters or 40
+  hex digits, its issuer, and the `value` text of the ledger); a multi-purpose token as `{ "currency": "<issuance ID>", "issuer", "value",
+  "mpt_issuance_id" }`, the 48 upper-case hex digits of the issuance ID in `currency` and again as the last key, the issuer read from the ID and
+  the `value` the raw integer units, never scaled. **This is the data API's MPT amount object**; the scale and the ticker of a token are not
+  in an amount. A key an object has no value for is left out, never `null`.
+- **History** is the transactions that changed the object (a failed attempt that touched nothing is not in it), each an **event**: what
+  happened (`event`), the ledger and time, the transaction (`tx_hash`, `tx_type`, `result`), the `account` that sent it, the `delegate` that
+  sent it for the account when there is one, then the facts of its type. The detail of an object embeds its **newest 50 events, newest first**,
+  and `history_marker` when there are more: it continues at `/{id}/history?descending=true&marker=…`. A marker works for one route and one
+  direction.
+- **History routes** take `descending` (default false: oldest first), `limit` (200, maximum 1000), `marker` (`(ledger_index, tx_index)` of the
+  last event of the page) and `format=csv`, and send the `Link` header; an unknown parameter is ignored. A page past the end of an object that
+  has events is `count: 0`; an object with none is 404. The CSV has one row for each event and **the same columns on every page** whatever
+  the events of the page hold: the keys of an event in order, then those of its type, an amount's keys joined to its name with a dot
+  (`amount.currency`, `amount.issuer`, `amount.value`, `amount.mpt_issuance_id`), a key the event has no value for an empty cell.
+- **Reads** are of the committed ledgers only, from the rows the syncer wrote, each bounded by the object (its type and ID) and the ledger of
+  the answer: the cost of an answer does not grow with the history of the network.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`. 401 and 429 are the usual ones.
+
+**Status.** `T` is the `close_time` of the answer. An object that is still in the ledger has a status that depends on the time; a deleted one
+has the status of the event that deleted it.
+
+| Object | Status |
+| --- | --- |
+| Escrow, in the ledger | `can_be_cancelled` if it has `cancel_after` and `T` is after it; else `pending` if it has `finish_after` and `T` is not after it; else `can_be_finished` (a conditional escrow without `finish_after` can be finished from its creation) |
+| Escrow, deleted | `finished` (by `EscrowFinish`), `cancelled` (by `EscrowCancel`) or `removed` (any other transaction) |
+| Check, in the ledger | `expired` if it has `expiration` and `T` is at or after it, else `open` |
+| Check, deleted | `cashed` (by `CheckCash`), `cancelled` (by `CheckCancel`) or `removed` |
+| Payment channel, in the ledger | `closing` if it has an `expiration`, or a `cancel_after` that `T` has reached; else `open` |
+| Payment channel, deleted | `closed` (by a claim that closed it) or `removed` |
+
+**The examples** are real answers over the recorded mainnet ledgers that the end-to-end suites seed (22 ledgers of the XRP Ledger, 102,145,584
+to 107,972,102, around escrows, checks, payment channels and delegations): the `close_time` is that of the newest of them, which is the time
+a `status` such as `can_be_cancelled` is worked out at, and the first of them is where the `coverage` starts.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer. Each line is checked against the
+constant the route is served by (`apps/api/src/ledger-objects/api-reference.spec.ts`).
+
+Keys of the coverage, in order: `from_ledger_index?, complete`.
+
+Keys of an amount, in order: `currency, issuer?, value, mpt_issuance_id?`.
+
+Keys of an event, in order: `event, ledger_index, time, tx_hash, tx_type, account, delegate?, result`.
+
+Keys of the extras of an escrow event, in order: `amount?, fulfillment?`.
+
+Keys of created, in order: `ledger_index, time, tx_hash`.
+
+Keys of removed, in order: `ledger_index, time, tx_hash, tx_type`.
+
+Keys of an escrow, in order: `escrow_id, account, sequence?, destination, amount?, finish_after?, cancel_after?, condition?, fulfillment?, destination_tag?, source_tag?, transfer_rate?, status, created?, removed?`.
+
+Keys of the escrow answer, in order: `result, coverage, ledger_index, close_time, escrow, history, history_marker?`.
+
+Keys of the history answer, in order: `result, coverage, ledger_index, close_time, count, marker?, history`.
+
+### `GET /v2/escrows/{escrow_id}`
+
+One escrow as of the newest committed ledger, with its newest 50 events.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `escrow_id` (path) | | The 64 hex digits of the escrow's ID, in any case. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "escrow": {…}, "history": [Event, …], "history_marker": "…" }`.
+The escrow:
+
+- `account` is the owner (the account that created it) and `destination` the account that receives the amount; they are the same account for
+  an escrow to oneself. `sequence` is the escrow's own `Sequence`, else the sequence of the transaction that created it (a ticket's, for an
+  escrow made with a ticket); it is what makes the ID (see below), and is left out when no indexed row says it.
+- `amount` is the escrowed amount: XRP or XAH, an issued token, or (on the XRP Ledger, with the TokenEscrow amendment) a multi-purpose token,
+  as an [amount](#ledger-objects). `transfer_rate` is the ledger's number for a token escrow (`1000000000` is no fee).
+- `finish_after` and `cancel_after` are the two times of a timed escrow, `condition` the hex of the crypto-condition of a conditional one, and
+  `destination_tag` and `source_tag` the tags of the creating transaction; each is left out when the escrow has none.
+- `fulfillment` is the fulfillment of the transaction that finished a conditional escrow, once it is finished.
+- `status` is one of `pending`, `can_be_finished`, `can_be_cancelled`, `finished`, `cancelled`, `removed` (the table above).
+- `created` is `{ ledger_index, time, tx_hash }` of the transaction that created it, when that transaction is indexed (it is not for an
+  escrow created before the index starts), and `removed` is `{ ledger_index, time, tx_hash, tx_type }` of the transaction that deleted it,
+  once it is deleted.
+
+An event of an escrow has `event`: `create`, `finish`, `cancel`, `removed` (deleted by another transaction) or `update` (changed by a
+transaction no one expects), and adds `amount` to a `create` and `fulfillment` to a `finish`. `GET /v2/escrows/B95064B1A92F02EE009E6BDFB369CF476FB925BB8615456970E38774034A5D30`, a timed escrow of 0.5 XRP that is past its `cancel_after`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "escrow": {
+    "escrow_id": "B95064B1A92F02EE009E6BDFB369CF476FB925BB8615456970E38774034A5D30",
+    "account": "rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V",
+    "sequence": 107896555,
+    "destination": "rGtW2dWHmHQ3f65pfbjYF5PbFbdZwgwuqW",
+    "amount": { "currency": "XRP", "value": "0.5" },
+    "finish_after": "2026-10-25T16:50:01Z",
+    "cancel_after": "2026-10-25T17:49:01Z",
+    "source_tag": 2610250016,
+    "status": "can_be_cancelled",
+    "created": {
+      "ledger_index": 107897249,
+      "time": "2026-10-25T16:49:20Z",
+      "tx_hash": "BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53"
+    }
+  },
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107897249,
+      "time": "2026-10-25T16:49:20Z",
+      "tx_hash": "BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53",
+      "tx_type": "EscrowCreate",
+      "account": "rNeJW71pMjKy42j5jn7vnWZAbmuU6SKs6V",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRP", "value": "0.5" }
+    }
+  ]
+}
+```
+
+A finished escrow keeps its last state, its `removed`, and the events that made it: this 75,000 XRB escrow, created by its owner and finished by a
+bot (the `account` of the `finish` event is the sender of the transaction, not the owner). Its `status` no longer depends on the time:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "escrow": {
+    "escrow_id": "FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4",
+    "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+    "sequence": 107945427,
+    "destination": "rHiwfnKJCwNePaTj8HmEYCx8G5NCsSEJSt",
+    "amount": { "currency": "XRB", "issuer": "rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa", "value": "75000" },
+    "finish_after": "2026-10-28T22:14:47Z",
+    "status": "finished",
+    "created": {
+      "ledger_index": 107945438,
+      "time": "2026-10-27T22:14:51Z",
+      "tx_hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C"
+    },
+    "removed": {
+      "ledger_index": 107967068,
+      "time": "2026-10-28T22:14:51Z",
+      "tx_hash": "375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA",
+      "tx_type": "EscrowFinish"
+    }
+  },
+  "history": [
+    {
+      "event": "finish",
+      "ledger_index": 107967068,
+      "time": "2026-10-28T22:14:51Z",
+      "tx_hash": "375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA",
+      "tx_type": "EscrowFinish",
+      "account": "rPw6JAdM9BGwH4y4LxJQBDybaGNhFLCspU",
+      "result": "tesSUCCESS"
+    },
+    {
+      "event": "create",
+      "ledger_index": 107945438,
+      "time": "2026-10-27T22:14:51Z",
+      "tx_hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C",
+      "tx_type": "EscrowCreate",
+      "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRB", "issuer": "rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa", "value": "75000" }
+    }
+  ]
+}
+```
+
+**Coverage.** The `coverage` of an escrow is the feature's `escrows` ([Coverage](#coverage)): the Escrow amendment's enable ledger (28,685,313 on
+the XRP Ledger, **when the ledger state lists the amendment**: Escrow is retired, and the API reports an enabling ledger only for an amendment
+the node's ledger state lists) or, on Xahau, which has had escrows since its genesis, its first ledger (1). It is the escrow's own when the
+escrow's creation is indexed. An escrow created before the index starts and finished after it (`8993DA09444641A6BDA272A292157A0E8AF79F040AA4E551C48257F493228455`
+is one, in the recorded ledgers) has `"complete": false` and no `created`; one created before it and not touched since is a 404. On a testnet
+`escrows` is complete only when the index holds the amendment's `EnableAmendment` and the history starts at or before it.
+
+Errors, in the order they are checked: 400 `invalid escrow id`; 404 `escrow not found`; 500 `unable to retrieve escrow`.
+
+### `GET /v2/escrows/{escrow_id}/history`
+
+The events of one escrow, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `escrow_id` (path) | | The 64 hex digits, in any case. |
+| `descending` | false | Newest first. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | `(ledger_index, tx_index)` of the last event. |
+| `format` | json | `csv`: file `<escrow_id> - escrow history.csv` (the ID upper-case), every column of the event. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "history": [Event, …] }`. The events are
+those of the detail, from the first or the last, with the `coverage` of the escrow; `marker` is the key of the last event of the page and is left
+out of the last page. `GET /v2/escrows/FA8631A0C654F964699C8B9A1277DA0C3F62D034190E62062F2D662A9D23C1B4/history?limit=1`:
+
+```json
+{
+  "result": "success",
+  "coverage": { "from_ledger_index": 102145584, "complete": true },
+  "ledger_index": 107972102,
+  "close_time": "2026-10-29T03:50:41Z",
+  "count": 1,
+  "marker": "WzEwNzk0NTQzOCw5OF0",
+  "history": [
+    {
+      "event": "create",
+      "ledger_index": 107945438,
+      "time": "2026-10-27T22:14:51Z",
+      "tx_hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C",
+      "tx_type": "EscrowCreate",
+      "account": "rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm",
+      "result": "tesSUCCESS",
+      "amount": { "currency": "XRB", "issuer": "rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa", "value": "75000" }
+    }
+  ]
+}
+```
+
+With `format=csv` the same escrow, newest first, is (`descending=true`):
+
+```text
+"event","ledger_index","time","tx_hash","tx_type","account","delegate","result","amount.currency","amount.issuer","amount.value","amount.mpt_issuance_id","fulfillment"
+"finish","107967068","2026-10-28T22:14:51Z","375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA","EscrowFinish","rPw6JAdM9BGwH4y4LxJQBDybaGNhFLCspU","","tesSUCCESS","","","","",""
+"create","107945438","2026-10-27T22:14:51Z","3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C","EscrowCreate","rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm","","tesSUCCESS","XRB","rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa","75000","",""
+```
+
+Errors, in the order they are checked: 400 `invalid escrow id`, `invalid marker`; 404 `escrow not found` (an escrow with no event, also for a
+`marker`); 500 `unable to retrieve escrow history`.
+
+### `GET /v2/accounts/{address}/escrows/{sequence}`
+
+The escrow an account created with a given sequence, answered **exactly as `GET /v2/escrows/{escrow_id}`** answers its ID, which is worked out from
+the owner and the sequence (a hash of the two, so no read comes before it). `sequence` is the `Sequence` of the `EscrowCreate` or, for one sent
+with a ticket, its `TicketSequence`.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `address` (path) | | The owner: a classic address (an X-address is no address here). |
+| `sequence` (path) | | Digits, at most 4294967295. |
+
+Unlike the other routes under an account, the address is checked, as it is part of the ID. Errors, in the order they are checked: 400 `invalid ripple
+address`, `invalid sequence number` (the messages of [`GET /v2/accounts/{address}/transactions/{sequence}`](#get-v2accountsaddresstransactionssequence));
+404 `escrow not found`; 500 `unable to retrieve escrow`.
+
+**Differences from data.ripple.com**: none, the endpoints are new. The original's `GET /v2/accounts/{address}/escrows` (the list of an account) is
+not served and answers 404 ([Compatibility](#compatibility)).
 
 ---
 

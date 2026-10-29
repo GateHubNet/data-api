@@ -33,6 +33,8 @@ export const XRPL_ACCOUNT_STATE_DIR = join(FIXTURES, 'xrpl', 'account-state');
 export const XRPL_PATH_PAYMENTS_DIR = join(FIXTURES, 'xrpl', 'path-payments');
 /** Mainnet ledgers recorded around NFToken transactions (mints, offers, sales, burns, a modify): see the fixtures README. */
 export const XRPL_NFT_DIR = join(FIXTURES, 'xrpl', 'nft');
+/** Mainnet ledgers recorded around escrows, checks, payment channels and delegations (D5, Task 1): see its `FINDINGS.md`. */
+export const XRPL_OBJECTS_DIR = join(FIXTURES, 'xrpl', 'objects');
 export const XAHAU_RECORDED_DIR = join(FIXTURES, 'xahau', 'recorded');
 /** Xahau ledgers recorded around URIToken transactions (mints, sell offers, a buy, a burn, a Remit): see the fixtures README. */
 export const XAHAU_URITOKEN_DIR = join(FIXTURES, 'xahau', 'uritoken');
@@ -43,6 +45,8 @@ export const XAHAU_TESTNET_RECORDED_DIR = join(FIXTURES, 'xahau-testnet', 'recor
 /** Xahau flag ledger 26570752: 22 UNLReport pseudo-transactions with `Account: ""`, and 15 Payments. */
 export const XAHAU_FLAG_DIR = join(FIXTURES, 'xahau', 'flag');
 export const XAHAU_FLAG_LEDGER = 26570752;
+/** Xahau ledgers recorded around escrows, checks and payment channels, XAH and issued-token ones (D5, Task 1): see its `FINDINGS.md`. */
+export const XAHAU_OBJECTS_DIR = join(FIXTURES, 'xahau', 'objects');
 
 /**
  * The fixture sets the API tests seed. `xrpl-amm` is the AMM ledgers alone (16 ledgers from 93663334 on: 39 order-book
@@ -57,9 +61,11 @@ export type SeedName =
   | 'xrpl-account-state'
   | 'xrpl-path-payments'
   | 'xrpl-nft'
+  | 'xrpl-objects'
   | 'xahau-recorded'
   | 'xahau-uritoken'
   | 'xahau-flag'
+  | 'xahau-objects'
   | 'xrpl-testnet-recorded'
   | 'xahau-testnet-recorded';
 
@@ -71,9 +77,11 @@ const DIRS: Record<SeedName, string[]> = {
   'xrpl-account-state': [XRPL_ACCOUNT_STATE_DIR],
   'xrpl-path-payments': [XRPL_PATH_PAYMENTS_DIR],
   'xrpl-nft': [XRPL_NFT_DIR],
+  'xrpl-objects': [XRPL_OBJECTS_DIR],
   'xahau-recorded': [XAHAU_RECORDED_DIR],
   'xahau-uritoken': [XAHAU_URITOKEN_DIR],
   'xahau-flag': [XAHAU_FLAG_DIR],
+  'xahau-objects': [XAHAU_OBJECTS_DIR],
   'xrpl-testnet-recorded': [XRPL_TESTNET_RECORDED_DIR],
   'xahau-testnet-recorded': [XAHAU_TESTNET_RECORDED_DIR],
 };
@@ -99,9 +107,11 @@ export const SEED_NETWORK: Record<SeedName, NetworkName> = {
   'xrpl-account-state': 'xrpl',
   'xrpl-path-payments': 'xrpl',
   'xrpl-nft': 'xrpl',
+  'xrpl-objects': 'xrpl',
   'xahau-recorded': 'xahau',
   'xahau-uritoken': 'xahau',
   'xahau-flag': 'xahau',
+  'xahau-objects': 'xahau',
   'xrpl-testnet-recorded': 'xrpl-testnet',
   'xahau-testnet-recorded': 'xahau-testnet',
 };

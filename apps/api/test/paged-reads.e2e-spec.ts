@@ -4,6 +4,7 @@ import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { accountAt, primaryKeys, served } from './support/amm';
 import { fixtureTransactions } from './support/fixtures';
 import { insertNftEvents, nftEventRow } from './support/nfts';
+import { COUNTERPARTY, insertObjects, jsonOf, objectRow, OWNER } from './support/objects';
 import { expectBoundedInOrderRead, explain, innerRead, isPageRead, tableReads } from './support/plans';
 import {
   BULK_BASES,
@@ -1895,6 +1896,185 @@ describe('the sales of the network and the history of an account read the granul
           wantKeys([MID_EVENT_LEDGER, 1, 0], descending, 200, eventsStart, eventsEnd, ([, tx]) => tx === 3),
         );
       });
+    });
+  });
+});
+
+describe('the detail and the history of an escrow read the granules of a page and the rows of the escrow, not the 810,000 rows of the table (read_rows over a bulk of four parts)', () => {
+  // The rows of an object are a range of the primary key of `object_changes` (its type and id, then its ledgers):
+  // `readDistinctPage` reads that range in the order of the key and stops after the page, and the creation is a read of the same
+  // range. The escrow has 10,000 events, 2,500 in each of four parts, and its creation in a part of its own. Two other escrows, one
+  // that sorts before it and one after it, have 100,000 rows in each of four parts of their own, in the same partition: a read that
+  // did not use the key (or the limit, or the object) would read the 810,000 rows of the table.
+  const ESCROW = '5'.repeat(64);
+  const BEFORE = '4'.repeat(64);
+  const AFTER = '6'.repeat(64);
+  const TEMPLATE = '3'.repeat(64);
+  const EVENTS_PER_PART = 2_500;
+  const OTHERS_PER_PART = 100_000;
+  const GRANULE = 8192;
+  /** The parts that hold rows of the escrow: the four of the bulk and the one with its creation. */
+  const PARTS = BULK_BASES.length + 1;
+  const ESCROW_ROWS = BULK_BASES.length * EVENTS_PER_PART + 1;
+  /** The rows the bulk and the two made by hand add to the table; the rows of the mock ledgers come with the seed. */
+  const ADDED_ROWS = BULK_BASES.length * (EVENTS_PER_PART + 2 * OTHERS_PER_PART) + 2;
+  /** A page touches about a granule of each part that holds the escrow, and one more for the part's partial granule. */
+  const PAGE_BOUND = (PARTS + 1) * GRANULE;
+  /** The creation (and the existence read) reads the prefix of the escrow and nothing else: its rows and two granules a part. */
+  const PREFIX_BOUND = ESCROW_ROWS + 2 * GRANULE * PARTS;
+  /** The creation of the escrow, below the bulk. */
+  const CREATED_LEDGER = 20_999_500;
+  /** The middle of the escrow's events in the second part: a marker there makes the page start inside the bulk. */
+  const MID_LEDGER = BULK_BASES[1] + Math.floor(EVENTS_PER_PART / 8);
+
+  let h: Harness;
+  let api: ApiClient;
+  /** The rows of the table before the bulk: the object rows of the mock ledgers (an escrow and two channel claims). */
+  let seeded: number;
+
+  /** The reads of a request on `object_changes`, told apart by what they read. */
+  function readsByKind(reads: LoggedRead[]) {
+    return {
+      page: reads.filter((r) => r.query.includes('AS distinct_page_read')),
+      creation: reads.filter((r) => r.query.includes("action = 'created'")),
+      known: reads.filter((r) => r.query.startsWith('SELECT ledger_index FROM')),
+    };
+  }
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'ripple-mock', env: NO_RATE_LIMIT });
+    api = await h.api();
+    const [before] = await h.ch.query<{ n: string }>(`SELECT count() AS n FROM ${Table.ObjectChanges}`);
+    seeded = Number(before.n);
+    const fields = jsonOf({ Account: OWNER, Amount: '1000000', Destination: COUNTERPARTY, Sequence: 1 });
+    // one real row is the template of the bulk (a change of a made-up escrow, in a ledger between the mock ledgers) and one
+    // is the creation of the escrow under test
+    await insertObjects(h, [
+      objectRow({
+        object_type: 'Escrow',
+        object_id: TEMPLATE,
+        ledger_index: 20_999_000,
+        tx_index: 1,
+        tx_type: 'Payment',
+        action: 'modified',
+        event: 'update',
+        fields,
+      }),
+      objectRow({ object_type: 'Escrow', object_id: ESCROW, ledger_index: CREATED_LEDGER, tx_index: 0, fields }),
+    ]);
+    const template = `SELECT * FROM ${Table.ObjectChanges} WHERE object_id = {template:String} LIMIT 1`;
+    for (const [id, perPart] of [
+      [BEFORE, OTHERS_PER_PART],
+      [ESCROW, EVENTS_PER_PART],
+      [AFTER, OTHERS_PER_PART],
+    ] as const) {
+      await insertBulk(
+        h,
+        Table.ObjectChanges,
+        template,
+        { template: TEMPLATE, id },
+        // the first digit of the escrow in its transaction hash: a page of another escrow's rows would show
+        (base) =>
+          `{id:String} AS object_id, ${bulkLedger(base)} AS ledger_index, ${BULK_TX_INDEX} AS tx_index, ` +
+          `concat('bulk-', substring({id:String}, 1, 1)) AS tx_hash`,
+        perPart,
+      );
+    }
+  }, 600_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  /** The transactions of the events of an answer that are the bulk's: all of them are the escrow's. */
+  const bulkHashes = (events: unknown): string[] =>
+    (events as { tx_hash: string }[]).map((e) => e.tx_hash).filter((hash) => hash.startsWith('bulk-'));
+
+  it('the seed is as assumed: 10,001 rows of the escrow in five parts, among the 800,000 rows of two other escrows', async () => {
+    const [mine] = await h.ch.query<{ n: string; parts: string }>(
+      `SELECT count() AS n, uniqExact(_part) AS parts FROM ${Table.ObjectChanges} WHERE object_id = {id:String}`,
+      { id: ESCROW },
+    );
+    expect([Number(mine.n), Number(mine.parts)]).toEqual([ESCROW_ROWS, PARTS]);
+    const [all] = await h.ch.query<{ n: string; partitions: string }>(
+      `SELECT count() AS n, uniqExact(_partition_id) AS partitions FROM ${Table.ObjectChanges}`,
+    );
+    // the bulk of the other escrows is 800,000 rows (4 x 200,000) in the partition of the escrow
+    expect([Number(all.n), Number(all.partitions)]).toEqual([seeded + ADDED_ROWS, 1]);
+    expect(BULK_ROWS).toBe(800_000);
+    // the bounds are far below the table: a read of the table, or of the type, fails them
+    expect(PAGE_BOUND).toBeLessThan((seeded + ADDED_ROWS) / 8);
+    expect(PREFIX_BOUND).toBeLessThan((seeded + ADDED_ROWS) / 8);
+  });
+
+  it('the detail reads the newest 51 rows (a granule of each part) and the creation (the prefix of the escrow), not the table', async () => {
+    const path = `/v2/escrows/${ESCROW}`;
+    const { reads, body } = await served(h, api, Table.ObjectChanges, path, 'escrow');
+    const kinds = readsByKind(reads);
+    expect([kinds.page.length, kinds.creation.length, kinds.known.length]).toEqual([1, 1, 0]);
+    for (const read of kinds.page)
+      expect([path, read.read_rows <= PAGE_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+    // the creation is older than the newest 51 rows: the prefix is read to find it
+    for (const read of kinds.creation)
+      expect([path, read.read_rows <= PREFIX_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+    // and the answer is whole: the creation was found, the page is the newest 50 of the escrow's rows and a marker for the rest
+    expect((body.escrow as Record<string, unknown>).created).toMatchObject({ ledger_index: CREATED_LEDGER });
+    expect([(body.history as unknown[]).length, body.history_marker === undefined]).toEqual([50, false]);
+    expect(bulkHashes(body.history)).toHaveLength(50);
+  });
+
+  describe.each([false, true])('descending=%s', (descending) => {
+    const pageOf = (limit: number, marker?: (string | number)[]): string =>
+      `/v2/escrows/${ESCROW}/history?limit=${limit}&descending=${descending}${marker === undefined ? '' : `&marker=${markerOf(marker)}`}`;
+
+    it.each([
+      ['the first page', undefined],
+      ['a page that starts inside the bulk', [MID_LEDGER, 1]],
+      ['a page near the start of the range', [BULK_BASES[0] + 100, 2]],
+    ] as const)('a page of 200 events (%s) reads about a granule of each part, and is whole', async (_name, marker) => {
+      const path = pageOf(200, marker as (string | number)[] | undefined);
+      const { reads, body } = await served(h, api, Table.ObjectChanges, path, 'history');
+      const kinds = readsByKind(reads);
+      expect([path, kinds.page.length, kinds.creation.length, kinds.known.length]).toEqual([
+        path,
+        1,
+        1,
+        marker === undefined ? 0 : 1,
+      ]);
+      for (const read of kinds.page)
+        expect([path, read.read_rows <= PAGE_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      // the creation and the existence read are the prefix of the escrow
+      for (const read of [...kinds.creation, ...kinds.known]) {
+        expect([path, read.read_rows <= PREFIX_BOUND ? 'bounded' : read.read_rows]).toEqual([path, 'bounded']);
+      }
+      expect([path, (body.history as unknown[]).length, body.marker === undefined]).toEqual([path, 200, false]);
+      // every event is the escrow's (the other escrows share its ledgers), but its creation
+      expect(bulkHashes(body.history).length).toBeGreaterThanOrEqual(199);
+    });
+
+    it('the page read is read in the order of the key, stops after its rows, and the other reads are the prefix of the escrow', async () => {
+      const path = pageOf(200, [MID_LEDGER, 1]);
+      const { statements } = await served(h, api, Table.ObjectChanges, path, 'history');
+      const page = statements.filter(([sql]) => isPageRead(sql));
+      expect(page).toHaveLength(1);
+      const [sql, params] = page[0];
+      await expectBoundedInOrderRead(h, sql, params, descending, path);
+      expect(sql).not.toMatch(/\bFINAL\b/i);
+      // the primary key narrows the read to the escrow and its ledgers: a few granules out of those of the table
+      const [primary] = primaryKeys(await explain(h, 'indexes = 1', innerRead(sql), params));
+      expect(primary.keys).toEqual(['object_type', 'object_id', 'ledger_index']);
+      expect(primary.condition).toContain(`object_id in ['${ESCROW}'`);
+      expect(primary.granules[0]).toBeLessThan(primary.granules[1] / 4);
+      // the creation and the existence read narrow by the type and the id the same way: the prefix of the escrow
+      const others = statements.filter(([text]) => !isPageRead(text));
+      expect(others).toHaveLength(2);
+      for (const [other, otherParams] of others) {
+        const [narrowed] = primaryKeys(await explain(h, 'indexes = 1', other, otherParams));
+        expect(narrowed.keys.slice(0, 2)).toEqual(['object_type', 'object_id']);
+        expect(narrowed.condition).toContain(`object_id in ['${ESCROW}'`);
+        // (ClickHouse prunes the parts that hold no created row before the primary key looks at a read of the creation)
+        if (!other.includes("action = 'created'")) expect(narrowed.granules[0]).toBeLessThan(narrowed.granules[1] / 4);
+      }
     });
   });
 });

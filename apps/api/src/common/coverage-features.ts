@@ -1,4 +1,4 @@
-import { NetworkProfile, NFT_PARSER_VERSION } from '@gatehub/data-api-shared';
+import { NetworkProfile, NFT_PARSER_VERSION, OBJECT_PARSER_VERSION } from '@gatehub/data-api-shared';
 
 /** Where a feature starts on a network (spec §4). */
 export type FeatureStart =
@@ -18,8 +18,8 @@ export interface CoverageFeature {
 }
 
 /**
- * The features of program 2 whose coverage an answer states, by name. D3 registers `nfts`; D5, D6, D7 and D9 add their
- * entries here and use `FeatureCoverageService`, and define no rule of their own.
+ * The features of program 2 whose coverage an answer states, by name. D3 registers `nfts`, D5 `escrows`, `payment_channels`,
+ * `checks` and `delegations`; D6, D7 and D9 add their entries here and use `FeatureCoverageService`, and define no rule of their own.
  */
 export const COVERAGE_FEATURES = {
   // NFTs are an amendment on both families, by the family and not the network, so a testnet takes its mainnet's
@@ -29,6 +29,29 @@ export const COVERAGE_FEATURES = {
       kind: 'amendment',
       amendment: p.family === 'xahau' ? 'URIToken' : 'NonFungibleTokensV1_1',
     }),
+  },
+  // The ledger objects of D5 (spec 1.4). Xahau has had escrows, payment channels and checks since its genesis, so on the family
+  // they start at the first ledger of the network (no enable ledger is added to the amendment metadata of Xahau). The XRP
+  // Ledger enabled them by amendment: Escrow and PayChan are retired, so the assembly gives them an enable ledger only when
+  // the ledger state lists them, and on a testnet only an indexed one counts. A testnet takes the rule of its family.
+  escrows: {
+    parserVersion: OBJECT_PARSER_VERSION,
+    startOf: (p) => (p.family === 'xahau' ? { kind: 'first_ledger' } : { kind: 'amendment', amendment: 'Escrow' }),
+  },
+  payment_channels: {
+    parserVersion: OBJECT_PARSER_VERSION,
+    startOf: (p) => (p.family === 'xahau' ? { kind: 'first_ledger' } : { kind: 'amendment', amendment: 'PayChan' }),
+  },
+  checks: {
+    parserVersion: OBJECT_PARSER_VERSION,
+    startOf: (p) => (p.family === 'xahau' ? { kind: 'first_ledger' } : { kind: 'amendment', amendment: 'Checks' }),
+  },
+  // Delegation is an amendment of the XRP Ledger family only: Xahau cannot have it, so its delegations are complete and
+  // the route reads no table.
+  delegations: {
+    parserVersion: OBJECT_PARSER_VERSION,
+    startOf: (p) =>
+      p.hasDelegation ? { kind: 'amendment', amendment: 'PermissionDelegationV1_1' } : { kind: 'unavailable' },
   },
 } satisfies Record<string, CoverageFeature>;
 

@@ -1,4 +1,10 @@
-import { ClickHouseService, getNetworkProfile, NetworkName, NFT_PARSER_VERSION } from '@gatehub/data-api-shared';
+import {
+  ClickHouseService,
+  getNetworkProfile,
+  NetworkName,
+  NFT_PARSER_VERSION,
+  OBJECT_PARSER_VERSION,
+} from '@gatehub/data-api-shared';
 import { AmendmentsAssembly, AmendmentView, findAmendment } from '../validators/amendment-status';
 import { AmendmentsService } from '../validators/amendments.service';
 import { CacheService } from './cache.service';
@@ -191,6 +197,101 @@ describe('FeatureCoverageService', () => {
         amendments,
       });
       expect(await allNew.svc.coverage('nfts')).toEqual({ from_ledger_index: NFTS_ENABLED - 3, complete: true });
+    });
+  });
+
+  describe('the features of D5', () => {
+    // Escrow and PayChan are retired amendments: the assembly gives them an `enabled` object only when the ledger lists them
+    // (the metadata file's ledger then), so a test that wants them enabled names the ledger
+    const ESCROW_ENABLED = 28_685_313;
+    const OBJECTS = OBJECT_PARSER_VERSION;
+
+    it('xahau escrows are complete from ledger 1 and xrpl escrows from 28685313', async () => {
+      // Xahau lists neither Escrow nor PayChan: its escrows start at its first ledger, with no amendment read
+      const first = setup({ network: 'xahau', ledgers: startingAt(1, OBJECTS) });
+      expect(await first.svc.coverage('escrows')).toEqual({ from_ledger_index: 1, complete: true });
+      expect(first.amendmentsGet).not.toHaveBeenCalled();
+      const second = setup({ network: 'xahau', ledgers: startingAt(2, OBJECTS) });
+      expect(await second.svc.coverage('escrows')).toEqual({ from_ledger_index: 2, complete: false });
+
+      const amendments = [amendment('Escrow', ESCROW_ENABLED, 'metadata')];
+      const at = setup({ ledgers: startingAt(ESCROW_ENABLED, OBJECTS), amendments });
+      expect(await at.svc.coverage('escrows')).toEqual({ from_ledger_index: ESCROW_ENABLED, complete: true });
+      const after = setup({ ledgers: startingAt(ESCROW_ENABLED + 1, OBJECTS), amendments });
+      expect(await after.svc.coverage('escrows')).toEqual({ from_ledger_index: ESCROW_ENABLED + 1, complete: false });
+    });
+
+    it('an xrpl-testnet escrow is complete false without an indexed EnableAmendment', async () => {
+      const without = setup({
+        network: 'xrpl-testnet',
+        ledgers: startingAt(5, OBJECTS),
+        amendments: [amendment('Escrow')],
+      });
+      expect(await without.svc.coverage('escrows')).toEqual({ from_ledger_index: 5, complete: false });
+      const indexed = setup({
+        network: 'xrpl-testnet',
+        ledgers: startingAt(5, OBJECTS),
+        amendments: [amendment('Escrow', 3, 'ledger')],
+      });
+      expect(await indexed.svc.coverage('escrows')).toEqual({ from_ledger_index: 5, complete: false });
+      const early = setup({
+        network: 'xrpl-testnet',
+        ledgers: startingAt(5, OBJECTS),
+        amendments: [amendment('Escrow', 7, 'ledger')],
+      });
+      expect(await early.svc.coverage('escrows')).toEqual({ from_ledger_index: 5, complete: true });
+    });
+
+    it('a testnet of Xahau is complete false for escrows and complete true for delegations, which it cannot have', async () => {
+      const { svc, amendmentsGet } = setup({ network: 'xahau-testnet', ledgers: startingAt(9, OBJECTS) });
+      expect(await svc.coverage('escrows')).toEqual({ from_ledger_index: 9, complete: false });
+      expect(await svc.coverage('delegations')).toEqual({ from_ledger_index: 9, complete: true });
+      expect(amendmentsGet).not.toHaveBeenCalled();
+      expect(svc.isAvailable('delegations')).toBe(false);
+      expect(svc.isAvailable('escrows')).toBe(true);
+    });
+
+    it('delegations follow PermissionDelegationV1_1 where the network has it, and are complete on Xahau', async () => {
+      const enabled = 107_524_865;
+      const amendments = [amendment('PermissionDelegationV1_1', enabled, 'metadata')];
+      const xrpl = setup({ ledgers: startingAt(enabled, OBJECTS), amendments });
+      expect(await xrpl.svc.coverage('delegations')).toEqual({ from_ledger_index: enabled, complete: true });
+      const later = setup({ ledgers: startingAt(enabled + 1, OBJECTS), amendments });
+      expect(await later.svc.coverage('delegations')).toEqual({ from_ledger_index: enabled + 1, complete: false });
+      const xahau = setup({ network: 'xahau', ledgers: startingAt(8_852_809, OBJECTS) });
+      expect(await xahau.svc.coverage('delegations')).toEqual({ from_ledger_index: 8_852_809, complete: true });
+    });
+
+    it('checks and payment channels follow their amendments', async () => {
+      const checks = setup({ ledgers: startingAt(56_219_905, OBJECTS), amendments: [amendment('Checks', 56_219_905)] });
+      expect(await checks.svc.coverage('checks')).toEqual({ from_ledger_index: 56_219_905, complete: true });
+      const channels = setup({
+        ledgers: startingAt(ESCROW_ENABLED + 1, OBJECTS),
+        amendments: [amendment('PayChan', ESCROW_ENABLED, 'metadata')],
+      });
+      expect(await channels.svc.coverage('payment_channels')).toEqual({
+        from_ledger_index: ESCROW_ENABLED + 1,
+        complete: false,
+      });
+    });
+
+    it('is the parser of the objects that decides where the rows start, not the NFT parser', async () => {
+      // ledgers of the NFT parser (5) but not of the object parser (7) lie below 100: the escrows start above them
+      const { svc } = setup({
+        network: 'xahau',
+        ledgers: [
+          [90, NFT_PARSER_VERSION],
+          [100, OBJECTS],
+        ],
+      });
+      expect(await svc.coverage('escrows')).toEqual({ from_ledger_index: 91, complete: false });
+    });
+
+    it("an escrow created at or above the coverage is complete whatever came before; the feature's is kept", async () => {
+      const { svc } = setup({ network: 'xahau', ledgers: startingAt(2_000, OBJECTS) });
+      expect(await svc.itemCoverage('escrows', 2_000)).toEqual({ from_ledger_index: 2_000, complete: true });
+      expect(await svc.itemCoverage('escrows', 1_999)).toEqual({ from_ledger_index: 2_000, complete: false });
+      expect(await svc.itemCoverage('escrows', undefined)).toEqual({ from_ledger_index: 2_000, complete: false });
     });
   });
 

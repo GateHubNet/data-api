@@ -42,6 +42,7 @@ import {
 import { ExchangesModule } from './exchanges/exchanges.module';
 import { RatesModule } from './exchanges/rates.module';
 import { ExportsModule } from './exports/exports.module';
+import { LedgerObjectsModule } from './ledger-objects/ledger-objects.module';
 import { LedgersModule } from './ledgers/ledgers.module';
 import { LivelinessModule } from './modules/liveliness/liveliness.module';
 import { NamesModule } from './names/names.module';
@@ -99,6 +100,7 @@ const ENDPOINT_MODULES: Type<unknown>[] = [
   NftModule,
   ExportsModule,
   NamesModule,
+  LedgerObjectsModule,
 ];
 
 /** `Cache-Control` for the `/v2` responses that succeed; `RippleErrorFilter` replaces it with `no-store` on an error. */

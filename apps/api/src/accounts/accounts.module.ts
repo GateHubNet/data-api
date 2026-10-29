@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { RatesModule } from '../exchanges/rates.module';
+import { LedgerObjectsModule } from '../ledger-objects/ledger-objects.module';
 import { NamesModule } from '../names/names.module';
 import { NftModule } from '../nft/nft.module';
 import { PathPaymentsModule } from '../path-payments/path-payments.module';
@@ -12,6 +13,7 @@ import { AccountBalanceChangesService } from './account-balance-changes.service'
 import { AccountBalancesController } from './account-balances.controller';
 import { AccountBalancesService } from './account-balances.service';
 import { AccountDayGroupsService } from './account-day-groups.service';
+import { AccountEscrowController } from './account-escrow.controller';
 import { AccountExchangesController } from './account-exchanges.controller';
 import { AccountExchangesService } from './account-exchanges.service';
 import { AccountFlagsService } from './account-flags.service';
@@ -45,14 +47,15 @@ import { TrustLinesService } from './trust-lines.service';
  * `GET /v2/accounts/:address/path_payments` (read by the `PathPaymentsService` of `PathPaymentsModule`), and the trust
  * lines of an account at a ledger from the state history, `GET /v2/accounts/:address/trustlines` (its read,
  * `TrustLinesService`, gives `/balances` its trust lines at a historical ledger too), and the NFT routes of an account,
- * `GET /v2/accounts/:address/{nfts,nft_history}` (read by the `NftAccountsService` of `NftModule`).
+ * `GET /v2/accounts/:address/{nfts,nft_history}` (read by the `NftAccountsService` of `NftModule`), and the escrow of an account by its
+ * sequence, `GET /v2/accounts/:address/escrows/:sequence` (read by the `LedgerObjectsService` of `LedgerObjectsModule`).
  *
  * The routes under an account (`/v2/accounts/:address/balances`, `/transactions`, ...) belong to this module too: each
  * is a controller of its own with `@RippleController('v2/accounts')` and a path that continues after `:address`, added
  * to `controllers` below. `:address` matches one segment only, so these never compete with the lookup.
  */
 @Module({
-  imports: [RatesModule, PathPaymentsModule, NftModule, NamesModule],
+  imports: [RatesModule, PathPaymentsModule, NftModule, NamesModule, LedgerObjectsModule],
   controllers: [
     AccountsController,
     AccountTransactionsController,
@@ -68,6 +71,7 @@ import { TrustLinesService } from './trust-lines.service';
     AccountTrustlinesController,
     AccountPathPaymentsController,
     AccountNftsController,
+    AccountEscrowController,
   ],
   providers: [
     AccountsService,
