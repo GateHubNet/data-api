@@ -796,7 +796,8 @@ routes or the `escrows` option: `013` needs no undo, and a syncer of the previou
 objects are 404 or start in the middle until they are re-ingested).
 
 - **The first fill of `escrows` holds ticks, by design.** With no sentinel the job starts at the ledger before the first committed one and walks to the head in steps of
-  1,000,000 ledgers, each a handful of narrow reads and the writes of the escrows it touched; on a full parser-7 history of the XRP Ledger that is about 80 steps. The
+  1,000,000 ledgers, each a handful of narrow reads and the writes of the escrows it touched; on a full parser-7 history of the XRP Ledger (from ledger 32,570, so from
+  32,569) that is about 108 steps: the first 28 or so, below the Escrow amendment (28,685,313), hold no escrow and are cheap, and about 80 can hold escrows. The
   budget is checked before a step and **never inside one** (a step cannot resume partway: its sentinel is its last write), so a heavy step runs past the 2 s, the rest of the
   tick waits for it (see the 23 of 30 s below), and the job goes on at the next tick where it stopped: expect `syncer_escrows_lag_ledgers` to fall in jumps of up to a million, and the
   later jobs of those ticks (`stats_live` among them) to be short of time until it is at the head. The watermark is in the table (`through_ledger` of the sentinel), so a restart

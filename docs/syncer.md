@@ -722,7 +722,8 @@ ClickHouse clock in milliseconds, above the key's newest).
 
 **`escrows`** (budget 2 s, **every tick**, fifth in the tick, right after `nft_state`; `runEscrowsStep` in `packages/shared/src/aggregate/escrows.job.ts`):
 - **A step.** The watermark `W` is the sentinel's `through_ledger` (with no sentinel, the ledger before the first committed one) and `H` the newest committed ledger; a step takes
-  the window `(W, U]`, `U = min(H, W + ESCROWS_STEP_LEDGERS)` with `ESCROWS_STEP_LEDGERS = 1,000,000`. It reads the distinct escrow IDs with an `object_changes` row in the window
+  the window `(W, U]`, `U = max(W, min(H, W + ESCROWS_STEP_LEDGERS))` with `ESCROWS_STEP_LEDGERS = 1,000,000` (a watermark above the head, which a reprocess can leave
+  behind it, stays where it is). It reads the distinct escrow IDs with an `object_changes` row in the window
   (partition pruning on `ledger_index` and the `object_type = 'Escrow'` prefix of the key), recomputes them `ESCROWS_CHUNK = 500` at a time (the newest row of each at or before
   `U` and its creation, mapped to an `escrows` row and written under one version per chunk; an ID with no row left gets a lightweight `DELETE`), reads the total again if anything
   was written or removed, and writes the sentinel **last**: `through_ledger = U` and the total (the new one, or the previous one when nothing changed).
@@ -730,7 +731,8 @@ ClickHouse clock in milliseconds, above the key's newest).
   its snapshot from it). A step that fails before it leaves the old sentinel, whose total and watermark agree, and the next run does the same window again, which rewrites the same rows.
 - **The budget is checked before a step and never inside one.** The first step of a run is always taken (unless the shutdown has begun); more follow while the watermark is below the
   head and the 2 s last. A step cannot resume partway (its sentinel is its last write), so it is not given a signal that the budget aborts, only the shutdown's (`EscrowsAborted`, neither
-  logged nor counted). A first fill over all history (about 80 steps on the XRP Ledger) therefore goes on where it stopped at each tick, and a heavy step runs past the budget.
+  logged nor counted). A first fill over all history (about 108 steps on the XRP Ledger from ledger 32,569: about 28 cheap ones below the Escrow amendment's 28,685,313, then about 80
+  that can hold escrows) therefore goes on where it stopped at each tick, and a heavy step runs past the budget.
 - **An escrow that cannot be mapped is set aside** (a text that is not JSON, an amount of no shape the ledger has, drops that are not a whole number, an MPT ID that is not one:
   unreachable from ledger data): the step commits without it, its old row stays (and the total counts that row), and it is counted and logged as a failure of `escrows` by its ID,
   with the reason.

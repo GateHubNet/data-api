@@ -86,9 +86,9 @@ what every transaction since did to it, and why it is in the state it is in. The
   is recorded in the fixtures, and the recorded close of an expired channel is `tesSUCCESS`). An unclassified change is `update`, counted, and shown as such.
 - **The `escrows` total reads one narrow row per escrow ever seen** (a few hundred thousand on the XRP Ledger), only on a run that changed something: tens of
   milliseconds. If it ever outgrows that it can be kept incrementally with the sentinel still written last, and readers do not change. A first run over all history
-  (a rebuild after the history backfill) is about 80 steps of 1,000,000 ledgers: a step is never cut by the budget (it cannot resume partway), so a tick with a heavy
-  step runs past the job's 2 s, and the job takes the ticks until its watermark reaches the head. The job has 2 s of the 30 s of a tick, which leaves `stats_live` 7 s
-  when every job before it uses its budget. The sentinel's total and its watermark always agree. An escrow whose rows cannot be mapped is set aside, counted as an
+  (a rebuild after the history backfill) is about 108 steps of 1,000,000 ledgers from ledger 32,569 (about 28 below the Escrow amendment, with no escrow, then about
+  80 that can hold escrows): a step is never cut by the budget (it cannot resume partway), so a tick with a heavy step runs past the job's 2 s, and the job takes
+  the ticks until its watermark reaches the head. The job has 2 s of the 30 s of a tick, which leaves `stats_live` 7 s when every job before it uses its budget. The sentinel's total and its watermark always agree. An escrow whose rows cannot be mapped is set aside, counted as an
   error by its ID, and the step commits without it.
 - **The status is a function of the time of the answer**, so a cached answer (`private, max-age=60`) can be a minute stale in it; the explorer mirrors the rules
   (`object-status.ts`) for objects it reads from the node.
