@@ -1,0 +1,206 @@
+{
+  "network": "xahau",
+  "endpoint": "wss://xahau.network",
+  "recorded_at": "2026-10-29T04:56:33.429Z",
+  "validated_head": 26873124,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676": {
+      "ledger": 14634228,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF": {
+      "ledger": 20555633,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    },
+    "D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA": {
+      "ledger": 10090323,
+      "type": "EscrowFinish",
+      "result": "tesSUCCESS"
+    },
+    "868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A": {
+      "ledger": 20449602,
+      "type": "EscrowCancel",
+      "result": "tesSUCCESS"
+    },
+    "D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086": {
+      "ledger": 25229443,
+      "type": "EscrowCreate",
+      "result": "tesSUCCESS"
+    },
+    "2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916": {
+      "ledger": 12064511,
+      "type": "CheckCreate",
+      "result": "tesSUCCESS"
+    },
+    "11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C": {
+      "ledger": 12064524,
+      "type": "CheckCash",
+      "result": "tesSUCCESS"
+    },
+    "2615DA09A9FB5E0F919EE108066407A518771B63541BCA51DEB10B96D9FFA026": {
+      "ledger": 26399329,
+      "type": "CheckCash",
+      "result": "tesSUCCESS"
+    },
+    "7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6": {
+      "ledger": 8852809,
+      "type": "PaymentChannelCreate",
+      "result": "tesSUCCESS"
+    },
+    "D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA": {
+      "ledger": 8863640,
+      "type": "PaymentChannelClaim",
+      "result": "tesSUCCESS"
+    },
+    "658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC": {
+      "ledger": 11056548,
+      "type": "PaymentChannelCreate",
+      "result": "tesSUCCESS"
+    },
+    "8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037": {
+      "ledger": 11083603,
+      "type": "PaymentChannelClaim",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "escrow_create": {
+      "ledger": 14634228,
+      "hash": "3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676",
+      "type": "EscrowCreate",
+      "note": "EscrowCreate of 200000000 drops (200 XAH) by rKqZCLrHu8dMPj444xPrDQCXUpZr6U2VWi to itself with FinishAfter 922161600 only: one CreatedNode Escrow whose NewFields carry TransferRate 1000000000 (every Xahau escrow has one) and OwnerNode \"1\". The transaction has NetworkID 21337."
+    },
+    "escrow_finish": {
+      "ledger": 20555633,
+      "hash": "E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF",
+      "type": "EscrowFinish",
+      "note": "EscrowFinish by the owner rKqZCLrHu8dMPj444xPrDQCXUpZr6U2VWi with Owner and OfferSequence 756253084 of its 100 XAH escrow (FinishAfter 822286800, created in ledger 10829963; the ledger closed at 823806092). The transaction also carries PreviousTxnID, the escrow's own (101 of the 341 Xahau EscrowFinish seen have it)."
+    },
+    "escrow_finish_escrow_id": {
+      "ledger": 10090323,
+      "hash": "D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA",
+      "type": "EscrowFinish",
+      "note": "EscrowFinish by r223rsyz1cfqPbjmiX6oYu1hFgNwCkWZH with EscrowID 10C5F525E3D07CAC9CD2BF3F53367653504B7D8A54451E311F5B38E70442457F and no OfferSequence. Its Owner, rPicqzcyoxw22XBrFCMAcFXYU2boeqYjm6, is the escrow's Destination, not its owner (the DeletedNode Escrow's Account is rD74dUPRFNfgnY2NzrxxYRXN4BrfGSN6Mv; 13370 XAH, FinishAfter 783730800, created by 17FD57E5… in ledger 8942030): the escrow is the DeletedNode whose index is the EscrowID."
+    },
+    "escrow_cancel": {
+      "ledger": 20449602,
+      "hash": "868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A",
+      "type": "EscrowCancel",
+      "note": "EscrowCancel by a third party: r42noEGvAqfwXnDBebeEPfYVswZVe6CKPo (Account) cancels the escrow of rN2DeuLywSibJ1kH5VtkbN2MYEV3qrXgM1 (Owner, OfferSequence 782424048): 1 XAH to rfjquSFSKXnDYdQyGWuXBSSSW87jfpX7Qm with DestinationTag 76765654, FinishAfter 804027600 and CancelAfter 804114000; the ledger closed at 823422433, long after CancelAfter."
+    },
+    "escrow_create_token": {
+      "ledger": 25229443,
+      "hash": "D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086",
+      "type": "EscrowCreate",
+      "note": "EscrowCreate of 80875 CLV (issuer rK8rYUs6gFH4QJ9JS814EF9112gKuYZZT) by rNyv2vcKQiR3UqsFBrjWR2MpjACJDFhcJT to itself, FinishAfter 1009904400 and CancelAfter 1109602800: CreatedNode Escrow (TransferRate 1000000000, no IssuerNode). The sender's RippleState is a ModifiedNode with empty PreviousFields: its Balance does not move, it gains LockCount 1 and LockedBalance -80875 (Xahau locks the tokens on the line)."
+    },
+    "check_create": {
+      "ledger": 12064511,
+      "hash": "2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916",
+      "type": "CheckCreate",
+      "note": "CheckCreate with SendMax \"1000000\" (1 XAH) from rwietsevLFg8XSmG3bEZzFein1g8RBqWDZ to rsYxnKtb8JBzfG4hp6sVF3WiVNw2broUFo, no Expiration: one CreatedNode Check. It is cashed 13 ledgers later by check_cash."
+    },
+    "check_cash": {
+      "ledger": 12064524,
+      "hash": "11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C",
+      "type": "CheckCash",
+      "note": "CheckCash by the destination rsYxnKtb8JBzfG4hp6sVF3WiVNw2broUFo with DeliverMin \"1000000\" and no Amount, for the check of check_create: DeletedNode Check, DeliveredAmount \"1000000\" in the metadata. A real DeliverMin cash; the XRPL set has none (FINDINGS.md of both sets)."
+    },
+    "channel_create": {
+      "ledger": 8852809,
+      "hash": "7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6",
+      "type": "PaymentChannelCreate",
+      "note": "PaymentChannelCreate of 300000 drops from rL6rwNe6puyoN5X1BUy8pEQb6Un23m2f1m to rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR with SettleDelay 1209600: one CreatedNode PayChannel whose NewFields have Balance \"0\" and TransferRate 1000000000 (on XRPL a created channel has no Balance)."
+    },
+    "channel_claim": {
+      "ledger": 8863640,
+      "hash": "D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA",
+      "type": "PaymentChannelClaim",
+      "note": "The first claim of the channel of channel_create: PaymentChannelClaim by the destination rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR with Balance \"15838\"; the channel's PreviousFields.Balance is \"0\"."
+    },
+    "channel_create_token": {
+      "ledger": 11056548,
+      "hash": "658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC",
+      "type": "PaymentChannelCreate",
+      "note": "PaymentChannelCreate of 1 DHA (issuer rDyz9rX7eGJRdVDC8NGxMxqh9U14qduqzS) from rL6rwNe6puyoN5X1BUy8pEQb6Un23m2f1m to rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR: the CreatedNode PayChannel has issued-token Amount and Balance (DHA 0); the creator's RippleState gains LockCount 6 and LockedBalance (-4.978119 to -5.978119 DHA) and its Balance does not move."
+    },
+    "channel_claim_token": {
+      "ledger": 11083603,
+      "hash": "8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037",
+      "type": "PaymentChannelClaim",
+      "note": "The first claim of the channel of channel_create_token, by the destination with Balance 0.023506 DHA: the channel's PreviousFields.Balance is {DHA, \"0\"}. Two RippleStates move: the creator's (LockedBalance -5.978119 to -5.954613, Balance -9997.999123 to -9997.975617 from the issuer side) and the destination's (0 to -0.023506)."
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 8852809,
+      "bytes": 22711,
+      "gzipBytes": 4992
+    },
+    {
+      "ledger": 8863640,
+      "bytes": 1271785,
+      "gzipBytes": 243895
+    },
+    {
+      "ledger": 10090323,
+      "bytes": 331042,
+      "gzipBytes": 73069
+    },
+    {
+      "ledger": 11056548,
+      "bytes": 12725,
+      "gzipBytes": 3517
+    },
+    {
+      "ledger": 11083603,
+      "bytes": 993913,
+      "gzipBytes": 193599
+    },
+    {
+      "ledger": 12064511,
+      "bytes": 1254412,
+      "gzipBytes": 248600
+    },
+    {
+      "ledger": 12064524,
+      "bytes": 1410042,
+      "gzipBytes": 263357
+    },
+    {
+      "ledger": 14634228,
+      "bytes": 7260,
+      "gzipBytes": 2659
+    },
+    {
+      "ledger": 20449602,
+      "bytes": 6856,
+      "gzipBytes": 2701
+    },
+    {
+      "ledger": 20555633,
+      "bytes": 1797881,
+      "gzipBytes": 320537
+    },
+    {
+      "ledger": 25229443,
+      "bytes": 9859,
+      "gzipBytes": 3282
+    },
+    {
+      "ledger": 26399329,
+      "bytes": 15444,
+      "gzipBytes": 4346
+    }
+  ]
+}

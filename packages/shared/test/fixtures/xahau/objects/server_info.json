@@ -1,0 +1,70 @@
+{
+  "info": {
+    "build_version": "2026.10.13-release+4119",
+    "complete_ledgers": "1-26873124",
+    "server_state": "full",
+    "server_state_duration_us": "445865353000",
+    "load_factor": 1,
+    "io_latency_ms": 1,
+    "jq_trans_overflow": "0",
+    "peer_disconnects": "0",
+    "peer_disconnects_resources": "0",
+    "uptime": 445865,
+    "network_id": 21337,
+    "validation_quorum": 0,
+    "published_ledger": 26873124,
+    "time": "2026-Oct-29 04:56:03.095000 UTC",
+    "initial_sync_duration_us": "1094000",
+    "load_factor_server": 1,
+    "state_accounting": {
+      "connected": {
+        "duration_us": "0",
+        "transitions": "0"
+      },
+      "disconnected": {
+        "duration_us": "0",
+        "transitions": "0"
+      },
+      "full": {
+        "duration_us": "445865353000",
+        "transitions": "1"
+      },
+      "syncing": {
+        "duration_us": "0",
+        "transitions": "0"
+      },
+      "tracking": {
+        "duration_us": "0",
+        "transitions": "0"
+      }
+    },
+    "last_close": {
+      "converge_time_s": 2,
+      "proposers": 19
+    },
+    "complete_ledgers_pinned": "empty",
+    "hostid": "SELENA",
+    "peers": 212,
+    "ports": [
+      {
+        "port": "4000",
+        "protocol": [
+          "ws",
+          "http"
+        ]
+      }
+    ],
+    "pubkey_node": "n9JYxms4BTRi8v2YmsUH4fiV4Zco9CqWcmdY1ddY3BBEocLcEkMD",
+    "validated_ledger": {
+      "seq": 26873124,
+      "hash": "406C55172095D54A9DC61F9AEDC19108B73BED64F2C1ADAE20C6B9ECA4946591",
+      "age": 0,
+      "base_fee_xrp": 0.00001,
+      "reserve_base_xrp": 1,
+      "reserve_inc_xrp": 0.2,
+      "base_fee_native": 0.00001,
+      "reserve_base_native": 1,
+      "reserve_inc_native": 0.2
+    }
+  }
+}

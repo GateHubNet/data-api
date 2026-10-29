@@ -13,6 +13,8 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/account-domains/`        | Mainnet AccountSets that set and change a Domain (see "Account domains").               |
 | `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                    |
 | `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).           |
+| `xrpl/objects/`                | Mainnet escrow, check, payment channel and delegation cases (see below).                |
+| `xahau/objects/`               | Xahau escrow, check and payment channel cases (see below).                              |
 | `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                          |
 | `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                   |
 | `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
@@ -34,7 +36,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/` and `xrpl/account-domains/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/` and `xahau/objects/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -286,6 +288,58 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpo
 
 **Not found** (within the 19,955 ledgers scanned, fewer than the 50,000 the plan names): `offer_removed_other`. No transaction of a type other than NFTokenAcceptOffer, NFTokenBurn and NFTokenCancelOffer deleted an `NFTokenOffer` in them (an AccountDelete of an offer's owner is the only other type expected to), and the 290 accounts that owned offers in the first part of the scan all still existed when checked with `account_info`. The scan was stopped there because the node answered "You are placing too much load on the server" to it. Task 4 needs a `synthetic-…` transaction for `offer_removed_other`.
 
+### XRPL ledger object cases (`xrpl/objects/`)
+
+Recorded 2026-10-29 from `wss://s2.ripple.com` (rippled mainnet, network id 0; validated head 107973016) with `--txs` and `--delay-ms 150`, one
+request at a time: 22 ledgers, 2.02 MB gzipped (largest 428 KB, ledger 107972102). `manifest.json` has the 19 cases found under `cases.<name>` as
+`{ledger, hash, type, note}` (the note says what the metadata shows) and the 22 transactions under `txs`; three of them are supporting, not cases: the
+token cashes `3ABD7BA6…` (ledger 107703707) and `A075E757…` (107711512) for the `DeliveredAmount` finding and the creation of the channel of `channel_claim`,
+`E8A8466A…` (107624182). `FINDINGS.md` answers the eight questions of the plan's Task 1, each with the ledger and hash that show it.
+`src/test-utils/object-cases.ts` (`OBJECT_CASES`, `objectCase`, `objectLedgers`; test-only) is how later tests read them, and
+`src/ingest/object-fixtures.spec.ts` pins what every case is for.
+
+Escrow, channel and delegation transactions are rare, so `--want` could not find them. The hashes came from three sources, none of them in the repository:
+a throwaway script that walked 4,998 validated ledgers back from the head (107972126 down to 107967129, about 5 hours) with
+`ledger { transactions: true, expand: true }` and kept every escrow, check, channel and DelegateSet transaction and every transaction with a `Delegate` (it
+found checks in plenty and almost nothing else); `account_tx` of the busy accounts it and the older fixtures named (a channel destination, a bot that finishes
+escrows, four token-escrow testers, a timed-escrow user, the one delegator); and the Escrow nodes of the finishes it read, whose `PreviousTxnID` names the
+`EscrowCreate`. `escrow_finish_timed`, `check_create_token`, `check_cash_amount` and `delegated_batch_inner` were recorded before (`xrpl/recorded`, `xrpl/amm`) and are recorded
+again here so that the object cases live in one directory. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xrpl --endpoint wss://s2.ripple.com \
+  --out test/fixtures/xrpl/objects --delay-ms 150 --txs BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53,7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954,92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046,852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198,3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C,375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA,DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E,CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326,A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE,3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330,A075E757D0E6E283ABB6CD7ED751A412D4B1DC14C6F5DE616819C7D6579EC63C,BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77,04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7,E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127,0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE,886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790,29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB,42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75,FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8,9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9,4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66,8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8
+```
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `escrow_create_timed` | 107897249 | `BF93E9B72AE372BCEB27781CA58C4ABE7E51EE9F5D254D02B83C92EC1A22AE53` | XRP escrow with `FinishAfter` and `CancelAfter`, no `Condition` |
+| `escrow_create_conditional` | 106268539 | `7FE0A05E9A877AC8D4CCEDD0F860C3E5AD73B0FC8A0ACAEE734324B9685E1954` | `Condition`, `FinishAfter`, `CancelAfter`; 4258 of an issued token (a token-escrow test) |
+| `escrow_finish_timed` | 107670360 | `92EC1EA8B38B7242F07591AB4BF1AAB5E6B2E3015CE6E15AAAADAC05E6B74046` | No `Fulfillment`; a 50 XRP escrow created in ledger 59388170 |
+| `escrow_cancel` | 106179366 | `852853679C20D7128E4201E8F3DC7B7FE894F93A03F7435C9FC7D3980C70C198` | Cancel by a third party (`Account` is not `Owner`) after `CancelAfter`; token escrow |
+| `escrow_create_token` | 107945438 | `3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C` | 75000 XRB, `FinishAfter` only: the sender's trust line moves |
+| `escrow_finish_token` | 107967068 | `375202E930018352EA63F82A1DCAF7795916DC5117C74D013119E67955C157DA` | Finish of that escrow, sent by a bot with a ticket: the destination's trust line moves |
+| `check_create_xrp` | 107972102 | `DE0C4334780CE8115BCCB7E41371B85D13D284F82F48EFB98BE8D2F894207E0E` | `SendMax` 1000 XRP, no `Expiration` |
+| `check_create_token` | 107698980 | `CCDBCADF2DE0EF5E85A3332C4CADE9A0C28F3B5E7220C4890E27D196415D0326` | 1 RLUSD with `InvoiceID` and `Expiration` |
+| `check_cash_amount` | 107671568 | `A0EE5458F913A115FC3BA022BDC227FBBCE81236DDF4A6B2BEA06BAEFAA8C1CE` | `Amount` 933.622827 XRP; a Batch inner; no `DeliveredAmount` |
+| `check_cancel_source` | 107968411 | `BC27613BAFC8E4A3B198A1458E1CF9EC28BDD0E8AFCE02C733C484F9F3979C77` | Cancel by the check's own source |
+| `channel_create` | 106970128 | `04BF7DE957E5E2EE8BB67EF00CEB2EFF7A72496FAED3442CA9680E8ECF2EAFB7` | 10000 drops with `CancelAfter` and `SettleDelay` 1209600; no `Balance` in `NewFields` |
+| `channel_fund_expiration` | 107220098 | `0E08BB2ADB8831F0D20DC26CB9AEE0782E82C141725ECB7F465B78CF3D63F6DE` | Fund of 1 drop with `Expiration` |
+| `channel_claim` | 107641123 | `886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790` | The first claim of a channel: `PreviousFields.Balance` "0" |
+| `channel_close_request` | 107107437 | `29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB` | `tfClose` by the source with the balance below the amount: the channel stays and gains `Expiration` |
+| `channel_close_destination` | 107296498 | `42AACB8AB7ADBAB178D0FE7E2EB49ABCF102B64AA7D9807424E35D0C413E3C75` | `tfClose` by the destination: the channel is deleted at once |
+| `channel_renew` | 107218583 | `FCBC932640226E26E212E3E2F8F71763440DC092A398CA8C84B06FA870CABCE8` | `tfRenew`: the `Expiration` of the close request is removed |
+| `channel_close_expired` | 102145584 | `9E365C57A2C57EFD0C2E46907E6E8625972350BE0A929005FB3F3A68922B20B9` | A claim on a channel whose `Expiration` has passed deletes it |
+| `delegate_set_create` | 107558036 | `4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66` | `OfferCreate` and `OfferCancel` permissions: a created `Delegate` |
+| `delegated_batch_inner` | 107699656 | `8A57855B074280D7783182F3556BADD92246252E6EFFE0FD7E807E0B200FC2D8` | `Delegate` set, `Fee` "0", `tfInnerBatchTxn`: an inner transaction of a Batch |
+
+**Not found** (within the ledgers scanned and the histories read; each is built synthetically in the test that needs it): `escrow_create_ticket`,
+`escrow_finish_fulfillment` (every conditional escrow seen is a token escrow that its testers cancelled), `escrow_create_mpt` (no MPT amount in any of the
+12,880 escrow transactions read), `check_cash_deliver_min` (none of the 7,501 CheckCash of the scan has a `DeliverMin`; the recorded 107671568 has none either,
+and a real one is in `xahau/objects`), `check_cancel_third_party_expired` (all 1,801 CheckCancel of the scan are by the check's own source),
+`delegate_set_replace`, `delegate_set_empty`, `delegated_payment` and `delegated_tec` (one delegation exists, an offer bot's: its only DelegateSet is
+`delegate_set_create`, and every delegated transaction is a successful OfferCreate or OfferCancel).
+
 ### Xahau (`xahau/recorded/`)
 
 Recorded 2026-10-15 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337): validated head
@@ -336,6 +390,40 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endp
 
 **Not found** (within those ledgers and the account histories): `uritoken_mint_with_offer`. No `URITokenMint` carries an `Amount` (or a `Destination`) among the 14,211 mints seen in the 32,927 ledgers read, nor among the mints in the `account_tx` of the marketplace accounts looked at. Task 5 needs a `synthetic-…` transaction for `uritoken_mint_with_offer`.
 **`uritoken_buy_above_ask` is the fallback the plan allows**: no `URITokenBuy` paid more than the ask in any buy met, so the case is a buy at exactly the ask (its note says so).
+
+### Xahau ledger object cases (`xahau/objects/`)
+
+Recorded 2026-10-29 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337; validated head 26873124) with `--txs` and `--delay-ms 1000`,
+one request at a time: 12 ledgers, 1.36 MB gzipped (largest 321 KB, ledger 20555633). `manifest.json` has the 11 cases under `cases.<name>` as
+`{ledger, hash, type, note}`; the twelfth transaction, the token cash `2615DA09…` (ledger 26399329), is supporting. `FINDINGS.md` has Xahau's escrow fields, the
+`EscrowFinish` with `EscrowID`, the first ledger and the amendments; `src/test-utils/object-cases.ts` and `src/ingest/object-fixtures.spec.ts` are the same as for XRPL.
+
+The node throttles by units, and a scan of ledgers is its costliest request, so the hashes were not found by scanning alone. A throwaway script (not in the repository) read
+999 validated ledgers back from 26872090 (hash lists first, then the transactions of the 604 ledgers of at most 80 transactions; the 348 Evernode bursts above that were not read)
+and met no Escrow, Check or PaymentChannel transaction. A walk of the whole state at ledger 26872617 with `ledger_data` (binary, 393 pages of 2048 entries, 1 s apart; 804,801
+entries) then listed every live Escrow (198), PayChannel (13) and Check (6) entry, and `account_tx` of the 83 accounts they name (two pages each at most) gave the creating,
+claiming, finishing and cashing transactions. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endpoint wss://xahau.network \
+  --out test/fixtures/xahau/objects --delay-ms 1000 --txs 3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676,E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF,D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA,868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A,D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086,2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916,11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C,2615DA09A9FB5E0F919EE108066407A518771B63541BCA51DEB10B96D9FFA026,7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6,D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA,658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC,8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037
+```
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `escrow_create` | 14634228 | `3F0CBC302AD643A2EE6D19871648810FDCA2C352DB7F935321160330AD28B676` | 200 XAH to itself, `FinishAfter` only; `TransferRate` in `NewFields` |
+| `escrow_finish` | 20555633 | `E10D035E51F79BFD31417602241CAFFF07FBA0C25FD10B06EDA95E0A21F077FF` | `Owner` and `OfferSequence`; carries `PreviousTxnID` |
+| `escrow_finish_escrow_id` | 10090323 | `D1B7A0AD6C6DA3551F97F1C63E4035DABC7C58AE21F9F758090C588B824973BA` | `EscrowID`, no `OfferSequence`; `Owner` is the escrow's destination |
+| `escrow_cancel` | 20449602 | `868B415FA3C613BB3F7D0902E5DAFA3933547F4172754737B421717FB542285A` | Cancel by a third party (`Account` is not `Owner`) |
+| `escrow_create_token` | 25229443 | `D09B8B9BF75C0A991CBEF6B2C47480DCA7460F43E50AD9C5AC522D56513F3086` | 80875 CLV: the trust line gains `LockCount` and `LockedBalance`, its `Balance` does not move |
+| `check_create` | 12064511 | `2351E62FD79D086C7F9248CAB28B9DD32E090457858B65380EB269EEF79E2916` | `SendMax` 1 XAH |
+| `check_cash` | 12064524 | `11B73A143945187700479CA7B6965F763DB6FCD04244E48A227B68F54055F89C` | `DeliverMin` "1000000", no `Amount`; `DeliveredAmount` in the metadata |
+| `channel_create` | 8852809 | `7358DBCAD7FF0B3ECBB6D5BC296CB52E3B98290DAEA0549137FA861CA2D346C6` | 300000 drops; `Balance` "0" and `TransferRate` in `NewFields` |
+| `channel_claim` | 8863640 | `D58A83E1E25B0AD4C79537E8F2D6402ACDEE4FF5EADAB1F23F181F689E9503CA` | The first claim of that channel: `PreviousFields.Balance` "0" |
+| `channel_create_token` | 11056548 | `658229F6A67A15A316105775DF582A3211B519874CADF899623D121735FE30CC` | 1 DHA: `Amount` and `Balance` are token amounts; the creator's line is locked |
+| `channel_claim_token` | 11083603 | `8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037` | The first claim of that channel: two trust lines move |
+
+Every case of the set was found. Xahau has no conditional escrow among its 198 live ones (none has a `Condition`), no MPT and no `Delegate`, so the set has none.
 
 ### Account domains (`xrpl/account-domains/`)
 
