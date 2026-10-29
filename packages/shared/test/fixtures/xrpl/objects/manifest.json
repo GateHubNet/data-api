@@ -152,7 +152,7 @@
       "ledger": 107945438,
       "hash": "3D7F58900F76F6B50D7B5BB1988D9E3C4E33744928B14DE1106848FFA9A3343C",
       "type": "EscrowCreate",
-      "note": "EscrowCreate of 75000 XRB (issuer rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa) from rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm to rHiwfnKJCwNePaTj8HmEYCx8G5NCsSEJSt, FinishAfter 846540887 only: one CreatedNode Escrow and one ModifiedNode RippleState, the sender's line (Balance 10000000 to 9925000 from the issuer side); the issuer's AccountRoot is not in the metadata. Finished by escrow_finish_token."
+      "note": "EscrowCreate of 75000 XRB (issuer rD9ixf7RRUKuKVFTsZa3fZGAN6HtNziPKa) from rfd4xkXuigdGJV2XYkbosFzBQaLsc6M8Vm to rHiwfnKJCwNePaTj8HmEYCx8G5NCsSEJSt, FinishAfter 846540887 only: one CreatedNode Escrow and one ModifiedNode RippleState, the sender's line (it is the low side; Balance 10000000 to 9925000 from the low side: the sender's holding falls by 75000); the issuer's AccountRoot is not in the metadata. Finished by escrow_finish_token."
     },
     "escrow_finish_token": {
       "ledger": 107967068,
@@ -206,7 +206,7 @@
       "ledger": 107107437,
       "hash": "29DE719FF22F8F1CE291BE2350C459CE9B06982EE4B15ACEAA1E5925FFE709DB",
       "type": "PaymentChannelClaim",
-      "note": "tfClose (131072) by the source rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu while the channel's Balance 2469 is below its Amount 5000000: the channel stays (ModifiedNode, PreviousFields empty) and gains Expiration 844406430, the SettleDelay 1209600 after the ledger close 843196831."
+      "note": "tfClose (131072) by the source rfn1iu8peiUtayZMqXcpL8rt7x4cfk1Qfu while the channel's Balance 2469 is below its Amount 5000000: the channel stays (ModifiedNode, PreviousFields empty) and gains Expiration 844406430, the SettleDelay 1209600 after the ledger's parent_close_time 843196830 (the time a transaction sees; the ledger closed at 843196831)."
     },
     "channel_close_destination": {
       "ledger": 107296498,
