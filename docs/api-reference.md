@@ -235,8 +235,9 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
     backfilled.
   - A feature **a network cannot have** is `complete: true` (nothing can be missing) and its routes read no table: the delegations of Xahau and
     Xahau Testnet, which have no permission delegation.
-- **One item.** The detail of one item (an NFT, with its history and offers; an escrow, with its history) states its own coverage: the feature's, and complete also when the
-  item's creation is indexed (its mint is at or above `from_ledger_index`), whatever came before it.
+- **One item.** The detail of one item (an NFT, with its history and offers; an escrow, a check or a payment channel, each with its history) states its own
+  coverage: the feature's, and complete also when the item's creation is indexed (its mint, or the transaction that created it, is at or above
+  `from_ledger_index`), whatever came before it.
 - **Freshness.** A feature's coverage is kept for 60 seconds. A read of it that fails fails the route with the route's own 500 message, and no
   `complete: false` is invented in its place.
 - **Placement.** `coverage` is the key after `result` on every answer derived from ledger history, lists, aggregates and details alike. An
@@ -3920,6 +3921,7 @@ The check:
 An event of a check has `event`: `create`, `cash`, `cancel`, `removed` (deleted by another transaction) or `update`, and adds `send_max` and
 `expiration` to a `create` and `delivered` to a `cash`. The `account` of a `cash` is the sender of the `CheckCash` (the destination), and of a
 `cancel` the sender of the `CheckCancel`: the source, the destination, or anyone once the check has expired.
+
 `GET /v2/checks/60FCB1E8C72A695CBB6BDF718D30AF2310A9BED6D3F6D92F54C0E429186D1A42`, a check for 1 RLUSD that nobody cashed before it expired:
 
 ```json
@@ -4046,7 +4048,8 @@ an escrow, with the events of a check and the `coverage` of the check. With `for
 
 ```text
 "event","ledger_index","time","tx_hash","tx_type","account","delegate","result","send_max.currency","send_max.issuer","send_max.value","send_max.mpt_issuance_id","expiration","delivered.currency","delivered.issuer","delivered.value","delivered.mpt_issuance_id"
-"cash","107703707","2026-10-16T21:57:22Z","3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330","CheckCash","rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ","","tesSUCCESS","","","","","","524C555344000000000000000000000000000000","rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De","0.438027",""```
+"cash","107703707","2026-10-16T21:57:22Z","3ABD7BA6DA173F446AFA31C5C2D4EA51FC73A3BDA6E9ED7BBC557A215E33B330","CheckCash","rBi1QrVjwaNofisZAQnovoXdHkS73FG1tJ","","tesSUCCESS","","","","","","524C555344000000000000000000000000000000","rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De","0.438027",""
+```
 
 Errors, in the order they are checked: 400 `invalid check id`, `invalid marker`; 404 `check not found` (a check with no event, also for a
 `marker`); 500 `unable to retrieve check history`.
@@ -4084,8 +4087,9 @@ An event of a channel has `event`: `create`, `fund`, `claim`, `close_request` (t
 `renew` (the source took the `expiration` away), `close` (deleted by a claim or a fund), `removed` (deleted by another transaction) or `update`.
 Every event adds `amount` and `balance`, the channel's after the transaction, `amount_change` and `balance_change` when the transaction changed
 them (the difference after less before, in the channel's currency; a claim has a `balance_change`, a fund an `amount_change`), `expiration`
-when the channel has one after the transaction, and `settle_delay` to a `create`. `GET /v2/payment_channels/E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA`,
-a channel of 1 XRP claimed from once:
+when the channel has one after the transaction, and `settle_delay` to a `create`.
+
+`GET /v2/payment_channels/E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA`, a channel of 1 XRP claimed from once:
 
 ```json
 {
@@ -4228,6 +4232,7 @@ The events of one payment channel, oldest first.
 
 `{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "count": n, "marker": "…", "history": [Event, …] }`, as the history of
 an escrow, with the events of a channel and the `coverage` of the channel; it has no `funds` and `claims`, which are the channel's.
+
 `GET /v2/payment_channels/E22CCE8FA636C8BDF1C3C4AA17FD604B8FDE268E4F6BF9022B5336536F5B69EA/history?limit=1`:
 
 ```json
@@ -4261,7 +4266,8 @@ whether it holds claims, funds or a creation:
 ```text
 "event","ledger_index","time","tx_hash","tx_type","account","delegate","result","amount.currency","amount.issuer","amount.value","amount.mpt_issuance_id","balance.currency","balance.issuer","balance.value","balance.mpt_issuance_id","amount_change.currency","amount_change.issuer","amount_change.value","amount_change.mpt_issuance_id","balance_change.currency","balance_change.issuer","balance_change.value","balance_change.mpt_issuance_id","expiration","settle_delay"
 "claim","107641123","2026-10-14T02:25:30Z","886A9054CD78D4C2F1250999F8D65DB3048F8FC9AFB24523AD755B29797AC790","PaymentChannelClaim","rLggTEwmTe3eJgyQbCSk4wQazow2TeKrtR","","tesSUCCESS","XRP","","1","","XRP","","0.032185","","","","","","XRP","","0.032185","","",""
-"create","107624182","2026-10-13T08:05:31Z","E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127","PaymentChannelCreate","rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM","","tesSUCCESS","XRP","","1","","XRP","","0","","","","","","","","","","","1209600"```
+"create","107624182","2026-10-13T08:05:31Z","E8A8466AF9E1E5E6339F1EAC64A9B8AD7AB4BE42613605511EDC80E1FCD34127","PaymentChannelCreate","rQQQrUdN1cLdNmxH4dHfKgmX5P4kf3ZrM","","tesSUCCESS","XRP","","1","","XRP","","0","","","","","","","","","","","1209600"
+```
 
 Errors, in the order they are checked: 400 `invalid channel id`, `invalid marker`; 404 `payment channel not found` (a channel with no event, also
 for a `marker`); 500 `unable to retrieve payment channel history`.
