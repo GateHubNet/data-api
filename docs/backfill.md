@@ -413,10 +413,20 @@ history that starts in the middle, with no `created`, and says `complete: false`
    about to run, it covers this range, and running both writes these ledgers twice, which does no harm.
    It writes the `Delegate` rows, the delegates' `account_transactions` rows, the fee rows of the delegated transactions on their delegates and the object rows of
    escrows, checks and channels for these ledgers. Xahau has no delegation: nothing is re-ingested there for it.
-3. **The aggregates follow by themselves.** Every written chunk marks its hours in `agg_dirty`; the slice's hooks recompute what they touch (the rollups of heavy accounts,
-   the pair statistics, the rates) and, last, **the `escrows` hook**, which recomputes the escrows of the slice's ledgers as of the job's watermark and reads the total
-   again if one changed ([syncer](syncer.md#the-escrows-job)). The `escrows` job itself builds its table from the rows there are, in steps of 1,000,000 ledgers, until
-   **`syncer_escrows_lag_ledgers` is a few ledgers** ([operations](operations.md#ledger-objects-and-delegation)).
+3. **The aggregates follow by themselves, all of them.** Every written chunk marks its hours in `agg_dirty`, so the reprocess queues its whole range: the days since
+   the amendment (2026-10-08), about 20 of them on 2026-10-28. `stats_dirty` drains it a slice (at most a day) at a time, and **every aggregate's dirty work runs for
+   those days**, although only the rows of the delegated transactions changed: `stats_hourly` and the daily volume sets of each day, the AMM pools with a state row in
+   the slice and the `amm_daily` sets of its days, the rates of its days and of the 14 days after them (marked stale, then computed again), its hours of
+   `pair_hourly`, the day rollups of the heavy accounts, the ledgers marked in `nft_dirty` (the dirty sweep of `nft_state` then rebuilds every NFT touched in those
+   days) and, last, **the `escrows` hook**, which recomputes the escrows of the slice's ledgers as of the job's watermark and reads the total again if one changed
+   ([syncer](syncer.md#the-escrows-job)). Until a slice is drained its hours show the old numbers. Watch the queue fall back to the few ranges live ingest leaves:
+
+   ```sql
+   SELECT count() FROM xrpl.agg_dirty;
+   ```
+
+   The `escrows` job itself builds its table from the rows there are, in steps of 1,000,000 ledgers, until **`syncer_escrows_lag_ledgers` is a few ledgers**
+   ([operations](operations.md#ledger-objects-and-delegation)).
 4. Check the coverage:
 
    ```sql
