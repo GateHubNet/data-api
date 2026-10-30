@@ -482,8 +482,9 @@ which starts at the first ledger of the network (32,570 on the XRP Ledger, 1 on 
 **What a re-ingest does to the tokens.**
 - **Filling the state tables further back** moves the state coverage start, and the job builds a **new generation** by itself (its `coverage_from` is no longer the start): the pass over the wider
   `trust_line_states`, an hour to a few hours, with the live generation serving until it is promoted ([operations](operations.md#issued-tokens)). **Do not fill the history while the first generation is
-  building**: a generation is promoted only if the coverage start is still the one it was built on, and the job retires a building generation whose start has moved (the oldest stored ledger when no ledger of a
-  parser older than 3 is stored, else one above the newest of them) and starts another from the first account, at every housekeeping (about every ten minutes). A fill that keeps writing ledgers below the oldest stored one
+  building**: the job compares the coverage start with the one a generation was built on at every housekeeping (about every ten minutes; the promotion does not check it, so a build that finishes in between is promoted and
+  replaced at the next one), and retires a building generation whose start has moved (the oldest stored ledger when no ledger of a parser older than 3 is stored, else one above the newest of them) and starts another
+  from the first account. A fill that keeps writing ledgers below the oldest stored one (a single ascending `--from/--to` run moves the start once, at its first chunk; a fill from the top down moves it with every chunk)
   therefore restarts a first build every ten minutes until it ends; finish the fill first, or expect the restarts (the log says `tokens: generation N was stale while it built; it is retired`). Only the building
   generation restarts: the live one keeps serving.
 - **A `--reprocess` of a range** writes the touches of its ledgers, as for every table, and marks its hours in `agg_dirty`. Each slice's **`tokens` hook**, the last of the hooks, lowers the `repair_from` of the live and the

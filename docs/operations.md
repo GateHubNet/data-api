@@ -101,8 +101,10 @@ and writes the third table of the file. Nothing checks for the tables at boot: r
 object routes answer 500 until the tables exist). The rollout and the history: [Ledger objects and delegation](#ledger-objects-and-delegation),
 [backfill](backfill.md#ledger-objects-and-delegation-re-ingest).
 **The ingest needs migration `014_issued_tokens.sql` applied before a syncer with parser version 8 starts, and the api after it.** That syncer writes `state_touches` with every ledger,
-and an insert into a missing table fails the batch, so the live runner retries the same ledgers without end; the `tokens` job reads and writes the other three tables of the file.
-Nothing checks for the tables at boot: run the migrate job first (the compose files do), then deploy the syncer, then the api (the token routes answer 500 until the tables exist).
+and an insert into a missing table fails the batch, so the live runner would retry the same ledgers without end; the `tokens` job reads and writes the other three tables of the file.
+A syncer with the `ingest` worker (it needs `state_touches`) or the `aggregator` worker (it needs all four tables) therefore refuses to boot against a database without them: the message
+names the file and the tables that are missing (`lacks the schema of 014_issued_tokens.sql`). Run the migrate job first (the compose files do), then deploy the syncer, then the api (the
+token routes answer 500 until the tables exist).
 **The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
 [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
 for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
@@ -387,7 +389,7 @@ dropped, or a ledger answering 500) without caring about partition alignment, us
 | `syncer_last_commit_age_seconds` | under ~10 s live (a ledger closes every 3-4 s on XRPL) | Above 60 s with a lag of 0 means the chain is not closing ledgers or the head hint is stuck |
 | syncer probe `state` | `live` (`catching_up` while behind) | `halted` (chain break, a ledger the parser rejects, or lost lease) |
 | `syncer_aggregator_stats_lag_seconds` | 0 | Positive for hours: the sweep is slower than the data, see [syncer](syncer.md#7-the-aggregator) |
-| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs), for `nft_state` / `nft_state_dirty` / `nft_collections` [the NFT data](#the-nft-data), for `tokens` / `tokens_dirty` [Issued tokens](#issued-tokens), for `escrows` / `escrows_dirty` [Ledger objects and delegation) |
+| `syncer_aggregator_errors_total{job}` | flat | Rising: look for the job's log lines. For `amm_pools` / `amm_daily` see [the AMM jobs](#the-amm-jobs), for `nft_state` / `nft_state_dirty` / `nft_collections` [the NFT data](#the-nft-data), for `tokens` / `tokens_dirty` [Issued tokens](#issued-tokens), for `escrows` / `escrows_dirty` [Ledger objects and delegation](#ledger-objects-and-delegation) |
 | `syncer_amm_unclassified_total` | a trickle at most | A burst: the parser met a pool shape it cannot place (a new kind of AMM transaction, an MPT asset); see [backfill](backfill.md#amm-data-re-ingest) |
 | `syncer_nft_state_lag_ledgers` | 0-2 once caught up (not set after a start until the job has placed its cursor: it keeps its value, 0 in a new process, and never reads the whole head) | Above 100 for more than 10 minutes (alert with a `for:` longer than a tick); large and falling is a catch-up, see [The NFT data](#the-nft-data). A read of the cursor that keeps failing shows as `{job="nft_state"}` errors, not here |
 | `syncer_nft_dirty_ledgers` | 0 | Positive and not falling for an hour: a re-ingest is waiting for `nft_state` and the job is failing (`syncer_aggregator_errors_total{job="nft_state"}`); falling is the digest of a re-ingest |
@@ -865,17 +867,20 @@ time; the rest is an aggregate that the `tokens` job of the aggregator builds fr
 
 **What the owner does to deploy** (per network, the sandbox first, then production; the order matters):
 1. **Apply migration `014`** on each network database (`dc run --rm migrate-xrpl` / `migrate-xahau`; from source `pnpm ch:migrate`) **before the syncer and the API of this release**: the writer
-   inserts into `state_touches` on every ledger, and a write to a missing table fails the batch ([above](#apply-a-schema-migration)). **The job needs the other three tables as well**, and without them
-   it cannot read its generations: its hook then throws on every `agg_dirty` slice and **the queue stops draining for every job** (a persistent `tokens_dirty`, [below](#a-persistent-tokens_dirty)).
+   inserts into `state_touches` on every ledger, and a write to a missing table fails the batch ([above](#apply-a-schema-migration)). **The job needs the other three tables as well**, and **the syncer refuses to boot without 014**: with
+   the `ingest` worker it checks for `state_touches`, with the `aggregator` worker for all four tables, and the message names `014_issued_tokens.sql` and what is missing
+   ([syncer](syncer.md#10-failure-modes)). A job that cannot read its generations would make its hook throw on every `agg_dirty` slice and **stop the queue for every job**: that is left to ClickHouse
+   failing the job's opening reads, also at the first run after a boot that could not make the check (a persistent `tokens_dirty`, [below](#a-persistent-tokens_dirty)).
 2. **Deploy the syncer** (parser version 8). From the deploy ledger every ledger has its touches, and the `tokens` job **builds the first generation from `trust_line_states`**, as it is: no re-ingest is
    needed for it. The build is a pass over all of `trust_line_states`, in batches of 500 accounts (about 60 of them fit in the 4 s of a tick on the synthetic data), one tick a minute: **between an hour and a
    few hours** on a full XRP Ledger history ([the estimate below](#estimated-for-the-xrp-ledger)). Watch `syncer_tokens_building` (1 until the generation is promoted) and the logged cursor
    (`tokens: generation 1: the account pass is at <account> ...`). Until it is live `/v2/tokens` answers the no-generation answer and a token 404.
-   **Finish every history fill before the first build starts.** A generation is promoted only if the state coverage start is still the one it was built on: at each housekeeping (every tenth run, about every ten
-   minutes) the job compares it, **retires a building generation whose start has moved and starts another from the first account** (`tokens: generation N was stale while it built; it is retired`). The start is
-   the oldest stored ledger, or one above the newest ledger written by a parser older than 3 ([Coverage](api-reference.md#coverage)), so it moves while a fill keeps writing ledgers below the oldest stored one
-   (a fill from the top down moves it with every chunk) and while a range-ingest or `--reprocess` rewrites the newest ledgers of an older parser; a multi-hour first build under such a fill restarts every
-   ten minutes and does not end. Only the building generation restarts (the live one, once there is one, keeps serving), so this starves a **first** build and delays a rebuild; the program's reprocess
+   **Finish every history fill before the first build starts.** The promotion does not check the state coverage start; the housekeeping does: at each one (every tenth run, about every ten
+   minutes) the job compares the start with the one the generation was built on and **retires a building generation whose start has moved and starts another from the first account** (`tokens: generation N was stale while it built; it is retired`).
+   A build that finishes between two housekeepings is promoted all the same, then found stale at the next one and replaced (the live generation, once there is one, keeps serving meanwhile). The start is
+   the oldest stored ledger when no ledger of a parser older than 3 is stored, else one above the newest ledger written by such a parser ([Coverage](api-reference.md#coverage)), so it moves while a fill keeps writing ledgers
+   below the oldest stored one (a single ascending `--from/--to` run moves it once, at its first chunk; a fill from the top down moves it with every chunk) and while a range-ingest or `--reprocess` rewrites the newest
+   ledgers of an older parser; a multi-hour first build under such a fill restarts every ten minutes and does not end. Only the building generation restarts (the live one, once there is one, keeps serving), so this starves a **first** build and delays a rebuild; the program's reprocess
    moves the start only while stored ledgers of a parser older than 3 remain, and not at all over a database whose ledgers are all version 3 or later.
    **Listings need D4's account domains**: a token is `listed` only when the issuer's account domain is known (`account_domains`) and its toml was read by the `tomls` worker. Seed first to avoid a wait, not
    because it is lost otherwise: run the [account-domains seed](backfill.md#account-domains-seed) (it needs no reprocess) and let the `tomls` worker's first sweep run before the build. A first generation
@@ -896,7 +901,7 @@ time; the rest is an aggregate that the `tokens` job of the aggregator builds fr
    by one generation at each rebuild; nothing else is affected.
 6. **Hand the explorer this commit** for its API sync (`pnpm api:sync`): `docs/openapi.yaml` has the four paths and the Tokens section of the reference is what its fixture generator follows.
 7. **The explorer's `TOKENS` switch** goes on in an environment once `syncer_tokens_live` is 1 and `syncer_tokens_lag_ledgers` is under 300 there, on both networks.
-8. **Record the real first-build duration and the daily `state_touches` rows** in the table below (the rest of this section is measured on synthetic data and estimated).
+8. **Record the real first-build duration, the daily `state_touches` rows and the slowest windows of the first day** in the table below (the rest of this section is measured on synthetic data and estimated).
 
 **No new setting.** The job and its budget are in the aggregator (`GH_WORKERS` with `aggregator`, as for the NFT jobs, on by default); the api needs nothing of its own. To roll back, remove the routes: `014`
 needs no undo, and a syncer of the previous release writes no touches (the ledgers it writes meanwhile have none, and the job builds a new generation when it meets them).
@@ -906,6 +911,7 @@ needs no undo, and a syncer of the previous release writes no touches (the ledge
 | First build: started, promoted, ticks, the account pass's last cursor | | |
 | Lines in `trust_line_states` (`SELECT uniqExact(account, counterparty, currency) FROM xrpl.trust_line_states`: two for each `RippleState`), its rows, and the `tokens` rows of the live generation | | |
 | `state_touches` rows a day (`SELECT count() FROM xrpl.state_touches WHERE ledger_index >= <a day ago>`) | | |
+| The slowest live window, and the slowest catch-up or repair window, of the first day (the `ms` at the end of the job's debug lines `tokens: generation N (live): ledgers A - B, ...` and `(repair)`) | | |
 
 ### A forced rebuild
 
@@ -948,7 +954,11 @@ OPTIMIZE TABLE trust_line_states FINAL; OPTIMIZE TABLE account_states FINAL;
 The 8x table is the same insert seven more times with the account numbers moved by 100,000 for each copy and the holders by 400,000. The job's functions were then called from a script, as the runner calls them: a tick starts a
 batch (`nextPassAccounts`, `writePassLines`, `passTokens`, `recomputeTokens` with `rematch: 'all'`, the generation row) while less than 4 s have passed since it started; a window is `applyLineStates` and
 `recomputeTokens` over random lines of the table, in chunks of 2,000 (`LINE_STATES_SQL`, `STORED_LINES_SQL`); the memory is `system.query_log.memory_usage` and the rows read are its `read_rows`. The **cost of the
-toml sweep was not measured**, nor was the cost of an empty repair window.
+toml sweep was not measured**, nor was the cost of an empty repair window. **`account_states` held 3 rows an account** in these tables, so **the issuer-settings read of a window was not measured at mainnet shape**:
+it takes the newest row of each issuer the window names (`LIMIT 1 BY account` over `account IN {issuers}`), which reads each issuer's prefix of the key in every partition, with the wide `fields` column, and the
+whole history of a busy issuer's changes of its own settings. On real tables with billions of rows a window that names a few hundred issuers may spend seconds on this read alone; a window is never cut, so the
+effect is time (the run overruns its 4 s and delays `stats_live` of that tick), not a stall. The job logs the duration of each window at debug level (`tokens: generation N (live): ledgers A - B, ..., T ms`; the repair
+has the same line, with `(repair)`), so that the rollout can record the slowest ones (the table above); a read of the newest key first is for the rollout to show necessary.
 
 | What | Measured |
 | --- | --- |
@@ -1010,7 +1020,8 @@ block has no row left to rebuild it from, and drops out of the tokens it belonge
 `syncer_aggregator_errors_total{job="tokens_dirty"}` rises at each tick and `SELECT count() FROM xrpl.agg_dirty` does not fall. The hook of `tokens` is the last of the hooks of a slice and **throws, by design, while the job
 has not read its version floor or when the reads that open its last run failed**, so that a range is never marked without the job being able to repair it; a slice that fails stays in `agg_dirty` and its earlier hooks
 run again at each tick. Look in the log for `Aggregator job tokens failed...` and `Aggregator job tokens_dirty failed in <from> - <to>: ...`:
-- **A missing table** (`Table xrpl.token_generations doesn't exist`): migration 014 was not applied before the syncer. Apply it (`dc run --rm migrate-xrpl`); the job reads its tables at the next tick and the queue drains.
+- **A missing table** (`Table xrpl.token_generations doesn't exist`): migration 014 was not applied before the syncer, and the boot check could not be made (ClickHouse was unreachable then: the boot log has
+  `Could not check that 014_issued_tokens.sql is applied`), because a syncer that can read the database refuses to boot without it. Apply it (`dc run --rm migrate-xrpl`); the job reads its tables at the next tick and the queue drains.
 - **ClickHouse refusing the reads** of the job (time limit, memory cap, the database down): fix the cause; the job's opening reads work at the next tick.
 - **A step of the job that fails** does not stop the hook: only the opening reads do. A drop that fails for the privilege, a window, a batch of the pass, a rebuild check that keeps failing wait (5 minutes, doubling to an hour)
   and show as `tokens` errors, not as `tokens_dirty`.

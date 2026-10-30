@@ -617,7 +617,8 @@ coverage is never complete (§6).
 - **Rollout order**: `migrate` (the new migration: the syncer's ledger writer fails without `state_touches`), then the syncer (new
   parser; the job starts the first generation), then the api. The explorer's `TOKENS` goes on once `syncer_tokens_live` is 1 and the
   lag is small. Until the first generation is live, the list answers the no-generation answer and the detail 404.
-- **Permissions**: the syncer's ClickHouse user needs `ALTER … DROP PARTITION` on `token_lines` and `tokens` (§3).
+- **Permissions**: the syncer's ClickHouse user needs `ALTER DELETE` (the privilege that `ALTER TABLE … DROP PARTITION` asks for) on
+  `token_lines` and `tokens` (§3).
 - **Duration of the first build**: the pass reads all of `trust_line_states` once; on a full XRPL history it takes hours under its
   4 s a tick (the plan measures it on the verification database and records it in `operations.md`).
 

@@ -64,5 +64,6 @@ issuer's toml says of it, its biggest holders and its recent transfers. The inde
 - **Answers are a few ledgers behind the head** (the job's lag; alert `syncer_tokens_lag_ledgers > 300` for 15 minutes), and a toml change shows within tens of minutes. The 15 minutes that a retired
   generation is kept cost its partitions' disk meanwhile.
 - **A job that cannot read its tables stalls the hook for every job.** The hook of `tokens` is the last one of a slice and throws while the job has not read its version floor or its opening reads
-  fail, so `agg_dirty` does not drain: migration 014 must be applied before the syncer starts ([operations](../operations.md#apply-a-schema-migration)).
+  fail, so `agg_dirty` does not drain. A missing migration 014 cannot cause it: the syncer refuses to boot without the tables (the ingest needs `state_touches`, the aggregator all four), as it does
+  without 002 or 012 for their workers ([operations](../operations.md#apply-a-schema-migration)). What is left is ClickHouse failing the job's opening reads ([operations](../operations.md#a-persistent-tokens_dirty)).
 - **An issuer with millions of lines is one statement** of the pass (seconds, hundreds of megabytes: measured in [operations](../operations.md#issued-tokens)); the pass does not split it.
