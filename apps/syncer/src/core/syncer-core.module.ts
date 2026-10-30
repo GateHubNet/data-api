@@ -14,7 +14,7 @@ import { PrometheusService } from '../modules/prometheus/prometheus.service';
 import { WorkerModule } from '../worker-registry';
 import { migrateOnBoot } from './migrate-on-boot';
 import { createNodeClient } from './node-client.provider';
-import { assertTomlsSchema, assertValidatorsSchema } from './schema-check';
+import { assertIssuedTokensSchema, assertTomlsSchema, assertValidatorsSchema } from './schema-check';
 
 /**
  * Token of the async provider that applies the boot-time migrations and then checks that the schema of
@@ -89,6 +89,7 @@ export class SyncerCoreModule {
             const migrated = await migrateOnBoot(config, clickHouse, logger);
             await assertValidatorsSchema(ch, enabledWorkers(config), clickHouse.database, logger);
             await assertTomlsSchema(ch, enabledWorkers(config), clickHouse.database, logger);
+            await assertIssuedTokensSchema(ch, enabledWorkers(config), clickHouse.database, logger);
             return migrated;
           },
           inject: [ClickHouseService],

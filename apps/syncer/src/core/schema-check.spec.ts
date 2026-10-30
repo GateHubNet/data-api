@@ -1,6 +1,13 @@
 import { ClickHouseService, Table } from '@gatehub/data-api-shared';
 import { WorkerName } from '../config/syncer.config';
-import { assertTomlsSchema, assertValidatorsSchema, TOMLS_MIGRATION, VALIDATORS_MIGRATION } from './schema-check';
+import {
+  assertIssuedTokensSchema,
+  assertTomlsSchema,
+  assertValidatorsSchema,
+  ISSUED_TOKENS_MIGRATION,
+  TOMLS_MIGRATION,
+  VALIDATORS_MIGRATION,
+} from './schema-check';
 
 /** The columns of `system.columns` a database has, as `table.column`. */
 const ALL_OF_002 = [
@@ -144,6 +151,93 @@ describe('assertTomlsSchema', () => {
     const warn = jest.fn();
     await expect(assertTomlsSchema(ch, workers('tomls'), 'xrpl', { warn })).resolves.toBe(undefined);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(TOMLS_MIGRATION));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
+  });
+});
+
+describe('assertIssuedTokensSchema', () => {
+  const FOUR = [Table.StateTouches, Table.TokenGenerations, Table.TokenLines, Table.Tokens];
+
+  it('checks nothing when neither the ingest nor the aggregator worker is enabled', async () => {
+    const db = tablesOf();
+    const warn = jest.fn();
+    await assertIssuedTokensSchema(db.ch, workers('validations', 'fee_stats', 'validators', 'tomls'), 'xrpl', { warn });
+    await assertIssuedTokensSchema(db.ch, workers(), 'xrpl', { warn });
+    expect(db.query).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('passes a database with the four tables of 014, reading system.tables of the database with bound values', async () => {
+    const db = tablesOf(...FOUR);
+    await expect(
+      assertIssuedTokensSchema(db.ch, workers('ingest', 'aggregator'), 'xrpl', { warn: jest.fn() }),
+    ).resolves.toBe(undefined);
+    expect(db.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toContain('FROM system.tables');
+    expect(sql).toContain('database = currentDatabase()');
+    expect(params).toEqual({ tables: FOUR });
+  });
+
+  it('asks the ingest worker for state_touches alone, and the aggregator worker for all four', async () => {
+    const ingest = tablesOf(Table.StateTouches);
+    await expect(
+      assertIssuedTokensSchema(ingest.ch, workers('ingest', 'tomls'), 'xrpl', { warn: jest.fn() }),
+    ).resolves.toBe(undefined);
+    expect(ingest.query.mock.calls[0][1]).toEqual({ tables: [Table.StateTouches] });
+
+    const aggregator = tablesOf(...FOUR);
+    await expect(
+      assertIssuedTokensSchema(aggregator.ch, workers('aggregator'), 'xrpl', { warn: jest.fn() }),
+    ).resolves.toBe(undefined);
+    expect(aggregator.query.mock.calls[0][1]).toEqual({ tables: FOUR });
+  });
+
+  it('fails the boot of the ingest worker on a database without 014, naming the migration and state_touches', async () => {
+    const check = assertIssuedTokensSchema(tablesOf(Table.Ledgers).ch, workers('ingest', 'fee_stats'), 'xahau', {
+      warn: jest.fn(),
+    });
+    await expect(check).rejects.toThrow(ISSUED_TOKENS_MIGRATION);
+    expect(ISSUED_TOKENS_MIGRATION).toBe('014_issued_tokens.sql');
+    await expect(check).rejects.toThrow(`(table ${Table.StateTouches})`);
+    await expect(check).rejects.toThrow('the ingest worker writes');
+    await expect(check).rejects.toThrow('database "xahau"');
+    await expect(check).rejects.toThrow('apply the migrations');
+  });
+
+  it('fails the boot of the aggregator worker on a database without 014, naming all four tables', async () => {
+    const check = assertIssuedTokensSchema(tablesOf(Table.Ledgers).ch, workers('aggregator'), 'xrpl', {
+      warn: jest.fn(),
+    });
+    await expect(check).rejects.toThrow(
+      `(table ${Table.StateTouches}, table ${Table.TokenGenerations}, table ${Table.TokenLines}, table ${Table.Tokens})`,
+    );
+    await expect(check).rejects.toThrow('the aggregator worker reads and writes');
+  });
+
+  it('names both workers when both are enabled', async () => {
+    const check = assertIssuedTokensSchema(tablesOf().ch, workers('ingest', 'aggregator'), 'xrpl', { warn: jest.fn() });
+    await expect(check).rejects.toThrow('the ingest worker writes and the aggregator worker reads and writes');
+  });
+
+  it('names exactly the tables that are missing', async () => {
+    const half = tablesOf(Table.StateTouches, Table.TokenGenerations);
+    const check = assertIssuedTokensSchema(half.ch, workers('aggregator'), 'xrpl', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(`(table ${Table.TokenLines}, table ${Table.Tokens})`);
+    // the ingest worker does not need the aggregates: the same database lets it start
+    await expect(assertIssuedTokensSchema(half.ch, workers('ingest'), 'xrpl', { warn: jest.fn() })).resolves.toBe(
+      undefined,
+    );
+  });
+
+  it('does not fail the boot when the check cannot be made, and says so', async () => {
+    const ch = {
+      query: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:8123')),
+    } as unknown as Pick<ClickHouseService, 'query'>;
+    const warn = jest.fn();
+    await expect(assertIssuedTokensSchema(ch, workers('aggregator'), 'xrpl', { warn })).resolves.toBe(undefined);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(ISSUED_TOKENS_MIGRATION));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
   });
 });

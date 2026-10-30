@@ -117,10 +117,12 @@ async function waitFor<T>(probe: () => Promise<T | undefined>, what: string, tim
 
 describe('AppModule on a real ClickHouse', () => {
   let app: INestApplication | undefined;
-  afterEach(async () => {
+  /** Closes the app that `bootApp` made last (the compiler cannot see that `bootApp` assigns it). */
+  async function closeApp(): Promise<void> {
     await app?.close();
     app = undefined;
-  });
+  }
+  afterEach(closeApp);
 
   /** Builds the AppModule (fresh module registry: it reads GH_* on import), with only the node client faked. */
   async function bootApp(env: Record<string, string>): Promise<string> {
@@ -166,18 +168,23 @@ describe('AppModule on a real ClickHouse', () => {
     expect(res.status).toBe(200);
   });
 
+  /** Runs `run` with a schema folder that holds only the named migrations: a database that was never upgraded past them. */
+  async function withMigrations<T>(files: string[], run: (schemaDir: string) => Promise<T>): Promise<T> {
+    const dir = mkdtempSync(join(tmpdir(), 'syncer-schema-'));
+    try {
+      for (const file of files) copyFileSync(join(SCHEMA_DIR, file), join(dir, file));
+      return await run(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   it('fails the boot, naming 002_validators_amendments.sql, when the validations worker runs on a database of 001 alone', async () => {
     const database = 'syncer_app_e2e_without_002';
-    // a database that was never upgraded: the migration runner applies a folder that holds 001 alone
-    const only001 = mkdtempSync(join(tmpdir(), 'syncer-schema-001-'));
-    try {
-      copyFileSync(join(SCHEMA_DIR, '001_baseline.sql'), join(only001, '001_baseline.sql'));
-      await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: only001 });
-    } finally {
-      rmSync(only001, { recursive: true, force: true });
-    }
-    await app?.close();
-    app = undefined;
+    await withMigrations(['001_baseline.sql'], (schemaDir) =>
+      bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
+    );
+    await closeApp();
     const tables = await tablesOf(database);
     expect(tables).toEqual(expect.arrayContaining(['validations', 'validator_manifests', 'schema_migrations']));
     expect(tables).not.toContain('validator_seen');
@@ -185,8 +192,43 @@ describe('AppModule on a real ClickHouse', () => {
     await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'validations' })).rejects.toThrow(
       /lacks the schema of 002_validators_amendments\.sql \(column validations\.server_version, .*\), which the validations worker writes/,
     );
-    // the other workers do not need it
-    await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' });
+    // the other workers do not need 002: the aggregator is refused for the schema of 014 alone
+    const refused = await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' }).catch(
+      (err: Error) => err,
+    );
+    expect(refused).toBeInstanceOf(Error);
+    expect((refused as Error).message).toContain('lacks the schema of 014_issued_tokens.sql');
+    expect((refused as Error).message).not.toContain('002_validators_amendments.sql');
+  });
+
+  it('fails the boot, naming 014_issued_tokens.sql, when the ingest or the aggregator worker runs on a database of 001 alone', async () => {
+    const database = 'syncer_app_e2e_without_014';
+    await withMigrations(['001_baseline.sql'], (schemaDir) =>
+      bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
+    );
+    await closeApp();
+    expect(await tablesOf(database)).not.toContain('state_touches');
+
+    await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'ingest' })).rejects.toThrow(
+      /lacks the schema of 014_issued_tokens\.sql \(table state_touches\), which the ingest worker writes/,
+    );
+    await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' })).rejects.toThrow(
+      /lacks the schema of 014_issued_tokens\.sql \(table state_touches, table token_generations, table token_lines, table tokens\), which the aggregator worker reads and writes/,
+    );
+    // the same database lets a syncer without a worker that needs 014 start, and the migration lets the aggregator start
+    await bootApp({ GH_CLICKHOUSE_DATABASE: database });
+    await closeApp();
+    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql'], (schemaDir) =>
+      bootApp({
+        GH_CLICKHOUSE_DATABASE: database,
+        GH_WORKERS: 'aggregator',
+        GH_RUN_MIGRATIONS_ON_BOOT: 'true',
+        GH_SCHEMA_DIR: schemaDir,
+      }),
+    );
+    expect(await tablesOf(database)).toEqual(
+      expect.arrayContaining(['state_touches', 'token_generations', 'token_lines', 'tokens']),
+    );
   });
 
   it('leaves the database alone when migrations are off', async () => {

@@ -122,3 +122,66 @@ export async function assertTomlsSchema(
       'GH_RUN_MIGRATIONS_ON_BOOT=true) and start the syncer again',
   );
 }
+
+/** The migration that adds what the ingest writes with every ledger (`state_touches`) and what the aggregator's `tokens` job keeps. */
+export const ISSUED_TOKENS_MIGRATION = '014_issued_tokens.sql';
+
+/**
+ * The tables of `ISSUED_TOKENS_MIGRATION` each worker needs, and what it does with them. The ingest writes `state_touches` with every
+ * ledger; the `tokens` job of the aggregator reads that table and keeps the three aggregates.
+ */
+const ISSUED_TOKENS_NEEDS: ReadonlyMap<WorkerName, { tables: readonly Table[]; does: string }> = new Map([
+  ['ingest', { tables: [Table.StateTouches], does: 'writes' }],
+  [
+    'aggregator',
+    {
+      tables: [Table.StateTouches, Table.TokenGenerations, Table.TokenLines, Table.Tokens],
+      does: 'reads and writes',
+    },
+  ],
+]);
+
+/**
+ * Fails the boot when the ingest or the aggregator worker is enabled and the database lacks the tables of `014_issued_tokens.sql`
+ * the worker needs (the ingest `state_touches`, the aggregator all four): without them the live runner would retry the same ledgers
+ * without end, and a `tokens` job that cannot read its generations makes its hook throw on every `agg_dirty` slice, so that the
+ * queue stops draining for every job. It runs after the boot-time migrations. A check that cannot be made (ClickHouse unreachable)
+ * does not fail the boot: it is said, and the workers report the failures of their reads and writes as they always do.
+ */
+export async function assertIssuedTokensSchema(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+): Promise<void> {
+  const workers = [...ISSUED_TOKENS_NEEDS.keys()].filter((name) => enabled.has(name));
+  if (workers.length === 0) return;
+  const wanted = [...new Set(workers.flatMap((name) => ISSUED_TOKENS_NEEDS.get(name)?.tables ?? []))];
+  const who = (list: readonly WorkerName[]): string =>
+    `${list.join(' and ')} ${list.length === 1 ? 'worker' : 'workers'}`;
+  let rows: { table_name: string }[];
+  try {
+    rows = await ch.query<{ table_name: string }>(
+      `SELECT name AS table_name
+         FROM system.tables
+        WHERE database = currentDatabase() AND name IN {tables:Array(String)}
+        ORDER BY name`,
+      { tables: wanted },
+    );
+  } catch (err) {
+    logger.warn(
+      `Could not check that ${ISSUED_TOKENS_MIGRATION} is applied (${err instanceof Error ? err.message : String(err)}); ` +
+        `the ${who(workers)} ${workers.length === 1 ? 'starts' : 'start'} without the check`,
+    );
+    return;
+  }
+  const present = new Set(rows.map((row) => row.table_name));
+  const missing = wanted.filter((table) => !present.has(table)).map((table) => `table ${table}`);
+  if (missing.length === 0) return;
+  const needs = workers.map((name) => `the ${name} worker ${ISSUED_TOKENS_NEEDS.get(name)?.does}`).join(' and ');
+  throw new Error(
+    `The ClickHouse database "${database}" lacks the schema of ${ISSUED_TOKENS_MIGRATION} (${missing.join(', ')}), which ` +
+      `${needs}: apply the migrations (pnpm --filter @gatehub/data-api-shared ch:migrate, or GH_RUN_MIGRATIONS_ON_BOOT=true) ` +
+      'and start the syncer again',
+  );
+}
