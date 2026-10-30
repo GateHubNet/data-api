@@ -243,6 +243,29 @@ failed` the cause is (2), and the slice waits for a step that commits): the slic
 `SELECT count() FROM xrpl.agg_dirty` does not fall, and the earlier hooks of the slice (rates, pairs, rollups, `nft_dirty`) run again at every tick until it works; fix the cause and the
 next tick drains the queue. (5) `SYSTEM STOP MERGES` on `xrpl.escrows` stops the lightweight `DELETE` a step may wait for: start merges again.
 
+### `/v2/tokens` lists nothing, a token answers 404, a token is not `listed`, or `syncer_tokens_lag_ledgers` is high
+**Nothing is listed (`"count": 0, "tokens": []`) and a token is 404 `token not found`.** Four causes, in the order to look. (1) **No generation is live yet**: a new database, or a first build under way
+(hours on a full XRP Ledger history). `syncer_tokens_live` is 0; `syncer_tokens_building` 1 with `tokens: generation N: the account pass is at <account> ...` in the log is the build, 0 and nothing
+logged is a job that does not run (the `aggregator` worker is off, or the first run failed: look for `Aggregator job tokens failed`). (2) **The token has no counting line, or its lines have not changed since the
+coverage starts**: the answer's `coverage` has `"complete": false` until the state tables are whole from ledger 32,570 (`SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3` is the
+newest ledger the state tables lack), and a line that has not changed since `from_ledger_index` is not known ([backfill](backfill.md#account-state-history-re-ingest)). Filling the history builds a new generation by itself.
+(3) **The currency is an AMM's LP token** (`03` and 38 hex digits): never a token here, the pool's page is `/v2/amm/pools`. (4) **The path**: `usd` names `USD`, a code outside rippled's set is
+400 `invalid currency`, and a 3-character code and its 40-hex form are the same token ([api-reference](api-reference.md#tokens)).
+**A token is not `listed`, or has no `domain`.** The listing is two-way and comes from D4's store: the issuer's account must have a Domain in `account_domains` (seed it, [backfill](backfill.md#account-domains-seed)), the
+`tomls` worker must have read that domain's toml (`GET /v2/toml/{domain}`, [Account names and tomls](api-reference.md#account-names-and-tomls)), and the toml must have a `[[CURRENCIES]]` entry with the token's code and
+issuer that counts on this network (`network` empty or the network's name). A change shows after the job's sweep, within tens of minutes ([operations](operations.md#issued-tokens)).
+**`syncer_tokens_lag_ledgers` is high or stays still.** The gauge follows the head also while the job's steps fail; a database that is down freezes it, so read it with
+`rate(syncer_aggregator_errors_total{job="tokens"}[15m])`. Causes: a step that fails (a window, a batch, a rebuild check: `Aggregator job tokens failed...`, and after two in a row it waits 5 minutes,
+doubling to an hour), a window of a heavy ledger (a few seconds: it halves itself and the lag falls once it is applied), a reprocess whose repair is under way (`syncer_tokens_repair_ledgers` above 0), or a
+generation marked stale whose replacement is still building (`syncer_tokens_building` 1: the live one serves meanwhile, with its last `through_ledger`).
+
+### `agg_dirty` does not drain: the tokens hook fails
+**Symptom:** `SELECT count() FROM xrpl.agg_dirty` does not fall, `syncer_aggregator_errors_total{job="tokens_dirty"}` rises at each tick, and the log has `Aggregator job tokens_dirty failed in <from> - <to>: ...`
+(`the tokens job has not read its version floor yet` or `could not read its generations at its last run`). The hook of the `tokens` job is the last of a slice's hooks and refuses to run while the job cannot
+read its generations, so the slice stays queued **for every job** and its earlier hooks run again at each tick. The usual cause is **migration 014 not applied** before the syncer started (`Table ...
+token_generations doesn't exist` in the log of the job): apply it (`dc run --rm migrate-xrpl`), and the next tick drains the queue. Otherwise the opening reads fail for another reason (ClickHouse down, a
+memory or time limit): fix it. No mark is lost meanwhile ([operations](operations.md#a-persistent-tokens_dirty)).
+
 ### The Xahau syncer is halted on a payment channel that holds an issued token
 **Symptom:** `state=halted` and `error: Cannot parse ledger <index>: ... dropsToNative: invalid value '[object Object]' ...`. Before parser version 7, `BalanceChangesParser` read the amounts of a payment channel as drops, and a channel that holds an issued token (Xahau, `PaychanAndEscrowForTokens`) made it
 throw, so the live syncer stopped at its ledger (`state=halted`, [operations](operations.md#syncer-halted)) and a range-ingest chunk with it failed. This release types the amounts, and

@@ -331,6 +331,16 @@ account domains, and `readStoredTomls` of their distinct domains, matched in the
 shows within D4's schedule plus ten minutes. The api never reads the store for tokens: the answers serve the token rows
 (`DomainTomlsService.get(domain)` stays D4's route's and the account page's).
 
+*Amended 2026-10-30 by the D6 build (Tasks 6 and 7, written in the docs by Task 13):* the sweep is not one pass over every token. It runs in
+**resumable steps** of `TOKENS_STATE_CHUNK` tokens from a cursor the runner keeps in memory (a step never reads every token and domain), as many
+steps to a housekeeping run as the job's budget allows; a sweep the budget cut goes on at the next housekeeping, and one that has read the last
+token starts over from the first at the next. A step reads the next tokens as §3.1's amendment reads the accounts, `GROUP BY issuer, currency` with
+`argMax` of the version, `ORDER BY` the key and `LIMIT` with `optimize_aggregation_in_order` (`LIMIT 1 BY` would read every row after the
+cursor); the reads of a step go by chunks, and only the live generation is swept (a building one matches each token as it computes it). The real
+bound of "a toml change shows" is therefore not ten minutes: the housekeeping runs at every tenth run (about every ten minutes), a sweep of the
+about 50,000 tokens of the XRP Ledger can take more than one of them when the budget cuts it, and D4's `tomls` worker has to have read the changed toml first, so **a change
+shows within tens of minutes** on the XRP Ledger, after the worker's own schedule.
+
 ### 3.8 Metrics
 
 | Metric | |

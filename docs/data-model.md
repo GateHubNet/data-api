@@ -478,8 +478,9 @@ rows in it until it is re-ingested. Columns: `ledger_index`, `tx_index`, `kind` 
 `currency` (`LowCardinality`). For a `line` row `account` is the line's low account, `counterparty` its high account and `currency` the currency
 as the ledger writes it; for an `account` row `counterparty` and `currency` are `''`. The `tokens` job of the aggregator finds the lines and
 issuers that changed since its cursor by a range of the primary key: the two state tables are ordered by account, so a ledger range is no key
-range there, and the merged part that holds the newest ledgers would be read whole at every tick. About one row per changed trust line node,
-compressed small like `amm_pool_touches`.
+range there, and the merged part that holds the newest ledgers would be read whole at every tick. About one row per changed trust line node (and a
+few `account` rows): about 25 to 40 rows a ledger on the mainnet ledgers recorded in the repository, so some 700,000 a day, and about 70 to 90 bytes a row compressed
+([operations](operations.md#measured-on-synthetic-data)); small, like `amm_pool_touches`.
 
 ## 3. Node-sourced, aggregate and internal tables
 
@@ -617,7 +618,7 @@ version already written, as text. **Readers name one generation (`generation = {
 | --- | --- | --- | --- |
 | `token_generations` | `generation`, no partition | The job's state, one row for every change of a generation, the newest `version` of a `generation` is its state: `state` (`Enum8`: `building`, `live`, `retired`), `config_version UInt16`, `coverage_from` (the state coverage start the generation was built on), `head_ledger` (the ledger its account pass reads at), `account_cursor` (the last account the pass finished, `''` before the first), `pass_done UInt8`, `through_ledger` (the ledger up to which every touch has been applied), `repair_from` (the lowest ledger to apply again, 0: none), `holders` (the distinct holders of all tokens at `holders_ledger`), `started_at` and `changed_at` (`DateTime64(3, 'UTC')`). The live generation is the highest whose newest row is `live` | the `tokens` job |
 | `token_lines` | `(issuer, currency, holder)`, `PARTITION BY generation` | The state of every trust line that counts, from the token's side: `balance` (the holder's, 0 or above, exact text) with `balance_f` (`Float64`), `limit` (the holder's), `frozen` and `authorized` (the issuer side's flags), `ledger_index` (the line's newest state), `deleted UInt8` (a tombstone: the line no longer counts) and `version` | the `tokens` job, a token's holders |
-| `tokens` | `(issuer, currency)`, `PARTITION BY generation` | One row per token and recompute: `code` (the currency as text, `''` when it has none), `holders`, `trust_lines`, `supply` (exact text) with `supply_f`, `last_ledger`, the issuer's settings at the ledger the row was computed at (`issuer_flags`, `transfer_rate`, `issuer_ledger`, 0 when the issuer has no state row), `domain`, the toml listing (`listed UInt8`, `name`, `toml`: the JSON of the served fields of the matched currency entry, `''` when not listed), `deleted UInt8` (no line counts any more) and `version` | the token list and detail |
+| `tokens` | `(issuer, currency)`, `PARTITION BY generation` | One row per token and recompute: `code` (the currency as text, `''` when it has none), `holders`, `trust_lines`, `supply` (exact text) with `supply_f`, `last_ledger`, the issuer's settings at the ledger the row was computed at (`issuer_flags`, `transfer_rate`, `issuer_ledger`, 0 when the issuer has no state row), `domain`, the toml listing (`listed UInt8`, `name`, `toml`: the JSON of the served fields of the matched currency entry, `''` when not listed), `deleted UInt8` (no line counts any more) and `version` | the token list, the detail and the holders of a token |
 
 ## 4. Relationships
 

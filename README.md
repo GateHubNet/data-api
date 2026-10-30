@@ -133,6 +133,7 @@ Full contract: [docs/api-reference.md](docs/api-reference.md).
 | NFTs (extras, both networks) | `/v2/nfts/{nft_id}`, `/v2/nfts/{nft_id}/{history,offers}`, `/v2/accounts/{address}/{nfts,nft_history}`, `/v2/nft_collections`, `/v2/nft_collections/{issuer}/{taxon}` (XRPL) or `/{issuer}` (Xahau) with `/{nfts,holders,sales,stats}`, `/v2/nft_sales`; each answer has `coverage` |
 | Names (extras) | `/v2/account_names?addresses=` (the display names, domains and labels of up to 100 addresses), `/v2/toml/{domain}` (what a domain's toml says, as the syncer last read it) |
 | Ledger objects (extras, both networks) | `/v2/escrows/{id}`, `/v2/checks/{id}`, `/v2/payment_channels/{id}`, each with `/history` (an object's state and the transactions that changed it, with `status` and `coverage`), `/v2/accounts/{address}/escrows/{sequence}` (an escrow by owner and sequence), `/v2/accounts/{address}/delegations` (`direction=given\|held`; empty on Xahau), `/v2/ledger_objects/{id}` (which kind of object an ID is) |
+| Tokens (extras, both networks) | `/v2/tokens` (the issued tokens ranked by holders; `kind`, `min_holders`, `q`), `/v2/tokens/{currency}.{issuer}` (one token: supply, price, the issuer's settings, its toml entry, its markets), `.../holders` and `.../transfers`; each answer has `coverage` |
 | Validations | `/v2/ledgers/{hash}/validations[/{pubkey}]` (alias `/v2/ledger/...`) |
 | Validators | `/v2/network/validators[/{key}]`, `/v2/network/validators/summary`, `/v2/network/validators/{key}/validations` |
 | Amendments | `/v2/network/amendments[/{name}]` |

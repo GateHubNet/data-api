@@ -64,7 +64,7 @@ Everything both services need, written once:
   (`config/amendments/<family>.json`), read by the testnet of the family without its `enabled` entries.
 - **`clickhouse/`**: config, the thin typed `ClickHouseService` (bound parameters, per-query guards, synchronous inserts with dedup
   tokens), `Table` enum, row types, the tracked migration runner.
-- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, and the history of escrows, checks, payment channels and delegations) and
+- **`parsers/`** and **`ingest/`**: pure parsers (payments, exchanges, balance changes, accounts created, affected accounts, AMM, path payments, NFTs and URITokens, the history of escrows, checks, payment channels and delegations, and the index of the trust lines and issuers a transaction changed, `state_touches`) and
   `buildLedgerRows` (a raw ledger -> rows of the 32 ledger-derived tables), the `LedgerSource` interface (`RpcLedgerSource`,
   `FixtureLedgerSource`; a SQLite history importer would be another), `LedgerWriter` and the ingest-state helpers (checkpoint,
   partition-scoped deletes, quiescence).
@@ -80,7 +80,7 @@ Everything both services need, written once:
   (`amm-reads.ts`, the windowed fill-forward of pool state in `amm-pools.job.ts`), the jobs of the account and market aggregates
   (`rates_daily`, `pair_hourly`, `markets_live`, `account_rollups`), the NFT jobs (`nft_state`, `nft_collections`, with `foldNftEvents`, the one
   fold of an NFT's events that the job and the API's detail route share, and the prices of sales in `query/nft-prices.ts`) and the `escrows` job (the
-  current state of every escrow and the sentinel that holds the escrowed total for D7).
+  current state of every escrow and the sentinel that holds the escrowed total for D7) and the `tokens` job (the generations of the issued tokens built from the state history and the touch index: `tokens.job.ts`, with the pure rules of a token in `token-rules.ts`).
 
 ### Syncer: `apps/syncer` (`@gatehub/data-syncer`)
 
@@ -105,7 +105,7 @@ A NestJS REST service that reads ClickHouse with parameterised SQL and serves th
   short API timeouts, for balances and orders), `CacheService`.
 - **Guards:** `ApiKeyGuard` (before) `ApiThrottlerGuard` (per client address and route, or per key and route for a key in `GH_RATE_LIMIT_KEYS`); `MetricsInterceptor`.
 - **Endpoint modules** (`ledgers`, `transactions`, `payments`, `exchanges`, `accounts` with the analytics routes, `active-accounts`, `network` with the markets route, `amm`,
-  `nft`, `names`, `ledger-objects`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
+  `nft`, `names`, `ledger-objects`, `tokens`, `validations`, `validators` with the amendments routes, `stats`, `exports`): see [api-reference](api-reference.md). Ops controllers (`/liveliness/healthz`) are unversioned.
 - Boots through the toolbox `bootstrap()`: Swagger at `/internal/docs`, metrics on a second port, validation pipe disabled (it rejects
   unknown query parameters; the Ripple API ignores them), compression, CORS, `trust proxy` applied in `onModuleInit`.
 
@@ -170,6 +170,26 @@ The escrow, check, payment channel and delegation routes are GateHub extras ([AD
 - **Delegations** read the account's prefix of `account_object_changes` for `Delegate` and the role, the newest row of each ID and those that are not deleted (at most 10,000
   IDs), then their newest `object_changes` rows 1,000 IDs at a time, and sort and page them in memory.
 - **Reads** are bounded by `read_rows` tests (`paged-reads.e2e-spec.ts`, over a bulk of other objects' rows): the object's prefix and `H` on every read.
+
+#### The tokens module (`apps/api/src/tokens`)
+
+The four routes of the issued tokens are GateHub extras ([ADR-0019](adr/0019-issued-tokens-from-state-history.md)); `TokensModule` is in `ENDPOINT_MODULES` before `NotFoundModule`
+(`app.module.spec.ts` pins its place) and imports `NetworkModule` (for `MarketsService`) and `PaymentsModule` (for `PaymentsService`).
+
+- **One controller, four routes, in this order:** `TokensController` has the list, `:token/holders`, `:token/transfers` and `:token`, so that no path shadows another. The list is served by the `TokenListService`
+  of the kind asked for, found in the `TOKEN_LIST_SERVICES` map: the controller knows no kind but through it, so that D9 adds `mpt` with a service and a line in the map and changes nothing else. Every check
+  of a route (the path, the parameters, the marker) is made before the first read.
+- **The generation.** `TokensService` reads `token_generations` once for all requests of five seconds (`CacheService`, one fixed key) and takes the live generation, its `through_ledger` and the close time of that
+  ledger from `ledgers`; every read of `tokens` and `token_lines` names the generation, so one partition is read. A live generation whose ledger is not stored is a 500, not a guess. The list is
+  the newest row of each token (`LIMIT 1 BY`, `deleted` dropped after it) with `row_number()` for the rank, the counts in one more read of the same rows; the detail is a point read; `TokenHoldersService` reads the
+  token's prefix of `token_lines` (the newest row per holder inside, the order and the rank outside, then the marker).
+- **Price and markets at request time.** `TokenMarkets` reads the newest `include` sets of `markets_live` (`day` and `30day`) through the `MarketsService` and keeps them 30 s under two fixed keys of `CacheService`
+  (the clear route clears them); the pure turning of a pair so that the token is the base is in `token-markets.ts`.
+- **The transfers** are `TokenTransfersService`, which calls `PaymentsService.list` with the token as the asset (the `payments_by_currency` read of `/v2/payments`) and maps the rows; it never reads the aggregate, so
+  there is no 404. Their coverage is the feature `token_transfers`, the others' `issued_tokens` (`common/coverage-features.ts`).
+- **Objects in one file.** `token-objects.ts` holds every object, its key order (the `*_KEYS` constants that the tests and `tokens/api-reference.spec.ts` pin), its CSV columns and the builders;
+  `token-param.ts` the path, `token-list.ts` the query, the marker and the envelope of the list.
+- **Reads** are bounded by `read_rows` tests (`tokens.e2e-spec.ts`, over a bulk of other tokens' rows and the retired generation's; `paged-reads.e2e-spec.ts` for the transfers).
 
 #### The names module (`apps/api/src/names`)
 

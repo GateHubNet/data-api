@@ -130,6 +130,9 @@ address.
   `query_params` with typed placeholders (`{currency:String}`, `{limit:UInt32}`), never by string interpolation. Pagination and
   `IN (...)` clauses emit placeholders too. The only interpolated parts are table names (from the `Table` enum, enforced by a unit test),
   column lists and sort keys, all hard-coded; interval expressions come from a fixed whitelist.
+- **Search and the tokens.** The search `q` of `GET /v2/tokens` (1 to 64 characters) is a bound parameter used with `positionCaseInsensitiveUTF8` and `startsWith`, never a `LIKE` pattern, so `%` and `_` match
+  themselves; the path of a token is parsed into a currency and a classic address before any read. What the toml of an issuer says of a token (`toml` of the detail: names, descriptions, a URL) is the text
+  an issuer chose, served as data in a fixed set of keys and never fetched; the job and the api never request a toml ([ADR-0019](adr/0019-issued-tokens-from-state-history.md)).
 - **Resource guards:** every SELECT carries `max_execution_time` and `max_memory_usage` (`GH_CLICKHOUSE_MAX_EXECUTION_TIME`,
   `GH_CLICKHOUSE_MAX_QUERY_MEMORY`), and endpoints bound their own work (`limit` maxima, the 200-day report window, capped candle pages,
   node timeouts for live lookups).
@@ -185,7 +188,8 @@ Production compose (`docker-compose.prod.yaml`):
 - **Load-test override.** `docker-compose.prod.override.yaml` publishes ClickHouse on the host for seeding; never use it in production.
 - **Dev compose:** everything is published on `127.0.0.1` only, and the dev API key is `dev-api-key`.
 - **ClickHouse users:** a dedicated `data_api` user (access management enabled), not `default`. The api and the syncers share it
-  (full access); a read-only user for the api would be better.
+  (full access); a read-only user for the api would be better. **A narrower user for the syncer still needs `ALTER ... DROP PARTITION` on `token_lines` and `tokens`**: the `tokens` job drops the
+  partitions of a retired generation (the number is made by the job and checked as an integer, the one statement that takes no bound parameter; [clickhouse](clickhouse.md), [syncer](syncer.md#the-tokens-job)).
 
 ### Outbound HTTPS to arbitrary public hosts (syncer)
 

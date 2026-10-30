@@ -463,6 +463,48 @@ How it behaves:
 - **The reprocess of a range that is already version 7** deletes and writes its rows again, in both tables, like every child table; the `escrows` hook then recomputes
   the escrows of the range, so an escrow whose rows a reprocess made vanish is removed from the aggregate.
 
+### Issued tokens re-ingest
+
+`PARSER_VERSION` became 8 with the touch index of the issued tokens (`TOKEN_PARSER_VERSION`, [ADR-0019](adr/0019-issued-tokens-from-state-history.md)). From the deploy on, the live syncer writes `state_touches`: a row for
+each trust line a transaction created, deleted or changed and for each issuer whose flags, transfer rate or domain changed (or that sent an `AccountSet`), in the order of the ledgers. The ledgers written before it
+have none. Both networks have the data: the XRP Ledger's trust lines and Xahau's.
+
+**The aggregate of the issued tokens needs no re-ingest.** The `tokens` job builds its first generation from `trust_line_states` as it is (the account pass), and needs the touches only above the ledger the
+generation was built at. What decides how much of the history the tokens show is the **state tables**, not this parser: the `coverage` of `/v2/tokens`, `/v2/tokens/{currency}.{issuer}` and `/holders` is the feature `issued_tokens`,
+which starts at the first ledger of the network (32,570 on the XRP Ledger, 1 on Xahau) and is `complete` when every ledger from there is written by parser version 3 or later, the
+[account state history](#account-state-history-re-ingest) back to its first ledger. The transfers (`token_transfers`) are payments, which every stored ledger has.
+
+| | XRPL | Xahau |
+| --- | --- | --- |
+| Coverage of the tokens starts at | **32,570**, the first ledger | **1**, the genesis |
+| Fill the state tables with | `--from 32570` | `--from 1` (`--concurrency 1` on the public node) |
+
+**What a re-ingest does to the tokens.**
+- **Filling the state tables further back** moves the state coverage start, and the job builds a **new generation** by itself (its `coverage_from` is no longer the start): the pass over the wider
+  `trust_line_states`, hours, with the live generation serving until it is promoted ([operations](operations.md#issued-tokens)).
+- **A `--reprocess` of a range** writes the touches of its ledgers, as for every table, and marks its hours in `agg_dirty`. Each slice's **`tokens` hook**, the last of the hooks, lowers the `repair_from` of the live and the
+  building generation to the slice's first ledger, and the job applies the touches of `[repair_from, through_ledger]` again, 500 ledgers a window, reading the state at `through_ledger` (a line changed in the range
+  and again later keeps its later state). A window that meets a ledger written by an **older parser** (one without touches) ends the repair and marks a **rebuild**: a new generation is built from the state
+  tables beside the live one and swapped in, which is how the **program's one reprocess**, over the whole history after its last parser version (about **108 million ledgers, 216,000 windows of 500**), reaches the tokens.
+  The rebuild is hours, once at a time; expect more than one while a reprocess runs from the oldest ledger up, because the repair keeps reaching ledgers not yet reprocessed ([operations](operations.md#issued-tokens)).
+- **The testnets** get no backfill, and their tokens stay `complete: false`.
+
+**Prerequisites for the listing.** A token is `listed`, and has a `domain`, only when the issuer's account domain is known and its toml was read: seed `account_domains` from the state history first
+([Account domains seed](#account-domains-seed)) and let the `tomls` worker make its first sweep ([operations](operations.md#the-display-names)), or the tokens are built with no domain and no listing, and the job's
+toml sweep corrects them as the domains are read.
+
+Check the coverage and the build:
+
+```sql
+-- the state tables cover the ledgers above this one (NULL: every stored ledger)
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3;
+-- the touches exist from this ledger on (the ledgers below it were written before parser version 8)
+SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 8;
+-- the generations of the issued tokens (building, live, retired) and how far each is
+SELECT generation, argMax(state, version) AS state, argMax(through_ledger, version) AS through_ledger, argMax(repair_from, version) AS repair_from
+FROM xrpl.token_generations GROUP BY generation ORDER BY generation;
+```
+
 ### Public nodes and rate limits
 
 Public nodes limit what one client may ask, and say how long to wait: `rate limit: units quota (50000 per 10s) exhausted, retry in

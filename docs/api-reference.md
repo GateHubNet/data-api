@@ -14,7 +14,7 @@ API at `/internal/docs`, `/internal/docs-json`). The reasons behind every delibe
 Contents: [Conventions](#conventions) · [Ledgers](#ledgers) · [Transactions](#transactions) · [Payments](#payments) ·
 [Path payments](#path-payments) · [Exchanges](#exchanges) · [Rates and normalize](#exchange-rates-and-normalize) · [Accounts](#accounts) ·
 [Active accounts](#active-accounts) · [Network](#network) · [AMM](#amm) · [NFTs](#nfts) · [Account names and tomls](#account-names-and-tomls) ·
-[Ledger objects](#ledger-objects) · [Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
+[Ledger objects](#ledger-objects) · [Tokens](#tokens) · [Validations](#validations) · [Validators and amendments](#validators-and-amendments) · [Stats](#stats) · [Exports](#exports) ·
 [Operational endpoints](#operational-endpoints)
 
 ---
@@ -205,7 +205,7 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 ### Coverage
 
 A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (the
-[NFTs](#nfts) and the [ledger objects](#ledger-objects); later features of the same program register with the same service and add no rule of their own) put
+[NFTs](#nfts), the [ledger objects](#ledger-objects) and the [tokens](#tokens); later features of the same program register with the same service and add no rule of their own) put
 
 ```json
 "coverage": { "from_ledger_index": 107874617, "complete": false }
@@ -228,7 +228,9 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
     while the node's ledger state lists them. Where no enabling ledger is known, `complete` is false.
   - A feature **as old as the network**, with no amendment, starts at the network's first ledger: **32,570** on the XRP
     Ledger and **1** on Xahau, its genesis, so complete coverage on Xahau needs ledger 1 indexed (`range-ingest --from 1`). The escrows, payment
-    channels and checks of Xahau are such features: it has had them since its genesis, and its coverage starts at ledger 1.
+    channels and checks of Xahau are such features: it has had them since its genesis, and its coverage starts at ledger 1. The issued tokens are such a feature on every
+    network: the list, the detail and the holders (made of the state tables, `issued_tokens`) and the transfers (the payments, `token_transfers`) each start at the first ledger,
+    so on a testnet they are never complete.
   - **The testnets** have no first ledger (their index starts at the validated head of their deployment's first boot and is dropped when the
     network is reset) and ignore the enable ledgers of the metadata file, which are mainnet's: a feature as old as the network is always
     `complete: false` there, and a feature of an amendment only when the index holds the amendment's `EnableAmendment`. They are not
@@ -237,7 +239,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
     Xahau Testnet, which have no permission delegation.
 - **One item.** The detail of one item (an NFT, with its history and offers; an escrow, a check or a payment channel, each with its history) states its own
   coverage: the feature's, and complete also when the item's creation is indexed (its mint, or the transaction that created it, is at or above
-  `from_ledger_index`), whatever came before it.
+  `from_ledger_index`), whatever came before it. The detail of a token is the exception: it states the feature's `issued_tokens`, with no coverage of its own.
 - **Freshness.** A feature's coverage is kept for 60 seconds. A read of it that fails fails the route with the route's own 500 message, and no
   `complete: false` is invented in its place.
 - **Placement.** `coverage` is the key after `result` on every answer derived from ledger history, lists, aggregates and details alike. An
@@ -246,7 +248,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
   carry none.
 
 Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
-does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, and the parser of the ledger objects is version 7.
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of come with version 3 and the payments their transfers are read from with version 1.
 
 ### Compatibility
 
@@ -300,6 +302,11 @@ From the ledger objects ([ADR-0018](adr/0018-ledger-object-history.md), [ADR-001
 [Ledger objects](#ledger-objects), `GET /v2/escrows/{id}`, `/v2/checks/{id}` and `/v2/payment_channels/{id}`, each with its `/history`,
 `GET /v2/ledger_objects/{id}`, `GET /v2/accounts/{address}/escrows/{sequence}` and `GET /v2/accounts/{address}/delegations`, and the `coverage`
 field that their answers carry (all but `GET /v2/ledger_objects/{id}`, a lookup). The original's lists of an account's escrows and channels are still out of scope (below).
+
+From the issued tokens ([ADR-0019](adr/0019-issued-tokens-from-state-history.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md) Amendment 8, items 94 to 102): the four routes of
+[Tokens](#tokens), [`GET /v2/tokens`](#get-v2tokens) (the issued tokens ranked by holders, with `kind`, `min_holders` and a search),
+[`GET /v2/tokens/{currency}.{issuer}`](#get-v2tokenscurrencyissuer) with its [`/holders`](#get-v2tokenscurrencyissuerholders) and
+[`/transfers`](#get-v2tokenscurrencyissuertransfers), and the `coverage` field that their answers carry. The original's `/v2/currencies` and `/v2/gateways` are still out of scope (below).
 
 **Out of scope.** The original served more than the endpoint set this API was asked to implement. These routes of the original
 (`api/server.js` of the `master` branch) are **not part of this API and answer 404** `{"result":"error","message":"Cannot GET ..."}`:
@@ -4444,6 +4451,621 @@ every ID when no ledger is committed); 500 `unable to retrieve ledger object`.
 
 **Differences from data.ripple.com**: none, the endpoints are new. The original's `GET /v2/accounts/{address}/escrows` (the list of an account) is
 not served and answers 404 ([Compatibility](#compatibility)).
+
+---
+
+## Tokens
+
+GateHub extras: the original served no list of tokens (its `/v2/currencies` and `/v2/gateways` are not served, [Compatibility](#compatibility)). These four routes serve the **issued
+tokens** of the network, the currencies issued on trust lines: the tokens ranked by the number of their holders, one token with the settings of its issuer, its toml entry, its
+markets and its price, the holders of a token by balance, and the payments that delivered a token. The tokens, their holders and their supply are an aggregate that the syncer's
+`tokens` job keeps current from the state history ([syncer](syncer.md#the-tokens-job), [ADR-0019](adr/0019-issued-tokens-from-state-history.md), the rows in
+[data-model](data-model.md#issued-tokens-migration-014)); the design is in the [spec](superpowers/specs/2026-10-24-issued-tokens-design.md). The transfers are read from the ledgers
+at query time, as `/v2/payments` is.
+
+Everything below follows the usual contract (the [conventions](#conventions) above: errors, keys, `limit`, markers and `Link`, CSV), with these rules, whose shapes and key orders are ours
+and are pinned by tests:
+
+- **What a token is.** A trust line between two accounts in a currency has a balance from each side. From the side of the issuer of the token (C, I), the other account H of a line
+  **holds** the token when the balance is below 0 (H's balance is its negation). The line **counts** when H holds the token, or its balance is 0 and H's own limit is above 0.
+
+  | Term | Rule |
+  | --- | --- |
+  | **holders** | the lines that count with a balance above 0 |
+  | **trust lines** | the lines that count, the zero balances included (`trust_lines - holders` is the number of those) |
+  | **supply** | the exact sum of the holders' balances: the issuer's obligations, as `gateway_balances` of the node gives them. It is the supply of the token, not the circulating supply of the native currency |
+  | **token** | a currency with its issuer, with at least one line that counts |
+
+  A line with both limits above 0 and a zero balance counts for the tokens of both its accounts. A frozen line counts, and so does the reserve line of an AMM pool (the pool is a
+  holder). **A currency of an AMM's LP token (`03` and 38 hex digits) is not a token here**: it counts for nothing, is never listed and its detail and holders are 404 (the pool's page is
+  [`/v2/amm/pools`](#amm)); its transfers are listed all the same.
+- **Coverage.** Every answer carries `coverage`, the key right after `result`, and it is not in the CSV ([Coverage](#coverage)). The list, the detail and the holders state the feature
+  `issued_tokens`, whose rows are the state tables written by parser version 3 or later; the transfers state `token_transfers`, whose rows are the payments of every stored ledger (parser
+  version 1). Both are features without an amendment: they start at the first ledger of the network (**32,570** on the XRP Ledger, **1** on Xahau), and a testnet, which has no first
+  ledger, is never `complete`. For `issued_tokens` `complete` also means that the state tables hold the state of that first ledger, which the history fill provides: a trust line that has
+  not changed since `from_ledger_index` is not known, so while `complete` is false a token, a holder or an issuer's settings can be missing, and a token whose lines have not
+  changed since then is a 404. The coverage of the state tables is the one that decides whether the aggregate is built again: filling the history further back builds a new generation
+  of it ([operations](operations.md#issued-tokens)).
+- **As of.** The list, the detail and the holders name `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`) after the coverage: the ledger the live generation of the aggregate is
+  through, and when it closed. Everything in the answer is as of that ledger, except the price, the volume and the markets, which are the newest sets of
+  [`/v2/network/markets`](#get-v2networkmarkets) (kept 30 seconds). The generation is read every 5 seconds and the job keeps it within a few ledgers of the head, so an answer is
+  about a minute behind the ledger chain at most (the alert is 300 ledgers). The transfers have no ledger of their own: they are the payments of the committed ledgers.
+- **Before the first generation exists** (a new database, or a first build under way) the list answers `{ "result": "success", "coverage": …, "kind": "issued", "count": 0, "tokens": [] }`
+  and the detail and the holders answer 404; the transfers do not depend on it.
+- **The token in a path** is one segment, `{currency}.{issuer}`, split at its **last** `.`, `+` or `|` (an address has none, so a text code may hold one): the code before it, the issuer
+  after it. The code is a 3-character code of the ledger's set (letters, digits and ``? ! @ # $ % ^ & * < > ( ) { } [ ] |``), upper-cased as the payments routes do; 40
+  hex digits, in any case (a hex that is the standard form of a 3-character code is that code); or a text of 4 to 20 printable ASCII characters (a space included), taken as its 40 hex digits padded
+  with zeros. Anything else, a 3-character code outside the set included, is 400 `invalid currency`. A currency the ledger
+  holds in lower case (`usd`) cannot be reached: `usd` names `USD`. `code` in answers is the reverse: the 3-character code, or the text of the hex when its bytes, the trailing zeros
+  dropped, are printable ASCII, and left out otherwise (a demurrage currency has none). `a.b.c` and `A.B.C` are two currencies (only a 3-character code is upper-cased). The native
+  code with an issuer is 400 (`XRP cannot have an issuer`, `XAH` on Xahau); on Xahau an issued `XRP` is a currency like any other.
+- **Order and `rank`.** The list is ordered by `holders` descending, then `issuer`, then `currency`; `rank` is the place of a token in that order among the tokens the filters select
+  (1 on the first, not restarting on a page). The holders of a token are ordered by balance descending, then by address, and each page ranks over the **whole** list, so `rank`
+  is the same whichever page the holder is on. The ranking of the list is rebuilt every minute, and its marker is a cursor into the ranking, as the marker of
+  [`/v2/amm/pools`](#get-v2ammpools) is: a token can move between two pages from one minute to the next, and the pages concatenate to the unpaged list only while the ranking does not change.
+- **Amounts.** `supply`, `balance`, `limit`, `volume`, `counter_volume`, `native_volume` and `amount` are exact decimal text in whole units. `share` is the balance over the supply of the
+  token, exact, rounded half up to 6 decimals (`"0.117300"`). `price`, `last` are 8 significant digits, as `last` of `network/markets`; a price below 0.000001 or from 100,000,000 up comes as
+  exponent text (`"9.9000000e-7"`, `"1.2345679e+8"`), which every decimal parser reads. `price_change` and `change` are percent, 2 decimals, half up (`"-20.00"`). A key that has no
+  value is left out, never `null`; counts and ranks are numbers; flags are booleans.
+- **No node fallback.** The API serves what the index holds. A token the index does not know answers 404 `token not found`, and the explorer shows it from the node with a note
+  of the coverage; `gateway_balances` is heavy for a big issuer and gives no holders.
+- **Reads** are of one partition of the aggregate (the live generation) or of the token's key prefix in it, and of the committed ledgers only: the cost of an answer does not grow
+  with the history of the network.
+- **Cache-Control** is the usual `private, max-age=60`, and errors `no-store`. 401 and 429 are the usual ones.
+
+**The examples** are real answers of the end-to-end suites, key order included. The list, the detail and the holders are those of a synthetic world (`apps/api/test/support/tokens-seed.ts`:
+the rows the `tokens` job writes, put in the tables directly, three generations side by side), whose markets are the sets of the markets world of the suites, so a `price_time` is
+that of 2020-07-02 and the ledger numbers are made up; the transfers are the payments of real ledgers of the XRP Ledger that the suites seed (the recorded path payments,
+107,872,476 to 107,873,045), so their `coverage` is the one that seed gives.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer. Each line is checked against the constant the route is served by
+(`apps/api/src/tokens/api-reference.spec.ts`).
+
+Keys of the coverage, in order: `from_ledger_index?, complete`.
+
+Keys of the list answer, in order: `result, coverage, kind, ledger_index?, close_time?, totals?, total?, total_below?, count, marker?, tokens`.
+
+Keys of the totals, in order: `tokens, tokens_with_10_holders, holders?, native_volume?`.
+
+Keys of an issued token row, in order: `rank, currency, code?, issuer, holders, trust_lines, supply, price?, price_change?, price_time?, native_volume?, trades?, domain?, listed, name?`.
+
+Keys of the token answer, in order: `result, coverage, ledger_index, close_time, token`.
+
+Keys of a token, in order: `currency, code?, issuer, holders, trust_lines, supply, price?, price_change?, price_time?, native_volume?, trades?, domain?, toml_url?, listed, toml?, issuer_settings?, markets, last_ledger`.
+
+Keys of toml, in order: `name?, desc?, icon?, symbol?, display_decimals?, asset_class?, asset_subclass?, attestation?`.
+
+Keys of issuer_settings, in order: `transfer_fee, global_freeze, no_freeze, allow_trust_line_clawback, require_auth, default_ripple`.
+
+Keys of a market, in order: `counter_currency, counter_issuer?, count, volume, counter_volume, native_volume?, last, change?, last_time, amm_pool?`.
+
+Keys of the holders answer, in order: `result, coverage, ledger_index, close_time, supply, count, marker?, holders`.
+
+Keys of a holder, in order: `rank, holder, balance, share, limit, frozen, authorized`.
+
+Keys of the transfers answer, in order: `result, coverage, count, marker?, transfers`.
+
+Keys of a transfer, in order: `hash, ledger_index, executed_time, source, destination, amount, source_tag?, destination_tag?`.
+
+### `GET /v2/tokens`
+
+The issued tokens of the network, the most held first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `kind` | `issued` | The kind of token. Anything else answers 400 `invalid kind - use: issued`. The list is built for more than one kind: `kind` is echoed in every answer and is part of the marker (a marker of one kind is `invalid marker` for another). |
+| `min_holders` | 0 | Only the tokens with at least this many holders: plain digits, 0 to 1,000,000,000, else 400 `invalid min_holders`. |
+| `q` | | A search, trimmed, 1 to 64 characters (else 400 `invalid search`; an empty one is none). |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `tokens.csv`, the tokens flattened (the `tokens` only, without `coverage` and the counts). |
+
+**Search.** `q` a classic address: the tokens of that issuer. Anything else matches a token when its `code`, `name` or `domain` contains `q` (case-insensitive), its currency is `q` (40 hex digits,
+in any case) or its issuer starts with `q`. It does not match the display name of the issuer (that is [`/v2/account_names`](#account-names-and-tomls)).
+
+**Counts.** `total` is the number of tokens the filters select, on all pages. `total_below`, when `min_holders` is above 0, is the number that match `q` (or all tokens without `q`) but have
+fewer than `min_holders` holders: the "Show all (48,206 hidden)" of a board. `totals` describe the whole kind, **whatever the filters**: `tokens` (every token), `tokens_with_10_holders` (a
+fixed floor of 10, whatever `min_holders` is), `holders` (the distinct accounts that hold any token of the generation, counted by the job about every ten minutes; **left out while it has not
+counted them**, never a false 0) and `native_volume` (the `total_native_volume` of the `day` set of [`/v2/network/markets`](#get-v2networkmarkets), every pair; left out while there is no set).
+
+`GET /v2/tokens?limit=2`:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "kind": "issued",
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "totals": {
+    "tokens": 15,
+    "tokens_with_10_holders": 9,
+    "holders": 4321,
+    "native_volume": "243.5"
+  },
+  "total": 15,
+  "count": 2,
+  "marker": "WyJpc3N1ZWQiLDYwLCJyTXdqWWVkamM3cXF0S1lWTGlBY2NKU21Dd2loNExuRTJxIiwiVVNEIl0",
+  "tokens": [
+    {
+      "rank": 1,
+      "currency": "USD",
+      "code": "USD",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "holders": 120,
+      "trust_lines": 150,
+      "supply": "7320",
+      "price": "0.40000000",
+      "price_change": "-20.00",
+      "price_time": "2020-07-02T10:42:17Z",
+      "native_volume": "150",
+      "trades": 35,
+      "domain": "northpeak.example",
+      "listed": true,
+      "name": "Northpeak USD"
+    },
+    {
+      "rank": 2,
+      "currency": "USD",
+      "code": "USD",
+      "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+      "holders": 60,
+      "trust_lines": 61,
+      "supply": "1860",
+      "native_volume": "0",
+      "trades": 0,
+      "domain": "bluewave.example",
+      "listed": true,
+      "name": "Bluewave Dollar"
+    }
+  ]
+}
+```
+
+With `min_holders` and a search (`/v2/tokens?min_holders=10&q=north&limit=5`), `total_below` is there and `totals` are the same:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "kind": "issued",
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "totals": {
+    "tokens": 15,
+    "tokens_with_10_holders": 9,
+    "holders": 4321,
+    "native_volume": "243.5"
+  },
+  "total": 2,
+  "total_below": 0,
+  "count": 2,
+  "tokens": [
+    {
+      "rank": 1,
+      "currency": "USD",
+      "code": "USD",
+      "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+      "holders": 120,
+      "trust_lines": 150,
+      "supply": "7320",
+      "price": "0.40000000",
+      "price_change": "-20.00",
+      "price_time": "2020-07-02T10:42:17Z",
+      "native_volume": "150",
+      "trades": 35,
+      "domain": "northpeak.example",
+      "listed": true,
+      "name": "Northpeak USD"
+    },
+    {
+      "rank": 2,
+      "currency": "4E50555344000000000000000000000000000000",
+      "code": "NPUSD",
+      "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+      "holders": 40,
+      "trust_lines": 41,
+      "supply": "840",
+      "native_volume": "0",
+      "trades": 0,
+      "domain": "northpeak.example",
+      "listed": true,
+      "name": "Northpeak Dollar"
+    }
+  ]
+}
+```
+
+The row of a token:
+
+- `rank`, `currency` (the ledger's form: the 3 characters or 40 upper-case hex digits), `code?` (see the path), `issuer`.
+- `holders`, `trust_lines` and `supply` as defined above.
+- `price?`, `price_change?` and `price_time?`: the last trade against the native currency in the `day` set of the markets, with its change in percent and its time; else the last trade in
+  the `30day` set, with its time and **no change**; else absent (a token that has not traded against the native currency in 30 days has no price).
+- `native_volume?` and `trades?`: the sum, over the pairs of the `day` set that have the token on a side, of the native volume (the pairs that have one) and of the trade count. `"0"` and 0
+  for a token with no pair; both absent while there is no `day` set.
+- `domain?` (the issuer's account domain, in lower case), `listed` (the issuer's toml lists the token, below) and `name?` (the name the toml gives it).
+
+**Listed.** A token is `listed` when the toml of the issuer's own account domain has a `[[CURRENCIES]]` entry that counts on this network, names the token's issuer and has the token's
+code: two-way, the account and its domain, and the domain's toml and the account. An entry in another domain's toml does not list the token. The tomls are those the `tomls` worker
+fetched ([Account names and tomls](#account-names-and-tomls)). A change of one shows after the worker has read it again (its own schedule) and the sweep of the `tokens` job has met the token: within
+tens of minutes on the XRP Ledger, not at once ([operations](operations.md#issued-tokens)).
+
+**No generation.** `{"result":"success","coverage":{…},"kind":"issued","count":0,"tokens":[]}`, with the keys of the list that it has:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "complete": false
+  },
+  "kind": "issued",
+  "count": 0,
+  "tokens": []
+}
+```
+
+**CSV.** The columns are the keys of a row, in their order, whatever the page holds; a key a row has no value for is an empty cell and a flag is `true` or `false`. A page without a row is an empty
+file.
+
+```text
+"rank","currency","code","issuer","holders","trust_lines","supply","price","price_change","price_time","native_volume","trades","domain","listed","name"
+"1","USD","USD","rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B","120","150","7320","0.40000000","-20.00","2020-07-02T10:42:17Z","150","35","northpeak.example","true","Northpeak USD"
+"2","USD","USD","rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q","60","61","1860","","","","0","0","bluewave.example","true","Bluewave Dollar"
+"3","EUR","EUR","rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B","60","60","1860","","","","25","35","","false",""
+```
+
+Errors, in the order they are checked: 400 `invalid kind - use: issued`, `invalid min_holders`, `invalid search`, `invalid marker`; 500 `unable to retrieve tokens`. A 400 comes before any read.
+A generation whose newest ledger is not stored yet answers 500 as well (it can for a moment during a `--reprocess` of the newest ledgers): the answer names the ledger it is as of, and no other is
+invented in its place.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{currency}.{issuer}`
+
+One issued token as of the ledger of the live generation. No CSV.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `currency.issuer` (path) | | The token, as above. |
+
+`{ "result": "success", "coverage": …, "ledger_index": n, "close_time": "…", "token": {…} }`. The token has the keys of a row of the list, without `rank`, and these:
+
+- `holders` and `trust_lines` are those of the token's own row, as the list shows them.
+- `toml_url?` is `https://{domain}{path}` of the toml of the issuer's domain (`/.well-known/xrp-ledger.toml`, `/.well-known/xahau.toml` on Xahau), there whenever `domain` is, listed or not.
+- `toml?` is what the toml says of the token: `name`, `desc`, `icon`, `symbol`, `display_decimals` (a whole number 0 to 30), `asset_class`, `asset_subclass` and `attestation`, each as the toml gives
+  it (text), the fields of the xrp-ledger.toml reference and of the XLS-26 draft; others are not served, and a URL among them is text, never fetched. Left out when the token is not listed.
+- `issuer_settings?` are the settings of the issuer's account as of the ledger: `transfer_fee` (a percent, exact: a `TransferRate` of 1,002,000,000 is `"0.2"`, and none is `"0"`), and the flags
+  by the names of the network (the XRP Ledger and Xahau number the bits differently; `AllowTrustLineClawback` is `0x80000000` on the first and `0x1000` on Xahau): `global_freeze`,
+  `no_freeze`, `allow_trust_line_clawback`, `require_auth`, `default_ripple`. **Left out while the issuer has no row in the state tables** (its settings are unknown, not off).
+- `markets` are the pairs of the `day` set with the token on a side, **turned so that the token is the base**: `counter_currency` (and `counter_issuer`, absent for the native currency), `count`,
+  `volume` (the token's side), `counter_volume` (the other), `native_volume?`, `last` (the other asset per token: the stored rate, or its inverse), `change?` (percent, from the open and the last
+  in that orientation), `last_time` and `amm_pool?` (when the set has it). Ordered by `native_volume` descending (a pair without one last), then `count`, at most 20; `[]` for a token with no pair.
+- `last_ledger` is the newest ledger in which one of the token's lines changed.
+
+A listed token on a network whose issuer has settings, with its markets:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "token": {
+    "currency": "USD",
+    "code": "USD",
+    "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+    "holders": 120,
+    "trust_lines": 150,
+    "supply": "7320",
+    "price": "0.40000000",
+    "price_change": "-20.00",
+    "price_time": "2020-07-02T10:42:17Z",
+    "native_volume": "150",
+    "trades": 35,
+    "domain": "northpeak.example",
+    "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
+    "listed": true,
+    "toml": {
+      "name": "Northpeak USD"
+    },
+    "issuer_settings": {
+      "transfer_fee": "0",
+      "global_freeze": false,
+      "no_freeze": false,
+      "allow_trust_line_clawback": true,
+      "require_auth": false,
+      "default_ripple": true
+    },
+    "markets": [
+      {
+        "counter_currency": "XRP",
+        "count": 13,
+        "volume": "130",
+        "counter_volume": "65",
+        "native_volume": "65",
+        "last": "0.40000000",
+        "change": "-20.00",
+        "last_time": "2020-07-02T10:42:17Z",
+        "amm_pool": false
+      },
+      {
+        "counter_currency": "ZZZ",
+        "counter_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+        "count": 12,
+        "volume": "120",
+        "counter_volume": "240",
+        "native_volume": "60",
+        "last": "2.0000000",
+        "change": "0.00",
+        "last_time": "2020-07-02T04:11:00Z",
+        "amm_pool": false
+      },
+      {
+        "counter_currency": "EUR",
+        "counter_issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+        "count": 10,
+        "volume": "50",
+        "counter_volume": "40",
+        "native_volume": "25",
+        "last": "0.80000000",
+        "change": "0.00",
+        "last_time": "2020-07-02T05:09:00Z",
+        "amm_pool": false
+      }
+    ],
+    "last_ledger": 107899990
+  }
+}
+```
+
+A token with a toml entry (`NPUSD` has a 40-hex currency and a `code`) and no pair in the day set:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "token": {
+    "currency": "4E50555344000000000000000000000000000000",
+    "code": "NPUSD",
+    "issuer": "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
+    "holders": 40,
+    "trust_lines": 41,
+    "supply": "840",
+    "native_volume": "0",
+    "trades": 0,
+    "domain": "northpeak.example",
+    "toml_url": "https://northpeak.example/.well-known/xrp-ledger.toml",
+    "listed": true,
+    "toml": {
+      "name": "Northpeak Dollar",
+      "desc": "A US dollar stablecoin",
+      "display_decimals": 2,
+      "asset_class": "Fiat-backed stablecoin",
+      "attestation": "https://northpeak.example/attestations/2026-09.pdf"
+    },
+    "issuer_settings": {
+      "transfer_fee": "0.2",
+      "global_freeze": false,
+      "no_freeze": true,
+      "allow_trust_line_clawback": false,
+      "require_auth": true,
+      "default_ripple": false
+    },
+    "markets": [],
+    "last_ledger": 107899990
+  }
+}
+```
+
+An issuer with no row in the state tables has no `issuer_settings`, and a token that is not listed has no `toml`:
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "token": {
+    "currency": "OLD",
+    "code": "OLD",
+    "issuer": "rrrrrrrrrrrrrrrrrrrY1d5fYNE",
+    "holders": 8,
+    "trust_lines": 9,
+    "supply": "40",
+    "native_volume": "0",
+    "trades": 0,
+    "listed": false,
+    "markets": [],
+    "last_ledger": 107899990
+  }
+}
+```
+
+Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid issuer address`; 404 `token not found` (no line counts, an LP token
+(without a read), a token whose lines have not changed since the coverage starts, or no generation yet); 500 `unable to retrieve token`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{currency}.{issuer}/holders`
+
+The accounts that hold the token, the largest balance first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `currency.issuer` (path) | | The token, as above. |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `<code or currency> <issuer> - holders.csv` (the same for every spelling of the token), the holders flattened, without `coverage`, `supply` and the counts. |
+
+The lines of the token with a balance above 0, ordered by balance descending, then by holder. The marker is `(balance, holder)` of the last row. `rank` is the holder's place among **all** the
+holders. `supply` is the token's, `limit` the holder's limit (exact text), `frozen` and `authorized` the issuer's freeze and authorization of the line, and `share` as above.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 32570,
+    "complete": true
+  },
+  "ledger_index": 107900000,
+  "close_time": "2026-10-29T03:50:41Z",
+  "supply": "840",
+  "count": 3,
+  "marker": "WzM4LjUsInJycnJycnJycnJycnJycnJycmNKWTJ2YU5uWCJd",
+  "holders": [
+    {
+      "rank": 1,
+      "holder": "rrrrrrrrrrrrrrrrrrcJYjXAZjD",
+      "balance": "40.5",
+      "share": "0.048214",
+      "limit": "1000000",
+      "frozen": false,
+      "authorized": false
+    },
+    {
+      "rank": 2,
+      "holder": "rrrrrrrrrrrrrrrrrrcJYdToyGA",
+      "balance": "39.5",
+      "share": "0.047024",
+      "limit": "1000000",
+      "frozen": false,
+      "authorized": false
+    },
+    {
+      "rank": 3,
+      "holder": "rrrrrrrrrrrrrrrrrrcJY2vaNnX",
+      "balance": "38.5",
+      "share": "0.045833",
+      "limit": "1000000",
+      "frozen": false,
+      "authorized": false
+    }
+  ]
+}
+```
+
+CSV (the `Link` header carries the next page as for every list):
+
+```text
+"rank","holder","balance","share","limit","frozen","authorized"
+"1","rrrrrrrrrrrrrrrrrrcJYjXAZjD","40.5","0.048214","1000000","false","false"
+"2","rrrrrrrrrrrrrrrrrrcJYdToyGA","39.5","0.047024","1000000","false","false"
+"3","rrrrrrrrrrrrrrrrrrcJY2vaNnX","38.5","0.045833","1000000","false","false"
+```
+
+Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid issuer address`, `invalid marker`, all before any read; 404 `token not found`
+(as the detail); 500 `unable to retrieve holders`.
+
+**Differences from data.ripple.com**: none, the endpoint is new.
+
+### `GET /v2/tokens/{currency}.{issuer}/transfers`
+
+The payments that delivered the token, oldest first.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `currency.issuer` (path) | | The token, as above. |
+| `start` | the beginning | |
+| `end` | the newest ledger | |
+| `descending` | false | |
+| `limit` | 200 (max 1000) | |
+| `marker` | | |
+| `format` | json | `csv`: file `<code or currency> <issuer> - transfers.csv`, a column for each key of a transfer; a tag a transfer does not have is an empty cell. |
+
+These are the successful `Payment` transactions between two different accounts that delivered the currency of this issuer, read as
+[`/v2/payments/{currency}`](#get-v2paymentscurrency) reads them (the same window, `descending`, `limit` and marker, with their rules and messages), with the delivered amount: **a payment to oneself is
+not a transfer** (it is not a payment, [Payments](#payments); it is a [path payment](#path-payments)). `amount` is the amount the payment delivered, not the one it asked for. The issuer is the
+issuer of the delivered amount. A tag of `0` is a tag and is served.
+
+**No 404.** The list does not look the token up: a token nobody was paid in, one the aggregate does not know and an LP token list the transfers they have, and no transfers is `count: 0`
+(an empty file in CSV). The `coverage` is that of the payments of the ledgers (`token_transfers`), not of the state tables, so the two can differ for one token.
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 11999941,
+    "complete": false
+  },
+  "count": 2,
+  "marker": "WzEwNzg3MzAyNCw1XQ",
+  "transfers": [
+    {
+      "hash": "2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3",
+      "ledger_index": 107872476,
+      "executed_time": "2026-10-24T13:45:51Z",
+      "source": "rajCZLPm7AnGJrQRwiuJHN1xZw5KLAvQTe",
+      "destination": "raJmzfum8TF4eR4cBkSiMAmKJHwAQKNZNT",
+      "amount": "0.2121364558499999"
+    },
+    {
+      "hash": "3EBBB8672ADA7B5EADBE3878740346DD60B667D4919E1084D2E140238F0D2044",
+      "ledger_index": 107873024,
+      "executed_time": "2026-10-24T14:21:42Z",
+      "source": "rfaF3eu2m192LkHKdxRfzd68oEC1paa57",
+      "destination": "rMPwy3Ntx56Nyc2fKGNm7VRWdmpHSB92Z7",
+      "amount": "0.002",
+      "source_tag": 804681468
+    }
+  ]
+}
+```
+
+A destination tag of 0 (`/v2/tokens/Sanctum.rNcqT1tds4vdroichNKuTh3Ppd8KAdFHnN/transfers`):
+
+```json
+{
+  "result": "success",
+  "coverage": {
+    "from_ledger_index": 11999941,
+    "complete": false
+  },
+  "count": 1,
+  "transfers": [
+    {
+      "hash": "196DF224FABA0748314F72CBC788299024E5953465772E395AD3BA9A26A3335A",
+      "ledger_index": 107873045,
+      "executed_time": "2026-10-24T14:23:10Z",
+      "source": "rfLquFDGTFnvzb5C3Pf9BsgukRBa6DdtZe",
+      "destination": "rNcqT1tds4vdroichNKuTh3Ppd8KAdFHnN",
+      "amount": "0.0000000074",
+      "destination_tag": 0
+    }
+  ]
+}
+```
+
+CSV:
+
+```text
+"hash","ledger_index","executed_time","source","destination","amount","source_tag","destination_tag"
+"2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3","107872476","2026-10-24T13:45:51Z","rajCZLPm7AnGJrQRwiuJHN1xZw5KLAvQTe","raJmzfum8TF4eR4cBkSiMAmKJHwAQKNZNT","0.2121364558499999","",""
+"3EBBB8672ADA7B5EADBE3878740346DD60B667D4919E1084D2E140238F0D2044","107873024","2026-10-24T14:21:42Z","rfaF3eu2m192LkHKdxRfzd68oEC1paa57","rMPwy3Ntx56Nyc2fKGNm7VRWdmpHSB92Z7","0.002","804681468",""
+```
+
+Errors, in the order they are checked: 400 `invalid currency`, `XRP cannot have an issuer` (`XAH` on Xahau), `invalid issuer address`, then those of `/v2/payments`: `invalid start date format`,
+`invalid end date format`, `invalid marker`; 500 `unable to retrieve transfers`. A 400 comes before any read, and the coverage is read after the page.
+
+**Differences from data.ripple.com**: none, the endpoint is new. Its relation to `/v2/payments/{currency}`: the same payments from the same table, in the same order, window and paging, in a smaller row:
+the hash, the ledger and time, the two parties, the delivered amount and the tags, where `/v2/payments` serves the balance changes and the fee as well.
 
 ---
 

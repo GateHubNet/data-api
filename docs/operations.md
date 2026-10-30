@@ -34,6 +34,7 @@ no `GH_CLICKHOUSE_DATABASE`, so each network's database is the name its profile 
 | AMM data | `syncer_amm_unclassified_total`, the `amm_pools` / `amm_daily` error labels, [the AMM jobs](#the-amm-jobs) |
 | NFT data | `syncer_nft_state_lag_ledgers`, `syncer_nft_dirty_ledgers`, `syncer_nft_collections_pending`, `syncer_nft_skipped_total`, the `nft_state` / `nft_state_dirty` / `nft_collections` error labels, [the NFT data](#the-nft-data) |
 | Ledger objects | `syncer_escrows_lag_ledgers`, `syncer_escrows_open`, `syncer_objects_unclassified_total`, the `escrows` / `escrows_dirty` error labels; the rollout and the re-ingest: [Ledger objects and delegation](#ledger-objects-and-delegation) |
+| Issued tokens | `syncer_tokens_live`, `syncer_tokens_lag_ledgers`, `syncer_tokens_building`, `syncer_tokens_repair_ledgers`, the `tokens` / `tokens_dirty` error labels; the rollout, the first build and the runbook: [Issued tokens](#issued-tokens) |
 | Display names | `syncer_tomls_due`, `syncer_tomls_domains{status}`, `syncer_tomls_checks_total{outcome}`, `syncer_tomls_discovery_seconds`; the rollout and the seed: [The display names](#the-display-names) |
 | Validators progress | `syncer_validators_rounds_lag_ledgers`, `syncer_validators_agreement_lag_seconds`, `syncer_validators_unl_expiry_seconds`, `syncer_amendments_without_metadata` (the rollout: [Roll out the validators and amendments data](#roll-out-the-validators-and-amendments-data)) |
 | Exports | `exporter-xrpl` / `exporter-xahau` (profile `exports`, one each): `GET /liveliness/healthz` on 3005, `exporter_jobs_total{status}`; the jobs are rows of `export_jobs` ([deployment](deployment.md#topology)) |
@@ -371,7 +372,7 @@ has not changed since that block, until its next change, and nothing can bring i
 whose rows of the block are dropped too. A `range-ingest` of the block later writes the same rows again (the same `version`), and `--reprocess` deletes and
 rewrites them as it does in every table.
 
-The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations`, the tables of the validators and amendments data (migration 002) and the account and market aggregates (migration 003) are independent: a dropped block reaches the aggregates only through `agg_dirty` when it is ingested again. A block dropped from the AMM tables and
+The rollups (`stats_hourly`, `volume_*`, `amm_pools`, `amm_daily`) and the issued token tables (`token_generations`, `token_lines`, `tokens`: [Retention of the token tables](#retention-of-the-token-tables)) are not touched: old hours keep their numbers (that is usually what you want); `fee_stats`, `validations`, the tables of the validators and amendments data (migration 002) and the account and market aggregates (migration 003) are independent: a dropped block reaches the aggregates only through `agg_dirty` when it is ingested again. A block dropped from the AMM tables and
 brought back by `range-ingest` marks `agg_dirty`, and the aggregator rebuilds the pools and days it covers.
 
 To **bring a dropped block back**, run `range-ingest` over the same range: with no `ledgers` rows left it ingests everything. To repair a **partial** loss (some tables
@@ -847,6 +848,147 @@ SELECT object_type, count() AS rows, uniqExact(object_id) AS objects FROM xrpl.o
 SELECT object_type, tx_type, count() FROM xrpl.object_changes WHERE event = 'update' GROUP BY object_type, tx_type ORDER BY count() DESC LIMIT 20;
 ```
 
+## Issued tokens
+
+The explorer's Tokens and Token pages (the issued tokens of the network ranked by holders, one token with the settings of its issuer, its toml entry and its markets, its holders and its
+transfers) are served by `/v2/tokens` ([api-reference](api-reference.md#tokens), [ADR-0019](adr/0019-issued-tokens-from-state-history.md)). The transfers are read from the ledgers at query
+time; the rest is an aggregate that the `tokens` job of the aggregator builds from the state history and keeps current ([syncer](syncer.md#the-tokens-job)). The pieces, all per network:
+
+| Piece | Cadence | Healthy | Watch |
+| --- | --- | --- | --- |
+| `state_touches`, written by the ingest (parser version 8) | with every ledger | a row for each changed trust line and each issuer-settings change, in ledger order (about 25 to 40 a ledger: [measured](#measured-on-synthetic-data)) | the live runner's log; `SELECT count() FROM xrpl.state_touches WHERE ledger_index >= <a recent ledger>` |
+| The `tokens` job of the aggregator ([syncer](syncer.md#the-tokens-job)) | every tick, eighth in the tick (after `markets_live`), budget 4 s; the housekeeping every tenth run | `syncer_tokens_live` 1, `syncer_tokens_lag_ledgers` 0 to a few ledgers, `syncer_tokens_building` 0 and `syncer_tokens_repair_ledgers` 0 outside a build and a re-ingest | `syncer_aggregator_errors_total{job="tokens"}` and `{job="tokens_dirty"}`; the four gauges; log lines `tokens: ...` |
+| The routes of the api | the live generation read every 5 s, the markets sets every 30 s, the coverage every 60 s | an answer is as of the ledger it names, a few ledgers behind the head | a 500 `unable to retrieve tokens` (`token`, `holders`, `transfers`) is a failed read, which the api logs with its cause |
+
+**What the owner does to deploy** (per network, the sandbox first, then production; the order matters):
+1. **Apply migration `014`** on each network database (`dc run --rm migrate-xrpl` / `migrate-xahau`; from source `pnpm ch:migrate`) **before the syncer and the API of this release**: the writer
+   inserts into `state_touches` on every ledger, and a write to a missing table fails the batch ([above](#apply-a-schema-migration)). **The job needs the other three tables as well**, and without them
+   it cannot read its generations: its hook then throws on every `agg_dirty` slice and **the queue stops draining for every job** (a persistent `tokens_dirty`, [below](#a-persistent-tokens_dirty)).
+2. **Deploy the syncer** (parser version 8). From the deploy ledger every ledger has its touches, and the `tokens` job **builds the first generation from `trust_line_states`**, as it is: no re-ingest is
+   needed for it. The build is hours on a full XRP Ledger history ([the estimate below](#estimated-for-the-xrp-ledger)), a batch of 500 accounts in each tick's 4 s: watch `syncer_tokens_building` (1 until the
+   generation is promoted) and the logged cursor (`tokens: generation 1: the account pass is at <account> ...`). Until it is live `/v2/tokens` answers the no-generation answer and a token 404.
+   **Listings need D4's account domains**: a token is `listed` only when the issuer's account domain is known (`account_domains`) and its toml was read by the `tomls` worker, so run the
+   [account-domains seed](backfill.md#account-domains-seed) (it needs no reprocess) and let the `tomls` worker's first sweep run before the build, or `domain` is empty and `listed` false until the
+   issuers next change and the sweep of the job meets them ([the display names](#the-display-names)).
+3. **Deploy the API.** The explorer reads `/v2/tokens` from it.
+4. **No reprocess is needed for the aggregate** (the touches only matter after the first generation's head). The coverage follows the state tables ([Coverage](api-reference.md#coverage)): `complete` needs
+   the state tables whole from ledger 32,570 (ADR-0015's history load), and filling them further back builds a new generation by itself. **The program's one reprocess** (after its last parser version)
+   writes every ledger by parser version 8 and **rebuilds the generation through the repair path**: each `agg_dirty` slice lowers the `repair_from` of the generations, the repair applies the windows of
+   `[repair_from, through_ledger]` again, and **a window that meets a ledger written by an older parser ends the repair and marks a rebuild** (a new generation is built from the state tables beside the
+   live one and swapped in). The tokens reprocess is the **whole history**, about **108 million ledgers, 216,000 windows of 500**, not the 415,000 ledgers of the delegation re-ingest. While it runs
+   from the oldest ledger up, the frontier of the reprocess is always followed by ledgers of an older parser, so expect the job to rebuild more than once (each time a repair reaches the frontier):
+   every build is hours, only one runs at a time, the live generation serves meanwhile, and the generation built after the last slice is the right one. The repair itself takes at most half of a run's
+   budget and a window is never cut: between one window a minute (a window of ten thousand lines takes seconds, [measured](#measured-on-synthetic-data)) and a hundred or more (an empty one), so the repair
+   of a reprocessed range of years is days, not hours. Watch `syncer_tokens_repair_ledgers`, `syncer_tokens_building` and `SELECT count() FROM xrpl.agg_dirty`.
+5. **The syncer's ClickHouse user keeps `ALTER ... DROP PARTITION` on `token_lines` and `tokens`** if access is ever narrowed: the job drops a retired generation's partitions 15 minutes after it
+   was replaced. Today the full-access `data_api` user has it ([clickhouse](clickhouse.md), [security](security.md)). Without it the drop fails (a streak, then a wait), the retired partitions stay and disk grows
+   by one generation at each rebuild; nothing else is affected.
+6. **The explorer's `TOKENS` switch** goes on in an environment once `syncer_tokens_live` is 1 and `syncer_tokens_lag_ledgers` is under 300 there, on both networks.
+7. **Record the real first-build duration and the daily `state_touches` rows** in the table below (the rest of this section is measured on synthetic data and estimated).
+
+**No new setting.** The job and its budget are in the aggregator (`GH_WORKERS` with `aggregator`, as for the NFT jobs, on by default); the api needs nothing of its own. To roll back, remove the routes: `014`
+needs no undo, and a syncer of the previous release writes no touches (the ledgers it writes meanwhile have none, and the job builds a new generation when it meets them).
+
+| Rollout record (to fill in) | XRP Ledger | Xahau |
+| --- | --- | --- |
+| First build: started, promoted, ticks, the account pass's last cursor | | |
+| Lines in `trust_line_states` (`SELECT uniqExact(account, counterparty, currency) FROM xrpl.trust_line_states`: two for each `RippleState`), its rows, and the `tokens` rows of the live generation | | |
+| `state_touches` rows a day (`SELECT count() FROM xrpl.state_touches WHERE ledger_index >= <a day ago>`) | | |
+
+### A forced rebuild
+
+A change of the token rules (the listing, the supply, anything every token must be computed again for) bumps `TOKENS_CONFIG_VERSION` in `packages/shared/src/aggregate/tokens.job.ts` and ships with a release.
+The next housekeeping of the job (within ten runs of the start) finds the live generation's `config_version` stale and starts a new generation beside it: the live one keeps serving and being
+updated, the new one is built by the pass and the touches after its head, promoted when it has caught up, and the old partitions are dropped 15 minutes later. There is no outage and no step to run,
+and the first build's duration (below) is the duration of the rebuild; `syncer_tokens_building` is 1 meanwhile. Two other things force one by themselves: a change of the state coverage start (a history
+fill, or a range written again by an older parser) and a window of touches that meets a ledger of an older parser.
+
+### Measured on synthetic data
+
+Measured on 2026-10-30 with the real functions of the job (`nextPassAccounts`, `writePassLines`, `passTokens`, `recomputeTokens`, `applyLineStates`, `distinctHolders`) against a ClickHouse 26.8.14.3 of its own in
+Docker (16 CPUs, 16 GB for the VM, a laptop shared with other work, the tables warm in the cache), through the clients' production defaults (30 s of execution time, no memory cap). **Synthetic means
+that the shape is made up**: `trust_line_states` has 1,000,000 lines in 50,000 accounts, 5 state rows for each (5,000,000 rows, 409 MB, merged to one part for each of 3 partitions), one issuer has 200,000 of the lines
+(the others about 16) and half of the others' lines are on the issuer's side (their holder has a balance), so the pass writes 596,000 `token_lines` rows and 50,002 `tokens` rows (the board of mainnet shows 49,490 tokens); a second table of 8
+copies of it (8,000,000 lines, 400,000 accounts, 40,000,000 rows, 3.3 GB, 4,923 granules) carries the figures marked "8x". Real tables are not this shape: the figures show how the job scales, not what
+mainnet costs.
+
+| What | Measured |
+| --- | --- |
+| **The account pass, a 4 s tick** (batches start while the budget lasts, 3 runs) | 62 to 64 batches: **31,000 to 32,000 accounts** and 4.0 to 5.0 million `trust_line_states` rows read, 31,000 tokens recomputed and 250,000 to 440,000 `token_lines` rows written (the tick that holds the big issuer writes more), 4.03 to 4.05 s |
+| The whole pass | 100 batches in 2 ticks (6 s of work). 8x: 800 batches in 13 ticks (50 s), 30,500 to 34,500 accounts and 4.1 to 5.2 million rows a tick |
+| **The slowest batch** | **0.35 to 0.39 s**, the batch that holds the issuer of 200,000 lines (the lines' `INSERT ... SELECT` 0.27 s and the tokens 0.07 s); the median batch 58 to 59 ms, the 90th percentile 62 to 65 ms. Nothing near the 4 s of a tick |
+| **Peak memory** (`system.query_log.memory_usage`) | **140 MiB**, the `INSERT ... SELECT` of the big issuer's batch (the average batch 22 MiB); every other statement of the pass 14 MiB or less |
+| An issuer with **2,000,000 lines** (10,000,000 state rows) in one batch | 2.1 s for the lines, 0.4 s for the tokens, **2.5 s**; peak **696 MiB**. A batch is one statement and is not split, and is never cut by the budget |
+| **A window of 2,000 lines** (the touches of a window are read in chunks of 2,000 lines), 8x | `LINE_STATES_SQL` **0.30 s** (3,371 of 4,923 granules, 27.5 million rows, 221 MiB peak), `STORED_LINES_SQL` **0.15 s** (two reads of 2,000 keys, 3.9 of 5.4 million rows, 103 MiB peak); applying it 0.48 s and recomputing its 3,600 tokens 0.40 s: **0.9 s** against the 4 s of a tick. On the 1x table 0.3 s |
+| A window of 20,000 lines (the most a window holds before it is halved), 8x | applying 4.7 s, recomputing 35,000 tokens 1.0 s: **5.7 s**, past a tick (a window is never cut; the next run starts when it ends). A window of 500 ledgers holds about 12,000 lines on today's mainnet (below), so a heavy window is a few seconds |
+| **`distinctHolders`**, 8x (4,776,431 `token_lines` rows, 2,216,359 distinct holders) | 0.40 s, **331 MiB** |
+
+**`distinctHolders` against `maxQueryMemoryBytes`.** The job runs in the syncer, whose `GH_CLICKHOUSE_MAX_QUERY_MEMORY` is 0 (no cap of its own: the server's limit applies) in `deploy/.env.prod.example`; the api's cap of
+2 GiB (`API_CLICKHOUSE_MAX_QUERY_MEMORY`) does not apply to it. Linearly, 20 million lines with about 9 million distinct holders would need about 1.4 GiB: under 2 GiB, not by much. **If a cap is ever set on the
+syncer, keep it above 2 GiB** (the query is one aggregate over the generation's partition, and runs once in ten runs).
+
+**`state_touches` rows a ledger**, from the parser over the real mainnet ledgers the repository records (not a sample: they were picked for the transactions in them):
+
+| Ledgers | Ledgers | Touches | A ledger |
+| --- | --- | --- | --- |
+| `recorded` (107,670,360 to 107,671,607) | 9 | 221 | 24.6 (22.2 `line`, 2.3 `account`) |
+| the path payments (107,872,476 to 107,873,048, and 3 older) | 7 | 156 | 22.3 |
+| the ledger objects (102,145,584 to 107,972,102) | 22 | 885 | 40.2 |
+| All three | 38 | 1,262 | **33.2** (31.0 `line`, 2.2 `account`) |
+
+A `line` touch is one changed `RippleState` node (a state change writes two `trust_line_states` rows, one for each side). A burst is far above this: a press report of October 2026 tells of a ledger with thousands of `TrustSet`
+transactions (4,416 transactions in one ledger, 97 percent of them trust lines). The compressed size of a `state_touches` row was **68 bytes** (3,000,000 rows of random 32-digit addresses; real base58
+addresses are a little less compressible, so 70 to 90 bytes).
+
+### Estimated for the XRP Ledger
+
+These are estimates, and say what they assume. **The count of `RippleState` entries of the XRP Ledger is not known here**: no figure is in the repository, and a search for one found only 1,030,942 total trust lines
+in September 2021 (a post of Xrpl.Services on X), far below today's. The estimates below assume round figures, to be replaced by the real count at the rollout (step 7).
+
+| Estimate | Assumes | How | Result |
+| --- | --- | --- | --- |
+| **The first build** (the account pass; the touches after its head are a few minutes of work on top) | **20 million** `RippleState` entries (an assumed round figure, no source), 5 state rows for each of its two sides (the synthetic shape) = 200 million `trust_line_states` rows | rows ÷ about 4.5 million rows a tick (4.0 to 5.2 million measured), one tick a minute | about **44 ticks, under an hour** with the table in the page cache |
+| the same, a longer history | 40 million entries, 10 state rows for each side = 800 million rows | the same rate | about **180 ticks, 3 hours** |
+| the same, a shorter one | 10 million entries, 5 state rows = 100 million rows | the same rate | about 22 ticks, 22 minutes |
+| **Disk of the table the pass reads** | 200 million rows | 82 bytes a row (409 MB for 5 million, measured) | about 16 GB, so a cold table is read from disk, which makes the build slower than the cached rate: allow a multiple of the figures above |
+| **`state_touches` rows a day** | **33 touches a ledger** (31 `RippleState` nodes: the 38 recorded ledgers above, which were picked for their transactions and may be above the average) and **20,800 ledgers a day** (the figure of the delegation re-ingest, about 21,600 at a ledger every 4 s) | 33.2 × 20,800 | about **690,000 rows a day** (460,000 to 840,000 for 22 to 40 a ledger), 50 to 60 MB a day compressed at 70 to 90 bytes, about 20 GB a year (the P6 retention drops it with its block) |
+| **The repair of a reprocess** (step 4) | 216,000 windows of 500 ledgers; 12,000 lines in a window (500 ledgers × 25 `line` touches, today's rate: older ledgers have fewer) | 3 to 4 s a window (the interpolation of the measured 0.9 s for 2,000 lines and 5.7 s for 20,000), one window a run | **at worst 216,000 minutes, 150 days**, if every window were as heavy as today's and the repair never found an older parser; the windows of the early years hold far fewer lines, and an empty window costs a few small reads (not measured). The rebuild that the first older-parser window starts is the hours of the first estimate |
+
+A batch of the pass is nowhere near the 4 s of a tick on the synthetic data. Two things can pass it, and a batch or a window is never cut: an issuer with several million lines (2 million: 2.5 s and 700 MiB; the
+figure grows linearly), and a window of touches of several thousand lines (a few seconds). A tick that holds one runs long, and `stats_live` and `stats_dirty` after it get what is left of the 30 s ([the budget of a tick](#ledger-objects-and-delegation)).
+
+### Retention of the token tables
+
+`state_touches` is a P6 ledger table and goes with its block when the ledger tables are dropped ([Retention](#retention): the same ten partitions of a block as `amm_pool_touches`). **The token tables are never dropped by
+retention**: `token_lines`, `tokens` and `token_generations` are aggregates, partitioned by generation, and nothing rebuilds them after a drop but the account pass over the state tables. A rebuild after a block was
+dropped (a forced rebuild, or a new generation after a change of the coverage) is **exact only for the lines whose last state row is above the oldest kept block**: a line that was last changed in a dropped
+block has no row left to rebuild it from, and drops out of the tokens it belonged to (their holders, trust lines and supply fall). The live generation keeps serving the lines it already has.
+
+### A persistent `tokens_dirty`
+
+`syncer_aggregator_errors_total{job="tokens_dirty"}` rises at each tick and `SELECT count() FROM xrpl.agg_dirty` does not fall. The hook of `tokens` is the last of the hooks of a slice and **throws, by design, while the job
+has not read its version floor or when the reads that open its last run failed**, so that a range is never marked without the job being able to repair it; a slice that fails stays in `agg_dirty` and its earlier hooks
+run again at each tick. Look in the log for `Aggregator job tokens failed...` and `Aggregator job tokens_dirty failed in <from> - <to>: ...`:
+- **A missing table** (`Table xrpl.token_generations doesn't exist`): migration 014 was not applied before the syncer. Apply it (`dc run --rm migrate-xrpl`); the job reads its tables at the next tick and the queue drains.
+- **ClickHouse refusing the reads** of the job (time limit, memory cap, the database down): fix the cause; the job's opening reads work at the next tick.
+- **A step of the job that fails** does not stop the hook: only the opening reads do. A drop that fails for the privilege, a window, a batch of the pass, a rebuild check that keeps failing wait (5 minutes, doubling to an hour)
+  and show as `tokens` errors, not as `tokens_dirty`.
+No mark is lost meanwhile; when the job reads its tables the queue drains by itself.
+
+```sql
+-- the generations: the newest row of each (state: building, live, retired)
+SELECT generation, argMax(state, version) AS state, argMax(through_ledger, version) AS through_ledger, argMax(repair_from, version) AS repair_from,
+       argMax(pass_done, version) AS pass_done, argMax(account_cursor, version) AS cursor, argMax(holders, version) AS holders
+FROM xrpl.token_generations GROUP BY generation ORDER BY generation;
+-- the head, for the lag of the live generation
+SELECT max(ledger_index) AS head FROM xrpl.ledgers;
+-- the tokens of the live generation (replace 7 with its number): the newest row of each, not deleted
+SELECT count() FROM (SELECT issuer, currency, argMax(deleted, version) AS gone FROM xrpl.tokens WHERE generation = 7 GROUP BY issuer, currency) WHERE gone = 0;
+-- the partitions: a retired generation should be gone 15 minutes after it was replaced
+SELECT table, partition, sum(rows) AS rows, formatReadableSize(sum(bytes_on_disk)) AS size FROM system.parts
+WHERE database = 'xrpl' AND table IN ('token_lines', 'tokens') AND active GROUP BY table, partition ORDER BY table, partition;
+```
+
 ## Backfill and repair
 
 The live syncer never fills history. History, gaps and parser changes go through the range-ingest CLI, which runs next to the live
@@ -938,6 +1080,7 @@ FROM xrpl.account_rollup_state ORDER BY account, version DESC LIMIT 1 BY account
   that keeps failing keeps its days waiting too: the "Daily rates not written" alert and `syncer_aggregator_errors_total` both show it.
 - **Hours**: the hours of the slice in the last 31 days are recomputed at once (after an AMM `--reprocess` this is what puts the swaps into the `amm` rows of the Markets, see [the AMM data additions](#the-amm-data-additions)).
 - **Heavy accounts**: every account whose rollups cover a day of the slice has that day recomputed (a new rollup set under a new version), and the partitions of the range are recounted by the next discovery.
+- **Issued tokens**: the slice's `tokens` hook (the last one) lowers `repair_from` of the live and the building generation, and the `tokens` job applies the touches of `[repair_from, through_ledger]` again, a window of 500 ledgers at a time; a window that meets a ledger of an older parser marks a rebuild instead ([Issued tokens](#issued-tokens)).
 
 Between the rewrite and the hook the aggregates show the old data (eventual, like `stats_hourly`). A hook that fails fails its slice: the range stays in `agg_dirty` and is retried at the next tick, and `syncer_aggregator_errors_total{job="rates_daily_dirty"}` (or `pair_hourly_dirty`, `account_rollups_dirty`, `nft_state_dirty`, `escrows_dirty`, `tokens_dirty`) says which.
 

@@ -257,7 +257,10 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
 - `014_issued_tokens.sql` (four `CREATE TABLE IF NOT EXISTS`: the ledger-derived `state_touches`, and the aggregates `token_generations`, `token_lines` and `tokens`) is additive but **sets an order**:
   `migrate` first, then the syncer, then the api. A syncer of this version (parser version 8) writes `state_touches` with every ledger, and an insert into a missing table fails the batch, so the
   live runner would retry the same ledgers without end; its `tokens` job reads and writes the other three, and the token routes of the api answer 500 until the tables exist. Nothing checks for
-  them at boot. The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last.
+  them at boot, and a job that cannot read its tables keeps `agg_dirty` from draining for every job ([troubleshooting](troubleshooting.md#agg_dirty-does-not-drain-the-tokens-hook-fails)). The compose files make
+  both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. The syncer's ClickHouse user needs `ALTER ... DROP PARTITION` on `token_lines` and `tokens` (the shipped
+  full-access `data_api` user has it, [clickhouse](clickhouse.md)). The first generation of the issued tokens is built by the `tokens` job in the hours after the deploy: the explorer's `TOKENS` switch waits for
+  `syncer_tokens_live` 1 ([operations](operations.md#issued-tokens)).
 
 ## Configuration and secrets
 

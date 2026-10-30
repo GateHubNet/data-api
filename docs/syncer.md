@@ -26,8 +26,8 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
                                                    ledger tables)    amendment_
                                                    + escrows (reads  features,
                                                    object_changes)   validator_votes,
-                                                                     amendment_
-                                                                     tallies,
+                                                   + tokens (reads   amendment_
+                                                   state tables)     tallies,
                                                                      validator_
                                                                      agreement_hourly
                           ClickHouse, database = the network name
@@ -355,7 +355,7 @@ constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment
 | 5 | `escrows` | 2 s | The current state of every escrow (`escrows`) and the **sentinel** row that holds the escrowed total and the ledger it is as of, which D7's supply reads. **At every tick**, the watermark of the sentinel follows the head; the first fill goes in steps of 1,000,000 ledgers, and a step is never cut by the budget ([the escrows job](#the-escrows-job)). |
 | 6 | `pair_hourly` | 3 s | The candle of every pair in each UTC hour of the last 31 days (`pair_hourly`), the live hours first, then the back-fill. See [7.2](#72-pair_hourly). |
 | 7 | `markets_live` | 3 s | The Markets sets (`markets_live`) of the periods `day`, `7day` and `30day`, in three filters each (`include`, `exclude`, `only`), made of the hours of `pair_hourly`; `day` at every tick, the other two every fifth. See [7.3](#73-markets_live). |
-| 8 | `tokens` | 4 s | The generations of the issued tokens (`token_generations`, `token_lines`, `tokens`): the touches of the live generation, its repair after a re-ingest, every tenth run the housekeeping (the rebuild check, the distinct holders, the toml sweep), the account pass and the touches of the generation that builds, its promotion, and the drop of the generations retired. Its state is in the generation rows, so a restart goes on where it was. |
+| 8 | `tokens` | 4 s | The generations of the issued tokens (`token_generations`, `token_lines`, `tokens`): the touches of the live generation, its repair after a re-ingest, every tenth run the housekeeping (the rebuild check, the distinct holders, the toml sweep), the account pass and the touches of the generation that builds, its promotion, and the drop of the generations retired. Its state is in the generation rows, so a restart goes on where it was ([the tokens job](#the-tokens-job)). |
 | 9 | `stats_live` | 20 s | Recomputes `stats_hourly` from `ledgers`: a **catch-up** from the newest hour that has ledgers (the watermark) to two hours ago, then the **tail** (the last two hours to the end of the current hour). With no stats at all it starts at the hour of the **first ledger**; a slice with no ledger jumps to the hour of the next one. |
 | 10 | `stats_dirty` | 10 s | Drains `agg_dirty`, the hour ranges that ingest rewrote behind the aggregator, oldest first, in slices of at most a day; also recomputes, for the days and ledgers a slice covers, the daily volume sets, the AMM pools with a state row in them and the `amm_daily` sets of the days, runs the hooks of the account and market jobs ([7.6](#76-the-agg_dirty-hooks)), marks the slice's ledgers in `nft_dirty` for `nft_state` ([the NFT jobs](#the-nft-jobs)), recomputes the escrows of the slice's ledgers ([the escrows job](#the-escrows-job)), and, last, marks the slice for the repair of the issued-token generations. |
 | 11 | `amm_daily` | 4 s, **every 5th tick** | One set per UTC day with the stats of every AMM pool: today every run, yesterday until its set is final, then the closed days newest first ([the AMM jobs](#the-amm-jobs)). |
@@ -760,6 +760,75 @@ ClickHouse clock in milliseconds, above the key's newest).
 expects, stored as event `update`; counted by the live ingest and the range-ingest runs of the process, once per committed write), and `syncer_aggregator_runs_total` /
 `syncer_aggregator_errors_total` with the labels `escrows` and `escrows_dirty`. A job that keeps failing logs `Aggregator job escrows failed...: ...` and, for an escrow set aside,
 `Aggregator job escrows failed for escrow <id>, set aside: ...`.
+
+### The tokens job
+
+The aggregates `token_generations`, `token_lines` and `tokens` ([data-model](data-model.md#issued-tokens-migration-014)) keep the issued tokens of the network: for every token its holders,
+its trust lines and its exact supply, the settings of its issuer and what the issuer's toml says of it, and the state of every trust line that counts (what the api's token list, detail and
+holders serve; [ADR-0019](adr/0019-issued-tokens-from-state-history.md), [spec](superpowers/specs/2026-10-24-issued-tokens-design.md)). They are built from the state tables
+(`trust_line_states`, `account_states`), kept current from the ledger-ordered index of what changed (`state_touches`, written by the ingest from parser version 8), and read by **generation**:
+a generation is one build, written beside the live one and swapped in whole. Like the other jobs it reads **committed ledgers only**, is a runner in a file of its own
+(`tokens.job-runner.ts`, behind `AggregatorJobContext`, registered with the `tokens` option that `aggregator.module.ts` builds from the network's profile and the one `RatesService`), and writes
+version sets (a version is the runner's clock in milliseconds, above any version stored: the job reads the floor at its first run). It runs on both networks, and on a database whose
+state tables are empty it waits for a ledger.
+
+**`tokens`** (budget `AGGREGATOR_TOKENS_BUDGET_MS` = 4 s, **every tick**, eighth in the tick: after `markets_live`, before `stats_live` and `stats_dirty`, so that even the first tick's `agg_dirty` slices find
+the version floor the hook needs; the shared work is `packages/shared/src/aggregate/tokens.job.ts`). The constants are those of `tokens.job.ts`: `TOKENS_CONFIG_VERSION` (1; a bump builds a new
+generation), `TOKENS_PASS_ACCOUNTS` (500 accounts a batch of the pass), `TOKENS_TOUCH_WINDOW` (500 ledgers, halved while a window holds more than `TOKENS_TOUCH_WINDOW_MAX_LINES` = 20,000
+distinct lines), `TOKENS_STATE_CHUNK` (2,000 keys a read: they travel as query parameters in the URL, and ClickHouse refuses one over 128 KiB), `TOKENS_TOML_DOMAINS_CHUNK` (500),
+`TOKENS_HOUSEKEEPING_EVERY_TICKS` (10), `TOKENS_RETIRED_KEEP_MS` (15 minutes) and `TOKENS_PROMOTE_NEAR_HEAD` (10 ledgers). A run does, in order, each part while the budget lasts (a step is
+never cut inside, so the last one of a run can end past the budget) and the parts after one that failed still run:
+
+1. **The opening reads**: the generations (`token_generations`, the newest row of each), the head (the newest committed ledger) and, the first time, the version floor.
+2. **The live generation's touches.** The window `(through_ledger, +500]` (up to the head): its distinct line touches from `state_touches` (a key range; LP currencies dropped) and the accounts of its `account`
+   touches. Every ledger in the window must have been written by parser version 8 or later (`min(parser_version)` of the `ledgers` rows): an older one means touches are missing, and the
+   generation is **marked stale** and moves no more (it keeps serving until a new one replaces it). Otherwise the newest state of each line is read at the window's end, both orientations are
+   compared with the newest stored `token_lines` row and a row (or a tombstone) is written where they differ, then **every token of the window's lines and every token of each touched issuer is
+   recomputed** (changed or not, so that a crash between the steps is repaired by doing the window again), and last the generation row with the new `through_ledger`: the cursor moves after the
+   rows are written.
+3. **The repair**, when `repair_from` is set (the hook below): the windows of `[repair_from, through_ledger]` again, read at `through_ledger` (a line changed in the window and again later keeps its
+   later state), each followed by a row that moves `repair_from` up; it takes at most half the budget, so that the program's reprocess cannot keep the rest from running. A window that meets a ledger of
+   an older parser **ends the repair and marks a rebuild** while the live touches go on.
+4. **Housekeeping**, at the first run with a ledger and then at every `TOKENS_HOUSEKEEPING_EVERY_TICKS`-th run (about every ten minutes): the **rebuild check**, the **distinct holders** and the **toml sweep**
+   (the first housekeeping does only the check). The check starts a new generation when there is no live one and none builds, or the live one is stale: its `config_version` is not
+   `TOKENS_CONFIG_VERSION`, its `coverage_from` is not the state coverage start (the history was filled further back, or a range was written again by an older parser), or its touches or its repair met
+   a ledger of an older parser. A building generation that is stale for the same reasons is retired first. The holders are `uniqExact(holder)` over the live generation's newest live lines with a balance
+   above 0, written into the generation row with `holders_ledger` = its `through_ledger` (the list leaves `totals.holders` out while it is 0). The sweep compares every live token's listing
+   (`domain`, `listed`, `name`, `toml`) with the issuer's current account domain and D4's store of tomls, and rewrites the rows that differ, in **resumable steps** of `TOKENS_STATE_CHUNK` tokens
+   from a cursor kept in memory (a sweep the budget cut goes on at the next housekeeping, and one that read the last token starts over): a toml change shows within **tens of minutes** on the XRP
+   Ledger, after the `tomls` worker has read it, not within ten.
+5. **The generation that builds**, one at a time: a row `building` with `head_ledger` = the head, then the **account pass** (`nextPassAccounts`: the next 500 accounts of `trust_line_states` in key order, by a `GROUP BY` read that
+   stops after the batch; `writePassLines`: one server-side `INSERT … SELECT` of the newest row of each line of those accounts at or before `head_ledger`, from the account's side as the issuer; then the
+   `tokens` rows of those issuers, matched with the tomls), the cursor (`account_cursor`) moving after each batch; then the touches after `head_ledger` as in 2; then its **promotion** once the pass is
+   done and its `through_ledger` is at least the live one's (within 10 ledgers of the head when there is none): a row `live` for it, then a row `retired` for the old one. A generation that
+   went stale while it built is retired.
+6. **The drop**: the partitions of every generation retired more than 15 minutes ago (`ALTER TABLE … DROP PARTITION` on `token_lines` and `tokens`; once per generation and process).
+
+- **A step that fails is the failure of the job** (counted as `tokens`, logged, the parts after it still run), is tried again at the next run, and waits when it keeps failing: a step of a generation
+  (a window, a batch of the pass, a repair), the first rebuild check and a drop that fail twice in a row wait 5 minutes, doubling up to an hour (`NFT_RETRY_MS`, `NFT_MAX_RETRY_MS`, the rule of the NFTs that fail on their own), while
+  the other parts go on; a drop that fails for lack of the privilege cannot stall anything else. The gauges are set **after a failed run too**, from a read of the generations and the head, so a window that
+  is stuck shows as a lag that grows with the head.
+- **A window the touches made too big is halved** (a ledger is applied whole), and the halved window is kept for the next one; a window that keeps failing is not made smaller than a ledger.
+- **A restart goes on where it was**: the state is in the generation rows. What is in memory is only what a restart finds again or does without (the housekeeping count, the version floor, the halved windows,
+  the sweep's cursor, the backoffs, the generations marked for a rebuild: the mark of a rebuild is found again by the same window).
+- **Shutdown** aborts a step before its next write (`TokensAborted`, neither logged nor counted).
+- **The hook** of the `agg_dirty` slices: [7.6](#76-the-agg_dirty-hooks), item 6, error label `tokens_dirty`. It is the **last** of the hooks of a slice, and only lowers `repair_from` of every generation that is
+  live or builds and whose `through_ledger` reaches the slice (no lower than its `coverage_from`: a slice below it is left to the rebuild check), writing one generation row each; the next run of the job
+  applies the repair. It throws before it reads while the job has not read its version floor yet (before its first run) or when the reads that open its last run failed, so that the slice fails and
+  its range stays in `agg_dirty` (a mark is never lost). **A job that cannot read its tables therefore keeps `agg_dirty` from draining for every job**: apply migration 014 before the syncer starts
+  ([operations](operations.md#apply-a-schema-migration)).
+- **Gauges.** `syncer_tokens_live` (1 when a live generation exists), `syncer_tokens_lag_ledgers` (the head less the live generation's `through_ledger`), `syncer_tokens_building` (1 while a generation builds; its
+  progress, the account cursor, is logged at each batch) and `syncer_tokens_repair_ledgers` (`through_ledger` less `repair_from`, 0 without a repair)
+  ([observability](observability.md#4-metrics-syncer)). The alert is `syncer_tokens_lag_ledgers > 300` for 15 minutes, paired with `rate(syncer_aggregator_errors_total{job="tokens"}[15m])`
+  ([observability](observability.md#recommended-alerts)); `syncer_tokens_live` gates the explorer's `TOKENS` switch.
+- **The cost.** A pass batch of 500 accounts is a key range of `trust_line_states` and a server-side insert, tens of milliseconds on a table of a million lines; an issuer with millions of lines is one statement of
+  seconds that the pass does not split; a window of a minute of the XRP Ledger is a few thousand lines and a few hundred tokens. The figures measured on synthetic data, and the estimate of the first
+  build on the XRP Ledger, are in [operations](operations.md#issued-tokens).
+
+**Metrics.** The four gauges above, and `syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the labels `tokens` and `tokens_dirty`. A job that keeps failing logs `Aggregator job tokens failed...: ...`; the
+job logs `tokens: generation N started at ledger L (config C, state coverage from F[, replacing generation M])`, `... the account pass is at <account> (A account(s), T token(s))`, `... is live (through ledger L)`,
+`... is retired` and `the partitions of retired generation N are dropped`, and warns `tokens: ledgers A - B (touches|repair of generation N) were written by a parser older than 8; ... the generation is replaced by
+a new one built from the state tables` once.
 
 ## 8. The validators worker
 
@@ -1210,6 +1279,9 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
 | `Aggregator job escrows failed for escrow <id>, set aside: <reason>` | The rows of one escrow cannot be mapped to an `escrows` row, for the reason given | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
 | `Aggregator job escrows_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed | The slice stays queued and its earlier hooks run again at each tick, until it works ([7.6](#76-the-agg_dirty-hooks)). |
+| `Aggregator job tokens failed: ...` and `syncer_tokens_lag_ledgers` grows with the head | A part of the `tokens` job failed (ClickHouse refusing a read or an insert, the privilege of `DROP PARTITION`, a missing table) | The next run starts over from the rows (the cursors move after the writes); a step that fails twice waits 5 minutes, doubling to an hour, and the other parts go on. See [the tokens job](#the-tokens-job). |
+| `tokens: ledgers A - B (touches of generation N) were written by a parser older than 8; ...` | A window of the live or the building generation holds a ledger written before the touches existed | The generation is replaced by a new one built from the state tables; the live one keeps serving until then. After a reprocess it is the expected way. |
+| `Aggregator job tokens_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed, or the tokens job has not read its generations (migration 014 missing, ClickHouse down at the first run) | The slice stays queued, `agg_dirty` does not drain for any job until the job reads its tables ([the tokens job](#the-tokens-job), [troubleshooting](troubleshooting.md#agg_dirty-does-not-drain-the-tokens-hook-fails)). |
 | `Cannot parse ledger <n>: ... dropsToNative: invalid value '[object Object]'` on a Xahau payment channel | A syncer older than parser version 7 met a payment channel that holds an issued token | Halted until a restart on this release, which types the channel's amounts ([troubleshooting](troubleshooting.md#the-xahau-syncer-is-halted-on-a-payment-channel-that-holds-an-issued-token)). |
 
 ## 11. Source map
@@ -1229,6 +1301,7 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
 | `apps/syncer/src/aggregator/{nft-state,nft-collections}.job-runner.ts` | The two NFT jobs ([the NFT jobs](#the-nft-jobs)) |
 | `apps/syncer/src/aggregator/escrows.job-runner.ts`, `packages/shared/src/aggregate/escrows.job.ts` | The `escrows` job: the runner (steps, gauges, the `agg_dirty` hook) and what it reads and writes (`runEscrowsStep`, `recomputeEscrows`, `readEscrowed`) ([the escrows job](#the-escrows-job)) |
+| `apps/syncer/src/aggregator/tokens.job-runner.ts`, `packages/shared/src/aggregate/{tokens.job,token-rules}.ts`, `util/currency-code.ts` | The `tokens` job: the runner (generations, touches, repair, housekeeping, the pass, the drop, gauges, the `agg_dirty` hook), what it reads and writes, and the pure rules (orientation of a line, the toml match, currency codes) ([the tokens job](#the-tokens-job)) |
 | `packages/shared/src/aggregate/{nft-state,nft-state.job,nft-collections.job}.ts`, `query/nft-prices.ts` | The fold of an NFT, what the NFT jobs read and write, and the one conversion of a price |
 | `packages/shared/src/aggregate/{rates-daily,pair-hourly,markets-live,account-rollups}.job.ts`, `aggregate-sets.ts` | What the runners write: the sets, their versions and their readers |
 | `packages/shared/src/query/{daily-rates,account-day-groups,valuation}.ts` | What the API reads them with: `DailyRates`, the day groups (raw or rollup), the valuation rule |
