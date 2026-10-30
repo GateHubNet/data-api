@@ -9,7 +9,7 @@ The workload is append-only, ledger-ordered data read two ways: selective lookup
 and aggregates (candles, rates, volumes, stats). That is columnar-OLAP territory and what the previous design (a search engine
 used for aggregations) was weakest at ([ADR-0001](adr/0001-use-clickhouse.md)).
 
-One ClickHouse **server** holds one **database per network**, each with the same 70 tables
+One ClickHouse **server** holds one **database per network**, each with the same 74 tables
 ([ADR-0009](adr/0009-one-deployment-per-network.md)). The names are the profiles': `xrpl`, `xahau`, `xrpl_testnet` and `xahau_testnet`. Production's
 server holds `xrpl` and `xahau`, the sandbox's own server `xrpl_testnet` and `xahau_testnet`, and both have the `shared` database (account names and labels).
 The SQL on this page names `xrpl`; on a testnet write its database in its place. A testnet is never on the production server: the sandbox is a stack of
@@ -162,7 +162,7 @@ The production compose already runs **ClickHouse Keeper** and wires the server t
 defines `<zookeeper>`, `<macros>` and a one-shard cluster). To make it highly available:
 
 1. Switch the engines to `ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/{database}/{table}', '{replica}'[, version])` in a **new
-   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 31 ledger-derived tables
+   migration**, and replace `non_replicated_deduplication_window` by `replicated_deduplication_window` on the 32 ledger-derived tables
    **and** on `validator_validations` and `validator_seen` (migration 002: the collector's retried inserts carry a deduplication token, and
    those two tables have a window of 100; the nine tables of migration 003 have none, a set of theirs is idempotent by its `version`).
    `{shard}` and `{replica}` come from the `<macros>`.
@@ -191,17 +191,17 @@ Do not run production without a tested restore:
 
 ## Retention and TTL
 
-`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap, but **a ledger lives in 31
+`transactions.tx_json` + `meta_json` are the bulk of the data and are already `ZSTD(3)`-compressed. Partitions make retention cheap, but **a ledger lives in 32
 tables that must agree**, so retention is never per table:
 
 - The `ledgers` row is the commit marker. `range-ingest` **skips every ledger that has one** (it believes the ledger is complete), and the live syncer does not look
   behind its checkpoint, so a half-dropped ledger is not repaired by re-ingesting its range.
 - A ledger with a `ledgers` row but fewer stored transactions than its `tx_count` answers **500** on `/v2/ledgers/{id}`; payments, exchanges and balance changes
   whose tables were dropped just vanish from lists.
-- Partition sizes differ: `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales` and `nft_touches` are partitioned per **1,000,000** ledgers (P6), the other twenty-three ledger-keyed tables per **10,000,000** (P7),
+- Partition sizes differ: `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches` and `state_touches` are partitioned per **1,000,000** ledgers (P6), the other twenty-three ledger-keyed tables per **10,000,000** (P7),
   and `accounts_created` is not partitioned.
 
-The safe procedure drops **one 10,000,000-ledger block from 30 of the 31 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`
+The safe procedure drops **one 10,000,000-ledger block from 31 of the 32 ledger-derived tables**: the ten P6 partitions of `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`, `state_touches`
 (`ledgers` first, the commit marker), partition `k` of twenty-two of the twenty-three P7 tables, and a `DELETE ... WHERE ledger_index BETWEEN ...` on `accounts_created`. `account_domains` is kept:
 it holds about one row per account and partition, and dropping a partition would forget the domain of every account unchanged since that block, which the seed
 cannot bring back (its block of `account_states` is dropped too). The exact commands are in [operations](operations.md#retention). To restore a block run `range-ingest` over the same range (no `ledgers` rows are left, so it ingests everything); to repair

@@ -135,6 +135,13 @@ const SHAPES: Record<Table, Shape> = {
     partition: P7,
     order: 'account, object_type, role, ledger_index, tx_index, object_id',
   },
+  // the ledger-ordered index of the lines and issuers whose token state changed (migration 014): the tokens job scans it by
+  // primary-key range, as it does amm_pool_touches and nft_touches
+  [Table.StateTouches]: {
+    engine: 'ReplacingMergeTree',
+    partition: P6,
+    order: 'ledger_index, tx_index, kind, account, counterparty, currency',
+  },
   [Table.FeeStats]: { engine: 'MergeTree', partition: 'toYYYYMM(ts)', order: 'ts' },
   [Table.Validations]: {
     engine: 'AggregatingMergeTree',
@@ -287,6 +294,21 @@ const SHAPES: Record<Table, Shape> = {
   },
   // the aggregator's escrows and their sentinel row (migration 013): no partition, the newest version of an escrow wins
   [Table.Escrows]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'escrow_id' },
+  // the issued-token aggregate (migration 014): the job's generations, and the lines and tokens of each generation, which are
+  // swapped and dropped by generation (PARTITION BY generation)
+  [Table.TokenGenerations]: { engine: 'ReplacingMergeTree', version: 'version', partition: '', order: 'generation' },
+  [Table.TokenLines]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'generation',
+    order: 'issuer, currency, holder',
+  },
+  [Table.Tokens]: {
+    engine: 'ReplacingMergeTree',
+    version: 'version',
+    partition: 'generation',
+    order: 'issuer, currency',
+  },
   // what the tomls worker read of a domain (migration 012): one row per check, the newest wins
   [Table.DomainTomls]: { engine: 'ReplacingMergeTree', version: 'checked_at', partition: '', order: 'domain' },
   [Table.AccountNetworkNames]: { engine: 'MergeTree', partition: '', order: 'address, added_at' },
@@ -365,6 +387,10 @@ const MIGRATION_012_TABLES: Table[] = [Table.AccountDomains, Table.DomainTomls];
 const MIGRATION_013 = '013_ledger_objects.sql';
 /** The tables of migration 013. */
 const MIGRATION_013_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectChanges, Table.Escrows];
+/** The issued tokens (D6): the ledger-derived touch index of token state and the three aggregates of the `tokens` job. */
+const MIGRATION_014 = '014_issued_tokens.sql';
+/** The tables of migration 014. */
+const MIGRATION_014_TABLES: Table[] = [Table.StateTouches, Table.TokenGenerations, Table.TokenLines, Table.Tokens];
 
 /** The ledger-derived base and secondary tables: written with insert dedup tokens, so they keep a dedup window. */
 const DEDUP_TABLES: Table[] = [
@@ -399,6 +425,7 @@ const DEDUP_TABLES: Table[] = [
   Table.AccountDomains,
   Table.ObjectChanges,
   Table.AccountObjectChanges,
+  Table.StateTouches,
 ];
 
 /** The migration runner's split of a file into statements (see `splitStatements` in migrate.ts). */
@@ -1841,6 +1868,102 @@ describe('migrations (e2e)', () => {
       for (const table of MIGRATION_013_TABLES) expect(await tablesOf(config.database)).toContain(table);
 
       expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+  });
+
+  describe('migration 014', () => {
+    const realFiles = () =>
+      readdirSync(REAL_SCHEMA_DIR)
+        .filter((f) => f.endsWith('.sql'))
+        .sort();
+    let dir: string;
+    let previousDir: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'gh-schema-014-'));
+      previousDir = process.env.GH_SCHEMA_DIR;
+      process.env.GH_SCHEMA_DIR = dir;
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.GH_SCHEMA_DIR;
+      else process.env.GH_SCHEMA_DIR = previousDir;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    const copyReal = (files: string[]) => {
+      for (const f of files) copyFileSync(join(REAL_SCHEMA_DIR, f), join(dir, f));
+    };
+    const tablesOf = async (database: string): Promise<string[]> =>
+      (
+        await admin.query<{ name: string }>(`SELECT name FROM system.tables WHERE database = {db:String}`, {
+          db: database,
+        })
+      ).map((t) => t.name);
+
+    it('applies 014 to a database migrated before it, and then nothing', async () => {
+      const config = { ...ch.config, database: 'ctl_014_after' };
+      const before = realFiles().filter((f) => f !== MIGRATION_014);
+      expect(before.length).toBeGreaterThan(0);
+      expect(realFiles()).toContain(MIGRATION_014);
+
+      copyReal(before);
+      expect(await runMigrations({ config, log })).toEqual({ applied: before, skipped: [] });
+      for (const table of MIGRATION_014_TABLES) expect(await tablesOf(config.database)).not.toContain(table);
+
+      copyReal([MIGRATION_014]);
+      expect(await runMigrations({ config, log })).toEqual({ applied: [MIGRATION_014], skipped: before });
+      for (const table of MIGRATION_014_TABLES) expect(await tablesOf(config.database)).toContain(table);
+
+      expect(await runMigrations({ config, log })).toEqual({ applied: [], skipped: realFiles() });
+    });
+
+    it('drops one generation of token_lines and tokens with DROP PARTITION', async () => {
+      const config = { ...ch.config, database: 'ctl_014_drop' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const svc = new ClickHouseService(config);
+      try {
+        for (const generation of [1, 2]) {
+          await svc.insert(Table.TokenLines, [{ ...SAMPLE_ROWS[Table.TokenLines], generation }]);
+          await svc.insert(Table.Tokens, [{ ...SAMPLE_ROWS[Table.Tokens], generation }]);
+        }
+        const generationsOf = async (table: Table): Promise<number[]> =>
+          (await svc.query<{ generation: number }>(`SELECT DISTINCT generation FROM ${table} ORDER BY generation`)).map(
+            (r) => Number(r.generation),
+          );
+        expect(await generationsOf(Table.TokenLines)).toEqual([1, 2]);
+        expect(await generationsOf(Table.Tokens)).toEqual([1, 2]);
+
+        // the partition of a generation is the generation: the syncer drops it by number, the one statement that takes no parameter
+        await svc.command(`ALTER TABLE ${Table.TokenLines} DROP PARTITION 1`);
+        await svc.command(`ALTER TABLE ${Table.Tokens} DROP PARTITION 1`);
+
+        expect(await generationsOf(Table.TokenLines)).toEqual([2]);
+        expect(await generationsOf(Table.Tokens)).toEqual([2]);
+      } finally {
+        await svc.close();
+      }
+    });
+
+    it('keeps state_touches narrow: the six columns of the spec, and a kind that is an Enum8 of line and account', async () => {
+      const config = { ...ch.config, database: 'ctl_014_narrow' };
+      copyReal(realFiles());
+      await runMigrations({ config, log });
+
+      const columns = await admin.query<{ name: string; type: string }>(
+        `SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} ORDER BY position`,
+        { db: config.database, table: Table.StateTouches },
+      );
+      expect(columns).toEqual([
+        { name: 'ledger_index', type: 'UInt32' },
+        { name: 'tx_index', type: 'UInt32' },
+        { name: 'kind', type: "Enum8('line' = 1, 'account' = 2)" },
+        { name: 'account', type: 'String' },
+        { name: 'counterparty', type: 'String' },
+        { name: 'currency', type: 'LowCardinality(String)' },
+      ]);
     });
   });
 });

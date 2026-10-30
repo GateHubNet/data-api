@@ -99,6 +99,9 @@ Nothing checks for the tables at boot: run the migrate job first (the compose fi
 and writes the third table of the file. Nothing checks for the tables at boot: run the migrate job first (the compose files do), then deploy the syncer, then the api (the
 object routes answer 500 until the tables exist). The rollout and the history: [Ledger objects and delegation](#ledger-objects-and-delegation),
 [backfill](backfill.md#ledger-objects-and-delegation-re-ingest).
+**The ingest needs migration `014_issued_tokens.sql` applied before a syncer with parser version 8 starts, and the api after it.** That syncer writes `state_touches` with every ledger,
+and an insert into a missing table fails the batch, so the live runner retries the same ledgers without end; the `tokens` job reads and writes the other three tables of the file.
+Nothing checks for the tables at boot: run the migrate job first (the compose files do), then deploy the syncer, then the api (the token routes answer 500 until the tables exist).
 **The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
 [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
 for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
@@ -344,8 +347,8 @@ dropping whole partitions, **but a ledger exists only if all its tables agree**:
 - A ledger that has a `ledgers` row but fewer stored transactions than its `tx_count` is answered with **500** by `/v2/ledgers/{id}` (and its hash list); lists of
   payments, exchanges and balance changes silently lose the rows whose tables were dropped.
 
-So never drop the partitions of one table alone. Drop **the same ledger range from 30 of the 31 ledger-derived tables, all but `account_domains`**, in blocks
-aligned to the **10,000,000-ledger partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
+So never drop the partitions of one table alone. Drop **the same ledger range from 31 of the 32 ledger-derived tables, all but `account_domains`**, in blocks
+aligned to the **10,000,000-ledger partitions of the P7 tables** (the P6 tables `ledgers`, `transactions`, `payments`, `amm_pool_touches`, `path_payments`, `nft_sales`, `nft_touches`, `state_touches` have ten 1,000,000-ledger partitions per block; `accounts_created` has no partition and
 is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledgers vanish from every list at once), then the children. For the block 80,000,000-89,999,999
 (P7 partition 8, P6 partitions 80-89) of the XRPL database:
 
@@ -353,7 +356,7 @@ is cleaned with a `DELETE`). `ledgers` goes first (the commit marker: the ledger
 # run from the repo root; clickhouse-client authenticates with the container's own environment (the secret never touches the host command line)
 ch() { dc exec -T clickhouse sh -c 'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" -q "$0"' "$1"; }
 for p in 80 81 82 83 84 85 86 87 88 89; do ch "ALTER TABLE xrpl.ledgers DROP PARTITION $p"; done      # the commit marker first
-for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments amm_pool_touches path_payments nft_sales nft_touches; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
+for p in 80 81 82 83 84 85 86 87 88 89; do for t in transactions payments amm_pool_touches path_payments nft_sales nft_touches state_touches; do ch "ALTER TABLE xrpl.$t DROP PARTITION $p"; done; done
 for t in ledger_by_hash tx_by_hash tx_by_type account_transactions account_tx_by_sequence payments_by_currency account_payments exchanges account_exchanges balance_changes \
          amm_pool_states amm_liquidity account_amm_liquidity amm_governance account_states trust_line_states account_path_payments \
          nft_events account_nft_events collection_nft_events object_changes account_object_changes; do

@@ -88,23 +88,28 @@ const NFT_LEDGER_TABLES: Table[] = [
  */
 const OBJECT_LEDGER_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectChanges];
 
+/** The ledger table of the touches of token state (migration 014): a child table like the others, empty until its parser exists. */
+const TOUCH_LEDGER_TABLES: Table[] = [Table.StateTouches];
+
 /**
  * The tables the ripple-mock ledgers have (almost) no activity for: the delete tests put hand-made rows into them
  * (`insertSeededRows`), to see what the deletes reach and what they leave. The recorded AMM, NFT and object ledgers give
  * real rows to these tables, but they all sit in one partition of each, and the delete tests need the rows over several.
  * `account_domains` (migration 012) is one of them: the last ripple-mock ledger gives it two rows of one account, but the
  * delete tests need a row in every ledger, and each of an account of its own (`seededDomainRow`). The two object tables
- * (migration 013) are the others: two ripple-mock ledgers give them rows, in one partition.
+ * (migration 013) are the others: two ripple-mock ledgers give them rows, in one partition. `state_touches` (migration 014)
+ * is the last: no parser fills it yet.
  */
 const SEEDED_LEDGER_TABLES: Table[] = [
   ...AMM_LEDGER_TABLES,
   ...NFT_LEDGER_TABLES,
   Table.AccountDomains,
   ...OBJECT_LEDGER_TABLES,
+  ...TOUCH_LEDGER_TABLES,
 ];
 
 /** The seeded tables partitioned by a million ledgers (P6); the others by ten million (P7). */
-const SEEDED_P6_TABLES: Table[] = [Table.AmmPoolTouches, Table.NftSales, Table.NftTouches];
+const SEEDED_P6_TABLES: Table[] = [Table.AmmPoolTouches, Table.NftSales, Table.NftTouches, Table.StateTouches];
 
 type Counts = Record<string, number>;
 type Json = Record<string, unknown>;
@@ -140,7 +145,8 @@ const sortedBy = (rows: Json[], keys: string[]): Json[] =>
 /**
  * What the counted tables hold when exactly the ledgers of `built` matching `keep` were written, from the rows
  * `buildLedgerRows` made (`account_domains` is not counted: `MERGED_TABLES`). `seeded` are ledgers that also got one
- * hand-made row in each AMM and NFT table, in `account_domains` and in the two object tables (`insertSeededRows`).
+ * hand-made row in each AMM and NFT table, in `account_domains`, in the two object tables and in `state_touches`
+ * (`insertSeededRows`).
  */
 function countsOf(
   built: LedgerRows[],
@@ -235,7 +241,8 @@ describe('LedgerWriter and ingest state (e2e)', () => {
 
   /**
    * The hand-made rows of a seeded table (`insertSeededRows`): in `account_domains` the ones of the `rSeeded…` accounts, in
-   * the object tables the ones of the sample's object (two ripple-mock ledgers have real rows in them).
+   * the object tables the ones of the sample's object (two ripple-mock ledgers have real rows in them), in `state_touches` the
+   * ones of the sample's line.
    */
   const countSeeded = (svc: ClickHouseService, table: Table): Promise<number> =>
     count(
@@ -245,7 +252,9 @@ describe('LedgerWriter and ingest state (e2e)', () => {
         ? "startsWith(account, 'rSeeded')"
         : OBJECT_LEDGER_TABLES.includes(table)
           ? `object_id = '${SAMPLE_ROWS[Table.ObjectChanges].object_id}'`
-          : '1',
+          : TOUCH_LEDGER_TABLES.includes(table)
+            ? `account = '${SAMPLE_ROWS[Table.StateTouches].account}' AND counterparty = '${SAMPLE_ROWS[Table.StateTouches].counterparty}'`
+            : '1',
     );
 
   const rowsAbove = async (svc: ClickHouseService, cp: number): Promise<Counts> =>
@@ -316,20 +325,25 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   }
 
   /**
-   * The hand-made row of `table` for a ledger: the table's sample row, moved to the ledger. The touches of a pool and
-   * of an NFT are the columns of their key, with no time, and `account_domains` and `account_object_changes` have none
-   * either. The key of an object row has the ledger in it, so a row of each ledger is a row of its own.
+   * The hand-made row of `table` for a ledger: the table's sample row, moved to the ledger. The touches of a pool, of an
+   * NFT and of token state are the columns of their key, with no time, and `account_domains` and `account_object_changes`
+   * have none either. The key of an object row has the ledger in it, so a row of each ledger is a row of its own.
    */
   function seededRow(table: Table, ledger: LedgerRows['ledger']): Json {
     if (table === Table.AccountDomains) return seededDomainRow(ledger.ledger_index);
     const row: Json = { ...SAMPLE_ROWS[table], ledger_index: ledger.ledger_index };
-    if (table === Table.AmmPoolTouches || table === Table.NftTouches || table === Table.AccountObjectChanges)
+    if (
+      table === Table.AmmPoolTouches ||
+      table === Table.NftTouches ||
+      table === Table.AccountObjectChanges ||
+      table === Table.StateTouches
+    )
       return row;
     return { ...row, close_time: ledger.close_time };
   }
 
   /**
-   * One row in each AMM and NFT ledger table, in `account_domains` and in the two object tables, for every one of
+   * One row in each AMM and NFT ledger table, in `account_domains`, in the two object tables and in `state_touches`, for every one of
    * `rows`' ledgers. The ripple-mock ledgers (2021) have no such activity (but for two rows of `account_domains` in the
    * last one), so the delete tests put these in by hand, over several partitions, to see what the deletes reach and what
    * they leave. `expectedCounts` and `expectStored` take them as `seeded`.

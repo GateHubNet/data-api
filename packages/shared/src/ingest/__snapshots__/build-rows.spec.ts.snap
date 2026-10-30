@@ -2979,6 +2979,7 @@ exports[`a transaction whose Account is "" (Xahau UNLReport; ruling R95) matches
       "tx_index": 36,
     },
   ],
+  "stateTouches": [],
   "transactions": [
     {
       "account": "r9E2h5xmwoT5UNSBnv4EgwU4c6SNZwdUhd",
@@ -4896,6 +4897,7 @@ exports[`buildLedgerRows snapshots recorded Xahau ledger 26540188 (GenesisMint, 
       "tx_index": 3,
     },
   ],
+  "stateTouches": [],
   "transactions": [
     {
       "account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
@@ -5841,6 +5843,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11118827 1`] = `
   "pathPayments": [],
   "payments": [],
   "paymentsByCurrency": [],
+  "stateTouches": [],
   "transactions": [
     {
       "account": "rHsZHqa5oMQNL5hFm4kfLd47aEMYjPstpg",
@@ -7901,6 +7904,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11119620 (payments, exchan
       "tx_index": 7,
     },
   ],
+  "stateTouches": [],
   "transactions": [
     {
       "account": "rKLpjpCoXgLQQYQyj13zgay73rsgmzNH13",
@@ -9416,6 +9420,7 @@ exports[`buildLedgerRows snapshots ripple-mock ledger 11618225 (a payment that c
       "tx_index": 4,
     },
   ],
+  "stateTouches": [],
   "transactions": [
     {
       "account": "rBSZe33F5oxHTbxSF1nZJooVDpcrrqNFp3",

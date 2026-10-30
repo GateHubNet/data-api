@@ -650,6 +650,22 @@ export interface AccountObjectChangesRow {
   action: 'created' | 'modified' | 'deleted';
 }
 
+/**
+ * A trust line or an account whose token state a transaction may have changed (`state_touches`, migration 014): the narrow,
+ * ledger-ordered index of `trust_line_states` and `account_states`, as `AmmPoolTouchesRow` is of the pool states. The tokens
+ * job reads it by a range of the primary key. For a `line` row `account` is the line's low account, `counterparty` its high
+ * account and `currency` the currency as the ledger writes it; for an `account` row (an account whose token settings may have
+ * changed) `counterparty` and `currency` are `''`.
+ */
+export interface StateTouchesRow {
+  ledger_index: number;
+  tx_index: number;
+  kind: 'line' | 'account';
+  account: string;
+  counterparty: string;
+  currency: string;
+}
+
 // -- Node-sourced tables -----------------------------------------------------------------------------------------
 
 export interface FeeStatsRow {
@@ -1314,6 +1330,87 @@ export interface EscrowsRow {
   deleted: number;
   open_count: UInt64Value;
   through_ledger: number;
+  version: UInt64Value;
+}
+
+// -- Issued tokens (migration 014) -------------------------------------------------------------------------------
+
+/**
+ * One row of `token_generations`, the state of the tokens job: a row is written for every change of a generation, and the
+ * newest `version` of a `generation` is its state. The live generation is the highest one whose newest row is `live`.
+ *
+ * `coverage_from` is the state coverage start the generation was built on and `head_ledger` the ledger its account pass reads
+ * at. `account_cursor` is the last account the pass finished (`''` before the first) and `pass_done` is 1 once the pass has
+ * finished. `through_ledger` is the ledger up to which every touch has been applied, `repair_from` the lowest ledger to apply
+ * again (0: none). `holders` is the number of distinct holders of all tokens at `holders_ledger`.
+ */
+export interface TokenGenerationsRow {
+  generation: number;
+  state: 'building' | 'live' | 'retired';
+  config_version: number;
+  coverage_from: number;
+  head_ledger: number;
+  account_cursor: string;
+  pass_done: number;
+  through_ledger: number;
+  repair_from: number;
+  holders: number;
+  holders_ledger: number;
+  started_at: UnixSecondsMs;
+  changed_at: UnixSecondsMs;
+  version: UInt64Value;
+}
+
+/**
+ * One row of `token_lines`: a trust line that counts, from the token's side. `balance` is the holder's (0 or above, exact
+ * decimal text, `balance_f` its `Float64` shadow) and `limit` the holder's limit. `frozen` and `authorized` are the issuer
+ * side's freeze and auth flags and `ledger_index` is the ledger of the line's newest state. `deleted = 1` is a tombstone:
+ * the line no longer counts. A reader names one `generation`, keeps the newest `version` of each (issuer, currency, holder)
+ * and drops tombstones after that. `version` is the writer's clock in milliseconds, at least one more than any version
+ * already written, as text or a number.
+ */
+export interface TokenLinesRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  holder: string;
+  balance: string;
+  balance_f: number;
+  limit: string;
+  frozen: number;
+  authorized: number;
+  ledger_index: number;
+  deleted: number;
+  version: UInt64Value;
+}
+
+/**
+ * One row of `tokens`, one per token and recompute. `code` is the currency as text (`''` when it has none), `supply` the exact
+ * sum of the holders' balances (`supply_f` its shadow) and `last_ledger` the newest `ledger_index` of the token's lines. The
+ * issuer's settings are those of its newest `account_states` row at the ledger the row was computed at: `issuer_flags` (the
+ * `Flags` of its AccountRoot), `transfer_rate` (0 when absent) and `issuer_ledger` (that row's ledger, 0 when the issuer has no
+ * row in the state tables). `domain` is the issuer's account domain (`''` when none); `listed`, `name` and `toml` come from the
+ * toml of that domain: `toml` is the JSON of the served fields of the matched currency entry, `''` when not listed.
+ * `deleted = 1`: no line counts any more.
+ */
+export interface TokensRow {
+  generation: number;
+  issuer: string;
+  currency: string;
+  code: string;
+  holders: number;
+  trust_lines: number;
+  supply: string;
+  supply_f: number;
+  last_ledger: number;
+  issuer_ledger: number;
+  issuer_flags: number;
+  transfer_rate: number;
+  domain: string;
+  listed: number;
+  name: string;
+  toml: string;
+  deleted: number;
   version: UInt64Value;
 }
 

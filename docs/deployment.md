@@ -254,6 +254,10 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   so the live runner would retry the same ledgers without end; its `escrows` job reads and writes the third, and the object routes of the api answer 500 until the tables exist. Nothing checks for
   them at boot. The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. Then delegation is re-ingested on the XRP Ledger
   ([operations](operations.md#ledger-objects-and-delegation), [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)).
+- `014_issued_tokens.sql` (four `CREATE TABLE IF NOT EXISTS`: the ledger-derived `state_touches`, and the aggregates `token_generations`, `token_lines` and `tokens`) is additive but **sets an order**:
+  `migrate` first, then the syncer, then the api. A syncer of this version (parser version 8) writes `state_touches` with every ledger, and an insert into a missing table fails the batch, so the
+  live runner would retry the same ledgers without end; its `tokens` job reads and writes the other three, and the token routes of the api answer 500 until the tables exist. Nothing checks for
+  them at boot. The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last.
 
 ## Configuration and secrets
 

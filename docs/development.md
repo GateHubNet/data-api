@@ -211,7 +211,7 @@ Mirror a small domain such as `apps/api/src/active-accounts/`.
 
 ### 6b. Add a ClickHouse table or column
 
-1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `013_ledger_objects.sql`; 008 is reserved by another change of spec #4;
+1. Add a **new** migration file `packages/shared/schema/NNN_*.sql`, numbered after the last one (now `014_issued_tokens.sql`; 008 is reserved by another change of spec #4;
    never edit an applied one; `CREATE ... IF NOT EXISTS` or `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the semicolon of a
    statement must end its last line, no comment line may end with `;`).
 2. Add the table to the `Table` enum (`tables.ts`) and its row type to `rows.ts`.

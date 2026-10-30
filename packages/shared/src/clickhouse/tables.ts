@@ -45,6 +45,9 @@ export enum Table {
   // narrow index by account.
   ObjectChanges = 'object_changes',
   AccountObjectChanges = 'account_object_changes',
+  // The ledger-ordered index of the trust lines and issuers whose token state a transaction changed (migration 014, written by
+  // ingest from parser version 8): the tokens job scans it by ledger, as the aggregator scans the other touch tables.
+  StateTouches = 'state_touches',
   // Collected from the node (not derived from a ledger).
   FeeStats = 'fee_stats',
   Validations = 'validations',
@@ -84,6 +87,11 @@ export enum Table {
   NftCollectionHolders = 'nft_collection_holders',
   // Migration 013, written by the aggregator: the state of every escrow, plus a sentinel row that holds the escrowed total.
   Escrows = 'escrows',
+  // Written by the aggregator's `tokens` job (migration 014): the generations of the token set and the lines and tokens of each,
+  // swapped and dropped by generation.
+  TokenGenerations = 'token_generations',
+  TokenLines = 'token_lines',
+  Tokens = 'tokens',
   // Migration 012, written by the syncer's tomls worker: one row per check of a domain's toml, the newest wins.
   DomainTomls = 'domain_tomls',
   // Written by the operator with plain SQL inserts (ADR-0014).

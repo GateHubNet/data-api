@@ -28,6 +28,7 @@ import {
   PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
+  StateTouchesRow,
   TransactionsRow,
   TrustLineStatesRow,
   TxByHashRow,
@@ -103,6 +104,11 @@ export interface LedgerRows {
   objectChanges: ObjectChangesRow[];
   /** The index of `objectChanges` by account: a row for the owner and one for the counterparty of each. */
   accountObjectChanges: AccountObjectChangesRow[];
+  /**
+   * The trust lines and issuers whose token state a transaction changed (migration 014): the ledger-ordered index the tokens job
+   * scans. Always empty until the parser that fills it exists (parser version 8).
+   */
+  stateTouches: StateTouchesRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
   diagnostics: LedgerDiagnostics;
 }
@@ -142,7 +148,8 @@ export type ChildRowsKey = Exclude<keyof LedgerRows, 'ledger' | 'ledgerByHash' |
  * Every table that holds the rows of a ledger's transactions, with the `LedgerRows` property that fills it: all the
  * ledger-derived tables except `ledgers` and `ledger_by_hash`, which are the commit marker and are written separately.
  * They are the 12 tables of the Ripple v2 data, the 5 AMM ledger tables, the 2 state history tables, the path payments
- * and their index by account, the 5 NFT tables, the account domains, and the object changes and their index by account.
+ * and their index by account, the 5 NFT tables, the account domains, the object changes and their index by account, and the
+ * state touches.
  */
 export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.Transactions, 'transactions'],
@@ -174,6 +181,7 @@ export const CHILD_TABLES: ReadonlyArray<[Table, ChildRowsKey]> = [
   [Table.AccountDomains, 'accountDomains'],
   [Table.ObjectChanges, 'objectChanges'],
   [Table.AccountObjectChanges, 'accountObjectChanges'],
+  [Table.StateTouches, 'stateTouches'],
 ];
 
 const paymentParser = new PaymentParser();
@@ -304,6 +312,7 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
     accountDomains: [],
     objectChanges: [],
     accountObjectChanges: [],
+    stateTouches: [],
     diagnostics: { ammUnclassified: 0, nftSkipped: 0, invalidDomains: 0, objectsUnclassified: 0 },
   };
 

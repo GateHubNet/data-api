@@ -53,8 +53,12 @@ import {
   PathPaymentsRow,
   PaymentsByCurrencyRow,
   PaymentsRow,
+  StateTouchesRow,
   StatsHourlyRow,
   SyncerLeaseRow,
+  TokenGenerationsRow,
+  TokenLinesRow,
+  TokensRow,
   TransactionsRow,
   TrustLineStatesRow,
   TxByHashRow,
@@ -106,6 +110,7 @@ export interface TableRows {
   [Table.AccountDomains]: AccountDomainsRow;
   [Table.ObjectChanges]: ObjectChangesRow;
   [Table.AccountObjectChanges]: AccountObjectChangesRow;
+  [Table.StateTouches]: StateTouchesRow;
   [Table.FeeStats]: FeeStatsRow;
   [Table.Validations]: ValidationsRow;
   [Table.ValidatorManifests]: ValidatorManifestsRow;
@@ -138,6 +143,9 @@ export interface TableRows {
   [Table.NftCollections]: NftCollectionsRow;
   [Table.NftCollectionHolders]: NftCollectionHoldersRow;
   [Table.Escrows]: EscrowsRow;
+  [Table.TokenGenerations]: TokenGenerationsRow;
+  [Table.TokenLines]: TokenLinesRow;
+  [Table.Tokens]: TokensRow;
   [Table.DomainTomls]: DomainTomlsRow;
   [Table.AccountNetworkNames]: AccountNetworkNamesRow;
   [Table.IngestLog]: IngestLogRow;
@@ -586,6 +594,15 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     tx_index: 8,
     object_id: hash(40),
     action: 'created',
+  },
+  // a trust line whose state a transaction changed (the touch of the line Alice holds with the issuer)
+  [Table.StateTouches]: {
+    ledger_index: LEDGER,
+    tx_index: 9,
+    kind: 'line',
+    account: ALICE,
+    counterparty: ISSUER,
+    currency: 'USD',
   },
   [Table.FeeStats]: {
     ts: CLOSE_MS,
@@ -1062,6 +1079,59 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     deleted: 0,
     open_count: 0,
     through_ledger: 0,
+    version: VERSION_MS,
+  },
+  // the generation the job is building: its account pass has read as far as Bob and applied the touches up to 500 ledgers back
+  [Table.TokenGenerations]: {
+    generation: 2,
+    state: 'building',
+    config_version: 1,
+    coverage_from: LEDGER - 1_000,
+    head_ledger: LEDGER,
+    account_cursor: BOB,
+    pass_done: 0,
+    through_ledger: LEDGER - 500,
+    repair_from: LEDGER - 200,
+    holders: 1_200,
+    holders_ledger: LEDGER - 600,
+    started_at: CLOSE_MS,
+    changed_at: 1_700_000_060.456,
+    version: VERSION_MS,
+  },
+  // Alice holds 1250.75 USD of the issuer (the line counts), the issuer has authorized the line
+  [Table.TokenLines]: {
+    generation: 2,
+    issuer: ISSUER,
+    currency: 'USD',
+    holder: ALICE,
+    balance: '1250.75',
+    balance_f: 1250.75,
+    limit: '5000',
+    frozen: 0,
+    authorized: 1,
+    ledger_index: LEDGER,
+    deleted: 0,
+    version: VERSION_MS,
+  },
+  // the token those lines make: 1,200 holders on 1,500 counting lines, the issuer's flags (DefaultRipple) and a 0.5% transfer fee, listed by its toml
+  [Table.Tokens]: {
+    generation: 2,
+    issuer: ISSUER,
+    currency: 'USD',
+    code: 'USD',
+    holders: 1_200,
+    trust_lines: 1_500,
+    supply: '9876543.21',
+    supply_f: 9876543.21,
+    last_ledger: LEDGER,
+    issuer_ledger: LEDGER - 10,
+    issuer_flags: 8_388_608,
+    transfer_rate: 1_005_000_000,
+    domain: 'sample.example',
+    listed: 1,
+    name: 'Sample USD',
+    toml: JSON.stringify({ code: 'USD', issuer: ISSUER, name: 'Sample USD' }),
+    deleted: 0,
     version: VERSION_MS,
   },
   [Table.DomainTomls]: {

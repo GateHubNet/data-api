@@ -97,6 +97,14 @@ describe('LEDGER_KEYED_TABLES', () => {
     expect(LEDGER_KEYED_TABLES.map((t) => t.table)).not.toContain(Table.Escrows);
   });
 
+  it('lists state_touches by a million, and not the token aggregates: a ledger rewrite must not touch them', () => {
+    expect(LEDGER_KEYED_TABLES.filter((t) => t.table === Table.StateTouches)).toEqual([
+      { table: Table.StateTouches, partitionSize: P6 },
+    ]);
+    const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
+    for (const table of [Table.TokenGenerations, Table.TokenLines, Table.Tokens]) expect(tables).not.toContain(table);
+  });
+
   it('lists every table once and keeps the commit marker first', () => {
     const tables = LEDGER_KEYED_TABLES.map((t) => t.table);
     expect(new Set(tables).size).toBe(tables.length);
