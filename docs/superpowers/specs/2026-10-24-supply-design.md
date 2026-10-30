@@ -170,7 +170,11 @@ ORDER BY ledger_index;
 ```
 
 - **Readers** take the newest snapshot without `FINAL`: `ORDER BY ledger_index DESC, version DESC LIMIT 1` (a read of the end of the key).
-  A cycle that is redone at the same ledger (a retry after a failed insert) writes the same key under a newer `version`.
+  A cycle that is redone at the same ledger (a retry after a failed insert) writes the same key under a newer `version`. *Amended
+  2026-10-30 by the D7 Task 5 build: that one read scans the whole part, because `version` is not in the key and the read in order cannot stop
+  at the first row (20,000 of 20,000 rows read, measured). Readers take the newest snapshot in two reads of the end of the key: the newest
+  `ledger_index` (`ORDER BY ledger_index DESC LIMIT 1`), then every version of that ledger by its key, of which the highest `version` is the
+  snapshot (section 3).*
 - Not a ledger table (not in `CHILD_TABLES` / `LEDGER_KEYED_TABLES`): recovery never deletes it. Every cycle recomputes everything
   from the tables, so a re-ingest needs no `agg_dirty` hook: the next cycle (at most an hour later) carries it (section 4.5).
 - Size: 24 rows a day, a few hundred bytes each. No TTL (decision 9).
@@ -237,7 +241,12 @@ with, not a mint (decision 5), and its ledger is the only one where the invarian
 
 `packages/shared/src/query/supply.ts` (pure SQL builders and small readers; every user value bound):
 
-- `newestSnapshot(ch)`: `SELECT * FROM network_supply ORDER BY ledger_index DESC, version DESC LIMIT 1`.
+- `newestSnapshot(ch)`: `SELECT * FROM network_supply ORDER BY ledger_index DESC, version DESC LIMIT 1`. *Amended 2026-10-30 by the D7 Task 5
+  build: two reads, each of one granule at the end of the key: `SELECT ledger_index FROM network_supply ORDER BY ledger_index DESC LIMIT 1`,
+  then the columns `WHERE ledger_index = {ledger:UInt32}` (a handful of rows: one for each time the cycle was redone at that ledger), of which
+  the code takes the highest `version` as a number. The single read above scans the whole part (section 1.4); ordering the second read by
+  `version` in SQL reads its granule twice (ClickHouse reads the order columns first, then the others for the one row), and `version` aliased
+  to its text in the select that orders would sort `10` below `9`.*
 - `mintSums(ch, from, to, byDay)`: the minted drops by source over ledgers `[from, to]`, in total or per UTC day. It reads in slices of
   `SUPPLY_MINT_SLICE_LEDGERS` = 1,000,000 ledgers (one P6 partition), so the set of claim hashes a read builds is one slice's
   (plus `SUPPLY_PARENT_LEDGERS` = 256 ledgers before it):
@@ -412,7 +421,7 @@ Xahau:
 - `close_time` is the snapshot ledger's (`YYYY-MM-DDTHH:mm:ssZ`); `computed_at` when the row was written.
 - **Errors**: 404 `supply not computed yet` (no snapshot); 500 `unable to retrieve supply`.
 - **Cache**: the default `Cache-Control: private, max-age=60`. **Query bound**: one granule of `network_supply` (the read of the end of
-  the key).
+  the key). *Amended 2026-10-30 by the D7 Task 5 build: two such reads, one after the other (sections 3 and 6).*
 
 ### 5.2 `GET /v2/network/supply/minted`
 
@@ -469,6 +478,11 @@ newest day is the running one, summed so far.
 | Xahau burned | `ledgers` up to L, nothing else | `supply-job.e2e-spec.ts` |
 | `mintSums` slice | the P6 key ranges of the slice (`read_rows` ≤ the slice's rows + 256 ledgers of claims) | `supply-minted.e2e-spec.ts` |
 | the network_state / SetFee read | one granule each | `supply-job.e2e-spec.ts` |
+
+*Amended 2026-10-30 by the D7 Task 5 build: `newestSnapshot` is two reads of the end of the key (section 3), and its bound is the form the other
+bound tests use, the rows the read needs plus two granules for each part, not 8,192 rows. Over 20,000 rows in one part that is 1 + 2 × 8,192 =
+16,385: the one read it replaced (20,000 rows) is over it, and each of the two reads (11,808 rows) is under it, because the part's last granule
+holds the rows from the 8,193rd on. The test is `supply-reads.e2e-spec.ts` of `packages/shared`, not `supply.e2e-spec.ts`.*
 
 ## 7. XRPL, Xahau and the sandbox
 

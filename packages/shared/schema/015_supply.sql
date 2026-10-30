@@ -15,7 +15,8 @@
 --
 -- network_supply is an aggregate, written by the syncer's aggregator only (job supply, ReplacingMergeTree(version), no
 -- partition, no TTL, no dedup window, and never deleted by recovery): one row per snapshot, written in one insert. Readers
--- take the newest snapshot without FINAL, by ORDER BY ledger_index DESC, version DESC LIMIT 1.
+-- take the newest snapshot without FINAL, in two reads of the end of the key: the newest ledger_index (ORDER BY ledger_index
+-- DESC LIMIT 1), then every version of that ledger by its key, of which the highest version is the snapshot.
 --
 -- Every statement is IF NOT EXISTS, so the file can simply be run again.
 --

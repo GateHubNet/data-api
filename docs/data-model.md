@@ -659,7 +659,9 @@ ledger), `escrowed` and `escrow_count` (the open native escrows), `amm` (`Nullab
 `amm_pools` (`UInt32`, the live pools with a native reserve above 0), `reserve_base` and `reserve_inc` (`Nullable`, `NULL` when no reserve value is known at
 the ledger), `accounts` (the existing accounts, AMM pool accounts left out), `owner_count` (the sum of their `OwnerCount`), `minted_rewards`,
 `minted_import` and `minted_genesis` (`Nullable`, every indexed mint up to the ledger, `NULL` on XRPL) and `version`.
-**Readers take the newest snapshot without `FINAL`**: `ORDER BY ledger_index DESC, version DESC LIMIT 1`, a read of the end of the key. A cycle that is
+**Readers take the newest snapshot without `FINAL`**, in two reads of the end of the key (`newestSnapshot`): the newest `ledger_index` (`ORDER BY
+ledger_index DESC LIMIT 1`), then every version of that ledger by its key, of which the highest `version` is the snapshot. One read,
+`ORDER BY ledger_index DESC, version DESC LIMIT 1`, would read the whole part: `version` is not in the key. A cycle that is
 redone at the same ledger (a retry after a failed insert) writes the same key under a newer `version`.
 
 ## 4. Relationships

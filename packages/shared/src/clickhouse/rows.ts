@@ -1486,9 +1486,9 @@ export interface TokensRow {
 
 /**
  * One snapshot of the native supply (`network_supply`), written by the aggregator's `supply` job in one insert; the newest
- * `version` of a `ledger_index` is the snapshot, and a reader takes the newest snapshot by `ORDER BY ledger_index DESC, version DESC
- * LIMIT 1`. All amounts are in drops. `ledger_index` and `close_time` are the snapshot ledger's; `started_at` is when the cycle began
- * (the cadence reads it) and `computed_at` when the row was written.
+ * `version` of a `ledger_index` is the snapshot, and a reader takes the newest snapshot with `newestSnapshot` (the newest
+ * `ledger_index`, then the highest `version` of it). All amounts are in drops. `ledger_index` and `close_time` are the snapshot
+ * ledger's; `started_at` is when the cycle began (the cadence reads it) and `computed_at` when the row was written.
  *
  * `burned` is 10^17 less `total_coins` on XRPL and the sum of `fee_total` up to the ledger on Xahau. `escrowed` and `escrow_count`
  * are the open native escrows. `amm` is the drops in the pools (`null` on a network without AMM) and `amm_pools` the live pools with

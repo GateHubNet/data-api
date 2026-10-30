@@ -24,7 +24,7 @@ const D3 = '2026-10-03';
 
 const mint = (
   ledger_index: number,
-  amount: number,
+  amount: number | string,
   parent_tx_hash: string,
   closed: string,
   position: { tx_index?: number; mint_index?: number } = {},
@@ -51,7 +51,7 @@ const claim = (ledger_index: number, tx_hash: string, over: Partial<RewardClaims
   ...over,
 });
 
-const imported = (ledger_index: number, minted: number, closed: string, tx_index = 0): ImportsRow => ({
+const imported = (ledger_index: number, minted: number | string, closed: string, tx_index = 0): ImportsRow => ({
   ledger_index,
   tx_index,
   tx_hash: `import-${ledger_index}-${tx_index}`,
@@ -201,6 +201,80 @@ describe('the supply reads (e2e)', () => {
       expect((await mintSums(ch, 1_000_000, 1_999_999, true)).get(D1)).toEqual(sums(0, 0, 8));
     });
 
+    it('reads from the first ledgers, where the 256 ledgers before the slice are below 0', async () => {
+      const ch = await fresh();
+      // Xahau's history starts at ledger 1 or 2: the claims are read from max(0, from - 256), and a negative bound is no UInt32
+      await ch.insert(Table.RewardClaims, [claim(50, 'claim-50')]);
+      await ch.insert(Table.GenesisMints, [mint(52, 5, 'claim-50', `${D1}T00:00:00Z`)]);
+      expect(await mintSums(ch, 1, 100, false)).toEqual(sums(5, 0, 0));
+      expect(await mintSums(ch, 0, 100, false)).toEqual(sums(5, 0, 0));
+      expect((await mintSums(ch, 1, 100, true)).get(D1)).toEqual(sums(5, 0, 0));
+    });
+
+    it('adds every import and every mint entry of a ledger', async () => {
+      const ch = await fresh();
+      // the key of an import is (ledger, place in the ledger), the key of a mint entry (ledger, place, entry)
+      await ch.insert(Table.Imports, [
+        imported(1_000_400, 10, `${D1}T00:00:00Z`),
+        imported(1_000_400, 20, `${D1}T00:00:00Z`, 1),
+        imported(1_000_400, 40, `${D1}T00:00:00Z`, 2),
+      ]);
+      await ch.insert(Table.GenesisMints, [
+        mint(1_000_500, 1, '', `${D1}T00:00:00Z`),
+        mint(1_000_500, 2, '', `${D1}T00:00:00Z`, { mint_index: 1 }),
+        mint(1_000_500, 4, '', `${D1}T00:00:00Z`, { tx_index: 1 }),
+        mint(1_000_500, 8, '', `${D1}T00:00:00Z`, { tx_index: 1, mint_index: 1 }),
+      ]);
+      expect(await mintSums(ch, 1_000_000, 1_999_999, false)).toEqual(sums(0, 70, 15));
+      expect((await mintSums(ch, 1_000_000, 1_999_999, true)).get(D1)).toEqual(sums(0, 70, 15));
+    });
+
+    it('answers the days in ascending order, whatever order the slices and the ledgers come in', async () => {
+      const ch = await fresh();
+      const D0 = '2026-09-30';
+      // the first slice has the latest day of a mint and the earliest day of an import; the second has a later day in an earlier ledger
+      await ch.insert(Table.GenesisMints, [
+        mint(10, 3, '', `${D3}T00:00:00Z`),
+        mint(1_000_105, 2, '', `${D2}T00:00:00Z`),
+        mint(1_000_900, 1, '', `${D1}T00:00:00Z`),
+      ]);
+      await ch.insert(Table.Imports, [imported(11, 4, `${D0}T00:00:00Z`), imported(1_000_400, 8, `${D2}T00:00:00Z`)]);
+      const byDay = await mintSums(ch, 0, 1_999_999, true);
+      expect([...byDay.keys()]).toEqual([D0, D1, D2, D3]);
+      expect(byDay.get(D0)).toEqual(sums(0, 4, 0));
+      expect(byDay.get(D1)).toEqual(sums(0, 0, 1));
+      expect(byDay.get(D2)).toEqual(sums(0, 8, 2));
+      expect(byDay.get(D3)).toEqual(sums(0, 0, 3));
+    });
+
+    it('adds amounts past 2^53 exactly', async () => {
+      const ch = await fresh();
+      // 2^53 + 1 is no JS number: it is inserted as text, summed by ClickHouse inside a slice, and added across slices as a bigint
+      const BIG = '9007199254740993';
+      const big = (times: number): bigint => BigInt(BIG) * BigInt(times);
+      await ch.insert(Table.RewardClaims, [claim(1_000_100, 'claim-big')]);
+      await ch.insert(Table.GenesisMints, [
+        mint(1_000_105, BIG, 'claim-big', `${D1}T00:00:00Z`),
+        mint(1_000_106, BIG, 'claim-big', `${D1}T00:00:00Z`),
+        mint(1_000_107, BIG, '', `${D1}T00:00:00Z`),
+        mint(1_000_108, BIG, '', `${D1}T00:00:00Z`),
+        mint(2_000_001, BIG, '', `${D2}T00:00:00Z`),
+      ]);
+      await ch.insert(Table.Imports, [
+        imported(1_000_400, BIG, `${D1}T00:00:00Z`),
+        imported(1_000_401, BIG, `${D1}T00:00:00Z`),
+        imported(2_000_002, BIG, `${D2}T00:00:00Z`),
+      ]);
+      expect(await mintSums(ch, 1_000_000, 2_999_999, false)).toEqual({
+        rewards: big(2),
+        genesis_mint: big(3),
+        import: big(3),
+      });
+      const byDay = await mintSums(ch, 1_000_000, 2_999_999, true);
+      expect(byDay.get(D1)).toEqual({ rewards: big(2), genesis_mint: big(2), import: big(2) });
+      expect(byDay.get(D2)).toEqual({ rewards: 0n, genesis_mint: big(1), import: big(1) });
+    });
+
     it('counts a mint and an import written twice once', async () => {
       const ch = await fresh();
       await stopMerges(ch, Table.GenesisMints, Table.Imports, Table.RewardClaims);
@@ -210,7 +284,8 @@ describe('the supply reads (e2e)', () => {
         mint(1_000_105, 11, 'claim-1', `${D1}T00:00:00Z`, { mint_index: 1 }),
         mint(1_000_106, 7, '', `${D1}T00:00:00Z`),
       ];
-      const imports = [imported(1_000_400, 1000, `${D1}T00:00:00Z`), imported(1_000_401, 20, `${D1}T00:00:00Z`)];
+      // two imports of one ledger: the key of an import is its ledger and its place in the ledger
+      const imports = [imported(1_000_400, 1000, `${D1}T00:00:00Z`), imported(1_000_400, 20, `${D1}T00:00:00Z`, 1)];
       const written: Array<[Table, object[]]> = [
         [Table.RewardClaims, claims],
         [Table.GenesisMints, mints],
@@ -477,8 +552,8 @@ describe('the supply reads (e2e)', () => {
           version: 2,
           amm: null,
           minted_rewards: '41203318512207',
-          minted_import: '8102233104',
-          minted_genesis: '120000',
+          minted_import: '8102233104000',
+          minted_genesis: '120000000000',
         }),
       ]);
       expect(await newestSnapshot(ch)).toMatchObject({
@@ -486,12 +561,12 @@ describe('the supply reads (e2e)', () => {
         version: '2',
         amm: null,
         minted_rewards: '41203318512207',
-        minted_import: '8102233104',
-        minted_genesis: '120000',
+        minted_import: '8102233104000',
+        minted_genesis: '120000000000',
       });
     });
 
-    it('reads one granule for the newest snapshot', async () => {
+    it('reads two granules of the end of the key for the newest snapshot, one for each of its reads', async () => {
       const ch = await fresh();
       await stopMerges(ch, Table.NetworkSupply);
       // 20,000 snapshots in one insert: one part
@@ -525,7 +600,7 @@ describe('the supply reads (e2e)', () => {
       // scan of the table is over it
       const bound = 1 + 2 * GRANULE * parts;
       expect(bound).toBeLessThan(20_000);
-      expect(read.length).toBeGreaterThan(0);
+      expect(read).toHaveLength(2);
       for (const { read_rows } of read) expect(Number(read_rows)).toBeLessThanOrEqual(bound);
     });
   });

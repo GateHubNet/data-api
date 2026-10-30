@@ -73,9 +73,9 @@ export interface NetworkProfile {
    */
   readonly hasAmm: boolean;
   /**
-   * Whether the network creates native currency after its genesis (`GenesisMint`, `Import` and the balance rewards of
-   * `ClaimReward`): Xahau and its testnet do; the XRP Ledger mints nothing, its supply only falls. The supply reads the mints
-   * only where this is true. The key is in every profile.
+   * Whether the network creates native currency after its genesis (`GenesisMint`, which the genesis account's hook emits to pay
+   * the reward of a `ClaimReward`, and `Import`; the claim itself mints nothing): Xahau and its testnet do; the XRP Ledger
+   * mints nothing, its supply only falls. The supply reads the mints only where this is true. The key is in every profile.
    */
   readonly hasMinting: boolean;
   /** The node software of the network: it decides how `server_version` is decoded. */
