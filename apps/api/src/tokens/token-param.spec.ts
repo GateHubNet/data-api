@@ -1,5 +1,5 @@
 import { RippleHttpError } from '../common/errors';
-import { parseTokenParam, tokenFileStem } from './token-param';
+import { parseTokenParam, tokenFileStem, tokenFileStemOfPath } from './token-param';
 
 const ISSUER = 'rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq';
 /** The X-address of a classic address: not accepted as an issuer. */
@@ -130,5 +130,29 @@ describe('tokenFileStem', () => {
     expect(tokenFileStem({ currency: noText, issuer: ISSUER })).toBe(`${noText} ${ISSUER}`);
     const lp = `03${'AB'.repeat(19)}`;
     expect(tokenFileStem({ currency: lp, issuer: ISSUER })).toBe(`${lp} ${ISSUER}`);
+  });
+});
+
+describe('tokenFileStemOfPath', () => {
+  it('is the stem of the token the path names, whatever the spelling of it', () => {
+    const hex = hexOf('RLUSD');
+    for (const raw of [
+      `RLUSD.${ISSUER}`,
+      `RLUSD+${ISSUER}`,
+      `RLUSD|${ISSUER}`,
+      `${hex}.${ISSUER}`,
+      `${hex.toLowerCase()}+${ISSUER}`,
+    ]) {
+      expect([raw, tokenFileStemOfPath(raw)]).toEqual([raw, `RLUSD ${ISSUER}`]);
+    }
+    expect(tokenFileStemOfPath(`usd.${ISSUER}`)).toBe(`USD ${ISSUER}`);
+    expect(tokenFileStemOfPath(`${USD_STANDARD}.${ISSUER}`)).toBe(`USD ${ISSUER}`);
+    // a text code that holds a separator: the last one splits
+    expect(tokenFileStemOfPath(`A.B C.${ISSUER}`)).toBe(`A.B C ${ISSUER}`);
+  });
+
+  it('is the 40 hex digits of a currency with no code', () => {
+    const noText = `FF${'00'.repeat(18)}01`;
+    expect(tokenFileStemOfPath(`${noText.toLowerCase()}.${ISSUER}`)).toBe(`${noText} ${ISSUER}`);
   });
 });

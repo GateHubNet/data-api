@@ -1,5 +1,6 @@
 import {
   ClickHouseService,
+  isLpCurrency,
   liveGenerationOf,
   NetworkProfile,
   readTokenGenerations,
@@ -11,6 +12,7 @@ import { CacheService } from '../common/cache.service';
 import { Coverage, FeatureCoverageService } from '../common/feature-coverage.service';
 import { NETWORK_PROFILE } from '../config/api.config';
 import type { CsvRow } from '../nft/nft-objects';
+import { HolderKey, TokenHoldersService } from './token-holders.service';
 import {
   decodeTokenListMarker,
   encodeTokenListMarker,
@@ -18,15 +20,19 @@ import {
   TokenListQuery,
   TokenListService,
 } from './token-list';
-import { tokenMarketFacts, TokenMarkets } from './token-markets';
+import { tokenMarketFacts, TokenMarkets, tokenMarkets } from './token-markets';
 import {
+  HolderRow,
   IssuedTokenRow,
   issuedTokenRow,
   IssuedTotals,
   issuedTotals,
   StoredToken,
   toIssuedTokenCsvRow,
+  TokenObject,
+  tokenObject,
 } from './token-objects';
+import type { TokenRef } from './token-param';
 
 /** How long the live generation is kept (spec 5): one read of `token_generations` serves the requests of five seconds. */
 export const TOKENS_GENERATION_CACHE_MS = 5_000;
@@ -46,7 +52,7 @@ export interface LiveTokens {
   holdersLedger: number;
 }
 
-/** The columns of a token the list serves (and the detail, Task 11, is made from). */
+/** The columns of a token the list serves (and the detail is made from). */
 const TOKEN_COLUMNS =
   'issuer, currency, code, holders, trust_lines, supply, last_ledger, issuer_ledger, issuer_flags, transfer_rate, domain, listed, name, toml';
 
@@ -100,10 +106,30 @@ interface CountsRead {
   n_below?: number | string;
 }
 
+/** The answer of the detail of a token (spec 5.2): the generation it is from, and the token. */
+export interface TokenDetail {
+  coverage: Coverage;
+  ledgerIndex: number;
+  /** Unix seconds: the close time of `ledgerIndex`. */
+  closeTime: number;
+  token: TokenObject;
+}
+
+/** The answer of the holders of a token (spec 5.3): the generation it is from, the token's supply and a page of its holders. */
+export interface TokenHolders {
+  coverage: Coverage;
+  ledgerIndex: number;
+  closeTime: number;
+  supply: string;
+  rows: HolderRow[];
+  /** The marker of the next page; none on the last. */
+  marker?: string;
+}
+
 /**
- * The issued tokens (spec 5.1 and 6): the live generation, the list of its tokens ranked by holders, and the coverage of the
- * feature. Every read of `tokens` names the generation (`generation = {g}`), so one partition is read, and keeps the newest row of
- * each token. The price and volume of the page come from `TokenMarkets`. The detail and the holders are Task 11's.
+ * The issued tokens (spec 5 and 6): the live generation, the list of its tokens ranked by holders, one token and its holders, and
+ * the coverage of the feature. Every read of `tokens` names the generation (`generation = {g}`), so one partition is read, and keeps
+ * the newest row of each token. The price, volume and markets come from `TokenMarkets`; a page of holders from `TokenHoldersService`.
  */
 @Injectable()
 export class TokensService implements TokenListService<IssuedTokenRow, IssuedTotals> {
@@ -114,6 +140,7 @@ export class TokensService implements TokenListService<IssuedTokenRow, IssuedTot
     private readonly cache: CacheService,
     private readonly features: FeatureCoverageService,
     private readonly markets: TokenMarkets,
+    private readonly holderPages: TokenHoldersService,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
   ) {}
 
@@ -155,6 +182,70 @@ export class TokensService implements TokenListService<IssuedTokenRow, IssuedTot
       holders: generation.holders,
       holdersLedger: generation.holders_ledger,
     };
+  }
+
+  /**
+   * One token (spec 5.2): its newest row in the live generation, with its price, volume and markets, or `undefined` for a token
+   * that is not there: no live generation, an LP token (which counts for nothing, so no read is made for it), no row, or a deleted
+   * one. The coverage and the markets are read once the token is known.
+   */
+  async token(ref: TokenRef): Promise<TokenDetail | undefined> {
+    const found = await this.stored(ref);
+    if (found === undefined) return undefined;
+    const [coverage, snapshot] = await Promise.all([this.coverage(), this.markets.snapshot()]);
+    return {
+      coverage,
+      ledgerIndex: found.live.ledgerIndex,
+      closeTime: found.live.closeTime,
+      token: tokenObject(
+        found.token,
+        tokenMarketFacts(snapshot, ref, this.profile.nativeCurrency),
+        tokenMarkets(snapshot, ref),
+        this.profile,
+      ),
+    };
+  }
+
+  /**
+   * A page of the holders of a token (spec 5.3), `undefined` for a token that is not there (as `token`). `after` is the key of the
+   * marker, which the caller has decoded (a bad one is a 400 before any read).
+   */
+  async holders(ref: TokenRef, o: { limit: number; after?: HolderKey }): Promise<TokenHolders | undefined> {
+    const found = await this.stored(ref);
+    if (found === undefined) return undefined;
+    const supply = found.token.supply;
+    const [coverage, page] = await Promise.all([
+      this.coverage(),
+      this.holderPages.page(found.live, ref, { supply, ...o }),
+    ]);
+    return {
+      coverage,
+      ledgerIndex: found.live.ledgerIndex,
+      closeTime: found.live.closeTime,
+      supply,
+      rows: page.rows,
+      ...(page.marker !== undefined && { marker: page.marker }),
+    };
+  }
+
+  /**
+   * The live generation and the newest row of a token in it: the point read `generation = {g} AND issuer = {issuer} AND currency =
+   * {currency} ORDER BY version DESC LIMIT 1`, a few granules of one partition. `undefined` when there is no live generation, for an
+   * LP token (no read at all), and when the token has no row or its newest is deleted.
+   */
+  private async stored(ref: TokenRef): Promise<{ live: LiveTokens; token: StoredToken } | undefined> {
+    if (isLpCurrency(ref.currency)) return undefined;
+    const live = await this.live();
+    if (live === undefined) return undefined;
+    const [row] = await this.ch.query<StoredToken & { deleted: number }>(
+      `SELECT ${TOKEN_COLUMNS}, deleted
+         FROM ${Table.Tokens}
+        WHERE generation = {g:UInt32} AND issuer = {issuer:String} AND currency = {currency:String}
+        ORDER BY version DESC
+        LIMIT 1`,
+      { g: live.generation, issuer: ref.issuer, currency: ref.currency },
+    );
+    return row === undefined || row.deleted === 1 ? undefined : { live, token: row };
   }
 
   /**

@@ -32,6 +32,18 @@ import { ledgerRow } from './validators-seed';
  *
  * **The ledgers**: the first ledger of the network (its profile's, parser `STATE_PARSER_VERSION`: the state coverage is whole
  * from there) and the ledger `THROUGH`, whose close time the answers name.
+ *
+ * **`passOver`** (the world of the routes of one token, `seedTokensWorld(h, { passOver: true })`) adds what the reads of ONE token
+ * must pass over, so that the bounds of their `read_rows` can fail:
+ *  - in `tokens`, a bulk of other tokens in the live partition (`LIVE_TOKENS_BULK`, half of them the issuer A's other currencies),
+ *    beside the bulk of the retired generation, and the token `TIE`;
+ *  - in `token_lines`, a bulk of other tokens' lines in the live partition (`LIVE_LINES_BULK`: half of them the issuer A's other
+ *    currencies, a quarter other issuers' `USD`) and of the retired generation's (`RETIRED_BULK_PARTS` parts of
+ *    `RETIRED_BULK_PER_PART`), and the lines of `USD` of the issuer A in the retired and the building generations;
+ *  - the versions a line goes through: an older version of a holder of `USD` with another balance, two holders of it that are
+ *    tombstones (their older version had a balance), three holders of `NPUSD` whose newest version (3000, in a part of the other
+ *    versions) is frozen and/or authorized and has another limit, and the lines of `TIE`, whose balances are equal or the same double.
+ *    None changes the holders, the supply or the lines that count of a token of `LIVE_TOKENS`.
  */
 
 export const RETIRED = 6;
@@ -55,12 +67,18 @@ export const ISSUER_D = accountAt(0x4001);
 export const NPUSD_HEX = '4E50555344000000000000000000000000000000';
 export const DEMURRAGE_HEX = '0158415500000000C1F76FF6ECB0BAC600000000';
 
-/** `AccountRoot` flags the issuers of the world have (the detail reads them, Task 11). */
+/**
+ * `AccountRoot` flags the issuers of the world have (the detail reads them). The clawback bit is not the same on the two networks:
+ * `0x80000000` is `AllowTrustLineClawback` on the XRP Ledger and `DisallowIncomingRemit` on Xahau, whose clawback flag is `0x1000`
+ * (and 0x1000 names nothing on the XRP Ledger).
+ */
 export const FLAGS = {
   defaultRipple: 0x00800000,
   requireAuth: 0x00040000,
   noFreeze: 0x00200000,
   globalFreeze: 0x00400000,
+  clawbackXrpl: 0x80000000,
+  clawbackXahau: 0x00001000,
 } as const;
 
 /** A token of the live generation as the world declares it. */
@@ -79,6 +97,8 @@ export interface SeedToken {
   listed?: boolean;
   /** The name the toml gives the token. */
   name?: string;
+  /** What the token's `toml` column holds, when it is not just `{ code, issuer, name }` (only the fields of `TOKEN_TOML_KEYS` are served). */
+  toml?: Record<string, unknown>;
   issuerFlags: number;
   transferRate: number;
   /** 0: the issuer has no row in the state tables, its settings are not known. */
@@ -89,15 +109,17 @@ const token = (
   t: Partial<SeedToken> & Pick<SeedToken, 'key' | 'issuer' | 'currency' | 'holders' | 'trustLines'>,
 ): SeedToken => ({
   code: t.currency.length === 3 ? t.currency : '',
-  issuerFlags: FLAGS.defaultRipple,
+  // `>>> 0`: a bit-or with 0x80000000 is a negative number, and `issuer_flags` is a UInt32
+  issuerFlags: (FLAGS.defaultRipple | FLAGS.clawbackXrpl) >>> 0,
   transferRate: 0,
   issuerLedger: THROUGH - 100,
   ...t,
 });
 
 /**
- * The tokens of the live generation. The issuers' settings: A has DefaultRipple; B requires auth, has no freeze and charges 0.2
- * percent; C has frozen all its lines; D has no row in the state tables.
+ * The tokens of the live generation. The issuers' settings: A has DefaultRipple and the XRPL's clawback bit (so it allows clawback on
+ * the XRP Ledger, and on Xahau it disallows incoming remits); B requires auth, has no freeze and charges 0.2 percent; C has frozen
+ * all its lines and has the Xahau clawback bit; D has no row in the state tables.
  */
 export const LIVE_TOKENS: SeedToken[] = [
   token({
@@ -134,6 +156,16 @@ export const LIVE_TOKENS: SeedToken[] = [
     domain: 'northpeak.example',
     listed: true,
     name: 'Northpeak Dollar',
+    // the fields the toml gives it, and two that are not served
+    toml: {
+      name: 'Northpeak Dollar',
+      desc: 'A US dollar stablecoin',
+      display_decimals: 2,
+      asset_class: 'Fiat-backed stablecoin',
+      attestation: 'https://northpeak.example/attestations/2026-09.pdf',
+      code: 'NPUSD',
+      priority: 1,
+    },
     issuerFlags: FLAGS.requireAuth | FLAGS.noFreeze,
     transferRate: 1_002_000_000,
   }),
@@ -143,7 +175,7 @@ export const LIVE_TOKENS: SeedToken[] = [
     currency: DEMURRAGE_HEX,
     holders: 25,
     trustLines: 30,
-    issuerFlags: FLAGS.globalFreeze,
+    issuerFlags: FLAGS.globalFreeze | FLAGS.clawbackXahau,
   }),
   token({
     key: 'xyz',
@@ -151,7 +183,7 @@ export const LIVE_TOKENS: SeedToken[] = [
     currency: 'XYZ',
     holders: 15,
     trustLines: 15,
-    issuerFlags: FLAGS.globalFreeze,
+    issuerFlags: FLAGS.globalFreeze | FLAGS.clawbackXahau,
   }),
   token({ key: 'btc', issuer: ISSUER_A, currency: 'BTC', holders: 12, trustLines: 14 }),
   token({ key: 'jpy', issuer: ISSUER_A, currency: 'JPY', holders: 10, trustLines: 10 }),
@@ -199,6 +231,9 @@ export const supplyOf = (holders: number): string =>
 /** The holder account of the `i`-th line (1-based) of the `n`-th token. */
 export const holderAt = (n: number, i: number): string => accountAt(0x100000 + n * 1000 + i);
 
+/** The holder account of the `i`-th line (1-based) of a token of `LIVE_TOKENS`. */
+export const holderOf = (t: SeedToken, i: number): string => holderAt(LIVE_TOKENS.indexOf(t), i);
+
 const OLD_VERSION = 1_000;
 const NEW_VERSION = 2_000;
 
@@ -242,7 +277,7 @@ export function liveRow(t: SeedToken): TokensRow {
     domain: t.domain ?? '',
     listed: t.listed ? 1 : 0,
     name: t.name ?? '',
-    toml: t.listed ? JSON.stringify({ code: t.code, issuer: t.issuer, name: t.name ?? '' }) : '',
+    toml: t.listed ? JSON.stringify(t.toml ?? { code: t.code, issuer: t.issuer, name: t.name ?? '' }) : '',
   });
 }
 
@@ -327,22 +362,164 @@ export const LIVE_PARTS = 2;
 export const RETIRED_BULK_PER_PART = 20_000;
 export const RETIRED_BULK_PARTS = 4;
 
+/**
+ * `INSERT INTO tokens SELECT` `n` rows (`number` counts them) of a generation: `issuer` and `currency` are SQL expressions of `number`
+ * (and of `params`), the rest are the quiet values of a token nobody lists.
+ */
+async function insertTokensBulk(
+  h: Harness,
+  generation: number,
+  n: number,
+  issuer: string,
+  currency: string,
+  params: Record<string, unknown> = {},
+): Promise<void> {
+  await h.ch.command(
+    `INSERT INTO ${Table.Tokens}
+     SELECT toUInt32({generation:UInt32}) AS generation,
+            ${issuer} AS issuer,
+            ${currency} AS currency, 'BLK' AS code,
+            toUInt32(number % 5000) AS holders, toUInt32(number % 5000 + 1) AS trust_lines,
+            '1' AS supply, toFloat64(1) AS supply_f,
+            toUInt32(1) AS last_ledger, toUInt32(1) AS issuer_ledger, toUInt32(0) AS issuer_flags, toUInt32(0) AS transfer_rate,
+            '' AS domain, toUInt8(0) AS listed, '' AS name, '' AS toml, toUInt8(0) AS deleted, toUInt64(1) AS version
+       FROM numbers({n:UInt32})`,
+    { generation, n, ...params },
+  );
+}
+
 /** The bulk of the retired generation: `perPart` tokens of no one's in each of four parts. A reader that reads past its generation reads them. */
 async function seedRetiredBulk(h: Harness, perPart: number): Promise<void> {
   for (let part = 0; part < RETIRED_BULK_PARTS; part++) {
-    await h.ch.command(
-      `INSERT INTO ${Table.Tokens}
-       SELECT toUInt32({generation:UInt32}) AS generation,
-              concat('rBulkIssuer', toString({part:UInt32} * 1000000 + number)) AS issuer,
-              'BLK' AS currency, 'BLK' AS code,
-              toUInt32(number % 5000) AS holders, toUInt32(number % 5000 + 1) AS trust_lines,
-              '1' AS supply, toFloat64(1) AS supply_f,
-              toUInt32(1) AS last_ledger, toUInt32(1) AS issuer_ledger, toUInt32(0) AS issuer_flags, toUInt32(0) AS transfer_rate,
-              '' AS domain, toUInt8(0) AS listed, '' AS name, '' AS toml, toUInt8(0) AS deleted, toUInt64(1) AS version
-         FROM numbers({n:UInt32})`,
-      { generation: RETIRED, part, n: perPart },
+    await insertTokensBulk(
+      h,
+      RETIRED,
+      perPart,
+      `concat('rBulkIssuer', toString({part:UInt32} * 1000000 + number))`,
+      `'BLK'`,
+      { part },
     );
   }
+}
+
+// -- what the reads of one token pass over (`passOver`) ---------------------------------------------------------------
+
+/** Rows of other tokens in the live partition of `tokens` (one part, half of them the issuer A's) and of `token_lines` (one part). */
+export const LIVE_TOKENS_BULK = 120_000;
+export const LIVE_LINES_BULK = 160_000;
+/** The parts of the live partitions with `passOver`: the other versions, the newest rows, and the bulk. */
+export const PASS_OVER_PARTS = 3;
+
+/** The version of a line's newest state when it changes after `NEW_VERSION`. */
+const NEWER_VERSION = 3_000;
+
+/** A token of the live generation whose holders have equal balances, and balances that are one double (see `TIE_BALANCES`). */
+export const TIE = { issuer: ISSUER_C, currency: 'TIE' } as const;
+/** The holder account of the `i`-th line (1-based) of TIE. */
+export const tieHolder = (i: number): string => holderAt(90, i);
+/**
+ * The lines of TIE, by the number of the holder: three equal balances, two equal ones, two balances of different texts and the same
+ * double (`9007199254740993` is not a double: it reads as `9007199254740992`), a tiny one, and a line with no balance.
+ */
+export const TIE_BALANCES: readonly (readonly [number, string])[] = [
+  [1, '100'],
+  [2, '100'],
+  [3, '100'],
+  [4, '50'],
+  [5, '50'],
+  [6, '9007199254740993'],
+  [7, '9007199254740992'],
+  [8, '0.000001'],
+  [9, '0'],
+];
+export const TIE_HOLDERS = 8;
+export const TIE_SUPPLY = TIE_BALANCES.reduce((sum, [, balance]) => sum.plus(balance), new BigNumber(0)).toFixed();
+
+const tokenByKey = (key: string): SeedToken => LIVE_TOKENS.find((t) => t.key === key) as SeedToken;
+
+/** The row of `tokens` of TIE (live generation). */
+const tieRow = (): TokensRow =>
+  tokensRow({
+    generation: LIVE,
+    issuer: TIE.issuer,
+    currency: TIE.currency,
+    holders: TIE_HOLDERS,
+    trust_lines: TIE_BALANCES.length,
+    supply: TIE_SUPPLY,
+    supply_f: Number(TIE_SUPPLY),
+  });
+
+/**
+ * The lines of the live generation that are other versions, in a part of their own: the older ones of a line that has a newer one in
+ * the next part, and the newest of three lines of NPUSD (the base lines of them are older).
+ */
+function otherVersionsOfLines(): TokenLinesRow[] {
+  const usd = tokenByKey('usd');
+  const npusd = tokenByKey('npusd');
+  return [
+    // USD's first holder had a balance of 9999.5 once (the newest, 1.5, is in the next part); two more held 700 and 300 (below)
+    lineRow(usd, holderOf(usd, 1), '9999.5', { version: OLD_VERSION }),
+    lineRow(usd, holderOf(usd, 152), '700', { version: OLD_VERSION }),
+    lineRow(usd, holderOf(usd, 153), '300', { version: OLD_VERSION }),
+    // TIE's first holder had 5
+    lineRow(TIE, tieHolder(1), '5', { version: OLD_VERSION }),
+    // NPUSD's three largest holders: the newest version of the first is authorized with a limit of 1e9, of the second authorized and
+    // frozen, of the third frozen with no limit; their versions in the next part have neither flag
+    lineRow(npusd, holderOf(npusd, 40), balanceOf(40), {
+      version: NEWER_VERSION,
+      authorized: 1,
+      limit: '1000000000',
+    }),
+    lineRow(npusd, holderOf(npusd, 39), balanceOf(39), { version: NEWER_VERSION, authorized: 1, frozen: 1 }),
+    lineRow(npusd, holderOf(npusd, 38), balanceOf(38), { version: NEWER_VERSION, frozen: 1, limit: '0' }),
+  ];
+}
+
+/** The newest lines `passOver` adds to the base lines: the tombstones of the two holders of USD that were, and TIE's lines. */
+function newestLinesOfPassOver(): TokenLinesRow[] {
+  const usd = tokenByKey('usd');
+  return [
+    // a line that no longer counts keeps its last balance (a reader that did not drop `deleted` would show it)...
+    lineRow(usd, holderOf(usd, 152), '700', { deleted: 1 }),
+    // ...or has emptied
+    lineRow(usd, holderOf(usd, 153), '0', { deleted: 1, limit: '0' }),
+    ...TIE_BALANCES.map(([i, balance]) => lineRow(TIE, tieHolder(i), balance)),
+  ];
+}
+
+/** The lines of USD of the issuer A in the other generations: a reader that does not name its generation lists their holders. */
+function linesOfOtherGenerations(): TokenLinesRow[] {
+  const usd = tokenByKey('usd');
+  return [
+    lineRow(usd, holderOf(usd, 900), '999999', { generation: RETIRED }),
+    lineRow(usd, holderOf(usd, 901), '888888', { generation: BUILDING }),
+  ];
+}
+
+/** `n` lines of a generation that are no token of the world's: half of them of the issuer A's `BLK`, a quarter `USD` of other issuers. */
+async function insertLinesBulk(h: Harness, generation: number, n: number): Promise<void> {
+  await h.ch.command(
+    `INSERT INTO ${Table.TokenLines} (generation, issuer, currency, holder, balance, balance_f, \`limit\`, frozen, authorized, ledger_index, deleted, version)
+     SELECT toUInt32({generation:UInt32}),
+            if(number % 4 < 2, {issuer:String}, concat('rBulkIssuer', toString(number % 997))),
+            if(number % 4 = 2, 'USD', 'BLK'),
+            concat('rBulkHolder', toString(number)),
+            '1', toFloat64(1), '1000000', toUInt8(0), toUInt8(0), toUInt32(1), toUInt8(0), toUInt64(1)
+       FROM numbers({n:UInt32})`,
+    { generation, issuer: ISSUER_A, n },
+  );
+}
+
+/** Rows of other tokens in the live partition of `tokens`: half of them the issuer A's other currencies. */
+async function insertLiveTokensBulk(h: Harness, n: number): Promise<void> {
+  await insertTokensBulk(
+    h,
+    LIVE,
+    n,
+    `if(number % 2 = 0, {issuer:String}, concat('rBulkIssuer', toString(number % 997)))`,
+    `concat('B', toString(number))`,
+    { issuer: ISSUER_A },
+  );
 }
 
 export interface TokensWorldOptions {
@@ -354,6 +531,8 @@ export interface TokensWorldOptions {
   bulk?: boolean;
   /** Write the lines of the live tokens. Default: yes. */
   lines?: boolean;
+  /** Write what the reads of one token pass over (see the header): TIE, other versions and generations, and the live bulks. Default: no. */
+  passOver?: boolean;
 }
 
 /**
@@ -384,6 +563,7 @@ export async function seedTokensWorld(h: Harness, options: TokensWorldOptions = 
     [
       ...LIVE_TOKENS.map(liveRow),
       tokensRow({ generation: LIVE, issuer: DEAD.issuer, currency: DEAD.currency, holders: 500, deleted: 1 }),
+      ...(options.passOver === true ? [tieRow()] : []),
     ],
     // the other generations: the same USD with other numbers, a token of each only, and the retired one's bulk (below)
     [
@@ -399,7 +579,21 @@ export async function seedTokensWorld(h: Harness, options: TokensWorldOptions = 
   );
   if (options.bulk !== false) await seedRetiredBulk(h, RETIRED_BULK_PER_PART);
 
-  if (options.lines !== false) await h.ch.insert(Table.TokenLines, LIVE_TOKENS.flatMap(linesOf));
+  const passOver = options.passOver === true;
+  if (passOver) await insertLiveTokensBulk(h, LIVE_TOKENS_BULK);
+
+  if (passOver) await h.ch.insert(Table.TokenLines, otherVersionsOfLines());
+  if (options.lines !== false || passOver) {
+    await h.ch.insert(Table.TokenLines, [
+      ...(options.lines !== false ? LIVE_TOKENS.flatMap(linesOf) : []),
+      ...(passOver ? newestLinesOfPassOver() : []),
+    ]);
+  }
+  if (passOver) {
+    await h.ch.insert(Table.TokenLines, linesOfOtherGenerations());
+    await insertLinesBulk(h, LIVE, LIVE_LINES_BULK);
+    for (let part = 0; part < RETIRED_BULK_PARTS; part++) await insertLinesBulk(h, RETIRED, RETIRED_BULK_PER_PART);
+  }
 
   if (options.markets !== false) {
     await seedMarketsWorld(h, MARKETS_NOW, { periods: ['day', '30day'], native: profile.nativeCurrency });

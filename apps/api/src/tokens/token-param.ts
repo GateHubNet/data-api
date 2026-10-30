@@ -25,9 +25,7 @@ export interface TokenRef {
  * like any other); `invalid issuer address` (a classic address is required, an X-address is not one).
  */
 export function parseTokenParam(raw: string, native: 'XRP' | 'XAH'): TokenRef {
-  const at = Math.max(raw.lastIndexOf('.'), raw.lastIndexOf('+'), raw.lastIndexOf('|'));
-  const code = at < 0 ? raw : raw.slice(0, at);
-  const issuer = at < 0 ? '' : raw.slice(at + 1);
+  const { code, issuer } = splitTokenParam(raw);
 
   const currency = ledgerCurrencyOf(code);
   if (currency === undefined) throw badRequest('invalid currency');
@@ -36,7 +34,23 @@ export function parseTokenParam(raw: string, native: 'XRP' | 'XAH'): TokenRef {
   return { currency, issuer };
 }
 
+/** The segment split at its last `.`, `+` or `|`: the code before it and the issuer after it (`''` when there is no separator). */
+function splitTokenParam(raw: string): { code: string; issuer: string } {
+  const at = Math.max(raw.lastIndexOf('.'), raw.lastIndexOf('+'), raw.lastIndexOf('|'));
+  return { code: at < 0 ? raw : raw.slice(0, at), issuer: at < 0 ? '' : raw.slice(at + 1) };
+}
+
 /** `<code or currency> <issuer>`, the stem of the names of the CSV files: the code when the currency has one, else its hex. */
 export function tokenFileStem(t: TokenRef): string {
   return `${currencyCode(t.currency) ?? t.currency} ${t.issuer}`;
+}
+
+/**
+ * The stem of the CSV file of a path segment that `parseTokenParam` has accepted (a CSV is named once the route has answered, and
+ * the network's native code, which is all `parseTokenParam` needs the profile for, cannot be in an accepted path): the same stem
+ * for every spelling of a token, `NPUSD`, its 40 hex digits in either case, `+` or `|` for `.`.
+ */
+export function tokenFileStemOfPath(raw: string): string {
+  const { code, issuer } = splitTokenParam(raw);
+  return tokenFileStem({ currency: ledgerCurrencyOf(code) ?? code, issuer });
 }
