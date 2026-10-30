@@ -98,7 +98,7 @@ interface Seen {
   head: number;
 }
 
-/** The step of the first rebuild check in the streaks (it belongs to no generation). */
+/** The step of the rebuild check in the streaks (it belongs to no generation). */
 const CHECK_STEP = 'check';
 
 /** The three streams of touches, each with a window of its own (the repair reads ledgers the live touches have long passed). */
@@ -130,7 +130,7 @@ interface Streak {
  * **Liveness.** A failure never stops the other steps of a run, and a run that failed sets the gauges all the same (from a read of
  * the generations and the head, `reportAfterFailure`). The first housekeeping does only the rebuild check, never the holders (one
  * read of every line of the generation) or the sweep. A step that fails twice in a row (a window, a batch of the pass, a drop, the
- * first rebuild check) waits, `NFT_RETRY_MS` and twice as long for each failure after that, up to `NFT_MAX_RETRY_MS`; the touches
+ * rebuild check) waits, `NFT_RETRY_MS` and twice as long for each failure after that, up to `NFT_MAX_RETRY_MS`; the touches
  * of the other generation and the pass go on. A step that keeps failing cannot stall the hook of `agg_dirty` either: the hook
  * depends only on the reads that open a run (`beginFailed`), not on how the steps of the run ended. The window a
  * heavy ledger halved is kept, so that the next window does not read the lines of a full one to halve it again. The repair takes at
@@ -154,7 +154,7 @@ export class TokensJobRunner {
     repair: TOKENS_TOUCH_WINDOW,
     building: TOKENS_TOUCH_WINDOW,
   };
-  /** The steps that failed (`<generation>:<step>`). */
+  /** The steps that failed, by `<generation>:<step>` (`-` when the step belongs to no generation: the rebuild check). */
   private readonly streaks = new Map<string, Streak>();
   /** The generations a rebuild is wanted for: they met a ledger of an older parser, in their touches or in their repair. */
   private readonly stale = new Set<number>();
@@ -182,7 +182,7 @@ export class TokensJobRunner {
    * run the housekeeping, the generation that builds, and the drop, each while the budget lasts. A step that fails is the failure
    * of the job (the first is thrown, the others are logged and counted here) and the parts after it still run; the next run starts
    * over from the rows. The housekeeping runs at the 1st, 11th, 21st … run, and at the next run when it could not run at the 1st
-   * (no budget, a failed read); the rebuild check of the first housekeeping is all it does.
+   * (no budget, no ledger, a failed read); the rebuild check of the first housekeeping is all it does.
    */
   async run(tick: AggregatorTick): Promise<void> {
     if (this.ctx.closing()) return;
@@ -208,15 +208,15 @@ export class TokensJobRunner {
       await part(() => this.liveTouches(tick, sight));
       await part(() => this.repair(tick, sight));
       const first = !this.checked;
-      // the first check is made at every run until it works, unless it keeps failing: then it waits like any step
-      if (
-        (first && !this.waiting(undefined, CHECK_STEP)) ||
-        (!first && (n - 1) % TOKENS_HOUSEKEEPING_EVERY_TICKS === 0)
-      ) {
-        await part(async () => {
-          const made = await this.guarded(undefined, CHECK_STEP, () => this.rebuildCheck(tick, sight));
-          this.checked = made || this.checked;
-        });
+      // the first check is made at every run until it works, a later one at every housekeeping; either waits when it keeps failing
+      if (first || (n - 1) % TOKENS_HOUSEKEEPING_EVERY_TICKS === 0) {
+        // a run with no budget or no ledger does not make the check, so it is neither a success nor a failure of it: the streak stays
+        if (this.go(tick) && sight.head > 0 && !this.waiting(undefined, CHECK_STEP)) {
+          await part(async () => {
+            const made = await this.guarded(undefined, CHECK_STEP, () => this.rebuildCheck(tick, sight));
+            this.checked = made || this.checked;
+          });
+        }
         if (!first) {
           await part(() => this.holders(tick, sight));
           await part(() => this.tomlSweep(tick, sight));
@@ -354,9 +354,9 @@ export class TokensJobRunner {
   }
 
   /**
-   * Runs a step of a generation (or of the job: no generation). One that fails is tried again at the next run; one that fails twice in a row waits `NFT_RETRY_MS`,
-   * and twice as long after each further failure, up to `NFT_MAX_RETRY_MS` (the rule of the NFTs that fail on their own); one that
-   * works forgets it. Neither the shutdown nor an abort is a failure of the step.
+   * Runs a step of a generation (or of the job: no generation). One that fails is tried again at the next run; one that fails twice
+   * in a row waits `NFT_RETRY_MS`, and twice as long after each further failure, up to `NFT_MAX_RETRY_MS` (the rule of the NFTs that
+   * fail on their own); one that works forgets it. Neither the shutdown nor an abort is a failure of the step.
    */
   private async guarded<T>(generation: number | undefined, step: string, work: () => Promise<T>): Promise<T> {
     const key = `${generation ?? '-'}:${step}`;
@@ -474,6 +474,7 @@ export class TokensJobRunner {
     role: 'live' | 'building',
   ): Promise<boolean> {
     return this.guarded(g.generation, role, async () => {
+      const began = this.ctx.clock();
       const from = g.through_ledger;
       const window = await this.nextWindow(role, from, seen.head);
       if (window.to <= from || this.ctx.closing()) return false;
@@ -487,7 +488,7 @@ export class TokensJobRunner {
       await this.change(tick, seen, g, { through_ledger: window.to });
       this.ctx.logger.debug(
         `tokens: generation ${g.generation} (${role}): ledgers ${from + 1} - ${window.to}, ` +
-          `${window.lines.length} line(s), ${window.issuers.length} issuer(s)`,
+          `${window.lines.length} line(s), ${window.issuers.length} issuer(s), ${this.ctx.clock() - began} ms`,
       );
       return true;
     });
@@ -522,6 +523,7 @@ export class TokensJobRunner {
       if (live === undefined || live.repair_from === 0 || this.stale.has(live.generation)) return;
       if (!this.go(tick) || this.ctx.clock() >= until || this.waiting(live.generation, 'repair')) return;
       const more = await this.guarded(live.generation, 'repair', async () => {
+        const began = this.ctx.clock();
         const from = live.repair_from - 1;
         const head = live.through_ledger;
         const window = await this.nextWindow('repair', from, head);
@@ -536,6 +538,10 @@ export class TokensJobRunner {
         await this.applyWindow(tick, live.generation, window, head);
         if (this.ctx.closing()) return false;
         await this.change(tick, seen, live, { repair_from: window.to >= head ? 0 : window.to + 1 });
+        this.ctx.logger.debug(
+          `tokens: generation ${live.generation} (repair): ledgers ${from + 1} - ${window.to}, ` +
+            `${window.lines.length} line(s), ${window.issuers.length} issuer(s), ${this.ctx.clock() - began} ms`,
+        );
         return true;
       });
       if (!more) return;
@@ -550,11 +556,10 @@ export class TokensJobRunner {
    * The rebuild check (spec 3.3): a generation is started when there is no live one and none builds, or the live one is stale. A
    * generation is stale when its `config_version` is not the job's, when the state coverage start is not its `coverage_from`, or
    * when its touches or its repair met a ledger of an older parser. A building generation that is stale for the same reasons is
-   * retired first. Nothing is started without a ledger. True when the check was made (not when there is no budget for it, or no
-   * ledger yet: the next run tries again, so that the first generation starts at the first run that has a ledger).
+   * retired first. The caller makes the check only with budget left and a ledger (the next run tries again otherwise, so that the
+   * first generation starts at the first run that has a ledger). True when the check was made: false when the shutdown began first.
    */
   private async rebuildCheck(tick: AggregatorTick, seen: Seen): Promise<boolean> {
-    if (!this.go(tick) || seen.head === 0) return false;
     const coverage = await this.fns.stateCoverageStart(this.ctx.ch);
     if (this.ctx.closing()) return false;
     if (coverage === undefined) return true;

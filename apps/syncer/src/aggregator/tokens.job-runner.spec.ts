@@ -404,6 +404,19 @@ describe('TokensJobRunner', () => {
       expect(world.g(1).through_ledger).toBe(1500);
     });
 
+    it('logs a debug line for each window of the live touches and of the repair, with how long it took', async () => {
+      world.seed(gen(1, 'live', { through_ledger: 1000, repair_from: 900 }));
+      world.head = 1050;
+      world.issuersOfWindow = [ISSUER];
+      world.costs.set('apply', 250);
+      await run(make());
+      const lines = logger.debug.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith('tokens:'));
+      expect(lines).toEqual([
+        'tokens: generation 1 (live): ledgers 1001 - 1050, 50 line(s), 1 issuer(s), 250 ms',
+        'tokens: generation 1 (repair): ledgers 900 - 1050, 151 line(s), 1 issuer(s), 250 ms',
+      ]);
+    });
+
     it('does nothing at the head', async () => {
       world.seed(gen(1, 'live', { through_ledger: 1500 }));
       await run(make());
@@ -1307,6 +1320,63 @@ describe('TokensJobRunner', () => {
       await run(r);
       expect(tries()).toBe(4);
       expect(world.events.filter((e) => e.startsWith('holders') || e.startsWith('sweep'))).toEqual([]);
+    });
+
+    it('a first rebuild check that fails backs off across runs that have no budget or no ledger in between: they do not clear its streak', async () => {
+      world.seed(gen(1, 'live', { through_ledger: 1500 }));
+      const boom = new Error('Code: 241. Memory limit exceeded');
+      world.fail('coverage', boom, boom, boom);
+      const r = make();
+      const tries = (): number => world.events.filter((e) => e === 'coverage').length;
+      /** A run of a catch-up whose steps have used the budget of the tick. */
+      const noBudget = (): Promise<void> => r.run({ now: new Date(), deadline: Date.now() - 1, signal: abort.signal });
+
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded'); // the first failure
+      await noBudget(); // the check is not made, so it has not worked either
+      world.head = 0;
+      await run(r); // no ledger: the same
+      world.head = 1500;
+      await noBudget();
+      expect(tries()).toBe(1);
+
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded'); // the second in a row: now it waits
+      expect(tries()).toBe(2);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('check failed 2 times in a row'));
+      await noBudget();
+      await expect(run(r)).resolves.toBeUndefined(); // still waiting
+      expect(tries()).toBe(2);
+
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS);
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded');
+      expect(tries()).toBe(3);
+    });
+
+    it('the check of a later housekeeping waits after two failures in a row, as its log says, while the holders and the sweep go on', async () => {
+      world.seed(gen(1, 'live', { through_ledger: 1500 }));
+      const boom = new Error('Code: 241. Memory limit exceeded');
+      const r = make();
+      const tries = (): number => world.events.filter((e) => e === 'coverage').length;
+      const holders = (): number => world.events.filter((e) => e === 'holders g1').length;
+      await run(r); // the first check works
+      world.fail('coverage', boom, boom, boom);
+      await runs(r, TOKENS_HOUSEKEEPING_EVERY_TICKS - 1); // runs 2 to 10: no housekeeping
+      expect(tries()).toBe(1);
+
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded'); // the 11th: the first failure of a later check
+      await runs(r, TOKENS_HOUSEKEEPING_EVERY_TICKS - 1);
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded'); // the 21st: the second in a row
+      expect(tries()).toBe(3);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/check failed 2 times in a row .*it waits 5 min/));
+
+      await runs(r, TOKENS_HOUSEKEEPING_EVERY_TICKS - 1);
+      await expect(run(r)).resolves.toBeUndefined(); // the 31st: the housekeeping is due, the check waits and the rest goes on
+      expect(tries()).toBe(3);
+      expect(holders()).toBe(3);
+
+      jest.setSystemTime(Date.now() + NFT_RETRY_MS);
+      await runs(r, TOKENS_HOUSEKEEPING_EVERY_TICKS - 1);
+      await expect(run(r)).rejects.toThrow('Memory limit exceeded'); // the 41st: after the wait, it is made again
+      expect(tries()).toBe(4);
     });
 
     it('a mark of the hook on the generation that builds survives its promotion and is then worked off', async () => {
