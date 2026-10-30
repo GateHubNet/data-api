@@ -9,6 +9,7 @@ import { DailyRates } from '../query/daily-rates';
 import { exactAmount, exactSum, floatSum, ratio, sumOf } from '../query/decimal';
 import { nftSalesNativeSql } from '../query/nft-prices';
 import { LedgerRange, RatesService } from '../query/rates.service';
+import { HEX_CURRENCY_CODE, STANDARD_CURRENCY_CODE } from '../util/currency-code';
 // amm-daily.job imports this module too: neither may use the other's exports at load time, only inside functions
 import { ammWindowSwapTotals, SwapTotals } from './amm-daily.job';
 import { AmmPoolVolume, ammPoolVolumes } from './amm-reads';
@@ -117,15 +118,12 @@ function invalid(where: string, why: string): never {
   throw new Error(`Invalid markets config: ${where}: ${why}`);
 }
 
-/** A currency code as the ledger takes it: three characters of the standard set, or 40 hex digits. */
-const STANDARD_CODE = /^[A-Za-z0-9?!@#$%^&*<>(){}[\]|]{3}$/;
-const HEX_CODE = /^[0-9A-Fa-f]{40}$/;
-
+/** A currency code as the ledger takes it: three characters of the standard set, or 40 hex digits (`util/currency-code.ts`). */
 function checkAsset(where: string, a: unknown, nativeCurrency: string): void {
   if (typeof a !== 'object' || a === null) return invalid(where, 'must be an object with a currency (and an issuer)');
   const { currency, issuer } = a as MarketAsset;
   if (typeof currency !== 'string' || currency === '') return invalid(where, 'needs a currency');
-  if (currency !== nativeCurrency && !STANDARD_CODE.test(currency) && !HEX_CODE.test(currency)) {
+  if (currency !== nativeCurrency && !STANDARD_CURRENCY_CODE.test(currency) && !HEX_CURRENCY_CODE.test(currency)) {
     return invalid(where, `"${currency}" is not a currency code (three characters, or 40 hexadecimal digits)`);
   }
   if (issuer !== undefined && issuer !== null && typeof issuer !== 'string')

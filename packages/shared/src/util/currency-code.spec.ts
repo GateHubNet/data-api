@@ -1,7 +1,16 @@
-import { currencyCode, isLpCurrency, ledgerCurrencyOf } from './currency-code';
+import {
+  currencyCode,
+  HEX_CURRENCY_CODE,
+  isLpCurrency,
+  ledgerCurrencyOf,
+  STANDARD_CURRENCY_CODE,
+} from './currency-code';
 
 const ZEROS = (n: number): string => '0'.repeat(n);
 const hexOf = (text: string): string => Buffer.from(text, 'latin1').toString('hex').toUpperCase().padEnd(40, '0');
+/** The standard form of a 3-character code: bytes 12 to 14 hold it, the rest is zero. */
+const standardHexOf = (code: string): string =>
+  ZEROS(24) + Buffer.from(code, 'latin1').toString('hex').toUpperCase() + ZEROS(10);
 
 describe('currencyCode', () => {
   it('gives a 3-character currency as it is', () => {
@@ -33,7 +42,7 @@ describe('currencyCode', () => {
     expect(currencyCode('4100420000000000000000000000000000000000')).toBeUndefined();
     // a byte above 0x7E
     expect(currencyCode('41FF000000000000000000000000000000000000')).toBeUndefined();
-    // the standard form with a character outside 0x21-0x7E: not a code, and not text either (it starts with zero bytes)
+    // the standard form with a space, outside the ledger's set: not a code, and not text either (it starts with zero bytes)
     expect(currencyCode('0000000000000000000000005520440000000000')).toBeUndefined();
   });
 
@@ -78,7 +87,7 @@ describe('ledgerCurrencyOf', () => {
     expect(currencyCode(ledgerCurrencyOf('A.B.C') as string)).toBe('A.B.C');
   });
 
-  it('takes a 3-character code of 0x21 to 0x7E and a text of 4 to 20 characters of 0x20 to 0x7E, nothing else', () => {
+  it("takes a 3-character code of the ledger's set and a text of 4 to 20 characters of 0x20 to 0x7E, nothing else", () => {
     expect(ledgerCurrencyOf('$&!')).toBe('$&!');
     expect(ledgerCurrencyOf('U D')).toBeUndefined();
     expect(ledgerCurrencyOf('MY T')).toBe('4D592054' + ZEROS(32));
@@ -124,5 +133,50 @@ describe('isLpCurrency', () => {
     expect(isLpCurrency('04A1F7' + ZEROS(34))).toBe(false);
     expect(isLpCurrency('03A1F7' + ZEROS(33))).toBe(false);
     expect(isLpCurrency('03A1F7' + ZEROS(35))).toBe(false);
+  });
+});
+
+describe("the 3-character set of the ledger (rippled's isoCharSet)", () => {
+  // written out apart from the pattern: the ledger prints any other 3 characters of a standard form as 40 hex digits
+  const ISO = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?!@#$%^&*<>(){}[]|';
+
+  it('is exactly the letters, the digits and ? ! @ # $ % ^ & * < > ( ) { } [ ] |', () => {
+    for (let byte = 0; byte < 0x80; byte += 1) {
+      const character = String.fromCharCode(byte);
+      expect([character, STANDARD_CURRENCY_CODE.test('A' + character + 'B')]).toEqual([
+        character,
+        ISO.includes(character),
+      ]);
+    }
+    expect(STANDARD_CURRENCY_CODE.test('AB')).toBe(false);
+    expect(STANDARD_CURRENCY_CODE.test('ABCD')).toBe(false);
+    expect(STANDARD_CURRENCY_CODE.test('A\nB')).toBe(false);
+    expect(HEX_CURRENCY_CODE.test('0'.repeat(40))).toBe(true);
+    expect(HEX_CURRENCY_CODE.test('0'.repeat(41))).toBe(false);
+  });
+
+  it.each(['-', '.', '"', "'", '+', ',', '/', ':', ';', '=', '~', '`', '_', '\\'])(
+    'a standard form with %s stays 40 hex digits, and has no code',
+    (character) => {
+      const hex = standardHexOf('A' + character + 'B');
+      expect(ledgerCurrencyOf(hex)).toBe(hex);
+      expect(ledgerCurrencyOf(hex.toLowerCase())).toBe(hex);
+      expect(currencyCode(hex)).toBeUndefined();
+    },
+  );
+
+  it('a 3-character code with a character outside the set is no currency, as a path code and as a currency', () => {
+    for (const code of ['A-B', 'A.B', 'A+B', 'A"B', "A'B", 'A B', 'A_B', '---']) {
+      expect([code, ledgerCurrencyOf(code)]).toEqual([code, undefined]);
+      expect([code, currencyCode(code)]).toEqual([code, undefined]);
+    }
+  });
+
+  it.each(['A|B', 'a|b', '<>(', '{}[', '?!@', '$%^', '&*)', '0x1'])('%s is a code and round-trips', (code) => {
+    const ledger = code.toUpperCase();
+    expect(ledgerCurrencyOf(code)).toBe(ledger);
+    expect(currencyCode(ledger)).toBe(ledger);
+    expect(ledgerCurrencyOf(standardHexOf(code))).toBe(ledger);
+    expect(currencyCode(standardHexOf(ledger))).toBe(ledger);
   });
 });
