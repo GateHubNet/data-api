@@ -6,7 +6,13 @@ import { syntheticHash } from '../../test/synthetic-hash';
 import { mptOfferHash, withMptOffers } from '../../test/synthetic-mpt-offers';
 import { EXPIRED_ACCEPT_BASE, withTecExpiredAccept } from '../../test/synthetic-tec-expired-accept';
 import { foldNftEvents } from '../aggregate/nft-state';
-import { DOMAIN_PARSER_VERSION, NFT_PARSER_VERSION, OBJECT_PARSER_VERSION, PARSER_VERSION } from '../clickhouse/rows';
+import {
+  DOMAIN_PARSER_VERSION,
+  NFT_PARSER_VERSION,
+  OBJECT_PARSER_VERSION,
+  PARSER_VERSION,
+  TOKEN_PARSER_VERSION,
+} from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { getNetworkProfile } from '../network';
 import { AmmParser } from '../parsers/amm.parser';
@@ -14,6 +20,7 @@ import { NftParser, ParsedNft, rolesOf } from '../parsers/nft.parser';
 import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, parseContextFor, toParserTx } from '../parsers/parser.interface';
 import { PaymentParser } from '../parsers/payment.parser';
+import { StateTouchesParser } from '../parsers/state-touches.parser';
 import { deepFreeze } from '../test-utils/deep-freeze';
 import { objectCase, objectFixturesDir } from '../test-utils/object-cases';
 import { buildLedgerRows, CHILD_TABLES, ChildRowsKey, LedgerParseError, LedgerRows } from './build-rows';
@@ -119,6 +126,18 @@ const OBJECTS_XAHAU: FixtureSet = {
   name: 'recorded object cases (xahau)',
   ctx: XAHAU,
   dir: objectFixturesDir('xahau'),
+  minNativeChecked: 0,
+  minTrustlinesChecked: 0,
+};
+
+/**
+ * The recorded AccountSet and Clawback cases of the token aggregate (`test/fixtures/xrpl/state-touches`, D6 Task 2): whole
+ * ledgers around each case. No `SETS` entry either.
+ */
+const STATE_TOUCHES_XRPL: FixtureSet = {
+  name: 'recorded state touch cases (xrpl)',
+  ctx: XRPL,
+  dir: join(FIXTURES, 'xrpl', 'state-touches'),
   minNativeChecked: 0,
   minTrustlinesChecked: 0,
 };
@@ -482,6 +501,7 @@ describe('buildLedgerRows mapping', () => {
         fee_max: '0',
       });
       for (const [, key] of CHILD_TABLES) expect(empty[key]).toEqual([]);
+      expect(empty.stateTouches).toEqual([]);
     });
 
     it('maps a missing parent_close_time (genesis) to 0', () => {
@@ -1380,6 +1400,7 @@ describe('AMM rows (parser version 2)', () => {
       [Table.AccountDomains, 'accountDomains'],
       [Table.ObjectChanges, 'objectChanges'],
       [Table.AccountObjectChanges, 'accountObjectChanges'],
+      [Table.StateTouches, 'stateTouches'],
     ];
 
     // The AMM cases and the recorded NFT and URIToken ledgers together: the sales are in the latter. The Domain rows are in
@@ -1392,6 +1413,7 @@ describe('AMM rows (parser version 2)', () => {
       ...builtOf(XAHAU_SET),
       ...builtOf(OBJECTS_XRPL),
       ...builtOf(OBJECTS_XAHAU),
+      ...builtOf(STATE_TOUCHES_XRPL),
     ];
 
     it.each(tables)('%s', (table, key) => {
@@ -1426,10 +1448,10 @@ describe('AMM rows (parser version 2)', () => {
       }
     });
 
-    it('stores parser_version 7 (the object history, after the account domains of 6)', () => {
-      expect(PARSER_VERSION).toBe(7);
-      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(7);
-      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(7);
+    it('stores parser_version 8 (the touch index of the token aggregate, after the object history of 7)', () => {
+      expect(PARSER_VERSION).toBe(8);
+      for (const { rows } of builtOf(RIPPLE_MOCK).slice(0, 5)) expect(rows.ledger.parser_version).toBe(8);
+      for (const { rows } of builtOf(AMM_SET)) expect(rows.ledger.parser_version).toBe(8);
     });
   });
 
@@ -1834,14 +1856,16 @@ describe('NFT rows (parser version 5)', () => {
   });
 
   describe('parser_version', () => {
-    it('stamps the parser version of the build on the ledger row: 7, with the NFT parser still at 5 and the domain parser at 6', () => {
-      expect(PARSER_VERSION).toBe(7);
+    it('stamps the parser version of the build on the ledger row: 8, with the NFT parser still at 5, the domain parser at 6 and the object parser at 7', () => {
+      expect(PARSER_VERSION).toBe(8);
       expect(NFT_PARSER_VERSION).toBe(5);
       expect(DOMAIN_PARSER_VERSION).toBe(6);
+      expect(OBJECT_PARSER_VERSION).toBe(7);
+      expect(TOKEN_PARSER_VERSION).toBe(8);
       for (const set of [NFT_SET, URITOKEN_SET, RIPPLE_MOCK]) {
-        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(7);
+        for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(8);
       }
-      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(7);
+      expect(buildLedgerRows(sampleLedger(), XRPL).ledger.parser_version).toBe(8);
     });
   });
 
@@ -2323,11 +2347,14 @@ describe('ledger objects (parser version 7)', () => {
     },
   );
 
-  it('stamps parser_version 7, the first version that has object rows', () => {
+  it('stamps parser_version 8 on the object ledgers: OBJECT_PARSER_VERSION, the first version with object rows, stays 7', () => {
     expect(OBJECT_PARSER_VERSION).toBe(7);
-    expect(PARSER_VERSION).toBe(7);
+    expect(PARSER_VERSION).toBe(8);
     for (const set of [OBJECTS_XRPL, OBJECTS_XAHAU]) {
-      for (const { rows } of builtOf(set)) expect(rows.ledger.parser_version).toBe(OBJECT_PARSER_VERSION);
+      for (const { rows } of builtOf(set)) {
+        expect(rows.ledger.parser_version).toBe(PARSER_VERSION);
+        expect(rows.ledger.parser_version).toBeGreaterThanOrEqual(OBJECT_PARSER_VERSION);
+      }
     }
   });
 });
@@ -2336,6 +2363,97 @@ describe('ledger objects (parser version 7)', () => {
 function pick<T extends object, K extends keyof T>(object: T, keys: readonly K[]): Pick<T, K> {
   return Object.fromEntries(keys.map((key) => [key, object[key]])) as Pick<T, K>;
 }
+
+describe('state touches (parser version 8)', () => {
+  const stateTouches = new StateTouchesParser();
+  const SOURCES = [RIPPLE_MOCK, AMM_SET, XAHAU_SET, NFT_SET, OBJECTS_XRPL, OBJECTS_XAHAU, STATE_TOUCHES_XRPL];
+
+  it('is the version of the token aggregate: TOKEN_PARSER_VERSION is the PARSER_VERSION that introduced the table', () => {
+    expect(TOKEN_PARSER_VERSION).toBe(8);
+    expect(PARSER_VERSION).toBeGreaterThanOrEqual(TOKEN_PARSER_VERSION);
+  });
+
+  it.each(SOURCES)(
+    'is what the parser says for each transaction, in the order of the transactions, over $name',
+    (set) => {
+      let touches = 0;
+      for (const { raw, rows } of builtOf(set)) {
+        const expected = raw.transactions.flatMap((tx) => {
+          const t = toParserTx(tx, raw.header, null);
+          return stateTouches
+            .parse(deepFreeze(t), set.ctx)
+            .map((touch) => ({ ledger_index: raw.header.ledger_index, tx_index: t.tx_index, ...touch }));
+        });
+        expect(rows.stateTouches).toEqual(expected);
+        touches += expected.length;
+      }
+      expect(touches).toBeGreaterThan(0);
+    },
+  );
+
+  it('gives the touches of ripple-mock 11119620 (6 lines) and 11618225 (6 lines and the created account), and none to 11118827 and the Xahau ledgers', () => {
+    const kinds = (index: number) =>
+      ledgerNamed(RIPPLE_MOCK, index)
+        .rows.stateTouches.map((r) => r.kind)
+        .sort();
+    expect(kinds(11118827)).toEqual([]);
+    expect(kinds(11119620)).toEqual(['line', 'line', 'line', 'line', 'line', 'line']);
+    expect(kinds(11618225)).toEqual(['account', 'line', 'line', 'line', 'line', 'line', 'line']);
+    expect(ledgerNamed(XAHAU_SET, 26540188).rows.stateTouches).toEqual([]);
+  });
+
+  it("writes the transaction's own index, meta.TransactionIndex, and the line of a recorded Clawback", () => {
+    // (The node lists this transaction 123rd of 157 in the expanded ledger; its TransactionIndex is 80.)
+    const clawback = JSON.parse(readFileSync(join(FIXTURES, 'xrpl', 'state-touches', 'manifest.json'), 'utf8')).cases
+      .clawback as { ledger: number; hash: string };
+    const { raw, rows } = ledgerNamed(STATE_TOUCHES_XRPL, clawback.ledger);
+    const tx = raw.transactions.find((t) => t.hash === clawback.hash)!;
+    const txIndex = tx.meta.TransactionIndex as number;
+    expect(txIndex).toBe(80);
+
+    expect(rows.stateTouches.filter((r) => r.tx_index === txIndex)).toEqual([
+      {
+        ledger_index: clawback.ledger,
+        tx_index: txIndex,
+        kind: 'line',
+        account: 'rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89',
+        counterparty: 'rYNK7JFGbJhkX8HhT4zw1LJ1Yiu3aa9Mp',
+        currency: '594F494E4B000000000000000000000000000000',
+      },
+    ]);
+  });
+
+  it('writes the touches of a failed transaction too, and none for a ledger without transactions', () => {
+    const failedSet = rawTx(
+      { TransactionType: 'AccountSet', Account: 'rSet' },
+      0,
+      'F'.repeat(64),
+      [
+        {
+          ModifiedNode: {
+            LedgerEntryType: 'AccountRoot',
+            FinalFields: { Account: 'rSet', Balance: '1', Sequence: 6 },
+            PreviousFields: { Balance: '13', Sequence: 5 },
+          },
+        },
+      ],
+      'tecNO_PERMISSION',
+    );
+    const rows = buildLedgerRows(ledgerOf([failedSet]), XRPL);
+
+    expect(rows.stateTouches).toEqual([
+      {
+        ledger_index: rows.ledger.ledger_index,
+        tx_index: 0,
+        kind: 'account',
+        account: 'rSet',
+        counterparty: '',
+        currency: '',
+      },
+    ]);
+    expect(buildLedgerRows(ledgerOf([]), XRPL).stateTouches).toEqual([]);
+  });
+});
 
 describe('CHILD_TABLES', () => {
   it('lists every ledger-derived table except ledgers and ledger_by_hash, once: the 12 of the Ripple v2 data, the 5 AMM ones, the 2 state tables, the path payments and their index by account, the 5 NFT ones, the account domains, the object changes and their index by account, the state touches', () => {

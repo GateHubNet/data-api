@@ -85,6 +85,8 @@ interface Scenario {
   nft?: boolean;
   /** The ledgers are the recorded escrow, check, channel and delegation cases: both object tables get rows. */
   objects?: boolean;
+  /** The ledgers are the recorded AccountSet and Clawback cases of the token aggregate: `state_touches` gets rows of both kinds. */
+  touches?: boolean;
 }
 
 const SCENARIOS: Scenario[] = [
@@ -121,6 +123,15 @@ const SCENARIOS: Scenario[] = [
     dir: 'xahau/objects',
     ledgers: 12,
     objects: true,
+  },
+  // Whole ledgers around the recorded AccountSet (TransferRate, asfAllowTrustLineClawback) and Clawback cases: the touches of both kinds.
+  {
+    name: 'recorded state touches xrpl',
+    database: 'rows_state_touches',
+    network: 'xrpl',
+    dir: 'xrpl/state-touches',
+    ledgers: 3,
+    touches: true,
   },
 ];
 
@@ -252,6 +263,25 @@ describe('buildLedgerRows into ClickHouse (e2e)', () => {
           READ_SETTINGS,
         );
         expect(Number(owners?.n)).toBe(await count(Table.ObjectChanges));
+      });
+    }
+
+    if (scenario.touches) {
+      it('the touch fixtures land in state_touches, with line and account rows (kind reads back as its label)', async () => {
+        const written = inserted.get(Table.StateTouches)!;
+        const stored = await svc.query<{ kind: string; n: string }>(
+          `SELECT kind, count() AS n FROM ${Table.StateTouches} GROUP BY kind`,
+          {},
+          READ_SETTINGS,
+        );
+        const byKind = (kind: string) => written.filter((r) => r.kind === kind).length;
+        expect(byKind('line')).toBeGreaterThan(0);
+        expect(byKind('account')).toBeGreaterThan(0);
+        // (GROUP BY gives no order, and an Enum8 sorts by value, not by label: the groups are compared as a map.)
+        expect(Object.fromEntries(stored.map((r) => [r.kind, Number(r.n)]))).toEqual({
+          line: byKind('line'),
+          account: byKind('account'),
+        });
       });
     }
 

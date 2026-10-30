@@ -89,7 +89,8 @@ the five NFT tables `nft_events`, `account_nft_events`, `collection_nft_events`,
 parser version 5: a ledger written by an older parser has no rows in them), the Domain of an account `account_domains` (migration 012, filled from
 parser version 6 and ordered by account), the history of the tracked ledger objects `object_changes` and its index by account
 `account_object_changes` (migration 013, filled from parser version 7: a ledger written by an older parser has no rows in them), and the index of the trust
-lines and issuers whose token state a transaction changed `state_touches` (migration 014);
+lines and issuers whose token state a transaction changed `state_touches` (migration 014, filled from parser version 8: a ledger written by an older parser
+has no rows in it, and the tokens job never applies a window that holds one);
 see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
@@ -110,6 +111,10 @@ come with parser version 7: the transaction's `Delegate` is listed in `account_t
 delegated transaction is booked to the delegate (`feePayer`: the `transaction_cost` row of `balance_changes`, and the source columns of `payments` and `path_payments`), and the
 payment channels that hold an issued token (Xahau) are typed with token amounts instead of throwing ([ADR-0018](adr/0018-ledger-object-history.md), [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md)
 items 90 to 92).
+The state touches parser reads the metadata of every transaction, whatever its result, for the nodes the token aggregate depends on: each created, modified (with
+`PreviousFields`) or deleted `RippleState` is one `line` row (the low account, the high account and the currency, an LP currency too), and each created or deleted
+`AccountRoot`, each one modified with `Flags`, `TransferRate` or `Domain` among its `PreviousFields`, and the root of the sender of an `AccountSet` (a field set for the first time is
+not in `PreviousFields`; the sender is `senderAccount`, never the delegate that paid the fee) is one `account` row. A balance or sequence change of any other transaction makes none.
 `LedgerWriter.write()` then inserts, in this order:
 
 1. all child tables, in parallel (each insert is chunked at 50,000 rows),

@@ -11,6 +11,7 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xrpl/amm/`                    | Mainnet AMM transactions, one ledger per named case (see below).                        |
 | `xrpl/account-state/`          | Mainnet changes of account flags, trust line settings and an AccountDelete.             |
 | `xrpl/account-domains/`        | Mainnet AccountSets that set and change a Domain (see "Account domains").               |
+| `xrpl/state-touches/`          | Mainnet AccountSets (TransferRate, AllowTrustLineClawback) and a Clawback (see "State touches"). |
 | `xrpl/nft/`                    | Mainnet NFToken transactions, one ledger per named case (see below).                    |
 | `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).           |
 | `xrpl/objects/`                | Mainnet escrow, check, payment channel and delegation cases (see below).                |
@@ -36,7 +37,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/` and `xahau/objects/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/`, `xahau/objects/` and `xrpl/state-touches/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -472,6 +473,47 @@ Facts the ledgers show:
 
 The e2e test writes the ledgers of each network through `LedgerWriter` (the new directory and the read-in-place ledgers) into a real ClickHouse and compares the newest row of
 each account (`argMax(…, version)`, never row counts: the table collapses by account) with the Domain in the metadata and the `version` of its transaction. It deletes the newest case ledger (`deleteLedgerRange`) and writes it again: the rows come back the same.
+
+### State touches (`xrpl/state-touches/`)
+
+For the issued tokens: the `state_touches` rows the parser writes (version 8, `StateTouchesParser`) are checked against the metadata of these ledgers
+(`src/parsers/state-touches.parser.spec.ts`, and the `build-rows` unit and e2e suites). Recorded 2026-10-30 from `wss://s2.ripple.com` (rippled mainnet,
+network id 0; validated head 107991428) with `--txs` and `--delay-ms 500`: 3 ledgers (101 KB gzipped, largest 61 KB). `manifest.json` has the cases under
+`cases.<name>` as `{ledger, hash, type, note}`. Nothing was scanned (`--want` was not used), and nothing of Xahau was requested: its cases are read in place.
+
+The hashes came from `account_tx` of known issuers, one request at a time (a throwaway script, not in the repository): the GateHub issuer
+`rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq` (the AccountSets of its first rows) and the RLUSD issuer `rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De` (the same). The
+Clawback came from a page of a third-party explorer that lists it, and was then checked with `tx` on the node: validated, `tesSUCCESS`, in the ledger below.
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `accountset_transfer_rate` | 11738848 | `E9CFA70630C46E4E6E539C5FA840487974A241A9A9E75EE6FB3555711144D746` | The GateHub issuer sets `TransferRate` 1002000000 for the first time. Its account root is the only node and its `PreviousFields` hold `Balance` and `Sequence` alone: the touch comes from the rule for the sender of an `AccountSet` |
+| `accountset_allow_clawback` | 89925780 | `9B1042DD30188C9BAE7F81C5B3DB91F9C121669A359F4124FBB88531F8BAADA2` | The RLUSD issuer sets `SetFlag` 16 (`asfAllowTrustLineClawback`). Its account root is the only node and its `PreviousFields` hold `Balance`, `Flags` and `Sequence` |
+| `clawback` | 85885429 | `C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8` | `rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89` claws back 1 unit of `594F494E4B000000000000000000000000000000` from `rYNK7JFGbJhkX8HhT4zw1LJ1Yiu3aa9Mp`. Two nodes: the issuer's root (`Balance` and `Sequence`: no touch) and the trust line (`Balance`: one `line` touch) |
+
+**Read in place** (the ledgers are in other directories and not copied; the test loads them by their hash, and names each case as below):
+
+| Case | Directory, ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `accountset_domain` (changed) | `xrpl/account-domains/` 107938710 | `894FEA1CFABB94BF99E0B138516FA54BC46CFC3AA9B05C768656F1D1E180EA98` | `Domain` is among the `PreviousFields` of the sender's root |
+| `accountset_domain` (set first) | `xrpl/account-domains/` 107939675 | `7F95E7D0DC924ADFCCF31F13AF1C4720F31BFECABC6F6195876BE472BCA4A22F` | `Domain` is in `FinalFields` alone; only `Balance` and `Sequence` are in the `PreviousFields`: the sender rule is the only way to the touch |
+| `payment_ripples_through_issuer` | `xrpl/account-state/` 104477592 | `33B40BE22F00E669023312A6F7192EC20748CA5111DA180B81E5D6458DCDA06B` | A Payment through the issuer `rBitcoiNXev8VoVxV7pwoQx1sSfonVP9i3`: four trust lines move, no account root changes more than `Balance` and `Sequence` |
+| `offercreate_two_issued_lines` | `xrpl/account-state/` 104477592 | `E75F47B22075C3554C321E125F127F71E2C440B03770A350886C943995690FA5` | An OfferCreate that crosses two offers: four trust lines, two of the currency `XAH` and two of RLUSD (`524C5553…`) |
+| `ammdeposit_lp_line` | `xrpl/account-state/` 107872956 | `45E37A13EEEA300014BEBBD81F915ECBE338481732B6E409579D7422B5BC684D` | An AMMDeposit: the depositor's LP line (`03D2DE40…`), written like any other line |
+| `trustset_preauthorizes` | `xrpl/account-state/` 104477592 | `7CD6BB1BEAFB159C576910B8A442FCD86FA92B2E8454CF8BE6190299AC9609EA` | `tfSetfAuth`: the USDV issuer creates the line; its own root changes `Balance`, `OwnerCount` and `Sequence`: no touch |
+| `trustline_deleted` | `xrpl/account-state/` 104566926 | `49F56DB0FC454C5AEF99E8C538188523F7B3BBF932DC95B2981DBF1C0ED054C5` | The line is a `DeletedNode` |
+| `trustset_freeze` | `xrpl/account-state/` 26926380 | `40574C8990CD1EAD6D9831D6A32CBE16E3412CE0BDE48F5B86750A8BD8156CAD` | The line is modified (HighFreeze) |
+| `trustset` (Xahau) | `xahau/objects/` 11056548 | `2A1E6EADE207AB90023A2F050ED1766A7932C53776AF0A2287C90FF7B2A0F6FB` | A TrustSet that changes the limit of a USD line |
+| `payment_issued` (Xahau, EVR) | `xahau/objects/` 11056548 | `1A8BE06C9600311F0A908AC263C4643BA4F90A904F01AE374B1F7F3018C28EBE` | A Payment of EVR: two trust lines of the issuer `rEvernodee8dJLaFsujS6q1EiXvZYmHXr8` |
+| `remit_issued` (Xahau) | `xahau/recorded/` 26540613 | `8C50C44787A12B785AA62377D0AFA6C4711E8E07EF68BA6E83DC286F7EE79AAF` | A Remit of issued tokens: six trust lines, and five account roots that change `Balance`, `TouchCount` and the like (no touch) |
+
+Every case of the plan was found. Facts the ledgers show:
+
+- A `TransferRate`, a `Domain` or a flag that an account sets for the first time is not always in the `PreviousFields`: `accountset_transfer_rate` and the Domain set first have
+  `Balance` and `Sequence` alone, so the touch of the sender of an `AccountSet` does not wait for them (the rule is in `StateTouchesParser`).
+- The AMM pool's own account root (`ammdeposit_lp_line`) changes `Balance` only, and the `AMM` node is not an account root: neither is a touch.
+- `meta.TransactionIndex` is the `tx_index` of a touch, not the position of the transaction in the expanded list (the Clawback is the 123rd of the 157 transactions of its
+  ledger's list and has `TransactionIndex` 80).
 
 ### XRPL Testnet (`xrpl-testnet/recorded/`)
 

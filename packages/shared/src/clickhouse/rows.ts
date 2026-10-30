@@ -38,12 +38,14 @@ import type { TomlAccount, TomlCurrency, TomlValidator } from '../tomls/toml-rea
  *       a delegate's `account_transactions` row, the fee booked to a delegated transaction's delegate, and the typed
  *       balance changes of issued-token channels; `OBJECT_PARSER_VERSION`. Ledgers written with an older version have
  *       none of these; `--reprocess` rewrites them.
+ *  - 8: the touch index of the token aggregate (`state_touches`). A ledger written by an older version has none; the job
+ *       never applies a window that holds one (`TOKEN_PARSER_VERSION`).
  *
  * A reader that depends on a feature compares a ledger's version with that feature's constant (`AMM_PARSER_VERSION`,
- * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`, `NFT_PARSER_VERSION`, `DOMAIN_PARSER_VERSION`, `OBJECT_PARSER_VERSION`),
- * never with `PARSER_VERSION`.
+ * `STATE_PARSER_VERSION`, `PATH_PARSER_VERSION`, `NFT_PARSER_VERSION`, `DOMAIN_PARSER_VERSION`, `OBJECT_PARSER_VERSION`,
+ * `TOKEN_PARSER_VERSION`), never with `PARSER_VERSION`.
  */
-export const PARSER_VERSION = 7;
+export const PARSER_VERSION = 8;
 
 /** The first parser version that writes swaps and the AMM tables: a ledger written by an older one lacks them. */
 export const AMM_PARSER_VERSION = 2;
@@ -79,6 +81,13 @@ export const DOMAIN_PARSER_VERSION = 6;
  * on it, never on `PARSER_VERSION`.
  */
 export const OBJECT_PARSER_VERSION = 7;
+
+/**
+ * The first parser version that writes `state_touches`, the ledger-ordered index of the trust lines and issuers a transaction
+ * changed: a ledger written by an older one has none, and the tokens job never applies a window that holds one. Gates compare
+ * with this constant, never with `PARSER_VERSION`, which later features move on.
+ */
+export const TOKEN_PARSER_VERSION = 8;
 
 /** `UInt64` column: a string stays exact above 2^53. */
 export type UInt64Value = string | number;

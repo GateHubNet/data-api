@@ -136,7 +136,7 @@ const SHAPES: Record<Table, Shape> = {
     order: 'account, object_type, role, ledger_index, tx_index, object_id',
   },
   // the ledger-ordered index of the lines and issuers whose token state changed (migration 014): the tokens job scans it by
-  // primary-key range, as it does amm_pool_touches and nft_touches
+  // primary-key range, as the aggregator scans the other touch tables
   [Table.StateTouches]: {
     engine: 'ReplacingMergeTree',
     partition: P6,

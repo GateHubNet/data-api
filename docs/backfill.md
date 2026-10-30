@@ -117,12 +117,17 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   of such an account): ledgers written by an older version have none. **No reprocess is needed for them**: a one-off SQL seed gives every
   account its current Domain from the state history ([Account domains seed](#account-domains-seed)), and an account whose Domain was set
   before that history is learnt at its next change. A `--reprocess` of a range writes the rows of its ledgers, as for every table.
-  Parser version 7 (the current one) adds the history of escrows, checks, payment channels and delegations (`object_changes` and its index by
+  Parser version 7 adds the history of escrows, checks, payment channels and delegations (`object_changes` and its index by
   account `account_object_changes`), gives a delegate its `account_transactions` row, books the fee of a delegated transaction to its delegate and
   types the balance changes of issued-token payment channels: ledgers written by an older version have none of these, and `--reprocess` writes them (see
   [Ledger objects and delegation re-ingest](#ledger-objects-and-delegation-re-ingest)).
   Changes of these objects that no event of the table expects are counted in `syncer_objects_unclassified_total`, and the range-ingest log names the
   total of its run (a warning when it is not 0, and `L unclassified object changes` in the last line).
+  Parser version 8 (the current one) adds the index of the trust lines and issuers whose token state a transaction changed (`state_touches`, a row for each
+  created, modified or deleted trust line and for each account root whose flags, transfer rate or domain changed, or that sent an `AccountSet`;
+  `TOKEN_PARSER_VERSION`): ledgers written by an older version have none. **The aggregate of the issued tokens needs no re-ingest of them**: its account
+  pass reads `trust_line_states` as it is, and the job needs the touches only above the ledger its generation was built at. The job never applies a window that
+  holds a ledger of an older version: it builds a new generation instead. A `--reprocess` of a range writes the touches of its ledgers, as for every table.
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.

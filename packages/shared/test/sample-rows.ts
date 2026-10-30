@@ -595,13 +595,14 @@ export const SAMPLE_ROWS: { [T in Table]: TableRows[T] } = {
     object_id: hash(40),
     action: 'created',
   },
-  // a trust line whose state a transaction changed (the touch of the line Alice holds with the issuer)
+  // a trust line whose state a transaction changed (the touch of the line Alice holds with the issuer: `account` is the line's
+  // low account, and the issuer's AccountID is the lower of the two)
   [Table.StateTouches]: {
     ledger_index: LEDGER,
     tx_index: 9,
     kind: 'line',
-    account: ALICE,
-    counterparty: ISSUER,
+    account: ISSUER,
+    counterparty: ALICE,
     currency: 'USD',
   },
   [Table.FeeStats]: {

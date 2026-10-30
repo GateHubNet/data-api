@@ -88,7 +88,10 @@ const NFT_LEDGER_TABLES: Table[] = [
  */
 const OBJECT_LEDGER_TABLES: Table[] = [Table.ObjectChanges, Table.AccountObjectChanges];
 
-/** The ledger table of the touches of token state (migration 014): a child table like the others, empty until its parser exists. */
+/**
+ * The ledger table of the touches of token state (migration 014): a child table like the others, with rows from the touches
+ * parser. Of the ripple-mock ledgers two have rows (11119620 and 11618225), in one partition.
+ */
 const TOUCH_LEDGER_TABLES: Table[] = [Table.StateTouches];
 
 /**
@@ -98,7 +101,7 @@ const TOUCH_LEDGER_TABLES: Table[] = [Table.StateTouches];
  * `account_domains` (migration 012) is one of them: the last ripple-mock ledger gives it two rows of one account, but the
  * delete tests need a row in every ledger, and each of an account of its own (`seededDomainRow`). The two object tables
  * (migration 013) are the others: two ripple-mock ledgers give them rows, in one partition. `state_touches` (migration 014)
- * is the last: no parser fills it yet.
+ * is the last: two ripple-mock ledgers give it rows too, in one partition.
  */
 const SEEDED_LEDGER_TABLES: Table[] = [
   ...AMM_LEDGER_TABLES,
@@ -449,13 +452,15 @@ describe('LedgerWriter and ingest state (e2e)', () => {
       expect(new Set(tokens).size).toBe(tokens.length);
 
       // The child tables that have rows (the 12 of the Ripple data, the 2 state tables, the path payments and their index
-      // by account, account_domains, which the last ledger has two rows for, and the 2 object tables, which the ledgers of
-      // a recorded EscrowCreate and of two channel claims have rows for: these ledgers have no AMM or NFT activity, so the
-      // 5 AMM tables and the 5 NFT tables get no insert) start together, before any of them has finished.
+      // by account, account_domains, which the last ledger has two rows for, the 2 object tables, which the ledgers of
+      // a recorded EscrowCreate and of two channel claims have rows for, and state_touches, which the ledgers of 11119620 and
+      // 11618225 have rows for: these ledgers have no AMM or NFT activity, so the 5 AMM tables and the 5 NFT tables get no
+      // insert) start together, before any of them has finished.
       const childTables = new Set<string>(
         CHILD_TABLES.filter(([, key]) => BUILT.some((rows) => rows[key].length > 0)).map(([t]) => t),
       );
-      expect(childTables.size).toBe(19);
+      expect(childTables.size).toBe(20);
+      expect(childTables).toContain(Table.StateTouches);
       expect(childTables).toContain(Table.ObjectChanges);
       expect(childTables).toContain(Table.AccountObjectChanges);
       expect(childTables).toContain(Table.AccountStates);

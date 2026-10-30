@@ -1,0 +1,68 @@
+{
+  "network": "xrpl",
+  "endpoint": "wss://s2.ripple.com",
+  "recorded_at": "2026-10-30T01:25:39.156Z",
+  "validated_head": 107991428,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "E9CFA70630C46E4E6E539C5FA840487974A241A9A9E75EE6FB3555711144D746": {
+      "ledger": 11738848,
+      "type": "AccountSet",
+      "result": "tesSUCCESS"
+    },
+    "9B1042DD30188C9BAE7F81C5B3DB91F9C121669A359F4124FBB88531F8BAADA2": {
+      "ledger": 89925780,
+      "type": "AccountSet",
+      "result": "tesSUCCESS"
+    },
+    "C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8": {
+      "ledger": 85885429,
+      "type": "Clawback",
+      "result": "tesSUCCESS"
+    }
+  },
+  "cases": {
+    "accountset_transfer_rate": {
+      "ledger": 11738848,
+      "hash": "E9CFA70630C46E4E6E539C5FA840487974A241A9A9E75EE6FB3555711144D746",
+      "type": "AccountSet",
+      "note": "AccountSet by the GateHub issuer rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq sets its TransferRate to 1002000000 for the first time. Its account root is the only node: PreviousFields hold Balance and Sequence alone, so the touch comes from the AccountSet sender rule, not from the PreviousFields"
+    },
+    "accountset_allow_clawback": {
+      "ledger": 89925780,
+      "hash": "9B1042DD30188C9BAE7F81C5B3DB91F9C121669A359F4124FBB88531F8BAADA2",
+      "type": "AccountSet",
+      "note": "AccountSet SetFlag 16 (asfAllowTrustLineClawback) by the RLUSD issuer rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De. Its account root is the only node: PreviousFields hold Balance, Flags and Sequence"
+    },
+    "clawback": {
+      "ledger": 85885429,
+      "hash": "C2071343FB6CB00E495F50BD319B773D7461435E5B19F8EF0E1E2AF2853824D8",
+      "type": "Clawback",
+      "note": "rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89 claws back 1 unit of 594F494E4B000000000000000000000000000000 from rYNK7JFGbJhkX8HhT4zw1LJ1Yiu3aa9Mp. Two nodes: the issuer root (PreviousFields Balance and Sequence) and the RippleState (PreviousFields Balance)"
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 11738848,
+      "bytes": 24425,
+      "gzipBytes": 6217
+    },
+    {
+      "ledger": 85885429,
+      "bytes": 281340,
+      "gzipBytes": 61066
+    },
+    {
+      "ledger": 89925780,
+      "bytes": 191300,
+      "gzipBytes": 36438
+    }
+  ]
+}

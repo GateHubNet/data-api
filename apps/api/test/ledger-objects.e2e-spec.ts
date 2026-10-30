@@ -1,4 +1,11 @@
-import { amendmentId, escrowId, OBJECT_PARSER_VERSION, ObjectChangesRow, Table } from '@gatehub/data-api-shared';
+import {
+  amendmentId,
+  escrowId,
+  OBJECT_PARSER_VERSION,
+  ObjectChangesRow,
+  PARSER_VERSION,
+  Table,
+} from '@gatehub/data-api-shared';
 import { classicAddressToXAddress } from 'ripple-address-codec';
 import { COVERAGE_KEYS } from '../src/common/feature-coverage.service';
 import {
@@ -216,7 +223,9 @@ describe('the escrow routes over the recorded xrpl ledgers', () => {
       `SELECT ledger_index, toUnixTimestamp(close_time) AS t, parser_version AS v FROM ${Table.Ledgers}
         ORDER BY ledger_index DESC LIMIT 1`,
     );
-    expect([head?.ledger_index, Number(head?.t), head?.v]).toEqual([HEAD, HEAD_CLOSE, OBJECT_PARSER_VERSION]);
+    // the ledger writer stamps the parser version of the build, which is at or above the first version that has object rows
+    expect([head?.ledger_index, Number(head?.t), head?.v]).toEqual([HEAD, HEAD_CLOSE, PARSER_VERSION]);
+    expect(PARSER_VERSION).toBeGreaterThanOrEqual(OBJECT_PARSER_VERSION);
     const first = await h.ch.queryOne<{ ledger_index: number }>(
       `SELECT ledger_index FROM ${Table.Ledgers} ORDER BY ledger_index LIMIT 1`,
     );

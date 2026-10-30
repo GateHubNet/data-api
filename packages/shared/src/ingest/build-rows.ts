@@ -48,6 +48,7 @@ import { ObjectChangesParser } from '../parsers/object-changes.parser';
 import { ParseContext, ParserTx, senderAccount, toParserTx } from '../parsers/parser.interface';
 import { PathPaymentParser } from '../parsers/path-payments.parser';
 import { PaymentParser } from '../parsers/payment.parser';
+import { StateTouchesParser } from '../parsers/state-touches.parser';
 import { TrustLineStatesParser } from '../parsers/trust-line-states.parser';
 import { RawLedger } from './raw-ledger';
 
@@ -105,8 +106,9 @@ export interface LedgerRows {
   /** The index of `objectChanges` by account: a row for the owner and one for the counterparty of each. */
   accountObjectChanges: AccountObjectChangesRow[];
   /**
-   * The trust lines and issuers whose token state a transaction changed (migration 014): the ledger-ordered index the tokens job
-   * scans. Always empty until the parser that fills it exists (parser version 8).
+   * The trust lines and issuers whose token state a transaction changed (migration 014, parser version 8:
+   * `TOKEN_PARSER_VERSION`): the ledger-ordered index the tokens job scans. Whatever the transaction's result, as its
+   * metadata says.
    */
   stateTouches: StateTouchesRow[];
   /** What the parsers noticed while building the rows. Never inserted: there is no table for it. */
@@ -192,6 +194,7 @@ const accountsCreatedParser = new AccountsCreatedParser();
 const accountStatesParser = new AccountStatesParser();
 const accountDomainsParser = new AccountDomainsParser();
 const trustLineStatesParser = new TrustLineStatesParser();
+const stateTouchesParser = new StateTouchesParser();
 const ammParser = new AmmParser();
 const nftParser = new NftParser();
 const objectChangesParser = new ObjectChangesParser();
@@ -832,6 +835,11 @@ function buildRows(raw: RawLedger, ctx: ParseContext): LedgerRows {
         flags: line.flags,
         deleted: line.deleted ? 1 : 0,
       });
+    }
+
+    // A narrow row per line or issuer the transaction changed, the key range the tokens job reads by ledger.
+    for (const touch of stateTouchesParser.parse(t, ctx)) {
+      rows.stateTouches.push({ ledger_index: header.ledger_index, tx_index: txIndex, ...touch });
     }
   }
 
