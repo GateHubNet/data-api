@@ -5,6 +5,7 @@ import { firstCommittedLedger } from '../ingest/ingest-state';
 import { NetworkProfile } from '../network/network-profile';
 import { coverageFrom } from '../query/parser-coverage';
 import { mintSlices, MintSums } from '../query/supply';
+import { chunk } from '../util/helpers';
 import { feesOfSetFee } from '../util/set-fee';
 import { AMM_POOLS_CHUNK, committedHead, poolsChangedSince } from './amm-pools.job';
 import { readEscrowed } from './escrows.job';
@@ -33,8 +34,11 @@ import {
  *    that are stale at L are found from the touches: a pool stale at L has a touch in `(min(C, L), L]` that its row has not seen,
  *    because the runner has rebuilt every pool touched up to C, except a pool it has set aside. Those pools, together with the pools
  *    whose row is past L, are filled forward at L in steps (`amm`); filling forward a pool that was only stale past L is harmless.
- *    The set-aside pools are not: they are counted at their stored row, and listed, for the caller to warn about. So the sum is
- *    exact except for a set-aside pool, whose AMM pages show the same stored state. The only wait is for the runner's first cursor.
+ *    The set-aside pools are not: they are counted at their stored row (a pool with none counts nothing), and listed, for the
+ *    caller to warn about; they are pool accounts whether or not they have a row, since the runner's cursor goes past them. So the
+ *    sum is exact except for a set-aside pool, whose AMM pages show the same stored state, and for a pool that a re-ingest of
+ *    ledgers made stale below the cursor, which counts at its stored row until `agg_dirty` rebuilds it (a snapshot that a re-ingest
+ *    leaves off is the case spec 4.5 tolerates; the next cycle is right again). The only wait is for the runner's first cursor.
  *  - **A row of a pool never stalls the cycle**: a native reserve that is not a whole number of drops, or that is NULL, counts as 0
  *    and the pool is listed (`poolsAtZero`).
  */
@@ -86,12 +90,18 @@ export interface SupplyCycle {
   /** The reserve values in force at L, `null` when neither `network_state` nor a `SetFee` says. */
   reserveBase: bigint | null;
   reserveInc: bigint | null;
-  /** Every pool account, sorted: the accounts the reserves leave out. A pool with no `amm_pools` row yet is in it. */
+  /**
+   * Every pool account, sorted: the accounts the reserves leave out. A pool with no `amm_pools` row yet is in it (a touched one,
+   * or a set-aside one), so is a set-aside pool whatever its touches.
+   */
   poolAccounts: readonly string[];
   /** The native drops in the pools so far, and how many pools hold any: `null` and 0 when the network has no AMM. */
   amm: bigint | null;
   ammPools: number;
-  /** The set-aside pools of this cycle, counted at their stored row (the caller logs one warning naming them). */
+  /**
+   * The pools the runner has set aside, sorted, counted at their stored row, or at nothing when they have none (the caller logs
+   * one warning naming them).
+   */
   poolsAtStoredRow: readonly string[];
   /** The pools counted as 0 because their native reserve is NULL or is not a whole number of drops (the caller logs them). */
   poolsAtZero: readonly string[];
@@ -240,13 +250,6 @@ interface AmmStart {
   steps: SupplyStep[];
 }
 
-/** `items` in chunks of `size`. */
-function chunked<T>(items: readonly T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let at = 0; at < items.length; at += size) chunks.push(items.slice(at, at + size));
-  return chunks;
-}
-
 /** A stored row's native drops, `null` when the row cannot say (the reserve is NULL or not a whole number of drops). */
 function storedNativeDrops(pool: PoolReserves, native: string): bigint | null {
   if (pool.deleted) return 0n;
@@ -273,7 +276,9 @@ async function ammStart(
   // the touches in (min(cursor, L), L]; a cursor at or past L leaves none to look for
   const touched = await stalePoolsUpTo(ch, cursor, ledger, SUPPLY_AMM_TOUCHED_LIMIT);
 
-  const poolAccounts = new Set([...rows.map((row) => row.amm_account), ...touched]);
+  // a set-aside pool is a pool of the cycle whether or not it has a row: the runner moves its cursor past a pool it sets aside, so
+  // a pool that has failed from its first rebuild has no row and no touch above the cursor, and only the runner's list names it
+  const poolAccounts = new Set([...rows.map((row) => row.amm_account), ...touched, ...setAside]);
   const fill = new Set(touched);
   for (const row of rows) if (Number(row.last_ledger) > ledger) fill.add(row.amm_account);
   for (const account of setAside) fill.delete(account);
@@ -296,9 +301,9 @@ async function ammStart(
     amm,
     ammPools,
     poolAccounts: [...poolAccounts].sort(),
-    poolsAtStoredRow: [...new Set(setAside)].filter((account) => poolAccounts.has(account)).sort(),
+    poolsAtStoredRow: [...new Set(setAside)].sort(),
     poolsAtZero,
-    steps: chunked([...fill].sort(), AMM_POOLS_CHUNK).map((pools): SupplyStep => ({ kind: 'amm', pools })),
+    steps: chunk([...fill].sort(), AMM_POOLS_CHUNK).map((pools): SupplyStep => ({ kind: 'amm', pools })),
   };
 }
 

@@ -287,6 +287,21 @@ restart forgets it and the next tick starts a fresh cycle.
   `ammPoolsWatermark(ch) >= L` (no pool has a touch at or below L that its row has not seen). When either is not met (no sentinel yet,
   the AMM job behind), the cycle does not start and the next tick tries again; after `SUPPLY_START_WAIT_TICKS` = 10 such ticks it warns
   once (`supply: waiting for escrows/amm_pools to reach the head`). Both jobs run earlier in the same tick, so this is rare.
+  *Amended 2026-10-30 by the D7 Task 6 build (the text above stays as the plan wrote it). Two changes to when a cycle starts.
+  (a) A cycle starts at L only when the sentinel exists with a `through_ledger` above 0, `committedHead(ch) − through_ledger` is at most
+  `SUPPLY_MAX_LAG_LEDGERS` = 1,000, and the `ledgers` row of L is stored (read by its key); otherwise the start answers
+  `{ waiting: 'escrows' }`, which counts toward the warning. During a first fill or a rebuild of the escrows job (D5: about 80 to 108
+  ticks) L is millions of ledgers behind the head while the first tick reads the current state at the head, and a step of the escrows job
+  (1,000,000 ledgers, `to = min(head, from + step)`) can land in a gap of the index, where a missing `ledgers` row would throw at every
+  tick. A start that throws still counts as a failed step (same streak and backoff). The checks run in the order that costs least: the
+  sentinel, the head, the row of L. (b) There is no `ammPoolsWatermark(ch) >= L` condition. `ammPoolsWatermark` is a scan of every touch of
+  every pool, joined with `amm_pools`, which the plan would have awaited at every cycle start and every waiting tick. It also races two
+  jobs: `amm_pools` (job 3) reads its head before `escrows` (job 5) reads the head that becomes L, an AMM-touched ledger committed
+  in between puts the watermark below L, and on XRPL most ledgers touch a pool, so the wait would be common, not rare. And a pool the
+  runner sets aside (`MAX_ISOLATED_POOLS_PER_BATCH`) stays stale in the tables while the runner's cursor goes on, so the watermark would
+  stay below it for good and supply on XRPL would wait for ever. The aggregator service lends the job the `amm_pools` runner's in-memory
+  cursor C and its set-aside pools (`SupplyAmmSight`), and the one AMM wait is `{ waiting: 'amm_pools' }` while the runner has no cursor
+  (before its first run after the process started). Section 4.2 says how the cycle uses them.*
 - **First tick** (the current-state reads, which must be taken at the tick L is chosen): L's `close_time` and `total_coins` from
   `ledgers`; escrowed (`drops`, `open` from `readEscrowed`); on XRPL the AMM step (4.2, part 1); the reserve values (4.3); the AMM pool
   accounts (for the reserves step). The job stores no coverage: the api adds it per part (1.5).
@@ -307,6 +322,22 @@ L`: touched since, usually a few hundred at most) are filled forward at L with t
 AMM_FILL_WINDOW_LEDGERS, …)` over the reserve columns, `AMM_POOLS_CHUNK` (200) at a time, one chunk a step. `amm` = Σ native reserves
 (exact, from the reserve strings, in drops); `amm_pools` = the pools with a native reserve above 0 and not deleted.
 
+*Amended 2026-10-30 by the D7 Task 6 build (the text above stays as the plan wrote it). Part 1 stands: the newest row of every pool. What
+changes is which pools are filled forward, because the watermark condition of 4.1 is gone and so is its guarantee that every row with
+`last_ledger <= L` is the pool's state at L. A pool is stale at L when it has a touch at or below L that its row has not seen. The runner has
+rebuilt every pool touched up to its cursor C, except a pool it has set aside, so a pool stale at L has an unseen touch in `(min(C, L), L]`
+or is set aside. The fill-forward set at L is therefore the pools of `poolsChangedSince(ch, min(C, L), 100_000)` (`SUPPLY_AMM_TOUCHED_LIMIT`; a
+page that is cut is followed from its `upTo` until the answer is complete up to L, each page awaited; with C at or past L nothing is asked)
+together with the pools whose row is past L (`last_ledger > L`), minus the set-aside pools, in steps of `AMM_POOLS_CHUNK` (200). A pool that
+was only stale past L is filled forward as well; that is harmless, as the fill-forward at L gives the state it already has. Every other pool,
+a set-aside one included even when its row is past L, adds its stored row now, and the cycle logs one warning naming the set-aside pools
+(`poolsAtStoredRow`). So the sum is exact except for a set-aside pool, whose AMM pages show the same stored state, and for a pool that a
+re-ingest of ledgers made stale below the cursor, which counts at its stored row until `agg_dirty` rebuilds it (4.5). The pool accounts left
+out of the reserves are every `amm_account` of `amm_pools`, the touched pools (a new pool has no row yet) and the set-aside pools (the
+runner's cursor goes past a pool it sets aside, and one that failed from its first rebuild has no row at all). A row that cannot be read never
+stalls the cycle: a native side with a NULL reserve, or a reserve that is not a whole number of drops, counts 0 and the pool is listed
+(`poolsAtZero`, logged).*
+
 ### 4.3 Reserves
 
 **Reserve values** at L: `SELECT reserve_base, reserve_inc FROM network_state WHERE ledger_index <= {L:UInt32} ORDER BY ledger_index
@@ -314,6 +345,16 @@ DESC, polled_at DESC LIMIT 1`; with no row (the validators worker off, or past t
 (`tx_by_type` prefix `('SetFee')`, newest first, `LIMIT 1`, then its `tx_json` from `transactions` by key: `ReserveBaseDrops` /
 `ReserveIncrementDrops`, else `ReserveBase` / `ReserveIncrement`); with neither, `reserve_base`/`reserve_inc` are NULL and the api
 leaves `reserves` out (decision 10). The two numbers are those in force at L, so a reserve change shows in the next snapshot.
+
+*Amended 2026-10-30 by the D7 Task 6 build (the text above stays as the plan wrote it). The `network_state` lookup is two reads of the key,
+as `newestSnapshot` became (1.4): `SELECT ledger_index FROM network_state WHERE ledger_index <= {L:UInt32} ORDER BY ledger_index DESC LIMIT
+1`, then `SELECT reserve_base, reserve_inc … WHERE ledger_index = {ledger:UInt32} ORDER BY polled_at DESC LIMIT 1` (the later of the polls of
+that ledger). The single read above scans the whole part, because `polled_at` is not in the key and the read in order cannot stop at the first
+row: 28,082 rows read in a part of 55,001 (bound 16,386). The `SetFee` fallback reads `tx_by_type` in the order of its key, type first (`ORDER
+BY tx_type DESC, ledger_index DESC, tx_index DESC LIMIT 1`), then `transactions` by `(ledger_index, tx_index)`, and reads the fees with
+D1's `feesOfSetFee` (moved from the syncer's `tally.ts` to `packages/shared/src/util/set-fee.ts`, used by the voting rounds as before): the
+drops form first, the digit and `UInt64` checks, the legacy forms. A `SetFee` it cannot read, or whose `transactions` row is missing, gives
+NULL for both.*
 
 **Accounts and owner count.** The state of every account at L, read in **account ranges**: the key space of `account_states` cut by the
 two characters after `r` (3,364 prefixes in byte order of the XRPL base58 alphabet, `SUPPLY_ACCOUNT_PREFIXES`), `SUPPLY_PREFIXES_PER_READ`
@@ -344,6 +385,10 @@ of 5 s. Should a cycle take longer than an hour, cycles simply run back to back:
 - **Burned**: `SELECT sum(fee_total) FROM (SELECT fee_total FROM ledgers WHERE ledger_index <= {L} ORDER BY ledger_index LIMIT 1 BY
   ledger_index)`: one read of the narrow `ledgers` columns (Xahau: about 27 million rows). XRPL: `burned` = 10¹⁷ − `total_coins` (no
   history, no read).
+  *Amended 2026-10-30 by the D7 Task 6 build: Xahau burned is cut like minted. The plan has one `burned` step for each slice of
+  `mintSlices(oldest stored ledger, L)`, each a read of one partition of `ledgers` (a step is never cut, and one read of about 27 million
+  rows could be the step forced past the deadline), and the sums add up. The plan lists the steps in the order accounts, amm, burned (all
+  slices), minted (all slices). `burned` starts at 0 on Xahau and at `10¹⁷ − total_coins` on XRPL.*
 - **Minted**: `mintSums(ch, first, L, false)` from the oldest ledger the three tables can hold (`newestLedgerBelowVersion(ch,
   MINT_PARSER_VERSION) + 1`, or the oldest stored ledger), one slice a step (about 27 on Xahau). XRPL: the three columns NULL.
 
@@ -483,6 +528,14 @@ newest day is the running one, summed so far.
 bound tests use, the rows the read needs plus two granules for each part, not 8,192 rows. Over 20,000 rows in one part that is 1 + 2 × 8,192 =
 16,385: the one read it replaced (20,000 rows) is over it, and each of the two reads (11,808 rows) is under it, because the part's last granule
 holds the rows from the 8,193rd on. The test is `supply-reads.e2e-spec.ts` of `packages/shared`, not `supply.e2e-spec.ts`.*
+
+*Amended 2026-10-30 by the D7 Task 6 build: the network_state / SetFee row is not "one granule each" but the form of the other bounds, the rows
+the read needs plus two granules (the table's own: 8,192 rows, 1,024 for `transactions`) for each part that holds rows of the read. The lookups
+are four reads, and the test (`supply-job.e2e-spec.ts`) seeds bulks of more than that bound in the very parts they read, with merges stopped:
+`network_state`, two reads of 5,849 and 11,698 rows against 16,386 (one part); `tx_by_type` 8,192 against 16,385 (one part); `transactions`
+1,025 against 4,097 (two parts). Each fails under a mutant that loses the key order or the key (the single `network_state` read: 28,082; the
+`tx_by_type` read with the type moved last in the order: 40,960; the `transactions` read by place alone: 65,537). The Xahau burned row is one
+read of `ledgers` for each slice, within that partition (Task 7).*
 
 ## 7. XRPL, Xahau and the sandbox
 

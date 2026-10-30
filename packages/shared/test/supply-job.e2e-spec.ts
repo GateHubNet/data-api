@@ -153,6 +153,9 @@ describe('startSupplyCycle (e2e)', () => {
     for (const table of tables) await ch.command(`SYSTEM STOP MERGES ${table}`);
   };
 
+  const countOf = async (ch: ClickHouseService, sql: string, params: Record<string, unknown> = {}): Promise<number> =>
+    Number((await ch.queryOne<{ n: string }>(sql, params))?.n);
+
   /** The sentinel of the escrows job at `through`, and the ledgers `through .. head` committed (every one: the head is the newest). */
   async function ready(
     ch: ClickHouseService,
@@ -198,7 +201,10 @@ describe('startSupplyCycle (e2e)', () => {
       const ch = await fresh();
       await ch.insert(Table.Escrows, [sentinel({ amount_drops: '0', open_count: 0, through_ledger: 0, version: 1 })]);
       await ch.insert(Table.Ledgers, [ledgerRow(L)]);
+      // answered by the sentinel alone: the head, 5,000 ahead of ledger 0, would answer the same, but after a second read
+      const query = jest.spyOn(ch, 'query');
       expect(await startSupplyCycle(ch, xahau, STARTED_AT)).toEqual({ waiting: 'escrows' });
+      expect(query).toHaveBeenCalledTimes(1);
     });
 
     it('starts at the sentinel while the head is at most 1,000 ledgers ahead, and waits when it is further', async () => {
@@ -328,6 +334,10 @@ describe('startSupplyCycle (e2e)', () => {
       await ch.insert(Table.NetworkState, [stateRow(L - 10, [1_000_000, 200_000], 1)]);
       await ch.insert(Table.NetworkState, [stateRow(L + 5, [9_000_000, 900_000], 9)]);
       await ch.insert(Table.NetworkState, [stateRow(L - 4000, [7_000_000, 700_000], 0)]);
+      // the premise: the two polls are two rows of the table (no merge ran), not one
+      expect(await countOf(ch, `SELECT count() AS n FROM ${Table.NetworkState} WHERE ledger_index = ${L - 10}`)).toBe(
+        2,
+      );
       expect(await reservesOf(ch)).toEqual([2_000_000n, 400_000n]);
     });
 
@@ -403,6 +413,15 @@ describe('startSupplyCycle (e2e)', () => {
         ch,
         setFee(4_900, { ReserveBaseDrops: 'many', ReserveIncrementDrops: '2', BaseFeeDrops: '10' }),
       );
+      expect(await reservesOf(ch)).toEqual([null, null]);
+    });
+
+    it('leaves them NULL when the newest SetFee of the index has no transaction row (a re-ingest dropped it)', async () => {
+      const ch = await fresh();
+      await ready(ch);
+      // the older SetFee is whole, the newest has its index row and no transaction: the newest is the one asked for, and it says nothing
+      await insertSetFees(ch, setFee(4_000, DROPS('1000000', '200000')));
+      await ch.insert(Table.TxByType, [{ tx_type: 'SetFee', ledger_index: 4_900, tx_index: 0, result: 'tesSUCCESS' }]);
       expect(await reservesOf(ch)).toEqual([null, null]);
     });
 
@@ -495,6 +514,8 @@ describe('startSupplyCycle (e2e)', () => {
       // the older version of a pool is bigger: the newest version (the higher number, '10' above '9') is the one
       await ch.insert(Table.AmmPools, [pool(acct(1), { reserve_base: '999', version: 9 })]);
       await ch.insert(Table.AmmPools, [pool(acct(1), { reserve_base: '10', version: 10 })]);
+      // the premise: both versions are rows of the table (no merge ran)
+      expect(await countOf(ch, `SELECT count() AS n FROM ${Table.AmmPools} WHERE amm_account = '${acct(1)}'`)).toBe(2);
       await ch.insert(Table.AmmPools, [
         pool(acct(2), {
           base_currency: 'USD',
@@ -632,7 +653,7 @@ describe('startSupplyCycle (e2e)', () => {
       expect(cycle.poolAccounts).toEqual([1, 2, 3, 4, 5, 6, 7, 8].map(acct));
     });
 
-    it('asks poolsChangedSince from the cursor (and from L when the cursor is past it) with the named limit', async () => {
+    it('asks poolsChangedSince from the cursor, with the named limit', async () => {
       const ch = await fresh();
       await ready(ch, { head: L + 10 });
       await ch.insert(Table.AmmPools, [pool(acct(1), { last_ledger: 100 })]);
@@ -657,14 +678,17 @@ describe('startSupplyCycle (e2e)', () => {
         pool(acct(3), { last_ledger: 100 }), // stale only past L: the cursor has not got there, and this start does not need it
       ]);
       await ch.insert(Table.AmmPoolTouches, [touch(4_000, acct(1)), touch(L + 50, acct(2)), touch(L + 60, acct(3))]);
-      const query = jest.spyOn(ch, 'query');
-      const cycle = await start(ch, xrpl, sight(L + 20));
-      expect(ammPools(cycle)).toEqual([acct(2)]);
-      expect(native(cycle)).toEqual([20_000_000n, 2]);
-      expect(query.mock.calls.filter(([sql]) => String(sql).includes(Table.AmmPoolTouches))).toEqual([]);
+      for (const cursor of [L, L + 20]) {
+        const query = jest.spyOn(ch, 'query');
+        const cycle = await start(ch, xrpl, sight(cursor));
+        expect([cursor, ammPools(cycle)]).toEqual([cursor, [acct(2)]]);
+        expect([cursor, native(cycle)]).toEqual([cursor, [20_000_000n, 2]]);
+        expect(query.mock.calls.filter(([sql]) => String(sql).includes(Table.AmmPoolTouches))).toEqual([]);
+        query.mockRestore();
+      }
     });
 
-    it('takes the cursor below L when it is below it, and L when the cursor is above', async () => {
+    it('finds a pool stale at L only from a cursor below its touch: a cursor at the touch, or above L, asks for none', async () => {
       const ch = await fresh();
       await ready(ch, { head: L + 100 });
       await ch.insert(Table.AmmPools, [pool(acct(1), { last_ledger: 100 })]);
@@ -672,6 +696,13 @@ describe('startSupplyCycle (e2e)', () => {
       // a cursor below the touch finds the pool stale; a cursor at the touch (the runner has been through it) does not ask
       expect(ammPools(await start(ch, xrpl, sight(3_499)))).toEqual([acct(1)]);
       expect(ammPools(await start(ch, xrpl, sight(3_500)))).toEqual([]);
+      // a cursor above L is read as L: the pool whose touch the runner has passed counts at its stored row (a re-ingest of ledgers
+      // below the cursor can leave one so until agg_dirty rebuilds it, which spec 4.5 tolerates), and no touch is read
+      const query = jest.spyOn(ch, 'query');
+      const above = await start(ch, xrpl, sight(L + 50));
+      expect(ammPools(above)).toEqual([]);
+      expect(native(above)).toEqual([10_000_000n, 1]);
+      expect(query.mock.calls.filter(([sql]) => String(sql).includes(Table.AmmPoolTouches))).toEqual([]);
     });
 
     it('chunks the pools to fill forward into amm steps of 200, sorted, in order', async () => {
@@ -691,7 +722,7 @@ describe('startSupplyCycle (e2e)', () => {
       expect(cycle.poolAccounts).toEqual(accounts);
     });
 
-    it('lists a set-aside pool once, whether it is stale at L, past L or neither, and not a set-aside pool it has no row or touch of', async () => {
+    it('lists a set-aside pool once, whether it is stale at L, past L or neither, and one it has no row or touch of', async () => {
       const ch = await fresh();
       await ready(ch);
       await ch.insert(Table.AmmPools, [
@@ -700,12 +731,14 @@ describe('startSupplyCycle (e2e)', () => {
       ]);
       await ch.insert(Table.AmmPoolTouches, [touch(4_000, acct(1)), touch(4_000, acct(2))]);
       const cycle = await start(ch, xrpl, sight(3_000, [acct(2), acct(1), acct(404)]));
-      expect(cycle.poolsAtStoredRow).toEqual([acct(1), acct(2)]);
+      // the runner names a pool it set aside: it is a pool of the cycle whether or not the tables hold a row or a touch of it
+      expect(cycle.poolsAtStoredRow).toEqual([acct(1), acct(2), acct(404)]);
+      expect(cycle.poolAccounts).toEqual([acct(1), acct(2), acct(404)]);
       expect(stepsOf(cycle, 'amm')).toEqual([]);
       expect(native(cycle)).toEqual([3_000_000n, 2]);
     });
 
-    it('a pool that is set aside and has a touch at L and no row is a pool of the cycle, and counts nothing', async () => {
+    it('a pool that is set aside and has a touch above the cursor and no row is a pool of the cycle, and counts nothing', async () => {
       const ch = await fresh();
       await ready(ch);
       await ch.insert(Table.AmmPoolTouches, [touch(4_000, acct(9))]);
@@ -713,6 +746,22 @@ describe('startSupplyCycle (e2e)', () => {
       expect(cycle.poolAccounts).toEqual([acct(9)]);
       expect(cycle.poolsAtStoredRow).toEqual([acct(9)]);
       expect(stepsOf(cycle, 'amm')).toEqual([]);
+    });
+
+    it('a pool the runner set aside before it ever had a row is named and left out of the reserves, though its cursor is past its touches', async () => {
+      const ch = await fresh();
+      await ready(ch, { head: L + 100 });
+      // the runner moves its cursor past a pool it sets aside: the touch is at or below the cursor, the pool has no row (it failed from
+      // its first rebuild), and nothing in the tables finds it; only the runner's list does
+      await ch.insert(Table.AmmPools, [pool(acct(1), { last_ledger: 4_400, reserve_base: '40' })]);
+      await ch.insert(Table.AmmPoolTouches, [touch(4_400, acct(1)), touch(4_000, acct(9))]);
+      for (const cursor of [4_500, L, L + 50]) {
+        const cycle = await start(ch, xrpl, sight(cursor, [acct(9)]));
+        expect([cursor, cycle.poolAccounts]).toEqual([cursor, [acct(1), acct(9)]]);
+        expect([cursor, cycle.poolsAtStoredRow]).toEqual([cursor, [acct(9)]]);
+        expect([cursor, stepsOf(cycle, 'amm')]).toEqual([cursor, []]);
+        expect([cursor, native(cycle)]).toEqual([cursor, [40_000_000n, 1]]);
+      }
     });
   });
 
@@ -905,9 +954,6 @@ describe('startSupplyCycle (e2e)', () => {
     const readsOf = (all: Logged[], table: Table): number[] =>
       all.filter((r) => r.tables.length === 1 && r.tables[0].endsWith(`.${table}`)).map((r) => r.read_rows);
 
-    const countOf = async (ch: ClickHouseService, sql: string, params: Record<string, unknown> = {}): Promise<number> =>
-      Number((await ch.queryOne<{ n: string }>(sql, params))?.n);
-
     /** The active parts of a table that hold a row where `where` is true: the only parts a read of those rows opens. */
     const partsWith = (
       ch: ClickHouseService,
@@ -997,11 +1043,11 @@ describe('startSupplyCycle (e2e)', () => {
           },
           Table.NetworkState,
         );
-        // the newest poll of the newest ledger at or before L, the later of the two
+        // the poll of the newest ledger at or before L
         expect([cycle?.reserveBase, cycle?.reserveInc]).toEqual([2_000_000n, 400_000n]);
         const reads = readsOf(all, Table.NetworkState);
         expect(reads.length).toBeGreaterThanOrEqual(1);
-        // the rows needed: the newest ledger (1 row), then its polls (2 rows)
+        // the rows needed: the newest ledger (1 row), then its poll (1 row), counted as 2
         const lookup = await bound(ch, Table.NetworkState, 2, 'ledger_index <= {l:UInt32}', { l: BL });
         for (const read of reads) expect(read).toBeLessThanOrEqual(lookup);
       });
