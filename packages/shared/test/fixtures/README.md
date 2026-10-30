@@ -436,9 +436,9 @@ sit beside them. `manifest.json` has the four cases under `cases.<name>` as `{le
 Xahau's first ledger, what `Import.cpp` credits, and the hand check of the invariant on each Import.
 
 The scans that exist (5,000 ledgers of `xahau/recorded`, 5,000 more in the account domains search) found no `Import`, and at about 5,000 ledgers a day a deeper scan is not an option, so the two Imports
-were found through accounts. The other `xahau/` directories name 1,531 accounts; 41 of them have an `AccountRoot` with `ImportSequence` in some transaction's metadata (only an account that
+were found through accounts. In the other `xahau/` directories, 41 accounts have an `AccountRoot` with `ImportSequence` in some transaction's metadata (only an account that
 imported has the field). `account_tx` with `forward: true` and `limit: 3` on each of the 41: 40 start with an `Import` that creates the account, the 41st
-(`rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`) with a `Payment`, then an `Import` into the existing account. `tx` confirmed the two chosen ones. 55 requests in all (my 47: 41 `account_tx`, 2 `tx`, 3
+(`rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`) with a `Payment`, then an `Import` into the existing account. `tx` confirmed the two chosen ones. 55 requests in all (47 by hand: 41 `account_tx`, 2 `tx`, 3
 `ledger_entry` and a `server_info`; the recorder's 8), one in flight at a time, mine 1.1 s apart and the recorder's with a pause of 1 s after each ledger and `tx` (its `server_info` and `server_definitions` at the start follow each other directly), none throttled. Recorded with:
 
 ```bash
@@ -454,13 +454,15 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endp
 | (its parent) | 24508586 | | For the invariant: 127 transactions in the child, one of them the `Import` |
 | `import-existing-account` | 2609053 | `3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE` | An `Import` of `rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`, which exists: `Fee` 100, `Balance` 1000000 to 999911 (minted 11) |
 | (its parent) | 2609052 | | For the invariant |
-| `claim-opt-out` (hand-made) | 26540187 | `3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C` | `26540187-opt-out.json`: the recorded ledger of `xahau/recorded` with the `ClaimReward`'s `Flags` set from 0 to 1 |
+| `claim-opt-out` (hand-made) | 26540187 | `3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C` | `26540187-opt-out.json`: the recorded ledger of `xahau/recorded` with the `ClaimReward`'s `Flags` set from 0 to 1 and its `Issuer` removed (an opt-out has none, xahaud `ClaimReward.cpp:124-129`) |
 | `genesis-mint-governance` (hand-made) | 26540188 | `E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D` | `26540188-governance.json`: the recorded ledger with the `GenesisMint`'s `EmitDetails.EmitParentTxnID` set to the recorded `Invoke` `DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D` (ledger 26540711 of `xahau/recorded`), which is no claim |
 
-The hand-made files are copies of ledgers that `xahau/recorded` holds for real, with the one edit named above and nothing else changed (the ledger hash and the transaction hashes are those of the real
+The hand-made files are copies of ledgers that `xahau/recorded` holds for real, with the edits named above (one for the governance mint, two for the opt-out claim) and nothing else changed (the ledger hash and the transaction hashes are those of the real
 ledger, not recomputed); their `note` in the manifest starts "hand-made:". They load beside the recorded ledgers (a file `<index>-<label>.json` is a ledger) and the directory has no recorded
-26540187 or 26540188, which would be a duplicate index; a test of the invariant that must not use them leaves them out by file name. **Not found** (nothing was searched for them under the bounds of one
-request at a time): a recorded `ClaimReward` with `tfOptOut`, a `GenesisMint` whose parent is no claim, an `Import` whose inner XRPL transaction is a `tec`, and an `AccountDelete` on Xahau
+26540187 or 26540188, which would be a duplicate index; a test of the invariant that must not use them leaves them out by file name (the manifest's `cases.<name>.file`).
+
+**Not found** (nothing was searched for them under the bounds of one
+request at a time): a recorded `ClaimReward` with `tfOptOut`, a `GenesisMint` whose parent is no claim, an `Import` whose inner XRPL transaction is a `tec`, an `Import` that creates an account with a burn credit above 0 (`ZeroB2M` is on at 24508587, so its credit is 0), and an `AccountDelete` on Xahau
 (its case was dropped, no task reads it); `FINDINGS.md` lists them.
 
 ### Account domains (`xrpl/account-domains/`)
