@@ -1,7 +1,8 @@
 -- =============================================================================
 -- GateHub Data API: the supply (D7, spec 2026-10-24-supply-design.md section 1). Additive to 001_baseline.sql, one
--- database per network. Required before the syncer of this release (its writer inserts into the three ledger tables on
--- every ledger, and deletes from them on recovery and --reprocess) and before the api.
+-- database per network. Required before the syncer of this release (on Xahau its writer inserts into the three ledger
+-- tables whenever a ledger holds a GenesisMint, an Import or a ClaimReward, and an insert into a missing table fails the
+-- batch) and before the api.
 --
 -- genesis_mints, imports and reward_claims are ledger-derived, written by ingest with the ledger's other rows from
 -- parser version 9 on (MINT_PARSER_VERSION). They are the three ways Xahau mints native coins outside a payment, and they

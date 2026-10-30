@@ -360,10 +360,11 @@ describe('LedgerWriter and ingest state (e2e)', () => {
   }
 
   /**
-   * One row in each AMM and NFT ledger table, in `account_domains`, in the two object tables, in `state_touches` and in the three
-   * mint tables, for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no such activity (but for two rows of `account_domains` in the
-   * last one), so the delete tests put these in by hand, over several partitions, to see what the deletes reach and what
-   * they leave. `expectedCounts` and `expectStored` take them as `seeded`.
+   * One row in each AMM and NFT ledger table, in `account_domains`, in the two object tables, in `state_touches` and in
+   * the three mint tables, for every one of `rows`' ledgers. The ripple-mock ledgers (2021) have no such activity (but
+   * for two rows of `account_domains` in the last one), so the delete tests put these in by hand, over several
+   * partitions, to see what the deletes reach and what they leave. `expectedCounts` and `expectStored` take them as
+   * `seeded`.
    */
   async function insertSeededRows(svc: ClickHouseService, rows: LedgerRows[]): Promise<void> {
     for (const table of SEEDED_LEDGER_TABLES)

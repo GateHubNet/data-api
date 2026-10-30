@@ -921,12 +921,15 @@ describe('migrations (e2e)', () => {
         expect(row?.engine_full).toContain('ttl_only_drop_parts = 1');
       });
 
-      it('keeps validator_seen, the votes and the tallies for ever', async () => {
+      it('keeps validator_seen, the votes, the tallies and network_supply (spec decision 9) for ever', async () => {
         const kept = await svc.query<{ name: string; create_table_query: string }>(
           `SELECT name, create_table_query FROM system.tables WHERE database = {db:String} AND name IN {names:Array(String)}`,
-          { db: 'xahau', names: [Table.ValidatorSeen, Table.ValidatorVotes, Table.AmendmentTallies] },
+          {
+            db: 'xahau',
+            names: [Table.ValidatorSeen, Table.ValidatorVotes, Table.AmendmentTallies, Table.NetworkSupply],
+          },
         );
-        expect(kept).toHaveLength(3);
+        expect(kept).toHaveLength(4);
         for (const t of kept)
           expect({ table: t.name, ttl: /\bTTL\b/.test(t.create_table_query) }).toEqual({ table: t.name, ttl: false });
       });
@@ -2118,9 +2121,10 @@ describe('migrations (e2e)', () => {
             at(-20, 100, { minted_rewards: null, minted_import: null, minted_genesis: null }),
           ]);
           await svc.insert(Table.NetworkSupply, [at(-10, 9_000, { amm: null })]);
-          // a cycle redone at the same ledger writes the same key under a newer version
-          await svc.insert(Table.NetworkSupply, [at(0, 1_000)]);
+          // a cycle redone at the same ledger writes the same key under a newer version: the newer one goes in first
+          // here, so that it is the version and not the last insert that wins, in the read below and in the merge after
           await svc.insert(Table.NetworkSupply, [at(0, 2_000, { reserve_base: null, reserve_inc: null })]);
+          await svc.insert(Table.NetworkSupply, [at(0, 1_000)]);
 
           expect(
             await svc.queryOne(
