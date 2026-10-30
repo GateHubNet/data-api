@@ -16,6 +16,7 @@ ignores everything else in the directory (`manifest.json`, `server_info.json`, `
 | `xahau/uritoken/`              | Xahau URIToken and Remit transactions, one ledger per named case (see below).           |
 | `xrpl/objects/`                | Mainnet escrow, check, payment channel and delegation cases (see below).                |
 | `xahau/objects/`               | Xahau escrow, check and payment channel cases (see below).                              |
+| `xahau/mint/`                  | Xahau Imports with their parent ledgers, and two hand-made mint ledgers (see "Xahau minting"). |
 | `xahau/recorded/`              | Xahau mainnet ledgers recorded from a public node (see below).                          |
 | `xrpl-testnet/recorded/`       | XRPL Testnet ledgers recorded from a public testnet node (see below).                   |
 | `xahau-testnet/recorded/`      | Xahau Testnet ledgers recorded from a public testnet node (see below).                  |
@@ -37,7 +38,7 @@ Each `<index>.json.gz` is the full `result` of the rippled API v1 request
 - `server_info.json`: the node's `server_info` result at recording time.
 - `manifest.json`: endpoint, validated head, number of ledgers scanned, which wanted types were found (ledger and
   transaction hash) and which were not, and the recorded `ledgers`. `--txs` runs add a `txs` map (hash to
-  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/`, `xahau/objects/` and `xrpl/state-touches/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
+  `{ledger, type, result}`). `xrpl/amm/`, `xrpl/path-payments/`, `xrpl/nft/`, `xahau/uritoken/`, `xrpl/account-domains/`, `xrpl/objects/`, `xahau/objects/`, `xahau/mint/` and `xrpl/state-touches/` also have a hand-written `cases` object (case name to `{ledger, hash, type, note}`).
 
 ### Re-recording
 
@@ -425,6 +426,42 @@ pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endp
 | `channel_claim_token` | 11083603 | `8A6812049815D9A8D9B582BA682AD18A4ADB5C049412978CEBA0F8E56AC4A037` | The first claim of that channel: two trust lines move |
 
 Every case of the set was found. Xahau has no conditional escrow among its 198 live ones (none has a `Condition`), no MPT and no `Delegate`, so the set has none.
+
+### Xahau minting (`xahau/mint/`)
+
+For the supply parsers (`genesis_mints`, `imports`, `reward_claims`) and the invariant of the supply spec (F2: per ledger, Σ minted = Δ`total_coins` + `fee_total`, which needs
+a ledger and its parent). Recorded 2026-10-30 from `wss://xahau.network` (xahaud 2026.10.13-release+4119, network id 21337; validated head 26905635) with `--txs` and
+`--ledgers` and `--delay-ms 1000`, one request at a time, and no `--want` scan (`scanned` 0): 4 ledgers, 345 KB gzipped (largest 191 KB, ledger 24508587). Two hand-made ledgers
+sit beside them. `manifest.json` has the four cases under `cases.<name>` as `{ledger, hash, type, note}` (the hand-made two also name their `file`); `FINDINGS.md` has the opt-out bit,
+Xahau's first ledger, what `Import.cpp` credits, and the hand check of the invariant on each Import.
+
+The scans that exist (5,000 ledgers of `xahau/recorded`, 5,000 more in the account domains search) found no `Import`, and at about 5,000 ledgers a day a deeper scan is not an option, so the two Imports
+were found through accounts. The other `xahau/` directories name 1,531 accounts; 41 of them have an `AccountRoot` with `ImportSequence` in some transaction's metadata (only an account that
+imported has the field). `account_tx` with `forward: true` and `limit: 3` on each of the 41: 40 start with an `Import` that creates the account, the 41st
+(`rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`) with a `Payment`, then an `Import` into the existing account. `tx` confirmed the two chosen ones. 55 requests in all (my 47: 41 `account_tx`, 2 `tx`, 3
+`ledger_entry` and a `server_info`; the recorder's 8), one in flight at a time, mine 1.1 s apart and the recorder's with a pause of 1 s after each ledger and `tx` (its `server_info` and `server_definitions` at the start follow each other directly), none throttled. Recorded with:
+
+```bash
+pnpm --filter @gatehub/data-api-shared record:fixtures -- --network xahau --endpoint wss://xahau.network \
+  --out test/fixtures/xahau/mint --delay-ms 1000 \
+  --txs A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843,3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE \
+  --ledgers 24508586,2609052
+```
+
+| Case | Ledger | Transaction | What it shows |
+| --- | --- | --- | --- |
+| `import-creates-account` | 24508587 | `A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843` | The first `Import` of `rBPKXGERk7KrzZDGXscchv4eQoS2k6nV6M`: `Fee` 0, a `CreatedNode` `AccountRoot` with `Balance` 2000000 (the starting bonus) |
+| (its parent) | 24508586 | | For the invariant: 127 transactions in the child, one of them the `Import` |
+| `import-existing-account` | 2609053 | `3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE` | An `Import` of `rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge`, which exists: `Fee` 100, `Balance` 1000000 to 999911 (minted 11) |
+| (its parent) | 2609052 | | For the invariant |
+| `claim-opt-out` (hand-made) | 26540187 | `3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C` | `26540187-opt-out.json`: the recorded ledger of `xahau/recorded` with the `ClaimReward`'s `Flags` set from 0 to 1 |
+| `genesis-mint-governance` (hand-made) | 26540188 | `E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D` | `26540188-governance.json`: the recorded ledger with the `GenesisMint`'s `EmitDetails.EmitParentTxnID` set to the recorded `Invoke` `DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D` (ledger 26540711 of `xahau/recorded`), which is no claim |
+
+The hand-made files are copies of ledgers that `xahau/recorded` holds for real, with the one edit named above and nothing else changed (the ledger hash and the transaction hashes are those of the real
+ledger, not recomputed); their `note` in the manifest starts "hand-made:". They load beside the recorded ledgers (a file `<index>-<label>.json` is a ledger) and the directory has no recorded
+26540187 or 26540188, which would be a duplicate index; a test of the invariant that must not use them leaves them out by file name. **Not found** (nothing was searched for them under the bounds of one
+request at a time): a recorded `ClaimReward` with `tfOptOut`, a `GenesisMint` whose parent is no claim, an `Import` whose inner XRPL transaction is a `tec`, and an `AccountDelete` on Xahau
+(its case was dropped, no task reads it); `FINDINGS.md` lists them.
 
 ### Account domains (`xrpl/account-domains/`)
 

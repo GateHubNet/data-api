@@ -1,0 +1,76 @@
+{
+  "network": "xahau",
+  "endpoint": "wss://xahau.network",
+  "recorded_at": "2026-10-30T13:27:15.140Z",
+  "validated_head": 26905635,
+  "scan_limit": 0,
+  "scanned": 0,
+  "skipped": [],
+  "any_result": false,
+  "complete": true,
+  "server_definitions": true,
+  "found": {},
+  "missing": [],
+  "txs": {
+    "A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843": {
+      "ledger": 24508587,
+      "type": "Import",
+      "result": "tesSUCCESS"
+    },
+    "3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE": {
+      "ledger": 2609053,
+      "type": "Import",
+      "result": "tesSUCCESS"
+    }
+  },
+  "ledgers": [
+    {
+      "ledger": 2609052,
+      "bytes": 3154,
+      "gzipBytes": 1355
+    },
+    {
+      "ledger": 2609053,
+      "bytes": 87464,
+      "gzipBytes": 27351
+    },
+    {
+      "ledger": 24508586,
+      "bytes": 523198,
+      "gzipBytes": 124748
+    },
+    {
+      "ledger": 24508587,
+      "bytes": 725562,
+      "gzipBytes": 191172
+    }
+  ],
+  "cases": {
+    "import-creates-account": {
+      "ledger": 24508587,
+      "hash": "A7390ED8A8CDC6F66D49B1B0CD09B88FF4AC9E2AC6F6C5973AA39B793FD01843",
+      "type": "Import",
+      "note": "rBPKXGERk7KrzZDGXscchv4eQoS2k6nV6M: the first Import of the account creates its AccountRoot (CreatedNode, Balance 2000000, the starting bonus; Fee 0). Parent ledger 24508586 is recorded for the invariant."
+    },
+    "import-existing-account": {
+      "ledger": 2609053,
+      "hash": "3952439762C5B9B5E30113FE089C2BCE8C51A7DA1C998C0E3B8D65B79D8E20CE",
+      "type": "Import",
+      "note": "rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge: an Import into an account that already existed (ModifiedNode, Balance 1000000 to 999911, Fee 100, so minted 11); its first transaction was a Payment in ledger 2608942, 111 ledgers earlier. Parent ledger 2609052 is recorded for the invariant."
+    },
+    "claim-opt-out": {
+      "ledger": 26540187,
+      "hash": "3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C",
+      "type": "ClaimReward",
+      "file": "26540187-opt-out.json",
+      "note": "hand-made: the recorded ClaimReward of xahau/recorded 26540187 with Flags set from 0 to 1 (tfOptOut); nothing else changed, so the Issuer is still there, which xahaud would refuse as temMALFORMED for an opt-out (ClaimReward.cpp:125-129) and the parser does not look at. The file is a copy of that ledger; xahau/recorded keeps the real one."
+    },
+    "genesis-mint-governance": {
+      "ledger": 26540188,
+      "hash": "E8264F11B5CDD9844BFCF3C5CDFE99B5F7EBB91B3723C2CC8A1680FAD86EB22D",
+      "type": "GenesisMint",
+      "file": "26540188-governance.json",
+      "note": "hand-made: the recorded GenesisMint of xahau/recorded 26540188 with EmitDetails.EmitParentTxnID set from its ClaimReward (3A1F25CD...) to the recorded Invoke DE1FEAEA69ABF97EA8D95341A6C9B79094746CD8F35C0557583BB986867BB48D (ledger 26540711 of xahau/recorded), which is no claim; nothing else changed. The file is a copy of that ledger; xahau/recorded keeps the real one."
+    }
+  }
+}
