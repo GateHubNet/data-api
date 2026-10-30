@@ -69,6 +69,7 @@ export * from './aggregate/nft-state.job';
 export * from './aggregate/pair-hourly.job';
 export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
+export * from './aggregate/supply';
 export * from './aggregate/token-rules';
 export * from './aggregate/tokens.job';
 export * from './aggregate/volume.job';
@@ -84,6 +85,7 @@ export * from './query/newest-page';
 export * from './query/nft-prices';
 export * from './query/parser-coverage';
 export * from './query/rates.service';
+export * from './query/supply';
 export * from './query/valuation';
 
 // Utils

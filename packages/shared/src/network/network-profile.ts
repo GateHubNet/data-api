@@ -66,6 +66,18 @@ export interface NetworkProfile {
    * the XRP Ledger and its testnet do; Xahau has no such amendment. The key is in every profile.
    */
   readonly hasDelegation: boolean;
+  /**
+   * Whether the network has automated market makers (the `AMM` ledger object and its transactions): the XRP Ledger and its
+   * testnet do; Xahau does not. The supply counts the native currency held by pools only where this is true. The key is in
+   * every profile.
+   */
+  readonly hasAmm: boolean;
+  /**
+   * Whether the network creates native currency after its genesis (`GenesisMint`, `Import` and the balance rewards of
+   * `ClaimReward`): Xahau and its testnet do; the XRP Ledger mints nothing, its supply only falls. The supply reads the mints
+   * only where this is true. The key is in every profile.
+   */
+  readonly hasMinting: boolean;
   /** The node software of the network: it decides how `server_version` is decoded. */
   software: 'rippled' | 'xahaud';
   /** Where a validator's domain publishes its TOML file. */
@@ -122,6 +134,8 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     partialPaymentFixLedger: 4594094,
     firstLedger: 32570,
     hasDelegation: true,
+    hasAmm: true,
+    hasMinting: false,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     tomlNetworkNames: ['main', 'mainnet'],
@@ -147,6 +161,8 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     partialPaymentFixLedger: 0,
     firstLedger: 1,
     hasDelegation: false,
+    hasAmm: false,
+    hasMinting: true,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
@@ -172,6 +188,8 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     partialPaymentFixLedger: 0,
     firstLedger: undefined,
     hasDelegation: true,
+    hasAmm: true,
+    hasMinting: false,
     software: 'rippled',
     tomlPath: '/.well-known/xrp-ledger.toml',
     tomlNetworkNames: ['testnet'],
@@ -207,6 +225,8 @@ const PROFILES: Record<NetworkName, NetworkProfile> = {
     partialPaymentFixLedger: 0,
     firstLedger: undefined,
     hasDelegation: false,
+    hasAmm: false,
+    hasMinting: true,
     software: 'xahaud',
     tomlPath: '/.well-known/xahau.toml',
     tomlNetworkNames: ['testnet', '21338'],

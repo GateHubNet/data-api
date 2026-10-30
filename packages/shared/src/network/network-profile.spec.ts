@@ -41,6 +41,8 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       partialPaymentFixLedger: 4594094,
       firstLedger: 32570,
       hasDelegation: true,
+      hasAmm: true,
+      hasMinting: false,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       tomlNetworkNames: ['main', 'mainnet'],
@@ -66,6 +68,8 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       partialPaymentFixLedger: 0,
       firstLedger: 1,
       hasDelegation: false,
+      hasAmm: false,
+      hasMinting: true,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       tomlNetworkNames: ['main', 'mainnet', 'xahau', '21337'],
@@ -91,6 +95,8 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       partialPaymentFixLedger: 0,
       firstLedger: undefined,
       hasDelegation: true,
+      hasAmm: true,
+      hasMinting: false,
       software: 'rippled',
       tomlPath: '/.well-known/xrp-ledger.toml',
       tomlNetworkNames: ['testnet'],
@@ -116,6 +122,8 @@ const FOUR: [NetworkName, Omit<NetworkProfile, 'definitionsFallback'>][] = [
       partialPaymentFixLedger: 0,
       firstLedger: undefined,
       hasDelegation: false,
+      hasAmm: false,
+      hasMinting: true,
       software: 'xahaud',
       tomlPath: '/.well-known/xahau.toml',
       tomlNetworkNames: ['testnet', '21338'],
@@ -230,6 +238,20 @@ describe('network profiles', () => {
 
     it('hasDelegation is true on xrpl and its testnet and false on Xahau and its testnet', () => {
       expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasDelegation)).toEqual([true, false, true, false]);
+    });
+
+    it('says which networks have AMM and which mint', () => {
+      // NETWORK_NAMES order: xrpl, xahau, xrpl-testnet, xahau-testnet
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasAmm)).toEqual([true, false, true, false]);
+      expect(NETWORK_NAMES.map((n) => getNetworkProfile(n).hasMinting)).toEqual([false, true, false, true]);
+    });
+
+    it('has the hasAmm and hasMinting keys on all four profiles', () => {
+      for (const name of NETWORK_NAMES) {
+        for (const key of ['hasAmm', 'hasMinting']) {
+          expect(Object.prototype.hasOwnProperty.call(getNetworkProfile(name), key)).toBe(true);
+        }
+      }
     });
 
     it('defaults to xrpl when GH_NETWORK is unset', () => {
