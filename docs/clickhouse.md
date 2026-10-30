@@ -147,7 +147,7 @@ reduce windows, and filtered `balance_changes`. They are bounded by the guards a
 
 The API and the syncer use the **same ClickHouse user** (`data_api`, a full-access user that the compose creates); a read-only
 user for the API would be better and is a known hardening gap ([security](security.md#10-security-checklist)).
-**If the syncer's access is ever narrowed, it needs `ALTER ... DROP PARTITION` on `token_lines` and `tokens`** (and, for the ledger tables' recovery and retention, the privileges it has today): the `tokens` job swaps the issued tokens
+**If the syncer's access is ever narrowed, it needs `ALTER DELETE` on `token_lines` and `tokens`** (the privilege that `ALTER TABLE ... DROP PARTITION` asks for) (and, for the ledger tables' recovery and retention, the privileges it has today): the `tokens` job swaps the issued tokens
 in whole generations, each a partition (`PARTITION BY generation`), and drops a retired generation's partitions 15 minutes after it was replaced ([syncer](syncer.md#the-tokens-job), [ADR-0019](adr/0019-issued-tokens-from-state-history.md)).
 Without the privilege the drop fails (a wait that doubles up to an hour), the retired partitions stay and the disk grows by one generation at each rebuild; nothing else is affected.
 

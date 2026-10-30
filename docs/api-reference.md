@@ -4695,7 +4695,7 @@ The row of a token:
 **Listed.** A token is `listed` when the toml of the issuer's own account domain has a `[[CURRENCIES]]` entry that counts on this network, names the token's issuer and has the token's
 code: two-way, the account and its domain, and the domain's toml and the account. An entry in another domain's toml does not list the token. The tomls are those the `tomls` worker
 fetched ([Account names and tomls](#account-names-and-tomls)). A change of one shows after the worker has read it again (its own schedule) and the sweep of the `tokens` job has met the token: within
-tens of minutes on the XRP Ledger, not at once ([operations](operations.md#issued-tokens)).
+tens of minutes on the XRP Ledger (an estimate, not a measurement), not at once ([operations](operations.md#issued-tokens)).
 
 **No generation.** `{"result":"success","coverage":{…},"kind":"issued","count":0,"tokens":[]}`, with the keys of the list that it has:
 
@@ -4740,7 +4740,7 @@ One issued token as of the ledger of the live generation. No CSV.
 - `holders` and `trust_lines` are those of the token's own row, as the list shows them.
 - `toml_url?` is `https://{domain}{path}` of the toml of the issuer's domain (`/.well-known/xrp-ledger.toml`, `/.well-known/xahau.toml` on Xahau), there whenever `domain` is, listed or not.
 - `toml?` is what the toml says of the token: `name`, `desc`, `icon`, `symbol`, `display_decimals` (a whole number 0 to 30), `asset_class`, `asset_subclass` and `attestation`, each as the toml gives
-  it (text), the fields of the xrp-ledger.toml reference and of the XLS-26 draft; others are not served, and a URL among them is text, never fetched. Left out when the token is not listed.
+  it (text), the fields of the xrp-ledger.toml reference and of the XLS-26 draft; others are not served, and a URL among them is text, never fetched. Left out when the token is not listed, and when the listed entry has none of these fields.
 - `issuer_settings?` are the settings of the issuer's account as of the ledger: `transfer_fee` (a percent, exact: a `TransferRate` of 1,002,000,000 is `"0.2"`, and none is `"0"`), and the flags
   by the names of the network (the XRP Ledger and Xahau number the bits differently; `AllowTrustLineClawback` is `0x80000000` on the first and `0x1000` on Xahau): `global_freeze`,
   `no_freeze`, `allow_trust_line_clawback`, `require_auth`, `default_ripple`. **Left out while the issuer has no row in the state tables** (its settings are unknown, not off).
@@ -4915,7 +4915,8 @@ The accounts that hold the token, the largest balance first.
 | `marker` | | |
 | `format` | json | `csv`: file `<code or currency> <issuer> - holders.csv` (the same for every spelling of the token), the holders flattened, without `coverage`, `supply` and the counts. |
 
-The lines of the token with a balance above 0, ordered by balance descending, then by holder. The marker is `(balance, holder)` of the last row. `rank` is the holder's place among **all** the
+The lines of the token with a balance above 0, ordered by balance descending, then by holder. The order is made on the balance as a double (a `Float64`), not on its exact text: two balances that are different
+texts and the same double (`9007199254740992` and `9007199254740993`) are tied and come in the order of their holders, and the marker is that double and the holder of the last row. `rank` is the holder's place among **all** the
 holders. `supply` is the token's, `limit` the holder's limit (exact text), `frozen` and `authorized` the issuer's freeze and authorization of the line, and `share` as above.
 
 ```json

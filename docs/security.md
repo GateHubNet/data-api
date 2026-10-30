@@ -188,7 +188,7 @@ Production compose (`docker-compose.prod.yaml`):
 - **Load-test override.** `docker-compose.prod.override.yaml` publishes ClickHouse on the host for seeding; never use it in production.
 - **Dev compose:** everything is published on `127.0.0.1` only, and the dev API key is `dev-api-key`.
 - **ClickHouse users:** a dedicated `data_api` user (access management enabled), not `default`. The api and the syncers share it
-  (full access); a read-only user for the api would be better. **A narrower user for the syncer still needs `ALTER ... DROP PARTITION` on `token_lines` and `tokens`**: the `tokens` job drops the
+  (full access); a read-only user for the api would be better. **A narrower user for the syncer still needs `ALTER DELETE` on `token_lines` and `tokens`** (the privilege that `ALTER TABLE ... DROP PARTITION` asks for): the `tokens` job drops the
   partitions of a retired generation (the number is made by the job and checked as an integer, the one statement that takes no bound parameter; [clickhouse](clickhouse.md), [syncer](syncer.md#the-tokens-job)).
 
 ### Outbound HTTPS to arbitrary public hosts (syncer)

@@ -481,12 +481,16 @@ which starts at the first ledger of the network (32,570 on the XRP Ledger, 1 on 
 
 **What a re-ingest does to the tokens.**
 - **Filling the state tables further back** moves the state coverage start, and the job builds a **new generation** by itself (its `coverage_from` is no longer the start): the pass over the wider
-  `trust_line_states`, hours, with the live generation serving until it is promoted ([operations](operations.md#issued-tokens)).
+  `trust_line_states`, an hour to a few hours, with the live generation serving until it is promoted ([operations](operations.md#issued-tokens)). **Do not fill the history while the first generation is
+  building**: a generation is promoted only if the coverage start is still the one it was built on, and the job retires a building generation whose start has moved (the oldest stored ledger when no ledger of a
+  parser older than 3 is stored, else one above the newest of them) and starts another from the first account, at every housekeeping (about every ten minutes). A fill that keeps writing ledgers below the oldest stored one
+  therefore restarts a first build every ten minutes until it ends; finish the fill first, or expect the restarts (the log says `tokens: generation N was stale while it built; it is retired`). Only the building
+  generation restarts: the live one keeps serving.
 - **A `--reprocess` of a range** writes the touches of its ledgers, as for every table, and marks its hours in `agg_dirty`. Each slice's **`tokens` hook**, the last of the hooks, lowers the `repair_from` of the live and the
   building generation to the slice's first ledger, and the job applies the touches of `[repair_from, through_ledger]` again, 500 ledgers a window, reading the state at `through_ledger` (a line changed in the range
   and again later keeps its later state). A window that meets a ledger written by an **older parser** (one without touches) ends the repair and marks a **rebuild**: a new generation is built from the state
   tables beside the live one and swapped in, which is how the **program's one reprocess**, over the whole history after its last parser version (about **108 million ledgers, 216,000 windows of 500**), reaches the tokens.
-  The rebuild is hours, once at a time; expect more than one while a reprocess runs from the oldest ledger up, because the repair keeps reaching ledgers not yet reprocessed ([operations](operations.md#issued-tokens)).
+  The rebuild is an hour to a few hours, once at a time; expect more than one while a reprocess runs from the oldest ledger up, because the repair keeps reaching ledgers not yet reprocessed ([operations](operations.md#issued-tokens)).
 - **The testnets** get no backfill, and their tokens stay `complete: false`.
 
 **Prerequisites for the listing.** A token is `listed`, and has a `domain`, only when the issuer's account domain is known and its toml was read: seed `account_domains` from the state history first

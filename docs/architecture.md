@@ -14,7 +14,8 @@ exporter and a shared library. This page explains the moving parts; the reasons 
  │ syncer (apps/syncer) — ONE per network                            │
  │   ingest ─ LiveRunner (live + catch-up)   range-ingest CLI        │
  │   validations ─ collector      fee_stats ─ poller                 │
- │   aggregator ─ stats, volumes, AMM pools, rates, markets, rollups │
+ │   aggregator ─ stats, volumes, AMM, rates, markets, rollups,      │
+ │                escrows, issued tokens                             │
  │   validators ─ UNL lists, domains (HTTPS), votes, agreement       │
  │   tomls ─ the toml of every domain accounts name (HTTPS)          │
  └──────────────────────────────┬────────────────────────────────────┘
@@ -241,7 +242,8 @@ views. See [clickhouse](clickhouse.md).
    aggregates (`amm_pools`, `amm_daily`) from the append-only AMM ledger tables and the NFT aggregates (`nfts`, `account_nfts`, `nft_collections`,
    `nft_collection_holders`) from the append-only NFT ledger tables, and keeps the account and market
    aggregates (daily native rates, `pair_hourly` and `markets_live` from `exchanges`, rollups of heavy accounts from `balance_changes`,
-   `account_transactions` and `account_exchanges`); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
+   `account_transactions` and `account_exchanges`), the escrowed total from `object_changes`, and the issued tokens (`token_generations`, `token_lines`, `tokens`: generations built from `trust_line_states`, `account_states` and the
+   `state_touches` index, swapped whole); the `validators` worker fetches the validator lists and the domains' TOML files, polls the node's amendment state, and computes the voting
    rounds and the hourly agreement from `validations` and `ledgers`.
 5. Crashes recover from the database alone: re-read the checkpoint, delete the uncommitted tail, carry on
    ([syncer](syncer.md#checkpoint-boot-and-recovery)).

@@ -245,7 +245,7 @@ next tick drains the queue. (5) `SYSTEM STOP MERGES` on `xrpl.escrows` stops the
 
 ### `/v2/tokens` lists nothing, a token answers 404, a token is not `listed`, or `syncer_tokens_lag_ledgers` is high
 **Nothing is listed (`"count": 0, "tokens": []`) and a token is 404 `token not found`.** Four causes, in the order to look. (1) **No generation is live yet**: a new database, or a first build under way
-(hours on a full XRP Ledger history). `syncer_tokens_live` is 0; `syncer_tokens_building` 1 with `tokens: generation N: the account pass is at <account> ...` in the log is the build, 0 and nothing
+(an hour to a few hours on a full XRP Ledger history). `syncer_tokens_live` is 0; `syncer_tokens_building` 1 with `tokens: generation N: the account pass is at <account> ...` in the log is the build, 0 and nothing
 logged is a job that does not run (the `aggregator` worker is off, or the first run failed: look for `Aggregator job tokens failed`). (2) **The token has no counting line, or its lines have not changed since the
 coverage starts**: the answer's `coverage` has `"complete": false` until the state tables are whole from ledger 32,570 (`SELECT maxOrNull(ledger_index) FROM xrpl.ledgers WHERE parser_version < 3` is the
 newest ledger the state tables lack), and a line that has not changed since `from_ledger_index` is not known ([backfill](backfill.md#account-state-history-re-ingest)). Filling the history builds a new generation by itself.
@@ -257,7 +257,9 @@ issuer that counts on this network (`network` empty or the network's name). A ch
 **`syncer_tokens_lag_ledgers` is high or stays still.** The gauge follows the head also while the job's steps fail; a database that is down freezes it, so read it with
 `rate(syncer_aggregator_errors_total{job="tokens"}[15m])`. Causes: a step that fails (a window, a batch, a rebuild check: `Aggregator job tokens failed...`, and after two in a row it waits 5 minutes,
 doubling to an hour), a window of a heavy ledger (a few seconds: it halves itself and the lag falls once it is applied), a reprocess whose repair is under way (`syncer_tokens_repair_ledgers` above 0), or a
-generation marked stale whose replacement is still building (`syncer_tokens_building` 1: the live one serves meanwhile, with its last `through_ledger`).
+generation marked stale whose replacement is still building (`syncer_tokens_building` 1: the live one serves meanwhile, with its last `through_ledger`). **A build that never ends** and a log line every ten minutes saying
+`tokens: generation N was stale while it built; it is retired` is a coverage start that keeps moving (a history fill below the oldest stored ledger, or a rewrite of the newest ledger of a parser older than 3, is under way):
+the job starts the build again from the first account at each housekeeping. Finish the fill; the next build runs to the end ([backfill](backfill.md#issued-tokens-re-ingest)).
 
 ### `agg_dirty` does not drain: the tokens hook fails
 **Symptom:** `SELECT count() FROM xrpl.agg_dirty` does not fall, `syncer_aggregator_errors_total{job="tokens_dirty"}` rises at each tick, and the log has `Aggregator job tokens_dirty failed in <from> - <to>: ...`

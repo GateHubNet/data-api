@@ -487,7 +487,7 @@ original did not have. **No route of the original is removed or changes the shap
     names of the network; left out while the issuer has no row in the state tables), `markets` (the pairs of the `day` set turned so that the token is the base, at most 20) and `last_ledger`.
     No CSV.
 99. **Holders.** The counting lines with a balance above 0 by balance descending, then holder, with `rank` over the whole list on every page (so a page costs the token's whole prefix), `share` (the balance
-    over the supply, 6 decimals, half up), `limit`, `frozen` and `authorized`. The marker is `(balance, holder)`. CSV file `<code or currency> <issuer> - holders.csv`.
+    over the supply, 6 decimals, half up), `limit`, `frozen` and `authorized`. The order and the marker are made on the balance as a double (balances of the same double are tied and come by holder), so the marker is that double and the holder of the last row. CSV file `<code or currency> <issuer> - holders.csv`.
 100. **Transfers and `/v2/payments`.** The same payments from the same table in the same order, window and paging as [`/v2/payments/{currency}`](../api-reference.md#get-v2paymentscurrency), with its
     messages (`start`, `end`, `descending`, `limit`, `marker`): the successful `Payment` transactions between two different accounts that delivered the token (**a payment to oneself is not a
     transfer**, as item 66 has it, and is a path payment), in a smaller row with the delivered amount as `amount`. The list does not look the token up: there is **no 404** for a token nobody was

@@ -796,7 +796,9 @@ never cut inside, so the last one of a run can end past the budget) and the part
    above 0, written into the generation row with `holders_ledger` = its `through_ledger` (the list leaves `totals.holders` out while it is 0). The sweep compares every live token's listing
    (`domain`, `listed`, `name`, `toml`) with the issuer's current account domain and D4's store of tomls, and rewrites the rows that differ, in **resumable steps** of `TOKENS_STATE_CHUNK` tokens
    from a cursor kept in memory (a sweep the budget cut goes on at the next housekeeping, and one that read the last token starts over): a toml change shows within **tens of minutes** on the XRP
-   Ledger, after the `tomls` worker has read it, not within ten.
+   Ledger, after the `tomls` worker has read it, not within ten (derived from the housekeeping cadence and the step size, not measured; the cost of a sweep step was not measured). The check also **retires a building
+   generation whose `coverage_from` is no longer the state coverage start and starts another**, at every housekeeping: a start that keeps moving (a history fill below the oldest stored ledger under way) restarts the build
+   every ten minutes, and a first build never ends under it ([operations](operations.md#issued-tokens)).
 5. **The generation that builds**, one at a time: a row `building` with `head_ledger` = the head, then the **account pass** (`nextPassAccounts`: the next 500 accounts of `trust_line_states` in key order, by a `GROUP BY` read that
    stops after the batch; `writePassLines`: one server-side `INSERT … SELECT` of the newest row of each line of those accounts at or before `head_ledger`, from the account's side as the issuer; then the
    `tokens` rows of those issuers, matched with the tomls), the cursor (`account_cursor`) moving after each batch; then the touches after `head_ledger` as in 2; then its **promotion** once the pass is
@@ -822,7 +824,7 @@ never cut inside, so the last one of a run can end past the budget) and the part
   ([observability](observability.md#4-metrics-syncer)). The alert is `syncer_tokens_lag_ledgers > 300` for 15 minutes, paired with `rate(syncer_aggregator_errors_total{job="tokens"}[15m])`
   ([observability](observability.md#recommended-alerts)); `syncer_tokens_live` gates the explorer's `TOKENS` switch.
 - **The cost.** A pass batch of 500 accounts is a key range of `trust_line_states` and a server-side insert, tens of milliseconds on a table of a million lines; an issuer with millions of lines is one statement of
-  seconds that the pass does not split; a window of a minute of the XRP Ledger is a few thousand lines and a few hundred tokens. The figures measured on synthetic data, and the estimate of the first
+  seconds that the pass does not split; a window of a minute of the XRP Ledger (about 15 ledgers, about 500 touches at the 33 a ledger measured on the recorded ledgers) is a few hundred lines and tokens. The figures measured on synthetic data, and the estimate of the first
   build on the XRP Ledger, are in [operations](operations.md#issued-tokens).
 
 **Metrics.** The four gauges above, and `syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the labels `tokens` and `tokens_dirty`. A job that keeps failing logs `Aggregator job tokens failed...: ...`; the

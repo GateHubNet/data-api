@@ -35,7 +35,7 @@ issuer's toml says of it, its biggest holders and its recent transfers. The inde
    live generation is kept current from the touches of each window, and a **change of the rules, of the coverage, or a window met in an older parser starts a new generation**
    beside it. It is promoted once it has caught up (a `live` row for it, then a `retired` row for the old one), readers switch at the first row, and the old partitions are dropped 15
    minutes later. Every read names its generation, so a generation is one unit, never mixed with another. A generation is a partition (`PARTITION BY generation`) so that **dropping a
-   retired one is `ALTER TABLE … DROP PARTITION`**, which is why the syncer's ClickHouse user needs that privilege on `token_lines` and `tokens` (today the full-access `data_api` user has it).
+   retired one is `ALTER TABLE … DROP PARTITION`**, which is why the syncer's ClickHouse user needs `ALTER DELETE` (the privilege that statement asks for) on `token_lines` and `tokens` (today the full-access `data_api` user has it).
    A version is the runner's clock in milliseconds, above any stored one, and readers keep the newest row of each key (`LIMIT 1 BY`, never `FINAL`).
 4. **A re-ingest reaches the job through `agg_dirty`.** The hook (the last of `hooksOfSlice`) only lowers `repair_from` of the live and the building generation; the next runs apply the touches
    of `[repair_from, through_ledger]` again, reading the state at `through_ledger`, so a line changed in the repaired window and again later keeps its later state. A window that meets a ledger
@@ -55,7 +55,7 @@ issuer's toml says of it, its biggest holders and its recent transfers. The inde
 9. **The routes are GateHub extras** (ADR-0010 Amendment 8). No supply or holders history is kept (a daily statistics job, deferred).
 
 ## Consequences
-- **The first build is hours of 4 s ticks, once.** The account pass reads all of `trust_line_states` once, one tick a minute; the rate measured on synthetic data and the estimate for the XRP
+- **The first build is an hour to a few hours of 4 s ticks, once.** The account pass reads all of `trust_line_states` once, one tick a minute; the rate measured on synthetic data and the estimate for the XRP
   Ledger are in [operations](../operations.md#issued-tokens). While it builds the list answers the no-generation answer and the detail 404.
 - **A parser version and a table of touches** (about 25 to 40 rows a ledger on the ledgers recorded so far, measured), kept by the P6 retention with the other ledger tables. The token tables
   are never dropped by retention: a rebuild after a drop is exact only for the lines whose last state is above the oldest kept block.

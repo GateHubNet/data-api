@@ -339,7 +339,7 @@ token starts over from the first at the next. A step reads the next tokens as §
 cursor); the reads of a step go by chunks, and only the live generation is swept (a building one matches each token as it computes it). The real
 bound of "a toml change shows" is therefore not ten minutes: the housekeeping runs at every tenth run (about every ten minutes), a sweep of the
 about 50,000 tokens of the XRP Ledger can take more than one of them when the budget cuts it, and D4's `tomls` worker has to have read the changed toml first, so **a change
-shows within tens of minutes** on the XRP Ledger, after the worker's own schedule.
+shows within tens of minutes** on the XRP Ledger, after the worker's own schedule (a figure derived from the cadence and the step size; the cost of a sweep step was not measured).
 
 ### 3.8 Metrics
 
