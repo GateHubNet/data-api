@@ -53,6 +53,16 @@ describe('exactAmount', () => {
   });
 });
 
+describe('exactAmount of a balance', () => {
+  it('reads the balance of a token line, with balance_f for its limit', () => {
+    const sql = exactAmount('balance');
+    expect(sql).toContain(`toDecimal256OrNull(balance, ${EXACT_SCALE})`);
+    expect(sql).toContain(`balance_f < ${EXACT_LIMIT}`);
+    expect(sql).toContain(`<= ${EXACT_SCALE}`);
+    expect(sql).not.toContain('amount');
+  });
+});
+
 describe('exactAmount of a column without a float shadow', () => {
   it('reads amount_change with the float of its own text as the shadow, below 1e36 either way round', () => {
     const sql = exactAmount('amount_change');

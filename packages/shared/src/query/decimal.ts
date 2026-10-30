@@ -19,7 +19,7 @@ export const EXACT_LIMIT = '1e36';
 
 /**
  * The exact decimal of an amount column (`base_amount`, `counter_amount` of `exchanges`, `delivered_amount` of
- * `account_payments`: code, never input; each has an `_f` shadow next to it), or `NULL` when the
+ * `account_payments`, `balance` of `token_lines`: code, never input; each has an `_f` shadow next to it), or `NULL` when the
  * decimal cannot hold it whole. An amount is summed exactly only when it has at most 30 decimal places (a
  * `Decimal256(30)` silently drops the digits after them, so 1e-35 would count as 0) and is below 1e36 (so that up to
  * 1e10 of them stay below the 1e46 it holds; a sum past it wraps without an error). Issued amounts run from 1e-81 to
@@ -31,7 +31,9 @@ export const EXACT_LIMIT = '1e36';
  * text (`toFloat64OrZero`, 0 for a text that is none, which the decimal then refuses) and the limit holds for the
  * magnitude, either way round.
  */
-export function exactAmount(column: 'base_amount' | 'counter_amount' | 'delivered_amount' | 'amount_change'): string {
+export function exactAmount(
+  column: 'base_amount' | 'counter_amount' | 'delivered_amount' | 'balance' | 'amount_change',
+): string {
   const places =
     `toInt64(if(position(${column}, '.') = 0, 0, length(splitByChar('e', ${column})[1]) - position(${column}, '.')))` +
     ` - toInt64OrZero(replaceOne(splitByChar('e', ${column})[2], '+', ''))`;

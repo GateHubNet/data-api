@@ -68,6 +68,7 @@ export * from './aggregate/pair-hourly.job';
 export * from './aggregate/rates-daily.job';
 export * from './aggregate/stats.job';
 export * from './aggregate/token-rules';
+export * from './aggregate/tokens.job';
 export * from './aggregate/volume.job';
 
 // Query
