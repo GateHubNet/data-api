@@ -195,12 +195,12 @@ const metrics = {
   }),
   supplySnapshotAgeSeconds: new Gauge({
     name: 'syncer_supply_snapshot_age_seconds',
-    help: 'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); not set until it has seen one. Alert above 3 hours.',
+    help: 'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); no sample until it has seen one. Alert above 3 hours.',
     registers: [registry],
   }),
   supplyCycleSeconds: new Gauge({
     name: 'syncer_supply_cycle_seconds',
-    help: 'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row.',
+    help: 'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row; no sample until the first one.',
     registers: [registry],
   }),
   validatorsUnlFetchesTotal: new Counter({
@@ -287,6 +287,12 @@ const metrics = {
 // A labelled counter has no series until its first `inc`, and `increase()` of a series that first shows at its value is 0: the first
 // Import the parser clamps would raise no alert. The series of the one kind starts at 0, as the unlabelled counters above do.
 metrics.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, 0);
+
+// prom-client gives a gauge without labels a sample of 0 when it is registered. These two are not known until the supply job has seen
+// a snapshot, or written a row: a 0 would read as a snapshot that has just been written, and no alert could fire on a job that
+// never writes one. So they start without a sample (the HELP and TYPE lines stay, `absent()` is true), and a `set` brings it.
+metrics.supplySnapshotAgeSeconds.remove();
+metrics.supplyCycleSeconds.remove();
 
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
 nodeThrottle.on('pause', (pause: ThrottlePause) => metrics.nodeRateLimitedTotal.inc({ endpoint: pause.host }));

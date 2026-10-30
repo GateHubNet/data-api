@@ -15,9 +15,8 @@ import { AGGREGATOR_OPTIONS, AggregatorOptions, AggregatorService } from './aggr
  * bundled `config/markets/<network>.json`), the rates of the network, which the volume jobs, the value of a pool, the NFT
  * jobs, the escrows job, the tokens job and the account and market jobs share (one `RatesService`, with the daily rates of the
  * NFT prices over it), the profile of the network (which the tokens job matches the tomls with, and the supply job asks whether
- * the network has an AMM and whether it mints), and the size from which an
- * account is rolled up (`GH_ACCOUNT_ROLLUP_MIN_ROWS`). A config that is not valid stops the
- * boot with a message that says what is wrong with it, instead of failing every tick.
+ * the network has an AMM and whether it mints), and the size from which an account is rolled up (`GH_ACCOUNT_ROLLUP_MIN_ROWS`).
+ * A config that is not valid stops the boot with a message that says what is wrong with it, instead of failing every tick.
  */
 export function aggregatorOptions(
   ch: ClickHouseService,

@@ -56,7 +56,7 @@ import {
 import { AggregatorNfts, NFT_STATE_FUNCTIONS, NftStateFunctions, NftStateJobRunner } from './nft-state.job-runner';
 import { PairHourlyJobRunner } from './pair-hourly.job-runner';
 import { RatesDailyJobRunner } from './rates-daily.job-runner';
-import { AggregatorSupply, SUPPLY_FUNCTIONS, SupplyFunctions, SupplyJobRunner } from './supply.job-runner';
+import { AggregatorSupply, NO_AMM_SIGHT, SupplyFunctions, SupplyJobRunner } from './supply.job-runner';
 import { AggregatorTokens, TOKENS_FUNCTIONS, TokensFunctions, TokensJobRunner } from './tokens.job-runner';
 
 // the AMM jobs live in files of their own; what they export is part of the options of the service, so it is exported here too
@@ -668,9 +668,9 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
           {
             ...options.supply,
             // the cursor and the set-aside pools of the `amm_pools` runner, read when a start is attempted: none without that job
-            ammSight: options.supply.ammSight ?? (() => this.ammPools?.sight() ?? { cursor: undefined, setAside: [] }),
+            ammSight: options.supply.ammSight ?? (() => this.ammPools?.sight() ?? NO_AMM_SIGHT),
           },
-          { ...SUPPLY_FUNCTIONS, ...options.supplyFunctions },
+          options.supplyFunctions,
         )
       : undefined;
     this.ammDaily = options.ammDaily

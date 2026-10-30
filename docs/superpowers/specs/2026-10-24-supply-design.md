@@ -311,6 +311,14 @@ restart forgets it and the next tick starts a fresh cycle.
 - **Failures.** A step that fails is logged and counted (`syncer_aggregator_errors_total{job="supply"}`) and tried again at the next
   tick; the cycle keeps its place. After 3 failures of the same step the cycle is dropped and the next one waits 5 minutes, doubling up
   to an hour (the other jobs' backoff). A shutdown aborts the step in flight and writes nothing.
+  *Amended 2026-10-30 by the D7 Task 8 build (the text above stays as the plan wrote it). A shutdown does not abort a step in flight:
+  the steps are reads and take no signal (`runSupplyStep`), so a step that is running when the stop begins runs out unobserved, its
+  result is dropped, and the stop waits for the tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`. What the stop does keep is the rest of
+  the sentence: no step or write begins after it, and the write is given the tick's signal. "The same step" counts across runs: the
+  streak is kept between ticks, a tick that does not attempt the step (the stop began, a wait is running) neither counts nor clears
+  it, and a step that works, a start that answers (even that it waits) or a read of the newest snapshot that answers that no cycle is
+  due clears it. A start that throws, a read of the newest snapshot that fails and a write that fails are steps of this rule. A failure
+  that comes of the stop does not count toward the streak, and `failed()` decides what is logged and counted of it.*
 
 ### 4.2 AMM (XRPL)
 

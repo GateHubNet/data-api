@@ -53,7 +53,7 @@ export const SUPPLY_MAX_STEP_FAILURES = 3;
 const MAX_POOLS_NAMED = 10;
 
 /** The sight of a process that has no `amm_pools` runner: no cursor, so that a start on a network with an AMM waits. */
-const NO_SIGHT: SupplyAmmSight = { cursor: undefined, setAside: [] };
+export const NO_AMM_SIGHT: SupplyAmmSight = Object.freeze({ cursor: undefined, setAside: Object.freeze([]) });
 
 /** The pools of a warning: the first `MAX_POOLS_NAMED`, and how many more there are. */
 const named = (pools: readonly string[]): string =>
@@ -81,13 +81,17 @@ const named = (pools: readonly string[]): string =>
  * **Failures.** A step that fails (or a start that throws, or a read of the newest snapshot, or the write) is logged and counted
  * by `deps.failed`, ends the run, and stays first: it is tried again at the **next** tick, not at once. Its failures count across
  * runs: a run that does not attempt it (the stop began, a wait is running) neither counts nor clears the streak; a step that
- * works, a start that answers (even that it waits) and a written row clear it. The third failure in a row drops the cycle and
- * starts a wait before the next start: 5 minutes, doubling up to an hour (`AGGREGATE_RETRY_MS`, `AGGREGATE_MAX_RETRY_MS`), which a
- * written row resets. A failure that comes of the shutdown is not the step's: nothing is counted or remembered for it.
+ * works, a start that answers (even that it waits), a read of the newest snapshot that answers that no cycle is due, and a written
+ * row clear it. The third failure in a row drops the cycle and starts a wait before the next start: 5 minutes, doubling up to an
+ * hour (`AGGREGATE_RETRY_MS`, `AGGREGATE_MAX_RETRY_MS`), which a written row resets. A failure that comes of the shutdown does not
+ * count toward the streak (`deps.failed` decides what is logged and counted of it: an abort is neither, a plain read error is both).
+ * A step that takes longer than the budget is warned about once for as long as the steps keep being slow: the warning is said
+ * again after a step that came in time, so a cycle whose steps straddle the budget can log it more than once.
  *
  * **Gauges.** `syncer_supply_snapshot_age_seconds` is set at every run from the newest snapshot the process has seen (read or
- * written), also after a failed read or a failed step, and not at all until it has seen one; `syncer_supply_cycle_seconds` is the
- * wall time of a cycle, set when its row is written.
+ * written), also after a failed read or a failed step; until it has seen one it has no sample (`PrometheusService` removes the 0 that
+ * a registered gauge starts with, so that `absent()` can tell). `syncer_supply_cycle_seconds` is the wall time of a cycle, set when
+ * its row is written, and has no sample before the first one.
  */
 export class SupplyJobRunner {
   private readonly fns: SupplyFunctions;
@@ -166,14 +170,18 @@ export class SupplyJobRunner {
     if (deps.closing()) return false;
     if (newest !== undefined) {
       this.closeTime = Number(newest.close_time);
-      if (deps.clock() - Number(newest.started_at) * 1000 < SUPPLY_INTERVAL_MS) return false;
+      if (deps.clock() - Number(newest.started_at) * 1000 < SUPPLY_INTERVAL_MS) {
+        // no cycle is due: the failures of the reads before this one were of a start that is not wanted now
+        this.failures = 0;
+        return false;
+      }
     }
 
     const began = deps.clock();
     let answer: SupplyStart;
     try {
       // the sight is read now, after the `amm_pools` job of this tick, and only where there is an AMM to wait for
-      const sight = this.supply.profile.hasAmm ? (this.supply.ammSight?.() ?? NO_SIGHT) : undefined;
+      const sight = this.supply.profile.hasAmm ? (this.supply.ammSight?.() ?? NO_AMM_SIGHT) : undefined;
       answer = await this.fns.startSupplyCycle(deps.ch, this.supply.profile, Math.floor(began / 1000), sight);
     } catch (err) {
       this.fail(err, ' in the start', 'the start');

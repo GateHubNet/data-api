@@ -455,6 +455,54 @@ describe('SupplyJobRunner', () => {
       expect(world.reads).toBe(reads + 1);
     });
 
+    it('waits 5 minutes after a dropped cycle, doubling for each further dropped cycle up to an hour, and a written row resets the wait', async () => {
+      // the starts answer; a step fails every time (a range that does not fit, a row that cannot be read), so each cycle is dropped
+      world.steps = 5;
+      world.failTimes.set(2, 1_000);
+      const r = runner();
+      const dropACycle = async (): Promise<void> => {
+        for (let i = 0; i < 3; i++) await run(r);
+      };
+      const droppedWaits = (): number[] =>
+        warnings()
+          .filter((text) => text.includes('was dropped'))
+          .map((text) => Number(/waits (\d+) min/.exec(text)?.[1]));
+
+      await dropACycle();
+      expect(world.starts).toHaveLength(1);
+      for (const wait of [5, 10, 20, 40, 60, 60]) {
+        const starts = world.starts.length;
+        const reads = world.reads;
+        // a minute short of the wait, nothing is read and nothing starts
+        advance(minutes(wait) - 1);
+        await run(r);
+        expect(world.reads).toBe(reads);
+        expect(world.starts).toHaveLength(starts);
+        // the wait is over: a new cycle starts, reaches the step, and is dropped by its third failure
+        advance(1);
+        await dropACycle();
+        expect(world.starts).toHaveLength(starts + 1);
+      }
+      expect(droppedWaits()).toEqual([5, 10, 20, 40, 60, 60, 60]);
+
+      // the data is fine: the next cycle is written, and the wait begins again at 5 minutes
+      world.failTimes.delete(2);
+      advance(minutes(60));
+      await run(r);
+      expect(world.writes).toHaveLength(1);
+      world.failTimes.set(2, 1_000);
+      advance(SUPPLY_INTERVAL_MS);
+      await dropACycle();
+      expect(droppedWaits().at(-1)).toBe(5);
+      const reads = world.reads;
+      advance(minutes(5) - 1);
+      await run(r);
+      expect(world.reads).toBe(reads);
+      advance(1);
+      await run(r);
+      expect(world.reads).toBe(reads + 1);
+    });
+
     it('counts the failures of a step across runs: a failure every other run, with runs that attempt nothing between, still drops the cycle at its third', async () => {
       world.steps = 5;
       world.failTimes.set(1, 10);
@@ -541,6 +589,28 @@ describe('SupplyJobRunner', () => {
       world.startError = undefined;
       await run(r);
       expect(world.writes).toHaveLength(1);
+    });
+
+    it('clears the streak of the start when the read of the newest snapshot answers that no cycle is due', async () => {
+      const r = runner();
+      world.readError = new Error('connect ECONNREFUSED');
+      await run(r);
+      await run(r);
+      expect(fake.failures).toHaveLength(2);
+      // the read answers: the snapshot started a minute ago, so no start is wanted, and the two failures are behind
+      world.readError = undefined;
+      world.snapshot = snapshotOf({ started_at: NOW_SECONDS - 60, close_time: NOW_SECONDS - 90 });
+      await run(r);
+      expect(world.starts).toHaveLength(0);
+      // an hour later the start is wanted and throws once: it is the first failure of a streak, not the third
+      advance(SUPPLY_INTERVAL_MS);
+      world.startError = new Error('connect ECONNREFUSED');
+      await run(r);
+      expect(fake.failures).toHaveLength(3);
+      expect(warnings()).toEqual([]);
+      const reads = world.reads;
+      await run(r);
+      expect(world.reads).toBe(reads + 1);
     });
 
     it('clears the streak of the start when a start answers that it waits', async () => {

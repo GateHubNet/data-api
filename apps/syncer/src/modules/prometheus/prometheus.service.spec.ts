@@ -241,12 +241,12 @@ describe('PrometheusService', () => {
     const declared: [string, string, string][] = [
       [
         'syncer_supply_snapshot_age_seconds',
-        'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); not set until it has seen one. Alert above 3 hours.',
+        'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); no sample until it has seen one. Alert above 3 hours.',
         '4210',
       ],
       [
         'syncer_supply_cycle_seconds',
-        'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row.',
+        'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row; no sample until the first one.',
         '187\\.5',
       ],
     ];
@@ -255,6 +255,31 @@ describe('PrometheusService', () => {
       expect(text).toMatch(new RegExp(`^${name} ${value}$`, 'm'));
       expect((service.registry.getSingleMetric(name) as unknown as { labelNames: string[] }).labelNames).toEqual([]);
     }
+  });
+
+  it('has no sample of the two supply gauges before the supply job sets them, so that absent() can tell a job that never wrote a row, and has one after', async () => {
+    // a fresh module, so that no other test has set them in the registry the service shares
+    await jest.isolateModulesAsync(async () => {
+      const { PrometheusService: Fresh } = await import('./prometheus.service');
+      const service = new Fresh();
+      service.onModuleInit();
+      const names = ['syncer_supply_snapshot_age_seconds', 'syncer_supply_cycle_seconds'];
+
+      const before = await service.getMetrics();
+      for (const name of names) {
+        expect(before).toContain(`# HELP ${name} `);
+        expect(before).toContain(`# TYPE ${name} gauge\n`);
+        expect(before).not.toMatch(new RegExp(`^${name}[ {]`, 'm'));
+      }
+      // a gauge without labels that is not removed has a sample of 0 from the start: the other gauges of the job families do
+      expect(before).toMatch(/^syncer_tokens_live 0$/m);
+
+      service.supplySnapshotAgeSeconds.set(0);
+      service.supplyCycleSeconds.set(12.5);
+      const after = await service.getMetrics();
+      expect(after).toMatch(/^syncer_supply_snapshot_age_seconds 0$/m);
+      expect(after).toMatch(/^syncer_supply_cycle_seconds 12\.5$/m);
+    });
   });
 
   describe('the declaration of the validators metrics', () => {

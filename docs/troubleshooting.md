@@ -226,7 +226,7 @@ starts ([deployment](deployment.md#schema-migrations), [agg_dirty does not drain
 ### Syncer refuses to boot: `lacks the schema of 015_supply.sql`
 The `ingest` worker is enabled and the database does not have the three mint tables `genesis_mints`, `imports` and `reward_claims`, or the `aggregator` worker is and it lacks any of those and `network_supply`. The schema is one on
 every network, so a syncer on the XRP Ledger is refused too, though its ingest never inserts into the mint tables; on Xahau an insert into a missing mint table fails the batch, so the live runner would retry the same ledgers
-without end, and the `supply` job of the aggregator reads and writes its tables on both networks. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer again
+without end, and the `supply` job of the aggregator reads them on Xahau (it plans no read of them on the XRP Ledger) and writes `network_supply` on both. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer again
 ([deployment](deployment.md#schema-migrations)).
 
 ### An escrow, check, payment channel or delegation answers 404, has no `created`, or says `"complete": false`
