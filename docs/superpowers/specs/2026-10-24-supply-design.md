@@ -206,7 +206,11 @@ fed into `buildLedgerRows`:
 
 **`packages/shared/src/parsers/rewards.parser.ts`** (`RewardsParser`):
 - `ClaimReward` (any result): one `reward_claims` row: `account` = `Account`, `issuer` = `Issuer` (`''` without), `opt_out` = `Flags &
-  1` (tfOptOut; Task 1 confirms the bit on a recorded opt-out claim, else from xahaud's `TxFlags.h`).
+  1` (tfOptOut; Task 1 confirms the bit on a recorded opt-out claim, else from xahaud's `TxFlags.h`). *Amended 2026-10-30 by the D7
+  Task 3 build: the parser follows xahaud's own test, which is equality and not a mask: `opt_out = (Flags === TF_OPT_OUT)`
+  (`ClaimReward.cpp:127` and `:202`, `isOptOut = flags && *flags == tfOptOut`; Task 1's `FINDINGS.md`, fact 1). An opt-out has `Flags`
+  exactly 1 and no `Issuer`; a `Flags` of 0x80000001 with an `Issuer` is a normal claim for xahaud, so it is not an opt-out here, where
+  `Flags & 1` would have called it one. The two tests differ only there: no such claim is recorded.*
 - `GenesisMint` with result `tesSUCCESS`: one `genesis_mints` row per entry of `GenesisMints` that has a native `Amount` (a string of
   drops), in entry order (`mint_index` = the entry's index, so a skipped entry leaves a gap and the key never moves): `destination`,
   `amount`, `parent_tx_hash` and `emit_hook_hash` from `EmitDetails` (`''` without). An entry with a non-native or absent `Amount` has

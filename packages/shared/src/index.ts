@@ -16,12 +16,14 @@ export * from './parsers/amm.parser';
 export * from './parsers/balance-changes.parser';
 export * from './parsers/exchanges.parser';
 export * from './parsers/from-client.parser';
+export * from './parsers/import.parser';
 export * from './parsers/nft.parser';
 export * from './parsers/object-changes.parser';
 export * from './parsers/parser.interface';
 export * from './parsers/path-payments.parser';
 export * from './parsers/payment.parser';
 export * from './parsers/permissions';
+export * from './parsers/rewards.parser';
 export * from './parsers/state-touches.parser';
 export * from './parsers/trust-line-states.parser';
 
