@@ -28,7 +28,8 @@ export type AggregatorJobName =
   | 'nft_collections'
   | 'rates_daily'
   | 'account_rollups'
-  | 'volume_backfill';
+  | 'volume_backfill'
+  | 'supply';
 
 /**
  * What the `AggregatorService` lends the runners of its jobs that live in files of their own (`amm_pools`, `amm_daily`,

@@ -9,6 +9,9 @@ import {
   NftKey,
   RatesService,
   RollupState,
+  SupplyAmmSight,
+  SupplyCycle,
+  supplySnapshotRow,
   Table,
   TokenGenerationsRow,
   TokensAborted,
@@ -25,6 +28,7 @@ import {
   AGGREGATOR_PAIR_HOURLY_BUDGET_MS,
   AGGREGATOR_RATES_DAILY_BUDGET_MS,
   AGGREGATOR_SHUTDOWN_WAIT_MS,
+  AGGREGATOR_SUPPLY_BUDGET_MS,
   AGGREGATOR_TICK_BUDGET_MS,
   AGGREGATOR_TOKENS_BUDGET_MS,
   AGGREGATOR_VOLUME_DAILY_BUDGET_MS,
@@ -37,11 +41,12 @@ import {
   NFT_COLLECTIONS_EVERY_TICKS,
   NftCollectionsFunctions,
   NftStateFunctions,
+  SupplyFunctions,
   TokensFunctions,
 } from './aggregator.service';
 
 /**
- * The order of a tick with the account and market jobs registered (and the AMM jobs, the NFT jobs, the escrows job and the tokens job), and what that order is for: the live
+ * The order of a tick with the account and market jobs registered (and the AMM jobs, the NFT jobs, the escrows job, the tokens job and the supply job), and what that order is for: the live
  * volume jobs are not starved, whatever the jobs after them are doing. The shared functions of the jobs, the volume
  * functions and the database are fakes; the services, the runners and their hooks in `agg_dirty` are the real ones.
  */
@@ -67,6 +72,7 @@ const EVERY_JOB = [
   'rates_daily',
   'account_rollups',
   'volume_backfill',
+  'supply',
 ];
 
 /** The jobs of a tick `tickNo` (counted from 0), when every one is registered: `nft_collections` runs at the first tick and every fifth after it. */
@@ -448,12 +454,93 @@ class TokensWorld {
   }
 }
 
+/**
+ * The functions of the `supply` job, as its runner calls them. By default the world is quiet: the newest snapshot started a minute
+ * ago, so no cycle starts and the job only reads it. `due()` makes the next run start a cycle of `steps` steps (default 3, each
+ * `stepMs` of the fake clock); `busy()` gives the job far more to do than its budget lets it (no snapshot, a cycle of a thousand
+ * steps). The start is noted as `supply_start` (with the sight it was given), a step as `supply_step`, the write as `supply_write`.
+ */
+class SupplyWorld {
+  stepMs = 0;
+  /** The sights the starts were given (`undefined` on a network without an AMM). */
+  readonly sights: Array<SupplyAmmSight | undefined> = [];
+  private snapshot: { started_at: number; close_time: number } | undefined = {
+    started_at: NOW_SECONDS - 60,
+    close_time: NOW_SECONDS - 90,
+  };
+  private planned = 3;
+
+  constructor(private readonly note: (event: string) => void) {}
+
+  /** The next run starts a cycle of `steps` steps. */
+  due(steps = 3): void {
+    this.snapshot = undefined;
+    this.planned = steps;
+  }
+
+  busy(stepMs: number): void {
+    this.stepMs = stepMs;
+    this.due(1000);
+  }
+
+  private cycle(): SupplyCycle {
+    return {
+      ledger: 1000,
+      closeTime: NOW_SECONDS - 5,
+      startedAt: NOW_SECONDS,
+      totalCoins: 1_000_000n,
+      escrowed: 0n,
+      escrowCount: 0,
+      reserveBase: null,
+      reserveInc: null,
+      poolAccounts: [],
+      amm: null,
+      ammPools: 0,
+      poolsAtStoredRow: [],
+      poolsAtZero: [],
+      accounts: 0n,
+      ownerCount: 0n,
+      burned: 0n,
+      minted: null,
+      pending: Array.from({ length: this.planned }, (_, i) => ({
+        kind: 'accounts' as const,
+        range: { lo: `r${i}`, hi: `r${i + 1}` },
+      })),
+      steps: this.planned,
+    };
+  }
+
+  fns(): Partial<SupplyFunctions> {
+    return {
+      newestSnapshot: async () =>
+        this.snapshot && ({ ...supplySnapshotRow(this.cycle(), NOW_SECONDS, 1), ...this.snapshot } as never),
+      startSupplyCycle: async (_ch, _profile, _startedAt, amm) => {
+        this.note('supply_start');
+        this.sights.push(amm);
+        return { cycle: this.cycle() };
+      },
+      runSupplyStep: async (_ch, _profile, cycle) => {
+        this.note('supply_step');
+        if (this.stepMs > 0) jest.setSystemTime(Date.now() + this.stepMs);
+        return { ...cycle, pending: cycle.pending.slice(1) };
+      },
+      writeSupplySnapshot: async (_ch, cycle, computedAt) => {
+        this.note('supply_write');
+        const row = supplySnapshotRow(cycle, computedAt, 1);
+        this.snapshot = { started_at: row.started_at, close_time: row.close_time };
+        return row;
+      },
+    };
+  }
+}
+
 describe('the schedule of the aggregator with the account and market jobs', () => {
   let ch: FakeClickHouse;
   let world: D2World;
   let nftWorld: NftWorld;
   let escrowsWorld: EscrowsWorld;
   let tokensWorld: TokensWorld;
+  let supplyWorld: SupplyWorld;
   let logger: { log: jest.Mock; warn: jest.Mock; error: jest.Mock; debug: jest.Mock };
   let metrics: Record<
     | 'aggregatorRunsTotal'
@@ -473,7 +560,9 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     | 'tokensLive'
     | 'tokensLagLedgers'
     | 'tokensBuilding'
-    | 'tokensRepairLedgers',
+    | 'tokensRepairLedgers'
+    | 'supplySnapshotAgeSeconds'
+    | 'supplyCycleSeconds',
     { inc: jest.Mock; set: jest.Mock }
   >;
   const created: AggregatorService[] = [];
@@ -504,6 +593,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     nftWorld = new NftWorld(note);
     escrowsWorld = new EscrowsWorld(note);
     tokensWorld = new TokensWorld(note);
+    supplyWorld = new SupplyWorld(note);
     logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
     metrics = {
       aggregatorRunsTotal: { inc: jest.fn(), set: jest.fn() },
@@ -524,6 +614,8 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       tokensLagLedgers: { inc: jest.fn(), set: jest.fn() },
       tokensBuilding: { inc: jest.fn(), set: jest.fn() },
       tokensRepairLedgers: { inc: jest.fn(), set: jest.fn() },
+      supplySnapshotAgeSeconds: { inc: jest.fn(), set: jest.fn() },
+      supplyCycleSeconds: { inc: jest.fn(), set: jest.fn() },
     };
     recompute = jest.fn(async (_ch: unknown, from: Date, to: Date) => {
       const f = from.getTime() / 1000;
@@ -543,7 +635,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     jest.useRealTimers();
   });
 
-  /** A service with every job registered; the volume sets, the AMM sets, the NFT sets, the escrows, the tokens and the account and market sets are the fakes above. */
+  /** A service with every job registered; the volume sets, the AMM sets, the NFT sets, the escrows, the tokens, the supply snapshot and the account and market sets are the fakes above. */
   function service(options: AggregatorOptions = {}): AggregatorService {
     const amm = quietAmm(note);
     const svc = new AggregatorService(ch.asService(), metrics as never, { register: jest.fn() } as never, {
@@ -572,6 +664,8 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       escrowsFunctions: escrowsWorld.fns(),
       tokens: { profile: getNetworkProfile('xrpl'), rates: nftWorld.rates() },
       tokensFunctions: tokensWorld.fns(),
+      supply: { profile: getNetworkProfile('xrpl') },
+      supplyFunctions: supplyWorld.fns(),
       ammDaily: { rates },
       ammDailyFunctions: amm.daily,
       // amm_daily at every tick, so that every tick of a test has every job
@@ -604,7 +698,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     });
   };
 
-  it('the jobs of a tick are volume_live, volume_daily, amm_pools, nft_state, escrows, pair_hourly, markets_live, tokens, stats_live, stats_dirty, amm_daily, nft_collections, rates_daily, account_rollups, volume_backfill', async () => {
+  it('the jobs of a tick are volume_live, volume_daily, amm_pools, nft_state, escrows, pair_hourly, markets_live, tokens, stats_live, stats_dirty, amm_daily, nft_collections, rates_daily, account_rollups, volume_backfill, supply', async () => {
     caughtUp();
     await service().tick();
     expect(runs()).toEqual(EVERY_JOB);
@@ -616,6 +710,8 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     expect(at('markets_live')).toBeLessThan(at('stats'));
     // and amm_daily after the stats (its quiet sets of today and yesterday)
     expect(at('stats')).toBeLessThan(at('amm_daily'));
+    // and supply is the last of them, after volume_backfill (job 16)
+    expect(runs().slice(-2)).toEqual(['volume_backfill', 'supply']);
   });
 
   it('the account and market jobs keep their places without the volume jobs, and the volume jobs theirs without them', async () => {
@@ -634,6 +730,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       'nft_collections',
       'rates_daily',
       'account_rollups',
+      'supply',
     ]);
     metrics.aggregatorRunsTotal.inc.mockClear();
     await service({ aggregates: undefined }).tick();
@@ -649,6 +746,7 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       'amm_daily',
       'nft_collections',
       'volume_backfill',
+      'supply',
     ]);
     metrics.aggregatorRunsTotal.inc.mockClear();
     await service({ ammPools: undefined, ammDaily: undefined }).tick();
@@ -662,6 +760,13 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     metrics.aggregatorRunsTotal.inc.mockClear();
     await service({ tokens: undefined }).tick();
     expect(runs()).toEqual(EVERY_JOB.filter((job) => job !== 'tokens'));
+    metrics.aggregatorRunsTotal.inc.mockClear();
+    await service({ supply: undefined }).tick();
+    expect(runs()).toEqual(EVERY_JOB.filter((job) => job !== 'supply'));
+    // and with neither the volume jobs nor the supply job, the last job of a tick is account_rollups
+    metrics.aggregatorRunsTotal.inc.mockClear();
+    await service({ volumes: undefined, supply: undefined }).tick();
+    expect(runs().slice(-1)).toEqual(['account_rollups']);
   });
 
   it('runs nft_state after amm_pools with its own budget, which it alone uses and which does not shorten the budgets of the jobs after it', async () => {
@@ -845,15 +950,18 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     expect(count('account_rollups_recount')).toBe(AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS / 1000);
   });
 
-  it('with every job registered, nft_state, escrows, tokens and every D2 job using its whole budget, volume_live and volume_daily run first and finish in every one of 10 ticks, and a tick ends within AGGREGATOR_TICK_BUDGET_MS plus one set', async () => {
+  it('with every job registered, nft_state, escrows, tokens, supply and every D2 job using its whole budget, volume_live and volume_daily run first and finish in every one of 10 ticks, and a tick ends within AGGREGATOR_TICK_BUDGET_MS plus one set and one supply step', async () => {
     // The most any tick can be asked for: 230 days of stats to catch up and 30 ranges of agg_dirty to drain, 4 s a slice, and
-    // every D2 job with far more to do than its budget (1 s a set). The longest set is the slice of the stats.
+    // every D2 job with far more to do than its budget (1 s a set). The longest set is the slice of the stats. Supply is last and
+    // finds the tick spent: it takes the one unit of a run it is owed (its start, then at every later tick one step of 1 s).
     const SLICE_MS = 4000;
+    const SUPPLY_STEP_MS = 1000;
     statsMs = SLICE_MS;
     world.busy(1000);
     nftWorld.busy(1000);
     escrowsWorld.busy(1000);
     tokensWorld.busy(1000);
+    supplyWorld.busy(SUPPLY_STEP_MS);
     ch.watermark = unix('2026-03-01T00:00:00Z');
     ch.closes = Array.from({ length: 230 }, (_, i) => unix('2026-03-01T00:30:00Z') + i * DAY);
     ch.closes.push(NOW_SECONDS - 3);
@@ -891,10 +999,13 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       expect(count('tokens_pass')).toBe(AGGREGATOR_TOKENS_BUDGET_MS / 1000);
       expect(count('markets_live')).toBeGreaterThanOrEqual(1);
       expect(count('rates_daily ')).toBeGreaterThanOrEqual(1);
-      // the tick used its budget, and ended within it and the set in flight
+      // supply started its cycle at the first tick, and took one step, no more, at each of the others: the tick was spent
+      expect(count('supply_start')).toBe(tickNo === 0 ? 1 : 0);
+      expect(count('supply_step')).toBe(tickNo === 0 ? 0 : 1);
+      // the tick used its budget, and ended within it, the set in flight and the step of supply
       const took = Date.now() - tickStart;
       expect(took).toBeGreaterThanOrEqual(AGGREGATOR_TICK_BUDGET_MS);
-      expect(took).toBeLessThanOrEqual(AGGREGATOR_TICK_BUDGET_MS + SLICE_MS);
+      expect(took).toBeLessThanOrEqual(AGGREGATOR_TICK_BUDGET_MS + SLICE_MS + SUPPLY_STEP_MS);
     }
     expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
     // the sweeps are what ran long: neither is over
@@ -973,6 +1084,115 @@ describe('the schedule of the aggregator with the account and market jobs', () =
     // the generation is still building: the job always has a batch more
     expect(metrics.tokensBuilding.set).toHaveBeenLastCalledWith(1);
     expect(metrics.tokensLive.set).toHaveBeenLastCalledWith(0);
+  });
+
+  it('runs supply last with its own budget, which it alone uses, and a tick of the other jobs does not shorten it', async () => {
+    expect(AGGREGATOR_SUPPLY_BUDGET_MS).toBe(5000);
+    caughtUp();
+    supplyWorld.busy(1000);
+    await service().tick();
+    // a step at a time while the budget of the job is not spent: 1 s a step, the 5 s of the job (the start takes none)
+    expect(count('supply_start')).toBe(1);
+    expect(count('supply_step')).toBe(AGGREGATOR_SUPPLY_BUDGET_MS / 1000);
+    // after volume_backfill (a run is counted when the job ends)
+    expect(runs().slice(-2)).toEqual(['volume_backfill', 'supply']);
+    expect(events().findIndex((event) => event === 'supply_start')).toBeGreaterThan(
+      events().findIndex((event) => event.startsWith('daily')),
+    );
+    expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+
+    log.length = 0;
+    jest.setSystemTime(NOW);
+    supplyWorld.busy(1000);
+    await service({ budgetsMs: { supply: 2000 } }).tick();
+    expect(count('supply_step')).toBe(2);
+  });
+
+  it('does not starve the live sets with supply registered', async () => {
+    // a cycle of a thousand steps (1 s each), far more than the 5 s of the job; nothing else has any work, so the time of a tick is the job's
+    caughtUp();
+    supplyWorld.busy(1000);
+    const svc = service();
+
+    for (let tickNo = 0; tickNo < 10; tickNo++) {
+      const tickStart = NOW_MS + tickNo * 60_000;
+      jest.setSystemTime(tickStart);
+      log.length = 0;
+      metrics.aggregatorRunsTotal.inc.mockClear();
+      await svc.tick();
+
+      // the fifteen live sets and the eight daily ones are the first things the tick does, at its very start
+      const first = log.slice(0, 23);
+      expect(first.map((entry) => entry.event.split(' ')[0])).toEqual([
+        ...Array(15).fill('live'),
+        ...Array(8).fill('daily'),
+      ]);
+      expect(first.every((entry) => entry.at === tickStart)).toBe(true);
+      // and the jobs ran to the end, in order, supply last
+      expect(runs()).toEqual(JOBS_OF_TICK(tickNo));
+      expect(runs().slice(0, 2)).toEqual(['volume_live', 'volume_daily']);
+      expect(runs().at(-1)).toBe('supply');
+      // the job used the whole of its budget and no more: five steps of the cycle that began at the first tick (the start takes none)
+      expect(count('supply_step')).toBe(AGGREGATOR_SUPPLY_BUDGET_MS / 1000);
+      expect(count('supply_start')).toBe(tickNo === 0 ? 1 : 0);
+      expect(Date.now() - tickStart).toBe(AGGREGATOR_SUPPLY_BUDGET_MS);
+    }
+    expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+    // the cycle is still under way: one start for the ten ticks, and no row
+    expect(count('supply_write')).toBe(0);
+  });
+
+  describe('the sight of the amm_pools runner that supply is lent', () => {
+    it('is its cursor and its set-aside pools as they are when the start is attempted, after the amm_pools job of the tick', async () => {
+      caughtUp();
+      supplyWorld.due();
+      // the first batch of the job: a good pool and one that fails on its own; the cursor goes to 1300 and the pool is set aside
+      await service({
+        ammPoolsFunctions: {
+          watermark: async () => 1234,
+          changedSince: async (_ch, ledger) =>
+            ledger < 1300 ? { accounts: ['rGoodPool', 'rBadPool'], upTo: 1300 } : { accounts: [], upTo: ledger },
+          poolsClosedIn: async () => [],
+          recompute: async (_ch, _rates, accounts) => {
+            if (accounts.includes('rBadPool')) throw new Error('DB::Exception: memory limit');
+            return accounts.length;
+          },
+        },
+      }).tick();
+      expect(supplyWorld.sights).toEqual([{ cursor: 1300, setAside: ['rBadPool'] }]);
+      expect(runs().indexOf('amm_pools')).toBeLessThan(runs().indexOf('supply'));
+    });
+
+    it('is no cursor before the first run of the job has read it, and a start that follows waits for it', async () => {
+      caughtUp();
+      supplyWorld.due();
+      await service({
+        ammPoolsFunctions: { watermark: () => Promise.reject(new Error('connect ECONNREFUSED')) },
+      }).tick();
+      expect(supplyWorld.sights).toEqual([{ cursor: undefined, setAside: [] }]);
+    });
+
+    it('is a sight with no cursor in a process that has no amm_pools job', async () => {
+      caughtUp();
+      supplyWorld.due();
+      await service({ ammPools: undefined, ammDaily: undefined }).tick();
+      expect(supplyWorld.sights).toEqual([{ cursor: undefined, setAside: [] }]);
+    });
+
+    it('is not asked for on a network without an AMM', async () => {
+      caughtUp();
+      supplyWorld.due();
+      await service({ supply: { profile: getNetworkProfile('xahau') } }).tick();
+      expect(supplyWorld.sights).toEqual([undefined]);
+    });
+
+    it('can be replaced by the option, for tests', async () => {
+      caughtUp();
+      supplyWorld.due();
+      const sight: SupplyAmmSight = { cursor: 7, setAside: ['rLent'] };
+      await service({ supply: { profile: getNetworkProfile('xrpl'), ammSight: () => sight } }).tick();
+      expect(supplyWorld.sights).toEqual([sight]);
+    });
   });
 
   it('a read of the collections that are behind that does not answer does not keep the jobs after nft_collections from running in that tick', async () => {

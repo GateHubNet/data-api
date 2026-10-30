@@ -205,24 +205,35 @@ export async function assertIssuedTokensSchema(
   await assertTablesOf(ch, enabled, database, logger, ISSUED_TOKENS_MIGRATION, ISSUED_TOKENS_NEEDS);
 }
 
-/** The migration that adds the Xahau mint tables the ingest writes when a ledger has mint rows, and the supply tables the aggregator keeps. */
+/** The migration that adds the mint tables the ingest writes when a ledger has mint rows, and the snapshot table the aggregator's `supply` job writes. */
 export const SUPPLY_MIGRATION = '015_supply.sql';
 
 /**
  * The tables of `SUPPLY_MIGRATION` each worker needs, and what it does with them. The ingest writes the three mint tables
- * (`genesis_mints`, `imports`, `reward_claims`) whenever a ledger has mint rows.
+ * (`genesis_mints`, `imports`, `reward_claims`) whenever a ledger has mint rows. The `supply` job of the aggregator writes its
+ * snapshots to `network_supply` and reads the mint tables for the minted sums. The schema is one on every network, so each worker
+ * needs its tables wherever it runs.
  */
 const SUPPLY_NEEDS: SchemaNeeds = new Map([
   ['ingest', { tables: [Table.GenesisMints, Table.Imports, Table.RewardClaims], does: 'writes' }],
+  [
+    'aggregator',
+    {
+      tables: [Table.GenesisMints, Table.Imports, Table.RewardClaims, Table.NetworkSupply],
+      does: 'reads and writes',
+    },
+  ],
 ]);
 
 /**
- * Fails the boot when the ingest worker is enabled and the database lacks the three mint tables of `015_supply.sql`. The schema is
- * one on every network, so the check does not ask which one this is; on Xahau the ingest inserts into the tables as soon as a
- * ledger holds a mint, and an insert into a missing table fails the batch, so that the live runner would retry the same ledgers
- * without end. It runs after the boot-time migrations and after the check of 014, which it follows in the same way. A check that
- * cannot be made (ClickHouse unreachable) does not fail the boot: it is said, and the worker reports the failures of its writes as
- * it always does.
+ * Fails the boot when the ingest or the aggregator worker is enabled and the database lacks the tables of `015_supply.sql` the
+ * worker needs (the ingest the three mint tables, the aggregator those and `network_supply`). The schema is one on every network,
+ * so the check does not ask which one this is. On Xahau the ingest inserts into the mint tables as soon as a ledger holds a mint,
+ * and an insert into a missing table fails the batch, so that the live runner would retry the same ledgers without end. The
+ * `supply` job of the aggregator reads the newest snapshot at every run and writes the next one: without its table it fails at
+ * every run, and on Xahau its minted steps read the mint tables. It runs after the boot-time migrations and after the check of 014,
+ * which it follows in the same way. A check that cannot be made (ClickHouse unreachable) does not fail the boot: it is said, and the
+ * workers report the failures of their reads and writes as they always do.
  */
 export async function assertSupplySchema(
   ch: Pick<ClickHouseService, 'query'>,

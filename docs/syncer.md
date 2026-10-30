@@ -28,8 +28,8 @@ and database**. Settings: [configuration](configuration.md#5-syncer-appssyncer);
                                                    object_changes)   validator_votes,
                                                    + tokens (reads   amendment_
                                                    state tables)     tallies,
-                                                                     validator_
-                                                                     agreement_hourly
+                                                   + supply (reads   validator_
+                                                   state, ledgers)   agreement_hourly
                           ClickHouse, database = the network name
 ```
 
@@ -50,9 +50,9 @@ Then, in order:
    that cannot reach ClickHouse is logged and the boot goes on). With the `tomls` worker enabled, the two tables of
    `012_display_names.sql` (`account_domains`, `domain_tomls`) are checked the same way, and a database without them refuses the boot.
    With the `ingest` or the `aggregator` worker enabled, the tables of `014_issued_tokens.sql` they need are checked the same way (the ingest `state_touches`, the
-   aggregator all four: `lacks the schema of 014_issued_tokens.sql`), and with the `ingest` worker the three Xahau mint tables of `015_supply.sql` (`genesis_mints`, `imports`,
-   `reward_claims`: `lacks the schema of 015_supply.sql`), on every network, since the schema is one and on Xahau an insert into a missing table fails the batch. The check of
-   015 runs after the one of 014.
+   aggregator all four: `lacks the schema of 014_issued_tokens.sql`), and the tables of `015_supply.sql` the same way (the ingest the three mint tables `genesis_mints`, `imports`,
+   `reward_claims`; the aggregator those and `network_supply`: `lacks the schema of 015_supply.sql`), on every network, since the schema is one (on Xahau an insert into a missing mint table fails the batch,
+   and the `supply` job reads and writes its tables on both networks). The check of 015 runs after the one of 014.
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
    (`server_info.network_id` must be one of the profile's `acceptedNodeNetworkIds`: `xrpl` 0 or nothing, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338, and no other). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
@@ -348,7 +348,7 @@ most 2 s for the sample in flight.
 
 ## 7. The aggregator
 
-Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs fifteen jobs **in priority order**; a job
+Once a minute (`AGGREGATOR_INTERVAL_MS`), within a 30 s tick budget, the aggregator runs sixteen jobs **in priority order**; a job
 gets what the earlier ones left and has a budget of its own so that a long sweep never starves the live work. The budgets are
 constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment variables, and so are the cadences of `amm_daily` and `nft_collections`:
 
@@ -369,6 +369,7 @@ constants of `aggregator.service.ts` (`AGGREGATOR_*_BUDGET_MS`), not environment
 | 13 | `rates_daily` | 8 s | The rate of every asset against the native currency for each closed, final UTC day (`native_rates_daily`), newest first. See [7.1](#71-rates_daily). |
 | 14 | `account_rollups` | 8 s | The discovery of heavy accounts and their daily rollups: the increment of each new day and the promotion of the days before. Off with `GH_ACCOUNT_ROLLUP_MIN_ROWS=0`. See [7.4](#74-account_rollups). |
 | 15 | `volume_backfill` | 10 s | The closed days that have no final daily set for the current `version` of the markets config (the NFT volume's is its own), **newest first**, all four metrics. |
+| 16 | `supply` | 5 s | The hourly snapshot of the native supply (`network_supply`): total coins, burned, escrowed, the AMM pools' drops, the accounts and their reserves, and on Xahau the minted drops. A cycle is spread over ticks, a step at a time, and the first step of a run is taken whatever is left of the tick ([the supply job](#the-supply-job)). |
 
 Properties that matter operationally:
 
@@ -511,10 +512,10 @@ The writer's version is the largest over all four rollup tables, so a retry neve
 
 ### 7.5 Runners, registration and failures
 
-Each job is a **runner** in a file of its own in `apps/syncer/src/aggregator/` (`rates-daily`, `pair-hourly`, `markets-live` and `account-rollups` `.job-runner.ts`). A runner keeps its own state (cursors, waits, announcements,
+Each job is a **runner** in a file of its own in `apps/syncer/src/aggregator/` (`rates-daily`, `pair-hourly`, `markets-live` and `account-rollups` `.job-runner.ts`, and `supply.job-runner.ts`, [the supply job](#the-supply-job)). A runner keeps its own state (cursors, waits, announcements,
 the run counter of `markets_live`) and gets what it needs of the service through one small interface of its own, **`AggregateJobDeps`** (`aggregate-job-deps.ts`): the `ClickHouseService`, the logger, the metrics, the clock, `closing()`,
 `failed(job, err, where?)` and the job's budget. A runner imports only the shared package, that file and the types of `aggregator.service.ts` (`AggregatorTick`, `AggregatorJob`); its constructor takes the deps, the shared options
-(`AggregatorAggregates`: the `RatesService` and the minimum of rows) and, for tests, the functions of the shared package to replace. A runner's `job()` is its entry in the jobs list, and three of them have an `ofSlice(start, end, tick)` hook.
+(`AggregatorAggregates`: the `RatesService` and the minimum of rows) and, for tests, the functions of the shared package to replace. A runner's `job()` is its entry in the jobs list, and three of them have an `ofSlice(start, end, tick)` hook (the `supply` runner takes the same deps, with its own options, and has no hook).
 
 The **registration** is all that changes in the service: the four names in `AggregatorJobName`, four budget constants (`AGGREGATOR_PAIR_HOURLY_BUDGET_MS`, `AGGREGATOR_MARKETS_LIVE_BUDGET_MS`, `AGGREGATOR_RATES_DAILY_BUDGET_MS`,
 `AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS`), the option `aggregates` (without it the four jobs and their hooks do not exist, as in the unit tests of the volume jobs), the four entries of the jobs list at the places of the table above, and one
@@ -838,6 +839,65 @@ never cut inside, so the last one of a run can end past the budget) and the part
 job logs `tokens: generation N started at ledger L (config C, state coverage from F[, replacing generation M])`, `... the account pass is at <account> (A account(s), T token(s))`, `... is live (through ledger L)`,
 `... is retired` and `the partitions of retired generation N are dropped`, and warns `tokens: ledgers A - B (touches|repair of generation N) were written by a parser older than 8; ... the generation is replaced by
 a new one built from the state tables` once.
+
+### The supply job
+
+The aggregate `network_supply` ([data-model](data-model.md#supply-migration-015)) keeps one row per snapshot of the native supply, about one an hour: the total coins, the burned, the escrowed, the drops in
+the AMM pools, the existing accounts and their owner counts (from which the api works out the reserves), and on Xahau the minted drops by source ([spec](superpowers/specs/2026-10-24-supply-design.md)). The api
+serves the newest row. Like the other jobs it reads **committed ledgers only**, is a runner in a file of its own (`supply.job-runner.ts`, behind `AggregateJobDeps`, registered with the `supply` option that
+`aggregator.module.ts` builds from the network's profile), and runs on both networks. It has no `agg_dirty` hook, so `tokens` stays the last of the hooks of a slice. It needs migration 015: a syncer with the
+`aggregator` worker refuses to boot without the four tables of the file ([operations](operations.md#apply-a-schema-migration)).
+
+**`supply`** (budget `AGGREGATOR_SUPPLY_BUDGET_MS` = 5 s, **every tick**, sixteenth and last in the tick: after `volume_backfill`, so the jobs before `stats_live` still have their 27 of the 30 s and the job only gets what the live
+work left; the shared work is `packages/shared/src/aggregate/supply.job.ts`). The constants are `SUPPLY_INTERVAL_MS` (3,600,000), `SUPPLY_START_WAIT_TICKS` (10), `SUPPLY_MAX_LAG_LEDGERS` (1,000),
+`SUPPLY_PREFIXES_PER_READ` (32) and `SUPPLY_MINT_SLICE_LEDGERS` (1,000,000). The state of a **cycle** (one snapshot at one ledger L: its partial sums and the steps still to run) is in memory; a restart forgets it and the next
+run starts a fresh one. A run does, in order:
+
+1. **The cadence.** With no cycle in progress and no wait running (below), the newest snapshot is read (two reads of the end of the key of `network_supply`). If its `started_at` is less than an hour ago the run is over; with no snapshot,
+   or one that started an hour ago, a cycle is started. The read is made once a run and never while a cycle is under way.
+2. **The start**, which takes the reads that must be made at the tick L is chosen. **L is the `through_ledger` of the escrows sentinel** ([the escrows job](#the-escrows-job)), and a cycle starts at it only when the sentinel exists with a
+   `through_ledger` above 0, the newest committed ledger is no more than 1,000 ledgers ahead of it, and the `ledgers` row of L is stored. During a first fill or a rebuild of the `escrows` job L is millions of ledgers behind the head, and
+   the start answers that it **waits** for it. The start reads L's close time and `total_coins`, the escrowed total and count of the sentinel, the reserve values in force at L (the newest `network_state` row at or before L, else the
+   newest `SetFee`, else none: the api then leaves the reserves out), on XRPL the first part of the AMM (below), on Xahau where the burned and minted slices start, and plans the steps. A start that waits counts a **waiting
+   tick**; the 10th in a row logs the warning `supply: waiting for escrows/amm_pools to reach the head` once, and the count begins again when a cycle starts.
+3. **The steps**, in this order: the **account ranges** (106 reads, each of up to 32 two-character prefixes of the account IDs: the existing accounts at L and their owner counts, the AMM pool accounts left out), on XRPL the **AMM
+   fill-forwards** (200 pools a step), on Xahau the **burned** slices (the fees of the ledgers, one read of one partition of `ledgers` each) and the **minted** slices (the mint tables, one read of one partition each, from the
+   oldest ledger they can hold: the one after the newest ledger written by an older parser, else the oldest stored; [data-model](data-model.md#supply-migration-015)). The sums of each step are added to the cycle. On XRPL burned
+   is `10^17` less `total_coins`, with no read.
+4. **The write**, when no step is left: one insert of the row (`version` above the clock and above any version of that ledger), then the gauges and one line of the log.
+
+- **The budget, and the first step.** Steps run while the clock is before the deadline of the tick (the job's 5 s, or what is left of the tick) and the stop has not begun. **The first step of a run is always taken**, whatever is left
+  of the tick, so that a cycle moves at every tick even when the jobs before it use the whole of it; the run that **starts** a cycle takes the start as its one such unit, and no step follows it past the deadline. **A step is
+  never cut by the budget** (it only reads, and takes no signal): the job can run as long as one step past it, and a step that takes longer than the budget is warned about, `supply: a step took <ms> ms, over its budget of 5000 ms`,
+  once until a step comes in time. The write is not a step that needs time: it is made as soon as the last step is done. `aggregator.schedule.spec.ts` pins the order, and that a tick of the live jobs that use their whole budgets
+  ends within the tick budget, the set in flight and one step of this job.
+- **The AMM (XRPL).** The start does not wait for the AMM job to be up to date: the service **lends** it the cursor of the `amm_pools` runner and the pools that runner has set aside (`AmmPoolsJobRunner.sight`, read when a start
+  is attempted, after job 3 of the same tick). The newest `amm_pools` row of every pool is read; a pool is **stale at L** when it has a touch at or below L that its row has not seen, which can only be a pool touched after the cursor or a pool
+  set aside, and the stale pools (with those whose row is past L) are **filled forward at L** from `amm_pool_states`, 200 a step. So the sum is exact except for a **set-aside pool**, which is counted at its stored row, and
+  named in one warning when the cycle starts (`supply: N AMM pool(s) set aside by the amm_pools job are counted at their stored row, and not as of ledger L: ...`, the first ten listed). A pool whose native reserve is NULL or
+  not a whole number of drops counts as 0 and does not stall the cycle; the pools so counted are named in one warning at the write, when the amm steps have run. With the `amm_pools` job off in the process, or before
+  it has read its cursor (the first run after a start), the start waits (`amm_pools`) and the warning above is what says so; on Xahau there is no AMM and no sight is asked for.
+- **Re-ingests.** Every step reads ledgers at or below L, and the current-state tables are read at the tick L is chosen, so a snapshot is the state of one ledger. A `--reprocess` or range-ingest that rewrites ledgers at or below L
+  while a cycle runs can leave that cycle's figures off for the accounts or mints it rewrote (a range read between the delete and the rewrite), and a pool that a re-ingest made stale below the cursor counts at its stored row until
+  `agg_dirty` rebuilds it; the next cycle, an hour later, is right again. There is nothing incremental to repair, so there is no hook.
+- **Failures.** A step that fails (a step of the cycle, a start that throws, the read of the newest snapshot, the write) is logged and counted (`syncer_aggregator_errors_total{job="supply"}`), **ends the run** and stays first: it is
+  tried again at the **next** tick, not at once. Its failures are counted across runs: a run that does not attempt it (the stop began, a wait is running) neither counts nor clears the streak, and only a step that works (or a start that answers,
+  even that it waits) clears it. **The third failure in a row drops the cycle** and starts a wait before the next start: 5 minutes, doubling up to an hour (`AGGREGATE_RETRY_MS`, `AGGREGATE_MAX_RETRY_MS`), which **a written row resets**.
+  The waits are in memory: a restart starts again. A failure that comes of the shutdown is neither counted nor remembered.
+- **Shutdown** stops the steps (none starts after it), and the write is given the signal of the tick, so a row is not written after it (`AggregateSetAborted`, neither logged nor counted).
+- **Gauges and the log.** `syncer_supply_snapshot_age_seconds` is the time since the close time of the newest snapshot the process has seen, read or written, **set at every run, also after a failed read or a failed step** (from the last one it
+  knew), and not at all until it has seen one; `syncer_supply_cycle_seconds` is the wall time of the last finished cycle, from its start to its write ([observability](observability.md#4-metrics-syncer)). The alert is the snapshot age above
+  3 hours, paired with `rate(syncer_aggregator_errors_total{job="supply"}[15m])` ([observability](observability.md#recommended-alerts)). Each finished cycle logs one line, `supply: ledger <L>, <N> steps, <S> s, in drops: total ..., burned ...,
+  escrowed ..., amm ..., reserves ..., minted ...` (N is the number of steps the plan had), and a cycle that is dropped logs `supply: the cycle at ledger <L> was dropped after 3 failures in a row of the <kind> step; the next start waits <m> min`.
+- **The cost.** Each cycle reads every row of `account_states` up to L once, in 106 reads of a key range (four narrow columns and the key, never the wide `fields`), a plain `GROUP BY` with the AMM pool accounts left out. The
+  plan estimated some billions of rows on the XRP Ledger, about a minute or two of reads, so 20 to 40 ticks of 5 s (an estimate, not measured on a full history); a cycle that takes more than an hour just runs back to back with the next, and the
+  snapshot says its own ledger and time. **The memory of such a read** is that of the hash aggregation of the accounts in its range, and does not grow with the rows: measured on ClickHouse 26.8.14.3 with merges stopped, the peak was 384 MiB (65,000 accounts in
+  29.9 million rows and 88 parts) to 1.07 GiB (200,000 accounts in 60 million rows and 92 parts) at 16 threads, and less with fewer. The in-order aggregation the plan first had needed 2.2 to 7 GiB and was dropped (the spec's
+  amendment of 2026-10-30, section 4.3). **The syncer sets no memory limit per query as deployed (0)**, so a read is limited by the server's memory alone; the guard of the api (`max_memory_usage`) does not apply to the syncer's connection.
+  A run that has nothing to do costs the two reads of the newest snapshot.
+
+**Metrics.** The two gauges above, and `syncer_aggregator_runs_total` / `syncer_aggregator_errors_total` with the label `supply`. A job that keeps failing logs `Aggregator job supply failed in the <kind> step: ...` (`... in the start`,
+`... reading the newest snapshot`, `... writing the snapshot`).
 
 ## 8. The validators worker
 
@@ -1286,7 +1346,7 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `Toml checks: the pass failed: <name> (<type>)` | ClickHouse refused the read of the schedule or the insert of the rows | The rows not written are due again at the next pass (a minute later). |
 | Boot refuses: `lacks the schema of 012_display_names.sql` | The migration was not applied before a syncer with the `tomls` worker | Apply it (`migrate-<network>`) and start the syncer again. |
 | Boot refuses: `lacks the schema of 014_issued_tokens.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs `state_touches`) or the `aggregator` worker (it needs all four tables of the file) | Apply it (`migrate-<network>`) and start the syncer again. |
-| Boot refuses: `lacks the schema of 015_supply.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the three mint tables `genesis_mints`, `imports` and `reward_claims`, on either network: the schema is one, and on Xahau an insert into a missing table fails the batch) | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 015_supply.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the three mint tables `genesis_mints`, `imports` and `reward_claims`) or the `aggregator` worker (those and `network_supply`), on either network: the schema is one, on Xahau an insert into a missing mint table fails the batch, and the `supply` job reads and writes its tables | Apply it (`migrate-<network>`) and start the syncer again. |
 | `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
 | `Aggregator job escrows failed for escrow <id>, set aside: <reason>` | The rows of one escrow cannot be mapped to an `escrows` row, for the reason given | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
 | `Aggregator job escrows_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed | The slice stays queued and its earlier hooks run again at each tick, until it works ([7.6](#76-the-agg_dirty-hooks)). |
@@ -1312,6 +1372,7 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `apps/syncer/src/aggregator/{rates-daily,pair-hourly,markets-live,account-rollups}.job-runner.ts`, `aggregate-job-deps.ts` | The four account and market jobs: the runners and `AggregateJobDeps` ([7.5](#75-runners-registration-and-failures)) |
 | `apps/syncer/src/aggregator/{nft-state,nft-collections}.job-runner.ts` | The two NFT jobs ([the NFT jobs](#the-nft-jobs)) |
 | `apps/syncer/src/aggregator/escrows.job-runner.ts`, `packages/shared/src/aggregate/escrows.job.ts` | The `escrows` job: the runner (steps, gauges, the `agg_dirty` hook) and what it reads and writes (`runEscrowsStep`, `recomputeEscrows`, `readEscrowed`) ([the escrows job](#the-escrows-job)) |
+| `apps/syncer/src/aggregator/supply.job-runner.ts`, `packages/shared/src/aggregate/{supply,supply.job}.ts`, `query/supply.ts` | The `supply` job: the runner (the cycle over ticks, the waits, the failures, the gauges), the start, the steps and the write, the arithmetic (account ranges, reserves, a pool's native side) and the reads the api shares (`newestSnapshot`, `mintSums`) ([the supply job](#the-supply-job)) |
 | `apps/syncer/src/aggregator/tokens.job-runner.ts`, `packages/shared/src/aggregate/{tokens.job,token-rules}.ts`, `util/currency-code.ts` | The `tokens` job: the runner (generations, touches, repair, housekeeping, the pass, the drop, gauges, the `agg_dirty` hook), what it reads and writes, and the pure rules (orientation of a line, the toml match, currency codes) ([the tokens job](#the-tokens-job)) |
 | `packages/shared/src/aggregate/{nft-state,nft-state.job,nft-collections.job}.ts`, `query/nft-prices.ts` | The fold of an NFT, what the NFT jobs read and write, and the one conversion of a price |
 | `packages/shared/src/aggregate/{rates-daily,pair-hourly,markets-live,account-rollups}.job.ts`, `aggregate-sets.ts` | What the runners write: the sets, their versions and their readers |

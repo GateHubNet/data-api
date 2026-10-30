@@ -246,28 +246,39 @@ describe('assertIssuedTokensSchema', () => {
 
 describe('assertSupplySchema', () => {
   const MINT_TABLES = [Table.GenesisMints, Table.Imports, Table.RewardClaims];
+  const ALL_TABLES = [...MINT_TABLES, Table.NetworkSupply];
 
-  it('checks nothing when the ingest worker is not enabled', async () => {
+  it('checks nothing when neither the ingest nor the aggregator worker is enabled', async () => {
     const db = tablesOf();
     const warn = jest.fn();
-    await assertSupplySchema(db.ch, workers('validations', 'fee_stats', 'validators', 'tomls', 'aggregator'), 'xahau', {
-      warn,
-    });
+    await assertSupplySchema(db.ch, workers('validations', 'fee_stats', 'validators', 'tomls'), 'xahau', { warn });
     await assertSupplySchema(db.ch, workers(), 'xahau', { warn });
     expect(db.query).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('passes a database with the three mint tables of 015, reading system.tables of the database with bound values', async () => {
+  it('passes a database with the three mint tables of 015 for the ingest, reading system.tables of the database with bound values', async () => {
     const db = tablesOf(...MINT_TABLES);
-    await expect(
-      assertSupplySchema(db.ch, workers('ingest', 'aggregator'), 'xahau', { warn: jest.fn() }),
-    ).resolves.toBe(undefined);
+    await expect(assertSupplySchema(db.ch, workers('ingest'), 'xahau', { warn: jest.fn() })).resolves.toBe(undefined);
     expect(db.query).toHaveBeenCalledTimes(1);
     const [sql, params] = db.query.mock.calls[0];
     expect(sql).toContain('FROM system.tables');
     expect(sql).toContain('database = currentDatabase()');
     expect(params).toEqual({ tables: MINT_TABLES });
+  });
+
+  it('passes a database with the four tables of 015 for the aggregator, and for both workers', async () => {
+    const db = tablesOf(...ALL_TABLES);
+    await expect(assertSupplySchema(db.ch, workers('aggregator'), 'xrpl', { warn: jest.fn() })).resolves.toBe(
+      undefined,
+    );
+    expect(db.query.mock.calls[0][1]).toEqual({ tables: ALL_TABLES });
+    await expect(
+      assertSupplySchema(db.ch, workers('ingest', 'aggregator'), 'xahau', { warn: jest.fn() }),
+    ).resolves.toBe(undefined);
+    // both workers ask once, for the tables of both, each named once
+    expect(db.query).toHaveBeenCalledTimes(2);
+    expect(db.query.mock.calls[1][1]).toEqual({ tables: ALL_TABLES });
   });
 
   it('fails the boot of the ingest worker on a database without 015, naming the migration and the three tables, on either network', async () => {
@@ -291,10 +302,41 @@ describe('assertSupplySchema', () => {
     expect(SUPPLY_MIGRATION).toBe('015_supply.sql');
   });
 
+  it('fails the boot of the aggregator worker on a database without 015, naming the migration and the four tables, on either network', async () => {
+    for (const database of ['xahau', 'xrpl']) {
+      const check = assertSupplySchema(
+        tablesOf(Table.Ledgers, Table.StateTouches).ch,
+        workers('aggregator', 'fee_stats'),
+        database,
+        { warn: jest.fn() },
+      );
+      await expect(check).rejects.toThrow(SUPPLY_MIGRATION);
+      await expect(check).rejects.toThrow(
+        `(table ${Table.GenesisMints}, table ${Table.Imports}, table ${Table.RewardClaims}, table ${Table.NetworkSupply})`,
+      );
+      await expect(check).rejects.toThrow('the aggregator worker reads and writes');
+      await expect(check).rejects.not.toThrow('the ingest worker');
+      await expect(check).rejects.toThrow(`database "${database}"`);
+    }
+  });
+
+  it('names the tables once, and what each worker does, when the ingest and the aggregator are both enabled', async () => {
+    const check = assertSupplySchema(tablesOf().ch, workers('ingest', 'aggregator'), 'xahau', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(
+      `(table ${Table.GenesisMints}, table ${Table.Imports}, table ${Table.RewardClaims}, table ${Table.NetworkSupply}), ` +
+        'which the ingest worker writes and the aggregator worker reads and writes',
+    );
+  });
+
   it('names exactly the tables that are missing', async () => {
     const check = assertSupplySchema(tablesOf(Table.GenesisMints).ch, workers('ingest'), 'xahau', { warn: jest.fn() });
     await expect(check).rejects.toThrow(`(table ${Table.Imports}, table ${Table.RewardClaims})`);
     await expect(check).rejects.not.toThrow(`table ${Table.GenesisMints}`);
+    // the aggregator with the mint tables and not the snapshot table: only the snapshot table is named
+    const aggregator = assertSupplySchema(tablesOf(...MINT_TABLES).ch, workers('aggregator'), 'xrpl', {
+      warn: jest.fn(),
+    });
+    await expect(aggregator).rejects.toThrow(`(table ${Table.NetworkSupply})`);
   });
 
   it('is a check of its own: a database with the tables of 014 and not 015 passes 014 and fails 015, each naming its own file', async () => {
@@ -317,5 +359,7 @@ describe('assertSupplySchema', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(SUPPLY_MIGRATION));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('the ingest worker starts without the check'));
+    await expect(assertSupplySchema(ch, workers('aggregator'), 'xrpl', { warn })).resolves.toBe(undefined);
+    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining('the aggregator worker starts without the check'));
   });
 });

@@ -56,6 +56,7 @@ import {
 import { AggregatorNfts, NFT_STATE_FUNCTIONS, NftStateFunctions, NftStateJobRunner } from './nft-state.job-runner';
 import { PairHourlyJobRunner } from './pair-hourly.job-runner';
 import { RatesDailyJobRunner } from './rates-daily.job-runner';
+import { AggregatorSupply, SUPPLY_FUNCTIONS, SupplyFunctions, SupplyJobRunner } from './supply.job-runner';
 import { AggregatorTokens, TOKENS_FUNCTIONS, TokensFunctions, TokensJobRunner } from './tokens.job-runner';
 
 // the AMM jobs live in files of their own; what they export is part of the options of the service, so it is exported here too
@@ -75,6 +76,7 @@ export { MAX_ISOLATED_COLLECTIONS_PER_BATCH, NFT_COLLECTIONS_EVERY_TICKS } from 
 export type { NftCollectionsFunctions } from './nft-collections.job-runner';
 export { MAX_ISOLATED_NFTS_PER_BATCH, NFT_MAX_RETRY_MS, NFT_RETRY_MS } from './nft-state.job-runner';
 export type { AggregatorNfts, NftStateFunctions } from './nft-state.job-runner';
+export type { AggregatorSupply, SupplyFunctions } from './supply.job-runner';
 export type { AggregatorTokens, TokensFunctions } from './tokens.job-runner';
 
 /** The aggregator runs its jobs once a minute. */
@@ -135,6 +137,14 @@ export const AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS = 8000;
  * one to start on time.
  */
 export const AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS = 10_000;
+
+/**
+ * How much of the tick `supply` (the hourly snapshot of the native supply) may use. It runs last, after `volume_backfill`, and only
+ * ever gets what the jobs before it left; a cycle is spread over ticks, a step at a time, and a step is never cut by the budget
+ * (it only reads), so a tick can run as long as one step beyond it. The first step of a run is taken whatever is left of the tick,
+ * so that a cycle moves at every tick even when the jobs before it use the whole of it.
+ */
+export const AGGREGATOR_SUPPLY_BUDGET_MS = 5_000;
 
 /**
  * How much of the tick `amm_pools` may use. It runs right after the daily volumes, so that the pool list is refreshed at every
@@ -303,6 +313,14 @@ export interface AggregatorOptions {
   /** Replaces the `tokens` functions of the shared package; for tests. */
   tokensFunctions?: Partial<TokensFunctions>;
   /**
+   * With it the `supply` job runs (an hourly snapshot of the native supply, `network_supply`); without it it does not. On a network
+   * with an AMM the job is lent the `amm_pools` runner's cursor and set-aside pools (`AmmPoolsJobRunner.sight`), or none when that job
+   * is off; `ammSight` of the option replaces that, for tests.
+   */
+  supply?: AggregatorSupply;
+  /** Replaces the `supply` functions of the shared package; for tests. */
+  supplyFunctions?: Partial<SupplyFunctions>;
+  /**
    * With it the `amm_daily` job runs (today and yesterday, the back-fill of the closed days, and the days of `agg_dirty`);
    * without it it does not.
    */
@@ -470,11 +488,22 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     would call a day final while its ledgers are still to come.
  *     A day is computed once; a new config version computes them all again; a set that keeps failing waits (5 minutes,
  *     doubling, until the config version changes) and the older days go on.
+ * 16. **supply** (with the `supply` option): an hourly snapshot of the native supply, one row of `network_supply` (`SupplyJobRunner`,
+ *     spec 2026-10-24-supply-design.md): the total coins, the burned, the escrowed (the sentinel of the `escrows` job), the drops in
+ *     the AMM pools (XRPL), the accounts and their owner counts at one ledger L, and on Xahau the minted drops by source. A cycle
+ *     starts when the newest snapshot began an hour ago, at the ledger of the escrows sentinel, and is spread over ticks, a step at
+ *     a time (the account ranges, the AMM fill-forwards, on Xahau the burned and minted slices), under
+ *     `AGGREGATOR_SUPPLY_BUDGET_MS`; the first step of a run is taken whatever is left of the tick, and a step is never cut. It
+ *     runs last, so it only gets what the live work left. A step that fails ends the run and is tried again at the next tick; the
+ *     third failure in a row drops the cycle and starts a wait (5 minutes, doubling up to an hour, reset by a written row).
+ *     `syncer_supply_snapshot_age_seconds` is set at every run, and `syncer_supply_cycle_seconds` when a row is written.
  *
  * The AMM jobs (3 and 11), `nft_state` (4), `escrows` (5), `tokens` (8) and `nft_collections` (12) are runners in files of their own
  * (`AmmPoolsJobRunner`, `AmmDailyJobRunner`, `NftStateJobRunner`, `EscrowsJobRunner`, `TokensJobRunner`, `NftCollectionsJobRunner`),
  * with their own state; the service lends them the database, the clock, the budgets and the rules of the tick
- * (`AggregatorJobContext`).
+ * (`AggregatorJobContext`). The runners of the account and market jobs (6, 7, 13, 14) and of `supply` (16) take the smaller
+ * `AggregateJobDeps` instead; `supply` is also lent the sight of the `amm_pools` runner (its cursor and the pools it has set aside:
+ * `AmmPoolsJobRunner.sight`), which it reads when a start is attempted, after job 3 of the tick.
  *
  * Every slice and every set is idempotent (`recomputeStatsHourly`; a volume set or a set of the account and market jobs is a
  * complete set under a new version), which is what lets this retry, resume and crash anywhere:
@@ -522,6 +551,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
   private readonly escrows?: EscrowsJobRunner;
   /** The `tokens` job and its hook in the slices of `agg_dirty` (with the `tokens` option). */
   private readonly tokens?: TokensJobRunner;
+  /** The `supply` job (with the `supply` option). */
+  private readonly supply?: SupplyJobRunner;
   /** The `amm_daily` job and its hook in the slices of `agg_dirty` (with the `ammDaily` option). */
   private readonly ammDaily?: AmmDailyJobRunner;
   /** How many ticks have run their jobs: the cadence of the jobs that do not run at every tick. */
@@ -571,6 +602,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       rates_daily: AGGREGATOR_RATES_DAILY_BUDGET_MS,
       account_rollups: AGGREGATOR_ACCOUNT_ROLLUPS_BUDGET_MS,
       volume_backfill: AGGREGATOR_VOLUME_BACKFILL_BUDGET_MS,
+      supply: AGGREGATOR_SUPPLY_BUDGET_MS,
       ...options.budgetsMs,
     };
     this.volumes = options.volumes;
@@ -585,18 +617,19 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
     this.logger = options.logger ?? new Logger(AggregatorService.name);
     this.clock = options.now ?? Date.now;
     this.recompute = options.recompute ?? recomputeStatsHourly;
+    // what a runner of the `AggregateJobDeps` kind is lent: the database, the log and the metrics, the clock, its budget, the stop
+    // and the rule of failure
+    const depsOf = (job: AggregatorJobName): AggregateJobDeps => ({
+      ch,
+      logger: this.logger,
+      metrics,
+      budgetMs: this.budgets[job],
+      clock: () => this.clock(),
+      closing: () => this.closing,
+      failed: (name, err, where) => this.failed(name, err, where),
+    });
     const aggregates = options.aggregates;
     if (aggregates) {
-      // what a runner is lent: the database, the log and the metrics, the clock, its budget, the stop and the rule of failure
-      const depsOf = (job: AggregatorJobName): AggregateJobDeps => ({
-        ch,
-        logger: this.logger,
-        metrics,
-        budgetMs: this.budgets[job],
-        clock: () => this.clock(),
-        closing: () => this.closing,
-        failed: (name, err, where) => this.failed(name, err, where),
-      });
       const fns = options.aggregateFunctions;
       this.aggregateRunners = {
         pairHourly: new PairHourlyJobRunner(depsOf('pair_hourly'), aggregates, fns),
@@ -628,6 +661,17 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       : undefined;
     this.tokens = options.tokens
       ? new TokensJobRunner(context, options.tokens, { ...TOKENS_FUNCTIONS, ...options.tokensFunctions })
+      : undefined;
+    this.supply = options.supply
+      ? new SupplyJobRunner(
+          depsOf('supply'),
+          {
+            ...options.supply,
+            // the cursor and the set-aside pools of the `amm_pools` runner, read when a start is attempted: none without that job
+            ammSight: options.supply.ammSight ?? (() => this.ammPools?.sight() ?? { cursor: undefined, setAside: [] }),
+          },
+          { ...SUPPLY_FUNCTIONS, ...options.supplyFunctions },
+        )
       : undefined;
     this.ammDaily = options.ammDaily
       ? new AmmDailyJobRunner(context, options.ammDaily, { ...AMM_DAILY_FUNCTIONS, ...options.ammDailyFunctions })
@@ -713,6 +757,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
             },
           ]
         : []),
+      ...(this.supply ? [this.supply.job()] : []),
       ...(options.extraJobs ?? []),
     ];
     for (const job of this.jobs) {

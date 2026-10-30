@@ -25,7 +25,8 @@ import {
  * Token of the async provider that applies the boot-time migrations and then checks that the schema of
  * `002_validators_amendments.sql` is there when a worker that writes it is enabled (`assertValidatorsSchema`), that of
  * `012_display_names.sql` when the tomls worker is (`assertTomlsSchema`), that of `014_issued_tokens.sql` when the ingest or
- * the aggregator is (`assertIssuedTokensSchema`) and that of `015_supply.sql` when the ingest is (`assertSupplySchema`). Nest
+ * the aggregator is (`assertIssuedTokensSchema`) and that of `015_supply.sql` when the ingest or the aggregator is
+ * (`assertSupplySchema`). Nest
  * awaits async providers before it calls any lifecycle hook, so workers (which start in their hooks) always find the migrated
  * schema, and a database without 002, 012, 014 or 015 fails the boot instead of every write of the workers that need it;
  * nothing injects this.

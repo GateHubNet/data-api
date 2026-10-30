@@ -19,7 +19,7 @@ import { AggregatorService } from './aggregator.service';
 
 const QUIET = { log: () => undefined, warn: () => undefined, error: () => undefined };
 
-/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs, of the escrows job and of the tokens job, over fakes. */
+/** The metrics of the aggregator, of the account and market jobs, of the NFT jobs, of the escrows job, of the tokens job and of the supply job, over fakes. */
 const fakeMetrics = () => ({
   aggregatorRunsTotal: { inc: jest.fn() },
   aggregatorErrorsTotal: { inc: jest.fn() },
@@ -39,6 +39,8 @@ const fakeMetrics = () => ({
   tokensLagLedgers: { set: jest.fn() },
   tokensBuilding: { set: jest.fn() },
   tokensRepairLedgers: { set: jest.fn() },
+  supplySnapshotAgeSeconds: { set: jest.fn() },
+  supplyCycleSeconds: { set: jest.fn() },
 });
 
 describe('AggregatorModule', () => {
@@ -125,6 +127,11 @@ describe('AggregatorModule', () => {
     ]) {
       expect(gauge.set).toHaveBeenCalledWith(0);
     }
+    // and the supply job, which finds no snapshot and no escrows sentinel in an empty database: its start waits, and it knows no
+    // snapshot, so it sets neither of its gauges
+    expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'supply' });
+    expect(metrics.supplySnapshotAgeSeconds.set).not.toHaveBeenCalled();
+    expect(metrics.supplyCycleSeconds.set).not.toHaveBeenCalled();
     // and the NFT collections job, which finds no collection behind in an empty database and sets its gauge
     expect(metrics.aggregatorRunsTotal.inc).toHaveBeenCalledWith({ job: 'nft_collections' });
     expect(metrics.nftCollectionsPending.set).toHaveBeenCalledWith(0);
@@ -238,6 +245,19 @@ describe('AggregatorModule', () => {
       aggregatorOptions(ch, xahau, { accountRollupMinRows: 1 } as SyncerConfig, { log: jest.fn() } as never).tokens
         ?.profile,
     ).toBe(xahau);
+  });
+
+  it('turns the supply job on with the profile of the network', () => {
+    const ch = {} as ClickHouseService;
+    const log = jest.fn();
+    for (const network of ['xrpl', 'xahau'] as const) {
+      const profile = getNetworkProfile(network);
+      const options = aggregatorOptions(ch, profile, { accountRollupMinRows: 1 } as SyncerConfig, { log } as never);
+      // the profile says whether the network has an AMM (the sight of the amm_pools runner is the service's to lend) and mints
+      expect(options.supply?.profile).toBe(profile);
+      expect(options.supply?.ammSight).toBeUndefined();
+    }
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^Supply job on: /));
   });
 
   it('refuses to boot on a markets config that is not valid, and says what is wrong with it', async () => {

@@ -33,6 +33,8 @@ export interface FakeDeps {
     ratesDailyMissingDays: { set: jest.Mock };
     accountRollupsHeavyAccounts: { set: jest.Mock };
     accountRollupsPendingAccounts: { set: jest.Mock };
+    supplySnapshotAgeSeconds: { set: jest.Mock };
+    supplyCycleSeconds: { set: jest.Mock };
   };
   /** Aborts the signal of the ticks. */
   readonly abort: AbortController;
@@ -54,6 +56,8 @@ export function fakeDeps(o: { budgetMs?: number } = {}): FakeDeps {
     ratesDailyMissingDays: { set: jest.fn() },
     accountRollupsHeavyAccounts: { set: jest.fn() },
     accountRollupsPendingAccounts: { set: jest.fn() },
+    supplySnapshotAgeSeconds: { set: jest.fn() },
+    supplyCycleSeconds: { set: jest.fn() },
   };
   const abort = new AbortController();
   const fake: FakeDeps = {

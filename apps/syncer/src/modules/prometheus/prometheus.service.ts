@@ -193,6 +193,16 @@ const metrics = {
     help: 'through_ledger less repair_from of the live generation of the issued tokens: the ledgers its repair applies again, 0 without a repair.',
     registers: [registry],
   }),
+  supplySnapshotAgeSeconds: new Gauge({
+    name: 'syncer_supply_snapshot_age_seconds',
+    help: 'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); not set until it has seen one. Alert above 3 hours.',
+    registers: [registry],
+  }),
+  supplyCycleSeconds: new Gauge({
+    name: 'syncer_supply_cycle_seconds',
+    help: 'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row.',
+    registers: [registry],
+  }),
   validatorsUnlFetchesTotal: new Counter({
     name: 'syncer_validators_unl_fetches_total',
     help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
@@ -326,6 +336,8 @@ export class PrometheusService implements OnModuleInit {
   readonly tokensLagLedgers = metrics.tokensLagLedgers;
   readonly tokensBuilding = metrics.tokensBuilding;
   readonly tokensRepairLedgers = metrics.tokensRepairLedgers;
+  readonly supplySnapshotAgeSeconds = metrics.supplySnapshotAgeSeconds;
+  readonly supplyCycleSeconds = metrics.supplyCycleSeconds;
   readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;

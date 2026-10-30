@@ -215,10 +215,11 @@ describe('AppModule on a real ClickHouse', () => {
     await expect(bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' })).rejects.toThrow(
       /lacks the schema of 014_issued_tokens\.sql \(table state_touches, table token_generations, table token_lines, table tokens\), which the aggregator worker reads and writes/,
     );
-    // the same database lets a syncer without a worker that needs 014 start, and the migration lets the aggregator start
+    // the same database lets a syncer without a worker that needs 014 start, and the migrations (015 too: the aggregator needs the
+    // tables of the supply job as well) let the aggregator start
     await bootApp({ GH_CLICKHOUSE_DATABASE: database });
     await closeApp();
-    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql'], (schemaDir) =>
+    await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql'], (schemaDir) =>
       bootApp({
         GH_CLICKHOUSE_DATABASE: database,
         GH_WORKERS: 'aggregator',
@@ -231,7 +232,7 @@ describe('AppModule on a real ClickHouse', () => {
     );
   });
 
-  it('fails the boot, naming 015_supply.sql and its three mint tables, when the ingest worker runs on a database of 001 and 014', async () => {
+  it('fails the boot, naming 015_supply.sql and its tables, when the ingest or the aggregator worker runs on a database of 001 and 014', async () => {
     const database = 'syncer_app_e2e_without_015';
     await withMigrations(['001_baseline.sql', '014_issued_tokens.sql'], (schemaDir) =>
       bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_RUN_MIGRATIONS_ON_BOOT: 'true', GH_SCHEMA_DIR: schemaDir }),
@@ -250,7 +251,16 @@ describe('AppModule on a real ClickHouse', () => {
       /lacks the schema of 015_supply\.sql \(table genesis_mints, table imports, table reward_claims\), which the ingest worker writes/,
     );
     expect((refused as Error).message).not.toContain('014_issued_tokens.sql');
-    // the same database lets a syncer without the ingest worker start, and the migration then gives the three tables
+    // the aggregator is refused as well, for the three mint tables it reads and the table of the snapshots it writes
+    const aggregatorRefused = await bootApp({ GH_CLICKHOUSE_DATABASE: database, GH_WORKERS: 'aggregator' }).catch(
+      (err: Error) => err,
+    );
+    expect(aggregatorRefused).toBeInstanceOf(Error);
+    expect((aggregatorRefused as Error).message).toMatch(
+      /lacks the schema of 015_supply\.sql \(table genesis_mints, table imports, table reward_claims, table network_supply\), which the aggregator worker reads and writes/,
+    );
+    expect((aggregatorRefused as Error).message).not.toContain('014_issued_tokens.sql');
+    // the same database lets a syncer without the ingest and the aggregator workers start, and the migration then gives the tables
     await bootApp({ GH_CLICKHOUSE_DATABASE: database });
     await closeApp();
     await withMigrations(['001_baseline.sql', '014_issued_tokens.sql', '015_supply.sql'], (schemaDir) =>

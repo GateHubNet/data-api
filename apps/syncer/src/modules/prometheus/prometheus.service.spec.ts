@@ -231,6 +231,32 @@ describe('PrometheusService', () => {
     }
   });
 
+  it('registers the two gauges of the supply job with their names, types, label sets and help texts (spec section 4.6)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.supplySnapshotAgeSeconds.set(4210);
+    service.supplyCycleSeconds.set(187.5);
+
+    const text = await service.getMetrics();
+    const declared: [string, string, string][] = [
+      [
+        'syncer_supply_snapshot_age_seconds',
+        'Seconds since the close time of the newest supply snapshot the supply job knows (read or written by it); not set until it has seen one. Alert above 3 hours.',
+        '4210',
+      ],
+      [
+        'syncer_supply_cycle_seconds',
+        'Wall-clock seconds the last finished supply cycle took, from its start to the write of its snapshot row.',
+        '187\\.5',
+      ],
+    ];
+    for (const [name, help, value] of declared) {
+      expect(text).toContain(`# HELP ${name} ${help}\n# TYPE ${name} gauge\n`);
+      expect(text).toMatch(new RegExp(`^${name} ${value}$`, 'm'));
+      expect((service.registry.getSingleMetric(name) as unknown as { labelNames: string[] }).labelNames).toEqual([]);
+    }
+  });
+
   describe('the declaration of the validators metrics', () => {
     // [name, type, declared label names (exactly), HELP text (spec section 6)]
     const declared: [string, string, string[], string][] = [
