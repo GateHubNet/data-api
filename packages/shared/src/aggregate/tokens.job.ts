@@ -1,5 +1,5 @@
 import { ClickHouseService } from '../clickhouse/clickhouse.service';
-import { STATE_PARSER_VERSION, TokenGenerationsRow, TokensRow } from '../clickhouse/rows';
+import { STATE_PARSER_VERSION, TokenGenerationsRow, TokenLinesRow, TokensRow } from '../clickhouse/rows';
 import { Table } from '../clickhouse/tables';
 import { NetworkProfile } from '../network/network-profile';
 import { exactAmount, exactSum, floatSum, sumOf } from '../query/decimal';
@@ -9,7 +9,15 @@ import { TomlCurrency } from '../tomls/toml-read';
 import { readStoredTomls } from '../tomls/toml-store';
 import { currencyCode, LP_CURRENCY } from '../util/currency-code';
 import { chunk } from '../util/helpers';
-import { TokenKey, tokenListing, TokenListing } from './token-rules';
+import {
+  LowSideLine,
+  orientations,
+  sameTokenLine,
+  TokenKey,
+  tokenListing,
+  TokenListing,
+  WantedTokenLine,
+} from './token-rules';
 
 /**
  * The `tokens` job's shared functions (spec sections 2.2 to 2.4, 3.1 and 3.7): the generations of the token set, the account pass that
@@ -28,6 +36,13 @@ import { TokenKey, tokenListing, TokenListing } from './token-rules';
  *    stopping after the batch (a granule or so of each part: not every row after the cursor), and `writePassLines` reads the newest
  *    row of each line of those accounts at or before the head, from the account's side as the issuer (`issuer = account`), in one
  *    `INSERT ... SELECT`. Each line is written once, by its issuer's side, so both orientations of a line come from its two accounts.
+ *  - **Touches move a generation on.** `touchesOfWindow` picks the next window `(from, to]` and reads `state_touches` for it, a key
+ *    range; `applyLineStates` reads the newest low-side state of each changed line (`(account, counterparty, currency) IN …`, a
+ *    prefix of the key each) at or before `atLedger` and writes, for both orientations of a line, the `token_lines` rows that
+ *    differ from the newest stored ones; the runner then recomputes the tokens of those lines and of the issuers the window
+ *    touched (`tokensOfIssuers`). `atLedger` is the window's end for a window that moves the generation on, and the generation's
+ *    `through_ledger` for the repair of a window below it: a line changed in the repaired window and again later keeps its later
+ *    state, and so do the issuer's settings.
  *  - **Query parameters travel in the URL** and ClickHouse refuses one over 128 KiB (ADR-0012): every array parameter holds at most
  *    `TOKENS_STATE_CHUNK` keys of at most 40 characters, or `TOKENS_TOML_DOMAINS_CHUNK` domains of at most 128, so every read that
  *    names accounts, tokens or domains goes by chunks.
@@ -541,4 +556,314 @@ export async function recomputeTokens(
     throwIfAborted(signal);
     await ch.insert(Table.Tokens, rows);
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Applying touches
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** A trust line as `state_touches` names it: its low account, its high account and its currency in the ledger's form. */
+export interface LineKey {
+  account: string;
+  counterparty: string;
+  currency: string;
+}
+
+/** The most rows a `LIMIT` takes: a window of one ledger is read whole, whatever it holds. */
+const UNBOUNDED = 4_294_967_295;
+
+/**
+ * The distinct trust lines `state_touches` names in the ledgers `(from, to]`, in key order, LP currencies dropped: a key range of
+ * the table (its key starts with `ledger_index`). At most `limit` of them: `touchesOfWindow` reads one more than the lines a window
+ * may hold, which is enough to halve it.
+ */
+export const WINDOW_LINES_SQL = `SELECT DISTINCT account, counterparty, currency
+  FROM ${Table.StateTouches}
+ WHERE ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32} AND kind = 'line'
+   AND NOT match(currency, '${LP_CURRENCY.source}')
+ ORDER BY account, counterparty, currency
+ LIMIT {limit:UInt32}`;
+
+/** The accounts whose token settings the ledgers `(from, to]` may have changed, in key order. */
+export const WINDOW_ISSUERS_SQL = `SELECT DISTINCT account
+  FROM ${Table.StateTouches}
+ WHERE ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32} AND kind = 'account'
+ ORDER BY account`;
+
+/**
+ * The window `(from, to]` the job applies next (spec 3.2 steps 1 and 2): `to` is `from + window`, or the head when that is nearer,
+ * halved while the window holds more than `maxLines` distinct lines, never below one ledger (a ledger is applied whole). With its
+ * distinct line touches (LP currencies dropped), in key order, and the accounts of its account touches, which are not limited by
+ * `maxLines`. A window at the head is empty: `to` is `from`. Every read is a key range of `state_touches`; a window that is too
+ * big is found out by reading `maxLines + 1` lines of it, not all of them.
+ */
+export async function touchesOfWindow(
+  ch: ClickHouseService,
+  from: number,
+  head: number,
+  o: { window?: number; maxLines?: number } = {},
+): Promise<{ to: number; lines: LineKey[]; issuers: string[] }> {
+  const window = Math.max(1, Math.floor(o.window ?? TOKENS_TOUCH_WINDOW));
+  const maxLines = o.maxLines ?? TOKENS_TOUCH_WINDOW_MAX_LINES;
+  let to = Math.max(from, Math.min(from + window, head));
+  if (to === from) return { to, lines: [], issuers: [] };
+  for (;;) {
+    const oneLedger = to - from <= 1;
+    const lines = await ch.query<LineKey>(WINDOW_LINES_SQL, {
+      from,
+      to,
+      limit: oneLedger ? UNBOUNDED : maxLines + 1,
+    });
+    if (lines.length > maxLines && !oneLedger) {
+      to = from + Math.max(1, Math.floor((to - from) / 2));
+      continue;
+    }
+    const issuers = await ch.query<{ account: string }>(WINDOW_ISSUERS_SQL, { from, to });
+    return { to, lines, issuers: issuers.map((row) => row.account) };
+  }
+}
+
+/** The lowest parser version of the ledgers `(from, to]`, `NULL` when there is none: a key range of `ledgers`. */
+export const PARSER_FLOOR_SQL = `SELECT minOrNull(parser_version) AS floor_version
+  FROM ${Table.Ledgers}
+ WHERE ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32}`;
+
+/**
+ * The lowest parser version of the ledgers in `(from, to]` (a key range of `ledgers`), `null` when the window has no ledger. A
+ * ledger written by a parser older than `TOKEN_PARSER_VERSION` has no touches, so the runner never applies a window whose floor is
+ * below it (spec 3.2 step 1).
+ */
+export async function parserFloorOf(ch: ClickHouseService, from: number, to: number): Promise<number | null> {
+  const row = await ch.queryOne<{ floor_version: Counted | null }>(PARSER_FLOOR_SQL, { from, to });
+  return row?.floor_version == null ? null : Number(row.floor_version);
+}
+
+/** The lines named by three arrays zipped (as `TOKEN_KEYS_IN` zips two), so that the keys are one parameter each. */
+const LINE_KEYS_IN = `(account, counterparty, currency) IN (
+            SELECT tupleElement(key, 1), tupleElement(key, 2), tupleElement(key, 3)
+              FROM (SELECT arrayJoin(arrayZip({accounts:Array(String)}, {counterparties:Array(String)}, {currencies:Array(String)})) AS key))`;
+
+/**
+ * The newest row of each line named, from its low account's side (`account` is the low account of every key the parser wrote; the
+ * high account's rows have the keys the other way round), at or before a ledger: a prefix of the table's key for each line, then
+ * the newest of its rows.
+ */
+export const LINE_STATES_SQL = `SELECT account, counterparty, currency, ledger_index, balance, \`limit\`, limit_peer,
+       authorized, peer_authorized, freeze, peer_freeze, deleted
+  FROM ${Table.TrustLineStates}
+ WHERE ${LINE_KEYS_IN} AND ledger_index <= {at:UInt32}
+ ORDER BY account, counterparty, currency, ledger_index DESC, tx_index DESC, node_index DESC
+ LIMIT 1 BY account, counterparty, currency`;
+
+/** A row of `LINE_STATES_SQL` as ClickHouse gives it. */
+interface LineStateRead {
+  account: string;
+  counterparty: string;
+  currency: string;
+  ledger_index: Counted;
+  balance: string;
+  limit: string;
+  limit_peer: string;
+  authorized: Counted;
+  peer_authorized: Counted;
+  freeze: Counted;
+  peer_freeze: Counted;
+  deleted: Counted;
+}
+
+/** The newest `token_lines` row of each (issuer, currency, holder) named, in a generation (the key of the table). */
+export const STORED_LINES_SQL = `SELECT issuer, currency, holder, balance, \`limit\`, frozen, authorized, ledger_index, deleted
+  FROM ${Table.TokenLines}
+ WHERE generation = {g:UInt32} AND (issuer, currency, holder) IN (
+            SELECT tupleElement(key, 1), tupleElement(key, 2), tupleElement(key, 3)
+              FROM (SELECT arrayJoin(arrayZip({issuers:Array(String)}, {currencies:Array(String)}, {holders:Array(String)})) AS key))
+ ORDER BY issuer, currency, holder, version DESC
+ LIMIT 1 BY issuer, currency, holder`;
+
+/** A row of `STORED_LINES_SQL` as ClickHouse gives it. */
+interface StoredLineRead extends TokenKey {
+  holder: string;
+  balance: string;
+  limit: string;
+  frozen: Counted;
+  authorized: Counted;
+  ledger_index: Counted;
+  deleted: Counted;
+}
+
+const lineKeyOf = (line: LineKey): string => JSON.stringify([line.account, line.counterparty, line.currency]);
+
+/** The state of a line as `orientations` reads it: a `trust_line_states` row (UInt8 flags are 0 or 1), or a deleted line when the table has none. */
+function lowSideLine(line: LineKey, row: LineStateRead | undefined): LowSideLine {
+  if (row === undefined) {
+    return {
+      ...line,
+      balance: '0',
+      limit: '0',
+      limit_peer: '0',
+      authorized: false,
+      peer_authorized: false,
+      freeze: false,
+      peer_freeze: false,
+      ledger_index: 0,
+      deleted: true,
+    };
+  }
+  return {
+    ...line,
+    balance: row.balance,
+    limit: row.limit,
+    limit_peer: row.limit_peer,
+    authorized: Number(row.authorized) === 1,
+    peer_authorized: Number(row.peer_authorized) === 1,
+    freeze: Number(row.freeze) === 1,
+    peer_freeze: Number(row.peer_freeze) === 1,
+    ledger_index: Number(row.ledger_index),
+    deleted: Number(row.deleted) === 1,
+  };
+}
+
+/** One orientation of a line: the token, its holder, what the row should say (null: none) and the ledger of the line's newest state (`undefined`: it has no state). */
+interface Side {
+  token: TokenKey;
+  holder: string;
+  wanted: WantedTokenLine | null;
+  stateLedger: number | undefined;
+}
+
+/**
+ * Applies the state of some lines to generation `p.generation` (spec 3.2 step 3): reads the newest low-side row of each line at or
+ * before `p.atLedger`, `TOKENS_STATE_CHUNK` lines a read, and writes, for both orientations of each line, under `p.version`:
+ *  - the wanted `token_lines` row where it differs from the newest stored one (or the stored one is a tombstone);
+ *  - a tombstone where a live row no longer counts (the line was deleted, emptied with no limit, or turned round).
+ * A line with no state row at or before `atLedger` (a re-ingest removed it) is treated as deleted. A row that already says what is
+ * wanted is not written again, so applying a window twice changes nothing. Resolves with every token of the lines, both
+ * orientations, changed or not: the tokens whose rows the runner makes again.
+ *
+ * `p.atLedger` is the window's end for a window that moves the generation on, and the generation's `through_ledger` for the repair
+ * of a window below it: read at the window's end, the repair of a line changed in the window and again later would write the older
+ * state, and the line would keep it until the repair reached the later change. Every array parameter holds at most
+ * `TOKENS_STATE_CHUNK` keys: the stored rows of a chunk of lines (twice as many keys) are read in chunks too. `signal` is checked
+ * before each read and write.
+ */
+export async function applyLineStates(
+  ch: ClickHouseService,
+  p: { generation: number; lines: readonly LineKey[]; atLedger: number; version: string },
+  signal?: AbortSignal,
+): Promise<TokenKey[]> {
+  const { generation, atLedger, version } = p;
+  const distinct = [...new Map(p.lines.map((line) => [lineKeyOf(line), line])).values()];
+  const tokens = new Map<string, TokenKey>();
+  for (const part of chunk(distinct, TOKENS_STATE_CHUNK)) {
+    throwIfAborted(signal);
+    const stateRows = await ch.query<LineStateRead>(LINE_STATES_SQL, {
+      accounts: part.map((line) => line.account),
+      counterparties: part.map((line) => line.counterparty),
+      currencies: part.map((line) => line.currency),
+      at: atLedger,
+    });
+    const states = new Map(stateRows.map((row) => [lineKeyOf(row), row]));
+    const sides = part.flatMap((line): Side[] => {
+      const state = states.get(lineKeyOf(line));
+      const stateLedger = state === undefined ? undefined : Number(state.ledger_index);
+      return orientations(lowSideLine(line, state)).map(({ token, holder, wanted }) => ({
+        token,
+        holder,
+        wanted,
+        stateLedger,
+      }));
+    });
+    for (const { token } of sides) tokens.set(keyOf(token), token);
+
+    // the newest stored row of each (issuer, currency, holder): two to a line, so a chunk of lines takes two reads at most
+    const stored = new Map<string, StoredLineRead>();
+    for (const keys of chunk(sides, TOKENS_STATE_CHUNK)) {
+      throwIfAborted(signal);
+      const rows = await ch.query<StoredLineRead>(STORED_LINES_SQL, {
+        g: generation,
+        issuers: keys.map((side) => side.token.issuer),
+        currencies: keys.map((side) => side.token.currency),
+        holders: keys.map((side) => side.holder),
+      });
+      for (const row of rows) stored.set(JSON.stringify([row.issuer, row.currency, row.holder]), row);
+    }
+
+    const rows: TokenLinesRow[] = [];
+    for (const { token, holder, wanted, stateLedger } of sides) {
+      const old = stored.get(JSON.stringify([token.issuer, token.currency, holder]));
+      const live = old !== undefined && Number(old.deleted) === 0;
+      if (wanted !== null) {
+        const same =
+          live &&
+          sameTokenLine(
+            {
+              balance: old.balance,
+              limit: old.limit,
+              frozen: Number(old.frozen),
+              authorized: Number(old.authorized),
+              ledger_index: Number(old.ledger_index),
+            },
+            wanted,
+          );
+        if (same) continue;
+        rows.push({
+          generation,
+          issuer: token.issuer,
+          currency: token.currency,
+          holder,
+          balance: wanted.balance,
+          balance_f: Number(wanted.balance),
+          limit: wanted.limit,
+          frozen: wanted.frozen,
+          authorized: wanted.authorized,
+          ledger_index: wanted.ledger_index,
+          deleted: 0,
+          version,
+        });
+      } else if (live) {
+        // a tombstone says what the row said, at the ledger the line changed in (the row's own when the line has no state)
+        rows.push({
+          generation,
+          issuer: token.issuer,
+          currency: token.currency,
+          holder,
+          balance: old.balance,
+          balance_f: Number(old.balance),
+          limit: old.limit,
+          frozen: Number(old.frozen),
+          authorized: Number(old.authorized),
+          ledger_index: stateLedger ?? Number(old.ledger_index),
+          deleted: 1,
+          version,
+        });
+      }
+    }
+    if (rows.length === 0) continue;
+    throwIfAborted(signal);
+    await ch.insert(Table.TokenLines, rows);
+  }
+  return [...tokens.values()];
+}
+
+/** The tokens of some issuers in a generation: a prefix of the key of `tokens` for each, one partition. */
+export const ISSUER_TOKENS_SQL = `SELECT DISTINCT issuer, currency
+  FROM ${Table.Tokens}
+ WHERE generation = {g:UInt32} AND issuer IN {issuers:Array(String)}
+ ORDER BY issuer, currency`;
+
+/**
+ * The tokens of the issuers in generation `generation` (spec 3.2 step 4): each issuer's prefix of `tokens`, every token that has a
+ * row, one whose newest row is a deletion included (it may have a line again). In key order. By chunks of `TOKENS_STATE_CHUNK`
+ * issuers: a window's account touches are not limited by `TOKENS_TOUCH_WINDOW_MAX_LINES`.
+ */
+export async function tokensOfIssuers(
+  ch: ClickHouseService,
+  generation: number,
+  issuers: readonly string[],
+): Promise<TokenKey[]> {
+  const tokens: TokenKey[] = [];
+  for (const part of chunk([...new Set(issuers)].sort(), TOKENS_STATE_CHUNK)) {
+    tokens.push(...(await ch.query<TokenKey>(ISSUER_TOKENS_SQL, { g: generation, issuers: part })));
+  }
+  return tokens;
 }

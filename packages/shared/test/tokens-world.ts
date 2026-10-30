@@ -30,6 +30,9 @@ import { syntheticHash } from './synthetic-hash';
  *  - `first + 3`: `gate` lowers its transfer rate to 1.002 and freezes globally; a balance changes again.
  *  - `first + 4`: a deleted line is made again; an AMM pool holds two tokens and issues its LP token; `gone` is deleted.
  *  - `first + 5` (the head): one more change; `nostate` has two lines of HUG, one of them 1e40 (above what the exact sums hold).
+ *
+ * A second batch of four ledgers after the head is written apart (`seedTokensWorldLater`): the suites that read the world at its head
+ * never see it, and the suites of the touches apply it.
  */
 
 type Json = Record<string, any>;
@@ -200,6 +203,33 @@ const entry = (code: string, issuer: string, fields: Json, network = ''): TomlCu
   network,
   fields: JSON.stringify(fields),
 });
+
+/** The ledgers of a timeline, `first` the index of the first: the transactions of a ledger in the order given. */
+function ledgersOf(first: number, timeline: readonly WorldTx[][]) {
+  return timeline.map((txs, n) => {
+    const index = first + n;
+    return normalizeLedgerResponse({
+      ledger_index: index,
+      ledger_hash: syntheticHash('tokens-world-ledger', String(index)),
+      parent_hash: syntheticHash('tokens-world-ledger', String(index - 1)),
+      account_hash: syntheticHash('tokens-world-accounts', String(index)),
+      transaction_hash: syntheticHash('tokens-world-transactions', String(index)),
+      total_coins: '99999999999000000',
+      close_time: 800_000_000 + index * 4,
+      close_time_resolution: 10,
+      transactions: txs.map((t, i) => ({
+        hash: syntheticHash('synthetic-tokens-world', `${index}:${i}`),
+        TransactionType: t.type,
+        Account: t.account,
+        Fee: '10',
+        Sequence: 1,
+        Flags: 0,
+        SigningPubKey: '',
+        metaData: { TransactionIndex: i, TransactionResult: 'tesSUCCESS', AffectedNodes: t.nodes },
+      })),
+    });
+  });
+}
 
 /** The accounts, currencies and ledgers of the world, for the suites that read it. */
 export interface TokensWorld {
@@ -476,29 +506,7 @@ export async function seedTokensWorld(
   changes(5, pU1, pU1b);
   makes(5, hugeA, hugeB);
 
-  const ledgers = timeline.map((txs, n) => {
-    const index = first + n;
-    return normalizeLedgerResponse({
-      ledger_index: index,
-      ledger_hash: syntheticHash('tokens-world-ledger', String(index)),
-      parent_hash: syntheticHash('tokens-world-ledger', String(index - 1)),
-      account_hash: syntheticHash('tokens-world-accounts', String(index)),
-      transaction_hash: syntheticHash('tokens-world-transactions', String(index)),
-      total_coins: '99999999999000000',
-      close_time: 800_000_000 + index * 4,
-      close_time_resolution: 10,
-      transactions: txs.map((t, i) => ({
-        hash: syntheticHash('synthetic-tokens-world', `${index}:${i}`),
-        TransactionType: t.type,
-        Account: t.account,
-        Fee: '10',
-        Sequence: 1,
-        Flags: 0,
-        SigningPubKey: '',
-        metaData: { TransactionIndex: i, TransactionResult: 'tesSUCCESS', AffectedNodes: t.nodes },
-      })),
-    });
-  });
+  const ledgers = ledgersOf(first, timeline);
   await writer.write(ledgers);
 
   // -- the domains of the issuers and their tomls, written the way D4's workers do --------------------------------------------
@@ -573,6 +581,119 @@ export async function seedTokensWorld(
     gateRate: 1_002_000_000,
     issuerLow,
     issuerHigh,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The second batch
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** What the second batch of the world did, by the ledger it did it in (`first` is its first ledger, the world's head + 1). */
+export interface TokensWorldLater {
+  first: number;
+  head: number;
+  ledgers: number[];
+  /** The holders of gate's USD whose lines change, and the ledgers they change in:
+   *  - `changedTwice`: 100.5 becomes 150 at `first` and 180 at `first + 2`;
+   *  - `turnedRound`: 250 becomes -4 at `first + 1` (the holder now owes gate: the line counts for the holder's token) and 7 at `first + 3`;
+   *  - `emptied`: 5 becomes 0 at `first + 1`, and the holder's limit is 0, so the line counts no more;
+   *  - `deleted`: the line is deleted at `first`;
+   *  - `made`: a line of 77 is made at `first`. */
+  changedTwice: string;
+  turnedRound: string;
+  emptied: string;
+  deleted: string;
+  made: string;
+  /** The currency `plain` issues from `first` on, and the holder of its one line. */
+  newCurrency: string;
+  newHolder: string;
+  /** The ledgers and rates of gate's `AccountSet`s: the rate goes up twice. */
+  rateSteps: Array<{ ledger: number; rate: number }>;
+}
+
+/**
+ * Writes the second batch of the world, four ledgers after its head, through `writer`: the first batch is untouched, so the suites
+ * that read it keep their numbers at `world.head`. What it does is on `TokensWorldLater`; it is what the touches of a window
+ * apply: a line changed in two ledgers, a line turned round (and back), emptied and deleted, a line and a token made, an
+ * issuer whose transfer rate changes twice (`gate`), and an issuer with no `AccountRoot` whose line changes (`nostate`).
+ */
+export async function seedTokensWorldLater(writer: LedgerWriter, world: TokensWorld): Promise<TokensWorldLater> {
+  const first = world.head + 1;
+  const { gate, plain, nostate } = world;
+  const NEW = 'NEW';
+
+  const timeline: WorldTx[][] = Array.from({ length: 4 }, () => []);
+  const at = (n: number, tx: WorldTx): void => void timeline[n].push(tx);
+  const makes = (n: number, line: Line): void =>
+    at(n, { type: 'TrustSet', account: line.holder, nodes: [createdLine(line)] });
+  const changes = (n: number, before: Line, held: string): Line => {
+    const after = { ...before, held };
+    at(n, { type: 'TrustSet', account: after.holder, nodes: [modifiedLine(before, after)] });
+    return after;
+  };
+  const deletes = (n: number, last: Line): void =>
+    at(n, { type: 'TrustSet', account: last.holder, nodes: [deletedLine(last)] });
+  const sets = (n: number, sequence: number, rate: number, before: number): void =>
+    at(n, {
+      type: 'AccountSet',
+      account: gate,
+      nodes: [
+        modifiedRoot({ account: gate, flags: world.gateFlags, sequence, transferRate: rate }, { TransferRate: before }),
+      ],
+    });
+
+  // the lines of the first batch that change, as that batch made them
+  const usd = (holder: string, held: string, holderLimit: string): Line => ({
+    issuer: gate,
+    holder,
+    currency: world.usd,
+    held,
+    holderLimit,
+  });
+  const gU1 = usd(above(gate, 'gU1'), '100.5', '1000');
+  const gU2 = usd(below(gate, 'gU2'), '250', '1000');
+  const gU3 = usd(above(gate, 'gU3'), '0.0000001', '10');
+  const gU9 = usd(above(gate, 'gU9'), '5', '0');
+  const sA1: Line = { issuer: nostate, holder: above(nostate, 'sA1'), currency: 'ABC', held: '9', holderLimit: '100' };
+  const gU16 = usd(above(gate, 'gU16'), '77', '100');
+  const pN1: Line = { issuer: plain, holder: above(plain, 'pN1'), currency: NEW, held: '3', holderLimit: '50' };
+
+  // first: a balance changes (and again at first + 2); a line is deleted; two are made; the rate goes up
+  sets(0, 14, 1_010_000_000, world.gateRate);
+  const gU1b = changes(0, gU1, '150');
+  deletes(0, gU3);
+  makes(0, gU16);
+  makes(0, pN1);
+
+  // first + 1: a line turns round; one is emptied with no limit
+  const gU2b = changes(1, gU2, '-4');
+  changes(1, gU9, '0');
+
+  // first + 2: the balance changes again; the rate goes up again; the issuer with no root has a line change
+  changes(2, gU1b, '180');
+  sets(2, 15, 1_015_000_000, 1_010_000_000);
+  changes(2, sA1, '12');
+
+  // first + 3: the line that turned round turns back
+  changes(3, gU2b, '7');
+
+  const ledgers = ledgersOf(first, timeline);
+  await writer.write(ledgers);
+  return {
+    first,
+    head: first + timeline.length - 1,
+    ledgers: timeline.map((_, n) => first + n),
+    changedTwice: gU1.holder,
+    turnedRound: gU2.holder,
+    emptied: gU9.holder,
+    deleted: gU3.holder,
+    made: gU16.holder,
+    newCurrency: NEW,
+    newHolder: pN1.holder,
+    rateSteps: [
+      { ledger: first, rate: 1_010_000_000 },
+      { ledger: first + 2, rate: 1_015_000_000 },
+    ],
   };
 }
 

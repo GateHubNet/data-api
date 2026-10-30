@@ -1,19 +1,30 @@
 import { TokenKey } from '../src/aggregate/token-rules';
 import {
+  applyLineStates,
   buildingGenerationOf,
+  ISSUER_TOKENS_SQL,
   issuerDomains,
+  LINE_STATES_SQL,
+  LineKey,
   liveGenerationOf,
   nextPassAccounts,
+  PARSER_FLOOR_SQL,
+  parserFloorOf,
   PASS_LINES_SELECT,
   passTokens,
   readTokenGenerations,
   recomputeTokens,
   stateCoverageStart,
+  STORED_LINES_SQL,
   TOKENS_PASS_ACCOUNTS,
   TOKENS_STATE_CHUNK,
   TOKENS_TOML_DOMAINS_CHUNK,
   TokensAborted,
+  tokensOfIssuers,
   tokensVersionFloor,
+  touchesOfWindow,
+  WINDOW_ISSUERS_SQL,
+  WINDOW_LINES_SQL,
   writePassLines,
   writeTokenGeneration,
 } from '../src/aggregate/tokens.job';
@@ -39,6 +50,7 @@ import {
   bruteForceTokens,
   lineMapKey,
   seedTokensWorld,
+  seedTokensWorldLater,
   tokenMapKey,
   TokensWorld,
 } from './tokens-world';
@@ -131,6 +143,25 @@ describe('the tokens job (e2e)', () => {
   }
 
   const tokenOf = (issuer: string, currency: string): string => tokenMapKey({ issuer, currency });
+
+  const hexOf = (text: string): string => Buffer.from(text).toString('hex').toUpperCase();
+
+  /** The stored toml of a domain that lists one currency (`currency` as the toml writes its code) of an issuer. */
+  const tomlRow = (domain: string, issuer: string, currency: string, name: string, checked: number): DomainTomlsRow =>
+    okTomlRow({
+      domain,
+      tomlUrl: tomlUrlOf(domain, PROFILE),
+      content: {
+        modified: null,
+        expires: null,
+        accounts: [],
+        currencies: [{ code: currency, issuer, network: '', fields: JSON.stringify({ name }) }],
+        validators: [],
+        principals: [],
+      },
+      now: checked,
+      recheckMs: 3_600_000,
+    });
 
   beforeAll(async () => {
     container = await startClickHouse();
@@ -521,8 +552,6 @@ describe('the tokens job (e2e)', () => {
     const OTHER = 'rRecomputeOtherIssuerxxxxxxxxxxxxx';
     const DOMAIN = 'recompute.example';
     const OTHER_DOMAIN = 'other-recompute.example';
-    const hexOf = (text: string): string => Buffer.from(text).toString('hex').toUpperCase();
-
     const line = (
       issuer: string,
       currency: string,
@@ -540,22 +569,6 @@ describe('the tokens job (e2e)', () => {
       ledger_index: 500,
       version,
     });
-
-    const tomlRow = (domain: string, issuer: string, currency: string, name: string, checked: number): DomainTomlsRow =>
-      okTomlRow({
-        domain,
-        tomlUrl: tomlUrlOf(domain, PROFILE),
-        content: {
-          modified: null,
-          expires: null,
-          accounts: [],
-          currencies: [{ code: currency, issuer, network: '', fields: JSON.stringify({ name }) }],
-          validators: [],
-          principals: [],
-        },
-        now: checked,
-        recheckMs: 3_600_000,
-      });
 
     it('gives a token that loses every line a deleted row, and nothing to one that never had a line', async () => {
       const svc = await fresh();
@@ -936,6 +949,681 @@ describe('the tokens job (e2e)', () => {
       expect(await stateCoverageStart(svc)).toBe(16);
       await store([25, 1]);
       expect(await stateCoverageStart(svc)).toBe(26);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('applying touches', () => {
+    const usdOf = (base: TokensWorld): TokenKey => ({ issuer: base.gate, currency: base.usd });
+
+    /** A migrated database with the world and its second batch of ledgers: the touches of the second batch are what the tests apply. */
+    async function twoBatches() {
+      const svc = await fresh();
+      const writer = new LedgerWriter(svc, CTX);
+      const base = await seedTokensWorld(svc, writer);
+      const more = await seedTokensWorldLater(writer, base);
+      return { svc, base, more };
+    }
+
+    /**
+     * Applies the touches of (from, head] to `generation` as the runner does, window by window: the line states, then the tokens of the
+     * lines and of the issuers (rematched), all at the window's end. Returns the end of each window.
+     */
+    async function applyTouches(
+      svc: ClickHouseService,
+      generation: number,
+      from: number,
+      head: number,
+      o: { window?: number; maxLines?: number } = {},
+    ): Promise<number[]> {
+      const ends: number[] = [];
+      for (let through = from; through < head; ) {
+        const window = await touchesOfWindow(svc, through, head, o);
+        const version = nextVersion();
+        const lineTokens = await applyLineStates(svc, {
+          generation,
+          lines: window.lines,
+          atLedger: window.to,
+          version,
+        });
+        const issuerTokens = await tokensOfIssuers(svc, generation, window.issuers);
+        await recomputeTokens(svc, {
+          generation,
+          tokens: [...lineTokens, ...issuerTokens],
+          atLedger: window.to,
+          version,
+          profile: PROFILE,
+          rematch: new Set(window.issuers),
+        });
+        through = window.to;
+        ends.push(through);
+      }
+      return ends;
+    }
+
+    /** One window applied at `atLedger`, which is the window's end for a window that moves on and the generation's `through_ledger` for a repair. */
+    async function applyWindow(
+      svc: ClickHouseService,
+      generation: number,
+      window: { to: number; lines: LineKey[]; issuers: string[] },
+      atLedger: number,
+    ): Promise<void> {
+      const version = nextVersion();
+      const lineTokens = await applyLineStates(svc, { generation, lines: window.lines, atLedger, version });
+      const issuerTokens = await tokensOfIssuers(svc, generation, window.issuers);
+      await recomputeTokens(svc, {
+        generation,
+        tokens: [...lineTokens, ...issuerTokens],
+        atLedger,
+        version,
+        profile: PROFILE,
+        rematch: new Set(window.issuers),
+      });
+    }
+
+    /** The rows of a token's line as the table keeps them, newest first: the history of one key. */
+    interface LineHistory {
+      balance: string;
+      limit: string;
+      ledger_index: number;
+      deleted: number;
+      version_text: string;
+    }
+    async function historyOf(svc: ClickHouseService, generation: number, token: TokenKey, holder: string) {
+      return svc.query<LineHistory>(
+        `SELECT balance, \`limit\`, ledger_index, deleted, toString(version) AS version_text
+           FROM ${Table.TokenLines}
+          WHERE generation = {generation:UInt32} AND issuer = {issuer:String} AND currency = {currency:String}
+                AND holder = {holder:String}
+          ORDER BY version DESC`,
+        { generation, issuer: token.issuer, currency: token.currency, holder },
+      );
+    }
+
+    /** The newest row of each line of a generation with its version, tombstones included, by `lineMapKey`. */
+    async function newestLines(svc: ClickHouseService, generation: number): Promise<Map<string, TokenLinesRow>> {
+      const rows = await svc.query<Omit<TokenLinesRow, 'version'> & { version_text: string }>(
+        `SELECT issuer, currency, holder, balance, balance_f, \`limit\`, frozen, authorized, ledger_index, deleted,
+                toString(version) AS version_text
+           FROM ${Table.TokenLines}
+          WHERE generation = {generation:UInt32}
+          ORDER BY issuer, currency, holder, version DESC
+          LIMIT 1 BY issuer, currency, holder`,
+        { generation },
+      );
+      return new Map(
+        rows.map(({ version_text, ...row }) => [lineMapKey(row, row.holder), { ...row, version: version_text }]),
+      );
+    }
+
+    /** The live tokens of a generation without their version (it is the clock of the write that made them). */
+    async function tokensWithoutVersion(svc: ClickHouseService, generation: number) {
+      return new Map([...(await liveTokens(svc, generation))].map(([key, { version, ...row }]) => [key, row]));
+    }
+
+    /** The live lines and tokens of two generations, every column but the generation and the version, are the same. */
+    async function expectSameGenerations(svc: ClickHouseService, a: number, b: number): Promise<void> {
+      const lines = await liveLines(svc, b);
+      expect(lines.size).toBeGreaterThan(30);
+      expect(await liveLines(svc, a)).toEqual(lines);
+      const tokens = await tokensWithoutVersion(svc, b);
+      expect(tokens.size).toBeGreaterThan(8);
+      expect(await tokensWithoutVersion(svc, a)).toEqual(tokens);
+    }
+
+    const keysOf = (tokens: readonly TokenKey[]): string[] => tokens.map(tokenMapKey).sort();
+
+    // -----------------------------------------------------------------------------------------------------------------
+    it('an incremental generation equals a fresh one built at the same head, row for row', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      await buildGeneration(svc, 2, more.head);
+      // the second batch changes what the generation says, so that the equality below is not the first generation's own
+      expect(await liveLines(svc, 1)).not.toEqual(await liveLines(svc, 2));
+      expect(await tokensWithoutVersion(svc, 1)).not.toEqual(await tokensWithoutVersion(svc, 2));
+
+      // one ledger a window: four windows, the line changed twice is applied twice
+      expect(await applyTouches(svc, 1, base.head, more.head, { window: 1 })).toEqual(more.ledgers);
+      await expectSameGenerations(svc, 1, 2);
+
+      // and the oracle at the new head says the same of the counts
+      const expected = await bruteForceTokens(svc, more.head);
+      const tokens = await liveTokens(svc, 1);
+      expect([...tokens.keys()].sort()).toEqual([...expected.keys()].sort());
+      for (const [key, want] of expected) {
+        expect({ holders: tokens.get(key)?.holders, trust_lines: tokens.get(key)?.trust_lines }).toMatchObject({
+          holders: want.holders,
+          trust_lines: want.trust_lines,
+        });
+        expect(tokens.get(key)?.supply).toBe(want.supply);
+      }
+      // the new token is there, the line that turned round and back is not a line of its holder's token
+      expect(tokens.get(tokenOf(base.plain, more.newCurrency))).toMatchObject({ holders: 1, supply: '3' });
+      expect(tokens.get(tokenOf(more.turnedRound, base.usd))).toBeUndefined();
+      expect(tokens.get(tokenOf(base.gate, base.usd))).toMatchObject({
+        transfer_rate: 1_015_000_000,
+        issuer_ledger: more.first + 2,
+      });
+    });
+
+    it('gives the same rows whatever the size of the windows', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, more.head);
+
+      // two ledgers a window
+      await buildGeneration(svc, 2, base.head);
+      expect(await applyTouches(svc, 2, base.head, more.head, { window: 2 })).toEqual([more.first + 1, more.head]);
+      await expectSameGenerations(svc, 2, 1);
+
+      // one window of all four ledgers: the line changed twice is applied once, at the end, and the one that turned round and back too
+      await buildGeneration(svc, 3, base.head);
+      expect(await applyTouches(svc, 3, base.head, more.head)).toEqual([more.head]);
+      await expectSameGenerations(svc, 3, 1);
+
+      // windows halved while they hold more than three lines: one ledger of 4 lines, then one of 2, then the last two ledgers (3)
+      await buildGeneration(svc, 4, base.head);
+      expect(await applyTouches(svc, 4, base.head, more.head, { maxLines: 3 })).toEqual([
+        more.first,
+        more.first + 1,
+        more.head,
+      ]);
+      await expectSameGenerations(svc, 4, 1);
+    });
+
+    it('turns a line round: a tombstone for one token, a row for the other', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      const gate = usdOf(base);
+      const holders: TokenKey = { issuer: more.turnedRound, currency: base.usd };
+      const before = await liveLines(svc, 1);
+      expect(before.get(lineMapKey(gate, more.turnedRound))).toMatchObject({ balance: '250', limit: '1000' });
+      expect(before.has(lineMapKey(holders, base.gate))).toBe(false);
+
+      // the ledger it turns round in: 250 becomes -4, so that the holder now owes gate 4
+      const window = await touchesOfWindow(svc, more.first, more.first + 1);
+      const version = nextVersion();
+      const tokens = await applyLineStates(svc, { generation: 1, lines: window.lines, atLedger: window.to, version });
+      // both tokens of the line are named, the one that lost its row and the one that got it
+      expect(keysOf(tokens)).toEqual(expect.arrayContaining(keysOf([gate, holders])));
+
+      const history = await historyOf(svc, 1, gate, more.turnedRound);
+      expect(history.map((h) => [h.deleted, h.version_text])).toEqual([
+        [1, version],
+        [0, expect.any(String)],
+      ]);
+      expect(await historyOf(svc, 1, holders, base.gate)).toEqual([
+        { balance: '4', limit: '0', ledger_index: more.first + 1, deleted: 0, version_text: version },
+      ]);
+      const after = await liveLines(svc, 1);
+      expect(after.has(lineMapKey(gate, more.turnedRound))).toBe(false);
+      expect(after.get(lineMapKey(holders, base.gate))).toMatchObject({ balance: '4', limit: '0', frozen: 0 });
+
+      // it turns back in the next ledger: the row of the holder's token goes, gate's comes back
+      const back = await touchesOfWindow(svc, more.first + 2, more.head);
+      await applyLineStates(svc, { generation: 1, lines: back.lines, atLedger: back.to, version: nextVersion() });
+      const again = await liveLines(svc, 1);
+      expect(again.get(lineMapKey(gate, more.turnedRound))).toMatchObject({ balance: '7', limit: '1000' });
+      expect(again.has(lineMapKey(holders, base.gate))).toBe(false);
+    });
+
+    it('writes a tombstone for a deleted line and for one emptied with no limit', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      const gate = usdOf(base);
+      const deleted = lineMapKey(gate, more.deleted);
+      const emptied = lineMapKey(gate, more.emptied);
+      const before = await newestLines(svc, 1);
+      expect(before.get(deleted)).toMatchObject({ balance: '0.0000001', limit: '10', deleted: 0 });
+      expect(before.get(emptied)).toMatchObject({ balance: '5', limit: '0', deleted: 0 });
+
+      // the ledger of the deletion: the line is gone from the state, its final fields still show a balance
+      const first = await touchesOfWindow(svc, base.head, more.first);
+      let version = nextVersion();
+      await applyLineStates(svc, { generation: 1, lines: first.lines, atLedger: first.to, version });
+      const mid = await newestLines(svc, 1);
+      expect(mid.get(deleted)).toMatchObject({ deleted: 1, version, ledger_index: more.first });
+      // the emptied line is not touched yet
+      expect(mid.get(emptied)).toEqual(before.get(emptied));
+
+      // the ledger it is emptied in: a balance of 0 with a limit of 0 counts for no one
+      const second = await touchesOfWindow(svc, more.first, more.first + 1);
+      version = nextVersion();
+      await applyLineStates(svc, { generation: 1, lines: second.lines, atLedger: second.to, version });
+      const after = await newestLines(svc, 1);
+      expect(after.get(emptied)).toMatchObject({ deleted: 1, version, ledger_index: more.first + 1 });
+      expect(after.get(deleted)).toEqual(mid.get(deleted));
+      // the other side of both lines never counted: the issuer extended no credit, so there is no row for it, not even a tombstone
+      for (const holder of [more.deleted, more.emptied]) {
+        expect(after.has(lineMapKey({ issuer: holder, currency: base.usd }, base.gate))).toBe(false);
+      }
+      const live = await liveLines(svc, 1);
+      expect(live.has(deleted) || live.has(emptied)).toBe(false);
+    });
+
+    it('treats a line with no state row at or before atLedger as deleted', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      const window = await touchesOfWindow(svc, more.first, more.first + 1);
+      // before the first ledger of the world: a re-ingest removed the rows of these lines
+      const version = nextVersion();
+      const tokens = await applyLineStates(svc, {
+        generation: 1,
+        lines: window.lines,
+        atLedger: base.first - 1,
+        version,
+      });
+      expect(tokens.length).toBeGreaterThan(0);
+      const newest = await newestLines(svc, 1);
+      for (const holder of [more.turnedRound, more.emptied]) {
+        expect(newest.get(lineMapKey(usdOf(base), holder))).toMatchObject({ deleted: 1, version });
+      }
+    });
+
+    it('applying a window twice changes nothing', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      const window = await touchesOfWindow(svc, base.head, more.head, { window: 2 });
+      expect(window.to).toBe(more.first + 1);
+      const first = nextVersion();
+      const tokens = await applyLineStates(svc, {
+        generation: 1,
+        lines: window.lines,
+        atLedger: window.to,
+        version: first,
+      });
+      await recomputeTokens(svc, {
+        generation: 1,
+        tokens,
+        atLedger: window.to,
+        version: first,
+        profile: PROFILE,
+        rematch: new Set(window.issuers),
+      });
+      const lines = await newestLines(svc, 1);
+      const written = Number((await svc.query<{ n: string }>(`SELECT count() AS n FROM ${Table.TokenLines}`))[0].n);
+      const tokenRows = await tokensWithoutVersion(svc, 1);
+
+      const second = nextVersion();
+      const again = await applyLineStates(svc, {
+        generation: 1,
+        lines: window.lines,
+        atLedger: window.to,
+        version: second,
+      });
+      expect(keysOf(again)).toEqual(keysOf(tokens));
+      // not one new row, so not one new version for a key: the newest rows are the same, versions included
+      expect(await newestLines(svc, 1)).toEqual(lines);
+      expect(Number((await svc.query<{ n: string }>(`SELECT count() AS n FROM ${Table.TokenLines}`))[0].n)).toBe(
+        written,
+      );
+      expect([...lines.values()].some((row) => row.version === first)).toBe(true);
+      expect([...lines.values()].some((row) => row.version === second)).toBe(false);
+
+      // the tokens are written again under the newer version and say the same
+      await recomputeTokens(svc, {
+        generation: 1,
+        tokens: again,
+        atLedger: window.to,
+        version: second,
+        profile: PROFILE,
+        rematch: new Set(window.issuers),
+      });
+      expect(await tokensWithoutVersion(svc, 1)).toEqual(tokenRows);
+    });
+
+    it("an account touch recomputes the issuer's tokens with its new TransferRate and domain", async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      const before = await liveTokens(svc, 1);
+      const myToken = tokenOf(base.gate, base.myToken);
+      expect(before.get(myToken)).toMatchObject({
+        transfer_rate: base.gateRate,
+        issuer_ledger: base.rateNow,
+        domain: base.gateDomain,
+        listed: 1,
+        name: 'My Token',
+      });
+
+      // gate moves to another domain, whose toml lists MYTOKEN under another name and no other token (D4's workers write these rows)
+      await svc.insert(Table.AccountDomains, [
+        {
+          ...SAMPLE_ROWS[Table.AccountDomains],
+          account: base.gate,
+          ledger_index: more.first,
+          tx_index: 0,
+          node_index: 0,
+          version: String(BigInt(more.first) << 32n),
+          domain_hex: hexOf('moved.example'),
+          deleted: 0,
+        },
+      ]);
+      await svc.insert(Table.DomainTomls, [
+        tomlRow('moved.example', base.gate, 'MYTOKEN', 'My Token, moved', 1_700_000_000.5),
+      ]);
+
+      // the ledger of its AccountSet: the window also holds lines of gate's USD, but none of MYTOKEN or BTH
+      const window = await touchesOfWindow(svc, base.head, more.first);
+      expect(window.issuers).toEqual([base.gate]);
+      await applyWindow(svc, 1, window, window.to);
+
+      const after = await liveTokens(svc, 1);
+      for (const [key, listed, name] of [
+        [myToken, 1, 'My Token, moved'],
+        [tokenOf(base.gate, base.both), 0, ''],
+        [tokenOf(base.gate, base.usd), 0, ''],
+      ] as const) {
+        expect(after.get(key)).toMatchObject({
+          transfer_rate: 1_010_000_000,
+          issuer_ledger: more.first,
+          issuer_flags: base.gateFlags,
+          domain: 'moved.example',
+          listed,
+          name,
+        });
+      }
+      // the tokens of an issuer the window does not touch are not written again
+      for (const key of [tokenOf(base.plain, base.usd), tokenOf(base.nodomain, base.eur)]) {
+        expect(after.get(key)).toEqual(before.get(key));
+      }
+    });
+
+    it('a line changed in the repaired window and again later keeps its later state after the first window', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      await applyTouches(svc, 1, base.head, more.head, { window: 1 });
+      const twice = lineMapKey(usdOf(base), more.changedTwice);
+      const gate = tokenOf(base.gate, base.usd);
+      const lines = await liveLines(svc, 1);
+      const tokens = await tokensWithoutVersion(svc, 1);
+      // the line was changed in the first window (150) and again in the third (180), and gate's rate went up in the same two
+      expect(lines.get(twice)).toMatchObject({ balance: '180', ledger_index: more.first + 2 });
+      expect(tokens.get(gate)).toMatchObject({ transfer_rate: 1_015_000_000, issuer_ledger: more.first + 2 });
+
+      // the repair of the first window, which the generation is past: it reads at the generation's through_ledger
+      const window = await touchesOfWindow(svc, base.head, more.head, { window: 1 });
+      expect(window.to).toBe(more.first);
+      expect(window.lines.length).toBeGreaterThan(2);
+      expect(window.issuers).toEqual([base.gate]);
+      await applyWindow(svc, 1, window, more.head);
+      expect(await liveLines(svc, 1)).toEqual(lines);
+      expect(await tokensWithoutVersion(svc, 1)).toEqual(tokens);
+
+      // read at the window's own end, the same repair would put the line and the rate back to what they were then
+      await applyWindow(svc, 1, window, window.to);
+      expect((await liveLines(svc, 1)).get(twice)).toMatchObject({ balance: '150', ledger_index: more.first });
+      expect((await liveTokens(svc, 1)).get(gate)).toMatchObject({
+        transfer_rate: 1_010_000_000,
+        issuer_ledger: more.first,
+      });
+      // and at the through_ledger once more it is right again
+      await applyWindow(svc, 1, window, more.head);
+      expect(await liveLines(svc, 1)).toEqual(lines);
+      expect(await tokensWithoutVersion(svc, 1)).toEqual(tokens);
+    });
+
+    it('writes nothing once the signal is aborted', async () => {
+      const { svc, base, more } = await twoBatches();
+      await buildGeneration(svc, 1, base.head);
+      const window = await touchesOfWindow(svc, base.head, more.head);
+      const before = await newestLines(svc, 1);
+      const controller = new AbortController();
+      controller.abort();
+      await expect(
+        applyLineStates(
+          svc,
+          { generation: 1, lines: window.lines, atLedger: window.to, version: nextVersion() },
+          controller.signal,
+        ),
+      ).rejects.toBeInstanceOf(TokensAborted);
+      expect(await newestLines(svc, 1)).toEqual(before);
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('touchesOfWindow', () => {
+      it('halves a window that holds more than maxLines lines', async () => {
+        const { svc, base, more } = await twoBatches();
+        // the four ledgers hold 4, 2, 2 and 1 line touches: 7 distinct lines in all, 6 in the first two ledgers
+        const whole = await touchesOfWindow(svc, base.head, more.head, { window: 500, maxLines: 100 });
+        expect(whole.to).toBe(more.head);
+        expect(whole.lines).toHaveLength(7);
+        expect(whole.issuers).toEqual([base.gate]);
+
+        const six = await touchesOfWindow(svc, base.head, more.head, { window: 500, maxLines: 6 });
+        expect(six.to).toBe(more.first + 1);
+        expect(six.lines).toHaveLength(6);
+
+        // 3 lines: the two ledgers hold 6, so the window is halved to one ledger, which holds 4: a ledger is never halved
+        const three = await touchesOfWindow(svc, base.head, more.head, { window: 500, maxLines: 3 });
+        expect(three.to).toBe(more.first);
+        expect(three.to).toBeLessThan(more.head);
+        expect(three.lines).toHaveLength(4);
+        expect(three.issuers).toEqual([base.gate]);
+
+        // the window is the size asked, and the head is not passed
+        const two = await touchesOfWindow(svc, base.head, more.head, { window: 2 });
+        expect(two.to).toBe(more.first + 1);
+        expect((await touchesOfWindow(svc, more.first + 2, more.head, { window: 500 })).to).toBe(more.head);
+        // a window at the head is empty
+        expect(await touchesOfWindow(svc, more.head, more.head)).toEqual({ to: more.head, lines: [], issuers: [] });
+      });
+
+      it('lists the distinct lines in key order, drops the LP lines and names the issuers of the account touches', async () => {
+        // the last two ledgers of the world's first batch: the pool's lines (one of them an LP token's), gone's AccountDelete and changes
+        const window = await touchesOfWindow(ch, world.first + 3, world.head);
+        const [stored] = await ch.query<{ n: string }>(
+          `SELECT count() AS n FROM ${Table.StateTouches} WHERE currency = {lp:String}`,
+          { lp: world.lp },
+        );
+        expect(Number(stored.n)).toBeGreaterThan(0);
+        expect(window.lines.some((line) => line.currency === world.lp)).toBe(false);
+        expect(window.lines.length).toBeGreaterThan(4);
+        const order = window.lines.map((line) => JSON.stringify([line.account, line.counterparty, line.currency]));
+        expect(order).toEqual([...order].sort());
+        expect(new Set(order).size).toBe(order.length);
+        // the pool's lines of USD and the lines of the huge currency are there
+        expect(window.lines.map((line) => line.currency)).toEqual(expect.arrayContaining([world.usd, world.huge]));
+        expect(window.issuers).toEqual([world.gone]);
+        // an AccountSet is an account touch and not a line: the ledger of gate's second one holds one line and one issuer
+        const rate = await touchesOfWindow(ch, world.rateNow - 1, world.rateNow);
+        expect(rate.lines).toHaveLength(1);
+        expect(rate.issuers).toEqual([world.gate]);
+      });
+    });
+
+    describe('parserFloorOf', () => {
+      it('gives the lowest version of the window', async () => {
+        const { svc, base, more } = await twoBatches();
+        expect(await parserFloorOf(svc, base.first - 1, more.head)).toBe(PARSER_VERSION);
+        // one ledger is written again by an older parser
+        await svc.command(
+          `INSERT INTO ${Table.Ledgers} SELECT * REPLACE (7 AS parser_version) FROM ${Table.Ledgers} WHERE ledger_index = {ledger:UInt32}`,
+          { ledger: base.first + 2 },
+        );
+        expect(await parserFloorOf(svc, base.first - 1, more.head)).toBe(7);
+        // the window is (from, to]: it holds the ledger at `to` and not the one at `from`
+        expect(await parserFloorOf(svc, base.first + 1, base.first + 2)).toBe(7);
+        expect(await parserFloorOf(svc, base.first + 2, more.head)).toBe(PARSER_VERSION);
+        expect(await parserFloorOf(svc, base.first - 1, base.first + 1)).toBe(PARSER_VERSION);
+      });
+
+      it('is null when the window has no ledger', async () => {
+        const { svc, base, more } = await twoBatches();
+        expect(await parserFloorOf(svc, more.head, more.head + 100)).toBeNull();
+        expect(await parserFloorOf(svc, base.first + 1, base.first + 1)).toBeNull();
+        expect(await parserFloorOf(svc, 0, base.first - 1)).toBeNull();
+      });
+    });
+
+    describe('tokensOfIssuers', () => {
+      it('gives the tokens of the issuers in a generation, the deleted ones included, in key order', async () => {
+        const svc = await fresh();
+        const token = (issuer: string, currency: string, version: string, deleted = 0): TokensRow => ({
+          ...SAMPLE_ROWS[Table.Tokens],
+          generation: 4,
+          issuer,
+          currency,
+          deleted,
+          version,
+        });
+        await svc.insert(Table.Tokens, [
+          token('rIssuerB', 'USD', '10'),
+          token('rIssuerA', 'USD', '10'),
+          // written twice: one token
+          token('rIssuerA', 'USD', '20'),
+          token('rIssuerA', 'EUR', '10'),
+          // its newest row is a deletion: still a token of the issuer
+          token('rIssuerA', 'GON', '10'),
+          token('rIssuerA', 'GON', '30', 1),
+          token('rIssuerC', 'USD', '10'),
+          // another generation
+          { ...token('rIssuerA', 'BTC', '10'), generation: 5 },
+        ]);
+        expect(await tokensOfIssuers(svc, 4, ['rIssuerA', 'rIssuerB', 'rNobody'])).toEqual([
+          { issuer: 'rIssuerA', currency: 'EUR' },
+          { issuer: 'rIssuerA', currency: 'GON' },
+          { issuer: 'rIssuerA', currency: 'USD' },
+          { issuer: 'rIssuerB', currency: 'USD' },
+        ]);
+        expect(await tokensOfIssuers(svc, 4, [])).toEqual([]);
+        expect(await tokensOfIssuers(svc, 6, ['rIssuerA'])).toEqual([]);
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    it('reads a key range of state_touches and key prefixes of trust_line_states', async () => {
+      // the plan's primary key section of a read: it is there only when the read uses the index
+      const primaryOf = async (
+        svc: ClickHouseService,
+        sql: string,
+        params: Record<string, unknown>,
+      ): Promise<string> => {
+        const text = (await svc.query<{ explain: string }>(`EXPLAIN indexes = 1 ${sql}`, params))
+          .map((r) => r.explain)
+          .join('\n');
+        expect(text).toContain('PrimaryKey');
+        return text.slice(text.indexOf('PrimaryKey'));
+      };
+
+      // the touches of the window (from, to] and the parser floor of its ledgers: a range of the first column of the key
+      for (const sql of [WINDOW_LINES_SQL, WINDOW_ISSUERS_SQL, PARSER_FLOOR_SQL]) {
+        const primary = await primaryOf(ch, sql, { from: world.first + 1, to: world.first + 3, limit: 5 });
+        expect(primary).toMatch(/Keys:\s+ledger_index/);
+        // `ledger_index > from` on an integer column is `ledger_index >= from + 1` to the index
+        expect(primary).toContain(`ledger_index in [${world.first + 2}, +Inf)`);
+        expect(primary).toContain(`ledger_index in (-Inf, ${world.first + 3}]`);
+      }
+
+      // the line states: the key (account, counterparty, currency) of the lines named, not a scan of the table
+      const lines = await primaryOf(ch, LINE_STATES_SQL, {
+        accounts: [world.gate, world.plain],
+        counterparties: [world.pool, world.pool],
+        currencies: [world.usd, world.usd],
+        at: world.head,
+      });
+      expect(lines).toMatch(/Keys:\s+account\s+counterparty\s+currency/);
+      expect(lines).toContain('(account, counterparty, currency) in 2-element set');
+      expect(lines).toContain(`ledger_index in (-Inf, ${world.head}]`);
+
+      // the stored lines and the tokens of the issuers: the key of token_lines and tokens, in one generation
+      const svc = await fresh();
+      await svc.insert(Table.TokenLines, [{ ...SAMPLE_ROWS[Table.TokenLines], generation: 1 }]);
+      await svc.insert(Table.Tokens, [{ ...SAMPLE_ROWS[Table.Tokens], generation: 1 }]);
+      const stored = await primaryOf(svc, STORED_LINES_SQL, {
+        g: 1,
+        issuers: [world.gate],
+        currencies: [world.usd],
+        holders: [world.pool],
+      });
+      expect(stored).toMatch(/Keys:\s+issuer\s+currency\s+holder/);
+      expect(stored).toContain('(issuer, currency, holder) in 1-element set');
+      const tokens = await primaryOf(svc, ISSUER_TOKENS_SQL, { g: 1, issuers: [world.gate, world.plain] });
+      expect(tokens).toMatch(/Keys:\s+issuer/);
+      expect(tokens).toContain('issuer in 2-element set');
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    it('reads the line states, the stored lines and the tokens of 2,001 keys in chunks of a query parameter', async () => {
+      const svc = await fresh();
+      const COUNT = TOKENS_STATE_CHUNK + 1;
+      const numbers = Array.from({ length: COUNT }, (_, n) => n);
+      const HIGH = 'rBulkZHighAccountxxxxxxxxxxxxxxxxxx';
+      const lowOf = (n: number): string => `rBulkLowAccount${String(n).padStart(5, '0')}xxxxxxxxxxxxxx`;
+      const currencyOf = (n: number): string => `${n.toString(16).toUpperCase().padStart(8, '0')}${'AB'.repeat(16)}`;
+      expect(currencyOf(0)).toHaveLength(40);
+      expect(lowOf(0) < HIGH).toBe(true);
+
+      // each line: the low account owes 5 and the high account's limit is 10, so that the low account's token has one holder
+      await svc.insert(
+        Table.TrustLineStates,
+        numbers.map((n) => ({
+          ...SAMPLE_ROWS[Table.TrustLineStates],
+          account: lowOf(n),
+          counterparty: HIGH,
+          currency: currencyOf(n),
+          ledger_index: 60,
+          balance: '-5',
+          limit: '0',
+          limit_peer: '10',
+          deleted: 0,
+        })),
+      );
+      const lines = numbers.map((n) => ({ account: lowOf(n), counterparty: HIGH, currency: currencyOf(n) }));
+
+      const spy = jest.spyOn(svc, 'query');
+      let queried: Array<Record<string, unknown>> = [];
+      let tokens: TokenKey[];
+      let ofIssuers: TokenKey[];
+      try {
+        tokens = await applyLineStates(svc, { generation: 3, lines, atLedger: 70, version: '20' });
+        // the tokens of 2,001 issuers
+        await svc.insert(
+          Table.Tokens,
+          numbers.map((n) => ({
+            ...SAMPLE_ROWS[Table.Tokens],
+            generation: 3,
+            issuer: lowOf(n),
+            currency: currencyOf(n),
+            version: '20',
+          })),
+        );
+        ofIssuers = await tokensOfIssuers(
+          svc,
+          3,
+          lines.map((line) => line.account),
+        );
+      } finally {
+        // restoring clears the record of the calls
+        queried = spy.mock.calls.map((call) => call[1] ?? {});
+        spy.mockRestore();
+      }
+
+      const arrays = (name: string): number[] =>
+        queried.flatMap((params) => (Array.isArray(params[name]) ? [(params[name] as unknown[]).length] : []));
+      // the 2,001 lines are read in a chunk of 2,000 and one of 1; their 4,002 rows of token_lines are named 2,000, 2,000 and 2
+      for (const name of ['accounts', 'counterparties']) {
+        expect(arrays(name).filter((length) => length > 1)).toEqual([TOKENS_STATE_CHUNK]);
+        expect(arrays(name).reduce((a, b) => a + b, 0)).toBe(COUNT);
+      }
+      expect(Math.max(...arrays('holders'))).toBe(TOKENS_STATE_CHUNK);
+      expect(arrays('holders').reduce((a, b) => a + b, 0)).toBe(2 * COUNT);
+      // the issuers of the tokens: 2,000 and 1, and both arrays of a line read are never over a chunk
+      expect(Math.max(...arrays('issuers'))).toBe(TOKENS_STATE_CHUNK);
+      for (const name of ['accounts', 'counterparties', 'currencies', 'issuers', 'holders']) {
+        expect(Math.max(...arrays(name))).toBeLessThanOrEqual(TOKENS_STATE_CHUNK);
+      }
+
+      // every line made a row for the low account's token, and both orientations of every line are named
+      expect(tokens).toHaveLength(2 * COUNT);
+      expect(ofIssuers).toHaveLength(COUNT);
+      const live = await liveLines(svc, 3);
+      expect(live.size).toBe(COUNT);
+      for (const n of [0, TOKENS_STATE_CHUNK - 1, TOKENS_STATE_CHUNK]) {
+        expect(live.get(lineMapKey({ issuer: lowOf(n), currency: currencyOf(n) }, HIGH))).toMatchObject({
+          balance: '5',
+          limit: '10',
+          ledger_index: 60,
+        });
+      }
     });
   });
 });
