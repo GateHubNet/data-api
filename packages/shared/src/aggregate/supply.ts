@@ -77,20 +77,25 @@ function wholeUnitsToDrops(text: string): bigint {
 }
 
 /**
- * The native currency a pool holds, in drops: its `reserve_base` when the base is the native currency (`native` with no
- * issuer: an issued currency of the same code is not it), else its `reserve_counter` when the counter is, else 0. A pool that is
+ * The reserve text of the pool's native side: its `reserve_base` when the base is the native currency (`native` with no issuer:
+ * an issued currency of the same code is not it), else its `reserve_counter` when the counter is. `undefined` when neither side
+ * is native, `null` when the native side has no reserve (the pool's row has never been given one).
+ */
+export function nativeSideReserve(pool: PoolReserves, native: string): string | null | undefined {
+  if (pool.base_currency === native && pool.base_issuer === '') return pool.reserve_base;
+  if (pool.counter_currency === native && pool.counter_issuer === '') return pool.reserve_counter;
+  return undefined;
+}
+
+/**
+ * The native currency a pool holds, in drops: the reserve of its native side (`nativeSideReserve`), else 0. A pool that is
  * deleted holds nothing, and a native side with no reserve counts as nothing. The reserve is exact decimal text in whole
  * units; a text that is not a whole number of drops throws.
  */
 export function nativeReserveDrops(pool: PoolReserves, native: string): bigint {
   if (pool.deleted) return 0n;
-  const reserve =
-    pool.base_currency === native && pool.base_issuer === ''
-      ? pool.reserve_base
-      : pool.counter_currency === native && pool.counter_issuer === ''
-        ? pool.reserve_counter
-        : null;
-  return reserve === null ? 0n : wholeUnitsToDrops(reserve);
+  const reserve = nativeSideReserve(pool, native);
+  return reserve == null ? 0n : wholeUnitsToDrops(reserve);
 }
 
 /** The drops the cap lost: `NATIVE_CAP_DROPS − totalCoins` (the XRP Ledger burns fees; it never mints). */

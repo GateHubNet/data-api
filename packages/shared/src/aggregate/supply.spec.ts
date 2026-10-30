@@ -2,6 +2,7 @@ import {
   burnedFromCap,
   NATIVE_CAP_DROPS,
   nativeReserveDrops,
+  nativeSideReserve,
   PoolReserves,
   reservesDrops,
   SUPPLY_ACCOUNT_PREFIXES,
@@ -131,6 +132,22 @@ describe('the supply arithmetic', () => {
 
     it('counts a native side without a reserve as nothing', () => {
       expect(nativeReserveDrops(pool({ reserve_base: null }), 'XRP')).toBe(0n);
+    });
+
+    it('tells a native side with no reserve (null) from a pool with no native side (undefined)', () => {
+      expect(nativeSideReserve(pool({}), 'XRP')).toBe('1.5');
+      expect(nativeSideReserve(pool({ reserve_base: null }), 'XRP')).toBeNull();
+      expect(nativeSideReserve(pool({ base_currency: 'EUR', base_issuer: 'rOther' }), 'XRP')).toBeUndefined();
+      // a deleted pool still has the side; it is `nativeReserveDrops` that counts it as nothing
+      expect(nativeSideReserve(pool({ deleted: true }), 'XRP')).toBe('1.5');
+      const counter = pool({
+        base_currency: 'USD',
+        base_issuer: 'rIssuer',
+        counter_currency: 'XRP',
+        counter_issuer: '',
+      });
+      expect(nativeSideReserve({ ...counter, reserve_counter: null }, 'XRP')).toBeNull();
+      expect(nativeSideReserve(counter, 'XRP')).toBe('9999');
     });
 
     it('is exact where a float is not', () => {
