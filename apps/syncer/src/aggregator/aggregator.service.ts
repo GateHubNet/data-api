@@ -19,6 +19,7 @@ import {
   ShutdownSignals,
   StatsRecomputeAborted,
   Table,
+  TokensAborted,
   VOLUME_METRICS,
   volumeDaysDone,
   VolumeMetric,
@@ -156,6 +157,14 @@ export const AGGREGATOR_NFT_STATE_BUDGET_MS = 3000;
  * The budget is checked before a step and never in one, so the job may run as long as one step beyond it.
  */
 export const AGGREGATOR_ESCROWS_BUDGET_MS = 2000;
+
+/**
+ * How much of the tick `tokens` (the issued tokens' generations: the touches of the live one, its repair, the housekeeping, the
+ * account pass of the one that builds) may use. It runs after `markets_live` and before `stats_live`. A window of touches or a
+ * batch of accounts is a few statements and is not cut, so this is a bound for a database that has gone slow, or for the first build
+ * over all accounts (the pass goes on at the next tick where its stored cursor says).
+ */
+export const AGGREGATOR_TOKENS_BUDGET_MS = 4000;
 
 /** How much of the tick `nft_collections` (the collections whose NFTs were rebuilt) may use; it runs every `NFT_COLLECTIONS_EVERY_TICKS` ticks. */
 export const AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS = 3000;
@@ -460,9 +469,9 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *  - **Shutdown** (module destroy, or SIGTERM through `ShutdownSignals`): no tick starts after it; the signal of the slice or set
  *    in flight is aborted, so that its rows are not written (the abort, `StatsRecomputeAborted`, `VolumeRecomputeAborted`,
  *    `AggregateSetAborted`, `AmmPoolsRecomputeAborted`, `AmmDailyRecomputeAborted`, `NftRebuildAborted`,
- *    `NftCollectionsRecomputeAborted` or `EscrowsAborted`, is neither logged as an error nor counted); no change to `agg_dirty`
- *    is started after it (a narrowing that has inserted its row finishes its delete, so as not to leave the old row beside the
- *    new one). The stop waits for the tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`, then abandons it and says so.
+ *    `NftCollectionsRecomputeAborted`, `EscrowsAborted` or `TokensAborted`, is neither logged as an error nor counted); no change
+ *    to `agg_dirty` is started after it (a narrowing that has inserted its row finishes its delete, so as not to leave the old row
+ *    beside the new one). The stop waits for the tick for at most `AGGREGATOR_SHUTDOWN_WAIT_MS`, then abandons it and says so.
  */
 @Injectable()
 export class AggregatorService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -528,6 +537,7 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
       nft_collections: AGGREGATOR_NFT_COLLECTIONS_BUDGET_MS,
       pair_hourly: AGGREGATOR_PAIR_HOURLY_BUDGET_MS,
       markets_live: AGGREGATOR_MARKETS_LIVE_BUDGET_MS,
+      tokens: AGGREGATOR_TOKENS_BUDGET_MS,
       stats_live: options.liveBudgetMs ?? AGGREGATOR_LIVE_BUDGET_MS,
       stats_dirty: AGGREGATOR_DIRTY_BUDGET_MS,
       amm_daily: AGGREGATOR_AMM_DAILY_BUDGET_MS,
@@ -768,7 +778,8 @@ export class AggregatorService implements OnApplicationBootstrap, OnModuleDestro
         err instanceof AmmDailyRecomputeAborted ||
         err instanceof NftRebuildAborted ||
         err instanceof NftCollectionsRecomputeAborted ||
-        err instanceof EscrowsAborted)
+        err instanceof EscrowsAborted ||
+        err instanceof TokensAborted)
     ) {
       this.logger.log(`Dropped the ${job} slice in flight at shutdown`);
       return;

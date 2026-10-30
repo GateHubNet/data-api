@@ -167,6 +167,26 @@ const metrics = {
     help: 'Open native escrows, as the sentinel of the escrows job counts them.',
     registers: [registry],
   }),
+  tokensLive: new Gauge({
+    name: 'syncer_tokens_live',
+    help: "1 when a live generation of the issued tokens exists, else 0. Gates the explorer's TOKENS switch.",
+    registers: [registry],
+  }),
+  tokensLagLedgers: new Gauge({
+    name: 'syncer_tokens_lag_ledgers',
+    help: 'Ledgers between the newest committed ledger and the through_ledger of the live generation of the issued tokens (0 without one).',
+    registers: [registry],
+  }),
+  tokensBuilding: new Gauge({
+    name: 'syncer_tokens_building',
+    help: '1 while a generation of the issued tokens builds, else 0. The account cursor of its pass is logged at each batch.',
+    registers: [registry],
+  }),
+  tokensRepairLedgers: new Gauge({
+    name: 'syncer_tokens_repair_ledgers',
+    help: 'through_ledger less repair_from of the live generation of the issued tokens: the ledgers its repair applies again, 0 without a repair.',
+    registers: [registry],
+  }),
   validatorsUnlFetchesTotal: new Counter({
     name: 'syncer_validators_unl_fetches_total',
     help: 'Validator list fetches, by publisher and outcome (ok, unchanged, or the reason code of the failure).',
@@ -291,6 +311,10 @@ export class PrometheusService implements OnModuleInit {
   readonly nftCollectionsPending = metrics.nftCollectionsPending;
   readonly escrowsLagLedgers = metrics.escrowsLagLedgers;
   readonly escrowsOpen = metrics.escrowsOpen;
+  readonly tokensLive = metrics.tokensLive;
+  readonly tokensLagLedgers = metrics.tokensLagLedgers;
+  readonly tokensBuilding = metrics.tokensBuilding;
+  readonly tokensRepairLedgers = metrics.tokensRepairLedgers;
   readonly validatorsUnlFetchesTotal = metrics.validatorsUnlFetchesTotal;
   readonly validatorsUnlExpirySeconds = metrics.validatorsUnlExpirySeconds;
   readonly validatorsUnlSize = metrics.validatorsUnlSize;

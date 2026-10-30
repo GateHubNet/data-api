@@ -9,6 +9,7 @@ import {
   RatesService,
   RollupState,
   Table,
+  TokensAborted,
 } from '@gatehub/data-api-shared';
 import { DAY, HOUR, iso, NOW, unix } from '../../test/aggregate-job-fakes';
 import { AggregateFunctions } from './aggregate-job-deps';
@@ -1072,6 +1073,28 @@ describe('the schedule of the aggregator with the account and market jobs', () =
       expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('shutdown'));
       // and the range, whose slice was cut short, is left as it was
       if (setup === 'range') expect(ch.dirty).toEqual([{ from: unix(DIRTY_FROM), to: unix(DIRTY_TO), created: 1000 }]);
+    });
+
+    it('a TokensAborted, which the tokens job throws, is dropped at shutdown like the others (any job reaches the same rule)', async () => {
+      caughtUp();
+      world.busy(0);
+      const svc = service();
+      world.throwOn.set('pair_hourly', () => {
+        void svc.stop();
+        return new TokensAborted();
+      });
+      await svc.tick();
+      expect(metrics.aggregatorErrorsTotal.inc).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('shutdown'));
+    });
+
+    it('while a TokensAborted that the shutdown did not cause is an error, as any failure', async () => {
+      caughtUp();
+      world.busy(0);
+      world.throwOn.set('pair_hourly', () => new TokensAborted());
+      await service().tick();
+      expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledWith({ job: 'pair_hourly' });
     });
 
     it('while a real failure of the same job still is an error', async () => {

@@ -169,6 +169,44 @@ describe('PrometheusService', () => {
     }
   });
 
+  it('registers the four gauges of the tokens job with their names, types, label sets and help texts (spec section 3.8)', async () => {
+    const service = new PrometheusService();
+    service.onModuleInit();
+    service.tokensLive.set(1);
+    service.tokensLagLedgers.set(12);
+    service.tokensBuilding.set(1);
+    service.tokensRepairLedgers.set(340);
+
+    const text = await service.getMetrics();
+    const declared: [string, string, number][] = [
+      [
+        'syncer_tokens_live',
+        "1 when a live generation of the issued tokens exists, else 0. Gates the explorer's TOKENS switch.",
+        1,
+      ],
+      [
+        'syncer_tokens_lag_ledgers',
+        'Ledgers between the newest committed ledger and the through_ledger of the live generation of the issued tokens (0 without one).',
+        12,
+      ],
+      [
+        'syncer_tokens_building',
+        '1 while a generation of the issued tokens builds, else 0. The account cursor of its pass is logged at each batch.',
+        1,
+      ],
+      [
+        'syncer_tokens_repair_ledgers',
+        'through_ledger less repair_from of the live generation of the issued tokens: the ledgers its repair applies again, 0 without a repair.',
+        340,
+      ],
+    ];
+    for (const [name, help, value] of declared) {
+      expect(text).toContain(`# HELP ${name} ${help}\n# TYPE ${name} gauge\n`);
+      expect(text).toMatch(new RegExp(`^${name} ${value}$`, 'm'));
+      expect((service.registry.getSingleMetric(name) as unknown as { labelNames: string[] }).labelNames).toEqual([]);
+    }
+  });
+
   describe('the declaration of the validators metrics', () => {
     // [name, type, declared label names (exactly), HELP text (spec section 6)]
     const declared: [string, string, string[], string][] = [
