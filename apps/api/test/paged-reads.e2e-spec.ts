@@ -320,6 +320,36 @@ describe('a page reads the granules it needs, not the range (read_rows over a bu
       expect((body.payments as unknown[]).length).toBe(5);
     });
 
+    describe('/v2/tokens/:token/transfers (payments_by_currency)', () => {
+      const transfers = (): string => page(`/v2/tokens/${accounts.currency}/transfers`, [MID, 1]);
+
+      it('a page of 5 transfers that starts inside the bulk reads about a granule of each part, and is whole', async () => {
+        const { body } = await expectBounded(Table.PaymentsByCurrency, transfers(), 'transfers');
+        // the five keys after the marker in the direction of the list, and the marker of the page after them
+        expect((body.transfers as { ledger_index: number }[]).map((t) => t.ledger_index)).toEqual(
+          descending ? [MID, MID - 1, MID - 1, MID - 1, MID - 1] : [MID, MID, MID + 1, MID + 1, MID + 1],
+        );
+        expect(body.count).toBe(5);
+        expect(body.marker).toBe(markerOf(descending ? [MID - 1, 0] : [MID + 1, 2]));
+        // and the rows of the page, read from payments by their keys, are a few granules too
+        await expectBounded(Table.Payments, transfers(), 'transfers');
+      });
+
+      it('the page read is read in the order of the key and stops after its rows', async () => {
+        const path = transfers();
+        const { statements } = await served(h, api, Table.PaymentsByCurrency, path, 'transfers');
+        const reads = statements.filter(([sql]) => isPageRead(sql));
+        expect(reads).toHaveLength(1);
+        const [sql, params] = reads[0];
+        await expectBoundedInOrderRead(h, sql, params, descending, path);
+        // the token is a condition of the inner read, bound and not written into the statement
+        expect(innerRead(sql)).toContain('currency = {currency:String}');
+        expect(innerRead(sql)).toContain('issuer = {issuer:String}');
+        expect(sql).not.toContain(accounts.currency.split('+')[1]);
+        expect(sql).not.toMatch(/\bFINAL\b/i);
+      });
+    });
+
     it('/v2/exchanges/:base/:counter (exchanges)', async () => {
       const { body } = await expectBounded(
         Table.Exchanges,

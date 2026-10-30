@@ -11,6 +11,8 @@ import {
   TOKEN_ANSWER_KEYS,
   TOKEN_KEYS,
   TOKEN_MARKET_KEYS,
+  TRANSFER_ROW_KEYS,
+  TRANSFERS_ANSWER_KEYS,
 } from '../src/tokens/token-objects';
 import { ApiClient, Harness, NO_RATE_LIMIT, startHarness } from './harness';
 import { cells, compare, decodeMarker, iso, lines, primaryKeys, served } from './support/amm';
@@ -2034,5 +2036,554 @@ describe('GET /v2/tokens/{currency}.{issuer} and /holders on the world of what a
     expect(pageKey.condition).toContain(`issuer in ['${ISSUER_A}', '${ISSUER_A}']`);
     expect(pageKey.granules[0]).toBeLessThanOrEqual(2 * PASS_OVER_PARTS);
     expect(pageKey.granules[1]).toBeGreaterThan(LIVE_LINES_BULK / GRANULE);
+  });
+});
+
+// =====================================================================================================================
+// the transfers of a token (spec 5.4)
+// =====================================================================================================================
+
+/**
+ * `GET /v2/tokens/{currency}.{issuer}/transfers` on the recorded ledgers of the path payments (`xrpl-path-payments`, the fixtures
+ * README): 7 ledgers whose payments were read off by hand. The tokens it uses:
+ *  - RLUSD of `rMxC…` (the hex `524C…`): five payments in two ledgers, the first of 107872476 with a maximum `amount` of
+ *    1000000000000000e-1 that delivers 0.2121364558499999 (a transfer's `amount` is what was delivered), the four of 107873024
+ *    with a source tag. The ledger 107873024 holds a sixth payment of RLUSD, tx 142, by `rwG5…` to itself: a conversion, a path
+ *    payment and no payment, so it is no transfer;
+ *  - USD of `rMwj…`: two payments of 1 in one ledger (11999941, the transactions 12 and 13);
+ *  - Sanctum of `rNcq…`: a payment to its own issuer with the destination tag 0 (a tag of 0 is a tag);
+ *  - DIP of `rUmZ…`: one payment that delivered 16538.3324944, with a stored `amount` of 772003547.5625318;
+ *  - WBLV of `rMhk…`: payments to oneself only, so none.
+ */
+const RLUSD_ISSUER = 'rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De';
+const RLUSD_PATH = `/v2/tokens/RLUSD.${RLUSD_ISSUER}/transfers`;
+const USD_PATH = '/v2/tokens/USD.rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q/transfers';
+const SANCTUM_PATH = '/v2/tokens/Sanctum.rNcqT1tds4vdroichNKuTh3Ppd8KAdFHnN/transfers';
+const DIP_PATH = '/v2/tokens/DIP.rUmZDci9VKj9BgiBCE9TsLpypERU6jJqxR/transfers';
+const WBLV_PATH = '/v2/tokens/WBLV.rMhk9GPrsoWWAgWB4ai9QrELm8G1rMDySM/transfers';
+
+const RLUSD_TRANSFERS: Obj[] = [
+  {
+    hash: '2DD69A5FB706C325BEB11EF19B177EFEFE0597823E4474996BB3C35FE38715E3',
+    ledger_index: 107872476,
+    executed_time: '2026-10-24T13:45:51Z',
+    source: 'rajCZLPm7AnGJrQRwiuJHN1xZw5KLAvQTe',
+    destination: 'raJmzfum8TF4eR4cBkSiMAmKJHwAQKNZNT',
+    amount: '0.2121364558499999',
+  },
+  {
+    hash: '3EBBB8672ADA7B5EADBE3878740346DD60B667D4919E1084D2E140238F0D2044',
+    ledger_index: 107873024,
+    executed_time: '2026-10-24T14:21:42Z',
+    source: 'rfaF3eu2m192LkHKdxRfzd68oEC1paa57',
+    destination: 'rMPwy3Ntx56Nyc2fKGNm7VRWdmpHSB92Z7',
+    amount: '0.002',
+    source_tag: 804681468,
+  },
+  {
+    hash: '82BA04923E8DDBE740C8EBDB584AB5F7A373ADA491D583320DAA63D1A2D6650D',
+    ledger_index: 107873024,
+    executed_time: '2026-10-24T14:21:42Z',
+    source: 'rnBBvCh2SKLuAaWv3RYqQMpBKEtGodDEXE',
+    destination: 'ra9b6JX5aPVbdJhogDDddsRAcasWg7gzC3',
+    amount: '0.006',
+    source_tag: 804681468,
+  },
+  {
+    hash: '54605B551E528AEC06E5D0C90F865F5146EBB1017E51C0CAA4F7F1C120023B0C',
+    ledger_index: 107873024,
+    executed_time: '2026-10-24T14:21:42Z',
+    source: 'rEWw5NtgMHduW5HGrVcNJnrft3cmX8eohT',
+    destination: 'ra9b6JX5aPVbdJhogDDddsRAcasWg7gzC3',
+    amount: '0.006',
+    source_tag: 804681468,
+  },
+  {
+    hash: 'EE8F91A02C1AC5CBF95336A34969DCCF28394FB535C7A5AFB7B293EF01489D13',
+    ledger_index: 107873024,
+    executed_time: '2026-10-24T14:21:42Z',
+    source: 'rQBHKLStC1h4PiCmpL7PbFTkpHs9F7vmtV',
+    destination: 'ra9b6JX5aPVbdJhogDDddsRAcasWg7gzC3',
+    amount: '0.006',
+    source_tag: 804681468,
+  },
+];
+/** The keys `(ledger_index, tx_index)` of the RLUSD transfers, which the markers hold. */
+const RLUSD_KEYS: [number, number][] = [
+  [107872476, 268],
+  [107873024, 5],
+  [107873024, 29],
+  [107873024, 115],
+  [107873024, 144],
+];
+const USD_TRANSFERS: Obj[] = [
+  {
+    hash: 'E8400F741F3A8A770675FFBC68978446048E1B7F0225EBA6D1B48FF4DAB3E091',
+    ledger_index: 11999941,
+    executed_time: '2015-03-01T11:13:10Z',
+    source: 'rLD5UcXZYgnhp12ivLZvpRx3JBBmz9PrvA',
+    destination: 'rGhsEo2jCEp2k46Zx1arv9t7U5KTTUr4QV',
+    amount: '1',
+  },
+  {
+    hash: 'E362675D8230B1A615C9BF53BC0B288F3AAA36CDF8D4D3E3EE8A681966BE8397',
+    ledger_index: 11999941,
+    executed_time: '2015-03-01T11:13:10Z',
+    source: 'rLD5UcXZYgnhp12ivLZvpRx3JBBmz9PrvA',
+    destination: 'rGhsEo2jCEp2k46Zx1arv9t7U5KTTUr4QV',
+    amount: '1',
+  },
+];
+const SANCTUM_TRANSFERS: Obj[] = [
+  {
+    hash: '196DF224FABA0748314F72CBC788299024E5953465772E395AD3BA9A26A3335A',
+    ledger_index: 107873045,
+    executed_time: '2026-10-24T14:23:10Z',
+    source: 'rfLquFDGTFnvzb5C3Pf9BsgukRBa6DdtZe',
+    destination: 'rNcqT1tds4vdroichNKuTh3Ppd8KAdFHnN',
+    amount: '0.0000000074',
+    destination_tag: 0,
+  },
+];
+const DIP_TRANSFERS: Obj[] = [
+  {
+    hash: '8AFED3CFAFC890BF399AC789450A0122BB01293F4982C4CA67A25F33A776B6C9',
+    ledger_index: 107873024,
+    executed_time: '2026-10-24T14:21:42Z',
+    source: 'rPP3R33zpehB5hTy2jSYZek5ntq3HQym68',
+    destination: 'rUgpReijx3tRpW7s1AcP14uGvET3bxTtBj',
+    amount: '16538.3324944',
+  },
+];
+/** The coverage of the world as seeded: the oldest stored ledger is where the history starts, and the network starts at 32570. */
+const SEEDED_COVERAGE = { from_ledger_index: 11_999_941, complete: false };
+
+describe('GET /v2/tokens/{currency}.{issuer}/transfers on the recorded ledgers of the path payments', () => {
+  let h: Harness;
+  let api: ApiClient;
+  let get: ApiClient['get'];
+
+  beforeAll(async () => {
+    h = await startHarness({ seed: 'xrpl-path-payments', env: NO_RATE_LIMIT, controllers: CACHE_ROUTE });
+    api = await h.api();
+    get = api.get;
+  }, 300_000);
+  afterAll(async () => {
+    await h?.close();
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const clearCache = async (): Promise<void> => {
+    await api.ok('/v2/test-cache/clear', 'result');
+  };
+  const transfersOf = async (path: string): Promise<Obj> => (await api.ok(path, 'transfers')).body as Obj;
+  /** The answer of the world as seeded for transfers: `count` is theirs, the coverage is the seeded one. */
+  const answer = (transfers: Obj[], marker?: string): Obj => ({
+    result: 'success',
+    coverage: SEEDED_COVERAGE,
+    count: transfers.length,
+    ...(marker !== undefined && { marker }),
+    transfers,
+  });
+  /** `?a=1&b=2`, encoded. */
+  const qs = (params: Record<string, string | number | boolean>): string =>
+    `?${new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)]))}`;
+
+  it('the data is as the tests assume', async () => {
+    const keys = async (table: Table, currency: string, issuer: string): Promise<number[][]> =>
+      (
+        await h.ch.query<{ ledger_index: number; tx_index: number }>(
+          `SELECT ledger_index, tx_index FROM ${table} WHERE currency = {currency:String} AND issuer = {issuer:String}
+            ORDER BY ledger_index, tx_index`,
+          { currency, issuer },
+        )
+      ).map((r) => [r.ledger_index, r.tx_index]);
+    const rlusd = '524C555344000000000000000000000000000000';
+    expect(await keys(Table.PaymentsByCurrency, rlusd, RLUSD_ISSUER)).toEqual(RLUSD_KEYS);
+    // the payment to oneself, tx 142 of 107873024 (and its way back, in XRP): a path payment each, and no payment
+    expect(await keys(Table.PathPayments, rlusd, RLUSD_ISSUER)).toContainEqual([107873024, 142]);
+    const [self] = await h.ch.query<{ source: string; destination: string; delivered_amount: string }>(
+      `SELECT source, destination, delivered_amount FROM ${Table.PathPayments} WHERE ledger_index = 107873024 AND tx_index = 142`,
+    );
+    expect(self.source).toBe(self.destination);
+    expect(self.delivered_amount).toBe('0.2421239281499999');
+    const [{ n }] = await h.ch.query<{ n: string }>(
+      `SELECT count() AS n FROM ${Table.Payments} WHERE ledger_index = 107873024 AND tx_index IN (142, 143)`,
+    );
+    expect(Number(n)).toBe(0);
+    // WBLV has payments to oneself and no payment
+    expect(
+      await keys(
+        Table.PaymentsByCurrency,
+        '57424C5600000000000000000000000000000000',
+        'rMhk9GPrsoWWAgWB4ai9QrELm8G1rMDySM',
+      ),
+    ).toEqual([]);
+    expect(
+      (await keys(Table.PathPayments, '57424C5600000000000000000000000000000000', 'rMhk9GPrsoWWAgWB4ai9QrELm8G1rMDySM'))
+        .length,
+    ).toBeGreaterThan(3);
+  });
+
+  it('transfers: the payments that delivered the token, payments to oneself left out, oldest first and descending', async () => {
+    const asc = await api.ok(RLUSD_PATH, 'transfers');
+    expect(asc.body).toEqual(answer(RLUSD_TRANSFERS));
+    // the keys, in their order: the answer's (no marker on a last page), the coverage's, the rows'
+    expectKeysInOrder(asc.body, TRANSFERS_ANSWER_KEYS);
+    expect(Object.keys(asc.body)).toEqual(['result', 'coverage', 'count', 'transfers']);
+    expectKeysInOrder(asc.body.coverage, COVERAGE_KEYS);
+    for (const row of asc.body.transfers as Obj[]) expectKeysInOrder(row, TRANSFER_ROW_KEYS);
+    expect(asc.headers['cache-control']).toBe('private, max-age=60');
+    expect(asc.headers.link).toBeUndefined();
+
+    // the sixth payment of RLUSD in the ledger, to oneself, is not among them
+    const hashes = (asc.body.transfers as Obj[]).map((t) => t.hash);
+    expect(hashes).not.toContain('CD912AE203499F6B19AA2B2F91F2A082D2D048F1EC55EACAA3F5A554D36F7618');
+    expect(asc.body.count).toBe(5);
+
+    // descending is the same rows the other way round; anything but /true/i is ascending, and an empty value too
+    const desc = await transfersOf(`${RLUSD_PATH}?descending=true`);
+    expect(desc).toEqual(answer([...RLUSD_TRANSFERS].reverse()));
+    expect(await transfersOf(`${RLUSD_PATH}?descending=TRUE`)).toEqual(desc);
+    for (const flag of ['false', '', '0', 'no'])
+      expect(await transfersOf(`${RLUSD_PATH}?descending=${flag}`)).toEqual(asc.body);
+
+    // the amount is the delivered one (the first RLUSD payment's stored `amount` is 1000000000000000e-1, DIP's 772003547.5625318),
+    // a tag of 0 is a tag, and two payments of one ledger are in the order of their transactions
+    expect(await transfersOf(DIP_PATH)).toEqual(answer(DIP_TRANSFERS));
+    expect(await transfersOf(SANCTUM_PATH)).toEqual(answer(SANCTUM_TRANSFERS));
+    expect(await transfersOf(USD_PATH)).toEqual(answer(USD_TRANSFERS));
+    expect(await transfersOf(`${USD_PATH}?descending=true`)).toEqual(answer([...USD_TRANSFERS].reverse()));
+    // payments to oneself only: no transfer
+    expect(await transfersOf(WBLV_PATH)).toEqual(answer([]));
+    expect(Object.keys(await transfersOf(WBLV_PATH))).toEqual(['result', 'coverage', 'count', 'transfers']);
+
+    // every spelling of the token lists the same transfers: the hex in either case, + and | for the dot, a code in any case
+    const rlusdHex = '524C555344000000000000000000000000000000';
+    for (const segment of [
+      `${rlusdHex}.${RLUSD_ISSUER}`,
+      `${rlusdHex.toLowerCase()}+${RLUSD_ISSUER}`,
+      `RLUSD%7C${RLUSD_ISSUER}`,
+    ]) {
+      expect([segment, await transfersOf(`/v2/tokens/${segment}/transfers`)]).toEqual([segment, asc.body]);
+    }
+    expect(await transfersOf('/v2/tokens/usd.rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q/transfers')).toEqual(
+      answer(USD_TRANSFERS),
+    );
+
+    // the window of /v2/payments: start is inclusive, end is the end of the period it names, an empty start is none
+    const at = '2026-10-24T14:21:42';
+    expect(await transfersOf(`${RLUSD_PATH}${qs({ start: `${at}Z` })}`)).toEqual(answer(RLUSD_TRANSFERS.slice(1)));
+    expect(await transfersOf(`${RLUSD_PATH}${qs({ start: '2026-10-24T14:21:43Z' })}`)).toEqual(answer([]));
+    expect(await transfersOf(`${RLUSD_PATH}${qs({ end: '2026-10-24T13:45:51Z' })}`)).toEqual(
+      answer(RLUSD_TRANSFERS.slice(0, 1)),
+    );
+    expect(await transfersOf(`${RLUSD_PATH}${qs({ end: '2026-10-24T13:45:50Z' })}`)).toEqual(answer([]));
+    expect(await transfersOf(`${RLUSD_PATH}${qs({ start: `${at}Z`, end: `${at}Z`, descending: true })}`)).toEqual(
+      answer(RLUSD_TRANSFERS.slice(1).reverse()),
+    );
+    expect(await transfersOf(`${RLUSD_PATH}?start=`)).toEqual(asc.body);
+    expect(await transfersOf(`${RLUSD_PATH}${qs({ start: '2026-10-24', end: '2026-10-24' })}`)).toEqual(asc.body);
+    expect(await transfersOf(`${RLUSD_PATH}${qs({ end: '2026-10-23' })}`)).toEqual(answer([]));
+
+    // limit: the default 200, a non-number or below 1 is the default, a page is cut at it
+    expect(await transfersOf(`${RLUSD_PATH}?limit=abc`)).toEqual(asc.body);
+    expect(await transfersOf(`${RLUSD_PATH}?limit=0`)).toEqual(asc.body);
+    expect(await transfersOf(`${RLUSD_PATH}?limit=100000`)).toEqual(asc.body);
+    expect((await transfersOf(`${RLUSD_PATH}?limit=2`)).transfers).toEqual(RLUSD_TRANSFERS.slice(0, 2));
+
+    // pages: the marker is the key of the last row, the next page continues strictly after it, both directions
+    const marked = (i: number): string => markerOf(RLUSD_KEYS[i]);
+    for (const limit of [1, 2, 3, 4]) {
+      const pages = await api.pages<Obj>(RLUSD_PATH, limit, 'transfers');
+      expect([limit, pages.flatMap((p) => p.transfers as Obj[])]).toEqual([limit, RLUSD_TRANSFERS]);
+      expect([limit, pages.map((p) => p.count)]).toEqual([
+        limit,
+        Array.from({ length: Math.ceil(5 / limit) }, (_, i) => Math.min(limit, 5 - i * limit)),
+      ]);
+      const down = await api.pages<Obj>(`${RLUSD_PATH}?descending=true`, limit, 'transfers');
+      expect([limit, down.flatMap((p) => p.transfers as Obj[])]).toEqual([limit, [...RLUSD_TRANSFERS].reverse()]);
+    }
+    const first = await get(`${RLUSD_PATH}?limit=2`);
+    expect(first.body).toEqual(answer(RLUSD_TRANSFERS.slice(0, 2), marked(1)));
+    expect(Object.keys(first.body)).toEqual(['result', 'coverage', 'count', 'marker', 'transfers']);
+    expectKeysInOrder(first.body, TRANSFERS_ANSWER_KEYS);
+    expect(first.headers.link).toBe(
+      `<${new URL(first.request.url).origin}${RLUSD_PATH}?limit=2&marker=${marked(1)}>; rel="next"`,
+    );
+    expect((await get(`${RLUSD_PATH}?limit=2&marker=${marked(1)}`)).body).toEqual(
+      answer(RLUSD_TRANSFERS.slice(2, 4), marked(3)),
+    );
+    expect((await get(`${RLUSD_PATH}?limit=2&marker=${marked(3)}`)).body).toEqual(answer(RLUSD_TRANSFERS.slice(4)));
+    expect((await get(`${RLUSD_PATH}?limit=2&descending=true&marker=${marked(3)}`)).body).toEqual(
+      answer([RLUSD_TRANSFERS[2], RLUSD_TRANSFERS[1]], marked(1)),
+    );
+    // a marker is a place, not a row of the list: any key works, and one past the end of the history is an empty page
+    expect((await get(`${RLUSD_PATH}?marker=${markerOf([107873024, 6])}`)).body).toEqual(
+      answer([RLUSD_TRANSFERS[2], RLUSD_TRANSFERS[3], RLUSD_TRANSFERS[4]]),
+    );
+    expect((await get(`${RLUSD_PATH}?marker=${markerOf([999_999_999, 0])}`)).body).toEqual(answer([]));
+  });
+
+  it('transfers of a token the aggregate does not know', async () => {
+    // a live generation (through a ledger that is stored) that knows no token at all: RLUSD has no row in it, so its detail and its
+    // holders are 404 ...
+    await h.ch.insert(Table.Ledgers, [{ ...ledgerRow(THROUGH, THROUGH_CLOSE), parser_version: STATE_PARSER_VERSION }]);
+    await h.ch.insert(Table.TokenGenerations, [generationRow(LIVE, 'live', 10)]);
+    await clearCache();
+    for (const path of [RLUSD_PATH.replace('/transfers', ''), RLUSD_PATH.replace('/transfers', '/holders')]) {
+      const res = await get(path);
+      expect([path, res.status, res.body]).toEqual([path, 404, { result: 'error', message: 'token not found' }]);
+    }
+    // ... and its transfers are listed all the same, from the payments, and without a read of the aggregate
+    const query = jest.spyOn(h.ch, 'query');
+    expect(await transfersOf(RLUSD_PATH)).toEqual(answer(RLUSD_TRANSFERS));
+    // a token nobody was paid in is an empty list, not a 404
+    const nobody = await get(`/v2/tokens/FOO.${RLUSD_ISSUER}/transfers`);
+    expect([nobody.status, nobody.body]).toEqual([200, answer([])]);
+    const statements = query.mock.calls.map(([sql]) => String(sql));
+    jest.restoreAllMocks();
+    expect(statements.length).toBeGreaterThan(0);
+    for (const table of [Table.Tokens, Table.TokenLines, Table.TokenGenerations]) {
+      expect([table, statements.filter((sql) => new RegExp(`FROM ${table}\\b`).test(sql))]).toEqual([table, []]);
+    }
+
+    // an LP currency counts for nothing in the aggregate, and its payments are transfers: one is written, a copy of the
+    // first payment of 107873024 (transaction 5) with another position, hash and currency
+    const lp = `03${'AB'.repeat(19)}`;
+    const lpHash = 'A'.repeat(64);
+    const copy = (table: Table, where: string): Promise<void> =>
+      h.ch.command(
+        `INSERT INTO ${table} SELECT tpl.* REPLACE (toUInt32(900) AS tx_index, {lp:String} AS currency${
+          table === Table.Payments ? ', {hash:String} AS tx_hash' : ''
+        }) FROM (SELECT * FROM ${table} WHERE ${where}) AS tpl`,
+        { lp, hash: lpHash },
+      );
+    await copy(Table.Payments, 'ledger_index = 107873024 AND tx_index = 5');
+    await copy(Table.PaymentsByCurrency, `ledger_index = 107873024 AND tx_index = 5 AND issuer = '${RLUSD_ISSUER}'`);
+    await clearCache();
+    const lpPath = `/v2/tokens/${lp}.${RLUSD_ISSUER}/transfers`;
+    expect(await transfersOf(lpPath)).toEqual(answer([{ ...RLUSD_TRANSFERS[1], hash: lpHash }]));
+    // the same token by its lower-case hex, and the other tokens of the issuer are untouched
+    expect(await transfersOf(lpPath.replace(lp, lp.toLowerCase()))).toEqual(await transfersOf(lpPath));
+    expect(await transfersOf(RLUSD_PATH)).toEqual(answer(RLUSD_TRANSFERS));
+  });
+
+  it("transfers errors in /v2/payments' order", async () => {
+    // the path's 400s, then `start`, `end` and the marker; and none of them reads anything
+    const issuer = RLUSD_ISSUER;
+    const token = `/v2/tokens/RLUSD.${issuer}/transfers`;
+    const cases: [string, string][] = [
+      // the path first, whatever the query holds
+      [`/v2/tokens/A-B.${issuer}/transfers${qs({ start: 'x', end: 'y', marker: '!' })}`, 'invalid currency'],
+      [`/v2/tokens/XRP.${issuer}/transfers${qs({ start: 'x', end: 'y', marker: '!' })}`, 'XRP cannot have an issuer'],
+      [
+        `/v2/tokens/RLUSD.rNotAnAddress/transfers${qs({ start: 'x', end: 'y', marker: '!' })}`,
+        'invalid issuer address',
+      ],
+      [`/v2/tokens/RLUSD/transfers${qs({ start: 'x', end: 'y', marker: '!' })}`, 'invalid issuer address'],
+      // then the dates, start before end
+      [`${token}${qs({ start: 'x', end: 'y', marker: '!' })}`, 'invalid start date format'],
+      [`${token}${qs({ start: '2026-13-45' })}`, 'invalid start date format'],
+      [`${token}${qs({ end: 'y', marker: '!' })}`, 'invalid end date format'],
+      [`${token}${qs({ start: '', end: 'y', marker: '!' })}`, 'invalid end date format'],
+      // then the marker, whatever the window and the other parameters hold
+      [`${token}${qs({ marker: '!' })}`, 'invalid marker'],
+      [`${token}${qs({ start: '2030-01-01', marker: '!' })}`, 'invalid marker'],
+      [`${token}${qs({ limit: 'abc', descending: 'maybe', marker: '!' })}`, 'invalid marker'],
+    ];
+    for (const marker of [
+      '!!!',
+      '20130611200120|000001021029|00001',
+      Buffer.from('not json').toString('base64url'),
+      Buffer.from('[1]').toString('base64url'),
+      Buffer.from('[1,2,3]').toString('base64url'),
+      Buffer.from('["a",1]').toString('base64url'),
+      Buffer.from('[-1,0]').toString('base64url'),
+      Buffer.from('{"a":1}').toString('base64url'),
+      `${markerOf(RLUSD_KEYS[1])}x!`,
+    ]) {
+      cases.push([`${token}${qs({ marker })}`, 'invalid marker']);
+    }
+    // the cache is cleared first: with the coverage and the generation kept, a read before the checks would go unseen
+    await clearCache();
+    const query = jest.spyOn(h.ch, 'query');
+    for (const [url, message] of cases) {
+      const res = await get(url);
+      expect([url, res.status, res.body]).toEqual([url, 400, { result: 'error', message }]);
+      expect(res.headers['cache-control']).toBe('no-store');
+    }
+    // no read for any of them, with the cache cleared before each of them too (the coverage of the first would be kept)
+    expect(query.mock.calls.map(([sql]) => String(sql))).toEqual([]);
+    for (const [url] of cases) {
+      await clearCache();
+      query.mockClear();
+      await get(url);
+      expect([url, query.mock.calls.length]).toEqual([url, 0]);
+    }
+    // a limit and a descending that are no good are not errors
+    jest.restoreAllMocks();
+    expect((await get(`${token}${qs({ limit: 'abc', descending: 'maybe' })}`)).status).toBe(200);
+  });
+
+  it('transfers CSV', async () => {
+    const header = TRANSFER_ROW_KEYS.map((k) => `"${k}"`);
+    const rlusd = await get(`${RLUSD_PATH}?format=csv`);
+    expect(rlusd.status).toBe(200);
+    expect(rlusd.headers['content-type']).toMatch(/^text\/csv/);
+    // the code of the token and its issuer, whatever the spelling of the path
+    expect(rlusd.headers['content-disposition']).toBe(csvDisposition(`RLUSD ${RLUSD_ISSUER} - transfers`));
+    const table = lines(rlusd.text).map(cells);
+    // fixed columns, the keys of the row in their order, and an empty cell for a tag the payment does not have
+    expect(table[0]).toEqual(header);
+    expect(table).toHaveLength(1 + 5);
+    for (const row of table) expect(row).toHaveLength(TRANSFER_ROW_KEYS.length);
+    expect(table[1]).toEqual([
+      `"${RLUSD_TRANSFERS[0].hash as string}"`,
+      '"107872476"',
+      '"2026-10-24T13:45:51Z"',
+      `"${RLUSD_TRANSFERS[0].source as string}"`,
+      `"${RLUSD_TRANSFERS[0].destination as string}"`,
+      '"0.2121364558499999"',
+      '""',
+      '""',
+    ]);
+    expect(table[2].slice(6)).toEqual(['"804681468"', '""']);
+    // no envelope, no coverage
+    for (const word of ['coverage', 'from_ledger_index', 'complete', 'result', 'count', 'marker']) {
+      expect(rlusd.text).not.toContain(word);
+    }
+
+    // the columns do not depend on the rows of the page: a page without a tag, a page with only a source tag, one with a
+    // destination tag of 0 (a tag), and an empty page (an empty file) are all of the same columns
+    const one = await get(`${RLUSD_PATH}?format=csv&limit=1`);
+    expect(lines(one.text).map(cells)).toEqual(table.slice(0, 2));
+    const sanctum = lines((await get(`${SANCTUM_PATH}?format=csv`)).text).map(cells);
+    expect(sanctum[0]).toEqual(header);
+    expect(sanctum[1].slice(5)).toEqual(['"0.0000000074"', '""', '"0"']);
+    expect((await get(`${WBLV_PATH}?format=csv`)).text).toBe('');
+    expect((await get(`${RLUSD_PATH}?format=csv&descending=true`)).text).toBe(
+      [rlusd.text.split('\n')[0], ...rlusd.text.split('\n').slice(1).reverse()].join('\n'),
+    );
+
+    // the other spellings of the path give the same file under the same name
+    for (const segment of [
+      `524C555344000000000000000000000000000000.${RLUSD_ISSUER}`,
+      `524c555344000000000000000000000000000000+${RLUSD_ISSUER}`,
+      `RLUSD%7C${RLUSD_ISSUER}`,
+    ]) {
+      const other = await get(`/v2/tokens/${segment}/transfers?format=csv`);
+      expect([segment, other.headers['content-disposition'], other.text]).toEqual([
+        segment,
+        rlusd.headers['content-disposition'],
+        rlusd.text,
+      ]);
+    }
+    // a 3-character code is named by it in upper case, a currency with no code by its hex
+    const usd = await get('/v2/tokens/usd.rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q/transfers?format=csv');
+    expect(usd.headers['content-disposition']).toBe(
+      csvDisposition('USD rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q - transfers'),
+    );
+    const lp = `03${'AB'.repeat(19)}`;
+    const hexOnly = await get(`/v2/tokens/${lp}.${RLUSD_ISSUER}/transfers?format=csv`);
+    expect(hexOnly.headers['content-disposition']).toBe(csvDisposition(`${lp} ${RLUSD_ISSUER} - transfers`));
+
+    // pages: the same columns, the rows of the JSON pages, and the Link header with format=csv
+    let marker: string | undefined;
+    let pages = 0;
+    const rows: string[][] = [];
+    do {
+      const q = `limit=2${marker ? `&marker=${marker}` : ''}`;
+      const part = await get(`${RLUSD_PATH}?format=csv&${q}`);
+      const json = await get(`${RLUSD_PATH}?${q}`);
+      const text = lines(part.text).map(cells);
+      expect([pages, text[0]]).toEqual([pages, header]);
+      expect(text.length - 1).toBe((json.body.transfers as Obj[]).length);
+      rows.push(...text.slice(1));
+      expect(part.headers.link).toBe(
+        json.body.marker === undefined
+          ? undefined
+          : `<${new URL(part.request.url).origin}${RLUSD_PATH}?format=csv&limit=2&marker=${json.body.marker as string}>; rel="next"`,
+      );
+      marker = json.body.marker as string | undefined;
+      pages += 1;
+    } while (marker && pages < 10);
+    expect([pages, rows]).toEqual([3, table.slice(1)]);
+
+    // an error is not a CSV
+    const bad = await get(`${RLUSD_PATH}?format=csv&marker=%25%25`);
+    expect([bad.status, bad.body]).toEqual([400, { result: 'error', message: 'invalid marker' }]);
+  });
+
+  it('a failed read is 500 unable to retrieve transfers, whichever read fails, and nothing is kept of it', async () => {
+    const real = h.ch.query.bind(h.ch);
+    const failing = (pattern: RegExp): jest.SpyInstance =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      jest.spyOn(h.ch, 'query').mockImplementation(((sql: string, ...rest: any[]) =>
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        pattern.test(sql) ? Promise.reject(new Error('clickhouse is down')) : (real as any)(sql, ...rest)) as never);
+    // the range of ledgers, the keys, the rows of the keys, and the coverage
+    const reads: [string, RegExp][] = [
+      ['every read', /./],
+      ['the ledgers (the range and the coverage)', /FROM ledgers\b/],
+      ['the keys', /FROM payments_by_currency\b/],
+      ['the payments of the keys', /FROM payments\b/],
+    ];
+    for (const [what, pattern] of reads) {
+      for (const path of [RLUSD_PATH, `${RLUSD_PATH}?format=csv`, `${RLUSD_PATH}?descending=true&limit=2`]) {
+        await clearCache();
+        const spy = failing(pattern);
+        const res = await get(path);
+        spy.mockRestore();
+        expect([what, path, res.status, res.body]).toEqual([
+          what,
+          path,
+          500,
+          { result: 'error', message: 'unable to retrieve transfers' },
+        ]);
+        expect(res.headers['cache-control']).toBe('no-store');
+      }
+    }
+    // and nothing was kept of the failures
+    await clearCache();
+    expect(await transfersOf(RLUSD_PATH)).toEqual(answer(RLUSD_TRANSFERS));
+  });
+
+  it('answers 401 without a key', async () => {
+    const res = await h.http().get(RLUSD_PATH);
+    expect([res.status, res.body]).toEqual([401, { result: 'error', message: 'Missing or invalid API key.' }]);
+  });
+
+  it("transfers coverage is token_transfers', complete on XRPL with every ledger stored from 32570", async () => {
+    const coverageOf = async (path = RLUSD_PATH): Promise<unknown> => {
+      await clearCache();
+      return (await api.ok(path, 'coverage')).body.coverage;
+    };
+    // the oldest stored ledger is where the history starts, and the network starts at 32570: not complete
+    expect(await coverageOf()).toEqual(SEEDED_COVERAGE);
+    // the first ledger of XRPL, stored by the parser that wrote every ledger's payments: complete. The state tables the
+    // aggregate is built from are of the state parser, and this ledger is older than it: their start moves above it
+    await h.ch.insert(Table.Ledgers, [{ ...ledgerRow(32_570, 1_390_000_000), parser_version: 1 }]);
+    expect(await coverageOf()).toEqual({ from_ledger_index: 32_570, complete: true });
+    expect(await coverageOf('/v2/tokens')).toEqual({ from_ledger_index: 32_571, complete: false });
+    // the answer says the same on every page, for every token, and for one nobody was paid in
+    for (const path of [WBLV_PATH, USD_PATH, `${RLUSD_PATH}?limit=1`, `/v2/tokens/FOO.${RLUSD_ISSUER}/transfers`]) {
+      expect([path, await coverageOf(path)]).toEqual([path, { from_ledger_index: 32_570, complete: true }]);
+    }
+    // a ledger of the state parser below the current one is of the state tables only: transfers need the payments parser
+    await h.ch.insert(Table.Ledgers, [
+      { ...ledgerRow(90_000_000, 1_750_000_000), parser_version: STATE_PARSER_VERSION - 1 },
+    ]);
+    expect(await coverageOf()).toEqual({ from_ledger_index: 32_570, complete: true });
+    expect(await coverageOf('/v2/tokens')).toEqual({ from_ledger_index: 90_000_001, complete: false });
+    // a ledger written before the payments parser (version 0) moves the start of the transfers above it
+    await h.ch.insert(Table.Ledgers, [{ ...ledgerRow(95_000_000, 1_760_000_000), parser_version: 0 }]);
+    expect(await coverageOf()).toEqual({ from_ledger_index: 95_000_001, complete: false });
+    // the coverage is kept for a minute, like the others
+    await h.ch.insert(Table.Ledgers, [{ ...ledgerRow(96_000_000, 1_770_000_000), parser_version: 0 }]);
+    expect(((await api.ok(RLUSD_PATH, 'coverage')).body as Obj).coverage).toEqual({
+      from_ledger_index: 95_000_001,
+      complete: false,
+    });
   });
 });

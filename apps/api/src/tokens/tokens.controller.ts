@@ -4,11 +4,11 @@ import { ApiOperation, ApiParam, ApiQuery } from '@nestjs/swagger';
 // `import type`: the decorated parameters below would otherwise make Nest's metadata `require('express')`, which is
 // not a dependency of this app (only its types are)
 import type { Request, Response } from 'express';
-import { Csv } from '../common/csv.interceptor';
+import { Csv, wantsCsv } from '../common/csv.interceptor';
 import { notFound } from '../common/errors';
 import { fmtTime } from '../common/format';
 import { setLinkHeader } from '../common/pagination';
-import { first, limitParam, Query as QueryParams } from '../common/params';
+import { bool, dateParam, endExclusive, first, limitParam, Query as QueryParams } from '../common/params';
 import { RippleController, RippleRoute } from '../common/ripple-controller';
 import { NETWORK_PROFILE } from '../config/api.config';
 import { decodeHoldersMarker } from './token-holders.service';
@@ -20,7 +20,9 @@ import {
   tokenListBody,
   TokenListService,
 } from './token-list';
+import { toTransferCsvRow } from './token-objects';
 import { parseTokenParam, tokenFileStemOfPath } from './token-param';
+import { TokenTransfersService } from './token-transfers.service';
 import { TokensService } from './tokens.service';
 
 /**
@@ -28,6 +30,9 @@ import { TokensService } from './tokens.service';
  * path names, whatever its spelling.
  */
 const holdersFilename = (req: Request): string => `${tokenFileStemOfPath(String(req.params.token))} - holders`;
+
+/** The name of the CSV file of the transfers, `<code or currency> <issuer> - transfers` (`@Csv` adds the `.csv`), as that of the holders. */
+const transfersFilename = (req: Request): string => `${tokenFileStemOfPath(String(req.params.token))} - transfers`;
 
 /** The documentation of the segment of the path that names a token. */
 const TOKEN_PARAM = {
@@ -40,18 +45,21 @@ const TOKEN_PARAM = {
 /**
  * The tokens (spec 5). The list is `GET /v2/tokens`, served by the `TokenListService` of the kind asked for
  * (`TOKEN_LIST_SERVICES`): this controller knows no kind but through that map, so that D9 adds `mpt` without a change here. One
- * token and its holders are `GET /v2/tokens/{currency}.{issuer}` and `.../holders`, issued tokens only.
+ * token, its holders and its transfers are `GET /v2/tokens/{currency}.{issuer}`, `.../holders` and `.../transfers`, issued tokens only.
  *
  * The checks of the list come in the order of the parameters: `kind`, `min_holders`, `q`, then the marker (the service, before it
  * reads). Those of a token's routes: the path (`invalid currency`, `XRP cannot have an issuer`, `invalid issuer address`), the
- * marker of the holders, all of them before any read, then the token (404 `token not found`). The answer states `coverage`, the key
- * after `result`, which is the feature's own (spec 6).
+ * marker of the holders, all of them before any read, then the token (404 `token not found`). Those of the transfers are the path's,
+ * then `/v2/payments`': `start`, `end` and the marker (`PaymentsService` decodes it before its first read), and the transfers of a
+ * token the job does not know are listed all the same (no 404). The answer states `coverage`, the key after `result`, which is the
+ * feature's own (spec 6).
  */
 @RippleController('v2/tokens')
 export class TokensController {
   constructor(
     @Inject(TOKEN_LIST_SERVICES) private readonly services: ReadonlyMap<TokenKind, TokenListService>,
     private readonly tokens: TokensService,
+    private readonly transferPages: TokenTransfersService,
     @Inject(NETWORK_PROFILE) private readonly profile: NetworkProfile,
   ) {}
 
@@ -148,6 +156,58 @@ export class TokensController {
       count: found.rows.length,
       ...(found.marker !== undefined && { marker: found.marker }),
       holders: found.rows,
+    };
+  }
+
+  @Get(':token/transfers')
+  @RippleRoute('unable to retrieve transfers')
+  @Csv(transfersFilename, 'transfers')
+  @ApiOperation({
+    summary: 'Get the transfers of a token',
+    description:
+      'The payments that delivered the token, oldest first: the `Payment` transactions between two different accounts that ' +
+      'delivered the currency of the issuer (a payment to oneself is not a payment, as in `/v2/payments`), with the `amount` ' +
+      'delivered and the tags the payment has. The window, `descending`, `limit` and `marker` are those of `/v2/payments` ' +
+      '(`start` inclusive, `end` the end of the period it names; the marker is `(ledger_index, tx_index)`). The path names the ' +
+      'token like the detail does, but the list does not look the token up: a token nobody was paid in, one the tokens job does ' +
+      'not know and an LP token list the transfers they have, and no transfers is an empty list. `coverage` is that of the ' +
+      'payments of the ledgers, not of the state tables. `format=csv` gives the transfers as a CSV file ' +
+      '`<code or currency> <issuer> - transfers.csv` with a column for each key of a transfer (without `coverage`).',
+  })
+  @ApiParam(TOKEN_PARAM)
+  @ApiQuery({ name: 'start', required: false, description: 'Start time. Default: the beginning.' })
+  @ApiQuery({ name: 'end', required: false, description: 'End time. Default: the newest ledger.' })
+  @ApiQuery({ name: 'descending', required: false, type: Boolean, description: 'Newest first.' })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Default 200, at most 1000.' })
+  @ApiQuery({ name: 'marker', required: false, description: 'From the previous page.' })
+  @ApiQuery({ name: 'format', required: false, enum: ['json', 'csv'], description: 'Default: json.' })
+  async transfers(
+    @Param('token') raw: string,
+    @Query() query: QueryParams,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<Record<string, unknown>> {
+    // the checks come in the order of `/v2/payments`, after the path's: start (an empty one is none), end, the rest, the marker
+    const ref = parseTokenParam(raw, this.profile.nativeCurrency);
+    const start = first(query, 'start') === '' ? undefined : dateParam(query, 'start', 'invalid start date format');
+    const end = dateParam(query, 'end', 'invalid end date format');
+    // the marker is checked by `PaymentsService.list`, the first thing it does, so that its 400 comes before any read; the
+    // coverage is read after the page for that reason
+    const page = await this.transferPages.page(ref, {
+      ...(start && { start: start.date }),
+      ...(end && { endExclusive: endExclusive(end) }),
+      descending: bool(query, 'descending'),
+      limit: limitParam(query, { def: 200, max: 1000 }),
+      marker: first(query, 'marker'),
+    });
+    const coverage = await this.transferPages.coverage();
+    setLinkHeader(req, res, page.marker);
+    return {
+      result: 'success',
+      coverage,
+      count: page.rows.length,
+      ...(page.marker !== undefined && { marker: page.marker }),
+      transfers: wantsCsv(query) ? page.rows.map(toTransferCsvRow) : page.rows,
     };
   }
 
