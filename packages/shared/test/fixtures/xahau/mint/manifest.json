@@ -63,7 +63,7 @@
       "hash": "3A1F25CDF0E2E4466AA0B019EA3039A6E5F87C01FBDD69CBDC474DAC32D8E64C",
       "type": "ClaimReward",
       "file": "26540187-opt-out.json",
-      "note": "hand-made: the recorded ClaimReward of xahau/recorded 26540187 with Flags set from 0 to 1 (tfOptOut); nothing else changed, so the Issuer is still there, which xahaud would refuse as temMALFORMED for an opt-out (ClaimReward.cpp:125-129) and the parser does not look at. The file is a copy of that ledger; xahau/recorded keeps the real one."
+      "note": "hand-made: the recorded ClaimReward of xahau/recorded 26540187 with Flags set from 0 to 1 (tfOptOut) and its Issuer removed, as xahaud requires of an opt-out (ClaimReward.cpp:124-129: an opt-out has no Issuer, any other claim must have one); nothing else changed (its metadata is still that of the normal claim, which the parser does not read). The file is a copy of that ledger; xahau/recorded keeps the real one."
     },
     "genesis-mint-governance": {
       "ledger": 26540188,
