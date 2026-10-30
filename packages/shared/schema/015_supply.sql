@@ -1,16 +1,17 @@
 -- =============================================================================
 -- GateHub Data API: the supply (D7, spec 2026-10-24-supply-design.md section 1). Additive to 001_baseline.sql, one
 -- database per network. Required before the syncer of this release (on Xahau its writer inserts into the three ledger
--- tables whenever a ledger holds a GenesisMint, an Import or a ClaimReward, and an insert into a missing table fails the
--- batch) and before the api.
+-- tables whenever a ledger has mint rows, from a successful GenesisMint or Import or from any ClaimReward, and an insert
+-- into a missing table fails the batch) and before the api.
 --
 -- genesis_mints, imports and reward_claims are ledger-derived, written by ingest with the ledger's other rows from
--- parser version 9 on (MINT_PARSER_VERSION). They are the three ways Xahau mints native coins outside a payment, and they
--- stay empty on XRPL. genesis_mints has a row for each entry of GenesisMints with a native Amount in a successful
--- GenesisMint, imports a row for each successful Import and reward_claims a row for each ClaimReward, whatever its result
--- (the parent of a reward mint is a claim whether or not the claim succeeded). Recovery and --reprocess delete the three
--- by ledger_index with the other ledger tables. A ledger written by an older parser has no rows in them. All three are
--- partitioned by a million ledgers and carry the dedup window of every ledger-derived table.
+-- parser version 9 on (MINT_PARSER_VERSION). They record Xahau's sources of new native coins (the reward claims behind
+-- reward mints, the genesis mints, the imports), and they stay empty on XRPL. genesis_mints has a row for each entry of
+-- GenesisMints with a native Amount in a successful GenesisMint, imports a row for each successful Import and
+-- reward_claims a row for each ClaimReward, whatever its result (the parent of a reward mint is a claim whether or not
+-- the claim succeeded). Recovery and --reprocess delete the three by ledger_index with the other ledger tables. A ledger
+-- written by an older parser has no rows in them. All three are partitioned by a million ledgers and carry the dedup
+-- window of every ledger-derived table.
 --
 -- network_supply is an aggregate, written by the syncer's aggregator only (job supply, ReplacingMergeTree(version), no
 -- partition, no TTL, no dedup window, and never deleted by recovery): one row per snapshot, written in one insert. Readers

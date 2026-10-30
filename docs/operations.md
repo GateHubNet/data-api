@@ -106,7 +106,7 @@ A syncer with the `ingest` worker (it needs `state_touches`) or the `aggregator`
 names the file and the tables that are missing (`lacks the schema of 014_issued_tokens.sql`). Run the migrate job first (the compose files do), then deploy the syncer, then the api (the
 token routes answer 500 until the tables exist).
 **The ingest needs migration `015_supply.sql` applied before a syncer with parser version 9 starts, and the api after it.** That syncer writes `genesis_mints`, `imports` and `reward_claims` on Xahau,
-whenever a ledger holds a `GenesisMint`, an `Import` or a `ClaimReward` (on XRPL they stay empty and nothing is written to them), and an insert into a missing table fails the batch, so the live runner
+whenever a ledger has mint rows (a successful `GenesisMint` or `Import`, or any `ClaimReward`) (on XRPL they stay empty and nothing is written to them), and an insert into a missing table fails the batch, so the live runner
 would retry the same ledgers without end. The `supply` job reads the three tables and writes the fourth, `network_supply`. Nothing checks for the tables at boot yet (a check like 014's comes with the
 mint parsers and the supply job of this release). Run the migrate job first (the compose files do), then deploy the syncer, then the api (the supply routes answer 500 until the tables exist).
 **The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,

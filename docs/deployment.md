@@ -263,7 +263,7 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   full-access `data_api` user has it, [clickhouse](clickhouse.md)). The first generation of the issued tokens is built by the `tokens` job in the hours after the deploy (finish any history fill first: a fill that moves the coverage start restarts the build, [operations](operations.md#issued-tokens)): the explorer's `TOKENS` switch waits for
   `syncer_tokens_live` 1 ([operations](operations.md#issued-tokens)).
 - `015_supply.sql` (four `CREATE TABLE IF NOT EXISTS`: the ledger-derived Xahau mint tables `genesis_mints`, `imports` and `reward_claims`, and the aggregate `network_supply`) is additive but **sets an
-  order**: `migrate` first, then the syncer, then the api. A syncer of this version (parser version 9) writes the three ledger tables on Xahau, whenever a ledger holds a `GenesisMint`, an `Import` or a `ClaimReward` (on XRPL they stay empty), and an insert into a
+  order**: `migrate` first, then the syncer, then the api. A syncer of this version (parser version 9) writes the three ledger tables on Xahau, whenever a ledger has mint rows (a successful `GenesisMint` or `Import`, or any `ClaimReward`) (on XRPL they stay empty), and an insert into a
   missing table fails the batch, so the live runner would retry the same ledgers without end. Its `supply` job reads them and
   writes `network_supply`, and the supply routes of the api answer 500 until the tables exist. Nothing checks for them at boot yet (a check like 014's comes with the mint parsers and the supply job of
   this release). The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last.
