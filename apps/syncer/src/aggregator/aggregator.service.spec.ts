@@ -1923,11 +1923,12 @@ describe('AggregatorService volume jobs', () => {
         'volume_backfill',
       ]);
 
-      // and the next tick does it again, and removes the range; the mark is the first ledger of the slice
+      // and the next tick does it again, and removes the range; the mark is the first ledger of the slice (`rangeRates`: 100, above the
+      // generation's coverage_from of 1)
       world.state.hookFails = undefined;
       await svc.tick();
       expect(ch.dirty).toEqual([]);
-      expect(world.rows.get(1)?.repair_from).toBeGreaterThan(0);
+      expect(world.rows.get(1)?.repair_from).toBe(100);
       expect(metrics.aggregatorErrorsTotal.inc).toHaveBeenCalledTimes(1);
     });
   });

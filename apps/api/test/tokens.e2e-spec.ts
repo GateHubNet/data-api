@@ -2454,8 +2454,8 @@ describe('GET /v2/tokens/{currency}.{issuer}/transfers on the recorded ledgers o
       expect(rlusd.text).not.toContain(word);
     }
 
-    // the columns do not depend on the rows of the page: a page without a tag, a page with only a source tag, one with a
-    // destination tag of 0 (a tag), and an empty page (an empty file) are all of the same columns
+    // the columns do not depend on the rows of the page: a page without a tag, a page with only a source tag and one with a
+    // destination tag of 0 (a tag) are all of the same columns; an empty page is an empty file, with no header
     const one = await get(`${RLUSD_PATH}?format=csv&limit=1`);
     expect(lines(one.text).map(cells)).toEqual(table.slice(0, 2));
     const sanctum = lines((await get(`${SANCTUM_PATH}?format=csv`)).text).map(cells);

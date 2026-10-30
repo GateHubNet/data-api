@@ -439,8 +439,9 @@ const iso = (seconds: number): string => `${new Date(seconds * 1000).toISOString
  *     and last, with the `tokens` option (also without the others), each generation of the issued tokens that is live or builds and
  *     whose `through_ledger` reaches the first ledger of the slice gets its `repair_from` lowered to it, for the next run of
  *     `tokens` to apply again (the hook writes nothing else, and nothing when `repair_from` would not change; it throws before it
- *     reads while the job has no version floor yet, so that the slice fails and its range stays). A failing hook before it, the
- *     escrows', skips it for the tick: the marks wait in `agg_dirty`.
+ *     reads while the job has no version floor yet, or when the reads that opened the job's last run (the generations, the head, the
+ *     floor) failed, so that the slice fails and its range stays). A failing hook before it, the escrows', skips it for the tick:
+ *     the marks wait in `agg_dirty`.
  * 11. **amm_daily** (with the `ammDaily` option; at the first tick and then every `AMM_DAILY_EVERY_TICKS`): one set per UTC day with
  *     the stats of every AMM pool (swap volume, estimated fees, liquidity, closing state, value): today and yesterday, the
  *     stalest first and a day that failed last time behind the others (R87), then the closed days, newest first, that have no

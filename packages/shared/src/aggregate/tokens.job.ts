@@ -29,8 +29,8 @@ import {
  *    read of them names one.
  *  - **Every write is idempotent and versioned.** A row is a function of the ledger state it is computed from; a version is the
  *    runner's clock in milliseconds, at least one more than any version already written (`tokensVersionFloor` gives the floor), and
- *    is passed in: the functions here never read a clock. Readers keep the newest version of a key (`LIMIT 1 BY`, no `FINAL`) and
- *    drop `deleted = 1` after that.
+ *    is passed in: the functions here never read a clock. Readers keep the newest version of a key (`LIMIT 1 BY`, or `argMax` of
+ *    `version` where the toml sweep groups by the key to read it in order; never `FINAL`) and drop `deleted = 1` after that.
  *  - **The pass reads a key range.** `trust_line_states` is ordered by `account`; a batch of `TOKENS_PASS_ACCOUNTS` accounts is the
  *    range `(after, through]` of it. `nextPassAccounts` finds the batch's last account by reading the table in key order and
  *    stopping after the batch (a granule or so of each part: not every row after the cursor), and `writePassLines` reads the newest
