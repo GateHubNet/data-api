@@ -1,5 +1,7 @@
 import {
+  AMM_PARSER_VERSION,
   getNetworkProfile,
+  MINT_PARSER_VERSION,
   NETWORK_NAMES,
   OBJECT_PARSER_VERSION,
   STATE_PARSER_VERSION,
@@ -82,4 +84,56 @@ describe('the coverage features of D6', () => {
       ]);
     },
   );
+});
+
+/**
+ * The features D7 registers (spec 1.5): the parts of the supply that are read from ledger history. `escrows` (D5) is the coverage of
+ * the escrowed and circulating parts.
+ */
+const D7_FEATURES = ['fees', 'amm', 'account_states', 'mints'] as const satisfies CoverageFeatureName[];
+
+describe('the coverage features of D7', () => {
+  it('registers the four features, each on the parser that writes its rows, and no other feature of D7', () => {
+    expect(Object.keys(pick(COVERAGE_FEATURES, D7_FEATURES))).toEqual([...D7_FEATURES]);
+    expect(COVERAGE_FEATURES.fees.parserVersion).toBe(1);
+    expect(COVERAGE_FEATURES.amm.parserVersion).toBe(AMM_PARSER_VERSION);
+    expect(COVERAGE_FEATURES.account_states.parserVersion).toBe(STATE_PARSER_VERSION);
+    expect(COVERAGE_FEATURES.mints.parserVersion).toBe(MINT_PARSER_VERSION);
+    // the versions the rows are written from (rows.ts), not constants of this spec
+    expect([AMM_PARSER_VERSION, STATE_PARSER_VERSION, MINT_PARSER_VERSION]).toEqual([2, 3, 9]);
+  });
+
+  it.each(['fees', 'account_states'] as const)(
+    '%s starts at the first ledger of the network on all four profiles (none on a testnet)',
+    (feature) => {
+      // every stored ledger has a fee total, and the state tables need no amendment
+      expect(startsOf(feature)).toEqual([
+        { kind: 'first_ledger' },
+        { kind: 'first_ledger' },
+        { kind: 'first_ledger' },
+        { kind: 'first_ledger' },
+      ]);
+    },
+  );
+
+  it('amm starts with the AMM amendment where the network has AMM, and is unavailable where it has none', () => {
+    // a testnet takes the rule of the family it follows, and Xahau has no AMM
+    expect(startsOf('amm')).toEqual([
+      { kind: 'amendment', amendment: 'AMM' },
+      { kind: 'unavailable' },
+      { kind: 'amendment', amendment: 'AMM' },
+      { kind: 'unavailable' },
+    ]);
+    expect(NETWORK_NAMES.map((name) => getNetworkProfile(name).hasAmm)).toEqual([true, false, true, false]);
+  });
+
+  it('mints start at the first ledger where the network mints, and are unavailable where it does not', () => {
+    expect(startsOf('mints')).toEqual([
+      { kind: 'unavailable' },
+      { kind: 'first_ledger' },
+      { kind: 'unavailable' },
+      { kind: 'first_ledger' },
+    ]);
+    expect(NETWORK_NAMES.map((name) => getNetworkProfile(name).hasMinting)).toEqual([false, true, false, true]);
+  });
 });

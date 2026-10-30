@@ -205,7 +205,7 @@ Run the API behind TLS: it speaks plain HTTP and trusts the proxy in front of it
 ### Coverage
 
 A feature whose data are read from ledger history says how much of that history the index holds. The routes of such a feature (the
-[NFTs](#nfts), the [ledger objects](#ledger-objects) and the [tokens](#tokens); later features of the same program register with the same service and add no rule of their own) put
+[NFTs](#nfts), the [ledger objects](#ledger-objects), the [tokens](#tokens) and the [supply](#get-v2networksupply); later features of the same program register with the same service and add no rule of their own) put
 
 ```json
 "coverage": { "from_ledger_index": 107874617, "complete": false }
@@ -248,7 +248,7 @@ right after `result`. Keys, in order: `from_ledger_index?`, `complete`. It is no
   carry none.
 
 Coverage turns `complete` once no ledger at or above the start ledger was written by an older parser, which is what re-ingesting the history
-does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of come with version 3 and the payments their transfers are read from with version 1.
+does ([backfill](backfill.md#nft-re-ingest)); the NFT parser is version 5, the parser of the ledger objects is version 7, the state tables the issued tokens are made of (and the reserves of the supply) come with version 3 and the payments their transfers are read from (and Xahau's burned supply, from the fee totals) with version 1; the AMM data of the supply come with version 2 and the mint tables of Xahau's minted supply with version 9.
 
 ### Compatibility
 
@@ -1831,7 +1831,7 @@ Errors: the pair errors of the exchanges route, then 400 `invalid period - use: 
 
 ## Network
 
-`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` has an object of its own, described with the route.
+`fees` and `fee_stats` answer `{ "result": "success", "marker": "…", "count": n, "rows": [...] }` (the key order is `result, marker, count, rows`); the three volume routes answer `{ "result": "success", "count": n, "marker": "…", "rows": [...] }`, and `nft_volume` the same with `coverage` after `result`. `marker` is present only when there is a next page. `markets` and `supply` have an object of their own, described with each route.
 
 ### `GET /v2/network/fees`
 
@@ -2309,6 +2309,149 @@ market that both routes show, the numbers can differ: the markets window starts 
 last 24 hours to the second); the markets rate of an asset comes from its native pair whether or not that pair is configured, where
 `exchange_volume` takes only the configured native markets; `network/markets` lists every pair that traded, `exchange_volume` the
 configured ones; and prices are in the canonical stored orientation of the pair.
+
+### `GET /v2/network/supply`
+
+The native supply of the network at one ledger: how much exists, how much was burned, how much is escrowed, how much circulates, how much sits in AMM pools and how much the
+accounts must keep as reserves, and on Xahau how much was minted, by source. It is an **addition** (not in the original, which had `/v2/network/xrp_distribution`, out of scope
+and answering 404, and no supply route; see [ADR-0010](adr/0010-ripple-v2-wire-compatibility.md#2-endpoints-kept-added-dropped)) and uses the contract layer of every route (API key,
+rate limit, `Cache-Control: private, max-age=60`, errors `{"result":"error","message"}`). It takes no parameter: the ones sent are ignored. The design is in the
+[spec](superpowers/specs/2026-10-24-supply-design.md).
+
+- **A snapshot, not a live figure.** The syncer's `supply` job computes every figure at one ledger, once an hour, and writes one row; the route serves the newest row, so an answer is up to
+  an hour old. `ledger_index` and `close_time` (`YYYY-MM-DDTHH:mm:ssZ`) are the ledger every figure is as of, `computed_at` when the row was written. Before the first snapshot exists the
+  answer is 404 `supply not computed yet`.
+- **Amounts** are exact decimal text in whole units of the native currency (`"64772465269.314"`: the drops divided by a million, trailing zeros dropped), summed in drops, so no float is
+  in the way; the total of the XRP Ledger is past 2^53 drops. Counts (`escrows`, `pools`, `accounts`, `owner_count`) are numbers. A key without a value is left out, never `null`: `minted`
+  is there only on a network that mints (Xahau), `amm` only where AMM exists (the XRP Ledger), `reserves` only when a reserve value is known at the snapshot ledger.
+- **The parts**, in the order the answer has them:
+
+  | Part | What it is |
+  | --- | --- |
+  | `total` | The native currency in existence after the snapshot ledger: the `total_coins` of its header. |
+  | `burned` | The currency destroyed. On the XRP Ledger only fees destroy coins and nothing creates any, so it is exactly 100 billion XRP less `total`: exact, from the header, and it needs no history, so it has no `coverage`. Xahau has no cap and its minting raises the total, so there it is the sum of the fees of every indexed ledger up to the snapshot ledger (each ledger's fee total), and has its `coverage`: a history that starts late leaves out the fees before it, so the network has burned more than the answer says. |
+  | `minted` | Xahau only: what the indexed ledgers created, `amount` being `rewards` + `import` + `genesis_mint`. A reward is minted by the `GenesisMint` that the reward hook of the genesis account emits for a `ClaimReward` (the claim itself mints nothing, and the governance members' share of a reward is in it); `genesis_mint` is every other `GenesisMint`; `import` is what an `Import` credited: the fee of the XRP Ledger transaction it carries, scaled by the burn-to-mint schedule of xahaud, and the starting bonus of an account the Import creates. The supply the network started with is not minted. Ledger by ledger, what was minted is the growth of `total_coins` plus the fees of the ledger. |
+  | `escrowed` | The native currency in open native escrows, and how many there are (`escrows`). Token escrows are not supply. |
+  | `circulating` | `total` less `escrowed`. It still counts the currency in AMM pools, in payment channels and held as reserves. It states the coverage of `escrowed`, since `total` needs none. |
+  | `amm` | XRP Ledger only: the native currency in the pools of automated market makers at the snapshot ledger, and the number of live pools with a native reserve above 0 (`pools`). |
+  | `reserves` | What the accounts must keep: `accounts` × `base` + `owner_count` × `increment`, at the reserve values in force at the snapshot ledger. `accounts` are the existing accounts, the pseudo-accounts of AMM pools (which keep no reserve) left out, and `owner_count` the sum of their owner counts. It is not the sum of the balances kept: a few accounts hold less than their requirement after paying fees. |
+
+- **Coverage.** Every part that is read from the indexed history ends with its own `coverage` (the last key of the part; [Coverage](#coverage)), and `total` and the XRPL `burned` have
+  none. The answer carries no `coverage` of its own. Each part states the feature it is read from, and the features are the ones of this table (the parser version is the first one
+  that writes the feature's rows):
+
+  | Part | Feature | Parser version | Starts at (XRP Ledger / Xahau) |
+  | --- | --- | --- | --- |
+  | `burned` (Xahau) | `fees` | 1 | the first ledger, 1 |
+  | `minted` (Xahau) | `mints` | 9 | the first ledger, 1 |
+  | `escrowed`, `circulating` | `escrows` | 7 | ledger 28,685,313, the `Escrow` amendment / the first ledger, 1 |
+  | `amm` (XRP Ledger) | `amm` | 2 | ledger 86,795,265, the `AMM` amendment |
+  | `reserves` | `account_states` | 3 | the first ledger, 32,570 / the first ledger, 1 |
+
+  `escrows` is the feature of the [ledger objects](#ledger-objects), whose escrow routes state the same coverage. The others are read from the same stored ledgers by parsers of their own: for `reserves` `complete` also means that the state tables hold the state of the first ledger, which the history fill provides (an account that has not changed since
+  `from_ledger_index` is not in the state tables, so while it is false `accounts` and `owner_count` count too few), and for `minted` that the ledgers hold their mints, which the parser of version 9 writes (ledgers written
+  by an older one are re-ingested, [backfill](backfill.md)). A testnet has no first ledger, so a part that starts there is never `complete`, and an amendment's part only when the
+  index holds its `EnableAmendment`. The coverage is the index's **at the time of the request**, where the figures are the snapshot's: when a re-ingest or the history fill makes a feature
+  `complete`, the part says so at once, and its figure follows at the next snapshot.
+- **Errors**: 401 and 429 as everywhere, 404 `supply not computed yet`, 500 `unable to retrieve supply` (when a read fails, the coverage included; no part is served without its coverage).
+  Errors are `no-store`.
+
+**The examples** are answers of the end-to-end suite (`apps/api/test/supply.e2e-spec.ts`, key order included; the snapshots are written by hand, `apps/api/test/support/supply-seed.ts`, with
+made-up figures of a plausible day). The XRPL one is read over a history that starts at ledger 28,685,313, the ledger Escrow was enabled in: the escrows and the AMM pools are complete, the
+reserves, which start at the first ledger, 32,570, are not. The Xahau one is read over a history from ledger 1.
+
+**Objects.** The key orders below are the ones the code serves; a key marked `?` can be missing from an answer.
+
+Keys of the supply answer, in order: `result, ledger_index, close_time, computed_at, currency, total, burned, minted?, escrowed, circulating, amm?, reserves?`.
+
+Keys of burned, in order: `amount, coverage?`.
+
+Keys of minted, in order: `amount, rewards, import, genesis_mint, coverage`.
+
+Keys of escrowed, in order: `amount, escrows, coverage`.
+
+Keys of circulating, in order: `amount, coverage`.
+
+Keys of amm, in order: `amount, pools, coverage`.
+
+Keys of reserves, in order: `amount, accounts, owner_count, base, increment, coverage`.
+
+On the XRP Ledger:
+
+```json
+{
+  "result": "success",
+  "ledger_index": 107747456,
+  "close_time": "2026-10-24T21:00:00Z",
+  "computed_at": "2026-10-24T21:01:47Z",
+  "currency": "XRP",
+  "total": "99985312374.716318",
+  "burned": { "amount": "14687625.283682" },
+  "escrowed": {
+    "amount": "35212847105.402318",
+    "escrows": 12879,
+    "coverage": { "from_ledger_index": 28685313, "complete": true }
+  },
+  "circulating": {
+    "amount": "64772465269.314",
+    "coverage": { "from_ledger_index": 28685313, "complete": true }
+  },
+  "amm": {
+    "amount": "46218377.402915",
+    "pools": 14594,
+    "coverage": { "from_ledger_index": 28685313, "complete": true }
+  },
+  "reserves": {
+    "amount": "9810004",
+    "accounts": 6410280,
+    "owner_count": 16998620,
+    "base": "1",
+    "increment": "0.2",
+    "coverage": { "from_ledger_index": 28685313, "complete": false }
+  }
+}
+```
+
+On Xahau:
+
+```json
+{
+  "result": "success",
+  "ledger_index": 26603520,
+  "close_time": "2026-10-24T21:00:02Z",
+  "computed_at": "2026-10-24T21:00:31Z",
+  "currency": "XAH",
+  "total": "613401782.117306",
+  "burned": {
+    "amount": "2318.640227",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "minted": {
+    "amount": "49425551.616207",
+    "rewards": "41203318.512207",
+    "import": "8102233.104",
+    "genesis_mint": "120000",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "escrowed": {
+    "amount": "18406227.318004",
+    "escrows": 2140,
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "circulating": {
+    "amount": "594995554.799302",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  },
+  "reserves": {
+    "amount": "268973.2",
+    "accounts": 186412,
+    "owner_count": 412806,
+    "base": "1",
+    "increment": "0.2",
+    "coverage": { "from_ledger_index": 1, "complete": true }
+  }
+}
+```
 
 ---
 

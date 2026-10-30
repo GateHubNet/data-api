@@ -1,4 +1,6 @@
 import {
+  AMM_PARSER_VERSION,
+  MINT_PARSER_VERSION,
   NetworkProfile,
   NFT_PARSER_VERSION,
   OBJECT_PARSER_VERSION,
@@ -24,8 +26,8 @@ export interface CoverageFeature {
 
 /**
  * The features of program 2 whose coverage an answer states, by name. D3 registers `nfts`, D5 `escrows`, `payment_channels`,
- * `checks` and `delegations`, D6 `issued_tokens` and `token_transfers`; D7 and D9 add their entries here and use
- * `FeatureCoverageService`, and define no rule of their own.
+ * `checks` and `delegations`, D6 `issued_tokens` and `token_transfers`, D7 `fees`, `amm`, `account_states` and `mints`; D9 adds its
+ * entries here and uses `FeatureCoverageService`, and defines no rule of its own.
  */
 export const COVERAGE_FEATURES = {
   // NFTs are an amendment on both families, by the family and not the network, so a testnet takes its mainnet's
@@ -64,6 +66,21 @@ export const COVERAGE_FEATURES = {
   // records state; the transfers are payments, which every stored ledger has.
   issued_tokens: { parserVersion: STATE_PARSER_VERSION, startOf: () => ({ kind: 'first_ledger' }) },
   token_transfers: { parserVersion: 1, startOf: () => ({ kind: 'first_ledger' }) },
+  // The parts of the supply of D7 (spec 1.5) that are read from ledger history; the escrowed and circulating parts state `escrows`.
+  // `fees` is Xahau's burned, the sum of the fee totals of the stored ledgers, which every ledger a parser wrote has. `account_states`
+  // is the reserves: the state of every account, from the first ledger of the network (the history load writes that ledger's state).
+  // `fees` and `account_states` are the rules of `token_transfers` and `issued_tokens` under names of their own, so each is cached
+  // (60 s) and read on its own. A network that cannot have AMM or minting has nothing to be missing.
+  fees: { parserVersion: 1, startOf: () => ({ kind: 'first_ledger' }) },
+  amm: {
+    parserVersion: AMM_PARSER_VERSION,
+    startOf: (p) => (p.hasAmm ? { kind: 'amendment', amendment: 'AMM' } : { kind: 'unavailable' }),
+  },
+  account_states: { parserVersion: STATE_PARSER_VERSION, startOf: () => ({ kind: 'first_ledger' }) },
+  mints: {
+    parserVersion: MINT_PARSER_VERSION,
+    startOf: (p) => (p.hasMinting ? { kind: 'first_ledger' } : { kind: 'unavailable' }),
+  },
 } satisfies Record<string, CoverageFeature>;
 
 export type CoverageFeatureName = keyof typeof COVERAGE_FEATURES;
