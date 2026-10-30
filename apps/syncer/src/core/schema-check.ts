@@ -123,6 +123,54 @@ export async function assertTomlsSchema(
   );
 }
 
+/** The tables of one migration each worker needs, and what it does with them. */
+type SchemaNeeds = ReadonlyMap<WorkerName, { tables: readonly Table[]; does: string }>;
+
+/**
+ * Fails the boot when a worker of `needs` is enabled and the database lacks the tables of `migration` it needs, naming the file,
+ * the tables and what the workers do with them. A check that cannot be made (ClickHouse unreachable) does not fail the boot: it
+ * is said, and the workers report the failures of their reads and writes as they always do. Shared by the checks of 014 and 015.
+ */
+async function assertTablesOf(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+  migration: string,
+  needs: SchemaNeeds,
+): Promise<void> {
+  const workers = [...needs.keys()].filter((name) => enabled.has(name));
+  if (workers.length === 0) return;
+  const wanted = [...new Set(workers.flatMap((name) => needs.get(name)?.tables ?? []))];
+  const who = (list: readonly WorkerName[]): string =>
+    `${list.join(' and ')} ${list.length === 1 ? 'worker' : 'workers'}`;
+  let rows: { table_name: string }[];
+  try {
+    rows = await ch.query<{ table_name: string }>(
+      `SELECT name AS table_name
+         FROM system.tables
+        WHERE database = currentDatabase() AND name IN {tables:Array(String)}
+        ORDER BY name`,
+      { tables: wanted },
+    );
+  } catch (err) {
+    logger.warn(
+      `Could not check that ${migration} is applied (${err instanceof Error ? err.message : String(err)}); ` +
+        `the ${who(workers)} ${workers.length === 1 ? 'starts' : 'start'} without the check`,
+    );
+    return;
+  }
+  const present = new Set(rows.map((row) => row.table_name));
+  const missing = wanted.filter((table) => !present.has(table)).map((table) => `table ${table}`);
+  if (missing.length === 0) return;
+  const does = workers.map((name) => `the ${name} worker ${needs.get(name)?.does}`).join(' and ');
+  throw new Error(
+    `The ClickHouse database "${database}" lacks the schema of ${migration} (${missing.join(', ')}), which ` +
+      `${does}: apply the migrations (pnpm --filter @gatehub/data-api-shared ch:migrate, or GH_RUN_MIGRATIONS_ON_BOOT=true) ` +
+      'and start the syncer again',
+  );
+}
+
 /** The migration that adds what the ingest writes with every ledger (`state_touches`) and what the aggregator's `tokens` job keeps. */
 export const ISSUED_TOKENS_MIGRATION = '014_issued_tokens.sql';
 
@@ -130,7 +178,7 @@ export const ISSUED_TOKENS_MIGRATION = '014_issued_tokens.sql';
  * The tables of `ISSUED_TOKENS_MIGRATION` each worker needs, and what it does with them. The ingest writes `state_touches` with every
  * ledger; the `tokens` job of the aggregator reads that table and keeps the three aggregates.
  */
-const ISSUED_TOKENS_NEEDS: ReadonlyMap<WorkerName, { tables: readonly Table[]; does: string }> = new Map([
+const ISSUED_TOKENS_NEEDS: SchemaNeeds = new Map([
   ['ingest', { tables: [Table.StateTouches], does: 'writes' }],
   [
     'aggregator',
@@ -154,34 +202,33 @@ export async function assertIssuedTokensSchema(
   database: string,
   logger: { warn(message: string): void },
 ): Promise<void> {
-  const workers = [...ISSUED_TOKENS_NEEDS.keys()].filter((name) => enabled.has(name));
-  if (workers.length === 0) return;
-  const wanted = [...new Set(workers.flatMap((name) => ISSUED_TOKENS_NEEDS.get(name)?.tables ?? []))];
-  const who = (list: readonly WorkerName[]): string =>
-    `${list.join(' and ')} ${list.length === 1 ? 'worker' : 'workers'}`;
-  let rows: { table_name: string }[];
-  try {
-    rows = await ch.query<{ table_name: string }>(
-      `SELECT name AS table_name
-         FROM system.tables
-        WHERE database = currentDatabase() AND name IN {tables:Array(String)}
-        ORDER BY name`,
-      { tables: wanted },
-    );
-  } catch (err) {
-    logger.warn(
-      `Could not check that ${ISSUED_TOKENS_MIGRATION} is applied (${err instanceof Error ? err.message : String(err)}); ` +
-        `the ${who(workers)} ${workers.length === 1 ? 'starts' : 'start'} without the check`,
-    );
-    return;
-  }
-  const present = new Set(rows.map((row) => row.table_name));
-  const missing = wanted.filter((table) => !present.has(table)).map((table) => `table ${table}`);
-  if (missing.length === 0) return;
-  const needs = workers.map((name) => `the ${name} worker ${ISSUED_TOKENS_NEEDS.get(name)?.does}`).join(' and ');
-  throw new Error(
-    `The ClickHouse database "${database}" lacks the schema of ${ISSUED_TOKENS_MIGRATION} (${missing.join(', ')}), which ` +
-      `${needs}: apply the migrations (pnpm --filter @gatehub/data-api-shared ch:migrate, or GH_RUN_MIGRATIONS_ON_BOOT=true) ` +
-      'and start the syncer again',
-  );
+  await assertTablesOf(ch, enabled, database, logger, ISSUED_TOKENS_MIGRATION, ISSUED_TOKENS_NEEDS);
+}
+
+/** The migration that adds the Xahau mint tables the ingest writes with every ledger and the supply tables the aggregator keeps. */
+export const SUPPLY_MIGRATION = '015_supply.sql';
+
+/**
+ * The tables of `SUPPLY_MIGRATION` each worker needs, and what it does with them. The ingest writes the three mint tables
+ * (`genesis_mints`, `imports`, `reward_claims`) with every ledger.
+ */
+const SUPPLY_NEEDS: SchemaNeeds = new Map([
+  ['ingest', { tables: [Table.GenesisMints, Table.Imports, Table.RewardClaims], does: 'writes' }],
+]);
+
+/**
+ * Fails the boot when the ingest worker is enabled and the database lacks the three mint tables of `015_supply.sql`. The schema is
+ * one on every network, so the check does not ask which one this is; on Xahau the ingest inserts into the tables as soon as a
+ * ledger holds a mint, and an insert into a missing table fails the batch, so that the live runner would retry the same ledgers
+ * without end. It runs after the boot-time migrations and after the check of 014, which it follows in the same way. A check that
+ * cannot be made (ClickHouse unreachable) does not fail the boot: it is said, and the worker reports the failures of its writes as
+ * it always does.
+ */
+export async function assertSupplySchema(
+  ch: Pick<ClickHouseService, 'query'>,
+  enabled: ReadonlySet<WorkerName>,
+  database: string,
+  logger: { warn(message: string): void },
+): Promise<void> {
+  await assertTablesOf(ch, enabled, database, logger, SUPPLY_MIGRATION, SUPPLY_NEEDS);
 }

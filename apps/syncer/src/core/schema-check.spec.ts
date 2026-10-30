@@ -2,9 +2,11 @@ import { ClickHouseService, Table } from '@gatehub/data-api-shared';
 import { WorkerName } from '../config/syncer.config';
 import {
   assertIssuedTokensSchema,
+  assertSupplySchema,
   assertTomlsSchema,
   assertValidatorsSchema,
   ISSUED_TOKENS_MIGRATION,
+  SUPPLY_MIGRATION,
   TOMLS_MIGRATION,
   VALIDATORS_MIGRATION,
 } from './schema-check';
@@ -239,5 +241,81 @@ describe('assertIssuedTokensSchema', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(ISSUED_TOKENS_MIGRATION));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
+  });
+});
+
+describe('assertSupplySchema', () => {
+  const MINT_TABLES = [Table.GenesisMints, Table.Imports, Table.RewardClaims];
+
+  it('checks nothing when the ingest worker is not enabled', async () => {
+    const db = tablesOf();
+    const warn = jest.fn();
+    await assertSupplySchema(db.ch, workers('validations', 'fee_stats', 'validators', 'tomls', 'aggregator'), 'xahau', {
+      warn,
+    });
+    await assertSupplySchema(db.ch, workers(), 'xahau', { warn });
+    expect(db.query).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('passes a database with the three mint tables of 015, reading system.tables of the database with bound values', async () => {
+    const db = tablesOf(...MINT_TABLES);
+    await expect(
+      assertSupplySchema(db.ch, workers('ingest', 'aggregator'), 'xahau', { warn: jest.fn() }),
+    ).resolves.toBe(undefined);
+    expect(db.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toContain('FROM system.tables');
+    expect(sql).toContain('database = currentDatabase()');
+    expect(params).toEqual({ tables: MINT_TABLES });
+  });
+
+  it('fails the boot of the ingest worker on a database without 015, naming the migration and the three tables, on either network', async () => {
+    for (const database of ['xahau', 'xrpl']) {
+      const check = assertSupplySchema(
+        tablesOf(Table.Ledgers, Table.StateTouches).ch,
+        workers('ingest', 'fee_stats'),
+        database,
+        {
+          warn: jest.fn(),
+        },
+      );
+      await expect(check).rejects.toThrow(SUPPLY_MIGRATION);
+      await expect(check).rejects.toThrow(
+        `(table ${Table.GenesisMints}, table ${Table.Imports}, table ${Table.RewardClaims})`,
+      );
+      await expect(check).rejects.toThrow('the ingest worker writes');
+      await expect(check).rejects.toThrow(`database "${database}"`);
+      await expect(check).rejects.toThrow('apply the migrations');
+    }
+    expect(SUPPLY_MIGRATION).toBe('015_supply.sql');
+  });
+
+  it('names exactly the tables that are missing', async () => {
+    const check = assertSupplySchema(tablesOf(Table.GenesisMints).ch, workers('ingest'), 'xahau', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(`(table ${Table.Imports}, table ${Table.RewardClaims})`);
+    await expect(check).rejects.not.toThrow(`table ${Table.GenesisMints}`);
+  });
+
+  it('is a check of its own: a database with the tables of 014 and not 015 passes 014 and fails 015, each naming its own file', async () => {
+    const db = tablesOf(Table.StateTouches, Table.TokenGenerations, Table.TokenLines, Table.Tokens);
+    await expect(
+      assertIssuedTokensSchema(db.ch, workers('ingest', 'aggregator'), 'xahau', { warn: jest.fn() }),
+    ).resolves.toBe(undefined);
+    const check = assertSupplySchema(db.ch, workers('ingest', 'aggregator'), 'xahau', { warn: jest.fn() });
+    await expect(check).rejects.toThrow(SUPPLY_MIGRATION);
+    await expect(check).rejects.not.toThrow(ISSUED_TOKENS_MIGRATION);
+  });
+
+  it('does not fail the boot when the check cannot be made, and says so', async () => {
+    const ch = {
+      query: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:8123')),
+    } as unknown as Pick<ClickHouseService, 'query'>;
+    const warn = jest.fn();
+    await expect(assertSupplySchema(ch, workers('ingest'), 'xahau', { warn })).resolves.toBe(undefined);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(SUPPLY_MIGRATION));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ECONNREFUSED'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('the ingest worker starts without the check'));
   });
 });
