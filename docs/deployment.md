@@ -265,8 +265,9 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
 - `015_supply.sql` (four `CREATE TABLE IF NOT EXISTS`: the ledger-derived Xahau mint tables `genesis_mints`, `imports` and `reward_claims`, and the aggregate `network_supply`) is additive but **sets an
   order**: `migrate` first, then the syncer, then the api. A syncer of this version (parser version 9) writes the three ledger tables on Xahau, whenever a ledger has mint rows (a successful `GenesisMint` or `Import`, or any `ClaimReward`) (on XRPL they stay empty), and an insert into a
   missing table fails the batch, so the live runner would retry the same ledgers without end. Its `supply` job reads them and
-  writes `network_supply`, and the supply routes of the api answer 500 until the tables exist. Nothing checks for them at boot yet (a check like 014's comes with the mint parsers and the supply job of
-  this release). The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last.
+  writes `network_supply`, and the supply routes of the api answer 500 until the tables exist. A syncer with the `ingest` worker refuses to boot without the three mint tables
+  (`lacks the schema of 015_supply.sql`, on every network: the schema is one, and on Xahau the first ledger with a mint would fail its batch), after the same check for 014. The compose files make both wait for `migrate`; by hand,
+  run `migrate`, start the syncer, and the api last.
 
 ## Configuration and secrets
 

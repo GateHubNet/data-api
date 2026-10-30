@@ -107,8 +107,9 @@ names the file and the tables that are missing (`lacks the schema of 014_issued_
 token routes answer 500 until the tables exist).
 **The ingest needs migration `015_supply.sql` applied before a syncer with parser version 9 starts, and the api after it.** That syncer writes `genesis_mints`, `imports` and `reward_claims` on Xahau,
 whenever a ledger has mint rows (a successful `GenesisMint` or `Import`, or any `ClaimReward`) (on XRPL they stay empty and nothing is written to them), and an insert into a missing table fails the batch, so the live runner
-would retry the same ledgers without end. The `supply` job reads the three tables and writes the fourth, `network_supply`. Nothing checks for the tables at boot yet (a check like 014's comes with the
-mint parsers and the supply job of this release). Run the migrate job first (the compose files do), then deploy the syncer, then the api (the supply routes answer 500 until the tables exist).
+would retry the same ledgers without end. The `supply` job reads the three tables and writes the fourth, `network_supply`. A syncer with the `ingest` worker therefore refuses to boot against a
+database without the three mint tables: the message names the file and the tables (`lacks the schema of 015_supply.sql`), on every network, since the schema is one on both and on Xahau an insert into a missing table
+fails the batch. Run the migrate job first (the compose files do), then deploy the syncer, then the api (the supply routes answer 500 until the tables exist).
 **The shared database has migrations of its own.** `packages/shared/schema-shared/` holds the schema of the `shared` database (account names and labels,
 [ADR-0014](adr/0014-address-names-and-labels-in-a-shared-database.md)), numbered from 001 and recorded in `shared.schema_migrations`. One job applies it
 for both networks, `dc run --rm migrate-shared` (the command `migrate.js shared`); never run it from two places at once. **It must run before an api
@@ -962,7 +963,8 @@ toml sweep was not measured**, nor was the cost of an empty repair window. **`ac
 it takes the newest row of each issuer the window names (`LIMIT 1 BY account` over `account IN {issuers}`), which reads each issuer's prefix of the key in every partition, with the wide `fields` column, and the
 whole history of a busy issuer's changes of its own settings. On real tables with billions of rows a window that names a few hundred issuers may spend seconds on this read alone; a window is never cut, so the
 effect is time (the run overruns its 4 s and delays `stats_live` of that tick), not a stall. The job logs the duration of each window at debug level (`tokens: generation N (live): ledgers A - B, ..., T ms`; the repair
-has the same line, with `(repair)`), so that the rollout can record the slowest ones (the table above); a read of the newest key first is for the rollout to show necessary.
+has the same line, with `(repair)`), so that the rollout can record the slowest ones (the table above); a read of the newest key first is for the rollout to show necessary. The `T ms` covers the **whole window**, from the
+read that chooses it to the update of the generation row (the older-parser check, the state reads, the recompute and the writes), not the issuer-settings read alone, so it shows that a window was slow and not which of its reads.
 
 | What | Measured |
 | --- | --- |

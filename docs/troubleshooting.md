@@ -218,6 +218,16 @@ account names any more: the store keeps every domain it checked ([operations](op
 The `tomls` worker is enabled and the database does not have `account_domains` and `domain_tomls`. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer
 again. A syncer of this release without the tables could not write a ledger either, so migrate before it starts ([deployment](deployment.md#schema-migrations)).
 
+### Syncer refuses to boot: `lacks the schema of 014_issued_tokens.sql`
+The `ingest` worker is enabled and the database does not have `state_touches`, or the `aggregator` worker is and it lacks any of `state_touches`, `token_generations`, `token_lines` and `tokens`. Apply the migrations
+(`dc run --rm migrate-<network>`) and start the syncer again. A syncer of this release without `state_touches` could not write a ledger, and an aggregator without the other three could not drain `agg_dirty`, so migrate before it
+starts ([deployment](deployment.md#schema-migrations), [agg_dirty does not drain](#agg_dirty-does-not-drain-the-tokens-hook-fails)).
+
+### Syncer refuses to boot: `lacks the schema of 015_supply.sql`
+The `ingest` worker is enabled and the database does not have the three Xahau mint tables `genesis_mints`, `imports` and `reward_claims`. The schema is one on every network, so a syncer on the XRP Ledger is refused too, though it
+never inserts into them; on Xahau an insert into a missing table fails the batch, so the live runner would retry the same ledgers without end. Apply the migrations (`dc run --rm migrate-<network>`) and start the syncer again
+([deployment](deployment.md#schema-migrations)). If the boot log says `Could not check that 015_supply.sql is applied`, ClickHouse was unreachable at the boot and the migration may be the cause.
+
 ### An escrow, check, payment channel or delegation answers 404, has no `created`, or says `"complete": false`
 `coverage` says how much of the history the index holds ([api-reference](api-reference.md#coverage)): the object data start at the first ledger written by parser version 7 or
 later, and `complete` is true only when that is at or before the ledger the feature starts at (XRPL: 28,685,313 for escrows and payment channels, 56,219,905 for checks, 107,524,865

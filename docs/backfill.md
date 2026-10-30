@@ -123,11 +123,16 @@ ingest (Ruling R110). A database filled by range ingests only (no lease row) is 
   [Ledger objects and delegation re-ingest](#ledger-objects-and-delegation-re-ingest)).
   Changes of these objects that no event of the table expects are counted in `syncer_objects_unclassified_total`, and the range-ingest log names the
   total of its run (a warning when it is not 0, and `L unclassified object changes` in the last line).
-  Parser version 8 (the current one) adds the index of the trust lines and issuers whose token state a transaction changed (`state_touches`, a row for each
+  Parser version 8 adds the index of the trust lines and issuers whose token state a transaction changed (`state_touches`, a row for each
   created, modified or deleted trust line and for each account root whose flags, transfer rate or domain changed, or that sent an `AccountSet`;
   `TOKEN_PARSER_VERSION`): ledgers written by an older version have none. **The aggregate of the issued tokens needs no re-ingest of them**: its account
   pass reads `trust_line_states` as it is, and the job needs the touches only above the ledger its generation was built at. The job never applies a window that
   holds a ledger of an older version: it builds a new generation instead. A `--reprocess` of a range writes the touches of its ledgers, as for every table.
+  Parser version 9 (the current one) adds the Xahau mint rows (`genesis_mints`, `imports` and `reward_claims`; `MINT_PARSER_VERSION`): the entries of a `GenesisMint`, the
+  drops each `Import` brought and the `ClaimReward`s that a reward mint answers. Xahau ledgers written by an older version have none of them, and a `--reprocess` of a range
+  writes them; XRPL has none of the three transaction types, so its ledgers hold no mint row of any version. Readers of the three tables gate on `MINT_PARSER_VERSION`, never on
+  `PARSER_VERSION`. An `Import` whose minted drops come out below 0 (the network cannot produce one) is stored as 0 and counted in
+  `syncer_parser_anomalies_total{kind="import_minted_negative"}`; the range-ingest log names the count of its run in a warning when it is not 0 (its last line does not carry it).
 - **Aggregates:** every written chunk marks its hours in `agg_dirty`; the aggregator recomputes the stats and the daily volumes of
   those hours within its per-tick budgets (see [syncer](syncer.md#7-the-aggregator)). A multi-year backfill therefore takes the
   aggregator a while to digest: `SELECT count() FROM xrpl.agg_dirty` shrinks as it works.

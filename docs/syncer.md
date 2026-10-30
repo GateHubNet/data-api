@@ -49,6 +49,10 @@ Then, in order:
    (`system.columns`): a database without it refuses the boot with a message that names the file and what is missing (a check
    that cannot reach ClickHouse is logged and the boot goes on). With the `tomls` worker enabled, the two tables of
    `012_display_names.sql` (`account_domains`, `domain_tomls`) are checked the same way, and a database without them refuses the boot.
+   With the `ingest` or the `aggregator` worker enabled, the tables of `014_issued_tokens.sql` they need are checked the same way (the ingest `state_touches`, the
+   aggregator all four: `lacks the schema of 014_issued_tokens.sql`), and with the `ingest` worker the three Xahau mint tables of `015_supply.sql` (`genesis_mints`, `imports`,
+   `reward_claims`: `lacks the schema of 015_supply.sql`), on every network, since the schema is one and on Xahau an insert into a missing table fails the batch. The check of
+   015 runs after the one of 014.
 2. The shared **`NodeClient`** connects to `GH_NODE_ENDPOINTS` and checks that the node belongs to `GH_NETWORK`
    (`server_info.network_id` must be one of the profile's `acceptedNodeNetworkIds`: `xrpl` 0 or nothing, `xahau` 21337, `xrpl-testnet` 1, `xahau-testnet` 21338, and no other). A node of another network refuses the boot.
 3. The workers start in their lifecycle hooks. SIGTERM/SIGINT run the registered cleanups (workers stop, the lease is released,
@@ -91,7 +95,8 @@ parser version 6 and ordered by account), the history of the tracked ledger obje
 `account_object_changes` (migration 013, filled from parser version 7: a ledger written by an older parser has no rows in them), the index of the trust
 lines and issuers whose token state a transaction changed `state_touches` (migration 014, filled from parser version 8: a ledger written by an older parser
 has no rows in it, and the tokens job never applies a window that holds one), and the three Xahau mint tables `genesis_mints`, `imports` and
-`reward_claims` (migration 015: empty on XRPL, and on Xahau until the mint parsers of parser version 9 write them);
+`reward_claims` (migration 015, filled from parser version 9: a Xahau ledger written by an older parser has no rows in them, and XRPL has none of the three
+transaction types, so they stay empty there);
 see [data-model](data-model.md)). The parsers never mutate their input and take the
 network profile (native currency, CTID network id, the ledger from which partial payments report `delivered_amount`).
 The AMM parser reads every successful transaction: a swap against a pool becomes an `exchanges` row (and its `account_exchanges`
@@ -1281,6 +1286,7 @@ The log lines, as built (the context is `TomlChecker`, `DomainDiscovery` or `Tom
 | `Toml checks: the pass failed: <name> (<type>)` | ClickHouse refused the read of the schedule or the insert of the rows | The rows not written are due again at the next pass (a minute later). |
 | Boot refuses: `lacks the schema of 012_display_names.sql` | The migration was not applied before a syncer with the `tomls` worker | Apply it (`migrate-<network>`) and start the syncer again. |
 | Boot refuses: `lacks the schema of 014_issued_tokens.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs `state_touches`) or the `aggregator` worker (it needs all four tables of the file) | Apply it (`migrate-<network>`) and start the syncer again. |
+| Boot refuses: `lacks the schema of 015_supply.sql` | The migration was not applied before a syncer with the `ingest` worker (it needs the three mint tables `genesis_mints`, `imports` and `reward_claims`, on either network: the schema is one, and on Xahau an insert into a missing table fails the batch) | Apply it (`migrate-<network>`) and start the syncer again. |
 | `Aggregator job escrows failed: ...` and `syncer_escrows_lag_ledgers` grows with the head | A step of the `escrows` job failed (ClickHouse refusing a read or an insert, mostly) | The window `(watermark, head]` is done again at the next tick; the sentinel keeps its old total and watermark, which agree. The gauge follows the head. See [the escrows job](#the-escrows-job). |
 | `Aggregator job escrows failed for escrow <id>, set aside: <reason>` | The rows of one escrow cannot be mapped to an `escrows` row, for the reason given | The step commits without it and counts it; the escrow keeps its old row. A bug to report. |
 | `Aggregator job escrows_dirty failed in <from> - <to>: ...` | The hook of an `agg_dirty` slice failed | The slice stays queued and its earlier hooks run again at each tick, until it works ([7.6](#76-the-agg_dirty-hooks)). |
