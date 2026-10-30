@@ -24,9 +24,10 @@ import { TokenKey, tokenListing, TokenListing } from './token-rules';
  *    is passed in: the functions here never read a clock. Readers keep the newest version of a key (`LIMIT 1 BY`, no `FINAL`) and
  *    drop `deleted = 1` after that.
  *  - **The pass reads a key range.** `trust_line_states` is ordered by `account`; a batch of `TOKENS_PASS_ACCOUNTS` accounts is the
- *    range `(after, through]` of it (`nextPassAccounts`), and `writePassLines` reads the newest row of each line of those accounts
- *    at or before the head, from the account's side as the issuer (`issuer = account`), in one `INSERT ... SELECT`. Each line is
- *    written once, by its issuer's side, so both orientations of a line come from its two accounts.
+ *    range `(after, through]` of it. `nextPassAccounts` finds the batch's last account by reading the table in key order and
+ *    stopping after the batch (a granule or so of each part: not every row after the cursor), and `writePassLines` reads the newest
+ *    row of each line of those accounts at or before the head, from the account's side as the issuer (`issuer = account`), in one
+ *    `INSERT ... SELECT`. Each line is written once, by its issuer's side, so both orientations of a line come from its two accounts.
  *  - **Query parameters travel in the URL** and ClickHouse refuses one over 128 KiB (ADR-0012): every array parameter holds at most
  *    `TOKENS_STATE_CHUNK` keys of at most 40 characters, or `TOKENS_TOML_DOMAINS_CHUNK` domains of at most 128, so every read that
  *    names accounts, tokens or domains goes by chunks.
@@ -196,20 +197,28 @@ export async function tokensVersionFloor(ch: ClickHouseService): Promise<string>
 // The account pass
 // ---------------------------------------------------------------------------------------------------------------------
 
-/** The next accounts of the pass in key order: `LIMIT 1 BY account` keeps one row of each, `LIMIT n` stops after `n`. */
+/**
+ * The next accounts of the pass in key order. `GROUP BY account ORDER BY account LIMIT n` with `optimize_aggregation_in_order` reads
+ * the table in the order of its key and stops after `n` groups, a granule or a few of each part; `max_block_size` at the table's
+ * granule (8,192 rows) keeps the blocks of that read as small. `LIMIT 1 BY account LIMIT n` gives the same accounts but is not stopped
+ * by the limit: it reads every row after the cursor (measured on ClickHouse 26.8, spec 3.1 step 1).
+ */
 const NEXT_ACCOUNTS_SQL = `SELECT account
   FROM ${Table.TrustLineStates}
  WHERE account > {after:String}
+ GROUP BY account
  ORDER BY account
- LIMIT 1 BY account
  LIMIT {n:UInt32}`;
+
+const NEXT_ACCOUNTS_SETTINGS = { optimize_aggregation_in_order: 1, max_block_size: '8192' } as const;
 
 /**
  * The accounts that have a trust line after `after`, in key order, at most `n` (spec 3.1 step 1): the accounts of the next batch of
- * the pass. Empty once the pass has passed the last account. `after` is `''` for the first batch.
+ * the pass. Empty once the pass has passed the last account. `after` is `''` for the first batch. The read is bounded by the batch,
+ * not by the rows after the cursor: about one granule of each part of the table, plus the rows of an account that fills a part.
  */
 export async function nextPassAccounts(ch: ClickHouseService, after: string, n: number): Promise<string[]> {
-  const rows = await ch.query<{ account: string }>(NEXT_ACCOUNTS_SQL, { after, n });
+  const rows = await ch.query<{ account: string }>(NEXT_ACCOUNTS_SQL, { after, n }, NEXT_ACCOUNTS_SETTINGS);
   return rows.map((row) => row.account);
 }
 

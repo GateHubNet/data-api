@@ -29,7 +29,7 @@ import { syntheticHash } from './synthetic-hash';
  *  - `first + 2`: balances change; two lines are deleted (one still shows a balance owed); one line turns round.
  *  - `first + 3`: `gate` lowers its transfer rate to 1.002 and freezes globally; a balance changes again.
  *  - `first + 4`: a deleted line is made again; an AMM pool holds two tokens and issues its LP token; `gone` is deleted.
- *  - `first + 5` (the head): one more change.
+ *  - `first + 5` (the head): one more change; `nostate` has two lines of HUG, one of them 1e40 (above what the exact sums hold).
  */
 
 type Json = Record<string, any>;
@@ -225,6 +225,8 @@ export interface TokensWorld {
   both: string;
   myToken: string;
   lp: string;
+  /** A currency of `nostate` with an amount (1e40) that the exact sums cannot hold: its supply is the Float64 sum. */
+  huge: string;
   /** The ledgers of `gate`'s `AccountSet`s: the transfer rate 1.005 is set at `rateFirst`, the rate 1.002 and the global freeze at `rateNow`. */
   rateFirst: number;
   rateNow: number;
@@ -265,6 +267,7 @@ export async function seedTokensWorld(
   const BTH = 'BTH';
   const myToken = ledgerCurrencyOf('MYTOKEN') as string;
   const lp = `03${'AB'.repeat(19)}`;
+  const huge = 'HUG';
 
   const timeline: WorldTx[][] = Array.from({ length: 6 }, () => []);
   const at = (n: number, tx: WorldTx): void => void timeline[n].push(tx);
@@ -369,6 +372,21 @@ export async function seedTokensWorld(
     held: '1',
     holderLimit: '100',
   });
+  // 1e40 is above the 1e36 that the exact sums hold, so the supply of HUG is the Float64 sum: 1e40 and 5 make 1e40
+  const hugeA: Line = count({
+    issuer: nostate,
+    holder: above(nostate, 'hugeA'),
+    currency: huge,
+    held: '1e40',
+    holderLimit: '1000',
+  });
+  const hugeB: Line = count({
+    issuer: nostate,
+    holder: below(nostate, 'hugeB'),
+    currency: huge,
+    held: '5',
+    holderLimit: '1000',
+  });
   const xG1: Line = count({ issuer: gone, holder: above(gone, 'xG1'), currency: 'GON', held: '2', holderLimit: '100' });
   const poolGate: Line = count({
     issuer: gate,
@@ -456,6 +474,7 @@ export async function seedTokensWorld(
 
   // -- first + 5: the head --------------------------------------------------------------------------------------------------
   changes(5, pU1, pU1b);
+  makes(5, hugeA, hugeB);
 
   const ledgers = timeline.map((txs, n) => {
     const index = first + n;
@@ -545,6 +564,7 @@ export async function seedTokensWorld(
     both: BTH,
     myToken,
     lp,
+    huge,
     rateFirst: first + 1,
     rateNow: first + 3,
     gateDomain,
@@ -644,24 +664,41 @@ export interface BruteForceToken {
   supply: string;
 }
 
+/** Whether `Decimal256(30)` holds an amount whole (`exactAmount`): at most 30 decimal places and below 1e36. */
+const fitsExactSum = (balance: string): boolean => {
+  const n = new BigNumber(balance);
+  return (n.decimalPlaces() ?? 0) <= 30 && n.isLessThan('1e36');
+};
+
 /**
  * The tokens at `head`, counted the plain way: the lines of `bruteForceLines` per token, the holders those with a balance above 0, the
- * supply the exact sum of their balances (BigNumber). Keyed by `tokenMapKey`; a token with no line that counts is not in it.
+ * supply the exact sum of their balances (BigNumber). A token with a balance that the exact sums cannot hold (more than 30 decimal
+ * places, or 1e36 and above) has the Float64 sum of its balances instead, as `sumOf` gives it. Keyed by `tokenMapKey`; a token with no
+ * line that counts is not in it.
  */
 export async function bruteForceTokens(ch: ClickHouseService, head: number): Promise<Map<string, BruteForceToken>> {
-  const tokens = new Map<string, { holders: number; trust_lines: number; supply: BigNumber }>();
+  const tokens = new Map<
+    string,
+    { holders: number; trust_lines: number; supply: BigNumber; float: number; fits: boolean }
+  >();
   for (const { token, line } of (await bruteForceLines(ch, head)).values()) {
     const key = tokenMapKey(token);
-    const sums = tokens.get(key) ?? { holders: 0, trust_lines: 0, supply: new BigNumber(0) };
+    const sums = tokens.get(key) ?? { holders: 0, trust_lines: 0, supply: new BigNumber(0), float: 0, fits: true };
     sums.trust_lines += 1;
     if (new BigNumber(line.balance).isGreaterThan(0)) sums.holders += 1;
     sums.supply = sums.supply.plus(line.balance);
+    sums.float += Number(line.balance);
+    sums.fits &&= fitsExactSum(line.balance);
     tokens.set(key, sums);
   }
   return new Map(
     [...tokens].map(([key, sums]) => [
       key,
-      { holders: sums.holders, trust_lines: sums.trust_lines, supply: sums.supply.toFixed() },
+      {
+        holders: sums.holders,
+        trust_lines: sums.trust_lines,
+        supply: sums.fits ? sums.supply.toFixed() : new BigNumber(sums.float).toFixed(),
+      },
     ]),
   );
 }

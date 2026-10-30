@@ -100,16 +100,21 @@ describe('the tokens job (e2e)', () => {
 
   /** The newest row of each token of a generation that is not deleted, by `tokenMapKey`. */
   async function liveTokens(svc: ClickHouseService, generation: number): Promise<Map<string, TokensRow>> {
-    const rows = await svc.query<TokensRow>(
+    const rows = await svc.query<Omit<TokensRow, 'version'> & { version_text: string }>(
       `SELECT issuer, currency, code, holders, trust_lines, supply, supply_f, last_ledger, issuer_ledger, issuer_flags,
-              transfer_rate, domain, listed, name, toml, deleted, toString(version) AS version
+              transfer_rate, domain, listed, name, toml, deleted, toString(version) AS version_text
          FROM ${Table.Tokens}
         WHERE generation = {generation:UInt32}
         ORDER BY issuer, currency, version DESC
         LIMIT 1 BY issuer, currency`,
       { generation },
     );
-    return new Map(rows.filter((r) => r.deleted === 0).map((r) => [tokenMapKey(r), r]));
+    // the alias is not `version`: it would shadow the column and `ORDER BY version` would sort the text
+    return new Map(
+      rows
+        .filter((r) => r.deleted === 0)
+        .map(({ version_text, ...row }): [string, TokensRow] => [tokenMapKey(row), { ...row, version: version_text }]),
+    );
   }
 
   /** The newest row of each line of a generation that is not deleted, by `lineMapKey`. */
@@ -208,6 +213,15 @@ describe('the tokens job (e2e)', () => {
       ]);
       // plain's USD: one holder at the head's 2, a zero line, and the pool's 700
       expect(tokens.get(tokenOf(world.plain, world.usd))).toMatchObject({ holders: 2, trust_lines: 3, supply: '702' });
+    });
+
+    it('takes the Float64 sum as the supply when an amount does not fit the exact sums', () => {
+      // 1e40 (above the 1e36 the exact sums hold) and 5: the exact sum would leave the 1e40 out and say 5
+      const token = tokens.get(tokenOf(world.nostate, world.huge));
+      expect(token).toMatchObject({ holders: 2, trust_lines: 2, supply: '10000000000000000000000000000000000000000' });
+      expect(token?.supply_f).toBe(1e40);
+      // the others keep their exact sums
+      expect(tokens.get(tokenOf(world.nostate, 'ABC'))?.supply).toBe('10');
     });
 
     it('counts a zero line with both limits above 0 for both tokens, and no LP line', async () => {
@@ -372,18 +386,82 @@ describe('the tokens job (e2e)', () => {
     });
 
     it('the pass reads a key range of trust_line_states', async () => {
+      const accounts = (await ch.query<{ account: string }>(`SELECT DISTINCT account FROM ${Table.TrustLineStates}`))
+        .map((r) => r.account)
+        .sort();
+      const after = accounts[2];
+      const through = accounts[accounts.length - 3];
       const plan = await ch.query<{ explain: string }>(`EXPLAIN indexes = 1 ${PASS_LINES_SELECT}`, {
         g: 1,
-        after: '',
-        through: 'r',
+        after,
+        through,
         head: world.head,
         version: '1',
       });
       const text = plan.map((r) => r.explain).join('\n');
-      const primary = text.slice(text.indexOf('PrimaryKey'));
       expect(text).toContain('PrimaryKey');
+      const primary = text.slice(text.indexOf('PrimaryKey'));
       expect(primary).toMatch(/Keys:\s+account/);
-      expect(primary).toMatch(/Condition:.*account/);
+      // both bounds of the range are in the primary key's condition: the batch is a range, not a prefix of the table
+      expect(primary).toContain(`account in (-Inf, '${through}']`);
+      expect(primary).toContain(`account in ('${after}', +Inf)`);
+    });
+
+    it('nextPassAccounts reads about a granule of each part, not every row after the cursor', async () => {
+      // three parts that each hold the same 500 accounts (as parts of different ledgers do), merges stopped so that they stay
+      const svc = await fresh();
+      const db = (await svc.queryOne<{ db: string }>('SELECT currentDatabase() AS db'))?.db ?? '';
+      await svc.command(`SYSTEM STOP MERGES ${db}.${Table.TrustLineStates}`);
+      const PARTS = 3;
+      const PER_ACCOUNT = 600;
+      const ACCOUNTS = 500;
+      for (let part = 0; part < PARTS; part++) {
+        await svc.command(
+          `INSERT INTO ${Table.TrustLineStates}
+             (account, counterparty, currency, ledger_index, tx_index, node_index, tx_hash, close_time, balance, \`limit\`,
+              limit_peer, no_ripple, no_ripple_peer, authorized, peer_authorized, freeze, peer_freeze, quality_in, quality_out,
+              flags, deleted)
+           SELECT concat('rA', leftPad(toString(intDiv(number, ${PER_ACCOUNT})), 6, '0')),
+                  concat('rB', leftPad(toString(number % ${PER_ACCOUNT}), 6, '0')),
+                  'USD', {ledger:UInt32}, 0, 0, '', now(), '-5', '0', '10', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+             FROM numbers(${ACCOUNTS * PER_ACCOUNT})`,
+          { ledger: 100 + part },
+        );
+      }
+      const [parts] = await svc.query<{ parts: string }>(
+        `SELECT count() AS parts FROM system.parts WHERE database = {db:String} AND table = {table:String} AND active`,
+        { db, table: Table.TrustLineStates },
+      );
+      expect(Number(parts.parts)).toBe(PARTS);
+
+      const readRows = async (after: string): Promise<number> => {
+        await svc.command('SYSTEM FLUSH LOGS');
+        const [row] = await svc.query<{ read_rows: string }>(
+          `SELECT read_rows FROM system.query_log
+            WHERE type = 'QueryFinish' AND current_database = {db:String} AND startsWith(query, 'SELECT account')
+              AND position(query, {cursor:String}) > 0
+            ORDER BY event_time_microseconds DESC LIMIT 1`,
+          { db, cursor: `account > '${after}'` },
+        );
+        return Number(row.read_rows);
+      };
+
+      for (const [after, first] of [
+        ['', 'rA000000'],
+        ['rA000250', 'rA000251'],
+      ] as const) {
+        const [{ remainder }] = await svc.query<{ remainder: string }>(
+          `SELECT count() AS remainder FROM ${Table.TrustLineStates} WHERE account > {after:String}`,
+          { after },
+        );
+        const accounts = await nextPassAccounts(svc, after, 3);
+        expect(accounts).toEqual([first, ...accounts.slice(1)]);
+        expect(accounts).toHaveLength(3);
+        const rows = await readRows(after);
+        // the rows after the cursor are 900,000 and 448,200: a batch of 3 accounts reads a granule or a few of each part (8,192 rows)
+        expect(Number(remainder)).toBeGreaterThan(400_000);
+        expect(rows).toBeLessThan(PARTS * 4 * 8_192);
+      }
     });
   });
 
@@ -502,13 +580,13 @@ describe('the tokens job (e2e)', () => {
       ]);
       await recompute('40', [a, never]);
       expect(await liveTokens(svc, 7)).toEqual(new Map());
-      const rows = await svc.query<{ currency: string; deleted: number; version: string }>(
-        `SELECT currency, deleted, toString(version) AS version FROM ${Table.Tokens} ORDER BY currency, version`,
+      const rows = await svc.query<{ currency: string; deleted: number; version_text: string }>(
+        `SELECT currency, deleted, toString(version) AS version_text FROM ${Table.Tokens} ORDER BY currency, version`,
       );
       // the live row, then the deleted one: the token that never had a line has no row at all
       expect(rows).toEqual([
-        { currency: 'AAA', deleted: 0, version: '20' },
-        { currency: 'AAA', deleted: 1, version: '40' },
+        { currency: 'AAA', deleted: 0, version_text: '20' },
+        { currency: 'AAA', deleted: 1, version_text: '40' },
       ]);
 
       // nothing more for a token that is already deleted
@@ -592,11 +670,11 @@ describe('the tokens job (e2e)', () => {
         profile: PROFILE,
         rematch: 'all',
       });
-      const rows = await svc.query<{ issuer: string; currency: string; version: string }>(
-        `SELECT issuer, currency, toString(version) AS version FROM ${Table.Tokens} ORDER BY issuer, currency`,
+      const rows = await svc.query<{ issuer: string; currency: string; version_text: string }>(
+        `SELECT issuer, currency, toString(version) AS version_text FROM ${Table.Tokens} ORDER BY issuer, currency`,
       );
       expect(rows).toHaveLength(3);
-      expect(new Set(rows.map((r) => r.version))).toEqual(new Set(['9007199254740993']));
+      expect(new Set(rows.map((r) => r.version_text))).toEqual(new Set(['9007199254740993']));
     });
 
     it('writes nothing once the signal is aborted', async () => {

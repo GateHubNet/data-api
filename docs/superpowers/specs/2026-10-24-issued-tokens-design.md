@@ -231,8 +231,10 @@ read: the keys travel as query parameters in the URL, ADR-0012's lesson), `TOKEN
 A generation starts with a row `building`, `head_ledger` = the head, `coverage_from` = the state coverage start (§6). The pass walks
 the issuers in key order, `TOKENS_PASS_ACCOUNTS` at a time:
 
-1. The next accounts: `SELECT account FROM trust_line_states WHERE account > {cursor} ORDER BY account LIMIT 1 BY account LIMIT
-   {n}` (key order, stops after `n`).
+1. The next accounts: `SELECT account FROM trust_line_states WHERE account > {cursor} GROUP BY account ORDER BY account LIMIT
+   {n}` with the settings `optimize_aggregation_in_order = 1` and `max_block_size = 8192` (key order, stops after `n`, one
+   granule of each part). *Amended 2026-10-30 by the D6 Task 4 review: `LIMIT 1 BY` reads the whole remainder (every row after
+   the cursor, measured on ClickHouse 26.8); `GROUP BY` with `optimize_aggregation_in_order` reads one granule per part.*
 2. Server-side, `INSERT INTO token_lines SELECT …` from the newest row of each (account, counterparty, currency) of those accounts at
    or before `head_ledger` (the read of `TrustLinesService`, without its ledger-specific filters), keeping the rows where the line is
    not deleted, the currency is not an LP token's, and the line counts for the account's own token (§1, the account as issuer):
