@@ -46,6 +46,10 @@ import {
  *  - **Query parameters travel in the URL** and ClickHouse refuses one over 128 KiB (ADR-0012): every array parameter holds at most
  *    `TOKENS_STATE_CHUNK` keys of at most 40 characters, or `TOKENS_TOML_DOMAINS_CHUNK` domains of at most 128, so every read that
  *    names accounts, tokens or domains goes by chunks.
+ *  - **Housekeeping** (spec 3.3, 3.6, 3.7): `distinctHolders` is one aggregate over the live generation's partition of `token_lines`
+ *    (it reads every row of the generation, so it is for a run with time to spare and not for a first one); `tomlSweep` compares
+ *    the tokens' listing with the store in steps of at most `TOKENS_STATE_CHUNK` tokens from a cursor, so that no step reads every
+ *    token and domain; and `dropTokenGeneration` drops a retired generation's partitions.
  *  - **Nothing is written once the shutdown has begun**: `signal` is checked before each read of a chunk and each write.
  */
 
@@ -225,7 +229,8 @@ const NEXT_ACCOUNTS_SQL = `SELECT account
  ORDER BY account
  LIMIT {n:UInt32}`;
 
-const NEXT_ACCOUNTS_SETTINGS = { optimize_aggregation_in_order: 1, max_block_size: '8192' } as const;
+/** The settings of a read that stops after its `LIMIT` groups (this and the sweep's step): the key order, and blocks as small as a granule. */
+const IN_ORDER_SETTINGS = { optimize_aggregation_in_order: 1, max_block_size: '8192' } as const;
 
 /**
  * The accounts that have a trust line after `after`, in key order, at most `n` (spec 3.1 step 1): the accounts of the next batch of
@@ -233,7 +238,7 @@ const NEXT_ACCOUNTS_SETTINGS = { optimize_aggregation_in_order: 1, max_block_siz
  * not by the rows after the cursor: about one granule of each part of the table, plus the rows of an account that fills a part.
  */
 export async function nextPassAccounts(ch: ClickHouseService, after: string, n: number): Promise<string[]> {
-  const rows = await ch.query<{ account: string }>(NEXT_ACCOUNTS_SQL, { after, n }, NEXT_ACCOUNTS_SETTINGS);
+  const rows = await ch.query<{ account: string }>(NEXT_ACCOUNTS_SQL, { after, n }, IN_ORDER_SETTINGS);
   return rows.map((row) => row.account);
 }
 
@@ -344,10 +349,20 @@ async function currenciesOf(ch: ClickHouseService, domains: readonly string[]): 
 // The token rows
 // ---------------------------------------------------------------------------------------------------------------------
 
-/** The tokens named by two arrays zipped (as `paymentsByKeys` does), so that the keys are one parameter each. */
-const TOKEN_KEYS_IN = `(issuer, currency) IN (
-            SELECT tupleElement(key, 1), tupleElement(key, 2)
-              FROM (SELECT arrayJoin(arrayZip({issuers:Array(String)}, {currencies:Array(String)})) AS key))`;
+/**
+ * `(a, b, ...) IN (...)` over keys named by arrays zipped (as `paymentsByKeys` does), so that the keys of a column are one query
+ * parameter, `Array(String)`, each: `columns` are the key columns, `arrays` the names of their parameters, in the same order.
+ */
+function zippedKeysIn(columns: readonly string[], arrays: readonly string[]): string {
+  const parameters = arrays.map((name) => `{${name}:Array(String)}`).join(', ');
+  const elements = columns.map((_, i) => `tupleElement(key, ${i + 1})`).join(', ');
+  return `(${columns.join(', ')}) IN (
+            SELECT ${elements}
+              FROM (SELECT arrayJoin(arrayZip(${parameters})) AS key))`;
+}
+
+/** The tokens named by two arrays zipped. */
+const TOKEN_KEYS_IN = zippedKeysIn(['issuer', 'currency'], ['issuers', 'currencies']);
 
 /**
  * The totals of some tokens in a generation: over the newest row of each (issuer, currency, holder) inside, `deleted = 0` outside.
@@ -569,19 +584,31 @@ export interface LineKey {
   currency: string;
 }
 
+const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** The order of the table's key (the texts are ASCII, so that code units order as ClickHouse's bytes do). */
+const compareLines = (a: LineKey, b: LineKey): number =>
+  compareText(a.account, b.account) ||
+  compareText(a.counterparty, b.counterparty) ||
+  compareText(a.currency, b.currency);
+
+/** The most a `UInt32` holds: a `LIMIT` takes no more, and a generation is no larger. */
+const MAX_UINT32 = 4_294_967_295;
+
 /** The most rows a `LIMIT` takes: a window of one ledger is read whole, whatever it holds. */
-const UNBOUNDED = 4_294_967_295;
+const UNBOUNDED = MAX_UINT32;
 
 /**
- * The distinct trust lines `state_touches` names in the ledgers `(from, to]`, in key order, LP currencies dropped: a key range of
- * the table (its key starts with `ledger_index`). At most `limit` of them: `touchesOfWindow` reads one more than the lines a window
- * may hold, which is enough to halve it.
+ * The distinct trust lines `state_touches` names in the ledgers `(from, to]`, LP currencies dropped: a key range of the table (its
+ * key starts with `ledger_index`). At most `limit` of them, in no order: with an `ORDER BY` the read takes every row of the window
+ * before it gives the first `limit` (measured: all of 1,024,000 rows, against 114,688 without it), and the window that is too big is
+ * the very one that must not be read whole. `touchesOfWindow` reads one more than the lines a window may hold, which is enough to
+ * halve it, and puts the lines it keeps in key order itself.
  */
 export const WINDOW_LINES_SQL = `SELECT DISTINCT account, counterparty, currency
   FROM ${Table.StateTouches}
  WHERE ledger_index > {from:UInt32} AND ledger_index <= {to:UInt32} AND kind = 'line'
    AND NOT match(currency, '${LP_CURRENCY.source}')
- ORDER BY account, counterparty, currency
  LIMIT {limit:UInt32}`;
 
 /** The accounts whose token settings the ledgers `(from, to]` may have changed, in key order. */
@@ -595,7 +622,8 @@ export const WINDOW_ISSUERS_SQL = `SELECT DISTINCT account
  * halved while the window holds more than `maxLines` distinct lines, never below one ledger (a ledger is applied whole). With its
  * distinct line touches (LP currencies dropped), in key order, and the accounts of its account touches, which are not limited by
  * `maxLines`. A window at the head is empty: `to` is `from`. Every read is a key range of `state_touches`; a window that is too
- * big is found out by reading `maxLines + 1` lines of it, not all of them.
+ * big is found out by reading `maxLines + 1` lines of it (the read stops there: it has no `ORDER BY`), not all of them. The lines
+ * of the window that is kept, `maxLines` or fewer (a one-ledger window has as many as it has), are put in key order here.
  */
 export async function touchesOfWindow(
   ch: ClickHouseService,
@@ -618,6 +646,7 @@ export async function touchesOfWindow(
       to = from + Math.max(1, Math.floor((to - from) / 2));
       continue;
     }
+    lines.sort(compareLines);
     const issuers = await ch.query<{ account: string }>(WINDOW_ISSUERS_SQL, { from, to });
     return { to, lines, issuers: issuers.map((row) => row.account) };
   }
@@ -638,10 +667,11 @@ export async function parserFloorOf(ch: ClickHouseService, from: number, to: num
   return row?.floor_version == null ? null : Number(row.floor_version);
 }
 
-/** The lines named by three arrays zipped (as `TOKEN_KEYS_IN` zips two), so that the keys are one parameter each. */
-const LINE_KEYS_IN = `(account, counterparty, currency) IN (
-            SELECT tupleElement(key, 1), tupleElement(key, 2), tupleElement(key, 3)
-              FROM (SELECT arrayJoin(arrayZip({accounts:Array(String)}, {counterparties:Array(String)}, {currencies:Array(String)})) AS key))`;
+/** The lines named by three arrays zipped. */
+const LINE_KEYS_IN = zippedKeysIn(
+  ['account', 'counterparty', 'currency'],
+  ['accounts', 'counterparties', 'currencies'],
+);
 
 /**
  * The newest row of each line named, from its low account's side (`account` is the low account of every key the parser wrote; the
@@ -671,12 +701,12 @@ interface LineStateRead {
   deleted: Counted;
 }
 
+const STORED_LINE_KEYS_IN = zippedKeysIn(['issuer', 'currency', 'holder'], ['issuers', 'currencies', 'holders']);
+
 /** The newest `token_lines` row of each (issuer, currency, holder) named, in a generation (the key of the table). */
 export const STORED_LINES_SQL = `SELECT issuer, currency, holder, balance, \`limit\`, frozen, authorized, ledger_index, deleted
   FROM ${Table.TokenLines}
- WHERE generation = {g:UInt32} AND (issuer, currency, holder) IN (
-            SELECT tupleElement(key, 1), tupleElement(key, 2), tupleElement(key, 3)
-              FROM (SELECT arrayJoin(arrayZip({issuers:Array(String)}, {currencies:Array(String)}, {holders:Array(String)})) AS key))
+ WHERE generation = {g:UInt32} AND ${STORED_LINE_KEYS_IN}
  ORDER BY issuer, currency, holder, version DESC
  LIMIT 1 BY issuer, currency, holder`;
 
@@ -692,6 +722,9 @@ interface StoredLineRead extends TokenKey {
 }
 
 const lineKeyOf = (line: LineKey): string => JSON.stringify([line.account, line.counterparty, line.currency]);
+
+/** The key a `token_lines` row has in this file's maps: its token and its holder. */
+const holderKeyOf = (token: TokenKey, holder: string): string => JSON.stringify([token.issuer, token.currency, holder]);
 
 /** The state of a line as `orientations` reads it: a `trust_line_states` row (UInt8 flags are 0 or 1), or a deleted line when the table has none. */
 function lowSideLine(line: LineKey, row: LineStateRead | undefined): LowSideLine {
@@ -785,12 +818,12 @@ export async function applyLineStates(
         currencies: keys.map((side) => side.token.currency),
         holders: keys.map((side) => side.holder),
       });
-      for (const row of rows) stored.set(JSON.stringify([row.issuer, row.currency, row.holder]), row);
+      for (const row of rows) stored.set(holderKeyOf(row, row.holder), row);
     }
 
     const rows: TokenLinesRow[] = [];
     for (const { token, holder, wanted, stateLedger } of sides) {
-      const old = stored.get(JSON.stringify([token.issuer, token.currency, holder]));
+      const old = stored.get(holderKeyOf(token, holder));
       const live = old !== undefined && Number(old.deleted) === 0;
       if (wanted !== null) {
         const same =
@@ -866,4 +899,198 @@ export async function tokensOfIssuers(
     tokens.push(...(await ch.query<TokenKey>(ISSUER_TOKENS_SQL, { g: generation, issuers: part })));
   }
   return tokens;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Housekeeping: the distinct holders, the toml sweep and dropping a generation
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * The distinct holders of a generation (spec 3.6): over the newest row of each (issuer, currency, holder), the rows that are live
+ * and hold something. One aggregate over one partition: it reads every row of the generation and holds one hash of each distinct
+ * holder (measured on 3.2 million rows and 580,000 holders: 0.4 s and 200 MiB). The alias is not a column name.
+ */
+const DISTINCT_HOLDERS_SQL = `SELECT uniqExact(holder) AS n_holders
+  FROM (SELECT holder, balance_f, deleted
+          FROM ${Table.TokenLines}
+         WHERE generation = {g:UInt32}
+         ORDER BY issuer, currency, holder, version DESC
+         LIMIT 1 BY issuer, currency, holder)
+ WHERE deleted = 0 AND balance_f > 0`;
+
+/**
+ * `uniqExact(holder)` over the generation's newest live lines with `balance_f > 0` (spec 3.6): the accounts that hold any token of
+ * it, each once however many tokens it holds. The runner writes it to the generation row with `holders_ledger` = its
+ * `through_ledger`. One read of the generation's partition of `token_lines` and of no other (some millions of rows on XRPL).
+ */
+export async function distinctHolders(ch: ClickHouseService, generation: number): Promise<number> {
+  const row = await ch.queryOne<{ n_holders: Counted }>(DISTINCT_HOLDERS_SQL, { g: generation });
+  return Number(row?.n_holders ?? 0);
+}
+
+/**
+ * The listing columns of the newest row of each token after a cursor, in key order, at most `n` of them (`argMax` of `version`,
+ * never `FINAL`; the aliases are not column names): `GROUP BY` the whole key with `ORDER BY` it and in-order aggregation reads the
+ * key range from the cursor and stops after `n` groups, a granule or a few of each part. `LIMIT 1 BY issuer, currency LIMIT n` gives
+ * the same tokens but reads every row after the cursor (the lesson of `nextPassAccounts`). `{issuer}` is `''` before the first
+ * token: no issuer is empty.
+ */
+const SWEEP_TOKENS_SQL = `SELECT issuer, currency, argMax(domain, version) AS top_domain, argMax(listed, version) AS top_listed,
+       argMax(name, version) AS top_name, argMax(toml, version) AS top_toml, argMax(deleted, version) AS gone
+  FROM ${Table.Tokens}
+ WHERE generation = {g:UInt32} AND (issuer > {issuer:String} OR (issuer = {issuer:String} AND currency > {currency:String}))
+ GROUP BY issuer, currency
+ ORDER BY issuer, currency
+ LIMIT {n:UInt32}`;
+
+interface SweepTokenRead extends TokenKey {
+  top_domain: string;
+  top_listed: Counted;
+  top_name: string;
+  top_toml: string;
+  gone: Counted;
+}
+
+/** The whole newest row of each of some tokens, for the ones whose listing a step rewrites. */
+const SWEPT_ROWS_SQL = `SELECT issuer, currency, code, holders, trust_lines, supply, supply_f, last_ledger, issuer_ledger, issuer_flags,
+       transfer_rate, deleted
+  FROM ${Table.Tokens}
+ WHERE generation = {g:UInt32} AND ${TOKEN_KEYS_IN}
+ ORDER BY issuer, currency, version DESC
+ LIMIT 1 BY issuer, currency`;
+
+interface SweptRowRead extends TokenKey {
+  code: string;
+  holders: Counted;
+  trust_lines: Counted;
+  supply: string;
+  supply_f: Counted;
+  last_ledger: Counted;
+  issuer_ledger: Counted;
+  issuer_flags: Counted;
+  transfer_rate: Counted;
+  deleted: Counted;
+}
+
+/** What one step of the toml sweep did: the rows it rewrote, and where the next step goes on (`undefined`: it read the last token). */
+export interface TomlSweepStep {
+  rewritten: number;
+  next: TokenKey | undefined;
+}
+
+/**
+ * One step of the toml sweep (spec 3.7): the next `p.limit` tokens (`TOKENS_STATE_CHUNK` by default) of generation `p.generation`
+ * after the token `p.after` (from the first for `undefined`), in key order. For those whose newest row is not a deletion it compares
+ * the row's `domain, listed, name, toml` with what the issuer's current account domain and D4's store of tomls give now
+ * (`issuerDomains`, `readStoredTomls` of the distinct domains, `tokenListing`), and writes again, under `p.version`, the rows that
+ * differ: the same counts, supply and settings, the listing of the store. Resolves with how many it rewrote and the cursor of the
+ * next step, `undefined` once the last token was in this one.
+ *
+ * A step is bounded by its `limit`, never by the number of tokens or domains: the runner calls it again from `next`, one step or
+ * a few to a run, and starts over from the first token at the next housekeeping. The reads go by chunks (`TOKENS_STATE_CHUNK`
+ * keys, `TOKENS_TOML_DOMAINS_CHUNK` domains). `signal` is checked before each read and the write.
+ */
+export async function tomlSweep(
+  ch: ClickHouseService,
+  p: {
+    generation: number;
+    version: string;
+    profile: Pick<NetworkProfile, 'tomlNetworkNames'>;
+    after?: TokenKey;
+    limit?: number;
+  },
+  signal?: AbortSignal,
+): Promise<TomlSweepStep> {
+  const { generation, version, profile } = p;
+  const limit = Math.max(1, Math.floor(p.limit ?? TOKENS_STATE_CHUNK));
+  throwIfAborted(signal);
+  // one more than the step takes: whether there is one is whether the step is the last
+  const read = await ch.query<SweepTokenRead>(
+    SWEEP_TOKENS_SQL,
+    { g: generation, issuer: p.after?.issuer ?? '', currency: p.after?.currency ?? '', n: limit + 1 },
+    IN_ORDER_SETTINGS,
+  );
+  const page = read.slice(0, limit);
+  const last = page[page.length - 1];
+  const next = read.length > limit && last !== undefined ? { issuer: last.issuer, currency: last.currency } : undefined;
+  const live = page.filter((t) => Number(t.gone) === 0);
+  if (live.length === 0) return { rewritten: 0, next };
+
+  throwIfAborted(signal);
+  const domains = await issuerDomains(
+    ch,
+    live.map((t) => t.issuer),
+  );
+  throwIfAborted(signal);
+  const currencies = await currenciesOf(
+    ch,
+    [...domains.values()].filter((domain) => domain !== ''),
+  );
+  // the tokens whose row says otherwise than the store, with what it should say
+  const listings = new Map<string, TokenListing>();
+  const differing: TokenKey[] = [];
+  for (const t of live) {
+    const domain = domains.get(t.issuer) ?? '';
+    const listing = tokenListing(t, domain, currencies.get(domain), profile);
+    const same =
+      listing.domain === t.top_domain &&
+      listing.listed === Number(t.top_listed) &&
+      listing.name === t.top_name &&
+      listing.toml === t.top_toml;
+    if (same) continue;
+    listings.set(keyOf(t), listing);
+    differing.push({ issuer: t.issuer, currency: t.currency });
+  }
+
+  let rewritten = 0;
+  for (const part of chunk(differing, TOKENS_STATE_CHUNK)) {
+    throwIfAborted(signal);
+    const rows = await ch.query<SweptRowRead>(SWEPT_ROWS_SQL, {
+      g: generation,
+      issuers: part.map((t) => t.issuer),
+      currencies: part.map((t) => t.currency),
+    });
+    const swept: TokensRow[] = [];
+    for (const row of rows) {
+      const listing = listings.get(keyOf(row));
+      if (listing === undefined || Number(row.deleted) === 1) continue;
+      swept.push({
+        generation,
+        issuer: row.issuer,
+        currency: row.currency,
+        code: row.code,
+        holders: Number(row.holders),
+        trust_lines: Number(row.trust_lines),
+        supply: row.supply,
+        supply_f: Number(row.supply_f),
+        last_ledger: Number(row.last_ledger),
+        issuer_ledger: Number(row.issuer_ledger),
+        issuer_flags: Number(row.issuer_flags),
+        transfer_rate: Number(row.transfer_rate),
+        ...listing,
+        deleted: 0,
+        version,
+      });
+    }
+    if (swept.length === 0) continue;
+    throwIfAborted(signal);
+    await ch.insert(Table.Tokens, swept);
+    rewritten += swept.length;
+  }
+  return { rewritten, next };
+}
+
+/**
+ * Drops the partitions of a generation from `token_lines` and `tokens` (`ALTER TABLE … DROP PARTITION {generation}`, spec 3.3): the
+ * partition of a generation is the generation. Dropping a partition that is not there is nothing, so the job may run it again after
+ * a restart. The statement takes no parameter, so the number is checked as a `UInt32` and written into it: a `RangeError` for
+ * anything else, before any query. The caller drops only generations that are retired.
+ */
+export async function dropTokenGeneration(ch: ClickHouseService, generation: number): Promise<void> {
+  if (!Number.isInteger(generation) || generation < 0 || generation > MAX_UINT32) {
+    throw new RangeError(`A token generation is a UInt32, got ${generation}`);
+  }
+  for (const table of [Table.TokenLines, Table.Tokens]) {
+    await ch.command(`ALTER TABLE ${table} DROP PARTITION ${generation}`);
+  }
 }

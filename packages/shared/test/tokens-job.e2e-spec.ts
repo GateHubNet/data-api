@@ -2,6 +2,8 @@ import { TokenKey } from '../src/aggregate/token-rules';
 import {
   applyLineStates,
   buildingGenerationOf,
+  distinctHolders,
+  dropTokenGeneration,
   ISSUER_TOKENS_SQL,
   issuerDomains,
   LINE_STATES_SQL,
@@ -22,6 +24,7 @@ import {
   TokensAborted,
   tokensOfIssuers,
   tokensVersionFloor,
+  tomlSweep,
   touchesOfWindow,
   WINDOW_ISSUERS_SQL,
   WINDOW_LINES_SQL,
@@ -42,6 +45,7 @@ import { Table } from '../src/clickhouse/tables';
 import { LedgerWriter } from '../src/ingest/ledger-writer';
 import { getNetworkProfile } from '../src/network';
 import { parseContextFor } from '../src/parsers/parser.interface';
+import { TomlCurrency } from '../src/tomls/toml-read';
 import { okTomlRow, tomlUrlOf } from '../src/tomls/toml-store';
 import { startClickHouse, StartedClickHouse } from './clickhouse-container';
 import { SAMPLE_ROWS } from './sample-rows';
@@ -852,6 +856,124 @@ describe('the tokens job (e2e)', () => {
         });
       }
     });
+
+    it('sweeps 2,001 tokens in a step of 2,000 and one of 1, with the domains read 500 at a time', async () => {
+      const svc = await fresh();
+      const numbers = Array.from({ length: COUNT }, (_, n) => n);
+      // the rows say nothing of the toml (a generation built before the tomls were read); the store lists every token.
+      // generation 3 is swept in the steps of a chunk, generation 4 in one step of more than a chunk
+      for (const generation of [3, 4]) {
+        await svc.insert(
+          Table.Tokens,
+          numbers.map((n) => ({
+            ...SAMPLE_ROWS[Table.Tokens],
+            generation,
+            issuer: issuerOf(n),
+            currency: currencyOf(n),
+            domain: '',
+            listed: 0,
+            name: '',
+            toml: '',
+            deleted: 0,
+            version: '10',
+          })),
+        );
+      }
+      await svc.insert(
+        Table.AccountDomains,
+        numbers.map((n) => ({
+          ...SAMPLE_ROWS[Table.AccountDomains],
+          account: issuerOf(n),
+          domain_hex: Buffer.from(domainOf(n)).toString('hex').toUpperCase(),
+        })),
+      );
+      await svc.insert(
+        Table.DomainTomls,
+        numbers.map((n) =>
+          okTomlRow({
+            domain: domainOf(n),
+            tomlUrl: tomlUrlOf(domainOf(n), PROFILE),
+            content: {
+              modified: null,
+              expires: null,
+              accounts: [],
+              currencies: [
+                {
+                  code: currencyOf(n),
+                  issuer: issuerOf(n),
+                  network: '',
+                  fields: JSON.stringify({ name: `Token ${n}` }),
+                },
+              ],
+              validators: [],
+              principals: [],
+            },
+            now: 1_700_000_000,
+            recheckMs: 3_600_000,
+          }),
+        ),
+      );
+
+      const spy = jest.spyOn(svc, 'query');
+      /** The parameters of the reads `run` made. */
+      const queriedBy = async (run: () => Promise<unknown>): Promise<Array<Record<string, unknown>>> => {
+        const before = spy.mock.calls.length;
+        await run();
+        return spy.mock.calls.slice(before).map((call) => call[1] ?? {});
+      };
+      const arraysIn = (queried: Array<Record<string, unknown>>, name: string): number[] =>
+        queried.flatMap((params) => (Array.isArray(params[name]) ? [(params[name] as unknown[]).length] : []));
+      let first: Awaited<ReturnType<typeof tomlSweep>> | undefined;
+      let second: Awaited<ReturnType<typeof tomlSweep>> | undefined;
+      let whole: Awaited<ReturnType<typeof tomlSweep>> | undefined;
+      let chunked: Array<Record<string, unknown>>;
+      let single: Array<Record<string, unknown>>;
+      try {
+        chunked = await queriedBy(async () => {
+          first = await tomlSweep(svc, { generation: 3, version: '20', profile: PROFILE });
+          second = await tomlSweep(svc, { generation: 3, version: '21', profile: PROFILE, after: first.next });
+        });
+        single = await queriedBy(async () => {
+          whole = await tomlSweep(svc, { generation: 4, version: '22', profile: PROFILE, limit: COUNT });
+        });
+      } finally {
+        // restoring clears the record of the calls
+        spy.mockRestore();
+      }
+
+      // the tokens are in key order, the issuers being zero-padded: a step of a chunk ends at the 2,000th, the next has the last
+      expect(first?.rewritten).toBe(TOKENS_STATE_CHUNK);
+      expect(first?.next).toEqual({
+        issuer: issuerOf(TOKENS_STATE_CHUNK - 1),
+        currency: currencyOf(TOKENS_STATE_CHUNK - 1),
+      });
+      expect(second).toEqual({ rewritten: 1, next: undefined });
+      expect(whole).toEqual({ rewritten: COUNT, next: undefined });
+
+      // no array parameter is longer than a chunk, and the longest are exactly one; the domains go 500 at a time, each once
+      for (const queried of [chunked, single]) {
+        for (const name of ['issuers', 'currencies']) {
+          expect(Math.max(...arraysIn(queried, name))).toBe(TOKENS_STATE_CHUNK);
+        }
+        expect(Math.max(...arraysIn(queried, 'domains'))).toBe(TOKENS_TOML_DOMAINS_CHUNK);
+        expect(arraysIn(queried, 'domains').reduce((a, b) => a + b, 0)).toBe(COUNT);
+      }
+      // the step of more than a chunk reads its rows to rewrite in a chunk and the one left over
+      expect(arraysIn(single, 'currencies')).toEqual([TOKENS_STATE_CHUNK, 1]);
+
+      for (const generation of [3, 4]) {
+        const rows = await liveTokens(svc, generation);
+        expect(rows.size).toBe(COUNT);
+        for (const n of [0, TOKENS_TOML_DOMAINS_CHUNK, TOKENS_STATE_CHUNK - 1, TOKENS_STATE_CHUNK]) {
+          expect(rows.get(tokenMapKey({ issuer: issuerOf(n), currency: currencyOf(n) }))).toMatchObject({
+            domain: domainOf(n),
+            listed: 1,
+            name: `Token ${n}`,
+            version: generation === 4 ? '22' : n < TOKENS_STATE_CHUNK ? '20' : '21',
+          });
+        }
+      }
+    });
   });
 
   // -------------------------------------------------------------------------------------------------------------------
@@ -1100,9 +1222,18 @@ describe('the tokens job (e2e)', () => {
       // the new token is there, the line that turned round and back is not a line of its holder's token
       expect(tokens.get(tokenOf(base.plain, more.newCurrency))).toMatchObject({ holders: 1, supply: '3' });
       expect(tokens.get(tokenOf(more.turnedRound, base.usd))).toBeUndefined();
+      const [firstStep, lastStep] = more.rateSteps;
+      expect(firstStep.ledger).toBe(more.first);
       expect(tokens.get(tokenOf(base.gate, base.usd))).toMatchObject({
-        transfer_rate: 1_015_000_000,
-        issuer_ledger: more.first + 2,
+        transfer_rate: lastStep.rate,
+        issuer_ledger: lastStep.ledger,
+      });
+      // the line made in the second batch and the line of the new token, each as a row of its own
+      const lines = await liveLines(svc, 1);
+      expect(lines.get(lineMapKey(usdOf(base), more.made))).toMatchObject({ balance: '77', ledger_index: more.first });
+      expect(lines.get(lineMapKey({ issuer: base.plain, currency: more.newCurrency }, more.newHolder))).toMatchObject({
+        balance: '3',
+        ledger_index: more.first,
       });
     });
 
@@ -1313,8 +1444,8 @@ describe('the tokens job (e2e)', () => {
         [tokenOf(base.gate, base.usd), 0, ''],
       ] as const) {
         expect(after.get(key)).toMatchObject({
-          transfer_rate: 1_010_000_000,
-          issuer_ledger: more.first,
+          transfer_rate: more.rateSteps[0].rate,
+          issuer_ledger: more.rateSteps[0].ledger,
           issuer_flags: base.gateFlags,
           domain: 'moved.example',
           listed,
@@ -1337,7 +1468,8 @@ describe('the tokens job (e2e)', () => {
       const tokens = await tokensWithoutVersion(svc, 1);
       // the line was changed in the first window (150) and again in the third (180), and gate's rate went up in the same two
       expect(lines.get(twice)).toMatchObject({ balance: '180', ledger_index: more.first + 2 });
-      expect(tokens.get(gate)).toMatchObject({ transfer_rate: 1_015_000_000, issuer_ledger: more.first + 2 });
+      const [firstStep, lastStep] = more.rateSteps;
+      expect(tokens.get(gate)).toMatchObject({ transfer_rate: lastStep.rate, issuer_ledger: lastStep.ledger });
 
       // the repair of the first window, which the generation is past: it reads at the generation's through_ledger
       const window = await touchesOfWindow(svc, base.head, more.head, { window: 1 });
@@ -1352,8 +1484,8 @@ describe('the tokens job (e2e)', () => {
       await applyWindow(svc, 1, window, window.to);
       expect((await liveLines(svc, 1)).get(twice)).toMatchObject({ balance: '150', ledger_index: more.first });
       expect((await liveTokens(svc, 1)).get(gate)).toMatchObject({
-        transfer_rate: 1_010_000_000,
-        issuer_ledger: more.first,
+        transfer_rate: firstStep.rate,
+        issuer_ledger: firstStep.ledger,
       });
       // and at the through_ledger once more it is right again
       await applyWindow(svc, 1, window, more.head);
@@ -1427,6 +1559,64 @@ describe('the tokens job (e2e)', () => {
         const rate = await touchesOfWindow(ch, world.rateNow - 1, world.rateNow);
         expect(rate.lines).toHaveLength(1);
         expect(rate.issuers).toEqual([world.gate]);
+      });
+    });
+
+    describe('the lines of a window', () => {
+      const LEDGERS = 300;
+      const PER_LEDGER = 2_000;
+
+      /** A table whose accounts fall as the ledgers rise: the order of the table is not the key order. */
+      async function fallingTouches(): Promise<ClickHouseService> {
+        const svc = await fresh();
+        await svc.command(
+          `INSERT INTO ${Table.StateTouches} (ledger_index, tx_index, kind, account, counterparty, currency)
+           SELECT intDiv(number, ${PER_LEDGER}) + 1, 0, 'line',
+                  concat('rLow', leftPad(toString(${LEDGERS * PER_LEDGER} - number), 8, '0')), 'rHigh', 'USD'
+             FROM numbers(${LEDGERS * PER_LEDGER})`,
+        );
+        return svc;
+      }
+
+      it('are put in key order by the job, whatever the order of the table', async () => {
+        const svc = await fallingTouches();
+        const window = await touchesOfWindow(svc, 0, 3);
+        expect(window.to).toBe(3);
+        expect(window.lines).toHaveLength(3 * PER_LEDGER);
+        // the table lists the first ledger's accounts first, and they are the highest: the lowest account is the third ledger's
+        const order = window.lines.map((line) => JSON.stringify([line.account, line.counterparty, line.currency]));
+        expect(order).toEqual([...order].sort());
+        expect(window.lines[0].account).toBe(
+          `rLow${String(LEDGERS * PER_LEDGER - 3 * PER_LEDGER + 1).padStart(8, '0')}`,
+        );
+
+        // a window of one ledger is read whole whatever it holds, and sorted too
+        const one = await touchesOfWindow(svc, 5, LEDGERS, { window: 100, maxLines: 10 });
+        expect(one.to).toBe(6);
+        expect(one.lines).toHaveLength(PER_LEDGER);
+        const oneOrder = one.lines.map((line) => line.account);
+        expect(oneOrder).toEqual([...oneOrder].sort());
+      });
+
+      it('finds out that a window holds too many lines by reading some of them, not all', async () => {
+        const svc = await fallingTouches();
+        const queryId = `window-lines-${Date.now()}`;
+        const read = await svc.raw.query({
+          query: WINDOW_LINES_SQL,
+          query_params: { from: 0, to: LEDGERS, limit: 101 },
+          query_id: queryId,
+          format: 'JSONEachRow',
+          // each stream of the read takes a block before the limit stops it: a few streams, so that the count is the same on any machine
+          clickhouse_settings: { max_threads: 2 },
+        });
+        expect(await read.json()).toHaveLength(101);
+        await svc.command('SYSTEM FLUSH LOGS');
+        const [log] = await svc.query<{ read_rows: string }>(
+          `SELECT read_rows FROM system.query_log WHERE type = 'QueryFinish' AND query_id = {queryId:String}`,
+          { queryId },
+        );
+        // the window holds 600,000 touches; with an ORDER BY the read takes every one of them (measured 600,000, against 221,184 without it)
+        expect(Number(log.read_rows)).toBeLessThan((LEDGERS * PER_LEDGER) / 2);
       });
     });
 
@@ -1624,6 +1814,475 @@ describe('the tokens job (e2e)', () => {
           ledger_index: 60,
         });
       }
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------------------------------
+  describe('distinct holders, the toml sweep and dropping a generation', () => {
+    /** A migrated database with the world's first batch built into generation 1 at its head. */
+    async function builtWorld() {
+      const svc = await fresh();
+      const base = await seedTokensWorld(svc, new LedgerWriter(svc, CTX));
+      await buildGeneration(svc, 1, base.head);
+      return { svc, base };
+    }
+
+    const line = (
+      generation: number,
+      issuer: string,
+      currency: string,
+      holder: string,
+      balance: string,
+      version: string,
+      deleted = 0,
+    ): TokenLinesRow => ({
+      ...SAMPLE_ROWS[Table.TokenLines],
+      generation,
+      issuer,
+      currency,
+      holder,
+      balance,
+      balance_f: Number(balance),
+      ledger_index: 10,
+      deleted,
+      version,
+    });
+
+    /** The `read_rows` of the newest finished query of this database whose text holds `marker`. */
+    async function readRowsOf(svc: ClickHouseService, marker: string): Promise<number> {
+      const db = (await svc.queryOne<{ db: string }>('SELECT currentDatabase() AS db'))?.db ?? '';
+      await svc.command('SYSTEM FLUSH LOGS');
+      const [row] = await svc.query<{ read_rows: string }>(
+        `SELECT read_rows FROM system.query_log
+          WHERE type = 'QueryFinish' AND current_database = {db:String} AND position(query, {marker:String}) > 0
+          ORDER BY event_time_microseconds DESC LIMIT 1`,
+        { db, marker },
+      );
+      return Number(row.read_rows);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('distinctHolders', () => {
+      it('counts an account holding two tokens once and a zero line not at all', async () => {
+        const svc = await fresh();
+        await svc.insert(Table.TokenLines, [
+          // alice holds three tokens of two issuers: one holder
+          line(1, 'rIssuerOne', 'USD', 'rAlice', '5', '10'),
+          line(1, 'rIssuerOne', 'EUR', 'rAlice', '7', '10'),
+          line(1, 'rIssuerTwo', 'USD', 'rAlice', '1', '10'),
+          // a line with a limit and no balance holds nothing
+          line(1, 'rIssuerOne', 'USD', 'rZero', '0', '10'),
+          // a line that was deleted: the tombstone still says what the row said, and it is the newest
+          line(1, 'rIssuerOne', 'USD', 'rGone', '3', '10'),
+          line(1, 'rIssuerOne', 'USD', 'rGone', '3', '20', 1),
+          // the newest row of a line decides: 0 and then 9 counts, 4 and then 0 does not
+          line(1, 'rIssuerOne', 'USD', 'rBack', '0', '10'),
+          line(1, 'rIssuerOne', 'USD', 'rBack', '9', '20'),
+          line(1, 'rIssuerOne', 'USD', 'rEmptied', '4', '10'),
+          line(1, 'rIssuerOne', 'USD', 'rEmptied', '0', '20'),
+          // a balance too small for a decimal to show still holds
+          line(1, 'rIssuerOne', 'EUR', 'rTiny', '0.000000000000000000000000000000000001', '10'),
+          // another generation is another set
+          line(2, 'rIssuerOne', 'USD', 'rAlice', '5', '10'),
+          line(2, 'rIssuerOne', 'USD', 'rOther', '8', '10'),
+        ]);
+        expect(await distinctHolders(svc, 1)).toBe(3);
+        expect(await distinctHolders(svc, 2)).toBe(2);
+        expect(await distinctHolders(svc, 7)).toBe(0);
+      });
+
+      it('counts the holders of the world as the brute force does', async () => {
+        const { svc, base } = await builtWorld();
+        const counting = [...(await bruteForceLines(svc, base.head)).values()].filter(
+          ({ line: l }) => Number(l.balance) > 0,
+        );
+        const holders = new Set(counting.map(({ line: l }) => l.holder));
+        // the AMM pool holds the USD of two issuers: it is one holder of two lines
+        expect(holders.size).toBeLessThan(counting.length);
+        expect(await distinctHolders(svc, 1)).toBe(holders.size);
+      });
+
+      it('reads the partition of the generation and no other', async () => {
+        const svc = await fresh();
+        await svc.insert(Table.TokenLines, [
+          line(1, 'rIssuerOne', 'USD', 'rAlice', '5', '10'),
+          line(1, 'rIssuerOne', 'USD', 'rBob', '5', '10'),
+          line(1, 'rIssuerTwo', 'USD', 'rAlice', '5', '10'),
+        ]);
+        await svc.command(
+          `INSERT INTO ${Table.TokenLines}
+             (generation, issuer, currency, holder, balance, balance_f, \`limit\`, frozen, authorized, ledger_index, deleted, version)
+           SELECT 2, concat('rIssuer', toString(number % 50)), 'USD', concat('rHolder', toString(number)), '1', 1, '10', 0, 0, 5, 0, 10
+             FROM numbers(100000)`,
+        );
+        expect(await distinctHolders(svc, 1)).toBe(2);
+        expect(await readRowsOf(svc, 'uniqExact(holder)')).toBe(3);
+        expect(await distinctHolders(svc, 2)).toBe(100_000);
+        expect(await readRowsOf(svc, 'uniqExact(holder)')).toBe(100_000);
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('tomlSweep', () => {
+      /** The sweep from `after` to the end, `limit` tokens a step: every step it took. */
+      async function sweepToEnd(
+        svc: ClickHouseService,
+        o: { after?: TokenKey; limit?: number; version?: () => string } = {},
+      ) {
+        const steps: Array<{ rewritten: number; next: TokenKey | undefined }> = [];
+        let after = o.after;
+        do {
+          const step = await tomlSweep(svc, {
+            generation: 1,
+            version: (o.version ?? nextVersion)(),
+            profile: PROFILE,
+            after,
+            limit: o.limit,
+          });
+          steps.push(step);
+          after = step.next;
+        } while (after !== undefined);
+        return steps;
+      }
+
+      const rewrittenIn = (steps: ReadonlyArray<{ rewritten: number }>): number =>
+        steps.reduce((sum, step) => sum + step.rewritten, 0);
+
+      /** A newer toml of `domain` with these entries. */
+      const tomlOf = (domain: string, currencies: TomlCurrency[], checked: number): DomainTomlsRow =>
+        okTomlRow({
+          domain,
+          tomlUrl: tomlUrlOf(domain, PROFILE),
+          content: { modified: null, expires: null, accounts: [], currencies, validators: [], principals: [] },
+          now: checked,
+          recheckMs: 3_600_000,
+        });
+
+      /** A check that failed beyond its grace: nothing in effect (D4 writes these rows, so it is a literal here). */
+      const failedToml = (domain: string, checked: number): DomainTomlsRow => ({
+        domain,
+        toml_url: tomlUrlOf(domain, PROFILE),
+        status: 'failed',
+        reason: 'http_status',
+        status_code: 404,
+        checked_at: checked,
+        fetched_at: null,
+        next_check_at: Math.ceil(checked + 86_400),
+        failures: 9,
+        modified: null,
+        expires: null,
+        accounts: [],
+        currencies: [],
+        validators: [],
+        principals: [],
+      });
+
+      const entryOf = (code: string, issuer: string, fields: Record<string, unknown>): TomlCurrency => ({
+        code,
+        issuer,
+        network: '',
+        fields: JSON.stringify(fields),
+      });
+
+      it('rewrites a row whose domain or toml changed and no other', async () => {
+        const { svc, base } = await builtWorld();
+        const before = await liveTokens(svc, 1);
+        expect(before.size).toBeGreaterThan(8);
+
+        // nothing changed since the generation was built: nothing is written
+        expect(rewrittenIn(await sweepToEnd(svc))).toBe(0);
+        expect(await liveTokens(svc, 1)).toEqual(before);
+
+        // plain moves to a domain whose toml was never stored; gate's toml names MYTOKEN anew and lists USD as it did
+        await svc.insert(Table.AccountDomains, [
+          {
+            ...SAMPLE_ROWS[Table.AccountDomains],
+            account: base.plain,
+            ledger_index: base.head + 1,
+            tx_index: 0,
+            node_index: 0,
+            version: String(BigInt(base.head + 1) << 32n),
+            domain_hex: hexOf('Moved.Example'),
+            deleted: 0,
+          },
+        ]);
+        await svc.insert(Table.DomainTomls, [
+          tomlOf(
+            base.gateDomain,
+            [
+              entryOf('USD', base.gate, {
+                name: 'Gateway Dollar',
+                icon: 'https://gateway.example/usd.png',
+                display_decimals: 2,
+                ignored: 'not served',
+              }),
+              entryOf('MYTOKEN', base.gate, { name: 'My Token, renamed', symbol: 'MYT' }),
+            ],
+            1_700_000_100,
+          ),
+        ]);
+
+        const version = nextVersion();
+        const steps = await sweepToEnd(svc, { version: () => version });
+        expect(rewrittenIn(steps)).toBe(2);
+
+        const plain = tokenOf(base.plain, base.usd);
+        const myToken = tokenOf(base.gate, base.myToken);
+        const after = await liveTokens(svc, 1);
+        expect([...after.keys()]).toEqual([...before.keys()]);
+        // the counts, the supply and the issuer's settings are the row's own; the listing is the store's; the version is the sweep's
+        expect(after.get(plain)).toEqual({
+          ...before.get(plain),
+          domain: 'moved.example',
+          listed: 0,
+          name: '',
+          toml: '',
+          version,
+        });
+        expect(after.get(myToken)).toEqual({
+          ...before.get(myToken),
+          name: 'My Token, renamed',
+          toml: '{"name":"My Token, renamed","symbol":"MYT"}',
+          version,
+        });
+        for (const [key, row] of after) {
+          if (key !== plain && key !== myToken) expect(row).toEqual(before.get(key));
+        }
+
+        // swept again, the rows say what the store says
+        expect(rewrittenIn(await sweepToEnd(svc))).toBe(0);
+        expect(await liveTokens(svc, 1)).toEqual(after);
+      });
+
+      it('un-lists a token whose toml failed beyond its grace, and lists it again when the toml comes back', async () => {
+        const { svc, base } = await builtWorld();
+        const before = await liveTokens(svc, 1);
+        const listed = [tokenOf(base.gate, base.usd), tokenOf(base.gate, base.myToken)];
+        for (const key of listed) expect(before.get(key)).toMatchObject({ listed: 1, domain: base.gateDomain });
+
+        // a newer check with nothing in effect
+        await svc.insert(Table.DomainTomls, [failedToml(base.gateDomain, 1_700_000_100)]);
+        const failedVersion = nextVersion();
+        expect(rewrittenIn(await sweepToEnd(svc, { version: () => failedVersion }))).toBe(2);
+        const unlisted = await liveTokens(svc, 1);
+        for (const key of listed) {
+          expect(unlisted.get(key)).toEqual({
+            ...before.get(key),
+            domain: base.gateDomain,
+            listed: 0,
+            name: '',
+            toml: '',
+            version: failedVersion,
+          });
+        }
+        // gate's BTH was never listed, and was not written
+        expect(unlisted.get(tokenOf(base.gate, base.both))).toEqual(before.get(tokenOf(base.gate, base.both)));
+
+        // the toml is fetched again, as it was
+        await svc.insert(Table.DomainTomls, [
+          tomlOf(
+            base.gateDomain,
+            [
+              entryOf('USD', base.gate, {
+                name: 'Gateway Dollar',
+                icon: 'https://gateway.example/usd.png',
+                display_decimals: 2,
+              }),
+              entryOf('MYTOKEN', base.gate, { name: 'My Token', symbol: 'MYT' }),
+            ],
+            1_700_000_200,
+          ),
+        ]);
+        expect(rewrittenIn(await sweepToEnd(svc))).toBe(2);
+        const relisted = await liveTokens(svc, 1);
+        for (const key of listed) {
+          expect(relisted.get(key)).toMatchObject({
+            listed: 1,
+            name: before.get(key)?.name,
+            toml: before.get(key)?.toml,
+          });
+        }
+      });
+
+      it('goes on from a cursor in steps of limit tokens and ends with no cursor', async () => {
+        const { svc, base } = await builtWorld();
+        // a token whose newest row is a deletion is not live whatever its older row says, and is not rewritten
+        await svc.insert(Table.Tokens, [
+          {
+            ...SAMPLE_ROWS[Table.Tokens],
+            generation: 1,
+            issuer: base.plain,
+            currency: 'DEL',
+            domain: '',
+            listed: 0,
+            name: '',
+            toml: '',
+            deleted: 0,
+            version: nextVersion(),
+          },
+          {
+            ...SAMPLE_ROWS[Table.Tokens],
+            generation: 1,
+            issuer: base.plain,
+            currency: 'DEL',
+            domain: '',
+            listed: 0,
+            name: '',
+            toml: '',
+            deleted: 1,
+            version: nextVersion(),
+          },
+        ]);
+        const keys = (
+          await svc.query<TokenKey>(
+            `SELECT DISTINCT issuer, currency FROM ${Table.Tokens} WHERE generation = 1 ORDER BY issuer, currency`,
+          )
+        ).map(({ issuer, currency }) => ({ issuer, currency }));
+        expect(keys.length).toBeGreaterThan(9);
+        const newestOfDel = async () =>
+          (
+            await svc.query<{ deleted: number }>(
+              `SELECT deleted FROM ${Table.Tokens} WHERE generation = 1 AND issuer = {issuer:String} AND currency = 'DEL'
+                ORDER BY version DESC LIMIT 1`,
+              { issuer: base.plain },
+            )
+          )[0].deleted;
+        await svc.insert(Table.DomainTomls, [failedToml(base.gateDomain, 1_700_000_100)]);
+
+        // three a step: a step reads at most three tokens, its cursor is the last it read, and the one after the last ends it
+        const steps = await sweepToEnd(svc, { limit: 3 });
+        expect(steps).toHaveLength(Math.ceil(keys.length / 3));
+        steps.forEach((step, k) => {
+          expect(step.next).toEqual((k + 1) * 3 < keys.length ? keys[(k + 1) * 3 - 1] : undefined);
+        });
+        expect(rewrittenIn(steps)).toBe(2);
+        expect(Number(await newestOfDel())).toBe(1);
+
+        // the number of steps is the same when a step takes exactly the rest, and one step takes them all
+        expect((await sweepToEnd(svc, { limit: keys.length })).map((step) => step.next)).toEqual([undefined]);
+        expect(await sweepToEnd(svc, { limit: keys.length - 1 })).toHaveLength(2);
+
+        // a step starts after its cursor: what is at or before it is not looked at
+        await svc.insert(Table.DomainTomls, [
+          tomlOf(
+            base.gateDomain,
+            [
+              entryOf('USD', base.gate, { name: 'Gateway Dollar' }),
+              entryOf('MYTOKEN', base.gate, { name: 'My Token' }),
+            ],
+            1_700_000_200,
+          ),
+        ]);
+        const last = keys[keys.length - 1];
+        const gateKeys = keys.filter((key) => key.issuer === base.gate);
+        expect(gateKeys.length).toBeGreaterThan(1);
+        const pastGate = await tomlSweep(svc, {
+          generation: 1,
+          version: nextVersion(),
+          profile: PROFILE,
+          after: gateKeys[gateKeys.length - 1],
+          limit: keys.length,
+        });
+        expect(pastGate.rewritten).toBe(0);
+        const atTheEnd = await tomlSweep(svc, { generation: 1, version: nextVersion(), profile: PROFILE, after: last });
+        expect(atTheEnd).toEqual({ rewritten: 0, next: undefined });
+        // and the rest, from the start, finds the two
+        expect(rewrittenIn(await sweepToEnd(svc, { limit: 4 }))).toBe(2);
+      });
+
+      it('reads a step of tokens, not every token after the cursor', async () => {
+        // three parts that each hold the same 100,000 tokens, merges stopped so that they stay
+        const svc = await fresh();
+        const db = (await svc.queryOne<{ db: string }>('SELECT currentDatabase() AS db'))?.db ?? '';
+        await svc.command(`SYSTEM STOP MERGES ${db}.${Table.Tokens}`);
+        const PARTS = 3;
+        for (let part = 0; part < PARTS; part++) {
+          await svc.command(
+            `INSERT INTO ${Table.Tokens}
+               (generation, issuer, currency, code, holders, trust_lines, supply, supply_f, last_ledger, issuer_ledger, issuer_flags,
+                transfer_rate, domain, listed, name, toml, deleted, version)
+             SELECT 1, concat('rIssuer', leftPad(toString(number), 7, '0')), 'USD', 'USD', 1, 1, '1', 1, 5, 4, 0, 0, '', 0, '', '', 0,
+                    {version:UInt64}
+               FROM numbers(100000)`,
+            { version: 10 + part },
+          );
+        }
+        const step = await tomlSweep(svc, {
+          generation: 1,
+          version: '100',
+          profile: PROFILE,
+          after: { issuer: 'rIssuer0030000', currency: 'USD' },
+          limit: 5,
+        });
+        // no issuer has a domain, so every token says what the sweep finds
+        expect(step).toEqual({ rewritten: 0, next: { issuer: 'rIssuer0030005', currency: 'USD' } });
+        const rows = await readRowsOf(svc, 'top_domain');
+        // 210,000 rows lie after the cursor: a step of 5 reads a granule or a few of each part (8,192 rows)
+        expect(rows).toBeLessThan(PARTS * 4 * 8_192);
+      });
+
+      it('writes nothing once the signal is aborted', async () => {
+        const { svc, base } = await builtWorld();
+        await svc.insert(Table.DomainTomls, [failedToml(base.gateDomain, 1_700_000_100)]);
+        const before = await liveTokens(svc, 1);
+        const controller = new AbortController();
+        controller.abort();
+        await expect(
+          tomlSweep(svc, { generation: 1, version: nextVersion(), profile: PROFILE }, controller.signal),
+        ).rejects.toBeInstanceOf(TokensAborted);
+        expect(await liveTokens(svc, 1)).toEqual(before);
+        // the same step with the signal alive would have written
+        expect(rewrittenIn(await sweepToEnd(svc))).toBe(2);
+      });
+    });
+
+    // -----------------------------------------------------------------------------------------------------------------
+    describe('dropTokenGeneration', () => {
+      const generationsOf = async (svc: ClickHouseService, table: Table): Promise<number[]> =>
+        (await svc.query<{ generation: number }>(`SELECT DISTINCT generation FROM ${table} ORDER BY generation`)).map(
+          (r) => Number(r.generation),
+        );
+
+      it('drops only that generation of both tables', async () => {
+        const svc = await fresh();
+        for (const generation of [1, 2, 3]) {
+          await svc.insert(Table.TokenLines, [{ ...SAMPLE_ROWS[Table.TokenLines], generation }]);
+          await svc.insert(Table.Tokens, [{ ...SAMPLE_ROWS[Table.Tokens], generation }]);
+          await svc.insert(Table.TokenGenerations, [{ ...SAMPLE_ROWS[Table.TokenGenerations], generation }]);
+        }
+        await dropTokenGeneration(svc, 2);
+        expect(await generationsOf(svc, Table.TokenLines)).toEqual([1, 3]);
+        expect(await generationsOf(svc, Table.Tokens)).toEqual([1, 3]);
+        // the generation's own state is not a partition of either, and stays
+        expect(await generationsOf(svc, Table.TokenGenerations)).toEqual([1, 2, 3]);
+
+        // a partition that is not there is nothing to drop: the job may run it again after a restart
+        await dropTokenGeneration(svc, 2);
+        await dropTokenGeneration(svc, 99);
+        expect(await generationsOf(svc, Table.TokenLines)).toEqual([1, 3]);
+        await dropTokenGeneration(svc, 1);
+        await dropTokenGeneration(svc, 3);
+        expect(await generationsOf(svc, Table.TokenLines)).toEqual([]);
+        expect(await generationsOf(svc, Table.Tokens)).toEqual([]);
+      });
+
+      it('refuses a generation that is not a UInt32', async () => {
+        const svc = await fresh();
+        const spy = jest.spyOn(svc, 'command');
+        try {
+          for (const bad of [-1, 1.5, 4_294_967_296, Number.NaN, Number.POSITIVE_INFINITY, 1e21]) {
+            await expect(dropTokenGeneration(svc, bad)).rejects.toThrow(RangeError);
+          }
+          // nothing was sent
+          expect(spy).not.toHaveBeenCalled();
+          // the ends of the range are generations
+          await dropTokenGeneration(svc, 0);
+          await dropTokenGeneration(svc, 4_294_967_295);
+          expect(spy).toHaveBeenCalledTimes(4);
+        } finally {
+          spy.mockRestore();
+        }
+      });
     });
   });
 });
