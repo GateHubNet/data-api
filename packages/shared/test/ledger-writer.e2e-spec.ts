@@ -204,15 +204,6 @@ const oIndex = (i: number): number => OBJECT_LEDGERS[i].header.ledger_index;
 /** The object fixture ledgers. */
 const expectedObjectCounts = (keep?: (ledgerIndex: number) => boolean): Counts => countsOf(OBJECT_BUILT, keep);
 
-/** The Xahau mint fixture ledgers (`xahau/mint`): what writing them gives. */
-const expectedMintCounts = (keep?: (ledgerIndex: number) => boolean): Counts =>
-  countsOf(
-    FixtureLedgerSource.fromDir(join(__dirname, 'fixtures/xahau/mint'))
-      .list()
-      .map((raw) => buildLedgerRows(raw, parseContextFor(getNetworkProfile('xahau')))),
-    keep,
-  );
-
 describe('LedgerWriter and ingest state (e2e)', () => {
   let ch: StartedClickHouse;
   const services: ClickHouseService[] = [];
@@ -1474,7 +1465,7 @@ describe('LedgerWriter and ingest state (e2e)', () => {
     }
 
     it('lands in the three tables: counts and every row as built, and no clamped import is reported', async () => {
-      const expected = expectedMintCounts();
+      const expected = countsOf(MINT_BUILT);
       // the two hand-made ledgers hold the mints (8 entries) and the claim (1); the two recorded Imports are the 2
       expect([Table.GenesisMints, Table.Imports, Table.RewardClaims].map((t) => expected[t])).toEqual([8, 2, 1]);
 

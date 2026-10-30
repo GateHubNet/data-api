@@ -489,7 +489,7 @@ few `account` rows): about 25 to 40 rows a ledger on the mainnet ledgers recorde
 The native coins Xahau mints outside a payment, which the supply sums ([spec](superpowers/specs/2026-10-24-supply-design.md)): the entries of
 a `GenesisMint`, the `Import`s, and the `ClaimReward`s that a reward mint answers. The three are child tables like `account_states`
 (`CHILD_TABLES`, `LEDGER_KEYED_TABLES`, the deduplication window, deleted by recovery and `--reprocess`), all P6, and they are **empty on XRPL**, where none of the three
-transaction types exists. They are written from parser version 9 (`MINT_PARSER_VERSION`) with every ledger: a Xahau ledger written by an older parser has no rows in
+transaction types exists. They are written from parser version 9 (`MINT_PARSER_VERSION`), whenever a ledger has mint rows (a successful `GenesisMint` or `Import`, or any `ClaimReward`): a Xahau ledger written by an older parser has no rows in
 them until it is re-ingested, so their coverage starts at the first ledger the new parser wrote. Amounts are drops (`UInt64`).
 
 #### `genesis_mints` (P6, `ORDER BY (ledger_index, tx_index, mint_index)`)

@@ -60,7 +60,7 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^# TYPE syncer_parser_anomalies_total counter$/m);
     expect(text).toContain(
       '# HELP syncer_parser_anomalies_total Things a parser found in a ledger that the network cannot produce and stored in a ' +
-        'safe form, by kind (import_minted_negative: an Xahau Import whose minted drops came out below 0 and were stored as 0), ' +
+        'safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0), ' +
         'over the ledgers written by the live ingest and by range-ingest runs of this process.\n' +
         '# TYPE syncer_parser_anomalies_total counter\n',
     );
@@ -75,6 +75,21 @@ describe('PrometheusService', () => {
     expect(text).toMatch(/^syncer_escrows_lag_ledgers 6$/m);
     expect(text).toMatch(/^# TYPE syncer_escrows_open gauge$/m);
     expect(text).toMatch(/^syncer_escrows_open 7$/m);
+  });
+
+  it('shows the series of syncer_parser_anomalies_total{kind="import_minted_negative"} at 0 before any clamp, so that an alert on its increase fires on the first one', async () => {
+    // A fresh copy of the module: the counters are process-wide, and the other cases of this file have incremented this one.
+    let text = '';
+    await jest.isolateModulesAsync(async () => {
+      const { PrometheusService: Fresh } = await import('./prometheus.service');
+      const service = new Fresh();
+      service.onModuleInit();
+      text = await service.getMetrics();
+    });
+    expect(text).toMatch(/^syncer_parser_anomalies_total\{kind="import_minted_negative"\} 0$/m);
+    // the unlabelled siblings start at 0 the same way
+    expect(text).toMatch(/^syncer_objects_unclassified_total 0$/m);
+    expect(text).toMatch(/^syncer_nft_skipped_total 0$/m);
   });
 
   it('exposes the metrics of the validators worker, by name, type and label set', async () => {

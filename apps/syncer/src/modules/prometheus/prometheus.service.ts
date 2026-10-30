@@ -68,7 +68,7 @@ const metrics = {
   }),
   parserAnomaliesTotal: new Counter({
     name: 'syncer_parser_anomalies_total',
-    help: 'Things a parser found in a ledger that the network cannot produce and stored in a safe form, by kind (import_minted_negative: an Xahau Import whose minted drops came out below 0 and were stored as 0), over the ledgers written by the live ingest and by range-ingest runs of this process.',
+    help: 'Things a parser found in a ledger that the network cannot produce and stored in a safe form, by kind (import_minted_negative: a Xahau Import whose minted drops came out below 0 and were stored as 0), over the ledgers written by the live ingest and by range-ingest runs of this process.',
     labelNames: ['kind'],
     registers: [registry],
   }),
@@ -273,6 +273,10 @@ const metrics = {
     registers: [registry],
   }),
 };
+
+// A labelled counter has no series until its first `inc`, and `increase()` of a series that first shows at its value is 0: the first
+// Import the parser clamps would raise no alert. The series of the one kind starts at 0, as the unlabelled counters above do.
+metrics.parserAnomaliesTotal.inc({ kind: 'import_minted_negative' }, 0);
 
 // Every node client of the process shares `nodeThrottle`: each pause it starts is counted here, once.
 nodeThrottle.on('pause', (pause: ThrottlePause) => metrics.nodeRateLimitedTotal.inc({ endpoint: pause.host }));

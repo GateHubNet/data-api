@@ -2676,41 +2676,93 @@ describe('Xahau mint rows (parser version 9)', () => {
     },
   );
 
-  it('mints what the header grew by plus the fees, on every recorded parent and child', () => {
-    const genesisId = xahauGenesisId();
-    const handMade = handMadeLedgers();
-    expect([...handMade].sort()).toEqual([26540187, 26540188]);
+  /** Whether the ledger holds the `EnableAmendment` of XahauGenesis: it changes `total_coins` once, at the network's start. */
+  const enablesXahauGenesis = (raw: RawLedger, genesisId = xahauGenesisId()): boolean =>
+    raw.transactions.some((t) => t.tx.TransactionType === 'EnableAmendment' && t.tx.Amendment === genesisId);
 
+  /**
+   * The invariant of the supply on every ledger of `ledgers` whose parent is in `ledgers` too (the `excluded` indexes are in
+   * neither role), but for a ledger that enables XahauGenesis: the supply it began with is not a mint (decision 5). The
+   * entries minted by a `GenesisMint` plus the drops each `Import` brought equal the growth of `total_coins` plus the fees.
+   * Fails an `expect` when it does not hold, and says what it checked.
+   */
+  function checkMintInvariant(ledgers: readonly Built[], excluded: ReadonlySet<number> = new Set()) {
+    const genesisId = xahauGenesisId();
+    const byIndex = new Map(
+      ledgers
+        .filter((b) => !excluded.has(b.raw.header.ledger_index))
+        .map((b) => [b.raw.header.ledger_index, b] as const),
+    );
     let pairs = 0;
     let genesis = 0n;
     let imported = 0n;
-    for (const [set, excluded] of [
-      [XAHAU_SET, new Set<number>()],
-      [MINT_XAHAU, handMade],
-    ] as const) {
-      const ledgers = new Map(builtOf(set).map((b) => [b.raw.header.ledger_index, b] as const));
-      for (const [index, child] of ledgers) {
-        const parent = ledgers.get(index - 1);
-        if (excluded.has(index) || !parent || excluded.has(index - 1)) continue;
-        // XahauGenesis changes total_coins once, at the network's start: the supply it began with, not a mint.
-        const starts = child.raw.transactions.some(
-          (t) => t.tx.TransactionType === 'EnableAmendment' && t.tx.Amendment === genesisId,
-        );
-        if (starts) continue;
+    for (const [index, child] of byIndex) {
+      const parent = byIndex.get(index - 1);
+      if (!parent || enablesXahauGenesis(child.raw, genesisId)) continue;
 
-        const fromGenesis = child.rows.genesisMints.reduce((sum, r) => sum + BigInt(r.amount), 0n);
-        const fromImports = child.rows.imports.reduce((sum, r) => sum + BigInt(r.minted), 0n);
-        const grown = BigInt(child.rows.ledger.total_coins) - BigInt(parent.rows.ledger.total_coins);
-        expect([index, fromGenesis + fromImports]).toEqual([index, grown + BigInt(child.rows.ledger.fee_total)]);
-        genesis += fromGenesis;
-        imported += fromImports;
-        pairs++;
-      }
+      const fromGenesis = child.rows.genesisMints.reduce((sum, r) => sum + BigInt(r.amount), 0n);
+      const fromImports = child.rows.imports.reduce((sum, r) => sum + BigInt(r.minted), 0n);
+      const grown = BigInt(child.rows.ledger.total_coins) - BigInt(parent.rows.ledger.total_coins);
+      expect([index, fromGenesis + fromImports]).toEqual([index, grown + BigInt(child.rows.ledger.fee_total)]);
+      genesis += fromGenesis;
+      imported += fromImports;
+      pairs++;
     }
+    return { pairs, genesis, imported };
+  }
+
+  it('mints what the header grew by plus the fees, on every recorded parent and child', () => {
+    const handMade = handMadeLedgers();
+    expect([...handMade].sort()).toEqual([26540187, 26540188]);
+
+    const recorded = checkMintInvariant(builtOf(XAHAU_SET));
+    const cases = checkMintInvariant(builtOf(MINT_XAHAU), handMade);
+    const pairs = recorded.pairs + cases.pairs;
     expect(pairs).toBeGreaterThanOrEqual(2);
     // not vacuous: both kinds of mint were part of it
-    expect(genesis).toBeGreaterThan(0n);
-    expect(imported).toBeGreaterThan(0n);
+    expect(recorded.genesis + cases.genesis).toBeGreaterThan(0n);
+    expect(recorded.imported + cases.imported).toBeGreaterThan(0n);
+  });
+
+  describe('the XahauGenesis skip of that invariant', () => {
+    // No recorded ledger enables XahauGenesis (it did so at ledger 3), so the skip is shown on hand-built ones.
+    const ZERO = 'rrrrrrrrrrrrrrrrrrrrrhoLvTp';
+    const enable = (amendment: string): Json =>
+      rawTx(
+        { TransactionType: 'EnableAmendment', Account: ZERO, Fee: '0', Amendment: amendment },
+        0,
+        'E'.repeat(64),
+        [],
+      );
+    const pair = (amendment?: string): Built[] =>
+      [
+        ledgerOf([], { ledger_index: '5000000', total_coins: '1000' }),
+        // total_coins grows by 500 with no mint and no fee: not a mint, the supply the network began with
+        ledgerOf(amendment === undefined ? [] : [enable(amendment)], { ledger_index: '5000001', total_coins: '1500' }),
+      ].map((raw) => ({ raw, rows: buildLedgerRows(raw, XAHAU) }));
+
+    it('uses the id of the amendment: the first half of the SHA-512 of its name, as amendment ids are', () => {
+      expect(xahauGenesisId()).toBe(
+        createHash('sha512').update('XahauGenesis').digest('hex').slice(0, 64).toUpperCase(),
+      );
+      expect(xahauGenesisId()).toBe('6E739F4F8B07BED29FC9FF440DA3C301CD14A180DF45819F658FEC2F7DE31427');
+    });
+
+    it('skips a ledger that enables XahauGenesis, and holds any other ledger whose total_coins grows without a mint to the invariant', () => {
+      const id = xahauGenesisId();
+      expect(checkMintInvariant(pair(id))).toEqual({ pairs: 0, genesis: 0n, imported: 0n });
+      expect(enablesXahauGenesis(pair(id)[1].raw)).toBe(true);
+      // another amendment, or none, is no skip: the growth is unexplained and the invariant fails
+      expect(enablesXahauGenesis(pair('A'.repeat(64))[1].raw)).toBe(false);
+      expect(() => checkMintInvariant(pair('A'.repeat(64)))).toThrow();
+      expect(() => checkMintInvariant(pair())).toThrow();
+    });
+
+    it('is not taken by a recorded Xahau ledger: none enables XahauGenesis', () => {
+      for (const set of [XAHAU_SET, MINT_XAHAU]) {
+        for (const { raw } of builtOf(set)) expect(enablesXahauGenesis(raw)).toBe(false);
+      }
+    });
   });
 
   it.each([
@@ -2729,7 +2781,21 @@ describe('Xahau mint rows (parser version 9)', () => {
 
   it('gives every recorded XRPL ledger the three arrays empty', () => {
     let ledgers = 0;
-    for (const set of [...SETS.filter((s) => s.ctx === XRPL), NFT_SET, OBJECTS_XRPL, STATE_TOUCHES_XRPL]) {
+    // every other directory of ledgers of the XRP Ledger and its testnet
+    const rest = (network: 'xrpl' | 'xrpl-testnet', dir: string): FixtureSet => ({
+      name: `${network}/${dir}`,
+      ctx: parseContextFor(getNetworkProfile(network)),
+      dir: join(FIXTURES, network, dir),
+      minNativeChecked: 0,
+      minTrustlinesChecked: 0,
+    });
+    const others = [
+      rest('xrpl', 'account-state'),
+      rest('xrpl', 'account-domains'),
+      rest('xrpl', 'path-payments'),
+      rest('xrpl-testnet', 'recorded'),
+    ];
+    for (const set of [...SETS.filter((s) => s.ctx === XRPL), NFT_SET, OBJECTS_XRPL, STATE_TOUCHES_XRPL, ...others]) {
       for (const { rows } of builtOf(set)) {
         expect([rows.genesisMints, rows.imports, rows.rewardClaims]).toEqual([[], [], []]);
         expect(rows.diagnostics.importMintedNegative).toBe(0);
@@ -2737,6 +2803,7 @@ describe('Xahau mint rows (parser version 9)', () => {
       }
     }
     expect(ledgers).toBeGreaterThan(100);
+    for (const set of others) expect([set.name, builtOf(set).length > 0]).toEqual([set.name, true]);
     expect(buildLedgerRows(sampleLedger(), XRPL).imports).toEqual([]);
   });
 

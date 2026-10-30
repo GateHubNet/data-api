@@ -205,12 +205,12 @@ export async function assertIssuedTokensSchema(
   await assertTablesOf(ch, enabled, database, logger, ISSUED_TOKENS_MIGRATION, ISSUED_TOKENS_NEEDS);
 }
 
-/** The migration that adds the Xahau mint tables the ingest writes with every ledger and the supply tables the aggregator keeps. */
+/** The migration that adds the Xahau mint tables the ingest writes when a ledger has mint rows, and the supply tables the aggregator keeps. */
 export const SUPPLY_MIGRATION = '015_supply.sql';
 
 /**
  * The tables of `SUPPLY_MIGRATION` each worker needs, and what it does with them. The ingest writes the three mint tables
- * (`genesis_mints`, `imports`, `reward_claims`) with every ledger.
+ * (`genesis_mints`, `imports`, `reward_claims`) whenever a ledger has mint rows.
  */
 const SUPPLY_NEEDS: SchemaNeeds = new Map([
   ['ingest', { tables: [Table.GenesisMints, Table.Imports, Table.RewardClaims], does: 'writes' }],
