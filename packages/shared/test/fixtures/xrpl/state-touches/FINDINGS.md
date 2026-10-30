@@ -1,0 +1,24 @@
+# XRPL state touch fixtures: findings
+
+Recorded 2026-10-30 from `wss://s2.ripple.com` (rippled mainnet, network id 0; validated head 107991428) with `--txs --delay-ms 500`: 3 ledgers, 3 transactions (101 KB gzipped, largest 61 KB, ledger 85885429), the 3 cases of `manifest.json`. `README.md` ("State touches") lists the cases and the transactions read in place; this page says how they were found and what the metadata shows. The checks were made with throwaway scripts (not in the repository) and with `src/parsers/state-touches.parser.spec.ts`.
+
+## Where the cases came from
+
+- **Requests, all to `s2`, one at a time (400 ms apart).** `account_tx` with `tx_type` `AccountSet`, oldest first, three pages of 200 rows each, for the GateHub issuer `rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq`, the Bitstamp issuer `rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B`, the RLUSD issuer `rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De` and the USDV issuer `rfffsukWALJB1PXYk7H8xkR6UJUDT8nMJE`; then 60 pages for the first two (nothing more with a `TransferRate` or `SetFlag` than the first pages show, except `SetFlag` 8 for GateHub in ledger 12296677); `account_tx` with `tx_type` `Clawback` over the first 40 pages of the RLUSD issuer: none; one `tx` lookup of the Clawback below. Nothing was scanned with `--want` and no ledger was walked.
+- **`accountset_transfer_rate`**: the GateHub issuer's third AccountSet (`SetFlag` 1 and 3 come first, ledgers 11738826 and 11738840). Bitstamp's first AccountSet, ledger 242874 (`A0DB532BB3EDF23C6513FFC18345545FCD13B3F92983FDB291668C0A652A92FC`), is the same case on a very old ledger; it was not recorded.
+- **`accountset_allow_clawback`**: the RLUSD issuer's third AccountSet (`SetFlag` 8, 9, **16**, 4 in ledgers 89925766 to 89925803).
+- **`clawback`**: no Clawback is in the first 40 pages of the RLUSD issuer's `Clawback` rows, and none was found in the recorded ledgers of earlier work either (`xrpl/recorded`'s manifest lists it as missing). The hash came from a page of a third-party explorer that lists a successful Clawback of February 2024; `tx` on `s2` confirms it (validated, `tesSUCCESS`, ledger 85885429, `rYNKrtQaf3vUVWVK5sw9rJdPGDLbxZu89` against its own `594F494E4B000000000000000000000000000000`).
+
+## Findings
+
+1. **A `TransferRate` set for the first time is not in `PreviousFields`.** In `accountset_transfer_rate` (ledger 11738848, `E9CFA706…`) the account root is the only node, with `FinalFields.TransferRate` 1002000000 and `PreviousFields` `Balance` and `Sequence` alone. Spec 4's rule (`Flags`, `TransferRate` or `Domain` among the `PreviousFields`) alone would give this AccountSet no touch; the rule for the sender of an `AccountSet` does. Same for the Domain set first in `xrpl/account-domains/107939675`. (Checked: `account_tx` of the issuer shows its first two AccountSets are `SetFlag` 1 and 3, so no earlier `TransferRate` existed.)
+2. **A flag change is in `PreviousFields`.** `accountset_allow_clawback` (ledger 89925780, `9B1042DD…`, `SetFlag` 16) has `PreviousFields` `Balance`, `Flags` and `Sequence` on the issuer's root (`Flags` is always present on an account root, so a change of it is listed).
+3. **A Clawback touches one line and, if the fee is all the issuer pays, no root.** `clawback` (ledger 85885429, `C2071343…`) has two nodes: the issuer's `AccountRoot` (`PreviousFields` `Balance` and `Sequence`: the fee) and the `RippleState` (`PreviousFields` `Balance`). The holder's root is not in the metadata. The `RippleState` has the issuer as low account (`LowLimit.issuer` `rYNKrt…`), the holder as high one.
+4. **An LP line is an ordinary `RippleState`.** `xrpl/account-state/107872956` (`45E37A13…`, AMMDeposit) lists the depositor's line to the pool with the 40-digit LP currency `03D2DE40…`, and the pool's account root with `Balance` alone. The parser writes the line (the job drops LP currencies) and not the pool root.
+5. **Xahau account roots change fields that are no touch.** In `xahau/recorded/26540613` (the Remit `8C50C447…`) all five roots change `TouchCount`, and one of them also `HookStateCount`, `OwnerCount`, `RewardAccumulator` and `RewardLgrLast`: none has `Flags`, `TransferRate` or `Domain`, and the Remit is no AccountSet, so it has six `line` touches and no `account` one.
+6. **`meta.TransactionIndex` is the `tx_index`.** The Clawback is the 123rd of the 157 transactions in the node's expanded list and has `TransactionIndex` 80; `buildLedgerRows` writes 80.
+
+## Not recorded
+
+- **Xahau**: nothing was requested. Its `TrustSet`, EVR `Payment` and `Remit` are read in place (`xahau/objects/11056548`, `xahau/recorded/26540613`).
+- **A `TransferRate` that changes** (the old value in `PreviousFields`): none was looked for beyond the first pages of two issuers. The hand-made unit case covers `TransferRate` among the `PreviousFields`.

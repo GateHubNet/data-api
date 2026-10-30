@@ -1,5 +1,5 @@
 import { dropsToNative } from '../util/amount';
-import { ParseContext, ParserTx } from './parser.interface';
+import { NODE_OPS, NodeOp, ParseContext, ParserTx } from './parser.interface';
 
 /** The state of an account root after a transaction changed it. */
 export interface ParsedAccountState {
@@ -19,11 +19,9 @@ export interface ParsedAccountState {
 
 type Json = Readonly<Record<string, any>>;
 
-const OPS = ['CreatedNode', 'ModifiedNode', 'DeletedNode'] as const;
-
 /** An `AccountRoot` node of a transaction's metadata that the transaction changed. */
 export interface ChangedAccountRoot {
-  op: 'CreatedNode' | 'ModifiedNode' | 'DeletedNode';
+  op: NodeOp;
   /** The node's position in `meta.AffectedNodes`. */
   node_index: number;
   /** The node under its `op` key: `NewFields` (created) or `FinalFields` and `PreviousFields`. */
@@ -41,7 +39,7 @@ export function changedAccountRoots(t: ParserTx): ChangedAccountRoot[] {
   const roots: ChangedAccountRoot[] = [];
   const nodes: readonly Json[] = t.meta.AffectedNodes ?? [];
   nodes.forEach((entry, index) => {
-    const op = OPS.find((o) => entry?.[o]);
+    const op = NODE_OPS.find((o) => entry?.[o]);
     if (!op) return;
     const node: Json = entry[op];
     if (node.LedgerEntryType !== 'AccountRoot') return;

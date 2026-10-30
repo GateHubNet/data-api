@@ -77,6 +77,13 @@ export function feePayer(tx: Readonly<Record<string, unknown>>): string | undefi
   return delegateOf(tx) ?? senderAccount(tx);
 }
 
+/**
+ * The three keys under which `meta.AffectedNodes` wraps a node, and what each did to the ledger entry. The one list of them
+ * for the parsers that walk the metadata node by node (`changedAccountRoots`, `changedTrustLines`).
+ */
+export const NODE_OPS = ['CreatedNode', 'ModifiedNode', 'DeletedNode'] as const;
+export type NodeOp = (typeof NODE_OPS)[number];
+
 export function toParserTx(raw: RawTransaction, header: LedgerHeader, client: string | null): ParserTx {
   return {
     hash: raw.hash,

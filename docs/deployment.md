@@ -250,7 +250,7 @@ Migrations are **owned by one-shot jobs**, not run on every replica at boot:
   both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. Then the account domains are seeded once per network ([operations](operations.md#the-display-names),
   [backfill](backfill.md#account-domains-seed)).
 - `013_ledger_objects.sql` (three `CREATE TABLE IF NOT EXISTS`: the ledger-derived `object_changes` and `account_object_changes`, and the aggregate `escrows`) is additive but **sets an order**:
-  `migrate` first, then the syncer, then the api. A syncer of this version (parser version 7) writes the two ledger tables with every ledger, and an insert into a missing table fails the batch,
+  `migrate` first, then the syncer, then the api. A syncer of this version (parser version 7 or later) writes the two ledger tables with every ledger, and an insert into a missing table fails the batch,
   so the live runner would retry the same ledgers without end; its `escrows` job reads and writes the third, and the object routes of the api answer 500 until the tables exist. Nothing checks for
   them at boot. The compose files make both wait for `migrate`; by hand, run `migrate`, start the syncer, and the api last. Then delegation is re-ingested on the XRP Ledger
   ([operations](operations.md#ledger-objects-and-delegation), [backfill](backfill.md#ledger-objects-and-delegation-re-ingest)).

@@ -479,7 +479,8 @@ each account (`argMax(…, version)`, never row counts: the table collapses by a
 For the issued tokens: the `state_touches` rows the parser writes (version 8, `StateTouchesParser`) are checked against the metadata of these ledgers
 (`src/parsers/state-touches.parser.spec.ts`, and the `build-rows` unit and e2e suites). Recorded 2026-10-30 from `wss://s2.ripple.com` (rippled mainnet,
 network id 0; validated head 107991428) with `--txs` and `--delay-ms 500`: 3 ledgers (101 KB gzipped, largest 61 KB). `manifest.json` has the cases under
-`cases.<name>` as `{ledger, hash, type, note}`. Nothing was scanned (`--want` was not used), and nothing of Xahau was requested: its cases are read in place.
+`cases.<name>` as `{ledger, hash, type, note}`; `FINDINGS.md` says how they were found and what their metadata shows. Nothing was scanned (`--want` was not used),
+and nothing of Xahau was requested: its cases are read in place.
 
 The hashes came from `account_tx` of known issuers, one request at a time (a throwaway script, not in the repository): the GateHub issuer
 `rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq` (the AccountSets of its first rows) and the RLUSD issuer `rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De` (the same). The

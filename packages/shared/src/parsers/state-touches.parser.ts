@@ -1,5 +1,6 @@
 import { changedAccountRoots } from './account-states.parser';
 import { ParseContext, ParserTx, senderAccount } from './parser.interface';
+import { changedTrustLines } from './trust-line-states.parser';
 
 /**
  * A trust line or an account whose token state a transaction may have changed (`state_touches`, spec 2.1). A `line` is a trust
@@ -15,8 +16,6 @@ export interface ParsedStateTouch {
 
 type Json = Readonly<Record<string, any>>;
 
-const OPS = ['CreatedNode', 'ModifiedNode', 'DeletedNode'] as const;
-
 /** The fields of an account root that a token's settings are read from: its flags, its transfer rate and its domain. */
 const ACCOUNT_SETTINGS = ['Flags', 'TransferRate', 'Domain'] as const;
 
@@ -30,7 +29,8 @@ export class StateTouchesParser {
    * its sequence, and its metadata says what it changed.
    *
    * - `line`: a `RippleState` node that is created, deleted, or modified with `PreviousFields` (a node that was only
-   *   threaded changed nothing: the rule of `trust_line_states`). `account` is `LowLimit.issuer`, `counterparty`
+   *   threaded changed nothing): the nodes of `changedTrustLines`, the walk of `trust_line_states` too, so that this table
+   *   stays its index. `account` is `LowLimit.issuer`, `counterparty`
    *   `HighLimit.issuer` and `currency` `Balance.currency`, all of the node's final fields (`NewFields` of a created node,
    *   else `FinalFields`). LP currencies are written too: the job drops them.
    * - `account`: an `AccountRoot` that is created, deleted, or modified with `Flags`, `TransferRate` or `Domain` among its
@@ -51,20 +51,9 @@ export class StateTouchesParser {
   parse(t: ParserTx, _ctx: ParseContext): ParsedStateTouch[] {
     const touches: Array<{ node_index: number; touch: ParsedStateTouch }> = [];
 
-    const nodes: readonly Json[] = t.meta.AffectedNodes ?? [];
-    nodes.forEach((entry, index) => {
-      const op = OPS.find((o) => entry?.[o]);
-      if (!op) return;
-      const node: Json = entry[op];
-      if (node.LedgerEntryType !== 'RippleState') return;
-      if (op === 'ModifiedNode' && !node.PreviousFields) return;
-      const fields: Json | undefined = op === 'CreatedNode' ? node.NewFields : node.FinalFields;
-      const low = fields?.LowLimit?.issuer;
-      const high = fields?.HighLimit?.issuer;
-      const currency = fields?.Balance?.currency;
-      if (typeof low !== 'string' || typeof high !== 'string' || typeof currency !== 'string') return;
-      touches.push({ node_index: index, touch: { kind: 'line', account: low, counterparty: high, currency } });
-    });
+    for (const { node_index, low, high, currency } of changedTrustLines(t)) {
+      touches.push({ node_index, touch: { kind: 'line', account: low, counterparty: high, currency } });
+    }
 
     const sender = t.tx.TransactionType === 'AccountSet' ? senderAccount(t.tx) : undefined;
     for (const { op, node_index, node } of changedAccountRoots(t)) {

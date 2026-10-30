@@ -8,13 +8,15 @@ import { deepFreeze } from '../test-utils/deep-freeze';
 import { AccountStatesParser } from './account-states.parser';
 import { ParseContext, parseContextFor, ParserTx, toParserTx } from './parser.interface';
 import { ParsedStateTouch, StateTouchesParser } from './state-touches.parser';
-import { TrustLineStatesParser } from './trust-line-states.parser';
+import { changedTrustLines, TrustLineStatesParser } from './trust-line-states.parser';
 
 type Json = Record<string, any>;
 
 const CTX: ParseContext = { nativeCurrency: 'XRP', networkId: 0, partialPaymentFixLedger: 0 };
 const XRPL = parseContextFor(getNetworkProfile('xrpl'));
 const XAHAU = parseContextFor(getNetworkProfile('xahau'));
+const XRPL_TESTNET = parseContextFor(getNetworkProfile('xrpl-testnet'));
+const XAHAU_TESTNET = parseContextFor(getNetworkProfile('xahau-testnet'));
 
 const FIXTURES = join(__dirname, '..', '..', 'test', 'fixtures');
 
@@ -91,7 +93,8 @@ describe('StateTouchesParser', () => {
   describe('lines', () => {
     it('writes a line touch for a created, a modified and a deleted RippleState, from the final fields', () => {
       const t = parserTx({ TransactionType: 'TrustSet' }, [
-        // The low account's limit is what the node ends with: the created node's NewFields, the others' FinalFields.
+        // The line's identity (low account, high account, currency) is read from the final fields of the node: the NewFields of a
+        // created node, the FinalFields of the others.
         createdLine(lineFields(ISSUER, HOLDER, 'USD')),
         modifiedLine(lineFields(ISSUER, OTHER, 'EUR', { Flags: 65536 }), { Flags: 0 }),
         // PreviousFields.Balance names another currency: the touch is the final one.
@@ -283,7 +286,7 @@ describe('StateTouchesParser', () => {
         [modifiedRoot({ Account: HOLDER, Balance: '1', Sequence: 6 }, { Balance: '13', Sequence: 5 })],
         'tecPATH_PARTIAL',
       );
-      // A tec result that does remove a line: an expired offer's funds, or a tecINCOMPLETE delete.
+      // A failed transaction whose metadata still names a line: a tecKILLED OfferCreate with a modified RippleState.
       const failedWithLine = parserTx(
         { TransactionType: 'OfferCreate', Account: HOLDER },
         [modifiedLine(lineFields(ISSUER, HOLDER), { Balance: {} })],
@@ -622,38 +625,46 @@ describe('StateTouchesParser over the recorded cases', () => {
   describe('agrees with the two state parsers it indexes', () => {
     const lines = new TrustLineStatesParser();
     const accounts = new AccountStatesParser();
+    /** Every fixture directory that holds ledgers. */
     const SETS: Array<[string, ParseContext]> = [
       ['xrpl/ripple-mock', XRPL],
       ['xrpl/recorded', XRPL],
-      ['xrpl/account-state', XRPL],
-      ['xrpl/state-touches', XRPL],
       ['xrpl/amm', XRPL],
+      ['xrpl/account-state', XRPL],
+      ['xrpl/account-domains', XRPL],
+      ['xrpl/nft', XRPL],
+      ['xrpl/objects', XRPL],
+      ['xrpl/path-payments', XRPL],
+      ['xrpl/state-touches', XRPL],
       ['xahau/recorded', XAHAU],
+      ['xahau/flag', XAHAU],
+      ['xahau/uritoken', XAHAU],
       ['xahau/objects', XAHAU],
+      ['xrpl-testnet/recorded', XRPL_TESTNET],
+      ['xahau-testnet/recorded', XAHAU_TESTNET],
     ];
 
-    it.each(SETS)(
-      '%s: a line touch for each trust line of trust_line_states (once, low account first), and no other',
-      (dir, ctx) => {
-        let checked = 0;
-        for (const ledger of ledgersOf(dir)) {
-          for (const raw of ledger.transactions) {
-            const t = deepFreeze(toParserTx(raw, ledger.header, null));
-            // Each node gives the low account's state first and the high account's second: the first one is the touch.
-            const expected = lines
-              .parse(t, ctx)
-              .filter((_, i) => i % 2 === 0)
-              .map((s) => line(s.account, s.counterparty, s.currency));
-            const touched = parser.parse(t, ctx).filter((s) => s.kind === 'line');
-            expect(touched).toStrictEqual(expected);
-            checked += expected.length;
-          }
+    /** The line touches of the directory, each compared with the low-side row of `trust_line_states` of its node. */
+    function checkLines(dir: string, ctx: ParseContext): number {
+      let checked = 0;
+      for (const ledger of ledgersOf(dir)) {
+        for (const raw of ledger.transactions) {
+          const t = deepFreeze(toParserTx(raw, ledger.header, null));
+          // Each node gives the low account's state first and the high account's second: the first one is the touch.
+          const expected = lines
+            .parse(t, ctx)
+            .filter((_, i) => i % 2 === 0)
+            .map((s) => line(s.account, s.counterparty, s.currency));
+          const touched = parser.parse(t, ctx).filter((s) => s.kind === 'line');
+          expect(touched).toStrictEqual(expected);
+          checked += expected.length;
         }
-        expect(checked).toBeGreaterThan(0);
-      },
-    );
+      }
+      return checked;
+    }
 
-    it.each(SETS)('%s: an account touch only for an account of account_states, in the same transaction', (dir, ctx) => {
+    /** The account touches of the directory, each an account of `account_states` in the same transaction. */
+    function checkAccounts(dir: string, ctx: ParseContext): number {
       let checked = 0;
       for (const ledger of ledgersOf(dir)) {
         for (const raw of ledger.transactions) {
@@ -665,8 +676,67 @@ describe('StateTouchesParser over the recorded cases', () => {
           }
         }
       }
-      // The ledgers of every set create or delete an account or change a flag somewhere, except where noted.
-      if (dir !== 'xrpl/amm') expect(checked).toBeGreaterThan(0);
+      return checked;
+    }
+
+    it.each(SETS)(
+      '%s: a line touch for each trust line of trust_line_states (once, low account first), and no other',
+      (dir, ctx) => {
+        checkLines(dir, ctx);
+      },
+    );
+
+    it.each(SETS)('%s: an account touch only for an account of account_states, in the same transaction', (dir, ctx) => {
+      checkAccounts(dir, ctx);
+    });
+
+    it('is not vacuous: the fixture directories hold line touches and account touches', () => {
+      // (A directory of pseudo-transactions, like xahau/flag, or one without a change of flags has none of one kind.)
+      expect(SETS.reduce((sum, [dir, ctx]) => sum + checkLines(dir, ctx), 0)).toBeGreaterThan(3000);
+      expect(SETS.reduce((sum, [dir, ctx]) => sum + checkAccounts(dir, ctx), 0)).toBeGreaterThan(200);
+    });
+  });
+
+  describe('the walk it shares with trust_line_states (changedTrustLines)', () => {
+    it('selects the created, the deleted and the modified-with-PreviousFields RippleState nodes, with their identity and final fields', () => {
+      const final = lineFields(ISSUER, HOLDER, 'EUR');
+      const t = parserTx({ TransactionType: 'TrustSet' }, [
+        {
+          ModifiedNode: {
+            LedgerEntryType: 'AccountRoot',
+            FinalFields: { Account: ISSUER },
+            PreviousFields: { Flags: 0 },
+          },
+        },
+        createdLine(lineFields(ISSUER, OTHER, 'USD')),
+        modifiedLine(lineFields(ISSUER, OTHER, 'GBP')),
+        modifiedLine(final, { Flags: 0 }),
+        deletedLine(lineFields(HOLDER, OTHER, 'JPY')),
+        modifiedLine({ LowLimit: { issuer: ISSUER } }, { Flags: 0 }),
+      ]);
+
+      expect(
+        changedTrustLines(t).map(({ op, node_index, low, high, currency }) => ({
+          op,
+          node_index,
+          low,
+          high,
+          currency,
+        })),
+      ).toStrictEqual([
+        { op: 'CreatedNode', node_index: 1, low: ISSUER, high: OTHER, currency: 'USD' },
+        { op: 'ModifiedNode', node_index: 3, low: ISSUER, high: HOLDER, currency: 'EUR' },
+        { op: 'DeletedNode', node_index: 4, low: HOLDER, high: OTHER, currency: 'JPY' },
+      ]);
+      // The fields are the node's own, the final ones.
+      expect(changedTrustLines(t)[1].fields).toBe((t.meta.AffectedNodes as Json[])[3].ModifiedNode.FinalFields);
+      // And the state touches are those nodes' lines, with the root that changed its Flags, in the order of the nodes.
+      expect(parser.parse(t, CTX)).toStrictEqual([
+        root(ISSUER),
+        line(ISSUER, OTHER, 'USD'),
+        line(ISSUER, HOLDER, 'EUR'),
+        line(HOLDER, OTHER, 'JPY'),
+      ]);
     });
   });
 });
